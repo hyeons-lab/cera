@@ -2321,6 +2321,55 @@ impl Model for MetalLfm2Model {
         }
         logits
     }
+
+    /// Batched embedding-prefill: skip the `embed_tokens` lookup
+    /// and feed the caller's pre-computed hidden-dim frames straight
+    /// into the per-layer pipeline. Used by audio + any other
+    /// embedding-input modality. The trait default (parent `Model`)
+    /// loops `forward_from_embedding` per frame and pays full per-
+    /// token GEMV setup × n_frames; this override mirrors the CPU
+    /// `Lfm2Model::forward_prefill_from_embeddings` (PR #104) so
+    /// Metal audio prefill can amortize per-layer GEMM dispatch the
+    /// same way text prefill already does.
+    ///
+    /// No prefix-cache lookup: embedding inputs have no token-id key
+    /// to match against (the cache is keyed by the LLM token stream),
+    /// and the audio encoder's output is non-deterministic across
+    /// runs anyway. A future cache layer keyed on encoder-input hash
+    /// could be plumbed in, but it'd live above this method, not
+    /// inside it.
+    fn forward_prefill_from_embeddings(
+        &self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        assert!(
+            n_tokens > 0,
+            "forward_prefill_from_embeddings requires at least one frame"
+        );
+        let hidden_size = self.config.hidden_size;
+        assert_eq!(
+            embeddings.len(),
+            n_tokens * hidden_size,
+            "embeddings.len() ({}) != n_tokens ({}) * hidden_size ({})",
+            embeddings.len(),
+            n_tokens,
+            hidden_size
+        );
+
+        // Fresh prefill semantics match the token entry: clear the
+        // GPU-resident seq_len counter so we're not appending after
+        // KV from a previous generate(). InferenceState is the
+        // caller's responsibility on the embedding path (no prefix-
+        // cache restore).
+        if start_pos == 0 {
+            self.state.seq_len.store(0, Ordering::Relaxed);
+        }
+
+        self.forward_prefill_inner_from_embeddings(embeddings, n_tokens, start_pos, state)
+    }
 }
 
 impl MetalLfm2Model {
@@ -2372,13 +2421,84 @@ impl MetalLfm2Model {
             }
         }
 
-        // Op-first batching: within each layer, batch each operation across
-        // all N tokens before moving to the next operation. GEMV dispatches
-        // against the same weight matrix execute consecutively, keeping
-        // weights in GPU SLC (read once from DRAM instead of N times).
-        //
-        // Conv1d and attention are sequential (state dependencies) and use
-        // the single-token hidden_buf scratch.
+        self.prefill_layers_and_logits(n, start_pos, state)
+    }
+
+    fn forward_prefill_inner_from_embeddings(
+        &self,
+        embeddings: &[f32],
+        n: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        assert!(n > 0);
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        assert_eq!(
+            embeddings.len(),
+            n * hs,
+            "embeddings.len() ({}) != n ({}) * hidden_size ({})",
+            embeddings.len(),
+            n,
+            hs
+        );
+
+        assert!(
+            start_pos + n <= self.state.max_seq_len,
+            "prefill seq_len {} + {} exceeds max {}",
+            start_pos,
+            n,
+            self.state.max_seq_len
+        );
+
+        // Chunked prefill: same shape as the token path. Each chunk
+        // populates `prefill_batch_buf` then runs the per-layer body.
+        let max_chunk = self.state.max_seq_len.min(MAX_PREFILL_TOKENS);
+        if n > max_chunk {
+            let mut logits = Vec::new();
+            let mut pos = start_pos;
+            let mut remaining = embeddings;
+            let mut remaining_n = n;
+            while remaining_n > 0 {
+                let chunk_n = remaining_n.min(max_chunk);
+                let chunk = &remaining[..chunk_n * hs];
+                logits = self.forward_prefill_inner_from_embeddings(chunk, chunk_n, pos, state);
+                pos += chunk_n;
+                remaining = &remaining[chunk_n * hs..];
+                remaining_n -= chunk_n;
+            }
+            return logits;
+        }
+
+        // Stage embeddings directly into batch_buf (memcpy, no dequant).
+        // Same row-major layout as `dequant_embedding_row` produces in
+        // the token path: frame `i` at byte offset `i * hs * 4`.
+        let batch_buf = &self.prefill_batch_buf;
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(batch_buf.contents() as *mut f32, hs * n);
+            dst.copy_from_slice(embeddings);
+        }
+
+        self.prefill_layers_and_logits(n, start_pos, state)
+    }
+
+    /// Per-layer dispatch + final-frame logits projection for a
+    /// pre-staged prefill batch. Shared by both
+    /// [`Self::forward_prefill_inner`] (token-id input, dequantizes
+    /// `embed_tokens` into `prefill_batch_buf`) and
+    /// [`Self::forward_prefill_inner_from_embeddings`] (raw embeddings
+    /// input, memcpy-staged). The two entry points differ only in how
+    /// they fill `prefill_batch_buf`; everything from the first
+    /// `add_rmsnorm_batch` onward lives here.
+    fn prefill_layers_and_logits(
+        &self,
+        n: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let batch_buf = &self.prefill_batch_buf;
         let cb = self.ctx.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         let is = cfg.intermediate_size;

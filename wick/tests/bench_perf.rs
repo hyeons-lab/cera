@@ -1176,3 +1176,107 @@ fn test_profile_longctx_1_6b_n128() {
 fn test_profile_longctx_1_6b_n4096() {
     profile_longctx_run("LFM2.5-VL-1.6B-Q4_0", 4096);
 }
+
+/// Embedding-prefill speedup. Measures wall-clock for two paths
+/// processing the same `n_frames`-frame embedding buffer:
+///   - **loop**: trait default — `forward_from_embedding` per frame.
+///   - **batched**: this PR's `forward_prefill_from_embeddings`
+///     override (memcpy stage + per-layer GEMM batch).
+///
+/// `n_frames = 128` was chosen to match the typical LFM2.5-Audio
+/// clip length (~5s ≈ 125 frames at the encoder's downsampled
+/// rate). Run on each model size we ship for. Prints
+/// `loop_ms`, `batched_ms`, and `loop / batched` ratio. Not a
+/// regression assert — the speedup itself is the documentation.
+fn bench_prefill_from_embeddings(model_path: &Path, n_frames: usize) -> (f64, f64) {
+    use wick::model::Model;
+    use wick::model::metal_lfm2::MetalLfm2Model;
+
+    let gguf_a = wick::gguf::GgufFile::open(model_path).unwrap();
+    let gguf_b = wick::gguf::GgufFile::open(model_path).unwrap();
+    let model_a = MetalLfm2Model::from_gguf(gguf_a, model_path, 8192).unwrap();
+    let model_b = MetalLfm2Model::from_gguf(gguf_b, model_path, 8192).unwrap();
+    let cfg = model_a.config();
+    let hidden_size = cfg.hidden_size;
+
+    // Synthetic embeddings — content is irrelevant, only shape matters
+    // for the timing measurement. Same buffer for both paths so any
+    // frame-content-dependent cost difference cancels.
+    let embeddings: Vec<f32> = (0..n_frames * hidden_size)
+        .map(|i| (((i * 31 + 7) % 257) as f32) * 0.001 - 0.1)
+        .collect();
+
+    // Warmup both models: get the Metal pipeline cache hot, KV
+    // allocations dirty, etc. so the first measured run isn't an
+    // outlier.
+    {
+        let mut state = wick::kv_cache::InferenceState::from_config(cfg);
+        for j in 0..n_frames.min(4) {
+            let frame = &embeddings[j * hidden_size..(j + 1) * hidden_size];
+            let _ = model_a.forward_from_embedding(frame, j, &mut state);
+        }
+    }
+    {
+        let mut state = wick::kv_cache::InferenceState::from_config(cfg);
+        let _ = model_b.forward_prefill_from_embeddings(&embeddings, n_frames, 0, &mut state);
+    }
+
+    // Best of 3 each — `min` is the cleanest signal under thermal
+    // noise + GPU scheduling jitter.
+    let mut best_loop_ms = f64::MAX;
+    for _ in 0..3 {
+        let mut state = wick::kv_cache::InferenceState::from_config(cfg);
+        let t0 = Instant::now();
+        for j in 0..n_frames {
+            let frame = &embeddings[j * hidden_size..(j + 1) * hidden_size];
+            let _ = model_a.forward_from_embedding(frame, j, &mut state);
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if ms < best_loop_ms {
+            best_loop_ms = ms;
+        }
+    }
+    let mut best_batched_ms = f64::MAX;
+    for _ in 0..3 {
+        let mut state = wick::kv_cache::InferenceState::from_config(cfg);
+        let t0 = Instant::now();
+        let _ = model_b.forward_prefill_from_embeddings(&embeddings, n_frames, 0, &mut state);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if ms < best_batched_ms {
+            best_batched_ms = ms;
+        }
+    }
+
+    let ratio = best_loop_ms / best_batched_ms;
+    eprintln!(
+        "  n={n_frames:>3}: loop={best_loop_ms:>7.1} ms  batched={best_batched_ms:>6.1} ms  ratio={ratio:>5.2}x"
+    );
+    (best_loop_ms, best_batched_ms)
+}
+
+#[test]
+#[ignore]
+fn test_metal_prefill_from_embeddings_speedup_450m() {
+    let Some(path) = find_model("LFM2.5-VL-450M-Q4_0") else {
+        return;
+    };
+    eprintln!("=== Metal forward_prefill_from_embeddings speedup (450M) ===");
+    let (_, batched) = bench_prefill_from_embeddings(&path, 128);
+    // Sanity floor: batched should be well under 1s for n=128 on a
+    // 450M model. Catches a future regression that re-introduces a
+    // per-frame GEMV path.
+    assert!(
+        batched < 1000.0,
+        "batched embedding prefill took {batched:.1} ms — expected sub-second"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_metal_prefill_from_embeddings_speedup_1_6b() {
+    let Some(path) = find_model("LFM2.5-VL-1.6B-Q4_0") else {
+        return;
+    };
+    eprintln!("=== Metal forward_prefill_from_embeddings speedup (1.6B) ===");
+    bench_prefill_from_embeddings(&path, 128);
+}
