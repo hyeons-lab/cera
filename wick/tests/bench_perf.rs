@@ -1206,6 +1206,20 @@ fn bench_prefill_from_embeddings(model_path: &Path, n_frames: usize) -> (f64, f6
         .map(|i| (((i * 31 + 7) % 257) as f32) * 0.001 - 0.1)
         .collect();
 
+    // Capture each model's empty (seq_len=0) state so we can restore
+    // before each timed run. `MetalLfm2Model::forward_from_embedding`
+    // ignores the `pos` argument and advances its own internal
+    // `seq_len` atomic; without an explicit reset, the loop path
+    // would start each timed run at an ever-increasing GPU
+    // `seq_len`, attending over more cells per frame and biasing
+    // the timing. (The batched path resets internally on
+    // `start_pos == 0` but we restore for symmetry.) Snapshot at
+    // seq_len=0 captures empty K/V layers (zero bytes) and a
+    // seq_len of 0 — restoring is a near-free reset of the
+    // internal counter.
+    let zero_state_a = model_a.snapshot_state();
+    let zero_state_b = model_b.snapshot_state();
+
     // Warmup both models: get the Metal pipeline cache hot, KV
     // allocations dirty, etc. so the first measured run isn't an
     // outlier.
@@ -1222,9 +1236,12 @@ fn bench_prefill_from_embeddings(model_path: &Path, n_frames: usize) -> (f64, f6
     }
 
     // Best of 3 each — `min` is the cleanest signal under thermal
-    // noise + GPU scheduling jitter.
+    // noise + GPU scheduling jitter. `restore_state` runs OUTSIDE
+    // the timed region so the reset cost doesn't bleed into the
+    // measurement.
     let mut best_loop_ms = f64::MAX;
     for _ in 0..3 {
+        model_a.restore_state(&zero_state_a);
         let mut state = wick::kv_cache::InferenceState::from_config(cfg);
         let t0 = Instant::now();
         for j in 0..n_frames {
@@ -1238,6 +1255,7 @@ fn bench_prefill_from_embeddings(model_path: &Path, n_frames: usize) -> (f64, f6
     }
     let mut best_batched_ms = f64::MAX;
     for _ in 0..3 {
+        model_b.restore_state(&zero_state_b);
         let mut state = wick::kv_cache::InferenceState::from_config(cfg);
         let t0 = Instant::now();
         let _ = model_b.forward_prefill_from_embeddings(&embeddings, n_frames, 0, &mut state);

@@ -625,7 +625,7 @@ fn forward_prefill_from_embeddings_matches_per_frame_loop() {
 
 /// Metal counterpart of
 /// [`forward_prefill_from_embeddings_matches_per_frame_loop`]. The
-/// Metal `Lfm2Model` override (this PR) and the trait-default
+/// Metal `MetalLfm2Model` override (this PR) and the trait-default
 /// per-frame `forward_from_embedding` loop must produce the same
 /// final-frame logits — modulo the f16-K-cache rounding that the
 /// production Metal forward path already absorbs in
