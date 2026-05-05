@@ -688,7 +688,13 @@ fn main() -> Result<()> {
                 } else {
                     let resampled = resample_linear(&pcm_in, sr_in, TARGET_SR);
                     eprintln!(
-                        "Resampled {sr_in} Hz → {TARGET_SR} Hz: {} → {} samples (linear)",
+                        "note: resampling {sr_in} Hz → {TARGET_SR} Hz \
+                         ({} → {} samples, linear interpolation). \
+                         For best quality and performance pass \
+                         16 kHz mono PCM16 directly — e.g. \
+                         `sox in.wav -r 16000 -c 1 -b 16 out.wav` \
+                         or `ffmpeg -i in.wav -ar 16000 -ac 1 -sample_fmt s16 out.wav` \
+                         — to skip this step.",
                         pcm_in.len(),
                         resampled.len()
                     );
