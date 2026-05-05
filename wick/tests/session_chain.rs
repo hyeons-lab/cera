@@ -1504,8 +1504,9 @@ fn asr_real_audio_matches_input_phrase() {
     // So the decoded output the assertion below sees is just
     // `"Today is a beautiful day."` without any trailing
     // `<|im_end|>` literal. 24 leaves headroom in case a future
-    // regression suppresses EOS — the substring assertion would
-    // then catch the start of a longer hallucinated tail.
+    // regression suppresses EOS — the strict-equality assertion
+    // would then fail with the longer hallucinated tail in the
+    // diff message.
     let opts = greedy_opts(24);
     let mut sink = CollectSink(Vec::new());
     session.generate(&opts, &mut sink).expect("generate");

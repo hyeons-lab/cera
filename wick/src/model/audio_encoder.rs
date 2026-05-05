@@ -787,24 +787,35 @@ pub fn conformer_conv_module_forward(
 
     // ── Step 4: SYMMETRIC depthwise conv1d. The LFM2A reference
     //    is a NON-causal encoder (offline ASR) — its conv module
-    //    pads `(kernel_size - 1) / 2` zeros on EACH side of the
-    //    input, not all on the left as a causal conv would. Wick
-    //    previously did all-left causal padding which produced a
-    //    backwards-shifted convolution that diverged sharply from
-    //    the reference (verified by per-tensor diff against
-    //    ggml's `ssm_conv` output: wick output[t=0, c=0..2] =
-    //    [-0.197, 0.003, 0.417] vs reference [3.077, 1.458, 1.064]).
-    //    The pad+roll+pad sequence in `tools/mtmd/models/conformer.cpp`
-    //    is what produces the symmetric layout in the reference.
-    //    Output length is preserved either way; only the alignment
-    //    of the kernel within the input window changes.
+    //    pads zeros on EACH side of the input, not all on the
+    //    left as a causal conv would. Wick previously did all-left
+    //    causal padding which produced a backwards-shifted
+    //    convolution that diverged sharply from the reference
+    //    (verified by per-tensor diff against ggml's `ssm_conv`
+    //    output: wick output[t=0, c=0..2] = [-0.197, 0.003, 0.417]
+    //    vs reference [3.077, 1.458, 1.064]). The `pad+roll+pad`
+    //    sequence in `tools/mtmd/models/conformer.cpp` is what
+    //    produces the symmetric layout in the reference.
+    //
+    //    Padding split: `pad_total = kernel_size - 1`. For odd
+    //    kernels (the LFM2A case, k=9 → pad_total=8 → 4+4),
+    //    `pad_left == pad_right`. For even kernels we follow the
+    //    standard "extra pad on the right" convention
+    //    (`pad_right = pad_total - pad_left`), matching ggml's
+    //    behavior. `pad_right` isn't read directly because the
+    //    `vec![0.0f32; t + pad_total]` allocation already zeroes
+    //    the trailing slots — declared explicitly here for
+    //    documentation and so the math is unambiguous.
     let pad_total = kernel_size - 1;
     let pad_left = pad_total / 2;
+    let _pad_right = pad_total - pad_left;
     let mut padded = vec![0.0f32; n_embd * (t + pad_total)];
     // Outer loop over channels gives sequential writes to `padded`
     // (per-channel slice is contiguous in memory). Inner loop over
     // ti has strided reads from `glu_time_major` but writes are
     // typically the more cache-sensitive direction (write-allocate).
+    // Zeros at indices [0..pad_left] (left pad) and [pad_left+t..]
+    // (right pad) come for free from the buffer's zero-init.
     for c in 0..n_embd {
         for ti in 0..t {
             padded[c * (t + pad_total) + pad_left + ti] = glu_time_major[ti * n_embd + c];
