@@ -95,14 +95,15 @@ enum Command {
         #[arg(long)]
         vocoder: Option<String>,
 
-        /// Path to a mono PCM16 WAV file to feed as audio input.
-        /// Any sample rate accepted — non-16 kHz inputs are
-        /// resampled with linear interpolation before encoding.
-        /// For studio-quality downsampling, pre-resample externally
-        /// (sox/ffmpeg) and pass a 16 kHz WAV to bypass that step.
-        /// Encoded via the bundle's mmproj (`AudioEncoderWeights`)
-        /// and prefilled into the LLM as soft tokens via
-        /// `Session::append_audio`.
+        /// Path to a PCM16 WAV file to feed as audio input. Any
+        /// sample rate accepted — non-16 kHz inputs are resampled
+        /// with linear interpolation before encoding. Multi-channel
+        /// inputs are down-mixed to mono by averaging across
+        /// channels. For studio-quality conversion, pre-resample
+        /// and down-mix externally (sox/ffmpeg) and pass 16 kHz
+        /// mono PCM16 to bypass both steps. Encoded via the
+        /// bundle's mmproj (`AudioEncoderWeights`) and prefilled
+        /// into the LLM as soft tokens via `Session::append_audio`.
         ///
         /// Combinations:
         /// - With `--prompt` alone: a leading text prefix (after BOS)
@@ -308,14 +309,18 @@ fn summarize(mut xs: Vec<f64>) -> (f64, f64, f64, f64, f64) {
     (p(0.1), p(0.5), p(0.9), mean, var.sqrt())
 }
 
-/// Read a WAV file and return (samples_f32_in_minus1_to_1,
-/// sample_rate). Strict: accepts only mono PCM16 (audio_format = 1,
-/// channels = 1, bits_per_sample = 16). Errors on anything else
-/// rather than silently down-mixing or converting — the caller
-/// (today: `--audio-in`) must produce a clean WAV.
+/// Read a PCM16 WAV file and return (samples_f32_in_minus1_to_1,
+/// sample_rate). Output is always mono: multi-channel inputs are
+/// down-mixed by averaging across channels per frame. Sample rate
+/// is returned untouched — resampling happens at the call site.
+///
+/// Constraints: `audio_format == 1` (PCM), `bits_per_sample == 16`,
+/// `channels >= 1`. Anything else errors with a typed message
+/// pointing at the offending field.
 ///
 /// Skips unknown subchunks (LIST, JUNK, etc.) between fmt and data
-/// per the RIFF spec.
+/// per the RIFF spec. Emits a `note:` line on stderr when down-mix
+/// happens so the user can see why the channel count dropped.
 fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
     use anyhow::{Context, anyhow, bail};
     use std::io::Read;
@@ -384,29 +389,57 @@ fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
             "WAV `{path}`: audio_format {audio_format} (expected 1=PCM). Re-encode as 16-bit PCM."
         );
     }
-    if channels != 1 {
-        bail!(
-            "WAV `{path}`: {channels} channels (expected 1=mono). Down-mix externally before passing in."
-        );
+    if channels < 1 {
+        bail!("WAV `{path}`: channels=0 in fmt header (must be >= 1)");
     }
     if bits != 16 {
         bail!("WAV `{path}`: {bits} bits/sample (expected 16). Re-encode as 16-bit PCM.");
     }
 
-    if data_sz % 2 != 0 {
-        bail!("WAV `{path}`: data chunk size {data_sz} is not a multiple of 2 (PCM16 frame size)");
+    // PCM16 frame = `channels` samples × 2 bytes.
+    let frame_bytes = 2usize * channels as usize;
+    if data_sz % frame_bytes != 0 {
+        bail!(
+            "WAV `{path}`: data chunk size {data_sz} is not a multiple of frame size \
+             {frame_bytes} ({channels} channels × 2 bytes)"
+        );
     }
-    let n_samples = data_sz / 2;
-    let mut samples = Vec::with_capacity(n_samples);
-    for i in 0..n_samples {
-        let lo = buf[data_off + i * 2];
-        let hi = buf[data_off + i * 2 + 1];
-        let s = i16::from_le_bytes([lo, hi]);
-        // Symmetric scale: i16::MIN -> -1.0, i16::MAX -> ~1.0. Using 32768
-        // (vs 32767) keeps zero exactly at zero and avoids the asymmetric
-        // off-by-one when round-tripping through `write_wav` (which clamps
-        // before scaling by 32767).
-        samples.push(s as f32 / 32768.0);
+    let n_frames = data_sz / frame_bytes;
+
+    // Symmetric scale: i16::MIN -> -1.0, i16::MAX -> ~1.0. Using 32768
+    // (vs 32767) keeps zero exactly at zero and avoids the asymmetric
+    // off-by-one when round-tripping through `write_wav` (which clamps
+    // before scaling by 32767).
+    let read_sample = |frame_idx: usize, ch: usize| -> f32 {
+        let o = data_off + (frame_idx * channels as usize + ch) * 2;
+        let s = i16::from_le_bytes([buf[o], buf[o + 1]]);
+        s as f32 / 32768.0
+    };
+
+    let mut samples = Vec::with_capacity(n_frames);
+    if channels == 1 {
+        for f in 0..n_frames {
+            samples.push(read_sample(f, 0));
+        }
+    } else {
+        // Down-mix by averaging across channels. Average (vs sum) keeps
+        // amplitudes inside [-1, 1] when each channel is in range; a
+        // sum could clip a stereo input where both channels are at full
+        // scale.
+        let inv = 1.0_f32 / channels as f32;
+        for f in 0..n_frames {
+            let mut acc = 0.0_f32;
+            for c in 0..channels as usize {
+                acc += read_sample(f, c);
+            }
+            samples.push(acc * inv);
+        }
+        eprintln!(
+            "note: down-mixing {channels}-channel WAV `{path}` to mono \
+             by averaging across channels. For best fidelity pass mono \
+             PCM16 directly — e.g. `sox in.wav -c 1 out.wav` or \
+             `ffmpeg -i in.wav -ac 1 out.wav` — to skip this step."
+        );
     }
     Ok((samples, sample_rate))
 }
@@ -1381,35 +1414,137 @@ mod tests {
         );
     }
 
-    /// Multi-channel WAV must be rejected with a typed error mentioning
-    /// the channel count.
+    /// Stereo WAV must be down-mixed to mono by averaging across
+    /// channels. Hand-craft a 4-frame stereo file with L=+0.5,
+    /// R=-0.5 and verify the mono output is all zeros (avg of
+    /// opposites = 0).
     #[test]
-    fn read_wav_rejects_stereo() {
-        // Hand-craft a minimal stereo WAV header (44 bytes + 0 data).
+    fn read_wav_downmixes_stereo_to_average() {
+        // Stereo PCM16 @ 16 kHz, 4 frames. L=+0.5 (16384), R=-0.5 (-16384).
+        let l: i16 = 16_384;
+        let r: i16 = -16_384;
+        let mut data: Vec<u8> = Vec::new();
+        for _ in 0..4 {
+            data.extend_from_slice(&l.to_le_bytes());
+            data.extend_from_slice(&r.to_le_bytes());
+        }
+        let data_sz = data.len() as u32;
+
         let mut buf: Vec<u8> = Vec::new();
         buf.extend_from_slice(b"RIFF");
-        buf.extend_from_slice(&36u32.to_le_bytes()); // file size - 8
+        buf.extend_from_slice(&(36 + data_sz).to_le_bytes());
         buf.extend_from_slice(b"WAVE");
         buf.extend_from_slice(b"fmt ");
-        buf.extend_from_slice(&16u32.to_le_bytes()); // fmt size
-        buf.extend_from_slice(&1u16.to_le_bytes()); // audio_format = PCM
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
         buf.extend_from_slice(&2u16.to_le_bytes()); // 2 channels
         buf.extend_from_slice(&16_000u32.to_le_bytes());
-        buf.extend_from_slice(&64_000u32.to_le_bytes()); // byte rate
-        buf.extend_from_slice(&4u16.to_le_bytes()); // block align
-        buf.extend_from_slice(&16u16.to_le_bytes()); // bits/sample
+        buf.extend_from_slice(&64_000u32.to_le_bytes());
+        buf.extend_from_slice(&4u16.to_le_bytes()); // block align (2ch * 2B)
+        buf.extend_from_slice(&16u16.to_le_bytes());
         buf.extend_from_slice(b"data");
-        buf.extend_from_slice(&0u32.to_le_bytes()); // empty data
+        buf.extend_from_slice(&data_sz.to_le_bytes());
+        buf.extend_from_slice(&data);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stereo.wav");
         std::fs::write(&path, &buf).unwrap();
 
+        let (samples, sr) = read_wav_pcm16_mono(path.to_str().unwrap()).unwrap();
+        assert_eq!(sr, 16_000);
+        assert_eq!(
+            samples.len(),
+            4,
+            "stereo down-mix should yield 4 mono frames"
+        );
+        for (i, &s) in samples.iter().enumerate() {
+            assert!(
+                s.abs() < 1e-3,
+                "frame {i}: avg of +0.5 and -0.5 should be ~0; got {s}"
+            );
+        }
+    }
+
+    /// 4-channel WAV must average all four channels per frame.
+    #[test]
+    fn read_wav_downmixes_quad_to_average() {
+        // 4-channel @ 16 kHz, 2 frames. Channels = +1.0, +0.5, -0.5, -1.0.
+        // Average per frame = 0.0.
+        let s1: i16 = 32_767; // ~+1.0
+        let s2: i16 = 16_384; // +0.5
+        let s3: i16 = -16_384; // -0.5
+        let s4: i16 = -32_768; // -1.0
+        let mut data: Vec<u8> = Vec::new();
+        for _ in 0..2 {
+            data.extend_from_slice(&s1.to_le_bytes());
+            data.extend_from_slice(&s2.to_le_bytes());
+            data.extend_from_slice(&s3.to_le_bytes());
+            data.extend_from_slice(&s4.to_le_bytes());
+        }
+        let data_sz = data.len() as u32;
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&(36 + data_sz).to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&4u16.to_le_bytes()); // 4 channels
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&128_000u32.to_le_bytes());
+        buf.extend_from_slice(&8u16.to_le_bytes()); // block align
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&data_sz.to_le_bytes());
+        buf.extend_from_slice(&data);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quad.wav");
+        std::fs::write(&path, &buf).unwrap();
+
+        let (samples, _sr) = read_wav_pcm16_mono(path.to_str().unwrap()).unwrap();
+        assert_eq!(samples.len(), 2);
+        // i16::MAX is 32767 vs i16::MIN = -32768 → asymmetric scale
+        // means the +1.0/-1.0 pair averages to ~-1/(4*32768) ≈ -7.6e-6,
+        // which combined with +0.5/-0.5 (exact 0) gives ~-1.9e-6.
+        // Use a generous epsilon since the meaningful claim is "averages
+        // to zero", not "byte-exact".
+        for (i, &s) in samples.iter().enumerate() {
+            assert!(
+                s.abs() < 1e-3,
+                "frame {i}: 4-channel avg should be ~0; got {s}"
+            );
+        }
+    }
+
+    /// channels=0 in the fmt header is malformed and must be rejected.
+    #[test]
+    fn read_wav_rejects_zero_channels() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&36u32.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        buf.extend_from_slice(&0u16.to_le_bytes()); // 0 channels (malformed)
+        buf.extend_from_slice(&16_000u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero_ch.wav");
+        std::fs::write(&path, &buf).unwrap();
+
         let err = read_wav_pcm16_mono(path.to_str().unwrap()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("2 channels") && msg.contains("mono"),
-            "error should mention channels=2 and mono requirement; got: {msg}"
+            msg.contains("channels=0"),
+            "error should mention channels=0; got: {msg}"
         );
     }
 
