@@ -1149,6 +1149,20 @@ fn main() -> Result<()> {
 
             let engine = load_engine(Path::new(&model), &device, context_size)?;
             let tokenizer = engine.tokenizer();
+
+            // Up-front chat-template probe: fail before the user types
+            // anything if the model has no template metadata. Without this,
+            // the first per-turn `apply_chat_template` would `?`-return
+            // through the entire CLI after the user already typed a
+            // message — confusing UX.
+            if tokenizer.chat_template().is_none() {
+                anyhow::bail!(
+                    "model has no chat template metadata; \
+                     `wick chat` requires a chat-tuned model. \
+                     Use `wick run --prompt <text>` for plain completion instead."
+                );
+            }
+
             let mut session = engine.new_session(wick::SessionConfig {
                 seed,
                 ..Default::default()
@@ -1162,18 +1176,22 @@ fn main() -> Result<()> {
                 });
             }
 
+            // The actual backend choice is reported by `load_engine` via
+            // its own "Using ... backend" line above; don't echo `device`
+            // here since under `--device auto` it'd misrepresent the
+            // resolved backend.
             eprintln!(
-                "wick chat ({} backend, ctx={context_size}, max_tokens/turn={max_tokens}). \
-                 Send EOF (Ctrl+D) or type `/exit` to quit.",
-                device
+                "wick chat (ctx={context_size}, max_tokens/turn={max_tokens}). \
+                 Send EOF (Ctrl+D) or type `/exit` to quit."
             );
             if !history.is_empty() {
                 eprintln!("(system prompt active)");
             }
 
             let stdin = std::io::stdin();
+            let cancel = session.cancel_handle();
             loop {
-                eprint!("\nuser> ");
+                eprint!("user> ");
                 std::io::stderr().flush().ok();
                 let mut line = String::new();
                 let n = stdin.lock().read_line(&mut line)?;
@@ -1181,8 +1199,11 @@ fn main() -> Result<()> {
                     eprintln!();
                     break; // EOF
                 }
-                let user = line.trim().to_string();
-                if user.is_empty() {
+                // Strip line terminators only; preserve any meaningful
+                // leading/trailing whitespace the user actually typed
+                // (e.g. indented code in a prompt).
+                let user = line.trim_end_matches(['\r', '\n']).to_string();
+                if user.trim().is_empty() {
                     continue;
                 }
                 if user == "/exit" || user == "/quit" {
@@ -1198,13 +1219,20 @@ fn main() -> Result<()> {
                 // the engine's prefix cache for fast turn-N+1 prefill.
                 // Delta-prefill is a future optimization; the simplicity
                 // of "render fresh, reset, prefill" is worth the lookup.
-                let formatted = wick::tokenizer::apply_chat_template(tokenizer, &history, true)?;
+                let formatted =
+                    match wick::tokenizer::apply_chat_template(tokenizer, &history, true) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("error: chat-template render failed: {e}");
+                            history.pop();
+                            continue;
+                        }
+                    };
                 let tokens = tokenizer.encode(&formatted);
 
                 session.reset();
                 if let Err(e) = session.append_tokens(&tokens) {
                     eprintln!("error: append_tokens failed: {e}");
-                    // Pop the user turn so a retry doesn't double-add it.
                     history.pop();
                     continue;
                 }
@@ -1219,16 +1247,29 @@ fn main() -> Result<()> {
                 std::io::stderr().flush().ok();
 
                 let mut sink = ChatSink::new(tokenizer, session.cancel_handle());
-                if let Err(e) = session.generate(&opts, &mut sink) {
-                    eprintln!("\nerror: generate failed: {e}");
-                    history.pop();
-                    continue;
-                }
+                let summary = match session.generate(&opts, &mut sink) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("\nerror: generate failed: {e}");
+                        history.pop();
+                        continue;
+                    }
+                };
                 eprintln!();
                 history.push(wick::tokenizer::ChatMessage {
                     role: "assistant".into(),
                     content: sink.into_text(),
                 });
+
+                // Stop the REPL if the sink flipped cancel because stdout
+                // is gone (BrokenPipe — the user piped us into `head` or
+                // similar). Without this we'd keep prompting + decoding
+                // even though nothing reaches the terminal anymore.
+                if matches!(summary.finish_reason, wick::FinishReason::Cancelled)
+                    && cancel.load(Ordering::Relaxed)
+                {
+                    break;
+                }
             }
         }
         Command::Bench {
