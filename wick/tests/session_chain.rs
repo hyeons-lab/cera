@@ -1254,3 +1254,188 @@ fn engine_does_not_load_encoder_for_text_bundle() {
         "text-path engine must not eagerly load any audio encoder"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Real-audio ASR end-to-end (PR 4j).
+//
+// Existing audio-in tests above feed synthetic noise — they prove the
+// pipeline doesn't NaN/panic, but say nothing about whether the model
+// actually transcribes. The fixture in `tests/fixtures/audio/` is real
+// macOS-`say` TTS output (16 kHz mono PCM16); the test below feeds it
+// through the full chat-template + ASR flow and asserts the model's
+// transcription contains a known anchor word from the source phrase.
+//
+// macOS `say` rather than wick's own TTS so a regression in the LLM
+// (e.g. the magnitude divergence tracked in
+// `~/.claude/.../project_llm_magnitude_bug.md`) doesn't shift both
+// directions of a self-loop test in lockstep — see
+// `wick/tests/fixtures/audio/README.md` for the rationale.
+// ---------------------------------------------------------------------------
+
+/// Read a 16 kHz mono PCM16 WAV file into f32 samples in [-1, 1].
+/// Mirrors `wick-cli/src/main.rs::read_wav_pcm16_mono` — duplicated
+/// here so the test doesn't depend on the CLI binary. Errors out on
+/// any format other than the canonical wick audio-input shape.
+fn read_wav_pcm16_mono_test(path: &std::path::Path) -> (Vec<f32>, u32) {
+    let buf = std::fs::read(path).expect("read fixture WAV");
+    assert!(buf.len() >= 12, "WAV too short");
+    assert_eq!(&buf[0..4], b"RIFF", "missing RIFF header");
+    assert_eq!(&buf[8..12], b"WAVE", "missing WAVE header");
+
+    let read_u16 = |o: usize| u16::from_le_bytes(buf[o..o + 2].try_into().unwrap());
+    let read_u32 = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+
+    // Walk subchunks from offset 12 to find `fmt ` and `data`.
+    let mut o = 12usize;
+    let mut fmt_off: Option<usize> = None;
+    let mut data: Option<(usize, usize)> = None;
+    while o + 8 <= buf.len() {
+        let id = &buf[o..o + 4];
+        let sz = read_u32(o + 4) as usize;
+        let body = o + 8;
+        if id == b"fmt " {
+            fmt_off = Some(body);
+        } else if id == b"data" {
+            data = Some((body, sz));
+        }
+        o = body + sz + (sz & 1);
+    }
+    let fmt = fmt_off.expect("no fmt chunk");
+    let (data_off, data_sz) = data.expect("no data chunk");
+
+    assert_eq!(read_u16(fmt), 1, "expected PCM (audio_format=1)");
+    assert_eq!(read_u16(fmt + 2), 1, "expected mono");
+    let sample_rate = read_u32(fmt + 4);
+    assert_eq!(read_u16(fmt + 14), 16, "expected 16-bit");
+
+    let n_samples = data_sz / 2;
+    let mut samples = Vec::with_capacity(n_samples);
+    for i in 0..n_samples {
+        let s = i16::from_le_bytes([buf[data_off + i * 2], buf[data_off + i * 2 + 1]]);
+        samples.push(s as f32 / 32768.0);
+    }
+    (samples, sample_rate)
+}
+
+/// End-to-end ASR on real TTS audio. Loads
+/// `tests/fixtures/audio/today_is_a_beautiful_day.wav` (~1.6 s of
+/// macOS `say` output) through the full chat-template + audio-input
+/// flow, runs greedy decode at temperature 0, and asserts the
+/// transcription contains the case-insensitive substring
+/// `"today is a beautiful day"` — verified locally that
+/// LFM2.5-Audio-1.5B-Q4_0 transcribes the FIRST 5 tokens of this
+/// audio word-for-word with system prompt `"Perform ASR."`.
+///
+/// Why a substring rather than strict equality: Q4_0 doesn't
+/// reliably emit `<|im_end|>` after the transcription, so longer
+/// `max_tokens` runs append hallucinated continuation (typically
+/// "...to be the beautiful day to be"). The substring assertion
+/// absorbs that tail while still catching gross failures — missing
+/// words, NaN propagation, audio-encoder regressions, or a marker-
+/// split bug picking the wrong insertion point — any of which
+/// would either drop the anchor phrase or panic downstream.
+#[test]
+#[ignore]
+fn asr_real_audio_contains_anchor_word() {
+    use wick::model::audio_encoder::AudioEncoderWeights;
+    use wick::tokenizer::{ChatMessage, apply_chat_template};
+
+    let Ok(home) = std::env::var("HOME") else {
+        eprintln!("no HOME env — skipping");
+        return;
+    };
+    let bundle = std::path::PathBuf::from(&home).join(".leap/models/LFM2.5-Audio-1.5B-Q4_0");
+    let primary = bundle.join("LFM2.5-Audio-1.5B-Q4_0.gguf");
+    let mmproj_path = bundle.join("mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf");
+    if !primary.exists() || !mmproj_path.exists() {
+        eprintln!("LFM2.5-Audio bundle not present — skipping");
+        return;
+    }
+
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/audio/today_is_a_beautiful_day.wav");
+    let (pcm, sr) = read_wav_pcm16_mono_test(&fixture);
+    assert_eq!(sr, 16_000, "fixture must be 16 kHz");
+
+    let primary_gguf = wick::gguf::GgufFile::open(&primary).unwrap();
+    let tokenizer = wick::tokenizer::BpeTokenizer::from_gguf(&primary_gguf).unwrap();
+    let model = wick::model::load_model(primary_gguf, 4096).unwrap();
+    let model: Arc<dyn Model> = Arc::from(model);
+    let tokenizer_arc = Arc::new(tokenizer);
+    let mut session = Session::new(
+        Arc::clone(&model),
+        Arc::clone(&tokenizer_arc),
+        ModalityCapabilities {
+            text_in: true,
+            text_out: true,
+            audio_in: true,
+            audio_out: false,
+            image_in: false,
+        },
+        SessionConfig::default(),
+    );
+
+    let mmproj = wick::gguf::GgufFile::open(&mmproj_path).unwrap();
+    let encoder = Arc::new(AudioEncoderWeights::from_gguf(&mmproj).unwrap());
+    session.attach_audio_encoder(encoder);
+
+    // Chat-template flow (mirrors `wick-cli/src/main.rs`'s
+    // `--audio-in` + `--system` path). Pick a vocab-resident special
+    // token as the audio insertion marker, render the template with
+    // that marker as user content, encode, find the marker's single
+    // position, then feed prefix → audio → suffix so the audio sits
+    // inside the user turn before `<|im_end|>`.
+    let marker_candidates = [
+        "<|reserved_4|>",
+        "<|reserved_5|>",
+        "<|reserved_6|>",
+        "<|reserved_7|>",
+    ];
+    let (marker_id, marker_name) = marker_candidates
+        .iter()
+        .find_map(|name| tokenizer_arc.special_token_id(name).map(|id| (id, *name)))
+        .expect("no marker token in vocab");
+
+    let messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: "Perform ASR.".into(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: marker_name.to_string(),
+        },
+    ];
+    let formatted = apply_chat_template(&tokenizer_arc, &messages, true).unwrap();
+    let toks = tokenizer_arc.encode(&formatted);
+    let split = toks
+        .iter()
+        .position(|&t| t == marker_id)
+        .expect("marker not in encoded chat-template tokens");
+    let (prefix, suffix) = (&toks[..split], &toks[split + 1..]);
+
+    if !prefix.is_empty() {
+        session.append_tokens(prefix).expect("append prefix");
+    }
+    session.append_audio(&pcm, sr).expect("append_audio");
+    if !suffix.is_empty() {
+        session.append_tokens(suffix).expect("append suffix");
+    }
+
+    // Greedy decode. 24 tokens is enough for the model to emit the
+    // anchor word — locally observed at ~7–8 tokens before EOS on
+    // this fixture, but allow headroom for tokenizer drift.
+    let opts = greedy_opts(24);
+    let mut sink = CollectSink(Vec::new());
+    session.generate(&opts, &mut sink).expect("generate");
+
+    let decoded = tokenizer_arc.decode(&sink.0);
+    eprintln!("ASR transcription: {decoded:?}");
+
+    let lower = decoded.to_lowercase();
+    const ANCHOR: &str = "today is a beautiful day";
+    assert!(
+        lower.contains(ANCHOR),
+        "expected anchor phrase '{ANCHOR}' in transcription, got: {decoded:?}"
+    );
+}
