@@ -22,14 +22,14 @@
 #   output.
 #
 # Why this specific phrase:
-# - Verified locally that LFM2.5-Audio-1.5B-Q4_0 transcribes the
-#   FIRST 5 tokens of this audio EXACTLY ("Today is a beautiful day")
-#   at greedy temp 0 with system="Perform ASR.". Q4_0 doesn't
-#   reliably emit `<|im_end|>` after the transcription, so longer
-#   max_tokens runs include hallucinated continuation — the test
-#   asserts a case-insensitive substring match on the input phrase
-#   (which is robust to that tail-degeneration but catches gross
-#   transcription failures).
+# - Verified locally that LFM2.5-Audio-1.5B-Q4_0 transcribes this
+#   audio as `"Today is a beautiful day."` (with trailing period)
+#   then emits `<|im_end|>`, byte-identical to llama.cpp's
+#   `llama-mtmd-cli` reference output. The `asr_real_audio_matches_input_phrase`
+#   integration test asserts strict equality (case-insensitive,
+#   whitespace-trimmed) against that reference string — so a
+#   regression in the audio encoder, LLM forward, or chat-template
+#   marker split surfaces immediately as a non-matching transcription.
 
 set -euo pipefail
 

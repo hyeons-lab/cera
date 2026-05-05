@@ -1106,11 +1106,14 @@ impl Lfm2Model {
         // to print the last token's RMS at each layer entry, after
         // attn/conv (post 1st residual), and after FFN (post 2nd
         // residual). Used to find the layer where wick's hidden
-        // states diverge from llama.cpp's reference — the
-        // long-standing magnitude-drift bug. Off in production: a
-        // missing-env-var check is one syscall per call, gated above
-        // every loop body to keep the hot path cold.
-        let debug_hidden = std::env::var("WICK_DEBUG_HIDDEN").is_ok();
+        // states diverge from llama.cpp's reference. Off in
+        // production: a missing-env-var check is one syscall per
+        // call, gated above every loop body to keep the hot path
+        // cold. Any non-`"1"` value (including unset, empty, or
+        // `"0"`) leaves diagnostics off — this matches the
+        // documented `=1` setter and avoids a stray
+        // `WICK_DEBUG_HIDDEN=0` accidentally enabling logging.
+        let debug_hidden = std::env::var("WICK_DEBUG_HIDDEN").as_deref() == Ok("1");
         let log_rms = |label: &str, hidden: &[f32]| {
             if !debug_hidden {
                 return;

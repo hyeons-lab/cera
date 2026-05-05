@@ -1307,6 +1307,10 @@ fn read_wav_pcm16_mono_test(path: &std::path::Path) -> (Vec<f32>, u32) {
     };
 
     // Walk subchunks from offset 12 to find `fmt ` and `data`.
+    // Both chunk size and chunk-end-vs-EOF are validated DURING the
+    // walk so a malformed `sz` (overflow, points past EOF, or `fmt`
+    // with `sz < 16`) fails with a clear message before the field
+    // reads downstream see out-of-bounds offsets.
     let mut o = 12usize;
     let mut fmt_off: Option<usize> = None;
     let mut data: Option<(usize, usize)> = None;
@@ -1314,17 +1318,26 @@ fn read_wav_pcm16_mono_test(path: &std::path::Path) -> (Vec<f32>, u32) {
         let id = &buf[o..o + 4];
         let sz = read_u32(o + 4) as usize;
         let body = o + 8;
+        let chunk_end = body.checked_add(sz).expect("WAV chunk size overflow");
+        assert!(
+            chunk_end <= buf.len(),
+            "WAV chunk `{}` size {sz} exceeds file (body+sz={chunk_end} > len={})",
+            std::str::from_utf8(id).unwrap_or("?"),
+            buf.len()
+        );
         if id == b"fmt " {
+            // PCM `fmt ` chunks declare audio_format/channels/
+            // sample_rate/byte_rate/block_align/bits — 16 bytes
+            // minimum. A shorter declared `sz` would let `read_u16(
+            // fmt + 14)` below read past the chunk into adjacent
+            // bytes; assert here so the failure points at the
+            // truncated chunk, not the wrong field.
+            assert!(
+                sz >= 16,
+                "WAV `fmt ` chunk size {sz} < 16 (PCM minimum); file may be malformed"
+            );
             fmt_off = Some(body);
         } else if id == b"data" {
-            // Catch a `data_sz` that points past EOF before we
-            // index into it down below.
-            let data_end = body.checked_add(sz).expect("WAV data chunk size overflow");
-            assert!(
-                data_end <= buf.len(),
-                "WAV data chunk size {sz} exceeds file (body+sz={data_end} > len={})",
-                buf.len()
-            );
             data = Some((body, sz));
         }
         // Subchunks are word-aligned: pad odd sizes by 1.
@@ -1335,16 +1348,6 @@ fn read_wav_pcm16_mono_test(path: &std::path::Path) -> (Vec<f32>, u32) {
     }
     let fmt = fmt_off.expect("no fmt chunk");
     let (data_off, data_sz) = data.expect("no data chunk");
-
-    // `fmt` chunk needs at least 16 bytes (PCM format spec): the
-    // fields we read are at offsets 0, 2, 4, 14 — read_u16(fmt + 14)
-    // requires fmt + 16 <= buf.len(). Catch a truncated fmt chunk
-    // before it panics in read_u16.
-    assert!(
-        fmt.checked_add(16).is_some_and(|end| end <= buf.len()),
-        "WAV `fmt ` chunk truncated: needs 16 bytes from offset {fmt}, file is {} bytes",
-        buf.len()
-    );
     assert_eq!(read_u16(fmt), 1, "expected PCM (audio_format=1)");
     assert_eq!(read_u16(fmt + 2), 1, "expected mono");
     let sample_rate = read_u32(fmt + 4);
@@ -1493,12 +1496,16 @@ fn asr_real_audio_matches_input_phrase() {
         session.append_tokens(suffix).expect("append suffix");
     }
 
-    // max_tokens=24 covers llama.cpp's expected 7-token output
-    // ("Today is a beautiful day." + `<|im_end|>`) with margin.
-    // The model emits EOS at token 7 and `generate` stops cleanly;
-    // 24 is a safety bound in case of a future regression that
-    // suppresses EOS, and gives the assertion below a clear
-    // truncation point if that ever happens.
+    // max_tokens=24 is a safety bound. The model emits 6 visible
+    // tokens (`"Today is a beautiful day."` — the period is its
+    // own token) and then `<|im_end|>` at step 7, at which point
+    // `Session::generate` stops with `FinishReason::Stop` BEFORE
+    // emitting the EOS token to the sink (see `session.rs:920`).
+    // So the decoded output the assertion below sees is just
+    // `"Today is a beautiful day."` without any trailing
+    // `<|im_end|>` literal. 24 leaves headroom in case a future
+    // regression suppresses EOS — the substring assertion would
+    // then catch the start of a longer hallucinated tail.
     let opts = greedy_opts(24);
     let mut sink = CollectSink(Vec::new());
     session.generate(&opts, &mut sink).expect("generate");
