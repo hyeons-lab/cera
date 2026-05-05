@@ -923,16 +923,17 @@ fn main() -> Result<()> {
                 });
             } else {
                 // Derive `<root>/kv` consistently. Explicit `--cache-dir foo`
-                // yields `foo/kv`; default yields `$HOME/.cache/wick/kv`.
+                // yields `foo/kv`; default yields `$HOME/.cache/wick/kv` via
+                // the shared `default_cache_dir()` helper. KV stays disabled
+                // when `$HOME` is unset (TMPDIR fallback is bundle-only).
                 // Keeps KV files and bundle downloads (under
-                // `<root>/huggingface.co/...`) in distinct subtrees of the
-                // shared root.
-                let dir: Option<std::path::PathBuf> = if let Some(d) = cache_dir {
-                    Some(std::path::PathBuf::from(d).join("kv"))
+                // `<root>/huggingface.co/...`) in distinct subtrees.
+                let dir: Option<PathBuf> = if let Some(d) = cache_dir {
+                    Some(PathBuf::from(d).join("kv"))
+                } else if std::env::var_os("HOME").is_some() {
+                    Some(default_cache_dir().join("kv"))
                 } else {
-                    std::env::var("HOME")
-                        .ok()
-                        .map(|h| std::path::PathBuf::from(h).join(".cache/wick/kv"))
+                    None
                 };
                 engine.configure_cache(wick::kv_cache::KvCacheConfig {
                     cache_dir: dir,
