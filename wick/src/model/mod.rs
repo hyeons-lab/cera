@@ -53,16 +53,22 @@ pub struct ModelConfig {
 /// Kotlin/Swift wrappers move the `Arc` between threads and require
 /// both bounds).
 ///
-/// **GPU backends are NOT safe across concurrent `Session`s** even
-/// though the type bounds permit it: `MetalLfm2Model` / `GpuLfm2Model`
-/// keep per-forward scratch buffers + GPU-resident KV caches in their
-/// own state. Two threads cloning the same `Arc<dyn Model>` and
-/// running `forward()` concurrently would trample those buffers. The
-/// plan's multi-session invariant (one GPU model instance per concurrent
-/// Session) is enforced at the caller; this bound only covers the
-/// *trait-object shape*, not the GPU-state sharing contract. CPU
-/// `Lfm2Model` has no such shared state and is safely shareable across
-/// concurrent Sessions.
+/// **GPU backends keep per-instance scratch buffers + GPU-resident
+/// KV caches in their own state.** `MetalLfm2Model` self-defends with
+/// an internal `Mutex<()>` (`infer_lock`) that serializes every Model
+/// trait call: two threads cloning the same `Arc<dyn Model>` and
+/// running `forward()` / `forward_prefill()` concurrently are safe —
+/// the second call blocks until the first releases. The lock is
+/// uncontended in the single-Session-per-Model case, costing ~50 ns
+/// per call (negligible vs Metal dispatch). For genuine throughput
+/// across concurrent Sessions, prefer one `MetalLfm2Model` per
+/// Session: their KV caches and scratch are still shared and the
+/// lock just turns a races-to-corruption into a serial bottleneck.
+///
+/// `GpuLfm2Model` (wgpu) has the same shared-state shape; it has not
+/// yet been audited for the lock. CPU `Lfm2Model` has no such shared
+/// state and is safely shareable across concurrent Sessions without
+/// any lock.
 pub trait Model: Send + Sync {
     /// Run a forward pass for a single token and return logits over the vocabulary.
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32>;
