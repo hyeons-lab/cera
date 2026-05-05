@@ -199,6 +199,20 @@ pub struct MetalLfm2Model {
     profile_timer: Option<CategoryTimer>,
     gpu_timer: Option<GpuTimer>,
     pub prefix_cache: Mutex<crate::kv_cache::KvPrefixCache>,
+    /// Serializes Model trait calls on this instance. Without it,
+    /// two `Session`s sharing this `Arc<dyn Model>` and running
+    /// `forward()` / `forward_prefill()` concurrently would race on
+    /// the per-instance scratch buffers (`prefill_batch_buf`,
+    /// `q_buf`, `k_buf`, `attn_out_buf`, etc.) and on the GPU KV
+    /// caches in `MetalState`. The `Model` trait doc historically
+    /// pushed the "one model per concurrent Session" invariant onto
+    /// callers; this lock makes the Metal backend self-defending so
+    /// a contract violation serializes cleanly instead of corrupting
+    /// state. Lock cost is ~50ns uncontended (negligible vs Metal
+    /// dispatch ~ms+), and the GPU command queue already serializes
+    /// work — this just synchronizes the CPU-side bookkeeping that
+    /// stages and awaits each command buffer.
+    infer_lock: Mutex<()>,
     /// Cached env var values: read once at init to avoid per-dispatch syscalls.
     force_flash: bool,
     attn_mode: String,
@@ -513,6 +527,7 @@ impl MetalLfm2Model {
             },
             gpu_timer,
             prefix_cache,
+            infer_lock: Mutex::new(()),
             force_flash: std::env::var("WICK_FLASH").as_deref() == Ok("1"),
             attn_mode: std::env::var("WICK_ATTN").unwrap_or_default(),
             skip_attn: std::env::var("WICK_PROFILE").as_deref() == Ok("noattn"),
@@ -1955,6 +1970,7 @@ impl MetalLfm2Model {
 
 impl Model for MetalLfm2Model {
     fn forward(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         assert_eq!(tokens.len(), 1, "Metal forward expects single token");
         let token_id = tokens[0] as usize;
         let cfg = &self.config;
@@ -2028,11 +2044,16 @@ impl Model for MetalLfm2Model {
 
     fn forward_greedy(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> u32 {
         // Profile paths still go through forward() + CPU argmax (diagnostic).
+        // Don't take `infer_lock` on this branch — `self.forward()`
+        // takes it itself. Acquiring here would deadlock on the
+        // recursive lock attempt (`std::sync::Mutex` is not
+        // reentrant).
         if self.profile_timer.is_some() || self.gpu_timer.is_some() {
             let logits = self.forward(tokens, _pos, state);
             return crate::sampler::cpu_argmax(&logits);
         }
 
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         assert_eq!(tokens.len(), 1, "Metal forward expects single token");
         let token_id = tokens[0] as usize;
         let cfg = &self.config;
@@ -2080,6 +2101,7 @@ impl Model for MetalLfm2Model {
         _pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         assert_eq!(tokens.len(), 1);
         let token_id = tokens[0] as usize;
         let cfg = &self.config;
@@ -2127,6 +2149,7 @@ impl Model for MetalLfm2Model {
         _pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         assert_eq!(embedding.len(), hs);
@@ -2163,6 +2186,7 @@ impl Model for MetalLfm2Model {
         _pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         assert_eq!(embedding.len(), hs);
@@ -2208,6 +2232,120 @@ impl Model for MetalLfm2Model {
     }
 
     fn snapshot_state(&self) -> crate::kv_cache::StateSnapshot {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        self.snapshot_state_locked()
+    }
+
+    fn restore_state(&self, snapshot: &crate::kv_cache::StateSnapshot) {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        self.restore_state_locked(snapshot);
+    }
+
+    fn forward_prefill(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        // Fresh prefill (start_pos == 0) → reset GPU-resident state so the model
+        // doesn't carry KV history from a previous generation. The CPU-side
+        // InferenceState is already fresh when callers invoke generate() again,
+        // but the Metal model holds its own seq_len counter and GPU KV buffers.
+        if start_pos == 0 {
+            self.state.seq_len.store(0, Ordering::Relaxed);
+
+            // Cache lookup: only for fresh prefills.
+            let hit = self
+                .prefix_cache
+                .lock()
+                .expect("prefix_cache mutex poisoned")
+                .find_longest_prefix(tokens);
+            if let Some((snapshot, prefix_len)) = hit {
+                // Always keep at least 1 token for forward_prefill_inner to produce logits.
+                let use_len = prefix_len.min(tokens.len().saturating_sub(1));
+                if use_len > 0 {
+                    self.restore_state_locked(&snapshot);
+                    state.seq_len = use_len;
+
+                    let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
+                    self.prefix_cache
+                        .lock()
+                        .expect("prefix_cache mutex poisoned")
+                        .insert(tokens, self.snapshot_state_locked());
+                    return logits;
+                }
+            }
+        }
+
+        let logits = self.forward_prefill_inner(tokens, start_pos, state);
+        if start_pos == 0 {
+            self.prefix_cache
+                .lock()
+                .expect("prefix_cache mutex poisoned")
+                .insert(tokens, self.snapshot_state_locked());
+        }
+        logits
+    }
+
+    /// Batched embedding-prefill: skip the `embed_tokens` lookup
+    /// and feed the caller's pre-computed hidden-dim frames straight
+    /// into the per-layer pipeline. Used by audio + any other
+    /// embedding-input modality. The trait default (parent `Model`)
+    /// loops `forward_from_embedding` per frame and pays full per-
+    /// token GEMV setup × n_frames; this override mirrors the CPU
+    /// `Lfm2Model::forward_prefill_from_embeddings` (PR #104) so
+    /// Metal audio prefill can amortize per-layer GEMM dispatch the
+    /// same way text prefill already does.
+    ///
+    /// No prefix-cache lookup: embedding inputs have no token-id key
+    /// to match against (the cache is keyed by the LLM token stream),
+    /// and the audio encoder's output is non-deterministic across
+    /// runs anyway. A future cache layer keyed on encoder-input hash
+    /// could be plumbed in, but it'd live above this method, not
+    /// inside it.
+    fn forward_prefill_from_embeddings(
+        &self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        assert!(
+            n_tokens > 0,
+            "forward_prefill_from_embeddings requires at least one frame"
+        );
+        let hidden_size = self.config.hidden_size;
+        assert_eq!(
+            embeddings.len(),
+            n_tokens * hidden_size,
+            "embeddings.len() ({}) != n_tokens ({}) * hidden_size ({})",
+            embeddings.len(),
+            n_tokens,
+            hidden_size
+        );
+
+        // Fresh prefill semantics match the token entry: clear the
+        // GPU-resident seq_len counter so we're not appending after
+        // KV from a previous generate(). InferenceState is the
+        // caller's responsibility on the embedding path (no prefix-
+        // cache restore).
+        if start_pos == 0 {
+            self.state.seq_len.store(0, Ordering::Relaxed);
+        }
+
+        self.forward_prefill_inner_from_embeddings(embeddings, n_tokens, start_pos, state)
+    }
+}
+
+impl MetalLfm2Model {
+    /// Lock-free body of `Model::snapshot_state`. Callers that
+    /// already hold `infer_lock` (e.g. `forward_prefill`'s prefix-
+    /// cache write step) call this directly to avoid a recursive
+    /// `Mutex::lock()` deadlock — `std::sync::Mutex` is not
+    /// reentrant.
+    fn snapshot_state_locked(&self) -> crate::kv_cache::StateSnapshot {
         use crate::kv_cache::{LayerSnapshot, StateSnapshot};
         let seq_len = self.state.seq_len.load(Ordering::Relaxed);
         let cfg = &self.config;
@@ -2239,7 +2377,9 @@ impl Model for MetalLfm2Model {
         StateSnapshot { layers, seq_len }
     }
 
-    fn restore_state(&self, snapshot: &crate::kv_cache::StateSnapshot) {
+    /// Lock-free body of `Model::restore_state`. See
+    /// [`Self::snapshot_state_locked`] for the locking contract.
+    fn restore_state_locked(&self, snapshot: &crate::kv_cache::StateSnapshot) {
         use crate::kv_cache::LayerSnapshot;
         let _cfg = &self.config;
         for (i, layer_snap) in snapshot.layers.iter().enumerate() {
@@ -2276,103 +2416,6 @@ impl Model for MetalLfm2Model {
             .store(snapshot.seq_len, Ordering::Relaxed);
     }
 
-    fn forward_prefill(
-        &self,
-        tokens: &[u32],
-        start_pos: usize,
-        state: &mut InferenceState,
-    ) -> Vec<f32> {
-        // Fresh prefill (start_pos == 0) → reset GPU-resident state so the model
-        // doesn't carry KV history from a previous generation. The CPU-side
-        // InferenceState is already fresh when callers invoke generate() again,
-        // but the Metal model holds its own seq_len counter and GPU KV buffers.
-        if start_pos == 0 {
-            self.state.seq_len.store(0, Ordering::Relaxed);
-
-            // Cache lookup: only for fresh prefills.
-            let hit = self
-                .prefix_cache
-                .lock()
-                .expect("prefix_cache mutex poisoned")
-                .find_longest_prefix(tokens);
-            if let Some((snapshot, prefix_len)) = hit {
-                // Always keep at least 1 token for forward_prefill_inner to produce logits.
-                let use_len = prefix_len.min(tokens.len().saturating_sub(1));
-                if use_len > 0 {
-                    self.restore_state(&snapshot);
-                    state.seq_len = use_len;
-
-                    let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
-                    self.prefix_cache
-                        .lock()
-                        .expect("prefix_cache mutex poisoned")
-                        .insert(tokens, self.snapshot_state());
-                    return logits;
-                }
-            }
-        }
-
-        let logits = self.forward_prefill_inner(tokens, start_pos, state);
-        if start_pos == 0 {
-            self.prefix_cache
-                .lock()
-                .expect("prefix_cache mutex poisoned")
-                .insert(tokens, self.snapshot_state());
-        }
-        logits
-    }
-
-    /// Batched embedding-prefill: skip the `embed_tokens` lookup
-    /// and feed the caller's pre-computed hidden-dim frames straight
-    /// into the per-layer pipeline. Used by audio + any other
-    /// embedding-input modality. The trait default (parent `Model`)
-    /// loops `forward_from_embedding` per frame and pays full per-
-    /// token GEMV setup × n_frames; this override mirrors the CPU
-    /// `Lfm2Model::forward_prefill_from_embeddings` (PR #104) so
-    /// Metal audio prefill can amortize per-layer GEMM dispatch the
-    /// same way text prefill already does.
-    ///
-    /// No prefix-cache lookup: embedding inputs have no token-id key
-    /// to match against (the cache is keyed by the LLM token stream),
-    /// and the audio encoder's output is non-deterministic across
-    /// runs anyway. A future cache layer keyed on encoder-input hash
-    /// could be plumbed in, but it'd live above this method, not
-    /// inside it.
-    fn forward_prefill_from_embeddings(
-        &self,
-        embeddings: &[f32],
-        n_tokens: usize,
-        start_pos: usize,
-        state: &mut InferenceState,
-    ) -> Vec<f32> {
-        assert!(
-            n_tokens > 0,
-            "forward_prefill_from_embeddings requires at least one frame"
-        );
-        let hidden_size = self.config.hidden_size;
-        assert_eq!(
-            embeddings.len(),
-            n_tokens * hidden_size,
-            "embeddings.len() ({}) != n_tokens ({}) * hidden_size ({})",
-            embeddings.len(),
-            n_tokens,
-            hidden_size
-        );
-
-        // Fresh prefill semantics match the token entry: clear the
-        // GPU-resident seq_len counter so we're not appending after
-        // KV from a previous generate(). InferenceState is the
-        // caller's responsibility on the embedding path (no prefix-
-        // cache restore).
-        if start_pos == 0 {
-            self.state.seq_len.store(0, Ordering::Relaxed);
-        }
-
-        self.forward_prefill_inner_from_embeddings(embeddings, n_tokens, start_pos, state)
-    }
-}
-
-impl MetalLfm2Model {
     fn forward_prefill_inner(
         &self,
         tokens: &[u32],
@@ -2975,6 +3018,7 @@ impl MetalLfm2Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<(String, f64)> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         // Upfront bounds check so failures are atomic — otherwise a call
         // exceeding the context window could partially advance seq_len /
         // KV / conv buffers across successful chunks and then panic on a
