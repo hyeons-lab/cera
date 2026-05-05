@@ -1928,7 +1928,10 @@ impl Lfm2Model {
             } else {
                 "attn"
             };
-            log_rms(&format!("layer {layer} ({block_kind}) block-out"), &block_out);
+            log_rms(
+                &format!("layer {layer} ({block_kind}) block-out"),
+                &block_out,
+            );
 
             // Residual: hidden += block_out
             for i in 0..hs * n {
