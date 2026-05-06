@@ -383,6 +383,25 @@ impl InferenceState {
     /// (TurboQuant) cache? Used by `Session::append_tokens` to decide
     /// whether `n_keep` shift is supported for this state — v1 gates
     /// shift on uncompressed caches only.
+    /// `true` iff *every* attention layer has BOTH
+    /// `compressed_keys` and `compressed_values` populated. Used by
+    /// the prefix-cache lookup gate to distinguish a fully-
+    /// TurboQuant state (matchable against
+    /// `LayerSnapshot::AttentionCompressed`) from a mixed-mode one
+    /// (no snapshot variant fits — `snapshot()` returns `None`).
+    pub fn is_fully_compressed(&self) -> bool {
+        self.layers.iter().all(|l| match l {
+            LayerState::Attention {
+                compressed_keys,
+                compressed_values,
+                ..
+            } => compressed_keys.is_some() && compressed_values.is_some(),
+            // Conv layers are never compressed; they don't impact
+            // the "fully compressed" determination.
+            LayerState::Conv { .. } => true,
+        })
+    }
+
     pub fn is_compressed(&self) -> bool {
         self.layers.iter().any(|l| {
             matches!(

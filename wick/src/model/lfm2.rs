@@ -2374,19 +2374,38 @@ impl Model for Lfm2Model {
                 .expect("prefix_cache mutex poisoned")
                 .find_longest_prefix(tokens);
             if let Some((snapshot, prefix_len)) = hit {
-                // Compatibility gate: a snapshot's compression mode
-                // must match the live state. Cross-mode restores
-                // would panic in `InferenceState::restore` (compressed
-                // snapshot into a `None`-slot live state, or
-                // uncompressed snapshot into a TurboQuant-configured
-                // live state with mismatched scratch/rotation shape).
-                // Treat as cache miss + fall through to cold prefill.
+                // Compatibility gate: snapshot's compression mode
+                // must match the live state's. Cross-mode restores
+                // would panic in `InferenceState::restore`
+                // (compressed snapshot into `None` slots, or
+                // uncompressed snapshot into a TurboQuant-
+                // configured state with mismatched scratch / rotation
+                // shape). Three live-state modes:
+                //
+                // - fully uncompressed → match `Attention` snapshots.
+                // - fully compressed   → match `AttentionCompressed`.
+                // - mixed-mode (one side compressed, the other not):
+                //   `snapshot()` returns `None` so the cache never
+                //   holds an entry that matches; both branches below
+                //   reject.
+                //
+                // `state.is_compressed()` (any-side-compressed) is
+                // too loose for the compressed branch: a mixed-mode
+                // state would erroneously match a fully-compressed
+                // snapshot and panic in `restore`. Use
+                // `is_fully_compressed` for the compressed branch,
+                // `!is_compressed` for the uncompressed branch.
                 // Today `model_fingerprint` doesn't include the
                 // compression flags, so a `--cache-dir` shared
                 // between TurboQuant and uncompressed runs of the
-                // same model file relies on this gate; future v2
-                // could fold compression into the fingerprint.
-                if snapshot.is_compressed() != state.is_compressed() {
+                // same model file relies on this gate; v2 could
+                // fold compression into the fingerprint.
+                let compatible = if snapshot.is_compressed() {
+                    state.is_fully_compressed() && state.is_compressed()
+                } else {
+                    !state.is_compressed()
+                };
+                if !compatible {
                     // skip; fall through to cold prefill.
                 } else {
                     // Keep at least one token for the suffix prefill
