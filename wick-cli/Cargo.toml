@@ -20,6 +20,14 @@ anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Terminal UI for `wick chat`. Auto-engaged when stdin+stdout are TTYs;
+# `--no-tui` falls back to the line-based REPL. crossterm is ratatui's
+# default backend on macOS / Linux / Windows.
+ratatui = "0.29"
+crossterm = "0.28"
+# Accurate column-width count for the TUI input cursor (CJK / emoji).
+# Tiny dep — just a static `char → width` table.
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

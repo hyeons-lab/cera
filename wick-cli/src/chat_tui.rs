@@ -1,0 +1,803 @@
+//! Inline TUI for `wick chat` — Claude Code / Junie style.
+//!
+//! Instead of taking over the whole terminal with a full-screen
+//! alternate buffer, we use ratatui's `Viewport::Inline` mode: a
+//! small (2-line) widget area pinned at the bottom of the terminal,
+//! with everything above flowing to the scrollback as normal terminal
+//! output. User and assistant messages get committed to scrollback
+//! via `Terminal::insert_before` once they're finalised; live
+//! streaming + the input prompt live in the inline viewport.
+//!
+//! Layout (bottom of terminal):
+//!
+//!   ```
+//!   …prior messages in scrollback above…
+//!   user> What is 2+2?
+//!   assistant> 4
+//!
+//!   > _                                    <- input line (cursor here)
+//!   ↵ send · /help · Ctrl+C to exit         <- hint line
+//!   ```
+//!
+//! While the worker is mid-generate, the input line shows
+//! `assistant> <streaming tokens>` and the hint line says
+//! "generating… Ctrl+C to cancel". When the turn finishes, the
+//! assembled assistant text gets emitted to scrollback and the input
+//! line returns to its empty prompt.
+//!
+//! Slash commands (`/help`, `/clear`, `/exit`, `/quit`) match the
+//! line-based REPL exactly. `/help` and `/clear` feedback also goes
+//! to scrollback via `insert_before` so it doesn't get lost in
+//! viewport refreshes.
+
+use std::io::{self, Stdout, Write};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
+use std::time::Duration;
+
+use anyhow::Result;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+use ratatui::{Terminal, TerminalOptions, Viewport};
+use unicode_width::UnicodeWidthChar;
+use wick::tokenizer::{BpeTokenizer, ChatMessage};
+use wick::{FinishReason, GenerateOpts, ModalitySink, Session};
+
+/// Updates flowing from the inference worker thread to the UI.
+enum UiUpdate {
+    /// Decoded text — append to the in-flight assistant reply.
+    Chunk(String),
+    /// Turn finished; carries the finish reason for the hint line.
+    Done(FinishReason),
+    /// `session.append_tokens` or `session.generate` errored. The
+    /// in-flight user turn gets popped on the worker side; the UI
+    /// surfaces the message and returns to the prompt.
+    Error(String),
+}
+
+/// User-driven turns dispatched from the UI to the worker. The full
+/// history (including the new user turn at the end) ships per turn —
+/// the worker is stateless w.r.t. history so `/clear` on the UI side
+/// just stops including the dropped messages on the next turn,
+/// without needing a "reset history" signal back to the worker.
+enum TurnRequest {
+    Turn(Vec<ChatMessage>),
+    Shutdown,
+}
+
+struct ChatState {
+    history: Vec<ChatMessage>,
+    /// In-flight assistant text streamed from the worker. `None`
+    /// between turns; `Some` while generating.
+    pending: Option<String>,
+    input: String,
+    /// Cursor column inside `input` measured in bytes (always on a
+    /// char boundary).
+    cursor: usize,
+    /// `true` while the worker is busy.
+    generating: bool,
+    /// Last finish reason — surfaced briefly in the hint line.
+    last_finish: Option<FinishReason>,
+}
+
+/// RAII guard that disables raw mode + emits a final newline when
+/// dropped, even on panic. Ensures the user's terminal is left in a
+/// usable state if anything in the TUI loop unwinds — without this,
+/// a panic mid-render would leave the shell stuck in raw mode and
+/// the user would have to `reset` or close the window.
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        // Restore cursor visibility — ratatui hides it during draws
+        // and a panic mid-frame would otherwise leave the user's
+        // shell with no visible cursor. Then emit a newline so the
+        // shell prompt lands on a fresh row after the inline
+        // viewport's bottom line.
+        let _ = execute!(
+            io::stdout(),
+            crossterm::cursor::Show,
+            crossterm::cursor::MoveToColumn(0)
+        );
+        let _ = writeln!(io::stdout());
+    }
+}
+
+/// Run the inline TUI. Consumes the `Session` because the worker
+/// thread takes ownership for the duration; returns the final
+/// history when the user exits cleanly.
+///
+/// `tokenizer` is taken as `Arc<BpeTokenizer>` rather than a value
+/// clone because `WickEngine` already stores the tokenizer behind an
+/// `Arc` (see `engine.tokenizer_arc()`) and the vocab + merge tables
+/// are large enough that a deep clone is wasteful. The worker thread
+/// receives its own `Arc` by clone, sharing the underlying maps.
+pub(crate) fn run(
+    session: Session,
+    tokenizer: std::sync::Arc<BpeTokenizer>,
+    initial_history: Vec<ChatMessage>,
+    opts: GenerateOpts,
+) -> Result<Vec<ChatMessage>> {
+    enable_raw_mode()?;
+    // Install the panic guard FIRST so any later `?` early-return
+    // (or panic from `Terminal::with_options`) restores the terminal
+    // before unwinding past this frame.
+    let _guard = RawModeGuard;
+
+    let mut stdout = io::stdout();
+    // No alternate-screen toggle — we want messages to remain in the
+    // user's scrollback after exit.
+    let backend = CrosstermBackend::new(stdout.by_ref());
+    // Inline(3): up to 2 lines for input/streaming with wrap, plus
+    // 1 hint line. Multi-line input fits within the same 2-row pane;
+    // wrapped streaming output auto-scrolls to keep the latest tokens
+    // visible.
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(3),
+        },
+    )?;
+
+    let result = run_inner(&mut terminal, session, tokenizer, initial_history, opts);
+
+    // On clean exit also clear the inline viewport region + restore
+    // the cursor explicitly (the guard's Drop only handles raw mode
+    // and the trailing newline).
+    let _ = terminal.clear();
+    let _ = terminal.show_cursor();
+    result
+}
+
+fn run_inner(
+    terminal: &mut Terminal<CrosstermBackend<&mut Stdout>>,
+    session: Session,
+    tokenizer: std::sync::Arc<BpeTokenizer>,
+    initial_history: Vec<ChatMessage>,
+    opts: GenerateOpts,
+) -> Result<Vec<ChatMessage>> {
+    let cancel = session.cancel_handle();
+    let mut state = ChatState {
+        history: initial_history,
+        pending: None,
+        input: String::new(),
+        cursor: 0,
+        generating: false,
+        last_finish: None,
+    };
+
+    // Print system prompt + any pre-loaded history into scrollback so
+    // the user sees what's already in context.
+    for msg in &state.history {
+        emit_message_to_scrollback(terminal, &msg.role, &msg.content)?;
+    }
+    if !state.history.is_empty() {
+        // Blank separator before the input area.
+        emit_blank_line(terminal)?;
+    }
+
+    let (tx_turn, rx_turn) = mpsc::channel::<TurnRequest>();
+    let (tx_update, rx_update) = mpsc::channel::<UiUpdate>();
+
+    let worker_tokenizer = tokenizer;
+    let worker_opts = opts.clone();
+    let worker_handle = thread::spawn(move || {
+        worker_loop(session, worker_tokenizer, worker_opts, rx_turn, tx_update);
+    });
+
+    'outer: loop {
+        terminal.draw(|frame| draw_inline(frame, &state))?;
+
+        // Drain worker updates between draws.
+        loop {
+            match rx_update.try_recv() {
+                Ok(UiUpdate::Chunk(s)) => {
+                    // Strip leading whitespace ONLY while `pending`
+                    // is still empty/whitespace. Chat templates often
+                    // emit a leading "\n" or "\n " right after the
+                    // assistant tag; we want that gone, but any
+                    // whitespace AFTER the first non-whitespace
+                    // character is real (code-block indent, list
+                    // markers, etc.) and must be preserved.
+                    let pending = state.pending.get_or_insert_with(String::new);
+                    if pending.chars().all(char::is_whitespace) {
+                        pending.clear();
+                        pending.push_str(s.trim_start());
+                    } else {
+                        pending.push_str(&s);
+                    }
+                }
+                Ok(UiUpdate::Done(reason)) => {
+                    if let Some(text) = state.pending.take() {
+                        // Commit the assistant turn to scrollback so
+                        // it stays visible after the viewport
+                        // redraws.
+                        emit_message_to_scrollback(terminal, "assistant", &text)?;
+                        emit_blank_line(terminal)?;
+                        state.history.push(ChatMessage {
+                            role: "assistant".into(),
+                            content: text,
+                        });
+                    }
+                    state.generating = false;
+                    state.last_finish = Some(reason);
+                }
+                Ok(UiUpdate::Error(e)) => {
+                    if let Some(last) = state.history.last()
+                        && last.role == "user"
+                    {
+                        state.history.pop();
+                    }
+                    state.pending = None;
+                    state.generating = false;
+                    emit_status_to_scrollback(terminal, &format!("error: {e}"))?;
+                    emit_blank_line(terminal)?;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break 'outer,
+            }
+        }
+
+        if !crossterm::event::poll(Duration::from_millis(50))? {
+            continue;
+        }
+        match crossterm::event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => {
+                match handle_key(k, &mut state, &tx_turn, &cancel, terminal)? {
+                    KeyAction::Continue => {}
+                    KeyAction::Exit => break 'outer,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let _ = tx_turn.send(TurnRequest::Shutdown);
+    drop(tx_turn);
+    let _ = worker_handle.join();
+    Ok(state.history)
+}
+
+enum KeyAction {
+    Continue,
+    Exit,
+}
+
+fn handle_key(
+    k: KeyEvent,
+    state: &mut ChatState,
+    tx_turn: &Sender<TurnRequest>,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    terminal: &mut Terminal<CrosstermBackend<&mut Stdout>>,
+) -> Result<KeyAction> {
+    // Ctrl+C / Ctrl+D semantics, matching the hint line:
+    // - mid-generate → only cancel the in-flight turn, stay in the
+    //   TUI. The worker observes `cancel` between tokens, returns
+    //   `Cancelled`, and `state.generating` flips to false on the
+    //   next `UiUpdate::Done` drain.
+    // - idle → exit the TUI cleanly.
+    if k.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('d'))
+    {
+        if state.generating {
+            cancel.store(true, Ordering::Relaxed);
+            return Ok(KeyAction::Continue);
+        }
+        return Ok(KeyAction::Exit);
+    }
+
+    if state.generating {
+        // No editing while a turn is in flight; only Ctrl+C above.
+        return Ok(KeyAction::Continue);
+    }
+
+    match k.code {
+        KeyCode::Esc => {
+            if state.input.is_empty() {
+                return Ok(KeyAction::Exit);
+            }
+            state.input.clear();
+            state.cursor = 0;
+        }
+        KeyCode::Enter => {
+            // Shift+Enter inserts a newline (multi-line composition);
+            // bare Enter submits. Some terminals don't distinguish
+            // Shift+Enter from Enter at the keyboard layer; users on
+            // those terminals can paste multi-line text or use Alt+Enter
+            // (handled below) instead.
+            if k.modifiers.contains(KeyModifiers::SHIFT) || k.modifiers.contains(KeyModifiers::ALT)
+            {
+                state.input.insert(state.cursor, '\n');
+                state.cursor += 1;
+                return Ok(KeyAction::Continue);
+            }
+            let line = std::mem::take(&mut state.input);
+            state.cursor = 0;
+            if line.trim().is_empty() {
+                return Ok(KeyAction::Continue);
+            }
+            return dispatch_user_input(line, state, tx_turn, terminal);
+        }
+        KeyCode::Backspace if state.cursor > 0 => {
+            let prev = prev_char_boundary(&state.input, state.cursor);
+            state.input.drain(prev..state.cursor);
+            state.cursor = prev;
+        }
+        KeyCode::Delete if state.cursor < state.input.len() => {
+            let next = next_char_boundary(&state.input, state.cursor);
+            state.input.drain(state.cursor..next);
+        }
+        KeyCode::Left if state.cursor > 0 => {
+            state.cursor = prev_char_boundary(&state.input, state.cursor);
+        }
+        KeyCode::Right if state.cursor < state.input.len() => {
+            state.cursor = next_char_boundary(&state.input, state.cursor);
+        }
+        KeyCode::Home => state.cursor = 0,
+        KeyCode::End => state.cursor = state.input.len(),
+        KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.input.insert(state.cursor, c);
+            state.cursor += c.len_utf8();
+        }
+        _ => {}
+    }
+    Ok(KeyAction::Continue)
+}
+
+fn dispatch_user_input(
+    line: String,
+    state: &mut ChatState,
+    tx_turn: &Sender<TurnRequest>,
+    terminal: &mut Terminal<CrosstermBackend<&mut Stdout>>,
+) -> Result<KeyAction> {
+    if line.starts_with('/') {
+        // Trim trailing whitespace before matching so commands like
+        // `/help ` or `/exit\t` still dispatch — same fix as the
+        // line-REPL slash dispatch (PR #125 review).
+        match line.trim_end() {
+            "/exit" | "/quit" => return Ok(KeyAction::Exit),
+            "/help" => {
+                emit_status_to_scrollback(terminal, "Commands: /clear  /help  /exit  /quit")?;
+                emit_blank_line(terminal)?;
+                return Ok(KeyAction::Continue);
+            }
+            "/clear" => {
+                // Preserve the system prompt (if any) by truncating
+                // to the first message rather than clear+clone+push.
+                // The worker is stateless w.r.t. history, so no
+                // explicit reset signal is needed — the next turn
+                // ships the smaller history.
+                let had_system = state.history.first().is_some_and(|m| m.role == "system");
+                if had_system {
+                    state.history.truncate(1);
+                } else {
+                    state.history.clear();
+                }
+                state.pending = None;
+                emit_status_to_scrollback(
+                    terminal,
+                    if had_system {
+                        "history cleared (system prompt preserved)"
+                    } else {
+                        "history cleared"
+                    },
+                )?;
+                emit_blank_line(terminal)?;
+                return Ok(KeyAction::Continue);
+            }
+            other => {
+                emit_status_to_scrollback(
+                    terminal,
+                    &format!("unknown command: {other} — type /help"),
+                )?;
+                emit_blank_line(terminal)?;
+                return Ok(KeyAction::Continue);
+            }
+        }
+    }
+
+    // Real user message: emit to scrollback, push to history, kick
+    // the worker with the full history (worker is stateless).
+    emit_message_to_scrollback(terminal, "user", &line)?;
+    state.history.push(ChatMessage {
+        role: "user".into(),
+        content: line,
+    });
+    state.pending = Some(String::new());
+    state.generating = true;
+    state.last_finish = None;
+    if tx_turn
+        .send(TurnRequest::Turn(state.history.clone()))
+        .is_err()
+    {
+        emit_status_to_scrollback(terminal, "worker thread exited unexpectedly")?;
+        // Roll back the user turn — it never reached the worker, so
+        // leaving it in `history` would mis-represent the
+        // conversation in the next attempt and in the returned
+        // history on exit.
+        state.history.pop();
+        state.generating = false;
+        state.pending = None;
+    }
+    Ok(KeyAction::Continue)
+}
+
+// ── Worker thread ──────────────────────────────────────────────────────────
+
+fn worker_loop(
+    mut session: Session,
+    tokenizer: std::sync::Arc<BpeTokenizer>,
+    opts: GenerateOpts,
+    rx_turn: Receiver<TurnRequest>,
+    tx_update: Sender<UiUpdate>,
+) {
+    while let Ok(req) = rx_turn.recv() {
+        let TurnRequest::Turn(history) = req else {
+            break;
+        };
+
+        // Stateless: history is the full conversation including the
+        // just-pushed user turn at the end. UI is the source of
+        // truth. `/clear` on UI side just sends a smaller history
+        // next turn — no separate reset needed here.
+        let formatted = match wick::tokenizer::apply_chat_template(&tokenizer, &history, true) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ =
+                    tx_update.send(UiUpdate::Error(format!("chat-template render failed: {e}")));
+                continue;
+            }
+        };
+        let tokens = tokenizer.encode(&formatted);
+
+        session.reset();
+        if let Err(e) = session.append_tokens(&tokens) {
+            let _ = tx_update.send(UiUpdate::Error(format!("append_tokens failed: {e}")));
+            continue;
+        }
+
+        let mut sink = TuiSink {
+            tokenizer: &tokenizer,
+            tx: tx_update.clone(),
+        };
+        let summary = match session.generate(&opts, &mut sink) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx_update.send(UiUpdate::Error(format!("generate failed: {e}")));
+                continue;
+            }
+        };
+        // Drop sink so its `tx` clone is released before the final
+        // send below; chunks have already been streamed to the UI
+        // token-by-token via `on_text_tokens`.
+        drop(sink);
+        let _ = tx_update.send(UiUpdate::Done(summary.finish_reason));
+    }
+}
+
+struct TuiSink<'a> {
+    tokenizer: &'a BpeTokenizer,
+    tx: Sender<UiUpdate>,
+}
+
+impl ModalitySink for TuiSink<'_> {
+    fn on_text_tokens(&mut self, tokens: &[u32]) {
+        let piece = self.tokenizer.decode(tokens);
+        let _ = self.tx.send(UiUpdate::Chunk(piece));
+    }
+    fn on_done(&mut self, _reason: FinishReason) {
+        // Final `Done` carries the FinishReason and is emitted by
+        // `worker_loop` after `generate` returns.
+    }
+}
+
+// ── Rendering: inline viewport ─────────────────────────────────────────────
+
+fn draw_inline(frame: &mut ratatui::Frame, state: &ChatState) {
+    let area = frame.area();
+    // Layout: 2 lines for input/streaming (with wrap), 1 hint line.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Length(1)])
+        .split(area);
+
+    draw_input_or_stream(frame, chunks[0], state);
+    draw_hint(frame, chunks[1], state);
+}
+
+fn draw_input_or_stream(frame: &mut ratatui::Frame, area: Rect, state: &ChatState) {
+    use ratatui::widgets::Wrap;
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    if state.generating {
+        // Show the streaming assistant text in place of the input
+        // line. Wrap so long replies are visible across viewport
+        // rows; auto-scroll keeps the latest content in view when
+        // the wrapped + multi-line text exceeds the available rows.
+        //
+        // Multi-line: the model can stream `\n` mid-response (code
+        // blocks, lists, paragraph breaks). `Paragraph` doesn't
+        // honor `\n` inside a `Span` — it's only a row-break across
+        // separate `Line` objects — so we split `pending` on `\n`
+        // and emit one `Line` per source-line, matching how the
+        // finalized message is rendered to scrollback. First line
+        // carries the "assistant> " prefix; continuation lines
+        // are indented under the content for visual alignment.
+        //
+        // Compute total rows by feeding the COMBINED prefix + pending
+        // string through `wrapped_row_count` at `area.width`. Only
+        // the first row carries the "assistant> " prefix; subsequent
+        // wrapped continuation rows have the full `area.width`
+        // available (ratatui's Wrap doesn't preserve indent across
+        // a soft wrap). Computing on the prefixed combined string
+        // at the full width matches both hard breaks (`\n`) and
+        // soft wraps exactly.
+        let pending = state.pending.as_deref().unwrap_or("");
+        // `wrapped_height_for_message` mirrors how the message is
+        // laid out below: per-source-line, with role label on row 0
+        // and continuation indent on subsequent source-lines, soft
+        // wrapping at `area.width`. Using it here keeps the scroll
+        // offset in sync with the actual rendered Lines.
+        let total_rows = wrapped_height_for_message("assistant", pending, area.width);
+        let scroll = total_rows.saturating_sub(area.height);
+        let label = "assistant> ";
+        let indent: String = " ".repeat(label.len());
+        let mut lines: Vec<Line> = Vec::new();
+        let mut first = true;
+        for src in pending.split('\n') {
+            let mut spans = Vec::new();
+            if first {
+                spans.push(Span::styled(label, bold));
+                first = false;
+            } else {
+                spans.push(Span::raw(indent.clone()));
+            }
+            spans.push(Span::raw(src.to_string()));
+            lines.push(Line::from(spans));
+        }
+        let para = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        frame.render_widget(para, area);
+    } else {
+        // Multi-line input: render as one Line per source-line. Each
+        // gets the "> " prompt; continuation lines get a 2-col
+        // indent so wrapped + multi-line text reads naturally. Note
+        // `"".split('\n')` already yields one empty element, so we
+        // always have at least one Line — no fallback push needed.
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, src_line) in state.input.split('\n').enumerate() {
+            let lead: Span = if i == 0 {
+                Span::styled("> ", dim)
+            } else {
+                Span::raw("  ")
+            };
+            lines.push(Line::from(vec![lead, Span::raw(src_line.to_string())]));
+        }
+        // Cursor position in the unscrolled paragraph coordinate
+        // space. Walk the input up to byte offset `cursor`, tracking
+        // display columns via `unicode-width` so wide CJK and emoji
+        // chars take 2 cells.
+        //
+        // Rules (matching how the rendered Lines + Wrap behave):
+        // - Row 0 starts at col 2 (after the "> " prompt span).
+        // - A '\n' starts a new source-line; the next row begins at
+        //   col 2 (the "  " continuation indent).
+        // - A SOFT wrap (col + w > area.width within one source-
+        //   line) starts a new row at col 0 — ratatui's Wrap does
+        //   not preserve any leading indent across the wrap.
+        let mut row: u16 = 0;
+        let mut col: u16 = 2; // first row starts after "> "
+        for ch in state.input[..state.cursor].chars() {
+            if ch == '\n' {
+                row = row.saturating_add(1);
+                col = 2;
+                continue;
+            }
+            let w = ch.width().unwrap_or(0) as u16;
+            if col + w > area.width && area.width > 0 {
+                row = row.saturating_add(1);
+                col = 0;
+            }
+            col += w;
+        }
+        // Vertical scroll: if the cursor row sits below the viewport,
+        // scroll the Paragraph so the cursor row is the LAST visible
+        // row. Without this, multi-line input wider than 2 source
+        // rows or anything that wraps past the inline pane would
+        // hide the caret. The same offset is subtracted from the
+        // rendered cursor row so it stays inside `area`.
+        let scroll_y = row.saturating_sub(area.height.saturating_sub(1));
+        let para = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_y, 0));
+        frame.render_widget(para, area);
+
+        let mut cursor_row = row.saturating_sub(scroll_y);
+        let mut cursor_col = col;
+        if cursor_row >= area.height {
+            cursor_row = area.height.saturating_sub(1);
+            cursor_col = area.width.saturating_sub(1);
+        } else if cursor_col >= area.width {
+            cursor_col = area.width.saturating_sub(1);
+        }
+        frame.set_cursor_position((
+            area.x.saturating_add(cursor_col),
+            area.y.saturating_add(cursor_row),
+        ));
+    }
+}
+
+/// Compute how many rows a wrapped string takes inside `width`
+/// columns, treating each '\n' as a hard break and each `\u{...}`
+/// width as `unicode-width` reports. Used to size the
+/// streaming-pane scroll offset.
+fn wrapped_row_count(s: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 1;
+    }
+    let mut rows: u16 = 1;
+    let mut col: u16 = 0;
+    for ch in s.chars() {
+        if ch == '\n' {
+            rows = rows.saturating_add(1);
+            col = 0;
+            continue;
+        }
+        let w = ch.width().unwrap_or(0) as u16;
+        if col + w > width {
+            rows = rows.saturating_add(1);
+            col = 0;
+        }
+        col += w;
+    }
+    rows
+}
+
+fn draw_hint(frame: &mut ratatui::Frame, area: Rect, state: &ChatState) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let text = if state.generating {
+        String::from("generating… Ctrl+C to cancel")
+    } else if let Some(reason) = &state.last_finish {
+        format!("↵ send · /help · Ctrl+C to exit  ·  last turn: {reason:?}")
+    } else {
+        String::from("↵ send · /help · Ctrl+C to exit")
+    };
+    frame.render_widget(Paragraph::new(Line::from(Span::styled(text, dim))), area);
+}
+
+// ── Scrollback emission ────────────────────────────────────────────────────
+//
+// `Terminal::insert_before` writes lines into the scrollback above
+// the inline viewport. Used to commit user/assistant turns and
+// status messages so they persist outside the redraw cycle.
+
+fn emit_message_to_scrollback(
+    terminal: &mut Terminal<CrosstermBackend<&mut Stdout>>,
+    role: &str,
+    content: &str,
+) -> Result<()> {
+    use ratatui::widgets::{Widget, Wrap};
+    let term_width = terminal.size()?.width.max(1);
+    let lines = render_message_lines(role, content);
+    // Pre-compute the wrapped row count so `insert_before` reserves
+    // enough rows for the Paragraph's wrap output. Without this we'd
+    // either truncate (set_line into a 1-row buffer per source-line,
+    // the previous bug) or over-/under-allocate.
+    let height = wrapped_height_for_message(role, content, term_width).max(1);
+    terminal.insert_before(height, |buf| {
+        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+        para.render(buf.area, buf);
+    })?;
+    Ok(())
+}
+
+/// Total wrapped row count for a `role + content` pair given a
+/// terminal `width`. Mirrors how `Paragraph::wrap` lays the message
+/// out: the role label sits at the start of source-line 0, every
+/// other source-line gets a continuation indent of the label's
+/// width (so wrapped/newline content aligns under the first line's
+/// content), and each row breaks at `width` columns measured by
+/// `unicode-width`.
+fn wrapped_height_for_message(role: &str, content: &str, width: u16) -> u16 {
+    let label = format!("{role}> ");
+    let indent: String = " ".repeat(label.len());
+    let mut total: u16 = 0;
+    let mut first = true;
+    for src in content.split('\n') {
+        let prefix = if first {
+            label.as_str()
+        } else {
+            indent.as_str()
+        };
+        first = false;
+        let combined: String = format!("{prefix}{src}");
+        total = total.saturating_add(wrapped_row_count(&combined, width));
+    }
+    total
+}
+
+fn emit_status_to_scrollback(
+    terminal: &mut Terminal<CrosstermBackend<&mut Stdout>>,
+    text: &str,
+) -> Result<()> {
+    use ratatui::widgets::{Widget, Wrap};
+    let term_width = terminal.size()?.width.max(1);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let line = Line::from(vec![Span::raw("· "), Span::styled(text.to_string(), dim)]);
+    // Compute wrapped height up-front so `insert_before` reserves
+    // enough rows. Mirrors `emit_message_to_scrollback`'s pattern —
+    // the previous `set_line` call truncated long status / help
+    // text in the user's scrollback because it doesn't wrap.
+    let combined = format!("· {text}");
+    let height = wrapped_row_count(&combined, term_width).max(1);
+    terminal.insert_before(height, |buf| {
+        let para = Paragraph::new(line).wrap(Wrap { trim: false });
+        para.render(buf.area, buf);
+    })?;
+    Ok(())
+}
+
+fn emit_blank_line(terminal: &mut Terminal<CrosstermBackend<&mut Stdout>>) -> Result<()> {
+    terminal.insert_before(1, |_| {})?;
+    Ok(())
+}
+
+fn render_message_lines(role: &str, content: &str) -> Vec<Line<'static>> {
+    let label_style = match role {
+        "user" => Style::default().add_modifier(Modifier::BOLD),
+        "assistant" => Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        "system" => Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+        _ => Style::default(),
+    };
+    let label = format!("{role}> ");
+    // Indent continuation lines by the label's display width so
+    // multi-line messages line up under the first line's content.
+    // Role labels are ASCII so byte-len == column-width here; wider
+    // role names would still be safe under this assumption since
+    // ratatui will lay the indent out as that many cells regardless
+    // of how `width()` would measure them.
+    let indent: String = " ".repeat(label.len());
+    let mut lines = Vec::new();
+    let mut first = true;
+    for source_line in content.split('\n') {
+        let mut spans = Vec::new();
+        if first {
+            spans.push(Span::styled(label.clone(), label_style));
+            first = false;
+        } else {
+            spans.push(Span::raw(indent.clone()));
+        }
+        spans.push(Span::raw(source_line.to_string()));
+        lines.push(Line::from(spans));
+    }
+    // `"".split('\n')` always yields one element so `lines` is never
+    // empty here; no fallback push required.
+    lines
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+fn prev_char_boundary(s: &str, byte: usize) -> usize {
+    let mut i = byte.saturating_sub(1);
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn next_char_boundary(s: &str, byte: usize) -> usize {
+    let mut i = byte + 1;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
