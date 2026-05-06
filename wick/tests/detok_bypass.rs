@@ -6,7 +6,7 @@ fn detok_bypass_backbone() {
     if !path.exists() {
         return;
     }
-    let gguf = wick::gguf::GgufFile::open(&path).unwrap();
+    let gguf = wick::gguf::GgufFile::open_arc(&path).unwrap();
     let tw = wick::model::audio_decoder::DetokenizerWeights::from_gguf(&gguf).unwrap();
     let n = tw.config.n_embd;
 

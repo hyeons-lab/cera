@@ -7,7 +7,7 @@ fn load_vocoder_gguf() {
         return;
     }
 
-    let gguf = wick::gguf::GgufFile::open(&path).unwrap();
+    let gguf = wick::gguf::GgufFile::open_arc(&path).unwrap();
     let weights = wick::model::audio_decoder::AudioDecoderWeights::from_gguf(&gguf).unwrap();
 
     let dc = &weights.depthformer_config;
@@ -41,7 +41,7 @@ fn load_detokenizer() {
         return;
     }
 
-    let gguf = wick::gguf::GgufFile::open(&path).unwrap();
+    let gguf = wick::gguf::GgufFile::open_arc(&path).unwrap();
     let detok = wick::model::audio_decoder::DetokenizerWeights::from_gguf(&gguf).unwrap();
 
     let c = &detok.config;

@@ -7,7 +7,7 @@ fn depthformer_forward_smoke() {
         return;
     }
 
-    let gguf = wick::gguf::GgufFile::open(&path).unwrap();
+    let gguf = wick::gguf::GgufFile::open_arc(&path).unwrap();
     let weights = wick::model::audio_decoder::AudioDecoderWeights::from_gguf(&gguf).unwrap();
     let mut state = wick::model::audio_decoder::DepthformerState::new(&weights.depthformer_config);
 

@@ -908,7 +908,7 @@ fn append_audio_wrong_sample_rate_returns_backend_error() {
         );
         return;
     }
-    let mmproj = wick::gguf::GgufFile::open(&mmproj_path).unwrap();
+    let mmproj = wick::gguf::GgufFile::open_arc(&mmproj_path).unwrap();
     let mut weights = AudioEncoderWeights::from_gguf(&mmproj).unwrap();
 
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
@@ -993,7 +993,7 @@ fn append_audio_end_to_end() {
         SessionConfig::default(),
     );
 
-    let mmproj = wick::gguf::GgufFile::open(&mmproj_path).unwrap();
+    let mmproj = wick::gguf::GgufFile::open_arc(&mmproj_path).unwrap();
     let encoder = Arc::new(AudioEncoderWeights::from_gguf(&mmproj).unwrap());
     session.attach_audio_encoder(encoder);
 
@@ -1067,7 +1067,7 @@ fn reset_preserves_attached_audio_encoder() {
         );
         return;
     }
-    let mmproj = wick::gguf::GgufFile::open(&mmproj_path).unwrap();
+    let mmproj = wick::gguf::GgufFile::open_arc(&mmproj_path).unwrap();
     let encoder = Arc::new(AudioEncoderWeights::from_gguf(&mmproj).unwrap());
 
     let gguf = wick::gguf::GgufFile::open(&model_path).unwrap();
@@ -1141,7 +1141,7 @@ fn append_audio_dimension_mismatch_returns_backend_error() {
     // LLM here is LFM2-VL-450M (hidden_size = 1024 too — they
     // happen to match). To force a mismatch, swap the encoder's
     // config llm_hidden_size to something deliberately wrong.
-    let mmproj = wick::gguf::GgufFile::open(&mmproj_path).unwrap();
+    let mmproj = wick::gguf::GgufFile::open_arc(&mmproj_path).unwrap();
     let mut weights = AudioEncoderWeights::from_gguf(&mmproj).unwrap();
     let actual = weights.config.llm_hidden_size;
     weights.config.llm_hidden_size = actual + 1; // poison
@@ -1428,7 +1428,7 @@ fn asr_real_audio_matches_input_phrase() {
         SessionConfig::default(),
     );
 
-    let mmproj = wick::gguf::GgufFile::open(&mmproj_path).unwrap();
+    let mmproj = wick::gguf::GgufFile::open_arc(&mmproj_path).unwrap();
     let encoder = Arc::new(AudioEncoderWeights::from_gguf(&mmproj).unwrap());
     session.attach_audio_encoder(encoder);
 

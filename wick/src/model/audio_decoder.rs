@@ -5,11 +5,13 @@
 //! 2. DepthformerModel — small 6-layer attention-only transformer (backbone of DecoderModel)
 //! 3. Detokenizer — codes → spectrogram → PCM (not loaded here yet — Phase 5)
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 
 use crate::backend::cpu;
 use crate::gguf::GgufFile;
-use crate::tensor::DType;
+use crate::model::weights::MmapWeight;
 
 /// GPU-accelerated audio backend. Implementations provide Metal or WGPU
 /// dispatch for the depthformer (code sampling) and detokenizer (spectrum).
@@ -50,109 +52,33 @@ pub struct DecoderConfig {
     pub rms_norm_eps: f32,
 }
 
-/// A single tensor stored as dequantized f32 for CPU inference.
-pub struct F32Weight {
-    pub data: Vec<f32>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-impl F32Weight {
-    /// `pub(crate)` rather than `pub` — only used by sibling
-    /// modules in `wick::model` (e.g. `audio_encoder`); not part
-    /// of the crate's external API surface.
-    pub(crate) fn from_tensor(gguf: &GgufFile, name: &str) -> Result<Self> {
-        let tensor = gguf.get_tensor(name)?;
-        let shape = tensor.shape();
-        let (rows, cols) = match shape.len() {
-            1 => (1, shape[0]),
-            2 => (shape[1], shape[0]), // GGUF stores [cols, rows]
-            _ => anyhow::bail!("unexpected tensor rank for {name}: {}", shape.len()),
-        };
-        let data = tensor.to_f32_vec();
-        Ok(Self { data, rows, cols })
-    }
-
-    /// Matrix-vector multiply: y = self × x. self is [rows, cols], x is [cols].
-    pub fn gemv(&self, x: &[f32], y: &mut [f32]) {
-        assert_eq!(x.len(), self.cols);
-        assert_eq!(y.len(), self.rows);
-        for (r, y_r) in y.iter_mut().enumerate() {
-            let row = &self.data[r * self.cols..(r + 1) * self.cols];
-            *y_r = row.iter().zip(x).map(|(w, x)| w * x).sum();
-        }
-    }
-}
-
-/// A weight tensor stored in its native quantized format (Q4_0).
-/// Uses the quantized GEMV path (NEON Q4_0×Q8_0) matching ggml's computation.
-pub struct QuantWeight {
-    pub data: Vec<u8>,
-    pub dtype: DType,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-impl QuantWeight {
-    fn from_tensor(gguf: &GgufFile, name: &str) -> Result<Self> {
-        let tensor = gguf.get_tensor(name)?;
-        let shape = tensor.shape();
-        let (rows, cols) = match shape.len() {
-            1 => (1, shape[0]),
-            2 => (shape[1], shape[0]),
-            _ => anyhow::bail!("unexpected tensor rank for {name}: {}", shape.len()),
-        };
-        let data = tensor.data().to_vec();
-        let dtype = tensor.dtype();
-        Ok(Self {
-            data,
-            rows,
-            cols,
-            dtype,
-        })
-    }
-
-    /// Matrix-vector multiply using the quantized GEMV path.
-    pub fn gemv(&self, x: &[f32], y: &mut [f32]) {
-        assert_eq!(x.len(), self.cols);
-        assert_eq!(y.len(), self.rows);
-        crate::backend::cpu::gemv_dispatch(
-            self.dtype, &self.data, x, y, self.rows, self.cols, None,
-        );
-    }
-
-    /// Matrix-vector multiply for a row subrange [row_start..row_start+n_rows].
-    /// Used for per-codebook slicing of depth_linear.
-    pub fn gemv_rows(&self, x: &[f32], y: &mut [f32], row_start: usize, n_rows: usize) {
-        assert_eq!(x.len(), self.cols);
-        assert_eq!(y.len(), n_rows);
-        assert!(row_start + n_rows <= self.rows);
-        let row_bytes = (self.cols / self.dtype.block_size()) * self.dtype.block_bytes();
-        let offset = row_start * row_bytes;
-        let slice = &self.data[offset..offset + n_rows * row_bytes];
-        crate::backend::cpu::gemv_dispatch(self.dtype, slice, x, y, n_rows, self.cols, None);
-    }
-}
+// `F32Weight` / `QuantWeight` were the previous (owned-f32 /
+// owned-bytes) types. They've been collapsed into the shared
+// mmap-backed [`MmapWeight`] in `wick::model::weights` —
+// dispatching on `dtype` instead of carrying the type
+// distinction in the struct name. All audio_decoder structs
+// below now use `MmapWeight` directly for consistency with
+// `audio_encoder` and `vision_encoder`.
 
 /// Per-layer weights for one depthformer layer.
-/// Uses QuantWeight for GEMV to match ggml's Q4_0 computation path.
+/// Uses MmapWeight for GEMV to match ggml's Q4_0 computation path.
 pub struct DepthformerLayerWeights {
     pub operator_norm: Vec<f32>,
-    pub wqkv: QuantWeight,
+    pub wqkv: MmapWeight,
     pub q_norm: Vec<f32>,
     pub k_norm: Vec<f32>,
-    pub wo: QuantWeight,
+    pub wo: MmapWeight,
     pub ffn_norm: Vec<f32>,
-    pub w1: QuantWeight, // gate
-    pub w2: QuantWeight, // down
-    pub w3: QuantWeight, // up
+    pub w1: MmapWeight, // gate
+    pub w2: MmapWeight, // down
+    pub w3: MmapWeight, // up
 }
 
 /// Per-codebook embedding layer weights.
 pub struct CodebookWeights {
-    pub embedding: F32Weight,
+    pub embedding: MmapWeight,
     pub norm: Vec<f32>,
-    pub to_logits: QuantWeight,
+    pub to_logits: MmapWeight,
 }
 
 /// All weights for the audio decoder (loaded from vocoder GGUF).
@@ -160,15 +86,18 @@ pub struct AudioDecoderWeights {
     pub depthformer_config: DepthformerConfig,
     pub decoder_config: DecoderConfig,
     pub depthformer_layers: Vec<DepthformerLayerWeights>,
-    pub depth_linear_w: QuantWeight,
+    pub depth_linear_w: MmapWeight,
     pub depth_linear_b: Vec<f32>,
     pub depth_embeddings: Vec<CodebookWeights>,
     pub audio_embedding: CodebookWeights,
 }
 
 impl AudioDecoderWeights {
-    /// Load all decoder weights from the vocoder GGUF.
-    pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
+    /// Load all decoder weights from the vocoder GGUF. Takes
+    /// `&Arc<GgufFile>` because [`MmapWeight`] holds onto a clone
+    /// of the Arc — the loader doesn't copy any tensor bytes,
+    /// only constructs handles.
+    pub fn from_gguf(gguf: &Arc<GgufFile>) -> Result<Self> {
         // Hyperparameters from GGUF metadata.
         let n_layer = gguf
             .get_u32("depthformer_n_layer")
@@ -179,7 +108,7 @@ impl AudioDecoderWeights {
 
         // Derive head config from qkv_proj shape.
         // qkv_proj.weight is [n_embd, (n_head + 2*n_head_kv) * head_dim]
-        let qkv = F32Weight::from_tensor(gguf, "depthformer.layers.0.operator.qkv_proj.weight")?;
+        let qkv = MmapWeight::from_gguf(gguf, "depthformer.layers.0.operator.qkv_proj.weight")?;
         let q_norm_w =
             gguf.get_tensor("depthformer.layers.0.operator.attention.q_layernorm.weight")?;
         let n_embd_head = q_norm_w.shape()[0]; // head_dim from q_norm shape
@@ -196,7 +125,7 @@ impl AudioDecoderWeights {
         );
 
         // FFN dim from w1 shape.
-        let w1_0 = F32Weight::from_tensor(gguf, "depthformer.layers.0.feed_forward.w1.weight")?;
+        let w1_0 = MmapWeight::from_gguf(gguf, "depthformer.layers.0.feed_forward.w1.weight")?;
         let ffn_dim = w1_0.rows;
 
         let depthformer_config = DepthformerConfig {
@@ -219,28 +148,25 @@ impl AudioDecoderWeights {
                 operator_norm: gguf
                     .get_tensor(&format!("{prefix}.operator_norm.weight"))?
                     .to_f32_vec(),
-                wqkv: QuantWeight::from_tensor(
-                    gguf,
-                    &format!("{prefix}.operator.qkv_proj.weight"),
-                )?,
+                wqkv: MmapWeight::from_gguf(gguf, &format!("{prefix}.operator.qkv_proj.weight"))?,
                 q_norm: gguf
                     .get_tensor(&format!("{prefix}.operator.attention.q_layernorm.weight"))?
                     .to_f32_vec(),
                 k_norm: gguf
                     .get_tensor(&format!("{prefix}.operator.attention.k_layernorm.weight"))?
                     .to_f32_vec(),
-                wo: QuantWeight::from_tensor(gguf, &format!("{prefix}.operator.out_proj.weight"))?,
+                wo: MmapWeight::from_gguf(gguf, &format!("{prefix}.operator.out_proj.weight"))?,
                 ffn_norm: gguf
                     .get_tensor(&format!("{prefix}.ffn_norm.weight"))?
                     .to_f32_vec(),
-                w1: QuantWeight::from_tensor(gguf, &format!("{prefix}.feed_forward.w1.weight"))?,
-                w2: QuantWeight::from_tensor(gguf, &format!("{prefix}.feed_forward.w2.weight"))?,
-                w3: QuantWeight::from_tensor(gguf, &format!("{prefix}.feed_forward.w3.weight"))?,
+                w1: MmapWeight::from_gguf(gguf, &format!("{prefix}.feed_forward.w1.weight"))?,
+                w2: MmapWeight::from_gguf(gguf, &format!("{prefix}.feed_forward.w2.weight"))?,
+                w3: MmapWeight::from_gguf(gguf, &format!("{prefix}.feed_forward.w3.weight"))?,
             });
         }
 
         // Decoder model weights.
-        let depth_linear_w = QuantWeight::from_tensor(gguf, "depth_linear.weight")?;
+        let depth_linear_w = MmapWeight::from_gguf(gguf, "depth_linear.weight")?;
         let depth_linear_b = gguf.get_tensor("depth_linear.bias")?.to_f32_vec();
 
         let n_codebook = 8;
@@ -248,20 +174,20 @@ impl AudioDecoderWeights {
         for i in 0..n_codebook {
             let prefix = format!("depth_embeddings.{i}");
             depth_embeddings.push(CodebookWeights {
-                embedding: F32Weight::from_tensor(gguf, &format!("{prefix}.embedding.weight"))?,
+                embedding: MmapWeight::from_gguf(gguf, &format!("{prefix}.embedding.weight"))?,
                 norm: gguf
                     .get_tensor(&format!("{prefix}.embedding_norm.weight"))?
                     .to_f32_vec(),
-                to_logits: QuantWeight::from_tensor(gguf, &format!("{prefix}.to_logits.weight"))?,
+                to_logits: MmapWeight::from_gguf(gguf, &format!("{prefix}.to_logits.weight"))?,
             });
         }
 
         let audio_embedding = CodebookWeights {
-            embedding: F32Weight::from_tensor(gguf, "audio_embedding.embedding.weight")?,
+            embedding: MmapWeight::from_gguf(gguf, "audio_embedding.embedding.weight")?,
             norm: gguf
                 .get_tensor("audio_embedding.embedding_norm.weight")?
                 .to_f32_vec(),
-            to_logits: QuantWeight::from_tensor(gguf, "audio_embedding.to_logits.weight")?,
+            to_logits: MmapWeight::from_gguf(gguf, "audio_embedding.to_logits.weight")?,
         };
 
         // Derive decoder config from weight shapes.
@@ -416,7 +342,7 @@ pub fn depthformer_forward(
         qkv.iter_mut().for_each(|v| *v = 0.0);
         crate::backend::cpu::gemv_dispatch(
             lw.wqkv.dtype,
-            &lw.wqkv.data,
+            lw.wqkv.data(),
             &cur,
             &mut qkv,
             lw.wqkv.rows,
@@ -506,7 +432,7 @@ pub fn depthformer_forward(
         up.iter_mut().for_each(|v| *v = 0.0);
         crate::backend::cpu::gemv_dispatch(
             lw.w1.dtype,
-            &lw.w1.data,
+            lw.w1.data(),
             &cur,
             &mut gate,
             lw.w1.rows,
@@ -515,7 +441,7 @@ pub fn depthformer_forward(
         );
         crate::backend::cpu::gemv_dispatch(
             lw.w3.dtype,
-            &lw.w3.data,
+            lw.w3.data(),
             &cur,
             &mut up,
             lw.w3.rows,
@@ -578,7 +504,7 @@ pub fn sample_audio_frame(
         if j > 0 && prev_token >= 0 {
             let prev_cb = &weights.depth_embeddings[j - 1];
             let tok = prev_token as usize;
-            let emb_row = &prev_cb.embedding.data[tok * n_embd_d..(tok + 1) * n_embd_d];
+            let emb_row = &prev_cb.embedding.as_f32()[tok * n_embd_d..(tok + 1) * n_embd_d];
             for (d, e) in depthformer_in.iter_mut().zip(emb_row) {
                 *d += e;
             }
@@ -642,7 +568,7 @@ pub fn embed_audio_token(weights: &AudioDecoderWeights, codes: &[i32; 8]) -> Vec
 
     for (j, &code) in codes.iter().enumerate() {
         let offset_idx = j * n_vocab + code as usize;
-        let row = &emb.data[offset_idx * emb_dim..(offset_idx + 1) * emb_dim];
+        let row = &emb.as_f32()[offset_idx * emb_dim..(offset_idx + 1) * emb_dim];
         for (r, e) in result.iter_mut().zip(row) {
             *r += e;
         }
@@ -678,18 +604,18 @@ pub struct DetokenizerConfig {
 pub struct DetokLayerWeights {
     pub operator_norm: Vec<f32>,
     pub ffn_norm: Vec<f32>,
-    pub ffn_w1: F32Weight, // gate
-    pub ffn_w2: F32Weight, // down
-    pub ffn_w3: F32Weight, // up
+    pub ffn_w1: MmapWeight, // gate
+    pub ffn_w2: MmapWeight, // down
+    pub ffn_w3: MmapWeight, // up
     // Conv layers
-    pub conv_in_proj: Option<F32Weight>,
-    pub conv_out_proj: Option<F32Weight>,
+    pub conv_in_proj: Option<MmapWeight>,
+    pub conv_out_proj: Option<MmapWeight>,
     pub conv_weight: Option<Vec<f32>>, // [kernel_size, n_embd]
     // Attention layers
-    pub wq: Option<F32Weight>,
-    pub wk: Option<F32Weight>,
-    pub wv: Option<F32Weight>,
-    pub wo: Option<F32Weight>,
+    pub wq: Option<MmapWeight>,
+    pub wk: Option<MmapWeight>,
+    pub wv: Option<MmapWeight>,
+    pub wo: Option<MmapWeight>,
     pub q_norm: Option<Vec<f32>>,
     pub k_norm: Option<Vec<f32>>,
 }
@@ -698,28 +624,36 @@ pub struct DetokLayerWeights {
 pub struct DetokenizerWeights {
     pub config: DetokenizerConfig,
     pub output_norm: Vec<f32>,
-    pub emb_weight: F32Weight, // code embedding [n_codes * n_vocab, emb_dim]
-    pub lin_w: F32Weight,      // linear head
+    pub emb_weight: MmapWeight, // code embedding [n_codes * n_vocab, emb_dim]
+    pub lin_w: MmapWeight,      // linear head
     pub lin_b: Vec<f32>,
     pub layers: Vec<DetokLayerWeights>,
 }
 
 impl DetokenizerWeights {
-    pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
+    pub fn from_gguf(gguf: &Arc<GgufFile>) -> Result<Self> {
         // Layer types (hardcoded from decoder.cpp).
         let layer_is_conv = vec![true, true, false, true, false, true, false, true];
         let n_layer = layer_is_conv.len();
 
         // Derive config from weight shapes.
-        let conv_in = F32Weight::from_tensor(gguf, "lfm.layers.0.conv.in_proj.weight")?;
+        let conv_in = MmapWeight::from_gguf(gguf, "lfm.layers.0.conv.in_proj.weight")?;
         let n_embd = conv_in.cols;
         let q_norm_w = gguf.get_tensor("lfm.layers.2.self_attn.q_layernorm.weight")?;
         let n_embd_head = q_norm_w.shape()[0];
-        let q_w = F32Weight::from_tensor(gguf, "lfm.layers.2.self_attn.q_proj.weight")?;
+        // Guard against a corrupt vocoder GGUF reporting an empty
+        // q_layernorm shape — both `n_head` and `n_head_kv` are
+        // derived from this dim and would div-by-zero panic
+        // otherwise.
+        anyhow::ensure!(
+            n_embd_head > 0,
+            "detokenizer n_embd_head must be > 0 (q_layernorm shape was empty)"
+        );
+        let q_w = MmapWeight::from_gguf(gguf, "lfm.layers.2.self_attn.q_proj.weight")?;
         let n_head = q_w.rows / n_embd_head;
-        let k_w = F32Weight::from_tensor(gguf, "lfm.layers.2.self_attn.k_proj.weight")?;
+        let k_w = MmapWeight::from_gguf(gguf, "lfm.layers.2.self_attn.k_proj.weight")?;
         let n_head_kv = k_w.rows / n_embd_head;
-        let ffn_w1_0 = F32Weight::from_tensor(gguf, "lfm.layers.0.feed_forward.w1.weight")?;
+        let ffn_w1_0 = MmapWeight::from_gguf(gguf, "lfm.layers.0.feed_forward.w1.weight")?;
         let ffn_dim = ffn_w1_0.rows;
 
         let config = DetokenizerConfig {
@@ -742,8 +676,8 @@ impl DetokenizerWeights {
 
         let output_norm = gguf.get_tensor("lfm.embedding_norm.weight")?.to_f32_vec();
 
-        let emb_weight = F32Weight::from_tensor(gguf, "emb.emb.weight")?;
-        let lin_w = F32Weight::from_tensor(gguf, "lin.weight")?;
+        let emb_weight = MmapWeight::from_gguf(gguf, "emb.emb.weight")?;
+        let lin_w = MmapWeight::from_gguf(gguf, "lin.weight")?;
         let lin_b = gguf.get_tensor("lin.bias")?.to_f32_vec();
 
         let mut layers = Vec::with_capacity(n_layer);
@@ -758,11 +692,11 @@ impl DetokenizerWeights {
                 ffn_norm: gguf
                     .get_tensor(&format!("{prefix}.ffn_norm.weight"))?
                     .to_f32_vec(),
-                ffn_w1: F32Weight::from_tensor(gguf, &format!("{prefix}.feed_forward.w1.weight"))?,
-                ffn_w2: F32Weight::from_tensor(gguf, &format!("{prefix}.feed_forward.w2.weight"))?,
-                ffn_w3: F32Weight::from_tensor(gguf, &format!("{prefix}.feed_forward.w3.weight"))?,
+                ffn_w1: MmapWeight::from_gguf(gguf, &format!("{prefix}.feed_forward.w1.weight"))?,
+                ffn_w2: MmapWeight::from_gguf(gguf, &format!("{prefix}.feed_forward.w2.weight"))?,
+                ffn_w3: MmapWeight::from_gguf(gguf, &format!("{prefix}.feed_forward.w3.weight"))?,
                 conv_in_proj: if is_conv {
-                    Some(F32Weight::from_tensor(
+                    Some(MmapWeight::from_gguf(
                         gguf,
                         &format!("{prefix}.conv.in_proj.weight"),
                     )?)
@@ -770,7 +704,7 @@ impl DetokenizerWeights {
                     None
                 },
                 conv_out_proj: if is_conv {
-                    Some(F32Weight::from_tensor(
+                    Some(MmapWeight::from_gguf(
                         gguf,
                         &format!("{prefix}.conv.out_proj.weight"),
                     )?)
@@ -786,7 +720,7 @@ impl DetokenizerWeights {
                     None
                 },
                 wq: if !is_conv {
-                    Some(F32Weight::from_tensor(
+                    Some(MmapWeight::from_gguf(
                         gguf,
                         &format!("{prefix}.self_attn.q_proj.weight"),
                     )?)
@@ -794,7 +728,7 @@ impl DetokenizerWeights {
                     None
                 },
                 wk: if !is_conv {
-                    Some(F32Weight::from_tensor(
+                    Some(MmapWeight::from_gguf(
                         gguf,
                         &format!("{prefix}.self_attn.k_proj.weight"),
                     )?)
@@ -802,7 +736,7 @@ impl DetokenizerWeights {
                     None
                 },
                 wv: if !is_conv {
-                    Some(F32Weight::from_tensor(
+                    Some(MmapWeight::from_gguf(
                         gguf,
                         &format!("{prefix}.self_attn.v_proj.weight"),
                     )?)
@@ -810,7 +744,7 @@ impl DetokenizerWeights {
                     None
                 },
                 wo: if !is_conv {
-                    Some(F32Weight::from_tensor(
+                    Some(MmapWeight::from_gguf(
                         gguf,
                         &format!("{prefix}.self_attn.out_proj.weight"),
                     )?)
@@ -912,7 +846,7 @@ pub fn detok_embed_codes(weights: &DetokenizerWeights, codes: &[i32]) -> Vec<f32
     let mut result = vec![0.0f32; emb_dim];
     for (j, &code) in codes.iter().enumerate() {
         let idx = j * n_vocab_per_cb + code as usize;
-        let row = &emb.data[idx * emb_dim..(idx + 1) * emb_dim];
+        let row = &emb.as_f32()[idx * emb_dim..(idx + 1) * emb_dim];
         for (r, e) in result.iter_mut().zip(row) {
             *r += e;
         }

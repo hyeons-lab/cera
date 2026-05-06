@@ -47,6 +47,7 @@ use crate::kv_cache::KvCacheConfig;
 use crate::manifest::ManifestFiles;
 use crate::manifest::{InferenceType, Manifest};
 use crate::model::audio_encoder::AudioEncoderWeights;
+use crate::model::vision_encoder::VisionEncoderWeights;
 use crate::model::{self, Model};
 use crate::session::{ModalityCapabilities, Session, SessionConfig, WickError};
 use crate::tokenizer::BpeTokenizer;
@@ -196,11 +197,17 @@ pub struct WickEngine {
     /// `manifest.files.multimodal_projector` when the inference_type
     /// is `LlamaCppImageToText`. `None` for text / audio bundles, or
     /// when the mmproj fails to open (warned, not fatal — text-only
-    /// chat against a VL bundle still works without it). Phase 1 of
-    /// the VL pipeline only mmaps the file; later phases consume it
-    /// to construct typed `VisionEncoderWeights` and run the ViT
-    /// forward pass.
+    /// chat against a VL bundle still works without it). Kept around
+    /// alongside the typed `vision_encoder` for raw-bytes consumers
+    /// that need direct GGUF metadata access.
     vision_encoder_gguf: Option<Arc<GgufFile>>,
+    /// Typed vision-encoder weights, parsed from the mmproj GGUF.
+    /// `Some` whenever `vision_encoder_gguf` is `Some` and the
+    /// shape sanity checks pass; `None` when the GGUF was
+    /// successfully mmapped but parsing failed (warned). This is
+    /// the primary VL accessor — Phase 2's forward pass reads from
+    /// it directly.
+    vision_encoder: Option<Arc<VisionEncoderWeights>>,
 }
 
 impl WickEngine {
@@ -421,6 +428,15 @@ impl WickEngine {
         } else {
             None
         };
+        // Typed weights only when the raw mmproj loaded — we don't
+        // re-attempt the open here. Failure to parse leaves the
+        // typed slot unset (warned in `try_parse_vision_encoder`)
+        // but text-only chat keeps working. Pass the mmproj path
+        // along so the warn log can identify which file failed.
+        let vl_mmproj_path = manifest.files.multimodal_projector.as_deref();
+        let vision_encoder = vision_encoder_gguf
+            .as_ref()
+            .and_then(|g| try_parse_vision_encoder(g, vl_mmproj_path));
         Ok(Self {
             manifest,
             model,
@@ -429,6 +445,7 @@ impl WickEngine {
             config: cfg,
             audio_encoder,
             vision_encoder_gguf,
+            vision_encoder,
         })
     }
 
@@ -505,21 +522,36 @@ impl WickEngine {
         self.audio_encoder.as_ref()
     }
 
-    /// Borrow the eagerly-mmapped vision-encoder mmproj GGUF, if
-    /// any. `Some` for VL bundles loaded from filesystem paths via
+    /// Borrow the typed vision-encoder weights parsed from the
+    /// mmproj GGUF, if any. **Primary VL accessor** — Phase 2's
+    /// forward pass reads from this. `Some` whenever the mmproj
+    /// loaded AND the typed parse succeeded; `None` for non-VL
+    /// bundles, hermetic constructors (which skip the eager
+    /// load), or when parsing the mmproj failed at engine
+    /// construction (warned via tracing).
+    pub fn vision_encoder(&self) -> Option<&Arc<VisionEncoderWeights>> {
+        self.vision_encoder.as_ref()
+    }
+
+    /// Borrow the raw mmapped vision-encoder mmproj GGUF, if any.
+    /// `Some` for VL bundles loaded from filesystem paths via
     /// `from_path`, `from_files`, or `from_bundle_id`. Hermetic
     /// constructors (`from_bytes`, `from_reader`) skip the eager
     /// mmap to keep the no-filesystem contract, so they always
     /// return `None` here.
     ///
-    /// **Provisional API.** Phase 1 of the VL pipeline exposes the
-    /// raw `Arc<GgufFile>` because typed weights aren't parsed yet.
-    /// Phase 2 will introduce a typed `VisionEncoderWeights` plus a
-    /// `vision_encoder()` accessor that becomes the primary entry
-    /// point; this `_gguf` accessor will stay around as a raw-bytes
-    /// escape hatch for advanced consumers but isn't where most
-    /// callers should land in the long run. Today, image input
+    /// **Escape hatch for raw-bytes consumers — hidden from
+    /// public docs.** Most callers should reach for the typed
+    /// [`Self::vision_encoder`] instead. This accessor stays
+    /// around for tools that need direct GGUF metadata access
+    /// (debug inspection, format-shape introspection, future
+    /// `wick inspect-mmproj`-style commands), but it can
+    /// disagree with `vision_encoder()` — if the mmap succeeded
+    /// but the typed parse failed, this returns `Some` while
+    /// `vision_encoder()` returns `None`. Callers gating VL
+    /// support must use `vision_encoder()`. Today, image input
     /// still errors; text-only chat against a VL bundle works.
+    #[doc(hidden)]
     pub fn vision_encoder_gguf(&self) -> Option<&Arc<GgufFile>> {
         self.vision_encoder_gguf.as_ref()
     }
@@ -888,7 +920,7 @@ fn try_load_audio_encoder(manifest: &Manifest) -> Option<Arc<AudioEncoderWeights
     let mmproj_path = manifest.files.multimodal_projector.as_ref()?;
     let path = Path::new(mmproj_path);
     let gguf = match GgufFile::open(path) {
-        Ok(g) => g,
+        Ok(g) => Arc::new(g),
         Err(e) => {
             tracing::warn!(
                 target: "wick::engine",
@@ -957,6 +989,34 @@ fn try_load_vision_encoder_gguf(manifest: &Manifest) -> Option<Arc<GgufFile>> {
 #[cfg(not(feature = "mmap"))]
 fn try_load_vision_encoder_gguf(_manifest: &Manifest) -> Option<Arc<GgufFile>> {
     None
+}
+
+/// Parse the eagerly-mmapped mmproj GGUF into typed
+/// `VisionEncoderWeights`. Failure is non-fatal — text-only chat
+/// against a VL bundle still works without typed weights — so a
+/// parse error logs a warn and returns `None` rather than failing
+/// the engine load. Phase-2 forward pass code reads
+/// `engine.vision_encoder()` and surfaces an explicit
+/// "no vision encoder attached" error if `None`.
+fn try_parse_vision_encoder(
+    gguf: &Arc<GgufFile>,
+    path: Option<&str>,
+) -> Option<Arc<VisionEncoderWeights>> {
+    match VisionEncoderWeights::from_gguf(gguf) {
+        Ok(w) => Some(Arc::new(w)),
+        Err(e) => {
+            tracing::warn!(
+                target: "wick::engine",
+                path = %path.unwrap_or("<in-memory>"),
+                error = %format!("{e:#}"),
+                "vision mmproj parsed-into-weights step failed; image \
+                 input will surface as 'no vision encoder attached' \
+                 once that path lands. Text-only chat against this \
+                 bundle still works."
+            );
+            None
+        }
+    }
 }
 
 /// Shared gate for the set of `InferenceType`s the engine can actually

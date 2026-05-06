@@ -339,6 +339,16 @@ impl GgufFile {
         Self::from_backing(Backing::Mmap(mmap))
     }
 
+    /// Convenience: [`Self::open`] + wrap in `Arc`. The mmap-backed
+    /// weight loaders ([`crate::model::weights::MmapWeight`]) take
+    /// `&Arc<GgufFile>` so they can hold their own clones of the
+    /// Arc and keep the mmap alive without copying tensor bytes.
+    /// This helper keeps load sites short.
+    #[cfg(feature = "mmap")]
+    pub fn open_arc(path: &Path) -> Result<Arc<Self>> {
+        Self::open(path).map(Arc::new)
+    }
+
     /// Parse a GGUF file from an owned byte buffer. Use for WASM
     /// (no filesystem mmap), in-memory test fixtures, or when the caller
     /// wants to keep the bytes around without re-reading. `Arc<[u8]>` so
@@ -702,6 +712,16 @@ impl GgufFile {
     pub fn tensor_data(&self, name: &str) -> Result<&[u8]> {
         let (_info, range) = self.tensor_range(name)?;
         Ok(&self.data.as_slice()[range])
+    }
+
+    /// Get the byte offset + length of a tensor within
+    /// [`Self::mmap_data`]. Used by [`crate::model::weights::MmapWeight`]
+    /// to construct mmap-backed handles without resorting to raw
+    /// pointer arithmetic between the tensor slice and the backing
+    /// buffer.
+    pub fn tensor_offset_len(&self, name: &str) -> Result<(usize, usize)> {
+        let (_info, range) = self.tensor_range(name)?;
+        Ok((range.start, range.end - range.start))
     }
 
     /// Get tensor metadata: (byte_offset_in_backing, rows, cols, dtype).

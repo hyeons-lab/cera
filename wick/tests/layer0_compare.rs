@@ -46,7 +46,7 @@ fn depthformer_layer0_standalone() {
         eprintln!("vocoder GGUF not found, skipping");
         return;
     }
-    let voc_gguf = wick::gguf::GgufFile::open(&vocoder_path).unwrap();
+    let voc_gguf = wick::gguf::GgufFile::open_arc(&vocoder_path).unwrap();
     let dw = wick::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_gguf).unwrap();
 
     // ── Load known input ────────────────────────────────────────────────

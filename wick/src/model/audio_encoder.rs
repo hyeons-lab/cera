@@ -31,7 +31,9 @@
 use anyhow::{Context, Result};
 
 use crate::gguf::GgufFile;
-use crate::model::audio_decoder::F32Weight;
+use std::sync::Arc;
+
+use crate::model::weights::MmapWeight;
 
 // ── GGUF metadata keys ────────────────────────────────────────────────
 
@@ -109,7 +111,7 @@ pub struct ConvStemWeights {
     pub layers: Vec<ConvLayerWeights>,
     /// `a.pre_encode.out.{weight,bias}` — projects flattened conv
     /// output to `n_embd`.
-    pub pre_encode_out_w: F32Weight,
+    pub pre_encode_out_w: MmapWeight,
     pub pre_encode_out_b: Vec<f32>,
 }
 
@@ -124,10 +126,10 @@ pub struct ConformerLayerWeights {
     pub ffn_norm_w: Vec<f32>,
     pub ffn_norm_b: Vec<f32>,
     /// `a.blk.{il}.ffn_up.{weight,bias}` — `[n_embd → n_ff]`.
-    pub ffn_up_w: F32Weight,
+    pub ffn_up_w: MmapWeight,
     pub ffn_up_b: Vec<f32>,
     /// `a.blk.{il}.ffn_down.{weight,bias}` — `[n_ff → n_embd]`.
-    pub ffn_down_w: F32Weight,
+    pub ffn_down_w: MmapWeight,
     pub ffn_down_b: Vec<f32>,
 
     // ── Multi-head self-attention with relative-position bias ─────
@@ -135,16 +137,16 @@ pub struct ConformerLayerWeights {
     pub ln1_w: Vec<f32>,
     pub ln1_b: Vec<f32>,
     /// `a.blk.{il}.attn_q.{weight,bias}`.
-    pub attn_q_w: F32Weight,
+    pub attn_q_w: MmapWeight,
     pub attn_q_b: Vec<f32>,
     /// `a.blk.{il}.attn_k.{weight,bias}`.
-    pub attn_k_w: F32Weight,
+    pub attn_k_w: MmapWeight,
     pub attn_k_b: Vec<f32>,
     /// `a.blk.{il}.attn_v.{weight,bias}`.
-    pub attn_v_w: F32Weight,
+    pub attn_v_w: MmapWeight,
     pub attn_v_b: Vec<f32>,
     /// `a.blk.{il}.attn_out.{weight,bias}`.
-    pub attn_o_w: F32Weight,
+    pub attn_o_w: MmapWeight,
     pub attn_o_b: Vec<f32>,
     /// `a.blk.{il}.pos_bias_u` — per-head u bias for relative pos.
     pub pos_bias_u: Vec<f32>,
@@ -152,7 +154,7 @@ pub struct ConformerLayerWeights {
     pub pos_bias_v: Vec<f32>,
     /// `a.blk.{il}.linear_pos.weight` — projects relative position
     /// embeddings into per-head dim.
-    pub linear_pos_w: F32Weight,
+    pub linear_pos_w: MmapWeight,
 
     // ── Convolution module (GLU + depthwise + pointwise) ──────────
     /// `a.blk.{il}.norm_conv.{weight,bias}` — conv module pre-norm.
@@ -161,7 +163,7 @@ pub struct ConformerLayerWeights {
     /// `a.blk.{il}.conv_pw1.{weight,bias}` — first pointwise conv
     /// (the GLU split happens by halving the output channels in the
     /// forward pass).
-    pub conv_pw1_w: F32Weight,
+    pub conv_pw1_w: MmapWeight,
     pub conv_pw1_b: Vec<f32>,
     /// `a.blk.{il}.conv_dw.{weight,bias}` — depthwise 1D conv.
     /// `weight` shape is `[channels, 1, kernel_size]`; preserved as
@@ -173,7 +175,7 @@ pub struct ConformerLayerWeights {
     pub conv_norm_w: Vec<f32>,
     pub conv_norm_b: Vec<f32>,
     /// `a.blk.{il}.conv_pw2.{weight,bias}` — second pointwise conv.
-    pub conv_pw2_w: F32Weight,
+    pub conv_pw2_w: MmapWeight,
     pub conv_pw2_b: Vec<f32>,
 
     // ── FFN 2 (with 0.5 residual scaling) ─────────────────────────
@@ -181,10 +183,10 @@ pub struct ConformerLayerWeights {
     pub ffn_norm_1_w: Vec<f32>,
     pub ffn_norm_1_b: Vec<f32>,
     /// `a.blk.{il}.ffn_up_1.{weight,bias}`.
-    pub ffn_up_1_w: F32Weight,
+    pub ffn_up_1_w: MmapWeight,
     pub ffn_up_1_b: Vec<f32>,
     /// `a.blk.{il}.ffn_down_1.{weight,bias}`.
-    pub ffn_down_1_w: F32Weight,
+    pub ffn_down_1_w: MmapWeight,
     pub ffn_down_1_b: Vec<f32>,
 
     // ── Final block norm ──────────────────────────────────────────
@@ -202,10 +204,10 @@ pub struct AudioMlpAdapterWeights {
     pub norm_w: Vec<f32>,
     pub norm_b: Vec<f32>,
     /// `mm.a.mlp.1.{weight,bias}` — `[n_embd → n_ff_adapter]`.
-    pub up_w: F32Weight,
+    pub up_w: MmapWeight,
     pub up_b: Vec<f32>,
     /// `mm.a.mlp.3.{weight,bias}` — `[n_ff_adapter → llm_hidden_size]`.
-    pub down_w: F32Weight,
+    pub down_w: MmapWeight,
     pub down_b: Vec<f32>,
 }
 
@@ -236,7 +238,7 @@ impl AudioEncoderWeights {
     /// the loaded `ffn_up.weight` shape (the metadata key is stale
     /// on the real LFM2.5-Audio-1.5B mmproj GGUF — claims 512 while
     /// the tensor is `[512, 2048]`).
-    pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
+    pub fn from_gguf(gguf: &Arc<GgufFile>) -> Result<Self> {
         // ── Config from metadata ──
         let n_layer = gguf
             .get_u32(KEY_N_LAYER)
@@ -267,7 +269,7 @@ impl AudioEncoderWeights {
         for idx in stem_indices {
             stem_layers.push(load_conv_layer(gguf, idx)?);
         }
-        let pre_encode_out_w = F32Weight::from_tensor(gguf, "a.pre_encode.out.weight")
+        let pre_encode_out_w = MmapWeight::from_gguf(gguf, "a.pre_encode.out.weight")
             .context("loading a.pre_encode.out.weight")?;
         let pre_encode_out_b = load_vec_f32(gguf, "a.pre_encode.out.bias")?;
 
@@ -374,10 +376,10 @@ impl AudioEncoderWeights {
         let mlp_adapter = AudioMlpAdapterWeights {
             norm_w: load_vec_f32(gguf, "mm.a.mlp.0.weight")?,
             norm_b: load_vec_f32(gguf, "mm.a.mlp.0.bias")?,
-            up_w: F32Weight::from_tensor(gguf, "mm.a.mlp.1.weight")
+            up_w: MmapWeight::from_gguf(gguf, "mm.a.mlp.1.weight")
                 .context("loading mm.a.mlp.1.weight")?,
             up_b: load_vec_f32(gguf, "mm.a.mlp.1.bias")?,
-            down_w: F32Weight::from_tensor(gguf, "mm.a.mlp.3.weight")
+            down_w: MmapWeight::from_gguf(gguf, "mm.a.mlp.3.weight")
                 .context("loading mm.a.mlp.3.weight")?,
             down_b: load_vec_f32(gguf, "mm.a.mlp.3.bias")?,
         };
@@ -407,7 +409,7 @@ impl AudioEncoderWeights {
 
 /// Load one conv1d stem layer at the given positional index. Stem
 /// uses `a.conv1d.{idx}.weight` / `.bias` per llama.cpp's naming.
-fn load_conv_layer(gguf: &GgufFile, idx: u32) -> Result<ConvLayerWeights> {
+fn load_conv_layer(gguf: &Arc<GgufFile>, idx: u32) -> Result<ConvLayerWeights> {
     let weight_name = format!("a.conv1d.{idx}.weight");
     let bias_name = format!("a.conv1d.{idx}.bias");
     let weight_t = gguf
@@ -425,12 +427,12 @@ fn load_conv_layer(gguf: &GgufFile, idx: u32) -> Result<ConvLayerWeights> {
 }
 
 /// Load one Conformer block's full weight set.
-fn load_conformer_block(gguf: &GgufFile, il: usize) -> Result<ConformerLayerWeights> {
+fn load_conformer_block(gguf: &Arc<GgufFile>, il: usize) -> Result<ConformerLayerWeights> {
     let pfx = format!("a.blk.{il}");
 
     // Helpers — keep the per-tensor lines short.
-    let wt_f32 = |name: &str| -> Result<F32Weight> {
-        F32Weight::from_tensor(gguf, name).with_context(|| format!("loading {name}"))
+    let wt_f32 = |name: &str| -> Result<MmapWeight> {
+        MmapWeight::from_gguf(gguf, name).with_context(|| format!("loading {name}"))
     };
     let vec_f32 = |name: &str| load_vec_f32(gguf, name);
 
@@ -489,7 +491,7 @@ fn load_conformer_block(gguf: &GgufFile, il: usize) -> Result<ConformerLayerWeig
 }
 
 /// Read a 1D `Vec<f32>` from a GGUF tensor by name.
-fn load_vec_f32(gguf: &GgufFile, name: &str) -> Result<Vec<f32>> {
+fn load_vec_f32(gguf: &Arc<GgufFile>, name: &str) -> Result<Vec<f32>> {
     let tensor = gguf
         .get_tensor(name)
         .with_context(|| format!("loading {name}"))?;
@@ -613,9 +615,9 @@ pub fn conformer_ffn_forward(
     x: &mut [f32],
     norm_w: &[f32],
     norm_b: &[f32],
-    up_w: &F32Weight,
+    up_w: &MmapWeight,
     up_b: &[f32],
-    down_w: &F32Weight,
+    down_w: &MmapWeight,
     down_b: &[f32],
     n_embd: usize,
     n_ff: usize,
@@ -718,13 +720,13 @@ pub fn conformer_conv_module_forward(
     x: &mut [f32],
     norm_conv_w: &[f32],
     norm_conv_b: &[f32],
-    pw1_w: &F32Weight,
+    pw1_w: &MmapWeight,
     pw1_b: &[f32],
     conv_dw_w: &[f32],
     conv_dw_b: &[f32],
     conv_norm_w: &[f32],
     conv_norm_b: &[f32],
-    pw2_w: &F32Weight,
+    pw2_w: &MmapWeight,
     pw2_b: &[f32],
     n_embd: usize,
     t: usize,
@@ -922,7 +924,7 @@ pub fn conformer_conv_module_forward(
 /// - **`f64` accumulation** is used for the attention-score dot
 ///   products (`matrix_ac`, `matrix_bd`), the softmax sums, and
 ///   the `attn @ V` reduction. The dense projections (`Q`/`K`/`V`,
-///   `linear_pos`, output) go through `F32Weight::gemv`, which
+///   `linear_pos`, output) go through `MmapWeight::gemv`, which
 ///   accumulates in `f32`. A future change could swap in an
 ///   f64-accumulating GEMV path if encoder numerics need
 ///   tightening.
@@ -941,17 +943,17 @@ pub fn conformer_self_attention_forward(
     pos_emb: &[f32],
     ln1_w: &[f32],
     ln1_b: &[f32],
-    attn_q_w: &F32Weight,
+    attn_q_w: &MmapWeight,
     attn_q_b: &[f32],
-    attn_k_w: &F32Weight,
+    attn_k_w: &MmapWeight,
     attn_k_b: &[f32],
-    attn_v_w: &F32Weight,
+    attn_v_w: &MmapWeight,
     attn_v_b: &[f32],
-    attn_o_w: &F32Weight,
+    attn_o_w: &MmapWeight,
     attn_o_b: &[f32],
     pos_bias_u: &[f32],
     pos_bias_v: &[f32],
-    linear_pos_w: &F32Weight,
+    linear_pos_w: &MmapWeight,
     n_embd: usize,
     n_head: usize,
     t: usize,
@@ -1649,7 +1651,7 @@ mod tests {
     #[test]
     fn from_gguf_errors_on_missing_metadata() {
         let bytes: Arc<[u8]> = Arc::from(empty_gguf_bytes().into_boxed_slice());
-        let gguf = GgufFile::from_bytes(bytes).expect("parse minimal gguf");
+        let gguf = Arc::new(GgufFile::from_bytes(bytes).expect("parse minimal gguf"));
         match AudioEncoderWeights::from_gguf(&gguf) {
             Ok(_) => panic!("expected missing-metadata error, got Ok"),
             Err(e) => {
@@ -1695,7 +1697,7 @@ mod tests {
             eprintln!("skip: mmproj GGUF not at {}", path.display());
             return;
         }
-        let gguf = GgufFile::open(&path).expect("open mmproj gguf");
+        let gguf = GgufFile::open_arc(&path).expect("open mmproj gguf");
         let w = AudioEncoderWeights::from_gguf(&gguf).expect("load mmproj gguf");
 
         // Real-bundle config (verified via `wick-cli inspect`):
@@ -1760,11 +1762,7 @@ mod tests {
         for i in 0..n_embd {
             pw1_w_data[i * n_embd + i] = 1.0;
         }
-        let pw1_w = F32Weight {
-            data: pw1_w_data,
-            rows: 2 * n_embd,
-            cols: n_embd,
-        };
+        let pw1_w = MmapWeight::from_owned_f32(pw1_w_data, 2 * n_embd, n_embd);
         let pw1_b = vec![0.0; 2 * n_embd];
 
         // conv_dw_w [n_embd × kernel]: per-channel kernel [0, 1, 0].
@@ -1787,11 +1785,7 @@ mod tests {
         for i in 0..n_embd {
             pw2_w_data[i * n_embd + i] = 1.0;
         }
-        let pw2_w = F32Weight {
-            data: pw2_w_data,
-            rows: n_embd,
-            cols: n_embd,
-        };
+        let pw2_w = MmapWeight::from_owned_f32(pw2_w_data, n_embd, n_embd);
         let pw2_b = vec![0.0; n_embd];
 
         conformer_conv_module_forward(
@@ -1850,7 +1844,7 @@ mod tests {
         let norm_w = vec![1.0; n_embd];
         let norm_b = vec![0.0; n_embd];
 
-        // Identity matrix for both up and down (in F32Weight's
+        // Identity matrix for both up and down (in MmapWeight's
         // [rows, cols] = [n_ff, n_embd] layout, row-major).
         let identity = vec![
             1.0, 0.0, 0.0, 0.0, // row 0
@@ -1858,17 +1852,9 @@ mod tests {
             0.0, 0.0, 1.0, 0.0, // row 2
             0.0, 0.0, 0.0, 1.0, // row 3
         ];
-        let up_w = F32Weight {
-            data: identity.clone(),
-            rows: n_ff,
-            cols: n_embd,
-        };
+        let up_w = MmapWeight::from_owned_f32(identity.clone(), n_ff, n_embd);
         let up_b = vec![0.0; n_ff];
-        let down_w = F32Weight {
-            data: identity,
-            rows: n_embd,
-            cols: n_ff,
-        };
+        let down_w = MmapWeight::from_owned_f32(identity, n_embd, n_ff);
         let down_b = vec![0.0; n_embd];
 
         let mut scratch_pre_norm = vec![0.0; n_embd];
@@ -2023,13 +2009,9 @@ mod tests {
         let ln1_w: Vec<f32> = (0..n_embd).map(|i| 0.9 + 0.05 * i as f32).collect();
         let ln1_b: Vec<f32> = (0..n_embd).map(|i| 0.01 * i as f32).collect();
 
-        let mk_w = |seed: usize| -> F32Weight {
+        let mk_w = |seed: usize| -> MmapWeight {
             let data: Vec<f32> = (0..n_embd * n_embd).map(|i| pat(seed, i)).collect();
-            F32Weight {
-                data,
-                rows: n_embd,
-                cols: n_embd,
-            }
+            MmapWeight::from_owned_f32(data, n_embd, n_embd)
         };
         let mk_b = |seed: usize| -> Vec<f32> { (0..n_embd).map(|i| pat(seed, i) * 0.5).collect() };
 
@@ -2055,11 +2037,7 @@ mod tests {
                     data[r * POS_EMB_DIM + c] = pat(301 + r, c);
                 }
             }
-            F32Weight {
-                data,
-                rows: n_embd,
-                cols: POS_EMB_DIM,
-            }
+            MmapWeight::from_owned_f32(data, n_embd, POS_EMB_DIM)
         };
 
         conformer_self_attention_forward(
@@ -2095,10 +2073,11 @@ mod tests {
                 .map(|(i, &v)| ((v as f64 - mean) * inv_std * w[i] as f64 + b[i] as f64) as f32)
                 .collect()
         };
-        let matvec = |w: &F32Weight, x: &[f32], b: &[f32]| -> Vec<f32> {
+        let matvec = |w: &MmapWeight, x: &[f32], b: &[f32]| -> Vec<f32> {
+            let w_data = w.as_f32();
             (0..w.rows)
                 .map(|r| {
-                    let row = &w.data[r * w.cols..(r + 1) * w.cols];
+                    let row = &w_data[r * w.cols..(r + 1) * w.cols];
                     let mut s = b[r] as f64;
                     for c in 0..w.cols {
                         s += row[c] as f64 * x[c] as f64;
@@ -2211,18 +2190,11 @@ mod tests {
         let n_head = 2;
         let mut x: Vec<f32> = vec![];
         let pos_emb: Vec<f32> = vec![];
-        let zero_w = F32Weight {
-            data: vec![0.0; n_embd * n_embd],
-            rows: n_embd,
-            cols: n_embd,
-        };
+        let zero_w = MmapWeight::from_owned_f32(vec![0.0; n_embd * n_embd], n_embd, n_embd);
         let zero_b = vec![0.0; n_embd];
         let zero_pos = vec![0.0; n_embd];
-        let zero_lp = F32Weight {
-            data: vec![0.0; n_embd * POS_EMB_DIM],
-            rows: n_embd,
-            cols: POS_EMB_DIM,
-        };
+        let zero_lp =
+            MmapWeight::from_owned_f32(vec![0.0; n_embd * POS_EMB_DIM], n_embd, POS_EMB_DIM);
         let ones = vec![1.0; n_embd];
 
         conformer_self_attention_forward(
@@ -2326,11 +2298,7 @@ mod tests {
                 for i in 0..n_embd {
                     data[i * plane + i] = 1.0;
                 }
-                F32Weight {
-                    data,
-                    rows: n_embd,
-                    cols: plane,
-                }
+                MmapWeight::from_owned_f32(data, n_embd, plane)
             },
             pre_encode_out_b: vec![0.0; n_embd],
         };
@@ -2401,11 +2369,7 @@ mod tests {
                     shape: vec![1, 1, 2, 2],
                 },
             ],
-            pre_encode_out_w: F32Weight {
-                data: vec![0.0; 2 * 2],
-                rows: 2,
-                cols: 2,
-            },
+            pre_encode_out_w: MmapWeight::from_owned_f32(vec![0.0; 2 * 2], 2, 2),
             pre_encode_out_b: vec![0.0; 2],
         };
 
@@ -2421,11 +2385,7 @@ mod tests {
     /// unchanged; the only transform is the per-block ln_2
     /// LayerNorm + the MLP adapter.
     fn neutral_conformer_block(n_embd: usize, n_ff: usize) -> ConformerLayerWeights {
-        let zero_w = |rows, cols| F32Weight {
-            data: vec![0.0; rows * cols],
-            rows,
-            cols,
-        };
+        let zero_w = |rows, cols| MmapWeight::from_owned_f32(vec![0.0; rows * cols], rows, cols);
         ConformerLayerWeights {
             // FFN-1
             ffn_norm_w: vec![1.0; n_embd],
@@ -2524,11 +2484,7 @@ mod tests {
                 for i in 0..n_embd {
                     data[i * n_embd + i] = 1.0;
                 }
-                F32Weight {
-                    data,
-                    rows: n_embd,
-                    cols: n_embd,
-                }
+                MmapWeight::from_owned_f32(data, n_embd, n_embd)
             },
             pre_encode_out_b: vec![0.0; n_embd],
         };
@@ -2547,17 +2503,9 @@ mod tests {
         let mlp_adapter = AudioMlpAdapterWeights {
             norm_w: vec![1.0; n_embd],
             norm_b: vec![0.0; n_embd],
-            up_w: F32Weight {
-                data: adapter_up,
-                rows: n_ff_adapter,
-                cols: n_embd,
-            },
+            up_w: MmapWeight::from_owned_f32(adapter_up, n_ff_adapter, n_embd),
             up_b: vec![0.0; n_ff_adapter],
-            down_w: F32Weight {
-                data: adapter_down,
-                rows: llm_hidden_size,
-                cols: n_ff_adapter,
-            },
+            down_w: MmapWeight::from_owned_f32(adapter_down, llm_hidden_size, n_ff_adapter),
             down_b: vec![0.0; llm_hidden_size],
         };
 
@@ -2634,11 +2582,7 @@ mod tests {
                 for i in 0..n_embd {
                     data[i * n_embd + i] = 1.0;
                 }
-                F32Weight {
-                    data,
-                    rows: n_embd,
-                    cols: n_embd,
-                }
+                MmapWeight::from_owned_f32(data, n_embd, n_embd)
             },
             pre_encode_out_b: vec![0.0; n_embd],
         };
@@ -2654,17 +2598,9 @@ mod tests {
         let mlp_adapter = AudioMlpAdapterWeights {
             norm_w: vec![1.0; n_embd],
             norm_b: vec![0.0; n_embd],
-            up_w: F32Weight {
-                data: adapter_up,
-                rows: n_ff_adapter,
-                cols: n_embd,
-            },
+            up_w: MmapWeight::from_owned_f32(adapter_up, n_ff_adapter, n_embd),
             up_b: vec![0.0; n_ff_adapter],
-            down_w: F32Weight {
-                data: adapter_down,
-                rows: llm_hidden_size,
-                cols: n_ff_adapter,
-            },
+            down_w: MmapWeight::from_owned_f32(adapter_down, llm_hidden_size, n_ff_adapter),
             down_b: vec![0.0; llm_hidden_size],
         };
 
@@ -2732,28 +2668,20 @@ mod tests {
                         shape: vec![1, 1, n_embd, n_embd],
                     },
                 ],
-                pre_encode_out_w: F32Weight {
-                    data: vec![0.0; n_embd * n_embd],
-                    rows: n_embd,
-                    cols: n_embd,
-                },
+                pre_encode_out_w: MmapWeight::from_owned_f32(
+                    vec![0.0; n_embd * n_embd],
+                    n_embd,
+                    n_embd,
+                ),
                 pre_encode_out_b: vec![0.0; n_embd],
             },
             layers: vec![],
             mlp_adapter: AudioMlpAdapterWeights {
                 norm_w: vec![1.0; n_embd],
                 norm_b: vec![0.0; n_embd],
-                up_w: F32Weight {
-                    data: vec![0.0; n_embd * n_embd],
-                    rows: n_embd,
-                    cols: n_embd,
-                },
+                up_w: MmapWeight::from_owned_f32(vec![0.0; n_embd * n_embd], n_embd, n_embd),
                 up_b: vec![0.0; n_embd],
-                down_w: F32Weight {
-                    data: vec![0.0; n_embd * n_embd],
-                    rows: n_embd,
-                    cols: n_embd,
-                },
+                down_w: MmapWeight::from_owned_f32(vec![0.0; n_embd * n_embd], n_embd, n_embd),
                 down_b: vec![0.0; n_embd],
             },
         };
@@ -2810,11 +2738,7 @@ mod tests {
                 for i in 0..n_embd {
                     data[i * n_embd + i] = 1.0;
                 }
-                F32Weight {
-                    data,
-                    rows: n_embd,
-                    cols: n_embd,
-                }
+                MmapWeight::from_owned_f32(data, n_embd, n_embd)
             },
             pre_encode_out_b: vec![0.0; n_embd],
         };
@@ -2830,17 +2754,9 @@ mod tests {
         let mlp_adapter = AudioMlpAdapterWeights {
             norm_w: vec![1.0; n_embd],
             norm_b: vec![0.0; n_embd],
-            up_w: F32Weight {
-                data: adapter_up,
-                rows: n_ff_adapter,
-                cols: n_embd,
-            },
+            up_w: MmapWeight::from_owned_f32(adapter_up, n_ff_adapter, n_embd),
             up_b: vec![0.0; n_ff_adapter],
-            down_w: F32Weight {
-                data: adapter_down,
-                rows: llm_hidden_size,
-                cols: n_ff_adapter,
-            },
+            down_w: MmapWeight::from_owned_f32(adapter_down, llm_hidden_size, n_ff_adapter),
             down_b: vec![0.0; llm_hidden_size],
         };
 
@@ -2908,28 +2824,20 @@ mod tests {
                         shape: vec![1, 1, n_embd, n_embd],
                     },
                 ],
-                pre_encode_out_w: F32Weight {
-                    data: vec![0.0; n_embd * n_embd],
-                    rows: n_embd,
-                    cols: n_embd,
-                },
+                pre_encode_out_w: MmapWeight::from_owned_f32(
+                    vec![0.0; n_embd * n_embd],
+                    n_embd,
+                    n_embd,
+                ),
                 pre_encode_out_b: vec![0.0; n_embd],
             },
             layers: vec![],
             mlp_adapter: AudioMlpAdapterWeights {
                 norm_w: vec![1.0; n_embd],
                 norm_b: vec![0.0; n_embd],
-                up_w: F32Weight {
-                    data: vec![0.0; n_embd * n_embd],
-                    rows: n_embd,
-                    cols: n_embd,
-                },
+                up_w: MmapWeight::from_owned_f32(vec![0.0; n_embd * n_embd], n_embd, n_embd),
                 up_b: vec![0.0; n_embd],
-                down_w: F32Weight {
-                    data: vec![0.0; n_embd * n_embd],
-                    rows: n_embd,
-                    cols: n_embd,
-                },
+                down_w: MmapWeight::from_owned_f32(vec![0.0; n_embd * n_embd], n_embd, n_embd),
                 down_b: vec![0.0; n_embd],
             },
         };

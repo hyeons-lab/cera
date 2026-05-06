@@ -105,6 +105,70 @@ fn vl_bundle_loads_text_only() {
         "mmproj should set `clip.has_vision_encoder = true`"
     );
 
+    // Phase-2 typed loader. The mmproj must have been parsed into
+    // `VisionEncoderWeights`; spec from `project_vl_architecture.md`
+    // (LFM2.5-VL-450M ViT-12-768).
+    let ve = engine
+        .vision_encoder()
+        .expect("VL bundles must expose typed VisionEncoderWeights via vision_encoder()");
+    assert_eq!(ve.config.n_layer, 12, "ViT block count");
+    assert_eq!(ve.config.n_embd, 768, "ViT hidden dim");
+    assert_eq!(ve.config.n_head, 12, "ViT head count");
+    assert_eq!(ve.config.n_ff, 3072, "ViT FFN dim");
+    assert_eq!(ve.config.image_size, 256);
+    assert_eq!(ve.config.patch_size, 16);
+    assert_eq!(ve.config.n_patches, 256, "16×16 patch grid");
+    assert_eq!(ve.config.projection_dim, 1024, "matches LFM2 embed dim");
+    assert_eq!(ve.config.scale_factor, 2, "pixel-shuffle factor");
+    assert_eq!(ve.blocks.len(), 12);
+
+    // Sanity-check the preprocessing constants. The loader reads
+    // `clip.vision.image_{mean,std}` from f32-array metadata; if
+    // the key got renamed or the array length drifted, the
+    // loader bails — but a wrong-but-loadable replacement (e.g.
+    // a key returning all-zeros) would slip through. CLIP-family
+    // mean/std fall in (0, 1); std must be non-zero to avoid
+    // divide-by-zero in the future preprocessor.
+    for (i, m) in ve.config.image_mean.iter().enumerate() {
+        assert!(*m > 0.0 && *m < 1.0, "image_mean[{i}] = {m} outside (0, 1)");
+    }
+    for (i, s) in ve.config.image_std.iter().enumerate() {
+        assert!(*s > 0.0 && *s < 1.0, "image_std[{i}] = {s} outside (0, 1)");
+    }
+    assert!(
+        ve.config.eps > 0.0 && ve.config.eps < 1e-3,
+        "layer_norm_epsilon = {} outside (0, 1e-3)",
+        ve.config.eps
+    );
+
+    // Per-block shapes — every block must have the same
+    // ViT-12-768 layout. Looping catches a hypothetical
+    // off-by-one or partial-load bug that would leave a later
+    // block in a degenerate state. Loader's `anyhow::ensure!`
+    // already runs at parse time but asserting here encodes the
+    // contract.
+    for (i, blk) in ve.blocks.iter().enumerate() {
+        assert_eq!(blk.q_w.rows, 768, "block {i} q_w rows");
+        assert_eq!(blk.q_w.cols, 768, "block {i} q_w cols");
+        assert_eq!(blk.k_w.rows, 768, "block {i} k_w rows");
+        assert_eq!(blk.v_w.rows, 768, "block {i} v_w rows");
+        assert_eq!(blk.o_w.rows, 768, "block {i} o_w rows");
+        assert_eq!(blk.ffn_up_w.rows, 3072, "block {i} ffn_up_w rows");
+        assert_eq!(blk.ffn_up_w.cols, 768, "block {i} ffn_up_w cols");
+        assert_eq!(blk.ffn_down_w.rows, 768, "block {i} ffn_down_w rows");
+        assert_eq!(blk.ffn_down_w.cols, 3072, "block {i} ffn_down_w cols");
+        assert_eq!(blk.ln1_w.len(), 768, "block {i} ln1_w len");
+        assert_eq!(blk.ln2_w.len(), 768, "block {i} ln2_w len");
+    }
+
+    // Position embeddings cover every patch.
+    assert_eq!(ve.position_embed.len(), 256 * 768);
+    // Projector dims: mm.1 is [3072 → 2048], mm.2 is [2048 → 1024].
+    assert_eq!(ve.projector.mm1_w.rows, 2048);
+    assert_eq!(ve.projector.mm1_w.cols, 3072);
+    assert_eq!(ve.projector.mm2_w.rows, 1024);
+    assert_eq!(ve.projector.mm2_w.cols, 2048);
+
     // End-to-end: render the chat template (exercises the
     // `{% generation %}` strip in tokenizer.rs), tokenize, prefill,
     // and greedy-decode a few tokens. Catches regressions in either
