@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7,6 +7,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use wick::tokenizer::BpeTokenizer;
 use wick::{BackendPreference, EngineConfig, FinishReason, ModalitySink, WickEngine};
+
+mod chat_tui;
 
 /// Decode tokens to stdout as they stream. Used by the `run` command.
 ///
@@ -401,6 +403,15 @@ enum Command {
         /// `--temperature > 0`; ignored under greedy decoding.
         #[arg(long)]
         seed: Option<u64>,
+
+        /// Disable the inline TUI even when stdin/stdout are TTYs.
+        /// Falls back to the line-based REPL — useful for shell
+        /// scripting, log capture, or terminals that don't speak
+        /// the ratatui control sequences cleanly. Auto-detection
+        /// also falls back to the line REPL when either stdin or
+        /// stdout is redirected.
+        #[arg(long)]
+        no_tui: bool,
     },
 
     /// Tokenize text and print token IDs (for comparison with HuggingFace).
@@ -1472,6 +1483,7 @@ fn main() -> Result<()> {
             max_tokens,
             temperature,
             seed,
+            no_tui,
         } => {
             use std::io::BufRead;
 
@@ -1509,7 +1521,7 @@ fn main() -> Result<()> {
                 );
             }
 
-            let mut session = engine.new_session(wick::SessionConfig {
+            let session = engine.new_session(wick::SessionConfig {
                 seed,
                 ..Default::default()
             });
@@ -1522,6 +1534,29 @@ fn main() -> Result<()> {
                 });
             }
 
+            let opts = wick::GenerateOpts {
+                max_tokens: max_tokens as u32,
+                temperature,
+                ..Default::default()
+            };
+
+            // Dispatch: inline TUI when both stdin AND stdout are TTYs
+            // (so cursor positioning + raw-mode keystroke reads behave
+            // sensibly) and the user didn't opt out via `--no-tui`.
+            // Otherwise fall back to the line-based REPL — works for
+            // pipes, log capture, dumb terminals, scripted tests.
+            let use_tui =
+                !no_tui && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+            if use_tui {
+                // `tokenizer_arc()` shares the engine's existing
+                // `Arc<BpeTokenizer>` with the worker thread instead
+                // of deep-cloning the vocab + merge tables.
+                let _final_history = chat_tui::run(session, engine.tokenizer_arc(), history, opts)?;
+                return Ok(());
+            }
+
+            // Line-based REPL fallback below.
+            let mut session = session;
             // The actual backend choice is reported by `load_engine` via
             // its own "Using ... backend" line above; don't echo `device`
             // here since under `--device auto` it'd misrepresent the
@@ -1636,12 +1671,6 @@ fn main() -> Result<()> {
                     history.pop();
                     continue;
                 }
-
-                let opts = wick::GenerateOpts {
-                    max_tokens: max_tokens as u32,
-                    temperature,
-                    ..Default::default()
-                };
 
                 eprint!("assistant> ");
                 std::io::stderr().flush().ok();
