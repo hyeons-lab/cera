@@ -415,9 +415,39 @@ enum Command {
     /// (WICK_PROFILE must be unset) — profile-mode timings are diagnostic and
     /// don't predict real decode throughput.
     Bench {
-        /// Path to the model (`.gguf`, `.json` manifest, or manifest dir).
-        #[arg(short, long)]
-        model: String,
+        /// Path to the model: a `.gguf` file, a `.json` LeapBundles
+        /// manifest, or a directory containing exactly one `.json`
+        /// manifest. Mutually exclusive with `--bundle-id` /
+        /// `--quant`; one of the two source forms must be set.
+        #[arg(
+            short,
+            long,
+            conflicts_with_all = ["bundle_id", "quant"],
+        )]
+        model: Option<String>,
+
+        /// LeapBundles bundle id (e.g. `LFM2-1.2B-GGUF`). Pairs
+        /// with `--quant` for auto-download from
+        /// `huggingface.co/LiquidAI/LeapBundles`. Cached under
+        /// `--cache-dir` (default `$HOME/.cache/wick`).
+        #[arg(long, requires = "quant")]
+        bundle_id: Option<String>,
+
+        /// Quantization label for `--bundle-id` (e.g. `Q4_0`,
+        /// `Q8_0`). Pairs with `--bundle-id`: clap rejects
+        /// either flag without the other.
+        #[arg(long, requires = "bundle_id")]
+        quant: Option<String>,
+
+        /// Cache root for `--bundle-id` downloads. Default:
+        /// `$HOME/.cache/wick`. Used only for bundle download
+        /// caching; bench's KV prefix cache is the engine default
+        /// (warm-only, in-memory) regardless of this flag —
+        /// `wick run --cache-dir <d>` is the right entrypoint
+        /// for KV-cache-aware benchmarks. No-op when `--model`
+        /// is used.
+        #[arg(long)]
+        cache_dir: Option<String>,
 
         /// The prompt to benchmark on.
         #[arg(short, long, default_value = "The capital of France is")]
@@ -1584,6 +1614,9 @@ fn main() -> Result<()> {
         }
         Command::Bench {
             model,
+            bundle_id,
+            quant,
+            cache_dir,
             prompt,
             prompt_tokens,
             runs,
@@ -1602,8 +1635,14 @@ fn main() -> Result<()> {
                 );
             }
 
-            let engine =
-                load_engine_from_spec(ModelSpec::Path(Path::new(&model)), &device, context_size)?;
+            let engine = resolve_engine(
+                model.as_deref(),
+                bundle_id.as_deref(),
+                quant.as_deref(),
+                cache_dir.as_deref(),
+                &device,
+                context_size,
+            )?;
             let tokenizer = engine.tokenizer();
             let add_bos = engine.metadata().add_bos_token;
             let kv_compression = setup_kv_compression(engine.model(), &kv_cache_keys)?;
@@ -1985,6 +2024,46 @@ mod tests {
             r.is_ok(),
             "expected `run --bundle-id X --quant Y` to parse, got: {:?}",
             r.err()
+        );
+    }
+
+    /// `bench` is the third subcommand carrying the bundle-id
+    /// surface; ensure it parses too.
+    #[test]
+    fn bench_subcommand_parses_with_bundle_id() {
+        let r = Cli::try_parse_from([
+            "wick",
+            "bench",
+            "--bundle-id",
+            "LFM2-1.2B-GGUF",
+            "--quant",
+            "Q4_0",
+        ]);
+        assert!(
+            r.is_ok(),
+            "expected `bench --bundle-id X --quant Y` to parse, got: {:?}",
+            r.err()
+        );
+    }
+
+    /// `bench --model` + `--bundle-id` must be rejected at parse
+    /// time (mutually exclusive). Mirrors the gate on `run` /
+    /// `chat`.
+    #[test]
+    fn bench_subcommand_rejects_model_with_bundle_id() {
+        let r = Cli::try_parse_from([
+            "wick",
+            "bench",
+            "--model",
+            "/tmp/x",
+            "--bundle-id",
+            "LFM2-1.2B-GGUF",
+            "--quant",
+            "Q4_0",
+        ]);
+        assert!(
+            r.is_err(),
+            "expected `bench --model` + `--bundle-id` to be rejected by clap"
         );
     }
 
