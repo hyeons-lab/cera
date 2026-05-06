@@ -2359,14 +2359,13 @@ impl Model for Lfm2Model {
             "forward_prefill requires at least one token"
         );
 
-        // Cache participation gates:
-        // - `start_pos == 0`: only on a fresh prefill. Continuation
-        //   prefills (chunked / mid-sequence) carry KV state from
-        //   the prior chunk so a cache restore would clobber it.
-        // - `!state.is_compressed()`: TurboQuant-compressed caches
-        //   don't fit `LayerSnapshot::Attention { k_data, v_data }`
-        //   cleanly; same gate the n_keep shift uses.
-        let cache_eligible = start_pos == 0 && !state.is_compressed();
+        // Cache participation gate: only on a fresh prefill
+        // (`start_pos == 0`). Continuation prefills (chunked /
+        // mid-sequence) carry KV state from the prior chunk so a
+        // cache restore would clobber it. TurboQuant-compressed
+        // states are now supported via `LayerSnapshot::AttentionCompressed`
+        // (the `!is_compressed()` exclusion was lifted in this PR).
+        let cache_eligible = start_pos == 0;
 
         if cache_eligible {
             let hit = self
@@ -2375,19 +2374,55 @@ impl Model for Lfm2Model {
                 .expect("prefix_cache mutex poisoned")
                 .find_longest_prefix(tokens);
             if let Some((snapshot, prefix_len)) = hit {
-                // Keep at least one token for the suffix prefill so we
-                // always run a forward pass that produces logits.
-                let use_len = prefix_len.min(tokens.len().saturating_sub(1));
-                if use_len > 0 {
-                    state.restore(&snapshot);
-                    let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
-                    if let Some(snap) = state.snapshot() {
-                        self.prefix_cache
-                            .lock()
-                            .expect("prefix_cache mutex poisoned")
-                            .insert(tokens, snap);
+                // Compatibility gate: snapshot's compression mode
+                // must match the live state's. Cross-mode restores
+                // would panic in `InferenceState::restore`
+                // (compressed snapshot into `None` slots, or
+                // uncompressed snapshot into a TurboQuant-
+                // configured state with mismatched scratch / rotation
+                // shape). Three live-state modes:
+                //
+                // - fully uncompressed → match `Attention` snapshots.
+                // - fully compressed   → match `AttentionCompressed`.
+                // - mixed-mode (one side compressed, the other not):
+                //   `snapshot()` returns `None` so the cache never
+                //   holds an entry that matches; both branches below
+                //   reject.
+                //
+                // `state.is_compressed()` (any-side-compressed) is
+                // too loose for the compressed branch: a mixed-mode
+                // state would erroneously match a fully-compressed
+                // snapshot and panic in `restore`. Use
+                // `is_fully_compressed` for the compressed branch,
+                // `!is_compressed` for the uncompressed branch.
+                // Today `model_fingerprint` doesn't include the
+                // compression flags, so a `--cache-dir` shared
+                // between TurboQuant and uncompressed runs of the
+                // same model file relies on this gate; v2 could
+                // fold compression into the fingerprint.
+                let compatible = if snapshot.is_compressed() {
+                    state.is_fully_compressed() && state.is_compressed()
+                } else {
+                    !state.is_compressed()
+                };
+                if !compatible {
+                    // skip; fall through to cold prefill.
+                } else {
+                    // Keep at least one token for the suffix prefill
+                    // so we always run a forward pass that produces
+                    // logits.
+                    let use_len = prefix_len.min(tokens.len().saturating_sub(1));
+                    if use_len > 0 {
+                        state.restore(&snapshot);
+                        let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
+                        if let Some(snap) = state.snapshot() {
+                            self.prefix_cache
+                                .lock()
+                                .expect("prefix_cache mutex poisoned")
+                                .insert(tokens, snap);
+                        }
+                        return logits;
                     }
-                    return logits;
                 }
             }
         }
