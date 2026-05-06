@@ -267,3 +267,146 @@ fn vl_bundle_loads_text_only() {
          numerical blow-up somewhere in the pipeline"
     );
 }
+
+/// **Phase 3 slice 1 end-to-end smoke.** Synthesises an in-memory
+/// PNG, drives `Session::append_image` end-to-end (preprocess →
+/// ViT → projector → splice into LLM prefill via
+/// `append_embeddings`), generates a few tokens, and asserts the
+/// LLM produced non-degenerate text. Catches "completely broken"
+/// — pipeline runs, image embeddings get into the LLM stream, the
+/// LLM doesn't crash on them. Strong correctness gate (parity vs
+/// `clip.cpp` on a real image with strict numerical tolerance) is
+/// deferred; the LLM-output check rules out gross structural
+/// issues like NaN propagation or pixel-shuffle row/col swaps
+/// causing the LLM to produce gibberish.
+#[test]
+#[ignore = "downloads ~310 MB across two GGUFs; set WICK_TEST_DOWNLOAD=1 and pass --ignored"]
+fn vl_bundle_appends_synthetic_image() {
+    if std::env::var("WICK_TEST_DOWNLOAD").is_err() {
+        eprintln!("skipping: WICK_TEST_DOWNLOAD not set");
+        return;
+    }
+
+    let main = common::download::ensure_cached(MAIN_URL, MAIN_FILE);
+    let mmproj = common::download::ensure_cached(MMPROJ_URL, MMPROJ_FILE);
+    let mut files = ModelFiles::text(&main);
+    files.multimodal_projector = Some(mmproj);
+    files.inference_type = Some(InferenceType::LlamaCppImageToText);
+    let engine = WickEngine::from_files(
+        files,
+        EngineConfig {
+            // The LLM context needs room for prefix tokens + 64
+            // image tokens + suffix tokens + a few generation
+            // tokens. 256 is plenty for the smoke.
+            context_size: 256,
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        },
+    )
+    .expect("VL bundle load");
+
+    // Image input: prefer a real fixture at
+    // `wick/tests/fixtures/pug.jpg` (committed for end-to-end
+    // demos against an actual recognisable subject). Fall back
+    // to a synthesised solid-red 256² PNG when the fixture is
+    // missing — keeps the smoke runnable in environments that
+    // haven't checked out the fixture (also avoids hard-failing
+    // when this test runs through `--test-threads=1` on a
+    // shallow clone). The smoke only asserts the LLM produces
+    // non-degenerate text, so either input is fine for that
+    // gate; a real image just gives nicer manual output.
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("pug.jpg");
+    let img_bytes: Vec<u8> = if fixture.exists() {
+        std::fs::read(&fixture).expect("read pug.jpg fixture")
+    } else {
+        eprintln!(
+            "note: {} not found — falling back to a synthetic red PNG. \
+             Save a small image fixture at that path for richer manual output.",
+            fixture.display()
+        );
+        use image::{ImageBuffer, Rgb};
+        let img = ImageBuffer::<Rgb<u8>, _>::from_fn(256, 256, |_, _| Rgb([255u8, 0, 0]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode synthetic png");
+        png
+    };
+
+    // Capabilities should now report image_in for VL bundles.
+    let caps = engine.capabilities();
+    assert!(caps.image_in, "VL capabilities must report image_in=true");
+
+    // Render the chat-template "image+text" prompt manually,
+    // splitting around the literal `<image>` token the template
+    // emits for content items with `type == "image"`. Then drive
+    // the prefix/image/suffix interleave directly through
+    // `Session::append_tokens` / `append_image`.
+    let tokenizer = engine.tokenizer();
+    let messages = vec![ChatMessage {
+        role: "user".to_string(),
+        // Plain text content — append_image splices BEFORE the
+        // text on the prefix side; the chat template's
+        // `parse_content` macro emits a literal `<image>` token
+        // for richer content lists, but we drive the prefix /
+        // image / suffix split manually so the test stays
+        // independent of the template's image handling.
+        content: "Describe what you see.".to_string(),
+    }];
+    let formatted = wick::tokenizer::apply_chat_template(tokenizer, &messages, true)
+        .expect("chat template render");
+    let prompt_tokens = tokenizer.encode(&formatted);
+    assert!(!prompt_tokens.is_empty(), "tokenized prompt is empty");
+
+    // The chat-template-emitted prompt has the assistant tag at
+    // the end ("…<|im_start|>assistant\n"). For the smoke, we
+    // splice the image right before the user content's text by
+    // appending a tiny prefix, then the image, then the rest.
+    // Real users will get a higher-level helper (slice 2/3) that
+    // walks the template's `<image>` markers and does this
+    // splitting automatically.
+    //
+    // Simplest approach for the smoke: prepend the image to the
+    // tokenized prompt. The image embeddings land before the user
+    // turn opens; the LLM sees `<image_tokens>…<|im_start|>user
+    // …<|im_start|>assistant\n` and continues generating text.
+    let mut session = engine.new_session(Default::default());
+    session
+        .append_image(&img_bytes)
+        .expect("append_image should succeed end-to-end");
+    session
+        .append_tokens(&prompt_tokens)
+        .expect("append_tokens for the chat-template prompt");
+
+    struct Collect(Vec<u32>);
+    impl ModalitySink for Collect {
+        fn on_text_tokens(&mut self, t: &[u32]) {
+            self.0.extend_from_slice(t);
+        }
+        fn on_done(&mut self, _: FinishReason) {}
+    }
+    let mut sink = Collect(Vec::new());
+    let opts = GenerateOpts {
+        max_tokens: 16,
+        temperature: 0.0,
+        ..Default::default()
+    };
+    session
+        .generate(&opts, &mut sink)
+        .expect("generate after image+prompt");
+    assert!(
+        !sink.0.is_empty(),
+        "generated zero tokens — append_image / forward / decode wiring is broken"
+    );
+    let decoded = tokenizer.decode(&sink.0);
+    eprintln!("vl smoke decoded output: {decoded:?}");
+    let alpha_count = decoded.chars().filter(char::is_ascii_alphabetic).count();
+    assert!(
+        alpha_count >= 4,
+        "post-image generation looks degenerate (got {decoded:?}); image embeddings \
+         likely poisoned the LLM stream"
+    );
+}
