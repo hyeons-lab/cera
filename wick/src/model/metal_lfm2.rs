@@ -912,8 +912,8 @@ impl MetalLfm2Model {
             y_stride,
             if accumulate { 1 } else { 0 },
         ];
-        let tg_rows = (w.m + 63) / 64; // ceil(m/64)
-        let tg_cols = (n + 31) / 32; // ceil(n/32)
+        let tg_rows = w.m.div_ceil(64);
+        let tg_cols = n.div_ceil(32);
         let gemm_pipeline = match w.dtype {
             DType::Q8_0 => &self.pipelines.gemm_q8_0,
             _ => &self.pipelines.gemm_q4_0,
@@ -1135,6 +1135,7 @@ impl MetalLfm2Model {
         enc.dispatch_thread_groups(grid, sz1d(32));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_gemv_splitk_q4_0(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1151,7 +1152,7 @@ impl MetalLfm2Model {
         // `(split_id, row_group)` via integer division. A 2D dispatch won't
         // work here — `tg_id` is bound as `uint`, so it only gets the X
         // component and every TG would compute `split_id == 0`.
-        let rows_per_split = (w.m as u64 + 7) / 8; // ROWS_PER_TG = 8
+        let rows_per_split = (w.m as u64).div_ceil(8); // ROWS_PER_TG = 8
         let grid = MTLSize::new(rows_per_split * n_splits as u64, 1, 1);
         let split_params = [w.m, w.k, n_splits];
 
@@ -1177,6 +1178,7 @@ impl MetalLfm2Model {
         enc.dispatch_threads(sz1d(w.m as u64), sz1d(256));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_gemv_impl(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1487,6 +1489,7 @@ impl MetalLfm2Model {
         enc.dispatch_thread_groups(sz1d(n_elements.div_ceil(256) as u64), sz1d(256));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_qk_norm_rope(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1987,7 +1990,7 @@ impl MetalLfm2Model {
         let smem_bytes = half_bytes + float_bytes;
         enc.set_threadgroup_memory_length(0, smem_bytes as u64);
         let q_per_tg = 8u32;
-        let n_tgs = ((n + q_per_tg - 1) / q_per_tg) * n_heads;
+        let n_tgs = n.div_ceil(q_per_tg) * n_heads;
         enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(256));
     }
 }
