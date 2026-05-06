@@ -2286,9 +2286,16 @@ impl Model for MetalLfm2Model {
                 .expect("prefix_cache mutex poisoned")
                 .find_longest_prefix(tokens);
             if let Some((snapshot, prefix_len)) = hit {
-                // Always keep at least 1 token for forward_prefill_inner to produce logits.
-                let use_len = prefix_len.min(tokens.len().saturating_sub(1));
-                if use_len > 0 {
+                // Strict-prefix-only: a `prefix_len == tokens.len()`
+                // hit would force `use_len = tokens.len() - 1`, but
+                // the restored conv rolling buffer reflects "after
+                // all tokens" — re-running the last token would
+                // advance the conv buffer one position past where
+                // it should be (conv layers don't gate on
+                // seq_len). Skip full hits; fall through to cold
+                // prefill. Same fix wgpu got in PR #120.
+                if prefix_len < tokens.len() && prefix_len > 0 {
+                    let use_len = prefix_len;
                     self.restore_state_locked(&snapshot);
                     state.seq_len = use_len;
 
@@ -2300,6 +2307,12 @@ impl Model for MetalLfm2Model {
                     return logits;
                 }
             }
+            // Cache miss on a fresh prefill: zero the GPU conv
+            // rolling buffers so stale state from a prior
+            // generation can't leak in. Cache hits skip this
+            // (`restore_state_locked` rewrites the buffers from
+            // the snapshot).
+            self.zero_conv_buffers_locked();
         }
 
         let logits = self.forward_prefill_inner(tokens, start_pos, state);
@@ -2354,9 +2367,15 @@ impl Model for MetalLfm2Model {
         // GPU-resident seq_len counter so we're not appending after
         // KV from a previous generate(). InferenceState is the
         // caller's responsibility on the embedding path (no prefix-
-        // cache restore).
+        // cache restore on the embeddings path; encoder output is
+        // non-deterministic so it isn't worth cache keying).
+        // Conv rolling buffers also need explicit zero — same
+        // reasoning as the token-id `forward_prefill` cache-miss
+        // path; without it stale conv state from a prior generate()
+        // leaks into the new run.
         if start_pos == 0 {
             self.state.seq_len.store(0, Ordering::Relaxed);
+            self.zero_conv_buffers_locked();
         }
 
         self.forward_prefill_inner_from_embeddings(embeddings, n_tokens, start_pos, state)
@@ -2495,11 +2514,55 @@ impl MetalLfm2Model {
                         );
                     }
                 }
+                LayerSnapshot::AttentionCompressed { .. } => {
+                    // Unreachable in normal operation: Metal doesn't
+                    // configure TurboQuant compression, so the prefix
+                    // cache built against this model never contains
+                    // AttentionCompressed snapshots — `model_id` is
+                    // `"metal:..."` vs CPU's `"cpu:..."`, separating
+                    // their on-disk namespaces. Panic on the hard
+                    // error path so an accidental cross-namespace
+                    // load surfaces fast instead of corrupting state.
+                    panic!(
+                        "MetalLfm2Model::restore_state_locked received \
+                         a TurboQuant-compressed snapshot at layer {i}; \
+                         Metal does not support TurboQuant. This indicates \
+                         a cross-backend cache-namespace leak."
+                    );
+                }
             }
         }
         self.state
             .seq_len
             .store(snapshot.seq_len, Ordering::Relaxed);
+    }
+
+    /// Zero every conv layer's GPU rolling buffer. Called on a fresh
+    /// prefill (`start_pos == 0`) cache MISS so stale conv state
+    /// from a prior generation can't leak into the new run. Cache
+    /// HITs go through `restore_state_locked` which overwrites the
+    /// buffers from the snapshot, so this only fires on the cold
+    /// path.
+    ///
+    /// Why this is needed: `state.seq_len` is reset on `start_pos
+    /// == 0`, and attention K/V are cell-keyed by position so
+    /// stale tail data is invisible (kernels honor seq_len). But
+    /// conv layers always read the entire rolling buffer regardless
+    /// of seq_len — see `conv1d.metal`. Without this zero, an FFI /
+    /// long-lived process that reuses the same `MetalLfm2Model`
+    /// across multiple `Session`s would drift on conv state.
+    fn zero_conv_buffers_locked(&self) {
+        let cfg = &self.config;
+        for i in 0..cfg.n_layers {
+            if cfg.block_types[i] == BlockType::GatedConv
+                && let Some(conv_buf) = self.state.conv_buffers[i].as_ref()
+            {
+                let byte_len = conv_buf.length() as usize;
+                unsafe {
+                    std::ptr::write_bytes(conv_buf.contents() as *mut u8, 0, byte_len);
+                }
+            }
+        }
     }
 }
 
