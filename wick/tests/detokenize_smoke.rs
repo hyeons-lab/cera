@@ -7,7 +7,7 @@ fn detokenize_smoke() {
         return;
     }
 
-    let gguf = wick::gguf::GgufFile::open(&path).unwrap();
+    let gguf = wick::gguf::GgufFile::open_arc(&path).unwrap();
     let decoder_weights =
         wick::model::audio_decoder::AudioDecoderWeights::from_gguf(&gguf).unwrap();
     let detok_weights = wick::model::audio_decoder::DetokenizerWeights::from_gguf(&gguf).unwrap();

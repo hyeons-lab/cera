@@ -23,7 +23,7 @@ fn depthformer_cb2_sensitivity() {
     let wick_emb = load_emb(wick_emb_path);
     let ref_emb = load_emb(ref_emb_path);
 
-    let voc_gguf = wick::gguf::GgufFile::open(&vocoder_path).unwrap();
+    let voc_gguf = wick::gguf::GgufFile::open_arc(&vocoder_path).unwrap();
     let dw = wick::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_gguf).unwrap();
 
     // Both should produce frame 1 codes [127, 1470, 457, 1422, 481, 1509, 976, 2008]

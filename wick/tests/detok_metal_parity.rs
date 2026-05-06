@@ -45,7 +45,7 @@ fn load_vocoder() -> Option<(wick::gguf::GgufFile, std::path::PathBuf)> {
         eprintln!("vocoder not found at {}, skipping", path.display());
         return None;
     }
-    let gguf = wick::gguf::GgufFile::open(&path).unwrap();
+    let gguf = wick::gguf::GgufFile::open_arc(&path).unwrap();
     Some((gguf, path))
 }
 

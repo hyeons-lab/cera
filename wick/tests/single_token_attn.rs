@@ -7,7 +7,7 @@ fn single_token_attention() {
         return;
     }
 
-    let gguf = wick::gguf::GgufFile::open(&vocoder_path).unwrap();
+    let gguf = wick::gguf::GgufFile::open_arc(&vocoder_path).unwrap();
     let dw = wick::model::audio_decoder::AudioDecoderWeights::from_gguf(&gguf).unwrap();
     let cfg = &dw.depthformer_config;
 

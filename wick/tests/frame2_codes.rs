@@ -32,7 +32,7 @@ fn frame2_codes_from_ref_embedding() {
     let ref_f2 = load_emb("/tmp/ref_frame2_emb.bin");
     let wick_f2 = load_emb("/tmp/wick_frame2_emb.bin");
 
-    let voc_gguf = wick::gguf::GgufFile::open(&vocoder_path).unwrap();
+    let voc_gguf = wick::gguf::GgufFile::open_arc(&vocoder_path).unwrap();
     let dw = wick::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_gguf).unwrap();
 
     // The depthformer has KV cache state from previous frames.

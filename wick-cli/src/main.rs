@@ -1406,8 +1406,13 @@ fn main() -> Result<()> {
             eprintln!("Prompt tokens: {}", tokens.len());
 
             if let Some(vocoder_path) = &vocoder {
-                // Audio generation mode.
-                let voc_gguf = wick::gguf::GgufFile::open(Path::new(vocoder_path))?;
+                // Audio generation mode. The audio decoder weight
+                // loaders take `&Arc<GgufFile>` (mmap-backed weight
+                // handles hold their own Arc clones to keep the
+                // GGUF alive — see `wick::model::weights::MmapWeight`);
+                // `open_arc` is the convenience opener that wraps in
+                // `Arc` for us.
+                let voc_gguf = wick::gguf::GgufFile::open_arc(Path::new(vocoder_path))?;
                 let decoder_weights =
                     wick::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_gguf)?;
                 let detok_weights =
