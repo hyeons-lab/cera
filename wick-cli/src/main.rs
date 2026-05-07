@@ -248,7 +248,7 @@ enum Command {
         #[arg(long, conflicts_with_all = ["vocoder", "audio_out", "token_ids", "image"])]
         audio_in: Option<String>,
 
-        /// Path to one or more image files (PNG / JPEG / WebP).
+        /// Path to one or more image files (PNG or JPEG).
         /// When set, renders the model's chat template with
         /// multimodal content (image(s) plus optional `--prompt`)
         /// and prefills via `Session::append_chat_with_images`.
@@ -1205,6 +1205,22 @@ fn main() -> Result<()> {
             ubatch_size,
             n_keep,
         } => {
+            // Read `--image` bytes BEFORE engine load so a missing /
+            // unreadable path fails fast — engine load can spend
+            // ~1 GB of RAM on Q4_0 weights and a typo'd `--image
+            // not_a_path.jpg` shouldn't pay that cost. Empty vec
+            // when the flag isn't set; the image branch later
+            // checks `image_bytes.is_empty()`.
+            let image_bytes: Vec<Vec<u8>> = image
+                .iter()
+                .map(|path| {
+                    let bytes =
+                        std::fs::read(path).with_context(|| format!("reading --image {path}"))?;
+                    eprintln!("Loaded image: {path} ({} bytes)", bytes.len());
+                    Ok::<_, anyhow::Error>(bytes)
+                })
+                .collect::<Result<_>>()?;
+
             // `cache_dir` is shared between bundle downloads (when
             // `--bundle-id` is set) and the KV prefix cache below.
             let engine = resolve_engine(
@@ -1236,19 +1252,9 @@ fn main() -> Result<()> {
             // `Session::append_chat_with_images` (PR #134), which
             // walks `<image>` markers and splices in the model-
             // specific `<|image_start|>` / `<|image_end|>` envelope.
-            if !image.is_empty() {
-                // Read all image bytes up-front so a missing /
-                // unreadable path fails before model load — there's
-                // no point spending ~1 GB of RAM on Q4_0 weights only
-                // to error on `--image not_a_real_path.jpg`.
-                let mut owned_bytes: Vec<Vec<u8>> = Vec::with_capacity(image.len());
-                for path in &image {
-                    let bytes =
-                        std::fs::read(path).with_context(|| format!("reading --image {path}"))?;
-                    eprintln!("Loaded image: {path} ({} bytes)", bytes.len());
-                    owned_bytes.push(bytes);
-                }
-
+            // Image bytes were read above (pre-engine-load) so this
+            // branch starts with files known to be valid.
+            if !image_bytes.is_empty() {
                 eprintln!(
                     "Model: {} | {} layers | hidden={}",
                     engine.model().config().architecture,
@@ -1270,9 +1276,7 @@ fn main() -> Result<()> {
                 // is the order LFM2-VL was trained on (matches
                 // mtmd-cli's `<image> Describe<|im_end|>` shape).
                 let mut content: Vec<wick::tokenizer::ContentItem> =
-                    std::iter::repeat_with(|| wick::tokenizer::ContentItem::Image)
-                        .take(image.len())
-                        .collect();
+                    vec![wick::tokenizer::ContentItem::Image; image_bytes.len()];
                 if let Some(p) = &prompt
                     && !p.is_empty()
                 {
@@ -1289,7 +1293,7 @@ fn main() -> Result<()> {
                     role: "user".into(),
                     content,
                 });
-                let images_refs: Vec<&[u8]> = owned_bytes.iter().map(|v| v.as_slice()).collect();
+                let images_refs: Vec<&[u8]> = image_bytes.iter().map(|v| v.as_slice()).collect();
 
                 let prefill_start = std::time::Instant::now();
                 session.append_chat_with_images(&messages, &images_refs, true)?;
@@ -1297,7 +1301,7 @@ fn main() -> Result<()> {
                 let kv_after_prefill = session.position();
                 eprintln!(
                     "Image prefill: {kv_after_prefill} KV tokens, {:.1} ms",
-                    prefill_elapsed.as_millis()
+                    prefill_elapsed.as_secs_f64() * 1000.0
                 );
 
                 let opts = wick::GenerateOpts {
