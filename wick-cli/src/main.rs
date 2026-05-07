@@ -1777,16 +1777,15 @@ fn main() -> Result<()> {
             }
 
             // Image attachments collected via `/image <path>` for the
-            // NEXT user turn. Both vecs drain on user-message send AND
-            // on `/clear`. Image context grounds only the immediate
-            // follow-up turn; subsequent turns see only the
-            // `[image: <path>]` marker stored in `history` plus the
-            // assistant's reply. Multi-turn re-feed (re-encoding the
+            // NEXT user turn. Drains on a successful turn AND on
+            // `/clear`. Image context grounds only the immediate
+            // follow-up turn — subsequent turns re-render history
+            // as text-only and rely on the assistant's prior reply
+            // for context. Multi-turn re-feed (re-encoding the
             // image every turn so the model retains visual context
             // across many follow-ups) is a follow-up — see plan
             // `000120-01`'s "Out of scope".
             let mut pending_images: Vec<Vec<u8>> = Vec::new();
-            let mut pending_image_paths: Vec<String> = Vec::new();
 
             let opts = wick::GenerateOpts {
                 max_tokens: max_tokens as u32,
@@ -1930,7 +1929,6 @@ fn main() -> Result<()> {
                             // brand-new conversation).
                             let pending_dropped = !pending_images.is_empty();
                             pending_images.clear();
-                            pending_image_paths.clear();
                             eprintln!(
                                 "(history cleared{}{})",
                                 if had_system {
@@ -2000,11 +1998,33 @@ fn main() -> Result<()> {
                             //   /image a.jpg
                             //   /image b.jpg
                             //   compare these two
-                            // The vecs drain after the next user
-                            // message OR on `/clear`.
+                            // Pending state drains after the next
+                            // successful turn OR on `/clear`.
                             if rest.is_empty() {
                                 eprintln!("usage: /image <path>");
                                 continue;
+                            }
+                            // Sanity-cap on file size so a typo'd
+                            // `/image /var/log/something.bin` doesn't
+                            // OOM the REPL on a multi-GB file.
+                            // Real PNG / JPEG inputs for VL are well
+                            // under 50 MB (LFM2-VL's max input band
+                            // is 262 144 pixels = ~1 MB raw RGB);
+                            // anything past 50 MB is a misuse.
+                            const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+                            match std::fs::metadata(rest) {
+                                Ok(meta) if meta.len() > MAX_IMAGE_BYTES => {
+                                    eprintln!(
+                                        "error: /image {rest}: file is {} bytes, larger than the 50 MB cap",
+                                        meta.len(),
+                                    );
+                                    continue;
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    eprintln!("error: /image stat failed for {rest}: {e}");
+                                    continue;
+                                }
                             }
                             match std::fs::read(rest) {
                                 Ok(bytes) => {
@@ -2013,10 +2033,9 @@ fn main() -> Result<()> {
                                         bytes.len()
                                     );
                                     pending_images.push(bytes);
-                                    pending_image_paths.push(rest.to_string());
                                 }
                                 Err(e) => {
-                                    eprintln!("error: /image read failed: {e}");
+                                    eprintln!("error: /image read failed for {rest}: {e}");
                                 }
                             }
                             continue;
@@ -2039,7 +2058,7 @@ fn main() -> Result<()> {
                 // every turn so the model retains visual context) is
                 // a follow-up; see plan `000120-01`'s "Out of scope".
                 // Until then, transcripts via `/save` lose the
-                // image-attachment record by design — use
+                // image-attachment record by design — using
                 // `/image <path>` is enough of a hint while the chat
                 // is live.
                 history.push(wick::tokenizer::ChatMessage {
@@ -2057,9 +2076,10 @@ fn main() -> Result<()> {
                     // text-only multimodal entries, append the new
                     // user turn as `[Image*N, Text(user)?]`, and feed
                     // through `Session::append_chat_with_images`. The
-                    // last `history` entry is the text-marker form
-                    // we just pushed; we replace it here with the
-                    // multimodal shape the helper expects.
+                    // last `history` entry is the text-only user line
+                    // we just pushed; the helper rebuilds it here as
+                    // a multimodal shape with the image content
+                    // items in front.
                     let mut messages: Vec<wick::tokenizer::ChatMessageMultimodal> = history
                         [..history.len() - 1]
                         .iter()
@@ -2095,21 +2115,13 @@ fn main() -> Result<()> {
                         Err(e) => Err(format!("chat-template render failed: {e}")),
                     }
                 };
-                match prefill_outcome {
-                    Ok(()) => {
-                        // Image attachment is consumed by the
-                        // successful prefill; drain so the next
-                        // turn starts clean.
-                        pending_images.clear();
-                        pending_image_paths.clear();
-                    }
-                    Err(msg) => {
-                        eprintln!("error: {msg}");
-                        history.pop();
-                        // Leave pending state intact so the user can
-                        // retype the prompt without re-attaching.
-                        continue;
-                    }
+                if let Err(msg) = prefill_outcome {
+                    eprintln!("error: {msg}");
+                    history.pop();
+                    // Leave pending state intact so the user can
+                    // retype the prompt without re-attaching the
+                    // image.
+                    continue;
                 }
 
                 eprint!("assistant> ");
@@ -2121,6 +2133,12 @@ fn main() -> Result<()> {
                     Err(e) => {
                         eprintln!("\nerror: generate failed: {e}");
                         history.pop();
+                        // Same retry semantics as the prefill-error
+                        // path: leave pending images intact. The
+                        // next turn will run `session.reset()` which
+                        // clears the KV state, then re-prefill with
+                        // the same images — consistent and gives
+                        // the user a clean retry.
                         continue;
                     }
                 };
@@ -2129,6 +2147,11 @@ fn main() -> Result<()> {
                     role: "assistant".into(),
                     content: sink.into_text(),
                 });
+                // Image attachment is consumed by a turn that
+                // produced an assistant reply — drain only here so
+                // either a prefill OR generate error preserves
+                // pending state for the user's retry.
+                pending_images.clear();
 
                 // Stop the REPL if the sink flipped cancel because stdout
                 // is gone (BrokenPipe — the user piped us into `head` or
