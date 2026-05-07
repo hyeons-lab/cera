@@ -236,7 +236,12 @@ pub fn can_shift(
 /// that the caller should swap for the
 /// `<|image_start|>` + image embeddings + `<|image_end|>`
 /// envelope at append time.
-#[derive(Debug, PartialEq, Eq)]
+///
+/// `Copy` because every variant is either unit (`Image`) or
+/// composed of `usize` fields (`Text { start, end }`) — letting the
+/// walk loop in [`Session::append_chat_with_images`] match on
+/// `*seg` without the borrow-checker friction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChatTemplateSegment {
     Text { start: usize, end: usize },
     Image,
