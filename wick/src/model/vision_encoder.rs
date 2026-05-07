@@ -706,17 +706,23 @@ fn patch_embed_compute(
     let c_stride = cfg.image_size * cfg.image_size;
     let n_patches = cfg.n_patches;
 
-    // Per-patch closure: extract the patch_size² × 3 chunk into a
-    // local scratch, run the matmul-as-matvec against `conv_w`
-    // viewed as `[in_dim × out_dim]` row-major, then add the
-    // per-channel bias. Independent per-patch — safe to dispatch
-    // across rayon workers.
+    // Per-patch math: extract the patch_size² × 3 chunk into a
+    // pre-allocated `patch` scratch, run the matmul-as-matvec
+    // against `conv_w` viewed as `[in_dim × out_dim]` row-major,
+    // then add the per-channel bias. The scratch can be reused
+    // across patches — every patch writes the same `in_dim`
+    // entries so no zero-init is needed between calls.
+    //
+    // out_row[oc] = Σ_in patch[in] · conv_w[in × out_dim + oc] + conv_b[oc]
+    //
+    // matmul_f32 *accumulates* (`c[i,j] += …`); pre-filling
+    // out_row with the bias lands the bias-add for free, mirroring
+    // the trick `cpu::conv2d`'s pointwise fast path uses.
     let conv_w = &patch_embed.conv_w;
     let conv_b = &patch_embed.conv_b;
-    let compute_patch = |patch_idx: usize, out_row: &mut [f32]| {
+    let compute_patch = |patch: &mut [f32], patch_idx: usize, out_row: &mut [f32]| {
         let gr = patch_idx / grid;
         let gc = patch_idx % grid;
-        let mut patch = vec![0f32; in_dim];
         for c in 0..3 {
             for kh in 0..p {
                 for kw in 0..p {
@@ -728,27 +734,31 @@ fn patch_embed_compute(
                 }
             }
         }
-        // out_row[oc] = Σ_in patch[in] · conv_w[in × out_dim + oc] + conv_b[oc]
         out_row.copy_from_slice(conv_b);
-        crate::backend::cpu::matmul_f32(&patch, conv_w, out_row, 1, out_dim, in_dim);
-        // matmul_f32 *accumulates* (`c[i,j] += …`); we pre-filled
-        // out_row with the bias so the matmul lands the bias add
-        // for free. Same trick `cpu::conv2d`'s pointwise fast path
-        // uses on line 1080 — keep the convention consistent.
+        crate::backend::cpu::matmul_f32(patch, conv_w, out_row, 1, out_dim, in_dim);
     };
 
     let mut out = vec![0f32; n_patches * out_dim];
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        out.par_chunks_mut(out_dim)
-            .enumerate()
-            .for_each(|(patch_idx, out_row)| compute_patch(patch_idx, out_row));
+        // `for_each_init` gives each rayon worker its own
+        // long-lived `patch` buffer, so the parallel path also
+        // amortises the allocation across patches handled by the
+        // same worker (instead of per-patch alloc).
+        out.par_chunks_mut(out_dim).enumerate().for_each_init(
+            || vec![0f32; in_dim],
+            |patch, (patch_idx, out_row)| compute_patch(patch, patch_idx, out_row),
+        );
     }
     #[cfg(not(feature = "parallel"))]
     {
+        // Hoisted out of the loop: 256 × 768 × 4 bytes = 768 KB
+        // saved per encode in the single-threaded path, plus the
+        // allocator pressure.
+        let mut patch = vec![0f32; in_dim];
         for (patch_idx, out_row) in out.chunks_mut(out_dim).enumerate() {
-            compute_patch(patch_idx, out_row);
+            compute_patch(&mut patch, patch_idx, out_row);
         }
     }
     out
