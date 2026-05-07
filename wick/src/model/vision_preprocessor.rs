@@ -82,6 +82,16 @@ pub fn calc_size_preserved_ratio(
 ) -> (usize, usize) {
     debug_assert!(align_size > 0);
     debug_assert!(min_pixels <= max_pixels);
+    // `area` divides into `beta` in the scale-up branch — guard
+    // against `width == 0 || height == 0` (the `image` crate
+    // rejects zero-pixel inputs upstream, but `calc_size_preserved_ratio`
+    // is `pub` and could be called directly). Falling through with
+    // `align_size × align_size` is the smallest aligned grid the
+    // encoder can consume, which is the right "give up gracefully"
+    // answer for an empty input.
+    if width == 0 || height == 0 {
+        return (align_size, align_size);
+    }
     let round_by = |x: f64| ((x / align_size as f64).round() as usize) * align_size;
     let floor_by = |x: f64| ((x / align_size as f64).floor() as usize) * align_size;
     let ceil_by = |x: f64| ((x / align_size as f64).ceil() as usize) * align_size;
@@ -264,6 +274,24 @@ mod tests {
     fn calc_size_preserved_ratio_passes_through_when_in_band() {
         let (w, h) = calc_size_preserved_ratio(256, 256, 32, 65_536, 262_144);
         assert_eq!((w, h), (256, 256));
+    }
+
+    /// Zero dimensions short-circuit to `(align, align)` instead of
+    /// dividing by zero in the scale-up branch.
+    #[test]
+    fn calc_size_preserved_ratio_zero_dims_returns_align() {
+        assert_eq!(
+            calc_size_preserved_ratio(0, 100, 32, 65_536, 262_144),
+            (32, 32)
+        );
+        assert_eq!(
+            calc_size_preserved_ratio(100, 0, 32, 65_536, 262_144),
+            (32, 32)
+        );
+        assert_eq!(
+            calc_size_preserved_ratio(0, 0, 32, 65_536, 262_144),
+            (32, 32)
+        );
     }
 
     /// Synthesise a 4×4 solid red PNG, run through the
