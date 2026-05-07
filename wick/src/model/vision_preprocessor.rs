@@ -90,11 +90,16 @@ pub fn calc_size_preserved_ratio(
     let mut h_bar = align_size.max(round_by(height as f64));
 
     let area = (width as f64) * (height as f64);
-    if h_bar * w_bar > max_pixels {
+    // `saturating_mul` keeps the comparison correct on 32-bit
+    // targets (wasm32) where huge inputs could overflow `usize`.
+    // Saturation pushes the value to `usize::MAX`, which routes us
+    // into the "scale down" branch — the safe direction.
+    let area_check = h_bar.saturating_mul(w_bar);
+    if area_check > max_pixels {
         let beta = (area / max_pixels as f64).sqrt();
         w_bar = align_size.max(floor_by((width as f64) / beta));
         h_bar = align_size.max(floor_by((height as f64) / beta));
-    } else if h_bar * w_bar < min_pixels {
+    } else if area_check < min_pixels {
         let beta = (min_pixels as f64 / area).sqrt();
         w_bar = ceil_by((width as f64) * beta);
         h_bar = ceil_by((height as f64) * beta);
@@ -133,18 +138,21 @@ pub fn preprocess_image(
     debug_assert_eq!(target_h % cfg.patch_size, 0);
 
     // Bilinear (Triangle) resize — matches llama.cpp's
-    // `RESIZE_ALGO_BILINEAR` for `PROJECTOR_TYPE_LFM2`. Convert
-    // directly to RgbImage in each branch (avoids a redundant
-    // DynamicImage wrap when no resize is needed).
+    // `RESIZE_ALGO_BILINEAR` for `PROJECTOR_TYPE_LFM2`. Resize the
+    // `DynamicImage` (in its native pixel format) before converting
+    // to RGB — a 4096×4096 RGBA8 input would otherwise allocate a
+    // ~50 MB intermediate `to_rgb8` buffer just to throw it away on
+    // resize. Resizing first means we only `into_rgb8` the
+    // post-resize buffer, which is bounded by `image_max_pixels`.
     let rgb = if img.width() == target_w as u32 && img.height() == target_h as u32 {
         img.into_rgb8()
     } else {
-        image::imageops::resize(
-            &img.to_rgb8(),
+        img.resize_exact(
             target_w as u32,
             target_h as u32,
             image::imageops::FilterType::Triangle,
         )
+        .into_rgb8()
     };
 
     // Normalize: NCHW f32, `(rgb / 255 - mean) / std` per channel.

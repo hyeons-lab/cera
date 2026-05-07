@@ -164,6 +164,11 @@ impl VisionEncoderConfig {
         let scale_factor =
             gguf.get_u32(KEY_SCALE_FACTOR)
                 .with_context(|| format!("missing `{KEY_SCALE_FACTOR}`"))? as usize;
+        anyhow::ensure!(
+            scale_factor > 0,
+            "scale_factor ({scale_factor}) must be > 0; a zero or missing value would \
+             collapse the pixel band and trip a divide-by-zero in `pixel_shuffle`",
+        );
         let image_mean = read_rgb_array(gguf, KEY_IMAGE_MEAN)?;
         let image_std = read_rgb_array(gguf, KEY_IMAGE_STD)?;
 
@@ -471,19 +476,36 @@ impl VisionEncoderWeights {
         let cfg = &self.config;
         anyhow::ensure!(grid_w > 0 && grid_h > 0, "grid dims must be > 0");
         anyhow::ensure!(
+            cfg.scale_factor > 0,
+            "vision encoder config has scale_factor=0; refusing to divide by zero"
+        );
+        anyhow::ensure!(
             grid_w % cfg.scale_factor == 0 && grid_h % cfg.scale_factor == 0,
             "grid {grid_w}×{grid_h} not divisible by scale_factor ({})",
             cfg.scale_factor,
         );
-        let target_w = grid_w * cfg.patch_size;
-        let target_h = grid_h * cfg.patch_size;
-        let n_pix = 3 * target_w * target_h;
+        // Compute target image / patch counts with overflow checks —
+        // a malformed caller (or 32-bit target like wasm32 with a
+        // huge grid) shouldn't silently wrap and bypass the
+        // pixels.len() invariant below.
+        let target_w = grid_w
+            .checked_mul(cfg.patch_size)
+            .ok_or_else(|| anyhow::anyhow!("grid_w·patch_size overflow"))?;
+        let target_h = grid_h
+            .checked_mul(cfg.patch_size)
+            .ok_or_else(|| anyhow::anyhow!("grid_h·patch_size overflow"))?;
+        let n_pix = target_w
+            .checked_mul(target_h)
+            .and_then(|x| x.checked_mul(3))
+            .ok_or_else(|| anyhow::anyhow!("3·target_w·target_h overflow"))?;
         anyhow::ensure!(
             pixels.len() == n_pix,
             "encode_image: pixels.len() {} != 3·target_w·target_h ({n_pix})",
             pixels.len()
         );
-        let n_patches = grid_w * grid_h;
+        let n_patches = grid_w
+            .checked_mul(grid_h)
+            .ok_or_else(|| anyhow::anyhow!("grid_w·grid_h overflow"))?;
 
         // 1. Patch embed: [3, H, W] → [n_patches, n_embd]
         let mut tokens = patch_embed_compute(pixels, &self.patch_embed, cfg, grid_w, grid_h);
@@ -537,8 +559,8 @@ impl VisionEncoderWeights {
                 &self.position_embed,
                 trained_side,
                 trained_side,
-                grid_w,
                 grid_h,
+                grid_w,
                 cfg.n_embd,
             ))
         }
@@ -856,8 +878,8 @@ fn interpolate_pos_embed_2d(
     pos: &[f32],
     in_h: usize,
     in_w: usize,
-    out_w: usize,
     out_h: usize,
+    out_w: usize,
     n_embd: usize,
 ) -> Vec<f32> {
     debug_assert_eq!(pos.len(), in_h * in_w * n_embd);
@@ -1370,7 +1392,7 @@ mod tests {
         // Single channel, 2×2 grid with corner values 1/2/3/4.
         let n_embd = 1;
         let input: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
-        let out = interpolate_pos_embed_2d(&input, 2, 2, 6, 4, n_embd);
+        let out = interpolate_pos_embed_2d(&input, 2, 2, 4, 6, n_embd);
         // out[0, 0] = top-left corner of input (1.0).
         assert!((out[0] - 1.0).abs() < 1e-5);
         // out[0, 5] = top-right corner of input (2.0).
