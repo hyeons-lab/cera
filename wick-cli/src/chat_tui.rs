@@ -71,8 +71,18 @@ enum UiUpdate {
 /// the worker is stateless w.r.t. history so `/clear` on the UI side
 /// just stops including the dropped messages on the next turn,
 /// without needing a "reset history" signal back to the worker.
+///
+/// `images` carries any pending `/image <path>` attachments for the
+/// final user turn. Empty → text path; non-empty → multimodal path
+/// via `Session::append_chat_with_images`. `Arc<Vec<u8>>` (not bare
+/// `Vec<u8>`) so cloning the pending vec for the channel send is a
+/// refcount bump per attachment rather than a deep memcpy of up to
+/// 50 MB per image.
 enum TurnRequest {
-    Turn(Vec<ChatMessage>),
+    Turn {
+        history: Vec<ChatMessage>,
+        images: Vec<std::sync::Arc<Vec<u8>>>,
+    },
     Shutdown,
 }
 
@@ -89,6 +99,16 @@ struct ChatState {
     generating: bool,
     /// Last finish reason — surfaced briefly in the hint line.
     last_finish: Option<FinishReason>,
+    /// Image bytes attached via `/image <path>`; consumed by the
+    /// next user turn. Drained on `UiUpdate::Done` after the
+    /// assistant message commits, and on `/clear`. Preserved on
+    /// `UiUpdate::Error` so the user can retry without
+    /// re-attaching.
+    ///
+    /// `Arc<Vec<u8>>` (not bare `Vec<u8>`) so the per-turn
+    /// channel send only bumps refcounts instead of memcpy'ing
+    /// up to N × 50 MB of image bytes.
+    pending_images: Vec<std::sync::Arc<Vec<u8>>>,
 }
 
 /// RAII guard that disables raw mode + emits a final newline when
@@ -176,6 +196,7 @@ fn run_inner(
         cursor: 0,
         generating: false,
         last_finish: None,
+        pending_images: Vec::new(),
     };
 
     // Print system prompt + any pre-loaded history into scrollback so
@@ -231,6 +252,13 @@ fn run_inner(
                             content: text,
                         });
                     }
+                    // Drain pending images only after a full-turn
+                    // success (worker finished prefill AND
+                    // generate, assistant text just committed). On
+                    // error the `Error` arm leaves them intact so
+                    // the user can retry without re-attaching —
+                    // same discipline as the line REPL (PR #136).
+                    state.pending_images.clear();
                     state.generating = false;
                     state.last_finish = Some(reason);
                 }
@@ -402,6 +430,10 @@ fn dispatch_user_input(
                     terminal,
                     "  /save <path>     Save the conversation transcript to a file",
                 )?;
+                emit_status_to_scrollback(
+                    terminal,
+                    "  /image <path>    Attach an image to the next user turn (repeat for multi-image)",
+                )?;
                 emit_status_to_scrollback(terminal, "  /help            Show this help")?;
                 emit_status_to_scrollback(terminal, "  /exit, /quit     Exit the REPL")?;
                 emit_blank_line(terminal)?;
@@ -419,12 +451,17 @@ fn dispatch_user_input(
                 } else {
                     state.history.clear();
                 }
+                let pending_dropped = !state.pending_images.is_empty();
+                state.pending_images.clear();
                 emit_status_to_scrollback(
                     terminal,
-                    if had_system {
-                        "history cleared (system prompt preserved)"
-                    } else {
-                        "history cleared"
+                    match (had_system, pending_dropped) {
+                        (true, true) => {
+                            "history cleared (system prompt preserved); pending images dropped"
+                        }
+                        (true, false) => "history cleared (system prompt preserved)",
+                        (false, true) => "history cleared; pending images dropped",
+                        (false, false) => "history cleared",
                     },
                 )?;
                 emit_blank_line(terminal)?;
@@ -449,6 +486,75 @@ fn dispatch_user_input(
                 };
                 emit_status_to_scrollback(terminal, &msg)?;
                 emit_blank_line(terminal)?;
+                return Ok(KeyAction::Continue);
+            }
+            "/image" => {
+                if rest.is_empty() {
+                    emit_status_to_scrollback(terminal, "usage: /image <path>")?;
+                    emit_blank_line(terminal)?;
+                    return Ok(KeyAction::Continue);
+                }
+                // Real LFM2-VL inputs are ~1 MB raw RGB; 50 MB is
+                // generous but rejects clearly malicious /
+                // accidental multi-GB inputs that would OOM the
+                // REPL on `std::fs::read`.
+                const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+                // Reject non-regular files BEFORE the size cap:
+                // special files like `/dev/zero` and FIFOs report
+                // `len() == 0` from `metadata()` but `std::fs::read`
+                // would then read unbounded data and OOM the REPL.
+                // `is_file()` is a metadata-level check so it
+                // doesn't add an extra syscall.
+                match std::fs::metadata(rest) {
+                    Ok(meta) if !meta.is_file() => {
+                        emit_status_to_scrollback(
+                            terminal,
+                            &format!("error: /image {rest}: not a regular file"),
+                        )?;
+                        emit_blank_line(terminal)?;
+                        return Ok(KeyAction::Continue);
+                    }
+                    Ok(meta) if meta.len() > MAX_IMAGE_BYTES => {
+                        emit_status_to_scrollback(
+                            terminal,
+                            &format!(
+                                "error: /image {rest}: file is {} bytes, larger than the 50 MB cap",
+                                meta.len()
+                            ),
+                        )?;
+                        emit_blank_line(terminal)?;
+                        return Ok(KeyAction::Continue);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        emit_status_to_scrollback(
+                            terminal,
+                            &format!("error: /image stat failed for {rest}: {e}"),
+                        )?;
+                        emit_blank_line(terminal)?;
+                        return Ok(KeyAction::Continue);
+                    }
+                }
+                match std::fs::read(rest) {
+                    Ok(bytes) => {
+                        emit_status_to_scrollback(
+                            terminal,
+                            &format!(
+                                "(image attached: {rest}, {} bytes; sends with next message)",
+                                bytes.len()
+                            ),
+                        )?;
+                        emit_blank_line(terminal)?;
+                        state.pending_images.push(std::sync::Arc::new(bytes));
+                    }
+                    Err(e) => {
+                        emit_status_to_scrollback(
+                            terminal,
+                            &format!("error: /image read failed for {rest}: {e}"),
+                        )?;
+                        emit_blank_line(terminal)?;
+                    }
+                }
                 return Ok(KeyAction::Continue);
             }
             "/system" => {
@@ -504,15 +610,26 @@ fn dispatch_user_input(
     state.pending = Some(String::new());
     state.generating = true;
     state.last_finish = None;
+    // Clone the pending-images vec for the channel send — `Arc`
+    // makes this a refcount bump per attachment rather than a
+    // memcpy. The UI-side copy stays valid until pending images
+    // are drained on `UiUpdate::Done` after the assistant message
+    // commits; on send-error the UI-side `pending_images` is
+    // intact so the user can retry without re-attaching.
+    let images = state.pending_images.clone();
     if tx_turn
-        .send(TurnRequest::Turn(state.history.clone()))
+        .send(TurnRequest::Turn {
+            history: state.history.clone(),
+            images,
+        })
         .is_err()
     {
         emit_status_to_scrollback(terminal, "worker thread exited unexpectedly")?;
         // Roll back the user turn — it never reached the worker, so
         // leaving it in `history` would mis-represent the
         // conversation in the next attempt and in the returned
-        // history on exit.
+        // history on exit. `pending_images` stays intact so the
+        // user can retry without re-attaching.
         state.history.pop();
         state.generating = false;
         state.pending = None;
@@ -530,7 +647,7 @@ fn worker_loop(
     tx_update: Sender<UiUpdate>,
 ) {
     while let Ok(req) = rx_turn.recv() {
-        let TurnRequest::Turn(history) = req else {
+        let TurnRequest::Turn { history, images } = req else {
             break;
         };
 
@@ -538,19 +655,56 @@ fn worker_loop(
         // just-pushed user turn at the end. UI is the source of
         // truth. `/clear` on UI side just sends a smaller history
         // next turn — no separate reset needed here.
-        let formatted = match wick::tokenizer::apply_chat_template(&tokenizer, &history, true) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ =
-                    tx_update.send(UiUpdate::Error(format!("chat-template render failed: {e}")));
-                continue;
-            }
-        };
-        let tokens = tokenizer.encode(&formatted);
-
         session.reset();
-        if let Err(e) = session.append_tokens(&tokens) {
-            let _ = tx_update.send(UiUpdate::Error(format!("append_tokens failed: {e}")));
+        let prefill_outcome: Result<(), String> = if images.is_empty() {
+            match wick::tokenizer::apply_chat_template(&tokenizer, &history, true) {
+                Ok(formatted) => {
+                    let tokens = tokenizer.encode(&formatted);
+                    session
+                        .append_tokens(&tokens)
+                        .map_err(|e| format!("append_tokens failed: {e}"))
+                }
+                Err(e) => Err(format!("chat-template render failed: {e}")),
+            }
+        } else {
+            // Multimodal path: convert prior history into text-only
+            // multimodal entries, append the new user turn as
+            // `[Image*N, Text(user)?]`, and feed through
+            // `Session::append_chat_with_images`. The last
+            // `history` entry is the text-only user line the UI
+            // pushed; rebuild it here as a multimodal shape with
+            // the image content items in front. Mirrors the line
+            // REPL's per-turn dispatch in `Command::Chat`.
+            let split = history.len().saturating_sub(1);
+            let mut messages: Vec<wick::tokenizer::ChatMessageMultimodal> = history[..split]
+                .iter()
+                .map(|m| wick::tokenizer::ChatMessageMultimodal {
+                    role: m.role.clone(),
+                    content: vec![wick::tokenizer::ContentItem::Text {
+                        text: m.content.clone(),
+                    }],
+                })
+                .collect();
+            let user_text = history
+                .last()
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            let mut content: Vec<wick::tokenizer::ContentItem> =
+                vec![wick::tokenizer::ContentItem::Image; images.len()];
+            if !user_text.is_empty() {
+                content.push(wick::tokenizer::ContentItem::Text { text: user_text });
+            }
+            messages.push(wick::tokenizer::ChatMessageMultimodal {
+                role: "user".into(),
+                content,
+            });
+            let images_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
+            session
+                .append_chat_with_images(&messages, &images_refs, true)
+                .map_err(|e| format!("append_chat_with_images failed: {e}"))
+        };
+        if let Err(msg) = prefill_outcome {
+            let _ = tx_update.send(UiUpdate::Error(msg));
             continue;
         }
 
