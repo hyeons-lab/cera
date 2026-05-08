@@ -67,6 +67,12 @@ enum UiUpdate {
     /// in-flight user turn gets popped on the worker side; the UI
     /// surfaces the message and returns to the prompt.
     Error(String),
+    /// Worker-emitted status line — used today for "(history
+    /// truncated to fit context: dropped oldest turn pair)" so the
+    /// user can see when prefill auto-shrinks history. Routed
+    /// through `emit_status_to_scrollback` like slash-command
+    /// status messages.
+    Status(String),
     /// A `/image <url>` fetch finished. `Ok(bytes)` pushes onto
     /// `pending_images`; `Err(message)` is surfaced as a status line.
     /// Always clears `state.fetching_url` so the UI unlocks.
@@ -324,6 +330,14 @@ fn run_inner(
                     state.pending = None;
                     state.generating = false;
                     emit_status_to_scrollback(terminal, &format!("error: {e}"))?;
+                    emit_blank_line(terminal)?;
+                }
+                Ok(UiUpdate::Status(msg)) => {
+                    // Worker-emitted status line (e.g. history
+                    // truncation). Doesn't affect generating /
+                    // pending state — just surfaces a one-line note
+                    // in scrollback alongside slash-command output.
+                    emit_status_to_scrollback(terminal, &msg)?;
                     emit_blank_line(terminal)?;
                 }
                 Ok(UiUpdate::ImageFetched { url, result }) => {
@@ -758,8 +772,8 @@ fn worker_loop(
 ) {
     while let Ok(req) = rx_turn.recv() {
         let TurnRequest::Turn {
-            history,
-            history_images,
+            mut history,
+            mut history_images,
         } = req
         else {
             break;
@@ -769,49 +783,79 @@ fn worker_loop(
         // just-pushed user turn at the end. UI is the source of
         // truth. `/clear` on UI side just sends a smaller history
         // next turn — no separate reset needed here.
-        session.reset();
-        let any_images = history_images.iter().any(|v| !v.is_empty());
-        let prefill_outcome: Result<(), String> = if any_images {
-            // Multimodal path: synthesize multimodal messages by
-            // zipping history with history_images. Each user turn
-            // that had attachments rebuilds as
-            // `[Image*N, Text(content)?]`; turns without
-            // attachments rebuild as `[Text(content)]`. Image bytes
-            // flatten across all turns in document order, matching
-            // the chat template's `<image>` marker walk.
-            let messages: Vec<wick::tokenizer::ChatMessageMultimodal> = history
-                .iter()
-                .zip(history_images.iter())
-                .map(|(msg, imgs)| {
-                    let mut content: Vec<wick::tokenizer::ContentItem> =
-                        vec![wick::tokenizer::ContentItem::Image; imgs.len()];
-                    if !msg.content.is_empty() {
-                        content.push(wick::tokenizer::ContentItem::Text {
-                            text: msg.content.clone(),
-                        });
+        //
+        // On `WickError::ContextOverflow` we drop the oldest
+        // user+assistant pair from this turn's local copy and
+        // retry; status flows back to the UI via
+        // `UiUpdate::Status`. The UI's authoritative `state.history`
+        // is unchanged — `/save` still writes the full transcript
+        // the user typed, and the next `TurnRequest::Turn` arrives
+        // with the same overshoot. Worker re-truncates each turn.
+        // V1: simple, the wasted retries are bounded by the cap
+        // overshoot, not total history length.
+        let prefill_outcome: Result<(), String> = loop {
+            session.reset();
+            // Recompute per attempt: a truncation step may have
+            // dropped the last image-bearing turn, in which case the
+            // conversation is now text-only and the chat template
+            // renders a different (string- vs list-shaped) content
+            // prefix.
+            let any_images = history_images.iter().any(|v| !v.is_empty());
+            let attempt: Result<(), wick::WickError> = if any_images {
+                // Multimodal path: synthesize multimodal messages by
+                // zipping history with history_images. Each user turn
+                // that had attachments rebuilds as
+                // `[Image*N, Text(content)?]`; turns without
+                // attachments rebuild as `[Text(content)]`. Image
+                // bytes flatten across all turns in document order,
+                // matching the chat template's `<image>` marker walk.
+                let messages: Vec<wick::tokenizer::ChatMessageMultimodal> = history
+                    .iter()
+                    .zip(history_images.iter())
+                    .map(|(msg, imgs)| {
+                        let mut content: Vec<wick::tokenizer::ContentItem> =
+                            vec![wick::tokenizer::ContentItem::Image; imgs.len()];
+                        if !msg.content.is_empty() {
+                            content.push(wick::tokenizer::ContentItem::Text {
+                                text: msg.content.clone(),
+                            });
+                        }
+                        wick::tokenizer::ChatMessageMultimodal {
+                            role: msg.role.clone(),
+                            content,
+                        }
+                    })
+                    .collect();
+                let images_refs: Vec<&[u8]> = history_images
+                    .iter()
+                    .flat_map(|v| v.iter().map(|a| a.as_slice()))
+                    .collect();
+                session.append_chat_with_images(&messages, &images_refs, true)
+            } else {
+                match wick::tokenizer::apply_chat_template(&tokenizer, &history, true) {
+                    Ok(formatted) => {
+                        let tokens = tokenizer.encode(&formatted);
+                        session.append_tokens(&tokens)
                     }
-                    wick::tokenizer::ChatMessageMultimodal {
-                        role: msg.role.clone(),
-                        content,
-                    }
-                })
-                .collect();
-            let images_refs: Vec<&[u8]> = history_images
-                .iter()
-                .flat_map(|v| v.iter().map(|a| a.as_slice()))
-                .collect();
-            session
-                .append_chat_with_images(&messages, &images_refs, true)
-                .map_err(|e| format!("append_chat_with_images failed: {e}"))
-        } else {
-            match wick::tokenizer::apply_chat_template(&tokenizer, &history, true) {
-                Ok(formatted) => {
-                    let tokens = tokenizer.encode(&formatted);
-                    session
-                        .append_tokens(&tokens)
-                        .map_err(|e| format!("append_tokens failed: {e}"))
+                    Err(e) => break Err(format!("chat-template render failed: {e}")),
                 }
-                Err(e) => Err(format!("chat-template render failed: {e}")),
+            };
+            match attempt {
+                Ok(()) => break Ok(()),
+                Err(wick::WickError::ContextOverflow { max_seq_len, by }) => {
+                    if !crate::truncate_oldest_turn_pair(&mut history, &mut history_images) {
+                        break Err(format!(
+                            "prompt too large for context window: would need {by} more \
+                             tokens past the {max_seq_len}-token cap, and there's no \
+                             older history to drop. Raise --context-size or shorten \
+                             the prompt."
+                        ));
+                    }
+                    let _ = tx_update.send(UiUpdate::Status(
+                        "(history truncated to fit context: dropped oldest turn pair)".into(),
+                    ));
+                }
+                Err(other) => break Err(format!("prefill failed: {other}")),
             }
         };
         if let Err(msg) = prefill_outcome {

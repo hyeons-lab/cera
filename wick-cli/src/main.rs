@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use wick::tokenizer::BpeTokenizer;
-use wick::{BackendPreference, EngineConfig, FinishReason, ModalitySink, WickEngine};
+use wick::{BackendPreference, EngineConfig, FinishReason, ModalitySink, WickEngine, WickError};
 
 mod chat_tui;
 mod image_source;
@@ -649,6 +649,51 @@ fn write_transcript(history: &[wick::tokenizer::ChatMessage], path: &Path) -> st
     }
     w.flush()?;
     Ok(())
+}
+
+/// Drop the oldest user+assistant pair from `history` (and the matching
+/// entries in `history_images`), preserving any system message at index 0
+/// and never touching the most recent entry (which is the user turn the
+/// caller is about to prefill). Used by the chat REPL to shrink history
+/// on `WickError::ContextOverflow` and retry, instead of bubbling overflow
+/// up as a hard error and forcing the user to `/clear`.
+///
+/// Pairs are dropped together so the chat-template's alternating
+/// user/assistant invariant stays intact. Returns `false` when there's
+/// nothing left to drop without touching the system entry or the current
+/// turn — caller surfaces "prompt too large for context window even with
+/// empty history".
+pub(crate) fn truncate_oldest_turn_pair(
+    history: &mut Vec<wick::tokenizer::ChatMessage>,
+    history_images: &mut Vec<Vec<Arc<Vec<u8>>>>,
+) -> bool {
+    debug_assert_eq!(history.len(), history_images.len());
+    // Index of the first non-system entry. System lives at index 0 when
+    // present (or there's no system at all).
+    let start = if history.first().map(|m| m.role.as_str()) == Some("system") {
+        1
+    } else {
+        0
+    };
+    // Need at least 2 non-system entries to drop ONE pair without touching
+    // the just-pushed user turn at the tail. (1 means only the current
+    // user turn exists past the system; nothing older to drop.)
+    if history.len() <= start + 1 {
+        return false;
+    }
+    history.remove(start);
+    history_images.remove(start);
+    // If the next entry is the matching assistant reply, drop it too. The
+    // length check stays bounded by `start + 1` (the original user-turn
+    // tail is now at `start` after the first remove if there's no
+    // assistant in between). Without this guard a malformed history
+    // (interrupted turn with no assistant reply) would still drop one
+    // entry safely.
+    if history.len() > start + 1 && history[start].role == "assistant" {
+        history.remove(start);
+        history_images.remove(start);
+    }
+    true
 }
 
 /// Default cache root, used by the bundle-id flow when `--cache-dir` is
@@ -2105,59 +2150,114 @@ fn main() -> Result<()> {
                 // the engine's prefix cache for fast turn-N+1 prefill.
                 // Delta-prefill is a future optimization; the simplicity
                 // of "render fresh, reset, prefill" is worth the lookup.
-                session.reset();
-                let any_images = history_images.iter().any(|v| !v.is_empty());
-                // SIGINT during ANY part of this turn — prefill, the
-                // "assistant> " banner print, or generate — should
-                // cancel the in-flight call, not kill the REPL. Hold
-                // `intercepting=true` across the whole turn span and
-                // only release it at the very end (after we've read
-                // `sigint_fired`), so there's no gap where a SIGINT
-                // would be misrouted to `process::exit(130)`.
+                // SIGINT during ANY part of this turn — prefill (incl.
+                // any retries), the "assistant> " banner print, or
+                // generate — should cancel the in-flight call, not kill
+                // the REPL. Hold `intercepting=true` across the whole
+                // turn span and only release it at the very end (after
+                // we've read `sigint_fired`), so there's no gap where a
+                // SIGINT would be misrouted to `process::exit(130)`.
                 intercepting.store(true, Ordering::Relaxed);
-                let prefill_outcome: Result<(), String> = if any_images {
-                    // Multimodal prefill: synthesize multimodal
-                    // messages by zipping history with
-                    // history_images. Each user turn that had
-                    // attachments rebuilds as
-                    // `[Image*N, Text(content)?]`; turns without
-                    // attachments rebuild as `[Text(content)]`.
-                    // Image bytes flatten across all turns in
-                    // document order, matching the chat template's
-                    // `<image>` marker walk.
-                    let messages: Vec<wick::tokenizer::ChatMessageMultimodal> = history
-                        .iter()
-                        .zip(history_images.iter())
-                        .map(|(msg, imgs)| {
-                            let mut content: Vec<wick::tokenizer::ContentItem> =
-                                vec![wick::tokenizer::ContentItem::Image; imgs.len()];
-                            if !msg.content.is_empty() {
-                                content.push(wick::tokenizer::ContentItem::Text {
-                                    text: msg.content.clone(),
-                                });
+                // Retry-on-overflow: on `WickError::ContextOverflow`
+                // drop the oldest user+assistant pair and re-render,
+                // so a long conversation can keep going past the
+                // window cap without forcing the user to `/clear`.
+                // Bounded by `truncate_oldest_turn_pair` which
+                // returns false once only the system + the just-
+                // pushed user remain — at which point overflow is a
+                // real "single prompt too large" and we surface it.
+                //
+                // Truncation runs against a SCRATCH copy of the history
+                // — `scratch_history` / `scratch_images`. The
+                // authoritative `history` / `history_images` are only
+                // overwritten with the (possibly-truncated) scratch
+                // AFTER the turn is fully durable (prefill + generate
+                // both succeed). On any failure path the scratch is
+                // discarded and the user keeps every typed turn. Image
+                // bytes are `Arc<Vec<u8>>` so cloning the parallel
+                // `Vec<Vec<…>>` is a refcount bump per attachment, not
+                // a memcpy of up to 50 MB per image.
+                let mut scratch_history = history.clone();
+                let mut scratch_images = history_images.clone();
+                let prefill_outcome: Result<(), String> = loop {
+                    session.reset();
+                    // Recompute per attempt: a truncation step may have
+                    // dropped the last image-bearing turn, in which case
+                    // the conversation is now text-only and the chat
+                    // template renders a different (string-shaped vs
+                    // list-shaped) content prefix.
+                    let any_images = scratch_images.iter().any(|v| !v.is_empty());
+                    let attempt: Result<(), WickError> = if any_images {
+                        // Multimodal prefill: synthesize multimodal
+                        // messages by zipping scratch_history with
+                        // scratch_images. Each user turn that had
+                        // attachments rebuilds as
+                        // `[Image*N, Text(content)?]`; turns without
+                        // attachments rebuild as `[Text(content)]`.
+                        // Image bytes flatten across all turns in
+                        // document order, matching the chat template's
+                        // `<image>` marker walk.
+                        let messages: Vec<wick::tokenizer::ChatMessageMultimodal> = scratch_history
+                            .iter()
+                            .zip(scratch_images.iter())
+                            .map(|(msg, imgs)| {
+                                let mut content: Vec<wick::tokenizer::ContentItem> =
+                                    vec![wick::tokenizer::ContentItem::Image; imgs.len()];
+                                if !msg.content.is_empty() {
+                                    content.push(wick::tokenizer::ContentItem::Text {
+                                        text: msg.content.clone(),
+                                    });
+                                }
+                                wick::tokenizer::ChatMessageMultimodal {
+                                    role: msg.role.clone(),
+                                    content,
+                                }
+                            })
+                            .collect();
+                        let images_refs: Vec<&[u8]> = scratch_images
+                            .iter()
+                            .flat_map(|v| v.iter().map(|a| a.as_slice()))
+                            .collect();
+                        session.append_chat_with_images(&messages, &images_refs, true)
+                    } else {
+                        match wick::tokenizer::apply_chat_template(
+                            tokenizer,
+                            &scratch_history,
+                            true,
+                        ) {
+                            Ok(formatted) => {
+                                let tokens = tokenizer.encode(&formatted);
+                                session.append_tokens(&tokens)
                             }
-                            wick::tokenizer::ChatMessageMultimodal {
-                                role: msg.role.clone(),
-                                content,
+                            Err(e) => {
+                                break Err(format!("chat-template render failed: {e}"));
                             }
-                        })
-                        .collect();
-                    let images_refs: Vec<&[u8]> = history_images
-                        .iter()
-                        .flat_map(|v| v.iter().map(|a| a.as_slice()))
-                        .collect();
-                    session
-                        .append_chat_with_images(&messages, &images_refs, true)
-                        .map_err(|e| format!("append_chat_with_images failed: {e}"))
-                } else {
-                    match wick::tokenizer::apply_chat_template(tokenizer, &history, true) {
-                        Ok(formatted) => {
-                            let tokens = tokenizer.encode(&formatted);
-                            session
-                                .append_tokens(&tokens)
-                                .map_err(|e| format!("append_tokens failed: {e}"))
                         }
-                        Err(e) => Err(format!("chat-template render failed: {e}")),
+                    };
+                    match attempt {
+                        Ok(()) => break Ok(()),
+                        Err(WickError::ContextOverflow { max_seq_len, by }) => {
+                            if !truncate_oldest_turn_pair(&mut scratch_history, &mut scratch_images)
+                            {
+                                break Err(format!(
+                                    "prompt too large for context window: would need {} more \
+                                     tokens past the {max_seq_len}-token cap, and there's no \
+                                     older history to drop. Raise --context-size or shorten \
+                                     the prompt.",
+                                    by
+                                ));
+                            }
+                            eprintln!(
+                                "(history truncated to fit context: dropped oldest turn pair)"
+                            );
+                        }
+                        Err(other) => {
+                            // Cancelled, real decode failures, etc. —
+                            // surface as the existing String-typed
+                            // error path. Scratch is discarded by
+                            // simply not committing it.
+                            break Err(format!("prefill failed: {other}"));
+                        }
                     }
                 };
                 if let Err(msg) = prefill_outcome {
@@ -2200,7 +2300,10 @@ fn main() -> Result<()> {
                         // not as `Err`. An `Err` here is always a real
                         // decode failure — print it verbatim so the
                         // user sees what actually broke, even if a
-                        // SIGINT happened to fire concurrently.
+                        // SIGINT happened to fire concurrently. The
+                        // turn isn't durable, so the scratch goes
+                        // unused; authoritative `history` keeps every
+                        // pre-truncation pair intact.
                         eprintln!("\nerror: generate failed: {e}");
                         history.pop();
                         history_images.pop();
@@ -2214,6 +2317,17 @@ fn main() -> Result<()> {
                         continue;
                     }
                 };
+                // Generate succeeded (possibly with finish_reason =
+                // Cancelled — that path is also durable: the user
+                // saw partial assistant output streamed live, and a
+                // Ctrl+C marker is added below). Commit the
+                // (possibly-truncated) scratch back to authoritative
+                // state. The current user turn is at the tail of
+                // both vectors; truncation only ever removed pairs
+                // from the front; appending the assistant reply
+                // below uses `history` (the now-committed copy).
+                history = scratch_history;
+                history_images = scratch_images;
                 // Mark a SIGINT-truncated turn before pushing it into
                 // history so the user can see in scrollback that the
                 // assistant reply was interrupted (otherwise it just
@@ -2421,11 +2535,123 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
         Cli, Command, display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono, resample_linear,
-        resolve_engine, split_at_marker, write_transcript, write_wav,
+        resolve_engine, split_at_marker, truncate_oldest_turn_pair, write_transcript, write_wav,
     };
     use clap::Parser;
+    use wick::tokenizer::ChatMessage;
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    type ImagesByTurn = Vec<Vec<Arc<Vec<u8>>>>;
+
+    /// Helper: build aligned (history, history_images) where every entry
+    /// gets an empty image vec. Caller can override specific image vecs
+    /// after the call.
+    fn fixture(history: Vec<ChatMessage>) -> (Vec<ChatMessage>, ImagesByTurn) {
+        let images = vec![Vec::new(); history.len()];
+        (history, images)
+    }
+
+    #[test]
+    fn truncate_drops_oldest_pair_with_system() {
+        let (mut hist, mut imgs) = fixture(vec![
+            msg("system", "you are helpful"),
+            msg("user", "u1"),
+            msg("assistant", "a1"),
+            msg("user", "u2"),
+            msg("assistant", "a2"),
+            msg("user", "u3"),
+        ]);
+        assert!(truncate_oldest_turn_pair(&mut hist, &mut imgs));
+        assert_eq!(
+            hist.iter()
+                .map(|m| (m.role.as_str(), m.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("system", "you are helpful"),
+                ("user", "u2"),
+                ("assistant", "a2"),
+                ("user", "u3"),
+            ]
+        );
+        assert_eq!(imgs.len(), hist.len());
+    }
+
+    #[test]
+    fn truncate_drops_oldest_pair_no_system() {
+        let (mut hist, mut imgs) = fixture(vec![
+            msg("user", "u1"),
+            msg("assistant", "a1"),
+            msg("user", "u2"),
+            msg("assistant", "a2"),
+            msg("user", "u3"),
+        ]);
+        assert!(truncate_oldest_turn_pair(&mut hist, &mut imgs));
+        assert_eq!(
+            hist.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["u2", "a2", "u3"]
+        );
+    }
+
+    #[test]
+    fn truncate_drops_image_bytes_with_pair() {
+        let (mut hist, mut imgs) = fixture(vec![
+            msg("user", "u1"),
+            msg("assistant", "a1"),
+            msg("user", "u2"),
+        ]);
+        // Attach an image to the oldest user turn.
+        imgs[0].push(Arc::new(vec![0xAB; 16]));
+        assert!(truncate_oldest_turn_pair(&mut hist, &mut imgs));
+        // u1+a1 dropped → only u2 left (no images on u2).
+        assert_eq!(hist.len(), 1);
+        assert_eq!(imgs.len(), 1);
+        assert!(imgs[0].is_empty());
+    }
+
+    #[test]
+    fn truncate_refuses_to_drop_current_user_turn_only() {
+        // System + just the current user. Nothing older to drop.
+        let (mut hist, mut imgs) = fixture(vec![msg("system", "sys"), msg("user", "u1")]);
+        assert!(!truncate_oldest_turn_pair(&mut hist, &mut imgs));
+        // Unchanged.
+        assert_eq!(hist.len(), 2);
+    }
+
+    #[test]
+    fn truncate_refuses_on_system_only() {
+        let (mut hist, mut imgs) = fixture(vec![msg("system", "sys")]);
+        assert!(!truncate_oldest_turn_pair(&mut hist, &mut imgs));
+        assert_eq!(hist.len(), 1);
+    }
+
+    #[test]
+    fn truncate_refuses_on_empty() {
+        let mut hist: Vec<ChatMessage> = Vec::new();
+        let mut imgs: Vec<Vec<Arc<Vec<u8>>>> = Vec::new();
+        assert!(!truncate_oldest_turn_pair(&mut hist, &mut imgs));
+    }
+
+    #[test]
+    fn truncate_handles_dangling_user_without_assistant() {
+        // Edge case: a prior turn errored mid-flight and the assistant
+        // reply was popped, leaving two consecutive user messages.
+        // Drop one, leave the rest. Test guards against accidentally
+        // dropping the second remove() when no assistant is present.
+        let (mut hist, mut imgs) = fixture(vec![msg("user", "u_orphan"), msg("user", "u_current")]);
+        assert!(truncate_oldest_turn_pair(&mut hist, &mut imgs));
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].content, "u_current");
+    }
 
     /// Round-trip: deterministic samples → write_wav → read_wav_pcm16_mono.
     /// The reader must recover the same sample count + sample rate, with
