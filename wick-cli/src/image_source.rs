@@ -8,6 +8,7 @@
 //! exhaust memory.
 
 use std::io::Read;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -29,11 +30,15 @@ const MAX_REDIRECTS: usize = 10;
 /// smaller bloats syscall count.
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Returns true iff `arg` looks like an HTTP(S) URL. Anything else (including
+/// Returns true iff `arg` looks like an HTTP(S) URL. The scheme prefix match
+/// is case-insensitive per RFC 3986 §3.1 ("Although schemes are case-
+/// insensitive, the canonical form is lowercase…"). Anything else (including
 /// `file://`, relative paths, absolute paths, and bare strings) is treated
 /// as a filesystem path by [`load`].
 pub(crate) fn looks_like_url(arg: &str) -> bool {
-    arg.starts_with("http://") || arg.starts_with("https://")
+    let bytes = arg.as_bytes();
+    matches!(bytes.get(..7), Some(p) if p.eq_ignore_ascii_case(b"http://"))
+        || matches!(bytes.get(..8), Some(p) if p.eq_ignore_ascii_case(b"https://"))
 }
 
 /// Resolves `arg` to image bytes, capped at `max_bytes`. URL inputs fetch
@@ -58,15 +63,26 @@ fn load_path(path: &str, max_bytes: u64) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("reading image source {path}"))
 }
 
-fn load_url(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
-        .user_agent(concat!("wick-cli/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("build HTTP client for image fetch")?;
+/// Process-wide HTTP client. Built once on first fetch; reused for every
+/// subsequent URL fetch. Reqwest's blocking client owns its own tokio
+/// runtime + TLS config — building it per-fetch was milliseconds-scale
+/// waste that grows linearly with `wick run --image url1 --image url2 …`.
+fn http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+            .user_agent(concat!("wick-cli/", env!("CARGO_PKG_VERSION")))
+            .build()
+            // A construction failure means the bundled rustls / tokio init
+            // is broken at compile-pinned-version level; no sensible fallback.
+            .expect("failed to build reqwest::blocking::Client for image fetch")
+    })
+}
 
-    let mut response = client
+fn load_url(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    let mut response = http_client()
         .get(url)
         .send()
         .with_context(|| format!("fetch image source {url}"))?
@@ -150,11 +166,16 @@ mod tests {
     }
 
     #[test]
-    fn classifier_accepts_http_and_https() {
+    fn classifier_accepts_http_and_https_any_case() {
         assert!(looks_like_url("http://example.com/a.jpg"));
         assert!(looks_like_url("https://example.com/a.jpg"));
         assert!(looks_like_url("https://"));
         assert!(looks_like_url("http://"));
+        // RFC 3986 §3.1: schemes are case-insensitive.
+        assert!(looks_like_url("Http://example.com/x"));
+        assert!(looks_like_url("HTTP://example.com/x"));
+        assert!(looks_like_url("HTTPS://example.com/x"));
+        assert!(looks_like_url("HtTpS://example.com/x"));
     }
 
     #[test]
@@ -165,8 +186,8 @@ mod tests {
         assert!(!looks_like_url("path.jpg"));
         assert!(!looks_like_url("file:///abs/path.jpg"));
         assert!(!looks_like_url("ftp://example.com/x"));
-        assert!(!looks_like_url("Http://example.com/x")); // case-sensitive
         assert!(!looks_like_url("httpfoo"));
+        assert!(!looks_like_url("http")); // shorter than the prefix
     }
 
     #[test]

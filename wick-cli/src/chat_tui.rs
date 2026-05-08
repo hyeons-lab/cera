@@ -637,11 +637,25 @@ fn dispatch_user_input(
                 state.fetching_url = Some(url.clone());
                 let tx = tx_update.clone();
                 std::thread::spawn(move || {
-                    let result =
+                    // Wrap the fetch in `catch_unwind` so a panic inside
+                    // rustls / tokio (rare but possible) gets mapped to
+                    // a normal error result instead of dropping the
+                    // thread and leaving the UI deadlocked with
+                    // `fetching_url = Some(...)` forever (no event ever
+                    // arrives to clear it). The closure captures the
+                    // owned `String` `url` by reference; `String` is
+                    // `UnwindSafe` so no `AssertUnwindSafe` wrapper is
+                    // needed.
+                    let load_result = std::panic::catch_unwind(|| {
                         crate::image_source::load(&url, crate::image_source::MAX_IMAGE_BYTES)
-                            .map_err(|e| format!("{e:#}"));
-                    // Errors here mean the UI dropped the receiver
-                    // (clean exit) — drop the result silently.
+                    });
+                    let result = match load_result {
+                        Ok(Ok(bytes)) => Ok(bytes),
+                        Ok(Err(e)) => Err(format!("{e:#}")),
+                        Err(_) => Err("image fetch panicked".to_string()),
+                    };
+                    // A `SendError` here means the UI dropped the
+                    // receiver (clean exit) — discard the result silently.
                     let _ = tx.send(UiUpdate::ImageFetched { url, result });
                 });
                 return Ok(KeyAction::Continue);
