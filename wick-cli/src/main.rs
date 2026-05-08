@@ -2166,22 +2166,40 @@ fn main() -> Result<()> {
                 // returns false once only the system + the just-
                 // pushed user remain — at which point overflow is a
                 // real "single prompt too large" and we surface it.
-                let any_images = history_images.iter().any(|v| !v.is_empty());
+                //
+                // Truncation runs against a SCRATCH copy of the history
+                // — `scratch_history` / `scratch_images`. The
+                // authoritative `history` / `history_images` are only
+                // overwritten with the (possibly-truncated) scratch
+                // AFTER the turn is fully durable (prefill + generate
+                // both succeed). On any failure path the scratch is
+                // discarded and the user keeps every typed turn. Image
+                // bytes are `Arc<Vec<u8>>` so cloning the parallel
+                // `Vec<Vec<…>>` is a refcount bump per attachment, not
+                // a memcpy of up to 50 MB per image.
+                let mut scratch_history = history.clone();
+                let mut scratch_images = history_images.clone();
                 let prefill_outcome: Result<(), String> = loop {
                     session.reset();
+                    // Recompute per attempt: a truncation step may have
+                    // dropped the last image-bearing turn, in which case
+                    // the conversation is now text-only and the chat
+                    // template renders a different (string-shaped vs
+                    // list-shaped) content prefix.
+                    let any_images = scratch_images.iter().any(|v| !v.is_empty());
                     let attempt: Result<(), WickError> = if any_images {
                         // Multimodal prefill: synthesize multimodal
-                        // messages by zipping history with
-                        // history_images. Each user turn that had
+                        // messages by zipping scratch_history with
+                        // scratch_images. Each user turn that had
                         // attachments rebuilds as
                         // `[Image*N, Text(content)?]`; turns without
                         // attachments rebuild as `[Text(content)]`.
                         // Image bytes flatten across all turns in
                         // document order, matching the chat template's
                         // `<image>` marker walk.
-                        let messages: Vec<wick::tokenizer::ChatMessageMultimodal> = history
+                        let messages: Vec<wick::tokenizer::ChatMessageMultimodal> = scratch_history
                             .iter()
-                            .zip(history_images.iter())
+                            .zip(scratch_images.iter())
                             .map(|(msg, imgs)| {
                                 let mut content: Vec<wick::tokenizer::ContentItem> =
                                     vec![wick::tokenizer::ContentItem::Image; imgs.len()];
@@ -2196,20 +2214,21 @@ fn main() -> Result<()> {
                                 }
                             })
                             .collect();
-                        let images_refs: Vec<&[u8]> = history_images
+                        let images_refs: Vec<&[u8]> = scratch_images
                             .iter()
                             .flat_map(|v| v.iter().map(|a| a.as_slice()))
                             .collect();
                         session.append_chat_with_images(&messages, &images_refs, true)
                     } else {
-                        match wick::tokenizer::apply_chat_template(tokenizer, &history, true) {
+                        match wick::tokenizer::apply_chat_template(
+                            tokenizer,
+                            &scratch_history,
+                            true,
+                        ) {
                             Ok(formatted) => {
                                 let tokens = tokenizer.encode(&formatted);
                                 session.append_tokens(&tokens)
                             }
-                            // Render error is its own anyhow::Error;
-                            // synthesize a typed-ish WickError-shaped
-                            // payload so the caller can match cleanly.
                             Err(e) => {
                                 break Err(format!("chat-template render failed: {e}"));
                             }
@@ -2218,7 +2237,8 @@ fn main() -> Result<()> {
                     match attempt {
                         Ok(()) => break Ok(()),
                         Err(WickError::ContextOverflow { max_seq_len, by }) => {
-                            if !truncate_oldest_turn_pair(&mut history, &mut history_images) {
+                            if !truncate_oldest_turn_pair(&mut scratch_history, &mut scratch_images)
+                            {
                                 break Err(format!(
                                     "prompt too large for context window: would need {} more \
                                      tokens past the {max_seq_len}-token cap, and there's no \
@@ -2234,7 +2254,8 @@ fn main() -> Result<()> {
                         Err(other) => {
                             // Cancelled, real decode failures, etc. —
                             // surface as the existing String-typed
-                            // error path.
+                            // error path. Scratch is discarded by
+                            // simply not committing it.
                             break Err(format!("prefill failed: {other}"));
                         }
                     }
@@ -2279,7 +2300,10 @@ fn main() -> Result<()> {
                         // not as `Err`. An `Err` here is always a real
                         // decode failure — print it verbatim so the
                         // user sees what actually broke, even if a
-                        // SIGINT happened to fire concurrently.
+                        // SIGINT happened to fire concurrently. The
+                        // turn isn't durable, so the scratch goes
+                        // unused; authoritative `history` keeps every
+                        // pre-truncation pair intact.
                         eprintln!("\nerror: generate failed: {e}");
                         history.pop();
                         history_images.pop();
@@ -2293,6 +2317,17 @@ fn main() -> Result<()> {
                         continue;
                     }
                 };
+                // Generate succeeded (possibly with finish_reason =
+                // Cancelled — that path is also durable: the user
+                // saw partial assistant output streamed live, and a
+                // Ctrl+C marker is added below). Commit the
+                // (possibly-truncated) scratch back to authoritative
+                // state. The current user turn is at the tail of
+                // both vectors; truncation only ever removed pairs
+                // from the front; appending the assistant reply
+                // below uses `history` (the now-committed copy).
+                history = scratch_history;
+                history_images = scratch_images;
                 // Mark a SIGINT-truncated turn before pushing it into
                 // history so the user can see in scrollback that the
                 // assistant reply was interrupted (otherwise it just

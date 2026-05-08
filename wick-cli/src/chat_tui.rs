@@ -793,9 +793,14 @@ fn worker_loop(
         // with the same overshoot. Worker re-truncates each turn.
         // V1: simple, the wasted retries are bounded by the cap
         // overshoot, not total history length.
-        let any_images = history_images.iter().any(|v| !v.is_empty());
         let prefill_outcome: Result<(), String> = loop {
             session.reset();
+            // Recompute per attempt: a truncation step may have
+            // dropped the last image-bearing turn, in which case the
+            // conversation is now text-only and the chat template
+            // renders a different (string- vs list-shaped) content
+            // prefix.
+            let any_images = history_images.iter().any(|v| !v.is_empty());
             let attempt: Result<(), wick::WickError> = if any_images {
                 // Multimodal path: synthesize multimodal messages by
                 // zipping history with history_images. Each user turn
