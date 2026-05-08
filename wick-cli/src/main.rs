@@ -696,6 +696,52 @@ pub(crate) fn truncate_oldest_turn_pair(
     true
 }
 
+/// Simulate `n_pairs` consecutive `truncate_oldest_turn_pair` calls without
+/// actually mutating anything. Returns `(start, end, applied)` describing
+/// the slice that would remain after the truncations:
+///
+/// * `start` — index 0 unless a system message lives at index 0 (then 1).
+/// * `end` — index just past the last dropped entry; the kept entries are
+///   `history[..start]` (system prefix, possibly empty) and
+///   `history[end..]`.
+/// * `applied` — number of pairs actually dropped, capped by what the
+///   real helper would have done. Equal to `n_pairs` in the common case;
+///   less when fewer than `n_pairs` pairs exist past the system prefix
+///   without touching the just-pushed user turn at the tail.
+///
+/// Lets the TUI build the per-turn channel send by chaining the kept
+/// slices without paying the O(N) `Vec::remove` shift inside a loop.
+pub(crate) fn simulate_truncate_oldest_turn_pairs(
+    history: &[wick::tokenizer::ChatMessage],
+    n_pairs: usize,
+) -> (usize, usize, usize) {
+    let start = if history.first().map(|m| m.role.as_str()) == Some("system") {
+        1
+    } else {
+        0
+    };
+    let mut end = start;
+    let mut applied = 0;
+    while applied < n_pairs {
+        // Mirror the helper's "need at least 2 entries past `end` (incl.
+        // the tail) to drop one pair without touching the just-pushed
+        // user turn" precondition.
+        if history.len() <= end + 1 {
+            break;
+        }
+        // Drop the user-or-orphan entry at `end`.
+        end += 1;
+        // Helper drops the next entry too iff it is the matching
+        // assistant reply. Keep the same predicate so simulation
+        // matches mutation byte-for-byte.
+        if end < history.len() && history[end].role == "assistant" {
+            end += 1;
+        }
+        applied += 1;
+    }
+    (start, end, applied)
+}
+
 /// Default cache root, used by the bundle-id flow when `--cache-dir` is
 /// unset: `$HOME/.cache/wick` when `$HOME` is set, otherwise
 /// `<TMPDIR>/.cache/wick`. Shared between the `BundleRepo` (downloads land
@@ -2539,7 +2585,8 @@ mod tests {
 
     use super::{
         Cli, Command, display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono, resample_linear,
-        resolve_engine, split_at_marker, truncate_oldest_turn_pair, write_transcript, write_wav,
+        resolve_engine, simulate_truncate_oldest_turn_pairs, split_at_marker,
+        truncate_oldest_turn_pair, write_transcript, write_wav,
     };
     use clap::Parser;
     use wick::tokenizer::ChatMessage;
@@ -2651,6 +2698,80 @@ mod tests {
         assert!(truncate_oldest_turn_pair(&mut hist, &mut imgs));
         assert_eq!(hist.len(), 1);
         assert_eq!(hist[0].content, "u_current");
+    }
+
+    /// Equivalence: `simulate_truncate_oldest_turn_pairs` must produce the
+    /// same kept-suffix as N consecutive `truncate_oldest_turn_pair` calls
+    /// on the same input. The TUI dispatch path relies on this to skip the
+    /// O(N) `Vec::remove` shifting per turn.
+    #[test]
+    fn simulate_truncate_matches_in_place_helper() {
+        let cases: &[Vec<ChatMessage>] = &[
+            vec![],
+            vec![msg("system", "s")],
+            vec![msg("system", "s"), msg("user", "u1")],
+            vec![
+                msg("system", "s"),
+                msg("user", "u1"),
+                msg("assistant", "a1"),
+                msg("user", "u2"),
+                msg("assistant", "a2"),
+                msg("user", "u3"),
+            ],
+            vec![
+                msg("user", "u1"),
+                msg("assistant", "a1"),
+                msg("user", "u2"),
+                msg("assistant", "a2"),
+                msg("user", "u3"),
+            ],
+            // Dangling-user history (orphaned by a prior generate failure
+            // before the assistant reply landed).
+            vec![
+                msg("user", "u_orphan"),
+                msg("user", "u2"),
+                msg("assistant", "a2"),
+                msg("user", "u3"),
+            ],
+        ];
+        for hist in cases {
+            for n in 0..=5 {
+                // Reference: mutate via the in-place helper.
+                let mut ref_hist = hist.clone();
+                let mut ref_imgs: ImagesByTurn = vec![Vec::new(); ref_hist.len()];
+                let mut ref_applied = 0usize;
+                for _ in 0..n {
+                    if !truncate_oldest_turn_pair(&mut ref_hist, &mut ref_imgs) {
+                        break;
+                    }
+                    ref_applied += 1;
+                }
+
+                // Candidate: simulate, then build the kept suffix by chain.
+                let (start, end, applied) = simulate_truncate_oldest_turn_pairs(hist, n);
+                assert_eq!(
+                    applied, ref_applied,
+                    "applied count mismatch: hist={hist:?} n={n}"
+                );
+                let candidate: Vec<ChatMessage> = hist[..start]
+                    .iter()
+                    .chain(hist[end..].iter())
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    candidate.len(),
+                    ref_hist.len(),
+                    "kept-suffix length mismatch: hist={hist:?} n={n}"
+                );
+                for (i, (cand, refm)) in candidate.iter().zip(ref_hist.iter()).enumerate() {
+                    assert_eq!(
+                        (cand.role.as_str(), cand.content.as_str()),
+                        (refm.role.as_str(), refm.content.as_str()),
+                        "kept-suffix entry {i} mismatch: hist={hist:?} n={n}"
+                    );
+                }
+            }
+        }
     }
 
     /// Round-trip: deterministic samples → write_wav → read_wav_pcm16_mono.

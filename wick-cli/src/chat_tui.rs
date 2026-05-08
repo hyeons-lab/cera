@@ -757,10 +757,6 @@ fn dispatch_user_input(
     state.pending = Some(String::new());
     state.generating = true;
     state.last_finish = None;
-    // Clone history + history_images for the channel send. With
-    // `Arc<Vec<u8>>` storage, the per-turn channel send is a
-    // refcount bump per attachment rather than a deep memcpy.
-    //
     // Pre-apply `truncate_offset` here — once the worker has
     // confirmed truncation of N pairs in prior turns
     // (`UiUpdate::HistoryTruncated`), every subsequent dispatch
@@ -771,20 +767,36 @@ fn dispatch_user_input(
     // belt+suspenders for first-time overflow + future cap
     // changes; in steady state, `truncate_offset` lets it find
     // the prefill fits on the first attempt.
-    let mut history_for_worker = state.history.clone();
-    let mut history_images_for_worker = state.history_images.clone();
-    for _ in 0..state.truncate_offset {
-        if !crate::truncate_oldest_turn_pair(
-            &mut history_for_worker,
-            &mut history_images_for_worker,
-        ) {
-            // Drift — UI's offset claimed more pairs than the
-            // current history actually has. Stop applying further
-            // pre-truncations rather than spinning; worker's retry
-            // loop will handle any residual overflow.
-            break;
-        }
+    //
+    // Use `simulate_truncate_oldest_turn_pairs` to walk the index
+    // once without mutating, then build the per-turn copy by
+    // chaining the kept system prefix and tail. Avoids O(offset ×
+    // history_len) `Vec::remove` shifting + allocating clone-then-
+    // discard for the dropped entries that the `truncate_…` helper
+    // would do. With `Arc<Vec<u8>>` storage, building the per-turn
+    // history_images copy is refcount bumps per attachment, not
+    // deep memcpy.
+    let (kept_start, drop_end, applied) =
+        crate::simulate_truncate_oldest_turn_pairs(&state.history, state.truncate_offset);
+    if applied < state.truncate_offset {
+        // Drift — fewer pairs to drop than the offset claimed. Most
+        // likely cause is a benign one-off (`/clear` resets the
+        // counter, but anything that asymmetrically mutated history
+        // could trip it). Self-heal so the next dispatch doesn't
+        // repeat the same break.
+        state.truncate_offset = applied;
     }
+    let history_for_worker: Vec<ChatMessage> = state.history[..kept_start]
+        .iter()
+        .chain(state.history[drop_end..].iter())
+        .cloned()
+        .collect();
+    let history_images_for_worker: Vec<Vec<std::sync::Arc<Vec<u8>>>> = state.history_images
+        [..kept_start]
+        .iter()
+        .chain(state.history_images[drop_end..].iter())
+        .cloned()
+        .collect();
     if tx_turn
         .send(TurnRequest::Turn {
             history: history_for_worker,
@@ -824,20 +836,25 @@ fn worker_loop(
             break;
         };
 
-        // Stateless: history is the full conversation including the
+        // Stateless: history is the full conversation (post any
+        // UI-side `truncate_offset` pre-application) including the
         // just-pushed user turn at the end. UI is the source of
-        // truth. `/clear` on UI side just sends a smaller history
-        // next turn — no separate reset needed here.
+        // truth — `/clear` resets offset and sends a smaller
+        // history next turn; no separate reset signal is needed.
         //
         // On `WickError::ContextOverflow` we drop the oldest
         // user+assistant pair from this turn's local copy and
-        // retry; status flows back to the UI via
-        // `UiUpdate::Status`. The UI's authoritative `state.history`
-        // is unchanged — `/save` still writes the full transcript
-        // the user typed, and the next `TurnRequest::Turn` arrives
-        // with the same overshoot. Worker re-truncates each turn.
-        // V1: simple, the wasted retries are bounded by the cap
-        // overshoot, not total history length.
+        // retry; the drop is reported to the UI via
+        // `UiUpdate::HistoryTruncated`, which both surfaces a
+        // status line and bumps `state.truncate_offset`. The UI's
+        // authoritative `state.history` is intentionally NOT
+        // mutated, so `/save` still writes the full transcript
+        // the user typed. Steady state: UI's offset means the
+        // first attempt fits without re-rendering or re-encoding
+        // dropped pairs every turn. The retry loop here is
+        // belt+suspenders for the very first overflow before the
+        // UI knows about it, plus any drift the offset can't
+        // anticipate.
         let prefill_outcome: Result<(), String> = loop {
             session.reset();
             // Recompute per attempt: a truncation step may have
