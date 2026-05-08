@@ -2153,9 +2153,15 @@ fn main() -> Result<()> {
                                 eprintln!("usage: /image <path-or-url>");
                                 continue;
                             }
-                            // Path branch: instant fs read; SIGINT during it
-                            // is unobservable, so no cancellation plumbing
-                            // needed. Stays on the REPL thread.
+                            // Path branch: synchronous fs read; this arm is
+                            // intentionally not cancellable. SIGINT during
+                            // a path read falls to the at-prompt handler
+                            // branch and exits — fine for the typical
+                            // sub-second local read; less ideal for a slow
+                            // network mount or a 50 MB max-size read where
+                            // the read itself could take long enough to
+                            // matter, but the threading machinery isn't
+                            // worth it for a path that's blocking-by-design.
                             if !image_source::looks_like_url(rest) {
                                 match image_source::load(rest, image_source::MAX_IMAGE_BYTES) {
                                     Ok(bytes) => {
@@ -2183,6 +2189,15 @@ fn main() -> Result<()> {
                             // resolves the request (≤30s timeout); its
                             // eventual `tx.send` returns SendError silently
                             // when the receiver is dropped.
+                            //
+                            // Hoist `intercepting=true` BEFORE any URL-
+                            // branch work (eprintln, channel setup, thread
+                            // spawn) — a SIGINT in the gap between branch
+                            // entry and the store would otherwise route to
+                            // the at-prompt handler branch and exit. Same
+                            // race PR #140's review caught for the
+                            // prefill/generate span.
+                            intercepting.store(true, Ordering::Relaxed);
                             eprintln!("(downloading {rest}...)");
                             let url = rest.to_string();
                             let url_for_thread = url.clone();
@@ -2207,7 +2222,6 @@ fn main() -> Result<()> {
                                 };
                                 let _ = tx.send(payload);
                             });
-                            intercepting.store(true, Ordering::Relaxed);
                             let outcome: std::result::Result<Vec<u8>, String> = loop {
                                 match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                                     Ok(thread_result) => break thread_result,
@@ -2227,6 +2241,19 @@ fn main() -> Result<()> {
                             };
                             let fetch_sigint = sigint_fired.swap(false, Ordering::Relaxed);
                             intercepting.store(false, Ordering::Relaxed);
+                            // Cancel-state hygiene: a SIGINT during the wait
+                            // sets BOTH `cancel` and `sigint_fired`. If the
+                            // fetch happened to complete first
+                            // (recv_timeout returned Ok before our cancel
+                            // poll observed it), the Ok arm below would
+                            // surface the bytes — but `cancel` would stay
+                            // set and the next session call would hit a
+                            // stale cancel. Clear it whenever SIGINT fired,
+                            // regardless of outcome. Matches the generate
+                            // path's discipline (PR #140 review).
+                            if fetch_sigint {
+                                cancel.store(false, Ordering::Relaxed);
+                            }
                             match outcome {
                                 Ok(bytes) => {
                                     eprintln!(
@@ -2237,7 +2264,6 @@ fn main() -> Result<()> {
                                 }
                                 Err(_) if fetch_sigint => {
                                     eprintln!("(cancelled)");
-                                    cancel.store(false, Ordering::Relaxed);
                                 }
                                 Err(msg) => {
                                     eprintln!("error: /image {url}: {msg}");
