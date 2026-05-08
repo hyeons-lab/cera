@@ -1856,14 +1856,23 @@ fn main() -> Result<()> {
             // flip the session's cancel flag.
             // The TUI path takes a different branch above and never
             // reaches this code; raw mode handles Ctrl+C as a key event.
-            let intercepting = std::sync::Arc::new(AtomicBool::new(false));
-            let sigint_fired = std::sync::Arc::new(AtomicBool::new(false));
+            let intercepting = Arc::new(AtomicBool::new(false));
+            let sigint_fired = Arc::new(AtomicBool::new(false));
             signal::install_line_repl_handler(
-                std::sync::Arc::clone(&cancel),
-                std::sync::Arc::clone(&intercepting),
-                std::sync::Arc::clone(&sigint_fired),
+                Arc::clone(&cancel),
+                Arc::clone(&intercepting),
+                Arc::clone(&sigint_fired),
             )?;
             loop {
+                // Defense against a leak from the previous turn's
+                // swap→store window: a SIGINT that arrived between
+                // `sigint_fired.swap(false)` and
+                // `intercepting.store(false)` would have re-set
+                // `sigint_fired` while intercepting was still true; the
+                // outer cleanup already saved its own snapshot, so any
+                // late set must NOT carry into the next turn or the
+                // user sees a spurious "(cancelled)".
+                sigint_fired.store(false, Ordering::Relaxed);
                 eprint!("user> ");
                 std::io::stderr().flush().ok();
                 let mut line = String::new();
@@ -2098,11 +2107,13 @@ fn main() -> Result<()> {
                 // of "render fresh, reset, prefill" is worth the lookup.
                 session.reset();
                 let any_images = history_images.iter().any(|v| !v.is_empty());
-                // SIGINT during prefill should cancel the in-flight call,
-                // not kill the REPL. Toggle the shared `intercepting`
-                // flag the SIGINT handler reads; flip it back as soon as
-                // the call returns so a Ctrl+C between prefill and
-                // generate-line-printing falls through to process exit.
+                // SIGINT during ANY part of this turn — prefill, the
+                // "assistant> " banner print, or generate — should
+                // cancel the in-flight call, not kill the REPL. Hold
+                // `intercepting=true` across the whole turn span and
+                // only release it at the very end (after we've read
+                // `sigint_fired`), so there's no gap where a SIGINT
+                // would be misrouted to `process::exit(130)`.
                 intercepting.store(true, Ordering::Relaxed);
                 let prefill_outcome: Result<(), String> = if any_images {
                     // Multimodal prefill: synthesize multimodal
@@ -2149,15 +2160,13 @@ fn main() -> Result<()> {
                         Err(e) => Err(format!("chat-template render failed: {e}")),
                     }
                 };
-                intercepting.store(false, Ordering::Relaxed);
-                // `swap(false)` reads-and-clears so we know whether SIGINT
-                // fired during THIS call and the flag is fresh for the
-                // next one. `cancel.load()` separately tells us whether
-                // the session reported cancellation (could be SIGINT or
-                // a future BrokenPipe-during-prefill, though the latter
-                // doesn't happen today).
-                let prefill_sigint = sigint_fired.swap(false, Ordering::Relaxed);
                 if let Err(msg) = prefill_outcome {
+                    // Read `sigint_fired` BEFORE releasing intercepting:
+                    // if SIGINT lands between the swap and the store,
+                    // the handler still routes to the cancel branch
+                    // (loop-top defense clears the leftover next turn).
+                    let prefill_sigint = sigint_fired.swap(false, Ordering::Relaxed);
+                    intercepting.store(false, Ordering::Relaxed);
                     if prefill_sigint {
                         eprintln!("(cancelled)");
                     } else {
@@ -2178,18 +2187,21 @@ fn main() -> Result<()> {
                 std::io::stderr().flush().ok();
 
                 let mut sink = ChatSink::new(tokenizer, session.cancel_handle());
-                intercepting.store(true, Ordering::Relaxed);
                 let generate_result = session.generate(&opts, &mut sink);
-                intercepting.store(false, Ordering::Relaxed);
+                // Same swap-before-store discipline as the prefill arm —
+                // capture in-turn SIGINTs before releasing intercepting.
                 let generate_sigint = sigint_fired.swap(false, Ordering::Relaxed);
+                intercepting.store(false, Ordering::Relaxed);
                 let summary = match generate_result {
                     Ok(s) => s,
                     Err(e) => {
-                        if generate_sigint {
-                            eprintln!("\n(cancelled)");
-                        } else {
-                            eprintln!("\nerror: generate failed: {e}");
-                        }
+                        // `Session::generate` surfaces cancellation as
+                        // `Ok(summary)` with `FinishReason::Cancelled`,
+                        // not as `Err`. An `Err` here is always a real
+                        // decode failure — print it verbatim so the
+                        // user sees what actually broke, even if a
+                        // SIGINT happened to fire concurrently.
+                        eprintln!("\nerror: generate failed: {e}");
                         history.pop();
                         history_images.pop();
                         cancel.store(false, Ordering::Relaxed);
@@ -2205,11 +2217,19 @@ fn main() -> Result<()> {
                 // Mark a SIGINT-truncated turn before pushing it into
                 // history so the user can see in scrollback that the
                 // assistant reply was interrupted (otherwise it just
-                // looks like the model trailed off mid-sentence). Only
-                // emits when the SIGINT path produced an Ok summary —
-                // i.e. the worker observed cancel between tokens and
-                // returned cleanly with FinishReason::Cancelled.
-                if generate_sigint {
+                // looks like the model trailed off mid-sentence). Both
+                // gates required:
+                // - `finish_reason == Cancelled` is the source of truth
+                //   from the session — no marker if the model finished
+                //   naturally, even if a SIGINT happened to fire (a
+                //   `generate()` start-of-call cancel-reset can swallow
+                //   one).
+                // - `generate_sigint` separates SIGINT from the only
+                //   other finish_reason=Cancelled path, the
+                //   `ChatSink`-self-cancel-on-BrokenPipe escape below.
+                let cancelled_clean =
+                    matches!(summary.finish_reason, wick::FinishReason::Cancelled);
+                if cancelled_clean && generate_sigint {
                     eprintln!("\n(cancelled)");
                 } else {
                     eprintln!();
@@ -2233,10 +2253,7 @@ fn main() -> Result<()> {
                 // SIGINT cancellation also flips `cancel`, but we want to
                 // stay in the REPL after Ctrl+C — `generate_sigint`
                 // tells the two apart.
-                if matches!(summary.finish_reason, wick::FinishReason::Cancelled)
-                    && cancel.load(Ordering::Relaxed)
-                    && !generate_sigint
-                {
+                if cancelled_clean && cancel.load(Ordering::Relaxed) && !generate_sigint {
                     break;
                 }
                 // Clear the cancel flag if SIGINT set it on a successful

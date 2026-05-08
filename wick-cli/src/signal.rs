@@ -29,10 +29,15 @@ use anyhow::{Context, Result};
 /// Conventional Unix exit code for "killed by SIGINT" (128 + signal number).
 const SIGINT_EXIT_CODE: i32 = 130;
 
-/// Signal-safe handler logic. Extracted into a free function so the
-/// `intercepting=true` branch can be unit-tested without registering a
-/// real handler (which is process-global and would conflict with other
-/// tests).
+/// Handler closure body. NOT an async-signal-safe handler in the POSIX
+/// sense — `ctrlc` runs the closure on a dedicated thread it spawns at
+/// `set_handler` time (Unix `sigwait` loop / Windows console control
+/// handler), and `process::exit` itself is not async-signal-safe — but
+/// the closure runs in normal Rust thread context, so the only
+/// constraint is the usual thread-safe atomic / sync-primitive usage.
+/// Extracted into a free function so the `intercepting=true` branch can
+/// be unit-tested without registering a real handler (which is
+/// process-global and would conflict with other tests).
 ///
 /// `sigint_fired` is set in addition to the session's `cancel` flag so the
 /// REPL can distinguish "user pressed Ctrl+C" from "stdout went away and
