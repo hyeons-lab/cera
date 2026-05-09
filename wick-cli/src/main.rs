@@ -1660,7 +1660,9 @@ fn main() -> Result<()> {
                         cfg.layer_is_conv.iter().filter(|&&c| c).count()
                     );
                 }
-                if std::env::var("WICK_GPU_DF").as_deref() == Ok("1") {
+                let gpu_df_requested = std::env::var("WICK_GPU_DF").as_deref() == Ok("1");
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                if gpu_df_requested {
                     eprintln!(
                         "warning: WICK_GPU_DF=1 enables an experimental Metal depthformer that \
                          currently produces incorrect codes (frame-1 immediate-end with \
@@ -1704,7 +1706,7 @@ fn main() -> Result<()> {
                     audio_temperature,
                     audio_top_k,
                     mode,
-                    gpu_depthformer: std::env::var("WICK_GPU_DF").as_deref() == Ok("1"),
+                    gpu_depthformer: gpu_df_requested,
                 };
 
                 #[cfg(all(feature = "metal", target_os = "macos"))]
