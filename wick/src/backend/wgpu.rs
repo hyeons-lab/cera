@@ -402,6 +402,10 @@ pub mod shaders {
     pub const GEMV_Q6_K: &str = include_str!("shaders/gemv_q6_k.wgsl");
     pub const ELEMENTWISE: &str = include_str!("shaders/elementwise.wgsl");
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.wgsl");
+    pub const RMSNORM_BATCH: &str = include_str!("shaders/rmsnorm_batch.wgsl");
+    pub const QK_NORM_ROPE_BATCH: &str = include_str!("shaders/qk_norm_rope_batch.wgsl");
+    pub const CONV1D_FUSED_BATCH: &str = include_str!("shaders/conv1d_fused_batch.wgsl");
+    pub const GEMM_Q4_0: &str = include_str!("shaders/gemm_q4_0.wgsl");
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.wgsl");
     pub const SOFTMAX: &str = include_str!("shaders/softmax.wgsl");
     pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.wgsl");
@@ -1341,5 +1345,692 @@ mod tests {
         assert_eq!(v64, 64, "override HEAD_DIM=64 not honored");
         assert_eq!(v128, 128, "override HEAD_DIM=128 not honored");
         println!("WGSL override spike OK: same module → HEAD_DIM={v64} and {v128}");
+    }
+
+    /// Parity check: `rmsnorm_batch` on N vectors must match the
+    /// per-vector `rmsnorm.wgsl` invoked N times. Same fixture, same
+    /// weights, byte-close output. Covers the contract that PR 2.C-full
+    /// will lean on — batched dispatch is a no-op rewrite of the
+    /// per-token loop.
+    #[test]
+    fn test_gpu_rmsnorm_batch_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let n: u32 = 1024; // hidden_size
+        let batch: u32 = 7; // N tokens — non-power-of-two on purpose
+        let eps = 1e-5f32;
+
+        // Build N distinct vectors. Each token gets its own pseudo-random
+        // pattern so no two share a sum_sq → catches per-workgroup
+        // offset bugs.
+        let mut src: Vec<f32> = Vec::with_capacity((n * batch) as usize);
+        for b in 0..batch {
+            for i in 0..n {
+                src.push(((b as f32 + 1.0) * (i as f32 - 512.0)) * 0.001);
+            }
+        }
+        let weight: Vec<f32> = (0..n).map(|i| 0.8 + (i as f32 % 7.0) * 0.05).collect();
+
+        // ─── Reference: run the per-vector rmsnorm.wgsl N times ───
+        let pipeline_per = ctx.create_pipeline(shaders::RMSNORM, "rmsnorm", "rmsnorm_ref");
+        let w_buf = ctx.upload_f32(&weight, "w");
+        let params_per = [n, eps.to_bits(), 0u32, 0u32];
+        let p_buf_per = ctx.upload_storage(bytemuck::cast_slice(&params_per), "params_per");
+
+        let mut reference = vec![0.0f32; (n * batch) as usize];
+        for b in 0..batch {
+            let row_start = (b * n) as usize;
+            let row_end = row_start + n as usize;
+            let scratch = ctx.create_storage_rw((n as u64) * 4, "rmsnorm_ref_scratch");
+            ctx.queue
+                .write_buffer(&scratch, 0, bytemuck::cast_slice(&src[row_start..row_end]));
+            let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline_per.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: scratch.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: w_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: p_buf_per.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline_per);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            ctx.queue.submit(Some(enc.finish()));
+            let out = ctx.download_f32(&scratch, n as usize);
+            reference[row_start..row_end].copy_from_slice(&out);
+        }
+
+        // ─── Batched run: one dispatch with N workgroups ───
+        let pipeline_batch =
+            ctx.create_pipeline(shaders::RMSNORM_BATCH, "rmsnorm_batch", "rmsnorm_batch");
+        let src_buf = ctx.create_storage_rw((src.len() as u64) * 4, "src");
+        ctx.queue
+            .write_buffer(&src_buf, 0, bytemuck::cast_slice(&src));
+        let dst_buf = ctx.create_storage_rw((src.len() as u64) * 4, "dst");
+        // params: (n, eps_bits, src_stride, dst_stride). Strides are both `n` here.
+        let params_batch = [n, eps.to_bits(), n, n];
+        let p_buf_batch = ctx.upload_storage(bytemuck::cast_slice(&params_batch), "params_batch");
+        // The `rmsnorm_batch` entry point doesn't read `residual`, and
+        // naga's auto-layout drops binding 4 from the inferred layout
+        // accordingly — the bind group has only 4 entries.
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline_batch.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: src_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dst_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: w_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_buf_batch.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline_batch);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(batch, 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        let batched = ctx.download_f32(&dst_buf, (n * batch) as usize);
+
+        // Allow ~1e-3 absolute slack — same threshold the per-vector
+        // test uses against the CPU reference.
+        for i in 0..(n * batch) as usize {
+            let diff = (reference[i] - batched[i]).abs();
+            assert!(
+                diff < 1e-3,
+                "rmsnorm_batch mismatch at idx {i} (token {}, dim {}): \
+                 ref={}, batched={}, diff={diff}",
+                i / n as usize,
+                i % n as usize,
+                reference[i],
+                batched[i]
+            );
+        }
+    }
+
+    /// `qk_norm_rope_batch` parity: per-head rmsnorm + RoPE on a batch
+    /// of N tokens must match running CPU rmsnorm + CPU rope per token
+    /// at `pos = start_pos + token_idx`. Both Q and K are checked.
+    #[test]
+    fn test_gpu_qk_norm_rope_batch_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let n_heads: u32 = 4;
+        let n_kv_heads: u32 = 2;
+        let head_dim: u32 = 64;
+        let n_tokens: u32 = 3;
+        let start_pos: u32 = 5;
+        let eps = 1e-5f32;
+        let freq_base = 10000.0f32;
+        let rope_type: u32 = 0;
+        let q_stride = n_heads * head_dim;
+        let k_stride = n_kv_heads * head_dim;
+
+        // Build N tokens of Q and K activations.
+        let mut q_batch: Vec<f32> = Vec::with_capacity((n_tokens * q_stride) as usize);
+        let mut k_batch: Vec<f32> = Vec::with_capacity((n_tokens * k_stride) as usize);
+        for t in 0..n_tokens {
+            for i in 0..q_stride {
+                q_batch.push(((t as f32 + 1.0) * (i as f32 - 32.0)) * 0.01);
+            }
+            for i in 0..k_stride {
+                k_batch.push(((t as f32 + 2.0) * (i as f32 - 16.0)) * 0.013);
+            }
+        }
+        let q_norm_w: Vec<f32> = (0..head_dim)
+            .map(|i| 0.9 + (i as f32 % 5.0) * 0.04)
+            .collect();
+        let k_norm_w: Vec<f32> = (0..head_dim)
+            .map(|i| 1.1 - (i as f32 % 5.0) * 0.03)
+            .collect();
+
+        // ─── CPU reference: per-token rmsnorm-then-rope on each head ──────
+        let mut ref_q = q_batch.clone();
+        let mut ref_k = k_batch.clone();
+        for t in 0..n_tokens {
+            let q_off = (t * q_stride) as usize;
+            let k_off = (t * k_stride) as usize;
+            // rmsnorm each Q head
+            for h in 0..n_heads as usize {
+                let head_start = q_off + h * head_dim as usize;
+                let head_end = head_start + head_dim as usize;
+                crate::backend::cpu::rmsnorm(&mut ref_q[head_start..head_end], &q_norm_w, eps);
+            }
+            // rmsnorm each K head
+            for h in 0..n_kv_heads as usize {
+                let head_start = k_off + h * head_dim as usize;
+                let head_end = head_start + head_dim as usize;
+                crate::backend::cpu::rmsnorm(&mut ref_k[head_start..head_end], &k_norm_w, eps);
+            }
+            // rope at pos = start_pos + t over the per-token Q/K slabs
+            let q_end = q_off + (n_heads * head_dim) as usize;
+            let k_end = k_off + (n_kv_heads * head_dim) as usize;
+            crate::backend::cpu::rope(
+                &mut ref_q[q_off..q_end],
+                &mut ref_k[k_off..k_end],
+                (start_pos + t) as usize,
+                n_heads as usize,
+                n_kv_heads as usize,
+                head_dim as usize,
+                freq_base,
+            );
+        }
+
+        // ─── Batched run: one dispatch over (n_tokens × heads_per_token) ──
+        let pipeline = ctx.create_pipeline(
+            shaders::QK_NORM_ROPE_BATCH,
+            "qk_norm_rope_batch",
+            "qk_norm_rope_batch",
+        );
+        let q_buf = ctx.create_storage_rw((q_batch.len() as u64) * 4, "q");
+        ctx.queue
+            .write_buffer(&q_buf, 0, bytemuck::cast_slice(&q_batch));
+        let k_buf = ctx.create_storage_rw((k_batch.len() as u64) * 4, "k");
+        ctx.queue
+            .write_buffer(&k_buf, 0, bytemuck::cast_slice(&k_batch));
+        let qw_buf = ctx.upload_f32(&q_norm_w, "q_norm_w");
+        let kw_buf = ctx.upload_f32(&k_norm_w, "k_norm_w");
+        let params = [
+            start_pos,
+            n_tokens,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            eps.to_bits(),
+            freq_base.to_bits(),
+            rope_type,
+            q_stride,
+            k_stride,
+        ];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: q_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: k_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: qw_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: kw_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(n_tokens * (n_heads + n_kv_heads), 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+
+        let got_q = ctx.download_f32(&q_buf, q_batch.len());
+        let got_k = ctx.download_f32(&k_buf, k_batch.len());
+
+        // RoPE introduces sin/cos differences between iterative theta
+        // (CPU) and per-d `pow` (shader); the residual is well below
+        // 1e-3 in practice but allow a generous slack.
+        let tol = 2e-3f32;
+        for i in 0..ref_q.len() {
+            let diff = (ref_q[i] - got_q[i]).abs();
+            assert!(
+                diff < tol,
+                "Q mismatch at idx {i} (token {}, dim {}): cpu={}, gpu={}, diff={diff}",
+                i / q_stride as usize,
+                i % q_stride as usize,
+                ref_q[i],
+                got_q[i]
+            );
+        }
+        for i in 0..ref_k.len() {
+            let diff = (ref_k[i] - got_k[i]).abs();
+            assert!(
+                diff < tol,
+                "K mismatch at idx {i} (token {}, dim {}): cpu={}, gpu={}, diff={diff}",
+                i / k_stride as usize,
+                i % k_stride as usize,
+                ref_k[i],
+                got_k[i]
+            );
+        }
+    }
+
+    /// `conv1d_fused_batch` parity: walking N tokens through the
+    /// fused (x⊙b → conv → c⊙conv) pipeline must match the same
+    /// sequence performed step-by-step on the CPU. Verifies the
+    /// rolling-buffer carry-over across token boundaries — the
+    /// non-trivial part vs. the per-token shader.
+    #[test]
+    fn test_gpu_conv1d_fused_batch_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let hs: usize = 64;
+        let kernel_size: usize = 4;
+        let d_conv: usize = kernel_size - 1; // 3
+        let n_tokens: usize = 5;
+        let proj_stride = 3 * hs;
+        let out_stride = hs;
+
+        // Build proj as N tokens × (x | c | b), each segment hs floats.
+        let mut proj: Vec<f32> = Vec::with_capacity(n_tokens * proj_stride);
+        for t in 0..n_tokens {
+            // x
+            for i in 0..hs {
+                proj.push(((t as f32 + 1.0) * (i as f32 - 32.0)) * 0.011);
+            }
+            // c
+            for i in 0..hs {
+                proj.push(((t as f32 + 2.0) * (i as f32 + 5.0)) * 0.007);
+            }
+            // b
+            for i in 0..hs {
+                proj.push(((t as f32 + 3.0) * (i as f32 - 16.0)) * 0.013);
+            }
+        }
+        // Initial rolling buffer (d_conv × hs) — non-zero so the
+        // first token's conv reads real prior context.
+        let mut rb_initial: Vec<f32> = Vec::with_capacity(d_conv * hs);
+        for k in 0..d_conv {
+            for i in 0..hs {
+                rb_initial.push(((k as f32 + 1.0) * (i as f32 - 8.0)) * 0.005);
+            }
+        }
+        // Conv weights: hs × kernel_size, layout `weight[ch * ks + k]`.
+        let mut weight: Vec<f32> = Vec::with_capacity(hs * kernel_size);
+        for ch in 0..hs {
+            for k in 0..kernel_size {
+                weight.push(0.1 + (ch as f32 % 7.0) * 0.02 - (k as f32) * 0.03);
+            }
+        }
+
+        // ─── CPU reference ────────────────────────────────────────
+        let mut ref_out = vec![0.0f32; n_tokens * out_stride];
+        let mut ref_rb = rb_initial.clone();
+        for t in 0..n_tokens {
+            let base = t * proj_stride;
+            for ch in 0..hs {
+                let x = proj[base + ch];
+                let c = proj[base + hs + ch];
+                let b = proj[base + 2 * hs + ch];
+                let bx = x * b;
+
+                let mut sum = 0.0f32;
+                for k in 0..d_conv {
+                    sum += ref_rb[k * hs + ch] * weight[ch * kernel_size + k];
+                }
+                sum += bx * weight[ch * kernel_size + d_conv];
+
+                // Shift rolling buffer left; append bx at the tail.
+                if d_conv > 1 {
+                    for k in 0..d_conv - 1 {
+                        ref_rb[k * hs + ch] = ref_rb[(k + 1) * hs + ch];
+                    }
+                }
+                if d_conv > 0 {
+                    ref_rb[(d_conv - 1) * hs + ch] = bx;
+                }
+
+                ref_out[t * out_stride + ch] = c * sum;
+            }
+        }
+
+        // ─── Batched GPU run ──────────────────────────────────────
+        let pipeline = ctx.create_pipeline(
+            shaders::CONV1D_FUSED_BATCH,
+            "conv1d_fused_batch",
+            "conv1d_fused_batch",
+        );
+        let proj_buf = ctx.upload_f32(&proj, "proj");
+        let rb_buf = ctx.create_storage_rw((rb_initial.len() as u64) * 4, "rb");
+        ctx.queue
+            .write_buffer(&rb_buf, 0, bytemuck::cast_slice(&rb_initial));
+        let weight_buf = ctx.upload_f32(&weight, "weight");
+        let out_buf = ctx.create_storage_rw((ref_out.len() as u64) * 4, "out");
+        let params: [u32; 6] = [
+            hs as u32,
+            kernel_size as u32,
+            d_conv as u32,
+            n_tokens as u32,
+            proj_stride as u32,
+            out_stride as u32,
+        ];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: proj_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: rb_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: weight_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(((hs + 255) / 256) as u32, 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+
+        let got_out = ctx.download_f32(&out_buf, ref_out.len());
+        let got_rb = ctx.download_f32(&rb_buf, ref_rb.len());
+
+        let tol = 1e-4f32;
+        for i in 0..ref_out.len() {
+            let diff = (ref_out[i] - got_out[i]).abs();
+            assert!(
+                diff < tol,
+                "out mismatch at idx {i} (token {}, ch {}): cpu={}, gpu={}, diff={diff}",
+                i / hs,
+                i % hs,
+                ref_out[i],
+                got_out[i]
+            );
+        }
+        for i in 0..ref_rb.len() {
+            let diff = (ref_rb[i] - got_rb[i]).abs();
+            assert!(
+                diff < tol,
+                "rolling-buffer mismatch at idx {i}: cpu={}, gpu={}, diff={diff}",
+                ref_rb[i],
+                got_rb[i]
+            );
+        }
+    }
+
+    /// `gemm_q4_0` parity: batched output[token, row] must match the
+    /// CPU-side dequant + matmul at every (row, token) cell. Uses the
+    /// same Q4_0 layout the gemv tests do (8 rows × small K).
+    #[test]
+    fn test_gpu_gemm_q4_0_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let m: u32 = 8;
+        let k: u32 = 64;
+        let n: u32 = 5; // tokens
+        let nb = k / 32;
+        let x_stride = k;
+        let y_stride = m;
+
+        // Build f32 weights, quantize to Q4_0.
+        let weights_f32: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 + 3) % 29) as f32 * 0.1 - 1.4)
+            .collect();
+        let mut q4_bytes: Vec<u8> = Vec::new();
+        for row in 0..m as usize {
+            for b in 0..nb as usize {
+                let start = row * k as usize + b * 32;
+                let chunk = &weights_f32[start..start + 32];
+                let max_abs = chunk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                let scale = max_abs / 7.0;
+                let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                let d_bits = half::f16::from_f32(scale).to_bits();
+                q4_bytes.push((d_bits & 0xFF) as u8);
+                q4_bytes.push((d_bits >> 8) as u8);
+                for qi in 0..16 {
+                    let lo = ((chunk[qi] * inv).round() + 8.0).clamp(0.0, 15.0) as u8;
+                    let hi = ((chunk[qi + 16] * inv).round() + 8.0).clamp(0.0, 15.0) as u8;
+                    q4_bytes.push(lo | (hi << 4));
+                }
+            }
+        }
+
+        // N input vectors of K floats each, each vector distinct.
+        let mut x_batch: Vec<f32> = Vec::with_capacity((n * x_stride) as usize);
+        for t in 0..n {
+            for i in 0..k {
+                x_batch.push(((t as f32 + 1.0) * (i as f32 - 32.0)) * 0.05);
+            }
+        }
+
+        // ─── CPU reference: dequant Q4_0 + matmul row × x for each token ───
+        let mut expected = vec![0.0f32; (n * m) as usize];
+        for t in 0..n as usize {
+            let x_slice = &x_batch[t * x_stride as usize..(t + 1) * x_stride as usize];
+            for row in 0..m as usize {
+                let mut acc = 0.0f32;
+                for b in 0..nb as usize {
+                    let block_off = (row * nb as usize + b) * 18;
+                    let d_bits = u16::from_le_bytes([q4_bytes[block_off], q4_bytes[block_off + 1]]);
+                    let delta = half::f16::from_bits(d_bits).to_f32();
+                    for qi in 0..16 {
+                        let byte = q4_bytes[block_off + 2 + qi];
+                        let lo = (byte & 0xF) as f32 - 8.0;
+                        let hi = ((byte >> 4) & 0xF) as f32 - 8.0;
+                        acc += lo * delta * x_slice[b * 32 + qi];
+                        acc += hi * delta * x_slice[b * 32 + qi + 16];
+                    }
+                }
+                expected[t * m as usize + row] = acc;
+            }
+        }
+
+        // ─── Batched GPU run ──────────────────────────────────────────────
+        let a_buf = ctx.upload_storage(&q4_bytes, "weights");
+        let x_buf = ctx.upload_f32(&x_batch, "x_batch");
+        let y_buf = ctx.create_storage_rw(((n * y_stride) as u64) * 4, "y_batch");
+        let params: [u32; 6] = [m, k, n, x_stride, y_stride, 0];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0", "gemm_q4_0");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(m.div_ceil(4), n, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+
+        let got = ctx.download_f32(&y_buf, (n * y_stride) as usize);
+
+        // Q4_0 quantization noise — same threshold the per-token test uses.
+        for t in 0..n as usize {
+            for row in 0..m as usize {
+                let idx = t * m as usize + row;
+                let diff = (expected[idx] - got[idx]).abs();
+                assert!(
+                    diff < 0.5,
+                    "GEMM Q4_0 mismatch at (token {t}, row {row}): cpu={}, gpu={}, diff={diff}",
+                    expected[idx],
+                    got[idx]
+                );
+            }
+        }
+    }
+
+    /// `add_rmsnorm_batch` parity: identical to running `add_inplace`
+    /// on each vector + residual, then `rmsnorm_batch`. Confirms the
+    /// fused kernel matches the unfused two-step sequence.
+    #[test]
+    fn test_gpu_add_rmsnorm_batch_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let n: u32 = 1024;
+        let batch: u32 = 5;
+        let eps = 1e-5f32;
+
+        let mut src: Vec<f32> = Vec::with_capacity((n * batch) as usize);
+        let mut residual: Vec<f32> = Vec::with_capacity((n * batch) as usize);
+        for b in 0..batch {
+            for i in 0..n {
+                src.push(((b + 1) as f32 * (i as f32 - 512.0)) * 0.001);
+                residual.push(((b + 2) as f32 * ((i as f32 + 17.0) % 13.0)) * 0.002);
+            }
+        }
+        let weight: Vec<f32> = (0..n).map(|i| 0.8 + (i as f32 % 7.0) * 0.05).collect();
+
+        // CPU reference: src += residual, then rmsnorm with eps.
+        let mut reference = src.clone();
+        for i in 0..reference.len() {
+            reference[i] += residual[i];
+        }
+        for b in 0..batch {
+            let row_start = (b * n) as usize;
+            let row_end = row_start + n as usize;
+            crate::backend::cpu::rmsnorm(&mut reference[row_start..row_end], &weight, eps);
+        }
+
+        // Batched fused run.
+        let pipeline = ctx.create_pipeline(
+            shaders::RMSNORM_BATCH,
+            "add_rmsnorm_batch",
+            "add_rmsnorm_batch",
+        );
+        let src_buf = ctx.create_storage_rw((src.len() as u64) * 4, "src");
+        ctx.queue
+            .write_buffer(&src_buf, 0, bytemuck::cast_slice(&src));
+        let dst_buf = ctx.create_storage_rw((src.len() as u64) * 4, "dst");
+        let res_buf = ctx.upload_f32(&residual, "residual");
+        let w_buf = ctx.upload_f32(&weight, "w");
+        let params = [n, eps.to_bits(), n, n];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: src_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dst_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: w_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: res_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(batch, 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        let batched = ctx.download_f32(&dst_buf, (n * batch) as usize);
+
+        for i in 0..(n * batch) as usize {
+            let diff = (reference[i] - batched[i]).abs();
+            assert!(
+                diff < 1e-3,
+                "add_rmsnorm_batch mismatch at idx {i} (token {}, dim {}): \
+                 ref={}, batched={}, diff={diff}",
+                i / n as usize,
+                i % n as usize,
+                reference[i],
+                batched[i]
+            );
+        }
     }
 }
