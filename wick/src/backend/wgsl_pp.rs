@@ -260,7 +260,7 @@ impl Preprocessor {
         let source = self
             .embedded
             .get(name)
-            .with_context(|| format!("Included file not found: {name}"))?;
+            .with_context(|| format!("included file not found: {name}"))?;
         include_stack.insert(name.to_string());
         let result = self.process(source, macros, predefined, include_stack, cond, out);
         include_stack.remove(name);
@@ -328,7 +328,7 @@ fn expand_internal(line: &str, macros: &Macros, visiting: &mut HashSet<String>) 
     let mut out = String::with_capacity(line.len());
     let mut iter = line.char_indices().peekable();
     while let Some((start, c)) = iter.next() {
-        if (c.is_ascii_alphabetic() || c == '_') && !c.is_ascii_digit() {
+        if c.is_ascii_alphabetic() || c == '_' {
             // Walk to the end of the identifier; record the byte index
             // so we can slice the original string with no allocation.
             let mut end = start + c.len_utf8();
