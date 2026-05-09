@@ -1823,7 +1823,11 @@ mod tests {
             Err(_) => return,
         };
 
-        let hs: usize = 64;
+        // hs=1024 matches LFM2-VL-450M's decode-time hidden_size, so the
+        // dispatch grid spans 4 workgroups (`(hs/256, 1, 1)`) — the actual
+        // production shape. Smaller fixtures only exercise the single-WG
+        // path and miss any cross-workgroup correctness issues.
+        let hs: usize = 1024;
         let kernel_size: usize = 4;
         let d_conv: usize = kernel_size - 1; // 3
 
