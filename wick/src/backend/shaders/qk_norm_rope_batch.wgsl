@@ -11,8 +11,8 @@
 // the appropriate weight, then RoPE is applied with the per-token `pos`.
 //
 // Dispatch: (n_tokens * (n_heads + n_kv_heads), 1, 1) workgroups of 256 threads.
-// `head_dim` must be ≤ 256 (existing LFM2 configs use 64 or 128); larger
-// would require splitting the workgroup-shared scratch.
+// `head_dim` is unconstrained: phase loops stride by 256 and `shared_sum`
+// is sized to the workgroup (not `head_dim`). LFM2 uses 64 or 128.
 //
 // Bind group 0:
 //   @binding(0) q_batch: array<f32>    (read-write, n_tokens × q_stride floats)
@@ -84,13 +84,24 @@ fn qk_norm_rope_batch(
     }
 
     // ─── Phase 1: per-head rmsnorm in place ────────────────────────────────
-    // Sum of squares.
+    // Sum of squares. `select(...)` would evaluate both arms per WGSL spec,
+    // so for the K branch we'd read `q_batch[base + i]` with a K-derived
+    // `base` — wasted bandwidth, and OOB if Q's stride ever drops below K's.
+    // Branch instead so only the active buffer is touched.
     var partial: f32 = 0.0;
     var i = tid;
-    while i < head_dim {
-        let v = select(k_batch[base + i], q_batch[base + i], is_q);
-        partial += v * v;
-        i += 256u;
+    if is_q {
+        while i < head_dim {
+            let v = q_batch[base + i];
+            partial += v * v;
+            i += 256u;
+        }
+    } else {
+        while i < head_dim {
+            let v = k_batch[base + i];
+            partial += v * v;
+            i += 256u;
+        }
     }
     shared_sum[tid] = partial;
     workgroupBarrier();
@@ -99,14 +110,16 @@ fn qk_norm_rope_batch(
 
     // Normalize + scale by per-element weight, write back in place.
     i = tid;
-    while i < head_dim {
-        let w = select(k_norm_w[i], q_norm_w[i], is_q);
-        if is_q {
-            q_batch[base + i] = q_batch[base + i] * inv_rms * w;
-        } else {
-            k_batch[base + i] = k_batch[base + i] * inv_rms * w;
+    if is_q {
+        while i < head_dim {
+            q_batch[base + i] = q_batch[base + i] * inv_rms * q_norm_w[i];
+            i += 256u;
         }
-        i += 256u;
+    } else {
+        while i < head_dim {
+            k_batch[base + i] = k_batch[base + i] * inv_rms * k_norm_w[i];
+            i += 256u;
+        }
     }
     workgroupBarrier();
 

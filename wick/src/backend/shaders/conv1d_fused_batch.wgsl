@@ -14,6 +14,9 @@
 //   output[token, ch] = c * conv_out
 //
 // Constraints: kernel_size ≤ 4, d_conv ≤ 3 (LFM2 uses ks=4, d_conv=3).
+// Validated at the top of the kernel — out-of-range params return early
+// rather than risk OOB on the size-4 `w_local` / size-3 `rb` register
+// arrays.
 //
 // Bind group 0:
 //   @binding(0) proj: array<f32>     (read; n_tokens × proj_stride, packed (x,c,b))
@@ -42,6 +45,11 @@ fn conv1d_fused_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
     let out_stride = params[5];
 
     if ch >= hs { return; }
+    // Static guard: the `w_local` / `rb` register arrays are sized for
+    // LFM2's ks=4 / d_conv=3. Bail on any host-side dispatch with
+    // out-of-range params before `w_local[d_conv]` or `rb[d_conv - 1u]`
+    // can OOB.
+    if ks > 4u || d_conv > 3u { return; }
 
     // Pre-load weights for this channel (size ≤ 4).
     var w_local: array<f32, 4>;
