@@ -72,7 +72,6 @@ struct GpuPipelines {
     softmax: wgpu::ComputePipeline,
     rope: wgpu::ComputePipeline,
     attention: wgpu::ComputePipeline,
-    conv1d: wgpu::ComputePipeline,
     conv1d_fused: wgpu::ComputePipeline,
     argmax_f32: wgpu::ComputePipeline,
     // ── Batched-prefill pipelines ─────────────────────────────────────
@@ -279,7 +278,6 @@ impl GpuLfm2Model {
             softmax: ctx.create_pipeline(shaders::SOFTMAX, "softmax", "softmax"),
             rope: ctx.create_pipeline(shaders::ROPE, "rope", "rope"),
             attention: ctx.create_pipeline(shaders::ATTENTION, "attention", "attention"),
-            conv1d: ctx.create_pipeline(shaders::CONV1D, "conv1d_depthwise", "conv1d"),
             conv1d_fused: ctx.create_pipeline(
                 shaders::CONV1D_FUSED,
                 "conv1d_fused",
