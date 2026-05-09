@@ -1688,16 +1688,35 @@ impl GpuLfm2Model {
 //   gemm_q4_0                         (PR #154)
 //   attention_prefill                 (PR #156)
 //
-// Scope of this first cut:
-//   * `start_pos == 0` only — fresh prefills, no continuation chunks.
-//   * `tokens.len() <= MAX_PREFILL_TOKENS` — chunking is per-token fallback.
-//   * All matmul weights must be Q4_0 (the LFM2 Q4_0 GGUF default). Non-Q4_0
-//     paths fall back to the per-token loop at the dispatcher.
+// Scope:
+//   * `forward_prefill_batched_locked` accepts any `start_pos`, so the
+//     dispatcher chunks long prompts through it in
+//     `min(max_seq_len, MAX_PREFILL_TOKENS)` chunks (each chunk advances
+//     `start_pos`; conv rolling state and KV cache writes carry across).
+//   * `1 <= n <= MAX_PREFILL_TOKENS` per call (asserted).
+//   * `start_pos + n <= max_seq_len` (asserted).
+//   * All matmul weights must be Q4_0 (the LFM2 Q4_0 GGUF default).
+//     Non-Q4_0 paths fall through to the per-token loop at the dispatcher.
 //
-// Anything outside this scope falls through to the per-token
-// `forward_inner_compute` loop in `forward_prefill`. Cache snapshot/restore,
-// continuation prefills, and the f32-weight fallback can land in follow-up
-// PRs without disturbing the contract here.
+// The non-Q4_0 fallback (an f32 `gemm_f32` shader, or per-token gemv with
+// offset bindings) can land in a follow-up PR without disturbing this
+// contract.
+//
+// Per-dispatch overhead note: each `encode_*` helper builds a fresh
+// `wgpu::BindGroup` and uploads a small params buffer per call. The CPU
+// cost is ~1 % of total prefill time at the workloads measured in PR #157;
+// promoting the params buffers to model-resident state and caching the
+// bind groups for fixed prefill scratch buffers is a clean follow-up
+// optimization. Kept simple here so the refactor is reviewable.
+//
+// `prefill_scores_buf` size note: this scratch is sized to
+// `MAX_PREFILL_TOKENS × n_heads × max_seq_len × 4` bytes (256 MB on
+// LFM2-VL-450M / 512 MB on LFM2.5-VL-1.6B at the default 8192 context).
+// On native macOS this is fine (M1+ unified memory). For wasm / WebGPU
+// tier-1 (256 MB max storage buffer) this becomes load-bearing — the
+// proper fix is a two-pass online softmax in `attention_prefill.wgsl`
+// that doesn't materialize the full scores matrix; queued as a follow-up
+// shader PR.
 
 impl GpuLfm2Model {
     /// Returns true iff every matmul weight on every layer is Q4_0 — the
@@ -2120,18 +2139,34 @@ impl GpuLfm2Model {
         state: &mut InferenceState,
     ) -> Vec<f32> {
         debug_assert!(!tokens.is_empty());
-        debug_assert!(tokens.len() <= MAX_PREFILL_TOKENS);
+        let n = tokens.len();
+        // Bounds checks — make a misuse fail deterministically rather
+        // than show up later as a wgpu validation error during a buffer
+        // copy or as silent out-of-bounds attention reads.
+        assert!(
+            start_pos + n <= self.gpu_state.max_seq_len,
+            "prefill start_pos {start_pos} + n {n} exceeds max_seq_len {}",
+            self.gpu_state.max_seq_len,
+        );
+        debug_assert!(
+            n <= self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS),
+            "n {n} exceeds chunk capacity (max_seq_len = {}, MAX_PREFILL_TOKENS = {MAX_PREFILL_TOKENS})",
+            self.gpu_state.max_seq_len,
+        );
         // `start_pos > 0` is supported for chunked prefills — the
-        // dispatcher walks through chunks of up to MAX_PREFILL_TOKENS.
+        // dispatcher walks through chunks of up to
+        // `min(max_seq_len, MAX_PREFILL_TOKENS)` and increments
+        // `start_pos` per chunk.
 
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let is = cfg.intermediate_size;
-        let n = tokens.len();
 
-        // Reset internal seq_len mirror; matches the per-token path.
-        // Conv buffer zeroing is the dispatcher's responsibility (it
-        // happens once per fresh prefill regardless of which path runs).
+        // Reset profiler spans + seq_len mirror so this chunk owns its
+        // own profile output and starts clean. Conv buffer zeroing is
+        // the dispatcher's responsibility (happens once per fresh
+        // prefill, regardless of which path runs and how many chunks).
+        self.ctx.reset_profiler();
         self.gpu_state.seq_len.store(start_pos, Ordering::Relaxed);
 
         // ─── Stage embeddings into prefill_batch_buf ──────────────────────
@@ -2758,11 +2793,25 @@ impl Model for GpuLfm2Model {
             // bounded. Each chunk advances `start_pos`; conv rolling
             // state and KV cache writes carry across chunks naturally.
             if !tokens.is_empty() && self.all_matmul_weights_q4_0() {
+                // Chunk size respects both the static MAX_PREFILL_TOKENS
+                // budget AND the model's actual `max_seq_len` — otherwise
+                // a caller with `--context-size < 512` would dispatch
+                // batched chunks larger than the KV cache and OOB on the
+                // copy_buffer_to_buffer write.
+                let chunk_size = self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS);
                 let mut logits = Vec::new();
                 let mut pos = 0usize;
                 while pos < tokens.len() {
-                    let end = (pos + MAX_PREFILL_TOKENS).min(tokens.len());
-                    logits = self.forward_prefill_batched_locked(&tokens[pos..end], pos, state);
+                    let end = (pos + chunk_size).min(tokens.len());
+                    // `start_pos + pos` rather than `pos`: defensive against
+                    // a future caller passing non-zero start_pos through
+                    // this branch (today the outer `if start_pos == 0`
+                    // gate makes them equal).
+                    logits = self.forward_prefill_batched_locked(
+                        &tokens[pos..end],
+                        start_pos + pos,
+                        state,
+                    );
                     pos = end;
                 }
                 self.prefix_cache
