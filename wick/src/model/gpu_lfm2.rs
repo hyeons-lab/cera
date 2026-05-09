@@ -1801,9 +1801,20 @@ impl Model for GpuLfm2Model {
                     // splits don't drift.)
                     self.gpu_state.seq_len.store(use_len, Ordering::Relaxed);
                     state.seq_len = use_len;
+                    // Skip the per-token vocab-sized download_f32 for
+                    // every prefill step except the last — only the
+                    // final logits are returned to the caller.
+                    // `prefix_len < tokens.len()` is enforced above, so
+                    // `remaining` is always >= 1 here.
+                    let remaining = &tokens[use_len..];
+                    let last = remaining.len() - 1;
                     let mut logits = Vec::new();
-                    for (j, &token) in tokens[use_len..].iter().enumerate() {
-                        logits = self.forward_inner(&[token], use_len + j, state);
+                    for (j, &token) in remaining.iter().enumerate() {
+                        if j == last {
+                            logits = self.forward_inner(&[token], use_len + j, state);
+                        } else {
+                            self.forward_inner_compute(&[token], use_len + j, state);
+                        }
                     }
                     self.prefix_cache
                         .lock()
@@ -1824,9 +1835,24 @@ impl Model for GpuLfm2Model {
         // Sequential single-token forward via the lock-free body — calling
         // `self.forward()` here would re-acquire the (non-reentrant)
         // `infer_lock` we already hold and deadlock.
+        //
+        // For every step except the last, drive the GPU via
+        // `forward_inner_compute` so the per-token vocab-sized
+        // `download_f32` is skipped — only the final iteration's
+        // logits make it back to the caller. At p=4096 this drops
+        // 4095 vocab-sized blocking readbacks (vocab × 4 bytes ×
+        // 4095 = ~1 GB at vocab=65536). Empty `tokens` makes
+        // `last` underflow — guarded by `if !tokens.is_empty()`.
         let mut logits = Vec::new();
-        for (i, &token) in tokens.iter().enumerate() {
-            logits = self.forward_inner(&[token], start_pos + i, state);
+        if !tokens.is_empty() {
+            let last = tokens.len() - 1;
+            for (i, &token) in tokens.iter().enumerate() {
+                if i == last {
+                    logits = self.forward_inner(&[token], start_pos + i, state);
+                } else {
+                    self.forward_inner_compute(&[token], start_pos + i, state);
+                }
+            }
         }
         if start_pos == 0 {
             self.prefix_cache
