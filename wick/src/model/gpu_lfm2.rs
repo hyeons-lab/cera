@@ -330,13 +330,9 @@ impl GpuLfm2Model {
             let (buf, dtype) = if wref.dtype == DType::Q4_0 {
                 let data = cpu_model.weight_bytes(wref);
                 (ctx.upload_storage(data, name), DType::Q4_0)
-            } else if use_f16 {
-                // TODO: Dequantize directly into F16 to avoid intermediate F32 allocation.
-                // NOTE: gemv_f32.wgsl reinterprets f16 as f32, producing incorrect results.
-                // We default to F32 for now until f16-aware shaders are added in Phase B.1.
-                let f32_data = cpu_model.dequantize_weight(wref);
-                (ctx.upload_f32(&f32_data, name), DType::F32)
             } else {
+                // TODO: Upload as F16 to save bandwidth (requires F16-aware matmul shaders
+                // in Phase B.1). For now we dequantize all non-Q4_0 to F32.
                 let f32_data = cpu_model.dequantize_weight(wref);
                 (ctx.upload_f32(&f32_data, name), DType::F32)
             };

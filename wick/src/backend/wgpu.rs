@@ -43,13 +43,9 @@ impl GpuTensor {
     /// Return the size of the tensor data in bytes.
     pub fn size_bytes(&self) -> usize {
         let block_size = self.dtype.block_size();
-        assert!(
-            self.numel() % block_size == 0,
-            "tensor numel {} not divisible by block_size {}",
-            self.numel(),
-            block_size
-        );
-        (self.numel() / block_size) * self.dtype.block_bytes()
+        // Use div_ceil to ensure sufficient buffer size even if not perfectly aligned
+        // to block boundaries (though in practice LLM tensors usually are).
+        self.numel().div_ceil(block_size) * self.dtype.block_bytes()
     }
 }
 
@@ -178,7 +174,9 @@ impl GpuContext {
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
                 contents: data,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
             })
     }
 
@@ -188,9 +186,31 @@ impl GpuContext {
     }
 
     /// Upload f32 data to a GPU storage buffer, converting to f16.
+    ///
+    /// Uses a chunked approach to avoid materializing the full f16 vector
+    /// on the host, reducing peak memory usage.
     pub fn upload_f32_as_f16(&self, data: &[f32], label: &str) -> wgpu::Buffer {
-        let f16_data: Vec<f16> = data.iter().map(|&x| f16::from_f32(x)).collect();
-        self.upload_storage(bytemuck::cast_slice(&f16_data), label)
+        let byte_size = (data.len() * 2) as u64;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: byte_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Use 1MB chunks for conversion
+        let chunk_size = 512 * 1024;
+        for (i, chunk) in data.chunks(chunk_size).enumerate() {
+            let f16_chunk: Vec<f16> = chunk.iter().map(|&x| f16::from_f32(x)).collect();
+            self.queue.write_buffer(
+                &buffer,
+                (i * chunk_size * 2) as u64,
+                bytemuck::cast_slice(&f16_chunk),
+            );
+        }
+        buffer
     }
 
     /// Upload f16 data to a GPU storage buffer.
@@ -320,16 +340,23 @@ impl GpuContext {
     pub fn download_f16_as_f32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<f32> {
         use std::sync::atomic::Ordering;
         let size = (count * std::mem::size_of::<f16>()) as u64;
+        // copy_buffer_to_buffer requires 4-byte alignment for size and offsets.
+        let aligned_size = size.div_ceil(4) * 4;
+
         let staging_guard = {
             let mut guard = self.staging.lock().expect("staging mutex poisoned");
-            if guard.as_ref().map(|b| b.size() < size).unwrap_or(true) {
+            if guard
+                .as_ref()
+                .map(|b| b.size() < aligned_size)
+                .unwrap_or(true)
+            {
                 *guard = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("staging-download"),
-                    size,
+                    size: aligned_size,
                     usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }));
-                self.staging_size.store(size, Ordering::Relaxed);
+                self.staging_size.store(aligned_size, Ordering::Relaxed);
             }
             guard
         };
@@ -340,10 +367,10 @@ impl GpuContext {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("download_f16"),
             });
-        encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, size);
+        encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, aligned_size);
         self.queue.submit(Some(encoder.finish()));
 
-        let slice = staging.slice(0..size);
+        let slice = staging.slice(0..aligned_size);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             tx.send(r).ok();
@@ -354,7 +381,8 @@ impl GpuContext {
             .expect("GPU readback failed");
 
         let data = slice.get_mapped_range();
-        let f16_data: &[f16] = bytemuck::cast_slice(&data);
+        // Slicing to exact byte count before casting to handle potential 2-byte padding.
+        let f16_data: &[f16] = bytemuck::cast_slice(&data[0..size as usize]);
         let result: Vec<f32> = f16_data.iter().map(|&x| x.to_f32()).collect();
         drop(data);
         staging.unmap();
@@ -1433,7 +1461,9 @@ mod tests {
             let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("override_spike_out"),
                 size: 4,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
