@@ -341,9 +341,7 @@ impl GpuContext {
                 label: Some("download_f16"),
             });
         encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, size);
-        rx.recv()
-            .expect("GPU readback channel closed")
-            .expect("GPU readback failed");
+        self.queue.submit(Some(encoder.finish()));
 
         let slice = staging.slice(0..size);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -351,7 +349,9 @@ impl GpuContext {
             tx.send(r).ok();
         });
         self.device.poll(wgpu::Maintain::Wait);
-        rx.recv().unwrap().unwrap();
+        rx.recv()
+            .expect("GPU readback channel closed")
+            .expect("GPU readback failed");
 
         let data = slice.get_mapped_range();
         let f16_data: &[f16] = bytemuck::cast_slice(&data);
