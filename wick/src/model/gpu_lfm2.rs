@@ -321,11 +321,6 @@ impl GpuLfm2Model {
         );
         let output_norm = ctx.upload_f32(cpu_model.output_norm_weight(), "output_norm");
 
-        let use_f16 = std::env::var("WICK_WGPU_F16").as_deref() == Ok("1");
-        if use_f16 {
-            tracing::info!("WGPU: F16 weight upload requested (experimental)");
-        }
-
         let upload_weight = |wref: &super::lfm2::WeightRef, name: &str| -> GpuWeight {
             let (buf, dtype) = if wref.dtype == DType::Q4_0 {
                 let data = cpu_model.weight_bytes(wref);
