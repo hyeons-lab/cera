@@ -316,9 +316,9 @@ impl GpuLfm2Model {
                     ("INIT_SRC0_SHMEM_FLOAT", ""),
                     ("INIT_SRC1_SHMEM_FLOAT", ""),
                     ("WORKGROUP_SIZE_M", "8u"),
-                    ("WORKGROUP_SIZE_N", "8u"),
+                    ("WORKGROUP_SIZE_N", "32u"),
                     ("TILE_M", "4u"),
-                    ("TILE_N", "4u"),
+                    ("TILE_N", "1u"),
                     ("TILE_K", "32u"),
                 ],
             ),
@@ -333,9 +333,9 @@ impl GpuLfm2Model {
                     ("INIT_SRC0_SHMEM_FLOAT", ""),
                     ("INIT_SRC1_SHMEM_FLOAT", ""),
                     ("WORKGROUP_SIZE_M", "8u"),
-                    ("WORKGROUP_SIZE_N", "8u"),
+                    ("WORKGROUP_SIZE_N", "32u"),
                     ("TILE_M", "4u"),
-                    ("TILE_N", "4u"),
+                    ("TILE_N", "1u"),
                     ("TILE_K", "32u"),
                 ],
             ),
@@ -348,12 +348,11 @@ impl GpuLfm2Model {
                     ("SRC0_INNER_TYPE", "u32"),
                     ("SRC1_INNER_TYPE", "f32"),
                     ("INIT_SRC0_SHMEM_Q4_0", ""),
-                    
                     ("INIT_SRC1_SHMEM_FLOAT", ""),
                     ("WORKGROUP_SIZE_M", "8u"),
-                    ("WORKGROUP_SIZE_N", "8u"),
+                    ("WORKGROUP_SIZE_N", "32u"),
                     ("TILE_M", "4u"),
-                    ("TILE_N", "4u"),
+                    ("TILE_N", "1u"),
                     ("TILE_K", "32u"),
                 ],
             ),
@@ -366,12 +365,11 @@ impl GpuLfm2Model {
                     ("SRC0_INNER_TYPE", "u32"),
                     ("SRC1_INNER_TYPE", "f32"),
                     ("INIT_SRC0_SHMEM_Q4_0", ""),
-                    
                     ("INIT_SRC1_SHMEM_FLOAT", ""),
                     ("WORKGROUP_SIZE_M", "8u"),
-                    ("WORKGROUP_SIZE_N", "8u"),
+                    ("WORKGROUP_SIZE_N", "32u"),
                     ("TILE_M", "4u"),
-                    ("TILE_N", "4u"),
+                    ("TILE_N", "1u"),
                     ("TILE_K", "32u"),
                 ],
             ),
@@ -1846,8 +1844,8 @@ impl GpuLfm2Model {
         );
     }
 
-    /// Encode `gemm_q4_0`: y[t * y_stride + r] = Σ_k weight[r, k] * x[t * x_stride + k].
-    /// One workgroup per (4-row block, token).
+    /// Encode register-tiled 2D matmul: y = weight * x.
+    /// Supports both F32 and Q4_0 variants via specialized pipelines.
     #[allow(clippy::too_many_arguments)]
     fn encode_mul_mat_reg_tile(
         &self,
@@ -1861,7 +1859,7 @@ impl GpuLfm2Model {
         y_stride: u32,
     ) {
         let m = w.tensor.shape[0] as u32;
-        let use_vec = m % 4 == 0;
+        let use_vec = m % 4 == 0 && k % 4 == 0 && x_stride % 4 == 0 && y_stride % 4 == 0;
         let pipeline = match (w.tensor.dtype, use_vec) {
             (DType::Q4_0, true) => &self.pipelines.mul_mat_reg_tile_q4_0_vec,
             (DType::Q4_0, false) => &self.pipelines.mul_mat_reg_tile_q4_0_scalar,

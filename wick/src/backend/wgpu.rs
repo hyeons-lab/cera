@@ -718,8 +718,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn test_gpu_mul_mat_tile_q4_0_parity() {
         let ctx = match GpuContext::new() {
@@ -738,7 +736,7 @@ mod tests {
             .collect();
         let mut q4_bytes: Vec<u8> = Vec::new();
         for row in 0..m as usize {
-            for b in 0..(k/32) as usize {
+            for b in 0..(k / 32) as usize {
                 let start = row * k as usize + b * 32;
                 let chunk = &weights_f32[start..start + 32];
                 let max_abs = chunk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
@@ -768,7 +766,7 @@ mod tests {
             let x_slice = &x_batch[t * x_stride as usize..(t + 1) * x_stride as usize];
             for row in 0..m as usize {
                 let mut acc = 0.0f32;
-                for b in 0..(k/32) as usize {
+                for b in 0..(k / 32) as usize {
                     let block_off = (row * (k as usize / 32) + b) * 18;
                     let d_bits = u16::from_le_bytes([q4_bytes[block_off], q4_bytes[block_off + 1]]);
                     let delta = half::f16::from_bits(d_bits).to_f32();
@@ -788,9 +786,18 @@ mod tests {
         let a_buf = ctx.upload_storage(&q4_bytes, "weights");
         let x_buf = ctx.upload_f32(&x_batch, "x_batch");
         let y_buf = ctx.create_storage_rw(((n * y_stride) as u64) * 4, "y_batch");
-        
+
         // MulMatParams: m, k, n, x_stride, y_stride, batch_stride_x, batch_stride_y, batch_stride_w
-        let params: [u32; 8] = [m, k, n, x_stride, y_stride, x_stride, y_stride, (m * (k/32) * 18)];
+        let params: [u32; 8] = [
+            m,
+            k,
+            n,
+            x_stride,
+            y_stride,
+            x_stride,
+            y_stride,
+            (m * (k / 32) * 18),
+        ];
         let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
         let pipeline = ctx.create_pipeline_with_defines(
@@ -814,13 +821,25 @@ mod tests {
             label: None,
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: a_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: y_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: p_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_buf.as_entire_binding(),
+                },
             ],
         });
-        
+
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -840,7 +859,124 @@ mod tests {
         for i in 0..(n * m) as usize {
             let diff = (result[i] - expected[i]).abs();
             // Q4_0 precision is lower, but should be within noise
-            assert!(diff < 1e-2, "mismatch at {}: {} vs {}", i, result[i], expected[i]);
+            assert!(
+                diff < 1e-2,
+                "mismatch at {}: {} vs {}",
+                i,
+                result[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_mul_mat_tile_scalar_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        // m=30 is NOT a multiple of 4, forcing SCALAR variant
+        let m: u32 = 30;
+        let k: u32 = 128;
+        let n: u32 = 16;
+        let x_stride = k;
+        let y_stride = m;
+
+        let weights_f32: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 + 3) % 29) as f32 * 0.1 - 1.4)
+            .collect();
+        let mut x_batch: Vec<f32> = Vec::with_capacity((n * x_stride) as usize);
+        for t in 0..n {
+            for i in 0..k {
+                x_batch.push(((t as f32 + 1.0) * (i as f32 - 64.0)) * 0.05);
+            }
+        }
+
+        let mut expected = vec![0.0f32; (n * m) as usize];
+        for t in 0..n as usize {
+            let x_slice = &x_batch[t * x_stride as usize..(t + 1) * x_stride as usize];
+            for row in 0..m as usize {
+                let mut acc = 0.0f32;
+                for col in 0..k as usize {
+                    acc += weights_f32[row * k as usize + col] * x_slice[col];
+                }
+                expected[t * m as usize + row] = acc;
+            }
+        }
+
+        let a_buf = ctx.upload_f32(&weights_f32, "weights");
+        let x_buf = ctx.upload_f32(&x_batch, "x_batch");
+        let y_buf = ctx.create_storage_rw(((n * y_stride) as u64) * 4, "y_batch");
+
+        let params: [u32; 8] = [m, k, n, x_stride, y_stride, x_stride, y_stride, 0];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline_with_defines(
+            shaders::MUL_MAT_REG_TILE,
+            "main",
+            "mul_mat_tile_scalar_test",
+            &[
+                ("SCALAR", ""),
+                ("SRC0_INNER_TYPE", "f32"),
+                ("SRC1_INNER_TYPE", "f32"),
+                ("INIT_SRC0_SHMEM_FLOAT", ""),
+                ("INIT_SRC1_SHMEM_FLOAT", ""),
+                ("WORKGROUP_SIZE_M", "8u"),
+                ("WORKGROUP_SIZE_N", "8u"),
+                ("TILE_M", "4u"),
+                ("TILE_N", "4u"),
+                ("TILE_K", "32u"),
+            ],
+        );
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            let wg_m = m.div_ceil(8 * 4);
+            let wg_n = n.div_ceil(8 * 4);
+            pass.dispatch_workgroups(wg_m, wg_n, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll(wgpu::Maintain::Wait);
+
+        let result = ctx.download_f32(&y_buf, (n * m) as usize);
+        for i in 0..(n * m) as usize {
+            let diff = (result[i] - expected[i]).abs();
+            assert!(
+                diff < 1e-4,
+                "mismatch at {}: {} vs {}",
+                i,
+                result[i],
+                expected[i]
+            );
         }
     }
 
@@ -884,7 +1020,7 @@ mod tests {
         let a_buf = ctx.upload_f32(&weights_f32, "weights");
         let x_buf = ctx.upload_f32(&x_batch, "x_batch");
         let y_buf = ctx.create_storage_rw(((n * y_stride) as u64) * 4, "y_batch");
-        
+
         // MulMatParams: m, k, n, x_stride, y_stride, batch_stride_x, batch_stride_y, batch_stride_w
         let params: [u32; 8] = [m, k, n, x_stride, y_stride, x_stride, y_stride, 0];
         let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
@@ -910,13 +1046,25 @@ mod tests {
             label: None,
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: a_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: y_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: p_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_buf.as_entire_binding(),
+                },
             ],
         });
-        
+
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -936,7 +1084,13 @@ mod tests {
         let result = ctx.download_f32(&y_buf, (n * m) as usize);
         for i in 0..(n * m) as usize {
             let diff = (result[i] - expected[i]).abs();
-            assert!(diff < 1e-4, "mismatch at {}: {} vs {}", i, result[i], expected[i]);
+            assert!(
+                diff < 1e-4,
+                "mismatch at {}: {} vs {}",
+                i,
+                result[i],
+                expected[i]
+            );
         }
     }
 
