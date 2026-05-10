@@ -7,6 +7,9 @@ pub mod blas;
 #[cfg(feature = "gpu")]
 pub mod wgpu;
 
+#[cfg(feature = "gpu")]
+pub mod wgsl_pp;
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
 
