@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use wgpu::util::DeviceExt;
 
 use crate::backend::wgsl_pp::Preprocessor;
+use crate::tensor::DType;
+use half::f16;
 
 /// GPU compute context: device, queue, and optional timestamp profiling.
 pub struct GpuContext {
@@ -23,6 +25,25 @@ pub struct GpuContext {
     /// prerequisite for `Arc<dyn Model>: Send + Sync` through the FFI.
     staging: std::sync::Mutex<Option<wgpu::Buffer>>,
     staging_size: std::sync::atomic::AtomicU64,
+}
+
+/// A tensor stored on the GPU.
+pub struct GpuTensor {
+    pub buffer: wgpu::Buffer,
+    pub dtype: DType,
+    pub shape: Vec<usize>,
+}
+
+impl GpuTensor {
+    /// Return the number of elements in the tensor.
+    pub fn numel(&self) -> usize {
+        self.shape.iter().product()
+    }
+
+    /// Return the size of the tensor data in bytes.
+    pub fn size_bytes(&self) -> usize {
+        (self.numel() / self.dtype.block_size()) * self.dtype.block_bytes()
+    }
 }
 
 /// GPU timestamp profiler — records per-dispatch timing.
@@ -67,6 +88,9 @@ impl GpuContext {
         let mut features = wgpu::Features::SUBGROUP;
         if has_timestamps {
             features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+        if adapter.features().contains(wgpu::Features::SHADER_F16) {
+            features |= wgpu::Features::SHADER_F16;
         }
 
         // Use the adapter's actual limits instead of hardcoding. This avoids
@@ -153,6 +177,17 @@ impl GpuContext {
 
     /// Upload f32 data to a GPU storage buffer.
     pub fn upload_f32(&self, data: &[f32], label: &str) -> wgpu::Buffer {
+        self.upload_storage(bytemuck::cast_slice(data), label)
+    }
+
+    /// Upload f32 data to a GPU storage buffer, converting to f16.
+    pub fn upload_f32_as_f16(&self, data: &[f32], label: &str) -> wgpu::Buffer {
+        let f16_data: Vec<f16> = data.iter().map(|&x| f16::from_f32(x)).collect();
+        self.upload_storage(bytemuck::cast_slice(&f16_data), label)
+    }
+
+    /// Upload f16 data to a GPU storage buffer.
+    pub fn upload_f16(&self, data: &[f16], label: &str) -> wgpu::Buffer {
         self.upload_storage(bytemuck::cast_slice(data), label)
     }
 
@@ -269,6 +304,49 @@ impl GpuContext {
 
         let data = slice.get_mapped_range();
         let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        result
+    }
+
+    /// Read f16 data back from a GPU buffer and convert to f32 (blocking).
+    pub fn download_f16_as_f32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<f32> {
+        use std::sync::atomic::Ordering;
+        let size = (count * std::mem::size_of::<f16>()) as u64;
+        let staging_guard = {
+            let mut guard = self.staging.lock().expect("staging mutex poisoned");
+            if guard.as_ref().map(|b| b.size() < size).unwrap_or(true) {
+                *guard = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("staging-download"),
+                    size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+                self.staging_size.store(size, Ordering::Relaxed);
+            }
+            guard
+        };
+        let staging = staging_guard.as_ref().unwrap();
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("download_f16"),
+            });
+        encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, size);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(0..size);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).ok();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let data = slice.get_mapped_range();
+        let f16_data: &[f16] = bytemuck::cast_slice(&data);
+        let result: Vec<f32> = f16_data.iter().map(|&x| x.to_f32()).collect();
         drop(data);
         staging.unmap();
         result
@@ -472,6 +550,25 @@ mod tests {
         let buf = ctx.upload_f32(&data, "test");
         let result = ctx.download_f32(&buf, data.len());
         assert_eq!(data, result);
+    }
+
+    #[test]
+    fn test_gpu_f16_roundtrip() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return, // skip if no GPU
+        };
+
+        let data: Vec<f32> = (0..256).map(|i| i as f32 * 0.1).collect();
+        let buf = ctx.upload_f32_as_f16(&data, "test_f16");
+        let result = ctx.download_f16_as_f32(&buf, data.len());
+
+        for i in 0..data.len() {
+            let diff = (data[i] - result[i]).abs();
+            // F16 precision is limited, relative error ~1e-3. 
+            // For values up to 25.6, absolute error can be up to ~0.02.
+            assert!(diff < 2e-2, "f16 mismatch at {i}: {} vs {}", data[i], result[i]);
+        }
     }
 
     #[test]
