@@ -286,13 +286,7 @@ fn cond_active(stack: &[Cond]) -> bool {
 }
 
 fn strip_quotes(s: &str) -> Option<&str> {
-    let s = s.trim();
-    let bytes = s.as_bytes();
-    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
-        Some(&s[1..s.len() - 1])
-    } else {
-        None
-    }
+    s.trim().strip_prefix('"')?.strip_suffix('"')
 }
 
 /// Strip `// comment` from the end of a directive line. Only strips
@@ -385,38 +379,45 @@ enum Tok {
 
 fn lex_expr(input: &str) -> Result<Vec<Tok>> {
     let mut tokens = Vec::new();
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
+    let mut iter = input.char_indices().peekable();
+    while let Some((start, c)) = iter.next() {
         if c.is_whitespace() {
-            i += 1;
-        } else if c.is_ascii_digit() {
-            let start = i;
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                i += 1;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let mut end = start + c.len_utf8();
+            while let Some(&(_, nc)) = iter.peek() {
+                if nc.is_ascii_digit() {
+                    end += nc.len_utf8();
+                    iter.next();
+                } else {
+                    break;
+                }
             }
-            let s: String = chars[start..i].iter().collect();
+            let s = &input[start..end];
             let n: i64 = s
                 .parse()
                 .map_err(|_| anyhow!("invalid number in expression: {s}"))?;
             tokens.push(Tok::Num(n));
         } else if c.is_ascii_alphabetic() || c == '_' {
-            let start = i;
-            while i < chars.len() && is_ident_char(chars[i]) {
-                i += 1;
+            let mut end = start + c.len_utf8();
+            while let Some(&(_, nc)) = iter.peek() {
+                if is_ident_char(nc) {
+                    end += nc.len_utf8();
+                    iter.next();
+                } else {
+                    break;
+                }
             }
-            tokens.push(Tok::Ident(chars[start..i].iter().collect()));
+            tokens.push(Tok::Ident(input[start..end].to_string()));
         } else if c == '(' {
             tokens.push(Tok::LParen);
-            i += 1;
         } else if c == ')' {
             tokens.push(Tok::RParen);
-            i += 1;
         } else {
             // Two-char ops first — match on the char pair to avoid
             // allocating a String per non-ident character.
-            let next = chars.get(i + 1).copied();
+            let next = iter.peek().map(|(_, nc)| *nc);
             let two_op = match (c, next) {
                 ('=', Some('=')) => Some("=="),
                 ('!', Some('=')) => Some("!="),
@@ -430,7 +431,7 @@ fn lex_expr(input: &str) -> Result<Vec<Tok>> {
             };
             if let Some(op) = two_op {
                 tokens.push(Tok::Op(op));
-                i += 2;
+                iter.next();
                 continue;
             }
             // Single-char ops.
@@ -448,7 +449,6 @@ fn lex_expr(input: &str) -> Result<Vec<Tok>> {
             match single {
                 Some(op) => {
                     tokens.push(Tok::Op(op));
-                    i += 1;
                 }
                 None => bail!("unexpected character in expression: {c:?}"),
             }
