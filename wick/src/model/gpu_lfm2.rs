@@ -330,12 +330,17 @@ impl GpuLfm2Model {
         let upload_weight = |wref: &super::lfm2::WeightRef, name: &str| -> GpuWeight {
             let (buf, dtype) = if wref.dtype == DType::Q4_0 {
                 let data = cpu_model.weight_bytes(wref);
-                (ctx.upload_storage(data, name), DType::Q4_0)
-            } else if use_f16 {
-                let f32_data = cpu_model.dequantize_weight(wref);
-                (ctx.upload_f32_as_f16(&f32_data, name), DType::F16)
-            } else {
-                let f32_data = cpu_model.dequantize_weight(wref);
+                let (buf, dtype) = if wref.dtype == DType::Q4_0 {
+                    let data = cpu_model.weight_bytes(wref);
+                    (ctx.upload_storage(data, name), DType::Q4_0)
+                } else if use_f16 {
+                    // TODO: Dequantize directly into F16 to avoid intermediate F32 allocation
+                    let f32_data = cpu_model.dequantize_weight(wref);
+                    (ctx.upload_f32_as_f16(&f32_data, name), DType::F16)
+                } else {
+                    let f32_data = cpu_model.dequantize_weight(wref);
+                    (ctx.upload_f32(&f32_data, name), DType::F32)
+                };
                 (ctx.upload_f32(&f32_data, name), DType::F32)
             };
             let params_buf = ctx.upload_storage(
