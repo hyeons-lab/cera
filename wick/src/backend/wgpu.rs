@@ -45,7 +45,9 @@ impl GpuTensor {
         let block_size = self.dtype.block_size();
         // Use div_ceil to ensure sufficient buffer size even if not perfectly aligned
         // to block boundaries (though in practice LLM tensors usually are).
-        self.numel().div_ceil(block_size) * self.dtype.block_bytes()
+        let raw_size = self.numel().div_ceil(block_size) * self.dtype.block_bytes();
+        // Ensure 4-byte alignment for compatibility with wgpu copy operations.
+        raw_size.div_ceil(4) * 4
     }
 }
 
@@ -205,11 +207,23 @@ impl GpuContext {
         let chunk_size = 512 * 1024;
         for (i, chunk) in data.chunks(chunk_size).enumerate() {
             let f16_chunk: Vec<f16> = chunk.iter().map(|&x| f16::from_f32(x)).collect();
-            self.queue.write_buffer(
-                &buffer,
-                (i * chunk_size * 2) as u64,
-                bytemuck::cast_slice(&f16_chunk),
-            );
+            let chunk_byte_size = (f16_chunk.len() * 2) as u64;
+            let aligned_chunk_size = chunk_byte_size.div_ceil(4) * 4;
+            if aligned_chunk_size > chunk_byte_size {
+                let mut padded = f16_chunk;
+                padded.push(f16::ZERO);
+                self.queue.write_buffer(
+                    &buffer,
+                    (i * chunk_size * 2) as u64,
+                    bytemuck::cast_slice(&padded),
+                );
+            } else {
+                self.queue.write_buffer(
+                    &buffer,
+                    (i * chunk_size * 2) as u64,
+                    bytemuck::cast_slice(&f16_chunk),
+                );
+            }
         }
         buffer
     }
@@ -589,7 +603,8 @@ mod tests {
             Err(_) => return, // skip if no GPU
         };
 
-        let data: Vec<f32> = (0..256).map(|i| i as f32 * 0.1).collect();
+        // Use odd number of elements to test alignment/padding logic.
+        let data: Vec<f32> = (0..257).map(|i| i as f32 * 0.1).collect();
         let buf = ctx.upload_f32(&data, "test");
         let result = ctx.download_f32(&buf, data.len());
         assert_eq!(data, result);
@@ -602,7 +617,8 @@ mod tests {
             Err(_) => return, // skip if no GPU
         };
 
-        let data: Vec<f32> = (0..256).map(|i| i as f32 * 0.1).collect();
+        // Use odd number of elements to test alignment/padding logic.
+        let data: Vec<f32> = (0..257).map(|i| i as f32 * 0.1).collect();
         let buf = ctx.upload_f32_as_f16(&data, "test_f16");
         let result = ctx.download_f16_as_f32(&buf, data.len());
 
