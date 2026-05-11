@@ -21,6 +21,45 @@ use crate::tensor::DType;
 /// scratch, so the worst-case scratch footprint is bounded.
 const MAX_PREFILL_TOKENS: usize = 512;
 
+// Tile geometry for the register-tiled matmul pipeline. The shader
+// receives these via preprocessor #defines below; keeping a single
+// source of truth here means dispatch geometry can never drift out of
+// sync with the kernel.
+const MUL_MAT_TILE_WG_M: u32 = 8;
+const MUL_MAT_TILE_WG_N: u32 = 32;
+const MUL_MAT_TILE_M: u32 = 4;
+const MUL_MAT_TILE_N: u32 = 1;
+const MUL_MAT_TILE_K: u32 = 32;
+
+/// Build a `mul_mat_reg_tile` pipeline for the requested variant.
+/// `use_vec` enables vec4 loads/stores (requires the `m` and `k` of
+/// every dispatched matrix to be a multiple of 4).
+fn build_mul_mat_pipeline(ctx: &GpuContext, label: &str, use_vec: bool) -> wgpu::ComputePipeline {
+    let wg_m = format!("{MUL_MAT_TILE_WG_M}u");
+    let wg_n = format!("{MUL_MAT_TILE_WG_N}u");
+    let tile_m = format!("{MUL_MAT_TILE_M}u");
+    let tile_n = format!("{MUL_MAT_TILE_N}u");
+    let tile_k = format!("{MUL_MAT_TILE_K}u");
+    let variant = if use_vec { "VEC" } else { "SCALAR" };
+    ctx.create_pipeline_with_defines(
+        shaders::MUL_MAT_REG_TILE,
+        "main",
+        label,
+        &[
+            (variant, ""),
+            ("SRC0_INNER_TYPE", "u32"),
+            ("SRC1_INNER_TYPE", "f32"),
+            ("INIT_SRC0_SHMEM_Q4_0", ""),
+            ("INIT_SRC1_SHMEM_FLOAT", ""),
+            ("WORKGROUP_SIZE_M", &wg_m),
+            ("WORKGROUP_SIZE_N", &wg_n),
+            ("TILE_M", &tile_m),
+            ("TILE_N", &tile_n),
+            ("TILE_K", &tile_k),
+        ],
+    )
+}
+
 /// A weight matrix on GPU — tracks buffer + dtype + pre-allocated params for dispatch.
 struct GpuWeight {
     tensor: GpuTensor,
@@ -76,8 +115,6 @@ struct GpuPipelines {
     qk_norm_rope_batch: wgpu::ComputePipeline,
     conv1d_fused_batch: wgpu::ComputePipeline,
 
-    mul_mat_reg_tile_f32_vec: wgpu::ComputePipeline,
-    mul_mat_reg_tile_f32_scalar: wgpu::ComputePipeline,
     mul_mat_reg_tile_q4_0_vec: wgpu::ComputePipeline,
     mul_mat_reg_tile_q4_0_scalar: wgpu::ComputePipeline,
     attention_prefill: wgpu::ComputePipeline,
@@ -305,73 +342,11 @@ impl GpuLfm2Model {
                 "conv1d_fused_batch",
             ),
 
-            mul_mat_reg_tile_f32_vec: ctx.create_pipeline_with_defines(
-                shaders::MUL_MAT_REG_TILE,
-                "main",
-                "mul_mat_f32_vec",
-                &[
-                    ("VEC", ""),
-                    ("SRC0_INNER_TYPE", "f32"),
-                    ("SRC1_INNER_TYPE", "f32"),
-                    ("INIT_SRC0_SHMEM_FLOAT", ""),
-                    ("INIT_SRC1_SHMEM_FLOAT", ""),
-                    ("WORKGROUP_SIZE_M", "8u"),
-                    ("WORKGROUP_SIZE_N", "32u"),
-                    ("TILE_M", "4u"),
-                    ("TILE_N", "1u"),
-                    ("TILE_K", "32u"),
-                ],
-            ),
-            mul_mat_reg_tile_f32_scalar: ctx.create_pipeline_with_defines(
-                shaders::MUL_MAT_REG_TILE,
-                "main",
-                "mul_mat_f32_scalar",
-                &[
-                    ("SCALAR", ""),
-                    ("SRC0_INNER_TYPE", "f32"),
-                    ("SRC1_INNER_TYPE", "f32"),
-                    ("INIT_SRC0_SHMEM_FLOAT", ""),
-                    ("INIT_SRC1_SHMEM_FLOAT", ""),
-                    ("WORKGROUP_SIZE_M", "8u"),
-                    ("WORKGROUP_SIZE_N", "32u"),
-                    ("TILE_M", "4u"),
-                    ("TILE_N", "1u"),
-                    ("TILE_K", "32u"),
-                ],
-            ),
-            mul_mat_reg_tile_q4_0_vec: ctx.create_pipeline_with_defines(
-                shaders::MUL_MAT_REG_TILE,
-                "main",
-                "mul_mat_q4_0_vec",
-                &[
-                    ("VEC", ""),
-                    ("SRC0_INNER_TYPE", "u32"),
-                    ("SRC1_INNER_TYPE", "f32"),
-                    ("INIT_SRC0_SHMEM_Q4_0", ""),
-                    ("INIT_SRC1_SHMEM_FLOAT", ""),
-                    ("WORKGROUP_SIZE_M", "8u"),
-                    ("WORKGROUP_SIZE_N", "32u"),
-                    ("TILE_M", "4u"),
-                    ("TILE_N", "1u"),
-                    ("TILE_K", "32u"),
-                ],
-            ),
-            mul_mat_reg_tile_q4_0_scalar: ctx.create_pipeline_with_defines(
-                shaders::MUL_MAT_REG_TILE,
-                "main",
+            mul_mat_reg_tile_q4_0_vec: build_mul_mat_pipeline(&ctx, "mul_mat_q4_0_vec", true),
+            mul_mat_reg_tile_q4_0_scalar: build_mul_mat_pipeline(
+                &ctx,
                 "mul_mat_q4_0_scalar",
-                &[
-                    ("SCALAR", ""),
-                    ("SRC0_INNER_TYPE", "u32"),
-                    ("SRC1_INNER_TYPE", "f32"),
-                    ("INIT_SRC0_SHMEM_Q4_0", ""),
-                    ("INIT_SRC1_SHMEM_FLOAT", ""),
-                    ("WORKGROUP_SIZE_M", "8u"),
-                    ("WORKGROUP_SIZE_N", "32u"),
-                    ("TILE_M", "4u"),
-                    ("TILE_N", "1u"),
-                    ("TILE_K", "32u"),
-                ],
+                false,
             ),
             attention_prefill: ctx.create_pipeline(
                 shaders::ATTENTION_PREFILL,
@@ -1845,8 +1820,9 @@ impl GpuLfm2Model {
     }
 
     /// Encode register-tiled 2D matmul: y = weight * x.
-    /// Supports both F32 and Q4_0 variants via specialized pipelines.
-    #[allow(clippy::too_many_arguments)]
+    /// Weight must be Q4_0 — F32 weights are not yet a production code
+    /// path in this model. The VEC pipeline fires when `m` and `k` are
+    /// both multiples of 4; otherwise SCALAR.
     fn encode_mul_mat_reg_tile(
         &self,
         enc: &mut wgpu::CommandEncoder,
@@ -1855,25 +1831,22 @@ impl GpuLfm2Model {
         y: &wgpu::Buffer,
         n: u32,
         k: u32,
-        x_stride: u32,
-        y_stride: u32,
     ) {
+        debug_assert_eq!(
+            w.tensor.dtype,
+            DType::Q4_0,
+            "encode_mul_mat_reg_tile only supports Q4_0 weights"
+        );
         let m = w.tensor.shape[0] as u32;
-        let use_vec = m % 4 == 0 && k % 4 == 0 && x_stride % 4 == 0 && y_stride % 4 == 0;
-        let pipeline = match (w.tensor.dtype, use_vec) {
-            (DType::Q4_0, true) => &self.pipelines.mul_mat_reg_tile_q4_0_vec,
-            (DType::Q4_0, false) => &self.pipelines.mul_mat_reg_tile_q4_0_scalar,
-            (DType::F32, true) => &self.pipelines.mul_mat_reg_tile_f32_vec,
-            _ => &self.pipelines.mul_mat_reg_tile_f32_scalar,
+        let use_vec = m % 4 == 0 && k % 4 == 0;
+        let pipeline = if use_vec {
+            &self.pipelines.mul_mat_reg_tile_q4_0_vec
+        } else {
+            &self.pipelines.mul_mat_reg_tile_q4_0_scalar
         };
 
-        // MulMatParams: m, k, n, x_stride, y_stride, batch_stride_x, batch_stride_y, batch_stride_w
-        let params: [u32; 8] = [
-            m, k, n, x_stride, y_stride,
-            0, // batch_stride_x (not used for single-batch prefill today)
-            0, // batch_stride_y
-            0, // batch_stride_w
-        ];
+        // MulMatParams: m, k, n.
+        let params: [u32; 3] = [m, k, n];
         let p_buf = self
             .ctx
             .upload_storage(bytemuck::cast_slice(&params), "mul_mat_tile_params");
@@ -1904,9 +1877,8 @@ impl GpuLfm2Model {
                 ],
             });
 
-        // WORKGROUP_SIZE_M=8, WORKGROUP_SIZE_N=8, TILE_M=4, TILE_N=4
-        let wg_m = m.div_ceil(8 * 4);
-        let wg_n = n.div_ceil(8 * 4);
+        let wg_m = m.div_ceil(MUL_MAT_TILE_WG_M * MUL_MAT_TILE_M);
+        let wg_n = n.div_ceil(MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N);
 
         self.encode(enc, pipeline, &bg, (wg_m, wg_n, 1), "mul_mat_tile");
     }
@@ -2240,8 +2212,6 @@ impl GpuLfm2Model {
                     &self.prefill_proj_buf,
                     n_u,
                     hs_u,
-                    hs_u,
-                    3 * hs_u,
                 );
 
                 // Phase 3: fused conv1d (1 dispatch over all N tokens;
@@ -2264,8 +2234,6 @@ impl GpuLfm2Model {
                     &self.prefill_normed_buf,
                     &self.prefill_gate_buf,
                     n_u,
-                    hs_u,
-                    hs_u,
                     hs_u,
                 );
             } else {
@@ -2292,8 +2260,6 @@ impl GpuLfm2Model {
                     &self.prefill_proj_buf,
                     n_u,
                     hs_u,
-                    hs_u,
-                    hs_u,
                 );
                 self.encode_mul_mat_reg_tile(
                     &mut enc,
@@ -2302,8 +2268,6 @@ impl GpuLfm2Model {
                     &self.prefill_gate_buf,
                     n_u,
                     hs_u,
-                    hs_u,
-                    kv_dim,
                 );
                 self.encode_mul_mat_reg_tile(
                     &mut enc,
@@ -2312,8 +2276,6 @@ impl GpuLfm2Model {
                     &self.prefill_up_buf,
                     n_u,
                     hs_u,
-                    hs_u,
-                    kv_dim,
                 );
 
                 // Phase B: batched per-head Q/K rmsnorm + RoPE.
@@ -2381,8 +2343,6 @@ impl GpuLfm2Model {
                     &self.prefill_gate_buf,
                     n_u,
                     hs_u,
-                    hs_u,
-                    hs_u,
                 );
             }
 
@@ -2405,8 +2365,6 @@ impl GpuLfm2Model {
                 &self.prefill_gate_buf,
                 n_u,
                 hs_u,
-                hs_u,
-                is_u,
             );
             self.encode_mul_mat_reg_tile(
                 &mut enc,
@@ -2415,8 +2373,6 @@ impl GpuLfm2Model {
                 &self.prefill_up_buf,
                 n_u,
                 hs_u,
-                hs_u,
-                is_u,
             );
             // silu_mul over the full N × is buffer.
             {
@@ -2468,8 +2424,6 @@ impl GpuLfm2Model {
                 &self.prefill_up_buf,
                 n_u,
                 is_u,
-                is_u,
-                hs_u,
             );
         }
 
