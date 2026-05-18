@@ -563,6 +563,7 @@ pub mod shaders {
     pub const GEMV_Q4_0: &str = include_str!("shaders/gemv_q4_0.wgsl");
     pub const GEMV_Q4_0_FAST: &str = include_str!("shaders/gemv_q4_0_fast.wgsl");
     pub const GEMV_Q6_K: &str = include_str!("shaders/gemv_q6_k.wgsl");
+    pub const GEMV_Q8_0: &str = include_str!("shaders/gemv_q8_0.wgsl");
     pub const ELEMENTWISE: &str = include_str!("shaders/elementwise.wgsl");
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.wgsl");
     pub const RMSNORM_BATCH: &str = include_str!("shaders/rmsnorm_batch.wgsl");
@@ -1811,6 +1812,250 @@ mod tests {
             );
         }
         println!("Q4_0 GEMV {m}×{k}: all rows match");
+    }
+
+    #[test]
+    fn test_gpu_gemv_q8_0() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let m = 9u32;
+        let k = 64u32;
+        let nb = k / 32;
+
+        let weights_f32: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 13 + 5) % 41) as f32 * 0.07 - 1.3)
+            .collect();
+
+        let mut q8_bytes: Vec<u8> = Vec::new();
+        let mut expected = vec![0.0f32; m as usize];
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 - 17.0) * 0.03125).collect();
+
+        for row in 0..m as usize {
+            for b in 0..nb as usize {
+                let start = row * k as usize + b * 32;
+                let block = &weights_f32[start..start + 32];
+                let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let d = if amax != 0.0 { amax / 127.0 } else { 0.0 };
+                let d_f16 = half::f16::from_f32(d);
+                q8_bytes.extend_from_slice(&d_f16.to_bits().to_le_bytes());
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+
+                for (qi, &value) in block.iter().enumerate() {
+                    let quant = (value * id).round().clamp(-127.0, 127.0) as i8;
+                    q8_bytes.push(quant as u8);
+                    expected[row] += f32::from(quant) * d_f16.to_f32() * x[b * 32 + qi];
+                }
+            }
+        }
+
+        let a_buf = ctx.upload_storage(&q8_bytes, "A_q8");
+        let x_buf = ctx.upload_f32(&x, "x");
+        let y_buf = ctx.create_storage_rw((m as u64) * 4, "y");
+        let params = [m, k];
+        let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0", "gemv_q8_0");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(m.div_ceil(8), 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+
+        let result = ctx.download_f32(&y_buf, m as usize);
+        for i in 0..m as usize {
+            let diff = (expected[i] - result[i]).abs();
+            assert!(
+                diff < 1e-3,
+                "Q8_0 GEMV mismatch at row {i}: cpu={}, gpu={}, diff={diff}",
+                expected[i],
+                result[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_gemv_quant_dispatch_smoke() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let m = 9u32;
+        let k = 64u32;
+        let nb = k / 32;
+        let weights_f32: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 11 + 7) % 37) as f32 * 0.08 - 1.2)
+            .collect();
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 - 23.0) * 0.025).collect();
+
+        let mut q4_bytes = Vec::new();
+        let mut q4_expected = vec![0.0f32; m as usize];
+        let mut q8_bytes = Vec::new();
+        let mut q8_expected = vec![0.0f32; m as usize];
+        let mut f32_expected = vec![0.0f32; m as usize];
+
+        for row in 0..m as usize {
+            for col in 0..k as usize {
+                f32_expected[row] += weights_f32[row * k as usize + col] * x[col];
+            }
+
+            for b in 0..nb as usize {
+                let start = row * k as usize + b * 32;
+                let block = &weights_f32[start..start + 32];
+                let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+
+                let d4 = if amax != 0.0 { amax / 7.0 } else { 0.0 };
+                let d4_f16 = half::f16::from_f32(d4);
+                q4_bytes.extend_from_slice(&d4_f16.to_bits().to_le_bytes());
+                let id4 = if d4 != 0.0 { 1.0 / d4 } else { 0.0 };
+                for qi in 0..16 {
+                    let lo = ((block[qi] * id4 + 8.5) as u8).min(15);
+                    let hi = ((block[16 + qi] * id4 + 8.5) as u8).min(15);
+                    q4_bytes.push(lo | (hi << 4));
+                    q4_expected[row] += (f32::from(lo) - 8.0) * d4_f16.to_f32() * x[b * 32 + qi];
+                    q4_expected[row] +=
+                        (f32::from(hi) - 8.0) * d4_f16.to_f32() * x[b * 32 + 16 + qi];
+                }
+
+                let d8 = if amax != 0.0 { amax / 127.0 } else { 0.0 };
+                let d8_f16 = half::f16::from_f32(d8);
+                q8_bytes.extend_from_slice(&d8_f16.to_bits().to_le_bytes());
+                let id8 = if d8 != 0.0 { 1.0 / d8 } else { 0.0 };
+                for (qi, &value) in block.iter().enumerate() {
+                    let quant = (value * id8).round().clamp(-127.0, 127.0) as i8;
+                    q8_bytes.push(quant as u8);
+                    q8_expected[row] += f32::from(quant) * d8_f16.to_f32() * x[b * 32 + qi];
+                }
+            }
+        }
+
+        struct Case<'a> {
+            name: &'static str,
+            dtype: DType,
+            shader: &'static str,
+            entry: &'static str,
+            rows_per_wg: u32,
+            weight_bytes: &'a [u8],
+            expected: &'a [f32],
+            tolerance: f32,
+        }
+
+        let f32_weight_bytes = bytemuck::cast_slice(&weights_f32);
+        let cases = [
+            Case {
+                name: "f32",
+                dtype: DType::F32,
+                shader: shaders::GEMV_F32,
+                entry: "gemv_f32",
+                rows_per_wg: 8,
+                weight_bytes: f32_weight_bytes,
+                expected: &f32_expected,
+                tolerance: 1e-4,
+            },
+            Case {
+                name: "q4_0",
+                dtype: DType::Q4_0,
+                shader: shaders::GEMV_Q4_0_FAST,
+                entry: "gemv_q4_0_fast",
+                rows_per_wg: 4,
+                weight_bytes: &q4_bytes,
+                expected: &q4_expected,
+                tolerance: 5e-2,
+            },
+            Case {
+                name: "q8_0",
+                dtype: DType::Q8_0,
+                shader: shaders::GEMV_Q8_0,
+                entry: "gemv_q8_0",
+                rows_per_wg: 8,
+                weight_bytes: &q8_bytes,
+                expected: &q8_expected,
+                tolerance: 1e-3,
+            },
+        ];
+
+        let x_buf = ctx.upload_f32(&x, "gemv_dispatch_x");
+        let params = [m, k];
+        let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "gemv_dispatch_params");
+
+        for case in cases {
+            let pipeline = ctx.create_pipeline(case.shader, case.entry, case.name);
+            let a_buf = ctx.upload_storage(case.weight_bytes, case.name);
+            let y_buf = ctx.create_storage_rw((m as u64) * 4, "gemv_dispatch_y");
+            let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(case.name),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: a_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: x_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: y_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(m.div_ceil(case.rows_per_wg), 1, 1);
+            }
+            ctx.queue.submit(Some(enc.finish()));
+
+            let result = ctx.download_f32(&y_buf, m as usize);
+            for i in 0..m as usize {
+                let diff = (case.expected[i] - result[i]).abs();
+                assert!(
+                    diff < case.tolerance,
+                    "{:?} {} GEMV mismatch at row {i}: cpu={}, gpu={}, diff={diff}",
+                    case.dtype,
+                    case.name,
+                    case.expected[i],
+                    result[i]
+                );
+            }
+        }
     }
 
     /// Argmax kernel correctness across three shapes that exercise the

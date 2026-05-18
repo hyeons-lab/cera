@@ -99,6 +99,7 @@ struct GpuPipelines {
     gemv_q4_0: wgpu::ComputePipeline,
     gemv_q4_0_fast: wgpu::ComputePipeline,
     gemv_q6_k: wgpu::ComputePipeline,
+    gemv_q8_0: wgpu::ComputePipeline,
     add_inplace: wgpu::ComputePipeline,
     mul_inplace: wgpu::ComputePipeline,
     silu_mul_inplace: wgpu::ComputePipeline,
@@ -299,6 +300,7 @@ impl GpuLfm2Model {
                 "gemv_q4_0_fast",
             ),
             gemv_q6_k: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k", "gemv_q6_k"),
+            gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0", "gemv_q8_0"),
             add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "add"),
             mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_inplace", "mul"),
             silu_mul_inplace: ctx.create_pipeline(
@@ -355,7 +357,7 @@ impl GpuLfm2Model {
             ),
         };
 
-        // Upload weights: Q4_0 stays quantized, others dequantized to f32
+        // Upload weights: Q4_0/Q8_0 stay quantized, others dequantized to f32.
         let emb_tensor = cpu_model.gguf().get_tensor("token_embd.weight")?;
         let embedding_f32 = emb_tensor.to_f32_vec();
         let embedding = ctx.upload_f32(&embedding_f32, "token_embd.weight");
@@ -366,9 +368,9 @@ impl GpuLfm2Model {
         let output_norm = ctx.upload_f32(cpu_model.output_norm_weight(), "output_norm");
 
         let upload_weight = |wref: &super::lfm2::WeightRef, name: &str| -> GpuWeight {
-            let (buf, dtype) = if wref.dtype == DType::Q4_0 {
+            let (buf, dtype) = if matches!(wref.dtype, DType::Q4_0 | DType::Q8_0) {
                 let data = cpu_model.weight_bytes(wref);
-                (ctx.upload_storage(data, name), DType::Q4_0)
+                (ctx.upload_storage(data, name), wref.dtype)
             } else {
                 // TODO: Upload as F16 to save bandwidth (requires F16-aware matmul shaders
                 // in Phase B.1). For now we dequantize all non-Q4_0 to F32.
@@ -628,10 +630,7 @@ impl GpuLfm2Model {
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
-        let pipeline = match w.tensor.dtype {
-            DType::Q4_0 => &self.pipelines.gemv_q4_0_fast,
-            _ => &self.pipelines.gemv_f32,
-        };
+        let (pipeline, _, _) = self.gemv_pipeline_rows_label(w);
         self.ctx
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -656,6 +655,33 @@ impl GpuLfm2Model {
                     },
                 ],
             })
+    }
+
+    fn gemv_pipeline_rows_label(
+        &self,
+        w: &GpuWeight,
+    ) -> (&wgpu::ComputePipeline, u32, &'static str) {
+        match w.tensor.dtype {
+            DType::Q4_0 => (&self.pipelines.gemv_q4_0_fast, 4, "gemv_q4"),
+            DType::Q8_0 => (&self.pipelines.gemv_q8_0, 8, "gemv_q8"),
+            _ => (&self.pipelines.gemv_f32, 1, "gemv_f32"),
+        }
+    }
+
+    fn gemv_workgroups(&self, w: &GpuWeight) -> (u32, u32, u32) {
+        let (_, rows_per_wg, _) = self.gemv_pipeline_rows_label(w);
+        let rows = (w.tensor.shape[0] as u32).div_ceil(rows_per_wg);
+        (rows.min(65535), rows.div_ceil(65535), 1)
+    }
+
+    fn dispatch_gemv_into(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        w: &GpuWeight,
+        bind_group: &wgpu::BindGroup,
+    ) {
+        let (pipeline, _, _) = self.gemv_pipeline_rows_label(w);
+        self.dispatch_into(pass, pipeline, bind_group, self.gemv_workgroups(w));
     }
 
     /// Pre-create bind groups for all per-layer GEMV dispatches.
@@ -764,14 +790,7 @@ impl GpuLfm2Model {
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) {
-        let pipeline = match w.tensor.dtype {
-            DType::Q4_0 => &self.pipelines.gemv_q4_0_fast,
-            _ => &self.pipelines.gemv_f32,
-        };
-        let label = match w.tensor.dtype {
-            DType::Q4_0 => "gemv_q4",
-            _ => "gemv_f32",
-        };
+        let (pipeline, _, label) = self.gemv_pipeline_rows_label(w);
         // Use cached BG if available (pre-created at init for known
         // weight/input/output triples — saves ~16µs per dispatch).
         let fresh_bg;
@@ -781,14 +800,7 @@ impl GpuLfm2Model {
             fresh_bg = self.make_gemv_bg(w, input, output);
             &fresh_bg
         };
-        // Fast Q4_0 shader processes 4 rows per workgroup; f32 processes 1 row.
-        let rows_per_wg: u32 = match w.tensor.dtype {
-            DType::Q4_0 => 4,
-            _ => 1,
-        };
-        let workgroups_x = ((w.tensor.shape[0] as u32).div_ceil(rows_per_wg)).min(65535);
-        let workgroups_y = ((w.tensor.shape[0] as u32).div_ceil(rows_per_wg)).div_ceil(65535);
-        self.encode(enc, pipeline, bg, (workgroups_x, workgroups_y, 1), label);
+        self.encode(enc, pipeline, bg, self.gemv_workgroups(w), label);
     }
 
     /// Encode f32 GEMV (for tied embeddings output projection which stays f32).
@@ -1045,8 +1057,6 @@ impl GpuLfm2Model {
                         &in_bg_tmp
                     }
                 };
-                let in_rows = (in_w.tensor.shape[0] as u32).div_ceil(4);
-
                 // Pass 1: rmsnorm + in_proj (after hidden→normed copy).
                 self.encode_copy(
                     &mut enc,
@@ -1062,12 +1072,7 @@ impl GpuLfm2Model {
                         timestamp_writes: None,
                     });
                     self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
-                    self.dispatch_into(
-                        &mut pass,
-                        &self.pipelines.gemv_q4_0_fast,
-                        in_bg,
-                        (in_rows.min(65535), in_rows.div_ceil(65535), 1),
-                    );
+                    self.dispatch_gemv_into(&mut pass, in_w, in_bg);
                 }
 
                 // Pre-create BGs for passes 2 and 3. The fused conv shader reads
@@ -1114,7 +1119,6 @@ impl GpuLfm2Model {
                         &out_bg_tmp
                     }
                 };
-                let out_rows = (out_w.tensor.shape[0] as u32).div_ceil(4);
                 let add_p = &self.elementwise_hs_params;
                 let add_bg = self
                     .ctx
@@ -1161,12 +1165,7 @@ impl GpuLfm2Model {
                         label: Some("conv_post"),
                         timestamp_writes: None,
                     });
-                    self.dispatch_into(
-                        &mut pass,
-                        &self.pipelines.gemv_q4_0_fast,
-                        out_bg,
-                        (out_rows.min(65535), out_rows.div_ceil(65535), 1),
-                    );
+                    self.dispatch_gemv_into(&mut pass, out_w, out_bg);
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.add_inplace,
@@ -1304,9 +1303,6 @@ impl GpuLfm2Model {
                         ],
                     });
 
-                let q_rows = (q_w.tensor.shape[0] as u32).div_ceil(4);
-                let k_rows = (k_w.tensor.shape[0] as u32).div_ceil(4);
-                let v_rows = (v_w.tensor.shape[0] as u32).div_ceil(4);
                 let max_pairs = std::cmp::max(n_heads, n_kv_heads) * (head_dim / 2);
 
                 // Copy hidden → normed, then pass 1: norm + QKV + per-head norm + rope.
@@ -1324,24 +1320,9 @@ impl GpuLfm2Model {
                         timestamp_writes: None,
                     });
                     self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
-                    self.dispatch_into(
-                        &mut pass,
-                        &self.pipelines.gemv_q4_0_fast,
-                        q_bg,
-                        (q_rows.min(65535), q_rows.div_ceil(65535), 1),
-                    );
-                    self.dispatch_into(
-                        &mut pass,
-                        &self.pipelines.gemv_q4_0_fast,
-                        k_bg,
-                        (k_rows.min(65535), k_rows.div_ceil(65535), 1),
-                    );
-                    self.dispatch_into(
-                        &mut pass,
-                        &self.pipelines.gemv_q4_0_fast,
-                        v_bg,
-                        (v_rows.min(65535), v_rows.div_ceil(65535), 1),
-                    );
+                    self.dispatch_gemv_into(&mut pass, q_w, q_bg);
+                    self.dispatch_gemv_into(&mut pass, k_w, k_bg);
+                    self.dispatch_gemv_into(&mut pass, v_w, v_bg);
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.per_head_rmsnorm,
@@ -1417,18 +1398,12 @@ impl GpuLfm2Model {
                             },
                         ],
                     });
-                let out_rows = (out_w.tensor.shape[0] as u32).div_ceil(4);
                 {
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("attn_post"),
                         timestamp_writes: None,
                     });
-                    self.dispatch_into(
-                        &mut pass,
-                        &self.pipelines.gemv_q4_0_fast,
-                        out_bg,
-                        (out_rows.min(65535), out_rows.div_ceil(65535), 1),
-                    );
+                    self.dispatch_gemv_into(&mut pass, out_w, out_bg);
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.add_inplace,
@@ -1541,9 +1516,6 @@ impl GpuLfm2Model {
                     ],
                 });
 
-            let gate_rows = (lw.ffn_gate.tensor.shape[0] as u32).div_ceil(4);
-            let up_rows = (lw.ffn_up.tensor.shape[0] as u32).div_ceil(4);
-            let down_rows = (lw.ffn_down.tensor.shape[0] as u32).div_ceil(4);
             {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("ffn"),
@@ -1552,18 +1524,8 @@ impl GpuLfm2Model {
                 // rmsnorm
                 self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
                 // gate + up GEMVs
-                self.dispatch_into(
-                    &mut pass,
-                    &self.pipelines.gemv_q4_0_fast,
-                    gate_bg,
-                    (gate_rows.min(65535), gate_rows.div_ceil(65535), 1),
-                );
-                self.dispatch_into(
-                    &mut pass,
-                    &self.pipelines.gemv_q4_0_fast,
-                    up_bg,
-                    (up_rows.min(65535), up_rows.div_ceil(65535), 1),
-                );
+                self.dispatch_gemv_into(&mut pass, &lw.ffn_gate, gate_bg);
+                self.dispatch_gemv_into(&mut pass, &lw.ffn_up, up_bg);
                 // silu_mul
                 self.dispatch_into(
                     &mut pass,
@@ -1572,12 +1534,7 @@ impl GpuLfm2Model {
                     ((lw.ffn_gate.tensor.shape[0] as u32).div_ceil(256), 1, 1),
                 );
                 // down GEMV
-                self.dispatch_into(
-                    &mut pass,
-                    &self.pipelines.gemv_q4_0_fast,
-                    down_bg,
-                    (down_rows.min(65535), down_rows.div_ceil(65535), 1),
-                );
+                self.dispatch_gemv_into(&mut pass, &lw.ffn_down, down_bg);
                 // residual add
                 self.dispatch_into(
                     &mut pass,
