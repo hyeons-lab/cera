@@ -570,6 +570,7 @@ pub mod shaders {
     pub const QK_NORM_ROPE_BATCH: &str = include_str!("shaders/qk_norm_rope_batch.wgsl");
     pub const CONV1D_FUSED_BATCH: &str = include_str!("shaders/conv1d_fused_batch.wgsl");
     pub const GEMM_Q4_0: &str = include_str!("shaders/gemm_q4_0.wgsl");
+    pub const GEMM_Q8_0: &str = include_str!("shaders/gemm_q8_0.wgsl");
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.wgsl");
     pub const SOFTMAX: &str = include_str!("shaders/softmax.wgsl");
     pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.wgsl");
@@ -1899,6 +1900,119 @@ mod tests {
                 expected[i],
                 result[i]
             );
+        }
+    }
+
+    #[test]
+    fn test_gpu_gemm_q8_0_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let m = 11u32;
+        let k = 64u32;
+        let n = 3u32;
+        let x_stride = k + 4;
+        let y_stride = m + 5;
+        let nb = k / 32;
+
+        let weights_f32: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 + 3) % 53) as f32 * 0.045 - 1.1)
+            .collect();
+
+        let mut q8_bytes: Vec<u8> = Vec::new();
+        for row in 0..m as usize {
+            for b in 0..nb as usize {
+                let start = row * k as usize + b * 32;
+                let block = &weights_f32[start..start + 32];
+                let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let d = if amax != 0.0 { amax / 127.0 } else { 0.0 };
+                let d_f16 = half::f16::from_f32(d);
+                q8_bytes.extend_from_slice(&d_f16.to_bits().to_le_bytes());
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                for &value in block {
+                    let quant = (value * id).round().clamp(-127.0, 127.0) as i8;
+                    q8_bytes.push(quant as u8);
+                }
+            }
+        }
+
+        let mut x_batch = vec![0.0f32; (n * x_stride) as usize];
+        for t in 0..n as usize {
+            for i in 0..k as usize {
+                x_batch[t * x_stride as usize + i] = ((t as f32 + 1.0) * (i as f32 - 19.0)) * 0.021;
+            }
+        }
+
+        let mut expected = vec![0.0f32; (n * y_stride) as usize];
+        for t in 0..n as usize {
+            let x_slice = &x_batch[t * x_stride as usize..t * x_stride as usize + k as usize];
+            for row in 0..m as usize {
+                let mut acc = 0.0f32;
+                for b in 0..nb as usize {
+                    let block_off = (row * nb as usize + b) * 34;
+                    let d_bits = u16::from_le_bytes([q8_bytes[block_off], q8_bytes[block_off + 1]]);
+                    let d = half::f16::from_bits(d_bits).to_f32();
+                    for qi in 0..32 {
+                        let quant = q8_bytes[block_off + 2 + qi] as i8;
+                        acc += f32::from(quant) * d * x_slice[b * 32 + qi];
+                    }
+                }
+                expected[t * y_stride as usize + row] = acc;
+            }
+        }
+
+        let a_buf = ctx.upload_storage(&q8_bytes, "gemm_q8_weights");
+        let x_buf = ctx.upload_f32(&x_batch, "gemm_q8_x");
+        let y_buf = ctx.create_storage_rw(((n * y_stride) as u64) * 4, "gemm_q8_y");
+        let params: [u32; 6] = [m, k, n, x_stride, y_stride, 0];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "gemm_q8_params");
+
+        let pipeline = ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0", "gemm_q8_0");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(m.div_ceil(8), n, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+
+        let got = ctx.download_f32(&y_buf, (n * y_stride) as usize);
+        for t in 0..n as usize {
+            for row in 0..m as usize {
+                let idx = t * y_stride as usize + row;
+                let diff = (expected[idx] - got[idx]).abs();
+                assert!(
+                    diff < 1e-3,
+                    "Q8_0 GEMM mismatch at token {t}, row {row}: cpu={}, gpu={}, diff={diff}",
+                    expected[idx],
+                    got[idx]
+                );
+            }
         }
     }
 
