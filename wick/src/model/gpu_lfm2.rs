@@ -663,10 +663,14 @@ impl GpuLfm2Model {
         &self,
         w: &GpuWeight,
     ) -> (&wgpu::ComputePipeline, u32, &'static str) {
+        // rows-per-workgroup MUST match each shader's `NR`/`ROWS_PER_WG`
+        // constant: gemv_q4_0_fast=4, gemv_q8_0=8, gemv_f32=8. A mismatch
+        // over-dispatches and the shaders bounds-check only writes, not
+        // weight reads, so a too-small value reads past the weight buffer.
         match w.tensor.dtype {
             DType::Q4_0 => (&self.pipelines.gemv_q4_0_fast, 4, "gemv_q4"),
             DType::Q8_0 => (&self.pipelines.gemv_q8_0, 8, "gemv_q8"),
-            _ => (&self.pipelines.gemv_f32, 1, "gemv_f32"),
+            _ => (&self.pipelines.gemv_f32, 8, "gemv_f32"),
         }
     }
 
