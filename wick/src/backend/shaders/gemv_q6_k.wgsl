@@ -1,5 +1,3 @@
-// NOTE: Uses subgroupAdd without `enable subgroups;` — see gemv_q4_0.wgsl.
-//
 // Q6_K GEMV — Metal kernel layout with per-byte reads.
 // Correct but slow due to per-byte u32 load+shift+mask overhead (regresses
 // vs f32 on macOS wgpu). NOT wired into production — kept for future
@@ -15,6 +13,9 @@
 const QK_K: u32 = 256u;
 const Q6K_BYTES: u32 = 210u;
 const NR: u32 = 2u;
+const WG_SIZE: u32 = 32u;
+
+var<workgroup> partials: array<f32, 64>;
 
 fn rb(off: u32) -> u32 {
     return (a[off / 4u] >> ((off % 4u) * 8u)) & 0xFFu;
@@ -106,10 +107,21 @@ fn gemv_q6_k(
         b += 2u;
     }
 
-    let total0 = subgroupAdd(sumf0);
-    let total1 = subgroupAdd(sumf1);
+    partials[0u * WG_SIZE + tiisg] = sumf0;
+    partials[1u * WG_SIZE + tiisg] = sumf1;
+    workgroupBarrier();
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride / 2u) {
+        if tiisg < stride {
+            for (var r = 0u; r < NR; r += 1u) {
+                let idx = r * WG_SIZE + tiisg;
+                partials[idx] += partials[idx + stride];
+            }
+        }
+        workgroupBarrier();
+    }
+
     if tiisg == 0u {
-        if first_row < m { y[first_row] = total0; }
-        if first_row + 1u < m { y[first_row + 1u] = total1; }
+        if first_row < m { y[first_row] = partials[0u * WG_SIZE]; }
+        if first_row + 1u < m { y[first_row + 1u] = partials[1u * WG_SIZE]; }
     }
 }

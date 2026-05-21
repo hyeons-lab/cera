@@ -17,6 +17,8 @@ pub struct GpuContext {
     pub queue: wgpu::Queue,
     pub adapter_name: String,
     pub backend: String,
+    pub max_storage_buffer_binding_size: u64,
+    pub min_storage_buffer_offset_alignment: u64,
     pub preprocessor: Preprocessor,
     /// Timestamp profiling (None if TIMESTAMP_QUERY not supported).
     pub profiler: Option<GpuProfiler>,
@@ -83,14 +85,7 @@ impl GpuContext {
         let profile_requested = std::env::var("WICK_GPU_PROFILE").as_deref() == Ok("1");
         let has_timestamps =
             profile_requested && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        // Subgroup ops (subgroupAdd) are required by all WGSL compute kernels.
-        // Fail clearly if the adapter doesn't support them.
-        anyhow::ensure!(
-            adapter.features().contains(wgpu::Features::SUBGROUP),
-            "GPU adapter does not support subgroup operations (required for WGSL kernels). \
-             Use --device cpu instead."
-        );
-        let mut features = wgpu::Features::SUBGROUP;
+        let mut features = wgpu::Features::empty();
         if has_timestamps {
             features |= wgpu::Features::TIMESTAMP_QUERY;
         }
@@ -102,20 +97,6 @@ impl GpuContext {
         // failures on GPUs with smaller max_buffer_size (integrated, mobile).
         let adapter_limits = adapter.limits();
 
-        // The reduction kernels (gemv/gemm Q4_0/Q8_0) launch 32-thread
-        // workgroups and finalize with `subgroupAdd` + a single `tid==0`
-        // writer. That is only correct if all 32 lanes belong to one
-        // subgroup, i.e. the subgroup is at least 32 lanes wide. Fail
-        // clearly here rather than producing silently-wrong matmul output
-        // on hardware that splits the workgroup into smaller subgroups.
-        // A reported `0` means the backend doesn't expose the size (e.g.
-        // GL); proceed on the SUBGROUP-feature assumption in that case.
-        let min_sg = adapter_limits.min_subgroup_size;
-        anyhow::ensure!(
-            min_sg == 0 || min_sg >= 32,
-            "GPU minimum subgroup size {min_sg} < 32; wick's reduction kernels \
-             require a subgroup of at least 32 lanes. Use --device cpu instead."
-        );
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("wick-gpu"),
@@ -170,7 +151,7 @@ impl GpuContext {
         tracing::info!(
             adapter = %adapter_name,
             backend = %backend,
-            subgroup = true,  // required — checked above
+            min_subgroup_size = adapter_limits.min_subgroup_size,
             "GPU initialized"
         );
 
@@ -179,6 +160,9 @@ impl GpuContext {
             queue,
             adapter_name,
             backend,
+            max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size as u64,
+            min_storage_buffer_offset_alignment: adapter_limits.min_storage_buffer_offset_alignment
+                as u64,
             preprocessor,
             profiler,
             staging: std::sync::Mutex::new(None),

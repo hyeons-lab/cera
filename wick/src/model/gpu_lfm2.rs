@@ -817,8 +817,15 @@ impl GpuLfm2Model {
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
         m: u32,
-        _k: u32,
+        k: u32,
     ) {
+        let weight_bytes = u64::from(m) * u64::from(k) * 4;
+        let max_binding = self.ctx.max_storage_buffer_binding_size;
+        if weight_bytes > max_binding {
+            self.encode_gemv_f32_tiled(enc, weight, input, output, m, k);
+            return;
+        }
+
         // Use pre-allocated params (m=vocab_size, k=hs are constant).
         let params_buf = &self.embedding_params;
         let bg = self
@@ -854,6 +861,85 @@ impl GpuLfm2Model {
             (groups.min(65535), groups.div_ceil(65535), 1),
             "gemv_f32",
         );
+    }
+
+    /// Encode f32 GEMV in row tiles for adapters with small
+    /// max_storage_buffer_binding_size limits. The tied embedding/output
+    /// projection can exceed those limits even though each row slice is legal.
+    fn encode_gemv_f32_tiled(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        weight: &wgpu::Buffer,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        m: u32,
+        k: u32,
+    ) {
+        let row_bytes = u64::from(k) * 4;
+        let max_binding = self.ctx.max_storage_buffer_binding_size;
+        let offset_align = self.ctx.min_storage_buffer_offset_alignment.max(4);
+        let align_rows = (offset_align / 4).max(1) as u32;
+        let max_rows = (max_binding / row_bytes) as u32;
+        let tile_rows = (max_rows / align_rows) * align_rows;
+        assert!(
+            tile_rows >= 8,
+            "GPU max storage binding size {} is too small for f32 GEMV rows of {} bytes",
+            max_binding,
+            row_bytes
+        );
+
+        let layout = self.pipelines.gemv_f32.get_bind_group_layout(0);
+        let mut row_start = 0u32;
+        while row_start < m {
+            let rows = (m - row_start).min(tile_rows);
+            let weight_offset = u64::from(row_start) * row_bytes;
+            let output_offset = u64::from(row_start) * 4;
+            let params_buf = self
+                .ctx
+                .upload_storage(bytemuck::cast_slice(&[rows, k]), "gemv_f32.tile.params");
+            let bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: weight,
+                                offset: weight_offset,
+                                size: wgpu::BufferSize::new(u64::from(rows) * row_bytes),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: input.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: output,
+                                offset: output_offset,
+                                size: wgpu::BufferSize::new(u64::from(rows) * 4),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: params_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+            let groups = rows.div_ceil(8);
+            self.encode(
+                enc,
+                &self.pipelines.gemv_f32,
+                &bg,
+                (groups.min(65535), groups.div_ceil(65535), 1),
+                "gemv_f32_tiled",
+            );
+            row_start += rows;
+        }
     }
 
     fn encode_rmsnorm(

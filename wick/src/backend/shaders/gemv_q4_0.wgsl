@@ -1,7 +1,3 @@
-// NOTE: Uses subgroupAdd without `enable subgroups;` — the directive
-// breaks compilation on macOS wgpu (naga), but the bare builtin works.
-// For non-Apple targets, add `enable subgroups;` or use a workgroup fallback.
-//
 // Q4_0 GEMV: y[m] = dequant(A_q4_0[m, k]) × x[k]
 //
 // Q4_0 block layout (18 bytes per 32 elements):
@@ -10,8 +6,8 @@
 //
 // Strategy: Each workgroup processes 8 output rows simultaneously.
 // This reuses loaded x values across 4 rows, reducing x reads by 4x.
-// 32 threads per workgroup (one subgroup), each thread processes blocks
-// in stride-32 pattern. Subgroup reduction for final sum per row.
+// 32 threads per workgroup, each thread processes blocks in stride-32
+// pattern. Workgroup reduction finalizes one sum per row.
 //
 // Dispatch: (ceil(m / 8), 1, 1) workgroups
 
@@ -21,6 +17,9 @@
 @group(0) @binding(3) var<storage, read> params: vec2<u32>;
 
 const ROWS_PER_WG: u32 = 8u;
+const WG_SIZE: u32 = 32u;
+
+var<workgroup> partials: array<f32, 256>;
 
 @compute @workgroup_size(32, 1, 1)
 fn gemv_q4_0(
@@ -70,25 +69,34 @@ fn gemv_q4_0(
         bi += 32u;
     }
 
-    // Subgroup reduction for each row
-    let total0 = subgroupAdd(sum0);
-    let total1 = subgroupAdd(sum1);
-    let total2 = subgroupAdd(sum2);
-    let total3 = subgroupAdd(sum3);
-    let total4 = subgroupAdd(sum4);
-    let total5 = subgroupAdd(sum5);
-    let total6 = subgroupAdd(sum6);
-    let total7 = subgroupAdd(sum7);
+    partials[0u * WG_SIZE + tid] = sum0;
+    partials[1u * WG_SIZE + tid] = sum1;
+    partials[2u * WG_SIZE + tid] = sum2;
+    partials[3u * WG_SIZE + tid] = sum3;
+    partials[4u * WG_SIZE + tid] = sum4;
+    partials[5u * WG_SIZE + tid] = sum5;
+    partials[6u * WG_SIZE + tid] = sum6;
+    partials[7u * WG_SIZE + tid] = sum7;
+    workgroupBarrier();
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride / 2u) {
+        if tid < stride {
+            for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
+                let idx = r * WG_SIZE + tid;
+                partials[idx] += partials[idx + stride];
+            }
+        }
+        workgroupBarrier();
+    }
 
     if tid == 0u {
-        if row_base + 0u < m { y[row_base + 0u] = total0; }
-        if row_base + 1u < m { y[row_base + 1u] = total1; }
-        if row_base + 2u < m { y[row_base + 2u] = total2; }
-        if row_base + 3u < m { y[row_base + 3u] = total3; }
-        if row_base + 4u < m { y[row_base + 4u] = total4; }
-        if row_base + 5u < m { y[row_base + 5u] = total5; }
-        if row_base + 6u < m { y[row_base + 6u] = total6; }
-        if row_base + 7u < m { y[row_base + 7u] = total7; }
+        if row_base + 0u < m { y[row_base + 0u] = partials[0u * WG_SIZE]; }
+        if row_base + 1u < m { y[row_base + 1u] = partials[1u * WG_SIZE]; }
+        if row_base + 2u < m { y[row_base + 2u] = partials[2u * WG_SIZE]; }
+        if row_base + 3u < m { y[row_base + 3u] = partials[3u * WG_SIZE]; }
+        if row_base + 4u < m { y[row_base + 4u] = partials[4u * WG_SIZE]; }
+        if row_base + 5u < m { y[row_base + 5u] = partials[5u * WG_SIZE]; }
+        if row_base + 6u < m { y[row_base + 6u] = partials[6u * WG_SIZE]; }
+        if row_base + 7u < m { y[row_base + 7u] = partials[7u * WG_SIZE]; }
     }
 }
 

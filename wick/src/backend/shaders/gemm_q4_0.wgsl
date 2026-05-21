@@ -1,7 +1,7 @@
 // Batched Q4_0 GEMM: output[token, row] = Σ_k weight[row, k] * x[token, k].
 //
 // Each workgroup computes 4 output rows for ONE token. The kernel body
-// reuses gemv_q4_0_fast's half-block dot product with `subgroupAdd`-based
+// reuses gemv_q4_0_fast's half-block dot product with workgroup-memory
 // reduction across the 32-thread workgroup.
 //
 // This is a no-frills batched form — for a real GEMM we'd want a tiled
@@ -27,6 +27,9 @@
 
 const NR: u32 = 4u;
 const NQ: u32 = 16u;
+const WG_SIZE: u32 = 32u;
+
+var<workgroup> partials: array<f32, 128>;
 
 fn half_block_dot(blk_byte: u32, sumy: f32, yl: ptr<function, array<f32, 16>>, il: u32) -> f32 {
     let word_off = blk_byte / 4u;
@@ -123,16 +126,25 @@ fn gemm_q4_0(
         ib += NQ;
     }
 
-    // Subgroup reduction (32 threads = 1 subgroup).
-    let t0 = subgroupAdd(sumf[0]);
-    let t1 = subgroupAdd(sumf[1]);
-    let t2 = subgroupAdd(sumf[2]);
-    let t3 = subgroupAdd(sumf[3]);
+    for (var r = 0u; r < NR; r += 1u) {
+        partials[r * WG_SIZE + tid] = sumf[r];
+    }
+    workgroupBarrier();
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride / 2u) {
+        if tid < stride {
+            for (var r = 0u; r < NR; r += 1u) {
+                let idx = r * WG_SIZE + tid;
+                partials[idx] += partials[idx + stride];
+            }
+        }
+        workgroupBarrier();
+    }
+
     if tid == 0u {
         let y_base = token * y_stride;
-        if r0 + 0u < m { y[y_base + r0 + 0u] = t0; }
-        if r0 + 1u < m { y[y_base + r0 + 1u] = t1; }
-        if r0 + 2u < m { y[y_base + r0 + 2u] = t2; }
-        if r0 + 3u < m { y[y_base + r0 + 3u] = t3; }
+        if r0 + 0u < m { y[y_base + r0 + 0u] = partials[0u * WG_SIZE]; }
+        if r0 + 1u < m { y[y_base + r0 + 1u] = partials[1u * WG_SIZE]; }
+        if r0 + 2u < m { y[y_base + r0 + 2u] = partials[2u * WG_SIZE]; }
+        if r0 + 3u < m { y[y_base + r0 + 3u] = partials[3u * WG_SIZE]; }
     }
 }

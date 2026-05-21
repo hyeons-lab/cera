@@ -1,6 +1,6 @@
 // F32 GEMV: y[m] = A[m, k] × x[k]
 //
-// 8 rows per workgroup, 32 threads (1 subgroup). x is loaded once per WG
+// 8 rows per workgroup, 32 threads. x is loaded once per WG
 // and reused across 8 rows — 8× less x bandwidth than 1-row-per-WG.
 //
 // Dispatch: (ceil(m/8), 1, 1) workgroups
@@ -13,6 +13,9 @@
 #include "common_decls.tmpl"
 
 const NR: u32 = 8u;
+const WG_SIZE: u32 = 32u;
+
+var<workgroup> partials: array<f32, 256>;
 
 @compute @workgroup_size(32, 1, 1)
 fn gemv_f32(
@@ -39,11 +42,27 @@ fn gemv_f32(
         col += 32u;
     }
 
-    // Subgroup reduction.
+    // Workgroup reduction. This is correct on adapters whose subgroups are
+    // narrower than the 32-thread workgroup.
     for (var r = 0u; r < NR; r += 1u) {
-        let total = subgroupAdd(sums[r]);
-        if tid == 0u && r0 + r < m {
-            y[r0 + r] = total;
+        partials[r * WG_SIZE + tid] = sums[r];
+    }
+    workgroupBarrier();
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride / 2u) {
+        if tid < stride {
+            for (var r = 0u; r < NR; r += 1u) {
+                let idx = r * WG_SIZE + tid;
+                partials[idx] += partials[idx + stride];
+            }
+        }
+        workgroupBarrier();
+    }
+
+    if tid == 0u {
+        for (var r = 0u; r < NR; r += 1u) {
+            if r0 + r < m {
+                y[r0 + r] = partials[r * WG_SIZE];
+            }
         }
     }
 }
