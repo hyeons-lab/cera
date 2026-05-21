@@ -20,6 +20,10 @@
 @group(0) @binding(3) var<storage, read> params: vec2<u32>;
 
 const ROWS_PER_WG: u32 = 8u;
+const BLOCKS_PER_WG: u32 = 32u;
+const QK: u32 = 32u;
+
+var<workgroup> x_tiles: array<f32, 1024>;
 
 @compute @workgroup_size(32, 1, 1)
 fn gemv_q8_0(
@@ -39,23 +43,31 @@ fn gemv_q8_0(
         sums[r] = 0.0;
     }
 
-    var bi = tid;
-    while bi < nb {
-        let col_base = bi * 32u;
+    var block_base = 0u;
+    while block_base < nb {
+        let blocks_this_group = min(BLOCKS_PER_WG, nb - block_base);
+        let x_count = blocks_this_group * QK;
 
-        var xl: array<f32, 32>;
-        for (var i = 0u; i < 32u; i += 1u) {
-            xl[i] = x[col_base + i];
+        for (var i = tid; i < x_count; i += BLOCKS_PER_WG) {
+            let block = i / QK;
+            let elem = i % QK;
+            x_tiles[i] = x[(block_base + block) * QK + elem];
         }
+        workgroupBarrier();
 
-        for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
-            let row = row_base + r;
-            if row < m {
-                sums[r] += process_block_q8_0(row, bi, row_bytes, &xl);
+        let bi = block_base + tid;
+        if tid < blocks_this_group {
+            let x_base = tid * QK;
+            for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
+                let row = row_base + r;
+                if row < m {
+                    sums[r] += process_block_q8_0_shared(row, bi, row_bytes, &x_tiles, x_base);
+                }
             }
         }
 
-        bi += 32u;
+        workgroupBarrier();
+        block_base += BLOCKS_PER_WG;
     }
 
     for (var r = 0u; r < ROWS_PER_WG; r += 1u) {

@@ -114,6 +114,29 @@ fn process_block_q8_0(
 
     return sum * scale;
 }
+
+fn process_block_q8_0_shared(
+    row: u32,
+    bi: u32,
+    row_bytes: u32,
+    xl: ptr<workgroup, array<f32, 1024>>,
+    x_base: u32,
+) -> f32 {
+    let block_byte = row * row_bytes + bi * 34u;
+    let scale_bits = get_u32_at(block_byte) & 0xFFFFu;
+    let scale = unpack2x16float(scale_bits).x;
+
+    var sum = 0.0;
+    for (var i = 0u; i < 32u; i += 4u) {
+        let packed = get_u32_at(block_byte + 2u + i);
+        sum += f32(bitcast<i32>((packed & 0x000000FFu) << 24u) >> 24u) * (*xl)[x_base + i + 0u];
+        sum += f32(bitcast<i32>((packed & 0x0000FF00u) << 16u) >> 24u) * (*xl)[x_base + i + 1u];
+        sum += f32(bitcast<i32>((packed & 0x00FF0000u) << 8u) >> 24u) * (*xl)[x_base + i + 2u];
+        sum += f32(bitcast<i32>(packed & 0xFF000000u) >> 24u) * (*xl)[x_base + i + 3u];
+    }
+
+    return sum * scale;
+}
 #endif
 
 #endif // COMMON_DECLS_TMPL
