@@ -1,5 +1,6 @@
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -104,22 +105,30 @@ impl ModalitySink for ChatSink<'_> {
 #[derive(Debug, Default)]
 struct CliDownloadProgress {
     last_url: Mutex<Option<String>>,
-    /// `true` once `on_progress` has been called at least once. Used by
-    /// the caller to decide whether to emit a trailing newline after the
-    /// resolve — cache hits never call back, so an unconditional newline
-    /// would leak a blank line on every silent resolve.
-    printed_any: AtomicBool,
 }
 
 impl CliDownloadProgress {
-    fn printed_any(&self) -> bool {
-        self.printed_any.load(Ordering::Relaxed)
+    fn reset(&self) {
+        let mut guard = self
+            .last_url
+            .lock()
+            .expect("CliDownloadProgress lock poisoned");
+        *guard = None;
+    }
+
+    fn finish_line(&self) {
+        let mut guard = self
+            .last_url
+            .lock()
+            .expect("CliDownloadProgress lock poisoned");
+        if guard.take().is_some() {
+            eprintln!();
+        }
     }
 }
 
 impl wick::bundle::DownloadProgress for CliDownloadProgress {
     fn on_progress(&self, url: &str, bytes: u64, total: Option<u64>) {
-        self.printed_any.store(true, Ordering::Relaxed);
         // URL transition → seal the prior line with a newline so it stays
         // legible after the next file's progress overwrites the position.
         {
@@ -561,6 +570,57 @@ enum Command {
         #[arg(long)]
         quants: bool,
     },
+
+    /// Download LeapBundles manifests and model files without loading them.
+    ///
+    /// Accepts one or more `ID:QUANT` pairs. Bare bundle IDs are normalized
+    /// the same way as `run` / `chat` / `bench`, so both
+    /// `LFM2.5-350M:Q4_0` and `LFM2.5-350M-GGUF:Q4_0` are valid.
+    DownloadBundles {
+        /// Bundle and quant pair to download, shaped `ID:QUANT`.
+        /// Repeat the flag to prefetch a spread of models:
+        /// `--bundle LFM2.5-350M:Q4_0 --bundle LFM2-700M:Q8_0`.
+        #[arg(long = "bundle", value_name = "ID:QUANT", required = true)]
+        bundles: Vec<BundleQuantPair>,
+
+        /// Cache root for downloads. Default: `$HOME/.cache/wick`.
+        #[arg(long)]
+        cache_dir: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BundleQuantPair {
+    bundle_id: String,
+    quant: String,
+}
+
+impl FromStr for BundleQuantPair {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let (bundle_id, quant) = s
+            .split_once(':')
+            .ok_or_else(|| "expected ID:QUANT, for example LFM2.5-350M:Q4_0".to_string())?;
+        let bundle_id = bundle_id.trim();
+        let quant = quant.trim();
+        if bundle_id.is_empty() {
+            return Err("bundle id before `:` must not be empty".to_string());
+        }
+        if quant.is_empty() {
+            return Err("quant after `:` must not be empty".to_string());
+        }
+        Ok(Self {
+            bundle_id: bundle_id.to_string(),
+            quant: quant.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for BundleQuantPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.bundle_id, self.quant)
+    }
 }
 
 /// Load a `WickEngine` from a path that may be a bare `.gguf`, a `.json`
@@ -614,6 +674,66 @@ fn normalize_bundle_id(input: &str) -> String {
 /// just display verbatim).
 fn display_bundle_id(name: &str) -> &str {
     name.strip_suffix(LEAP_BUNDLE_GGUF_SUFFIX).unwrap_or(name)
+}
+
+fn strip_file_scheme(s: &str) -> Option<&str> {
+    if s.len() >= 7 && s[..7].eq_ignore_ascii_case("file://") {
+        Some(&s[7..])
+    } else {
+        None
+    }
+}
+
+fn resolve_manifest_file_for_download(
+    repo: &wick::bundle::BundleRepo,
+    progress: &CliDownloadProgress,
+    value: &str,
+    manifest_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    if image_source::looks_like_url(value) {
+        let result = repo.resolve_url(value, None);
+        progress.finish_line();
+        return Ok(result?);
+    }
+    if let Some(rest) = strip_file_scheme(value) {
+        anyhow::bail!(
+            "manifest references `file://` URI `{value}`; pass the local path directly, e.g. `{rest}`"
+        );
+    }
+    let path = Path::new(value);
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else if let Some(dir) = manifest_dir {
+        Ok(dir.join(path))
+    } else {
+        Ok(path.to_path_buf())
+    }
+}
+
+fn download_bundle_pair(
+    repo: &wick::bundle::BundleRepo,
+    pair: &BundleQuantPair,
+    progress: &CliDownloadProgress,
+) -> Result<()> {
+    let normalized = normalize_bundle_id(&pair.bundle_id);
+    let manifest_url = wick::bundle::leap_bundles_manifest_url(&normalized, &pair.quant)?;
+    eprintln!("Resolving bundle `{normalized}` (quant `{}`)", pair.quant);
+    let manifest_result = repo.resolve_url(&manifest_url, None);
+    progress.finish_line();
+    let manifest_path =
+        manifest_result.with_context(|| format!("downloading manifest `{manifest_url}`"))?;
+    let manifest = wick::manifest::Manifest::from_file(&manifest_path)?;
+    let manifest_dir = manifest_path.parent();
+    eprintln!("  manifest: {}", manifest_path.display());
+    for (role, value) in manifest.files_in_order() {
+        let path = resolve_manifest_file_for_download(repo, progress, value, manifest_dir)
+            .with_context(|| {
+                format!("resolving `{role}` file for `{normalized}:{}`", pair.quant)
+            })?;
+        eprintln!("  {role}: {}", path.display());
+    }
+    progress.finish_line();
+    Ok(())
 }
 
 /// Write the chat history to `path` as a plain-text transcript:
@@ -839,9 +959,9 @@ fn load_engine_from_spec(
                 "Resolving bundle `{id}` (quant `{quant}`) into cache `{}`…",
                 cache_dir.display()
             );
-            // Concrete `Arc<CliDownloadProgress>` first so we can check
-            // `printed_any` after the resolve; coerce to `Arc<dyn ...>`
-            // only at the BundleRepo call site.
+            // Concrete `Arc<CliDownloadProgress>` first so we can seal the
+            // progress line after the resolve; coerce to `Arc<dyn ...>` only
+            // at the BundleRepo call site.
             let progress = Arc::new(CliDownloadProgress::default());
             let repo = wick::bundle::BundleRepo::with_progress(
                 cache_dir,
@@ -856,13 +976,7 @@ fn load_engine_from_spec(
                     bundle_repo: Some(repo),
                 },
             )?;
-            // Seal the final progress line — but only if any progress
-            // actually printed. Cache hits resolve without firing the
-            // callback, and an unconditional newline would leak a blank
-            // line on every silent resolve.
-            if progress.printed_any() {
-                eprintln!();
-            }
+            progress.finish_line();
             engine
         }
     };
@@ -1845,6 +1959,33 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::DownloadBundles { bundles, cache_dir } => {
+            let cache = cache_dir
+                .map(PathBuf::from)
+                .unwrap_or_else(default_cache_dir);
+            eprintln!("Cache: {}", cache.display());
+            let progress = Arc::new(CliDownloadProgress::default());
+            let repo = wick::bundle::BundleRepo::with_progress(
+                cache,
+                progress.clone() as Arc<dyn wick::bundle::DownloadProgress>,
+            );
+            let mut failures = Vec::new();
+            for pair in &bundles {
+                progress.reset();
+                if let Err(err) = download_bundle_pair(&repo, pair, &progress) {
+                    progress.finish_line();
+                    eprintln!("error: {pair}: {err:#}");
+                    failures.push(pair.to_string());
+                }
+            }
+            if !failures.is_empty() {
+                anyhow::bail!(
+                    "failed to download {} bundle(s): {}",
+                    failures.len(),
+                    failures.join(", ")
+                );
+            }
+        }
         Command::Chat {
             model,
             bundle_id,
@@ -2715,8 +2856,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        Cli, Command, display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono, resample_linear,
-        resolve_engine, simulate_truncate_oldest_turn_pairs, split_at_marker,
+        BundleQuantPair, Cli, Command, display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono,
+        resample_linear, resolve_engine, simulate_truncate_oldest_turn_pairs, split_at_marker,
         truncate_oldest_turn_pair, write_transcript, write_wav,
     };
     use clap::Parser;
@@ -3197,6 +3338,52 @@ mod tests {
             r.is_err(),
             "expected `bench --model` + `--bundle-id` to be rejected by clap"
         );
+    }
+
+    #[test]
+    fn download_bundles_parses_repeated_pairs() {
+        let cli = Cli::try_parse_from([
+            "wick",
+            "download-bundles",
+            "--bundle",
+            "LFM2.5-350M:Q4_0",
+            "--bundle",
+            "LFM2-700M-GGUF:Q8_0",
+            "--cache-dir",
+            "/tmp/wick-cache",
+        ])
+        .expect("download-bundles should parse repeated ID:QUANT pairs");
+
+        match cli.command {
+            Command::DownloadBundles { bundles, cache_dir } => {
+                assert_eq!(
+                    bundles,
+                    vec![
+                        BundleQuantPair {
+                            bundle_id: "LFM2.5-350M".into(),
+                            quant: "Q4_0".into(),
+                        },
+                        BundleQuantPair {
+                            bundle_id: "LFM2-700M-GGUF".into(),
+                            quant: "Q8_0".into(),
+                        },
+                    ]
+                );
+                assert_eq!(cache_dir.as_deref(), Some("/tmp/wick-cache"));
+            }
+            _ => panic!("expected DownloadBundles command"),
+        }
+    }
+
+    #[test]
+    fn download_bundles_rejects_malformed_pair() {
+        for arg in ["LFM2.5-350M", ":Q4_0", "LFM2.5-350M:"] {
+            let r = Cli::try_parse_from(["wick", "download-bundles", "--bundle", arg]);
+            assert!(
+                r.is_err(),
+                "expected malformed download pair `{arg}` to be rejected"
+            );
+        }
     }
 
     /// `resolve_engine` with no source flags errors out before
