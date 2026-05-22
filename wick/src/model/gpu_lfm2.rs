@@ -230,7 +230,7 @@ pub struct GpuLfm2Model {
     per_head_norm_params: wgpu::Buffer,      // [head_dim, eps_bits, 0, 0]
     rope_params: wgpu::Buffer, // [pos, n_heads, n_kv_heads, head_dim, theta_bits] — updated per token
     attn_params: wgpu::Buffer, // [n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale, 0, 0] — updated per token
-    gemv_f32_tile_params: Vec<wgpu::Buffer>, // [rows, k] per output-projection tile
+    gemv_f32_tile_params: Vec<wgpu::Buffer>, // [rows, k, row_base, 0] per output-projection tile
     // Conv scratch
     conv_proj_buf: wgpu::Buffer, // [3 × hidden_size]
     conv_gate_buf: wgpu::Buffer, // [hidden_size] — fused conv writes here, out_proj reads
@@ -405,7 +405,12 @@ impl GpuLfm2Model {
         let embedding_f32 = emb_tensor.to_f32_vec();
         let embedding = ctx.upload_f32(&embedding_f32, "token_embd.weight");
         let embedding_params = ctx.upload_storage(
-            bytemuck::cast_slice(&[config.vocab_size as u32, config.hidden_size as u32]),
+            bytemuck::cast_slice(&[
+                config.vocab_size as u32,
+                config.hidden_size as u32,
+                0u32,
+                0u32,
+            ]),
             "emb_params",
         );
         let output_norm = ctx.upload_f32(cpu_model.output_norm_weight(), "output_norm");
@@ -592,7 +597,7 @@ impl GpuLfm2Model {
         let mut gemv_f32_tile_params = Vec::with_capacity(gemv_f32_tile_count as usize);
         for i in 0..gemv_f32_tile_count {
             gemv_f32_tile_params
-                .push(ctx.create_storage_rw(2 * 4, &format!("gemv_f32_tile_params.{i}")));
+                .push(ctx.create_storage_rw(4 * 4, &format!("gemv_f32_tile_params.{i}")));
         }
 
         // Argmax I/O buffers. `argmax_params` is uploaded once with
@@ -944,14 +949,15 @@ impl GpuLfm2Model {
         while row_start < m {
             let rows = (m - row_start).min(tile_rows);
             let weight_offset = u64::from(row_start) * row_bytes;
-            let output_offset = u64::from(row_start) * 4;
             let params_buf = self
                 .gemv_f32_tile_params
                 .get(tile_idx)
                 .expect("preallocated f32 GEMV tile params");
-            self.ctx
-                .queue
-                .write_buffer(params_buf, 0, bytemuck::cast_slice(&[rows, k]));
+            self.ctx.queue.write_buffer(
+                params_buf,
+                0,
+                bytemuck::cast_slice(&[rows, k, row_start, 0u32]),
+            );
             let bg = self
                 .ctx
                 .device
@@ -973,11 +979,7 @@ impl GpuLfm2Model {
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: output,
-                                offset: output_offset,
-                                size: wgpu::BufferSize::new(u64::from(rows) * 4),
-                            }),
+                            resource: output.as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,

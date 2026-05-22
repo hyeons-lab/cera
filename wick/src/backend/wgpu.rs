@@ -664,7 +664,7 @@ mod tests {
         let a_buf = ctx.upload_f32(&a, "A");
         let x_buf = ctx.upload_f32(&x, "x");
         let y_buf = ctx.create_storage_rw((m as u64) * 4, "y");
-        let params = [m, k];
+        let params = [m, k, 0u32, 0u32];
         let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
         let pipeline = ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32");
@@ -1234,7 +1234,7 @@ mod tests {
         let a_buf = ctx.upload_f32(&a, "A");
         let x_buf = ctx.upload_f32(&x, "x");
         let y_buf = ctx.create_storage_rw((m as u64) * 4, "y");
-        let params = [m, k];
+        let params = [m, k, 0u32, 0u32];
         let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
         let pipeline = ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32");
@@ -1315,7 +1315,7 @@ mod tests {
         let a_buf = ctx.upload_f32(&a, "A");
         let x_buf = ctx.upload_f32(&x, "x");
         let y_buf = ctx.create_storage_rw((m as u64) * 4, "y");
-        let params = [m, k];
+        let params = [m, k, 0u32, 0u32];
         let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
         let pipeline = ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32");
@@ -1764,7 +1764,7 @@ mod tests {
         let a_buf = ctx.upload_storage(&q4_bytes, "A_q4");
         let x_buf = ctx.upload_f32(&x, "x");
         let y_buf = ctx.create_storage_rw((m as u64) * 4, "y");
-        let params = [m, k];
+        let params = [m, k, 0u32, 0u32];
         let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
         let pipeline = ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0", "gemv_q4_0");
@@ -1854,7 +1854,7 @@ mod tests {
         let a_buf = ctx.upload_storage(&q8_bytes, "A_q8");
         let x_buf = ctx.upload_f32(&x, "x");
         let y_buf = ctx.create_storage_rw((m as u64) * 4, "y");
-        let params = [m, k];
+        let params = [m, k, 0u32, 0u32];
         let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
         let pipeline = ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0", "gemv_q8_0");
@@ -2117,7 +2117,7 @@ mod tests {
         ];
 
         let x_buf = ctx.upload_f32(&x, "gemv_dispatch_x");
-        let params = [m, k];
+        let params = [m, k, 0u32, 0u32];
         let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "gemv_dispatch_params");
 
         for case in cases {

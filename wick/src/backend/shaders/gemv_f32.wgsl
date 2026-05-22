@@ -8,7 +8,7 @@
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
-@group(0) @binding(3) var<storage, read> params: vec2<u32>;
+@group(0) @binding(3) var<storage, read> params: vec4<u32>;
 
 #include "common_decls.tmpl"
 
@@ -24,6 +24,7 @@ fn gemv_f32(
 ) {
     let m = params.x;
     let k = params.y;
+    let row_base = params.z;
     let tid = lid.x;
     let r0 = get_wid(wid) * NR;
 
@@ -61,7 +62,7 @@ fn gemv_f32(
     if tid == 0u {
         for (var r = 0u; r < NR; r += 1u) {
             if r0 + r < m {
-                y[r0 + r] = partials[r * WG_SIZE];
+                y[row_base + r0 + r] = partials[r * WG_SIZE];
             }
         }
     }
