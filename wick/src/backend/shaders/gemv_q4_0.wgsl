@@ -52,7 +52,9 @@ fn gemv_q4_0(
         }
 
         for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
-            sums[r] += process_block(row_base + r, bi, row_bytes, &xl);
+            if row_base + r < m {
+                sums[r] += process_block(row_base + r, bi, row_bytes, &xl);
+            }
         }
 
         bi += 32u;

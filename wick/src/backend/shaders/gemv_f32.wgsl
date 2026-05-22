@@ -38,7 +38,9 @@ fn gemv_f32(
     while col < k {
         let xv = x[col];
         for (var r = 0u; r < NR; r += 1u) {
-            sums[r] += a[(r0 + r) * k + col] * xv;
+            if r0 + r < m {
+                sums[r] += a[(r0 + r) * k + col] * xv;
+            }
         }
         col += 32u;
     }

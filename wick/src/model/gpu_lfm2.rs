@@ -69,7 +69,13 @@ fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
+fn lcm_u64(a: u64, b: u64) -> u64 {
+    (a / gcd_u64(a, b)) * b
+}
+
 fn f32_gemv_tile_rows(m: u32, k: u32, max_binding: u64, offset_alignment: u64) -> u32 {
+    const ROWS_PER_WG: u64 = 8;
+
     let row_bytes = u64::from(k) * 4;
     let full_bytes = u64::from(m) * row_bytes;
     if full_bytes <= max_binding {
@@ -86,7 +92,10 @@ fn f32_gemv_tile_rows(m: u32, k: u32, max_binding: u64, offset_alignment: u64) -
 
     let offset_alignment = offset_alignment.max(4);
     let row_alignment = (offset_alignment / gcd_u64(row_bytes, offset_alignment)).max(1) as u32;
-    let tile_rows = if max_rows >= row_alignment {
+    let tile_alignment = lcm_u64(u64::from(row_alignment), ROWS_PER_WG) as u32;
+    let tile_rows = if max_rows >= tile_alignment {
+        max_rows - (max_rows % tile_alignment)
+    } else if max_rows >= row_alignment {
         max_rows - (max_rows % row_alignment)
     } else {
         max_rows
@@ -103,7 +112,7 @@ fn f32_gemv_tile_rows(m: u32, k: u32, max_binding: u64, offset_alignment: u64) -
 /// A weight matrix on GPU — tracks buffer + dtype + pre-allocated params for dispatch.
 struct GpuWeight {
     tensor: GpuTensor,
-    /// Pre-allocated params buffer with [m, k] — eliminates per-dispatch allocation.
+    /// Pre-allocated params buffer with [m, k, row_base, 0] — eliminates per-dispatch allocation.
     params_buf: wgpu::Buffer,
     /// Pre-created bind group for this weight's primary GEMV dispatch.
     /// Created after all scratch buffers are allocated, to avoid per-token
@@ -426,7 +435,7 @@ impl GpuLfm2Model {
                 (ctx.upload_f32(&f32_data, name), DType::F32)
             };
             let params_buf = ctx.upload_storage(
-                bytemuck::cast_slice(&[wref.m as u32, wref.k as u32]),
+                bytemuck::cast_slice(&[wref.m as u32, wref.k as u32, 0u32, 0u32]),
                 &format!("{name}.params"),
             );
             GpuWeight {
