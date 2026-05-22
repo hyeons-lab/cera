@@ -34,15 +34,10 @@ fn gemv_q4_0(
     let nb = k / 32u;
     let row_bytes = nb * 18u;
 
-    // Partial sums for 8 rows
-    var sum0: f32 = 0.0;
-    var sum1: f32 = 0.0;
-    var sum2: f32 = 0.0;
-    var sum3: f32 = 0.0;
-    var sum4: f32 = 0.0;
-    var sum5: f32 = 0.0;
-    var sum6: f32 = 0.0;
-    var sum7: f32 = 0.0;
+    var sums: array<f32, 8>;
+    for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
+        sums[r] = 0.0;
+    }
 
     // Each thread processes blocks in stride-32 pattern
     var bi = tid;
@@ -56,27 +51,16 @@ fn gemv_q4_0(
             xl[i] = x[col_base + i];
         }
 
-        // Process this block for each of the 8 rows
-        sum0 += process_block(row_base + 0u, bi, row_bytes, &xl);
-        sum1 += process_block(row_base + 1u, bi, row_bytes, &xl);
-        sum2 += process_block(row_base + 2u, bi, row_bytes, &xl);
-        sum3 += process_block(row_base + 3u, bi, row_bytes, &xl);
-        sum4 += process_block(row_base + 4u, bi, row_bytes, &xl);
-        sum5 += process_block(row_base + 5u, bi, row_bytes, &xl);
-        sum6 += process_block(row_base + 6u, bi, row_bytes, &xl);
-        sum7 += process_block(row_base + 7u, bi, row_bytes, &xl);
+        for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
+            sums[r] += process_block(row_base + r, bi, row_bytes, &xl);
+        }
 
         bi += 32u;
     }
 
-    partials[0u * WG_SIZE + tid] = sum0;
-    partials[1u * WG_SIZE + tid] = sum1;
-    partials[2u * WG_SIZE + tid] = sum2;
-    partials[3u * WG_SIZE + tid] = sum3;
-    partials[4u * WG_SIZE + tid] = sum4;
-    partials[5u * WG_SIZE + tid] = sum5;
-    partials[6u * WG_SIZE + tid] = sum6;
-    partials[7u * WG_SIZE + tid] = sum7;
+    for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
+        partials[r * WG_SIZE + tid] = sums[r];
+    }
     workgroupBarrier();
     for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride / 2u) {
         if tid < stride {
@@ -89,14 +73,11 @@ fn gemv_q4_0(
     }
 
     if tid == 0u {
-        if row_base + 0u < m { y[row_base + 0u] = partials[0u * WG_SIZE]; }
-        if row_base + 1u < m { y[row_base + 1u] = partials[1u * WG_SIZE]; }
-        if row_base + 2u < m { y[row_base + 2u] = partials[2u * WG_SIZE]; }
-        if row_base + 3u < m { y[row_base + 3u] = partials[3u * WG_SIZE]; }
-        if row_base + 4u < m { y[row_base + 4u] = partials[4u * WG_SIZE]; }
-        if row_base + 5u < m { y[row_base + 5u] = partials[5u * WG_SIZE]; }
-        if row_base + 6u < m { y[row_base + 6u] = partials[6u * WG_SIZE]; }
-        if row_base + 7u < m { y[row_base + 7u] = partials[7u * WG_SIZE]; }
+        for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
+            if row_base + r < m {
+                y[row_base + r] = partials[r * WG_SIZE];
+            }
+        }
     }
 }
 

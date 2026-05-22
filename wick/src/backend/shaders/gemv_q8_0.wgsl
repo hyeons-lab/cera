@@ -15,8 +15,11 @@
 @group(0) @binding(3) var<storage, read> params: vec2<u32>;
 
 const ROWS_PER_WG: u32 = 8u;
+const BLOCKS_PER_WG: u32 = 32u;
+const QK: u32 = 32u;
 const WG_SIZE: u32 = 32u;
 
+var<workgroup> x_tiles: array<f32, 1024>;
 var<workgroup> partials: array<f32, 256>;
 
 @compute @workgroup_size(32, 1, 1)
@@ -37,23 +40,43 @@ fn gemv_q8_0(
         sums[r] = 0.0;
     }
 
-    var bi = tid;
-    while bi < nb {
-        let x_base = bi * 32u;
+    var block_base = 0u;
+    while block_base < nb {
+        let blocks_this_group = min(BLOCKS_PER_WG, nb - block_base);
+        let x_count = blocks_this_group * QK;
 
-        var xl: array<f32, 32>;
-        for (var i = 0u; i < 32u; i += 1u) {
-            xl[i] = x[x_base + i];
+        for (var i = tid; i < x_count; i += BLOCKS_PER_WG) {
+            let block = i / QK;
+            let elem = i % QK;
+            x_tiles[i] = x[(block_base + block) * QK + elem];
         }
+        workgroupBarrier();
 
-        for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
-            let row = row_base + r;
-            if row < m {
-                sums[r] += process_block_q8_0(row, bi, row_bytes, &xl);
+        let bi = block_base + tid;
+        if tid < blocks_this_group {
+            let x_base = tid * QK;
+            for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
+                let row = row_base + r;
+                if row < m {
+                    let block_byte = row * row_bytes + bi * 34u;
+                    let scale_bits = get_u32_at(block_byte) & 0xFFFFu;
+                    let scale = unpack2x16float(scale_bits).x;
+
+                    var sum = 0.0;
+                    for (var i = 0u; i < QK; i += 4u) {
+                        let packed = get_u32_at(block_byte + 2u + i);
+                        sum += f32(bitcast<i32>((packed & 0x000000FFu) << 24u) >> 24u) * x_tiles[x_base + i + 0u];
+                        sum += f32(bitcast<i32>((packed & 0x0000FF00u) << 16u) >> 24u) * x_tiles[x_base + i + 1u];
+                        sum += f32(bitcast<i32>((packed & 0x00FF0000u) << 8u) >> 24u) * x_tiles[x_base + i + 2u];
+                        sum += f32(bitcast<i32>(packed & 0xFF000000u) >> 24u) * x_tiles[x_base + i + 3u];
+                    }
+                    sums[r] += sum * scale;
+                }
             }
         }
 
-        bi += WG_SIZE;
+        workgroupBarrier();
+        block_base += BLOCKS_PER_WG;
     }
 
     for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
