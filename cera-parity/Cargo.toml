@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Parity harness for cera — runs the same prompt through every binding leg and byte-compares token streams against a Rust reference."
+publish = false
 
 [lib]
 # Plain `lib` — future Kotlin-via-JNA / Swift-via-UniFFI legs may want

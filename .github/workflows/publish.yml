@@ -1,0 +1,235 @@
+name: Publish
+
+# Manual release pipeline. Trigger from the Actions tab with the `dry_run`
+# toggle:
+#   - dry_run = true  (default): verifies crate packaging + npm packaging
+#     without uploading anything. Safe to run anytime.
+#   - dry_run = false: publishes all public crates to crates.io, publishes
+#     cera-wasm to npm, builds the `cera` CLI for macOS/Linux/Windows, and
+#     cuts a `v<version>` GitHub release with the binaries attached.
+#
+# Version is read from the `cera` crate (all crates share 0.x in lockstep).
+#
+# Required repository secrets:
+#   - CARGO_REGISTRY_TOKEN : crates.io API token (Publish scope)
+#   - NPM_TOKEN            : npmjs.com automation token for the @hyeonslab scope
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (verify packaging without uploading)'
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  publish-crates:
+    name: Publish crates to crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Determine workspace version (from `cera`)
+        id: version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "cera") | .version')
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "Could not determine cera version" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "cera version: $VERSION"
+
+      # Compile-verify the whole workspace with local path deps before any
+      # packaging. The dry-run packaging below uses --no-verify for downstream
+      # crates (their `cera` dep isn't on the index yet), so this is what
+      # actually guarantees every crate still builds.
+      - name: Verify workspace compiles
+        run: cargo check --workspace
+
+      - name: Publish crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Topological order: `cera` (no internal deps) first, then the three
+          # crates that depend only on `cera`. `cera-parity` is publish=false
+          # (internal cross-language parity harness) and is excluded.
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "=== DRY RUN: packaging only, no upload ==="
+            cargo package -p cera
+            # Downstream crates depend on `cera = "0.1.0"`, which is not on the
+            # index during a dry run — point the dep back at the local path and
+            # skip the verify build's registry resolution.
+            for c in cera-ffi cera-cli cera-wasm; do
+              echo "--- packaging $c ---"
+              cargo package -p "$c" --no-verify \
+                --config "patch.crates-io.cera.path='cera'"
+            done
+            echo "All crates packaged successfully (dry run)."
+            exit 0
+          fi
+
+          echo "=== PUBLISHING TO crates.io ==="
+          echo "Publishing cera..."
+          cargo publish -p cera
+          echo "Waiting for crates.io index propagation..."
+          sleep 30
+
+          # ffi / cli / wasm all depend only on `cera` (now on the index) and
+          # not on each other, so a short courtesy sleep between them is enough.
+          for c in cera-ffi cera-cli cera-wasm; do
+            echo "Publishing $c..."
+            cargo publish -p "$c"
+            sleep 15
+          done
+          echo "All crates published successfully."
+
+  publish-npm:
+    name: Publish cera-wasm to npm
+    needs: publish-crates
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: 'v0.14.0'
+
+      - name: Install binaryen (provides wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Publish the `bundler` target as the canonical `@hyeonslab/cera-wasm`
+      # (the most common consumer shape). The `web` / `nodejs` shapes share the
+      # same package name today; publishing them as distinct npm packages is a
+      # follow-up (would require rewriting package.json.name per target).
+      - name: Build cera-wasm npm package (bundler)
+        run: |
+          wasm-pack build cera-wasm \
+            --target bundler \
+            --release \
+            --scope hyeonslab \
+            --out-dir pkg-bundler
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "=== DRY RUN: npm publish --dry-run ==="
+            npm publish cera-wasm/pkg-bundler --access public --dry-run
+          else
+            npm publish cera-wasm/pkg-bundler --access public
+          fi
+
+  build-cli:
+    name: Build cera CLI (${{ matrix.name }})
+    needs: publish-crates
+    if: ${{ github.event.inputs.dry_run == 'false' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon: ship the batteries-included binary — Accelerate
+          # (AMX) for CPU prefill + the Metal GPU backend, both system-provided.
+          - os: macos-latest
+            name: macos-arm64
+            features: '--features blas,metal'
+            archive: tar
+          - os: ubuntu-latest
+            name: linux-x86_64
+            features: ''
+            archive: tar
+          - os: windows-latest
+            name: windows-x86_64
+            features: ''
+            archive: zip
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build cera
+        run: cargo build --release -p cera-cli --bin cera ${{ matrix.features }}
+
+      - name: Package (tar.gz)
+        if: ${{ matrix.archive == 'tar' }}
+        env:
+          VERSION: ${{ needs.publish-crates.outputs.version }}
+        run: |
+          tar -czf "cera-${{ matrix.name }}-v${VERSION}.tar.gz" -C target/release cera
+
+      - name: Package (zip)
+        if: ${{ matrix.archive == 'zip' }}
+        shell: pwsh
+        run: |
+          $version = "${{ needs.publish-crates.outputs.version }}"
+          Compress-Archive -Path target/release/cera.exe `
+            -DestinationPath "cera-${{ matrix.name }}-v$version.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.name }}
+          path: cera-${{ matrix.name }}-v${{ needs.publish-crates.outputs.version }}.*
+          if-no-files-found: error
+
+  release:
+    name: Tag & GitHub Release
+    needs: [publish-crates, publish-npm, build-cli]
+    if: ${{ github.event.inputs.dry_run == 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Least privilege: only this job creates the tag / release.
+    permissions:
+      contents: write
+    steps:
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Create tag and GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.publish-crates.outputs.version }}
+          name: v${{ needs.publish-crates.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/**/cera-*
