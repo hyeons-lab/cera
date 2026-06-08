@@ -21,10 +21,8 @@
 // uses wid.x directly (no get_wid flattening, since wid.y carries the
 // token axis); the host asserts ceil(m/8) <= 65535.
 //
-// Subgroup invariant: same as gemv_q8_0 — the 32-thread workgroup is
-// finalized with subgroupAdd + a single tid==0 writer, correct only when
-// all 32 lanes share one subgroup. GpuContext enforces
-// min_subgroup_size >= 32 at init.
+// The 32-thread workgroup is finalized with workgroup-memory reduction,
+// so this kernel remains correct when adapters expose narrower subgroups.
 
 @group(0) @binding(0) var<storage, read> a: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
@@ -32,6 +30,9 @@
 @group(0) @binding(3) var<storage, read> params: array<u32, 6>;
 
 const ROWS_PER_WG: u32 = 8u;
+const WG_SIZE: u32 = 32u;
+
+var<workgroup> partials: array<f32, 256>;
 
 @compute @workgroup_size(32, 1, 1)
 fn gemm_q8_0(
@@ -76,9 +77,24 @@ fn gemm_q8_0(
 
     let y_base = token * y_stride;
     for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
-        let total = subgroupAdd(sums[r]);
-        if tid == 0u && row_base + r < m {
-            y[y_base + row_base + r] = total;
+        partials[r * WG_SIZE + tid] = sums[r];
+    }
+    workgroupBarrier();
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride / 2u) {
+        if tid < stride {
+            for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
+                let idx = r * WG_SIZE + tid;
+                partials[idx] += partials[idx + stride];
+            }
+        }
+        workgroupBarrier();
+    }
+
+    if tid == 0u {
+        for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
+            if row_base + r < m {
+                y[y_base + row_base + r] = partials[r * WG_SIZE];
+            }
         }
     }
 }

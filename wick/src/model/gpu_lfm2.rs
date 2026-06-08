@@ -60,10 +60,59 @@ fn build_mul_mat_pipeline(ctx: &GpuContext, label: &str, use_vec: bool) -> wgpu:
     )
 }
 
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+fn lcm_u64(a: u64, b: u64) -> u64 {
+    (a / gcd_u64(a, b)) * b
+}
+
+fn f32_gemv_tile_rows(m: u32, k: u32, max_binding: u64, offset_alignment: u64) -> u32 {
+    const ROWS_PER_WG: u64 = 8;
+
+    let row_bytes = u64::from(k) * 4;
+    let full_bytes = u64::from(m) * row_bytes;
+    if full_bytes <= max_binding {
+        return m;
+    }
+
+    let max_rows = (max_binding / row_bytes) as u32;
+    assert!(
+        max_rows > 0,
+        "GPU max storage binding size {} is too small for one f32 GEMV row of {} bytes",
+        max_binding,
+        row_bytes
+    );
+
+    let offset_alignment = offset_alignment.max(4);
+    let row_alignment = (offset_alignment / gcd_u64(row_bytes, offset_alignment)).max(1) as u32;
+    let tile_alignment = lcm_u64(u64::from(row_alignment), ROWS_PER_WG) as u32;
+    let tile_rows = if max_rows >= tile_alignment {
+        max_rows - (max_rows % tile_alignment)
+    } else if max_rows >= row_alignment {
+        max_rows - (max_rows % row_alignment)
+    } else {
+        max_rows
+    };
+    assert!(
+        tile_rows > 0 && (u64::from(tile_rows) * row_bytes) % offset_alignment == 0,
+        "GPU storage binding alignment {} cannot be satisfied for f32 GEMV rows of {} bytes",
+        offset_alignment,
+        row_bytes
+    );
+    tile_rows
+}
+
 /// A weight matrix on GPU — tracks buffer + dtype + pre-allocated params for dispatch.
 struct GpuWeight {
     tensor: GpuTensor,
-    /// Pre-allocated params buffer with [m, k] — eliminates per-dispatch allocation.
+    /// Pre-allocated params buffer with [m, k, row_base, 0] — eliminates per-dispatch allocation.
     params_buf: wgpu::Buffer,
     /// Pre-created bind group for this weight's primary GEMV dispatch.
     /// Created after all scratch buffers are allocated, to avoid per-token
@@ -183,13 +232,14 @@ pub struct GpuLfm2Model {
     /// (logits_buf, argmax_out_buf, argmax_params), so build it once.
     argmax_bg: wgpu::BindGroup,
     // Pre-allocated shader params (avoids upload_storage per dispatch).
-    rmsnorm_hs_params: wgpu::Buffer,     // [hs, eps_bits, 0, 0]
-    elementwise_hs_params: wgpu::Buffer, // [hs, 0]
-    elementwise_is_params: wgpu::Buffer, // [intermediate_size, 0]
-    conv1d_params: wgpu::Buffer,         // [hs, kernel_size, d_conv, 0]
-    per_head_norm_params: wgpu::Buffer,  // [head_dim, eps_bits, 0, 0]
+    rmsnorm_hs_params: wgpu::Buffer,         // [hs, eps_bits, 0, 0]
+    elementwise_hs_params: wgpu::Buffer,     // [hs, 0]
+    elementwise_is_params: wgpu::Buffer,     // [intermediate_size, 0]
+    conv1d_params: wgpu::Buffer,             // [hs, kernel_size, d_conv, 0]
+    per_head_norm_params: wgpu::Buffer,      // [head_dim, eps_bits, 0, 0]
     rope_params: wgpu::Buffer, // [pos, n_heads, n_kv_heads, head_dim, theta_bits] — updated per token
     attn_params: wgpu::Buffer, // [n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale, 0, 0] — updated per token
+    gemv_f32_tile_params: Vec<wgpu::Buffer>, // [rows, k, row_base, 0] per output-projection tile
     // Conv scratch
     conv_proj_buf: wgpu::Buffer, // [3 × hidden_size]
     conv_gate_buf: wgpu::Buffer, // [hidden_size] — fused conv writes here, out_proj reads
@@ -364,7 +414,12 @@ impl GpuLfm2Model {
         let embedding_f32 = emb_tensor.to_f32_vec();
         let embedding = ctx.upload_f32(&embedding_f32, "token_embd.weight");
         let embedding_params = ctx.upload_storage(
-            bytemuck::cast_slice(&[config.vocab_size as u32, config.hidden_size as u32]),
+            bytemuck::cast_slice(&[
+                config.vocab_size as u32,
+                config.hidden_size as u32,
+                0u32,
+                0u32,
+            ]),
             "emb_params",
         );
         let output_norm = ctx.upload_f32(cpu_model.output_norm_weight(), "output_norm");
@@ -380,7 +435,7 @@ impl GpuLfm2Model {
                 (ctx.upload_f32(&f32_data, name), DType::F32)
             };
             let params_buf = ctx.upload_storage(
-                bytemuck::cast_slice(&[wref.m as u32, wref.k as u32]),
+                bytemuck::cast_slice(&[wref.m as u32, wref.k as u32, 0u32, 0u32]),
                 &format!("{name}.params"),
             );
             GpuWeight {
@@ -541,6 +596,18 @@ impl GpuLfm2Model {
         // rope_params is updated per token via queue.write_buffer — needs COPY_DST.
         let rope_params = ctx.create_storage_rw(5 * 4, "rope_params");
         let attn_params = ctx.create_storage_rw(8 * 4, "attn_params");
+        let gemv_f32_tile_rows = f32_gemv_tile_rows(
+            config.vocab_size as u32,
+            hs as u32,
+            ctx.max_storage_buffer_binding_size,
+            ctx.min_storage_buffer_offset_alignment,
+        );
+        let gemv_f32_tile_count = (config.vocab_size as u32).div_ceil(gemv_f32_tile_rows);
+        let mut gemv_f32_tile_params = Vec::with_capacity(gemv_f32_tile_count as usize);
+        for i in 0..gemv_f32_tile_count {
+            gemv_f32_tile_params
+                .push(ctx.create_storage_rw(4 * 4, &format!("gemv_f32_tile_params.{i}")));
+        }
 
         // Argmax I/O buffers. `argmax_params` is uploaded once with
         // vocab_size; `argmax_out_buf` is a 4-byte sink. Bind group is
@@ -608,6 +675,7 @@ impl GpuLfm2Model {
             per_head_norm_params,
             rope_params,
             attn_params,
+            gemv_f32_tile_params,
             conv_proj_buf,
             conv_gate_buf,
             prefill_batch_buf,
@@ -817,8 +885,15 @@ impl GpuLfm2Model {
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
         m: u32,
-        _k: u32,
+        k: u32,
     ) {
+        let weight_bytes = u64::from(m) * u64::from(k) * 4;
+        let max_binding = self.ctx.max_storage_buffer_binding_size;
+        if weight_bytes > max_binding {
+            self.encode_gemv_f32_tiled(enc, weight, input, output, m, k);
+            return;
+        }
+
         // Use pre-allocated params (m=vocab_size, k=hs are constant).
         let params_buf = &self.embedding_params;
         let bg = self
@@ -854,6 +929,84 @@ impl GpuLfm2Model {
             (groups.min(65535), groups.div_ceil(65535), 1),
             "gemv_f32",
         );
+    }
+
+    /// Encode f32 GEMV in row tiles for adapters with small
+    /// max_storage_buffer_binding_size limits. The tied embedding/output
+    /// projection can exceed those limits even though each row slice is legal.
+    fn encode_gemv_f32_tiled(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        weight: &wgpu::Buffer,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        m: u32,
+        k: u32,
+    ) {
+        let row_bytes = u64::from(k) * 4;
+        let max_binding = self.ctx.max_storage_buffer_binding_size;
+        let tile_rows = f32_gemv_tile_rows(
+            m,
+            k,
+            max_binding,
+            self.ctx.min_storage_buffer_offset_alignment,
+        );
+
+        let layout = self.pipelines.gemv_f32.get_bind_group_layout(0);
+        let mut row_start = 0u32;
+        let mut tile_idx = 0usize;
+        while row_start < m {
+            let rows = (m - row_start).min(tile_rows);
+            let weight_offset = u64::from(row_start) * row_bytes;
+            let params_buf = self
+                .gemv_f32_tile_params
+                .get(tile_idx)
+                .expect("preallocated f32 GEMV tile params");
+            self.ctx.queue.write_buffer(
+                params_buf,
+                0,
+                bytemuck::cast_slice(&[rows, k, row_start, 0u32]),
+            );
+            let bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: weight,
+                                offset: weight_offset,
+                                size: wgpu::BufferSize::new(u64::from(rows) * row_bytes),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: input.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: output.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: params_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+            let groups = rows.div_ceil(8);
+            self.encode(
+                enc,
+                &self.pipelines.gemv_f32,
+                &bg,
+                (groups.min(65535), groups.div_ceil(65535), 1),
+                "gemv_f32_tiled",
+            );
+            row_start += rows;
+            tile_idx += 1;
+        }
     }
 
     fn encode_rmsnorm(

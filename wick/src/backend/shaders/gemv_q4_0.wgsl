@@ -1,7 +1,3 @@
-// NOTE: Uses subgroupAdd without `enable subgroups;` — the directive
-// breaks compilation on macOS wgpu (naga), but the bare builtin works.
-// For non-Apple targets, add `enable subgroups;` or use a workgroup fallback.
-//
 // Q4_0 GEMV: y[m] = dequant(A_q4_0[m, k]) × x[k]
 //
 // Q4_0 block layout (18 bytes per 32 elements):
@@ -10,8 +6,8 @@
 //
 // Strategy: Each workgroup processes 8 output rows simultaneously.
 // This reuses loaded x values across 4 rows, reducing x reads by 4x.
-// 32 threads per workgroup (one subgroup), each thread processes blocks
-// in stride-32 pattern. Subgroup reduction for final sum per row.
+// 32 threads per workgroup, each thread processes blocks in stride-32
+// pattern. Workgroup reduction finalizes one sum per row.
 //
 // Dispatch: (ceil(m / 8), 1, 1) workgroups
 
@@ -21,6 +17,9 @@
 @group(0) @binding(3) var<storage, read> params: vec2<u32>;
 
 const ROWS_PER_WG: u32 = 8u;
+const WG_SIZE: u32 = 32u;
+
+var<workgroup> partials: array<f32, 256>;
 
 @compute @workgroup_size(32, 1, 1)
 fn gemv_q4_0(
@@ -35,15 +34,10 @@ fn gemv_q4_0(
     let nb = k / 32u;
     let row_bytes = nb * 18u;
 
-    // Partial sums for 8 rows
-    var sum0: f32 = 0.0;
-    var sum1: f32 = 0.0;
-    var sum2: f32 = 0.0;
-    var sum3: f32 = 0.0;
-    var sum4: f32 = 0.0;
-    var sum5: f32 = 0.0;
-    var sum6: f32 = 0.0;
-    var sum7: f32 = 0.0;
+    var sums: array<f32, 8>;
+    for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
+        sums[r] = 0.0;
+    }
 
     // Each thread processes blocks in stride-32 pattern
     var bi = tid;
@@ -57,38 +51,35 @@ fn gemv_q4_0(
             xl[i] = x[col_base + i];
         }
 
-        // Process this block for each of the 8 rows
-        sum0 += process_block(row_base + 0u, bi, row_bytes, &xl);
-        sum1 += process_block(row_base + 1u, bi, row_bytes, &xl);
-        sum2 += process_block(row_base + 2u, bi, row_bytes, &xl);
-        sum3 += process_block(row_base + 3u, bi, row_bytes, &xl);
-        sum4 += process_block(row_base + 4u, bi, row_bytes, &xl);
-        sum5 += process_block(row_base + 5u, bi, row_bytes, &xl);
-        sum6 += process_block(row_base + 6u, bi, row_bytes, &xl);
-        sum7 += process_block(row_base + 7u, bi, row_bytes, &xl);
+        for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
+            if row_base + r < m {
+                sums[r] += process_block(row_base + r, bi, row_bytes, &xl);
+            }
+        }
 
         bi += 32u;
     }
 
-    // Subgroup reduction for each row
-    let total0 = subgroupAdd(sum0);
-    let total1 = subgroupAdd(sum1);
-    let total2 = subgroupAdd(sum2);
-    let total3 = subgroupAdd(sum3);
-    let total4 = subgroupAdd(sum4);
-    let total5 = subgroupAdd(sum5);
-    let total6 = subgroupAdd(sum6);
-    let total7 = subgroupAdd(sum7);
+    for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
+        partials[r * WG_SIZE + tid] = sums[r];
+    }
+    workgroupBarrier();
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride / 2u) {
+        if tid < stride {
+            for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
+                let idx = r * WG_SIZE + tid;
+                partials[idx] += partials[idx + stride];
+            }
+        }
+        workgroupBarrier();
+    }
 
     if tid == 0u {
-        if row_base + 0u < m { y[row_base + 0u] = total0; }
-        if row_base + 1u < m { y[row_base + 1u] = total1; }
-        if row_base + 2u < m { y[row_base + 2u] = total2; }
-        if row_base + 3u < m { y[row_base + 3u] = total3; }
-        if row_base + 4u < m { y[row_base + 4u] = total4; }
-        if row_base + 5u < m { y[row_base + 5u] = total5; }
-        if row_base + 6u < m { y[row_base + 6u] = total6; }
-        if row_base + 7u < m { y[row_base + 7u] = total7; }
+        for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
+            if row_base + r < m {
+                y[row_base + r] = partials[r * WG_SIZE];
+            }
+        }
     }
 }
 
