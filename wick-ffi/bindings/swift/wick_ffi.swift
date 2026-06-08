@@ -2148,6 +2148,17 @@ public protocol WickEngineProtocol: AnyObject, Sendable {
     func specialTokenId(name: String)  -> UInt32?
     
     /**
+     * Transcribe mono `f32` PCM audio (normalized to roughly `[-1.0, 1.0]`) to text using the
+     * model's trained `"Perform ASR."` chat mode. `sample_rate` must match the audio encoder's
+     * expected rate (resample beforehand if needed). Requires an audio-capable bundle; a text-only
+     * model returns an [`FfiError`] for unsupported modality.
+     *
+     * Blocking: runs a full prefill + greedy decode. Foreign async runtimes should wrap the call in
+     * `spawn_blocking` / its equivalent.
+     */
+    func transcribe(pcm: [Float], sampleRate: UInt32) throws  -> String
+    
+    /**
      * Total vocabulary size — the number of distinct token IDs the
      * model can emit. Sourced from the model's config (matches
      * [`ModelMetadata::vocab_size`]) rather than the tokenizer's
@@ -2492,6 +2503,25 @@ open func specialTokenId(name: String) -> UInt32?  {
     uniffi_wick_ffi_fn_method_wickengine_special_token_id(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(name),$0
+    )
+})
+}
+    
+    /**
+     * Transcribe mono `f32` PCM audio (normalized to roughly `[-1.0, 1.0]`) to text using the
+     * model's trained `"Perform ASR."` chat mode. `sample_rate` must match the audio encoder's
+     * expected rate (resample beforehand if needed). Requires an audio-capable bundle; a text-only
+     * model returns an [`FfiError`] for unsupported modality.
+     *
+     * Blocking: runs a full prefill + greedy decode. Foreign async runtimes should wrap the call in
+     * `spawn_blocking` / its equivalent.
+     */
+open func transcribe(pcm: [Float], sampleRate: UInt32)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_wick_ffi_fn_method_wickengine_transcribe(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceFloat.lower(pcm),
+        FfiConverterUInt32.lower(sampleRate),$0
     )
 })
 }
@@ -4040,6 +4070,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_wickengine_special_token_id() != 49161) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_wick_ffi_checksum_method_wickengine_transcribe() != 59537) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_wick_ffi_checksum_method_wickengine_vocab_size() != 46634) {

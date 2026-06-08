@@ -519,6 +519,91 @@ impl WickEngine {
         session
     }
 
+    /// Transcribe mono `f32` PCM audio to text using the model's trained `"Perform ASR."` chat mode.
+    ///
+    /// Renders the chat template with a system `"Perform ASR."` turn and an audio-marker placeholder
+    /// in the user turn, prefills `prefix tokens → audio → suffix tokens`, then greedily decodes and
+    /// returns the trimmed transcription. Requires an audio-capable bundle (one whose mmproj / audio
+    /// encoder is attached); on a text-only model `append_audio` returns
+    /// [`WickError::UnsupportedModality`].
+    ///
+    /// `sample_rate` must match the audio encoder's expected rate (resample beforehand if needed).
+    pub fn transcribe(&self, pcm: &[f32], sample_rate: u32) -> Result<String, WickError> {
+        use crate::session::{FinishReason, GenerateOpts, ModalitySink};
+        use crate::tokenizer::{ChatMessage, apply_chat_template};
+
+        let tok = self.tokenizer();
+        // The audio insertion point is marked with a reserved special token, split out after render.
+        let (marker_id, marker_name) = [
+            "<|reserved_4|>",
+            "<|reserved_5|>",
+            "<|reserved_6|>",
+            "<|reserved_7|>",
+        ]
+        .into_iter()
+        .find_map(|name| tok.special_token_id(name).map(|id| (id, name)))
+        .ok_or_else(|| {
+            WickError::Backend(
+                "no audio marker special token (<|reserved_4|>..7) in tokenizer".to_string(),
+            )
+        })?;
+
+        let messages = [
+            ChatMessage {
+                role: "system".to_string(),
+                content: "Perform ASR.".to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: marker_name.to_string(),
+            },
+        ];
+        let formatted = apply_chat_template(tok, &messages, true)
+            .map_err(|e| WickError::Backend(format!("chat template render failed: {e}")))?;
+        let toks = tok.encode(&formatted);
+
+        let marker_positions: Vec<usize> = toks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| if *t == marker_id { Some(i) } else { None })
+            .collect();
+        if marker_positions.len() != 1 {
+            return Err(WickError::Backend(format!(
+                "expected exactly one audio marker `{marker_name}` in rendered prompt, found {}",
+                marker_positions.len()
+            )));
+        }
+        let split = marker_positions[0];
+
+        let mut session = self.new_session(SessionConfig::default());
+        if split > 0 {
+            session.append_tokens(&toks[..split])?;
+        }
+        session.append_audio(pcm, sample_rate)?;
+        if split + 1 < toks.len() {
+            session.append_tokens(&toks[split + 1..])?;
+        }
+
+        struct CollectSink {
+            tokens: Vec<u32>,
+        }
+        impl ModalitySink for CollectSink {
+            fn on_text_tokens(&mut self, tokens: &[u32]) {
+                self.tokens.extend_from_slice(tokens);
+            }
+            fn on_done(&mut self, _reason: FinishReason) {}
+        }
+
+        let mut sink = CollectSink { tokens: Vec::new() };
+        let opts = GenerateOpts {
+            max_tokens: 64,
+            temperature: 0.0,
+            ..GenerateOpts::default()
+        };
+        session.generate(&opts, &mut sink)?;
+        Ok(tok.decode(&sink.tokens).trim().to_string())
+    }
+
     /// Borrow the eagerly-loaded audio encoder, if any. Most callers
     /// shouldn't need this — [`Self::new_session`] auto-attaches the
     /// encoder to every session — but the audio output pipeline and

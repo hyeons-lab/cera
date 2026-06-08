@@ -1586,6 +1586,14 @@ fn main() -> Result<()> {
                     engine.model().config().hidden_size
                 );
 
+                // ASR fast path: route the model's trained transcription mode through the shared
+                // `WickEngine::transcribe` helper (also exposed via wick-ffi for Kotlin/Swift).
+                if system.as_deref() == Some("Perform ASR.") {
+                    let text = engine.transcribe(&pcm, sr)?;
+                    println!("{text}");
+                    return Ok(());
+                }
+
                 let mut session = engine.new_session(wick::SessionConfig {
                     kv_compression,
                     seed: None,
