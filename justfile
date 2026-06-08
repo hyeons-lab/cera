@@ -222,8 +222,8 @@ swift-smoke:
 # `just wasm-web` for direct browser ESM (`<script type="module">`)
 # or `just wasm-node` for CommonJS Node consumers.
 #
-# `--scope hyeonslab` makes the generated `package.json.name`
-# `@hyeonslab/cera-wasm` so a published artifact lands under the
+# `--scope hyeons-lab` makes the generated `package.json.name`
+# `@hyeons-lab/cera-wasm` so a published artifact lands under the
 # right npm scope. The publish workflow itself is a follow-up PR;
 # this just locks the name.
 #
@@ -238,7 +238,7 @@ swift-smoke:
 # `[package.metadata.wasm-pack.profile.release]` so this recipe and the
 # CI `cera-wasm-pack` job produce byte-identical output.
 wasm:
-    wasm-pack build cera-wasm --target bundler --release --scope hyeonslab --out-dir pkg-bundler
+    wasm-pack build cera-wasm --target bundler --release --scope hyeons-lab --out-dir pkg-bundler
     @echo "--- cera-wasm/pkg-bundler/ ---"
     @ls -lh cera-wasm/pkg-bundler/
 
@@ -247,16 +247,16 @@ wasm:
 # and `await init()` once before calling exports. Right shape for
 # `<script type="module">` and bundler-less workflows.
 wasm-web:
-    wasm-pack build cera-wasm --target web --release --scope hyeonslab --out-dir pkg-web
+    wasm-pack build cera-wasm --target web --release --scope hyeons-lab --out-dir pkg-web
     @echo "--- cera-wasm/pkg-web/ ---"
     @ls -lh cera-wasm/pkg-web/
 
 # Build the `--target nodejs` variant — CommonJS module that Node
-# consumers `require('@hyeonslab/cera-wasm')` directly without the
+# consumers `require('@hyeons-lab/cera-wasm')` directly without the
 # experimental-wasm-modules dance. Right shape for Node CLI tools
 # / scripts that prefer CommonJS or are stuck on older Node.
 wasm-node:
-    wasm-pack build cera-wasm --target nodejs --release --scope hyeonslab --out-dir pkg-nodejs
+    wasm-pack build cera-wasm --target nodejs --release --scope hyeons-lab --out-dir pkg-nodejs
     @echo "--- cera-wasm/pkg-nodejs/ ---"
     @ls -lh cera-wasm/pkg-nodejs/
 
@@ -334,7 +334,7 @@ wasm-web-mt:
     RUSTFLAGS="{{WASM_MT_RUSTFLAGS}}" \
     wasm-pack build cera-wasm \
         --target web --release \
-        --scope hyeonslab --out-dir pkg-web-mt \
+        --scope hyeons-lab --out-dir pkg-web-mt \
         -- --features parallel \
         -Z build-std=panic_abort,std
     @echo "--- cera-wasm/pkg-web-mt/ ---"
@@ -347,7 +347,7 @@ wasm-node-mt:
     RUSTFLAGS="{{WASM_MT_RUSTFLAGS}}" \
     wasm-pack build cera-wasm \
         --target nodejs --release \
-        --scope hyeonslab --out-dir pkg-nodejs-mt \
+        --scope hyeons-lab --out-dir pkg-nodejs-mt \
         -- --features parallel \
         -Z build-std=panic_abort,std
     @echo "--- cera-wasm/pkg-nodejs-mt/ ---"

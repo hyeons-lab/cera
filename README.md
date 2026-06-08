@@ -294,7 +294,7 @@ See `cera/src/turboquant.rs` for the implementation and `cera/src/kv_cache.rs` f
 - **Bench harness** — `cera bench` with p10/p50/p90/stddev for reproducible A/B comparisons
 - **Chat mode** with Jinja2 chat template rendering
 - **Single static binary**
-- **Multi-target FFI bindings** — JVM (Android), Apple platforms (iOS / macOS XCFramework), and browser / Node (`@hyeonslab/cera-wasm`) all driven from the same Rust core via `cera-ffi` (UniFFI) and `cera-wasm` (`wasm-bindgen`).
+- **Multi-target FFI bindings** — JVM (Android), Apple platforms (iOS / macOS XCFramework), and browser / Node (`@hyeons-lab/cera-wasm`) all driven from the same Rust core via `cera-ffi` (UniFFI) and `cera-wasm` (`wasm-bindgen`).
 
 ## Build
 
@@ -332,7 +332,7 @@ Five-crate workspace:
 - **`cera`** — core library (GGUF parsing, quantization, compute backends, models, tokenizer)
 - **`cera-cli`** — CLI binary (clap, dispatches to `cera`)
 - **`cera-ffi`** — UniFFI bindings for foreign-language consumers (Kotlin, Swift, Python, …). See [`cera-ffi/README.md`](cera-ffi/README.md) for scope + roadmap.
-- **`cera-wasm`** — `wasm-bindgen` browser / Node bindings (`@hyeonslab/cera-wasm` shape). See [`cera-wasm/README.md`](cera-wasm/README.md) for usage + worker / cancellation patterns.
+- **`cera-wasm`** — `wasm-bindgen` browser / Node bindings (`@hyeons-lab/cera-wasm` shape). See [`cera-wasm/README.md`](cera-wasm/README.md) for usage + worker / cancellation patterns.
 - **`cera-parity`** — cross-binding parity harness that runs the same prompt through `cera`, `cera-ffi` (JNA / Swift), and reports drift. See [`cera-parity/README.md`](cera-parity/README.md).
 
 ### Module layout

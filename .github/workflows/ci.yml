@@ -104,7 +104,7 @@ jobs:
     #   - `web`: direct browser ESM that callers `init()` themselves
     #     before use. Right shape for `<script type="module">` and
     #     loaders without bundler-side wasm support.
-    #   - `nodejs`: CommonJS for Node — `require('@hyeonslab/cera-wasm')`
+    #   - `nodejs`: CommonJS for Node — `require('@hyeons-lab/cera-wasm')`
     #     without the experimental-wasm-modules dance.
     #
     # Three artifacts are uploaded so reviewers / downstream devs can
@@ -137,15 +137,15 @@ jobs:
       - name: Install binaryen (provides wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
       - name: Build cera-wasm npm package
-        # `--scope hyeonslab` matches the package name advertised in
-        # cera-wasm/README.md (`@hyeonslab/cera-wasm`). `--out-dir`
+        # `--scope hyeons-lab` matches the package name advertised in
+        # cera-wasm/README.md (`@hyeons-lab/cera-wasm`). `--out-dir`
         # gives each matrix entry its own directory so the artifact
         # uploads don't collide.
         run: |
           wasm-pack build cera-wasm \
             --target ${{ matrix.target }} \
             --release \
-            --scope hyeonslab \
+            --scope hyeons-lab \
             --out-dir pkg-${{ matrix.target }}
       - name: Check .wasm size budget
         # Hard cap on the post-wasm-opt cdylib size. Catches the
@@ -265,7 +265,7 @@ jobs:
           wasm-pack build cera-wasm \
             --target ${{ matrix.target }} \
             --release \
-            --scope hyeonslab \
+            --scope hyeons-lab \
             --out-dir pkg-${{ matrix.target }}-mt \
             -- --features parallel \
             -Z build-std=panic_abort,std

@@ -12,7 +12,7 @@ name: Publish
 #
 # Required repository secrets:
 #   - CARGO_REGISTRY_TOKEN : crates.io API token (Publish scope)
-#   - NPM_TOKEN            : npmjs.com automation token for the @hyeonslab scope
+#   - NPM_TOKEN            : npmjs.com automation token for the @hyeons-lab scope
 
 on:
   workflow_dispatch:
@@ -130,7 +130,7 @@ jobs:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
-      # Publish the `bundler` target as the canonical `@hyeonslab/cera-wasm`
+      # Publish the `bundler` target as the canonical `@hyeons-lab/cera-wasm`
       # (the most common consumer shape). The `web` / `nodejs` shapes share the
       # same package name today; publishing them as distinct npm packages is a
       # follow-up (would require rewriting package.json.name per target).
@@ -139,7 +139,7 @@ jobs:
           wasm-pack build cera-wasm \
             --target bundler \
             --release \
-            --scope hyeonslab \
+            --scope hyeons-lab \
             --out-dir pkg-bundler
 
       - name: Publish to npm

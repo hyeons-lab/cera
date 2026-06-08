@@ -17,7 +17,7 @@
 ## Install
 
 ```sh
-npm install @hyeonslab/cera-wasm  # not yet published
+npm install @hyeons-lab/cera-wasm  # not yet published
 ```
 
 For now, download the artifact matching your consumer shape from
@@ -28,18 +28,18 @@ on `main` — three are produced per build:
 |---|---|---|
 | `cera-wasm-pkg-bundler` | `bundler` | webpack 5+, Vite, Rollup (with wasm plugin), Parcel — the typical app build |
 | `cera-wasm-pkg-web` | `web` | `<script type="module">` direct in the browser, or any bundler-less ESM workflow |
-| `cera-wasm-pkg-nodejs` | `nodejs` | `require('@hyeonslab/cera-wasm')` from CommonJS Node, or older Node without ESM `import` |
+| `cera-wasm-pkg-nodejs` | `nodejs` | `require('@hyeons-lab/cera-wasm')` from CommonJS Node, or older Node without ESM `import` |
 
 ```sh
 npm install /path/to/downloaded/pkg-bundler  # or pkg-web / pkg-nodejs
 ```
 
 > **One npm package, three target shapes:** all three artifacts
-> ship `package.json.name` = `@hyeonslab/cera-wasm` today. The
+> ship `package.json.name` = `@hyeons-lab/cera-wasm` today. The
 > publish workflow (deferred) will resolve the collision before
 > shipping to the registry — likely by publishing each target as
-> a separate scoped package (`@hyeonslab/cera-wasm`,
-> `@hyeonslab/cera-wasm-web`, `@hyeonslab/cera-wasm-nodejs`).
+> a separate scoped package (`@hyeons-lab/cera-wasm`,
+> `@hyeons-lab/cera-wasm-web`, `@hyeons-lab/cera-wasm-nodejs`).
 
 ## Usage
 
@@ -48,13 +48,13 @@ target also needs a one-time `await init()` call before the first
 export — see the
 [wasm-pack docs](https://rustwasm.github.io/docs/wasm-pack/tutorials/npm-browser-packages/getting-started.html)
 for the init pattern. The `nodejs` target does **not** need an
-explicit init: `require('@hyeonslab/cera-wasm')` returns a ready
+explicit init: `require('@hyeons-lab/cera-wasm')` returns a ready
 module (the entry self-loads the wasm via `fs.readFileSync`).
 
 ### Manifest parsing
 
 ```js
-import { ceraVersion, Manifest } from '@hyeonslab/cera-wasm';
+import { ceraVersion, Manifest } from '@hyeons-lab/cera-wasm';
 
 console.log(ceraVersion());  // e.g. "0.1.0"
 
@@ -70,7 +70,7 @@ console.log(manifest.schemaVersion);   // "1.0.0"
 ### Loading a model + tokenizing
 
 ```js
-import { CeraEngine } from '@hyeonslab/cera-wasm';
+import { CeraEngine } from '@hyeons-lab/cera-wasm';
 
 // Fetch the GGUF (use the `modelUrl` from a parsed manifest, or a
 // direct URL).
@@ -134,7 +134,7 @@ engine.free();
 ### Inference (text)
 
 ```js
-import { CeraEngine, SessionConfig, GenerateOpts } from '@hyeonslab/cera-wasm';
+import { CeraEngine, SessionConfig, GenerateOpts } from '@hyeons-lab/cera-wasm';
 
 const engine = CeraEngine.fromGgufBytes(gguf, 2048);
 const tok = engine.tokenizer;
@@ -192,7 +192,7 @@ import {
     SessionConfig,
     GenerateOpts,
     TurboQuantConfig,
-} from '@hyeonslab/cera-wasm';
+} from '@hyeons-lab/cera-wasm';
 
 const cfg = new SessionConfig();
 cfg.seed = 42n;        // BigInt — wasm-bindgen maps Rust u64 to JS BigInt
@@ -242,7 +242,7 @@ session.generate(opts, (toks) => out.push(...toks));
 >
 > ```js
 > // worker.js
-> import { CeraEngine, SessionConfig, GenerateOpts } from '@hyeonslab/cera-wasm';
+> import { CeraEngine, SessionConfig, GenerateOpts } from '@hyeons-lab/cera-wasm';
 > self.onmessage = async (ev) => {
 >     const engine = CeraEngine.fromGgufBytes(ev.data.gguf);
 >     const session = engine.newSession(new SessionConfig());
@@ -373,7 +373,7 @@ Bundlers without native wasm support need a loader plugin; see the
 for webpack / Rollup / Parcel specifics.
 
 For no-bundler workflows (`<script type="module">` directly in the
-browser, or `require('@hyeonslab/cera-wasm')` from CommonJS Node),
+browser, or `require('@hyeons-lab/cera-wasm')` from CommonJS Node),
 download the `cera-wasm-pkg-web` or `cera-wasm-pkg-nodejs` artifact
 instead — see the `Install` section above for the per-target
 table.
@@ -445,7 +445,7 @@ isn't available — wrap the init in an async IIFE (or run the
 snippet from a `.mjs` / `"type": "module"` ESM file):
 
 ```js
-const { initThreadPool, CeraEngine } = require('@hyeonslab/cera-wasm');
+const { initThreadPool, CeraEngine } = require('@hyeons-lab/cera-wasm');
 const os = require('os');
 
 (async () => {
