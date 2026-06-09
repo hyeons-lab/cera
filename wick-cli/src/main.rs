@@ -1255,12 +1255,9 @@ fn resample_linear(samples: &[f32], sr_in: u32, sr_out: u32) -> Vec<f32> {
 /// rendered token stream deterministically; the caller should
 /// drop `--system` to fall back to plain audio-in mode.
 fn pick_audio_marker_token(tok: &BpeTokenizer) -> Result<(u32, &'static str)> {
-    for name in [
-        "<|reserved_4|>",
-        "<|reserved_5|>",
-        "<|reserved_6|>",
-        "<|reserved_7|>",
-    ] {
+    // Candidate list lives in `wick` core so this path and `WickEngine::transcribe`
+    // can't drift apart.
+    for name in WickEngine::AUDIO_MARKER_CANDIDATES {
         if let Some(id) = tok.special_token_id(name) {
             return Ok((id, name));
         }
@@ -1291,29 +1288,14 @@ fn pick_audio_marker_token(tok: &BpeTokenizer) -> Result<(u32, &'static str)> {
 ///   the marker token name, making the insertion point ambiguous.
 ///   Caller should remove that literal.
 fn split_at_marker(tokens: &[u32], marker_id: u32, marker_name: &str) -> Result<usize> {
-    let mut found: Option<usize> = None;
-    let mut count: usize = 0;
-    for (i, &t) in tokens.iter().enumerate() {
-        if t == marker_id {
-            count += 1;
-            if found.is_none() {
-                found = Some(i);
-            }
-        }
-    }
-    match (count, found) {
-        (1, Some(idx)) => Ok(idx),
-        (0, _) => anyhow::bail!(
-            "audio marker token `{marker_name}` (id {marker_id}) not found in rendered \
-             chat-template tokens — the template may have stripped or escaped the \
-             placeholder. Drop `--system` to fall back to plain audio-in."
-        ),
-        (n, _) => anyhow::bail!(
-            "audio marker token `{marker_name}` (id {marker_id}) appears {n} times in \
-             rendered tokens; expected exactly one insertion point. Check that \
-             `--prompt` and `--system` text don't contain literal `{marker_name}`."
-        ),
-    }
+    // Delegates to the shared core scanner so the marker-splitting logic lives in
+    // one place. Append CLI-specific recovery hints (flag names) to the core error.
+    WickEngine::split_tokens_at_marker(tokens, marker_id, marker_name).map_err(|e| {
+        anyhow::anyhow!(
+            "{e}. Drop `--system` to fall back to plain audio-in, or remove any literal \
+             marker text from `--prompt` / `--system`."
+        )
+    })
 }
 
 /// Write PCM float32 samples as a WAV file (16-bit PCM, mono).
@@ -1585,6 +1567,24 @@ fn main() -> Result<()> {
                     engine.model().config().n_layers,
                     engine.model().config().hidden_size
                 );
+
+                // ASR fast path: dogfood the shared `WickEngine::transcribe` helper (also exposed
+                // via wick-ffi for Kotlin/Swift). `transcribe` is a fixed greedy decode with the
+                // default token budget (256) and no `--prompt`/KV-compression knobs — so only take
+                // it when the user's flags are compatible with that exact behavior. Otherwise fall
+                // through to the chat-template flow below, which honors `--max-tokens`,
+                // `--temperature`, `--kv-cache-keys`, and appends `--prompt` before the marker.
+                // (256 / "f32" mirror the `Run` clap defaults; `transcribe` uses the same budget.)
+                let prompt_is_empty = prompt.as_deref().unwrap_or("").trim().is_empty();
+                let transcribe_compatible = prompt_is_empty
+                    && temperature <= 0.0
+                    && max_tokens == 256
+                    && kv_cache_keys == "f32";
+                if system.as_deref() == Some("Perform ASR.") && transcribe_compatible {
+                    let text = engine.transcribe(&pcm, sr)?;
+                    println!("{text}");
+                    return Ok(());
+                }
 
                 let mut session = engine.new_session(wick::SessionConfig {
                     kv_compression,

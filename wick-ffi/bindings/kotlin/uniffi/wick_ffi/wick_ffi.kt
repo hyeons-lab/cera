@@ -898,6 +898,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_wick_ffi_checksum_method_wickengine_special_token_id(): Short
 
+    external fun uniffi_wick_ffi_checksum_method_wickengine_transcribe(): Short
+
     external fun uniffi_wick_ffi_checksum_method_wickengine_vocab_size(): Short
 
     external fun uniffi_wick_ffi_checksum_constructor_bundlerepo_new(): Short
@@ -1185,6 +1187,13 @@ internal object UniffiLib {
     external fun uniffi_wick_ffi_fn_method_wickengine_special_token_id(
         `ptr`: Long,
         `name`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_wick_ffi_fn_method_wickengine_transcribe(
+        `ptr`: Long,
+        `pcm`: RustBuffer.ByValue,
+        `sampleRate`: Int,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
@@ -1503,6 +1512,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_method_wickengine_special_token_id() != 49161.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_wick_ffi_checksum_method_wickengine_transcribe() != 59537.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_wick_ffi_checksum_method_wickengine_vocab_size() != 46634.toShort()) {
@@ -4147,6 +4159,20 @@ public interface WickEngineInterface {
     fun `specialTokenId`(`name`: kotlin.String): kotlin.UInt?
 
     /**
+     * Transcribe mono `f32` PCM audio (normalized to roughly `[-1.0, 1.0]`) to text using the
+     * model's trained `"Perform ASR."` chat mode. `sample_rate` must match the audio encoder's
+     * expected rate (resample beforehand if needed). Requires an audio-capable bundle; a text-only
+     * model returns an [`FfiError`] for unsupported modality.
+     *
+     * Blocking: runs a full prefill + greedy decode. Foreign async runtimes should wrap the call in
+     * `spawn_blocking` / its equivalent.
+     */
+    fun `transcribe`(
+        `pcm`: List<kotlin.Float>,
+        `sampleRate`: kotlin.UInt,
+    ): kotlin.String
+
+    /**
      * Total vocabulary size — the number of distinct token IDs the
      * model can emit. Sourced from the model's config (matches
      * [`ModelMetadata::vocab_size`]) rather than the tokenizer's
@@ -4497,6 +4523,33 @@ open class WickEngine :
                     UniffiLib.uniffi_wick_ffi_fn_method_wickengine_special_token_id(
                         it,
                         FfiConverterString.lower(`name`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Transcribe mono `f32` PCM audio (normalized to roughly `[-1.0, 1.0]`) to text using the
+     * model's trained `"Perform ASR."` chat mode. `sample_rate` must match the audio encoder's
+     * expected rate (resample beforehand if needed). Requires an audio-capable bundle; a text-only
+     * model returns an [`FfiError`] for unsupported modality.
+     *
+     * Blocking: runs a full prefill + greedy decode. Foreign async runtimes should wrap the call in
+     * `spawn_blocking` / its equivalent.
+     */
+    @Throws(FfiException::class)
+    override fun `transcribe`(
+        `pcm`: List<kotlin.Float>,
+        `sampleRate`: kotlin.UInt,
+    ): kotlin.String =
+        FfiConverterString.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_wick_ffi_fn_method_wickengine_transcribe(
+                        it,
+                        FfiConverterSequenceFloat.lower(`pcm`),
+                        FfiConverterUInt.lower(`sampleRate`),
                         _status,
                     )
                 }

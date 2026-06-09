@@ -531,6 +531,11 @@ uint64_t uniffi_wick_ffi_fn_method_wickengine_new_session(uint64_t ptr, RustBuff
 RustBuffer uniffi_wick_ffi_fn_method_wickengine_special_token_id(uint64_t ptr, RustBuffer name, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_TRANSCRIBE
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_TRANSCRIBE
+RustBuffer uniffi_wick_ffi_fn_method_wickengine_transcribe(uint64_t ptr, RustBuffer pcm, uint32_t sample_rate, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_VOCAB_SIZE
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_FN_METHOD_WICKENGINE_VOCAB_SIZE
 uint32_t uniffi_wick_ffi_fn_method_wickengine_vocab_size(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -991,6 +996,12 @@ uint16_t uniffi_wick_ffi_checksum_method_wickengine_new_session(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_SPECIAL_TOKEN_ID
 #define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_SPECIAL_TOKEN_ID
 uint16_t uniffi_wick_ffi_checksum_method_wickengine_special_token_id(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_TRANSCRIBE
+#define UNIFFI_FFIDEF_UNIFFI_WICK_FFI_CHECKSUM_METHOD_WICKENGINE_TRANSCRIBE
+uint16_t uniffi_wick_ffi_checksum_method_wickengine_transcribe(void
     
 );
 #endif

@@ -633,6 +633,17 @@ impl WickEngine {
         self.inner.capabilities().into()
     }
 
+    /// Transcribe mono `f32` PCM audio (normalized to roughly `[-1.0, 1.0]`) to text using the
+    /// model's trained `"Perform ASR."` chat mode. `sample_rate` must match the audio encoder's
+    /// expected rate (resample beforehand if needed). Requires an audio-capable bundle; a text-only
+    /// model returns an [`FfiError`] for unsupported modality.
+    ///
+    /// Blocking: runs a full prefill + greedy decode. Foreign async runtimes should wrap the call in
+    /// `spawn_blocking` / its equivalent.
+    pub fn transcribe(&self, pcm: Vec<f32>, sample_rate: u32) -> Result<String, FfiError> {
+        Ok(self.inner.transcribe(&pcm, sample_rate)?)
+    }
+
     /// Resolved context-window size (KV cache cap) the engine was
     /// configured with. Mirrors the `context_size` field of the
     /// [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
