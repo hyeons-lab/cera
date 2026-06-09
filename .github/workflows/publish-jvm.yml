@@ -1,0 +1,129 @@
+name: Publish JVM/Android (Maven Central)
+
+# Manual release pipeline for the cera-ffi Kotlin bindings (desktop JVM jar +
+# Android AAR), published to Maven Central under `com.hyeons-lab`. Separate from
+# `publish.yml` (crates.io + npm) because it needs the native-lib cross-build
+# matrix + a JVM/Android toolchain.
+#
+#   dry_run = true  (default): `publishToMavenLocal` — validates packaging, no upload.
+#   dry_run = false:           `publishToMavenCentral` — uploads 0.1.0-SNAPSHOT to the
+#                              Central Portal snapshot repo (no GPG signing required).
+#
+# Required repository secrets (only for a real upload):
+#   - MAVEN_CENTRAL_USERNAME : Central Portal token username
+#   - MAVEN_CENTRAL_PASSWORD : Central Portal token password
+# A real (non-SNAPSHOT) release would additionally need GPG signing secrets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (publishToMavenLocal, no upload)'
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  native-libs:
+    name: Native libs (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Desktop JVM targets → JNA resource-prefix dirs under the jvm module.
+          - { os: macos-latest,   label: darwin-aarch64, target: aarch64-apple-darwin,    lib: libcera_ffi.dylib, dest: cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/darwin-aarch64, android: false }
+          - { os: ubuntu-latest,  label: linux-x86-64,   target: x86_64-unknown-linux-gnu, lib: libcera_ffi.so,    dest: cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/linux-x86-64,  android: true  }
+          - { os: windows-latest, label: win32-x86-64,   target: x86_64-pc-windows-msvc,  lib: cera_ffi.dll,      dest: cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/win32-x86-64,  android: false }
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build desktop cdylib
+        shell: bash
+        run: |
+          cargo build -p cera-ffi --release --target ${{ matrix.target }}
+          mkdir -p "${{ matrix.dest }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.lib }}" "${{ matrix.dest }}/${{ matrix.lib }}"
+
+      # Android .so for all four ABIs — built once, on the Linux runner.
+      - name: Set up Android NDK
+        if: ${{ matrix.android }}
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+      - name: Build Android jniLibs
+        if: ${{ matrix.android }}
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
+          cargo install cargo-ndk --version '^4' --locked
+          cargo ndk -o cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs \
+            --target arm64-v8a --target armeabi-v7a --target x86_64 --target x86 \
+            build -p cera-ffi --release
+
+      - name: Upload staged native libs
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.label }}
+          path: |
+            cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/
+            cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs/
+          if-no-files-found: error
+          include-hidden-files: false
+
+  publish:
+    name: Assemble & publish to Maven Central
+    needs: native-libs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      # Pull every runner's native libs back into the module source trees. The
+      # committed `cera_ffi.kt` binding is already in the repo (srcDir'd by both
+      # modules), so no Rust build is needed here.
+      - name: Download native libs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: .
+
+      - name: Show staged native libs
+        run: |
+          find cera-ffi-kotlin -path '*/resources/*/*' -o -path '*/jniLibs/*/*' | sort
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Publish
+        working-directory: cera-ffi-kotlin
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "=== DRY RUN: publishToMavenLocal (no upload) ==="
+            ./gradlew publishToMavenLocal --no-daemon --stacktrace
+          else
+            echo "=== Publishing 0.1.0-SNAPSHOT to Maven Central ==="
+            ./gradlew publishToMavenCentral --no-daemon --stacktrace
+          fi

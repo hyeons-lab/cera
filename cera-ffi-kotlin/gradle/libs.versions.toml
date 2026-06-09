@@ -1,0 +1,21 @@
+[versions]
+# Pins mirror the prism repo (the reference for this publishing setup).
+kotlin = "2.3.10"
+agp = "8.13.2"
+mavenPublish = "0.36.0"
+compileSdk = "36"
+minSdk = "28"
+# JNA + coroutines are what the UniFFI-generated `cera_ffi.kt` compiles against
+# (matches the cera-parity Kotlin leg).
+jna = "5.15.0"
+kotlinxCoroutines = "1.10.2"
+
+[libraries]
+jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+maven-publish = { id = "com.vanniktech.maven.publish", version.ref = "mavenPublish" }

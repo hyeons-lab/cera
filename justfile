@@ -120,6 +120,37 @@ android-all:
 android-arm64:
     cargo ndk --target arm64-v8a build -p cera-ffi --release
 
+# Stage the cera-ffi cdylib for the HOST desktop platform into the
+# `cera-ffi-jvm` module's JNA resource layout, for local
+# `./gradlew :cera-ffi-jvm:publishToMavenLocal` testing. CI stages all three
+# desktop targets (macOS .dylib, Linux .so, Windows .dll) per-runner; see
+# `.github/workflows/publish-jvm.yml`. JNA resolves `libcera_ffi` from the
+# classpath via its platform resource prefix (darwin-aarch64 / linux-x86-64 /
+# win32-x86-64).
+jvm-libs-host:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p cera-ffi --release
+    case "$(uname -s)-$(uname -m)" in
+      Darwin-arm64)  prefix=darwin-aarch64; lib=libcera_ffi.dylib ;;
+      Darwin-x86_64) prefix=darwin-x86-64;  lib=libcera_ffi.dylib ;;
+      Linux-x86_64)  prefix=linux-x86-64;   lib=libcera_ffi.so ;;
+      *) echo "unsupported host $(uname -s)-$(uname -m) for jvm-libs-host" >&2; exit 1 ;;
+    esac
+    dest="cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/$prefix"
+    mkdir -p "$dest"
+    cp "target/release/$lib" "$dest/$lib"
+    echo "staged $dest/$lib"
+
+# Cross-compile cera-ffi for all four Android ABIs and stage them directly into
+# the `cera-ffi-android` module's jniLibs (cargo-ndk's `-o` writes the
+# `<abi>/libcera_ffi.so` layout). Requires the same cargo-ndk + NDK setup as
+# `android-all`.
+android-libs:
+    cargo ndk -o cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs \
+        --target arm64-v8a --target armeabi-v7a --target x86_64 --target x86 \
+        build -p cera-ffi --release
+
 # Cross-compile `cera-ffi` to all three arm64-only Apple-platform
 # targets and assemble a `CeraFFI.xcframework` ready for Swift
 # Package Manager / Xcode consumption. Three single-arch slices:
