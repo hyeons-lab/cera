@@ -1,4 +1,4 @@
-| Model | Prompt | Gen | Prefill tok/s (Wick / Llama) | Decode tok/s (Wick / Llama) | RSS MB (Wick / Llama) | Footprint MB (Wick / Llama) |
+| Model | Prompt | Gen | Prefill tok/s (Cera / Llama) | Decode tok/s (Cera / Llama) | RSS MB (Cera / Llama) | Footprint MB (Cera / Llama) |
 |-------|--------|-----|------------------------------|-----------------------------|-----------------------|-----------------------------|
 | LFM2-VL-450M-Q4_0.gguf | 128 | 64 | 8142.0 / 2657.0 (**3.06x**) | 467.4 / 303.4 (**1.54x**) | 62.4 / 282.9 (0.22x) | 272.2 / 53.8 (5.06x) |
 | LFM2-VL-450M-Q4_0.gguf | 128 | 256 | 4540.0 / 2355.0 (**1.93x**) | 251.8 / 303.0 (0.83x) | 65.6 / 280.6 (0.23x) | 275.6 / 51.5 (5.35x) |

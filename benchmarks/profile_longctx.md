@@ -32,11 +32,11 @@ real data.
   - `flash_attention` auto-activates at `seq_len > 4096`, so any
     context window > 4096 produced corrupt logits and silently unusable
     generation.
-  - `attention_gqa` is opt-in via `WICK_ATTN=gqa` (latent).
-  - `attention_splitk` is opt-in via `WICK_ATTN=splitk` (latent).
+  - `attention_gqa` is opt-in via `CERA_ATTN=gqa` (latent).
+  - `attention_splitk` is opt-in via `CERA_ATTN=splitk` (latent).
   All three fixed in this PR: K/V bindings changed to `half*` with
   `float()` casts on load. Regression tests at
-  `wick/tests/attention_metal_parity.rs` (classic vs flash / gqa /
+  `cera/tests/attention_metal_parity.rs` (classic vs flash / gqa /
   splitk greedy-token parity on a 450M prompt) all pass.
 
 ---
@@ -49,13 +49,13 @@ of the batched-prefill path that actually produces the benchmark numbers.
 | Instrument                                | Path it measures                                    | Blind spot                                                                         |
 |-------------------------------------------|-----------------------------------------------------|------------------------------------------------------------------------------------|
 | `forward_prefill_profiled` (ignored test) | Batched prefill, per-phase                          | Per-phase `wait_until_completed` inflates high-dispatch-count phases; also chunks at MAX_PREFILL_TOKENS=512 so n=4096 runs become 8-chunk sequential (same behavior as production). |
-| `WICK_PROFILE=timing` (CategoryTimer)     | **Only single-token `forward()`** (decode steps)    | Never activates on batched prefill — `forward_prefill_inner` bypasses it.           |
-| `WICK_PROFILE=noattn`                     | Only `encode_attention` and `encode_attention_q_offset` call sites | **Batched prefill uses `encode_attention_prefill`** (line 2477 in `metal_lfm2.rs`) which has no `noattn` check. So noattn does not skip batched-prefill attention. |
+| `CERA_PROFILE=timing` (CategoryTimer)     | **Only single-token `forward()`** (decode steps)    | Never activates on batched prefill — `forward_prefill_inner` bypasses it.           |
+| `CERA_PROFILE=noattn`                     | Only `encode_attention` and `encode_attention_q_offset` call sites | **Batched prefill uses `encode_attention_prefill`** (line 2477 in `metal_lfm2.rs`) which has no `noattn` check. So noattn does not skip batched-prefill attention. |
 
 Implication: **for batched prefill, we do not have a clean wall-time
 attribution tool**. The best we have is the (per-phase-sync-inflated)
 `forward_prefill_profiled` percentages and the algorithmic O(n²) signature
-of the total-time scaling. Decode attribution via `WICK_PROFILE=timing` is
+of the total-time scaling. Decode attribution via `CERA_PROFILE=timing` is
 clean — the decode loop goes through the single-token `forward()` path.
 
 Adding a `sample_counters_in_buffer`-based profiler to `forward_prefill_inner`
@@ -66,7 +66,7 @@ for the follow-up plan.
 
 ## 2. Wall-time: scaling signal
 
-`wick bench --device metal --no-cache --max-tokens 1 --runs 3 --warmup 1`,
+`cera bench --device metal --no-cache --max-tokens 1 --runs 3 --warmup 1`,
 median of 3.
 
 | Model  | Prompt | Prefill tok/s | Per-token (us) | Scaling vs p=128 |
@@ -79,11 +79,11 @@ median of 3.
 
 At 32× more tokens, per-token cost grows 2.9–3.6×. Total wall time grows
 ~115× for 32× more tokens on 450M = **O(n^1.37)**. That is between O(n) and
-O(n²) and matches the table's "llama.cpp stays flat, wick halves" shape.
+O(n²) and matches the table's "llama.cpp stays flat, cera halves" shape.
 
 Compare to published `deltas_table.md` (llama.cpp on M1 Max):
 - 450M Q4_0: p=128 → p=4096 prefill: 4573 → 10309 tok/s (0.98× scaling, flat)
-- wick same row: 8073 → 2241 (3.60× per-token regression)
+- cera same row: 8073 → 2241 (3.60× per-token regression)
 
 ---
 
@@ -138,7 +138,7 @@ O(n)-per-token attention-compute signature.
 
 ## 4. Decode phase profile (CategoryTimer, valid on single-token path)
 
-`WICK_PROFILE=timing wick bench --device metal --no-cache --context-size 8192
+`CERA_PROFILE=timing cera bench --device metal --no-cache --context-size 8192
 --prompt-tokens N --max-tokens 128`. Per-category ms/token averaged across
 96 decoded tokens (CategoryTimer's print cadence prints at 32/64/96 for `% 32`).
 
@@ -212,10 +212,10 @@ thermal). Not a present regression — deprioritize.
 
 ## 6. Attention share cross-check (invalid for batched prefill)
 
-Planned: compare `WICK_PROFILE=noattn` wall time vs unset to estimate
+Planned: compare `CERA_PROFILE=noattn` wall time vs unset to estimate
 attention's wall-time contribution.
 
-Actual: **`WICK_PROFILE=noattn` only affects `encode_attention` and
+Actual: **`CERA_PROFILE=noattn` only affects `encode_attention` and
 `encode_attention_q_offset` (lines 1613, 1726 in `metal_lfm2.rs`). Batched
 prefill uses a third function, `encode_attention_prefill` (line 2477), which
 does not check the env var.** So the noattn cross-check skipped attention on
@@ -232,7 +232,7 @@ Raw numbers from the attempted cross-check (prefill tok/s, median of 3, 2.5 mode
 
 Low deltas reflect the broken routing, not real attention cost.
 
-**Action for follow-up**: add a `WICK_PROFILE=noattn` check inside
+**Action for follow-up**: add a `CERA_PROFILE=noattn` check inside
 `encode_attention_prefill` (a 3-line change) *or* add sampled GPU timestamps
 to the batched prefill path. Either gives clean attribution.
 
@@ -299,14 +299,14 @@ Scope for the follow-up plan:
 
 ## 8. Post-instrumentation attribution (2026-04-16, PR #19)
 
-Step (1) from §7 now lands: the `WICK_PROFILE=noattn` guard fires in
+Step (1) from §7 now lands: the `CERA_PROFILE=noattn` guard fires in
 batched prefill (`forward_prefill_inner`), and a GPU-timestamp variant of
 `forward_prefill_profiled` sidesteps the per-phase `commit + wait`
 overhead that inflated small phases in the CPU-wall-clock run.
 
 ### 8.1 noattn on batched prefill (the table §6 warned about)
 
-`wick bench --device metal --no-cache --context-size 8192 --prompt-tokens N
+`cera bench --device metal --no-cache --context-size 8192 --prompt-tokens N
 --runs 3 --warmup 1 --max-tokens 0` on LFM2.5-VL-450M-Q4_0, M1 Max:
 
 | Prompt | regular (tok/s) | noattn (tok/s) | attn share (1 - regular/noattn) |
@@ -326,8 +326,8 @@ total time attention costs at that scale. Ignore the sign.
 
 ### 8.2 GPU timestamps vs CPU wall clock (sanity)
 
-`WICK_PROFILE=gpu cargo test ... test_profile_longctx_2_5_450m_n4096`
-vs the default `WICK_PROFILE` path, 450M @ p=4096:
+`CERA_PROFILE=gpu cargo test ... test_profile_longctx_2_5_450m_n4096`
+vs the default `CERA_PROFILE` path, 450M @ p=4096:
 
 | Category       | CPU-wall µs | GPU-ticks µs | Δ         | GPU share |
 |----------------|------------:|-------------:|----------:|----------:|

@@ -31,37 +31,37 @@ run() {
 
 echo "=== Step 1: batched-prefill per-phase via forward_prefill_profiled ==="
 run batched_prefill_all \
-    cargo test -p wick --release --features metal --test bench_perf -- \
+    cargo test -p cera --release --features metal --test bench_perf -- \
         --ignored --nocapture --test-threads=1 test_profile_longctx_
 
 echo "=== Step 2: decode CategoryTimer (single-token forward) ==="
 for CTX in 128 2048 4096; do
     run "450m_decode_ctx${CTX}" \
-        env WICK_PROFILE=timing cargo run --release -q -p wick-cli --features metal -- bench --device metal --no-cache --context-size 8192 \
+        env CERA_PROFILE=timing cargo run --release -q -p cera-cli --features metal -- bench --device metal --no-cache --context-size 8192 \
             --model "$MODEL_450M" --prompt-tokens "$CTX" \
             --max-tokens 128 --runs 1 --warmup 0
 done
 
-echo "=== Step 3: prefill wall-time (no WICK_PROFILE) ==="
+echo "=== Step 3: prefill wall-time (no CERA_PROFILE) ==="
 for P in 128 1024 4096; do
     run "450m_wall_p${P}" \
-        cargo run --release -q -p wick-cli --features metal -- bench --device metal --no-cache \
+        cargo run --release -q -p cera-cli --features metal -- bench --device metal --no-cache \
             --model "$MODEL_450M" --prompt-tokens "$P" \
             --max-tokens 1 --runs 3 --warmup 1
 done
 run "16b_wall_p128" \
-    cargo run --release -q -p wick-cli --features metal -- bench --device metal --no-cache \
+    cargo run --release -q -p cera-cli --features metal -- bench --device metal --no-cache \
         --model "$MODEL_16B" --prompt-tokens 128 \
         --max-tokens 1 --runs 3 --warmup 1
 run "16b_wall_p4096" \
-    cargo run --release -q -p wick-cli --features metal -- bench --device metal --no-cache \
+    cargo run --release -q -p cera-cli --features metal -- bench --device metal --no-cache \
         --model "$MODEL_16B" --prompt-tokens 4096 \
         --max-tokens 1 --runs 3 --warmup 1
 
 echo "=== Step 4: noattn wall-time cross-check ==="
 for P in 128 1024 4096; do
     run "450m_noattn_p${P}" \
-        env WICK_PROFILE=noattn cargo run --release -q -p wick-cli --features metal -- bench --device metal --no-cache \
+        env CERA_PROFILE=noattn cargo run --release -q -p cera-cli --features metal -- bench --device metal --no-cache \
             --model "$MODEL_450M" --prompt-tokens "$P" \
             --max-tokens 1 --runs 3 --warmup 1
 done

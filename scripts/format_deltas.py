@@ -12,14 +12,14 @@ for r in rows:
     data[key][r['engine']] = r
 
 lines = []
-lines.append('| Model | Prompt | Gen | Prefill tok/s (Wick / Llama) | Decode tok/s (Wick / Llama) | RSS MB (Wick / Llama) | Footprint MB (Wick / Llama) |')
+lines.append('| Model | Prompt | Gen | Prefill tok/s (Cera / Llama) | Decode tok/s (Cera / Llama) | RSS MB (Cera / Llama) | Footprint MB (Cera / Llama) |')
 lines.append('|-------|--------|-----|------------------------------|-----------------------------|-----------------------|-----------------------------|')
 
 for key in sorted(data.keys()):
     engines = data[key]
-    if 'wick' not in engines or 'llama.cpp' not in engines:
+    if 'cera' not in engines or 'llama.cpp' not in engines:
         continue
-    w = engines['wick']
+    w = engines['cera']
     l = engines['llama.cpp']
     
     w_p = float(w['prefill_tps'])

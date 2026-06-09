@@ -1,8 +1,8 @@
-warning: WICK_PROFILE is set — bench numbers will be inflated by profile overhead
+warning: CERA_PROFILE is set — bench numbers will be inflated by profile overhead
 Using native Metal backend
 Model: lfm2 | 16 layers | hidden=1024
 Prompt tokens: 128 | max_tokens: 128 | warmup: 0 | runs: 1
-[wick-metal] per-category ms/token breakdown (32 tokens):
+[cera-metal] per-category ms/token breakdown (32 tokens):
   conv_pre         2.588 (12.8%)
   conv1d           2.395 (11.9%)
   ffn_norm_gemv    4.481 (22.2%)
@@ -13,7 +13,7 @@ Prompt tokens: 128 | max_tokens: 128 | warmup: 0 | runs: 1
   attn_out         1.350 ( 6.7%)
   out              0.671 ( 3.3%)
   TOTAL           20.171
-[wick-metal] per-category ms/token breakdown (64 tokens):
+[cera-metal] per-category ms/token breakdown (64 tokens):
   conv_pre         2.584 (12.7%)
   conv1d           2.387 (11.8%)
   ffn_norm_gemv    4.499 (22.2%)
@@ -24,7 +24,7 @@ Prompt tokens: 128 | max_tokens: 128 | warmup: 0 | runs: 1
   attn_out         1.368 ( 6.7%)
   out              0.714 ( 3.5%)
   TOTAL           20.304
-[wick-metal] per-category ms/token breakdown (96 tokens):
+[cera-metal] per-category ms/token breakdown (96 tokens):
   conv_pre         2.629 (12.7%)
   conv1d           2.431 (11.8%)
   ffn_norm_gemv    4.579 (22.2%)

@@ -1,0 +1,142 @@
+[package]
+name = "cera"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust-native LLM inference engine"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytemuck.workspace = true
+byteorder.workspace = true
+half.workspace = true
+memmap2 = { workspace = true, optional = true }
+minijinja.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+regex.workspace = true
+rayon = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+metal = { workspace = true, optional = true }
+objc = { workspace = true, optional = true }
+rustfft.workspace = true
+flatbuffers.workspace = true
+cblas-sys = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+# Image decode + resize for the VL input preprocessor. PNG + JPEG
+# only — wider format support pulls heavier transitive deps that
+# don't pay for themselves until users demand WebP/AVIF/etc.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
+
+# BLAS providers: Apple Accelerate on macOS (unlocks AMX), OpenBLAS elsewhere.
+# Only the provider crate for the current target is pulled in, so cross-platform
+# builds with the `blas` feature work out of the box on supported hosts.
+[target.'cfg(target_os = "macos")'.dependencies]
+accelerate-src = { workspace = true, optional = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+openblas-src = { workspace = true, optional = true }
+
+# wasm32 portability deps, scoped by sub-target.
+#
+# `web-time` works on every wasm32 flavor (browser, Node, WASI) and is
+# applied to all `target_arch = "wasm32"` builds. It re-exports
+# `std::time::{Instant, Duration}` on native and provides equivalents on
+# wasm. Re-exported by `cera::time` (see `src/time.rs`); the lib uses
+# `crate::time::Instant` everywhere `std::time::Instant` would otherwise
+# panic at runtime on wasm32-unknown-unknown.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time.workspace = true
+
+# `getrandom`'s `js` feature is JS-glue specific (browser
+# `crypto.getRandomValues`) and only makes sense on `wasm32-unknown-unknown`
+# — `wasm32-wasi` has its own native entropy source and should not be
+# forced through the JS path. Narrow the cfg to `target_os = "unknown"`
+# so a future WASI build picks up the WASI backend instead.
+#
+# `getrandom` is a transitive dep pulled by `rand 0.8`; cera code never
+# references it directly. This is the "fake dep" pattern: the dep exists
+# purely to enable the cargo feature on the transitive copy. **The version
+# is coupled to `rand 0.8` upstream** — a future `rand 0.9+` bump moves to
+# `getrandom 0.3`, where the wasm feature is renamed to `wasm_js`. Update
+# both together if/when that happens.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true, features = ["js"] }
+
+# wgpu on wasm32: the WebGPU backend types (`wgpu::Buffer` etc.) wrap
+# JS objects, which are not thread-safe. wgpu's
+# `fragile-send-sync-non-atomic-wasm` adds Send+Sync impls **only when
+# the `atomics` target-feature is OFF** (single-threaded wasm — JS is
+# single-threaded by default, so the impls are sound there). When
+# `atomics` is ON (multi-threaded wasm via wasm-bindgen-rayon, where
+# real concurrency exists), the impls disappear and wgpu types stay
+# `!Sync`, surfacing the threading mistake at compile time instead of
+# runtime UB.
+#
+# Without this feature, our `Model: Send + Sync` bound rejects
+# `GpuLfm2Model` on wasm. We always-on it for wasm32; threaded wasm
+# builds (which set `atomics` via the `wasm-web-mt` / `wasm-node-mt`
+# justfile recipes' RUSTFLAGS) will still fail to satisfy the bound,
+# which is the right outcome — multi-threaded wgpu wasm needs wgpu
+# pinned to a dedicated worker, not naively shared across threads.
+[target.'cfg(target_arch = "wasm32")'.dependencies.wgpu]
+workspace = true
+optional = true
+features = ["fragile-send-sync-non-atomic-wasm"]
+
+[dev-dependencies]
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+# Gated integration tests (`shift_real_model.rs`, `bundle_download.rs`)
+# that perform HTTP downloads are `#[cfg(feature = "remote")]`'d at the
+# test level — run them with `cargo test -p cera --features remote -- ...`.
+# The downloader code itself lives in `src/bundle/download.rs` under the
+# same feature, so there is a single implementation.
+
+[features]
+# Portability feature set (Phase 1.3).
+#
+# `parallel`, `mmap`, `std-fs`, `disk-cache` are default-on so desktop + CLI
+# builds are unchanged. Turn them off to shrink the crate for targets like
+# wasm32-unknown-unknown or embedded environments:
+#
+#   cargo check -p cera --no-default-features
+#   cargo check -p cera --no-default-features --features parallel
+#
+# Feature deps:
+#   mmap        ⇒ std-fs  (memory-mapping a file needs a filesystem path)
+#   disk-cache  ⇒ std-fs  (writing the cold KV tier needs std::fs)
+#   gpu         — wgpu compute. Independent of `mmap` after PR 4.1 — the
+#                 model loader accepts an already-parsed `GgufFile`
+#                 regardless of whether the bytes came from `open` (mmap)
+#                 or `from_bytes` (in-memory, e.g. wasm). Auto-dispatch
+#                 backend retry still requires `mmap` (re-opens the file
+#                 between backends) — see `clone_gguf_like` cfg gate.
+#   metal       ⇒ mmap    (re-opens GGUF via mmap)
+#   blas        — unchanged; opt-in GEMM accelerator
+#   remote      ⇒ std-fs  (BundleRepo caches downloads to a store_dir)
+parallel = ["dep:rayon"]
+std-fs = []
+mmap = ["dep:memmap2", "std-fs"]
+disk-cache = ["std-fs"]
+gpu = ["dep:wgpu", "dep:pollster"]
+metal = ["dep:metal", "dep:objc", "mmap"]
+blas = ["dep:cblas-sys", "dep:accelerate-src", "dep:openblas-src"]
+# BundleRepo + HTTP downloader + SHA-256 integrity. Opt-in so wasm and
+# tightly-scoped embedded builds don't pull reqwest. (See
+# `src/bundle/mod.rs` for the verification policy.)
+remote = ["dep:reqwest", "dep:sha2", "std-fs"]
+# VL image-input preprocessor (PNG/JPEG decode + resize +
+# normalize). Default-on so the canonical VL bundles light up
+# `Session::append_image` without an extra flag; opt-out shrinks
+# wasm / embedded builds that only do text or raw-PCM audio
+# input. Pure-Rust deps — no system libpng/libjpeg required.
+vl-preprocess = ["dep:image"]
+default = ["parallel", "mmap", "std-fs", "disk-cache", "vl-preprocess"]

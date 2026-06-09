@@ -1,0 +1,1211 @@
+//! wasm-bindgen wrapper around the `cera` core inference engine.
+//!
+//! This crate produces the `.wasm` cdylib that browser / Node consumers
+//! drive via the JS glue emitted by `wasm-bindgen-cli`. Native consumers
+//! should use the `cera` crate directly — cera-wasm exists purely to
+//! map `cera`'s Rust API onto the JS interop boundary.
+//!
+//! The lib body is `cfg(target_arch = "wasm32")`-gated: on native
+//! targets this crate compiles to an empty cdylib, which keeps
+//! workspace-wide commands (`cargo check --workspace`,
+//! `cargo clippy --workspace`) honest without needing to special-case
+//! the wasm wrapper.
+
+#![cfg(target_arch = "wasm32")]
+
+use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
+
+// Pull `wasm-bindgen-rayon` into the link graph so its
+// `#[wasm_bindgen]`-emitted `initThreadPool` export survives
+// dead-code elimination and reaches the generated `cera_wasm.d.ts`.
+// JS init pattern + COOP/COEP requirement live in
+// `cera-wasm/README.md`'s "Multi-threaded build" section.
+#[cfg(feature = "parallel")]
+pub use wasm_bindgen_rayon::init_thread_pool;
+
+// Custom TypeScript declarations injected into the generated
+// `cera_wasm.d.ts`. wasm-bindgen would otherwise type wasm-side
+// `JsValue` parameters as `any`, losing IDE completion + type
+// checking for the structured shapes we expect from JS callers.
+//
+// Each `extern "C" { #[wasm_bindgen(typescript_type = "...")]
+// pub type T; }` block below declares a Rust-side opaque handle
+// whose only purpose is to carry a custom TS type label. At
+// runtime these are still plain `JsValue`s.
+#[wasm_bindgen(typescript_custom_section)]
+const TS_APPEND: &'static str = r#"
+/**
+ * One entry in the chat-message array passed to
+ * `Tokenizer.applyChatTemplate`. Mirrors the OpenAI / Anthropic
+ * SDK shape — cera currently models only `role` and `content`;
+ * tool-calls / function-calls are not yet supported.
+ */
+export interface ChatMessage {
+    role: string;
+    content: string;
+}
+"#;
+
+#[wasm_bindgen]
+extern "C" {
+    /// Opaque type-label wrapper for `ChatMessage[]` — the
+    /// argument shape `Tokenizer.applyChatTemplate` accepts.
+    /// At the wasm boundary this is just a JsValue array; the
+    /// generated .d.ts surfaces it as `ChatMessage[]` so JS/TS
+    /// callers get IDE completion + type checking.
+    #[wasm_bindgen(typescript_type = "ChatMessage[]")]
+    pub type ChatMessageArray;
+}
+
+#[wasm_bindgen(typescript_custom_section)]
+const TS_CAPABILITIES: &'static str = r#"
+/**
+ * Modality capability flags for a loaded model. Returned by
+ * `CeraEngine.capabilities` and `Session.capabilities`. Mirrors
+ * the `ModalityCapabilities` shape exposed by the JVM/Apple
+ * bindings (cera-ffi) so cross-platform consumers can probe the
+ * same fields regardless of which binding they're driving.
+ *
+ * Note: under cera-wasm's current loader (`fromGgufBytes`), the
+ * model's `inference_type` is synthesized as text-only — these
+ * flags will report `textIn: true, textOut: true` and `false`
+ * for everything else even for genuinely audio- or
+ * image-capable models. A model-aware loader (planned) will
+ * make these flags reflect the real capability surface.
+ */
+export interface Capabilities {
+    readonly textIn: boolean;
+    readonly textOut: boolean;
+    readonly imageIn: boolean;
+    readonly audioIn: boolean;
+    readonly audioOut: boolean;
+}
+"#;
+
+#[wasm_bindgen]
+extern "C" {
+    /// Opaque type-label wrapper for the `Capabilities`
+    /// interface declared in the TS custom section above. At the
+    /// wasm boundary this is a plain JS object; the type label
+    /// surfaces in `.d.ts` so callers get IDE completion +
+    /// destructuring (`const { audioIn } = engine.capabilities`).
+    #[wasm_bindgen(typescript_type = "Capabilities")]
+    pub type Capabilities;
+}
+
+/// Build a JS-side `Capabilities` object from a cera core
+/// `ModalityCapabilities`. Used by both `CeraEngine.capabilities`
+/// and `Session.capabilities` so the field set + naming stays in
+/// lock-step.
+fn capabilities_to_js(caps: cera::ModalityCapabilities) -> Capabilities {
+    let obj = js_sys::Object::new();
+    // `Reflect::set` only fails when the target isn't an object
+    // — `Object::new()` always is, so the `Result` is structurally
+    // unreachable here. Discard it inside the helper closure to
+    // keep the per-field calls one line each.
+    let set_bool = |key: &str, value: bool| {
+        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), &JsValue::from_bool(value));
+    };
+    set_bool("textIn", caps.text_in);
+    set_bool("textOut", caps.text_out);
+    set_bool("imageIn", caps.image_in);
+    set_bool("audioIn", caps.audio_in);
+    set_bool("audioOut", caps.audio_out);
+    JsValue::from(obj).unchecked_into()
+}
+
+/// Returns the version of the `cera` core library this binding wraps.
+///
+/// Note this is **`cera`'s** version, not `cera-wasm`'s — JS callers
+/// usually want to know what core lib is driving the engine, since
+/// the wrapper crate version may evolve independently.
+#[wasm_bindgen(js_name = ceraVersion)]
+pub fn cera_version() -> String {
+    cera::VERSION.to_string()
+}
+
+/// Map an `anyhow::Error` into a `JsError` preserving the full
+/// `{:#}` chain. Centralised so every wrapper surface throws the
+/// same shape.
+fn map_err(err: anyhow::Error) -> JsError {
+    JsError::new(&format!("{err:#}"))
+}
+
+/// Parsed view of a LeapBundles `*.json` manifest.
+///
+/// JS callers fetch the manifest bytes (e.g. via `fetch().arrayBuffer()`)
+/// and pass them to `Manifest.parse`. The wrapper exposes the typed
+/// fields cera already understands; the raw `serde_json::Value`
+/// retained on the inner `cera::manifest::Manifest` is intentionally
+/// **not** exposed here — JS callers can re-parse the JSON themselves
+/// for forward-compat fields, and we don't want to commit to a
+/// `serde-wasm-bindgen` round-trip on every getter.
+#[wasm_bindgen]
+pub struct Manifest {
+    inner: cera::manifest::Manifest,
+}
+
+#[wasm_bindgen]
+impl Manifest {
+    /// Parse a JSON manifest from raw bytes. Throws a `JsError` on
+    /// malformed JSON or when required fields are missing or wrongly
+    /// typed (e.g. no `load_time_parameters.model`). Unknown
+    /// `inference_type` values are **not** an error — they round-trip
+    /// through `cera::manifest::InferenceType::Unknown(String)` and
+    /// surface verbatim via the `inferenceType` getter, so JS callers
+    /// can decide how to react instead of catching here.
+    #[wasm_bindgen]
+    pub fn parse(json_bytes: &[u8]) -> Result<Manifest, JsError> {
+        cera::manifest::Manifest::from_bytes(json_bytes)
+            .map(|inner| Manifest { inner })
+            .map_err(map_err)
+    }
+
+    /// Raw `inference_type` string (e.g. `llama.cpp/text-to-text`).
+    /// Round-trips through cera's enum, so unknown variants come back
+    /// as their original string — no information loss.
+    #[wasm_bindgen(getter, js_name = inferenceType)]
+    pub fn inference_type(&self) -> String {
+        self.inner.inference_type.as_str().to_string()
+    }
+
+    #[wasm_bindgen(getter, js_name = schemaVersion)]
+    pub fn schema_version(&self) -> String {
+        self.inner.schema_version.clone()
+    }
+
+    /// URL (or local path string) for the primary model GGUF.
+    #[wasm_bindgen(getter, js_name = modelUrl)]
+    pub fn model_url(&self) -> String {
+        self.inner.files.model.clone()
+    }
+
+    /// URL of the multimodal projector GGUF if the manifest declares
+    /// one (VL / audio models). `undefined` for plain text models.
+    #[wasm_bindgen(getter, js_name = multimodalProjectorUrl)]
+    pub fn multimodal_projector_url(&self) -> Option<String> {
+        self.inner.files.multimodal_projector.clone()
+    }
+
+    /// URL of the audio-decoder GGUF for audio-out models.
+    #[wasm_bindgen(getter, js_name = audioDecoderUrl)]
+    pub fn audio_decoder_url(&self) -> Option<String> {
+        self.inner.files.audio_decoder.clone()
+    }
+
+    /// URL of the audio-tokenizer checkpoint (typically `.safetensors`).
+    #[wasm_bindgen(getter, js_name = audioTokenizerUrl)]
+    pub fn audio_tokenizer_url(&self) -> Option<String> {
+        self.inner.files.audio_tokenizer.clone()
+    }
+
+    /// Jinja chat template override from the manifest, if present.
+    /// `undefined` means "use the template embedded in the GGUF
+    /// metadata" (cera's standard fallback).
+    #[wasm_bindgen(getter, js_name = chatTemplate)]
+    pub fn chat_template(&self) -> Option<String> {
+        self.inner.chat_template.clone()
+    }
+}
+
+/// Map a `cera::CeraError` into a `JsError`. Uses `Display` (not `Debug`)
+/// so JS callers see the same message a cera CLI consumer would. Kept
+/// distinct from `map_err` (which handles `anyhow::Error`) so the call
+/// sites stay readable — both helpers throw the same `JsError` shape on
+/// the JS side.
+fn map_cera_err(err: cera::CeraError) -> JsError {
+    JsError::new(&err.to_string())
+}
+
+/// Loaded inference engine — wraps `cera::CeraEngine` with sync access
+/// to model metadata and the tokenizer.
+///
+/// JS callers fetch the GGUF (e.g. via `fetch().arrayBuffer()`), pass
+/// the bytes to [`CeraEngine.fromGgufBytes`], and use the returned
+/// handle to read model info or pull a `Tokenizer`. Session-based
+/// inference (`generate`, streaming) is intentionally not exposed yet
+/// — that shape needs an async/streaming design that lives in a
+/// follow-up PR.
+///
+/// **Memory:** the loaded GGUF stays resident in wasm linear memory
+/// for the lifetime of this object. Call `.free()` (auto-emitted by
+/// wasm-bindgen) when done to release it; without that, the entire
+/// model lives until the page unloads.
+#[wasm_bindgen]
+pub struct CeraEngine {
+    inner: cera::CeraEngine,
+}
+
+#[wasm_bindgen]
+impl CeraEngine {
+    /// Load a model from in-memory GGUF bytes. `contextSize` defaults
+    /// to 4096 if omitted; the actual KV-cache cap is the smaller of
+    /// the requested size and the model's own `max_seq_len`.
+    ///
+    /// The backend is forced to CPU — wasm has no native GPU/Metal
+    /// backend. Throws on parse failure, unsupported quantization,
+    /// or unrecognized architecture.
+    #[wasm_bindgen(js_name = fromGgufBytes)]
+    pub fn from_gguf_bytes(
+        bytes: Vec<u8>,
+        context_size: Option<u32>,
+    ) -> Result<CeraEngine, JsError> {
+        // Spread `..Default::default()` so the wrapper picks up any
+        // future EngineConfig fields (e.g. `bundle_repo` when the
+        // `remote` feature is on) without a compile break — only the
+        // two we actually want to override are spelled out.
+        // `..default()` is intentionally retained for forward
+        // compatibility — clippy's `needless_update` only fires under
+        // feature combos where `EngineConfig` happens to collapse to
+        // exactly the two listed fields (e.g. wasm32 minimal builds).
+        // Adding a feature later that introduces a new field would
+        // otherwise compile-break this constructor; the spread keeps
+        // it future-proof.
+        #[allow(clippy::needless_update)]
+        let cfg = cera::EngineConfig {
+            context_size: context_size.unwrap_or(4096) as usize,
+            backend: cera::BackendPreference::Cpu,
+            ..cera::EngineConfig::default()
+        };
+        cera::CeraEngine::from_bytes(bytes, cfg)
+            .map(|inner| CeraEngine { inner })
+            .map_err(map_cera_err)
+    }
+
+    /// Model architecture string from the GGUF metadata
+    /// (e.g. `"lfm2"`, `"llama"`).
+    #[wasm_bindgen(getter)]
+    pub fn architecture(&self) -> String {
+        self.inner.metadata().architecture.clone()
+    }
+
+    /// Maximum sequence length the model was trained for. Independent
+    /// of the engine's `contextSize` config — that one is the KV
+    /// cache cap, this is the model's positional encoding ceiling.
+    #[wasm_bindgen(getter, js_name = maxSeqLen)]
+    pub fn max_seq_len(&self) -> u32 {
+        self.inner.metadata().max_seq_len
+    }
+
+    #[wasm_bindgen(getter, js_name = vocabSize)]
+    pub fn vocab_size(&self) -> u32 {
+        self.inner.metadata().vocab_size
+    }
+
+    /// Quantization label from the GGUF (e.g. `"Q4_0"`, `"Q4_K_M"`).
+    /// Useful for telling users what they actually loaded when the
+    /// download URL doesn't make it obvious.
+    #[wasm_bindgen(getter)]
+    pub fn quantization(&self) -> String {
+        self.inner.metadata().quantization.clone()
+    }
+
+    /// `true` when the loaded GGUF carries an embedded Jinja chat
+    /// template. JS callers can use this to decide whether to render
+    /// `Tokenizer.chatTemplate` themselves vs falling back to a
+    /// hard-coded prompt format.
+    #[wasm_bindgen(getter, js_name = hasChatTemplate)]
+    pub fn has_chat_template(&self) -> bool {
+        self.inner.metadata().has_chat_template
+    }
+
+    /// `true` when the GGUF declares `tokenizer.ggml.add_bos_token`.
+    /// Callers that hand-build a token sequence from `Tokenizer.encode`
+    /// should prepend `Tokenizer.bosToken` when this is `true` (and
+    /// the model has a BOS) — cera's encoder returns the raw tokens
+    /// without that prefix.
+    #[wasm_bindgen(getter, js_name = addBosToken)]
+    pub fn add_bos_token(&self) -> bool {
+        self.inner.metadata().add_bos_token
+    }
+
+    /// Modality capability flags reported by the loaded model.
+    /// See the `Capabilities` interface in the generated `.d.ts`
+    /// for the field shape.
+    ///
+    /// **Caveat:** today cera-wasm only loads models via
+    /// `CeraEngine.fromGgufBytes`, which routes through cera's
+    /// synthetic-text manifest path. As a result this getter
+    /// always returns `{ textIn: true, textOut: true, imageIn:
+    /// false, audioIn: false, audioOut: false }` — even for
+    /// genuinely audio- or image-capable models. The shape is
+    /// exposed now so JS code stabilizes against the same surface
+    /// the JVM/Apple bindings (cera-ffi) report; a model-aware
+    /// loader (planned) will make these flags reflect the real
+    /// capability surface without a binding break.
+    #[wasm_bindgen(getter)]
+    pub fn capabilities(&self) -> Capabilities {
+        capabilities_to_js(self.inner.capabilities())
+    }
+
+    /// Requested context-window size (KV cache cap) the engine was
+    /// configured with. Mirrors what `fromGgufBytes(bytes,
+    /// contextSize)` resolved to — i.e. the value of `contextSize`
+    /// you passed in, or `4096` if you omitted it. Unlike
+    /// `cera-ffi`'s `EngineConfig::try_from`, the wasm load path
+    /// has no `0` → `maxSeqLen` translation: a `contextSize` of `0`
+    /// trips cera core's `context_size > 0` load assertion and
+    /// `fromGgufBytes` throws.
+    ///
+    /// Note this is the **engine-level requested** cap, not a
+    /// per-session ceiling. cera core clamps the model's
+    /// `maxSeqLen` at load time to `min(contextSize,
+    /// gguf_max_seq_len)`, so `engine.maxSeqLen` is already the
+    /// effective ceiling — `contextSize` is informational ("what
+    /// cap did I load with?") rather than a value to `Math.min`
+    /// against `maxSeqLen` at call sites.
+    #[wasm_bindgen(getter, js_name = contextSize)]
+    pub fn context_size(&self) -> u32 {
+        self.inner.config().context_size as u32
+    }
+
+    /// Returns a `Tokenizer` handle bound to this engine's vocab.
+    /// Each call allocates a fresh JS object but the underlying
+    /// tokenizer state is shared via `Arc` — cheap to call, JS
+    /// callers can cache the result if they prefer one handle.
+    #[wasm_bindgen(getter)]
+    pub fn tokenizer(&self) -> Tokenizer {
+        Tokenizer {
+            inner: self.inner.tokenizer_arc(),
+        }
+    }
+
+    /// Construct a new `Session` for this engine. The `config`
+    /// freezes per-session knobs — sampler `seed`, `nKeep`
+    /// pinned-prefix size, `ubatchSize` chunked-prefill batch,
+    /// `maxSeqLen` KV cap. For the cera defaults
+    /// (`maxSeqLen = null` → engine's effective cap, i.e.
+    /// `min(engine.contextSize, model.maxSeqLen)`; `nKeep = 0`,
+    /// `seed = null`, `ubatchSize = 512`), pass a freshly-
+    /// constructed `new SessionConfig()`.
+    ///
+    /// `config` is **borrowed**, not consumed — JS callers can
+    /// reuse the same `SessionConfig` across multiple `newSession`
+    /// calls. Inner state is cloned per-session at the boundary.
+    /// This mirrors how `Session.generate` borrows `GenerateOpts`.
+    /// (wasm-bindgen doesn't support `Option<&T>` for wrapper
+    /// types, so a default-config caller passes
+    /// `new SessionConfig()` rather than omitting the arg.)
+    ///
+    /// The returned `Session` keeps its own `Arc` clones of the
+    /// engine's model and tokenizer, so freeing the engine doesn't
+    /// invalidate any in-flight sessions.
+    #[wasm_bindgen(js_name = newSession)]
+    pub fn new_session(&self, config: &SessionConfig) -> Session {
+        Session {
+            inner: self.inner.new_session(config.inner.clone()),
+        }
+    }
+}
+
+/// BPE tokenizer wrapper. Constructed via `CeraEngine.tokenizer`;
+/// no standalone `from*` constructor (the GGUF metadata required to
+/// build one is reachable only through the engine).
+///
+/// Round-trip note: `decode(encode(text))` is **not** guaranteed to
+/// be byte-identical to `text` for inputs containing tokens that
+/// don't survive BPE merge replay (rare in practice — BOS/EOS,
+/// some byte-level edge cases). When you need exact reproduction,
+/// keep the original string around.
+#[wasm_bindgen]
+pub struct Tokenizer {
+    inner: std::sync::Arc<cera::tokenizer::BpeTokenizer>,
+}
+
+#[wasm_bindgen]
+impl Tokenizer {
+    /// Tokenize a UTF-8 string. Returns the token IDs as a
+    /// `Uint32Array`. No BOS/EOS prefix — callers that want them
+    /// should prepend `bosToken` / append `eosToken` manually.
+    #[wasm_bindgen]
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        self.inner.encode(text)
+    }
+
+    /// Detokenize back to a UTF-8 string. Lossy for tokens whose
+    /// byte sequences don't decode to valid UTF-8 — those are
+    /// replaced with U+FFFD per `String::from_utf8_lossy`.
+    #[wasm_bindgen]
+    pub fn decode(&self, tokens: &[u32]) -> String {
+        self.inner.decode(tokens)
+    }
+
+    #[wasm_bindgen(getter, js_name = vocabSize)]
+    pub fn vocab_size(&self) -> u32 {
+        self.inner.vocab_size() as u32
+    }
+
+    /// BOS token ID, if the GGUF metadata declares one.
+    #[wasm_bindgen(getter, js_name = bosToken)]
+    pub fn bos_token(&self) -> Option<u32> {
+        self.inner.bos_token()
+    }
+
+    /// EOS token ID, if the GGUF metadata declares one.
+    #[wasm_bindgen(getter, js_name = eosToken)]
+    pub fn eos_token(&self) -> Option<u32> {
+        self.inner.eos_token()
+    }
+
+    /// Look up a special-token ID by its literal name (e.g.
+    /// `"<|im_start|>"`, `"<|tool_calls_section_begin|>"`).
+    /// Returns `undefined` when no entry exists for that name in
+    /// the model's special-token registry.
+    ///
+    /// Lookup scope: only tokens flagged as control or
+    /// user-defined in the GGUF metadata are registered for this
+    /// lookup. cera reads `tokenizer.ggml.token_type` and admits
+    /// tokens with type `3` (control) or type `4` (user-defined);
+    /// regular vocab entries are not reachable via this method
+    /// even though their names exist in `tokenizer.ggml.tokens`.
+    /// Names accepted here are the literal vocab strings indexed
+    /// by the special token's ID.
+    ///
+    /// Useful for constructing prompts with specific control
+    /// tokens directly (chat-template-like flows) without
+    /// round-tripping through `applyChatTemplate`. For BOS / EOS
+    /// prefer `bosToken` / `eosToken` (named getters that don't
+    /// risk a typo in the lookup string).
+    ///
+    /// Mirrors `CeraEngine.specialTokenId` from cera-ffi (where
+    /// it lives engine-side); cera-wasm hangs it off `Tokenizer`
+    /// to match the established `engine.tokenizer.<method>`
+    /// access pattern.
+    #[wasm_bindgen(js_name = specialTokenId)]
+    pub fn special_token_id(&self, name: &str) -> Option<u32> {
+        self.inner.special_token_id(name)
+    }
+
+    /// `true` when `id` is registered as a control or user-defined
+    /// special token in the model's GGUF metadata
+    /// (`tokenizer.ggml.token_type` types `3` / `4`). Useful for
+    /// output filtering — e.g. dropping `<|im_end|>` from a
+    /// `Session.generate` token-callback batch before joining the
+    /// IDs into UI-rendered text — and for token-class
+    /// classification in analysis tools.
+    ///
+    /// Out-of-range IDs (>= vocab size) and regular vocab tokens
+    /// both return `false`. Companion to `specialTokenId` which
+    /// goes the other direction (name → ID).
+    #[wasm_bindgen(js_name = isSpecialToken)]
+    pub fn is_special_token(&self, id: u32) -> bool {
+        self.inner.is_special_token(id)
+    }
+
+    /// Raw embedded Jinja chat template from the GGUF metadata, if
+    /// any. Most callers should use [`Self::apply_chat_template`]
+    /// (`applyChatTemplate` in JS) instead — this getter is for
+    /// inspection or for callers who want to render with a
+    /// different Jinja runtime.
+    #[wasm_bindgen(getter, js_name = chatTemplate)]
+    pub fn chat_template(&self) -> Option<String> {
+        self.inner.chat_template().map(str::to_owned)
+    }
+
+    /// Render the model's embedded Jinja chat template against a
+    /// `[{ role, content }, ...]` array, returning the prompt
+    /// string ready for `Tokenizer.encode` + `Session.appendTokens`.
+    ///
+    /// `addGenerationPrompt` defaults to `true` (the common case
+    /// when sending to the model expecting a response). Set to
+    /// `false` when you only want the conversation rendered without
+    /// the trailing assistant-prompt suffix.
+    ///
+    /// Throws `JsError` on:
+    /// - the model not carrying a chat template
+    ///   (`engine.hasChatTemplate === false`),
+    /// - malformed `messages` (not an array, or entries missing
+    ///   `role`/`content` strings),
+    /// - a Jinja render failure (template references an undefined
+    ///   variable, etc.).
+    #[wasm_bindgen(js_name = applyChatTemplate)]
+    pub fn apply_chat_template(
+        &self,
+        messages: ChatMessageArray,
+        add_generation_prompt: Option<bool>,
+    ) -> Result<String, JsError> {
+        // `ChatMessageArray` is a wasm-bindgen opaque type-label
+        // wrapper around `JsValue` — the runtime check + parse
+        // still happens in `parse_chat_messages`. The TS-side
+        // win is purely surface (callers get `ChatMessage[]`
+        // instead of `any`).
+        let msgs = parse_chat_messages(messages.as_ref())?;
+        cera::tokenizer::apply_chat_template(
+            &self.inner,
+            &msgs,
+            add_generation_prompt.unwrap_or(true),
+        )
+        .map_err(map_err)
+    }
+}
+
+/// Parse a JS-side `[{ role, content }, ...]` array into the cera
+/// core type, using `js_sys::Reflect` directly rather than going
+/// through `serde-wasm-bindgen`. Both approaches were measured —
+/// they produce **the same wasm size** (the size growth from
+/// `apply_chat_template` is dominated by minijinja's render path,
+/// not the deserialiser). The manual `Reflect` walk is preferred
+/// here because it keeps the dep graph smaller (one less crate to
+/// audit + faster cold builds) for two flat string fields. If a
+/// future surface needs rich nested deserialisation, revisit and
+/// add `serde-wasm-bindgen` then.
+fn parse_chat_messages(value: &JsValue) -> Result<Vec<cera::tokenizer::ChatMessage>, JsError> {
+    let array = value
+        .dyn_ref::<js_sys::Array>()
+        .ok_or_else(|| JsError::new("messages must be an array"))?;
+    // `js_sys::Array::length` returns `u32` and that's the index
+    // type `Array::get` takes — keep `len` in `u32` for the loop
+    // and only widen to `usize` at the `Vec::with_capacity` call.
+    let len = array.length();
+    let mut msgs = Vec::with_capacity(len as usize);
+    let role_key = JsValue::from_str("role");
+    let content_key = JsValue::from_str("content");
+    for i in 0..len {
+        let entry = array.get(i);
+        msgs.push(cera::tokenizer::ChatMessage {
+            role: read_string_field(&entry, &role_key, "role", i)?,
+            content: read_string_field(&entry, &content_key, "content", i)?,
+        });
+    }
+    Ok(msgs)
+}
+
+/// Read a string-typed field off a JS object, distinguishing the
+/// three failure modes a JS caller will commonly hit so the thrown
+/// `JsError` actually points at the bug:
+///   - `entry` is not an object (`Reflect::get` errors)
+///   - the field is missing (`Reflect::get` returns `undefined`)
+///   - the field is present but not a string
+///
+/// `js_sys::Reflect::get` only `Err`s on the first case (proxy
+/// throws, target not Object); missing-property-on-an-Object
+/// returns `Ok(JsValue::UNDEFINED)`, which would otherwise
+/// silently fall through to a misleading "must be a string"
+/// message. Splitting the cases keeps `messages[i].role missing`
+/// distinguishable from `messages[i].role must be a string`.
+fn read_string_field(
+    entry: &JsValue,
+    key: &JsValue,
+    field_name: &str,
+    index: u32,
+) -> Result<String, JsError> {
+    let value = js_sys::Reflect::get(entry, key)
+        .map_err(|_| JsError::new(&format!("messages[{index}] is not an object")))?;
+    if value.is_undefined() {
+        return Err(JsError::new(&format!(
+            "messages[{index}] missing '{field_name}' field"
+        )));
+    }
+    value
+        .as_string()
+        .ok_or_else(|| JsError::new(&format!("messages[{index}].{field_name} must be a string")))
+}
+
+// ---------------------------------------------------------------------------
+// Session + generate
+// ---------------------------------------------------------------------------
+
+/// Per-session knobs frozen at `CeraEngine.newSession(config)` time.
+/// Constructed via `new SessionConfig()` in JS (returns the cera
+/// defaults: `maxSeqLen=null` → engine's effective max, `nKeep=0`,
+/// `seed=null`, `ubatchSize=512`, `kvCompression=null`).
+///
+/// Set `kvCompression` to a [`TurboQuantConfig`] to compress the
+/// KV cache (~3 bits/elem for keys, ~2 bits/elem for values).
+/// See the per-property doc for trade-offs.
+#[wasm_bindgen]
+#[derive(Default, Clone)]
+pub struct SessionConfig {
+    inner: cera::SessionConfig,
+}
+
+#[wasm_bindgen]
+impl SessionConfig {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cap on total tokens held in KV. `null` (the common case)
+    /// defers to the engine's effective max — i.e.
+    /// `min(engine.contextSize, model.maxSeqLen)`. Set to a
+    /// smaller value here to further lower the cap; values larger
+    /// than the engine's effective max are still capped at it.
+    #[wasm_bindgen(getter, js_name = maxSeqLen)]
+    pub fn max_seq_len(&self) -> Option<u32> {
+        self.inner.max_seq_len
+    }
+    #[wasm_bindgen(setter, js_name = maxSeqLen)]
+    pub fn set_max_seq_len(&mut self, v: Option<u32>) {
+        self.inner.max_seq_len = v;
+    }
+
+    /// Number of leading tokens pinned in KV across context shifts —
+    /// a system prompt or persistent prefix that should survive
+    /// when the cache fills. `0` (default) disables the pin.
+    #[wasm_bindgen(getter, js_name = nKeep)]
+    pub fn n_keep(&self) -> u32 {
+        self.inner.n_keep
+    }
+    #[wasm_bindgen(setter, js_name = nKeep)]
+    pub fn set_n_keep(&mut self, v: u32) {
+        self.inner.n_keep = v;
+    }
+
+    /// Deterministic sampler seed. `null` (default) uses a fresh
+    /// random seed per session — set this to make a session's
+    /// outputs reproducible across runs (useful for testing /
+    /// demos / regression checks).
+    #[wasm_bindgen(getter)]
+    pub fn seed(&self) -> Option<u64> {
+        self.inner.seed
+    }
+    #[wasm_bindgen(setter)]
+    pub fn set_seed(&mut self, v: Option<u64>) {
+        self.inner.seed = v;
+    }
+
+    /// Chunked-prefill batch size (tokens per micro-batch during
+    /// the prefill pass). Smaller values give finer-grained
+    /// `Session.cancel()` checkpoints during long prompt eval at
+    /// some perf cost. cera's default is `512`.
+    #[wasm_bindgen(getter, js_name = ubatchSize)]
+    pub fn ubatch_size(&self) -> u32 {
+        self.inner.ubatch_size
+    }
+    #[wasm_bindgen(setter, js_name = ubatchSize)]
+    pub fn set_ubatch_size(&mut self, v: u32) {
+        self.inner.ubatch_size = v;
+    }
+
+    /// KV cache compression configuration. `null` (default) stores
+    /// keys and values as f32 — best fidelity, biggest memory
+    /// footprint. Set to a [`TurboQuantConfig`] to **request**
+    /// TurboQuant compression — keys to ~3 bits/elem, values to
+    /// ~2 bits/elem (plus f16 norms per block); the same `seed`
+    /// reproduces the same per-layer Hadamard rotations
+    /// deterministically.
+    ///
+    /// **Silent fallbacks to be aware of:**
+    /// - TurboQuant only kicks in when the loaded model's
+    ///   attention `head_dim` is a power of two (a constraint of
+    ///   the Hadamard rotation). If it isn't, cera logs a warning
+    ///   and falls back to the uncompressed f32 path even with
+    ///   this set — there's no JS-visible error, just no
+    ///   compression.
+    /// - `nKeep` (context-shift) is incompatible with TurboQuant.
+    ///   Setting both gets a warning at session creation and the
+    ///   `nKeep` value is ignored on KV overflow (the cache
+    ///   overflows hard instead of shifting). Pick one.
+    ///
+    /// Setting this consumes the JS-side `TurboQuantConfig`
+    /// handle (wasm-bindgen's `Option<T>` parameter shape). Read
+    /// back via the getter — which returns a fresh handle that's
+    /// a snapshot, not a live link — if you need to inspect the
+    /// current config without affecting it.
+    #[wasm_bindgen(getter, js_name = kvCompression)]
+    pub fn kv_compression(&self) -> Option<TurboQuantConfig> {
+        match &self.inner.kv_compression {
+            cera::kv_cache::KvCompression::None => None,
+            cera::kv_cache::KvCompression::TurboQuant { seed, keys, values } => {
+                Some(TurboQuantConfig {
+                    seed: *seed,
+                    keys: *keys,
+                    values: *values,
+                })
+            }
+        }
+    }
+    #[wasm_bindgen(setter, js_name = kvCompression)]
+    pub fn set_kv_compression(&mut self, v: Option<TurboQuantConfig>) {
+        self.inner.kv_compression = match v {
+            None => cera::kv_cache::KvCompression::None,
+            Some(tqc) => cera::kv_cache::KvCompression::TurboQuant {
+                seed: tqc.seed,
+                keys: tqc.keys,
+                values: tqc.values,
+            },
+        };
+    }
+}
+
+/// TurboQuant KV-cache compression configuration. Construct via
+/// `new TurboQuantConfig(seed)` for the common production setup
+/// (both `keys` and `values` compressed); flip the per-side
+/// toggles for debugging (e.g. to isolate how much drift each
+/// side contributes).
+///
+/// - **Keys**: 2-bit PolarQuant + 1-bit QJL residual
+///   (3 bits/elem + f16 norms per block).
+/// - **Values**: 2-bit PolarQuant only (2 bits/elem + f16 norms
+///   per block).
+///
+/// `seed` drives the per-layer randomized Hadamard rotations —
+/// the same seed produces the same rotations deterministically,
+/// so a seeded session with TurboQuant on stays bitwise-
+/// reproducible across runs.
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct TurboQuantConfig {
+    seed: u64,
+    keys: bool,
+    values: bool,
+}
+
+#[wasm_bindgen]
+impl TurboQuantConfig {
+    /// Construct with the common production setup: both keys and
+    /// values compressed. Pass an explicit `seed` so the per-layer
+    /// rotations are reproducible.
+    #[wasm_bindgen(constructor)]
+    pub fn new(seed: u64) -> Self {
+        Self {
+            seed,
+            keys: true,
+            values: true,
+        }
+    }
+
+    /// Hadamard-rotation seed. Same seed → same rotations →
+    /// reproducible KV cache contents (necessary for bitwise-
+    /// identical replay across sessions).
+    #[wasm_bindgen(getter)]
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+    #[wasm_bindgen(setter)]
+    pub fn set_seed(&mut self, v: u64) {
+        self.seed = v;
+    }
+
+    /// Compress the K side of the KV cache. Default `true`.
+    /// Useful to flip off when debugging quality regressions to
+    /// isolate K-side vs V-side contribution.
+    #[wasm_bindgen(getter)]
+    pub fn keys(&self) -> bool {
+        self.keys
+    }
+    #[wasm_bindgen(setter)]
+    pub fn set_keys(&mut self, v: bool) {
+        self.keys = v;
+    }
+
+    /// Compress the V side of the KV cache. Default `true`.
+    #[wasm_bindgen(getter)]
+    pub fn values(&self) -> bool {
+        self.values
+    }
+    #[wasm_bindgen(setter)]
+    pub fn set_values(&mut self, v: bool) {
+        self.values = v;
+    }
+}
+
+/// Per-call generation options. Constructed via `new GenerateOpts()`
+/// in JS (returns the cera defaults: `maxTokens=256`,
+/// `temperature=0.7`, `topP=0.9`, `topK=40`, no stop tokens, flush
+/// every 16 tokens or 50 ms).
+///
+/// `repetitionPenalty` is read-only — cera's sampler does not yet
+/// honor it (deferred); exposing the setter would let JS callers pass
+/// values that silently no-op.
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct GenerateOpts {
+    inner: cera::GenerateOpts,
+}
+
+#[wasm_bindgen]
+impl GenerateOpts {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[wasm_bindgen(getter, js_name = maxTokens)]
+    pub fn max_tokens(&self) -> u32 {
+        self.inner.max_tokens
+    }
+    #[wasm_bindgen(setter, js_name = maxTokens)]
+    pub fn set_max_tokens(&mut self, v: u32) {
+        self.inner.max_tokens = v;
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn temperature(&self) -> f32 {
+        self.inner.temperature
+    }
+    #[wasm_bindgen(setter)]
+    pub fn set_temperature(&mut self, v: f32) {
+        self.inner.temperature = v;
+    }
+
+    #[wasm_bindgen(getter, js_name = topP)]
+    pub fn top_p(&self) -> f32 {
+        self.inner.top_p
+    }
+    #[wasm_bindgen(setter, js_name = topP)]
+    pub fn set_top_p(&mut self, v: f32) {
+        self.inner.top_p = v;
+    }
+
+    #[wasm_bindgen(getter, js_name = topK)]
+    pub fn top_k(&self) -> u32 {
+        self.inner.top_k
+    }
+    #[wasm_bindgen(setter, js_name = topK)]
+    pub fn set_top_k(&mut self, v: u32) {
+        self.inner.top_k = v;
+    }
+
+    /// Read-only — cera's sampler doesn't yet honor this field.
+    /// Surfaced as a getter so JS callers can read the default
+    /// (`1.0`); the setter is intentionally absent so callers don't
+    /// pass values that silently no-op.
+    #[wasm_bindgen(getter, js_name = repetitionPenalty)]
+    pub fn repetition_penalty(&self) -> f32 {
+        self.inner.repetition_penalty
+    }
+
+    /// Token IDs that, if produced, end decoding with
+    /// `finishReason = "Stop"`. Empty by default.
+    #[wasm_bindgen(getter, js_name = stopTokens)]
+    pub fn stop_tokens(&self) -> Vec<u32> {
+        self.inner.stop_tokens.clone()
+    }
+    #[wasm_bindgen(setter, js_name = stopTokens)]
+    pub fn set_stop_tokens(&mut self, v: Vec<u32>) {
+        self.inner.stop_tokens = v;
+    }
+
+    #[wasm_bindgen(getter, js_name = flushEveryTokens)]
+    pub fn flush_every_tokens(&self) -> u32 {
+        self.inner.flush_every_tokens
+    }
+    #[wasm_bindgen(setter, js_name = flushEveryTokens)]
+    pub fn set_flush_every_tokens(&mut self, v: u32) {
+        self.inner.flush_every_tokens = v;
+    }
+
+    #[wasm_bindgen(getter, js_name = flushEveryMs)]
+    pub fn flush_every_ms(&self) -> u32 {
+        self.inner.flush_every_ms
+    }
+    #[wasm_bindgen(setter, js_name = flushEveryMs)]
+    pub fn set_flush_every_ms(&mut self, v: u32) {
+        self.inner.flush_every_ms = v;
+    }
+}
+
+/// Summary returned from a completed `Session.generate` call.
+#[wasm_bindgen]
+pub struct GenerateSummary {
+    inner: cera::GenerateSummary,
+}
+
+#[wasm_bindgen]
+impl GenerateSummary {
+    #[wasm_bindgen(getter, js_name = tokensGenerated)]
+    pub fn tokens_generated(&self) -> u32 {
+        self.inner.tokens_generated
+    }
+
+    #[wasm_bindgen(getter, js_name = promptEvalTokens)]
+    pub fn prompt_eval_tokens(&self) -> u32 {
+        self.inner.prompt_eval_tokens
+    }
+
+    #[wasm_bindgen(getter, js_name = promptEvalMs)]
+    pub fn prompt_eval_ms(&self) -> u32 {
+        self.inner.prompt_eval_ms
+    }
+
+    #[wasm_bindgen(getter, js_name = decodeMs)]
+    pub fn decode_ms(&self) -> u32 {
+        self.inner.decode_ms
+    }
+
+    /// Why decode ended. One of `"MaxTokens"`, `"Stop"`,
+    /// `"Cancelled"`, `"ContextFull"`, or `"Error(<message>)"` —
+    /// the `Error(...)` form preserves the inner string verbatim
+    /// (no surrounding quotes), so JS callers can log it directly.
+    #[wasm_bindgen(getter, js_name = finishReason)]
+    pub fn finish_reason(&self) -> String {
+        // `format!("{:?}", reason)` would render `Error(String)` as
+        // `Error("...")` (with the Debug-quoted inner string).
+        // Match each variant explicitly so the public shape matches
+        // the doc comment: `Error(plain inner message)` and bare
+        // names for the payload-free variants.
+        match &self.inner.finish_reason {
+            cera::FinishReason::MaxTokens => "MaxTokens".to_string(),
+            cera::FinishReason::Stop => "Stop".to_string(),
+            cera::FinishReason::Cancelled => "Cancelled".to_string(),
+            cera::FinishReason::ContextFull => "ContextFull".to_string(),
+            cera::FinishReason::Error(msg) => format!("Error({msg})"),
+        }
+    }
+}
+
+/// Stateful generation handle. Built via `CeraEngine.newSession(config)`.
+///
+/// JS callers seed the conversation by calling `appendText` /
+/// `appendTokens` and then drive decode with `generate(opts, cb)`.
+/// The callback fires once per flush boundary (every
+/// `flushEveryTokens` decoded tokens, or `flushEveryMs` ms,
+/// whichever comes first) with the new tokens.
+///
+/// **Worker note:** `generate` is synchronous and will block the
+/// thread it runs on for the duration of decode (potentially
+/// seconds). On the browser main thread that freezes the page —
+/// always call from a Web Worker. On Node it also blocks the JS
+/// event loop (libuv's background I/O thread pool keeps running,
+/// but JS callbacks queue): use `worker_threads` for server
+/// processes that need to handle other requests during inference;
+/// one-off scripts are fine to run sync.
+///
+/// **Cancellation:** since the worker thread is blocked inside
+/// `generate`, the worker's own `onmessage` handler can't run —
+/// incoming `postMessage({kind:'cancel'})` queues but doesn't
+/// dispatch until `generate` returns, so a flag set by that
+/// handler can't be updated mid-decode. To cancel during a
+/// running `generate` call, either call `session.cancel()` from inside
+/// the token callback based on state it can observe directly
+/// (elapsed time, token budget, accumulated content), or use
+/// cross-thread shared memory signalling (`SharedArrayBuffer` +
+/// `Atomics`) — see `cera-wasm/README.md` for the full
+/// `SharedArrayBuffer` pattern, which requires cross-origin
+/// isolation in browsers.
+#[wasm_bindgen]
+pub struct Session {
+    inner: cera::Session,
+}
+
+#[wasm_bindgen]
+impl Session {
+    /// Tokenize `text` using the session's tokenizer and append the
+    /// result to the KV cache. Equivalent to
+    /// `appendTokens(tokenizer.encode(text))` but avoids the round
+    /// trip through JS for the encoded buffer.
+    #[wasm_bindgen(js_name = appendText)]
+    pub fn append_text(&mut self, text: &str) -> Result<(), JsError> {
+        self.inner.append_text(text).map_err(map_cera_err)
+    }
+
+    /// Append already-tokenized IDs to the KV cache. Use when you
+    /// need control over BOS/EOS framing or you've cached tokens
+    /// from a previous encode.
+    #[wasm_bindgen(js_name = appendTokens)]
+    pub fn append_tokens(&mut self, tokens: &[u32]) -> Result<(), JsError> {
+        self.inner.append_tokens(tokens).map_err(map_cera_err)
+    }
+
+    /// Append PCM audio samples (mono `f32`, normalized to roughly
+    /// `[-1.0, 1.0]`) at `sample_rate` Hz.
+    ///
+    /// **Status: placeholder.** The wasm shape is wired through to
+    /// `cera::Session::append_audio`, but the cera core method is
+    /// currently a scaffold — for any model it errors, either with
+    /// the `UnsupportedModality` variant (text-only LLMs) or with
+    /// a `Backend(...)` variant (audio-capable models, awaiting
+    /// Session-side audio-tokenizer wiring). This export exists so
+    /// JS / TS consumers can lock in the symbol + signature now and
+    /// the wasm-pack `.d.ts` artifact catches any future shape
+    /// changes; it does **not** yet decode and append audio tokens.
+    /// Mirrors the same placeholder framing that cera-ffi shipped
+    /// in PR #78.
+    ///
+    /// `samples` arrives as `Float32Array` on the JS side. The
+    /// wasm-bindgen boundary copies the typed-array contents into
+    /// wasm linear memory once — there's no per-element boxing
+    /// (contrast with Kotlin's `List<Float>` 4× memory overhead
+    /// flagged in PR #78). The `&[f32]` Rust signature matches
+    /// `appendTokens(&[u32])` and avoids the per-call `Vec`
+    /// allocation that an owned parameter would require.
+    ///
+    /// Errors today are thrown as JS `Error`s; the message string
+    /// is the underlying `cera::CeraError::Display` text (same as
+    /// `appendText` / `appendTokens` produce):
+    /// - `"empty input"` if `samples.length === 0` — fast-fail at
+    ///   the wasm boundary, parity with `appendText` /
+    ///   `appendTokens` empty-input rejection.
+    /// - `"modality not supported by this model"` for text-only
+    ///   models (`session.capabilities.audioIn === false` —
+    ///   currently always `false` under the synthetic-text
+    ///   loader; see `CeraEngine.capabilities` doc).
+    /// - `"backend: Session::append_audio is not yet implemented for audio-capable models — ..."`
+    ///   for audio-capable models — placeholder string until the
+    ///   real implementation lands.
+    #[wasm_bindgen(js_name = appendAudio)]
+    pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), JsError> {
+        if samples.is_empty() {
+            return Err(map_cera_err(cera::CeraError::EmptyInput));
+        }
+        self.inner
+            .append_audio(samples, sample_rate)
+            .map_err(map_cera_err)
+    }
+
+    /// Current KV cache position (number of tokens currently held).
+    #[wasm_bindgen(getter)]
+    pub fn position(&self) -> u32 {
+        self.inner.position()
+    }
+
+    /// Modality capability flags reported by the model backing
+    /// this session. Same shape as `CeraEngine.capabilities` —
+    /// see that getter for the `Capabilities` field documentation
+    /// and the synthetic-text caveat that applies to all
+    /// `fromGgufBytes`-loaded models today.
+    #[wasm_bindgen(getter)]
+    pub fn capabilities(&self) -> Capabilities {
+        capabilities_to_js(self.inner.capabilities())
+    }
+
+    /// Flip the cancel atomic, requesting that any in-flight
+    /// `generate` call exit at its next checkpoint with
+    /// `finishReason = "Cancelled"`. Safe to call from any thread
+    /// (including a Worker that owns this session — though wasm
+    /// without SharedArrayBuffer makes cross-thread sharing
+    /// unusual).
+    #[wasm_bindgen]
+    pub fn cancel(&self) {
+        self.inner.cancel()
+    }
+
+    /// Clear the cancel flag without dropping any session state.
+    /// Use this after observing a cancellation signal — either a
+    /// thrown cancellation error from `appendText` / `appendTokens`
+    /// (mid-prefill cancellation surfaces as a thrown error) or
+    /// `summary.finishReason === "Cancelled"` on the value
+    /// returned from `generate` (cancellation during decode is
+    /// reported via the finish reason, not a thrown error) — when
+    /// you want to resume work on the same session without losing
+    /// the accumulated KV cache.
+    ///
+    /// Compared to `reset()`:
+    /// - `clearCancel`: keeps KV state, `position`, and the
+    ///   sampler intact; only flips the cancel atomic back to
+    ///   `false`. Use for "interrupted but continuing" flows.
+    /// - `reset()`: drops KV cache, `position`, last logits, and
+    ///   re-seeds the sampler. Use for "clear conversation"
+    ///   flows.
+    ///
+    /// **Call sequencing:** invoke this *after* `generate` /
+    /// `appendText` / `appendTokens` has returned. Even though
+    /// the underlying cera method takes `&self`, wasm-bindgen's
+    /// JS-side borrow check on the `Session` wrapper rejects any
+    /// method call (including this `&self` one) while another
+    /// method is still borrowing the same handle — calling
+    /// `session.clearCancel()` from inside a `generate` token
+    /// callback would throw "recursive use of an object". The
+    /// `&self` Rust shape matters in the native binding
+    /// (`cera-ffi`) where there's no JS-side borrow check; in
+    /// wasm it just means there's no `&mut self` cost on the cera
+    /// core side.
+    #[wasm_bindgen(js_name = clearCancel)]
+    pub fn clear_cancel(&self) {
+        self.inner.clear_cancel()
+    }
+
+    /// Drop accumulated state and return the session to a freshly-
+    /// opened shape. Clears the KV cache, `position`, the last
+    /// logits, and the cancel flag, then re-seeds the sampler from
+    /// the `SessionConfig.seed` originally passed to `newSession`.
+    ///
+    /// Use this for "clear conversation" UI actions — it skips the
+    /// per-session setup cost that `engine.newSession(config)`
+    /// would pay (model + tokenizer Arc clones, sampler ctor),
+    /// while still leaving the session indistinguishable from a
+    /// fresh one.
+    ///
+    /// Sampler re-seed semantics:
+    /// - `SessionConfig.seed = some bigint` — deterministic
+    ///   sessions stay deterministic across `reset()`; the next
+    ///   `generate` produces the same first token sequence as the
+    ///   original.
+    /// - `SessionConfig.seed = null` — the sampler picks a new
+    ///   random seed on each `reset()`, so successive
+    ///   conversations decorrelate.
+    ///
+    /// Engine-level disk prefix cache (when configured on
+    /// `CeraEngine`) is not touched — those entries are
+    /// engine-scoped, not session-scoped.
+    ///
+    /// **Threading:** unlike `cancel()` (which only flips an
+    /// atomic and is safe to call concurrently with anything),
+    /// `reset()` takes `&mut self` and rebuilds non-atomic
+    /// internal state (KV cache, sampler). Must be called on
+    /// the owning thread, with no in-flight `generate` /
+    /// `appendText` / `appendTokens` running. The wasm-bindgen
+    /// borrow check enforces this within a single Worker; if
+    /// you share a `Session` across Workers via
+    /// `SharedArrayBuffer`-style schemes, it's on you to
+    /// serialize calls.
+    #[wasm_bindgen]
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    /// Decode tokens until `opts.maxTokens`, a stop token, EOS, or
+    /// `cancel()` fires. The `onTextTokens` callback is invoked once
+    /// per flush boundary with a `Uint32Array` of the latest tokens
+    /// (*not* the cumulative buffer — concatenate yourself if you
+    /// want the full sequence).
+    ///
+    /// Returns the `GenerateSummary` once decode finishes. Throws
+    /// `JsError` on backend failure (the summary's `finishReason`
+    /// already covers logical end conditions like `"Stop"` or
+    /// `"ContextFull"`).
+    #[wasm_bindgen]
+    pub fn generate(
+        &mut self,
+        opts: &GenerateOpts,
+        on_text_tokens: &js_sys::Function,
+    ) -> Result<GenerateSummary, JsError> {
+        let mut sink = JsTextSink {
+            on_text: on_text_tokens,
+        };
+        self.inner
+            .generate(&opts.inner, &mut sink)
+            .map(|inner| GenerateSummary { inner })
+            .map_err(map_cera_err)
+    }
+}
+
+/// Internal `ModalitySink` implementation that trampolines text
+/// tokens to a JS callback. Audio frames are dropped (text-only
+/// flow); a separate `JsAudioSink` will land alongside the audio
+/// engine wrapper in a future PR.
+struct JsTextSink<'a> {
+    on_text: &'a js_sys::Function,
+}
+
+impl<'a> cera::ModalitySink for JsTextSink<'a> {
+    fn on_text_tokens(&mut self, tokens: &[u32]) {
+        // `Uint32Array::from(&[u32])` allocates JS-owned memory and
+        // copies the slice in. We *could* use `Uint32Array::view`
+        // for zero-copy, but the resulting view becomes invalid the
+        // moment Rust grows linear memory mid-call (a footgun JS
+        // callers would hit randomly). Per-flush copy cost is
+        // trivial relative to a forward pass.
+        let array = js_sys::Uint32Array::from(tokens);
+        // Treat any exception thrown by the JS callback as fatal:
+        // re-throw it across the wasm boundary so it lands in the
+        // JS caller's `try { ... } catch` around `session.generate`.
+        // `wasm_bindgen::throw_val` aborts the current Rust call
+        // immediately — cera's generate loop has no defined
+        // recovery path for sink errors anyway, so unwinding mid-
+        // decode is no worse than a `cancel()` (the KV cache is
+        // left in whatever state the partial decode produced).
+        if let Err(err) = self.on_text.call1(&JsValue::null(), &array) {
+            wasm_bindgen::throw_val(err);
+        }
+    }
+
+    fn on_done(&mut self, _reason: cera::FinishReason) {
+        // The `GenerateSummary` already carries the finish reason;
+        // no need to re-emit it through the sink. JS callers see it
+        // via `summary.finishReason` after `generate` returns.
+    }
+}

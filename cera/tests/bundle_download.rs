@@ -1,0 +1,127 @@
+//! End-to-end smoke test for `BundleRepo` against a real HuggingFace
+//! URL. Proves the downloader + integrity check + cache-hit codepath
+//! actually work against the upstream CDN, on a real GGUF.
+//!
+//! Two assertions:
+//! 1. A fresh `BundleRepo` resolves an HF URL, downloads the file, and
+//!    the resulting path loads into a `CeraEngine` without error —
+//!    this exercises SHA-256-on-the-fly hashing + `X-Linked-Etag`
+//!    verification against the live HF CDN.
+//! 2. A second `resolve_url` call for the same URL returns the same
+//!    path without re-downloading (proved by comparing mtimes).
+//!
+//! Gating: `#[ignore]` + `CERA_TEST_DOWNLOAD=1` env var so `cargo test`
+//! never hits the network. To opt in:
+//!
+//! ```sh
+//! CERA_TEST_DOWNLOAD=1 cargo test -p cera --features remote \
+//!     --test bundle_download -- --ignored
+//! ```
+//!
+//! On CI, the download is cached under `target/tmp/cera-test-models/`
+//! so repeat runs pay only an HTTP HEAD probe.
+
+#![cfg(feature = "remote")]
+
+mod common;
+
+use std::time::SystemTime;
+
+use cera::bundle::BundleRepo;
+use cera::engine::{BackendPreference, CeraEngine, EngineConfig, ModelFiles};
+
+/// LFM2-350M-Extract Q4_0 GGUF — the same file `from_bundle_id` pulls
+/// in `bundle_from_id.rs` (its manifest's `model` URL points here), so
+/// CI's `target/tmp/cera-test-models` cache is shared across all three
+/// integration tests and pays only a HEAD probe on subsequent runs.
+/// Mutable `resolve/main/` ref is intentional — these tests assert
+/// load-and-shift sanity, not bit-exact weight equality. If upstream
+/// re-uploads, `BundleRepo`'s validation policy detects the changed
+/// artifact via `X-Linked-Etag` (or per-file SHA-256 when supplied)
+/// and falls back to `Content-Length` only when no hash-like
+/// identifier is available — either way a re-download fires on the
+/// next run. Phase 1.6's `BundleRepo` is where pinning to a revision
+/// hash belongs.
+const MODEL_URL: &str = "https://huggingface.co/LiquidAI/LFM2-350M-Extract-GGUF/resolve/main/LFM2-350M-Extract-Q4_0.gguf";
+const MODEL_FILE: &str = "LFM2-350M-Extract-Q4_0.gguf";
+
+#[test]
+#[ignore = "downloads ~210 MB; set CERA_TEST_DOWNLOAD=1 and pass --ignored"]
+fn bundle_repo_resolves_and_loads_from_hf() {
+    if std::env::var("CERA_TEST_DOWNLOAD").is_err() {
+        eprintln!("skipping: CERA_TEST_DOWNLOAD not set");
+        return;
+    }
+
+    // Use the shared test cache via the `common` helper — exercises the
+    // same BundleRepo codepath but rooted in the CI-cached location so
+    // repeat runs don't redownload.
+    let path = common::download::ensure_cached(MODEL_URL, MODEL_FILE);
+    assert!(
+        path.exists(),
+        "BundleRepo.resolve_url did not produce an existing file at {}",
+        path.display()
+    );
+
+    // Sanity: the file is large enough to be a real GGUF (>150 MB —
+    // LFM2-350M-Extract Q4_0 is ~209 MB).
+    let size = std::fs::metadata(&path)
+        .expect("stat downloaded file")
+        .len();
+    assert!(
+        size > 150 * 1024 * 1024,
+        "downloaded file only {size} bytes — HF returned an error page?"
+    );
+
+    // End-to-end: feed the resolved path into CeraEngine. A bogus
+    // download (truncated / wrong content-type page) would fail GGUF
+    // header parse here, so this doubles as an integrity smoke test.
+    let engine = CeraEngine::from_files(
+        ModelFiles::text(&path),
+        EngineConfig {
+            context_size: 128,
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        },
+    )
+    .expect("load engine from resolved bundle file");
+    let meta = engine.metadata();
+    assert!(
+        meta.max_seq_len > 0,
+        "engine metadata missing max_seq_len — model parse failed silently"
+    );
+}
+
+#[test]
+#[ignore = "downloads ~210 MB; set CERA_TEST_DOWNLOAD=1 and pass --ignored"]
+fn bundle_repo_cache_hit_does_not_redownload() {
+    if std::env::var("CERA_TEST_DOWNLOAD").is_err() {
+        eprintln!("skipping: CERA_TEST_DOWNLOAD not set");
+        return;
+    }
+
+    // Pre-populate via the shared helper so we're measuring a cache hit
+    // on the *second* call regardless of whether the first test ran.
+    let first = common::download::ensure_cached(MODEL_URL, MODEL_FILE);
+    let mtime_before = first
+        .metadata()
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    // A fresh BundleRepo pointed at the same store_dir must see the
+    // cached file via the HEAD-probe policy — no rewrite.
+    let repo = BundleRepo::new(common::download::cache_dir());
+    let second = repo
+        .resolve_url(MODEL_URL, None)
+        .expect("resolve on cache hit");
+    assert_eq!(first, second, "cache-hit path should match the first call");
+
+    let mtime_after = second
+        .metadata()
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    assert_eq!(
+        mtime_before, mtime_after,
+        "cache hit should not rewrite the file (mtime changed)"
+    );
+}

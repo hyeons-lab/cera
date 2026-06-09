@@ -27,30 +27,30 @@ fmt-fix:
 
 # Run the CLI with arguments
 run *ARGS:
-    cargo run --bin wick -- {{ARGS}}
+    cargo run --bin cera -- {{ARGS}}
 
 # Run benchmarks
 bench *ARGS:
-    cargo run --release --bin wick -- bench {{ARGS}}
+    cargo run --release --bin cera -- bench {{ARGS}}
 
 # Run all CI checks locally (mirrors GitHub Actions)
 ci: fmt clippy test
 
 # Platform-specific shared-library path for the uniffi-bindgen
 # `--library` argument. `os()` is a just built-in.
-# - macOS: `libwick_ffi.dylib`
-# - Linux / other unix: `libwick_ffi.so`
-# - Windows: `wick_ffi.dll` (no `lib` prefix — Rust follows the
+# - macOS: `libcera_ffi.dylib`
+# - Linux / other unix: `libcera_ffi.so`
+# - Windows: `cera_ffi.dll` (no `lib` prefix — Rust follows the
 #   Windows convention on that target).
-WICK_FFI_DYLIB := if os() == "macos" {
-    "target/debug/libwick_ffi.dylib"
+CERA_FFI_DYLIB := if os() == "macos" {
+    "target/debug/libcera_ffi.dylib"
 } else if os() == "windows" {
-    "target/debug/wick_ffi.dll"
+    "target/debug/cera_ffi.dll"
 } else {
-    "target/debug/libwick_ffi.so"
+    "target/debug/libcera_ffi.so"
 }
 
-# Regenerate the vendored Kotlin + Swift bindings in wick-ffi/bindings/.
+# Regenerate the vendored Kotlin + Swift bindings in cera-ffi/bindings/.
 # Runs the `uniffi-bindgen` binary in this repo against the freshly-built
 # debug cdylib. Kotlin output is ktlint-formatted automatically (uniffi
 # invokes ktlint on PATH); Swift is formatter-free (no standard Swift
@@ -58,7 +58,7 @@ WICK_FFI_DYLIB := if os() == "macos" {
 # exports change.
 #
 # `--features bindgen` on the `cargo run` invocations turns on the
-# opt-in `wick-ffi/bindgen` crate feature, which pulls in
+# opt-in `cera-ffi/bindgen` crate feature, which pulls in
 # `uniffi/cli` (clap + friends) only for the binary build. Mobile
 # consumers of the library / cdylib / staticlib never build with
 # this feature, so their binaries stay lean.
@@ -68,31 +68,31 @@ WICK_FFI_DYLIB := if os() == "macos" {
 # package manager. CI installs it as part of the ffi-bindings-drift
 # job.
 bindings:
-    cargo build -p wick-ffi
-    cargo run -q -p wick-ffi --bin uniffi-bindgen --features bindgen -- generate \
-        --library {{WICK_FFI_DYLIB}} \
+    cargo build -p cera-ffi
+    cargo run -q -p cera-ffi --bin uniffi-bindgen --features bindgen -- generate \
+        --library {{CERA_FFI_DYLIB}} \
         --language kotlin \
-        --out-dir wick-ffi/bindings/kotlin
-    cargo run -q -p wick-ffi --bin uniffi-bindgen --features bindgen -- generate \
-        --library {{WICK_FFI_DYLIB}} \
+        --out-dir cera-ffi/bindings/kotlin
+    cargo run -q -p cera-ffi --bin uniffi-bindgen --features bindgen -- generate \
+        --library {{CERA_FFI_DYLIB}} \
         --language swift \
-        --out-dir wick-ffi/bindings/swift
+        --out-dir cera-ffi/bindings/swift
 
 # Verify the committed Kotlin + Swift bindings are up to date with the
 # current Rust FFI surface. Regenerates in-place and fails if `git diff`
 # shows changes — signals that someone touched a `#[uniffi::*]` export
 # without running `just bindings`. CI runs this too; see ci.yml.
 bindings-check: bindings
-    @if [ -n "$(git status --porcelain wick-ffi/bindings)" ]; then \
+    @if [ -n "$(git status --porcelain cera-ffi/bindings)" ]; then \
         echo "ERROR: vendored bindings are stale. Run \`just bindings\` and commit the diff."; \
-        git --no-pager diff wick-ffi/bindings; \
+        git --no-pager diff cera-ffi/bindings; \
         exit 1; \
     fi
 
-# Cross-compile `wick-ffi` as a `.so` for every Android ABI supported
+# Cross-compile `cera-ffi` as a `.so` for every Android ABI supported
 # by the Android NDK: arm64-v8a (modern devices), armeabi-v7a (older),
 # x86_64 (emulator on Intel hosts), x86 (emulator on legacy Intel hosts).
-# Produces `target/<triple>/release/libwick_ffi.so` per ABI.
+# Produces `target/<triple>/release/libcera_ffi.so` per ABI.
 #
 # Requires `cargo-ndk` v4.x (`cargo install cargo-ndk --version '^4'
 # --locked` — pin the major because 4.0 changed the flag shape to
@@ -112,16 +112,16 @@ android-all:
         --target armeabi-v7a \
         --target x86_64 \
         --target x86 \
-        build -p wick-ffi --release
+        build -p cera-ffi --release
 
 # Single-ABI variant — useful when iterating on one device architecture
 # and you don't need to rebuild all four every cycle. Picks arm64-v8a
 # as the default since it's what real Android phones ship with today.
 android-arm64:
-    cargo ndk --target arm64-v8a build -p wick-ffi --release
+    cargo ndk --target arm64-v8a build -p cera-ffi --release
 
-# Cross-compile `wick-ffi` to all three arm64-only Apple-platform
-# targets and assemble a `WickFFI.xcframework` ready for Swift
+# Cross-compile `cera-ffi` to all three arm64-only Apple-platform
+# targets and assemble a `CeraFFI.xcframework` ready for Swift
 # Package Manager / Xcode consumption. Three single-arch slices:
 # real iPhones (`ios-arm64`), Apple Silicon Mac iOS Simulator
 # (`ios-arm64-simulator`), and native Apple Silicon Macs
@@ -135,34 +135,34 @@ android-arm64:
 # staticlib is portable across Apple Silicon Macs (otherwise the
 # build host's specific microarch leaks into the binary).
 #
-# The vendored Swift bindings under `wick-ffi/bindings/swift/`
+# The vendored Swift bindings under `cera-ffi/bindings/swift/`
 # provide the headers + module map; CI regenerates them via the
 # `ffi-bindings-drift` job so they stay locked to the current Rust
 # surface.
 #
-# Output: `target/xcframework-build/WickFFI.xcframework` (~125 MB,
+# Output: `target/xcframework-build/CeraFFI.xcframework` (~125 MB,
 # 42 MB per slice). CI uploads the same path as a per-run artifact.
 apple-xcframework:
     #!/usr/bin/env bash
     set -euo pipefail
-    RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-ios --release
-    RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-ios-sim --release
-    RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-darwin --release
+    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release
+    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios-sim --release
+    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release
     OUT=target/xcframework-build
     rm -rf "$OUT"
     mkdir -p "$OUT/headers"
     # Stage the headers + module map next to where xcodebuild will
-    # look. UniFFI-generated `wick_ffiFFI.modulemap` is renamed to
+    # look. UniFFI-generated `cera_ffiFFI.modulemap` is renamed to
     # `module.modulemap` on the way in — Xcode's framework conventions
     # require that exact filename inside a `Headers/` directory.
-    cp wick-ffi/bindings/swift/wick_ffiFFI.h "$OUT/headers/"
-    cp wick-ffi/bindings/swift/wick_ffiFFI.modulemap "$OUT/headers/module.modulemap"
+    cp cera-ffi/bindings/swift/cera_ffiFFI.h "$OUT/headers/"
+    cp cera-ffi/bindings/swift/cera_ffiFFI.modulemap "$OUT/headers/module.modulemap"
     xcodebuild -create-xcframework \
-        -library target/aarch64-apple-ios/release/libwick_ffi.a -headers "$OUT/headers" \
-        -library target/aarch64-apple-ios-sim/release/libwick_ffi.a -headers "$OUT/headers" \
-        -library target/aarch64-apple-darwin/release/libwick_ffi.a -headers "$OUT/headers" \
-        -output "$OUT/WickFFI.xcframework"
-    echo "Built $OUT/WickFFI.xcframework"
+        -library target/aarch64-apple-ios/release/libcera_ffi.a -headers "$OUT/headers" \
+        -library target/aarch64-apple-ios-sim/release/libcera_ffi.a -headers "$OUT/headers" \
+        -library target/aarch64-apple-darwin/release/libcera_ffi.a -headers "$OUT/headers" \
+        -output "$OUT/CeraFFI.xcframework"
+    echo "Built $OUT/CeraFFI.xcframework"
 
 # Single-target iOS smoke test — verifies the device cross-compile
 # works without paying for the full apple-xcframework pipeline (3
@@ -178,10 +178,10 @@ apple-xcframework:
 # apple-darwin), but the override forestalls an externally-set
 # RUSTFLAGS environment variable from contaminating this smoke build.
 ios-arm64:
-    RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-ios --release
+    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release
 
 # End-to-end Swift integration test against the macOS slice. Compiles
-# `wick-ffi/tests/swift/main.swift` together with the vendored Swift
+# `cera-ffi/tests/swift/main.swift` together with the vendored Swift
 # binding, links against the freshly-built `aarch64-apple-darwin`
 # staticlib, runs the resulting binary. Exercises function calls,
 # enum + record marshaling, and FfiError round-trip end-to-end.
@@ -197,33 +197,33 @@ ios-arm64:
 swift-smoke:
     #!/usr/bin/env bash
     set -euo pipefail
-    RUSTFLAGS="" cargo build -p wick-ffi --target aarch64-apple-darwin --release
+    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release
     swiftc \
-        wick-ffi/tests/swift/main.swift \
-        wick-ffi/bindings/swift/wick_ffi.swift \
-        -import-objc-header wick-ffi/bindings/swift/wick_ffiFFI.h \
+        cera-ffi/tests/swift/main.swift \
+        cera-ffi/bindings/swift/cera_ffi.swift \
+        -import-objc-header cera-ffi/bindings/swift/cera_ffiFFI.h \
         -L target/aarch64-apple-darwin/release \
-        -lwick_ffi \
-        -o target/wick-swift-smoke
-    target/wick-swift-smoke
+        -lcera_ffi \
+        -o target/cera-swift-smoke
+    target/cera-swift-smoke
 
-# Build the `wick-wasm` npm-shaped package via `wasm-pack`
+# Build the `cera-wasm` npm-shaped package via `wasm-pack`
 # (bundler target — see `wasm-web` / `wasm-node` for siblings).
 #
 # Wraps `cargo build --target wasm32-unknown-unknown` + `wasm-bindgen-cli`
-# + `wasm-opt -O3` and writes the output to `wick-wasm/pkg-bundler/`
+# + `wasm-opt -O3` and writes the output to `cera-wasm/pkg-bundler/`
 # (gitignored — the matrix layout uses `pkg-<target>` to keep the
 # three target outputs from colliding). The result includes
-# `package.json`, `wick_wasm.js`, `wick_wasm.d.ts`,
-# `wick_wasm_bg.wasm`, and the README — drop-in for
-# `npm install ./wick-wasm/pkg-bundler`.
+# `package.json`, `cera_wasm.js`, `cera_wasm.d.ts`,
+# `cera_wasm_bg.wasm`, and the README — drop-in for
+# `npm install ./cera-wasm/pkg-bundler`.
 #
 # Target is `bundler` (webpack / Vite / Rollup-friendly ESM). Use
 # `just wasm-web` for direct browser ESM (`<script type="module">`)
 # or `just wasm-node` for CommonJS Node consumers.
 #
 # `--scope hyeonslab` makes the generated `package.json.name`
-# `@hyeonslab/wick-wasm` so a published artifact lands under the
+# `@hyeonslab/cera-wasm` so a published artifact lands under the
 # right npm scope. The publish workflow itself is a follow-up PR;
 # this just locks the name.
 #
@@ -234,35 +234,35 @@ swift-smoke:
 #   - `wasm32-unknown-unknown` rustup target
 #     (`rustup target add wasm32-unknown-unknown`)
 #
-# wasm-opt flags are pinned in `wick-wasm/Cargo.toml` under
+# wasm-opt flags are pinned in `cera-wasm/Cargo.toml` under
 # `[package.metadata.wasm-pack.profile.release]` so this recipe and the
-# CI `wick-wasm-pack` job produce byte-identical output.
+# CI `cera-wasm-pack` job produce byte-identical output.
 wasm:
-    wasm-pack build wick-wasm --target bundler --release --scope hyeonslab --out-dir pkg-bundler
-    @echo "--- wick-wasm/pkg-bundler/ ---"
-    @ls -lh wick-wasm/pkg-bundler/
+    wasm-pack build cera-wasm --target bundler --release --scope hyeonslab --out-dir pkg-bundler
+    @echo "--- cera-wasm/pkg-bundler/ ---"
+    @ls -lh cera-wasm/pkg-bundler/
 
 # Build the `--target web` variant — direct browser ESM, no bundler
-# required. Consumers `import init, { ... } from './wick_wasm.js'`
+# required. Consumers `import init, { ... } from './cera_wasm.js'`
 # and `await init()` once before calling exports. Right shape for
 # `<script type="module">` and bundler-less workflows.
 wasm-web:
-    wasm-pack build wick-wasm --target web --release --scope hyeonslab --out-dir pkg-web
-    @echo "--- wick-wasm/pkg-web/ ---"
-    @ls -lh wick-wasm/pkg-web/
+    wasm-pack build cera-wasm --target web --release --scope hyeonslab --out-dir pkg-web
+    @echo "--- cera-wasm/pkg-web/ ---"
+    @ls -lh cera-wasm/pkg-web/
 
 # Build the `--target nodejs` variant — CommonJS module that Node
-# consumers `require('@hyeonslab/wick-wasm')` directly without the
+# consumers `require('@hyeonslab/cera-wasm')` directly without the
 # experimental-wasm-modules dance. Right shape for Node CLI tools
 # / scripts that prefer CommonJS or are stuck on older Node.
 wasm-node:
-    wasm-pack build wick-wasm --target nodejs --release --scope hyeonslab --out-dir pkg-nodejs
-    @echo "--- wick-wasm/pkg-nodejs/ ---"
-    @ls -lh wick-wasm/pkg-nodejs/
+    wasm-pack build cera-wasm --target nodejs --release --scope hyeonslab --out-dir pkg-nodejs
+    @echo "--- cera-wasm/pkg-nodejs/ ---"
+    @ls -lh cera-wasm/pkg-nodejs/
 
 # ── Multi-threaded wasm builds ──────────────────────────────────────────
 #
-# Threaded variants light up `wick`'s rayon paths (batched prefill
+# Threaded variants light up `cera`'s rayon paths (batched prefill
 # GEMM, parallel GEMV row sweeps, dequant_rows_to_f32) on the wasm
 # target via `wasm-bindgen-rayon`. The generated package surfaces a
 # `initThreadPool(numThreads)` JS export that callers `await` once
@@ -270,7 +270,7 @@ wasm-node:
 #
 # Three things turn this on together — none of them are useful
 # without the others:
-#   1. `--features parallel` on `wick-wasm` enables `wick/parallel`
+#   1. `--features parallel` on `cera-wasm` enables `cera/parallel`
 #      (rayon) and links `wasm-bindgen-rayon` (the JS thread-pool
 #      shim).
 #   2. `RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals"`
@@ -332,26 +332,26 @@ WASM_MT_RUSTFLAGS := "-C target-feature=+atomics,+bulk-memory,+mutable-globals" 
 # calls run rayon work on the worker pool.
 wasm-web-mt:
     RUSTFLAGS="{{WASM_MT_RUSTFLAGS}}" \
-    wasm-pack build wick-wasm \
+    wasm-pack build cera-wasm \
         --target web --release \
         --scope hyeonslab --out-dir pkg-web-mt \
         -- --features parallel \
         -Z build-std=panic_abort,std
-    @echo "--- wick-wasm/pkg-web-mt/ ---"
-    @ls -lh wick-wasm/pkg-web-mt/
+    @echo "--- cera-wasm/pkg-web-mt/ ---"
+    @ls -lh cera-wasm/pkg-web-mt/
 
 # Build the `--target nodejs` threaded variant — `pkg-nodejs-mt/`.
 # Node consumers `await initThreadPool(os.cpus().length)` once before
 # driving inference; the pool is backed by `worker_threads`.
 wasm-node-mt:
     RUSTFLAGS="{{WASM_MT_RUSTFLAGS}}" \
-    wasm-pack build wick-wasm \
+    wasm-pack build cera-wasm \
         --target nodejs --release \
         --scope hyeonslab --out-dir pkg-nodejs-mt \
         -- --features parallel \
         -Z build-std=panic_abort,std
-    @echo "--- wick-wasm/pkg-nodejs-mt/ ---"
-    @ls -lh wick-wasm/pkg-nodejs-mt/
+    @echo "--- cera-wasm/pkg-nodejs-mt/ ---"
+    @ls -lh cera-wasm/pkg-nodejs-mt/
 
 # Clean build artifacts
 clean:

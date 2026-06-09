@@ -12,7 +12,7 @@ def find_models(models_dir):
         return models
     for root, dirs, files in os.walk(models_dir):
         for file in files:
-            # Filter for LLM/VL models (wick only supports LFM2 architecture currently)
+            # Filter for LLM/VL models (cera only supports LFM2 architecture currently)
             if file.endswith(".gguf") and "LFM2" in file and "vocoder" not in file and "Audio" not in file:
                 models.append(Path(root) / file)
     return sorted(models)
@@ -28,11 +28,11 @@ def parse_time_output(stderr):
             footprint = int(line.strip().split()[0])
     return rss, footprint
 
-def run_wick(wick_bin, model_path, prompt_len, gen_len, runs):
-    print(f"  [wick] p={prompt_len} n={gen_len}...")
+def run_cera(cera_bin, model_path, prompt_len, gen_len, runs):
+    print(f"  [cera] p={prompt_len} n={gen_len}...")
     cmd = [
         "/usr/bin/time", "-l",
-        str(wick_bin), "bench",
+        str(cera_bin), "bench",
         "--model", str(model_path),
         "--prompt-tokens", str(prompt_len),
         "--max-tokens", str(gen_len),
@@ -43,7 +43,7 @@ def run_wick(wick_bin, model_path, prompt_len, gen_len, runs):
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        # Parse tok/s from stderr (wick bench outputs diagnostics to stderr)
+        # Parse tok/s from stderr (cera bench outputs diagnostics to stderr)
         decode_match = re.search(r"decode tok/s: p50=([\d.]+)", proc.stderr)
         prefill_match = re.search(r"prefill tok/s: p50=([\d.]+)", proc.stderr)
         
@@ -53,7 +53,7 @@ def run_wick(wick_bin, model_path, prompt_len, gen_len, runs):
         rss, footprint = parse_time_output(proc.stderr)
         return prefill_tps, decode_tps, rss, footprint
     except Exception as e:
-        print(f"    Error running wick: {e}")
+        print(f"    Error running cera: {e}")
         return 0.0, 0.0, 0, 0
 
 def run_llama(llama_bench, model_path, prompt_len, gen_len, runs):
@@ -103,9 +103,9 @@ def resolve_llama_bench():
     return Path("llama-bench")
 
 def main():
-    parser = argparse.ArgumentParser(description="Wick vs llama.cpp benchmark matrix")
+    parser = argparse.ArgumentParser(description="Cera vs llama.cpp benchmark matrix")
     parser.add_argument("--models-dir", type=Path, default=Path.home() / ".leap" / "models", help="Directory containing GGUF models")
-    parser.add_argument("--wick-bin", type=Path, default=Path.cwd() / "target" / "release" / "wick", help="Path to wick binary")
+    parser.add_argument("--cera-bin", type=Path, default=Path.cwd() / "target" / "release" / "cera", help="Path to cera binary")
     parser.add_argument("--llama-bench", type=Path, default=resolve_llama_bench(), help="Path to llama-bench binary")
     parser.add_argument("--output", type=Path, default=Path("benchmark_results.csv"), help="Output CSV file")
     parser.add_argument("--runs", type=int, default=5, help="Number of runs per configuration")
@@ -131,11 +131,11 @@ def main():
             print(f"\nBenchmarking model: {model_name}")
             for p_len in PROMPT_LENGTHS:
                 for g_len in GEN_LENGTHS:
-                    # Run Wick
-                    p_tps, d_tps, rss, foot = run_wick(args.wick_bin, model, p_len, g_len, args.runs)
+                    # Run Cera
+                    p_tps, d_tps, rss, foot = run_cera(args.cera_bin, model, p_len, g_len, args.runs)
                     writer.writerow({
                         "model": model_name, "prompt_len": p_len, "gen_len": g_len,
-                        "engine": "wick", "prefill_tps": p_tps, "decode_tps": d_tps,
+                        "engine": "cera", "prefill_tps": p_tps, "decode_tps": d_tps,
                         "rss_mb": rss / 1024 / 1024, "footprint_mb": foot / 1024 / 1024
                     })
                     

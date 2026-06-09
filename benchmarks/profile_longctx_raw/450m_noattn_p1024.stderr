@@ -1,4 +1,4 @@
-warning: WICK_PROFILE is set — bench numbers will be inflated by profile overhead
+warning: CERA_PROFILE is set — bench numbers will be inflated by profile overhead
 Using native Metal backend
 Model: lfm2 | 16 layers | hidden=1024
 Prompt tokens: 1024 | max_tokens: 1 | warmup: 1 | runs: 3

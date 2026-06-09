@@ -13,12 +13,12 @@ just clippy             # lint
 just ci                 # full CI check: fmt + clippy + test
 
 # Single test or module
-cargo test -p wick -- <test_name>
-cargo test -p wick <module>::tests       # e.g. quant::tests, gguf::tests
+cargo test -p cera -- <test_name>
+cargo test -p cera <module>::tests       # e.g. quant::tests, gguf::tests
 
 # CLI commands (working features)
-cargo run -p wick-cli -- inspect <path.gguf>
-cargo run -p wick-cli -- tokenize <path.gguf> "text"
+cargo run -p cera-cli -- inspect <path.gguf>
+cargo run -p cera-cli -- tokenize <path.gguf> "text"
 ```
 
 **Always run `cargo fmt` before committing.** CI enforces `cargo fmt --check` and will fail on unformatted code.
@@ -27,8 +27,8 @@ cargo run -p wick-cli -- tokenize <path.gguf> "text"
 
 Two-crate Cargo workspace:
 
-- **`wick`** — core library (all inference logic)
-- **`wick-cli`** — binary (clap CLI that dispatches to `wick`)
+- **`cera`** — core library (all inference logic)
+- **`cera-cli`** — binary (clap CLI that dispatches to `cera`)
 
 ### GGUF Parsing (`gguf.rs`)
 
@@ -64,6 +64,6 @@ Self-contained BPE tokenizer that loads vocab, merges, and special tokens direct
 
 - Edition 2024, MSRV 1.85
 - `.cargo/config.toml` sets native CPU feature flags per target architecture
-- `gpu` feature flag exists but `wgpu` is not wired into `wick/Cargo.toml` yet (planned for V2)
+- `gpu` feature flag exists but `wgpu` is not wired into `cera/Cargo.toml` yet (planned for V2)
 - Error handling: `anyhow` with `ensure!` / `with_context()` / `bail!`
 - Release profile: LTO thin, single codegen unit, stripped symbols

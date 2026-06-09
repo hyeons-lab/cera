@@ -1,0 +1,22 @@
+// SPM `.systemLibrary` target's module map. Module name MUST be
+// `cera_ffiFFI` so that the generated `cera_ffi.swift` (which uses
+// `#if canImport(cera_ffiFFI) ; import cera_ffiFFI`) sees the C FFI
+// declarations. Any other name and the `canImport` guard fails
+// silently, leaving every `uniffi_cera_ffi_fn_*` symbol undeclared in
+// scope at compile time.
+//
+// The header itself is a symlink into `cera-ffi/bindings/swift/` so
+// `just bindings` regenerations are picked up automatically.
+module cera_ffiFFI {
+    header "cera_ffiFFI.h"
+    export *
+    // Match the `use` lines that the canonical
+    // `cera-ffi/bindings/swift/cera_ffiFFI.modulemap` declares, in
+    // case a future Linux Swift leg or a non-default toolchain
+    // depends on the explicit platform-module imports for the C
+    // stdint / stdbool / Darwin types referenced by the generated
+    // header.
+    use "Darwin"
+    use "_Builtin_stdbool"
+    use "_Builtin_stdint"
+}

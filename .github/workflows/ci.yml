@@ -59,9 +59,9 @@ jobs:
         run: cargo build --workspace --release
 
   wasm-build:
-    # Phase 3 of the FFI multi-target plan is `wick-wasm` (browser/Node
+    # Phase 3 of the FFI multi-target plan is `cera-wasm` (browser/Node
     # via wasm-bindgen, not UniFFI). Before any of that lands the
-    # foundation needs to hold: `wick` core has to compile for
+    # foundation needs to hold: `cera` core has to compile for
     # `wasm32-unknown-unknown` across the feature combos that the
     # wasm-bindgen wrapper crate (Phase 3.2) might enable. Phase 1.3
     # (PR #32) made `parallel`, `mmap`, `std-fs`, `disk-cache`,
@@ -72,7 +72,7 @@ jobs:
     # supported feature combos.
     #
     # `remote` is intentionally NOT in the matrix — `reqwest` doesn't
-    # link on wasm32-unknown-unknown; wick-wasm will have its own
+    # link on wasm32-unknown-unknown; cera-wasm will have its own
     # `fetch`-based adapter (Phase 3.x).
     name: Wasm Build (${{ matrix.features }})
     needs: check
@@ -93,9 +93,9 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Check wasm32 compile
-        run: cargo check -p wick ${{ matrix.features }} --target wasm32-unknown-unknown
+        run: cargo check -p cera ${{ matrix.features }} --target wasm32-unknown-unknown
 
-  wick-wasm-pack:
+  cera-wasm-pack:
     # Multi-target wasm-pack build. Each matrix entry produces one
     # consumer shape:
     #   - `bundler`: ESM with bundler-only `import * as wasm from
@@ -104,7 +104,7 @@ jobs:
     #   - `web`: direct browser ESM that callers `init()` themselves
     #     before use. Right shape for `<script type="module">` and
     #     loaders without bundler-side wasm support.
-    #   - `nodejs`: CommonJS for Node — `require('@hyeonslab/wick-wasm')`
+    #   - `nodejs`: CommonJS for Node — `require('@hyeonslab/cera-wasm')`
     #     without the experimental-wasm-modules dance.
     #
     # Three artifacts are uploaded so reviewers / downstream devs can
@@ -115,8 +115,8 @@ jobs:
     #
     # `cargo build` regression check is preserved as a side-effect of
     # the wasm-pack pipeline (any of the three matrix entries failing
-    # would catch a wick core regression).
-    name: Wick-Wasm Pack (${{ matrix.target }})
+    # would catch a cera core regression).
+    name: Cera-Wasm Pack (${{ matrix.target }})
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -136,13 +136,13 @@ jobs:
           version: 'v0.14.0'
       - name: Install binaryen (provides wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
-      - name: Build wick-wasm npm package
+      - name: Build cera-wasm npm package
         # `--scope hyeonslab` matches the package name advertised in
-        # wick-wasm/README.md (`@hyeonslab/wick-wasm`). `--out-dir`
+        # cera-wasm/README.md (`@hyeonslab/cera-wasm`). `--out-dir`
         # gives each matrix entry its own directory so the artifact
         # uploads don't collide.
         run: |
-          wasm-pack build wick-wasm \
+          wasm-pack build cera-wasm \
             --target ${{ matrix.target }} \
             --release \
             --scope hyeonslab \
@@ -172,8 +172,8 @@ jobs:
         # where contributors will sanity-check it locally.
         run: |
           set -euo pipefail
-          PKG=wick-wasm/pkg-${{ matrix.target }}
-          WASM=$PKG/wick_wasm_bg.wasm
+          PKG=cera-wasm/pkg-${{ matrix.target }}
+          WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
           BUDGET_KB=2560  # 2.5 MB
           BUDGET_BYTES=$((BUDGET_KB * 1024))
@@ -187,7 +187,7 @@ jobs:
           # otherwise abort on the redirect.
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
           {
-            echo "## Wick-Wasm Pack output (${{ matrix.target }})"
+            echo "## Cera-Wasm Pack output (${{ matrix.target }})"
             echo
             echo "**\`$WASM\`: ${SIZE_KB} KB / ${BUDGET_KB} KB budget**"
             echo
@@ -205,13 +205,13 @@ jobs:
           echo "$WASM: ${SIZE_KB} KB / ${BUDGET_KB} KB budget — OK"
       - uses: actions/upload-artifact@v4
         with:
-          name: wick-wasm-pkg-${{ matrix.target }}
-          path: wick-wasm/pkg-${{ matrix.target }}/
+          name: cera-wasm-pkg-${{ matrix.target }}
+          path: cera-wasm/pkg-${{ matrix.target }}/
           if-no-files-found: error
           retention-days: 30
 
-  wick-wasm-pack-mt:
-    # Multi-threaded wasm-pack build. Mirrors `wick-wasm-pack`
+  cera-wasm-pack-mt:
+    # Multi-threaded wasm-pack build. Mirrors `cera-wasm-pack`
     # above but flips on the `parallel` feature + the
     # `wasm-bindgen-rayon` thread-pool shim, so the resulting
     # package surfaces an `initThreadPool(numThreads)` JS export
@@ -223,7 +223,7 @@ jobs:
     # Build flags break down identically to the `wasm-web-mt` /
     # `wasm-node-mt` justfile recipes; if those go stale this
     # job catches it.
-    name: Wick-Wasm Pack MT (${{ matrix.target }})
+    name: Cera-Wasm Pack MT (${{ matrix.target }})
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -249,7 +249,7 @@ jobs:
           version: 'v0.14.0'
       - name: Install binaryen (provides wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
-      - name: Build wick-wasm npm package (threaded)
+      - name: Build cera-wasm npm package (threaded)
         # Flag breakdown lives in the justfile next to
         # `WASM_MT_RUSTFLAGS`. Keep this command in lockstep —
         # if a flag changes there it must change here too.
@@ -262,7 +262,7 @@ jobs:
             -C link-arg=--export=__tls_size \
             -C link-arg=--export=__tls_align \
             -C link-arg=--export=__tls_base" \
-          wasm-pack build wick-wasm \
+          wasm-pack build cera-wasm \
             --target ${{ matrix.target }} \
             --release \
             --scope hyeonslab \
@@ -277,13 +277,13 @@ jobs:
         # (i.e. wasm-bindgen-rayon got DCE'd out).
         run: |
           set -euo pipefail
-          PKG=wick-wasm/pkg-${{ matrix.target }}-mt
-          WASM=$PKG/wick_wasm_bg.wasm
-          DTS=$PKG/wick_wasm.d.ts
+          PKG=cera-wasm/pkg-${{ matrix.target }}-mt
+          WASM=$PKG/cera_wasm_bg.wasm
+          DTS=$PKG/cera_wasm.d.ts
           # `wasm-objdump` ships in `wabt`; `binaryen` (already
           # installed above for `wasm-opt`) doesn't include it,
           # so we install wabt here only — keeps the main
-          # wick-wasm-pack job's install step lean.
+          # cera-wasm-pack job's install step lean.
           sudo apt-get install -y wabt
           MEM_LINE=$(wasm-objdump -j Import -x "$WASM" | grep '^ - memory\[0\]' || true)
           if ! echo "$MEM_LINE" | grep -q 'shared'; then
@@ -308,15 +308,15 @@ jobs:
         # here in the same commit.
         run: |
           set -euo pipefail
-          PKG=wick-wasm/pkg-${{ matrix.target }}-mt
-          WASM=$PKG/wick_wasm_bg.wasm
+          PKG=cera-wasm/pkg-${{ matrix.target }}-mt
+          WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
           BUDGET_KB=3072  # 3 MB — threaded body is ~30% larger than st
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           SIZE_KB=$(( (SIZE_BYTES + 1023) / 1024 ))
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
           {
-            echo "## Wick-Wasm Pack MT output (${{ matrix.target }})"
+            echo "## Cera-Wasm Pack MT output (${{ matrix.target }})"
             echo
             echo "**\`$WASM\`: ${SIZE_KB} KB / ${BUDGET_KB} KB budget**"
             echo
@@ -331,14 +331,14 @@ jobs:
           echo "$WASM: ${SIZE_KB} KB / ${BUDGET_KB} KB budget — OK"
       - uses: actions/upload-artifact@v4
         with:
-          name: wick-wasm-pkg-${{ matrix.target }}-mt
-          path: wick-wasm/pkg-${{ matrix.target }}-mt/
+          name: cera-wasm-pkg-${{ matrix.target }}-mt
+          path: cera-wasm/pkg-${{ matrix.target }}-mt/
           if-no-files-found: error
           retention-days: 30
 
   ffi-bindings-drift:
     # Verifies the committed Kotlin + Swift bindings under
-    # wick-ffi/bindings/ stay in sync with the Rust `#[uniffi::*]`
+    # cera-ffi/bindings/ stay in sync with the Rust `#[uniffi::*]`
     # surface. Regenerates via `uniffi-bindgen` (the in-repo binary
     # target) against the freshly-built debug dylib and fails if
     # `git diff` shows changes — signalling someone touched the FFI
@@ -363,7 +363,7 @@ jobs:
         # output is reproducible across CI runs + developer workstations
         # AND so a compromised mirror can't slip a different binary past
         # the drift check. Bump in lockstep with whatever's documented
-        # in wick-ffi/README.md (regenerate the bindings in the same PR).
+        # in cera-ffi/README.md (regenerate the bindings in the same PR).
         #
         # `curl --fail --proto '=https' --tlsv1.2` hardens the download
         # against silent HTTP errors and legacy TLS downgrades.
@@ -379,32 +379,32 @@ jobs:
           chmod +x /tmp/ktlint
           sudo mv /tmp/ktlint /usr/local/bin/ktlint
           ktlint --version
-      - name: Build wick-ffi (cdylib for bindgen)
-        run: cargo build -p wick-ffi
+      - name: Build cera-ffi (cdylib for bindgen)
+        run: cargo build -p cera-ffi
       - name: Regenerate bindings
         # `--features bindgen` opts into the crate's `bindgen` feature,
         # which lights up `uniffi/cli`. Library consumers never pay for
         # this feature; only the binary target needs it.
         run: |
-          cargo run -q -p wick-ffi --bin uniffi-bindgen --features bindgen -- generate \
-            --library target/debug/libwick_ffi.so \
+          cargo run -q -p cera-ffi --bin uniffi-bindgen --features bindgen -- generate \
+            --library target/debug/libcera_ffi.so \
             --language kotlin \
-            --out-dir wick-ffi/bindings/kotlin
-          cargo run -q -p wick-ffi --bin uniffi-bindgen --features bindgen -- generate \
-            --library target/debug/libwick_ffi.so \
+            --out-dir cera-ffi/bindings/kotlin
+          cargo run -q -p cera-ffi --bin uniffi-bindgen --features bindgen -- generate \
+            --library target/debug/libcera_ffi.so \
             --language swift \
-            --out-dir wick-ffi/bindings/swift
+            --out-dir cera-ffi/bindings/swift
       - name: Diff committed bindings
         run: |
-          if [ -n "$(git status --porcelain wick-ffi/bindings)" ]; then
-            echo "::error::Vendored bindings under wick-ffi/bindings/ are out of date."
+          if [ -n "$(git status --porcelain cera-ffi/bindings)" ]; then
+            echo "::error::Vendored bindings under cera-ffi/bindings/ are out of date."
             echo "Run 'just bindings' locally and commit the resulting diff."
-            git --no-pager diff wick-ffi/bindings
+            git --no-pager diff cera-ffi/bindings
             exit 1
           fi
 
   android-abis:
-    # Cross-compiles `wick-ffi` to every Android ABI supported by the
+    # Cross-compiles `cera-ffi` to every Android ABI supported by the
     # Android NDK (arm64-v8a, armeabi-v7a, x86_64, x86). Verifies each
     # `.so` is a valid ELF of the right architecture and uploads the
     # release libraries as a CI artifact so consumers can grab a
@@ -440,7 +440,7 @@ jobs:
       # Install NDK. Pin to r27c — a validated stable release the
       # workspace builds against cleanly. Bumping is a one-line change:
       # update this version string (and the matching note in
-      # wick-ffi/README.md) and re-run CI to confirm every ABI still
+      # cera-ffi/README.md) and re-run CI to confirm every ABI still
       # builds. The `cargo ndk` flag shape is compatible across recent
       # NDK majors so the pin is about toolchain + sysroot stability
       # across runs, not a hard constraint.
@@ -456,11 +456,11 @@ jobs:
         # used `--platform` + `--arch`). Let cargo pick the latest
         # 4.x patch so security-fix releases get picked up.
         run: cargo install cargo-ndk --version '^4' --locked
-      - name: Cross-compile wick-ffi
+      - name: Cross-compile cera-ffi
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          cargo ndk --target ${{ matrix.abi }} build -p wick-ffi --release
+          cargo ndk --target ${{ matrix.abi }} build -p cera-ffi --release
       - name: Verify ELF shape
         # Catches a regression where `cargo build` succeeds but the
         # cdylib rule silently produces a host-arch binary. Assert
@@ -474,7 +474,7 @@ jobs:
         # branch, this step fails loudly instead of silently
         # passing. Same pattern as exhaustive `match` on a Rust enum.
         run: |
-          SO=target/${{ matrix.rust_target }}/release/libwick_ffi.so
+          SO=target/${{ matrix.rust_target }}/release/libcera_ffi.so
           ls -la "$SO"
           file "$SO"
           HEADER=$(readelf -h "$SO")
@@ -504,11 +504,11 @@ jobs:
       - name: Log .so size
         # Per-ABI size + the artifact name reviewers will look for
         # in the run page sidebar. Mirrors the size-summary pattern
-        # used by `wick-wasm-pack` / `apple-xcframework` so every
+        # used by `cera-wasm-pack` / `apple-xcframework` so every
         # artifact-producing job surfaces info the same way.
         run: |
           set -euo pipefail
-          SO=target/${{ matrix.rust_target }}/release/libwick_ffi.so
+          SO=target/${{ matrix.rust_target }}/release/libcera_ffi.so
           ls -lh "$SO"
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
           {
@@ -520,21 +520,21 @@ jobs:
             ls -lh "$SO"
             echo '```'
             echo
-            echo "Download: artifact \`wick-ffi-android-${{ matrix.abi }}\` on this run page."
+            echo "Download: artifact \`cera-ffi-android-${{ matrix.abi }}\` on this run page."
           } >> "$SUMMARY"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wick-ffi-android-${{ matrix.abi }}
-          path: target/${{ matrix.rust_target }}/release/libwick_ffi.so
+          name: cera-ffi-android-${{ matrix.abi }}
+          path: target/${{ matrix.rust_target }}/release/libcera_ffi.so
           # Per-run artifact; 7-day retention is enough to copy into
           # a consumer app's `src/main/jniLibs/<abi>/` for testing
           # without keeping stale binaries around.
           retention-days: 7
 
   apple-xcframework:
-    # Cross-compiles wick-ffi to all three arm64-only Apple-platform
-    # Rust targets and assembles `WickFFI.xcframework` ready for
+    # Cross-compiles cera-ffi to all three arm64-only Apple-platform
+    # Rust targets and assembles `CeraFFI.xcframework` ready for
     # Swift Package Manager / Xcode consumption. Three slices end up
     # in the framework:
     #   - ios-arm64           (real iPhones / iPads)
@@ -603,19 +603,19 @@ jobs:
         # more weight than the recipe itself.
         run: |
           set -euo pipefail
-          cargo build -p wick-ffi --target aarch64-apple-ios --release
-          cargo build -p wick-ffi --target aarch64-apple-ios-sim --release
-          cargo build -p wick-ffi --target aarch64-apple-darwin --release
+          cargo build -p cera-ffi --target aarch64-apple-ios --release
+          cargo build -p cera-ffi --target aarch64-apple-ios-sim --release
+          cargo build -p cera-ffi --target aarch64-apple-darwin --release
           OUT=target/xcframework-build
           rm -rf "$OUT"
           mkdir -p "$OUT/headers"
-          cp wick-ffi/bindings/swift/wick_ffiFFI.h "$OUT/headers/"
-          cp wick-ffi/bindings/swift/wick_ffiFFI.modulemap "$OUT/headers/module.modulemap"
+          cp cera-ffi/bindings/swift/cera_ffiFFI.h "$OUT/headers/"
+          cp cera-ffi/bindings/swift/cera_ffiFFI.modulemap "$OUT/headers/module.modulemap"
           xcodebuild -create-xcframework \
-              -library target/aarch64-apple-ios/release/libwick_ffi.a -headers "$OUT/headers" \
-              -library target/aarch64-apple-ios-sim/release/libwick_ffi.a -headers "$OUT/headers" \
-              -library target/aarch64-apple-darwin/release/libwick_ffi.a -headers "$OUT/headers" \
-              -output "$OUT/WickFFI.xcframework"
+              -library target/aarch64-apple-ios/release/libcera_ffi.a -headers "$OUT/headers" \
+              -library target/aarch64-apple-ios-sim/release/libcera_ffi.a -headers "$OUT/headers" \
+              -library target/aarch64-apple-darwin/release/libcera_ffi.a -headers "$OUT/headers" \
+              -output "$OUT/CeraFFI.xcframework"
       - name: Log XCFramework size
         # Logs the per-slice + total size so a future regression where
         # debuginfo slips back in (or a heavyweight dep accidentally
@@ -627,16 +627,16 @@ jobs:
         # `du -sh` output goes to both stdout (build log) and the
         # `$GITHUB_STEP_SUMMARY` markdown file for the per-run
         # summary. Mirrors the size-reporting pattern used by
-        # `wick-wasm-pack` / `wick-wasm-pack-mt`. Default
+        # `cera-wasm-pack` / `cera-wasm-pack-mt`. Default
         # `$GITHUB_STEP_SUMMARY` to `/dev/null` so a contributor
         # can copy this script and run it locally — the variable
         # only exists inside GitHub Actions and `set -u` would
         # otherwise abort on the redirect.
         run: |
           set -euo pipefail
-          XCF=target/xcframework-build/WickFFI.xcframework
+          XCF=target/xcframework-build/CeraFFI.xcframework
           du -sh "$XCF"
-          du -sh "$XCF"/*/libwick_ffi*.a
+          du -sh "$XCF"/*/libcera_ffi*.a
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
           {
             echo "## Apple XCFramework artifact"
@@ -645,12 +645,12 @@ jobs:
             echo
             echo '```'
             du -sh "$XCF"
-            du -sh "$XCF"/*/libwick_ffi*.a
+            du -sh "$XCF"/*/libcera_ffi*.a
             echo '```'
             echo
             echo "Slices: \`ios-arm64\` + \`ios-arm64-simulator\` + \`macos-arm64\` (no x86_64 — Apple Silicon-only)."
             echo
-            echo "Download: artifact \`wick-ffi-apple-xcframework\` on this run page."
+            echo "Download: artifact \`cera-ffi-apple-xcframework\` on this run page."
           } >> "$SUMMARY"
       - name: Swift smoke test (macOS)
         # Validates the entire pipeline end-to-end: compiles a small
@@ -670,19 +670,19 @@ jobs:
         # mode for UniFFI 0.31.
         #
         # `-import-objc-header` exposes the C declarations from
-        # `wick_ffiFFI.h` without needing a separate module map +
+        # `cera_ffiFFI.h` without needing a separate module map +
         # SPM ceremony for a single-binary test. Foundation auto-
         # links on Apple platforms.
         run: |
           set -euo pipefail
           swiftc \
-              wick-ffi/tests/swift/main.swift \
-              wick-ffi/bindings/swift/wick_ffi.swift \
-              -import-objc-header wick-ffi/bindings/swift/wick_ffiFFI.h \
+              cera-ffi/tests/swift/main.swift \
+              cera-ffi/bindings/swift/cera_ffi.swift \
+              -import-objc-header cera-ffi/bindings/swift/cera_ffiFFI.h \
               -L target/aarch64-apple-darwin/release \
-              -lwick_ffi \
-              -o /tmp/wick-swift-smoke
-          /tmp/wick-swift-smoke
+              -lcera_ffi \
+              -o /tmp/cera-swift-smoke
+          /tmp/cera-swift-smoke
       - name: Verify XCFramework slices
         # Catches a regression where one slice silently has the wrong
         # architecture or platform — `Info.plist` advertises
@@ -699,7 +699,7 @@ jobs:
         # iOS-specific path.
         run: |
           set -euo pipefail
-          XCF=target/xcframework-build/WickFFI.xcframework
+          XCF=target/xcframework-build/CeraFFI.xcframework
           test -d "$XCF" || { echo "::error::xcframework not built"; exit 1; }
           plutil -p "$XCF/Info.plist"
           plutil -convert json -o - "$XCF/Info.plist" | python3 -c '
@@ -732,10 +732,10 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wick-ffi-apple-xcframework
+          name: cera-ffi-apple-xcframework
           # Upload the directory (xcframework is a folder bundle on
           # disk); actions/upload-artifact zips it transparently.
-          path: target/xcframework-build/WickFFI.xcframework
+          path: target/xcframework-build/CeraFFI.xcframework
           retention-days: 7
 
   integration-test:
@@ -764,8 +764,8 @@ jobs:
         with:
           toolchain: nightly-2026-04-02
       - uses: Swatinem/rust-cache@v2
-      # OpenBLAS provides cblas_sgemm for the wick `blas` feature
-      # (linked via `openblas-src` / `cblas-sys`, see wick/Cargo.toml).
+      # OpenBLAS provides cblas_sgemm for the cera `blas` feature
+      # (linked via `openblas-src` / `cblas-sys`, see cera/Cargo.toml).
       # On x86_64 this is the actual SGEMM impl behind
       # `try_blas_prefill_gemm` — meaningful only after this PR lifted
       # the `cfg(target_arch = "aarch64")` gate that previously made
@@ -775,17 +775,17 @@ jobs:
       - name: Cache downloaded test models
         uses: actions/cache@v4
         with:
-          path: target/tmp/wick-test-models
+          path: target/tmp/cera-test-models
           # Bump the key suffix to invalidate after model-file changes.
           # `v2`: switched fixture to LFM2-350M-Extract Q4_0 (~210 MB)
           # from LFM2-1.2B Q4_0 (~700 MB) — the 1.2B was timing out the
           # job's 15-minute cap on Ubuntu CPU runners (~13 min runtime
           # for `shift_real_model` alone).
-          key: wick-test-models-lfm2-350m-extract-q4_0-v2
+          key: cera-test-models-lfm2-350m-extract-q4_0-v2
       # NOTE: targeted to the download-gated test binaries only.
       # `cargo test -- --ignored` without `--test` would sweep every
       # #[ignore]'d test in the workspace (Metal microbenchmarks,
-      # parity tests requiring WICK_TEST_MODEL, etc.), most of which
+      # parity tests requiring CERA_TEST_MODEL, etc.), most of which
       # don't belong on an Ubuntu CI runner. `--features remote,blas`:
       # `remote` for the bundle downloader + cache shim, `blas` to
       # route SGEMM through OpenBLAS instead of the scalar fallback.
@@ -795,9 +795,9 @@ jobs:
       # platform-specific BLAS bug to chase.
       - name: Run gated integration tests
         env:
-          WICK_TEST_DOWNLOAD: "1"
+          CERA_TEST_DOWNLOAD: "1"
         run: |
-          cargo test -p wick --features remote,blas \
+          cargo test -p cera --features remote,blas \
             --test shift_real_model \
             --test bundle_download \
             --test bundle_from_id \
@@ -822,7 +822,7 @@ jobs:
         with:
           toolchain: nightly-2026-04-02
       - uses: Swatinem/rust-cache@v2
-      # JDK 21 (Temurin) for the Kotlin runner. The wick ecosystem
+      # JDK 21 (Temurin) for the Kotlin runner. The cera ecosystem
       # baselines on JDK 21 (per the user's global CLAUDE.md note that
       # the SDKMAN current may drift to a newer Java that breaks
       # plugins). Using `setup-java`'s built-in Gradle caching lets the
@@ -836,32 +836,32 @@ jobs:
       - name: Cache downloaded parity fixtures
         uses: actions/cache@v4
         with:
-          # Distinct from `wick-test-models` so a fixture rotation in
+          # Distinct from `cera-test-models` so a fixture rotation in
           # one suite doesn't invalidate the other. Bump the key suffix
-          # when the bundle id / quant in `wick-parity/tests/parity.rs`
+          # when the bundle id / quant in `cera-parity/tests/parity.rs`
           # changes. The macOS swift parity job uses the same key
           # value but lives in a separate (OS-segregated) cache pool.
-          path: target/tmp/wick-parity-cache
-          key: wick-parity-cache-lfm2-350m-q4_0-v1
-      # The Kotlin leg loads `libwick_ffi.so` through JNA. Build the
+          path: target/tmp/cera-parity-cache
+          key: cera-parity-cache-lfm2-350m-q4_0-v1
+      # The Kotlin leg loads `libcera_ffi.so` through JNA. Build the
       # cdylib first so JNA's `-Djna.library.path` (set on the
       # subprocess via `--lib-dir`) finds something to load.
       # `--release`: the harness below runs in `--release`; loading a
       # debug cdylib here would compare release rust vs debug FFI
       # native code — apples to oranges, and would make the kotlin
       # leg look 5-10× slower than reality.
-      - name: Build wick-ffi cdylib (release)
-        run: cargo build --release -p wick-ffi
+      - name: Build cera-ffi cdylib (release)
+        run: cargo build --release -p cera-ffi
       # Build the Kotlin runner fat jar. `--no-daemon` is the right
       # default for CI (single-shot invocation; daemon adds startup
       # cost and disk usage that doesn't pay off across runs).
       - name: Build kotlin-jna runner
-        working-directory: wick-parity/legs/kotlin
+        working-directory: cera-parity/legs/kotlin
         run: ./gradlew --no-daemon shadowJar
       # `cargo run check` does both jobs the integration tests
       # used to do — token equality across legs (rust ↔ ffi ↔
       # kotlin-jna) and per-leg wall-clock with a threshold gate.
-      # `--release` matters: a debug build of wick is ~10× slower
+      # `--release` matters: a debug build of cera is ~10× slower
       # at LFM2 prefill, which would dominate the timing data and
       # turn the perf table into noise.
       #
@@ -878,17 +878,17 @@ jobs:
       # gate is load-bearing. The same invocation also gates
       # token equality (exit 1 on divergence) — replaces the old
       # `cargo test --tests --ignored` step.
-      # `WICK_PARITY_RUN` is intentionally NOT set here — the
-      # `wick-parity check` CLI invocation doesn't read it (that env
+      # `CERA_PARITY_RUN` is intentionally NOT set here — the
+      # `cera-parity check` CLI invocation doesn't read it (that env
       # var only gates the `#[ignore]`'d cargo-test integration
       # tests). Including it would imply the CLI cares about it.
       - name: Run parity harness with perf gate
         run: |
-          cargo run --release -p wick-parity -- check \
+          cargo run --release -p cera-parity -- check \
             --bundle LFM2-350M-Extract-GGUF --quant Q4_0 \
             --prompt "The capital of France is" \
             --max-tokens 16 --seed 0 \
-            --kotlin-runner ${{ github.workspace }}/wick-parity/legs/kotlin/build/libs/wick-parity-kotlin-all.jar \
+            --kotlin-runner ${{ github.workspace }}/cera-parity/legs/kotlin/build/libs/cera-parity-kotlin-all.jar \
             --lib-dir ${{ github.workspace }}/target/release \
             --max-slowdown 30 \
             --fail-on-slowdown
@@ -918,8 +918,8 @@ jobs:
           # Same key as `parity-test`'s ubuntu run; GitHub's cache
           # is OS-segregated so they live in separate pools and the
           # 210 MB fixture downloads at most once per OS per run.
-          path: target/tmp/wick-parity-cache
-          key: wick-parity-cache-lfm2-350m-q4_0-v1
+          path: target/tmp/cera-parity-cache
+          key: cera-parity-cache-lfm2-350m-q4_0-v1
       # SPM build cache. Keyed on Package.swift + the two binding
       # files (which are git-tracked symlinks but their content
       # hashes change when `just bindings` regenerates upstream).
@@ -928,9 +928,9 @@ jobs:
       - name: Cache SPM build artifacts
         uses: actions/cache@v4
         with:
-          path: wick-parity/legs/swift/.build
-          key: wick-parity-swift-spm-${{ hashFiles('wick-parity/legs/swift/Package.swift', 'wick-ffi/bindings/swift/wick_ffi.swift', 'wick-ffi/bindings/swift/wick_ffiFFI.h') }}
-      # The Swift leg links against `libwick_ffi.dylib` at build time.
+          path: cera-parity/legs/swift/.build
+          key: cera-parity-swift-spm-${{ hashFiles('cera-parity/legs/swift/Package.swift', 'cera-ffi/bindings/swift/cera_ffi.swift', 'cera-ffi/bindings/swift/cera_ffiFFI.h') }}
+      # The Swift leg links against `libcera_ffi.dylib` at build time.
       # The binary records an absolute install_name pointing at the
       # cdylib's build-time location under `target/release/` in this
       # same checkout, so dyld can find the dylib by that path alone.
@@ -945,16 +945,16 @@ jobs:
       # harness below runs in `--release`; loading a debug cdylib
       # would compare release rust vs debug FFI native code (apples
       # to oranges) and inflate the swift slowdown ratio.
-      - name: Build wick-ffi cdylib (release)
-        run: cargo build --release -p wick-ffi
+      - name: Build cera-ffi cdylib (release)
+        run: cargo build --release -p cera-ffi
       # `swift build -c release -Xlinker -L<dir>` produces
-      # `.build/release/WickParitySwift`. `-Xlinker -L<dir>` is the
+      # `.build/release/CeraParitySwift`. `-Xlinker -L<dir>` is the
       # SPM-portable way to add a library search path; `LDFLAGS` is
       # not honored consistently by `swift build`. Linking against
-      # `target/release` matches the `cargo build --release -p wick-ffi`
+      # `target/release` matches the `cargo build --release -p cera-ffi`
       # output so install_name + runtime DYLD_LIBRARY_PATH agree.
       - name: Build swift-uniffi runner
-        working-directory: wick-parity/legs/swift
+        working-directory: cera-parity/legs/swift
         run: |
           swift build -c release \
             -Xlinker -L${{ github.workspace }}/target/release
@@ -965,19 +965,19 @@ jobs:
       # because swift-uniffi has shown nearly identical
       # subprocess overhead to kotlin-jna on local M-class runs
       # (10.5×–12× kotlin-jna vs 10.9×–12.3× swift-uniffi at the
-      # `wick-parity check` defaults).
+      # `cera-parity check` defaults).
       #
-      # `WICK_PARITY_RUN` is intentionally NOT set here — the
-      # `wick-parity check` CLI invocation doesn't read it (that env
+      # `CERA_PARITY_RUN` is intentionally NOT set here — the
+      # `cera-parity check` CLI invocation doesn't read it (that env
       # var only gates the `#[ignore]`'d cargo-test integration
       # tests).
       - name: Run parity harness with perf gate
         run: |
-          cargo run --release -p wick-parity -- check \
+          cargo run --release -p cera-parity -- check \
             --bundle LFM2-350M-Extract-GGUF --quant Q4_0 \
             --prompt "The capital of France is" \
             --max-tokens 16 --seed 0 \
-            --swift-runner ${{ github.workspace }}/wick-parity/legs/swift/.build/release/WickParitySwift \
+            --swift-runner ${{ github.workspace }}/cera-parity/legs/swift/.build/release/CeraParitySwift \
             --lib-dir ${{ github.workspace }}/target/release \
             --max-slowdown 30 \
             --fail-on-slowdown
