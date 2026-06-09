@@ -1588,7 +1588,12 @@ fn main() -> Result<()> {
 
                 // ASR fast path: route the model's trained transcription mode through the shared
                 // `WickEngine::transcribe` helper (also exposed via wick-ffi for Kotlin/Swift).
-                if system.as_deref() == Some("Perform ASR.") {
+                // Only when no `--prompt` is given: a prompt is a documented leading text
+                // instruction that must sit before the audio marker, which `transcribe` (pure
+                // "Perform ASR." + audio) can't express — so fall through to the chat-template
+                // flow below, which appends the prompt before the marker.
+                let prompt_is_empty = prompt.as_deref().unwrap_or("").trim().is_empty();
+                if system.as_deref() == Some("Perform ASR.") && prompt_is_empty {
                     let text = engine.transcribe(&pcm, sr)?;
                     println!("{text}");
                     return Ok(());
