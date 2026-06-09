@@ -519,6 +519,52 @@ impl WickEngine {
         session
     }
 
+    /// Reserved special-token names, in priority order, that mark the audio
+    /// insertion point inside a rendered chat template. The first one the
+    /// tokenizer actually defines is used. Shared by [`Self::transcribe`] and
+    /// the CLI's audio chat path so the two never drift.
+    pub const AUDIO_MARKER_CANDIDATES: [&'static str; 4] = [
+        "<|reserved_4|>",
+        "<|reserved_5|>",
+        "<|reserved_6|>",
+        "<|reserved_7|>",
+    ];
+
+    /// Find the unique index of `marker_id` in `tokens` (single pass, no
+    /// allocation). The caller slices `tokens[..idx]` / `tokens[idx + 1..]` for
+    /// the prefix/suffix around the audio marker. Errors name both `marker_name`
+    /// and `marker_id` so callers can act: "not found" means the template
+    /// stripped/escaped the placeholder; "appears N times" means user text
+    /// contained a literal marker, making the insertion point ambiguous.
+    pub fn split_tokens_at_marker(
+        tokens: &[u32],
+        marker_id: u32,
+        marker_name: &str,
+    ) -> Result<usize, WickError> {
+        let mut found: Option<usize> = None;
+        let mut count: usize = 0;
+        for (i, &t) in tokens.iter().enumerate() {
+            if t == marker_id {
+                count += 1;
+                if found.is_none() {
+                    found = Some(i);
+                }
+            }
+        }
+        match (count, found) {
+            (1, Some(idx)) => Ok(idx),
+            (0, _) => Err(WickError::Backend(format!(
+                "audio marker token `{marker_name}` (id {marker_id}) not found in rendered \
+                 chat-template tokens — the template may have stripped or escaped the placeholder"
+            ))),
+            (n, _) => Err(WickError::Backend(format!(
+                "audio marker token `{marker_name}` (id {marker_id}) appears {n} times in \
+                 rendered tokens; expected exactly one insertion point (check that prompt/system \
+                 text does not contain a literal `{marker_name}`)"
+            ))),
+        }
+    }
+
     /// Transcribe mono `f32` PCM audio to text using the model's trained `"Perform ASR."` chat mode.
     ///
     /// Renders the chat template with a system `"Perform ASR."` turn and an audio-marker placeholder
@@ -534,19 +580,14 @@ impl WickEngine {
 
         let tok = self.tokenizer();
         // The audio insertion point is marked with a reserved special token, split out after render.
-        let (marker_id, marker_name) = [
-            "<|reserved_4|>",
-            "<|reserved_5|>",
-            "<|reserved_6|>",
-            "<|reserved_7|>",
-        ]
-        .into_iter()
-        .find_map(|name| tok.special_token_id(name).map(|id| (id, name)))
-        .ok_or_else(|| {
-            WickError::Backend(
-                "no audio marker special token (<|reserved_4|>..7) in tokenizer".to_string(),
-            )
-        })?;
+        let (marker_id, marker_name) = Self::AUDIO_MARKER_CANDIDATES
+            .into_iter()
+            .find_map(|name| tok.special_token_id(name).map(|id| (id, name)))
+            .ok_or_else(|| {
+                WickError::Backend(
+                    "no audio marker special token (<|reserved_4|>..7) in tokenizer".to_string(),
+                )
+            })?;
 
         let messages = [
             ChatMessage {
@@ -562,18 +603,7 @@ impl WickEngine {
             .map_err(|e| WickError::Backend(format!("chat template render failed: {e}")))?;
         let toks = tok.encode(&formatted);
 
-        let marker_positions: Vec<usize> = toks
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| if *t == marker_id { Some(i) } else { None })
-            .collect();
-        if marker_positions.len() != 1 {
-            return Err(WickError::Backend(format!(
-                "expected exactly one audio marker `{marker_name}` in rendered prompt, found {}",
-                marker_positions.len()
-            )));
-        }
-        let split = marker_positions[0];
+        let split = Self::split_tokens_at_marker(&toks, marker_id, marker_name)?;
 
         let mut session = self.new_session(SessionConfig::default());
         if split > 0 {
@@ -595,8 +625,10 @@ impl WickEngine {
         }
 
         let mut sink = CollectSink { tokens: Vec::new() };
+        // Greedy decode for deterministic transcription. Keep the default
+        // `max_tokens` (256) as the safety ceiling — generation stops on EOS;
+        // a low hard cap (was 64) silently truncated longer transcriptions.
         let opts = GenerateOpts {
-            max_tokens: 64,
             temperature: 0.0,
             ..GenerateOpts::default()
         };
