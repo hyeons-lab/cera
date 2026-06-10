@@ -2,7 +2,8 @@ name: Publish JVM/Android (Maven Central)
 
 # Manual release pipeline for the cera-ffi Kotlin bindings (desktop JVM jar +
 # Android AAR), published to Maven Central under `com.hyeons-lab`. Separate from
-# `publish.yml` (crates.io + npm) because it needs the native-lib cross-build
+# the crates.io / npm / CLI publish workflows (publish-crates.yml,
+# publish-npm.yml, publish-cli.yml) because it needs the native-lib cross-build
 # matrix + a JVM/Android toolchain.
 #
 #   dry_run = true  (default): `publishToMavenLocal` — validates packaging, no upload.
@@ -63,6 +64,7 @@ jobs:
       # Android .so for all four ABIs — built once, on the Linux runner.
       - name: Set up Android NDK
         if: ${{ matrix.android }}
+        id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r27c
