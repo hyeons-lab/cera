@@ -49,5 +49,18 @@ mavenPublishing {
             "UniFFI/JNA Kotlin bindings for the cera inference engine — Android AAR with " +
                 "jniLibs for arm64-v8a, armeabi-v7a, x86_64, and x86."
         )
+        // Dual-licensed Apache-2.0 OR MIT, matching the Cargo workspace.
+        licenses {
+            license {
+                name.set("The Apache License, Version 2.0")
+                url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
+                distribution.set("repo")
+            }
+            license {
+                name.set("MIT License")
+                url.set("https://opensource.org/licenses/MIT")
+                distribution.set("repo")
+            }
+        }
     }
 }
