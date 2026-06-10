@@ -25,10 +25,13 @@ cargo run -p cera-cli -- tokenize <path.gguf> "text"
 
 ## Architecture
 
-Two-crate Cargo workspace:
+Five-crate Cargo workspace:
 
 - **`cera`** — core library (all inference logic)
 - **`cera-cli`** — binary (clap CLI that dispatches to `cera`)
+- **`cera-ffi`** — UniFFI bindings exposing the engine to Kotlin/Swift/etc.
+- **`cera-parity`** — cross-language parity harness (not published)
+- **`cera-wasm`** — wasm-bindgen browser/Node bindings
 
 ### GGUF Parsing (`gguf.rs`)
 
@@ -64,6 +67,6 @@ Self-contained BPE tokenizer that loads vocab, merges, and special tokens direct
 
 - Edition 2024, MSRV 1.85
 - `.cargo/config.toml` sets native CPU feature flags per target architecture
-- `gpu` feature flag exists but `wgpu` is not wired into `cera/Cargo.toml` yet (planned for V2)
+- `wgpu` is wired into `cera/Cargo.toml` as an optional dependency behind the `gpu` feature (Metal backend behind `metal`)
 - Error handling: `anyhow` with `ensure!` / `with_context()` / `bail!`
 - Release profile: LTO thin, single codegen unit, stripped symbols
