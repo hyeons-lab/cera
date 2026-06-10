@@ -1,1 +1,1 @@
-../../../../../wick-ffi/bindings/swift/wick_ffi.swift
+../../../../../cera-ffi/bindings/swift/cera_ffi.swift
