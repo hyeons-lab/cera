@@ -1,6 +1,7 @@
 plugins {
+    // AGP 9+ has built-in Kotlin support — the `org.jetbrains.kotlin.android`
+    // plugin is no longer applied here (see kotl.in/gradle/agp-built-in-kotlin).
     alias(libs.plugins.android.library)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.maven.publish)
 }
 
@@ -14,12 +15,13 @@ android {
         minSdk = libs.versions.minSdk.get().toInt()
     }
 
-    sourceSets["main"].apply {
-        // Same vendored binding the JVM module uses (no copy).
-        kotlin.srcDir("../../cera-ffi/bindings/kotlin")
-        // Per-ABI native libs are staged here by `just android-libs` (gitignored):
-        //   jniLibs/{arm64-v8a,armeabi-v7a,x86_64,x86}/libcera_ffi.so
-        jniLibs.srcDir("src/main/jniLibs")
+    sourceSets {
+        named("main") {
+            // Same vendored binding the JVM module uses (no copy). Native libs
+            // are staged into the default `src/main/jniLibs/<abi>/` by
+            // `just android-libs` (gitignored) — no custom srcDir needed.
+            kotlin.srcDir("../../cera-ffi/bindings/kotlin")
+        }
     }
     // Release-variant publishing (+ sources/javadoc jars) is configured by the
     // vanniktech maven-publish plugin; don't call `publishing.singleVariant`

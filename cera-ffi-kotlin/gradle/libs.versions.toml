@@ -1,7 +1,7 @@
 [versions]
-# Pins mirror the prism repo (the reference for this publishing setup).
-kotlin = "2.3.10"
-agp = "8.13.2"
+# Latest stable as of 2026-06 (Gradle 9.5.1 in the wrapper).
+kotlin = "2.4.0"
+agp = "9.2.1"
 mavenPublish = "0.36.0"
 compileSdk = "36"
 minSdk = "28"
@@ -15,7 +15,7 @@ jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
 
 [plugins]
+# AGP 9+ has built-in Kotlin, so the android module needs no kotlin-android plugin.
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
-kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 android-library = { id = "com.android.library", version.ref = "agp" }
 maven-publish = { id = "com.vanniktech.maven.publish", version.ref = "mavenPublish" }
