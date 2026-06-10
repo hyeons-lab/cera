@@ -3,7 +3,7 @@
 # Run order: metal first (fast), then cpu/gpu @ small prompts, then large.
 set -euo pipefail
 
-BIN="./target/release/wick"
+BIN="./target/release/cera"
 OUT="bench_results.csv"
 LOG="bench_log.txt"
 

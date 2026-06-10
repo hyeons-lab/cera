@@ -1,1 +1,0 @@
-../../../../../wick-ffi/bindings/swift/wick_ffi.swift

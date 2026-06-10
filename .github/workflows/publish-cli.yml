@@ -1,0 +1,129 @@
+name: Publish CLI binaries
+
+# Standalone CLI binary release — builds the `cera` binary for macOS/Linux/
+# Windows and attaches them to a `v<version>` GitHub release. Independent of
+# crates.io, npm, and Maven. No external secrets (uses the default GITHUB_TOKEN
+# for the release).
+#
+#   dry_run = true  (default): builds + packages the binaries, no GitHub release.
+#   dry_run = false:           also cuts the `v<version>` release with the binaries.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (build binaries, no GitHub release)'
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  version:
+    name: Determine version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+      - name: Read version from `cera`
+        id: version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "cera") | .version')
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "Could not determine cera version" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "cera version: $VERSION"
+
+  build-cli:
+    name: Build cera CLI (${{ matrix.name }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon: ship the batteries-included binary — Accelerate
+          # (AMX) for CPU prefill + the Metal GPU backend, both system-provided.
+          - os: macos-latest
+            name: macos-arm64
+            features: '--features blas,metal'
+            archive: tar
+          - os: ubuntu-latest
+            name: linux-x86_64
+            features: ''
+            archive: tar
+          - os: windows-latest
+            name: windows-x86_64
+            features: ''
+            archive: zip
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build cera
+        run: cargo build --release -p cera-cli --bin cera ${{ matrix.features }}
+
+      - name: Package (tar.gz)
+        if: ${{ matrix.archive == 'tar' }}
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          tar -czf "cera-${{ matrix.name }}-v${VERSION}.tar.gz" -C target/release cera
+
+      - name: Package (zip)
+        if: ${{ matrix.archive == 'zip' }}
+        shell: pwsh
+        run: |
+          $version = "${{ needs.version.outputs.version }}"
+          Compress-Archive -Path target/release/cera.exe `
+            -DestinationPath "cera-${{ matrix.name }}-v$version.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.name }}
+          path: cera-${{ matrix.name }}-v${{ needs.version.outputs.version }}.*
+          if-no-files-found: error
+
+  release:
+    name: Tag & GitHub Release
+    needs: [version, build-cli]
+    if: ${{ github.event.inputs.dry_run == 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Least privilege: only this job creates the tag / release.
+    permissions:
+      contents: write
+    steps:
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Create tag and GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: v${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/**/cera-*

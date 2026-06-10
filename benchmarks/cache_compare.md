@@ -6,7 +6,7 @@ prompt = 482 tokens (the test text repeated 30×). Reproduce with
 
 ## Cross-process disk-cache (the mobile-restart scenario)
 
-Each run is a fresh `wick run` invocation — process exits between runs,
+Each run is a fresh `cera run` invocation — process exits between runs,
 so the in-memory warm cache is gone every time. Only the on-disk cold tier
 (written under `<cache-dir>/kv/`) survives.
 
@@ -39,7 +39,7 @@ benefit a mobile / FFI consumer gets after the host process is killed and
 relaunched: the conversation prefix rehydrates from disk instead of
 re-prefilling cold from scratch.
 
-## In-process warm cache (`wick bench --runs 5`)
+## In-process warm cache (`cera bench --runs 5`)
 
 Each row aggregates 5 timed iterations within one process. The default
 config keeps the engine alive across iterations, so iter 1 is cold and
@@ -77,7 +77,7 @@ token. Both cache hits skip that work for cells that were already computed:
 - These numbers are for a 1.5B Q4_0 model. Bigger models compute-bound
   on the same hardware would see a larger relative win from cache hits
   (the cold prefill takes longer; the cache load is roughly the same).
-- `wick bench`'s default `--warmup 2` discards the first 2 iters; the
+- `cera bench`'s default `--warmup 2` discards the first 2 iters; the
   numbers above used `--warmup 0` so iter 1 (cold) is included in the
   default-cache row, which is exactly what surfaces the cold-vs-warm
   contrast.

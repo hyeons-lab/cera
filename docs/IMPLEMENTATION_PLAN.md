@@ -1,4 +1,4 @@
-# Wick — Implementation Plan
+# Cera — Implementation Plan
 
 A Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
@@ -7,7 +7,7 @@ A Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 ## Guiding Principles
 
 1. **Build for the hard case first.** LFM2's hybrid conv+attention architecture is more complex than LLaMA. If the abstractions handle LFM2, every pure-transformer model falls out for free.
-2. **Two crates, not nine.** `wick` (library) and `wick-cli` (binary). Split later when API boundaries are stable. Every additional crate is compile-time overhead and API surface to maintain.
+2. **Two crates, not nine.** `cera` (library) and `cera-cli` (binary). Split later when API boundaries are stable. Every additional crate is compile-time overhead and API surface to maintain.
 3. **No CUDA in v1.** wgpu gives us Vulkan, Metal, D3D12, and WebGPU from one set of WGSL shaders. Accept the 10-20% gap vs cuBLAS on datacenter GPUs. Add CUDA as a v2 backend if demand warrants.
 4. **Two quant types, not twenty.** Q4_K_M and Q8_0 cover >90% of models people actually download. Each quant type requires a dequant kernel × every backend. Expand later.
 5. **Own the tokenizer.** Write a minimal BPE implementation (~300 lines) instead of pulling in the HF `tokenizers` crate (15+ deps, doesn't compile to WASM). LFM2's byte-level BPE with 65K vocab is simple.
@@ -19,7 +19,7 @@ A Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
 **Target: 6-8 weeks.** One developer + Claude Code.
 
-**End state:** `wick run -m LFM2.5-1.2B-Q4_K_M.gguf -p "Hello"` generates coherent text at 15-30+ tok/s on CPU with SIMD, 40+ tok/s on GPU via wgpu. Supports LFM2 and LLaMA-family models. Single static binary, no Python, no runtime dependencies.
+**End state:** `cera run -m LFM2.5-1.2B-Q4_K_M.gguf -p "Hello"` generates coherent text at 15-30+ tok/s on CPU with SIMD, 40+ tok/s on GPU via wgpu. Supports LFM2 and LLaMA-family models. Single static binary, no Python, no runtime dependencies.
 
 ---
 
@@ -29,9 +29,9 @@ A Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 ```
 0.1  Create the workspace:
 
-     wick/
+     cera/
      ├── Cargo.toml              # workspace root
-     ├── wick/                  # library crate (everything lives here)
+     ├── cera/                  # library crate (everything lives here)
      │   ├── Cargo.toml
      │   └── src/
      │       ├── lib.rs
@@ -51,7 +51,7 @@ A Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
      │       │   └── llama.rs    # LLaMA / Mistral / Qwen / Gemma / Phi
      │       ├── kv_cache.rs     # KV cache (simple contiguous, then paged)
      │       └── engine.rs       # Top-level generate() orchestration
-     └── wick-cli/              # CLI binary
+     └── cera-cli/              # CLI binary
          ├── Cargo.toml
          └── src/main.rs
 
@@ -132,7 +132,7 @@ A Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
      - Memory-map tensor data with memmap2 (zero-copy)
      - get_tensor(), tensor_data(), print_inspect()
 
-2.2  wick inspect CLI command — dumps metadata + tensor info
+2.2  cera inspect CLI command — dumps metadata + tensor info
 
 2.3  tokenizer.rs — Minimal BPE:
      - Load vocab + merges from GGUF metadata
@@ -140,7 +140,7 @@ A Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
      - Special token detection from token_type array
      - Chat template rendering via minijinja
 
-2.4  wick tokenize CLI command + Python comparison script
+2.4  cera tokenize CLI command + Python comparison script
 ```
 
 ---
@@ -152,7 +152,7 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 
 ```
 3.1  Determine LFM2 GGUF tensor naming:
-     BEFORE writing any model code, run `wick inspect` on the LFM2 GGUF
+     BEFORE writing any model code, run `cera inspect` on the LFM2 GGUF
      and document every tensor name and shape.
 
      Known from real LFM2-VL-450M inspection:
@@ -179,7 +179,7 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 
 3.6  engine.rs — Generation loop with prefill + decode
 
-3.7  wick run CLI command
+3.7  cera run CLI command
 
 3.8  Correctness validation against llama.cpp
 ```
@@ -221,9 +221,9 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 **Time: 3-5 days**
 
 ```
-6.1  HuggingFace model download: wick run -m LiquidAI/LFM2.5-1.2B-Instruct
-6.2  Interactive chat mode: wick chat -m model.gguf
-6.3  Benchmark command: wick bench -m model.gguf
+6.1  HuggingFace model download: cera run -m LiquidAI/LFM2.5-1.2B-Instruct
+6.2  Interactive chat mode: cera chat -m model.gguf
+6.3  Benchmark command: cera bench -m model.gguf
 6.4  Correctness: perplexity on WikiText-2 for Q4_K_M and Q8_0
 6.5  CI + static binary releases (Linux, macOS, Windows)
 6.6  README with benchmarks, install instructions, supported models
@@ -261,7 +261,7 @@ Google Research's data-oblivious KV cache compression (ICLR 2026). Compresses KV
 Q2_K through Q6_K, IQ quants, GPTQ, AWQ, FP8, in-situ quantization.
 
 ### V2.7: Per-Shape Kernel Tuning (GEMV/MMVQ) — 1-2 weeks
-Profile-guided kernel optimization for quantized decode (batch=1 GEMV). Instead of using one-size-fits-all thread/block configs for all layers, profile each unique (quant_type, N, K) shape on the target GPU and apply optimal nwarps/rows_per_block at runtime. Inspired by [kernel-anvil](https://github.com/apollosenvy/kernel-anvil) which demonstrated 2.25x decode speedup on Qwen3.5-27B Q4_K_M (12→27 tok/s on RX 7900 XTX) by auto-tuning llama.cpp's MMVQ kernels per model shape. Key insight: a 1024-row GQA projection and a 17408-row FFN layer have very different optimal configs. The bottleneck classification (bandwidth-bound vs occupancy-limited vs compute-bound) determines the sweep strategy. For wick: implement shape-aware dispatch in wgpu compute shaders (WGSL workgroup size, rows per invocation) and optionally in CPU SIMD (loop tiling). Store per-model configs as JSON; profile on first run or via `wick tune` command.
+Profile-guided kernel optimization for quantized decode (batch=1 GEMV). Instead of using one-size-fits-all thread/block configs for all layers, profile each unique (quant_type, N, K) shape on the target GPU and apply optimal nwarps/rows_per_block at runtime. Inspired by [kernel-anvil](https://github.com/apollosenvy/kernel-anvil) which demonstrated 2.25x decode speedup on Qwen3.5-27B Q4_K_M (12→27 tok/s on RX 7900 XTX) by auto-tuning llama.cpp's MMVQ kernels per model shape. Key insight: a 1024-row GQA projection and a 17408-row FFN layer have very different optimal configs. The bottleneck classification (bandwidth-bound vs occupancy-limited vs compute-bound) determines the sweep strategy. For cera: implement shape-aware dispatch in wgpu compute shaders (WGSL workgroup size, rows per invocation) and optionally in CPU SIMD (loop tiling). Store per-model configs as JSON; profile on first run or via `cera tune` command.
 
 ### V2.8: Speculative Decoding — 1-2 weeks
 Draft model + verification, self-speculative. 1.3-2x decode speedup.
@@ -279,7 +279,7 @@ Pipeline parallelism, tensor parallelism, CPU offloading.
 Optional cuBLAS + FlashAttention + CUDA graphs. Requires nvcc.
 
 ### V2.13: Python Bindings — 1-2 weeks
-PyO3 bindings, `pip install wick-engine`.
+PyO3 bindings, `pip install cera-engine`.
 
 ### V2.14: Kotlin Multiplatform Bindings — 2-3 weeks
 C ABI via cbindgen + platform-native FFI per KMP target (cinterop, Panama FFM, PanamaPort, JS interop).
@@ -331,7 +331,7 @@ gpu = ["dep:wgpu"]
 ```
 
 > **Note:** The `wgpu` dependency and `gpu = ["dep:wgpu"]` feature shown above are
-> illustrative of the planned V2 layout. The current `wick/Cargo.toml` has `gpu = []`
+> illustrative of the planned V2 layout. The current `cera/Cargo.toml` has `gpu = []`
 > as a placeholder with no `wgpu` dependency wired in yet.
 
 No `tokenizers`, no `rayon`, no `axum`, no `tokio`, no `wasm-bindgen`.

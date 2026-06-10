@@ -1,12 +1,12 @@
 [workspace]
-members = ["wick", "wick-cli", "wick-ffi", "wick-parity", "wick-wasm"]
+members = ["cera", "cera-cli", "cera-ffi", "cera-parity", "cera-wasm"]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.85"  # minimum; edition 2024 requires 1.85+
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/hyeons-lab/wick"
+repository = "https://github.com/hyeons-lab/cera"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -34,7 +34,7 @@ tempfile = "3"
 # BLAS bindings for SGEMM on CPU prefill. On macOS the `accelerate-src` provider
 # dispatches through Apple's Accelerate framework (unlocking the AMX matrix unit);
 # on Linux the `openblas-src` provider pulls in OpenBLAS. Gated behind the `blas`
-# feature in the wick crate so non-BLAS builds still work via the NEON integer path.
+# feature in the cera crate so non-BLAS builds still work via the NEON integer path.
 cblas-sys = "0.1"
 accelerate-src = "0.3"
 openblas-src = { version = "0.10", features = ["system"] }
@@ -43,10 +43,10 @@ openblas-src = { version = "0.10", features = ["system"] }
 # stays straightforward.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 sha2 = "0.10"
-# Cross-platform Ctrl+C handler. wick-cli installs one in the line-REPL chat
+# Cross-platform Ctrl+C handler. cera-cli installs one in the line-REPL chat
 # loop so SIGINT cancels the in-flight turn instead of killing the process.
 ctrlc = "3"
-# UniFFI for multi-language bindings (wick-ffi crate). Version pinned to
+# UniFFI for multi-language bindings (cera-ffi crate). Version pinned to
 # a 0.31.x series — bindings are ABI-stable within a minor.
 uniffi = "0.31"
 # wasm32-unknown-unknown portability deps (Phase 3 of the FFI multi-target
@@ -58,20 +58,20 @@ uniffi = "0.31"
 #     `wasm_js` feature instead — they're not interchangeable.
 #   - `web-time 1` is the standard `std::time::{Instant, Duration}` shim
 #     for wasm32-unknown-unknown (where `std::time::Instant` compiles
-#     since Rust 1.74 but panics at runtime). Used by `wick::time` to
+#     since Rust 1.74 but panics at runtime). Used by `cera::time` to
 #     give the lib a single Instant type that works on both targets.
 getrandom = "0.2"
 web-time = "1"
-# JS interop for the `wick-wasm` crate. Pinned to 0.2.x — wasm-bindgen
+# JS interop for the `cera-wasm` crate. Pinned to 0.2.x — wasm-bindgen
 # is ABI-stable within a minor and breakage between minors is the
 # normal "regenerate the JS glue" upgrade dance, not a code-level
-# rewrite. Only consumed by `wick-wasm`; native crates don't pull it.
+# rewrite. Only consumed by `cera-wasm`; native crates don't pull it.
 wasm-bindgen = "0.2"
 # Worker-pool init shim that lights up rayon on `wasm32-unknown-unknown`.
 # Provides a `#[wasm_bindgen]` `init_thread_pool(num_threads)` export
 # that JS callers `await` once before any rayon work; under the hood
 # it spawns Web Workers (browser) or `worker_threads` (Node) and
-# attaches them to rayon's global pool. Only consumed by `wick-wasm`
+# attaches them to rayon's global pool. Only consumed by `cera-wasm`
 # behind its opt-in `parallel` feature — single-threaded wasm builds
 # don't pull this in. Pinned to 1.x; the crate is ABI-stable within
 # a major.

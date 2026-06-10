@@ -15,7 +15,7 @@ rustflags = ["-C", "target-cpu=native"]
 rustflags = ["-C", "target-cpu=native"]
 
 [target.x86_64-unknown-linux-gnu]
-# `x86-64-v3` ≈ Haswell baseline: AVX2 + FMA + BMI1/BMI2. Matches what wick's
+# `x86-64-v3` ≈ Haswell baseline: AVX2 + FMA + BMI1/BMI2. Matches what cera's
 # AVX2 kernels already opt into via `#[target_feature(enable = "avx2,fma")]`.
 rustflags = ["-C", "target-cpu=x86-64-v3"]
 

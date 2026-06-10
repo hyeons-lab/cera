@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare Wick tokenizer output against a Python BPE reference loaded from the same GGUF."""
+"""Compare Cera tokenizer output against a Python BPE reference loaded from the same GGUF."""
 
 import os
 import re
@@ -27,7 +27,7 @@ TEST_STRINGS = [
 
 
 def unescape_token(s: str) -> bytes:
-    """Mirror Wick's unescape_token: <0xHH> -> byte, ▁ -> space."""
+    """Mirror Cera's unescape_token: <0xHH> -> byte, ▁ -> space."""
     m = re.fullmatch(r"<0x([0-9A-Fa-f]{2})>", s)
     if m:
         return bytes([int(m.group(1), 16)])
@@ -36,7 +36,7 @@ def unescape_token(s: str) -> bytes:
 
 def bpe_encode(text: str, token_to_id: dict[bytes, int],
                merge_ranks: dict[tuple[bytes, bytes], int]) -> list[int]:
-    """Byte-level BPE encode — same algorithm as Wick's tokenizer."""
+    """Byte-level BPE encode — same algorithm as Cera's tokenizer."""
     if not text:
         return []
 
@@ -99,7 +99,7 @@ print(f"Vocab size: {len(vocab)}, Merges: {len(merge_ranks)}")
 
 # ── Compare ─────────────────────────────────────────────────────────────────
 
-wick_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+cera_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 passed = 0
 failed = 0
@@ -108,10 +108,10 @@ for text in TEST_STRINGS:
     # Python reference
     py_ids = bpe_encode(text, token_to_id, merge_ranks)
 
-    # Wick encode
+    # Cera encode
     result = subprocess.run(
-        ["cargo", "run", "--quiet", "--bin", "wick", "--", "tokenize", "-m", gguf_path, "-t", text],
-        capture_output=True, text=True, cwd=wick_dir,
+        ["cargo", "run", "--quiet", "--bin", "cera", "--", "tokenize", "-m", gguf_path, "-t", text],
+        capture_output=True, text=True, cwd=cera_dir,
     )
     if result.returncode != 0:
         print(f"\n[ERROR] 'cargo run' failed with exit code {result.returncode} for input {text!r}", file=sys.stderr)
@@ -120,13 +120,13 @@ for text in TEST_STRINGS:
         if result.stdout:
             print("stdout:", result.stdout.strip(), file=sys.stderr)
         sys.exit(result.returncode or 1)
-    wick_output = result.stdout.strip()
-    if wick_output == "[]":
-        wick_ids = []
+    cera_output = result.stdout.strip()
+    if cera_output == "[]":
+        cera_ids = []
     else:
-        wick_ids = [int(x) for x in wick_output.strip("[]").split(", ") if x]
+        cera_ids = [int(x) for x in cera_output.strip("[]").split(", ") if x]
 
-    match = py_ids == wick_ids
+    match = py_ids == cera_ids
     status = "PASS" if match else "FAIL"
     if match:
         passed += 1
@@ -136,7 +136,7 @@ for text in TEST_STRINGS:
     print(f"\n[{status}] {text!r}")
     if not match:
         print(f"  Python: {py_ids}")
-        print(f"  Wick:   {wick_ids}")
+        print(f"  Cera:   {cera_ids}")
     else:
         print(f"  IDs:    {py_ids}")
 

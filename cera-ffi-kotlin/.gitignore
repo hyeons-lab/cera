@@ -1,0 +1,13 @@
+# Gradle
+.gradle/
+build/
+**/build/
+local.properties
+
+# Staged native libraries — built by `just jvm-libs` / `just android-libs` (and
+# in CI per-runner), never committed.
+**/src/main/resources/darwin-aarch64/
+**/src/main/resources/darwin-x86-64/
+**/src/main/resources/linux-x86-64/
+**/src/main/resources/win32-x86-64/
+**/src/main/jniLibs/

@@ -1,4 +1,4 @@
-# Wick
+# Cera
 
 Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
@@ -35,7 +35,7 @@ Q4_0 is faster than Q8_0 for both decode and prefill (less weight data to read p
 
 #### CPU prefill via Accelerate BLAS (Apple AMX) — opt-in, aarch64 only
 
-The batched prefill GEMM path is currently `#[cfg(target_arch = "aarch64")]`, so the BLAS rewrite only takes effect on Apple Silicon (and aarch64 Linux if anyone runs wick there). On x86_64 Linux `forward_prefill` still falls through to the per-token GEMV loop regardless of the `blas` feature — enabling BLAS on x86_64 just pulls in OpenBLAS for nothing. Extending the batched path to x86_64 is a separate follow-up.
+The batched prefill GEMM path is currently `#[cfg(target_arch = "aarch64")]`, so the BLAS rewrite only takes effect on Apple Silicon (and aarch64 Linux if anyone runs cera there). On x86_64 Linux `forward_prefill` still falls through to the per-token GEMV loop regardless of the `blas` feature — enabling BLAS on x86_64 just pulls in OpenBLAS for nothing. Extending the batched path to x86_64 is a separate follow-up.
 
 On aarch64 with the feature on, SGEMM dispatches through Apple's Accelerate framework (unlocking the AMX matrix unit) or through OpenBLAS on aarch64 Linux. Weights are dequantized row-by-row into a reusable `InferenceState` scratch, then multiplied by the f32 input columns — eight call sites per layer (conv in/out proj, attn Q/K/V/output, FFN gate/up/down).
 
@@ -51,14 +51,14 @@ That's a **1.91× end-to-end prefill speedup**. A standalone GEMM microbench on 
 Gated behind the **opt-in** `blas` feature so default builds stay zero-dependency. To enable on macOS (Accelerate is system-provided, no install needed):
 
 ```bash
-cargo build --release -p wick-cli --features blas
+cargo build --release -p cera-cli --features blas
 ```
 
 To enable on Linux (requires a system OpenBLAS install):
 
 ```bash
 sudo apt-get install libopenblas-dev pkg-config
-cargo build --release -p wick-cli --features blas
+cargo build --release -p cera-cli --features blas
 ```
 
 Default builds — `cargo build --release` with no features — use the pure-NEON integer GEMM path on aarch64 and need no system libraries.
@@ -73,7 +73,7 @@ Two GPU backends with runtime selection via `--device`:
 
 #### Decode throughput vs llama.cpp (greedy, M1 Max, Q4_0)
 
-| Model             | Test  | llama.cpp | wick Metal       |
+| Model             | Test  | llama.cpp | cera Metal       |
 |-------------------|-------|----------:|-----------------:|
 | LFM2.5-VL-450M    | tg128 | 142       | **351** (+147%)  |
 | LFM2.5-VL-450M    | tg512 | 139       | **321** (+131%)  |
@@ -90,9 +90,9 @@ timed over the next 128 or 512 tokens (no timing includes the prefill).
 Reproduction commands:
 
 ```
-# wick (per row, swap --max-tokens)
-wick bench -m model.gguf --device metal --no-cache --prompt-tokens 128 --max-tokens 128 --runs 20 --warmup 3
-wick bench -m model.gguf --device metal --no-cache --prompt-tokens 128 --max-tokens 512 --runs 20 --warmup 3
+# cera (per row, swap --max-tokens)
+cera bench -m model.gguf --device metal --no-cache --prompt-tokens 128 --max-tokens 128 --runs 20 --warmup 3
+cera bench -m model.gguf --device metal --no-cache --prompt-tokens 128 --max-tokens 512 --runs 20 --warmup 3
 
 # llama.cpp (per row, swap -n)
 llama-bench -m model.gguf -p 128 -n 128 -ngl 99 -r 10
@@ -101,7 +101,7 @@ llama-bench -m model.gguf -p 128 -n 512 -ngl 99 -r 10
 
 #### Prefill throughput vs llama.cpp (Q4_0, Metal, M1 Max)
 
-| Model          | Prompt | llama.cpp | wick Metal      | Ratio |
+| Model          | Prompt | llama.cpp | cera Metal      | Ratio |
 |----------------|-------:|----------:|----------------:|------:|
 | LFM2.5-VL-450M | 128    | 7619      | **8315** (+9%)  | 1.09× |
 | LFM2.5-VL-450M | 1024   | 8213      | 6411            | 0.78× |
@@ -110,9 +110,9 @@ llama-bench -m model.gguf -p 128 -n 512 -ngl 99 -r 10
 | LFM2.5-VL-1.6B | 1024   | 2481      | 1864            | 0.75× |
 | LFM2.5-VL-1.6B | 4096   | 2178      | 1135            | 0.52× |
 
-Wick leads on 450M at p=128 and is competitive on 1.6B at p=128;
+Cera leads on 450M at p=128 and is competitive on 1.6B at p=128;
 llama.cpp's BLAS-backed GEMM still wins at p=1024 and p=4096 on both
-models. PR [#20](https://github.com/hyeons-lab/wick/pull/20) landed a
+models. PR [#20](https://github.com/hyeons-lab/cera/pull/20) landed a
 **+26% improvement** to Metal prefill at p=4096 (2227 → 2817 tok/s on
 LFM2.5-VL-450M) via a one-simdgroup-per-query rewrite of
 `attention_prefill.metal`. Further work on the long-prompt gap is
@@ -121,10 +121,10 @@ tracked in `benchmarks/profile_longctx.md`.
 Reproduction commands:
 
 ```
-# wick (per row, swap --prompt-tokens)
-wick bench -m model.gguf --device metal --no-cache --context-size 8192 --prompt-tokens 128  --max-tokens 0 --runs 20 --warmup 3
-wick bench -m model.gguf --device metal --no-cache --context-size 8192 --prompt-tokens 1024 --max-tokens 0 --runs 20 --warmup 3
-wick bench -m model.gguf --device metal --no-cache --context-size 8192 --prompt-tokens 4096 --max-tokens 0 --runs 20 --warmup 3
+# cera (per row, swap --prompt-tokens)
+cera bench -m model.gguf --device metal --no-cache --context-size 8192 --prompt-tokens 128  --max-tokens 0 --runs 20 --warmup 3
+cera bench -m model.gguf --device metal --no-cache --context-size 8192 --prompt-tokens 1024 --max-tokens 0 --runs 20 --warmup 3
+cera bench -m model.gguf --device metal --no-cache --context-size 8192 --prompt-tokens 4096 --max-tokens 0 --runs 20 --warmup 3
 
 # llama.cpp (per row, swap -p)
 llama-bench -m model.gguf -p 128  -n 0 -ngl 99 -r 20
@@ -160,7 +160,7 @@ llama-bench -m model.gguf -p 4096 -n 0 -ngl 99 -r 20
 
 ## TurboQuant KV Cache Compression
 
-Wick includes the **first implementation of the TurboQuant algorithm** ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874), Google Research 2025) **for LFM2 architectures**, compressing **both keys and values**. llama.cpp already supports simpler quantized KV caches (q4_0, q4_1, q8_0) for LFM2; TurboQuant is a newer, more sophisticated algorithm that offers better accuracy-per-bit via a data-oblivious rotation + residual correction pipeline.
+Cera includes the **first implementation of the TurboQuant algorithm** ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874), Google Research 2025) **for LFM2 architectures**, compressing **both keys and values**. llama.cpp already supports simpler quantized KV caches (q4_0, q4_1, q8_0) for LFM2; TurboQuant is a newer, more sophisticated algorithm that offers better accuracy-per-bit via a data-oblivious rotation + residual correction pipeline.
 
 ### What it is
 
@@ -176,11 +176,11 @@ TurboQuant compresses KV cache **keys to ~3 bits/element** and **values to ~2 bi
 
 | Approach | Bits per key | Bits per value | Calibration | Unbiased estimator |
 |----------|---:|---:|:-:|:-:|
-| f32 (wick default) | 32 | 32 | — | — |
+| f32 (cera default) | 32 | 32 | — | — |
 | f16 (llama.cpp default) | 16 | 16 | — | — |
 | llama.cpp q8_0 KV | 8 | 8 | — | — |
 | llama.cpp q4_0 KV | 4 | 4 | — | — |
-| **wick TurboQuant tq3** | **3** | **2** | **no** | **yes** (keys) |
+| **cera TurboQuant tq3** | **3** | **2** | **no** | **yes** (keys) |
 
 TurboQuant's differentiators:
 
@@ -192,7 +192,7 @@ TurboQuant's differentiators:
 
 | Format | Bytes/key + value (head_dim=128) | Compression |
 |--------|---:|---:|
-| f32 (wick default) | 512 + 512 = 1024 | 1× |
+| f32 (cera default) | 512 + 512 = 1024 | 1× |
 | f16 | 256 + 256 = 512 | 2× |
 | **TurboQuant tq3** | **52 + 34 = 86** | **~12×** |
 
@@ -204,7 +204,7 @@ Savings scale linearly with context length — at 8K+ tokens the KV cache domina
 
 ### Throughput
 
-After full optimization (NEON SIMD, GQA batching, zero heap in hot path, fused encode pipeline), **TurboQuant decode is within ±5% of wick f32** and sometimes *faster* (the GQA-batched attention with pre-computed scratch amortizes better than the original f32 path at short contexts). Values reuse the same NEON kernel pattern as keys for the hot inner loop.
+After full optimization (NEON SIMD, GQA batching, zero heap in hot path, fused encode pipeline), **TurboQuant decode is within ±5% of cera f32** and sometimes *faster* (the GQA-batched attention with pre-computed scratch amortizes better than the original f32 path at short contexts). Values reuse the same NEON kernel pattern as keys for the hot inner loop.
 
 ### Backend support
 
@@ -212,20 +212,20 @@ After full optimization (NEON SIMD, GQA batching, zero heap in hot path, fused e
 
 ### CLI: enabling TurboQuant
 
-Both `wick run` and `wick bench` accept `--kv-cache-keys` (the flag name is kept for backwards compatibility; it now covers values too):
+Both `cera run` and `cera bench` accept `--kv-cache-keys` (the flag name is kept for backwards compatibility; it now covers values too):
 
 ```bash
 # Uncompressed (default) — keys and values stored as f32
-wick run -m lfm2.gguf -p "Hello" --kv-cache-keys f32 --device cpu
+cera run -m lfm2.gguf -p "Hello" --kv-cache-keys f32 --device cpu
 
 # Full TurboQuant — 3-bit keys + 2-bit values (production default, CPU backend only)
-wick run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3 --device cpu
+cera run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3 --device cpu
 
 # Keys only — 3-bit keys, values stay f32 (debugging: isolate key error)
-wick run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3-keys --device cpu
+cera run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3-keys --device cpu
 
 # Values only — values stay 2-bit, keys stay f32 (debugging: isolate value error)
-wick run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3-values --device cpu
+cera run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3-values --device cpu
 ```
 
 Accepted values for `--kv-cache-keys`:
@@ -237,10 +237,10 @@ Accepted values for `--kv-cache-keys`:
 | `tq3-keys` | 3-bit | f32 | Debug: measure key-only drift |
 | `tq3-values` | f32 | 2-bit | Debug: measure value-only drift |
 
-The same flag applies to `wick bench` for A/B benchmarking:
+The same flag applies to `cera bench` for A/B benchmarking:
 
 ```bash
-wick bench -m lfm2.gguf --kv-cache-keys tq3 --max-tokens 256 --device cpu
+cera bench -m lfm2.gguf --kv-cache-keys tq3 --max-tokens 256 --device cpu
 ```
 
 ### Programmatic API
@@ -248,7 +248,7 @@ wick bench -m lfm2.gguf --kv-cache-keys tq3 --max-tokens 256 --device cpu
 TurboQuant is configured in a **single call** — construct a `KvCompression` and pass it to `InferenceState::from_config_with_compression` or via `GenerateConfig`. No separate `enable_turboquant` call is needed; the rotation state, compressed caches, and scratch buffers are all set up on the `InferenceState` from the same configuration.
 
 ```rust
-use wick::kv_cache::{InferenceState, KvCompression};
+use cera::kv_cache::{InferenceState, KvCompression};
 
 // Production: both sides compressed. The single `seed` drives the
 // per-layer randomized Hadamard rotations deterministically.
@@ -258,7 +258,7 @@ let state = InferenceState::from_config_with_compression(
 );
 
 // Or via the bench/engine config:
-let gen_cfg = wick::engine::GenerateConfig {
+let gen_cfg = cera::engine::GenerateConfig {
     kv_compression: KvCompression::turboquant(42),
     ..Default::default()
 };
@@ -281,7 +281,7 @@ let cfg = KvCompression::TurboQuant { seed: 42, keys: false, values: true  }; //
 
 To check whether a loaded model's backend supports TurboQuant, call `model.turboquant_supported()` before asking for compression — it returns `false` on GPU backends and on any model whose `head_dim` isn't a power of 2 (the Walsh-Hadamard transform requires it).
 
-See `wick/src/turboquant.rs` for the implementation and `wick/src/kv_cache.rs` for the `KvCompression` enum.
+See `cera/src/turboquant.rs` for the implementation and `cera/src/kv_cache.rs` for the `KvCompression` enum.
 
 ## Features
 
@@ -291,10 +291,10 @@ See `wick/src/turboquant.rs` for the implementation and `wick/src/kv_cache.rs` f
 - **Quantization** — Q4_0, Q8_0, Q6_K, Q4_K_M for weights
 - **TurboQuant KV cache compression** — ~12× KV reduction (3-bit keys + 2-bit values), unbiased attention estimator, first TurboQuant implementation for LFM2
 - **Built-in BPE tokenizer** — no Python, no runtime dependencies
-- **Bench harness** — `wick bench` with p10/p50/p90/stddev for reproducible A/B comparisons
+- **Bench harness** — `cera bench` with p10/p50/p90/stddev for reproducible A/B comparisons
 - **Chat mode** with Jinja2 chat template rendering
 - **Single static binary**
-- **Multi-target FFI bindings** — JVM (Android), Apple platforms (iOS / macOS XCFramework), and browser / Node (`@hyeonslab/wick-wasm`) all driven from the same Rust core via `wick-ffi` (UniFFI) and `wick-wasm` (`wasm-bindgen`).
+- **Multi-target FFI bindings** — JVM (Android), Apple platforms (iOS / macOS XCFramework), and browser / Node (`@hyeons-lab/cera-wasm`) all driven from the same Rust core via `cera-ffi` (UniFFI) and `cera-wasm` (`wasm-bindgen`).
 
 ## Build
 
@@ -306,39 +306,39 @@ cargo build --workspace
 just release
 
 # Run
-cargo run --release -p wick-cli -- run --model model.gguf --prompt "Hello, world!"
+cargo run --release -p cera-cli -- run --model model.gguf --prompt "Hello, world!"
 ```
 
 ## Usage
 
 ```bash
 # Generate text
-wick run --model model.gguf --prompt "What is Rust?"
+cera run --model model.gguf --prompt "What is Rust?"
 
 # Inspect a model file
-wick inspect --model model.gguf
+cera inspect --model model.gguf
 
 # Interactive chat
-wick chat --model model.gguf
+cera chat --model model.gguf
 
 # Tokenize (for debugging)
-wick tokenize --model model.gguf "Hello world"
+cera tokenize --model model.gguf "Hello world"
 ```
 
 ## Architecture
 
 Five-crate workspace:
 
-- **`wick`** — core library (GGUF parsing, quantization, compute backends, models, tokenizer)
-- **`wick-cli`** — CLI binary (clap, dispatches to `wick`)
-- **`wick-ffi`** — UniFFI bindings for foreign-language consumers (Kotlin, Swift, Python, …). See [`wick-ffi/README.md`](wick-ffi/README.md) for scope + roadmap.
-- **`wick-wasm`** — `wasm-bindgen` browser / Node bindings (`@hyeonslab/wick-wasm` shape). See [`wick-wasm/README.md`](wick-wasm/README.md) for usage + worker / cancellation patterns.
-- **`wick-parity`** — cross-binding parity harness that runs the same prompt through `wick`, `wick-ffi` (JNA / Swift), and reports drift. See [`wick-parity/README.md`](wick-parity/README.md).
+- **`cera`** — core library (GGUF parsing, quantization, compute backends, models, tokenizer)
+- **`cera-cli`** — CLI binary (clap, dispatches to `cera`)
+- **`cera-ffi`** — UniFFI bindings for foreign-language consumers (Kotlin, Swift, Python, …). See [`cera-ffi/README.md`](cera-ffi/README.md) for scope + roadmap.
+- **`cera-wasm`** — `wasm-bindgen` browser / Node bindings (`@hyeons-lab/cera-wasm` shape). See [`cera-wasm/README.md`](cera-wasm/README.md) for usage + worker / cancellation patterns.
+- **`cera-parity`** — cross-binding parity harness that runs the same prompt through `cera`, `cera-ffi` (JNA / Swift), and reports drift. See [`cera-parity/README.md`](cera-parity/README.md).
 
 ### Module layout
 
 ```
-wick/src/
+cera/src/
 ├── gguf.rs              # mmap-based GGUF parser (zero-copy tensor access)
 ├── tensor.rs            # DType enum (F32, F16, BF16, Q4_0, Q8_0, Q4_K_M, Q6_K)
 ├── quant.rs             # Block structs + scalar dequant/vec_dot kernels

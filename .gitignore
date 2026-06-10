@@ -3,13 +3,13 @@
 **/*.rs.bk
 Cargo.lock
 
-# Gradle / Kotlin (wick-parity Kotlin leg + any future Gradle subprojects)
+# Gradle / Kotlin (cera-parity Kotlin leg + any future Gradle subprojects)
 **/.gradle/
 **/.kotlin/
 **/build/
 !**/src/**/build/
 
-# Swift Package Manager (wick-parity Swift leg + any future SPM subprojects)
+# Swift Package Manager (cera-parity Swift leg + any future SPM subprojects)
 **/.build/
 **/.swiftpm/
 **/Package.resolved
@@ -37,7 +37,7 @@ devlog/
 # Benchmark artifacts
 benchmark_results.csv
 benchmark_output.log
-wick_time.txt
+cera_time.txt
 llama_time.txt
 bench_results.csv
 bench_log.txt
