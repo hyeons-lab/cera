@@ -70,9 +70,14 @@ fn encode_with_bos(tok: &BpeTokenizer, gguf: &GgufFile, prompt: &str) -> Vec<u32
 /// Validate one model's fixture set. Returns failure strings (empty = pass);
 /// `None` if the model GGUF is absent (skipped).
 fn check_model(fixture_dir: &std::path::Path) -> Option<Vec<String>> {
-    let index: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(fixture_dir.join("index.json")).ok()?)
-            .ok()?;
+    // Committed fixtures must parse — corruption is a hard failure, not a skip.
+    // The *only* intended skip is the model GGUF being absent (CI / no download).
+    let index_path = fixture_dir.join("index.json");
+    let index: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&index_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", index_path.display())),
+    )
+    .unwrap_or_else(|e| panic!("parse {}: {e}", index_path.display()));
     let model_file = index["model_file"].as_str().unwrap();
     let mp = models_dir().join(model_file);
     if !mp.exists() {

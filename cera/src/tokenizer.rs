@@ -157,13 +157,18 @@ impl BpeTokenizer {
                         .collect();
                     for i in 0..ranges.len() {
                         let (a, b) = ranges[i];
-                        // Whitespace runs are ASCII (newline-terminated runs are
-                        // claimed by an earlier alternative), so the last char is
-                        // one byte — `b - 1` is a valid boundary.
+                        // Whitespace runs are ASCII, so the last char is one byte
+                        // — `b - 1` is a valid boundary.
                         let is_ws_run =
                             b - a >= 2 && s.as_bytes()[a..b].iter().all(u8::is_ascii_whitespace);
+                        // Only hand a trailing *space/tab* to the next chunk. A
+                        // run ending in a newline is normally claimed by the
+                        // earlier `\s*[\r\n]+` alternative, but guard anyway: the
+                        // lookahead only applies to a space before a word, never
+                        // to a newline (which belongs with the whitespace chunk).
+                        let last_is_spacetab = matches!(s.as_bytes()[b - 1], b' ' | b'\t');
                         let next_non_ws = s[b..].chars().next().is_some_and(|c| !c.is_whitespace());
-                        if is_ws_run && next_non_ws && i + 1 < ranges.len() {
+                        if is_ws_run && last_is_spacetab && next_non_ws && i + 1 < ranges.len() {
                             ranges[i].1 = b - 1;
                             ranges[i + 1].0 = b - 1;
                         }

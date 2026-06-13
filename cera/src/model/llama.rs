@@ -341,8 +341,11 @@ impl LlamaModel {
 
             // Oracle gate: residual stream after the full layer (= llama.cpp's
             // `l_out-{i}`). All-position for early layers, last-position for the
-            // final layer — the test sums vs. takes-last accordingly.
-            transformer::oracle_dump::record(&format!("l_out-{i}"), hidden);
+            // final layer — the test sums vs. takes-last accordingly. Guarded so
+            // the per-token `format!` allocation only happens when dumping.
+            if transformer::oracle_dump::is_active() {
+                transformer::oracle_dump::record(&format!("l_out-{i}"), hidden);
+            }
         }
 
         cpu::rmsnorm(hidden, &self.output_norm_weight, cfg.rms_norm_eps);
@@ -407,6 +410,16 @@ impl Model for LlamaModel {
         assert!(
             !tokens.is_empty(),
             "forward_prefill requires at least one token"
+        );
+        // Each `forward` appends one K/V cell and advances `seq_len`, so the
+        // rope position of token `i` must equal the current cache length. That
+        // holds only when `start_pos` lines up with the existing cache — enforce
+        // it so a mismatched snapshot/prefix-cache restore fails loudly here
+        // rather than drifting into a later KV-shift panic.
+        assert_eq!(
+            start_pos, state.seq_len,
+            "forward_prefill: start_pos ({start_pos}) must equal state.seq_len ({})",
+            state.seq_len
         );
         // Sequential per-token prefill. Correctness-first: a batched-GEMM
         // prefill path (like LFM2's) is a later optimization.

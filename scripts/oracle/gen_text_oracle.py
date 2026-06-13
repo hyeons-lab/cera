@@ -103,7 +103,8 @@ def main():
     ap.add_argument("prompts", nargs="+")
     args = ap.parse_args()
 
-    env = dict(os.environ, DYLD_LIBRARY_PATH=args.bin_dir)
+    # Locate the just-built llama.cpp shared libs: DYLD_* on macOS, LD_* on Linux.
+    env = dict(os.environ, DYLD_LIBRARY_PATH=args.bin_dir, LD_LIBRARY_PATH=args.bin_dir)
     os.makedirs(args.out_dir, exist_ok=True)
 
     index = {

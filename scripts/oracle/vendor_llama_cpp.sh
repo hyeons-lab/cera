@@ -37,10 +37,17 @@ echo "[oracle] checked out $(git -C "${BUILD_ROOT}" rev-parse --short HEAD)"
 #                         `llama-cli` raw-completion path into `llama-completion`.
 #   llama-eval-callback — per-tensor dumps with full-tensor `sum` checksums,
 #                         filterable via --tensor-filter (sub-step gates).
+# Oracle runs are CPU-only (`-ngl 0`), so no GPU backend is required. Enable
+# Metal only on macOS so the build doesn't pull in a GPU toolchain (or fail) on
+# Linux hosts.
+METAL_FLAG="-DGGML_METAL=OFF"
+if [ "$(uname -s)" = "Darwin" ]; then
+  METAL_FLAG="-DGGML_METAL=ON"
+fi
 cmake -S "${BUILD_ROOT}" -B "${BUILD_ROOT}/build" \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLAMA_CURL=OFF \
-  -DGGML_METAL=ON \
+  "${METAL_FLAG}" \
   >/dev/null
 cmake --build "${BUILD_ROOT}/build" \
   --target llama-completion llama-eval-callback \

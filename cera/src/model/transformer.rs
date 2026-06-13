@@ -15,13 +15,17 @@ use crate::tensor::DType;
 //
 // When enabled, records the full-tensor `sum` of named sub-step activations in
 // call order, so a test can compare them against per-node `sum` checksums
-// captured from llama.cpp (see `cera/tests/oracle_qwen2.rs` and
+// captured from llama.cpp (see `cera/tests/oracle_text.rs` and
 // `scripts/oracle/`). Off (and free) unless `oracle_dump::begin()` is called.
 // Records every occurrence (once per token during prefill) so the test can sum
 // all-position nodes and take the last occurrence for last-position nodes.
 //
-// `#[doc(hidden)] pub` so the integration test (`tests/oracle_qwen2.rs`, a
+// `#[doc(hidden)] pub` so the integration test (`tests/oracle_text.rs`, a
 // separate crate) can drive it; not part of the supported public API.
+//
+// Callers that must allocate to build a node name (e.g. `format!("l_out-{i}")`)
+// should guard with `is_active()` so disabled inference pays nothing beyond a
+// cheap thread-local bool read.
 #[doc(hidden)]
 pub mod oracle_dump {
     use std::cell::RefCell;
@@ -38,6 +42,13 @@ pub mod oracle_dump {
     /// Stop collecting and return the recorded `(name, sum)` occurrences.
     pub fn take() -> Vec<(String, f64)> {
         SINK.with(|s| s.borrow_mut().take().unwrap_or_default())
+    }
+
+    /// Whether collection is active. Lets hot-path callers skip building node
+    /// names (and the record call) when the dump is off.
+    #[inline]
+    pub fn is_active() -> bool {
+        SINK.with(|s| s.borrow().is_some())
     }
 
     /// Record the sum of `data` under `name` if collection is active.
