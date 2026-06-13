@@ -47,7 +47,7 @@ Metal forward passes currently support **LFM2 only**; Qwen runs on CPU.
 | V2.12 CUDA backend | ⬜ | |
 | V2.13 Python (PyO3) bindings | ⬜ | |
 | V2.14 Kotlin Multiplatform bindings | ✅ | `cera-ffi-kotlin` (android + jvm) |
-| V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync API + token streaming verified end-to-end; `*Async` stubbed |
+| V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync API, token streaming, `generateAsync`, `withProgress` verified; `generateStreamingAsync`/`fromBundleIdAsync` stubbed |
 | V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core shipped, CPU-only encode |
 | V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
 | V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync engine API verified end-to-end; streaming/async stubbed |
@@ -395,10 +395,30 @@ workspace) and four codegen fixes — to be upstreamed to
    `Vec<u32>`/`Vec<f32>`/enum now decode correctly. 223 vendored tests pass
    (incl. new callback-mapper tests).
 
-**Remaining:** `*Async` methods (`generate_async`, `generate_streaming_async`,
-`fromBundleIdAsync`) still need the async invocation ABI (separate, larger —
-stubbed to throw); `BundleRepo.withProgress` (DownloadProgressSink) is wired but
-unverified (stubbed); package prebuilt native libs per target (Android jniLibs /
+**Async — `generateAsync` WORKS; callback-async is fundamentally blocked.**
+`generateAsync` returns a real `Future` via UniFFI's rust-future poll/complete
+loop (already emitted by the generator's ffibuffer-async path) — verified async:
+24 tokens with the Dart event loop ticking ~44× during decode
+(`example/cera_async.dart`). **`generateStreamingAsync` cannot work**: cera runs
+it on a tokio blocking-pool thread, so the sink fires from a non-isolate thread,
+and `NativeCallable.isolateLocal` may only be invoked from its owning isolate
+("Cannot invoke native callback outside an isolate"). Supporting it needs
+`NativeCallable.listener` (cross-thread, queued) callback vtables — a larger
+generator change. Stubbed with that explanation. (Sync `generate_streaming` is
+fine — callbacks fire on the calling thread; run it in a Dart `Isolate` for
+off-UI-thread streaming.) `fromBundleIdAsync` (async constructor returning an
+object handle) stays generator-stubbed — needs the object/pointer rust-future
+variant.
+
+**`BundleRepo.withProgress` — VERIFIED.** `DownloadProgressSink.onProgress`
+fires (on the calling thread, since `fromBundleId` is synchronous) with all args
+RustBuffer-decoded correctly: `url: String`, `bytesDownloaded: u64`,
+`totalBytes: Option<u64>` (`example/cera_progress.dart`, against the
+`LFM2-350M-GGUF` bundle).
+
+**Remaining:** `NativeCallable.listener` callback vtables (unblocks
+`generateStreamingAsync`); object/pointer rust-future variant (unblocks
+`fromBundleIdAsync`); package prebuilt native libs per target (Android jniLibs /
 iOS xcframework / desktop); expose a detokenizer over FFI; example Flutter app +
 wire the Dart drift check into CI; then the upstream PR.
 

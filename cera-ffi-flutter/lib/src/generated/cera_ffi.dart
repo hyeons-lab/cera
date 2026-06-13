@@ -6249,7 +6249,7 @@ final class BundleRepo {
   /// new one — Arc-based, so all in-flight calls finish on the
   /// old sink and new calls go to the new one.
   static BundleRepo withProgress(String storeDir, DownloadProgressSink progress) {
-    throw UnsupportedError('BundleRepo.withProgress is not yet usable via the Dart bindings (V2.17).');
+    return _bindings().bundleRepoCreateWithProgress(storeDir, progress);
   }
 
   /// Total bytes currently held in the cache. Returns `0` if the
@@ -7236,7 +7236,7 @@ final class Session {
   /// sink callbacks fire for that case (the decode never began).
   Future<GenerateSummary> generateStreamingAsync(GenerateOpts opts, ModalitySink sink) {
     _ensureOpen();
-    throw UnsupportedError('generate_streaming_async is not yet usable via the Dart bindings (async out-arg ABI WIP, V2.17).');
+    throw UnsupportedError('generate_streaming_async is not supported: its sink callbacks fire from a tokio worker thread, which NativeCallable.isolateLocal cannot service. Use the synchronous generateStreaming (optionally in a Dart Isolate), or await generateAsync. See V2.17.');
   }
 
   /// Current KV position — how many tokens live in the cache.

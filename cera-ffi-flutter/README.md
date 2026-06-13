@@ -95,16 +95,26 @@ target (Android jniLibs, iOS xcframework, desktop bundles) is follow-up work.
 
 Tracked in `docs/IMPLEMENTATION_PLAN.md` → **V2.17**:
 
-- **Streaming works.** `Session.generateStreaming(opts, sink)` delivers tokens
-  to a Dart `ModalitySink` (`onTextTokens` / `onAudioFrames` / `onDone`) — see
+**Works (verified):**
+- **Sync `generate`** — `example/cera_generate.dart`.
+- **Token streaming** — `Session.generateStreaming(opts, sink)` → Dart
+  `ModalitySink` (`onTextTokens`/`onAudioFrames`/`onDone`),
   `example/cera_stream.dart`. The vendored generator
-  (`third_party/uniffi-bindgen-dart/`) carries four fixes for this: callback-arg
-  lowering, the vtable-init symbol, vtable slot ordering, and the RustBuffer
-  callback-arg ABI (to be upstreamed).
-- **`*Async` methods** (`generateAsync`, `generateStreamingAsync`,
-  `fromBundleIdAsync`) throw `UnsupportedError` — they need the async invocation
-  ABI, still unimplemented in the generator.
-- **`BundleRepo.withProgress`** is wired but unverified — stubbed to throw.
+  (`third_party/uniffi-bindgen-dart/`) carries the four fixes that enable it
+  (callback-arg lowering, vtable-init symbol, vtable slot order, RustBuffer
+  callback-arg ABI — to be upstreamed).
+- **`generateAsync`** — real `Future` via the rust-future poll loop; the event
+  loop stays responsive during decode (`example/cera_async.dart`).
+- **`BundleRepo.withProgress`** — `DownloadProgressSink.onProgress` fires with
+  correctly decoded args (`example/cera_progress.dart`).
+
+**Not yet supported (throw `UnsupportedError`):**
+- **`generateStreamingAsync`** — cera runs it on a tokio worker thread, so the
+  sink fires off-isolate; `NativeCallable.isolateLocal` can't service that. Needs
+  `NativeCallable.listener` vtables. Use sync `generateStreaming` (optionally in
+  a Dart `Isolate`) instead.
+- **`fromBundleIdAsync`** — async constructor returning an object handle; needs
+  the object/pointer rust-future variant.
 - **No detokenizer** over FFI — `generate` returns token IDs.
 
 > The callback vtable's static `NativeCallable.isolateLocal`s keep the isolate

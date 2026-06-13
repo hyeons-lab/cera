@@ -64,17 +64,25 @@ void main(List<String> args) {
     stdout.writeln('  fixed fromBundleIdAsync return type (1 site)');
   }
 
-  // Fix 3: stub the entry points that still aren't usable. Sync
-  // `generate_streaming` works now (vtable order + RustBuffer callback-arg ABI
-  // are fixed in the vendored generator), so it is NO LONGER stubbed. The
-  // `*Async` variants still hit the generator's unimplemented async out-arg ABI,
-  // and `BundleRepo.withProgress` (DownloadProgressSink) isn't verified yet, so
-  // those stay stubbed to throw a clear error rather than misbehave. See V2.17.
+  // Fix 3: stub the entry points that still aren't usable. Working now (NOT
+  // stubbed): sync `generate` / `generate_streaming`, and `generateAsync`
+  // (ffibuffer rust-future poll/complete — verified async, event loop stays
+  // responsive).
+  //
+  // `generateStreamingAsync` is async AND takes a callback sink. cera runs it on
+  // a tokio blocking-pool thread, so the sink fires from a NON-isolate thread —
+  // and `NativeCallable.isolateLocal` can only be invoked from its owning
+  // isolate ("Cannot invoke native callback outside an isolate"). Supporting it
+  // needs `NativeCallable.listener` (cross-thread, queued) callback vtables, a
+  // larger generator change. Stub until then. (`generate_streaming` sync is
+  // fine: callbacks fire on the calling thread.)
+  //
+  // `from_bundle_id_async` (async constructor returning an object handle) stays
+  // on the generator's own stub — it needs the object/pointer rust-future
+  // variant, which the generator doesn't emit yet.
   const methodStubs = <String, String>{
     'return _ffi.sessionInvokeGenerateStreamingAsync(_handle, opts, sink);':
-        "throw UnsupportedError('generate_streaming_async is not yet usable via the Dart bindings (async out-arg ABI WIP, V2.17).');",
-    'return _bindings().bundleRepoCreateWithProgress(storeDir, progress);':
-        "throw UnsupportedError('BundleRepo.withProgress is not yet usable via the Dart bindings (V2.17).');",
+        "throw UnsupportedError('generate_streaming_async is not supported: its sink callbacks fire from a tokio worker thread, which NativeCallable.isolateLocal cannot service. Use the synchronous generateStreaming (optionally in a Dart Isolate), or await generateAsync. See V2.17.');",
   };
   methodStubs.forEach((bad, good) {
     if (src.contains(bad)) {
