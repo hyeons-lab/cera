@@ -1,0 +1,458 @@
+// Architecture-independent transformer machinery shared by NEOX-rope text
+// models (Qwen2, Qwen3). Mirrors the weight plumbing + per-token kernels in
+// `lfm2.rs` so a plain transformer model (`llama.rs`) can reuse them without
+// touching the LFM2 implementation. A later PR migrates LFM2 onto this module;
+// for now the duplication keeps regression risk to zero.
+
+use anyhow::{Context, Result};
+
+use crate::backend::cpu;
+use crate::gguf::GgufFile;
+use crate::kv_cache::{InferenceState, LayerState};
+use crate::tensor::DType;
+
+// ── Oracle dump sink (test-only correctness gate) ───────────────────────────
+//
+// When enabled, records the full-tensor `sum` of named sub-step activations in
+// call order, so a test can compare them against per-node `sum` checksums
+// captured from llama.cpp (see `cera/tests/oracle_qwen2.rs` and
+// `scripts/oracle/`). Off (and free) unless `oracle_dump::begin()` is called.
+// Records every occurrence (once per token during prefill) so the test can sum
+// all-position nodes and take the last occurrence for last-position nodes.
+//
+// `#[doc(hidden)] pub` so the integration test (`tests/oracle_qwen2.rs`, a
+// separate crate) can drive it; not part of the supported public API.
+#[doc(hidden)]
+pub mod oracle_dump {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SINK: RefCell<Option<Vec<(String, f64)>>> = const { RefCell::new(None) };
+    }
+
+    /// Start collecting (clears any prior buffer).
+    pub fn begin() {
+        SINK.with(|s| *s.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stop collecting and return the recorded `(name, sum)` occurrences.
+    pub fn take() -> Vec<(String, f64)> {
+        SINK.with(|s| s.borrow_mut().take().unwrap_or_default())
+    }
+
+    /// Record the sum of `data` under `name` if collection is active.
+    #[inline]
+    pub(crate) fn record(name: &str, data: &[f32]) {
+        SINK.with(|s| {
+            if let Some(buf) = s.borrow_mut().as_mut() {
+                buf.push((name.to_string(), data.iter().map(|&x| x as f64).sum()));
+            }
+        });
+    }
+}
+
+// ── Pre-resolved weight reference ───────────────────────────────────────────
+
+/// Pre-resolved reference to a quantized weight in the mmap. Computed once at
+/// load time to avoid HashMap lookups during inference. Semantics match
+/// `lfm2::WeightRef`.
+#[derive(Debug, Clone)]
+pub(crate) struct WeightRef {
+    pub start: usize,
+    pub size: usize,
+    pub dtype: DType,
+    pub m: usize,
+    pub k: usize,
+}
+
+/// Resolve a tensor name to a pre-computed byte range in the mmap.
+pub(crate) fn resolve_weight(gguf: &GgufFile, name: &str) -> Result<WeightRef> {
+    let info = gguf
+        .tensors
+        .get(name)
+        .with_context(|| format!("tensor not found: {name}"))?;
+
+    // info.offset is already absolute (data_offset + raw_offset from GGUF)
+    let start =
+        usize::try_from(info.offset).with_context(|| format!("tensor {name} offset overflow"))?;
+
+    let size = info.size_bytes;
+    let dtype = info.dtype;
+
+    // GGUF shape: [inner_dim, outer_dim] → in memory: outer_dim rows of inner_dim elements
+    let k = info.shape.first().copied().unwrap_or(1); // inner dim (elements per row)
+    let m = if info.shape.len() > 1 {
+        info.shape[1]
+    } else {
+        1
+    }; // outer dim (number of rows)
+
+    Ok(WeightRef {
+        start,
+        size,
+        dtype,
+        m,
+        k,
+    })
+}
+
+/// Get the raw bytes for a pre-resolved weight.
+#[inline]
+pub(crate) fn weight_data<'a>(gguf: &'a GgufFile, wref: &WeightRef) -> &'a [u8] {
+    &gguf.mmap_data()[wref.start..wref.start + wref.size]
+}
+
+/// GEMV dispatch without scratch buffers.
+pub(crate) fn gemv(gguf: &GgufFile, wref: &WeightRef, x: &[f32], y: &mut [f32]) {
+    let data = weight_data(gguf, wref);
+    cpu::gemv_dispatch(wref.dtype, data, x, y, wref.m, wref.k, None);
+}
+
+/// GEMV with pre-quantized Q8_0 input (skips re-quantizing x for each weight
+/// matrix). For Q4_0/Q8_0/Q6K weights the integer dot-product path is used;
+/// other dtypes fall back to the f32 path.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn gemv_preq(
+    gguf: &GgufFile,
+    wref: &WeightRef,
+    x_f32: &[f32],
+    q8s: &[f32],
+    q8q: &[i8],
+    y: &mut [f32],
+) {
+    let data = weight_data(gguf, wref);
+    cpu::gemv_with_preq(wref.dtype, data, q8s, q8q, x_f32, y, wref.m, wref.k);
+}
+
+/// Quantize `x` to Q8_0 into the state's reusable scratch buffers.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
+    assert_eq!(
+        x.len() % 32,
+        0,
+        "quantize_to_scratch: x.len() must be divisible by 32"
+    );
+    let nb = x.len() / 32;
+    state.scratch.q8_scales.resize(nb, 0.0);
+    state.scratch.q8_quants.resize(x.len(), 0);
+    unsafe {
+        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+            x,
+            &mut state.scratch.q8_scales,
+            &mut state.scratch.q8_quants,
+        );
+    }
+}
+
+/// Dequantize a single row from a quantized matrix into `out`.
+pub(crate) fn dequantize_row_into(
+    gguf: &GgufFile,
+    wref: &WeightRef,
+    row_idx: usize,
+    out: &mut [f32],
+) {
+    assert!(
+        row_idx < wref.m,
+        "dequantize_row: row_idx {row_idx} out of range (m={})",
+        wref.m
+    );
+    let data = weight_data(gguf, wref);
+    let row_bytes = wref.k / wref.dtype.block_size() * wref.dtype.block_bytes();
+    let row_start = row_idx * row_bytes;
+    let row_data = &data[row_start..row_start + row_bytes];
+
+    match wref.dtype {
+        DType::Q6K => crate::quant::dequantize_q6_k_row(row_data, out),
+        DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, out),
+        DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, out),
+        DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, out),
+        DType::F32 => {
+            let floats: &[f32] = bytemuck::cast_slice(row_data);
+            out.copy_from_slice(floats);
+        }
+        _ => panic!("unsupported embedding dtype: {:?}", wref.dtype),
+    }
+}
+
+/// Dequantize a single row to an owned `Vec<f32>` (embedding lookup).
+pub(crate) fn dequantize_row(gguf: &GgufFile, wref: &WeightRef, row_idx: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; wref.k];
+    dequantize_row_into(gguf, wref, row_idx, &mut out);
+    out
+}
+
+// ── Generic per-layer kernels ───────────────────────────────────────────────
+
+/// Pre-resolved attention weight refs for a transformer layer.
+pub(crate) struct AttnWeights<'a> {
+    pub attn_q: &'a WeightRef,
+    pub attn_k: &'a WeightRef,
+    pub attn_v: &'a WeightRef,
+    pub attn_output: &'a WeightRef,
+}
+
+/// Optional per-arch knobs for the attention helper.
+///
+/// - `qkv_bias`: Q/K/V bias vectors added right after each projection GEMV.
+///   Present for Qwen2, `None` for Qwen3.
+/// - `qk_norm`: per-head RMSNorm weights for Q and K, applied BEFORE RoPE
+///   (head_dim each). Present for Qwen3, `None` for Qwen2.
+pub(crate) struct AttnExtras<'a> {
+    pub qkv_bias: Option<(&'a [f32], &'a [f32], &'a [f32])>,
+    pub qk_norm: Option<(&'a [f32], &'a [f32])>,
+}
+
+/// Static per-layer dimensions for the attention helper.
+#[derive(Clone, Copy)]
+pub(crate) struct AttnDims {
+    pub hidden_size: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub rope_theta: f32,
+    pub rms_norm_eps: f32,
+}
+
+/// Run one attention block for a single token. Writes the post-output-projection
+/// result into `state.scratch.out[..hidden_size]`. The pre-normed hidden state
+/// `hidden` is expected to already be RMSNorm'd by the caller (and, on aarch64,
+/// pre-quantized into `state.scratch.q8_*`). KV append + attention go through
+/// the f32 `LayerState::Attention` cache exactly as LFM2's f32 path does.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_attn_block(
+    gguf: &GgufFile,
+    layer: usize,
+    weights: &AttnWeights,
+    extras: &AttnExtras,
+    dims: AttnDims,
+    hidden: &[f32],
+    pos: usize,
+    state: &mut InferenceState,
+) {
+    let head_dim = dims.head_dim;
+    let n_heads = dims.n_heads;
+    let n_kv_heads = dims.n_kv_heads;
+    let hidden_size = dims.hidden_size;
+    let kv_dim = n_kv_heads * head_dim;
+
+    let q = &mut state.scratch.q[..hidden_size];
+    let k = &mut state.scratch.k[..kv_dim];
+    let v = &mut state.scratch.v[..kv_dim];
+
+    // Q, K, V projections. On aarch64 the hidden state was pre-quantized to
+    // Q8_0 at the layer level, so the integer dot-product path is used.
+    #[cfg(target_arch = "aarch64")]
+    {
+        gemv_preq(
+            gguf,
+            weights.attn_q,
+            hidden,
+            &state.scratch.q8_scales,
+            &state.scratch.q8_quants,
+            q,
+        );
+        gemv_preq(
+            gguf,
+            weights.attn_k,
+            hidden,
+            &state.scratch.q8_scales,
+            &state.scratch.q8_quants,
+            k,
+        );
+        gemv_preq(
+            gguf,
+            weights.attn_v,
+            hidden,
+            &state.scratch.q8_scales,
+            &state.scratch.q8_quants,
+            v,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        gemv(gguf, weights.attn_q, hidden, q);
+        gemv(gguf, weights.attn_k, hidden, k);
+        gemv(gguf, weights.attn_v, hidden, v);
+    }
+
+    // Qwen2 bias: applied right after each Q/K/V projection.
+    if let Some((q_bias, k_bias, v_bias)) = extras.qkv_bias {
+        cpu::add_inplace(q, q_bias);
+        cpu::add_inplace(k, k_bias);
+        cpu::add_inplace(v, v_bias);
+    }
+
+    // Qwen3 per-head QK norm: RMSNorm each head slice with shared weights,
+    // applied BEFORE RoPE (mirrors LFM2's mandatory QK-norm).
+    if let Some((q_norm, k_norm)) = extras.qk_norm {
+        for h in 0..n_heads {
+            cpu::rmsnorm(
+                &mut q[h * head_dim..(h + 1) * head_dim],
+                q_norm,
+                dims.rms_norm_eps,
+            );
+        }
+        for h in 0..n_kv_heads {
+            cpu::rmsnorm(
+                &mut k[h * head_dim..(h + 1) * head_dim],
+                k_norm,
+                dims.rms_norm_eps,
+            );
+        }
+    }
+
+    // RoPE (NEOX / split-halves layout — correct for Qwen2/Qwen3).
+    cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, dims.rope_theta);
+
+    // Append K, V to the f32 cache.
+    if let LayerState::Attention {
+        key_cache,
+        value_cache,
+        ..
+    } = &mut state.layers[layer]
+    {
+        key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
+        value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
+    }
+
+    // GQA: grouped query attention over the full KV cache.
+    let group_size = n_heads / n_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    {
+        let (k_cache, v_cache) = match &state.layers[layer] {
+            LayerState::Attention {
+                key_cache,
+                value_cache,
+                ..
+            } => (key_cache.as_slice(), value_cache.as_slice()),
+            _ => panic!("expected Attention state for layer {layer}"),
+        };
+        let seq_len = k_cache.len() / kv_dim;
+        let attn_out = &mut state.scratch.attn_out[..hidden_size];
+        let q = &state.scratch.q[..hidden_size];
+        let scores = &mut state.scratch.scores;
+        scores.resize(seq_len, 0.0);
+        for h in 0..n_heads {
+            let kv_h = h / group_size;
+            let q_head = &q[h * head_dim..(h + 1) * head_dim];
+            let kv_h_offset = kv_h * head_dim;
+            cpu::attn_scores(
+                q_head,
+                k_cache,
+                scores,
+                kv_dim,
+                kv_h_offset,
+                head_dim,
+                scale,
+                seq_len,
+            );
+            cpu::softmax_inplace(scores);
+            cpu::attn_values(
+                scores,
+                v_cache,
+                &mut attn_out[h * head_dim..(h + 1) * head_dim],
+                kv_dim,
+                kv_h_offset,
+                head_dim,
+                seq_len,
+            );
+        }
+    }
+
+    // Output projection into state.scratch.out.
+    let out = &mut state.scratch.out[..hidden_size];
+    gemv(
+        gguf,
+        weights.attn_output,
+        &state.scratch.attn_out[..hidden_size],
+        out,
+    );
+}
+
+/// Pre-resolved FFN weight refs for a transformer layer.
+pub(crate) struct FfnWeights<'a> {
+    pub ffn_gate: &'a WeightRef,
+    pub ffn_up: &'a WeightRef,
+    pub ffn_down: &'a WeightRef,
+}
+
+/// Run one SwiGLU FFN block for a single token: `ffn_input` is the already
+/// RMSNorm'd (and, on aarch64, pre-quantized) hidden state. Writes the result
+/// into `state.scratch.out[..hidden_size]`. Identical to LFM2's FFN.
+pub(crate) fn forward_ffn_block(
+    gguf: &GgufFile,
+    weights: &FfnWeights,
+    hidden_size: usize,
+    intermediate_size: usize,
+    ffn_input: &[f32],
+    state: &mut InferenceState,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        gemv_preq(
+            gguf,
+            weights.ffn_gate,
+            ffn_input,
+            &state.scratch.q8_scales,
+            &state.scratch.q8_quants,
+            &mut state.scratch.gate[..intermediate_size],
+        );
+        gemv_preq(
+            gguf,
+            weights.ffn_up,
+            ffn_input,
+            &state.scratch.q8_scales,
+            &state.scratch.q8_quants,
+            &mut state.scratch.up[..intermediate_size],
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        gemv(
+            gguf,
+            weights.ffn_gate,
+            ffn_input,
+            &mut state.scratch.gate[..intermediate_size],
+        );
+        gemv(
+            gguf,
+            weights.ffn_up,
+            ffn_input,
+            &mut state.scratch.up[..intermediate_size],
+        );
+    }
+
+    cpu::silu_mul_inplace(
+        &mut state.scratch.gate[..intermediate_size],
+        &state.scratch.up[..intermediate_size],
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let nb = intermediate_size / 32;
+        state.scratch.q8_scales.resize(nb, 0.0);
+        state.scratch.q8_quants.resize(intermediate_size, 0);
+        unsafe {
+            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                &state.scratch.gate[..intermediate_size],
+                &mut state.scratch.q8_scales,
+                &mut state.scratch.q8_quants,
+            );
+        }
+        gemv_preq(
+            gguf,
+            weights.ffn_down,
+            &state.scratch.gate[..intermediate_size],
+            &state.scratch.q8_scales,
+            &state.scratch.q8_quants,
+            &mut state.scratch.out[..hidden_size],
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    gemv(
+        gguf,
+        weights.ffn_down,
+        &state.scratch.gate[..intermediate_size],
+        &mut state.scratch.out[..hidden_size],
+    );
+}

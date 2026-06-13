@@ -1,5 +1,5 @@
 {
-  "model_file": "qwen2-0_5b-instruct-q4_0.gguf",
+  "model_file": "qwen2-0_5b-instruct-q8_0.gguf",
   "llama_cpp_sha": "d8a24ccee207a1ff24c513fe1c7d3222b3ccd837",
   "n_predict": 16,
   "prompts": [

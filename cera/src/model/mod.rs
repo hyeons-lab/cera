@@ -1,5 +1,6 @@
 pub mod lfm2;
 pub mod llama;
+pub mod transformer;
 
 #[cfg(feature = "gpu")]
 pub mod gpu_lfm2;
@@ -345,6 +346,11 @@ pub fn load_model(
         .unwrap_or_default();
     match arch.as_str() {
         "lfm2" => Ok(Box::new(lfm2::Lfm2Model::from_gguf_with_id(
+            gguf,
+            context_size,
+            model_id,
+        )?)),
+        "qwen2" | "qwen3" => Ok(Box::new(llama::LlamaModel::from_gguf_with_id(
             gguf,
             context_size,
             model_id,

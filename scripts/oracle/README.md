@@ -29,8 +29,8 @@ Two gate signals per prompt (see `cera/tests/fixtures/oracle/<model>/*.json`):
 
 ```bash
 scripts/oracle/vendor_llama_cpp.sh        # clone+build pinned llama.cpp (~target/, gitignored)
-hf download Qwen/Qwen2-0.5B-Instruct-GGUF qwen2-0_5b-instruct-q4_0.gguf \
-    --local-dir target/oracle/models      # fixture model (gitignored, ~350MB)
+hf download Qwen/Qwen2-0.5B-Instruct-GGUF qwen2-0_5b-instruct-q8_0.gguf \
+    --local-dir target/oracle/models      # fixture model (gitignored, ~530MB Q8_0)
 scripts/oracle/gen_qwen2_fixtures.sh      # writes cera/tests/fixtures/oracle/qwen2-0_5b/
 ```
 

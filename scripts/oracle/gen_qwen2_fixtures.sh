@@ -5,7 +5,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN_DIR="${REPO_ROOT}/target/oracle/llama.cpp/build/bin"
-MODEL="${REPO_ROOT}/target/oracle/models/qwen2-0_5b-instruct-q4_0.gguf"
+MODEL="${REPO_ROOT}/target/oracle/models/qwen2-0_5b-instruct-q8_0.gguf"
 OUT_DIR="${REPO_ROOT}/cera/tests/fixtures/oracle/qwen2-0_5b"
 LLAMA_SHA="$(git -C "${REPO_ROOT}/target/oracle/llama.cpp" rev-parse HEAD)"
 

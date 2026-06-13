@@ -76,6 +76,12 @@ def capture_greedy(bin_dir, model, prompt, n_predict, env):
             f"{bin_dir}/llama-completion", "-m", model, "-p", prompt,
             "--temp", "0", "--top-k", "1", "-n", str(n_predict),
             "-ngl", "0", "--no-display-prompt",
+            # RAW completion: -no-cnv disables conversation mode, which otherwise
+            # auto-enables when the model ships a chat template and would wrap the
+            # prompt in user/assistant turns — making the greedy text inconsistent
+            # with eval-callback's raw tokenization (and with cera, which prefills
+            # the raw prompt tokens).
+            "-no-cnv",
         ],
         env,
     )
