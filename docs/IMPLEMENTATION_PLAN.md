@@ -47,6 +47,7 @@ Metal forward passes currently support **LFM2 only**; Qwen runs on CPU.
 | V2.12 CUDA backend | ⬜ | |
 | V2.13 Python (PyO3) bindings | ⬜ | |
 | V2.14 Kotlin Multiplatform bindings | ✅ | `cera-ffi-kotlin` (android + jvm) |
+| V2.17 Flutter / Dart bindings | ⬜ | spiked — uniffi-bindgen-dart works for the sync core; async/streaming surface needs fixes |
 | V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core shipped, CPU-only encode |
 | V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
 
@@ -349,6 +350,38 @@ PyO3 bindings, `pip install cera-engine`.
 
 ### V2.14: Kotlin Multiplatform Bindings — 2-3 weeks ✅ DONE
 C ABI via cbindgen + platform-native FFI per KMP target (cinterop, Panama FFM, PanamaPort, JS interop).
+
+### V2.17: Flutter / Dart Bindings — 2-3 weeks ⬜ (spiked)
+Expose the engine to Flutter/Dart, reusing the existing `cera-ffi` UniFFI
+surface (the same C ABI that already backs Kotlin + Swift). A new
+`cera-ffi-flutter` Dart package would ship the generated bindings plus the
+prebuilt native libs (Android `.so` / iOS xcframework / desktop dylib).
+
+**Spike result (2026-06-13, `uniffi-bindgen-dart` 0.1.3):** Viable but not
+turnkey. The generator builds against `uniffi_bindgen 0.31.1` (our exact
+version) and emitted ~7,300 lines of Dart from the current `cera-ffi` dylib
+with **zero Rust-side changes** — structs, enums, sync methods, and
+`CeraEngine.transcribe` came out clean (UniFFI checksums matched). After adding
+the `ffi` package dep and an SDK `^3.3.0` constraint, `dart analyze` drops to
+**8 errors, 0 warnings**, and every error sits in the *advanced* FFI surface:
+- callback / foreign-trait sinks — `DownloadProgressSink`, `ModalitySink`
+  (download progress + audio-modality streaming) generate invalid casts;
+- async constructor `fromBundleIdAsync` returns `CeraEngine` instead of
+  `Future<CeraEngine>`;
+- a `_UniFfiFfiBufferElement.pointer` getter bug in sequence handling.
+
+So the bulk auto-generates, but cera leans hard on exactly the async +
+streaming-callback features 0.1.3 mishandles. Paths forward:
+1. **Narrow the Dart-exposed surface** — generate for the sync core, hand-write
+   thin Dart shims for the streaming/async bits.
+2. **Patch/contribute upstream** — the failures are isolated; `uniffi-bindgen-dart`
+   is young (0.1.x) and the fixes look tractable.
+3. **flutter_rust_bridge** — separate binding layer, but first-class async +
+   `Stream` support (a better fit for token/audio streaming) at the cost of not
+   reusing the UniFFI interface.
+
+Recommendation: pursue (1)+(2) to stay aligned with the existing UniFFI
+bindings; fall back to (3) if streaming UX becomes the priority.
 
 ---
 
