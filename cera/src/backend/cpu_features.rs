@@ -157,9 +157,13 @@ pub fn detect() -> CpuFeatures {
         f.avx512f = is_x86_feature_detected!("avx512f");
         f.avx512bw = is_x86_feature_detected!("avx512bw");
         f.avx512vnni = is_x86_feature_detected!("avx512vnni");
-        // NOTE: capped at Avx2 — no AVX-512 kernels exist yet. When they land,
-        // add `if f.avx512f && f.avx512bw { CpuTier::Avx512 }` above this.
-        f.tier = if f.avx2 && f.fma {
+        // Avx512 covers the 512-bit f32 Q8_0/Q4_0 `vec_dot` kernels (avx512f is
+        // sufficient for those; it implies AVX2+FMA, which the Q4_K_M fallback
+        // to the AVX2 kernel needs). VNNI is detected for diagnostics but not
+        // yet exploited — a true int8 path on x86 is a separate change.
+        f.tier = if f.avx512f {
+            CpuTier::Avx512
+        } else if f.avx2 && f.fma {
             CpuTier::Avx2
         } else {
             CpuTier::Scalar
@@ -245,7 +249,10 @@ mod tests {
     fn detected_tier_matches_arch() {
         let t = detect().tier;
         #[cfg(target_arch = "x86_64")]
-        assert!(matches!(t, CpuTier::Scalar | CpuTier::Avx2));
+        assert!(matches!(
+            t,
+            CpuTier::Scalar | CpuTier::Avx2 | CpuTier::Avx512
+        ));
         #[cfg(target_arch = "aarch64")]
         assert!(matches!(
             t,

@@ -1744,6 +1744,134 @@ mod avx2 {
     }
 }
 
+// ── x86_64 AVX-512 ──────────────────────────────────────────────────────────
+//
+// 512-bit-wide f32 vec_dot kernels — the AVX2 algorithm at double the vector
+// width (16 f32 lanes per op). The x86 hot path is int8-weight × f32-activation,
+// so these stay on the f32-FMA path; a true VNNI int8×int8 GEMV would need a
+// quantized-activation path on x86 (like aarch64's pre-quant kernels) and is a
+// separate, larger change. Only Q8_0 and Q4_0 have AVX-512 kernels; Q4_K_M
+// stays on AVX2 even at the Avx512 tier (the dispatcher routes it there).
+//
+// NOTE: not executable on the aarch64 dev host. Verified by `avx512_tests`
+// below, which run only where `is_x86_feature_detected!("avx512f")` holds
+// (e.g. Zen 4/5, Skylake-X), comparing each kernel against the scalar reference.
+#[cfg(target_arch = "x86_64")]
+mod avx512 {
+    // The `_mm512_*` intrinsics stabilized in Rust 1.89, past the crate's
+    // documented 1.85 MSRV. This module is x86-only and reached only at runtime
+    // on AVX-512 hosts (which run a recent toolchain), so the newer intrinsics
+    // are acceptable here; the rest of the crate stays within 1.85.
+    #![allow(clippy::incompatible_msrv)]
+    use super::*;
+    use std::arch::x86_64::*;
+
+    /// AVX-512 Q8_0 dot product with f32 vector. 16 lanes/iter, 2 iters for 32.
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn vec_dot_q8_0_f32_avx512(block: &BlockQ8_0, y: &[f32]) -> f32 {
+        unsafe {
+            debug_assert_eq!(y.len(), 32);
+            let d = f16::from_bits(block.delta).to_f32();
+            let quants_ptr = block.quants.as_ptr();
+            let y_ptr = y.as_ptr();
+            let mut acc = _mm512_setzero_ps();
+            for i in (0..32).step_by(16) {
+                // 16 int8 → 16 i32 (sign-extend) → 16 f32.
+                let q128 = _mm_loadu_si128(quants_ptr.add(i) as *const __m128i);
+                let qf = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(q128));
+                let yv = _mm512_loadu_ps(y_ptr.add(i));
+                acc = _mm512_fmadd_ps(qf, yv, acc);
+            }
+            d * _mm512_reduce_add_ps(acc)
+        }
+    }
+
+    /// AVX-512 Q4_0 dot product with f32 vector. Low 16 nibbles ↔ y[0..16],
+    /// high 16 ↔ y[16..32]; each nibble is `(n - 8) * d`.
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn vec_dot_q4_0_f32_avx512(block: &BlockQ4_0, y: &[f32]) -> f32 {
+        unsafe {
+            debug_assert_eq!(y.len(), 32);
+            let d = f16::from_bits(block.d).to_f32();
+            let offset = _mm512_set1_ps(8.0);
+            let mask_lo = _mm_set1_epi8(0x0F);
+            let y_ptr = y.as_ptr();
+
+            let qbytes = _mm_loadu_si128(block.qs.as_ptr() as *const __m128i);
+            let lo = _mm_and_si128(qbytes, mask_lo);
+            let hi = _mm_and_si128(_mm_srli_epi16(qbytes, 4), mask_lo);
+
+            let mut acc = _mm512_setzero_ps();
+            // 16 low nibbles (zero-extend u8 → i32) → f32, minus 8, FMA y[0..16].
+            let lo_f = _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(lo)), offset);
+            acc = _mm512_fmadd_ps(lo_f, _mm512_loadu_ps(y_ptr), acc);
+            let hi_f = _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(hi)), offset);
+            acc = _mm512_fmadd_ps(hi_f, _mm512_loadu_ps(y_ptr.add(16)), acc);
+
+            d * _mm512_reduce_add_ps(acc)
+        }
+    }
+
+    #[cfg(test)]
+    mod avx512_tests {
+        use super::*;
+        use crate::quant::{vec_dot_q4_0_f32_scalar, vec_dot_q8_0_f32_scalar};
+
+        fn lcg(state: &mut u64) -> f32 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((*state >> 40) as f32 / (1u64 << 24) as f32) - 1.0
+        }
+
+        #[test]
+        fn q8_0_avx512_matches_scalar() {
+            if !is_x86_feature_detected!("avx512f") {
+                return; // only runs on AVX-512 hardware (e.g. the AMD Zen 5 box)
+            }
+            let mut st = 0x1357_9bdfu64;
+            let mut quants = [0i8; 32];
+            for q in quants.iter_mut() {
+                *q = (lcg(&mut st) * 127.0) as i32 as i8;
+            }
+            let block = BlockQ8_0 {
+                delta: f16::from_f32(0.043).to_bits(),
+                quants,
+            };
+            let y: Vec<f32> = (0..32).map(|_| lcg(&mut st)).collect();
+            let got = unsafe { vec_dot_q8_0_f32_avx512(&block, &y) };
+            let want = vec_dot_q8_0_f32_scalar(&block, &y);
+            assert!(
+                (got - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                "{got} vs {want}"
+            );
+        }
+
+        #[test]
+        fn q4_0_avx512_matches_scalar() {
+            if !is_x86_feature_detected!("avx512f") {
+                return;
+            }
+            let mut st = 0x2468_ace0u64;
+            let mut qs = [0u8; 16];
+            for b in qs.iter_mut() {
+                *b = (lcg(&mut st) * 127.0) as i32 as u8;
+            }
+            let block = BlockQ4_0 {
+                d: f16::from_f32(0.037).to_bits(),
+                qs,
+            };
+            let y: Vec<f32> = (0..32).map(|_| lcg(&mut st)).collect();
+            let got = unsafe { vec_dot_q4_0_f32_avx512(&block, &y) };
+            let want = vec_dot_q4_0_f32_scalar(&block, &y);
+            assert!(
+                (got - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                "{got} vs {want}"
+            );
+        }
+    }
+}
+
 // ── Dispatch ────────────────────────────────────────────────────────────────
 
 /// Best available Q4_0 dot product.
@@ -1760,8 +1888,7 @@ pub fn vec_dot_q4_0_f32(block: &BlockQ4_0, y: &[f32]) -> f32 {
         use crate::backend::cpu_features::{CpuTier, cpu_features};
         match cpu_features().tier {
             CpuTier::Scalar => crate::quant::vec_dot_q4_0_f32_scalar(block, y),
-            // Avx512 isn't produced by `detect()` yet (no kernels); it folds
-            // into the AVX2 path until its kernels land.
+            CpuTier::Avx512 => unsafe { avx512::vec_dot_q4_0_f32_avx512(block, y) },
             _ => unsafe { avx2::vec_dot_q4_0_f32_avx2(block, y) },
         }
     }
@@ -1786,6 +1913,7 @@ pub fn vec_dot_q8_0_f32(block: &BlockQ8_0, y: &[f32]) -> f32 {
         use crate::backend::cpu_features::{CpuTier, cpu_features};
         match cpu_features().tier {
             CpuTier::Scalar => crate::quant::vec_dot_q8_0_f32_scalar(block, y),
+            CpuTier::Avx512 => unsafe { avx512::vec_dot_q8_0_f32_avx512(block, y) },
             _ => unsafe { avx2::vec_dot_q8_0_f32_avx2(block, y) },
         }
     }
