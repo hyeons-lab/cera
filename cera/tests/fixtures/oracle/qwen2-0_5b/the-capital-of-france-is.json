@@ -1,0 +1,2923 @@
+{
+  "prompt": "The capital of France is",
+  "input_tokens": [
+    785,
+    6722,
+    315,
+    9625,
+    374
+  ],
+  "greedy_text": "Paris.",
+  "nodes": [
+    {
+      "name": "embd",
+      "op": "GET_ROWS",
+      "sum": -0.572942
+    },
+    {
+      "name": "norm-0",
+      "op": "RMS_NORM",
+      "sum": -43.253963
+    },
+    {
+      "name": "attn_norm-0",
+      "op": "MUL",
+      "sum": 1.905535
+    },
+    {
+      "name": "Qcur-0",
+      "op": "MUL_MAT",
+      "sum": -127.601715
+    },
+    {
+      "name": "Qcur-0",
+      "op": "ADD",
+      "sum": 12.986603
+    },
+    {
+      "name": "Qcur-0",
+      "op": "RESHAPE",
+      "sum": 12.986603
+    },
+    {
+      "name": "Qcur-0",
+      "op": "ROPE",
+      "sum": -26.175045
+    },
+    {
+      "name": "Vcur-0",
+      "op": "MUL_MAT",
+      "sum": 0.497179
+    },
+    {
+      "name": "Vcur-0",
+      "op": "ADD",
+      "sum": 1.130772
+    },
+    {
+      "name": "Vcur-0",
+      "op": "RESHAPE",
+      "sum": 1.130772
+    },
+    {
+      "name": "Kcur-0",
+      "op": "MUL_MAT",
+      "sum": 35.741383
+    },
+    {
+      "name": "Kcur-0",
+      "op": "ADD",
+      "sum": -41.996986
+    },
+    {
+      "name": "Kcur-0",
+      "op": "RESHAPE",
+      "sum": -41.996986
+    },
+    {
+      "name": "Kcur-0",
+      "op": "ROPE",
+      "sum": -21.698364
+    },
+    {
+      "name": "__fattn__-0",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 10.088554
+    },
+    {
+      "name": "kqv_out-0",
+      "op": "RESHAPE",
+      "sum": 10.088554
+    },
+    {
+      "name": "node_26",
+      "op": "MUL_MAT",
+      "sum": -0.046329
+    },
+    {
+      "name": "ffn_inp-0",
+      "op": "ADD",
+      "sum": -0.61927
+    },
+    {
+      "name": "norm-0",
+      "op": "RMS_NORM",
+      "sum": -41.449459
+    },
+    {
+      "name": "ffn_norm-0",
+      "op": "MUL",
+      "sum": -7.927083
+    },
+    {
+      "name": "ffn_gate-0",
+      "op": "MUL_MAT",
+      "sum": -2492.922363
+    },
+    {
+      "name": "ffn_up-0",
+      "op": "MUL_MAT",
+      "sum": -14.769693
+    },
+    {
+      "name": "ffn_swiglu-0",
+      "op": "SWIGLU",
+      "sum": -4.346242
+    },
+    {
+      "name": "ffn_out-0",
+      "op": "MUL_MAT",
+      "sum": 24.606646
+    },
+    {
+      "name": "l_out-0",
+      "op": "ADD",
+      "sum": 23.987364
+    },
+    {
+      "name": "norm-1",
+      "op": "RMS_NORM",
+      "sum": 105.937897
+    },
+    {
+      "name": "attn_norm-1",
+      "op": "MUL",
+      "sum": 50.839554
+    },
+    {
+      "name": "Qcur-1",
+      "op": "MUL_MAT",
+      "sum": -65.99054
+    },
+    {
+      "name": "Qcur-1",
+      "op": "ADD",
+      "sum": 114.786774
+    },
+    {
+      "name": "Qcur-1",
+      "op": "RESHAPE",
+      "sum": 114.786774
+    },
+    {
+      "name": "Qcur-1",
+      "op": "ROPE",
+      "sum": 207.536774
+    },
+    {
+      "name": "Vcur-1",
+      "op": "MUL_MAT",
+      "sum": -1.137967
+    },
+    {
+      "name": "Vcur-1",
+      "op": "ADD",
+      "sum": 6.149213
+    },
+    {
+      "name": "Vcur-1",
+      "op": "RESHAPE",
+      "sum": 6.149213
+    },
+    {
+      "name": "Kcur-1",
+      "op": "MUL_MAT",
+      "sum": -17.571709
+    },
+    {
+      "name": "Kcur-1",
+      "op": "ADD",
+      "sum": -717.564026
+    },
+    {
+      "name": "Kcur-1",
+      "op": "RESHAPE",
+      "sum": -717.564026
+    },
+    {
+      "name": "Kcur-1",
+      "op": "ROPE",
+      "sum": -687.705017
+    },
+    {
+      "name": "__fattn__-1",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 50.787228
+    },
+    {
+      "name": "kqv_out-1",
+      "op": "RESHAPE",
+      "sum": 50.787228
+    },
+    {
+      "name": "node_60",
+      "op": "MUL_MAT",
+      "sum": 11.214112
+    },
+    {
+      "name": "ffn_inp-1",
+      "op": "ADD",
+      "sum": 35.201515
+    },
+    {
+      "name": "norm-1",
+      "op": "RMS_NORM",
+      "sum": 138.867981
+    },
+    {
+      "name": "ffn_norm-1",
+      "op": "MUL",
+      "sum": 54.860348
+    },
+    {
+      "name": "ffn_gate-1",
+      "op": "MUL_MAT",
+      "sum": -10087.832031
+    },
+    {
+      "name": "ffn_up-1",
+      "op": "MUL_MAT",
+      "sum": -31.890882
+    },
+    {
+      "name": "ffn_swiglu-1",
+      "op": "SWIGLU",
+      "sum": 16.592482
+    },
+    {
+      "name": "ffn_out-1",
+      "op": "MUL_MAT",
+      "sum": 83.340988
+    },
+    {
+      "name": "l_out-1",
+      "op": "ADD",
+      "sum": 118.542709
+    },
+    {
+      "name": "norm-2",
+      "op": "RMS_NORM",
+      "sum": 177.979706
+    },
+    {
+      "name": "attn_norm-2",
+      "op": "MUL",
+      "sum": 18.952799
+    },
+    {
+      "name": "Qcur-2",
+      "op": "MUL_MAT",
+      "sum": -267.017914
+    },
+    {
+      "name": "Qcur-2",
+      "op": "ADD",
+      "sum": -225.314529
+    },
+    {
+      "name": "Qcur-2",
+      "op": "RESHAPE",
+      "sum": -225.314529
+    },
+    {
+      "name": "Qcur-2",
+      "op": "ROPE",
+      "sum": -200.818085
+    },
+    {
+      "name": "Vcur-2",
+      "op": "MUL_MAT",
+      "sum": -0.075203
+    },
+    {
+      "name": "Vcur-2",
+      "op": "ADD",
+      "sum": 1.214793
+    },
+    {
+      "name": "Vcur-2",
+      "op": "RESHAPE",
+      "sum": 1.214793
+    },
+    {
+      "name": "Kcur-2",
+      "op": "MUL_MAT",
+      "sum": -31.964203
+    },
+    {
+      "name": "Kcur-2",
+      "op": "ADD",
+      "sum": -184.210312
+    },
+    {
+      "name": "Kcur-2",
+      "op": "RESHAPE",
+      "sum": -184.210312
+    },
+    {
+      "name": "Kcur-2",
+      "op": "ROPE",
+      "sum": -146.388336
+    },
+    {
+      "name": "__fattn__-2",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -4.610469
+    },
+    {
+      "name": "kqv_out-2",
+      "op": "RESHAPE",
+      "sum": -4.610469
+    },
+    {
+      "name": "node_94",
+      "op": "MUL_MAT",
+      "sum": -0.646068
+    },
+    {
+      "name": "ffn_inp-2",
+      "op": "ADD",
+      "sum": 117.896553
+    },
+    {
+      "name": "norm-2",
+      "op": "RMS_NORM",
+      "sum": 173.879227
+    },
+    {
+      "name": "ffn_norm-2",
+      "op": "MUL",
+      "sum": 175.990707
+    },
+    {
+      "name": "ffn_gate-2",
+      "op": "MUL_MAT",
+      "sum": -12159.186523
+    },
+    {
+      "name": "ffn_up-2",
+      "op": "MUL_MAT",
+      "sum": 19.889786
+    },
+    {
+      "name": "ffn_swiglu-2",
+      "op": "SWIGLU",
+      "sum": 1717.673584
+    },
+    {
+      "name": "ffn_out-2",
+      "op": "MUL_MAT",
+      "sum": 1140.445435
+    },
+    {
+      "name": "l_out-2",
+      "op": "ADD",
+      "sum": 1258.342651
+    },
+    {
+      "name": "norm-3",
+      "op": "RMS_NORM",
+      "sum": 160.098221
+    },
+    {
+      "name": "attn_norm-3",
+      "op": "MUL",
+      "sum": 79.720772
+    },
+    {
+      "name": "Qcur-3",
+      "op": "MUL_MAT",
+      "sum": 51.109737
+    },
+    {
+      "name": "Qcur-3",
+      "op": "ADD",
+      "sum": -749.560059
+    },
+    {
+      "name": "Qcur-3",
+      "op": "RESHAPE",
+      "sum": -749.560059
+    },
+    {
+      "name": "Qcur-3",
+      "op": "ROPE",
+      "sum": -693.628113
+    },
+    {
+      "name": "Vcur-3",
+      "op": "MUL_MAT",
+      "sum": 0.685197
+    },
+    {
+      "name": "Vcur-3",
+      "op": "ADD",
+      "sum": 4.607237
+    },
+    {
+      "name": "Vcur-3",
+      "op": "RESHAPE",
+      "sum": 4.607237
+    },
+    {
+      "name": "Kcur-3",
+      "op": "MUL_MAT",
+      "sum": 20.608744
+    },
+    {
+      "name": "Kcur-3",
+      "op": "ADD",
+      "sum": 509.239014
+    },
+    {
+      "name": "Kcur-3",
+      "op": "RESHAPE",
+      "sum": 509.239014
+    },
+    {
+      "name": "Kcur-3",
+      "op": "ROPE",
+      "sum": 502.9198
+    },
+    {
+      "name": "__fattn__-3",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -26.347799
+    },
+    {
+      "name": "kqv_out-3",
+      "op": "RESHAPE",
+      "sum": -26.347799
+    },
+    {
+      "name": "node_128",
+      "op": "MUL_MAT",
+      "sum": 5.621208
+    },
+    {
+      "name": "ffn_inp-3",
+      "op": "ADD",
+      "sum": 1263.96228
+    },
+    {
+      "name": "norm-3",
+      "op": "RMS_NORM",
+      "sum": 169.179672
+    },
+    {
+      "name": "ffn_norm-3",
+      "op": "MUL",
+      "sum": 191.060989
+    },
+    {
+      "name": "ffn_gate-3",
+      "op": "MUL_MAT",
+      "sum": -21834.052734
+    },
+    {
+      "name": "ffn_up-3",
+      "op": "MUL_MAT",
+      "sum": 44.549725
+    },
+    {
+      "name": "ffn_swiglu-3",
+      "op": "SWIGLU",
+      "sum": 48.572304
+    },
+    {
+      "name": "ffn_out-3",
+      "op": "MUL_MAT",
+      "sum": 41.039291
+    },
+    {
+      "name": "l_out-3",
+      "op": "ADD",
+      "sum": 1305.001099
+    },
+    {
+      "name": "norm-4",
+      "op": "RMS_NORM",
+      "sum": 152.144928
+    },
+    {
+      "name": "attn_norm-4",
+      "op": "MUL",
+      "sum": 122.443024
+    },
+    {
+      "name": "Qcur-4",
+      "op": "MUL_MAT",
+      "sum": -198.69696
+    },
+    {
+      "name": "Qcur-4",
+      "op": "ADD",
+      "sum": -1057.99292
+    },
+    {
+      "name": "Qcur-4",
+      "op": "RESHAPE",
+      "sum": -1057.99292
+    },
+    {
+      "name": "Qcur-4",
+      "op": "ROPE",
+      "sum": -1127.592041
+    },
+    {
+      "name": "Vcur-4",
+      "op": "MUL_MAT",
+      "sum": -23.653736
+    },
+    {
+      "name": "Vcur-4",
+      "op": "ADD",
+      "sum": -4.598971
+    },
+    {
+      "name": "Vcur-4",
+      "op": "RESHAPE",
+      "sum": -4.598971
+    },
+    {
+      "name": "Kcur-4",
+      "op": "MUL_MAT",
+      "sum": -90.258156
+    },
+    {
+      "name": "Kcur-4",
+      "op": "ADD",
+      "sum": -320.943665
+    },
+    {
+      "name": "Kcur-4",
+      "op": "RESHAPE",
+      "sum": -320.943665
+    },
+    {
+      "name": "Kcur-4",
+      "op": "ROPE",
+      "sum": -342.201355
+    },
+    {
+      "name": "__fattn__-4",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -6.769947
+    },
+    {
+      "name": "kqv_out-4",
+      "op": "RESHAPE",
+      "sum": -6.769947
+    },
+    {
+      "name": "node_162",
+      "op": "MUL_MAT",
+      "sum": 8.182073
+    },
+    {
+      "name": "ffn_inp-4",
+      "op": "ADD",
+      "sum": 1313.183838
+    },
+    {
+      "name": "norm-4",
+      "op": "RMS_NORM",
+      "sum": 165.483932
+    },
+    {
+      "name": "ffn_norm-4",
+      "op": "MUL",
+      "sum": 278.979065
+    },
+    {
+      "name": "ffn_gate-4",
+      "op": "MUL_MAT",
+      "sum": -21778.666016
+    },
+    {
+      "name": "ffn_up-4",
+      "op": "MUL_MAT",
+      "sum": 79.01091
+    },
+    {
+      "name": "ffn_swiglu-4",
+      "op": "SWIGLU",
+      "sum": 371.664246
+    },
+    {
+      "name": "ffn_out-4",
+      "op": "MUL_MAT",
+      "sum": 925.125427
+    },
+    {
+      "name": "l_out-4",
+      "op": "ADD",
+      "sum": 2238.310791
+    },
+    {
+      "name": "norm-5",
+      "op": "RMS_NORM",
+      "sum": 181.711746
+    },
+    {
+      "name": "attn_norm-5",
+      "op": "MUL",
+      "sum": 108.006531
+    },
+    {
+      "name": "Qcur-5",
+      "op": "MUL_MAT",
+      "sum": 28.270523
+    },
+    {
+      "name": "Qcur-5",
+      "op": "ADD",
+      "sum": 260.936707
+    },
+    {
+      "name": "Qcur-5",
+      "op": "RESHAPE",
+      "sum": 260.936707
+    },
+    {
+      "name": "Qcur-5",
+      "op": "ROPE",
+      "sum": 178.378357
+    },
+    {
+      "name": "Vcur-5",
+      "op": "MUL_MAT",
+      "sum": -23.417671
+    },
+    {
+      "name": "Vcur-5",
+      "op": "ADD",
+      "sum": -1.304811
+    },
+    {
+      "name": "Vcur-5",
+      "op": "RESHAPE",
+      "sum": -1.304811
+    },
+    {
+      "name": "Kcur-5",
+      "op": "MUL_MAT",
+      "sum": 7.470825
+    },
+    {
+      "name": "Kcur-5",
+      "op": "ADD",
+      "sum": 1.128137
+    },
+    {
+      "name": "Kcur-5",
+      "op": "RESHAPE",
+      "sum": 1.128137
+    },
+    {
+      "name": "Kcur-5",
+      "op": "ROPE",
+      "sum": -12.041035
+    },
+    {
+      "name": "__fattn__-5",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -88.852074
+    },
+    {
+      "name": "kqv_out-5",
+      "op": "RESHAPE",
+      "sum": -88.852074
+    },
+    {
+      "name": "node_196",
+      "op": "MUL_MAT",
+      "sum": -4.901109
+    },
+    {
+      "name": "ffn_inp-5",
+      "op": "ADD",
+      "sum": 2233.411865
+    },
+    {
+      "name": "norm-5",
+      "op": "RMS_NORM",
+      "sum": 166.69931
+    },
+    {
+      "name": "ffn_norm-5",
+      "op": "MUL",
+      "sum": 170.54184
+    },
+    {
+      "name": "ffn_gate-5",
+      "op": "MUL_MAT",
+      "sum": -16575.623047
+    },
+    {
+      "name": "ffn_up-5",
+      "op": "MUL_MAT",
+      "sum": -14.820546
+    },
+    {
+      "name": "ffn_swiglu-5",
+      "op": "SWIGLU",
+      "sum": 8.388708
+    },
+    {
+      "name": "ffn_out-5",
+      "op": "MUL_MAT",
+      "sum": 55.564507
+    },
+    {
+      "name": "l_out-5",
+      "op": "ADD",
+      "sum": 2288.973145
+    },
+    {
+      "name": "norm-6",
+      "op": "RMS_NORM",
+      "sum": 214.959579
+    },
+    {
+      "name": "attn_norm-6",
+      "op": "MUL",
+      "sum": 221.601898
+    },
+    {
+      "name": "Qcur-6",
+      "op": "MUL_MAT",
+      "sum": -22.118097
+    },
+    {
+      "name": "Qcur-6",
+      "op": "ADD",
+      "sum": -467.801025
+    },
+    {
+      "name": "Qcur-6",
+      "op": "RESHAPE",
+      "sum": -467.801025
+    },
+    {
+      "name": "Qcur-6",
+      "op": "ROPE",
+      "sum": -360.359039
+    },
+    {
+      "name": "Vcur-6",
+      "op": "MUL_MAT",
+      "sum": 16.414587
+    },
+    {
+      "name": "Vcur-6",
+      "op": "ADD",
+      "sum": 3.952182
+    },
+    {
+      "name": "Vcur-6",
+      "op": "RESHAPE",
+      "sum": 3.952182
+    },
+    {
+      "name": "Kcur-6",
+      "op": "MUL_MAT",
+      "sum": 1.693666
+    },
+    {
+      "name": "Kcur-6",
+      "op": "ADD",
+      "sum": -13.543151
+    },
+    {
+      "name": "Kcur-6",
+      "op": "RESHAPE",
+      "sum": -13.543151
+    },
+    {
+      "name": "Kcur-6",
+      "op": "ROPE",
+      "sum": -2.023799
+    },
+    {
+      "name": "__fattn__-6",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -2.83845
+    },
+    {
+      "name": "kqv_out-6",
+      "op": "RESHAPE",
+      "sum": -2.83845
+    },
+    {
+      "name": "node_230",
+      "op": "MUL_MAT",
+      "sum": 5.172795
+    },
+    {
+      "name": "ffn_inp-6",
+      "op": "ADD",
+      "sum": 2294.140137
+    },
+    {
+      "name": "norm-6",
+      "op": "RMS_NORM",
+      "sum": 224.969223
+    },
+    {
+      "name": "ffn_norm-6",
+      "op": "MUL",
+      "sum": 259.475677
+    },
+    {
+      "name": "ffn_gate-6",
+      "op": "MUL_MAT",
+      "sum": -19437.677734
+    },
+    {
+      "name": "ffn_up-6",
+      "op": "MUL_MAT",
+      "sum": -5.706048
+    },
+    {
+      "name": "ffn_swiglu-6",
+      "op": "SWIGLU",
+      "sum": -31.011757
+    },
+    {
+      "name": "ffn_out-6",
+      "op": "MUL_MAT",
+      "sum": 47.927216
+    },
+    {
+      "name": "l_out-6",
+      "op": "ADD",
+      "sum": 2342.070068
+    },
+    {
+      "name": "norm-7",
+      "op": "RMS_NORM",
+      "sum": 200.261612
+    },
+    {
+      "name": "attn_norm-7",
+      "op": "MUL",
+      "sum": 149.669571
+    },
+    {
+      "name": "Qcur-7",
+      "op": "MUL_MAT",
+      "sum": -170.49614
+    },
+    {
+      "name": "Qcur-7",
+      "op": "ADD",
+      "sum": 453.570801
+    },
+    {
+      "name": "Qcur-7",
+      "op": "RESHAPE",
+      "sum": 453.570801
+    },
+    {
+      "name": "Qcur-7",
+      "op": "ROPE",
+      "sum": 465.463684
+    },
+    {
+      "name": "Vcur-7",
+      "op": "MUL_MAT",
+      "sum": 40.053913
+    },
+    {
+      "name": "Vcur-7",
+      "op": "ADD",
+      "sum": 38.950615
+    },
+    {
+      "name": "Vcur-7",
+      "op": "RESHAPE",
+      "sum": 38.950615
+    },
+    {
+      "name": "Kcur-7",
+      "op": "MUL_MAT",
+      "sum": 49.353771
+    },
+    {
+      "name": "Kcur-7",
+      "op": "ADD",
+      "sum": 1.251058
+    },
+    {
+      "name": "Kcur-7",
+      "op": "RESHAPE",
+      "sum": 1.251058
+    },
+    {
+      "name": "Kcur-7",
+      "op": "ROPE",
+      "sum": 1.722629
+    },
+    {
+      "name": "__fattn__-7",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 84.989464
+    },
+    {
+      "name": "kqv_out-7",
+      "op": "RESHAPE",
+      "sum": 84.989464
+    },
+    {
+      "name": "node_264",
+      "op": "MUL_MAT",
+      "sum": -24.648767
+    },
+    {
+      "name": "ffn_inp-7",
+      "op": "ADD",
+      "sum": 2317.420166
+    },
+    {
+      "name": "norm-7",
+      "op": "RMS_NORM",
+      "sum": 154.679337
+    },
+    {
+      "name": "ffn_norm-7",
+      "op": "MUL",
+      "sum": 164.610718
+    },
+    {
+      "name": "ffn_gate-7",
+      "op": "MUL_MAT",
+      "sum": -23416.582031
+    },
+    {
+      "name": "ffn_up-7",
+      "op": "MUL_MAT",
+      "sum": 16.69017
+    },
+    {
+      "name": "ffn_swiglu-7",
+      "op": "SWIGLU",
+      "sum": -29.583918
+    },
+    {
+      "name": "ffn_out-7",
+      "op": "MUL_MAT",
+      "sum": 54.61578
+    },
+    {
+      "name": "l_out-7",
+      "op": "ADD",
+      "sum": 2372.037109
+    },
+    {
+      "name": "norm-8",
+      "op": "RMS_NORM",
+      "sum": 227.241776
+    },
+    {
+      "name": "attn_norm-8",
+      "op": "MUL",
+      "sum": 250.254471
+    },
+    {
+      "name": "Qcur-8",
+      "op": "MUL_MAT",
+      "sum": -2.338881
+    },
+    {
+      "name": "Qcur-8",
+      "op": "ADD",
+      "sum": -295.179413
+    },
+    {
+      "name": "Qcur-8",
+      "op": "RESHAPE",
+      "sum": -295.179413
+    },
+    {
+      "name": "Qcur-8",
+      "op": "ROPE",
+      "sum": -402.167053
+    },
+    {
+      "name": "Vcur-8",
+      "op": "MUL_MAT",
+      "sum": 0.53315
+    },
+    {
+      "name": "Vcur-8",
+      "op": "ADD",
+      "sum": 22.068184
+    },
+    {
+      "name": "Vcur-8",
+      "op": "RESHAPE",
+      "sum": 22.068184
+    },
+    {
+      "name": "Kcur-8",
+      "op": "MUL_MAT",
+      "sum": -33.690838
+    },
+    {
+      "name": "Kcur-8",
+      "op": "ADD",
+      "sum": -58.427753
+    },
+    {
+      "name": "Kcur-8",
+      "op": "RESHAPE",
+      "sum": -58.427753
+    },
+    {
+      "name": "Kcur-8",
+      "op": "ROPE",
+      "sum": -35.648697
+    },
+    {
+      "name": "__fattn__-8",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 16.542049
+    },
+    {
+      "name": "kqv_out-8",
+      "op": "RESHAPE",
+      "sum": 16.542049
+    },
+    {
+      "name": "node_298",
+      "op": "MUL_MAT",
+      "sum": -9.101006
+    },
+    {
+      "name": "ffn_inp-8",
+      "op": "ADD",
+      "sum": 2362.932861
+    },
+    {
+      "name": "norm-8",
+      "op": "RMS_NORM",
+      "sum": 206.549454
+    },
+    {
+      "name": "ffn_norm-8",
+      "op": "MUL",
+      "sum": 229.10936
+    },
+    {
+      "name": "ffn_gate-8",
+      "op": "MUL_MAT",
+      "sum": -13544.482422
+    },
+    {
+      "name": "ffn_up-8",
+      "op": "MUL_MAT",
+      "sum": -47.447525
+    },
+    {
+      "name": "ffn_swiglu-8",
+      "op": "SWIGLU",
+      "sum": 0.661693
+    },
+    {
+      "name": "ffn_out-8",
+      "op": "MUL_MAT",
+      "sum": 12.067142
+    },
+    {
+      "name": "l_out-8",
+      "op": "ADD",
+      "sum": 2375.01001
+    },
+    {
+      "name": "norm-9",
+      "op": "RMS_NORM",
+      "sum": 159.149643
+    },
+    {
+      "name": "attn_norm-9",
+      "op": "MUL",
+      "sum": 80.346611
+    },
+    {
+      "name": "Qcur-9",
+      "op": "MUL_MAT",
+      "sum": -37.87167
+    },
+    {
+      "name": "Qcur-9",
+      "op": "ADD",
+      "sum": 11.442998
+    },
+    {
+      "name": "Qcur-9",
+      "op": "RESHAPE",
+      "sum": 11.442998
+    },
+    {
+      "name": "Qcur-9",
+      "op": "ROPE",
+      "sum": -76.70665
+    },
+    {
+      "name": "Vcur-9",
+      "op": "MUL_MAT",
+      "sum": -41.612534
+    },
+    {
+      "name": "Vcur-9",
+      "op": "ADD",
+      "sum": -50.874985
+    },
+    {
+      "name": "Vcur-9",
+      "op": "RESHAPE",
+      "sum": -50.874985
+    },
+    {
+      "name": "Kcur-9",
+      "op": "MUL_MAT",
+      "sum": -65.000137
+    },
+    {
+      "name": "Kcur-9",
+      "op": "ADD",
+      "sum": -88.725922
+    },
+    {
+      "name": "Kcur-9",
+      "op": "RESHAPE",
+      "sum": -88.725922
+    },
+    {
+      "name": "Kcur-9",
+      "op": "ROPE",
+      "sum": -75.121437
+    },
+    {
+      "name": "__fattn__-9",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -86.149483
+    },
+    {
+      "name": "kqv_out-9",
+      "op": "RESHAPE",
+      "sum": -86.149483
+    },
+    {
+      "name": "node_332",
+      "op": "MUL_MAT",
+      "sum": -4.641189
+    },
+    {
+      "name": "ffn_inp-9",
+      "op": "ADD",
+      "sum": 2370.364014
+    },
+    {
+      "name": "norm-9",
+      "op": "RMS_NORM",
+      "sum": 151.104095
+    },
+    {
+      "name": "ffn_norm-9",
+      "op": "MUL",
+      "sum": 120.254883
+    },
+    {
+      "name": "ffn_gate-9",
+      "op": "MUL_MAT",
+      "sum": -10993.8125
+    },
+    {
+      "name": "ffn_up-9",
+      "op": "MUL_MAT",
+      "sum": 5.528634
+    },
+    {
+      "name": "ffn_swiglu-9",
+      "op": "SWIGLU",
+      "sum": 14.083038
+    },
+    {
+      "name": "ffn_out-9",
+      "op": "MUL_MAT",
+      "sum": 41.552204
+    },
+    {
+      "name": "l_out-9",
+      "op": "ADD",
+      "sum": 2411.922119
+    },
+    {
+      "name": "norm-10",
+      "op": "RMS_NORM",
+      "sum": 173.900818
+    },
+    {
+      "name": "attn_norm-10",
+      "op": "MUL",
+      "sum": 118.29129
+    },
+    {
+      "name": "Qcur-10",
+      "op": "MUL_MAT",
+      "sum": -19.034531
+    },
+    {
+      "name": "Qcur-10",
+      "op": "ADD",
+      "sum": 1569.941772
+    },
+    {
+      "name": "Qcur-10",
+      "op": "RESHAPE",
+      "sum": 1569.941772
+    },
+    {
+      "name": "Qcur-10",
+      "op": "ROPE",
+      "sum": 1237.223633
+    },
+    {
+      "name": "Vcur-10",
+      "op": "MUL_MAT",
+      "sum": 18.430243
+    },
+    {
+      "name": "Vcur-10",
+      "op": "ADD",
+      "sum": 17.481684
+    },
+    {
+      "name": "Vcur-10",
+      "op": "RESHAPE",
+      "sum": 17.481684
+    },
+    {
+      "name": "Kcur-10",
+      "op": "MUL_MAT",
+      "sum": 44.3255
+    },
+    {
+      "name": "Kcur-10",
+      "op": "ADD",
+      "sum": -0.819777
+    },
+    {
+      "name": "Kcur-10",
+      "op": "RESHAPE",
+      "sum": -0.819777
+    },
+    {
+      "name": "Kcur-10",
+      "op": "ROPE",
+      "sum": -11.873451
+    },
+    {
+      "name": "__fattn__-10",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 15.060568
+    },
+    {
+      "name": "kqv_out-10",
+      "op": "RESHAPE",
+      "sum": 15.060568
+    },
+    {
+      "name": "node_366",
+      "op": "MUL_MAT",
+      "sum": -6.535862
+    },
+    {
+      "name": "ffn_inp-10",
+      "op": "ADD",
+      "sum": 2405.37793
+    },
+    {
+      "name": "norm-10",
+      "op": "RMS_NORM",
+      "sum": 162.609818
+    },
+    {
+      "name": "ffn_norm-10",
+      "op": "MUL",
+      "sum": 136.835205
+    },
+    {
+      "name": "ffn_gate-10",
+      "op": "MUL_MAT",
+      "sum": -8731.152344
+    },
+    {
+      "name": "ffn_up-10",
+      "op": "MUL_MAT",
+      "sum": 23.227324
+    },
+    {
+      "name": "ffn_swiglu-10",
+      "op": "SWIGLU",
+      "sum": 17.835064
+    },
+    {
+      "name": "ffn_out-10",
+      "op": "MUL_MAT",
+      "sum": 28.509768
+    },
+    {
+      "name": "l_out-10",
+      "op": "ADD",
+      "sum": 2433.889893
+    },
+    {
+      "name": "norm-11",
+      "op": "RMS_NORM",
+      "sum": 177.596237
+    },
+    {
+      "name": "attn_norm-11",
+      "op": "MUL",
+      "sum": 146.040527
+    },
+    {
+      "name": "Qcur-11",
+      "op": "MUL_MAT",
+      "sum": -230.895309
+    },
+    {
+      "name": "Qcur-11",
+      "op": "ADD",
+      "sum": -1368.713501
+    },
+    {
+      "name": "Qcur-11",
+      "op": "RESHAPE",
+      "sum": -1368.713501
+    },
+    {
+      "name": "Qcur-11",
+      "op": "ROPE",
+      "sum": -1416.657349
+    },
+    {
+      "name": "Vcur-11",
+      "op": "MUL_MAT",
+      "sum": -19.646738
+    },
+    {
+      "name": "Vcur-11",
+      "op": "ADD",
+      "sum": -24.202473
+    },
+    {
+      "name": "Vcur-11",
+      "op": "RESHAPE",
+      "sum": -24.202473
+    },
+    {
+      "name": "Kcur-11",
+      "op": "MUL_MAT",
+      "sum": -4.396218
+    },
+    {
+      "name": "Kcur-11",
+      "op": "ADD",
+      "sum": -90.273712
+    },
+    {
+      "name": "Kcur-11",
+      "op": "RESHAPE",
+      "sum": -90.273712
+    },
+    {
+      "name": "Kcur-11",
+      "op": "ROPE",
+      "sum": -82.381508
+    },
+    {
+      "name": "__fattn__-11",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -16.699139
+    },
+    {
+      "name": "kqv_out-11",
+      "op": "RESHAPE",
+      "sum": -16.699139
+    },
+    {
+      "name": "node_400",
+      "op": "MUL_MAT",
+      "sum": -7.704615
+    },
+    {
+      "name": "ffn_inp-11",
+      "op": "ADD",
+      "sum": 2426.180908
+    },
+    {
+      "name": "norm-11",
+      "op": "RMS_NORM",
+      "sum": 163.215988
+    },
+    {
+      "name": "ffn_norm-11",
+      "op": "MUL",
+      "sum": 120.615868
+    },
+    {
+      "name": "ffn_gate-11",
+      "op": "MUL_MAT",
+      "sum": -10647.169922
+    },
+    {
+      "name": "ffn_up-11",
+      "op": "MUL_MAT",
+      "sum": 91.239288
+    },
+    {
+      "name": "ffn_swiglu-11",
+      "op": "SWIGLU",
+      "sum": 52.546722
+    },
+    {
+      "name": "ffn_out-11",
+      "op": "MUL_MAT",
+      "sum": -10.765941
+    },
+    {
+      "name": "l_out-11",
+      "op": "ADD",
+      "sum": 2415.418701
+    },
+    {
+      "name": "norm-12",
+      "op": "RMS_NORM",
+      "sum": 125.751152
+    },
+    {
+      "name": "attn_norm-12",
+      "op": "MUL",
+      "sum": 61.652676
+    },
+    {
+      "name": "Qcur-12",
+      "op": "MUL_MAT",
+      "sum": 21.93965
+    },
+    {
+      "name": "Qcur-12",
+      "op": "ADD",
+      "sum": 163.556198
+    },
+    {
+      "name": "Qcur-12",
+      "op": "RESHAPE",
+      "sum": 163.556198
+    },
+    {
+      "name": "Qcur-12",
+      "op": "ROPE",
+      "sum": 187.220352
+    },
+    {
+      "name": "Vcur-12",
+      "op": "MUL_MAT",
+      "sum": 11.115124
+    },
+    {
+      "name": "Vcur-12",
+      "op": "ADD",
+      "sum": 1.528672
+    },
+    {
+      "name": "Vcur-12",
+      "op": "RESHAPE",
+      "sum": 1.528672
+    },
+    {
+      "name": "Kcur-12",
+      "op": "MUL_MAT",
+      "sum": -22.271311
+    },
+    {
+      "name": "Kcur-12",
+      "op": "ADD",
+      "sum": 17.951775
+    },
+    {
+      "name": "Kcur-12",
+      "op": "RESHAPE",
+      "sum": 17.951775
+    },
+    {
+      "name": "Kcur-12",
+      "op": "ROPE",
+      "sum": 7.153987
+    },
+    {
+      "name": "__fattn__-12",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -4.734774
+    },
+    {
+      "name": "kqv_out-12",
+      "op": "RESHAPE",
+      "sum": -4.734774
+    },
+    {
+      "name": "node_434",
+      "op": "MUL_MAT",
+      "sum": 10.499653
+    },
+    {
+      "name": "ffn_inp-12",
+      "op": "ADD",
+      "sum": 2425.913818
+    },
+    {
+      "name": "norm-12",
+      "op": "RMS_NORM",
+      "sum": 143.870132
+    },
+    {
+      "name": "ffn_norm-12",
+      "op": "MUL",
+      "sum": 103.081863
+    },
+    {
+      "name": "ffn_gate-12",
+      "op": "MUL_MAT",
+      "sum": -12928.78125
+    },
+    {
+      "name": "ffn_up-12",
+      "op": "MUL_MAT",
+      "sum": 74.942192
+    },
+    {
+      "name": "ffn_swiglu-12",
+      "op": "SWIGLU",
+      "sum": -25.447201
+    },
+    {
+      "name": "ffn_out-12",
+      "op": "MUL_MAT",
+      "sum": -2.001956
+    },
+    {
+      "name": "l_out-12",
+      "op": "ADD",
+      "sum": 2423.922119
+    },
+    {
+      "name": "norm-13",
+      "op": "RMS_NORM",
+      "sum": 128.617386
+    },
+    {
+      "name": "attn_norm-13",
+      "op": "MUL",
+      "sum": 62.663925
+    },
+    {
+      "name": "Qcur-13",
+      "op": "MUL_MAT",
+      "sum": 70.015701
+    },
+    {
+      "name": "Qcur-13",
+      "op": "ADD",
+      "sum": 1052.901489
+    },
+    {
+      "name": "Qcur-13",
+      "op": "RESHAPE",
+      "sum": 1052.901489
+    },
+    {
+      "name": "Qcur-13",
+      "op": "ROPE",
+      "sum": 958.809326
+    },
+    {
+      "name": "Vcur-13",
+      "op": "MUL_MAT",
+      "sum": 24.400511
+    },
+    {
+      "name": "Vcur-13",
+      "op": "ADD",
+      "sum": 19.437365
+    },
+    {
+      "name": "Vcur-13",
+      "op": "RESHAPE",
+      "sum": 19.437365
+    },
+    {
+      "name": "Kcur-13",
+      "op": "MUL_MAT",
+      "sum": 51.036575
+    },
+    {
+      "name": "Kcur-13",
+      "op": "ADD",
+      "sum": 121.589783
+    },
+    {
+      "name": "Kcur-13",
+      "op": "RESHAPE",
+      "sum": 121.589783
+    },
+    {
+      "name": "Kcur-13",
+      "op": "ROPE",
+      "sum": 88.240311
+    },
+    {
+      "name": "__fattn__-13",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 64.771904
+    },
+    {
+      "name": "kqv_out-13",
+      "op": "RESHAPE",
+      "sum": 64.771904
+    },
+    {
+      "name": "node_468",
+      "op": "MUL_MAT",
+      "sum": 2.386909
+    },
+    {
+      "name": "ffn_inp-13",
+      "op": "ADD",
+      "sum": 2426.300293
+    },
+    {
+      "name": "norm-13",
+      "op": "RMS_NORM",
+      "sum": 133.054749
+    },
+    {
+      "name": "ffn_norm-13",
+      "op": "MUL",
+      "sum": 91.918427
+    },
+    {
+      "name": "ffn_gate-13",
+      "op": "MUL_MAT",
+      "sum": -9539.958008
+    },
+    {
+      "name": "ffn_up-13",
+      "op": "MUL_MAT",
+      "sum": -266.844391
+    },
+    {
+      "name": "ffn_swiglu-13",
+      "op": "SWIGLU",
+      "sum": 13.912008
+    },
+    {
+      "name": "ffn_out-13",
+      "op": "MUL_MAT",
+      "sum": 14.318173
+    },
+    {
+      "name": "l_out-13",
+      "op": "ADD",
+      "sum": 2440.623047
+    },
+    {
+      "name": "norm-14",
+      "op": "RMS_NORM",
+      "sum": 140.362503
+    },
+    {
+      "name": "attn_norm-14",
+      "op": "MUL",
+      "sum": 80.519592
+    },
+    {
+      "name": "Qcur-14",
+      "op": "MUL_MAT",
+      "sum": 152.749802
+    },
+    {
+      "name": "Qcur-14",
+      "op": "ADD",
+      "sum": 1560.887817
+    },
+    {
+      "name": "Qcur-14",
+      "op": "RESHAPE",
+      "sum": 1560.887817
+    },
+    {
+      "name": "Qcur-14",
+      "op": "ROPE",
+      "sum": 1727.752319
+    },
+    {
+      "name": "Vcur-14",
+      "op": "MUL_MAT",
+      "sum": 9.032171
+    },
+    {
+      "name": "Vcur-14",
+      "op": "ADD",
+      "sum": 13.188227
+    },
+    {
+      "name": "Vcur-14",
+      "op": "RESHAPE",
+      "sum": 13.188227
+    },
+    {
+      "name": "Kcur-14",
+      "op": "MUL_MAT",
+      "sum": 11.79111
+    },
+    {
+      "name": "Kcur-14",
+      "op": "ADD",
+      "sum": -68.026665
+    },
+    {
+      "name": "Kcur-14",
+      "op": "RESHAPE",
+      "sum": -68.026665
+    },
+    {
+      "name": "Kcur-14",
+      "op": "ROPE",
+      "sum": -50.700356
+    },
+    {
+      "name": "__fattn__-14",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 8.413485
+    },
+    {
+      "name": "kqv_out-14",
+      "op": "RESHAPE",
+      "sum": 8.413485
+    },
+    {
+      "name": "node_502",
+      "op": "MUL_MAT",
+      "sum": 11.847358
+    },
+    {
+      "name": "ffn_inp-14",
+      "op": "ADD",
+      "sum": 2452.470947
+    },
+    {
+      "name": "norm-14",
+      "op": "RMS_NORM",
+      "sum": 160.135971
+    },
+    {
+      "name": "ffn_norm-14",
+      "op": "MUL",
+      "sum": 108.810295
+    },
+    {
+      "name": "ffn_gate-14",
+      "op": "MUL_MAT",
+      "sum": -10109.520508
+    },
+    {
+      "name": "ffn_up-14",
+      "op": "MUL_MAT",
+      "sum": 101.906036
+    },
+    {
+      "name": "ffn_swiglu-14",
+      "op": "SWIGLU",
+      "sum": 0.074538
+    },
+    {
+      "name": "ffn_out-14",
+      "op": "MUL_MAT",
+      "sum": 7.593582
+    },
+    {
+      "name": "l_out-14",
+      "op": "ADD",
+      "sum": 2460.052734
+    },
+    {
+      "name": "norm-15",
+      "op": "RMS_NORM",
+      "sum": 156.631638
+    },
+    {
+      "name": "attn_norm-15",
+      "op": "MUL",
+      "sum": 125.242653
+    },
+    {
+      "name": "Qcur-15",
+      "op": "MUL_MAT",
+      "sum": 148.332886
+    },
+    {
+      "name": "Qcur-15",
+      "op": "ADD",
+      "sum": 630.888794
+    },
+    {
+      "name": "Qcur-15",
+      "op": "RESHAPE",
+      "sum": 630.888794
+    },
+    {
+      "name": "Qcur-15",
+      "op": "ROPE",
+      "sum": 506.161194
+    },
+    {
+      "name": "Vcur-15",
+      "op": "MUL_MAT",
+      "sum": -7.451201
+    },
+    {
+      "name": "Vcur-15",
+      "op": "ADD",
+      "sum": -0.95126
+    },
+    {
+      "name": "Vcur-15",
+      "op": "RESHAPE",
+      "sum": -0.95126
+    },
+    {
+      "name": "Kcur-15",
+      "op": "MUL_MAT",
+      "sum": 27.697626
+    },
+    {
+      "name": "Kcur-15",
+      "op": "ADD",
+      "sum": 123.053154
+    },
+    {
+      "name": "Kcur-15",
+      "op": "RESHAPE",
+      "sum": 123.053154
+    },
+    {
+      "name": "Kcur-15",
+      "op": "ROPE",
+      "sum": 130.721634
+    },
+    {
+      "name": "__fattn__-15",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -17.895006
+    },
+    {
+      "name": "kqv_out-15",
+      "op": "RESHAPE",
+      "sum": -17.895006
+    },
+    {
+      "name": "node_536",
+      "op": "MUL_MAT",
+      "sum": 0.689508
+    },
+    {
+      "name": "ffn_inp-15",
+      "op": "ADD",
+      "sum": 2460.749023
+    },
+    {
+      "name": "norm-15",
+      "op": "RMS_NORM",
+      "sum": 157.18364
+    },
+    {
+      "name": "ffn_norm-15",
+      "op": "MUL",
+      "sum": 153.896378
+    },
+    {
+      "name": "ffn_gate-15",
+      "op": "MUL_MAT",
+      "sum": -12138.797852
+    },
+    {
+      "name": "ffn_up-15",
+      "op": "MUL_MAT",
+      "sum": -37.663963
+    },
+    {
+      "name": "ffn_swiglu-15",
+      "op": "SWIGLU",
+      "sum": -5.59429
+    },
+    {
+      "name": "ffn_out-15",
+      "op": "MUL_MAT",
+      "sum": 7.280092
+    },
+    {
+      "name": "l_out-15",
+      "op": "ADD",
+      "sum": 2468.03125
+    },
+    {
+      "name": "norm-16",
+      "op": "RMS_NORM",
+      "sum": 163.68309
+    },
+    {
+      "name": "attn_norm-16",
+      "op": "MUL",
+      "sum": 178.061203
+    },
+    {
+      "name": "Qcur-16",
+      "op": "MUL_MAT",
+      "sum": 206.195648
+    },
+    {
+      "name": "Qcur-16",
+      "op": "ADD",
+      "sum": -324.673187
+    },
+    {
+      "name": "Qcur-16",
+      "op": "RESHAPE",
+      "sum": -324.673187
+    },
+    {
+      "name": "Qcur-16",
+      "op": "ROPE",
+      "sum": -258.71402
+    },
+    {
+      "name": "Vcur-16",
+      "op": "MUL_MAT",
+      "sum": 8.561661
+    },
+    {
+      "name": "Vcur-16",
+      "op": "ADD",
+      "sum": 5.469009
+    },
+    {
+      "name": "Vcur-16",
+      "op": "RESHAPE",
+      "sum": 5.469009
+    },
+    {
+      "name": "Kcur-16",
+      "op": "MUL_MAT",
+      "sum": 0.040214
+    },
+    {
+      "name": "Kcur-16",
+      "op": "ADD",
+      "sum": 69.317177
+    },
+    {
+      "name": "Kcur-16",
+      "op": "RESHAPE",
+      "sum": 69.317177
+    },
+    {
+      "name": "Kcur-16",
+      "op": "ROPE",
+      "sum": 70.5009
+    },
+    {
+      "name": "__fattn__-16",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 27.10363
+    },
+    {
+      "name": "kqv_out-16",
+      "op": "RESHAPE",
+      "sum": 27.10363
+    },
+    {
+      "name": "node_570",
+      "op": "MUL_MAT",
+      "sum": -9.358602
+    },
+    {
+      "name": "ffn_inp-16",
+      "op": "ADD",
+      "sum": 2458.672607
+    },
+    {
+      "name": "norm-16",
+      "op": "RMS_NORM",
+      "sum": 148.734482
+    },
+    {
+      "name": "ffn_norm-16",
+      "op": "MUL",
+      "sum": 142.936539
+    },
+    {
+      "name": "ffn_gate-16",
+      "op": "MUL_MAT",
+      "sum": -13554.398438
+    },
+    {
+      "name": "ffn_up-16",
+      "op": "MUL_MAT",
+      "sum": 151.450363
+    },
+    {
+      "name": "ffn_swiglu-16",
+      "op": "SWIGLU",
+      "sum": 26.34787
+    },
+    {
+      "name": "ffn_out-16",
+      "op": "MUL_MAT",
+      "sum": 16.747786
+    },
+    {
+      "name": "l_out-16",
+      "op": "ADD",
+      "sum": 2475.418457
+    },
+    {
+      "name": "norm-17",
+      "op": "RMS_NORM",
+      "sum": 156.126877
+    },
+    {
+      "name": "attn_norm-17",
+      "op": "MUL",
+      "sum": 109.451607
+    },
+    {
+      "name": "Qcur-17",
+      "op": "MUL_MAT",
+      "sum": 188.3293
+    },
+    {
+      "name": "Qcur-17",
+      "op": "ADD",
+      "sum": 336.971222
+    },
+    {
+      "name": "Qcur-17",
+      "op": "RESHAPE",
+      "sum": 336.971222
+    },
+    {
+      "name": "Qcur-17",
+      "op": "ROPE",
+      "sum": 150.893661
+    },
+    {
+      "name": "Vcur-17",
+      "op": "MUL_MAT",
+      "sum": -4.690455
+    },
+    {
+      "name": "Vcur-17",
+      "op": "ADD",
+      "sum": 4.364256
+    },
+    {
+      "name": "Vcur-17",
+      "op": "RESHAPE",
+      "sum": 4.364256
+    },
+    {
+      "name": "Kcur-17",
+      "op": "MUL_MAT",
+      "sum": -6.08212
+    },
+    {
+      "name": "Kcur-17",
+      "op": "ADD",
+      "sum": -4.771698
+    },
+    {
+      "name": "Kcur-17",
+      "op": "RESHAPE",
+      "sum": -4.771698
+    },
+    {
+      "name": "Kcur-17",
+      "op": "ROPE",
+      "sum": -33.82235
+    },
+    {
+      "name": "__fattn__-17",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 133.242905
+    },
+    {
+      "name": "kqv_out-17",
+      "op": "RESHAPE",
+      "sum": 133.242905
+    },
+    {
+      "name": "node_604",
+      "op": "MUL_MAT",
+      "sum": -3.391642
+    },
+    {
+      "name": "ffn_inp-17",
+      "op": "ADD",
+      "sum": 2472.032715
+    },
+    {
+      "name": "norm-17",
+      "op": "RMS_NORM",
+      "sum": 146.394928
+    },
+    {
+      "name": "ffn_norm-17",
+      "op": "MUL",
+      "sum": 138.221939
+    },
+    {
+      "name": "ffn_gate-17",
+      "op": "MUL_MAT",
+      "sum": -17718.748047
+    },
+    {
+      "name": "ffn_up-17",
+      "op": "MUL_MAT",
+      "sum": 55.035057
+    },
+    {
+      "name": "ffn_swiglu-17",
+      "op": "SWIGLU",
+      "sum": -21.19014
+    },
+    {
+      "name": "ffn_out-17",
+      "op": "MUL_MAT",
+      "sum": 0.407009
+    },
+    {
+      "name": "l_out-17",
+      "op": "ADD",
+      "sum": 2472.442627
+    },
+    {
+      "name": "norm-18",
+      "op": "RMS_NORM",
+      "sum": 141.109741
+    },
+    {
+      "name": "attn_norm-18",
+      "op": "MUL",
+      "sum": 35.943447
+    },
+    {
+      "name": "Qcur-18",
+      "op": "MUL_MAT",
+      "sum": -207.298264
+    },
+    {
+      "name": "Qcur-18",
+      "op": "ADD",
+      "sum": -156.848221
+    },
+    {
+      "name": "Qcur-18",
+      "op": "RESHAPE",
+      "sum": -156.848221
+    },
+    {
+      "name": "Qcur-18",
+      "op": "ROPE",
+      "sum": -267.36731
+    },
+    {
+      "name": "Vcur-18",
+      "op": "MUL_MAT",
+      "sum": 36.036552
+    },
+    {
+      "name": "Vcur-18",
+      "op": "ADD",
+      "sum": 37.072887
+    },
+    {
+      "name": "Vcur-18",
+      "op": "RESHAPE",
+      "sum": 37.072887
+    },
+    {
+      "name": "Kcur-18",
+      "op": "MUL_MAT",
+      "sum": -7.154519
+    },
+    {
+      "name": "Kcur-18",
+      "op": "ADD",
+      "sum": -8.731987
+    },
+    {
+      "name": "Kcur-18",
+      "op": "RESHAPE",
+      "sum": -8.731987
+    },
+    {
+      "name": "Kcur-18",
+      "op": "ROPE",
+      "sum": -34.363911
+    },
+    {
+      "name": "__fattn__-18",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 44.686783
+    },
+    {
+      "name": "kqv_out-18",
+      "op": "RESHAPE",
+      "sum": 44.686783
+    },
+    {
+      "name": "node_638",
+      "op": "MUL_MAT",
+      "sum": -16.75761
+    },
+    {
+      "name": "ffn_inp-18",
+      "op": "ADD",
+      "sum": 2455.679199
+    },
+    {
+      "name": "norm-18",
+      "op": "RMS_NORM",
+      "sum": 124.066971
+    },
+    {
+      "name": "ffn_norm-18",
+      "op": "MUL",
+      "sum": 84.959221
+    },
+    {
+      "name": "ffn_gate-18",
+      "op": "MUL_MAT",
+      "sum": -13650.302734
+    },
+    {
+      "name": "ffn_up-18",
+      "op": "MUL_MAT",
+      "sum": 173.577942
+    },
+    {
+      "name": "ffn_swiglu-18",
+      "op": "SWIGLU",
+      "sum": -12.39547
+    },
+    {
+      "name": "ffn_out-18",
+      "op": "MUL_MAT",
+      "sum": 23.083622
+    },
+    {
+      "name": "l_out-18",
+      "op": "ADD",
+      "sum": 2478.766602
+    },
+    {
+      "name": "norm-19",
+      "op": "RMS_NORM",
+      "sum": 139.078003
+    },
+    {
+      "name": "attn_norm-19",
+      "op": "MUL",
+      "sum": 31.256474
+    },
+    {
+      "name": "Qcur-19",
+      "op": "MUL_MAT",
+      "sum": 77.989426
+    },
+    {
+      "name": "Qcur-19",
+      "op": "ADD",
+      "sum": 169.594894
+    },
+    {
+      "name": "Qcur-19",
+      "op": "RESHAPE",
+      "sum": 169.594894
+    },
+    {
+      "name": "Qcur-19",
+      "op": "ROPE",
+      "sum": 82.404022
+    },
+    {
+      "name": "Vcur-19",
+      "op": "MUL_MAT",
+      "sum": -30.379946
+    },
+    {
+      "name": "Vcur-19",
+      "op": "ADD",
+      "sum": -20.033091
+    },
+    {
+      "name": "Vcur-19",
+      "op": "RESHAPE",
+      "sum": -20.033091
+    },
+    {
+      "name": "Kcur-19",
+      "op": "MUL_MAT",
+      "sum": 55.930058
+    },
+    {
+      "name": "Kcur-19",
+      "op": "ADD",
+      "sum": 118.077858
+    },
+    {
+      "name": "Kcur-19",
+      "op": "RESHAPE",
+      "sum": 118.077858
+    },
+    {
+      "name": "Kcur-19",
+      "op": "ROPE",
+      "sum": 99.798256
+    },
+    {
+      "name": "__fattn__-19",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -49.2994
+    },
+    {
+      "name": "kqv_out-19",
+      "op": "RESHAPE",
+      "sum": -49.2994
+    },
+    {
+      "name": "node_672",
+      "op": "MUL_MAT",
+      "sum": 0.978246
+    },
+    {
+      "name": "ffn_inp-19",
+      "op": "ADD",
+      "sum": 2479.743896
+    },
+    {
+      "name": "norm-19",
+      "op": "RMS_NORM",
+      "sum": 139.617584
+    },
+    {
+      "name": "ffn_norm-19",
+      "op": "MUL",
+      "sum": 158.321564
+    },
+    {
+      "name": "ffn_gate-19",
+      "op": "MUL_MAT",
+      "sum": -21121.763672
+    },
+    {
+      "name": "ffn_up-19",
+      "op": "MUL_MAT",
+      "sum": -350.980103
+    },
+    {
+      "name": "ffn_swiglu-19",
+      "op": "SWIGLU",
+      "sum": 80.39077
+    },
+    {
+      "name": "ffn_out-19",
+      "op": "MUL_MAT",
+      "sum": -24.534599
+    },
+    {
+      "name": "l_out-19",
+      "op": "ADD",
+      "sum": 2455.199219
+    },
+    {
+      "name": "norm-20",
+      "op": "RMS_NORM",
+      "sum": 112.340324
+    },
+    {
+      "name": "attn_norm-20",
+      "op": "MUL",
+      "sum": 29.379204
+    },
+    {
+      "name": "Qcur-20",
+      "op": "MUL_MAT",
+      "sum": 117.310959
+    },
+    {
+      "name": "Qcur-20",
+      "op": "ADD",
+      "sum": 1272.624756
+    },
+    {
+      "name": "Qcur-20",
+      "op": "RESHAPE",
+      "sum": 1272.624756
+    },
+    {
+      "name": "Qcur-20",
+      "op": "ROPE",
+      "sum": 1132.785522
+    },
+    {
+      "name": "Vcur-20",
+      "op": "MUL_MAT",
+      "sum": -9.63433
+    },
+    {
+      "name": "Vcur-20",
+      "op": "ADD",
+      "sum": 39.67601
+    },
+    {
+      "name": "Vcur-20",
+      "op": "RESHAPE",
+      "sum": 39.67601
+    },
+    {
+      "name": "Kcur-20",
+      "op": "MUL_MAT",
+      "sum": 0.539347
+    },
+    {
+      "name": "Kcur-20",
+      "op": "ADD",
+      "sum": -47.750305
+    },
+    {
+      "name": "Kcur-20",
+      "op": "RESHAPE",
+      "sum": -47.750305
+    },
+    {
+      "name": "Kcur-20",
+      "op": "ROPE",
+      "sum": -73.729927
+    },
+    {
+      "name": "__fattn__-20",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 321.888153
+    },
+    {
+      "name": "kqv_out-20",
+      "op": "RESHAPE",
+      "sum": 321.888153
+    },
+    {
+      "name": "node_706",
+      "op": "MUL_MAT",
+      "sum": 16.524355
+    },
+    {
+      "name": "ffn_inp-20",
+      "op": "ADD",
+      "sum": 2471.734375
+    },
+    {
+      "name": "norm-20",
+      "op": "RMS_NORM",
+      "sum": 118.329216
+    },
+    {
+      "name": "ffn_norm-20",
+      "op": "MUL",
+      "sum": 107.222389
+    },
+    {
+      "name": "ffn_gate-20",
+      "op": "MUL_MAT",
+      "sum": -19266.886719
+    },
+    {
+      "name": "ffn_up-20",
+      "op": "MUL_MAT",
+      "sum": -25.977077
+    },
+    {
+      "name": "ffn_swiglu-20",
+      "op": "SWIGLU",
+      "sum": 7.266214
+    },
+    {
+      "name": "ffn_out-20",
+      "op": "MUL_MAT",
+      "sum": -13.729725
+    },
+    {
+      "name": "l_out-20",
+      "op": "ADD",
+      "sum": 2458.006836
+    },
+    {
+      "name": "norm-21",
+      "op": "RMS_NORM",
+      "sum": 93.959618
+    },
+    {
+      "name": "attn_norm-21",
+      "op": "MUL",
+      "sum": 39.523106
+    },
+    {
+      "name": "Qcur-21",
+      "op": "MUL_MAT",
+      "sum": 278.721222
+    },
+    {
+      "name": "Qcur-21",
+      "op": "ADD",
+      "sum": -186.483582
+    },
+    {
+      "name": "Qcur-21",
+      "op": "RESHAPE",
+      "sum": -186.483582
+    },
+    {
+      "name": "Qcur-21",
+      "op": "ROPE",
+      "sum": -193.106873
+    },
+    {
+      "name": "Vcur-21",
+      "op": "MUL_MAT",
+      "sum": -100.039116
+    },
+    {
+      "name": "Vcur-21",
+      "op": "ADD",
+      "sum": -102.303734
+    },
+    {
+      "name": "Vcur-21",
+      "op": "RESHAPE",
+      "sum": -102.303734
+    },
+    {
+      "name": "Kcur-21",
+      "op": "MUL_MAT",
+      "sum": -3.521424
+    },
+    {
+      "name": "Kcur-21",
+      "op": "ADD",
+      "sum": 3.039103
+    },
+    {
+      "name": "Kcur-21",
+      "op": "RESHAPE",
+      "sum": 3.039103
+    },
+    {
+      "name": "Kcur-21",
+      "op": "ROPE",
+      "sum": 6.26403
+    },
+    {
+      "name": "__fattn__-21",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -34.340008
+    },
+    {
+      "name": "kqv_out-21",
+      "op": "RESHAPE",
+      "sum": -34.340008
+    },
+    {
+      "name": "node_740",
+      "op": "MUL_MAT",
+      "sum": 4.17193
+    },
+    {
+      "name": "ffn_inp-21",
+      "op": "ADD",
+      "sum": 2462.167969
+    },
+    {
+      "name": "norm-21",
+      "op": "RMS_NORM",
+      "sum": 94.764854
+    },
+    {
+      "name": "ffn_norm-21",
+      "op": "MUL",
+      "sum": 41.770908
+    },
+    {
+      "name": "ffn_gate-21",
+      "op": "MUL_MAT",
+      "sum": -17336.451172
+    },
+    {
+      "name": "ffn_up-21",
+      "op": "MUL_MAT",
+      "sum": 432.864197
+    },
+    {
+      "name": "ffn_swiglu-21",
+      "op": "SWIGLU",
+      "sum": -49.342728
+    },
+    {
+      "name": "ffn_out-21",
+      "op": "MUL_MAT",
+      "sum": 46.752792
+    },
+    {
+      "name": "l_out-21",
+      "op": "ADD",
+      "sum": 2508.921631
+    },
+    {
+      "name": "norm-22",
+      "op": "RMS_NORM",
+      "sum": 126.065987
+    },
+    {
+      "name": "attn_norm-22",
+      "op": "MUL",
+      "sum": 114.246452
+    },
+    {
+      "name": "Qcur-22",
+      "op": "MUL_MAT",
+      "sum": -92.052979
+    },
+    {
+      "name": "Qcur-22",
+      "op": "ADD",
+      "sum": -767.25238
+    },
+    {
+      "name": "Qcur-22",
+      "op": "RESHAPE",
+      "sum": -767.25238
+    },
+    {
+      "name": "Qcur-22",
+      "op": "ROPE",
+      "sum": -753.598083
+    },
+    {
+      "name": "Vcur-22",
+      "op": "MUL_MAT",
+      "sum": 2.600138
+    },
+    {
+      "name": "Vcur-22",
+      "op": "ADD",
+      "sum": 40.547813
+    },
+    {
+      "name": "Vcur-22",
+      "op": "RESHAPE",
+      "sum": 40.547813
+    },
+    {
+      "name": "Kcur-22",
+      "op": "MUL_MAT",
+      "sum": -18.822834
+    },
+    {
+      "name": "Kcur-22",
+      "op": "ADD",
+      "sum": -38.538029
+    },
+    {
+      "name": "Kcur-22",
+      "op": "RESHAPE",
+      "sum": -38.538029
+    },
+    {
+      "name": "Kcur-22",
+      "op": "ROPE",
+      "sum": -54.970753
+    },
+    {
+      "name": "__fattn__-22",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 234.312714
+    },
+    {
+      "name": "kqv_out-22",
+      "op": "RESHAPE",
+      "sum": 234.312714
+    },
+    {
+      "name": "node_774",
+      "op": "MUL_MAT",
+      "sum": 65.427498
+    },
+    {
+      "name": "ffn_inp-22",
+      "op": "ADD",
+      "sum": 2574.348633
+    },
+    {
+      "name": "norm-22",
+      "op": "RMS_NORM",
+      "sum": 148.951675
+    },
+    {
+      "name": "ffn_norm-22",
+      "op": "MUL",
+      "sum": 245.008621
+    },
+    {
+      "name": "ffn_gate-22",
+      "op": "MUL_MAT",
+      "sum": -13809.306641
+    },
+    {
+      "name": "ffn_up-22",
+      "op": "MUL_MAT",
+      "sum": -54.024841
+    },
+    {
+      "name": "ffn_swiglu-22",
+      "op": "SWIGLU",
+      "sum": 1706.858887
+    },
+    {
+      "name": "ffn_out-22",
+      "op": "MUL_MAT",
+      "sum": -1789.750854
+    },
+    {
+      "name": "l_out-22",
+      "op": "ADD",
+      "sum": 784.603394
+    },
+    {
+      "name": "norm-23",
+      "op": "RMS_NORM",
+      "sum": 143.928101
+    },
+    {
+      "name": "attn_norm-23",
+      "op": "MUL",
+      "sum": 490.429108
+    },
+    {
+      "name": "Qcur-23",
+      "op": "MUL_MAT",
+      "sum": -162.795486
+    },
+    {
+      "name": "Qcur-23",
+      "op": "ADD",
+      "sum": -240.466232
+    },
+    {
+      "name": "Qcur-23",
+      "op": "RESHAPE",
+      "sum": -240.466232
+    },
+    {
+      "name": "Qcur-23",
+      "op": "ROPE",
+      "sum": -212.07814
+    },
+    {
+      "name": "Vcur-23",
+      "op": "MUL_MAT",
+      "sum": 151.403976
+    },
+    {
+      "name": "Vcur-23",
+      "op": "ADD",
+      "sum": 33.913761
+    },
+    {
+      "name": "Vcur-23",
+      "op": "RESHAPE",
+      "sum": 33.913761
+    },
+    {
+      "name": "Kcur-23",
+      "op": "MUL_MAT",
+      "sum": 8.045445
+    },
+    {
+      "name": "Kcur-23",
+      "op": "ADD",
+      "sum": -966.170776
+    },
+    {
+      "name": "Kcur-23",
+      "op": "RESHAPE",
+      "sum": -966.170776
+    },
+    {
+      "name": "Kcur-23",
+      "op": "ROPE",
+      "sum": -969.10614
+    },
+    {
+      "name": "__fattn__-23",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -59.301388
+    },
+    {
+      "name": "kqv_out-23",
+      "op": "RESHAPE",
+      "sum": -59.301388
+    },
+    {
+      "name": "node_808",
+      "op": "MUL_MAT",
+      "sum": -108.611839
+    },
+    {
+      "name": "node_809",
+      "op": "GET_ROWS",
+      "sum": -10.340237
+    },
+    {
+      "name": "node_810",
+      "op": "GET_ROWS",
+      "sum": 42.708332
+    },
+    {
+      "name": "ffn_inp-23",
+      "op": "ADD",
+      "sum": 32.36808
+    },
+    {
+      "name": "norm-23",
+      "op": "RMS_NORM",
+      "sum": 12.895493
+    },
+    {
+      "name": "ffn_norm-23",
+      "op": "MUL",
+      "sum": -10.684282
+    },
+    {
+      "name": "ffn_gate-23",
+      "op": "MUL_MAT",
+      "sum": -3795.978516
+    },
+    {
+      "name": "ffn_up-23",
+      "op": "MUL_MAT",
+      "sum": -19.312637
+    },
+    {
+      "name": "ffn_swiglu-23",
+      "op": "SWIGLU",
+      "sum": -85.511253
+    },
+    {
+      "name": "ffn_out-23",
+      "op": "MUL_MAT",
+      "sum": 22.89736
+    },
+    {
+      "name": "l_out-23",
+      "op": "ADD",
+      "sum": 55.265461
+    },
+    {
+      "name": "norm",
+      "op": "RMS_NORM",
+      "sum": 21.721991
+    },
+    {
+      "name": "result_norm",
+      "op": "MUL",
+      "sum": 52.810577
+    },
+    {
+      "name": "result_output",
+      "op": "MUL_MAT",
+      "sum": -496324.28125
+    }
+  ]
+}
