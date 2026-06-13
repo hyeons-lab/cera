@@ -1192,6 +1192,13 @@ fn load_text_model(
     path: Option<&Path>,
     cfg: &EngineConfig,
 ) -> Result<Box<dyn Model>, CeraError> {
+    // Fail fast with a clear error if the host can't safely run the compiled
+    // kernels (today: aarch64 cores without `dotprod`, which would otherwise
+    // SIGILL deep in a GEMV). No-op on x86_64, which always has a scalar path.
+    crate::backend::cpu_features::cpu_features()
+        .ensure_supported()
+        .map_err(CeraError::Backend)?;
+
     match cfg.backend {
         BackendPreference::Auto => load_text_model_auto(gguf, path, cfg.context_size),
         BackendPreference::Cpu => model::load_model(gguf, path, cfg.context_size)

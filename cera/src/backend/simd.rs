@@ -1219,10 +1219,12 @@ pub fn vec_dot_q4_0_f32(block: &BlockQ4_0, y: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            unsafe { avx2::vec_dot_q4_0_f32_avx2(block, y) }
-        } else {
-            crate::quant::vec_dot_q4_0_f32_scalar(block, y)
+        use crate::backend::cpu_features::{CpuTier, cpu_features};
+        match cpu_features().tier {
+            CpuTier::Scalar => crate::quant::vec_dot_q4_0_f32_scalar(block, y),
+            // Avx512 isn't produced by `detect()` yet (no kernels); it folds
+            // into the AVX2 path until its kernels land.
+            _ => unsafe { avx2::vec_dot_q4_0_f32_avx2(block, y) },
         }
     }
 
@@ -1243,10 +1245,10 @@ pub fn vec_dot_q8_0_f32(block: &BlockQ8_0, y: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            unsafe { avx2::vec_dot_q8_0_f32_avx2(block, y) }
-        } else {
-            crate::quant::vec_dot_q8_0_f32_scalar(block, y)
+        use crate::backend::cpu_features::{CpuTier, cpu_features};
+        match cpu_features().tier {
+            CpuTier::Scalar => crate::quant::vec_dot_q8_0_f32_scalar(block, y),
+            _ => unsafe { avx2::vec_dot_q8_0_f32_avx2(block, y) },
         }
     }
 
@@ -1266,10 +1268,10 @@ pub fn vec_dot_q4_k_m_f32(block: &BlockQ4KM, y: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            unsafe { avx2::vec_dot_q4_k_m_f32_avx2(block, y) }
-        } else {
-            crate::quant::vec_dot_q4_k_m_f32_scalar(block, y)
+        use crate::backend::cpu_features::{CpuTier, cpu_features};
+        match cpu_features().tier {
+            CpuTier::Scalar => crate::quant::vec_dot_q4_k_m_f32_scalar(block, y),
+            _ => unsafe { avx2::vec_dot_q4_k_m_f32_avx2(block, y) },
         }
     }
 

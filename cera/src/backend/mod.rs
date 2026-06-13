@@ -1,4 +1,5 @@
 pub mod cpu;
+pub mod cpu_features;
 pub mod simd;
 
 #[cfg(feature = "blas")]
