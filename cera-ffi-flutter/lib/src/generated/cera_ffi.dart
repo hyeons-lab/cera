@@ -6898,7 +6898,7 @@ final class _ModalitySinkTraitCallbackBridge {
 
   ModalitySink? lookup(int handle) => _callbacks[handle];
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)> _freeNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)>.isolateLocal((int handle) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)> _freeNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)>.listener((int handle) {
     instance.release(handle);
   });
 
@@ -6906,63 +6906,39 @@ final class _ModalitySinkTraitCallbackBridge {
     return instance.cloneHandle(handle);
   }, exceptionalReturn: 0);
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onTextTokensNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.isolateLocal((int handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onTextTokensNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
     final ModalitySink? callback = instance.lookup(handle);
     if (callback == null) {
-      outStatus.ref
-        ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = 'Invalid callback handle'.toNativeUtf8();
       return;
     }
     try {
       callback.onTextTokens((() { final r = _UniFfiBinaryReader(tokens.data.asTypedList(tokens.len)); final n = r.readI32(); return List.generate(n, (_) => r.readU32()); })());
-      outStatus.ref
-        ..code = _rustCallStatusSuccess
-        ..errorBuf = ffi.nullptr;
-    } catch (err) {
-      outStatus.ref
-        ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = err.toString().toNativeUtf8();
+    } catch (_) {
+      // async listener: no channel to report a Dart error to Rust
     }
   });
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onAudioFramesNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.isolateLocal((int handle, _UniFfiRustBuffer pcm, int sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onAudioFramesNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer pcm, int sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
     final ModalitySink? callback = instance.lookup(handle);
     if (callback == null) {
-      outStatus.ref
-        ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = 'Invalid callback handle'.toNativeUtf8();
       return;
     }
     try {
       callback.onAudioFrames((() { final r = _UniFfiBinaryReader(pcm.data.asTypedList(pcm.len)); final n = r.readI32(); return List.generate(n, (_) => r.readF32()); })(), sampleRate);
-      outStatus.ref
-        ..code = _rustCallStatusSuccess
-        ..errorBuf = ffi.nullptr;
-    } catch (err) {
-      outStatus.ref
-        ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = err.toString().toNativeUtf8();
+    } catch (_) {
+      // async listener: no channel to report a Dart error to Rust
     }
   });
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onDoneNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.isolateLocal((int handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onDoneNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
     final ModalitySink? callback = instance.lookup(handle);
     if (callback == null) {
-      outStatus.ref
-        ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = 'Invalid callback handle'.toNativeUtf8();
       return;
     }
     try {
       callback.onDone(_uniffiReadFinishReason(_UniFfiBinaryReader(reason.data.asTypedList(reason.len))));
-      outStatus.ref
-        ..code = _rustCallStatusSuccess
-        ..errorBuf = ffi.nullptr;
-    } catch (err) {
-      outStatus.ref
-        ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = err.toString().toNativeUtf8();
+    } catch (_) {
+      // async listener: no channel to report a Dart error to Rust
     }
   });
 
@@ -7236,7 +7212,7 @@ final class Session {
   /// sink callbacks fire for that case (the decode never began).
   Future<GenerateSummary> generateStreamingAsync(GenerateOpts opts, ModalitySink sink) {
     _ensureOpen();
-    throw UnsupportedError('generate_streaming_async is not supported: its sink callbacks fire from a tokio worker thread, which NativeCallable.isolateLocal cannot service. Use the synchronous generateStreaming (optionally in a Dart Isolate), or await generateAsync. See V2.17.');
+    return _ffi.sessionInvokeGenerateStreamingAsync(_handle, opts, sink);
   }
 
   /// Current KV position — how many tokens live in the cache.

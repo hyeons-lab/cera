@@ -35,7 +35,7 @@ class _CollectingSink implements ModalitySink {
   }
 }
 
-void main(List<String> args) {
+Future<void> main(List<String> args) async {
   if (args.isEmpty) {
     print('usage: dart run example/cera_stream.dart <model.gguf> [prompt]');
     return;
@@ -79,11 +79,20 @@ void main(List<String> args) {
     sink,
   );
 
+  // generate_streaming is synchronous and ModalitySink's vtable uses
+  // NativeCallable.listener (so the same vtable also works for the async
+  // variant). listener callbacks are delivered on the event loop, which can't
+  // run while this synchronous call blocks the isolate — so the callbacks are
+  // queued and arrive only once we yield here. (For live, per-token delivery,
+  // use generateStreamingAsync — see example/cera_async.dart.)
+  while (sink.finish == null) {
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+
   print('done: ${sink.tokens.length} tokens over ${sink.batches} callback batches, '
       'finish=${sink.finish}, decode=${summary.decodeMs}ms');
 
-  // The callback vtable's static `NativeCallable.isolateLocal`s keep the isolate
-  // alive, so a CLI script won't exit on its own. A real Flutter app stays
-  // running anyway; here we exit explicitly.
+  // The callback vtable's static NativeCallables keep the isolate alive, so a
+  // CLI script won't exit on its own. A Flutter app stays running regardless.
   exit(0);
 }

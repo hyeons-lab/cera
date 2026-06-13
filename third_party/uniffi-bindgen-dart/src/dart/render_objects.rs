@@ -1,16 +1,58 @@
 use super::config::CustomTypeConfig;
 use super::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Names of foreign-implementable (callback-trait) objects that are passed as an
+/// argument to at least one ASYNC function or method. Such callbacks are invoked
+/// by Rust from a non-isolate thread, so their Dart vtable must use
+/// `NativeCallable.listener`. Interfaces used only by synchronous APIs are left
+/// on `isolateLocal` (synchronous, same-thread delivery).
+fn callback_traits_used_async(objects: &[UdlObject], functions: &[UdlFunction]) -> HashSet<String> {
+    let trait_names: HashSet<&str> = objects
+        .iter()
+        .filter(|o| o.has_callback_interface)
+        .map(|o| o.name.as_str())
+        .collect();
+    let mut used = HashSet::new();
+    let mut scan = |is_async: bool, args: &[UdlArg]| {
+        if !is_async {
+            return;
+        }
+        for a in args {
+            if let Some(n) = object_name_from_type(&a.type_) {
+                if trait_names.contains(n) {
+                    used.insert(n.to_string());
+                }
+            }
+        }
+    };
+    for f in functions {
+        scan(f.is_async, &f.args);
+    }
+    for o in objects {
+        for m in &o.methods {
+            scan(m.is_async, &m.args);
+        }
+    }
+    used
+}
 
 pub(super) fn render_object_classes(
     objects: &[UdlObject],
     callback_interfaces: &[UdlCallbackInterface],
+    functions: &[UdlFunction],
     ffi_class_name: &str,
     api_overrides: &ApiOverrides,
     records: &[UdlRecord],
     enums: &[UdlEnum],
     custom_types: &HashMap<String, CustomTypeConfig>,
 ) -> String {
+    // Callback-trait interfaces passed to an ASYNC function/method are invoked
+    // from a non-isolate thread (e.g. a tokio worker), so their void methods
+    // must use `NativeCallable.listener` (cross-thread, async delivery).
+    // Interfaces only used by synchronous APIs keep `isolateLocal` (same-thread,
+    // synchronous — which preserves synchronous progress + in-callback abort).
+    let async_callback_traits = callback_traits_used_async(objects, functions);
     let mut out = String::new();
     for object in objects {
         if api_overrides.excluded(&ApiOverrides::object_key(&object.name)) {
@@ -25,6 +67,7 @@ pub(super) fn render_object_classes(
                 records,
                 enums,
                 custom_types,
+                async_callback_traits.contains(&object.name),
             ));
         } else {
             out.push_str(&render_plain_object(
@@ -57,6 +100,7 @@ fn render_trait_interface(
     records: &[UdlRecord],
     enums: &[UdlEnum],
     custom_types: &HashMap<String, CustomTypeConfig>,
+    use_listener: bool,
 ) -> String {
     let object_name = api_overrides
         .renamed_or_default(&ApiOverrides::object_key(&object.name), || {
@@ -366,6 +410,7 @@ fn render_trait_interface(
         records,
         enums,
         custom_types,
+        use_listener,
     ));
 
     // 5. FfiCodec that handles both Rust-backed and Dart-backed instances
@@ -722,6 +767,7 @@ fn render_trait_callback_bridge(
     records: &[UdlRecord],
     enums: &[UdlEnum],
     custom_types: &HashMap<String, CustomTypeConfig>,
+    use_listener: bool,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("final class {bridge_name} {{\n"));
@@ -773,10 +819,12 @@ fn render_trait_callback_bridge(
         "  {object_name}? lookup(int handle) => _callbacks[handle];\n\n"
     ));
 
-    // free native callable
-    out.push_str(
-        "  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)> _freeNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)>.isolateLocal((int handle) {\n",
-    );
+    // free native callable. Void → can be a cross-thread `listener` when this
+    // interface is used asynchronously; otherwise same-thread `isolateLocal`.
+    let free_ctor = if use_listener { "listener" } else { "isolateLocal" };
+    out.push_str(&format!(
+        "  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)> _freeNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)>.{free_ctor}((int handle) {{\n",
+    ));
     out.push_str("    instance.release(handle);\n");
     out.push_str("  });\n\n");
 
@@ -827,51 +875,80 @@ fn render_trait_callback_bridge(
         ffi_args.push("ffi.Pointer<_RustCallStatus> outStatus".to_string());
         dart_args.push("ffi.Pointer<_RustCallStatus> outStatus".to_string());
 
+        // Void methods use `NativeCallable.listener` so Rust can invoke them
+        // from a non-isolate thread (e.g. a tokio worker driving
+        // generate_streaming_async). Methods with a return value must answer
+        // synchronously (write `outReturn`), which only `isolateLocal` can do —
+        // those stay isolate-local (and thus same-thread-only).
+        let is_listener = use_listener && method.return_type.is_none();
+        let ctor = if is_listener { "listener" } else { "isolateLocal" };
         out.push_str(&format!(
-            "  static final ffi.NativeCallable<ffi.Void Function({})> {native_callable_name} = ffi.NativeCallable<ffi.Void Function({})>.isolateLocal(({}) {{\n",
+            "  static final ffi.NativeCallable<ffi.Void Function({})> {native_callable_name} = ffi.NativeCallable<ffi.Void Function({})>.{ctor}(({}) {{\n",
             ffi_args.join(", "),
             ffi_args.join(", "),
             dart_args.join(", ")
         ));
-        out.push_str(&format!(
-            "    final {object_name}? callback = instance.lookup(handle);\n"
-        ));
-        out.push_str("    if (callback == null) {\n");
-        out.push_str("      outStatus.ref\n");
-        out.push_str("        ..code = _rustCallStatusUnexpectedError\n");
-        out.push_str("        ..errorBuf = 'Invalid callback handle'.toNativeUtf8();\n");
-        out.push_str("      return;\n");
-        out.push_str("    }\n");
-        out.push_str("    try {\n");
 
-        if let Some(return_type) = method.return_type.as_ref() {
+        if is_listener {
+            // A listener callback runs asynchronously on the owning isolate,
+            // AFTER the native call has returned — so `outStatus`/`outReturn` are
+            // already consumed by Rust (which pre-initialises the status to
+            // success). We therefore only deliver the decoded args and must NOT
+            // touch the (now-stale) out pointers. Foreign-side errors can't be
+            // reported back on this path, so they're swallowed.
             out.push_str(&format!(
-                "      final result = callback.{method_name}({});\n",
-                callback_args.join(", ")
+                "    final {object_name}? callback = instance.lookup(handle);\n"
             ));
-            let encoded = render_callback_return_encode_expr(
-                return_type,
-                "result",
-                records,
-                enums,
-                custom_types,
-            );
-            out.push_str(&format!("      outReturn.value = {encoded};\n"));
-        } else {
+            out.push_str("    if (callback == null) {\n      return;\n    }\n");
+            out.push_str("    try {\n");
             out.push_str(&format!(
                 "      callback.{method_name}({});\n",
                 callback_args.join(", ")
             ));
+            out.push_str("    } catch (_) {\n");
+            out.push_str("      // async listener: no channel to report a Dart error to Rust\n");
+            out.push_str("    }\n");
+            out.push_str("  });\n\n");
+        } else {
+            out.push_str(&format!(
+                "    final {object_name}? callback = instance.lookup(handle);\n"
+            ));
+            out.push_str("    if (callback == null) {\n");
+            out.push_str("      outStatus.ref\n");
+            out.push_str("        ..code = _rustCallStatusUnexpectedError\n");
+            out.push_str("        ..errorBuf = 'Invalid callback handle'.toNativeUtf8();\n");
+            out.push_str("      return;\n");
+            out.push_str("    }\n");
+            out.push_str("    try {\n");
+            if let Some(return_type) = method.return_type.as_ref() {
+                out.push_str(&format!(
+                    "      final result = callback.{method_name}({});\n",
+                    callback_args.join(", ")
+                ));
+                let encoded = render_callback_return_encode_expr(
+                    return_type,
+                    "result",
+                    records,
+                    enums,
+                    custom_types,
+                );
+                out.push_str(&format!("      outReturn.value = {encoded};\n"));
+            } else {
+                out.push_str(&format!(
+                    "      callback.{method_name}({});\n",
+                    callback_args.join(", ")
+                ));
+            }
+            out.push_str("      outStatus.ref\n");
+            out.push_str("        ..code = _rustCallStatusSuccess\n");
+            out.push_str("        ..errorBuf = ffi.nullptr;\n");
+            out.push_str("    } catch (err) {\n");
+            out.push_str("      outStatus.ref\n");
+            out.push_str("        ..code = _rustCallStatusUnexpectedError\n");
+            out.push_str("        ..errorBuf = err.toString().toNativeUtf8();\n");
+            out.push_str("    }\n");
+            out.push_str("  });\n\n");
         }
-        out.push_str("      outStatus.ref\n");
-        out.push_str("        ..code = _rustCallStatusSuccess\n");
-        out.push_str("        ..errorBuf = ffi.nullptr;\n");
-        out.push_str("    } catch (err) {\n");
-        out.push_str("      outStatus.ref\n");
-        out.push_str("        ..code = _rustCallStatusUnexpectedError\n");
-        out.push_str("        ..errorBuf = err.toString().toNativeUtf8();\n");
-        out.push_str("    }\n");
-        out.push_str("  });\n\n");
     }
 
     // createVTable

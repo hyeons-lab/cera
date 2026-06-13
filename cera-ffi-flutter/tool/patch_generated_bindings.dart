@@ -80,10 +80,10 @@ void main(List<String> args) {
   // `from_bundle_id_async` (async constructor returning an object handle) stays
   // on the generator's own stub — it needs the object/pointer rust-future
   // variant, which the generator doesn't emit yet.
-  const methodStubs = <String, String>{
-    'return _ffi.sessionInvokeGenerateStreamingAsync(_handle, opts, sink);':
-        "throw UnsupportedError('generate_streaming_async is not supported: its sink callbacks fire from a tokio worker thread, which NativeCallable.isolateLocal cannot service. Use the synchronous generateStreaming (optionally in a Dart Isolate), or await generateAsync. See V2.17.');",
-  };
+  // generate_streaming_async is now usable: the trait-callback vtable's void
+  // methods use NativeCallable.listener (cross-thread delivery), so sink
+  // callbacks fired from cera's tokio worker thread reach the Dart isolate.
+  const methodStubs = <String, String>{};
   methodStubs.forEach((bad, good) {
     if (src.contains(bad)) {
       src = src.replaceAll(bad, good);

@@ -51,8 +51,10 @@ void main(List<String> args) {
         bundleRepo: repo,
       ),
     );
-  } catch (_) {
-    // Download aborted by the sink throwing — expected.
+  } catch (e) {
+    // Expected when the sink throws to abort; anything else (e.g. a network /
+    // HTTP error before any progress) is surfaced here for diagnosis.
+    print('fromBundleId ended: ${e.runtimeType}: $e');
   }
   exit(0);
 }

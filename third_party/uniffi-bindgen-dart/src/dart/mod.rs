@@ -647,6 +647,7 @@ fn render_dart_scaffold(ctx: &RenderContext<'_>) -> String {
     out.push_str(&render_object_classes(
         objects,
         callback_interfaces,
+        functions,
         ffi_class_name,
         api_overrides,
         records,
