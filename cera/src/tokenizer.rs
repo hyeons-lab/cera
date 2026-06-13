@@ -142,14 +142,39 @@ impl BpeTokenizer {
             match segment {
                 Segment::Special(id) => result.push(*id),
                 Segment::Text(s) => {
-                    // Pretokenize: split into chunks using the LLAMA3/LFM2 regex.
-                    let chunks: Vec<&str> = self
+                    // Pretokenize into chunks. Work in byte ranges so we can
+                    // emulate the `\s+(?!\S)` lookahead the `regex` crate can't
+                    // express: in the GPT-2/LLAMA3/Qwen2 pretokenizers a run of
+                    // whitespace that is *followed by* a non-whitespace char
+                    // yields its LAST whitespace char to the following chunk —
+                    // e.g. "\n    return" splits as "   " + " return", not
+                    // "    " + "return". Without this, indented/multi-space text
+                    // (notably code) tokenizes differently from llama.cpp.
+                    let mut ranges: Vec<(usize, usize)> = self
                         .pretokenize_re
                         .find_iter(s)
-                        .map(|m| m.as_str())
+                        .map(|m| (m.start(), m.end()))
                         .collect();
-                    for chunk in &chunks {
-                        result.extend(self.bpe_encode_chunk(chunk));
+                    for i in 0..ranges.len() {
+                        let (a, b) = ranges[i];
+                        // Whitespace runs are ASCII, so the last char is one byte
+                        // — `b - 1` is a valid boundary.
+                        let is_ws_run =
+                            b - a >= 2 && s.as_bytes()[a..b].iter().all(u8::is_ascii_whitespace);
+                        // Only hand a trailing *space/tab* to the next chunk. A
+                        // run ending in a newline is normally claimed by the
+                        // earlier `\s*[\r\n]+` alternative, but guard anyway: the
+                        // lookahead only applies to a space before a word, never
+                        // to a newline (which belongs with the whitespace chunk).
+                        let last_is_spacetab = matches!(s.as_bytes()[b - 1], b' ' | b'\t');
+                        let next_non_ws = s[b..].chars().next().is_some_and(|c| !c.is_whitespace());
+                        if is_ws_run && last_is_spacetab && next_non_ws && i + 1 < ranges.len() {
+                            ranges[i].1 = b - 1;
+                            ranges[i + 1].0 = b - 1;
+                        }
+                    }
+                    for (a, b) in ranges {
+                        result.extend(self.bpe_encode_chunk(&s[a..b]));
                     }
                 }
             }
@@ -501,12 +526,27 @@ fn build_unicode_to_byte() -> HashMap<char, u8> {
 fn build_pretokenize_regex(pre_type: &str) -> Regex {
     let pattern = match pre_type {
         // LLAMA3 pattern — used by LFM2, LLaMA 3, and similar models.
-        // Simplified: the original has \s+(?!\S)|\s+ which requires lookahead;
-        // we use just \s+ since the earlier alternatives capture space-prefixed words.
+        // The original's `\s+(?!\S)|\s+` needs lookahead (unsupported by the
+        // `regex` crate); the trailing-whitespace-before-word behaviour is
+        // emulated in `encode`'s split loop instead, so this arm just uses `\s+`.
         "lfm2" | "llama3" | "llama-v3" => concat!(
             r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
             r"|[^\r\n\p{L}\p{N}]?\p{L}+",
             r"|\p{N}{1,3}",
+            r"| ?[^\s\p{L}\p{N}]+[\r\n]*",
+            r"|\s*[\r\n]+",
+            r"|\s+",
+        ),
+        // Qwen2 pattern — GPT-2 family with single-digit number splitting and
+        // case-insensitive contractions. Matches llama.cpp's "qwen2" regex
+        // (LLM_CHAT pre type), which differs from LLAMA3 only in splitting
+        // numbers one digit at a time (`\p{N}` rather than `\p{N}{1,3}`). The
+        // upstream `\s+(?!\S)` lookahead is emulated in `encode`'s split loop
+        // (see the LLAMA3 arm). Used by both Qwen2 and Qwen3 GGUFs.
+        "qwen2" => concat!(
+            r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
+            r"|[^\r\n\p{L}\p{N}]?\p{L}+",
+            r"|\p{N}",
             r"| ?[^\s\p{L}\p{N}]+[\r\n]*",
             r"|\s*[\r\n]+",
             r"|\s+",

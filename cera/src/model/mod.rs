@@ -1,5 +1,6 @@
 pub mod lfm2;
 pub mod llama;
+pub mod transformer;
 
 #[cfg(feature = "gpu")]
 pub mod gpu_lfm2;
@@ -33,6 +34,11 @@ pub struct ModelConfig {
     pub intermediate_size: usize,
     pub n_heads: usize,
     pub n_kv_heads: usize,
+    /// Attention head dimension. Usually `hidden_size / n_heads`, but some
+    /// architectures (e.g. Qwen3) decouple it via `*.attention.key_length`, so
+    /// it is carried explicitly: Q is `n_heads * head_dim`, KV is
+    /// `n_kv_heads * head_dim`, either of which can exceed `hidden_size`.
+    pub head_dim: usize,
     pub vocab_size: usize,
     pub max_seq_len: usize,
     pub rope_theta: f32,
@@ -345,6 +351,11 @@ pub fn load_model(
         .unwrap_or_default();
     match arch.as_str() {
         "lfm2" => Ok(Box::new(lfm2::Lfm2Model::from_gguf_with_id(
+            gguf,
+            context_size,
+            model_id,
+        )?)),
+        "qwen2" | "qwen3" => Ok(Box::new(llama::LlamaModel::from_gguf_with_id(
             gguf,
             context_size,
             model_id,

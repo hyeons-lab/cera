@@ -175,6 +175,7 @@ impl Lfm2Model {
             intermediate_size,
             n_heads,
             n_kv_heads,
+            head_dim: hidden_size / n_heads,
             vocab_size,
             max_seq_len,
             rope_theta,

@@ -334,6 +334,7 @@ fn mock_attention_config(max_seq_len: usize) -> ModelConfig {
         intermediate_size: 16,
         n_heads: 4,
         n_kv_heads: 4,
+        head_dim: 2,
         vocab_size: 8,
         max_seq_len,
         rope_theta: 10_000.0,
