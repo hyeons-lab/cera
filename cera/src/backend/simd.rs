@@ -1756,9 +1756,10 @@ pub(crate) mod neon {
             assert_close(&out_dot, &out_fb);
         }
 
-        /// i8mm Q8_0 GEMM vs the dotprod kernel. UNVERIFIED on the dev host —
-        /// only runs where `is_aarch64_feature_detected!("i8mm")` (ARMv8.6).
-        /// Covers odd m and n to exercise the scalar remainder paths.
+        /// i8mm Q8_0 GEMM vs the dotprod kernel. Skips on the dev host (M1 has no
+        /// i8mm); runs where `is_aarch64_feature_detected!("i8mm")` (ARMv8.6) —
+        /// notably the `simd-i8mm` CI job, which enforces it via
+        /// `CERA_REQUIRE_SIMD=i8mm`. Covers odd m and n for the remainder paths.
         #[test]
         fn i8mm_gemm_matches_dotprod() {
             if !require_simd_or_skip("i8mm", std::arch::is_aarch64_feature_detected!("i8mm")) {

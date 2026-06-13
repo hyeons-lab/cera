@@ -172,13 +172,17 @@ pub fn detect() -> CpuFeatures {
         f.avx512f = is_x86_feature_detected!("avx512f");
         f.avx512bw = is_x86_feature_detected!("avx512bw");
         f.avx512vnni = is_x86_feature_detected!("avx512vnni");
-        // Avx512 covers the 512-bit f32 Q8_0/Q4_0 `vec_dot` kernels — `avx512f`
-        // alone is sufficient for them (it implies AVX2+FMA, which the Q4_K_M
-        // fallback to the AVX2 kernel needs). The kernels use Rust-1.89 `_mm512_*`
-        // intrinsics, past the crate's 1.85 MSRV, so they live behind the
-        // default-on `avx512` feature; with it off the tier caps at Avx2 and the
-        // x86 build stays 1.85-compatible. VNNI is detected for diagnostics only.
-        f.tier = if f.avx512f && cfg!(feature = "avx512") {
+        // The Q8_0/Q4_0 AVX-512 kernels need only `avx512f` (the 512-bit FMA is
+        // part of AVX512F, not the legacy `fma` feature). But at the Avx512 tier
+        // Q4_K_M still routes to the AVX2 kernel, which needs `avx2`+`fma`, so
+        // require those too: no shipping AVX-512F CPU lacks them, but it keeps
+        // the tier honest about every kernel it can dispatch to (e.g. a
+        // hypothetical F-without-AVX2 part would fall to Avx2/Scalar, not SIGILL).
+        // The kernels use Rust-1.89 `_mm512_*` intrinsics, past the crate's 1.85
+        // MSRV, so they live behind the default-on `avx512` feature; with it off
+        // the tier caps at Avx2 and the x86 build stays 1.85-compatible. VNNI is
+        // detected for diagnostics only.
+        f.tier = if f.avx512f && f.avx2 && f.fma && cfg!(feature = "avx512") {
             CpuTier::Avx512
         } else if f.avx2 && f.fma {
             CpuTier::Avx2
