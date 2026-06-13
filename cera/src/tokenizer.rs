@@ -559,6 +559,20 @@ fn build_pretokenize_regex(pre_type: &str) -> Regex {
             r"| ?[^\s\p{L}\p{N}]+",
             r"|\s+",
         ),
+        // Refact pattern — used by Granite (and Refact/CodeShell/SmolLM). Matches
+        // llama.cpp's `LLAMA_VOCAB_PRE_TYPE_REFACT`: the GPT-2 pattern, but numbers
+        // are split one digit at a time (a leading `\p{N}` expr) — so `\p{N}`
+        // replaces GPT-2's ` ?\p{N}+`. Whitespace is GPT-2-style (`\s+`, with the
+        // `\s+(?!\S)` trailing-space lookahead emulated in `encode`), NOT the
+        // LLAMA3 `\s*[\r\n]+` newline handling — that distinction is what makes
+        // indentation (`\n    `) tokenize correctly for code.
+        "refact" => concat!(
+            r"(?:'s|'t|'re|'ve|'m|'ll|'d)",
+            r"| ?\p{L}+",
+            r"|\p{N}",
+            r"| ?[^\s\p{L}\p{N}]+",
+            r"|\s+",
+        ),
         // Default to LLAMA3 for unknown types (most general pattern)
         other => {
             tracing::warn!(

@@ -355,11 +355,9 @@ pub fn load_model(
             context_size,
             model_id,
         )?)),
-        "qwen2" | "qwen3" => Ok(Box::new(llama::LlamaModel::from_gguf_with_id(
-            gguf,
-            context_size,
-            model_id,
-        )?)),
+        "qwen2" | "qwen3" | "llama" | "mistral" | "granite" => Ok(Box::new(
+            llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?,
+        )),
         other => bail!("unsupported architecture: {other}"),
     }
 }

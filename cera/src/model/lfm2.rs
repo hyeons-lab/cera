@@ -2513,6 +2513,7 @@ impl Model for Lfm2Model {
             self.config.rope_theta,
             head_dim,
             &self.config.kv_heads_per_layer,
+            crate::backend::cpu::RopeType::Neox,
         );
     }
 }

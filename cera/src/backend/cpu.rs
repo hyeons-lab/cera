@@ -2106,6 +2106,23 @@ unsafe fn bits_to_f32_mask_hi(byte: u32) -> std::arch::aarch64::float32x4_t {
 
 // ── Positional encoding ─────────────────────────────────────────────────────
 
+/// RoPE pair layout.
+///
+/// - `Neox` (GPT-NeoX / split-halves): rotates `(x[i], x[i + head_dim/2])`.
+///   Correct for un-permuted Qwen2/Qwen3/LFM2 GGUF weights — llama.cpp applies
+///   `GGML_ROPE_TYPE_NEOX` to these.
+/// - `Norm` (original LLaMA / interleaved): rotates adjacent pairs
+///   `(x[2i], x[2i+1])`. Correct for un-permuted LLaMA/Mistral/Granite GGUF
+///   weights — llama.cpp applies `GGML_ROPE_TYPE_NORM` to these.
+///
+/// The per-pair angle schedule (`theta_base * theta_scale^i`) is identical
+/// across both layouts; only the element pairing differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeType {
+    Neox,
+    Norm,
+}
+
 /// Apply Rotary Position Embedding (RoPE) to Q and K vectors.
 ///
 /// `q` and `k` are [n_heads * head_dim] and [n_kv_heads * head_dim] respectively.
@@ -2186,6 +2203,73 @@ pub fn apply_rope_delta_to_head(head: &mut [f32], delta_pos: i32, head_dim: usiz
     }
 }
 
+/// NORM-layout (interleaved-pair) RoPE for Q and K. Sibling of [`rope`]; same
+/// signature and angle schedule, but rotates adjacent pairs `(x[2i], x[2i+1])`
+/// instead of split halves. Correct for un-permuted LLaMA/Mistral/Granite GGUF
+/// weights (llama.cpp `GGML_ROPE_TYPE_NORM`).
+pub fn rope_norm(
+    q: &mut [f32],
+    k: &mut [f32],
+    pos: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    freq_base: f32,
+) {
+    debug_assert_eq!(q.len(), n_heads * head_dim);
+    debug_assert_eq!(k.len(), n_kv_heads * head_dim);
+
+    for h in 0..n_heads {
+        let offset = h * head_dim;
+        apply_rope_norm_to_head(&mut q[offset..offset + head_dim], pos, head_dim, freq_base);
+    }
+    for h in 0..n_kv_heads {
+        let offset = h * head_dim;
+        apply_rope_norm_to_head(&mut k[offset..offset + head_dim], pos, head_dim, freq_base);
+    }
+}
+
+/// NORM-layout counterpart of [`apply_rope_to_head`]. Rotates adjacent pairs
+/// `(head[2i], head[2i+1])` with the same iterative theta schedule.
+pub fn apply_rope_norm_to_head(head: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
+    let half_dim = head_dim / 2;
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+    let mut theta = pos as f32;
+    for i in 0..half_dim {
+        let (sin_t, cos_t) = theta.sin_cos();
+
+        let x0 = head[2 * i];
+        let x1 = head[2 * i + 1];
+        head[2 * i] = x0 * cos_t - x1 * sin_t;
+        head[2 * i + 1] = x0 * sin_t + x1 * cos_t;
+        theta *= theta_scale;
+    }
+}
+
+/// NORM-layout counterpart of [`apply_rope_delta_to_head`]: composes an
+/// additional rotation of `delta_pos` onto an already-NORM-rotated head, used by
+/// the `n_keep` context shift for NORM-rope models. Same additive-rotation
+/// identity as the NEOX delta, on interleaved pairs.
+pub fn apply_rope_norm_delta_to_head(
+    head: &mut [f32],
+    delta_pos: i32,
+    head_dim: usize,
+    freq_base: f32,
+) {
+    let half_dim = head_dim / 2;
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+    let mut theta = delta_pos as f32;
+    for i in 0..half_dim {
+        let (sin_t, cos_t) = theta.sin_cos();
+
+        let x0 = head[2 * i];
+        let x1 = head[2 * i + 1];
+        head[2 * i] = x0 * cos_t - x1 * sin_t;
+        head[2 * i + 1] = x0 * sin_t + x1 * cos_t;
+        theta *= theta_scale;
+    }
+}
+
 // ── Convolution ─────────────────────────────────────────────────────────────
 
 /// Depthwise 1D convolution.
@@ -2239,6 +2323,14 @@ pub fn mul_inplace(a: &mut [f32], b: &[f32]) {
     debug_assert_eq!(a.len(), b.len());
     for (a, b) in a.iter_mut().zip(b.iter()) {
         *a *= *b;
+    }
+}
+
+/// Scalar multiplication: a *= s. Used by Granite's embedding / residual /
+/// logit scalar multipliers (`ggml_scale`).
+pub fn scale_inplace(a: &mut [f32], s: f32) {
+    for a in a.iter_mut() {
+        *a *= s;
     }
 }
 
@@ -2806,6 +2898,66 @@ mod tests {
 
         // q should have been rotated — not identical anymore
         assert!((q[0] - 1.0).abs() > 1e-3 || (q[2]).abs() > 1e-3);
+    }
+
+    #[test]
+    fn test_rope_norm_basic() {
+        // pos=0 → no rotation, same as NEOX.
+        let mut q = vec![1.0, 2.0, 3.0, 4.0];
+        let mut k = vec![5.0, 6.0, 7.0, 8.0];
+        let q_orig = q.clone();
+        let k_orig = k.clone();
+
+        rope_norm(&mut q, &mut k, 0, 1, 1, 4, 10000.0);
+
+        for i in 0..4 {
+            assert!((q[i] - q_orig[i]).abs() < 1e-5, "q[{i}] changed at pos=0");
+            assert!((k[i] - k_orig[i]).abs() < 1e-5, "k[{i}] changed at pos=0");
+        }
+    }
+
+    #[test]
+    fn test_rope_norm_rotates_adjacent_pairs() {
+        // NORM rotates (x[2i], x[2i+1]). With head=[1,0,1,0] and the first
+        // pair's angle = pos*1 = 1 rad, the first pair must become
+        // (cos 1, sin 1); split-halves (NEOX) would instead pair (x0,x2).
+        let head_dim = 4;
+        let freq_base = 10000.0_f32;
+        let pos = 1usize;
+        let mut head = vec![1.0, 0.0, 1.0, 0.0];
+        apply_rope_norm_to_head(&mut head, pos, head_dim, freq_base);
+
+        let theta0 = pos as f32; // i=0
+        assert!((head[0] - theta0.cos()).abs() < 1e-5);
+        assert!((head[1] - theta0.sin()).abs() < 1e-5);
+        // Second pair angle = pos * freq_base^(-2/head_dim).
+        let theta1 = pos as f32 * freq_base.powf(-2.0 / head_dim as f32);
+        assert!((head[2] - theta1.cos()).abs() < 1e-5);
+        assert!((head[3] - theta1.sin()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_rope_norm_delta_composition() {
+        // R(p_new) == R(p_new - p_old) ∘ R(p_old) for the NORM layout too.
+        let head_dim = 8;
+        let freq_base = 1_000_000.0_f32;
+        let raw = vec![0.3, -1.1, 2.0, 0.5, -0.7, 1.3, 0.9, -0.2];
+
+        let mut direct = raw.clone();
+        apply_rope_norm_to_head(&mut direct, 13, head_dim, freq_base);
+
+        let mut composed = raw.clone();
+        apply_rope_norm_to_head(&mut composed, 5, head_dim, freq_base);
+        apply_rope_norm_delta_to_head(&mut composed, 13 - 5, head_dim, freq_base);
+
+        for i in 0..head_dim {
+            assert!(
+                (direct[i] - composed[i]).abs() < 1e-4,
+                "norm rope delta mismatch at {i}: {} vs {}",
+                direct[i],
+                composed[i]
+            );
+        }
     }
 
     #[test]

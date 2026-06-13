@@ -1,19 +1,25 @@
-// Plain NEOX-rope transformer text model. Currently covers Qwen2 and Qwen3.
+// Plain dense transformer text model. Covers two RoPE families on one code path:
+//   - NEOX (split-halves) rope: Qwen2, Qwen3.
+//   - NORM (interleaved-pair) rope: LLaMA, Mistral, Granite 3.x.
 //
-// Both archs share one code path; per-arch differences are gated on tensor
-// presence at load time:
+// Per-arch differences are gated on tensor presence / metadata at load time:
 //   - Qwen2 carries Q/K/V projection biases (`blk.N.attn_{q,k,v}.bias`) and no
 //     QK-norm.
 //   - Qwen3 carries per-head Q/K RMSNorm weights (`blk.N.attn_{q,k}_norm.weight`)
 //     and no biases.
+//   - LLaMA / Mistral carry neither (plain attention) but use NORM rope.
+//   - Granite 3.x is a NORM-rope llama variant plus four scalar multipliers
+//     (`{arch}.embedding_scale`, `.residual_scale`, `.attention.scale`,
+//     `.logit_scale`). All default to identity, so the other archs are unaffected.
 //
-// Weights are unpermuted (NEOX layout), so cera's NEOX `cpu::rope` is used
-// directly — no weight permutation is needed (that's a future phase for the
-// LLaMA/Mistral half-rotation layout, out of scope here).
+// GGUF weights for every supported arch are stored un-permuted, matching
+// llama.cpp, so the correct rope layout is selected per arch (NEOX vs NORM)
+// rather than permuting weights at load.
 
 use anyhow::{Context, Result, ensure};
 
 use crate::backend::cpu;
+use crate::backend::cpu::RopeType;
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
 use crate::model::transformer::{self, AttnDims, AttnExtras, AttnWeights, FfnWeights, WeightRef};
@@ -38,6 +44,17 @@ pub struct LlamaModel {
     gguf: GgufFile,
     config: ModelConfig,
     head_dim: usize,
+    /// RoPE pair layout: `Neox` for Qwen2/Qwen3, `Norm` for LLaMA/Mistral/Granite.
+    rope_type: RopeType,
+    // Granite 3.x scalar multipliers; identity for every other arch.
+    /// Embeddings are scaled by this right after the token-embedding lookup.
+    embedding_scale: f32,
+    /// Each attention/FFN block output is scaled by this before its residual add.
+    residual_scale: f32,
+    /// Attention softmax scale override (`None` ⇒ `1/sqrt(head_dim)`).
+    attn_scale: Option<f32>,
+    /// Final logits are divided by this (`1.0` ⇒ no-op).
+    logit_scale: f32,
     // Pre-dequantized small F32 weights.
     output_norm_weight: Vec<f32>,
     attn_norm_weights: Vec<Vec<f32>>,
@@ -74,12 +91,38 @@ impl LlamaModel {
     ) -> Result<Self> {
         ensure!(context_size > 0, "context_size must be > 0");
 
-        // Metadata prefix is the architecture string itself ("qwen2" / "qwen3").
+        // Metadata prefix is the architecture string itself
+        // ("qwen2"/"qwen3"/"llama"/"mistral"/"granite").
         let arch = gguf
             .get_str("general.architecture")
             .context("missing general.architecture")?
             .to_string();
         let prefix = arch.as_str();
+
+        // RoPE layout per arch. Qwen GGUFs are NEOX (split-halves); the
+        // LLaMA-family (incl. Mistral and Granite) are NORM (interleaved pairs).
+        let rope_type = match prefix {
+            "qwen2" | "qwen3" => RopeType::Neox,
+            _ => RopeType::Norm,
+        };
+
+        // Granite 3.x scalar multipliers (HF names in parens). Absent on every
+        // other arch ⇒ identity, so this is a no-op for LLaMA/Mistral/Qwen.
+        //   embedding_scale (embedding_multiplier) — scale embeddings post-lookup
+        //   residual_scale  (residual_multiplier)  — scale each block output pre-add
+        //   attention.scale (attention_multiplier) — replaces 1/sqrt(head_dim)
+        //   logit_scale     (logits_scaling)       — divide final logits
+        let embedding_scale = gguf
+            .get_f32(&format!("{prefix}.embedding_scale"))
+            .unwrap_or(1.0);
+        let residual_scale = gguf
+            .get_f32(&format!("{prefix}.residual_scale"))
+            .unwrap_or(1.0);
+        let attn_scale = gguf.get_f32(&format!("{prefix}.attention.scale"));
+        let logit_scale = gguf
+            .get_f32(&format!("{prefix}.logit_scale"))
+            .unwrap_or(1.0);
+        ensure!(logit_scale != 0.0, "{prefix}.logit_scale must be non-zero");
 
         let n_layers =
             gguf.get_u32(&format!("{prefix}.block_count"))
@@ -237,6 +280,11 @@ impl LlamaModel {
             gguf,
             config,
             head_dim,
+            rope_type,
+            embedding_scale,
+            residual_scale,
+            attn_scale,
+            logit_scale,
             output_norm_weight,
             attn_norm_weights,
             ffn_norm_weights,
@@ -261,6 +309,8 @@ impl LlamaModel {
             head_dim: self.head_dim,
             rope_theta: self.config.rope_theta,
             rms_norm_eps: self.config.rms_norm_eps,
+            rope_type: self.rope_type,
+            attn_scale: self.attn_scale,
         }
     }
 
@@ -313,6 +363,11 @@ impl LlamaModel {
                 &self.gguf, i, &weights, &extras, dims, &normed, pos, state,
             );
 
+            // Granite scales the block output before the residual add (identity
+            // for every other arch).
+            if self.residual_scale != 1.0 {
+                cpu::scale_inplace(&mut state.scratch.out[..hs], self.residual_scale);
+            }
             cpu::add_inplace(hidden, &state.scratch.out[..hs]);
 
             // FFN pre-norm.
@@ -337,6 +392,9 @@ impl LlamaModel {
                 state,
             );
 
+            if self.residual_scale != 1.0 {
+                cpu::scale_inplace(&mut state.scratch.out[..hs], self.residual_scale);
+            }
             cpu::add_inplace(hidden, &state.scratch.out[..hs]);
 
             // Oracle gate: residual stream after the full layer (= llama.cpp's
@@ -379,6 +437,10 @@ impl LlamaModel {
             let _ = state;
             transformer::gemv(&self.gguf, out_ref, hidden, &mut logits);
         }
+        // Granite divides the logits by `logits_scaling` (identity elsewhere).
+        if self.logit_scale != 1.0 {
+            cpu::scale_inplace(&mut logits, 1.0 / self.logit_scale);
+        }
         transformer::oracle_dump::record("result_output", &logits);
         logits
     }
@@ -396,6 +458,12 @@ impl Model for LlamaModel {
         );
 
         let mut hidden = transformer::dequantize_row(&self.gguf, &self.embd_ref, token_id);
+        if self.embedding_scale != 1.0 {
+            cpu::scale_inplace(&mut hidden, self.embedding_scale);
+        }
+        // Record after the embedding scale: llama.cpp fires its "embd" callback
+        // post-scale, so the dumped node is GET_ROWS for plain archs (scale=1) and
+        // SCALE for Granite. Either way the value matches.
         transformer::oracle_dump::record("embd", &hidden);
         self.run_layers(&mut hidden, pos, state);
         self.project_logits(&hidden, state)
@@ -445,6 +513,7 @@ impl Model for LlamaModel {
             self.config.rope_theta,
             self.head_dim,
             &self.config.kv_heads_per_layer,
+            self.rope_type,
         );
     }
 }
