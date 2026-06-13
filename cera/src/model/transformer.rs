@@ -1,8 +1,13 @@
-// Architecture-independent transformer machinery shared by NEOX-rope text
-// models (Qwen2, Qwen3). Mirrors the weight plumbing + per-token kernels in
-// `lfm2.rs` so a plain transformer model (`llama.rs`) can reuse them without
-// touching the LFM2 implementation. A later PR migrates LFM2 onto this module;
-// for now the duplication keeps regression risk to zero.
+// Architecture-independent transformer machinery shared by the dense text models
+// (`llama.rs`: Qwen2/Qwen3/LLaMA/Mistral/Granite) and `lfm2.rs`. Holds the weight
+// plumbing (`WeightRef`, `resolve_weight`, `gemv`/`gemv_preq`, `dequantize_row*`,
+// `quantize_to_scratch`) and the per-token kernels (`forward_attn_block`,
+// `forward_ffn_block`).
+//
+// LFM2 shares the `WeightRef` type, the plumbing helpers, and `forward_ffn_block`.
+// Its attention stays in `lfm2.rs` because of the TurboQuant KV-compression branches
+// (compressed key/value caches + the GQA-batched TQ path), which don't belong in this
+// generic helper; likewise LFM2's batched/BLAS prefill is model-specific.
 
 use anyhow::{Context, Result};
 

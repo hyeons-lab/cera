@@ -7,22 +7,18 @@ use anyhow::{Context, Result, ensure};
 use crate::backend::cpu;
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvPrefixCache, LayerState};
+use crate::model::transformer::{self, FfnWeights};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 use crate::tensor::DType;
 use crate::turboquant;
 
 // ── Pre-resolved weight reference ───────────────────────────────────────────
 
-/// Pre-resolved reference to a quantized weight in the mmap.
-/// Computed once at load time to avoid HashMap lookups during inference.
-#[derive(Debug, Clone)]
-pub(crate) struct WeightRef {
-    pub start: usize,
-    pub size: usize,
-    pub dtype: DType,
-    pub m: usize,
-    pub k: usize,
-}
+// The pre-resolved mmap weight reference is the arch-agnostic one from
+// `transformer.rs`; LFM2 shares it (and the weight-plumbing helpers below) so the
+// type and kernels have a single definition. `gpu_lfm2.rs` / `metal_lfm2.rs` keep
+// referring to `lfm2::WeightRef` via this re-export.
+pub(crate) use transformer::WeightRef;
 
 /// Per-layer weight references for quantized tensors.
 #[derive(Debug, Clone)]
@@ -309,34 +305,9 @@ impl Lfm2Model {
     }
 
     /// Resolve a tensor name to a pre-computed byte range in the mmap.
+    /// Thin wrapper over the shared `transformer::resolve_weight`.
     fn resolve_weight(gguf: &GgufFile, name: &str) -> Result<WeightRef> {
-        let info = gguf
-            .tensors
-            .get(name)
-            .with_context(|| format!("tensor not found: {name}"))?;
-
-        // info.offset is already absolute (data_offset + raw_offset from GGUF)
-        let start = usize::try_from(info.offset)
-            .with_context(|| format!("tensor {name} offset overflow"))?;
-
-        let size = info.size_bytes;
-        let dtype = info.dtype;
-
-        // GGUF shape: [inner_dim, outer_dim] → in memory: outer_dim rows of inner_dim elements
-        let k = info.shape.first().copied().unwrap_or(1); // inner dim (elements per row)
-        let m = if info.shape.len() > 1 {
-            info.shape[1]
-        } else {
-            1
-        }; // outer dim (number of rows)
-
-        Ok(WeightRef {
-            start,
-            size,
-            dtype,
-            m,
-            k,
-        })
+        transformer::resolve_weight(gguf, name)
     }
 
     // ── Public accessors for GPU model construction ───────────────────────
@@ -464,22 +435,18 @@ impl Lfm2Model {
     /// Get the raw bytes for a pre-resolved weight.
     #[inline]
     fn weight_data(&self, wref: &WeightRef) -> &[u8] {
-        &self.gguf.mmap_data()[wref.start..wref.start + wref.size]
+        transformer::weight_data(&self.gguf, wref)
     }
 
-    /// GEMV dispatch without scratch buffers.
+    /// GEMV dispatch without scratch buffers (shared `transformer::gemv`).
     fn gemv(&self, wref: &WeightRef, x: &[f32], y: &mut [f32]) {
-        let data = self.weight_data(wref);
-        cpu::gemv_dispatch(wref.dtype, data, x, y, wref.m, wref.k, None);
+        transformer::gemv(&self.gguf, wref, x, y);
     }
 
-    /// GEMV with pre-quantized Q8_0 input (skips quantization step).
-    /// For Q4_0/Q8_0 weights, uses the integer dot product path directly.
-    /// For other dtypes, falls back to the f32 path.
+    /// GEMV with pre-quantized Q8_0 input (shared `transformer::gemv_preq`).
     #[cfg(target_arch = "aarch64")]
     fn gemv_preq(&self, wref: &WeightRef, x_f32: &[f32], q8s: &[f32], q8q: &[i8], y: &mut [f32]) {
-        let data = self.weight_data(wref);
-        cpu::gemv_with_preq(wref.dtype, data, q8s, q8q, x_f32, y, wref.m, wref.k);
+        transformer::gemv_preq(&self.gguf, wref, x_f32, q8s, q8q, y);
     }
 
     /// Run a prefill GEMM through BLAS (Accelerate on macOS → AMX, OpenBLAS
@@ -593,24 +560,11 @@ impl Lfm2Model {
         }
     }
 
-    /// Quantize x to Q8_0 into scratch buffers.
+    /// Quantize x to Q8_0 into scratch buffers (shared
+    /// `transformer::quantize_to_scratch`).
     #[cfg(target_arch = "aarch64")]
     fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
-        assert_eq!(
-            x.len() % 32,
-            0,
-            "quantize_to_scratch: x.len() must be divisible by 32"
-        );
-        let nb = x.len() / 32;
-        state.scratch.q8_scales.resize(nb, 0.0);
-        state.scratch.q8_quants.resize(x.len(), 0);
-        unsafe {
-            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                x,
-                &mut state.scratch.q8_scales,
-                &mut state.scratch.q8_quants,
-            );
-        }
+        transformer::quantize_to_scratch(x, state);
     }
 
     /// Dequantize a single row from a quantized matrix (for embedding lookup).
@@ -620,28 +574,10 @@ impl Lfm2Model {
         out
     }
 
+    /// Dequantize a single row into `out` (shared
+    /// `transformer::dequantize_row_into`).
     fn dequantize_row_into(&self, wref: &WeightRef, row_idx: usize, out: &mut [f32]) {
-        assert!(
-            row_idx < wref.m,
-            "dequantize_row: row_idx {row_idx} out of range (m={})",
-            wref.m
-        );
-        let data = self.weight_data(wref);
-        let row_bytes = wref.k / wref.dtype.block_size() * wref.dtype.block_bytes();
-        let row_start = row_idx * row_bytes;
-        let row_data = &data[row_start..row_start + row_bytes];
-
-        match wref.dtype {
-            DType::Q6K => crate::quant::dequantize_q6_k_row(row_data, out),
-            DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, out),
-            DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, out),
-            DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, out),
-            DType::F32 => {
-                let floats: &[f32] = bytemuck::cast_slice(row_data);
-                out.copy_from_slice(floats);
-            }
-            _ => panic!("unsupported embedding dtype: {:?}", wref.dtype),
-        }
+        transformer::dequantize_row_into(&self.gguf, wref, row_idx, out);
     }
 
     /// Process a single conv (recurrent) block using pre-allocated scratch buffers.
@@ -1049,69 +985,25 @@ impl Lfm2Model {
             ffn_input.copy_from_slice(hidden);
             cpu::rmsnorm(&mut ffn_input, &self.ffn_norm_weights[i], cfg.rms_norm_eps);
 
+            // SwiGLU FFN via the shared helper. On aarch64 it consumes the
+            // pre-quantized ffn_input, so quantize first (same contract as the
+            // llama/qwen per-token path).
+            #[cfg(target_arch = "aarch64")]
+            Self::quantize_to_scratch(&ffn_input, state);
+
             let refs = &self.layer_refs[i];
-            #[cfg(target_arch = "aarch64")]
-            {
-                Self::quantize_to_scratch(&ffn_input, state);
-                self.gemv_preq(
-                    &refs.ffn_gate,
-                    &ffn_input,
-                    &state.scratch.q8_scales,
-                    &state.scratch.q8_quants,
-                    &mut state.scratch.gate[..cfg.intermediate_size],
-                );
-                self.gemv_preq(
-                    &refs.ffn_up,
-                    &ffn_input,
-                    &state.scratch.q8_scales,
-                    &state.scratch.q8_quants,
-                    &mut state.scratch.up[..cfg.intermediate_size],
-                );
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                self.gemv(
-                    &refs.ffn_gate,
-                    &ffn_input,
-                    &mut state.scratch.gate[..cfg.intermediate_size],
-                );
-                self.gemv(
-                    &refs.ffn_up,
-                    &ffn_input,
-                    &mut state.scratch.up[..cfg.intermediate_size],
-                );
-            }
-
-            cpu::silu_mul_inplace(
-                &mut state.scratch.gate[..cfg.intermediate_size],
-                &state.scratch.up[..cfg.intermediate_size],
-            );
-
-            #[cfg(target_arch = "aarch64")]
-            {
-                let nb = cfg.intermediate_size / 32;
-                state.scratch.q8_scales.resize(nb, 0.0);
-                state.scratch.q8_quants.resize(cfg.intermediate_size, 0);
-                unsafe {
-                    crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                        &state.scratch.gate[..cfg.intermediate_size],
-                        &mut state.scratch.q8_scales,
-                        &mut state.scratch.q8_quants,
-                    );
-                }
-                self.gemv_preq(
-                    &refs.ffn_down,
-                    &state.scratch.gate[..cfg.intermediate_size],
-                    &state.scratch.q8_scales,
-                    &state.scratch.q8_quants,
-                    &mut state.scratch.out[..hs],
-                );
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            self.gemv(
-                &refs.ffn_down,
-                &state.scratch.gate[..cfg.intermediate_size],
-                &mut state.scratch.out[..hs],
+            let ffn_weights = FfnWeights {
+                ffn_gate: &refs.ffn_gate,
+                ffn_up: &refs.ffn_up,
+                ffn_down: &refs.ffn_down,
+            };
+            transformer::forward_ffn_block(
+                &self.gguf,
+                &ffn_weights,
+                hs,
+                cfg.intermediate_size,
+                &ffn_input,
+                state,
             );
 
             cpu::add_inplace(hidden, &state.scratch.out[..cfg.hidden_size]);
