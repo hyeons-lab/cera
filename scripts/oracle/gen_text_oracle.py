@@ -33,7 +33,16 @@ TOK_RE = re.compile(r"\bI\s+(\d+)\s*$")
 
 
 def run(cmd, env):
-    return subprocess.run(cmd, env=env, capture_output=True, text=True)
+    out = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    # Fail fast: a non-zero exit (missing model, loader error, wrong binary)
+    # would otherwise yield empty/partial fixtures and silently commit bad
+    # goldens. Surface stdout+stderr so the cause is obvious.
+    if out.returncode != 0:
+        raise SystemExit(
+            f"command failed ({out.returncode}): {' '.join(cmd)}\n"
+            f"--- stdout ---\n{out.stdout}\n--- stderr ---\n{out.stderr}"
+        )
+    return out
 
 
 def capture_nodes_and_tokens(bin_dir, model, prompt, env):
