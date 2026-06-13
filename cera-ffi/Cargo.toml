@@ -38,6 +38,14 @@ required-features = ["bindgen"]
 # don't need it and shouldn't pay for the extra dep cost.
 bindgen = ["uniffi/cli"]
 
+# Opt-in feature for the Dart/Flutter bindings (cera-ffi-flutter). The Dart
+# generator (uniffi-bindgen-dart) calls `uniffi_ffibuffer_*` trampolines —
+# extra scaffolding functions that pass args/returns through an FfiBuffer —
+# which UniFFI only emits under `scaffolding-ffi-buffer-fns`. Build the cdylib
+# with `--features ffi-buffer` for Dart; Kotlin/Swift use the standard symbols
+# and don't need it, so it stays off by default (extra symbols = larger lib).
+ffi-buffer = ["uniffi/scaffolding-ffi-buffer-fns"]
+
 [dependencies]
 # `tokio` feature activates the `async_runtime = "tokio"` export path
 # — required for the `async fn` methods on `Session` that offload the
