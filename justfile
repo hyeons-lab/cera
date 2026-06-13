@@ -36,6 +36,17 @@ bench *ARGS:
 # Run all CI checks locally (mirrors GitHub Actions)
 ci: fmt clippy test
 
+# Print the host's resolved SIMD tier, then run the tier-specific kernel tests.
+# Each test self-skips unless the host has the feature it covers, so the useful
+# output is host-dependent: on aarch64+dotprod the NEON fallback comparisons run;
+# on an AVX-512 box the avx512 tests run; on ARMv8.6 (i8mm) the i8mm test runs.
+# Nothing here needs a model file.
+verify-simd:
+    @echo "── detected CPU backend ──────────────────────────────"
+    cargo run -q -p cera-cli -- cpu
+    @echo "── cpu_features + tier-gated kernel tests ────────────"
+    cargo test -p cera --lib -- cpu_features fallback_tests avx512
+
 # Platform-specific shared-library path for the uniffi-bindgen
 # `--library` argument. `os()` is a just built-in.
 # - macOS: `libcera_ffi.dylib`
