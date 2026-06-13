@@ -373,10 +373,29 @@ and structured `FfiError` propagation also confirmed. Delivered:
 - `just dart-libs` / `dart-bindings` / `dart-bindings-check` recipes; committed
   generated bindings (analyze clean); `example/cera_generate.dart`.
 
-**Remaining:** streaming/progress callbacks + `*Async` methods (generator can't
-lower callback interfaces yet — stubbed to throw); package prebuilt native libs
-per target (Android jniLibs / iOS xcframework / desktop); expose a detokenizer
-over FFI; example Flutter app + wire the Dart drift check into CI.
+**Streaming — vendored generator, calling side working, receiving bridge WIP.**
+`uniffi-bindgen-dart` 0.1.3 can't lower callback-interface *arguments*, so a
+streaming sink couldn't be passed to Rust. We vendored the generator
+(`third_party/uniffi-bindgen-dart/`, own workspace) and fixed:
+- **callback-arg lowering** — sink args now lower through `<Name>FfiCodec.lower`
+  (registers the Dart impl + installs the vtable), not a raw object write;
+- **foreign-trait vtable-init symbol** — was `<name>_trait_callback_init` (no
+  such export); now UniFFI's `uniffi_<ns>_fn_init_callback_vtable_<name>`.
+With these, `generate_streaming` reaches Rust and **Rust invokes the Dart
+`ModalitySink` back** (verified). Two receiving-bridge codegen bugs remain
+before tokens actually flow, both pre-existing in the trait-bridge renderer:
+1. vtable slot order is alphabetical (`onAudioFrames, onDone, onTextTokens`) but
+   must match Rust's declaration order (`onTextTokens, onAudioFrames, onDone`);
+2. non-primitive callback args (`Vec<u32>`, `Vec<f32>`, enum) are typed
+   `Pointer<Utf8>` in the vtable instead of RustBuffer/i32 — needs proper decode.
+Until fixed, the streaming/progress entry points are stubbed to throw (no crash).
+Fixes to be upstreamed to `nchapman/uniffi-bindgen-dart`.
+
+**Remaining:** the two receiving-bridge fixes above (then `generate_streaming` /
+`generate_streaming_async`); `*Async` invocation ABI (separate, larger); package
+prebuilt native libs per target (Android jniLibs / iOS xcframework / desktop);
+expose a detokenizer over FFI; example Flutter app + wire the Dart drift check
+into CI.
 
 **Spike result (2026-06-13, `uniffi-bindgen-dart` 0.1.3):** Viable but not
 turnkey. The generator builds against `uniffi_bindgen 0.31.1` (our exact

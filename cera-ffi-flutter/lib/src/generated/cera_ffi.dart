@@ -2635,14 +2635,14 @@ class CeraFfiFfi {
   late final _UniFfiRustBuffer Function(_UniFfiForeignBytes bytes, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _uniFfiRustBufferFromBytes = _lib.lookupFunction<_UniFfiRustBuffer Function(_UniFfiForeignBytes bytes, ffi.Pointer<_UniFfiRustCallStatus> outStatus), _UniFfiRustBuffer Function(_UniFfiForeignBytes bytes, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('ffi_cera_ffi_rustbuffer_from_bytes');
   late final void Function(_UniFfiRustBuffer buf, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _uniFfiRustBufferFree = _lib.lookupFunction<ffi.Void Function(_UniFfiRustBuffer buf, ffi.Pointer<_UniFfiRustCallStatus> outStatus), void Function(_UniFfiRustBuffer buf, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('ffi_cera_ffi_rustbuffer_free');
 
-  late final void Function(ffi.Pointer<_DownloadProgressSinkTraitVTable>) _downloadProgressSinkTraitCallbackInit = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_DownloadProgressSinkTraitVTable>), void Function(ffi.Pointer<_DownloadProgressSinkTraitVTable>)>('downloadprogresssink_trait_callback_init');
+  late final void Function(ffi.Pointer<_DownloadProgressSinkTraitVTable>) _downloadProgressSinkTraitCallbackInit = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_DownloadProgressSinkTraitVTable>), void Function(ffi.Pointer<_DownloadProgressSinkTraitVTable>)>('uniffi_cera_ffi_fn_init_callback_vtable_downloadprogresssink');
   late final ffi.Pointer<_DownloadProgressSinkTraitVTable> _downloadProgressSinkTraitCallbackVTable = _DownloadProgressSinkTraitCallbackBridge.createVTable();
   late final bool _downloadProgressSinkTraitCallbackInitDone = (() {
     _downloadProgressSinkTraitCallbackInit(_downloadProgressSinkTraitCallbackVTable);
     return true;
   })();
 
-  late final void Function(ffi.Pointer<_ModalitySinkTraitVTable>) _modalitySinkTraitCallbackInit = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_ModalitySinkTraitVTable>), void Function(ffi.Pointer<_ModalitySinkTraitVTable>)>('modalitysink_trait_callback_init');
+  late final void Function(ffi.Pointer<_ModalitySinkTraitVTable>) _modalitySinkTraitCallbackInit = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_ModalitySinkTraitVTable>), void Function(ffi.Pointer<_ModalitySinkTraitVTable>)>('uniffi_cera_ffi_fn_init_callback_vtable_modalitysink');
   late final ffi.Pointer<_ModalitySinkTraitVTable> _modalitySinkTraitCallbackVTable = _ModalitySinkTraitCallbackBridge.createVTable();
   late final bool _modalitySinkTraitCallbackInitDone = (() {
     _modalitySinkTraitCallbackInit(_modalitySinkTraitCallbackVTable);
@@ -2885,7 +2885,7 @@ class CeraFfiFfi {
       (argBuf + 0).ref.u64 = storeDirRustBuffer.capacity;
       (argBuf + 1).ref.u64 = storeDirRustBuffer.len;
       (argBuf + 2).ref.ptr = storeDirRustBuffer.data.cast<ffi.Void>();
-      (argBuf + 3).ref.u64 = throw UnsupportedError('DownloadProgressSink callbacks are not supported by the Dart bindings yet (V2.17).');
+      (argBuf + 3).ref.u64 = DownloadProgressSinkFfiCodec.lower(progress);
       _bundleRepoCtorWithProgressFfiBuffer(argBuf, returnBuf);
       final int statusCode = (returnBuf + 1).ref.i8;
       if (statusCode != _uniFfiRustCallStatusSuccess) {
@@ -5828,7 +5828,7 @@ class CeraFfiFfi {
       (argBuf + 1).ref.u64 = optsRustBuffer.capacity;
       (argBuf + 2).ref.u64 = optsRustBuffer.len;
       (argBuf + 3).ref.ptr = optsRustBuffer.data.cast<ffi.Void>();
-      (argBuf + 4).ref.u64 = throw UnsupportedError('ModalitySink streaming is not supported by the Dart bindings yet (V2.17).');
+      (argBuf + 4).ref.u64 = ModalitySinkFfiCodec.lower(sink);
       _sessionGenerateStreamingFfiBuffer(argBuf, returnBuf);
       final int statusCode = (returnBuf + 3).ref.i8;
       if (statusCode != _uniFfiRustCallStatusSuccess) {
@@ -5938,7 +5938,7 @@ class CeraFfiFfi {
       (argBuf + 1).ref.u64 = optsRustBuffer.capacity;
       (argBuf + 2).ref.u64 = optsRustBuffer.len;
       (argBuf + 3).ref.ptr = optsRustBuffer.data.cast<ffi.Void>();
-      (argBuf + 4).ref.u64 = throw UnsupportedError('ModalitySink streaming is not supported by the Dart bindings yet (V2.17).');
+      (argBuf + 4).ref.u64 = ModalitySinkFfiCodec.lower(sink);
       _sessionGenerateStreamingAsyncFfiBuffer(argBuf, returnBuf);
       final int statusCode = (returnBuf + 1).ref.i8;
       if (statusCode != _uniFfiRustCallStatusSuccess) {
@@ -6249,7 +6249,7 @@ final class BundleRepo {
   /// new one — Arc-based, so all in-flight calls finish on the
   /// old sink and new calls go to the new one.
   static BundleRepo withProgress(String storeDir, DownloadProgressSink progress) {
-    return _bindings().bundleRepoCreateWithProgress(storeDir, progress);
+    throw UnsupportedError('BundleRepo.withProgress is not yet usable via the Dart bindings (V2.17 receiving-bridge WIP).');
   }
 
   /// Total bytes currently held in the cache. Returns `0` if the
@@ -7207,7 +7207,7 @@ final class Session {
   /// regardless of how the call exits.
   GenerateSummary generateStreaming(GenerateOpts opts, ModalitySink sink) {
     _ensureOpen();
-    return _ffi.sessionInvokeGenerateStreaming(_handle, opts, sink);
+    throw UnsupportedError('generate_streaming is not yet usable via the Dart bindings: the callback receiving-bridge (vtable slot order + non-primitive arg decode) is still WIP (V2.17).');
   }
 
   /// Async variant of [`Session::generate_streaming`] — delivers
@@ -7236,7 +7236,7 @@ final class Session {
   /// sink callbacks fire for that case (the decode never began).
   Future<GenerateSummary> generateStreamingAsync(GenerateOpts opts, ModalitySink sink) {
     _ensureOpen();
-    return _ffi.sessionInvokeGenerateStreamingAsync(_handle, opts, sink);
+    throw UnsupportedError('generate_streaming_async is not yet usable via the Dart bindings (V2.17 receiving-bridge WIP).');
   }
 
   /// Current KV position — how many tokens live in the cache.

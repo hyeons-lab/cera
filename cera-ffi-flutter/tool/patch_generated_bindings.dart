@@ -64,21 +64,27 @@ void main(List<String> args) {
     stdout.writeln('  fixed fromBundleIdAsync return type (1 site)');
   }
 
-  // Fix 3: neutralize callback-interface (sink) lowering. `throw` is a
-  // bottom-typed expression, so assigning it to the `int` union field both
-  // type-checks and avoids dead code after the statement.
-  const sinkStubs = <String, String>{
-    '(argBuf + 3).ref.u64 = progress;':
-        "(argBuf + 3).ref.u64 = throw UnsupportedError('DownloadProgressSink callbacks are not supported by the Dart bindings yet (V2.17).');",
-    '(argBuf + 4).ref.u64 = sink;':
-        "(argBuf + 4).ref.u64 = throw UnsupportedError('ModalitySink streaming is not supported by the Dart bindings yet (V2.17).');",
+  // Fix 3: streaming / progress entry points. The vendored generator now lowers
+  // callback-interface ARGUMENTS correctly (registers the Dart callback +
+  // installs the vtable), so Rust does invoke back into Dart. But the receiving
+  // bridge codegen still has two bugs for these interfaces — the vtable slot
+  // order is alphabetical instead of declaration order, and non-primitive
+  // callback args (Vec<u32>/Vec<f32>/enum) are typed as Pointer<Utf8> instead of
+  // RustBuffer — so an actual stream crashes. Until those are fixed (V2.17),
+  // stub the public entry points to throw a clear error rather than crash.
+  const methodStubs = <String, String>{
+    'return _ffi.sessionInvokeGenerateStreaming(_handle, opts, sink);':
+        "throw UnsupportedError('generate_streaming is not yet usable via the Dart bindings: the callback receiving-bridge (vtable slot order + non-primitive arg decode) is still WIP (V2.17).');",
+    'return _ffi.sessionInvokeGenerateStreamingAsync(_handle, opts, sink);':
+        "throw UnsupportedError('generate_streaming_async is not yet usable via the Dart bindings (V2.17 receiving-bridge WIP).');",
+    'return _bindings().bundleRepoCreateWithProgress(storeDir, progress);':
+        "throw UnsupportedError('BundleRepo.withProgress is not yet usable via the Dart bindings (V2.17 receiving-bridge WIP).');",
   };
-  sinkStubs.forEach((bad, good) {
-    final hits = bad.allMatches(src).length;
-    if (hits > 0) {
+  methodStubs.forEach((bad, good) {
+    if (src.contains(bad)) {
       src = src.replaceAll(bad, good);
-      applied += hits;
-      stdout.writeln('  stubbed callback sink: "${bad.trim()}" ($hits site(s))');
+      applied += 1;
+      stdout.writeln('  stubbed streaming/progress entry point');
     }
   });
 
