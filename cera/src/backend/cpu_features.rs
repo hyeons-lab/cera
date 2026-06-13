@@ -133,25 +133,14 @@ impl CpuFeatures {
 
     /// Verify the host can safely run cera's compiled kernels.
     ///
-    /// cera's aarch64 GEMV/GEMM kernels ([`super::simd::neon`]) are gated
-    /// `#[target_feature(enable = "neon,dotprod")]` and are invoked directly
-    /// (no per-call guard) from the CPU/LFM2/audio paths. On an aarch64 core
-    /// without `dotprod` they would execute illegal instructions (SIGILL).
-    /// Call this once at model load to turn that latent UB into a clean,
-    /// actionable error.
-    ///
-    /// On x86_64 there is always a scalar fallback, so this is a no-op.
+    /// Every aarch64 GEMV/GEMM entry point in [`super::simd::neon`] now runtime-
+    /// dispatches between its `dotprod` kernel and a plain-NEON fallback, so
+    /// `dotprod` is an accelerator rather than a hard requirement and NEON
+    /// (mandatory on aarch64) is always sufficient. x86_64 always has a scalar
+    /// fallback. This is therefore a no-op today, kept as the hook for any
+    /// future hard ISA requirement.
     pub fn ensure_supported(&self) -> Result<(), String> {
-        #[cfg(target_arch = "aarch64")]
-        if !self.dotprod {
-            return Err(format!(
-                "this aarch64 CPU lacks the `dotprod` (FEAT_DotProd) extension that \
-                 cera's NEON kernels require (detected tier: {}). Run on dotprod-capable \
-                 hardware (Cortex-A75+ / Apple M1+), or build a NEON-without-dotprod \
-                 variant once those fallback kernels exist.",
-                self.tier.label()
-            ));
-        }
+        let _ = self;
         Ok(())
     }
 }

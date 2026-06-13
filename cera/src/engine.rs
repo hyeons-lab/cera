@@ -1192,9 +1192,10 @@ fn load_text_model(
     path: Option<&Path>,
     cfg: &EngineConfig,
 ) -> Result<Box<dyn Model>, CeraError> {
-    // Fail fast with a clear error if the host can't safely run the compiled
-    // kernels (today: aarch64 cores without `dotprod`, which would otherwise
-    // SIGILL deep in a GEMV). No-op on x86_64, which always has a scalar path.
+    // Forward hook: fail fast with a clear error if a future build ever
+    // requires an ISA feature the host lacks. Today every backend has a
+    // runtime fallback (aarch64 NEON without dotprod, x86 scalar), so this is
+    // a no-op — but it keeps the check wired at the load boundary.
     crate::backend::cpu_features::cpu_features()
         .ensure_supported()
         .map_err(CeraError::Backend)?;
