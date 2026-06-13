@@ -187,7 +187,11 @@ impl InferenceState {
             "conv_kernel_size must be at least 2, got {kernel_size}"
         );
         let d_conv = kernel_size - 1;
-        let head_dim = config.hidden_size / config.n_heads;
+        // Carried explicitly (≠ hidden_size / n_heads for head_dim-decoupled
+        // models like Qwen3). `q_dim` (Q projection width = attention output
+        // width) can exceed hidden_size.
+        let head_dim = config.head_dim;
+        let q_dim = config.n_heads * head_dim;
         let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * head_dim;
 
         // Compressed (TurboQuant) caches start at the same per-layer cap as the
@@ -294,10 +298,10 @@ impl InferenceState {
                 ffn_input: vec![0.0; config.hidden_size],
                 conv_proj: vec![0.0; 3 * config.hidden_size],
                 conv_scratch: vec![0.0; config.hidden_size],
-                q: vec![0.0; config.hidden_size],
+                q: vec![0.0; q_dim],
                 k: vec![0.0; max_kv_dim],
                 v: vec![0.0; max_kv_dim],
-                attn_out: vec![0.0; config.hidden_size],
+                attn_out: vec![0.0; q_dim],
                 gate: vec![0.0; config.intermediate_size],
                 up: vec![0.0; config.intermediate_size],
                 out: vec![0.0; config.hidden_size],
@@ -1213,6 +1217,7 @@ mod tests {
             intermediate_size: hidden_size * 2,
             n_heads: 4,
             n_kv_heads: 2,
+            head_dim: hidden_size / 4,
             vocab_size: 256,
             max_seq_len: 64,
             rope_theta: 1_000_000.0,

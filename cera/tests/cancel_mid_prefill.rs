@@ -66,6 +66,7 @@ fn mock_config(vocab_size: usize, max_seq_len: usize) -> ModelConfig {
         intermediate_size: 0,
         n_heads: 0,
         n_kv_heads: 0,
+        head_dim: 0,
         vocab_size,
         max_seq_len,
         rope_theta: 0.0,

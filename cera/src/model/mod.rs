@@ -34,6 +34,11 @@ pub struct ModelConfig {
     pub intermediate_size: usize,
     pub n_heads: usize,
     pub n_kv_heads: usize,
+    /// Attention head dimension. Usually `hidden_size / n_heads`, but some
+    /// architectures (e.g. Qwen3) decouple it via `*.attention.key_length`, so
+    /// it is carried explicitly: Q is `n_heads * head_dim`, KV is
+    /// `n_kv_heads * head_dim`, either of which can exceed `hidden_size`.
+    pub head_dim: usize,
     pub vocab_size: usize,
     pub max_seq_len: usize,
     pub rope_theta: f32,

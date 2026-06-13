@@ -153,6 +153,7 @@ impl LlamaModel {
             intermediate_size,
             n_heads,
             n_kv_heads,
+            head_dim,
             vocab_size,
             max_seq_len,
             rope_theta,

@@ -234,8 +234,11 @@ pub(crate) fn forward_attn_block(
     let n_kv_heads = dims.n_kv_heads;
     let hidden_size = dims.hidden_size;
     let kv_dim = n_kv_heads * head_dim;
+    // Q projection width = attention output width. Equals hidden_size for most
+    // models, but Qwen3 decouples head_dim so q_dim can exceed it.
+    let q_dim = n_heads * head_dim;
 
-    let q = &mut state.scratch.q[..hidden_size];
+    let q = &mut state.scratch.q[..q_dim];
     let k = &mut state.scratch.k[..kv_dim];
     let v = &mut state.scratch.v[..kv_dim];
 
@@ -328,8 +331,8 @@ pub(crate) fn forward_attn_block(
             _ => panic!("expected Attention state for layer {layer}"),
         };
         let seq_len = k_cache.len() / kv_dim;
-        let attn_out = &mut state.scratch.attn_out[..hidden_size];
-        let q = &state.scratch.q[..hidden_size];
+        let attn_out = &mut state.scratch.attn_out[..q_dim];
+        let q = &state.scratch.q[..q_dim];
         let scores = &mut state.scratch.scores;
         scores.resize(seq_len, 0.0);
         for h in 0..n_heads {
@@ -359,12 +362,12 @@ pub(crate) fn forward_attn_block(
         }
     }
 
-    // Output projection into state.scratch.out.
+    // Output projection: attn_out (n_heads * head_dim) → out (hidden_size).
     let out = &mut state.scratch.out[..hidden_size];
     gemv(
         gguf,
         weights.attn_output,
-        &state.scratch.attn_out[..hidden_size],
+        &state.scratch.attn_out[..q_dim],
         out,
     );
 }
