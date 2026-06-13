@@ -10,14 +10,16 @@ V1 is complete, and the project has since grown well beyond the original
 roadmap into **multimodal** territory (vision, audio, TTS) that this plan never
 anticipated. The status legend below uses ✅ done · 🟡 partial · ⬜ not started.
 
-**V1 (Phases 0–6):** ✅ complete. CPU (SIMD + runtime feature dispatch + BLAS),
-wgpu GPU backend, Metal backend, GGUF parser, BPE tokenizer, sampler, KV cache,
-generation engine, HF bundle download, interactive chat TUI, and bench command
-all shipped. Architecture coverage is `lfm2`, `qwen2`, `qwen3` (Qwen runs on the
-LLaMA code path). **Not yet wired:** the bare `llama` arch string and the
-Mistral / Gemma / Phi3 variants named in Phase 4 — the code path exists but
-those arch strings aren't dispatched. GPU (wgpu) and Metal forward passes
-currently support **LFM2 only**; Qwen runs on CPU.
+**V1 (Phases 0–6):** ✅ pipeline complete, 🟡 Phase 4 architecture coverage
+partial. CPU (SIMD + runtime feature dispatch + BLAS), wgpu GPU backend, Metal
+backend, GGUF parser, BPE tokenizer, sampler, KV cache, generation engine, HF
+bundle download, interactive chat TUI, and bench command are all shipped — the
+end-to-end inference pipeline is done. The one open item is **Phase 4 model
+coverage**: architecture dispatch currently handles `lfm2`, `qwen2`, `qwen3`
+(Qwen runs on the LLaMA code path), but the bare `llama` arch string and the
+Mistral / Gemma / Phi3 variants named in Phase 4 are **not yet wired** — the
+shared code path exists but those arch strings aren't dispatched. GPU (wgpu) and
+Metal forward passes currently support **LFM2 only**; Qwen runs on CPU.
 
 **Beyond the V1 plan (off-roadmap, shipped):**
 - LFM2-VL **vision** encoder + preprocessor (image → embeddings)
@@ -45,8 +47,8 @@ currently support **LFM2 only**; Qwen runs on CPU.
 | V2.12 CUDA backend | ⬜ | |
 | V2.13 Python (PyO3) bindings | ⬜ | |
 | V2.14 Kotlin Multiplatform bindings | ✅ | `cera-ffi-kotlin` (android + jvm) |
-| V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core done, CPU-only encode |
-| V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core done, Metal-only decode accel |
+| V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core shipped, CPU-only encode |
+| V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
 
 **Tally:** original V2 — 3 done (2.2, 2.5b, 2.14), 1 partial (2.6), 11 remaining.
 Plus 2 off-roadmap multimodal tracks shipped (V2.15 Vision, V2.16 Audio/TTS).
@@ -241,8 +243,8 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 **Time: 3-5 days**
 
 ```
-4.1  model/llama.rs — LLaMA is all-attention blocks.            ✅ (shared path)
-4.2  Architecture variants: mistral, qwen2, gemma, phi3         🟡 qwen2/qwen3 only
+4.1  model/llama.rs — LLaMA is all-attention blocks.   [done: shared path]
+4.2  Architecture variants: mistral, qwen2, gemma, phi3  [partial: qwen2/qwen3 only]
 4.3  Test each on a real GGUF. Greedy decoding matches llama.cpp.
 ```
 
@@ -281,12 +283,12 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 **Time: 3-5 days**
 
 ```
-6.1  HuggingFace model download (bundle system: list/download/bundle cmds)   ✅
-6.2  Interactive chat mode: cera chat (TUI)                                  ✅
-6.3  Benchmark command: cera bench                                           ✅
-6.4  Correctness: perplexity / parity harness vs llama.cpp                   ✅
-6.5  CI + static binary releases (Linux, macOS, Windows)                     ✅
-6.6  README with benchmarks, install instructions, supported models          ✅
+6.1  HuggingFace model download (bundle system: list/download/bundle cmds)
+6.2  Interactive chat mode: cera chat (TUI)
+6.3  Benchmark command: cera bench
+6.4  Correctness: perplexity / parity harness vs llama.cpp
+6.5  CI + static binary releases (Linux, macOS, Windows)
+6.6  README with benchmarks, install instructions, supported models
 ```
 
 > Note: model distribution is handled via the **bundle** system
@@ -356,7 +358,7 @@ These tracks were not in the original V1/V2 plan but have been built out to
 support the LFM2-VL and LFM2-Audio model families. Documented here so the
 roadmap reflects what actually exists.
 
-### V2.15: Vision (LFM2-VL) — ✅ DONE (core), 🟡 architecture coverage
+### V2.15: Vision (LFM2-VL) — ✅ core shipped
 Image → text via a CLIP-family ViT encoder with a 2-layer MLP projector
 (`PROJECTOR_TYPE_LFM2`). Shipped:
 - `model/vision_encoder.rs` — ViT encoder weights + tensor mapping, loaded from
@@ -366,23 +368,27 @@ Image → text via a CLIP-family ViT encoder with a 2-layer MLP projector
   resize → normalize → `[3×H×W]` NCHW tensor, with 2× pixel-unshuffle to match
   the encoder patch grid.
 - Soft-token prefill into the LLM via `Session::append_chat_with_images`;
-  CLI `cera run --image <path|url> [--image ...] --prompt`, multi-image supported.
+  CLI `cera run --image <path|url> [--image ...] [--prompt "…"]`, multi-image
+  supported. `--prompt` is optional in image mode (image-only inputs are allowed).
 
 Remaining:
 - CPU-only encode path — no wgpu/Metal acceleration for the ViT yet.
 - Single projector family (`LFM2`); other VL projector types not mapped.
 
-### V2.16: Audio + TTS (LFM2-Audio) — ✅ DONE (core), 🟡 acceleration
+### V2.16: Audio + TTS (LFM2-Audio) — ✅ core shipped
 Full duplex: PCM in (ASR / audio understanding) and PCM out (speech
 generation). Shipped:
 - **Input:** `model/audio_preprocessor.rs` (PCM → log-mel, Slaney scale,
   librosa-compatible) → `model/audio_encoder.rs` (Conformer-style encoder,
   `PROJECTOR_TYPE_LFM2A`) → soft tokens via `Session::append_audio`.
-  CLI `cera run --audio-in <wav>`; one-call ASR via `WickEngine.transcribe` FFI.
+  CLI `cera run --audio-in <wav> --system "Perform ASR."`; one-call ASR via the
+  `CeraEngine.transcribe` UniFFI method.
 - **Output:** `model/audio_decoder.rs` (DecoderModel samples 8 codes/frame +
   6-layer Depthformer backbone) → Detokenizer (codes → spectrogram → PCM via
   ISTFT/rustfft). Driven by `audio_engine.rs`, a generation loop with text↔audio
-  modality switching. CLI `cera run --vocoder <gguf> --audio-out <wav>`.
+  modality switching. CLI
+  `cera run --vocoder <gguf> --system "…" --prompt "…" --audio-out <wav>`
+  (`--system` is required with `--vocoder`).
 - **Acceleration:** `model/metal_audio_decoder.rs` moves the detokenizer
   backbone to Metal (~165ms→~10-15ms/frame target); ISTFT stays on CPU.
 
