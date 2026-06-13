@@ -45,7 +45,7 @@ impl GemvPtrs {
 #[allow(clippy::needless_range_loop, unused_unsafe)]
 pub(crate) mod neon {
     use super::*;
-    use crate::backend::cpu_features::cpu_features;
+    use crate::backend::cpu_features::{CpuTier, cpu_features};
     use std::arch::aarch64::*;
     use std::mem::size_of;
 
@@ -1030,7 +1030,7 @@ pub(crate) mod neon {
         q8_scales: &mut Vec<f32>,
         q8_quants: &mut Vec<i8>,
     ) {
-        if cpu_features().dotprod {
+        if cpu_features().tier >= CpuTier::NeonDotprod {
             unsafe {
                 let n_blocks = k / 32;
                 q8_scales.resize(n_blocks, 0.0);
@@ -1047,7 +1047,8 @@ pub(crate) mod neon {
     //
     // The kernels above tagged `*_dotprod` require FEAT_DotProd (`vdotq_s32`).
     // These public entry points keep the original signatures so every call site
-    // is unchanged; they branch on `cpu_features().dotprod`. The `*_base`
+    // is unchanged; they branch on `cpu_features().tier` (so `CERA_CPU_TIER` can
+    // force a lower path). The `*_base`
     // fallbacks run on baseline NEON: they emulate `vdotq_s32` with `vmull_s8` +
     // pairwise-add (bit-identical to the real instruction), staying on the
     // integer path and avoiding per-element int→f32 conversion. Q6_K keeps the
@@ -1280,7 +1281,9 @@ pub(crate) mod neon {
         _m: usize,
         k: usize,
     ) {
-        if cpu_features().dotprod {
+        // Compare against `tier` (not the raw `dotprod` flag) so `CERA_CPU_TIER`
+        // can force the base path, e.g. for parity testing on dotprod hardware.
+        if cpu_features().tier >= CpuTier::NeonDotprod {
             unsafe { gemv_q4_0_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, _m, k) }
         } else {
             unsafe { gemv_q4_0_q8_0_neon_base(a_quant, x_scales, x_quants, y, _m, k) }
@@ -1296,7 +1299,7 @@ pub(crate) mod neon {
         _m: usize,
         k: usize,
     ) {
-        if cpu_features().dotprod {
+        if cpu_features().tier >= CpuTier::NeonDotprod {
             unsafe { gemv_q8_0_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, _m, k) }
         } else {
             unsafe { gemv_q8_0_q8_0_neon_base(a_quant, x_scales, x_quants, y, _m, k) }
@@ -1312,7 +1315,7 @@ pub(crate) mod neon {
         _m: usize,
         k: usize,
     ) {
-        if cpu_features().dotprod {
+        if cpu_features().tier >= CpuTier::NeonDotprod {
             unsafe { gemv_q6k_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, _m, k) }
         } else {
             let xf = reconstruct_q8_0_input(x_scales, x_quants, k);
@@ -1487,7 +1490,7 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) {
-        if cpu_features().dotprod {
+        if cpu_features().tier >= CpuTier::NeonDotprod {
             unsafe { gemm_q4_0_q8_0_neon_dotprod(a_quant, b_scales, b_quants, out, m, n, k) }
         } else {
             unsafe { gemm_q4_0_q8_0_neon_base(a_quant, b_scales, b_quants, out, m, n, k) }
@@ -1505,7 +1508,6 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) {
-        use crate::backend::cpu_features::CpuTier;
         match cpu_features().tier {
             CpuTier::NeonI8mm => unsafe {
                 gemm_q8_0_q8_0_neon_i8mm(a_quant, b_scales, b_quants, out, m, n, k)

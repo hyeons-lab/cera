@@ -64,13 +64,25 @@ impl CpuTier {
 
     /// Parse a `CERA_CPU_TIER` label. Accepts a few spellings; returns `None`
     /// for anything unrecognized (the override is then ignored).
+    ///
+    /// Labels are arch-gated: only tiers valid for the current `target_arch`
+    /// (plus `Scalar`) parse. Otherwise a cross-arch label like `avx2` on
+    /// aarch64 would parse to `Avx2`, which — because `Avx2 < Neon*` in the
+    /// ordering — `with_tier_override` would accept as a "downgrade", leaving
+    /// the host with a tier it can't run. Returning `None` makes such an
+    /// override a no-op instead.
     fn parse(s: &str) -> Option<CpuTier> {
         match s.trim().to_ascii_lowercase().as_str() {
             "scalar" | "none" | "off" => Some(CpuTier::Scalar),
+            #[cfg(target_arch = "x86_64")]
             "avx2" => Some(CpuTier::Avx2),
+            #[cfg(target_arch = "x86_64")]
             "avx512" => Some(CpuTier::Avx512),
+            #[cfg(target_arch = "aarch64")]
             "neon" => Some(CpuTier::Neon),
+            #[cfg(target_arch = "aarch64")]
             "dotprod" | "neon+dotprod" | "neon,dotprod" => Some(CpuTier::NeonDotprod),
+            #[cfg(target_arch = "aarch64")]
             "i8mm" | "neon+i8mm" | "neon,i8mm" => Some(CpuTier::NeonI8mm),
             _ => None,
         }
@@ -297,15 +309,30 @@ mod tests {
 
     #[test]
     fn tier_label_roundtrips_through_parse() {
-        for t in [
-            CpuTier::Scalar,
-            CpuTier::Avx2,
-            CpuTier::Avx512,
-            CpuTier::Neon,
-            CpuTier::NeonDotprod,
-            CpuTier::NeonI8mm,
-        ] {
+        // `parse` is arch-gated, so only the current arch's tiers round-trip.
+        let mut tiers = vec![CpuTier::Scalar];
+        #[cfg(target_arch = "x86_64")]
+        tiers.extend([CpuTier::Avx2, CpuTier::Avx512]);
+        #[cfg(target_arch = "aarch64")]
+        tiers.extend([CpuTier::Neon, CpuTier::NeonDotprod, CpuTier::NeonI8mm]);
+        for t in tiers {
             assert_eq!(CpuTier::parse(t.label()), Some(t), "label {:?}", t.label());
+        }
+    }
+
+    #[test]
+    fn cross_arch_override_label_is_rejected() {
+        // The label for a tier from the *other* arch must not parse — otherwise
+        // it could be applied as a bogus "downgrade" (e.g. `avx2` on aarch64).
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(CpuTier::parse("avx2"), None);
+            assert_eq!(CpuTier::parse("avx512"), None);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(CpuTier::parse("neon"), None);
+            assert_eq!(CpuTier::parse("i8mm"), None);
         }
     }
 
