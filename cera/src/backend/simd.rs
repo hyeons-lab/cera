@@ -1564,6 +1564,23 @@ pub(crate) mod neon {
             }
         }
 
+        /// Tier-test gate. Returns true if the test should run. Normally skips
+        /// (returns false) when the host lacks `feature`; but if the
+        /// `CERA_REQUIRE_SIMD` env var lists `feature`, a missing feature is a
+        /// hard failure — so a dedicated CI job on known-capable hardware proves
+        /// the kernel actually executed rather than silently skipping.
+        fn require_simd_or_skip(feature: &str, detected: bool) -> bool {
+            if detected {
+                return true;
+            }
+            let required = std::env::var("CERA_REQUIRE_SIMD").unwrap_or_default();
+            assert!(
+                !required.split(',').any(|f| f.trim() == feature),
+                "CERA_REQUIRE_SIMD requires `{feature}` but this host doesn't report it"
+            );
+            false
+        }
+
         #[test]
         fn q4_0_gemv_fallback_matches_dotprod() {
             if !cpu_features().dotprod {
@@ -1743,7 +1760,7 @@ pub(crate) mod neon {
         /// Covers odd m and n to exercise the scalar remainder paths.
         #[test]
         fn i8mm_gemm_matches_dotprod() {
-            if !std::arch::is_aarch64_feature_detected!("i8mm") {
+            if !require_simd_or_skip("i8mm", std::arch::is_aarch64_feature_detected!("i8mm")) {
                 return;
             }
             for &(m, n, k) in &[(4usize, 4usize, 64usize), (5, 3, 96), (2, 7, 64)] {
@@ -2032,10 +2049,26 @@ mod avx512 {
             ((*state >> 40) as f32 / (1u64 << 24) as f32) - 1.0
         }
 
+        /// Tier-test gate. Skips when the host lacks `feature`, unless
+        /// `CERA_REQUIRE_SIMD` lists it — then a missing feature fails the test,
+        /// so a CI job on AVX-512 hardware proves the kernel actually ran.
+        fn require_simd_or_skip(feature: &str, detected: bool) -> bool {
+            if detected {
+                return true;
+            }
+            let required = std::env::var("CERA_REQUIRE_SIMD").unwrap_or_default();
+            assert!(
+                !required.split(',').any(|f| f.trim() == feature),
+                "CERA_REQUIRE_SIMD requires `{feature}` but this host doesn't report it"
+            );
+            false
+        }
+
         #[test]
         fn q8_0_avx512_matches_scalar() {
-            if !is_x86_feature_detected!("avx512f") {
-                return; // only runs on AVX-512 hardware (e.g. the AMD Zen 5 box)
+            // Only runs on AVX-512 hardware (e.g. the AMD Zen 5 box).
+            if !require_simd_or_skip("avx512", is_x86_feature_detected!("avx512f")) {
+                return;
             }
             let mut st = 0x1357_9bdfu64;
             let mut quants = [0i8; 32];
@@ -2057,7 +2090,7 @@ mod avx512 {
 
         #[test]
         fn q4_0_avx512_matches_scalar() {
-            if !is_x86_feature_detected!("avx512f") {
+            if !require_simd_or_skip("avx512", is_x86_feature_detected!("avx512f")) {
                 return;
             }
             let mut st = 0x2468_ace0u64;

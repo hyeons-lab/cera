@@ -44,6 +44,29 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  # Validate the aarch64 i8mm Q8_0 GEMM kernel on real ARMv8.6 hardware.
+  # GitHub's `ubuntu-24.04-arm` runner is Azure Cobalt 100 (Arm Neoverse N2,
+  # Armv9 → FEAT_I8MM), so this is where the otherwise-unverifiable i8mm tier
+  # actually executes. `CERA_REQUIRE_SIMD=i8mm` turns a missing feature into a
+  # test failure, so a green check proves the kernel ran rather than silently
+  # skipping (which is how the same test behaves on the M1/x86 runners above).
+  simd-i8mm:
+    name: SIMD i8mm validation (arm64)
+    needs: check
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+      - uses: Swatinem/rust-cache@v2
+      - name: Print resolved CPU tier
+        run: cargo run -q -p cera-cli -- cpu
+      - name: Validate i8mm + NEON fallbacks (fail if i8mm absent)
+        env:
+          CERA_REQUIRE_SIMD: i8mm
+        run: cargo test -p cera --lib -- cpu_features fallback_tests
+
   build-release:
     name: Release Build
     needs: check
