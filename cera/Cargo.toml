@@ -139,4 +139,9 @@ remote = ["dep:reqwest", "dep:sha2", "std-fs"]
 # wasm / embedded builds that only do text or raw-PCM audio
 # input. Pure-Rust deps — no system libpng/libjpeg required.
 vl-preprocess = ["dep:image"]
-default = ["parallel", "mmap", "std-fs", "disk-cache", "vl-preprocess"]
+# x86_64 AVX-512 vec_dot tier (Q8_0/Q4_0). The `_mm512_*` intrinsics stabilized
+# in Rust 1.89, past the crate's 1.85 MSRV, so this is opt-out: default-on for
+# out-of-box performance on AVX-512 hosts, but disabling it keeps the x86 build
+# compiling on Rust 1.85–1.88 (the tier then caps at AVX2). No-op on non-x86.
+avx512 = []
+default = ["parallel", "mmap", "std-fs", "disk-cache", "vl-preprocess", "avx512"]

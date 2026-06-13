@@ -547,6 +547,12 @@ RustBuffer uniffi_cera_ffi_fn_func_cera_ffi_version(RustCallStatus *_Nonnull out
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CPU_BACKEND_REPORT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CPU_BACKEND_REPORT
+RustBuffer uniffi_cera_ffi_fn_func_cpu_backend_report(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_FFI_CERA_FFI_RUSTBUFFER_ALLOC
 #define UNIFFI_FFIDEF_FFI_CERA_FFI_RUSTBUFFER_ALLOC
 RustBuffer ffi_cera_ffi_rustbuffer_alloc(uint64_t size, RustCallStatus *_Nonnull out_status
@@ -810,6 +816,12 @@ void ffi_cera_ffi_rust_future_complete_void(uint64_t handle, RustCallStatus *_No
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CERA_FFI_VERSION
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CERA_FFI_VERSION
 uint16_t uniffi_cera_ffi_checksum_func_cera_ffi_version(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CPU_BACKEND_REPORT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CPU_BACKEND_REPORT
+uint16_t uniffi_cera_ffi_checksum_func_cpu_backend_report(void
     
 );
 #endif

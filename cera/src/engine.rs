@@ -1192,6 +1192,14 @@ fn load_text_model(
     path: Option<&Path>,
     cfg: &EngineConfig,
 ) -> Result<Box<dyn Model>, CeraError> {
+    // Forward hook: fail fast with a clear error if a future build ever
+    // requires an ISA feature the host lacks. Today every backend has a
+    // runtime fallback (aarch64 NEON without dotprod, x86 scalar), so this is
+    // a no-op — but it keeps the check wired at the load boundary.
+    crate::backend::cpu_features::cpu_features()
+        .ensure_supported()
+        .map_err(CeraError::Backend)?;
+
     match cfg.backend {
         BackendPreference::Auto => load_text_model_auto(gguf, path, cfg.context_size),
         BackendPreference::Cpu => model::load_model(gguf, path, cfg.context_size)

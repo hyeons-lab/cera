@@ -45,6 +45,7 @@ impl GemvPtrs {
 #[allow(clippy::needless_range_loop, unused_unsafe)]
 pub(crate) mod neon {
     use super::*;
+    use crate::backend::cpu_features::{CpuTier, cpu_features};
     use std::arch::aarch64::*;
     use std::mem::size_of;
 
@@ -325,7 +326,7 @@ pub(crate) mod neon {
     /// NEON integer GEMV using pre-quantized Q8_0 input.
     /// Call `quantize_f32_to_q8_0_neon` first, then call this for each weight matrix.
     #[target_feature(enable = "neon,dotprod")]
-    pub unsafe fn gemv_q4_0_q8_0_neon(
+    unsafe fn gemv_q4_0_q8_0_neon_dotprod(
         a_quant: &[u8],
         x_scales: &[f32],
         x_quants: &[i8],
@@ -414,9 +415,9 @@ pub(crate) mod neon {
         }
     }
 
-    /// NEON integer GEMV: y[m] = A_q4_0[m,k] @ x_f32[k].
-    /// Uses caller-provided scratch buffers to avoid per-call heap allocation.
-    #[target_feature(enable = "neon,dotprod")]
+    /// NEON Q4_0 GEMV: y[m] = A_q4_0[m,k] @ x_f32[k]. Quantizes x to Q8_0 into
+    /// the caller-provided scratch (avoiding a per-call heap alloc) then defers
+    /// to the pre-quantized dispatcher, which picks the dotprod or `_base` path.
     pub unsafe fn gemv_q4_0_f32_neon(
         a_quant: &[u8],
         x: &[f32],
@@ -437,7 +438,7 @@ pub(crate) mod neon {
 
     /// NEON Q8_0 × Q8_0 GEMV with pre-quantized input (no quantization step).
     #[target_feature(enable = "neon,dotprod")]
-    pub unsafe fn gemv_q8_0_q8_0_neon(
+    unsafe fn gemv_q8_0_q8_0_neon_dotprod(
         a_quant: &[u8],
         x_scales: &[f32],
         x_quants: &[i8],
@@ -523,9 +524,9 @@ pub(crate) mod neon {
         }
     }
 
-    /// NEON integer GEMV: y[m] = A_q8_0[m,k] @ x_f32[k].
-    /// Convenience wrapper: quantizes x then calls gemv_q8_0_q8_0_neon.
-    #[target_feature(enable = "neon,dotprod")]
+    /// NEON Q8_0 GEMV: y[m] = A_q8_0[m,k] @ x_f32[k]. Quantizes x to Q8_0 into
+    /// the caller-provided scratch then defers to the pre-quantized dispatcher,
+    /// which picks the dotprod or `_base` path.
     pub unsafe fn gemv_q8_0_f32_neon(
         a_quant: &[u8],
         x: &[f32],
@@ -549,7 +550,7 @@ pub(crate) mod neon {
     /// Extracts 6-bit quants as i8, dots with Q8_0 input using vdotq_s32.
     /// 16 sub-blocks of 16 values per Q6_K block, each with its own scale.
     #[target_feature(enable = "neon,dotprod")]
-    pub unsafe fn gemv_q6k_q8_0_neon(
+    unsafe fn gemv_q6k_q8_0_neon_dotprod(
         a_quant: &[u8],
         x_scales: &[f32],
         x_quants: &[i8],
@@ -693,7 +694,7 @@ pub(crate) mod neon {
     /// still A/B against it.
     #[allow(dead_code)]
     #[target_feature(enable = "neon,dotprod")]
-    pub unsafe fn gemm_q4_0_q8_0_neon(
+    unsafe fn gemm_q4_0_q8_0_neon_dotprod(
         a_quant: &[u8],
         b_scales: &[f32],
         b_quants: &[i8],
@@ -934,7 +935,7 @@ pub(crate) mod neon {
     /// still A/B against it.
     #[allow(dead_code)]
     #[target_feature(enable = "neon,dotprod")]
-    pub unsafe fn gemm_q8_0_q8_0_neon(
+    unsafe fn gemm_q8_0_q8_0_neon_dotprod(
         a_quant: &[u8],
         b_scales: &[f32],
         b_quants: &[i8],
@@ -1018,8 +1019,8 @@ pub(crate) mod neon {
         }
     }
 
-    /// NEON Q6_K GEMV: quantizes x to Q8_0 using scratch, then calls integer path.
-    #[target_feature(enable = "neon,dotprod")]
+    /// NEON Q6_K GEMV dispatcher: quantizes x to Q8_0 then runs the integer
+    /// dotprod path when available, else a plain-NEON f32 fallback.
     pub unsafe fn gemv_q6k_f32_neon(
         a_quant: &[u8],
         x: &[f32],
@@ -1029,12 +1030,778 @@ pub(crate) mod neon {
         q8_scales: &mut Vec<f32>,
         q8_quants: &mut Vec<i8>,
     ) {
+        if cpu_features().tier >= CpuTier::NeonDotprod {
+            unsafe {
+                let n_blocks = k / 32;
+                q8_scales.resize(n_blocks, 0.0);
+                q8_quants.resize(k, 0);
+                quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
+                gemv_q6k_q8_0_neon_dotprod(a_quant, q8_scales, q8_quants, y, _m, k);
+            }
+        } else {
+            gemv_q6k_fallback(a_quant, x, y, k);
+        }
+    }
+
+    // ── Pre-quantized / GEMM dispatchers + NEON-without-dotprod fallbacks ────
+    //
+    // The kernels above tagged `*_dotprod` require FEAT_DotProd (`vdotq_s32`).
+    // These public entry points keep the original signatures so every call site
+    // is unchanged; they branch on `cpu_features().tier` (so `CERA_CPU_TIER` can
+    // force a lower path). The `*_base`
+    // fallbacks run on baseline NEON: they emulate `vdotq_s32` with `vmull_s8` +
+    // pairwise-add (bit-identical to the real instruction), staying on the
+    // integer path and avoiding per-element int→f32 conversion. Q6_K keeps the
+    // simpler f32-reconstruct fallback — its 6-bit unpack isn't worth a bespoke
+    // integer kernel for a rare quant. Correctness is verified on dotprod
+    // hardware by `fallback_tests`, comparing each fallback to its `*_dotprod`
+    // sibling.
+
+    /// Emulate `vdotq_s32(acc, a, b)` on baseline NEON (no FEAT_DotProd).
+    /// `vmull_s8` widens the 16 signed int8×int8 products to int16; two pairwise
+    /// adds then reduce them into the same four groups-of-four int32 lanes that
+    /// `vdotq_s32` produces — so the result is bit-identical.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn vdotq_s32_emu(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
         unsafe {
-            let n_blocks = k / 32;
-            q8_scales.resize(n_blocks, 0.0);
-            q8_quants.resize(k, 0);
-            quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
-            gemv_q6k_q8_0_neon(a_quant, q8_scales, q8_quants, y, _m, k);
+            let p_lo = vmull_s8(vget_low_s8(a), vget_low_s8(b));
+            let p_hi = vmull_s8(vget_high_s8(a), vget_high_s8(b));
+            let s_lo = vpaddlq_s16(p_lo);
+            let s_hi = vpaddlq_s16(p_hi);
+            vaddq_s32(acc, vpaddq_s32(s_lo, s_hi))
+        }
+    }
+
+    /// Reconstruct f32 input from a Q8_0-quantized vector (`x[i] = q[i] * scale`).
+    /// Used only by the Q6_K f32-reconstruct fallback.
+    fn reconstruct_q8_0_input(x_scales: &[f32], x_quants: &[i8], k: usize) -> Vec<f32> {
+        let nb = k / 32;
+        let mut xf = vec![0.0f32; k];
+        for bi in 0..nb {
+            let s = x_scales[bi];
+            for l in 0..32 {
+                xf[bi * 32 + l] = x_quants[bi * 32 + l] as f32 * s;
+            }
+        }
+        xf
+    }
+
+    /// Baseline-NEON Q4_0 × Q8_0 GEMV using the emulated integer dot.
+    #[target_feature(enable = "neon")]
+    unsafe fn gemv_q4_0_q8_0_neon_base(
+        a_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        let blocks_per_row = k / 32;
+        let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
+        let compute_row = |(i, yi): (usize, &mut f32)| unsafe {
+            let mask_lo = vdupq_n_u8(0x0F);
+            let offset_8 = vdupq_n_s8(0x8);
+            let row_start = i * row_bytes;
+            // Accumulate into an f32x4 (scaled per block via vmlaq_n_f32) like the
+            // dotprod kernels; the cross-lane reduction happens once at the end.
+            let mut sumv = vdupq_n_f32(0.0);
+            for bi in 0..blocks_per_row {
+                let b = &*(a_quant
+                    .as_ptr()
+                    .add(row_start + bi * size_of::<BlockQ4_0>())
+                    as *const BlockQ4_0);
+                let v = vld1q_u8(b.qs.as_ptr());
+                let v_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, mask_lo)), offset_8);
+                let v_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v)), offset_8);
+                let y_lo = vld1q_s8(x_quants.as_ptr().add(bi * 32));
+                let y_hi = vld1q_s8(x_quants.as_ptr().add(bi * 32 + 16));
+                let z = vdupq_n_s32(0);
+                let p = vdotq_s32_emu(vdotq_s32_emu(z, v_lo, y_lo), v_hi, y_hi);
+                let d = f16::from_bits(b.d).to_f32() * x_scales[bi];
+                sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d);
+            }
+            *yi = vaddvq_f32(sumv);
+        };
+        if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
+            super::super::cpu::par_rows(y, 512, compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
+        }
+    }
+
+    /// Baseline-NEON Q8_0 × Q8_0 GEMV using the emulated integer dot.
+    #[target_feature(enable = "neon")]
+    unsafe fn gemv_q8_0_q8_0_neon_base(
+        a_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        let blocks_per_row = k / 32;
+        let row_bytes = blocks_per_row * size_of::<BlockQ8_0>();
+        let compute_row = |(i, yi): (usize, &mut f32)| unsafe {
+            let row_start = i * row_bytes;
+            let mut sumv = vdupq_n_f32(0.0);
+            for bi in 0..blocks_per_row {
+                let wb = &*(a_quant
+                    .as_ptr()
+                    .add(row_start + bi * size_of::<BlockQ8_0>())
+                    as *const BlockQ8_0);
+                let w_lo = vld1q_s8(wb.quants.as_ptr());
+                let w_hi = vld1q_s8(wb.quants.as_ptr().add(16));
+                let x_lo = vld1q_s8(x_quants.as_ptr().add(bi * 32));
+                let x_hi = vld1q_s8(x_quants.as_ptr().add(bi * 32 + 16));
+                let z = vdupq_n_s32(0);
+                let p = vdotq_s32_emu(vdotq_s32_emu(z, w_lo, x_lo), w_hi, x_hi);
+                let d = f16::from_bits(wb.delta).to_f32() * x_scales[bi];
+                sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d);
+            }
+            *yi = vaddvq_f32(sumv);
+        };
+        if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
+            super::super::cpu::par_rows(y, 512, compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
+        }
+    }
+
+    /// Baseline-NEON Q4_0 × Q8_0 GEMM using the emulated integer dot.
+    #[target_feature(enable = "neon")]
+    unsafe fn gemm_q4_0_q8_0_neon_base(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        let nb = k / 32;
+        let row_bytes = nb * size_of::<BlockQ4_0>();
+        let compute_row = |(i, row): (usize, &mut [f32])| unsafe {
+            let mask_lo = vdupq_n_u8(0x0F);
+            let offset_8 = vdupq_n_s8(0x8);
+            let row_start = i * row_bytes;
+            for j in 0..n {
+                let mut sumv = vdupq_n_f32(0.0);
+                for bi in 0..nb {
+                    let b = &*(a_quant
+                        .as_ptr()
+                        .add(row_start + bi * size_of::<BlockQ4_0>())
+                        as *const BlockQ4_0);
+                    let v = vld1q_u8(b.qs.as_ptr());
+                    let v_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, mask_lo)), offset_8);
+                    let v_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v)), offset_8);
+                    let y_lo = vld1q_s8(b_quants.as_ptr().add(j * k + bi * 32));
+                    let y_hi = vld1q_s8(b_quants.as_ptr().add(j * k + bi * 32 + 16));
+                    let z = vdupq_n_s32(0);
+                    let p = vdotq_s32_emu(vdotq_s32_emu(z, v_lo, y_lo), v_hi, y_hi);
+                    let d = f16::from_bits(b.d).to_f32() * b_scales[j * nb + bi];
+                    sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d);
+                }
+                row[j] = vaddvq_f32(sumv);
+            }
+        };
+        if m >= super::super::cpu::GEMV_PAR_THRESHOLD {
+            super::super::cpu::par_rows_n(out, n, 256, compute_row);
+        } else {
+            out.chunks_mut(n).enumerate().for_each(compute_row);
+        }
+    }
+
+    /// Baseline-NEON Q8_0 × Q8_0 GEMM using the emulated integer dot.
+    #[target_feature(enable = "neon")]
+    unsafe fn gemm_q8_0_q8_0_neon_base(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        let nb = k / 32;
+        let row_bytes = nb * size_of::<BlockQ8_0>();
+        let compute_row = |(i, row): (usize, &mut [f32])| unsafe {
+            let row_start = i * row_bytes;
+            for j in 0..n {
+                let mut sumv = vdupq_n_f32(0.0);
+                for bi in 0..nb {
+                    let wb = &*(a_quant
+                        .as_ptr()
+                        .add(row_start + bi * size_of::<BlockQ8_0>())
+                        as *const BlockQ8_0);
+                    let w_lo = vld1q_s8(wb.quants.as_ptr());
+                    let w_hi = vld1q_s8(wb.quants.as_ptr().add(16));
+                    let y_lo = vld1q_s8(b_quants.as_ptr().add(j * k + bi * 32));
+                    let y_hi = vld1q_s8(b_quants.as_ptr().add(j * k + bi * 32 + 16));
+                    let z = vdupq_n_s32(0);
+                    let p = vdotq_s32_emu(vdotq_s32_emu(z, w_lo, y_lo), w_hi, y_hi);
+                    let d = f16::from_bits(wb.delta).to_f32() * b_scales[j * nb + bi];
+                    sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d);
+                }
+                row[j] = vaddvq_f32(sumv);
+            }
+        };
+        if m >= super::super::cpu::GEMV_PAR_THRESHOLD {
+            super::super::cpu::par_rows_n(out, n, 256, compute_row);
+        } else {
+            out.chunks_mut(n).enumerate().for_each(compute_row);
+        }
+    }
+
+    /// Plain-NEON Q6_K GEMV fallback. Mirrors `backend::cpu::gemv_q6k_f32`.
+    fn gemv_q6k_fallback(a_quant: &[u8], x: &[f32], y: &mut [f32], k: usize) {
+        let blocks_per_row = k / 256;
+        let row_bytes = blocks_per_row * size_of::<BlockQ6K>();
+        let compute_row = |(i, yi): (usize, &mut f32)| {
+            let row_start = i * row_bytes;
+            let mut sum = 0.0f32;
+            for bi in 0..blocks_per_row {
+                let off = row_start + bi * size_of::<BlockQ6K>();
+                let block = unsafe { &*(a_quant.as_ptr().add(off) as *const BlockQ6K) };
+                sum += crate::quant::vec_dot_q6_k_f32(block, &x[bi * 256..(bi + 1) * 256]);
+            }
+            *yi = sum;
+        };
+        if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
+            super::super::cpu::par_rows(y, 512, compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
+        }
+    }
+
+    /// Q4_0 pre-quantized GEMV dispatcher (input already Q8_0).
+    pub unsafe fn gemv_q4_0_q8_0_neon(
+        a_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        // Compare against `tier` (not the raw `dotprod` flag) so `CERA_CPU_TIER`
+        // can force the base path, e.g. for parity testing on dotprod hardware.
+        if cpu_features().tier >= CpuTier::NeonDotprod {
+            unsafe { gemv_q4_0_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, _m, k) }
+        } else {
+            unsafe { gemv_q4_0_q8_0_neon_base(a_quant, x_scales, x_quants, y, _m, k) }
+        }
+    }
+
+    /// Q8_0 pre-quantized GEMV dispatcher (input already Q8_0).
+    pub unsafe fn gemv_q8_0_q8_0_neon(
+        a_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        if cpu_features().tier >= CpuTier::NeonDotprod {
+            unsafe { gemv_q8_0_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, _m, k) }
+        } else {
+            unsafe { gemv_q8_0_q8_0_neon_base(a_quant, x_scales, x_quants, y, _m, k) }
+        }
+    }
+
+    /// Q6_K pre-quantized GEMV dispatcher (input already Q8_0).
+    pub unsafe fn gemv_q6k_q8_0_neon(
+        a_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        if cpu_features().tier >= CpuTier::NeonDotprod {
+            unsafe { gemv_q6k_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, _m, k) }
+        } else {
+            let xf = reconstruct_q8_0_input(x_scales, x_quants, k);
+            gemv_q6k_fallback(a_quant, &xf, y, k);
+        }
+    }
+
+    // ── aarch64 i8mm tier ────────────────────────────────────────────────────
+    //
+    // `vmmlaq_s32` (FEAT_I8MM, ARMv8.6) does a 2×8 · 8×2 → 2×2 int8 matmul in one
+    // op, a natural fit for Q8_0 GEMM (2 weight rows × 2 input cols per step).
+    // i8mm always implies dotprod, so this is purely a prefill speedup over the
+    // dotprod GEMM — never a correctness necessity (the dispatcher still has the
+    // dotprod path).
+    //
+    // NOTE: i8mm is ARMv8.6, which the aarch64 dev host (M1: dotprod, no i8mm)
+    // can't execute — it compiles natively (the intrinsic is gated, not run).
+    // It IS validated on CI by the `simd-i8mm` job on `ubuntu-24.04-arm` (Azure
+    // Cobalt 100 / Neoverse N2), which runs `i8mm_gemm_matches_dotprod` under
+    // `CERA_REQUIRE_SIMD=i8mm` so a missing feature fails rather than skips.
+
+    /// Scalar single-output Q8_0 GEMM dot, for odd row/col remainders.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_q8_0_scalar_dot(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        i: usize,
+        j: usize,
+        nb: usize,
+        k: usize,
+        row_bytes: usize,
+    ) -> f32 {
+        let mut acc = 0.0f32;
+        for bi in 0..nb {
+            let wb = unsafe {
+                &*(a_quant
+                    .as_ptr()
+                    .add(i * row_bytes + bi * size_of::<BlockQ8_0>())
+                    as *const BlockQ8_0)
+            };
+            let dw = f16::from_bits(wb.delta).to_f32();
+            let db = b_scales[j * nb + bi];
+            let mut s = 0i32;
+            for l in 0..32 {
+                s += wb.quants[l] as i32 * b_quants[j * k + bi * 32 + l] as i32;
+            }
+            acc += s as f32 * dw * db;
+        }
+        acc
+    }
+
+    /// i8mm Q8_0 × Q8_0 GEMM. Processes 2×2 output tiles with `vmmlaq_s32`,
+    /// parallelized across row-pairs; odd row/col remainders use the scalar dot.
+    #[target_feature(enable = "neon,i8mm")]
+    unsafe fn gemm_q8_0_q8_0_neon_i8mm(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        let nb = k / 32;
+        let row_bytes = nb * size_of::<BlockQ8_0>();
+        let m_even = m & !1;
+        let n_even = n & !1;
+
+        // Main even×even tiles, parallel over 2-row strips.
+        {
+            #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
+            use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+            out[..m_even * n]
+                .par_chunks_mut(2 * n)
+                .enumerate()
+                .for_each(|(p, strip)| {
+                    let i = p * 2;
+                    for j in (0..n_even).step_by(2) {
+                        let (mut s00, mut s01, mut s10, mut s11) = (0.0f32, 0.0, 0.0, 0.0);
+                        for bi in 0..nb {
+                            let (wb0, wb1) = unsafe {
+                                (
+                                    &*(a_quant
+                                        .as_ptr()
+                                        .add(i * row_bytes + bi * size_of::<BlockQ8_0>())
+                                        as *const BlockQ8_0),
+                                    &*(a_quant
+                                        .as_ptr()
+                                        .add((i + 1) * row_bytes + bi * size_of::<BlockQ8_0>())
+                                        as *const BlockQ8_0),
+                                )
+                            };
+                            let dw0 = f16::from_bits(wb0.delta).to_f32();
+                            let dw1 = f16::from_bits(wb1.delta).to_f32();
+                            let db0 = b_scales[j * nb + bi];
+                            let db1 = b_scales[(j + 1) * nb + bi];
+                            let mut acc = unsafe { vdupq_n_s32(0) };
+                            for c in 0..4 {
+                                let off = c * 8;
+                                unsafe {
+                                    // a: row0 = weight i, row1 = weight i+1 (8 deep).
+                                    let av = vcombine_s8(
+                                        vld1_s8(wb0.quants.as_ptr().add(off)),
+                                        vld1_s8(wb1.quants.as_ptr().add(off)),
+                                    );
+                                    // b: row0 = input col j, row1 = input col j+1.
+                                    let bv = vcombine_s8(
+                                        vld1_s8(b_quants.as_ptr().add(j * k + bi * 32 + off)),
+                                        vld1_s8(b_quants.as_ptr().add((j + 1) * k + bi * 32 + off)),
+                                    );
+                                    acc = vmmlaq_s32(acc, av, bv);
+                                }
+                            }
+                            // Lanes: [W_i·B_j, W_i·B_{j+1}, W_{i+1}·B_j, W_{i+1}·B_{j+1}].
+                            let (d00, d01, d10, d11) = unsafe {
+                                (
+                                    vgetq_lane_s32::<0>(acc) as f32,
+                                    vgetq_lane_s32::<1>(acc) as f32,
+                                    vgetq_lane_s32::<2>(acc) as f32,
+                                    vgetq_lane_s32::<3>(acc) as f32,
+                                )
+                            };
+                            s00 += d00 * dw0 * db0;
+                            s01 += d01 * dw0 * db1;
+                            s10 += d10 * dw1 * db0;
+                            s11 += d11 * dw1 * db1;
+                        }
+                        strip[j] = s00;
+                        strip[j + 1] = s01;
+                        strip[n + j] = s10;
+                        strip[n + j + 1] = s11;
+                    }
+                    // Odd last column within this strip.
+                    if n_even < n {
+                        let j = n - 1;
+                        strip[j] = gemm_q8_0_scalar_dot(
+                            a_quant, b_scales, b_quants, i, j, nb, k, row_bytes,
+                        );
+                        strip[n + j] = gemm_q8_0_scalar_dot(
+                            a_quant,
+                            b_scales,
+                            b_quants,
+                            i + 1,
+                            j,
+                            nb,
+                            k,
+                            row_bytes,
+                        );
+                    }
+                });
+        }
+
+        // Odd last row (covers all columns).
+        if m_even < m {
+            let i = m - 1;
+            for j in 0..n {
+                out[i * n + j] =
+                    gemm_q8_0_scalar_dot(a_quant, b_scales, b_quants, i, j, nb, k, row_bytes);
+            }
+        }
+    }
+
+    /// Q4_0 × Q8_0 GEMM dispatcher.
+    pub unsafe fn gemm_q4_0_q8_0_neon(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        if cpu_features().tier >= CpuTier::NeonDotprod {
+            unsafe { gemm_q4_0_q8_0_neon_dotprod(a_quant, b_scales, b_quants, out, m, n, k) }
+        } else {
+            unsafe { gemm_q4_0_q8_0_neon_base(a_quant, b_scales, b_quants, out, m, n, k) }
+        }
+    }
+
+    /// Q8_0 × Q8_0 GEMM dispatcher. Prefers i8mm (`vmmlaq_s32`) when the tier is
+    /// resolved to it, else dotprod, else the emulated-integer base.
+    pub unsafe fn gemm_q8_0_q8_0_neon(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        match cpu_features().tier {
+            CpuTier::NeonI8mm => unsafe {
+                gemm_q8_0_q8_0_neon_i8mm(a_quant, b_scales, b_quants, out, m, n, k)
+            },
+            CpuTier::NeonDotprod => unsafe {
+                gemm_q8_0_q8_0_neon_dotprod(a_quant, b_scales, b_quants, out, m, n, k)
+            },
+            _ => unsafe { gemm_q8_0_q8_0_neon_base(a_quant, b_scales, b_quants, out, m, n, k) },
+        }
+    }
+
+    // Verify each NEON-without-dotprod fallback against its `*_dotprod` sibling.
+    // These only run on dotprod-capable hardware (e.g. Apple Silicon) — where
+    // both paths are valid to call — and assert they agree to f32 tolerance.
+    // Both consume the same q8_0-quantized input; the Q4_0/Q8_0 `_base` kernels
+    // use the bit-identical emulated `vdotq_s32`, so they differ from the
+    // dotprod path only in f32 scale-accumulation order, while the Q6_K path
+    // reconstructs to f32 and reuses `vec_dot_q6_k_f32`.
+    #[cfg(test)]
+    mod fallback_tests {
+        use super::*;
+
+        /// Deterministic LCG → f32 in [-1, 1). Avoids `rand` and is stable.
+        fn lcg(state: &mut u64) -> f32 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((*state >> 40) as f32 / (1u64 << 24) as f32) - 1.0
+        }
+
+        fn blocks_to_bytes<T: Copy>(blocks: &[T]) -> Vec<u8> {
+            unsafe {
+                std::slice::from_raw_parts(
+                    blocks.as_ptr() as *const u8,
+                    std::mem::size_of_val(blocks),
+                )
+                .to_vec()
+            }
+        }
+
+        fn quantize_col(x: &[f32]) -> (Vec<f32>, Vec<i8>) {
+            let nb = x.len() / 32;
+            let mut s = vec![0.0f32; nb];
+            let mut q = vec![0i8; x.len()];
+            unsafe { quantize_f32_to_q8_0_neon(x, &mut s, &mut q) };
+            (s, q)
+        }
+
+        fn assert_close(a: &[f32], b: &[f32]) {
+            assert_eq!(a.len(), b.len());
+            for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
+                assert!(
+                    (x - y).abs() <= 1e-2 * (1.0 + x.abs()),
+                    "row {i}: dotprod={x} fallback={y}"
+                );
+            }
+        }
+
+        /// Tier-test gate. Returns true if the test should run. Normally skips
+        /// (returns false) when the host lacks `feature`; but if the
+        /// `CERA_REQUIRE_SIMD` env var lists `feature`, a missing feature is a
+        /// hard failure — so a dedicated CI job on known-capable hardware proves
+        /// the kernel actually executed rather than silently skipping.
+        fn require_simd_or_skip(feature: &str, detected: bool) -> bool {
+            if detected {
+                return true;
+            }
+            let required = std::env::var("CERA_REQUIRE_SIMD").unwrap_or_default();
+            assert!(
+                !required.split(',').any(|f| f.trim() == feature),
+                "CERA_REQUIRE_SIMD requires `{feature}` but this host doesn't report it"
+            );
+            false
+        }
+
+        #[test]
+        fn q4_0_gemv_fallback_matches_dotprod() {
+            if !cpu_features().dotprod {
+                return;
+            }
+            let (m, k, nb) = (6usize, 128usize, 4usize);
+            let mut st = 0x1234_5678u64;
+            let blocks: Vec<BlockQ4_0> = (0..m * nb)
+                .map(|_| {
+                    let mut qs = [0u8; 16];
+                    for b in qs.iter_mut() {
+                        *b = (lcg(&mut st) * 127.0) as i32 as u8;
+                    }
+                    BlockQ4_0 {
+                        d: f16::from_f32(0.03 + lcg(&mut st).abs() * 0.1).to_bits(),
+                        qs,
+                    }
+                })
+                .collect();
+            let a = blocks_to_bytes(&blocks);
+            let x: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+            let (xs, xq) = quantize_col(&x);
+
+            let mut y_dot = vec![0.0f32; m];
+            unsafe { gemv_q4_0_q8_0_neon_dotprod(&a, &xs, &xq, &mut y_dot, m, k) };
+            let mut y_fb = vec![0.0f32; m];
+            unsafe { gemv_q4_0_q8_0_neon_base(&a, &xs, &xq, &mut y_fb, m, k) };
+            assert_close(&y_dot, &y_fb);
+        }
+
+        #[test]
+        fn q8_0_gemv_fallback_matches_dotprod() {
+            if !cpu_features().dotprod {
+                return;
+            }
+            let (m, k, nb) = (6usize, 128usize, 4usize);
+            let mut st = 0x9e37_79b9u64;
+            let blocks: Vec<BlockQ8_0> = (0..m * nb)
+                .map(|_| {
+                    let mut quants = [0i8; 32];
+                    for q in quants.iter_mut() {
+                        *q = (lcg(&mut st) * 127.0) as i32 as i8;
+                    }
+                    BlockQ8_0 {
+                        delta: f16::from_f32(0.03 + lcg(&mut st).abs() * 0.1).to_bits(),
+                        quants,
+                    }
+                })
+                .collect();
+            let a = blocks_to_bytes(&blocks);
+            let x: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+            let (xs, xq) = quantize_col(&x);
+
+            let mut y_dot = vec![0.0f32; m];
+            unsafe { gemv_q8_0_q8_0_neon_dotprod(&a, &xs, &xq, &mut y_dot, m, k) };
+            let mut y_fb = vec![0.0f32; m];
+            unsafe { gemv_q8_0_q8_0_neon_base(&a, &xs, &xq, &mut y_fb, m, k) };
+            assert_close(&y_dot, &y_fb);
+        }
+
+        #[test]
+        fn q6k_gemv_fallback_matches_dotprod() {
+            if !cpu_features().dotprod {
+                return;
+            }
+            let (m, k, nb) = (5usize, 256usize, 1usize); // one Q6_K super-block / row
+            let mut st = 0xdead_beefu64;
+            let blocks: Vec<BlockQ6K> = (0..m * nb)
+                .map(|_| {
+                    let mut ql = [0u8; 128];
+                    let mut qh = [0u8; 64];
+                    let mut scales = [0i8; 16];
+                    for b in ql.iter_mut() {
+                        *b = (lcg(&mut st) * 127.0) as i32 as u8;
+                    }
+                    for b in qh.iter_mut() {
+                        *b = (lcg(&mut st) * 127.0) as i32 as u8;
+                    }
+                    for s in scales.iter_mut() {
+                        *s = (lcg(&mut st) * 16.0) as i32 as i8;
+                    }
+                    BlockQ6K {
+                        ql,
+                        qh,
+                        scales,
+                        d: f16::from_f32(0.02 + lcg(&mut st).abs() * 0.05).to_bits(),
+                    }
+                })
+                .collect();
+            let a = blocks_to_bytes(&blocks);
+            let x: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+            let (xs, xq) = quantize_col(&x);
+
+            let mut y_dot = vec![0.0f32; m];
+            unsafe { gemv_q6k_q8_0_neon_dotprod(&a, &xs, &xq, &mut y_dot, m, k) };
+            let xf = reconstruct_q8_0_input(&xs, &xq, k);
+            let mut y_fb = vec![0.0f32; m];
+            gemv_q6k_fallback(&a, &xf, &mut y_fb, k);
+            assert_close(&y_dot, &y_fb);
+        }
+
+        #[test]
+        fn q4_0_gemm_fallback_matches_dotprod() {
+            if !cpu_features().dotprod {
+                return;
+            }
+            let (m, n, k, nb) = (4usize, 3usize, 96usize, 3usize);
+            let mut st = 0x0bad_f00du64;
+            let blocks: Vec<BlockQ4_0> = (0..m * nb)
+                .map(|_| {
+                    let mut qs = [0u8; 16];
+                    for b in qs.iter_mut() {
+                        *b = (lcg(&mut st) * 127.0) as i32 as u8;
+                    }
+                    BlockQ4_0 {
+                        d: f16::from_f32(0.03 + lcg(&mut st).abs() * 0.1).to_bits(),
+                        qs,
+                    }
+                })
+                .collect();
+            let a = blocks_to_bytes(&blocks);
+            // B: n columns of length k, quantized to Q8_0 column-major.
+            let mut b_scales = vec![0.0f32; n * nb];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+                let (s, q) = quantize_col(&col);
+                b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+
+            let mut out_dot = vec![0.0f32; m * n];
+            unsafe { gemm_q4_0_q8_0_neon_dotprod(&a, &b_scales, &b_quants, &mut out_dot, m, n, k) };
+            let mut out_fb = vec![0.0f32; m * n];
+            unsafe { gemm_q4_0_q8_0_neon_base(&a, &b_scales, &b_quants, &mut out_fb, m, n, k) };
+            assert_close(&out_dot, &out_fb);
+        }
+
+        #[test]
+        fn q8_0_gemm_fallback_matches_dotprod() {
+            if !cpu_features().dotprod {
+                return;
+            }
+            let (m, n, k, nb) = (4usize, 3usize, 96usize, 3usize);
+            let mut st = 0xcafe_d00du64;
+            let blocks: Vec<BlockQ8_0> = (0..m * nb)
+                .map(|_| {
+                    let mut quants = [0i8; 32];
+                    for q in quants.iter_mut() {
+                        *q = (lcg(&mut st) * 127.0) as i32 as i8;
+                    }
+                    BlockQ8_0 {
+                        delta: f16::from_f32(0.03 + lcg(&mut st).abs() * 0.1).to_bits(),
+                        quants,
+                    }
+                })
+                .collect();
+            let a = blocks_to_bytes(&blocks);
+            let mut b_scales = vec![0.0f32; n * nb];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+                let (s, q) = quantize_col(&col);
+                b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+
+            let mut out_dot = vec![0.0f32; m * n];
+            unsafe { gemm_q8_0_q8_0_neon_dotprod(&a, &b_scales, &b_quants, &mut out_dot, m, n, k) };
+            let mut out_fb = vec![0.0f32; m * n];
+            unsafe { gemm_q8_0_q8_0_neon_base(&a, &b_scales, &b_quants, &mut out_fb, m, n, k) };
+            assert_close(&out_dot, &out_fb);
+        }
+
+        /// i8mm Q8_0 GEMM vs the dotprod kernel. Skips on the dev host (M1 has no
+        /// i8mm); runs where `is_aarch64_feature_detected!("i8mm")` (ARMv8.6) —
+        /// notably the `simd-i8mm` CI job, which enforces it via
+        /// `CERA_REQUIRE_SIMD=i8mm`. Covers odd m and n for the remainder paths.
+        #[test]
+        fn i8mm_gemm_matches_dotprod() {
+            if !require_simd_or_skip("i8mm", std::arch::is_aarch64_feature_detected!("i8mm")) {
+                return;
+            }
+            for &(m, n, k) in &[(4usize, 4usize, 64usize), (5, 3, 96), (2, 7, 64)] {
+                let nb = k / 32;
+                let mut st = 0x5151_2323u64 ^ ((m * 131 + n * 17 + k) as u64);
+                let blocks: Vec<BlockQ8_0> = (0..m * nb)
+                    .map(|_| {
+                        let mut quants = [0i8; 32];
+                        for q in quants.iter_mut() {
+                            *q = (lcg(&mut st) * 127.0) as i32 as i8;
+                        }
+                        BlockQ8_0 {
+                            delta: f16::from_f32(0.03 + lcg(&mut st).abs() * 0.1).to_bits(),
+                            quants,
+                        }
+                    })
+                    .collect();
+                let a = blocks_to_bytes(&blocks);
+                let mut b_scales = vec![0.0f32; n * nb];
+                let mut b_quants = vec![0i8; n * k];
+                for j in 0..n {
+                    let col: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+                    let (s, q) = quantize_col(&col);
+                    b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                    b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+                }
+
+                let mut out_dot = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q8_0_q8_0_neon_dotprod(&a, &b_scales, &b_quants, &mut out_dot, m, n, k)
+                };
+                let mut out_i8mm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q8_0_q8_0_neon_i8mm(&a, &b_scales, &b_quants, &mut out_i8mm, m, n, k)
+                };
+                assert_close(&out_dot, &out_i8mm);
+            }
         }
     }
 }
@@ -1206,6 +1973,153 @@ mod avx2 {
     }
 }
 
+// ── x86_64 AVX-512 ──────────────────────────────────────────────────────────
+//
+// 512-bit-wide f32 vec_dot kernels — the AVX2 algorithm at double the vector
+// width (16 f32 lanes per op). The x86 hot path is int8-weight × f32-activation,
+// so these stay on the f32-FMA path; a true VNNI int8×int8 GEMV would need a
+// quantized-activation path on x86 (like aarch64's pre-quant kernels) and is a
+// separate, larger change. Only Q8_0 and Q4_0 have AVX-512 kernels; Q4_K_M
+// stays on AVX2 even at the Avx512 tier (the dispatcher routes it there).
+//
+// NOTE: not executable on the aarch64 dev host. Verified by `avx512_tests`
+// below, which run only where `is_x86_feature_detected!("avx512f")` holds
+// (e.g. Zen 4/5, Skylake-X), comparing each kernel against the scalar reference.
+//
+// Behind the default-on `avx512` crate feature: the `_mm512_*` intrinsics need
+// Rust 1.89 (past the 1.85 MSRV), so disabling the feature keeps x86 building on
+// 1.85–1.88 (the tier then caps at AVX2; `detect()` won't produce `Avx512`).
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+mod avx512 {
+    // 1.89 `_mm512_*` intrinsics vs the 1.85 MSRV — see the module gate above.
+    // The `avx512` feature lets MSRV-sensitive builds opt out; when it's on, the
+    // build already requires 1.89, so silence the (correct) lint here.
+    #![allow(clippy::incompatible_msrv)]
+    use super::*;
+    use std::arch::x86_64::*;
+
+    /// AVX-512 Q8_0 dot product with f32 vector. 16 lanes/iter, 2 iters for 32.
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn vec_dot_q8_0_f32_avx512(block: &BlockQ8_0, y: &[f32]) -> f32 {
+        unsafe {
+            debug_assert_eq!(y.len(), 32);
+            let d = f16::from_bits(block.delta).to_f32();
+            let quants_ptr = block.quants.as_ptr();
+            let y_ptr = y.as_ptr();
+            let mut acc = _mm512_setzero_ps();
+            for i in (0..32).step_by(16) {
+                // 16 int8 → 16 i32 (sign-extend) → 16 f32.
+                let q128 = _mm_loadu_si128(quants_ptr.add(i) as *const __m128i);
+                let qf = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(q128));
+                let yv = _mm512_loadu_ps(y_ptr.add(i));
+                acc = _mm512_fmadd_ps(qf, yv, acc);
+            }
+            d * _mm512_reduce_add_ps(acc)
+        }
+    }
+
+    /// AVX-512 Q4_0 dot product with f32 vector. Low 16 nibbles ↔ y[0..16],
+    /// high 16 ↔ y[16..32]; each nibble is `(n - 8) * d`.
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn vec_dot_q4_0_f32_avx512(block: &BlockQ4_0, y: &[f32]) -> f32 {
+        unsafe {
+            debug_assert_eq!(y.len(), 32);
+            let d = f16::from_bits(block.d).to_f32();
+            let offset = _mm512_set1_ps(8.0);
+            let mask_lo = _mm_set1_epi8(0x0F);
+            let y_ptr = y.as_ptr();
+
+            let qbytes = _mm_loadu_si128(block.qs.as_ptr() as *const __m128i);
+            let lo = _mm_and_si128(qbytes, mask_lo);
+            let hi = _mm_and_si128(_mm_srli_epi16(qbytes, 4), mask_lo);
+
+            let mut acc = _mm512_setzero_ps();
+            // 16 low nibbles (zero-extend u8 → i32) → f32, minus 8, FMA y[0..16].
+            let lo_f = _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(lo)), offset);
+            acc = _mm512_fmadd_ps(lo_f, _mm512_loadu_ps(y_ptr), acc);
+            let hi_f = _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(hi)), offset);
+            acc = _mm512_fmadd_ps(hi_f, _mm512_loadu_ps(y_ptr.add(16)), acc);
+
+            d * _mm512_reduce_add_ps(acc)
+        }
+    }
+
+    #[cfg(test)]
+    mod avx512_tests {
+        use super::*;
+        use crate::quant::{vec_dot_q4_0_f32_scalar, vec_dot_q8_0_f32_scalar};
+
+        fn lcg(state: &mut u64) -> f32 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((*state >> 40) as f32 / (1u64 << 24) as f32) - 1.0
+        }
+
+        /// Tier-test gate. Skips when the host lacks `feature`, unless
+        /// `CERA_REQUIRE_SIMD` lists it — then a missing feature fails the test,
+        /// so a CI job on AVX-512 hardware proves the kernel actually ran.
+        fn require_simd_or_skip(feature: &str, detected: bool) -> bool {
+            if detected {
+                return true;
+            }
+            let required = std::env::var("CERA_REQUIRE_SIMD").unwrap_or_default();
+            assert!(
+                !required.split(',').any(|f| f.trim() == feature),
+                "CERA_REQUIRE_SIMD requires `{feature}` but this host doesn't report it"
+            );
+            false
+        }
+
+        #[test]
+        fn q8_0_avx512_matches_scalar() {
+            // Only runs on AVX-512 hardware (e.g. the AMD Zen 5 box).
+            if !require_simd_or_skip("avx512", is_x86_feature_detected!("avx512f")) {
+                return;
+            }
+            let mut st = 0x1357_9bdfu64;
+            let mut quants = [0i8; 32];
+            for q in quants.iter_mut() {
+                *q = (lcg(&mut st) * 127.0) as i32 as i8;
+            }
+            let block = BlockQ8_0 {
+                delta: f16::from_f32(0.043).to_bits(),
+                quants,
+            };
+            let y: Vec<f32> = (0..32).map(|_| lcg(&mut st)).collect();
+            let got = unsafe { vec_dot_q8_0_f32_avx512(&block, &y) };
+            let want = vec_dot_q8_0_f32_scalar(&block, &y);
+            assert!(
+                (got - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                "{got} vs {want}"
+            );
+        }
+
+        #[test]
+        fn q4_0_avx512_matches_scalar() {
+            if !require_simd_or_skip("avx512", is_x86_feature_detected!("avx512f")) {
+                return;
+            }
+            let mut st = 0x2468_ace0u64;
+            let mut qs = [0u8; 16];
+            for b in qs.iter_mut() {
+                *b = (lcg(&mut st) * 127.0) as i32 as u8;
+            }
+            let block = BlockQ4_0 {
+                d: f16::from_f32(0.037).to_bits(),
+                qs,
+            };
+            let y: Vec<f32> = (0..32).map(|_| lcg(&mut st)).collect();
+            let got = unsafe { vec_dot_q4_0_f32_avx512(&block, &y) };
+            let want = vec_dot_q4_0_f32_scalar(&block, &y);
+            assert!(
+                (got - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                "{got} vs {want}"
+            );
+        }
+    }
+}
+
 // ── Dispatch ────────────────────────────────────────────────────────────────
 
 /// Best available Q4_0 dot product.
@@ -1219,10 +2133,15 @@ pub fn vec_dot_q4_0_f32(block: &BlockQ4_0, y: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            unsafe { avx2::vec_dot_q4_0_f32_avx2(block, y) }
-        } else {
-            crate::quant::vec_dot_q4_0_f32_scalar(block, y)
+        use crate::backend::cpu_features::{CpuTier, cpu_features};
+        match cpu_features().tier {
+            CpuTier::Scalar => crate::quant::vec_dot_q4_0_f32_scalar(block, y),
+            // `Avx512` is only produced when the `avx512` feature is on; the
+            // gated arm matches the module's gate so the build is consistent
+            // either way (with it off, the tier folds into the AVX2 arm).
+            #[cfg(feature = "avx512")]
+            CpuTier::Avx512 => unsafe { avx512::vec_dot_q4_0_f32_avx512(block, y) },
+            _ => unsafe { avx2::vec_dot_q4_0_f32_avx2(block, y) },
         }
     }
 
@@ -1243,10 +2162,12 @@ pub fn vec_dot_q8_0_f32(block: &BlockQ8_0, y: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            unsafe { avx2::vec_dot_q8_0_f32_avx2(block, y) }
-        } else {
-            crate::quant::vec_dot_q8_0_f32_scalar(block, y)
+        use crate::backend::cpu_features::{CpuTier, cpu_features};
+        match cpu_features().tier {
+            CpuTier::Scalar => crate::quant::vec_dot_q8_0_f32_scalar(block, y),
+            #[cfg(feature = "avx512")]
+            CpuTier::Avx512 => unsafe { avx512::vec_dot_q8_0_f32_avx512(block, y) },
+            _ => unsafe { avx2::vec_dot_q8_0_f32_avx2(block, y) },
         }
     }
 
@@ -1266,10 +2187,10 @@ pub fn vec_dot_q4_k_m_f32(block: &BlockQ4KM, y: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            unsafe { avx2::vec_dot_q4_k_m_f32_avx2(block, y) }
-        } else {
-            crate::quant::vec_dot_q4_k_m_f32_scalar(block, y)
+        use crate::backend::cpu_features::{CpuTier, cpu_features};
+        match cpu_features().tier {
+            CpuTier::Scalar => crate::quant::vec_dot_q4_k_m_f32_scalar(block, y),
+            _ => unsafe { avx2::vec_dot_q4_k_m_f32_avx2(block, y) },
         }
     }
 

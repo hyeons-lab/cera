@@ -357,6 +357,10 @@ enum Command {
         model: String,
     },
 
+    /// Print the resolved CPU backend tier + detected SIMD features for this
+    /// host (no model required). Same line `inspect` shows under "CPU Backend".
+    Cpu,
+
     /// Interactive multi-turn chat REPL.
     ///
     /// Reads user messages from stdin one line at a time, renders
@@ -1932,6 +1936,14 @@ fn main() -> Result<()> {
         Command::Inspect { model } => {
             let gguf = cera::gguf::GgufFile::open(Path::new(&model))?;
             gguf.print_inspect();
+            println!();
+            println!("=== CPU Backend ===");
+            // Host capability + the SIMD tier the runtime resolved for it.
+            // Useful in bug reports to know which kernel path actually ran.
+            println!("{}", cera::cpu_features().report());
+        }
+        Command::Cpu => {
+            println!("{}", cera::cpu_features().report());
         }
         Command::Tokenize { model, text } => {
             let gguf = cera::gguf::GgufFile::open(Path::new(&model))?;

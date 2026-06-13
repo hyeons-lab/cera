@@ -1,6 +1,6 @@
 #![cfg_attr(
     target_arch = "aarch64",
-    feature(stdarch_neon_dotprod, stdarch_aarch64_prefetch)
+    feature(stdarch_neon_dotprod, stdarch_aarch64_prefetch, stdarch_neon_i8mm)
 )]
 
 /// Crate version, sourced from `Cargo.toml` at compile time. Useful
@@ -36,6 +36,7 @@ pub mod turboquant;
 // Canonical public re-exports for the stateful API. Consumers should
 // `use cera::{Session, ModalitySink, ...}` rather than reaching into
 // `cera::session::*`.
+pub use backend::cpu_features::{CpuFeatures, CpuTier, cpu_features, cpu_tier};
 pub use engine::{BackendPreference, CeraEngine, EngineConfig, ModelFiles, ModelMetadata};
 pub use session::{
     CeraError, FinishReason, GenerateOpts, GenerateSummary, ModalityCapabilities, ModalitySink,
