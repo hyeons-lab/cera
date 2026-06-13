@@ -47,7 +47,7 @@ Metal forward passes currently support **LFM2 only**; Qwen runs on CPU.
 | V2.12 CUDA backend | ⬜ | |
 | V2.13 Python (PyO3) bindings | ⬜ | |
 | V2.14 Kotlin Multiplatform bindings | ✅ | `cera-ffi-kotlin` (android + jvm) |
-| V2.17 Flutter / Dart bindings | ⬜ | spiked + `cera-ffi-flutter` scaffold landed; async/streaming codegen surface needs fixes |
+| V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync engine API verified end-to-end; streaming/async stubbed |
 | V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core shipped, CPU-only encode |
 | V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
 | V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync engine API verified end-to-end; streaming/async stubbed |
@@ -352,21 +352,31 @@ PyO3 bindings, `pip install cera-engine`.
 ### V2.14: Kotlin Multiplatform Bindings — 2-3 weeks ✅ DONE
 C ABI via cbindgen + platform-native FFI per KMP target (cinterop, Panama FFM, PanamaPort, JS interop).
 
-### V2.17: Flutter / Dart Bindings — 2-3 weeks ⬜ (spiked + scaffolded)
+### V2.17: Flutter / Dart Bindings — 2-3 weeks 🟡 (sync API working)
 Expose the engine to Flutter/Dart, reusing the existing `cera-ffi` UniFFI
 surface (the same C ABI that already backs Kotlin + Swift). The
-`cera-ffi-flutter` Dart package ships the generated bindings plus the prebuilt
-native libs (Android `.so` / iOS xcframework / desktop dylib).
+`cera-ffi-flutter` Dart package ships the generated+patched bindings plus a
+platform-aware native-library loader.
 
-**Scaffold landed:** `cera-ffi-flutter/` package skeleton — `pubspec.yaml`
-(`ffi` dep, SDK `^3.3.0`), a platform-aware `CeraLibrary.open()` loader
-(resolves the real `cera_ffi` cdylib and injects it, sidestepping the
-generator's `uniffi_cera_ffi` name default), public barrel, and a
-`just dart-bindings` recipe that runs `uniffi-bindgen-dart` into
-`lib/src/generated/`. The generated blob is gitignored (regenerated, not
-committed) until the codegen gaps below are resolved; the hand-written package
-code analyzes clean. Remaining: fix/shim the async+streaming surface, package
-prebuilt native libs per target, add an example app + Dart CI drift check.
+**Working (verified end-to-end):** the synchronous engine API round-trips real
+inference — loaded a Qwen2-0.5B GGUF through `CeraEngine.fromPath` →
+`newSession` → `appendText` → `generate` and got tokens back; `cpuBackendReport`
+and structured `FfiError` propagation also confirmed. Delivered:
+- `cera-ffi` gains an **`ffi-buffer`** cargo feature
+  (`uniffi/scaffolding-ffi-buffer-fns`) — the Dart generator calls
+  `uniffi_ffibuffer_*` trampolines UniFFI only emits under that flag.
+- `tool/patch_generated_bindings.dart` — deterministic, idempotent post-gen
+  fixups: corrects `rustbuffer`/`rust_future` symbol names + the `.ref.ptr`
+  union field, rewrites native-lib resolution (`CERA_FFI_LIB` + platform name),
+  synthesizes the `EngineConfig` record encoder, fixes the async-ctor return
+  type, and stubs the unsupported callback-sink methods.
+- `just dart-libs` / `dart-bindings` / `dart-bindings-check` recipes; committed
+  generated bindings (analyze clean); `example/cera_generate.dart`.
+
+**Remaining:** streaming/progress callbacks + `*Async` methods (generator can't
+lower callback interfaces yet — stubbed to throw); package prebuilt native libs
+per target (Android jniLibs / iOS xcframework / desktop); expose a detokenizer
+over FFI; example Flutter app + wire the Dart drift check into CI.
 
 **Spike result (2026-06-13, `uniffi-bindgen-dart` 0.1.3):** Viable but not
 turnkey. The generator builds against `uniffi_bindgen 0.31.1` (our exact

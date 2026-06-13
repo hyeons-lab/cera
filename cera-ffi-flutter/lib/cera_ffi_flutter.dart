@@ -28,7 +28,4 @@
 library cera_ffi_flutter;
 
 export 'src/library_loader.dart';
-
-// Uncomment once `just dart-bindings` has generated the file. Kept commented
-// so the committed scaffold analyzes cleanly without the generated artifact.
-// export 'src/generated/cera_ffi.dart';
+export 'src/generated/cera_ffi.dart';

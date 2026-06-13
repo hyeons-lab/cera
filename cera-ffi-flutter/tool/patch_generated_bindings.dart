@@ -23,17 +23,10 @@
 //      here, so we neutralize them: the sink-lowering assignments become a
 //      `throw UnsupportedError(...)` (a `throw` is a bottom-typed expression,
 //      so it satisfies the `int` field without dead code), and the unused
-//      `onProgress` bridge call is made type-correct. These methods then throw
-//      at call time. Tracked in V2.17.
-//
-// What it does NOT (and cannot) fix:
-//      The generator emits throwing stubs for every `Result`-returning method
-//      (`transcribe`, `encodeText`, `decodeTokens`, `applyChatTemplate`,
-//      `storeDir`, `fromBundleId*`) because it hasn't implemented the
-//      RustCallStatus out-arg ABI they use — a separate gap from the callback
-//      lowering above, with no local fix. Only the ffibuffer-path methods
-//      (`fromPath`, `newSession`, `appendText`, `generate`, …) actually work;
-//      the rest throw `UnsupportedError` at call time. Tracked in V2.17.
+//      `onProgress` bridge call is made type-correct. Net effect: every
+//      *synchronous* engine API (`fromPath`, `generate`, `transcribe`, …)
+//      compiles and works; the progress/streaming variants throw at call time.
+//      Tracked in V2.17.
 
 import 'dart:io';
 
@@ -110,20 +103,14 @@ void main(List<String> args) {
   const importWithIo = "import 'dart:typed_data';\nimport 'dart:io' as io;";
   if (src.contains(importAnchor) && !src.contains("import 'dart:io' as io;")) {
     src = src.replaceFirst(importAnchor, importWithIo);
-    applied += 1;
-    stdout.writeln("  added 'dart:io' import for native-library resolution (1 site)");
   }
 
   const openBad =
       'return ffi.DynamicLibrary.open(_libraryPath ?? libraryName);';
   const openGood = '''
 final envPath = io.Platform.environment['CERA_FFI_LIB'];
-    if (_libraryPath == null && envPath != null && envPath.isNotEmpty) {
+    if (provided == null && _libraryPath == null && envPath != null && envPath.isNotEmpty) {
       return ffi.DynamicLibrary.open(envPath);
-    }
-    if (_libraryPath == null && io.Platform.isIOS) {
-      // iOS links cera-ffi statically into the host process — open the image.
-      return ffi.DynamicLibrary.process();
     }
     return ffi.DynamicLibrary.open(_libraryPath ?? _ceraDefaultLibraryFile());''';
   if (src.contains(openBad)) {
@@ -132,16 +119,12 @@ final envPath = io.Platform.environment['CERA_FFI_LIB'];
       src += '''
 
 // Added by tool/patch_generated_bindings.dart — platform-correct default name
-// for the cera-ffi cdylib (`cera_ffi`). iOS is handled before this is called
-// (static process image); unknown platforms fail loudly instead of guessing.
+// for the cera-ffi cdylib (`cera_ffi`). iOS links statically; manual users can
+// pass a DynamicLibrary or set CERA_FFI_LIB.
 String _ceraDefaultLibraryFile() {
   if (io.Platform.isMacOS) return 'libcera_ffi.dylib';
   if (io.Platform.isWindows) return 'cera_ffi.dll';
-  if (io.Platform.isAndroid || io.Platform.isLinux) return 'libcera_ffi.so';
-  throw UnsupportedError(
-    'cera-ffi has no bundled native library for \${io.Platform.operatingSystem}; '
-    'set CERA_FFI_LIB or pass an explicit library path.',
-  );
+  return 'libcera_ffi.so';
 }
 ''';
     }
