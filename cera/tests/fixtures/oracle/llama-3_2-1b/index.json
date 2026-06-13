@@ -1,0 +1,31 @@
+{
+  "model_file": "Llama-3.2-1B-Instruct-Q8_0.gguf",
+  "llama_cpp_sha": "d8a24ccee207a1ff24c513fe1c7d3222b3ccd837",
+  "n_predict": 16,
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "fixture": "the-capital-of-france-is.json",
+      "n_tokens": 6,
+      "n_nodes": 342
+    },
+    {
+      "prompt": "def add(a, b):\n    return",
+      "fixture": "def-add-a-b-return.json",
+      "n_tokens": 9,
+      "n_nodes": 342
+    },
+    {
+      "prompt": "Hola, \u00bfc\u00f3mo est\u00e1s?",
+      "fixture": "hola-c-mo-est-s.json",
+      "n_tokens": 9,
+      "n_nodes": 342
+    },
+    {
+      "prompt": "1 + 2 + 3 =",
+      "fixture": "1-2-3.json",
+      "n_tokens": 9,
+      "n_nodes": 342
+    }
+  ]
+}

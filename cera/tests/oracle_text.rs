@@ -1,6 +1,9 @@
-//! Cross-implementation correctness gate for NEOX-rope text models (Qwen2,
-//! Qwen3) against golden fixtures generated from upstream llama.cpp on the *same*
-//! quantized GGUF (see `scripts/oracle/`).
+//! Cross-implementation correctness gate for the dense text models cera serves
+//! through `LlamaModel` — NEOX-rope (Qwen2, Qwen3) and NORM-rope (LLaMA, Mistral,
+//! Granite 3.x) — against golden fixtures generated from upstream llama.cpp on the
+//! *same* quantized GGUF (see `scripts/oracle/`). Granite additionally exercises
+//! the embedding/residual/attention/logit scalar multipliers (folded into the
+//! gated `l_out-{i}`, `embd`, and `result_output` sums).
 //!
 //! Iterates every fixture set under `tests/fixtures/oracle/<model>/`; each
 //! `index.json` names its `model_file`, looked up under `target/oracle/models/`
@@ -60,16 +63,22 @@ fn models_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/oracle/models")
 }
 
-/// Encode a prompt the same way the oracle did: byte-level BPE, prepending BOS
-/// only when the GGUF requests it (Qwen does not).
-fn encode_with_bos(tok: &BpeTokenizer, gguf: &GgufFile, prompt: &str) -> Vec<u32> {
+/// Encode a prompt the same way the oracle did: byte-level BPE, with a leading
+/// BOS to match llama.cpp's special-token prefixing.
+///
+/// cera's `encode()` does not prepend BOS — that's the Session / chat-template
+/// layer's job — so the harness adds it here to isolate BPE-merge parity. We
+/// detect whether this model adds BOS from the golden `want_tokens` (first token
+/// == this model's BOS id) rather than from `tokenizer.ggml.add_bos_token`: that
+/// metadata key is *absent* on some BPE GGUFs (e.g. `llama-bpe`), yet llama.cpp
+/// still prepends BOS by vocab-type default. Qwen's goldens don't start with BOS,
+/// so it stays BOS-free.
+fn encode_with_bos(tok: &BpeTokenizer, want_tokens: &[u32], prompt: &str) -> Vec<u32> {
     let mut tokens = Vec::new();
-    if tok.bos_token().is_some()
-        && gguf
-            .get_bool("tokenizer.ggml.add_bos_token")
-            .unwrap_or(false)
-    {
-        tokens.push(tok.bos_token().unwrap());
+    if let Some(bos) = tok.bos_token() {
+        if want_tokens.first() == Some(&bos) {
+            tokens.push(bos);
+        }
     }
     tokens.extend_from_slice(&tok.encode(prompt));
     tokens
@@ -112,15 +121,19 @@ fn check_model(fixture_dir: &std::path::Path) -> Option<Vec<String>> {
     // and localizes to the layer. The finer post-rope Q/K sums were evaluated as
     // gate nodes and rejected — rope rotation makes them cancel toward zero, so
     // their relative sum diff is a noisy checksum (>10% under pure Q8_0 noise).
-    let expected_op = |name: &str| -> &'static str {
+    // A cera-recorded node may map to one of a few llama.cpp ops depending on
+    // arch: Granite scales the embeddings and the logits, so its "embd" callback
+    // fires on a SCALE node (not GET_ROWS) and "result_output" on a SCALE node
+    // (not MUL_MAT). The first candidate present in the oracle wins.
+    let candidate_ops = |name: &str| -> &'static [&'static str] {
         if name == "embd" {
-            "GET_ROWS"
+            &["GET_ROWS", "SCALE"]
         } else if name.starts_with("l_out-") {
-            "ADD"
+            &["ADD"]
         } else if name == "result_norm" {
-            "MUL"
+            &["MUL"]
         } else if name == "result_output" {
-            "MUL_MAT"
+            &["MUL_MAT", "SCALE"]
         } else {
             panic!("unmapped oracle node name {name:?}")
         }
@@ -156,7 +169,7 @@ fn check_model(fixture_dir: &std::path::Path) -> Option<Vec<String>> {
             .collect();
 
         // Gate 1 — tokenizer parity.
-        let got_tokens = encode_with_bos(&tokenizer, &gguf, prompt);
+        let got_tokens = encode_with_bos(&tokenizer, &want_tokens, prompt);
         if got_tokens != want_tokens {
             failures.push(format!(
                 "[{fname}] tokenizer mismatch:\n    cera: {got_tokens:?}\n    llama:{want_tokens:?}"
@@ -191,9 +204,14 @@ fn check_model(fixture_dir: &std::path::Path) -> Option<Vec<String>> {
         let mut worst = 0.0f64;
         let mut checked = 0usize;
         for (name, &got) in &cera {
-            let op = expected_op(name);
-            let Some(&exp) = want.get(&(name.as_str(), op)) else {
-                failures.push(format!("[{fname}] oracle has no node ({name:?}, {op:?})"));
+            let ops = candidate_ops(name);
+            let Some((op, &exp)) = ops
+                .iter()
+                .find_map(|op| want.get(&(name.as_str(), *op)).map(|exp| (*op, exp)))
+            else {
+                failures.push(format!(
+                    "[{fname}] oracle has no node {name:?} with any op in {ops:?}"
+                ));
                 continue;
             };
             let d = rel_diff(got, exp);

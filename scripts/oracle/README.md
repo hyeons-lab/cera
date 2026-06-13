@@ -1,7 +1,10 @@
 # Text-model reference oracle
 
 Golden fixtures for validating cera's text-model forward pass against upstream
-llama.cpp, used by Phase A (Qwen2/Qwen3) model-correctness tests.
+llama.cpp. Covers both RoPE families cera serves through `LlamaModel`:
+NEOX-rope (Qwen2/Qwen3, Phase A) and NORM-rope (LLaMA/Mistral/Granite 3.x,
+Phase B). Granite also exercises its embedding/residual/attention/logit scalar
+multipliers (they fold into the gated `embd`/`l_out-{i}`/`result_output` sums).
 
 ## Design
 
@@ -33,12 +36,16 @@ scripts/oracle/vendor_llama_cpp.sh        # clone+build pinned llama.cpp (~targe
 # Fixture models (gitignored). Q8_0 — uniform, fully supported by cera, tightest
 # numeric match. NB: Qwen's "Q4_0" GGUFs store ffn_down as Q4_1, which cera
 # doesn't support; use Q8_0.
-hf download Qwen/Qwen2-0.5B-Instruct-GGUF qwen2-0_5b-instruct-q8_0.gguf --local-dir target/oracle/models
-hf download Qwen/Qwen3-0.6B-GGUF          Qwen3-0.6B-Q8_0.gguf          --local-dir target/oracle/models
+hf download Qwen/Qwen2-0.5B-Instruct-GGUF     qwen2-0_5b-instruct-q8_0.gguf     --local-dir target/oracle/models
+hf download Qwen/Qwen3-0.6B-GGUF              Qwen3-0.6B-Q8_0.gguf              --local-dir target/oracle/models
+hf download bartowski/Llama-3.2-1B-Instruct-GGUF   Llama-3.2-1B-Instruct-Q8_0.gguf   --local-dir target/oracle/models
+hf download bartowski/granite-3.1-2b-instruct-GGUF granite-3.1-2b-instruct-Q8_0.gguf --local-dir target/oracle/models
 
 # gen_fixtures.sh <model-gguf-basename> <fixture-subdir>
-scripts/oracle/gen_fixtures.sh qwen2-0_5b-instruct-q8_0.gguf qwen2-0_5b
-scripts/oracle/gen_fixtures.sh Qwen3-0.6B-Q8_0.gguf          qwen3-0_6b
+scripts/oracle/gen_fixtures.sh qwen2-0_5b-instruct-q8_0.gguf     qwen2-0_5b
+scripts/oracle/gen_fixtures.sh Qwen3-0.6B-Q8_0.gguf              qwen3-0_6b
+scripts/oracle/gen_fixtures.sh Llama-3.2-1B-Instruct-Q8_0.gguf   llama-3_2-1b
+scripts/oracle/gen_fixtures.sh granite-3.1-2b-instruct-Q8_0.gguf granite-3_1-2b
 ```
 
 The pinned llama.cpp SHA lives in `vendor_llama_cpp.sh`; bump it deliberately and
