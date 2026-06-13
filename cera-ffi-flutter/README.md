@@ -95,16 +95,18 @@ target (Android jniLibs, iOS xcframework, desktop bundles) is follow-up work.
 
 Tracked in `docs/IMPLEMENTATION_PLAN.md` → **V2.17**:
 
-- **Streaming / progress callbacks** (`generateStreaming`,
-  `generateStreamingAsync`, `BundleRepo.withProgress`) throw `UnsupportedError`.
-  The vendored generator (`third_party/uniffi-bindgen-dart/`) now lowers the
-  callback *argument* correctly and Rust does call back into the Dart sink, but
-  two receiving-bridge codegen bugs remain (vtable slot order + non-primitive
-  arg decode), so these are stubbed to throw rather than crash.
-- **Async methods** (`*Async`) hit the generator's unimplemented out-arg ABI.
+- **Streaming works.** `Session.generateStreaming(opts, sink)` delivers tokens
+  to a Dart `ModalitySink` (`onTextTokens` / `onAudioFrames` / `onDone`) — see
+  `example/cera_stream.dart`. The vendored generator
+  (`third_party/uniffi-bindgen-dart/`) carries four fixes for this: callback-arg
+  lowering, the vtable-init symbol, vtable slot ordering, and the RustBuffer
+  callback-arg ABI (to be upstreamed).
+- **`*Async` methods** (`generateAsync`, `generateStreamingAsync`,
+  `fromBundleIdAsync`) throw `UnsupportedError` — they need the async invocation
+  ABI, still unimplemented in the generator.
+- **`BundleRepo.withProgress`** is wired but unverified — stubbed to throw.
 - **No detokenizer** over FFI — `generate` returns token IDs.
 
-The generator is vendored under `third_party/uniffi-bindgen-dart/` with fixes
-(callback-arg lowering, vtable-init symbol) to be upstreamed to
-`nchapman/uniffi-bindgen-dart`. Finishing the receiving bridge unblocks
-streaming; `flutter_rust_bridge` remains a fallback for the streaming pieces.
+> The callback vtable's static `NativeCallable.isolateLocal`s keep the isolate
+> alive, so a CLI script must `exit()` explicitly (the example does); a Flutter
+> app stays running regardless.

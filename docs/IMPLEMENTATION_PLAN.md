@@ -47,7 +47,7 @@ Metal forward passes currently support **LFM2 only**; Qwen runs on CPU.
 | V2.12 CUDA backend | ⬜ | |
 | V2.13 Python (PyO3) bindings | ⬜ | |
 | V2.14 Kotlin Multiplatform bindings | ✅ | `cera-ffi-kotlin` (android + jvm) |
-| V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync engine API verified end-to-end; streaming/async stubbed |
+| V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync API + token streaming verified end-to-end; `*Async` stubbed |
 | V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core shipped, CPU-only encode |
 | V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
 | V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync engine API verified end-to-end; streaming/async stubbed |
@@ -352,7 +352,7 @@ PyO3 bindings, `pip install cera-engine`.
 ### V2.14: Kotlin Multiplatform Bindings — 2-3 weeks ✅ DONE
 C ABI via cbindgen + platform-native FFI per KMP target (cinterop, Panama FFM, PanamaPort, JS interop).
 
-### V2.17: Flutter / Dart Bindings — 2-3 weeks 🟡 (sync API working)
+### V2.17: Flutter / Dart Bindings — 2-3 weeks 🟡 (sync + streaming working)
 Expose the engine to Flutter/Dart, reusing the existing `cera-ffi` UniFFI
 surface (the same C ABI that already backs Kotlin + Swift). The
 `cera-ffi-flutter` Dart package ships the generated+patched bindings plus a
@@ -373,37 +373,34 @@ and structured `FfiError` propagation also confirmed. Delivered:
 - `just dart-libs` / `dart-bindings` / `dart-bindings-check` recipes; committed
   generated bindings (analyze clean); `example/cera_generate.dart`.
 
-**Streaming — vendored generator, calling side working, receiving bridge WIP.**
-`uniffi-bindgen-dart` 0.1.3 can't lower callback-interface *arguments*, so a
-streaming sink couldn't be passed to Rust. We vendored the generator
-(`third_party/uniffi-bindgen-dart/`, own workspace) and fixed:
-- **callback-arg lowering** — sink args now lower through `<Name>FfiCodec.lower`
-  (registers the Dart impl + installs the vtable), not a raw object write;
-- **foreign-trait vtable-init symbol** — was `<name>_trait_callback_init` (no
-  such export); now UniFFI's `uniffi_<ns>_fn_init_callback_vtable_<name>`.
-With these, `generate_streaming` reaches Rust and **Rust invokes the Dart
-`ModalitySink` back** (verified). Receiving-bridge status:
-1. **Vtable slot order — FIXED.** The generator sorted methods alphabetically,
+**Streaming — WORKING (verified end-to-end).** `generate_streaming(opts, sink)`
+delivers tokens to a Dart-implemented `ModalitySink`: a Qwen2-0.5B run produced
+24 `onTextTokens` callbacks + one `onDone(FinishReasonMaxTokens)`. Getting there
+required vendoring the generator (`third_party/uniffi-bindgen-dart/`, own
+workspace) and four codegen fixes — to be upstreamed to
+`nchapman/uniffi-bindgen-dart`:
+1. **Callback-arg lowering** — sink args lower via `<Name>FfiCodec.lower`
+   (registers the Dart impl + installs the vtable), not a raw object write — so
+   a sink can be passed *into* Rust.
+2. **Foreign-trait vtable-init symbol** — was `<name>_trait_callback_init` (no
+   such export); now UniFFI's `uniffi_<ns>_fn_init_callback_vtable_<name>`.
+3. **Vtable slot order** — the generator sorted methods alphabetically,
    misaligning slots vs Rust's declaration order; now preserved for callback
-   traits (ModalitySink vtable = `onTextTokens, onAudioFrames, onDone`).
-2. **Non-primitive callback arg ABI — remaining (a feature, not a bug).** The
-   generator uses a JSON-string ABI for complex callback args (records→JSON,
-   sequences→`jsonDecode`, enums→string, `Option<primitive>`→JSON), but stock
-   UniFFI passes a **RustBuffer** (by value) with binary serialization. cera's
-   `ModalitySink` (`Vec<u32>`/`Vec<f32>`/enum) hits the JSON path, which no
-   upstream golden fixture exercises against a real Rust ABI. Finishing streaming
-   means implementing the RustBuffer callback-arg ABI (map Sequence/Enum/Record/
-   `Option<primitive>` → `_UniFfiRustBuffer`, decode via the existing
-   `_UniFfiBinaryReader`/`_uniffiRead<T>`); touches shared callback mappers and
-   rewrites affected golden tests — its own focused effort + upstream PR.
-Until then, the streaming/progress entry points are stubbed to throw (no crash).
-All fixes to be upstreamed to `nchapman/uniffi-bindgen-dart`.
+   traits (`onTextTokens, onAudioFrames, onDone`).
+4. **RustBuffer callback-arg ABI** — the generator JSON-encoded complex callback
+   args (`Pointer<Utf8>`), but stock UniFFI passes a **RustBuffer by value**.
+   Added callback-specific FFI mappers (`map_callback_native/dart_ffi_type`,
+   scoped to callback bridges — the non-ffibuffer runtime path is untouched) +
+   RustBuffer decode via the existing `_UniFfiBinaryReader`/`_uniffiRead<T>`.
+   `Vec<u32>`/`Vec<f32>`/enum now decode correctly. 223 vendored tests pass
+   (incl. new callback-mapper tests).
 
-**Remaining:** the RustBuffer callback-arg ABI (then `generate_streaming` /
-`generate_streaming_async`); `*Async` invocation ABI (separate, larger); package
-prebuilt native libs per target (Android jniLibs / iOS xcframework / desktop);
-expose a detokenizer over FFI; example Flutter app + wire the Dart drift check
-into CI.
+**Remaining:** `*Async` methods (`generate_async`, `generate_streaming_async`,
+`fromBundleIdAsync`) still need the async invocation ABI (separate, larger —
+stubbed to throw); `BundleRepo.withProgress` (DownloadProgressSink) is wired but
+unverified (stubbed); package prebuilt native libs per target (Android jniLibs /
+iOS xcframework / desktop); expose a detokenizer over FFI; example Flutter app +
+wire the Dart drift check into CI; then the upstream PR.
 
 **Spike result (2026-06-13, `uniffi-bindgen-dart` 0.1.3):** Viable but not
 turnkey. The generator builds against `uniffi_bindgen 0.31.1` (our exact

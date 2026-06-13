@@ -693,12 +693,12 @@ fn render_trait_vtable_struct(
         for arg in &method.args {
             let arg_name = safe_dart_identifier(&to_lower_camel(&arg.name));
             let arg_native =
-                map_runtime_native_ffi_type(&arg.type_, records, enums).unwrap_or("ffi.Uint64");
+                map_callback_native_ffi_type(&arg.type_, records, enums).unwrap_or("ffi.Uint64");
             ffi_args.push(format!("{arg_native} {arg_name}"));
         }
         if let Some(return_type) = method.return_type.as_ref() {
             let out_type =
-                map_runtime_native_ffi_type(return_type, records, enums).unwrap_or("ffi.Uint64");
+                map_callback_native_ffi_type(return_type, records, enums).unwrap_or("ffi.Uint64");
             ffi_args.push(format!("ffi.Pointer<{out_type}> outReturn"));
         } else {
             ffi_args.push("ffi.Pointer<ffi.Void> outReturn".to_string());
@@ -802,8 +802,8 @@ fn render_trait_callback_bridge(
         for arg in &method.args {
             let arg_name = safe_dart_identifier(&to_lower_camel(&arg.name));
             let arg_native =
-                map_runtime_native_ffi_type(&arg.type_, records, enums).unwrap_or("ffi.Uint64");
-            let arg_dart = map_runtime_dart_ffi_type(&arg.type_, records, enums).unwrap_or("int");
+                map_callback_native_ffi_type(&arg.type_, records, enums).unwrap_or("ffi.Uint64");
+            let arg_dart = map_callback_dart_ffi_type(&arg.type_, records, enums).unwrap_or("int");
             ffi_args.push(format!("{arg_native} {arg_name}"));
             dart_args.push(format!("{arg_dart} {arg_name}"));
             callback_args.push(render_callback_arg_decode_expr(
@@ -817,7 +817,7 @@ fn render_trait_callback_bridge(
 
         if let Some(return_type) = method.return_type.as_ref() {
             let out_type =
-                map_runtime_native_ffi_type(return_type, records, enums).unwrap_or("ffi.Uint64");
+                map_callback_native_ffi_type(return_type, records, enums).unwrap_or("ffi.Uint64");
             ffi_args.push(format!("ffi.Pointer<{out_type}> outReturn"));
             dart_args.push(format!("ffi.Pointer<{out_type}> outReturn"));
         } else {

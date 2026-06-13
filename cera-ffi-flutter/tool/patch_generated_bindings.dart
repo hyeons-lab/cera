@@ -64,40 +64,25 @@ void main(List<String> args) {
     stdout.writeln('  fixed fromBundleIdAsync return type (1 site)');
   }
 
-  // Fix 3: streaming / progress entry points. The vendored generator now lowers
-  // callback-interface ARGUMENTS correctly (registers the Dart callback +
-  // installs the vtable), so Rust does invoke back into Dart. But the receiving
-  // bridge codegen still has two bugs for these interfaces — the vtable slot
-  // order is alphabetical instead of declaration order, and non-primitive
-  // callback args (Vec<u32>/Vec<f32>/enum) are typed as Pointer<Utf8> instead of
-  // RustBuffer — so an actual stream crashes. Until those are fixed (V2.17),
-  // stub the public entry points to throw a clear error rather than crash.
+  // Fix 3: stub the entry points that still aren't usable. Sync
+  // `generate_streaming` works now (vtable order + RustBuffer callback-arg ABI
+  // are fixed in the vendored generator), so it is NO LONGER stubbed. The
+  // `*Async` variants still hit the generator's unimplemented async out-arg ABI,
+  // and `BundleRepo.withProgress` (DownloadProgressSink) isn't verified yet, so
+  // those stay stubbed to throw a clear error rather than misbehave. See V2.17.
   const methodStubs = <String, String>{
-    'return _ffi.sessionInvokeGenerateStreaming(_handle, opts, sink);':
-        "throw UnsupportedError('generate_streaming is not yet usable via the Dart bindings: the callback receiving-bridge (vtable slot order + non-primitive arg decode) is still WIP (V2.17).');",
     'return _ffi.sessionInvokeGenerateStreamingAsync(_handle, opts, sink);':
-        "throw UnsupportedError('generate_streaming_async is not yet usable via the Dart bindings (V2.17 receiving-bridge WIP).');",
+        "throw UnsupportedError('generate_streaming_async is not yet usable via the Dart bindings (async out-arg ABI WIP, V2.17).');",
     'return _bindings().bundleRepoCreateWithProgress(storeDir, progress);':
-        "throw UnsupportedError('BundleRepo.withProgress is not yet usable via the Dart bindings (V2.17 receiving-bridge WIP).');",
+        "throw UnsupportedError('BundleRepo.withProgress is not yet usable via the Dart bindings (V2.17).');",
   };
   methodStubs.forEach((bad, good) {
     if (src.contains(bad)) {
       src = src.replaceAll(bad, good);
       applied += 1;
-      stdout.writeln('  stubbed streaming/progress entry point');
+      stdout.writeln('  stubbed unsupported entry point');
     }
   });
-
-  // The `onProgress` bridge passes a `Pointer<Utf8>` where `int?` is expected.
-  // The bridge is unreachable once the sink registration above throws, so we
-  // just make it type-check by passing null.
-  const bridgeBad = ', bytesDownloaded, totalBytes);';
-  const bridgeGood = ', bytesDownloaded, null);';
-  if (src.contains(bridgeBad)) {
-    src = src.replaceAll(bridgeBad, bridgeGood);
-    applied += 1;
-    stdout.writeln('  fixed onProgress bridge arg type (1 site)');
-  }
 
   // Fix 4: native-library resolution. The generator emits a single
   // `libraryName = 'uniffi_cera_ffi'` and `DynamicLibrary.open(libraryName)`,

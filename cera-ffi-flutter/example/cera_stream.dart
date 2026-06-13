@@ -6,6 +6,8 @@
 //   cd cera-ffi-flutter
 //   CERA_FFI_LIB=../target/debug/libcera_ffi.dylib \
 //     dart run example/cera_stream.dart /path/to/model.gguf "Once upon a time"
+import 'dart:io' show exit;
+
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
 
 /// Collects streamed tokens as Rust pushes them across the FFI boundary.
@@ -79,4 +81,9 @@ void main(List<String> args) {
 
   print('done: ${sink.tokens.length} tokens over ${sink.batches} callback batches, '
       'finish=${sink.finish}, decode=${summary.decodeMs}ms');
+
+  // The callback vtable's static `NativeCallable.isolateLocal`s keep the isolate
+  // alive, so a CLI script won't exit on its own. A real Flutter app stays
+  // running anyway; here we exit explicitly.
+  exit(0);
 }

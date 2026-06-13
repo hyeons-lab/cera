@@ -560,6 +560,62 @@ pub(super) fn map_runtime_dart_ffi_type(
     }
 }
 
+/// FFI type for a value crossing a **callback** boundary (foreign-trait /
+/// callback-interface vtable arg or return). UniFFI passes String / Sequence /
+/// Enum / Record / Option<non-object> as a `RustBuffer` BY VALUE (binary-
+/// serialized) — confirmed against the Kotlin/Swift reference bindings, where
+/// these args are `RustBuffer.ByValue`. Primitives and object handles stay
+/// scalar. This is intentionally separate from `map_runtime_*_ffi_type` (used by
+/// the non-ffibuffer runtime path, where String marshals as `Pointer<Utf8>`),
+/// so the change is scoped to callback bridges only. For a by-value struct the
+/// native and Dart sides use the same type, so one function serves both.
+/// True for the callback arg/return types that cross the boundary as a
+/// `RustBuffer` by value (must match `render_callback_arg_decode_expr`). Bytes /
+/// Map keep their existing runtime mapping; Object / Optional<Object> stay
+/// scalar handles.
+fn is_callback_rustbuffer_type(type_: &Type) -> bool {
+    let t = if let Type::Custom { builtin, .. } = type_ {
+        builtin.as_ref()
+    } else {
+        type_
+    };
+    match t {
+        Type::String | Type::Sequence { .. } | Type::Record { .. } | Type::Enum { .. } => true,
+        Type::Optional { .. } => {
+            !is_runtime_optional_object_type(t) && !is_runtime_optional_bytes_type(t)
+        }
+        _ => false,
+    }
+}
+
+/// Native-side FFI type for a callback vtable arg/return. RustBuffer-by-value for
+/// the complex families; otherwise the standard native marker. Scoped to callback
+/// bridges (the non-ffibuffer runtime path keeps `map_runtime_native_ffi_type`).
+pub(super) fn map_callback_native_ffi_type(
+    type_: &Type,
+    records: &[UdlRecord],
+    enums: &[UdlEnum],
+) -> Option<&'static str> {
+    if is_callback_rustbuffer_type(type_) {
+        return Some("_UniFfiRustBuffer");
+    }
+    map_runtime_native_ffi_type(type_, records, enums)
+}
+
+/// Dart-side type for a callback vtable arg/return (the `NativeCallable` closure
+/// parameter). Same RustBuffer struct as the native side for by-value families;
+/// otherwise the Dart scalar (`int`/`double`/`bool`).
+pub(super) fn map_callback_dart_ffi_type(
+    type_: &Type,
+    records: &[UdlRecord],
+    enums: &[UdlEnum],
+) -> Option<&'static str> {
+    if is_callback_rustbuffer_type(type_) {
+        return Some("_UniFfiRustBuffer");
+    }
+    map_runtime_dart_ffi_type(type_, records, enums)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,6 +877,59 @@ mod tests {
         assert_eq!(
             map_runtime_native_ffi_type(&t, &[], &[]),
             Some("ffi.Pointer<Utf8>")
+        );
+    }
+
+    // ── callback FFI mappers (RustBuffer-by-value ABI) ──────────────────
+
+    #[test]
+    fn callback_ffi_string_is_rustbuffer() {
+        // Both native and Dart sides see the struct by value.
+        assert_eq!(
+            map_callback_native_ffi_type(&Type::String, &[], &[]),
+            Some("_UniFfiRustBuffer")
+        );
+        assert_eq!(
+            map_callback_dart_ffi_type(&Type::String, &[], &[]),
+            Some("_UniFfiRustBuffer")
+        );
+    }
+
+    #[test]
+    fn callback_ffi_sequence_is_rustbuffer() {
+        let t = Type::Sequence {
+            inner_type: Box::new(Type::UInt32),
+        };
+        assert_eq!(
+            map_callback_native_ffi_type(&t, &[], &[]),
+            Some("_UniFfiRustBuffer")
+        );
+    }
+
+    #[test]
+    fn callback_ffi_primitive_stays_scalar() {
+        // Primitives are NOT RustBuffer: native marker on one side, Dart scalar
+        // on the other (this split is why the closure params type-check).
+        assert_eq!(
+            map_callback_native_ffi_type(&Type::UInt32, &[], &[]),
+            Some("ffi.Uint32")
+        );
+        assert_eq!(
+            map_callback_dart_ffi_type(&Type::UInt32, &[], &[]),
+            Some("int")
+        );
+    }
+
+    #[test]
+    fn callback_ffi_object_stays_handle() {
+        let t = Type::Object {
+            name: "Sink".into(),
+            module_path: "".into(),
+            imp: ObjectImpl::Struct,
+        };
+        assert_eq!(
+            map_callback_native_ffi_type(&t, &[], &[]),
+            Some("ffi.Uint64")
         );
     }
 

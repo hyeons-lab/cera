@@ -122,7 +122,7 @@ pub(super) fn render_callback_bridges(
             let mut ffi_args = vec!["ffi.Uint64 handle".to_string()];
             for arg in &method.args {
                 let arg_name = safe_dart_identifier(&to_lower_camel(&arg.name));
-                let arg_native = map_runtime_native_ffi_type(&arg.type_, records, enums)
+                let arg_native = map_callback_native_ffi_type(&arg.type_, records, enums)
                     .expect("validated runtime callback arg type");
                 ffi_args.push(format!("{arg_native} {arg_name}"));
             }
@@ -139,7 +139,7 @@ pub(super) fn render_callback_bridges(
                 );
             } else {
                 if let Some(return_type) = method.return_type.as_ref() {
-                    let out_type = map_runtime_native_ffi_type(return_type, records, enums)
+                    let out_type = map_callback_native_ffi_type(return_type, records, enums)
                         .expect("validated runtime callback return type");
                     ffi_args.push(format!("ffi.Pointer<{out_type}> outReturn"));
                 } else {
@@ -240,9 +240,9 @@ pub(super) fn render_callback_bridges(
             let mut callback_args = Vec::new();
             for arg in &method.args {
                 let arg_name = safe_dart_identifier(&to_lower_camel(&arg.name));
-                let arg_native = map_runtime_native_ffi_type(&arg.type_, records, enums)
+                let arg_native = map_callback_native_ffi_type(&arg.type_, records, enums)
                     .expect("validated runtime callback arg type");
-                let arg_dart = map_runtime_dart_ffi_type(&arg.type_, records, enums)
+                let arg_dart = map_callback_dart_ffi_type(&arg.type_, records, enums)
                     .expect("validated runtime callback arg type");
                 ffi_args.push(format!("{arg_native} {arg_name}"));
                 dart_args.push(format!("{arg_dart} {arg_name}"));
@@ -416,7 +416,7 @@ pub(super) fn render_callback_bridges(
                 out.push_str("    }();\n");
             } else {
                 if let Some(return_type) = method.return_type.as_ref() {
-                    let out_type = map_runtime_native_ffi_type(return_type, records, enums)
+                    let out_type = map_callback_native_ffi_type(return_type, records, enums)
                         .expect("validated runtime callback return type");
                     ffi_args.push(format!("ffi.Pointer<{out_type}> outReturn"));
                     dart_args.push(format!("ffi.Pointer<{out_type}> outReturn"));
@@ -853,42 +853,13 @@ pub(super) fn render_callback_arg_decode_expr(
     custom_types: &HashMap<String, CustomTypeConfig>,
 ) -> String {
     let type_ = runtime_unwrapped_type(original_type);
+    // Complex callback args arrive as a `_UniFfiRustBuffer` by value (UniFFI's
+    // ABI; see map_runtime_*_ffi_type). Build a binary reader over its bytes and
+    // deserialize with the same big-endian format UniFFI uses for records.
+    let reader = format!("_UniFfiBinaryReader({arg_name}.data.asTypedList({arg_name}.len))");
     let builtin_expr = match type_ {
-        Type::String => format!(
-            "{arg_name} == ffi.nullptr ? (throw StateError('Rust passed null string callback arg')) : {arg_name}.toDartString()"
-        ),
-        Type::Optional { inner_type } if is_runtime_string_type(inner_type) => {
-            format!("{arg_name} == ffi.nullptr ? null : {arg_name}.toDartString()")
-        }
-        Type::Record { .. } if records
-            .iter()
-            .any(|r| record_name_from_type(type_) == Some(r.name.as_str())) =>
-        {
-            let record_name = record_name_from_type(type_).unwrap_or("Record");
-            format!(
-                "{arg_name} == ffi.nullptr ? (throw StateError('Rust passed null record callback arg')) : {}.fromJson(jsonDecode({arg_name}.toDartString()) as Map<String, dynamic>)",
-                to_upper_camel(record_name)
-            )
-        }
-        Type::Enum { .. } if is_runtime_enum_type(type_, enums) => {
-            let enum_name = enum_name_from_type(type_).unwrap_or("Enum");
-            format!(
-                "{arg_name} == ffi.nullptr ? (throw StateError('Rust passed null enum callback arg')) : {}FfiCodec.decode({arg_name}.toDartString())",
-                to_upper_camel(enum_name)
-            )
-        }
-        Type::Sequence { inner_type } if is_runtime_sequence_json_type(type_) => {
-            let inner_decode = render_json_decode_expr("item", inner_type, custom_types);
-            format!(
-                "{arg_name} == ffi.nullptr ? (throw StateError('Rust passed null sequence callback arg')) : (jsonDecode({arg_name}.toDartString()) as List).map((item) => {inner_decode}).toList()"
-            )
-        }
-        Type::Object { name, .. } => {
-            format!(
-                "{}FfiCodec.lift({arg_name})",
-                to_upper_camel(name)
-            )
-        }
+        // Scalars / handles passed directly (not via RustBuffer).
+        Type::Object { name, .. } => format!("{}FfiCodec.lift({arg_name})", to_upper_camel(name)),
         Type::Optional { inner_type } if is_runtime_object_type(inner_type) => {
             let name = object_name_from_type(inner_type)
                 .expect("is_runtime_object_type guarantees Object inner");
@@ -897,19 +868,94 @@ pub(super) fn render_callback_arg_decode_expr(
                 to_upper_camel(name)
             )
         }
-        Type::Bytes => {
-            format!(
-                "{arg_name} == ffi.nullptr ? (throw StateError('Rust passed null bytes callback arg')) : base64Decode({arg_name}.toDartString())"
-            )
-        }
         Type::Timestamp => {
             format!("DateTime.fromMicrosecondsSinceEpoch({arg_name}, isUtc: true)")
         }
         Type::Duration => format!("Duration(microseconds: {arg_name})"),
+
+        // RustBuffer-backed types. A top-level String is the raw UTF-8 of the
+        // buffer (no length prefix); everything else is UniFFI-serialized.
+        Type::String => {
+            format!("utf8.decode({arg_name}.data.asTypedList({arg_name}.len))")
+        }
+        Type::Enum { .. } if is_runtime_enum_type(type_, enums) => {
+            let enum_name = enum_name_from_type(type_).unwrap_or("Enum");
+            format!("_uniffiRead{}({reader})", to_upper_camel(enum_name))
+        }
+        Type::Record { .. }
+            if records
+                .iter()
+                .any(|r| record_name_from_type(type_) == Some(r.name.as_str())) =>
+        {
+            let record_name = record_name_from_type(type_).unwrap_or("Record");
+            format!("_uniffiRead{}({reader})", to_upper_camel(record_name))
+        }
+        Type::Sequence { inner_type } => {
+            let elem =
+                render_runtime_reader_read_expr("r", inner_type, records, enums, custom_types);
+            format!(
+                "(() {{ final r = {reader}; final n = r.readI32(); return List.generate(n, (_) => {elem}); }})()"
+            )
+        }
+        Type::Optional { inner_type } => {
+            let inner =
+                render_runtime_reader_read_expr("r", inner_type, records, enums, custom_types);
+            format!("(() {{ final r = {reader}; return r.readI8() == 0 ? null : {inner}; }})()")
+        }
         _ => arg_name.to_string(),
     };
     // Apply lift template if the original type is Custom (stripped by runtime_unwrapped_type above).
     lift_custom_if_needed(&builtin_expr, original_type, custom_types)
+}
+
+/// Render an expression that reads ONE value of `type_` from a
+/// `_UniFfiBinaryReader` named `reader` (used for sequence elements and the
+/// payload of an optional in the callback-arg RustBuffer ABI).
+pub(super) fn render_runtime_reader_read_expr(
+    reader: &str,
+    type_: &Type,
+    records: &[UdlRecord],
+    enums: &[UdlEnum],
+    custom_types: &HashMap<String, CustomTypeConfig>,
+) -> String {
+    let t = runtime_unwrapped_type(type_);
+    let expr = match t {
+        Type::UInt8 => format!("{reader}.readU8()"),
+        Type::Int8 => format!("{reader}.readI8()"),
+        Type::UInt16 => format!("{reader}.readU16()"),
+        Type::Int16 => format!("{reader}.readI16()"),
+        Type::UInt32 => format!("{reader}.readU32()"),
+        Type::Int32 => format!("{reader}.readI32()"),
+        Type::UInt64 => format!("{reader}.readU64()"),
+        Type::Int64 => format!("{reader}.readI64()"),
+        Type::Float32 => format!("{reader}.readF32()"),
+        Type::Float64 => format!("{reader}.readF64()"),
+        Type::Boolean => format!("{reader}.readBool()"),
+        Type::String => format!("{reader}.readString()"),
+        Type::Enum { .. } if is_runtime_enum_type(t, enums) => {
+            format!(
+                "_uniffiRead{}({reader})",
+                to_upper_camel(enum_name_from_type(t).unwrap_or("Enum"))
+            )
+        }
+        Type::Record { .. }
+            if records
+                .iter()
+                .any(|r| record_name_from_type(t) == Some(r.name.as_str())) =>
+        {
+            format!(
+                "_uniffiRead{}({reader})",
+                to_upper_camel(record_name_from_type(t).unwrap_or("Record"))
+            )
+        }
+        Type::Object { name, .. } => {
+            format!("{}FfiCodec.lift({reader}.readU64())", to_upper_camel(name))
+        }
+        // Fallback: read a u64 (keeps generation total; not hit for the runtime
+        // callback types Cera uses — primitives/sequences/enums).
+        _ => format!("{reader}.readU64()"),
+    };
+    lift_custom_if_needed(&expr, type_, custom_types)
 }
 
 pub(super) fn render_callback_return_encode_expr(
