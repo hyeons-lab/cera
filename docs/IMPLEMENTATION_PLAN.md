@@ -4,6 +4,57 @@ A Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
 ---
 
+## Implementation Status (updated 2026-06-13)
+
+V1 is complete, and the project has since grown well beyond the original
+roadmap into **multimodal** territory (vision, audio, TTS) that this plan never
+anticipated. The status legend below uses ✅ done · 🟡 partial · ⬜ not started.
+
+**V1 (Phases 0–6):** ✅ complete. CPU (SIMD + runtime feature dispatch + BLAS),
+wgpu GPU backend, Metal backend, GGUF parser, BPE tokenizer, sampler, KV cache,
+generation engine, HF bundle download, interactive chat TUI, and bench command
+all shipped. Architecture coverage is `lfm2`, `qwen2`, `qwen3` (Qwen runs on the
+LLaMA code path). **Not yet wired:** the bare `llama` arch string and the
+Mistral / Gemma / Phi3 variants named in Phase 4 — the code path exists but
+those arch strings aren't dispatched. GPU (wgpu) and Metal forward passes
+currently support **LFM2 only**; Qwen runs on CPU.
+
+**Beyond the V1 plan (off-roadmap, shipped):**
+- LFM2-VL **vision** encoder + preprocessor (image → embeddings)
+- LFM2-Audio **audio** encoder/decoder + preprocessor (PCM → embeddings, ASR)
+- **TTS** generation
+- **WASM** build (threaded via wasm-bindgen-rayon + wgpu-on-wasm) — this is V2.2
+- Kotlin Multiplatform FFI (`cera-ffi-kotlin`: android + jvm) — this is V2.14
+
+**V2 status at a glance:**
+
+| Item | Status | Notes |
+|------|--------|-------|
+| V2.1 Server + continuous batching | ⬜ | no HTTP server, KV cache still contiguous (not paged) |
+| V2.2 Browser / WASM | ✅ | `cera-wasm`, threads, wgpu-on-wasm |
+| V2.3 Structured output (GBNF) | ⬜ | |
+| V2.4 KV cache serialization (.lmkv) | ⬜ | |
+| V2.5 Prefix caching (radix) | ⬜ | |
+| V2.5b TurboQuant KV compression | ✅ | `cera/src/turboquant.rs` |
+| V2.6 More quant formats | 🟡 | Q6_K added; Q2/Q3/Q5_K, IQ, GPTQ, AWQ, FP8 remain |
+| V2.7 Per-shape kernel tuning | ⬜ | no `cera tune` / autotune |
+| V2.8 Speculative decoding | ⬜ | |
+| V2.9 LoRA adapters | ⬜ | |
+| V2.10 MoE support | ⬜ | |
+| V2.11 Multi-GPU | ⬜ | |
+| V2.12 CUDA backend | ⬜ | |
+| V2.13 Python (PyO3) bindings | ⬜ | |
+| V2.14 Kotlin Multiplatform bindings | ✅ | `cera-ffi-kotlin` (android + jvm) |
+| V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core done, CPU-only encode |
+| V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core done, Metal-only decode accel |
+
+**Tally:** original V2 — 3 done (2.2, 2.5b, 2.14), 1 partial (2.6), 11 remaining.
+Plus 2 off-roadmap multimodal tracks shipped (V2.15 Vision, V2.16 Audio/TTS).
+The largest untouched buckets are the **production server stack** (2.1/2.4/2.5)
+and **decode-speed work** (2.7/2.8).
+
+---
+
 ## Guiding Principles
 
 1. **Build for the hard case first.** LFM2's hybrid conv+attention architecture is more complex than LLaMA. If the abstractions handle LFM2, every pure-transformer model falls out for free.
@@ -145,7 +196,7 @@ A Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
 ---
 
-## Phase 3: LFM2 Forward Pass
+## Phase 3: LFM2 Forward Pass ✅
 **Time: 7-10 days**
 
 Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
@@ -186,19 +237,28 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 
 ---
 
-## Phase 4: LLaMA + Additional Architectures
+## Phase 4: LLaMA + Additional Architectures 🟡
 **Time: 3-5 days**
 
 ```
-4.1  model/llama.rs — LLaMA is all-attention blocks.
-4.2  Architecture variants: mistral, qwen2, gemma, phi3
+4.1  model/llama.rs — LLaMA is all-attention blocks.            ✅ (shared path)
+4.2  Architecture variants: mistral, qwen2, gemma, phi3         🟡 qwen2/qwen3 only
 4.3  Test each on a real GGUF. Greedy decoding matches llama.cpp.
 ```
 
+> Status: the LLaMA code path is implemented and serves `qwen2`/`qwen3`. The bare
+> `llama` arch string and the `mistral`/`gemma`/`phi3` variants are not yet
+> dispatched in `model/mod.rs`. Verified vs llama.cpp for Qwen2/Qwen3 (NEOX RoPE).
+
 ---
 
-## Phase 5: wgpu GPU Backend
+## Phase 5: wgpu GPU Backend ✅
 **Time: 10-14 days**
+
+> Status: wgpu backend shipped (matmul, quantized GEMM/GEMV, rmsnorm, silu, rope,
+> softmax, attention, conv1d, element-wise) plus a separate **Metal** backend and
+> shader preprocessor. GPU forward pass currently supports **LFM2 only**; runs on
+> wasm as well. Subgroup variants implemented with small-subgroup adapter support.
 
 ```
 5.1  backend/wgpu.rs — Device init, buffer pool, weight upload.
@@ -217,17 +277,21 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 
 ---
 
-## Phase 6: Polish v1 for Release
+## Phase 6: Polish v1 for Release ✅
 **Time: 3-5 days**
 
 ```
-6.1  HuggingFace model download: cera run -m LiquidAI/LFM2.5-1.2B-Instruct
-6.2  Interactive chat mode: cera chat -m model.gguf
-6.3  Benchmark command: cera bench -m model.gguf
-6.4  Correctness: perplexity on WikiText-2 for Q4_K_M and Q8_0
-6.5  CI + static binary releases (Linux, macOS, Windows)
-6.6  README with benchmarks, install instructions, supported models
+6.1  HuggingFace model download (bundle system: list/download/bundle cmds)   ✅
+6.2  Interactive chat mode: cera chat (TUI)                                  ✅
+6.3  Benchmark command: cera bench                                           ✅
+6.4  Correctness: perplexity / parity harness vs llama.cpp                   ✅
+6.5  CI + static binary releases (Linux, macOS, Windows)                     ✅
+6.6  README with benchmarks, install instructions, supported models          ✅
 ```
+
+> Note: model distribution is handled via the **bundle** system
+> (`list-bundles`, `download-bundles`, `bundle`) rather than a bare
+> `cera run -m <hf-id>` form.
 
 ---
 
@@ -239,50 +303,92 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 
 Ordered by estimated impact. Many can be worked in parallel.
 
-### V2.1: Server + Continuous Batching — 3-4 weeks
+### V2.1: Server + Continuous Batching — 3-4 weeks ⬜
 OpenAI-compatible HTTP server (axum + SSE), continuous batching scheduler, paged attention (replaces contiguous KV cache), request queue, Prometheus metrics, preemption.
 
-### V2.2: Browser / WASM — 3-4 weeks (parallel with V2.1)
+### V2.2: Browser / WASM — 3-4 weeks ✅ DONE
 WASM build (dual: threaded + single-threaded), wasm-bindgen-rayon for multi-threaded CPU, Web Worker architecture, OPFS model caching, JS API + npm package, Chrome enhanced (subgroups, dot4U8Packed, f16), Safari baseline (f16, standard WGSL), feature detection.
 
-### V2.3: Structured Output — 1-2 weeks
+### V2.3: Structured Output — 1-2 weeks ⬜
 GBNF grammar parser, JSON schema → grammar compiler, regex constraints, async FSM mask computation overlapped with forward pass.
 
-### V2.4: KV Cache Serialization — 1-2 weeks
+### V2.4: KV Cache Serialization — 1-2 weeks ⬜
 Serialize KV cache + conv buffers to .lmkv files, system prompt caching, conversation checkpointing, KV quantization for storage.
 
-### V2.5: Prefix Caching (Radix Attention) — 1-2 weeks
+### V2.5: Prefix Caching (Radix Attention) — 1-2 weeks ⬜
 Radix tree for in-memory prefix matching, LRU eviction, scheduler integration. 5-6x speedup on prefix-heavy workloads.
 
-### V2.5b: TurboQuant KV Cache Compression — 1-2 weeks
+### V2.5b: TurboQuant KV Cache Compression — 1-2 weeks ✅ DONE
 Google Research's data-oblivious KV cache compression (ICLR 2026). Compresses KV cache to 3-3.5 bits with zero accuracy loss.
 
-### V2.6: More Quantization Formats — 1 week per format
+### V2.6: More Quantization Formats — 1 week per format 🟡 PARTIAL (Q6_K done)
 Q2_K through Q6_K, IQ quants, GPTQ, AWQ, FP8, in-situ quantization.
 
-### V2.7: Per-Shape Kernel Tuning (GEMV/MMVQ) — 1-2 weeks
+### V2.7: Per-Shape Kernel Tuning (GEMV/MMVQ) — 1-2 weeks ⬜
 Profile-guided kernel optimization for quantized decode (batch=1 GEMV). Instead of using one-size-fits-all thread/block configs for all layers, profile each unique (quant_type, N, K) shape on the target GPU and apply optimal nwarps/rows_per_block at runtime. Inspired by [kernel-anvil](https://github.com/apollosenvy/kernel-anvil) which demonstrated 2.25x decode speedup on Qwen3.5-27B Q4_K_M (12→27 tok/s on RX 7900 XTX) by auto-tuning llama.cpp's MMVQ kernels per model shape. Key insight: a 1024-row GQA projection and a 17408-row FFN layer have very different optimal configs. The bottleneck classification (bandwidth-bound vs occupancy-limited vs compute-bound) determines the sweep strategy. For cera: implement shape-aware dispatch in wgpu compute shaders (WGSL workgroup size, rows per invocation) and optionally in CPU SIMD (loop tiling). Store per-model configs as JSON; profile on first run or via `cera tune` command.
 
-### V2.8: Speculative Decoding — 1-2 weeks
+### V2.8: Speculative Decoding — 1-2 weeks ⬜
 Draft model + verification, self-speculative. 1.3-2x decode speedup.
 
-### V2.9: LoRA Adapters — 1-2 weeks
+### V2.9: LoRA Adapters — 1-2 weeks ⬜
 Runtime LoRA loading, merge/unmerge, per-request LoRA selection.
 
-### V2.10: MoE Support — 2-3 weeks
+### V2.10: MoE Support — 2-3 weeks ⬜
 Top-K expert routing for Mixtral, LFM2-8B-A1B, LFM2-24B-A2B.
 
-### V2.11: Multi-GPU — 3-4 weeks
+### V2.11: Multi-GPU — 3-4 weeks ⬜
 Pipeline parallelism, tensor parallelism, CPU offloading.
 
-### V2.12: CUDA Backend — 3-4 weeks
+### V2.12: CUDA Backend — 3-4 weeks ⬜
 Optional cuBLAS + FlashAttention + CUDA graphs. Requires nvcc.
 
-### V2.13: Python Bindings — 1-2 weeks
+### V2.13: Python Bindings — 1-2 weeks ⬜
 PyO3 bindings, `pip install cera-engine`.
 
-### V2.14: Kotlin Multiplatform Bindings — 2-3 weeks
+### V2.14: Kotlin Multiplatform Bindings — 2-3 weeks ✅ DONE
 C ABI via cbindgen + platform-native FFI per KMP target (cinterop, Panama FFM, PanamaPort, JS interop).
+
+---
+
+## Multimodal (off original roadmap — added retroactively)
+
+These tracks were not in the original V1/V2 plan but have been built out to
+support the LFM2-VL and LFM2-Audio model families. Documented here so the
+roadmap reflects what actually exists.
+
+### V2.15: Vision (LFM2-VL) — ✅ DONE (core), 🟡 architecture coverage
+Image → text via a CLIP-family ViT encoder with a 2-layer MLP projector
+(`PROJECTOR_TYPE_LFM2`). Shipped:
+- `model/vision_encoder.rs` — ViT encoder weights + tensor mapping, loaded from
+  the `multimodal_projector` GGUF in a VL bundle (`mmproj-*.gguf`). Verified
+  against LFM2.5-VL-450M.
+- `model/vision_preprocessor.rs` — PNG/JPEG decode → aspect-preserving dynamic
+  resize → normalize → `[3×H×W]` NCHW tensor, with 2× pixel-unshuffle to match
+  the encoder patch grid.
+- Soft-token prefill into the LLM via `Session::append_chat_with_images`;
+  CLI `cera run --image <path|url> [--image ...] --prompt`, multi-image supported.
+
+Remaining:
+- CPU-only encode path — no wgpu/Metal acceleration for the ViT yet.
+- Single projector family (`LFM2`); other VL projector types not mapped.
+
+### V2.16: Audio + TTS (LFM2-Audio) — ✅ DONE (core), 🟡 acceleration
+Full duplex: PCM in (ASR / audio understanding) and PCM out (speech
+generation). Shipped:
+- **Input:** `model/audio_preprocessor.rs` (PCM → log-mel, Slaney scale,
+  librosa-compatible) → `model/audio_encoder.rs` (Conformer-style encoder,
+  `PROJECTOR_TYPE_LFM2A`) → soft tokens via `Session::append_audio`.
+  CLI `cera run --audio-in <wav>`; one-call ASR via `WickEngine.transcribe` FFI.
+- **Output:** `model/audio_decoder.rs` (DecoderModel samples 8 codes/frame +
+  6-layer Depthformer backbone) → Detokenizer (codes → spectrogram → PCM via
+  ISTFT/rustfft). Driven by `audio_engine.rs`, a generation loop with text↔audio
+  modality switching. CLI `cera run --vocoder <gguf> --audio-out <wav>`.
+- **Acceleration:** `model/metal_audio_decoder.rs` moves the detokenizer
+  backbone to Metal (~165ms→~10-15ms/frame target); ISTFT stays on CPU.
+
+Remaining:
+- Metal-only detokenizer acceleration — no wgpu path; CPU fallback is slow.
+- Streaming/real-time output not yet exposed (batch WAV writer only).
 
 ---
 
