@@ -411,8 +411,15 @@ pub(super) fn component_interface_to_metadata(
                     }],
                 });
             }
-            methods.sort_by(|a, b| a.name.cmp(&b.name));
-            methods.dedup_by(|a, b| a.name == b.name);
+            // For foreign-implementable traits (callback interfaces) the method
+            // order IS the vtable slot order, which must match UniFFI's Rust
+            // vtable (declaration order). Sorting alphabetically here would
+            // misalign the slots, so only sort/dedup for regular objects (where
+            // each method has its own FFI symbol and order is cosmetic).
+            if !obj.has_callback_interface() {
+                methods.sort_by(|a, b| a.name.cmp(&b.name));
+                methods.dedup_by(|a, b| a.name == b.name);
+            }
 
             UdlObject {
                 name: obj.name().to_string(),

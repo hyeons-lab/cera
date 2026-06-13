@@ -382,16 +382,24 @@ streaming sink couldn't be passed to Rust. We vendored the generator
 - **foreign-trait vtable-init symbol** — was `<name>_trait_callback_init` (no
   such export); now UniFFI's `uniffi_<ns>_fn_init_callback_vtable_<name>`.
 With these, `generate_streaming` reaches Rust and **Rust invokes the Dart
-`ModalitySink` back** (verified). Two receiving-bridge codegen bugs remain
-before tokens actually flow, both pre-existing in the trait-bridge renderer:
-1. vtable slot order is alphabetical (`onAudioFrames, onDone, onTextTokens`) but
-   must match Rust's declaration order (`onTextTokens, onAudioFrames, onDone`);
-2. non-primitive callback args (`Vec<u32>`, `Vec<f32>`, enum) are typed
-   `Pointer<Utf8>` in the vtable instead of RustBuffer/i32 — needs proper decode.
-Until fixed, the streaming/progress entry points are stubbed to throw (no crash).
-Fixes to be upstreamed to `nchapman/uniffi-bindgen-dart`.
+`ModalitySink` back** (verified). Receiving-bridge status:
+1. **Vtable slot order — FIXED.** The generator sorted methods alphabetically,
+   misaligning slots vs Rust's declaration order; now preserved for callback
+   traits (ModalitySink vtable = `onTextTokens, onAudioFrames, onDone`).
+2. **Non-primitive callback arg ABI — remaining (a feature, not a bug).** The
+   generator uses a JSON-string ABI for complex callback args (records→JSON,
+   sequences→`jsonDecode`, enums→string, `Option<primitive>`→JSON), but stock
+   UniFFI passes a **RustBuffer** (by value) with binary serialization. cera's
+   `ModalitySink` (`Vec<u32>`/`Vec<f32>`/enum) hits the JSON path, which no
+   upstream golden fixture exercises against a real Rust ABI. Finishing streaming
+   means implementing the RustBuffer callback-arg ABI (map Sequence/Enum/Record/
+   `Option<primitive>` → `_UniFfiRustBuffer`, decode via the existing
+   `_UniFfiBinaryReader`/`_uniffiRead<T>`); touches shared callback mappers and
+   rewrites affected golden tests — its own focused effort + upstream PR.
+Until then, the streaming/progress entry points are stubbed to throw (no crash).
+All fixes to be upstreamed to `nchapman/uniffi-bindgen-dart`.
 
-**Remaining:** the two receiving-bridge fixes above (then `generate_streaming` /
+**Remaining:** the RustBuffer callback-arg ABI (then `generate_streaming` /
 `generate_streaming_async`); `*Async` invocation ABI (separate, larger); package
 prebuilt native libs per target (Android jniLibs / iOS xcframework / desktop);
 expose a detokenizer over FFI; example Flutter app + wire the Dart drift check
