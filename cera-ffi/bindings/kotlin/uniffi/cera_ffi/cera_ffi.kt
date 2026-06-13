@@ -836,6 +836,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_func_cera_ffi_version(): Short
 
+    external fun uniffi_cera_ffi_checksum_func_cpu_backend_report(): Short
+
     external fun uniffi_cera_ffi_checksum_method_bundlerepo_cache_size(): Short
 
     external fun uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache(): Short
@@ -1204,6 +1206,8 @@ internal object UniffiLib {
 
     external fun uniffi_cera_ffi_fn_func_cera_ffi_version(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_func_cpu_backend_report(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
+
     external fun ffi_cera_ffi_rustbuffer_alloc(
         `size`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -1419,6 +1423,9 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_func_cera_ffi_version() != 39330.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_cpu_backend_report() != 61086.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364.toShort()) {
@@ -5051,6 +5058,14 @@ data class ModelMetadata(
      * want to insert a BOS at the head of a raw prompt should honor it.
      */
     var `addBosToken`: kotlin.Boolean,
+    /**
+     * SIMD backend tier the runtime resolved for this host (e.g.
+     * `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
+     * model-specific — surfaced here so consumers fetching metadata also
+     * get backend diagnostics for telemetry / bug reports. For the full
+     * feature list, see [`cpu_backend_report`].
+     */
+    var `cpuBackend`: kotlin.String,
 ) {
     companion object
 }
@@ -5067,6 +5082,7 @@ public object FfiConverterTypeModelMetadata : FfiConverterRustBuffer<ModelMetada
             FfiConverterBoolean.read(buf),
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterString.read(buf),
         )
 
     override fun allocationSize(value: ModelMetadata) =
@@ -5076,7 +5092,8 @@ public object FfiConverterTypeModelMetadata : FfiConverterRustBuffer<ModelMetada
                 FfiConverterUInt.allocationSize(value.`vocabSize`) +
                 FfiConverterBoolean.allocationSize(value.`hasChatTemplate`) +
                 FfiConverterString.allocationSize(value.`quantization`) +
-                FfiConverterBoolean.allocationSize(value.`addBosToken`)
+                FfiConverterBoolean.allocationSize(value.`addBosToken`) +
+                FfiConverterString.allocationSize(value.`cpuBackend`)
         )
 
     override fun write(
@@ -5089,6 +5106,7 @@ public object FfiConverterTypeModelMetadata : FfiConverterRustBuffer<ModelMetada
         FfiConverterBoolean.write(value.`hasChatTemplate`, buf)
         FfiConverterString.write(value.`quantization`, buf)
         FfiConverterBoolean.write(value.`addBosToken`, buf)
+        FfiConverterString.write(value.`cpuBackend`, buf)
     }
 }
 
@@ -5917,5 +5935,18 @@ fun `ceraFfiVersion`(): kotlin.String =
     FfiConverterString.lift(
         uniffiRustCall { _status ->
             UniffiLib.uniffi_cera_ffi_fn_func_cera_ffi_version(_status)
+        },
+    )
+
+/**
+ * One-line CPU backend report for this host — the resolved SIMD tier plus the
+ * detected feature flags, e.g. `cpu: tier=neon+dotprod [neon dotprod]`. A host
+ * property independent of any loaded model; callable without an engine. Handy
+ * for telemetry and bug reports (tells you which kernel path actually ran).
+ */
+fun `cpuBackendReport`(): kotlin.String =
+    FfiConverterString.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_cpu_backend_report(_status)
         },
     )

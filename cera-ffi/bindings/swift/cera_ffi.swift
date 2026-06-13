@@ -3085,6 +3085,14 @@ public struct ModelMetadata: Equatable, Hashable {
      * want to insert a BOS at the head of a raw prompt should honor it.
      */
     public var addBosToken: Bool
+    /**
+     * SIMD backend tier the runtime resolved for this host (e.g.
+     * `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
+     * model-specific — surfaced here so consumers fetching metadata also
+     * get backend diagnostics for telemetry / bug reports. For the full
+     * feature list, see [`cpu_backend_report`].
+     */
+    public var cpuBackend: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3092,13 +3100,21 @@ public struct ModelMetadata: Equatable, Hashable {
         /**
          * Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
          * want to insert a BOS at the head of a raw prompt should honor it.
-         */addBosToken: Bool) {
+         */addBosToken: Bool, 
+        /**
+         * SIMD backend tier the runtime resolved for this host (e.g.
+         * `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
+         * model-specific — surfaced here so consumers fetching metadata also
+         * get backend diagnostics for telemetry / bug reports. For the full
+         * feature list, see [`cpu_backend_report`].
+         */cpuBackend: String) {
         self.architecture = architecture
         self.maxSeqLen = maxSeqLen
         self.vocabSize = vocabSize
         self.hasChatTemplate = hasChatTemplate
         self.quantization = quantization
         self.addBosToken = addBosToken
+        self.cpuBackend = cpuBackend
     }
 
     
@@ -3122,7 +3138,8 @@ public struct FfiConverterTypeModelMetadata: FfiConverterRustBuffer {
                 vocabSize: FfiConverterUInt32.read(from: &buf), 
                 hasChatTemplate: FfiConverterBool.read(from: &buf), 
                 quantization: FfiConverterString.read(from: &buf), 
-                addBosToken: FfiConverterBool.read(from: &buf)
+                addBosToken: FfiConverterBool.read(from: &buf), 
+                cpuBackend: FfiConverterString.read(from: &buf)
         )
     }
 
@@ -3133,6 +3150,7 @@ public struct FfiConverterTypeModelMetadata: FfiConverterRustBuffer {
         FfiConverterBool.write(value.hasChatTemplate, into: &buf)
         FfiConverterString.write(value.quantization, into: &buf)
         FfiConverterBool.write(value.addBosToken, into: &buf)
+        FfiConverterString.write(value.cpuBackend, into: &buf)
     }
 }
 
@@ -3960,6 +3978,18 @@ public func ceraFfiVersion() -> String  {
     )
 })
 }
+/**
+ * One-line CPU backend report for this host — the resolved SIMD tier plus the
+ * detected feature flags, e.g. `cpu: tier=neon+dotprod [neon dotprod]`. A host
+ * property independent of any loaded model; callable without an engine. Handy
+ * for telemetry and bug reports (tells you which kernel path actually ran).
+ */
+public func cpuBackendReport() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_cpu_backend_report($0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -3977,6 +4007,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_cera_ffi_checksum_func_cera_ffi_version() != 39330) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_cpu_backend_report() != 61086) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {

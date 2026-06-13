@@ -335,6 +335,12 @@ pub struct ModelMetadata {
     /// Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
     /// want to insert a BOS at the head of a raw prompt should honor it.
     pub add_bos_token: bool,
+    /// SIMD backend tier the runtime resolved for this host (e.g.
+    /// `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
+    /// model-specific — surfaced here so consumers fetching metadata also
+    /// get backend diagnostics for telemetry / bug reports. For the full
+    /// feature list, see [`cpu_backend_report`].
+    pub cpu_backend: String,
 }
 
 impl From<&cera::ModelMetadata> for ModelMetadata {
@@ -346,6 +352,7 @@ impl From<&cera::ModelMetadata> for ModelMetadata {
             has_chat_template: m.has_chat_template,
             quantization: m.quantization.clone(),
             add_bos_token: m.add_bos_token,
+            cpu_backend: cera::cpu_tier().label().to_string(),
         }
     }
 }
@@ -1618,6 +1625,15 @@ impl CeraEngine {
 #[uniffi::export]
 pub fn cera_ffi_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// One-line CPU backend report for this host — the resolved SIMD tier plus the
+/// detected feature flags, e.g. `cpu: tier=neon+dotprod [neon dotprod]`. A host
+/// property independent of any loaded model; callable without an engine. Handy
+/// for telemetry and bug reports (tells you which kernel path actually ran).
+#[uniffi::export]
+pub fn cpu_backend_report() -> String {
+    cera::cpu_features().report()
 }
 
 #[cfg(test)]
