@@ -1103,7 +1103,9 @@ pub(crate) mod neon {
             let mask_lo = vdupq_n_u8(0x0F);
             let offset_8 = vdupq_n_s8(0x8);
             let row_start = i * row_bytes;
-            let mut acc = 0.0f32;
+            // Accumulate into an f32x4 (scaled per block via vmlaq_n_f32) like the
+            // dotprod kernels; the cross-lane reduction happens once at the end.
+            let mut sumv = vdupq_n_f32(0.0);
             for bi in 0..blocks_per_row {
                 let b = &*(a_quant
                     .as_ptr()
@@ -1117,9 +1119,9 @@ pub(crate) mod neon {
                 let z = vdupq_n_s32(0);
                 let p = vdotq_s32_emu(vdotq_s32_emu(z, v_lo, y_lo), v_hi, y_hi);
                 let d = f16::from_bits(b.d).to_f32() * x_scales[bi];
-                acc += vaddvq_s32(p) as f32 * d;
+                sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d);
             }
-            *yi = acc;
+            *yi = vaddvq_f32(sumv);
         };
         if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
             super::super::cpu::par_rows(y, 512, compute_row);
@@ -1142,7 +1144,7 @@ pub(crate) mod neon {
         let row_bytes = blocks_per_row * size_of::<BlockQ8_0>();
         let compute_row = |(i, yi): (usize, &mut f32)| unsafe {
             let row_start = i * row_bytes;
-            let mut acc = 0.0f32;
+            let mut sumv = vdupq_n_f32(0.0);
             for bi in 0..blocks_per_row {
                 let wb = &*(a_quant
                     .as_ptr()
@@ -1155,9 +1157,9 @@ pub(crate) mod neon {
                 let z = vdupq_n_s32(0);
                 let p = vdotq_s32_emu(vdotq_s32_emu(z, w_lo, x_lo), w_hi, x_hi);
                 let d = f16::from_bits(wb.delta).to_f32() * x_scales[bi];
-                acc += vaddvq_s32(p) as f32 * d;
+                sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d);
             }
-            *yi = acc;
+            *yi = vaddvq_f32(sumv);
         };
         if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
             super::super::cpu::par_rows(y, 512, compute_row);
@@ -1184,7 +1186,7 @@ pub(crate) mod neon {
             let offset_8 = vdupq_n_s8(0x8);
             let row_start = i * row_bytes;
             for j in 0..n {
-                let mut acc = 0.0f32;
+                let mut sumv = vdupq_n_f32(0.0);
                 for bi in 0..nb {
                     let b = &*(a_quant
                         .as_ptr()
@@ -1198,9 +1200,9 @@ pub(crate) mod neon {
                     let z = vdupq_n_s32(0);
                     let p = vdotq_s32_emu(vdotq_s32_emu(z, v_lo, y_lo), v_hi, y_hi);
                     let d = f16::from_bits(b.d).to_f32() * b_scales[j * nb + bi];
-                    acc += vaddvq_s32(p) as f32 * d;
+                    sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d);
                 }
-                row[j] = acc;
+                row[j] = vaddvq_f32(sumv);
             }
         };
         if m >= super::super::cpu::GEMV_PAR_THRESHOLD {
@@ -1226,7 +1228,7 @@ pub(crate) mod neon {
         let compute_row = |(i, row): (usize, &mut [f32])| unsafe {
             let row_start = i * row_bytes;
             for j in 0..n {
-                let mut acc = 0.0f32;
+                let mut sumv = vdupq_n_f32(0.0);
                 for bi in 0..nb {
                     let wb = &*(a_quant
                         .as_ptr()
@@ -1239,9 +1241,9 @@ pub(crate) mod neon {
                     let z = vdupq_n_s32(0);
                     let p = vdotq_s32_emu(vdotq_s32_emu(z, w_lo, y_lo), w_hi, y_hi);
                     let d = f16::from_bits(wb.delta).to_f32() * b_scales[j * nb + bi];
-                    acc += vaddvq_s32(p) as f32 * d;
+                    sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d);
                 }
-                row[j] = acc;
+                row[j] = vaddvq_f32(sumv);
             }
         };
         if m >= super::super::cpu::GEMV_PAR_THRESHOLD {
