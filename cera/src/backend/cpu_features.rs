@@ -15,11 +15,13 @@
 //!
 //! ## Implemented vs. detected
 //!
-//! [`CpuFeatures::tier`] reports the best tier cera actually has *kernels* for
-//! (today: [`CpuTier::Avx2`] on x86, [`CpuTier::NeonDotprod`] on aarch64), so a
-//! dispatcher can never route to a kernel that doesn't exist. The raw feature
-//! bools (e.g. [`CpuFeatures::avx512f`]) are detected and exposed regardless,
-//! for diagnostics and so future kernels can light up without re-plumbing.
+//! [`CpuFeatures::tier`] reports the best tier cera actually has *kernels* for,
+//! so a dispatcher can never route to a kernel that doesn't exist. On x86 that
+//! is [`CpuTier::Avx512`] (Q8_0/Q4_0 `vec_dot`; needs the default-on `avx512`
+//! crate feature, else [`CpuTier::Avx2`]); on aarch64 it is [`CpuTier::NeonI8mm`]
+//! (Q8_0 GEMM) down to [`CpuTier::NeonDotprod`]. The raw feature bools (e.g.
+//! [`CpuFeatures::avx512vnni`]) are detected and exposed regardless, for
+//! diagnostics and so future kernels can light up without re-plumbing.
 
 use std::sync::OnceLock;
 
@@ -30,21 +32,22 @@ use std::sync::OnceLock;
 /// NeonDotprod < NeonI8mm`). Cross-architecture comparisons are nonsensical but
 /// harmless — only one architecture's variants are ever produced at runtime.
 ///
-/// [`Avx512`](CpuTier::Avx512) and [`NeonI8mm`](CpuTier::NeonI8mm) are reserved
-/// for when those kernels land; [`detect`] does not produce them yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CpuTier {
     /// Portable scalar reference path. Always available.
     Scalar,
     /// x86_64 AVX2 + FMA.
     Avx2,
-    /// x86_64 AVX-512 (F + BW, optionally VNNI). Reserved — no kernels yet.
+    /// x86_64 AVX-512 — 512-bit f32 `vec_dot` for Q8_0/Q4_0 (needs only
+    /// `avx512f`). Produced when the default-on `avx512` crate feature is
+    /// enabled; disable it for a Rust 1.85-compatible x86 build.
     Avx512,
     /// aarch64 baseline NEON.
     Neon,
     /// aarch64 NEON + dotprod (FEAT_DotProd, `vdotq_s32`).
     NeonDotprod,
-    /// aarch64 NEON + i8mm (FEAT_I8MM, `vmmlaq_s32`). Reserved — no kernels yet.
+    /// aarch64 NEON + i8mm (FEAT_I8MM, `vmmlaq_s32`) — Q8_0 GEMM only; other ops
+    /// use the dotprod path (i8mm implies dotprod).
     NeonI8mm,
 }
 
@@ -169,11 +172,13 @@ pub fn detect() -> CpuFeatures {
         f.avx512f = is_x86_feature_detected!("avx512f");
         f.avx512bw = is_x86_feature_detected!("avx512bw");
         f.avx512vnni = is_x86_feature_detected!("avx512vnni");
-        // Avx512 covers the 512-bit f32 Q8_0/Q4_0 `vec_dot` kernels (avx512f is
-        // sufficient for those; it implies AVX2+FMA, which the Q4_K_M fallback
-        // to the AVX2 kernel needs). VNNI is detected for diagnostics but not
-        // yet exploited — a true int8 path on x86 is a separate change.
-        f.tier = if f.avx512f {
+        // Avx512 covers the 512-bit f32 Q8_0/Q4_0 `vec_dot` kernels — `avx512f`
+        // alone is sufficient for them (it implies AVX2+FMA, which the Q4_K_M
+        // fallback to the AVX2 kernel needs). The kernels use Rust-1.89 `_mm512_*`
+        // intrinsics, past the crate's 1.85 MSRV, so they live behind the
+        // default-on `avx512` feature; with it off the tier caps at Avx2 and the
+        // x86 build stays 1.85-compatible. VNNI is detected for diagnostics only.
+        f.tier = if f.avx512f && cfg!(feature = "avx512") {
             CpuTier::Avx512
         } else if f.avx2 && f.fma {
             CpuTier::Avx2
@@ -189,9 +194,9 @@ pub fn detect() -> CpuFeatures {
         f.dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
         f.i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
         // NeonI8mm currently lights up only the Q8_0 GEMM kernel; everything
-        // else uses the dotprod path (i8mm implies dotprod). It is UNVERIFIED on
-        // available hardware (see `simd::neon::gemm_q8_0_q8_0_neon_i8mm`) — gated
-        // behind real i8mm detection so non-i8mm hosts never reach it.
+        // else uses the dotprod path (i8mm implies dotprod). Gated behind real
+        // i8mm detection so non-i8mm hosts never reach it; the kernel is
+        // validated on CI by the `simd-i8mm` job (ubuntu-24.04-arm, Neoverse N2).
         f.tier = if f.neon && f.dotprod && f.i8mm {
             CpuTier::NeonI8mm
         } else if f.neon && f.dotprod {

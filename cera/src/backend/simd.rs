@@ -1331,12 +1331,11 @@ pub(crate) mod neon {
     // dotprod GEMM — never a correctness necessity (the dispatcher still has the
     // dotprod path).
     //
-    // NOTE: UNVERIFIED on available hardware — i8mm is ARMv8.6, which neither the
-    // aarch64 dev host (M1: dotprod, no i8mm) nor an x86 box can execute. It
-    // compiles natively (the intrinsic is gated, not run) and is checked by
-    // `i8mm_gemm_matches_dotprod` *only* where `is_aarch64_feature_detected!
-    // ("i8mm")` holds. Validate on ARMv8.6 hardware (e.g. Graviton3/4, newer
-    // Apple) before relying on it.
+    // NOTE: i8mm is ARMv8.6, which the aarch64 dev host (M1: dotprod, no i8mm)
+    // can't execute — it compiles natively (the intrinsic is gated, not run).
+    // It IS validated on CI by the `simd-i8mm` job on `ubuntu-24.04-arm` (Azure
+    // Cobalt 100 / Neoverse N2), which runs `i8mm_gemm_matches_dotprod` under
+    // `CERA_REQUIRE_SIMD=i8mm` so a missing feature fails rather than skips.
 
     /// Scalar single-output Q8_0 GEMM dot, for odd row/col remainders.
     #[allow(clippy::too_many_arguments)]
@@ -1983,12 +1982,15 @@ mod avx2 {
 // NOTE: not executable on the aarch64 dev host. Verified by `avx512_tests`
 // below, which run only where `is_x86_feature_detected!("avx512f")` holds
 // (e.g. Zen 4/5, Skylake-X), comparing each kernel against the scalar reference.
-#[cfg(target_arch = "x86_64")]
+//
+// Behind the default-on `avx512` crate feature: the `_mm512_*` intrinsics need
+// Rust 1.89 (past the 1.85 MSRV), so disabling the feature keeps x86 building on
+// 1.85–1.88 (the tier then caps at AVX2; `detect()` won't produce `Avx512`).
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 mod avx512 {
-    // The `_mm512_*` intrinsics stabilized in Rust 1.89, past the crate's
-    // documented 1.85 MSRV. This module is x86-only and reached only at runtime
-    // on AVX-512 hosts (which run a recent toolchain), so the newer intrinsics
-    // are acceptable here; the rest of the crate stays within 1.85.
+    // 1.89 `_mm512_*` intrinsics vs the 1.85 MSRV — see the module gate above.
+    // The `avx512` feature lets MSRV-sensitive builds opt out; when it's on, the
+    // build already requires 1.89, so silence the (correct) lint here.
     #![allow(clippy::incompatible_msrv)]
     use super::*;
     use std::arch::x86_64::*;
@@ -2131,6 +2133,10 @@ pub fn vec_dot_q4_0_f32(block: &BlockQ4_0, y: &[f32]) -> f32 {
         use crate::backend::cpu_features::{CpuTier, cpu_features};
         match cpu_features().tier {
             CpuTier::Scalar => crate::quant::vec_dot_q4_0_f32_scalar(block, y),
+            // `Avx512` is only produced when the `avx512` feature is on; the
+            // gated arm matches the module's gate so the build is consistent
+            // either way (with it off, the tier folds into the AVX2 arm).
+            #[cfg(feature = "avx512")]
             CpuTier::Avx512 => unsafe { avx512::vec_dot_q4_0_f32_avx512(block, y) },
             _ => unsafe { avx2::vec_dot_q4_0_f32_avx2(block, y) },
         }
@@ -2156,6 +2162,7 @@ pub fn vec_dot_q8_0_f32(block: &BlockQ8_0, y: &[f32]) -> f32 {
         use crate::backend::cpu_features::{CpuTier, cpu_features};
         match cpu_features().tier {
             CpuTier::Scalar => crate::quant::vec_dot_q8_0_f32_scalar(block, y),
+            #[cfg(feature = "avx512")]
             CpuTier::Avx512 => unsafe { avx512::vec_dot_q8_0_f32_avx512(block, y) },
             _ => unsafe { avx2::vec_dot_q8_0_f32_avx2(block, y) },
         }
