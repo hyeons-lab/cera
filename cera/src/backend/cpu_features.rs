@@ -176,8 +176,13 @@ pub fn detect() -> CpuFeatures {
         f.neon = std::arch::is_aarch64_feature_detected!("neon");
         f.dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
         f.i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
-        // NOTE: capped at NeonDotprod — no i8mm kernels exist yet.
-        f.tier = if f.neon && f.dotprod {
+        // NeonI8mm currently lights up only the Q8_0 GEMM kernel; everything
+        // else uses the dotprod path (i8mm implies dotprod). It is UNVERIFIED on
+        // available hardware (see `simd::neon::gemm_q8_0_q8_0_neon_i8mm`) — gated
+        // behind real i8mm detection so non-i8mm hosts never reach it.
+        f.tier = if f.neon && f.dotprod && f.i8mm {
+            CpuTier::NeonI8mm
+        } else if f.neon && f.dotprod {
             CpuTier::NeonDotprod
         } else if f.neon {
             CpuTier::Neon
@@ -256,7 +261,7 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         assert!(matches!(
             t,
-            CpuTier::Scalar | CpuTier::Neon | CpuTier::NeonDotprod
+            CpuTier::Scalar | CpuTier::Neon | CpuTier::NeonDotprod | CpuTier::NeonI8mm
         ));
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         assert_eq!(t, CpuTier::Scalar);

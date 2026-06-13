@@ -1,6 +1,6 @@
 #![cfg_attr(
     target_arch = "aarch64",
-    feature(stdarch_neon_dotprod, stdarch_aarch64_prefetch)
+    feature(stdarch_neon_dotprod, stdarch_aarch64_prefetch, stdarch_neon_i8mm)
 )]
 
 /// Crate version, sourced from `Cargo.toml` at compile time. Useful
