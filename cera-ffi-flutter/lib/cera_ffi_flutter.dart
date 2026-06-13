@@ -2,22 +2,19 @@
 ///
 /// This is the package's public entry point. It re-exports:
 /// - [CeraLibrary] — the platform-aware native-library loader.
-/// - the UniFFI bindings from `src/generated/cera_ffi.dart` (the engine API:
-///   `CeraEngine`, `EngineConfig`, …).
+/// - (after generation) the UniFFI bindings from `src/generated/cera_ffi.dart`.
 ///
-/// ## Regenerating the bindings
+/// ## Generating the bindings
 ///
-/// The generated UniFFI bindings under `lib/src/generated/` are committed and
-/// exported (see V2.17 in `docs/IMPLEMENTATION_PLAN.md`). They're regenerated +
-/// patched from the repo root with:
+/// The generated UniFFI bindings are not committed (see V2.17 in
+/// `docs/IMPLEMENTATION_PLAN.md`). Produce them from the repo root with:
 ///
 /// ```sh
-/// just dart-bindings        # rebuilds the cdylib, regenerates, patches
-/// just dart-bindings-check  # fails if the committed bindings drift
+/// just dart-bindings
 /// ```
 ///
-/// Edit the Rust `#[uniffi::*]` surface or `tool/patch_generated_bindings.dart`,
-/// never `lib/src/generated/cera_ffi.dart` by hand.
+/// which writes `lib/src/generated/cera_ffi.dart`. Once present, uncomment the
+/// export below to surface the engine API (`CeraEngine`, `EngineConfig`, …).
 ///
 /// ## Usage sketch
 ///
@@ -31,4 +28,7 @@
 library cera_ffi_flutter;
 
 export 'src/library_loader.dart';
-export 'src/generated/cera_ffi.dart';
+
+// Uncomment once `just dart-bindings` has generated the file. Kept commented
+// so the committed scaffold analyzes cleanly without the generated artifact.
+// export 'src/generated/cera_ffi.dart';

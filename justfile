@@ -89,39 +89,20 @@ bindings:
         --language swift \
         --out-dir cera-ffi/bindings/swift
 
-# Build the `cera-ffi` cdylib with the `ffi-buffer` feature — required by the
-# Dart bindings. `uniffi-bindgen-dart` calls `uniffi_ffibuffer_*` trampolines
-# that UniFFI only emits under `scaffolding-ffi-buffer-fns`. Kotlin/Swift use
-# the standard symbols and don't need this, so the feature stays off for them.
-dart-libs:
-    cargo build -p cera-ffi --features ffi-buffer
-    @echo "Built {{CERA_FFI_DYLIB}} (with ffi-buffer trampolines)."
-    @echo "Point Dart at it via CERA_FFI_LIB or place it on the loader path."
-
-# Generate + patch the Dart/Flutter bindings into the cera-ffi-flutter package.
-# Dart is not a built-in uniffi-bindgen language — it uses the external
-# `uniffi-bindgen-dart` tool (pins uniffi_bindgen 0.31, matching this workspace).
-# The raw output has several codegen bugs against Cera's FFI surface, so we run
-# `tool/patch_generated_bindings.dart` immediately after (deterministic +
-# idempotent): it fixes symbol names, native-lib resolution, the EngineConfig
-# record encoder, and stubs the unsupported callback-streaming surface. The
-# patched result analyzes clean and round-trips real inference. See V2.17.
+# Generate the Dart/Flutter bindings into the cera-ffi-flutter package.
+# Unlike Kotlin/Swift, Dart is not a built-in uniffi-bindgen language — it
+# uses the external `uniffi-bindgen-dart` tool (pins uniffi_bindgen 0.31,
+# matching this workspace). The output is gitignored: the generator (0.1.3)
+# still emits invalid Dart for the async + streaming-callback surface, so we
+# regenerate rather than commit the blob. See V2.17 in the implementation plan.
 #
 # Requires: `cargo install uniffi-bindgen-dart` and a Dart SDK >= 3.3.
-dart-bindings: dart-libs
+dart-bindings:
+    cargo build -p cera-ffi
     uniffi-bindgen-dart generate {{CERA_FFI_DYLIB}} \
         --out-dir cera-ffi-flutter/lib/src/generated
-    cd cera-ffi-flutter && dart run tool/patch_generated_bindings.dart
-
-# Verify the committed Dart bindings are up to date with the current FFI
-# surface (regenerate + patch in place, fail on diff) and analyze the package.
-dart-bindings-check: dart-bindings
-    @if [ -n "$(git status --porcelain cera-ffi-flutter/lib/src/generated)" ]; then \
-        echo "ERROR: Dart bindings are stale. Run \`just dart-bindings\` and commit the diff."; \
-        git --no-pager diff cera-ffi-flutter/lib/src/generated; \
-        exit 1; \
-    fi
-    cd cera-ffi-flutter && dart pub get && dart analyze
+    @echo "Generated cera-ffi-flutter/lib/src/generated/cera_ffi.dart"
+    @echo "NOTE: ~8 known analyzer errors in the async/streaming surface (V2.17)."
 
 # Verify the committed Kotlin + Swift bindings are up to date with the
 # current Rust FFI surface. Regenerates in-place and fails if `git diff`
