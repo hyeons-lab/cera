@@ -850,20 +850,23 @@ fn render_trait_callback_bridge(
         .filter(|m| !is_uniffi_trait_method_name(&m.name))
         .any(|m| m.args.iter().any(|a| is_callback_rustbuffer_type(&a.type_)));
     if object_has_buffer_arg {
+        // Reusable out-status for the buffer frees. Callbacks on an isolate run
+        // serially, so a single process-lifetime status (like the static
+        // NativeCallables themselves) is safe and avoids a calloc/free pair on
+        // every — potentially per-token — callback invocation.
+        out.push_str(
+            "  static final ffi.Pointer<_UniFfiRustCallStatus> _freeArgStatus = calloc<_UniFfiRustCallStatus>();\n\n",
+        );
         out.push_str("  static void _uniffiFreeArgBuffer(_UniFfiRustBuffer buf) {\n");
         out.push_str("    if (buf.data == ffi.nullptr && buf.len == 0 && buf.capacity == 0) {\n");
         out.push_str("      return;\n");
         out.push_str("    }\n");
-        out.push_str(
-            "    final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();\n",
-        );
-        out.push_str("    freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;\n");
-        out.push_str("    freeStatusPtr.ref.errorBuf\n");
+        out.push_str("    _freeArgStatus.ref.code = _uniFfiRustCallStatusSuccess;\n");
+        out.push_str("    _freeArgStatus.ref.errorBuf\n");
         out.push_str("      ..capacity = 0\n");
         out.push_str("      ..len = 0\n");
         out.push_str("      ..data = ffi.nullptr;\n");
-        out.push_str("    _bindings()._uniFfiRustBufferFree(buf, freeStatusPtr);\n");
-        out.push_str("    calloc.free(freeStatusPtr);\n");
+        out.push_str("    _bindings()._uniFfiRustBufferFree(buf, _freeArgStatus);\n");
         out.push_str("  }\n\n");
     }
 

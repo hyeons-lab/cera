@@ -6697,18 +6697,18 @@ final class _DownloadProgressSinkTraitCallbackBridge {
     return instance.cloneHandle(handle);
   }, exceptionalReturn: 0);
 
+  static final ffi.Pointer<_UniFfiRustCallStatus> _freeArgStatus = calloc<_UniFfiRustCallStatus>();
+
   static void _uniffiFreeArgBuffer(_UniFfiRustBuffer buf) {
     if (buf.data == ffi.nullptr && buf.len == 0 && buf.capacity == 0) {
       return;
     }
-    final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
-    freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
-    freeStatusPtr.ref.errorBuf
+    _freeArgStatus.ref.code = _uniFfiRustCallStatusSuccess;
+    _freeArgStatus.ref.errorBuf
       ..capacity = 0
       ..len = 0
       ..data = ffi.nullptr;
-    _bindings()._uniFfiRustBufferFree(buf, freeStatusPtr);
-    calloc.free(freeStatusPtr);
+    _bindings()._uniFfiRustBufferFree(buf, _freeArgStatus);
   }
 
   static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onProgressNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.isolateLocal((int handle, _UniFfiRustBuffer url, int bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
@@ -6925,18 +6925,18 @@ final class _ModalitySinkTraitCallbackBridge {
     return instance.cloneHandle(handle);
   }, exceptionalReturn: 0);
 
+  static final ffi.Pointer<_UniFfiRustCallStatus> _freeArgStatus = calloc<_UniFfiRustCallStatus>();
+
   static void _uniffiFreeArgBuffer(_UniFfiRustBuffer buf) {
     if (buf.data == ffi.nullptr && buf.len == 0 && buf.capacity == 0) {
       return;
     }
-    final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
-    freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
-    freeStatusPtr.ref.errorBuf
+    _freeArgStatus.ref.code = _uniFfiRustCallStatusSuccess;
+    _freeArgStatus.ref.errorBuf
       ..capacity = 0
       ..len = 0
       ..data = ffi.nullptr;
-    _bindings()._uniFfiRustBufferFree(buf, freeStatusPtr);
-    calloc.free(freeStatusPtr);
+    _bindings()._uniFfiRustBufferFree(buf, _freeArgStatus);
   }
 
   static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onTextTokensNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
