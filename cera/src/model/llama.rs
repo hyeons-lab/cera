@@ -89,7 +89,7 @@ impl LlamaModel {
         ensure!(context_size > 0, "context_size must be > 0");
 
         // Metadata prefix is the architecture string itself
-        // ("qwen2"/"qwen3"/"llama"/"mistral"/"granite").
+        // ("qwen2"/"qwen3"/"llama"/"granite"; classic Mistral ships as "llama").
         let arch = gguf
             .get_str("general.architecture")
             .context("missing general.architecture")?
@@ -100,7 +100,8 @@ impl LlamaModel {
         // LLaMA-family (incl. Mistral and Granite) are NORM (interleaved pairs).
         let rope_type = match prefix {
             "qwen2" | "qwen3" => RopeType::Neox,
-            "llama" | "mistral" | "granite" => RopeType::Norm,
+            // "llama" also covers classic Mistral (it ships as GGUF arch "llama").
+            "llama" | "granite" => RopeType::Norm,
             // Keep exhaustive with the `load_model` dispatch allow-list: a new arch
             // routed here without a layout mapping must fail loudly rather than
             // silently default to NORM (wrong for any NEOX-family arch — phi3,
