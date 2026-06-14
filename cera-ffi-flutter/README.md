@@ -24,7 +24,9 @@ cera-ffi-flutter/
 ├── lib/
 │   ├── cera_ffi_flutter.dart # public barrel (loader + generated re-export)
 │   └── src/
-│       ├── library_loader.dart   # CeraLibrary.open() — platform dylib resolution
+│       ├── library_loader.dart      # conditional export (io vs web)
+│       ├── library_loader_io.dart   # CeraLibrary.open() — dart:ffi dylib resolution
+│       ├── library_loader_web.dart  # web stub — open() throws UnsupportedError
 │       └── generated/
 │           └── cera_ffi.dart     # generated bindings (gitignored; run codegen)
 ```
@@ -69,14 +71,20 @@ xcframework, desktop bundles) is follow-up work.
 
 ## Platform support
 
-**Native platforms only** (Android, iOS, macOS, Linux, Windows). This is a
-`dart:ffi` package — both the loader and the generated bindings import
-`dart:ffi`/`dart:io` and the loader's public API returns a `DynamicLibrary`, so
-the package cannot compile for **Flutter Web**, which has no FFI. Stubbing the
-loader behind conditional imports wouldn't help, because the generated bindings
-themselves are FFI throughout; web support would require a separate non-FFI
-transport (e.g. WASM via `cera-wasm`) and is out of scope for these bindings.
-Depend on this package only from the native targets of a multi-platform app.
+**Runs on native platforms only** (Android, iOS, macOS, Linux, Windows) — it's
+a `dart:ffi` package and Flutter Web has no FFI. The loader uses a conditional
+export (`library_loader.dart` → `library_loader_io.dart` when `dart:io` is
+available, else `library_loader_web.dart`), so a multi-platform app that also
+targets web can still **import** the package: on web `CeraLibrary.open()` throws
+a clear `UnsupportedError` instead of breaking compilation. Web *support* (not
+just import-safety) would require a non-FFI transport (e.g. WASM via
+`cera-wasm`) and is out of scope for these bindings.
+
+> Note: once the generated UniFFI bindings are committed and exported from the
+> barrel, they'll need the same conditional-export guard — they're `dart:ffi`
+> throughout. The export is commented out for now (see [Generating the
+> bindings](#generating-the-bindings)), so the committed scaffold is currently
+> web-import-safe end-to-end.
 
 ## Known gaps
 
