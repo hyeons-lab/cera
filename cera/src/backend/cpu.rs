@@ -2232,18 +2232,7 @@ pub fn rope_norm(
 /// NORM-layout counterpart of [`apply_rope_to_head`]. Rotates adjacent pairs
 /// `(head[2i], head[2i+1])` with the same iterative theta schedule.
 pub fn apply_rope_norm_to_head(head: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
-    let half_dim = head_dim / 2;
-    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
-    let mut theta = pos as f32;
-    for i in 0..half_dim {
-        let (sin_t, cos_t) = theta.sin_cos();
-
-        let x0 = head[2 * i];
-        let x1 = head[2 * i + 1];
-        head[2 * i] = x0 * cos_t - x1 * sin_t;
-        head[2 * i + 1] = x0 * sin_t + x1 * cos_t;
-        theta *= theta_scale;
-    }
+    rope_norm_pairs(head, pos as f32, head_dim, freq_base);
 }
 
 /// NORM-layout counterpart of [`apply_rope_delta_to_head`]: composes an
@@ -2256,16 +2245,21 @@ pub fn apply_rope_norm_delta_to_head(
     head_dim: usize,
     freq_base: f32,
 ) {
-    let half_dim = head_dim / 2;
-    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
-    let mut theta = delta_pos as f32;
-    for i in 0..half_dim {
-        let (sin_t, cos_t) = theta.sin_cos();
+    rope_norm_pairs(head, delta_pos as f32, head_dim, freq_base);
+}
 
-        let x0 = head[2 * i];
-        let x1 = head[2 * i + 1];
-        head[2 * i] = x0 * cos_t - x1 * sin_t;
-        head[2 * i + 1] = x0 * sin_t + x1 * cos_t;
+/// Shared kernel for NORM (interleaved-pair) RoPE: rotates each adjacent pair
+/// `(head[2i], head[2i+1])` by `theta_start * theta_scale^i`. The absolute
+/// (`pos`) and delta (`delta_pos`) entry points differ only in `theta_start`.
+fn rope_norm_pairs(head: &mut [f32], theta_start: f32, head_dim: usize, freq_base: f32) {
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+    let mut theta = theta_start;
+    for pair in head.chunks_exact_mut(2) {
+        let (sin_t, cos_t) = theta.sin_cos();
+        let x0 = pair[0];
+        let x1 = pair[1];
+        pair[0] = x0 * cos_t - x1 * sin_t;
+        pair[1] = x0 * sin_t + x1 * cos_t;
         theta *= theta_scale;
     }
 }

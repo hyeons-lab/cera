@@ -118,7 +118,12 @@ impl LlamaModel {
         let residual_scale = gguf
             .get_f32(&format!("{prefix}.residual_scale"))
             .unwrap_or(1.0);
-        let attn_scale = gguf.get_f32(&format!("{prefix}.attention.scale"));
+        // llama.cpp treats a stored `attention.scale == 0.0` as "absent ⇒ use
+        // 1/sqrt(head_dim)", so map Some(0.0) → None to match (a literal 0.0
+        // would otherwise zero every attention score).
+        let attn_scale = gguf
+            .get_f32(&format!("{prefix}.attention.scale"))
+            .filter(|&s| s != 0.0);
         let logit_scale = gguf
             .get_f32(&format!("{prefix}.logit_scale"))
             .unwrap_or(1.0);

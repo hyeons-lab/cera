@@ -33,6 +33,12 @@ pub struct BpeTokenizer {
     chat_template: Option<String>,
     /// Pre-compiled pretokenizer regex.
     pretokenize_re: Regex,
+    /// True when the pretokenizer splits digits as a bare `\p{N}` with no leading
+    /// space (REFACT family — Granite/Refact/CodeShell/SmolLM). The whitespace
+    /// `\s+(?!\S)` emulation in `pretokenize` must then NOT donate a trailing
+    /// space to a following digit, since llama.cpp keeps such digits bare. False
+    /// for GPT-2/LLAMA3-style pretokenizers, whose ` ?\p{N}+` absorbs the space.
+    digits_split_bare: bool,
     /// GPT-2 byte→unicode mapping (computed once, used in encode).
     byte_to_unicode: [char; 256],
     /// GPT-2 unicode→byte mapping (computed once, used in decode).
@@ -106,6 +112,7 @@ impl BpeTokenizer {
         // Select pretokenizer based on model type
         let pre_type = gguf.get_str("tokenizer.ggml.pre").unwrap_or("gpt2");
         let pretokenize_re = build_pretokenize_regex(pre_type);
+        let digits_split_bare = pre_type == "refact";
         let byte_to_unicode = build_byte_to_unicode();
         let unicode_to_byte = build_unicode_to_byte();
 
@@ -118,6 +125,7 @@ impl BpeTokenizer {
             eos_id,
             chat_template,
             pretokenize_re,
+            digits_split_bare,
             byte_to_unicode,
             unicode_to_byte,
         })
@@ -142,44 +150,61 @@ impl BpeTokenizer {
             match segment {
                 Segment::Special(id) => result.push(*id),
                 Segment::Text(s) => {
-                    // Pretokenize into chunks. Work in byte ranges so we can
-                    // emulate the `\s+(?!\S)` lookahead the `regex` crate can't
-                    // express: in the GPT-2/LLAMA3/Qwen2 pretokenizers a run of
-                    // whitespace that is *followed by* a non-whitespace char
-                    // yields its LAST whitespace char to the following chunk —
-                    // e.g. "\n    return" splits as "   " + " return", not
-                    // "    " + "return". Without this, indented/multi-space text
-                    // (notably code) tokenizes differently from llama.cpp.
-                    let mut ranges: Vec<(usize, usize)> = self
-                        .pretokenize_re
-                        .find_iter(s)
-                        .map(|m| (m.start(), m.end()))
-                        .collect();
-                    for i in 0..ranges.len() {
-                        let (a, b) = ranges[i];
-                        // Whitespace runs are ASCII, so the last char is one byte
-                        // — `b - 1` is a valid boundary.
-                        let is_ws_run =
-                            b - a >= 2 && s.as_bytes()[a..b].iter().all(u8::is_ascii_whitespace);
-                        // Only hand a trailing *space/tab* to the next chunk. A
-                        // run ending in a newline is normally claimed by the
-                        // earlier `\s*[\r\n]+` alternative, but guard anyway: the
-                        // lookahead only applies to a space before a word, never
-                        // to a newline (which belongs with the whitespace chunk).
-                        let last_is_spacetab = matches!(s.as_bytes()[b - 1], b' ' | b'\t');
-                        let next_non_ws = s[b..].chars().next().is_some_and(|c| !c.is_whitespace());
-                        if is_ws_run && last_is_spacetab && next_non_ws && i + 1 < ranges.len() {
-                            ranges[i].1 = b - 1;
-                            ranges[i + 1].0 = b - 1;
-                        }
-                    }
-                    for (a, b) in ranges {
-                        result.extend(self.bpe_encode_chunk(&s[a..b]));
+                    for chunk in self.pretokenize(s) {
+                        result.extend(self.bpe_encode_chunk(chunk));
                     }
                 }
             }
         }
         result
+    }
+
+    /// Pretokenize a text segment into chunks, applying the regex split plus the
+    /// `\s+(?!\S)` whitespace-donation the `regex` crate can't express directly.
+    ///
+    /// In the GPT-2/LLAMA3/Qwen2 pretokenizers a whitespace run *followed by* a
+    /// non-whitespace char yields its LAST whitespace char to the following
+    /// chunk — e.g. `"\n    return"` → `"\n   "` + `" return"`, not `"\n    "` +
+    /// `"return"`. Without this, indented/multi-space text (notably code)
+    /// tokenizes differently from llama.cpp.
+    ///
+    /// REFACT-family pretokenizers (`digits_split_bare`) split digits as a bare
+    /// `\p{N}` with no leading space, so a whitespace run before a digit keeps
+    /// its trailing space (llama.cpp leaves the digit bare); every other
+    /// pretokenizer uses ` ?\p{N}+`, where the digit does absorb the space.
+    fn pretokenize<'a>(&self, s: &'a str) -> Vec<&'a str> {
+        let mut ranges: Vec<(usize, usize)> = self
+            .pretokenize_re
+            .find_iter(s)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        for i in 0..ranges.len() {
+            let (a, b) = ranges[i];
+            // Whitespace runs are ASCII, so the last char is one byte — `b - 1`
+            // is a valid boundary.
+            let is_ws_run = b - a >= 2 && s.as_bytes()[a..b].iter().all(u8::is_ascii_whitespace);
+            // Only hand a trailing *space/tab* to the next chunk. A run ending in
+            // a newline is normally claimed by the earlier `\s*[\r\n]+`
+            // alternative, but guard anyway: the lookahead applies to a space
+            // before a word, never to a newline.
+            let last_is_spacetab = matches!(s.as_bytes()[b - 1], b' ' | b'\t');
+            let next_char = s[b..].chars().next();
+            let next_non_ws = next_char.is_some_and(|c| !c.is_whitespace());
+            // REFACT keeps digits bare, so don't donate a space to a following
+            // digit; other pretokenizers' ` ?\p{N}+` does take it.
+            let next_takes_space =
+                !(self.digits_split_bare && next_char.is_some_and(char::is_numeric));
+            if is_ws_run
+                && last_is_spacetab
+                && next_non_ws
+                && next_takes_space
+                && i + 1 < ranges.len()
+            {
+                ranges[i].1 = b - 1;
+                ranges[i + 1].0 = b - 1;
+            }
+        }
+        ranges.iter().map(|&(a, b)| &s[a..b]).collect()
     }
 
     /// Split text at special token boundaries, returning alternating
@@ -662,6 +687,7 @@ mod tests {
             eos_id: None,
             chat_template: None,
             pretokenize_re: build_pretokenize_regex("lfm2"),
+            digits_split_bare: false,
             byte_to_unicode: build_byte_to_unicode(),
             unicode_to_byte: build_unicode_to_byte(),
         }
@@ -714,6 +740,75 @@ mod tests {
         let chunks: Vec<&str> = re.find_iter("test 12345").map(|m| m.as_str()).collect();
         // Numbers split into 1-3 digit groups
         assert_eq!(chunks, vec!["test", " ", "123", "45"]);
+    }
+
+    #[test]
+    fn test_pretokenize_refact_splits_each_digit() {
+        // REFACT (Granite) splits numbers one digit at a time via a bare `\p{N}`,
+        // unlike LLAMA3's ` ?\p{N}+` which groups 1-3 digits.
+        let re = build_pretokenize_regex("refact");
+        let chunks: Vec<&str> = re.find_iter("12345").map(|m| m.as_str()).collect();
+        assert_eq!(chunks, vec!["1", "2", "3", "4", "5"]);
+    }
+
+    #[test]
+    fn test_pretokenize_refact_contractions_and_words() {
+        // The non-digit arms still match GPT-2 behavior (leading-space words,
+        // contraction suffixes).
+        let re = build_pretokenize_regex("refact");
+        let chunks: Vec<&str> = re.find_iter("I'm ok").map(|m| m.as_str()).collect();
+        assert_eq!(chunks, vec!["I", "'m", " ok"]);
+    }
+
+    #[test]
+    fn test_refact_keeps_whitespace_run_before_digit() {
+        // llama.cpp REFACT is a two-pass split (`\p{N}` first), so a digit is
+        // always bare and a preceding whitespace run keeps its trailing space.
+        // `pretokenize` must not donate a space to a digit when `digits_split_bare`.
+        let tok = make_pretok_tokenizer("refact");
+        assert_eq!(tok.pretokenize("  3"), vec!["  ", "3"]);
+        assert_eq!(tok.pretokenize("x  9"), vec!["x", "  ", "9"]);
+        // Indented digit (the common code case): "\n    3" → ["\n    ", "3"].
+        assert_eq!(tok.pretokenize("\n    3"), vec!["\n    ", "3"]);
+        // A single space before a digit is unaffected (emulation needs a run ≥2).
+        assert_eq!(tok.pretokenize(" 3"), vec![" ", "3"]);
+    }
+
+    #[test]
+    fn test_refact_still_donates_space_before_word() {
+        // Donation MUST still happen before a letter/symbol (those arms carry the
+        // ` ?` leading space in REFACT too), so only digits are special-cased.
+        let tok = make_pretok_tokenizer("refact");
+        assert_eq!(tok.pretokenize("  x"), vec![" ", " x"]);
+        assert_eq!(tok.pretokenize("\n    return"), vec!["\n   ", " return"]);
+    }
+
+    #[test]
+    fn test_gpt2_digit_absorbs_donated_space() {
+        // The GPT-2 pretokenizer's number arm is ` ?\p{N}+`, so a digit genuinely
+        // takes the donated leading space (matching llama.cpp's GPT-2 split) —
+        // only the bare-`\p{N}` REFACT family suppresses the donation. This guards
+        // the gating: the fix must not change non-REFACT pretokenizers.
+        let tok = make_pretok_tokenizer("gpt2");
+        assert_eq!(tok.pretokenize("  3"), vec![" ", " 3"]);
+    }
+
+    /// Minimal tokenizer for exercising `pretokenize` (regex + whitespace
+    /// emulation) without a full vocab.
+    fn make_pretok_tokenizer(pre: &str) -> BpeTokenizer {
+        BpeTokenizer {
+            vocab: Vec::new(),
+            token_to_id: HashMap::new(),
+            merge_ranks: HashMap::new(),
+            special_tokens: HashMap::new(),
+            bos_id: None,
+            eos_id: None,
+            chat_template: None,
+            pretokenize_re: build_pretokenize_regex(pre),
+            digits_split_bare: pre == "refact",
+            byte_to_unicode: build_byte_to_unicode(),
+            unicode_to_byte: build_unicode_to_byte(),
+        }
     }
 
     /// Build a tokenizer with GPT-2-style vocab (Ġ-prefixed tokens for spaces).
@@ -785,6 +880,7 @@ mod tests {
             eos_id: None,
             chat_template: None,
             pretokenize_re: build_pretokenize_regex("lfm2"),
+            digits_split_bare: false,
             byte_to_unicode: build_byte_to_unicode(),
             unicode_to_byte: build_unicode_to_byte(),
         }
