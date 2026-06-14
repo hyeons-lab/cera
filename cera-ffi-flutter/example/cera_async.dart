@@ -55,30 +55,26 @@ Future<void> main(List<String> args) async {
   print('generateAsync done: ${out.tokens.length} tokens, '
       '${out.summary.decodeMs}ms, event-loop ticks during decode=$ticks');
 
-  // generateStreamingAsync mixes async + a callback sink. cera runs it on a
-  // tokio worker thread, and NativeCallable.isolateLocal can't be invoked off
-  // the owning isolate — so it throws. (Use sync generateStreaming, optionally
-  // inside a Dart Isolate, for streaming; or generateAsync for async w/o a sink.)
+  // generateStreamingAsync mixes async + a callback sink. cera runs the sink on
+  // a tokio worker thread; the ModalitySink vtable uses NativeCallable.listener,
+  // which delivers those cross-thread callbacks onto this isolate's event loop —
+  // so the sink fires live, per token, while the Future is awaited.
   final sink = _AsyncSink();
   session.appendText(prompt);
-  try {
-    await session.generateStreamingAsync(
-      const GenerateOpts(
-        maxTokens: 16,
-        temperature: 0.0,
-        topP: 1.0,
-        topK: 0,
-        repetitionPenalty: 1.0,
-        stopTokens: <int>[],
-        flushEveryTokens: 1,
-        flushEveryMs: 0,
-      ),
-      sink,
-    );
-    print('generateStreamingAsync done: ${sink.count} tokens, finish=${sink.finish}');
-  } on UnsupportedError catch (e) {
-    print('generateStreamingAsync unsupported (expected): ${e.message}');
-  }
+  await session.generateStreamingAsync(
+    const GenerateOpts(
+      maxTokens: 16,
+      temperature: 0.0,
+      topP: 1.0,
+      topK: 0,
+      repetitionPenalty: 1.0,
+      stopTokens: <int>[],
+      flushEveryTokens: 1,
+      flushEveryMs: 0,
+    ),
+    sink,
+  );
+  print('generateStreamingAsync done: ${sink.count} tokens, finish=${sink.finish}');
   exit(0);
 }
 

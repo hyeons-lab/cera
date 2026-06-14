@@ -16,17 +16,16 @@
 //      `async` auto-wraps the return into a Future and turns the stub's throw
 //      into a rejected Future — type-correct, behaviour unchanged.
 //
-//   3. callback-interface lowering (4 sites)
-//      The generator can't lower `DownloadProgressSink` / `ModalitySink`
-//      arguments to their handle ints, so `*WithProgress` and `*Streaming*`
-//      methods don't type-check. There is no correct codegen we can recover
-//      here, so we neutralize them: the sink-lowering assignments become a
-//      `throw UnsupportedError(...)` (a `throw` is a bottom-typed expression,
-//      so it satisfies the `int` field without dead code), and the unused
-//      `onProgress` bridge call is made type-correct. Net effect: every
-//      *synchronous* engine API (`fromPath`, `generate`, `transcribe`, …)
-//      compiles and works; the progress/streaming variants throw at call time.
-//      Tracked in V2.17.
+//   (Callback-interface lowering is NO LONGER patched here. The vendored
+//    generator under `third_party/uniffi-bindgen-dart` now lowers
+//    `DownloadProgressSink` / `ModalitySink` arguments and emits working
+//    callback vtables, so the `*WithProgress` / `*Streaming*` entry points —
+//    including `generateStreamingAsync` via NativeCallable.listener — type-check
+//    and run without a patch. `fromBundleIdAsync` still throws; it needs the
+//    object/pointer rust-future variant. Tracked in V2.17.)
+//
+// Plus native-lib resolution, RustBuffer/rust_future symbol names, and the
+// EngineConfig record encoder (Fixes 4–6 below).
 
 import 'dart:io';
 
@@ -64,33 +63,12 @@ void main(List<String> args) {
     stdout.writeln('  fixed fromBundleIdAsync return type (1 site)');
   }
 
-  // Fix 3: stub the entry points that still aren't usable. Working now (NOT
-  // stubbed): sync `generate` / `generate_streaming`, and `generateAsync`
-  // (ffibuffer rust-future poll/complete — verified async, event loop stays
-  // responsive).
-  //
-  // `generateStreamingAsync` is async AND takes a callback sink. cera runs it on
-  // a tokio blocking-pool thread, so the sink fires from a NON-isolate thread —
-  // and `NativeCallable.isolateLocal` can only be invoked from its owning
-  // isolate ("Cannot invoke native callback outside an isolate"). Supporting it
-  // needs `NativeCallable.listener` (cross-thread, queued) callback vtables, a
-  // larger generator change. Stub until then. (`generate_streaming` sync is
-  // fine: callbacks fire on the calling thread.)
-  //
-  // `from_bundle_id_async` (async constructor returning an object handle) stays
-  // on the generator's own stub — it needs the object/pointer rust-future
-  // variant, which the generator doesn't emit yet.
-  // generate_streaming_async is now usable: the trait-callback vtable's void
-  // methods use NativeCallable.listener (cross-thread delivery), so sink
-  // callbacks fired from cera's tokio worker thread reach the Dart isolate.
-  const methodStubs = <String, String>{};
-  methodStubs.forEach((bad, good) {
-    if (src.contains(bad)) {
-      src = src.replaceAll(bad, good);
-      applied += 1;
-      stdout.writeln('  stubbed unsupported entry point');
-    }
-  });
+  // (No callback-stubbing fix: the vendored generator now lowers the sink
+  // arguments and emits working callback vtables, so `*WithProgress` and
+  // `*Streaming*` — including `generateStreamingAsync` via NativeCallable.listener
+  // — type-check and run without a patch. `fromBundleIdAsync` keeps the
+  // generator's own throwing stub; it needs the object/pointer rust-future
+  // variant. See V2.17.)
 
   // Fix 4: native-library resolution. The generator emits a single
   // `libraryName = 'uniffi_cera_ffi'` and `DynamicLibrary.open(libraryName)`,

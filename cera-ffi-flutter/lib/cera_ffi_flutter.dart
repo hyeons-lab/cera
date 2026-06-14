@@ -2,19 +2,18 @@
 ///
 /// This is the package's public entry point. It re-exports:
 /// - [CeraLibrary] — the platform-aware native-library loader.
-/// - (after generation) the UniFFI bindings from `src/generated/cera_ffi.dart`.
+/// - the UniFFI engine bindings from `src/generated/cera_ffi.dart`
+///   (`CeraEngine`, `EngineConfig`, `Session`, `ModalitySink`, …).
 ///
-/// ## Generating the bindings
+/// ## Regenerating the bindings
 ///
-/// The generated UniFFI bindings are not committed (see V2.17 in
-/// `docs/IMPLEMENTATION_PLAN.md`). Produce them from the repo root with:
+/// The generated UniFFI bindings are committed under
+/// `src/generated/cera_ffi.dart`. Regenerate them from the repo root if the
+/// Rust FFI surface changes (see V2.17 in `docs/IMPLEMENTATION_PLAN.md`):
 ///
 /// ```sh
 /// just dart-bindings
 /// ```
-///
-/// which writes `lib/src/generated/cera_ffi.dart`. Once present, uncomment the
-/// export below to surface the engine API (`CeraEngine`, `EngineConfig`, …).
 ///
 /// ## Usage sketch
 ///

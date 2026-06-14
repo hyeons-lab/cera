@@ -9,11 +9,12 @@ native-library loader. The Dart bindings are generated from the compiled
 `cera-ffi` cdylib by `uniffi-bindgen-dart` and then run through a small,
 deterministic patch tool that fixes the generator's known bugs.
 
-> **Status: working (V2.17).** The synchronous engine API — model load,
-> sessions, `generate`, `transcribe`, tokenizer access — round-trips real
-> inference (verified loading a Qwen2 GGUF and generating tokens). The
-> async + streaming-callback surface (`generateStreaming*`, progress sinks) is
-> stubbed to throw pending upstream codegen support — see [Limitations](#limitations).
+> **Status: working (V2.17).** The engine API — model load, sessions,
+> `generate`, `transcribe`, and tokenizer access — works end-to-end, including
+> the async (`generateAsync`) and streaming-callback (`generateStreaming*`,
+> progress sinks) surfaces, all driven through the vendored generator's
+> callback support. Verified loading a Qwen2 GGUF and streaming tokens into a
+> Dart `ModalitySink`. See [Limitations](#limitations).
 
 ## Layout
 
