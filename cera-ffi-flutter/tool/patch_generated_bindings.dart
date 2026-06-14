@@ -23,10 +23,17 @@
 //      here, so we neutralize them: the sink-lowering assignments become a
 //      `throw UnsupportedError(...)` (a `throw` is a bottom-typed expression,
 //      so it satisfies the `int` field without dead code), and the unused
-//      `onProgress` bridge call is made type-correct. Net effect: every
-//      *synchronous* engine API (`fromPath`, `generate`, `transcribe`, …)
-//      compiles and works; the progress/streaming variants throw at call time.
-//      Tracked in V2.17.
+//      `onProgress` bridge call is made type-correct. These methods then throw
+//      at call time. Tracked in V2.17.
+//
+// What it does NOT (and cannot) fix:
+//      The generator emits throwing stubs for every `Result`-returning method
+//      (`transcribe`, `encodeText`, `decodeTokens`, `applyChatTemplate`,
+//      `storeDir`, `fromBundleId*`) because it hasn't implemented the
+//      RustCallStatus out-arg ABI they use — a separate gap from the callback
+//      lowering above, with no local fix. Only the ffibuffer-path methods
+//      (`fromPath`, `newSession`, `appendText`, `generate`, …) actually work;
+//      the rest throw `UnsupportedError` at call time. Tracked in V2.17.
 
 import 'dart:io';
 
