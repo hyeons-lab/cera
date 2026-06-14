@@ -821,7 +821,11 @@ fn render_trait_callback_bridge(
 
     // free native callable. Void → can be a cross-thread `listener` when this
     // interface is used asynchronously; otherwise same-thread `isolateLocal`.
-    let free_ctor = if use_listener { "listener" } else { "isolateLocal" };
+    let free_ctor = if use_listener {
+        "listener"
+    } else {
+        "isolateLocal"
+    };
     out.push_str(&format!(
         "  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)> _freeNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)>.{free_ctor}((int handle) {{\n",
     ));
@@ -835,6 +839,34 @@ fn render_trait_callback_bridge(
     out.push_str("    return instance.cloneHandle(handle);\n");
     out.push_str("  }, exceptionalReturn: 0);\n\n");
 
+    // RustBuffer callback args are passed by value, and Rust transfers ownership
+    // of the lowered buffer to the foreign callback (standard UniFFI
+    // foreign-callback contract). The bridge must free each one after decoding
+    // its value — otherwise every callback invocation leaks a RustBuffer. Emit a
+    // shared helper once (only when some method actually takes a buffer arg).
+    let object_has_buffer_arg = object
+        .methods
+        .iter()
+        .filter(|m| !is_uniffi_trait_method_name(&m.name))
+        .any(|m| m.args.iter().any(|a| is_callback_rustbuffer_type(&a.type_)));
+    if object_has_buffer_arg {
+        out.push_str("  static void _uniffiFreeArgBuffer(_UniFfiRustBuffer buf) {\n");
+        out.push_str("    if (buf.data == ffi.nullptr && buf.len == 0 && buf.capacity == 0) {\n");
+        out.push_str("      return;\n");
+        out.push_str("    }\n");
+        out.push_str(
+            "    final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();\n",
+        );
+        out.push_str("    freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;\n");
+        out.push_str("    freeStatusPtr.ref.errorBuf\n");
+        out.push_str("      ..capacity = 0\n");
+        out.push_str("      ..len = 0\n");
+        out.push_str("      ..data = ffi.nullptr;\n");
+        out.push_str("    _bindings()._uniFfiRustBufferFree(buf, freeStatusPtr);\n");
+        out.push_str("    calloc.free(freeStatusPtr);\n");
+        out.push_str("  }\n\n");
+    }
+
     // Per-method native callables
     for method in &object.methods {
         if is_uniffi_trait_method_name(&method.name) {
@@ -846,6 +878,7 @@ fn render_trait_callback_bridge(
         let mut ffi_args = vec!["ffi.Uint64 handle".to_string()];
         let mut dart_args = vec!["int handle".to_string()];
         let mut callback_args = Vec::new();
+        let mut buffer_arg_names = Vec::new();
 
         for arg in &method.args {
             let arg_name = safe_dart_identifier(&to_lower_camel(&arg.name));
@@ -861,7 +894,18 @@ fn render_trait_callback_bridge(
                 enums,
                 custom_types,
             ));
+            if is_callback_rustbuffer_type(&arg.type_) {
+                buffer_arg_names.push(arg_name);
+            }
         }
+
+        // Free statements for the RustBuffer args (6-space indent, for inside a
+        // try/finally or if-block). Empty when the method takes no buffer args.
+        let free_buffers: String = buffer_arg_names
+            .iter()
+            .map(|n| format!("      _uniffiFreeArgBuffer({n});\n"))
+            .collect();
+        let has_buffers = !buffer_arg_names.is_empty();
 
         if let Some(return_type) = method.return_type.as_ref() {
             let out_type =
@@ -881,7 +925,11 @@ fn render_trait_callback_bridge(
         // synchronously (write `outReturn`), which only `isolateLocal` can do —
         // those stay isolate-local (and thus same-thread-only).
         let is_listener = use_listener && method.return_type.is_none();
-        let ctor = if is_listener { "listener" } else { "isolateLocal" };
+        let ctor = if is_listener {
+            "listener"
+        } else {
+            "isolateLocal"
+        };
         out.push_str(&format!(
             "  static final ffi.NativeCallable<ffi.Void Function({})> {native_callable_name} = ffi.NativeCallable<ffi.Void Function({})>.{ctor}(({}) {{\n",
             ffi_args.join(", "),
@@ -895,11 +943,15 @@ fn render_trait_callback_bridge(
             // already consumed by Rust (which pre-initialises the status to
             // success). We therefore only deliver the decoded args and must NOT
             // touch the (now-stale) out pointers. Foreign-side errors can't be
-            // reported back on this path, so they're swallowed.
+            // reported back on this path, so they're swallowed. RustBuffer args
+            // are still owned by us and freed in `finally` (and on early return).
             out.push_str(&format!(
                 "    final {object_name}? callback = instance.lookup(handle);\n"
             ));
-            out.push_str("    if (callback == null) {\n      return;\n    }\n");
+            out.push_str("    if (callback == null) {\n");
+            out.push_str(&free_buffers);
+            out.push_str("      return;\n");
+            out.push_str("    }\n");
             out.push_str("    try {\n");
             out.push_str(&format!(
                 "      callback.{method_name}({});\n",
@@ -907,16 +959,27 @@ fn render_trait_callback_bridge(
             ));
             out.push_str("    } catch (_) {\n");
             out.push_str("      // async listener: no channel to report a Dart error to Rust\n");
-            out.push_str("    }\n");
+            if has_buffers {
+                out.push_str("    } finally {\n");
+                out.push_str(&free_buffers);
+                out.push_str("    }\n");
+            } else {
+                out.push_str("    }\n");
+            }
             out.push_str("  });\n\n");
         } else {
+            // Synchronous (isolateLocal) bridge. Owns its RustBuffer args too;
+            // free them in `finally`. `errorBuf` is set to nullptr (the error
+            // code still propagates) — handing Rust a `toNativeUtf8()` C string
+            // both leaks it and is ambiguous to free across the FFI boundary.
             out.push_str(&format!(
                 "    final {object_name}? callback = instance.lookup(handle);\n"
             ));
             out.push_str("    if (callback == null) {\n");
+            out.push_str(&free_buffers);
             out.push_str("      outStatus.ref\n");
             out.push_str("        ..code = _rustCallStatusUnexpectedError\n");
-            out.push_str("        ..errorBuf = 'Invalid callback handle'.toNativeUtf8();\n");
+            out.push_str("        ..errorBuf = ffi.nullptr;\n");
             out.push_str("      return;\n");
             out.push_str("    }\n");
             out.push_str("    try {\n");
@@ -942,11 +1005,17 @@ fn render_trait_callback_bridge(
             out.push_str("      outStatus.ref\n");
             out.push_str("        ..code = _rustCallStatusSuccess\n");
             out.push_str("        ..errorBuf = ffi.nullptr;\n");
-            out.push_str("    } catch (err) {\n");
+            out.push_str("    } catch (_) {\n");
             out.push_str("      outStatus.ref\n");
             out.push_str("        ..code = _rustCallStatusUnexpectedError\n");
-            out.push_str("        ..errorBuf = err.toString().toNativeUtf8();\n");
-            out.push_str("    }\n");
+            out.push_str("        ..errorBuf = ffi.nullptr;\n");
+            if has_buffers {
+                out.push_str("    } finally {\n");
+                out.push_str(&free_buffers);
+                out.push_str("    }\n");
+            } else {
+                out.push_str("    }\n");
+            }
             out.push_str("  });\n\n");
         }
     }

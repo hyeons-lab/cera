@@ -112,10 +112,12 @@ Tracked in `docs/IMPLEMENTATION_PLAN.md` → **V2.17**:
   synchronously (it's sync-only, so its vtable stays `isolateLocal`), args
   correctly decoded (`example/cera_progress.dart`).
 
-The vendored generator (`third_party/uniffi-bindgen-dart/`) carries five fixes
+The vendored generator (`third_party/uniffi-bindgen-dart/`) carries six fixes
 that enable all this — to be upstreamed: callback-arg lowering, vtable-init
-symbol, vtable slot order, RustBuffer callback-arg ABI, and the per-interface
-`listener`/`isolateLocal` choice.
+symbol, vtable slot order, RustBuffer callback-arg ABI, the per-interface
+`listener`/`isolateLocal` choice, and freeing the RustBuffer callback arguments
+after decode (Rust transfers their ownership to the callback) plus a null
+`errorBuf` on the callback error path — both to avoid per-callback leaks.
 
 **Not yet supported (throws `UnsupportedError`):**
 - **`fromBundleIdAsync`** — async constructor returning an object handle; needs

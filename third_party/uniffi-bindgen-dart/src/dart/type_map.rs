@@ -573,7 +573,7 @@ pub(super) fn map_runtime_dart_ffi_type(
 /// `RustBuffer` by value (must match `render_callback_arg_decode_expr`). Bytes /
 /// Map keep their existing runtime mapping; Object / Optional<Object> stay
 /// scalar handles.
-fn is_callback_rustbuffer_type(type_: &Type) -> bool {
+pub(super) fn is_callback_rustbuffer_type(type_: &Type) -> bool {
     let t = if let Type::Custom { builtin, .. } = type_ {
         builtin.as_ref()
     } else {

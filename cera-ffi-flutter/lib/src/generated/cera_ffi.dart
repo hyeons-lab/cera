@@ -6697,12 +6697,28 @@ final class _DownloadProgressSinkTraitCallbackBridge {
     return instance.cloneHandle(handle);
   }, exceptionalReturn: 0);
 
+  static void _uniffiFreeArgBuffer(_UniFfiRustBuffer buf) {
+    if (buf.data == ffi.nullptr && buf.len == 0 && buf.capacity == 0) {
+      return;
+    }
+    final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+    freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+    freeStatusPtr.ref.errorBuf
+      ..capacity = 0
+      ..len = 0
+      ..data = ffi.nullptr;
+    _bindings()._uniFfiRustBufferFree(buf, freeStatusPtr);
+    calloc.free(freeStatusPtr);
+  }
+
   static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onProgressNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.isolateLocal((int handle, _UniFfiRustBuffer url, int bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
     final DownloadProgressSink? callback = instance.lookup(handle);
     if (callback == null) {
+      _uniffiFreeArgBuffer(url);
+      _uniffiFreeArgBuffer(totalBytes);
       outStatus.ref
         ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = 'Invalid callback handle'.toNativeUtf8();
+        ..errorBuf = ffi.nullptr;
       return;
     }
     try {
@@ -6710,10 +6726,13 @@ final class _DownloadProgressSinkTraitCallbackBridge {
       outStatus.ref
         ..code = _rustCallStatusSuccess
         ..errorBuf = ffi.nullptr;
-    } catch (err) {
+    } catch (_) {
       outStatus.ref
         ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = err.toString().toNativeUtf8();
+        ..errorBuf = ffi.nullptr;
+    } finally {
+      _uniffiFreeArgBuffer(url);
+      _uniffiFreeArgBuffer(totalBytes);
     }
   });
 
@@ -6906,39 +6925,62 @@ final class _ModalitySinkTraitCallbackBridge {
     return instance.cloneHandle(handle);
   }, exceptionalReturn: 0);
 
+  static void _uniffiFreeArgBuffer(_UniFfiRustBuffer buf) {
+    if (buf.data == ffi.nullptr && buf.len == 0 && buf.capacity == 0) {
+      return;
+    }
+    final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+    freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+    freeStatusPtr.ref.errorBuf
+      ..capacity = 0
+      ..len = 0
+      ..data = ffi.nullptr;
+    _bindings()._uniFfiRustBufferFree(buf, freeStatusPtr);
+    calloc.free(freeStatusPtr);
+  }
+
   static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onTextTokensNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
     final ModalitySink? callback = instance.lookup(handle);
     if (callback == null) {
+      _uniffiFreeArgBuffer(tokens);
       return;
     }
     try {
       callback.onTextTokens((() { final r = _UniFfiBinaryReader(tokens.data.asTypedList(tokens.len)); final n = r.readI32(); return List.generate(n, (_) => r.readU32()); })());
     } catch (_) {
       // async listener: no channel to report a Dart error to Rust
+    } finally {
+      _uniffiFreeArgBuffer(tokens);
     }
   });
 
   static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onAudioFramesNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer pcm, int sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
     final ModalitySink? callback = instance.lookup(handle);
     if (callback == null) {
+      _uniffiFreeArgBuffer(pcm);
       return;
     }
     try {
       callback.onAudioFrames((() { final r = _UniFfiBinaryReader(pcm.data.asTypedList(pcm.len)); final n = r.readI32(); return List.generate(n, (_) => r.readF32()); })(), sampleRate);
     } catch (_) {
       // async listener: no channel to report a Dart error to Rust
+    } finally {
+      _uniffiFreeArgBuffer(pcm);
     }
   });
 
   static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onDoneNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
     final ModalitySink? callback = instance.lookup(handle);
     if (callback == null) {
+      _uniffiFreeArgBuffer(reason);
       return;
     }
     try {
       callback.onDone(_uniffiReadFinishReason(_UniFfiBinaryReader(reason.data.asTypedList(reason.len))));
     } catch (_) {
       // async listener: no channel to report a Dart error to Rust
+    } finally {
+      _uniffiFreeArgBuffer(reason);
     }
   });
 
