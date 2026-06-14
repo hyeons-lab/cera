@@ -9,6 +9,10 @@ use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvPrefixCache, LayerState};
 use crate::model::transformer::{self, FfnWeights};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
+// DType is only referenced from the BLAS prefill path and the aarch64 NEON
+// GEMM dispatch (the dtype == Q4_0/Q8_0 checks); on x86_64 without `blas` none
+// of those compile, so the import would be unused. Gate it to match.
+#[cfg(any(feature = "blas", target_arch = "aarch64"))]
 use crate::tensor::DType;
 use crate::turboquant;
 
@@ -389,34 +393,9 @@ impl Lfm2Model {
         self.weight_data(wref)
     }
 
-    /// Dequantize a weight matrix to f32 given a WeightRef.
-    #[allow(dead_code)]
-    pub(crate) fn dequantize_weight(&self, wref: &crate::model::lfm2::WeightRef) -> Vec<f32> {
-        let mut out = vec![0.0f32; wref.m * wref.k];
-        let data = self.weight_data(wref);
-        let row_bytes = wref.k / wref.dtype.block_size() * wref.dtype.block_bytes();
-        for row in 0..wref.m {
-            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
-            let row_out = &mut out[row * wref.k..(row + 1) * wref.k];
-            self.dequantize_row_into_slice(wref, row_data, row_out);
-        }
-        out
-    }
-
-    #[allow(dead_code)]
-    fn dequantize_row_into_slice(&self, wref: &WeightRef, row_data: &[u8], out: &mut [f32]) {
-        match wref.dtype {
-            DType::Q6K => crate::quant::dequantize_q6_k_row(row_data, out),
-            DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, out),
-            DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, out),
-            DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, out),
-            DType::F32 => {
-                let floats: &[f32] = bytemuck::cast_slice(row_data);
-                out.copy_from_slice(floats);
-            }
-            _ => panic!("unsupported dtype: {:?}", wref.dtype),
-        }
-    }
+    // Full-matrix dequant lives in `transformer::dequantize_weight`; the LFM2
+    // `GpuWeightSource` impl delegates to it. (The old inherent duplicate +
+    // `dequantize_row_into_slice` helper were removed — single implementation.)
 
     /// Access the per-layer weight refs (for GPU model construction).
     #[allow(dead_code)]

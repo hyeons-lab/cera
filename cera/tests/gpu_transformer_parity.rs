@@ -129,50 +129,63 @@ fn check_parity(model_file: &str, prompt: &str, n_predict: usize) -> Option<Resu
     eprintln!("  cpu text: {:?}", tokenizer.decode(&cpu_toks));
     eprintln!("  gpu text: {:?}", tokenizer.decode(&gpu_toks));
 
-    // First index where the greedy streams differ. Everything before it matched
-    // exactly — same tokens fed identically through the full forward pass — so a
-    // wrong rope layout / dropped bias / missing scalar (which perturbs every
-    // step) would diverge at index 0–1, not deep into the stream.
-    let div = cpu_toks.iter().zip(&gpu_toks).position(|(a, b)| a != b);
-    let div = match div {
-        None if cpu_toks.len() == gpu_toks.len() => {
+    // Lowest index where the streams differ on their overlapping prefix. `None`
+    // ⇒ no token-level disagreement (one may just be shorter).
+    let Some(div) = cpu_toks.iter().zip(&gpu_toks).position(|(a, b)| a != b) else {
+        // Identical on the overlap. Equal length = exact match. Unequal length
+        // means one backend emitted EOS a step earlier — a near-tie at the EOS
+        // boundary; the shorter stream didn't record that step's logits, so
+        // there's nothing to classify, and the long shared prefix already proves
+        // numerical equivalence. Benign either way (and never indexes *_steps,
+        // which would be out of bounds at min(len)).
+        if cpu_toks.len() == gpu_toks.len() {
             eprintln!("  exact match across {} tokens", cpu_toks.len());
-            return Some(Ok(()));
+        } else {
+            eprintln!(
+                "  match across {} shared tokens; benign EOS-timing length diff ({} vs {})",
+                cpu_toks.len().min(gpu_toks.len()),
+                cpu_toks.len(),
+                gpu_toks.len()
+            );
         }
-        None => cpu_toks.len().min(gpu_toks.len()),
-        Some(d) => d,
+        return Some(Ok(()));
     };
 
-    // The streams diverge at `div`. Decide whether it's a benign near-tie (Q8
-    // GPU/CPU accumulation noise tipping two nearly-equal logits) or a real bug.
-    // On CPU's own logits at that step, the gap between CPU's pick and GPU's pick
-    // must be a tiny fraction of the logit scale; ditto symmetrically on GPU.
-    // A real bug makes GPU pick a token CPU ranked far below — a large gap.
+    // `div` is strictly less than the shorter stream's length, so indexing
+    // `*_steps[div]` below is in bounds. Classify the divergence: a benign
+    // near-tie (Q8 GPU/CPU accumulation noise tipping two nearly-equal logits)
+    // has a tiny CPU-pick-vs-GPU-pick logit gap on BOTH backends; a real bug
+    // makes one backend pick a token the other ranked far below — a large gap.
+    //
+    // Also require a meaningful exact-match prefix: a wrong rope/bias/scalar
+    // perturbs every step, so a genuine bug diverges at the very start. An early
+    // flip is failed even if its gap looks small — that early position is itself
+    // the bug signature, so a coincidentally-tied first token must not pass.
     const TIE_REL_TOL: f64 = 0.02;
+    const MIN_MATCH_PREFIX: usize = 4;
     let gap_rel = |logits: &[f32], a: u32, b: u32| -> f64 {
         let la = logits[a as usize] as f64;
         let lb = logits[b as usize] as f64;
         let scale = la.abs().max(lb.abs()).max(1.0);
         (la - lb).abs() / scale
     };
-    let cpu_l = &cpu_steps[div].logits;
-    let gpu_l = &gpu_steps[div].logits;
     let cpu_pick = cpu_toks[div];
     let gpu_pick = gpu_toks[div];
-    let gap_cpu = gap_rel(cpu_l, cpu_pick, gpu_pick);
-    let gap_gpu = gap_rel(gpu_l, cpu_pick, gpu_pick);
+    let gap_cpu = gap_rel(&cpu_steps[div].logits, cpu_pick, gpu_pick);
+    let gap_gpu = gap_rel(&gpu_steps[div].logits, cpu_pick, gpu_pick);
     eprintln!(
         "  diverge@{div}: cpu_pick={cpu_pick} gpu_pick={gpu_pick} \
          gap_cpu={gap_cpu:.4} gap_gpu={gap_gpu:.4} (matched {div} tokens)"
     );
 
-    if gap_cpu < TIE_REL_TOL && gap_gpu < TIE_REL_TOL {
+    if div >= MIN_MATCH_PREFIX && gap_cpu < TIE_REL_TOL && gap_gpu < TIE_REL_TOL {
         eprintln!("  near-tie flip at {div} (within Q8 noise) — not a bug");
         Some(Ok(()))
     } else {
         Some(Err(format!(
-            "{model_file}: GPU diverges at token {div} and it is NOT a near-tie \
-             (gap_cpu={gap_cpu:.4}, gap_gpu={gap_gpu:.4} ≥ {TIE_REL_TOL})\n    \
+            "{model_file}: GPU diverges at token {div} and it is NOT a benign near-tie \
+             (need div ≥ {MIN_MATCH_PREFIX} and gap < {TIE_REL_TOL}; got \
+             gap_cpu={gap_cpu:.4}, gap_gpu={gap_gpu:.4})\n    \
              cpu: {cpu_toks:?}\n    gpu: {gpu_toks:?}"
         )))
     }

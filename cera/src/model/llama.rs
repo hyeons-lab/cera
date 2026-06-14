@@ -615,8 +615,14 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
         self.rope_type
     }
     fn supports_batched_prefill(&self) -> bool {
-        // Correctness-first: dense transformers prefill via the per-token
-        // decode loop. Batched-prefill shaders for these archs are a follow-up.
+        // Correctness-first: dense transformers prefill via the per-token decode
+        // loop. Returning `true` here is NOT safe yet — two concrete blockers in
+        // the batched path must be lifted first: (1) `encode_qk_norm_rope_batch`
+        // hardcodes `rope_type = 0` (NEOX), wrong for the NORM archs
+        // (LLaMA/Mistral/Granite); (2) `qk_norm_rope_batch.wgsl` has no
+        // freq_factors binding, so Llama-3 RoPE scaling would be dropped. Also
+        // missing: QKV bias, untied output, and Granite scalars on the batched
+        // path. Until those land, dense transformers stay on the per-token loop.
         false
     }
 }

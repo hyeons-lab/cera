@@ -279,7 +279,9 @@ pub struct GpuLfm2Model {
     logit_scale_params: Option<wgpu::Buffer>,
     conv1d_params: wgpu::Buffer,        // [hs, kernel_size, d_conv, 0]
     per_head_norm_params: wgpu::Buffer, // [head_dim, eps_bits, 0, 0]
-    rope_params: wgpu::Buffer, // [pos, n_heads, n_kv_heads, head_dim, theta_bits] — updated per token
+    // [pos, n_heads, n_kv_heads, head_dim, theta_bits, rope_type, has_freq_factors]
+    // — 7 u32, updated per token; must stay in sync with rope.wgsl's params array.
+    rope_params: wgpu::Buffer,
     attn_params: wgpu::Buffer, // [n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale, 0, 0] — updated per token
     gemv_f32_tile_params: Vec<wgpu::Buffer>, // [rows, k, row_base, 0] per output-projection tile
     // Conv scratch
@@ -2955,7 +2957,11 @@ impl GpuLfm2Model {
     fn snapshot_state_locked(&self) -> StateSnapshot {
         let seq_len = self.gpu_state.seq_len.load(Ordering::Relaxed);
         let cfg = &self.config;
-        let head_dim = cfg.hidden_size / cfg.n_heads;
+        // Use config.head_dim, NOT hidden_size/n_heads: Qwen3 decouples head_dim
+        // (attention.key_length), so the KV cache is sized by config.head_dim. The
+        // stale formula under-counts the snapshot/restore floats and corrupts the
+        // KV cache on a prefix-cache hit. Matches the from_weight_source alloc.
+        let head_dim = cfg.head_dim;
         let kernel_size = cfg.conv_kernel_size.unwrap_or(3);
         let d_conv = kernel_size - 1;
 

@@ -1,9 +1,9 @@
 // RoPE: Rotary Position Embedding applied to Q and K vectors.
 //
 // Each thread handles one (cos, sin) pair for one dimension pair in one head.
-// Applied to both Q (n_heads) and K (n_kv_heads) concatenated in the same buffer:
-//   q_and_k[0..n_heads*head_dim] = Q
-//   q_and_k[n_heads*head_dim..] = K (only first n_kv_heads*head_dim used)
+// Q and K live in separate buffers (bindings 0 and 1); the same thread index
+// rotates the matching pair in each (Q over n_heads, K over n_kv_heads), with
+// every head indexed from its own buffer base (head * head_dim).
 //
 // Two pair layouts, selected by `rope_type` (matches `cpu::RopeType`):
 //   0 = NEOX (split-halves): rotates (x[d], x[d + head_dim/2]). Qwen2/Qwen3/LFM2.
