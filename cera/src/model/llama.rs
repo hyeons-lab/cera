@@ -16,7 +16,7 @@
 // llama.cpp, so the correct rope layout is selected per arch (NEOX vs NORM)
 // rather than permuting weights at load.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::backend::cpu;
 use crate::backend::cpu::RopeType;
@@ -107,7 +107,15 @@ impl LlamaModel {
         // LLaMA-family (incl. Mistral and Granite) are NORM (interleaved pairs).
         let rope_type = match prefix {
             "qwen2" | "qwen3" => RopeType::Neox,
-            _ => RopeType::Norm,
+            "llama" | "mistral" | "granite" => RopeType::Norm,
+            // Keep exhaustive with the `load_model` dispatch allow-list: a new arch
+            // routed here without a layout mapping must fail loudly rather than
+            // silently default to NORM (wrong for any NEOX-family arch — phi3,
+            // stablelm, gemma, starcoder2, … are all NEOX in llama.cpp).
+            other => bail!(
+                "LlamaModel: no RoPE layout mapping for arch {other:?}; \
+                 add it to the rope_type match in llama.rs"
+            ),
         };
 
         // Granite 3.x scalar multipliers (HF names in parens). Absent on every
