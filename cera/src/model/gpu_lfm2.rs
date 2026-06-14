@@ -9,10 +9,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 
+use crate::backend::cpu::RopeType;
 use crate::backend::wgpu::{GpuContext, GpuTensor, shaders};
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvPrefixCache, LayerSnapshot, StateSnapshot};
-use crate::model::{BlockType, Model, ModelConfig};
+use crate::model::gpu_weight_source::GpuWeightSource;
+use crate::model::transformer::WeightRef;
+use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 use crate::tensor::DType;
 
 /// Maximum N for a single batched-prefill dispatch. Mirrors the Metal
@@ -139,6 +142,11 @@ struct GpuLayerWeights {
     attn_output: Option<GpuWeight>,
     attn_q_norm: Option<wgpu::Buffer>,
     attn_k_norm: Option<wgpu::Buffer>,
+    // Qwen2 Q/K/V projection biases (f32), added after each projection GEMV.
+    // `None` for archs without QKV bias.
+    attn_q_bias: Option<wgpu::Buffer>,
+    attn_k_bias: Option<wgpu::Buffer>,
+    attn_v_bias: Option<wgpu::Buffer>,
 }
 
 /// Compute pipelines for all shader entry points.
@@ -150,6 +158,12 @@ struct GpuPipelines {
     gemv_q6_k: wgpu::ComputePipeline,
     gemv_q8_0: wgpu::ComputePipeline,
     add_inplace: wgpu::ComputePipeline,
+    /// Residual add with a scalar on the addend (`a += s*b`). Used for the
+    /// attention/FFN residual adds so Granite's residual multiplier folds in;
+    /// `s = 1.0` for every other arch.
+    scaled_add_inplace: wgpu::ComputePipeline,
+    /// In-place scale by a constant (`a *= s`). Granite logit/residual scalars.
+    scale_f32: wgpu::ComputePipeline,
     mul_inplace: wgpu::ComputePipeline,
     silu_mul_inplace: wgpu::ComputePipeline,
     rmsnorm: wgpu::ComputePipeline,
@@ -203,8 +217,26 @@ pub struct GpuLfm2Model {
     embedding: wgpu::Buffer,
     #[allow(dead_code)]
     embedding_params: wgpu::Buffer,
+    /// Separate output projection (`output.weight`), dequantized to f32, when
+    /// the model has untied embeddings. `None` ⇒ the logit projection reuses
+    /// `embedding` (tied embeddings — LFM2, Qwen, Llama-3.2, Granite).
+    output_weight: Option<wgpu::Buffer>,
     output_norm: wgpu::Buffer,
     layers: Vec<GpuLayerWeights>,
+    /// RoPE pair layout for this model (`Neox` LFM2/Qwen, `Norm` Llama family).
+    rope_type: RopeType,
+    /// Granite 3.x scalar multipliers (identity for every other arch). The
+    /// embedding multiplier is pre-folded into `gpu_state.embedding_f32`; the
+    /// residual/attention/logit multipliers are applied during the forward pass.
+    scalars: ScalarMultipliers,
+    /// Whether the batched-prefill GPU path is enabled (LFM2 only today; the
+    /// dense transformers prefill via the per-token decode loop).
+    batched_prefill: bool,
+    /// Llama-3 RoPE frequency factors (`rope_freqs.weight`), or a 1-element
+    /// dummy when the model uses plain RoPE. Always bound (binding 3) on the
+    /// decode rope dispatch; `has_freq_factors` in `rope_params` gates its use.
+    rope_freqs_buf: wgpu::Buffer,
+    has_freq_factors: bool,
     // GPU scratch buffers (reused across layers)
     hidden_buf: wgpu::Buffer,    // [hidden_size]
     normed_buf: wgpu::Buffer,    // [hidden_size]
@@ -232,11 +264,21 @@ pub struct GpuLfm2Model {
     /// (logits_buf, argmax_out_buf, argmax_params), so build it once.
     argmax_bg: wgpu::BindGroup,
     // Pre-allocated shader params (avoids upload_storage per dispatch).
-    rmsnorm_hs_params: wgpu::Buffer,         // [hs, eps_bits, 0, 0]
-    elementwise_hs_params: wgpu::Buffer,     // [hs, 0]
-    elementwise_is_params: wgpu::Buffer,     // [intermediate_size, 0]
-    conv1d_params: wgpu::Buffer,             // [hs, kernel_size, d_conv, 0]
-    per_head_norm_params: wgpu::Buffer,      // [head_dim, eps_bits, 0, 0]
+    rmsnorm_hs_params: wgpu::Buffer,     // [hs, eps_bits, 0, 0]
+    elementwise_hs_params: wgpu::Buffer, // [hs, 0]
+    elementwise_is_params: wgpu::Buffer, // [intermediate_size, 0]
+    /// `[n_heads*head_dim, 0]` — Q bias add length (= hs when head_dim=hs/n_heads).
+    elementwise_qdim_params: wgpu::Buffer,
+    /// `[n_kv_heads*head_dim, 0]` — K/V bias add length.
+    elementwise_kvdim_params: wgpu::Buffer,
+    /// `[hs, residual_scale_bits]` — addend scalar for the attention/FFN
+    /// residual `scaled_add_inplace` (Granite residual multiplier; 1.0 else).
+    residual_add_params: wgpu::Buffer,
+    /// `[vocab_size, (1/logit_scale)_bits]` — Granite logit-scale divide, applied
+    /// via `scale_f32` after the LM head. `None` when logit_scale == 1.0.
+    logit_scale_params: Option<wgpu::Buffer>,
+    conv1d_params: wgpu::Buffer,        // [hs, kernel_size, d_conv, 0]
+    per_head_norm_params: wgpu::Buffer, // [head_dim, eps_bits, 0, 0]
     rope_params: wgpu::Buffer, // [pos, n_heads, n_kv_heads, head_dim, theta_bits] — updated per token
     attn_params: wgpu::Buffer, // [n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale, 0, 0] — updated per token
     gemv_f32_tile_params: Vec<wgpu::Buffer>, // [rows, k, row_base, 0] per output-projection tile
@@ -321,19 +363,52 @@ impl GpuLfm2Model {
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
+        let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
+        Self::from_weight_source(&cpu_model, context_size, model_id)
+    }
+
+    /// Construct a GPU model for a dense transformer (Qwen2/Qwen3/LLaMA/
+    /// Mistral/Granite) — the `LlamaModel` family. Mirrors `from_gguf_with_id`
+    /// but feeds the shared loader a `LlamaModel` weight source instead of
+    /// `Lfm2Model`. The GPU forward path is arch-generic; per-arch behavior
+    /// (NEOX/NORM rope, QK-norm, QKV bias, untied output, Granite scalars) is
+    /// driven by the `GpuWeightSource` accessors + `config`.
+    pub fn from_llama_with_id(
+        gguf: GgufFile,
+        context_size: usize,
+        model_id: String,
+    ) -> Result<Self> {
+        let cpu_model =
+            super::llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id.clone())?;
+        Self::from_weight_source(&cpu_model, context_size, model_id)
+    }
+
+    /// Generalized GPU loader over any [`GpuWeightSource`]. Uploads weights,
+    /// builds pipelines + scratch, and wires the arch-specific knobs. The
+    /// concrete CPU model (`Lfm2Model` / `LlamaModel`) is only borrowed here
+    /// for its weights/metadata; it is dropped on return.
+    fn from_weight_source(
+        src: &dyn GpuWeightSource,
+        context_size: usize,
+        model_id: String,
+    ) -> Result<Self> {
         let ctx = GpuContext::new()?;
 
-        // Parse config (same as CPU Lfm2Model). The CPU loader already caps
-        // max_seq_len to context_size internally, so the second .min() below
-        // is redundant but kept for clarity.
-        let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
-        let mut config = cpu_model.config().clone();
+        // The CPU loader already caps max_seq_len to context_size internally,
+        // so the second .min() below is redundant but kept for clarity.
+        let mut config = src.config().clone();
         let max_seq_len = context_size.min(config.max_seq_len);
         config.max_seq_len = max_seq_len;
         let hs = config.hidden_size;
         let is = config.intermediate_size;
-        let max_kv_dim =
-            config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * (hs / config.n_heads);
+        // head_dim is decoupled from hidden/n_heads (Qwen3 sets it explicitly),
+        // so size Q/K/V/attn-out buffers by config.head_dim, not hs/n_heads.
+        let head_dim = config.head_dim;
+        let q_dim = config.n_heads * head_dim;
+        let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * head_dim;
+        let rope_type = src.rope_type();
+        let scalars = config.scalars;
+        let batched_prefill = src.supports_batched_prefill();
 
         tracing::info!(
             "GPU model: {} layers, hs={hs}, is={is}, vocab={}",
@@ -353,6 +428,12 @@ impl GpuLfm2Model {
             gemv_q6_k: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k", "gemv_q6_k"),
             gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0", "gemv_q8_0"),
             add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "add"),
+            scaled_add_inplace: ctx.create_pipeline(
+                shaders::ELEMENTWISE,
+                "scaled_add_inplace",
+                "scaled_add",
+            ),
+            scale_f32: ctx.create_pipeline(shaders::SCALE_F32, "scale_f32", "scale_f32"),
             mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_inplace", "mul"),
             silu_mul_inplace: ctx.create_pipeline(
                 shaders::ELEMENTWISE,
@@ -410,9 +491,21 @@ impl GpuLfm2Model {
         };
 
         // Upload weights: Q4_0/Q8_0 stay quantized, others dequantized to f32.
-        let emb_tensor = cpu_model.gguf().get_tensor("token_embd.weight")?;
-        let embedding_f32 = emb_tensor.to_f32_vec();
-        let embedding = ctx.upload_f32(&embedding_f32, "token_embd.weight");
+        let emb_tensor = src.gguf().get_tensor("token_embd.weight")?;
+        // The GPU `embedding` buffer feeds the (tied) logit projection and must
+        // stay UNSCALED. The CPU-side `embedding_f32` cache feeds the input
+        // embedding lookup; Granite's embedding multiplier is pre-folded into it
+        // (no-op for every other arch). Keeping the two copies separate means a
+        // tied-embedding Granite gets the scale on input only, exactly like the
+        // CPU LlamaModel (`scale_inplace` after `dequantize_row`).
+        let embedding_raw = emb_tensor.to_f32_vec();
+        let embedding = ctx.upload_f32(&embedding_raw, "token_embd.weight");
+        let mut embedding_f32 = embedding_raw;
+        if scalars.embedding != 1.0 {
+            for v in embedding_f32.iter_mut() {
+                *v *= scalars.embedding;
+            }
+        }
         let embedding_params = ctx.upload_storage(
             bytemuck::cast_slice(&[
                 config.vocab_size as u32,
@@ -422,16 +515,16 @@ impl GpuLfm2Model {
             ]),
             "emb_params",
         );
-        let output_norm = ctx.upload_f32(cpu_model.output_norm_weight(), "output_norm");
+        let output_norm = ctx.upload_f32(src.output_norm_weight(), "output_norm");
 
-        let upload_weight = |wref: &super::lfm2::WeightRef, name: &str| -> GpuWeight {
+        let upload_weight = |wref: &WeightRef, name: &str| -> GpuWeight {
             let (buf, dtype) = if matches!(wref.dtype, DType::Q4_0 | DType::Q8_0) {
-                let data = cpu_model.weight_bytes(wref);
+                let data = src.weight_bytes(wref);
                 (ctx.upload_storage(data, name), wref.dtype)
             } else {
                 // TODO: Upload as F16 to save bandwidth (requires F16-aware matmul shaders
                 // in Phase B.1). For now we dequantize all non-Q4_0 to F32.
-                let f32_data = cpu_model.dequantize_weight(wref);
+                let f32_data = src.dequantize_weight(wref);
                 (ctx.upload_f32(&f32_data, name), DType::F32)
             };
             let params_buf = ctx.upload_storage(
@@ -449,54 +542,70 @@ impl GpuLfm2Model {
             }
         };
 
+        // Optional per-head QK-norm (Qwen3) and QKV bias (Qwen2) upload helpers.
+        let upload_opt_f32 = |data: Option<&[f32]>, name: &str| -> Option<wgpu::Buffer> {
+            data.map(|d| ctx.upload_f32(d, name))
+        };
+
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
-            let refs = &cpu_model.layer_refs()[i];
-            let attn_norm = ctx.upload_f32(cpu_model.attn_norm_weight(i), &format!("l{i}.anorm"));
-            let ffn_norm = ctx.upload_f32(cpu_model.ffn_norm_weight(i), &format!("l{i}.fnorm"));
+            let attn_norm = ctx.upload_f32(src.attn_norm_weight(i), &format!("l{i}.anorm"));
+            let ffn_norm = ctx.upload_f32(src.ffn_norm_weight(i), &format!("l{i}.fnorm"));
 
-            let ffn_gate = upload_weight(&refs.ffn_gate, &format!("l{i}.ffn_gate"));
-            let ffn_up = upload_weight(&refs.ffn_up, &format!("l{i}.ffn_up"));
-            let ffn_down = upload_weight(&refs.ffn_down, &format!("l{i}.ffn_down"));
+            let ffn_gate = upload_weight(src.ffn_gate_ref(i), &format!("l{i}.ffn_gate"));
+            let ffn_up = upload_weight(src.ffn_up_ref(i), &format!("l{i}.ffn_up"));
+            let ffn_down = upload_weight(src.ffn_down_ref(i), &format!("l{i}.ffn_down"));
 
             let is_conv = config.block_types[i] == BlockType::GatedConv;
 
             let (conv_in_proj, conv_out_proj, conv_weight) = if is_conv {
-                let ip = refs.shortconv_in_proj.as_ref().unwrap();
-                let op = refs.shortconv_out_proj.as_ref().unwrap();
+                let ip = src.conv_in_proj_ref(i).expect("conv layer missing in_proj");
+                let op = src
+                    .conv_out_proj_ref(i)
+                    .expect("conv layer missing out_proj");
                 (
                     Some(upload_weight(ip, &format!("l{i}.conv_ip"))),
                     Some(upload_weight(op, &format!("l{i}.conv_op"))),
-                    Some(
-                        ctx.upload_f32(cpu_model.conv_weight(i).unwrap(), &format!("l{i}.conv_w")),
-                    ),
+                    Some(ctx.upload_f32(
+                        src.conv_weight(i).expect("conv layer missing conv weight"),
+                        &format!("l{i}.conv_w"),
+                    )),
                 )
             } else {
                 (None, None, None)
             };
 
+            // Attention weights. Plain transformers have every attention layer;
+            // LFM2 has them only on attention blocks. QK-norm (Qwen3) and QKV
+            // bias (Qwen2) are uploaded only when the source carries them.
             let (attn_q, attn_k, attn_v, attn_output, attn_q_norm, attn_k_norm) = if !is_conv {
-                let qr = refs.attn_q.as_ref().unwrap();
-                let kr = refs.attn_k.as_ref().unwrap();
-                let vr = refs.attn_v.as_ref().unwrap();
-                let or = refs.attn_output.as_ref().unwrap();
                 (
-                    Some(upload_weight(qr, &format!("l{i}.attn_q"))),
-                    Some(upload_weight(kr, &format!("l{i}.attn_k"))),
-                    Some(upload_weight(vr, &format!("l{i}.attn_v"))),
-                    Some(upload_weight(or, &format!("l{i}.attn_o"))),
-                    Some(ctx.upload_f32(
-                        cpu_model.attn_q_norm_weight(i).unwrap(),
-                        &format!("l{i}.qn"),
+                    Some(upload_weight(
+                        src.attn_q_ref(i).expect("attn layer missing q"),
+                        &format!("l{i}.attn_q"),
                     )),
-                    Some(ctx.upload_f32(
-                        cpu_model.attn_k_norm_weight(i).unwrap(),
-                        &format!("l{i}.kn"),
+                    Some(upload_weight(
+                        src.attn_k_ref(i).expect("attn layer missing k"),
+                        &format!("l{i}.attn_k"),
                     )),
+                    Some(upload_weight(
+                        src.attn_v_ref(i).expect("attn layer missing v"),
+                        &format!("l{i}.attn_v"),
+                    )),
+                    Some(upload_weight(
+                        src.attn_output_ref(i).expect("attn layer missing output"),
+                        &format!("l{i}.attn_o"),
+                    )),
+                    upload_opt_f32(src.attn_q_norm_weight(i), &format!("l{i}.qn")),
+                    upload_opt_f32(src.attn_k_norm_weight(i), &format!("l{i}.kn")),
                 )
             } else {
                 (None, None, None, None, None, None)
             };
+
+            let attn_q_bias = upload_opt_f32(src.attn_q_bias(i), &format!("l{i}.qb"));
+            let attn_k_bias = upload_opt_f32(src.attn_k_bias(i), &format!("l{i}.kb"));
+            let attn_v_bias = upload_opt_f32(src.attn_v_bias(i), &format!("l{i}.vb"));
 
             layers.push(GpuLayerWeights {
                 attn_norm,
@@ -513,8 +622,17 @@ impl GpuLfm2Model {
                 attn_output,
                 attn_q_norm,
                 attn_k_norm,
+                attn_q_bias,
+                attn_k_bias,
+                attn_v_bias,
             });
         }
+
+        // Untied output projection (`output.weight`), dequantized to f32 like
+        // the embedding table. `None` ⇒ tied embeddings (reuse `embedding`).
+        let output_weight = src
+            .output_ref()
+            .map(|wref| ctx.upload_f32(&src.dequantize_weight(wref), "output.weight"));
 
         // Create scratch buffers
         let f = |size: usize, name: &str| ctx.create_storage_rw((size * 4) as u64, name);
@@ -524,10 +642,13 @@ impl GpuLfm2Model {
         let gate_buf = f(is, "gate");
         let up_buf = f(is, "up");
         let out_buf = f(hs, "out");
-        let q_buf = f(hs, "q");
+        // Q and the attention output are sized by n_heads*head_dim (= q_dim),
+        // which exceeds hs when head_dim is decoupled (Qwen3). The out_proj maps
+        // q_dim → hs. K/V are sized by max_kv_heads*head_dim.
+        let q_buf = f(q_dim, "q");
         let k_buf = f(max_kv_dim, "k");
         let v_buf = f(max_kv_dim, "v");
-        let attn_out_buf = f(hs, "attn_out");
+        let attn_out_buf = f(q_dim, "attn_out");
         let logits_buf = f(config.vocab_size, "logits");
         let scores_buf = f(config.n_heads * max_seq_len, "scores");
         let conv_proj_buf = f(3 * hs, "conv_proj");
@@ -552,7 +673,6 @@ impl GpuLfm2Model {
         let mut conv_buffers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
             if config.block_types[i] == BlockType::Attention {
-                let head_dim = hs / config.n_heads;
                 let kv_dim = config.kv_heads_per_layer[i] * head_dim;
                 let k_cache = f(max_seq_len * kv_dim, &format!("l{i}.k_cache"));
                 let v_cache = f(max_seq_len * kv_dim, &format!("l{i}.v_cache"));
@@ -582,19 +702,50 @@ impl GpuLfm2Model {
             ctx.upload_storage(bytemuck::cast_slice(&[hs as u32, 0u32]), "ew_hs_params");
         let elementwise_is_params =
             ctx.upload_storage(bytemuck::cast_slice(&[is as u32, 0u32]), "ew_is_params");
+        // QKV-bias add lengths (Qwen2). q_dim == hs unless head_dim is decoupled.
+        let kv_dim_bias = config.n_kv_heads * head_dim;
+        let elementwise_qdim_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[q_dim as u32, 0u32]),
+            "ew_qdim_params",
+        );
+        let elementwise_kvdim_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[kv_dim_bias as u32, 0u32]),
+            "ew_kvdim_params",
+        );
+        // Residual add scalar (Granite residual multiplier; 1.0 elsewhere).
+        let residual_add_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[hs as u32, scalars.residual.to_bits()]),
+            "residual_add_params",
+        );
+        // Granite logit divide: scale by 1/logit_scale. None when identity.
+        let logit_scale_params = (scalars.logit != 1.0).then(|| {
+            ctx.upload_storage(
+                bytemuck::cast_slice(&[config.vocab_size as u32, (1.0 / scalars.logit).to_bits()]),
+                "logit_scale_params",
+            )
+        });
         let kernel_size = config.conv_kernel_size.unwrap_or(3) as u32;
         let d_conv = kernel_size - 1;
-        let head_dim = (hs / config.n_heads) as u32;
+        let head_dim_u32 = head_dim as u32;
         let conv1d_params = ctx.upload_storage(
             bytemuck::cast_slice(&[hs as u32, kernel_size, d_conv, 0u32]),
             "conv1d_params",
         );
         let per_head_norm_params = ctx.upload_storage(
-            bytemuck::cast_slice(&[head_dim, config.rms_norm_eps.to_bits(), 0u32, 0u32]),
+            bytemuck::cast_slice(&[head_dim_u32, config.rms_norm_eps.to_bits(), 0u32, 0u32]),
             "ph_norm_params",
         );
         // rope_params is updated per token via queue.write_buffer — needs COPY_DST.
-        let rope_params = ctx.create_storage_rw(5 * 4, "rope_params");
+        // 7 u32: pos, n_heads, n_kv_heads, head_dim, freq_base_bits, rope_type,
+        // has_freq_factors.
+        let rope_params = ctx.create_storage_rw(7 * 4, "rope_params");
+        // Llama-3 RoPE frequency factors (binding 3 of the rope dispatch).
+        // Always bound; a 1-element dummy when the model uses plain RoPE.
+        let has_freq_factors = src.rope_freqs().is_some();
+        let rope_freqs_buf = match src.rope_freqs() {
+            Some(rf) => ctx.upload_f32(rf, "rope_freqs"),
+            None => ctx.upload_f32(&[1.0f32], "rope_freqs_dummy"),
+        };
         let attn_params = ctx.create_storage_rw(8 * 4, "attn_params");
         let gemv_f32_tile_rows = f32_gemv_tile_rows(
             config.vocab_size as u32,
@@ -651,8 +802,14 @@ impl GpuLfm2Model {
             pipelines,
             embedding,
             embedding_params,
+            output_weight,
             output_norm,
             layers,
+            rope_type,
+            scalars,
+            batched_prefill,
+            rope_freqs_buf,
+            has_freq_factors,
             hidden_buf,
             normed_buf,
             ffn_input_buf,
@@ -671,6 +828,10 @@ impl GpuLfm2Model {
             rmsnorm_hs_params,
             elementwise_hs_params,
             elementwise_is_params,
+            elementwise_qdim_params,
+            elementwise_kvdim_params,
+            residual_add_params,
+            logit_scale_params,
             conv1d_params,
             per_head_norm_params,
             rope_params,
@@ -1334,10 +1495,11 @@ impl GpuLfm2Model {
                 }
             } else {
                 // Attention block — batched into 2 compute passes (separated by KV cache copies).
-                let head_dim = (hs / cfg.n_heads) as u32;
+                let head_dim = cfg.head_dim as u32;
                 let n_kv_heads = cfg.kv_heads_per_layer[i] as u32;
                 let kv_dim = n_kv_heads * head_dim;
                 let n_heads = cfg.n_heads as u32;
+                let q_dim = n_heads * head_dim;
 
                 // Pre-create all BGs before opening passes.
                 let norm_bg = self
@@ -1388,54 +1550,84 @@ impl GpuLfm2Model {
                         &v_bg_tmp
                     }
                 };
-                let qn_bg = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &self.pipelines.per_head_rmsnorm.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.q_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: lw.attn_q_norm.as_ref().unwrap().as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: self.per_head_norm_params.as_entire_binding(),
-                            },
-                        ],
-                    });
-                let kn_bg = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &self.pipelines.per_head_rmsnorm.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.k_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: lw.attn_k_norm.as_ref().unwrap().as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: self.per_head_norm_params.as_entire_binding(),
-                            },
-                        ],
-                    });
-                let rope_data: [u32; 5] = [
+                // QK-norm (Qwen3) — only when the layer carries per-head norm
+                // weights. Built as `Option` so non-Qwen3 archs skip the dispatch.
+                let per_head_norm_bg = |buf: &wgpu::Buffer, norm: &wgpu::Buffer| {
+                    self.ctx
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &self.pipelines.per_head_rmsnorm.get_bind_group_layout(0),
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: norm.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: self.per_head_norm_params.as_entire_binding(),
+                                },
+                            ],
+                        })
+                };
+                let qn_bg = lw
+                    .attn_q_norm
+                    .as_ref()
+                    .map(|w| per_head_norm_bg(&self.q_buf, w));
+                let kn_bg = lw
+                    .attn_k_norm
+                    .as_ref()
+                    .map(|w| per_head_norm_bg(&self.k_buf, w));
+
+                // QKV bias (Qwen2) — added right after each projection GEMV,
+                // before QK-norm/RoPE. `Option` so bias-less archs skip it.
+                let bias_bg = |buf: &wgpu::Buffer, bias: &wgpu::Buffer, params: &wgpu::Buffer| {
+                    self.ctx
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &self.pipelines.add_inplace.get_bind_group_layout(0),
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: bias.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: params.as_entire_binding(),
+                                },
+                            ],
+                        })
+                };
+                let qb_bg = lw
+                    .attn_q_bias
+                    .as_ref()
+                    .map(|b| bias_bg(&self.q_buf, b, &self.elementwise_qdim_params));
+                let kb_bg = lw
+                    .attn_k_bias
+                    .as_ref()
+                    .map(|b| bias_bg(&self.k_buf, b, &self.elementwise_kvdim_params));
+                let vb_bg = lw
+                    .attn_v_bias
+                    .as_ref()
+                    .map(|b| bias_bg(&self.v_buf, b, &self.elementwise_kvdim_params));
+
+                let rope_data: [u32; 7] = [
                     pos as u32,
                     n_heads,
                     n_kv_heads,
                     head_dim,
                     cfg.rope_theta.to_bits(),
+                    self.rope_type as u32,
+                    self.has_freq_factors as u32,
                 ];
                 self.ctx
                     .queue
@@ -1458,6 +1650,10 @@ impl GpuLfm2Model {
                             wgpu::BindGroupEntry {
                                 binding: 2,
                                 resource: self.rope_params.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: self.rope_freqs_buf.as_entire_binding(),
                             },
                         ],
                     });
@@ -1482,18 +1678,48 @@ impl GpuLfm2Model {
                     self.dispatch_gemv_into(&mut pass, q_w, q_bg);
                     self.dispatch_gemv_into(&mut pass, k_w, k_bg);
                     self.dispatch_gemv_into(&mut pass, v_w, v_bg);
-                    self.dispatch_into(
-                        &mut pass,
-                        &self.pipelines.per_head_rmsnorm,
-                        &qn_bg,
-                        (n_heads, 1, 1),
-                    );
-                    self.dispatch_into(
-                        &mut pass,
-                        &self.pipelines.per_head_rmsnorm,
-                        &kn_bg,
-                        (n_kv_heads, 1, 1),
-                    );
+                    // QKV bias (Qwen2): add right after the projections.
+                    if let Some(bg) = qb_bg.as_ref() {
+                        self.dispatch_into(
+                            &mut pass,
+                            &self.pipelines.add_inplace,
+                            bg,
+                            (q_dim.div_ceil(256), 1, 1),
+                        );
+                    }
+                    if let Some(bg) = kb_bg.as_ref() {
+                        self.dispatch_into(
+                            &mut pass,
+                            &self.pipelines.add_inplace,
+                            bg,
+                            (kv_dim.div_ceil(256), 1, 1),
+                        );
+                    }
+                    if let Some(bg) = vb_bg.as_ref() {
+                        self.dispatch_into(
+                            &mut pass,
+                            &self.pipelines.add_inplace,
+                            bg,
+                            (kv_dim.div_ceil(256), 1, 1),
+                        );
+                    }
+                    // QK-norm (Qwen3): per-head RMSNorm before RoPE.
+                    if let Some(bg) = qn_bg.as_ref() {
+                        self.dispatch_into(
+                            &mut pass,
+                            &self.pipelines.per_head_rmsnorm,
+                            bg,
+                            (n_heads, 1, 1),
+                        );
+                    }
+                    if let Some(bg) = kn_bg.as_ref() {
+                        self.dispatch_into(
+                            &mut pass,
+                            &self.pipelines.per_head_rmsnorm,
+                            bg,
+                            (n_kv_heads, 1, 1),
+                        );
+                    }
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.rope,
@@ -1510,7 +1736,12 @@ impl GpuLfm2Model {
                 self.encode_copy(&mut enc, &self.v_buf, 0, v_cache, kv_offset, kv_dim as u64);
 
                 let attn_seq_len = (seq_len + 1) as u32;
-                let scale = 1.0 / (head_dim as f32).sqrt();
+                // Granite overrides the softmax scale with its attention
+                // multiplier; every other arch uses 1/sqrt(head_dim).
+                let scale = self
+                    .scalars
+                    .attn
+                    .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
                 // Attention BG (changes per token due to seq_len).
                 self.encode_attention(
                     &mut enc,
@@ -1535,13 +1766,14 @@ impl GpuLfm2Model {
                         &out_bg_tmp
                     }
                 };
-                let add_p = &self.elementwise_hs_params;
+                // Residual add: `scaled_add_inplace` folds Granite's residual
+                // multiplier into the addend (1.0 for every other arch).
                 let add_bg = self
                     .ctx
                     .device
                     .create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
-                        layout: &self.pipelines.add_inplace.get_bind_group_layout(0),
+                        layout: &self.pipelines.scaled_add_inplace.get_bind_group_layout(0),
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
@@ -1553,7 +1785,7 @@ impl GpuLfm2Model {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: add_p.as_entire_binding(),
+                                resource: self.residual_add_params.as_entire_binding(),
                             },
                         ],
                     });
@@ -1565,7 +1797,7 @@ impl GpuLfm2Model {
                     self.dispatch_gemv_into(&mut pass, out_w, out_bg);
                     self.dispatch_into(
                         &mut pass,
-                        &self.pipelines.add_inplace,
+                        &self.pipelines.scaled_add_inplace,
                         &add_bg,
                         (hs32.div_ceil(256), 1, 1),
                     );
@@ -1652,13 +1884,14 @@ impl GpuLfm2Model {
                     &down_bg_tmp
                 }
             };
-            let add_params = &self.elementwise_hs_params;
+            // Residual add: `scaled_add_inplace` folds Granite's residual
+            // multiplier into the addend (1.0 for every other arch).
             let add_bg = self
                 .ctx
                 .device
                 .create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
-                    layout: &self.pipelines.add_inplace.get_bind_group_layout(0),
+                    layout: &self.pipelines.scaled_add_inplace.get_bind_group_layout(0),
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
@@ -1670,7 +1903,7 @@ impl GpuLfm2Model {
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
-                            resource: add_params.as_entire_binding(),
+                            resource: self.residual_add_params.as_entire_binding(),
                         },
                     ],
                 });
@@ -1697,7 +1930,7 @@ impl GpuLfm2Model {
                 // residual add
                 self.dispatch_into(
                     &mut pass,
-                    &self.pipelines.add_inplace,
+                    &self.pipelines.scaled_add_inplace,
                     &add_bg,
                     (hs32.div_ceil(256), 1, 1),
                 );
@@ -1705,7 +1938,8 @@ impl GpuLfm2Model {
             self.ctx.queue.submit(Some(enc.finish()));
         }
 
-        // 3. Output norm + projection.
+        // 3. Output norm + projection. Untied models project through
+        // `output.weight`; tied models reuse the embedding table.
         let mut enc = self.new_encoder();
         self.encode_rmsnorm(
             &mut enc,
@@ -1714,14 +1948,46 @@ impl GpuLfm2Model {
             hs32,
             cfg.rms_norm_eps,
         );
+        let out_proj = self.output_weight.as_ref().unwrap_or(&self.embedding);
         self.encode_gemv_f32(
             &mut enc,
-            &self.embedding,
+            out_proj,
             &self.hidden_buf,
             &self.logits_buf,
             cfg.vocab_size as u32,
             hs32,
         );
+        // Granite divides the logits by `logits_scaling` (identity elsewhere).
+        if let Some(params) = self.logit_scale_params.as_ref() {
+            let scale_bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("logit_scale_bg"),
+                    layout: &self.pipelines.scale_f32.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.logits_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: params.as_entire_binding(),
+                        },
+                    ],
+                });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("logit_scale"),
+                timestamp_writes: None,
+            });
+            self.dispatch_into(
+                &mut pass,
+                &self.pipelines.scale_f32,
+                &scale_bg,
+                ((cfg.vocab_size as u32).div_ceil(256), 1, 1),
+            );
+            drop(pass);
+        }
         self.submit_and_wait(enc);
 
         // 4. Update seq_len + profile bookkeeping. Logits are now in
@@ -1943,6 +2209,7 @@ impl GpuLfm2Model {
     /// Batched prefill supports quantized Q4_0 and Q8_0 weights. F32 weights
     /// are not a production path in this model. `x_stride` and `y_stride` are
     /// measured in f32 elements between consecutive token vectors.
+    #[allow(clippy::too_many_arguments)] // tile geometry + strides; splitting hurts clarity
     fn encode_mul_mat_reg_tile(
         &self,
         enc: &mut wgpu::CommandEncoder,
@@ -2911,12 +3178,19 @@ impl Model for GpuLfm2Model {
             //   * all matmul weights have a batched quantized kernel
             //     (Q4_0/Q8_0 today; other dtypes fall through to the
             //     per-token loop)
+            //   * the model wires the batched-prefill path (`batched_prefill`).
+            //     LFM2 does; the dense transformers prefill via the per-token
+            //     decode loop (their batched shaders are a follow-up), so they
+            //     fall through to the sequential loop below.
             //
             // Long prompts are chunked through the batched path in
             // MAX_PREFILL_TOKENS-sized chunks so the scratch buffers stay
             // bounded. Each chunk advances `start_pos`; conv rolling
             // state and KV cache writes carry across chunks naturally.
-            if !tokens.is_empty() && self.all_matmul_weights_batched_supported() {
+            if !tokens.is_empty()
+                && self.batched_prefill
+                && self.all_matmul_weights_batched_supported()
+            {
                 // Chunk size respects both the static MAX_PREFILL_TOKENS
                 // budget AND the model's actual `max_seq_len` — otherwise
                 // a caller with `--context-size < 512` would dispatch

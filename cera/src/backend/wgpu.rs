@@ -564,6 +564,7 @@ pub mod shaders {
     pub const GEMV_Q6_K: &str = include_str!("shaders/gemv_q6_k.wgsl");
     pub const GEMV_Q8_0: &str = include_str!("shaders/gemv_q8_0.wgsl");
     pub const ELEMENTWISE: &str = include_str!("shaders/elementwise.wgsl");
+    pub const SCALE_F32: &str = include_str!("shaders/scale_f32.wgsl");
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.wgsl");
     pub const RMSNORM_BATCH: &str = include_str!("shaders/rmsnorm_batch.wgsl");
     pub const QK_NORM_ROPE_BATCH: &str = include_str!("shaders/qk_norm_rope_batch.wgsl");

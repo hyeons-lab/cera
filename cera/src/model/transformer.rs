@@ -197,6 +197,18 @@ pub(crate) fn dequantize_row(gguf: &GgufFile, wref: &WeightRef, row_idx: usize) 
     out
 }
 
+/// Dequantize a full `[m, k]` weight matrix to an owned row-major `Vec<f32>`.
+/// Used by the GPU loaders to upload non-quantized-kernel dtypes as F32.
+#[cfg(feature = "gpu")]
+pub(crate) fn dequantize_weight(gguf: &GgufFile, wref: &WeightRef) -> Vec<f32> {
+    let mut out = vec![0.0f32; wref.m * wref.k];
+    for row in 0..wref.m {
+        let row_out = &mut out[row * wref.k..(row + 1) * wref.k];
+        dequantize_row_into(gguf, wref, row, row_out);
+    }
+    out
+}
+
 // ── Generic per-layer kernels ───────────────────────────────────────────────
 
 /// Pre-resolved attention weight refs for a transformer layer.
