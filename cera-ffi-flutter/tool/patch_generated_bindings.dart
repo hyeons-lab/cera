@@ -109,8 +109,12 @@ void main(List<String> args) {
       'return ffi.DynamicLibrary.open(_libraryPath ?? libraryName);';
   const openGood = '''
 final envPath = io.Platform.environment['CERA_FFI_LIB'];
-    if (provided == null && _libraryPath == null && envPath != null && envPath.isNotEmpty) {
+    if (_libraryPath == null && envPath != null && envPath.isNotEmpty) {
       return ffi.DynamicLibrary.open(envPath);
+    }
+    if (_libraryPath == null && io.Platform.isIOS) {
+      // iOS links cera-ffi statically into the host process — open the image.
+      return ffi.DynamicLibrary.process();
     }
     return ffi.DynamicLibrary.open(_libraryPath ?? _ceraDefaultLibraryFile());''';
   if (src.contains(openBad)) {
@@ -119,12 +123,16 @@ final envPath = io.Platform.environment['CERA_FFI_LIB'];
       src += '''
 
 // Added by tool/patch_generated_bindings.dart — platform-correct default name
-// for the cera-ffi cdylib (`cera_ffi`). iOS links statically; manual users can
-// pass a DynamicLibrary or set CERA_FFI_LIB.
+// for the cera-ffi cdylib (`cera_ffi`). iOS is handled before this is called
+// (static process image); unknown platforms fail loudly instead of guessing.
 String _ceraDefaultLibraryFile() {
   if (io.Platform.isMacOS) return 'libcera_ffi.dylib';
   if (io.Platform.isWindows) return 'cera_ffi.dll';
-  return 'libcera_ffi.so';
+  if (io.Platform.isAndroid || io.Platform.isLinux) return 'libcera_ffi.so';
+  throw UnsupportedError(
+    'cera-ffi has no bundled native library for \${io.Platform.operatingSystem}; '
+    'set CERA_FFI_LIB or pass an explicit library path.',
+  );
 }
 ''';
     }
