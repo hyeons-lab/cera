@@ -1,0 +1,13 @@
+{
+  "model_file": "Llama-3.2-1B-Instruct-Q8_0.gguf",
+  "llama_cpp_sha": "d8a24ccee207a1ff24c513fe1c7d3222b3ccd837",
+  "n_predict": 8,
+  "prompts": [
+    {
+      "prompt": "The history of the printing press is a story of gradual innovation across many centuries and cultures. Long before Johannes Gutenberg assembled his famous movable type system in the middle of the fifteenth century, craftsmen in East Asia had already experimented with woodblock printing and with ceramic and metal characters. Gutenberg's decisive contribution was to combine a durable metal alloy for the type, an oil based ink that adhered well to metal, and a screw press adapted from the machines used to crush grapes and olives. Together these elements made it possible to produce books quickly and in large numbers, and the resulting flood of printed material helped to spread literacy, accelerate scientific exchange, and reshape religious and political life across the whole of Europe.",
+      "fixture": "the-history-of-the-printing-press-is-a-s.json",
+      "n_tokens": 142,
+      "n_nodes": 342
+    }
+  ]
+}

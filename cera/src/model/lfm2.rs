@@ -2514,6 +2514,7 @@ impl Model for Lfm2Model {
             head_dim,
             &self.config.kv_heads_per_layer,
             crate::backend::cpu::RopeType::Neox,
+            None,
         );
     }
 }

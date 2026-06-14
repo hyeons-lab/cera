@@ -46,6 +46,10 @@ pub struct LlamaModel {
     head_dim: usize,
     /// RoPE pair layout: `Neox` for Qwen2/Qwen3, `Norm` for LLaMA/Mistral/Granite.
     rope_type: RopeType,
+    /// Llama-3 RoPE frequency-scaling factors (`rope_freqs.weight`, `head_dim/2`),
+    /// applied per-pair on the NORM path. `None` for archs without the tensor
+    /// (Qwen/Mistral/Granite) ⇒ plain RoPE.
+    rope_freqs: Option<Vec<f32>>,
     // Granite 3.x scalar multipliers; identity for every other arch.
     /// Embeddings are scaled by this right after the token-embedding lookup.
     embedding_scale: f32,
@@ -281,11 +285,28 @@ impl LlamaModel {
             None
         };
 
+        // Llama-3 RoPE frequency scaling (`rope_scaling: llama3`): per-pair factors
+        // that divide each rotation angle, applied by llama.cpp on every rope call.
+        // Present on Llama-3.x, absent on Qwen/Mistral/Granite ⇒ None (plain RoPE).
+        let rope_freqs = gguf
+            .get_tensor("rope_freqs.weight")
+            .ok()
+            .map(|t| t.to_f32_vec());
+        if let Some(rf) = &rope_freqs {
+            ensure!(
+                rf.len() == head_dim / 2,
+                "rope_freqs.weight has {} entries, expected head_dim/2 = {}",
+                rf.len(),
+                head_dim / 2
+            );
+        }
+
         Ok(Self {
             gguf,
             config,
             head_dim,
             rope_type,
+            rope_freqs,
             embedding_scale,
             residual_scale,
             attn_scale,
@@ -306,7 +327,7 @@ impl LlamaModel {
     }
 
     /// Attention dims for a layer (constant across layers here).
-    fn attn_dims(&self) -> AttnDims {
+    fn attn_dims(&self) -> AttnDims<'_> {
         AttnDims {
             hidden_size: self.config.hidden_size,
             n_heads: self.config.n_heads,
@@ -316,6 +337,7 @@ impl LlamaModel {
             rms_norm_eps: self.config.rms_norm_eps,
             rope_type: self.rope_type,
             attn_scale: self.attn_scale,
+            rope_freqs: self.rope_freqs.as_deref(),
         }
     }
 
@@ -519,6 +541,7 @@ impl Model for LlamaModel {
             self.head_dim,
             &self.config.kv_heads_per_layer,
             self.rope_type,
+            self.rope_freqs.as_deref(),
         );
     }
 }

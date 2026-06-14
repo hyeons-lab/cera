@@ -602,6 +602,7 @@ impl InferenceState {
     /// - `n_keep + shift <= seq_len`
     /// - `!self.is_compressed()`
     /// - `n_kv_heads_per_layer.len() == self.layers.len()`
+    #[allow(clippy::too_many_arguments)]
     pub fn shift_kv_with_rope(
         &mut self,
         n_keep: usize,
@@ -610,6 +611,10 @@ impl InferenceState {
         head_dim: usize,
         n_kv_heads_per_layer: &[usize],
         rope_type: crate::backend::cpu::RopeType,
+        // Llama-3 RoPE frequency-scaling factors (`rope_freqs.weight`); must match
+        // the forward pass so the delta-rotation composes correctly. Only used on
+        // the NORM path; `None` ⇒ plain RoPE.
+        freq_factors: Option<&[f32]>,
     ) {
         // Hard preconditions — keep them in release builds. Silently
         // decrementing `seq_len` without actually shifting the
@@ -708,7 +713,11 @@ impl InferenceState {
                             }
                             crate::backend::cpu::RopeType::Norm => {
                                 crate::backend::cpu::apply_rope_norm_delta_to_head(
-                                    head, delta, head_dim, rope_theta,
+                                    head,
+                                    delta,
+                                    head_dim,
+                                    rope_theta,
+                                    freq_factors,
                                 )
                             }
                         }

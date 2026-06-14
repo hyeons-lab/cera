@@ -215,7 +215,7 @@ pub(crate) struct AttnExtras<'a> {
 
 /// Static per-layer dimensions for the attention helper.
 #[derive(Clone, Copy)]
-pub(crate) struct AttnDims {
+pub(crate) struct AttnDims<'a> {
     pub hidden_size: usize,
     pub n_heads: usize,
     pub n_kv_heads: usize,
@@ -227,6 +227,9 @@ pub(crate) struct AttnDims {
     /// Softmax scale override. `None` ⇒ `1/sqrt(head_dim)` (the default). Granite
     /// 3.x sets this to its `attention.scale` multiplier.
     pub attn_scale: Option<f32>,
+    /// Llama-3 RoPE frequency-scaling factors (`rope_freqs.weight`, `head_dim/2`),
+    /// applied only on the NORM path; `None` ⇒ plain RoPE.
+    pub rope_freqs: Option<&'a [f32]>,
 }
 
 /// Run one attention block for a single token. Writes the post-output-projection
@@ -240,7 +243,7 @@ pub(crate) fn forward_attn_block(
     layer: usize,
     weights: &AttnWeights,
     extras: &AttnExtras,
-    dims: AttnDims,
+    dims: AttnDims<'_>,
     hidden: &[f32],
     pos: usize,
     state: &mut InferenceState,
@@ -324,9 +327,16 @@ pub(crate) fn forward_attn_block(
     // interleaved for LLaMA/Mistral/Granite).
     match dims.rope_type {
         cpu::RopeType::Neox => cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, dims.rope_theta),
-        cpu::RopeType::Norm => {
-            cpu::rope_norm(q, k, pos, n_heads, n_kv_heads, head_dim, dims.rope_theta)
-        }
+        cpu::RopeType::Norm => cpu::rope_norm(
+            q,
+            k,
+            pos,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            dims.rope_theta,
+            dims.rope_freqs,
+        ),
     }
 
     // Append K, V to the f32 cache.

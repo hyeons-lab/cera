@@ -172,6 +172,7 @@ fn shift_kv_with_rope_preserves_head_and_re_rotates_tail() {
         head_dim,
         &n_kv_heads_per_layer,
         cera::backend::cpu::RopeType::Neox,
+        None,
     );
 
     assert_eq!(state.seq_len, seq_len - shift);
@@ -330,6 +331,7 @@ impl Model for MockModel {
             head_dim,
             &self.config.kv_heads_per_layer,
             cera::backend::cpu::RopeType::Neox,
+            None,
         );
     }
 }

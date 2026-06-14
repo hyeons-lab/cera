@@ -2203,10 +2203,12 @@ pub fn apply_rope_delta_to_head(head: &mut [f32], delta_pos: i32, head_dim: usiz
     }
 }
 
-/// NORM-layout (interleaved-pair) RoPE for Q and K. Sibling of [`rope`]; same
-/// signature and angle schedule, but rotates adjacent pairs `(x[2i], x[2i+1])`
-/// instead of split halves. Correct for un-permuted LLaMA/Mistral/Granite GGUF
-/// weights (llama.cpp `GGML_ROPE_TYPE_NORM`).
+/// NORM-layout (interleaved-pair) RoPE for Q and K. Sibling of [`rope`], but
+/// rotates adjacent pairs `(x[2i], x[2i+1])` instead of split halves. Correct for
+/// un-permuted LLaMA/Mistral/Granite GGUF weights (llama.cpp `GGML_ROPE_TYPE_NORM`).
+/// `freq_factors` is the optional Llama-3 RoPE scaling (`rope_freqs.weight`);
+/// `None` ⇒ plain RoPE (Mistral/Granite, and Qwen never reach this path).
+#[allow(clippy::too_many_arguments)]
 pub fn rope_norm(
     q: &mut [f32],
     k: &mut [f32],
@@ -2215,52 +2217,86 @@ pub fn rope_norm(
     n_kv_heads: usize,
     head_dim: usize,
     freq_base: f32,
+    freq_factors: Option<&[f32]>,
 ) {
     debug_assert_eq!(q.len(), n_heads * head_dim);
     debug_assert_eq!(k.len(), n_kv_heads * head_dim);
 
     for h in 0..n_heads {
         let offset = h * head_dim;
-        apply_rope_norm_to_head(&mut q[offset..offset + head_dim], pos, head_dim, freq_base);
+        apply_rope_norm_to_head(
+            &mut q[offset..offset + head_dim],
+            pos,
+            head_dim,
+            freq_base,
+            freq_factors,
+        );
     }
     for h in 0..n_kv_heads {
         let offset = h * head_dim;
-        apply_rope_norm_to_head(&mut k[offset..offset + head_dim], pos, head_dim, freq_base);
+        apply_rope_norm_to_head(
+            &mut k[offset..offset + head_dim],
+            pos,
+            head_dim,
+            freq_base,
+            freq_factors,
+        );
     }
 }
 
 /// NORM-layout counterpart of [`apply_rope_to_head`]. Rotates adjacent pairs
-/// `(head[2i], head[2i+1])` with the same iterative theta schedule.
-pub fn apply_rope_norm_to_head(head: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
-    rope_norm_pairs(head, pos as f32, head_dim, freq_base);
+/// `(head[2i], head[2i+1])` with the same iterative theta schedule. `freq_factors`
+/// (Llama-3 RoPE scaling, `rope_freqs.weight`) optionally divides each pair's
+/// angle; `None` ⇒ plain RoPE.
+pub fn apply_rope_norm_to_head(
+    head: &mut [f32],
+    pos: usize,
+    head_dim: usize,
+    freq_base: f32,
+    freq_factors: Option<&[f32]>,
+) {
+    rope_norm_pairs(head, pos as f32, head_dim, freq_base, freq_factors);
 }
 
 /// NORM-layout counterpart of [`apply_rope_delta_to_head`]: composes an
 /// additional rotation of `delta_pos` onto an already-NORM-rotated head, used by
 /// the `n_keep` context shift for NORM-rope models. Same additive-rotation
-/// identity as the NEOX delta, on interleaved pairs.
+/// identity as the NEOX delta, on interleaved pairs. Must receive the same
+/// `freq_factors` as the forward pass for the composition identity to hold.
 pub fn apply_rope_norm_delta_to_head(
     head: &mut [f32],
     delta_pos: i32,
     head_dim: usize,
     freq_base: f32,
+    freq_factors: Option<&[f32]>,
 ) {
-    rope_norm_pairs(head, delta_pos as f32, head_dim, freq_base);
+    rope_norm_pairs(head, delta_pos as f32, head_dim, freq_base, freq_factors);
 }
 
 /// Shared kernel for NORM (interleaved-pair) RoPE: rotates each adjacent pair
-/// `(head[2i], head[2i+1])` by `theta_start * theta_scale^i`. The absolute
-/// (`pos`) and delta (`delta_pos`) entry points differ only in `theta_start`.
-fn rope_norm_pairs(head: &mut [f32], theta_start: f32, head_dim: usize, freq_base: f32) {
+/// `(head[2i], head[2i+1])` by `(theta_start * theta_scale^i) / freq_factors[i]`.
+/// The absolute (`pos`) and delta (`delta_pos`) entry points differ only in
+/// `theta_start`. `freq_factors` is the optional Llama-3 per-pair scaling
+/// (`rope_freqs.weight`, length `head_dim/2`); `None` ⇒ all factors 1.0. Matches
+/// ggml's `rope_yarn(theta_base / ff, ...)`.
+fn rope_norm_pairs(
+    head: &mut [f32],
+    theta_start: f32,
+    head_dim: usize,
+    freq_base: f32,
+    freq_factors: Option<&[f32]>,
+) {
     let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
-    let mut theta = theta_start;
-    for pair in head.chunks_exact_mut(2) {
+    let mut theta_base = theta_start;
+    for (i, pair) in head.chunks_exact_mut(2).enumerate() {
+        let ff = freq_factors.map_or(1.0, |f| f[i]);
+        let theta = theta_base / ff;
         let (sin_t, cos_t) = theta.sin_cos();
         let x0 = pair[0];
         let x1 = pair[1];
         pair[0] = x0 * cos_t - x1 * sin_t;
         pair[1] = x0 * sin_t + x1 * cos_t;
-        theta *= theta_scale;
+        theta_base *= theta_scale;
     }
 }
 
@@ -2902,7 +2938,7 @@ mod tests {
         let q_orig = q.clone();
         let k_orig = k.clone();
 
-        rope_norm(&mut q, &mut k, 0, 1, 1, 4, 10000.0);
+        rope_norm(&mut q, &mut k, 0, 1, 1, 4, 10000.0, None);
 
         for i in 0..4 {
             assert!((q[i] - q_orig[i]).abs() < 1e-5, "q[{i}] changed at pos=0");
@@ -2919,13 +2955,35 @@ mod tests {
         let freq_base = 10000.0_f32;
         let pos = 1usize;
         let mut head = vec![1.0, 0.0, 1.0, 0.0];
-        apply_rope_norm_to_head(&mut head, pos, head_dim, freq_base);
+        apply_rope_norm_to_head(&mut head, pos, head_dim, freq_base, None);
 
         let theta0 = pos as f32; // i=0
         assert!((head[0] - theta0.cos()).abs() < 1e-5);
         assert!((head[1] - theta0.sin()).abs() < 1e-5);
         // Second pair angle = pos * freq_base^(-2/head_dim).
         let theta1 = pos as f32 * freq_base.powf(-2.0 / head_dim as f32);
+        assert!((head[2] - theta1.cos()).abs() < 1e-5);
+        assert!((head[3] - theta1.sin()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_rope_norm_freq_factors_divide_theta() {
+        // Llama-3 RoPE scaling divides each pair's angle by freq_factors[i]
+        // (ggml: theta_base / ff). factor 2.0 on pair 0 halves its rotation angle
+        // vs the plain-RoPE case.
+        let head_dim = 4;
+        let freq_base = 10000.0_f32;
+        let pos = 1usize;
+        let ff = [2.0_f32, 4.0]; // head_dim/2 entries
+        let mut head = vec![1.0, 0.0, 1.0, 0.0];
+        apply_rope_norm_to_head(&mut head, pos, head_dim, freq_base, Some(&ff));
+
+        // Pair 0: angle = pos / ff[0] = 1/2.
+        let theta0 = pos as f32 / ff[0];
+        assert!((head[0] - theta0.cos()).abs() < 1e-5);
+        assert!((head[1] - theta0.sin()).abs() < 1e-5);
+        // Pair 1: angle = (pos * freq_base^(-2/head_dim)) / ff[1].
+        let theta1 = pos as f32 * freq_base.powf(-2.0 / head_dim as f32) / ff[1];
         assert!((head[2] - theta1.cos()).abs() < 1e-5);
         assert!((head[3] - theta1.sin()).abs() < 1e-5);
     }
@@ -2938,11 +2996,11 @@ mod tests {
         let raw = vec![0.3, -1.1, 2.0, 0.5, -0.7, 1.3, 0.9, -0.2];
 
         let mut direct = raw.clone();
-        apply_rope_norm_to_head(&mut direct, 13, head_dim, freq_base);
+        apply_rope_norm_to_head(&mut direct, 13, head_dim, freq_base, None);
 
         let mut composed = raw.clone();
-        apply_rope_norm_to_head(&mut composed, 5, head_dim, freq_base);
-        apply_rope_norm_delta_to_head(&mut composed, 13 - 5, head_dim, freq_base);
+        apply_rope_norm_to_head(&mut composed, 5, head_dim, freq_base, None);
+        apply_rope_norm_delta_to_head(&mut composed, 13 - 5, head_dim, freq_base, None);
 
         for i in 0..head_dim {
             assert!(
