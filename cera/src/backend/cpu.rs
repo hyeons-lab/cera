@@ -2359,8 +2359,8 @@ pub fn mul_inplace(a: &mut [f32], b: &[f32]) {
 /// Scalar multiplication: a *= s. Used by Granite's embedding / residual /
 /// logit scalar multipliers (`ggml_scale`).
 pub fn scale_inplace(a: &mut [f32], s: f32) {
-    for a in a.iter_mut() {
-        *a *= s;
+    for x in a.iter_mut() {
+        *x *= s;
     }
 }
 
