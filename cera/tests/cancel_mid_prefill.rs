@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use cera::kv_cache::InferenceState;
-use cera::model::{Model, ModelConfig};
+use cera::model::{Model, ModelConfig, ScalarMultipliers};
 
 /// Minimal fake model: no real inference, just enough trait surface
 /// to call `Model::forward_prefill_chunked` directly. Records chunk
@@ -74,6 +74,7 @@ fn mock_config(vocab_size: usize, max_seq_len: usize) -> ModelConfig {
         block_types: Vec::new(),
         conv_kernel_size: None,
         kv_heads_per_layer: Vec::new(),
+        scalars: ScalarMultipliers::default(),
     }
 }
 

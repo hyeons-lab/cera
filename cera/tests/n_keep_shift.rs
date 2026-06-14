@@ -25,7 +25,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use cera::backend::cpu::{apply_rope_delta_to_head, apply_rope_to_head};
+use cera::backend::cpu::{apply_rope_delta_to_head, apply_rope_norm_to_head, apply_rope_to_head};
 use cera::kv_cache::{InferenceState, LayerState};
 use cera::model::{Model, ModelConfig};
 
@@ -165,7 +165,15 @@ fn shift_kv_with_rope_preserves_head_and_re_rotates_tail() {
         })
         .collect();
 
-    state.shift_kv_with_rope(n_keep, shift, freq_base, head_dim, &n_kv_heads_per_layer);
+    state.shift_kv_with_rope(
+        n_keep,
+        shift,
+        freq_base,
+        head_dim,
+        &n_kv_heads_per_layer,
+        cera::backend::cpu::RopeType::Neox,
+        None,
+    );
 
     assert_eq!(state.seq_len, seq_len - shift);
 
@@ -233,6 +241,92 @@ fn shift_kv_with_rope_preserves_head_and_re_rotates_tail() {
             }
         } else {
             panic!("expected attention layer {layer_idx}");
+        }
+    }
+}
+
+#[test]
+fn shift_kv_with_rope_norm_re_rotates_tail() {
+    // NORM-layout counterpart of test 2: the production LLaMA/Mistral/Granite
+    // n_keep-shift path (`apply_rope_norm_delta_to_head` via shift_kv_with_rope),
+    // which test 2 (NEOX) doesn't exercise. Run both without and with Llama-3
+    // `freq_factors` to also cover the rope_freqs-in-shift threading.
+    let head_dim = 16;
+    let n_kv_heads_per_layer = vec![2usize];
+    let seq_len = 20;
+    let n_keep = 4;
+    let shift = 6;
+    let freq_base = 500_000.0f32; // Llama-3-ish base
+    // Non-trivial per-pair factors (head_dim/2 entries).
+    let ff: Vec<f32> = (0..head_dim / 2).map(|i| 1.0 + i as f32).collect();
+    let raw_for = |h: usize, d: usize| 0.1 * (h as f32) + 0.02 * (d as f32) + 0.3;
+    let kv_dim = n_kv_heads_per_layer[0] * head_dim;
+
+    for freq_factors in [None, Some(ff.as_slice())] {
+        let mut state = InferenceState::new(1);
+        state.seq_len = seq_len;
+        if let LayerState::Attention {
+            key_cache,
+            value_cache,
+            ..
+        } = &mut state.layers[0]
+        {
+            for t in 0..seq_len {
+                for h in 0..n_kv_heads_per_layer[0] {
+                    let raw: Vec<f32> = (0..head_dim).map(|d| raw_for(h, d)).collect();
+                    let mut rotated = raw.clone();
+                    apply_rope_norm_to_head(&mut rotated, t, head_dim, freq_base, freq_factors);
+                    key_cache.extend_from_slice(&rotated);
+                    value_cache.extend_from_slice(&raw); // V is not RoPE'd
+                }
+            }
+        }
+        let head_snapshot: Vec<f32> =
+            if let LayerState::Attention { key_cache, .. } = &state.layers[0] {
+                key_cache[..n_keep * kv_dim].to_vec()
+            } else {
+                unreachable!()
+            };
+
+        state.shift_kv_with_rope(
+            n_keep,
+            shift,
+            freq_base,
+            head_dim,
+            &n_kv_heads_per_layer,
+            cera::backend::cpu::RopeType::Norm,
+            freq_factors,
+        );
+
+        assert_eq!(state.seq_len, seq_len - shift);
+        let new_seq_len = seq_len - shift;
+        let has_ff = freq_factors.is_some();
+        if let LayerState::Attention { key_cache, .. } = &state.layers[0] {
+            assert_eq!(key_cache.len(), new_seq_len * kv_dim);
+            // Head cells: untouched.
+            assert_eq!(
+                &key_cache[..n_keep * kv_dim],
+                head_snapshot.as_slice(),
+                "NORM head cells must be untouched (ff={has_ff})"
+            );
+            // Tail cells: each re-rotated (via the NORM delta kernel) to match a
+            // fresh NORM rotation for its new position.
+            for t_new in n_keep..new_seq_len {
+                for h in 0..n_kv_heads_per_layer[0] {
+                    let raw: Vec<f32> = (0..head_dim).map(|d| raw_for(h, d)).collect();
+                    let mut oracle = raw.clone();
+                    apply_rope_norm_to_head(&mut oracle, t_new, head_dim, freq_base, freq_factors);
+                    let start = t_new * kv_dim + h * head_dim;
+                    let actual = &key_cache[start..start + head_dim];
+                    let err = max_abs_diff(actual, &oracle);
+                    assert!(
+                        err < 1e-3,
+                        "NORM shift (ff={has_ff}): h={h} t_new={t_new} max-err={err}"
+                    );
+                }
+            }
+        } else {
+            unreachable!()
         }
     }
 }
@@ -322,6 +416,8 @@ impl Model for MockModel {
             self.config.rope_theta,
             head_dim,
             &self.config.kv_heads_per_layer,
+            cera::backend::cpu::RopeType::Neox,
+            None,
         );
     }
 }
@@ -342,6 +438,7 @@ fn mock_attention_config(max_seq_len: usize) -> ModelConfig {
         block_types: vec![cera::model::BlockType::Attention],
         conv_kernel_size: None,
         kv_heads_per_layer: vec![4],
+        scalars: cera::model::ScalarMultipliers::default(),
     }
 }
 

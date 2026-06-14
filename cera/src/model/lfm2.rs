@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use crate::backend::cpu;
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvPrefixCache, LayerState};
-use crate::model::{BlockType, Model, ModelConfig};
+use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 use crate::tensor::DType;
 use crate::turboquant;
 
@@ -183,6 +183,7 @@ impl Lfm2Model {
             block_types: block_types.clone(),
             conv_kernel_size,
             kv_heads_per_layer: kv_heads_per_layer.clone(),
+            scalars: ScalarMultipliers::default(),
         };
 
         // Pre-extract small F32 weights
@@ -2513,6 +2514,8 @@ impl Model for Lfm2Model {
             self.config.rope_theta,
             head_dim,
             &self.config.kv_heads_per_layer,
+            crate::backend::cpu::RopeType::Neox,
+            None,
         );
     }
 }

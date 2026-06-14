@@ -602,6 +602,7 @@ impl InferenceState {
     /// - `n_keep + shift <= seq_len`
     /// - `!self.is_compressed()`
     /// - `n_kv_heads_per_layer.len() == self.layers.len()`
+    #[allow(clippy::too_many_arguments)]
     pub fn shift_kv_with_rope(
         &mut self,
         n_keep: usize,
@@ -609,6 +610,11 @@ impl InferenceState {
         rope_theta: f32,
         head_dim: usize,
         n_kv_heads_per_layer: &[usize],
+        rope_type: crate::backend::cpu::RopeType,
+        // Llama-3 RoPE frequency-scaling factors (`rope_freqs.weight`); must match
+        // the forward pass so the delta-rotation composes correctly. Only used on
+        // the NORM path; `None` ⇒ plain RoPE.
+        freq_factors: Option<&[f32]>,
     ) {
         // Hard preconditions — keep them in release builds. Silently
         // decrementing `seq_len` without actually shifting the
@@ -698,12 +704,23 @@ impl InferenceState {
                     for h in 0..n_kv_heads {
                         let head_start = row_base + h * head_dim;
                         let head_end = head_start + head_dim;
-                        crate::backend::cpu::apply_rope_delta_to_head(
-                            &mut key_cache[head_start..head_end],
-                            delta,
-                            head_dim,
-                            rope_theta,
-                        );
+                        let head = &mut key_cache[head_start..head_end];
+                        match rope_type {
+                            crate::backend::cpu::RopeType::Neox => {
+                                crate::backend::cpu::apply_rope_delta_to_head(
+                                    head, delta, head_dim, rope_theta,
+                                )
+                            }
+                            crate::backend::cpu::RopeType::Norm => {
+                                crate::backend::cpu::apply_rope_norm_delta_to_head(
+                                    head,
+                                    delta,
+                                    head_dim,
+                                    rope_theta,
+                                    freq_factors,
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -1235,6 +1252,7 @@ mod tests {
             kv_heads_per_layer: (0..n_layers)
                 .map(|i| if i % 2 == 0 { 2 } else { 0 })
                 .collect(),
+            scalars: crate::model::ScalarMultipliers::default(),
         }
     }
 

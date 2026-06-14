@@ -215,13 +215,21 @@ pub(crate) struct AttnExtras<'a> {
 
 /// Static per-layer dimensions for the attention helper.
 #[derive(Clone, Copy)]
-pub(crate) struct AttnDims {
+pub(crate) struct AttnDims<'a> {
     pub hidden_size: usize,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
+    /// RoPE pair layout: `Neox` for Qwen2/Qwen3, `Norm` for LLaMA/Mistral/Granite.
+    pub rope_type: cpu::RopeType,
+    /// Softmax scale override. `None` ⇒ `1/sqrt(head_dim)` (the default). Granite
+    /// 3.x sets this to its `attention.scale` multiplier.
+    pub attn_scale: Option<f32>,
+    /// Llama-3 RoPE frequency-scaling factors (`rope_freqs.weight`, `head_dim/2`),
+    /// applied only on the NORM path; `None` ⇒ plain RoPE.
+    pub rope_freqs: Option<&'a [f32]>,
 }
 
 /// Run one attention block for a single token. Writes the post-output-projection
@@ -235,7 +243,7 @@ pub(crate) fn forward_attn_block(
     layer: usize,
     weights: &AttnWeights,
     extras: &AttnExtras,
-    dims: AttnDims,
+    dims: AttnDims<'_>,
     hidden: &[f32],
     pos: usize,
     state: &mut InferenceState,
@@ -315,8 +323,21 @@ pub(crate) fn forward_attn_block(
         }
     }
 
-    // RoPE (NEOX / split-halves layout — correct for Qwen2/Qwen3).
-    cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, dims.rope_theta);
+    // RoPE — layout per arch (NEOX split-halves for Qwen2/Qwen3, NORM
+    // interleaved for LLaMA/Mistral/Granite).
+    match dims.rope_type {
+        cpu::RopeType::Neox => cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, dims.rope_theta),
+        cpu::RopeType::Norm => cpu::rope_norm(
+            q,
+            k,
+            pos,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            dims.rope_theta,
+            dims.rope_freqs,
+        ),
+    }
 
     // Append K, V to the f32 cache.
     if let LayerState::Attention {
@@ -331,7 +352,10 @@ pub(crate) fn forward_attn_block(
 
     // GQA: grouped query attention over the full KV cache.
     let group_size = n_heads / n_kv_heads;
-    let scale = 1.0 / (head_dim as f32).sqrt();
+    // Default softmax scale 1/sqrt(head_dim); Granite overrides via attn_scale.
+    let scale = dims
+        .attn_scale
+        .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
     {
         let (k_cache, v_cache) = match &state.layers[layer] {
             LayerState::Attention {
