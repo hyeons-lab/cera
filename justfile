@@ -89,6 +89,21 @@ bindings:
         --language swift \
         --out-dir cera-ffi/bindings/swift
 
+# Generate the Dart/Flutter bindings into the cera-ffi-flutter package.
+# Unlike Kotlin/Swift, Dart is not a built-in uniffi-bindgen language — it
+# uses the external `uniffi-bindgen-dart` tool (pins uniffi_bindgen 0.31,
+# matching this workspace). The output is gitignored: the generator (0.1.3)
+# still emits invalid Dart for the async + streaming-callback surface, so we
+# regenerate rather than commit the blob. See V2.17 in the implementation plan.
+#
+# Requires: `cargo install uniffi-bindgen-dart` and a Dart SDK >= 3.3.
+dart-bindings:
+    cargo build -p cera-ffi
+    uniffi-bindgen-dart generate {{CERA_FFI_DYLIB}} \
+        --out-dir cera-ffi-flutter/lib/src/generated
+    @echo "Generated cera-ffi-flutter/lib/src/generated/cera_ffi.dart"
+    @echo "NOTE: ~8 known analyzer errors in the async/streaming surface (V2.17)."
+
 # Verify the committed Kotlin + Swift bindings are up to date with the
 # current Rust FFI surface. Regenerates in-place and fails if `git diff`
 # shows changes — signals that someone touched a `#[uniffi::*]` export

@@ -1,0 +1,20 @@
+# Dart / Flutter tooling
+.dart_tool/
+.packages
+pubspec.lock
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Generated UniFFI bindings — regenerate with `just dart-bindings`.
+# Not committed: the generator (uniffi-bindgen-dart 0.1.3) still emits invalid
+# Dart for the async + streaming-callback surface (see V2.17). Committing the
+# blob would ship code that doesn't analyze. Regenerate locally / in CI.
+/lib/src/generated/cera_ffi.dart
+
+# Bundled native libraries (built from the cera-ffi crate per target).
+/native/
+*.so
+*.dylib
+*.dll
+*.a

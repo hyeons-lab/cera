@@ -1,0 +1,9 @@
+include: package:lints/recommended.yaml
+
+analyzer:
+  exclude:
+    # Generated UniFFI bindings — produced by `just dart-bindings`, not
+    # hand-edited. Excluded from lints (and from the known async/streaming
+    # codegen errors tracked in V2.17) so the hand-written package code can be
+    # analyzed cleanly on its own.
+    - lib/src/generated/**
