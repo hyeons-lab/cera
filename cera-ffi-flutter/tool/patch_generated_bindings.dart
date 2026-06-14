@@ -103,6 +103,8 @@ void main(List<String> args) {
   const importWithIo = "import 'dart:typed_data';\nimport 'dart:io' as io;";
   if (src.contains(importAnchor) && !src.contains("import 'dart:io' as io;")) {
     src = src.replaceFirst(importAnchor, importWithIo);
+    applied += 1;
+    stdout.writeln("  added 'dart:io' import for native-library resolution (1 site)");
   }
 
   const openBad =

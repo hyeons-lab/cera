@@ -11,11 +11,13 @@ generated — produced from the compiled `cera-ffi` cdylib by
 fixes the generator's known bugs (never edited by hand). The loader, barrel,
 and package scaffold are maintained in-tree.
 
-> **Status: working (V2.17).** The synchronous engine API — model load,
-> sessions, `generate`, `transcribe`, tokenizer access — round-trips real
-> inference (verified loading a Qwen2 GGUF and generating tokens). The
-> async + streaming-callback surface (`generateStreaming*`, progress sinks) is
-> stubbed to throw pending upstream codegen support — see [Limitations](#limitations).
+> **Status: core path working (V2.17).** The synchronous load → session →
+> `generate` path round-trips real inference (verified loading a Qwen2 GGUF and
+> generating tokens). Several other methods — `transcribe`, the tokenizer
+> accessors (`encodeText`/`decodeTokens`/`applyChatTemplate`), `fromBundleId*`,
+> and the async + streaming-callback surface — currently throw
+> `UnsupportedError`: `uniffi-bindgen-dart` 0.1.3 doesn't implement the
+> RustCallStatus out-arg ABI those use. See [Limitations](#limitations).
 
 ## Layout
 
@@ -99,22 +101,32 @@ target (Android jniLibs, iOS xcframework, desktop bundles) is follow-up work.
 
 Tracked in `docs/IMPLEMENTATION_PLAN.md` → **V2.17**:
 
+- **`Result`-returning methods throw `UnsupportedError`** — `transcribe`, the
+  tokenizer accessors (`encodeText`, `decodeTokens`, `applyChatTemplate`),
+  `storeDir`, and `fromBundleId`/`fromBundleIdAsync`. The generator (0.1.3)
+  hasn't implemented the RustCallStatus out-arg ABI these use, so the method
+  bodies are emitted as throwing stubs. (`generate` works because it takes the
+  ffibuffer path.) This also means **no detokenizer** over FFI yet — `generate`
+  returns token IDs.
 - **Streaming / progress callbacks** (`generateStreaming`,
   `generateStreamingAsync`, `BundleRepo.withProgress`) throw `UnsupportedError`
-  — `uniffi-bindgen-dart` doesn't yet lower callback-interface arguments.
-- **Async methods** (`*Async`) hit the generator's unimplemented out-arg ABI.
-- **No detokenizer** over FFI — `generate` returns token IDs.
+  — the generator doesn't yet lower callback-interface arguments.
 
-Paths forward: upstream the callback-interface lowering, or use
+Paths forward: upstream the out-arg ABI + callback-interface lowering, or use
 `flutter_rust_bridge` for the streaming pieces.
 
 ## Platform support
 
 **Native platforms only** (Android, iOS, macOS, Linux, Windows) — this is a
-`dart:ffi` package and Flutter Web has no FFI. The loader itself is split behind
-a conditional export (`library_loader.dart` → `library_loader_io.dart` when
+`dart:ffi` package and Flutter Web has no FFI. The loader is split behind a
+conditional export (`library_loader.dart` → `library_loader_io.dart` when
 `dart:io` is available, else the throwing `library_loader_web.dart` stub), but
 the committed generated bindings (`lib/src/generated/cera_ffi.dart`) import
 `dart:ffi` unconditionally, so the package as a whole does not compile for web.
-Web *support* would require a non-FFI transport (e.g. WASM via `cera-wasm`) and
-is out of scope for these bindings.
+
+A conditional export of the generated file isn't practical: a web stub would
+have to redeclare the entire ~7k-line generated API (`CeraEngine`,
+`EngineConfig`, every record/enum) just to satisfy the analyzer, and keep it in
+sync on every regeneration. Web *support* belongs in a separate non-FFI
+transport (WASM via `cera-wasm`), not a stub of these bindings. Depend on this
+package from the native targets of a multi-platform app.

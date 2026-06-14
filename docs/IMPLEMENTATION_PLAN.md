@@ -420,10 +420,12 @@ and structured `FfiError` propagation also confirmed. Delivered:
 - `just dart-libs` / `dart-bindings` / `dart-bindings-check` recipes; committed
   generated bindings (analyze clean); `example/cera_generate.dart`.
 
-**Remaining:** streaming/progress callbacks + `*Async` methods (generator can't
-lower callback interfaces yet — stubbed to throw); package prebuilt native libs
-per target (Android jniLibs / iOS xcframework / desktop); expose a detokenizer
-over FFI; example Flutter app + wire the Dart drift check into CI.
+**Remaining:** `Result`-returning methods (`transcribe`, the tokenizer
+accessors, `storeDir`, `fromBundleId*`) and the streaming/progress + `*Async`
+surface throw `UnsupportedError` — `uniffi-bindgen-dart` 0.1.3 implements neither
+the RustCallStatus out-arg ABI nor callback-interface lowering; package prebuilt
+native libs per target (Android jniLibs / iOS xcframework / desktop); expose a
+detokenizer over FFI; example Flutter app + wire the Dart drift check into CI.
 
 **Spike result (2026-06-13, `uniffi-bindgen-dart` 0.1.3):** Viable but not
 turnkey. The generator builds against `uniffi_bindgen 0.31.1` (our exact

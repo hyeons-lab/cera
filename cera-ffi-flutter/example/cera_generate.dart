@@ -2,7 +2,10 @@
 // synchronous generation.
 //
 // Prerequisites:
-//   1. Build the native lib:   just dart-libs        (or `cargo build -p cera-ffi`)
+//   1. Build the native lib:   just dart-libs
+//      (equivalently `cargo build -p cera-ffi --features ffi-buffer` — the
+//      `ffi-buffer` feature is required; a plain `cargo build -p cera-ffi`
+//      omits the `uniffi_ffibuffer_*` trampolines and fails at runtime.)
 //   2. Generate the bindings:  just dart-bindings
 //   3. Point at the native lib via CERA_FFI_LIB (or place it on the loader path):
 //
