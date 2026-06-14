@@ -12,6 +12,10 @@ import 'dart:io' show Platform;
 ///
 /// On iOS the symbols are linked statically into the host process, so we open
 /// the process image instead of a standalone file.
+///
+/// Native platforms only: this uses `dart:ffi`/`dart:io` and returns a
+/// [ffi.DynamicLibrary], so the package does not compile for Flutter Web (no
+/// FFI). See the README "Platform support" section.
 class CeraLibrary {
   CeraLibrary._();
 

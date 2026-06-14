@@ -5,8 +5,10 @@ inference engine.
 
 This package wraps the **`cera-ffi` UniFFI surface** — the same C ABI that backs
 the Kotlin (`cera-ffi-kotlin`) and Swift bindings — and adds a platform-aware
-native-library loader. It is generated, not hand-maintained: the Dart bindings
-are produced from the compiled `cera-ffi` cdylib by `uniffi-bindgen-dart`.
+native-library loader. Only the Dart bindings under `lib/src/generated/` are
+generated (produced from the compiled `cera-ffi` cdylib by
+`uniffi-bindgen-dart`, never edited by hand); the loader, barrel, and package
+scaffold are maintained in-tree.
 
 > **Status: scaffold (V2.17, ⬜ in progress).** The package skeleton, loader,
 > and generation tooling are in place. The generated bindings are **not yet
@@ -64,6 +66,17 @@ We inject the library rather than relying on the generated name-based lookup:
 the generator defaults to `uniffi_cera_ffi`, but the actual cdylib base name is
 `cera_ffi`. Packaging the prebuilt libs per target (Android jniLibs, iOS
 xcframework, desktop bundles) is follow-up work.
+
+## Platform support
+
+**Native platforms only** (Android, iOS, macOS, Linux, Windows). This is a
+`dart:ffi` package — both the loader and the generated bindings import
+`dart:ffi`/`dart:io` and the loader's public API returns a `DynamicLibrary`, so
+the package cannot compile for **Flutter Web**, which has no FFI. Stubbing the
+loader behind conditional imports wouldn't help, because the generated bindings
+themselves are FFI throughout; web support would require a separate non-FFI
+transport (e.g. WASM via `cera-wasm`) and is out of scope for these bindings.
+Depend on this package only from the native targets of a multi-platform app.
 
 ## Known gaps
 
