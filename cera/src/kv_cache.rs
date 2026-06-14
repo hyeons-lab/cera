@@ -1252,6 +1252,7 @@ mod tests {
             kv_heads_per_layer: (0..n_layers)
                 .map(|i| if i % 2 == 0 { 2 } else { 0 })
                 .collect(),
+            scalars: crate::model::ScalarMultipliers::default(),
         }
     }
 

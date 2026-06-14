@@ -23,7 +23,7 @@ use crate::backend::cpu::RopeType;
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
 use crate::model::transformer::{self, AttnDims, AttnExtras, AttnWeights, FfnWeights, WeightRef};
-use crate::model::{BlockType, Model, ModelConfig};
+use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 
 // ── Per-layer weight references ─────────────────────────────────────────────
 
@@ -50,15 +50,8 @@ pub struct LlamaModel {
     /// applied per-pair on the NORM path. `None` for archs without the tensor
     /// (Qwen/Mistral/Granite) ⇒ plain RoPE.
     rope_freqs: Option<Vec<f32>>,
-    // Granite 3.x scalar multipliers; identity for every other arch.
-    /// Embeddings are scaled by this right after the token-embedding lookup.
-    embedding_scale: f32,
-    /// Each attention/FFN block output is scaled by this before its residual add.
-    residual_scale: f32,
-    /// Attention softmax scale override (`None` ⇒ `1/sqrt(head_dim)`).
-    attn_scale: Option<f32>,
-    /// Final logits are divided by this (`1.0` ⇒ no-op).
-    logit_scale: f32,
+    // Granite 3.x scalar multipliers live on `config.scalars` (identity for
+    // every other arch) — see `ScalarMultipliers`.
     // Pre-dequantized small F32 weights.
     output_norm_weight: Vec<f32>,
     attn_norm_weights: Vec<Vec<f32>>,
@@ -118,28 +111,10 @@ impl LlamaModel {
             ),
         };
 
-        // Granite 3.x scalar multipliers (HF names in parens). Absent on every
-        // other arch ⇒ identity, so this is a no-op for LLaMA/Mistral/Qwen.
-        //   embedding_scale (embedding_multiplier) — scale embeddings post-lookup
-        //   residual_scale  (residual_multiplier)  — scale each block output pre-add
-        //   attention.scale (attention_multiplier) — replaces 1/sqrt(head_dim)
-        //   logit_scale     (logits_scaling)       — divide final logits
-        let embedding_scale = gguf
-            .get_f32(&format!("{prefix}.embedding_scale"))
-            .unwrap_or(1.0);
-        let residual_scale = gguf
-            .get_f32(&format!("{prefix}.residual_scale"))
-            .unwrap_or(1.0);
-        // llama.cpp treats a stored `attention.scale == 0.0` as "absent ⇒ use
-        // 1/sqrt(head_dim)", so map Some(0.0) → None to match (a literal 0.0
-        // would otherwise zero every attention score).
-        let attn_scale = gguf
-            .get_f32(&format!("{prefix}.attention.scale"))
-            .filter(|&s| s != 0.0);
-        let logit_scale = gguf
-            .get_f32(&format!("{prefix}.logit_scale"))
-            .unwrap_or(1.0);
-        ensure!(logit_scale != 0.0, "{prefix}.logit_scale must be non-zero");
+        // Granite 3.x scalar multipliers (embedding/residual/attention/logit).
+        // Absent on every other arch ⇒ identity, so this is a no-op for
+        // LLaMA/Mistral/Qwen. Carried on `config.scalars`.
+        let scalars = ScalarMultipliers::from_gguf(&gguf, prefix)?;
 
         let n_layers =
             gguf.get_u32(&format!("{prefix}.block_count"))
@@ -221,6 +196,7 @@ impl LlamaModel {
             block_types,
             conv_kernel_size: None,
             kv_heads_per_layer,
+            scalars,
         };
 
         // Final norm tensor (NOT the LFM2 `token_embd_norm.weight`).
@@ -315,10 +291,6 @@ impl LlamaModel {
             head_dim,
             rope_type,
             rope_freqs,
-            embedding_scale,
-            residual_scale,
-            attn_scale,
-            logit_scale,
             output_norm_weight,
             attn_norm_weights,
             ffn_norm_weights,
@@ -344,7 +316,7 @@ impl LlamaModel {
             rope_theta: self.config.rope_theta,
             rms_norm_eps: self.config.rms_norm_eps,
             rope_type: self.rope_type,
-            attn_scale: self.attn_scale,
+            attn_scale: self.config.scalars.attn,
             rope_freqs: self.rope_freqs.as_deref(),
         }
     }
@@ -400,8 +372,8 @@ impl LlamaModel {
 
             // Granite scales the block output before the residual add (identity
             // for every other arch).
-            if self.residual_scale != 1.0 {
-                cpu::scale_inplace(&mut state.scratch.out[..hs], self.residual_scale);
+            if self.config.scalars.residual != 1.0 {
+                cpu::scale_inplace(&mut state.scratch.out[..hs], self.config.scalars.residual);
             }
             cpu::add_inplace(hidden, &state.scratch.out[..hs]);
 
@@ -427,8 +399,8 @@ impl LlamaModel {
                 state,
             );
 
-            if self.residual_scale != 1.0 {
-                cpu::scale_inplace(&mut state.scratch.out[..hs], self.residual_scale);
+            if self.config.scalars.residual != 1.0 {
+                cpu::scale_inplace(&mut state.scratch.out[..hs], self.config.scalars.residual);
             }
             cpu::add_inplace(hidden, &state.scratch.out[..hs]);
 
@@ -473,8 +445,8 @@ impl LlamaModel {
             transformer::gemv(&self.gguf, out_ref, hidden, &mut logits);
         }
         // Granite divides the logits by `logits_scaling` (identity elsewhere).
-        if self.logit_scale != 1.0 {
-            cpu::scale_inplace(&mut logits, 1.0 / self.logit_scale);
+        if self.config.scalars.logit != 1.0 {
+            cpu::scale_inplace(&mut logits, 1.0 / self.config.scalars.logit);
         }
         transformer::oracle_dump::record("result_output", &logits);
         logits
@@ -493,8 +465,8 @@ impl Model for LlamaModel {
         );
 
         let mut hidden = transformer::dequantize_row(&self.gguf, &self.embd_ref, token_id);
-        if self.embedding_scale != 1.0 {
-            cpu::scale_inplace(&mut hidden, self.embedding_scale);
+        if self.config.scalars.embedding != 1.0 {
+            cpu::scale_inplace(&mut hidden, self.config.scalars.embedding);
         }
         // Record after the embedding scale: llama.cpp fires its "embd" callback
         // post-scale, so the dumped node is GET_ROWS for plain archs (scale=1) and

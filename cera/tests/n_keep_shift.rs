@@ -438,6 +438,7 @@ fn mock_attention_config(max_seq_len: usize) -> ModelConfig {
         block_types: vec![cera::model::BlockType::Attention],
         conv_kernel_size: None,
         kv_heads_per_layer: vec![4],
+        scalars: cera::model::ScalarMultipliers::default(),
     }
 }
 

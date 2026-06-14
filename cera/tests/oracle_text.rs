@@ -67,21 +67,35 @@ fn models_dir() -> PathBuf {
 /// BOS to match llama.cpp's special-token prefixing.
 ///
 /// cera's `encode()` does not prepend BOS — that's the Session / chat-template
-/// layer's job — so the harness adds it here to isolate BPE-merge parity. We
-/// detect whether this model adds BOS from the golden `want_tokens` (first token
-/// == this model's BOS id) rather than from `tokenizer.ggml.add_bos_token`: that
-/// metadata key is *absent* on some BPE GGUFs (e.g. `llama-bpe`), yet llama.cpp
-/// still prepends BOS by vocab-type default. Qwen's goldens don't start with BOS,
-/// so it stays BOS-free.
+/// layer's job — so the harness normalizes that prefix here to isolate BPE-merge
+/// parity. We can't read it off `tokenizer.ggml.add_bos_token`: that key is
+/// *absent* on some BPE GGUFs (e.g. `llama-bpe`), yet llama.cpp still prepends
+/// BOS by vocab-type default.
+///
+/// Decide from the *whole* golden sequence rather than `want_tokens.first()`
+/// alone: only prepend when the golden is exactly `[bos] ++ encode(prompt)`.
+/// Keying on the full body is unambiguous even when the prompt's first *content*
+/// token legitimately equals `bos_id` and the model does NOT add BOS — e.g. Qwen
+/// (`bos_id == eos_id == <|endoftext|>`, `add_bos_token = false`) on a prompt
+/// that literally starts with "<|endoftext|>": a first-token heuristic would
+/// double-prepend and false-fail the tokenizer gate. A genuine BPE divergence in
+/// the body still surfaces — the `[1..] == base` check fails, no BOS is added,
+/// and the mismatch is reported.
 fn encode_with_bos(tok: &BpeTokenizer, want_tokens: &[u32], prompt: &str) -> Vec<u32> {
-    let mut tokens = Vec::new();
-    if let Some(bos) = tok.bos_token() {
-        if want_tokens.first() == Some(&bos) {
+    let base = tok.encode(prompt);
+    match tok.bos_token() {
+        Some(bos)
+            if want_tokens.first() == Some(&bos)
+                && want_tokens.len() == base.len() + 1
+                && want_tokens[1..] == base[..] =>
+        {
+            let mut tokens = Vec::with_capacity(base.len() + 1);
             tokens.push(bos);
+            tokens.extend_from_slice(&base);
+            tokens
         }
+        _ => base,
     }
-    tokens.extend_from_slice(&tok.encode(prompt));
-    tokens
 }
 
 /// Validate one model's fixture set. Returns failure strings (empty = pass);
@@ -121,19 +135,33 @@ fn check_model(fixture_dir: &std::path::Path) -> Option<Vec<String>> {
     // and localizes to the layer. The finer post-rope Q/K sums were evaluated as
     // gate nodes and rejected — rope rotation makes them cancel toward zero, so
     // their relative sum diff is a noisy checksum (>10% under pure Q8_0 noise).
-    // A cera-recorded node may map to one of a few llama.cpp ops depending on
-    // arch: Granite scales the embeddings and the logits, so its "embd" callback
-    // fires on a SCALE node (not GET_ROWS) and "result_output" on a SCALE node
-    // (not MUL_MAT). The first candidate present in the oracle wins.
-    let candidate_ops = |name: &str| -> &'static [&'static str] {
+    //
+    // Which op a node maps to is per-arch DETERMINISTIC, so derive the exact
+    // expected op from the model's own scalar metadata rather than accepting an
+    // OR-list of "acceptable" ops. Granite scales the embeddings and the logits,
+    // so its "embd" callback fires on a SCALE node (not GET_ROWS) and
+    // "result_output" on SCALE (not MUL_MAT); plain archs never scale, so they
+    // stay GET_ROWS / MUL_MAT. An exact per-arch op keeps the gate a precise
+    // contract — it catches a genuinely wrong mapping (e.g. an arch that should
+    // scale `embd` but emits GET_ROWS), which a first-present-wins list could not.
+    let scalars = model.config().scalars;
+    let expected_op = |name: &str| -> &'static str {
         if name == "embd" {
-            &["GET_ROWS", "SCALE"]
+            if scalars.embedding != 1.0 {
+                "SCALE"
+            } else {
+                "GET_ROWS"
+            }
         } else if name.starts_with("l_out-") {
-            &["ADD"]
+            "ADD"
         } else if name == "result_norm" {
-            &["MUL"]
+            "MUL"
         } else if name == "result_output" {
-            &["MUL_MAT", "SCALE"]
+            if scalars.logit != 1.0 {
+                "SCALE"
+            } else {
+                "MUL_MAT"
+            }
         } else {
             panic!("unmapped oracle node name {name:?}")
         }
@@ -204,13 +232,10 @@ fn check_model(fixture_dir: &std::path::Path) -> Option<Vec<String>> {
         let mut worst = 0.0f64;
         let mut checked = 0usize;
         for (name, &got) in &cera {
-            let ops = candidate_ops(name);
-            let Some((op, &exp)) = ops
-                .iter()
-                .find_map(|op| want.get(&(name.as_str(), *op)).map(|exp| (*op, exp)))
-            else {
+            let op = expected_op(name);
+            let Some(&exp) = want.get(&(name.as_str(), op)) else {
                 failures.push(format!(
-                    "[{fname}] oracle has no node {name:?} with any op in {ops:?}"
+                    "[{fname}] oracle has no node {name:?} with op {op:?}"
                 ));
                 continue;
             };

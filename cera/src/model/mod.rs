@@ -13,7 +13,7 @@ pub mod metal_audio_decoder;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
@@ -23,6 +23,70 @@ use crate::kv_cache::InferenceState;
 pub enum BlockType {
     Attention,
     GatedConv,
+}
+
+/// Architecture scalar multipliers (Granite 3.x; HF names in parens). Every
+/// other arch leaves all of these absent ⇒ [`ScalarMultipliers::default`]
+/// (identity), so they are a no-op for LLaMA/Mistral/Qwen.
+///
+/// These travel on [`ModelConfig`] alongside the other GGUF-derived scalars
+/// (`rope_theta`, `rms_norm_eps`, …) so a new multiplier-bearing arch or
+/// back-end consumes them from config instead of re-deriving the four keys.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScalarMultipliers {
+    /// `embedding_multiplier` — scale embeddings right after the token lookup.
+    /// `1.0` ⇒ no-op.
+    pub embedding: f32,
+    /// `residual_multiplier` — scale each attention/FFN block output before its
+    /// residual add. `1.0` ⇒ no-op.
+    pub residual: f32,
+    /// `attention_multiplier` — softmax scale that *replaces* `1/sqrt(head_dim)`.
+    /// `None` ⇒ use the default `1/sqrt(head_dim)` (it is a replacement, not a
+    /// multiplier, so it can't share the `1.0`-identity representation).
+    pub attn: Option<f32>,
+    /// `logits_scaling` — divide the final logits by this. `1.0` ⇒ no-op.
+    pub logit: f32,
+}
+
+impl Default for ScalarMultipliers {
+    fn default() -> Self {
+        Self {
+            embedding: 1.0,
+            residual: 1.0,
+            attn: None,
+            logit: 1.0,
+        }
+    }
+}
+
+impl ScalarMultipliers {
+    /// Load the four Granite scalars from GGUF metadata under `{prefix}.*`.
+    /// Absent keys map to identity, so this returns [`Self::default`] for every
+    /// non-Granite arch.
+    pub fn from_gguf(gguf: &GgufFile, prefix: &str) -> Result<Self> {
+        let embedding = gguf
+            .get_f32(&format!("{prefix}.embedding_scale"))
+            .unwrap_or(1.0);
+        let residual = gguf
+            .get_f32(&format!("{prefix}.residual_scale"))
+            .unwrap_or(1.0);
+        // llama.cpp treats a stored `attention.scale == 0.0` as "absent ⇒ use
+        // 1/sqrt(head_dim)", so map Some(0.0) → None to match (a literal 0.0
+        // would otherwise zero every attention score).
+        let attn = gguf
+            .get_f32(&format!("{prefix}.attention.scale"))
+            .filter(|&s| s != 0.0);
+        let logit = gguf
+            .get_f32(&format!("{prefix}.logit_scale"))
+            .unwrap_or(1.0);
+        ensure!(logit != 0.0, "{prefix}.logit_scale must be non-zero");
+        Ok(Self {
+            embedding,
+            residual,
+            attn,
+            logit,
+        })
+    }
 }
 
 /// Model configuration extracted from GGUF metadata.
@@ -49,6 +113,9 @@ pub struct ModelConfig {
     pub conv_kernel_size: Option<usize>,
     /// Per-layer KV head counts. Length = n_layers. 0 for conv layers.
     pub kv_heads_per_layer: Vec<usize>,
+    /// Architecture scalar multipliers (Granite 3.x). Identity for every other
+    /// arch — see [`ScalarMultipliers`].
+    pub scalars: ScalarMultipliers,
 }
 
 /// Trait for loaded models that can run forward passes.
