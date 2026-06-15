@@ -47,6 +47,7 @@ Metal forward passes currently support **LFM2 only**; Qwen runs on CPU.
 | V2.12 CUDA backend | ⬜ | |
 | V2.13 Python (PyO3) bindings | ⬜ | |
 | V2.14 Kotlin Multiplatform bindings | ✅ | `cera-ffi-kotlin` (android + jvm) |
+| V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync + async generate, sync + async streaming, `withProgress` all verified; only `fromBundleIdAsync` stubbed |
 | V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core shipped, CPU-only encode |
 | V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
 | V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync engine API verified end-to-end; streaming/async stubbed |
@@ -350,6 +351,108 @@ PyO3 bindings, `pip install cera-engine`.
 
 ### V2.14: Kotlin Multiplatform Bindings — 2-3 weeks ✅ DONE
 C ABI via cbindgen + platform-native FFI per KMP target (cinterop, Panama FFM, PanamaPort, JS interop).
+
+### V2.17: Flutter / Dart Bindings — 2-3 weeks 🟡 (sync + streaming working)
+Expose the engine to Flutter/Dart, reusing the existing `cera-ffi` UniFFI
+surface (the same C ABI that already backs Kotlin + Swift). The
+`cera-ffi-flutter` Dart package ships the generated+patched bindings plus a
+platform-aware native-library loader.
+
+**Working (verified end-to-end):** the synchronous engine API round-trips real
+inference — loaded a Qwen2-0.5B GGUF through `CeraEngine.fromPath` →
+`newSession` → `appendText` → `generate` and got tokens back; `cpuBackendReport`
+and structured `FfiError` propagation also confirmed. Delivered:
+- `cera-ffi` gains an **`ffi-buffer`** cargo feature
+  (`uniffi/scaffolding-ffi-buffer-fns`) — the Dart generator calls
+  `uniffi_ffibuffer_*` trampolines UniFFI only emits under that flag.
+- `tool/patch_generated_bindings.dart` — deterministic, idempotent post-gen
+  fixups: corrects `rustbuffer`/`rust_future` symbol names + the `.ref.ptr`
+  union field, rewrites native-lib resolution (`CERA_FFI_LIB` + platform name),
+  synthesizes the `EngineConfig` record encoder, fixes the async-ctor return
+  type, and stubs the unsupported callback-sink methods.
+- `just dart-libs` / `dart-bindings` / `dart-bindings-check` recipes; committed
+  generated bindings (analyze clean); `example/cera_generate.dart`.
+
+**Streaming — WORKING (verified end-to-end).** `generate_streaming(opts, sink)`
+delivers tokens to a Dart-implemented `ModalitySink`: a Qwen2-0.5B run produced
+24 `onTextTokens` callbacks + one `onDone(FinishReasonMaxTokens)`. Getting there
+required vendoring the generator (`third_party/uniffi-bindgen-dart/`, own
+workspace) and five codegen fixes — to be upstreamed to
+`nchapman/uniffi-bindgen-dart`:
+1. **Callback-arg lowering** — sink args lower via `<Name>FfiCodec.lower`
+   (registers the Dart impl + installs the vtable), not a raw object write — so
+   a sink can be passed *into* Rust.
+2. **Foreign-trait vtable-init symbol** — was `<name>_trait_callback_init` (no
+   such export); now UniFFI's `uniffi_<ns>_fn_init_callback_vtable_<name>`.
+3. **Vtable slot order** — the generator sorted methods alphabetically,
+   misaligning slots vs Rust's declaration order; now preserved for callback
+   traits (`onTextTokens, onAudioFrames, onDone`).
+4. **RustBuffer callback-arg ABI** — the generator JSON-encoded complex callback
+   args (`Pointer<Utf8>`), but stock UniFFI passes a **RustBuffer by value**.
+   Added callback-specific FFI mappers (`map_callback_native/dart_ffi_type`,
+   scoped to callback bridges — the non-ffibuffer runtime path is untouched) +
+   RustBuffer decode via the existing `_UniFfiBinaryReader`/`_uniffiRead<T>`.
+   `Vec<u32>`/`Vec<f32>`/enum now decode correctly. 223 vendored tests pass
+   (incl. new callback-mapper tests).
+5. **Per-interface `listener` vs `isolateLocal`** — void vtable methods of a
+   callback interface used by any *async* method use `NativeCallable.listener`
+   (cross-thread); sync-only interfaces keep `isolateLocal`. Unblocks
+   `generate_streaming_async` (see Async below).
+
+**Async — `generateAsync` AND `generateStreamingAsync` WORK.** `generateAsync`
+returns a real `Future` via UniFFI's rust-future poll/complete loop — verified
+async: 24 tokens with the Dart event loop ticking ~45× during decode.
+`generateStreamingAsync` streams tokens to a Dart `ModalitySink` from cera's
+tokio worker thread (16 tokens + `onDone` verified, `example/cera_async.dart`).
+The enabler is a **per-interface vtable-callable heuristic**: a callback
+interface passed to any *async* method gets `NativeCallable.listener` (callable
+cross-thread, delivered on the owning isolate's event loop); interfaces used
+only by synchronous APIs keep `NativeCallable.isolateLocal` (same-thread,
+synchronous). So `ModalitySink` (used by `generate_streaming_async`) → listener;
+`DownloadProgressSink` (only `with_progress`) → isolateLocal.
+
+Consequence: `listener` callbacks are async, so **sync `generate_streaming`'s
+`ModalitySink` callbacks are now queued** and arrive only when you yield to the
+event loop (drain after the call — `example/cera_stream.dart`; or just use
+`generateStreamingAsync`). `fromBundleIdAsync` stays generator-stubbed — async
+constructor returning an object handle needs the object/pointer rust-future
+variant.
+
+**`BundleRepo.withProgress` — VERIFIED.** `DownloadProgressSink.onProgress`
+fires synchronously (it stays `isolateLocal`; `fromBundleId` is synchronous) with
+all args RustBuffer-decoded correctly: `url: String`, `bytesDownloaded: u64`,
+`totalBytes: Option<u64>` (`example/cera_progress.dart`, `LFM2-350M-GGUF`).
+
+**Remaining:** object/pointer rust-future variant (unblocks `fromBundleIdAsync`);
+package prebuilt native libs per target (Android jniLibs / iOS xcframework /
+desktop); expose a detokenizer over FFI; example Flutter app + wire the Dart
+drift check into CI; then the upstream PR.
+
+**Spike result (2026-06-13, `uniffi-bindgen-dart` 0.1.3):** Viable but not
+turnkey. The generator builds against `uniffi_bindgen 0.31.1` (our exact
+version) and emitted ~7,300 lines of Dart from the current `cera-ffi` dylib
+with **zero Rust-side changes** — structs, enums, sync methods, and
+`CeraEngine.transcribe` came out clean (UniFFI checksums matched). After adding
+the `ffi` package dep and an SDK `^3.3.0` constraint, `dart analyze` drops to
+**8 errors, 0 warnings**, and every error sits in the *advanced* FFI surface:
+- callback / foreign-trait sinks — `DownloadProgressSink`, `ModalitySink`
+  (download progress + audio-modality streaming) generate invalid casts;
+- async constructor `fromBundleIdAsync` returns `CeraEngine` instead of
+  `Future<CeraEngine>`;
+- a `_UniFfiFfiBufferElement.pointer` getter bug in sequence handling.
+
+So the bulk auto-generates, but cera leans hard on exactly the async +
+streaming-callback features 0.1.3 mishandles. Paths forward:
+1. **Narrow the Dart-exposed surface** — generate for the sync core, hand-write
+   thin Dart shims for the streaming/async bits.
+2. **Patch/contribute upstream** — the failures are isolated; `uniffi-bindgen-dart`
+   is young (0.1.x) and the fixes look tractable.
+3. **flutter_rust_bridge** — separate binding layer, but first-class async +
+   `Stream` support (a better fit for token/audio streaming) at the cost of not
+   reusing the UniFFI interface.
+
+Recommendation: pursue (1)+(2) to stay aligned with the existing UniFFI
+bindings; fall back to (3) if streaming UX becomes the priority.
 
 ---
 

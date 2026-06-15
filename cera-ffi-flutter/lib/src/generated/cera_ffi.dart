@@ -2204,12 +2204,8 @@ class CeraFfiFfi {
       return provided;
     }
     final envPath = io.Platform.environment['CERA_FFI_LIB'];
-    if (_libraryPath == null && envPath != null && envPath.isNotEmpty) {
+    if (provided == null && _libraryPath == null && envPath != null && envPath.isNotEmpty) {
       return ffi.DynamicLibrary.open(envPath);
-    }
-    if (_libraryPath == null && io.Platform.isIOS) {
-      // iOS links cera-ffi statically into the host process — open the image.
-      return ffi.DynamicLibrary.process();
     }
     return ffi.DynamicLibrary.open(_libraryPath ?? _ceraDefaultLibraryFile());
   }
@@ -2639,14 +2635,14 @@ class CeraFfiFfi {
   late final _UniFfiRustBuffer Function(_UniFfiForeignBytes bytes, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _uniFfiRustBufferFromBytes = _lib.lookupFunction<_UniFfiRustBuffer Function(_UniFfiForeignBytes bytes, ffi.Pointer<_UniFfiRustCallStatus> outStatus), _UniFfiRustBuffer Function(_UniFfiForeignBytes bytes, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('ffi_cera_ffi_rustbuffer_from_bytes');
   late final void Function(_UniFfiRustBuffer buf, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _uniFfiRustBufferFree = _lib.lookupFunction<ffi.Void Function(_UniFfiRustBuffer buf, ffi.Pointer<_UniFfiRustCallStatus> outStatus), void Function(_UniFfiRustBuffer buf, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('ffi_cera_ffi_rustbuffer_free');
 
-  late final void Function(ffi.Pointer<_DownloadProgressSinkTraitVTable>) _downloadProgressSinkTraitCallbackInit = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_DownloadProgressSinkTraitVTable>), void Function(ffi.Pointer<_DownloadProgressSinkTraitVTable>)>('downloadprogresssink_trait_callback_init');
+  late final void Function(ffi.Pointer<_DownloadProgressSinkTraitVTable>) _downloadProgressSinkTraitCallbackInit = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_DownloadProgressSinkTraitVTable>), void Function(ffi.Pointer<_DownloadProgressSinkTraitVTable>)>('uniffi_cera_ffi_fn_init_callback_vtable_downloadprogresssink');
   late final ffi.Pointer<_DownloadProgressSinkTraitVTable> _downloadProgressSinkTraitCallbackVTable = _DownloadProgressSinkTraitCallbackBridge.createVTable();
   late final bool _downloadProgressSinkTraitCallbackInitDone = (() {
     _downloadProgressSinkTraitCallbackInit(_downloadProgressSinkTraitCallbackVTable);
     return true;
   })();
 
-  late final void Function(ffi.Pointer<_ModalitySinkTraitVTable>) _modalitySinkTraitCallbackInit = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_ModalitySinkTraitVTable>), void Function(ffi.Pointer<_ModalitySinkTraitVTable>)>('modalitysink_trait_callback_init');
+  late final void Function(ffi.Pointer<_ModalitySinkTraitVTable>) _modalitySinkTraitCallbackInit = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_ModalitySinkTraitVTable>), void Function(ffi.Pointer<_ModalitySinkTraitVTable>)>('uniffi_cera_ffi_fn_init_callback_vtable_modalitysink');
   late final ffi.Pointer<_ModalitySinkTraitVTable> _modalitySinkTraitCallbackVTable = _ModalitySinkTraitCallbackBridge.createVTable();
   late final bool _modalitySinkTraitCallbackInitDone = (() {
     _modalitySinkTraitCallbackInit(_modalitySinkTraitCallbackVTable);
@@ -2889,7 +2885,7 @@ class CeraFfiFfi {
       (argBuf + 0).ref.u64 = storeDirRustBuffer.capacity;
       (argBuf + 1).ref.u64 = storeDirRustBuffer.len;
       (argBuf + 2).ref.ptr = storeDirRustBuffer.data.cast<ffi.Void>();
-      (argBuf + 3).ref.u64 = throw UnsupportedError('DownloadProgressSink callbacks are not supported by the Dart bindings yet (V2.17).');
+      (argBuf + 3).ref.u64 = DownloadProgressSinkFfiCodec.lower(progress);
       _bundleRepoCtorWithProgressFfiBuffer(argBuf, returnBuf);
       final int statusCode = (returnBuf + 1).ref.i8;
       if (statusCode != _uniFfiRustCallStatusSuccess) {
@@ -4697,6 +4693,105 @@ class CeraFfiFfi {
 
   late final int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _modalitySinkClone = _lib.lookupFunction<ffi.Uint64 Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('uniffi_cera_ffi_fn_clone_modalitysink');
 
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _modalitySinkOnTextTokensFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_modalitysink_on_text_tokens');
+
+  void modalitySinkInvokeOnTextTokens(int handle, List<int> tokens) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _modalitySinkClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      final tokensWriter = _UniFfiBinaryWriter();
+      tokensWriter.writeI32(tokens.length);
+      for (final item in tokens) {
+        tokensWriter.writeU32(item);
+      }
+      final Uint8List tokensBytes = tokensWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> tokensPtr = tokensBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(tokensBytes.length);
+      if (tokensBytes.isNotEmpty) { tokensPtr.asTypedList(tokensBytes.length).setAll(0, tokensBytes); }
+      foreignArgPtrs.add(tokensPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> tokensFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      tokensFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      tokensFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> tokensForeignPtr = calloc<_UniFfiForeignBytes>();
+      tokensForeignPtr.ref
+        ..len = tokensBytes.length
+        ..data = tokensPtr;
+      final _UniFfiRustBuffer tokensRustBuffer = _uniFfiRustBufferFromBytes(tokensForeignPtr.ref, tokensFromBytesStatusPtr);
+      calloc.free(tokensForeignPtr);
+      final int tokensFromBytesCode = tokensFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer tokensFromBytesErrBuf = tokensFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(tokensFromBytesStatusPtr);
+      if (tokensFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> tokensFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        tokensFromBytesErrBufPtr.ref
+          ..capacity = tokensFromBytesErrBuf.capacity
+          ..len = tokensFromBytesErrBuf.len
+          ..data = tokensFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(tokensFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $tokensFromBytesCode');
+      }
+      (argBuf + 1).ref.u64 = tokensRustBuffer.capacity;
+      (argBuf + 2).ref.u64 = tokensRustBuffer.len;
+      (argBuf + 3).ref.ptr = tokensRustBuffer.data.cast<ffi.Void>();
+      _modalitySinkOnTextTokensFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 0).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 1).ref.u64
+          ..len = (returnBuf + 2).ref.u64
+          ..data = (returnBuf + 3).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
   late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _modalitySinkOnAudioFramesFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_modalitysink_on_audio_frames');
 
   void modalitySinkInvokeOnAudioFrames(int handle, List<double> pcm, int sampleRate) {
@@ -4855,105 +4950,6 @@ class CeraFfiFfi {
       (argBuf + 2).ref.u64 = reasonRustBuffer.len;
       (argBuf + 3).ref.ptr = reasonRustBuffer.data.cast<ffi.Void>();
       _modalitySinkOnDoneFfiBuffer(argBuf, returnBuf);
-      final int statusCode = (returnBuf + 0).ref.i8;
-      if (statusCode != _uniFfiRustCallStatusSuccess) {
-        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
-        errBufPtr.ref
-          ..capacity = (returnBuf + 1).ref.u64
-          ..len = (returnBuf + 2).ref.u64
-          ..data = (returnBuf + 3).ref.ptr.cast<ffi.Uint8>();
-        rustRetBufferPtrs.add(errBufPtr);
-        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
-      }
-      return;
-    } finally {
-      for (final ptr in foreignArgPtrs) {
-        if (ptr != ffi.nullptr) {
-          calloc.free(ptr);
-        }
-      }
-      for (final bufPtr in rustRetBufferPtrs) {
-        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
-          continue;
-        }
-        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
-        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
-        freeStatusPtr.ref.errorBuf
-          ..capacity = 0
-          ..len = 0
-          ..data = ffi.nullptr;
-        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
-        calloc.free(freeStatusPtr);
-        calloc.free(bufPtr);
-      }
-      calloc.free(argBuf);
-      calloc.free(returnBuf);
-    }
-  }
-
-  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _modalitySinkOnTextTokensFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_modalitysink_on_text_tokens');
-
-  void modalitySinkInvokeOnTextTokens(int handle, List<int> tokens) {
-    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(4);
-    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(4);
-    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
-    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
-    try {
-      final int clonedHandle;
-      {
-        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
-        try {
-          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
-          cloneStatusPtr.ref.errorBuf
-            ..capacity = 0
-            ..len = 0
-            ..data = ffi.nullptr;
-          clonedHandle = _modalitySinkClone(handle, cloneStatusPtr);
-          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
-            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
-          }
-        } finally {
-          calloc.free(cloneStatusPtr);
-        }
-      }
-      (argBuf + 0).ref.u64 = clonedHandle;
-      final tokensWriter = _UniFfiBinaryWriter();
-      tokensWriter.writeI32(tokens.length);
-      for (final item in tokens) {
-        tokensWriter.writeU32(item);
-      }
-      final Uint8List tokensBytes = tokensWriter.toBytes();
-      final ffi.Pointer<ffi.Uint8> tokensPtr = tokensBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(tokensBytes.length);
-      if (tokensBytes.isNotEmpty) { tokensPtr.asTypedList(tokensBytes.length).setAll(0, tokensBytes); }
-      foreignArgPtrs.add(tokensPtr);
-      final ffi.Pointer<_UniFfiRustCallStatus> tokensFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
-      tokensFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
-      tokensFromBytesStatusPtr.ref.errorBuf
-        ..capacity = 0
-        ..len = 0
-        ..data = ffi.nullptr;
-      final ffi.Pointer<_UniFfiForeignBytes> tokensForeignPtr = calloc<_UniFfiForeignBytes>();
-      tokensForeignPtr.ref
-        ..len = tokensBytes.length
-        ..data = tokensPtr;
-      final _UniFfiRustBuffer tokensRustBuffer = _uniFfiRustBufferFromBytes(tokensForeignPtr.ref, tokensFromBytesStatusPtr);
-      calloc.free(tokensForeignPtr);
-      final int tokensFromBytesCode = tokensFromBytesStatusPtr.ref.code;
-      final _UniFfiRustBuffer tokensFromBytesErrBuf = tokensFromBytesStatusPtr.ref.errorBuf;
-      calloc.free(tokensFromBytesStatusPtr);
-      if (tokensFromBytesCode != _uniFfiRustCallStatusSuccess) {
-        final ffi.Pointer<_UniFfiRustBuffer> tokensFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
-        tokensFromBytesErrBufPtr.ref
-          ..capacity = tokensFromBytesErrBuf.capacity
-          ..len = tokensFromBytesErrBuf.len
-          ..data = tokensFromBytesErrBuf.data;
-        rustRetBufferPtrs.add(tokensFromBytesErrBufPtr);
-        throw StateError('UniFFI rustbuffer_from_bytes failed with status $tokensFromBytesCode');
-      }
-      (argBuf + 1).ref.u64 = tokensRustBuffer.capacity;
-      (argBuf + 2).ref.u64 = tokensRustBuffer.len;
-      (argBuf + 3).ref.ptr = tokensRustBuffer.data.cast<ffi.Void>();
-      _modalitySinkOnTextTokensFfiBuffer(argBuf, returnBuf);
       final int statusCode = (returnBuf + 0).ref.i8;
       if (statusCode != _uniFfiRustCallStatusSuccess) {
         final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
@@ -5832,7 +5828,7 @@ class CeraFfiFfi {
       (argBuf + 1).ref.u64 = optsRustBuffer.capacity;
       (argBuf + 2).ref.u64 = optsRustBuffer.len;
       (argBuf + 3).ref.ptr = optsRustBuffer.data.cast<ffi.Void>();
-      (argBuf + 4).ref.u64 = throw UnsupportedError('ModalitySink streaming is not supported by the Dart bindings yet (V2.17).');
+      (argBuf + 4).ref.u64 = ModalitySinkFfiCodec.lower(sink);
       _sessionGenerateStreamingFfiBuffer(argBuf, returnBuf);
       final int statusCode = (returnBuf + 3).ref.i8;
       if (statusCode != _uniFfiRustCallStatusSuccess) {
@@ -5942,7 +5938,7 @@ class CeraFfiFfi {
       (argBuf + 1).ref.u64 = optsRustBuffer.capacity;
       (argBuf + 2).ref.u64 = optsRustBuffer.len;
       (argBuf + 3).ref.ptr = optsRustBuffer.data.cast<ffi.Void>();
-      (argBuf + 4).ref.u64 = throw UnsupportedError('ModalitySink streaming is not supported by the Dart bindings yet (V2.17).');
+      (argBuf + 4).ref.u64 = ModalitySinkFfiCodec.lower(sink);
       _sessionGenerateStreamingAsyncFfiBuffer(argBuf, returnBuf);
       final int statusCode = (returnBuf + 1).ref.i8;
       if (statusCode != _uniFfiRustCallStatusSuccess) {
@@ -6639,7 +6635,7 @@ final class _DownloadProgressSinkImpl implements DownloadProgressSink {
   @override
   void onProgress(String url, int bytesDownloaded, int? totalBytes) {
     _ensureOpen();
-    _ffi.downloadProgressSinkInvokeOnProgress(_handle, url, bytesDownloaded, null);
+    _ffi.downloadProgressSinkInvokeOnProgress(_handle, url, bytesDownloaded, totalBytes);
   }
 
 }
@@ -6649,7 +6645,7 @@ final class _DownloadProgressSinkTraitVTable extends ffi.Struct {
 
   external ffi.Pointer<ffi.NativeFunction<ffi.Uint64 Function(ffi.Uint64 handle)>> uniffiClone;
 
-  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<Utf8> url, ffi.Uint64 bytesDownloaded, ffi.Pointer<Utf8> totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>> onProgress;
+  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>> onProgress;
 
 }
 
@@ -6701,23 +6697,42 @@ final class _DownloadProgressSinkTraitCallbackBridge {
     return instance.cloneHandle(handle);
   }, exceptionalReturn: 0);
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<Utf8> url, ffi.Uint64 bytesDownloaded, ffi.Pointer<Utf8> totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onProgressNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<Utf8> url, ffi.Uint64 bytesDownloaded, ffi.Pointer<Utf8> totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.isolateLocal((int handle, ffi.Pointer<Utf8> url, int bytesDownloaded, ffi.Pointer<Utf8> totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
+  static final ffi.Pointer<_UniFfiRustCallStatus> _freeArgStatus = calloc<_UniFfiRustCallStatus>();
+
+  static void _uniffiFreeArgBuffer(_UniFfiRustBuffer buf) {
+    if (buf.data == ffi.nullptr && buf.len == 0 && buf.capacity == 0) {
+      return;
+    }
+    _freeArgStatus.ref.code = _uniFfiRustCallStatusSuccess;
+    _freeArgStatus.ref.errorBuf
+      ..capacity = 0
+      ..len = 0
+      ..data = ffi.nullptr;
+    _bindings()._uniFfiRustBufferFree(buf, _freeArgStatus);
+  }
+
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onProgressNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.isolateLocal((int handle, _UniFfiRustBuffer url, int bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
     final DownloadProgressSink? callback = instance.lookup(handle);
     if (callback == null) {
+      _uniffiFreeArgBuffer(url);
+      _uniffiFreeArgBuffer(totalBytes);
       outStatus.ref
         ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = 'Invalid callback handle'.toNativeUtf8();
+        ..errorBuf = ffi.nullptr;
       return;
     }
     try {
-      callback.onProgress(url == ffi.nullptr ? (throw StateError('Rust passed null string callback arg')) : url.toDartString(), bytesDownloaded, null);
+      callback.onProgress(utf8.decode(url.data.asTypedList(url.len)), bytesDownloaded, (() { final r = _UniFfiBinaryReader(totalBytes.data.asTypedList(totalBytes.len)); return r.readI8() == 0 ? null : r.readU64(); })());
       outStatus.ref
         ..code = _rustCallStatusSuccess
         ..errorBuf = ffi.nullptr;
-    } catch (err) {
+    } catch (_) {
       outStatus.ref
         ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = err.toString().toNativeUtf8();
+        ..errorBuf = ffi.nullptr;
+    } finally {
+      _uniffiFreeArgBuffer(url);
+      _uniffiFreeArgBuffer(totalBytes);
     }
   });
 
@@ -6760,6 +6775,10 @@ final class DownloadProgressSinkFfiCodec {
 /// marshalling onto a different thread (e.g. Swift's `@MainActor`) it
 /// is the implementer's responsibility to dispatch the call there.
 abstract interface class ModalitySink {
+  /// Called with each chunk of generated token IDs. Ownership of the
+  /// `Vec<u32>` is transferred to the callback, so implementations
+  /// may retain or store it directly if needed — no clone required.
+  void onTextTokens(List<int> tokens);
   /// Called with each chunk of generated PCM audio samples. Not
   /// called for text-only models; LFM2-Audio-class models emit here.
   /// The `sample_rate` is the model's native output rate (typically
@@ -6773,10 +6792,6 @@ abstract interface class ModalitySink {
   /// [`FinishReason::Error`] so foreign consumers have a reliable
   /// end-of-stream signal regardless of how the call exits.
   void onDone(FinishReason reason);
-  /// Called with each chunk of generated token IDs. Ownership of the
-  /// `Vec<u32>` is transferred to the callback, so implementations
-  /// may retain or store it directly if needed — no clone required.
-  void onTextTokens(List<int> tokens);
 }
 
 final class _ModalitySinkFinalizerToken {
@@ -6815,6 +6830,15 @@ final class _ModalitySinkImpl implements ModalitySink {
     }
   }
 
+  /// Called with each chunk of generated token IDs. Ownership of the
+  /// `Vec<u32>` is transferred to the callback, so implementations
+  /// may retain or store it directly if needed — no clone required.
+  @override
+  void onTextTokens(List<int> tokens) {
+    _ensureOpen();
+    _ffi.modalitySinkInvokeOnTextTokens(_handle, tokens);
+  }
+
   /// Called with each chunk of generated PCM audio samples. Not
   /// called for text-only models; LFM2-Audio-class models emit here.
   /// The `sample_rate` is the model's native output rate (typically
@@ -6838,15 +6862,6 @@ final class _ModalitySinkImpl implements ModalitySink {
     _ffi.modalitySinkInvokeOnDone(_handle, reason);
   }
 
-  /// Called with each chunk of generated token IDs. Ownership of the
-  /// `Vec<u32>` is transferred to the callback, so implementations
-  /// may retain or store it directly if needed — no clone required.
-  @override
-  void onTextTokens(List<int> tokens) {
-    _ensureOpen();
-    _ffi.modalitySinkInvokeOnTextTokens(_handle, tokens);
-  }
-
 }
 
 final class _ModalitySinkTraitVTable extends ffi.Struct {
@@ -6854,11 +6869,11 @@ final class _ModalitySinkTraitVTable extends ffi.Struct {
 
   external ffi.Pointer<ffi.NativeFunction<ffi.Uint64 Function(ffi.Uint64 handle)>> uniffiClone;
 
-  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<Utf8> pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>> onAudioFrames;
+  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>> onTextTokens;
 
-  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<Utf8> reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>> onDone;
+  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>> onAudioFrames;
 
-  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<Utf8> tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>> onTextTokens;
+  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>> onDone;
 
 }
 
@@ -6902,7 +6917,7 @@ final class _ModalitySinkTraitCallbackBridge {
 
   ModalitySink? lookup(int handle) => _callbacks[handle];
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)> _freeNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)>.isolateLocal((int handle) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)> _freeNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)>.listener((int handle) {
     instance.release(handle);
   });
 
@@ -6910,63 +6925,62 @@ final class _ModalitySinkTraitCallbackBridge {
     return instance.cloneHandle(handle);
   }, exceptionalReturn: 0);
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<Utf8> pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onAudioFramesNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<Utf8> pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.isolateLocal((int handle, ffi.Pointer<Utf8> pcm, int sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
+  static final ffi.Pointer<_UniFfiRustCallStatus> _freeArgStatus = calloc<_UniFfiRustCallStatus>();
+
+  static void _uniffiFreeArgBuffer(_UniFfiRustBuffer buf) {
+    if (buf.data == ffi.nullptr && buf.len == 0 && buf.capacity == 0) {
+      return;
+    }
+    _freeArgStatus.ref.code = _uniFfiRustCallStatusSuccess;
+    _freeArgStatus.ref.errorBuf
+      ..capacity = 0
+      ..len = 0
+      ..data = ffi.nullptr;
+    _bindings()._uniFfiRustBufferFree(buf, _freeArgStatus);
+  }
+
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onTextTokensNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
     final ModalitySink? callback = instance.lookup(handle);
     if (callback == null) {
-      outStatus.ref
-        ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = 'Invalid callback handle'.toNativeUtf8();
+      _uniffiFreeArgBuffer(tokens);
       return;
     }
     try {
-      callback.onAudioFrames(pcm == ffi.nullptr ? (throw StateError('Rust passed null sequence callback arg')) : (jsonDecode(pcm.toDartString()) as List).map((item) => (item as num).toDouble()).toList(), sampleRate);
-      outStatus.ref
-        ..code = _rustCallStatusSuccess
-        ..errorBuf = ffi.nullptr;
-    } catch (err) {
-      outStatus.ref
-        ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = err.toString().toNativeUtf8();
+      callback.onTextTokens((() { final r = _UniFfiBinaryReader(tokens.data.asTypedList(tokens.len)); final n = r.readI32(); return List.generate(n, (_) => r.readU32()); })());
+    } catch (_) {
+      // async listener: no channel to report a Dart error to Rust
+    } finally {
+      _uniffiFreeArgBuffer(tokens);
     }
   });
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<Utf8> reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onDoneNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<Utf8> reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.isolateLocal((int handle, ffi.Pointer<Utf8> reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onAudioFramesNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer pcm, int sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
     final ModalitySink? callback = instance.lookup(handle);
     if (callback == null) {
-      outStatus.ref
-        ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = 'Invalid callback handle'.toNativeUtf8();
+      _uniffiFreeArgBuffer(pcm);
       return;
     }
     try {
-      callback.onDone(reason == ffi.nullptr ? (throw StateError('Rust passed null enum callback arg')) : FinishReasonFfiCodec.decode(reason.toDartString()));
-      outStatus.ref
-        ..code = _rustCallStatusSuccess
-        ..errorBuf = ffi.nullptr;
-    } catch (err) {
-      outStatus.ref
-        ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = err.toString().toNativeUtf8();
+      callback.onAudioFrames((() { final r = _UniFfiBinaryReader(pcm.data.asTypedList(pcm.len)); final n = r.readI32(); return List.generate(n, (_) => r.readF32()); })(), sampleRate);
+    } catch (_) {
+      // async listener: no channel to report a Dart error to Rust
+    } finally {
+      _uniffiFreeArgBuffer(pcm);
     }
   });
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<Utf8> tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onTextTokensNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<Utf8> tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.isolateLocal((int handle, ffi.Pointer<Utf8> tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onDoneNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
     final ModalitySink? callback = instance.lookup(handle);
     if (callback == null) {
-      outStatus.ref
-        ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = 'Invalid callback handle'.toNativeUtf8();
+      _uniffiFreeArgBuffer(reason);
       return;
     }
     try {
-      callback.onTextTokens(tokens == ffi.nullptr ? (throw StateError('Rust passed null sequence callback arg')) : (jsonDecode(tokens.toDartString()) as List).map((item) => (item as num).toInt()).toList());
-      outStatus.ref
-        ..code = _rustCallStatusSuccess
-        ..errorBuf = ffi.nullptr;
-    } catch (err) {
-      outStatus.ref
-        ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = err.toString().toNativeUtf8();
+      callback.onDone(_uniffiReadFinishReason(_UniFfiBinaryReader(reason.data.asTypedList(reason.len))));
+    } catch (_) {
+      // async listener: no channel to report a Dart error to Rust
+    } finally {
+      _uniffiFreeArgBuffer(reason);
     }
   });
 
@@ -6975,9 +6989,9 @@ final class _ModalitySinkTraitCallbackBridge {
     vtablePtr.ref
       ..uniffiFree = _freeNative.nativeFunction
       ..uniffiClone = _cloneNative.nativeFunction
+      ..onTextTokens = _onTextTokensNative.nativeFunction
       ..onAudioFrames = _onAudioFramesNative.nativeFunction
       ..onDone = _onDoneNative.nativeFunction
-      ..onTextTokens = _onTextTokensNative.nativeFunction
     ;
     return vtablePtr;
   }
@@ -7301,14 +7315,10 @@ String cpuBackendReport() {
 
 
 // Added by tool/patch_generated_bindings.dart — platform-correct default name
-// for the cera-ffi cdylib (`cera_ffi`). iOS is handled before this is called
-// (static process image); unknown platforms fail loudly instead of guessing.
+// for the cera-ffi cdylib (`cera_ffi`). iOS links statically; manual users can
+// pass a DynamicLibrary or set CERA_FFI_LIB.
 String _ceraDefaultLibraryFile() {
   if (io.Platform.isMacOS) return 'libcera_ffi.dylib';
   if (io.Platform.isWindows) return 'cera_ffi.dll';
-  if (io.Platform.isAndroid || io.Platform.isLinux) return 'libcera_ffi.so';
-  throw UnsupportedError(
-    'cera-ffi has no bundled native library for ${io.Platform.operatingSystem}; '
-    'set CERA_FFI_LIB or pass an explicit library path.',
-  );
+  return 'libcera_ffi.so';
 }

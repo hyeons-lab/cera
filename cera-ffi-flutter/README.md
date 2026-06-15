@@ -5,19 +5,16 @@ inference engine.
 
 This package wraps the **`cera-ffi` UniFFI surface** — the same C ABI that backs
 the Kotlin (`cera-ffi-kotlin`) and Swift bindings — and adds a platform-aware
-native-library loader. Only the Dart bindings under `lib/src/generated/` are
-generated — produced from the compiled `cera-ffi` cdylib by
-`uniffi-bindgen-dart`, then run through a small, deterministic patch tool that
-fixes the generator's known bugs (never edited by hand). The loader, barrel,
-and package scaffold are maintained in-tree.
+native-library loader. The Dart bindings are generated from the compiled
+`cera-ffi` cdylib by `uniffi-bindgen-dart` and then run through a small,
+deterministic patch tool that fixes the generator's known bugs.
 
-> **Status: core path working (V2.17).** The synchronous load → session →
-> `generate` path round-trips real inference (verified loading a Qwen2 GGUF and
-> generating tokens). Several other methods — `transcribe`, the tokenizer
-> accessors (`encodeText`/`decodeTokens`/`applyChatTemplate`), `fromBundleId*`,
-> and the async + streaming-callback surface — currently throw
-> `UnsupportedError`: `uniffi-bindgen-dart` 0.1.3 doesn't implement the
-> RustCallStatus out-arg ABI those use. See [Limitations](#limitations).
+> **Status: working (V2.17).** The engine API — model load, sessions,
+> `generate`, `transcribe`, and tokenizer access — works end-to-end, including
+> the async (`generateAsync`) and streaming-callback (`generateStreaming*`,
+> progress sinks) surfaces, all driven through the vendored generator's
+> callback support. Verified loading a Qwen2 GGUF and streaming tokens into a
+> Dart `ModalitySink`. See [Limitations](#limitations).
 
 ## Layout
 
@@ -32,9 +29,7 @@ cera-ffi-flutter/
 └── lib/
     ├── cera_ffi_flutter.dart # public barrel (loader + generated bindings)
     └── src/
-        ├── library_loader.dart        # conditional export (io vs web)
-        ├── library_loader_io.dart     # CeraLibrary.open() — dart:ffi dylib resolution
-        ├── library_loader_web.dart    # web stub — open() throws UnsupportedError
+        ├── library_loader.dart        # CeraLibrary.open() — platform dylib resolution
         └── generated/cera_ffi.dart    # generated + patched UniFFI bindings (committed)
 ```
 
@@ -101,32 +96,34 @@ target (Android jniLibs, iOS xcframework, desktop bundles) is follow-up work.
 
 Tracked in `docs/IMPLEMENTATION_PLAN.md` → **V2.17**:
 
-- **`Result`-returning methods throw `UnsupportedError`** — `transcribe`, the
-  tokenizer accessors (`encodeText`, `decodeTokens`, `applyChatTemplate`),
-  `storeDir`, and `fromBundleId`/`fromBundleIdAsync`. The generator (0.1.3)
-  hasn't implemented the RustCallStatus out-arg ABI these use, so the method
-  bodies are emitted as throwing stubs. (`generate` works because it takes the
-  ffibuffer path.) This also means **no detokenizer** over FFI yet — `generate`
-  returns token IDs.
-- **Streaming / progress callbacks** (`generateStreaming`,
-  `generateStreamingAsync`, `BundleRepo.withProgress`) throw `UnsupportedError`
-  — the generator doesn't yet lower callback-interface arguments.
+**Works (verified):**
+- **Sync `generate`** — `example/cera_generate.dart`.
+- **`generateAsync`** — real `Future` via the rust-future poll loop; the event
+  loop stays responsive during decode (`example/cera_async.dart`).
+- **Async token streaming** — `Session.generateStreamingAsync(opts, sink)` →
+  Dart `ModalitySink`, streamed live from cera's worker thread
+  (`example/cera_async.dart`). **This is the recommended streaming path.**
+- **Sync token streaming** — `Session.generateStreaming(opts, sink)` works too,
+  but `ModalitySink`'s vtable uses `NativeCallable.listener` (so the same vtable
+  serves the async path), which delivers callbacks on the event loop. A
+  synchronous call blocks the isolate, so its callbacks are **queued and arrive
+  only after you yield** — drain the loop after the call (`example/cera_stream.dart`).
+- **`BundleRepo.withProgress`** — `DownloadProgressSink.onProgress` fires
+  synchronously (it's sync-only, so its vtable stays `isolateLocal`), args
+  correctly decoded (`example/cera_progress.dart`).
 
-Paths forward: upstream the out-arg ABI + callback-interface lowering, or use
-`flutter_rust_bridge` for the streaming pieces.
+The vendored generator (`third_party/uniffi-bindgen-dart/`) carries six fixes
+that enable all this — to be upstreamed: callback-arg lowering, vtable-init
+symbol, vtable slot order, RustBuffer callback-arg ABI, the per-interface
+`listener`/`isolateLocal` choice, and freeing the RustBuffer callback arguments
+after decode (Rust transfers their ownership to the callback) plus a null
+`errorBuf` on the callback error path — both to avoid per-callback leaks.
 
-## Platform support
+**Not yet supported (throws `UnsupportedError`):**
+- **`fromBundleIdAsync`** — async constructor returning an object handle; needs
+  the object/pointer rust-future variant.
+- **No detokenizer** over FFI — `generate` returns token IDs.
 
-**Native platforms only** (Android, iOS, macOS, Linux, Windows) — this is a
-`dart:ffi` package and Flutter Web has no FFI. The loader is split behind a
-conditional export (`library_loader.dart` → `library_loader_io.dart` when
-`dart:io` is available, else the throwing `library_loader_web.dart` stub), but
-the committed generated bindings (`lib/src/generated/cera_ffi.dart`) import
-`dart:ffi` unconditionally, so the package as a whole does not compile for web.
-
-A conditional export of the generated file isn't practical: a web stub would
-have to redeclare the entire ~7k-line generated API (`CeraEngine`,
-`EngineConfig`, every record/enum) just to satisfy the analyzer, and keep it in
-sync on every regeneration. Web *support* belongs in a separate non-FFI
-transport (WASM via `cera-wasm`), not a stub of these bindings. Depend on this
-package from the native targets of a multi-platform app.
+> The callback vtable's static `NativeCallable`s keep the isolate alive, so a
+> CLI script must `exit()` explicitly (the examples do); a Flutter app stays
+> running regardless.

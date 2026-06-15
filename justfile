@@ -99,17 +99,22 @@ dart-libs:
     @echo "Point Dart at it via CERA_FFI_LIB or place it on the loader path."
 
 # Generate + patch the Dart/Flutter bindings into the cera-ffi-flutter package.
-# Dart is not a built-in uniffi-bindgen language — it uses the external
-# `uniffi-bindgen-dart` tool (pins uniffi_bindgen 0.31, matching this workspace).
-# The raw output has several codegen bugs against Cera's FFI surface, so we run
-# `tool/patch_generated_bindings.dart` immediately after (deterministic +
-# idempotent): it fixes symbol names, native-lib resolution, the EngineConfig
-# record encoder, and stubs the unsupported callback-streaming surface. The
-# patched result analyzes clean and round-trips real inference. See V2.17.
+# Builds + runs the VENDORED uniffi-bindgen-dart (third_party/) — patched for
+# Cera with callback-argument lowering + the foreign-trait vtable-init symbol fix
+# that makes streaming work; built from source rather than `cargo install`ing the
+# upstream 0.1.3 so those fixes are in effect (to be upstreamed). It runs against
+# the ffi-buffer cdylib, then `tool/patch_generated_bindings.dart` (deterministic
+# + idempotent) fixes symbol names, native-lib resolution, and the EngineConfig
+# record encoder. The patched result analyzes clean and round-trips real
+# inference, including async + streaming. See V2.17.
 #
-# Requires: `cargo install uniffi-bindgen-dart` and a Dart SDK >= 3.3.
+# `cargo run --manifest-path` is used over a hardcoded target/ binary path so it
+# stays portable (handles the Windows `.exe` suffix automatically).
+#
+# Requires a Dart SDK >= 3.3.
 dart-bindings: dart-libs
-    uniffi-bindgen-dart generate {{CERA_FFI_DYLIB}} \
+    cargo run --release --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml -- \
+        generate {{CERA_FFI_DYLIB}} \
         --out-dir cera-ffi-flutter/lib/src/generated
     cd cera-ffi-flutter && dart run tool/patch_generated_bindings.dart
 
