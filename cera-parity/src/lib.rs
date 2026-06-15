@@ -173,6 +173,7 @@ fn greedy_opts(max_tokens: u32) -> cera::GenerateOpts {
         top_k: settings::TOP_K,
         repetition_penalty: settings::REPETITION_PENALTY,
         stop_tokens: Vec::new(),
+        grammar: None,
         flush_every_tokens: settings::FLUSH_EVERY_TOKENS,
         flush_every_ms: settings::FLUSH_EVERY_MS,
     }

@@ -920,6 +920,9 @@ impl From<GenerateOpts> for cera::GenerateOpts {
             top_k: o.top_k,
             repetition_penalty: o.repetition_penalty,
             stop_tokens: o.stop_tokens,
+            // Grammar-constrained decoding isn't exposed over FFI yet (it needs an
+            // `Arc<cera::grammar::Grammar>`); foreign callers use the unconstrained path.
+            grammar: None,
             flush_every_tokens: o.flush_every_tokens,
             flush_every_ms: o.flush_every_ms,
         }
@@ -943,6 +946,10 @@ impl From<cera::FinishReason> for FinishReason {
             cera::FinishReason::Stop => FinishReason::Stop,
             cera::FinishReason::Cancelled => FinishReason::Cancelled,
             cera::FinishReason::ContextFull => FinishReason::ContextFull,
+            // Unreachable over FFI today (grammar isn't exposed); a dead-ended grammar is
+            // a terminal stop. Map to `Stop` rather than grow the FFI enum (which would
+            // force a regen of the committed Kotlin/Swift/Dart bindings).
+            cera::FinishReason::GrammarDeadEnd => FinishReason::Stop,
             cera::FinishReason::Error(msg) => FinishReason::Error { message: msg },
         }
     }

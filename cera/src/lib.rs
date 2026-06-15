@@ -21,6 +21,7 @@ mod generated {
     include!("generated/kv_cache_generated.rs");
 }
 pub mod gguf;
+pub mod grammar;
 pub mod kv_cache;
 pub mod manifest;
 pub mod model;

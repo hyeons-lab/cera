@@ -67,6 +67,10 @@ pub struct GenerateOpts {
     pub repetition_penalty: f32,
     /// If any of these fires, decode stops with `FinishReason::Stop`.
     pub stop_tokens: Vec<u32>,
+    /// Optional GBNF grammar. When set, decode is constrained: each step masks the
+    /// logits to only tokens the grammar accepts (EOS only when the grammar is
+    /// complete). Forces off the greedy `forward_greedy` fast path. See [`crate::grammar`].
+    pub grammar: Option<Arc<crate::grammar::Grammar>>,
     /// Emit `on_text_tokens` at least every N tokens. `0` treats as 1.
     pub flush_every_tokens: u32,
     /// Emit `on_text_tokens` at least every N milliseconds. `0` disables time-based flushing.
@@ -82,6 +86,7 @@ impl Default for GenerateOpts {
             top_k: 40,
             repetition_penalty: 1.0,
             stop_tokens: Vec::new(),
+            grammar: None,
             flush_every_tokens: 16,
             flush_every_ms: 50,
         }
@@ -110,6 +115,9 @@ pub enum FinishReason {
     /// Reached the session's `max_seq_len`; no room to decode further
     /// without a context shift (landing in Phase 1.5 via `n_keep`).
     ContextFull,
+    /// A grammar constraint left no token allowed at this step (the grammar can't be
+    /// satisfied by the vocabulary from here). Decode stops rather than spin.
+    GrammarDeadEnd,
     /// Other error; the outer `Result` is the authoritative channel.
     Error(String),
 }
@@ -1168,7 +1176,35 @@ impl Session {
         // Greedy mode is decided once per generate call: deterministic
         // argmax + `forward_greedy`. Stochastic mode samples with RNG +
         // `forward` (keeps logits, supports chaining).
-        let greedy = opts.temperature <= 0.0 || opts.top_k == 1;
+        //
+        // Grammar masking needs the full logit vector at every step, so it is
+        // incompatible with the `forward_greedy` fast path (which argmaxes inside the
+        // model and never returns logits). When a grammar is active we always take the
+        // logits-returning path; `want_greedy` still picks argmax-vs-sample over the
+        // *masked* logits, so `--temperature 0 --grammar ...` stays deterministic.
+        let want_greedy = opts.temperature <= 0.0 || opts.top_k == 1;
+        let greedy = want_greedy && opts.grammar.is_none();
+
+        // Build the grammar matcher + per-token output-byte table once for this call.
+        // The table is O(vocab) to build; correctness-first (a candidate-pruning trie is
+        // a future optimization).
+        let (mut grammar_state, grammar_mask) = if let Some(g) = &opts.grammar {
+            let vocab = self.tokenizer.vocab_size();
+            let mut token_bytes = Vec::with_capacity(vocab);
+            let mut special = Vec::with_capacity(vocab);
+            for id in 0..vocab as u32 {
+                token_bytes.push(self.tokenizer.token_output_bytes(id));
+                special.push(self.tokenizer.is_special_token(id));
+            }
+            let mask =
+                crate::grammar::GrammarMask::new(token_bytes, self.tokenizer.eos_token(), special);
+            (
+                Some(crate::grammar::GrammarState::new(g.clone())),
+                Some(mask),
+            )
+        } else {
+            (None, None)
+        };
 
         // Stochastic-only state. Allocating the scratch buffer and syncing
         // the sampler are skipped in greedy mode where neither is touched.
@@ -1223,12 +1259,32 @@ impl Session {
             } else {
                 sample_scratch.clear();
                 sample_scratch.extend_from_slice(&logits);
-                self.sampler.sample(&mut sample_scratch)
+                if let Some(state) = grammar_state.as_ref() {
+                    // Mask logits to grammar-allowed tokens (EOS only when complete).
+                    let allowed = grammar_mask
+                        .as_ref()
+                        .expect("grammar_mask present when grammar_state is")
+                        .apply(state, &mut sample_scratch);
+                    if allowed == 0 {
+                        finish = FinishReason::GrammarDeadEnd;
+                        break;
+                    }
+                }
+                if want_greedy {
+                    crate::sampler::cpu_argmax(&sample_scratch)
+                } else {
+                    self.sampler.sample(&mut sample_scratch)
+                }
             };
 
             if self.tokenizer.eos_token() == Some(token) || opts.stop_tokens.contains(&token) {
                 finish = FinishReason::Stop;
                 break;
+            }
+
+            // Advance the grammar by the chosen (non-EOS, non-special) token's bytes.
+            if let Some(state) = grammar_state.as_mut() {
+                state.accept(grammar_mask.as_ref().unwrap().token_bytes(token));
             }
 
             pending.push(token);

@@ -370,6 +370,35 @@ impl BpeTokenizer {
     pub fn is_special_token(&self, id: u32) -> bool {
         self.special_tokens.values().any(|&v| v == id)
     }
+
+    /// Raw output bytes a single token contributes to the decoded stream.
+    ///
+    /// This is the per-token slice of [`decode`](Self::decode): valid-UTF-8 tokens have
+    /// the GPT-2 `unicode_to_byte` mapping reversed (e.g. `Ġ` → space); raw byte-fallback
+    /// tokens (e.g. `<0x80>`, not valid UTF-8) are emitted as-is. Used by grammar-
+    /// constrained decoding to test a candidate token against the grammar at the byte
+    /// level — do NOT use the raw vocab entry, which for GPT-2/Qwen vocabs stores the
+    /// *remapped* bytes. Returns an empty vec for an out-of-range id.
+    pub fn token_output_bytes(&self, id: u32) -> Vec<u8> {
+        let Some(token_bytes) = self.vocab.get(id as usize) else {
+            return Vec::new();
+        };
+        match std::str::from_utf8(token_bytes) {
+            Ok(s) => {
+                let mut out = Vec::with_capacity(token_bytes.len());
+                for ch in s.chars() {
+                    if let Some(&b) = self.unicode_to_byte.get(&ch) {
+                        out.push(b);
+                    } else {
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    }
+                }
+                out
+            }
+            Err(_) => token_bytes.clone(),
+        }
+    }
 }
 
 // ── Chat template rendering ─────────────────────────────────────────────────
