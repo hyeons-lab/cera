@@ -458,10 +458,133 @@ impl<'a> Parser<'a> {
         for (name, &id) in &self.symbol_ids {
             ensure!(self.defined[id as usize], "undefined rule: `{name}`");
         }
+        // Reject left recursion (incl. ε-cycles), which would infinite-loop the matcher.
+        self.check_no_left_recursion()?;
         Ok(Grammar {
             rules: self.rules,
             root,
         })
+    }
+
+    /// Split a rule's element list into its alternates (the slices between `Alt`/`End`).
+    fn alternates(&self, rule: usize) -> Vec<&[Elem]> {
+        let elems = &self.rules[rule];
+        let mut alts = Vec::new();
+        let mut start = 0usize;
+        for (i, e) in elems.iter().enumerate() {
+            match e {
+                Elem::Alt => {
+                    alts.push(&elems[start..i]);
+                    start = i + 1;
+                }
+                Elem::End => {
+                    alts.push(&elems[start..i]);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        alts
+    }
+
+    /// Which rules can derive the empty string (fixpoint over the alternates).
+    fn compute_nullable(&self) -> Vec<bool> {
+        let n = self.rules.len();
+        let mut nullable = vec![false; n];
+        loop {
+            let mut changed = false;
+            for r in 0..n {
+                if nullable[r] {
+                    continue;
+                }
+                // A rule is nullable if any alternate is entirely nullable rule-refs
+                // (an empty alternate vacuously qualifies); a terminal makes it not.
+                let any = self.alternates(r).iter().any(|alt| {
+                    alt.iter().all(|e| match e {
+                        Elem::RuleRef(b) => nullable[*b as usize],
+                        _ => false,
+                    })
+                });
+                if any {
+                    nullable[r] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        nullable
+    }
+
+    fn rule_label(&self, id: u32) -> String {
+        match self.symbol_ids.iter().find(|&(_, &v)| v == id) {
+            Some((name, _)) => format!("rule `{name}`"),
+            None => "an anonymous (…)/repetition subrule".to_string(),
+        }
+    }
+
+    /// Reject left recursion: this stack matcher (like GBNF generally) requires that no
+    /// rule can recurse without first consuming a byte. Left recursion — including
+    /// ε-cycles such as `""*` or `A ::= B; B ::= A` — would infinite-loop `advance_stack`.
+    fn check_no_left_recursion(&self) -> Result<()> {
+        let n = self.rules.len();
+        let nullable = self.compute_nullable();
+        // Left-corner graph: A → B if some alternate of A reaches `RuleRef(B)` through a
+        // prefix of nullable rule-refs (B can be entered without consuming a byte).
+        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (a, adj_a) in adj.iter_mut().enumerate() {
+            for alt in self.alternates(a) {
+                for &e in alt {
+                    match e {
+                        Elem::RuleRef(b) => {
+                            adj_a.push(b);
+                            if !nullable[b as usize] {
+                                break; // non-nullable: nothing past it is a left corner
+                            }
+                        }
+                        // A terminal consumes a byte → left corner ends here.
+                        _ => break,
+                    }
+                }
+            }
+        }
+        // Iterative 3-colour DFS for a back edge (a cycle in the left-corner graph).
+        #[derive(Clone, Copy, PartialEq)]
+        enum Color {
+            White,
+            Gray,
+            Black,
+        }
+        let mut color = vec![Color::White; n];
+        for s in 0..n {
+            if color[s] != Color::White {
+                continue;
+            }
+            color[s] = Color::Gray;
+            let mut stack: Vec<(usize, usize)> = vec![(s, 0)];
+            while let Some(&(node, ci)) = stack.last() {
+                if ci < adj[node].len() {
+                    stack.last_mut().unwrap().1 += 1;
+                    let b = adj[node][ci] as usize;
+                    match color[b] {
+                        Color::Gray => bail!(
+                            "grammar is left-recursive: {} can recurse without consuming input",
+                            self.rule_label(b as u32)
+                        ),
+                        Color::White => {
+                            color[b] = Color::Gray;
+                            stack.push((b, 0));
+                        }
+                        Color::Black => {}
+                    }
+                } else {
+                    color[node] = Color::Black;
+                    stack.pop();
+                }
+            }
+        }
+        Ok(())
     }
 
     fn parse_rule(&mut self) -> Result<()> {
@@ -532,7 +655,7 @@ impl<'a> Parser<'a> {
             // Postfix repetition binds to the element just parsed.
             if let Some(op @ (b'*' | b'+' | b'?')) = self.peek() {
                 self.pos += 1;
-                self.apply_repetition(out, last_start, op);
+                self.apply_repetition(out, last_start, op)?;
             }
         }
         Ok(())
@@ -540,7 +663,14 @@ impl<'a> Parser<'a> {
 
     /// Rewrite `out[start..]` (the just-parsed unit) into a fresh recursive rule per the
     /// repetition operator, replacing it with a single `RuleRef`.
-    fn apply_repetition(&mut self, out: &mut Vec<Elem>, start: usize, op: u8) {
+    fn apply_repetition(&mut self, out: &mut Vec<Elem>, start: usize, op: u8) -> Result<()> {
+        // An empty unit (e.g. `""*`) would desugar to `S ::= S | ε` — a left-recursive
+        // ε-cycle that infinite-loops the matcher. Reject it up front with a clear error.
+        ensure!(
+            start < out.len(),
+            "repetition operator `{}` has nothing to repeat",
+            op as char
+        );
         let unit: Vec<Elem> = out.split_off(start);
         let sub = self.anon_rule();
         let mut body = Vec::new();
@@ -570,6 +700,7 @@ impl<'a> Parser<'a> {
         }
         self.rules[sub as usize] = body;
         out.push(Elem::RuleRef(sub));
+        Ok(())
     }
 
     fn parse_string_literal(&mut self, out: &mut Vec<Elem>) -> Result<()> {
@@ -794,6 +925,23 @@ mod tests {
         assert!(Grammar::parse(r#"root ::= "unterminated"#).is_err());
         assert!(Grammar::parse("root ::= ").is_ok()); // empty rule = matches empty input
         assert!(Grammar::parse(r#"root ::= ("a""#).is_err()); // unclosed group
+    }
+
+    #[test]
+    fn rejects_left_recursion_no_stack_overflow() {
+        // Empty repetition unit (`""*`) — caught at the postfix site.
+        assert!(Grammar::parse(r#"root ::= ""*"#).is_err());
+        assert!(Grammar::parse(r#"root ::= ""+"#).is_err());
+        // Direct left recursion.
+        assert!(Grammar::parse(r#"root ::= root "x" | "y""#).is_err());
+        // Indirect left recursion (A → B → A).
+        assert!(Grammar::parse("root ::= a\na ::= b\nb ::= a").is_err());
+        // Repetition of a nullable rule is an ε-cycle.
+        assert!(Grammar::parse("root ::= n*\nn ::= \"a\"?").is_err());
+        // Right recursion is fine (consumes before recursing).
+        assert!(Grammar::parse(r#"root ::= "a" root | "a""#).is_ok());
+        // A nullable rule used in sequence (not repeated) is fine.
+        assert!(Grammar::parse("root ::= ws \"x\"\nws ::= \" \"*").is_ok());
     }
 
     #[test]

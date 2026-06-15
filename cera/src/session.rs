@@ -332,6 +332,12 @@ pub struct Session {
     /// before [`Self::append_image`] is called. Held by `Arc`
     /// for the same reason as `audio_encoder`.
     vision_encoder: Option<Arc<crate::model::vision_encoder::VisionEncoderWeights>>,
+    /// Cached grammar logit-mask (per-token output bytes + EOS/special flags). Built
+    /// lazily on the first grammar-constrained `generate` and reused across calls — it
+    /// depends only on the tokenizer, not on the grammar. Taken into a local for the
+    /// duration of a `generate` (to avoid borrow conflicts with `model`/`sampler`) and
+    /// restored before returning. See [`crate::grammar`].
+    grammar_mask: Option<crate::grammar::GrammarMask>,
 }
 
 impl Session {
@@ -424,6 +430,7 @@ impl Session {
             config,
             audio_encoder: None,
             vision_encoder: None,
+            grammar_mask: None,
         }
     }
 
@@ -1185,10 +1192,13 @@ impl Session {
         let want_greedy = opts.temperature <= 0.0 || opts.top_k == 1;
         let greedy = want_greedy && opts.grammar.is_none();
 
-        // Build the grammar matcher + per-token output-byte table once for this call.
-        // The table is O(vocab) to build; correctness-first (a candidate-pruning trie is
-        // a future optimization).
-        let (mut grammar_state, grammar_mask) = if let Some(g) = &opts.grammar {
+        // Grammar matcher + per-token output-byte mask. The mask depends only on the
+        // tokenizer (not the grammar), so build it once (O(vocab)) and cache it on the
+        // session; subsequent grammar-constrained calls reuse it. It's `take`n into a
+        // local for the loop (so the borrow doesn't conflict with `model`/`sampler`) and
+        // restored after. A candidate-pruning trie is a future optimization.
+        let grammar_active = opts.grammar.is_some();
+        if grammar_active && self.grammar_mask.is_none() {
             let vocab = self.tokenizer.vocab_size();
             let mut token_bytes = Vec::with_capacity(vocab);
             let mut special = Vec::with_capacity(vocab);
@@ -1196,15 +1206,21 @@ impl Session {
                 token_bytes.push(self.tokenizer.token_output_bytes(id));
                 special.push(self.tokenizer.is_special_token(id));
             }
-            let mask =
-                crate::grammar::GrammarMask::new(token_bytes, self.tokenizer.eos_token(), special);
-            (
-                Some(crate::grammar::GrammarState::new(g.clone())),
-                Some(mask),
-            )
+            self.grammar_mask = Some(crate::grammar::GrammarMask::new(
+                token_bytes,
+                self.tokenizer.eos_token(),
+                special,
+            ));
+        }
+        let grammar_mask = if grammar_active {
+            self.grammar_mask.take()
         } else {
-            (None, None)
+            None
         };
+        let mut grammar_state = opts
+            .grammar
+            .as_ref()
+            .map(|g| crate::grammar::GrammarState::new(g.clone()));
 
         // Stochastic-only state. Allocating the scratch buffer and syncing
         // the sampler are skipped in greedy mode where neither is touched.
@@ -1317,6 +1333,11 @@ impl Session {
                 finish = FinishReason::Cancelled;
                 break;
             }
+        }
+
+        // Restore the cached grammar mask for reuse by the next grammar-constrained call.
+        if grammar_active {
+            self.grammar_mask = grammar_mask;
         }
 
         if !pending.is_empty() {
