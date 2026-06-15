@@ -6645,7 +6645,7 @@ final class _DownloadProgressSinkTraitVTable extends ffi.Struct {
 
   external ffi.Pointer<ffi.NativeFunction<ffi.Uint64 Function(ffi.Uint64 handle)>> uniffiClone;
 
-  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>> onProgress;
+  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>> onProgress;
 
 }
 
@@ -6711,25 +6711,31 @@ final class _DownloadProgressSinkTraitCallbackBridge {
     _bindings()._uniFfiRustBufferFree(buf, _freeArgStatus);
   }
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onProgressNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.isolateLocal((int handle, _UniFfiRustBuffer url, int bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)> _onProgressNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>.isolateLocal((int handle, _UniFfiRustBuffer url, int bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus) {
     final DownloadProgressSink? callback = instance.lookup(handle);
     if (callback == null) {
       _uniffiFreeArgBuffer(url);
       _uniffiFreeArgBuffer(totalBytes);
-      outStatus.ref
-        ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = ffi.nullptr;
+      outStatus.ref.code = _uniFfiRustCallStatusUnexpectedError;
+      outStatus.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
       return;
     }
     try {
       callback.onProgress(utf8.decode(url.data.asTypedList(url.len)), bytesDownloaded, (() { final r = _UniFfiBinaryReader(totalBytes.data.asTypedList(totalBytes.len)); return r.readI8() == 0 ? null : r.readU64(); })());
-      outStatus.ref
-        ..code = _rustCallStatusSuccess
-        ..errorBuf = ffi.nullptr;
+      outStatus.ref.code = _uniFfiRustCallStatusSuccess;
+      outStatus.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
     } catch (_) {
-      outStatus.ref
-        ..code = _rustCallStatusUnexpectedError
-        ..errorBuf = ffi.nullptr;
+      outStatus.ref.code = _uniFfiRustCallStatusUnexpectedError;
+      outStatus.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
     } finally {
       _uniffiFreeArgBuffer(url);
       _uniffiFreeArgBuffer(totalBytes);
@@ -6869,11 +6875,11 @@ final class _ModalitySinkTraitVTable extends ffi.Struct {
 
   external ffi.Pointer<ffi.NativeFunction<ffi.Uint64 Function(ffi.Uint64 handle)>> uniffiClone;
 
-  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>> onTextTokens;
+  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>> onTextTokens;
 
-  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>> onAudioFrames;
+  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>> onAudioFrames;
 
-  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>> onDone;
+  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>> onDone;
 
 }
 
@@ -6939,7 +6945,7 @@ final class _ModalitySinkTraitCallbackBridge {
     _bindings()._uniFfiRustBufferFree(buf, _freeArgStatus);
   }
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onTextTokensNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)> _onTextTokensNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer tokens, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus) {
     final ModalitySink? callback = instance.lookup(handle);
     if (callback == null) {
       _uniffiFreeArgBuffer(tokens);
@@ -6954,7 +6960,7 @@ final class _ModalitySinkTraitCallbackBridge {
     }
   });
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onAudioFramesNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer pcm, int sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)> _onAudioFramesNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer pcm, ffi.Uint32 sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer pcm, int sampleRate, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus) {
     final ModalitySink? callback = instance.lookup(handle);
     if (callback == null) {
       _uniffiFreeArgBuffer(pcm);
@@ -6969,7 +6975,7 @@ final class _ModalitySinkTraitCallbackBridge {
     }
   });
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)> _onDoneNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_RustCallStatus> outStatus) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)> _onDoneNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer reason, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus) {
     final ModalitySink? callback = instance.lookup(handle);
     if (callback == null) {
       _uniffiFreeArgBuffer(reason);
