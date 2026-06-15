@@ -75,13 +75,14 @@ fn json_grammar_rejects_invalid() {
 #[test]
 fn json_incomplete_prefix_is_not_complete_but_extensible() {
     let g = json();
-    // A partial object is accepted (the bytes parse) but not a complete value.
-    let st = run(&g, br#"{"a":"#).expect("prefix should parse");
+    // A partial object `{"a":` — parsed up to (and including) the colon, so the grammar
+    // now expects a value. Accepted (the bytes parse) but not a complete value.
+    let st = run(&g, b"{\"a\":").expect("prefix should parse");
     assert!(!st.is_complete());
-    // ...and can still be extended toward a valid value.
-    assert!(st.accepts(b"1"));
-    assert!(st.accepts(b"\""));
-    assert!(st.accepts(b"[")); // value can begin with an array
+    // ...and the next byte can begin any JSON value: a number, a string, or an array.
+    assert!(st.accepts(b"1")); // number
+    assert!(st.accepts(b"\"")); // string
+    assert!(st.accepts(b"[")); // array
 }
 
 #[test]

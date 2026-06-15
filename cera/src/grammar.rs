@@ -289,8 +289,16 @@ pub struct GrammarMask {
 
 impl GrammarMask {
     /// Build from per-token output bytes, the EOS id, and a per-token "is special" flag.
+    ///
+    /// Panics if `token_bytes` and `special` differ in length (they must both equal the
+    /// vocab size) — a real `assert` so a caller mistake fails loudly here rather than as
+    /// an opaque index panic inside [`apply`](Self::apply) in release builds.
     pub fn new(token_bytes: Vec<Vec<u8>>, eos: Option<u32>, special: Vec<bool>) -> Self {
-        debug_assert_eq!(token_bytes.len(), special.len());
+        assert_eq!(
+            token_bytes.len(),
+            special.len(),
+            "GrammarMask: token_bytes and special must have the same (vocab) length"
+        );
         GrammarMask {
             token_bytes,
             eos,

@@ -1293,12 +1293,19 @@ impl Session {
                 }
             };
 
-            if self.tokenizer.eos_token() == Some(token) || opts.stop_tokens.contains(&token) {
+            // Stop on EOS or an explicit stop token — but when a grammar is active, only
+            // once it permits termination. Otherwise an early stop token could truncate
+            // mid-derivation (e.g. exit mid-JSON), breaking the conformance guarantee.
+            // (EOS is already mask-gated to `is_complete`; this also gates `stop_tokens`.)
+            let stop_allowed = grammar_state.as_ref().is_none_or(|s| s.is_complete());
+            if stop_allowed
+                && (self.tokenizer.eos_token() == Some(token) || opts.stop_tokens.contains(&token))
+            {
                 finish = FinishReason::Stop;
                 break;
             }
 
-            // Advance the grammar by the chosen (non-EOS, non-special) token's bytes.
+            // Advance the grammar by the chosen (grammar-valid, non-EOS) token's bytes.
             if let Some(state) = grammar_state.as_mut() {
                 state.accept(grammar_mask.as_ref().unwrap().token_bytes(token));
             }
