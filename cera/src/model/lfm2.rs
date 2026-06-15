@@ -9,6 +9,10 @@ use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvPrefixCache, LayerState};
 use crate::model::transformer::{self, FfnWeights};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
+// DType is only referenced from the BLAS prefill path and the aarch64 NEON
+// GEMM dispatch (the dtype == Q4_0/Q8_0 checks); on x86_64 without `blas` none
+// of those compile, so the import would be unused. Gate it to match.
+#[cfg(any(feature = "blas", target_arch = "aarch64"))]
 use crate::tensor::DType;
 use crate::turboquant;
 
@@ -389,34 +393,9 @@ impl Lfm2Model {
         self.weight_data(wref)
     }
 
-    /// Dequantize a weight matrix to f32 given a WeightRef.
-    #[allow(dead_code)]
-    pub(crate) fn dequantize_weight(&self, wref: &crate::model::lfm2::WeightRef) -> Vec<f32> {
-        let mut out = vec![0.0f32; wref.m * wref.k];
-        let data = self.weight_data(wref);
-        let row_bytes = wref.k / wref.dtype.block_size() * wref.dtype.block_bytes();
-        for row in 0..wref.m {
-            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
-            let row_out = &mut out[row * wref.k..(row + 1) * wref.k];
-            self.dequantize_row_into_slice(wref, row_data, row_out);
-        }
-        out
-    }
-
-    #[allow(dead_code)]
-    fn dequantize_row_into_slice(&self, wref: &WeightRef, row_data: &[u8], out: &mut [f32]) {
-        match wref.dtype {
-            DType::Q6K => crate::quant::dequantize_q6_k_row(row_data, out),
-            DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, out),
-            DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, out),
-            DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, out),
-            DType::F32 => {
-                let floats: &[f32] = bytemuck::cast_slice(row_data);
-                out.copy_from_slice(floats);
-            }
-            _ => panic!("unsupported dtype: {:?}", wref.dtype),
-        }
-    }
+    // Full-matrix dequant lives in `transformer::dequantize_weight`; the LFM2
+    // `GpuWeightSource` impl delegates to it. (The old inherent duplicate +
+    // `dequantize_row_into_slice` helper were removed — single implementation.)
 
     /// Access the per-layer weight refs (for GPU model construction).
     #[allow(dead_code)]
@@ -2409,5 +2388,97 @@ impl Model for Lfm2Model {
             crate::backend::cpu::RopeType::Neox,
             None,
         );
+    }
+}
+
+// ── GPU weight source ───────────────────────────────────────────────────────
+//
+// Drives the wgpu loader (`gpu_lfm2.rs`) for LFM2. Conv layers expose
+// `conv_*` refs; attention layers expose `attn_*` refs + QK-norm. LFM2 has no
+// QKV bias / untied output / Llama-3 freq-factors, uses NEOX RoPE, identity
+// scalars, and supports the batched-prefill GPU path.
+#[cfg(feature = "gpu")]
+impl crate::model::gpu_weight_source::GpuWeightSource for Lfm2Model {
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+    fn gguf(&self) -> &GgufFile {
+        &self.gguf
+    }
+
+    fn output_norm_weight(&self) -> &[f32] {
+        &self.output_norm_weight
+    }
+    fn attn_norm_weight(&self, layer: usize) -> &[f32] {
+        &self.attn_norm_weights[layer]
+    }
+    fn ffn_norm_weight(&self, layer: usize) -> &[f32] {
+        &self.ffn_norm_weights[layer]
+    }
+    fn attn_q_norm_weight(&self, layer: usize) -> Option<&[f32]> {
+        Lfm2Model::attn_q_norm_weight(self, layer)
+    }
+    fn attn_k_norm_weight(&self, layer: usize) -> Option<&[f32]> {
+        Lfm2Model::attn_k_norm_weight(self, layer)
+    }
+    fn conv_weight(&self, layer: usize) -> Option<&[f32]> {
+        Lfm2Model::conv_weight(self, layer)
+    }
+    fn attn_q_bias(&self, _layer: usize) -> Option<&[f32]> {
+        None
+    }
+    fn attn_k_bias(&self, _layer: usize) -> Option<&[f32]> {
+        None
+    }
+    fn attn_v_bias(&self, _layer: usize) -> Option<&[f32]> {
+        None
+    }
+    fn rope_freqs(&self) -> Option<&[f32]> {
+        None
+    }
+
+    fn weight_bytes(&self, wref: &WeightRef) -> &[u8] {
+        transformer::weight_data(&self.gguf, wref)
+    }
+    fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32> {
+        transformer::dequantize_weight(&self.gguf, wref)
+    }
+
+    fn output_ref(&self) -> Option<&WeightRef> {
+        None
+    }
+    fn ffn_gate_ref(&self, layer: usize) -> &WeightRef {
+        &self.layer_refs[layer].ffn_gate
+    }
+    fn ffn_up_ref(&self, layer: usize) -> &WeightRef {
+        &self.layer_refs[layer].ffn_up
+    }
+    fn ffn_down_ref(&self, layer: usize) -> &WeightRef {
+        &self.layer_refs[layer].ffn_down
+    }
+    fn conv_in_proj_ref(&self, layer: usize) -> Option<&WeightRef> {
+        self.layer_refs[layer].shortconv_in_proj.as_ref()
+    }
+    fn conv_out_proj_ref(&self, layer: usize) -> Option<&WeightRef> {
+        self.layer_refs[layer].shortconv_out_proj.as_ref()
+    }
+    fn attn_q_ref(&self, layer: usize) -> Option<&WeightRef> {
+        self.layer_refs[layer].attn_q.as_ref()
+    }
+    fn attn_k_ref(&self, layer: usize) -> Option<&WeightRef> {
+        self.layer_refs[layer].attn_k.as_ref()
+    }
+    fn attn_v_ref(&self, layer: usize) -> Option<&WeightRef> {
+        self.layer_refs[layer].attn_v.as_ref()
+    }
+    fn attn_output_ref(&self, layer: usize) -> Option<&WeightRef> {
+        self.layer_refs[layer].attn_output.as_ref()
+    }
+
+    fn rope_type(&self) -> crate::backend::cpu::RopeType {
+        crate::backend::cpu::RopeType::Neox
+    }
+    fn supports_batched_prefill(&self) -> bool {
+        true
     }
 }

@@ -5,6 +5,9 @@ pub mod transformer;
 #[cfg(feature = "gpu")]
 pub mod gpu_lfm2;
 
+#[cfg(feature = "gpu")]
+pub(crate) mod gpu_weight_source;
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_lfm2;
 
@@ -456,6 +459,12 @@ pub fn load_model_gpu(
             context_size,
             model_id,
         )?)),
+        // Dense transformers share the generalized wgpu loader (per-arch rope /
+        // QK-norm / QKV-bias / untied-output / Granite scalars are driven by the
+        // GpuWeightSource accessors). Mirrors the CPU `load_model` allow-list.
+        "qwen2" | "qwen3" | "llama" | "granite" => Ok(Box::new(
+            gpu_lfm2::GpuLfm2Model::from_llama_with_id(gguf, context_size, model_id)?,
+        )),
         other => bail!("unsupported architecture for GPU: {other}"),
     }
 }

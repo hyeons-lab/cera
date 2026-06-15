@@ -526,3 +526,103 @@ impl Model for LlamaModel {
         );
     }
 }
+
+// ── GPU weight source ───────────────────────────────────────────────────────
+//
+// Lets the wgpu loader (`gpu_lfm2.rs`) upload a dense transformer the same way
+// it uploads LFM2. Every layer is attention (no conv refs); QK-norm / QKV-bias
+// / untied-output / Llama-3 freq-factors are surfaced per-arch via the `Option`
+// accessors. Granite scalars ride on `config().scalars`.
+#[cfg(feature = "gpu")]
+impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+    fn gguf(&self) -> &GgufFile {
+        &self.gguf
+    }
+
+    fn output_norm_weight(&self) -> &[f32] {
+        &self.output_norm_weight
+    }
+    fn attn_norm_weight(&self, layer: usize) -> &[f32] {
+        &self.attn_norm_weights[layer]
+    }
+    fn ffn_norm_weight(&self, layer: usize) -> &[f32] {
+        &self.ffn_norm_weights[layer]
+    }
+    fn attn_q_norm_weight(&self, layer: usize) -> Option<&[f32]> {
+        self.attn_q_norm_weights[layer].as_deref()
+    }
+    fn attn_k_norm_weight(&self, layer: usize) -> Option<&[f32]> {
+        self.attn_k_norm_weights[layer].as_deref()
+    }
+    fn conv_weight(&self, _layer: usize) -> Option<&[f32]> {
+        None
+    }
+    fn attn_q_bias(&self, layer: usize) -> Option<&[f32]> {
+        self.attn_q_bias[layer].as_deref()
+    }
+    fn attn_k_bias(&self, layer: usize) -> Option<&[f32]> {
+        self.attn_k_bias[layer].as_deref()
+    }
+    fn attn_v_bias(&self, layer: usize) -> Option<&[f32]> {
+        self.attn_v_bias[layer].as_deref()
+    }
+    fn rope_freqs(&self) -> Option<&[f32]> {
+        self.rope_freqs.as_deref()
+    }
+
+    fn weight_bytes(&self, wref: &WeightRef) -> &[u8] {
+        transformer::weight_data(&self.gguf, wref)
+    }
+    fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32> {
+        transformer::dequantize_weight(&self.gguf, wref)
+    }
+
+    fn output_ref(&self) -> Option<&WeightRef> {
+        self.output_ref.as_ref()
+    }
+    fn ffn_gate_ref(&self, layer: usize) -> &WeightRef {
+        &self.layer_refs[layer].ffn_gate
+    }
+    fn ffn_up_ref(&self, layer: usize) -> &WeightRef {
+        &self.layer_refs[layer].ffn_up
+    }
+    fn ffn_down_ref(&self, layer: usize) -> &WeightRef {
+        &self.layer_refs[layer].ffn_down
+    }
+    fn conv_in_proj_ref(&self, _layer: usize) -> Option<&WeightRef> {
+        None
+    }
+    fn conv_out_proj_ref(&self, _layer: usize) -> Option<&WeightRef> {
+        None
+    }
+    fn attn_q_ref(&self, layer: usize) -> Option<&WeightRef> {
+        Some(&self.layer_refs[layer].attn_q)
+    }
+    fn attn_k_ref(&self, layer: usize) -> Option<&WeightRef> {
+        Some(&self.layer_refs[layer].attn_k)
+    }
+    fn attn_v_ref(&self, layer: usize) -> Option<&WeightRef> {
+        Some(&self.layer_refs[layer].attn_v)
+    }
+    fn attn_output_ref(&self, layer: usize) -> Option<&WeightRef> {
+        Some(&self.layer_refs[layer].attn_output)
+    }
+
+    fn rope_type(&self) -> RopeType {
+        self.rope_type
+    }
+    fn supports_batched_prefill(&self) -> bool {
+        // Correctness-first: dense transformers prefill via the per-token decode
+        // loop. Returning `true` here is NOT safe yet — two concrete blockers in
+        // the batched path must be lifted first: (1) `encode_qk_norm_rope_batch`
+        // hardcodes `rope_type = 0` (NEOX), wrong for the NORM archs
+        // (LLaMA/Mistral/Granite); (2) `qk_norm_rope_batch.wgsl` has no
+        // freq_factors binding, so Llama-3 RoPE scaling would be dropped. Also
+        // missing: QKV bias, untied output, and Granite scalars on the batched
+        // path. Until those land, dense transformers stay on the per-token loop.
+        false
+    }
+}

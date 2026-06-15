@@ -19,6 +19,17 @@ fn add_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
     a[i] = a[i] + b[i];
 }
 
+// Residual add with a scalar on the addend: a[i] += s * b[i], with `s`
+// bit-cast in params.y. Granite 3.x sets `s` to its residual multiplier; every
+// other arch passes s = 1.0, making this identical to `add_inplace`.
+@compute @workgroup_size(256, 1, 1)
+fn scaled_add_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let n = params.x;
+    if i >= n { return; }
+    a[i] = a[i] + bitcast<f32>(params.y) * b[i];
+}
+
 @compute @workgroup_size(256, 1, 1)
 fn mul_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
