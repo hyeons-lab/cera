@@ -942,6 +942,7 @@ impl GenerateSummary {
             cera::FinishReason::Stop => "Stop".to_string(),
             cera::FinishReason::Cancelled => "Cancelled".to_string(),
             cera::FinishReason::ContextFull => "ContextFull".to_string(),
+            cera::FinishReason::GrammarDeadEnd => "GrammarDeadEnd".to_string(),
             cera::FinishReason::Error(msg) => format!("Error({msg})"),
         }
     }
