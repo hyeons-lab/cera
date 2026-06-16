@@ -151,7 +151,10 @@ impl GrammarState {
         true
     }
 
-    /// Commit `bytes` to the state, advancing the frontiers. No-op if it dead-ends.
+    /// Commit `bytes` to the state, advancing the frontiers. If a byte dead-ends the
+    /// grammar, the state is left dead (`is_dead()` becomes true) and the remaining bytes
+    /// are not applied. Callers should only `accept` tokens that [`accepts`](Self::accepts)
+    /// returned true for.
     pub fn accept(&mut self, bytes: &[u8]) {
         for &b in bytes {
             let next = step(&self.grammar, &self.stacks, b);
