@@ -215,6 +215,15 @@ enum Command {
         #[arg(long, default_value_t = 0.7)]
         temperature: f32,
 
+        /// Constrain output to a GBNF grammar. Pass an inline grammar string, or
+        /// `@path/to/file.gbnf` to read it from a file.
+        #[arg(long)]
+        grammar: Option<String>,
+
+        /// Shorthand: constrain output to valid JSON (a bundled JSON grammar).
+        #[arg(long, conflicts_with = "grammar")]
+        json: bool,
+
         /// Device to use: cpu, gpu, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
@@ -1386,6 +1395,8 @@ fn main() -> Result<()> {
             prompt,
             max_tokens,
             temperature,
+            grammar,
+            json,
             device,
             token_ids,
             context_size,
@@ -1404,6 +1415,29 @@ fn main() -> Result<()> {
             ubatch_size,
             n_keep,
         } => {
+            // Compile the grammar (if any) up front so a malformed GBNF fails fast,
+            // before the engine loads ~1 GB of weights. `--json` uses a bundled grammar;
+            // `--grammar` takes an inline string or `@path` to a file.
+            let grammar_compiled: Option<std::sync::Arc<cera::grammar::Grammar>> = {
+                let src: Option<String> = if json {
+                    Some(include_str!("../grammars/json.gbnf").to_string())
+                } else if let Some(g) = &grammar {
+                    Some(match g.strip_prefix('@') {
+                        Some(path) => std::fs::read_to_string(path)
+                            .with_context(|| format!("reading grammar file `{path}`"))?,
+                        None => g.clone(),
+                    })
+                } else {
+                    None
+                };
+                match src {
+                    Some(s) => Some(std::sync::Arc::new(
+                        cera::grammar::Grammar::parse(&s).context("parsing GBNF grammar")?,
+                    )),
+                    None => None,
+                }
+            };
+
             // Resolve `--image` arguments BEFORE engine load so a missing
             // file / unreachable URL fails fast — engine load can spend
             // ~1 GB of RAM on Q4_0 weights and a typo'd `--image
@@ -1511,6 +1545,7 @@ fn main() -> Result<()> {
                 let opts = cera::GenerateOpts {
                     max_tokens: max_tokens as u32,
                     temperature,
+                    grammar: grammar_compiled.clone(),
                     ..Default::default()
                 };
                 let mut sink = StdoutSink::new(tokenizer, session.cancel_handle());
@@ -1662,6 +1697,7 @@ fn main() -> Result<()> {
                 let opts = cera::GenerateOpts {
                     max_tokens: max_tokens as u32,
                     temperature,
+                    grammar: grammar_compiled.clone(),
                     ..Default::default()
                 };
 
@@ -1908,6 +1944,7 @@ fn main() -> Result<()> {
                 let opts = cera::GenerateOpts {
                     max_tokens: max_tokens as u32,
                     temperature,
+                    grammar: grammar_compiled.clone(),
                     ..Default::default()
                 };
 

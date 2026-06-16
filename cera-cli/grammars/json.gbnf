@@ -1,0 +1,26 @@
+# JSON grammar (GBNF) — constrains output to a single valid JSON value.
+# Byte-level; uses only the v1-supported operators (* + ?), no {n,m} repeats.
+
+# Leading whitespace is allowed (a model may warm up with a newline); no trailing
+# whitespace, so once the value completes the only allowed token is EOS — the model
+# stops promptly instead of padding with whitespace.
+root   ::= ws value
+
+value  ::= object | array | string | number | "true" | "false" | "null"
+
+object ::= "{" ws ( member ( ws "," ws member )* )? ws "}"
+member ::= string ws ":" ws value
+
+array  ::= "[" ws ( value ( ws "," ws value )* )? ws "]"
+
+string ::= "\"" char* "\""
+char   ::= [^"\\] | "\\" esc
+esc    ::= ["\\/bfnrt] | "u" hex hex hex hex
+hex    ::= [0-9a-fA-F]
+
+number ::= "-"? int frac? exp?
+int    ::= "0" | [1-9] [0-9]*
+frac   ::= "." [0-9]+
+exp    ::= [eE] [-+]? [0-9]+
+
+ws     ::= [ \t\n\r]*
