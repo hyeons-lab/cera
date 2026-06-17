@@ -748,7 +748,7 @@ fn render_trait_vtable_struct(
         } else {
             ffi_args.push("ffi.Pointer<ffi.Void> outReturn".to_string());
         }
-        ffi_args.push("ffi.Pointer<_RustCallStatus> outStatus".to_string());
+        ffi_args.push("ffi.Pointer<_UniFfiRustCallStatus> outStatus".to_string());
         out.push_str(&format!(
             "  external ffi.Pointer<ffi.NativeFunction<ffi.Void Function({})>> {method_name};\n\n",
             ffi_args.join(", ")
@@ -919,8 +919,8 @@ fn render_trait_callback_bridge(
             ffi_args.push("ffi.Pointer<ffi.Void> outReturn".to_string());
             dart_args.push("ffi.Pointer<ffi.Void> outReturn".to_string());
         }
-        ffi_args.push("ffi.Pointer<_RustCallStatus> outStatus".to_string());
-        dart_args.push("ffi.Pointer<_RustCallStatus> outStatus".to_string());
+        ffi_args.push("ffi.Pointer<_UniFfiRustCallStatus> outStatus".to_string());
+        dart_args.push("ffi.Pointer<_UniFfiRustCallStatus> outStatus".to_string());
 
         // Void methods use `NativeCallable.listener` so Rust can invoke them
         // from a non-isolate thread (e.g. a tokio worker driving
@@ -972,17 +972,21 @@ fn render_trait_callback_bridge(
             out.push_str("  });\n\n");
         } else {
             // Synchronous (isolateLocal) bridge. Owns its RustBuffer args too;
-            // free them in `finally`. `errorBuf` is set to nullptr (the error
-            // code still propagates) — handing Rust a `toNativeUtf8()` C string
-            // both leaks it and is ambiguous to free across the FFI boundary.
+            // free them in `finally`. The status uses `_UniFfiRustCallStatus`,
+            // whose `errorBuf` is a `RustBuffer` (24 bytes) — matching Rust's
+            // `RustCallStatus { code, error_buf: RustBuffer }`. We write a zeroed
+            // (empty) RustBuffer: the error *code* still propagates, and an empty
+            // buffer is what Rust expects when there's no serialized message.
+            // (Handing Rust a `toNativeUtf8()` `Pointer<Utf8>` was both an ABI
+            // mismatch — wrong size/shape — and a leak.)
             out.push_str(&format!(
                 "    final {object_name}? callback = instance.lookup(handle);\n"
             ));
             out.push_str("    if (callback == null) {\n");
             out.push_str(&free_buffers);
-            out.push_str("      outStatus.ref\n");
-            out.push_str("        ..code = _rustCallStatusUnexpectedError\n");
-            out.push_str("        ..errorBuf = ffi.nullptr;\n");
+            out.push_str(&render_callback_status_write(
+                "_uniFfiRustCallStatusUnexpectedError",
+            ));
             out.push_str("      return;\n");
             out.push_str("    }\n");
             out.push_str("    try {\n");
@@ -1005,13 +1009,13 @@ fn render_trait_callback_bridge(
                     callback_args.join(", ")
                 ));
             }
-            out.push_str("      outStatus.ref\n");
-            out.push_str("        ..code = _rustCallStatusSuccess\n");
-            out.push_str("        ..errorBuf = ffi.nullptr;\n");
+            out.push_str(&render_callback_status_write(
+                "_uniFfiRustCallStatusSuccess",
+            ));
             out.push_str("    } catch (_) {\n");
-            out.push_str("      outStatus.ref\n");
-            out.push_str("        ..code = _rustCallStatusUnexpectedError\n");
-            out.push_str("        ..errorBuf = ffi.nullptr;\n");
+            out.push_str(&render_callback_status_write(
+                "_uniFfiRustCallStatusUnexpectedError",
+            ));
             if has_buffers {
                 out.push_str("    } finally {\n");
                 out.push_str(&free_buffers);
@@ -1090,4 +1094,18 @@ pub(super) fn trait_callback_vtable_field_name(object_name: &str) -> String {
         "_{}TraitCallbackVTable",
         to_lower_camel(object_name)
     ))
+}
+
+/// Emit a write of a trait-callback's `_UniFfiRustCallStatus` out-pointer: the status
+/// code plus a zeroed (empty) `RustBuffer` `errorBuf`. This matches Rust's
+/// `RustCallStatus { code, error_buf: RustBuffer }` ABI exactly (vs. the old 8-byte
+/// `Pointer<Utf8>` shape, which under-wrote Rust's 24-byte field and leaked).
+fn render_callback_status_write(code_const: &str) -> String {
+    format!(
+        "      outStatus.ref.code = {code_const};\n\
+         \x20     outStatus.ref.errorBuf\n\
+         \x20       ..capacity = 0\n\
+         \x20       ..len = 0\n\
+         \x20       ..data = ffi.nullptr;\n"
+    )
 }
