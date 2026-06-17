@@ -34,11 +34,21 @@ just android-libs
 
 CI (the `jvm` leg of `.github/workflows/publish.yml`, manual `workflow_dispatch`) cross-builds
 the native libs per runner (macOS/Linux/Windows + Android NDK), then publishes
-`0.1.0-SNAPSHOT` to the Maven Central **snapshot** repo via the vanniktech plugin.
+`cera-ffi` to Maven Central via the vanniktech plugin. The version (`VERSION_NAME`
+in `gradle.properties`) tracks the Cargo workspace version, so the Kotlin/Android
+artifacts release under the **same** version as the crates.io and npm artifacts —
+e.g. `0.1.1` everywhere.
 
-- SNAPSHOT publishing needs **no GPG signing** — only the Central Portal token
-  secrets `MAVEN_CENTRAL_USERNAME` / `MAVEN_CENTRAL_PASSWORD`.
-- Run with `dry_run = true` first (`publishToMavenLocal`, no upload).
+- A release version (no `-SNAPSHOT`) is a **real** Maven Central release and is
+  **GPG-signed** (`signAllPublications()`), so it needs both the Central Portal
+  token secrets `MAVEN_CENTRAL_USERNAME` / `MAVEN_CENTRAL_PASSWORD` **and** the
+  signing secrets `MAVEN_SIGNING_KEY` (ASCII-armored private key) /
+  `MAVEN_SIGNING_PASSWORD` (its passphrase). The real run uses
+  `publishAndReleaseToMavenCentral` (uploads, signs, and auto-releases the
+  deployment).
+- A `-SNAPSHOT` version instead routes to the snapshot repo and skips signing.
+- Run with `dry_run = true` first — it publishes a `-SNAPSHOT` to your local
+  Maven repo (`publishToMavenLocal`), needing no token or signing key.
 
 Versions (kotlin, AGP, vanniktech, compile/minSdk) are pinned in
 `gradle/libs.versions.toml`; publishing coordinates + POM in `gradle.properties`.

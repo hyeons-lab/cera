@@ -23,6 +23,8 @@ jobs:
           toolchain: nightly-2026-04-02
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Version drift check
+        run: ./scripts/bump-version.sh --check
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
