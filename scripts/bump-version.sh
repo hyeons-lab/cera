@@ -75,7 +75,7 @@ crate_pin_version() {
   # versions on the internal `cera*` path-dep lines in crate $1, one per line.
   # A crate may pin more than one internal crate (e.g. cera-parity pins both
   # `cera` and `cera-ffi`), so this can emit multiple versions.
-  perl -ne 'print "$1\n" if /^cera[a-z-]* = \{.*?\bversion = "([0-9]+\.[0-9]+\.[0-9]+)"/' "$ROOT/$1/Cargo.toml"
+  perl -ne 'print "$1\n" if /^\s*cera[a-z-]* = \{.*?\bversion = "([0-9]+\.[0-9]+\.[0-9]+)"/' "$ROOT/$1/Cargo.toml"
 }
 pubspec_build_name() {
   perl -ne 'print "$1" if /^version:\s*([0-9]+\.[0-9]+\.[0-9]+)/' "$PUBSPEC"
@@ -92,10 +92,16 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   cp="$(cargo_pkg_version)"
   [ "$cp" = "$want" ] || { echo "drift: Cargo.toml workspace.package version is '$cp', want '$want'" >&2; drift=1; }
   for c in "${PIN_CRATES[@]}"; do
+    seen_pin=0
     while IFS= read -r pin; do
       [ -n "$pin" ] || continue
+      seen_pin=1
       [ "$pin" = "$want" ] || { echo "drift: $c internal dep pin is '$pin', want '$want'" >&2; drift=1; }
     done < <(crate_pin_version "$c")
+    # Every PIN_CRATE is expected to carry at least one internal cera* pin; if
+    # the reader finds none (a removed pin or a reformatting the regex misses),
+    # treat it as drift rather than silently passing.
+    [ "$seen_pin" -eq 1 ] || { echo "drift: $c has no internal cera* path-dep pin (expected at least one)" >&2; drift=1; }
   done
   pp="$(pubspec_build_name)"
   [ "$pp" = "$want" ] || { echo "drift: pubspec.yaml build name is '$pp', want '$want'" >&2; drift=1; }
@@ -114,7 +120,7 @@ perl -i -pe 'BEGIN{$v=shift} s/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "$v
 # starting `cera* = {` so only internal dep requirements are touched (a crate
 # may pin several, e.g. cera-parity pins both `cera` and `cera-ffi`).
 for c in "${PIN_CRATES[@]}"; do
-  perl -i -pe 'BEGIN{$v=shift} s/(^cera[a-z-]* = \{.*?\bversion = ")[0-9]+\.[0-9]+\.[0-9]+(")/${1}$v$2/' \
+  perl -i -pe 'BEGIN{$v=shift} s/(^\s*cera[a-z-]* = \{.*?\bversion = ")[0-9]+\.[0-9]+\.[0-9]+(")/${1}$v$2/' \
     "$VERSION" "$ROOT/$c/Cargo.toml"
 done
 
