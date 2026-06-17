@@ -807,9 +807,8 @@ impl TurboQuantConfig {
 /// `temperature=0.7`, `topP=0.9`, `topK=40`, no stop tokens, flush
 /// every 16 tokens or 50 ms).
 ///
-/// `repetitionPenalty` is read-only — cera's sampler does not yet
-/// honor it (deferred); exposing the setter would let JS callers pass
-/// values that silently no-op.
+/// `minP` and `repetitionPenalty` are honored in the stochastic path
+/// (`temperature > 0` and `topK != 1`); greedy/argmax decoding ignores them.
 #[wasm_bindgen]
 #[derive(Default)]
 pub struct GenerateOpts {
@@ -859,13 +858,26 @@ impl GenerateOpts {
         self.inner.top_k = v;
     }
 
-    /// Read-only — cera's sampler doesn't yet honor this field.
-    /// Surfaced as a getter so JS callers can read the default
-    /// (`1.0`); the setter is intentionally absent so callers don't
-    /// pass values that silently no-op.
+    /// Min-p (relative) nucleus cutoff: drop tokens below `minP * pMax`.
+    /// `0.0` (default) disables it. Honored in the stochastic path.
+    #[wasm_bindgen(getter, js_name = minP)]
+    pub fn min_p(&self) -> f32 {
+        self.inner.min_p
+    }
+    #[wasm_bindgen(setter, js_name = minP)]
+    pub fn set_min_p(&mut self, v: f32) {
+        self.inner.min_p = v;
+    }
+
+    /// Repetition penalty over tokens generated this call. `1.0` (default)
+    /// disables it. Honored in the stochastic path.
     #[wasm_bindgen(getter, js_name = repetitionPenalty)]
     pub fn repetition_penalty(&self) -> f32 {
         self.inner.repetition_penalty
+    }
+    #[wasm_bindgen(setter, js_name = repetitionPenalty)]
+    pub fn set_repetition_penalty(&mut self, v: f32) {
+        self.inner.repetition_penalty = v;
     }
 
     /// Token IDs that, if produced, end decoding with

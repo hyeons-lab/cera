@@ -4843,7 +4843,13 @@ data class GenerateOpts(
     var `topP`: kotlin.Float,
     var `topK`: kotlin.UInt,
     /**
-     * Reserved — the sampler doesn't implement rep-penalty yet.
+     * Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
+     * disables it. Honored in the stochastic path.
+     */
+    var `minP`: kotlin.Float,
+    /**
+     * Repetition penalty over tokens generated this call. `1.0` disables it.
+     * Honored in the stochastic path (greedy/argmax decoding is unaffected).
      */
     var `repetitionPenalty`: kotlin.Float,
     /**
@@ -4873,6 +4879,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
             FfiConverterFloat.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterFloat.read(buf),
+            FfiConverterFloat.read(buf),
             FfiConverterSequenceUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
@@ -4884,6 +4891,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
                 FfiConverterFloat.allocationSize(value.`temperature`) +
                 FfiConverterFloat.allocationSize(value.`topP`) +
                 FfiConverterUInt.allocationSize(value.`topK`) +
+                FfiConverterFloat.allocationSize(value.`minP`) +
                 FfiConverterFloat.allocationSize(value.`repetitionPenalty`) +
                 FfiConverterSequenceUInt.allocationSize(value.`stopTokens`) +
                 FfiConverterUInt.allocationSize(value.`flushEveryTokens`) +
@@ -4898,6 +4906,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
         FfiConverterFloat.write(value.`temperature`, buf)
         FfiConverterFloat.write(value.`topP`, buf)
         FfiConverterUInt.write(value.`topK`, buf)
+        FfiConverterFloat.write(value.`minP`, buf)
         FfiConverterFloat.write(value.`repetitionPenalty`, buf)
         FfiConverterSequenceUInt.write(value.`stopTokens`, buf)
         FfiConverterUInt.write(value.`flushEveryTokens`, buf)

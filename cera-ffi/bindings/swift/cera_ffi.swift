@@ -2764,7 +2764,13 @@ public struct GenerateOpts: Equatable, Hashable {
     public var topP: Float
     public var topK: UInt32
     /**
-     * Reserved — the sampler doesn't implement rep-penalty yet.
+     * Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
+     * disables it. Honored in the stochastic path.
+     */
+    public var minP: Float
+    /**
+     * Repetition penalty over tokens generated this call. `1.0` disables it.
+     * Honored in the stochastic path (greedy/argmax decoding is unaffected).
      */
     public var repetitionPenalty: Float
     /**
@@ -2784,7 +2790,12 @@ public struct GenerateOpts: Equatable, Hashable {
     // declare one manually.
     public init(maxTokens: UInt32, temperature: Float, topP: Float, topK: UInt32, 
         /**
-         * Reserved — the sampler doesn't implement rep-penalty yet.
+         * Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
+         * disables it. Honored in the stochastic path.
+         */minP: Float, 
+        /**
+         * Repetition penalty over tokens generated this call. `1.0` disables it.
+         * Honored in the stochastic path (greedy/argmax decoding is unaffected).
          */repetitionPenalty: Float, 
         /**
          * Early-stop IDs (EOS / instruction markers / end-of-turn).
@@ -2799,6 +2810,7 @@ public struct GenerateOpts: Equatable, Hashable {
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
+        self.minP = minP
         self.repetitionPenalty = repetitionPenalty
         self.stopTokens = stopTokens
         self.flushEveryTokens = flushEveryTokens
@@ -2825,6 +2837,7 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
                 temperature: FfiConverterFloat.read(from: &buf), 
                 topP: FfiConverterFloat.read(from: &buf), 
                 topK: FfiConverterUInt32.read(from: &buf), 
+                minP: FfiConverterFloat.read(from: &buf), 
                 repetitionPenalty: FfiConverterFloat.read(from: &buf), 
                 stopTokens: FfiConverterSequenceUInt32.read(from: &buf), 
                 flushEveryTokens: FfiConverterUInt32.read(from: &buf), 
@@ -2837,6 +2850,7 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
         FfiConverterFloat.write(value.temperature, into: &buf)
         FfiConverterFloat.write(value.topP, into: &buf)
         FfiConverterUInt32.write(value.topK, into: &buf)
+        FfiConverterFloat.write(value.minP, into: &buf)
         FfiConverterFloat.write(value.repetitionPenalty, into: &buf)
         FfiConverterSequenceUInt32.write(value.stopTokens, into: &buf)
         FfiConverterUInt32.write(value.flushEveryTokens, into: &buf)

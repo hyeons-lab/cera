@@ -157,6 +157,7 @@ mod settings {
     pub const TEMPERATURE: f32 = 0.0;
     pub const TOP_P: f32 = 1.0;
     pub const TOP_K: u32 = 1;
+    pub const MIN_P: f32 = 0.0;
     pub const REPETITION_PENALTY: f32 = 1.0;
     pub const FLUSH_EVERY_TOKENS: u32 = 1;
     pub const FLUSH_EVERY_MS: u32 = 0;
@@ -171,6 +172,7 @@ fn greedy_opts(max_tokens: u32) -> cera::GenerateOpts {
         temperature: settings::TEMPERATURE,
         top_p: settings::TOP_P,
         top_k: settings::TOP_K,
+        min_p: settings::MIN_P,
         repetition_penalty: settings::REPETITION_PENALTY,
         stop_tokens: Vec::new(),
         grammar: None,
@@ -187,6 +189,7 @@ fn greedy_opts_ffi(max_tokens: u32) -> cera_ffi::GenerateOpts {
         temperature: settings::TEMPERATURE,
         top_p: settings::TOP_P,
         top_k: settings::TOP_K,
+        min_p: settings::MIN_P,
         repetition_penalty: settings::REPETITION_PENALTY,
         stop_tokens: Vec::new(),
         flush_every_tokens: settings::FLUSH_EVERY_TOKENS,

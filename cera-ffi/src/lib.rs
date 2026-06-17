@@ -885,7 +885,11 @@ pub struct GenerateOpts {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: u32,
-    /// Reserved — the sampler doesn't implement rep-penalty yet.
+    /// Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
+    /// disables it. Honored in the stochastic path.
+    pub min_p: f32,
+    /// Repetition penalty over tokens generated this call. `1.0` disables it.
+    /// Honored in the stochastic path (greedy/argmax decoding is unaffected).
     pub repetition_penalty: f32,
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     pub stop_tokens: Vec<u32>,
@@ -903,6 +907,7 @@ impl Default for GenerateOpts {
             temperature: core.temperature,
             top_p: core.top_p,
             top_k: core.top_k,
+            min_p: core.min_p,
             repetition_penalty: core.repetition_penalty,
             stop_tokens: core.stop_tokens,
             flush_every_tokens: core.flush_every_tokens,
@@ -918,6 +923,7 @@ impl From<GenerateOpts> for cera::GenerateOpts {
             temperature: o.temperature,
             top_p: o.top_p,
             top_k: o.top_k,
+            min_p: o.min_p,
             repetition_penalty: o.repetition_penalty,
             stop_tokens: o.stop_tokens,
             // Grammar-constrained decoding isn't exposed over FFI yet (it needs an

@@ -61,6 +61,7 @@ private object Settings {
     val TEMPERATURE: Float = 0.0f
     val TOP_P: Float = 1.0f
     val TOP_K: UInt = 1u
+    val MIN_P: Float = 0.0f
     val REPETITION_PENALTY: Float = 1.0f
     val FLUSH_EVERY_TOKENS: UInt = 1u
     val FLUSH_EVERY_MS: UInt = 0u
@@ -139,6 +140,7 @@ private fun runOnce(args: RunArgsOwned): List<UInt> {
         temperature = Settings.TEMPERATURE,
         topP = Settings.TOP_P,
         topK = Settings.TOP_K,
+        minP = Settings.MIN_P,
         repetitionPenalty = Settings.REPETITION_PENALTY,
         stopTokens = emptyList(),
         flushEveryTokens = Settings.FLUSH_EVERY_TOKENS,
