@@ -69,6 +69,7 @@ private enum Settings {
     static let temperature: Float = 0.0
     static let topP: Float = 1.0
     static let topK: UInt32 = 1
+    static let minP: Float = 0.0
     static let repetitionPenalty: Float = 1.0
     static let flushEveryTokens: UInt32 = 1
     static let flushEveryMs: UInt32 = 0
@@ -112,6 +113,7 @@ func runOnce(_ args: RunArgsOwned) throws -> [UInt32] {
         temperature: Settings.temperature,
         topP: Settings.topP,
         topK: Settings.topK,
+        minP: Settings.minP,
         repetitionPenalty: Settings.repetitionPenalty,
         stopTokens: [],
         flushEveryTokens: Settings.flushEveryTokens,

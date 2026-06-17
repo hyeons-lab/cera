@@ -63,7 +63,12 @@ pub struct GenerateOpts {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: u32,
-    /// Reserved — repetition penalty not yet supported by the sampler (deferred).
+    /// Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
+    /// disables it. Applied after top-k/top-p in the stochastic path only.
+    pub min_p: f32,
+    /// Repetition penalty over tokens generated so far this call (CTRL-style).
+    /// `1.0` disables it. Applied in the stochastic path only — greedy/argmax
+    /// decoding (`temperature <= 0` or `top_k == 1`) is unaffected.
     pub repetition_penalty: f32,
     /// If any of these fires, decode stops with `FinishReason::Stop`.
     pub stop_tokens: Vec<u32>,
@@ -84,6 +89,7 @@ impl Default for GenerateOpts {
             temperature: 0.7,
             top_p: 0.9,
             top_k: 40,
+            min_p: 0.0,
             repetition_penalty: 1.0,
             stop_tokens: Vec::new(),
             grammar: None,
@@ -1398,9 +1404,18 @@ impl Session {
             temperature: opts.temperature,
             top_k: opts.top_k as usize,
             top_p: opts.top_p,
+            min_p: opts.min_p,
+            repetition_penalty: opts.repetition_penalty,
             seed: self.config.seed,
         };
         self.sampler.set_config(cfg);
+        // Repetition penalty references tokens emitted this call only — start
+        // each generation with a clean slate so penalties don't leak across
+        // independent `generate()` calls on a reused session. Note: this makes
+        // the split-generation seed equivalence (one `generate(N)` == two
+        // `generate(N/2)`) hold only at `repetition_penalty == 1.0`; with a
+        // penalty active the chained calls see a smaller history window each.
+        self.sampler.reset_history();
     }
 }
 

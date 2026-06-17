@@ -237,7 +237,11 @@ class GenerateOpts {
     required this.temperature,
     required this.topP,
     required this.topK,
-    /// Reserved — the sampler doesn't implement rep-penalty yet.
+    /// Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
+    /// disables it. Honored in the stochastic path.
+    required this.minP,
+    /// Repetition penalty over tokens generated this call. `1.0` disables it.
+    /// Honored in the stochastic path (greedy/argmax decoding is unaffected).
     required this.repetitionPenalty,
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     required this.stopTokens,
@@ -251,7 +255,11 @@ class GenerateOpts {
   final double temperature;
   final double topP;
   final int topK;
-  /// Reserved — the sampler doesn't implement rep-penalty yet.
+  /// Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
+  /// disables it. Honored in the stochastic path.
+  final double minP;
+  /// Repetition penalty over tokens generated this call. `1.0` disables it.
+  /// Honored in the stochastic path (greedy/argmax decoding is unaffected).
   final double repetitionPenalty;
   /// Early-stop IDs (EOS / instruction markers / end-of-turn).
   final List<int> stopTokens;
@@ -266,6 +274,7 @@ class GenerateOpts {
       'temperature': this.temperature,
       'topP': this.topP,
       'topK': this.topK,
+      'minP': this.minP,
       'repetitionPenalty': this.repetitionPenalty,
       'stopTokens': this.stopTokens,
       'flushEveryTokens': this.flushEveryTokens,
@@ -279,6 +288,7 @@ class GenerateOpts {
       temperature: (json['temperature'] as num).toDouble(),
       topP: (json['topP'] as num).toDouble(),
       topK: (json['topK'] as num).toInt(),
+      minP: (json['minP'] as num).toDouble(),
       repetitionPenalty: (json['repetitionPenalty'] as num).toDouble(),
       stopTokens: (json['stopTokens'] as List).map((item) => (item as num).toInt()).toList(),
       flushEveryTokens: (json['flushEveryTokens'] as num).toInt(),
@@ -291,6 +301,7 @@ class GenerateOpts {
     double? temperature,
     double? topP,
     int? topK,
+    double? minP,
     double? repetitionPenalty,
     List<int>? stopTokens,
     int? flushEveryTokens,
@@ -301,6 +312,7 @@ class GenerateOpts {
       temperature: temperature ?? this.temperature,
       topP: topP ?? this.topP,
       topK: topK ?? this.topK,
+      minP: minP ?? this.minP,
       repetitionPenalty: repetitionPenalty ?? this.repetitionPenalty,
       stopTokens: stopTokens ?? this.stopTokens,
       flushEveryTokens: flushEveryTokens ?? this.flushEveryTokens,
@@ -310,16 +322,16 @@ class GenerateOpts {
 
   @override
   String toString() {
-    return 'GenerateOpts(maxTokens: $maxTokens, temperature: $temperature, topP: $topP, topK: $topK, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs)';
+    return 'GenerateOpts(maxTokens: $maxTokens, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is GenerateOpts && maxTokens == other.maxTokens && temperature == other.temperature && topP == other.topP && topK == other.topK && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs;
+      other is GenerateOpts && maxTokens == other.maxTokens && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs;
 
   @override
-  int get hashCode => Object.hash(maxTokens, temperature, topP, topK, repetitionPenalty, stopTokens, flushEveryTokens, flushEveryMs);
+  int get hashCode => Object.hash(maxTokens, temperature, topP, topK, minP, repetitionPenalty, stopTokens, flushEveryTokens, flushEveryMs);
 }
 
 /// Bundle of everything a synchronous `generate` call produces:
@@ -1748,6 +1760,7 @@ void _uniffiWriteGenerateOpts(GenerateOpts value, _UniFfiBinaryWriter writer) {
   writer.writeF32(value.temperature);
   writer.writeF32(value.topP);
   writer.writeU32(value.topK);
+  writer.writeF32(value.minP);
   writer.writeF32(value.repetitionPenalty);
   writer.writeI32(value.stopTokens.length);
   for (final item in value.stopTokens) {
@@ -1769,6 +1782,7 @@ GenerateOpts _uniffiReadGenerateOpts(_UniFfiBinaryReader reader) {
     temperature: reader.readF32(),
     topP: reader.readF32(),
     topK: reader.readU32(),
+    minP: reader.readF32(),
     repetitionPenalty: reader.readF32(),
     stopTokens: (() { final int __len = reader.readI32(); final out = <int>[]; for (var i = 0; i < __len; i++) { out.add(reader.readU32()); } return out; })(),
     flushEveryTokens: reader.readU32(),

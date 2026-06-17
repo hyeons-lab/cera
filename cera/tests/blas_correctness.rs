@@ -118,10 +118,9 @@ fn blas_prefill_matches_aarch64_reference() {
                 temperature: 0.0,
                 top_p: 1.0,
                 top_k: 1,
-                repetition_penalty: 1.0,
-                stop_tokens: Vec::new(),
                 flush_every_tokens: 1,
                 flush_every_ms: 0,
+                ..Default::default()
             },
             &mut sink,
         )
