@@ -66,6 +66,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Override .cargo/config.toml's `target-cpu=native` (see its header) — on CI
+  # runners "native" degrades to a feature-stripped baseline that trips
+  # `ring`'s aarch64-apple-darwin const assertion, and a release binary must run
+  # on any CPU of its arch anyway. Empty RUSTFLAGS forces the generic baseline.
+  # Mirrors ci.yml; a step needing specific flags (e.g. threaded wasm) sets them
+  # itself, overriding this default.
+  RUSTFLAGS: ""
 
 jobs:
   version:
