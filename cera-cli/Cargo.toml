@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "CLI for the Cera LLM inference engine"
+readme = "README.md"
+keywords = ["llm", "inference", "cli", "gguf", "ai"]
+categories = ["command-line-utilities", "science"]
 
 [[bin]]
 name = "cera"
