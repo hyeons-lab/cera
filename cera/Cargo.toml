@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Rust-native LLM inference engine"
+readme = "README.md"
+keywords = ["llm", "inference", "gguf", "ai", "ml"]
+categories = ["science", "algorithms"]
 
 [dependencies]
 anyhow.workspace = true
