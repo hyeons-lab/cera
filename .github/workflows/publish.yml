@@ -9,11 +9,15 @@ name: Publish
 # you can release any subset. `<version>` is read once from the `cera` crate.
 #
 # Idempotent: every leg skips work that's already done — crates already on the
-# index, npm versions already published, the Maven `-SNAPSHOT` (overwritable),
-# and the GitHub release (updated in place). So if a leg fails on a transient
-# error, just re-run the workflow (or "Re-run failed jobs"): completed parts are
-# skipped and only the failed parts retry. Publishes also retry transient
-# failures in-line before giving up.
+# index, npm versions already published, the Maven coordinate already released
+# on Central, and the GitHub release (updated in place). So if a leg fails on a
+# transient error, just re-run the workflow (or "Re-run failed jobs"): completed
+# parts are skipped and only the failed parts retry. Publishes also retry
+# transient failures in-line before giving up.
+#
+# All artifacts release under ONE version (read from the `cera` crate) — the
+# `version` job runs `bump-version.sh --check` first, so a drifted crate pin or
+# Gradle coordinate fails the release before anything is uploaded.
 #
 #   dry_run = true  (default): every enabled leg validates/packages only — no
 #                              uploads, no tag.
@@ -24,7 +28,11 @@ name: Publish
 # Secrets (only needed for a real, non-dry-run upload of that leg):
 #   CARGO_REGISTRY_TOKEN                    — crates.io
 #   NPM_TOKEN                               — npm (@hyeons-lab scope)
-#   MAVEN_CENTRAL_USERNAME / _PASSWORD      — Maven Central
+#   MAVEN_CENTRAL_USERNAME / _PASSWORD      — Maven Central (Central Portal token)
+#   MAVEN_SIGNING_KEY / MAVEN_SIGNING_PASSWORD — ASCII-armored GPG private key +
+#       its passphrase, used to sign the Maven release artifacts (required by
+#       Central for non-SNAPSHOT releases). The dry run publishes a SNAPSHOT
+#       locally and needs neither.
 # The tag + GitHub release uses the default GITHUB_TOKEN.
 
 on:
@@ -71,6 +79,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-04-02
+      # Gate the whole release on version consistency: every crate, the Dart
+      # pubspec, and the Gradle VERSION_NAME must match the VERSION file. This
+      # runs before anything publishes, so a drifted pin/coordinate can't ship.
+      - name: Version drift check
+        run: ./scripts/bump-version.sh --check
       - name: Read version from `cera`
         id: version
         run: |
@@ -408,7 +421,7 @@ jobs:
 
   publish-jvm:
     name: Assemble & publish to Maven Central
-    needs: jvm-native-libs
+    needs: [version, jvm-native-libs]
     if: ${{ github.event.inputs.jvm == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -439,19 +452,48 @@ jobs:
       - name: Publish
         working-directory: cera-ffi-kotlin
         env:
+          VERSION: ${{ needs.version.outputs.version }}
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          # GPG signing — required for a real (non-SNAPSHOT) Maven Central
+          # release; signAllPublications() is on whenever the version isn't a
+          # SNAPSHOT. Unused by the dry run (which publishes a SNAPSHOT locally).
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.MAVEN_SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.MAVEN_SIGNING_PASSWORD }}
         run: |
+          set -euo pipefail
+
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            echo "=== DRY RUN: publishToMavenLocal (no upload) ==="
-            ./gradlew publishToMavenLocal --no-daemon --stacktrace
-          else
-            # Idempotent: this publishes a `-SNAPSHOT`, and the Central Portal
-            # snapshot repo accepts re-publishing the same coordinate, so a
-            # rerun simply overwrites it.
-            echo "=== Publishing 0.1.0-SNAPSHOT to Maven Central ==="
-            ./gradlew publishToMavenCentral --no-daemon --stacktrace
+            # Validate assembly + packaging only. A `-SNAPSHOT` coordinate keeps
+            # signing off, so the dry run needs no GPG key (matching the
+            # secret-free dry runs of the crates/npm legs).
+            echo "=== DRY RUN: publishToMavenLocal cera-ffi ${VERSION}-SNAPSHOT (no upload) ==="
+            ./gradlew publishToMavenLocal -PVERSION_NAME="${VERSION}-SNAPSHOT" \
+              --no-daemon --stacktrace
+            exit 0
           fi
+
+          # Idempotent: unlike a snapshot, a released version cannot be
+          # re-published to Maven Central, so skip if the coordinate is already
+          # live. The JVM module's POM stands in for the whole deployment (both
+          # modules release together under the same version). NOTE: Maven Central
+          # → repo1 sync can lag minutes after a release, so an immediate rerun
+          # may not yet see it; wait before re-dispatching the jvm leg.
+          pom_url="https://repo1.maven.org/maven2/com/hyeons-lab/cera-ffi-jvm/${VERSION}/cera-ffi-jvm-${VERSION}.pom"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' "$pom_url" 2>/dev/null || echo 000)
+          if [ "$code" = "200" ]; then
+            echo "✓ cera-ffi ${VERSION} already on Maven Central — skipping"
+            exit 0
+          fi
+
+          # Real release: publishAndReleaseToMavenCentral signs (release version
+          # triggers signAllPublications) and auto-releases the deployment, so
+          # the artifacts go live without a manual Portal step. VERSION_NAME is
+          # pinned to the cera crate version so the Maven coordinate matches the
+          # git tag + crates.io + npm exactly.
+          echo "=== Publishing cera-ffi ${VERSION} to Maven Central ==="
+          ./gradlew publishAndReleaseToMavenCentral -PVERSION_NAME="${VERSION}" \
+            --no-daemon --stacktrace
 
   # ── Tag + GitHub release (the canonical release event) ─────────────────────
   release:
