@@ -288,7 +288,7 @@ jobs:
           Compress-Archive -Path target/release/cera.exe `
             -DestinationPath "cera-${{ matrix.name }}-v$version.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cli-${{ matrix.name }}
           path: cera-${{ matrix.name }}-v${{ needs.version.outputs.version }}.*
@@ -318,7 +318,7 @@ jobs:
       - name: Install binaryen (provides wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
@@ -416,7 +416,7 @@ jobs:
             build -p cera-ffi --release
 
       - name: Upload staged native libs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: native-${{ matrix.label }}
           path: |
@@ -441,7 +441,7 @@ jobs:
       # The artifacts are rooted at `cera-ffi-kotlin/` (see the CI_ARTIFACT_ROOT
       # marker on upload), so extract there to land each lib at its real path.
       - name: Download native libs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: native-*
           merge-multiple: true
@@ -451,7 +451,7 @@ jobs:
         run: |
           find cera-ffi-kotlin -path '*/resources/*/*' -o -path '*/jniLibs/*/*' | sort
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -535,7 +535,7 @@ jobs:
       # CLI binaries to attach — present only when the `cli` leg ran.
       - name: Download CLI artifacts
         if: ${{ needs.build-cli.result == 'success' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: cli-*
           merge-multiple: true
@@ -544,7 +544,7 @@ jobs:
       # Idempotent: action-gh-release updates an existing tag/release in place
       # and re-uploads assets, so re-running after a partial publish is safe.
       - name: Create tag and GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.version.outputs.version }}
           name: v${{ needs.version.outputs.version }}
