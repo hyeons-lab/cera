@@ -32,7 +32,7 @@ JAVA_HOME=<jdk21> ./gradlew :cera-ffi-jvm:publishToMavenLocal
 just android-libs
 ```
 
-CI (`.github/workflows/publish-jvm.yml`, manual `workflow_dispatch`) cross-builds
+CI (the `jvm` leg of `.github/workflows/publish.yml`, manual `workflow_dispatch`) cross-builds
 the native libs per runner (macOS/Linux/Windows + Android NDK), then publishes
 `0.1.0-SNAPSHOT` to the Maven Central **snapshot** repo via the vanniktech plugin.
 

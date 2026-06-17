@@ -1,0 +1,506 @@
+name: Publish
+
+# Consolidated release pipeline — crates.io, CLI binaries, npm (cera-wasm), and
+# Maven Central (cera-ffi Kotlin), plus the canonical `v<version>` git tag +
+# GitHub release. Replaces the former per-target workflows (publish-crates.yml,
+# publish-cli.yml, publish-npm.yml, publish-jvm.yml).
+#
+# A single workflow_dispatch with a global `dry_run` and per-target toggles, so
+# you can release any subset. `<version>` is read once from the `cera` crate.
+#
+# Idempotent: every leg skips work that's already done — crates already on the
+# index, npm versions already published, the Maven `-SNAPSHOT` (overwritable),
+# and the GitHub release (updated in place). So if a leg fails on a transient
+# error, just re-run the workflow (or "Re-run failed jobs"): completed parts are
+# skipped and only the failed parts retry. Publishes also retry transient
+# failures in-line before giving up.
+#
+#   dry_run = true  (default): every enabled leg validates/packages only — no
+#                              uploads, no tag.
+#   dry_run = false:           enabled legs publish for real, then the `release`
+#                              job cuts the `v<version>` tag + GitHub release
+#                              ONCE (after the enabled publishes succeed).
+#
+# Secrets (only needed for a real, non-dry-run upload of that leg):
+#   CARGO_REGISTRY_TOKEN                    — crates.io
+#   NPM_TOKEN                               — npm (@hyeons-lab scope)
+#   MAVEN_CENTRAL_USERNAME / _PASSWORD      — Maven Central
+# The tag + GitHub release uses the default GITHUB_TOKEN.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (validate/package only — no uploads, no tag)'
+        type: boolean
+        required: true
+        default: true
+      crates:
+        description: 'crates.io (cera, cera-ffi, cera-cli, cera-wasm)'
+        type: boolean
+        default: true
+      cli:
+        description: 'Build CLI binaries (attached to the release; the tag/release itself is cut whenever any leg runs)'
+        type: boolean
+        default: true
+      npm:
+        description: 'npm (cera-wasm)'
+        type: boolean
+        default: true
+      jvm:
+        description: 'Maven Central (cera-ffi Kotlin)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  version:
+    name: Determine version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+      - name: Read version from `cera`
+        id: version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "cera") | .version')
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "Could not determine cera version" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "cera version: $VERSION"
+
+  # ── crates.io ──────────────────────────────────────────────────────────────
+  publish-crates:
+    name: Publish crates to crates.io
+    needs: version
+    if: ${{ github.event.inputs.crates == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Compile-verify the whole workspace with local path deps before any
+      # packaging. The dry-run packaging below uses --no-verify for downstream
+      # crates (their `cera` dep isn't on the index yet), so this is what
+      # actually guarantees every crate still builds.
+      - name: Verify workspace compiles
+        run: cargo check --workspace
+
+      - name: Publish crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Topological order: `cera` (no internal deps) first, then the three
+          # crates that depend only on `cera`. `cera-parity` is publish=false
+          # (internal cross-language parity harness) and is excluded.
+
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "=== DRY RUN: packaging only, no upload ==="
+            cargo package -p cera
+            # Downstream crates depend on `cera = "0.1.x"`, which is not on the
+            # index during a dry run — point the dep back at the local path and
+            # skip the verify build's registry resolution.
+            for c in cera-ffi cera-cli cera-wasm; do
+              echo "--- packaging $c ---"
+              cargo package -p "$c" --no-verify \
+                --config "patch.crates-io.cera.path='cera'"
+            done
+            echo "All crates packaged successfully (dry run)."
+            exit 0
+          fi
+
+          echo "=== PUBLISHING TO crates.io ==="
+
+          crate_version() {
+            cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg n "$1" '.packages[] | select(.name == $n) | .version'
+          }
+
+          # 200 => this exact <crate>@<version> already exists on crates.io.
+          # No `-f`: a 404 is a normal "not published yet" answer (curl still
+          # exits 0 and reports the code); `|| echo 000` only covers a network
+          # failure, where we conservatively treat it as not-published. Used for
+          # the idempotency skip decision (does the version exist at all?).
+          is_published() {
+            local code
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              "https://crates.io/api/v1/crates/$1/$2" 2>/dev/null || echo 000)
+            [ "$code" = "200" ]
+          }
+
+          # Sparse-index path prefix for a crate name (cargo's own scheme).
+          index_prefix() {
+            local n="$1"
+            case "${#n}" in
+              1) printf '1' ;;
+              2) printf '2' ;;
+              3) printf '3/%s' "${n:0:1}" ;;
+              *) printf '%s/%s' "${n:0:2}" "${n:2:2}" ;;
+            esac
+          }
+
+          # True once <version> appears in the SPARSE INDEX (index.crates.io) —
+          # this, not the web API, is what the next `cargo publish` resolves the
+          # `cera` dep against. The API returns 200 almost immediately, but the
+          # index can lag, so a dependent publish would otherwise fail.
+          index_has() {
+            curl -sS "https://index.crates.io/$(index_prefix "$1")/$1" 2>/dev/null \
+              | grep -q "\"vers\":\"$2\""
+          }
+
+          # Idempotent per-crate publish: skip if already on the index (so a
+          # rerun retries only the missing crates), retry transient failures,
+          # and re-check after an error in case the upload actually landed.
+          publish_one() {
+            local crate="$1" ver
+            ver=$(crate_version "$crate")
+            if is_published "$crate" "$ver"; then
+              echo "✓ ${crate}@${ver} already on crates.io — skipping"
+              return 0
+            fi
+            local attempt=1 max=3
+            while :; do
+              echo "Publishing ${crate}@${ver} (attempt ${attempt}/${max})..."
+              if cargo publish -p "$crate"; then
+                break
+              fi
+              if is_published "$crate" "$ver"; then
+                echo "  ${crate}@${ver} present after error — treating as published"
+                break
+              fi
+              if [ "$attempt" -ge "$max" ]; then
+                echo "::error::${crate}@${ver} failed to publish after ${max} attempts" >&2
+                return 1
+              fi
+              attempt=$((attempt + 1))
+              echo "  transient failure — retrying in 15s..."
+              sleep 15
+            done
+            # Wait for the SPARSE INDEX to carry this version so the next crate's
+            # `cera` dep resolves (the web API lands sooner than the index).
+            for i in $(seq 1 20); do
+              if index_has "$crate" "$ver"; then
+                echo "  ${crate}@${ver} visible in sparse index"
+                return 0
+              fi
+              echo "  waiting for index propagation (${i}/20)..."
+              sleep 15
+            done
+            echo "::warning::${crate}@${ver} not in sparse index after wait"
+            return 0
+          }
+
+          for c in cera cera-ffi cera-cli cera-wasm; do
+            publish_one "$c" || exit 1
+          done
+          echo "All crates published (or already present)."
+
+  # ── CLI binaries ───────────────────────────────────────────────────────────
+  build-cli:
+    name: Build cera CLI (${{ matrix.name }})
+    needs: version
+    if: ${{ github.event.inputs.cli == 'true' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon: ship the batteries-included binary — Accelerate
+          # (AMX) for CPU prefill + the Metal GPU backend, both system-provided.
+          - os: macos-latest
+            name: macos-arm64
+            features: '--features blas,metal'
+            archive: tar
+          - os: ubuntu-latest
+            name: linux-x86_64
+            features: ''
+            archive: tar
+          - os: windows-latest
+            name: windows-x86_64
+            features: ''
+            archive: zip
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build cera
+        run: cargo build --release -p cera-cli --bin cera ${{ matrix.features }}
+
+      - name: Package (tar.gz)
+        if: ${{ matrix.archive == 'tar' }}
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          tar -czf "cera-${{ matrix.name }}-v${VERSION}.tar.gz" -C target/release cera
+
+      - name: Package (zip)
+        if: ${{ matrix.archive == 'zip' }}
+        shell: pwsh
+        run: |
+          $version = "${{ needs.version.outputs.version }}"
+          Compress-Archive -Path target/release/cera.exe `
+            -DestinationPath "cera-${{ matrix.name }}-v$version.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.name }}
+          path: cera-${{ matrix.name }}-v${{ needs.version.outputs.version }}.*
+          if-no-files-found: error
+
+  # ── npm (cera-wasm) ────────────────────────────────────────────────────────
+  publish-npm:
+    name: Publish cera-wasm to npm
+    needs: version
+    if: ${{ github.event.inputs.npm == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: 'v0.14.0'
+
+      - name: Install binaryen (provides wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Publish the `bundler` target as the canonical `@hyeons-lab/cera-wasm`
+      # (the most common consumer shape). The `web` / `nodejs` shapes share the
+      # same package name today; publishing them as distinct npm packages is a
+      # follow-up (would require rewriting package.json.name per target).
+      - name: Build cera-wasm npm package (bundler)
+        run: |
+          wasm-pack build cera-wasm \
+            --target bundler \
+            --release \
+            --scope hyeons-lab \
+            --out-dir pkg-bundler
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          pkg_dir=cera-wasm/pkg-bundler
+          name=$(node -p "require('./$pkg_dir/package.json').name")
+          version=$(node -p "require('./$pkg_dir/package.json').version")
+
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "=== DRY RUN: npm publish --dry-run (${name}@${version}) ==="
+            npm publish "$pkg_dir" --access public --dry-run
+            exit 0
+          fi
+
+          # Idempotent: npm rejects republishing an existing version, so skip if
+          # it's already up — a rerun then only retries what's missing.
+          if npm view "${name}@${version}" version >/dev/null 2>&1; then
+            echo "✓ ${name}@${version} already on npm — skipping"
+            exit 0
+          fi
+          echo "Publishing ${name}@${version} to npm..."
+          npm publish "$pkg_dir" --access public
+
+  # ── Maven Central (cera-ffi Kotlin) ────────────────────────────────────────
+  jvm-native-libs:
+    name: JVM native libs (${{ matrix.label }})
+    needs: version
+    if: ${{ github.event.inputs.jvm == 'true' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Desktop JVM targets → JNA resource-prefix dirs under the jvm module.
+          - { os: macos-latest,   label: darwin-aarch64, target: aarch64-apple-darwin,    lib: libcera_ffi.dylib, dest: cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/darwin-aarch64, android: false }
+          - { os: ubuntu-latest,  label: linux-x86-64,   target: x86_64-unknown-linux-gnu, lib: libcera_ffi.so,    dest: cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/linux-x86-64,  android: true  }
+          - { os: windows-latest, label: win32-x86-64,   target: x86_64-pc-windows-msvc,  lib: cera_ffi.dll,      dest: cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/win32-x86-64,  android: false }
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build desktop cdylib
+        shell: bash
+        run: |
+          cargo build -p cera-ffi --release --target ${{ matrix.target }}
+          mkdir -p "${{ matrix.dest }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.lib }}" "${{ matrix.dest }}/${{ matrix.lib }}"
+          # Marker at the module root so upload-artifact's lowest-common-ancestor
+          # is always `cera-ffi-kotlin/`, regardless of which subtrees a given
+          # runner populated (macOS/Windows stage only resources/, no jniLibs).
+          # Without it the LCA collapses to resources/ and the download lands the
+          # libs at the wrong paths. Paired with `path: cera-ffi-kotlin` on download.
+          touch cera-ffi-kotlin/CI_ARTIFACT_ROOT
+
+      # Android .so for all four ABIs — built once, on the Linux runner.
+      - name: Set up Android NDK
+        if: ${{ matrix.android }}
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+      - name: Build Android jniLibs
+        if: ${{ matrix.android }}
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
+          cargo install cargo-ndk --version '^4' --locked
+          cargo ndk -o cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs \
+            --target arm64-v8a --target armeabi-v7a --target x86_64 --target x86 \
+            build -p cera-ffi --release
+
+      - name: Upload staged native libs
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.label }}
+          path: |
+            cera-ffi-kotlin/CI_ARTIFACT_ROOT
+            cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/
+            cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs/
+          if-no-files-found: error
+          include-hidden-files: false
+
+  publish-jvm:
+    name: Assemble & publish to Maven Central
+    needs: jvm-native-libs
+    if: ${{ github.event.inputs.jvm == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      # Pull every runner's native libs back into the module source trees. The
+      # committed `cera_ffi.kt` binding is already in the repo (srcDir'd by both
+      # modules), so no Rust build is needed here.
+      # The artifacts are rooted at `cera-ffi-kotlin/` (see the CI_ARTIFACT_ROOT
+      # marker on upload), so extract there to land each lib at its real path.
+      - name: Download native libs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: cera-ffi-kotlin
+
+      - name: Show staged native libs
+        run: |
+          find cera-ffi-kotlin -path '*/resources/*/*' -o -path '*/jniLibs/*/*' | sort
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Publish
+        working-directory: cera-ffi-kotlin
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "=== DRY RUN: publishToMavenLocal (no upload) ==="
+            ./gradlew publishToMavenLocal --no-daemon --stacktrace
+          else
+            # Idempotent: this publishes a `-SNAPSHOT`, and the Central Portal
+            # snapshot repo accepts re-publishing the same coordinate, so a
+            # rerun simply overwrites it.
+            echo "=== Publishing 0.1.0-SNAPSHOT to Maven Central ==="
+            ./gradlew publishToMavenCentral --no-daemon --stacktrace
+          fi
+
+  # ── Tag + GitHub release (the canonical release event) ─────────────────────
+  release:
+    name: Tag & GitHub Release
+    needs: [version, publish-crates, build-cli, publish-npm, jvm-native-libs, publish-jvm]
+    # Real runs only, and only once every enabled leg succeeded. Disabled legs
+    # are `skipped` (not `failure`), so they don't block the tag; any actual
+    # failure does. `jvm-native-libs` is gated too: if it fails, `publish-jvm`
+    # is merely `skipped`, which would otherwise slip past the check below.
+    # `!cancelled()` lets this run despite skipped needs. The final clause
+    # requires at least one leg to be enabled, so an all-toggles-off dispatch
+    # can't cut an empty tag/release.
+    if: >-
+      ${{ !cancelled()
+          && github.event.inputs.dry_run == 'false'
+          && needs.version.result == 'success'
+          && needs.publish-crates.result != 'failure'
+          && needs.build-cli.result != 'failure'
+          && needs.publish-npm.result != 'failure'
+          && needs.jvm-native-libs.result != 'failure'
+          && needs.publish-jvm.result != 'failure'
+          && (github.event.inputs.crates == 'true'
+              || github.event.inputs.cli == 'true'
+              || github.event.inputs.npm == 'true'
+              || github.event.inputs.jvm == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Least privilege: only this job creates the tag / release.
+    permissions:
+      contents: write
+    steps:
+      # CLI binaries to attach — present only when the `cli` leg ran.
+      - name: Download CLI artifacts
+        if: ${{ needs.build-cli.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          merge-multiple: true
+          path: release-assets
+
+      # Idempotent: action-gh-release updates an existing tag/release in place
+      # and re-uploads assets, so re-running after a partial publish is safe.
+      - name: Create tag and GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: v${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          # Binaries are attached when the CLI leg ran; tolerate their absence
+          # so a crates-only / npm-only release still cuts the tag.
+          fail_on_unmatched_files: false
+          files: release-assets/**/cera-*

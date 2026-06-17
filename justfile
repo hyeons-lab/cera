@@ -174,7 +174,7 @@ android-arm64:
 # `cera-ffi-jvm` module's JNA resource layout, for local
 # `./gradlew :cera-ffi-jvm:publishToMavenLocal` testing. CI stages all three
 # desktop targets (macOS .dylib, Linux .so, Windows .dll) per-runner; see
-# `.github/workflows/publish-jvm.yml`. JNA resolves `libcera_ffi` from the
+# the `jvm` leg of `.github/workflows/publish.yml`. JNA resolves `libcera_ffi` from the
 # classpath via its platform resource prefix (darwin-aarch64 / linux-x86-64 /
 # win32-x86-64).
 jvm-libs-host:
