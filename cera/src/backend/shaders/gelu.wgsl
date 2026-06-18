@@ -19,6 +19,10 @@ fn gelu_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = params.x;
     if i >= n { return; }
     let xv = x[i];
-    let inner = 0.7978845608 * (xv + 0.044715 * xv * xv * xv);
+    // Clamp the tanh argument: tanh saturates to ±1 by |arg|≈15, but a GPU
+    // tanh computed as (exp(2a)-1)/(exp(2a)+1) overflows to inf/inf = NaN for
+    // large `a` (the cubic term makes `a` ~180 for |x|~17). Clamping is
+    // numerically identical to the CPU f32::tanh on the saturated tail.
+    let inner = clamp(0.7978845608 * (xv + 0.044715 * xv * xv * xv), -15.0, 15.0);
     x[i] = 0.5 * xv * (1.0 + tanh(inner));
 }

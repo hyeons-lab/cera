@@ -833,8 +833,11 @@ mod tests {
             Err(_) => return,
         };
 
+        // Span [-25, 25): includes large |x| where a naive GPU tanh
+        // (exp(2a)/...) overflows to NaN via gelu's cubic term — the clamp in
+        // gelu.wgsl must keep parity with the CPU's saturating f32::tanh.
         let n = 1000usize;
-        let x: Vec<f32> = (0..n).map(|i| (i as f32 - 500.0) * 0.01).collect();
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 - 500.0) * 0.05).collect();
 
         let mut expected = x.clone();
         crate::backend::cpu::gelu_inplace(&mut expected);
@@ -853,6 +856,12 @@ mod tests {
 
         let result = ctx.download_f32(&x_buf, n);
         for i in 0..n {
+            assert!(
+                result[i].is_finite(),
+                "gelu produced non-finite at {i} (x={}): {} — tanh overflow?",
+                x[i],
+                result[i]
+            );
             let diff = (expected[i] - result[i]).abs();
             // tanh on GPU vs CPU differs slightly; activation magnitudes ~O(1).
             assert!(

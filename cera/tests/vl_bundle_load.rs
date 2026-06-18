@@ -473,3 +473,194 @@ fn vl_bundle_appends_synthetic_image() {
          small-grid pos-embed interpolation may be broken"
     );
 }
+
+/// GPU-path end-to-end smoke (M4 wiring): build the same VL bundle with
+/// `BackendPreference::Auto` so the engine builds a GPU vision encoder
+/// (Metal on Apple Silicon, else wgpu) and the session runs the ViT on the
+/// GPU. Asserts the encoder was actually built (on gpu/metal builds) and that
+/// image-conditioned generation still produces non-degenerate English — i.e.
+/// the GPU encoder's embeddings splice into the LLM stream correctly, matching
+/// the CPU path's behavior. Skipped without `CERA_TEST_DOWNLOAD`.
+#[test]
+#[ignore = "downloads ~310 MB across two GGUFs; set CERA_TEST_DOWNLOAD=1 and pass --ignored"]
+fn vl_bundle_gpu_path_generates() {
+    if std::env::var("CERA_TEST_DOWNLOAD").is_err() {
+        eprintln!("skipping: CERA_TEST_DOWNLOAD not set");
+        return;
+    }
+
+    let main = common::download::ensure_cached(MAIN_URL, MAIN_FILE);
+    let mmproj = common::download::ensure_cached(MMPROJ_URL, MMPROJ_FILE);
+    let mut files = ModelFiles::text(&main);
+    files.multimodal_projector = Some(mmproj);
+    files.inference_type = Some(InferenceType::LlamaCppImageToText);
+    let engine = CeraEngine::from_files(
+        files,
+        EngineConfig {
+            context_size: 512,
+            // Auto → Metal/wgpu when compiled in; CPU otherwise.
+            backend: BackendPreference::Auto,
+            ..Default::default()
+        },
+    )
+    .expect("VL bundle load (Auto backend)");
+
+    // On a GPU/Metal build with a device present, the engine must have built
+    // a GPU vision encoder. On a CPU-only build this is a no-op (the CPU
+    // encoder backs image input), so only assert when a GPU feature is on.
+    #[cfg(any(feature = "gpu", all(feature = "metal", target_os = "macos")))]
+    assert!(
+        engine.has_gpu_vision_encoder(),
+        "Auto backend on a GPU build should build a GPU vision encoder"
+    );
+
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("pug.jpg");
+    let img_bytes: Vec<u8> = if fixture.exists() {
+        std::fs::read(&fixture).expect("read pug.jpg fixture")
+    } else {
+        use image::{ImageBuffer, Rgb};
+        let img = ImageBuffer::<Rgb<u8>, _>::from_fn(256, 256, |_, _| Rgb([255u8, 0, 0]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode synthetic png");
+        png
+    };
+
+    let tokenizer = engine.tokenizer();
+    let messages = vec![ChatMessageMultimodal {
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::Image,
+            ContentItem::Text {
+                text: "Describe what you see.".to_string(),
+            },
+        ],
+    }];
+
+    let mut session = engine.new_session(Default::default());
+    session
+        .append_chat_with_images(&messages, &[&img_bytes], true)
+        .expect("append_chat_with_images (GPU path) should succeed end-to-end");
+
+    struct Collect(Vec<u32>);
+    impl ModalitySink for Collect {
+        fn on_text_tokens(&mut self, t: &[u32]) {
+            self.0.extend_from_slice(t);
+        }
+        fn on_done(&mut self, _: FinishReason) {}
+    }
+    let mut sink = Collect(Vec::new());
+    let opts = GenerateOpts {
+        max_tokens: 32,
+        temperature: 0.0,
+        ..Default::default()
+    };
+    session
+        .generate(&opts, &mut sink)
+        .expect("generate after GPU image prefill");
+    let decoded = tokenizer.decode(&sink.0);
+    eprintln!("vl GPU-path decoded output: {decoded:?}");
+
+    let total = decoded.chars().count() as f32;
+    let alpha_or_space = decoded
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic() || *c == ' ')
+        .count() as f32;
+    assert!(total > 0.0, "decoded text is empty");
+    assert!(
+        alpha_or_space / total >= 0.6,
+        "GPU-path output mostly non-letters: {decoded:?}"
+    );
+    assert!(
+        decoded.contains(' '),
+        "GPU-path output has no spaces — single unbroken token: {decoded:?}"
+    );
+}
+
+/// Real-weights embedding parity: the GPU vision encoder must match the CPU
+/// encoder on the actual quantized mmproj (the synthetic F32 parity test in
+/// `vision_encoder_gpu` can't exercise quantized weights or the real
+/// 12-layer / 768-dim / GELU-saturating activations). Asserts no NaN/Inf and a
+/// small mean absolute difference vs the CPU reference. This is the regression
+/// guard for bugs like GPU `tanh` overflow in GELU.
+#[test]
+#[ignore = "downloads ~310 MB across two GGUFs; set CERA_TEST_DOWNLOAD=1 and pass --ignored"]
+fn vl_bundle_gpu_embeddings_match_cpu() {
+    if std::env::var("CERA_TEST_DOWNLOAD").is_err() {
+        eprintln!("skipping: CERA_TEST_DOWNLOAD not set");
+        return;
+    }
+    let main = common::download::ensure_cached(MAIN_URL, MAIN_FILE);
+    let mmproj = common::download::ensure_cached(MMPROJ_URL, MMPROJ_FILE);
+    let mut files = ModelFiles::text(&main);
+    files.multimodal_projector = Some(mmproj);
+    files.inference_type = Some(InferenceType::LlamaCppImageToText);
+    let engine = CeraEngine::from_files(
+        files,
+        EngineConfig {
+            context_size: 512,
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        },
+    )
+    .expect("load");
+    let cpu_enc = engine.vision_encoder().expect("vision encoder").clone();
+
+    // A non-trivial gradient image so activations span a realistic range
+    // (constant images don't exercise the large-activation GELU tail).
+    use image::{ImageBuffer, Rgb};
+    let img = ImageBuffer::<Rgb<u8>, _>::from_fn(256, 256, |x, y| {
+        Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+    });
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+
+    let pre =
+        cera::model::vision_preprocessor::preprocess_image_with_opts(&png, &cpu_enc.config, None)
+            .expect("preprocess");
+
+    let cpu_emb = cpu_enc
+        .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
+        .expect("cpu encode");
+
+    // Test whichever GPU backend is compiled in (Auto: Metal then wgpu).
+    let gpu = cera::model::vision_encoder_gpu::build_gpu_vision_encoder(
+        cpu_enc.as_ref(),
+        BackendPreference::Auto,
+    );
+    let Some(gpu) = gpu else {
+        eprintln!("no GPU backend available; skipping");
+        return;
+    };
+    let gpu_emb = gpu
+        .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
+        .expect("gpu encode");
+
+    assert_eq!(cpu_emb.len(), gpu_emb.len(), "embedding length mismatch");
+    let mut sum_abs = 0.0f64;
+    for (i, (c, g)) in cpu_emb.iter().zip(gpu_emb.iter()).enumerate() {
+        assert!(
+            g.is_finite(),
+            "GPU embedding non-finite at {i}: {g} (cpu={c})"
+        );
+        sum_abs += (c - g).abs() as f64;
+    }
+    let mean_abs = sum_abs / cpu_emb.len() as f64;
+    // GPU dequantizes weights to f32 and sums in a different order than the CPU
+    // quantized vec_dot, accumulated over 12 layers — a few-percent mean drift
+    // is expected and the LLM tolerates it (see vl_bundle_gpu_path_generates).
+    assert!(
+        mean_abs < 0.5,
+        "GPU vs CPU embedding mean_abs={mean_abs:.4} too large — likely a kernel bug"
+    );
+    eprintln!(
+        "GPU vs CPU embedding parity: mean_abs={mean_abs:.4}, n={}",
+        cpu_emb.len()
+    );
+}

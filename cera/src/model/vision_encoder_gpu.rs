@@ -371,12 +371,12 @@ pub fn encode_image_gpu<O: VitGpuOps>(
 
 // ── wgpu backend implementation ──────────────────────────────────────────────
 
-/// wgpu implementation of [`VitGpuOps`]. Holds the compute pipelines (compiled
-/// once) and borrows the [`GpuContext`]. Bind groups are created per dispatch
-/// (cheap relative to the kernel work).
+/// wgpu implementation of [`VitGpuOps`]. Owns the [`GpuContext`] and the compute
+/// pipelines (compiled once) so it can be cached for the session's lifetime.
+/// Bind groups are created per dispatch (cheap relative to the kernel work).
 #[cfg(feature = "gpu")]
-pub struct WgpuVitOps<'a> {
-    ctx: &'a crate::backend::wgpu::GpuContext,
+pub struct WgpuVitOps {
+    ctx: crate::backend::wgpu::GpuContext,
     p_linear: wgpu::ComputePipeline,
     p_bias: wgpu::ComputePipeline,
     p_layernorm: wgpu::ComputePipeline,
@@ -386,8 +386,8 @@ pub struct WgpuVitOps<'a> {
 }
 
 #[cfg(feature = "gpu")]
-impl<'a> WgpuVitOps<'a> {
-    pub fn new(ctx: &'a crate::backend::wgpu::GpuContext) -> Self {
+impl WgpuVitOps {
+    pub fn new(ctx: crate::backend::wgpu::GpuContext) -> Self {
         use crate::backend::wgpu::shaders;
         // f32 batched matmul via the SCALAR mul_mat variant (handles any m).
         let p_linear = ctx.create_pipeline_with_defines(
@@ -463,7 +463,7 @@ impl<'a> WgpuVitOps<'a> {
 }
 
 #[cfg(feature = "gpu")]
-impl VitGpuOps for WgpuVitOps<'_> {
+impl VitGpuOps for WgpuVitOps {
     type Buf = wgpu::Buffer;
 
     fn upload(&self, data: &[f32]) -> Self::Buf {
@@ -602,8 +602,8 @@ impl VitGpuOps for WgpuVitOps<'_> {
 /// `wait_until_completed`, so `download` always sees current data (unified
 /// memory on Apple Silicon).
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub struct MetalVitOps<'a> {
-    ctx: &'a crate::backend::metal::MetalContext,
+pub struct MetalVitOps {
+    ctx: crate::backend::metal::MetalContext,
     p_linear: metal::ComputePipelineState,
     p_bias: metal::ComputePipelineState,
     p_layernorm: metal::ComputePipelineState,
@@ -613,8 +613,8 @@ pub struct MetalVitOps<'a> {
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-impl<'a> MetalVitOps<'a> {
-    pub fn new(ctx: &'a crate::backend::metal::MetalContext) -> Result<Self> {
+impl MetalVitOps {
+    pub fn new(ctx: crate::backend::metal::MetalContext) -> Result<Self> {
         use crate::backend::metal::shaders;
         Ok(Self {
             p_linear: ctx.create_pipeline(shaders::VIT_LINEAR, "vit_linear")?,
@@ -656,7 +656,7 @@ impl<'a> MetalVitOps<'a> {
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-impl VitGpuOps for MetalVitOps<'_> {
+impl VitGpuOps for MetalVitOps {
     type Buf = metal::Buffer;
 
     fn upload(&self, data: &[f32]) -> Self::Buf {
@@ -769,6 +769,102 @@ impl VitGpuOps for MetalVitOps<'_> {
             metal::MTLSize::new(256, 1, 1),
         );
     }
+}
+
+// ── Cached, object-safe encoder for the live session path ────────────────────
+
+/// Object-safe GPU vision encoder cached in a [`crate::session::Session`].
+/// Wraps a backend's ops + uploaded weights so the whole ViT runs on the GPU.
+/// Implementors are `Send + Sync` so the engine can share them across sessions.
+pub trait VisionGpuEncode: Send + Sync {
+    /// Encode preprocessed pixels (`[3·H·W]` NCHW, normalized) at the given
+    /// patch grid. Output matches [`VisionEncoderWeights::encode_image`].
+    fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>>;
+}
+
+#[cfg(feature = "gpu")]
+struct WgpuVisionEncoder {
+    ops: WgpuVitOps,
+    weights: GpuVitWeights<wgpu::Buffer>,
+}
+
+#[cfg(feature = "gpu")]
+impl VisionGpuEncode for WgpuVisionEncoder {
+    fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
+        encode_image_gpu(&self.ops, &self.weights, pixels, grid_w, grid_h)
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+struct MetalVisionEncoder {
+    ops: MetalVitOps,
+    weights: GpuVitWeights<metal::Buffer>,
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+impl VisionGpuEncode for MetalVisionEncoder {
+    fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
+        encode_image_gpu(&self.ops, &self.weights, pixels, grid_w, grid_h)
+    }
+}
+
+/// Build a cached GPU vision encoder for `weights`, honoring `backend`.
+/// Returns `None` for `Cpu`, when the chosen backend's feature isn't compiled,
+/// or when the device/context can't be created — the caller then falls back to
+/// the CPU encoder. `Auto` prefers Metal, then wgpu.
+pub fn build_gpu_vision_encoder(
+    weights: &VisionEncoderWeights,
+    backend: crate::engine::BackendPreference,
+) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
+    use crate::engine::BackendPreference as BP;
+    match backend {
+        BP::Cpu => None,
+        BP::Metal => try_metal_vision_encoder(weights),
+        BP::Gpu => try_wgpu_vision_encoder(weights),
+        BP::Auto => try_metal_vision_encoder(weights).or_else(|| try_wgpu_vision_encoder(weights)),
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn try_wgpu_vision_encoder(
+    weights: &VisionEncoderWeights,
+) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
+    let ctx = crate::backend::wgpu::GpuContext::new().ok()?;
+    let ops = WgpuVitOps::new(ctx);
+    let gpu_w = GpuVitWeights::build(&ops, weights);
+    tracing::info!("vision encoder: using wgpu GPU backend");
+    Some(std::sync::Arc::new(WgpuVisionEncoder {
+        ops,
+        weights: gpu_w,
+    }))
+}
+
+#[cfg(not(feature = "gpu"))]
+fn try_wgpu_vision_encoder(
+    _weights: &VisionEncoderWeights,
+) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
+    None
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn try_metal_vision_encoder(
+    weights: &VisionEncoderWeights,
+) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
+    let ctx = crate::backend::metal::MetalContext::new().ok()?;
+    let ops = MetalVitOps::new(ctx).ok()?;
+    let gpu_w = GpuVitWeights::build(&ops, weights);
+    tracing::info!("vision encoder: using native Metal backend");
+    Some(std::sync::Arc::new(MetalVisionEncoder {
+        ops,
+        weights: gpu_w,
+    }))
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn try_metal_vision_encoder(
+    _weights: &VisionEncoderWeights,
+) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
+    None
 }
 
 #[cfg(all(
@@ -912,7 +1008,7 @@ mod tests {
             Ok(ctx) => ctx,
             Err(_) => return, // no GPU (CI)
         };
-        run_parity(&WgpuVitOps::new(&ctx));
+        run_parity(&WgpuVitOps::new(ctx));
     }
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -922,6 +1018,6 @@ mod tests {
             Ok(ctx) => ctx,
             Err(_) => return, // no Metal device (CI)
         };
-        run_parity(&MetalVitOps::new(&ctx).unwrap());
+        run_parity(&MetalVitOps::new(ctx).unwrap());
     }
 }
