@@ -806,11 +806,16 @@ do {
   (PNG / JPEG) to the context for VL bundles, mirroring
   `appendAudio`. `CeraEngine.newSession` auto-attaches the vision
   mmproj encoder, so no separate load call is needed. The optional
-  `maxLongSize` caps the image's longest side (high-quality
-  aspect-preserving downscale before encoding) as a quality/cost
-  knob; `null` uses the native resolution. Returns
-  `UnsupportedModality` on a non-VL model and `Backend` on a decode
-  / encoder mismatch. The underlying ViT encode runs on CPU.
+  per-call `maxLongSize` caps the longest side of the *encoded* image
+  (aspect-preserving): smaller = fewer image tokens, faster, less
+  detail. It only shrinks (never upscales) and takes precedence over
+  the model's minimum-resolution floor; `null` applies no cap for that
+  call. Returns `UnsupportedModality` on a non-VL model and `Backend`
+  on a decode / encoder mismatch. The ViT encode runs on CPU.
+- **`setImageMaxLongSize(maxLongSize)`** sets a session-default cap
+  honored by *every* image-append path (including chat-template flows),
+  so a host can configure the image-encode budget once instead of per
+  call. `appendImage`'s explicit argument overrides it for that call.
 
 ## Design notes
 

@@ -546,6 +546,11 @@ uint32_t uniffi_cera_ffi_fn_method_session_position(uint64_t ptr, RustCallStatus
 void uniffi_cera_ffi_fn_method_session_reset(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_SET_IMAGE_MAX_LONG_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_SET_IMAGE_MAX_LONG_SIZE
+void uniffi_cera_ffi_fn_method_session_set_image_max_long_size(uint64_t ptr, RustBuffer max_long_size, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CERA_FFI_VERSION
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CERA_FFI_VERSION
 RustBuffer uniffi_cera_ffi_fn_func_cera_ffi_version(RustCallStatus *_Nonnull out_status
@@ -1031,6 +1036,12 @@ uint16_t uniffi_cera_ffi_checksum_method_session_position(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_RESET
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_RESET
 uint16_t uniffi_cera_ffi_checksum_method_session_reset(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_SET_IMAGE_MAX_LONG_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_SET_IMAGE_MAX_LONG_SIZE
+uint16_t uniffi_cera_ffi_checksum_method_session_set_image_max_long_size(void
     
 );
 #endif

@@ -2060,13 +2060,16 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * `tracing::warn!` at `CeraEngine` construction. Both surface here
      * as a "no vision encoder attached" `Backend` error.
      *
-     * `max_long_size` optionally caps the image's longest side: when
-     * `Some(n)` and the decoded image is larger, it is downscaled
-     * (high-quality Lanczos3, aspect-preserving) to `n` *before*
-     * encoding — a caller-controlled quality/cost knob (bigger = more
-     * detail, slower). `None` (or `0`) uses the image at its native
-     * resolution. The model's own pixel-budget clamp still applies on
-     * top, so a cap above that budget is a no-op.
+     * `max_long_size` is an explicit per-call cap on the longest side
+     * of the *encoded* image: when `Some(n)`, the resize target is
+     * shrunk (aspect-preserving) so its longer side is at most `n`
+     * pixels — a quality/cost knob (smaller = fewer image tokens,
+     * faster, less detail). It only shrinks (never upscales) and takes
+     * precedence over the model's minimum-resolution floor. `None` (or
+     * `0`) falls back to [`Self::set_image_max_long_size`] only if the
+     * caller passes it explicitly — here `None` means "no cap for this
+     * call". The cap bounds the *encode*, not the *decode* (a huge
+     * source image is still decoded, bounded by internal limits).
      *
      * **Placement matters.** Prefer driving multimodal turns through
      * the chat template; calling this at the wrong stream position
@@ -2250,6 +2253,18 @@ public protocol SessionProtocol: AnyObject, Sendable {
      */
     func reset() throws 
     
+    /**
+     * Set a session-default cap on the longest side of an appended
+     * image, in pixels (`None` = no cap). Unlike the per-call
+     * `max_long_size` argument to [`Self::append_image`], this default
+     * is honored by every image-append path the session drives —
+     * including chat-template flows — so a host can configure the
+     * image-encode budget once. See [`Self::append_image`] for the cap
+     * semantics (shrinks the encoded target, never upscales, takes
+     * precedence over the model's minimum-resolution floor).
+     */
+    func setImageMaxLongSize(maxLongSize: UInt32?) throws 
+    
 }
 /**
  * Stateful inference handle. Wraps [`cera::Session`] behind a
@@ -2382,13 +2397,16 @@ open func appendAudio(samples: [Float], sampleRate: UInt32)throws   {try rustCal
      * `tracing::warn!` at `CeraEngine` construction. Both surface here
      * as a "no vision encoder attached" `Backend` error.
      *
-     * `max_long_size` optionally caps the image's longest side: when
-     * `Some(n)` and the decoded image is larger, it is downscaled
-     * (high-quality Lanczos3, aspect-preserving) to `n` *before*
-     * encoding — a caller-controlled quality/cost knob (bigger = more
-     * detail, slower). `None` (or `0`) uses the image at its native
-     * resolution. The model's own pixel-budget clamp still applies on
-     * top, so a cap above that budget is a no-op.
+     * `max_long_size` is an explicit per-call cap on the longest side
+     * of the *encoded* image: when `Some(n)`, the resize target is
+     * shrunk (aspect-preserving) so its longer side is at most `n`
+     * pixels — a quality/cost knob (smaller = fewer image tokens,
+     * faster, less detail). It only shrinks (never upscales) and takes
+     * precedence over the model's minimum-resolution floor. `None` (or
+     * `0`) falls back to [`Self::set_image_max_long_size`] only if the
+     * caller passes it explicitly — here `None` means "no cap for this
+     * call". The cap bounds the *encode*, not the *decode* (a huge
+     * source image is still decoded, bounded by internal limits).
      *
      * **Placement matters.** Prefer driving multimodal turns through
      * the chat template; calling this at the wrong stream position
@@ -2659,6 +2677,24 @@ open func position() -> UInt32  {
 open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_reset(
             self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Set a session-default cap on the longest side of an appended
+     * image, in pixels (`None` = no cap). Unlike the per-call
+     * `max_long_size` argument to [`Self::append_image`], this default
+     * is honored by every image-append path the session drives —
+     * including chat-template flows — so a host can configure the
+     * image-encode budget once. See [`Self::append_image`] for the cap
+     * semantics (shrinks the encoded target, never upscales, takes
+     * precedence over the model's minimum-resolution floor).
+     */
+open func setImageMaxLongSize(maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_set_image_max_long_size(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionUInt32.lower(maxLongSize),$0
     )
 }
 }
@@ -4214,7 +4250,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_append_audio() != 44552) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_append_image() != 47275) {
+    if (uniffi_cera_ffi_checksum_method_session_append_image() != 48956) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
@@ -4248,6 +4284,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 15544) {

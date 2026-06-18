@@ -433,19 +433,43 @@ fn vl_bundle_appends_synthetic_image() {
          likely poisoned the LLM stream"
     );
 
-    // `append_image_with_opts` with a `max_long_size` cap drives the
-    // same preprocess → ViT → splice path on real weights. Use a
-    // fresh session and append the image directly (no chat envelope —
-    // we're proving the capped path executes and advances the stream,
-    // not generation coherence). The 128px cap is well below the
-    // fixture's native size, so the Lanczos downscale path fires.
+    // Validate `max_long_size` end-to-end through the RECOMMENDED path
+    // (`append_chat_with_images`, which honors the session-default cap)
+    // on real weights. Compare against an uncapped baseline: the text
+    // tokens are identical across both, so a working cap must yield
+    // strictly FEWER image tokens, i.e. a lower KV position after
+    // prefill. This is the load-bearing check — it fails if the cap is
+    // a no-op, if the chat path ignores the session default, or if the
+    // old cascaded downscale→upscale re-inflated the grid back.
+    let uncapped_pos = {
+        let mut s = engine.new_session(Default::default());
+        s.append_chat_with_images(&messages, &[&img_bytes], true)
+            .expect("uncapped chat append");
+        s.position()
+    };
     let mut capped = engine.new_session(Default::default());
-    let before = capped.position();
+    capped.set_image_max_long_size(Some(128));
     capped
-        .append_image_with_opts(&img_bytes, Some(128))
-        .expect("append_image_with_opts with max_long_size should run end-to-end");
+        .append_chat_with_images(&messages, &[&img_bytes], true)
+        .expect("capped chat append should run end-to-end via the session default");
+    let capped_pos = capped.position();
     assert!(
-        capped.position() > before,
-        "capped append produced zero image tokens — preprocess/encode/splice broke"
+        capped_pos < uncapped_pos,
+        "max_long_size must reduce image tokens via the chat path: \
+         capped KV {capped_pos} should be < uncapped {uncapped_pos}"
+    );
+
+    // The capped, down-sampled embeddings must still be usable: a 128px
+    // cap takes the grid below the model's min_pixels floor, so this
+    // exercises the interpolated position-embedding path at a small
+    // grid. Generation must still produce tokens.
+    let mut capped_sink = Collect(Vec::new());
+    capped
+        .generate(&opts, &mut capped_sink)
+        .expect("generate after capped image prefill");
+    assert!(
+        !capped_sink.0.is_empty(),
+        "capped (sub-min_pixels) image prefill produced no generation — \
+         small-grid pos-embed interpolation may be broken"
     );
 }

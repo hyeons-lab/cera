@@ -906,6 +906,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_reset(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_session_set_image_max_long_size(): Int
+
     external fun uniffi_cera_ffi_checksum_constructor_bundlerepo_new(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress(): Int
@@ -1213,6 +1215,12 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
+    external fun uniffi_cera_ffi_fn_method_session_set_image_max_long_size(
+        `ptr`: Long,
+        `maxLongSize`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
     external fun uniffi_cera_ffi_fn_func_cera_ffi_version(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_func_cpu_backend_report(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
@@ -1503,7 +1511,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 44552) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 47275) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 48956) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
@@ -1537,6 +1545,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 15544) {
@@ -4106,13 +4117,16 @@ public interface SessionInterface {
      * `tracing::warn!` at `CeraEngine` construction. Both surface here
      * as a "no vision encoder attached" `Backend` error.
      *
-     * `max_long_size` optionally caps the image's longest side: when
-     * `Some(n)` and the decoded image is larger, it is downscaled
-     * (high-quality Lanczos3, aspect-preserving) to `n` *before*
-     * encoding — a caller-controlled quality/cost knob (bigger = more
-     * detail, slower). `None` (or `0`) uses the image at its native
-     * resolution. The model's own pixel-budget clamp still applies on
-     * top, so a cap above that budget is a no-op.
+     * `max_long_size` is an explicit per-call cap on the longest side
+     * of the *encoded* image: when `Some(n)`, the resize target is
+     * shrunk (aspect-preserving) so its longer side is at most `n`
+     * pixels — a quality/cost knob (smaller = fewer image tokens,
+     * faster, less detail). It only shrinks (never upscales) and takes
+     * precedence over the model's minimum-resolution floor. `None` (or
+     * `0`) falls back to [`Self::set_image_max_long_size`] only if the
+     * caller passes it explicitly — here `None` means "no cap for this
+     * call". The cap bounds the *encode*, not the *decode* (a huge
+     * source image is still decoded, bounded by internal limits).
      *
      * **Placement matters.** Prefer driving multimodal turns through
      * the chat template; calling this at the wrong stream position
@@ -4305,6 +4319,18 @@ public interface SessionInterface {
      */
     fun `reset`()
 
+    /**
+     * Set a session-default cap on the longest side of an appended
+     * image, in pixels (`None` = no cap). Unlike the per-call
+     * `max_long_size` argument to [`Self::append_image`], this default
+     * is honored by every image-append path the session drives —
+     * including chat-template flows — so a host can configure the
+     * image-encode budget once. See [`Self::append_image`] for the cap
+     * semantics (shrinks the encoded target, never upscales, takes
+     * precedence over the model's minimum-resolution floor).
+     */
+    fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?)
+
     companion object
 }
 
@@ -4491,13 +4517,16 @@ open class Session :
      * `tracing::warn!` at `CeraEngine` construction. Both surface here
      * as a "no vision encoder attached" `Backend` error.
      *
-     * `max_long_size` optionally caps the image's longest side: when
-     * `Some(n)` and the decoded image is larger, it is downscaled
-     * (high-quality Lanczos3, aspect-preserving) to `n` *before*
-     * encoding — a caller-controlled quality/cost knob (bigger = more
-     * detail, slower). `None` (or `0`) uses the image at its native
-     * resolution. The model's own pixel-budget clamp still applies on
-     * top, so a cap above that budget is a no-op.
+     * `max_long_size` is an explicit per-call cap on the longest side
+     * of the *encoded* image: when `Some(n)`, the resize target is
+     * shrunk (aspect-preserving) so its longer side is at most `n`
+     * pixels — a quality/cost knob (smaller = fewer image tokens,
+     * faster, less detail). It only shrinks (never upscales) and takes
+     * precedence over the model's minimum-resolution floor. `None` (or
+     * `0`) falls back to [`Self::set_image_max_long_size`] only if the
+     * caller passes it explicitly — here `None` means "no cap for this
+     * call". The cap bounds the *encode*, not the *decode* (a huge
+     * source image is still decoded, bounded by internal limits).
      *
      * **Placement matters.** Prefer driving multimodal turns through
      * the chat template; calling this at the wrong stream position
@@ -4820,6 +4849,28 @@ open class Session :
             uniffiRustCallWithError(FfiException) { _status ->
                 UniffiLib.uniffi_cera_ffi_fn_method_session_reset(
                     it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Set a session-default cap on the longest side of an appended
+     * image, in pixels (`None` = no cap). Unlike the per-call
+     * `max_long_size` argument to [`Self::append_image`], this default
+     * is honored by every image-append path the session drives —
+     * including chat-template flows — so a host can configure the
+     * image-encode budget once. See [`Self::append_image`] for the cap
+     * semantics (shrinks the encoded target, never upscales, takes
+     * precedence over the model's minimum-resolution floor).
+     */
+    @Throws(FfiException::class)
+    override fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_set_image_max_long_size(
+                    it,
+                    FfiConverterOptionalUInt.lower(`maxLongSize`),
                     _status,
                 )
             }

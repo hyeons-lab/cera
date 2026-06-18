@@ -117,6 +117,15 @@ pub fn calc_size_preserved_ratio(
     (w_bar, h_bar)
 }
 
+/// Hard cap on a decoded image's width / height, applied as an
+/// `image::Limits` dimension bound so a malformed or hostile file that
+/// declares enormous dimensions is rejected before its pixel buffer is
+/// allocated. 16384 px per side comfortably covers real photographs
+/// while bounding the worst case; the `image` crate's default 512 MiB
+/// `max_alloc` is the secondary backstop. See the decode site in
+/// [`preprocess_image_with_opts`].
+const MAX_DECODE_DIM: u32 = 16_384;
+
 /// Decode + dynamic-resolution resize + normalize an image into a
 /// [`PreprocessedImage`] the encoder consumes. `bytes` may be PNG
 /// or JPEG (auto-detected via `image::guess_format`); other
@@ -130,22 +139,24 @@ pub fn preprocess_image(
 }
 
 /// Like [`preprocess_image`], but with an optional caller-supplied
-/// cap (`max_long_size`) on the image's longest side, applied as a
-/// **pre-resize before** the model's own `[min, max]`-pixel clamp.
+/// cap (`max_long_size`) on the longest side of the **encoded** image.
 ///
-/// When `Some(n)` and the decoded image's longer side exceeds `n`,
-/// the image is downscaled (high-quality Lanczos3, aspect-preserving)
-/// so its long side equals `n`, *then* fed through the normal
-/// [`calc_size_preserved_ratio`] path. `None` (or `0`, or an image
-/// already within the cap) is a no-op and behaves identically to
-/// [`preprocess_image`].
+/// When `Some(n)`, the resize target chosen by
+/// [`calc_size_preserved_ratio`] is shrunk (aspect-preserving,
+/// re-aligned to `patch_size · scale_factor`) so its longer side is at
+/// most `n` pixels, and the image is then resampled **once**, straight
+/// from its native dimensions to that target — there is no cascaded
+/// downscale-then-upscale. The cap only ever *shrinks* the target (the
+/// `long > cap` guard never upscales) and **takes precedence over
+/// `cfg.image_min_pixels`**: a small `n` is an explicit request to
+/// trade detail for cost, clamped only at one aligned patch block.
+/// `None` (or `0`, or a target already within the cap) behaves
+/// identically to [`preprocess_image`].
 ///
-/// Note: the model's `cfg.image_max_pixels` clamp still applies on
-/// top. With the current single-tile pipeline a `max_long_size`
-/// larger than the model's pixel budget therefore has no effect —
-/// the knob can only *reduce* cost/resolution, not raise it beyond
-/// the encoder's baseline. (Raising effective resolution needs
-/// image slicing, tracked separately.)
+/// `max_long_size` caps the encoded resolution, not the *decode*: a
+/// huge source image is still fully decoded (bounded by the
+/// dimension/alloc limits applied below) before the target shrink, so
+/// the cap is a quality/encode-cost knob, not a decode-memory bound.
 pub fn preprocess_image_with_opts(
     bytes: &[u8],
     cfg: &VisionEncoderConfig,
@@ -155,34 +166,56 @@ pub fn preprocess_image_with_opts(
         return Err(CeraError::EmptyInput);
     }
 
-    let img = image::load_from_memory(bytes)
+    // Decode with explicit dimension limits. `bytes` may come from
+    // untrusted callers (the FFI `appendImage` surface is reachable
+    // from Kotlin/Swift/Flutter), so bound the declared dimensions to
+    // reject decompression bombs before the full pixel buffer is
+    // allocated. `max_long_size` is applied post-decode (it caps the
+    // encode target, not the decode), so it cannot bound this — the
+    // dimension limit must. The `image` crate's default `max_alloc`
+    // (512 MiB) still applies on top as a secondary backstop.
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| CeraError::Backend(format!("image format detection failed: {e}")))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_DIM);
+    limits.max_image_height = Some(MAX_DECODE_DIM);
+    reader.limits(limits);
+    let img = reader
+        .decode()
         .map_err(|e| CeraError::Backend(format!("image decode failed: {e}")))?;
 
-    // Optional caller-controlled long-side cap. `resize` fits the
-    // image *within* a `max × max` box preserving aspect, so the
-    // longer side lands exactly on `max` and the shorter side scales
-    // proportionally. Guard `max > 0` (a 0 cap is meaningless) and
-    // only fire when the image actually exceeds the cap so we never
-    // upscale here — upscaling is the model resize's job via the
-    // `min_pixels` branch.
-    let img = match max_long_size {
-        Some(max) if max > 0 && img.width().max(img.height()) > max => {
-            img.resize(max, max, image::imageops::FilterType::Lanczos3)
-        }
-        _ => img,
-    };
-
-    // Pick the resize target via llama.cpp's algorithm. align_size
-    // = patch_size · scale_factor guarantees both grid_w and
-    // grid_h are even and the 2× pixel-shuffle works out.
+    // Pick the resize target via llama.cpp's algorithm from the NATIVE
+    // decoded dims. align_size = patch_size · scale_factor guarantees
+    // both grid_w and grid_h are even and the 2× pixel-shuffle works
+    // out.
     let align = cfg.patch_size * cfg.scale_factor;
-    let (target_w, target_h) = calc_size_preserved_ratio(
+    let (mut target_w, mut target_h) = calc_size_preserved_ratio(
         img.width() as usize,
         img.height() as usize,
         align,
         cfg.image_min_pixels,
         cfg.image_max_pixels,
     );
+
+    // Optional caller cap on the longest side of the encoded target.
+    // Applied to the TARGET (not a pre-resize of the input) so the
+    // single `resize_exact` below goes straight from native dims to the
+    // final target — one resample, no cascaded downscale-then-upscale.
+    // Shrinks only (`long > cap`), preserves aspect, re-aligns by
+    // flooring, and clamps to at least one aligned block so the patch
+    // grid stays valid. Deliberately takes precedence over
+    // `image_min_pixels` (the caller is trading detail for cost).
+    if let Some(cap) = max_long_size.filter(|&c| c > 0).map(|c| c as usize) {
+        let long = target_w.max(target_h);
+        if long > cap {
+            let beta = cap as f64 / long as f64; // < 1.0 — shrink only
+            let floor_align = |x: f64| align.max(((x / align as f64).floor() as usize) * align);
+            target_w = floor_align(target_w as f64 * beta);
+            target_h = floor_align(target_h as f64 * beta);
+        }
+    }
+
     debug_assert_eq!(target_w % cfg.patch_size, 0);
     debug_assert_eq!(target_h % cfg.patch_size, 0);
 
@@ -421,6 +454,49 @@ mod tests {
         // Cap of 0 is treated as "no cap".
         let zero_cap = preprocess_image_with_opts(&bytes, &cfg, Some(0)).expect("zero cap");
         assert_eq!((zero_cap.target_w, zero_cap.target_h), (800, 400));
+    }
+
+    /// The cap takes precedence over `image_min_pixels` and shrinks the
+    /// target *below* the model's floor without any upscale-back — the
+    /// regression guard for the old cascaded downscale→upscale bug.
+    #[test]
+    fn preprocess_max_long_size_takes_precedence_over_min_pixels() {
+        let cfg = VisionEncoderConfig {
+            // align = 16 · 2 = 32 (a realistic LFM2-VL grid).
+            patch_size: 16,
+            scale_factor: 2,
+            // Real LFM2-VL band: 256² floor, 512² ceiling.
+            image_min_pixels: 65_536,
+            image_max_pixels: 262_144,
+            ..synth_cfg()
+        };
+        // 256×256 sits exactly on the min_pixels floor → uncapped is a
+        // pass-through at 256×256.
+        let img = ImageBuffer::<Rgb<u8>, _>::from_fn(256, 256, |_, _| Rgb([200u8, 100, 50]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode test png");
+
+        let uncapped = preprocess_image_with_opts(&bytes, &cfg, None).expect("uncapped");
+        assert_eq!((uncapped.target_w, uncapped.target_h), (256, 256));
+
+        // Cap=128 forces the target to 128×128 (= 16384 px, *below* the
+        // 65536 min_pixels floor). The old impl pre-resized to 128 then
+        // let the min_pixels branch upscale it back to 256; the fixed
+        // impl shrinks the target and resizes once, so it must stay at
+        // 128×128 and below the floor.
+        let capped = preprocess_image_with_opts(&bytes, &cfg, Some(128)).expect("capped");
+        assert_eq!((capped.target_w, capped.target_h), (128, 128));
+        assert!(
+            capped.target_w * capped.target_h < cfg.image_min_pixels,
+            "cap must take precedence over min_pixels (no upscale-back); got {}×{}",
+            capped.target_w,
+            capped.target_h,
+        );
     }
 
     /// Resize path: small JPEG (8×8) → resized to 4×4 (the

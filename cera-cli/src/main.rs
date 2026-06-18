@@ -297,6 +297,15 @@ enum Command {
         )]
         image: Vec<String>,
 
+        /// Cap the longest side (in pixels) of each `--image` input's
+        /// *encoded* resolution. Smaller = fewer image tokens, faster
+        /// prefill, less detail; larger (or unset) = full model
+        /// resolution. The cap only shrinks and takes precedence over
+        /// the model's minimum-resolution floor. Applies to every image
+        /// in the turn via `Session::set_image_max_long_size`.
+        #[arg(long, value_name = "PIXELS")]
+        max_long_size: Option<u32>,
+
         /// Output WAV file for generated audio.
         #[arg(long)]
         audio_out: Option<String>,
@@ -1403,6 +1412,7 @@ fn main() -> Result<()> {
             vocoder,
             audio_in,
             image,
+            max_long_size,
             audio_out,
             system,
             audio_temperature,
@@ -1507,6 +1517,9 @@ fn main() -> Result<()> {
                     n_keep,
                     ..Default::default()
                 });
+                // Honored by `append_chat_with_images` below (and any
+                // later append) — bounds each image's encoded long side.
+                session.set_image_max_long_size(max_long_size);
 
                 // Build messages: optional system turn (single text
                 // item) + a user turn with N image items followed by
