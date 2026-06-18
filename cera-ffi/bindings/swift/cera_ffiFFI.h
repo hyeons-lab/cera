@@ -486,6 +486,11 @@ void uniffi_cera_ffi_fn_free_session(uint64_t handle, RustCallStatus *_Nonnull o
 void uniffi_cera_ffi_fn_method_session_append_audio(uint64_t ptr, RustBuffer samples, uint32_t sample_rate, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_APPEND_IMAGE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_APPEND_IMAGE
+void uniffi_cera_ffi_fn_method_session_append_image(uint64_t ptr, RustBuffer bytes, RustBuffer max_long_size, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_APPEND_TEXT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_APPEND_TEXT
 void uniffi_cera_ffi_fn_method_session_append_text(uint64_t ptr, RustBuffer text, RustCallStatus *_Nonnull out_status
@@ -539,6 +544,11 @@ uint32_t uniffi_cera_ffi_fn_method_session_position(uint64_t ptr, RustCallStatus
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_RESET
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_RESET
 void uniffi_cera_ffi_fn_method_session_reset(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_SET_IMAGE_MAX_LONG_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_SET_IMAGE_MAX_LONG_SIZE
+void uniffi_cera_ffi_fn_method_session_set_image_max_long_size(uint64_t ptr, RustBuffer max_long_size, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CERA_FFI_VERSION
@@ -957,6 +967,12 @@ uint16_t uniffi_cera_ffi_checksum_method_session_append_audio(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_APPEND_IMAGE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_APPEND_IMAGE
+uint16_t uniffi_cera_ffi_checksum_method_session_append_image(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_APPEND_TEXT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_APPEND_TEXT
 uint16_t uniffi_cera_ffi_checksum_method_session_append_text(void
@@ -1020,6 +1036,12 @@ uint16_t uniffi_cera_ffi_checksum_method_session_position(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_RESET
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_RESET
 uint16_t uniffi_cera_ffi_checksum_method_session_reset(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_SET_IMAGE_MAX_LONG_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_SET_IMAGE_MAX_LONG_SIZE
+uint16_t uniffi_cera_ffi_checksum_method_session_set_image_max_long_size(void
     
 );
 #endif

@@ -802,10 +802,20 @@ do {
   carry whatever tokens decoded before the throw, but the session
   is left in a partial state — call `reset()` (or `clearCancel()`
   if you want to keep the partial KV) before the next `generate`.
-- **`appendImage` doesn't exist** in the FFI surface yet —
-  `cera::Session::append_image` is a stub that always returns
-  `UnsupportedModality`. The FFI shape will land alongside real
-  VL support core-side.
+- **`appendImage(bytes, maxLongSize)`** appends an encoded image
+  (PNG / JPEG) to the context for VL bundles, mirroring
+  `appendAudio`. `CeraEngine.newSession` auto-attaches the vision
+  mmproj encoder, so no separate load call is needed. The optional
+  per-call `maxLongSize` caps the longest side of the *encoded* image
+  (aspect-preserving): smaller = fewer image tokens, faster, less
+  detail. It only shrinks (never upscales) and takes precedence over
+  the model's minimum-resolution floor; `null` applies no cap for that
+  call. Returns `UnsupportedModality` on a non-VL model and `Backend`
+  on a decode / encoder mismatch. The ViT encode runs on CPU.
+- **`setImageMaxLongSize(maxLongSize)`** sets a session-default cap
+  honored by *every* image-append path (including chat-template flows),
+  so a host can configure the image-encode budget once instead of per
+  call. `appendImage`'s explicit argument overrides it for that call.
 
 ## Design notes
 

@@ -1185,6 +1185,87 @@ impl Session {
         Ok(())
     }
 
+    /// Append an encoded image (PNG / JPEG bytes, auto-detected) to the
+    /// context. The image is decoded, resized, normalized, and run
+    /// through the bundle's vision mmproj (`VisionEncoderWeights`), then
+    /// prefilled into the LLM as soft tokens — see
+    /// [`cera::Session::append_image`] for the underlying flow.
+    ///
+    /// `CeraEngine::new_session` auto-attaches the vision encoder when
+    /// the loaded bundle's `inference_type` is a VL type with
+    /// `multimodal_projector` set in the manifest, so FFI consumers
+    /// don't need a separate "load encoder" call. Bundles whose
+    /// manifest omits the mmproj end up with no encoder attached (no
+    /// log); bundles where it's named but fails to open/parse log a
+    /// `tracing::warn!` at `CeraEngine` construction. Both surface here
+    /// as a "no vision encoder attached" `Backend` error.
+    ///
+    /// `max_long_size` controls the per-call cap on the longest side of
+    /// the *encoded* image, with three cases distinguished so the
+    /// session default stays reachable through FFI:
+    /// - `None` — defer to the session default set via
+    ///   [`Self::set_image_max_long_size`] (no cap if none was set).
+    /// - `Some(0)` — explicitly force *no cap* for this call, ignoring
+    ///   the session default.
+    /// - `Some(n)` (`n > 0`) — cap this call at `n`, overriding the
+    ///   session default.
+    ///
+    /// When a cap applies, the resize target is shrunk
+    /// (aspect-preserving) so its longer side is at most `n` pixels,
+    /// floored at one aligned patch block (so a very small `n` can still
+    /// round up to that minimum) — a quality/cost knob (smaller = fewer
+    /// image tokens, faster, less detail). It only shrinks (never
+    /// upscales) and takes precedence over the model's
+    /// minimum-resolution floor. The cap bounds the *encode*, not the
+    /// *decode* (a huge source image is still decoded, bounded by
+    /// internal limits).
+    ///
+    /// **Placement matters.** Prefer driving multimodal turns through
+    /// the chat template; calling this at the wrong stream position
+    /// (outside the model's image-marker envelope) leaves the LLM
+    /// unable to interpret the embeddings as visual content. See
+    /// [`cera::Session::append_image`] for the marker recipe.
+    ///
+    /// Errors (capability is checked before emptiness, matching core):
+    /// - `UnsupportedModality` if the loaded model's
+    ///   [`ModalityCapabilities::image_in`] is `false`.
+    /// - `EmptyInput` when `bytes` is empty (on a VL session).
+    /// - `Backend(...)` for image decode failure, missing vision
+    ///   encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
+    ///   mismatch.
+    /// - `ContextOverflow` / `Cancelled` propagate from the
+    ///   underlying prefill.
+    pub fn append_image(&self, bytes: Vec<u8>, max_long_size: Option<u32>) -> Result<(), FfiError> {
+        // Delegate to the core methods (rather than always calling
+        // `append_image_with_opts`) so the session default stays
+        // reachable through FFI and core's capability-before-empty error
+        // precedence is preserved: `None` -> session default, `Some(0)`
+        // -> force no cap, `Some(n)` -> cap at `n`. The empty-bytes guard
+        // lives in core (`preprocess_image_with_opts`), which runs after
+        // the capability check, so a non-VL session still reports
+        // `UnsupportedModality` rather than `EmptyInput` for empty input.
+        let mut inner = self.lock_inner()?;
+        match max_long_size {
+            None => inner.append_image(&bytes),
+            Some(0) => inner.append_image_with_opts(&bytes, None),
+            Some(n) => inner.append_image_with_opts(&bytes, Some(n)),
+        }?;
+        Ok(())
+    }
+
+    /// Set a session-default cap on the longest side of an appended
+    /// image, in pixels (`None` = no cap). Unlike the per-call
+    /// `max_long_size` argument to [`Self::append_image`], this default
+    /// is honored by every image-append path the session drives —
+    /// including chat-template flows — so a host can configure the
+    /// image-encode budget once. See [`Self::append_image`] for the cap
+    /// semantics (shrinks the encoded target, never upscales, takes
+    /// precedence over the model's minimum-resolution floor).
+    pub fn set_image_max_long_size(&self, max_long_size: Option<u32>) -> Result<(), FfiError> {
+        self.lock_inner()?.set_image_max_long_size(max_long_size);
+        Ok(())
+    }
+
     /// Run autoregressive decode and return all emitted tokens +
     /// a summary. Synchronous — the call blocks until the decode
     /// loop exits (`max_tokens`, EOS, `cancel()`, or error).

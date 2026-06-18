@@ -117,6 +117,15 @@ pub fn calc_size_preserved_ratio(
     (w_bar, h_bar)
 }
 
+/// Hard cap on a decoded image's width / height, applied as an
+/// `image::Limits` dimension bound so a malformed or hostile file that
+/// declares enormous dimensions is rejected before its pixel buffer is
+/// allocated. 16384 px per side comfortably covers real photographs
+/// while bounding the worst case; the `image` crate's default 512 MiB
+/// `max_alloc` is the secondary backstop. See the decode site in
+/// [`preprocess_image_with_opts`].
+const MAX_DECODE_DIM: u32 = 16_384;
+
 /// Decode + dynamic-resolution resize + normalize an image into a
 /// [`PreprocessedImage`] the encoder consumes. `bytes` may be PNG
 /// or JPEG (auto-detected via `image::guess_format`); other
@@ -126,24 +135,91 @@ pub fn preprocess_image(
     bytes: &[u8],
     cfg: &VisionEncoderConfig,
 ) -> Result<PreprocessedImage, CeraError> {
+    preprocess_image_with_opts(bytes, cfg, None)
+}
+
+/// Like [`preprocess_image`], but with an optional caller-supplied
+/// cap (`max_long_size`) on the longest side of the **encoded** image.
+///
+/// When `Some(n)`, the resize target chosen by
+/// [`calc_size_preserved_ratio`] is shrunk (aspect-preserving,
+/// re-aligned to `patch_size · scale_factor`) so its longer side is at
+/// most `n` pixels — **except** that each dimension is floored at one
+/// aligned block (`patch_size · scale_factor`), so when
+/// `n < patch_size · scale_factor` the encoded long side rounds up to
+/// that minimum rather than going below it. The image is then resampled
+/// **once**, straight from its native dimensions to that target — there
+/// is no cascaded downscale-then-upscale. The cap only ever *shrinks*
+/// the target (the `long > cap` guard never upscales) and **takes
+/// precedence over `cfg.image_min_pixels`**: a small `n` is an explicit
+/// request to trade detail for cost, clamped only at one aligned patch
+/// block.
+/// `None` (or `0`, or a target already within the cap) behaves
+/// identically to [`preprocess_image`].
+///
+/// `max_long_size` caps the encoded resolution, not the *decode*: a
+/// huge source image is still fully decoded (bounded by the
+/// dimension/alloc limits applied below) before the target shrink, so
+/// the cap is a quality/encode-cost knob, not a decode-memory bound.
+pub fn preprocess_image_with_opts(
+    bytes: &[u8],
+    cfg: &VisionEncoderConfig,
+    max_long_size: Option<u32>,
+) -> Result<PreprocessedImage, CeraError> {
     if bytes.is_empty() {
         return Err(CeraError::EmptyInput);
     }
 
-    let img = image::load_from_memory(bytes)
+    // Decode with explicit dimension limits. `bytes` may come from
+    // untrusted callers (the FFI `appendImage` surface is reachable
+    // from Kotlin/Swift/Flutter), so bound the declared dimensions to
+    // reject decompression bombs before the full pixel buffer is
+    // allocated. `max_long_size` is applied post-decode (it caps the
+    // encode target, not the decode), so it cannot bound this — the
+    // dimension limit must. The `image` crate's default `max_alloc`
+    // (512 MiB) still applies on top as a secondary backstop.
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| CeraError::Backend(format!("image format detection failed: {e}")))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_DIM);
+    limits.max_image_height = Some(MAX_DECODE_DIM);
+    reader.limits(limits);
+    let img = reader
+        .decode()
         .map_err(|e| CeraError::Backend(format!("image decode failed: {e}")))?;
 
-    // Pick the resize target via llama.cpp's algorithm. align_size
-    // = patch_size · scale_factor guarantees both grid_w and
-    // grid_h are even and the 2× pixel-shuffle works out.
+    // Pick the resize target via llama.cpp's algorithm from the NATIVE
+    // decoded dims. align_size = patch_size · scale_factor guarantees
+    // both grid_w and grid_h are even and the 2× pixel-shuffle works
+    // out.
     let align = cfg.patch_size * cfg.scale_factor;
-    let (target_w, target_h) = calc_size_preserved_ratio(
+    let (mut target_w, mut target_h) = calc_size_preserved_ratio(
         img.width() as usize,
         img.height() as usize,
         align,
         cfg.image_min_pixels,
         cfg.image_max_pixels,
     );
+
+    // Optional caller cap on the longest side of the encoded target.
+    // Applied to the TARGET (not a pre-resize of the input) so the
+    // single `resize_exact` below goes straight from native dims to the
+    // final target — one resample, no cascaded downscale-then-upscale.
+    // Shrinks only (`long > cap`), preserves aspect, re-aligns by
+    // flooring, and clamps to at least one aligned block so the patch
+    // grid stays valid. Deliberately takes precedence over
+    // `image_min_pixels` (the caller is trading detail for cost).
+    if let Some(cap) = max_long_size.filter(|&c| c > 0).map(|c| c as usize) {
+        let long = target_w.max(target_h);
+        if long > cap {
+            let beta = cap as f64 / long as f64; // < 1.0 — shrink only
+            let floor_align = |x: f64| align.max(((x / align as f64).floor() as usize) * align);
+            target_w = floor_align(target_w as f64 * beta);
+            target_h = floor_align(target_h as f64 * beta);
+        }
+    }
+
     debug_assert_eq!(target_w % cfg.patch_size, 0);
     debug_assert_eq!(target_h % cfg.patch_size, 0);
 
@@ -338,6 +414,93 @@ mod tests {
             Err(CeraError::EmptyInput) => {}
             other => panic!("expected EmptyInput, got {other:?}"),
         }
+    }
+
+    /// `max_long_size` cap downscales a large input before the model
+    /// clamp, while `None` leaves it at native resolution. Uses a wide
+    /// pixel band so the cap (not `image_max_pixels`) is what binds.
+    #[test]
+    fn preprocess_max_long_size_caps_long_side() {
+        let cfg = VisionEncoderConfig {
+            // align = patch_size · scale_factor = 2, so targets stay
+            // multiples of 2 and the assertions below are exact.
+            patch_size: 2,
+            scale_factor: 1,
+            // Wide band: an 800×400 image (320k px) sits inside it, so
+            // without a cap the model resize is a pass-through and the
+            // cap is the only thing that can change the output size.
+            image_min_pixels: 4,
+            image_max_pixels: 1_000_000,
+            ..synth_cfg()
+        };
+        // 800×400 solid image (2:1 aspect).
+        let img = ImageBuffer::<Rgb<u8>, _>::from_fn(800, 400, |_, _| Rgb([128u8, 64, 32]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode test png");
+
+        // No cap → native 800×400 (within band, multiple of 2).
+        let uncapped = preprocess_image_with_opts(&bytes, &cfg, None).expect("uncapped");
+        assert_eq!((uncapped.target_w, uncapped.target_h), (800, 400));
+
+        // Cap=100 → long side downscaled to 100, aspect preserved → 100×50.
+        let capped = preprocess_image_with_opts(&bytes, &cfg, Some(100)).expect("capped");
+        assert_eq!((capped.target_w, capped.target_h), (100, 50));
+
+        // A cap larger than the image is a no-op (no upscale here).
+        let big_cap = preprocess_image_with_opts(&bytes, &cfg, Some(4000)).expect("big cap");
+        assert_eq!((big_cap.target_w, big_cap.target_h), (800, 400));
+
+        // Cap of 0 is treated as "no cap".
+        let zero_cap = preprocess_image_with_opts(&bytes, &cfg, Some(0)).expect("zero cap");
+        assert_eq!((zero_cap.target_w, zero_cap.target_h), (800, 400));
+    }
+
+    /// The cap takes precedence over `image_min_pixels` and shrinks the
+    /// target *below* the model's floor without any upscale-back — the
+    /// regression guard for the old cascaded downscale→upscale bug.
+    #[test]
+    fn preprocess_max_long_size_takes_precedence_over_min_pixels() {
+        let cfg = VisionEncoderConfig {
+            // align = 16 · 2 = 32 (a realistic LFM2-VL grid).
+            patch_size: 16,
+            scale_factor: 2,
+            // Real LFM2-VL band: 256² floor, 512² ceiling.
+            image_min_pixels: 65_536,
+            image_max_pixels: 262_144,
+            ..synth_cfg()
+        };
+        // 256×256 sits exactly on the min_pixels floor → uncapped is a
+        // pass-through at 256×256.
+        let img = ImageBuffer::<Rgb<u8>, _>::from_fn(256, 256, |_, _| Rgb([200u8, 100, 50]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode test png");
+
+        let uncapped = preprocess_image_with_opts(&bytes, &cfg, None).expect("uncapped");
+        assert_eq!((uncapped.target_w, uncapped.target_h), (256, 256));
+
+        // Cap=128 forces the target to 128×128 (= 16384 px, *below* the
+        // 65536 min_pixels floor). The old impl pre-resized to 128 then
+        // let the min_pixels branch upscale it back to 256; the fixed
+        // impl shrinks the target and resizes once, so it must stay at
+        // 128×128 and below the floor.
+        let capped = preprocess_image_with_opts(&bytes, &cfg, Some(128)).expect("capped");
+        assert_eq!((capped.target_w, capped.target_h), (128, 128));
+        assert!(
+            capped.target_w * capped.target_h < cfg.image_min_pixels,
+            "cap must take precedence over min_pixels (no upscale-back); got {}×{}",
+            capped.target_w,
+            capped.target_h,
+        );
     }
 
     /// Resize path: small JPEG (8×8) → resized to 4×4 (the

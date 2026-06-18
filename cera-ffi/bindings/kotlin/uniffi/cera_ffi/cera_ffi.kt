@@ -834,85 +834,89 @@ internal object IntegrityCheckingUniffiLib {
         uniffiCheckApiChecksums(this)
     }
 
-    external fun uniffi_cera_ffi_checksum_func_cera_ffi_version(): Short
+    external fun uniffi_cera_ffi_checksum_func_cera_ffi_version(): Int
 
-    external fun uniffi_cera_ffi_checksum_func_cpu_backend_report(): Short
+    external fun uniffi_cera_ffi_checksum_func_cpu_backend_report(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_bundlerepo_cache_size(): Short
+    external fun uniffi_cera_ffi_checksum_method_bundlerepo_cache_size(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache(): Short
+    external fun uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_bundlerepo_store_dir(): Short
+    external fun uniffi_cera_ffi_checksum_method_bundlerepo_store_dir(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template(): Short
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_ceraengine_bos_token(): Short
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_bos_token(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_ceraengine_capabilities(): Short
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_capabilities(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_ceraengine_context_size(): Short
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_context_size(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens(): Short
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_ceraengine_encode_text(): Short
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_encode_text(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_ceraengine_eos_token(): Short
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_eos_token(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template(): Short
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_ceraengine_is_special_token(): Short
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_is_special_token(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_ceraengine_metadata(): Short
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_metadata(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_ceraengine_new_session(): Short
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_new_session(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_ceraengine_special_token_id(): Short
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_special_token_id(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_ceraengine_transcribe(): Short
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_transcribe(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_ceraengine_vocab_size(): Short
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_vocab_size(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress(): Short
+    external fun uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens(): Short
+    external fun uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames(): Short
+    external fun uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_modalitysink_on_done(): Short
+    external fun uniffi_cera_ffi_checksum_method_modalitysink_on_done(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_session_append_audio(): Short
+    external fun uniffi_cera_ffi_checksum_method_session_append_audio(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_session_append_text(): Short
+    external fun uniffi_cera_ffi_checksum_method_session_append_image(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_session_append_tokens(): Short
+    external fun uniffi_cera_ffi_checksum_method_session_append_text(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_session_cancel(): Short
+    external fun uniffi_cera_ffi_checksum_method_session_append_tokens(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_session_capabilities(): Short
+    external fun uniffi_cera_ffi_checksum_method_session_cancel(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_session_clear_cancel(): Short
+    external fun uniffi_cera_ffi_checksum_method_session_capabilities(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_session_generate(): Short
+    external fun uniffi_cera_ffi_checksum_method_session_clear_cancel(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_session_generate_async(): Short
+    external fun uniffi_cera_ffi_checksum_method_session_generate(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_session_generate_streaming(): Short
+    external fun uniffi_cera_ffi_checksum_method_session_generate_async(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_session_generate_streaming_async(): Short
+    external fun uniffi_cera_ffi_checksum_method_session_generate_streaming(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_session_position(): Short
+    external fun uniffi_cera_ffi_checksum_method_session_generate_streaming_async(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_session_reset(): Short
+    external fun uniffi_cera_ffi_checksum_method_session_position(): Int
 
-    external fun uniffi_cera_ffi_checksum_constructor_bundlerepo_new(): Short
+    external fun uniffi_cera_ffi_checksum_method_session_reset(): Int
 
-    external fun uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress(): Short
+    external fun uniffi_cera_ffi_checksum_method_session_set_image_max_long_size(): Int
 
-    external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id(): Short
+    external fun uniffi_cera_ffi_checksum_constructor_bundlerepo_new(): Int
 
-    external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async(): Short
+    external fun uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress(): Int
 
-    external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_path(): Short
+    external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_path(): Int
 
     external fun ffi_cera_ffi_uniffi_contract_version(): Int
 }
@@ -1143,6 +1147,13 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
+    external fun uniffi_cera_ffi_fn_method_session_append_image(
+        `ptr`: Long,
+        `bytes`: RustBuffer.ByValue,
+        `maxLongSize`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
     external fun uniffi_cera_ffi_fn_method_session_append_text(
         `ptr`: Long,
         `text`: RustBuffer.ByValue,
@@ -1204,6 +1215,12 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
+    external fun uniffi_cera_ffi_fn_method_session_set_image_max_long_size(
+        `ptr`: Long,
+        `maxLongSize`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
     external fun uniffi_cera_ffi_fn_func_cera_ffi_version(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_func_cpu_backend_report(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
@@ -1242,7 +1259,7 @@ internal object UniffiLib {
     external fun ffi_cera_ffi_rust_future_complete_u8(
         `handle`: Long,
         uniffi_out_err: UniffiRustCallStatus,
-    ): Byte
+    ): Int
 
     external fun ffi_cera_ffi_rust_future_poll_i8(
         `handle`: Long,
@@ -1272,7 +1289,7 @@ internal object UniffiLib {
     external fun ffi_cera_ffi_rust_future_complete_u16(
         `handle`: Long,
         uniffi_out_err: UniffiRustCallStatus,
-    ): Short
+    ): Int
 
     external fun ffi_cera_ffi_rust_future_poll_i16(
         `handle`: Long,
@@ -1422,124 +1439,130 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_cera_ffi_checksum_func_cera_ffi_version() != 39330.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_func_cera_ffi_version() != 39330) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_cpu_backend_report() != 61086.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_func_cpu_backend_report() != 61086) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache() != 11512.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache() != 11512) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_store_dir() != 40876.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_store_dir() != 40876) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template() != 38712.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template() != 38712) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token() != 30744.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token() != 30744) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities() != 65060.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities() != 65060) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 47091.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 47091) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens() != 27407.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens() != 27407) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text() != 52220.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text() != 52220) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_eos_token() != 21294.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_eos_token() != 21294) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template() != 63563.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template() != 63563) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_is_special_token() != 7395.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_is_special_token() != 7395) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_metadata() != 46262.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_metadata() != 46262) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 54382.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 54382) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_transcribe() != 9680.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_transcribe() != 9680) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_vocab_size() != 13487.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_vocab_size() != 13487) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens() != 50332.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens() != 50332) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() != 54889.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() != 54889) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 2908.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 2908) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 44552.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 44552) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 13190) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_tokens() != 1227.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_cancel() != 7555.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_tokens() != 1227) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_capabilities() != 8147.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_cancel() != 7555) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_clear_cancel() != 11168.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_capabilities() != 8147) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_generate() != 57005.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_clear_cancel() != 11168) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_generate_async() != 10738.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_generate() != 57005) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming() != 43707.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_generate_async() != 10738) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 57581.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming() != 43707) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_position() != 13264.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 57581) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_reset() != 48041.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_position() != 13264) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 15544.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress() != 24631.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id() != 60717.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 15544) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 61537.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress() != 24631) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 64420.toShort()) {
+    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id() != 60717) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 61537) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 64420) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1930,6 +1953,28 @@ public object FfiConverterString : FfiConverter<String, RustBuffer.ByValue> {
         val byteBuf = toUtf8(value)
         buf.putInt(byteBuf.limit())
         buf.put(byteBuf)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterByteArray : FfiConverterRustBuffer<ByteArray> {
+    override fun read(buf: ByteBuffer): ByteArray {
+        val len = buf.getInt()
+        val byteArr = ByteArray(len)
+        buf.get(byteArr)
+        return byteArr
+    }
+
+    override fun allocationSize(value: ByteArray): ULong = 4UL + value.size.toULong()
+
+    override fun write(
+        value: ByteArray,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        buf.put(value)
     }
 }
 
@@ -4057,6 +4102,63 @@ public interface SessionInterface {
     )
 
     /**
+     * Append an encoded image (PNG / JPEG bytes, auto-detected) to the
+     * context. The image is decoded, resized, normalized, and run
+     * through the bundle's vision mmproj (`VisionEncoderWeights`), then
+     * prefilled into the LLM as soft tokens — see
+     * [`cera::Session::append_image`] for the underlying flow.
+     *
+     * `CeraEngine::new_session` auto-attaches the vision encoder when
+     * the loaded bundle's `inference_type` is a VL type with
+     * `multimodal_projector` set in the manifest, so FFI consumers
+     * don't need a separate "load encoder" call. Bundles whose
+     * manifest omits the mmproj end up with no encoder attached (no
+     * log); bundles where it's named but fails to open/parse log a
+     * `tracing::warn!` at `CeraEngine` construction. Both surface here
+     * as a "no vision encoder attached" `Backend` error.
+     *
+     * `max_long_size` controls the per-call cap on the longest side of
+     * the *encoded* image, with three cases distinguished so the
+     * session default stays reachable through FFI:
+     * - `None` — defer to the session default set via
+     * [`Self::set_image_max_long_size`] (no cap if none was set).
+     * - `Some(0)` — explicitly force *no cap* for this call, ignoring
+     * the session default.
+     * - `Some(n)` (`n > 0`) — cap this call at `n`, overriding the
+     * session default.
+     *
+     * When a cap applies, the resize target is shrunk
+     * (aspect-preserving) so its longer side is at most `n` pixels,
+     * floored at one aligned patch block (so a very small `n` can still
+     * round up to that minimum) — a quality/cost knob (smaller = fewer
+     * image tokens, faster, less detail). It only shrinks (never
+     * upscales) and takes precedence over the model's
+     * minimum-resolution floor. The cap bounds the *encode*, not the
+     * *decode* (a huge source image is still decoded, bounded by
+     * internal limits).
+     *
+     * **Placement matters.** Prefer driving multimodal turns through
+     * the chat template; calling this at the wrong stream position
+     * (outside the model's image-marker envelope) leaves the LLM
+     * unable to interpret the embeddings as visual content. See
+     * [`cera::Session::append_image`] for the marker recipe.
+     *
+     * Errors (capability is checked before emptiness, matching core):
+     * - `UnsupportedModality` if the loaded model's
+     * [`ModalityCapabilities::image_in`] is `false`.
+     * - `EmptyInput` when `bytes` is empty (on a VL session).
+     * - `Backend(...)` for image decode failure, missing vision
+     * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
+     * mismatch.
+     * - `ContextOverflow` / `Cancelled` propagate from the
+     * underlying prefill.
+     */
+    fun `appendImage`(
+        `bytes`: kotlin.ByteArray,
+        `maxLongSize`: kotlin.UInt?,
+    )
+
+    /**
      * Append raw text to the context, running a prefill over just
      * the new tokens. `EmptyInput` error if `text` is empty.
      */
@@ -4226,6 +4328,18 @@ public interface SessionInterface {
      */
     fun `reset`()
 
+    /**
+     * Set a session-default cap on the longest side of an appended
+     * image, in pixels (`None` = no cap). Unlike the per-call
+     * `max_long_size` argument to [`Self::append_image`], this default
+     * is honored by every image-append path the session drives —
+     * including chat-template flows — so a host can configure the
+     * image-encode budget once. See [`Self::append_image`] for the cap
+     * semantics (shrinks the encoded target, never upscales, takes
+     * precedence over the model's minimum-resolution floor).
+     */
+    fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?)
+
     companion object
 }
 
@@ -4391,6 +4505,73 @@ open class Session :
                 it,
                 FfiConverterSequenceFloat.lower(`samples`),
                 FfiConverterUInt.lower(`sampleRate`),
+                _status,
+            )
+        }
+    }
+
+    /**
+     * Append an encoded image (PNG / JPEG bytes, auto-detected) to the
+     * context. The image is decoded, resized, normalized, and run
+     * through the bundle's vision mmproj (`VisionEncoderWeights`), then
+     * prefilled into the LLM as soft tokens — see
+     * [`cera::Session::append_image`] for the underlying flow.
+     *
+     * `CeraEngine::new_session` auto-attaches the vision encoder when
+     * the loaded bundle's `inference_type` is a VL type with
+     * `multimodal_projector` set in the manifest, so FFI consumers
+     * don't need a separate "load encoder" call. Bundles whose
+     * manifest omits the mmproj end up with no encoder attached (no
+     * log); bundles where it's named but fails to open/parse log a
+     * `tracing::warn!` at `CeraEngine` construction. Both surface here
+     * as a "no vision encoder attached" `Backend` error.
+     *
+     * `max_long_size` controls the per-call cap on the longest side of
+     * the *encoded* image, with three cases distinguished so the
+     * session default stays reachable through FFI:
+     * - `None` — defer to the session default set via
+     * [`Self::set_image_max_long_size`] (no cap if none was set).
+     * - `Some(0)` — explicitly force *no cap* for this call, ignoring
+     * the session default.
+     * - `Some(n)` (`n > 0`) — cap this call at `n`, overriding the
+     * session default.
+     *
+     * When a cap applies, the resize target is shrunk
+     * (aspect-preserving) so its longer side is at most `n` pixels,
+     * floored at one aligned patch block (so a very small `n` can still
+     * round up to that minimum) — a quality/cost knob (smaller = fewer
+     * image tokens, faster, less detail). It only shrinks (never
+     * upscales) and takes precedence over the model's
+     * minimum-resolution floor. The cap bounds the *encode*, not the
+     * *decode* (a huge source image is still decoded, bounded by
+     * internal limits).
+     *
+     * **Placement matters.** Prefer driving multimodal turns through
+     * the chat template; calling this at the wrong stream position
+     * (outside the model's image-marker envelope) leaves the LLM
+     * unable to interpret the embeddings as visual content. See
+     * [`cera::Session::append_image`] for the marker recipe.
+     *
+     * Errors (capability is checked before emptiness, matching core):
+     * - `UnsupportedModality` if the loaded model's
+     * [`ModalityCapabilities::image_in`] is `false`.
+     * - `EmptyInput` when `bytes` is empty (on a VL session).
+     * - `Backend(...)` for image decode failure, missing vision
+     * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
+     * mismatch.
+     * - `ContextOverflow` / `Cancelled` propagate from the
+     * underlying prefill.
+     */
+    @Throws(FfiException::class)
+    override fun `appendImage`(
+        `bytes`: kotlin.ByteArray,
+        `maxLongSize`: kotlin.UInt?,
+    ) = callWithHandle {
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_method_session_append_image(
+                it,
+                FfiConverterByteArray.lower(`bytes`),
+                FfiConverterOptionalUInt.lower(`maxLongSize`),
                 _status,
             )
         }
@@ -4686,6 +4867,28 @@ open class Session :
             uniffiRustCallWithError(FfiException) { _status ->
                 UniffiLib.uniffi_cera_ffi_fn_method_session_reset(
                     it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Set a session-default cap on the longest side of an appended
+     * image, in pixels (`None` = no cap). Unlike the per-call
+     * `max_long_size` argument to [`Self::append_image`], this default
+     * is honored by every image-append path the session drives —
+     * including chat-template flows — so a host can configure the
+     * image-encode budget once. See [`Self::append_image`] for the cap
+     * semantics (shrinks the encoded target, never upscales, takes
+     * precedence over the model's minimum-resolution floor).
+     */
+    @Throws(FfiException::class)
+    override fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_set_image_max_long_size(
+                    it,
+                    FfiConverterOptionalUInt.lower(`maxLongSize`),
                     _status,
                 )
             }

@@ -39,8 +39,11 @@ includes the newer `mistral3`/`mistral4` layouts).
 
 **Modalities:** text-to-text is fully supported for every architecture above.
 **LFM2-Audio** (`lfm2-audio-v1`, text+audio in/out) also loads. **Vision (VL,
-image-to-text)** manifests are parsed but the loader is not wired up yet — it
-returns an error today.
+image-to-text)** is wired up end-to-end: `CeraEngine` auto-attaches the vision
+mmproj encoder for VL bundles, and `Session::append_image` (or
+`append_chat_with_images`) runs image → ViT → projector → soft-token prefill.
+Verified against LFM2.5-VL-450M; the ViT encode runs on CPU (no GPU/Metal path
+yet).
 
 ## Quick start
 

@@ -509,7 +509,11 @@ fileprivate struct FfiConverterString: FfiConverter {
             return String()
         }
         let bytes = UnsafeBufferPointer<UInt8>(start: value.data!, count: Int(value.len))
-        return String(bytes: bytes, encoding: String.Encoding.utf8)!
+        // Use Swift's native UTF-8 decoder; `String(bytes:encoding:.utf8)` goes
+        // through Foundation's NSString and silently strips a leading U+FEFF BOM.
+        // Invalid UTF-8 substitutes U+FFFD instead of trapping (unreachable
+        // given Rust's `String` invariant).
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     public static func lower(_ value: String) -> RustBuffer {
@@ -525,13 +529,32 @@ fileprivate struct FfiConverterString: FfiConverter {
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> String {
         let len: Int32 = try readInt(&buf)
-        return String(bytes: try readBytes(&buf, count: Int(len)), encoding: String.Encoding.utf8)!
+        // See `lift` above for why we avoid Foundation's NSString-backed decoder here.
+        return String(decoding: try readBytes(&buf, count: Int(len)), as: UTF8.self)
     }
 
     public static func write(_ value: String, into buf: inout [UInt8]) {
         let len = Int32(value.utf8.count)
         writeInt(&buf, len)
         writeBytes(&buf, value.utf8)
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterData: FfiConverterRustBuffer {
+    typealias SwiftType = Data
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
+        let len: Int32 = try readInt(&buf)
+        return Data(try readBytes(&buf, count: Int(len)))
+    }
+
+    public static func write(_ value: Data, into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        writeBytes(&buf, value)
     }
 }
 
@@ -1551,7 +1574,11 @@ fileprivate struct UniffiCallbackInterfaceDownloadProgressSink {
 
     // Rust stores this pointer for future callback invocations, so it must live
     // for the process lifetime (not just for the init function call).
-    static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceDownloadProgressSink> = {
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceDownloadProgressSink> = {
         let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceDownloadProgressSink>.allocate(capacity: 1)
         ptr.initialize(to: vtable)
         return UnsafePointer(ptr)
@@ -1885,7 +1912,11 @@ fileprivate struct UniffiCallbackInterfaceModalitySink {
 
     // Rust stores this pointer for future callback invocations, so it must live
     // for the process lifetime (not just for the init function call).
-    static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceModalitySink> = {
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceModalitySink> = {
         let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceModalitySink>.allocate(capacity: 1)
         ptr.initialize(to: vtable)
         return UnsafePointer(ptr)
@@ -2012,6 +2043,60 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * underlying prefill.
      */
     func appendAudio(samples: [Float], sampleRate: UInt32) throws 
+    
+    /**
+     * Append an encoded image (PNG / JPEG bytes, auto-detected) to the
+     * context. The image is decoded, resized, normalized, and run
+     * through the bundle's vision mmproj (`VisionEncoderWeights`), then
+     * prefilled into the LLM as soft tokens — see
+     * [`cera::Session::append_image`] for the underlying flow.
+     *
+     * `CeraEngine::new_session` auto-attaches the vision encoder when
+     * the loaded bundle's `inference_type` is a VL type with
+     * `multimodal_projector` set in the manifest, so FFI consumers
+     * don't need a separate "load encoder" call. Bundles whose
+     * manifest omits the mmproj end up with no encoder attached (no
+     * log); bundles where it's named but fails to open/parse log a
+     * `tracing::warn!` at `CeraEngine` construction. Both surface here
+     * as a "no vision encoder attached" `Backend` error.
+     *
+     * `max_long_size` controls the per-call cap on the longest side of
+     * the *encoded* image, with three cases distinguished so the
+     * session default stays reachable through FFI:
+     * - `None` — defer to the session default set via
+     * [`Self::set_image_max_long_size`] (no cap if none was set).
+     * - `Some(0)` — explicitly force *no cap* for this call, ignoring
+     * the session default.
+     * - `Some(n)` (`n > 0`) — cap this call at `n`, overriding the
+     * session default.
+     *
+     * When a cap applies, the resize target is shrunk
+     * (aspect-preserving) so its longer side is at most `n` pixels,
+     * floored at one aligned patch block (so a very small `n` can still
+     * round up to that minimum) — a quality/cost knob (smaller = fewer
+     * image tokens, faster, less detail). It only shrinks (never
+     * upscales) and takes precedence over the model's
+     * minimum-resolution floor. The cap bounds the *encode*, not the
+     * *decode* (a huge source image is still decoded, bounded by
+     * internal limits).
+     *
+     * **Placement matters.** Prefer driving multimodal turns through
+     * the chat template; calling this at the wrong stream position
+     * (outside the model's image-marker envelope) leaves the LLM
+     * unable to interpret the embeddings as visual content. See
+     * [`cera::Session::append_image`] for the marker recipe.
+     *
+     * Errors (capability is checked before emptiness, matching core):
+     * - `UnsupportedModality` if the loaded model's
+     * [`ModalityCapabilities::image_in`] is `false`.
+     * - `EmptyInput` when `bytes` is empty (on a VL session).
+     * - `Backend(...)` for image decode failure, missing vision
+     * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
+     * mismatch.
+     * - `ContextOverflow` / `Cancelled` propagate from the
+     * underlying prefill.
+     */
+    func appendImage(bytes: Data, maxLongSize: UInt32?) throws 
     
     /**
      * Append raw text to the context, running a prefill over just
@@ -2177,6 +2262,18 @@ public protocol SessionProtocol: AnyObject, Sendable {
      */
     func reset() throws 
     
+    /**
+     * Set a session-default cap on the longest side of an appended
+     * image, in pixels (`None` = no cap). Unlike the per-call
+     * `max_long_size` argument to [`Self::append_image`], this default
+     * is honored by every image-append path the session drives —
+     * including chat-template flows — so a host can configure the
+     * image-encode budget once. See [`Self::append_image`] for the cap
+     * semantics (shrinks the encoded target, never upscales, takes
+     * precedence over the model's minimum-resolution floor).
+     */
+    func setImageMaxLongSize(maxLongSize: UInt32?) throws 
+    
 }
 /**
  * Stateful inference handle. Wraps [`cera::Session`] behind a
@@ -2289,6 +2386,67 @@ open func appendAudio(samples: [Float], sampleRate: UInt32)throws   {try rustCal
             self.uniffiCloneHandle(),
         FfiConverterSequenceFloat.lower(samples),
         FfiConverterUInt32.lower(sampleRate),$0
+    )
+}
+}
+    
+    /**
+     * Append an encoded image (PNG / JPEG bytes, auto-detected) to the
+     * context. The image is decoded, resized, normalized, and run
+     * through the bundle's vision mmproj (`VisionEncoderWeights`), then
+     * prefilled into the LLM as soft tokens — see
+     * [`cera::Session::append_image`] for the underlying flow.
+     *
+     * `CeraEngine::new_session` auto-attaches the vision encoder when
+     * the loaded bundle's `inference_type` is a VL type with
+     * `multimodal_projector` set in the manifest, so FFI consumers
+     * don't need a separate "load encoder" call. Bundles whose
+     * manifest omits the mmproj end up with no encoder attached (no
+     * log); bundles where it's named but fails to open/parse log a
+     * `tracing::warn!` at `CeraEngine` construction. Both surface here
+     * as a "no vision encoder attached" `Backend` error.
+     *
+     * `max_long_size` controls the per-call cap on the longest side of
+     * the *encoded* image, with three cases distinguished so the
+     * session default stays reachable through FFI:
+     * - `None` — defer to the session default set via
+     * [`Self::set_image_max_long_size`] (no cap if none was set).
+     * - `Some(0)` — explicitly force *no cap* for this call, ignoring
+     * the session default.
+     * - `Some(n)` (`n > 0`) — cap this call at `n`, overriding the
+     * session default.
+     *
+     * When a cap applies, the resize target is shrunk
+     * (aspect-preserving) so its longer side is at most `n` pixels,
+     * floored at one aligned patch block (so a very small `n` can still
+     * round up to that minimum) — a quality/cost knob (smaller = fewer
+     * image tokens, faster, less detail). It only shrinks (never
+     * upscales) and takes precedence over the model's
+     * minimum-resolution floor. The cap bounds the *encode*, not the
+     * *decode* (a huge source image is still decoded, bounded by
+     * internal limits).
+     *
+     * **Placement matters.** Prefer driving multimodal turns through
+     * the chat template; calling this at the wrong stream position
+     * (outside the model's image-marker envelope) leaves the LLM
+     * unable to interpret the embeddings as visual content. See
+     * [`cera::Session::append_image`] for the marker recipe.
+     *
+     * Errors (capability is checked before emptiness, matching core):
+     * - `UnsupportedModality` if the loaded model's
+     * [`ModalityCapabilities::image_in`] is `false`.
+     * - `EmptyInput` when `bytes` is empty (on a VL session).
+     * - `Backend(...)` for image decode failure, missing vision
+     * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
+     * mismatch.
+     * - `ContextOverflow` / `Cancelled` propagate from the
+     * underlying prefill.
+     */
+open func appendImage(bytes: Data, maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_append_image(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(bytes),
+        FfiConverterOptionUInt32.lower(maxLongSize),$0
     )
 }
 }
@@ -2537,6 +2695,24 @@ open func position() -> UInt32  {
 open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_reset(
             self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Set a session-default cap on the longest side of an appended
+     * image, in pixels (`None` = no cap). Unlike the per-call
+     * `max_long_size` argument to [`Self::append_image`], this default
+     * is honored by every image-append path the session drives —
+     * including chat-template flows — so a host can configure the
+     * image-encode budget once. See [`Self::append_image`] for the cap
+     * semantics (shrinks the encoded target, never upscales, takes
+     * precedence over the model's minimum-resolution floor).
+     */
+open func setImageMaxLongSize(maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_set_image_max_long_size(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionUInt32.lower(maxLongSize),$0
     )
 }
 }
@@ -4092,6 +4268,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_append_audio() != 44552) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_session_append_image() != 13190) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4123,6 +4302,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 15544) {

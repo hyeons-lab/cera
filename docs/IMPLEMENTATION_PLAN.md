@@ -48,7 +48,7 @@ Metal forward passes currently support **LFM2 only**; Qwen runs on CPU.
 | V2.13 Python (PyO3) bindings | ⬜ | |
 | V2.14 Kotlin Multiplatform bindings | ✅ | `cera-ffi-kotlin` (android + jvm) |
 | V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync + async generate, sync + async streaming, `withProgress` all verified; only `fromBundleIdAsync` stubbed |
-| V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core shipped, CPU-only encode |
+| V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core + FFI shipped, CPU-only encode, no slicing |
 | V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
 | V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync engine API verified end-to-end; streaming/async stubbed |
 
@@ -474,10 +474,22 @@ Image → text via a CLIP-family ViT encoder with a 2-layer MLP projector
 - Soft-token prefill into the LLM via `Session::append_chat_with_images`;
   CLI `cera run --image <path|url> [--image ...] [--prompt "…"]`, multi-image
   supported. `--prompt` is optional in image mode (image-only inputs are allowed).
+- **FFI exposure:** `cera-ffi` `Session.appendImage(bytes, maxLongSize)` exposes
+  vision to Kotlin/Swift/Flutter. `maxLongSize` caps the longest side of the
+  *encoded* image (shrinks the resize target in a single resample, takes
+  precedence over `image_min_pixels`) — a quality/cost knob. Reachable through
+  every append path (including `append_chat_with_images` and the CLI) via the
+  session-default `Session::set_image_max_long_size` / `--max-long-size`; the
+  per-call `append_image_with_opts(bytes, max_long_size)` overrides it.
 
 Remaining:
 - CPU-only encode path — no wgpu/Metal acceleration for the ViT yet.
+- No image slicing/tiling — high-res input is downscaled to a single tile, so
+  `maxLongSize` lowers cost/resolution but can't raise effective resolution
+  above the single-tile budget (≈512²). Slicing is the high-res path.
 - Single projector family (`LFM2`); other VL projector types not mapped.
+- wasm: `cera-wasm` builds with `cera` default features off (no `image` crate),
+  so image input is intentionally not exposed there (binary-size choice).
 
 ### V2.16: Audio + TTS (LFM2-Audio) — ✅ core shipped
 Full duplex: PCM in (ASR / audio understanding) and PCM out (speech

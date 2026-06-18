@@ -338,6 +338,14 @@ pub struct Session {
     /// before [`Self::append_image`] is called. Held by `Arc`
     /// for the same reason as `audio_encoder`.
     vision_encoder: Option<Arc<crate::model::vision_encoder::VisionEncoderWeights>>,
+    /// Session-default cap on the longest side of an appended image
+    /// (in pixels), honored by every image-append path — including
+    /// [`Self::append_chat_with_images`]. `None` = no cap (native
+    /// resolution within the model's pixel budget). Set via
+    /// [`Self::set_image_max_long_size`]; [`Self::append_image_with_opts`]
+    /// takes an explicit per-call override. Preserved across
+    /// [`Self::reset`] — it's a preprocessing preference, not KV state.
+    image_max_long_size: Option<u32>,
     /// Cached grammar logit-mask (per-token output bytes + EOS/special flags). Built
     /// lazily on the first grammar-constrained `generate` and reused across calls — it
     /// depends only on the tokenizer, not on the grammar. Taken into a local for the
@@ -436,6 +444,7 @@ impl Session {
             config,
             audio_encoder: None,
             vision_encoder: None,
+            image_max_long_size: None,
             grammar_mask: None,
         }
     }
@@ -472,6 +481,18 @@ impl Session {
         encoder: Arc<crate::model::vision_encoder::VisionEncoderWeights>,
     ) {
         self.vision_encoder = Some(encoder);
+    }
+
+    /// Set the session-default cap on the longest side of an appended
+    /// image, in pixels (`None` = no cap). Every image-append path
+    /// honors it — including [`Self::append_chat_with_images`], the
+    /// recommended multimodal path — so callers can bound image-encode
+    /// cost once instead of per call. [`Self::append_image_with_opts`]
+    /// takes an explicit per-call override. See that method for the
+    /// cap semantics (shrinks the encoded target, never upscales,
+    /// takes precedence over the model's `image_min_pixels` floor).
+    pub fn set_image_max_long_size(&mut self, max_long_size: Option<u32>) {
+        self.image_max_long_size = max_long_size;
     }
 
     /// What this session accepts as input / emits as output. Derived
@@ -931,11 +952,39 @@ impl Session {
     ///    (mismatched mmproj loaded against a different LLM).
     /// 6. [`CeraError::ContextOverflow`] / [`CeraError::Cancelled`]
     ///    propagated from [`Self::append_embeddings`].
-    #[cfg(feature = "vl-preprocess")]
     pub fn append_image(&mut self, bytes: &[u8]) -> Result<(), CeraError> {
-        if bytes.is_empty() {
-            return Err(CeraError::EmptyInput);
-        }
+        self.append_image_with_opts(bytes, self.image_max_long_size)
+    }
+
+    /// Like [`Self::append_image`], but with an explicit per-call cap
+    /// (`max_long_size`) on the longest side of the **encoded** image,
+    /// overriding the session default ([`Self::set_image_max_long_size`]).
+    ///
+    /// When `Some(n)`, the resize target is shrunk (aspect-preserving,
+    /// re-aligned) so its longer side is at most `n` pixels — a
+    /// caller-controlled quality/cost knob (smaller = fewer image
+    /// tokens, faster, less detail). Each dimension is floored at one
+    /// aligned patch block (`patch_size · scale_factor`), so a very
+    /// small `n` rounds the encoded long side up to that minimum rather
+    /// than below it. The cap only ever *shrinks* the target (it never
+    /// upscales) and **takes precedence over the model's
+    /// `image_min_pixels` floor** — passing a small `n` is an explicit
+    /// request to trade detail for cost, down to one aligned patch
+    /// block. `None` (or `0`) applies no cap. See
+    /// [`crate::model::vision_preprocessor::preprocess_image_with_opts`].
+    ///
+    /// Errors are identical to [`Self::append_image`].
+    #[cfg(feature = "vl-preprocess")]
+    pub fn append_image_with_opts(
+        &mut self,
+        bytes: &[u8],
+        max_long_size: Option<u32>,
+    ) -> Result<(), CeraError> {
+        // No empty-bytes check here: an empty input is caught by
+        // `preprocess_image_with_opts` below (which returns
+        // `EmptyInput`), so a third copy of the guard would be
+        // redundant. The capability/encoder checks run first so a
+        // non-VL session still reports `UnsupportedModality`.
         if !self.capabilities.image_in {
             return Err(CeraError::UnsupportedModality);
         }
@@ -957,7 +1006,11 @@ impl Session {
                  The mmproj must pair with the LLM it was trained against."
             )));
         }
-        let pre = crate::model::vision_preprocessor::preprocess_image(bytes, &encoder.config)?;
+        let pre = crate::model::vision_preprocessor::preprocess_image_with_opts(
+            bytes,
+            &encoder.config,
+            max_long_size,
+        )?;
         let img_tokens = encoder
             .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
             .map_err(|e| CeraError::Backend(format!("encode_image: {e:#}")))?;
@@ -984,11 +1037,17 @@ impl Session {
         self.append_embeddings(&img_tokens, n_tokens)
     }
 
-    /// Stub `append_image` for builds without `vl-preprocess`. Same
-    /// signature so wasm / embedded code that conditionally calls
-    /// it still type-checks; always returns `UnsupportedModality`.
+    /// Stub `append_image_with_opts` for builds without `vl-preprocess`.
+    /// Same signature as the real method so conditionally-compiled
+    /// callers (FFI / wasm) still type-check; always returns
+    /// `UnsupportedModality`. (`append_image` delegates here, so it
+    /// needs no separate stub.)
     #[cfg(not(feature = "vl-preprocess"))]
-    pub fn append_image(&mut self, _bytes: &[u8]) -> Result<(), CeraError> {
+    pub fn append_image_with_opts(
+        &mut self,
+        _bytes: &[u8],
+        _max_long_size: Option<u32>,
+    ) -> Result<(), CeraError> {
         Err(CeraError::UnsupportedModality)
     }
 
