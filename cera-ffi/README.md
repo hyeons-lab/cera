@@ -811,7 +811,8 @@ do {
   detail. It only shrinks (never upscales) and takes precedence over
   the model's minimum-resolution floor; `null` applies no cap for that
   call. Returns `UnsupportedModality` on a non-VL model and `Backend`
-  on a decode / encoder mismatch. The ViT encode runs on CPU.
+  on a decode / encoder mismatch. The ViT encode runs on the GPU
+  (native Metal or wgpu, per the engine's backend) with a CPU fallback.
 - **`setImageMaxLongSize(maxLongSize)`** sets a session-default cap
   honored by *every* image-append path (including chat-template flows),
   so a host can configure the image-encode budget once instead of per

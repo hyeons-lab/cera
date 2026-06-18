@@ -42,8 +42,8 @@ includes the newer `mistral3`/`mistral4` layouts).
 image-to-text)** is wired up end-to-end: `CeraEngine` auto-attaches the vision
 mmproj encoder for VL bundles, and `Session::append_image` (or
 `append_chat_with_images`) runs image → ViT → projector → soft-token prefill.
-Verified against LFM2.5-VL-450M; the ViT encode runs on CPU (no GPU/Metal path
-yet).
+Verified against LFM2.5-VL-450M. The ViT encode runs on the GPU (native Metal or
+wgpu, selected by `BackendPreference`) with a CPU fallback.
 
 ## Quick start
 
