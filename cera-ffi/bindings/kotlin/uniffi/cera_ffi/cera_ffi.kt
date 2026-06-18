@@ -1511,7 +1511,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 44552) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 48956) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 13190) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
@@ -4117,16 +4117,25 @@ public interface SessionInterface {
      * `tracing::warn!` at `CeraEngine` construction. Both surface here
      * as a "no vision encoder attached" `Backend` error.
      *
-     * `max_long_size` is an explicit per-call cap on the longest side
-     * of the *encoded* image: when `Some(n)`, the resize target is
-     * shrunk (aspect-preserving) so its longer side is at most `n`
-     * pixels — a quality/cost knob (smaller = fewer image tokens,
-     * faster, less detail). It only shrinks (never upscales) and takes
-     * precedence over the model's minimum-resolution floor. `None` (or
-     * `0`) falls back to [`Self::set_image_max_long_size`] only if the
-     * caller passes it explicitly — here `None` means "no cap for this
-     * call". The cap bounds the *encode*, not the *decode* (a huge
-     * source image is still decoded, bounded by internal limits).
+     * `max_long_size` controls the per-call cap on the longest side of
+     * the *encoded* image, with three cases distinguished so the
+     * session default stays reachable through FFI:
+     * - `None` — defer to the session default set via
+     * [`Self::set_image_max_long_size`] (no cap if none was set).
+     * - `Some(0)` — explicitly force *no cap* for this call, ignoring
+     * the session default.
+     * - `Some(n)` (`n > 0`) — cap this call at `n`, overriding the
+     * session default.
+     *
+     * When a cap applies, the resize target is shrunk
+     * (aspect-preserving) so its longer side is at most `n` pixels,
+     * floored at one aligned patch block (so a very small `n` can still
+     * round up to that minimum) — a quality/cost knob (smaller = fewer
+     * image tokens, faster, less detail). It only shrinks (never
+     * upscales) and takes precedence over the model's
+     * minimum-resolution floor. The cap bounds the *encode*, not the
+     * *decode* (a huge source image is still decoded, bounded by
+     * internal limits).
      *
      * **Placement matters.** Prefer driving multimodal turns through
      * the chat template; calling this at the wrong stream position
@@ -4134,10 +4143,10 @@ public interface SessionInterface {
      * unable to interpret the embeddings as visual content. See
      * [`cera::Session::append_image`] for the marker recipe.
      *
-     * Errors:
-     * - `EmptyInput` when `bytes` is empty.
+     * Errors (capability is checked before emptiness, matching core):
      * - `UnsupportedModality` if the loaded model's
      * [`ModalityCapabilities::image_in`] is `false`.
+     * - `EmptyInput` when `bytes` is empty (on a VL session).
      * - `Backend(...)` for image decode failure, missing vision
      * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
      * mismatch.
@@ -4517,16 +4526,25 @@ open class Session :
      * `tracing::warn!` at `CeraEngine` construction. Both surface here
      * as a "no vision encoder attached" `Backend` error.
      *
-     * `max_long_size` is an explicit per-call cap on the longest side
-     * of the *encoded* image: when `Some(n)`, the resize target is
-     * shrunk (aspect-preserving) so its longer side is at most `n`
-     * pixels — a quality/cost knob (smaller = fewer image tokens,
-     * faster, less detail). It only shrinks (never upscales) and takes
-     * precedence over the model's minimum-resolution floor. `None` (or
-     * `0`) falls back to [`Self::set_image_max_long_size`] only if the
-     * caller passes it explicitly — here `None` means "no cap for this
-     * call". The cap bounds the *encode*, not the *decode* (a huge
-     * source image is still decoded, bounded by internal limits).
+     * `max_long_size` controls the per-call cap on the longest side of
+     * the *encoded* image, with three cases distinguished so the
+     * session default stays reachable through FFI:
+     * - `None` — defer to the session default set via
+     * [`Self::set_image_max_long_size`] (no cap if none was set).
+     * - `Some(0)` — explicitly force *no cap* for this call, ignoring
+     * the session default.
+     * - `Some(n)` (`n > 0`) — cap this call at `n`, overriding the
+     * session default.
+     *
+     * When a cap applies, the resize target is shrunk
+     * (aspect-preserving) so its longer side is at most `n` pixels,
+     * floored at one aligned patch block (so a very small `n` can still
+     * round up to that minimum) — a quality/cost knob (smaller = fewer
+     * image tokens, faster, less detail). It only shrinks (never
+     * upscales) and takes precedence over the model's
+     * minimum-resolution floor. The cap bounds the *encode*, not the
+     * *decode* (a huge source image is still decoded, bounded by
+     * internal limits).
      *
      * **Placement matters.** Prefer driving multimodal turns through
      * the chat template; calling this at the wrong stream position
@@ -4534,10 +4552,10 @@ open class Session :
      * unable to interpret the embeddings as visual content. See
      * [`cera::Session::append_image`] for the marker recipe.
      *
-     * Errors:
-     * - `EmptyInput` when `bytes` is empty.
+     * Errors (capability is checked before emptiness, matching core):
      * - `UnsupportedModality` if the loaded model's
      * [`ModalityCapabilities::image_in`] is `false`.
+     * - `EmptyInput` when `bytes` is empty (on a VL session).
      * - `Backend(...)` for image decode failure, missing vision
      * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
      * mismatch.
