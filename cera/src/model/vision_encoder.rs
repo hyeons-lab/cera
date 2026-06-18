@@ -874,7 +874,7 @@ fn patch_embed_compute(
 /// - 0.5)`, clamped to `[0, in_dim - 1]`. Output layout is
 /// `[out_h × out_w, n_embd]` row-major, matching the patch order
 /// `encode_image` adds against.
-fn interpolate_pos_embed_2d(
+pub(crate) fn interpolate_pos_embed_2d(
     pos: &[f32],
     in_h: usize,
     in_w: usize,
@@ -928,7 +928,7 @@ fn interpolate_pos_embed_2d(
 /// LFM2 projector convention; both grid dims must be divisible
 /// by `cfg.scale_factor` (the preprocessor's
 /// `align_size = patch_size · scale_factor` guarantees that).
-fn pixel_shuffle(
+pub(crate) fn pixel_shuffle(
     tokens: &[f32],
     cfg: &VisionEncoderConfig,
     grid_w: usize,
