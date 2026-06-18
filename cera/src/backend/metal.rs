@@ -188,6 +188,12 @@ pub mod shaders {
     pub const QK_NORM_ROPE_BATCH: &str = include_str!("shaders/qk_norm_rope_batch.metal");
     pub const CONV1D_FUSED_BATCH: &str = include_str!("shaders/conv1d_fused_batch.metal");
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.metal");
+    // Vision-encoder (ViT) kernels.
+    pub const VIT_LINEAR: &str = include_str!("shaders/vit_linear.metal");
+    pub const LAYERNORM_BATCH: &str = include_str!("shaders/layernorm_batch.metal");
+    pub const GELU: &str = include_str!("shaders/gelu.metal");
+    pub const BIAS_ADD: &str = include_str!("shaders/bias_add.metal");
+    pub const VIT_ATTENTION: &str = include_str!("shaders/vit_attention.metal");
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────

@@ -595,7 +595,186 @@ impl VitGpuOps for WgpuVitOps<'_> {
     }
 }
 
-#[cfg(all(test, feature = "gpu"))]
+// ── native Metal backend implementation ──────────────────────────────────────
+
+/// Native-Metal implementation of [`VitGpuOps`]. Mirrors [`WgpuVitOps`] using
+/// MSL kernels. Each op runs in its own command buffer and blocks on
+/// `wait_until_completed`, so `download` always sees current data (unified
+/// memory on Apple Silicon).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub struct MetalVitOps<'a> {
+    ctx: &'a crate::backend::metal::MetalContext,
+    p_linear: metal::ComputePipelineState,
+    p_bias: metal::ComputePipelineState,
+    p_layernorm: metal::ComputePipelineState,
+    p_gelu: metal::ComputePipelineState,
+    p_attn: metal::ComputePipelineState,
+    p_add: metal::ComputePipelineState,
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+impl<'a> MetalVitOps<'a> {
+    pub fn new(ctx: &'a crate::backend::metal::MetalContext) -> Result<Self> {
+        use crate::backend::metal::shaders;
+        Ok(Self {
+            p_linear: ctx.create_pipeline(shaders::VIT_LINEAR, "vit_linear")?,
+            p_bias: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add")?,
+            p_layernorm: ctx.create_pipeline(shaders::LAYERNORM_BATCH, "layernorm_batch")?,
+            p_gelu: ctx.create_pipeline(shaders::GELU, "gelu_inplace")?,
+            p_attn: ctx.create_pipeline(shaders::VIT_ATTENTION, "vit_attention")?,
+            p_add: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace")?,
+            ctx,
+        })
+    }
+
+    /// Run one kernel in its own command buffer: bind `bufs` at slots 0.. then
+    /// `params` (as bytes) at the next slot, dispatch, and block until done.
+    fn run(
+        &self,
+        pipe: &metal::ComputePipelineState,
+        bufs: &[&metal::Buffer],
+        params: &[u8],
+        grid: metal::MTLSize,
+        threads: metal::MTLSize,
+    ) {
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipe);
+        for (i, b) in bufs.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(b), 0);
+        }
+        enc.set_bytes(
+            bufs.len() as u64,
+            params.len() as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.dispatch_thread_groups(grid, threads);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+impl VitGpuOps for MetalVitOps<'_> {
+    type Buf = metal::Buffer;
+
+    fn upload(&self, data: &[f32]) -> Self::Buf {
+        self.ctx.upload_f32(data)
+    }
+
+    fn download(&self, buf: &Self::Buf, len: usize) -> Vec<f32> {
+        self.ctx.read_f32(buf, len)
+    }
+
+    fn linear(
+        &self,
+        x: &Self::Buf,
+        w: &Self::Buf,
+        tokens: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Self::Buf {
+        let y = self.ctx.create_buffer((tokens * out_dim * 4) as u64);
+        let params: [u32; 4] = [out_dim as u32, in_dim as u32, tokens as u32, 0];
+        self.run(
+            &self.p_linear,
+            &[w, x, &y],
+            bytemuck::cast_slice(&params),
+            metal::MTLSize::new(out_dim as u64, tokens as u64, 1),
+            metal::MTLSize::new(32, 1, 1),
+        );
+        y
+    }
+
+    fn bias_add(&self, x: &Self::Buf, bias: &Self::Buf, rows: usize, dim: usize) {
+        let total = (rows * dim) as u32;
+        let params: [u32; 2] = [total, dim as u32];
+        self.run(
+            &self.p_bias,
+            &[x, bias],
+            bytemuck::cast_slice(&params),
+            metal::MTLSize::new(total.div_ceil(256) as u64, 1, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+    }
+
+    fn layernorm(
+        &self,
+        src: &Self::Buf,
+        weight: &Self::Buf,
+        bias: &Self::Buf,
+        eps: f32,
+        rows: usize,
+        dim: usize,
+    ) -> Self::Buf {
+        let dst = self.ctx.create_buffer((rows * dim * 4) as u64);
+        let params: [u32; 4] = [dim as u32, eps.to_bits(), dim as u32, dim as u32];
+        self.run(
+            &self.p_layernorm,
+            &[src, &dst, weight, bias],
+            bytemuck::cast_slice(&params),
+            metal::MTLSize::new(rows as u64, 1, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+        dst
+    }
+
+    fn gelu(&self, x: &Self::Buf, len: usize) {
+        let params: [u32; 2] = [len as u32, 0];
+        self.run(
+            &self.p_gelu,
+            &[x],
+            bytemuck::cast_slice(&params),
+            metal::MTLSize::new((len as u64).div_ceil(256), 1, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+    }
+
+    fn attention(
+        &self,
+        q: &Self::Buf,
+        k: &Self::Buf,
+        v: &Self::Buf,
+        tokens: usize,
+        n_head: usize,
+        head_dim: usize,
+    ) -> Self::Buf {
+        let dim = n_head * head_dim;
+        let out = self.ctx.create_buffer((tokens * dim * 4) as u64);
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let params: [u32; 4] = [
+            tokens as u32,
+            n_head as u32,
+            head_dim as u32,
+            scale.to_bits(),
+        ];
+        self.run(
+            &self.p_attn,
+            &[q, k, v, &out],
+            bytemuck::cast_slice(&params),
+            metal::MTLSize::new(tokens as u64, n_head as u64, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+        out
+    }
+
+    fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize) {
+        let params: [u32; 2] = [len as u32, 0];
+        self.run(
+            &self.p_add,
+            &[dst, src],
+            bytemuck::cast_slice(&params),
+            metal::MTLSize::new((len as u64).div_ceil(256), 1, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+    }
+}
+
+#[cfg(all(
+    test,
+    any(feature = "gpu", all(feature = "metal", target_os = "macos"))
+))]
 mod tests {
     use super::*;
     use crate::model::vision_encoder::{PatchEmbedWeights, ProjectorWeights, VitBlockWeights};
@@ -693,16 +872,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_gpu_encode_image_parity() {
-        let ctx = match crate::backend::wgpu::GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(_) => return, // no GPU (CI)
-        };
-
+    /// Shared CPU↔GPU parity check, generic over the backend ops. Compares the
+    /// GPU forward against the CPU encoder on a synthetic 2-layer ViT with the
+    /// dynamic grid == trained grid (no pos-embed interpolation).
+    fn run_parity<O: VitGpuOps>(ops: &O) {
         let enc = synth_encoder();
         let cfg = &enc.config;
-        // Dynamic grid == trained grid (4×4) so no pos-embed interpolation.
         let grid_w = 4;
         let grid_h = 4;
         let target_w = grid_w * cfg.patch_size;
@@ -711,9 +886,8 @@ mod tests {
 
         let cpu_out = enc.encode_image(&pixels, grid_w, grid_h).unwrap();
 
-        let ops = WgpuVitOps::new(&ctx);
-        let gpu_w = GpuVitWeights::build(&ops, &enc);
-        let gpu_out = encode_image_gpu(&ops, &gpu_w, &pixels, grid_w, grid_h).unwrap();
+        let gpu_w = GpuVitWeights::build(ops, &enc);
+        let gpu_out = encode_image_gpu(ops, &gpu_w, &pixels, grid_w, grid_h).unwrap();
 
         assert_eq!(cpu_out.len(), gpu_out.len(), "output length mismatch");
         let mut max_diff = 0.0f32;
@@ -726,8 +900,28 @@ mod tests {
             );
         }
         println!(
-            "GPU ViT encode parity: max_diff={max_diff:.6}, {} values",
+            "ViT encode parity: max_diff={max_diff:.6}, {} values",
             cpu_out.len()
         );
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_gpu_encode_image_parity() {
+        let ctx = match crate::backend::wgpu::GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return, // no GPU (CI)
+        };
+        run_parity(&WgpuVitOps::new(&ctx));
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn test_metal_encode_image_parity() {
+        let ctx = match crate::backend::metal::MetalContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return, // no Metal device (CI)
+        };
+        run_parity(&MetalVitOps::new(&ctx).unwrap());
     }
 }
