@@ -933,6 +933,27 @@ impl Session {
     ///    propagated from [`Self::append_embeddings`].
     #[cfg(feature = "vl-preprocess")]
     pub fn append_image(&mut self, bytes: &[u8]) -> Result<(), CeraError> {
+        self.append_image_with_opts(bytes, None)
+    }
+
+    /// Like [`Self::append_image`], but with an optional caller-supplied
+    /// cap (`max_long_size`) on the image's longest side. When `Some(n)`
+    /// and the decoded image's longer side exceeds `n`, the image is
+    /// downscaled (high-quality Lanczos3, aspect-preserving) so its long
+    /// side equals `n` before encoding — a caller-controlled
+    /// quality/cost knob. `None` matches [`Self::append_image`] exactly.
+    ///
+    /// The model's `image_max_pixels` clamp still applies on top, so a
+    /// `max_long_size` above the encoder's pixel budget is a no-op; see
+    /// [`crate::model::vision_preprocessor::preprocess_image_with_opts`].
+    ///
+    /// Errors are identical to [`Self::append_image`].
+    #[cfg(feature = "vl-preprocess")]
+    pub fn append_image_with_opts(
+        &mut self,
+        bytes: &[u8],
+        max_long_size: Option<u32>,
+    ) -> Result<(), CeraError> {
         if bytes.is_empty() {
             return Err(CeraError::EmptyInput);
         }
@@ -957,7 +978,11 @@ impl Session {
                  The mmproj must pair with the LLM it was trained against."
             )));
         }
-        let pre = crate::model::vision_preprocessor::preprocess_image(bytes, &encoder.config)?;
+        let pre = crate::model::vision_preprocessor::preprocess_image_with_opts(
+            bytes,
+            &encoder.config,
+            max_long_size,
+        )?;
         let img_tokens = encoder
             .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
             .map_err(|e| CeraError::Backend(format!("encode_image: {e:#}")))?;
@@ -989,6 +1014,19 @@ impl Session {
     /// it still type-checks; always returns `UnsupportedModality`.
     #[cfg(not(feature = "vl-preprocess"))]
     pub fn append_image(&mut self, _bytes: &[u8]) -> Result<(), CeraError> {
+        Err(CeraError::UnsupportedModality)
+    }
+
+    /// Stub `append_image_with_opts` for builds without `vl-preprocess`.
+    /// Same signature as the real method so conditionally-compiled
+    /// callers (FFI / wasm) still type-check; always returns
+    /// `UnsupportedModality`.
+    #[cfg(not(feature = "vl-preprocess"))]
+    pub fn append_image_with_opts(
+        &mut self,
+        _bytes: &[u8],
+        _max_long_size: Option<u32>,
+    ) -> Result<(), CeraError> {
         Err(CeraError::UnsupportedModality)
     }
 

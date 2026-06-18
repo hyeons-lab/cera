@@ -48,7 +48,7 @@ Metal forward passes currently support **LFM2 only**; Qwen runs on CPU.
 | V2.13 Python (PyO3) bindings | ⬜ | |
 | V2.14 Kotlin Multiplatform bindings | ✅ | `cera-ffi-kotlin` (android + jvm) |
 | V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync + async generate, sync + async streaming, `withProgress` all verified; only `fromBundleIdAsync` stubbed |
-| V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core shipped, CPU-only encode |
+| V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core + FFI shipped, CPU-only encode, no slicing |
 | V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
 | V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync engine API verified end-to-end; streaming/async stubbed |
 
@@ -474,9 +474,15 @@ Image → text via a CLIP-family ViT encoder with a 2-layer MLP projector
 - Soft-token prefill into the LLM via `Session::append_chat_with_images`;
   CLI `cera run --image <path|url> [--image ...] [--prompt "…"]`, multi-image
   supported. `--prompt` is optional in image mode (image-only inputs are allowed).
+- **FFI exposure:** `cera-ffi` `Session.appendImage(bytes, maxLongSize)` exposes
+  vision to Kotlin/Swift/Flutter, with an optional caller-controlled long-side
+  cap (`Session::append_image_with_opts` core-side).
 
 Remaining:
 - CPU-only encode path — no wgpu/Metal acceleration for the ViT yet.
+- No image slicing/tiling — high-res input is downscaled to the encoder's
+  single-tile pixel budget (≈512²), so `maxLongSize` can only reduce cost, not
+  raise effective resolution.
 - Single projector family (`LFM2`); other VL projector types not mapped.
 
 ### V2.16: Audio + TTS (LFM2-Audio) — ✅ core shipped

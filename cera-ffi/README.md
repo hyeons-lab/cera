@@ -802,10 +802,15 @@ do {
   carry whatever tokens decoded before the throw, but the session
   is left in a partial state — call `reset()` (or `clearCancel()`
   if you want to keep the partial KV) before the next `generate`.
-- **`appendImage` doesn't exist** in the FFI surface yet —
-  `cera::Session::append_image` is a stub that always returns
-  `UnsupportedModality`. The FFI shape will land alongside real
-  VL support core-side.
+- **`appendImage(bytes, maxLongSize)`** appends an encoded image
+  (PNG / JPEG) to the context for VL bundles, mirroring
+  `appendAudio`. `CeraEngine.newSession` auto-attaches the vision
+  mmproj encoder, so no separate load call is needed. The optional
+  `maxLongSize` caps the image's longest side (high-quality
+  aspect-preserving downscale before encoding) as a quality/cost
+  knob; `null` uses the native resolution. Returns
+  `UnsupportedModality` on a non-VL model and `Backend` on a decode
+  / encoder mismatch. The underlying ViT encode runs on CPU.
 
 ## Design notes
 

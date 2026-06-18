@@ -1185,6 +1185,53 @@ impl Session {
         Ok(())
     }
 
+    /// Append an encoded image (PNG / JPEG bytes, auto-detected) to the
+    /// context. The image is decoded, resized, normalized, and run
+    /// through the bundle's vision mmproj (`VisionEncoderWeights`), then
+    /// prefilled into the LLM as soft tokens — see
+    /// [`cera::Session::append_image`] for the underlying flow.
+    ///
+    /// `CeraEngine::new_session` auto-attaches the vision encoder when
+    /// the loaded bundle's `inference_type` is a VL type with
+    /// `multimodal_projector` set in the manifest, so FFI consumers
+    /// don't need a separate "load encoder" call. Bundles whose
+    /// manifest omits the mmproj end up with no encoder attached (no
+    /// log); bundles where it's named but fails to open/parse log a
+    /// `tracing::warn!` at `CeraEngine` construction. Both surface here
+    /// as a "no vision encoder attached" `Backend` error.
+    ///
+    /// `max_long_size` optionally caps the image's longest side: when
+    /// `Some(n)` and the decoded image is larger, it is downscaled
+    /// (high-quality Lanczos3, aspect-preserving) to `n` *before*
+    /// encoding — a caller-controlled quality/cost knob (bigger = more
+    /// detail, slower). `None` (or `0`) uses the image at its native
+    /// resolution. The model's own pixel-budget clamp still applies on
+    /// top, so a cap above that budget is a no-op.
+    ///
+    /// **Placement matters.** Prefer driving multimodal turns through
+    /// the chat template; calling this at the wrong stream position
+    /// (outside the model's image-marker envelope) leaves the LLM
+    /// unable to interpret the embeddings as visual content. See
+    /// [`cera::Session::append_image`] for the marker recipe.
+    ///
+    /// Errors:
+    /// - `EmptyInput` when `bytes` is empty.
+    /// - `UnsupportedModality` if the loaded model's
+    ///   [`ModalityCapabilities::image_in`] is `false`.
+    /// - `Backend(...)` for image decode failure, missing vision
+    ///   encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
+    ///   mismatch.
+    /// - `ContextOverflow` / `Cancelled` propagate from the
+    ///   underlying prefill.
+    pub fn append_image(&self, bytes: Vec<u8>, max_long_size: Option<u32>) -> Result<(), FfiError> {
+        if bytes.is_empty() {
+            return Err(FfiError::EmptyInput);
+        }
+        self.lock_inner()?
+            .append_image_with_opts(&bytes, max_long_size)?;
+        Ok(())
+    }
+
     /// Run autoregressive decode and return all emitted tokens +
     /// a summary. Synchronous — the call blocks until the decode
     /// loop exits (`max_tokens`, EOS, `cancel()`, or error).

@@ -126,12 +126,51 @@ pub fn preprocess_image(
     bytes: &[u8],
     cfg: &VisionEncoderConfig,
 ) -> Result<PreprocessedImage, CeraError> {
+    preprocess_image_with_opts(bytes, cfg, None)
+}
+
+/// Like [`preprocess_image`], but with an optional caller-supplied
+/// cap (`max_long_size`) on the image's longest side, applied as a
+/// **pre-resize before** the model's own `[min, max]`-pixel clamp.
+///
+/// When `Some(n)` and the decoded image's longer side exceeds `n`,
+/// the image is downscaled (high-quality Lanczos3, aspect-preserving)
+/// so its long side equals `n`, *then* fed through the normal
+/// [`calc_size_preserved_ratio`] path. `None` (or `0`, or an image
+/// already within the cap) is a no-op and behaves identically to
+/// [`preprocess_image`].
+///
+/// Note: the model's `cfg.image_max_pixels` clamp still applies on
+/// top. With the current single-tile pipeline a `max_long_size`
+/// larger than the model's pixel budget therefore has no effect —
+/// the knob can only *reduce* cost/resolution, not raise it beyond
+/// the encoder's baseline. (Raising effective resolution needs
+/// image slicing, tracked separately.)
+pub fn preprocess_image_with_opts(
+    bytes: &[u8],
+    cfg: &VisionEncoderConfig,
+    max_long_size: Option<u32>,
+) -> Result<PreprocessedImage, CeraError> {
     if bytes.is_empty() {
         return Err(CeraError::EmptyInput);
     }
 
     let img = image::load_from_memory(bytes)
         .map_err(|e| CeraError::Backend(format!("image decode failed: {e}")))?;
+
+    // Optional caller-controlled long-side cap. `resize` fits the
+    // image *within* a `max × max` box preserving aspect, so the
+    // longer side lands exactly on `max` and the shorter side scales
+    // proportionally. Guard `max > 0` (a 0 cap is meaningless) and
+    // only fire when the image actually exceeds the cap so we never
+    // upscale here — upscaling is the model resize's job via the
+    // `min_pixels` branch.
+    let img = match max_long_size {
+        Some(max) if max > 0 && img.width().max(img.height()) > max => {
+            img.resize(max, max, image::imageops::FilterType::Lanczos3)
+        }
+        _ => img,
+    };
 
     // Pick the resize target via llama.cpp's algorithm. align_size
     // = patch_size · scale_factor guarantees both grid_w and
@@ -338,6 +377,50 @@ mod tests {
             Err(CeraError::EmptyInput) => {}
             other => panic!("expected EmptyInput, got {other:?}"),
         }
+    }
+
+    /// `max_long_size` cap downscales a large input before the model
+    /// clamp, while `None` leaves it at native resolution. Uses a wide
+    /// pixel band so the cap (not `image_max_pixels`) is what binds.
+    #[test]
+    fn preprocess_max_long_size_caps_long_side() {
+        let cfg = VisionEncoderConfig {
+            // align = patch_size · scale_factor = 2, so targets stay
+            // multiples of 2 and the assertions below are exact.
+            patch_size: 2,
+            scale_factor: 1,
+            // Wide band: an 800×400 image (320k px) sits inside it, so
+            // without a cap the model resize is a pass-through and the
+            // cap is the only thing that can change the output size.
+            image_min_pixels: 4,
+            image_max_pixels: 1_000_000,
+            ..synth_cfg()
+        };
+        // 800×400 solid image (2:1 aspect).
+        let img = ImageBuffer::<Rgb<u8>, _>::from_fn(800, 400, |_, _| Rgb([128u8, 64, 32]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode test png");
+
+        // No cap → native 800×400 (within band, multiple of 2).
+        let uncapped = preprocess_image_with_opts(&bytes, &cfg, None).expect("uncapped");
+        assert_eq!((uncapped.target_w, uncapped.target_h), (800, 400));
+
+        // Cap=100 → long side downscaled to 100, aspect preserved → 100×50.
+        let capped = preprocess_image_with_opts(&bytes, &cfg, Some(100)).expect("capped");
+        assert_eq!((capped.target_w, capped.target_h), (100, 50));
+
+        // A cap larger than the image is a no-op (no upscale here).
+        let big_cap = preprocess_image_with_opts(&bytes, &cfg, Some(4000)).expect("big cap");
+        assert_eq!((big_cap.target_w, big_cap.target_h), (800, 400));
+
+        // Cap of 0 is treated as "no cap".
+        let zero_cap = preprocess_image_with_opts(&bytes, &cfg, Some(0)).expect("zero cap");
+        assert_eq!((zero_cap.target_w, zero_cap.target_h), (800, 400));
     }
 
     /// Resize path: small JPEG (8×8) → resized to 4×4 (the

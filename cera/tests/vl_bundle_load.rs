@@ -432,4 +432,20 @@ fn vl_bundle_appends_synthetic_image() {
         "post-image generation looks degenerate (got {decoded:?}); image embeddings \
          likely poisoned the LLM stream"
     );
+
+    // `append_image_with_opts` with a `max_long_size` cap drives the
+    // same preprocess → ViT → splice path on real weights. Use a
+    // fresh session and append the image directly (no chat envelope —
+    // we're proving the capped path executes and advances the stream,
+    // not generation coherence). The 128px cap is well below the
+    // fixture's native size, so the Lanczos downscale path fires.
+    let mut capped = engine.new_session(Default::default());
+    let before = capped.position();
+    capped
+        .append_image_with_opts(&img_bytes, Some(128))
+        .expect("append_image_with_opts with max_long_size should run end-to-end");
+    assert!(
+        capped.position() > before,
+        "capped append produced zero image tokens — preprocess/encode/splice broke"
+    );
 }
