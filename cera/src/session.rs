@@ -963,11 +963,14 @@ impl Session {
     /// When `Some(n)`, the resize target is shrunk (aspect-preserving,
     /// re-aligned) so its longer side is at most `n` pixels — a
     /// caller-controlled quality/cost knob (smaller = fewer image
-    /// tokens, faster, less detail). The cap only ever *shrinks* the
-    /// target (it never upscales) and **takes precedence over the
-    /// model's `image_min_pixels` floor** — passing a small `n` is an
-    /// explicit request to trade detail for cost, down to one aligned
-    /// patch block. `None` (or `0`) applies no cap. See
+    /// tokens, faster, less detail). Each dimension is floored at one
+    /// aligned patch block (`patch_size · scale_factor`), so a very
+    /// small `n` rounds the encoded long side up to that minimum rather
+    /// than below it. The cap only ever *shrinks* the target (it never
+    /// upscales) and **takes precedence over the model's
+    /// `image_min_pixels` floor** — passing a small `n` is an explicit
+    /// request to trade detail for cost, down to one aligned patch
+    /// block. `None` (or `0`) applies no cap. See
     /// [`crate::model::vision_preprocessor::preprocess_image_with_opts`].
     ///
     /// Errors are identical to [`Self::append_image`].

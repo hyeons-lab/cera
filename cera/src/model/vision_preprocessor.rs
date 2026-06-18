@@ -144,12 +144,16 @@ pub fn preprocess_image(
 /// When `Some(n)`, the resize target chosen by
 /// [`calc_size_preserved_ratio`] is shrunk (aspect-preserving,
 /// re-aligned to `patch_size · scale_factor`) so its longer side is at
-/// most `n` pixels, and the image is then resampled **once**, straight
-/// from its native dimensions to that target — there is no cascaded
-/// downscale-then-upscale. The cap only ever *shrinks* the target (the
-/// `long > cap` guard never upscales) and **takes precedence over
-/// `cfg.image_min_pixels`**: a small `n` is an explicit request to
-/// trade detail for cost, clamped only at one aligned patch block.
+/// most `n` pixels — **except** that each dimension is floored at one
+/// aligned block (`patch_size · scale_factor`), so when
+/// `n < patch_size · scale_factor` the encoded long side rounds up to
+/// that minimum rather than going below it. The image is then resampled
+/// **once**, straight from its native dimensions to that target — there
+/// is no cascaded downscale-then-upscale. The cap only ever *shrinks*
+/// the target (the `long > cap` guard never upscales) and **takes
+/// precedence over `cfg.image_min_pixels`**: a small `n` is an explicit
+/// request to trade detail for cost, clamped only at one aligned patch
+/// block.
 /// `None` (or `0`, or a target already within the cap) behaves
 /// identically to [`preprocess_image`].
 ///

@@ -1200,16 +1200,25 @@ impl Session {
     /// `tracing::warn!` at `CeraEngine` construction. Both surface here
     /// as a "no vision encoder attached" `Backend` error.
     ///
-    /// `max_long_size` is an explicit per-call cap on the longest side
-    /// of the *encoded* image: when `Some(n)`, the resize target is
-    /// shrunk (aspect-preserving) so its longer side is at most `n`
-    /// pixels — a quality/cost knob (smaller = fewer image tokens,
-    /// faster, less detail). It only shrinks (never upscales) and takes
-    /// precedence over the model's minimum-resolution floor. `None` (or
-    /// `0`) falls back to [`Self::set_image_max_long_size`] only if the
-    /// caller passes it explicitly — here `None` means "no cap for this
-    /// call". The cap bounds the *encode*, not the *decode* (a huge
-    /// source image is still decoded, bounded by internal limits).
+    /// `max_long_size` controls the per-call cap on the longest side of
+    /// the *encoded* image, with three cases distinguished so the
+    /// session default stays reachable through FFI:
+    /// - `None` — defer to the session default set via
+    ///   [`Self::set_image_max_long_size`] (no cap if none was set).
+    /// - `Some(0)` — explicitly force *no cap* for this call, ignoring
+    ///   the session default.
+    /// - `Some(n)` (`n > 0`) — cap this call at `n`, overriding the
+    ///   session default.
+    ///
+    /// When a cap applies, the resize target is shrunk
+    /// (aspect-preserving) so its longer side is at most `n` pixels,
+    /// floored at one aligned patch block (so a very small `n` can still
+    /// round up to that minimum) — a quality/cost knob (smaller = fewer
+    /// image tokens, faster, less detail). It only shrinks (never
+    /// upscales) and takes precedence over the model's
+    /// minimum-resolution floor. The cap bounds the *encode*, not the
+    /// *decode* (a huge source image is still decoded, bounded by
+    /// internal limits).
     ///
     /// **Placement matters.** Prefer driving multimodal turns through
     /// the chat template; calling this at the wrong stream position
@@ -1217,21 +1226,30 @@ impl Session {
     /// unable to interpret the embeddings as visual content. See
     /// [`cera::Session::append_image`] for the marker recipe.
     ///
-    /// Errors:
-    /// - `EmptyInput` when `bytes` is empty.
+    /// Errors (capability is checked before emptiness, matching core):
     /// - `UnsupportedModality` if the loaded model's
     ///   [`ModalityCapabilities::image_in`] is `false`.
+    /// - `EmptyInput` when `bytes` is empty (on a VL session).
     /// - `Backend(...)` for image decode failure, missing vision
     ///   encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
     ///   mismatch.
     /// - `ContextOverflow` / `Cancelled` propagate from the
     ///   underlying prefill.
     pub fn append_image(&self, bytes: Vec<u8>, max_long_size: Option<u32>) -> Result<(), FfiError> {
-        if bytes.is_empty() {
-            return Err(FfiError::EmptyInput);
-        }
-        self.lock_inner()?
-            .append_image_with_opts(&bytes, max_long_size)?;
+        // Delegate to the core methods (rather than always calling
+        // `append_image_with_opts`) so the session default stays
+        // reachable through FFI and core's capability-before-empty error
+        // precedence is preserved: `None` -> session default, `Some(0)`
+        // -> force no cap, `Some(n)` -> cap at `n`. The empty-bytes guard
+        // lives in core (`preprocess_image_with_opts`), which runs after
+        // the capability check, so a non-VL session still reports
+        // `UnsupportedModality` rather than `EmptyInput` for empty input.
+        let mut inner = self.lock_inner()?;
+        match max_long_size {
+            None => inner.append_image(&bytes),
+            Some(0) => inner.append_image_with_opts(&bytes, None),
+            Some(n) => inner.append_image_with_opts(&bytes, Some(n)),
+        }?;
         Ok(())
     }
 
