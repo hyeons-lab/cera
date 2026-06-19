@@ -16,7 +16,9 @@ using namespace metal;
 // threadgroup memory bounded (≈176·head_dim + 2144 bytes).
 //
 // Q/K/V/out are [tokens, n_head*head_dim] row-major. Constraint: head_dim % 8
-// == 0 and head_dim <= 256 (the host uses the scalar kernel otherwise).
+// == 0 and head_dim <= 128 (the host caps this so the ≈176·head_dim + 2144 B of
+// threadgroup memory stays under Apple M1's 32 KB limit; larger head dims use
+// the scalar kernel).
 //
 // Dispatch: threadgroups (n_head * ceil(tokens/Q_PER_TG), 1, 1), threads (256).
 

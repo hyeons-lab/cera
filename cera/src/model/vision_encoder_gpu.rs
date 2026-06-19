@@ -321,14 +321,21 @@ struct VitProfiler {
 }
 
 impl VitProfiler {
-    /// `Some` iff `CERA_VIT_PROFILE` is set to a non-empty, non-`0` value.
+    /// Whether `CERA_VIT_PROFILE` is set to a non-empty, non-`0` value. Read
+    /// from the environment once and cached, so the disabled hot path is a
+    /// single atomic load (the env var is a process-lifetime toggle anyway).
+    fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("CERA_VIT_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0")
+        })
+    }
+
+    /// `Some` iff profiling is [`enabled`](Self::enabled).
     fn from_env() -> Option<Self> {
-        match std::env::var("CERA_VIT_PROFILE") {
-            Ok(v) if !v.is_empty() && v != "0" => Some(Self {
-                spans: std::cell::RefCell::new(Vec::new()),
-            }),
-            _ => None,
-        }
+        Self::enabled().then(|| Self {
+            spans: std::cell::RefCell::new(Vec::new()),
+        })
     }
 
     /// Add `d` to the running total for `label` (creating it on first use).
@@ -1165,10 +1172,12 @@ impl VitGpuOps for MetalVitOps {
     ) -> Self::Buf {
         let dim = n_head * head_dim;
         let out = self.ctx.create_buffer((tokens * dim * 4) as u64);
-        // Flash-attention MMA kernel needs head_dim a multiple of 8 (and ≤ 256,
-        // the threadgroup-memory budget); fall back to the scalar kernel for
-        // exotic head dims.
-        if head_dim % 8 == 0 && head_dim <= 256 {
+        // Flash-attention MMA kernel needs head_dim a multiple of 8 and ≤ 128:
+        // its threadgroup memory is 176·head_dim + 2144 bytes, so head_dim=256
+        // would need ~46 KB and blow the 32 KB threadgroup limit on Apple M1.
+        // 128 keeps it at ~24 KB and covers every current LFM2 ViT (hd ∈ {64,
+        // 128}); larger head dims fall back to the scalar kernel.
+        if head_dim % 8 == 0 && head_dim <= 128 {
             self.run_attn_mma(q, k, v, &out, tokens, n_head, head_dim);
         } else {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
