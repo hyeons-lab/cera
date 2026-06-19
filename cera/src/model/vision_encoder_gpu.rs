@@ -149,6 +149,9 @@ pub trait VitGpuOps {
 
 /// Dequantize a linear weight to a contiguous `[rows*cols]` f32 vector for
 /// upload. F32 weights are copied directly; quantized dtypes go row-by-row.
+/// Only the GPU/Metal backends use this (the wgpu/Metal `upload_weight` impls);
+/// gated to match so the default (no-backend) build doesn't flag it as dead.
+#[cfg(any(feature = "gpu", all(feature = "metal", target_os = "macos")))]
 fn dequant_weight(w: &MmapWeight) -> Vec<f32> {
     if let Some(f) = w.try_as_f32() {
         return f.to_vec();
