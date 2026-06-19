@@ -59,7 +59,8 @@ fn layernorm_batch(
     let mean = shared_mean;
 
     // Pass 2: var = (1/n) Σ (src - mean)^2.
-    workgroupBarrier();
+    // (No barrier needed here — the one after `shared_mean` is written already
+    // separates the mean read from the pass-2 `shared_sum` writes below.)
     partial = 0.0;
     i = tid;
     while i < n {

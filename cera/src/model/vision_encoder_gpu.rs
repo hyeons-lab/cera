@@ -19,7 +19,8 @@
 use anyhow::Result;
 
 use super::vision_encoder::{
-    VisionEncoderConfig, VisionEncoderWeights, interpolate_pos_embed_2d, pixel_shuffle,
+    VisionEncoderConfig, VisionEncoderWeights, extract_patch, interpolate_pos_embed_2d,
+    pixel_shuffle,
 };
 use crate::model::weights::MmapWeight;
 
@@ -27,7 +28,42 @@ use crate::model::weights::MmapWeight;
 /// workgroup-resident, sized MAX_TOKENS). LFM2-VL's `image_max_pixels` caps the
 /// patch grid well under this, but [`encode_image_gpu`] guards it so a future
 /// config can fall back to CPU instead of producing garbage.
+///
+/// This value MUST match the `MAX_TOKENS` literal sizing the `scores` scratch
+/// array in both `vit_attention.wgsl` and `vit_attention.metal` — raising it
+/// here without updating the shaders would let the guards admit grids larger
+/// than the scratch array and silently write out of bounds. The Metal pipeline
+/// can't take a runtime define (its source is a `&'static str` keyed by
+/// pointer), so the three literals are duplicated and kept in lockstep by
+/// `const_sync_tests::max_vit_tokens_matches_attention_shader_scratch`.
 pub const MAX_VIT_TOKENS: usize = 1024;
+
+#[cfg(test)]
+mod const_sync_tests {
+    use super::MAX_VIT_TOKENS;
+
+    /// Fails loudly if [`MAX_VIT_TOKENS`] is bumped without updating the
+    /// `scores` scratch-array size in both attention shaders — the missing
+    /// compile-time link the shaders' `MAX_TOKENS` literals would otherwise
+    /// lack. Runs in default CI (no GPU/feature needed): it only reads source.
+    #[test]
+    fn max_vit_tokens_matches_attention_shader_scratch() {
+        let wgsl = include_str!("../backend/shaders/vit_attention.wgsl");
+        let metal = include_str!("../backend/shaders/vit_attention.metal");
+        let wgsl_decl = format!("const MAX_TOKENS: u32 = {MAX_VIT_TOKENS}u;");
+        let metal_decl = format!("constant uint MAX_TOKENS = {MAX_VIT_TOKENS}u;");
+        assert!(
+            wgsl.contains(&wgsl_decl),
+            "vit_attention.wgsl MAX_TOKENS != MAX_VIT_TOKENS ({MAX_VIT_TOKENS}); \
+             update the shader's `scores` array size to match"
+        );
+        assert!(
+            metal.contains(&metal_decl),
+            "vit_attention.metal MAX_TOKENS != MAX_VIT_TOKENS ({MAX_VIT_TOKENS}); \
+             update the shader's `scores` array size to match"
+        );
+    }
+}
 
 /// Backend-agnostic GPU op interface for the ViT forward pass.
 ///
@@ -226,20 +262,16 @@ fn im2col_patches(
 
     let mut patches = vec![0f32; n_patches * in_dim];
     for patch_idx in 0..n_patches {
-        let gr = patch_idx / grid_w;
-        let gc = patch_idx % grid_w;
         let base = patch_idx * in_dim;
-        for c in 0..3 {
-            for kh in 0..p {
-                for kw in 0..p {
-                    let pixel_r = gr * p + kh;
-                    let pixel_c = gc * p + kw;
-                    let in_idx = c * p * p + kh * p + kw;
-                    let img_idx = c * c_stride + pixel_r * h_stride + pixel_c;
-                    patches[base + in_idx] = image[img_idx];
-                }
-            }
-        }
+        extract_patch(
+            image,
+            &mut patches[base..base + in_dim],
+            patch_idx,
+            grid_w,
+            p,
+            h_stride,
+            c_stride,
+        );
     }
     patches
 }
@@ -298,19 +330,28 @@ pub fn encode_image_gpu<O: VitGpuOps>(
     );
     ops.bias_add(&tokens, &gpu_w.patch_conv_b, n_patches, n_embd);
 
-    // 2. Add (interpolated) position embeddings.
+    // 2. Add (interpolated) position embeddings. The trained grid is square;
+    // guard that in release too (the CPU encoder only `debug_assert`s it), since
+    // a non-square `n_trained_patches` would make `interpolate_pos_embed_2d`
+    // index out of bounds. Borrow (not clone) the trained embedding on the
+    // common matching-grid path.
     let trained_side = (cfg.n_trained_patches as f64).sqrt().round() as usize;
-    let pos = if grid_w == trained_side && grid_h == trained_side {
-        gpu_w.position_embed.clone()
+    anyhow::ensure!(
+        trained_side * trained_side == cfg.n_trained_patches,
+        "non-square trained pos-embed grid ({} patches) is not supported",
+        cfg.n_trained_patches,
+    );
+    let pos: std::borrow::Cow<[f32]> = if grid_w == trained_side && grid_h == trained_side {
+        std::borrow::Cow::Borrowed(&gpu_w.position_embed)
     } else {
-        interpolate_pos_embed_2d(
+        std::borrow::Cow::Owned(interpolate_pos_embed_2d(
             &gpu_w.position_embed,
             trained_side,
             trained_side,
             grid_h,
             grid_w,
             n_embd,
-        )
+        ))
     };
     let pos_buf = ops.upload(&pos);
     ops.add(&tokens, &pos_buf, n_patches * n_embd);
@@ -387,39 +428,54 @@ pub struct WgpuVitOps {
 
 #[cfg(feature = "gpu")]
 impl WgpuVitOps {
-    pub fn new(ctx: crate::backend::wgpu::GpuContext) -> Self {
+    pub fn new(ctx: crate::backend::wgpu::GpuContext) -> Result<Self> {
         use crate::backend::wgpu::shaders;
-        // f32 batched matmul via the SCALAR mul_mat variant (handles any m).
-        let p_linear = ctx.create_pipeline_with_defines(
-            shaders::MUL_MAT_REG_TILE,
-            "main",
-            "vit_linear",
-            &[
-                ("SCALAR", ""),
-                ("SRC0_INNER_TYPE", "f32"),
-                ("SRC1_INNER_TYPE", "f32"),
-                ("INIT_SRC0_SHMEM_FLOAT", ""),
-                ("INIT_SRC1_SHMEM_FLOAT", ""),
-                ("WORKGROUP_SIZE_M", "8u"),
-                ("WORKGROUP_SIZE_N", "8u"),
-                ("TILE_M", "4u"),
-                ("TILE_N", "4u"),
-                ("TILE_K", "32u"),
-            ],
-        );
-        Self {
-            p_bias: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "vit_bias_add"),
-            p_layernorm: ctx.create_pipeline(
-                shaders::LAYERNORM_BATCH,
-                "layernorm_batch",
-                "vit_layernorm",
-            ),
-            p_gelu: ctx.create_pipeline(shaders::GELU, "gelu_inplace", "vit_gelu"),
-            p_attn: ctx.create_pipeline(shaders::VIT_ATTENTION, "vit_attention", "vit_attention"),
-            p_add: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "vit_add"),
-            p_linear,
-            ctx,
-        }
+        // `create_pipeline*` return the pipeline directly and panic on shader
+        // preprocessing or adapter-side validation/compile failure (they have
+        // no `Result`). Catch that here and surface an `Err` so the caller's
+        // `?` degrades to the CPU encoder — mirroring `MetalVitOps::new`'s
+        // `.ok()?` — instead of aborting `CeraEngine` construction on a weak or
+        // non-conformant adapter.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            // f32 batched matmul via the SCALAR mul_mat variant (handles any m).
+            let p_linear = ctx.create_pipeline_with_defines(
+                shaders::MUL_MAT_REG_TILE,
+                "main",
+                "vit_linear",
+                &[
+                    ("SCALAR", ""),
+                    ("SRC0_INNER_TYPE", "f32"),
+                    ("SRC1_INNER_TYPE", "f32"),
+                    ("INIT_SRC0_SHMEM_FLOAT", ""),
+                    ("INIT_SRC1_SHMEM_FLOAT", ""),
+                    ("WORKGROUP_SIZE_M", "8u"),
+                    ("WORKGROUP_SIZE_N", "8u"),
+                    ("TILE_M", "4u"),
+                    ("TILE_N", "4u"),
+                    ("TILE_K", "32u"),
+                ],
+            );
+            Self {
+                p_bias: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "vit_bias_add"),
+                p_layernorm: ctx.create_pipeline(
+                    shaders::LAYERNORM_BATCH,
+                    "layernorm_batch",
+                    "vit_layernorm",
+                ),
+                p_gelu: ctx.create_pipeline(shaders::GELU, "gelu_inplace", "vit_gelu"),
+                p_attn: ctx.create_pipeline(
+                    shaders::VIT_ATTENTION,
+                    "vit_attention",
+                    "vit_attention",
+                ),
+                p_add: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "vit_add"),
+                p_linear,
+                ctx,
+            }
+        }))
+        .map_err(|_| {
+            anyhow::anyhow!("wgpu ViT pipeline creation failed (shader compile/validation)")
+        })
     }
 
     /// Encode one bind group from `bufs` (in binding order) and dispatch.
@@ -830,7 +886,7 @@ fn try_wgpu_vision_encoder(
     weights: &VisionEncoderWeights,
 ) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
     let ctx = crate::backend::wgpu::GpuContext::new().ok()?;
-    let ops = WgpuVitOps::new(ctx);
+    let ops = WgpuVitOps::new(ctx).ok()?;
     let gpu_w = GpuVitWeights::build(&ops, weights);
     tracing::info!("vision encoder: using wgpu GPU backend");
     Some(std::sync::Arc::new(WgpuVisionEncoder {
@@ -1008,7 +1064,7 @@ mod tests {
             Ok(ctx) => ctx,
             Err(_) => return, // no GPU (CI)
         };
-        run_parity(&WgpuVitOps::new(ctx));
+        run_parity(&WgpuVitOps::new(ctx).expect("build wgpu vit ops"));
     }
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
