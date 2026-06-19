@@ -1034,17 +1034,27 @@ impl Session {
         )?;
         // Prefer the cached GPU encoder when one is attached and the patch
         // grid fits the GPU attention kernel's capacity; otherwise (or for
-        // oversized grids) fall back to the CPU encoder. The output is
-        // identical in shape and numerically equivalent either way.
+        // oversized grids) use the CPU encoder. The output is identical in
+        // shape and numerically equivalent either way.
         let grid_tokens = pre.grid_w.saturating_mul(pre.grid_h);
-        let use_gpu = self.gpu_vision_encoder.is_some()
-            && grid_tokens <= crate::model::vision_encoder_gpu::MAX_VIT_TOKENS;
-        let img_tokens = if use_gpu {
-            self.gpu_vision_encoder
-                .as_ref()
-                .unwrap()
-                .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
-                .map_err(|e| CeraError::Backend(format!("gpu encode_image: {e:#}")))?
+        let gpu = self
+            .gpu_vision_encoder
+            .as_ref()
+            .filter(|_| grid_tokens <= crate::model::vision_encoder_gpu::MAX_VIT_TOKENS);
+        let img_tokens = if let Some(gpu) = gpu {
+            match gpu.encode_image(&pre.pixels, pre.grid_w, pre.grid_h) {
+                Ok(tokens) => tokens,
+                // A GPU runtime failure (device lost, OOM, command-buffer
+                // error) must not abort the append: the CPU encoder is always
+                // attached as the documented fallback and produces numerically
+                // equivalent output. Degrade to it instead of failing.
+                Err(e) => {
+                    tracing::warn!("gpu vision encode failed ({e:#}); falling back to CPU encoder");
+                    encoder
+                        .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
+                        .map_err(|e| CeraError::Backend(format!("encode_image: {e:#}")))?
+                }
+            }
         } else {
             encoder
                 .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
