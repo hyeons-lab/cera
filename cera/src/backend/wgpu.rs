@@ -579,6 +579,11 @@ pub mod shaders {
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
     pub const CONV1D: &str = include_str!("shaders/conv1d.wgsl");
     pub const CONV1D_FUSED: &str = include_str!("shaders/conv1d_fused.wgsl");
+    // Vision-encoder (ViT) kernels.
+    pub const LAYERNORM_BATCH: &str = include_str!("shaders/layernorm_batch.wgsl");
+    pub const GELU: &str = include_str!("shaders/gelu.wgsl");
+    pub const BIAS_ADD: &str = include_str!("shaders/bias_add.wgsl");
+    pub const VIT_ATTENTION: &str = include_str!("shaders/vit_attention.wgsl");
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -714,6 +719,278 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "GEMV mismatch at row {i}: cpu={}, gpu={}, diff={diff}",
+                expected[i],
+                result[i]
+            );
+        }
+    }
+
+    // ── ViT vision-encoder kernel parity tests ──────────────────────────────
+    //
+    // Each validates a new shader (layernorm_batch, gelu, bias_add,
+    // vit_attention) against its CPU reference in `backend::cpu` /
+    // hand-rolled math. All skip cleanly when no GPU is present (CI).
+
+    /// Dispatch a single compute pipeline over `bufs` (in binding order) and
+    /// `workgroups`, returning nothing — caller reads back via `download_f32`.
+    fn run_kernel(
+        ctx: &GpuContext,
+        pipeline: &wgpu::ComputePipeline,
+        bufs: &[&wgpu::Buffer],
+        workgroups: (u32, u32, u32),
+    ) {
+        let entries: Vec<wgpu::BindGroupEntry> = bufs
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: b.as_entire_binding(),
+            })
+            .collect();
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &entries,
+        });
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll(wgpu::Maintain::Wait);
+    }
+
+    #[test]
+    fn test_gpu_layernorm_batch_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let rows = 5usize;
+        let dim = 320usize; // not a multiple of 256, > one wave
+        let eps = 1e-6f32;
+        let src: Vec<f32> = (0..rows * dim)
+            .map(|i| ((i * 31 + 7) % 197) as f32 * 0.03 - 2.9)
+            .collect();
+        let weight: Vec<f32> = (0..dim).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+        let bias: Vec<f32> = (0..dim).map(|i| (i % 5) as f32 * 0.2 - 0.4).collect();
+
+        // CPU reference (per row).
+        let mut expected = src.clone();
+        for r in 0..rows {
+            crate::backend::cpu::layer_norm_inplace(
+                &mut expected[r * dim..(r + 1) * dim],
+                &weight,
+                &bias,
+                eps,
+            );
+        }
+
+        let src_buf = ctx.upload_f32(&src, "src");
+        let dst_buf = ctx.create_storage_rw((rows * dim * 4) as u64, "dst");
+        let w_buf = ctx.upload_f32(&weight, "w");
+        let b_buf = ctx.upload_f32(&bias, "b");
+        let params = [dim as u32, eps.to_bits(), dim as u32, dim as u32];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline(
+            shaders::LAYERNORM_BATCH,
+            "layernorm_batch",
+            "layernorm_batch",
+        );
+        run_kernel(
+            &ctx,
+            &pipeline,
+            &[&src_buf, &dst_buf, &w_buf, &b_buf, &p_buf],
+            (rows as u32, 1, 1),
+        );
+
+        let result = ctx.download_f32(&dst_buf, rows * dim);
+        for i in 0..rows * dim {
+            let diff = (expected[i] - result[i]).abs();
+            assert!(
+                diff < 1e-3,
+                "layernorm mismatch at {i}: cpu={}, gpu={}, diff={diff}",
+                expected[i],
+                result[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_gelu_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        // Span [-25, 25): includes large |x| where a naive GPU tanh
+        // (exp(2a)/...) overflows to NaN via gelu's cubic term — the clamp in
+        // gelu.wgsl must keep parity with the CPU's saturating f32::tanh.
+        let n = 1000usize;
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 - 500.0) * 0.05).collect();
+
+        let mut expected = x.clone();
+        crate::backend::cpu::gelu_inplace(&mut expected);
+
+        let x_buf = ctx.upload_f32(&x, "x");
+        let params = [n as u32, 0u32];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline(shaders::GELU, "gelu_inplace", "gelu");
+        run_kernel(
+            &ctx,
+            &pipeline,
+            &[&x_buf, &p_buf],
+            (n.div_ceil(256) as u32, 1, 1),
+        );
+
+        let result = ctx.download_f32(&x_buf, n);
+        for i in 0..n {
+            assert!(
+                result[i].is_finite(),
+                "gelu produced non-finite at {i} (x={}): {} — tanh overflow?",
+                x[i],
+                result[i]
+            );
+            let diff = (expected[i] - result[i]).abs();
+            // tanh on GPU vs CPU differs slightly; activation magnitudes ~O(1).
+            assert!(
+                diff < 1e-4,
+                "gelu mismatch at {i}: cpu={}, gpu={}, diff={diff}",
+                expected[i],
+                result[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_bias_add_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let rows = 7usize;
+        let dim = 130usize;
+        let x: Vec<f32> = (0..rows * dim).map(|i| (i as f32) * 0.01).collect();
+        let bias: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.05 - 3.0).collect();
+
+        let mut expected = x.clone();
+        for r in 0..rows {
+            for j in 0..dim {
+                expected[r * dim + j] += bias[j];
+            }
+        }
+
+        let x_buf = ctx.upload_f32(&x, "x");
+        let b_buf = ctx.upload_f32(&bias, "bias");
+        let total = (rows * dim) as u32;
+        let params = [total, dim as u32];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "bias_add");
+        run_kernel(
+            &ctx,
+            &pipeline,
+            &[&x_buf, &b_buf, &p_buf],
+            ((total as usize).div_ceil(256) as u32, 1, 1),
+        );
+
+        let result = ctx.download_f32(&x_buf, rows * dim);
+        for i in 0..rows * dim {
+            assert!(
+                (expected[i] - result[i]).abs() < 1e-5,
+                "bias_add mismatch at {i}: cpu={}, gpu={}",
+                expected[i],
+                result[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_vit_attention_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let tokens = 20usize;
+        let n_head = 3usize;
+        let head_dim = 8usize;
+        let dim = n_head * head_dim;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        let mk = |seed: usize| -> Vec<f32> {
+            (0..tokens * dim)
+                .map(|i| (((i + seed) * 37 + 11) % 101) as f32 * 0.02 - 1.0)
+                .collect()
+        };
+        let q = mk(1);
+        let k = mk(2);
+        let v = mk(3);
+
+        // CPU reference: bidirectional softmax(QKᵀ·scale)·V per head.
+        let mut expected = vec![0.0f32; tokens * dim];
+        for h in 0..n_head {
+            for qi in 0..tokens {
+                let q_off = qi * dim + h * head_dim;
+                let mut scores = vec![0.0f32; tokens];
+                for ki in 0..tokens {
+                    let k_off = ki * dim + h * head_dim;
+                    let mut s = 0.0f32;
+                    for d in 0..head_dim {
+                        s += q[q_off + d] * k[k_off + d];
+                    }
+                    scores[ki] = s * scale;
+                }
+                crate::backend::cpu::softmax_inplace(&mut scores);
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for ki in 0..tokens {
+                        acc += scores[ki] * v[ki * dim + h * head_dim + d];
+                    }
+                    expected[q_off + d] = acc;
+                }
+            }
+        }
+
+        let q_buf = ctx.upload_f32(&q, "q");
+        let k_buf = ctx.upload_f32(&k, "k");
+        let v_buf = ctx.upload_f32(&v, "v");
+        let out_buf = ctx.create_storage_rw((tokens * dim * 4) as u64, "out");
+        let params = [
+            tokens as u32,
+            n_head as u32,
+            head_dim as u32,
+            scale.to_bits(),
+        ];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline =
+            ctx.create_pipeline(shaders::VIT_ATTENTION, "vit_attention", "vit_attention");
+        run_kernel(
+            &ctx,
+            &pipeline,
+            &[&q_buf, &k_buf, &v_buf, &out_buf, &p_buf],
+            (tokens as u32, n_head as u32, 1),
+        );
+
+        let result = ctx.download_f32(&out_buf, tokens * dim);
+        for i in 0..tokens * dim {
+            let diff = (expected[i] - result[i]).abs();
+            assert!(
+                diff < 1e-4,
+                "vit_attention mismatch at {i}: cpu={}, gpu={}, diff={diff}",
                 expected[i],
                 result[i]
             );

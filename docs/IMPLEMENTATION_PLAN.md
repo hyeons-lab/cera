@@ -48,7 +48,7 @@ Metal forward passes currently support **LFM2 only**; Qwen runs on CPU.
 | V2.13 Python (PyO3) bindings | ⬜ | |
 | V2.14 Kotlin Multiplatform bindings | ✅ | `cera-ffi-kotlin` (android + jvm) |
 | V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync + async generate, sync + async streaming, `withProgress` all verified; only `fromBundleIdAsync` stubbed |
-| V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core + FFI shipped, CPU-only encode, no slicing |
+| V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core + FFI + GPU (Metal/wgpu) encode shipped, no slicing |
 | V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
 | V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync engine API verified end-to-end; streaming/async stubbed |
 
@@ -481,9 +481,17 @@ Image → text via a CLIP-family ViT encoder with a 2-layer MLP projector
   every append path (including `append_chat_with_images` and the CLI) via the
   session-default `Session::set_image_max_long_size` / `--max-long-size`; the
   per-call `append_image_with_opts(bytes, max_long_size)` overrides it.
+- **GPU encode:** `model/vision_encoder_gpu.rs` runs the whole ViT (patch-embed,
+  attention, MLP, projector) on the GPU behind a shared `VitGpuOps` trait, with
+  both a wgpu (`WgpuVitOps`) and a native-Metal (`MetalVitOps`) implementation.
+  The engine builds + caches the GPU encoder from `BackendPreference`
+  (Auto→Metal→wgpu→CPU); sessions auto-select it for grids within the attention
+  kernel's capacity and fall back to the CPU encoder otherwise. Validated by
+  CPU-parity unit tests + gated real-weights tests (embedding parity + identical
+  generated description). im2col, position-embed interpolation, and pixel-shuffle
+  stay on the CPU (small, data-dependent rearrangement).
 
 Remaining:
-- CPU-only encode path — no wgpu/Metal acceleration for the ViT yet.
 - No image slicing/tiling — high-res input is downscaled to a single tile, so
   `maxLongSize` lowers cost/resolution but can't raise effective resolution
   above the single-tile budget (≈512²). Slicing is the high-res path.

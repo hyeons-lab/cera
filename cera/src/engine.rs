@@ -208,6 +208,11 @@ pub struct CeraEngine {
     /// the primary VL accessor — Phase 2's forward pass reads from
     /// it directly.
     vision_encoder: Option<Arc<VisionEncoderWeights>>,
+    /// Cached GPU vision encoder, built at construction when `vision_encoder`
+    /// is present and `cfg.backend` selects a GPU backend (and the device is
+    /// available). Shared into every session via `new_session`; sessions fall
+    /// back to the CPU `vision_encoder` when this is `None`.
+    gpu_vision_encoder: Option<Arc<dyn crate::model::vision_encoder_gpu::VisionGpuEncode>>,
 }
 
 impl CeraEngine {
@@ -437,6 +442,13 @@ impl CeraEngine {
         let vision_encoder = vision_encoder_gguf
             .as_ref()
             .and_then(|g| try_parse_vision_encoder(g, vl_mmproj_path));
+        // Build a cached GPU vision encoder when the backend selects one and a
+        // device is available. Uploading the mmproj to the GPU here (once)
+        // keeps it off the per-image hot path. Falls back to `None` (CPU
+        // encode) for `Cpu`, disabled features, or device-init failure.
+        let gpu_vision_encoder = vision_encoder.as_ref().and_then(|w| {
+            crate::model::vision_encoder_gpu::build_gpu_vision_encoder(w, cfg.backend)
+        });
         Ok(Self {
             manifest,
             model,
@@ -446,6 +458,7 @@ impl CeraEngine {
             audio_encoder,
             vision_encoder_gguf,
             vision_encoder,
+            gpu_vision_encoder,
         })
     }
 
@@ -515,6 +528,11 @@ impl CeraEngine {
         // the Arc per session is cheap.
         if let Some(encoder) = &self.vision_encoder {
             session.attach_vision_encoder(Arc::clone(encoder));
+        }
+        // GPU vision encoder (if one was built); the session prefers it over
+        // the CPU encoder for image input within the GPU kernel's capacity.
+        if let Some(gpu) = &self.gpu_vision_encoder {
+            session.attach_gpu_vision_encoder(Arc::clone(gpu));
         }
         session
     }
@@ -654,6 +672,14 @@ impl CeraEngine {
     /// construction (warned via tracing).
     pub fn vision_encoder(&self) -> Option<&Arc<VisionEncoderWeights>> {
         self.vision_encoder.as_ref()
+    }
+
+    /// Whether a GPU vision encoder was built at construction (true when a VL
+    /// mmproj loaded, `cfg.backend` selected a GPU backend, and the device was
+    /// available). When false, image input falls back to the CPU encoder.
+    /// Primarily for tests/diagnostics — sessions auto-select the GPU path.
+    pub fn has_gpu_vision_encoder(&self) -> bool {
+        self.gpu_vision_encoder.is_some()
     }
 
     /// Borrow the raw mmapped vision-encoder mmproj GGUF, if any.

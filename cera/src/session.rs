@@ -338,6 +338,12 @@ pub struct Session {
     /// before [`Self::append_image`] is called. Held by `Arc`
     /// for the same reason as `audio_encoder`.
     vision_encoder: Option<Arc<crate::model::vision_encoder::VisionEncoderWeights>>,
+    /// Optional cached GPU vision encoder. When present (and the patch
+    /// grid fits the GPU attention kernel), [`Self::append_image_with_opts`]
+    /// runs the ViT on the GPU instead of the CPU `vision_encoder`; the
+    /// CPU encoder above is always kept as the fallback. Attached via
+    /// [`Self::attach_gpu_vision_encoder`].
+    gpu_vision_encoder: Option<Arc<dyn crate::model::vision_encoder_gpu::VisionGpuEncode>>,
     /// Session-default cap on the longest side of an appended image
     /// (in pixels), honored by every image-append path — including
     /// [`Self::append_chat_with_images`]. `None` = no cap (native
@@ -444,6 +450,7 @@ impl Session {
             config,
             audio_encoder: None,
             vision_encoder: None,
+            gpu_vision_encoder: None,
             image_max_long_size: None,
             grammar_mask: None,
         }
@@ -481,6 +488,20 @@ impl Session {
         encoder: Arc<crate::model::vision_encoder::VisionEncoderWeights>,
     ) {
         self.vision_encoder = Some(encoder);
+    }
+
+    /// Attach a cached GPU vision encoder. When present,
+    /// [`Self::append_image_with_opts`] runs the ViT on the GPU for patch
+    /// grids within the GPU kernel's capacity
+    /// ([`crate::model::vision_encoder_gpu::MAX_VIT_TOKENS`]), falling back
+    /// to the CPU `vision_encoder` otherwise. The CPU encoder must still be
+    /// attached via [`Self::attach_vision_encoder`] (it backs the fallback
+    /// and the capability/dimension checks). Preserved across `reset()`.
+    pub fn attach_gpu_vision_encoder(
+        &mut self,
+        encoder: Arc<dyn crate::model::vision_encoder_gpu::VisionGpuEncode>,
+    ) {
+        self.gpu_vision_encoder = Some(encoder);
     }
 
     /// Set the session-default cap on the longest side of an appended
@@ -1011,9 +1032,34 @@ impl Session {
             &encoder.config,
             max_long_size,
         )?;
-        let img_tokens = encoder
-            .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
-            .map_err(|e| CeraError::Backend(format!("encode_image: {e:#}")))?;
+        // Prefer the cached GPU encoder when one is attached and the patch
+        // grid fits the GPU attention kernel's capacity; otherwise (or for
+        // oversized grids) use the CPU encoder. The output is identical in
+        // shape and numerically equivalent either way.
+        let grid_tokens = pre.grid_w.saturating_mul(pre.grid_h);
+        let gpu = self
+            .gpu_vision_encoder
+            .as_ref()
+            .filter(|_| grid_tokens <= crate::model::vision_encoder_gpu::MAX_VIT_TOKENS);
+        let img_tokens = if let Some(gpu) = gpu {
+            match gpu.encode_image(&pre.pixels, pre.grid_w, pre.grid_h) {
+                Ok(tokens) => tokens,
+                // A GPU runtime failure (device lost, OOM, command-buffer
+                // error) must not abort the append: the CPU encoder is always
+                // attached as the documented fallback and produces numerically
+                // equivalent output. Degrade to it instead of failing.
+                Err(e) => {
+                    tracing::warn!("gpu vision encode failed ({e:#}); falling back to CPU encoder");
+                    encoder
+                        .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
+                        .map_err(|e| CeraError::Backend(format!("encode_image: {e:#}")))?
+                }
+            }
+        } else {
+            encoder
+                .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
+                .map_err(|e| CeraError::Backend(format!("encode_image: {e:#}")))?
+        };
         // Sanity-check the encoder output shape before handing off
         // to `append_embeddings`. Integer division below would
         // silently truncate a non-multiple length and surface as a

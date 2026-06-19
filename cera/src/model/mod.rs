@@ -499,6 +499,7 @@ pub mod audio_decoder;
 pub mod audio_encoder;
 pub mod audio_preprocessor;
 pub mod vision_encoder;
+pub mod vision_encoder_gpu;
 #[cfg(feature = "vl-preprocess")]
 pub mod vision_preprocessor;
 pub mod weights;

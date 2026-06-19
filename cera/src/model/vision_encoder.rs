@@ -821,19 +821,7 @@ fn patch_embed_compute(
     let conv_w = &patch_embed.conv_w;
     let conv_b = &patch_embed.conv_b;
     let compute_patch = |patch: &mut [f32], patch_idx: usize, out_row: &mut [f32]| {
-        let gr = patch_idx / grid_w;
-        let gc = patch_idx % grid_w;
-        for c in 0..3 {
-            for kh in 0..p {
-                for kw in 0..p {
-                    let pixel_r = gr * p + kh;
-                    let pixel_c = gc * p + kw;
-                    let in_idx = c * p * p + kh * p + kw;
-                    let img_idx = c * c_stride + pixel_r * h_stride + pixel_c;
-                    patch[in_idx] = image[img_idx];
-                }
-            }
-        }
+        extract_patch(image, patch, patch_idx, grid_w, p, h_stride, c_stride);
         out_row.copy_from_slice(conv_b);
         crate::backend::cpu::matmul_f32(patch, conv_w, out_row, 1, out_dim, in_dim);
     };
@@ -863,6 +851,35 @@ fn patch_embed_compute(
     out
 }
 
+/// Extract one `[3·patch_size²]` patch (channel-major `(c, kh, kw)` layout)
+/// from an NCHW `image` into `patch`. Shared by the CPU `patch_embed_compute`
+/// and the GPU `im2col_patches` so the two patch extractions stay identical.
+/// `h_stride = target_w`, `c_stride = target_h · target_w`.
+#[inline]
+pub(crate) fn extract_patch(
+    image: &[f32],
+    patch: &mut [f32],
+    patch_idx: usize,
+    grid_w: usize,
+    p: usize,
+    h_stride: usize,
+    c_stride: usize,
+) {
+    let gr = patch_idx / grid_w;
+    let gc = patch_idx % grid_w;
+    for c in 0..3 {
+        for kh in 0..p {
+            for kw in 0..p {
+                let pixel_r = gr * p + kh;
+                let pixel_c = gc * p + kw;
+                let in_idx = c * p * p + kh * p + kw;
+                let img_idx = c * c_stride + pixel_r * h_stride + pixel_c;
+                patch[in_idx] = image[img_idx];
+            }
+        }
+    }
+}
+
 /// Bilinearly interpolate position embeddings from the trained
 /// `(in_h, in_w)` square grid to a dynamic `(out_h, out_w)` grid.
 /// Mirrors llama.cpp's `clip_graph::resize_position_embeddings`
@@ -874,7 +891,7 @@ fn patch_embed_compute(
 /// - 0.5)`, clamped to `[0, in_dim - 1]`. Output layout is
 /// `[out_h × out_w, n_embd]` row-major, matching the patch order
 /// `encode_image` adds against.
-fn interpolate_pos_embed_2d(
+pub(crate) fn interpolate_pos_embed_2d(
     pos: &[f32],
     in_h: usize,
     in_w: usize,
@@ -928,7 +945,7 @@ fn interpolate_pos_embed_2d(
 /// LFM2 projector convention; both grid dims must be divisible
 /// by `cfg.scale_factor` (the preprocessor's
 /// `align_size = patch_size · scale_factor` guarantees that).
-fn pixel_shuffle(
+pub(crate) fn pixel_shuffle(
     tokens: &[f32],
     cfg: &VisionEncoderConfig,
     grid_w: usize,
