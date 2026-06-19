@@ -888,6 +888,8 @@ pub struct MetalVitOps {
     p_layernorm: metal::ComputePipelineState,
     p_gelu: metal::ComputePipelineState,
     p_attn: metal::ComputePipelineState,
+    p_attn_mma: metal::ComputePipelineState,
+    p_attn_mma_hd64: metal::ComputePipelineState,
     p_add: metal::ComputePipelineState,
 }
 
@@ -903,6 +905,9 @@ impl MetalVitOps {
             p_layernorm: ctx.create_pipeline(shaders::LAYERNORM_BATCH, "layernorm_batch")?,
             p_gelu: ctx.create_pipeline(shaders::GELU, "gelu_inplace")?,
             p_attn: ctx.create_pipeline(shaders::VIT_ATTENTION, "vit_attention")?,
+            p_attn_mma: ctx.create_pipeline(shaders::VIT_ATTENTION_MMA, "vit_attention_mma")?,
+            p_attn_mma_hd64: ctx
+                .create_pipeline(shaders::VIT_ATTENTION_MMA, "vit_attention_mma_hd64")?,
             p_add: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace")?,
             ctx,
         })
@@ -979,6 +984,61 @@ impl MetalVitOps {
                 1,
             ),
             metal::MTLSize::new(128, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    /// Bidirectional attention via the flash-attention MMA kernel
+    /// (`vit_attention_mma`). Requires `head_dim % 8 == 0`; the caller falls
+    /// back to the scalar `vit_attention` otherwise. `q`/`k`/`v`/`out` are
+    /// `[tokens, n_head*head_dim]` f32. Threadgroup memory and grid mirror
+    /// `attention_prefill`'s host dispatch (Q_PER_TG=8 queries/threadgroup).
+    #[allow(clippy::too_many_arguments)]
+    fn run_attn_mma(
+        &self,
+        q: &metal::Buffer,
+        k: &metal::Buffer,
+        v: &metal::Buffer,
+        out: &metal::Buffer,
+        tokens: usize,
+        n_head: usize,
+        head_dim: usize,
+    ) {
+        const Q_PER_TG: u64 = 8;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let params: [u32; 4] = [
+            tokens as u32,
+            n_head as u32,
+            head_dim as u32,
+            scale.to_bits(),
+        ];
+        // q_tg + kv_tile (half) + scores + out_tg + state + rescales (f32)
+        // = 2·(8+64)·hd + 4·(8·64 + 8·hd + 8·2 + 8) bytes = 176·hd + 2144.
+        let shmem = 176 * head_dim as u64 + 2144;
+        // hd=64 gets the constant-propagated variant; others use the runtime one.
+        let pipe = if head_dim == 64 {
+            &self.p_attn_mma_hd64
+        } else {
+            &self.p_attn_mma
+        };
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipe);
+        enc.set_buffer(0, Some(q), 0);
+        enc.set_buffer(1, Some(k), 0);
+        enc.set_buffer(2, Some(v), 0);
+        enc.set_buffer(3, Some(out), 0);
+        enc.set_bytes(
+            4,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.set_threadgroup_memory_length(0, shmem);
+        enc.dispatch_thread_groups(
+            metal::MTLSize::new(n_head as u64 * (tokens as u64).div_ceil(Q_PER_TG), 1, 1),
+            metal::MTLSize::new(256, 1, 1),
         );
         enc.end_encoding();
         cb.commit();
@@ -1102,20 +1162,27 @@ impl VitGpuOps for MetalVitOps {
     ) -> Self::Buf {
         let dim = n_head * head_dim;
         let out = self.ctx.create_buffer((tokens * dim * 4) as u64);
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let params: [u32; 4] = [
-            tokens as u32,
-            n_head as u32,
-            head_dim as u32,
-            scale.to_bits(),
-        ];
-        self.run(
-            &self.p_attn,
-            &[q, k, v, &out],
-            bytemuck::cast_slice(&params),
-            metal::MTLSize::new(tokens as u64, n_head as u64, 1),
-            metal::MTLSize::new(256, 1, 1),
-        );
+        // Flash-attention MMA kernel needs head_dim a multiple of 8 (and ≤ 256,
+        // the threadgroup-memory budget); fall back to the scalar kernel for
+        // exotic head dims.
+        if head_dim % 8 == 0 && head_dim <= 256 {
+            self.run_attn_mma(q, k, v, &out, tokens, n_head, head_dim);
+        } else {
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let params: [u32; 4] = [
+                tokens as u32,
+                n_head as u32,
+                head_dim as u32,
+                scale.to_bits(),
+            ];
+            self.run(
+                &self.p_attn,
+                &[q, k, v, &out],
+                bytemuck::cast_slice(&params),
+                metal::MTLSize::new(tokens as u64, n_head as u64, 1),
+                metal::MTLSize::new(256, 1, 1),
+            );
+        }
         out
     }
 

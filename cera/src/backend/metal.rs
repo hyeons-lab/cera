@@ -194,6 +194,7 @@ pub mod shaders {
     pub const GELU: &str = include_str!("shaders/gelu.metal");
     pub const BIAS_ADD: &str = include_str!("shaders/bias_add.metal");
     pub const VIT_ATTENTION: &str = include_str!("shaders/vit_attention.metal");
+    pub const VIT_ATTENTION_MMA: &str = include_str!("shaders/vit_attention_mma.metal");
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
