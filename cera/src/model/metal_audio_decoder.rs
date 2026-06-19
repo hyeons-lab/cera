@@ -60,6 +60,7 @@ struct DetokLayerGpu {
 struct Pipelines {
     gemv_f32: ComputePipelineState,
     memcpy_f32: ComputePipelineState,
+    cast_f32_to_f16: ComputePipelineState,
     mul_out: ComputePipelineState,
     add_inplace: ComputePipelineState,
     silu_mul_inplace: ComputePipelineState,
@@ -158,6 +159,7 @@ impl MetalAudioDecoder {
         let pipes = Pipelines {
             gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32")?,
             memcpy_f32: ctx.create_pipeline(shaders::ELEMENTWISE, "memcpy_f32")?,
+            cast_f32_to_f16: ctx.create_pipeline(shaders::ELEMENTWISE, "cast_f32_to_f16")?,
             mul_out: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_out")?,
             add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace")?,
             silu_mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "silu_mul_inplace")?,
@@ -294,8 +296,10 @@ impl MetalAudioDecoder {
             if cfg.layer_is_conv[i] {
                 conv_bufs[i] = Some(ab(cfg.d_conv * n_embd));
             } else {
-                // KV caches are f32. flash_attention reads float*, not half*.
-                let kv_bytes = (cfg.swa_window_size * kv_dim * 4) as u64;
+                // KV caches are f16: flash_attention reads `half*` k_cache/v_cache
+                // (the K/V projections are computed in f32 and cast to f16 before
+                // the cache write — same shape as the LLM path in metal_lfm2).
+                let kv_bytes = (cfg.swa_window_size * kv_dim * 2) as u64;
                 kv_k[i] = Some(ctx.create_buffer(kv_bytes));
                 kv_v[i] = Some(ctx.create_buffer(kv_bytes));
             }
@@ -472,6 +476,25 @@ impl MetalAudioDecoder {
         enc.set_compute_pipeline_state(&self.pipes.memcpy_f32);
         enc.set_buffer(0, Some(src), src_off);
         enc.set_buffer(1, Some(dst), dst_off);
+        enc.set_bytes(2, 8, params.as_ptr() as *const _);
+        enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
+    }
+
+    /// Cast `n` f32 elements from `src` (offset 0) into `dst` as f16 at
+    /// `dst_off_bytes`. Used to write K/V projections into the f16 KV cache
+    /// that `flash_attention` consumes.
+    fn encode_cast_f32_to_f16(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        src: &Buffer,
+        dst: &Buffer,
+        dst_off_bytes: u64,
+        n: u32,
+    ) {
+        let params: [u32; 2] = [n, 0];
+        enc.set_compute_pipeline_state(&self.pipes.cast_f32_to_f16);
+        enc.set_buffer(0, Some(src), 0);
+        enc.set_buffer(1, Some(dst), dst_off_bytes);
         enc.set_bytes(2, 8, params.as_ptr() as *const _);
         enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
     }
@@ -671,11 +694,12 @@ impl MetalAudioDecoder {
             enc.dispatch_thread_groups(sz1d(n_kv as u64), sz1d(256));
             self.barrier(enc);
 
-            // Write K/V to cache as f32 (no f16 cast — preserves precision)
+            // Write K/V to cache as f16 — flash_attention reads `half*` cache.
+            // Offsets are in f16 bytes (kv_dim · 2).
             let cache_pos = pos % self.cfg.swa_window_size;
-            let cache_off = (cache_pos * kv_dim * 4) as u64;
-            self.encode_memcpy(enc, &self.k_buf, 0, k_cache, cache_off, kv_dim);
-            self.encode_memcpy(enc, &self.v_buf, 0, v_cache, cache_off, kv_dim);
+            let cache_off = (cache_pos * kv_dim * 2) as u64;
+            self.encode_cast_f32_to_f16(enc, &self.k_buf, k_cache, cache_off, kv_dim as u32);
+            self.encode_cast_f32_to_f16(enc, &self.v_buf, v_cache, cache_off, kv_dim as u32);
             self.barrier(enc);
         }
 
@@ -867,7 +891,7 @@ struct DfLayerGpu {
 struct DfPipelines {
     gemv_f32: ComputePipelineState,
     add_inplace: ComputePipelineState,
-    memcpy_f32: ComputePipelineState,
+    cast_f32_to_f16: ComputePipelineState,
     rmsnorm: ComputePipelineState,
     qk_norm_rope: ComputePipelineState,
     flash_attention: ComputePipelineState,
@@ -918,7 +942,7 @@ impl MetalDepthformer {
         let pipes = DfPipelines {
             gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32")?,
             add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace")?,
-            memcpy_f32: ctx.create_pipeline(shaders::ELEMENTWISE, "memcpy_f32")?,
+            cast_f32_to_f16: ctx.create_pipeline(shaders::ELEMENTWISE, "cast_f32_to_f16")?,
             rmsnorm: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm")?,
             qk_norm_rope: ctx.create_pipeline(shaders::QK_NORM_ROPE, "qk_norm_rope")?,
             flash_attention: ctx.create_pipeline(shaders::FLASH_ATTENTION, "flash_attention")?,
@@ -1033,8 +1057,9 @@ impl MetalDepthformer {
         let mut kv_k = Vec::with_capacity(df_cfg.n_layer);
         let mut kv_v = Vec::with_capacity(df_cfg.n_layer);
         for _ in 0..df_cfg.n_layer {
-            kv_k.push(ctx.create_buffer((df_cfg.max_seq_len * kv_dim * 4) as u64)); // f32
-            kv_v.push(ctx.create_buffer((df_cfg.max_seq_len * kv_dim * 4) as u64));
+            // f16 KV cache: flash_attention reads `half*` k_cache/v_cache.
+            kv_k.push(ctx.create_buffer((df_cfg.max_seq_len * kv_dim * 2) as u64));
+            kv_v.push(ctx.create_buffer((df_cfg.max_seq_len * kv_dim * 2) as u64));
         }
 
         let hidden_buf = buf(n_embd);
@@ -1165,25 +1190,27 @@ impl MetalDepthformer {
                 enc.set_bytes(4, 28, rope_params.as_ptr() as *const _);
                 enc.dispatch_thread_groups(sz1d((n_head + n_kv) as u64), sz1d(256));
 
-                // KV cache write: GPU memcpy from qkv_buf to cache (f32)
+                // KV cache write: cast f32 qkv_buf → f16 cache (flash_attention
+                // reads `half*`). Source offsets are f32 bytes; the cache offset
+                // is f16 bytes (kv_dim · 2).
                 let k_src_off = (q_dim * 4) as u64;
                 let v_src_off = ((q_dim + kv_dim) * 4) as u64;
-                let cache_off = (pos * kv_dim * 4) as u64;
+                let cache_off = (pos * kv_dim * 2) as u64;
                 let copy_params: [u32; 2] = [kv_dim as u32, 0];
-                // Copy K
-                enc.set_compute_pipeline_state(&self.pipes.memcpy_f32);
+                // Cast K
+                enc.set_compute_pipeline_state(&self.pipes.cast_f32_to_f16);
                 enc.set_buffer(0, Some(&self.qkv_buf), k_src_off);
                 enc.set_buffer(1, Some(&self.kv_k[il]), cache_off);
                 enc.set_bytes(2, 8, copy_params.as_ptr() as *const _);
                 enc.dispatch_thread_groups(sz1d((kv_dim as u64).div_ceil(256)), sz1d(256));
-                // Copy V
-                enc.set_compute_pipeline_state(&self.pipes.memcpy_f32);
+                // Cast V
+                enc.set_compute_pipeline_state(&self.pipes.cast_f32_to_f16);
                 enc.set_buffer(0, Some(&self.qkv_buf), v_src_off);
                 enc.set_buffer(1, Some(&self.kv_v[il]), cache_off);
                 enc.set_bytes(2, 8, copy_params.as_ptr() as *const _);
                 enc.dispatch_thread_groups(sz1d((kv_dim as u64).div_ceil(256)), sz1d(256));
 
-                // Attention (flash_attention reads float* KV)
+                // Attention (flash_attention reads `half*` KV)
                 let seq_len = pos + 1;
                 let attn_params: [u32; 8] = [
                     n_head,
