@@ -873,8 +873,9 @@ impl MetalAudioDecoder {
 
 // ── MetalDepthformer ────────────────────────────────────────────────────────
 //
-// F32 dequantized weights (matching CPU precision) + f32 KV cache.
-// Uses gemv_f32 + flash_attention (same as detokenizer F32 path).
+// F32 dequantized weights (matching CPU precision) + f16 KV cache (cast from
+// the f32 K/V projections before the cache write — `flash_attention` reads
+// `half*`). Uses gemv_f32 + flash_attention (same as the detokenizer path).
 
 struct DfLayerGpu {
     operator_norm: Buffer,
