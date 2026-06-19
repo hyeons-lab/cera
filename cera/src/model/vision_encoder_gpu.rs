@@ -122,6 +122,15 @@ pub trait VitGpuOps {
 
     /// In-place residual add: `dst[i] += src[i]` over `len` elements.
     fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize);
+
+    /// Block until all previously submitted GPU work has completed.
+    ///
+    /// Default no-op: Metal's ops each block on `wait_until_completed`, so the
+    /// GPU is already idle between calls. wgpu's `dispatch` only *submits* (work
+    /// runs asynchronously and is synced lazily at `download`), so it overrides
+    /// this with `device.poll(Wait)`. Only the env-gated [`VitProfiler`] calls
+    /// `sync` — the normal forward path never does, so wgpu keeps its pipelining.
+    fn sync(&self) {}
 }
 
 /// Dequantize a linear weight to a contiguous `[rows*cols]` f32 vector for
@@ -276,9 +285,80 @@ fn im2col_patches(
     patches
 }
 
+/// Env-gated per-op wall-clock profiler for [`encode_image_gpu`].
+///
+/// Enabled by setting `CERA_VIT_PROFILE` to a non-empty, non-`0` value. When
+/// unset the profiler is `None` and the forward pass runs with zero overhead
+/// (no timers, no `sync` calls). When set, each GPU op is followed by
+/// `ops.sync()` so its wall-clock isolates that op — accurate on Metal (ops
+/// already block) and on wgpu (the forced sync drains the otherwise-async
+/// dispatch).
+///
+/// NOTE: those per-op syncs serialize wgpu, so the *sum* reported here exceeds
+/// wgpu's real pipelined total — use the `vit_encode_bench` benchmark (profiling
+/// off) for end-to-end numbers. The per-op *breakdown* is the bottleneck signal.
+struct VitProfiler {
+    /// `(label, summed duration, call count)`, in first-seen order.
+    spans: std::cell::RefCell<Vec<(&'static str, std::time::Duration, u32)>>,
+}
+
+impl VitProfiler {
+    /// `Some` iff `CERA_VIT_PROFILE` is set to a non-empty, non-`0` value.
+    fn from_env() -> Option<Self> {
+        match std::env::var("CERA_VIT_PROFILE") {
+            Ok(v) if !v.is_empty() && v != "0" => Some(Self {
+                spans: std::cell::RefCell::new(Vec::new()),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Add `d` to the running total for `label` (creating it on first use).
+    fn record(&self, label: &'static str, d: std::time::Duration) {
+        let mut spans = self.spans.borrow_mut();
+        match spans.iter_mut().find(|s| s.0 == label) {
+            Some(s) => {
+                s.1 += d;
+                s.2 += 1;
+            }
+            None => spans.push((label, d, 1)),
+        }
+    }
+
+    /// Print the breakdown to stderr, sorted by descending total time, with each
+    /// op's share of the summed total, call count, and per-call mean.
+    fn report(&self, n_patches: usize, n_layer: usize) {
+        let mut spans = self.spans.borrow().clone();
+        spans.sort_by_key(|s| std::cmp::Reverse(s.1));
+        let total_ms: f64 = spans.iter().map(|s| s.1.as_secs_f64() * 1e3).sum();
+        eprintln!(
+            "\nViT GPU profile — {n_patches} patches, {n_layer} layers \
+             (per-op sync; wgpu sum is serialized, not the pipelined total)"
+        );
+        eprintln!(
+            "  {:<16} {:>10} {:>7} {:>6} {:>10}",
+            "stage", "total ms", "%", "calls", "mean ms"
+        );
+        for (label, dur, count) in &spans {
+            let ms = dur.as_secs_f64() * 1e3;
+            let pct = if total_ms > 0.0 {
+                ms / total_ms * 100.0
+            } else {
+                0.0
+            };
+            let mean = ms / *count as f64;
+            eprintln!("  {label:<16} {ms:>10.2} {pct:>6.1}% {count:>6} {mean:>10.3}");
+        }
+        eprintln!("  {:<16} {total_ms:>10.2} {:>6.1}%", "TOTAL", 100.0);
+    }
+}
+
 /// Run the ViT encoder + projector on the GPU. Backend-agnostic: `ops` provides
 /// the kernels, `gpu_w` the uploaded weights. Output is identical in shape to
 /// [`VisionEncoderWeights::encode_image`]: `[n_image_tokens * projection_dim]`.
+///
+/// Set `CERA_VIT_PROFILE=1` to print a per-op timing breakdown (see
+/// [`VitProfiler`]); unset, this runs with zero profiling overhead.
 pub fn encode_image_gpu<O: VitGpuOps>(
     ops: &O,
     gpu_w: &GpuVitWeights<O::Buf>,
@@ -318,17 +398,56 @@ pub fn encode_image_gpu<O: VitGpuOps>(
          caller should fall back to CPU",
     );
 
+    // Env-gated profiler (`CERA_VIT_PROFILE`). `None` → zero overhead.
+    let prof = VitProfiler::from_env();
+    // Time a GPU op: run it, force the GPU to finish (so async wgpu dispatches
+    // are attributed correctly), then record. Compiles to bare `$e` when off.
+    macro_rules! timed {
+        ($label:literal, $e:expr) => {{
+            match &prof {
+                Some(p) => {
+                    let __t = std::time::Instant::now();
+                    let __r = $e;
+                    ops.sync();
+                    p.record($label, __t.elapsed());
+                    __r
+                }
+                None => $e,
+            }
+        }};
+    }
+    // Time a CPU-side stage (no GPU sync — these don't submit GPU work).
+    macro_rules! timed_cpu {
+        ($label:literal, $e:expr) => {{
+            match &prof {
+                Some(p) => {
+                    let __t = std::time::Instant::now();
+                    let __r = $e;
+                    p.record($label, __t.elapsed());
+                    __r
+                }
+                None => $e,
+            }
+        }};
+    }
+
     // 1. Patch embed: im2col on CPU, batched matmul + bias on GPU.
-    let patches = im2col_patches(pixels, cfg, grid_w, grid_h);
-    let patches_buf = ops.upload(&patches);
-    let tokens = ops.linear(
-        &patches_buf,
-        &gpu_w.patch_conv_wt,
-        n_patches,
-        n_embd,
-        in_dim,
+    let patches = timed_cpu!("im2col", im2col_patches(pixels, cfg, grid_w, grid_h));
+    let patches_buf = timed!("upload", ops.upload(&patches));
+    let tokens = timed!(
+        "linear",
+        ops.linear(
+            &patches_buf,
+            &gpu_w.patch_conv_wt,
+            n_patches,
+            n_embd,
+            in_dim
+        )
     );
-    ops.bias_add(&tokens, &gpu_w.patch_conv_b, n_patches, n_embd);
+    timed!(
+        "bias_add",
+        ops.bias_add(&tokens, &gpu_w.patch_conv_b, n_patches, n_embd)
+    );
 
     // 2. Add (interpolated) position embeddings. The trained grid is square;
     // guard that in release too (the CPU encoder only `debug_assert`s it), since
@@ -344,70 +463,125 @@ pub fn encode_image_gpu<O: VitGpuOps>(
     let pos: std::borrow::Cow<[f32]> = if grid_w == trained_side && grid_h == trained_side {
         std::borrow::Cow::Borrowed(&gpu_w.position_embed)
     } else {
-        std::borrow::Cow::Owned(interpolate_pos_embed_2d(
-            &gpu_w.position_embed,
-            trained_side,
-            trained_side,
-            grid_h,
-            grid_w,
-            n_embd,
-        ))
+        timed_cpu!(
+            "posembed_interp",
+            std::borrow::Cow::Owned(interpolate_pos_embed_2d(
+                &gpu_w.position_embed,
+                trained_side,
+                trained_side,
+                grid_h,
+                grid_w,
+                n_embd,
+            ))
+        )
     };
-    let pos_buf = ops.upload(&pos);
-    ops.add(&tokens, &pos_buf, n_patches * n_embd);
+    let pos_buf = timed!("upload", ops.upload(&pos));
+    timed!("add", ops.add(&tokens, &pos_buf, n_patches * n_embd));
 
     // 3. ViT blocks.
     for blk in &gpu_w.blocks {
         // Pre-attention LN → Q/K/V (+bias) → attention → O proj (+bias) → residual.
-        let normed = ops.layernorm(&tokens, &blk.ln1_w, &blk.ln1_b, eps, n_patches, n_embd);
-        let q = ops.linear(&normed, &blk.q_w, n_patches, n_embd, n_embd);
-        ops.bias_add(&q, &blk.q_b, n_patches, n_embd);
-        let k = ops.linear(&normed, &blk.k_w, n_patches, n_embd, n_embd);
-        ops.bias_add(&k, &blk.k_b, n_patches, n_embd);
-        let v = ops.linear(&normed, &blk.v_w, n_patches, n_embd, n_embd);
-        ops.bias_add(&v, &blk.v_b, n_patches, n_embd);
-        let attn = ops.attention(&q, &k, &v, n_patches, n_head, head_dim);
-        let proj = ops.linear(&attn, &blk.o_w, n_patches, n_embd, n_embd);
-        ops.bias_add(&proj, &blk.o_b, n_patches, n_embd);
-        ops.add(&tokens, &proj, n_patches * n_embd);
+        let normed = timed!(
+            "layernorm",
+            ops.layernorm(&tokens, &blk.ln1_w, &blk.ln1_b, eps, n_patches, n_embd)
+        );
+        let q = timed!(
+            "linear",
+            ops.linear(&normed, &blk.q_w, n_patches, n_embd, n_embd)
+        );
+        timed!("bias_add", ops.bias_add(&q, &blk.q_b, n_patches, n_embd));
+        let k = timed!(
+            "linear",
+            ops.linear(&normed, &blk.k_w, n_patches, n_embd, n_embd)
+        );
+        timed!("bias_add", ops.bias_add(&k, &blk.k_b, n_patches, n_embd));
+        let v = timed!(
+            "linear",
+            ops.linear(&normed, &blk.v_w, n_patches, n_embd, n_embd)
+        );
+        timed!("bias_add", ops.bias_add(&v, &blk.v_b, n_patches, n_embd));
+        let attn = timed!(
+            "attention",
+            ops.attention(&q, &k, &v, n_patches, n_head, head_dim)
+        );
+        let proj = timed!(
+            "linear",
+            ops.linear(&attn, &blk.o_w, n_patches, n_embd, n_embd)
+        );
+        timed!("bias_add", ops.bias_add(&proj, &blk.o_b, n_patches, n_embd));
+        timed!("add", ops.add(&tokens, &proj, n_patches * n_embd));
 
         // Pre-MLP LN → FFN up (+bias) → GELU → FFN down (+bias) → residual.
-        let normed2 = ops.layernorm(&tokens, &blk.ln2_w, &blk.ln2_b, eps, n_patches, n_embd);
-        let mid = ops.linear(&normed2, &blk.ffn_up_w, n_patches, n_ff, n_embd);
-        ops.bias_add(&mid, &blk.ffn_up_b, n_patches, n_ff);
-        ops.gelu(&mid, n_patches * n_ff);
-        let down = ops.linear(&mid, &blk.ffn_down_w, n_patches, n_embd, n_ff);
-        ops.bias_add(&down, &blk.ffn_down_b, n_patches, n_embd);
-        ops.add(&tokens, &down, n_patches * n_embd);
+        let normed2 = timed!(
+            "layernorm",
+            ops.layernorm(&tokens, &blk.ln2_w, &blk.ln2_b, eps, n_patches, n_embd)
+        );
+        let mid = timed!(
+            "linear",
+            ops.linear(&normed2, &blk.ffn_up_w, n_patches, n_ff, n_embd)
+        );
+        timed!(
+            "bias_add",
+            ops.bias_add(&mid, &blk.ffn_up_b, n_patches, n_ff)
+        );
+        timed!("gelu", ops.gelu(&mid, n_patches * n_ff));
+        let down = timed!(
+            "linear",
+            ops.linear(&mid, &blk.ffn_down_w, n_patches, n_embd, n_ff)
+        );
+        timed!(
+            "bias_add",
+            ops.bias_add(&down, &blk.ffn_down_b, n_patches, n_embd)
+        );
+        timed!("add", ops.add(&tokens, &down, n_patches * n_embd));
     }
 
     // 4. Post-LN.
-    let tokens = ops.layernorm(
-        &tokens,
-        &gpu_w.post_ln_w,
-        &gpu_w.post_ln_b,
-        eps,
-        n_patches,
-        n_embd,
+    let tokens = timed!(
+        "layernorm",
+        ops.layernorm(
+            &tokens,
+            &gpu_w.post_ln_w,
+            &gpu_w.post_ln_b,
+            eps,
+            n_patches,
+            n_embd
+        )
     );
 
     // 5. Pixel-shuffle on CPU (pure rearrangement).
-    let tok_cpu = ops.download(&tokens, n_patches * n_embd);
-    let pooled = pixel_shuffle(&tok_cpu, cfg, grid_w, grid_h);
+    let tok_cpu = timed!("download", ops.download(&tokens, n_patches * n_embd));
+    let pooled = timed_cpu!(
+        "pixel_shuffle",
+        pixel_shuffle(&tok_cpu, cfg, grid_w, grid_h)
+    );
     let pooled_in_dim = n_embd * cfg.scale_factor * cfg.scale_factor;
     let n_out = pooled.len() / pooled_in_dim;
 
     // 6. Projector: mm.1 (+bias) + GELU → mm.2 (+bias).
     let mid_dim = gpu_w.proj_intermediate;
-    let pooled_buf = ops.upload(&pooled);
+    let pooled_buf = timed!("upload", ops.upload(&pooled));
     let proj_dim = cfg.projection_dim;
-    let mid = ops.linear(&pooled_buf, &gpu_w.mm1_w, n_out, mid_dim, pooled_in_dim);
-    ops.bias_add(&mid, &gpu_w.mm1_b, n_out, mid_dim);
-    ops.gelu(&mid, n_out * mid_dim);
-    let out = ops.linear(&mid, &gpu_w.mm2_w, n_out, proj_dim, mid_dim);
-    ops.bias_add(&out, &gpu_w.mm2_b, n_out, proj_dim);
+    let mid = timed!(
+        "linear",
+        ops.linear(&pooled_buf, &gpu_w.mm1_w, n_out, mid_dim, pooled_in_dim)
+    );
+    timed!("bias_add", ops.bias_add(&mid, &gpu_w.mm1_b, n_out, mid_dim));
+    timed!("gelu", ops.gelu(&mid, n_out * mid_dim));
+    let out = timed!(
+        "linear",
+        ops.linear(&mid, &gpu_w.mm2_w, n_out, proj_dim, mid_dim)
+    );
+    timed!(
+        "bias_add",
+        ops.bias_add(&out, &gpu_w.mm2_b, n_out, proj_dim)
+    );
 
-    Ok(ops.download(&out, n_out * proj_dim))
+    let result = timed!("download", ops.download(&out, n_out * proj_dim));
+    if let Some(p) = &prof {
+        p.report(n_patches, gpu_w.blocks.len());
+    }
+    Ok(result)
 }
 
 // ── wgpu backend implementation ──────────────────────────────────────────────
@@ -648,6 +822,12 @@ impl VitGpuOps for WgpuVitOps {
             &[dst, src, &p_buf],
             ((len as u32).div_ceil(256), 1, 1),
         );
+    }
+
+    /// wgpu's `dispatch` only submits — block here so the profiler can attribute
+    /// per-op GPU time. Off the profiled path this is never called.
+    fn sync(&self) {
+        self.ctx.device.poll(wgpu::Maintain::Wait);
     }
 }
 
