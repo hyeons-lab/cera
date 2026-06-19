@@ -7,8 +7,11 @@
 //! if a performance optimization (Q4_0 GEMV, f16 KV cache, fused shaders)
 //! degrades audio quality, these tests fail.
 //!
-//! Thresholds assume both paths use F32 dequantized weights. If the GPU
-//! path switches to quantized weights, thresholds must be re-evaluated.
+//! Both paths use F32 dequantized weights, but the GPU attention reads an
+//! f16 KV cache (the only dtype the Metal flash-attention kernel accepts —
+//! same as the production LLM decode path), so the per-frame cosine gate is
+//! 0.98 rather than 0.99. The log-magnitude `max_diff` gate is the primary
+//! correctness check. If the GPU path's precision changes again, re-evaluate.
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -114,21 +117,26 @@ fn spectrum_parity() {
 
             // Cosine similarity
             let cos = cosine_sim(cpu_frame, gpu_frame);
-            assert!(
-                cos > 0.99,
-                "code set {ci}, frame {f}: cosine {cos:.6} < 0.99"
-            );
-
             // Log-magnitude max diff
             let log_abs_cpu = &cpu_frame[..n_fft_bins];
             let log_abs_gpu = &gpu_frame[..n_fft_bins];
             let max_diff = max_abs_diff(log_abs_cpu, log_abs_gpu);
+            eprintln!("  code_set={ci} frame={f}: cos={cos:.6} max_diff={max_diff:.4}");
+            // 0.98, not 0.99: the GPU attention uses an f16 KV cache (the only
+            // dtype the Metal flash-attention kernel accepts, matching the
+            // production LLM decode path), while the CPU reference keeps K/V in
+            // f32. On low-energy frames the f16 phase bins make the full-vector
+            // cosine dip to ~0.987 even though the log-magnitude max_diff stays
+            // tiny (the assert below, the real correctness gate). A genuine
+            // regression collapses the cosine far below this.
+            assert!(
+                cos > 0.98,
+                "code set {ci}, frame {f}: cosine {cos:.6} < 0.98"
+            );
             assert!(
                 max_diff < 0.5,
                 "code set {ci}, frame {f}: log_abs max_diff {max_diff:.4} >= 0.5"
             );
-
-            eprintln!("  code_set={ci} frame={f}: cos={cos:.6} max_diff={max_diff:.4}");
         }
     }
     eprintln!("spectrum_parity: PASSED");
