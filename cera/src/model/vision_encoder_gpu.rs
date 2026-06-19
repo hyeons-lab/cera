@@ -74,17 +74,31 @@ pub trait VitGpuOps {
     /// Opaque GPU buffer handle (e.g. `wgpu::Buffer`, `metal::Buffer`).
     type Buf;
 
+    /// A linear-layer weight, ready for [`Self::linear`]. May keep the weight
+    /// quantized (Metal dispatches a Q8_0/Q4_0 simdgroup GEMM straight from the
+    /// packed bytes) or dequantized to f32 (wgpu). Distinct from [`Self::Buf`]
+    /// so backends can carry the dtype/packing alongside the GPU buffer.
+    type Weight;
+
     /// Upload `data` to a new GPU buffer.
     fn upload(&self, data: &[f32]) -> Self::Buf;
     /// Read `len` f32s back from a GPU buffer (blocking).
     fn download(&self, buf: &Self::Buf, len: usize) -> Vec<f32>;
 
-    /// `y[tokens, out_dim] = x[tokens, in_dim] · wᵀ` where `w` is
-    /// `[out_dim, in_dim]` row-major (the `MmapWeight` linear-layer layout).
+    /// Upload a (possibly quantized) linear weight `[out_dim, in_dim]` row-major
+    /// (the `MmapWeight` layout). Backends may keep it packed or dequantize.
+    fn upload_weight(&self, w: &MmapWeight) -> Self::Weight;
+
+    /// Upload a dense f32 linear weight `[out_dim, in_dim]` row-major (for
+    /// weights that aren't `MmapWeight`-backed, e.g. the transposed patch conv).
+    fn upload_weight_f32(&self, data: &[f32], out_dim: usize, in_dim: usize) -> Self::Weight;
+
+    /// `y[tokens, out_dim] = x[tokens, in_dim] · wᵀ` where `w` is the
+    /// `[out_dim, in_dim]` linear weight uploaded via [`Self::upload_weight`].
     fn linear(
         &self,
         x: &Self::Buf,
-        w: &Self::Buf,
+        w: &Self::Weight,
         tokens: usize,
         out_dim: usize,
         in_dim: usize,
@@ -122,10 +136,22 @@ pub trait VitGpuOps {
 
     /// In-place residual add: `dst[i] += src[i]` over `len` elements.
     fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize);
+
+    /// Block until all previously submitted GPU work has completed.
+    ///
+    /// Default no-op: Metal's ops each block on `wait_until_completed`, so the
+    /// GPU is already idle between calls. wgpu's `dispatch` only *submits* (work
+    /// runs asynchronously and is synced lazily at `download`), so it overrides
+    /// this with `device.poll(Wait)`. Only the env-gated [`VitProfiler`] calls
+    /// `sync` — the normal forward path never does, so wgpu keeps its pipelining.
+    fn sync(&self) {}
 }
 
 /// Dequantize a linear weight to a contiguous `[rows*cols]` f32 vector for
 /// upload. F32 weights are copied directly; quantized dtypes go row-by-row.
+/// Only the GPU/Metal backends use this (the wgpu/Metal `upload_weight` impls);
+/// gated to match so the default (no-backend) build doesn't flag it as dead.
+#[cfg(any(feature = "gpu", all(feature = "metal", target_os = "macos")))]
 fn dequant_weight(w: &MmapWeight) -> Vec<f32> {
     if let Some(f) = w.try_as_f32() {
         return f.to_vec();
@@ -137,24 +163,25 @@ fn dequant_weight(w: &MmapWeight) -> Vec<f32> {
     out
 }
 
-/// One ViT block's weights, uploaded to GPU buffers.
-pub struct GpuVitBlock<B> {
-    ln1_w: B,
-    ln1_b: B,
-    q_w: B,
-    q_b: B,
-    k_w: B,
-    k_b: B,
-    v_w: B,
-    v_b: B,
-    o_w: B,
-    o_b: B,
-    ln2_w: B,
-    ln2_b: B,
-    ffn_up_w: B,
-    ffn_up_b: B,
-    ffn_down_w: B,
-    ffn_down_b: B,
+/// One ViT block's weights, uploaded to GPU buffers. Linear weights are
+/// `O::Weight` (possibly quantized); norm/bias vectors are plain f32 `O::Buf`.
+pub struct GpuVitBlock<O: VitGpuOps> {
+    ln1_w: O::Buf,
+    ln1_b: O::Buf,
+    q_w: O::Weight,
+    q_b: O::Buf,
+    k_w: O::Weight,
+    k_b: O::Buf,
+    v_w: O::Weight,
+    v_b: O::Buf,
+    o_w: O::Weight,
+    o_b: O::Buf,
+    ln2_w: O::Buf,
+    ln2_b: O::Buf,
+    ffn_up_w: O::Weight,
+    ffn_up_b: O::Buf,
+    ffn_down_w: O::Weight,
+    ffn_down_b: O::Buf,
 }
 
 /// All vision-encoder weights uploaded to GPU buffers, plus the small CPU-side
@@ -163,7 +190,7 @@ pub struct GpuVitBlock<B> {
 /// Built once via [`GpuVitWeights::build`] and reused across images — the
 /// upload (the LFM2-VL mmproj dequantized to f32) is the expensive part and
 /// must not happen per image.
-pub struct GpuVitWeights<B> {
+pub struct GpuVitWeights<O: VitGpuOps> {
     cfg: VisionEncoderConfig,
     /// Trained position embedding `[n_trained_patches * n_embd]`, kept on CPU
     /// for per-call bilinear interpolation to the dynamic grid.
@@ -171,24 +198,24 @@ pub struct GpuVitWeights<B> {
     /// Patch-embed kernel transposed to `[n_embd, in_dim]` (the `linear`
     /// layout); the CPU encoder stores it as `[in_dim, n_embd]` for its
     /// `C = A·B` matmul, but `linear` computes `A·Bᵀ`.
-    patch_conv_wt: B,
-    patch_conv_b: B,
-    blocks: Vec<GpuVitBlock<B>>,
-    post_ln_w: B,
-    post_ln_b: B,
-    mm1_w: B,
-    mm1_b: B,
-    mm2_w: B,
-    mm2_b: B,
+    patch_conv_wt: O::Weight,
+    patch_conv_b: O::Buf,
+    blocks: Vec<GpuVitBlock<O>>,
+    post_ln_w: O::Buf,
+    post_ln_b: O::Buf,
+    mm1_w: O::Weight,
+    mm1_b: O::Buf,
+    mm2_w: O::Weight,
+    mm2_b: O::Buf,
     /// Projector intermediate width (`mm.1` rows). Derived from the tensor
     /// shape, not the LFM2 `projection_dim·2` convention, to stay robust to
     /// variants — matching `vision_encoder`'s loader.
     proj_intermediate: usize,
 }
 
-impl<B> GpuVitWeights<B> {
+impl<O: VitGpuOps> GpuVitWeights<O> {
     /// Upload every encoder weight via `ops`. Run once per loaded model.
-    pub fn build<O: VitGpuOps<Buf = B>>(ops: &O, w: &VisionEncoderWeights) -> Self {
+    pub fn build(ops: &O, w: &VisionEncoderWeights) -> Self {
         let cfg = w.config.clone();
         let p = cfg.patch_size;
         let in_dim = 3 * p * p;
@@ -209,33 +236,33 @@ impl<B> GpuVitWeights<B> {
             .map(|b| GpuVitBlock {
                 ln1_w: ops.upload(&b.ln1_w),
                 ln1_b: ops.upload(&b.ln1_b),
-                q_w: ops.upload(&dequant_weight(&b.q_w)),
+                q_w: ops.upload_weight(&b.q_w),
                 q_b: ops.upload(&b.q_b),
-                k_w: ops.upload(&dequant_weight(&b.k_w)),
+                k_w: ops.upload_weight(&b.k_w),
                 k_b: ops.upload(&b.k_b),
-                v_w: ops.upload(&dequant_weight(&b.v_w)),
+                v_w: ops.upload_weight(&b.v_w),
                 v_b: ops.upload(&b.v_b),
-                o_w: ops.upload(&dequant_weight(&b.o_w)),
+                o_w: ops.upload_weight(&b.o_w),
                 o_b: ops.upload(&b.o_b),
                 ln2_w: ops.upload(&b.ln2_w),
                 ln2_b: ops.upload(&b.ln2_b),
-                ffn_up_w: ops.upload(&dequant_weight(&b.ffn_up_w)),
+                ffn_up_w: ops.upload_weight(&b.ffn_up_w),
                 ffn_up_b: ops.upload(&b.ffn_up_b),
-                ffn_down_w: ops.upload(&dequant_weight(&b.ffn_down_w)),
+                ffn_down_w: ops.upload_weight(&b.ffn_down_w),
                 ffn_down_b: ops.upload(&b.ffn_down_b),
             })
             .collect();
 
         GpuVitWeights {
             position_embed: w.position_embed.clone(),
-            patch_conv_wt: ops.upload(&convt),
+            patch_conv_wt: ops.upload_weight_f32(&convt, out_dim, in_dim),
             patch_conv_b: ops.upload(&w.patch_embed.conv_b),
             blocks,
             post_ln_w: ops.upload(&w.post_ln_w),
             post_ln_b: ops.upload(&w.post_ln_b),
-            mm1_w: ops.upload(&dequant_weight(&w.projector.mm1_w)),
+            mm1_w: ops.upload_weight(&w.projector.mm1_w),
             mm1_b: ops.upload(&w.projector.mm1_b),
-            mm2_w: ops.upload(&dequant_weight(&w.projector.mm2_w)),
+            mm2_w: ops.upload_weight(&w.projector.mm2_w),
             mm2_b: ops.upload(&w.projector.mm2_b),
             proj_intermediate: w.projector.mm1_w.rows,
             cfg,
@@ -276,12 +303,90 @@ fn im2col_patches(
     patches
 }
 
+/// Env-gated per-op wall-clock profiler for [`encode_image_gpu`].
+///
+/// Enabled by setting `CERA_VIT_PROFILE` to a non-empty, non-`0` value. When
+/// unset the profiler is `None` and the forward pass runs with zero overhead
+/// (no timers, no `sync` calls). When set, each GPU op is followed by
+/// `ops.sync()` so its wall-clock isolates that op — accurate on Metal (ops
+/// already block) and on wgpu (the forced sync drains the otherwise-async
+/// dispatch).
+///
+/// NOTE: those per-op syncs serialize wgpu, so the *sum* reported here exceeds
+/// wgpu's real pipelined total — use the `vit_encode_bench` benchmark (profiling
+/// off) for end-to-end numbers. The per-op *breakdown* is the bottleneck signal.
+struct VitProfiler {
+    /// `(label, summed duration, call count)`, in first-seen order.
+    spans: std::cell::RefCell<Vec<(&'static str, std::time::Duration, u32)>>,
+}
+
+impl VitProfiler {
+    /// Whether `CERA_VIT_PROFILE` is set to a non-empty, non-`0` value. Read
+    /// from the environment once and cached, so the disabled hot path is a
+    /// single atomic load (the env var is a process-lifetime toggle anyway).
+    fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("CERA_VIT_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0")
+        })
+    }
+
+    /// `Some` iff profiling is [`enabled`](Self::enabled).
+    fn from_env() -> Option<Self> {
+        Self::enabled().then(|| Self {
+            spans: std::cell::RefCell::new(Vec::new()),
+        })
+    }
+
+    /// Add `d` to the running total for `label` (creating it on first use).
+    fn record(&self, label: &'static str, d: std::time::Duration) {
+        let mut spans = self.spans.borrow_mut();
+        match spans.iter_mut().find(|s| s.0 == label) {
+            Some(s) => {
+                s.1 += d;
+                s.2 += 1;
+            }
+            None => spans.push((label, d, 1)),
+        }
+    }
+
+    /// Print the breakdown to stderr, sorted by descending total time, with each
+    /// op's share of the summed total, call count, and per-call mean.
+    fn report(&self, n_patches: usize, n_layer: usize) {
+        let mut spans = self.spans.borrow().clone();
+        spans.sort_by_key(|s| std::cmp::Reverse(s.1));
+        let total_ms: f64 = spans.iter().map(|s| s.1.as_secs_f64() * 1e3).sum();
+        eprintln!(
+            "\nViT GPU profile — {n_patches} patches, {n_layer} layers \
+             (per-op sync; wgpu sum is serialized, not the pipelined total)"
+        );
+        eprintln!(
+            "  {:<16} {:>10} {:>7} {:>6} {:>10}",
+            "stage", "total ms", "%", "calls", "mean ms"
+        );
+        for (label, dur, count) in &spans {
+            let ms = dur.as_secs_f64() * 1e3;
+            let pct = if total_ms > 0.0 {
+                ms / total_ms * 100.0
+            } else {
+                0.0
+            };
+            let mean = ms / *count as f64;
+            eprintln!("  {label:<16} {ms:>10.2} {pct:>6.1}% {count:>6} {mean:>10.3}");
+        }
+        eprintln!("  {:<16} {total_ms:>10.2} {:>6.1}%", "TOTAL", 100.0);
+    }
+}
+
 /// Run the ViT encoder + projector on the GPU. Backend-agnostic: `ops` provides
 /// the kernels, `gpu_w` the uploaded weights. Output is identical in shape to
 /// [`VisionEncoderWeights::encode_image`]: `[n_image_tokens * projection_dim]`.
+///
+/// Set `CERA_VIT_PROFILE=1` to print a per-op timing breakdown (see
+/// [`VitProfiler`]); unset, this runs with zero profiling overhead.
 pub fn encode_image_gpu<O: VitGpuOps>(
     ops: &O,
-    gpu_w: &GpuVitWeights<O::Buf>,
+    gpu_w: &GpuVitWeights<O>,
     pixels: &[f32],
     grid_w: usize,
     grid_h: usize,
@@ -318,17 +423,56 @@ pub fn encode_image_gpu<O: VitGpuOps>(
          caller should fall back to CPU",
     );
 
+    // Env-gated profiler (`CERA_VIT_PROFILE`). `None` → zero overhead.
+    let prof = VitProfiler::from_env();
+    // Time a GPU op: run it, force the GPU to finish (so async wgpu dispatches
+    // are attributed correctly), then record. Compiles to bare `$e` when off.
+    macro_rules! timed {
+        ($label:literal, $e:expr) => {{
+            match &prof {
+                Some(p) => {
+                    let __t = std::time::Instant::now();
+                    let __r = $e;
+                    ops.sync();
+                    p.record($label, __t.elapsed());
+                    __r
+                }
+                None => $e,
+            }
+        }};
+    }
+    // Time a CPU-side stage (no GPU sync — these don't submit GPU work).
+    macro_rules! timed_cpu {
+        ($label:literal, $e:expr) => {{
+            match &prof {
+                Some(p) => {
+                    let __t = std::time::Instant::now();
+                    let __r = $e;
+                    p.record($label, __t.elapsed());
+                    __r
+                }
+                None => $e,
+            }
+        }};
+    }
+
     // 1. Patch embed: im2col on CPU, batched matmul + bias on GPU.
-    let patches = im2col_patches(pixels, cfg, grid_w, grid_h);
-    let patches_buf = ops.upload(&patches);
-    let tokens = ops.linear(
-        &patches_buf,
-        &gpu_w.patch_conv_wt,
-        n_patches,
-        n_embd,
-        in_dim,
+    let patches = timed_cpu!("im2col", im2col_patches(pixels, cfg, grid_w, grid_h));
+    let patches_buf = timed!("upload", ops.upload(&patches));
+    let tokens = timed!(
+        "linear",
+        ops.linear(
+            &patches_buf,
+            &gpu_w.patch_conv_wt,
+            n_patches,
+            n_embd,
+            in_dim
+        )
     );
-    ops.bias_add(&tokens, &gpu_w.patch_conv_b, n_patches, n_embd);
+    timed!(
+        "bias_add",
+        ops.bias_add(&tokens, &gpu_w.patch_conv_b, n_patches, n_embd)
+    );
 
     // 2. Add (interpolated) position embeddings. The trained grid is square;
     // guard that in release too (the CPU encoder only `debug_assert`s it), since
@@ -344,70 +488,125 @@ pub fn encode_image_gpu<O: VitGpuOps>(
     let pos: std::borrow::Cow<[f32]> = if grid_w == trained_side && grid_h == trained_side {
         std::borrow::Cow::Borrowed(&gpu_w.position_embed)
     } else {
-        std::borrow::Cow::Owned(interpolate_pos_embed_2d(
-            &gpu_w.position_embed,
-            trained_side,
-            trained_side,
-            grid_h,
-            grid_w,
-            n_embd,
-        ))
+        timed_cpu!(
+            "posembed_interp",
+            std::borrow::Cow::Owned(interpolate_pos_embed_2d(
+                &gpu_w.position_embed,
+                trained_side,
+                trained_side,
+                grid_h,
+                grid_w,
+                n_embd,
+            ))
+        )
     };
-    let pos_buf = ops.upload(&pos);
-    ops.add(&tokens, &pos_buf, n_patches * n_embd);
+    let pos_buf = timed!("upload", ops.upload(&pos));
+    timed!("add", ops.add(&tokens, &pos_buf, n_patches * n_embd));
 
     // 3. ViT blocks.
     for blk in &gpu_w.blocks {
         // Pre-attention LN → Q/K/V (+bias) → attention → O proj (+bias) → residual.
-        let normed = ops.layernorm(&tokens, &blk.ln1_w, &blk.ln1_b, eps, n_patches, n_embd);
-        let q = ops.linear(&normed, &blk.q_w, n_patches, n_embd, n_embd);
-        ops.bias_add(&q, &blk.q_b, n_patches, n_embd);
-        let k = ops.linear(&normed, &blk.k_w, n_patches, n_embd, n_embd);
-        ops.bias_add(&k, &blk.k_b, n_patches, n_embd);
-        let v = ops.linear(&normed, &blk.v_w, n_patches, n_embd, n_embd);
-        ops.bias_add(&v, &blk.v_b, n_patches, n_embd);
-        let attn = ops.attention(&q, &k, &v, n_patches, n_head, head_dim);
-        let proj = ops.linear(&attn, &blk.o_w, n_patches, n_embd, n_embd);
-        ops.bias_add(&proj, &blk.o_b, n_patches, n_embd);
-        ops.add(&tokens, &proj, n_patches * n_embd);
+        let normed = timed!(
+            "layernorm",
+            ops.layernorm(&tokens, &blk.ln1_w, &blk.ln1_b, eps, n_patches, n_embd)
+        );
+        let q = timed!(
+            "linear",
+            ops.linear(&normed, &blk.q_w, n_patches, n_embd, n_embd)
+        );
+        timed!("bias_add", ops.bias_add(&q, &blk.q_b, n_patches, n_embd));
+        let k = timed!(
+            "linear",
+            ops.linear(&normed, &blk.k_w, n_patches, n_embd, n_embd)
+        );
+        timed!("bias_add", ops.bias_add(&k, &blk.k_b, n_patches, n_embd));
+        let v = timed!(
+            "linear",
+            ops.linear(&normed, &blk.v_w, n_patches, n_embd, n_embd)
+        );
+        timed!("bias_add", ops.bias_add(&v, &blk.v_b, n_patches, n_embd));
+        let attn = timed!(
+            "attention",
+            ops.attention(&q, &k, &v, n_patches, n_head, head_dim)
+        );
+        let proj = timed!(
+            "linear",
+            ops.linear(&attn, &blk.o_w, n_patches, n_embd, n_embd)
+        );
+        timed!("bias_add", ops.bias_add(&proj, &blk.o_b, n_patches, n_embd));
+        timed!("add", ops.add(&tokens, &proj, n_patches * n_embd));
 
         // Pre-MLP LN → FFN up (+bias) → GELU → FFN down (+bias) → residual.
-        let normed2 = ops.layernorm(&tokens, &blk.ln2_w, &blk.ln2_b, eps, n_patches, n_embd);
-        let mid = ops.linear(&normed2, &blk.ffn_up_w, n_patches, n_ff, n_embd);
-        ops.bias_add(&mid, &blk.ffn_up_b, n_patches, n_ff);
-        ops.gelu(&mid, n_patches * n_ff);
-        let down = ops.linear(&mid, &blk.ffn_down_w, n_patches, n_embd, n_ff);
-        ops.bias_add(&down, &blk.ffn_down_b, n_patches, n_embd);
-        ops.add(&tokens, &down, n_patches * n_embd);
+        let normed2 = timed!(
+            "layernorm",
+            ops.layernorm(&tokens, &blk.ln2_w, &blk.ln2_b, eps, n_patches, n_embd)
+        );
+        let mid = timed!(
+            "linear",
+            ops.linear(&normed2, &blk.ffn_up_w, n_patches, n_ff, n_embd)
+        );
+        timed!(
+            "bias_add",
+            ops.bias_add(&mid, &blk.ffn_up_b, n_patches, n_ff)
+        );
+        timed!("gelu", ops.gelu(&mid, n_patches * n_ff));
+        let down = timed!(
+            "linear",
+            ops.linear(&mid, &blk.ffn_down_w, n_patches, n_embd, n_ff)
+        );
+        timed!(
+            "bias_add",
+            ops.bias_add(&down, &blk.ffn_down_b, n_patches, n_embd)
+        );
+        timed!("add", ops.add(&tokens, &down, n_patches * n_embd));
     }
 
     // 4. Post-LN.
-    let tokens = ops.layernorm(
-        &tokens,
-        &gpu_w.post_ln_w,
-        &gpu_w.post_ln_b,
-        eps,
-        n_patches,
-        n_embd,
+    let tokens = timed!(
+        "layernorm",
+        ops.layernorm(
+            &tokens,
+            &gpu_w.post_ln_w,
+            &gpu_w.post_ln_b,
+            eps,
+            n_patches,
+            n_embd
+        )
     );
 
     // 5. Pixel-shuffle on CPU (pure rearrangement).
-    let tok_cpu = ops.download(&tokens, n_patches * n_embd);
-    let pooled = pixel_shuffle(&tok_cpu, cfg, grid_w, grid_h);
+    let tok_cpu = timed!("download", ops.download(&tokens, n_patches * n_embd));
+    let pooled = timed_cpu!(
+        "pixel_shuffle",
+        pixel_shuffle(&tok_cpu, cfg, grid_w, grid_h)
+    );
     let pooled_in_dim = n_embd * cfg.scale_factor * cfg.scale_factor;
     let n_out = pooled.len() / pooled_in_dim;
 
     // 6. Projector: mm.1 (+bias) + GELU → mm.2 (+bias).
     let mid_dim = gpu_w.proj_intermediate;
-    let pooled_buf = ops.upload(&pooled);
+    let pooled_buf = timed!("upload", ops.upload(&pooled));
     let proj_dim = cfg.projection_dim;
-    let mid = ops.linear(&pooled_buf, &gpu_w.mm1_w, n_out, mid_dim, pooled_in_dim);
-    ops.bias_add(&mid, &gpu_w.mm1_b, n_out, mid_dim);
-    ops.gelu(&mid, n_out * mid_dim);
-    let out = ops.linear(&mid, &gpu_w.mm2_w, n_out, proj_dim, mid_dim);
-    ops.bias_add(&out, &gpu_w.mm2_b, n_out, proj_dim);
+    let mid = timed!(
+        "linear",
+        ops.linear(&pooled_buf, &gpu_w.mm1_w, n_out, mid_dim, pooled_in_dim)
+    );
+    timed!("bias_add", ops.bias_add(&mid, &gpu_w.mm1_b, n_out, mid_dim));
+    timed!("gelu", ops.gelu(&mid, n_out * mid_dim));
+    let out = timed!(
+        "linear",
+        ops.linear(&mid, &gpu_w.mm2_w, n_out, proj_dim, mid_dim)
+    );
+    timed!(
+        "bias_add",
+        ops.bias_add(&out, &gpu_w.mm2_b, n_out, proj_dim)
+    );
 
-    Ok(ops.download(&out, n_out * proj_dim))
+    let result = timed!("download", ops.download(&out, n_out * proj_dim));
+    if let Some(p) = &prof {
+        p.report(n_patches, gpu_w.blocks.len());
+    }
+    Ok(result)
 }
 
 // ── wgpu backend implementation ──────────────────────────────────────────────
@@ -521,6 +720,9 @@ impl WgpuVitOps {
 #[cfg(feature = "gpu")]
 impl VitGpuOps for WgpuVitOps {
     type Buf = wgpu::Buffer;
+    /// wgpu dequantizes every linear weight to f32 and runs the f32 tiled
+    /// matmul, so a weight is just a plain buffer.
+    type Weight = wgpu::Buffer;
 
     fn upload(&self, data: &[f32]) -> Self::Buf {
         self.ctx.upload_f32(data, "vit")
@@ -530,10 +732,18 @@ impl VitGpuOps for WgpuVitOps {
         self.ctx.download_f32(buf, len)
     }
 
+    fn upload_weight(&self, w: &MmapWeight) -> Self::Weight {
+        self.ctx.upload_f32(&dequant_weight(w), "vit_w")
+    }
+
+    fn upload_weight_f32(&self, data: &[f32], _out_dim: usize, _in_dim: usize) -> Self::Weight {
+        self.ctx.upload_f32(data, "vit_w")
+    }
+
     fn linear(
         &self,
         x: &Self::Buf,
-        w: &Self::Buf,
+        w: &Self::Weight,
         tokens: usize,
         out_dim: usize,
         in_dim: usize,
@@ -649,9 +859,30 @@ impl VitGpuOps for WgpuVitOps {
             ((len as u32).div_ceil(256), 1, 1),
         );
     }
+
+    /// wgpu's `dispatch` only submits — block here so the profiler can attribute
+    /// per-op GPU time. Off the profiled path this is never called.
+    fn sync(&self) {
+        self.ctx.device.poll(wgpu::Maintain::Wait);
+    }
 }
 
 // ── native Metal backend implementation ──────────────────────────────────────
+
+/// A Metal linear weight `[out_dim, in_dim]` row-major. Quantized weights keep
+/// their packed bytes and run the simdgroup `gemm_q8_0`/`gemm_q4_0` kernels;
+/// f32 weights (or quant dtypes without a GEMM kernel) fall back to the scalar
+/// `vit_linear` gemv on a dequantized f32 buffer.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub enum MetalVitWeight {
+    /// Dequantized f32 buffer, `[out_dim, in_dim]` row-major.
+    Dense(metal::Buffer),
+    /// Packed quantized bytes (`MmapWeight::data()` layout) + dtype.
+    Quant {
+        buf: metal::Buffer,
+        dtype: crate::tensor::DType,
+    },
+}
 
 /// Native-Metal implementation of [`VitGpuOps`]. Mirrors [`WgpuVitOps`] using
 /// MSL kernels. Each op runs in its own command buffer and blocks on
@@ -661,10 +892,14 @@ impl VitGpuOps for WgpuVitOps {
 pub struct MetalVitOps {
     ctx: crate::backend::metal::MetalContext,
     p_linear: metal::ComputePipelineState,
+    p_gemm_q8_0: metal::ComputePipelineState,
+    p_gemm_q4_0: metal::ComputePipelineState,
     p_bias: metal::ComputePipelineState,
     p_layernorm: metal::ComputePipelineState,
     p_gelu: metal::ComputePipelineState,
     p_attn: metal::ComputePipelineState,
+    p_attn_mma: metal::ComputePipelineState,
+    p_attn_mma_hd64: metal::ComputePipelineState,
     p_add: metal::ComputePipelineState,
 }
 
@@ -674,10 +909,15 @@ impl MetalVitOps {
         use crate::backend::metal::shaders;
         Ok(Self {
             p_linear: ctx.create_pipeline(shaders::VIT_LINEAR, "vit_linear")?,
+            p_gemm_q8_0: ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0")?,
+            p_gemm_q4_0: ctx.create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0")?,
             p_bias: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add")?,
             p_layernorm: ctx.create_pipeline(shaders::LAYERNORM_BATCH, "layernorm_batch")?,
             p_gelu: ctx.create_pipeline(shaders::GELU, "gelu_inplace")?,
             p_attn: ctx.create_pipeline(shaders::VIT_ATTENTION, "vit_attention")?,
+            p_attn_mma: ctx.create_pipeline(shaders::VIT_ATTENTION_MMA, "vit_attention_mma")?,
+            p_attn_mma_hd64: ctx
+                .create_pipeline(shaders::VIT_ATTENTION_MMA, "vit_attention_mma_hd64")?,
             p_add: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace")?,
             ctx,
         })
@@ -709,11 +949,117 @@ impl MetalVitOps {
         cb.commit();
         cb.wait_until_completed();
     }
+
+    /// Quantized `y[tokens, out_dim] = x[tokens, in_dim] · wᵀ` via the simdgroup
+    /// `gemm_q8_0`/`gemm_q4_0` kernels. `wq` is the packed weight `[out_dim,
+    /// in_dim]`; `x` is f32 `[tokens, in_dim]`; `y` is f32 `[tokens, out_dim]`.
+    /// Param/grid/threadgroup layout mirrors `metal_lfm2`'s `encode_gemm`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_gemm_quant(
+        &self,
+        pipe: &metal::ComputePipelineState,
+        wq: &metal::Buffer,
+        x: &metal::Buffer,
+        y: &metal::Buffer,
+        tokens: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) {
+        // GemmParams { m, k, n, x_stride, y_stride, _pad/accumulate=0 }.
+        let params: [u32; 6] = [
+            out_dim as u32,
+            in_dim as u32,
+            tokens as u32,
+            in_dim as u32,
+            out_dim as u32,
+            0,
+        ];
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipe);
+        enc.set_buffer(0, Some(wq), 0);
+        enc.set_buffer(1, Some(x), 0);
+        enc.set_buffer(2, Some(y), 0);
+        enc.set_bytes(
+            3,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.set_threadgroup_memory_length(0, 8192); // 4 KB weights + 4 KB input
+        enc.dispatch_thread_groups(
+            // (ceil(tokens/32), ceil(out_dim/64)) tiles × 128 threads (4 simdgroups).
+            metal::MTLSize::new(
+                (tokens as u64).div_ceil(32),
+                (out_dim as u64).div_ceil(64),
+                1,
+            ),
+            metal::MTLSize::new(128, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    /// Bidirectional attention via the flash-attention MMA kernel
+    /// (`vit_attention_mma`). Requires `head_dim % 8 == 0`; the caller falls
+    /// back to the scalar `vit_attention` otherwise. `q`/`k`/`v`/`out` are
+    /// `[tokens, n_head*head_dim]` f32. Threadgroup memory and grid mirror
+    /// `attention_prefill`'s host dispatch (Q_PER_TG=8 queries/threadgroup).
+    #[allow(clippy::too_many_arguments)]
+    fn run_attn_mma(
+        &self,
+        q: &metal::Buffer,
+        k: &metal::Buffer,
+        v: &metal::Buffer,
+        out: &metal::Buffer,
+        tokens: usize,
+        n_head: usize,
+        head_dim: usize,
+    ) {
+        const Q_PER_TG: u64 = 8;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let params: [u32; 4] = [
+            tokens as u32,
+            n_head as u32,
+            head_dim as u32,
+            scale.to_bits(),
+        ];
+        // q_tg + kv_tile (half) + scores + out_tg + state + rescales (f32)
+        // = 2·(8+64)·hd + 4·(8·64 + 8·hd + 8·2 + 8) bytes = 176·hd + 2144.
+        let shmem = 176 * head_dim as u64 + 2144;
+        // hd=64 gets the constant-propagated variant; others use the runtime one.
+        let pipe = if head_dim == 64 {
+            &self.p_attn_mma_hd64
+        } else {
+            &self.p_attn_mma
+        };
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipe);
+        enc.set_buffer(0, Some(q), 0);
+        enc.set_buffer(1, Some(k), 0);
+        enc.set_buffer(2, Some(v), 0);
+        enc.set_buffer(3, Some(out), 0);
+        enc.set_bytes(
+            4,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
+        enc.set_threadgroup_memory_length(0, shmem);
+        enc.dispatch_thread_groups(
+            metal::MTLSize::new(n_head as u64 * (tokens as u64).div_ceil(Q_PER_TG), 1, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    }
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 impl VitGpuOps for MetalVitOps {
     type Buf = metal::Buffer;
+    type Weight = MetalVitWeight;
 
     fn upload(&self, data: &[f32]) -> Self::Buf {
         self.ctx.upload_f32(data)
@@ -723,23 +1069,51 @@ impl VitGpuOps for MetalVitOps {
         self.ctx.read_f32(buf, len)
     }
 
+    fn upload_weight(&self, w: &MmapWeight) -> Self::Weight {
+        use crate::tensor::DType;
+        match w.dtype {
+            // Keep packed → simdgroup GEMM straight from the quantized bytes.
+            DType::Q8_0 | DType::Q4_0 => MetalVitWeight::Quant {
+                buf: self.ctx.upload_bytes(w.data()),
+                dtype: w.dtype,
+            },
+            // Dense or a quant dtype without a ViT GEMM kernel: dequantize.
+            _ => MetalVitWeight::Dense(self.ctx.upload_f32(&dequant_weight(w))),
+        }
+    }
+
+    fn upload_weight_f32(&self, data: &[f32], _out_dim: usize, _in_dim: usize) -> Self::Weight {
+        MetalVitWeight::Dense(self.ctx.upload_f32(data))
+    }
+
     fn linear(
         &self,
         x: &Self::Buf,
-        w: &Self::Buf,
+        w: &Self::Weight,
         tokens: usize,
         out_dim: usize,
         in_dim: usize,
     ) -> Self::Buf {
         let y = self.ctx.create_buffer((tokens * out_dim * 4) as u64);
-        let params: [u32; 4] = [out_dim as u32, in_dim as u32, tokens as u32, 0];
-        self.run(
-            &self.p_linear,
-            &[w, x, &y],
-            bytemuck::cast_slice(&params),
-            metal::MTLSize::new(out_dim as u64, tokens as u64, 1),
-            metal::MTLSize::new(32, 1, 1),
-        );
+        match w {
+            MetalVitWeight::Quant { buf, dtype } => {
+                let pipe = match dtype {
+                    crate::tensor::DType::Q8_0 => &self.p_gemm_q8_0,
+                    _ => &self.p_gemm_q4_0,
+                };
+                self.run_gemm_quant(pipe, buf, x, &y, tokens, out_dim, in_dim);
+            }
+            MetalVitWeight::Dense(wbuf) => {
+                let params: [u32; 4] = [out_dim as u32, in_dim as u32, tokens as u32, 0];
+                self.run(
+                    &self.p_linear,
+                    &[wbuf, x, &y],
+                    bytemuck::cast_slice(&params),
+                    metal::MTLSize::new(out_dim as u64, tokens as u64, 1),
+                    metal::MTLSize::new(32, 1, 1),
+                );
+            }
+        }
         y
     }
 
@@ -798,20 +1172,29 @@ impl VitGpuOps for MetalVitOps {
     ) -> Self::Buf {
         let dim = n_head * head_dim;
         let out = self.ctx.create_buffer((tokens * dim * 4) as u64);
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let params: [u32; 4] = [
-            tokens as u32,
-            n_head as u32,
-            head_dim as u32,
-            scale.to_bits(),
-        ];
-        self.run(
-            &self.p_attn,
-            &[q, k, v, &out],
-            bytemuck::cast_slice(&params),
-            metal::MTLSize::new(tokens as u64, n_head as u64, 1),
-            metal::MTLSize::new(256, 1, 1),
-        );
+        // Flash-attention MMA kernel needs head_dim a multiple of 8 and ≤ 128:
+        // its threadgroup memory is 176·head_dim + 2144 bytes, so head_dim=256
+        // would need ~46 KB and blow the 32 KB threadgroup limit on Apple M1.
+        // 128 keeps it at ~24 KB and covers every current LFM2 ViT (hd ∈ {64,
+        // 128}); larger head dims fall back to the scalar kernel.
+        if head_dim % 8 == 0 && head_dim <= 128 {
+            self.run_attn_mma(q, k, v, &out, tokens, n_head, head_dim);
+        } else {
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let params: [u32; 4] = [
+                tokens as u32,
+                n_head as u32,
+                head_dim as u32,
+                scale.to_bits(),
+            ];
+            self.run(
+                &self.p_attn,
+                &[q, k, v, &out],
+                bytemuck::cast_slice(&params),
+                metal::MTLSize::new(tokens as u64, n_head as u64, 1),
+                metal::MTLSize::new(256, 1, 1),
+            );
+        }
         out
     }
 
@@ -841,7 +1224,7 @@ pub trait VisionGpuEncode: Send + Sync {
 #[cfg(feature = "gpu")]
 struct WgpuVisionEncoder {
     ops: WgpuVitOps,
-    weights: GpuVitWeights<wgpu::Buffer>,
+    weights: GpuVitWeights<WgpuVitOps>,
 }
 
 #[cfg(feature = "gpu")]
@@ -854,7 +1237,7 @@ impl VisionGpuEncode for WgpuVisionEncoder {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 struct MetalVisionEncoder {
     ops: MetalVitOps,
-    weights: GpuVitWeights<metal::Buffer>,
+    weights: GpuVitWeights<MetalVitOps>,
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -945,8 +1328,40 @@ mod tests {
         MmapWeight::from_owned_bytes(bytemuck::cast_slice(&data).to_vec(), DType::F32, rows, cols)
     }
 
-    /// Build a tiny synthetic VL encoder (all F32) for CPU↔GPU parity.
+    /// Quantize a `[rows, cols]` row-major f32 weight to packed Q8_0 (34 bytes
+    /// per 32-element block: f16 scale + 32 int8) and wrap as an `MmapWeight` —
+    /// exercises the quantized GEMM path. `cols` must be a multiple of 32.
+    fn q8_0_weight(rows: usize, cols: usize, seed: usize) -> MmapWeight {
+        assert_eq!(cols % 32, 0, "Q8_0 cols must be a multiple of 32");
+        let data = rnd(rows * cols, seed);
+        let mut bytes = Vec::with_capacity(rows * (cols / 32) * 34);
+        for block in data.chunks_exact(32) {
+            let amax = block.iter().fold(0f32, |m, &x| m.max(x.abs()));
+            let d = amax / 127.0;
+            let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+            bytes.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+            for &x in block {
+                bytes.push((x * id).round().clamp(-127.0, 127.0) as i8 as u8);
+            }
+        }
+        MmapWeight::from_owned_bytes(bytes, DType::Q8_0, rows, cols)
+    }
+
+    /// Build a tiny synthetic VL encoder for CPU↔GPU parity. With `quant`, the
+    /// linear weights (q/k/v/o, ffn, projector) are Q8_0 to exercise the
+    /// quantized GEMM; norms/biases/conv stay f32. Without it, everything is f32.
     fn synth_encoder() -> VisionEncoderWeights {
+        synth_encoder_quant(false)
+    }
+
+    fn synth_encoder_quant(quant: bool) -> VisionEncoderWeights {
+        let lin = |rows: usize, cols: usize, seed: usize| {
+            if quant {
+                q8_0_weight(rows, cols, seed)
+            } else {
+                f32_weight(rows, cols, seed)
+            }
+        };
         // All linear in_dims (k) must be multiples of the matmul's TILE_K=32:
         //   patch in_dim = 3·patch_size² = 192; q/k/v/o/ffn_up = n_embd = 32;
         //   ffn_down = n_ff = 64; mm.1 = n_embd·sf² = 128; mm.2 = intermediate = 64.
@@ -987,19 +1402,19 @@ mod tests {
                 VitBlockWeights {
                     ln1_w: rnd(n_embd, s + 1),
                     ln1_b: rnd(n_embd, s + 2),
-                    q_w: f32_weight(n_embd, n_embd, s + 3),
+                    q_w: lin(n_embd, n_embd, s + 3),
                     q_b: rnd(n_embd, s + 4),
-                    k_w: f32_weight(n_embd, n_embd, s + 5),
+                    k_w: lin(n_embd, n_embd, s + 5),
                     k_b: rnd(n_embd, s + 6),
-                    v_w: f32_weight(n_embd, n_embd, s + 7),
+                    v_w: lin(n_embd, n_embd, s + 7),
                     v_b: rnd(n_embd, s + 8),
-                    o_w: f32_weight(n_embd, n_embd, s + 9),
+                    o_w: lin(n_embd, n_embd, s + 9),
                     o_b: rnd(n_embd, s + 10),
                     ln2_w: rnd(n_embd, s + 11),
                     ln2_b: rnd(n_embd, s + 12),
-                    ffn_up_w: f32_weight(n_ff, n_embd, s + 13),
+                    ffn_up_w: lin(n_ff, n_embd, s + 13),
                     ffn_up_b: rnd(n_ff, s + 14),
-                    ffn_down_w: f32_weight(n_embd, n_ff, s + 15),
+                    ffn_down_w: lin(n_embd, n_ff, s + 15),
                     ffn_down_b: rnd(n_embd, s + 16),
                 }
             })
@@ -1015,9 +1430,9 @@ mod tests {
             post_ln_w: rnd(n_embd, 53),
             post_ln_b: rnd(n_embd, 54),
             projector: ProjectorWeights {
-                mm1_w: f32_weight(intermediate, n_embd * scale_factor * scale_factor, 55),
+                mm1_w: lin(intermediate, n_embd * scale_factor * scale_factor, 55),
                 mm1_b: rnd(intermediate, 56),
-                mm2_w: f32_weight(projection_dim, intermediate, 57),
+                mm2_w: lin(projection_dim, intermediate, 57),
                 mm2_b: rnd(projection_dim, 58),
             },
             config: cfg,
@@ -1026,9 +1441,10 @@ mod tests {
 
     /// Shared CPU↔GPU parity check, generic over the backend ops. Compares the
     /// GPU forward against the CPU encoder on a synthetic 2-layer ViT with the
-    /// dynamic grid == trained grid (no pos-embed interpolation).
-    fn run_parity<O: VitGpuOps>(ops: &O) {
-        let enc = synth_encoder();
+    /// dynamic grid == trained grid (no pos-embed interpolation). `tol` is the
+    /// per-element absolute tolerance (looser for quantized weights, whose GPU
+    /// GEMM stores dequantized weights as half).
+    fn run_parity<O: VitGpuOps>(ops: &O, enc: &VisionEncoderWeights, tol: f32) {
         let cfg = &enc.config;
         let grid_w = 4;
         let grid_h = 4;
@@ -1038,7 +1454,7 @@ mod tests {
 
         let cpu_out = enc.encode_image(&pixels, grid_w, grid_h).unwrap();
 
-        let gpu_w = GpuVitWeights::build(ops, &enc);
+        let gpu_w = GpuVitWeights::build(ops, enc);
         let gpu_out = encode_image_gpu(ops, &gpu_w, &pixels, grid_w, grid_h).unwrap();
 
         assert_eq!(cpu_out.len(), gpu_out.len(), "output length mismatch");
@@ -1047,8 +1463,8 @@ mod tests {
             let d = (c - g).abs();
             max_diff = max_diff.max(d);
             assert!(
-                d < 2e-3,
-                "encode_image parity mismatch at {i}: cpu={c}, gpu={g}, diff={d}"
+                d < tol,
+                "encode_image parity mismatch at {i}: cpu={c}, gpu={g}, diff={d} (tol={tol})"
             );
         }
         println!(
@@ -1064,7 +1480,11 @@ mod tests {
             Ok(ctx) => ctx,
             Err(_) => return, // no GPU (CI)
         };
-        run_parity(&WgpuVitOps::new(ctx).expect("build wgpu vit ops"));
+        run_parity(
+            &WgpuVitOps::new(ctx).expect("build wgpu vit ops"),
+            &synth_encoder(),
+            2e-3,
+        );
     }
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -1074,6 +1494,39 @@ mod tests {
             Ok(ctx) => ctx,
             Err(_) => return, // no Metal device (CI)
         };
-        run_parity(&MetalVitOps::new(ctx).unwrap());
+        run_parity(&MetalVitOps::new(ctx).unwrap(), &synth_encoder(), 2e-3);
+    }
+
+    /// Q8_0 linear weights → exercises the Metal simdgroup `gemm_q8_0` path.
+    /// Looser tolerance: the GEMM stores dequantized weights as half, so it
+    /// diverges from the CPU's f32 dequant by more than the all-f32 case.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn test_metal_encode_image_parity_q8_0() {
+        let ctx = match crate::backend::metal::MetalContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return, // no Metal device (CI)
+        };
+        run_parity(
+            &MetalVitOps::new(ctx).unwrap(),
+            &synth_encoder_quant(true),
+            5e-2,
+        );
+    }
+
+    /// Q8_0 linear weights on wgpu, which dequantizes to f32 before its tiled
+    /// matmul — covers the `upload_weight` quant→f32 branch.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_gpu_encode_image_parity_q8_0() {
+        let ctx = match crate::backend::wgpu::GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return, // no GPU (CI)
+        };
+        run_parity(
+            &WgpuVitOps::new(ctx).expect("build wgpu vit ops"),
+            &synth_encoder_quant(true),
+            5e-2,
+        );
     }
 }
