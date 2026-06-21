@@ -76,9 +76,10 @@ pub trait VitGpuOps {
 
     /// A linear-layer weight, ready for [`Self::linear`]. Both GPU backends keep
     /// Q8_0/Q4_0 weights packed and run a quantized GEMM straight from the bytes
-    /// (Metal a simdgroup GEMM, wgpu the `gemm_q8_0`/`gemm_q4_0` WGSL kernels);
-    /// other dtypes are dequantized to f32. Distinct from [`Self::Buf`] so
-    /// backends can carry the dtype/packing alongside the GPU buffer.
+    /// (Metal a simdgroup GEMM, wgpu the register-tiled `mul_mat_reg_tile` kernel
+    /// with in-kernel Q8_0/Q4_0 decode); other dtypes are dequantized to f32.
+    /// Distinct from [`Self::Buf`] so backends can carry the dtype/packing
+    /// alongside the GPU buffer.
     type Weight;
 
     /// Upload `data` to a new GPU buffer.
@@ -635,7 +636,8 @@ const VIT_MM_TILE_K: u32 = 32;
 /// [`MetalVitWeight`]: quantized weights keep their packed bytes and run the
 /// register-tiled `mul_mat_reg_tile` GEMM (decoding Q8_0/Q4_0 into shared
 /// memory in-kernel); f32 weights (or quant dtypes without a tiled decoder)
-/// fall back to the scalar `MUL_MAT_REG_TILE` gemv on a dequantized f32 buffer.
+/// fall back to the same register-tiled `mul_mat_reg_tile` matmul on a
+/// dequantized f32 buffer (its f32 `INIT_SRC0_SHMEM_FLOAT` variant).
 #[cfg(feature = "gpu")]
 pub enum WgpuVitWeight {
     /// Dequantized f32 buffer, `[out_dim, in_dim]` row-major.
@@ -866,9 +868,14 @@ impl VitGpuOps for WgpuVitOps {
             .create_storage_rw((tokens * out_dim * 4) as u64, "vit_linear_out");
         match w {
             WgpuVitWeight::Quant { buf, dtype } => {
+                // `upload_weight` only builds `Quant` for Q8_0/Q4_0, so those
+                // are the only dtypes reachable here.
                 let pipe = match dtype {
                     crate::tensor::DType::Q8_0 => &self.p_mul_mat_q8_0,
-                    _ => &self.p_mul_mat_q4_0,
+                    crate::tensor::DType::Q4_0 => &self.p_mul_mat_q4_0,
+                    other => {
+                        unreachable!("WgpuVitWeight::Quant holds only Q8_0/Q4_0, got {other:?}")
+                    }
                 };
                 self.run_mul_mat_tiled(pipe, buf, x, &y, tokens, out_dim, in_dim);
             }
