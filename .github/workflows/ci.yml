@@ -110,6 +110,10 @@ jobs:
           - "--no-default-features"
           - "--no-default-features --features parallel,std-fs,disk-cache"
           - "--no-default-features --features mmap"
+          # WebGPU backend (Track B PR 4.2) — the async wgpu host layer +
+          # browser LFM2 session must keep compiling on wasm32. Runtime is
+          # covered by the headless smoke test (not in CI; needs a GPU).
+          - "--no-default-features --features gpu"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
@@ -119,6 +123,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check wasm32 compile
         run: cargo check -p cera ${{ matrix.features }} --target wasm32-unknown-unknown
+      - name: Check cera-wasm WebGPU surface compiles
+        # Runs once (on the gpu matrix entry): the browser `WebGpuSession`
+        # glue in cera-wasm only builds with the `wgpu` feature, which the
+        # cera-wasm-pack job doesn't enable.
+        if: matrix.features == '--no-default-features --features gpu'
+        run: cargo check -p cera-wasm --features wgpu --target wasm32-unknown-unknown
 
   cera-wasm-pack:
     # Multi-target wasm-pack build. Each matrix entry produces one
