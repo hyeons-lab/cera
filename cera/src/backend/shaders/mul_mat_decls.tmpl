@@ -30,7 +30,7 @@ fn store_shmem(val: f32, idx: u32) {
 #endif
 
 // Helpers for manual dequantization from u32-packed storage
-#ifdef INIT_SRC0_SHMEM_Q4_0
+#if defined(INIT_SRC0_SHMEM_Q4_0) || defined(INIT_SRC0_SHMEM_Q8_0)
 fn load_src0_u16_at(byte_offset: u32) -> u32 {
     let word = src0[byte_offset / 4u];
     let shift = (byte_offset & 2u) * 8u;
@@ -130,6 +130,52 @@ fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
             for (var j = 0u; j < 8u; j++) {
                 shmem[shmem_idx + j] = 0.0;
                 shmem[shmem_idx + j + 16u] = 0.0;
+            }
+        }
+    }
+}
+#endif
+
+#ifdef INIT_SRC0_SHMEM_Q8_0
+const Q8_BLOCK_SIZE = 32u;
+const Q8_BLOCK_BYTES = 34u;
+
+// Decode Q8_0 weight blocks (2-byte f16 scale + 32 int8 quants) straight into
+// the f32 src0 shmem tile, so the dtype-agnostic register-tiled matmul loop
+// reads plain f32. Work is split into 4-quant groups (8 per block) so every
+// thread participates — one full block per thread would idle 7/8 of a 256-wide
+// workgroup over a 32-row × 32-K tile.
+const Q8_GROUP = 4u;
+const Q8_GROUPS_PER_BLOCK = Q8_BLOCK_SIZE / Q8_GROUP;
+
+fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
+    let BLOCKS_K = TILE_K / Q8_BLOCK_SIZE;
+    let PARAMS_BLOCKS_K = (params.k + Q8_BLOCK_SIZE - 1u) / Q8_BLOCK_SIZE;
+    let total_groups = TILE_SRC0_ROWS * BLOCKS_K * Q8_GROUPS_PER_BLOCK;
+
+    for (var g = thread_id; g < total_groups; g += TOTAL_WORKGROUP_SIZE) {
+        let blk = g / Q8_GROUPS_PER_BLOCK;
+        let grp = g % Q8_GROUPS_PER_BLOCK; // quants [grp*4, grp*4+4)
+        let tile_m = blk / BLOCKS_K;
+        let block_k = blk % BLOCKS_K;
+        let shmem_base = tile_m * TILE_SRC0_STRIDE + block_k * Q8_BLOCK_SIZE + grp * Q8_GROUP;
+        let global_m = offset_m + tile_m;
+        let global_k_block = k_outer / Q8_BLOCK_SIZE + block_k;
+
+        if (global_m < params.m && global_k_block < PARAMS_BLOCKS_K) {
+            let src0_block_idx = global_m * PARAMS_BLOCKS_K + global_k_block;
+            let block_byte_base = src0_block_idx * Q8_BLOCK_BYTES;
+            let d = load_src0_f32_at(block_byte_base);
+            let q_packed = load_src0_u32_at(block_byte_base + 2u + grp * Q8_GROUP);
+            for (var kk = 0u; kk < Q8_GROUP; kk++) {
+                let q_byte = get_byte(q_packed, kk);
+                // Sign-extend the int8 quant via arithmetic shift.
+                let q = i32(q_byte << 24u) >> 24u;
+                shmem[shmem_base + kk] = f32(q) * d;
+            }
+        } else {
+            for (var kk = 0u; kk < Q8_GROUP; kk++) {
+                shmem[shmem_base + kk] = 0.0;
             }
         }
     }
