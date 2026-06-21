@@ -67,11 +67,23 @@ pub struct GpuProfiler {
 
 impl GpuContext {
     /// Initialize the GPU: request a high-performance adapter + device
-    /// (blocking). Native convenience wrapper around [`Self::new_async`];
-    /// must NOT be called on wasm32 (the WebGPU backend can only be driven
-    /// from the JS event loop — use `new_async().await` there).
+    /// (blocking). Native convenience wrapper around [`Self::new_async`].
+    /// Not available on wasm32 — the WebGPU backend can only be driven from
+    /// the JS event loop, so `pollster::block_on` would deadlock there; use
+    /// [`Self::new_async`]`.await` instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Result<Self> {
         pollster::block_on(Self::new_async())
+    }
+
+    /// wasm32 stub: the blocking [`Self::new`] cannot exist on wasm (it would
+    /// deadlock the JS event loop). Kept so callers that haven't migrated fail
+    /// with a clear message pointing at the async entry point.
+    #[cfg(target_arch = "wasm32")]
+    pub fn new() -> Result<Self> {
+        anyhow::bail!(
+            "GpuContext::new() is unavailable on wasm32; use GpuContext::new_async().await"
+        )
     }
 
     /// Initialize the GPU asynchronously: request a high-performance adapter

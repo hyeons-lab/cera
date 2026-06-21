@@ -2095,6 +2095,13 @@ impl GpuLfm2Model {
         let out = self.ctx.download_u32_async(&self.argmax_out_buf, 1).await;
         out[0]
     }
+
+    /// Adapter name and backend of the underlying [`GpuContext`], for
+    /// surfacing which GPU/backend the model is actually running on (e.g. in
+    /// the wasm `WebGpuSession.adapter` getter).
+    pub fn gpu_info(&self) -> (&str, &str) {
+        (&self.ctx.adapter_name, &self.ctx.backend)
+    }
 }
 
 // === Batched prefill — encode helpers + main method ========================

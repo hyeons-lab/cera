@@ -1290,14 +1290,11 @@ mod webgpu {
 
         /// Adapter + backend description of the WebGPU device (e.g.
         /// `"… (BrowserWebGpu)"`). Useful for confirming the GPU path is live.
+        /// Note: headless Chrome's Dawn adapter reports an empty name.
         #[wasm_bindgen(getter)]
         pub fn adapter(&self) -> String {
-            // (no direct ctx accessor on the model; report via config instead)
-            format!(
-                "lfm2 gpu: {} layers, vocab {}",
-                self.model.config().n_layers,
-                self.model.config().vocab_size,
-            )
+            let (name, backend) = self.model.gpu_info();
+            format!("{name} ({backend})")
         }
 
         /// Tokenize `prompt`, run prefill, then greedily decode up to
@@ -1312,8 +1309,12 @@ mod webgpu {
             on_token: &js_sys::Function,
         ) -> Result<String, JsError> {
             let mut ids = self.tokenizer.encode(prompt);
+            // Only prepend BOS if the encoder didn't already include it (a
+            // chat template or a literal special token in the prompt can).
             if let Some(bos) = self.tokenizer.bos_token() {
-                ids.insert(0, bos);
+                if ids.first() != Some(&bos) {
+                    ids.insert(0, bos);
+                }
             }
             if ids.is_empty() {
                 return Ok(String::new());
@@ -1342,7 +1343,15 @@ mod webgpu {
                 }
                 let piece = self.tokenizer.decode(&[next]);
                 out.push_str(&piece);
-                let _ = on_token.call1(&JsValue::NULL, &JsValue::from_str(&piece));
+                // Treat any exception the JS callback throws as fatal and
+                // re-throw it across the wasm boundary, mirroring
+                // `JsTextSink::on_text_tokens`. `throw_val` preserves the
+                // original error object so it lands in the caller's
+                // `try { ... } catch` around `generate` (rather than being
+                // silently swallowed while decoding continues).
+                if let Err(err) = on_token.call1(&JsValue::null(), &JsValue::from_str(&piece)) {
+                    wasm_bindgen::throw_val(err);
+                }
 
                 next = self
                     .model
