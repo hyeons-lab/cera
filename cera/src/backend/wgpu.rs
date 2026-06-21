@@ -584,6 +584,7 @@ pub mod shaders {
     pub const GELU: &str = include_str!("shaders/gelu.wgsl");
     pub const BIAS_ADD: &str = include_str!("shaders/bias_add.wgsl");
     pub const VIT_ATTENTION: &str = include_str!("shaders/vit_attention.wgsl");
+    pub const VIT_ATTENTION_TILED: &str = include_str!("shaders/vit_attention_tiled.wgsl");
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

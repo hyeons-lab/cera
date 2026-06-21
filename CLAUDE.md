@@ -50,10 +50,11 @@ Both validate offsets with checked arithmetic (`checked_add`, `usize::try_from`)
 
 ### Compute Backends (`backend/`)
 
-Three tiers with runtime dispatch:
+Four tiers with runtime dispatch:
 1. **`cpu.rs`** — scalar reference implementations operating on raw `&[f32]` slices (no Tensor in the hot path)
 2. **`simd.rs`** — NEON (aarch64) and AVX2 (x86_64) optimized `vec_dot` kernels with compile-time + runtime dispatch
-3. **`wgpu.rs`** — GPU backend placeholder (Phase 5)
+3. **`wgpu.rs`** — cross-platform GPU backend (`gpu` feature). Functional: WGSL GEMV/GEMM kernels (incl. quantized `gemm_q8_0`/`gemm_q4_0`), the ViT vision encoder, and LFM2 prefill/decode
+4. **`metal/`** — native Apple Metal backend (`metal` feature, macOS) with MSL kernels — the `Auto`-preferred GPU backend, used by LFM2 and the ViT vision encoder
 
 ### Models (`model/`)
 

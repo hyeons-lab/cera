@@ -74,10 +74,12 @@ pub trait VitGpuOps {
     /// Opaque GPU buffer handle (e.g. `wgpu::Buffer`, `metal::Buffer`).
     type Buf;
 
-    /// A linear-layer weight, ready for [`Self::linear`]. May keep the weight
-    /// quantized (Metal dispatches a Q8_0/Q4_0 simdgroup GEMM straight from the
-    /// packed bytes) or dequantized to f32 (wgpu). Distinct from [`Self::Buf`]
-    /// so backends can carry the dtype/packing alongside the GPU buffer.
+    /// A linear-layer weight, ready for [`Self::linear`]. Both GPU backends keep
+    /// Q8_0/Q4_0 weights packed and run a quantized GEMM straight from the bytes
+    /// (Metal a simdgroup GEMM, wgpu the register-tiled `mul_mat_reg_tile` kernel
+    /// with in-kernel Q8_0/Q4_0 decode); other dtypes are dequantized to f32.
+    /// Distinct from [`Self::Buf`] so backends can carry the dtype/packing
+    /// alongside the GPU buffer.
     type Weight;
 
     /// Upload `data` to a new GPU buffer.
@@ -611,6 +613,42 @@ pub fn encode_image_gpu<O: VitGpuOps>(
 
 // ── wgpu backend implementation ──────────────────────────────────────────────
 
+// Register-tiled `mul_mat_reg_tile` config for the ViT quantized GEMM. Each
+// workgroup computes a (WG_M·TILE_M)×(WG_N·TILE_N) = 32×32 output tile with
+// WG_M·WG_N = 256 threads, staging a TILE_K=32 slice of decoded weights +
+// activations into shared memory per step (so weights are reused across the
+// token tile instead of re-read per token like the batched-GEMV kernels).
+// 256 threads (WG_M·WG_N) with a 32×32 output tile. Higher TILE_N (more work
+// per thread, fewer threads) measured *slower* on Apple GPUs — occupancy beats
+// the better arithmetic intensity here.
+#[cfg(feature = "gpu")]
+const VIT_MM_WG_M: u32 = 8;
+#[cfg(feature = "gpu")]
+const VIT_MM_WG_N: u32 = 32;
+#[cfg(feature = "gpu")]
+const VIT_MM_TILE_M: u32 = 4;
+#[cfg(feature = "gpu")]
+const VIT_MM_TILE_N: u32 = 1;
+#[cfg(feature = "gpu")]
+const VIT_MM_TILE_K: u32 = 32;
+
+/// A wgpu linear weight `[out_dim, in_dim]` row-major. Mirrors
+/// [`MetalVitWeight`]: quantized weights keep their packed bytes and run the
+/// register-tiled `mul_mat_reg_tile` GEMM (decoding Q8_0/Q4_0 into shared
+/// memory in-kernel); f32 weights (or quant dtypes without a tiled decoder)
+/// fall back to the same register-tiled `mul_mat_reg_tile` matmul on a
+/// dequantized f32 buffer (its f32 `INIT_SRC0_SHMEM_FLOAT` variant).
+#[cfg(feature = "gpu")]
+pub enum WgpuVitWeight {
+    /// Dequantized f32 buffer, `[out_dim, in_dim]` row-major.
+    Dense(wgpu::Buffer),
+    /// Packed quantized bytes (`MmapWeight::data()` layout) + dtype.
+    Quant {
+        buf: wgpu::Buffer,
+        dtype: crate::tensor::DType,
+    },
+}
+
 /// wgpu implementation of [`VitGpuOps`]. Owns the [`GpuContext`] and the compute
 /// pipelines (compiled once) so it can be cached for the session's lifetime.
 /// Bind groups are created per dispatch (cheap relative to the kernel work).
@@ -618,10 +656,13 @@ pub fn encode_image_gpu<O: VitGpuOps>(
 pub struct WgpuVitOps {
     ctx: crate::backend::wgpu::GpuContext,
     p_linear: wgpu::ComputePipeline,
+    p_mul_mat_q8_0: wgpu::ComputePipeline,
+    p_mul_mat_q4_0: wgpu::ComputePipeline,
     p_bias: wgpu::ComputePipeline,
     p_layernorm: wgpu::ComputePipeline,
     p_gelu: wgpu::ComputePipeline,
     p_attn: wgpu::ComputePipeline,
+    p_attn_tiled: wgpu::ComputePipeline,
     p_add: wgpu::ComputePipeline,
 }
 
@@ -654,6 +695,32 @@ impl WgpuVitOps {
                     ("TILE_K", "32u"),
                 ],
             );
+            // Register-tiled quantized GEMM: decode Q8_0/Q4_0 weight blocks into
+            // shared memory in-kernel and reuse them across the token tile.
+            let (wg_m, wg_n) = (format!("{VIT_MM_WG_M}u"), format!("{VIT_MM_WG_N}u"));
+            let (tile_m, tile_n) = (format!("{VIT_MM_TILE_M}u"), format!("{VIT_MM_TILE_N}u"));
+            let tile_k = format!("{VIT_MM_TILE_K}u");
+            let mk_quant = |label: &str, init_src0: &str| {
+                ctx.create_pipeline_with_defines(
+                    shaders::MUL_MAT_REG_TILE,
+                    "main",
+                    label,
+                    &[
+                        ("SCALAR", ""),
+                        ("SRC0_INNER_TYPE", "u32"),
+                        ("SRC1_INNER_TYPE", "f32"),
+                        (init_src0, ""),
+                        ("INIT_SRC1_SHMEM_FLOAT", ""),
+                        ("WORKGROUP_SIZE_M", &wg_m),
+                        ("WORKGROUP_SIZE_N", &wg_n),
+                        ("TILE_M", &tile_m),
+                        ("TILE_N", &tile_n),
+                        ("TILE_K", &tile_k),
+                    ],
+                )
+            };
+            let p_mul_mat_q8_0 = mk_quant("vit_mul_mat_q8_0", "INIT_SRC0_SHMEM_Q8_0");
+            let p_mul_mat_q4_0 = mk_quant("vit_mul_mat_q4_0", "INIT_SRC0_SHMEM_Q4_0");
             Self {
                 p_bias: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "vit_bias_add"),
                 p_layernorm: ctx.create_pipeline(
@@ -667,7 +734,14 @@ impl WgpuVitOps {
                     "vit_attention",
                     "vit_attention",
                 ),
+                p_attn_tiled: ctx.create_pipeline(
+                    shaders::VIT_ATTENTION_TILED,
+                    "vit_attention_tiled",
+                    "vit_attention_tiled",
+                ),
                 p_add: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "vit_add"),
+                p_mul_mat_q8_0,
+                p_mul_mat_q4_0,
                 p_linear,
                 ctx,
             }
@@ -715,14 +789,46 @@ impl WgpuVitOps {
         }
         self.ctx.queue.submit(Some(enc.finish()));
     }
+
+    /// Quantized `y[tokens, out_dim] = x[tokens, in_dim] · wᵀ` via the
+    /// register-tiled `mul_mat_reg_tile` kernel (`pipe` carries the Q8_0/Q4_0
+    /// in-kernel decoder). `wq` is the packed weight `[out_dim, in_dim]`; `x` is
+    /// f32 `[tokens, in_dim]`; `y` is f32 `[tokens, out_dim]`. `MulMatParams`
+    /// is `[m, k, n, x_stride, y_stride]`; the grid covers one
+    /// (WG_M·TILE_M)×(WG_N·TILE_N) output tile per workgroup (dispatched 2D and
+    /// linearized in-shader to dodge the 65535 `num_wg.x` cap).
+    #[allow(clippy::too_many_arguments)]
+    fn run_mul_mat_tiled(
+        &self,
+        pipe: &wgpu::ComputePipeline,
+        wq: &wgpu::Buffer,
+        x: &wgpu::Buffer,
+        y: &wgpu::Buffer,
+        tokens: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) {
+        // MulMatParams { m, k, n, x_stride, y_stride }.
+        let params: [u32; 5] = [
+            out_dim as u32,
+            in_dim as u32,
+            tokens as u32,
+            in_dim as u32,
+            out_dim as u32,
+        ];
+        let p_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&params), "vit_mul_mat_params");
+        let wg_m = (out_dim as u32).div_ceil(VIT_MM_WG_M * VIT_MM_TILE_M);
+        let wg_n = (tokens as u32).div_ceil(VIT_MM_WG_N * VIT_MM_TILE_N);
+        self.dispatch(pipe, &[wq, x, y, &p_buf], (wg_m, wg_n, 1));
+    }
 }
 
 #[cfg(feature = "gpu")]
 impl VitGpuOps for WgpuVitOps {
     type Buf = wgpu::Buffer;
-    /// wgpu dequantizes every linear weight to f32 and runs the f32 tiled
-    /// matmul, so a weight is just a plain buffer.
-    type Weight = wgpu::Buffer;
+    type Weight = WgpuVitWeight;
 
     fn upload(&self, data: &[f32]) -> Self::Buf {
         self.ctx.upload_f32(data, "vit")
@@ -733,11 +839,20 @@ impl VitGpuOps for WgpuVitOps {
     }
 
     fn upload_weight(&self, w: &MmapWeight) -> Self::Weight {
-        self.ctx.upload_f32(&dequant_weight(w), "vit_w")
+        use crate::tensor::DType;
+        match w.dtype {
+            // Keep packed → quantized GEMM straight from the bytes.
+            DType::Q8_0 | DType::Q4_0 => WgpuVitWeight::Quant {
+                buf: self.ctx.upload_storage(w.data(), "vit_wq"),
+                dtype: w.dtype,
+            },
+            // Dense or a quant dtype without a ViT GEMM kernel: dequantize.
+            _ => WgpuVitWeight::Dense(self.ctx.upload_f32(&dequant_weight(w), "vit_w")),
+        }
     }
 
     fn upload_weight_f32(&self, data: &[f32], _out_dim: usize, _in_dim: usize) -> Self::Weight {
-        self.ctx.upload_f32(data, "vit_w")
+        WgpuVitWeight::Dense(self.ctx.upload_f32(data, "vit_w"))
     }
 
     fn linear(
@@ -751,20 +866,36 @@ impl VitGpuOps for WgpuVitOps {
         let y = self
             .ctx
             .create_storage_rw((tokens * out_dim * 4) as u64, "vit_linear_out");
-        // MulMatParams: m, k, n, x_stride, y_stride.
-        let params: [u32; 5] = [
-            out_dim as u32,
-            in_dim as u32,
-            tokens as u32,
-            in_dim as u32,
-            out_dim as u32,
-        ];
-        let p_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&params), "vit_linear_params");
-        let wg_m = (out_dim as u32).div_ceil(32);
-        let wg_n = (tokens as u32).div_ceil(32);
-        self.dispatch(&self.p_linear, &[w, x, &y, &p_buf], (wg_m, wg_n, 1));
+        match w {
+            WgpuVitWeight::Quant { buf, dtype } => {
+                // `upload_weight` only builds `Quant` for Q8_0/Q4_0, so those
+                // are the only dtypes reachable here.
+                let pipe = match dtype {
+                    crate::tensor::DType::Q8_0 => &self.p_mul_mat_q8_0,
+                    crate::tensor::DType::Q4_0 => &self.p_mul_mat_q4_0,
+                    other => {
+                        unreachable!("WgpuVitWeight::Quant holds only Q8_0/Q4_0, got {other:?}")
+                    }
+                };
+                self.run_mul_mat_tiled(pipe, buf, x, &y, tokens, out_dim, in_dim);
+            }
+            WgpuVitWeight::Dense(buf) => {
+                // MulMatParams: m, k, n, x_stride, y_stride.
+                let params: [u32; 5] = [
+                    out_dim as u32,
+                    in_dim as u32,
+                    tokens as u32,
+                    in_dim as u32,
+                    out_dim as u32,
+                ];
+                let p_buf = self
+                    .ctx
+                    .upload_storage(bytemuck::cast_slice(&params), "vit_linear_params");
+                let wg_m = (out_dim as u32).div_ceil(32);
+                let wg_n = (tokens as u32).div_ceil(32);
+                self.dispatch(&self.p_linear, &[buf, x, &y, &p_buf], (wg_m, wg_n, 1));
+            }
+        }
         y
     }
 
@@ -840,11 +971,24 @@ impl VitGpuOps for WgpuVitOps {
         let p_buf = self
             .ctx
             .upload_storage(bytemuck::cast_slice(&params), "vit_attn_params");
-        self.dispatch(
-            &self.p_attn,
-            &[q, k, v, &out, &p_buf],
-            (tokens as u32, n_head as u32, 1),
-        );
+        // Query-tiled flash attention (one workgroup per Q_TILE=256 queries,
+        // reusing K/V tiles in shared memory) when head_dim fits its shared/
+        // register sizing; else the scalar per-query kernel.
+        const VIT_ATTN_TILED_Q: u32 = 256;
+        const VIT_ATTN_TILED_MAX_HEAD_DIM: usize = 64;
+        if head_dim <= VIT_ATTN_TILED_MAX_HEAD_DIM {
+            self.dispatch(
+                &self.p_attn_tiled,
+                &[q, k, v, &out, &p_buf],
+                ((tokens as u32).div_ceil(VIT_ATTN_TILED_Q), n_head as u32, 1),
+            );
+        } else {
+            self.dispatch(
+                &self.p_attn,
+                &[q, k, v, &out, &p_buf],
+                (tokens as u32, n_head as u32, 1),
+            );
+        }
         out
     }
 
@@ -1347,20 +1491,42 @@ mod tests {
         MmapWeight::from_owned_bytes(bytes, DType::Q8_0, rows, cols)
     }
 
-    /// Build a tiny synthetic VL encoder for CPU↔GPU parity. With `quant`, the
-    /// linear weights (q/k/v/o, ffn, projector) are Q8_0 to exercise the
-    /// quantized GEMM; norms/biases/conv stay f32. Without it, everything is f32.
-    fn synth_encoder() -> VisionEncoderWeights {
-        synth_encoder_quant(false)
+    /// Quantize a `[rows, cols]` row-major f32 weight to packed Q4_0 (18 bytes
+    /// per 32-element block: f16 scale + 16 packed bytes, low nibbles → lanes
+    /// 0..16, high nibbles → 16..32, offset −8) and wrap as an `MmapWeight` —
+    /// exercises the `gemm_q4_0` GEMM path. `cols` must be a multiple of 32.
+    fn q4_0_weight(rows: usize, cols: usize, seed: usize) -> MmapWeight {
+        assert_eq!(cols % 32, 0, "Q4_0 cols must be a multiple of 32");
+        let data = rnd(rows * cols, seed);
+        let mut bytes = Vec::with_capacity(rows * (cols / 32) * 18);
+        for block in data.chunks_exact(32) {
+            let max_abs = block.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let scale = max_abs / 7.0;
+            let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+            bytes.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+            for qi in 0..16 {
+                let lo = ((block[qi] * inv).round() + 8.0).clamp(0.0, 15.0) as u8;
+                let hi = ((block[qi + 16] * inv).round() + 8.0).clamp(0.0, 15.0) as u8;
+                bytes.push(lo | (hi << 4));
+            }
+        }
+        MmapWeight::from_owned_bytes(bytes, DType::Q4_0, rows, cols)
     }
 
-    fn synth_encoder_quant(quant: bool) -> VisionEncoderWeights {
-        let lin = |rows: usize, cols: usize, seed: usize| {
-            if quant {
-                q8_0_weight(rows, cols, seed)
-            } else {
-                f32_weight(rows, cols, seed)
-            }
+    /// Build a tiny synthetic VL encoder for CPU↔GPU parity. With `quant`, the
+    /// linear weights (q/k/v/o, ffn, projector) are quantized to that dtype to
+    /// exercise the quantized GEMM; norms/biases/conv stay f32. `None` keeps
+    /// everything f32.
+    fn synth_encoder() -> VisionEncoderWeights {
+        synth_encoder_quant(None)
+    }
+
+    fn synth_encoder_quant(quant: Option<DType>) -> VisionEncoderWeights {
+        let lin = |rows: usize, cols: usize, seed: usize| match quant {
+            Some(DType::Q8_0) => q8_0_weight(rows, cols, seed),
+            Some(DType::Q4_0) => q4_0_weight(rows, cols, seed),
+            Some(d) => panic!("synth_encoder_quant: unsupported dtype {d:?}"),
+            None => f32_weight(rows, cols, seed),
         };
         // All linear in_dims (k) must be multiples of the matmul's TILE_K=32:
         //   patch in_dim = 3·patch_size² = 192; q/k/v/o/ffn_up = n_embd = 32;
@@ -1373,7 +1539,9 @@ mod tests {
         let scale_factor = 2;
         let projection_dim = 16;
         let intermediate = 64;
-        let trained_side = 4;
+        // 8×8 = 64 patches so attention spans >1 K_TILE (32) block, exercising
+        // the tiled flash-attention kernel's cross-block online-softmax path.
+        let trained_side = 8;
         let n_trained_patches = trained_side * trained_side;
         let image_size = trained_side * patch_size;
         let in_dim = 3 * patch_size * patch_size;
@@ -1446,8 +1614,10 @@ mod tests {
     /// GEMM stores dequantized weights as half).
     fn run_parity<O: VitGpuOps>(ops: &O, enc: &VisionEncoderWeights, tol: f32) {
         let cfg = &enc.config;
-        let grid_w = 4;
-        let grid_h = 4;
+        // Match the 8×8 trained grid (no pos-embed interpolation) and span
+        // multiple attention K_TILE blocks (64 tokens > 32).
+        let grid_w = 8;
+        let grid_h = 8;
         let target_w = grid_w * cfg.patch_size;
         let target_h = grid_h * cfg.patch_size;
         let pixels = rnd(3 * target_h * target_w, 999);
@@ -1509,13 +1679,13 @@ mod tests {
         };
         run_parity(
             &MetalVitOps::new(ctx).unwrap(),
-            &synth_encoder_quant(true),
+            &synth_encoder_quant(Some(DType::Q8_0)),
             5e-2,
         );
     }
 
-    /// Q8_0 linear weights on wgpu, which dequantizes to f32 before its tiled
-    /// matmul — covers the `upload_weight` quant→f32 branch.
+    /// Q8_0 linear weights on wgpu → exercises the `gemm_q8_0` GEMM path
+    /// (packed bytes, no dequant-to-f32 upload).
     #[cfg(feature = "gpu")]
     #[test]
     fn test_gpu_encode_image_parity_q8_0() {
@@ -1525,8 +1695,24 @@ mod tests {
         };
         run_parity(
             &WgpuVitOps::new(ctx).expect("build wgpu vit ops"),
-            &synth_encoder_quant(true),
+            &synth_encoder_quant(Some(DType::Q8_0)),
             5e-2,
+        );
+    }
+
+    /// Q4_0 linear weights on wgpu → exercises the `gemm_q4_0` GEMM path.
+    /// Looser tolerance than Q8_0: 4-bit quantization is far coarser.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_gpu_encode_image_parity_q4_0() {
+        let ctx = match crate::backend::wgpu::GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return, // no GPU (CI)
+        };
+        run_parity(
+            &WgpuVitOps::new(ctx).expect("build wgpu vit ops"),
+            &synth_encoder_quant(Some(DType::Q4_0)),
+            2e-1,
         );
     }
 }
