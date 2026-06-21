@@ -1,0 +1,11 @@
+{
+  "goog:chromeOptions": {
+    "args": [
+      "--headless=new",
+      "--enable-unsafe-webgpu",
+      "--enable-features=Vulkan,WebGPU",
+      "--use-angle=metal",
+      "--no-sandbox"
+    ]
+  }
+}

@@ -62,6 +62,12 @@ wasm-bindgen-futures = { workspace = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-rayon = { workspace = true, optional = true }
 
+# `wasm-bindgen-test` drives the headless-Chrome WebGPU smoke test
+# (`tests/webgpu_smoke.rs`) via `wasm-pack test --headless --chrome
+# --features wgpu`. wasm-only — the runner injects a browser harness.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }
+
 [features]
 # `parallel` — opt-in multi-threaded wasm build. Lights up
 # `cera/parallel` (rayon) and links `wasm-bindgen-rayon`, which
