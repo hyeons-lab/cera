@@ -369,6 +369,19 @@ impl GpuLfm2Model {
         Self::from_weight_source(&cpu_model, context_size, model_id)
     }
 
+    /// Construct an LFM2 GPU model with an externally-built [`GpuContext`].
+    /// The wasm/WebGPU entry point — callers build the context with
+    /// `GpuContext::new_async().await` (browser init is async) and hand it in.
+    pub fn from_gguf_with_ctx(
+        gguf: GgufFile,
+        context_size: usize,
+        model_id: String,
+        ctx: GpuContext,
+    ) -> Result<Self> {
+        let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
+        Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
+    }
+
     /// Construct a GPU model for a dense transformer (Qwen2/Qwen3/LLaMA/
     /// Mistral/Granite) — the `LlamaModel` family. Mirrors `from_gguf_with_id`
     /// but feeds the shared loader a `LlamaModel` weight source instead of
@@ -394,8 +407,24 @@ impl GpuLfm2Model {
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
+        // Native: build the GPU context synchronously. wasm callers must use
+        // `from_*_with_ctx` with a context built via `GpuContext::new_async`
+        // (WebGPU init only resolves on the JS event loop).
         let ctx = GpuContext::new()?;
+        Self::from_weight_source_with_ctx(src, context_size, model_id, ctx)
+    }
 
+    /// Like [`Self::from_weight_source`] but with an externally-constructed
+    /// [`GpuContext`]. This is the wasm entry point: the context is built
+    /// asynchronously (`GpuContext::new_async().await`) before construction,
+    /// since the rest of loading (weight upload + pipeline build) is sync GPU
+    /// work that does no readback and runs fine on the wasm main thread.
+    fn from_weight_source_with_ctx(
+        src: &dyn GpuWeightSource,
+        context_size: usize,
+        model_id: String,
+        ctx: GpuContext,
+    ) -> Result<Self> {
         // The CPU loader already caps max_seq_len to context_size internally,
         // so the second .min() below is redundant but kept for clarity.
         let mut config = src.config().clone();
@@ -2028,6 +2057,42 @@ impl GpuLfm2Model {
         self.ctx.finish_profiler();
 
         let out = self.ctx.download_u32(&self.argmax_out_buf, 1);
+        out[0]
+    }
+
+    /// Async (wasm/WebGPU) greedy decode step. Runs the full forward +
+    /// argmax on the GPU, then reads back the single argmax token id without
+    /// blocking — the wasm-compatible analog of [`Self::forward_greedy_inner`].
+    ///
+    /// The blocking version's `submit_and_wait`'s `device.poll(Maintain::Wait)`
+    /// is a no-op on the WebGPU backend (the browser owns the queue), so we
+    /// submit the argmax pass directly; the async `download_u32_async` is
+    /// ordered after it on the same queue. Single-token only, like the rest of
+    /// the GPU decode path. Callers drive prefill by stepping each prompt token
+    /// through this (discarding all but the last result).
+    pub async fn forward_greedy_async(
+        &self,
+        token: u32,
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> u32 {
+        self.forward_inner_compute(&[token], pos, state);
+
+        self.ctx.reset_profiler();
+        let mut enc = self.new_encoder();
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("argmax"),
+                timestamp_writes: self.ctx.begin_profile_span("argmax"),
+            });
+            pass.set_pipeline(&self.pipelines.argmax_f32);
+            pass.set_bind_group(0, &self.argmax_bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        self.ctx.queue.submit(Some(enc.finish()));
+        self.ctx.finish_profiler();
+
+        let out = self.ctx.download_u32_async(&self.argmax_out_buf, 1).await;
         out[0]
     }
 }

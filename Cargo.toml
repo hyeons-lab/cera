@@ -27,6 +27,10 @@ regex = "1"
 rayon = "1"
 wgpu = "24"
 pollster = "0.4"
+# Lightweight oneshot channel (no executor) used to bridge wgpu's
+# `map_async` completion callback into an `.await` for the wasm/WebGPU
+# async readback path — see `GpuContext::download_*_async`.
+futures-channel = "0.3"
 metal = "0.31"
 objc = "0.2"
 rustfft = "6.4"
@@ -68,6 +72,7 @@ web-time = "1"
 # normal "regenerate the JS glue" upgrade dance, not a code-level
 # rewrite. Only consumed by `cera-wasm`; native crates don't pull it.
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
 # Worker-pool init shim that lights up rayon on `wasm32-unknown-unknown`.
 # Provides a `#[wasm_bindgen]` `init_thread_pool(num_threads)` export
 # that JS callers `await` once before any rayon work; under the hood

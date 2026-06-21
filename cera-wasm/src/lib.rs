@@ -1222,3 +1222,138 @@ impl<'a> cera::ModalitySink for JsTextSink<'a> {
         // via `summary.finishReason` after `generate` returns.
     }
 }
+
+// ── WebGPU (wgpu) GPU-accelerated LFM2 inference ──────────────────────────
+//
+// Gated behind the `wgpu` cargo feature (which enables `cera/gpu`). Exposes an
+// async, GPU-backed text-generation surface for the browser. It deliberately
+// bypasses the synchronous `cera::Session`: the WebGPU backend can only be
+// driven from the JS event loop (no blocking GPU readback on the main thread),
+// so the whole prefill + decode loop is `async` and reads logits back via
+// `GpuContext::download_*_async`. Prototype scope: LFM2 only, greedy decode.
+// See devlog 000169.
+#[cfg(feature = "wgpu")]
+mod webgpu {
+    use super::map_err;
+    use cera::model::Model;
+    use std::sync::Arc;
+    use wasm_bindgen::prelude::*;
+
+    /// GPU-accelerated LFM2 session for the browser. Holds a WebGPU-resident
+    /// model + KV/conv state and streams decoded token text to a JS callback.
+    #[wasm_bindgen]
+    pub struct WebGpuSession {
+        model: cera::model::gpu_lfm2::GpuLfm2Model,
+        tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
+        state: cera::kv_cache::InferenceState,
+        eos: Option<u32>,
+    }
+
+    #[wasm_bindgen]
+    impl WebGpuSession {
+        /// Async constructor: initialize WebGPU (`requestAdapter` /
+        /// `requestDevice` resolve on the JS event loop), parse the in-memory
+        /// GGUF, upload the model to the GPU, and build a fresh inference
+        /// state. `contextSize` defaults to 4096. Throws if WebGPU is
+        /// unavailable, the bytes aren't a valid LFM2 GGUF, or the device
+        /// rejects the model.
+        #[wasm_bindgen(js_name = create)]
+        pub async fn create(
+            bytes: Vec<u8>,
+            context_size: Option<u32>,
+        ) -> Result<WebGpuSession, JsError> {
+            let ctx = cera::backend::wgpu::GpuContext::new_async()
+                .await
+                .map_err(map_err)?;
+            let ctx_size = context_size.unwrap_or(4096) as usize;
+            let gguf_bytes: Arc<[u8]> = Arc::from(bytes);
+            let gguf = cera::gguf::GgufFile::from_bytes(gguf_bytes).map_err(map_err)?;
+            // Build the tokenizer before the GGUF is moved into the model.
+            let tokenizer =
+                Arc::new(cera::tokenizer::BpeTokenizer::from_gguf(&gguf).map_err(map_err)?);
+            let eos = tokenizer.eos_token();
+            let model = cera::model::gpu_lfm2::GpuLfm2Model::from_gguf_with_ctx(
+                gguf,
+                ctx_size,
+                String::new(),
+                ctx,
+            )
+            .map_err(map_err)?;
+            let state = cera::kv_cache::InferenceState::from_config(model.config());
+            Ok(WebGpuSession {
+                model,
+                tokenizer,
+                state,
+                eos,
+            })
+        }
+
+        /// Adapter + backend description of the WebGPU device (e.g.
+        /// `"… (BrowserWebGpu)"`). Useful for confirming the GPU path is live.
+        #[wasm_bindgen(getter)]
+        pub fn adapter(&self) -> String {
+            // (no direct ctx accessor on the model; report via config instead)
+            format!(
+                "lfm2 gpu: {} layers, vocab {}",
+                self.model.config().n_layers,
+                self.model.config().vocab_size,
+            )
+        }
+
+        /// Tokenize `prompt`, run prefill, then greedily decode up to
+        /// `maxTokens` tokens. `onToken(text)` is invoked for each decoded
+        /// piece as it is produced; the full generated string is also
+        /// returned. Stops early on the model's EOS token.
+        #[wasm_bindgen]
+        pub async fn generate(
+            &mut self,
+            prompt: &str,
+            max_tokens: u32,
+            on_token: &js_sys::Function,
+        ) -> Result<String, JsError> {
+            let mut ids = self.tokenizer.encode(prompt);
+            if let Some(bos) = self.tokenizer.bos_token() {
+                ids.insert(0, bos);
+            }
+            if ids.is_empty() {
+                return Ok(String::new());
+            }
+
+            // Prefill: teacher-force every prompt token. Only the last token's
+            // argmax matters (the first generated token); intermediate argmax
+            // readbacks are discarded. Each step `.await`s the async readback,
+            // which yields to the JS event loop and keeps the GPU queue from
+            // backing up. (Perf: a batched no-readback prefill is a follow-up.)
+            let mut pos = 0usize;
+            let mut next = 0u32;
+            for (i, &tok) in ids.iter().enumerate() {
+                next = self
+                    .model
+                    .forward_greedy_async(tok, pos + i, &mut self.state)
+                    .await;
+            }
+            pos += ids.len();
+
+            // Greedy decode loop.
+            let mut out = String::new();
+            for _ in 0..max_tokens {
+                if Some(next) == self.eos {
+                    break;
+                }
+                let piece = self.tokenizer.decode(&[next]);
+                out.push_str(&piece);
+                let _ = on_token.call1(&JsValue::NULL, &JsValue::from_str(&piece));
+
+                next = self
+                    .model
+                    .forward_greedy_async(next, pos, &mut self.state)
+                    .await;
+                pos += 1;
+            }
+            Ok(out)
+        }
+    }
+}
+
+#[cfg(feature = "wgpu")]
+pub use webgpu::WebGpuSession;

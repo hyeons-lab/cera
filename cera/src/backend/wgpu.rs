@@ -66,18 +66,32 @@ pub struct GpuProfiler {
 }
 
 impl GpuContext {
-    /// Initialize the GPU: request a high-performance adapter + device.
+    /// Initialize the GPU: request a high-performance adapter + device
+    /// (blocking). Native convenience wrapper around [`Self::new_async`];
+    /// must NOT be called on wasm32 (the WebGPU backend can only be driven
+    /// from the JS event loop — use `new_async().await` there).
     pub fn new() -> Result<Self> {
+        pollster::block_on(Self::new_async())
+    }
+
+    /// Initialize the GPU asynchronously: request a high-performance adapter
+    /// and device. This is the wasm-compatible entry point — WebGPU's
+    /// `requestAdapter` / `requestDevice` resolve on the JS event loop, so
+    /// the host must `.await` rather than block. Native callers can use the
+    /// blocking [`Self::new`] wrapper.
+    pub async fn new_async() -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
 
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            ..Default::default()
-        }))
-        .context("no GPU adapter found")?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            })
+            .await
+            .context("no GPU adapter found")?;
 
         let adapter_name = adapter.get_info().name.clone();
         let backend = format!("{:?}", adapter.get_info().backend);
@@ -97,16 +111,18 @@ impl GpuContext {
         // failures on GPUs with smaller max_buffer_size (integrated, mobile).
         let adapter_limits = adapter.limits();
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("cera-gpu"),
-                required_features: features,
-                required_limits: adapter_limits.clone(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
-        .map_err(|e| anyhow::anyhow!("failed to request GPU device: {e}"))?;
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("cera-gpu"),
+                    required_features: features,
+                    required_limits: adapter_limits.clone(),
+                    memory_hints: wgpu::MemoryHints::Performance,
+                },
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to request GPU device: {e}"))?;
 
         let profiler = if has_timestamps {
             let max_queries = 512u32; // enough for ~16 layers × ~16 dispatches
@@ -303,6 +319,66 @@ impl GpuContext {
         drop(data);
         staging.unmap();
         result
+    }
+
+    /// Async GPU→CPU readback of `size` bytes — the wasm/WebGPU-compatible
+    /// analog of the blocking `download_*` helpers. WebGPU can only be driven
+    /// from the JS event loop, so we `.await` the `map_async` completion via a
+    /// oneshot channel instead of blocking on `device.poll(Maintain::Wait)` +
+    /// `mpsc::recv`. Allocates a fresh staging buffer per call (vs. the cached
+    /// staging the sync path reuses) — holding the staging mutex across an
+    /// `.await` would trip `await_holding_lock`, and per-token readback alloc
+    /// is fine for the current prototype (perf pass is a follow-up).
+    async fn download_raw_async(&self, buffer: &wgpu::Buffer, size: u64) -> Vec<u8> {
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging-download-async"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("download-async"),
+            });
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(0..size);
+        let (tx, rx) = futures_channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        // Native: drive the queue to completion so the callback fires before
+        // the await resolves (keeps the async fn usable from a blocking
+        // executor). wasm: the WebGPU backend ignores `poll`; the await
+        // suspends to the JS event loop, which fires the map callback.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.await
+            .expect("GPU readback channel closed")
+            .expect("GPU readback failed");
+
+        let data = slice.get_mapped_range();
+        let bytes = data.to_vec();
+        drop(data);
+        staging.unmap();
+        bytes
+    }
+
+    /// Async f32 readback. See [`Self::download_raw_async`].
+    pub async fn download_f32_async(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<f32> {
+        let size = (count * std::mem::size_of::<f32>()) as u64;
+        let bytes = self.download_raw_async(buffer, size).await;
+        bytemuck::cast_slice(&bytes).to_vec()
+    }
+
+    /// Async u32 readback (argmax token id). See [`Self::download_raw_async`].
+    pub async fn download_u32_async(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<u32> {
+        let size = (count * std::mem::size_of::<u32>()) as u64;
+        let bytes = self.download_raw_async(buffer, size).await;
+        bytemuck::cast_slice(&bytes).to_vec()
     }
 
     /// Read u32 data back from a GPU buffer (blocking). Mirrors
@@ -618,6 +694,21 @@ mod tests {
         let data: Vec<f32> = (0..257).map(|i| i as f32 * 0.1).collect();
         let buf = ctx.upload_f32(&data, "test");
         let result = ctx.download_f32(&buf, data.len());
+        assert_eq!(data, result);
+    }
+
+    #[test]
+    fn test_gpu_async_download_roundtrip() {
+        // Validates the wasm-facing async readback primitives on native by
+        // driving the futures with pollster. Same data path as the blocking
+        // roundtrip above, through `new_async` + `download_f32_async`.
+        let ctx = match pollster::block_on(GpuContext::new_async()) {
+            Ok(ctx) => ctx,
+            Err(_) => return, // skip if no GPU
+        };
+        let data: Vec<f32> = (0..257).map(|i| i as f32 * 0.1).collect();
+        let buf = ctx.upload_f32(&data, "test_async");
+        let result = pollster::block_on(ctx.download_f32_async(&buf, data.len()));
         assert_eq!(data, result);
     }
 

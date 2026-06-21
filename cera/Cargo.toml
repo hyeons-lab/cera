@@ -26,6 +26,7 @@ regex.workspace = true
 rayon = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
+futures-channel = { workspace = true, optional = true }
 metal = { workspace = true, optional = true }
 objc = { workspace = true, optional = true }
 rustfft.workspace = true
@@ -129,7 +130,7 @@ parallel = ["dep:rayon"]
 std-fs = []
 mmap = ["dep:memmap2", "std-fs"]
 disk-cache = ["std-fs"]
-gpu = ["dep:wgpu", "dep:pollster"]
+gpu = ["dep:wgpu", "dep:pollster", "dep:futures-channel"]
 metal = ["dep:metal", "dep:objc", "mmap"]
 blas = ["dep:cblas-sys", "dep:accelerate-src", "dep:openblas-src"]
 # BundleRepo + HTTP downloader + SHA-256 integrity. Opt-in so wasm and
