@@ -313,6 +313,16 @@ impl BpeTokenizer {
     /// from each token's vocab entry, maps them back to raw bytes, then
     /// interprets the result as UTF-8.
     pub fn decode(&self, token_ids: &[u32]) -> String {
+        String::from_utf8_lossy(&self.decode_bytes(token_ids)).into_owned()
+    }
+
+    /// Decode `token_ids` to their raw byte sequence, without the lossy UTF-8
+    /// conversion that [`Self::decode`] applies. A single multi-byte character
+    /// can span several byte-fallback tokens (e.g. an emoji as `<0xE2><0x80>…`),
+    /// so streaming callers should accumulate these bytes and only convert
+    /// complete UTF-8 prefixes — converting one token at a time would turn each
+    /// fragment into a U+FFFD replacement char.
+    pub fn decode_bytes(&self, token_ids: &[u32]) -> Vec<u8> {
         let mut raw_bytes = Vec::new();
         for &id in token_ids {
             if let Some(token_bytes) = self.vocab.get(id as usize) {
@@ -338,7 +348,7 @@ impl BpeTokenizer {
                 }
             }
         }
-        String::from_utf8_lossy(&raw_bytes).into_owned()
+        raw_bytes
     }
 
     /// Vocabulary size.

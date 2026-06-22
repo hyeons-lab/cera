@@ -97,7 +97,10 @@
       runBtn.addEventListener("click", async () => {
         if (!session) return;
         const prompt = $("prompt").value;
-        const maxTokens = parseInt($("maxtok").value, 10) || 64;
+        // Clamp to >=1: parseInt("") is NaN and `0` would otherwise generate
+        // nothing; fall back to 64 only for non-positive / unparseable input.
+        const parsedMax = parseInt($("maxtok").value, 10);
+        const maxTokens = Number.isFinite(parsedMax) && parsedMax > 0 ? parsedMax : 64;
         outEl.textContent = prompt;
         runBtn.disabled = true;
         setStatus("Generating on GPU…");

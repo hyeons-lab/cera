@@ -32,6 +32,9 @@ async fn webgpu_async_init_and_readback() {
     // exercises the same path the engine uses for logits readback.
     let data: Vec<f32> = (0..257).map(|i| i as f32 * 0.5).collect();
     let buf = ctx.upload_f32(&data, "smoke");
-    let out = ctx.download_f32_async(&buf, data.len()).await;
+    let out = ctx
+        .download_f32_async(&buf, data.len())
+        .await
+        .expect("async readback failed");
     assert_eq!(data, out, "async readback mismatch");
 }

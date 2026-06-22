@@ -1239,6 +1239,17 @@ mod webgpu {
     use std::sync::Arc;
     use wasm_bindgen::prelude::*;
 
+    /// Stream one decoded piece to the JS callback. Any exception it throws is
+    /// fatal and re-thrown across the wasm boundary (mirroring
+    /// `JsTextSink::on_text_tokens`); `throw_val` preserves the original error
+    /// object so it lands in the caller's `try { ... } catch` around `generate`
+    /// rather than being silently swallowed mid-decode.
+    fn emit(on_token: &js_sys::Function, piece: &str) {
+        if let Err(err) = on_token.call1(&JsValue::null(), &JsValue::from_str(piece)) {
+            wasm_bindgen::throw_val(err);
+        }
+    }
+
     /// GPU-accelerated LFM2 session for the browser. Holds a WebGPU-resident
     /// model + KV/conv state and streams decoded token text to a JS callback.
     #[wasm_bindgen]
@@ -1309,11 +1320,15 @@ mod webgpu {
             on_token: &js_sys::Function,
         ) -> Result<String, JsError> {
             let mut ids = self.tokenizer.encode(prompt);
-            // Only prepend BOS if the encoder didn't already include it (a
-            // chat template or a literal special token in the prompt can).
-            if let Some(bos) = self.tokenizer.bos_token() {
-                if ids.first() != Some(&bos) {
-                    ids.insert(0, bos);
+            // Prepend BOS only at the start of a session. The on-GPU KV cache
+            // persists across `generate` calls, so prepending on a continuation
+            // would inject a BOS at a nonzero position mid-sequence. Also skip
+            // if the encoder already emitted it (chat template / special token).
+            if self.state.seq_len == 0 {
+                if let Some(bos) = self.tokenizer.bos_token() {
+                    if ids.first() != Some(&bos) {
+                        ids.insert(0, bos);
+                    }
                 }
             }
             if ids.is_empty() {
@@ -1338,36 +1353,43 @@ mod webgpu {
                 )));
             }
 
-            // Prefill: teacher-force every prompt token. Only the last token's
-            // argmax matters (the first generated token); intermediate argmax
-            // readbacks are discarded. Each step `.await`s the async readback,
-            // which yields to the JS event loop and keeps the GPU queue from
-            // backing up. (Perf: a batched no-readback prefill is a follow-up.)
-            let mut next = 0u32;
-            for &tok in &ids {
-                next = self
-                    .model
-                    .forward_greedy_async(tok, pos, &mut self.state)
-                    .await;
+            // Prefill: feed every prompt token through the GPU to build the KV
+            // cache. All but the last token skip the argmax + readback (their
+            // predictions are unused), so an N-token prompt does a single
+            // GPU→CPU round-trip instead of N. The last token's argmax is the
+            // first generated token.
+            let (last, prefix) = ids.split_last().expect("ids is non-empty");
+            for &tok in prefix {
+                self.model.forward_prefill_step(tok, pos, &mut self.state);
                 pos += 1;
             }
+            let mut next = self
+                .model
+                .forward_greedy_async(*last, pos, &mut self.state)
+                .await
+                .map_err(map_err)?;
+            pos += 1;
 
-            // Greedy decode loop.
+            // Greedy decode loop. Stream raw bytes through a buffer and emit
+            // only complete UTF-8: a multi-byte character can span several
+            // byte-fallback tokens, so converting one token at a time would
+            // corrupt non-ASCII output into U+FFFD replacement chars.
             let mut out = String::new();
+            let mut pending = Vec::<u8>::new();
             for _ in 0..max_tokens {
                 if Some(next) == self.eos {
                     break;
                 }
-                let piece = self.tokenizer.decode(&[next]);
-                out.push_str(&piece);
-                // Treat any exception the JS callback throws as fatal and
-                // re-throw it across the wasm boundary, mirroring
-                // `JsTextSink::on_text_tokens`. `throw_val` preserves the
-                // original error object so it lands in the caller's
-                // `try { ... } catch` around `generate` (rather than being
-                // silently swallowed while decoding continues).
-                if let Err(err) = on_token.call1(&JsValue::null(), &JsValue::from_str(&piece)) {
-                    wasm_bindgen::throw_val(err);
+                pending.extend_from_slice(&self.tokenizer.decode_bytes(&[next]));
+                let valid = match std::str::from_utf8(&pending) {
+                    Ok(s) => s.len(),
+                    Err(e) => e.valid_up_to(),
+                };
+                if valid > 0 {
+                    let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                    out.push_str(&piece);
+                    emit(on_token, &piece);
+                    pending.drain(..valid);
                 }
 
                 // Stop before the next forward would overflow the context
@@ -1379,8 +1401,16 @@ mod webgpu {
                 next = self
                     .model
                     .forward_greedy_async(next, pos, &mut self.state)
-                    .await;
+                    .await
+                    .map_err(map_err)?;
                 pos += 1;
+            }
+            // Flush any trailing bytes (an incomplete multi-byte char at the
+            // stop boundary — lossy as a last resort).
+            if !pending.is_empty() {
+                let piece = String::from_utf8_lossy(&pending).into_owned();
+                out.push_str(&piece);
+                emit(on_token, &piece);
             }
             Ok(out)
         }
