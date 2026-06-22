@@ -1320,20 +1320,37 @@ mod webgpu {
                 return Ok(String::new());
             }
 
+            // `WebGpuSession` is stateful: the on-GPU KV cache persists across
+            // calls, so positions must continue from the current sequence
+            // length, not restart at 0 (restarting corrupts RoPE and overwrites
+            // live cache slots). `state.seq_len` is advanced by every forward.
+            let max_seq_len = self.model.config().max_seq_len;
+            let mut pos = self.state.seq_len;
+
+            // The GPU forward asserts `seq_len < max_seq_len`, so a prompt that
+            // doesn't fit in the remaining window would panic. Reject it with a
+            // clear error instead.
+            if pos + ids.len() > max_seq_len {
+                return Err(JsError::new(&format!(
+                    "prompt of {} tokens plus {pos} already in context exceeds \
+                     the model's max sequence length of {max_seq_len}",
+                    ids.len(),
+                )));
+            }
+
             // Prefill: teacher-force every prompt token. Only the last token's
             // argmax matters (the first generated token); intermediate argmax
             // readbacks are discarded. Each step `.await`s the async readback,
             // which yields to the JS event loop and keeps the GPU queue from
             // backing up. (Perf: a batched no-readback prefill is a follow-up.)
-            let mut pos = 0usize;
             let mut next = 0u32;
-            for (i, &tok) in ids.iter().enumerate() {
+            for &tok in &ids {
                 next = self
                     .model
-                    .forward_greedy_async(tok, pos + i, &mut self.state)
+                    .forward_greedy_async(tok, pos, &mut self.state)
                     .await;
+                pos += 1;
             }
-            pos += ids.len();
 
             // Greedy decode loop.
             let mut out = String::new();
@@ -1353,6 +1370,12 @@ mod webgpu {
                     wasm_bindgen::throw_val(err);
                 }
 
+                // Stop before the next forward would overflow the context
+                // window (the GPU forward asserts `seq_len < max_seq_len`). The
+                // token just emitted is the last one this call can produce.
+                if pos >= max_seq_len {
+                    break;
+                }
                 next = self
                     .model
                     .forward_greedy_async(next, pos, &mut self.state)
