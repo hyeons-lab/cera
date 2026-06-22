@@ -1222,3 +1222,200 @@ impl<'a> cera::ModalitySink for JsTextSink<'a> {
         // via `summary.finishReason` after `generate` returns.
     }
 }
+
+// ── WebGPU (wgpu) GPU-accelerated LFM2 inference ──────────────────────────
+//
+// Gated behind the `wgpu` cargo feature (which enables `cera/gpu`). Exposes an
+// async, GPU-backed text-generation surface for the browser. It deliberately
+// bypasses the synchronous `cera::Session`: the WebGPU backend can only be
+// driven from the JS event loop (no blocking GPU readback on the main thread),
+// so the whole prefill + decode loop is `async` and reads logits back via
+// `GpuContext::download_*_async`. Prototype scope: LFM2 only, greedy decode.
+// See devlog 000169.
+#[cfg(feature = "wgpu")]
+mod webgpu {
+    use super::map_err;
+    use cera::model::Model;
+    use std::sync::Arc;
+    use wasm_bindgen::prelude::*;
+
+    /// Stream one decoded piece to the JS callback. Any exception it throws is
+    /// fatal and re-thrown across the wasm boundary (mirroring
+    /// `JsTextSink::on_text_tokens`); `throw_val` preserves the original error
+    /// object so it lands in the caller's `try { ... } catch` around `generate`
+    /// rather than being silently swallowed mid-decode.
+    fn emit(on_token: &js_sys::Function, piece: &str) {
+        if let Err(err) = on_token.call1(&JsValue::null(), &JsValue::from_str(piece)) {
+            wasm_bindgen::throw_val(err);
+        }
+    }
+
+    /// GPU-accelerated LFM2 session for the browser. Holds a WebGPU-resident
+    /// model + KV/conv state and streams decoded token text to a JS callback.
+    #[wasm_bindgen]
+    pub struct WebGpuSession {
+        model: cera::model::gpu_lfm2::GpuLfm2Model,
+        tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
+        state: cera::kv_cache::InferenceState,
+        eos: Option<u32>,
+    }
+
+    #[wasm_bindgen]
+    impl WebGpuSession {
+        /// Async constructor: initialize WebGPU (`requestAdapter` /
+        /// `requestDevice` resolve on the JS event loop), parse the in-memory
+        /// GGUF, upload the model to the GPU, and build a fresh inference
+        /// state. `contextSize` defaults to 4096. Throws if WebGPU is
+        /// unavailable, the bytes aren't a valid LFM2 GGUF, or the device
+        /// rejects the model.
+        #[wasm_bindgen(js_name = create)]
+        pub async fn create(
+            bytes: Vec<u8>,
+            context_size: Option<u32>,
+        ) -> Result<WebGpuSession, JsError> {
+            let ctx = cera::backend::wgpu::GpuContext::new_async()
+                .await
+                .map_err(map_err)?;
+            let ctx_size = context_size.unwrap_or(4096) as usize;
+            let gguf_bytes: Arc<[u8]> = Arc::from(bytes);
+            let gguf = cera::gguf::GgufFile::from_bytes(gguf_bytes).map_err(map_err)?;
+            // Build the tokenizer before the GGUF is moved into the model.
+            let tokenizer =
+                Arc::new(cera::tokenizer::BpeTokenizer::from_gguf(&gguf).map_err(map_err)?);
+            let eos = tokenizer.eos_token();
+            let model = cera::model::gpu_lfm2::GpuLfm2Model::from_gguf_with_ctx(
+                gguf,
+                ctx_size,
+                String::new(),
+                ctx,
+            )
+            .map_err(map_err)?;
+            let state = cera::kv_cache::InferenceState::from_config(model.config());
+            Ok(WebGpuSession {
+                model,
+                tokenizer,
+                state,
+                eos,
+            })
+        }
+
+        /// Adapter + backend description of the WebGPU device (e.g.
+        /// `"… (BrowserWebGpu)"`). Useful for confirming the GPU path is live.
+        /// Note: headless Chrome's Dawn adapter reports an empty name.
+        #[wasm_bindgen(getter)]
+        pub fn adapter(&self) -> String {
+            let (name, backend) = self.model.gpu_info();
+            format!("{name} ({backend})")
+        }
+
+        /// Tokenize `prompt`, run prefill, then greedily decode up to
+        /// `maxTokens` tokens. `onToken(text)` is invoked for each decoded
+        /// piece as it is produced; the full generated string is also
+        /// returned. Stops early on the model's EOS token.
+        #[wasm_bindgen]
+        pub async fn generate(
+            &mut self,
+            prompt: &str,
+            max_tokens: u32,
+            on_token: &js_sys::Function,
+        ) -> Result<String, JsError> {
+            let mut ids = self.tokenizer.encode(prompt);
+            // Prepend BOS only at the start of a session. The on-GPU KV cache
+            // persists across `generate` calls, so prepending on a continuation
+            // would inject a BOS at a nonzero position mid-sequence. Also skip
+            // if the encoder already emitted it (chat template / special token).
+            if self.state.seq_len == 0 {
+                if let Some(bos) = self.tokenizer.bos_token() {
+                    if ids.first() != Some(&bos) {
+                        ids.insert(0, bos);
+                    }
+                }
+            }
+            if ids.is_empty() {
+                return Ok(String::new());
+            }
+
+            // `WebGpuSession` is stateful: the on-GPU KV cache persists across
+            // calls, so positions must continue from the current sequence
+            // length, not restart at 0 (restarting corrupts RoPE and overwrites
+            // live cache slots). `state.seq_len` is advanced by every forward.
+            let max_seq_len = self.model.config().max_seq_len;
+            let mut pos = self.state.seq_len;
+
+            // The GPU forward asserts `seq_len < max_seq_len`, so a prompt that
+            // doesn't fit in the remaining window would panic. Reject it with a
+            // clear error instead.
+            if pos + ids.len() > max_seq_len {
+                return Err(JsError::new(&format!(
+                    "prompt of {} tokens plus {pos} already in context exceeds \
+                     the model's max sequence length of {max_seq_len}",
+                    ids.len(),
+                )));
+            }
+
+            // Prefill: feed every prompt token through the GPU to build the KV
+            // cache. All but the last token skip the argmax + readback (their
+            // predictions are unused), so an N-token prompt does a single
+            // GPU→CPU round-trip instead of N. The last token's argmax is the
+            // first generated token.
+            let (last, prefix) = ids.split_last().expect("ids is non-empty");
+            for &tok in prefix {
+                self.model.forward_prefill_step(tok, pos, &mut self.state);
+                pos += 1;
+            }
+            let mut next = self
+                .model
+                .forward_greedy_async(*last, pos, &mut self.state)
+                .await
+                .map_err(map_err)?;
+            pos += 1;
+
+            // Greedy decode loop. Stream raw bytes through a buffer and emit
+            // only complete UTF-8: a multi-byte character can span several
+            // byte-fallback tokens, so converting one token at a time would
+            // corrupt non-ASCII output into U+FFFD replacement chars.
+            let mut out = String::new();
+            let mut pending = Vec::<u8>::new();
+            for _ in 0..max_tokens {
+                if Some(next) == self.eos {
+                    break;
+                }
+                pending.extend_from_slice(&self.tokenizer.decode_bytes(&[next]));
+                let valid = match std::str::from_utf8(&pending) {
+                    Ok(s) => s.len(),
+                    Err(e) => e.valid_up_to(),
+                };
+                if valid > 0 {
+                    let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                    out.push_str(&piece);
+                    emit(on_token, &piece);
+                    pending.drain(..valid);
+                }
+
+                // Stop before the next forward would overflow the context
+                // window (the GPU forward asserts `seq_len < max_seq_len`). The
+                // token just emitted is the last one this call can produce.
+                if pos >= max_seq_len {
+                    break;
+                }
+                next = self
+                    .model
+                    .forward_greedy_async(next, pos, &mut self.state)
+                    .await
+                    .map_err(map_err)?;
+                pos += 1;
+            }
+            // Flush any trailing bytes (an incomplete multi-byte char at the
+            // stop boundary — lossy as a last resort).
+            if !pending.is_empty() {
+                let piece = String::from_utf8_lossy(&pending).into_owned();
+                out.push_str(&piece);
+                emit(on_token, &piece);
+            }
+            Ok(out)
+        }
+    }
+}
+
+#[cfg(feature = "wgpu")]
+pub use webgpu::WebGpuSession;

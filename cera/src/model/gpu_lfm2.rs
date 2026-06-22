@@ -369,6 +369,19 @@ impl GpuLfm2Model {
         Self::from_weight_source(&cpu_model, context_size, model_id)
     }
 
+    /// Construct an LFM2 GPU model with an externally-built [`GpuContext`].
+    /// The wasm/WebGPU entry point — callers build the context with
+    /// `GpuContext::new_async().await` (browser init is async) and hand it in.
+    pub fn from_gguf_with_ctx(
+        gguf: GgufFile,
+        context_size: usize,
+        model_id: String,
+        ctx: GpuContext,
+    ) -> Result<Self> {
+        let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
+        Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
+    }
+
     /// Construct a GPU model for a dense transformer (Qwen2/Qwen3/LLaMA/
     /// Mistral/Granite) — the `LlamaModel` family. Mirrors `from_gguf_with_id`
     /// but feeds the shared loader a `LlamaModel` weight source instead of
@@ -394,8 +407,24 @@ impl GpuLfm2Model {
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
+        // Native: build the GPU context synchronously. wasm callers must use
+        // `from_*_with_ctx` with a context built via `GpuContext::new_async`
+        // (WebGPU init only resolves on the JS event loop).
         let ctx = GpuContext::new()?;
+        Self::from_weight_source_with_ctx(src, context_size, model_id, ctx)
+    }
 
+    /// Like [`Self::from_weight_source`] but with an externally-constructed
+    /// [`GpuContext`]. This is the wasm entry point: the context is built
+    /// asynchronously (`GpuContext::new_async().await`) before construction,
+    /// since the rest of loading (weight upload + pipeline build) is sync GPU
+    /// work that does no readback and runs fine on the wasm main thread.
+    fn from_weight_source_with_ctx(
+        src: &dyn GpuWeightSource,
+        context_size: usize,
+        model_id: String,
+        ctx: GpuContext,
+    ) -> Result<Self> {
         // The CPU loader already caps max_seq_len to context_size internally,
         // so the second .min() below is redundant but kept for clarity.
         let mut config = src.config().clone();
@@ -2006,6 +2035,18 @@ impl GpuLfm2Model {
     /// readback from `vocab_size * 4` bytes to `4` bytes — the
     /// wasm-async-friendly path, since a 4-byte map_async still
     /// blocks the JS event loop briefly but doesn't transfer megabytes.
+    /// Encode the argmax compute pass into `enc`. Shared by the sync and async
+    /// greedy paths so the kernel / bind-group / dispatch live in one place.
+    fn encode_argmax_pass(&self, enc: &mut wgpu::CommandEncoder) {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("argmax"),
+            timestamp_writes: self.ctx.begin_profile_span("argmax"),
+        });
+        pass.set_pipeline(&self.pipelines.argmax_f32);
+        pass.set_bind_group(0, &self.argmax_bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+
     fn forward_greedy_inner(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
         self.forward_inner_compute(tokens, pos, state);
 
@@ -2015,20 +2056,72 @@ impl GpuLfm2Model {
         // out of this PR.
         self.ctx.reset_profiler();
         let mut enc = self.new_encoder();
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("argmax"),
-                timestamp_writes: self.ctx.begin_profile_span("argmax"),
-            });
-            pass.set_pipeline(&self.pipelines.argmax_f32);
-            pass.set_bind_group(0, &self.argmax_bg, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
+        self.encode_argmax_pass(&mut enc);
         self.submit_and_wait(enc);
         self.ctx.finish_profiler();
 
         let out = self.ctx.download_u32(&self.argmax_out_buf, 1);
         out[0]
+    }
+
+    /// Async-path prefill step: run the forward and update the KV cache
+    /// *without* the argmax + readback. Used for every prompt token except the
+    /// last, whose argmax seeds decoding — so an N-token prompt does one GPU→CPU
+    /// round-trip instead of N. Synchronous: only the readback needs to be
+    /// async. Pins `gpu_state.seq_len` to `pos` so the RoPE position (driven by
+    /// `pos`) and the KV-write slot (driven by `gpu_state.seq_len`) cannot
+    /// drift (mirrors `forward_prefill`).
+    pub fn forward_prefill_step(&self, token: u32, pos: usize, state: &mut InferenceState) {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
+        self.forward_inner_compute(&[token], pos, state);
+    }
+
+    /// Async (wasm/WebGPU) greedy decode step. Runs the full forward + argmax
+    /// on the GPU, then reads back the single argmax token id without blocking
+    /// — the wasm-compatible analog of [`Self::forward_greedy_inner`].
+    ///
+    /// The blocking version's `submit_and_wait`'s `device.poll(Maintain::Wait)`
+    /// is a no-op on the WebGPU backend (the browser owns the queue), so we
+    /// submit the argmax pass directly; the readback is ordered after it on the
+    /// same queue. The GPU compute + submit run under `infer_lock` (serialising
+    /// shared scratch + GPU state against any other forward, like the sync
+    /// `Model` methods); the lock is released before the `.await` (a per-call
+    /// staging buffer makes the readback self-contained, so this is safe and
+    /// avoids holding a `std::sync::Mutex` across `.await`). Single-token only.
+    pub async fn forward_greedy_async(
+        &self,
+        token: u32,
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<u32> {
+        let pending = {
+            let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+            // Keep the KV-write slot in lockstep with the RoPE position.
+            self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
+            self.forward_inner_compute(&[token], pos, state);
+
+            self.ctx.reset_profiler();
+            let mut enc = self.new_encoder();
+            self.encode_argmax_pass(&mut enc);
+            self.ctx.queue.submit(Some(enc.finish()));
+            self.ctx.finish_profiler();
+
+            self.ctx
+                .begin_download(&self.argmax_out_buf, std::mem::size_of::<u32>() as u64)
+        };
+
+        let bytes = pending.recv().await?;
+        let mut out = [0u32; 1];
+        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
+        Ok(out[0])
+    }
+
+    /// Adapter name and backend of the underlying [`GpuContext`], for
+    /// surfacing which GPU/backend the model is actually running on (e.g. in
+    /// the wasm `WebGpuSession.adapter` getter).
+    pub fn gpu_info(&self) -> (&str, &str) {
+        (&self.ctx.adapter_name, &self.ctx.backend)
     }
 }
 

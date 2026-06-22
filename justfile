@@ -434,6 +434,38 @@ wasm-node-mt:
     @echo "--- cera-wasm/pkg-nodejs-mt/ ---"
     @ls -lh cera-wasm/pkg-nodejs-mt/
 
+# ── WebGPU (single-threaded GPU) wasm build + demo ──────────────────────
+#
+# The `wgpu` feature turns on `cera/gpu` so inference runs on the GPU via
+# WebGPU in the browser. Single-threaded only — `wgpu` and `parallel` are
+# mutually exclusive (wgpu's Send+Sync impls vanish under the `atomics`
+# target-feature; see `cera-wasm/Cargo.toml`). The browser GPU surface is
+# `WebGpuSession` (async `create` + `generate`).
+
+# Build the `--target web` WebGPU package straight into the demo page's
+# `pkg/` dir, so `cera-wasm/examples/webgpu/index.html` resolves
+# `./pkg/cera_wasm.js`. Serve it with `just wasm-demo-wgpu`.
+wasm-web-wgpu:
+    wasm-pack build cera-wasm --target web --release \
+        --out-dir examples/webgpu/pkg -- --features wgpu
+    @echo "--- cera-wasm/examples/webgpu/pkg/ ---"
+    @ls -lh cera-wasm/examples/webgpu/pkg/
+
+# Build + serve the in-browser WebGPU LFM2 demo on http://localhost:8000
+# (WebGPU is allowed on localhost without HTTPS). Open the page, pick a
+# real LFM2 GGUF, and watch it generate on the GPU. Ctrl-C to stop.
+wasm-demo-wgpu: wasm-web-wgpu
+    @echo "Serving WebGPU demo at http://localhost:8000  (Ctrl-C to stop)"
+    cd cera-wasm/examples/webgpu && python3 -m http.server 8000
+
+# Run the headless-Chrome WebGPU smoke test (async device init + readback
+# round-trip on real browser WebGPU). Requires a WebGPU-capable Chrome and
+# a chromedriver whose MAJOR version matches it on PATH — wasm-pack cannot
+# auto-fetch chromedriver on Apple Silicon. Chrome flags that enable
+# headless WebGPU live in `cera-wasm/webdriver.json`.
+wasm-test-wgpu:
+    cd cera-wasm && wasm-pack test --headless --chrome --features wgpu
+
 # Clean build artifacts
 clean:
     cargo clean

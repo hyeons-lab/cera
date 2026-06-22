@@ -49,6 +49,11 @@ anyhow.workspace = true
 # for the `on_text_tokens` trampoline). Already a transitive dep of
 # wasm-bindgen; declared here because we use the public types.
 js-sys = "0.3"
+# Bridges Rust `Future`s to JS Promises — required for the `async`
+# `#[wasm_bindgen]` exports on the WebGPU session (`WebGpuSession`).
+# wasm-bindgen's async-fn codegen references `wasm_bindgen_futures`
+# directly, so it must be a declared dependency.
+wasm-bindgen-futures = { workspace = true }
 
 # `wasm-bindgen-rayon` is wasm-only — it pulls in `web_sys::Worker`
 # / Node `worker_threads` glue that doesn't exist on native targets.
@@ -56,6 +61,12 @@ js-sys = "0.3"
 # --workspace` happy on the host even with `--features parallel`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-rayon = { workspace = true, optional = true }
+
+# `wasm-bindgen-test` drives the headless-Chrome WebGPU smoke test
+# (`tests/webgpu_smoke.rs`) via `wasm-pack test --headless --chrome
+# --features wgpu`. wasm-only — the runner injects a browser harness.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }
 
 [features]
 # `parallel` — opt-in multi-threaded wasm build. Lights up
