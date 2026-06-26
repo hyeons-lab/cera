@@ -7,12 +7,14 @@
 //   rmsnorm_batch          — read src, write dst.
 //                            dst[i] = src[i] * inv_rms(src) * w[i]
 //
-//   add_rmsnorm_batch      — read src + residual, write back to src and dst.
-//                            src[i] += residual[i];
+//   add_rmsnorm_batch      — read src + res_scale·residual, write back to src
+//                            and dst.
+//                            src[i] += res_scale * residual[i];
 //                            dst[i] = src[i] * inv_rms(src) * w[i]
 //
 // Both share the same Params struct and binding layout for slots 0–3;
-// `add_rmsnorm_batch` reads its residual from binding 4.
+// `add_rmsnorm_batch` reads its residual from binding 4 and the residual
+// multiplier from params[4] (Granite 3.x `residual_scale`; 1.0 ⇒ plain add).
 //
 // Bind groups:
 //   @binding(0) src: array<f32>      (read-write — `add_rmsnorm_batch` writes
@@ -20,7 +22,9 @@
 //                                      `rmsnorm_batch` only reads)
 //   @binding(1) dst: array<f32>      (read-write — normalized output)
 //   @binding(2) w: array<f32>        (read — per-element scale)
-//   @binding(3) params: vec4<u32>    (n, eps_bits, src_stride, dst_stride)
+//   @binding(3) params: array<u32,5> (n, eps_bits, src_stride, dst_stride,
+//                                      res_scale_bits — last used only by
+//                                      `add_rmsnorm_batch`)
 //   @binding(4) residual: array<f32> (read — only used by `add_rmsnorm_batch`,
 //                                      stride = src_stride)
 
@@ -30,7 +34,7 @@
 @group(0) @binding(0) var<storage, read_write> src: array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(2) var<storage, read> w: array<f32>;
-@group(0) @binding(3) var<storage, read> params: vec4<u32>;
+@group(0) @binding(3) var<storage, read> params: array<u32, 5>;
 @group(0) @binding(4) var<storage, read> residual: array<f32>;
 
 var<workgroup> shared_sum: array<f32, 256>;
@@ -41,10 +45,10 @@ fn rmsnorm_batch(
     @builtin(workgroup_id) wid: vec3<u32>,
 ) {
     let tid = lid.x;
-    let n = params.x;
-    let eps = bitcast<f32>(params.y);
-    let src_off = wid.x * params.z;
-    let dst_off = wid.x * params.w;
+    let n = params[0];
+    let eps = bitcast<f32>(params[1]);
+    let src_off = wid.x * params[2];
+    let dst_off = wid.x * params[3];
 
     // Phase 1: partial sum of squares.
     var partial: f32 = 0.0;
@@ -75,18 +79,20 @@ fn add_rmsnorm_batch(
     @builtin(workgroup_id) wid: vec3<u32>,
 ) {
     let tid = lid.x;
-    let n = params.x;
-    let eps = bitcast<f32>(params.y);
-    let src_off = wid.x * params.z;
-    let dst_off = wid.x * params.w;
+    let n = params[0];
+    let eps = bitcast<f32>(params[1]);
+    let src_off = wid.x * params[2];
+    let dst_off = wid.x * params[3];
+    let res_scale = bitcast<f32>(params[4]);
     let res_off = src_off; // residual shares stride with src
 
-    // Phase 1: add residual in-place AND compute sum of squares
-    // of the post-add value. Mirrors the metal kernel.
+    // Phase 1: add res_scale·residual in-place AND compute sum of squares
+    // of the post-add value. Mirrors the metal kernel. `res_scale` folds
+    // Granite's residual multiplier into the addend (1.0 ⇒ plain add).
     var partial: f32 = 0.0;
     var i = tid;
     while i < n {
-        let v = src[src_off + i] + residual[res_off + i];
+        let v = src[src_off + i] + res_scale * residual[res_off + i];
         src[src_off + i] = v;
         partial += v * v;
         i += 256u;

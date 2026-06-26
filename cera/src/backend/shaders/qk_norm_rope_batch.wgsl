@@ -17,11 +17,19 @@
 // Bind group 0:
 //   @binding(0) q_batch: array<f32>    (read-write, n_tokens × q_stride floats)
 //   @binding(1) k_batch: array<f32>    (read-write, n_tokens × k_stride floats)
-//   @binding(2) q_norm_w: array<f32>   (read, head_dim floats)
-//   @binding(3) k_norm_w: array<f32>   (read, head_dim floats)
-//   @binding(4) params: array<u32, 10> (start_pos, n_tokens, n_heads, n_kv_heads,
+//   @binding(2) q_norm_w: array<f32>   (read, head_dim floats; dummy when no QK-norm)
+//   @binding(3) k_norm_w: array<f32>   (read, head_dim floats; dummy when no QK-norm)
+//   @binding(4) params: array<u32, 12> (start_pos, n_tokens, n_heads, n_kv_heads,
 //                                       head_dim, eps_bits, freq_base_bits,
-//                                       rope_type, q_stride, k_stride)
+//                                       rope_type, q_stride, k_stride,
+//                                       has_freq_factors, has_qk_norm)
+//   @binding(5) freq_factors: array<f32> (head_dim/2 Llama-3 RoPE factors, or
+//                                         1-elem dummy when has_freq_factors == 0)
+//
+// `rope_type` (params[7]) selects the pair layout (0 = NEOX split-halves,
+// 1 = NORM interleaved), matching rope.wgsl. `has_qk_norm` (params[11]) gates
+// Phase 1: dense transformers (llama/qwen2/mistral/granite) carry no per-head
+// norm weights, so they run rope-only and bind a dummy for q_norm_w/k_norm_w.
 
 #define WG_SUM_REDUCE
 #include "common_decls.tmpl"
@@ -30,7 +38,8 @@
 @group(0) @binding(1) var<storage, read_write> k_batch: array<f32>;
 @group(0) @binding(2) var<storage, read> q_norm_w: array<f32>;
 @group(0) @binding(3) var<storage, read> k_norm_w: array<f32>;
-@group(0) @binding(4) var<storage, read> params: array<u32, 10>;
+@group(0) @binding(4) var<storage, read> params: array<u32, 12>;
+@group(0) @binding(5) var<storage, read> freq_factors: array<f32>;
 
 var<workgroup> shared_sum: array<f32, 256>;
 
@@ -50,6 +59,8 @@ fn qk_norm_rope_batch(
     let rope_type = params[7];
     let q_stride = params[8];
     let k_stride = params[9];
+    let has_freq_factors = params[10];
+    let has_qk_norm = params[11];
 
     let heads_per_token = n_heads + n_kv_heads;
     let token = wid.x / heads_per_token;
@@ -68,50 +79,62 @@ fn qk_norm_rope_batch(
     }
 
     // ─── Phase 1: per-head rmsnorm in place ────────────────────────────────
-    // Sum of squares. `select(...)` would evaluate both arms per WGSL spec,
-    // so for the K branch we'd read `q_batch[base + i]` with a K-derived
-    // `base` — wasted bandwidth, and OOB if Q's stride ever drops below K's.
-    // Branch instead so only the active buffer is touched.
-    var partial: f32 = 0.0;
-    var i = tid;
-    if is_q {
-        while i < head_dim {
-            let v = q_batch[base + i];
-            partial += v * v;
-            i += 256u;
+    // Gated on `has_qk_norm`: only Qwen3/LFM2 carry per-head norm weights.
+    // Dense transformers (llama/qwen2/mistral/granite) skip straight to RoPE
+    // and bind a dummy buffer for q_norm_w/k_norm_w. `has_qk_norm` is uniform
+    // across the workgroup, so the enclosing barriers stay in uniform control
+    // flow.
+    if has_qk_norm == 1u {
+        // Sum of squares. `select(...)` would evaluate both arms per WGSL spec,
+        // so for the K branch we'd read `q_batch[base + i]` with a K-derived
+        // `base` — wasted bandwidth, and OOB if Q's stride ever drops below K's.
+        // Branch instead so only the active buffer is touched.
+        var partial: f32 = 0.0;
+        var i = tid;
+        if is_q {
+            while i < head_dim {
+                let v = q_batch[base + i];
+                partial += v * v;
+                i += 256u;
+            }
+        } else {
+            while i < head_dim {
+                let v = k_batch[base + i];
+                partial += v * v;
+                i += 256u;
+            }
         }
-    } else {
-        while i < head_dim {
-            let v = k_batch[base + i];
-            partial += v * v;
-            i += 256u;
-        }
-    }
-    shared_sum[tid] = partial;
-    workgroupBarrier();
-    workgroup_sum_reduce(tid);
-    let inv_rms = 1.0 / sqrt(shared_sum[0] / f32(head_dim) + eps);
+        shared_sum[tid] = partial;
+        workgroupBarrier();
+        workgroup_sum_reduce(tid);
+        let inv_rms = 1.0 / sqrt(shared_sum[0] / f32(head_dim) + eps);
 
-    // Normalize + scale by per-element weight, write back in place.
-    i = tid;
-    if is_q {
-        while i < head_dim {
-            q_batch[base + i] = q_batch[base + i] * inv_rms * q_norm_w[i];
-            i += 256u;
+        // Normalize + scale by per-element weight, write back in place.
+        i = tid;
+        if is_q {
+            while i < head_dim {
+                q_batch[base + i] = q_batch[base + i] * inv_rms * q_norm_w[i];
+                i += 256u;
+            }
+        } else {
+            while i < head_dim {
+                k_batch[base + i] = k_batch[base + i] * inv_rms * k_norm_w[i];
+                i += 256u;
+            }
         }
-    } else {
-        while i < head_dim {
-            k_batch[base + i] = k_batch[base + i] * inv_rms * k_norm_w[i];
-            i += 256u;
-        }
+        workgroupBarrier();
     }
-    workgroupBarrier();
 
     // ─── Phase 2: RoPE — pairs of (cos, sin) rotations ─────────────────────
     // theta_d = pos * freq_base^(-2d / head_dim). Compute once per d via pow.
+    // `freq_factors` (Llama-3) optionally divides each pair's angle, mirroring
+    // rope.wgsl; gated by `has_freq_factors` (NEOX archs never set it).
     var d = tid;
     while d < half_dim {
-        let angle = rope_angle(pos, d, head_dim, freq_base);
+        var angle = rope_angle(pos, d, head_dim, freq_base);
+        if has_freq_factors == 1u {
+            angle = angle / freq_factors[d];
+        }
         var i0: u32;
         var i1: u32;
         if rope_type == 0u {

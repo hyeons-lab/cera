@@ -2901,8 +2901,9 @@ mod tests {
         ctx.queue
             .write_buffer(&src_buf, 0, bytemuck::cast_slice(&src));
         let dst_buf = ctx.create_storage_rw((src.len() as u64) * 4, "dst");
-        // params: (n, eps_bits, src_stride, dst_stride). Strides are both `n` here.
-        let params_batch = [n, eps.to_bits(), n, n];
+        // params: (n, eps_bits, src_stride, dst_stride, res_scale_bits). Strides
+        // are both `n` here; res_scale is unused by the no-residual entry point.
+        let params_batch = [n, eps.to_bits(), n, n, 1.0f32.to_bits()];
         let p_buf_batch = ctx.upload_storage(bytemuck::cast_slice(&params_batch), "params_batch");
         // The `rmsnorm_batch` entry point doesn't read `residual`, and
         // naga's auto-layout drops binding 4 from the inferred layout
@@ -3040,6 +3041,9 @@ mod tests {
             .write_buffer(&k_buf, 0, bytemuck::cast_slice(&k_batch));
         let qw_buf = ctx.upload_f32(&q_norm_w, "q_norm_w");
         let kw_buf = ctx.upload_f32(&k_norm_w, "k_norm_w");
+        // has_freq_factors = 0 (no Llama-3 scaling), has_qk_norm = 1 (this test
+        // exercises the rmsnorm+rope fused path). The rope-only and freq-factors
+        // variants are covered end-to-end by the differential prefill tests.
         let params = [
             start_pos,
             n_tokens,
@@ -3051,8 +3055,12 @@ mod tests {
             rope_type,
             q_stride,
             k_stride,
+            0, // has_freq_factors
+            1, // has_qk_norm
         ];
         let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+        // freq_factors: 1-element dummy (unused when has_freq_factors == 0).
+        let ff_buf = ctx.upload_f32(&[1.0f32], "freq_factors_dummy");
 
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -3077,6 +3085,10 @@ mod tests {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: p_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: ff_buf.as_entire_binding(),
                 },
             ],
         });
@@ -3580,10 +3592,14 @@ mod tests {
         }
         let weight: Vec<f32> = (0..n).map(|i| 0.8 + (i as f32 % 7.0) * 0.05).collect();
 
-        // CPU reference: src += residual, then rmsnorm with eps.
+        // Non-identity residual scale exercises Granite's `residual_multiplier`
+        // fold (every other arch passes 1.0 ⇒ plain add).
+        let res_scale = 0.7f32;
+
+        // CPU reference: src += res_scale·residual, then rmsnorm with eps.
         let mut reference = src.clone();
         for i in 0..reference.len() {
-            reference[i] += residual[i];
+            reference[i] += res_scale * residual[i];
         }
         for b in 0..batch {
             let row_start = (b * n) as usize;
@@ -3603,7 +3619,7 @@ mod tests {
         let dst_buf = ctx.create_storage_rw((src.len() as u64) * 4, "dst");
         let res_buf = ctx.upload_f32(&residual, "residual");
         let w_buf = ctx.upload_f32(&weight, "w");
-        let params = [n, eps.to_bits(), n, n];
+        let params = [n, eps.to_bits(), n, n, res_scale.to_bits()];
         let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
