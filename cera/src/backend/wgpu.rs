@@ -3132,6 +3132,185 @@ mod tests {
         }
     }
 
+    /// `qk_norm_rope_batch` parity for the two variants the dense-transformer
+    /// prefill path added but the test above doesn't cover (flagged in review):
+    ///   • `has_qk_norm = 0` — rope-only (llama/qwen2/mistral/granite); the
+    ///     Phase-1 rmsnorm uniform branch is skipped and slots 2/3 are dummies.
+    ///   • `has_freq_factors = 1` + `rope_type = 1` (NORM) — Llama-3 RoPE
+    ///     frequency scaling through `binding(5)`.
+    /// Both run rope-only against a CPU reference that does NOT rmsnorm.
+    #[test]
+    fn test_gpu_qk_norm_rope_batch_rope_only_and_freq_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let n_heads: u32 = 4;
+        let n_kv_heads: u32 = 2;
+        let head_dim: u32 = 64;
+        let n_tokens: u32 = 3;
+        let start_pos: u32 = 5;
+        let eps = 1e-5f32; // unused when has_qk_norm = 0, but still uploaded.
+        let freq_base = 10000.0f32;
+        let q_stride = n_heads * head_dim;
+        let k_stride = n_kv_heads * head_dim;
+
+        // Llama-3 freq factors (length head_dim/2), monotonically rising so the
+        // per-pair division has a visible, non-trivial effect.
+        let freqs: Vec<f32> = (0..head_dim / 2).map(|i| 1.0 + (i as f32) * 0.05).collect();
+
+        // (label, rope_type, has_freq_factors)
+        let cases: [(&str, u32, bool); 2] = [("neox_rope_only", 0, false), ("norm_freq", 1, true)];
+
+        for (label, rope_type, has_freq_factors) in cases {
+            let mut q_batch: Vec<f32> = Vec::with_capacity((n_tokens * q_stride) as usize);
+            let mut k_batch: Vec<f32> = Vec::with_capacity((n_tokens * k_stride) as usize);
+            for t in 0..n_tokens {
+                for i in 0..q_stride {
+                    q_batch.push(((t as f32 + 1.0) * (i as f32 - 32.0)) * 0.01);
+                }
+                for i in 0..k_stride {
+                    k_batch.push(((t as f32 + 2.0) * (i as f32 - 16.0)) * 0.013);
+                }
+            }
+
+            // CPU reference: rope-only at pos = start_pos + token, no rmsnorm.
+            let ff = if has_freq_factors {
+                Some(freqs.as_slice())
+            } else {
+                None
+            };
+            let mut ref_q = q_batch.clone();
+            let mut ref_k = k_batch.clone();
+            for t in 0..n_tokens {
+                let q_off = (t * q_stride) as usize;
+                let k_off = (t * k_stride) as usize;
+                let q_end = q_off + q_stride as usize;
+                let k_end = k_off + k_stride as usize;
+                let pos = (start_pos + t) as usize;
+                if rope_type == 0 {
+                    crate::backend::cpu::rope(
+                        &mut ref_q[q_off..q_end],
+                        &mut ref_k[k_off..k_end],
+                        pos,
+                        n_heads as usize,
+                        n_kv_heads as usize,
+                        head_dim as usize,
+                        freq_base,
+                    );
+                } else {
+                    crate::backend::cpu::rope_norm(
+                        &mut ref_q[q_off..q_end],
+                        &mut ref_k[k_off..k_end],
+                        pos,
+                        n_heads as usize,
+                        n_kv_heads as usize,
+                        head_dim as usize,
+                        freq_base,
+                        ff,
+                    );
+                }
+            }
+
+            let pipeline = ctx.create_pipeline(
+                shaders::QK_NORM_ROPE_BATCH,
+                "qk_norm_rope_batch",
+                "qk_norm_rope_batch",
+            );
+            let q_buf = ctx.create_storage_rw((q_batch.len() as u64) * 4, "q");
+            ctx.queue
+                .write_buffer(&q_buf, 0, bytemuck::cast_slice(&q_batch));
+            let k_buf = ctx.create_storage_rw((k_batch.len() as u64) * 4, "k");
+            ctx.queue
+                .write_buffer(&k_buf, 0, bytemuck::cast_slice(&k_batch));
+            // has_qk_norm = 0 ⇒ slots 2/3 are dummies; reuse the freq buffer.
+            let dummy = ctx.upload_f32(&[1.0f32], "qk_norm_dummy");
+            let ff_buf = if has_freq_factors {
+                ctx.upload_f32(&freqs, "freq_factors")
+            } else {
+                ctx.upload_f32(&[1.0f32], "freq_factors_dummy")
+            };
+            let params = [
+                start_pos,
+                n_tokens,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                eps.to_bits(),
+                freq_base.to_bits(),
+                rope_type,
+                q_stride,
+                k_stride,
+                has_freq_factors as u32,
+                0, // has_qk_norm
+            ];
+            let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+            let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: q_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: k_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: dummy.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: dummy.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: p_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: ff_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(n_tokens * (n_heads + n_kv_heads), 1, 1);
+            }
+            ctx.queue.submit(Some(enc.finish()));
+
+            let got_q = ctx.download_f32(&q_buf, q_batch.len());
+            let got_k = ctx.download_f32(&k_buf, k_batch.len());
+
+            let tol = 2e-3f32;
+            for i in 0..ref_q.len() {
+                let diff = (ref_q[i] - got_q[i]).abs();
+                assert!(
+                    diff < tol,
+                    "[{label}] Q mismatch at idx {i}: cpu={}, gpu={}, diff={diff}",
+                    ref_q[i],
+                    got_q[i]
+                );
+            }
+            for i in 0..ref_k.len() {
+                let diff = (ref_k[i] - got_k[i]).abs();
+                assert!(
+                    diff < tol,
+                    "[{label}] K mismatch at idx {i}: cpu={}, gpu={}, diff={diff}",
+                    ref_k[i],
+                    got_k[i]
+                );
+            }
+        }
+    }
+
     /// `conv1d_fused_batch` parity: walking N tokens through the
     /// fused (x⊙b → conv → c⊙conv) pipeline must match the same
     /// sequence performed step-by-step on the CPU. Verifies the

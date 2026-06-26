@@ -180,28 +180,38 @@ fn classify_streams(
     let ref_toks: Vec<u32> = ref_steps.iter().map(|s| s.token).collect();
     let test_toks: Vec<u32> = test_steps.iter().map(|s| s.token).collect();
 
+    const TIE_REL_TOL: f64 = 0.02;
+    const MIN_MATCH_PREFIX: usize = 4;
+
     // Lowest index where the streams differ on their overlapping prefix. `None`
     // ⇒ no token-level disagreement (one may just be shorter).
     let Some(div) = ref_toks.iter().zip(&test_toks).position(|(a, b)| a != b) else {
-        // Identical on the overlap. Unequal length means one emitted EOS a step
-        // earlier — a near-tie at the EOS boundary; the shared prefix already
-        // proves numerical equivalence. Benign either way (and never indexes
-        // *_steps out of bounds at min(len)).
+        let shared = ref_toks.len().min(test_toks.len());
         if ref_toks.len() == test_toks.len() {
             eprintln!("  exact match across {} tokens", ref_toks.len());
-        } else {
+            return Ok(());
+        }
+        // Unequal length with a matching shared prefix: one emitted EOS a step
+        // earlier. Benign ONLY when the shared prefix is long enough to prove
+        // numerical equivalence — otherwise a real bug that makes `test` emit a
+        // short-but-correct prefix then EOS prematurely would slip through. Hold
+        // it to the same MIN_MATCH_PREFIX bar as a positional divergence.
+        if shared >= MIN_MATCH_PREFIX {
             eprintln!(
-                "  match across {} shared tokens; benign EOS-timing length diff ({} vs {})",
-                ref_toks.len().min(test_toks.len()),
+                "  match across {shared} shared tokens; benign EOS-timing length diff ({} vs {})",
                 ref_toks.len(),
                 test_toks.len()
             );
+            return Ok(());
         }
-        return Ok(());
+        return Err(format!(
+            "{label}: {test_name} and {ref_name} agree on only {shared} tokens before a length \
+             split ({} vs {}) — too short to be a benign EOS-timing near-tie (need ≥ \
+             {MIN_MATCH_PREFIX})\n    {ref_name}: {ref_toks:?}\n    {test_name}: {test_toks:?}",
+            ref_toks.len(),
+            test_toks.len()
+        ));
     };
-
-    const TIE_REL_TOL: f64 = 0.02;
-    const MIN_MATCH_PREFIX: usize = 4;
     let gap_rel = |logits: &[f32], a: u32, b: u32| -> f64 {
         let la = logits[a as usize] as f64;
         let lb = logits[b as usize] as f64;

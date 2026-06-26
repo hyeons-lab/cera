@@ -697,11 +697,14 @@ impl GpuLfm2Model {
         // head_dim is decoupled (Qwen3), so the scratch buffers that hold Q
         // (proj), the attention output (normed), and K/V (gate/up) must be
         // sized by the max of every role each buffer plays across the layer.
+        // gate/up additionally carry hs-wide block outputs (attn/conv out_proj,
+        // FFN down) and the hs-stride residual — include `hs` so the sizing is
+        // self-evidently complete and not silently reliant on `is >= hs`.
         let prefill_batch_buf = f(hs * max_pref, "prefill_batch");
         let prefill_normed_buf = f(hs.max(q_dim) * max_pref, "prefill_normed");
         let prefill_proj_buf = f((3 * hs).max(q_dim) * max_pref, "prefill_proj");
-        let prefill_gate_buf = f(is.max(max_kv_dim) * max_pref, "prefill_gate");
-        let prefill_up_buf = f(is.max(max_kv_dim) * max_pref, "prefill_up");
+        let prefill_gate_buf = f(is.max(max_kv_dim).max(hs) * max_pref, "prefill_gate");
+        let prefill_up_buf = f(is.max(max_kv_dim).max(hs) * max_pref, "prefill_up");
         // attention_prefill scratch: per-(query, head, time) f32 slab.
         let prefill_scores_buf = f(max_pref * config.n_heads * max_seq_len, "prefill_scores");
 
@@ -2485,7 +2488,18 @@ impl GpuLfm2Model {
         // carry per-head norm weights (Qwen3/LFM2). Dense transformers
         // (llama/qwen2/mistral/granite) run rope-only; the kernel still needs
         // valid buffers bound at slots 2/3, so use `rope_freqs_buf` as a dummy.
-        let has_qk_norm = q_norm_w.is_some();
+        //
+        // Require BOTH norms present to enable QK-norm: with only one present the
+        // shader (has_qk_norm=1) would normalize the other head type against the
+        // 1-element dummy buffer — a silent OOB read. Every QK-norm arch carries
+        // both, so the assert documents that invariant rather than guarding a
+        // live case.
+        debug_assert_eq!(
+            q_norm_w.is_some(),
+            k_norm_w.is_some(),
+            "QK-norm weights must be both present or both absent",
+        );
+        let has_qk_norm = q_norm_w.is_some() && k_norm_w.is_some();
         let q_norm = q_norm_w.unwrap_or(&self.rope_freqs_buf);
         let k_norm = k_norm_w.unwrap_or(&self.rope_freqs_buf);
         let params: [u32; 12] = [
