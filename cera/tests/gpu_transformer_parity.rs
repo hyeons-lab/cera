@@ -25,13 +25,20 @@
 //!   CERA_GPU_PARITY=1 cargo test -p cera --features gpu --release \
 //!     --test gpu_transformer_parity -- --ignored --nocapture
 
-#![cfg(feature = "gpu")]
+#![cfg(any(feature = "gpu", all(feature = "metal", target_os = "macos")))]
 
 use std::path::PathBuf;
 
 use cera::gguf::GgufFile;
 use cera::kv_cache::{InferenceState, KvCompression};
-use cera::model::{Model, load_model, load_model_gpu};
+use cera::model::Model;
+// CPU oracle loader — used by both the wgpu (`check_parity`) and Metal
+// (`check_metal_matches_cpu`) parity gates, so it's needed under either feature.
+use cera::model::load_model;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use cera::model::load_model_metal;
+#[cfg(feature = "gpu")]
+use cera::model::load_model_gpu;
 use cera::tokenizer::BpeTokenizer;
 
 /// Greedy next-token pick — matches `sampler::cpu_argmax` (NaN → -inf,
@@ -116,6 +123,7 @@ fn greedy_decode(
 /// Run CPU-vs-GPU greedy parity for one model file. Returns `None` if the GGUF
 /// is absent (skip), else a failure message on mismatch (`Some(Err)`) or
 /// `Some(Ok(()))` on agreement.
+#[cfg(feature = "gpu")]
 fn check_parity(model_file: &str, prompt: &str, n_predict: usize) -> Option<Result<(), String>> {
     let mp = models_dir().join(model_file);
     if !mp.exists() {
@@ -245,6 +253,7 @@ fn classify_streams(
 /// batched attention/rope/bias/scalar path from CPU↔GPU float noise — a wrong
 /// batched rope layout, dropped freq-factor, missing QKV bias, mis-sized
 /// decoupled head_dim, or unapplied Granite scalar diverges the streams.
+#[cfg(feature = "gpu")]
 fn check_batched_vs_pertoken(
     model_file: &str,
     prompt: &str,
@@ -297,6 +306,125 @@ fn check_batched_vs_pertoken(
     ))
 }
 
+/// Metal twin of [`check_batched_vs_pertoken`]: GPU-internal differential
+/// (batched prefill vs per-token decode) on the SAME native-Metal model. Both
+/// runs share the generalized Metal forward path, so any divergence is a real
+/// bug in the dense-feature wiring (rope_type / freq-factors / QK-norm / QKV
+/// bias / decoupled head_dim / Granite scalars / untied output) of either the
+/// decode or the batched-prefill code path.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn check_metal_batched_vs_pertoken(
+    model_file: &str,
+    prompt: &str,
+    n_predict: usize,
+) -> Option<Result<(), String>> {
+    let mp = models_dir().join(model_file);
+    if !mp.exists() {
+        eprintln!("skipping {model_file}: not found at {}", mp.display());
+        return None;
+    }
+    eprintln!("=== metal batched-vs-pertoken: {model_file} ===");
+
+    let gguf = GgufFile::open(&mp).expect("open gguf");
+    let tokenizer = BpeTokenizer::from_gguf(&gguf).expect("tokenizer");
+    let eos = tokenizer.eos_token();
+    let mut tokens = Vec::new();
+    if let Some(bos) = tokenizer.bos_token() {
+        tokens.push(bos);
+    }
+    tokens.extend(tokenizer.encode(prompt));
+
+    let metal = match load_model_metal(GgufFile::open(&mp).expect("open gguf"), &mp, 8192) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("skipping {model_file}: Metal unavailable ({e})");
+            return None;
+        }
+    };
+
+    // Per-token first so its `forward` decode calls never collide with the
+    // batched run's prefix-cache insert (only `forward_prefill` writes it).
+    let pt_steps = greedy_decode(metal.as_ref(), &tokens, n_predict, eos, Prefill::PerToken);
+    let batched_steps = greedy_decode(metal.as_ref(), &tokens, n_predict, eos, Prefill::Batched);
+
+    eprintln!(
+        "  pertoken text: {:?}",
+        tokenizer.decode(&pt_steps.iter().map(|s| s.token).collect::<Vec<_>>())
+    );
+    eprintln!(
+        "  batched  text: {:?}",
+        tokenizer.decode(&batched_steps.iter().map(|s| s.token).collect::<Vec<_>>())
+    );
+
+    Some(classify_streams(
+        model_file,
+        "pertoken",
+        &pt_steps,
+        "batched",
+        &batched_steps,
+    ))
+}
+
+/// Native-Metal-vs-CPU greedy parity. The Metal-vs-Metal differential proves the
+/// batched and per-token paths agree, but it cannot catch a bug that is identical
+/// in BOTH Metal paths (e.g. a shared embedding/residual scalar or a tied-vs-
+/// untied output mix-up). Comparing the Metal batched run against the
+/// llama.cpp-verified CPU oracle closes that gap: any feature wired wrong in the
+/// shared Metal code diverges from CPU here. (Greedy argmax is invariant to the
+/// logit multiplier, so logit_scale is intentionally out of scope for this gate.)
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn check_metal_matches_cpu(
+    model_file: &str,
+    prompt: &str,
+    n_predict: usize,
+) -> Option<Result<(), String>> {
+    let mp = models_dir().join(model_file);
+    if !mp.exists() {
+        eprintln!("skipping {model_file}: not found at {}", mp.display());
+        return None;
+    }
+    eprintln!("=== metal-vs-cpu parity: {model_file} ===");
+
+    let gguf = GgufFile::open(&mp).expect("open gguf");
+    let tokenizer = BpeTokenizer::from_gguf(&gguf).expect("tokenizer");
+    let eos = tokenizer.eos_token();
+    let mut tokens = Vec::new();
+    if let Some(bos) = tokenizer.bos_token() {
+        tokens.push(bos);
+    }
+    tokens.extend(tokenizer.encode(prompt));
+
+    let cpu = load_model(GgufFile::open(&mp).expect("open gguf"), None, 8192).expect("cpu load");
+    let metal = match load_model_metal(GgufFile::open(&mp).expect("open gguf"), &mp, 8192) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("skipping {model_file}: Metal unavailable ({e})");
+            return None;
+        }
+    };
+
+    let cpu_steps = greedy_decode(cpu.as_ref(), &tokens, n_predict, eos, Prefill::Batched);
+    let metal_steps = greedy_decode(metal.as_ref(), &tokens, n_predict, eos, Prefill::Batched);
+
+    eprintln!(
+        "  cpu   text: {:?}",
+        tokenizer.decode(&cpu_steps.iter().map(|s| s.token).collect::<Vec<_>>())
+    );
+    eprintln!(
+        "  metal text: {:?}",
+        tokenizer.decode(&metal_steps.iter().map(|s| s.token).collect::<Vec<_>>())
+    );
+
+    Some(classify_streams(
+        model_file,
+        "cpu",
+        &cpu_steps,
+        "metal",
+        &metal_steps,
+    ))
+}
+
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore] // run with --ignored + CERA_GPU_PARITY=1
 fn gpu_transformer_matches_cpu() {
@@ -358,6 +486,7 @@ const CASES: [(&str, &str, usize); 4] = [
 /// transformer behavior. This is the primary correctness gate for the batched
 /// path: it compares two GPU runs (no CPU float noise), so any divergence is a
 /// real bug in the batched attention/rope/bias/scalar generalization.
+#[cfg(feature = "gpu")]
 #[test]
 #[ignore] // run with --ignored + CERA_GPU_PARITY=1
 fn gpu_batched_prefill_matches_pertoken() {
@@ -389,4 +518,82 @@ fn gpu_batched_prefill_matches_pertoken() {
         failures.join("\n")
     );
     eprintln!("batched-vs-pertoken OK across {ran} model(s)");
+}
+
+/// Native-Metal twin of [`gpu_batched_prefill_matches_pertoken`]: the primary
+/// correctness gate for the LLaMA-family Metal backend. Batched prefill must
+/// match the per-token decode loop EXACTLY (24-token greedy) on all four dense
+/// archs, which proves every dense feature — NEOX/NORM rope, Llama-3 freq
+/// factors, Qwen3 QK-norm + decoupled head_dim, Qwen2 QKV bias, Granite
+/// embedding/residual/attention/logit scalars, and untied output — is wired
+/// consistently across both Metal forward paths.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+#[ignore] // run with --ignored + CERA_METAL_PARITY=1
+fn metal_batched_prefill_matches_pertoken() {
+    if std::env::var("CERA_METAL_PARITY").as_deref() != Ok("1") {
+        eprintln!("skipping: CERA_METAL_PARITY=1 not set");
+        return;
+    }
+
+    let mut failures = Vec::new();
+    let mut ran = 0;
+    for (file, prompt, n) in CASES {
+        match check_metal_batched_vs_pertoken(file, prompt, n) {
+            None => {}
+            Some(Ok(())) => ran += 1,
+            Some(Err(e)) => {
+                ran += 1;
+                failures.push(e);
+            }
+        }
+    }
+
+    if ran == 0 {
+        eprintln!("no models present / no Metal — nothing verified");
+        return;
+    }
+    assert!(
+        failures.is_empty(),
+        "metal batched-vs-pertoken failures:\n{}",
+        failures.join("\n")
+    );
+    eprintln!("metal batched-vs-pertoken OK across {ran} model(s)");
+}
+
+/// Native-Metal output must match the CPU oracle. Catches shared-Metal-path bugs
+/// the batched-vs-pertoken differential is blind to (embedding/residual/attn
+/// scalars, tied-vs-untied output). Covers all four dense archs.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+#[ignore] // run with --ignored + CERA_METAL_PARITY=1
+fn metal_transformer_matches_cpu() {
+    if std::env::var("CERA_METAL_PARITY").as_deref() != Ok("1") {
+        eprintln!("skipping: CERA_METAL_PARITY=1 not set");
+        return;
+    }
+
+    let mut failures = Vec::new();
+    let mut ran = 0;
+    for (file, prompt, n) in CASES {
+        match check_metal_matches_cpu(file, prompt, n) {
+            None => {}
+            Some(Ok(())) => ran += 1,
+            Some(Err(e)) => {
+                ran += 1;
+                failures.push(e);
+            }
+        }
+    }
+
+    if ran == 0 {
+        eprintln!("no models present / no Metal — nothing verified");
+        return;
+    }
+    assert!(
+        failures.is_empty(),
+        "metal-vs-cpu parity failures:\n{}",
+        failures.join("\n")
+    );
+    eprintln!("metal-vs-cpu parity OK across {ran} model(s)");
 }

@@ -1005,3 +1005,293 @@ fn test_classic_vs_splitk_attention_synthetic() {
     let splitk = ctx.read_f32(&splitk_out_buf, (n_heads * head_dim) as usize);
     assert_close("classic vs splitk", &classic, &splitk, 1e-3);
 }
+
+// ── Dense-transformer kernel params (LLaMA-family Metal backend) ─────────────
+//
+// These exercise the new/extended kernel contracts the Metal dense-transformer
+// loader relies on: the elementwise scaled-add / scale, the residual-scaled
+// fused add+rmsnorm, and the rope-only / freq-factors arms of qk_norm_rope.
+
+/// NeoX RoPE reference (split-halves pairing) with optional Llama-3 freq
+/// factors — matches `qk_norm_rope.metal`'s `head_rope` for `rope_type == 0`.
+fn rope_neox_ref(
+    buf: &mut [f32],
+    pos: u32,
+    head_dim: usize,
+    freq_base: f32,
+    freq_factors: Option<&[f32]>,
+) {
+    let half = head_dim / 2;
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+    for d in 0..half {
+        let mut theta = pos as f32 * theta_scale.powi(d as i32);
+        if let Some(ff) = freq_factors {
+            theta /= ff[d];
+        }
+        let (sin_a, cos_a) = theta.sin_cos();
+        let x0 = buf[d];
+        let x1 = buf[d + half];
+        buf[d] = x0 * cos_a - x1 * sin_a;
+        buf[d + half] = x0 * sin_a + x1 * cos_a;
+    }
+}
+
+#[test]
+fn test_scale_f32() {
+    let Some(ctx) = setup() else { return };
+    let n = 1000u32;
+    let scale = 1.0f32 / 7.5; // Granite-style 1/logit_scale
+    let a: Vec<f32> = (0..n).map(|i| i as f32 * 0.1 - 50.0).collect();
+    let expected: Vec<f32> = a.iter().map(|x| x * scale).collect();
+
+    let a_buf = ctx.upload_f32(&a);
+    let p_buf = ctx.upload_bytes(bytemuck::cast_slice(&[n, scale.to_bits()]));
+    run_1d(
+        &ctx,
+        shaders::ELEMENTWISE,
+        "scale_f32",
+        &[&a_buf, &p_buf],
+        n as u64,
+        256,
+        true,
+    );
+    let got = ctx.read_f32(&a_buf, n as usize);
+    assert_close("scale_f32", &expected, &got, 1e-4);
+}
+
+#[test]
+fn test_scaled_add_inplace() {
+    let Some(ctx) = setup() else { return };
+    let n = 1000u32;
+    let scale = 0.625f32; // Granite-style residual multiplier
+    let a: Vec<f32> = (0..n).map(|i| i as f32 * 0.1).collect();
+    let b: Vec<f32> = (0..n).map(|i| (i as f32 * 0.03).sin()).collect();
+    let expected: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + scale * y).collect();
+
+    let a_buf = ctx.upload_f32(&a);
+    let b_buf = ctx.upload_f32(&b);
+    let p_buf = ctx.upload_bytes(bytemuck::cast_slice(&[n, scale.to_bits()]));
+    run_1d(
+        &ctx,
+        shaders::ELEMENTWISE,
+        "scaled_add_inplace",
+        &[&a_buf, &b_buf, &p_buf],
+        n as u64,
+        256,
+        true,
+    );
+    let got = ctx.read_f32(&a_buf, n as usize);
+    assert_close("scaled_add_inplace", &expected, &got, 1e-5);
+}
+
+#[test]
+fn test_add_rmsnorm_batch_res_scale() {
+    let Some(ctx) = setup() else { return };
+    let n = 2048usize;
+    let eps = 1e-5f32;
+    let res_scale = 0.7f32;
+    let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.031).sin() * 2.0).collect();
+    let residual: Vec<f32> = (0..n).map(|i| (i as f32 * 0.013).cos()).collect();
+    let w: Vec<f32> = (0..n)
+        .map(|i| 0.5 + (i as f32 * 0.017).cos() * 0.5)
+        .collect();
+
+    // Reference: v = src + res_scale*residual; dst = rmsnorm(v) * w.
+    let v: Vec<f32> = src
+        .iter()
+        .zip(&residual)
+        .map(|(s, r)| s + res_scale * r)
+        .collect();
+    let sum_sq: f32 = v.iter().map(|x| x * x).sum();
+    let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
+    let expected: Vec<f32> = v.iter().zip(&w).map(|(x, wi)| x * inv_rms * wi).collect();
+
+    let src_buf = ctx.upload_f32(&src);
+    let dst_buf = ctx.create_buffer((n as u64) * 4);
+    let w_buf = ctx.upload_f32(&w);
+    let res_buf = ctx.upload_f32(&residual);
+    // Params: [n, eps_bits, src_stride, dst_stride, res_scale_bits].
+    let params = [
+        n as u32,
+        eps.to_bits(),
+        n as u32,
+        n as u32,
+        res_scale.to_bits(),
+    ];
+    let p_buf = ctx.upload_bytes(bytemuck::cast_slice(&params));
+
+    let pipe = ctx
+        .create_pipeline(shaders::RMSNORM_BATCH, "add_rmsnorm_batch")
+        .expect("compile");
+    let cb = ctx.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipe);
+    enc.set_buffer(0, Some(&src_buf), 0);
+    enc.set_buffer(1, Some(&dst_buf), 0);
+    enc.set_buffer(2, Some(&w_buf), 0);
+    enc.set_buffer(3, Some(&p_buf), 0);
+    enc.set_buffer(4, Some(&res_buf), 0);
+    enc.dispatch_thread_groups(tg_size(1), tg_size(256));
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    let got = ctx.read_f32(&dst_buf, n);
+    assert_close("add_rmsnorm_batch res_scale", &expected, &got, 1e-4);
+}
+
+/// Dispatch `qk_norm_rope` with the given flags and return (q, k) post-kernel.
+#[allow(clippy::too_many_arguments)]
+fn run_qk_norm_rope(
+    ctx: &MetalContext,
+    q: &[f32],
+    k: &[f32],
+    pos: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    freq_base: f32,
+    rope_type: u32,
+    freq_factors: Option<&[f32]>,
+) -> (Vec<f32>, Vec<f32>) {
+    let q_buf = ctx.upload_f32(q);
+    let k_buf = ctx.upload_f32(k);
+    // has_qk_norm = 0 ⇒ rope-only; bind a 1-elt dummy at the norm slots.
+    let dummy = ctx.upload_f32(&[1.0f32]);
+    let ff_buf = match freq_factors {
+        Some(ff) => ctx.upload_f32(ff),
+        None => ctx.upload_f32(&[1.0f32]),
+    };
+    let has_ff = freq_factors.is_some() as u32;
+    let params: [u32; 9] = [
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        1e-5f32.to_bits(),
+        freq_base.to_bits(),
+        rope_type,
+        has_ff,
+        0, // has_qk_norm = 0 (rope-only)
+    ];
+    let p_buf = ctx.upload_bytes(bytemuck::cast_slice(&params));
+    let pipe = ctx
+        .create_pipeline(shaders::QK_NORM_ROPE, "qk_norm_rope")
+        .expect("compile");
+    let cb = ctx.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipe);
+    enc.set_buffer(0, Some(&q_buf), 0);
+    enc.set_buffer(1, Some(&k_buf), 0);
+    enc.set_buffer(2, Some(&dummy), 0);
+    enc.set_buffer(3, Some(&dummy), 0);
+    enc.set_buffer(4, Some(&p_buf), 0);
+    enc.set_buffer(5, Some(&ff_buf), 0);
+    enc.dispatch_thread_groups(tg_size((n_heads + n_kv_heads) as u64), tg_size(256));
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    (ctx.read_f32(&q_buf, q.len()), ctx.read_f32(&k_buf, k.len()))
+}
+
+#[test]
+fn test_qk_norm_rope_rope_only() {
+    let Some(ctx) = setup() else { return };
+    let (n_heads, n_kv_heads, head_dim) = (2usize, 1usize, 8usize);
+    let pos = 5u32;
+    let freq_base = 1_000_000.0f32;
+    let q: Vec<f32> = (0..n_heads * head_dim)
+        .map(|i| (i as f32 * 0.07).sin())
+        .collect();
+    let k: Vec<f32> = (0..n_kv_heads * head_dim)
+        .map(|i| (i as f32 * 0.05).cos())
+        .collect();
+
+    let mut exp_q = q.clone();
+    for h in 0..n_heads {
+        rope_neox_ref(
+            &mut exp_q[h * head_dim..(h + 1) * head_dim],
+            pos,
+            head_dim,
+            freq_base,
+            None,
+        );
+    }
+    let mut exp_k = k.clone();
+    for h in 0..n_kv_heads {
+        rope_neox_ref(
+            &mut exp_k[h * head_dim..(h + 1) * head_dim],
+            pos,
+            head_dim,
+            freq_base,
+            None,
+        );
+    }
+
+    let (got_q, got_k) = run_qk_norm_rope(
+        &ctx,
+        &q,
+        &k,
+        pos,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        freq_base,
+        0,
+        None,
+    );
+    assert_close("qk_norm_rope rope-only Q", &exp_q, &got_q, 1e-4);
+    assert_close("qk_norm_rope rope-only K", &exp_k, &got_k, 1e-4);
+}
+
+#[test]
+fn test_qk_norm_rope_freq_factors() {
+    let Some(ctx) = setup() else { return };
+    let (n_heads, n_kv_heads, head_dim) = (2usize, 1usize, 8usize);
+    let pos = 7u32;
+    let freq_base = 500_000.0f32;
+    // Llama-3-style per-pair frequency factors (head_dim/2 entries).
+    let ff: Vec<f32> = (0..head_dim / 2).map(|d| 1.0 + d as f32 * 0.5).collect();
+    let q: Vec<f32> = (0..n_heads * head_dim)
+        .map(|i| (i as f32 * 0.11).sin())
+        .collect();
+    let k: Vec<f32> = (0..n_kv_heads * head_dim)
+        .map(|i| (i as f32 * 0.09).cos())
+        .collect();
+
+    let mut exp_q = q.clone();
+    for h in 0..n_heads {
+        rope_neox_ref(
+            &mut exp_q[h * head_dim..(h + 1) * head_dim],
+            pos,
+            head_dim,
+            freq_base,
+            Some(&ff),
+        );
+    }
+    let mut exp_k = k.clone();
+    for h in 0..n_kv_heads {
+        rope_neox_ref(
+            &mut exp_k[h * head_dim..(h + 1) * head_dim],
+            pos,
+            head_dim,
+            freq_base,
+            Some(&ff),
+        );
+    }
+
+    let (got_q, got_k) = run_qk_norm_rope(
+        &ctx,
+        &q,
+        &k,
+        pos,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        freq_base,
+        0,
+        Some(&ff),
+    );
+    assert_close("qk_norm_rope freq_factors Q", &exp_q, &got_q, 1e-4);
+    assert_close("qk_norm_rope freq_factors K", &exp_k, &got_k, 1e-4);
+}

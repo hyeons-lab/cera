@@ -5,7 +5,7 @@ pub mod transformer;
 #[cfg(feature = "gpu")]
 pub mod gpu_lfm2;
 
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", all(feature = "metal", target_os = "macos")))]
 pub(crate) mod gpu_weight_source;
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -486,6 +486,10 @@ pub fn load_model_metal(
             path,
             context_size,
         )?)),
+        // Dense transformers share the generalized Metal forward path.
+        "qwen2" | "qwen3" | "llama" | "granite" => Ok(Box::new(
+            metal_lfm2::MetalLfm2Model::from_llama(gguf, path, context_size)?,
+        )),
         other => bail!("unsupported architecture for Metal: {other}"),
     }
 }

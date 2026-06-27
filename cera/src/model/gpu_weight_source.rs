@@ -50,7 +50,14 @@ pub(crate) trait GpuWeightSource {
     fn rope_freqs(&self) -> Option<&[f32]>;
 
     // ── Raw quantized-weight access (GGUF mmap handles) ─────────────────────
+    // The metal loader maps weights by absolute `wref.start` offset into its own
+    // mmap buffer, so it needs neither the byte slice nor a full dequantize.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     fn weight_bytes(&self, wref: &WeightRef) -> &[u8];
+    // The metal loader references weights via mmap byte offsets and never
+    // dequantizes a full matrix, so this accessor is dead under `metal` alone
+    // (live under `gpu`, where non-kernel dtypes are uploaded as F32).
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32>;
 
     // ── Per-layer / global weight refs ─────────────────────────────────────
@@ -72,6 +79,8 @@ pub(crate) trait GpuWeightSource {
     /// Whether the batched-prefill GPU path is wired for this model. LFM2 has
     /// the batched shaders; the dense transformers currently prefill via the
     /// per-token decode loop (correctness-first; batched prefill for them is a
-    /// follow-up), so they return `false`.
+    /// follow-up), so they return `false`. The metal backend always batches
+    /// prefill, so it never queries this — dead under `metal` alone.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     fn supports_batched_prefill(&self) -> bool;
 }

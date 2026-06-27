@@ -10,6 +10,8 @@ struct Params {
     uint eps_bits;    // f32 epsilon as raw bits
     uint src_stride;  // stride between src vectors (floats)
     uint dst_stride;  // stride between dst vectors (floats)
+    uint res_scale_bits; // f32 residual multiplier as raw bits (Granite;
+                         // 1.0 elsewhere). Only read by add_rmsnorm_batch.
 };
 
 kernel void rmsnorm_batch(
@@ -69,11 +71,12 @@ kernel void add_rmsnorm_batch(
     uint src_off = tg_id * params.src_stride;
     uint dst_off = tg_id * params.dst_stride;
     uint res_off = tg_id * params.src_stride;
+    float res_scale = as_type<float>(params.res_scale_bits);
 
-    // Phase 1: add residual in-place AND compute sum of squares.
+    // Phase 1: add (scaled) residual in-place AND compute sum of squares.
     float partial = 0.0f;
     for (uint i = tid; i < n; i += 256u) {
-        float v = src[src_off + i] + residual[res_off + i];
+        float v = src[src_off + i] + res_scale * residual[res_off + i];
         src[src_off + i] = v;  // write back the sum
         partial += v * v;
     }
