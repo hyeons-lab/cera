@@ -2994,6 +2994,12 @@ impl MetalLfm2Model {
                     head_dim: u32,
                     freq_base_bits: u32,
                     delta_pos: i32,
+                    // RoPE pair layout (0 = NeoX, 1 = NORM/interleaved) and the
+                    // Llama-3 freq-factors flag must match the forward
+                    // `qk_norm_rope` dispatch so the delta-rotation composes —
+                    // a NORM model shifted with the NeoX layout mis-rotates.
+                    rope_type: u32,
+                    has_freq_factors: u32,
                     _pad: u32,
                 }
                 let kparams = KParams {
@@ -3004,6 +3010,8 @@ impl MetalLfm2Model {
                     head_dim: head_dim as u32,
                     freq_base_bits,
                     delta_pos,
+                    rope_type: self.rope_type,
+                    has_freq_factors: u32::from(self.has_freq_factors),
                     _pad: 0,
                 };
                 enc.set_bytes(
@@ -3011,6 +3019,11 @@ impl MetalLfm2Model {
                     std::mem::size_of::<KParams>() as u64,
                     &kparams as *const _ as *const _,
                 );
+                // Bound at slot 3 even when `has_freq_factors` is false: the
+                // kernel only reads it on the Llama-3 path, but Metal requires
+                // every referenced buffer binding to be set. `rope_freqs_buf`
+                // is a `[1.0]` dummy for plain-RoPE models.
+                enc.set_buffer(3, Some(&self.rope_freqs_buf), 0);
                 let half_dim = head_dim / 2;
                 let total = (retained * n_kv_heads * half_dim) as u64;
                 enc.dispatch_thread_groups(sz1d(total.div_ceil(256)), sz1d(256));
@@ -3771,6 +3784,14 @@ impl MetalLfm2Model {
         }
     }
 
+    /// Read back the current logits (`vocab_size` floats) from the GPU.
+    /// `forward_prefill_profiled` leaves the last token's logits here but
+    /// returns timings, not logits — this lets a caller (e.g. a parity test)
+    /// recover them to compare the profiled path against production prefill.
+    pub fn read_logits(&self) -> Vec<f32> {
+        self.ctx.read_f32(&self.logits_buf, self.config.vocab_size)
+    }
+
     /// Shared per-phase layer loop for profiled prefill. Calls
     /// `run_phase(name, encode_fn)` once per logical phase in pipeline
     /// order — caller decides whether each phase runs in its own command
@@ -3879,10 +3900,15 @@ impl MetalLfm2Model {
                     );
                 });
             } else {
-                let head_dim = (hs / cfg.n_heads) as u32;
+                let head_dim = cfg.head_dim as u32;
                 let n_kv_heads = cfg.kv_heads_per_layer[layer] as u32;
                 let kv_dim = (n_kv_heads * head_dim) as usize;
                 let n_heads = cfg.n_heads as u32;
+                // Decoupled head_dim (Qwen3): the Q stream is q_dim = n_heads*head_dim
+                // wide, not hs. Mirror the production prefill strides so profiling a
+                // decoupled-head_dim model measures the real kernels (LFM2/llama
+                // collapse to q_dim == hs, so this is a no-op there).
+                let q_dim = (n_heads * head_dim) as usize;
                 let (k_cache, v_cache) = self.state.kv_caches[layer].as_ref().unwrap();
 
                 run_phase(format!("L{layer}_attn_qkv"), &|enc| {
@@ -3898,7 +3924,7 @@ impl MetalLfm2Model {
                         0,
                         n as u32,
                         hs as u32,
-                        hs as u32,
+                        q_dim as u32,
                         false,
                     );
                     self.encode_gemm(
@@ -3925,10 +3951,39 @@ impl MetalLfm2Model {
                         kv_dim as u32,
                         false,
                     );
+                    // Qwen2 QKV bias — broadcast-add across all N rows, before
+                    // QK-norm/RoPE. Absent (`None`) on every other arch. Mirrors
+                    // production prefill so profiled output stays arch-correct.
+                    if let Some(b) = lw.attn_q_bias.as_ref() {
+                        self.encode_bias_add(
+                            enc,
+                            &self.prefill_proj_buf,
+                            b,
+                            (n * q_dim) as u32,
+                            q_dim as u32,
+                        );
+                    }
+                    if let Some(b) = lw.attn_k_bias.as_ref() {
+                        self.encode_bias_add(
+                            enc,
+                            &self.prefill_gate_buf,
+                            b,
+                            (n * kv_dim) as u32,
+                            kv_dim as u32,
+                        );
+                    }
+                    if let Some(b) = lw.attn_v_bias.as_ref() {
+                        self.encode_bias_add(
+                            enc,
+                            &self.prefill_up_buf,
+                            b,
+                            (n * kv_dim) as u32,
+                            kv_dim as u32,
+                        );
+                    }
                 });
 
                 run_phase(format!("L{layer}_attn_rope_cast"), &|enc| {
-                    // Diagnostic path: hs strides (head_dim == hs/n_heads here).
                     self.encode_qk_norm_rope_batch(
                         enc,
                         &self.prefill_proj_buf,
@@ -3940,7 +3995,7 @@ impl MetalLfm2Model {
                         n_heads,
                         n_kv_heads,
                         head_dim,
-                        hs as u32,
+                        q_dim as u32,
                         kv_dim as u32,
                     );
 
@@ -3975,25 +4030,50 @@ impl MetalLfm2Model {
                         n_kv_heads,
                         head_dim,
                         start_pos as u32,
-                        hs as u32,
-                        hs as u32,
+                        q_dim as u32, // q_stride
+                        q_dim as u32, // out_stride
                     );
                 });
 
                 run_phase(format!("L{layer}_attn_outproj"), &|enc| {
                     let w_o = lw.attn_output.as_ref().unwrap();
-                    self.encode_gemm_add(
-                        enc,
-                        w_o,
-                        &self.prefill_normed_buf,
-                        0,
-                        batch_buf,
-                        0,
-                        &self.prefill_gate_buf,
-                        n as u32,
-                        hs as u32,
-                        hs as u32,
-                    );
+                    // Out-proj reads the concatenated head outputs (q_dim wide) and
+                    // writes hs back into the residual stream. Granite scales the
+                    // sublayer output (residual != 1.0); other archs plain-add.
+                    if self.scalars.residual == 1.0 {
+                        self.encode_gemm_add(
+                            enc,
+                            w_o,
+                            &self.prefill_normed_buf,
+                            0,
+                            batch_buf,
+                            0,
+                            &self.prefill_gate_buf,
+                            n as u32,
+                            q_dim as u32,
+                            hs as u32,
+                        );
+                    } else {
+                        self.encode_gemm(
+                            enc,
+                            w_o,
+                            &self.prefill_normed_buf,
+                            0,
+                            &self.prefill_gate_buf,
+                            0,
+                            n as u32,
+                            q_dim as u32,
+                            hs as u32,
+                            false,
+                        );
+                        self.encode_scaled_add_inplace(
+                            enc,
+                            batch_buf,
+                            &self.prefill_gate_buf,
+                            (n * hs) as u32,
+                            self.scalars.residual,
+                        );
+                    }
                 });
             }
 
@@ -4054,18 +4134,42 @@ impl MetalLfm2Model {
             });
 
             run_phase(format!("L{layer}_{lt}_ffn_down"), &|enc| {
-                self.encode_gemm_add(
-                    enc,
-                    &lw.ffn_down,
-                    &self.prefill_gate_buf,
-                    0,
-                    batch_buf,
-                    0,
-                    &self.prefill_normed_buf,
-                    n as u32,
-                    is as u32,
-                    hs as u32,
-                );
+                // Granite scales the FFN sublayer output (residual != 1.0); other
+                // archs plain-add.
+                if self.scalars.residual == 1.0 {
+                    self.encode_gemm_add(
+                        enc,
+                        &lw.ffn_down,
+                        &self.prefill_gate_buf,
+                        0,
+                        batch_buf,
+                        0,
+                        &self.prefill_normed_buf,
+                        n as u32,
+                        is as u32,
+                        hs as u32,
+                    );
+                } else {
+                    self.encode_gemm(
+                        enc,
+                        &lw.ffn_down,
+                        &self.prefill_gate_buf,
+                        0,
+                        &self.prefill_normed_buf,
+                        0,
+                        n as u32,
+                        is as u32,
+                        hs as u32,
+                        false,
+                    );
+                    self.encode_scaled_add_inplace(
+                        enc,
+                        batch_buf,
+                        &self.prefill_normed_buf,
+                        (n * hs) as u32,
+                        self.scalars.residual,
+                    );
+                }
             });
         }
 
@@ -4648,7 +4752,7 @@ impl MetalLfm2Model {
                 );
             } else {
                 // Attention
-                let head_dim = (hs / cfg.n_heads) as u32;
+                let head_dim = cfg.head_dim as u32;
                 let n_kv_heads = cfg.kv_heads_per_layer[i] as u32;
                 let kv_dim = n_kv_heads * head_dim;
                 let n_heads = cfg.n_heads as u32;
@@ -4791,10 +4895,11 @@ impl MetalLfm2Model {
                     );
                 });
             } else {
-                let head_dim = (hs / cfg.n_heads) as u32;
+                let head_dim = cfg.head_dim as u32;
                 let n_kv_heads = cfg.kv_heads_per_layer[i] as u32;
                 let kv_dim = n_kv_heads * head_dim;
                 let n_heads = cfg.n_heads as u32;
+                let q_dim = n_heads * head_dim;
                 let (k_cache, v_cache) = self.state.kv_caches[i].as_ref().unwrap();
                 let kv_offset = (pos * kv_dim as usize * 2) as u64; // f16 = 2 bytes
 
@@ -4810,6 +4915,17 @@ impl MetalLfm2Model {
                         &self.k_buf,
                         &self.v_buf,
                     );
+                    // Qwen2 QKV bias (absent on every other arch); mirrors
+                    // `encode_single_layer` so profiled output stays arch-correct.
+                    if let Some(b) = lw.attn_q_bias.as_ref() {
+                        self.encode_bias_add(enc, &self.q_buf, b, q_dim, q_dim);
+                    }
+                    if let Some(b) = lw.attn_k_bias.as_ref() {
+                        self.encode_bias_add(enc, &self.k_buf, b, kv_dim, kv_dim);
+                    }
+                    if let Some(b) = lw.attn_v_bias.as_ref() {
+                        self.encode_bias_add(enc, &self.v_buf, b, kv_dim, kv_dim);
+                    }
                 });
                 self.gpu_sampled_pass(timer, cb, "attn_qk_rope", |enc| {
                     self.encode_qk_norm_rope(
@@ -4843,11 +4959,14 @@ impl MetalLfm2Model {
                     );
                 });
                 self.gpu_sampled_pass(timer, cb, "attn_out", |enc| {
-                    self.encode_gemv_weight_accumulate(
+                    // Granite scales the sublayer output (residual != 1.0); other
+                    // archs use the fused accumulate-GEMV. `normed_buf` is free.
+                    self.encode_residual_proj(
                         enc,
                         lw.attn_output.as_ref().unwrap(),
                         &self.attn_out_buf,
                         &self.hidden_buf,
+                        &self.normed_buf,
                     );
                 });
             }
@@ -4877,11 +4996,14 @@ impl MetalLfm2Model {
                     &self.params.elementwise_is,
                     lw.ffn_gate.m,
                 );
-                self.encode_gemv_weight_accumulate(
+                // Granite-scaled FFN residual; `ffn_input_buf` is free (consumed
+                // by the gate/up projection) so it doubles as the scaled-add temp.
+                self.encode_residual_proj(
                     enc,
                     &lw.ffn_down,
                     &self.gate_buf,
                     &self.hidden_buf,
+                    &self.ffn_input_buf,
                 );
             });
         }
@@ -4944,10 +5066,11 @@ impl MetalLfm2Model {
                     );
                 });
             } else {
-                let head_dim = (hs / cfg.n_heads) as u32;
+                let head_dim = cfg.head_dim as u32;
                 let n_kv_heads = cfg.kv_heads_per_layer[i] as u32;
                 let kv_dim = n_kv_heads * head_dim;
                 let n_heads = cfg.n_heads as u32;
+                let q_dim = n_heads * head_dim;
                 let (k_cache, v_cache) = self.state.kv_caches[i].as_ref().unwrap();
                 let kv_offset = (pos * kv_dim as usize * 2) as u64; // f16 = 2 bytes
 
@@ -4965,6 +5088,17 @@ impl MetalLfm2Model {
                         &self.k_buf,
                         &self.v_buf,
                     );
+                    // Qwen2 QKV bias (absent on every other arch); mirrors
+                    // `encode_single_layer` so profiled output stays arch-correct.
+                    if let Some(b) = lw.attn_q_bias.as_ref() {
+                        self.encode_bias_add(enc, &self.q_buf, b, q_dim, q_dim);
+                    }
+                    if let Some(b) = lw.attn_k_bias.as_ref() {
+                        self.encode_bias_add(enc, &self.k_buf, b, kv_dim, kv_dim);
+                    }
+                    if let Some(b) = lw.attn_v_bias.as_ref() {
+                        self.encode_bias_add(enc, &self.v_buf, b, kv_dim, kv_dim);
+                    }
                 });
                 // fused qk norm + rope on f32 scratch, then cast to f16 cache.
                 self.profile_segment(timer, "attn_qk_rope", |enc| {
@@ -4998,13 +5132,15 @@ impl MetalLfm2Model {
                         head_dim,
                     );
                 });
-                // out proj with residual add.
+                // out proj with residual add (Granite scales the sublayer output;
+                // other archs use the fused accumulate-GEMV). `normed_buf` is free.
                 self.profile_segment(timer, "attn_out", |enc| {
-                    self.encode_gemv_weight_accumulate(
+                    self.encode_residual_proj(
                         enc,
                         lw.attn_output.as_ref().unwrap(),
                         &self.attn_out_buf,
                         &self.hidden_buf,
+                        &self.normed_buf,
                     );
                 });
             }
@@ -5026,7 +5162,8 @@ impl MetalLfm2Model {
                     self.encode_gemv_weight(enc, &lw.ffn_up, &self.ffn_input_buf, &self.up_buf);
                 }
             });
-            // silu_mul + ffn_down accumulate residual.
+            // silu_mul + ffn_down residual (Granite-scaled; `ffn_input_buf` is
+            // free here and doubles as the scaled-add temp).
             self.profile_segment(timer, "ffn_silu_down", |enc| {
                 self.encode_elementwise(
                     enc,
@@ -5036,11 +5173,12 @@ impl MetalLfm2Model {
                     &self.params.elementwise_is,
                     lw.ffn_gate.m,
                 );
-                self.encode_gemv_weight_accumulate(
+                self.encode_residual_proj(
                     enc,
                     &lw.ffn_down,
                     &self.gate_buf,
                     &self.hidden_buf,
+                    &self.ffn_input_buf,
                 );
             });
         }

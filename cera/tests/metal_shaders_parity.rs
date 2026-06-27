@@ -1295,3 +1295,238 @@ fn test_qk_norm_rope_freq_factors() {
     assert_close("qk_norm_rope freq_factors Q", &exp_q, &got_q, 1e-4);
     assert_close("qk_norm_rope freq_factors K", &exp_k, &got_k, 1e-4);
 }
+
+// ── kv_shift_k_to_scratch: NeoX + NORM RoPE delta parity ────────────────────
+
+/// Read f16 elements from a shared GPU buffer back as f32 (unified memory).
+fn read_f16(buf: &metal::Buffer, count: usize) -> Vec<f32> {
+    let ptr = buf.contents() as *const u16;
+    let bits = unsafe { std::slice::from_raw_parts(ptr, count) };
+    bits.iter()
+        .map(|&b| half::f16::from_bits(b).to_f32())
+        .collect()
+}
+
+/// CPU reference for the shift's RoPE delta, mirroring
+/// `cera::backend::cpu::apply_rope_delta_to_head` (NeoX, split-halves pairs)
+/// and `apply_rope_norm_delta_to_head` (NORM, interleaved pairs). `rope_type`
+/// 0 = NeoX, 1 = NORM. `freq_factors` (Llama-3) is NORM-only.
+fn rope_delta_ref(
+    head: &mut [f32],
+    delta_pos: i32,
+    head_dim: usize,
+    freq_base: f32,
+    rope_type: u32,
+    freq_factors: Option<&[f32]>,
+) {
+    let half = head_dim / 2;
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+    for d in 0..half {
+        let ff = freq_factors.map_or(1.0, |f| f[d]);
+        let theta = (delta_pos as f32 * theta_scale.powi(d as i32)) / ff;
+        let (s, c) = theta.sin_cos();
+        let (i0, i1) = if rope_type == 0 {
+            (d, d + half) // NeoX
+        } else {
+            (2 * d, 2 * d + 1) // NORM
+        };
+        let x0 = head[i0];
+        let x1 = head[i1];
+        head[i0] = x0 * c - x1 * s;
+        head[i1] = x0 * s + x1 * c;
+    }
+}
+
+/// Run `kv_shift_k_to_scratch` and return the rotated retained-region scratch.
+#[allow(clippy::too_many_arguments)]
+fn run_kv_shift_k(
+    ctx: &MetalContext,
+    k_cache_f32: &[f32],
+    n_keep: usize,
+    shift: usize,
+    seq_len: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    freq_base: f32,
+    rope_type: u32,
+    freq_factors: Option<&[f32]>,
+) -> Vec<f32> {
+    let kv_dim = n_kv_heads * head_dim;
+    let new_seq_len = seq_len - shift;
+    let retained = new_seq_len - n_keep;
+    let k_buf = upload_f16_from_f32(ctx, k_cache_f32);
+    let scratch = ctx.create_buffer((retained * kv_dim * 2) as u64); // f16
+    let ff_buf = freq_factors.map_or_else(|| ctx.upload_f32(&[1.0f32]), |ff| ctx.upload_f32(ff));
+    let delta_pos = -(shift as i32);
+    let params: [u32; 10] = [
+        n_keep as u32,
+        shift as u32,
+        new_seq_len as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        freq_base.to_bits(),
+        delta_pos as u32, // two's-complement bits; kernel reads as int
+        rope_type,
+        freq_factors.is_some() as u32,
+        0,
+    ];
+    let p_buf = ctx.upload_bytes(bytemuck::cast_slice(&params));
+    let pipe = ctx
+        .create_pipeline(shaders::KV_SHIFT, "kv_shift_k_to_scratch")
+        .expect("compile");
+    let cb = ctx.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipe);
+    enc.set_buffer(0, Some(&k_buf), 0);
+    enc.set_buffer(1, Some(&scratch), 0);
+    enc.set_buffer(2, Some(&p_buf), 0);
+    enc.set_buffer(3, Some(&ff_buf), 0);
+    let total = (retained * n_kv_heads * (head_dim / 2)) as u64;
+    enc.dispatch_thread_groups(tg_size(total.div_ceil(256)), tg_size(256));
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    read_f16(&scratch, retained * kv_dim)
+}
+
+/// Expected rotated retained-region: the f16-rounded source cells at their OLD
+/// positions, each head delta-rotated for `-shift`, compacted to scratch order.
+#[allow(clippy::too_many_arguments)]
+fn kv_shift_expected(
+    k_cache_f32: &[f32],
+    n_keep: usize,
+    shift: usize,
+    retained: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    freq_base: f32,
+    rope_type: u32,
+    freq_factors: Option<&[f32]>,
+) -> Vec<f32> {
+    let kv_dim = n_kv_heads * head_dim;
+    // Round inputs through f16 to match what the GPU actually reads.
+    let k_f16: Vec<f32> = k_cache_f32
+        .iter()
+        .map(|&x| half::f16::from_f32(x).to_f32())
+        .collect();
+    let delta_pos = -(shift as i32);
+    let mut out = vec![0.0f32; retained * kv_dim];
+    for t in 0..retained {
+        let t_old = n_keep + shift + t;
+        for h in 0..n_kv_heads {
+            let src =
+                &k_f16[t_old * kv_dim + h * head_dim..t_old * kv_dim + h * head_dim + head_dim];
+            let mut head = src.to_vec();
+            rope_delta_ref(
+                &mut head,
+                delta_pos,
+                head_dim,
+                freq_base,
+                rope_type,
+                freq_factors,
+            );
+            out[t * kv_dim + h * head_dim..t * kv_dim + h * head_dim + head_dim]
+                .copy_from_slice(&head);
+        }
+    }
+    out
+}
+
+#[test]
+fn test_kv_shift_neox() {
+    let Some(ctx) = setup() else { return };
+    let (seq_len, n_kv_heads, head_dim) = (16usize, 2usize, 8usize);
+    let (n_keep, shift) = (3usize, 4usize);
+    let freq_base = 1_000_000.0f32;
+    let kv_dim = n_kv_heads * head_dim;
+    let k: Vec<f32> = (0..seq_len * kv_dim)
+        .map(|i| (i as f32 * 0.013).sin() * 0.8)
+        .collect();
+    let retained = (seq_len - shift) - n_keep;
+
+    let got = run_kv_shift_k(
+        &ctx, &k, n_keep, shift, seq_len, n_kv_heads, head_dim, freq_base, 0, None,
+    );
+    let exp = kv_shift_expected(
+        &k, n_keep, shift, retained, n_kv_heads, head_dim, freq_base, 0, None,
+    );
+    // f16 storage round-trip dominates; powr-vs-iterative theta adds ~1e-5.
+    assert_close("kv_shift NeoX", &exp, &got, 2e-3);
+}
+
+#[test]
+fn test_kv_shift_norm() {
+    let Some(ctx) = setup() else { return };
+    let (seq_len, n_kv_heads, head_dim) = (16usize, 2usize, 8usize);
+    let (n_keep, shift) = (3usize, 4usize);
+    let freq_base = 500_000.0f32;
+    let kv_dim = n_kv_heads * head_dim;
+    let k: Vec<f32> = (0..seq_len * kv_dim)
+        .map(|i| (i as f32 * 0.017).cos() * 0.7)
+        .collect();
+    let retained = (seq_len - shift) - n_keep;
+
+    let got = run_kv_shift_k(
+        &ctx, &k, n_keep, shift, seq_len, n_kv_heads, head_dim, freq_base, 1, None,
+    );
+    let exp = kv_shift_expected(
+        &k, n_keep, shift, retained, n_kv_heads, head_dim, freq_base, 1, None,
+    );
+    assert_close("kv_shift NORM", &exp, &got, 2e-3);
+
+    // Guard: the OLD NeoX-only kernel would pair the wrong elements on a NORM
+    // model. Confirm the NeoX reference genuinely differs, so this test would
+    // have caught the mis-rotation regression.
+    let neox_exp = kv_shift_expected(
+        &k, n_keep, shift, retained, n_kv_heads, head_dim, freq_base, 0, None,
+    );
+    let max_layout_diff = exp
+        .iter()
+        .zip(neox_exp.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_layout_diff > 1e-2,
+        "NORM vs NeoX layouts should differ materially (got {max_layout_diff:.3e})"
+    );
+}
+
+#[test]
+fn test_kv_shift_norm_freq_factors() {
+    let Some(ctx) = setup() else { return };
+    let (seq_len, n_kv_heads, head_dim) = (16usize, 1usize, 8usize);
+    let (n_keep, shift) = (2usize, 5usize);
+    let freq_base = 500_000.0f32;
+    let kv_dim = n_kv_heads * head_dim;
+    // Llama-3-style per-pair frequency factors (head_dim/2 entries).
+    let ff: Vec<f32> = (0..head_dim / 2).map(|d| 1.0 + d as f32 * 0.5).collect();
+    let k: Vec<f32> = (0..seq_len * kv_dim)
+        .map(|i| (i as f32 * 0.021).sin() * 0.6)
+        .collect();
+    let retained = (seq_len - shift) - n_keep;
+
+    let got = run_kv_shift_k(
+        &ctx,
+        &k,
+        n_keep,
+        shift,
+        seq_len,
+        n_kv_heads,
+        head_dim,
+        freq_base,
+        1,
+        Some(&ff),
+    );
+    let exp = kv_shift_expected(
+        &k,
+        n_keep,
+        shift,
+        retained,
+        n_kv_heads,
+        head_dim,
+        freq_base,
+        1,
+        Some(&ff),
+    );
+    assert_close("kv_shift NORM freq_factors", &exp, &got, 2e-3);
+}

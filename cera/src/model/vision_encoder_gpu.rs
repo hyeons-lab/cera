@@ -1609,10 +1609,20 @@ mod tests {
 
     /// Shared CPU↔GPU parity check, generic over the backend ops. Compares the
     /// GPU forward against the CPU encoder on a synthetic 2-layer ViT with the
-    /// dynamic grid == trained grid (no pos-embed interpolation). `tol` is the
-    /// per-element absolute tolerance (looser for quantized weights, whose GPU
-    /// GEMM stores dequantized weights as half).
-    fn run_parity<O: VitGpuOps>(ops: &O, enc: &VisionEncoderWeights, tol: f32) {
+    /// dynamic grid == trained grid (no pos-embed interpolation).
+    ///
+    /// Tolerance follows numpy-`allclose` semantics: each element must satisfy
+    /// `|cpu - gpu| <= atol + rtol * |cpu|`. A pure absolute bound is the wrong
+    /// metric for the quantized GEMM paths, whose kernels store dequantized
+    /// weights as f16 — half-precision accumulation error scales with the output
+    /// magnitude, so a single large-magnitude element (e.g. ~4.5) can drift
+    /// ~1% (~0.05 abs) and tip a fixed absolute bound while every other element
+    /// is fine. `rtol` absorbs that magnitude-proportional noise; `atol` keeps
+    /// small-magnitude elements honest. A real GEMM bug (wrong index/scale/
+    /// transpose) produces errors of order the output itself, far past either
+    /// bound, so this does not mask regressions. Pass `rtol = 0.0` for the
+    /// all-f32 paths, where the absolute bound alone is already tight.
+    fn run_parity<O: VitGpuOps>(ops: &O, enc: &VisionEncoderWeights, atol: f32, rtol: f32) {
         let cfg = &enc.config;
         // Match the 8×8 trained grid (no pos-embed interpolation) and span
         // multiple attention K_TILE blocks (64 tokens > 32).
@@ -1629,16 +1639,20 @@ mod tests {
 
         assert_eq!(cpu_out.len(), gpu_out.len(), "output length mismatch");
         let mut max_diff = 0.0f32;
+        let mut max_rel = 0.0f32;
         for (i, (c, g)) in cpu_out.iter().zip(gpu_out.iter()).enumerate() {
             let d = (c - g).abs();
             max_diff = max_diff.max(d);
+            max_rel = max_rel.max(d / (c.abs() + 1e-6));
+            let limit = atol + rtol * c.abs();
             assert!(
-                d < tol,
-                "encode_image parity mismatch at {i}: cpu={c}, gpu={g}, diff={d} (tol={tol})"
+                d <= limit,
+                "encode_image parity mismatch at {i}: cpu={c}, gpu={g}, diff={d} \
+                 (limit={limit}, atol={atol}, rtol={rtol})"
             );
         }
         println!(
-            "ViT encode parity: max_diff={max_diff:.6}, {} values",
+            "ViT encode parity: max_diff={max_diff:.6}, max_rel={max_rel:.6}, {} values",
             cpu_out.len()
         );
     }
@@ -1654,6 +1668,7 @@ mod tests {
             &WgpuVitOps::new(ctx).expect("build wgpu vit ops"),
             &synth_encoder(),
             2e-3,
+            0.0, // all-f32 path: absolute bound is already tight
         );
     }
 
@@ -1664,12 +1679,15 @@ mod tests {
             Ok(ctx) => ctx,
             Err(_) => return, // no Metal device (CI)
         };
-        run_parity(&MetalVitOps::new(ctx).unwrap(), &synth_encoder(), 2e-3);
+        run_parity(&MetalVitOps::new(ctx).unwrap(), &synth_encoder(), 2e-3, 0.0);
     }
 
     /// Q8_0 linear weights → exercises the Metal simdgroup `gemm_q8_0` path.
-    /// Looser tolerance: the GEMM stores dequantized weights as half, so it
-    /// diverges from the CPU's f32 dequant by more than the all-f32 case.
+    /// The GEMM stores dequantized weights as f16, so its error scales with the
+    /// output magnitude — hence the relative tolerance (see `run_parity`). A
+    /// pure 5e-2 absolute bound was flaky here: the largest-magnitude element
+    /// (~4.5) drifts ~0.0505 (1.1% rel), tipping the bound on some Metal
+    /// hardware while every other element is well within it.
     #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn test_metal_encode_image_parity_q8_0() {
@@ -1680,7 +1698,8 @@ mod tests {
         run_parity(
             &MetalVitOps::new(ctx).unwrap(),
             &synth_encoder_quant(Some(DType::Q8_0)),
-            5e-2,
+            5e-2, // atol: proven floor for small-magnitude elements
+            2e-2, // rtol: f16-GEMM noise on large-magnitude elements
         );
     }
 
@@ -1697,6 +1716,7 @@ mod tests {
             &WgpuVitOps::new(ctx).expect("build wgpu vit ops"),
             &synth_encoder_quant(Some(DType::Q8_0)),
             5e-2,
+            2e-2, // f16-GEMM noise scales with magnitude (see run_parity)
         );
     }
 
@@ -1713,6 +1733,7 @@ mod tests {
             &WgpuVitOps::new(ctx).expect("build wgpu vit ops"),
             &synth_encoder_quant(Some(DType::Q4_0)),
             2e-1,
+            4e-2, // 4-bit GEMM noise scales with magnitude (see run_parity)
         );
     }
 }

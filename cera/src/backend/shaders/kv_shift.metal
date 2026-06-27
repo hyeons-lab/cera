@@ -22,13 +22,18 @@ using namespace metal;
 //    Metal compute kernels can't synchronize across the entire
 //    grid, so an in-place per-thread read+write would race.
 //
-// RoPE convention matches `qk_norm_rope.metal`'s NeoX layout
-// (pairs at [d, d + half_dim]), with `freq[d] = freq_base^(-2d/head_dim)`
-// and rotation `(x0, x1) → (x0*c - x1*s, x0*s + x1*c)` where
-// `c, s = cos(angle), sin(angle)` and `angle = delta_pos * freq[d]`.
-// For the shift case `delta_pos = -shift` so the stored angle is
-// reduced by `shift * freq[d]` per dim-pair — exactly what's needed
-// for the cell to re-encode its new (smaller) position.
+// RoPE convention matches `qk_norm_rope.metal`'s `head_rope`: each
+// dim-pair is rotated by `angle = delta_pos * theta_scale^d` (optionally
+// divided by `freq_factors[d]` for Llama-3) with `theta_scale =
+// freq_base^(-2/head_dim)` and rotation `(x0, x1) → (x0*c - x1*s,
+// x0*s + x1*c)`. For the shift case `delta_pos = -shift` so the stored
+// angle is reduced — exactly what's needed for the cell to re-encode its
+// new (smaller) position. `rope_type` selects the pair layout so this
+// composes with whatever the forward pass applied:
+//   0 = NeoX        → pairs at [d, d + half_dim]   (Qwen2/Qwen3/LFM2)
+//   1 = NORM/interl → pairs at [2d, 2d + 1]        (LLaMA/Mistral/Granite)
+// Using the wrong layout (the old NeoX-only kernel on a NORM model)
+// pairs the wrong elements and mis-rotates the retained K cells.
 
 struct KParams {
     uint  n_keep;
@@ -37,14 +42,17 @@ struct KParams {
     uint  n_kv_heads;
     uint  head_dim;
     uint  freq_base_bits;
-    int   delta_pos;        // -(shift as i32)
+    int   delta_pos;          // -(shift as i32)
+    uint  rope_type;          // 0 = NeoX, 1 = NORM/interleaved
+    uint  has_freq_factors;   // 1 ⇒ divide each pair's angle by freq_factors[d]
     uint  _pad;
 };
 
 kernel void kv_shift_k_to_scratch(
-    device const half* k_cache  [[buffer(0)]],
-    device half*       scratch  [[buffer(1)]],
-    constant KParams&  params   [[buffer(2)]],
+    device const half*  k_cache       [[buffer(0)]],
+    device half*        scratch       [[buffer(1)]],
+    constant KParams&   params        [[buffer(2)]],
+    device const float* freq_factors  [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint half_dim = params.head_dim / 2u;
@@ -61,32 +69,39 @@ kernel void kv_shift_k_to_scratch(
     uint kv_dim = params.n_kv_heads * params.head_dim;
     uint head_off = h * params.head_dim;
 
-    uint t_old = params.n_keep + t_off + params.shift;
-    uint src_i0 = t_old * kv_dim + head_off + d;
-    uint src_i1 = src_i0 + half_dim;
+    // Pair element offsets within the head depend on the RoPE layout.
+    uint e0, e1;
+    if (params.rope_type == 0u) {
+        e0 = d;             // NeoX: split-halves
+        e1 = d + half_dim;
+    } else {
+        e0 = 2u * d;        // NORM: adjacent pairs
+        e1 = 2u * d + 1u;
+    }
 
-    float x0 = float(k_cache[src_i0]);
-    float x1 = float(k_cache[src_i1]);
+    uint t_old = params.n_keep + t_off + params.shift;
+    uint src_base = t_old * kv_dim + head_off;
+    float x0 = float(k_cache[src_base + e0]);
+    float x1 = float(k_cache[src_base + e1]);
 
     float freq_base = as_type<float>(params.freq_base_bits);
-    // Mathematically equivalent to the forward-time RoPE expression
-    // (`rope.metal` uses the same form; `qk_norm_rope*.metal` uses an
-    // iterated `powr(theta_scale, d)` shape — different float ops, same
-    // value in the limit). Composing this delta with whatever angle
-    // the cell already encodes yields the new-position angle to within
-    // the f16-storage round-trip error of the surrounding K cache.
-    float freq = 1.0f / powr(freq_base, float(2u * d) / float(params.head_dim));
-    float angle = float(params.delta_pos) * freq;
-    float c = cos(angle);
-    float s = sin(angle);
+    // Same `powr(theta_scale, d)` form the forward `head_rope` uses, so the
+    // delta composes with the cell's existing angle to within the f16-storage
+    // round-trip error of the surrounding K cache.
+    float theta_scale = powr(freq_base, -2.0f / float(params.head_dim));
+    float theta = float(params.delta_pos) * powr(theta_scale, float(d));
+    if (params.has_freq_factors != 0u) {
+        theta = theta / freq_factors[d];
+    }
+    float c = cos(theta);
+    float s = sin(theta);
 
     float y0 = x0 * c - x1 * s;
     float y1 = x0 * s + x1 * c;
 
-    uint dst_i0 = t_off * kv_dim + head_off + d;
-    uint dst_i1 = dst_i0 + half_dim;
-    scratch[dst_i0] = half(y0);
-    scratch[dst_i1] = half(y1);
+    uint dst_base = t_off * kv_dim + head_off;
+    scratch[dst_base + e0] = half(y0);
+    scratch[dst_base + e1] = half(y1);
 }
 
 struct CopyParams {

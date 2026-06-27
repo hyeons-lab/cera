@@ -35,10 +35,10 @@ use cera::model::Model;
 // CPU oracle loader — used by both the wgpu (`check_parity`) and Metal
 // (`check_metal_matches_cpu`) parity gates, so it's needed under either feature.
 use cera::model::load_model;
-#[cfg(all(feature = "metal", target_os = "macos"))]
-use cera::model::load_model_metal;
 #[cfg(feature = "gpu")]
 use cera::model::load_model_gpu;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use cera::model::load_model_metal;
 use cera::tokenizer::BpeTokenizer;
 
 /// Greedy next-token pick — matches `sampler::cpu_argmax` (NaN → -inf,
@@ -422,6 +422,108 @@ fn check_metal_matches_cpu(
         "metal",
         &metal_steps,
     ))
+}
+
+/// The `CERA_PROFILE` diagnostic prefill path (`forward_prefill_profiled`) splits
+/// production prefill into per-phase command buffers for timing. It must produce
+/// the SAME prefill logits as production `forward_prefill` — otherwise the
+/// diagnostic strides/bias/residual have drifted (the path was "correct for LFM2
+/// only" before the dense-feature wiring). Compares the greedy next-token and the
+/// max per-logit delta on the prompt's last position for each dense arch
+/// (decoupled head_dim, QKV bias, NORM rope + Granite residual all exercised).
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn check_metal_profiled_prefill(model_file: &str, prompt: &str) -> Option<Result<(), String>> {
+    use cera::model::metal_lfm2::MetalLfm2Model;
+
+    let mp = models_dir().join(model_file);
+    if !mp.exists() {
+        eprintln!("skipping {model_file}: not found at {}", mp.display());
+        return None;
+    }
+    eprintln!("=== metal profiled-prefill vs production: {model_file} ===");
+
+    let gguf = GgufFile::open(&mp).expect("open gguf");
+    let tokenizer = BpeTokenizer::from_gguf(&gguf).expect("tokenizer");
+    let mut tokens = Vec::new();
+    if let Some(bos) = tokenizer.bos_token() {
+        tokens.push(bos);
+    }
+    tokens.extend(tokenizer.encode(prompt));
+
+    // Separate model instances so the second prefill can't restore the first's
+    // prefix cache instead of recomputing.
+    let prod = match MetalLfm2Model::from_llama(GgufFile::open(&mp).expect("open"), &mp, 8192) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("skipping {model_file}: Metal unavailable ({e})");
+            return None;
+        }
+    };
+    let prof = MetalLfm2Model::from_llama(GgufFile::open(&mp).expect("open"), &mp, 8192)
+        .expect("metal load (profiled)");
+
+    let cfg = prod.config();
+    let mut state_a = InferenceState::from_config(cfg);
+    let prod_logits = prod.forward_prefill(&tokens, 0, &mut state_a);
+
+    let mut state_b = InferenceState::from_config(prof.config());
+    let _timings = prof.forward_prefill_profiled(&tokens, 0, &mut state_b);
+    let prof_logits = prof.read_logits();
+
+    // Reuse the module-level greedy `argmax` (cpu_argmax semantics).
+    let prod_tok = argmax(&prod_logits);
+    let prof_tok = argmax(&prof_logits);
+    let max_delta = prod_logits
+        .iter()
+        .zip(prof_logits.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("  prod_tok={prod_tok} prof_tok={prof_tok} max_logit_delta={max_delta:.4e}");
+
+    if prod_tok != prof_tok {
+        return Some(Err(format!(
+            "{model_file}: profiled prefill greedy token {prof_tok} != production {prod_tok} \
+             (max_logit_delta={max_delta:.4e})"
+        )));
+    }
+    Some(Ok(()))
+}
+
+/// Gate: the diagnostic profiled-prefill path stays bit-faithful to production
+/// prefill across all four dense archs. Guards the `CERA_PROFILE` stride/bias/
+/// residual wiring against future drift.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+#[ignore] // run with --ignored + CERA_METAL_PARITY=1
+fn metal_profiled_prefill_matches_production() {
+    if std::env::var("CERA_METAL_PARITY").as_deref() != Ok("1") {
+        eprintln!("skipping: CERA_METAL_PARITY=1 not set");
+        return;
+    }
+
+    let mut failures = Vec::new();
+    let mut ran = 0;
+    for (file, prompt, _n) in CASES {
+        match check_metal_profiled_prefill(file, prompt) {
+            None => {}
+            Some(Ok(())) => ran += 1,
+            Some(Err(e)) => {
+                ran += 1;
+                failures.push(e);
+            }
+        }
+    }
+
+    if ran == 0 {
+        eprintln!("no models present / no Metal — nothing verified");
+        return;
+    }
+    assert!(
+        failures.is_empty(),
+        "metal profiled-prefill failures:\n{}",
+        failures.join("\n")
+    );
+    eprintln!("metal profiled-prefill matches production across {ran} model(s)");
 }
 
 #[cfg(feature = "gpu")]
