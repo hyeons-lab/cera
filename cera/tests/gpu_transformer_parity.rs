@@ -65,17 +65,39 @@ struct Step {
     logits: Vec<f32>,
 }
 
+/// How the prompt is consumed before greedy continuation.
+#[derive(Clone, Copy, PartialEq)]
+enum Prefill {
+    /// `forward_prefill` — the batched path on GPU once the gate is flipped.
+    Batched,
+    /// Drive `forward` one token at a time — the per-token decode loop, which
+    /// is the trusted oracle the batched path must match.
+    PerToken,
+}
+
 /// Greedy-decode up to `n_predict` tokens (EOS-terminated), recording each
-/// step's token + logits.
+/// step's token + logits. `prefill` selects how the prompt is consumed.
 fn greedy_decode(
     model: &dyn Model,
     prompt_tokens: &[u32],
     n_predict: usize,
     eos: Option<u32>,
+    prefill: Prefill,
 ) -> Vec<Step> {
     let mut state =
         InferenceState::from_config_with_compression(model.config(), &KvCompression::None);
-    let mut logits = model.forward_prefill(prompt_tokens, 0, &mut state);
+    let mut logits = match prefill {
+        Prefill::Batched => model.forward_prefill(prompt_tokens, 0, &mut state),
+        Prefill::PerToken => {
+            // Replicate the per-token prefill fallback: forward each prompt
+            // token in sequence; the last call's logits are the prefill output.
+            let mut l = Vec::new();
+            for (i, &t) in prompt_tokens.iter().enumerate() {
+                l = model.forward(&[t], i, &mut state);
+            }
+            l
+        }
+    };
     let mut out = Vec::with_capacity(n_predict);
     for _ in 0..n_predict {
         let next = argmax(&logits);
@@ -121,74 +143,158 @@ fn check_parity(model_file: &str, prompt: &str, n_predict: usize) -> Option<Resu
         }
     };
 
-    let cpu_steps = greedy_decode(cpu.as_ref(), &tokens, n_predict, eos);
-    let gpu_steps = greedy_decode(gpu.as_ref(), &tokens, n_predict, eos);
+    let cpu_steps = greedy_decode(cpu.as_ref(), &tokens, n_predict, eos, Prefill::Batched);
+    let gpu_steps = greedy_decode(gpu.as_ref(), &tokens, n_predict, eos, Prefill::Batched);
 
-    let cpu_toks: Vec<u32> = cpu_steps.iter().map(|s| s.token).collect();
-    let gpu_toks: Vec<u32> = gpu_steps.iter().map(|s| s.token).collect();
-    eprintln!("  cpu text: {:?}", tokenizer.decode(&cpu_toks));
-    eprintln!("  gpu text: {:?}", tokenizer.decode(&gpu_toks));
+    eprintln!(
+        "  cpu text: {:?}",
+        tokenizer.decode(&cpu_steps.iter().map(|s| s.token).collect::<Vec<_>>())
+    );
+    eprintln!(
+        "  gpu text: {:?}",
+        tokenizer.decode(&gpu_steps.iter().map(|s| s.token).collect::<Vec<_>>())
+    );
+
+    Some(classify_streams(
+        model_file, "cpu", &cpu_steps, "gpu", &gpu_steps,
+    ))
+}
+
+/// Classify two greedy streams as equivalent or genuinely divergent.
+///
+/// `ref`/`test` are interchangeable for the verdict — the gate is symmetric. A
+/// benign near-tie (Q8 accumulation noise tipping two nearly-equal logits) has
+/// a tiny ref-pick-vs-test-pick logit gap on BOTH streams; a real bug makes one
+/// stream pick a token the other ranked far below (a large gap). A meaningful
+/// exact-match prefix is also required: a wrong rope/bias/scalar perturbs every
+/// step, so a genuine bug diverges at the very start — an early flip is failed
+/// even if its gap looks small, because that early position is itself the bug
+/// signature.
+fn classify_streams(
+    label: &str,
+    ref_name: &str,
+    ref_steps: &[Step],
+    test_name: &str,
+    test_steps: &[Step],
+) -> Result<(), String> {
+    let ref_toks: Vec<u32> = ref_steps.iter().map(|s| s.token).collect();
+    let test_toks: Vec<u32> = test_steps.iter().map(|s| s.token).collect();
+
+    const TIE_REL_TOL: f64 = 0.02;
+    const MIN_MATCH_PREFIX: usize = 4;
 
     // Lowest index where the streams differ on their overlapping prefix. `None`
     // ⇒ no token-level disagreement (one may just be shorter).
-    let Some(div) = cpu_toks.iter().zip(&gpu_toks).position(|(a, b)| a != b) else {
-        // Identical on the overlap. Equal length = exact match. Unequal length
-        // means one backend emitted EOS a step earlier — a near-tie at the EOS
-        // boundary; the shorter stream didn't record that step's logits, so
-        // there's nothing to classify, and the long shared prefix already proves
-        // numerical equivalence. Benign either way (and never indexes *_steps,
-        // which would be out of bounds at min(len)).
-        if cpu_toks.len() == gpu_toks.len() {
-            eprintln!("  exact match across {} tokens", cpu_toks.len());
-        } else {
-            eprintln!(
-                "  match across {} shared tokens; benign EOS-timing length diff ({} vs {})",
-                cpu_toks.len().min(gpu_toks.len()),
-                cpu_toks.len(),
-                gpu_toks.len()
-            );
+    let Some(div) = ref_toks.iter().zip(&test_toks).position(|(a, b)| a != b) else {
+        let shared = ref_toks.len().min(test_toks.len());
+        if ref_toks.len() == test_toks.len() {
+            eprintln!("  exact match across {} tokens", ref_toks.len());
+            return Ok(());
         }
-        return Some(Ok(()));
+        // Unequal length with a matching shared prefix: one emitted EOS a step
+        // earlier. Benign ONLY when the shared prefix is long enough to prove
+        // numerical equivalence — otherwise a real bug that makes `test` emit a
+        // short-but-correct prefix then EOS prematurely would slip through. Hold
+        // it to the same MIN_MATCH_PREFIX bar as a positional divergence.
+        if shared >= MIN_MATCH_PREFIX {
+            eprintln!(
+                "  match across {shared} shared tokens; benign EOS-timing length diff ({} vs {})",
+                ref_toks.len(),
+                test_toks.len()
+            );
+            return Ok(());
+        }
+        return Err(format!(
+            "{label}: {test_name} and {ref_name} agree on only {shared} tokens before a length \
+             split ({} vs {}) — too short to be a benign EOS-timing near-tie (need ≥ \
+             {MIN_MATCH_PREFIX})\n    {ref_name}: {ref_toks:?}\n    {test_name}: {test_toks:?}",
+            ref_toks.len(),
+            test_toks.len()
+        ));
     };
-
-    // `div` is strictly less than the shorter stream's length, so indexing
-    // `*_steps[div]` below is in bounds. Classify the divergence: a benign
-    // near-tie (Q8 GPU/CPU accumulation noise tipping two nearly-equal logits)
-    // has a tiny CPU-pick-vs-GPU-pick logit gap on BOTH backends; a real bug
-    // makes one backend pick a token the other ranked far below — a large gap.
-    //
-    // Also require a meaningful exact-match prefix: a wrong rope/bias/scalar
-    // perturbs every step, so a genuine bug diverges at the very start. An early
-    // flip is failed even if its gap looks small — that early position is itself
-    // the bug signature, so a coincidentally-tied first token must not pass.
-    const TIE_REL_TOL: f64 = 0.02;
-    const MIN_MATCH_PREFIX: usize = 4;
     let gap_rel = |logits: &[f32], a: u32, b: u32| -> f64 {
         let la = logits[a as usize] as f64;
         let lb = logits[b as usize] as f64;
         let scale = la.abs().max(lb.abs()).max(1.0);
         (la - lb).abs() / scale
     };
-    let cpu_pick = cpu_toks[div];
-    let gpu_pick = gpu_toks[div];
-    let gap_cpu = gap_rel(&cpu_steps[div].logits, cpu_pick, gpu_pick);
-    let gap_gpu = gap_rel(&gpu_steps[div].logits, cpu_pick, gpu_pick);
+    let ref_pick = ref_toks[div];
+    let test_pick = test_toks[div];
+    let gap_ref = gap_rel(&ref_steps[div].logits, ref_pick, test_pick);
+    let gap_test = gap_rel(&test_steps[div].logits, ref_pick, test_pick);
     eprintln!(
-        "  diverge@{div}: cpu_pick={cpu_pick} gpu_pick={gpu_pick} \
-         gap_cpu={gap_cpu:.4} gap_gpu={gap_gpu:.4} (matched {div} tokens)"
+        "  diverge@{div}: {ref_name}_pick={ref_pick} {test_name}_pick={test_pick} \
+         gap_{ref_name}={gap_ref:.4} gap_{test_name}={gap_test:.4} (matched {div} tokens)"
     );
 
-    if div >= MIN_MATCH_PREFIX && gap_cpu < TIE_REL_TOL && gap_gpu < TIE_REL_TOL {
+    if div >= MIN_MATCH_PREFIX && gap_ref < TIE_REL_TOL && gap_test < TIE_REL_TOL {
         eprintln!("  near-tie flip at {div} (within Q8 noise) — not a bug");
-        Some(Ok(()))
+        Ok(())
     } else {
-        Some(Err(format!(
-            "{model_file}: GPU diverges at token {div} and it is NOT a benign near-tie \
-             (need div ≥ {MIN_MATCH_PREFIX} and gap < {TIE_REL_TOL}; got \
-             gap_cpu={gap_cpu:.4}, gap_gpu={gap_gpu:.4})\n    \
-             cpu: {cpu_toks:?}\n    gpu: {gpu_toks:?}"
-        )))
+        Err(format!(
+            "{label}: {test_name} diverges from {ref_name} at token {div} and it is NOT a \
+             benign near-tie (need div ≥ {MIN_MATCH_PREFIX} and gap < {TIE_REL_TOL}; got \
+             gap_{ref_name}={gap_ref:.4}, gap_{test_name}={gap_test:.4})\n    \
+             {ref_name}: {ref_toks:?}\n    {test_name}: {test_toks:?}"
+        ))
     }
+}
+
+/// GPU-internal differential: batched prefill vs the per-token decode loop on
+/// the SAME GPU model. Both run identical GEMM kernels, so they isolate the
+/// batched attention/rope/bias/scalar path from CPU↔GPU float noise — a wrong
+/// batched rope layout, dropped freq-factor, missing QKV bias, mis-sized
+/// decoupled head_dim, or unapplied Granite scalar diverges the streams.
+fn check_batched_vs_pertoken(
+    model_file: &str,
+    prompt: &str,
+    n_predict: usize,
+) -> Option<Result<(), String>> {
+    let mp = models_dir().join(model_file);
+    if !mp.exists() {
+        eprintln!("skipping {model_file}: not found at {}", mp.display());
+        return None;
+    }
+    eprintln!("=== batched-vs-pertoken: {model_file} ===");
+
+    let gguf = GgufFile::open(&mp).expect("open gguf");
+    let tokenizer = BpeTokenizer::from_gguf(&gguf).expect("tokenizer");
+    let eos = tokenizer.eos_token();
+    let mut tokens = Vec::new();
+    if let Some(bos) = tokenizer.bos_token() {
+        tokens.push(bos);
+    }
+    tokens.extend(tokenizer.encode(prompt));
+
+    let gpu = match load_model_gpu(GgufFile::open(&mp).expect("open gguf"), None, 8192) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("skipping {model_file}: GPU unavailable ({e})");
+            return None;
+        }
+    };
+
+    // Per-token first so its `forward` decode calls never collide with the
+    // batched run's prefix-cache insert (only `forward_prefill` writes it).
+    let pt_steps = greedy_decode(gpu.as_ref(), &tokens, n_predict, eos, Prefill::PerToken);
+    let batched_steps = greedy_decode(gpu.as_ref(), &tokens, n_predict, eos, Prefill::Batched);
+
+    eprintln!(
+        "  pertoken text: {:?}",
+        tokenizer.decode(&pt_steps.iter().map(|s| s.token).collect::<Vec<_>>())
+    );
+    eprintln!(
+        "  batched  text: {:?}",
+        tokenizer.decode(&batched_steps.iter().map(|s| s.token).collect::<Vec<_>>())
+    );
+
+    Some(classify_streams(
+        model_file,
+        "pertoken",
+        &pt_steps,
+        "batched",
+        &batched_steps,
+    ))
 }
 
 #[test]
@@ -199,29 +305,9 @@ fn gpu_transformer_matches_cpu() {
         return;
     }
 
-    // (file, prompt, n_predict). Short prompts keep greedy off near-ties.
-    let cases = [
-        (
-            "qwen2-0_5b-instruct-q8_0.gguf",
-            "The capital of France is",
-            24,
-        ),
-        ("Qwen3-0.6B-Q8_0.gguf", "The capital of France is", 24),
-        (
-            "Llama-3.2-1B-Instruct-Q8_0.gguf",
-            "The capital of France is",
-            24,
-        ),
-        (
-            "granite-3.1-2b-instruct-Q8_0.gguf",
-            "The capital of France is",
-            24,
-        ),
-    ];
-
     let mut failures = Vec::new();
     let mut ran = 0;
-    for (file, prompt, n) in cases {
+    for (file, prompt, n) in CASES {
         match check_parity(file, prompt, n) {
             None => {}
             Some(Ok(())) => ran += 1,
@@ -242,4 +328,65 @@ fn gpu_transformer_matches_cpu() {
         failures.join("\n")
     );
     eprintln!("GPU parity OK across {ran} model(s)");
+}
+
+/// (file, prompt, n_predict). One model per dense-transformer behavior:
+///   • qwen2  — NEOX rope + QKV bias
+///   • qwen3  — NEOX rope + QK-norm + decoupled head_dim
+///   • llama  — NORM rope + Llama-3 freq factors
+///   • granite — NORM rope + embedding/residual/attention/logit scalars
+const CASES: [(&str, &str, usize); 4] = [
+    (
+        "qwen2-0_5b-instruct-q8_0.gguf",
+        "The capital of France is",
+        24,
+    ),
+    ("Qwen3-0.6B-Q8_0.gguf", "The capital of France is", 24),
+    (
+        "Llama-3.2-1B-Instruct-Q8_0.gguf",
+        "The capital of France is",
+        24,
+    ),
+    (
+        "granite-3.1-2b-instruct-Q8_0.gguf",
+        "The capital of France is",
+        24,
+    ),
+];
+
+/// GPU batched prefill must match the GPU per-token decode loop for every dense
+/// transformer behavior. This is the primary correctness gate for the batched
+/// path: it compares two GPU runs (no CPU float noise), so any divergence is a
+/// real bug in the batched attention/rope/bias/scalar generalization.
+#[test]
+#[ignore] // run with --ignored + CERA_GPU_PARITY=1
+fn gpu_batched_prefill_matches_pertoken() {
+    if std::env::var("CERA_GPU_PARITY").as_deref() != Ok("1") {
+        eprintln!("skipping: CERA_GPU_PARITY=1 not set");
+        return;
+    }
+
+    let mut failures = Vec::new();
+    let mut ran = 0;
+    for (file, prompt, n) in CASES {
+        match check_batched_vs_pertoken(file, prompt, n) {
+            None => {}
+            Some(Ok(())) => ran += 1,
+            Some(Err(e)) => {
+                ran += 1;
+                failures.push(e);
+            }
+        }
+    }
+
+    if ran == 0 {
+        eprintln!("no models present / no GPU — nothing verified");
+        return;
+    }
+    assert!(
+        failures.is_empty(),
+        "batched-vs-pertoken failures:\n{}",
+        failures.join("\n")
+    );
+    eprintln!("batched-vs-pertoken OK across {ran} model(s)");
 }
