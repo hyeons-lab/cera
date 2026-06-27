@@ -1296,6 +1296,159 @@ fn test_qk_norm_rope_freq_factors() {
     assert_close("qk_norm_rope freq_factors K", &exp_k, &got_k, 1e-4);
 }
 
+/// NORM (interleaved-pair) reference for the forward `qk_norm_rope` kernel,
+/// mirroring `cera::backend::cpu::apply_rope_norm_to_head` — rotates adjacent
+/// pairs `(buf[2d], buf[2d+1])` instead of split halves. `freq_factors`
+/// (Llama-3) optionally divides each pair's angle.
+fn rope_norm_ref(
+    buf: &mut [f32],
+    pos: u32,
+    head_dim: usize,
+    freq_base: f32,
+    freq_factors: Option<&[f32]>,
+) {
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+    for d in 0..head_dim / 2 {
+        let mut theta = pos as f32 * theta_scale.powi(d as i32);
+        if let Some(ff) = freq_factors {
+            theta /= ff[d];
+        }
+        let (sin_a, cos_a) = theta.sin_cos();
+        let x0 = buf[2 * d];
+        let x1 = buf[2 * d + 1];
+        buf[2 * d] = x0 * cos_a - x1 * sin_a;
+        buf[2 * d + 1] = x0 * sin_a + x1 * cos_a;
+    }
+}
+
+/// Forward `qk_norm_rope` with `rope_type == 1` (NORM/interleaved), the layout
+/// LLaMA/Mistral/Granite use. The existing tests only cover `rope_type == 0`
+/// (NeoX); this exercises the interleaved-pair branch of `head_rope`.
+#[test]
+fn test_qk_norm_rope_norm() {
+    let Some(ctx) = setup() else { return };
+    let (n_heads, n_kv_heads, head_dim) = (2usize, 1usize, 8usize);
+    let pos = 6u32;
+    let freq_base = 500_000.0f32;
+    let q: Vec<f32> = (0..n_heads * head_dim)
+        .map(|i| (i as f32 * 0.07).sin())
+        .collect();
+    let k: Vec<f32> = (0..n_kv_heads * head_dim)
+        .map(|i| (i as f32 * 0.05).cos())
+        .collect();
+
+    let mut exp_q = q.clone();
+    for h in 0..n_heads {
+        rope_norm_ref(
+            &mut exp_q[h * head_dim..(h + 1) * head_dim],
+            pos,
+            head_dim,
+            freq_base,
+            None,
+        );
+    }
+    let mut exp_k = k.clone();
+    for h in 0..n_kv_heads {
+        rope_norm_ref(
+            &mut exp_k[h * head_dim..(h + 1) * head_dim],
+            pos,
+            head_dim,
+            freq_base,
+            None,
+        );
+    }
+
+    let (got_q, got_k) = run_qk_norm_rope(
+        &ctx,
+        &q,
+        &k,
+        pos,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        freq_base,
+        1, // NORM
+        None,
+    );
+    assert_close("qk_norm_rope NORM Q", &exp_q, &got_q, 1e-4);
+    assert_close("qk_norm_rope NORM K", &exp_k, &got_k, 1e-4);
+
+    // Guard: NORM must differ materially from the NeoX layout, so this test
+    // would catch a rope_type mis-wire that silently fell back to NeoX.
+    let mut neox_q = q.clone();
+    for h in 0..n_heads {
+        rope_neox_ref(
+            &mut neox_q[h * head_dim..(h + 1) * head_dim],
+            pos,
+            head_dim,
+            freq_base,
+            None,
+        );
+    }
+    let max_layout_diff = exp_q
+        .iter()
+        .zip(neox_q.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_layout_diff > 1e-2,
+        "NORM vs NeoX layouts should differ materially (got {max_layout_diff:.3e})"
+    );
+}
+
+/// Forward `qk_norm_rope` with NORM layout AND Llama-3 frequency factors — the
+/// exact combination Llama-3 dense models use (NORM rope + `rope_freqs.weight`).
+#[test]
+fn test_qk_norm_rope_norm_freq_factors() {
+    let Some(ctx) = setup() else { return };
+    let (n_heads, n_kv_heads, head_dim) = (2usize, 1usize, 8usize);
+    let pos = 9u32;
+    let freq_base = 500_000.0f32;
+    let ff: Vec<f32> = (0..head_dim / 2).map(|d| 1.0 + d as f32 * 0.5).collect();
+    let q: Vec<f32> = (0..n_heads * head_dim)
+        .map(|i| (i as f32 * 0.11).sin())
+        .collect();
+    let k: Vec<f32> = (0..n_kv_heads * head_dim)
+        .map(|i| (i as f32 * 0.09).cos())
+        .collect();
+
+    let mut exp_q = q.clone();
+    for h in 0..n_heads {
+        rope_norm_ref(
+            &mut exp_q[h * head_dim..(h + 1) * head_dim],
+            pos,
+            head_dim,
+            freq_base,
+            Some(&ff),
+        );
+    }
+    let mut exp_k = k.clone();
+    for h in 0..n_kv_heads {
+        rope_norm_ref(
+            &mut exp_k[h * head_dim..(h + 1) * head_dim],
+            pos,
+            head_dim,
+            freq_base,
+            Some(&ff),
+        );
+    }
+
+    let (got_q, got_k) = run_qk_norm_rope(
+        &ctx,
+        &q,
+        &k,
+        pos,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        freq_base,
+        1, // NORM
+        Some(&ff),
+    );
+    assert_close("qk_norm_rope NORM+ff Q", &exp_q, &got_q, 1e-4);
+    assert_close("qk_norm_rope NORM+ff K", &exp_k, &got_k, 1e-4);
+}
+
 // ── kv_shift_k_to_scratch: NeoX + NORM RoPE delta parity ────────────────────
 
 /// Read f16 elements from a shared GPU buffer back as f32 (unified memory).

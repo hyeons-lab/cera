@@ -1572,7 +1572,9 @@ impl MetalLfm2Model {
     }
 
     /// Granite scaled residual add: `a[i] += scale * b[i]` over `n` elements.
-    /// `scale == 1.0` ⇒ a plain residual add (every other arch).
+    /// `scale == 1.0` (every arch but Granite) takes the plain `add_inplace`
+    /// kernel — no per-element multiply, and byte-identical to the pre-Granite
+    /// residual add.
     fn encode_scaled_add_inplace(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -1581,10 +1583,14 @@ impl MetalLfm2Model {
         n: u32,
         scale: f32,
     ) {
-        enc.set_compute_pipeline_state(&self.pipelines.scaled_add_inplace);
+        let (pipeline, params) = if scale == 1.0 {
+            (&self.pipelines.add_inplace, [n, 0u32])
+        } else {
+            (&self.pipelines.scaled_add_inplace, [n, scale.to_bits()])
+        };
+        enc.set_compute_pipeline_state(pipeline);
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
-        let params: [u32; 2] = [n, scale.to_bits()];
         enc.set_bytes(
             2,
             std::mem::size_of_val(&params) as u64,
