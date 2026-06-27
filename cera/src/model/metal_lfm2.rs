@@ -490,6 +490,19 @@ impl MetalLfm2Model {
             Some(wref) => (Some(wref.start as u64), wref.dtype),
             None => (None, embedding_dtype),
         };
+        // `encode_gemv_output` only has Q6_K / Q8_0 / F32 logit-GEMV kernels; its
+        // fallback arm runs `gemv_f32`, so any other dtype (F16, Q4_0, …) would be
+        // silently reinterpreted as f32 and produce garbage logits. Reject it at
+        // load time rather than at the first decode. `output_dtype` is the
+        // effective projection dtype for both the untied (`output.weight`) and
+        // tied (embedding) cases — note the per-row embedding *lookup*
+        // (`dequant_embedding_row`) supports more dtypes than this *projection*.
+        anyhow::ensure!(
+            matches!(output_dtype, DType::F32 | DType::Q6K | DType::Q8_0),
+            "Metal backend has no logit-projection GEMV kernel for output dtype \
+             {output_dtype:?} (token_embd.weight / output.weight); only F32, Q6_K, \
+             and Q8_0 are supported",
+        );
 
         // output_norm is small (hs f32 = 4KB) — still copy since it's not in the mmap
         // tensor data region in a usable format (f32 vs mmap'd bytes).
@@ -1509,8 +1522,7 @@ impl MetalLfm2Model {
                 enc.set_buffer(3, Some(&self.params.gemv_output), 0);
                 enc.dispatch_thread_groups(grid, sz1d(32));
             }
-            _ => {
-                // Fallback: use f32 GEMV.
+            DType::F32 => {
                 let grid = sz2d(m.min(65535) as u64, m.div_ceil(65535) as u64);
                 enc.set_compute_pipeline_state(&self.pipelines.gemv_f32);
                 enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
@@ -1519,6 +1531,14 @@ impl MetalLfm2Model {
                 enc.set_buffer(3, Some(&self.params.gemv_output), 0);
                 enc.dispatch_thread_groups(grid, sz1d(32));
             }
+            // Unreachable: `from_weight_source` rejects any other output dtype at
+            // load (only F32/Q6_K/Q8_0 have a logit-GEMV kernel). Panic loudly
+            // rather than silently misreading quantized bytes as f32 if that guard
+            // ever regresses.
+            other => unreachable!(
+                "encode_gemv_output reached with unsupported dtype {other:?} — \
+                 should have been rejected at load by from_weight_source"
+            ),
         }
 
         // Granite logit-scale divide: multiply logits by 1/logit_scale. Identity
