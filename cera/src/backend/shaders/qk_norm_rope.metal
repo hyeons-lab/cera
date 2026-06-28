@@ -18,6 +18,8 @@ struct Params {
     uint eps_bits;
     uint freq_base_bits;
     uint rope_type; // 0 = NeoX (pairs at [i, i+half]), 1 = interleaved (pairs at [2i, 2i+1])
+    uint has_freq_factors; // 1 ⇒ divide each pair's angle by freq_factors[d] (Llama-3)
+    uint has_qk_norm;      // 1 ⇒ per-head RMSnorm (Qwen3/LFM2); 0 ⇒ rope-only (LLaMA/Qwen2)
 };
 
 inline void head_rmsnorm(
@@ -66,7 +68,9 @@ inline void head_rope(
     uint head_dim,
     uint pos,
     float freq_base,
-    uint rope_type
+    uint rope_type,
+    const device float* freq_factors, // [head_dim/2], valid only if has_freq_factors
+    uint has_freq_factors
 ) {
     uint half_dim = head_dim / 2u;
     // theta[d] = pos * freq_base^(-2d/head_dim). Compute with powr for O(1)
@@ -74,6 +78,11 @@ inline void head_rope(
     float theta_scale = powr(freq_base, -2.0f / float(head_dim));
     for (uint d = tid; d < half_dim; d += 256u) {
         float theta = float(pos) * powr(theta_scale, float(d));
+        // Llama-3 long-context RoPE scaling: divide the per-pair angle by the
+        // precomputed frequency factor (mirrors rope.metal / the wgpu path).
+        if (has_freq_factors != 0u) {
+            theta = theta / freq_factors[d];
+        }
         float cos_a = cos(theta);
         float sin_a = sin(theta);
         if (rope_type == 0u) {
@@ -98,6 +107,7 @@ kernel void qk_norm_rope(
     const device float* q_norm_w [[buffer(2)]],
     const device float* k_norm_w [[buffer(3)]],
     constant Params& params [[buffer(4)]],
+    const device float* freq_factors [[buffer(5)]],
     uint tid [[thread_position_in_threadgroup]],
     uint head [[threadgroup_position_in_grid]]
 ) {
@@ -116,17 +126,27 @@ kernel void qk_norm_rope(
     // remaining n_kv_heads handle K heads. Gives every TG equal work (no
     // load imbalance from doing 2× work in the first few TGs).
     uint rope_type = params.rope_type;
+    uint has_ff = params.has_freq_factors;
+    // QK-norm is optional: LFM2/Qwen3 have per-head Q/K norm weights, but
+    // LLaMA/Qwen2/Mistral/Granite do not — those run rope-only. `has_qk_norm`
+    // is uniform across the dispatch so the branch keeps the rmsnorm barriers
+    // uniform.
+    uint has_qk_norm = params.has_qk_norm;
 
     if (head < n_heads) {
         device float* q_head = q + head * head_dim;
-        head_rmsnorm(q_head, q_norm_w, scratch, tid, head_dim, eps);
-        head_rope(q_head, tid, head_dim, pos, freq_base, rope_type);
+        if (has_qk_norm != 0u) {
+            head_rmsnorm(q_head, q_norm_w, scratch, tid, head_dim, eps);
+        }
+        head_rope(q_head, tid, head_dim, pos, freq_base, rope_type, freq_factors, has_ff);
     } else {
         uint kh = head - n_heads;
         if (kh < n_kv_heads) {
             device float* k_head = k_cache + kh * head_dim;
-            head_rmsnorm(k_head, k_norm_w, scratch, tid, head_dim, eps);
-            head_rope(k_head, tid, head_dim, pos, freq_base, rope_type);
+            if (has_qk_norm != 0u) {
+                head_rmsnorm(k_head, k_norm_w, scratch, tid, head_dim, eps);
+            }
+            head_rope(k_head, tid, head_dim, pos, freq_base, rope_type, freq_factors, has_ff);
         }
     }
 }

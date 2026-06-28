@@ -70,3 +70,31 @@ kernel void silu_mul_inplace(
     float g = a[gid];
     a[gid] = (g / (1.0f + exp(-g))) * b[gid];
 }
+
+// Params carrying a scalar multiplier (raw f32 bits) for the Granite-style
+// scaled residual add and logit scaling. Identity (scale = 1.0) for every
+// other arch.
+struct ScaleParams { uint n; uint scale_bits; };
+
+// In-place scaled add: a[i] += scale * b[i]. Used for the decode-path residual
+// adds when residual_multiplier != 1.0 (Granite).
+kernel void scaled_add_inplace(
+    device float* a [[buffer(0)]],
+    const device float* b [[buffer(1)]],
+    constant ScaleParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.n) return;
+    a[gid] = a[gid] + as_type<float>(params.scale_bits) * b[gid];
+}
+
+// In-place scale: a[i] *= scale. Used to divide final logits by Granite's
+// logit scaling factor (caller passes 1/logit_scale).
+kernel void scale_f32(
+    device float* a [[buffer(0)]],
+    constant ScaleParams& params [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.n) return;
+    a[gid] = a[gid] * as_type<float>(params.scale_bits);
+}

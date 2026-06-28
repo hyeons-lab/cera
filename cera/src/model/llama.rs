@@ -533,7 +533,7 @@ impl Model for LlamaModel {
 // it uploads LFM2. Every layer is attention (no conv refs); QK-norm / QKV-bias
 // / untied-output / Llama-3 freq-factors are surfaced per-arch via the `Option`
 // accessors. Granite scalars ride on `config().scalars`.
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", all(feature = "metal", target_os = "macos")))]
 impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
     fn config(&self) -> &ModelConfig {
         &self.config
