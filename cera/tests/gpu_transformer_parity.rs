@@ -486,6 +486,19 @@ fn check_metal_profiled_prefill(model_file: &str, prompt: &str) -> Option<Result
              (max_logit_delta={max_delta:.4e})"
         )));
     }
+    // Argmax stability alone is too weak to back the "bit-faithful to production"
+    // claim: a stride/bias/residual wiring drift could shift logits without
+    // flipping the greedy token. The two paths run identical kernels on the same
+    // GPU over the same inputs, so the delta is deterministically ~0; assert a
+    // tight bound so any real drift fails the gate instead of slipping through.
+    const MAX_LOGIT_DELTA: f32 = 1e-3;
+    if max_delta > MAX_LOGIT_DELTA {
+        return Some(Err(format!(
+            "{model_file}: profiled prefill logits drifted from production \
+             (max_logit_delta={max_delta:.4e} > {MAX_LOGIT_DELTA:.0e}) despite matching \
+             greedy token {prod_tok}"
+        )));
+    }
     Some(Ok(()))
 }
 
