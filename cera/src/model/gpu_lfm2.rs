@@ -691,10 +691,12 @@ impl GpuLfm2Model {
         let q_buf = f(q_dim, "q");
         let k_buf = f(max_kv_dim, "k");
         let v_buf = f(max_kv_dim, "v");
-        // KV-shift scratch: one retained K/V layer slab. Sized to the worst case
-        // (`max_seq_len × max_kv_dim`); `.max(1)` guards the degenerate
-        // attention-free config so `create_storage_rw` never gets a 0-byte size.
-        let kv_shift_scratch = f((max_seq_len * max_kv_dim).max(1), "kv_shift_scratch");
+        // KV-shift scratch: one retained K/V layer slab, sized to the worst case
+        // (`max_seq_len × max_kv_dim`). No `.max(1)` guard — `k_buf`/`v_buf` above
+        // already allocate `max_kv_dim` floats, so an attention-free
+        // (`max_kv_dim == 0`) config would fail there first; LFM2 always has
+        // attention layers, so `max_kv_dim` is never 0 in practice anyway.
+        let kv_shift_scratch = f(max_seq_len * max_kv_dim, "kv_shift_scratch");
         let attn_out_buf = f(q_dim, "attn_out");
         let logits_buf = f(config.vocab_size, "logits");
         let scores_buf = f(config.n_heads * max_seq_len, "scores");
@@ -1431,17 +1433,16 @@ impl GpuLfm2Model {
                     ],
                 });
             // One thread per (retained cell, kv head, RoPE pair). The grid is
-            // 2-D-flattened (`wg.min(65535), wg.div_ceil(65535)`) because the
-            // retained context can push the workgroup count past the 65535
-            // per-dimension limit; the kernel recovers the flat index via
-            // `get_wid`. `encode` adds the GPU profiling span + debug label.
-            let total = (retained * n_kv_heads * (head_dim / 2)) as u32;
-            let wg = total.div_ceil(256);
+            // 2-D-flattened via `dispatch_dims` (shared with the oracle test and
+            // unit-tested in `backend::wgpu`) because the retained context can
+            // push the workgroup count past the 65535 per-dimension limit; the
+            // kernel recovers the flat index via `get_wid`. `encode` adds the GPU
+            // profiling span + debug label.
             self.encode(
                 &mut enc,
                 &self.pipelines.kv_shift,
                 &bg,
-                (wg.min(65535), wg.div_ceil(65535), 1),
+                params.dispatch_dims(),
                 "kv_shift",
             );
             // Copy rotated K back into the cache at the new n_keep-aligned offset.
@@ -3690,6 +3691,17 @@ impl Model for GpuLfm2Model {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         assert!(shift > 0, "shift must be > 0");
         let cur_len = self.gpu_state.seq_len.load(Ordering::Relaxed);
+        // This bounds check (and the caller's `Session::can_shift` gate) authorize
+        // the shift off counters that are equal only by the maintained
+        // `gpu_state.seq_len == state.seq_len == current_pos` invariant. Assert the
+        // two mirrors agree HERE so a future path that desyncs them trips loudly at
+        // the source, instead of silently computing `new_seq_len` from the wrong
+        // base or panicking on the bounds assert below with a confusing message.
+        debug_assert_eq!(
+            state.seq_len, cur_len,
+            "seq_len mirrors out of sync: state.seq_len={} gpu_state.seq_len={cur_len}",
+            state.seq_len,
+        );
         assert!(
             n_keep + shift <= cur_len,
             "shift range out of bounds: n_keep={n_keep} + shift={shift} > seq_len={cur_len}",

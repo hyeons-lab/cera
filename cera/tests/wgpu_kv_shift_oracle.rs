@@ -38,12 +38,15 @@
 use cera::backend::cpu::{apply_rope_norm_to_head, apply_rope_to_head};
 use cera::backend::wgpu::{GpuContext, KvShiftParams, shaders};
 
-// Dimensions are chosen so the dispatch spans MORE THAN ONE workgroup:
-// `total = RETAINED * N_KV_HEADS * (HEAD_DIM/2) = 19 * 2 * 8 = 304 > 256`, so
-// `dispatch_workgroups` rounds up to 2 groups. That exercises the kernel's
-// cross-workgroup `get_wid` index recovery and the 2-D grid sizing — a single
-// dispatch (total <= 256) would leave both untested and hide the per-dimension
-// workgroup-count handling.
+// Dimensions are chosen so the dispatch spans MORE THAN ONE workgroup in X:
+// `total = RETAINED * N_KV_HEADS * (HEAD_DIM/2) = 19 * 2 * 8 = 304 > 256`, so the
+// grid rounds up to 2 workgroups → `(2, 1, 1)`. That exercises the kernel's
+// cross-workgroup `get_wid` index recovery along X (`wid.x == 1` does real work).
+// It does NOT exercise the Y spill (`wid.y > 0`), which only occurs once the
+// workgroup count exceeds MAX_WG (65535) — a ~16.7M-thread dispatch no unit test
+// can afford to allocate a buffer for. The host-side grid sizing for that Y-spill
+// path (the exact logic the 2-D flatten added) is covered directly, without a
+// GPU, by the `kv_shift_workgroups` unit tests in `backend::wgpu`.
 const N_KV_HEADS: usize = 2;
 const HEAD_DIM: usize = 16;
 const SEQ_LEN: usize = 24;
@@ -139,11 +142,11 @@ fn run_kv_shift(
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bg, &[]);
-        // 2-D grid mirroring production (`encode_kv_shift_layers`): keeps the
-        // workgroup count within the 65535 per-dimension limit.
-        let total = (RETAINED * N_KV_HEADS * (HEAD_DIM / 2)) as u32;
-        let wg = total.div_ceil(256);
-        pass.dispatch_workgroups(wg.min(65535), wg.div_ceil(65535), 1);
+        // 2-D grid via the shared `dispatch_dims` helper — identical to
+        // production (`encode_kv_shift_layers`) so the test drives the kernel
+        // exactly as the engine does, and the grid-sizing logic lives in one place.
+        let (gx, gy, gz) = params.dispatch_dims();
+        pass.dispatch_workgroups(gx, gy, gz);
     }
     ctx.queue.submit(Some(enc.finish()));
     ctx.download_f32(&scratch, RETAINED * KV_DIM)
@@ -175,10 +178,28 @@ fn assert_matches_oracle(scratch: &[f32], oracle: impl Fn(&mut [f32], usize)) {
     eprintln!("max abs diff = {max_diff:.3e} (tol = {TOL:.0e})");
 }
 
+/// Acquire a GPU context, or signal skip. When `CERA_REQUIRE_GPU` is set (the CI
+/// lavapipe job sets it), a missing adapter is a hard FAILURE rather than a
+/// silent green skip — mirrors the `CERA_REQUIRE_SIMD` gate so a CI job that is
+/// supposed to run the kernel cannot pass by skipping it.
+fn gpu_ctx_or_skip() -> Option<GpuContext> {
+    match GpuContext::new() {
+        Ok(ctx) => Some(ctx),
+        Err(e) => {
+            let required = std::env::var("CERA_REQUIRE_GPU").unwrap_or_default();
+            assert!(
+                required.is_empty(),
+                "CERA_REQUIRE_GPU is set but no GPU adapter is available: {e}"
+            );
+            eprintln!("skipping: no GPU adapter ({e})");
+            None
+        }
+    }
+}
+
 #[test]
 fn kv_shift_neox_matches_cpu_rope_oracle() {
-    let Ok(ctx) = GpuContext::new() else {
-        eprintln!("skipping: no GPU adapter");
+    let Some(ctx) = gpu_ctx_or_skip() else {
         return;
     };
     let scratch = run_kv_shift(&ctx, 0, None, |head, t| {
@@ -191,8 +212,7 @@ fn kv_shift_neox_matches_cpu_rope_oracle() {
 
 #[test]
 fn kv_shift_norm_matches_cpu_rope_oracle() {
-    let Ok(ctx) = GpuContext::new() else {
-        eprintln!("skipping: no GPU adapter");
+    let Some(ctx) = gpu_ctx_or_skip() else {
         return;
     };
     let scratch = run_kv_shift(&ctx, 1, None, |head, t| {
@@ -205,8 +225,7 @@ fn kv_shift_norm_matches_cpu_rope_oracle() {
 
 #[test]
 fn kv_shift_norm_freq_factors_matches_cpu_rope_oracle() {
-    let Ok(ctx) = GpuContext::new() else {
-        eprintln!("skipping: no GPU adapter");
+    let Some(ctx) = gpu_ctx_or_skip() else {
         return;
     };
     // Llama-3-style per-pair frequency factors (head_dim/2 = 8 values).

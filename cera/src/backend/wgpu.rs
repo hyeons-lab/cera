@@ -733,14 +733,34 @@ pub mod shaders {
     pub const VIT_ATTENTION_TILED: &str = include_str!("shaders/vit_attention_tiled.wgsl");
 }
 
-/// Typed parameters for the `kv_shift` WGSL kernel (`shaders/kv_shift.wgsl`).
+/// Maximum workgroups per grid dimension. Mirrors `MAX_WG` in
+/// `shaders/common_decls.tmpl` — the two MUST stay equal: the kernel's `get_wid`
+/// recovers the flat workgroup index as `wid.x + wid.y * MAX_WG`, which only
+/// tiles correctly when the host pins the X extent to exactly this value once
+/// the grid spills into Y. 65535 is the WebGPU `maxComputeWorkgroupsPerDimension`
+/// floor (D3D12 / many Vulkan drivers).
+pub const MAX_WG: u32 = 65535;
+
+/// Flatten a 256-thread-per-workgroup dispatch of `total_threads` into a grid
+/// that respects the [`MAX_WG`] per-dimension cap. Returns `(x, y, 1)` with the
+/// X extent pinned to exactly `MAX_WG` whenever the count spills into Y, so the
+/// kernel's `get_wid = wid.x + wid.y * MAX_WG` recovers a gap-free, overlap-free
+/// linear index over `[0, ceil(total_threads / 256))`. Shared by the production
+/// `kv_shift` dispatch and the `wgpu_kv_shift_oracle` test so the two can't drift.
+pub fn kv_shift_workgroups(total_threads: u32) -> (u32, u32, u32) {
+    let wg = total_threads.div_ceil(256);
+    (wg.min(MAX_WG), wg.div_ceil(MAX_WG), 1)
+}
+
+/// Typed parameters for the wgpu `kv_shift` WGSL kernel (`shaders/kv_shift.wgsl`).
 ///
 /// Marshalled to an 8-element `array<u32>` storage buffer via
-/// [`Self::to_u32_array`]. Named fields are the single source of truth for the
-/// kernel's positional `params[i]` reads — keep this struct, the kernel's
+/// [`Self::to_u32_array`]. Named fields are the single source of truth for *this
+/// (wgpu) kernel's* positional `params[i]` reads — keep this struct, the kernel's
 /// `params` unpacking, and the kernel's header comment in lockstep. Used by both
 /// the production shift (`GpuLfm2Model::encode_kv_shift_layers`) and the
-/// `wgpu_kv_shift_oracle` test so the layout cannot drift between them.
+/// `wgpu_kv_shift_oracle` test so the wgpu layout cannot drift between them. (The
+/// Metal backend has its own `KParams`; this is only the wgpu-side definition.)
 #[derive(Copy, Clone)]
 pub struct KvShiftParams {
     /// Cells `[0, n_keep)` are kept verbatim; the shift drops `[n_keep, n_keep+shift)`.
@@ -775,6 +795,18 @@ impl KvShiftParams {
             self.has_freq_factors,
         ]
     }
+
+    /// One kernel thread per (retained cell, KV head, RoPE pair) — matches the
+    /// kernel's `total = retained * n_kv_heads * (head_dim / 2)`.
+    pub fn total_threads(self) -> u32 {
+        self.retained * self.n_kv_heads * (self.head_dim / 2)
+    }
+
+    /// 2-D-flattened workgroup grid for dispatching the `kv_shift` kernel over
+    /// [`Self::total_threads`]; see [`kv_shift_workgroups`].
+    pub fn dispatch_dims(self) -> (u32, u32, u32) {
+        kv_shift_workgroups(self.total_threads())
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -782,6 +814,77 @@ impl KvShiftParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kv_shift_workgroups_recovers_flat_index_bijectively() {
+        // The kernel recovers its flat workgroup index as `wid.x + wid.y*MAX_WG`.
+        // Verify the host grid sizing makes that a gap-free, overlap-free cover
+        // of `[0, ceil(total/256))` — INCLUDING totals large enough to spill into
+        // Y (`wid.y > 0`), the exact path the 2-D flatten fix added and the one
+        // the GPU oracle can't afford to allocate a buffer for. Runs on CPU.
+        let totals = [
+            1u32,
+            255,
+            256,
+            257,
+            304,                    // the oracle's total → grid (2,1,1), Y == 1
+            MAX_WG * 256,           // exactly MAX_WG workgroups, still Y == 1
+            MAX_WG * 256 + 1,       // first total that spills into Y
+            (MAX_WG + 7) * 256,     // small Y spill, non-multiple of MAX_WG
+            3 * MAX_WG * 256 - 100, // ~3 rows in Y
+        ];
+        for &total in &totals {
+            let wg = total.div_ceil(256);
+            let (gx, gy, gz) = kv_shift_workgroups(total);
+            assert_eq!(gz, 1, "z extent is always 1 (total={total})");
+            // The invariant the kernel relies on: once the grid spills into Y,
+            // X must be exactly MAX_WG or `get_wid`'s stride mis-tiles.
+            if gy > 1 {
+                assert_eq!(
+                    gx, MAX_WG,
+                    "X must be pinned to MAX_WG when Y>1 (total={total})"
+                );
+            }
+            assert!(
+                (gx as u64) * (gy as u64) >= wg as u64,
+                "grid {gx}x{gy} under-covers wg={wg} (total={total})",
+            );
+            // Every needed flat index in [0, wg) maps to a workgroup the grid
+            // actually dispatches, and flat->(x,y)->flat round-trips. O(wg).
+            for fw in 0..wg {
+                let x = fw % MAX_WG;
+                let y = fw / MAX_WG;
+                assert!(
+                    x < gx && y < gy,
+                    "flat {fw} maps to ({x},{y}) outside grid {gx}x{gy} (total={total})",
+                );
+                assert_eq!(
+                    x + y * MAX_WG,
+                    fw,
+                    "get_wid recovery is not the inverse (total={total})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kv_shift_params_dispatch_dims_match_total_threads() {
+        // Pin `total_threads` to the kernel's per-thread granularity and confirm
+        // the typed params route through the shared `kv_shift_workgroups` helper.
+        let p = KvShiftParams {
+            n_keep: 2,
+            shift: 3,
+            retained: 19,
+            n_kv_heads: 2,
+            head_dim: 16,
+            freq_base_bits: 10_000.0f32.to_bits(),
+            rope_type: 0,
+            has_freq_factors: 0,
+        };
+        assert_eq!(p.total_threads(), 19 * 2 * (16 / 2)); // 304
+        assert_eq!(p.dispatch_dims(), kv_shift_workgroups(p.total_threads()));
+        assert_eq!(p.dispatch_dims(), (2, 1, 1));
+    }
 
     #[test]
     fn test_gpu_context_init() {

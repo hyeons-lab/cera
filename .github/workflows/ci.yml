@@ -69,6 +69,34 @@ jobs:
           CERA_REQUIRE_SIMD: i8mm
         run: cargo test -p cera --lib -- cpu_features fallback_tests
 
+  # Run the wgpu compute kernels on CPU via Mesa's lavapipe (software Vulkan).
+  # The `gpu` feature is non-default, so the regular `test` job never compiles
+  # these — this is the only place the WGSL kernels (the KV-shift oracle, etc.)
+  # and the `backend::wgpu` host-side unit tests actually execute. `CERA_REQUIRE_GPU`
+  # turns a missing adapter into a failure (mirrors `CERA_REQUIRE_SIMD`), so a
+  # green check proves the kernels ran rather than silently skipping.
+  gpu-tests:
+    name: GPU tests (lavapipe)
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CERA_REQUIRE_GPU: 1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Mesa lavapipe (software Vulkan)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+      - name: Show Vulkan adapter
+        run: vulkaninfo --summary || true
+      - name: Run wgpu kernel + host-logic tests
+        run: cargo test -p cera --features gpu --lib --test wgpu_kv_shift_oracle
+
   build-release:
     name: Release Build
     needs: check
@@ -111,8 +139,8 @@ jobs:
           - "--no-default-features --features parallel,std-fs,disk-cache"
           - "--no-default-features --features mmap"
           # WebGPU backend (Track B PR 4.2) — the async wgpu host layer +
-          # browser LFM2 session must keep compiling on wasm32. Runtime is
-          # covered by the headless smoke test (not in CI; needs a GPU).
+          # browser LFM2 session must keep compiling on wasm32. Native runtime
+          # (WGSL kernels) is covered by the `gpu-tests` job above via lavapipe.
           - "--no-default-features --features gpu"
     steps:
       - uses: actions/checkout@v6
