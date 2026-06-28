@@ -733,6 +733,50 @@ pub mod shaders {
     pub const VIT_ATTENTION_TILED: &str = include_str!("shaders/vit_attention_tiled.wgsl");
 }
 
+/// Typed parameters for the `kv_shift` WGSL kernel (`shaders/kv_shift.wgsl`).
+///
+/// Marshalled to an 8-element `array<u32>` storage buffer via
+/// [`Self::to_u32_array`]. Named fields are the single source of truth for the
+/// kernel's positional `params[i]` reads — keep this struct, the kernel's
+/// `params` unpacking, and the kernel's header comment in lockstep. Used by both
+/// the production shift (`GpuLfm2Model::encode_kv_shift_layers`) and the
+/// `wgpu_kv_shift_oracle` test so the layout cannot drift between them.
+#[derive(Copy, Clone)]
+pub struct KvShiftParams {
+    /// Cells `[0, n_keep)` are kept verbatim; the shift drops `[n_keep, n_keep+shift)`.
+    pub n_keep: u32,
+    /// Number of cells dropped; the RoPE delta applied to retained K is `-shift`.
+    pub shift: u32,
+    /// `new_seq_len - n_keep` — count of retained (re-rotated) cells.
+    pub retained: u32,
+    /// KV heads in this layer (GQA-aware; can differ per layer).
+    pub n_kv_heads: u32,
+    /// Per-head dimension (RoPE pairs span `head_dim/2`).
+    pub head_dim: u32,
+    /// `rope_theta.to_bits()` — the RoPE frequency base, as f32 bits.
+    pub freq_base_bits: u32,
+    /// RoPE pair layout: 0 = NeoX (split-halves), 1 = NORM (interleaved).
+    pub rope_type: u32,
+    /// 1 when `freq_factors` holds real Llama-3 factors, 0 for the dummy buffer.
+    pub has_freq_factors: u32,
+}
+
+impl KvShiftParams {
+    /// Flatten to the `array<u32, 8>` layout the kernel reads positionally.
+    pub fn to_u32_array(self) -> [u32; 8] {
+        [
+            self.n_keep,
+            self.shift,
+            self.retained,
+            self.n_kv_heads,
+            self.head_dim,
+            self.freq_base_bits,
+            self.rope_type,
+            self.has_freq_factors,
+        ]
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

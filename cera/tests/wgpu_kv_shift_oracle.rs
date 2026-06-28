@@ -36,11 +36,17 @@
 #![cfg(feature = "gpu")]
 
 use cera::backend::cpu::{apply_rope_norm_to_head, apply_rope_to_head};
-use cera::backend::wgpu::{GpuContext, shaders};
+use cera::backend::wgpu::{GpuContext, KvShiftParams, shaders};
 
+// Dimensions are chosen so the dispatch spans MORE THAN ONE workgroup:
+// `total = RETAINED * N_KV_HEADS * (HEAD_DIM/2) = 19 * 2 * 8 = 304 > 256`, so
+// `dispatch_workgroups` rounds up to 2 groups. That exercises the kernel's
+// cross-workgroup `get_wid` index recovery and the 2-D grid sizing — a single
+// dispatch (total <= 256) would leave both untested and hide the per-dimension
+// workgroup-count handling.
 const N_KV_HEADS: usize = 2;
-const HEAD_DIM: usize = 8;
-const SEQ_LEN: usize = 8;
+const HEAD_DIM: usize = 16;
+const SEQ_LEN: usize = 24;
 const N_KEEP: usize = 2;
 const SHIFT: usize = 3;
 const KV_DIM: usize = N_KV_HEADS * HEAD_DIM;
@@ -48,6 +54,16 @@ const NEW_SEQ_LEN: usize = SEQ_LEN - SHIFT;
 const RETAINED: usize = NEW_SEQ_LEN - N_KEEP;
 const FREQ_BASE: f32 = 10_000.0;
 const TOL: f32 = 5e-5;
+
+/// Per-head initial K vector. The `+ h*0.5` term makes every KV head hold
+/// DISTINCT data, so a kernel regression in the read-side head offset
+/// (`head_off = h*head_dim`) is observable — with identical per-head data a
+/// dropped/wrong `h` would still read correct values and pass silently.
+fn head_initial(h: usize) -> Vec<f32> {
+    (0..HEAD_DIM)
+        .map(|i| (i as f32 + 1.0) * 0.1 + h as f32 * 0.5)
+        .collect()
+}
 
 /// Run the `kv_shift` kernel over a synthetic, RoPE'd K cache and return the
 /// retained-region scratch contents (`RETAINED × KV_DIM` floats). `rope_type`
@@ -60,12 +76,12 @@ fn run_kv_shift(
     populate: impl Fn(&mut [f32], usize),
 ) -> Vec<f32> {
     // Build the K cache: cell at absolute position `t` holds the forward-RoPE'd
-    // head for that position.
+    // head for that position. Each head starts from distinct data (see
+    // `head_initial`) so head addressing is actually under test.
     let mut k_cache = vec![0.0f32; SEQ_LEN * KV_DIM];
-    let initial: Vec<f32> = (0..HEAD_DIM).map(|i| (i as f32 + 1.0) * 0.1).collect();
     for t in 0..SEQ_LEN {
         for h in 0..N_KV_HEADS {
-            let mut rotated = initial.clone();
+            let mut rotated = head_initial(h);
             populate(&mut rotated, t);
             let off = t * KV_DIM + h * HEAD_DIM;
             k_cache[off..off + HEAD_DIM].copy_from_slice(&rotated);
@@ -77,18 +93,17 @@ fn run_kv_shift(
     let ff = freq_factors.unwrap_or(&[1.0]);
     let ff_buf = ctx.upload_f32(ff, "freq_factors");
 
-    let params: [u32; 9] = [
-        N_KEEP as u32,
-        SHIFT as u32,
-        NEW_SEQ_LEN as u32,
-        N_KV_HEADS as u32,
-        HEAD_DIM as u32,
-        FREQ_BASE.to_bits(),
-        (-(SHIFT as i32)) as u32,
+    let params = KvShiftParams {
+        n_keep: N_KEEP as u32,
+        shift: SHIFT as u32,
+        retained: RETAINED as u32,
+        n_kv_heads: N_KV_HEADS as u32,
+        head_dim: HEAD_DIM as u32,
+        freq_base_bits: FREQ_BASE.to_bits(),
         rope_type,
-        u32::from(freq_factors.is_some()),
-    ];
-    let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+        has_freq_factors: u32::from(freq_factors.is_some()),
+    };
+    let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params.to_u32_array()), "params");
 
     let pipeline = ctx.create_pipeline(shaders::KV_SHIFT, "kv_shift", "kv_shift");
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -124,8 +139,11 @@ fn run_kv_shift(
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bg, &[]);
+        // 2-D grid mirroring production (`encode_kv_shift_layers`): keeps the
+        // workgroup count within the 65535 per-dimension limit.
         let total = (RETAINED * N_KV_HEADS * (HEAD_DIM / 2)) as u32;
-        pass.dispatch_workgroups(total.div_ceil(256), 1, 1);
+        let wg = total.div_ceil(256);
+        pass.dispatch_workgroups(wg.min(65535), wg.div_ceil(65535), 1);
     }
     ctx.queue.submit(Some(enc.finish()));
     ctx.download_f32(&scratch, RETAINED * KV_DIM)
@@ -133,12 +151,11 @@ fn run_kv_shift(
 
 /// Assert each retained cell matches a fresh rotation at its NEW position.
 fn assert_matches_oracle(scratch: &[f32], oracle: impl Fn(&mut [f32], usize)) {
-    let initial: Vec<f32> = (0..HEAD_DIM).map(|i| (i as f32 + 1.0) * 0.1).collect();
     let mut max_diff = 0.0f32;
     for t_off in 0..RETAINED {
         let t_new = N_KEEP + t_off;
         for h in 0..N_KV_HEADS {
-            let mut expected = initial.clone();
+            let mut expected = head_initial(h);
             oracle(&mut expected, t_new);
             let off = t_off * KV_DIM + h * HEAD_DIM;
             let got = &scratch[off..off + HEAD_DIM];
@@ -192,8 +209,8 @@ fn kv_shift_norm_freq_factors_matches_cpu_rope_oracle() {
         eprintln!("skipping: no GPU adapter");
         return;
     };
-    // Llama-3-style per-pair frequency factors (head_dim/2 = 4 values).
-    let ff: Vec<f32> = vec![1.0, 1.5, 2.0, 4.0];
+    // Llama-3-style per-pair frequency factors (head_dim/2 = 8 values).
+    let ff: Vec<f32> = vec![1.0, 1.5, 2.0, 4.0, 1.25, 1.75, 3.0, 5.0];
     let scratch = run_kv_shift(&ctx, 1, Some(&ff), |head, t| {
         apply_rope_norm_to_head(head, t, HEAD_DIM, FREQ_BASE, Some(&ff));
     });
