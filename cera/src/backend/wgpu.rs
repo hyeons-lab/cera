@@ -720,6 +720,7 @@ pub mod shaders {
     pub const SOFTMAX: &str = include_str!("shaders/softmax.wgsl");
     pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.wgsl");
     pub const ROPE: &str = include_str!("shaders/rope.wgsl");
+    pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.wgsl");
     pub const ATTENTION: &str = include_str!("shaders/attention.wgsl");
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
     pub const CONV1D: &str = include_str!("shaders/conv1d.wgsl");
