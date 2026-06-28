@@ -490,18 +490,21 @@ impl MetalLfm2Model {
             Some(wref) => (Some(wref.start as u64), wref.dtype),
             None => (None, embedding_dtype),
         };
-        // `encode_gemv_output` only has Q6_K / Q8_0 / F32 logit-GEMV kernels; its
-        // fallback arm runs `gemv_f32`, so any other dtype (F16, Q4_0, …) would be
-        // silently reinterpreted as f32 and produce garbage logits. Reject it at
-        // load time rather than at the first decode. `output_dtype` is the
-        // effective projection dtype for both the untied (`output.weight`) and
+        // `encode_gemv_output` has F32 / Q4_0 / Q8_0 / Q6_K logit-GEMV kernels; any
+        // other dtype (F16, Q4_K, …) would otherwise hit the `unreachable!` arm (or,
+        // pre-guard, be silently reinterpreted as f32) and produce garbage logits.
+        // Reject it at load time rather than at the first decode. `output_dtype` is
+        // the effective projection dtype for both the untied (`output.weight`) and
         // tied (embedding) cases — note the per-row embedding *lookup*
         // (`dequant_embedding_row`) supports more dtypes than this *projection*.
         anyhow::ensure!(
-            matches!(output_dtype, DType::F32 | DType::Q6K | DType::Q8_0),
+            matches!(
+                output_dtype,
+                DType::F32 | DType::Q4_0 | DType::Q8_0 | DType::Q6K
+            ),
             "Metal backend has no logit-projection GEMV kernel for output dtype \
-             {output_dtype:?} (token_embd.weight / output.weight); only F32, Q6_K, \
-             and Q8_0 are supported",
+             {output_dtype:?} (token_embd.weight / output.weight); only F32, Q4_0, \
+             Q8_0, and Q6_K are supported",
         );
 
         // output_norm is small (hs f32 = 4KB) — still copy since it's not in the mmap
@@ -509,6 +512,17 @@ impl MetalLfm2Model {
         let output_norm = ctx.upload_f32(src.output_norm_weight());
 
         let upload_weight = |wref: &WeightRef| -> MetalWeight {
+            // Layer projection matmuls route through `encode_gemm` (Q4_0/Q8_0 only)
+            // and `encode_gemv` (Q4_0/Q8_0 + an explicit F32 arm). Any other dtype
+            // (Q6_K, F16, Q4_K, …) hits the GEMV `gemv_f32` fallback and is silently
+            // reinterpreted as f32 → garbage; `encode_gemm`'s own guard is a
+            // `debug_assert!` that vanishes in release, so reject here at load.
+            assert!(
+                matches!(wref.dtype, DType::Q4_0 | DType::Q8_0 | DType::F32),
+                "Metal backend has no layer-weight GEMM/GEMV kernel for dtype {:?}; \
+                 only Q4_0, Q8_0, and F32 projection weights are supported",
+                wref.dtype
+            );
             // Use byte offset into the shared mmap buffer instead of copying.
             let mmap_offset = wref.start as u64;
             let params_buf =
@@ -1522,6 +1536,18 @@ impl MetalLfm2Model {
                 enc.set_buffer(3, Some(&self.params.gemv_output), 0);
                 enc.dispatch_thread_groups(grid, sz1d(32));
             }
+            DType::Q4_0 => {
+                // Q4_0: 2 rows/TG, 32 threads — same dispatch geometry as the base
+                // `gemv_q4_0` layer-weight path and the Q8_0 arm above.
+                let groups = m.div_ceil(2);
+                let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
+                enc.set_compute_pipeline_state(&self.pipelines.gemv_q4_0);
+                enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
+                enc.set_buffer(1, Some(input), 0);
+                enc.set_buffer(2, Some(output), 0);
+                enc.set_buffer(3, Some(&self.params.gemv_output), 0);
+                enc.dispatch_thread_groups(grid, sz1d(32));
+            }
             DType::F32 => {
                 let grid = sz2d(m.min(65535) as u64, m.div_ceil(65535) as u64);
                 enc.set_compute_pipeline_state(&self.pipelines.gemv_f32);
@@ -1532,7 +1558,7 @@ impl MetalLfm2Model {
                 enc.dispatch_thread_groups(grid, sz1d(32));
             }
             // Unreachable: `from_weight_source` rejects any other output dtype at
-            // load (only F32/Q6_K/Q8_0 have a logit-GEMV kernel). Panic loudly
+            // load (only F32/Q4_0/Q8_0/Q6_K have a logit-GEMV kernel). Panic loudly
             // rather than silently misreading quantized bytes as f32 if that guard
             // ever regresses.
             other => unreachable!(
