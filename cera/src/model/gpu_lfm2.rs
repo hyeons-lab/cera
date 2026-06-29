@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Result;
 
 use crate::backend::cpu::RopeType;
-use crate::backend::wgpu::{GpuContext, GpuTensor, shaders};
+use crate::backend::wgpu::{GpuContext, GpuTensor, KvShiftParams, shaders};
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvPrefixCache, LayerSnapshot, StateSnapshot};
 use crate::model::gpu_weight_source::GpuWeightSource;
@@ -170,6 +170,9 @@ struct GpuPipelines {
     per_head_rmsnorm: wgpu::ComputePipeline,
     softmax: wgpu::ComputePipeline,
     rope: wgpu::ComputePipeline,
+    /// n_keep context shift: re-rotate retained K cells by `R(-shift)` into
+    /// scratch (the memcpy halves use `copy_buffer_to_buffer`). See `shift_kv`.
+    kv_shift: wgpu::ComputePipeline,
     attention: wgpu::ComputePipeline,
     conv1d_fused: wgpu::ComputePipeline,
     argmax_f32: wgpu::ComputePipeline,
@@ -250,9 +253,13 @@ pub struct GpuLfm2Model {
     q_buf: wgpu::Buffer,         // [hidden_size]
     k_buf: wgpu::Buffer,         // [max_kv_dim]
     v_buf: wgpu::Buffer,         // [max_kv_dim]
-    attn_out_buf: wgpu::Buffer,  // [hidden_size]
-    logits_buf: wgpu::Buffer,    // [vocab_size]
-    scores_buf: wgpu::Buffer,    // [n_heads × max_seq_len]
+    /// Scratch for the n_keep KV shift: holds the re-rotated retained K (and,
+    /// in a second pass, the moved V) for one layer before it is copied back
+    /// into the cache. Sized `[max_seq_len × max_kv_dim]` f32. See `shift_kv`.
+    kv_shift_scratch: wgpu::Buffer,
+    attn_out_buf: wgpu::Buffer, // [hidden_size]
+    logits_buf: wgpu::Buffer,   // [vocab_size]
+    scores_buf: wgpu::Buffer,   // [n_heads × max_seq_len]
     /// 4 bytes — receives argmax(logits) as a single u32. Cached so
     /// `forward_greedy` doesn't allocate per call. The `download_u32`
     /// readback over this 4-byte buffer is the wasm-async-friendly
@@ -482,6 +489,7 @@ impl GpuLfm2Model {
             ),
             softmax: ctx.create_pipeline(shaders::SOFTMAX, "softmax", "softmax"),
             rope: ctx.create_pipeline(shaders::ROPE, "rope", "rope"),
+            kv_shift: ctx.create_pipeline(shaders::KV_SHIFT, "kv_shift", "kv_shift"),
             attention: ctx.create_pipeline(shaders::ATTENTION, "attention", "attention"),
             conv1d_fused: ctx.create_pipeline(
                 shaders::CONV1D_FUSED,
@@ -683,6 +691,12 @@ impl GpuLfm2Model {
         let q_buf = f(q_dim, "q");
         let k_buf = f(max_kv_dim, "k");
         let v_buf = f(max_kv_dim, "v");
+        // KV-shift scratch: one retained K/V layer slab, sized to the worst case
+        // (`max_seq_len × max_kv_dim`). No `.max(1)` guard — `k_buf`/`v_buf` above
+        // already allocate `max_kv_dim` floats, so an attention-free
+        // (`max_kv_dim == 0`) config would fail there first; LFM2 always has
+        // attention layers, so `max_kv_dim` is never 0 in practice anyway.
+        let kv_shift_scratch = f(max_seq_len * max_kv_dim, "kv_shift_scratch");
         let attn_out_buf = f(q_dim, "attn_out");
         let logits_buf = f(config.vocab_size, "logits");
         let scores_buf = f(config.n_heads * max_seq_len, "scores");
@@ -861,6 +875,7 @@ impl GpuLfm2Model {
             q_buf,
             k_buf,
             v_buf,
+            kv_shift_scratch,
             attn_out_buf,
             logits_buf,
             scores_buf,
@@ -1330,6 +1345,139 @@ impl GpuLfm2Model {
         n_floats: u64,
     ) {
         enc.copy_buffer_to_buffer(src, src_off, dst, dst_off, n_floats * 4);
+    }
+
+    /// Per-layer dispatch loop for the n_keep KV shift, called by
+    /// `Model::shift_kv` once `retained > 0` is established. For each attention
+    /// layer: (1) re-rotate the retained K cells by `R(-shift)` into
+    /// `kv_shift_scratch` via the `kv_shift` kernel, (2) copy the rotated K back
+    /// into the cache at the `n_keep` offset, (3) ferry V through the same
+    /// scratch to its new offset (V isn't RoPE'd, but its source/destination
+    /// ranges overlap the same way K's do, so it can't move in place either).
+    ///
+    /// The two copies reuse `copy_buffer_to_buffer`; wgpu's automatic usage
+    /// tracking inserts the WAR/RAW barriers between the compute pass and the
+    /// copies (and across layers that share the one scratch buffer), so the
+    /// single command encoder stays correct without manual synchronization.
+    fn encode_kv_shift_layers(&self, n_keep: usize, shift: usize, retained: usize) {
+        debug_assert!(retained > 0, "encode_kv_shift_layers requires retained > 0");
+        let cfg = &self.config;
+        let head_dim = cfg.head_dim;
+        let freq_base_bits = cfg.rope_theta.to_bits();
+
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("kv_shift"),
+            });
+
+        for layer_idx in 0..cfg.n_layers {
+            if cfg.block_types[layer_idx] != BlockType::Attention {
+                continue;
+            }
+            let n_kv_heads = cfg.kv_heads_per_layer[layer_idx];
+            let kv_dim = n_kv_heads * head_dim;
+            let (k_cache, v_cache) = self.gpu_state.kv_caches[layer_idx]
+                .as_ref()
+                .expect("attention layer missing GPU kv_caches entry");
+
+            // Per-layer params: `n_kv_heads`/`kv_dim` can vary per layer (GQA),
+            // so a fresh tiny storage buffer per layer is simpler — and cheaper
+            // to reason about — than reusing one buffer with `write_buffer`
+            // (whose writes wouldn't interleave with the in-encoder dispatches).
+            // KV-shift fires only on context overflow, so the allocation is rare.
+            let params = KvShiftParams {
+                n_keep: n_keep as u32,
+                shift: shift as u32,
+                retained: retained as u32,
+                n_kv_heads: n_kv_heads as u32,
+                head_dim: head_dim as u32,
+                freq_base_bits,
+                rope_type: self.rope_type as u32,
+                has_freq_factors: u32::from(self.has_freq_factors),
+            };
+            let params_buf = self.ctx.upload_storage(
+                bytemuck::cast_slice(&params.to_u32_array()),
+                "kv_shift_params",
+            );
+
+            // ── K: re-rotate retained cells into scratch (compact order) ──
+            let bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("kv_shift"),
+                    layout: &self.pipelines.kv_shift.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: k_cache.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.kv_shift_scratch.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: params_buf.as_entire_binding(),
+                        },
+                        // Bound even when `has_freq_factors` is false: the kernel
+                        // only reads it on the Llama-3 path, but every binding in
+                        // the layout must be set. `rope_freqs_buf` is a `[1.0]`
+                        // dummy for plain-RoPE models.
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.rope_freqs_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+            // One thread per (retained cell, kv head, RoPE pair). The grid is
+            // 2-D-flattened via `dispatch_dims` (shared with the oracle test and
+            // unit-tested in `backend::wgpu`) because the retained context can
+            // push the workgroup count past the 65535 per-dimension limit; the
+            // kernel recovers the flat index via `get_wid`. `encode` adds the GPU
+            // profiling span + debug label.
+            self.encode(
+                &mut enc,
+                &self.pipelines.kv_shift,
+                &bg,
+                params.dispatch_dims(),
+                "kv_shift",
+            );
+            // Copy rotated K back into the cache at the new n_keep-aligned offset.
+            let n_floats = (retained * kv_dim) as u64;
+            self.encode_copy(
+                &mut enc,
+                &self.kv_shift_scratch,
+                0,
+                k_cache,
+                (n_keep * kv_dim * 4) as u64,
+                n_floats,
+            );
+
+            // ── V: ferry through scratch to the new offset (no rotation) ──
+            self.encode_copy(
+                &mut enc,
+                v_cache,
+                ((n_keep + shift) * kv_dim * 4) as u64,
+                &self.kv_shift_scratch,
+                0,
+                n_floats,
+            );
+            self.encode_copy(
+                &mut enc,
+                &self.kv_shift_scratch,
+                0,
+                v_cache,
+                (n_keep * kv_dim * 4) as u64,
+                n_floats,
+            );
+        }
+
+        // KV-shift is a rare, synchronous boundary (context overflow) — block so
+        // the subsequent prefill reads the fully-shifted cache.
+        self.submit_and_wait(enc);
     }
 }
 
@@ -3530,6 +3678,62 @@ impl Model for GpuLfm2Model {
     fn restore_state(&self, snapshot: &StateSnapshot) {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         self.restore_state_locked(snapshot);
+    }
+
+    fn supports_kv_shift(&self) -> bool {
+        // Mirror of CPU `Lfm2Model` / Metal `MetalLfm2Model` — the wgpu backend
+        // implements the GPU-side shift via the `kv_shift` WGSL kernel +
+        // `copy_buffer_to_buffer`. See `Self::shift_kv`.
+        true
+    }
+
+    fn shift_kv(&self, state: &mut InferenceState, n_keep: usize, shift: usize) {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        assert!(shift > 0, "shift must be > 0");
+        let cur_len = self.gpu_state.seq_len.load(Ordering::Relaxed);
+        // This bounds check (and the caller's `Session::can_shift` gate) authorize
+        // the shift off counters that are equal only by the maintained
+        // `gpu_state.seq_len == state.seq_len == current_pos` invariant. Assert the
+        // two mirrors agree HERE so a future path that desyncs them trips loudly at
+        // the source, instead of silently computing `new_seq_len` from the wrong
+        // base or panicking on the bounds assert below with a confusing message.
+        debug_assert_eq!(
+            state.seq_len, cur_len,
+            "seq_len mirrors out of sync: state.seq_len={} gpu_state.seq_len={cur_len}",
+            state.seq_len,
+        );
+        assert!(
+            n_keep + shift <= cur_len,
+            "shift range out of bounds: n_keep={n_keep} + shift={shift} > seq_len={cur_len}",
+        );
+        // The wgpu KV cache is dense f32 — TurboQuant compression is a CPU-only
+        // feature, so a compressed state should never reach this backend. Match
+        // the Metal gate so a caller branching on the flag surfaces fast.
+        assert!(
+            !state.is_compressed(),
+            "shift_kv called on a TurboQuant-compressed state; \
+             shifting compressed caches is not supported on the wgpu backend"
+        );
+
+        let new_seq_len = cur_len - shift;
+        let retained = new_seq_len - n_keep;
+
+        // Edge case: a shift that drops EVERY non-keep cell
+        // (`cur_len == n_keep + shift`) leaves nothing to re-rotate or copy.
+        // Skip the per-layer GPU work — a 0-element dispatch / 0-byte
+        // `copy_buffer_to_buffer` is a wgpu validation error — and only update
+        // the seq_len mirrors below. Reachable exactly as on Metal: `n_keep=32`,
+        // `max_seq_len=256`, an append to `cur_len=256` needs `shift=224 =
+        // cur_len - n_keep`.
+        if retained > 0 {
+            self.encode_kv_shift_layers(n_keep, shift, retained);
+        }
+
+        // Decrement both seq_len mirrors: the GPU-side `AtomicUsize` drives the
+        // forward path's KV write offsets + bounds checks; `state.seq_len` is the
+        // value the Session reads.
+        self.gpu_state.seq_len.store(new_seq_len, Ordering::Relaxed);
+        state.seq_len = new_seq_len;
     }
 
     fn config(&self) -> &ModelConfig {

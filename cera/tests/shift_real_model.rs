@@ -234,3 +234,15 @@ fn shift_runs_through_real_model() {
 fn shift_runs_through_real_model_metal() {
     run_shift_through_real_model(BackendPreference::Metal);
 }
+
+/// wgpu variant of `shift_runs_through_real_model` — the GPU `shift_kv` override
+/// on `GpuLfm2Model` is exercised end-to-end. The follow-up prefill reads the
+/// shifted (re-rotated) K cache on the GPU; a sign or layout bug in
+/// `kv_shift.wgsl`, or a bookkeeping bug in the scratch copy-back / V move,
+/// would surface as a numerical issue here or a downstream panic.
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "downloads ~210 MB + needs a GPU; set CERA_TEST_DOWNLOAD=1 and pass --ignored"]
+fn shift_runs_through_real_model_gpu() {
+    run_shift_through_real_model(BackendPreference::Gpu);
+}

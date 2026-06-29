@@ -223,9 +223,11 @@ pub trait Model: Send + Sync {
     /// [`Self::shift_kv`].
     ///
     /// The default is `false` so new backends opt in deliberately.
-    /// CPU LFM2 overrides to `true`; Metal keeps the default (its
-    /// GPU-side K cache needs a shader-based shift that lands as a
-    /// follow-up). Non-RoPE architectures also stay `false` — the
+    /// RoPE-based models override to `true` across their backends: the
+    /// CPU path re-rotates the KV cache on-CPU (`shift_kv_with_rope`,
+    /// used by both `Lfm2Model` and `LlamaModel`), while the LFM2 GPU
+    /// backends do a shader-based GPU-side shift (Metal `kv_shift.metal`,
+    /// wgpu `kv_shift.wgsl`). Non-RoPE architectures stay `false` — the
     /// shift semantics differ per positional-encoding scheme.
     fn supports_kv_shift(&self) -> bool {
         false
