@@ -31,9 +31,11 @@
 //! error, dim-pair swap, or magnitude drift.
 //!
 //! Gating: needs only a GPU adapter (wgpu → Metal/Vulkan/DX). Runs whenever the
-//! `gpu` feature is on; skips cleanly if no adapter is available.
+//! `gpu` feature is on; skips cleanly if no adapter is available. Excluded on
+//! wasm32: this test drives the kernel through the blocking `GpuContext::new()`,
+//! which is `#[cfg(not(target_arch = "wasm32"))]` (the browser path is async).
 
-#![cfg(feature = "gpu")]
+#![cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 
 use cera::backend::cpu::{apply_rope_norm_to_head, apply_rope_to_head};
 use cera::backend::wgpu::{GpuContext, KvShiftParams, shaders};
