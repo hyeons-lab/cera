@@ -744,7 +744,7 @@ pub struct QueryRotationScratch {
     pub q_rot: Vec<f32>,
     /// JL-projected queries: [n_heads * head_dim] — JL(PolarQuant-rotated).
     pub q_jl: Vec<f32>,
-    /// Pre-computed sum of each head's q_jl values: [n_heads].
+    /// Pre-computed sum of each head's q_jl values: `[n_heads]`.
     /// Avoids redundant O(head_dim) summation per key timestep.
     pub q_jl_total_sums: Vec<f32>,
 }

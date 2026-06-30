@@ -148,7 +148,7 @@ impl CpuFeatures {
 
     /// Verify the host can safely run cera's compiled kernels.
     ///
-    /// Every aarch64 GEMV/GEMM entry point in [`super::simd::neon`] now runtime-
+    /// Every aarch64 GEMV/GEMM entry point in `super::simd::neon` now runtime-
     /// dispatches between its `dotprod` kernel and a plain-NEON fallback, so
     /// `dotprod` is an accelerator rather than a hard requirement and NEON
     /// (mandatory on aarch64) is always sufficient. x86_64 always has a scalar

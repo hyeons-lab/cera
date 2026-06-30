@@ -144,7 +144,7 @@ pub trait VitGpuOps {
     /// Default no-op: Metal's ops each block on `wait_until_completed`, so the
     /// GPU is already idle between calls. wgpu's `dispatch` only *submits* (work
     /// runs asynchronously and is synced lazily at `download`), so it overrides
-    /// this with `device.poll(Wait)`. Only the env-gated [`VitProfiler`] calls
+    /// this with `device.poll(Wait)`. Only the env-gated `VitProfiler` calls
     /// `sync` — the normal forward path never does, so wgpu keeps its pipelining.
     fn sync(&self) {}
 }
@@ -385,7 +385,7 @@ impl VitProfiler {
 /// [`VisionEncoderWeights::encode_image`]: `[n_image_tokens * projection_dim]`.
 ///
 /// Set `CERA_VIT_PROFILE=1` to print a per-op timing breakdown (see
-/// [`VitProfiler`]); unset, this runs with zero profiling overhead.
+/// `VitProfiler`); unset, this runs with zero profiling overhead.
 pub fn encode_image_gpu<O: VitGpuOps>(
     ops: &O,
     gpu_w: &GpuVitWeights<O>,

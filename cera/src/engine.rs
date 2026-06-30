@@ -28,13 +28,13 @@
 //! - VL models (`llama.cpp/image-to-text`): the LLM half (plain
 //!   `architecture = "lfm2"` GGUF) loads via the existing text path;
 //!   the mmproj GGUF is mmaped and exposed via
-//!   [`Self::vision_encoder_gguf`] for follow-up phases. Image input
+//!   `Self::vision_encoder_gguf` for follow-up phases. Image input
 //!   isn't wired yet — `Session::append_image` lands in a later
 //!   phase. Today VL bundles work text-only.
 //! - Remote manifests: `from_path` only resolves local paths in v1. A
 //!   manifest whose `load_time_parameters.model` looks like an HTTP(S)
 //!   URL is rejected with a typed error pointing at Phase 1.6's
-//!   [`BundleRepo`] as the follow-up. Callers who already have the
+//!   `BundleRepo` as the follow-up. Callers who already have the
 //!   bundle on disk should point the manifest at the on-disk file.
 
 use std::io::Read;

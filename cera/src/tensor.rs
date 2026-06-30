@@ -127,7 +127,7 @@ impl Tensor {
         bytemuck::cast_slice_mut(&mut self.data)
     }
 
-    /// Convert tensor data to a Vec<f32>, dequantizing if necessary.
+    /// Convert tensor data to a `Vec<f32>`, dequantizing if necessary.
     pub fn to_f32_vec(&self) -> Vec<f32> {
         match self.dtype {
             DType::F32 => self.as_f32_slice().to_vec(),
