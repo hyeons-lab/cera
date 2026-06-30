@@ -2304,10 +2304,10 @@ fn rope_norm_pairs(
 
 /// Depthwise 1D convolution.
 ///
-/// `input`:  [seq_len, channels]
-/// `weight`: [channels, kernel_size] (one kernel per channel)
+/// `input`:  `[seq_len, channels]`
+/// `weight`: `[channels, kernel_size]` (one kernel per channel)
 /// `bias`:   optional `[channels]`
-/// `output`: [seq_len, channels] (same padding via zero-pad)
+/// `output`: `[seq_len, channels]` (same padding via zero-pad)
 pub fn conv1d_depthwise(
     input: &[f32],
     weight: &[f32],
