@@ -360,6 +360,13 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
+    /// Upper bound on a `{n,m}` repetition count. The desugaring inlines up to
+    /// `count` copies of the repeated unit (each copy spans the unit's elements),
+    /// so the worst-case expansion is `count × unit_size` — cap `count` so a
+    /// grammar can't amplify a large unit into an OOM. 1024 is far more than any
+    /// real fixed-width field needs; use `*`/`+` for genuinely unbounded counts.
+    const MAX_REPETITION: usize = 1024;
+
     fn new(src: &'a str) -> Self {
         Parser {
             src: src.as_bytes(),
@@ -663,10 +670,18 @@ impl<'a> Parser<'a> {
                 }
                 c => bail!("unexpected `{}` in rule `{rule_name}`", c as char),
             }
-            // Postfix repetition binds to the element just parsed.
-            if let Some(op @ (b'*' | b'+' | b'?')) = self.peek() {
-                self.pos += 1;
-                self.apply_repetition(out, last_start, op)?;
+            // Postfix repetition binds to the element just parsed (no
+            // intervening whitespace, matching `* + ?`).
+            match self.peek() {
+                Some(op @ (b'*' | b'+' | b'?')) => {
+                    self.pos += 1;
+                    self.apply_repetition(out, last_start, op)?;
+                }
+                Some(b'{') => {
+                    let (min, max) = self.parse_repetition_bound()?;
+                    self.apply_bounded_repetition(out, last_start, min, max)?;
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -711,6 +726,124 @@ impl<'a> Parser<'a> {
         }
         self.rules[sub as usize] = body;
         out.push(Elem::RuleRef(sub));
+        Ok(())
+    }
+
+    /// Parse a bounded-repetition suffix `{n}`, `{n,}`, `{n,m}`, or `{,m}` (the
+    /// opening `{` is at the cursor). Returns `(min, max)` where `max == None`
+    /// means unbounded (`{n,}`). A missing min defaults to 0 (`{,m}`); a missing
+    /// max in `{n}` form defaults to `min` (exact count). Counts are capped at
+    /// [`Self::MAX_REPETITION`] so a pathological grammar can't blow the parser's
+    /// memory up via the inline expansion.
+    fn parse_repetition_bound(&mut self) -> Result<(usize, Option<usize>)> {
+        self.pos += 1; // '{'
+        let min_digits = self.parse_count_digits()?;
+        let (min, max) = if self.peek() == Some(b',') {
+            self.pos += 1; // ','
+            let max_digits = self.parse_count_digits()?;
+            // At least one of `{n,}` / `{,m}` / `{n,m}` must carry a bound.
+            ensure!(
+                min_digits.is_some() || max_digits.is_some(),
+                "empty repetition bound `{{,}}`"
+            );
+            (min_digits.unwrap_or(0), max_digits)
+        } else {
+            // `{n}` — exact count; the min digits are required here.
+            let n = min_digits.ok_or_else(|| anyhow::anyhow!("empty repetition bound `{{}}`"))?;
+            (n, Some(n))
+        };
+        ensure!(
+            self.peek() == Some(b'}'),
+            "unterminated repetition bound (expected `}}`)"
+        );
+        self.pos += 1; // '}'
+        if let Some(max) = max {
+            ensure!(
+                max >= min,
+                "repetition bound `{{{min},{max}}}` has max < min"
+            );
+            ensure!(
+                max <= Self::MAX_REPETITION,
+                "repetition count {max} exceeds maximum {} (use `*`/`+` for unbounded)",
+                Self::MAX_REPETITION
+            );
+        }
+        ensure!(
+            min <= Self::MAX_REPETITION,
+            "repetition count {min} exceeds maximum {} (use `*`/`+` for unbounded)",
+            Self::MAX_REPETITION
+        );
+        Ok((min, max))
+    }
+
+    /// Parse a run of ASCII digits as a count, or `None` if there are no digits
+    /// at the cursor (so a caller can distinguish `{,m}`/`{n,}` from `{n,m}`).
+    fn parse_count_digits(&mut self) -> Result<Option<usize>> {
+        let start = self.pos;
+        let mut value: usize = 0;
+        while let Some(c @ b'0'..=b'9') = self.peek() {
+            value = value
+                .checked_mul(10)
+                .and_then(|v| v.checked_add((c - b'0') as usize))
+                .ok_or_else(|| anyhow::anyhow!("repetition count overflows"))?;
+            self.pos += 1;
+        }
+        Ok(if self.pos == start { None } else { Some(value) })
+    }
+
+    /// Desugar `unit{min,max}` into anonymous rules, mirroring [`apply_repetition`].
+    /// `min` mandatory copies are inlined, then either a `*`-style recursive tail
+    /// (`max == None`) or `max - min` nested-optional copies are appended.
+    fn apply_bounded_repetition(
+        &mut self,
+        out: &mut Vec<Elem>,
+        start: usize,
+        min: usize,
+        max: Option<usize>,
+    ) -> Result<()> {
+        // An empty unit makes the `{n,}` tail a left-recursive ε-cycle (and the
+        // mandatory/optional copies vacuous). Reject it, as `* + ?` do.
+        ensure!(start < out.len(), "repetition bound has nothing to repeat");
+        let unit: Vec<Elem> = out.split_off(start);
+
+        // `min` mandatory copies, inlined.
+        for _ in 0..min {
+            out.extend_from_slice(&unit);
+        }
+
+        match max {
+            // `{min,}` — unbounded tail: S ::= unit S | ε (same shape as `*`).
+            None => {
+                let sub = self.anon_rule();
+                let mut body = Vec::new();
+                body.extend_from_slice(&unit);
+                body.push(Elem::RuleRef(sub));
+                body.push(Elem::Alt);
+                body.push(Elem::End);
+                self.rules[sub as usize] = body;
+                out.push(Elem::RuleRef(sub));
+            }
+            // `{min,max}` — at most `extra` more copies, as a nested-optional
+            // chain built inside-out: T_k ::= unit [T_{k+1}] | ε.
+            Some(max) => {
+                let mut tail: Option<u32> = None;
+                for _ in 0..(max - min) {
+                    let sub = self.anon_rule();
+                    let mut body = Vec::new();
+                    body.extend_from_slice(&unit);
+                    if let Some(inner) = tail {
+                        body.push(Elem::RuleRef(inner));
+                    }
+                    body.push(Elem::Alt);
+                    body.push(Elem::End);
+                    self.rules[sub as usize] = body;
+                    tail = Some(sub);
+                }
+                if let Some(sub) = tail {
+                    out.push(Elem::RuleRef(sub));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -978,5 +1111,72 @@ mod tests {
         assert_eq!(allowed, 1); // only EOS now
         assert_eq!(logits[3], 0.0); // EOS allowed (complete)
         assert_eq!(logits[0], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn bounded_repetition_exact() {
+        // `{n}` — exactly n copies.
+        let g = grammar(r#"root ::= [0-9]{4}"#);
+        assert!(run(&g, b"2026").unwrap().is_complete());
+        assert!(!run(&g, b"202").unwrap().is_complete()); // 3 is a valid prefix, not complete
+        assert!(run(&g, b"20267").is_none()); // 5th digit rejected
+        assert!(run(&g, b"20a6").is_none()); // non-digit rejected
+        // `{1}` is a plain single copy.
+        let one = grammar(r#"root ::= "a"{1}"#);
+        assert!(run(&one, b"a").unwrap().is_complete());
+        assert!(run(&one, b"aa").is_none());
+    }
+
+    #[test]
+    fn bounded_repetition_range() {
+        // `{m,n}` — between m and n copies inclusive.
+        let g = grammar(r#"root ::= "a"{2,4}"#);
+        assert!(!run(&g, b"a").unwrap().is_complete()); // 1 < min
+        assert!(run(&g, b"aa").unwrap().is_complete()); // min
+        assert!(run(&g, b"aaa").unwrap().is_complete());
+        assert!(run(&g, b"aaaa").unwrap().is_complete()); // max
+        assert!(run(&g, b"aaaaa").is_none()); // > max
+    }
+
+    #[test]
+    fn bounded_repetition_optional_and_unbounded() {
+        // `{0,m}` — at most m (zero allowed).
+        let opt = grammar(r#"root ::= "a"{0,2}"#);
+        assert!(GrammarState::new(opt.clone()).is_complete()); // zero ok
+        assert!(run(&opt, b"aa").unwrap().is_complete());
+        assert!(run(&opt, b"aaa").is_none());
+        // `{,m}` — missing min defaults to 0.
+        let comma = grammar(r#"root ::= "a"{,2}"#);
+        assert!(GrammarState::new(comma.clone()).is_complete());
+        assert!(run(&comma, b"aa").unwrap().is_complete());
+        assert!(run(&comma, b"aaa").is_none());
+        // `{n,}` — n or more, unbounded above.
+        let unb = grammar(r#"root ::= "a"{2,}"#);
+        assert!(!run(&unb, b"a").unwrap().is_complete()); // < min
+        assert!(run(&unb, b"aa").unwrap().is_complete());
+        assert!(run(&unb, b"aaaaaaaa").unwrap().is_complete());
+    }
+
+    #[test]
+    fn bounded_repetition_composes() {
+        // Bound binds to the immediately-preceding unit (a group here), and the
+        // rest of the sequence still applies.
+        let g = grammar(r#"root ::= "[" ([0-9]{1,3} ",")* [0-9]{1,3} "]""#);
+        assert!(run(&g, b"[1]").unwrap().is_complete());
+        assert!(run(&g, b"[12,345,6]").unwrap().is_complete());
+        assert!(run(&g, b"[1234]").is_none()); // 4 digits > max
+    }
+
+    #[test]
+    fn bounded_repetition_errors() {
+        assert!(Grammar::parse(r#"root ::= "a"{2,1}"#).is_err()); // max < min
+        assert!(Grammar::parse(r#"root ::= "a"{}"#).is_err()); // no bound
+        assert!(Grammar::parse(r#"root ::= "a"{,}"#).is_err()); // no bound
+        assert!(Grammar::parse(r#"root ::= "a"{2"#).is_err()); // unterminated
+        assert!(Grammar::parse(r#"root ::= "a"{1,2,3}"#).is_err()); // extra field
+        assert!(Grammar::parse(r#"root ::= ""{2}"#).is_err()); // empty unit
+        assert!(Grammar::parse(r#"root ::= {3}"#).is_err()); // `{` not a valid unit start
+        // Over the cap.
+        assert!(Grammar::parse(r#"root ::= "a"{99999999}"#).is_err());
     }
 }
