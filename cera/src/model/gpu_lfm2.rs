@@ -1335,16 +1335,28 @@ impl GpuLfm2Model {
     // encode_per_head_rmsnorm, encode_rope, encode_elementwise, encode_conv1d
     // removed — logic inlined into batched forward pass.
 
+    /// Encode an f32-granular buffer→buffer copy. ALL THREE size args
+    /// (`src_off_floats`, `dst_off_floats`, `len_floats`) are counts of f32
+    /// elements, not bytes — the helper scales each by 4 internally. Keeping a
+    /// single unit at the call sites removes the foot-gun where an offset is
+    /// byte-counted but the length is float-counted (or vice-versa), which would
+    /// land the copy at the wrong offset and silently corrupt the KV cache.
     fn encode_copy(
         &self,
         enc: &mut wgpu::CommandEncoder,
         src: &wgpu::Buffer,
-        src_off: u64,
+        src_off_floats: u64,
         dst: &wgpu::Buffer,
-        dst_off: u64,
-        n_floats: u64,
+        dst_off_floats: u64,
+        len_floats: u64,
     ) {
-        enc.copy_buffer_to_buffer(src, src_off, dst, dst_off, n_floats * 4);
+        enc.copy_buffer_to_buffer(
+            src,
+            src_off_floats * 4,
+            dst,
+            dst_off_floats * 4,
+            len_floats * 4,
+        );
     }
 
     /// Per-layer dispatch loop for the n_keep KV shift, called by
@@ -1452,7 +1464,7 @@ impl GpuLfm2Model {
                 &self.kv_shift_scratch,
                 0,
                 k_cache,
-                (n_keep * kv_dim * 4) as u64,
+                (n_keep * kv_dim) as u64,
                 n_floats,
             );
 
@@ -1460,7 +1472,7 @@ impl GpuLfm2Model {
             self.encode_copy(
                 &mut enc,
                 v_cache,
-                ((n_keep + shift) * kv_dim * 4) as u64,
+                ((n_keep + shift) * kv_dim) as u64,
                 &self.kv_shift_scratch,
                 0,
                 n_floats,
@@ -1470,7 +1482,7 @@ impl GpuLfm2Model {
                 &self.kv_shift_scratch,
                 0,
                 v_cache,
-                (n_keep * kv_dim * 4) as u64,
+                (n_keep * kv_dim) as u64,
                 n_floats,
             );
         }
@@ -1921,9 +1933,23 @@ impl GpuLfm2Model {
                 // KV cache copies (encoder-level), then pass 2: attention + out_proj + add.
                 let (k_cache, v_cache) = self.gpu_state.kv_caches[i].as_ref().unwrap();
                 let seq_len = self.gpu_state.seq_len.load(Ordering::Relaxed);
-                let kv_offset = (seq_len * kv_dim as usize * 4) as u64;
-                self.encode_copy(&mut enc, &self.k_buf, 0, k_cache, kv_offset, kv_dim as u64);
-                self.encode_copy(&mut enc, &self.v_buf, 0, v_cache, kv_offset, kv_dim as u64);
+                let kv_offset_floats = (seq_len * kv_dim as usize) as u64;
+                self.encode_copy(
+                    &mut enc,
+                    &self.k_buf,
+                    0,
+                    k_cache,
+                    kv_offset_floats,
+                    kv_dim as u64,
+                );
+                self.encode_copy(
+                    &mut enc,
+                    &self.v_buf,
+                    0,
+                    v_cache,
+                    kv_offset_floats,
+                    kv_dim as u64,
+                );
 
                 let attn_seq_len = (seq_len + 1) as u32;
                 // Granite overrides the softmax scale with its attention
