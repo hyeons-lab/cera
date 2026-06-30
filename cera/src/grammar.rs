@@ -671,7 +671,7 @@ impl<'a> Parser<'a> {
                 c => bail!("unexpected `{}` in rule `{rule_name}`", c as char),
             }
             // Postfix repetition binds to the element just parsed (no
-            // intervening whitespace, matching `* + ?`).
+            // intervening whitespace, matching `* + ?` and `{n,m}`).
             match self.peek() {
                 Some(op @ (b'*' | b'+' | b'?')) => {
                     self.pos += 1;
@@ -752,10 +752,16 @@ impl<'a> Parser<'a> {
             let n = min_digits.ok_or_else(|| anyhow::anyhow!("empty repetition bound `{{}}`"))?;
             (n, Some(n))
         };
-        ensure!(
-            self.peek() == Some(b'}'),
-            "unterminated repetition bound (expected `}}`)"
-        );
+        match self.peek() {
+            Some(b'}') => {}
+            // A leftover field (e.g. `{1,2,3}`) lands here — distinguish it from a
+            // truly unterminated bound so the diagnostic isn't misleading.
+            Some(c) => bail!(
+                "unexpected `{}` in repetition bound (expected `}}`)",
+                c as char
+            ),
+            None => bail!("unterminated repetition bound (expected `}}`)"),
+        }
         self.pos += 1; // '}'
         if let Some(max) = max {
             ensure!(
@@ -1174,6 +1180,13 @@ mod tests {
         assert!(Grammar::parse(r#"root ::= "a"{,}"#).is_err()); // no bound
         assert!(Grammar::parse(r#"root ::= "a"{2"#).is_err()); // unterminated
         assert!(Grammar::parse(r#"root ::= "a"{1,2,3}"#).is_err()); // extra field
+        // The two malformed-tail cases get distinct diagnostics.
+        let extra = Grammar::parse(r#"root ::= "a"{1,2,3}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(extra.contains("unexpected"), "got: {extra}");
+        let eof = Grammar::parse(r#"root ::= "a"{2"#).unwrap_err().to_string();
+        assert!(eof.contains("unterminated"), "got: {eof}");
         assert!(Grammar::parse(r#"root ::= ""{2}"#).is_err()); // empty unit
         assert!(Grammar::parse(r#"root ::= {3}"#).is_err()); // `{` not a valid unit start
         // Over the cap.
