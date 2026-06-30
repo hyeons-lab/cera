@@ -1335,16 +1335,32 @@ impl GpuLfm2Model {
     // encode_per_head_rmsnorm, encode_rope, encode_elementwise, encode_conv1d
     // removed — logic inlined into batched forward pass.
 
+    /// Encode an f32-granular buffer→buffer copy. ALL THREE size args
+    /// (`src_off_floats`, `dst_off_floats`, `len_floats`) are counts of f32
+    /// elements, not bytes — the helper scales each to bytes internally. Keeping
+    /// a single unit at the call sites removes the foot-gun where an offset is
+    /// byte-counted but the length is float-counted (or vice-versa), which would
+    /// land the copy at the wrong offset and silently corrupt the KV cache.
+    ///
+    /// Associated (no `self`) so the unit contract is directly unit-testable;
+    /// every buffer→buffer copy in this file (decode, prefill, KV-shift, the
+    /// last-token epilogue) routes through here for one consistent convention.
     fn encode_copy(
-        &self,
         enc: &mut wgpu::CommandEncoder,
         src: &wgpu::Buffer,
-        src_off: u64,
+        src_off_floats: u64,
         dst: &wgpu::Buffer,
-        dst_off: u64,
-        n_floats: u64,
+        dst_off_floats: u64,
+        len_floats: u64,
     ) {
-        enc.copy_buffer_to_buffer(src, src_off, dst, dst_off, n_floats * 4);
+        let f32_bytes = std::mem::size_of::<f32>() as u64;
+        enc.copy_buffer_to_buffer(
+            src,
+            src_off_floats * f32_bytes,
+            dst,
+            dst_off_floats * f32_bytes,
+            len_floats * f32_bytes,
+        );
     }
 
     /// Per-layer dispatch loop for the n_keep KV shift, called by
@@ -1447,30 +1463,30 @@ impl GpuLfm2Model {
             );
             // Copy rotated K back into the cache at the new n_keep-aligned offset.
             let n_floats = (retained * kv_dim) as u64;
-            self.encode_copy(
+            Self::encode_copy(
                 &mut enc,
                 &self.kv_shift_scratch,
                 0,
                 k_cache,
-                (n_keep * kv_dim * 4) as u64,
+                (n_keep * kv_dim) as u64,
                 n_floats,
             );
 
             // ── V: ferry through scratch to the new offset (no rotation) ──
-            self.encode_copy(
+            Self::encode_copy(
                 &mut enc,
                 v_cache,
-                ((n_keep + shift) * kv_dim * 4) as u64,
+                ((n_keep + shift) * kv_dim) as u64,
                 &self.kv_shift_scratch,
                 0,
                 n_floats,
             );
-            self.encode_copy(
+            Self::encode_copy(
                 &mut enc,
                 &self.kv_shift_scratch,
                 0,
                 v_cache,
-                (n_keep * kv_dim * 4) as u64,
+                (n_keep * kv_dim) as u64,
                 n_floats,
             );
         }
@@ -1568,7 +1584,7 @@ impl GpuLfm2Model {
                     }
                 };
                 // Pass 1: rmsnorm + in_proj (after hidden→normed copy).
-                self.encode_copy(
+                Self::encode_copy(
                     &mut enc,
                     &self.hidden_buf,
                     0,
@@ -1851,7 +1867,7 @@ impl GpuLfm2Model {
                 let max_pairs = std::cmp::max(n_heads, n_kv_heads) * (head_dim / 2);
 
                 // Copy hidden → normed, then pass 1: norm + QKV + per-head norm + rope.
-                self.encode_copy(
+                Self::encode_copy(
                     &mut enc,
                     &self.hidden_buf,
                     0,
@@ -1921,9 +1937,23 @@ impl GpuLfm2Model {
                 // KV cache copies (encoder-level), then pass 2: attention + out_proj + add.
                 let (k_cache, v_cache) = self.gpu_state.kv_caches[i].as_ref().unwrap();
                 let seq_len = self.gpu_state.seq_len.load(Ordering::Relaxed);
-                let kv_offset = (seq_len * kv_dim as usize * 4) as u64;
-                self.encode_copy(&mut enc, &self.k_buf, 0, k_cache, kv_offset, kv_dim as u64);
-                self.encode_copy(&mut enc, &self.v_buf, 0, v_cache, kv_offset, kv_dim as u64);
+                let kv_offset_floats = (seq_len * kv_dim as usize) as u64;
+                Self::encode_copy(
+                    &mut enc,
+                    &self.k_buf,
+                    0,
+                    k_cache,
+                    kv_offset_floats,
+                    kv_dim as u64,
+                );
+                Self::encode_copy(
+                    &mut enc,
+                    &self.v_buf,
+                    0,
+                    v_cache,
+                    kv_offset_floats,
+                    kv_dim as u64,
+                );
 
                 let attn_seq_len = (seq_len + 1) as u32;
                 // Granite overrides the softmax scale with its attention
@@ -1995,7 +2025,7 @@ impl GpuLfm2Model {
             }
 
             // FFN — same encoder as block above.
-            self.encode_copy(
+            Self::encode_copy(
                 &mut enc,
                 &self.hidden_buf,
                 0,
@@ -3083,24 +3113,26 @@ impl GpuLfm2Model {
                 );
 
                 // Phase C: bulk-write K/V into the cache. The KV cache is
-                // `max_seq_len × kv_dim` f32; write `n × kv_dim` floats
-                // starting at `start_pos × kv_dim × 4` bytes. wgpu's
-                // copy_buffer_to_buffer is a no-shader memcpy.
-                let kv_off_bytes = (start_pos * kv_dim as usize * 4) as u64;
-                let kv_chunk_bytes = (n * kv_dim as usize * 4) as u64;
-                enc.copy_buffer_to_buffer(
+                // `max_seq_len × kv_dim` f32; write `n × kv_dim` floats starting
+                // at row `start_pos × kv_dim`. `encode_copy` is a no-shader
+                // memcpy that scales these f32 counts to bytes internally.
+                let kv_off_floats = (start_pos * kv_dim as usize) as u64;
+                let kv_chunk_floats = (n * kv_dim as usize) as u64;
+                Self::encode_copy(
+                    &mut enc,
                     &self.prefill_gate_buf,
                     0,
                     k_cache,
-                    kv_off_bytes,
-                    kv_chunk_bytes,
+                    kv_off_floats,
+                    kv_chunk_floats,
                 );
-                enc.copy_buffer_to_buffer(
+                Self::encode_copy(
+                    &mut enc,
                     &self.prefill_up_buf,
                     0,
                     v_cache,
-                    kv_off_bytes,
-                    kv_chunk_bytes,
+                    kv_off_floats,
+                    kv_chunk_floats,
                 );
 
                 // Phase D: batched causal attention. Q stride and the output
@@ -3275,13 +3307,14 @@ impl GpuLfm2Model {
         // Copy batch_buf[(n-1)*hs..n*hs] → hidden_buf (single-token
         // scratch), then rmsnorm + output projection through the existing
         // single-token helpers.
-        let last_off_bytes = ((n - 1) * hs * 4) as u64;
-        enc.copy_buffer_to_buffer(
+        let last_off_floats = ((n - 1) * hs) as u64;
+        Self::encode_copy(
+            &mut enc,
             &self.prefill_batch_buf,
-            last_off_bytes,
+            last_off_floats,
             &self.hidden_buf,
             0,
-            (hs * 4) as u64,
+            hs as u64,
         );
         self.encode_rmsnorm(
             &mut enc,
@@ -3738,5 +3771,64 @@ impl Model for GpuLfm2Model {
 
     fn config(&self) -> &ModelConfig {
         &self.config
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests {
+    use crate::backend::wgpu::GpuContext;
+
+    /// Acquire a GPU context or skip. Under `CERA_REQUIRE_GPU` (the lavapipe CI
+    /// job) a missing adapter is a hard failure, mirroring the oracle tests, so
+    /// the contract below cannot pass by silently skipping.
+    fn gpu_ctx_or_skip() -> Option<GpuContext> {
+        match GpuContext::new() {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                let required = std::env::var("CERA_REQUIRE_GPU").unwrap_or_default();
+                assert!(
+                    required.is_empty(),
+                    "CERA_REQUIRE_GPU is set but no GPU adapter is available: {e}"
+                );
+                eprintln!("skipping: no GPU adapter ({e})");
+                None
+            }
+        }
+    }
+
+    /// `encode_copy` treats all three args as f32-element COUNTS: source float
+    /// offset `S`, destination float offset `D`, length `L` must move
+    /// `src[S..S+L]` into `dst[D..D+L]` — i.e. each count is scaled to bytes
+    /// internally. The NON-ZERO offsets are the point: a regression that
+    /// byte-counts (or fails to scale) an offset lands the copy at the wrong row,
+    /// and this catches it hermetically on a GPU-less runner via lavapipe — the
+    /// hot decode/prefill append paths all route their nonzero offsets through
+    /// this same helper, so this is the value-level guard they otherwise lacked.
+    #[test]
+    fn encode_copy_scales_float_offsets_to_bytes() {
+        let Some(ctx) = gpu_ctx_or_skip() else {
+            return;
+        };
+        let src: Vec<f32> = (0..16).map(|x| x as f32).collect();
+        let src_buf = ctx.upload_f32(&src, "encode_copy_src");
+        // create_storage_rw is zero-initialized.
+        let dst_buf = ctx.create_storage_rw((16 * 4) as u64, "encode_copy_dst");
+
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // Copy 4 floats from src[2..6] to dst[5..9] using FLOAT offsets.
+        super::GpuLfm2Model::encode_copy(&mut enc, &src_buf, 2, &dst_buf, 5, 4);
+        ctx.queue.submit(Some(enc.finish()));
+
+        let got = ctx.download_f32(&dst_buf, 16);
+        let mut want = vec![0.0f32; 16];
+        want[5..9].copy_from_slice(&src[2..6]); // [2.0, 3.0, 4.0, 5.0]
+        assert_eq!(
+            got, want,
+            "encode_copy must scale float offsets/length to bytes \
+             (src_off=2, dst_off=5, len=4 → dst[5..9] == src[2..6])"
+        );
     }
 }
