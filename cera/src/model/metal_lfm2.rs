@@ -832,25 +832,29 @@ impl MetalLfm2Model {
         enc.dispatch_thread_groups(grid, threads_per_tg);
     }
 
-    /// Compute-based memcpy — reads src starting at src_off_bytes, writes dst at dst_off_bytes.
+    /// Compute-based memcpy — moves `len_floats` f32 from `src[src_off_floats..]`
+    /// to `dst[dst_off_floats..]`. ALL THREE size args are f32-element COUNTS
+    /// (scaled to the byte offsets Metal's `set_buffer` expects internally), so
+    /// this shares the single float-unit convention with wgpu's `encode_copy`.
     /// Keeps all work on the same compute encoder (avoids compute↔blit switches).
-    /// Expects a pre-allocated elementwise params buffer matching `n_floats`.
-    #[allow(clippy::too_many_arguments, dead_code)]
+    /// Expects a pre-allocated elementwise params buffer matching `len_floats`.
+    #[allow(clippy::too_many_arguments)]
     fn copy_compute(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
         src: &Buffer,
-        src_off: u64,
+        src_off_floats: u64,
         dst: &Buffer,
-        dst_off: u64,
+        dst_off_floats: u64,
         params: &Buffer,
-        n_floats: u64,
+        len_floats: u64,
     ) {
+        let f32_bytes = std::mem::size_of::<f32>() as u64;
         enc.set_compute_pipeline_state(&self.pipelines.memcpy_f32);
-        enc.set_buffer(0, Some(src), src_off);
-        enc.set_buffer(1, Some(dst), dst_off);
+        enc.set_buffer(0, Some(src), src_off_floats * f32_bytes);
+        enc.set_buffer(1, Some(dst), dst_off_floats * f32_bytes);
         enc.set_buffer(2, Some(params), 0);
-        enc.dispatch_threads(sz1d(n_floats), sz1d(256));
+        enc.dispatch_threads(sz1d(len_floats), sz1d(256));
     }
 
     fn encode_gemv_weight(
@@ -3718,11 +3722,11 @@ impl MetalLfm2Model {
 
         // Final: output norm + logits for last token only.
         {
-            let last_off = ((n - 1) * hs * 4) as u64;
+            let last_off_floats = ((n - 1) * hs) as u64;
             self.copy_compute(
                 enc,
                 batch_buf,
-                last_off,
+                last_off_floats,
                 &self.hidden_buf,
                 0,
                 &self.params.elementwise_hs,
@@ -4227,11 +4231,11 @@ impl MetalLfm2Model {
 
         // Final logits epilogue.
         run_phase("output".to_string(), &|enc| {
-            let last_off = ((n - 1) * hs * 4) as u64;
+            let last_off_floats = ((n - 1) * hs) as u64;
             self.copy_compute(
                 enc,
                 batch_buf,
-                last_off,
+                last_off_floats,
                 &self.hidden_buf,
                 0,
                 &self.params.elementwise_hs,
