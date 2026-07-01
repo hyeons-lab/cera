@@ -183,6 +183,14 @@ pub enum FfiError {
     /// `Throwable.message` collision reason as [`FfiError::Io`].
     #[error("backend: {detail}")]
     Backend { detail: String },
+
+    /// The GBNF grammar string passed in [`GenerateOpts::grammar`] failed to
+    /// compile. Has no cera analog — grammar compilation happens in the FFI
+    /// wrapper (the opaque `Arc<cera::grammar::Grammar>` can't cross the UniFFI
+    /// boundary, so callers pass the source text and we parse it here). `detail`
+    /// carries the parser's diagnostic.
+    #[error("grammar: {detail}")]
+    GrammarParse { detail: String },
 }
 
 impl From<cera::CeraError> for FfiError {
@@ -893,6 +901,11 @@ pub struct GenerateOpts {
     pub repetition_penalty: f32,
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     pub stop_tokens: Vec<u32>,
+    /// Optional GBNF grammar **source text** constraining the output (e.g. a
+    /// JSON grammar). `None` (the default) decodes unconstrained. Compiled on
+    /// the Rust side when the opts convert to `cera::GenerateOpts`; a malformed
+    /// grammar surfaces as [`FfiError::GrammarParse`]. See [`cera::grammar`].
+    pub grammar: Option<String>,
     /// Ignored under synchronous generate; reserved for streaming.
     pub flush_every_tokens: u32,
     /// Ignored under synchronous generate; reserved for streaming.
@@ -910,15 +923,31 @@ impl Default for GenerateOpts {
             min_p: core.min_p,
             repetition_penalty: core.repetition_penalty,
             stop_tokens: core.stop_tokens,
+            // Core default is no grammar; the compiled `Arc` has no FFI form, so
+            // the mirrored field is the (absent) source string.
+            grammar: None,
             flush_every_tokens: core.flush_every_tokens,
             flush_every_ms: core.flush_every_ms,
         }
     }
 }
 
-impl From<GenerateOpts> for cera::GenerateOpts {
-    fn from(o: GenerateOpts) -> Self {
-        cera::GenerateOpts {
+impl TryFrom<GenerateOpts> for cera::GenerateOpts {
+    type Error = FfiError;
+
+    /// Fallible because the GBNF `grammar` source is compiled here — a malformed
+    /// grammar becomes [`FfiError::GrammarParse`] rather than silently decoding
+    /// unconstrained.
+    fn try_from(o: GenerateOpts) -> Result<Self, FfiError> {
+        let grammar = match o.grammar {
+            Some(src) => Some(Arc::new(cera::grammar::Grammar::parse(&src).map_err(
+                |e| FfiError::GrammarParse {
+                    detail: format!("{e:#}"),
+                },
+            )?)),
+            None => None,
+        };
+        Ok(cera::GenerateOpts {
             max_tokens: o.max_tokens,
             temperature: o.temperature,
             top_p: o.top_p,
@@ -926,12 +955,10 @@ impl From<GenerateOpts> for cera::GenerateOpts {
             min_p: o.min_p,
             repetition_penalty: o.repetition_penalty,
             stop_tokens: o.stop_tokens,
-            // Grammar-constrained decoding isn't exposed over FFI yet (it needs an
-            // `Arc<cera::grammar::Grammar>`); foreign callers use the unconstrained path.
-            grammar: None,
+            grammar,
             flush_every_tokens: o.flush_every_tokens,
             flush_every_ms: o.flush_every_ms,
-        }
+        })
     }
 }
 
@@ -942,7 +969,13 @@ pub enum FinishReason {
     Stop,
     Cancelled,
     ContextFull,
-    Error { message: String },
+    /// A grammar constraint left no token allowed at this step — decoding
+    /// stopped because the grammar dead-ended. Only reachable when
+    /// [`GenerateOpts::grammar`] is set.
+    GrammarDeadEnd,
+    Error {
+        message: String,
+    },
 }
 
 impl From<cera::FinishReason> for FinishReason {
@@ -952,10 +985,7 @@ impl From<cera::FinishReason> for FinishReason {
             cera::FinishReason::Stop => FinishReason::Stop,
             cera::FinishReason::Cancelled => FinishReason::Cancelled,
             cera::FinishReason::ContextFull => FinishReason::ContextFull,
-            // Unreachable over FFI today (grammar isn't exposed); a dead-ended grammar is
-            // a terminal stop. Map to `Stop` rather than grow the FFI enum (which would
-            // force a regen of the committed Kotlin/Swift/Dart bindings).
-            cera::FinishReason::GrammarDeadEnd => FinishReason::Stop,
+            cera::FinishReason::GrammarDeadEnd => FinishReason::GrammarDeadEnd,
             cera::FinishReason::Error(msg) => FinishReason::Error { message: msg },
         }
     }
@@ -1285,7 +1315,10 @@ impl Session {
             fn on_done(&mut self, _reason: cera::FinishReason) {}
         }
         let mut sink = CollectSink(Vec::new());
-        let summary = self.lock_inner()?.generate(&opts.into(), &mut sink)?;
+        // Compile the grammar (if any) before taking the session lock so a
+        // malformed GBNF fails fast with `FfiError::GrammarParse`.
+        let core: cera::GenerateOpts = opts.try_into()?;
+        let summary = self.lock_inner()?.generate(&core, &mut sink)?;
         Ok(GenerateOutput {
             tokens: sink.0,
             summary: summary.into(),
@@ -1337,10 +1370,14 @@ impl Session {
         // already have to avoid session-reentrancy during success
         // callbacks; reusing that contract on the error path keeps
         // the hazard set minimal.
-        let outcome = match self.lock_inner() {
-            Ok(mut guard) => guard
-                .generate(&opts.into(), &mut adapter)
-                .map_err(FfiError::from),
+        // Compile the grammar first; a malformed GBNF (`FfiError::GrammarParse`)
+        // routes through the same best-effort `on_done(Error)` path below as any
+        // other pre-decode failure.
+        let outcome = match cera::GenerateOpts::try_from(opts) {
+            Ok(core) => match self.lock_inner() {
+                Ok(mut guard) => guard.generate(&core, &mut adapter).map_err(FfiError::from),
+                Err(e) => Err(e),
+            },
             Err(e) => Err(e),
         };
         match outcome {
@@ -2125,7 +2162,7 @@ mod tests {
     #[test]
     fn generate_opts_default_roundtrips_to_cera() {
         let ffi = GenerateOpts::default();
-        let core: cera::GenerateOpts = ffi.into();
+        let core: cera::GenerateOpts = ffi.try_into().expect("default opts have no grammar");
         let default_core = cera::GenerateOpts::default();
         // Field-by-field so a future cera field-add breaks here loudly.
         assert_eq!(core.max_tokens, default_core.max_tokens);
@@ -2134,8 +2171,30 @@ mod tests {
         assert_eq!(core.top_k, default_core.top_k);
         assert_eq!(core.repetition_penalty, default_core.repetition_penalty);
         assert_eq!(core.stop_tokens, default_core.stop_tokens);
+        assert!(core.grammar.is_none());
         assert_eq!(core.flush_every_tokens, default_core.flush_every_tokens);
         assert_eq!(core.flush_every_ms, default_core.flush_every_ms);
+    }
+
+    #[test]
+    fn generate_opts_compiles_valid_grammar() {
+        let ffi = GenerateOpts {
+            grammar: Some(r#"root ::= "yes" | "no""#.to_string()),
+            ..GenerateOpts::default()
+        };
+        let core: cera::GenerateOpts = ffi.try_into().expect("valid GBNF compiles");
+        assert!(core.grammar.is_some());
+    }
+
+    #[test]
+    fn generate_opts_rejects_malformed_grammar() {
+        let ffi = GenerateOpts {
+            // Unterminated string literal — the GBNF parser rejects it.
+            grammar: Some(r#"root ::= "oops"#.to_string()),
+            ..GenerateOpts::default()
+        };
+        let err = cera::GenerateOpts::try_from(ffi).unwrap_err();
+        assert!(matches!(err, FfiError::GrammarParse { .. }), "got: {err:?}");
     }
 
     #[test]
@@ -2146,6 +2205,7 @@ mod tests {
             (Core::Stop, "Stop"),
             (Core::Cancelled, "Cancelled"),
             (Core::ContextFull, "ContextFull"),
+            (Core::GrammarDeadEnd, "GrammarDeadEnd"),
             (Core::Error("boom".into()), "Error"),
         ];
         for (core, tag) in cases {
@@ -2155,6 +2215,7 @@ mod tests {
                 (FinishReason::Stop, "Stop") => {}
                 (FinishReason::Cancelled, "Cancelled") => {}
                 (FinishReason::ContextFull, "ContextFull") => {}
+                (FinishReason::GrammarDeadEnd, "GrammarDeadEnd") => {}
                 (FinishReason::Error { message }, "Error") => assert_eq!(message, "boom"),
                 _ => panic!("variant mismatch: {ffi:?} tagged {tag}"),
             }

@@ -192,6 +192,8 @@ fn greedy_opts_ffi(max_tokens: u32) -> cera_ffi::GenerateOpts {
         min_p: settings::MIN_P,
         repetition_penalty: settings::REPETITION_PENALTY,
         stop_tokens: Vec::new(),
+        // Parity runs decode unconstrained; grammar exercised separately.
+        grammar: None,
         flush_every_tokens: settings::FLUSH_EVERY_TOKENS,
         flush_every_ms: settings::FLUSH_EVERY_MS,
     }

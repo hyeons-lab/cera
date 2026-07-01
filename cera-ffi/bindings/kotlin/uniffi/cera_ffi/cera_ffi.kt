@@ -5060,6 +5060,13 @@ data class GenerateOpts(
      */
     var `stopTokens`: List<kotlin.UInt>,
     /**
+     * Optional GBNF grammar **source text** constraining the output (e.g. a
+     * JSON grammar). `None` (the default) decodes unconstrained. Compiled on
+     * the Rust side when the opts convert to `cera::GenerateOpts`; a malformed
+     * grammar surfaces as [`FfiError::GrammarParse`]. See [`cera::grammar`].
+     */
+    var `grammar`: kotlin.String?,
+    /**
      * Ignored under synchronous generate; reserved for streaming.
      */
     var `flushEveryTokens`: kotlin.UInt,
@@ -5084,6 +5091,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
             FfiConverterFloat.read(buf),
             FfiConverterFloat.read(buf),
             FfiConverterSequenceUInt.read(buf),
+            FfiConverterOptionalString.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
         )
@@ -5097,6 +5105,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
                 FfiConverterFloat.allocationSize(value.`minP`) +
                 FfiConverterFloat.allocationSize(value.`repetitionPenalty`) +
                 FfiConverterSequenceUInt.allocationSize(value.`stopTokens`) +
+                FfiConverterOptionalString.allocationSize(value.`grammar`) +
                 FfiConverterUInt.allocationSize(value.`flushEveryTokens`) +
                 FfiConverterUInt.allocationSize(value.`flushEveryMs`)
         )
@@ -5112,6 +5121,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
         FfiConverterFloat.write(value.`minP`, buf)
         FfiConverterFloat.write(value.`repetitionPenalty`, buf)
         FfiConverterSequenceUInt.write(value.`stopTokens`, buf)
+        FfiConverterOptionalString.write(value.`grammar`, buf)
         FfiConverterUInt.write(value.`flushEveryTokens`, buf)
         FfiConverterUInt.write(value.`flushEveryMs`, buf)
     }
@@ -5581,6 +5591,20 @@ sealed class FfiException : kotlin.Exception() {
             get() = "detail=${ `detail` }"
     }
 
+    /**
+     * The GBNF grammar string passed in [`GenerateOpts::grammar`] failed to
+     * compile. Has no cera analog — grammar compilation happens in the FFI
+     * wrapper (the opaque `Arc<cera::grammar::Grammar>` can't cross the UniFFI
+     * boundary, so callers pass the source text and we parse it here). `detail`
+     * carries the parser's diagnostic.
+     */
+    class GrammarParse(
+        val `detail`: kotlin.String,
+    ) : FfiException() {
+        override val message
+            get() = "detail=${ `detail` }"
+    }
+
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<FfiException> {
         override fun lift(error_buf: RustBuffer.ByValue): FfiException = FfiConverterTypeFfiError.lift(error_buf)
     }
@@ -5629,6 +5653,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
 
             8 -> {
                 FfiException.Backend(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            9 -> {
+                FfiException.GrammarParse(
                     FfiConverterString.read(buf),
                 )
             }
@@ -5684,6 +5714,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
                 4UL +
                     FfiConverterString.allocationSize(value.`detail`)
             )
+
+            is FfiException.GrammarParse -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`detail`)
+            )
         }
 
     override fun write(
@@ -5735,6 +5771,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
                 FfiConverterString.write(value.`detail`, buf)
                 Unit
             }
+
+            is FfiException.GrammarParse -> {
+                buf.putInt(9)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 }
@@ -5750,6 +5792,13 @@ sealed class FinishReason {
     object Cancelled : FinishReason()
 
     object ContextFull : FinishReason()
+
+    /**
+     * A grammar constraint left no token allowed at this step — decoding
+     * stopped because the grammar dead-ended. Only reachable when
+     * [`GenerateOpts::grammar`] is set.
+     */
+    object GrammarDeadEnd : FinishReason()
 
     data class Error(
         val `message`: kotlin.String,
@@ -5783,6 +5832,10 @@ public object FfiConverterTypeFinishReason : FfiConverterRustBuffer<FinishReason
             }
 
             5 -> {
+                FinishReason.GrammarDeadEnd
+            }
+
+            6 -> {
                 FinishReason.Error(
                     FfiConverterString.read(buf),
                 )
@@ -5823,6 +5876,13 @@ public object FfiConverterTypeFinishReason : FfiConverterRustBuffer<FinishReason
                 )
             }
 
+            is FinishReason.GrammarDeadEnd -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
             is FinishReason.Error -> {
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 (
@@ -5857,8 +5917,13 @@ public object FfiConverterTypeFinishReason : FfiConverterRustBuffer<FinishReason
                 Unit
             }
 
-            is FinishReason.Error -> {
+            is FinishReason.GrammarDeadEnd -> {
                 buf.putInt(5)
+                Unit
+            }
+
+            is FinishReason.Error -> {
+                buf.putInt(6)
                 FfiConverterString.write(value.`message`, buf)
                 Unit
             }
@@ -6018,6 +6083,38 @@ public object FfiConverterOptionalULong : FfiConverterRustBuffer<kotlin.ULong?> 
         } else {
             buf.put(1)
             FfiConverterULong.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalString : FfiConverterRustBuffer<kotlin.String?> {
+    override fun read(buf: ByteBuffer): kotlin.String? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterString.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.String?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterString.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: kotlin.String?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterString.write(value, buf)
         }
     }
 }
