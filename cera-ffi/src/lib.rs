@@ -184,11 +184,10 @@ pub enum FfiError {
     #[error("backend: {detail}")]
     Backend { detail: String },
 
-    /// The GBNF grammar string passed in [`GenerateOpts::grammar`] failed to
-    /// compile. Has no cera analog — grammar compilation happens in the FFI
-    /// wrapper (the opaque `Arc<cera::grammar::Grammar>` can't cross the UniFFI
-    /// boundary, so callers pass the source text and we parse it here). `detail`
-    /// carries the parser's diagnostic.
+    /// The GBNF grammar string passed in `GenerateOpts.grammar` failed to
+    /// compile. Grammar compilation happens in the FFI wrapper (the compiled
+    /// grammar object can't cross the boundary, so callers pass the source text
+    /// and it's parsed here). `detail` carries the parser's diagnostic.
     #[error("grammar: {detail}")]
     GrammarParse { detail: String },
 }
@@ -902,9 +901,9 @@ pub struct GenerateOpts {
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     pub stop_tokens: Vec<u32>,
     /// Optional GBNF grammar **source text** constraining the output (e.g. a
-    /// JSON grammar). `None` (the default) decodes unconstrained. Compiled on
-    /// the Rust side when the opts convert to `cera::GenerateOpts`; a malformed
-    /// grammar surfaces as [`FfiError::GrammarParse`]. See [`cera::grammar`].
+    /// JSON grammar). `None` (the default) decodes unconstrained. The grammar is
+    /// compiled on the Rust side when generation starts; a malformed grammar is
+    /// reported as a `GrammarParse` error.
     pub grammar: Option<String>,
     /// Ignored under synchronous generate; reserved for streaming.
     pub flush_every_tokens: u32,
