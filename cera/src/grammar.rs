@@ -89,7 +89,7 @@ struct Pos {
 
 /// Mutable per-generation grammar state: the set of active parse frontiers.
 ///
-/// A stack is a list of [`Pos`] whose top points at the next terminal to match. An
+/// A stack is a list of `Pos` whose top points at the next terminal to match. An
 /// **empty** stack means a complete derivation was reached (→ generation may stop).
 #[derive(Clone)]
 pub struct GrammarState {

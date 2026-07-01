@@ -386,7 +386,7 @@ impl BpeTokenizer {
     /// This is the per-token slice of [`decode`](Self::decode): valid-UTF-8 tokens have
     /// the GPT-2 `unicode_to_byte` mapping reversed (e.g. `Ġ` → space). Byte-fallback
     /// tokens — written in GGUF as the escape `<0xHH>` and already decoded to a single
-    /// raw byte at load time by [`unescape_token`] — are stored in `vocab` as that raw
+    /// raw byte at load time by `unescape_token` — are stored in `vocab` as that raw
     /// byte (which on its own may not be valid UTF-8) and emitted as-is. Used by
     /// grammar-constrained decoding to test a candidate token against the grammar at the
     /// byte level — do NOT use the raw `vocab` entry, which for GPT-2/Qwen vocabs stores

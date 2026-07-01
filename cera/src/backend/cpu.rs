@@ -130,7 +130,7 @@ pub fn matmul_f32(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: us
     }
 }
 
-/// Quantized Q4_0 × f32 matmul: C[m,n] = dequant(A_q4_0)[m,k] * B[k,n].
+/// Quantized Q4_0 × f32 matmul: `C[m,n] = dequant(A_q4_0)[m,k] * B[k,n]`.
 ///
 /// `a_quant` is raw Q4_0 bytes, row-major with `m` rows of `k` elements each.
 /// Each row is k/32 blocks of 18 bytes.
@@ -158,7 +158,7 @@ pub fn matmul_q4_0_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
     }
 }
 
-/// Quantized Q8_0 × f32 matmul: C[m,n] = dequant(A_q8)[m,k] * B[k,n].
+/// Quantized Q8_0 × f32 matmul: `C[m,n] = dequant(A_q8)[m,k] * B[k,n]`.
 ///
 /// `a_quant` is raw Q8_0 bytes, row-major with `m` rows of `k` elements each.
 /// Each row is k/32 blocks of 34 bytes.
@@ -187,7 +187,7 @@ pub fn matmul_q8_0_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
     }
 }
 
-/// Quantized Q4_K_M × f32 matmul: C[m,n] = dequant(A_q4km)[m,k] * B[k,n].
+/// Quantized Q4_K_M × f32 matmul: `C[m,n] = dequant(A_q4km)[m,k] * B[k,n]`.
 ///
 /// `a_quant` is raw Q4_K_M bytes, row-major with `m` rows of `k` elements each.
 /// Each row is k/256 blocks of 144 bytes.
@@ -261,7 +261,7 @@ pub fn par_rows_n(
 }
 
 #[allow(clippy::ptr_arg)]
-/// Q4_0 GEMV: y[m] = A_q4_0[m,k] @ x[k].
+/// Q4_0 GEMV: `y[m] = A_q4_0[m,k] @ x[k]`.
 ///
 /// On aarch64, uses integer dot product with caller-provided Q8_0 scratch buffers
 /// to avoid per-call heap allocation. The scratch buffers are resized as needed.
@@ -370,7 +370,7 @@ pub fn gemv_q4_0_with_q8(
 }
 
 #[allow(clippy::ptr_arg)]
-/// Q8_0 GEMV: y[m] = A_q8_0[m,k] @ x[k].
+/// Q8_0 GEMV: `y[m] = A_q8_0[m,k] @ x[k]`.
 /// On aarch64, uses integer dot product (quantize x to Q8_0, then Q8_0 × Q8_0
 /// with vdotq_s32 — ~4x fewer instructions than f32 widening path).
 pub fn gemv_q8_0_f32(
@@ -420,7 +420,7 @@ pub fn gemv_q8_0_f32(
     }
 }
 
-/// Q6_K GEMV: y[m] = A_q6k[m,k] @ x[k]. Parallelized across rows.
+/// Q6_K GEMV: `y[m] = A_q6k[m,k] @ x[k]`. Parallelized across rows.
 /// On aarch64, quantizes x to Q8_0 then uses integer Q6_K × Q8_0 dot product with vdotq_s32.
 #[allow(clippy::ptr_arg)]
 #[allow(unused_variables)]
@@ -471,7 +471,7 @@ pub fn gemv_q6k_f32(
     }
 }
 
-/// Q4_K_M GEMV: y[m] = A_q4km[m,k] @ x[k]. Parallelized across rows.
+/// Q4_K_M GEMV: `y[m] = A_q4km[m,k] @ x[k]`. Parallelized across rows.
 pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
@@ -498,7 +498,7 @@ pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     }
 }
 
-/// F32 GEMV: y[m] = A_f32[m,k] @ x[k].
+/// F32 GEMV: `y[m] = A_f32[m,k] @ x[k]`.
 pub fn gemv_f32(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
@@ -515,7 +515,7 @@ pub fn gemv_f32(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     }
 }
 
-/// Dispatch GEMV based on dtype: y[m] = W[m,k] @ x[k].
+/// Dispatch GEMV based on dtype: `y[m] = W[m,k] @ x[k]`.
 /// For Q4_0, pass scratch buffers to avoid per-call allocation.
 pub fn gemv_dispatch(
     dtype: DType,
@@ -1314,7 +1314,7 @@ pub fn conv2d(
 
 // ── Attention score/value computation ───────────────────────────────────────
 
-/// Compute attention scores for one head: scores[t] = dot(q_head, k_cache_row_t) * scale.
+/// Compute attention scores for one head: `scores[t] = dot(q_head, k_cache_row_t) * scale`.
 /// `k_cache` has stride `kv_dim` between timesteps; each key starts at offset `kv_h_offset`.
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn attn_scores(
@@ -1356,7 +1356,7 @@ pub fn attn_scores(
     }
 }
 
-/// Compute weighted sum of V cache for one head: attn_out[d] = sum_t(scores[t] * v[t,d]).
+/// Compute weighted sum of V cache for one head: `attn_out[d] = sum_t(scores[t] * v[t,d])`.
 /// `v_cache` has stride `kv_dim` between timesteps; each value starts at offset `kv_h_offset`.
 #[allow(clippy::needless_range_loop)]
 pub fn attn_values(
@@ -2304,10 +2304,10 @@ fn rope_norm_pairs(
 
 /// Depthwise 1D convolution.
 ///
-/// `input`:  [seq_len, channels]
-/// `weight`: [channels, kernel_size] (one kernel per channel)
-/// `bias`:   optional [channels]
-/// `output`: [seq_len, channels] (same padding via zero-pad)
+/// `input`:  `[seq_len, channels]`
+/// `weight`: `[channels, kernel_size]` (one kernel per channel)
+/// `bias`:   optional `[channels]`
+/// `output`: `[seq_len, channels]` (same padding via zero-pad)
 pub fn conv1d_depthwise(
     input: &[f32],
     weight: &[f32],
