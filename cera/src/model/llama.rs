@@ -22,6 +22,8 @@ use crate::backend::cpu;
 use crate::backend::cpu::RopeType;
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
+#[cfg(any(target_arch = "aarch64", feature = "blas"))]
+use crate::kv_cache::LayerState;
 use crate::model::transformer::{self, AttnDims, AttnExtras, AttnWeights, FfnWeights, WeightRef};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 
@@ -452,6 +454,564 @@ impl LlamaModel {
         transformer::oracle_dump::record("result_output", &logits);
         logits
     }
+
+    // ── Batched-GEMM prefill helpers (mirror LFM2's CPU prefill) ─────────────
+    //
+    // These read each weight matrix once for all N prompt tokens instead of the
+    // per-token GEMV loop. Same kernel dispatch as `Lfm2Model`: NEON
+    // `gemm_q{4_0,8_0}_q8_0` on aarch64 (input columns pre-quantized to Q8_0),
+    // or BLAS SGEMM after a full dequant when the `blas` feature is on.
+
+    /// Run a prefill GEMM through BLAS: dequantize `wref` into
+    /// `dequant_scratch[..m*k]`, then SGEMM `out[m, n] = weight[m, k] @ b[k, n]`
+    /// in row-major (both `b` and `out` are row-major `[k|m, n]`, stride `n`).
+    /// Returns `true` for the supported dtypes (Q4_0 / Q8_0); callers gate on
+    /// dtype upfront so the `false` arm is defensive.
+    #[cfg(feature = "blas")]
+    #[allow(clippy::too_many_arguments)]
+    fn try_blas_prefill_gemm(
+        &self,
+        wref: &WeightRef,
+        b: &[f32],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        dequant_scratch: &mut Vec<f32>,
+    ) -> bool {
+        debug_assert_eq!(wref.m, m, "try_blas_prefill_gemm: weight m mismatch");
+        debug_assert_eq!(wref.k, k, "try_blas_prefill_gemm: weight k mismatch");
+        let data = transformer::weight_data(&self.gguf, wref);
+        if dequant_scratch.len() < m * k {
+            dequant_scratch.resize(m * k, 0.0);
+        }
+        let dequant = &mut dequant_scratch[..m * k];
+        match wref.dtype {
+            crate::tensor::DType::Q4_0 => crate::quant::dequantize_q4_0_matrix(data, m, k, dequant),
+            crate::tensor::DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(data, m, k, dequant),
+            _ => return false,
+        }
+        crate::backend::blas::sgemm_rowmajor_nn(m, n, k, dequant, b, out);
+        true
+    }
+
+    /// Batched GEMM with pre-quantized Q8_0 input columns (NEON fallback, no
+    /// BLAS). Dispatches on the weight dtype; returns `true` when a kernel ran.
+    #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_preq(
+        &self,
+        wref: &WeightRef,
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> bool {
+        let data = transformer::weight_data(&self.gguf, wref);
+        match wref.dtype {
+            crate::tensor::DType::Q4_0 => unsafe {
+                crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
+                    data, b_scales, b_quants, out, m, n, k,
+                );
+                true
+            },
+            crate::tensor::DType::Q8_0 => unsafe {
+                crate::backend::simd::neon::gemm_q8_0_q8_0_neon(
+                    data, b_scales, b_quants, out, m, n, k,
+                );
+                true
+            },
+            _ => false,
+        }
+    }
+
+    /// Quantize all `n` columns of a column-major `[dim × n]` matrix to Q8_0
+    /// (NEON fallback only). `col` is a scratch column of length ≥ `dim`;
+    /// `scales`/`quants` receive the packed `[n][dim/32]` / `[n][dim]` layout the
+    /// NEON GEMM kernels consume.
+    #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+    fn quantize_columns(
+        mat: &[f32],
+        dim: usize,
+        n: usize,
+        col: &mut [f32],
+        scales: &mut [f32],
+        quants: &mut [i8],
+    ) {
+        let nb = dim / 32;
+        for j in 0..n {
+            for i in 0..dim {
+                col[i] = mat[i * n + j];
+            }
+            unsafe {
+                crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                    &col[..dim],
+                    &mut scales[j * nb..(j + 1) * nb],
+                    &mut quants[j * dim..(j + 1) * dim],
+                );
+            }
+        }
+    }
+
+    /// Batched-GEMM CPU prefill for the dense transformer (mirrors LFM2's CPU
+    /// prefill). Reads each weight matrix once for all `n` tokens. Column-major
+    /// `hidden[hs × n]` (token `j` of channel `i` at `i*n + j`). Numerically
+    /// matches the per-token `forward` path. Only compiled where a batched-GEMM
+    /// kernel exists (aarch64 NEON, or any target with the `blas` feature); the
+    /// per-token fallback covers every other build.
+    #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+    fn forward_prefill_batched(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let is = cfg.intermediate_size;
+        let n = tokens.len();
+        let head_dim = self.head_dim;
+        let n_heads = cfg.n_heads;
+        let n_kv_heads = cfg.n_kv_heads;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let group_size = n_heads / n_kv_heads;
+        // Granite overrides the softmax scale via `attention.scale`; every other
+        // arch uses the default 1/sqrt(head_dim).
+        let scale = cfg
+            .scalars
+            .attn
+            .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
+
+        // The batched-GEMM kernels (NEON `gemm_q{4_0,8_0}_q8_0` and BLAS SGEMM
+        // after `dequantize_q{4_0,8_0}_matrix`) only handle Q4_0/Q8_0. If any
+        // per-layer projection uses another dtype (e.g. Q4KM/Q6K), fall back to
+        // the sequential per-token path so the result stays correct.
+        let all_gemmable = self.layer_refs.iter().all(|r| {
+            [
+                &r.attn_q,
+                &r.attn_k,
+                &r.attn_v,
+                &r.attn_output,
+                &r.ffn_gate,
+                &r.ffn_up,
+                &r.ffn_down,
+            ]
+            .iter()
+            .all(|w| {
+                matches!(
+                    w.dtype,
+                    crate::tensor::DType::Q4_0 | crate::tensor::DType::Q8_0
+                )
+            })
+        });
+        if !all_gemmable {
+            let mut logits = Vec::new();
+            for (i, &token) in tokens.iter().enumerate() {
+                logits = self.forward(&[token], start_pos + i, state);
+            }
+            return logits;
+        }
+
+        // Embed all tokens → column-major hidden[hs × n] (Granite embedding scale).
+        let mut hidden = vec![0.0f32; hs * n];
+        let mut emb_buf = vec![0.0f32; hs];
+        for (j, &token_id) in tokens.iter().enumerate() {
+            let token_id = token_id as usize;
+            assert!(
+                token_id < self.embd_ref.m,
+                "token_id {token_id} out of range for vocab size {}",
+                self.embd_ref.m
+            );
+            transformer::dequantize_row_into(&self.gguf, &self.embd_ref, token_id, &mut emb_buf);
+            if cfg.scalars.embedding != 1.0 {
+                cpu::scale_inplace(&mut emb_buf, cfg.scalars.embedding);
+            }
+            for i in 0..hs {
+                hidden[i * n + j] = emb_buf[i];
+            }
+        }
+
+        // Per-layer buffers (reused across layers).
+        let mut normed = vec![0.0f32; hs * n];
+        let mut block_out = vec![0.0f32; hs * n];
+        let mut ffn_input = vec![0.0f32; hs * n];
+        let mut ffn_out = vec![0.0f32; hs * n];
+        let mut norm_col = vec![0.0f32; hs];
+        let mut ffn_col = vec![0.0f32; hs];
+        let mut q_mat = vec![0.0f32; q_dim * n];
+        let mut k_mat = vec![0.0f32; kv_dim * n];
+        let mut v_mat = vec![0.0f32; kv_dim * n];
+        let mut out_proj_input = vec![0.0f32; q_dim * n];
+        let mut gate_mat = vec![0.0f32; is * n];
+        let mut up_mat = vec![0.0f32; is * n];
+
+        // NEON-fallback Q8_0 input scratch. One buffer set sized to the largest
+        // GEMM k-dim (hs, q_dim, or is) — each quantize call is immediately
+        // followed by its paired GEMM with the same k, so reuse is safe.
+        #[cfg(not(feature = "blas"))]
+        let max_dim = hs.max(q_dim).max(is);
+        #[cfg(not(feature = "blas"))]
+        let mut col = vec![0.0f32; max_dim];
+        #[cfg(not(feature = "blas"))]
+        let mut bq_scales = vec![0.0f32; n * (max_dim / 32)];
+        #[cfg(not(feature = "blas"))]
+        let mut bq_quants = vec![0i8; n * max_dim];
+
+        for layer in 0..cfg.n_layers {
+            let refs = &self.layer_refs[layer];
+
+            // Attention pre-norm: rmsnorm each column.
+            for j in 0..n {
+                for i in 0..hs {
+                    norm_col[i] = hidden[i * n + j];
+                }
+                cpu::rmsnorm(
+                    &mut norm_col,
+                    &self.attn_norm_weights[layer],
+                    cfg.rms_norm_eps,
+                );
+                for i in 0..hs {
+                    normed[i * n + j] = norm_col[i];
+                }
+            }
+
+            // Batched Q/K/V projections (weight [m×hs] × normed[hs×n] → [m×n]).
+            #[cfg(feature = "blas")]
+            {
+                self.try_blas_prefill_gemm(
+                    &refs.attn_q,
+                    &normed,
+                    &mut q_mat,
+                    q_dim,
+                    n,
+                    hs,
+                    &mut state.scratch.dequant_weight_scratch,
+                );
+                self.try_blas_prefill_gemm(
+                    &refs.attn_k,
+                    &normed,
+                    &mut k_mat,
+                    kv_dim,
+                    n,
+                    hs,
+                    &mut state.scratch.dequant_weight_scratch,
+                );
+                self.try_blas_prefill_gemm(
+                    &refs.attn_v,
+                    &normed,
+                    &mut v_mat,
+                    kv_dim,
+                    n,
+                    hs,
+                    &mut state.scratch.dequant_weight_scratch,
+                );
+            }
+            #[cfg(not(feature = "blas"))]
+            {
+                Self::quantize_columns(&normed, hs, n, &mut col, &mut bq_scales, &mut bq_quants);
+                self.gemm_preq(
+                    &refs.attn_q,
+                    &bq_scales,
+                    &bq_quants,
+                    &mut q_mat,
+                    q_dim,
+                    n,
+                    hs,
+                );
+                self.gemm_preq(
+                    &refs.attn_k,
+                    &bq_scales,
+                    &bq_quants,
+                    &mut k_mat,
+                    kv_dim,
+                    n,
+                    hs,
+                );
+                self.gemm_preq(
+                    &refs.attn_v,
+                    &bq_scales,
+                    &bq_quants,
+                    &mut v_mat,
+                    kv_dim,
+                    n,
+                    hs,
+                );
+            }
+
+            // Per-arch attention knobs (constant across tokens within a layer).
+            let qkv_bias = match (
+                self.attn_q_bias[layer].as_deref(),
+                self.attn_k_bias[layer].as_deref(),
+                self.attn_v_bias[layer].as_deref(),
+            ) {
+                (Some(q), Some(k), Some(v)) => Some((q, k, v)),
+                _ => None,
+            };
+            let qk_norm = match (
+                self.attn_q_norm_weights[layer].as_deref(),
+                self.attn_k_norm_weights[layer].as_deref(),
+            ) {
+                (Some(q), Some(k)) => Some((q, k)),
+                _ => None,
+            };
+
+            // Per-token core: bias → QK-norm → RoPE → KV append → GQA attention.
+            for j in 0..n {
+                let pos = start_pos + j;
+                let q = &mut state.scratch.q[..q_dim];
+                let k = &mut state.scratch.k[..kv_dim];
+                let v = &mut state.scratch.v[..kv_dim];
+                for i in 0..q_dim {
+                    q[i] = q_mat[i * n + j];
+                }
+                for i in 0..kv_dim {
+                    k[i] = k_mat[i * n + j];
+                    v[i] = v_mat[i * n + j];
+                }
+
+                // Qwen2 Q/K/V bias.
+                if let Some((q_bias, k_bias, v_bias)) = qkv_bias {
+                    cpu::add_inplace(q, q_bias);
+                    cpu::add_inplace(k, k_bias);
+                    cpu::add_inplace(v, v_bias);
+                }
+
+                // Qwen3 per-head QK-norm — BEFORE RoPE.
+                if let Some((q_norm, k_norm)) = qk_norm {
+                    for h in 0..n_heads {
+                        cpu::rmsnorm(
+                            &mut q[h * head_dim..(h + 1) * head_dim],
+                            q_norm,
+                            cfg.rms_norm_eps,
+                        );
+                    }
+                    for h in 0..n_kv_heads {
+                        cpu::rmsnorm(
+                            &mut k[h * head_dim..(h + 1) * head_dim],
+                            k_norm,
+                            cfg.rms_norm_eps,
+                        );
+                    }
+                }
+
+                // RoPE — layout per arch (NEOX for Qwen, NORM for LLaMA/Granite).
+                match self.rope_type {
+                    RopeType::Neox => {
+                        cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, cfg.rope_theta)
+                    }
+                    RopeType::Norm => cpu::rope_norm(
+                        q,
+                        k,
+                        pos,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        cfg.rope_theta,
+                        self.rope_freqs.as_deref(),
+                    ),
+                }
+
+                // Append K, V to the f32 cache.
+                if let LayerState::Attention {
+                    key_cache,
+                    value_cache,
+                    ..
+                } = &mut state.layers[layer]
+                {
+                    key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
+                    value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
+                }
+
+                // GQA attention over the cache built so far (causal is automatic).
+                {
+                    let (k_cache, v_cache) = match &state.layers[layer] {
+                        LayerState::Attention {
+                            key_cache,
+                            value_cache,
+                            ..
+                        } => (key_cache.as_slice(), value_cache.as_slice()),
+                        _ => unreachable!("dense transformer layer is always Attention"),
+                    };
+                    let seq_len = k_cache.len() / kv_dim;
+                    let attn_out = &mut state.scratch.attn_out[..q_dim];
+                    let q = &state.scratch.q[..q_dim];
+                    let scores = &mut state.scratch.scores;
+                    scores.resize(seq_len, 0.0);
+                    for h in 0..n_heads {
+                        let kv_h = h / group_size;
+                        let q_head = &q[h * head_dim..(h + 1) * head_dim];
+                        let kv_h_offset = kv_h * head_dim;
+                        cpu::attn_scores(
+                            q_head,
+                            k_cache,
+                            scores,
+                            kv_dim,
+                            kv_h_offset,
+                            head_dim,
+                            scale,
+                            seq_len,
+                        );
+                        cpu::softmax_inplace(scores);
+                        cpu::attn_values(
+                            scores,
+                            v_cache,
+                            &mut attn_out[h * head_dim..(h + 1) * head_dim],
+                            kv_dim,
+                            kv_h_offset,
+                            head_dim,
+                            seq_len,
+                        );
+                    }
+                }
+
+                for i in 0..q_dim {
+                    out_proj_input[i * n + j] = state.scratch.attn_out[i];
+                }
+            }
+
+            // Batched output projection GEMM → block_out[hs × n] (k = q_dim).
+            #[cfg(feature = "blas")]
+            {
+                self.try_blas_prefill_gemm(
+                    &refs.attn_output,
+                    &out_proj_input,
+                    &mut block_out,
+                    hs,
+                    n,
+                    q_dim,
+                    &mut state.scratch.dequant_weight_scratch,
+                );
+            }
+            #[cfg(not(feature = "blas"))]
+            {
+                Self::quantize_columns(
+                    &out_proj_input,
+                    q_dim,
+                    n,
+                    &mut col,
+                    &mut bq_scales,
+                    &mut bq_quants,
+                );
+                self.gemm_preq(
+                    &refs.attn_output,
+                    &bq_scales,
+                    &bq_quants,
+                    &mut block_out,
+                    hs,
+                    n,
+                    q_dim,
+                );
+            }
+
+            // Granite residual scale, then residual add into hidden.
+            if cfg.scalars.residual != 1.0 {
+                cpu::scale_inplace(&mut block_out, cfg.scalars.residual);
+            }
+            cpu::add_inplace(&mut hidden, &block_out);
+
+            // FFN pre-norm: rmsnorm each column.
+            for j in 0..n {
+                for i in 0..hs {
+                    ffn_col[i] = hidden[i * n + j];
+                }
+                cpu::rmsnorm(
+                    &mut ffn_col,
+                    &self.ffn_norm_weights[layer],
+                    cfg.rms_norm_eps,
+                );
+                for i in 0..hs {
+                    ffn_input[i * n + j] = ffn_col[i];
+                }
+            }
+
+            // FFN gate/up GEMM → silu(gate)⊙up → down GEMM.
+            #[cfg(feature = "blas")]
+            {
+                self.try_blas_prefill_gemm(
+                    &refs.ffn_gate,
+                    &ffn_input,
+                    &mut gate_mat,
+                    is,
+                    n,
+                    hs,
+                    &mut state.scratch.dequant_weight_scratch,
+                );
+                self.try_blas_prefill_gemm(
+                    &refs.ffn_up,
+                    &ffn_input,
+                    &mut up_mat,
+                    is,
+                    n,
+                    hs,
+                    &mut state.scratch.dequant_weight_scratch,
+                );
+            }
+            #[cfg(not(feature = "blas"))]
+            {
+                Self::quantize_columns(&ffn_input, hs, n, &mut col, &mut bq_scales, &mut bq_quants);
+                self.gemm_preq(
+                    &refs.ffn_gate,
+                    &bq_scales,
+                    &bq_quants,
+                    &mut gate_mat,
+                    is,
+                    n,
+                    hs,
+                );
+                self.gemm_preq(&refs.ffn_up, &bq_scales, &bq_quants, &mut up_mat, is, n, hs);
+            }
+
+            cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
+
+            #[cfg(feature = "blas")]
+            {
+                self.try_blas_prefill_gemm(
+                    &refs.ffn_down,
+                    &gate_mat,
+                    &mut ffn_out,
+                    hs,
+                    n,
+                    is,
+                    &mut state.scratch.dequant_weight_scratch,
+                );
+            }
+            #[cfg(not(feature = "blas"))]
+            {
+                Self::quantize_columns(&gate_mat, is, n, &mut col, &mut bq_scales, &mut bq_quants);
+                self.gemm_preq(
+                    &refs.ffn_down,
+                    &bq_scales,
+                    &bq_quants,
+                    &mut ffn_out,
+                    hs,
+                    n,
+                    is,
+                );
+            }
+
+            // Granite residual scale, then residual add.
+            if cfg.scalars.residual != 1.0 {
+                cpu::scale_inplace(&mut ffn_out, cfg.scalars.residual);
+            }
+            cpu::add_inplace(&mut hidden, &ffn_out);
+        }
+
+        // Advance seq_len (the block loops appended KV cells without bumping it).
+        state.seq_len = start_pos + n;
+
+        // Final norm on the LAST column, then project last-token logits (what the
+        // decode loop consumes). `project_logits` handles the Granite logit scale
+        // and the aarch64 pre-quantized GEMV.
+        let mut last_hidden = vec![0.0f32; hs];
+        for i in 0..hs {
+            last_hidden[i] = hidden[i * n + (n - 1)];
+        }
+        cpu::rmsnorm(&mut last_hidden, &self.output_norm_weight, cfg.rms_norm_eps);
+        self.project_logits(&last_hidden, state)
+    }
 }
 
 impl Model for LlamaModel {
@@ -497,8 +1057,16 @@ impl Model for LlamaModel {
             "forward_prefill: start_pos ({start_pos}) must equal state.seq_len ({})",
             state.seq_len
         );
-        // Sequential per-token prefill. Correctness-first: a batched-GEMM
-        // prefill path (like LFM2's) is a later optimization.
+        // Batched-GEMM prefill (reads each weight once for all N tokens) on
+        // targets that have a batched kernel — aarch64 NEON or any `blas` build.
+        // `n == 1` stays on the per-token path to avoid GEMM setup overhead, and
+        // every other target has no batched kernel, so it also falls through.
+        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        if tokens.len() > 1 {
+            return self.forward_prefill_batched(tokens, start_pos, state);
+        }
+
+        // Sequential per-token prefill (single-token, or no batched kernel).
         let mut logits = Vec::new();
         for (i, &token) in tokens.iter().enumerate() {
             logits = self.forward(&[token], start_pos + i, state);
