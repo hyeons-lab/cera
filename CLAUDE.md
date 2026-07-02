@@ -58,7 +58,7 @@ Four tiers with runtime dispatch:
 
 ### Models (`model/`)
 
-`Model` trait with `forward()` and `config()`. `ModelConfig` supports per-layer `BlockType` (Attention or GatedConv) for hybrid architectures like LFM2. Both model families are implemented and inference-complete across all backends (CPU, wgpu, Metal) with decode + batched prefill:
+`Model` trait with `forward()` and `config()`. `ModelConfig` supports per-layer `BlockType` (Attention or GatedConv) for hybrid architectures like LFM2. Both model families are implemented and inference-complete across all backends (CPU, wgpu, Metal). Decode works everywhere; prefill uses batched GEMM on all GPU backends and on CPU for LFM2. **Dense-transformer CPU prefill (`llama.rs::forward_prefill`) is still sequential per-token** — a batched-GEMM path like LFM2's is a pending optimization (`supports_batched_prefill()` returns `true`, but that flag only gates the GPU wrappers, not the CPU path):
 - **LFM2 / LFM2.5** (`lfm2` arch, hybrid attention + gated-conv) — plus vision (LFM2-VL) and audio (LFM2-Audio) modalities.
 - **Dense transformers** (`llama` arch — also Qwen2/3, classic Mistral, Granite).
 
