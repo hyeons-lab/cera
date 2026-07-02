@@ -53,12 +53,16 @@ Both validate offsets with checked arithmetic (`checked_add`, `usize::try_from`)
 Four tiers with runtime dispatch:
 1. **`cpu.rs`** — scalar reference implementations operating on raw `&[f32]` slices (no Tensor in the hot path)
 2. **`simd.rs`** — NEON (aarch64) and AVX2 (x86_64) optimized `vec_dot` kernels with compile-time + runtime dispatch
-3. **`wgpu.rs`** — cross-platform GPU backend (`gpu` feature). Functional: WGSL GEMV/GEMM kernels (incl. quantized `gemm_q8_0`/`gemm_q4_0`), the ViT vision encoder, and LFM2 prefill/decode
-4. **`metal/`** — native Apple Metal backend (`metal` feature, macOS) with MSL kernels — the `Auto`-preferred GPU backend, used by LFM2 and the ViT vision encoder
+3. **`wgpu.rs`** — cross-platform GPU backend (`gpu` feature). Functional: WGSL GEMV/GEMM kernels (incl. quantized `gemm_q8_0`/`gemm_q4_0`), the ViT vision encoder, and decode + batched prefill for both LFM2 and dense transformers (llama/qwen2/qwen3/granite)
+4. **`metal/`** — native Apple Metal backend (`metal` feature, macOS) with MSL kernels — the `Auto`-preferred GPU backend, running decode + batched prefill for LFM2 and dense transformers plus the ViT vision encoder
 
 ### Models (`model/`)
 
-`Model` trait with `forward()` and `config()`. `ModelConfig` supports per-layer `BlockType` (Attention or GatedConv) for hybrid architectures like LFM2. LLaMA and LFM2 model implementations are Phase 3-4 work.
+`Model` trait with `forward()` and `config()`. `ModelConfig` supports per-layer `BlockType` (Attention or GatedConv) for hybrid architectures like LFM2. Both model families are implemented and inference-complete across all backends (CPU, wgpu, Metal). Decode works everywhere; prefill uses batched GEMM on all GPU backends and on CPU for LFM2. **Dense-transformer CPU prefill (`llama.rs::forward_prefill`) is still sequential per-token** — a batched-GEMM path like LFM2's is a pending optimization (`supports_batched_prefill()` returns `true`, but that flag only gates the GPU wrappers, not the CPU path):
+- **LFM2 / LFM2.5** (`lfm2` arch, hybrid attention + gated-conv) — plus vision (LFM2-VL) and audio (LFM2-Audio) modalities.
+- **Dense transformers** (`llama` arch — also Qwen2/3, classic Mistral, Granite).
+
+TurboQuant KV-cache compression is CPU-only (`Lfm2Model`); the GPU backends fall back to f32 KV.
 
 ### Tokenizer (`tokenizer.rs`)
 
