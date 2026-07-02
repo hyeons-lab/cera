@@ -94,7 +94,10 @@ cera run -m model.gguf -p "..." --grammar @schema.gbnf
 ```
 
 Supports literals, character classes, alternation, grouping, and repetition
-(`* + ?` and bounded `{n,m}`). Exposed programmatically via `GenerateOpts.grammar`.
+(`* + ?` and bounded `{n,m}`). Available from **every binding**, not just the
+CLI: pass a GBNF string via `GenerateOpts.grammar` in Rust and the Kotlin/Swift
+FFI, or `GenerateOpts.setGrammar(gbnf)` in the browser/Node (WASM) — the grammar
+is compiled natively so mobile and web apps get the same guaranteed-valid output.
 
 ## TurboQuant KV-cache compression
 
