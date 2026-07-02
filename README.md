@@ -35,7 +35,10 @@ of these architectures loads:
 | `granite` | **IBM Granite 3.x** | text |
 
 Every architecture above runs on **all three compute backends** (CPU, Metal, and
-wgpu) with both single-token decode and batched prefill.
+wgpu), with single-token decode and prompt prefill on each. Prefill uses
+batched-GEMM (each weight read once for the whole prompt) on the GPU backends for
+every architecture, and on CPU for LFM2; CPU prefill for the dense transformers
+is currently sequential per-token.
 
 ### Modalities
 
