@@ -10,7 +10,7 @@ or in the browser — from a single dependency-free core.
 
 ## Why Cera
 
-- **No Python, no runtime.** Pure Rust. The CLI is a single static binary; the
+- **No Python, no runtime.** Pure Rust. The CLI is a single binary; the
   library has zero required system dependencies on a default build.
 - **Runs everywhere.** The same core drives a desktop CLI, Android/iOS apps
   (via UniFFI), and the browser (via WebAssembly). Pick CPU or GPU at runtime.
@@ -58,7 +58,8 @@ or you can pin one:
 | **Native Metal** | `metal` | macOS | Hand-written MSL shaders, single-encoder dispatch, GPU argmax |
 | **wgpu** | `gpu` | macOS, Linux, Windows, browser | WGSL shaders over **Metal / Vulkan / DX12 / WebGPU** |
 
-`--device auto` prefers native Metal on Apple platforms and wgpu elsewhere.
+`--device auto` uses native Metal on macOS and wgpu where a GPU is available,
+falling back to CPU otherwise.
 
 ### Quantization
 
@@ -120,9 +121,13 @@ cera run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3 --device cpu
 ## Quick start
 
 ```bash
-# Build the CLI (add --features metal or --features gpu for a GPU build)
-cargo install cera-cli
-# ...or from source:
+# Install the CLI (CPU-only build)
+cargo install cera-cli --locked
+
+# ...or with a GPU backend
+cargo install cera-cli --locked --features metal   # or: --features gpu
+
+# ...or build from source
 just release   # optimized LTO build → target/release/cera
 ```
 

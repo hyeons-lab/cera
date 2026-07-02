@@ -84,7 +84,7 @@ integer GEMM path on aarch64 and need no system libraries.
 
 Two GPU backends with runtime selection via `--device`:
 
-- **Native Metal** (`--device metal`, macOS/iOS) — hand-written MSL shaders,
+- **Native Metal** (`--device metal`, macOS) — hand-written MSL shaders,
   single-encoder dispatch, GPU argmax. Decodes ~2× faster than llama.cpp on all
   tested Q4_0 models; prefill is competitive at short prompts and trails at long
   prompts (tracked in [`profile_longctx.md`](profile_longctx.md)).
