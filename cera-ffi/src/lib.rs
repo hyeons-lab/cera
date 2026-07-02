@@ -901,9 +901,9 @@ pub struct GenerateOpts {
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     pub stop_tokens: Vec<u32>,
     /// Optional GBNF grammar **source text** constraining the output (e.g. a
-    /// JSON grammar). `None` (the default) decodes unconstrained. The grammar is
-    /// compiled on the Rust side when generation starts; a malformed grammar is
-    /// reported as a `GrammarParse` error.
+    /// JSON grammar). When absent (the default), decoding is unconstrained. The
+    /// grammar is compiled on the Rust side when generation starts; a malformed
+    /// grammar is reported as a `GrammarParse` error.
     pub grammar: Option<String>,
     /// Ignored under synchronous generate; reserved for streaming.
     pub flush_every_tokens: u32,
@@ -970,7 +970,7 @@ pub enum FinishReason {
     ContextFull,
     /// A grammar constraint left no token allowed at this step — decoding
     /// stopped because the grammar dead-ended. Only reachable when
-    /// [`GenerateOpts::grammar`] is set.
+    /// `GenerateOpts.grammar` is set.
     GrammarDeadEnd,
     Error {
         message: String,

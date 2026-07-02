@@ -143,6 +143,7 @@ private fun runOnce(args: RunArgsOwned): List<UInt> {
         minP = Settings.MIN_P,
         repetitionPenalty = Settings.REPETITION_PENALTY,
         stopTokens = emptyList(),
+        grammar = null,
         flushEveryTokens = Settings.FLUSH_EVERY_TOKENS,
         flushEveryMs = Settings.FLUSH_EVERY_MS,
     )

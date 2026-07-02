@@ -116,6 +116,7 @@ func runOnce(_ args: RunArgsOwned) throws -> [UInt32] {
         minP: Settings.minP,
         repetitionPenalty: Settings.repetitionPenalty,
         stopTokens: [],
+        grammar: nil,
         flushEveryTokens: Settings.flushEveryTokens,
         flushEveryMs: Settings.flushEveryMs
     )

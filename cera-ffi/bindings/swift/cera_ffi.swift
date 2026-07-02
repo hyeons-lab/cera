@@ -2955,9 +2955,9 @@ public struct GenerateOpts: Equatable, Hashable {
     public var stopTokens: [UInt32]
     /**
      * Optional GBNF grammar **source text** constraining the output (e.g. a
-     * JSON grammar). `None` (the default) decodes unconstrained. The grammar is
-     * compiled on the Rust side when generation starts; a malformed grammar is
-     * reported as a `GrammarParse` error.
+     * JSON grammar). When absent (the default), decoding is unconstrained. The
+     * grammar is compiled on the Rust side when generation starts; a malformed
+     * grammar is reported as a `GrammarParse` error.
      */
     public var grammar: String?
     /**
@@ -2985,9 +2985,9 @@ public struct GenerateOpts: Equatable, Hashable {
          */stopTokens: [UInt32], 
         /**
          * Optional GBNF grammar **source text** constraining the output (e.g. a
-         * JSON grammar). `None` (the default) decodes unconstrained. The grammar is
-         * compiled on the Rust side when generation starts; a malformed grammar is
-         * reported as a `GrammarParse` error.
+         * JSON grammar). When absent (the default), decoding is unconstrained. The
+         * grammar is compiled on the Rust side when generation starts; a malformed
+         * grammar is reported as a `GrammarParse` error.
          */grammar: String?, 
         /**
          * Ignored under synchronous generate; reserved for streaming.
@@ -3830,7 +3830,7 @@ public enum FinishReason: Equatable, Hashable {
     /**
      * A grammar constraint left no token allowed at this step — decoding
      * stopped because the grammar dead-ended. Only reachable when
-     * [`GenerateOpts::grammar`] is set.
+     * `GenerateOpts.grammar` is set.
      */
     case grammarDeadEnd
     case error(message: String

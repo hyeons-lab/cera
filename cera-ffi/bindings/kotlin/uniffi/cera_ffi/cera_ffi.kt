@@ -5061,9 +5061,9 @@ data class GenerateOpts(
     var `stopTokens`: List<kotlin.UInt>,
     /**
      * Optional GBNF grammar **source text** constraining the output (e.g. a
-     * JSON grammar). `None` (the default) decodes unconstrained. The grammar is
-     * compiled on the Rust side when generation starts; a malformed grammar is
-     * reported as a `GrammarParse` error.
+     * JSON grammar). When absent (the default), decoding is unconstrained. The
+     * grammar is compiled on the Rust side when generation starts; a malformed
+     * grammar is reported as a `GrammarParse` error.
      */
     var `grammar`: kotlin.String?,
     /**
@@ -5795,7 +5795,7 @@ sealed class FinishReason {
     /**
      * A grammar constraint left no token allowed at this step — decoding
      * stopped because the grammar dead-ended. Only reachable when
-     * [`GenerateOpts::grammar`] is set.
+     * `GenerateOpts.grammar` is set.
      */
     object GrammarDeadEnd : FinishReason()
 
