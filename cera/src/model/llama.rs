@@ -509,7 +509,16 @@ impl LlamaModel {
         n: usize,
         k: usize,
     ) -> bool {
+        debug_assert_eq!(wref.m, m, "gemm_preq: weight m mismatch");
+        debug_assert_eq!(wref.k, k, "gemm_preq: weight k mismatch");
         let data = transformer::weight_data(&self.gguf, wref);
+        // `b_scales`/`b_quants` are sized to the largest GEMM k-dim and shared
+        // across projections with differing k; the NEON kernels require exactly
+        // `n*k` quants / `n*(k/32)` scales, so slice to this GEMM's k. The
+        // buffer is always ≥ the needed length, and `quantize_columns` packs
+        // column j at the matching `k`-strided offset.
+        let b_scales = &b_scales[..n * (k / 32)];
+        let b_quants = &b_quants[..n * k];
         match wref.dtype {
             crate::tensor::DType::Q4_0 => unsafe {
                 crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
@@ -620,10 +629,13 @@ impl LlamaModel {
         let mut emb_buf = vec![0.0f32; hs];
         for (j, &token_id) in tokens.iter().enumerate() {
             let token_id = token_id as usize;
+            // Bound on `vocab_size` (not the possibly-padded embedding row count
+            // `embd_ref.m`) so an out-of-vocab id is rejected identically to the
+            // per-token `forward` path rather than silently reading a pad row.
             assert!(
-                token_id < self.embd_ref.m,
-                "token_id {token_id} out of range for vocab size {}",
-                self.embd_ref.m
+                token_id < cfg.vocab_size,
+                "token_id {token_id} out of range (vocab_size={})",
+                cfg.vocab_size
             );
             transformer::dequantize_row_into(&self.gguf, &self.embd_ref, token_id, &mut emb_buf);
             if cfg.scalars.embedding != 1.0 {
@@ -1061,8 +1073,12 @@ impl Model for LlamaModel {
         // targets that have a batched kernel — aarch64 NEON or any `blas` build.
         // `n == 1` stays on the per-token path to avoid GEMM setup overhead, and
         // every other target has no batched kernel, so it also falls through.
+        // When the oracle-dump harness is collecting, fall back to the per-token
+        // path too: the batched path bypasses `run_layers` and so emits none of
+        // the per-substep `oracle_dump::record` nodes that `tests/oracle_text.rs`
+        // validates against llama.cpp.
         #[cfg(any(target_arch = "aarch64", feature = "blas"))]
-        if tokens.len() > 1 {
+        if tokens.len() > 1 && !transformer::oracle_dump::is_active() {
             return self.forward_prefill_batched(tokens, start_pos, state);
         }
 

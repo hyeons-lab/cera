@@ -4,15 +4,32 @@
 //! For each model that is present locally, two fresh `InferenceState`s compute:
 //!   (a) sequential per-token logits: `forward` per token, last token's logits;
 //!   (b) batched `forward_prefill` over the whole token slice.
-//! The last-token logits must match: max-abs element diff < 1e-2 AND identical
-//! argmax. This exercises every dense arch feature — Llama-3 NORM RoPE with
+//! The last-token logits must agree by cosine similarity + identical argmax.
+//! This exercises every dense arch feature — Llama-3 NORM RoPE with
 //! freq_factors, Qwen3 per-head QK-norm + decoupled head_dim (NEOX), Qwen2 QKV
 //! bias (NEOX), and Granite's four scalar multipliers.
 //!
-//! Models are resolved from a small set of candidate roots and SKIPPED when
-//! absent (mirrors the other real-model tests) so `cargo test` never fails on a
-//! machine without the fixtures. Run with `--nocapture` to see the per-model
-//! max-abs diffs.
+//! Methodology mirrors `blas_parity.rs`: the aarch64 NEON path shares the same
+//! Q8_0-quantize + int8-dot arithmetic as the per-token `forward`, so it is
+//! bit-identical (cosine = 1.0). A `--features blas` build runs the projections
+//! through Accelerate SGEMM in f32 while decode stays on Q8_0 `gemv_preq`, so a
+//! legitimate f32-vs-int reduction difference appears (cosine ~0.996); a flat
+//! max-abs bound would spuriously fail there. We therefore assert on cosine
+//! (tight on NEON, looser on BLAS) plus top-1 agreement, which catches real
+//! layout/dim/transpose bugs while tolerating f32 reordering.
+//!
+//! Compiled only where the batched path exists (`any(aarch64, blas)`) so a
+//! non-batched target can't silently compare the per-token path against itself.
+//! Marked `#[ignore]` like the other real-model tests so the mainline
+//! `cargo test --workspace` job (which has no ~GB fixtures) does not report a
+//! meaningless green; run explicitly with fixtures present:
+//!
+//! ```text
+//! CERA_MODEL_ROOT=/path/to/checkout \
+//!   cargo test -p cera --release --test llama_batched_prefill_parity -- --ignored --nocapture
+//! ```
+
+#![cfg(any(target_arch = "aarch64", feature = "blas"))]
 
 use std::path::PathBuf;
 
@@ -47,6 +64,14 @@ fn find_model(rel: &str) -> Option<PathBuf> {
     None
 }
 
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    dot / (na * nb)
+}
+
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b.iter())
@@ -69,7 +94,9 @@ const PROMPT: &[u32] = &[
     684, 456, 2758, 302, 12707, 28723,
 ];
 
-fn run_parity(rel: &str) -> Option<(f32, usize, usize)> {
+/// Returns `(cosine, max_abs_diff, argmax_batched, argmax_sequential)` for the
+/// last-token logits, or `None` when the fixture is absent.
+fn run_parity(rel: &str) -> Option<(f32, f32, usize, usize)> {
     // Bring `Model` into scope so the boxed trait object's methods resolve.
     #[allow(unused_imports)]
     use cera::model::Model;
@@ -94,6 +121,7 @@ fn run_parity(rel: &str) -> Option<(f32, usize, usize)> {
 
     assert_eq!(logits_pre.len(), logits_seq.len(), "logit length mismatch");
     Some((
+        cosine(&logits_pre, &logits_seq),
         max_abs_diff(&logits_pre, &logits_seq),
         argmax(&logits_pre),
         argmax(&logits_seq),
@@ -101,22 +129,36 @@ fn run_parity(rel: &str) -> Option<(f32, usize, usize)> {
 }
 
 fn check(rel: &str) {
-    let Some((max_diff, top_pre, top_seq)) = run_parity(rel) else {
+    let Some((cos, max_diff, top_pre, top_seq)) = run_parity(rel) else {
         eprintln!("[parity] SKIP (absent): {rel}");
         return;
     };
-    eprintln!("[parity] {rel}: max_abs_diff={max_diff:.6e} argmax pre={top_pre} seq={top_seq}");
+    eprintln!(
+        "[parity] {rel}: cosine={cos:.6} max_abs_diff={max_diff:.4e} argmax pre={top_pre} seq={top_seq}"
+    );
+
+    // NEON shares the per-token path's Q8_0-quantize + int8-dot, so it is
+    // bit-identical (cosine = 1.0). BLAS runs projections through f32 SGEMM
+    // while decode stays Q8_0, so ~0.996 is legitimate f32 reordering. Either
+    // way a real layout/dim/transpose bug drops cosine well below these bounds
+    // or flips the argmax.
+    #[cfg(not(feature = "blas"))]
+    let (min_cos, tier) = (0.9999_f32, "NEON");
+    #[cfg(feature = "blas")]
+    let (min_cos, tier) = (0.99_f32, "BLAS");
+
+    assert!(
+        cos > min_cos,
+        "{rel}: batched-prefill vs sequential cosine = {cos} (< {min_cos} on the {tier} path) — likely a layout/dim/transpose bug"
+    );
     assert_eq!(
         top_pre, top_seq,
         "{rel}: batched-prefill argmax {top_pre} != sequential argmax {top_seq}"
     );
-    assert!(
-        max_diff < 1e-2,
-        "{rel}: batched-prefill vs sequential max-abs logit diff {max_diff} >= 1e-2"
-    );
 }
 
 #[test]
+#[ignore]
 fn llama_batched_prefill_parity_llama3() {
     // Llama-3.2-1B: arch "llama", NORM RoPE with Llama-3 `rope_freqs` factors.
     // The Q8_0 build is used (fully supported); the repo's `Llama-3.2-1B-Q4_0`
@@ -126,16 +168,19 @@ fn llama_batched_prefill_parity_llama3() {
 }
 
 #[test]
+#[ignore]
 fn llama_batched_prefill_parity_qwen3() {
     check("target/oracle/models/Qwen3-0.6B-Q8_0.gguf");
 }
 
 #[test]
+#[ignore]
 fn llama_batched_prefill_parity_qwen2() {
     check("target/oracle/models/qwen2-0_5b-instruct-q8_0.gguf");
 }
 
 #[test]
+#[ignore]
 fn llama_batched_prefill_parity_granite() {
     check("target/oracle/models/granite-3.1-2b-instruct-Q8_0.gguf");
 }
