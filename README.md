@@ -1,419 +1,211 @@
 # Cera
 
-Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
+**A Rust-native LLM inference engine.** Load a GGUF model and run it locally —
+on your laptop's CPU, an Apple GPU, a cross-platform Vulkan/DX12 GPU, a phone,
+or in the browser — from a single dependency-free core.
 
-> **Note:** This project is a learning experiment — built to explore LLM inference internals, GGUF parsing, quantization, and SIMD/GPU compute in Rust. Not intended for production use.
+> **Note:** Cera is a learning experiment — built to explore LLM inference
+> internals, GGUF parsing, quantization, and SIMD/GPU compute in Rust. It's
+> functional and reasonably fast, but not intended for production use.
 
-## Benchmarks
+## Why Cera
 
-Measured on Apple M-series (aarch64), single-socket. All models loaded from GGUF with memory-mapped weights.
+- **No Python, no runtime.** Pure Rust. The CLI is a single static binary; the
+  library has zero required system dependencies on a default build.
+- **Runs everywhere.** The same core drives a desktop CLI, Android/iOS apps
+  (via UniFFI), and the browser (via WebAssembly). Pick CPU or GPU at runtime.
+- **Loads standard GGUF.** Point it at a `.gguf` file, a
+  [LeapBundles](https://huggingface.co/LiquidAI/LeapBundles) manifest, or a
+  bundle id — it can auto-download and cache models from Hugging Face.
+- **Multimodal.** Text, vision (image → text), and audio (in/out) models all
+  load through the same session API.
+- **Structured output.** Constrain generation to a GBNF grammar — or one flag
+  for guaranteed-valid JSON.
 
-### Decode (single-token generation)
+## Supported models
 
-| Model | Quant | tok/s |
-|-------|-------|------:|
-| LFM2-450M | Q4_0 | 119 |
-| LFM2-450M | Q8_0 | 107 |
-| LFM2.5-1.6B | Q4_0 | 57 |
-| LFM2.5-1.6B | Q8_0 | 51 |
+Dispatch is on the GGUF `general.architecture` string, so any GGUF matching one
+of these architectures loads:
 
-### Prefill (prompt processing)
+| Architecture | Models | Modalities |
+|--------------|--------|------------|
+| `lfm2` | Liquid **LFM2 / LFM2.5** (the canonical LeapBundles family) | text, vision, audio |
+| `llama` | **LLaMA 2 / 3**, and classic **Mistral 7B** (ships as GGUF arch `llama`) | text |
+| `qwen2`, `qwen3` | **Qwen2 / Qwen2.5 / Qwen3** | text |
+| `granite` | **IBM Granite 3.x** | text |
 
-| Model | Quant | 32 tok | 117 tok |
-|-------|-------|-------:|--------:|
-| LFM2-450M | Q4_0 | 475 | 539 |
-| LFM2-450M | Q8_0 | 407 | 451 |
-| LFM2.5-1.6B | Q4_0 | 160 | 191 |
-| LFM2.5-1.6B | Q8_0 | 131 | 158 |
+Every architecture above runs on **all three compute backends** (CPU, Metal, and
+wgpu) with both single-token decode and batched prefill.
 
-> These short-prompt numbers predate the Accelerate BLAS wiring (see the
-> "CPU prefill via Accelerate BLAS" subsection below). At 32-117 tokens,
-> overhead and per-call dequant cost dilute the BLAS win — the long-prompt
-> table further down shows the larger speedup BLAS delivers at scale.
+### Modalities
 
-Q4_0 is faster than Q8_0 for both decode and prefill (less weight data to read per row), matching llama.cpp behavior. Prefill scales well with prompt length due to batched GEMM amortizing weight reads across all tokens.
+- **Text → text** — every supported architecture.
+- **Vision (image → text)** — LFM2-VL models. `CeraEngine` auto-attaches the
+  vision encoder; `Session::append_image` runs image → ViT → projector → prefill.
+  The ViT encoder runs on the GPU (Metal or wgpu) with a CPU fallback. Verified
+  against LFM2.5-VL-450M.
+- **Audio (in / out)** — LFM2-Audio (`lfm2-audio-v1`): feed PCM audio in, and
+  (with a vocoder) decode audio out.
 
-#### CPU prefill via Accelerate BLAS (Apple AMX) — opt-in, aarch64 only
+## Platforms & backends
 
-The batched prefill GEMM path is currently `#[cfg(target_arch = "aarch64")]`, so the BLAS rewrite only takes effect on Apple Silicon (and aarch64 Linux if anyone runs cera there). On x86_64 Linux `forward_prefill` still falls through to the per-token GEMV loop regardless of the `blas` feature — enabling BLAS on x86_64 just pulls in OpenBLAS for nothing. Extending the batched path to x86_64 is a separate follow-up.
+Cera dispatches to the fastest available backend at runtime (`--device auto`),
+or you can pin one:
 
-On aarch64 with the feature on, SGEMM dispatches through Apple's Accelerate framework (unlocking the AMX matrix unit) or through OpenBLAS on aarch64 Linux. Weights are dequantized row-by-row into a reusable `InferenceState` scratch, then multiplied by the f32 input columns — eight call sites per layer (conv in/out proj, attn Q/K/V/output, FFN gate/up/down).
+| Backend | `--device` | Platforms | Notes |
+|---------|-----------|-----------|-------|
+| **CPU** | `cpu` | everywhere | Scalar reference + **NEON** (aarch64) / **AVX2** (x86_64) kernels; optional **Accelerate/OpenBLAS** via the `blas` feature |
+| **Native Metal** | `metal` | macOS | Hand-written MSL shaders, single-encoder dispatch, GPU argmax |
+| **wgpu** | `gpu` | macOS, Linux, Windows, browser | WGSL shaders over **Metal / Vulkan / DX12 / WebGPU** |
 
-On LFM2.5-VL-1.6B-Q4_0 with a 2002-token prompt (CPU, M-series):
+`--device auto` prefers native Metal on Apple platforms and wgpu elsewhere.
 
-| Path | Prefill (tok/s, p50) |
-|---|---:|
-| NEON integer GEMM (default) | 146 |
-| **Accelerate SGEMM (AMX, `--features blas`)** | **279** |
+### Quantization
 
-That's a **1.91× end-to-end prefill speedup**. A standalone GEMM microbench on the ffn_up shape `(m=6912, n=2002, k=2048)` shows Accelerate SGEMM at **1885 GFLOPs/s** vs the NEON Q4_0 × Q8_0 kernel at **645 GFLOPs/s** — a ~3× kernel speedup, diluted at the end-to-end level by non-GEMM attention compute.
+Weights load in **Q4_0**, **Q8_0**, **Q6_K**, and **Q4_K_M**; dense **F32 / F16 /
+BF16** are also supported. Activations are dynamically quantized to Q8_0 for fast
+integer GEMV on CPU.
 
-Gated behind the **opt-in** `blas` feature so default builds stay zero-dependency. To enable on macOS (Accelerate is system-provided, no install needed):
+## Language bindings
 
-```bash
-cargo build --release -p cera-cli --features blas
-```
+One Rust core, consumed from many places:
 
-To enable on Linux (requires a system OpenBLAS install):
+| Target | Crate / package | Consumers |
+|--------|-----------------|-----------|
+| **Rust** | [`cera`](cera/) | any Rust project (`cargo add cera`) |
+| **CLI** | [`cera-cli`](cera-cli/) | the `cera` binary |
+| **Kotlin / Swift / Python** | [`cera-ffi`](cera-ffi/) (UniFFI) | JVM, Apple platforms |
+| **Android** | [`cera-ffi-kotlin`](cera-ffi-kotlin/) | Android apps (AAR) |
+| **Flutter / Dart** | [`cera-ffi-flutter`](cera-ffi-flutter/) | cross-platform mobile |
+| **Browser / Node** | [`cera-wasm`](cera-wasm/) (`@hyeons-lab/cera-wasm`) | WebAssembly + WebGPU |
 
-```bash
-sudo apt-get install libopenblas-dev pkg-config
-cargo build --release -p cera-cli --features blas
-```
+## Structured output (GBNF grammars)
 
-Default builds — `cargo build --release` with no features — use the pure-NEON integer GEMM path on aarch64 and need no system libraries.
-
-### GPU backends
-
-Two GPU backends with runtime selection via `--device`:
-
-**Native Metal** (`--device metal`, macOS/iOS) — hand-written MSL shaders, single-encoder dispatch, GPU argmax. Decodes ~2× faster than llama.cpp on all tested Q4_0 models; prefill is competitive at short prompts and trails at long prompts (tracked in `benchmarks/profile_longctx.md`).
-
-**wgpu** (`--device gpu`, cross-platform) — WGSL shaders targeting Metal/Vulkan/DX12/WebGPU. Portable but slower due to API translation overhead.
-
-#### Decode throughput vs llama.cpp (greedy, M1 Max, Q4_0)
-
-| Model             | Test  | llama.cpp | cera Metal       |
-|-------------------|-------|----------:|-----------------:|
-| LFM2.5-VL-450M    | tg128 | 142       | **351** (+147%)  |
-| LFM2.5-VL-450M    | tg512 | 139       | **321** (+131%)  |
-| LFM2.5-VL-1.6B    | tg128 | 128       | **261** (+104%)  |
-| LFM2.5-VL-1.6B    | tg512 | 122       | **223** (+83%)   |
-| LFM2.5-Audio-1.5B | tg128 | 107*      | **226** (+111%)  |
-| LFM2.5-Audio-1.5B | tg512 | 115       | **222** (+93%)   |
-
-\* Audio tg128 is llama-bench noisy at r=10 (σ ≈ ±45). Steady-state Audio
-decode sits near the tg512 number.
-
-Both engines are primed with a 128-token prefill, then decode tok/s is
-timed over the next 128 or 512 tokens (no timing includes the prefill).
-Reproduction commands:
-
-```
-# cera (per row, swap --max-tokens)
-cera bench -m model.gguf --device metal --no-cache --prompt-tokens 128 --max-tokens 128 --runs 20 --warmup 3
-cera bench -m model.gguf --device metal --no-cache --prompt-tokens 128 --max-tokens 512 --runs 20 --warmup 3
-
-# llama.cpp (per row, swap -n)
-llama-bench -m model.gguf -p 128 -n 128 -ngl 99 -r 10
-llama-bench -m model.gguf -p 128 -n 512 -ngl 99 -r 10
-```
-
-#### Prefill throughput vs llama.cpp (Q4_0, Metal, M1 Max)
-
-| Model          | Prompt | llama.cpp | cera Metal      | Ratio |
-|----------------|-------:|----------:|----------------:|------:|
-| LFM2.5-VL-450M | 128    | 7619      | **8315** (+9%)  | 1.09× |
-| LFM2.5-VL-450M | 1024   | 8213      | 6411            | 0.78× |
-| LFM2.5-VL-450M | 4096   | 7008      | 2817            | 0.40× |
-| LFM2.5-VL-1.6B | 128    | 2750      | 2567            | 0.93× |
-| LFM2.5-VL-1.6B | 1024   | 2481      | 1864            | 0.75× |
-| LFM2.5-VL-1.6B | 4096   | 2178      | 1135            | 0.52× |
-
-Cera leads on 450M at p=128 and is competitive on 1.6B at p=128;
-llama.cpp's BLAS-backed GEMM still wins at p=1024 and p=4096 on both
-models. PR [#20](https://github.com/hyeons-lab/cera/pull/20) landed a
-**+26% improvement** to Metal prefill at p=4096 (2227 → 2817 tok/s on
-LFM2.5-VL-450M) via a one-simdgroup-per-query rewrite of
-`attention_prefill.metal`. Further work on the long-prompt gap is
-tracked in `benchmarks/profile_longctx.md`.
-
-Reproduction commands:
-
-```
-# cera (per row, swap --prompt-tokens)
-cera bench -m model.gguf --device metal --no-cache --context-size 8192 --prompt-tokens 128  --max-tokens 0 --runs 20 --warmup 3
-cera bench -m model.gguf --device metal --no-cache --context-size 8192 --prompt-tokens 1024 --max-tokens 0 --runs 20 --warmup 3
-cera bench -m model.gguf --device metal --no-cache --context-size 8192 --prompt-tokens 4096 --max-tokens 0 --runs 20 --warmup 3
-
-# llama.cpp (per row, swap -p)
-llama-bench -m model.gguf -p 128  -n 0 -ngl 99 -r 20
-llama-bench -m model.gguf -p 1024 -n 0 -ngl 99 -r 20
-llama-bench -m model.gguf -p 4096 -n 0 -ngl 99 -r 20
-```
-
-#### Key Metal optimizations
-
-- **GPU argmax** — greedy sampling on GPU, avoids 256KB logits readback (+57%)
-- **Q6_K native embedding GEMV** — reads 52 MB Q6_K bytes directly, no f32 dequant
-- **llama.cpp-derived fast Q4_0 GEMV** — pre-scaled y, uint16 nibble loads, sumy bias hoisting
-- **Fused gate+up GEMV** — single dispatch for both FFN projections
-- **Fused QK norm + RoPE** — 3 dispatches → 1 per attention layer
-- **Vectorized attention V loads** — float2 loads in weighted-sum phase
-- **Residual accumulate in GEMV** — `y += W×x` instead of separate add
-
-#### Key wgpu optimizations
-
-- **Compute pass batching** — 300 passes → ~80 per token (+30%)
-- **Fast Q4_0 GEMV** — ported Metal algorithm to WGSL with subgroupAdd
-- **Multi-row f32 GEMV** — 8 rows per workgroup, 8× less input bandwidth
-
-### Key optimizations
-
-- **Batched GEMM prefill** — reads each weight matrix once for all N tokens (vs N times with per-token GEMV)
-- **8-column grouped Q4_0 GEMM** — decode weight blocks once, dot against 8 input columns
-- **Integer Q4_0/Q8_0/Q6_K GEMV** — quantize activations to Q8_0, integer dot product via `vdotq_s32`
-- **Pre-quantize shared inputs** — one Q8_0 quantization reused across Q/K/V and gate/up projections
-- **NEON attention** — vectorized Q*K scores and softmax*V weighted sums with `vfmaq_f32`
-- **3-phase batched prefill** — batch input projections (GEMM) -> sequential core (conv/attention) -> batch output projections (GEMM)
-- **Software prefetch** in GEMV/GEMM inner loops
-
-## TurboQuant KV Cache Compression
-
-Cera includes the **first implementation of the TurboQuant algorithm** ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874), Google Research 2025) **for LFM2 architectures**, compressing **both keys and values**. llama.cpp already supports simpler quantized KV caches (q4_0, q4_1, q8_0) for LFM2; TurboQuant is a newer, more sophisticated algorithm that offers better accuracy-per-bit via a data-oblivious rotation + residual correction pipeline.
-
-### What it is
-
-TurboQuant compresses KV cache **keys to ~3 bits/element** and **values to ~2 bits/element** (together ~12× reduction vs f32) with near-lossless accuracy and **no calibration or fine-tuning** required.
-
-**Keys (3-bit)** — two-stage compression:
-1. **PolarQuant (2-bit)** — Randomized Hadamard Transform rotates each key vector, then quantizes coordinates to 4 Lloyd-Max centroids for the resulting Beta distribution. The rotation makes the distribution predictable, so no per-block scale factors are needed.
-2. **QJL (1-bit)** — Quantized Johnson-Lindenstrauss sign bits on the residual provide an *unbiased* inner-product estimator that corrects PolarQuant bias during attention score computation.
-
-**Values (2-bit)** — PolarQuant only. The attention operation on values is a weighted sum (not an inner product), so the QJL residual estimator doesn't apply — values need actual vector reconstruction, which PolarQuant gives directly. The weighted sum is computed in *rotated* 2-bit centroid space; a single `rht_inverse` per attention head at the end recovers the original basis (exploiting linearity of the transform). This makes values even cheaper than keys while maintaining good quality.
-
-### How it compares
-
-| Approach | Bits per key | Bits per value | Calibration | Unbiased estimator |
-|----------|---:|---:|:-:|:-:|
-| f32 (cera default) | 32 | 32 | — | — |
-| f16 (llama.cpp default) | 16 | 16 | — | — |
-| llama.cpp q8_0 KV | 8 | 8 | — | — |
-| llama.cpp q4_0 KV | 4 | 4 | — | — |
-| **cera TurboQuant tq3** | **3** | **2** | **no** | **yes** (keys) |
-
-TurboQuant's differentiators:
-
-- **Fewer bits per element** — 3+2 bits/KV vs q4_0's 4+4 bits/KV, via the rotation that eliminates the need for per-block scales.
-- **Unbiased attention score estimator** — the QJL correction term is provably unbiased for keys, while q4_0/q8_0 introduce bias that can compound across long contexts.
-- **Data-oblivious** — no calibration pass or fine-tuning; works on any model at any time.
-
-### Memory footprint
-
-| Format | Bytes/key + value (head_dim=128) | Compression |
-|--------|---:|---:|
-| f32 (cera default) | 512 + 512 = 1024 | 1× |
-| f16 | 256 + 256 = 512 | 2× |
-| **TurboQuant tq3** | **52 + 34 = 86** | **~12×** |
-
-For a 1.6B LFM2 model with 6 attention layers, n_kv_heads=8, at 4096 tokens:
-- **Uncompressed:** ~192 MB
-- **TurboQuant tq3:** ~16 MB
-
-Savings scale linearly with context length — at 8K+ tokens the KV cache dominates and savings approach the theoretical ~12×.
-
-### Throughput
-
-After full optimization (NEON SIMD, GQA batching, zero heap in hot path, fused encode pipeline), **TurboQuant decode is within ±5% of cera f32** and sometimes *faster* (the GQA-batched attention with pre-computed scratch amortizes better than the original f32 path at short contexts). Values reuse the same NEON kernel pattern as keys for the hot inner loop.
-
-### Backend support
-
-**TurboQuant is currently implemented only on the CPU backend (`Lfm2Model`).** The Metal and wgpu GPU backends do not yet honor the compressed caches — passing `--kv-cache-keys tq3` to a GPU run will log a warning and fall back to f32 KV. See the CPU-only limitation note in the memory-footprint comparison above if you need to pick a backend.
-
-### CLI: enabling TurboQuant
-
-Both `cera run` and `cera bench` accept `--kv-cache-keys` (the flag name is kept for backwards compatibility; it now covers values too):
+Force the model's output to match a grammar — useful for JSON, tool calls, or any
+schema. Cera ships a byte-level GBNF engine (mirroring llama.cpp's) that masks the
+sampler each step so only grammar-valid tokens can be produced.
 
 ```bash
-# Uncompressed (default) — keys and values stored as f32
-cera run -m lfm2.gguf -p "Hello" --kv-cache-keys f32 --device cpu
+# Guaranteed-valid JSON (bundled grammar)
+cera run -m model.gguf -p "List 3 colors as JSON" --json
 
-# Full TurboQuant — 3-bit keys + 2-bit values (production default, CPU backend only)
+# Any custom GBNF (inline or @file)
+cera run -m model.gguf -p "..." --grammar @schema.gbnf
+```
+
+Supports literals, character classes, alternation, grouping, and repetition
+(`* + ?` and bounded `{n,m}`). Exposed programmatically via `GenerateOpts.grammar`.
+
+## TurboQuant KV-cache compression
+
+Cera includes the **first implementation of TurboQuant**
+([arXiv:2504.19874](https://arxiv.org/abs/2504.19874), Google Research 2025) for
+LFM2 — compressing the KV cache to **~3 bits/key + ~2 bits/value (~12× vs f32)**
+with near-lossless quality and **no calibration**. On a 1.6B LFM2 model at 4K
+tokens that's ~192 MB → ~16 MB of KV, with decode staying within ±5% of f32.
+
+Enable it on the CLI (CPU backend):
+
+```bash
 cera run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3 --device cpu
-
-# Keys only — 3-bit keys, values stay f32 (debugging: isolate key error)
-cera run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3-keys --device cpu
-
-# Values only — values stay 2-bit, keys stay f32 (debugging: isolate value error)
-cera run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3-values --device cpu
 ```
 
-Accepted values for `--kv-cache-keys`:
+> Currently **CPU-only** (the Metal/wgpu backends fall back to f32 KV). See the
+> [`cera` crate README](cera/README.md) and `cera/src/turboquant.rs` for the
+> algorithm (PolarQuant + QJL) and the full compression/quality tables.
 
-| Value | Keys | Values | Use case |
-|-------|:-:|:-:|---|
-| `f32` / `none` | f32 | f32 | Baseline, no compression (default) |
-| `tq3` / `turboquant` | 3-bit | 2-bit | Production — both sides compressed |
-| `tq3-keys` | 3-bit | f32 | Debug: measure key-only drift |
-| `tq3-values` | f32 | 2-bit | Debug: measure value-only drift |
-
-The same flag applies to `cera bench` for A/B benchmarking:
+## Quick start
 
 ```bash
-cera bench -m lfm2.gguf --kv-cache-keys tq3 --max-tokens 256 --device cpu
+# Build the CLI (add --features metal or --features gpu for a GPU build)
+cargo install cera-cli
+# ...or from source:
+just release   # optimized LTO build → target/release/cera
 ```
 
-### Programmatic API
+```bash
+# Generate from a local GGUF
+cera run --model model.gguf --prompt "Explain quantization in one sentence."
 
-TurboQuant is configured in a **single call** — construct a `KvCompression` and pass it to `InferenceState::from_config_with_compression` or via `GenerateConfig`. No separate `enable_turboquant` call is needed; the rotation state, compressed caches, and scratch buffers are all set up on the `InferenceState` from the same configuration.
+# Auto-download a bundle from Hugging Face and generate
+cera run --bundle-id LFM2.5-1.2B-Instruct --quant Q4_0 --prompt "Hello"
+
+# Interactive multi-turn chat (keeps the prefix cache warm across turns)
+cera chat --bundle-id LFM2.5-1.2B-Instruct --quant Q4_0
+
+# Pick a GPU
+cera run -m model.gguf -p "Hi" --device metal   # or: gpu, cpu, auto
+```
+
+Using the library directly (streaming tokens through a sink):
 
 ```rust
-use cera::kv_cache::{InferenceState, KvCompression};
+use cera::{CeraEngine, EngineConfig, GenerateOpts, SessionConfig};
 
-// Production: both sides compressed. The single `seed` drives the
-// per-layer randomized Hadamard rotations deterministically.
-let state = InferenceState::from_config_with_compression(
-    model.config(),
-    &KvCompression::turboquant(42),
-);
+let engine = CeraEngine::from_path("model.gguf", EngineConfig::default())?;
+let mut session = engine.new_session(SessionConfig::default());
+session.append_text("Once upon a time")?;
 
-// Or via the bench/engine config:
-let gen_cfg = cera::engine::GenerateConfig {
-    kv_compression: KvCompression::turboquant(42),
-    ..Default::default()
-};
+let opts = GenerateOpts { max_tokens: 128, ..Default::default() };
+let summary = session.generate(&opts, &mut sink)?; // sink: your ModalitySink
 ```
 
-All four modes:
+See the [`cera` crate README](cera/README.md) for the full library API.
 
-```rust
-// Disabled — f32 KV for both keys and values (default)
-let cfg = KvCompression::None;
+## CLI commands
 
-// Both compressed — the shortcut wraps the common case
-let cfg = KvCompression::turboquant(42);
+| Command | Purpose |
+|---------|---------|
+| `run` | One-shot inference — text, optional grammar/JSON, plus image/audio input for VL/Audio bundles |
+| `chat` | Interactive multi-turn REPL with a persistent KV prefix cache |
+| `inspect` | Dump a GGUF's metadata, tensor shapes, and resolved backend tier |
+| `cpu` | Print the host's CPU backend tier + detected SIMD features (no model needed) |
+| `tokenize` | Encode text to token IDs (e.g. to compare against Hugging Face) |
+| `bench` | Measure decode/prefill throughput with p10/p50/p90/mean/stddev |
+| `list-bundles` | List bundles available on `LiquidAI/LeapBundles` |
+| `download-bundles` | Prefetch bundle manifests + model files without loading |
 
-// Or with explicit key/value flags (matches the CLI modes)
-let cfg = KvCompression::TurboQuant { seed: 42, keys: true,  values: true  }; // == tq3
-let cfg = KvCompression::TurboQuant { seed: 42, keys: true,  values: false }; // == tq3-keys
-let cfg = KvCompression::TurboQuant { seed: 42, keys: false, values: true  }; // == tq3-values
-```
+## Other features
 
-To check whether a loaded model's backend supports TurboQuant, call `model.turboquant_supported()` before asking for compression — it returns `false` on GPU backends and on any model whose `head_dim` isn't a power of 2 (the Walsh-Hadamard transform requires it).
-
-See `cera/src/turboquant.rs` for the implementation and `cera/src/kv_cache.rs` for the `KvCompression` enum.
-
-## Features
-
-- **GGUF model loading** with memory-mapped tensors
-- **Three compute backends** — CPU (NEON SIMD), native Metal (MSL), wgpu (WGSL/Vulkan/Metal/DX12)
-- **Hybrid architectures** — LFM2/LFM2.5 (gated conv + grouped query attention)
-- **Quantization** — Q4_0, Q8_0, Q6_K, Q4_K_M for weights
-- **TurboQuant KV cache compression** — ~12× KV reduction (3-bit keys + 2-bit values), unbiased attention estimator, first TurboQuant implementation for LFM2
-- **Built-in BPE tokenizer** — no Python, no runtime dependencies
-- **Bench harness** — `cera bench` with p10/p50/p90/stddev for reproducible A/B comparisons
-- **Chat mode** with Jinja2 chat template rendering
-- **Single static binary**
-- **Multi-target FFI bindings** — JVM (Android), Apple platforms (iOS / macOS XCFramework), and browser / Node (`@hyeons-lab/cera-wasm`) all driven from the same Rust core via `cera-ffi` (UniFFI) and `cera-wasm` (`wasm-bindgen`).
-
-## Build
-
-```bash
-# Debug build
-cargo build --workspace
-
-# Optimized release build (LTO, stripped)
-just release
-
-# Run
-cargo run --release -p cera-cli -- run --model model.gguf --prompt "Hello, world!"
-```
-
-## Usage
-
-```bash
-# Generate text
-cera run --model model.gguf --prompt "What is Rust?"
-
-# Inspect a model file
-cera inspect --model model.gguf
-
-# Interactive chat
-cera chat --model model.gguf
-
-# Tokenize (for debugging)
-cera tokenize --model model.gguf "Hello world"
-```
+- **Streaming & cancellation** — tokens (and audio frames) arrive through a
+  `ModalitySink` as they decode; `Session::cancel()` interrupts long prompts
+  responsively via chunked prefill.
+- **Prefix caching** — warm (in-memory) and cold (on-disk) KV reuse across
+  sessions, namespaced by model fingerprint, so repeated prompt prefixes skip
+  re-prefill.
+- **Chat templates** — Jinja2 (minijinja) rendering straight from GGUF metadata,
+  including multimodal (image + text) messages.
+- **Context shifting** — RoPE re-rotation with `n_keep` prefix pinning, on CPU
+  and GPU, keeps generation going past the context window.
+- **Built-in BPE tokenizer** — vocab, merges, and special tokens loaded directly
+  from GGUF; no external tokenizer files.
 
 ## Architecture
 
-Five-crate workspace:
+Cera is a Cargo workspace. The core library does GGUF parsing, quantization, the
+compute backends, the models, and the tokenizer; everything else is a thin
+adapter over it.
 
-- **`cera`** — core library (GGUF parsing, quantization, compute backends, models, tokenizer)
-- **`cera-cli`** — CLI binary (clap, dispatches to `cera`)
-- **`cera-ffi`** — UniFFI bindings for foreign-language consumers (Kotlin, Swift, Python, …). See [`cera-ffi/README.md`](cera-ffi/README.md) for scope + roadmap.
-- **`cera-wasm`** — `wasm-bindgen` browser / Node bindings (`@hyeons-lab/cera-wasm` shape). See [`cera-wasm/README.md`](cera-wasm/README.md) for usage + worker / cancellation patterns.
-- **`cera-parity`** — cross-binding parity harness that runs the same prompt through `cera`, `cera-ffi` (JNA / Swift), and reports drift. See [`cera-parity/README.md`](cera-parity/README.md).
+- **[`cera`](cera/)** — core library
+- **[`cera-cli`](cera-cli/)** — CLI binary (clap)
+- **[`cera-ffi`](cera-ffi/)** — UniFFI bindings (Kotlin / Swift / Python)
+- **[`cera-ffi-kotlin`](cera-ffi-kotlin/)** · **[`cera-ffi-flutter`](cera-ffi-flutter/)** — Android / Flutter packaging
+- **[`cera-wasm`](cera-wasm/)** — `wasm-bindgen` browser / Node bindings
+- **[`cera-parity`](cera-parity/)** — cross-binding parity harness (runs one prompt through every binding and reports drift)
 
-### Module layout
+See the [`cera` crate README](cera/README.md) for the module layout, the model
+trait, and the inference loop.
 
-```
-cera/src/
-├── gguf.rs              # mmap-based GGUF parser (zero-copy tensor access)
-├── tensor.rs            # DType enum (F32, F16, BF16, Q4_0, Q8_0, Q4_K_M, Q6_K)
-├── quant.rs             # Block structs + scalar dequant/vec_dot kernels
-├── turboquant.rs        # TurboQuant KV cache compression (PolarQuant + QJL)
-├── kv_cache.rs          # InferenceState, LayerState (attention/conv), scratch buffers
-├── tokenizer.rs         # BPE tokenizer + minijinja chat template rendering
-├── sampler.rs           # Temperature/top-k/top-p sampling, greedy fast path
-├── engine.rs            # generate() loop: prefill → decode
-├── backend/
-│   ├── cpu.rs           # Scalar reference + NEON attention kernels
-│   ├── simd.rs          # NEON (aarch64) + AVX2 (x86_64) GEMV/GEMM kernels
-│   ├── wgpu.rs          # wgpu cross-platform GPU backend
-│   └── metal.rs         # Native Metal backend (MSL shaders)
-└── model/
-    ├── mod.rs           # Model trait, ModelConfig, BlockType enum
-    ├── lfm2.rs          # LFM2 hybrid (conv + attention), CPU path
-    ├── gpu_lfm2.rs      # LFM2 on wgpu
-    ├── metal_lfm2.rs    # LFM2 on native Metal
-    └── llama.rs         # LLaMA-family stub (stub; future work)
-```
+## Performance
 
-### Model loading
+Cera is competitive with — and on decode, often faster than — llama.cpp on the
+LFM2 family. On an M1 Max with Q4_0 weights, the native Metal backend decodes
+roughly **2× faster than llama.cpp** across tested VL and Audio models; prefill
+leads at short prompts and trails at long ones.
 
-GGUF files are memory-mapped via `memmap2`. Two tensor access patterns:
-
-- `get_tensor(name)` — copies data into an owned `Tensor` (f32 dequantize for small weights like norms)
-- `tensor_data(name)` — returns a zero-copy `&[u8]` slice into the mmap for quantized weights
-
-All offsets validated with checked arithmetic (`checked_add`, `usize::try_from`).
-
-### Quantization formats
-
-| Format | Block size | Bytes/block | Use case |
-|--------|---:|---:|----------|
-| Q4_0 | 32 values | 18 B | Most weight matrices |
-| Q8_0 | 32 values | 34 B | Activations (dynamic quantization for integer GEMV) |
-| Q4_K_M | 256 values | 144 B | Higher-quality 4-bit with sub-block scales |
-| Q6_K | 256 values | 210 B | Embedding matrices (Metal backend) |
-
-Each format has `dequantize_*` (block → f32) and `vec_dot_*` (dot product without full dequant) paths. SIMD variants in `backend/simd.rs` use `vdotq_s32` on aarch64 and AVX2 on x86_64.
-
-### Compute backend tiers
-
-1. **Scalar CPU** (`backend/cpu.rs`) — reference implementations operating on raw `&[f32]` slices, no `Tensor` in the hot path
-2. **NEON SIMD** (aarch64) — vectorized Q4_0/Q8_0/Q6_K/Q4_K_M GEMV, attention scores, attention values
-3. **AVX2 SIMD** (x86_64) — dot product kernels for dense dispatch
-4. **Native Metal** (macOS/iOS only, `backend/metal.rs`) — hand-written MSL shaders, single-encoder dispatch, GPU argmax
-5. **wgpu** (cross-platform) — WGSL shaders targeting Metal/Vulkan/DX12/WebGPU via the wgpu crate
-
-Runtime dispatch via `--device` flag: `cpu | metal | gpu | auto`.
-
-### Hybrid model support (LFM2/LFM2.5)
-
-Unlike pure transformers, LFM2 interleaves two block types per layer:
-
-- **Gated convolution blocks** — depthwise 1D conv with gating, rolling buffer for O(1) decode
-- **Grouped query attention blocks** — standard GQA with per-head QK RMSnorm and RoPE
-
-`ModelConfig.block_types: Vec<BlockType>` specifies the per-layer pattern. `LayerState` tracks either a KV cache (attention) or a conv rolling buffer. TurboQuant only applies to attention layers.
-
-### Inference loop
-
-```
-generate() in engine.rs:
-  1. Prefill: forward_prefill(prompt_tokens, ...)
-     - Batched GEMM for Q/K/V/FFN projections (read weights once)
-     - Per-token attention + conv (sequential)
-     - Batched GEMM for output projection
-  2. Decode loop:
-     - forward(next_token, ...)
-     - Per-token GEMV (reads weights every token)
-     - Sampler picks next token (greedy fast path avoids logits readback)
-```
-
-See the benchmark tables above for per-backend performance.
+Detailed methodology, per-model tables (decode + prefill vs llama.cpp), the
+Accelerate/AMX BLAS results, and the backend optimization notes live in
+**[`benchmarks/README.md`](benchmarks/README.md)**.
 
 ## License
 
