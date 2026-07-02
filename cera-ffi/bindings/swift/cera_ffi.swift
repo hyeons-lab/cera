@@ -2954,6 +2954,13 @@ public struct GenerateOpts: Equatable, Hashable {
      */
     public var stopTokens: [UInt32]
     /**
+     * Optional GBNF grammar **source text** constraining the output (e.g. a
+     * JSON grammar). When absent (the default), decoding is unconstrained. The
+     * grammar is compiled on the Rust side when generation starts; a malformed
+     * grammar is reported as a `GrammarParse` error.
+     */
+    public var grammar: String?
+    /**
      * Ignored under synchronous generate; reserved for streaming.
      */
     public var flushEveryTokens: UInt32
@@ -2977,6 +2984,12 @@ public struct GenerateOpts: Equatable, Hashable {
          * Early-stop IDs (EOS / instruction markers / end-of-turn).
          */stopTokens: [UInt32], 
         /**
+         * Optional GBNF grammar **source text** constraining the output (e.g. a
+         * JSON grammar). When absent (the default), decoding is unconstrained. The
+         * grammar is compiled on the Rust side when generation starts; a malformed
+         * grammar is reported as a `GrammarParse` error.
+         */grammar: String?, 
+        /**
          * Ignored under synchronous generate; reserved for streaming.
          */flushEveryTokens: UInt32, 
         /**
@@ -2989,6 +3002,7 @@ public struct GenerateOpts: Equatable, Hashable {
         self.minP = minP
         self.repetitionPenalty = repetitionPenalty
         self.stopTokens = stopTokens
+        self.grammar = grammar
         self.flushEveryTokens = flushEveryTokens
         self.flushEveryMs = flushEveryMs
     }
@@ -3016,6 +3030,7 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
                 minP: FfiConverterFloat.read(from: &buf), 
                 repetitionPenalty: FfiConverterFloat.read(from: &buf), 
                 stopTokens: FfiConverterSequenceUInt32.read(from: &buf), 
+                grammar: FfiConverterOptionString.read(from: &buf), 
                 flushEveryTokens: FfiConverterUInt32.read(from: &buf), 
                 flushEveryMs: FfiConverterUInt32.read(from: &buf)
         )
@@ -3029,6 +3044,7 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
         FfiConverterFloat.write(value.minP, into: &buf)
         FfiConverterFloat.write(value.repetitionPenalty, into: &buf)
         FfiConverterSequenceUInt32.write(value.stopTokens, into: &buf)
+        FfiConverterOptionString.write(value.grammar, into: &buf)
         FfiConverterUInt32.write(value.flushEveryTokens, into: &buf)
         FfiConverterUInt32.write(value.flushEveryMs, into: &buf)
     }
@@ -3670,6 +3686,14 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
      */
     case Backend(detail: String
     )
+    /**
+     * The GBNF grammar string passed in `GenerateOpts.grammar` failed to
+     * compile. Grammar compilation happens in the FFI wrapper (the compiled
+     * grammar object can't cross the boundary, so callers pass the source text
+     * and it's parsed here). `detail` carries the parser's diagnostic.
+     */
+    case GrammarParse(detail: String
+    )
 
     
 
@@ -3714,6 +3738,9 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             detail: try FfiConverterString.read(from: &buf)
             )
         case 8: return .Backend(
+            detail: try FfiConverterString.read(from: &buf)
+            )
+        case 9: return .GrammarParse(
             detail: try FfiConverterString.read(from: &buf)
             )
 
@@ -3764,6 +3791,11 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(8))
             FfiConverterString.write(detail, into: &buf)
             
+        
+        case let .GrammarParse(detail):
+            writeInt(&buf, Int32(9))
+            FfiConverterString.write(detail, into: &buf)
+            
         }
     }
 }
@@ -3795,6 +3827,12 @@ public enum FinishReason: Equatable, Hashable {
     case stop
     case cancelled
     case contextFull
+    /**
+     * A grammar constraint left no token allowed at this step — decoding
+     * stopped because the grammar dead-ended. Only reachable when
+     * `GenerateOpts.grammar` is set.
+     */
+    case grammarDeadEnd
     case error(message: String
     )
 
@@ -3826,7 +3864,9 @@ public struct FfiConverterTypeFinishReason: FfiConverterRustBuffer {
         
         case 4: return .contextFull
         
-        case 5: return .error(message: try FfiConverterString.read(from: &buf)
+        case 5: return .grammarDeadEnd
+        
+        case 6: return .error(message: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -3853,8 +3893,12 @@ public struct FfiConverterTypeFinishReason: FfiConverterRustBuffer {
             writeInt(&buf, Int32(4))
         
         
-        case let .error(message):
+        case .grammarDeadEnd:
             writeInt(&buf, Int32(5))
+        
+        
+        case let .error(message):
+            writeInt(&buf, Int32(6))
             FfiConverterString.write(message, into: &buf)
             
         }
@@ -4006,6 +4050,30 @@ fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterUInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
+    typealias SwiftType = String?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterString.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }

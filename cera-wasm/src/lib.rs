@@ -908,6 +908,30 @@ impl GenerateOpts {
     pub fn set_flush_every_ms(&mut self, v: u32) {
         self.inner.flush_every_ms = v;
     }
+
+    /// Constrain decoding to a GBNF grammar (source text, e.g. a JSON grammar).
+    /// Each step masks the logits so only tokens the grammar accepts are
+    /// sampled. Throws a `JsError` if the grammar fails to compile; replaces any
+    /// grammar set by a prior call. A setter can't surface the parse error, so
+    /// this is a method rather than a `grammar` property.
+    #[wasm_bindgen(js_name = setGrammar)]
+    pub fn set_grammar(&mut self, gbnf: &str) -> Result<(), JsError> {
+        let grammar = cera::grammar::Grammar::parse(gbnf).map_err(map_err)?;
+        self.inner.grammar = Some(std::sync::Arc::new(grammar));
+        Ok(())
+    }
+
+    /// Remove any grammar constraint, returning to unconstrained decoding.
+    #[wasm_bindgen(js_name = clearGrammar)]
+    pub fn clear_grammar(&mut self) {
+        self.inner.grammar = None;
+    }
+
+    /// Whether a grammar constraint is currently set.
+    #[wasm_bindgen(getter, js_name = hasGrammar)]
+    pub fn has_grammar(&self) -> bool {
+        self.inner.grammar.is_some()
+    }
 }
 
 /// Summary returned from a completed `Session.generate` call.
