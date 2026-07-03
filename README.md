@@ -36,9 +36,9 @@ of these architectures loads:
 
 Every architecture above runs on **all three compute backends** (CPU, Metal, and
 wgpu), with single-token decode and prompt prefill on each. Prefill uses
-batched-GEMM (each weight read once for the whole prompt) on the GPU backends for
-every architecture, and on CPU for LFM2; CPU prefill for the dense transformers
-is currently sequential per-token.
+batched-GEMM (each weight read once for the whole prompt) on every backend and
+architecture — including CPU for both LFM2 and the dense transformers — with a
+tiled flash-attention path that kicks in for long prompts.
 
 ### Modalities
 
