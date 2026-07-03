@@ -3,7 +3,7 @@ description: >-
   Flutter/Dart bindings for the Cera inference engine. Wraps the cera-ffi
   UniFFI surface (the same C ABI behind the Kotlin and Swift bindings) plus a
   platform-aware native-library loader.
-version: 0.1.1
+version: 0.2.0
 publish_to: none
 repository: https://github.com/hyeons-lab/cera
 
