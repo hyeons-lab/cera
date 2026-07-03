@@ -66,7 +66,7 @@ tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-t
 # `sha2` + `std-fs` — the downloader + per-file SHA-256 verifier.
 # Default features (`parallel`, `mmap`, `std-fs`, `disk-cache`) stay
 # on; `CeraEngine::from_bundle_id` requires both `remote` and `mmap`.
-cera = { path = "../cera", version = "0.1.1", features = ["remote"] }
+cera = { path = "../cera", version = "0.2.0", features = ["remote"] }
 
 [dev-dependencies]
 # Full tokio feature set for `#[tokio::test]` so the async unit tests

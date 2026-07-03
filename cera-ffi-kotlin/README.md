@@ -37,7 +37,7 @@ the native libs per runner (macOS/Linux/Windows + Android NDK), then publishes
 `cera-ffi` to Maven Central via the vanniktech plugin. The version (`VERSION_NAME`
 in `gradle.properties`) tracks the Cargo workspace version, so the Kotlin/Android
 artifacts release under the **same** version as the crates.io and npm artifacts —
-e.g. `0.1.1` everywhere.
+e.g. `0.2.0` everywhere.
 
 - A release version (no `-SNAPSHOT`) is a **real** Maven Central release and is
   **GPG-signed** (`signAllPublications()`), so it needs both the Central Portal
