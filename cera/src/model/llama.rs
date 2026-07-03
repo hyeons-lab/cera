@@ -690,7 +690,18 @@ impl LlamaModel {
 
             // Pass A: per token, bias → QK-norm → RoPE → stash post-RoPE Q back
             // into q_mat (so the attention pass can read every query) → append
-            // K/V to the f32 cache.
+            // K/V to the f32 cache. Reserve the whole prompt's cache growth up
+            // front (matches lfm2) so the per-token extend_from_slice below
+            // doesn't repeatedly reallocate.
+            if let LayerState::Attention {
+                key_cache,
+                value_cache,
+                ..
+            } = &mut state.layers[layer]
+            {
+                key_cache.reserve(n * kv_dim);
+                value_cache.reserve(n * kv_dim);
+            }
             for j in 0..n {
                 let pos = start_pos + j;
                 let q = &mut state.scratch.q[..q_dim];

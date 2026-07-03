@@ -217,6 +217,17 @@ pub(crate) fn gemm_preq(
 ) -> bool {
     debug_assert_eq!(wref.m, m, "gemm_preq: weight m mismatch");
     debug_assert_eq!(wref.k, k, "gemm_preq: weight k mismatch");
+    // The NEON kernels assume Q8_0 block alignment (k a multiple of 32) and read
+    // exactly n*k quants / n*(k/32) scales; enforce both at the wrapper boundary
+    // so misuse (a non-32 k or an under-sized scratch) fails loudly in debug
+    // rather than silently truncating (k/32) or producing wrong results.
+    debug_assert_eq!(k % 32, 0, "gemm_preq: k ({k}) must be a multiple of 32");
+    debug_assert!(
+        b_scales.len() >= n * (k / 32) && b_quants.len() >= n * k,
+        "gemm_preq: input scratch too small (need {} scales / {} quants for n={n}, k={k})",
+        n * (k / 32),
+        n * k,
+    );
     let data = weight_data(gguf, wref);
     // The input scratch may be sized to the largest GEMM k-dim and shared across
     // projections with differing k; the NEON kernels require exactly `n*k`
@@ -251,6 +262,18 @@ pub(crate) fn quantize_columns(
     scales: &mut [f32],
     quants: &mut [i8],
 ) {
+    // Q8_0 packs 32-element blocks; `dim` must divide evenly (else the tail is
+    // silently dropped by `dim / 32`). Assert alignment + scratch capacity at the
+    // top so misuse is caught before the unsafe NEON quantizer runs.
+    debug_assert_eq!(
+        dim % 32,
+        0,
+        "quantize_columns: dim ({dim}) must be a multiple of 32"
+    );
+    debug_assert!(
+        col.len() >= dim && scales.len() >= n * (dim / 32) && quants.len() >= n * dim,
+        "quantize_columns: scratch too small for dim={dim}, n={n}",
+    );
     let nb = dim / 32;
     for j in 0..n {
         for i in 0..dim {
