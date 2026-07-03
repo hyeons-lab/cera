@@ -455,115 +455,6 @@ impl LlamaModel {
         logits
     }
 
-    // ── Batched-GEMM prefill helpers (mirror LFM2's CPU prefill) ─────────────
-    //
-    // These read each weight matrix once for all N prompt tokens instead of the
-    // per-token GEMV loop. Same kernel dispatch as `Lfm2Model`: NEON
-    // `gemm_q{4_0,8_0}_q8_0` on aarch64 (input columns pre-quantized to Q8_0),
-    // or BLAS SGEMM after a full dequant when the `blas` feature is on.
-
-    /// Run a prefill GEMM through BLAS: dequantize `wref` into
-    /// `dequant_scratch[..m*k]`, then SGEMM `out[m, n] = weight[m, k] @ b[k, n]`
-    /// in row-major (both `b` and `out` are row-major `[k|m, n]`, stride `n`).
-    /// Returns `true` for the supported dtypes (Q4_0 / Q8_0); callers gate on
-    /// dtype upfront so the `false` arm is defensive.
-    #[cfg(feature = "blas")]
-    #[allow(clippy::too_many_arguments)]
-    fn try_blas_prefill_gemm(
-        &self,
-        wref: &WeightRef,
-        b: &[f32],
-        out: &mut [f32],
-        m: usize,
-        n: usize,
-        k: usize,
-        dequant_scratch: &mut Vec<f32>,
-    ) -> bool {
-        debug_assert_eq!(wref.m, m, "try_blas_prefill_gemm: weight m mismatch");
-        debug_assert_eq!(wref.k, k, "try_blas_prefill_gemm: weight k mismatch");
-        let data = transformer::weight_data(&self.gguf, wref);
-        if dequant_scratch.len() < m * k {
-            dequant_scratch.resize(m * k, 0.0);
-        }
-        let dequant = &mut dequant_scratch[..m * k];
-        match wref.dtype {
-            crate::tensor::DType::Q4_0 => crate::quant::dequantize_q4_0_matrix(data, m, k, dequant),
-            crate::tensor::DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(data, m, k, dequant),
-            _ => return false,
-        }
-        crate::backend::blas::sgemm_rowmajor_nn(m, n, k, dequant, b, out);
-        true
-    }
-
-    /// Batched GEMM with pre-quantized Q8_0 input columns (NEON fallback, no
-    /// BLAS). Dispatches on the weight dtype; returns `true` when a kernel ran.
-    #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
-    #[allow(clippy::too_many_arguments)]
-    fn gemm_preq(
-        &self,
-        wref: &WeightRef,
-        b_scales: &[f32],
-        b_quants: &[i8],
-        out: &mut [f32],
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> bool {
-        debug_assert_eq!(wref.m, m, "gemm_preq: weight m mismatch");
-        debug_assert_eq!(wref.k, k, "gemm_preq: weight k mismatch");
-        let data = transformer::weight_data(&self.gguf, wref);
-        // `b_scales`/`b_quants` are sized to the largest GEMM k-dim and shared
-        // across projections with differing k; the NEON kernels require exactly
-        // `n*k` quants / `n*(k/32)` scales, so slice to this GEMM's k. The
-        // buffer is always ≥ the needed length, and `quantize_columns` packs
-        // column j at the matching `k`-strided offset.
-        let b_scales = &b_scales[..n * (k / 32)];
-        let b_quants = &b_quants[..n * k];
-        match wref.dtype {
-            crate::tensor::DType::Q4_0 => unsafe {
-                crate::backend::simd::neon::gemm_q4_0_q8_0_neon(
-                    data, b_scales, b_quants, out, m, n, k,
-                );
-                true
-            },
-            crate::tensor::DType::Q8_0 => unsafe {
-                crate::backend::simd::neon::gemm_q8_0_q8_0_neon(
-                    data, b_scales, b_quants, out, m, n, k,
-                );
-                true
-            },
-            _ => false,
-        }
-    }
-
-    /// Quantize all `n` columns of a column-major `[dim × n]` matrix to Q8_0
-    /// (NEON fallback only). `col` is a scratch column of length ≥ `dim`;
-    /// `scales`/`quants` receive the packed `[n][dim/32]` / `[n][dim]` layout the
-    /// NEON GEMM kernels consume.
-    #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
-    fn quantize_columns(
-        mat: &[f32],
-        dim: usize,
-        n: usize,
-        col: &mut [f32],
-        scales: &mut [f32],
-        quants: &mut [i8],
-    ) {
-        let nb = dim / 32;
-        for j in 0..n {
-            for i in 0..dim {
-                col[i] = mat[i * n + j];
-            }
-            unsafe {
-                crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                    &col[..dim],
-                    &mut scales[j * nb..(j + 1) * nb],
-                    &mut quants[j * dim..(j + 1) * dim],
-                );
-            }
-        }
-    }
-
     /// Batched-GEMM CPU prefill for the dense transformer (mirrors LFM2's CPU
     /// prefill). Reads each weight matrix once for all `n` tokens. Column-major
     /// `hidden[hs × n]` (token `j` of channel `i` at `i*n + j`). Numerically
@@ -693,7 +584,8 @@ impl LlamaModel {
             // Batched Q/K/V projections (weight [m×hs] × normed[hs×n] → [m×n]).
             #[cfg(feature = "blas")]
             {
-                self.try_blas_prefill_gemm(
+                transformer::try_blas_prefill_gemm(
+                    &self.gguf,
                     &refs.attn_q,
                     &normed,
                     &mut q_mat,
@@ -702,7 +594,8 @@ impl LlamaModel {
                     hs,
                     &mut state.scratch.dequant_weight_scratch,
                 );
-                self.try_blas_prefill_gemm(
+                transformer::try_blas_prefill_gemm(
+                    &self.gguf,
                     &refs.attn_k,
                     &normed,
                     &mut k_mat,
@@ -711,7 +604,8 @@ impl LlamaModel {
                     hs,
                     &mut state.scratch.dequant_weight_scratch,
                 );
-                self.try_blas_prefill_gemm(
+                transformer::try_blas_prefill_gemm(
+                    &self.gguf,
                     &refs.attn_v,
                     &normed,
                     &mut v_mat,
@@ -723,8 +617,16 @@ impl LlamaModel {
             }
             #[cfg(not(feature = "blas"))]
             {
-                Self::quantize_columns(&normed, hs, n, &mut col, &mut bq_scales, &mut bq_quants);
-                self.gemm_preq(
+                transformer::quantize_columns(
+                    &normed,
+                    hs,
+                    n,
+                    &mut col,
+                    &mut bq_scales,
+                    &mut bq_quants,
+                );
+                transformer::gemm_preq(
+                    &self.gguf,
                     &refs.attn_q,
                     &bq_scales,
                     &bq_quants,
@@ -733,7 +635,8 @@ impl LlamaModel {
                     n,
                     hs,
                 );
-                self.gemm_preq(
+                transformer::gemm_preq(
+                    &self.gguf,
                     &refs.attn_k,
                     &bq_scales,
                     &bq_quants,
@@ -742,7 +645,8 @@ impl LlamaModel {
                     n,
                     hs,
                 );
-                self.gemm_preq(
+                transformer::gemm_preq(
+                    &self.gguf,
                     &refs.attn_v,
                     &bq_scales,
                     &bq_quants,
@@ -887,7 +791,8 @@ impl LlamaModel {
             // Batched output projection GEMM → block_out[hs × n] (k = q_dim).
             #[cfg(feature = "blas")]
             {
-                self.try_blas_prefill_gemm(
+                transformer::try_blas_prefill_gemm(
+                    &self.gguf,
                     &refs.attn_output,
                     &out_proj_input,
                     &mut block_out,
@@ -899,7 +804,7 @@ impl LlamaModel {
             }
             #[cfg(not(feature = "blas"))]
             {
-                Self::quantize_columns(
+                transformer::quantize_columns(
                     &out_proj_input,
                     q_dim,
                     n,
@@ -907,7 +812,8 @@ impl LlamaModel {
                     &mut bq_scales,
                     &mut bq_quants,
                 );
-                self.gemm_preq(
+                transformer::gemm_preq(
+                    &self.gguf,
                     &refs.attn_output,
                     &bq_scales,
                     &bq_quants,
@@ -942,7 +848,8 @@ impl LlamaModel {
             // FFN gate/up GEMM → silu(gate)⊙up → down GEMM.
             #[cfg(feature = "blas")]
             {
-                self.try_blas_prefill_gemm(
+                transformer::try_blas_prefill_gemm(
+                    &self.gguf,
                     &refs.ffn_gate,
                     &ffn_input,
                     &mut gate_mat,
@@ -951,7 +858,8 @@ impl LlamaModel {
                     hs,
                     &mut state.scratch.dequant_weight_scratch,
                 );
-                self.try_blas_prefill_gemm(
+                transformer::try_blas_prefill_gemm(
+                    &self.gguf,
                     &refs.ffn_up,
                     &ffn_input,
                     &mut up_mat,
@@ -963,8 +871,16 @@ impl LlamaModel {
             }
             #[cfg(not(feature = "blas"))]
             {
-                Self::quantize_columns(&ffn_input, hs, n, &mut col, &mut bq_scales, &mut bq_quants);
-                self.gemm_preq(
+                transformer::quantize_columns(
+                    &ffn_input,
+                    hs,
+                    n,
+                    &mut col,
+                    &mut bq_scales,
+                    &mut bq_quants,
+                );
+                transformer::gemm_preq(
+                    &self.gguf,
                     &refs.ffn_gate,
                     &bq_scales,
                     &bq_quants,
@@ -973,14 +889,24 @@ impl LlamaModel {
                     n,
                     hs,
                 );
-                self.gemm_preq(&refs.ffn_up, &bq_scales, &bq_quants, &mut up_mat, is, n, hs);
+                transformer::gemm_preq(
+                    &self.gguf,
+                    &refs.ffn_up,
+                    &bq_scales,
+                    &bq_quants,
+                    &mut up_mat,
+                    is,
+                    n,
+                    hs,
+                );
             }
 
             cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
 
             #[cfg(feature = "blas")]
             {
-                self.try_blas_prefill_gemm(
+                transformer::try_blas_prefill_gemm(
+                    &self.gguf,
                     &refs.ffn_down,
                     &gate_mat,
                     &mut ffn_out,
@@ -992,8 +918,16 @@ impl LlamaModel {
             }
             #[cfg(not(feature = "blas"))]
             {
-                Self::quantize_columns(&gate_mat, is, n, &mut col, &mut bq_scales, &mut bq_quants);
-                self.gemm_preq(
+                transformer::quantize_columns(
+                    &gate_mat,
+                    is,
+                    n,
+                    &mut col,
+                    &mut bq_scales,
+                    &mut bq_quants,
+                );
+                transformer::gemm_preq(
+                    &self.gguf,
                     &refs.ffn_down,
                     &bq_scales,
                     &bq_quants,
