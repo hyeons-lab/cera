@@ -157,18 +157,6 @@ jobs:
               | jq -r --arg n "$1" '.packages[] | select(.name == $n) | .version'
           }
 
-          # 200 => this exact <crate>@<version> already exists on crates.io.
-          # No `-f`: a 404 is a normal "not published yet" answer (curl still
-          # exits 0 and reports the code); `|| echo 000` only covers a network
-          # failure, where we conservatively treat it as not-published. Used for
-          # the idempotency skip decision (does the version exist at all?).
-          is_published() {
-            local code
-            code=$(curl -sS -o /dev/null -w '%{http_code}' \
-              "https://crates.io/api/v1/crates/$1/$2" 2>/dev/null || echo 000)
-            [ "$code" = "200" ]
-          }
-
           # Sparse-index path prefix for a crate name (cargo's own scheme).
           index_prefix() {
             local n="$1"
@@ -195,18 +183,23 @@ jobs:
           publish_one() {
             local crate="$1" ver
             ver=$(crate_version "$crate")
-            if is_published "$crate" "$ver"; then
-              echo "✓ ${crate}@${ver} already on crates.io — skipping"
+            if index_has "$crate" "$ver"; then
+              echo "✓ ${crate}@${ver} already on the crates.io index — skipping"
               return 0
             fi
-            local attempt=1 max=3
+            local attempt=1 max=3 out
             while :; do
               echo "Publishing ${crate}@${ver} (attempt ${attempt}/${max})..."
-              if cargo publish -p "$crate"; then
+              if out=$(cargo publish -p "$crate" 2>&1); then
+                echo "$out"
                 break
               fi
-              if is_published "$crate" "$ver"; then
-                echo "  ${crate}@${ver} present after error — treating as published"
+              echo "$out"
+              # "already exists on crates.io index" is cargo's verbatim message
+              # when this version is already published — a definitive skip, not a
+              # transient error. Confirm against the sparse index too.
+              if grep -q "already exists on crates.io" <<<"$out" || index_has "$crate" "$ver"; then
+                echo "  ${crate}@${ver} already on the index — treating as published"
                 break
               fi
               if [ "$attempt" -ge "$max" ]; then
@@ -346,7 +339,9 @@ jobs:
 
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             echo "=== DRY RUN: npm publish --dry-run (${name}@${version}) ==="
-            npm publish "$pkg_dir" --access public --dry-run
+            # Leading `./` so npm reads this as a local dir, not a `user/repo`
+            # GitHub shorthand (which it would try to `git ls-remote`).
+            npm publish "./$pkg_dir" --access public --dry-run
             exit 0
           fi
 
@@ -357,7 +352,9 @@ jobs:
             exit 0
           fi
           echo "Publishing ${name}@${version} to npm..."
-          npm publish "$pkg_dir" --access public
+          # Leading `./` so npm reads this as a local dir, not a `user/repo`
+          # GitHub shorthand (which it would try to `git ls-remote`).
+          npm publish "./$pkg_dir" --access public
 
   # ── Maven Central (cera-ffi Kotlin) ────────────────────────────────────────
   jvm-native-libs:
