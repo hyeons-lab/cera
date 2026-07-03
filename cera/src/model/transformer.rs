@@ -160,6 +160,135 @@ pub(crate) fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
     }
 }
 
+// ── Batched-GEMM prefill helpers ────────────────────────────────────────────
+//
+// Shared by the dense-transformer (`llama.rs`) and LFM2 (`lfm2.rs`) CPU prefill
+// paths, which read each weight matrix once for all N prompt tokens instead of
+// the per-token GEMV loop. `try_blas_prefill_gemm` dequantizes the weight and
+// runs an f32 SGEMM (any target, `blas` feature); `gemm_preq`/`quantize_columns`
+// are the NEON fallback that pre-quantizes the input columns to Q8_0 and uses
+// the integer-dot kernels (aarch64, no `blas`).
+
+/// Prefill GEMM through BLAS: dequantize `wref` into `dequant_scratch[..m*k]`,
+/// then SGEMM `out[m, n] = weight[m, k] @ b[k, n]` in row-major (`b`/`out` are
+/// row-major `[k|m, n]`, stride `n`). Returns `true` for the supported dtypes
+/// (Q4_0 / Q8_0); callers gate on dtype upfront so the `false` arm is defensive.
+#[cfg(feature = "blas")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_blas_prefill_gemm(
+    gguf: &GgufFile,
+    wref: &WeightRef,
+    b: &[f32],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    dequant_scratch: &mut Vec<f32>,
+) -> bool {
+    debug_assert_eq!(wref.m, m, "try_blas_prefill_gemm: weight m mismatch");
+    debug_assert_eq!(wref.k, k, "try_blas_prefill_gemm: weight k mismatch");
+    let data = weight_data(gguf, wref);
+    if dequant_scratch.len() < m * k {
+        dequant_scratch.resize(m * k, 0.0);
+    }
+    let dequant = &mut dequant_scratch[..m * k];
+    match wref.dtype {
+        DType::Q4_0 => crate::quant::dequantize_q4_0_matrix(data, m, k, dequant),
+        DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(data, m, k, dequant),
+        _ => return false,
+    }
+    crate::backend::blas::sgemm_rowmajor_nn(m, n, k, dequant, b, out);
+    true
+}
+
+/// Batched GEMM with pre-quantized Q8_0 input columns (NEON fallback, no BLAS).
+/// Dispatches on the weight dtype; returns `true` when a kernel ran.
+#[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq(
+    gguf: &GgufFile,
+    wref: &WeightRef,
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    debug_assert_eq!(wref.m, m, "gemm_preq: weight m mismatch");
+    debug_assert_eq!(wref.k, k, "gemm_preq: weight k mismatch");
+    // The NEON kernels assume Q8_0 block alignment (k a multiple of 32) and read
+    // exactly n*k quants / n*(k/32) scales; enforce both at the wrapper boundary
+    // so misuse (a non-32 k or an under-sized scratch) fails loudly in debug
+    // rather than silently truncating (k/32) or producing wrong results.
+    debug_assert_eq!(k % 32, 0, "gemm_preq: k ({k}) must be a multiple of 32");
+    debug_assert!(
+        b_scales.len() >= n * (k / 32) && b_quants.len() >= n * k,
+        "gemm_preq: input scratch too small (need {} scales / {} quants for n={n}, k={k})",
+        n * (k / 32),
+        n * k,
+    );
+    let data = weight_data(gguf, wref);
+    // The input scratch may be sized to the largest GEMM k-dim and shared across
+    // projections with differing k; the NEON kernels require exactly `n*k`
+    // quants / `n*(k/32)` scales, so slice to this GEMM's k. The buffer is
+    // always ≥ the needed length (a no-op for exactly-sized callers), and
+    // `quantize_columns` packs column j at the matching `k`-strided offset.
+    let b_scales = &b_scales[..n * (k / 32)];
+    let b_quants = &b_quants[..n * k];
+    match wref.dtype {
+        DType::Q4_0 => unsafe {
+            crate::backend::simd::neon::gemm_q4_0_q8_0_neon(data, b_scales, b_quants, out, m, n, k);
+            true
+        },
+        DType::Q8_0 => unsafe {
+            crate::backend::simd::neon::gemm_q8_0_q8_0_neon(data, b_scales, b_quants, out, m, n, k);
+            true
+        },
+        _ => false,
+    }
+}
+
+/// Quantize all `n` columns of a column-major `[dim × n]` matrix to Q8_0 (NEON
+/// fallback only). `col` is a scratch column of length ≥ `dim`; `scales`/`quants`
+/// receive the packed `[n][dim/32]` / `[n][dim]` layout the NEON GEMM kernels
+/// consume.
+#[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+pub(crate) fn quantize_columns(
+    mat: &[f32],
+    dim: usize,
+    n: usize,
+    col: &mut [f32],
+    scales: &mut [f32],
+    quants: &mut [i8],
+) {
+    // Q8_0 packs 32-element blocks; `dim` must divide evenly (else the tail is
+    // silently dropped by `dim / 32`). Assert alignment + scratch capacity at the
+    // top so misuse is caught before the unsafe NEON quantizer runs.
+    debug_assert_eq!(
+        dim % 32,
+        0,
+        "quantize_columns: dim ({dim}) must be a multiple of 32"
+    );
+    debug_assert!(
+        col.len() >= dim && scales.len() >= n * (dim / 32) && quants.len() >= n * dim,
+        "quantize_columns: scratch too small for dim={dim}, n={n}",
+    );
+    let nb = dim / 32;
+    for j in 0..n {
+        for i in 0..dim {
+            col[i] = mat[i * n + j];
+        }
+        unsafe {
+            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                &col[..dim],
+                &mut scales[j * nb..(j + 1) * nb],
+                &mut quants[j * dim..(j + 1) * dim],
+            );
+        }
+    }
+}
+
 /// Dequantize a single row from a quantized matrix into `out`.
 pub(crate) fn dequantize_row_into(
     gguf: &GgufFile,
