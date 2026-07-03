@@ -690,18 +690,19 @@ impl LlamaModel {
 
             // Pass A: per token, bias → QK-norm → RoPE → stash post-RoPE Q back
             // into q_mat (so the attention pass can read every query) → append
-            // K/V to the f32 cache. Reserve the whole prompt's cache growth up
-            // front (matches lfm2) so the per-token extend_from_slice below
-            // doesn't repeatedly reallocate.
-            if let LayerState::Attention {
-                key_cache,
-                value_cache,
-                ..
-            } = &mut state.layers[layer]
-            {
-                key_cache.reserve(n * kv_dim);
-                value_cache.reserve(n * kv_dim);
-            }
+            // K/V to the f32 cache. Destructure the cache once (not per token)
+            // and reserve the whole prompt's growth up front (matches lfm2) so
+            // the per-token extend_from_slice doesn't repeatedly reallocate.
+            let (key_cache, value_cache) = match &mut state.layers[layer] {
+                LayerState::Attention {
+                    key_cache,
+                    value_cache,
+                    ..
+                } => (key_cache, value_cache),
+                _ => unreachable!("dense transformer layer is always Attention"),
+            };
+            key_cache.reserve(n * kv_dim);
+            value_cache.reserve(n * kv_dim);
             for j in 0..n {
                 let pos = start_pos + j;
                 let q = &mut state.scratch.q[..q_dim];
@@ -762,16 +763,9 @@ impl LlamaModel {
                     q_mat[i * n + j] = q[i];
                 }
 
-                // Append K, V to the f32 cache.
-                if let LayerState::Attention {
-                    key_cache,
-                    value_cache,
-                    ..
-                } = &mut state.layers[layer]
-                {
-                    key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
-                    value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
-                }
+                // Append K, V to the f32 cache (destructured once above the loop).
+                key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
+                value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
             }
 
             // Pass B: GQA attention over the now-complete KV cache → out_proj_input.
@@ -1032,14 +1026,14 @@ impl LlamaModel {
         state.seq_len = start_pos + n;
 
         // Final norm on the LAST column, then project last-token logits (what the
-        // decode loop consumes). `project_logits` handles the Granite logit scale
-        // and the aarch64 pre-quantized GEMV.
-        let mut last_hidden = vec![0.0f32; hs];
+        // decode loop consumes). Reuse `norm_col` (an hs-length scratch that's
+        // dead after the layer loop) rather than allocating. `project_logits`
+        // handles the Granite logit scale and the aarch64 pre-quantized GEMV.
         for i in 0..hs {
-            last_hidden[i] = hidden[i * n + (n - 1)];
+            norm_col[i] = hidden[i * n + (n - 1)];
         }
-        cpu::rmsnorm(&mut last_hidden, &self.output_norm_weight, cfg.rms_norm_eps);
-        self.project_logits(&last_hidden, state)
+        cpu::rmsnorm(&mut norm_col, &self.output_norm_weight, cfg.rms_norm_eps);
+        self.project_logits(&norm_col, state)
     }
 }
 
