@@ -563,6 +563,20 @@ impl LlamaModel {
         #[cfg(not(feature = "blas"))]
         let mut bq_quants = vec![0i8; n * max_dim];
 
+        // Flash attention (tiled + rayon) beats the naive per-token loop only for
+        // longer prompts; below the threshold its two-pass online-softmax overhead
+        // loses. Mirrors LFM2's measured crossover (~pp256 on Apple Silicon).
+        const FLASH_ATTN_THRESHOLD: usize = 256;
+        let use_flash = n >= FLASH_ATTN_THRESHOLD;
+        // Per-KV-head attention output, [n_kv_heads][group_size * n * head_dim],
+        // scattered back into out_proj_input after the flash pass. Reused across
+        // layers; empty (unused) below the threshold.
+        let mut flash_out = if use_flash {
+            vec![0.0f32; n_heads * n * head_dim]
+        } else {
+            Vec::new()
+        };
+
         for layer in 0..cfg.n_layers {
             let refs = &self.layer_refs[layer];
 
@@ -674,7 +688,9 @@ impl LlamaModel {
                 _ => None,
             };
 
-            // Per-token core: bias → QK-norm → RoPE → KV append → GQA attention.
+            // Pass A: per token, bias → QK-norm → RoPE → stash post-RoPE Q back
+            // into q_mat (so the attention pass can read every query) → append
+            // K/V to the f32 cache.
             for j in 0..n {
                 let pos = start_pos + j;
                 let q = &mut state.scratch.q[..q_dim];
@@ -730,6 +746,11 @@ impl LlamaModel {
                     ),
                 }
 
+                // Stash post-RoPE Q back into q_mat for the attention pass.
+                for i in 0..q_dim {
+                    q_mat[i * n + j] = q[i];
+                }
+
                 // Append K, V to the f32 cache.
                 if let LayerState::Attention {
                     key_cache,
@@ -740,21 +761,73 @@ impl LlamaModel {
                     key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
                     value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
                 }
+            }
 
-                // GQA attention over the cache built so far (causal is automatic).
-                {
-                    let (k_cache, v_cache) = match &state.layers[layer] {
-                        LayerState::Attention {
-                            key_cache,
-                            value_cache,
-                            ..
-                        } => (key_cache.as_slice(), value_cache.as_slice()),
-                        _ => unreachable!("dense transformer layer is always Attention"),
-                    };
-                    let seq_len = k_cache.len() / kv_dim;
-                    let attn_out = &mut state.scratch.attn_out[..q_dim];
-                    let q = &state.scratch.q[..q_dim];
-                    let scores = &mut state.scratch.scores;
+            // Pass B: GQA attention over the now-complete KV cache → out_proj_input.
+            let (k_cache, v_cache) = match &state.layers[layer] {
+                LayerState::Attention {
+                    key_cache,
+                    value_cache,
+                    ..
+                } => (key_cache.as_slice(), value_cache.as_slice()),
+                _ => unreachable!("dense transformer layer is always Attention"),
+            };
+            if use_flash {
+                // Flash attention (tiled + rayon), parallel across KV heads. Each
+                // KV head writes a contiguous [group_size * n * head_dim] chunk;
+                // par_chunks_mut hands out disjoint &mut so there's no aliasing.
+                let chunk_size = group_size * n * head_dim;
+                let flash_buf = &mut flash_out[..n_kv_heads * chunk_size];
+                let q_ref = &q_mat[..];
+                #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
+                use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+                flash_buf
+                    .par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(kv_h, chunk)| {
+                        cpu::flash_attention_gqa_cpu(
+                            q_ref,
+                            k_cache,
+                            v_cache,
+                            chunk,
+                            kv_h * group_size,
+                            group_size,
+                            n,
+                            n,
+                            kv_dim,
+                            kv_h * head_dim,
+                            head_dim,
+                            scale,
+                            start_pos,
+                        );
+                    });
+                // Scatter flash_out [n_heads, n, head_dim] → out_proj_input [q_dim,
+                // n] (stride-n columns). d-then-j inner order keeps out writes
+                // sequential (stride 1) with small-stride reads from flash_buf.
+                for kv_h in 0..n_kv_heads {
+                    for g in 0..group_size {
+                        let h = kv_h * group_size + g;
+                        let src_base = kv_h * chunk_size + g * n * head_dim;
+                        for d in 0..head_dim {
+                            let row_idx = (h * head_dim + d) * n;
+                            for j in 0..n {
+                                out_proj_input[row_idx + j] =
+                                    flash_buf[src_base + j * head_dim + d];
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Naive per-token attention: token j attends over cache[0..pos+1]
+                // (causal). Bit-identical to the per-token `forward` path.
+                let attn_out = &mut state.scratch.attn_out[..q_dim];
+                let q = &mut state.scratch.q[..q_dim];
+                let scores = &mut state.scratch.scores;
+                for j in 0..n {
+                    let seq_len = start_pos + j + 1;
+                    for i in 0..q_dim {
+                        q[i] = q_mat[i * n + j];
+                    }
                     scores.resize(seq_len, 0.0);
                     for h in 0..n_heads {
                         let kv_h = h / group_size;
@@ -781,10 +854,9 @@ impl LlamaModel {
                             seq_len,
                         );
                     }
-                }
-
-                for i in 0..q_dim {
-                    out_proj_input[i * n + j] = state.scratch.attn_out[i];
+                    for i in 0..q_dim {
+                        out_proj_input[i * n + j] = attn_out[i];
+                    }
                 }
             }
 

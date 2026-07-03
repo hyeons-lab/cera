@@ -94,22 +94,29 @@ const PROMPT: &[u32] = &[
     684, 456, 2758, 302, 12707, 28723,
 ];
 
+/// A ≥256-token prompt (the 24-token `PROMPT` tiled) that pushes
+/// `forward_prefill` over `FLASH_ATTN_THRESHOLD` so the batched path runs the
+/// flash-attention branch instead of the naive per-token loop.
+fn flash_prompt() -> Vec<u32> {
+    PROMPT.iter().copied().cycle().take(288).collect()
+}
+
 /// Returns `(cosine, max_abs_diff, argmax_batched, argmax_sequential)` for the
 /// last-token logits, or `None` when the fixture is absent.
-fn run_parity(rel: &str) -> Option<(f32, f32, usize, usize)> {
+fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, f32, usize, usize)> {
     // Bring `Model` into scope so the boxed trait object's methods resolve.
     #[allow(unused_imports)]
     use cera::model::Model;
 
     let path = find_model(rel)?;
-    eprintln!("[parity] loading {}", path.display());
+    eprintln!("[parity] loading {} ({} tok)", path.display(), tokens.len());
 
     // (a) Sequential per-token path.
     let gguf_seq = cera::gguf::GgufFile::open(&path).unwrap();
     let model_seq = cera::model::load_model(gguf_seq, None, 8192).unwrap();
     let mut state_seq = cera::kv_cache::InferenceState::from_config(model_seq.config());
     let mut logits_seq = Vec::new();
-    for (i, &tok) in PROMPT.iter().enumerate() {
+    for (i, &tok) in tokens.iter().enumerate() {
         logits_seq = model_seq.forward(&[tok], i, &mut state_seq);
     }
 
@@ -117,7 +124,7 @@ fn run_parity(rel: &str) -> Option<(f32, f32, usize, usize)> {
     let gguf_pre = cera::gguf::GgufFile::open(&path).unwrap();
     let model_pre = cera::model::load_model(gguf_pre, None, 8192).unwrap();
     let mut state_pre = cera::kv_cache::InferenceState::from_config(model_pre.config());
-    let logits_pre = model_pre.forward_prefill(PROMPT, 0, &mut state_pre);
+    let logits_pre = model_pre.forward_prefill(tokens, 0, &mut state_pre);
 
     assert_eq!(logits_pre.len(), logits_seq.len(), "logit length mismatch");
     Some((
@@ -128,33 +135,45 @@ fn run_parity(rel: &str) -> Option<(f32, f32, usize, usize)> {
     ))
 }
 
-fn check(rel: &str) {
-    let Some((cos, max_diff, top_pre, top_seq)) = run_parity(rel) else {
+fn check(rel: &str, tokens: &[u32]) {
+    let Some((cos, max_diff, top_pre, top_seq)) = run_parity(rel, tokens) else {
         eprintln!("[parity] SKIP (absent): {rel}");
         return;
     };
+    let is_flash = tokens.len() >= 256;
+    let path = if is_flash { "flash" } else { "naive" };
     eprintln!(
-        "[parity] {rel}: cosine={cos:.6} max_abs_diff={max_diff:.4e} argmax pre={top_pre} seq={top_seq}"
+        "[parity] {rel} [{path}]: cosine={cos:.6} max_abs_diff={max_diff:.4e} argmax pre={top_pre} seq={top_seq}"
     );
 
-    // NEON shares the per-token path's Q8_0-quantize + int8-dot, so it is
-    // bit-identical (cosine = 1.0). BLAS runs projections through f32 SGEMM
-    // while decode stays Q8_0, so ~0.996 is legitimate f32 reordering. Either
-    // way a real layout/dim/transpose bug drops cosine well below these bounds
-    // or flips the argmax.
+    // Threshold by (path, feature):
+    //  - naive NEON: shares the per-token path's Q8_0-quantize + int8-dot, so
+    //    bit-identical (cosine = 1.0) → tight 0.9999 bound.
+    //  - flash (n ≥ 256): online-softmax + tiling reorder the reduction (cosine
+    //    ~0.999), so use the 0.99 bound `blas_parity.rs` established for flash.
+    //  - BLAS: projections go through f32 SGEMM while decode stays Q8_0, a
+    //    legitimate f32-vs-int reordering (~0.996), so 0.99 for both paths.
+    // top-1 agreement (asserted below) is the discriminating correctness check;
+    // a real layout/dim/transpose bug drops cosine far below these or flips it.
     #[cfg(not(feature = "blas"))]
-    let (min_cos, tier) = (0.9999_f32, "NEON");
+    let (min_cos, tier) = (if is_flash { 0.99_f32 } else { 0.9999_f32 }, "NEON");
     #[cfg(feature = "blas")]
     let (min_cos, tier) = (0.99_f32, "BLAS");
 
     assert!(
         cos > min_cos,
-        "{rel}: batched-prefill vs sequential cosine = {cos} (< {min_cos} on the {tier} path) — likely a layout/dim/transpose bug"
+        "{rel} [{path}]: batched-prefill vs sequential cosine = {cos} (< {min_cos} on the {tier} path) — likely a layout/dim/transpose bug"
     );
     assert_eq!(
         top_pre, top_seq,
-        "{rel}: batched-prefill argmax {top_pre} != sequential argmax {top_seq}"
+        "{rel} [{path}]: batched-prefill argmax {top_pre} != sequential argmax {top_seq}"
     );
+}
+
+/// Check both the naive (24-token) and flash (288-token) batched-prefill paths.
+fn check_both(rel: &str) {
+    check(rel, PROMPT);
+    check(rel, &flash_prompt());
 }
 
 #[test]
@@ -164,23 +183,23 @@ fn llama_batched_prefill_parity_llama3() {
     // The Q8_0 build is used (fully supported); the repo's `Llama-3.2-1B-Q4_0`
     // GGUF carries Q4_1 ffn_down layers in blocks 0/1, a dtype cera can't
     // dequantize, so neither the batched nor the per-token path can run it.
-    check("target/oracle/models/Llama-3.2-1B-Instruct-Q8_0.gguf");
+    check_both("target/oracle/models/Llama-3.2-1B-Instruct-Q8_0.gguf");
 }
 
 #[test]
 #[ignore]
 fn llama_batched_prefill_parity_qwen3() {
-    check("target/oracle/models/Qwen3-0.6B-Q8_0.gguf");
+    check_both("target/oracle/models/Qwen3-0.6B-Q8_0.gguf");
 }
 
 #[test]
 #[ignore]
 fn llama_batched_prefill_parity_qwen2() {
-    check("target/oracle/models/qwen2-0_5b-instruct-q8_0.gguf");
+    check_both("target/oracle/models/qwen2-0_5b-instruct-q8_0.gguf");
 }
 
 #[test]
 #[ignore]
 fn llama_batched_prefill_parity_granite() {
-    check("target/oracle/models/granite-3.1-2b-instruct-Q8_0.gguf");
+    check_both("target/oracle/models/granite-3.1-2b-instruct-Q8_0.gguf");
 }
