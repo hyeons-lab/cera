@@ -3220,6 +3220,11 @@ impl Model for MetalLfm2Model {
         state: &mut InferenceState,
     ) -> Vec<f32> {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        // Stage the adapter so the batched LoRA hooks in the shared
+        // `prefill_layers_and_logits` apply on the embeddings-fed (LFM2-VL /
+        // Audio) path too — the token path resolves it, so without this the
+        // multimodal prefill would silently run base-model-only.
+        let _lora_guard = self.resolve_lora(state);
         assert!(
             n_tokens > 0,
             "forward_prefill_from_embeddings requires at least one frame"
