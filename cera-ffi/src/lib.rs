@@ -1148,6 +1148,17 @@ impl Session {
     }
 }
 
+/// Flatten `f32`s into a little-endian byte buffer (`4 * len` bytes). Explicit
+/// LE (not a native-endian `bytemuck` cast) so the wire format is stable across
+/// host architectures; callers reinterpret 4-byte groups as `f32`.
+fn f32_vec_to_le_bytes(v: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(v.len() * 4);
+    for &x in v {
+        bytes.extend_from_slice(&x.to_le_bytes());
+    }
+    bytes
+}
+
 #[uniffi::export]
 impl Session {
     /// Append raw text to the context, running a prefill over just
@@ -1212,6 +1223,44 @@ impl Session {
         }
         self.lock_inner()?.append_audio(&samples, sample_rate)?;
         Ok(())
+    }
+
+    /// Model hidden dimension `D`. Reshape a raw `[T*D]` byte buffer from
+    /// [`Self::hidden_states_for_tokens`] into `[T][D]` with this.
+    pub fn hidden_size(&self) -> Result<u32, FfiError> {
+        Ok(u32::try_from(self.lock_inner()?.hidden_size()).unwrap_or(u32::MAX))
+    }
+
+    /// Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
+    /// `--pooling none` / `llama_get_embeddings_ith` vector) for `tokens`,
+    /// returned as **little-endian f32 bytes**: `n_tokens * hidden_size * 4`
+    /// bytes, row-major, token `t` channel `c` at `(t*D + c) * 4`.
+    ///
+    /// Bytes (UniFFI `Data` in Swift, `ByteArray` in Kotlin) rather than
+    /// `List<Float>` to avoid Kotlin's per-element boxing on the potentially
+    /// large `[T*D]` payload. Swift decodes via `Data.withUnsafeBytes`; reflects
+    /// the active LoRA once that lands. Side-effect-free: does not disturb the
+    /// session's generation KV.
+    ///
+    /// Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
+    /// doesn't implement hidden-state extraction.
+    pub fn hidden_states_for_tokens(&self, tokens: Vec<u32>) -> Result<Vec<u8>, FfiError> {
+        let hs = self.lock_inner()?.hidden_states_for_tokens(&tokens)?;
+        Ok(f32_vec_to_le_bytes(&hs))
+    }
+
+    /// Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
+    /// (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+    pub fn hidden_states_for_text(&self, text: String) -> Result<Vec<u8>, FfiError> {
+        let hs = self.lock_inner()?.hidden_states_for_text(&text)?;
+        Ok(f32_vec_to_le_bytes(&hs))
+    }
+
+    /// Mean-pooled hidden state — a single `[hidden_size]` vector (the common
+    /// classifier path: pool in Rust, ship `D` floats not `T*D`). Returned as
+    /// `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
+    pub fn hidden_states_mean_pooled(&self, tokens: Vec<u32>) -> Result<Vec<f32>, FfiError> {
+        Ok(self.lock_inner()?.hidden_states_mean_pooled(&tokens)?)
     }
 
     /// Append an encoded image (PNG / JPEG bytes, auto-detected) to the

@@ -1037,6 +1037,54 @@ impl Session {
         self.inner.append_tokens(tokens).map_err(map_cera_err)
     }
 
+    /// Model hidden dimension `D` — reshape a `[T*D]` hidden-states buffer into
+    /// `[T][D]` with this.
+    #[wasm_bindgen(js_name = hiddenSize)]
+    pub fn hidden_size(&self) -> u32 {
+        self.inner.hidden_size() as u32
+    }
+
+    /// Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
+    /// `--pooling none` vector) for `tokens`, as a `Float32Array` of length
+    /// `tokens.length * hiddenSize` (row-major; token `t` channel `c` at
+    /// `t*hiddenSize + c`). The wasm boundary copies the buffer into the JS heap
+    /// once. Side-effect-free — does not disturb the generation KV.
+    #[wasm_bindgen(js_name = hiddenStatesForTokens)]
+    pub fn hidden_states_for_tokens(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<js_sys::Float32Array, JsError> {
+        let hs = self
+            .inner
+            .hidden_states_for_tokens(tokens)
+            .map_err(map_cera_err)?;
+        Ok(js_sys::Float32Array::from(hs.as_slice()))
+    }
+
+    /// Tokenize `text` and return its per-token hidden states as a `Float32Array`.
+    #[wasm_bindgen(js_name = hiddenStatesForText)]
+    pub fn hidden_states_for_text(&mut self, text: &str) -> Result<js_sys::Float32Array, JsError> {
+        let hs = self
+            .inner
+            .hidden_states_for_text(text)
+            .map_err(map_cera_err)?;
+        Ok(js_sys::Float32Array::from(hs.as_slice()))
+    }
+
+    /// Mean-pooled hidden state — a single `Float32Array` of length `hiddenSize`
+    /// (the common classifier path: pool in Rust, ship `D` floats not `T*D`).
+    #[wasm_bindgen(js_name = hiddenStatesMeanPooled)]
+    pub fn hidden_states_mean_pooled(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<js_sys::Float32Array, JsError> {
+        let pooled = self
+            .inner
+            .hidden_states_mean_pooled(tokens)
+            .map_err(map_cera_err)?;
+        Ok(js_sys::Float32Array::from(pooled.as_slice()))
+    }
+
     /// Append PCM audio samples (mono `f32`, normalized to roughly
     /// `[-1.0, 1.0]`) at `sample_rate` Hz.
     ///
