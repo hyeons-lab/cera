@@ -45,7 +45,8 @@ earlier "GPU is LFM2-only" limitation is gone (see #177/#192/#193/#194/#200).
 | V2.6 More quant formats | 🟡 | Q6_K added; Q2/Q3/Q5_K, IQ, GPTQ, AWQ, FP8 remain |
 | V2.7 Per-shape kernel tuning | ⬜ | no `cera tune` / autotune |
 | V2.8 Speculative decoding | ⬜ | |
-| V2.9 LoRA adapters | ⬜ | |
+| V2.9 LoRA adapters | ✅ | `cera/src/lora.rs`; runtime apply on CPU + Metal + wgpu; FFI/WASM |
+| — Hidden-states extraction | ✅ | `Model::hidden_states` (CPU/Metal/wgpu) + FFI/WASM; classifier/embedding path |
 | V2.10 MoE support | ⬜ | |
 | V2.11 Multi-GPU | ⬜ | |
 | V2.12 CUDA backend | ⬜ | |
@@ -348,8 +349,17 @@ Profile-guided kernel optimization for quantized decode (batch=1 GEMV). Instead 
 ### V2.8: Speculative Decoding — 1-2 weeks ⬜
 Draft model + verification, self-speculative. 1.3-2x decode speedup.
 
-### V2.9: LoRA Adapters — 1-2 weeks ⬜
-Runtime LoRA loading, merge/unmerge, per-request LoRA selection.
+### V2.9: LoRA Adapters — ✅ DONE
+Runtime LoRA apply (`y += scale·B·(A·x)`, **never merged** — base weights stay
+quantized, so hot-swap / unload / per-request selection are free). `cera/src/lora.rs`
+loads GGUF (`convert_lora_to_gguf`) and PEFT `.safetensors` adapters; applied on
+**CPU + Metal + wgpu** (the two GPU backends fold `scale` + Granite `residual_mult`
+into `B` at upload and cache uploads in an `Arc`-keyed LRU); attach/remove/hot-swap
+on `Session`, exposed over FFI (`LoraAdapters` + `attachLora`) and WASM. Dim-checked
+at attach; rank capped (`MAX_LORA_RANK`). GPU-vs-CPU parity verified (cosine ≥ 0.995).
+Shipped alongside **hidden-states extraction** (`Model::hidden_states`, post-final-norm
+per-token vectors reflecting the active adapter) — the classifier/embedding path that
+unblocks section-router / extractor heads. PRs #205–#215.
 
 ### V2.10: MoE Support — 2-3 weeks ⬜
 Top-K expert routing for Mixtral, LFM2-8B-A1B, LFM2-24B-A2B.
