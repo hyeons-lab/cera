@@ -3622,6 +3622,11 @@ impl Model for GpuLfm2Model {
     /// `hidden_buf`; the logits it also computes are ignored. `_state` is unused
     /// (wgpu keeps KV on the model). A drop-guard restores the generation
     /// `seq_len` and clears the flag on any exit, including a mid-run panic.
+    ///
+    /// Like [`Self::forward`], this is the **synchronous** native path: it blocks
+    /// on `download_f32` per token. The browser/WASM GPU path is the async
+    /// `WebGpuSession`, which never routes through this method — so the blocking
+    /// readback here is a native-only concern, identical to `forward`.
     fn hidden_states(&self, tokens: &[u32], _state: &mut InferenceState) -> Vec<f32> {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         assert!(

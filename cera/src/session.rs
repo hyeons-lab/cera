@@ -635,6 +635,19 @@ impl Session {
                 vocab_size: vocab_size as u32,
             });
         }
+        // A prompt longer than the context window would trip an `assert!` in the
+        // GPU backends' `hidden_states` (Metal/wgpu), whose panic would unwind
+        // through the held FFI mutex or trap wasm. Return a typed overflow error
+        // instead — consistent across all backends. (Unlike generation there's no
+        // n_keep shift here: extraction is one-shot, so an over-length chunk is a
+        // caller error, not something to silently truncate.)
+        let max_seq_len = model.config().max_seq_len;
+        if tokens.len() > max_seq_len {
+            return Err(CeraError::ContextOverflow {
+                max_seq_len: max_seq_len as u32,
+                by: (tokens.len() - max_seq_len) as u32,
+            });
+        }
         let n = tokens.len();
         // Reuse the scratch state when it's big enough; else (re)build it sized to
         // this prompt. Store the RAW `n` (not clamped to max_seq_len): otherwise a
