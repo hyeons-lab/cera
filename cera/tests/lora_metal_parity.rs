@@ -214,6 +214,178 @@ fn metal_lora_matches_cpu_and_noop() {
     );
 }
 
+/// Build a synthetic PEFT-safetensors adapter with an explicit `(module, in_dim,
+/// out_dim)` per target, so targets whose projection input isn't `hidden_size`
+/// (o_proj's `q_dim`, down_proj's `intermediate_size`) get the correct `A`
+/// width. `A` is `[rank × in_dim]`, `B` is `[out_dim × rank]`.
+fn synth_adapter_io(
+    layer: usize,
+    targets: &[(&str, usize, usize)],
+    rank: usize,
+    a_fill: f32,
+    b_fill: f32,
+    alpha: f32,
+) -> Arc<LoraAdapterWeights> {
+    let mut data: Vec<u8> = Vec::new();
+    let mut header = serde_json::Map::new();
+    let push = |header: &mut serde_json::Map<String, serde_json::Value>,
+                data: &mut Vec<u8>,
+                name: &str,
+                rows: usize,
+                cols: usize,
+                fill: f32| {
+        let begin = data.len();
+        for _ in 0..rows * cols {
+            data.extend_from_slice(&fill.to_le_bytes());
+        }
+        header.insert(
+            name.to_string(),
+            serde_json::json!({ "dtype": "F32", "shape": [rows, cols], "data_offsets": [begin, data.len()] }),
+        );
+    };
+    for (module, in_dim, out_dim) in targets {
+        let base = format!("base_model.model.model.layers.{layer}.{module}");
+        push(
+            &mut header,
+            &mut data,
+            &format!("{base}.lora_A.weight"),
+            rank,
+            *in_dim,
+            a_fill,
+        );
+        push(
+            &mut header,
+            &mut data,
+            &format!("{base}.lora_B.weight"),
+            *out_dim,
+            rank,
+            b_fill,
+        );
+    }
+    let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&header_bytes);
+    buf.extend_from_slice(&data);
+    LoraAdapterWeights::from_safetensors_bytes(&buf, Some(alpha)).expect("load synthetic adapter")
+}
+
+/// Prefill logits for the last token via the batched `forward_prefill` path.
+fn prefill_logits(
+    model: &dyn Model,
+    tokens: &[u32],
+    lora: Option<Arc<LoraAdapterWeights>>,
+) -> Vec<f32> {
+    let mut state = InferenceState::for_prefill(model.config(), tokens.len());
+    state.lora = lora;
+    model.forward_prefill(tokens, 0, &mut state)
+}
+
+/// Batched-prefill LoRA parity: with an adapter active, `MetalLfm2Model`'s
+/// batched-GEMM `forward_prefill` (in-batch LoRA, all N tokens) must match the
+/// CPU `Lfm2Model`'s batched prefill at cosine > 0.99 on the last-token logits.
+/// A wrong GEMM layout (token- vs channel-major), a transposed/mis-scaled B, a
+/// dropped hook, or a conv-layer QKV hook collapses this well below 0.99.
+#[test]
+#[ignore = "needs an LFM2 GGUF + a Metal GPU; gated on CERA_LORA_METAL_PARITY"]
+fn metal_batched_lora_matches_cpu_prefill() {
+    if std::env::var("CERA_LORA_METAL_PARITY").as_deref() != Ok("1") {
+        eprintln!("skip: set CERA_LORA_METAL_PARITY=1 to run");
+        return;
+    }
+    let Some(path) = lfm2_model_path() else {
+        eprintln!("skip: no LFM2 model (set CERA_LFM2_MODEL)");
+        return;
+    };
+
+    let cpu = load_model(GgufFile::open(&path).expect("open"), None, 8192).expect("cpu load");
+    let cfg = cpu.config();
+    let hs = cfg.hidden_size;
+    let is = cfg.intermediate_size;
+    let head_dim = cfg.head_dim;
+    let q_dim = cfg.n_heads * head_dim;
+    let vocab = cfg.vocab_size;
+
+    let metal =
+        match cera::model::load_model_metal(GgufFile::open(&path).expect("open gguf"), &path, 8192)
+        {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("skip: no Metal GPU: {e}");
+                return;
+            }
+        };
+
+    // Target an attention layer so q/k/v/o adapters land on real projections; FFN
+    // targets are valid on any layer, but we use the same (attention) layer here.
+    let attn_layer = cfg
+        .block_types
+        .iter()
+        .position(|b| *b == BlockType::Attention)
+        .expect("model has an attention layer");
+    let kv_dim = cfg.kv_heads_per_layer[attn_layer] * head_dim;
+
+    let attn: &[(&str, usize, usize)] = &[
+        ("self_attn.q_proj", hs, q_dim),
+        ("self_attn.k_proj", hs, kv_dim),
+        ("self_attn.v_proj", hs, kv_dim),
+        ("self_attn.o_proj", q_dim, hs),
+    ];
+    let ffn: &[(&str, usize, usize)] = &[
+        ("mlp.gate_proj", hs, is),
+        ("mlp.up_proj", hs, is),
+        ("mlp.down_proj", is, hs),
+    ];
+    let all: Vec<(&str, usize, usize)> = attn.iter().chain(ffn).copied().collect();
+
+    // A multi-token prompt (n > 1) forces the batched path.
+    let tokens: Vec<u32> = vec![1, 5, 9, 42, 100, 7, 3, 11];
+    let metal_base = prefill_logits(metal.as_ref(), &tokens, None);
+
+    // Compare Metal-batched vs CPU-batched last-token logits for an adapter over
+    // `targets`, asserting the adapter is live (moves the logits vs base) and the
+    // two backends agree at cosine > 0.99.
+    let check = |label: &str, targets: &[(&str, usize, usize)], a: f32, b: f32, alpha: f32| {
+        let adapter = synth_adapter_io(attn_layer, targets, 4, a, b, alpha);
+        let cpu_logits = prefill_logits(cpu.as_ref(), &tokens, Some(adapter.clone()));
+        let metal_logits = prefill_logits(metal.as_ref(), &tokens, Some(adapter));
+        assert_eq!(cpu_logits.len(), vocab, "{label}: CPU logits shape");
+        assert_eq!(metal_logits.len(), vocab, "{label}: Metal logits shape");
+        assert!(
+            metal_logits.iter().all(|x| x.is_finite()),
+            "{label}: Metal batched-LoRA logits must be finite"
+        );
+        // Live-hook guard: a dead batched hook would leave the logits at base.
+        let eff_delta = max_abs_diff(&metal_logits, &metal_base);
+        assert!(
+            eff_delta > 1e-2,
+            "{label}: batched LoRA must change the Metal logits (eff_delta {eff_delta:.3e})"
+        );
+        let cos = cosine(&cpu_logits, &metal_logits);
+        assert!(
+            cos > 0.99,
+            "{label}: batched Metal-vs-CPU LoRA prefill cosine {cos:.5} < 0.99"
+        );
+        eprintln!("  {label}: cosine {cos:.5} > 0.99, adapter delta {eff_delta:.3e} ✓");
+        cos
+    };
+
+    // Per-group at a strong magnitude: pins every batched hook's GEMM layout,
+    // B pre-scale, and buffer wiring (all four attention hooks; all three FFN
+    // hooks incl. the residual-fed down_proj).
+    eprintln!(
+        "metal_batched_lora_matches_cpu_prefill: {} tokens, vocab={vocab}, layer {attn_layer}",
+        tokens.len()
+    );
+    check("attn q/k/v/o", attn, 0.02, 0.02, 8.0);
+    check("ffn gate/up/down", ffn, 0.02, 0.02, 8.0);
+    // All seven composed. A moderate magnitude keeps the combined perturbation
+    // below the regime where attention nonlinearity + Metal's f16 KV cache (vs
+    // CPU's f32) amplify ULP-level backend divergence into the logits — the same
+    // f16-vs-f32 noise the cosine (not bit-equality) bar exists to tolerate.
+    check("all 7 composed", &all, 0.006, 0.006, 4.0);
+}
+
 /// Max absolute per-element difference between two equal-length vectors.
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
