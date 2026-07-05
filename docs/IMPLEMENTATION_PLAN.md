@@ -56,7 +56,8 @@ earlier "GPU is LFM2-only" limitation is gone (see #177/#192/#193/#194/#200).
 | V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
 
 **Tally:** original V2 — 4 done (2.2, 2.3, 2.5b, 2.14), 2 partial (2.6, 2.17),
-9 remaining. Plus 2 off-roadmap multimodal tracks shipped (V2.15 Vision, V2.16
+10 remaining (2.1, 2.4, 2.5, 2.7–2.13). Plus 2 off-roadmap multimodal tracks
+shipped (V2.15 Vision, V2.16
 Audio/TTS). The largest untouched buckets are the **production server stack**
 (2.1/2.4/2.5) and **decode-speed work** (2.7/2.8).
 
@@ -249,7 +250,7 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 
 ```
 4.1  model/llama.rs — LLaMA is all-attention blocks.   [done: shared path]
-4.2  Architecture variants: mistral, qwen2, gemma, phi3  [done: llama/mistral/qwen2/qwen3/granite; gemma/phi3 remain]
+4.2  Architecture variants: llama, mistral, qwen2, qwen3, granite, gemma, phi3  [done: llama/mistral/qwen2/qwen3/granite; gemma/phi3 remain]
 4.3  Test each on a real GGUF. Greedy decoding matches llama.cpp.
 ```
 
@@ -324,7 +325,7 @@ WASM build (dual: threaded + single-threaded), wasm-bindgen-rayon for multi-thre
 GBNF grammar parser + grammar-constrained decoding (`cera/src/grammar.rs`): each
 decode step masks logits to only grammar-accepted tokens. Supports bounded
 repetition `{n,m}` (#196) and is exposed over both FFI (`GenerateOpts.grammar`
-source text) and WASM (`set_grammar`/`clear_grammar`/`has_grammar`) (#198).
+source text) and WASM (`setGrammar`/`clearGrammar`/`hasGrammar`) (#198).
 Byte-level v1: non-ASCII / multi-byte ranges inside char classes are not yet
 supported. JSON-schema→grammar compiler and async FSM-mask overlap remain future
 enhancements.
