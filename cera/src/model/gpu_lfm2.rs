@@ -276,13 +276,24 @@ impl WgpuLoraAdapter {
                     _ => t.scale,
                 };
                 let b_scaled_data: Vec<f32> = t.b.iter().map(|&x| x * b_factor).collect();
-                // Batched-prefill B: scale only, no residual_mult fold (the fused
-                // residual add scales the delta afterward — see field docs).
-                let b_batched_data: Vec<f32> = t.b.iter().map(|&x| x * t.scale).collect();
+                let b_scaled = ctx.upload_f32(&b_scaled_data, "lora_b_scaled");
+                // Batched-prefill B: scale only (no residual_mult fold — the fused
+                // residual add scales the delta afterward). Byte-identical to
+                // `b_scaled` unless this is a residual-fed target on Granite
+                // (`residual_mult != 1`); in the common case share the buffer (a
+                // cheap `Arc` clone) instead of a duplicate upload.
+                let b_batched = if b_factor == t.scale {
+                    b_scaled.clone()
+                } else {
+                    ctx.upload_f32(
+                        &t.b.iter().map(|&x| x * t.scale).collect::<Vec<f32>>(),
+                        "lora_b_batched",
+                    )
+                };
                 targets[target.index()] = Some(WgpuLoraTarget {
                     a: ctx.upload_f32(&t.a, "lora_a"),
-                    b_scaled: ctx.upload_f32(&b_scaled_data, "lora_b_scaled"),
-                    b_batched: ctx.upload_f32(&b_batched_data, "lora_b_batched"),
+                    b_scaled,
+                    b_batched,
                     a_params: ctx
                         .upload_storage(bytemuck::cast_slice(&[rank, k, 0, 0]), "lora_a_p"),
                     b_params: ctx
