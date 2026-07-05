@@ -874,6 +874,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_loraadapters_target_count(): Int
+
     external fun uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens(): Int
 
     external fun uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames(): Int
@@ -887,6 +889,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_session_append_text(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_append_tokens(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_attach_lora(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_cancel(): Int
 
@@ -902,6 +906,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_generate_streaming_async(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_session_has_lora(): Int
+
     external fun uniffi_cera_ffi_checksum_method_session_hidden_size(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_hidden_states_for_text(): Int
@@ -911,6 +917,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_position(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_remove_lora(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_reset(): Int
 
@@ -925,6 +933,10 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_path(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors(): Int
 
     external fun ffi_cera_ffi_uniffi_contract_version(): Int
 }
@@ -1107,6 +1119,32 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
+    external fun uniffi_cera_ffi_fn_clone_loraadapters(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_free_loraadapters(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_constructor_loraadapters_from_gguf(
+        `path`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_constructor_loraadapters_from_safetensors(
+        `path`: RustBuffer.ByValue,
+        `alpha`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_loraadapters_target_count(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Int
+
     external fun uniffi_cera_ffi_fn_clone_modalitysink(
         `handle`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -1174,6 +1212,12 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
+    external fun uniffi_cera_ffi_fn_method_session_attach_lora(
+        `ptr`: Long,
+        `adapters`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
     external fun uniffi_cera_ffi_fn_method_session_cancel(
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -1213,6 +1257,11 @@ internal object UniffiLib {
         `sink`: Long,
     ): Long
 
+    external fun uniffi_cera_ffi_fn_method_session_has_lora(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+
     external fun uniffi_cera_ffi_fn_method_session_hidden_size(
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -1240,6 +1289,11 @@ internal object UniffiLib {
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): Int
+
+    external fun uniffi_cera_ffi_fn_method_session_remove_lora(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
 
     external fun uniffi_cera_ffi_fn_method_session_reset(
         `ptr`: Long,
@@ -1530,6 +1584,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens() != 50332) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1549,6 +1606,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_append_tokens() != 1227) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_attach_lora() != 7627) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_cancel() != 7555) {
@@ -1572,6 +1632,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 12198) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_session_has_lora() != 13931) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_size() != 46607) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1585,6 +1648,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_position() != 13264) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_remove_lora() != 29534) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
@@ -1606,6 +1672,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 64420) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() != 57598) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors() != 11183) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -3648,6 +3720,293 @@ public object FfiConverterTypeDownloadProgressSink : FfiConverter<DownloadProgre
 //
 
 /**
+ * A loaded LoRA adapter, ready to attach to a [`Session`] via
+ * [`Session::attach_lora`]. Load it once and share the handle across sessions —
+ * it's reference-counted internally, so attaching to multiple sessions doesn't
+ * re-parse or re-allocate the factors.
+ */
+public interface LoraAdaptersInterface {
+    /**
+     * Number of `(layer, target)` low-rank deltas the adapter carries — for
+     * diagnostics / logging.
+     */
+    fun `targetCount`(): kotlin.UInt
+
+    companion object
+}
+
+/**
+ * A loaded LoRA adapter, ready to attach to a [`Session`] via
+ * [`Session::attach_lora`]. Load it once and share the handle across sessions —
+ * it's reference-counted internally, so attaching to multiple sessions doesn't
+ * re-parse or re-allocate the factors.
+ */
+open class LoraAdapters :
+    Disposable,
+    AutoCloseable,
+    LoraAdaptersInterface {
+    /**
+     * @suppress
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(
+        private val handle: Long,
+    ) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_cera_ffi_fn_free_loraadapters(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object")
+        }
+        return uniffiRustCall { status ->
+            UniffiLib.uniffi_cera_ffi_fn_clone_loraadapters(handle, status)
+        }
+    }
+
+    /**
+     * Number of `(layer, target)` low-rank deltas the adapter carries — for
+     * diagnostics / logging.
+     */
+    override fun `targetCount`(): kotlin.UInt =
+        FfiConverterUInt.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_loraadapters_target_count(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    companion object {
+        /**
+         * Load a llama.cpp-format GGUF adapter (`convert_lora_to_gguf` output) from
+         * a local path. `alpha` is read from the adapter's `adapter.lora.alpha`
+         * metadata (missing ⇒ scale = 1).
+         */
+        @Throws(FfiException::class)
+        fun `fromGguf`(`path`: kotlin.String): LoraAdapters =
+            FfiConverterTypeLoraAdapters.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_gguf(FfiConverterString.lower(`path`), _status)
+                },
+            )
+
+        /**
+         * Load a PEFT `.safetensors` adapter from a local path. PEFT stores `alpha`
+         * in a sibling `adapter_config.json`, so pass it explicitly here (`None` ⇒
+         * scale = 1, i.e. `alpha == rank`).
+         */
+        @Throws(FfiException::class)
+        fun `fromSafetensors`(
+            `path`: kotlin.String,
+            `alpha`: kotlin.Float?,
+        ): LoraAdapters =
+            FfiConverterTypeLoraAdapters.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_safetensors(
+                        FfiConverterString.lower(`path`),
+                        FfiConverterOptionalFloat.lower(`alpha`),
+                        _status,
+                    )
+                },
+            )
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeLoraAdapters : FfiConverter<LoraAdapters, Long> {
+    override fun lower(value: LoraAdapters): Long = value.uniffiCloneHandle()
+
+    override fun lift(value: Long): LoraAdapters = LoraAdapters(UniffiWithHandle, value)
+
+    override fun read(buf: ByteBuffer): LoraAdapters = lift(buf.getLong())
+
+    override fun allocationSize(value: LoraAdapters) = 8UL
+
+    override fun write(
+        value: LoraAdapters,
+        buf: ByteBuffer,
+    ) {
+        buf.putLong(lower(value))
+    }
+}
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+/**
  * Streaming sink for decode output. Foreign callers implement this
  * trait (Kotlin class, Swift class, Python subclass) and pass an
  * `Arc<dyn ModalitySink>` to [`Session::generate_streaming`] to
@@ -4214,6 +4573,16 @@ public interface SessionInterface {
     fun `appendTokens`(`tokens`: List<kotlin.UInt>)
 
     /**
+     * Attach a [`LoraAdapters`] to this session (Swift `setLoraAdapters`). It's
+     * applied to every subsequent forward pass — generation **and**
+     * hidden-states extraction — until removed or replaced (hot-swap), and is
+     * preserved across [`Self::reset`]. Returns [`FfiError::LoraParse`] if the
+     * adapter's dimensions don't match the loaded model. Only affects tokens
+     * processed after the call (doesn't retroactively re-adapt cached KV).
+     */
+    fun `attachLora`(`adapters`: LoraAdapters)
+
+    /**
      * Signal in-flight `generate()` to exit with
      * `FinishReason::Cancelled` at the next between-token check.
      * Safe from any thread. No-op if no `generate()` is running.
@@ -4355,6 +4724,11 @@ public interface SessionInterface {
     ): GenerateSummary
 
     /**
+     * Whether a LoRA adapter is currently attached to this session.
+     */
+    fun `hasLora`(): kotlin.Boolean
+
+    /**
      * Model hidden dimension `D`. Reshape a raw `[T*D]` byte buffer from
      * [`Self::hidden_states_for_tokens`] into `[T][D]` with this. Lock-free
      * (cached at construction), so — like `position()` — it's safe to call from
@@ -4403,6 +4777,11 @@ public interface SessionInterface {
      * `generate()` is in flight.
      */
     fun `position`(): kotlin.UInt
+
+    /**
+     * Remove any attached LoRA adapter, returning to base-model inference.
+     */
+    fun `removeLora`()
 
     /**
      * Drop cached state + resample the seed. After `reset()` the
@@ -4696,6 +5075,26 @@ open class Session :
         }
 
     /**
+     * Attach a [`LoraAdapters`] to this session (Swift `setLoraAdapters`). It's
+     * applied to every subsequent forward pass — generation **and**
+     * hidden-states extraction — until removed or replaced (hot-swap), and is
+     * preserved across [`Self::reset`]. Returns [`FfiError::LoraParse`] if the
+     * adapter's dimensions don't match the loaded model. Only affects tokens
+     * processed after the call (doesn't retroactively re-adapt cached KV).
+     */
+    @Throws(FfiException::class)
+    override fun `attachLora`(`adapters`: LoraAdapters) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_attach_lora(
+                    it,
+                    FfiConverterTypeLoraAdapters.lower(`adapters`),
+                    _status,
+                )
+            }
+        }
+
+    /**
      * Signal in-flight `generate()` to exit with
      * `FinishReason::Cancelled` at the next between-token check.
      * Safe from any thread. No-op if no `generate()` is running.
@@ -4923,6 +5322,22 @@ open class Session :
         )
 
     /**
+     * Whether a LoRA adapter is currently attached to this session.
+     */
+    @Throws(FfiException::class)
+    override fun `hasLora`(): kotlin.Boolean =
+        FfiConverterBoolean.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_has_lora(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Model hidden dimension `D`. Reshape a raw `[T*D]` byte buffer from
      * [`Self::hidden_states_for_tokens`] into `[T][D]` with this. Lock-free
      * (cached at construction), so — like `position()` — it's safe to call from
@@ -5027,6 +5442,20 @@ open class Session :
                 }
             },
         )
+
+    /**
+     * Remove any attached LoRA adapter, returning to base-model inference.
+     */
+    @Throws(FfiException::class)
+    override fun `removeLora`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_remove_lora(
+                    it,
+                    _status,
+                )
+            }
+        }
 
     /**
      * Drop cached state + resample the seed. After `reset()` the
@@ -5794,6 +6223,18 @@ sealed class FfiException : kotlin.Exception() {
             get() = "id=${ `id` }, vocabSize=${ `vocabSize` }"
     }
 
+    /**
+     * A LoRA adapter failed to load ([`LoraAdapters::from_gguf`] /
+     * [`LoraAdapters::from_safetensors`]) or was incompatible with the model at
+     * attach time (wrong dimensions). `detail` carries the diagnostic.
+     */
+    class LoraParse(
+        val `detail`: kotlin.String,
+    ) : FfiException() {
+        override val message
+            get() = "detail=${ `detail` }"
+    }
+
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<FfiException> {
         override fun lift(error_buf: RustBuffer.ByValue): FfiException = FfiConverterTypeFfiError.lift(error_buf)
     }
@@ -5856,6 +6297,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
                 FfiException.InvalidToken(
                     FfiConverterUInt.read(buf),
                     FfiConverterUInt.read(buf),
+                )
+            }
+
+            11 -> {
+                FfiException.LoraParse(
+                    FfiConverterString.read(buf),
                 )
             }
 
@@ -5923,6 +6370,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
                     FfiConverterUInt.allocationSize(value.`id`) +
                     FfiConverterUInt.allocationSize(value.`vocabSize`)
             )
+
+            is FfiException.LoraParse -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`detail`)
+            )
         }
 
     override fun write(
@@ -5985,6 +6438,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
                 buf.putInt(10)
                 FfiConverterUInt.write(value.`id`, buf)
                 FfiConverterUInt.write(value.`vocabSize`, buf)
+                Unit
+            }
+
+            is FfiException.LoraParse -> {
+                buf.putInt(11)
+                FfiConverterString.write(value.`detail`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
@@ -6293,6 +6752,38 @@ public object FfiConverterOptionalULong : FfiConverterRustBuffer<kotlin.ULong?> 
         } else {
             buf.put(1)
             FfiConverterULong.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalFloat : FfiConverterRustBuffer<kotlin.Float?> {
+    override fun read(buf: ByteBuffer): kotlin.Float? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterFloat.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.Float?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterFloat.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: kotlin.Float?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterFloat.write(value, buf)
         }
     }
 }

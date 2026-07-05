@@ -441,6 +441,31 @@ void uniffi_cera_ffi_fn_init_callback_vtable_downloadprogresssink(const UniffiVT
 void uniffi_cera_ffi_fn_method_downloadprogresssink_on_progress(uint64_t ptr, RustBuffer url, uint64_t bytes_downloaded, RustBuffer total_bytes, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_LORAADAPTERS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_LORAADAPTERS
+uint64_t uniffi_cera_ffi_fn_clone_loraadapters(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_LORAADAPTERS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_LORAADAPTERS
+void uniffi_cera_ffi_fn_free_loraadapters(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_LORAADAPTERS_FROM_GGUF
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_LORAADAPTERS_FROM_GGUF
+uint64_t uniffi_cera_ffi_fn_constructor_loraadapters_from_gguf(RustBuffer path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_LORAADAPTERS_FROM_SAFETENSORS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_LORAADAPTERS_FROM_SAFETENSORS
+uint64_t uniffi_cera_ffi_fn_constructor_loraadapters_from_safetensors(RustBuffer path, RustBuffer alpha, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_LORAADAPTERS_TARGET_COUNT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_LORAADAPTERS_TARGET_COUNT
+uint32_t uniffi_cera_ffi_fn_method_loraadapters_target_count(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_MODALITYSINK
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_MODALITYSINK
 uint64_t uniffi_cera_ffi_fn_clone_modalitysink(uint64_t handle, RustCallStatus *_Nonnull out_status
@@ -501,6 +526,11 @@ void uniffi_cera_ffi_fn_method_session_append_text(uint64_t ptr, RustBuffer text
 void uniffi_cera_ffi_fn_method_session_append_tokens(uint64_t ptr, RustBuffer tokens, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_ATTACH_LORA
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_ATTACH_LORA
+void uniffi_cera_ffi_fn_method_session_attach_lora(uint64_t ptr, uint64_t adapters, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_CANCEL
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_CANCEL
 void uniffi_cera_ffi_fn_method_session_cancel(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -536,6 +566,11 @@ RustBuffer uniffi_cera_ffi_fn_method_session_generate_streaming(uint64_t ptr, Ru
 uint64_t uniffi_cera_ffi_fn_method_session_generate_streaming_async(uint64_t ptr, RustBuffer opts, uint64_t sink
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_HAS_LORA
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_HAS_LORA
+int8_t uniffi_cera_ffi_fn_method_session_has_lora(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_HIDDEN_SIZE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_HIDDEN_SIZE
 uint32_t uniffi_cera_ffi_fn_method_session_hidden_size(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -559,6 +594,11 @@ RustBuffer uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled(uint64_t 
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_POSITION
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_POSITION
 uint32_t uniffi_cera_ffi_fn_method_session_position(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_REMOVE_LORA
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_REMOVE_LORA
+void uniffi_cera_ffi_fn_method_session_remove_lora(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_RESET
@@ -963,6 +1003,12 @@ uint16_t uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_LORAADAPTERS_TARGET_COUNT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_LORAADAPTERS_TARGET_COUNT
+uint16_t uniffi_cera_ffi_checksum_method_loraadapters_target_count(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_TEXT_TOKENS
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_TEXT_TOKENS
 uint16_t uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens(void
@@ -1002,6 +1048,12 @@ uint16_t uniffi_cera_ffi_checksum_method_session_append_text(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_APPEND_TOKENS
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_APPEND_TOKENS
 uint16_t uniffi_cera_ffi_checksum_method_session_append_tokens(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_ATTACH_LORA
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_ATTACH_LORA
+uint16_t uniffi_cera_ffi_checksum_method_session_attach_lora(void
     
 );
 #endif
@@ -1047,6 +1099,12 @@ uint16_t uniffi_cera_ffi_checksum_method_session_generate_streaming_async(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_HAS_LORA
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_HAS_LORA
+uint16_t uniffi_cera_ffi_checksum_method_session_has_lora(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_HIDDEN_SIZE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_HIDDEN_SIZE
 uint16_t uniffi_cera_ffi_checksum_method_session_hidden_size(void
@@ -1074,6 +1132,12 @@ uint16_t uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_POSITION
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_POSITION
 uint16_t uniffi_cera_ffi_checksum_method_session_position(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_REMOVE_LORA
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_REMOVE_LORA
+uint16_t uniffi_cera_ffi_checksum_method_session_remove_lora(void
     
 );
 #endif
@@ -1116,6 +1180,18 @@ uint16_t uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async(vo
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CERAENGINE_FROM_PATH
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CERAENGINE_FROM_PATH
 uint16_t uniffi_cera_ffi_checksum_constructor_ceraengine_from_path(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_LORAADAPTERS_FROM_GGUF
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_LORAADAPTERS_FROM_GGUF
+uint16_t uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_LORAADAPTERS_FROM_SAFETENSORS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_LORAADAPTERS_FROM_SAFETENSORS
+uint16_t uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors(void
     
 );
 #endif

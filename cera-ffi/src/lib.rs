@@ -198,6 +198,12 @@ pub enum FfiError {
     /// `cera::CeraError::InvalidToken`.
     #[error("token id {id} out of range (vocab_size {vocab_size})")]
     InvalidToken { id: u32, vocab_size: u32 },
+
+    /// A LoRA adapter failed to load ([`LoraAdapters::from_gguf`] /
+    /// [`LoraAdapters::from_safetensors`]) or was incompatible with the model at
+    /// attach time (wrong dimensions). `detail` carries the diagnostic.
+    #[error("lora: {detail}")]
+    LoraParse { detail: String },
 }
 
 impl From<cera::CeraError> for FfiError {
@@ -220,9 +226,7 @@ impl From<cera::CeraError> for FfiError {
                 FfiError::InvalidToken { id, vocab_size }
             }
             cera::CeraError::Backend(s) => FfiError::Backend { detail: s },
-            // LoRA attach isn't exposed over FFI yet (LoRA-3 adds the surface +
-            // a dedicated variant); map to Backend for exhaustiveness meanwhile.
-            cera::CeraError::LoraDimMismatch(s) => FfiError::Backend { detail: s },
+            cera::CeraError::LoraDimMismatch(s) => FfiError::LoraParse { detail: s },
             cera::CeraError::Io(io_err) => FfiError::Io {
                 detail: io_err.to_string(),
             },
@@ -1115,6 +1119,53 @@ impl cera::ModalitySink for ForeignSinkAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// LoRA adapters
+// ---------------------------------------------------------------------------
+
+/// A loaded LoRA adapter, ready to attach to a [`Session`] via
+/// [`Session::attach_lora`]. Load it once and share the handle across sessions —
+/// it's reference-counted internally, so attaching to multiple sessions doesn't
+/// re-parse or re-allocate the factors.
+#[derive(uniffi::Object)]
+pub struct LoraAdapters {
+    inner: Arc<cera::lora::LoraAdapterWeights>,
+}
+
+#[uniffi::export]
+impl LoraAdapters {
+    /// Load a llama.cpp-format GGUF adapter (`convert_lora_to_gguf` output) from
+    /// a local path. `alpha` is read from the adapter's `adapter.lora.alpha`
+    /// metadata (missing ⇒ scale = 1).
+    #[uniffi::constructor]
+    pub fn from_gguf(path: String) -> Result<Arc<Self>, FfiError> {
+        let inner = cera::lora::LoraAdapterWeights::from_gguf(std::path::Path::new(&path))
+            .map_err(|e| FfiError::LoraParse {
+                detail: e.to_string(),
+            })?;
+        Ok(Arc::new(Self { inner }))
+    }
+
+    /// Load a PEFT `.safetensors` adapter from a local path. PEFT stores `alpha`
+    /// in a sibling `adapter_config.json`, so pass it explicitly here (`None` ⇒
+    /// scale = 1, i.e. `alpha == rank`).
+    #[uniffi::constructor]
+    pub fn from_safetensors(path: String, alpha: Option<f32>) -> Result<Arc<Self>, FfiError> {
+        let inner =
+            cera::lora::LoraAdapterWeights::from_safetensors(std::path::Path::new(&path), alpha)
+                .map_err(|e| FfiError::LoraParse {
+                    detail: e.to_string(),
+                })?;
+        Ok(Arc::new(Self { inner }))
+    }
+
+    /// Number of `(layer, target)` low-rank deltas the adapter carries — for
+    /// diagnostics / logging.
+    pub fn target_count(&self) -> u32 {
+        self.inner.target_count() as u32
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
@@ -1295,6 +1346,29 @@ impl Session {
     /// `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
     pub fn hidden_states_mean_pooled(&self, tokens: Vec<u32>) -> Result<Vec<f32>, FfiError> {
         Ok(self.lock_inner()?.hidden_states_mean_pooled(&tokens)?)
+    }
+
+    /// Attach a [`LoraAdapters`] to this session (Swift `setLoraAdapters`). It's
+    /// applied to every subsequent forward pass — generation **and**
+    /// hidden-states extraction — until removed or replaced (hot-swap), and is
+    /// preserved across [`Self::reset`]. Returns [`FfiError::LoraParse`] if the
+    /// adapter's dimensions don't match the loaded model. Only affects tokens
+    /// processed after the call (doesn't retroactively re-adapt cached KV).
+    pub fn attach_lora(&self, adapters: Arc<LoraAdapters>) -> Result<(), FfiError> {
+        self.lock_inner()?
+            .attach_lora_adapters(adapters.inner.clone())?;
+        Ok(())
+    }
+
+    /// Remove any attached LoRA adapter, returning to base-model inference.
+    pub fn remove_lora(&self) -> Result<(), FfiError> {
+        self.lock_inner()?.remove_lora_adapters();
+        Ok(())
+    }
+
+    /// Whether a LoRA adapter is currently attached to this session.
+    pub fn has_lora(&self) -> Result<bool, FfiError> {
+        Ok(self.lock_inner()?.has_lora_adapters())
     }
 
     /// Append an encoded image (PNG / JPEG bytes, auto-detected) to the

@@ -984,6 +984,45 @@ impl GenerateSummary {
     }
 }
 
+/// A loaded LoRA adapter, ready to attach to a [`Session`] via `attachLora`.
+/// Load it once (from bytes — the browser has no filesystem) and reuse the
+/// handle across sessions; the factors are reference-counted internally.
+#[wasm_bindgen]
+pub struct LoraAdapters {
+    inner: std::sync::Arc<cera::lora::LoraAdapterWeights>,
+}
+
+#[wasm_bindgen]
+impl LoraAdapters {
+    /// Load a llama.cpp-format GGUF adapter (`convert_lora_to_gguf` output) from
+    /// bytes. `alpha` is read from the adapter's `adapter.lora.alpha` metadata.
+    #[wasm_bindgen(js_name = fromGgufBytes)]
+    pub fn from_gguf_bytes(bytes: &[u8]) -> Result<LoraAdapters, JsError> {
+        let inner = cera::lora::LoraAdapterWeights::from_gguf_bytes(std::sync::Arc::from(bytes))
+            .map_err(map_err)?;
+        Ok(LoraAdapters { inner })
+    }
+
+    /// Load a PEFT `.safetensors` adapter from bytes. PEFT keeps `alpha` in a
+    /// sibling `adapter_config.json`, so pass it explicitly (`undefined` ⇒
+    /// scale = 1, i.e. `alpha == rank`).
+    #[wasm_bindgen(js_name = fromSafetensorsBytes)]
+    pub fn from_safetensors_bytes(
+        bytes: &[u8],
+        alpha: Option<f32>,
+    ) -> Result<LoraAdapters, JsError> {
+        let inner = cera::lora::LoraAdapterWeights::from_safetensors_bytes(bytes, alpha)
+            .map_err(map_err)?;
+        Ok(LoraAdapters { inner })
+    }
+
+    /// Number of `(layer, target)` low-rank deltas the adapter carries.
+    #[wasm_bindgen(js_name = targetCount)]
+    pub fn target_count(&self) -> u32 {
+        self.inner.target_count() as u32
+    }
+}
+
 /// Stateful generation handle. Built via `CeraEngine.newSession(config)`.
 ///
 /// JS callers seed the conversation by calling `appendText` /
@@ -1091,6 +1130,30 @@ impl Session {
             .hidden_states_mean_pooled(tokens)
             .map_err(map_cera_err)?;
         Ok(js_sys::Float32Array::from(pooled.as_slice()))
+    }
+
+    /// Attach a [`LoraAdapters`] to this session. Applied to every subsequent
+    /// forward pass — generation **and** hidden-states extraction — until
+    /// removed or replaced (hot-swap), and preserved across `reset()`. Throws if
+    /// the adapter's dimensions don't match the loaded model. Only affects tokens
+    /// processed after the call (doesn't retroactively re-adapt cached KV).
+    #[wasm_bindgen(js_name = attachLora)]
+    pub fn attach_lora(&mut self, adapters: &LoraAdapters) -> Result<(), JsError> {
+        self.inner
+            .attach_lora_adapters(adapters.inner.clone())
+            .map_err(map_cera_err)
+    }
+
+    /// Remove any attached LoRA adapter, returning to base-model inference.
+    #[wasm_bindgen(js_name = removeLora)]
+    pub fn remove_lora(&mut self) {
+        self.inner.remove_lora_adapters();
+    }
+
+    /// Whether a LoRA adapter is currently attached to this session.
+    #[wasm_bindgen(js_name = hasLora)]
+    pub fn has_lora(&self) -> bool {
+        self.inner.has_lora_adapters()
     }
 
     /// Append PCM audio samples (mono `f32`, normalized to roughly

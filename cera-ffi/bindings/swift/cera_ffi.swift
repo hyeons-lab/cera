@@ -1650,6 +1650,169 @@ public func FfiConverterTypeDownloadProgressSink_lower(_ value: DownloadProgress
 
 
 /**
+ * A loaded LoRA adapter, ready to attach to a [`Session`] via
+ * [`Session::attach_lora`]. Load it once and share the handle across sessions —
+ * it's reference-counted internally, so attaching to multiple sessions doesn't
+ * re-parse or re-allocate the factors.
+ */
+public protocol LoraAdaptersProtocol: AnyObject, Sendable {
+    
+    /**
+     * Number of `(layer, target)` low-rank deltas the adapter carries — for
+     * diagnostics / logging.
+     */
+    func targetCount()  -> UInt32
+    
+}
+/**
+ * A loaded LoRA adapter, ready to attach to a [`Session`] via
+ * [`Session::attach_lora`]. Load it once and share the handle across sessions —
+ * it's reference-counted internally, so attaching to multiple sessions doesn't
+ * re-parse or re-allocate the factors.
+ */
+open class LoraAdapters: LoraAdaptersProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_loraadapters(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_loraadapters(handle, $0) }
+    }
+
+    
+    /**
+     * Load a llama.cpp-format GGUF adapter (`convert_lora_to_gguf` output) from
+     * a local path. `alpha` is read from the adapter's `adapter.lora.alpha`
+     * metadata (missing ⇒ scale = 1).
+     */
+public static func fromGguf(path: String)throws  -> LoraAdapters  {
+    return try  FfiConverterTypeLoraAdapters_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_loraadapters_from_gguf(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+    
+    /**
+     * Load a PEFT `.safetensors` adapter from a local path. PEFT stores `alpha`
+     * in a sibling `adapter_config.json`, so pass it explicitly here (`None` ⇒
+     * scale = 1, i.e. `alpha == rank`).
+     */
+public static func fromSafetensors(path: String, alpha: Float?)throws  -> LoraAdapters  {
+    return try  FfiConverterTypeLoraAdapters_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_loraadapters_from_safetensors(
+        FfiConverterString.lower(path),
+        FfiConverterOptionFloat.lower(alpha),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Number of `(layer, target)` low-rank deltas the adapter carries — for
+     * diagnostics / logging.
+     */
+open func targetCount() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_loraadapters_target_count(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLoraAdapters: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = LoraAdapters
+
+    public static func lift(_ handle: UInt64) throws -> LoraAdapters {
+        return LoraAdapters(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: LoraAdapters) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LoraAdapters {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: LoraAdapters, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoraAdapters_lift(_ handle: UInt64) throws -> LoraAdapters {
+    return try FfiConverterTypeLoraAdapters.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoraAdapters_lower(_ value: LoraAdapters) -> UInt64 {
+    return FfiConverterTypeLoraAdapters.lower(value)
+}
+
+
+
+
+
+
+/**
  * Streaming sink for decode output. Foreign callers implement this
  * trait (Kotlin class, Swift class, Python subclass) and pass an
  * `Arc<dyn ModalitySink>` to [`Session::generate_streaming`] to
@@ -2111,6 +2274,16 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func appendTokens(tokens: [UInt32]) throws 
     
     /**
+     * Attach a [`LoraAdapters`] to this session (Swift `setLoraAdapters`). It's
+     * applied to every subsequent forward pass — generation **and**
+     * hidden-states extraction — until removed or replaced (hot-swap), and is
+     * preserved across [`Self::reset`]. Returns [`FfiError::LoraParse`] if the
+     * adapter's dimensions don't match the loaded model. Only affects tokens
+     * processed after the call (doesn't retroactively re-adapt cached KV).
+     */
+    func attachLora(adapters: LoraAdapters) throws 
+    
+    /**
      * Signal in-flight `generate()` to exit with
      * `FinishReason::Cancelled` at the next between-token check.
      * Safe from any thread. No-op if no `generate()` is running.
@@ -2246,6 +2419,11 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func generateStreamingAsync(opts: GenerateOpts, sink: ModalitySink) async throws  -> GenerateSummary
     
     /**
+     * Whether a LoRA adapter is currently attached to this session.
+     */
+    func hasLora() throws  -> Bool
+    
+    /**
      * Model hidden dimension `D`. Reshape a raw `[T*D]` byte buffer from
      * [`Self::hidden_states_for_tokens`] into `[T][D]` with this. Lock-free
      * (cached at construction), so — like `position()` — it's safe to call from
@@ -2294,6 +2472,11 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * `generate()` is in flight.
      */
     func position()  -> UInt32
+    
+    /**
+     * Remove any attached LoRA adapter, returning to base-model inference.
+     */
+    func removeLora() throws 
     
     /**
      * Drop cached state + resample the seed. After `reset()` the
@@ -2519,6 +2702,22 @@ open func appendTokens(tokens: [UInt32])throws   {try rustCallWithError(FfiConve
 }
     
     /**
+     * Attach a [`LoraAdapters`] to this session (Swift `setLoraAdapters`). It's
+     * applied to every subsequent forward pass — generation **and**
+     * hidden-states extraction — until removed or replaced (hot-swap), and is
+     * preserved across [`Self::reset`]. Returns [`FfiError::LoraParse`] if the
+     * adapter's dimensions don't match the loaded model. Only affects tokens
+     * processed after the call (doesn't retroactively re-adapt cached KV).
+     */
+open func attachLora(adapters: LoraAdapters)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_attach_lora(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeLoraAdapters_lower(adapters),$0
+    )
+}
+}
+    
+    /**
      * Signal in-flight `generate()` to exit with
      * `FinishReason::Cancelled` at the next between-token check.
      * Safe from any thread. No-op if no `generate()` is running.
@@ -2715,6 +2914,17 @@ open func generateStreamingAsync(opts: GenerateOpts, sink: ModalitySink)async th
 }
     
     /**
+     * Whether a LoRA adapter is currently attached to this session.
+     */
+open func hasLora()throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_has_lora(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
      * Model hidden dimension `D`. Reshape a raw `[T*D]` byte buffer from
      * [`Self::hidden_states_for_tokens`] into `[T][D]` with this. Lock-free
      * (cached at construction), so — like `position()` — it's safe to call from
@@ -2795,6 +3005,16 @@ open func position() -> UInt32  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Remove any attached LoRA adapter, returning to base-model inference.
+     */
+open func removeLora()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_remove_lora(
+            self.uniffiCloneHandle(),$0
+    )
+}
 }
     
     /**
@@ -3816,6 +4036,13 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
      */
     case InvalidToken(id: UInt32, vocabSize: UInt32
     )
+    /**
+     * A LoRA adapter failed to load ([`LoraAdapters::from_gguf`] /
+     * [`LoraAdapters::from_safetensors`]) or was incompatible with the model at
+     * attach time (wrong dimensions). `detail` carries the diagnostic.
+     */
+    case LoraParse(detail: String
+    )
 
     
 
@@ -3868,6 +4095,9 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
         case 10: return .InvalidToken(
             id: try FfiConverterUInt32.read(from: &buf), 
             vocabSize: try FfiConverterUInt32.read(from: &buf)
+            )
+        case 11: return .LoraParse(
+            detail: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -3927,6 +4157,11 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(10))
             FfiConverterUInt32.write(id, into: &buf)
             FfiConverterUInt32.write(vocabSize, into: &buf)
+            
+        
+        case let .LoraParse(detail):
+            writeInt(&buf, Int32(11))
+            FfiConverterString.write(detail, into: &buf)
             
         }
     }
@@ -4182,6 +4417,30 @@ fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterUInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionFloat: FfiConverterRustBuffer {
+    typealias SwiftType = Float?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterFloat.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterFloat.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -4456,6 +4715,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens() != 50332) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4475,6 +4737,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_append_tokens() != 1227) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_attach_lora() != 7627) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_cancel() != 7555) {
@@ -4498,6 +4763,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 12198) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_session_has_lora() != 13931) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_session_hidden_size() != 46607) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4511,6 +4779,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_position() != 13264) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_remove_lora() != 29534) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
@@ -4532,6 +4803,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 64420) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() != 57598) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors() != 11183) {
         return InitializationResult.apiChecksumMismatch
     }
 
