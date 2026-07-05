@@ -290,6 +290,10 @@ enum Command {
         /// pipeline), `--vocoder` / `--audio-out` (audio-output
         /// pipeline), and `--token-ids` (raw token mode bypasses
         /// the chat template the helper renders).
+        // The doc above shows a literal `--image https://…` example; a markdown
+        // autolink or code fence would leak into clap's `--help` output, so
+        // suppress the bare-url rustdoc lint here rather than mangling the help.
+        #[allow(rustdoc::bare_urls)]
         #[arg(
             long,
             value_name = "PATH-OR-URL",

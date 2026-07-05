@@ -10,7 +10,7 @@
 //!
 //! Layout (bottom of terminal):
 //!
-//!   ```
+//!   ```text
 //!   …prior messages in scrollback above…
 //!   user> What is 2+2?
 //!   assistant> 4

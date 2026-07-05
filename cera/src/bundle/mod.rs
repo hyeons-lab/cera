@@ -44,7 +44,7 @@
 //! 4. HEAD fails entirely — reuse whatever's cached so a transient
 //!    upstream blip doesn't defeat a CI cache hit.
 //!
-//! See [`download::head_info`] for the HEAD probe.
+//! See `download::head_info` for the HEAD probe.
 
 pub(crate) mod download;
 
@@ -490,7 +490,7 @@ pub struct LeapBundleEntry {
 /// rest of `cera` consumes via [`leap_bundles_manifest_url`].
 ///
 /// Network: blocking GET with a 30 s timeout (see
-/// [`LIST_BUNDLES_TIMEOUT`]) so a captive portal or stalled
+/// `LIST_BUNDLES_TIMEOUT`) so a captive portal or stalled
 /// connection surfaces as an error instead of hanging the CLI.
 /// No retry. Caller errors surface as [`CeraError::Backend`] with
 /// the underlying reqwest message.
@@ -586,7 +586,7 @@ fn parse_leap_bundles(body: &str) -> Result<Vec<LeapBundleEntry>, CeraError> {
 ///
 /// `bundle_id` / `quant` are interpolated directly into a URL path and
 /// must be safe filesystem components, so they go through the same
-/// strict [`validate_path_segment`] allowlist used for cache-dir
+/// strict `validate_path_segment` allowlist used for cache-dir
 /// segments. URL-reserved characters (`?`, `#`, `%`) are rejected so
 /// they can't alter URL semantics when interpolated.
 pub fn leap_bundles_manifest_url(bundle_id: &str, quant: &str) -> Result<String, CeraError> {
