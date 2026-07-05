@@ -128,7 +128,6 @@ fn run_shift_through_real_model(backend: BackendPreference) {
             context_size: CTX,
             backend,
             bundle_repo: Some(repo),
-            ..Default::default()
         },
     )
     .expect("load engine");

@@ -401,7 +401,7 @@ fn bench_metal_splitk(
         )
         .expect("MSL compile merge");
 
-    let rows_per_split = (shape.m + 7) / 8;
+    let rows_per_split = shape.m.div_ceil(8);
     let grid_split = MTLSize::new((rows_per_split * n_splits) as u64, 1, 1);
     let threads_split = MTLSize::new(64, 1, 1);
     let grid_merge = MTLSize::new(shape.m as u64, 1, 1);

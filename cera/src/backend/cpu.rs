@@ -2424,7 +2424,7 @@ mod tests {
 
         let rms = (4.0f32 + eps).sqrt(); // sqrt((4+4)/2 + eps)
         let inv_rms = 1.0 / rms;
-        let expected = vec![2.0 * inv_rms * 3.0, 2.0 * inv_rms * 0.5];
+        let expected = [2.0 * inv_rms * 3.0, 2.0 * inv_rms * 0.5];
 
         rmsnorm(&mut x, &weight, eps);
 
@@ -3072,6 +3072,7 @@ mod tests {
     }
 
     /// Reference scalar attention scores for testing.
+    #[allow(clippy::too_many_arguments)]
     fn attn_scores_scalar(
         q: &[f32],
         k_cache: &[f32],

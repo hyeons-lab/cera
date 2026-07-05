@@ -98,7 +98,7 @@ fn from_path_rejects_remote_model_url() {
 /// real `from_path` `.gguf` arm at `engine.rs`. The
 /// `from_path_vl_manifest_passes_inference_type_gate` test below
 /// covers the manifest-driven success path.
-
+///
 /// VL bundles loaded via a manifest pass the inference-type gate
 /// (Phase 1 of the VL pipeline). With placeholder GGUF bytes the
 /// loader still fails — but as a GGUF parse error from the LFM2

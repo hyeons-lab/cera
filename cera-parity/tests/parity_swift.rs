@@ -41,9 +41,9 @@
 //!
 //! macOS-only: this test depends on `swift build` + `libcera_ffi.dylib`
 //! + `DYLD_LIBRARY_PATH`. On Linux, `swift build` could in principle
-//! build the same source against `libcera_ffi.so` + `LD_LIBRARY_PATH`,
-//! but the toolchain weight isn't worth the marginal coverage —
-//! `parity_kotlin` already exercises the FFI surface on Linux.
+//!   build the same source against `libcera_ffi.so` + `LD_LIBRARY_PATH`,
+//!   but the toolchain weight isn't worth the marginal coverage —
+//!   `parity_kotlin` already exercises the FFI surface on Linux.
 
 use std::path::PathBuf;
 

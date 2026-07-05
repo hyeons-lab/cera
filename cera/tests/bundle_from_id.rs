@@ -42,7 +42,6 @@ fn from_bundle_id_loads_lfm2_q4_0() {
             context_size: 128,
             backend: BackendPreference::Cpu,
             bundle_repo: Some(repo),
-            ..Default::default()
         },
     )
     .expect("load engine from bundle id");
@@ -72,7 +71,6 @@ fn from_bundle_id_fails_without_bundle_repo() {
             context_size: 128,
             backend: BackendPreference::Cpu,
             bundle_repo: None,
-            ..Default::default()
         },
     );
     match result {

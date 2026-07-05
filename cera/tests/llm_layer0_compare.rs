@@ -1,7 +1,7 @@
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
-/// Standalone test: run ONLY LLM layer 0 (a GatedConv block) with a known token
-/// embedding and dump intermediates for comparison with a Python reference.
+//! Standalone test: run ONLY LLM layer 0 (a GatedConv block) with a known token
+//! embedding and dump intermediates for comparison with a Python reference.
 
 fn dump(path: &str, data: &[f32]) {
     let bytes: &[u8] = bytemuck::cast_slice(data);

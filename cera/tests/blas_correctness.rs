@@ -85,7 +85,6 @@ fn blas_prefill_matches_aarch64_reference() {
             context_size: CTX,
             backend: BackendPreference::Cpu,
             bundle_repo: Some(repo),
-            ..Default::default()
         },
     )
     .expect("load engine");

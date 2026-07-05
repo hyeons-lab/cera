@@ -1520,10 +1520,10 @@ mod tests {
 
             // Quantize and reconstruct
             let mut mse = 0.0f64;
-            for i in 0..head_dim {
-                let idx = quantize_scalar(rotated[i], &config.boundaries);
+            for &r in rotated.iter().take(head_dim) {
+                let idx = quantize_scalar(r, &config.boundaries);
                 let approx = config.centroids[idx as usize];
-                let err = (rotated[i] - approx) as f64;
+                let err = (r - approx) as f64;
                 mse += err * err;
             }
             total_mse += mse / head_dim as f64;
@@ -1956,7 +1956,7 @@ mod tests {
                     let config = TurboQuantConfig::for_head_dim(head_dim);
 
                     let mut rng = Xoshiro256SS::new(
-                        (head_dim as u64) ^ (group_size as u64) ^ (seq_len as u64) * 0xDEADBEEF,
+                        (head_dim as u64) ^ (group_size as u64) ^ ((seq_len as u64) * 0xDEADBEEF),
                     );
 
                     // Compress random values.

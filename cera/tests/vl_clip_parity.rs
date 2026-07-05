@@ -54,8 +54,8 @@ const MMPROJ_FILE: &str = "mmproj-LFM2.5-VL-450m-Q8_0.gguf";
 //     --image red_256.png --image-min-tokens 64 --image-max-tokens 64 \
 //     -ngl 0 --temp 0 -n 1 --no-warmup
 const REF_MEAN: f32 = -0.189_559;
-const REF_STD: f32 = 6.200_130;
-const REF_MIN: f32 = -324.152_222;
+const REF_STD: f32 = 6.200_13;
+const REF_MIN: f32 = -324.152_22;
 const REF_MAX: f32 = 49.164_997;
 const REF_TOKEN0_FIRST16: [f32; 16] = [
     -0.939_353, 0.294_400, 3.302_522, 4.070_815, 0.248_474, 1.013_565, -4.281_222, -0.095_652,
@@ -63,7 +63,7 @@ const REF_TOKEN0_FIRST16: [f32; 16] = [
 ];
 const REF_TOKEN0_LAST16: [f32; 16] = [
     -1.012_028,
-    -120.899_910,
+    -120.899_91,
     0.605_745,
     -1.800_021,
     -0.269_893,
@@ -77,7 +77,7 @@ const REF_TOKEN0_LAST16: [f32; 16] = [
     1.892_469,
     0.259_958,
     -7.124_193,
-    2.326_940,
+    2.326_94,
 ];
 
 #[test]
