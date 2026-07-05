@@ -358,6 +358,15 @@ pub struct Session {
     /// duration of a `generate` (to avoid borrow conflicts with `model`/`sampler`) and
     /// restored before returning. See [`crate::grammar`].
     grammar_mask: Option<crate::grammar::GrammarMask>,
+    /// Reusable throwaway state for [`Self::hidden_states_for_tokens`]. Sized to
+    /// the prompt via [`InferenceState::for_prefill`] and `clear_for_reuse`d
+    /// between calls, so the per-chunk classifier path does ~0 allocation after
+    /// warmup and never allocates a full-context KV cache. Separate from the
+    /// generation `state`, so extracting hidden states never disturbs an
+    /// in-progress conversation. `hs_scratch_cap` records the token capacity it
+    /// was built for (rebuild when a longer prompt arrives).
+    hs_scratch: Option<InferenceState>,
+    hs_scratch_cap: usize,
 }
 
 impl Session {
@@ -453,6 +462,8 @@ impl Session {
             gpu_vision_encoder: None,
             image_max_long_size: None,
             grammar_mask: None,
+            hs_scratch: None,
+            hs_scratch_cap: 0,
         }
     }
 
@@ -579,6 +590,82 @@ impl Session {
             ..SamplerConfig::default()
         };
         self.sampler = Sampler::new(sampler_cfg);
+    }
+
+    /// The model's hidden dimension `D` — the per-token width of the vectors
+    /// returned by [`Self::hidden_states_for_tokens`]. Callers reshape the
+    /// flattened `[T*D]` result into `[T][D]` with this.
+    pub fn hidden_size(&self) -> usize {
+        self.model.config().hidden_size
+    }
+
+    /// Extract the model's **per-token** last-layer hidden states (post-final
+    /// RMSNorm, matching llama.cpp `--pooling none`) for `tokens`.
+    ///
+    /// Returns a flattened row-major `[n_tokens * hidden_size]` buffer (token
+    /// `t`, channel `c` at `t * hidden_size + c`). This is a **side-effect-free**
+    /// one-shot prefill: it uses a reused, prompt-sized scratch state and does
+    /// NOT advance or disturb the session's generation KV, so it composes with an
+    /// already-primed conversation.
+    ///
+    /// Errors: [`CeraError::EmptyInput`] on empty input;
+    /// [`CeraError::UnsupportedModality`] if the backend doesn't implement
+    /// hidden-state extraction (probe via [`Model::supports_hidden_states`]).
+    pub fn hidden_states_for_tokens(&mut self, tokens: &[u32]) -> Result<Vec<f32>, CeraError> {
+        if tokens.is_empty() {
+            return Err(CeraError::EmptyInput);
+        }
+        // Clone the Arc (cheap refcount bump) so the model borrow doesn't
+        // conflict with the `&mut self.hs_scratch` borrow below.
+        let model = Arc::clone(&self.model);
+        if !model.supports_hidden_states() {
+            return Err(CeraError::UnsupportedModality);
+        }
+        let n = tokens.len();
+        // Reuse the scratch state when it's big enough; else (re)build it sized to
+        // this prompt. Never allocates a full-context KV cache.
+        let rebuild = self.hs_scratch.is_none() || self.hs_scratch_cap < n;
+        if rebuild {
+            let cfg = model.config();
+            self.hs_scratch = Some(InferenceState::for_prefill(cfg, n));
+            self.hs_scratch_cap = n.clamp(1, cfg.max_seq_len);
+        }
+        let state = self
+            .hs_scratch
+            .get_or_insert_with(|| InferenceState::for_prefill(model.config(), n));
+        if !rebuild {
+            state.clear_for_reuse();
+        }
+        Ok(model.hidden_states(tokens, state))
+    }
+
+    /// Like [`Self::hidden_states_for_tokens`] but **mean-pools** over tokens,
+    /// returning a single `[hidden_size]` vector. This is the common classifier
+    /// path (their head consumes the mean-pooled hidden state) and avoids
+    /// shipping the full `[T*D]` matrix across an FFI/WASM boundary.
+    pub fn hidden_states_mean_pooled(&mut self, tokens: &[u32]) -> Result<Vec<f32>, CeraError> {
+        let d = self.hidden_size();
+        let flat = self.hidden_states_for_tokens(tokens)?;
+        let t = flat.len() / d;
+        debug_assert_eq!(t * d, flat.len(), "hidden states not a multiple of D");
+        let mut pooled = vec![0.0f32; d];
+        for row in flat.chunks_exact(d) {
+            for (p, &x) in pooled.iter_mut().zip(row) {
+                *p += x;
+            }
+        }
+        if t > 0 {
+            let inv = 1.0 / t as f32;
+            pooled.iter_mut().for_each(|p| *p *= inv);
+        }
+        Ok(pooled)
+    }
+
+    /// Tokenize `text` and return its per-token hidden states. Convenience over
+    /// [`Self::hidden_states_for_tokens`] (Swift `hiddenStates(for:)`).
+    pub fn hidden_states_for_text(&mut self, text: &str) -> Result<Vec<f32>, CeraError> {
+        let tokens = self.tokenizer.encode(text);
+        self.hidden_states_for_tokens(&tokens)
     }
 
     /// Tokenize text and append. Convenience over `append_tokens`.
