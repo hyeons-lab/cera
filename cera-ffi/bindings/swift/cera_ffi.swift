@@ -1063,7 +1063,7 @@ public static func fromBundleId(bundleId: String, quant: String, config: EngineC
      * directory and attach it to the config before calling.
      *
      * Cancellation semantics (weaker than [`Session::generate_async`]):
-     * dropping the returned future drops the [`AbortOnDrop`] guard,
+     * dropping the returned future drops the `AbortOnDrop` guard,
      * which calls `AbortHandle::abort` on the spawned task. That
      * cancels the task if it's still queued on tokio's blocking
      * pool, so a not-yet-started download never runs. But if the
@@ -2172,7 +2172,7 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * Either path releases the session mutex; subsequent calls see
      * a clean session. You can also call [`Session::cancel`]
      * directly from any thread to trigger the same in-flight exit
-     * without dropping the future. See [`AsyncCancelGuard`] for the
+     * without dropping the future. See `AsyncCancelGuard` for the
      * full rationale.
      *
      * On error the wrapper performs the same poisoned-mutex handling
@@ -2235,7 +2235,7 @@ public protocol SessionProtocol: AnyObject, Sendable {
      *
      * Cancellation: dropping the returned future fires the same
      * abort + [`Session::cancel`] pair as [`Session::generate_async`]
-     * (see [`AsyncCancelGuard`]). For an in-flight decode, the loop
+     * (see `AsyncCancelGuard`). For an in-flight decode, the loop
      * exits with [`FinishReason::Cancelled`] and the sink's `on_done`
      * fires on the blocking worker before the task completes —
      * foreign consumers get the terminal signal even though they've
@@ -2603,7 +2603,7 @@ open func generate(opts: GenerateOpts)throws  -> GenerateOutput  {
      * Either path releases the session mutex; subsequent calls see
      * a clean session. You can also call [`Session::cancel`]
      * directly from any thread to trigger the same in-flight exit
-     * without dropping the future. See [`AsyncCancelGuard`] for the
+     * without dropping the future. See `AsyncCancelGuard` for the
      * full rationale.
      *
      * On error the wrapper performs the same poisoned-mutex handling
@@ -2689,7 +2689,7 @@ open func generateStreaming(opts: GenerateOpts, sink: ModalitySink)throws  -> Ge
      *
      * Cancellation: dropping the returned future fires the same
      * abort + [`Session::cancel`] pair as [`Session::generate_async`]
-     * (see [`AsyncCancelGuard`]). For an in-flight decode, the loop
+     * (see `AsyncCancelGuard`). For an in-flight decode, the loop
      * exits with [`FinishReason::Cancelled`] and the sink's `on_done`
      * fires on the blocking worker before the task completes —
      * foreign consumers get the terminal signal even though they've
@@ -4489,13 +4489,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_generate() != 57005) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_generate_async() != 10738) {
+    if (uniffi_cera_ffi_checksum_method_session_generate_async() != 58489) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_generate_streaming() != 43707) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 57581) {
+    if (uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 12198) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_hidden_size() != 46607) {
@@ -4528,7 +4528,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id() != 60717) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 61537) {
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 14088) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 64420) {
