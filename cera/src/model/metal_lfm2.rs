@@ -4,7 +4,7 @@
 // All GPU work per token is encoded into ONE command buffer and committed once.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use anyhow::Result;
 use metal::{Buffer, ComputePipelineState, MTLResourceOptions, MTLSize, NSUInteger};
@@ -164,6 +164,15 @@ struct MetalState {
     embedding_hidden_size: usize,
 }
 
+/// Scratch KV/conv caches for [`MetalLfm2Model::hidden_states`], mirroring the
+/// generation caches' shapes. Allocated **lazily** on first `hidden_states` call
+/// (via `OnceLock`), so a generation-only load never pays the (doubled) KV-cache
+/// VRAM. Selected over the generation caches by `use_hs_scratch`.
+struct HsScratch {
+    kv: Vec<Option<(Buffer, Buffer)>>,
+    conv: Vec<Option<Buffer>>,
+}
+
 /// Pre-allocated params buffers — values either written once at init (shape params)
 /// or updated per-token for a small fixed set (rope pos, attention seq_len).
 struct ParamsBufs {
@@ -271,6 +280,13 @@ pub struct MetalLfm2Model {
     /// `cera/src/backend/shaders/kv_shift.metal`.
     kv_shift_scratch: Buffer,
     state: MetalState,
+    /// Lazily-allocated scratch KV/conv for [`Self::hidden_states`] (see
+    /// [`HsScratch`]). Built on first use via [`Self::hs_scratch`] so a
+    /// generation-only load pays no extra KV VRAM. Selected over the generation
+    /// caches by `use_hs_scratch`, which is only toggled while holding
+    /// `infer_lock`, so the flag needs no stronger ordering than `Relaxed`.
+    hs_scratch: std::sync::OnceLock<HsScratch>,
+    use_hs_scratch: AtomicBool,
     /// Second mmap of the GGUF file — kept alive so the no-copy Metal buffer
     /// (mmap_buf) stays valid. The OS deduplicates physical pages with the
     /// first mmap inside cpu_model, so this costs zero extra memory.
@@ -631,6 +647,9 @@ impl MetalLfm2Model {
             }
         }
 
+        // Hidden-states scratch caches are allocated lazily on first use (see
+        // `Self::hs_scratch`) so generation-only loads don't pay their VRAM.
+
         // Pre-allocate params buffers. Shape params are written once; dynamic ones
         // (rope pos, attention seq_len) are updated per-token via buffer.contents().
         let head_dim_u32 = head_dim as u32;
@@ -750,6 +769,8 @@ impl MetalLfm2Model {
                 max_seq_len,
                 embedding_hidden_size: hs,
             },
+            hs_scratch: std::sync::OnceLock::new(),
+            use_hs_scratch: AtomicBool::new(false),
             profile_timer: if std::env::var("CERA_PROFILE").as_deref() == Ok("timing") {
                 Some(CategoryTimer::new())
             } else {
@@ -2424,6 +2445,85 @@ impl MetalLfm2Model {
 }
 
 impl Model for MetalLfm2Model {
+    fn supports_hidden_states(&self) -> bool {
+        true
+    }
+
+    /// Per-token post-final-norm hidden states, row-major `[n * hidden_size]`
+    /// (matching llama.cpp `--pooling none`). Runs a fresh-context prefill
+    /// against the dedicated [`HsScratch`] caches (selected via `use_hs_scratch`),
+    /// so it never touches the generation KV — the GPU analog of the CPU path's
+    /// separate scratch state. `_state` is unused: Metal keeps its KV on the
+    /// model, not the caller's `InferenceState`. Positions run `0..n`, so the
+    /// attention window and RoPE come purely from the loop index.
+    fn hidden_states(&self, tokens: &[u32], _state: &mut InferenceState) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        assert!(
+            !tokens.is_empty(),
+            "hidden_states requires at least one token"
+        );
+        let hs = self.config.hidden_size;
+        let vocab = self.config.vocab_size;
+        assert!(
+            tokens.len() <= self.state.max_seq_len,
+            "hidden_states chunk ({}) exceeds max_seq_len ({})",
+            tokens.len(),
+            self.state.max_seq_len
+        );
+
+        // Build the scratch caches on first use, then zero the scratch conv
+        // rolling buffers so each extraction starts from a clean convolution
+        // state. The scratch attention caches need no clearing: token `pos` only
+        // attends to `0..=pos`, all written earlier this run.
+        let scratch = self.hs_scratch();
+        for buf in scratch.conv.iter().flatten() {
+            let len = buf.length() as usize / 4;
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut f32, 0, len);
+            }
+        }
+
+        // Route the layer encoders at the scratch caches for the duration of the
+        // run. A drop-guard clears the flag even if a later assert or GPU call
+        // panics — otherwise a leaked `true` would send the next `forward()` into
+        // the scratch KV and silently corrupt generation.
+        struct ScratchGuard<'a>(&'a AtomicBool);
+        impl Drop for ScratchGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Relaxed);
+            }
+        }
+        self.use_hs_scratch.store(true, Ordering::Relaxed);
+        let _scratch_guard = ScratchGuard(&self.use_hs_scratch);
+
+        let mut out = Vec::with_capacity(tokens.len() * hs);
+        for (pos, &token) in tokens.iter().enumerate() {
+            let token_id = token as usize;
+            assert!(
+                token_id < vocab,
+                "token_id {token_id} out of range (vocab_size={vocab})"
+            );
+            // Dequant embedding → hidden_buf.
+            unsafe {
+                let dst =
+                    std::slice::from_raw_parts_mut(self.hidden_buf.contents() as *mut f32, hs);
+                self.dequant_embedding_row(token_id, dst);
+            }
+            // Layers (against scratch KV/conv) + output norm, then read the
+            // post-final-norm hidden state.
+            let cb = self.ctx.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.encode_layers(enc, pos);
+            self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            out.extend_from_slice(&self.ctx.read_f32(&self.normed_buf, hs));
+        }
+        // `_scratch_guard` clears `use_hs_scratch` here on the way out.
+        out
+    }
+
     fn forward(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> Vec<f32> {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         assert_eq!(tokens.len(), 1, "Metal forward expects single token");
@@ -4577,6 +4677,68 @@ impl MetalLfm2Model {
 
     /// Encode one full token's layer stack (all attn/conv + FFN blocks). `pos` is the
     /// sequence position for RoPE and the KV cache write offset.
+    /// Lazily build (once) the hidden-states scratch caches — same shapes as the
+    /// generation caches. Called under `infer_lock` from `hidden_states` before
+    /// `use_hs_scratch` is set, so `active_kv`/`active_conv` always find it built.
+    fn hs_scratch(&self) -> &HsScratch {
+        self.hs_scratch.get_or_init(|| {
+            let cfg = &self.config;
+            let head_dim = cfg.head_dim;
+            let hs = cfg.hidden_size;
+            let d_conv = cfg.conv_kernel_size.unwrap_or(3) - 1;
+            let max_seq_len = self.state.max_seq_len;
+            let mut kv = Vec::with_capacity(cfg.n_layers);
+            let mut conv = Vec::with_capacity(cfg.n_layers);
+            for i in 0..cfg.n_layers {
+                if cfg.block_types[i] == BlockType::Attention {
+                    let kv_dim = cfg.kv_heads_per_layer[i] * head_dim;
+                    let k = self.ctx.create_buffer((max_seq_len * kv_dim * 2) as u64);
+                    let v = self.ctx.create_buffer((max_seq_len * kv_dim * 2) as u64);
+                    kv.push(Some((k, v)));
+                    conv.push(None);
+                } else {
+                    kv.push(None);
+                    conv.push(Some(self.ctx.create_buffer((d_conv * hs * 4) as u64)));
+                }
+            }
+            HsScratch { kv, conv }
+        })
+    }
+
+    /// The attention KV cache for layer `i` — the hidden-states scratch cache
+    /// when [`Self::hidden_states`] is running (`use_hs_scratch`), else the
+    /// generation cache. Panics on a conv layer (no KV), matching the prior
+    /// direct `state.kv_caches[i].unwrap()`.
+    #[inline]
+    fn active_kv(&self, i: usize) -> &(Buffer, Buffer) {
+        let caches = if self.use_hs_scratch.load(Ordering::Relaxed) {
+            &self
+                .hs_scratch
+                .get()
+                .expect("hs_scratch built before use_hs_scratch is set")
+                .kv
+        } else {
+            &self.state.kv_caches
+        };
+        caches[i].as_ref().unwrap()
+    }
+
+    /// The conv rolling buffer for layer `i` — scratch vs generation, mirroring
+    /// [`Self::active_kv`].
+    #[inline]
+    fn active_conv(&self, i: usize) -> &Buffer {
+        let bufs = if self.use_hs_scratch.load(Ordering::Relaxed) {
+            &self
+                .hs_scratch
+                .get()
+                .expect("hs_scratch built before use_hs_scratch is set")
+                .conv
+        } else {
+            &self.state.conv_buffers
+        };
+        bufs[i].as_ref().unwrap()
+    }
+
     /// Encode a SINGLE layer for the current hidden_buf state at position pos.
     fn encode_single_layer(&self, enc: &metal::ComputeCommandEncoderRef, i: usize, pos: usize) {
         let cfg = &self.config;
@@ -4586,7 +4748,7 @@ impl MetalLfm2Model {
             let lw = &self.layers[i];
 
             if cfg.block_types[i] == BlockType::GatedConv {
-                let conv_buf = self.state.conv_buffers[i].as_ref().unwrap();
+                let conv_buf = self.active_conv(i);
 
                 // Decode-time gated-conv block, fused.
                 // 1. rmsnorm + 2. in_proj GEMV produce conv_proj_buf =
@@ -4638,7 +4800,7 @@ impl MetalLfm2Model {
                 let q_dim = n_heads * head_dim;
 
                 self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &lw.attn_norm);
-                let (k_cache, v_cache) = self.state.kv_caches[i].as_ref().unwrap();
+                let (k_cache, v_cache) = self.active_kv(i);
                 let kv_offset = (pos * kv_dim as usize * 2) as u64;
 
                 self.encode_gemv_qkv(
