@@ -214,6 +214,8 @@ pub enum CeraError {
     EmptyInput,
     #[error("token id {id} out of range (vocab_size {vocab_size})")]
     InvalidToken { id: u32, vocab_size: u32 },
+    #[error("LoRA adapter incompatible with this model: {0}")]
+    LoraDimMismatch(String),
     #[error("backend: {0}")]
     Backend(String),
     #[error("io: {0}")]
@@ -529,9 +531,24 @@ impl Session {
     /// hidden-states extraction — until replaced or removed. Replaces any prior
     /// adapter (hot-swap) and is preserved across [`Self::reset`]. Load the
     /// adapter once and share the `Arc` across sessions.
-    pub fn attach_lora_adapters(&mut self, adapters: Arc<crate::lora::LoraAdapterWeights>) {
+    ///
+    /// The adapter's dimensions are validated against the model up front, so an
+    /// adapter built for a different model is rejected with
+    /// [`CeraError::LoraDimMismatch`] rather than silently corrupting output.
+    ///
+    /// Note: this only affects tokens processed **after** the call — it does not
+    /// retroactively re-adapt KV already in the cache. Attach before prefilling
+    /// the context you want adapted (or [`Self::reset`] first).
+    pub fn attach_lora_adapters(
+        &mut self,
+        adapters: Arc<crate::lora::LoraAdapterWeights>,
+    ) -> Result<(), CeraError> {
+        adapters
+            .validate_dims(self.model.config())
+            .map_err(|e| CeraError::LoraDimMismatch(e.to_string()))?;
         self.lora = Some(adapters);
         self.state.lora = self.lora.clone();
+        Ok(())
     }
 
     /// Remove any attached LoRA adapter, returning to base-model inference.

@@ -152,7 +152,23 @@ fn lora_noop_and_effect() {
         assert_ne!(out, base, "{label} LoRA must change the hidden states");
         assert!(out.iter().all(|x| x.is_finite()), "{label}: finite output");
     }
+
+    // (c) validate_dims: a matching adapter is accepted; one with the wrong
+    // input width (a different model) is rejected up front.
+    assert!(
+        synth_adapter(attn_layer, hs, &[q, g], 4, 0.1, 0.1, 8.0)
+            .validate_dims(cfg)
+            .is_ok(),
+        "matching adapter must validate"
+    );
+    assert!(
+        synth_adapter(attn_layer, hs + 8, &[q], 4, 0.1, 0.1, 8.0)
+            .validate_dims(cfg)
+            .is_err(),
+        "wrong-input-width adapter must be rejected"
+    );
     eprintln!(
-        "lora_noop_and_effect: no-op bit-identical; attention + FFN hooks each change output ✓"
+        "lora_noop_and_effect: no-op bit-identical; attention + FFN hooks each change output; \
+         validate_dims accepts/rejects ✓"
     );
 }

@@ -220,6 +220,9 @@ impl From<cera::CeraError> for FfiError {
                 FfiError::InvalidToken { id, vocab_size }
             }
             cera::CeraError::Backend(s) => FfiError::Backend { detail: s },
+            // LoRA attach isn't exposed over FFI yet (LoRA-3 adds the surface +
+            // a dedicated variant); map to Backend for exhaustiveness meanwhile.
+            cera::CeraError::LoraDimMismatch(s) => FfiError::Backend { detail: s },
             cera::CeraError::Io(io_err) => FfiError::Io {
                 detail: io_err.to_string(),
             },
