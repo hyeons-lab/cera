@@ -131,13 +131,21 @@ impl MetalLoraAdapter {
                     _ => t.scale,
                 };
                 let b_scaled_data: Vec<f32> = t.b.iter().map(|&x| x * b_factor).collect();
-                // Batched-prefill B: scale only, no residual_mult fold (the fused
-                // residual add scales the delta afterward — see field docs).
-                let b_batched_data: Vec<f32> = t.b.iter().map(|&x| x * t.scale).collect();
+                let b_scaled = ctx.upload_f32(&b_scaled_data);
+                // Batched-prefill B: scale only (no residual_mult fold — the fused
+                // residual add scales the delta afterward). It's byte-identical to
+                // `b_scaled` unless this is a residual-fed target on Granite
+                // (`residual_mult != 1`); in the common case share the buffer (a
+                // cheap retain) instead of a duplicate upload.
+                let b_batched = if b_factor == t.scale {
+                    b_scaled.clone()
+                } else {
+                    ctx.upload_f32(&t.b.iter().map(|&x| x * t.scale).collect::<Vec<f32>>())
+                };
                 targets[target.index()] = Some(MetalLoraTarget {
                     a: ctx.upload_f32(&t.a),
-                    b_scaled: ctx.upload_f32(&b_scaled_data),
-                    b_batched: ctx.upload_f32(&b_batched_data),
+                    b_scaled,
+                    b_batched,
                     a_params: ctx.upload_bytes(bytemuck::cast_slice(&[rank, k])),
                     b_params: ctx.upload_bytes(bytemuck::cast_slice(&[d, rank])),
                     rank,
