@@ -23,6 +23,7 @@ mod generated {
 pub mod gguf;
 pub mod grammar;
 pub mod kv_cache;
+pub mod lora;
 pub mod manifest;
 pub mod model;
 pub mod par;
