@@ -704,6 +704,7 @@ pub mod shaders {
     pub const MUL_MAT_DECLS: &str = include_str!("shaders/mul_mat_decls.tmpl");
     pub const MUL_MAT_REG_TILE: &str = include_str!("shaders/mul_mat_reg_tile.wgsl");
     pub const GEMV_F32: &str = include_str!("shaders/gemv_f32.wgsl");
+    pub const GEMM_F32: &str = include_str!("shaders/gemm_f32.wgsl");
     pub const GEMV_Q4_0: &str = include_str!("shaders/gemv_q4_0.wgsl");
     pub const GEMV_Q4_0_FAST: &str = include_str!("shaders/gemv_q4_0_fast.wgsl");
     pub const GEMV_Q6_K: &str = include_str!("shaders/gemv_q6_k.wgsl");

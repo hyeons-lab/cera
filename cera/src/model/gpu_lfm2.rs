@@ -163,6 +163,12 @@ struct GpuPipelines {
     /// `y[row] += dot(A[row,:], x)` — the accumulate epilogue for the LoRA
     /// up-projection (`out += B_scaled·tmp`).
     gemv_f32_accum: wgpu::ComputePipeline,
+    /// Batched NT GEMM `C[M×N] = Lhs[M×K]·Rhs[N×K]ᵀ` (overwrite) — the LoRA
+    /// down-projection (`Tmp[n×rank] = X·Aᵀ`) in the batched prefill path.
+    gemm_f32_nt: wgpu::ComputePipeline,
+    /// Accumulate variant `C += Lhs·Rhsᵀ` — the LoRA up-projection epilogue
+    /// (`Y[n×d] += Tmp·B_batchedᵀ`) in the batched prefill path.
+    gemm_f32_nt_accum: wgpu::ComputePipeline,
     gemv_q4_0: wgpu::ComputePipeline,
     gemv_q4_0_fast: wgpu::ComputePipeline,
     gemv_q6_k: wgpu::ComputePipeline,
@@ -208,8 +214,20 @@ struct GpuPipelines {
 struct WgpuLoraTarget {
     /// Down-projection `A`, `[rank × k]` row-major (f32).
     a: wgpu::Buffer,
-    /// Up-projection `scale · B`, `[d × rank]` row-major (f32).
+    /// Up-projection `scale · B`, `[d × rank]` row-major (f32). For the
+    /// residual-fed targets (attn-output / ffn-down) this also folds the model's
+    /// `residual_mult`, because the **decode** path adds this delta straight into
+    /// the post-residual hidden state (see [`WgpuLoraAdapter::upload`]).
     b_scaled: wgpu::Buffer,
+    /// Up-projection `scale · B` **without** the `residual_mult` fold, for the
+    /// batched-prefill path. There the LoRA delta is accumulated into the
+    /// projection scratch *before* the fused residual add (`add_rmsnorm_batch` /
+    /// `scaled_add_inplace`) scales it by `residual_mult` — so folding
+    /// `residual_mult` here too would double-apply it (Granite only; identical to
+    /// `b_scaled` for every other arch, where `residual_mult == 1.0`). Matches the
+    /// CPU `lora::apply_prefill`, which uses a scale-only `B` and lets the model's
+    /// residual scale wrap the delta.
+    b_batched: wgpu::Buffer,
     /// `[rank, k, 0, 0]` params for the `A·x` GEMV.
     a_params: wgpu::Buffer,
     /// `[d, rank, 0, 0]` params for the `B_scaled·tmp` GEMV.
@@ -258,9 +276,13 @@ impl WgpuLoraAdapter {
                     _ => t.scale,
                 };
                 let b_scaled_data: Vec<f32> = t.b.iter().map(|&x| x * b_factor).collect();
+                // Batched-prefill B: scale only, no residual_mult fold (the fused
+                // residual add scales the delta afterward — see field docs).
+                let b_batched_data: Vec<f32> = t.b.iter().map(|&x| x * t.scale).collect();
                 targets[target.index()] = Some(WgpuLoraTarget {
                     a: ctx.upload_f32(&t.a, "lora_a"),
                     b_scaled: ctx.upload_f32(&b_scaled_data, "lora_b_scaled"),
+                    b_batched: ctx.upload_f32(&b_batched_data, "lora_b_batched"),
                     a_params: ctx
                         .upload_storage(bytemuck::cast_slice(&[rank, k, 0, 0]), "lora_a_p"),
                     b_params: ctx
@@ -478,6 +500,12 @@ pub struct GpuLfm2Model {
     /// Rank-width f32 scratch for the LoRA `tmp = A·x` intermediate. Sized to
     /// `MAX_LORA_RANK` so any accepted adapter fits without reallocation.
     lora_tmp: wgpu::Buffer,
+    /// Batched-prefill scratch for the LoRA down-projection result
+    /// (`Tmp[n_tokens × rank]`, token-major). Sized `MAX_LORA_RANK ×
+    /// min(max_seq_len, MAX_PREFILL_TOKENS)` f32 so it holds the whole rank
+    /// output for the largest prefill chunk. Filled by `gemm_f32_nt`, consumed by
+    /// `gemm_f32_nt_accum`.
+    lora_tmp_batched: wgpu::Buffer,
 }
 
 impl GpuLfm2Model {
@@ -590,6 +618,12 @@ impl GpuLfm2Model {
                 shaders::GEMV_F32,
                 "gemv_f32_accum",
                 "gemv_f32_accum",
+            ),
+            gemm_f32_nt: ctx.create_pipeline(shaders::GEMM_F32, "gemm_f32_nt", "gemm_f32_nt"),
+            gemm_f32_nt_accum: ctx.create_pipeline(
+                shaders::GEMM_F32,
+                "gemm_f32_nt_accum",
+                "gemm_f32_nt_accum",
             ),
             gemv_q4_0: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0", "gemv_q4_0"),
             gemv_q4_0_fast: ctx.create_pipeline(
@@ -986,6 +1020,11 @@ impl GpuLfm2Model {
         // LoRA `tmp = A·x` scratch, sized to the max supported rank so any
         // accepted adapter fits.
         let lora_tmp = ctx.create_storage_rw((crate::lora::MAX_LORA_RANK * 4) as u64, "lora_tmp");
+        // Batched LoRA down-projection scratch: MAX_LORA_RANK × max_pref f32s.
+        let lora_tmp_batched = ctx.create_storage_rw(
+            (crate::lora::MAX_LORA_RANK * max_pref * 4) as u64,
+            "lora_tmp_batched",
+        );
 
         let mut model = Self {
             ctx,
@@ -1046,6 +1085,7 @@ impl GpuLfm2Model {
             lora_lru: Mutex::new(Vec::new()),
             active_lora: Mutex::new(None),
             lora_tmp,
+            lora_tmp_batched,
         };
         model.cache_bind_groups();
         Ok(model)
@@ -1194,6 +1234,124 @@ impl GpuLfm2Model {
         target: LoraTarget,
     ) -> Option<&WgpuLoraTarget> {
         lora?.layers.get(layer)?[target.index()].as_ref()
+    }
+
+    /// Batched-prefill LoRA delta for one target, applied in-batch across all `n`
+    /// tokens: `Y[n×d] += B_batched · (A · X[n×k])`, computed as two NT GEMMs
+    /// (`gemm_f32_nt` / `gemm_f32_nt_accum`) that match the token-major batch
+    /// buffer layout (`X[tok*k + i]`, `Y[tok*d + o]`).
+    ///
+    /// `t.b_batched` carries only the `alpha/rank` scale (not `residual_mult`) —
+    /// the caller applies the LoRA before the fused residual add, so the model's
+    /// residual scale wraps the delta (matches `lora::apply_prefill`). Each GEMM
+    /// runs as its own compute pass, so wgpu's inter-pass resource barriers keep
+    /// the shared `lora_tmp_batched` write-then-read ordered (GEMM1 writes it,
+    /// GEMM2 reads it) and back-to-back hooks reusing the scratch stay correct.
+    fn encode_lora_batched(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        t: &WgpuLoraTarget,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        n: u32,
+    ) {
+        // GEMM 1: Tmp[n × rank] = X[n × k] · Aᵀ  (A is [rank × k] row-major).
+        // One workgroup per output element; total = n·rank workgroups.
+        let total1 = n * t.rank;
+        let p1: [u32; 4] = [n, t.rank, t.k, 0];
+        let p1_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&p1), "lora_batched_p1");
+        let bg1 = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("lora_batched_a"),
+                layout: &self.pipelines.gemm_f32_nt.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: input.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: t.a.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.lora_tmp_batched.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: p1_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        self.encode(
+            enc,
+            &self.pipelines.gemm_f32_nt,
+            &bg1,
+            (total1.min(65535), total1.div_ceil(65535), 1),
+            "lora_batched_a",
+        );
+
+        // GEMM 2: Y[n × d] += Tmp[n × rank] · Bᵀ  (B_batched is [d × rank] row-major).
+        let total2 = n * t.d;
+        let p2: [u32; 4] = [n, t.d, t.rank, 0];
+        let p2_buf = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&p2), "lora_batched_p2");
+        let bg2 = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("lora_batched_b"),
+                layout: &self.pipelines.gemm_f32_nt_accum.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.lora_tmp_batched.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: t.b_batched.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: p2_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        self.encode(
+            enc,
+            &self.pipelines.gemm_f32_nt_accum,
+            &bg2,
+            (total2.min(65535), total2.div_ceil(65535), 1),
+            "lora_batched_b",
+        );
+    }
+
+    /// Batched-prefill counterpart of the decode `dispatch_lora_into`: apply the
+    /// `(layer, target)` LoRA delta across all `n` tokens if the active adapter
+    /// touches it. `input`/`output` are token-major batch buffers at offset 0.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_lora_hook_batched(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        lora: Option<&Arc<WgpuLoraAdapter>>,
+        layer: usize,
+        target: LoraTarget,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        n: u32,
+    ) {
+        if let Some(t) = Self::lora_target(lora, layer, target) {
+            self.encode_lora_batched(enc, t, input, output, n);
+        }
     }
 
     /// Create a GEMV bind group for a given (weight, input, output) triple.
@@ -3360,6 +3518,14 @@ impl GpuLfm2Model {
         self.ctx.reset_profiler();
         self.gpu_state.seq_len.store(start_pos, Ordering::Relaxed);
 
+        // Active LoRA adapter (staged by `resolve_lora`); `None` on the base path.
+        // Each in-batch hook is a no-op unless the adapter touches that target.
+        let lora = self
+            .active_lora
+            .lock()
+            .expect("active_lora poisoned")
+            .clone();
+
         // ─── Stage embeddings into prefill_batch_buf ──────────────────────
         // CPU-side gather + one queue.write_buffer (the `embedding_f32`
         // table is pre-dequantized at load time and lives on the host).
@@ -3510,6 +3676,39 @@ impl GpuLfm2Model {
                     kv_dim,
                 );
 
+                // LoRA Q/K/V deltas: `+= scale·B·(A·normed)` on the raw
+                // projections, before QK-norm/RoPE (and the Qwen2 bias) — mirrors
+                // the decode hooks and the CPU `apply_attn_qkv`. Q → proj_buf,
+                // K → gate_buf, V → up_buf, all token-major (input is the shared
+                // attn_norm output in `prefill_normed_buf`).
+                self.encode_lora_hook_batched(
+                    &mut enc,
+                    lora.as_ref(),
+                    layer,
+                    LoraTarget::AttnQ,
+                    &self.prefill_normed_buf,
+                    &self.prefill_proj_buf,
+                    n_u,
+                );
+                self.encode_lora_hook_batched(
+                    &mut enc,
+                    lora.as_ref(),
+                    layer,
+                    LoraTarget::AttnK,
+                    &self.prefill_normed_buf,
+                    &self.prefill_gate_buf,
+                    n_u,
+                );
+                self.encode_lora_hook_batched(
+                    &mut enc,
+                    lora.as_ref(),
+                    layer,
+                    LoraTarget::AttnV,
+                    &self.prefill_normed_buf,
+                    &self.prefill_up_buf,
+                    n_u,
+                );
+
                 // Phase A2: QKV bias (Qwen2) — broadcast-add the bias vector
                 // across all N token rows, right after each projection and
                 // before QK-norm/RoPE. Absent on every other arch.
@@ -3603,6 +3802,21 @@ impl GpuLfm2Model {
                     q_dim,
                     hs_u,
                 );
+
+                // LoRA attn-output delta into gate_buf, BEFORE the FFN's fused
+                // `add_rmsnorm_batch` below scales it by `scalars.residual` (so
+                // `residual_mult` wraps the delta — hence `b_batched` carries scale
+                // only). Input is the attention output (o_proj input) in
+                // `prefill_normed_buf`.
+                self.encode_lora_hook_batched(
+                    &mut enc,
+                    lora.as_ref(),
+                    layer,
+                    LoraTarget::AttnOutput,
+                    &self.prefill_normed_buf,
+                    &self.prefill_gate_buf,
+                    n_u,
+                );
             }
 
             // ─── Phase 7: FFN ──────────────────────────────────────────────
@@ -3636,6 +3850,27 @@ impl GpuLfm2Model {
                 hs_u,
                 hs_u,
                 is_u,
+            );
+            // LoRA gate/up deltas on the raw projections, before silu_mul. Input
+            // is the ffn_norm output in `prefill_normed_buf`; outputs token-major
+            // (gate → gate_buf, up → up_buf). Applies to every layer (conv + attn).
+            self.encode_lora_hook_batched(
+                &mut enc,
+                lora.as_ref(),
+                layer,
+                LoraTarget::FfnGate,
+                &self.prefill_normed_buf,
+                &self.prefill_gate_buf,
+                n_u,
+            );
+            self.encode_lora_hook_batched(
+                &mut enc,
+                lora.as_ref(),
+                layer,
+                LoraTarget::FfnUp,
+                &self.prefill_normed_buf,
+                &self.prefill_up_buf,
+                n_u,
             );
             // silu_mul over the full N × is buffer.
             {
@@ -3689,6 +3924,19 @@ impl GpuLfm2Model {
                 is_u,
                 is_u,
                 hs_u,
+            );
+            // LoRA ffn-down delta into prefill_up_buf, BEFORE the next layer's
+            // fused `add_rmsnorm_batch` (or the final `scaled_add_inplace`) scales
+            // it by `scalars.residual`. Input is the silu_mul(gate,up) result in
+            // `prefill_gate_buf`.
+            self.encode_lora_hook_batched(
+                &mut enc,
+                lora.as_ref(),
+                layer,
+                LoraTarget::FfnDown,
+                &self.prefill_gate_buf,
+                &self.prefill_up_buf,
+                n_u,
             );
         }
 
@@ -4070,27 +4318,31 @@ impl Model for GpuLfm2Model {
         state: &mut InferenceState,
     ) -> Vec<f32> {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
-        // Stage the caller's adapter for the per-token layer encoders (the
-        // sequential fallback loop below runs them; the batched path does not,
-        // so it's disabled while an adapter is active). The guard clears
-        // `active_lora` on the way out.
+        // Stage the caller's adapter so both prefill paths apply it: the
+        // batched-GEMM path runs the in-batch LoRA hooks (two NT GEMMs per
+        // target), and the sequential fallback loop runs the decode hooks. The
+        // guard clears `active_lora` on the way out.
         let _lora_guard = self.resolve_lora(state);
         let lora_active = state.lora.is_some();
         // Reset internal seq_len so repeated generate() calls (bench) work.
         self.gpu_state.seq_len.store(start_pos, Ordering::Relaxed);
 
-        // Cache lookup: only on a fresh prefill (`start_pos == 0`), and never
-        // with a LoRA active — cached KV is base-model-only, so restoring it and
-        // adapting only the tail would corrupt the result (and inserting
-        // adapter-modified KV would poison the cache for later base runs). With
-        // an adapter, fall straight through to the per-token loop, which fires
-        // the hooks on every token.
-        if start_pos == 0 && !lora_active {
-            let hit = self
-                .prefix_cache
-                .lock()
-                .expect("prefix_cache mutex poisoned")
-                .find_longest_prefix(tokens);
+        // Fresh prefill (`start_pos == 0`) runs the batched-GEMM path — including
+        // with a LoRA active, which now applies in-batch (two NT GEMMs per target)
+        // rather than forcing the per-token fallback. The prefix cache is still
+        // bypassed with an adapter, though: cached KV is base-model-only, so
+        // restoring it and adapting only the tail would corrupt the result (and
+        // inserting adapter-modified KV would poison the cache for later base runs).
+        if start_pos == 0 {
+            // Cache lookup only for base-model prefills.
+            let hit = (!lora_active)
+                .then(|| {
+                    self.prefix_cache
+                        .lock()
+                        .expect("prefix_cache mutex poisoned")
+                        .find_longest_prefix(tokens)
+                })
+                .flatten();
             if let Some((snapshot, prefix_len)) = hit {
                 // Strict-prefix hits only. A `prefix_len == tokens.len()`
                 // hit would force `use_len = tokens.len() - 1`, but the
@@ -4179,10 +4431,13 @@ impl Model for GpuLfm2Model {
                     );
                     pos = end;
                 }
-                self.prefix_cache
-                    .lock()
-                    .expect("prefix_cache mutex poisoned")
-                    .insert(tokens, self.snapshot_state_locked());
+                // Only cache base-model KV — an adapted run's KV must never be reused.
+                if !lora_active {
+                    self.prefix_cache
+                        .lock()
+                        .expect("prefix_cache mutex poisoned")
+                        .insert(tokens, self.snapshot_state_locked());
+                }
                 return logits;
             }
         }
