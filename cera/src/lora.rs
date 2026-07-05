@@ -22,7 +22,7 @@
 //! f32 keeps the correction exact and gives one shared apply path across every
 //! backend with no dtype dispatch.
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "mmap", not(target_arch = "wasm32")))]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -133,18 +133,12 @@ impl LoraTargetWeights {
             "LoRA rank mismatch between A ({rank_a}) and B ({rank_b})"
         );
         ensure!(rank_a > 0 && k > 0 && d > 0, "LoRA dims must be non-zero");
-        ensure!(
-            a.len() == rank_a * k,
-            "LoRA A size {} != rank*k {}",
-            a.len(),
-            rank_a * k
-        );
-        ensure!(
-            b.len() == d * rank_a,
-            "LoRA B size {} != d*rank {}",
-            b.len(),
-            d * rank_a
-        );
+        // checked_mul so absurd dims from a malformed adapter error rather than
+        // wrapping (which could make a wrong size compare equal).
+        let ak = rank_a.checked_mul(k).context("LoRA A dims overflow")?;
+        let dr = d.checked_mul(rank_a).context("LoRA B dims overflow")?;
+        ensure!(a.len() == ak, "LoRA A size {} != rank*k {ak}", a.len());
+        ensure!(b.len() == dr, "LoRA B size {} != d*rank {dr}", b.len());
         Ok(Self {
             a,
             b,
@@ -197,8 +191,9 @@ impl LoraAdapterWeights {
     /// Load a llama.cpp-format GGUF adapter (`convert_lora_to_gguf` output) from
     /// a file. Tensors are named `blk.{N}.{stem}.weight.lora_a` / `.lora_b`;
     /// `alpha` is read from the `adapter.lora.alpha` metadata (falling back to
-    /// `rank`, i.e. `scale = 1`). Native only — WASM uses [`Self::from_gguf_bytes`].
-    #[cfg(not(target_arch = "wasm32"))]
+    /// `rank`, i.e. `scale = 1`). Requires the `mmap` feature (for
+    /// `GgufFile::open`); otherwise use [`Self::from_gguf_bytes`].
+    #[cfg(feature = "mmap")]
     pub fn from_gguf(path: &Path) -> Result<Arc<Self>> {
         let gguf = GgufFile::open(path).with_context(|| format!("open adapter {path:?}"))?;
         Self::from_gguf_file(&gguf)
