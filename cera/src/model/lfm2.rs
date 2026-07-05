@@ -554,6 +554,10 @@ impl Lfm2Model {
         let n_kv_heads = cfg.kv_heads_per_layer[layer];
         let kv_dim = n_kv_heads * head_dim;
 
+        // Cloned once (cheap Arc bump) so the base scratch buffers can stay
+        // mutably borrowed while the adapter (a disjoint field) is read.
+        let lora = state.lora.clone();
+
         // Q, K, V projections using pre-quantized hidden state
         let q = &mut state.scratch.q[..cfg.hidden_size];
         let k = &mut state.scratch.k[..kv_dim];
@@ -589,6 +593,20 @@ impl Lfm2Model {
             self.gemv(refs.attn_q.as_ref().unwrap(), hidden, q);
             self.gemv(refs.attn_k.as_ref().unwrap(), hidden, k);
             self.gemv(refs.attn_v.as_ref().unwrap(), hidden, v);
+        }
+
+        // LoRA on Q/K/V — input is the normed hidden, applied before QK-norm/RoPE.
+        if let Some(lora) = &lora {
+            let tmp = &mut state.scratch.lora_tmp;
+            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnQ) {
+                crate::lora::apply_decode(t, hidden, q, tmp);
+            }
+            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnK) {
+                crate::lora::apply_decode(t, hidden, k, tmp);
+            }
+            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnV) {
+                crate::lora::apply_decode(t, hidden, v, tmp);
+            }
         }
 
         // Per-head QK norm (RMSnorm each head slice with shared weights)
@@ -825,6 +843,17 @@ impl Lfm2Model {
             &state.scratch.attn_out[..cfg.hidden_size],
             out,
         );
+        // LoRA on the output projection (input = the attention output).
+        if let Some(lora) = &lora
+            && let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnOutput)
+        {
+            crate::lora::apply_decode(
+                t,
+                &state.scratch.attn_out[..cfg.hidden_size],
+                out,
+                &mut state.scratch.lora_tmp,
+            );
+        }
     }
     /// Run all layers + output norm on a hidden state vector. Shared by
     /// forward(), forward_embedding(), and forward_hidden_from_embedding().
@@ -1027,11 +1056,8 @@ impl Lfm2Model {
             // Operator: conv or attention — batch projections via GEMM, sequential core
             let is_conv = cfg.block_types[layer] == BlockType::GatedConv;
 
-            // A LoRA active forces the per-token fallback for this block so the
-            // adapter is applied via the decode hooks (batched-GEMM LoRA is a
-            // perf follow-up). `&&` short-circuits the batched work when set.
             #[cfg(any(target_arch = "aarch64", feature = "blas"))]
-            let used_block_gemm = state.lora.is_none() && {
+            let used_block_gemm = {
                 let refs = &self.layer_refs[layer];
                 if is_conv {
                     // --- Conv: batch in_proj + out_proj via GEMM ---
@@ -2208,6 +2234,19 @@ impl Model for Lfm2Model {
             !tokens.is_empty(),
             "forward_prefill requires at least one token"
         );
+
+        // With a LoRA active, run the prompt per-token through `forward`
+        // (→ `run_layers` → the hooked `forward_attn_block`/`forward_ffn_block`)
+        // so the adapter is applied to every token. The batched `forward_prefill_inner`
+        // path doesn't apply LoRA yet (batched-GEMM LoRA is a perf follow-up).
+        // Bypassing the prefix cache here is correct: cached KV is base-model-only.
+        if state.lora.is_some() {
+            let mut logits = Vec::new();
+            for (j, &tok) in tokens.iter().enumerate() {
+                logits = self.forward(&[tok], start_pos + j, state);
+            }
+            return logits;
+        }
 
         // Cache participation gate: only on a fresh prefill
         // (`start_pos == 0`). Continuation prefills (chunked /
