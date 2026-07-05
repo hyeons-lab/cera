@@ -2358,7 +2358,18 @@ impl Model for Lfm2Model {
         // `prefill_layers_and_logits` below would process them base-model-only,
         // leaving image/audio spans un-adapted while text spans get the adapter.
         // Matches the token-path gate in `forward_prefill`.
+        //
+        // `forward_from_embedding` derives its RoPE/KV position from
+        // `state.seq_len` (it ignores the passed `pos`), so frames land at
+        // seq_len, seq_len+1, … — correct exactly when `start_pos == seq_len`,
+        // which the prefill flow guarantees (text prefill advances seq_len to
+        // `start_pos` before an embedding span). Assert it so a future caller
+        // that violates the invariant is caught rather than silently mispositioned.
         if state.lora.is_some() {
+            debug_assert_eq!(
+                start_pos, state.seq_len,
+                "embedding LoRA prefill assumes start_pos == seq_len"
+            );
             let mut logits = Vec::new();
             for j in 0..n {
                 let frame = &embeddings[j * hs..(j + 1) * hs];
