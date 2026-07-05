@@ -4,6 +4,7 @@
 // The full forward pass runs in a single CommandEncoder per token — only the
 // logits vector is read back to CPU.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -14,6 +15,7 @@ use crate::backend::cpu::RopeType;
 use crate::backend::wgpu::{GpuContext, GpuTensor, KvShiftParams, shaders};
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvPrefixCache, LayerSnapshot, StateSnapshot};
+use crate::lora::{LoraAdapterWeights, LoraTarget};
 use crate::model::gpu_weight_source::GpuWeightSource;
 use crate::model::transformer::WeightRef;
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
@@ -30,6 +32,10 @@ const MAX_PREFILL_TOKENS: usize = 512;
 // source of truth here means dispatch geometry can never drift out of
 // sync with the kernel.
 const MUL_MAT_TILE_WG_M: u32 = 8;
+
+/// Rows emitted per workgroup by `gemv_f32` / `gemv_f32_accum` — MUST match the
+/// `NR` constant in `gemv_f32.wgsl`. Used to size the LoRA dispatch grids.
+const GEMV_F32_ROWS_PER_WG: u32 = 8;
 const MUL_MAT_TILE_WG_N: u32 = 32;
 const MUL_MAT_TILE_M: u32 = 4;
 const MUL_MAT_TILE_N: u32 = 1;
@@ -154,6 +160,9 @@ struct GpuLayerWeights {
 #[allow(dead_code)]
 struct GpuPipelines {
     gemv_f32: wgpu::ComputePipeline,
+    /// `y[row] += dot(A[row,:], x)` — the accumulate epilogue for the LoRA
+    /// up-projection (`out += B_scaled·tmp`).
+    gemv_f32_accum: wgpu::ComputePipeline,
     gemv_q4_0: wgpu::ComputePipeline,
     gemv_q4_0_fast: wgpu::ComputePipeline,
     gemv_q6_k: wgpu::ComputePipeline,
@@ -192,6 +201,81 @@ struct GpuPipelines {
     attention_prefill: wgpu::ComputePipeline,
 }
 
+/// One LoRA target's low-rank factors uploaded to GPU. The apply is two GEMV
+/// dispatches: `tmp = A·x` (`gemv_f32`, `m=rank`) then `out += B_scaled·tmp`
+/// (`gemv_f32_accum`, `m=d`). `scale = alpha/rank` is pre-folded into
+/// `b_scaled` at upload, so the runtime path has no separate scale pass.
+struct WgpuLoraTarget {
+    /// Down-projection `A`, `[rank × k]` row-major (f32).
+    a: wgpu::Buffer,
+    /// Up-projection `scale · B`, `[d × rank]` row-major (f32).
+    b_scaled: wgpu::Buffer,
+    /// `[rank, k, 0, 0]` params for the `A·x` GEMV.
+    a_params: wgpu::Buffer,
+    /// `[d, rank, 0, 0]` params for the `B_scaled·tmp` GEMV.
+    b_params: wgpu::Buffer,
+    rank: u32,
+    #[allow(dead_code)]
+    k: u32,
+    d: u32,
+}
+
+/// A LoRA adapter uploaded to GPU: per-layer, per-target (in `LoraTarget::index`
+/// order) low-rank factors. Built from a CPU [`LoraAdapterWeights`] via
+/// [`WgpuLoraAdapter::upload`] and cached on the model (Arc-pointer-keyed LRU).
+struct WgpuLoraAdapter {
+    layers: Vec<[Option<WgpuLoraTarget>; 7]>,
+}
+
+impl WgpuLoraAdapter {
+    /// Upload every `(layer, target)` factor pair to GPU buffers, folding
+    /// `scale` into `B` as it goes. Adapters are tiny (rank ≤ ~64), so the f32
+    /// copy through `upload_f32` is negligible.
+    ///
+    /// `residual_mult` is the model's residual multiplier (`scalars.residual`,
+    /// 1.0 for all archs except Granite). The base attn-output / ffn-down
+    /// projections feed the residual `scaled_add_inplace`, which scales their
+    /// result by `residual_mult` before the residual add — so those two targets'
+    /// LoRA delta must carry the same factor (folded into `B` here). The other
+    /// five targets don't feed the residual add, so they use `scale` alone.
+    fn upload(ctx: &GpuContext, w: &LoraAdapterWeights, residual_mult: f32) -> Self {
+        let mut layers = Vec::with_capacity(w.n_layers());
+        for layer in 0..w.n_layers() {
+            let mut targets: [Option<WgpuLoraTarget>; 7] = Default::default();
+            for target in LoraTarget::ALL {
+                let Some(t) = w.get(layer, target) else {
+                    continue;
+                };
+                let rank = t.rank as u32;
+                let k = t.k as u32;
+                let d = t.d as u32;
+                // Fold scale into B at upload → no runtime scale dispatch. For the
+                // residual-fed targets, also fold `residual_mult` (matches the
+                // base projection's residual `scaled_add_inplace`; no-op unless
+                // Granite).
+                let b_factor = match target {
+                    LoraTarget::AttnOutput | LoraTarget::FfnDown => t.scale * residual_mult,
+                    _ => t.scale,
+                };
+                let b_scaled_data: Vec<f32> = t.b.iter().map(|&x| x * b_factor).collect();
+                targets[target.index()] = Some(WgpuLoraTarget {
+                    a: ctx.upload_f32(&t.a, "lora_a"),
+                    b_scaled: ctx.upload_f32(&b_scaled_data, "lora_b_scaled"),
+                    a_params: ctx
+                        .upload_storage(bytemuck::cast_slice(&[rank, k, 0, 0]), "lora_a_p"),
+                    b_params: ctx
+                        .upload_storage(bytemuck::cast_slice(&[d, rank, 0, 0]), "lora_b_p"),
+                    rank,
+                    k,
+                    d,
+                });
+            }
+            layers.push(targets);
+        }
+        Self { layers }
+    }
+}
+
 /// GPU-resident inference state (KV cache + conv rolling buffers).
 #[allow(dead_code)]
 struct GpuState {
@@ -212,6 +296,17 @@ struct GpuState {
 struct HsScratch {
     kv: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>,
     conv: Vec<Option<wgpu::Buffer>>,
+}
+
+/// Clears `GpuLfm2Model::active_lora` when dropped, so a leaked `Some` can't
+/// send a later base-model forward through the adapter. Mirrors the Metal
+/// `LoraGuard`.
+struct LoraGuard<'a>(&'a Mutex<Option<Arc<WgpuLoraAdapter>>>);
+
+impl Drop for LoraGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().expect("active_lora poisoned") = None;
+    }
 }
 
 /// GPU-accelerated LFM2 model.
@@ -369,6 +464,20 @@ pub struct GpuLfm2Model {
     /// Defaults to `KvCacheConfig::default()` (warm-only) at
     /// construction time so warm hits work without explicit config.
     prefix_cache: Mutex<KvPrefixCache>,
+    /// GPU-uploaded LoRA adapters, keyed by the source CPU adapter's Arc
+    /// identity (via `Arc::ptr_eq`, NOT the raw pointer — a freed adapter's
+    /// address can be reused, so pointer identity alone would ABA-alias). LRU,
+    /// cap 3, so hot-swapping between a few adapters doesn't re-upload every
+    /// forward. Mutated only under `infer_lock`.
+    lora_lru: Mutex<Vec<(Arc<LoraAdapterWeights>, Arc<WgpuLoraAdapter>)>>,
+    /// The adapter to apply for the in-flight forward, staged by `resolve_lora`
+    /// and read by the per-layer encoders. Cleared by the returned `LoraGuard`
+    /// on drop so a leaked `Some` can't send a later base-model forward through
+    /// the adapter.
+    active_lora: Mutex<Option<Arc<WgpuLoraAdapter>>>,
+    /// Rank-width f32 scratch for the LoRA `tmp = A·x` intermediate. Sized to
+    /// `MAX_LORA_RANK` so any accepted adapter fits without reallocation.
+    lora_tmp: wgpu::Buffer,
 }
 
 impl GpuLfm2Model {
@@ -477,6 +586,11 @@ impl GpuLfm2Model {
         // Create pipelines
         let pipelines = GpuPipelines {
             gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32"),
+            gemv_f32_accum: ctx.create_pipeline(
+                shaders::GEMV_F32,
+                "gemv_f32_accum",
+                "gemv_f32_accum",
+            ),
             gemv_q4_0: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0", "gemv_q4_0"),
             gemv_q4_0_fast: ctx.create_pipeline(
                 shaders::GEMV_Q4_0_FAST,
@@ -869,6 +983,10 @@ impl GpuLfm2Model {
             &format!("wgpu:{model_id}"),
         ));
 
+        // LoRA `tmp = A·x` scratch, sized to the max supported rank so any
+        // accepted adapter fits.
+        let lora_tmp = ctx.create_storage_rw((crate::lora::MAX_LORA_RANK * 4) as u64, "lora_tmp");
+
         let mut model = Self {
             ctx,
             config,
@@ -925,9 +1043,157 @@ impl GpuLfm2Model {
             use_hs_scratch: AtomicBool::new(false),
             prefix_cache,
             model_id,
+            lora_lru: Mutex::new(Vec::new()),
+            active_lora: Mutex::new(None),
+            lora_tmp,
         };
         model.cache_bind_groups();
         Ok(model)
+    }
+
+    /// Resolve `state.lora` to a GPU-uploaded adapter and stage it in
+    /// `active_lora` for the encoders to read, returning a guard that clears
+    /// `active_lora` on drop. Uploads are cached in an Arc-pointer-keyed LRU
+    /// (cap 3) so hot-swapping between a few adapters doesn't re-upload every
+    /// forward. Must be called while holding `infer_lock` (it mutates the
+    /// per-model `active_lora`/`lora_lru`).
+    fn resolve_lora(&self, state: &InferenceState) -> LoraGuard<'_> {
+        let resolved = state.lora.as_ref().map(|adapter| {
+            let mut lru = self.lora_lru.lock().expect("lora_lru poisoned");
+            if let Some(pos) = lru.iter().position(|(cpu, _)| Arc::ptr_eq(cpu, adapter)) {
+                // Hit: mark most-recently-used by moving the entry to the end
+                // (the vec is ordered least- → most-recently-used).
+                let (cpu, gpu) = lru.remove(pos);
+                lru.push((cpu, gpu.clone()));
+                gpu
+            } else {
+                // Miss: upload, insert, evict the least-recently-used if over cap.
+                let gpu = Arc::new(WgpuLoraAdapter::upload(
+                    &self.ctx,
+                    adapter,
+                    self.scalars.residual,
+                ));
+                lru.push((adapter.clone(), gpu.clone()));
+                if lru.len() > 3 {
+                    lru.remove(0);
+                }
+                gpu
+            }
+        });
+        *self.active_lora.lock().expect("active_lora poisoned") = resolved;
+        LoraGuard(&self.active_lora)
+    }
+
+    /// Build the two bind groups for one LoRA target's apply:
+    /// `bg_a` = (A, input, lora_tmp, a_params) for `gemv_f32` (`tmp = A·x`), and
+    /// `bg_b` = (B_scaled, lora_tmp, output, b_params) for `gemv_f32_accum`
+    /// (`out += B_scaled·tmp`). Decode-path offsets are 0, so whole-buffer
+    /// bindings suffice (`x[col]`/`y[row]` read/write from the front).
+    fn lora_target_bgs(
+        &self,
+        t: &WgpuLoraTarget,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> (wgpu::BindGroup, wgpu::BindGroup) {
+        // `bg_a` binds to the `gemv_f32` pipeline, `bg_b` to `gemv_f32_accum`.
+        // wgpu treats the two pipelines as exclusive even though their layouts
+        // are structurally identical, so each bind group must be created from
+        // its own pipeline's layout.
+        let layout_a = self.pipelines.gemv_f32.get_bind_group_layout(0);
+        let layout_b = self.pipelines.gemv_f32_accum.get_bind_group_layout(0);
+        let bg_a = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("lora_a"),
+                layout: &layout_a,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: t.a.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: input.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.lora_tmp.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: t.a_params.as_entire_binding(),
+                    },
+                ],
+            });
+        let bg_b = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("lora_b"),
+                layout: &layout_b,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: t.b_scaled.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.lora_tmp.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: t.b_params.as_entire_binding(),
+                    },
+                ],
+            });
+        (bg_a, bg_b)
+    }
+
+    /// Append the `(layer, target)` LoRA delta into an already-open compute pass
+    /// if the active adapter touches it: two dispatches, `tmp = A·x` then
+    /// `out += B_scaled·tmp`. WebGPU serializes storage reads/writes between
+    /// dispatches in the same pass, so the shared `lora_tmp` scratch is safe to
+    /// reuse across back-to-back hooks. The caller must have pre-built the bind
+    /// groups (via `lora_target_bgs`) before opening the pass — bind groups
+    /// borrow `self` immutably, which conflicts with the mutable pass borrow.
+    fn dispatch_lora_into(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        t: &WgpuLoraTarget,
+        bg_a: &wgpu::BindGroup,
+        bg_b: &wgpu::BindGroup,
+    ) {
+        // tmp = A·x — m = rank rows. `gemv_f32`/`gemv_f32_accum` each emit `NR`
+        // rows per workgroup, so the group count is `rows / NR`.
+        let a_groups = t.rank.div_ceil(GEMV_F32_ROWS_PER_WG);
+        self.dispatch_into(
+            pass,
+            &self.pipelines.gemv_f32,
+            bg_a,
+            (a_groups.min(65535), a_groups.div_ceil(65535), 1),
+        );
+        // out += B_scaled·tmp — m = d rows.
+        let b_groups = t.d.div_ceil(GEMV_F32_ROWS_PER_WG);
+        self.dispatch_into(
+            pass,
+            &self.pipelines.gemv_f32_accum,
+            bg_b,
+            (b_groups.min(65535), b_groups.div_ceil(65535), 1),
+        );
+    }
+
+    /// Look up the active adapter's `(layer, target)` factors, if present.
+    fn lora_target(
+        lora: Option<&Arc<WgpuLoraAdapter>>,
+        layer: usize,
+        target: LoraTarget,
+    ) -> Option<&WgpuLoraTarget> {
+        lora?.layers.get(layer)?[target.index()].as_ref()
     }
 
     /// Create a GEMV bind group for a given (weight, input, output) triple.
@@ -1621,6 +1887,14 @@ impl GpuLfm2Model {
             bytemuck::cast_slice(&self.gpu_state.embedding_f32[emb_offset..emb_offset + hs]),
         );
 
+        // Active LoRA adapter (cheap Arc clone; `None` on the base-model path).
+        // Read once so every hook in this forward shares one lock acquisition.
+        let lora = self
+            .active_lora
+            .lock()
+            .expect("active_lora poisoned")
+            .clone();
+
         // 2. Per-layer loop — one encoder per layer (block + FFN merged).
         // Each layer submits independently to maintain CPU-GPU pipeline overlap.
         for i in 0..cfg.n_layers {
@@ -1946,6 +2220,21 @@ impl GpuLfm2Model {
 
                 let max_pairs = std::cmp::max(n_heads, n_kv_heads) * (head_dim / 2);
 
+                // LoRA Q/K/V deltas: `+= scale·B·(A·normed)` on the raw
+                // projections, before QK-norm/RoPE (additive, so it commutes
+                // with the Qwen2 bias-add below). Bind groups are built here
+                // (immutable `self` borrow) so they can be dispatched inside the
+                // `attn_pre` pass, which mutably borrows `enc`.
+                let q_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::AttnQ);
+                let k_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::AttnK);
+                let v_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::AttnV);
+                let q_lora_bgs =
+                    q_lora.map(|t| (t, self.lora_target_bgs(t, &self.normed_buf, &self.q_buf)));
+                let k_lora_bgs =
+                    k_lora.map(|t| (t, self.lora_target_bgs(t, &self.normed_buf, &self.k_buf)));
+                let v_lora_bgs =
+                    v_lora.map(|t| (t, self.lora_target_bgs(t, &self.normed_buf, &self.v_buf)));
+
                 // Copy hidden → normed, then pass 1: norm + QKV + per-head norm + rope.
                 Self::encode_copy(
                     &mut enc,
@@ -1964,6 +2253,16 @@ impl GpuLfm2Model {
                     self.dispatch_gemv_into(&mut pass, q_w, q_bg);
                     self.dispatch_gemv_into(&mut pass, k_w, k_bg);
                     self.dispatch_gemv_into(&mut pass, v_w, v_bg);
+                    // LoRA Q/K/V deltas on the raw projections (before bias/norm/rope).
+                    if let Some((t, (bg_a, bg_b))) = q_lora_bgs.as_ref() {
+                        self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
+                    }
+                    if let Some((t, (bg_a, bg_b))) = k_lora_bgs.as_ref() {
+                        self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
+                    }
+                    if let Some((t, (bg_a, bg_b))) = v_lora_bgs.as_ref() {
+                        self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
+                    }
                     // QKV bias (Qwen2): add right after the projections.
                     if let Some(bg) = qb_bg.as_ref() {
                         self.dispatch_into(
@@ -2089,6 +2388,17 @@ impl GpuLfm2Model {
                             },
                         ],
                     });
+                // LoRA attn-output delta: input is the attention output (o_proj
+                // input), added into the post-residual hidden state. The
+                // `residual_mult` fold at upload matches the base o_proj's
+                // `scaled_add_inplace` scaling.
+                let o_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::AttnOutput);
+                let o_lora_bgs = o_lora.map(|t| {
+                    (
+                        t,
+                        self.lora_target_bgs(t, &self.attn_out_buf, &self.hidden_buf),
+                    )
+                });
                 {
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("attn_post"),
@@ -2101,6 +2411,9 @@ impl GpuLfm2Model {
                         &add_bg,
                         (hs32.div_ceil(256), 1, 1),
                     );
+                    if let Some((t, (bg_a, bg_b))) = o_lora_bgs.as_ref() {
+                        self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
+                    }
                 }
             }
 
@@ -2208,6 +2521,29 @@ impl GpuLfm2Model {
                     ],
                 });
 
+            // LoRA gate/up deltas on the raw projections (before silu_mul), and
+            // the ffn-down delta into the post-residual hidden state (input is
+            // the silu_mul result in `gate_buf`). All three run for conv layers
+            // too — only the FFN is shared by both block types. `residual_mult`
+            // is folded into ffn-down's B at upload.
+            let gate_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::FfnGate);
+            let up_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::FfnUp);
+            let down_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::FfnDown);
+            let gate_lora_bgs = gate_lora.map(|t| {
+                (
+                    t,
+                    self.lora_target_bgs(t, &self.ffn_input_buf, &self.gate_buf),
+                )
+            });
+            let up_lora_bgs = up_lora.map(|t| {
+                (
+                    t,
+                    self.lora_target_bgs(t, &self.ffn_input_buf, &self.up_buf),
+                )
+            });
+            let down_lora_bgs =
+                down_lora.map(|t| (t, self.lora_target_bgs(t, &self.gate_buf, &self.hidden_buf)));
+
             {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("ffn"),
@@ -2218,6 +2554,13 @@ impl GpuLfm2Model {
                 // gate + up GEMVs
                 self.dispatch_gemv_into(&mut pass, &lw.ffn_gate, gate_bg);
                 self.dispatch_gemv_into(&mut pass, &lw.ffn_up, up_bg);
+                // LoRA gate/up deltas on the raw projections, before silu_mul.
+                if let Some((t, (bg_a, bg_b))) = gate_lora_bgs.as_ref() {
+                    self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
+                }
+                if let Some((t, (bg_a, bg_b))) = up_lora_bgs.as_ref() {
+                    self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
+                }
                 // silu_mul
                 self.dispatch_into(
                     &mut pass,
@@ -2234,6 +2577,10 @@ impl GpuLfm2Model {
                     &add_bg,
                     (hs32.div_ceil(256), 1, 1),
                 );
+                // LoRA ffn-down delta into the post-residual hidden state.
+                if let Some((t, (bg_a, bg_b))) = down_lora_bgs.as_ref() {
+                    self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
+                }
             }
             self.ctx.queue.submit(Some(enc.finish()));
         }
@@ -2342,6 +2689,7 @@ impl GpuLfm2Model {
     /// drift (mirrors `forward_prefill`).
     pub fn forward_prefill_step(&self, token: u32, pos: usize, state: &mut InferenceState) {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _lora_guard = self.resolve_lora(state);
         self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
         self.forward_inner_compute(&[token], pos, state);
     }
@@ -2366,6 +2714,7 @@ impl GpuLfm2Model {
     ) -> Result<u32> {
         let pending = {
             let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+            let _lora_guard = self.resolve_lora(state);
             // Keep the KV-write slot in lockstep with the RoPE position.
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
             self.forward_inner_compute(&[token], pos, state);
@@ -3619,16 +3968,20 @@ impl Model for GpuLfm2Model {
     /// drives `seq_len` from 0, so it's a fresh-context extraction on scratch KV
     /// that never touches the generation caches — the GPU analog of the CPU
     /// path's separate scratch state. Reads back the in-place post-`output_norm`
-    /// `hidden_buf`; the logits it also computes are ignored. `_state` is unused
-    /// (wgpu keeps KV on the model). A drop-guard restores the generation
-    /// `seq_len` and clears the flag on any exit, including a mid-run panic.
+    /// `hidden_buf`; the logits it also computes are ignored. `state` is read
+    /// only to stage the active LoRA adapter (wgpu keeps KV on the model, not in
+    /// `state`). A drop-guard restores the generation `seq_len` and clears the
+    /// flag on any exit, including a mid-run panic.
     ///
     /// Like [`Self::forward`], this is the **synchronous** native path: it blocks
     /// on `download_f32` per token. The browser/WASM GPU path is the async
     /// `WebGpuSession`, which never routes through this method — so the blocking
     /// readback here is a native-only concern, identical to `forward`.
-    fn hidden_states(&self, tokens: &[u32], _state: &mut InferenceState) -> Vec<f32> {
+    fn hidden_states(&self, tokens: &[u32], state: &mut InferenceState) -> Vec<f32> {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        // Stage the caller's adapter for the per-token layer encoders; the guard
+        // clears it on the way out.
+        let _lora_guard = self.resolve_lora(state);
         assert!(
             !tokens.is_empty(),
             "hidden_states requires at least one token"
@@ -3693,11 +4046,15 @@ impl Model for GpuLfm2Model {
 
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        // Stage the caller's adapter for the per-layer encoders; the guard
+        // clears it on the way out.
+        let _lora_guard = self.resolve_lora(state);
         self.forward_inner(tokens, pos, state)
     }
 
     fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _lora_guard = self.resolve_lora(state);
         self.forward_greedy_inner(tokens, pos, state)
     }
 
@@ -3713,14 +4070,22 @@ impl Model for GpuLfm2Model {
         state: &mut InferenceState,
     ) -> Vec<f32> {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        // Stage the caller's adapter for the per-token layer encoders (the
+        // sequential fallback loop below runs them; the batched path does not,
+        // so it's disabled while an adapter is active). The guard clears
+        // `active_lora` on the way out.
+        let _lora_guard = self.resolve_lora(state);
+        let lora_active = state.lora.is_some();
         // Reset internal seq_len so repeated generate() calls (bench) work.
         self.gpu_state.seq_len.store(start_pos, Ordering::Relaxed);
 
-        // Cache lookup: only on a fresh prefill (`start_pos == 0`).
-        // Continuation prefills (chunked / mid-sequence) carry KV from
-        // the prior chunk; restoring would clobber it. Same gate Metal
-        // and CPU use.
-        if start_pos == 0 {
+        // Cache lookup: only on a fresh prefill (`start_pos == 0`), and never
+        // with a LoRA active — cached KV is base-model-only, so restoring it and
+        // adapting only the tail would corrupt the result (and inserting
+        // adapter-modified KV would poison the cache for later base runs). With
+        // an adapter, fall straight through to the per-token loop, which fires
+        // the hooks on every token.
+        if start_pos == 0 && !lora_active {
             let hit = self
                 .prefix_cache
                 .lock()
@@ -3845,7 +4210,9 @@ impl Model for GpuLfm2Model {
                 }
             }
         }
-        if start_pos == 0 {
+        // Skip the cache insert with a LoRA active: the snapshot's KV reflects
+        // the adapter, not the base model, and would poison later base runs.
+        if start_pos == 0 && !lora_active {
             self.prefix_cache
                 .lock()
                 .expect("prefix_cache mutex poisoned")

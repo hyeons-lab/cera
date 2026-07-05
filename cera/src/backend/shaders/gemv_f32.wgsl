@@ -69,3 +69,57 @@ fn gemv_f32(
         }
     }
 }
+
+// F32 GEMV with accumulate: y[row] += dot(A[row, :], x). Same bindings, layout,
+// and dispatch as `gemv_f32`; used for the LoRA up-projection epilogue
+// (out += B_scaled · tmp), where `scale` is pre-folded into the uploaded B so
+// no separate scale pass is needed.
+@compute @workgroup_size(32, 1, 1)
+fn gemv_f32_accum(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let m = params.x;
+    let k = params.y;
+    let row_base = params.z;
+    let tid = lid.x;
+    let r0 = get_wid(wid) * NR;
+
+    var sums: array<f32, 8>;
+    for (var r = 0u; r < NR; r += 1u) {
+        sums[r] = 0.0;
+    }
+
+    var col = tid;
+    while col < k {
+        let xv = x[col];
+        for (var r = 0u; r < NR; r += 1u) {
+            if r0 + r < m {
+                sums[r] += a[(r0 + r) * k + col] * xv;
+            }
+        }
+        col += 32u;
+    }
+
+    for (var r = 0u; r < NR; r += 1u) {
+        partials[r * WG_SIZE + tid] = sums[r];
+    }
+    workgroupBarrier();
+    for (var stride = WG_SIZE / 2u; stride > 0u; stride = stride / 2u) {
+        if tid < stride {
+            for (var r = 0u; r < NR; r += 1u) {
+                let idx = r * WG_SIZE + tid;
+                partials[idx] += partials[idx + stride];
+            }
+        }
+        workgroupBarrier();
+    }
+
+    if tid == 0u {
+        for (var r = 0u; r < NR; r += 1u) {
+            if r0 + r < m {
+                y[row_base + r0 + r] += partials[r * WG_SIZE];
+            }
+        }
+    }
+}
