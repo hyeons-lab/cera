@@ -5,7 +5,8 @@
 // logits vector is read back to CPU.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::Result;
 
@@ -204,6 +205,15 @@ struct GpuState {
     embedding_f32: Vec<f32>,
 }
 
+/// Scratch KV/conv caches for [`GpuLfm2Model::hidden_states`], mirroring the
+/// generation caches' shapes. Allocated **lazily** on first `hidden_states` call
+/// (via `OnceLock`) so a generation-only load never pays the extra VRAM.
+/// Selected over the generation caches by `use_hs_scratch`.
+struct HsScratch {
+    kv: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>,
+    conv: Vec<Option<wgpu::Buffer>>,
+}
+
 /// GPU-accelerated LFM2 model.
 ///
 /// NOTE: This model is stateful — KV caches and conv rolling buffers live on
@@ -337,6 +347,13 @@ pub struct GpuLfm2Model {
     /// just synchronizes the CPU-side bookkeeping that stages each
     /// command encoder and reads back logits.
     infer_lock: Mutex<()>,
+    /// Lazily-allocated scratch KV/conv for [`Self::hidden_states`] (see
+    /// [`HsScratch`]). Built on first use via [`Self::hs_scratch`] so a
+    /// generation-only load pays no extra KV VRAM. Selected over the generation
+    /// caches by `use_hs_scratch`, which is only toggled while holding
+    /// `infer_lock`, so `Relaxed` ordering suffices.
+    hs_scratch: OnceLock<HsScratch>,
+    use_hs_scratch: AtomicBool,
     /// Caller-supplied identifier (typically the GGUF file path) used to
     /// namespace prefix-cache disk files. Prefixed with `"wgpu:"` before
     /// being fed to `model_fingerprint` so wgpu's f32 disk-cache files
@@ -904,6 +921,8 @@ impl GpuLfm2Model {
             prefill_scores_buf,
             gpu_state,
             infer_lock: Mutex::new(()),
+            hs_scratch: OnceLock::new(),
+            use_hs_scratch: AtomicBool::new(false),
             prefix_cache,
             model_id,
         };
@@ -1510,6 +1529,67 @@ impl GpuLfm2Model {
             .download_f32(&self.logits_buf, self.config.vocab_size)
     }
 
+    /// Lazily build (once) the hidden-states scratch caches — same shapes as the
+    /// generation caches. Called under `infer_lock` from `hidden_states` before
+    /// `use_hs_scratch` is set, so `active_kv`/`active_conv` always find it built.
+    fn hs_scratch(&self) -> &HsScratch {
+        self.hs_scratch.get_or_init(|| {
+            let cfg = &self.config;
+            let head_dim = cfg.head_dim;
+            let hs = cfg.hidden_size;
+            let d_conv = cfg.conv_kernel_size.unwrap_or(3) - 1;
+            let max_seq_len = self.gpu_state.max_seq_len;
+            let f = |size: usize, name: &str| self.ctx.create_storage_rw((size * 4) as u64, name);
+            let mut kv = Vec::with_capacity(cfg.n_layers);
+            let mut conv = Vec::with_capacity(cfg.n_layers);
+            for i in 0..cfg.n_layers {
+                if cfg.block_types[i] == BlockType::Attention {
+                    let kv_dim = cfg.kv_heads_per_layer[i] * head_dim;
+                    let k = f(max_seq_len * kv_dim, &format!("hs.l{i}.k"));
+                    let v = f(max_seq_len * kv_dim, &format!("hs.l{i}.v"));
+                    kv.push(Some((k, v)));
+                    conv.push(None);
+                } else {
+                    kv.push(None);
+                    conv.push(Some(f(d_conv * hs, &format!("hs.l{i}.conv"))));
+                }
+            }
+            HsScratch { kv, conv }
+        })
+    }
+
+    /// The attention KV cache for layer `i` — the hidden-states scratch cache
+    /// when [`Self::hidden_states`] is running (`use_hs_scratch`), else the
+    /// generation cache. Panics on a conv layer (no KV).
+    #[inline]
+    fn active_kv(&self, i: usize) -> &(wgpu::Buffer, wgpu::Buffer) {
+        let caches = if self.use_hs_scratch.load(Ordering::Relaxed) {
+            &self
+                .hs_scratch
+                .get()
+                .expect("hs_scratch built before use_hs_scratch is set")
+                .kv
+        } else {
+            &self.gpu_state.kv_caches
+        };
+        caches[i].as_ref().unwrap()
+    }
+
+    /// The conv rolling buffer for layer `i` — scratch vs generation.
+    #[inline]
+    fn active_conv(&self, i: usize) -> &wgpu::Buffer {
+        let bufs = if self.use_hs_scratch.load(Ordering::Relaxed) {
+            &self
+                .hs_scratch
+                .get()
+                .expect("hs_scratch built before use_hs_scratch is set")
+                .conv
+        } else {
+            &self.gpu_state.conv_buffers
+        };
+        bufs[i].as_ref().unwrap()
+    }
+
     /// Computes one forward pass and leaves the resulting logits in
     /// `self.logits_buf` on the GPU **without** reading them back. Caller
     /// chooses how to consume the logits — full readback for sampling
@@ -1550,7 +1630,7 @@ impl GpuLfm2Model {
             if cfg.block_types[i] == BlockType::GatedConv {
                 let kernel_size = cfg.conv_kernel_size.unwrap_or(3) as u32;
                 let _d_conv = kernel_size - 1;
-                let conv_buf = self.gpu_state.conv_buffers[i].as_ref().unwrap();
+                let conv_buf = self.active_conv(i);
 
                 // Pre-create BGs for conv block (using pre-allocated params).
                 let norm_bg = self
@@ -1935,7 +2015,7 @@ impl GpuLfm2Model {
                 }
 
                 // KV cache copies (encoder-level), then pass 2: attention + out_proj + add.
-                let (k_cache, v_cache) = self.gpu_state.kv_caches[i].as_ref().unwrap();
+                let (k_cache, v_cache) = self.active_kv(i);
                 let seq_len = self.gpu_state.seq_len.load(Ordering::Relaxed);
                 let kv_offset_floats = (seq_len * kv_dim as usize) as u64;
                 Self::encode_copy(
@@ -3528,6 +3608,84 @@ impl GpuLfm2Model {
 }
 
 impl Model for GpuLfm2Model {
+    fn supports_hidden_states(&self) -> bool {
+        true
+    }
+
+    /// Per-token post-final-norm hidden states, row-major `[n * hidden_size]`
+    /// (llama.cpp `--pooling none`). Reuses `forward_inner_compute` per token
+    /// (which drives the KV offset + attention window from `gpu_state.seq_len`):
+    /// routes KV to the dedicated [`HsScratch`] caches via `use_hs_scratch` and
+    /// drives `seq_len` from 0, so it's a fresh-context extraction on scratch KV
+    /// that never touches the generation caches — the GPU analog of the CPU
+    /// path's separate scratch state. Reads back the in-place post-`output_norm`
+    /// `hidden_buf`; the logits it also computes are ignored. `_state` is unused
+    /// (wgpu keeps KV on the model). A drop-guard restores the generation
+    /// `seq_len` and clears the flag on any exit, including a mid-run panic.
+    fn hidden_states(&self, tokens: &[u32], _state: &mut InferenceState) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        assert!(
+            !tokens.is_empty(),
+            "hidden_states requires at least one token"
+        );
+        let hs = self.config.hidden_size;
+        let vocab = self.config.vocab_size;
+        assert!(
+            tokens.len() <= self.gpu_state.max_seq_len,
+            "hidden_states chunk ({}) exceeds max_seq_len ({})",
+            tokens.len(),
+            self.gpu_state.max_seq_len
+        );
+
+        // Build scratch (once) and zero its conv rolling buffers so each
+        // extraction starts from a clean convolution state.
+        let scratch = self.hs_scratch();
+        let mut enc = self.new_encoder();
+        for buf in scratch.conv.iter().flatten() {
+            enc.clear_buffer(buf, 0, None);
+        }
+        self.submit_and_wait(enc);
+
+        // Route KV to the scratch caches and drive `gpu_state.seq_len` from 0 so
+        // the fresh-context prefill walks positions 0..n on the scratch KV. The
+        // drop-guard restores the generation `seq_len` and clears the flag on ANY
+        // exit (incl. a mid-run panic), so generation is never corrupted.
+        let saved_seq = self.gpu_state.seq_len.load(Ordering::Relaxed);
+        struct HsGuard<'a> {
+            flag: &'a AtomicBool,
+            seq: &'a AtomicUsize,
+            saved: usize,
+        }
+        impl Drop for HsGuard<'_> {
+            fn drop(&mut self) {
+                self.seq.store(self.saved, Ordering::Relaxed);
+                self.flag.store(false, Ordering::Relaxed);
+            }
+        }
+        self.gpu_state.seq_len.store(0, Ordering::Relaxed);
+        self.use_hs_scratch.store(true, Ordering::Relaxed);
+        let _hs_guard = HsGuard {
+            flag: &self.use_hs_scratch,
+            seq: &self.gpu_state.seq_len,
+            saved: saved_seq,
+        };
+
+        // `forward_inner_compute` needs a `&mut InferenceState` for its `seq_len`
+        // bookkeeping only (wgpu KV lives on the model), so a throwaway suffices.
+        let mut dummy = InferenceState::for_prefill(&self.config, 1);
+        let mut out = Vec::with_capacity(tokens.len() * hs);
+        for (pos, &token) in tokens.iter().enumerate() {
+            let token_id = token as usize;
+            assert!(
+                token_id < vocab,
+                "token_id {token_id} out of range (vocab_size={vocab})"
+            );
+            self.forward_inner_compute(&[token], pos, &mut dummy);
+            out.extend_from_slice(&self.ctx.download_f32(&self.hidden_buf, hs));
+        }
+        out
+    }
+
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         self.forward_inner(tokens, pos, state)
