@@ -2246,6 +2246,49 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func generateStreamingAsync(opts: GenerateOpts, sink: ModalitySink) async throws  -> GenerateSummary
     
     /**
+     * Model hidden dimension `D`. Reshape a raw `[T*D]` byte buffer from
+     * [`Self::hidden_states_for_tokens`] into `[T][D]` with this. Lock-free
+     * (cached at construction), so — like `position()` — it's safe to call from
+     * a `generate_streaming` sink callback.
+     */
+    func hiddenSize()  -> UInt32
+    
+    /**
+     * Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
+     * (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+     */
+    func hiddenStatesForText(text: String) throws  -> Data
+    
+    /**
+     * Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
+     * `--pooling none` / `llama_get_embeddings_ith` vector) for `tokens`,
+     * returned as **little-endian f32 bytes**: `n_tokens * hidden_size * 4`
+     * bytes, row-major, token `t` channel `c` at `(t*D + c) * 4`.
+     *
+     * Bytes (UniFFI `Data` in Swift, `ByteArray` in Kotlin) rather than
+     * `List<Float>` to avoid Kotlin's per-element boxing on the potentially
+     * large `[T*D]` payload. Swift decodes via `Data.withUnsafeBytes`; reflects
+     * the active LoRA once that lands. Side-effect-free: does not disturb the
+     * session's generation KV.
+     *
+     * Like `append_*` / `generate`, this holds the session mutex for the
+     * duration of the compute, so it must NOT be called re-entrantly from
+     * within a `generate_streaming` sink callback (would self-deadlock).
+     *
+     * Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
+     * doesn't implement hidden-state extraction; `InvalidToken` if any id is
+     * `>= vocab_size`.
+     */
+    func hiddenStatesForTokens(tokens: [UInt32]) throws  -> Data
+    
+    /**
+     * Mean-pooled hidden state — a single `[hidden_size]` vector (the common
+     * classifier path: pool in Rust, ship `D` floats not `T*D`). Returned as
+     * `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
+     */
+    func hiddenStatesMeanPooled(tokens: [UInt32]) throws  -> [Float]
+    
+    /**
      * Current KV position — how many tokens live in the cache.
      * Atomic-backed; safe to call from a different thread while
      * `generate()` is in flight.
@@ -2669,6 +2712,76 @@ open func generateStreamingAsync(opts: GenerateOpts, sink: ModalitySink)async th
             liftFunc: FfiConverterTypeGenerateSummary_lift,
             errorHandler: FfiConverterTypeFfiError_lift
         )
+}
+    
+    /**
+     * Model hidden dimension `D`. Reshape a raw `[T*D]` byte buffer from
+     * [`Self::hidden_states_for_tokens`] into `[T][D]` with this. Lock-free
+     * (cached at construction), so — like `position()` — it's safe to call from
+     * a `generate_streaming` sink callback.
+     */
+open func hiddenSize() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_session_hidden_size(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
+     * (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+     */
+open func hiddenStatesForText(text: String)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_hidden_states_for_text(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(text),$0
+    )
+})
+}
+    
+    /**
+     * Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
+     * `--pooling none` / `llama_get_embeddings_ith` vector) for `tokens`,
+     * returned as **little-endian f32 bytes**: `n_tokens * hidden_size * 4`
+     * bytes, row-major, token `t` channel `c` at `(t*D + c) * 4`.
+     *
+     * Bytes (UniFFI `Data` in Swift, `ByteArray` in Kotlin) rather than
+     * `List<Float>` to avoid Kotlin's per-element boxing on the potentially
+     * large `[T*D]` payload. Swift decodes via `Data.withUnsafeBytes`; reflects
+     * the active LoRA once that lands. Side-effect-free: does not disturb the
+     * session's generation KV.
+     *
+     * Like `append_*` / `generate`, this holds the session mutex for the
+     * duration of the compute, so it must NOT be called re-entrantly from
+     * within a `generate_streaming` sink callback (would self-deadlock).
+     *
+     * Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
+     * doesn't implement hidden-state extraction; `InvalidToken` if any id is
+     * `>= vocab_size`.
+     */
+open func hiddenStatesForTokens(tokens: [UInt32])throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceUInt32.lower(tokens),$0
+    )
+})
+}
+    
+    /**
+     * Mean-pooled hidden state — a single `[hidden_size]` vector (the common
+     * classifier path: pool in Rust, ship `D` floats not `T*D`). Returned as
+     * `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
+     */
+open func hiddenStatesMeanPooled(tokens: [UInt32])throws  -> [Float]  {
+    return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceUInt32.lower(tokens),$0
+    )
+})
 }
     
     /**
@@ -3694,6 +3807,15 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
      */
     case GrammarParse(detail: String
     )
+    /**
+     * A token id passed to `hidden_states_for_tokens` (or another
+     * token-taking method) was `>= vocab_size`. Returned as a typed error
+     * rather than tripping the model-layer `assert!` (whose panic would
+     * unwind through the held session lock and poison it). Mirrors
+     * `cera::CeraError::InvalidToken`.
+     */
+    case InvalidToken(id: UInt32, vocabSize: UInt32
+    )
 
     
 
@@ -3742,6 +3864,10 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             )
         case 9: return .GrammarParse(
             detail: try FfiConverterString.read(from: &buf)
+            )
+        case 10: return .InvalidToken(
+            id: try FfiConverterUInt32.read(from: &buf), 
+            vocabSize: try FfiConverterUInt32.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -3795,6 +3921,12 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
         case let .GrammarParse(detail):
             writeInt(&buf, Int32(9))
             FfiConverterString.write(detail, into: &buf)
+            
+        
+        case let .InvalidToken(id,vocabSize):
+            writeInt(&buf, Int32(10))
+            FfiConverterUInt32.write(id, into: &buf)
+            FfiConverterUInt32.write(vocabSize, into: &buf)
             
         }
     }
@@ -4364,6 +4496,18 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 57581) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_hidden_size() != 46607) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 54184) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_position() != 13264) {

@@ -902,6 +902,14 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_generate_streaming_async(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_session_hidden_size(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_hidden_states_for_text(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled(): Int
+
     external fun uniffi_cera_ffi_checksum_method_session_position(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_reset(): Int
@@ -1204,6 +1212,29 @@ internal object UniffiLib {
         `opts`: RustBuffer.ByValue,
         `sink`: Long,
     ): Long
+
+    external fun uniffi_cera_ffi_fn_method_session_hidden_size(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Int
+
+    external fun uniffi_cera_ffi_fn_method_session_hidden_states_for_text(
+        `ptr`: Long,
+        `text`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens(
+        `ptr`: Long,
+        `tokens`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled(
+        `ptr`: Long,
+        `tokens`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_method_session_position(
         `ptr`: Long,
@@ -1539,6 +1570,18 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 57581) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_size() != 46607) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 54184) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_position() != 13264) {
@@ -4312,6 +4355,49 @@ public interface SessionInterface {
     ): GenerateSummary
 
     /**
+     * Model hidden dimension `D`. Reshape a raw `[T*D]` byte buffer from
+     * [`Self::hidden_states_for_tokens`] into `[T][D]` with this. Lock-free
+     * (cached at construction), so — like `position()` — it's safe to call from
+     * a `generate_streaming` sink callback.
+     */
+    fun `hiddenSize`(): kotlin.UInt
+
+    /**
+     * Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
+     * (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+     */
+    fun `hiddenStatesForText`(`text`: kotlin.String): kotlin.ByteArray
+
+    /**
+     * Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
+     * `--pooling none` / `llama_get_embeddings_ith` vector) for `tokens`,
+     * returned as **little-endian f32 bytes**: `n_tokens * hidden_size * 4`
+     * bytes, row-major, token `t` channel `c` at `(t*D + c) * 4`.
+     *
+     * Bytes (UniFFI `Data` in Swift, `ByteArray` in Kotlin) rather than
+     * `List<Float>` to avoid Kotlin's per-element boxing on the potentially
+     * large `[T*D]` payload. Swift decodes via `Data.withUnsafeBytes`; reflects
+     * the active LoRA once that lands. Side-effect-free: does not disturb the
+     * session's generation KV.
+     *
+     * Like `append_*` / `generate`, this holds the session mutex for the
+     * duration of the compute, so it must NOT be called re-entrantly from
+     * within a `generate_streaming` sink callback (would self-deadlock).
+     *
+     * Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
+     * doesn't implement hidden-state extraction; `InvalidToken` if any id is
+     * `>= vocab_size`.
+     */
+    fun `hiddenStatesForTokens`(`tokens`: List<kotlin.UInt>): kotlin.ByteArray
+
+    /**
+     * Mean-pooled hidden state — a single `[hidden_size]` vector (the common
+     * classifier path: pool in Rust, ship `D` floats not `T*D`). Returned as
+     * `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
+     */
+    fun `hiddenStatesMeanPooled`(`tokens`: List<kotlin.UInt>): List<kotlin.Float>
+
+    /**
      * Current KV position — how many tokens live in the cache.
      * Atomic-backed; safe to call from a different thread while
      * `generate()` is in flight.
@@ -4834,6 +4920,95 @@ open class Session :
             { FfiConverterTypeGenerateSummary.lift(it) },
             // Error FFI converter
             FfiException.ErrorHandler,
+        )
+
+    /**
+     * Model hidden dimension `D`. Reshape a raw `[T*D]` byte buffer from
+     * [`Self::hidden_states_for_tokens`] into `[T][D]` with this. Lock-free
+     * (cached at construction), so — like `position()` — it's safe to call from
+     * a `generate_streaming` sink callback.
+     */
+    override fun `hiddenSize`(): kotlin.UInt =
+        FfiConverterUInt.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_size(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
+     * (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+     */
+    @Throws(FfiException::class)
+    override fun `hiddenStatesForText`(`text`: kotlin.String): kotlin.ByteArray =
+        FfiConverterByteArray.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_for_text(
+                        it,
+                        FfiConverterString.lower(`text`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
+     * `--pooling none` / `llama_get_embeddings_ith` vector) for `tokens`,
+     * returned as **little-endian f32 bytes**: `n_tokens * hidden_size * 4`
+     * bytes, row-major, token `t` channel `c` at `(t*D + c) * 4`.
+     *
+     * Bytes (UniFFI `Data` in Swift, `ByteArray` in Kotlin) rather than
+     * `List<Float>` to avoid Kotlin's per-element boxing on the potentially
+     * large `[T*D]` payload. Swift decodes via `Data.withUnsafeBytes`; reflects
+     * the active LoRA once that lands. Side-effect-free: does not disturb the
+     * session's generation KV.
+     *
+     * Like `append_*` / `generate`, this holds the session mutex for the
+     * duration of the compute, so it must NOT be called re-entrantly from
+     * within a `generate_streaming` sink callback (would self-deadlock).
+     *
+     * Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
+     * doesn't implement hidden-state extraction; `InvalidToken` if any id is
+     * `>= vocab_size`.
+     */
+    @Throws(FfiException::class)
+    override fun `hiddenStatesForTokens`(`tokens`: List<kotlin.UInt>): kotlin.ByteArray =
+        FfiConverterByteArray.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens(
+                        it,
+                        FfiConverterSequenceUInt.lower(`tokens`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Mean-pooled hidden state — a single `[hidden_size]` vector (the common
+     * classifier path: pool in Rust, ship `D` floats not `T*D`). Returned as
+     * `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
+     */
+    @Throws(FfiException::class)
+    override fun `hiddenStatesMeanPooled`(`tokens`: List<kotlin.UInt>): List<kotlin.Float> =
+        FfiConverterSequenceFloat.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled(
+                        it,
+                        FfiConverterSequenceUInt.lower(`tokens`),
+                        _status,
+                    )
+                }
+            },
         )
 
     /**
@@ -5604,6 +5779,21 @@ sealed class FfiException : kotlin.Exception() {
             get() = "detail=${ `detail` }"
     }
 
+    /**
+     * A token id passed to `hidden_states_for_tokens` (or another
+     * token-taking method) was `>= vocab_size`. Returned as a typed error
+     * rather than tripping the model-layer `assert!` (whose panic would
+     * unwind through the held session lock and poison it). Mirrors
+     * `cera::CeraError::InvalidToken`.
+     */
+    class InvalidToken(
+        val `id`: kotlin.UInt,
+        val `vocabSize`: kotlin.UInt,
+    ) : FfiException() {
+        override val message
+            get() = "id=${ `id` }, vocabSize=${ `vocabSize` }"
+    }
+
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<FfiException> {
         override fun lift(error_buf: RustBuffer.ByValue): FfiException = FfiConverterTypeFfiError.lift(error_buf)
     }
@@ -5659,6 +5849,13 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
             9 -> {
                 FfiException.GrammarParse(
                     FfiConverterString.read(buf),
+                )
+            }
+
+            10 -> {
+                FfiException.InvalidToken(
+                    FfiConverterUInt.read(buf),
+                    FfiConverterUInt.read(buf),
                 )
             }
 
@@ -5719,6 +5916,13 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
                 4UL +
                     FfiConverterString.allocationSize(value.`detail`)
             )
+
+            is FfiException.InvalidToken -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterUInt.allocationSize(value.`id`) +
+                    FfiConverterUInt.allocationSize(value.`vocabSize`)
+            )
         }
 
     override fun write(
@@ -5774,6 +5978,13 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
             is FfiException.GrammarParse -> {
                 buf.putInt(9)
                 FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is FfiException.InvalidToken -> {
+                buf.putInt(10)
+                FfiConverterUInt.write(value.`id`, buf)
+                FfiConverterUInt.write(value.`vocabSize`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

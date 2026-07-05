@@ -393,9 +393,9 @@ impl CeraEngine {
     /// invalidate any in-flight sessions.
     #[wasm_bindgen(js_name = newSession)]
     pub fn new_session(&self, config: &SessionConfig) -> Session {
-        Session {
-            inner: self.inner.new_session(config.inner.clone()),
-        }
+        let inner = self.inner.new_session(config.inner.clone());
+        let hidden_size = inner.hidden_size() as u32;
+        Session { inner, hidden_size }
     }
 }
 
@@ -1016,6 +1016,12 @@ impl GenerateSummary {
 #[wasm_bindgen]
 pub struct Session {
     inner: cera::Session,
+    /// Model hidden dimension, cached at construction so `hiddenSize()` is a
+    /// plain field read. wasm-bindgen guards each exported method with an
+    /// internal `RefCell` borrow, so an uncached getter called from inside a
+    /// `generate` callback (which holds the `&mut self` borrow) would panic with
+    /// a borrow error; the cached read avoids re-borrowing `self.inner`.
+    hidden_size: u32,
 }
 
 #[wasm_bindgen]
@@ -1038,10 +1044,12 @@ impl Session {
     }
 
     /// Model hidden dimension `D` — reshape a `[T*D]` hidden-states buffer into
-    /// `[T][D]` with this.
+    /// `[T][D]` with this. Reads a cached field (set at construction), so — unlike
+    /// the `&mut self` compute methods — it's safe to call from inside a `generate`
+    /// callback without a wasm-bindgen borrow panic.
     #[wasm_bindgen(js_name = hiddenSize)]
     pub fn hidden_size(&self) -> u32 {
-        self.inner.hidden_size() as u32
+        self.hidden_size
     }
 
     /// Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
