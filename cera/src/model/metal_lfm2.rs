@@ -3,8 +3,8 @@
 // Mirrors GpuLfm2Model (wgpu) but dispatches directly through the metal crate.
 // All GPU work per token is encoded into ONE command buffer and committed once.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use metal::{Buffer, ComputePipelineState, MTLResourceOptions, MTLSize, NSUInteger};
@@ -12,6 +12,7 @@ use metal::{Buffer, ComputePipelineState, MTLResourceOptions, MTLSize, NSUIntege
 use crate::backend::metal::{MetalContext, shaders};
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
+use crate::lora::{LoraAdapterWeights, LoraTarget};
 use crate::model::gpu_weight_source::GpuWeightSource;
 use crate::model::transformer::WeightRef;
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
@@ -60,8 +61,71 @@ struct MetalLayerWeights {
     attn_v_bias: Option<Buffer>,
 }
 
+/// One LoRA target's low-rank factors uploaded to GPU. The apply is two GEMV
+/// dispatches: `tmp = A·x` (`gemv_f32`, `m=rank`) then `out += B_scaled·tmp`
+/// (`gemv_f32_accum`, `m=d`). `scale = alpha/rank` is pre-folded into
+/// `b_scaled` at upload, so the runtime path has no separate scale pass.
+struct MetalLoraTarget {
+    /// Down-projection `A`, `[rank × k]` row-major (f32).
+    a: Buffer,
+    /// Up-projection `scale · B`, `[d × rank]` row-major (f32).
+    b_scaled: Buffer,
+    /// `Params { m: rank, k }` for the `A·x` GEMV.
+    a_params: Buffer,
+    /// `Params { m: d, k: rank }` for the `B_scaled·tmp` GEMV.
+    b_params: Buffer,
+    rank: u32,
+    #[allow(dead_code)]
+    k: u32,
+    d: u32,
+}
+
+/// A LoRA adapter uploaded to GPU: per-layer, per-target (in `LoraTarget::index`
+/// order) low-rank factors. Built from a CPU [`LoraAdapterWeights`] via
+/// [`MetalLoraAdapter::upload`] and cached on the model (Arc-pointer-keyed LRU).
+struct MetalLoraAdapter {
+    layers: Vec<[Option<MetalLoraTarget>; 7]>,
+}
+
+impl MetalLoraAdapter {
+    /// Upload every `(layer, target)` factor pair to GPU buffers, folding
+    /// `scale` into `B` as it goes. Adapters are tiny (rank ≤ ~64), so the f32
+    /// copy through `upload_f32` is negligible; a no-copy upload is a possible
+    /// perf follow-up.
+    fn upload(ctx: &MetalContext, w: &LoraAdapterWeights) -> Self {
+        let mut layers = Vec::with_capacity(w.n_layers());
+        for layer in 0..w.n_layers() {
+            let mut targets: [Option<MetalLoraTarget>; 7] = Default::default();
+            for target in LoraTarget::ALL {
+                let Some(t) = w.get(layer, target) else {
+                    continue;
+                };
+                let rank = t.rank as u32;
+                let k = t.k as u32;
+                let d = t.d as u32;
+                // Fold scale into B at upload → no runtime scale dispatch.
+                let b_scaled_data: Vec<f32> = t.b.iter().map(|&x| x * t.scale).collect();
+                targets[target.index()] = Some(MetalLoraTarget {
+                    a: ctx.upload_f32(&t.a),
+                    b_scaled: ctx.upload_f32(&b_scaled_data),
+                    a_params: ctx.upload_bytes(bytemuck::cast_slice(&[rank, k])),
+                    b_params: ctx.upload_bytes(bytemuck::cast_slice(&[d, rank])),
+                    rank,
+                    k,
+                    d,
+                });
+            }
+            layers.push(targets);
+        }
+        Self { layers }
+    }
+}
+
 struct MetalPipelines {
     gemv_f32: ComputePipelineState,
+    /// `y[row] += dot(A[row,:], x)` — the accumulate epilogue for the LoRA
+    /// up-projection (`out += B_scaled·tmp`).
+    gemv_f32_accum: ComputePipelineState,
     gemv_q4_0: ComputePipelineState,
     gemv_q4_0_accum: ComputePipelineState,
     gemv_q4_0_fast: ComputePipelineState,
@@ -324,6 +388,24 @@ pub struct MetalLfm2Model {
     /// Unique model identifier (GGUF file path). Used as part of the cache
     /// fingerprint so different models with the same architecture don't collide.
     model_id: String,
+
+    /// GPU-uploaded LoRA adapters keyed by their source CPU adapter, most-
+    /// recently-used last. Capped at 3 so hot-swapping between a couple of
+    /// adapters doesn't re-upload every forward. The entry holds the CPU
+    /// `Arc<LoraAdapterWeights>` (not just its pointer) so the address stays
+    /// pinned while cached — a bare pointer key would ABA-alias a freed adapter
+    /// against a later one reallocated at the same address, returning the wrong
+    /// GPU upload. The GPU `Arc` also keeps the active upload valid across a
+    /// forward even if the LRU evicts it mid-run.
+    lora_lru: Mutex<Vec<(Arc<LoraAdapterWeights>, Arc<MetalLoraAdapter>)>>,
+    /// The adapter to apply for the in-flight forward, set by `resolve_lora`
+    /// (under `infer_lock`) and cleared by the returned drop-guard. Read by
+    /// `encode_single_layer`.
+    active_lora: Mutex<Option<Arc<MetalLoraAdapter>>>,
+    /// Scratch for the LoRA down-projection result (`tmp = A·x`). Sized for a
+    /// safe max rank (512 f32); ranks above that are rejected by the CPU loader
+    /// long before here in practice.
+    lora_tmp: Buffer,
 }
 
 impl MetalLfm2Model {
@@ -384,6 +466,7 @@ impl MetalLfm2Model {
 
         let pipelines = MetalPipelines {
             gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32")?,
+            gemv_f32_accum: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32_accum")?,
             gemv_q4_0: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0")?,
             gemv_q4_0_accum: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0_accum")?,
             gemv_q4_0_fast: ctx.create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast")?,
@@ -711,6 +794,10 @@ impl MetalLfm2Model {
         let prefill_proj_cols = (3 * hs).max(q_dim);
         let prefill_gate_cols = is.max(max_kv_dim).max(hs);
 
+        // Bind before the struct literal moves `ctx`: `make_buf` borrows `ctx`,
+        // and this field is initialized after the `ctx` field.
+        let lora_tmp = make_buf(512);
+
         Ok(Self {
             hidden_buf: make_buf(hs),
             normed_buf: make_buf(hs),
@@ -783,6 +870,10 @@ impl MetalLfm2Model {
             attn_mode: std::env::var("CERA_ATTN").unwrap_or_default(),
             skip_attn: std::env::var("CERA_PROFILE").as_deref() == Ok("noattn"),
             model_id: model_id.into_owned(),
+            lora_lru: Mutex::new(Vec::new()),
+            active_lora: Mutex::new(None),
+            // 512 f32 covers any sane LoRA rank; `A·x` writes `rank` floats here.
+            lora_tmp,
         })
     }
 }
@@ -800,6 +891,17 @@ fn sz2d(x: u64, y: u64) -> MTLSize {
         width: x,
         height: y,
         depth: 1,
+    }
+}
+
+/// Clears `MetalLfm2Model::active_lora` when dropped, so a leaked `Some` can't
+/// send a later base-model forward through the adapter. Mirrors the
+/// `ScratchGuard`/`use_hs_scratch` pattern.
+struct LoraGuard<'a>(&'a Mutex<Option<Arc<MetalLoraAdapter>>>);
+
+impl Drop for LoraGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().expect("active_lora poisoned") = None;
     }
 }
 
@@ -851,6 +953,94 @@ impl MetalLfm2Model {
             enc.set_buffer(i as u64, Some(b), off);
         }
         enc.dispatch_thread_groups(grid, threads_per_tg);
+    }
+
+    /// Resolve `state.lora` to a GPU-uploaded adapter and stage it in
+    /// `active_lora` for the encoders to read, returning a guard that clears
+    /// `active_lora` on drop. Uploads are cached in an Arc-pointer-keyed LRU
+    /// (cap 3) so hot-swapping between a few adapters doesn't re-upload every
+    /// forward. Must be called while holding `infer_lock` (it mutates the
+    /// per-model `active_lora`/`lora_lru`).
+    fn resolve_lora(&self, state: &InferenceState) -> LoraGuard<'_> {
+        let resolved = state.lora.as_ref().map(|adapter| {
+            let mut lru = self.lora_lru.lock().expect("lora_lru poisoned");
+            if let Some(pos) = lru.iter().position(|(cpu, _)| Arc::ptr_eq(cpu, adapter)) {
+                // Hit: move to front (end = most-recently-used).
+                let (cpu, gpu) = lru.remove(pos);
+                lru.push((cpu, gpu.clone()));
+                gpu
+            } else {
+                // Miss: upload, insert, evict the least-recently-used if over cap.
+                let gpu = Arc::new(MetalLoraAdapter::upload(&self.ctx, adapter));
+                lru.push((adapter.clone(), gpu.clone()));
+                if lru.len() > 3 {
+                    lru.remove(0);
+                }
+                gpu
+            }
+        });
+        *self.active_lora.lock().expect("active_lora poisoned") = resolved;
+        LoraGuard(&self.active_lora)
+    }
+
+    /// Two-dispatch LoRA delta for one target: `out += scale · B · (A · x)`.
+    /// `scale` is pre-folded into `t.b_scaled`. Offsets are f32-element counts
+    /// (scaled to bytes here), matching the model's float-unit convention.
+    fn encode_lora_target(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        t: &MetalLoraTarget,
+        input: &Buffer,
+        in_off_floats: u64,
+        output: &Buffer,
+        out_off_floats: u64,
+    ) {
+        let f32b = std::mem::size_of::<f32>() as u64;
+        // tmp = A·x   (m = rank rows, k = input width) — plain f32 GEMV.
+        self.dispatch(
+            enc,
+            &self.pipelines.gemv_f32,
+            &[&t.a, input, &self.lora_tmp, &t.a_params],
+            &[0, in_off_floats * f32b, 0, 0],
+            sz2d(t.rank.min(65535) as u64, (t.rank as u64).div_ceil(65535)),
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        // out += B_scaled·tmp   (m = d rows, k = rank) — accumulate GEMV.
+        self.dispatch(
+            enc,
+            &self.pipelines.gemv_f32_accum,
+            &[&t.b_scaled, &self.lora_tmp, output, &t.b_params],
+            &[0, 0, out_off_floats * f32b, 0],
+            sz2d(t.d.min(65535) as u64, (t.d as u64).div_ceil(65535)),
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
+    /// Apply the `(layer, target)` LoRA delta if the active adapter touches it.
+    /// `input` is the target's pre-projection input; `output` is the base
+    /// projection's output (both at f32-element offset 0 in the decode path).
+    fn encode_lora_hook(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        lora: Option<&Arc<MetalLoraAdapter>>,
+        layer: usize,
+        target: LoraTarget,
+        input: &Buffer,
+        output: &Buffer,
+    ) {
+        if let Some(l) = lora
+            && let Some(t) = l.layers.get(layer).and_then(|a| a[target.index()].as_ref())
+        {
+            self.encode_lora_target(enc, t, input, 0, output, 0);
+        }
     }
 
     /// Compute-based memcpy — moves `len_floats` f32 from `src[src_off_floats..]`
@@ -2456,8 +2646,11 @@ impl Model for MetalLfm2Model {
     /// separate scratch state. `_state` is unused: Metal keeps its KV on the
     /// model, not the caller's `InferenceState`. Positions run `0..n`, so the
     /// attention window and RoPE come purely from the loop index.
-    fn hidden_states(&self, tokens: &[u32], _state: &mut InferenceState) -> Vec<f32> {
+    fn hidden_states(&self, tokens: &[u32], state: &mut InferenceState) -> Vec<f32> {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        // Stage the caller's adapter for the per-token layer encoders; the guard
+        // clears it on the way out.
+        let _lora_guard = self.resolve_lora(state);
         assert!(
             !tokens.is_empty(),
             "hidden_states requires at least one token"
@@ -2526,6 +2719,7 @@ impl Model for MetalLfm2Model {
 
     fn forward(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> Vec<f32> {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _lora_guard = self.resolve_lora(state);
         assert_eq!(tokens.len(), 1, "Metal forward expects single token");
         let token_id = tokens[0] as usize;
         let cfg = &self.config;
@@ -2609,6 +2803,7 @@ impl Model for MetalLfm2Model {
         }
 
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _lora_guard = self.resolve_lora(state);
         assert_eq!(tokens.len(), 1, "Metal forward expects single token");
         let token_id = tokens[0] as usize;
         let cfg = &self.config;
@@ -2802,6 +2997,25 @@ impl Model for MetalLfm2Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
+        // With a LoRA active, run the prompt per-token through `forward` so the
+        // adapter's per-token GPU apply (in `encode_single_layer`) fires on every
+        // token — the batched-GEMM prefill path has no LoRA epilogue yet (a perf
+        // follow-up). `forward` takes `infer_lock` itself, so we must NOT hold it
+        // across the loop (the mutex isn't reentrant). The prefix cache is
+        // bypassed: cached KV is base-model-only.
+        if state.lora.is_some() {
+            if start_pos == 0 {
+                let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+                self.state.seq_len.store(0, Ordering::Relaxed);
+                self.zero_conv_buffers_locked();
+            }
+            let mut logits = Vec::new();
+            for (j, &tok) in tokens.iter().enumerate() {
+                logits = self.forward(&[tok], start_pos + j, state);
+            }
+            return logits;
+        }
+
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         // Fresh prefill (start_pos == 0) → reset GPU-resident state so the model
         // doesn't carry KV history from a previous generation. The CPU-side
@@ -4744,6 +4958,13 @@ impl MetalLfm2Model {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let hs32 = hs as u32;
+        // Active LoRA adapter (cheap Arc clone; `None` on the base-model path).
+        // Read once so every hook in this layer shares one lock acquisition.
+        let lora = self
+            .active_lora
+            .lock()
+            .expect("active_lora poisoned")
+            .clone();
         {
             let lw = &self.layers[i];
 
@@ -4814,6 +5035,34 @@ impl MetalLfm2Model {
                     &self.v_buf,
                 );
 
+                // LoRA Q/K/V deltas: `+= scale·B·(A·normed)` on the raw
+                // projections, before QK-norm/RoPE (additive, so it commutes
+                // with the Qwen2 bias-add below).
+                self.encode_lora_hook(
+                    enc,
+                    lora.as_ref(),
+                    i,
+                    LoraTarget::AttnQ,
+                    &self.normed_buf,
+                    &self.q_buf,
+                );
+                self.encode_lora_hook(
+                    enc,
+                    lora.as_ref(),
+                    i,
+                    LoraTarget::AttnK,
+                    &self.normed_buf,
+                    &self.k_buf,
+                );
+                self.encode_lora_hook(
+                    enc,
+                    lora.as_ref(),
+                    i,
+                    LoraTarget::AttnV,
+                    &self.normed_buf,
+                    &self.v_buf,
+                );
+
                 // Qwen2 QKV bias: added right after the projections, before
                 // QK-norm/RoPE. Absent (`None`) on every other arch.
                 if let Some(b) = lw.attn_q_bias.as_ref() {
@@ -4864,6 +5113,17 @@ impl MetalLfm2Model {
                     &self.hidden_buf,
                     &self.normed_buf,
                 );
+
+                // LoRA attn-output delta: input is the attention output
+                // (o_proj input), added into the post-residual hidden state.
+                self.encode_lora_hook(
+                    enc,
+                    lora.as_ref(),
+                    i,
+                    LoraTarget::AttnOutput,
+                    &self.attn_out_buf,
+                    &self.hidden_buf,
+                );
             }
 
             // FFN
@@ -4881,6 +5141,23 @@ impl MetalLfm2Model {
                 self.encode_gemv_weight(enc, &lw.ffn_gate, &self.ffn_input_buf, &self.gate_buf);
                 self.encode_gemv_weight(enc, &lw.ffn_up, &self.ffn_input_buf, &self.up_buf);
             }
+            // LoRA gate/up deltas on the raw projections, before silu_mul.
+            self.encode_lora_hook(
+                enc,
+                lora.as_ref(),
+                i,
+                LoraTarget::FfnGate,
+                &self.ffn_input_buf,
+                &self.gate_buf,
+            );
+            self.encode_lora_hook(
+                enc,
+                lora.as_ref(),
+                i,
+                LoraTarget::FfnUp,
+                &self.ffn_input_buf,
+                &self.up_buf,
+            );
             self.encode_elementwise(
                 enc,
                 &self.pipelines.silu_mul_inplace,
@@ -4897,6 +5174,16 @@ impl MetalLfm2Model {
                 &self.gate_buf,
                 &self.hidden_buf,
                 &self.ffn_input_buf,
+            );
+            // LoRA ffn-down delta: input is the silu_mul(gate,up) result in
+            // `gate_buf`, added into the post-residual hidden state.
+            self.encode_lora_hook(
+                enc,
+                lora.as_ref(),
+                i,
+                LoraTarget::FfnDown,
+                &self.gate_buf,
+                &self.hidden_buf,
             );
         }
     }

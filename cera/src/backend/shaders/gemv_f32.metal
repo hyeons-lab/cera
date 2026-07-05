@@ -29,3 +29,30 @@ kernel void gemv_f32(
     float total = simd_sum(partial);
     if (tid == 0u) y[row] = total;
 }
+
+// F32 GEMV with accumulate: y[row] += dot(A[row, :], x). Same layout/dispatch as
+// `gemv_f32`; used for the LoRA up-projection epilogue (out += B_scaled · tmp),
+// where `scale` is pre-folded into the uploaded B so no separate scale pass is
+// needed.
+kernel void gemv_f32_accum(
+    const device float* a [[buffer(0)]],
+    const device float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant Params& params [[buffer(3)]],
+    uint3 tid_v [[thread_position_in_threadgroup]],
+    uint3 tg_id [[threadgroup_position_in_grid]]
+) {
+    uint tid = tid_v.x;
+    uint row = tg_id.x + tg_id.y * 65535u;
+    uint m = params.m;
+    uint k = params.k;
+    if (row >= m) return;
+
+    uint row_offset = row * k;
+    float partial = 0.0f;
+    for (uint col = tid; col < k; col += 32u) {
+        partial += a[row_offset + col] * x[col];
+    }
+    float total = simd_sum(partial);
+    if (tid == 0u) y[row] += total;
+}
