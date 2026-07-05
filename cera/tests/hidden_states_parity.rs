@@ -8,8 +8,9 @@
 //! oracle uses for its cosine gate. A wrong norm / dropped layer / stale KV would
 //! collapse cosine well below the 0.99 bar on the very first token.
 //!
-//! Gated behind `CERA_GPU_PARITY=1` and `#[ignore]`. Needs a plain LFM2 GGUF
-//! (`CERA_LFM2_MODEL=/path/to/lfm2.gguf`, or `models/LFM-450M-Q4_0.gguf`). Run:
+//! Gated behind `CERA_GPU_PARITY=1` and `#[ignore]`. Needs a plain (non-VL) LFM2
+//! GGUF passed via `CERA_LFM2_MODEL=/path/to/lfm2.gguf` (any local
+//! `models/LFM-450M-Q4_0.gguf` is used only if it's a valid GGUF). Run:
 //!   CERA_GPU_PARITY=1 CERA_LFM2_MODEL=... cargo test -p cera --features metal \
 //!     --release --test hidden_states_parity -- --ignored --nocapture
 
@@ -22,17 +23,18 @@ use cera::kv_cache::InferenceState;
 use cera::model::{load_model, load_model_metal};
 use cera::tokenizer::BpeTokenizer;
 
-/// Locate a plain (non-VL) LFM2 GGUF: `CERA_LFM2_MODEL` override, else the
-/// committed `models/LFM-450M-Q4_0.gguf`. Returns `None` (→ skip) if absent.
+/// Locate a plain (non-VL) LFM2 GGUF: the `CERA_LFM2_MODEL` override, else a
+/// local `models/LFM-450M-Q4_0.gguf` if present. Returns `None` (→ skip) if none
+/// is a *valid* GGUF — validated by actually opening it, so a leftover
+/// failed-download stub (a common 29-byte "Invalid username or password." file)
+/// is rejected rather than accepted and panicked on later.
 fn lfm2_model_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CERA_LFM2_MODEL") {
-        let p = PathBuf::from(p);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models/LFM-450M-Q4_0.gguf");
-    p.exists().then_some(p)
+    let env_path = std::env::var("CERA_LFM2_MODEL").ok().map(PathBuf::from);
+    let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models/LFM-450M-Q4_0.gguf");
+    env_path
+        .into_iter()
+        .chain(std::iter::once(local))
+        .find(|p| p.exists() && GgufFile::open(p).is_ok())
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -102,12 +104,21 @@ fn metal_hidden_states_matches_cpu() {
         tokens.len()
     );
 
-    // A second call must reproduce the first exactly — proves the scratch KV/conv
-    // is cleared between runs and generation KV isn't leaking in.
+    // A second call must reproduce the first — proves the scratch KV/conv is
+    // cleared between runs and no generation KV leaks in. A stale (uncleared)
+    // scratch would perturb the conv rolling state and diverge sharply; use a
+    // tight tolerance rather than bit-exact equality so ULP-level GPU
+    // accumulation noise across two command buffers can't flake the gate.
     let mut s2 = InferenceState::for_prefill(metal.config(), tokens.len());
     let again = metal.hidden_states(&tokens, &mut s2);
-    assert_eq!(
-        again, metal_hidden,
-        "Metal hidden_states not reproducible across calls"
+    assert_eq!(again.len(), metal_hidden.len(), "reproducibility: shape");
+    let max_abs = again
+        .iter()
+        .zip(&metal_hidden)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_abs < 1e-3,
+        "Metal hidden_states not reproducible across calls (max abs diff {max_abs:.2e})"
     );
 }

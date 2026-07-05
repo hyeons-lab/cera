@@ -164,6 +164,15 @@ struct MetalState {
     embedding_hidden_size: usize,
 }
 
+/// Scratch KV/conv caches for [`MetalLfm2Model::hidden_states`], mirroring the
+/// generation caches' shapes. Allocated **lazily** on first `hidden_states` call
+/// (via `OnceLock`), so a generation-only load never pays the (doubled) KV-cache
+/// VRAM. Selected over the generation caches by `use_hs_scratch`.
+struct HsScratch {
+    kv: Vec<Option<(Buffer, Buffer)>>,
+    conv: Vec<Option<Buffer>>,
+}
+
 /// Pre-allocated params buffers — values either written once at init (shape params)
 /// or updated per-token for a small fixed set (rope pos, attention seq_len).
 struct ParamsBufs {
@@ -271,14 +280,12 @@ pub struct MetalLfm2Model {
     /// `cera/src/backend/shaders/kv_shift.metal`.
     kv_shift_scratch: Buffer,
     state: MetalState,
-    /// Separate scratch KV / conv buffers for [`Self::hidden_states`], mirroring
-    /// `state.kv_caches` / `state.conv_buffers`. Running the hidden-states
-    /// prefill against these (selected via `use_hs_scratch`) keeps it a
-    /// fresh-context, side-effect-free extraction that never disturbs the
-    /// generation KV — matching the CPU path's dedicated scratch state. Only
-    /// toggled while holding `infer_lock`, so the flag needs no stronger ordering.
-    hs_scratch_kv: Vec<Option<(Buffer, Buffer)>>,
-    hs_scratch_conv: Vec<Option<Buffer>>,
+    /// Lazily-allocated scratch KV/conv for [`Self::hidden_states`] (see
+    /// [`HsScratch`]). Built on first use via [`Self::hs_scratch`] so a
+    /// generation-only load pays no extra KV VRAM. Selected over the generation
+    /// caches by `use_hs_scratch`, which is only toggled while holding
+    /// `infer_lock`, so the flag needs no stronger ordering than `Relaxed`.
+    hs_scratch: std::sync::OnceLock<HsScratch>,
     use_hs_scratch: AtomicBool,
     /// Second mmap of the GGUF file — kept alive so the no-copy Metal buffer
     /// (mmap_buf) stays valid. The OS deduplicates physical pages with the
@@ -640,24 +647,8 @@ impl MetalLfm2Model {
             }
         }
 
-        // Scratch KV/conv for hidden-states extraction — same shapes as the
-        // generation caches above. `hidden_states` runs its prefill against
-        // these so it's a fresh-context, side-effect-free extraction. See
-        // `use_hs_scratch` and `Self::active_kv` / `Self::active_conv`.
-        let mut hs_scratch_kv = Vec::with_capacity(config.n_layers);
-        let mut hs_scratch_conv = Vec::with_capacity(config.n_layers);
-        for i in 0..config.n_layers {
-            if config.block_types[i] == BlockType::Attention {
-                let kv_dim = config.kv_heads_per_layer[i] * head_dim;
-                let k_cache = ctx.create_buffer((max_seq_len * kv_dim * 2) as u64);
-                let v_cache = ctx.create_buffer((max_seq_len * kv_dim * 2) as u64);
-                hs_scratch_kv.push(Some((k_cache, v_cache)));
-                hs_scratch_conv.push(None);
-            } else {
-                hs_scratch_kv.push(None);
-                hs_scratch_conv.push(Some(make_buf(d_conv * hs)));
-            }
-        }
+        // Hidden-states scratch caches are allocated lazily on first use (see
+        // `Self::hs_scratch`) so generation-only loads don't pay their VRAM.
 
         // Pre-allocate params buffers. Shape params are written once; dynamic ones
         // (rope pos, attention seq_len) are updated per-token via buffer.contents().
@@ -778,8 +769,7 @@ impl MetalLfm2Model {
                 max_seq_len,
                 embedding_hidden_size: hs,
             },
-            hs_scratch_kv,
-            hs_scratch_conv,
+            hs_scratch: std::sync::OnceLock::new(),
             use_hs_scratch: AtomicBool::new(false),
             profile_timer: if std::env::var("CERA_PROFILE").as_deref() == Ok("timing") {
                 Some(CategoryTimer::new())
@@ -2461,11 +2451,11 @@ impl Model for MetalLfm2Model {
 
     /// Per-token post-final-norm hidden states, row-major `[n * hidden_size]`
     /// (matching llama.cpp `--pooling none`). Runs a fresh-context prefill
-    /// against the dedicated `hs_scratch_kv` / `hs_scratch_conv` caches (selected
-    /// via `use_hs_scratch`), so it never touches the generation KV — the GPU
-    /// analog of the CPU path's separate scratch state. `_state` is unused: Metal
-    /// keeps its KV on the model, not the caller's `InferenceState`. Positions run
-    /// `0..n`, so the attention window and RoPE come purely from the loop index.
+    /// against the dedicated [`HsScratch`] caches (selected via `use_hs_scratch`),
+    /// so it never touches the generation KV — the GPU analog of the CPU path's
+    /// separate scratch state. `_state` is unused: Metal keeps its KV on the
+    /// model, not the caller's `InferenceState`. Positions run `0..n`, so the
+    /// attention window and RoPE come purely from the loop index.
     fn hidden_states(&self, tokens: &[u32], _state: &mut InferenceState) -> Vec<f32> {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         assert!(
@@ -2481,10 +2471,12 @@ impl Model for MetalLfm2Model {
             self.state.max_seq_len
         );
 
-        // Zero the scratch conv rolling buffers so each extraction starts from a
-        // clean convolution state. The scratch attention caches need no clearing:
-        // token `pos` only attends to `0..=pos`, all written earlier this run.
-        for buf in self.hs_scratch_conv.iter().flatten() {
+        // Build the scratch caches on first use, then zero the scratch conv
+        // rolling buffers so each extraction starts from a clean convolution
+        // state. The scratch attention caches need no clearing: token `pos` only
+        // attends to `0..=pos`, all written earlier this run.
+        let scratch = self.hs_scratch();
+        for buf in scratch.conv.iter().flatten() {
             let len = buf.length() as usize / 4;
             unsafe {
                 std::ptr::write_bytes(buf.contents() as *mut f32, 0, len);
@@ -4685,7 +4677,34 @@ impl MetalLfm2Model {
 
     /// Encode one full token's layer stack (all attn/conv + FFN blocks). `pos` is the
     /// sequence position for RoPE and the KV cache write offset.
-    /// Encode a SINGLE layer for the current hidden_buf state at position pos.
+    /// Lazily build (once) the hidden-states scratch caches — same shapes as the
+    /// generation caches. Called under `infer_lock` from `hidden_states` before
+    /// `use_hs_scratch` is set, so `active_kv`/`active_conv` always find it built.
+    fn hs_scratch(&self) -> &HsScratch {
+        self.hs_scratch.get_or_init(|| {
+            let cfg = &self.config;
+            let head_dim = cfg.head_dim;
+            let hs = cfg.hidden_size;
+            let d_conv = cfg.conv_kernel_size.unwrap_or(3) - 1;
+            let max_seq_len = self.state.max_seq_len;
+            let mut kv = Vec::with_capacity(cfg.n_layers);
+            let mut conv = Vec::with_capacity(cfg.n_layers);
+            for i in 0..cfg.n_layers {
+                if cfg.block_types[i] == BlockType::Attention {
+                    let kv_dim = cfg.kv_heads_per_layer[i] * head_dim;
+                    let k = self.ctx.create_buffer((max_seq_len * kv_dim * 2) as u64);
+                    let v = self.ctx.create_buffer((max_seq_len * kv_dim * 2) as u64);
+                    kv.push(Some((k, v)));
+                    conv.push(None);
+                } else {
+                    kv.push(None);
+                    conv.push(Some(self.ctx.create_buffer((d_conv * hs * 4) as u64)));
+                }
+            }
+            HsScratch { kv, conv }
+        })
+    }
+
     /// The attention KV cache for layer `i` — the hidden-states scratch cache
     /// when [`Self::hidden_states`] is running (`use_hs_scratch`), else the
     /// generation cache. Panics on a conv layer (no KV), matching the prior
@@ -4693,7 +4712,11 @@ impl MetalLfm2Model {
     #[inline]
     fn active_kv(&self, i: usize) -> &(Buffer, Buffer) {
         let caches = if self.use_hs_scratch.load(Ordering::Relaxed) {
-            &self.hs_scratch_kv
+            &self
+                .hs_scratch
+                .get()
+                .expect("hs_scratch built before use_hs_scratch is set")
+                .kv
         } else {
             &self.state.kv_caches
         };
@@ -4705,13 +4728,18 @@ impl MetalLfm2Model {
     #[inline]
     fn active_conv(&self, i: usize) -> &Buffer {
         let bufs = if self.use_hs_scratch.load(Ordering::Relaxed) {
-            &self.hs_scratch_conv
+            &self
+                .hs_scratch
+                .get()
+                .expect("hs_scratch built before use_hs_scratch is set")
+                .conv
         } else {
             &self.state.conv_buffers
         };
         bufs[i].as_ref().unwrap()
     }
 
+    /// Encode a SINGLE layer for the current hidden_buf state at position pos.
     fn encode_single_layer(&self, enc: &metal::ComputeCommandEncoderRef, i: usize, pos: usize) {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
