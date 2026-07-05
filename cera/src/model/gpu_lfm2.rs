@@ -3578,13 +3578,17 @@ impl GpuLfm2Model {
             .queue
             .write_buffer(&self.prefill_batch_buf, 0, bytemuck::cast_slice(&staged));
 
-        // Reset the batched-LoRA params pool cursor: this call encodes into one
-        // command buffer + one submit, so `next_lora_params` hands out a distinct
-        // pooled buffer per GEMM dispatch starting from 0.
-        self.lora_params_pool
-            .lock()
-            .expect("lora_params_pool poisoned")
-            .1 = 0;
+        // Reset the batched-LoRA params pool cursor — only when an adapter is
+        // active (the base path encodes no LoRA dispatches, so it needn't touch
+        // the pool lock). This call encodes into one command buffer + one submit,
+        // so `next_lora_params` hands out a distinct pooled buffer per GEMM
+        // dispatch starting from 0.
+        if lora.is_some() {
+            self.lora_params_pool
+                .lock()
+                .expect("lora_params_pool poisoned")
+                .1 = 0;
+        }
 
         let mut enc = self.new_encoder();
         let n_u = n as u32;
