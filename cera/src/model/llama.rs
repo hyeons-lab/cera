@@ -492,6 +492,10 @@ impl LlamaModel {
             .attn
             .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
 
+        // Cloned once (cheap Arc bump) so the adapter can be read while the
+        // base-weight scratch buffers stay mutably borrowed (disjoint fields).
+        let lora = state.lora.clone();
+
         // The batched-GEMM kernels (NEON `gemm_q{4_0,8_0}_q8_0` and BLAS SGEMM
         // after `dequantize_q{4_0,8_0}_matrix`) only handle Q4_0/Q8_0. If any
         // per-layer projection uses another dtype (e.g. Q4KM/Q6K), fall back to
@@ -682,6 +686,38 @@ impl LlamaModel {
                     n,
                     hs,
                 );
+            }
+
+            // LoRA on Q/K/V — added to the projection outputs before bias/RoPE,
+            // input is the normed hidden `[hs×n]` (matches the decode hook order).
+            if let Some(lora) = &lora {
+                if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnQ) {
+                    crate::lora::apply_prefill(
+                        t,
+                        &normed,
+                        &mut q_mat,
+                        n,
+                        &mut state.scratch.lora_tmp,
+                    );
+                }
+                if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnK) {
+                    crate::lora::apply_prefill(
+                        t,
+                        &normed,
+                        &mut k_mat,
+                        n,
+                        &mut state.scratch.lora_tmp,
+                    );
+                }
+                if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnV) {
+                    crate::lora::apply_prefill(
+                        t,
+                        &normed,
+                        &mut v_mat,
+                        n,
+                        &mut state.scratch.lora_tmp,
+                    );
+                }
             }
 
             // Per-arch attention knobs (constant across tokens within a layer).
@@ -914,6 +950,21 @@ impl LlamaModel {
                 );
             }
 
+            // LoRA on the output projection — applied to the projection output
+            // BEFORE the residual scale (so Granite's multiplier wraps the delta
+            // too); input is the attention output `[q_dim×n]`.
+            if let Some(lora) = &lora
+                && let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnOutput)
+            {
+                crate::lora::apply_prefill(
+                    t,
+                    &out_proj_input,
+                    &mut block_out,
+                    n,
+                    &mut state.scratch.lora_tmp,
+                );
+            }
+
             // Granite residual scale, then residual add into hidden.
             if cfg.scalars.residual != 1.0 {
                 cpu::scale_inplace(&mut block_out, cfg.scalars.residual);
@@ -991,6 +1042,29 @@ impl LlamaModel {
                 );
             }
 
+            // LoRA on gate/up — BEFORE the SwiGLU mul, input is the normed FFN
+            // input `[hs×n]` (mirrors the decode hook order).
+            if let Some(lora) = &lora {
+                if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
+                    crate::lora::apply_prefill(
+                        t,
+                        &ffn_input,
+                        &mut gate_mat,
+                        n,
+                        &mut state.scratch.lora_tmp,
+                    );
+                }
+                if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
+                    crate::lora::apply_prefill(
+                        t,
+                        &ffn_input,
+                        &mut up_mat,
+                        n,
+                        &mut state.scratch.lora_tmp,
+                    );
+                }
+            }
+
             cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
 
             #[cfg(feature = "blas")]
@@ -1025,6 +1099,20 @@ impl LlamaModel {
                     hs,
                     n,
                     is,
+                );
+            }
+
+            // LoRA on the down projection — applied BEFORE the residual scale;
+            // input is the SwiGLU product in `gate_mat` `[is×n]`.
+            if let Some(lora) = &lora
+                && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnDown)
+            {
+                crate::lora::apply_prefill(
+                    t,
+                    &gate_mat,
+                    &mut ffn_out,
+                    n,
+                    &mut state.scratch.lora_tmp,
                 );
             }
 
@@ -1109,10 +1197,11 @@ impl Model for LlamaModel {
         );
         // Batched-GEMM capture when a batched kernel exists and n > 1; the
         // batched path internally falls back to per-token for non-gemmable dtypes.
-        // With a LoRA active, take the per-token path so the adapter is applied
-        // (batched-GEMM LoRA is a perf follow-up); the decode hooks handle it.
+        // An active LoRA is applied in-batch (via `apply_prefill` after each
+        // projection GEMM); non-gemmable dtypes fall back to the per-token decode
+        // hooks, which apply it too.
         #[cfg(any(target_arch = "aarch64", feature = "blas"))]
-        if tokens.len() > 1 && state.lora.is_none() {
+        if tokens.len() > 1 {
             let mut out = Vec::new();
             self.forward_prefill_batched(tokens, 0, state, Some(&mut out));
             return out;
@@ -1170,10 +1259,11 @@ impl Model for LlamaModel {
         // path too: the batched path bypasses `run_layers` and so emits none of
         // the per-substep `oracle_dump::record` nodes that `tests/oracle_text.rs`
         // validates against llama.cpp.
-        // A LoRA also forces the per-token path (the batched-GEMM path doesn't
-        // apply the adapter yet); the decode hooks in `run_layers` handle it.
+        // An active LoRA is applied in-batch (`apply_prefill` after each projection
+        // GEMM), so it no longer forces the per-token path; non-gemmable dtypes
+        // still fall back to the per-token decode hooks, which apply it too.
         #[cfg(any(target_arch = "aarch64", feature = "blas"))]
-        if tokens.len() > 1 && !transformer::oracle_dump::is_active() && state.lora.is_none() {
+        if tokens.len() > 1 && !transformer::oracle_dump::is_active() {
             return self.forward_prefill_batched(tokens, start_pos, state, None);
         }
 

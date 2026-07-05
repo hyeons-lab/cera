@@ -470,6 +470,53 @@ pub fn apply_decode(t: &LoraTargetWeights, x: &[f32], y: &mut [f32], tmp: &mut V
     }
 }
 
+/// Prefill-path apply: `Y += scale · B·(A·X)` for `n` tokens at once. `x` is the
+/// projection input `[k × n]` **channel-major** (`x[i*n + j]` = input channel `i`
+/// of token `j`), `y` the projection output `[d × n]` in the same layout,
+/// accumulated in place — matching the batched-prefill buffer layout so this
+/// drops in right after a base projection GEMM. `tmp` is scratch resized to
+/// `rank × n`. Equivalent to calling [`apply_decode`] on each of the `n` columns.
+pub fn apply_prefill(
+    t: &LoraTargetWeights,
+    x: &[f32],
+    y: &mut [f32],
+    n: usize,
+    tmp: &mut Vec<f32>,
+) {
+    debug_assert_eq!(x.len(), t.k * n);
+    debug_assert_eq!(y.len(), t.d * n);
+    // Nothing to apply for zero columns; also guards `chunks_exact_mut(0)`, which
+    // panics (this is a `pub` helper, so a caller could pass n == 0).
+    if n == 0 || t.scale == 0.0 {
+        return;
+    }
+    // Tmp[rank × n] = scale · (A · X).  A is [rank × k] row-major.
+    tmp.clear();
+    tmp.resize(t.rank * n, 0.0);
+    for (r, tmp_row) in tmp.chunks_exact_mut(n).enumerate() {
+        let a_row = &t.a[r * t.k..(r + 1) * t.k];
+        for (kk, &a_val) in a_row.iter().enumerate() {
+            let x_row = &x[kk * n..(kk + 1) * n];
+            for (t_j, &x_j) in tmp_row.iter_mut().zip(x_row) {
+                *t_j += a_val * x_j;
+            }
+        }
+        for t_j in tmp_row.iter_mut() {
+            *t_j *= t.scale;
+        }
+    }
+    // Y[d × n] += B · Tmp.  B is [d × rank] row-major.
+    for (o, y_row) in y.chunks_exact_mut(n).enumerate() {
+        let b_row = &t.b[o * t.rank..(o + 1) * t.rank];
+        for (r, &b_val) in b_row.iter().enumerate() {
+            let tmp_row = &tmp[r * n..(r + 1) * n];
+            for (y_j, &t_j) in y_row.iter_mut().zip(tmp_row) {
+                *y_j += b_val * t_j;
+            }
+        }
+    }
+}
+
 /// Apply the Q/K/V attention-projection LoRAs for one layer: `q/k/v` are the
 /// base projection outputs (share input `x`), each gets `+= scale·B·(A·x)` if the
 /// adapter targets it. Shared by both `forward_attn_block` implementations
@@ -747,6 +794,42 @@ mod tests {
         let expected = rank as f32 * (t.scale * sum_x); // scale = 4/2 = 2
         for &yi in &y {
             assert!((yi - expected).abs() < 1e-5, "{yi} != {expected}");
+        }
+    }
+
+    #[test]
+    fn apply_prefill_matches_per_column_decode() {
+        // The batched `apply_prefill` (Y[d×n] += scale·B·(A·X[k×n])) must equal
+        // running `apply_decode` on each of the n columns independently.
+        let (rank, k, d, n) = (3, 4, 5, 3);
+        let buf = synth_safetensors(rank, k, d, 0.5, 0.25);
+        let adapter = LoraAdapterWeights::from_safetensors_bytes(&buf, Some(6.0)).unwrap();
+        let t = adapter.get(0, LoraTarget::AttnQ).unwrap();
+
+        // Channel-major X [k×n], distinct per column; nonzero base Y to exercise
+        // the in-place accumulate.
+        let mut x = vec![0.0f32; k * n];
+        for i in 0..k {
+            for j in 0..n {
+                x[i * n + j] = (i as f32 + 1.0) * (j as f32 + 1.0) * 0.1;
+            }
+        }
+        let mut y_batched: Vec<f32> = (0..d * n).map(|i| i as f32 * 0.01).collect();
+        let mut y_ref = y_batched.clone();
+
+        let mut tmp = Vec::new();
+        apply_prefill(t, &x, &mut y_batched, n, &mut tmp);
+
+        for j in 0..n {
+            let x_col: Vec<f32> = (0..k).map(|i| x[i * n + j]).collect();
+            let mut y_col: Vec<f32> = (0..d).map(|o| y_ref[o * n + j]).collect();
+            apply_decode(t, &x_col, &mut y_col, &mut tmp);
+            for (o, &v) in y_col.iter().enumerate() {
+                y_ref[o * n + j] = v;
+            }
+        }
+        for (a, b) in y_batched.iter().zip(&y_ref) {
+            assert!((a - b).abs() < 1e-5, "{a} != {b}");
         }
     }
 

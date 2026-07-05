@@ -934,6 +934,10 @@ impl Lfm2Model {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
 
+        // Cloned once (cheap Arc bump) so the adapter can be read after each
+        // projection GEMM while the base-weight scratch buffers stay borrowed.
+        let lora = state.lora.clone();
+
         // Per-layer hidden-state diagnostic. Set `CERA_DEBUG_HIDDEN=1`
         // to print the last token's RMS at each layer entry, after
         // attn/conv (post 1st residual), and after FFN (post 2nd
@@ -1268,6 +1272,38 @@ impl Lfm2Model {
                                 n,
                                 hs,
                             );
+                        }
+
+                        // LoRA on Q/K/V — added to the projection outputs before
+                        // QK-norm/RoPE, input is the normed hidden `[hs×n]`.
+                        if let Some(lora) = &lora {
+                            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnQ) {
+                                crate::lora::apply_prefill(
+                                    t,
+                                    &normed,
+                                    &mut q_mat,
+                                    n,
+                                    &mut state.scratch.lora_tmp,
+                                );
+                            }
+                            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnK) {
+                                crate::lora::apply_prefill(
+                                    t,
+                                    &normed,
+                                    &mut k_mat[..kv_dim * n],
+                                    n,
+                                    &mut state.scratch.lora_tmp,
+                                );
+                            }
+                            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnV) {
+                                crate::lora::apply_prefill(
+                                    t,
+                                    &normed,
+                                    &mut v_mat[..kv_dim * n],
+                                    n,
+                                    &mut state.scratch.lora_tmp,
+                                );
+                            }
                         }
 
                         // Phase 2: Per-token attention (QK norm, RoPE, KV cache, scores)
@@ -1737,6 +1773,21 @@ impl Lfm2Model {
                             n,
                             hs,
                         );
+
+                        // LoRA on the output projection — applied to `block_out`
+                        // BEFORE the residual add; input is the attention output
+                        // `[hs×n]`.
+                        if let Some(lora) = &lora
+                            && let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnOutput)
+                        {
+                            crate::lora::apply_prefill(
+                                t,
+                                &out_proj_input,
+                                &mut block_out,
+                                n,
+                                &mut state.scratch.lora_tmp,
+                            );
+                        }
                         true
                     } else {
                         false
@@ -1893,6 +1944,29 @@ impl Lfm2Model {
                     );
                 }
 
+                // LoRA on gate/up — BEFORE the SiLU+mul, input is the normed FFN
+                // input `[hs×n]`.
+                if let Some(lora) = &lora {
+                    if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
+                        crate::lora::apply_prefill(
+                            t,
+                            &ffn_input,
+                            &mut gate_mat[..is * n],
+                            n,
+                            &mut state.scratch.lora_tmp,
+                        );
+                    }
+                    if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
+                        crate::lora::apply_prefill(
+                            t,
+                            &ffn_input,
+                            &mut up_mat[..is * n],
+                            n,
+                            &mut state.scratch.lora_tmp,
+                        );
+                    }
+                }
+
                 // Fused SiLU+mul (row-major is×n)
                 cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
 
@@ -1932,6 +2006,20 @@ impl Lfm2Model {
                     n,
                     is,
                 );
+
+                // LoRA on the down projection — applied to `ffn_out` BEFORE the
+                // residual add; input is the SiLU⊙up product in `gate_mat` `[is×n]`.
+                if let Some(lora) = &lora
+                    && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnDown)
+                {
+                    crate::lora::apply_prefill(
+                        t,
+                        &gate_mat[..is * n],
+                        &mut ffn_out,
+                        n,
+                        &mut state.scratch.lora_tmp,
+                    );
+                }
                 true
             } else {
                 false
@@ -1975,6 +2063,27 @@ impl Lfm2Model {
                         self.gemv(&refs.ffn_up, &col, &mut up_col);
                     }
 
+                    // LoRA on gate/up (per-token decode hook) — this fallback loop
+                    // doesn't route through `forward_ffn_block`, so apply it here.
+                    if let Some(lora) = &lora {
+                        if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
+                            crate::lora::apply_decode(
+                                t,
+                                &col,
+                                &mut gate_col,
+                                &mut state.scratch.lora_tmp,
+                            );
+                        }
+                        if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
+                            crate::lora::apply_decode(
+                                t,
+                                &col,
+                                &mut up_col,
+                                &mut state.scratch.lora_tmp,
+                            );
+                        }
+                    }
+
                     cpu::silu_mul_inplace(&mut gate_col, &up_col);
 
                     #[cfg(target_arch = "aarch64")]
@@ -1990,6 +2099,19 @@ impl Lfm2Model {
                     }
                     #[cfg(not(target_arch = "aarch64"))]
                     self.gemv(&refs.ffn_down, &gate_col, &mut out_col);
+
+                    // LoRA on the down projection (per-token decode hook) — input is
+                    // the SiLU⊙up product in `gate_col`.
+                    if let Some(lora) = &lora
+                        && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnDown)
+                    {
+                        crate::lora::apply_decode(
+                            t,
+                            &gate_col,
+                            &mut out_col,
+                            &mut state.scratch.lora_tmp,
+                        );
+                    }
 
                     for i in 0..hs {
                         ffn_out[i * n + j] = out_col[i];
@@ -2226,26 +2348,20 @@ impl Model for Lfm2Model {
             "forward_prefill requires at least one token"
         );
 
-        // With a LoRA active, run the prompt per-token through `forward`
-        // (→ `run_layers` → the hooked `forward_attn_block`/`forward_ffn_block`)
-        // so the adapter is applied to every token. The batched `forward_prefill_inner`
-        // path doesn't apply LoRA yet (batched-GEMM LoRA is a perf follow-up).
-        // Bypassing the prefix cache here is correct: cached KV is base-model-only.
-        if state.lora.is_some() {
-            let mut logits = Vec::new();
-            for (j, &tok) in tokens.iter().enumerate() {
-                logits = self.forward(&[tok], start_pos + j, state);
-            }
-            return logits;
-        }
-
         // Cache participation gate: only on a fresh prefill
         // (`start_pos == 0`). Continuation prefills (chunked /
         // mid-sequence) carry KV state from the prior chunk so a
         // cache restore would clobber it. TurboQuant-compressed
         // states are now supported via `LayerSnapshot::AttentionCompressed`
         // (the `!is_compressed()` exclusion was lifted in this PR).
-        let cache_eligible = start_pos == 0;
+        //
+        // An active LoRA also disables the prefix cache: the batched
+        // `forward_prefill_inner` still runs and applies the adapter in-batch (via
+        // `apply_prefill`), but the resulting KV is adapter-specific, and the cache
+        // key doesn't include the adapter — caching it would let a later base-model
+        // (or different-adapter) prefill restore adapted KV. Skip both the lookup
+        // and the insert while LoRA is attached.
+        let cache_eligible = start_pos == 0 && state.lora.is_none();
 
         if cache_eligible {
             let hit = self
@@ -2352,31 +2468,9 @@ impl Model for Lfm2Model {
             hs
         );
 
-        // With a LoRA active, run frames per-token through `forward_from_embedding`
-        // (→ `run_layers` → the hooked block fns) so the adapter applies to
-        // embedding-input (multimodal) tokens too — otherwise the batched
-        // `prefill_layers_and_logits` below would process them base-model-only,
-        // leaving image/audio spans un-adapted while text spans get the adapter.
-        // Matches the token-path gate in `forward_prefill`.
-        //
-        // `forward_from_embedding` derives its RoPE/KV position from
-        // `state.seq_len` (it ignores the passed `pos`), so frames land at
-        // seq_len, seq_len+1, … — correct exactly when `start_pos == seq_len`,
-        // which the prefill flow guarantees (text prefill advances seq_len to
-        // `start_pos` before an embedding span). Assert it so a future caller
-        // that violates the invariant is caught rather than silently mispositioned.
-        if state.lora.is_some() {
-            debug_assert_eq!(
-                start_pos, state.seq_len,
-                "embedding LoRA prefill assumes start_pos == seq_len"
-            );
-            let mut logits = Vec::new();
-            for j in 0..n {
-                let frame = &embeddings[j * hs..(j + 1) * hs];
-                logits = self.forward_from_embedding(frame, start_pos + j, state);
-            }
-            return logits;
-        }
+        // An active LoRA is applied in-batch by `prefill_layers_and_logits` (via
+        // `apply_prefill` after each projection GEMM), so embedding-input
+        // (multimodal) spans get the adapter too — no per-frame fallback needed.
 
         // Transpose row-major embeddings (frame j at [j*hs..(j+1)*hs])
         // into column-major hidden (token j's channel i at [i*n + j]) —
