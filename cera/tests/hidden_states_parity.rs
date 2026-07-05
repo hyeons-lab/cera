@@ -41,7 +41,10 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    dot / (na * nb)
+    let denom = na * nb;
+    // A zero-norm hidden state is itself a bug; return 0.0 (fails the >0.99 gate
+    // cleanly) rather than a NaN that muddies the failure message.
+    if denom == 0.0 { 0.0 } else { dot / denom }
 }
 
 #[test]
