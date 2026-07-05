@@ -133,6 +133,13 @@ impl LoraTargetWeights {
             "LoRA rank mismatch between A ({rank_a}) and B ({rank_b})"
         );
         ensure!(rank_a > 0 && k > 0 && d > 0, "LoRA dims must be non-zero");
+        // Cap the rank so backends can size fixed rank-width scratch (e.g. the
+        // Metal `lora_tmp` buffer) without an out-of-bounds risk. Real adapters
+        // are rank ≤ ~64; this bound is generous.
+        ensure!(
+            rank_a <= MAX_LORA_RANK,
+            "LoRA rank {rank_a} exceeds the supported maximum ({MAX_LORA_RANK})"
+        );
         // checked_mul so absurd dims from a malformed adapter error rather than
         // wrapping (which could make a wrong size compare equal).
         let ak = rank_a.checked_mul(k).context("LoRA A dims overflow")?;
@@ -308,6 +315,12 @@ impl LoraAdapterWeights {
 /// many layers; a larger index means a malformed/hostile tensor name, which we
 /// reject rather than let it size a huge allocation.
 const MAX_LORA_LAYERS: usize = 8192;
+
+/// Maximum supported LoRA rank. Adapters above this are rejected at load
+/// ([`LoraTargetWeights::new`]), which lets GPU backends size a fixed rank-width
+/// scratch buffer (the Metal `lora_tmp`) with no out-of-bounds risk. Real
+/// adapters are rank ≤ ~64; this bound is deliberately generous.
+pub const MAX_LORA_RANK: usize = 512;
 
 /// Accumulates loose A/B factors keyed by (layer, target), then validates + pairs
 /// them into a `LoraAdapterWeights`.

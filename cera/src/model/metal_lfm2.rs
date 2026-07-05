@@ -402,9 +402,10 @@ pub struct MetalLfm2Model {
     /// (under `infer_lock`) and cleared by the returned drop-guard. Read by
     /// `encode_single_layer`.
     active_lora: Mutex<Option<Arc<MetalLoraAdapter>>>,
-    /// Scratch for the LoRA down-projection result (`tmp = A·x`). Sized for a
-    /// safe max rank (512 f32); ranks above that are rejected by the CPU loader
-    /// long before here in practice.
+    /// Scratch for the LoRA down-projection result (`tmp = A·x`). Sized to
+    /// [`cera::lora::MAX_LORA_RANK`] f32; the loader rejects any adapter whose
+    /// rank exceeds that ([`LoraTargetWeights::new`]), so a `gemv_f32` writing
+    /// `rank` rows here can never overrun.
     lora_tmp: Buffer,
 }
 
@@ -796,7 +797,7 @@ impl MetalLfm2Model {
 
         // Bind before the struct literal moves `ctx`: `make_buf` borrows `ctx`,
         // and this field is initialized after the `ctx` field.
-        let lora_tmp = make_buf(512);
+        let lora_tmp = make_buf(crate::lora::MAX_LORA_RANK);
 
         Ok(Self {
             hidden_buf: make_buf(hs),
@@ -2740,7 +2741,17 @@ impl Model for MetalLfm2Model {
 
         let pos = self.state.seq_len.load(Ordering::Relaxed);
 
-        if let Some(timer) = &self.profile_timer {
+        // The per-category profiling paths re-implement the layer loop and don't
+        // run the LoRA hooks, so an active adapter forces the normal (hooked)
+        // `encode_layers` path — profiling + LoRA yields correct (adapted) output
+        // at the cost of no per-category breakdown (a diagnostic-only combo).
+        let lora_active = self
+            .active_lora
+            .lock()
+            .expect("active_lora poisoned")
+            .is_some();
+
+        if !lora_active && let Some(timer) = &self.profile_timer {
             // Profiling path: each category is its own command buffer so we can
             // measure wall time separately. Slower than normal — diagnostic only.
             self.encode_layers_profiled(pos, timer);
@@ -2753,7 +2764,7 @@ impl Model for MetalLfm2Model {
             if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
                 timer.print();
             }
-        } else if let Some(timer) = &self.gpu_timer {
+        } else if !lora_active && let Some(timer) = &self.gpu_timer {
             // GPU-timestamp profiling: one command buffer, many compute
             // encoders (one per category) — each with start/end timestamp
             // samples attached. Single commit+wait, then resolve samples.
