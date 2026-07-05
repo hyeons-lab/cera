@@ -4318,10 +4318,10 @@ impl Model for GpuLfm2Model {
         state: &mut InferenceState,
     ) -> Vec<f32> {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
-        // Stage the caller's adapter for the per-token layer encoders (the
-        // sequential fallback loop below runs them; the batched path does not,
-        // so it's disabled while an adapter is active). The guard clears
-        // `active_lora` on the way out.
+        // Stage the caller's adapter so both prefill paths apply it: the
+        // batched-GEMM path runs the in-batch LoRA hooks (two NT GEMMs per
+        // target), and the sequential fallback loop runs the decode hooks. The
+        // guard clears `active_lora` on the way out.
         let _lora_guard = self.resolve_lora(state);
         let lora_active = state.lora.is_some();
         // Reset internal seq_len so repeated generate() calls (bench) work.
