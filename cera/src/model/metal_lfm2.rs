@@ -68,8 +68,20 @@ struct MetalLayerWeights {
 struct MetalLoraTarget {
     /// Down-projection `A`, `[rank × k]` row-major (f32).
     a: Buffer,
-    /// Up-projection `scale · B`, `[d × rank]` row-major (f32).
+    /// Up-projection `scale · B`, `[d × rank]` row-major (f32). For the
+    /// residual-fed targets (attn-output / ffn-down) this also folds the
+    /// model's `residual_mult`, because the **decode** path adds this delta
+    /// straight into the post-residual hidden state (see [`MetalLoraAdapter::upload`]).
     b_scaled: Buffer,
+    /// Up-projection `scale · B` **without** the `residual_mult` fold, for the
+    /// batched-prefill path. There the LoRA delta is accumulated into the
+    /// projection scratch *before* the fused residual add (`add_rmsnorm_batch` /
+    /// `scaled_add_inplace`) scales it by `residual_mult` — so folding
+    /// `residual_mult` here too would double-apply it (Granite only; identical to
+    /// `b_scaled` for every other arch, where `residual_mult == 1.0`). Matches the
+    /// CPU `lora::apply_prefill`, which uses a scale-only `B` and lets the model's
+    /// residual scale wrap the delta.
+    b_batched: Buffer,
     /// `Params { m: rank, k }` for the `A·x` GEMV.
     a_params: Buffer,
     /// `Params { m: d, k: rank }` for the `B_scaled·tmp` GEMV.
@@ -119,9 +131,13 @@ impl MetalLoraAdapter {
                     _ => t.scale,
                 };
                 let b_scaled_data: Vec<f32> = t.b.iter().map(|&x| x * b_factor).collect();
+                // Batched-prefill B: scale only, no residual_mult fold (the fused
+                // residual add scales the delta afterward — see field docs).
+                let b_batched_data: Vec<f32> = t.b.iter().map(|&x| x * t.scale).collect();
                 targets[target.index()] = Some(MetalLoraTarget {
                     a: ctx.upload_f32(&t.a),
                     b_scaled: ctx.upload_f32(&b_scaled_data),
+                    b_batched: ctx.upload_f32(&b_batched_data),
                     a_params: ctx.upload_bytes(bytemuck::cast_slice(&[rank, k])),
                     b_params: ctx.upload_bytes(bytemuck::cast_slice(&[d, rank])),
                     rank,
@@ -212,6 +228,12 @@ struct MetalPipelines {
     conv1d_fused: ComputePipelineState,
     gemm_q4_0: ComputePipelineState,
     gemm_q8_0: ComputePipelineState,
+    /// Batched f32 NT GEMM `C = Lhs · Rhsᵀ` for the prefill LoRA down-projection
+    /// (`Tmp = X · Aᵀ`).
+    gemm_f32_nt: ComputePipelineState,
+    /// Accumulate variant `C += Lhs · Rhsᵀ` for the prefill LoRA up-projection
+    /// (`Y += Tmp · Bᵀ`).
+    gemm_f32_nt_accum: ComputePipelineState,
     attention_prefill: ComputePipelineState,
     /// Iter 5: head_dim-specialized prefill attention. Inner MMA loops
     /// resolve `hd_tiles = hd/8` to a constexpr at MSL compile time, letting
@@ -421,6 +443,12 @@ pub struct MetalLfm2Model {
     /// rank exceeds that ([`LoraTargetWeights::new`]), so a `gemv_f32` writing
     /// `rank` rows here can never overrun.
     lora_tmp: Buffer,
+    /// Scratch for the batched-prefill LoRA down-projection result
+    /// (`Tmp[n_tokens × rank]`, token-major). Sized `MAX_LORA_RANK ×
+    /// max_prefill_tokens` f32 so it covers any adapter rank the loader admits at
+    /// the largest prefill chunk. Filled by `gemm_f32_nt`, consumed by
+    /// `gemm_f32_nt_accum`.
+    lora_tmp_batched: Buffer,
 }
 
 impl MetalLfm2Model {
@@ -545,6 +573,8 @@ impl MetalLfm2Model {
             conv1d_fused: ctx.create_pipeline(shaders::CONV1D_FUSED, "conv1d_fused")?,
             gemm_q4_0: ctx.create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0")?,
             gemm_q8_0: ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0")?,
+            gemm_f32_nt: ctx.create_pipeline(shaders::GEMM_F32, "gemm_f32_nt")?,
+            gemm_f32_nt_accum: ctx.create_pipeline(shaders::GEMM_F32, "gemm_f32_nt_accum")?,
             attention_prefill: ctx
                 .create_pipeline(shaders::ATTENTION_PREFILL, "attention_prefill")?,
             attention_prefill_hd64: ctx
@@ -812,6 +842,8 @@ impl MetalLfm2Model {
         // Bind before the struct literal moves `ctx`: `make_buf` borrows `ctx`,
         // and this field is initialized after the `ctx` field.
         let lora_tmp = make_buf(crate::lora::MAX_LORA_RANK);
+        // Batched-prefill LoRA scratch: rank × n_tokens for the largest chunk.
+        let lora_tmp_batched = make_buf(crate::lora::MAX_LORA_RANK * max_pref);
 
         Ok(Self {
             hidden_buf: make_buf(hs),
@@ -889,6 +921,7 @@ impl MetalLfm2Model {
             active_lora: Mutex::new(None),
             // 512 f32 covers any sane LoRA rank; `A·x` writes `rank` floats here.
             lora_tmp,
+            lora_tmp_batched,
         })
     }
 }
@@ -1060,6 +1093,76 @@ impl MetalLfm2Model {
             && let Some(t) = l.layers.get(layer).and_then(|a| a[target.index()].as_ref())
         {
             self.encode_lora_target(enc, t, input, 0, output, 0);
+        }
+    }
+
+    /// Batched-prefill LoRA delta for one target, applied in-batch across all `n`
+    /// tokens: `Y[n×d] += B_batched · (A · X[n×k])`, computed as two NT GEMMs
+    /// (`gemm_f32_nt` / `gemm_f32_nt_accum`) that match the token-major batch
+    /// buffer layout (`X[tok*k + i]`, `Y[tok*d + o]`).
+    ///
+    /// `t.b_batched` carries only the `alpha/rank` scale (not `residual_mult`) —
+    /// the caller applies the LoRA before the fused residual add, so the model's
+    /// residual scale wraps the delta (matches `lora::apply_prefill`). Offsets are
+    /// f32-element counts; in the prefill pipeline every batch buffer starts at 0.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_lora_target_batched(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        t: &MetalLoraTarget,
+        input: &Buffer,
+        in_off_floats: u64,
+        output: &Buffer,
+        out_off_floats: u64,
+        n: usize,
+    ) {
+        let f32b = std::mem::size_of::<f32>() as u64;
+        // GEMM 1: Tmp[n × rank] = X[n × k] · Aᵀ  (A is [rank × k] row-major).
+        let total1 = n as u64 * t.rank as u64;
+        let p1: [u32; 3] = [n as u32, t.rank, t.k];
+        enc.set_compute_pipeline_state(&self.pipelines.gemm_f32_nt);
+        enc.set_buffer(0, Some(input), in_off_floats * f32b);
+        enc.set_buffer(1, Some(&t.a), 0);
+        enc.set_buffer(2, Some(&self.lora_tmp_batched), 0);
+        enc.set_bytes(
+            3,
+            std::mem::size_of_val(&p1) as u64,
+            p1.as_ptr() as *const _,
+        );
+        enc.dispatch_thread_groups(sz2d(total1.min(65535), total1.div_ceil(65535)), sz1d(32));
+        // GEMM 2: Y[n × d] += Tmp[n × rank] · Bᵀ  (B_batched is [d × rank] row-major).
+        let total2 = n as u64 * t.d as u64;
+        let p2: [u32; 3] = [n as u32, t.d, t.rank];
+        enc.set_compute_pipeline_state(&self.pipelines.gemm_f32_nt_accum);
+        enc.set_buffer(0, Some(&self.lora_tmp_batched), 0);
+        enc.set_buffer(1, Some(&t.b_batched), 0);
+        enc.set_buffer(2, Some(output), out_off_floats * f32b);
+        enc.set_bytes(
+            3,
+            std::mem::size_of_val(&p2) as u64,
+            p2.as_ptr() as *const _,
+        );
+        enc.dispatch_thread_groups(sz2d(total2.min(65535), total2.div_ceil(65535)), sz1d(32));
+    }
+
+    /// Batched-prefill counterpart of [`Self::encode_lora_hook`]: apply the
+    /// `(layer, target)` LoRA delta across all `n` tokens if the active adapter
+    /// touches it. `input`/`output` are token-major batch buffers at offset 0.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_lora_hook_batched(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        lora: Option<&Arc<MetalLoraAdapter>>,
+        layer: usize,
+        target: LoraTarget,
+        input: &Buffer,
+        output: &Buffer,
+        n: usize,
+    ) {
+        if let Some(l) = lora
+            && let Some(t) = l.layers.get(layer).and_then(|a| a[target.index()].as_ref())
+        {
+            self.encode_lora_target_batched(enc, t, input, 0, output, 0, n);
         }
     }
 
@@ -3027,26 +3130,15 @@ impl Model for MetalLfm2Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
-        // With a LoRA active, run the prompt per-token through `forward` so the
-        // adapter's per-token GPU apply (in `encode_single_layer`) fires on every
-        // token — the batched-GEMM prefill path has no LoRA epilogue yet (a perf
-        // follow-up). `forward` takes `infer_lock` itself, so we must NOT hold it
-        // across the loop (the mutex isn't reentrant). The prefix cache is
-        // bypassed: cached KV is base-model-only.
-        if state.lora.is_some() {
-            if start_pos == 0 {
-                let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
-                self.state.seq_len.store(0, Ordering::Relaxed);
-                self.zero_conv_buffers_locked();
-            }
-            let mut logits = Vec::new();
-            for (j, &tok) in tokens.iter().enumerate() {
-                logits = self.forward(&[tok], start_pos + j, state);
-            }
-            return logits;
-        }
-
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        // Stage the caller's adapter for the batched per-layer LoRA hooks in
+        // `prefill_layers_and_logits`; the guard clears it on the way out. The
+        // adapter is applied in-batch (two f32 GEMMs per target), so prefill keeps
+        // its batched-GEMM base path instead of falling back to per-token.
+        let _lora_guard = self.resolve_lora(state);
+        // Cached KV is base-model-only, so bypass the prefix cache when an adapter
+        // is active (both lookup and insert).
+        let lora_active = state.lora.is_some();
         // Fresh prefill (start_pos == 0) → reset GPU-resident state so the model
         // doesn't carry KV history from a previous generation. The CPU-side
         // InferenceState is already fresh when callers invoke generate() again,
@@ -3054,12 +3146,15 @@ impl Model for MetalLfm2Model {
         if start_pos == 0 {
             self.state.seq_len.store(0, Ordering::Relaxed);
 
-            // Cache lookup: only for fresh prefills.
-            let hit = self
-                .prefix_cache
-                .lock()
-                .expect("prefix_cache mutex poisoned")
-                .find_longest_prefix(tokens);
+            // Cache lookup: only for fresh, base-model prefills.
+            let hit = (!lora_active)
+                .then(|| {
+                    self.prefix_cache
+                        .lock()
+                        .expect("prefix_cache mutex poisoned")
+                        .find_longest_prefix(tokens)
+                })
+                .flatten();
             if let Some((snapshot, prefix_len)) = hit {
                 // Strict-prefix-only: a `prefix_len == tokens.len()`
                 // hit would force `use_len = tokens.len() - 1`, but
@@ -3091,7 +3186,8 @@ impl Model for MetalLfm2Model {
         }
 
         let logits = self.forward_prefill_inner(tokens, start_pos, state);
-        if start_pos == 0 {
+        // Only cache base-model KV — an adapted run's KV must never be reused.
+        if start_pos == 0 && !lora_active {
             self.prefix_cache
                 .lock()
                 .expect("prefix_cache mutex poisoned")
@@ -3124,6 +3220,11 @@ impl Model for MetalLfm2Model {
         state: &mut InferenceState,
     ) -> Vec<f32> {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        // Stage the adapter so the batched LoRA hooks in the shared
+        // `prefill_layers_and_logits` apply on the embeddings-fed (LFM2-VL /
+        // Audio) path too — the token path resolves it, so without this the
+        // multimodal prefill would silently run base-model-only.
+        let _lora_guard = self.resolve_lora(state);
         assert!(
             n_tokens > 0,
             "forward_prefill_from_embeddings requires at least one frame"
@@ -3623,6 +3724,14 @@ impl MetalLfm2Model {
         let is = cfg.intermediate_size;
         let b4 = |off: usize| (off * 4) as u64; // byte offset for f32
 
+        // Active LoRA adapter (staged by `resolve_lora`); `None` on the base path.
+        // Each in-batch hook is a no-op unless the adapter touches that target.
+        let lora = self
+            .active_lora
+            .lock()
+            .expect("active_lora poisoned")
+            .clone();
+
         for layer in 0..cfg.n_layers {
             let lw = &self.layers[layer];
 
@@ -3825,6 +3934,38 @@ impl MetalLfm2Model {
                     }
                 }
 
+                // LoRA Q/K/V deltas: `+= scale·B·(A·normed)` on the raw
+                // projections, before QK-norm/RoPE — mirrors the decode hooks and
+                // the CPU `apply_attn_qkv`. Q → proj_buf, K → gate_buf, V → up_buf,
+                // all token-major (input is the shared attn_norm output).
+                self.encode_lora_hook_batched(
+                    enc,
+                    lora.as_ref(),
+                    layer,
+                    LoraTarget::AttnQ,
+                    &self.prefill_normed_buf,
+                    &self.prefill_proj_buf,
+                    n,
+                );
+                self.encode_lora_hook_batched(
+                    enc,
+                    lora.as_ref(),
+                    layer,
+                    LoraTarget::AttnK,
+                    &self.prefill_normed_buf,
+                    &self.prefill_gate_buf,
+                    n,
+                );
+                self.encode_lora_hook_batched(
+                    enc,
+                    lora.as_ref(),
+                    layer,
+                    LoraTarget::AttnV,
+                    &self.prefill_normed_buf,
+                    &self.prefill_up_buf,
+                    n,
+                );
+
                 // Phase A0: Qwen2 QKV bias — broadcast-add across all N rows,
                 // before QK-norm/RoPE. Absent (`None`) on every other arch.
                 if let Some(b) = lw.attn_q_bias.as_ref() {
@@ -3945,6 +4086,20 @@ impl MetalLfm2Model {
                         );
                     }
                 }
+
+                // LoRA attn-output delta into gate_buf, BEFORE the fused residual
+                // add below scales it by `scalars.residual` (so `residual_mult`
+                // wraps the delta — hence `b_batched` carries scale only). Input is
+                // the attention output (o_proj input) in `prefill_normed_buf`.
+                self.encode_lora_hook_batched(
+                    enc,
+                    lora.as_ref(),
+                    layer,
+                    LoraTarget::AttnOutput,
+                    &self.prefill_normed_buf,
+                    &self.prefill_gate_buf,
+                    n,
+                );
             }
 
             // Phase 7: batch FFN for ALL N tokens
@@ -4009,6 +4164,26 @@ impl MetalLfm2Model {
                     );
                 }
             }
+            // LoRA gate/up deltas on the raw projections, before silu_mul. Input
+            // is the ffn_norm output in `prefill_normed_buf`; outputs token-major.
+            self.encode_lora_hook_batched(
+                enc,
+                lora.as_ref(),
+                layer,
+                LoraTarget::FfnGate,
+                &self.prefill_normed_buf,
+                &self.prefill_gate_buf,
+                n,
+            );
+            self.encode_lora_hook_batched(
+                enc,
+                lora.as_ref(),
+                layer,
+                LoraTarget::FfnUp,
+                &self.prefill_normed_buf,
+                &self.prefill_up_buf,
+                n,
+            );
             // silu_mul (1 dispatch for all N*is contiguous elements)
             {
                 let total = (n * is) as u32;
@@ -4051,6 +4226,18 @@ impl MetalLfm2Model {
                     );
                 }
             }
+            // LoRA ffn-down delta into normed_buf, BEFORE the next layer's fused
+            // residual add (or the final `scaled_add_inplace`) scales it by
+            // `scalars.residual`. Input is the silu_mul(gate,up) result in gate_buf.
+            self.encode_lora_hook_batched(
+                enc,
+                lora.as_ref(),
+                layer,
+                LoraTarget::FfnDown,
+                &self.prefill_gate_buf,
+                &self.prefill_normed_buf,
+                n,
+            );
         }
 
         // Add last layer's FFN down residual (in normed_buf) to batch_buf.
