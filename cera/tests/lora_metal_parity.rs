@@ -8,8 +8,10 @@
 //!     bar — the same methodology as `hidden_states_parity.rs`). A wrong B
 //!     pre-scale, transposed A/B, or a dropped hook collapses cosine well below
 //!     0.99 on the first token.
-//!  2. **No-op** — a `B = 0` adapter leaves the Metal output **bit-identical** to
-//!     the base (no-adapter) Metal output. This proves the hook fires without
+//!  2. **No-op** — a `B = 0` adapter leaves the Metal output equal to the base
+//!     (no-adapter) Metal output within a tight `1e-3` tolerance (in practice the
+//!     delta is exactly `0.0`, since Metal `hidden_states` is run-to-run
+//!     deterministic on this model). This proves the hook fires without
 //!     perturbing anything (a `+= 0.0` that flipped a sign or reordered accum
 //!     would show up here).
 //!

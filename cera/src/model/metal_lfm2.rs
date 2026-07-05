@@ -92,7 +92,14 @@ impl MetalLoraAdapter {
     /// `scale` into `B` as it goes. Adapters are tiny (rank ≤ ~64), so the f32
     /// copy through `upload_f32` is negligible; a no-copy upload is a possible
     /// perf follow-up.
-    fn upload(ctx: &MetalContext, w: &LoraAdapterWeights) -> Self {
+    ///
+    /// `residual_mult` is the model's residual multiplier (`scalars.residual`,
+    /// 1.0 for all archs except Granite). The base attn-output / ffn-down
+    /// projections feed `encode_residual_proj`, which scales their result by
+    /// `residual_mult` before the residual add — so those two targets' LoRA delta
+    /// must carry the same factor (folded into `B` here). The other five targets
+    /// don't feed the residual add, so they use `scale` alone.
+    fn upload(ctx: &MetalContext, w: &LoraAdapterWeights, residual_mult: f32) -> Self {
         let mut layers = Vec::with_capacity(w.n_layers());
         for layer in 0..w.n_layers() {
             let mut targets: [Option<MetalLoraTarget>; 7] = Default::default();
@@ -103,8 +110,15 @@ impl MetalLoraAdapter {
                 let rank = t.rank as u32;
                 let k = t.k as u32;
                 let d = t.d as u32;
-                // Fold scale into B at upload → no runtime scale dispatch.
-                let b_scaled_data: Vec<f32> = t.b.iter().map(|&x| x * t.scale).collect();
+                // Fold scale into B at upload → no runtime scale dispatch. For the
+                // residual-fed targets, also fold `residual_mult` (matches the
+                // base projection's `encode_residual_proj` scaling; no-op unless
+                // Granite).
+                let b_factor = match target {
+                    LoraTarget::AttnOutput | LoraTarget::FfnDown => t.scale * residual_mult,
+                    _ => t.scale,
+                };
+                let b_scaled_data: Vec<f32> = t.b.iter().map(|&x| x * b_factor).collect();
                 targets[target.index()] = Some(MetalLoraTarget {
                     a: ctx.upload_f32(&t.a),
                     b_scaled: ctx.upload_f32(&b_scaled_data),
@@ -966,13 +980,18 @@ impl MetalLfm2Model {
         let resolved = state.lora.as_ref().map(|adapter| {
             let mut lru = self.lora_lru.lock().expect("lora_lru poisoned");
             if let Some(pos) = lru.iter().position(|(cpu, _)| Arc::ptr_eq(cpu, adapter)) {
-                // Hit: move to front (end = most-recently-used).
+                // Hit: mark most-recently-used by moving the entry to the end
+                // (the vec is ordered least- → most-recently-used).
                 let (cpu, gpu) = lru.remove(pos);
                 lru.push((cpu, gpu.clone()));
                 gpu
             } else {
                 // Miss: upload, insert, evict the least-recently-used if over cap.
-                let gpu = Arc::new(MetalLoraAdapter::upload(&self.ctx, adapter));
+                let gpu = Arc::new(MetalLoraAdapter::upload(
+                    &self.ctx,
+                    adapter,
+                    self.scalars.residual,
+                ));
                 lru.push((adapter.clone(), gpu.clone()));
                 if lru.len() > 3 {
                     lru.remove(0);
