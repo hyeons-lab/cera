@@ -20,7 +20,7 @@
 //!      sum is NOT gated: it sums ~10^5 partially-cancelling logits, so its
 //!      relative diff is both noisy (Q8_0 accumulation doesn't average out) and
 //!      insensitive (a wrong rope convention barely moves it) — reported as info.
-//!   • greedy continuation (informational) — cera's `--temp 0` argmax decode vs
+//!      • greedy continuation (informational) — cera's `--temp 0` argmax decode vs
 //!      llama.cpp's greedy text, reported MATCH / DIVERGES but never gated:
 //!      greedy decode flips at near-tied logits, and Q8_0 noise tips those ties
 //!      into a different-but-coherent continuation that is not a bug.

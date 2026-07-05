@@ -229,7 +229,7 @@ fn multi_frame_stability() {
     // 8 frames = 48 tokens → wraps the SWA window (30) 1.6 times
     let all_codes: Vec<[i32; 8]> = (0..8)
         .map(|i| {
-            let base = (i * 100 + 50) as i32;
+            let base = i * 100 + 50;
             [
                 base,
                 base + 100,

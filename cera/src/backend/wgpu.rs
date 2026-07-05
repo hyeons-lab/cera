@@ -1255,13 +1255,13 @@ mod tests {
             for qi in 0..tokens {
                 let q_off = qi * dim + h * head_dim;
                 let mut scores = vec![0.0f32; tokens];
-                for ki in 0..tokens {
+                for (ki, si) in scores.iter_mut().enumerate() {
                     let k_off = ki * dim + h * head_dim;
                     let mut s = 0.0f32;
                     for d in 0..head_dim {
                         s += q[q_off + d] * k[k_off + d];
                     }
-                    scores[ki] = s * scale;
+                    *si = s * scale;
                 }
                 crate::backend::cpu::softmax_inplace(&mut scores);
                 for d in 0..head_dim {
@@ -2087,7 +2087,7 @@ mod tests {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups((n + 255) / 256, 1, 1);
+            pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
         }
         ctx.queue.submit(Some(encoder.finish()));
 
@@ -2151,7 +2151,7 @@ mod tests {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups((n + 255) / 256, 1, 1);
+            pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
         }
         ctx.queue.submit(Some(encoder.finish()));
 
@@ -2333,7 +2333,7 @@ mod tests {
 
         // CPU reference: dequant + matmul
         let mut expected = vec![0.0f32; m as usize];
-        for row in 0..m as usize {
+        for (row, exp) in expected.iter_mut().enumerate() {
             for b in 0..nb as usize {
                 let block_off = (row * nb as usize + b) * 18;
                 let d_bits = u16::from_le_bytes([q4_bytes[block_off], q4_bytes[block_off + 1]]);
@@ -2342,8 +2342,8 @@ mod tests {
                     let byte = q4_bytes[block_off + 2 + qi];
                     let lo = (byte & 0xF) as f32 - 8.0;
                     let hi = ((byte >> 4) & 0xF) as f32 - 8.0;
-                    expected[row] += lo * delta * x[b * 32 + qi];
-                    expected[row] += hi * delta * x[b * 32 + qi + 16];
+                    *exp += lo * delta * x[b * 32 + qi];
+                    *exp += hi * delta * x[b * 32 + qi + 16];
                 }
             }
         }
@@ -2421,7 +2421,7 @@ mod tests {
         let mut expected = vec![0.0f32; m as usize];
         let x: Vec<f32> = (0..k).map(|i| (i as f32 - 17.0) * 0.03125).collect();
 
-        for row in 0..m as usize {
+        for (row, exp) in expected.iter_mut().enumerate() {
             for b in 0..nb as usize {
                 let start = row * k as usize + b * 32;
                 let block = &weights_f32[start..start + 32];
@@ -2434,7 +2434,7 @@ mod tests {
                 for (qi, &value) in block.iter().enumerate() {
                     let quant = (value * id).round().clamp(-127.0, 127.0) as i8;
                     q8_bytes.push(quant as u8);
-                    expected[row] += f32::from(quant) * d_f16.to_f32() * x[b * 32 + qi];
+                    *exp += f32::from(quant) * d_f16.to_f32() * x[b * 32 + qi];
                 }
             }
         }
@@ -2745,15 +2745,13 @@ mod tests {
             ctx.queue.submit(Some(enc.finish()));
 
             let result = ctx.download_f32(&y_buf, m as usize);
-            for i in 0..m as usize {
-                let diff = (case.expected[i] - result[i]).abs();
+            for (i, (&exp, &got)) in case.expected.iter().zip(&result).enumerate() {
+                let diff = (exp - got).abs();
                 assert!(
                     diff < case.tolerance,
-                    "{:?} {} GEMV mismatch at row {i}: cpu={}, gpu={}, diff={diff}",
+                    "{:?} {} GEMV mismatch at row {i}: cpu={exp}, gpu={got}, diff={diff}",
                     case.dtype,
                     case.name,
-                    case.expected[i],
-                    result[i]
                 );
             }
         }
@@ -3594,7 +3592,7 @@ mod tests {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(((hs + 255) / 256) as u32, 1, 1);
+            pass.dispatch_workgroups(hs.div_ceil(256) as u32, 1, 1);
         }
         ctx.queue.submit(Some(enc.finish()));
 
@@ -3741,7 +3739,7 @@ mod tests {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(((hs + 255) / 256) as u32, 1, 1);
+            pass.dispatch_workgroups(hs.div_ceil(256) as u32, 1, 1);
         }
         ctx.queue.submit(Some(enc.finish()));
 

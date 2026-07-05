@@ -1169,6 +1169,10 @@ pub(crate) mod neon {
     }
 
     /// Baseline-NEON Q4_0 × Q8_0 GEMM using the emulated integer dot.
+    // Dispatch target of `gemm_q4_0_q8_0_neon`, whose only non-test consumer is
+    // `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
+    // --all-features (blas on), live under the default CI gate.
+    #[allow(dead_code)]
     #[target_feature(enable = "neon")]
     unsafe fn gemm_q4_0_q8_0_neon_base(
         a_quant: &[u8],
@@ -1213,6 +1217,10 @@ pub(crate) mod neon {
     }
 
     /// Baseline-NEON Q8_0 × Q8_0 GEMM using the emulated integer dot.
+    // Dispatch target of `gemm_q8_0_q8_0_neon`, whose only non-test consumer is
+    // `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
+    // --all-features (blas on), live under the default CI gate.
+    #[allow(dead_code)]
     #[target_feature(enable = "neon")]
     unsafe fn gemm_q8_0_q8_0_neon_base(
         a_quant: &[u8],
@@ -1340,6 +1348,10 @@ pub(crate) mod neon {
     // `CERA_REQUIRE_SIMD=i8mm` so a missing feature fails rather than skips.
 
     /// Scalar single-output Q8_0 GEMM dot, for odd row/col remainders.
+    // Remainder helper for the i8mm/neon Q8_0 kernels, reachable (non-test) only
+    // via `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
+    // --all-features (blas on), live under the default CI gate.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     fn gemm_q8_0_scalar_dot(
         a_quant: &[u8],
@@ -1372,6 +1384,10 @@ pub(crate) mod neon {
 
     /// i8mm Q8_0 × Q8_0 GEMM. Processes 2×2 output tiles with `vmmlaq_s32`,
     /// parallelized across row-pairs; odd row/col remainders use the scalar dot.
+    // i8mm dispatch target of `gemm_q8_0_q8_0_neon`, whose only non-test consumer
+    // is `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
+    // --all-features (blas on), live under the default CI gate.
+    #[allow(dead_code)]
     #[target_feature(enable = "neon,i8mm")]
     unsafe fn gemm_q8_0_q8_0_neon_i8mm(
         a_quant: &[u8],
@@ -1482,6 +1498,10 @@ pub(crate) mod neon {
     }
 
     /// Q4_0 × Q8_0 GEMM dispatcher.
+    // Only non-test consumer is `transformer::gemm_preq`, gated
+    // `not(feature = "blas")`; dead under --all-features (blas on), live under
+    // the default CI gate.
+    #[allow(dead_code)]
     pub unsafe fn gemm_q4_0_q8_0_neon(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -1500,6 +1520,10 @@ pub(crate) mod neon {
 
     /// Q8_0 × Q8_0 GEMM dispatcher. Prefers i8mm (`vmmlaq_s32`) when the tier is
     /// resolved to it, else dotprod, else the emulated-integer base.
+    // Only non-test consumer is `transformer::gemm_preq`, gated
+    // `not(feature = "blas")`; dead under --all-features (blas on), live under
+    // the default CI gate.
+    #[allow(dead_code)]
     pub unsafe fn gemm_q8_0_q8_0_neon(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -2212,8 +2236,8 @@ mod tests {
             d: f16::from_f32(0.5).to_bits(),
             qs: {
                 let mut q = [0u8; 16];
-                for i in 0..16 {
-                    q[i] = ((i % 13) as u8) | (((i % 7) as u8) << 4);
+                for (i, qi) in q.iter_mut().enumerate() {
+                    *qi = ((i % 13) as u8) | (((i % 7) as u8) << 4);
                 }
                 q
             },
@@ -2235,8 +2259,8 @@ mod tests {
             delta: f16::from_f32(0.3).to_bits(),
             quants: {
                 let mut q = [0i8; 32];
-                for i in 0..32 {
-                    q[i] = (i as i8) * 3 - 48;
+                for (i, qi) in q.iter_mut().enumerate() {
+                    *qi = (i as i8) * 3 - 48;
                 }
                 q
             },

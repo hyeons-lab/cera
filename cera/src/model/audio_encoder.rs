@@ -2435,11 +2435,11 @@ mod tests {
 
     /// End-to-end smoke test wiring conv stem + 1 Conformer block
     /// + MLP adapter. Verifies the orchestration runs without
-    /// panicking and produces finite output of the expected shape
-    /// `[t_out × llm_hidden_size]`. Per-piece correctness is
-    /// covered by the dedicated tests above; this catches wiring
-    /// bugs (mismatched scratch sizes, missing residual, wrong
-    /// loop bounds) in the orchestration layer.
+    ///   panicking and produces finite output of the expected shape
+    ///   `[t_out × llm_hidden_size]`. Per-piece correctness is
+    ///   covered by the dedicated tests above; this catches wiring
+    ///   bugs (mismatched scratch sizes, missing residual, wrong
+    ///   loop bounds) in the orchestration layer.
     #[test]
     fn audio_encoder_forward_smoke() {
         let n_embd = 4;

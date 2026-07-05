@@ -39,12 +39,12 @@ fn synth_adapter(
 ) -> Arc<LoraAdapterWeights> {
     let mut data: Vec<u8> = Vec::new();
     let mut header = serde_json::Map::new();
-    let mut push = |header: &mut serde_json::Map<String, serde_json::Value>,
-                    data: &mut Vec<u8>,
-                    name: &str,
-                    rows: usize,
-                    cols: usize,
-                    fill: f32| {
+    let push = |header: &mut serde_json::Map<String, serde_json::Value>,
+                data: &mut Vec<u8>,
+                name: &str,
+                rows: usize,
+                cols: usize,
+                fill: f32| {
         let begin = data.len();
         for _ in 0..rows * cols {
             data.extend_from_slice(&fill.to_le_bytes());

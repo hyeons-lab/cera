@@ -515,8 +515,8 @@ mod tests {
     fn test_dequantize_q4_0_varied() {
         // lo nibbles: 0..16, hi nibbles: all 15
         let mut qs = [0u8; 16];
-        for i in 0..16 {
-            qs[i] = (i as u8) | (15 << 4);
+        for (i, qsi) in qs.iter_mut().enumerate() {
+            *qsi = (i as u8) | (15 << 4);
         }
         let block = BlockQ4_0 {
             d: f16::from_f32(0.5).to_bits(),
@@ -525,29 +525,24 @@ mod tests {
         let out = dequantize_q4_0_block(&block);
 
         // First 16: (i - 8) * 0.5
-        for i in 0..16 {
+        for (i, &v) in out.iter().enumerate().take(16) {
             let expected = (i as f32 - 8.0) * 0.5;
             assert!(
-                (out[i] - expected).abs() < 1e-3,
-                "lo[{i}]: got {}, expected {expected}",
-                out[i]
+                (v - expected).abs() < 1e-3,
+                "lo[{i}]: got {v}, expected {expected}"
             );
         }
         // Last 16: (15 - 8) * 0.5 = 3.5
-        for i in 16..32 {
-            assert!(
-                (out[i] - 3.5).abs() < 1e-3,
-                "hi[{i}]: got {}, expected 3.5",
-                out[i]
-            );
+        for (i, &v) in out.iter().enumerate().skip(16) {
+            assert!((v - 3.5).abs() < 1e-3, "hi[{i}]: got {v}, expected 3.5");
         }
     }
 
     #[test]
     fn test_vec_dot_q4_0_matches_dequantize() {
         let mut qs = [0u8; 16];
-        for i in 0..16 {
-            qs[i] = ((i % 13) as u8) | (((i % 7) as u8) << 4);
+        for (i, qsi) in qs.iter_mut().enumerate() {
+            *qsi = ((i % 13) as u8) | (((i % 7) as u8) << 4);
         }
         let block = BlockQ4_0 {
             d: f16::from_f32(0.3).to_bits(),
@@ -569,18 +564,17 @@ mod tests {
     fn test_dequantize_q8_0_simple() {
         let block = make_q8_0_block(0.5, {
             let mut q = [0i8; 32];
-            for i in 0..32 {
-                q[i] = i as i8;
+            for (i, qi) in q.iter_mut().enumerate() {
+                *qi = i as i8;
             }
             q
         });
         let out = dequantize_q8_0_block(&block);
-        for i in 0..32 {
+        for (i, &v) in out.iter().enumerate() {
             let expected = i as f32 * 0.5;
             assert!(
-                (out[i] - expected).abs() < 1e-3,
-                "mismatch at {i}: got {}, expected {expected}",
-                out[i]
+                (v - expected).abs() < 1e-3,
+                "mismatch at {i}: got {v}, expected {expected}"
             );
         }
     }
@@ -590,8 +584,8 @@ mod tests {
         // Two blocks
         let block1 = make_q8_0_block(1.0, {
             let mut q = [0i8; 32];
-            for i in 0..32 {
-                q[i] = (i as i8) - 16;
+            for (i, qi) in q.iter_mut().enumerate() {
+                *qi = (i as i8) - 16;
             }
             q
         });
@@ -611,12 +605,11 @@ mod tests {
         dequantize_q8_0_row(&src, &mut dst);
 
         // Check block1 values
-        for i in 0..32 {
+        for (i, &v) in dst.iter().enumerate().take(32) {
             let expected = (i as f32 - 16.0) * 1.0;
             assert!(
-                (dst[i] - expected).abs() < 1e-3,
-                "block1[{i}]: got {}, expected {expected}",
-                dst[i]
+                (v - expected).abs() < 1e-3,
+                "block1[{i}]: got {v}, expected {expected}"
             );
         }
         // Check block2 values
@@ -722,8 +715,8 @@ mod tests {
     fn test_vec_dot_q8_0() {
         let block = make_q8_0_block(0.1, {
             let mut q = [0i8; 32];
-            for i in 0..32 {
-                q[i] = (i as i8) * 2 - 31;
+            for (i, qi) in q.iter_mut().enumerate() {
+                *qi = (i as i8) * 2 - 31;
             }
             q
         });

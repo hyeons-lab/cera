@@ -921,8 +921,8 @@ fn test_q8_0_gemm_standalone() {
         params.as_ptr() as *const _,
     );
     enc.set_threadgroup_memory_length(0, 8192);
-    let tg_rows = (m + 63) / 64;
-    let tg_cols = (n + 31) / 32;
+    let tg_rows = m.div_ceil(64);
+    let tg_cols = n.div_ceil(32);
     enc.dispatch_thread_groups(
         metal::MTLSize {
             width: tg_cols as u64,

@@ -1,7 +1,7 @@
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
-/// Standalone test: run ONLY depthformer layer 0 with a known input and dump
-/// intermediates + final output for comparison with ggml reference values.
+//! Standalone test: run ONLY depthformer layer 0 with a known input and dump
+//! intermediates + final output for comparison with ggml reference values.
 
 fn load_f32_bin(path: &str) -> Vec<f32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));

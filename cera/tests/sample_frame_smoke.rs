@@ -23,7 +23,7 @@ fn sample_audio_frame_smoke() {
     // Verify: 8 codes, each in [0, 2049).
     assert_eq!(codes.len(), 8);
     for (j, &c) in codes.iter().enumerate() {
-        assert!(c >= 0 && c < 2049, "code {j} = {c} out of range");
+        assert!((0..2049).contains(&c), "code {j} = {c} out of range");
     }
 
     // Embed codes back.
