@@ -485,7 +485,9 @@ pub fn apply_prefill(
 ) {
     debug_assert_eq!(x.len(), t.k * n);
     debug_assert_eq!(y.len(), t.d * n);
-    if t.scale == 0.0 {
+    // Nothing to apply for zero columns; also guards `chunks_exact_mut(0)`, which
+    // panics (this is a `pub` helper, so a caller could pass n == 0).
+    if n == 0 || t.scale == 0.0 {
         return;
     }
     // Tmp[rank × n] = scale · (A · X).  A is [rank × k] row-major.
