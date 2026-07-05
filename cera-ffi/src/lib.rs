@@ -1163,15 +1163,24 @@ impl Session {
     }
 }
 
-/// Flatten `f32`s into a little-endian byte buffer (`4 * len` bytes). Explicit
-/// LE (not a native-endian `bytemuck` cast) so the wire format is stable across
-/// host architectures; callers reinterpret 4-byte groups as `f32`.
+/// Flatten `f32`s into a little-endian byte buffer (`4 * len` bytes) so the wire
+/// format is stable across host architectures; callers reinterpret 4-byte groups
+/// as `f32`. On little-endian hosts (every UniFFI target in practice) the
+/// in-memory `f32` bytes already ARE the LE wire format, so a single bulk copy
+/// beats the per-element `to_le_bytes()` loop on the large `[T*D]` payloads.
 fn f32_vec_to_le_bytes(v: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(v.len() * 4);
-    for &x in v {
-        bytes.extend_from_slice(&x.to_le_bytes());
+    #[cfg(target_endian = "little")]
+    {
+        bytemuck::cast_slice::<f32, u8>(v).to_vec()
     }
-    bytes
+    #[cfg(target_endian = "big")]
+    {
+        let mut bytes = Vec::with_capacity(v.len() * 4);
+        for &x in v {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        bytes
+    }
 }
 
 #[uniffi::export]

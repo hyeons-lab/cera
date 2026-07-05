@@ -54,6 +54,9 @@ uniffi = { workspace = true, features = ["tokio"] }
 # `FfiError` derives `thiserror::Error` so `CeraError` messages can
 # flow through the FFI boundary unchanged. Already a workspace dep.
 thiserror.workspace = true
+# Bulk little-endian reinterpret of `&[f32]` → bytes in `f32_vec_to_le_bytes`
+# (hidden-states payloads) on LE hosts — one copy instead of per-element.
+bytemuck.workspace = true
 # Async runtime for `#[uniffi::export(async_runtime = "tokio")]`.
 # `rt` for the runtime core, `rt-multi-thread` so `spawn_blocking`
 # dispatches decode work onto a dedicated blocking worker thread
