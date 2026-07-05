@@ -32,6 +32,10 @@ const MAX_PREFILL_TOKENS: usize = 512;
 // source of truth here means dispatch geometry can never drift out of
 // sync with the kernel.
 const MUL_MAT_TILE_WG_M: u32 = 8;
+
+/// Rows emitted per workgroup by `gemv_f32` / `gemv_f32_accum` — MUST match the
+/// `NR` constant in `gemv_f32.wgsl`. Used to size the LoRA dispatch grids.
+const GEMV_F32_ROWS_PER_WG: u32 = 8;
 const MUL_MAT_TILE_WG_N: u32 = 32;
 const MUL_MAT_TILE_M: u32 = 4;
 const MUL_MAT_TILE_N: u32 = 1;
@@ -1164,8 +1168,9 @@ impl GpuLfm2Model {
         bg_a: &wgpu::BindGroup,
         bg_b: &wgpu::BindGroup,
     ) {
-        // tmp = A·x — m = rank rows (8 rows per workgroup, matching NR).
-        let a_groups = t.rank.div_ceil(8);
+        // tmp = A·x — m = rank rows. `gemv_f32`/`gemv_f32_accum` each emit `NR`
+        // rows per workgroup, so the group count is `rows / NR`.
+        let a_groups = t.rank.div_ceil(GEMV_F32_ROWS_PER_WG);
         self.dispatch_into(
             pass,
             &self.pipelines.gemv_f32,
@@ -1173,7 +1178,7 @@ impl GpuLfm2Model {
             (a_groups.min(65535), a_groups.div_ceil(65535), 1),
         );
         // out += B_scaled·tmp — m = d rows.
-        let b_groups = t.d.div_ceil(8);
+        let b_groups = t.d.div_ceil(GEMV_F32_ROWS_PER_WG);
         self.dispatch_into(
             pass,
             &self.pipelines.gemv_f32_accum,
@@ -3963,9 +3968,10 @@ impl Model for GpuLfm2Model {
     /// drives `seq_len` from 0, so it's a fresh-context extraction on scratch KV
     /// that never touches the generation caches — the GPU analog of the CPU
     /// path's separate scratch state. Reads back the in-place post-`output_norm`
-    /// `hidden_buf`; the logits it also computes are ignored. `_state` is unused
-    /// (wgpu keeps KV on the model). A drop-guard restores the generation
-    /// `seq_len` and clears the flag on any exit, including a mid-run panic.
+    /// `hidden_buf`; the logits it also computes are ignored. `state` is read
+    /// only to stage the active LoRA adapter (wgpu keeps KV on the model, not in
+    /// `state`). A drop-guard restores the generation `seq_len` and clears the
+    /// flag on any exit, including a mid-run panic.
     ///
     /// Like [`Self::forward`], this is the **synchronous** native path: it blocks
     /// on `download_f32` per token. The browser/WASM GPU path is the async

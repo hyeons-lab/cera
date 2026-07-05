@@ -10,8 +10,9 @@
 //!     0.99 on the first token.
 //!  2. **No-op** — a `B = 0` adapter leaves the wgpu output equal to the base
 //!     (no-adapter) wgpu output within a tight `1e-3` tolerance (in practice the
-//!     delta is exactly `0.0`, since the zero delta is skipped at upload). This
-//!     proves the hook fires without perturbing anything.
+//!     delta is exactly `0.0`). The adapter buffers are still uploaded and the
+//!     hooks still dispatch; the delta `B·(A·x)` is just identically zero because
+//!     `B = 0`. This proves the hook fires without perturbing anything.
 //!
 //! Gated behind `CERA_LORA_WGPU_PARITY=1` + a plain LFM2 GGUF via
 //! `CERA_LFM2_MODEL`, `#[ignore]`, `gpu` feature only. Run:
@@ -204,8 +205,9 @@ fn wgpu_lora_matches_cpu_and_noop() {
     );
 
     // ── (2) no-op: a B = 0 adapter must not perturb the output beyond the GPU
-    // reproducibility noise floor. The zero delta is skipped at upload, so this
-    // is the base pipeline plus only ULP-level cross-run noise. ──
+    // reproducibility noise floor. The buffers upload and the hooks dispatch, but
+    // `B·(A·x)` is identically zero (B = 0), so this is the base pipeline plus
+    // only ULP-level cross-run noise. ──
     let zero_b = synth_adapter(attn_layer, hs, &[q, g], 4, 0.3, 0.0, 8.0);
     let gpu_zero = run(gpu.as_ref(), &tokens, Some(zero_b));
     let noop_delta = max_abs_diff(&gpu_zero, &gpu_base);
