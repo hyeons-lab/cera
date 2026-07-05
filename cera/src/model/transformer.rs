@@ -406,6 +406,10 @@ pub(crate) fn forward_attn_block(
     // models, but Qwen3 decouples head_dim so q_dim can exceed it.
     let q_dim = n_heads * head_dim;
 
+    // Cloned once (cheap Arc bump) so the base-weight scratch buffers can stay
+    // mutably borrowed while we read the adapter (a disjoint field).
+    let lora = state.lora.clone();
+
     let q = &mut state.scratch.q[..q_dim];
     let k = &mut state.scratch.k[..kv_dim];
     let v = &mut state.scratch.v[..kv_dim];
@@ -451,6 +455,12 @@ pub(crate) fn forward_attn_block(
         cpu::add_inplace(q, q_bias);
         cpu::add_inplace(k, k_bias);
         cpu::add_inplace(v, v_bias);
+    }
+
+    // LoRA: add `scale·B·(A·hidden)` to each of Q/K/V (input is the normed
+    // hidden; the delta is applied before RoPE, matching the base projection).
+    if let Some(lora) = &lora {
+        crate::lora::apply_attn_qkv(lora, layer, hidden, q, k, v, &mut state.scratch.lora_tmp);
     }
 
     // Qwen3 per-head QK norm: RMSNorm each head slice with shared weights,
@@ -554,6 +564,17 @@ pub(crate) fn forward_attn_block(
         &state.scratch.attn_out[..q_dim],
         out,
     );
+    // LoRA on the output projection (input is the attention output).
+    if let Some(lora) = &lora
+        && let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnOutput)
+    {
+        crate::lora::apply_decode(
+            t,
+            &state.scratch.attn_out[..q_dim],
+            out,
+            &mut state.scratch.lora_tmp,
+        );
+    }
 }
 
 /// Pre-resolved FFN weight refs for a transformer layer.
@@ -568,12 +589,14 @@ pub(crate) struct FfnWeights<'a> {
 /// into `state.scratch.out[..hidden_size]`. Identical to LFM2's FFN.
 pub(crate) fn forward_ffn_block(
     gguf: &GgufFile,
+    layer: usize,
     weights: &FfnWeights,
     hidden_size: usize,
     intermediate_size: usize,
     ffn_input: &[f32],
     state: &mut InferenceState,
 ) {
+    let lora = state.lora.clone();
     #[cfg(target_arch = "aarch64")]
     {
         gemv_preq(
@@ -607,6 +630,27 @@ pub(crate) fn forward_ffn_block(
             ffn_input,
             &mut state.scratch.up[..intermediate_size],
         );
+    }
+
+    // LoRA on gate/up — BEFORE the SwiGLU mul (which reads both), input is the
+    // normed FFN input.
+    if let Some(lora) = &lora {
+        if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
+            crate::lora::apply_decode(
+                t,
+                ffn_input,
+                &mut state.scratch.gate[..intermediate_size],
+                &mut state.scratch.lora_tmp,
+            );
+        }
+        if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
+            crate::lora::apply_decode(
+                t,
+                ffn_input,
+                &mut state.scratch.up[..intermediate_size],
+                &mut state.scratch.lora_tmp,
+            );
+        }
     }
 
     cpu::silu_mul_inplace(
@@ -642,4 +686,16 @@ pub(crate) fn forward_ffn_block(
         &state.scratch.gate[..intermediate_size],
         &mut state.scratch.out[..hidden_size],
     );
+
+    // LoRA on the down projection (input is the SwiGLU product in `gate`).
+    if let Some(lora) = &lora
+        && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnDown)
+    {
+        crate::lora::apply_decode(
+            t,
+            &state.scratch.gate[..intermediate_size],
+            &mut state.scratch.out[..hidden_size],
+            &mut state.scratch.lora_tmp,
+        );
+    }
 }

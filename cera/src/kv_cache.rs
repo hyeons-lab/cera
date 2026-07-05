@@ -109,6 +109,9 @@ pub struct ScratchBuffers {
     /// every subsequent GEMM call within and between forward passes. Stays
     /// empty when the `blas` feature is off — the NEON fallback never touches it.
     pub dequant_weight_scratch: Vec<f32>,
+    /// Scratch for the LoRA down-projection intermediate (`A·x`). Reused across
+    /// apply calls so the LoRA hot path allocates nothing.
+    pub lora_tmp: Vec<f32>,
 }
 
 /// Inference state across all layers.
@@ -116,6 +119,11 @@ pub struct InferenceState {
     pub layers: Vec<LayerState>,
     pub seq_len: usize,
     pub scratch: ScratchBuffers,
+    /// Active LoRA adapter for this pass, if any. The Session copies its
+    /// attached adapter here before each forward; the CPU projection helpers
+    /// read `lora.get(layer, target)` and add `scale·B·(A·x)` after each base
+    /// GEMV. `None` ⇒ base model only.
+    pub lora: Option<std::sync::Arc<crate::lora::LoraAdapterWeights>>,
     /// TurboQuant encode scratch (None when disabled). Owned by InferenceState
     /// rather than Model so the model remains Sync for concurrent inference.
     pub tq_encode_scratch: Option<EncodeScratch>,
@@ -158,11 +166,13 @@ impl InferenceState {
                 q8_scales: Vec::new(),
                 q8_quants: Vec::new(),
                 dequant_weight_scratch: Vec::new(),
+                lora_tmp: Vec::new(),
             },
             tq_encode_scratch: None,
             tq_query_scratch: None,
             tq_rotations: Vec::new(),
             tq_config: None,
+            lora: None,
         }
     }
 
@@ -355,6 +365,7 @@ impl InferenceState {
                 // Grown lazily to max(3*hs*hs, is*hs) on the first BLAS GEMM
                 // call. Stays empty if the `blas` feature is off.
                 dequant_weight_scratch: Vec::new(),
+                lora_tmp: Vec::new(),
             },
             // Scratch is needed whenever either side is compressed. The
             // EncodeScratch `rot` buffer is shared between key and value
@@ -372,6 +383,7 @@ impl InferenceState {
             },
             tq_rotations,
             tq_config,
+            lora: None,
         }
     }
 

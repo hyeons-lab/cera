@@ -186,6 +186,55 @@ impl LoraAdapterWeights {
             .sum()
     }
 
+    /// Verify every target's `(k, d)` matches what `config`'s projections expect,
+    /// so an adapter built for a *different* model is rejected up front with a
+    /// clear error rather than silently truncating (mis-`zip`ing) in the apply
+    /// hot path and corrupting the output. Called at attach time.
+    pub fn validate_dims(&self, config: &crate::model::ModelConfig) -> Result<()> {
+        let n_layers = config
+            .block_types
+            .len()
+            .max(config.kv_heads_per_layer.len());
+        let q_dim = config.n_heads * config.head_dim;
+        for (layer, l) in self.layers.iter().enumerate() {
+            for target in LoraTarget::ALL {
+                let Some(t) = l.targets[target.index()].as_ref() else {
+                    continue;
+                };
+                ensure!(
+                    layer < n_layers,
+                    "LoRA references layer {layer} but the model has {n_layers} layers"
+                );
+                // Per-layer KV width (0 / absent ⇒ fall back to the global count).
+                let kv_heads = config
+                    .kv_heads_per_layer
+                    .get(layer)
+                    .copied()
+                    .filter(|&h| h > 0)
+                    .unwrap_or(config.n_kv_heads);
+                let kv_dim = kv_heads * config.head_dim;
+                let (want_k, want_d) = match target {
+                    LoraTarget::AttnQ => (config.hidden_size, q_dim),
+                    LoraTarget::AttnK | LoraTarget::AttnV => (config.hidden_size, kv_dim),
+                    LoraTarget::AttnOutput => (q_dim, config.hidden_size),
+                    LoraTarget::FfnGate | LoraTarget::FfnUp => {
+                        (config.hidden_size, config.intermediate_size)
+                    }
+                    LoraTarget::FfnDown => (config.intermediate_size, config.hidden_size),
+                };
+                ensure!(
+                    t.k == want_k && t.d == want_d,
+                    "LoRA target {target:?} on layer {layer} has dims (in={}, out={}), \
+                     but the model expects (in={want_k}, out={want_d}) — adapter built for a \
+                     different model?",
+                    t.k,
+                    t.d
+                );
+            }
+        }
+        Ok(())
+    }
+
     // ── GGUF ────────────────────────────────────────────────────────────────
 
     /// Load a llama.cpp-format GGUF adapter (`convert_lora_to_gguf` output) from
@@ -388,6 +437,11 @@ fn parse_peft_lora_name(name: &str) -> Option<(usize, LoraTarget, bool)> {
 pub fn apply_decode(t: &LoraTargetWeights, x: &[f32], y: &mut [f32], tmp: &mut Vec<f32>) {
     debug_assert_eq!(x.len(), t.k);
     debug_assert_eq!(y.len(), t.d);
+    // A zero-scale adapter is a guaranteed no-op — skip the loops (and the
+    // `+= 0.0`, which could otherwise flip a `-0.0` to `+0.0`).
+    if t.scale == 0.0 {
+        return;
+    }
     tmp.clear();
     tmp.resize(t.rank, 0.0);
     // tmp = scale · (A · x)   (A is [rank × k] row-major; fold scale into the
@@ -400,6 +454,30 @@ pub fn apply_decode(t: &LoraTargetWeights, x: &[f32], y: &mut [f32], tmp: &mut V
     for (row, yi) in t.b.chunks_exact(t.rank).zip(y.iter_mut()) {
         let acc: f32 = row.iter().zip(tmp.iter()).map(|(w, &ti)| w * ti).sum();
         *yi += acc;
+    }
+}
+
+/// Apply the Q/K/V attention-projection LoRAs for one layer: `q/k/v` are the
+/// base projection outputs (share input `x`), each gets `+= scale·B·(A·x)` if the
+/// adapter targets it. Shared by both `forward_attn_block` implementations
+/// (dense transformer + LFM2) so the two can't drift out of sync.
+pub fn apply_attn_qkv(
+    lora: &LoraAdapterWeights,
+    layer: usize,
+    x: &[f32],
+    q: &mut [f32],
+    k: &mut [f32],
+    v: &mut [f32],
+    tmp: &mut Vec<f32>,
+) {
+    if let Some(t) = lora.get(layer, LoraTarget::AttnQ) {
+        apply_decode(t, x, q, tmp);
+    }
+    if let Some(t) = lora.get(layer, LoraTarget::AttnK) {
+        apply_decode(t, x, k, tmp);
+    }
+    if let Some(t) = lora.get(layer, LoraTarget::AttnV) {
+        apply_decode(t, x, v, tmp);
     }
 }
 

@@ -214,6 +214,8 @@ pub enum CeraError {
     EmptyInput,
     #[error("token id {id} out of range (vocab_size {vocab_size})")]
     InvalidToken { id: u32, vocab_size: u32 },
+    #[error("LoRA adapter incompatible with this model: {0}")]
+    LoraDimMismatch(String),
     #[error("backend: {0}")]
     Backend(String),
     #[error("io: {0}")]
@@ -369,6 +371,12 @@ pub struct Session {
     /// was built for (rebuild when a longer prompt arrives).
     hs_scratch: Option<InferenceState>,
     hs_scratch_cap: usize,
+    /// Attached LoRA adapter, applied to every forward pass on this session
+    /// (generation + hidden-states). `None` ⇒ base model. Set via
+    /// [`Self::attach_lora_adapters`]; copied onto `state.lora` (and the
+    /// hidden-states scratch) so the CPU projection helpers pick it up.
+    /// Preserved across [`Self::reset`], like the vision/audio encoders.
+    lora: Option<Arc<crate::lora::LoraAdapterWeights>>,
 }
 
 impl Session {
@@ -466,6 +474,7 @@ impl Session {
             grammar_mask: None,
             hs_scratch: None,
             hs_scratch_cap: 0,
+            lora: None,
         }
     }
 
@@ -515,6 +524,42 @@ impl Session {
         encoder: Arc<dyn crate::model::vision_encoder_gpu::VisionGpuEncode>,
     ) {
         self.gpu_vision_encoder = Some(encoder);
+    }
+
+    /// Attach a LoRA adapter (from [`crate::lora::LoraAdapterWeights`]). It's
+    /// applied to every subsequent forward pass — generation **and**
+    /// hidden-states extraction — until replaced or removed. Replaces any prior
+    /// adapter (hot-swap) and is preserved across [`Self::reset`]. Load the
+    /// adapter once and share the `Arc` across sessions.
+    ///
+    /// The adapter's dimensions are validated against the model up front, so an
+    /// adapter built for a different model is rejected with
+    /// [`CeraError::LoraDimMismatch`] rather than silently corrupting output.
+    ///
+    /// Note: this only affects tokens processed **after** the call — it does not
+    /// retroactively re-adapt KV already in the cache. Attach before prefilling
+    /// the context you want adapted (or [`Self::reset`] first).
+    pub fn attach_lora_adapters(
+        &mut self,
+        adapters: Arc<crate::lora::LoraAdapterWeights>,
+    ) -> Result<(), CeraError> {
+        adapters
+            .validate_dims(self.model.config())
+            .map_err(|e| CeraError::LoraDimMismatch(e.to_string()))?;
+        self.lora = Some(adapters);
+        self.state.lora = self.lora.clone();
+        Ok(())
+    }
+
+    /// Remove any attached LoRA adapter, returning to base-model inference.
+    pub fn remove_lora_adapters(&mut self) {
+        self.lora = None;
+        self.state.lora = None;
+    }
+
+    /// Whether a LoRA adapter is currently attached.
+    pub fn has_lora_adapters(&self) -> bool {
+        self.lora.is_some()
     }
 
     /// Set the session-default cap on the longest side of an appended
@@ -582,6 +627,8 @@ impl Session {
         let model_cfg = self.model.config();
         self.state =
             InferenceState::from_config_with_compression(model_cfg, &self.config.kv_compression);
+        // Re-apply the attached adapter to the rebuilt state (preserved across reset).
+        self.state.lora = self.lora.clone();
         self.current_pos = 0;
         self.position_atomic.store(0, Ordering::Relaxed);
         self.last_logits = None;
@@ -669,6 +716,9 @@ impl Session {
         if !rebuild {
             state.clear_for_reuse();
         }
+        // Reflect the attached adapter in the extraction (the coordination point:
+        // the CPU per-token path applies it via the decode hooks).
+        state.lora = self.lora.clone();
         Ok(model.hidden_states(tokens, state))
     }
 

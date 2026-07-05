@@ -554,6 +554,10 @@ impl Lfm2Model {
         let n_kv_heads = cfg.kv_heads_per_layer[layer];
         let kv_dim = n_kv_heads * head_dim;
 
+        // Cloned once (cheap Arc bump) so the base scratch buffers can stay
+        // mutably borrowed while the adapter (a disjoint field) is read.
+        let lora = state.lora.clone();
+
         // Q, K, V projections using pre-quantized hidden state
         let q = &mut state.scratch.q[..cfg.hidden_size];
         let k = &mut state.scratch.k[..kv_dim];
@@ -589,6 +593,11 @@ impl Lfm2Model {
             self.gemv(refs.attn_q.as_ref().unwrap(), hidden, q);
             self.gemv(refs.attn_k.as_ref().unwrap(), hidden, k);
             self.gemv(refs.attn_v.as_ref().unwrap(), hidden, v);
+        }
+
+        // LoRA on Q/K/V — input is the normed hidden, applied before QK-norm/RoPE.
+        if let Some(lora) = &lora {
+            crate::lora::apply_attn_qkv(lora, layer, hidden, q, k, v, &mut state.scratch.lora_tmp);
         }
 
         // Per-head QK norm (RMSnorm each head slice with shared weights)
@@ -825,6 +834,17 @@ impl Lfm2Model {
             &state.scratch.attn_out[..cfg.hidden_size],
             out,
         );
+        // LoRA on the output projection (input = the attention output).
+        if let Some(lora) = &lora
+            && let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnOutput)
+        {
+            crate::lora::apply_decode(
+                t,
+                &state.scratch.attn_out[..cfg.hidden_size],
+                out,
+                &mut state.scratch.lora_tmp,
+            );
+        }
     }
     /// Run all layers + output norm on a hidden state vector. Shared by
     /// forward(), forward_embedding(), and forward_hidden_from_embedding().
@@ -872,6 +892,7 @@ impl Lfm2Model {
             };
             transformer::forward_ffn_block(
                 &self.gguf,
+                i,
                 &ffn_weights,
                 hs,
                 cfg.intermediate_size,
@@ -2205,6 +2226,19 @@ impl Model for Lfm2Model {
             "forward_prefill requires at least one token"
         );
 
+        // With a LoRA active, run the prompt per-token through `forward`
+        // (→ `run_layers` → the hooked `forward_attn_block`/`forward_ffn_block`)
+        // so the adapter is applied to every token. The batched `forward_prefill_inner`
+        // path doesn't apply LoRA yet (batched-GEMM LoRA is a perf follow-up).
+        // Bypassing the prefix cache here is correct: cached KV is base-model-only.
+        if state.lora.is_some() {
+            let mut logits = Vec::new();
+            for (j, &tok) in tokens.iter().enumerate() {
+                logits = self.forward(&[tok], start_pos + j, state);
+            }
+            return logits;
+        }
+
         // Cache participation gate: only on a fresh prefill
         // (`start_pos == 0`). Continuation prefills (chunked /
         // mid-sequence) carry KV state from the prior chunk so a
@@ -2317,6 +2351,32 @@ impl Model for Lfm2Model {
             n,
             hs
         );
+
+        // With a LoRA active, run frames per-token through `forward_from_embedding`
+        // (→ `run_layers` → the hooked block fns) so the adapter applies to
+        // embedding-input (multimodal) tokens too — otherwise the batched
+        // `prefill_layers_and_logits` below would process them base-model-only,
+        // leaving image/audio spans un-adapted while text spans get the adapter.
+        // Matches the token-path gate in `forward_prefill`.
+        //
+        // `forward_from_embedding` derives its RoPE/KV position from
+        // `state.seq_len` (it ignores the passed `pos`), so frames land at
+        // seq_len, seq_len+1, … — correct exactly when `start_pos == seq_len`,
+        // which the prefill flow guarantees (text prefill advances seq_len to
+        // `start_pos` before an embedding span). Assert it so a future caller
+        // that violates the invariant is caught rather than silently mispositioned.
+        if state.lora.is_some() {
+            debug_assert_eq!(
+                start_pos, state.seq_len,
+                "embedding LoRA prefill assumes start_pos == seq_len"
+            );
+            let mut logits = Vec::new();
+            for j in 0..n {
+                let frame = &embeddings[j * hs..(j + 1) * hs];
+                logits = self.forward_from_embedding(frame, start_pos + j, state);
+            }
+            return logits;
+        }
 
         // Transpose row-major embeddings (frame j at [j*hs..(j+1)*hs])
         // into column-major hidden (token j's channel i at [i*n + j]) —
