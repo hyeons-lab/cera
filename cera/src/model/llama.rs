@@ -395,6 +395,7 @@ impl LlamaModel {
             };
             transformer::forward_ffn_block(
                 &self.gguf,
+                i,
                 &ffn_weights,
                 hs,
                 cfg.intermediate_size,
@@ -1108,8 +1109,10 @@ impl Model for LlamaModel {
         );
         // Batched-GEMM capture when a batched kernel exists and n > 1; the
         // batched path internally falls back to per-token for non-gemmable dtypes.
+        // With a LoRA active, take the per-token path so the adapter is applied
+        // (batched-GEMM LoRA is a perf follow-up); the decode hooks handle it.
         #[cfg(any(target_arch = "aarch64", feature = "blas"))]
-        if tokens.len() > 1 {
+        if tokens.len() > 1 && state.lora.is_none() {
             let mut out = Vec::new();
             self.forward_prefill_batched(tokens, 0, state, Some(&mut out));
             return out;
@@ -1167,8 +1170,10 @@ impl Model for LlamaModel {
         // path too: the batched path bypasses `run_layers` and so emits none of
         // the per-substep `oracle_dump::record` nodes that `tests/oracle_text.rs`
         // validates against llama.cpp.
+        // A LoRA also forces the per-token path (the batched-GEMM path doesn't
+        // apply the adapter yet); the decode hooks in `run_layers` handle it.
         #[cfg(any(target_arch = "aarch64", feature = "blas"))]
-        if tokens.len() > 1 && !transformer::oracle_dump::is_active() {
+        if tokens.len() > 1 && !transformer::oracle_dump::is_active() && state.lora.is_none() {
             return self.forward_prefill_batched(tokens, start_pos, state, None);
         }
 

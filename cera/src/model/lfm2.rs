@@ -872,6 +872,7 @@ impl Lfm2Model {
             };
             transformer::forward_ffn_block(
                 &self.gguf,
+                i,
                 &ffn_weights,
                 hs,
                 cfg.intermediate_size,
@@ -1026,8 +1027,11 @@ impl Lfm2Model {
             // Operator: conv or attention — batch projections via GEMM, sequential core
             let is_conv = cfg.block_types[layer] == BlockType::GatedConv;
 
+            // A LoRA active forces the per-token fallback for this block so the
+            // adapter is applied via the decode hooks (batched-GEMM LoRA is a
+            // perf follow-up). `&&` short-circuits the batched work when set.
             #[cfg(any(target_arch = "aarch64", feature = "blas"))]
-            let used_block_gemm = {
+            let used_block_gemm = state.lora.is_none() && {
                 let refs = &self.layer_refs[layer];
                 if is_conv {
                     // --- Conv: batch in_proj + out_proj via GEMM ---
