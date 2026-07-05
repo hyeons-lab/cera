@@ -393,9 +393,9 @@ impl CeraEngine {
     /// invalidate any in-flight sessions.
     #[wasm_bindgen(js_name = newSession)]
     pub fn new_session(&self, config: &SessionConfig) -> Session {
-        Session {
-            inner: self.inner.new_session(config.inner.clone()),
-        }
+        let inner = self.inner.new_session(config.inner.clone());
+        let hidden_size = inner.hidden_size() as u32;
+        Session { inner, hidden_size }
     }
 }
 
@@ -1016,6 +1016,12 @@ impl GenerateSummary {
 #[wasm_bindgen]
 pub struct Session {
     inner: cera::Session,
+    /// Model hidden dimension, cached at construction so `hiddenSize()` is a
+    /// plain field read. wasm-bindgen guards each exported method with an
+    /// internal `RefCell` borrow, so an uncached getter called from inside a
+    /// `generate` callback (which holds the `&mut self` borrow) would panic with
+    /// a borrow error; the cached read avoids re-borrowing `self.inner`.
+    hidden_size: u32,
 }
 
 #[wasm_bindgen]
@@ -1035,6 +1041,56 @@ impl Session {
     #[wasm_bindgen(js_name = appendTokens)]
     pub fn append_tokens(&mut self, tokens: &[u32]) -> Result<(), JsError> {
         self.inner.append_tokens(tokens).map_err(map_cera_err)
+    }
+
+    /// Model hidden dimension `D` — reshape a `[T*D]` hidden-states buffer into
+    /// `[T][D]` with this. Reads a cached field (set at construction), so — unlike
+    /// the `&mut self` compute methods — it's safe to call from inside a `generate`
+    /// callback without a wasm-bindgen borrow panic.
+    #[wasm_bindgen(js_name = hiddenSize)]
+    pub fn hidden_size(&self) -> u32 {
+        self.hidden_size
+    }
+
+    /// Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
+    /// `--pooling none` vector) for `tokens`, as a `Float32Array` of length
+    /// `tokens.length * hiddenSize` (row-major; token `t` channel `c` at
+    /// `t*hiddenSize + c`). The wasm boundary copies the buffer into the JS heap
+    /// once. Side-effect-free — does not disturb the generation KV.
+    #[wasm_bindgen(js_name = hiddenStatesForTokens)]
+    pub fn hidden_states_for_tokens(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<js_sys::Float32Array, JsError> {
+        let hs = self
+            .inner
+            .hidden_states_for_tokens(tokens)
+            .map_err(map_cera_err)?;
+        Ok(js_sys::Float32Array::from(hs.as_slice()))
+    }
+
+    /// Tokenize `text` and return its per-token hidden states as a `Float32Array`.
+    #[wasm_bindgen(js_name = hiddenStatesForText)]
+    pub fn hidden_states_for_text(&mut self, text: &str) -> Result<js_sys::Float32Array, JsError> {
+        let hs = self
+            .inner
+            .hidden_states_for_text(text)
+            .map_err(map_cera_err)?;
+        Ok(js_sys::Float32Array::from(hs.as_slice()))
+    }
+
+    /// Mean-pooled hidden state — a single `Float32Array` of length `hiddenSize`
+    /// (the common classifier path: pool in Rust, ship `D` floats not `T*D`).
+    #[wasm_bindgen(js_name = hiddenStatesMeanPooled)]
+    pub fn hidden_states_mean_pooled(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<js_sys::Float32Array, JsError> {
+        let pooled = self
+            .inner
+            .hidden_states_mean_pooled(tokens)
+            .map_err(map_cera_err)?;
+        Ok(js_sys::Float32Array::from(pooled.as_slice()))
     }
 
     /// Append PCM audio samples (mono `f32`, normalized to roughly

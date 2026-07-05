@@ -1072,6 +1072,9 @@ impl LlamaModel {
     fn hidden_states_per_token(&self, tokens: &[u32], state: &mut InferenceState) -> Vec<f32> {
         let hs = self.config.hidden_size;
         let mut out = Vec::with_capacity(tokens.len() * hs);
+        // Reuse one embedding buffer across tokens (`dequantize_row_into`) instead
+        // of allocating a fresh Vec per token.
+        let mut hidden = vec![0.0f32; hs];
         for &token in tokens {
             let token_id = token as usize;
             assert!(
@@ -1079,7 +1082,7 @@ impl LlamaModel {
                 "token_id {token_id} out of range (vocab_size={})",
                 self.config.vocab_size
             );
-            let mut hidden = transformer::dequantize_row(&self.gguf, &self.embd_ref, token_id);
+            transformer::dequantize_row_into(&self.gguf, &self.embd_ref, token_id, &mut hidden);
             if self.config.scalars.embedding != 1.0 {
                 cpu::scale_inplace(&mut hidden, self.config.scalars.embedding);
             }

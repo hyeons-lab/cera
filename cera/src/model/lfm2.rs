@@ -2082,6 +2082,8 @@ impl Model for Lfm2Model {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let mut out = Vec::with_capacity(tokens.len() * hs);
+        // Reuse one embedding buffer across tokens instead of a per-token Vec.
+        let mut hidden = vec![0.0f32; hs];
         for &token in tokens {
             let token_id = token as usize;
             assert!(
@@ -2089,7 +2091,7 @@ impl Model for Lfm2Model {
                 "token_id {token_id} out of range (vocab_size={})",
                 cfg.vocab_size
             );
-            let mut hidden = self.dequantize_row(&self.embd_ref, token_id);
+            self.dequantize_row_into(&self.embd_ref, token_id, &mut hidden);
             // `run_layers` ropes at `pos == seq_len` and appends one cell,
             // bumping seq_len; a cleared state walks positions 0..n.
             let pos = state.seq_len;

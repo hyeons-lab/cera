@@ -212,6 +212,8 @@ pub enum CeraError {
     ContextOverflow { max_seq_len: u32, by: u32 },
     #[error("empty input")]
     EmptyInput,
+    #[error("token id {id} out of range (vocab_size {vocab_size})")]
+    InvalidToken { id: u32, vocab_size: u32 },
     #[error("backend: {0}")]
     Backend(String),
     #[error("io: {0}")]
@@ -610,7 +612,8 @@ impl Session {
     ///
     /// Errors: [`CeraError::EmptyInput`] on empty input;
     /// [`CeraError::UnsupportedModality`] if the backend doesn't implement
-    /// hidden-state extraction (probe via [`Model::supports_hidden_states`]).
+    /// hidden-state extraction (probe via [`Model::supports_hidden_states`]);
+    /// [`CeraError::InvalidToken`] if any id is `>= vocab_size`.
     pub fn hidden_states_for_tokens(&mut self, tokens: &[u32]) -> Result<Vec<f32>, CeraError> {
         if tokens.is_empty() {
             return Err(CeraError::EmptyInput);
@@ -621,15 +624,32 @@ impl Session {
         if !model.supports_hidden_states() {
             return Err(CeraError::UnsupportedModality);
         }
+        // Validate token ids BEFORE dispatch: the model embedding paths
+        // `assert!(id < vocab_size)`, and that panic would unwind through the
+        // held FFI mutex (poisoning the whole Session) or trap wasm. A bad id
+        // (e.g. from a mismatched external tokenizer) must be a typed error.
+        let vocab_size = model.config().vocab_size;
+        if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= vocab_size) {
+            return Err(CeraError::InvalidToken {
+                id: bad,
+                vocab_size: vocab_size as u32,
+            });
+        }
         let n = tokens.len();
         // Reuse the scratch state when it's big enough; else (re)build it sized to
-        // this prompt. Never allocates a full-context KV cache.
+        // this prompt. Store the RAW `n` (not clamped to max_seq_len): otherwise a
+        // prompt longer than max_seq_len would compare `cap < n` true on EVERY
+        // call and rebuild each time. The KV Vec grows once past the capped
+        // reservation and `clear_for_reuse` keeps that capacity. Never allocates a
+        // full-context KV cache up front.
         let rebuild = self.hs_scratch.is_none() || self.hs_scratch_cap < n;
         if rebuild {
-            let cfg = model.config();
-            self.hs_scratch = Some(InferenceState::for_prefill(cfg, n));
-            self.hs_scratch_cap = n.clamp(1, cfg.max_seq_len);
+            self.hs_scratch = Some(InferenceState::for_prefill(model.config(), n));
+            self.hs_scratch_cap = n;
         }
+        // `get_or_insert_with` (over `as_mut().unwrap()`) keeps clippy's
+        // `unnecessary_unwrap` quiet given the `is_none()` in `rebuild` above;
+        // the closure never runs (the slot is `Some` after the rebuild block).
         let state = self
             .hs_scratch
             .get_or_insert_with(|| InferenceState::for_prefill(model.config(), n));
