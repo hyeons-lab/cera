@@ -4,29 +4,33 @@ A Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
 ---
 
-## Implementation Status (updated 2026-06-13)
+## Implementation Status (updated 2026-07-04)
 
 V1 is complete, and the project has since grown well beyond the original
 roadmap into **multimodal** territory (vision, audio, TTS) that this plan never
 anticipated. The status legend below uses ✅ done · 🟡 partial · ⬜ not started.
+Published to crates.io / npm / Maven Central / CLI binaries at **0.2.0**.
 
-**V1 (Phases 0–6):** ✅ pipeline complete, 🟡 Phase 4 architecture coverage
-partial. CPU (SIMD + runtime feature dispatch + BLAS), wgpu GPU backend, Metal
-backend, GGUF parser, BPE tokenizer, sampler, KV cache, generation engine, HF
-bundle download, interactive chat TUI, and bench command are all shipped — the
-end-to-end inference pipeline is done. The one open item is **Phase 4 model
-coverage**: architecture dispatch currently handles `lfm2`, `qwen2`, `qwen3`
-(Qwen runs on the LLaMA code path), but the bare `llama` arch string and the
-Mistral / Gemma / Phi3 variants named in Phase 4 are **not yet wired** — the
-shared code path exists but those arch strings aren't dispatched. GPU (wgpu) and
-Metal forward passes currently support **LFM2 only**; Qwen runs on CPU.
+**V1 (Phases 0–6):** ✅ pipeline complete. CPU (SIMD + runtime feature dispatch
++ BLAS), wgpu GPU backend, Metal backend, GGUF parser, BPE tokenizer, sampler,
+KV cache, generation engine, HF bundle download, interactive chat TUI, and bench
+command are all shipped — the end-to-end inference pipeline is done. **Phase 4
+model coverage** has since expanded: architecture dispatch now handles `lfm2`,
+`qwen2`, `qwen3`, `llama`, and `granite` on the shared LLaMA/transformer code
+path (classic Mistral ships as arch `llama`, so it is covered too). Only the
+`gemma` and `phi3` arch strings named in Phase 4 remain unwired. The dense
+transformers run on **every backend** — CPU, wgpu, and Metal — with decode +
+batched-GEMM prefill and a tiled flash-attention path for long prompts; the
+earlier "GPU is LFM2-only" limitation is gone (see #177/#192/#193/#194/#200).
 
 **Beyond the V1 plan (off-roadmap, shipped):**
-- LFM2-VL **vision** encoder + preprocessor (image → embeddings)
+- LFM2-VL **vision** encoder + preprocessor (image → embeddings), GPU-accelerated
 - LFM2-Audio **audio** encoder/decoder + preprocessor (PCM → embeddings, ASR)
 - **TTS** generation
 - **WASM** build (threaded via wasm-bindgen-rayon + wgpu-on-wasm) — this is V2.2
 - Kotlin Multiplatform FFI (`cera-ffi-kotlin`: android + jvm) — this is V2.14
+- Batched-GEMM **prefill on all backends** (CPU/wgpu/Metal) + GPU-side KV-shift
+- Sampler: `min_p` and `repetition_penalty` (#180)
 
 **V2 status at a glance:**
 
@@ -34,7 +38,7 @@ Metal forward passes currently support **LFM2 only**; Qwen runs on CPU.
 |------|--------|-------|
 | V2.1 Server + continuous batching | ⬜ | no HTTP server, KV cache still contiguous (not paged) |
 | V2.2 Browser / WASM | ✅ | `cera-wasm`, threads, wgpu-on-wasm |
-| V2.3 Structured output (GBNF) | ⬜ | |
+| V2.3 Structured output (GBNF) | ✅ | `cera/src/grammar.rs` — grammar-constrained decoding + bounded rep `{n,m}`, exposed via FFI + WASM; only non-ASCII char-class ranges remain |
 | V2.4 KV cache serialization (.lmkv) | ⬜ | |
 | V2.5 Prefix caching (radix) | ⬜ | |
 | V2.5b TurboQuant KV compression | ✅ | `cera/src/turboquant.rs` |
@@ -50,12 +54,11 @@ Metal forward passes currently support **LFM2 only**; Qwen runs on CPU.
 | V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync + async generate, sync + async streaming, `withProgress` all verified; only `fromBundleIdAsync` stubbed |
 | V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core + FFI + GPU (Metal/wgpu) encode shipped, no slicing |
 | V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
-| V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync engine API verified end-to-end; streaming/async stubbed |
 
-**Tally:** original V2 — 3 done (2.2, 2.5b, 2.14), 2 partial (2.6, 2.17), 11 remaining.
-Plus 2 off-roadmap multimodal tracks shipped (V2.15 Vision, V2.16 Audio/TTS).
-The largest untouched buckets are the **production server stack** (2.1/2.4/2.5)
-and **decode-speed work** (2.7/2.8).
+**Tally:** original V2 — 4 done (2.2, 2.3, 2.5b, 2.14), 2 partial (2.6, 2.17),
+9 remaining. Plus 2 off-roadmap multimodal tracks shipped (V2.15 Vision, V2.16
+Audio/TTS). The largest untouched buckets are the **production server stack**
+(2.1/2.4/2.5) and **decode-speed work** (2.7/2.8).
 
 ---
 
@@ -246,13 +249,15 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 
 ```
 4.1  model/llama.rs — LLaMA is all-attention blocks.   [done: shared path]
-4.2  Architecture variants: mistral, qwen2, gemma, phi3  [partial: qwen2/qwen3 only]
+4.2  Architecture variants: mistral, qwen2, gemma, phi3  [done: llama/mistral/qwen2/qwen3/granite; gemma/phi3 remain]
 4.3  Test each on a real GGUF. Greedy decoding matches llama.cpp.
 ```
 
-> Status: the LLaMA code path is implemented and serves `qwen2`/`qwen3`. The bare
-> `llama` arch string and the `mistral`/`gemma`/`phi3` variants are not yet
-> dispatched in `model/mod.rs`. Verified vs llama.cpp for Qwen2/Qwen3 (NEOX RoPE).
+> Status: the shared LLaMA/transformer code path now dispatches `qwen2`, `qwen3`,
+> `llama`, and `granite` in `model/mod.rs` (CPU, wgpu, and Metal), with both NEOX
+> and NORM RoPE. Classic Mistral ships as arch `llama`, so it is covered on the
+> same path. Only the `gemma` and `phi3` arch strings remain unwired. Verified vs
+> llama.cpp for Qwen2/Qwen3 and the NORM-rope dense models (LLaMA/Mistral/Granite).
 
 ---
 
@@ -261,7 +266,9 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 
 > Status: wgpu backend shipped (matmul, quantized GEMM/GEMV, rmsnorm, silu, rope,
 > softmax, attention, conv1d, element-wise) plus a separate **Metal** backend and
-> shader preprocessor. GPU forward pass currently supports **LFM2 only**; runs on
+> shader preprocessor. GPU forward pass now supports **LFM2 and the dense
+> transformers** (llama/qwen2/qwen3/granite) on both wgpu and Metal — decode +
+> batched-GEMM prefill, GPU-side KV-shift, and the ViT vision encoder; runs on
 > wasm as well. Subgroup variants implemented with small-subgroup adapter support.
 
 ```
@@ -313,8 +320,14 @@ OpenAI-compatible HTTP server (axum + SSE), continuous batching scheduler, paged
 ### V2.2: Browser / WASM — 3-4 weeks ✅ DONE
 WASM build (dual: threaded + single-threaded), wasm-bindgen-rayon for multi-threaded CPU, Web Worker architecture, OPFS model caching, JS API + npm package, Chrome enhanced (subgroups, dot4U8Packed, f16), Safari baseline (f16, standard WGSL), feature detection.
 
-### V2.3: Structured Output — 1-2 weeks ⬜
-GBNF grammar parser, JSON schema → grammar compiler, regex constraints, async FSM mask computation overlapped with forward pass.
+### V2.3: Structured Output — 1-2 weeks ✅ DONE
+GBNF grammar parser + grammar-constrained decoding (`cera/src/grammar.rs`): each
+decode step masks logits to only grammar-accepted tokens. Supports bounded
+repetition `{n,m}` (#196) and is exposed over both FFI (`GenerateOpts.grammar`
+source text) and WASM (`set_grammar`/`clear_grammar`/`has_grammar`) (#198).
+Byte-level v1: non-ASCII / multi-byte ranges inside char classes are not yet
+supported. JSON-schema→grammar compiler and async FSM-mask overlap remain future
+enhancements.
 
 ### V2.4: KV Cache Serialization — 1-2 weeks ⬜
 Serialize KV cache + conv buffers to .lmkv files, system prompt caching, conversation checkpointing, KV quantization for storage.
@@ -352,7 +365,7 @@ PyO3 bindings, `pip install cera-engine`.
 ### V2.14: Kotlin Multiplatform Bindings — 2-3 weeks ✅ DONE
 C ABI via cbindgen + platform-native FFI per KMP target (cinterop, Panama FFM, PanamaPort, JS interop).
 
-### V2.17: Flutter / Dart Bindings — 2-3 weeks 🟡 (sync + streaming working)
+### V2.17: Flutter / Dart Bindings — 2-3 weeks 🟡 (sync + async + streaming working; only `fromBundleIdAsync` stubbed)
 Expose the engine to Flutter/Dart, reusing the existing `cera-ffi` UniFFI
 surface (the same C ABI that already backs Kotlin + Swift). The
 `cera-ffi-flutter` Dart package ships the generated+patched bindings plus a
@@ -519,62 +532,6 @@ generation). Shipped:
 Remaining:
 - Metal-only detokenizer acceleration — no wgpu path; CPU fallback is slow.
 - Streaming/real-time output not yet exposed (batch WAV writer only).
-
----
-
-### V2.17: Flutter / Dart Bindings — 2-3 weeks 🟡 (sync API working)
-Expose the engine to Flutter/Dart, reusing the existing `cera-ffi` UniFFI
-surface (the same C ABI that already backs Kotlin + Swift). The
-`cera-ffi-flutter` Dart package ships the generated+patched bindings plus a
-platform-aware native-library loader.
-
-**Working (verified end-to-end):** the synchronous engine API round-trips real
-inference — loaded a Qwen2-0.5B GGUF through `CeraEngine.fromPath` →
-`newSession` → `appendText` → `generate` and got tokens back; `cpuBackendReport`
-and structured `FfiError` propagation also confirmed. Delivered:
-- `cera-ffi` gains an **`ffi-buffer`** cargo feature
-  (`uniffi/scaffolding-ffi-buffer-fns`) — the Dart generator calls
-  `uniffi_ffibuffer_*` trampolines UniFFI only emits under that flag.
-- `tool/patch_generated_bindings.dart` — deterministic, idempotent post-gen
-  fixups: corrects `rustbuffer`/`rust_future` symbol names + the `.ref.ptr`
-  union field, rewrites native-lib resolution (`CERA_FFI_LIB` + platform name),
-  synthesizes the `EngineConfig` record encoder, fixes the async-ctor return
-  type, and stubs the unsupported callback-sink methods.
-- `just dart-libs` / `dart-bindings` / `dart-bindings-check` recipes; committed
-  generated bindings (analyze clean); `example/cera_generate.dart`.
-
-**Remaining:** `Result`-returning methods (`transcribe`, the tokenizer
-accessors, `storeDir`, `fromBundleId*`) and the streaming/progress + `*Async`
-surface throw `UnsupportedError` — `uniffi-bindgen-dart` 0.1.3 implements neither
-the RustCallStatus out-arg ABI nor callback-interface lowering; package prebuilt
-native libs per target (Android jniLibs / iOS xcframework / desktop); expose a
-detokenizer over FFI; example Flutter app + wire the Dart drift check into CI.
-
-**Spike result (2026-06-13, `uniffi-bindgen-dart` 0.1.3):** Viable but not
-turnkey. The generator builds against `uniffi_bindgen 0.31.1` (our exact
-version) and emitted ~7,300 lines of Dart from the current `cera-ffi` dylib
-with **zero Rust-side changes** — structs, enums, sync methods, and
-`CeraEngine.transcribe` came out clean (UniFFI checksums matched). After adding
-the `ffi` package dep and an SDK `^3.3.0` constraint, `dart analyze` drops to
-**8 errors, 0 warnings**, and every error sits in the *advanced* FFI surface:
-- callback / foreign-trait sinks — `DownloadProgressSink`, `ModalitySink`
-  (download progress + audio-modality streaming) generate invalid casts;
-- async constructor `fromBundleIdAsync` returns `CeraEngine` instead of
-  `Future<CeraEngine>`;
-- a `_UniFfiFfiBufferElement.pointer` getter bug in sequence handling.
-
-So the bulk auto-generates, but cera leans hard on exactly the async +
-streaming-callback features 0.1.3 mishandles. Paths forward:
-1. **Narrow the Dart-exposed surface** — generate for the sync core, hand-write
-   thin Dart shims for the streaming/async bits.
-2. **Patch/contribute upstream** — the failures are isolated; `uniffi-bindgen-dart`
-   is young (0.1.x) and the fixes look tractable.
-3. **flutter_rust_bridge** — separate binding layer, but first-class async +
-   `Stream` support (a better fit for token/audio streaming) at the cost of not
-   reusing the UniFFI interface.
-
-Recommendation: pursue (1)+(2) to stay aligned with the existing UniFFI
-bindings; fall back to (3) if streaming UX becomes the priority.
 
 ---
 
