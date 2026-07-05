@@ -2361,6 +2361,21 @@ impl Model for Lfm2Model {
             hs
         );
 
+        // With a LoRA active, run frames per-token through `forward_from_embedding`
+        // (→ `run_layers` → the hooked block fns) so the adapter applies to
+        // embedding-input (multimodal) tokens too — otherwise the batched
+        // `prefill_layers_and_logits` below would process them base-model-only,
+        // leaving image/audio spans un-adapted while text spans get the adapter.
+        // Matches the token-path gate in `forward_prefill`.
+        if state.lora.is_some() {
+            let mut logits = Vec::new();
+            for j in 0..n {
+                let frame = &embeddings[j * hs..(j + 1) * hs];
+                logits = self.forward_from_embedding(frame, start_pos + j, state);
+            }
+            return logits;
+        }
+
         // Transpose row-major embeddings (frame j at [j*hs..(j+1)*hs])
         // into column-major hidden (token j's channel i at [i*n + j]) —
         // same layout `forward_prefill` builds via the embed-table
