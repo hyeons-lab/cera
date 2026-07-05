@@ -1348,8 +1348,9 @@ impl Session {
         Ok(self.lock_inner()?.hidden_states_mean_pooled(&tokens)?)
     }
 
-    /// Attach a [`LoraAdapters`] to this session (Swift `setLoraAdapters`). It's
-    /// applied to every subsequent forward pass — generation **and**
+    /// Attach a [`LoraAdapters`] to this session (generated as `attachLora` in
+    /// Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
+    /// call). It's applied to every subsequent forward pass — generation **and**
     /// hidden-states extraction — until removed or replaced (hot-swap), and is
     /// preserved across [`Self::reset`]. Returns [`FfiError::LoraParse`] if the
     /// adapter's dimensions don't match the loaded model. Only affects tokens

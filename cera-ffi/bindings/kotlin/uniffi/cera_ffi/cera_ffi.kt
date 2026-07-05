@@ -1608,7 +1608,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_append_tokens() != 1227) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_attach_lora() != 7627) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_attach_lora() != 28982) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_cancel() != 7555) {
@@ -4573,8 +4573,9 @@ public interface SessionInterface {
     fun `appendTokens`(`tokens`: List<kotlin.UInt>)
 
     /**
-     * Attach a [`LoraAdapters`] to this session (Swift `setLoraAdapters`). It's
-     * applied to every subsequent forward pass — generation **and**
+     * Attach a [`LoraAdapters`] to this session (generated as `attachLora` in
+     * Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
+     * call). It's applied to every subsequent forward pass — generation **and**
      * hidden-states extraction — until removed or replaced (hot-swap), and is
      * preserved across [`Self::reset`]. Returns [`FfiError::LoraParse`] if the
      * adapter's dimensions don't match the loaded model. Only affects tokens
@@ -5075,8 +5076,9 @@ open class Session :
         }
 
     /**
-     * Attach a [`LoraAdapters`] to this session (Swift `setLoraAdapters`). It's
-     * applied to every subsequent forward pass — generation **and**
+     * Attach a [`LoraAdapters`] to this session (generated as `attachLora` in
+     * Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
+     * call). It's applied to every subsequent forward pass — generation **and**
      * hidden-states extraction — until removed or replaced (hot-swap), and is
      * preserved across [`Self::reset`]. Returns [`FfiError::LoraParse`] if the
      * adapter's dimensions don't match the loaded model. Only affects tokens
