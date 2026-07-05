@@ -190,6 +190,14 @@ pub enum FfiError {
     /// and it's parsed here). `detail` carries the parser's diagnostic.
     #[error("grammar: {detail}")]
     GrammarParse { detail: String },
+
+    /// A token id passed to `hidden_states_for_tokens` (or another
+    /// token-taking method) was `>= vocab_size`. Returned as a typed error
+    /// rather than tripping the model-layer `assert!` (whose panic would
+    /// unwind through the held session lock and poison it). Mirrors
+    /// `cera::CeraError::InvalidToken`.
+    #[error("token id {id} out of range (vocab_size {vocab_size})")]
+    InvalidToken { id: u32, vocab_size: u32 },
 }
 
 impl From<cera::CeraError> for FfiError {
@@ -208,6 +216,9 @@ impl From<cera::CeraError> for FfiError {
                 FfiError::ContextOverflow { max_seq_len, by }
             }
             cera::CeraError::EmptyInput => FfiError::EmptyInput,
+            cera::CeraError::InvalidToken { id, vocab_size } => {
+                FfiError::InvalidToken { id, vocab_size }
+            }
             cera::CeraError::Backend(s) => FfiError::Backend { detail: s },
             cera::CeraError::Io(io_err) => FfiError::Io {
                 detail: io_err.to_string(),
@@ -1122,6 +1133,10 @@ pub struct Session {
     cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Stored at construction so `capabilities()` doesn't need a lock.
     capabilities: ModalityCapabilities,
+    /// Model hidden dimension, cached at construction so `hidden_size()` is a
+    /// lock-free read — safe to call from a `generate_streaming` sink callback
+    /// (which runs while `generate` holds the mutex), same as `position()`.
+    hidden_size: u32,
 }
 
 impl Session {
@@ -1226,9 +1241,11 @@ impl Session {
     }
 
     /// Model hidden dimension `D`. Reshape a raw `[T*D]` byte buffer from
-    /// [`Self::hidden_states_for_tokens`] into `[T][D]` with this.
-    pub fn hidden_size(&self) -> Result<u32, FfiError> {
-        Ok(u32::try_from(self.lock_inner()?.hidden_size()).unwrap_or(u32::MAX))
+    /// [`Self::hidden_states_for_tokens`] into `[T][D]` with this. Lock-free
+    /// (cached at construction), so — like `position()` — it's safe to call from
+    /// a `generate_streaming` sink callback.
+    pub fn hidden_size(&self) -> u32 {
+        self.hidden_size
     }
 
     /// Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
@@ -1242,8 +1259,13 @@ impl Session {
     /// the active LoRA once that lands. Side-effect-free: does not disturb the
     /// session's generation KV.
     ///
+    /// Like `append_*` / `generate`, this holds the session mutex for the
+    /// duration of the compute, so it must NOT be called re-entrantly from
+    /// within a `generate_streaming` sink callback (would self-deadlock).
+    ///
     /// Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
-    /// doesn't implement hidden-state extraction.
+    /// doesn't implement hidden-state extraction; `InvalidToken` if any id is
+    /// `>= vocab_size`.
     pub fn hidden_states_for_tokens(&self, tokens: Vec<u32>) -> Result<Vec<u8>, FfiError> {
         let hs = self.lock_inner()?.hidden_states_for_tokens(&tokens)?;
         Ok(f32_vec_to_le_bytes(&hs))
@@ -1785,11 +1807,13 @@ impl CeraEngine {
         let position = session.position_handle();
         let cancel = session.cancel_handle();
         let capabilities = session.capabilities().into();
+        let hidden_size = u32::try_from(session.hidden_size()).unwrap_or(u32::MAX);
         Arc::new(Session {
             inner: std::sync::Mutex::new(session),
             position,
             cancel,
             capabilities,
+            hidden_size,
         })
     }
 }

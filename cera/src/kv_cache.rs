@@ -184,10 +184,11 @@ impl InferenceState {
     }
 
     /// Reset an existing state for reuse as a throwaway prefill scratch: zero
-    /// `seq_len` and truncate the (uncompressed) KV / conv buffers to empty
-    /// while KEEPING their allocated capacity, so a reused scratch does no
-    /// allocation. Intended for the [`Self::for_prefill`] path (no compression);
-    /// working scratch buffers are resized on demand by the forward pass.
+    /// `seq_len`, truncate the (uncompressed) KV caches to empty, and zero the
+    /// conv rolling buffers in place (kept at full length) — all while KEEPING
+    /// allocated capacity, so a reused scratch does no allocation. Intended for
+    /// the [`Self::for_prefill`] path (no compression); working scratch buffers
+    /// are resized on demand by the forward pass.
     pub fn clear_for_reuse(&mut self) {
         self.seq_len = 0;
         for layer in &mut self.layers {
