@@ -2063,6 +2063,42 @@ impl Lfm2Model {
 }
 
 impl Model for Lfm2Model {
+    fn supports_hidden_states(&self) -> bool {
+        true
+    }
+
+    /// Per-token post-final-norm hidden states, row-major `[n * hidden_size]`.
+    /// Mirrors [`Self::forward`]'s embedding path (dequantize → `run_layers`,
+    /// which applies the output norm) minus the logit projection — so the result
+    /// is the same post-`output_norm` vector, matching llama.cpp `--pooling none`.
+    /// Per-token (not batched): LFM2's batched prefill is entangled with the
+    /// prefix cache, and this stateless one-shot path must not touch it; batched
+    /// capture is a possible perf follow-up. `state` must start cleared at pos 0.
+    fn hidden_states(&self, tokens: &[u32], state: &mut InferenceState) -> Vec<f32> {
+        assert!(
+            !tokens.is_empty(),
+            "hidden_states requires at least one token"
+        );
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let mut out = Vec::with_capacity(tokens.len() * hs);
+        for &token in tokens {
+            let token_id = token as usize;
+            assert!(
+                token_id < cfg.vocab_size,
+                "token_id {token_id} out of range (vocab_size={})",
+                cfg.vocab_size
+            );
+            let mut hidden = self.dequantize_row(&self.embd_ref, token_id);
+            // `run_layers` ropes at `pos == seq_len` and appends one cell,
+            // bumping seq_len; a cleared state walks positions 0..n.
+            let pos = state.seq_len;
+            self.run_layers(&mut hidden, pos, state);
+            out.extend_from_slice(&hidden);
+        }
+        out
+    }
+
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
         assert_eq!(tokens.len(), 1, "LFM2 forward expects single token");
         let token_id = tokens[0] as usize;

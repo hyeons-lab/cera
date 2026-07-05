@@ -173,6 +173,38 @@ impl InferenceState {
         Self::from_config_with_compression(config, &KvCompression::None)
     }
 
+    /// Build a throwaway prefill state whose KV capacity is capped to
+    /// `n_tokens` cells (never the full `max_seq_len`), for one-shot passes
+    /// like hidden-state extraction. Uncompressed. Capacity is clamped to
+    /// `[1, max_seq_len]`, so a per-chunk classifier call reserves ~O(T·kv_dim)
+    /// rather than the hundreds of MB a full-context cache would.
+    pub fn for_prefill(config: &ModelConfig, n_tokens: usize) -> Self {
+        let capacity = n_tokens.clamp(1, config.max_seq_len);
+        Self::from_config_capped(config, &KvCompression::None, capacity)
+    }
+
+    /// Reset an existing state for reuse as a throwaway prefill scratch: zero
+    /// `seq_len` and truncate the (uncompressed) KV / conv buffers to empty
+    /// while KEEPING their allocated capacity, so a reused scratch does no
+    /// allocation. Intended for the [`Self::for_prefill`] path (no compression);
+    /// working scratch buffers are resized on demand by the forward pass.
+    pub fn clear_for_reuse(&mut self) {
+        self.seq_len = 0;
+        for layer in &mut self.layers {
+            match layer {
+                LayerState::Attention {
+                    key_cache,
+                    value_cache,
+                    ..
+                } => {
+                    key_cache.clear();
+                    value_cache.clear();
+                }
+                LayerState::Conv { buffer } => buffer.iter_mut().for_each(|x| *x = 0.0),
+            }
+        }
+    }
+
     /// Create inference state with optional KV cache compression.
     ///
     /// When `compression` is `KvCompression::TurboQuant`, this single call
@@ -181,6 +213,18 @@ impl InferenceState {
     /// the query rotation scratch. The model itself doesn't need to be
     /// "enabled" separately — it reads all TurboQuant state from here.
     pub fn from_config_with_compression(config: &ModelConfig, compression: &KvCompression) -> Self {
+        Self::from_config_capped(config, compression, config.max_seq_len)
+    }
+
+    /// Like [`Self::from_config_with_compression`] but caps the pre-allocated
+    /// KV-cache capacity to `capacity` cells instead of `config.max_seq_len`.
+    /// Backs [`Self::for_prefill`]. `capacity` should be pre-clamped to
+    /// `[1, max_seq_len]`; appending beyond it just triggers normal Vec growth.
+    fn from_config_capped(
+        config: &ModelConfig,
+        compression: &KvCompression,
+        capacity: usize,
+    ) -> Self {
         let kernel_size = config.conv_kernel_size.unwrap_or(3);
         assert!(
             kernel_size >= 2,
@@ -196,7 +240,7 @@ impl InferenceState {
 
         // Compressed (TurboQuant) caches start at the same per-layer cap as the
         // f32 path, so the compressed-side Vecs also avoid mid-decode reallocs.
-        let initial_capacity = config.max_seq_len;
+        let initial_capacity = capacity;
         let (compress_keys, compress_values) = compression.flags();
 
         // TurboQuant requires power-of-2 head_dim for the Walsh-Hadamard Transform.
@@ -240,10 +284,9 @@ impl InferenceState {
                     // max_seq_len from a malformed GGUF) surfaces as a
                     // clean panic instead of a wrapped capacity that
                     // silently reintroduces reallocs.
-                    let kv_capacity = config
-                        .max_seq_len
+                    let kv_capacity = capacity
                         .checked_mul(kv_dim)
-                        .expect("KV cache capacity overflow: max_seq_len * kv_dim");
+                        .expect("KV cache capacity overflow: capacity * kv_dim");
                     let compressed_keys = if compress_keys && n_kv_heads > 0 {
                         Some(CompressedKeyCache::new(
                             n_kv_heads,
@@ -1253,6 +1296,80 @@ mod tests {
                 .map(|i| if i % 2 == 0 { 2 } else { 0 })
                 .collect(),
             scalars: crate::model::ScalarMultipliers::default(),
+        }
+    }
+
+    /// `for_prefill` must cap the pre-allocated KV cache to the prompt length,
+    /// NOT `max_seq_len` — the whole point of the hidden-states scratch path.
+    #[test]
+    fn for_prefill_caps_kv_capacity() {
+        let cfg = tiny_config(4, 16); // max_seq_len=64; attn kv_dim = 2*4 = 8
+        let n = 5;
+        let kv_dim = cfg.kv_heads_per_layer[0] * cfg.head_dim;
+        let state = InferenceState::for_prefill(&cfg, n);
+        if let LayerState::Attention {
+            key_cache,
+            value_cache,
+            ..
+        } = &state.layers[0]
+        {
+            assert!(key_cache.capacity() >= n * kv_dim);
+            assert!(value_cache.capacity() >= n * kv_dim);
+            // Far below a full-context reservation (5*8=40 « 64*8=512).
+            assert!(key_cache.capacity() < cfg.max_seq_len * kv_dim);
+        } else {
+            panic!("layer 0 should be attention");
+        }
+        // Clamp: a prompt longer than max_seq_len caps at max_seq_len.
+        let big = InferenceState::for_prefill(&cfg, cfg.max_seq_len + 100);
+        if let LayerState::Attention { key_cache, .. } = &big.layers[0] {
+            assert!(key_cache.capacity() <= cfg.max_seq_len * kv_dim + kv_dim);
+        }
+    }
+
+    /// `clear_for_reuse` zeroes seq_len and empties KV/conv buffers while KEEPING
+    /// capacity, so a reused hidden-states scratch does no allocation.
+    #[test]
+    fn clear_for_reuse_resets_but_keeps_capacity() {
+        let cfg = tiny_config(4, 16);
+        let mut state = InferenceState::for_prefill(&cfg, 8);
+        state.seq_len = 3;
+        let (cap_k, cap_v) = if let LayerState::Attention {
+            key_cache,
+            value_cache,
+            ..
+        } = &mut state.layers[0]
+        {
+            for i in 0..16 {
+                key_cache.push(i as f32);
+                value_cache.push(i as f32);
+            }
+            (key_cache.capacity(), value_cache.capacity())
+        } else {
+            panic!("layer 0 should be attention");
+        };
+        if let LayerState::Conv { buffer } = &mut state.layers[1] {
+            buffer.iter_mut().for_each(|x| *x = 1.0);
+        }
+
+        state.clear_for_reuse();
+
+        assert_eq!(state.seq_len, 0);
+        if let LayerState::Attention {
+            key_cache,
+            value_cache,
+            ..
+        } = &state.layers[0]
+        {
+            assert!(key_cache.is_empty() && value_cache.is_empty());
+            assert_eq!(key_cache.capacity(), cap_k, "capacity must be retained");
+            assert_eq!(value_cache.capacity(), cap_v);
+        }
+        if let LayerState::Conv { buffer } = &state.layers[1] {
+            assert!(
+                buffer.iter().all(|&x| x == 0.0),
+                "conv buffer must be zeroed"
+            );
         }
     }
 

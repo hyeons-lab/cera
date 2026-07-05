@@ -344,6 +344,32 @@ pub trait Model: Send + Sync {
         logits
     }
 
+    /// Static capability probe: does this backend implement
+    /// [`Self::hidden_states`]? Default `false`; text backends opt in so an
+    /// unsupported backend surfaces a typed error instead of the default panic.
+    fn supports_hidden_states(&self) -> bool {
+        false
+    }
+
+    /// Run a forward pass over `tokens` and return the **per-token** last-layer
+    /// hidden state AFTER the final RMSNorm — the exact vector fed to the LM
+    /// head, matching llama.cpp `llama_get_embeddings_ith` with pooling `NONE`.
+    /// Downstream classifiers mean-pool this and run their own head.
+    ///
+    /// Output is flattened row-major `[n_tokens * hidden_size]` (token `t`,
+    /// channel `c` at `t * hidden_size + c`). Logits are NOT computed.
+    ///
+    /// `state` is a caller-owned throwaway scratch (the Session hands in a
+    /// reused, prompt-sized [`InferenceState::for_prefill`], cleared before the
+    /// call); this method starts from position 0 and does not touch any
+    /// generation KV.
+    ///
+    /// Default: panics; gated by [`Self::supports_hidden_states`].
+    fn hidden_states(&self, tokens: &[u32], state: &mut InferenceState) -> Vec<f32> {
+        let _ = (tokens, state);
+        unimplemented!("hidden_states not supported by this backend")
+    }
+
     /// Greedy (argmax) fast path. Returns just the selected token id,
     /// avoiding a full logits readback when the caller only needs argmax.
     ///

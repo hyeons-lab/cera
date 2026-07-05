@@ -462,11 +462,17 @@ impl LlamaModel {
     /// kernel exists (aarch64 NEON, or any target with the `blas` feature); the
     /// per-token fallback covers every other build.
     #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+    /// Batched-GEMM prefill. When `hidden_out` is `Some`, this captures the
+    /// per-token post-final-norm hidden states into it (row-major `[n * hs]`),
+    /// skips the logit projection, and returns an empty Vec — the hidden-states
+    /// path. When `None`, it norms+projects the last token and returns its logits
+    /// — the normal prefill path.
     fn forward_prefill_batched(
         &self,
         tokens: &[u32],
         start_pos: usize,
         state: &mut InferenceState,
+        hidden_out: Option<&mut Vec<f32>>,
     ) -> Vec<f32> {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
@@ -508,6 +514,12 @@ impl LlamaModel {
             })
         });
         if !all_gemmable {
+            // No batched kernel for these dtypes: capture per-token if requested,
+            // else fall back to the sequential per-token logit path.
+            if let Some(out) = hidden_out {
+                *out = self.hidden_states_per_token(tokens, state);
+                return Vec::new();
+            }
             let mut logits = Vec::new();
             for (i, &token) in tokens.iter().enumerate() {
                 logits = self.forward(&[token], start_pos + i, state);
@@ -1025,6 +1037,22 @@ impl LlamaModel {
         // Advance seq_len (the block loops appended KV cells without bumping it).
         state.seq_len = start_pos + n;
 
+        // Hidden-states capture: final-norm EVERY column into a row-major
+        // `[n * hs]` buffer (post-final-RMSNorm = llama.cpp `result_norm`),
+        // skipping the logit projection. Reuses `norm_col` as per-column scratch.
+        if let Some(out) = hidden_out {
+            out.clear();
+            out.reserve(n * hs);
+            for j in 0..n {
+                for i in 0..hs {
+                    norm_col[i] = hidden[i * n + j];
+                }
+                cpu::rmsnorm(&mut norm_col, &self.output_norm_weight, cfg.rms_norm_eps);
+                out.extend_from_slice(&norm_col);
+            }
+            return Vec::new();
+        }
+
         // Final norm on the LAST column, then project last-token logits (what the
         // decode loop consumes). Reuse `norm_col` (an hs-length scratch that's
         // dead after the layer loop) rather than allocating. `project_logits`
@@ -1035,9 +1063,57 @@ impl LlamaModel {
         cpu::rmsnorm(&mut norm_col, &self.output_norm_weight, cfg.rms_norm_eps);
         self.project_logits(&norm_col, state)
     }
+
+    /// Per-token hidden-states fallback: embed → `run_layers` (which applies the
+    /// final RMSNorm) per token, concatenated row-major `[n * hidden_size]`.
+    /// Post-final-norm, matching the batched capture path. Used when there's no
+    /// batched-GEMM kernel (`n == 1`, non-gemmable dtypes, or non-aarch64/non-blas).
+    /// Assumes `state` starts cleared at position 0.
+    fn hidden_states_per_token(&self, tokens: &[u32], state: &mut InferenceState) -> Vec<f32> {
+        let hs = self.config.hidden_size;
+        let mut out = Vec::with_capacity(tokens.len() * hs);
+        for &token in tokens {
+            let token_id = token as usize;
+            assert!(
+                token_id < self.config.vocab_size,
+                "token_id {token_id} out of range (vocab_size={})",
+                self.config.vocab_size
+            );
+            let mut hidden = transformer::dequantize_row(&self.gguf, &self.embd_ref, token_id);
+            if self.config.scalars.embedding != 1.0 {
+                cpu::scale_inplace(&mut hidden, self.config.scalars.embedding);
+            }
+            // `run_layers` ropes at `pos` and appends one KV cell, bumping
+            // seq_len; starting from a cleared state walks positions 0..n.
+            let pos = state.seq_len;
+            self.run_layers(&mut hidden, pos, state);
+            out.extend_from_slice(&hidden);
+        }
+        out
+    }
 }
 
 impl Model for LlamaModel {
+    fn supports_hidden_states(&self) -> bool {
+        true
+    }
+
+    fn hidden_states(&self, tokens: &[u32], state: &mut InferenceState) -> Vec<f32> {
+        assert!(
+            !tokens.is_empty(),
+            "hidden_states requires at least one token"
+        );
+        // Batched-GEMM capture when a batched kernel exists and n > 1; the
+        // batched path internally falls back to per-token for non-gemmable dtypes.
+        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        if tokens.len() > 1 {
+            let mut out = Vec::new();
+            self.forward_prefill_batched(tokens, 0, state, Some(&mut out));
+            return out;
+        }
+        self.hidden_states_per_token(tokens, state)
+    }
+
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
         assert_eq!(tokens.len(), 1, "LlamaModel forward expects single token");
         let token_id = tokens[0] as usize;
@@ -1090,7 +1166,7 @@ impl Model for LlamaModel {
         // validates against llama.cpp.
         #[cfg(any(target_arch = "aarch64", feature = "blas"))]
         if tokens.len() > 1 && !transformer::oracle_dump::is_active() {
-            return self.forward_prefill_batched(tokens, start_pos, state);
+            return self.forward_prefill_batched(tokens, start_pos, state, None);
         }
 
         // Sequential per-token prefill (single-token, or no batched kernel).
