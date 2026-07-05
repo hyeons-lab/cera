@@ -2491,7 +2491,19 @@ impl Model for MetalLfm2Model {
             }
         }
 
+        // Route the layer encoders at the scratch caches for the duration of the
+        // run. A drop-guard clears the flag even if a later assert or GPU call
+        // panics — otherwise a leaked `true` would send the next `forward()` into
+        // the scratch KV and silently corrupt generation.
+        struct ScratchGuard<'a>(&'a AtomicBool);
+        impl Drop for ScratchGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Relaxed);
+            }
+        }
         self.use_hs_scratch.store(true, Ordering::Relaxed);
+        let _scratch_guard = ScratchGuard(&self.use_hs_scratch);
+
         let mut out = Vec::with_capacity(tokens.len() * hs);
         for (pos, &token) in tokens.iter().enumerate() {
             let token_id = token as usize;
@@ -2516,7 +2528,7 @@ impl Model for MetalLfm2Model {
             cb.wait_until_completed();
             out.extend_from_slice(&self.ctx.read_f32(&self.normed_buf, hs));
         }
-        self.use_hs_scratch.store(false, Ordering::Relaxed);
+        // `_scratch_guard` clears `use_hs_scratch` here on the way out.
         out
     }
 
