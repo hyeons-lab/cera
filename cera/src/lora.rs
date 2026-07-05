@@ -457,6 +457,30 @@ pub fn apply_decode(t: &LoraTargetWeights, x: &[f32], y: &mut [f32], tmp: &mut V
     }
 }
 
+/// Apply the Q/K/V attention-projection LoRAs for one layer: `q/k/v` are the
+/// base projection outputs (share input `x`), each gets `+= scale·B·(A·x)` if the
+/// adapter targets it. Shared by both `forward_attn_block` implementations
+/// (dense transformer + LFM2) so the two can't drift out of sync.
+pub fn apply_attn_qkv(
+    lora: &LoraAdapterWeights,
+    layer: usize,
+    x: &[f32],
+    q: &mut [f32],
+    k: &mut [f32],
+    v: &mut [f32],
+    tmp: &mut Vec<f32>,
+) {
+    if let Some(t) = lora.get(layer, LoraTarget::AttnQ) {
+        apply_decode(t, x, q, tmp);
+    }
+    if let Some(t) = lora.get(layer, LoraTarget::AttnK) {
+        apply_decode(t, x, k, tmp);
+    }
+    if let Some(t) = lora.get(layer, LoraTarget::AttnV) {
+        apply_decode(t, x, v, tmp);
+    }
+}
+
 // ── minimal safetensors reader ────────────────────────────────────────────────
 
 /// A parsed safetensors header entry.

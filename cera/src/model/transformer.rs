@@ -460,16 +460,7 @@ pub(crate) fn forward_attn_block(
     // LoRA: add `scale·B·(A·hidden)` to each of Q/K/V (input is the normed
     // hidden; the delta is applied before RoPE, matching the base projection).
     if let Some(lora) = &lora {
-        let tmp = &mut state.scratch.lora_tmp;
-        if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnQ) {
-            crate::lora::apply_decode(t, hidden, q, tmp);
-        }
-        if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnK) {
-            crate::lora::apply_decode(t, hidden, k, tmp);
-        }
-        if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnV) {
-            crate::lora::apply_decode(t, hidden, v, tmp);
-        }
+        crate::lora::apply_attn_qkv(lora, layer, hidden, q, k, v, &mut state.scratch.lora_tmp);
     }
 
     // Qwen3 per-head QK norm: RMSNorm each head slice with shared weights,

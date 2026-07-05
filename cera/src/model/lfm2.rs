@@ -597,16 +597,7 @@ impl Lfm2Model {
 
         // LoRA on Q/K/V — input is the normed hidden, applied before QK-norm/RoPE.
         if let Some(lora) = &lora {
-            let tmp = &mut state.scratch.lora_tmp;
-            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnQ) {
-                crate::lora::apply_decode(t, hidden, q, tmp);
-            }
-            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnK) {
-                crate::lora::apply_decode(t, hidden, k, tmp);
-            }
-            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnV) {
-                crate::lora::apply_decode(t, hidden, v, tmp);
-            }
+            crate::lora::apply_attn_qkv(lora, layer, hidden, q, k, v, &mut state.scratch.lora_tmp);
         }
 
         // Per-head QK norm (RMSnorm each head slice with shared weights)
