@@ -21,6 +21,10 @@ or in the browser — from a single dependency-free core.
   load through the same session API.
 - **Structured output.** Constrain generation to a GBNF grammar — or one flag
   for guaranteed-valid JSON.
+- **LoRA adapters & embeddings.** Load LoRA adapters at runtime (GGUF or PEFT
+  safetensors), hot-swap / unload per session — applied on CPU, Metal, and wgpu,
+  never merged — and pull per-token hidden states out of the engine for
+  classifier and embedding heads. From every binding.
 
 ## Supported models
 
@@ -103,6 +107,37 @@ CLI: in Rust set `GenerateOpts.grammar` to a compiled `Grammar` (`Grammar::parse
 while the Kotlin/Swift FFI (`GenerateOpts.grammar`) and browser/Node WASM
 (`GenerateOpts.setGrammar(gbnf)`) take the GBNF string directly and compile it
 natively — so mobile and web apps get the same guaranteed-valid output.
+
+## LoRA adapters & hidden states
+
+**Runtime LoRA.** Load a LoRA adapter — a llama.cpp GGUF (from
+`convert_lora_to_gguf`) or a PEFT `.safetensors` — and attach it to a session. The
+delta is applied at inference time (`y += scale·B·(A·x)`), **never merged into the
+weights**, so the base model stays quantized and adapters hot-swap / unload per
+request at ~no cost. Runs on **CPU, Metal, and wgpu** (batched-GEMM prefill +
+decode) and is dimension-checked against the model at attach.
+
+**Hidden-states extraction.** Pull the per-token last-layer hidden state
+(post-final-RMSNorm — the llama.cpp `--pooling none` vector) straight out of the
+engine, reflecting the active adapter. This unblocks classifier / extractor /
+embedding heads — e.g. a section router: `LFM2.5` + a `route_section` LoRA + a
+small linear head over the mean-pooled hidden state.
+
+Both are available from **every binding**:
+
+```swift
+// Swift / Kotlin (UniFFI) — same shape on both
+let adapters = try LoraAdapters.fromSafetensors(path: p, alpha: nil)
+try session.attachLora(adapters: adapters)               // hot-swap-able
+let pooled = try session.hiddenStatesMeanPooled(tokens: toks)  // [hidden_size]
+```
+
+```js
+// Browser / Node (WASM)
+const adapters = LoraAdapters.fromSafetensorsBytes(bytes, undefined);
+session.attachLora(adapters);
+const pooled = session.hiddenStatesMeanPooled(tokens); // Float32Array
+```
 
 ## TurboQuant KV-cache compression
 
