@@ -260,6 +260,11 @@ impl LoraAdapterWeights {
     }
 }
 
+/// Sanity cap on an adapter's layer index — real models have well under this
+/// many layers; a larger index means a malformed/hostile tensor name, which we
+/// reject rather than let it size a huge allocation.
+const MAX_LORA_LAYERS: usize = 8192;
+
 /// Accumulates loose A/B factors keyed by (layer, target), then validates + pairs
 /// them into a `LoraAdapterWeights`.
 #[derive(Default)]
@@ -300,14 +305,27 @@ impl AdapterBuilder {
 
     fn finish(self, alpha: Option<f32>) -> Result<Arc<LoraAdapterWeights>> {
         ensure!(!self.factors.is_empty(), "adapter contains no LoRA tensors");
+        // Reject an absurd layer index from a malformed/hostile name before it
+        // sizes the `layers` Vec — otherwise `blk.9999999999...` would try to
+        // allocate ~10^10 entries and OOM-abort instead of erroring.
+        ensure!(
+            self.max_layer < MAX_LORA_LAYERS,
+            "adapter layer index {} exceeds the sane maximum ({MAX_LORA_LAYERS})",
+            self.max_layer
+        );
         let n_layers = self.max_layer + 1;
         let mut layers: Vec<LoraLayer> = (0..n_layers).map(|_| LoraLayer::default()).collect();
 
-        // A single global scale: alpha (or the first pair's rank if absent).
+        // Iterate in a deterministic (layer, target) order so `default_scale`
+        // (taken from the first pair) is stable across runs — HashMap order isn't.
+        let mut factors: Vec<_> = self.factors.into_iter().collect();
+        factors.sort_by_key(|&(key, _)| key);
+
+        // A single global scale: alpha/rank of the first (lowest-index) pair.
         let mut default_scale = 1.0f32;
         let mut scale_set = false;
 
-        for ((layer, target_idx), pair) in self.factors {
+        for ((layer, target_idx), pair) in factors {
             let (a, rank_a, k) = pair
                 .a
                 .with_context(|| format!("layer {layer} target {target_idx}: missing lora_a"))?;
@@ -417,7 +435,10 @@ struct SafeTensors {
 impl SafeTensors {
     fn parse(bytes: &[u8]) -> Result<Self> {
         ensure!(bytes.len() >= 8, "safetensors: truncated header length");
-        let header_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+        // `try_from` (not `as usize`) so an oversized length is REJECTED rather
+        // than truncated to a small in-range value on 32-bit targets (wasm).
+        let header_len = usize::try_from(u64::from_le_bytes(bytes[0..8].try_into().unwrap()))
+            .context("safetensors: header length too large for this platform")?;
         let header_end = 8usize
             .checked_add(header_len)
             .context("safetensors: header length overflow")?;
@@ -446,9 +467,9 @@ impl SafeTensors {
                 .and_then(|s| s.as_array())
                 .with_context(|| format!("{name}: missing shape"))?
                 .iter()
-                .map(|n| n.as_u64().map(|u| u as usize))
+                .map(|n| n.as_u64().and_then(|u| usize::try_from(u).ok()))
                 .collect::<Option<Vec<_>>>()
-                .with_context(|| format!("{name}: bad shape"))?;
+                .with_context(|| format!("{name}: bad shape (or a dim too large)"))?;
             let offsets = v
                 .get("data_offsets")
                 .and_then(|o| o.as_array())
@@ -457,8 +478,12 @@ impl SafeTensors {
                 offsets.len() == 2,
                 "{name}: data_offsets must be [begin, end]"
             );
-            let begin = offsets[0].as_u64().context("bad data_offset")? as usize;
-            let end = offsets[1].as_u64().context("bad data_offset")? as usize;
+            let to_usize = |v: &serde_json::Value| -> Result<usize> {
+                usize::try_from(v.as_u64().context("bad data_offset")?)
+                    .context("data_offset too large for this platform")
+            };
+            let begin = to_usize(&offsets[0])?;
+            let end = to_usize(&offsets[1])?;
             entries.push((
                 name.clone(),
                 StEntry {
@@ -494,24 +519,31 @@ impl SafeTensors {
             "safetensors: tensor slice out of range"
         );
         let raw = &bytes[start..end];
-        let n: usize = e.shape.iter().product();
+        // Checked product so a crafted shape (e.g. [6e9, 6e9]) yields a typed
+        // error, not an overflow panic (debug) / silent wrap (release).
+        let n = e
+            .shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .context("safetensors: shape product overflows usize")?;
+        let expect_bytes = |elt: usize| n.checked_mul(elt).context("safetensors: size overflow");
         match e.dtype.as_str() {
             "F32" => {
-                ensure!(raw.len() == n * 4, "F32 byte count mismatch");
+                ensure!(raw.len() == expect_bytes(4)?, "F32 byte count mismatch");
                 Ok(raw
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
                     .collect())
             }
             "F16" => {
-                ensure!(raw.len() == n * 2, "F16 byte count mismatch");
+                ensure!(raw.len() == expect_bytes(2)?, "F16 byte count mismatch");
                 Ok(raw
                     .chunks_exact(2)
                     .map(|c| half::f16::from_le_bytes(c.try_into().unwrap()).to_f32())
                     .collect())
             }
             "BF16" => {
-                ensure!(raw.len() == n * 2, "BF16 byte count mismatch");
+                ensure!(raw.len() == expect_bytes(2)?, "BF16 byte count mismatch");
                 Ok(raw
                     .chunks_exact(2)
                     .map(|c| half::bf16::from_le_bytes(c.try_into().unwrap()).to_f32())
@@ -643,6 +675,47 @@ mod tests {
         buf.extend_from_slice(&(hs.len() as u64).to_le_bytes());
         buf.extend_from_slice(&hs);
         buf.extend_from_slice(&[0u8; 16]);
+        assert!(LoraAdapterWeights::from_safetensors_bytes(&buf, None).is_err());
+    }
+
+    /// Wrap a JSON header into a safetensors buffer with `data_len` trailing bytes.
+    fn st_buf(header: serde_json::Value, data_len: usize) -> Vec<u8> {
+        let hs = serde_json::to_vec(&header).unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(hs.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&hs);
+        buf.extend_from_slice(&vec![0u8; data_len]);
+        buf
+    }
+
+    #[test]
+    fn rejects_absurd_layer_index() {
+        // A hostile PEFT name with a giant layer index must ERROR, not try to
+        // allocate ~10^10 layers and OOM-abort.
+        let a = "base_model.model.model.layers.9999999999.self_attn.q_proj.lora_A.weight";
+        let b = "base_model.model.model.layers.9999999999.self_attn.q_proj.lora_B.weight";
+        let buf = st_buf(
+            serde_json::json!({
+                a: { "dtype": "F32", "shape": [1, 1], "data_offsets": [0, 4] },
+                b: { "dtype": "F32", "shape": [1, 1], "data_offsets": [4, 8] },
+            }),
+            8,
+        );
+        assert!(LoraAdapterWeights::from_safetensors_bytes(&buf, None).is_err());
+    }
+
+    #[test]
+    fn rejects_overflow_shape() {
+        // A crafted shape whose product overflows usize must ERROR, not panic
+        // (debug overflow-check) nor silently wrap (release).
+        let big = (u64::MAX / 2) as usize;
+        let name = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight";
+        let buf = st_buf(
+            serde_json::json!({
+                name: { "dtype": "F32", "shape": [big, big], "data_offsets": [0, 4] },
+            }),
+            4,
+        );
         assert!(LoraAdapterWeights::from_safetensors_bytes(&buf, None).is_err());
     }
 }
