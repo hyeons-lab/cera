@@ -517,6 +517,14 @@ pub struct GpuLfm2Model {
     /// output for the largest prefill chunk. Filled by `gemm_f32_nt`, consumed by
     /// `gemm_f32_nt_accum`.
     lora_tmp_batched: wgpu::Buffer,
+    /// Reusable pool of 16-byte `[M,N,K,0]` params buffers for the batched-LoRA
+    /// GEMM dispatches, plus the next-free index (reset to 0 per prefill). The
+    /// batched prefill encodes every LoRA GEMM into ONE command buffer, so each
+    /// dispatch needs its OWN params buffer (a single shared one would be
+    /// last-write-wins across the submit); pooling reuses them across prefills so
+    /// only adapter-active prefill pays, and only once (grows to the high-water
+    /// mark, then zero allocation). Locked under `infer_lock` — no contention.
+    lora_params_pool: Mutex<(Vec<wgpu::Buffer>, usize)>,
 }
 
 impl GpuLfm2Model {
@@ -1097,6 +1105,7 @@ impl GpuLfm2Model {
             active_lora: Mutex::new(None),
             lora_tmp,
             lora_tmp_batched,
+            lora_params_pool: Mutex::new((Vec::new(), 0)),
         };
         model.cache_bind_groups();
         Ok(model)
@@ -1247,6 +1256,30 @@ impl GpuLfm2Model {
         lora?.layers.get(layer)?[target.index()].as_ref()
     }
 
+    /// A pooled 16-byte `[M,N,K,0]` params buffer for a batched-LoRA GEMM,
+    /// written with `data` and reused across prefills. The counter advances per
+    /// call so each dispatch in a prefill's single command buffer gets a distinct
+    /// buffer (a shared one would be last-write-wins across the submit); the pool
+    /// grows to the high-water mark then never allocates again. Reset the counter
+    /// (`lora_params_pool.1 = 0`) at the start of each batched prefill.
+    fn next_lora_params(&self, data: &[u32; 4]) -> wgpu::Buffer {
+        let mut pool = self
+            .lora_params_pool
+            .lock()
+            .expect("lora_params_pool poisoned");
+        let (bufs, next) = &mut *pool;
+        let idx = *next;
+        *next += 1;
+        if bufs.len() <= idx {
+            bufs.push(self.ctx.create_storage_rw(16, "lora_batched_params"));
+        }
+        let buf = bufs[idx].clone();
+        self.ctx
+            .queue
+            .write_buffer(&buf, 0, bytemuck::cast_slice(data));
+        buf
+    }
+
     /// Batched-prefill LoRA delta for one target, applied in-batch across all `n`
     /// tokens: `Y[n×d] += B_batched · (A · X[n×k])`, computed as two NT GEMMs
     /// (`gemm_f32_nt` / `gemm_f32_nt_accum`) that match the token-major batch
@@ -1270,9 +1303,7 @@ impl GpuLfm2Model {
         // One workgroup per output element; total = n·rank workgroups.
         let total1 = n * t.rank;
         let p1: [u32; 4] = [n, t.rank, t.k, 0];
-        let p1_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&p1), "lora_batched_p1");
+        let p1_buf = self.next_lora_params(&p1);
         let bg1 = self
             .ctx
             .device
@@ -1309,9 +1340,7 @@ impl GpuLfm2Model {
         // GEMM 2: Y[n × d] += Tmp[n × rank] · Bᵀ  (B_batched is [d × rank] row-major).
         let total2 = n * t.d;
         let p2: [u32; 4] = [n, t.d, t.rank, 0];
-        let p2_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&p2), "lora_batched_p2");
+        let p2_buf = self.next_lora_params(&p2);
         let bg2 = self
             .ctx
             .device
@@ -3548,6 +3577,14 @@ impl GpuLfm2Model {
         self.ctx
             .queue
             .write_buffer(&self.prefill_batch_buf, 0, bytemuck::cast_slice(&staged));
+
+        // Reset the batched-LoRA params pool cursor: this call encodes into one
+        // command buffer + one submit, so `next_lora_params` hands out a distinct
+        // pooled buffer per GEMM dispatch starting from 0.
+        self.lora_params_pool
+            .lock()
+            .expect("lora_params_pool poisoned")
+            .1 = 0;
 
         let mut enc = self.new_encoder();
         let n_u = n as u32;
