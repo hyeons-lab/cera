@@ -40,9 +40,10 @@
 // The `url` + `checksum` below carry the literal placeholders `RELEASE_VERSION`
 // / `RELEASE_CHECKSUM`. The `release` job in `.github/workflows/publish.yml`
 // rewrites them to the real `v<version>` URL and the XCFramework zip's
-// `swift package compute-checksum`, commits the result to `main`, and points
-// the `v<version>` tag at THAT commit — so `.package(url:, from:)` resolves the
-// tag with a valid checksum. Do NOT hand-edit these two literals.
+// `swift package compute-checksum` in a commit it points the `v<version>` tag
+// at — WITHOUT pushing to `main` (the branch ruleset forbids direct pushes), so
+// `main` keeps these placeholders while `.package(url:, from:)` resolves the
+// TAG, which carries the valid checksum. Do NOT hand-edit these two literals.
 //
 // ── Local validation ────────────────────────────────────────────────────────
 // The remote `url` can't resolve until a release exists. To validate locally,

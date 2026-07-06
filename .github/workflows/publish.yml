@@ -682,7 +682,14 @@ jobs:
           # (force-)tag push is allowed. The sed always turns placeholders into
           # real values, so there is always something to commit.
           git add Package.swift
-          git commit -m "chore(spm): pin CeraFFI.xcframework for v${VERSION}"
+          # Normally main carries placeholders so there is always a diff; guard
+          # the anomalous no-diff case (main already pinned) so `set -e` + an
+          # empty `git commit` can't abort the release — just tag current HEAD.
+          if git diff --cached --quiet; then
+            echo "Package.swift already pinned for v${VERSION} — tagging current HEAD"
+          else
+            git commit -m "chore(spm): pin CeraFFI.xcframework for v${VERSION}"
+          fi
           SHA=$(git rev-parse HEAD)
           git tag -f "v${VERSION}" "$SHA"
           git push -f origin "refs/tags/v${VERSION}"

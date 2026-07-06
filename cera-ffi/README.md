@@ -309,9 +309,10 @@ How it resolves:
 
 The `url` + `checksum` are checked in with the literal placeholders
 `RELEASE_VERSION` / `RELEASE_CHECKSUM`; the `release` job in
-`.github/workflows/publish.yml` rewrites them per release, commits the
-result to the default branch, and points the `v<version>` tag at that
-commit so `.package(url:, from:)` resolves the tag with a valid
+`.github/workflows/publish.yml` rewrites them per release in a commit it
+points the `v<version>` tag at — without pushing to the default branch
+(its ruleset forbids it), so the default branch keeps the placeholders
+and `.package(url:, from:)` resolves the tag, which carries a valid
 checksum.
 
 **Releasing / validating locally.** `just spm-xcframework-zip` builds,
