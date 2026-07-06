@@ -1,10 +1,9 @@
 # XcodeGen spec for the CeraChat example app.
 #
-# Regenerate the .xcodeproj with:
+# project.yml is the source of truth. The generated CeraChat.xcodeproj is
+# git-ignored — regenerate it after cloning (`brew install xcodegen`):
 #     xcodegen generate
-# (run from this directory). The generated CeraChat.xcodeproj is committed
-# so the example opens in Xcode without requiring XcodeGen, but project.yml
-# is the source of truth — edit here, then regenerate.
+# (run from this directory), then open CeraChat.xcodeproj in Xcode.
 name: CeraChat
 options:
   bundleIdPrefix: com.hyeonslab

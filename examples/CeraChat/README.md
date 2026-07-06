@@ -108,6 +108,18 @@ xcodebuild -project CeraChat.xcodeproj -scheme CeraChat \
     -destination 'platform=iOS Simulator,name=iPhone 16 Pro' build
 ```
 
+> **If `xcodebuild` reports "iOS <sdk> is not installed" / empty destinations:**
+> this happens when the Xcode SDK is newer than any installed Simulator
+> *runtime* (the scheme's run-destination resolution then finds none). Either
+> install the matching runtime (Xcode → Settings → Components), or build the
+> target directly against the Simulator SDK, which sidesteps destination
+> resolution:
+>
+> ```bash
+> xcodebuild -project CeraChat.xcodeproj -target CeraChat \
+>     -sdk iphonesimulator ARCHS=arm64 ONLY_ACTIVE_ARCH=YES build
+> ```
+
 On device, tap **Download** on the Load tab (needs network the first run). On
 the Simulator you can either download, import a local `.gguf`, or side-load one
 by setting `CERA_MODEL_PATH` in the scheme's Run environment to a local file —
