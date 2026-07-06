@@ -603,14 +603,13 @@ jobs:
       # the artifact downloads below (which land in release-assets/) must come
       # after it or they'd be wiped.
       #
-      # CAVEAT — branch protection: this job pushes a Package.swift commit to
-      # the default branch and force-moves the v<version> tag onto it, using the
-      # default GITHUB_TOKEN (needs `contents: write`, set on this job). If the
-      # default branch is protected such that GITHUB_TOKEN can't push directly
-      # (required PRs / status checks), this step fails — grant the token a
-      # bypass or run the SPM pin via a separate app/PAT. GITHUB_TOKEN pushes
-      # also intentionally don't retrigger workflows, so the pin commit won't
-      # kick off CI.
+      # Branch protection: the default branch's ruleset forbids direct pushes
+      # (bypass_actors: []), so the SPM pin is NEVER pushed to it. The pin step
+      # commits the checksum-rewritten Package.swift locally and points the
+      # v<version> TAG at that commit (tags aren't covered by the branch
+      # ruleset). Consumers resolve the tag; the default branch keeps the
+      # placeholder Package.swift. Uses GITHUB_TOKEN (needs `contents: write`,
+      # set on this job) for the tag push only.
       - name: Checkout default branch
         if: ${{ needs.build-spm.result == 'success' }}
         uses: actions/checkout@v6
@@ -641,7 +640,7 @@ jobs:
       # v<version> tag onto that commit — so `.package(url:, from:)` resolves
       # the tag with a checksum that matches the attached zip. Idempotent: a
       # rerun with identical inputs makes no commit and just re-points the tag.
-      - name: Pin Package.swift + move tag (SPM)
+      - name: Pin Package.swift + tag (SPM)
         if: ${{ needs.build-spm.result == 'success' }}
         env:
           VERSION: ${{ needs.version.outputs.version }}
@@ -668,20 +667,22 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          BRANCH="${{ github.event.repository.default_branch }}"
-          if git diff --quiet -- Package.swift; then
-            echo "Package.swift already pinned for v${VERSION} — no commit needed"
-          else
-            git add Package.swift
-            git commit -m "chore(spm): pin CeraFFI.xcframework for v${VERSION}"
-            git push origin "HEAD:${BRANCH}"
-          fi
+          # The default branch is protected by a ruleset (bypass_actors: [], so
+          # even GITHUB_TOKEN can't push to it) — do NOT push the pin there.
+          # Instead create the checksum-pinned commit locally (parent = the
+          # merged release commit) and point the v<version> tag at it.
+          # `.package(url:, from:)` resolves the TAG, which carries the correct
+          # Package.swift + checksum; the default branch keeps the placeholder
+          # form (only a `branch: "main"` SPM dep would see it, which isn't the
+          # documented path). Tags are NOT covered by the branch ruleset, so the
+          # (force-)tag push is allowed. The sed always turns placeholders into
+          # real values, so there is always something to commit.
+          git add Package.swift
+          git commit -m "chore(spm): pin CeraFFI.xcframework for v${VERSION}"
           SHA=$(git rev-parse HEAD)
-          # Force-move the tag onto the pinned commit so the release (created
-          # below) and the tag both reference the checksum-correct Package.swift.
           git tag -f "v${VERSION}" "$SHA"
           git push -f origin "refs/tags/v${VERSION}"
-          echo "Tag v${VERSION} -> ${SHA}"
+          echo "Tag v${VERSION} -> ${SHA} (pinned Package.swift; default branch untouched)"
 
       # Idempotent: action-gh-release updates an existing tag/release in place
       # and re-uploads assets, so re-running after a partial publish is safe.

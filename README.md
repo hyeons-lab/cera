@@ -84,6 +84,7 @@ One Rust core, consumed from many places:
 | **CLI** | [`cera-cli`](cera-cli/) | the `cera` binary |
 | **Kotlin / Swift / Python** | [`cera-ffi`](cera-ffi/) (UniFFI) | JVM, Apple platforms |
 | **Android** | [`cera-ffi-kotlin`](cera-ffi-kotlin/) | Android apps (AAR) |
+| **iOS / macOS** | [`Package.swift`](Package.swift) (SwiftPM XCFramework) | Apple apps (`.package(url:)`) — CPU-only for now |
 | **Flutter / Dart** | [`cera-ffi-flutter`](cera-ffi-flutter/) | cross-platform mobile |
 | **Browser / Node** | [`cera-wasm`](cera-wasm/) (`@hyeons-lab/cera-wasm`) | WebAssembly + WebGPU |
 
