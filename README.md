@@ -88,6 +88,10 @@ One Rust core, consumed from many places:
 | **Flutter / Dart** | [`cera-ffi-flutter`](cera-ffi-flutter/) | cross-platform mobile |
 | **Browser / Node** | [`cera-wasm`](cera-wasm/) (`@hyeons-lab/cera-wasm`) | WebAssembly + WebGPU |
 
+A complete SwiftUI example app (streaming chat + embeddings + LoRA) that consumes
+the published Swift Package lives in [`examples/CeraChat`](examples/CeraChat/) —
+it doubles as a real-device Metal validation harness.
+
 ## Structured output (GBNF grammars)
 
 Force the model's output to match a grammar — useful for JSON, tool calls, or any
