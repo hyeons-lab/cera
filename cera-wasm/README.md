@@ -191,7 +191,9 @@ embedding heads.
 ```js
 import { LoraAdapters } from '@hyeons-lab/cera-wasm';
 
-// alpha is undefined ⇒ scale = 1 (PEFT keeps alpha in adapter_config.json)
+// Pass your PEFT adapter's `lora_alpha` (from its adapter_config.json) as the
+// 2nd arg; `undefined` ⇒ alpha defaults to the rank (scale = 1). The loader
+// does not read adapter_config.json for you.
 const adapters = LoraAdapters.fromSafetensorsBytes(safetensorsBytes, undefined);
 // ...or LoraAdapters.fromGgufBytes(ggufBytes)
 session.attachLora(adapters);          // hot-swap-able; session.removeLora() to detach

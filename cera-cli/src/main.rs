@@ -1121,9 +1121,10 @@ fn load_engine_from_spec(
 /// Attach a LoRA adapter to a freshly-created session when `--lora <PATH>` is
 /// set. Shared by `Run`, `Chat`, and `Embed` so every session-creation site
 /// applies the adapter identically. The file extension selects the loader:
-/// `.safetensors` → PEFT (`alpha` read from the sibling `adapter_config.json`,
-/// so `None` here ⇒ `scale = 1`); anything else → llama.cpp GGUF (`alpha` from
-/// the adapter's own metadata). Dimensions are validated against the model by
+/// `.safetensors` → PEFT (`scale = alpha / rank`, where `alpha` comes from
+/// `--lora-alpha`; without it `alpha` defaults to the rank, i.e. `scale = 1` —
+/// the loader does not read `adapter_config.json`); anything else → llama.cpp
+/// GGUF (`alpha` from the adapter's own metadata). Dimensions are validated by
 /// `attach_lora_adapters`, so a mismatched adapter errors clearly rather than
 /// corrupting output.
 fn attach_lora(
@@ -1151,24 +1152,18 @@ fn attach_lora(
 
 /// Format an `f32` for `embed --json` output. Non-finite values (`NaN` / `inf`)
 /// become `null` so the emitted array stays valid JSON.
-fn json_f32(v: &f32) -> String {
-    if v.is_finite() {
-        v.to_string()
-    } else {
-        "null".to_string()
-    }
-}
-
 /// Write one `[hidden_size]` row of an `embed` result to `w` — comma-separated
-/// (`json`, non-finite → `null`) or space-separated. Streams value-by-value so
-/// a long `--per-token` result never materializes the whole matrix as strings.
+/// (`json`, non-finite → `null`) or space-separated. Streams value-by-value,
+/// formatting each float straight into `w` (no per-element `String`), so a long
+/// `--per-token` result never materializes the whole matrix.
 fn write_embed_row<W: std::io::Write>(w: &mut W, row: &[f32], json: bool) -> std::io::Result<()> {
     for (j, v) in row.iter().enumerate() {
         if j > 0 {
             write!(w, "{}", if json { "," } else { " " })?;
         }
-        if json {
-            write!(w, "{}", json_f32(v))?;
+        // JSON has no NaN/inf literal — emit `null` so the array stays valid.
+        if json && !v.is_finite() {
+            write!(w, "null")?;
         } else {
             write!(w, "{v}")?;
         }
