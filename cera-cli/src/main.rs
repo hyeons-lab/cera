@@ -502,11 +502,17 @@ enum Command {
     /// Extract hidden-state embeddings for a prompt.
     ///
     /// Runs a side-effect-free prefill and prints the model's last-layer
-    /// hidden states (post-final-RMSNorm, matching llama.cpp). By default the
-    /// per-token states are mean-pooled into a single `[hidden_size]` vector
-    /// (the common classifier / retrieval embedding); `--per-token` emits the
-    /// full `[T*hidden_size]` matrix, one row per token. Requires a model whose
-    /// backend implements hidden-state extraction.
+    /// hidden states — post-final-RMSNorm, the same vector llama.cpp returns
+    /// under `--pooling none`. By default the per-token states are mean-pooled
+    /// into a single `[hidden_size]` vector (the common classifier / retrieval
+    /// embedding); `--per-token` emits the full `[T*hidden_size]` matrix, one
+    /// row per token. Requires a model whose backend implements hidden-state
+    /// extraction.
+    ///
+    /// The prompt is raw-encoded — no BOS token and no chat template — matching
+    /// the library's `hidden_states_for_text`, so the CLI and the SDK produce
+    /// identical vectors for the same text. (llama.cpp's embedding CLI prepends
+    /// BOS by default, so add it to your prompt if you need that exact parity.)
     Embed {
         /// Path to the model: a `.gguf` file, a `.json` LeapBundles
         /// manifest, or a directory containing exactly one `.json`
@@ -1105,7 +1111,11 @@ fn load_engine_from_spec(
 fn attach_lora(session: &mut cera::Session, lora: &Option<String>) -> Result<()> {
     if let Some(p) = lora {
         let path = Path::new(p);
-        let adapters = if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+        let is_safetensors = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
+        let adapters = if is_safetensors {
             cera::lora::LoraAdapterWeights::from_safetensors(path, None)
         } else {
             cera::lora::LoraAdapterWeights::from_gguf(path)
@@ -1115,6 +1125,16 @@ fn attach_lora(session: &mut cera::Session, lora: &Option<String>) -> Result<()>
         eprintln!("attached LoRA adapter: {p}");
     }
     Ok(())
+}
+
+/// Format an `f32` for `embed --json` output. Non-finite values (`NaN` / `inf`)
+/// become `null` so the emitted array stays valid JSON.
+fn json_f32(v: &f32) -> String {
+    if v.is_finite() {
+        v.to_string()
+    } else {
+        "null".to_string()
+    }
 }
 
 /// Configure the engine's KV prefix cache from the four CLI flags shared by
@@ -1735,7 +1755,10 @@ fn main() -> Result<()> {
                 let transcribe_compatible = prompt_is_empty
                     && temperature <= 0.0
                     && max_tokens == 256
-                    && kv_cache_keys == "f32";
+                    && kv_cache_keys == "f32"
+                    // `engine.transcribe` bypasses the session, so a LoRA adapter
+                    // could never be attached — fall through to the session path.
+                    && lora.is_none();
                 if system.as_deref() == Some("Perform ASR.") && transcribe_compatible {
                     let text = engine.transcribe(&pcm, sr)?;
                     println!("{text}");
@@ -2157,7 +2180,7 @@ fn main() -> Result<()> {
                     let json_rows: Vec<String> = rows
                         .iter()
                         .map(|row| {
-                            let vals: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+                            let vals: Vec<String> = row.iter().map(json_f32).collect();
                             format!("[{}]", vals.join(","))
                         })
                         .collect();
@@ -2171,7 +2194,7 @@ fn main() -> Result<()> {
             } else {
                 let pooled = session.hidden_states_mean_pooled(&tokens)?;
                 if json {
-                    let vals: Vec<String> = pooled.iter().map(|v| v.to_string()).collect();
+                    let vals: Vec<String> = pooled.iter().map(json_f32).collect();
                     println!("[{}]", vals.join(","));
                 } else {
                     let line: Vec<String> = pooled.iter().map(|v| v.to_string()).collect();
