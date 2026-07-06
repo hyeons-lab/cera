@@ -43,14 +43,24 @@ cera run -m model.gguf -p "..." --grammar @schema.gbnf
 
 # Interactive multi-turn chat REPL (keeps the prefix cache warm across turns)
 cera chat --bundle-id LFM2.5-1.2B-Instruct --quant Q4_0
+
+# Attach a LoRA adapter (llama.cpp .gguf or PEFT .safetensors) for the session
+cera run -m model.gguf -p "..." --lora adapter.safetensors
+cera chat -m model.gguf --lora adapter.gguf
+
+# Extract hidden-state embeddings for a prompt (mean-pooled [hidden_size] vector)
+cera embed -m model.gguf -p "a chunk of text to embed"
+cera embed -m model.gguf -p "a chunk" --per-token   # full [T*hidden_size] matrix, one row per token
+cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead of space-separated floats
 ```
 
 ### Commands
 
 | Command | Purpose |
 |---------|---------|
-| `run` | Run inference on a prompt — text, optional grammar/JSON, plus audio input for LFM2-Audio bundles. |
-| `chat` | Interactive multi-turn REPL with `/help`, `/clear`, `/exit` slash commands. |
+| `run` | Run inference on a prompt — text, optional grammar/JSON, plus audio input for LFM2-Audio bundles. Optional `--lora` adapter. |
+| `chat` | Interactive multi-turn REPL with `/help`, `/clear`, `/exit` slash commands. Optional `--lora` adapter. |
+| `embed` | Extract last-layer hidden-state embeddings for a prompt — mean-pooled by default, `--per-token` for the full matrix, `--json` for array output. |
 | `inspect` | Inspect a GGUF file's metadata and resolved CPU backend tier. |
 | `cpu` | Print the host's CPU backend tier + detected SIMD features (no model needed). |
 | `tokenize` | Tokenize text and print token IDs (e.g. to compare against HuggingFace). |
@@ -60,7 +70,10 @@ cera chat --bundle-id LFM2.5-1.2B-Instruct --quant Q4_0
 
 Run `cera <command> --help` for the full flag list. Common `run` flags:
 `--max-tokens` (default 256), `--temperature` (default 0.7), `--device`
-(`cpu` / `gpu` / `auto`, default `auto`), `--grammar` / `--json`.
+(`cpu` / `gpu` / `auto`, default `auto`), `--grammar` / `--json`, and `--lora`
+to attach a LoRA adapter. `run`, `chat`, and `embed` all accept `--lora <PATH>`
+(a llama.cpp `.gguf` or PEFT `.safetensors` adapter); it applies to every
+forward pass — generation and hidden-state extraction alike.
 
 ## License
 

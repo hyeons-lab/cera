@@ -171,6 +171,11 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Clap subcommand args live inline in each variant; `Run`/`Chat`/`Embed` carry
+// many flags so the variants differ in size. Boxing fields to equalize them
+// would fight the derive for no runtime benefit (the enum is built once at
+// startup), so allow the size disparity here.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Run inference on a prompt.
     Run {
@@ -370,6 +375,10 @@ enum Command {
         /// compressed caches lands in a follow-up.
         #[arg(long, default_value_t = 0)]
         n_keep: u32,
+
+        /// Attach a LoRA adapter (.gguf or PEFT .safetensors) for this session.
+        #[arg(long, value_name = "PATH")]
+        lora: Option<String>,
     },
 
     /// Inspect a GGUF model file.
@@ -484,6 +493,72 @@ enum Command {
         /// stdout is redirected.
         #[arg(long)]
         no_tui: bool,
+
+        /// Attach a LoRA adapter (.gguf or PEFT .safetensors) for this session.
+        #[arg(long, value_name = "PATH")]
+        lora: Option<String>,
+    },
+
+    /// Extract hidden-state embeddings for a prompt.
+    ///
+    /// Runs a side-effect-free prefill and prints the model's last-layer
+    /// hidden states (post-final-RMSNorm, matching llama.cpp). By default the
+    /// per-token states are mean-pooled into a single `[hidden_size]` vector
+    /// (the common classifier / retrieval embedding); `--per-token` emits the
+    /// full `[T*hidden_size]` matrix, one row per token. Requires a model whose
+    /// backend implements hidden-state extraction.
+    Embed {
+        /// Path to the model: a `.gguf` file, a `.json` LeapBundles
+        /// manifest, or a directory containing exactly one `.json`
+        /// manifest. Mutually exclusive with `--bundle-id` /
+        /// `--quant`; one of the two source forms must be set.
+        #[arg(
+            short,
+            long,
+            conflicts_with_all = ["bundle_id", "quant"],
+        )]
+        model: Option<String>,
+
+        /// LeapBundles bundle id (e.g. `LFM2.5-1.2B-Instruct` or
+        /// `LFM2.5-1.2B-Instruct-GGUF` — `-GGUF` is appended
+        /// automatically if missing). Pairs with `--quant` for
+        /// auto-download from `huggingface.co/LiquidAI/LeapBundles`.
+        #[arg(long, requires = "quant")]
+        bundle_id: Option<String>,
+
+        /// Quantization label for `--bundle-id` (e.g. `Q4_0`, `Q8_0`).
+        #[arg(long, requires = "bundle_id")]
+        quant: Option<String>,
+
+        /// Cache root for `--bundle-id` downloads. Default: `$HOME/.cache/cera`.
+        #[arg(long)]
+        cache_dir: Option<String>,
+
+        /// The prompt to embed.
+        #[arg(short, long)]
+        prompt: String,
+
+        /// Device to use: cpu, gpu, metal, or auto.
+        #[arg(long, default_value = "auto")]
+        device: String,
+
+        /// Max context window size. Default 4096.
+        #[arg(long, default_value_t = 4096)]
+        context_size: usize,
+
+        /// Emit per-token hidden states (`[T*hidden_size]`, one line per
+        /// token) instead of the default mean-pooled `[hidden_size]` vector.
+        #[arg(long)]
+        per_token: bool,
+
+        /// Output as a JSON array (`[[..], ..]` per-token, or `[..]` pooled)
+        /// instead of space-separated floats.
+        #[arg(long)]
+        json: bool,
+
+        /// Attach a LoRA adapter (.gguf or PEFT .safetensors) for this session.
+        #[arg(long, value_name = "PATH")]
+        lora: Option<String>,
     },
 
     /// Tokenize text and print token IDs (for comparison with HuggingFace).
@@ -1019,6 +1094,29 @@ fn load_engine_from_spec(
     Ok(engine)
 }
 
+/// Attach a LoRA adapter to a freshly-created session when `--lora <PATH>` is
+/// set. Shared by `Run`, `Chat`, and `Embed` so every session-creation site
+/// applies the adapter identically. The file extension selects the loader:
+/// `.safetensors` → PEFT (`alpha` read from the sibling `adapter_config.json`,
+/// so `None` here ⇒ `scale = 1`); anything else → llama.cpp GGUF (`alpha` from
+/// the adapter's own metadata). Dimensions are validated against the model by
+/// `attach_lora_adapters`, so a mismatched adapter errors clearly rather than
+/// corrupting output.
+fn attach_lora(session: &mut cera::Session, lora: &Option<String>) -> Result<()> {
+    if let Some(p) = lora {
+        let path = Path::new(p);
+        let adapters = if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+            cera::lora::LoraAdapterWeights::from_safetensors(path, None)
+        } else {
+            cera::lora::LoraAdapterWeights::from_gguf(path)
+        }
+        .with_context(|| format!("loading LoRA adapter {p}"))?;
+        session.attach_lora_adapters(adapters)?;
+        eprintln!("attached LoRA adapter: {p}");
+    }
+    Ok(())
+}
+
 /// Configure the engine's KV prefix cache from the four CLI flags shared by
 /// `Run` and `Chat`. Encapsulates the `<root>/kv` derivation rule + the
 /// `--no-cache` short-circuit so both subcommands stay in sync.
@@ -1428,6 +1526,7 @@ fn main() -> Result<()> {
             kv_cache_keys,
             ubatch_size,
             n_keep,
+            lora,
         } => {
             // Compile the grammar (if any) up front so a malformed GBNF fails fast,
             // before the engine loads ~1 GB of weights. `--json` uses a bundled grammar;
@@ -1521,6 +1620,7 @@ fn main() -> Result<()> {
                     n_keep,
                     ..Default::default()
                 });
+                attach_lora(&mut session, &lora)?;
                 // Honored by `append_chat_with_images` below (and any
                 // later append) — bounds each image's encoded long side.
                 session.set_image_max_long_size(max_long_size);
@@ -1649,6 +1749,7 @@ fn main() -> Result<()> {
                     n_keep,
                     ..Default::default()
                 });
+                attach_lora(&mut session, &lora)?;
 
                 let prefill_start = std::time::Instant::now();
                 if let Some(sys) = &system {
@@ -1953,6 +2054,7 @@ fn main() -> Result<()> {
                     n_keep,
                     ..Default::default()
                 });
+                attach_lora(&mut session, &lora)?;
 
                 let prefill_start = std::time::Instant::now();
                 session.append_tokens(&tokens)?;
@@ -2004,6 +2106,78 @@ fn main() -> Result<()> {
             let tok = cera::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
             let ids = tok.encode(&text);
             println!("{ids:?}");
+        }
+        Command::Embed {
+            model,
+            bundle_id,
+            quant,
+            cache_dir,
+            prompt,
+            device,
+            context_size,
+            per_token,
+            json,
+            lora,
+        } => {
+            let engine = resolve_engine(
+                model.as_deref(),
+                bundle_id.as_deref(),
+                quant.as_deref(),
+                cache_dir.as_deref(),
+                &device,
+                context_size,
+            )?;
+
+            // Fail clearly before prefill if the resolved backend can't extract
+            // hidden states (rather than surfacing an opaque UnsupportedModality
+            // from deep inside `hidden_states_*`).
+            if !engine.model().supports_hidden_states() {
+                anyhow::bail!(
+                    "model/backend `{}` does not support hidden-state extraction; \
+                     try `--device cpu`",
+                    engine.metadata().architecture
+                );
+            }
+
+            let mut session = engine.new_session(cera::SessionConfig::default());
+            attach_lora(&mut session, &lora)?;
+
+            // Tokenize with the session's tokenizer so the ids match the model's
+            // vocab exactly (same path `hidden_states_for_text` would take).
+            let tokens = session.tokenizer().encode(&prompt);
+            if tokens.is_empty() {
+                anyhow::bail!("prompt tokenized to zero tokens; nothing to embed");
+            }
+            let hidden_size = session.hidden_size();
+
+            if per_token {
+                let flat = session.hidden_states_for_tokens(&tokens)?;
+                let rows: Vec<&[f32]> = flat.chunks_exact(hidden_size).collect();
+                if json {
+                    let json_rows: Vec<String> = rows
+                        .iter()
+                        .map(|row| {
+                            let vals: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+                            format!("[{}]", vals.join(","))
+                        })
+                        .collect();
+                    println!("[{}]", json_rows.join(","));
+                } else {
+                    for row in rows {
+                        let line: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+                        println!("{}", line.join(" "));
+                    }
+                }
+            } else {
+                let pooled = session.hidden_states_mean_pooled(&tokens)?;
+                if json {
+                    let vals: Vec<String> = pooled.iter().map(|v| v.to_string()).collect();
+                    println!("[{}]", vals.join(","));
+                } else {
+                    let line: Vec<String> = pooled.iter().map(|v| v.to_string()).collect();
+                    println!("{}", line.join(" "));
+                }
+            }
         }
         Command::ListBundles { quants } => {
             // One HTTP round-trip; sorted output. Quants are
@@ -2067,6 +2241,7 @@ fn main() -> Result<()> {
             temperature,
             seed,
             no_tui,
+            lora,
         } => {
             use std::io::BufRead;
 
@@ -2104,10 +2279,11 @@ fn main() -> Result<()> {
                 );
             }
 
-            let session = engine.new_session(cera::SessionConfig {
+            let mut session = engine.new_session(cera::SessionConfig {
                 seed,
                 ..Default::default()
             });
+            attach_lora(&mut session, &lora)?;
 
             let mut history: Vec<cera::tokenizer::ChatMessage> = Vec::new();
             // Parallel to `history`: each entry holds the images
@@ -3269,6 +3445,83 @@ mod tests {
             r.is_ok(),
             "expected full `chat` flag surface to parse, got: {:?}",
             r.err()
+        );
+    }
+
+    /// `run`, `chat`, and `embed` all accept `--lora <PATH>`; the flag
+    /// must parse and thread into the command's `lora` field.
+    #[test]
+    fn lora_flag_parses_on_run_chat_embed() {
+        let run = Cli::try_parse_from([
+            "cera",
+            "run",
+            "-m",
+            "/tmp/x",
+            "-p",
+            "hi",
+            "--lora",
+            "/tmp/a.safetensors",
+        ]);
+        let Ok(Cli {
+            command: Command::Run { lora, .. },
+        }) = run
+        else {
+            panic!("expected `run --lora` to parse, got: {:?}", run.err());
+        };
+        assert_eq!(lora.as_deref(), Some("/tmp/a.safetensors"));
+
+        let chat = Cli::try_parse_from(["cera", "chat", "-m", "/tmp/x", "--lora", "/tmp/a.gguf"]);
+        let Ok(Cli {
+            command: Command::Chat { lora, .. },
+        }) = chat
+        else {
+            panic!("expected `chat --lora` to parse, got: {:?}", chat.err());
+        };
+        assert_eq!(lora.as_deref(), Some("/tmp/a.gguf"));
+    }
+
+    /// `embed` requires `--prompt`, accepts a model source, and exposes
+    /// `--per-token` / `--json` / `--lora`.
+    #[test]
+    fn embed_subcommand_parses_full_surface() {
+        let r = Cli::try_parse_from([
+            "cera",
+            "embed",
+            "-m",
+            "/tmp/x",
+            "-p",
+            "a chunk",
+            "--per-token",
+            "--json",
+            "--lora",
+            "/tmp/a.gguf",
+        ]);
+        let Ok(Cli {
+            command:
+                Command::Embed {
+                    prompt,
+                    per_token,
+                    json,
+                    lora,
+                    ..
+                },
+        }) = r
+        else {
+            panic!("expected full `embed` surface to parse, got: {:?}", r.err());
+        };
+        assert_eq!(prompt, "a chunk");
+        assert!(per_token);
+        assert!(json);
+        assert_eq!(lora.as_deref(), Some("/tmp/a.gguf"));
+    }
+
+    /// `embed` without `--prompt` is rejected by clap — the prompt is required.
+    #[test]
+    fn embed_subcommand_requires_prompt() {
+        let r = Cli::try_parse_from(["cera", "embed", "-m", "/tmp/x"]);
+        assert!(
+            r.is_err(),
+            "expected `embed` without --prompt to be rejected"
         );
     }
 
