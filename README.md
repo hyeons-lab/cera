@@ -65,8 +65,8 @@ or you can pin one:
 | **Native Metal** | `metal` | macOS, iOS | Hand-written MSL shaders, single-encoder dispatch, GPU argmax |
 | **wgpu** | `gpu` | macOS, Linux, Windows, browser | WGSL shaders over **Metal / Vulkan / DX12 / WebGPU** |
 
-`--device auto` uses native Metal on macOS and wgpu where a GPU is available,
-falling back to CPU otherwise.
+`--device auto` uses native Metal on macOS and iOS, and wgpu where a GPU is
+available, falling back to CPU otherwise.
 
 ### Quantization
 

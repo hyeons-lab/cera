@@ -39,7 +39,7 @@ sha2 = { workspace = true, optional = true }
 # don't pay for themselves until users demand WebP/AVIF/etc.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 
-# BLAS providers: Apple Accelerate on macOS (unlocks AMX), OpenBLAS elsewhere.
+# BLAS providers: Apple Accelerate on macOS + iOS (unlocks AMX), OpenBLAS elsewhere.
 # Only the provider crate for the current target is pulled in, so cross-platform
 # builds with the `blas` feature work out of the box on supported hosts.
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]

@@ -1247,7 +1247,7 @@ fn load_text_model(
         }
         #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
         BackendPreference::Metal => Err(CeraError::Backend(
-            "Metal backend not available (compile with --features metal on macOS)".into(),
+            "Metal backend not available (compile with --features metal on macOS or iOS)".into(),
         )),
     }
 }
