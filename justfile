@@ -226,9 +226,24 @@ android-libs:
 apple-xcframework:
     #!/usr/bin/env bash
     set -euo pipefail
-    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release
-    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios-sim --release
-    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release
+    # Metal-enabled slices. The Metal backend is iOS-portable (Shared
+    # storage + system_default device); `--features metal` makes it the
+    # Auto-preferred GPU backend on all three arm64 slices, with CPU
+    # fallback. The `Cera` SwiftPM target links Metal.framework +
+    # Foundation (see Package.swift `linkerSettings`) — a static lib
+    # doesn't auto-link the system frameworks its symbols reference.
+    #
+    # Deployment targets pin the slices to Package.swift's
+    # `.macOS(.v12)` / `.iOS(.v15)` so a newer host SDK doesn't stamp a
+    # higher `minos` into the staticlib (which otherwise warns
+    # "built for newer macOS version than being linked" at consumer
+    # link time). MACOSX_/IPHONEOS_ are each read only by the matching
+    # target, so exporting both is safe.
+    export MACOSX_DEPLOYMENT_TARGET=12.0
+    export IPHONEOS_DEPLOYMENT_TARGET=15.0
+    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release --features metal
+    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios-sim --release --features metal
+    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release --features metal
     OUT=target/xcframework-build
     rm -rf "$OUT"
     mkdir -p "$OUT/headers"
@@ -298,7 +313,7 @@ spm-xcframework-zip: apple-xcframework
 # apple-darwin), but the override forestalls an externally-set
 # RUSTFLAGS environment variable from contaminating this smoke build.
 ios-arm64:
-    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release
+    IPHONEOS_DEPLOYMENT_TARGET=15.0 RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release --features metal
 
 # End-to-end Swift integration test against the macOS slice. Compiles
 # `cera-ffi/tests/swift/main.swift` together with the vendored Swift
@@ -317,13 +332,18 @@ ios-arm64:
 swift-smoke:
     #!/usr/bin/env bash
     set -euo pipefail
-    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release
+    MACOSX_DEPLOYMENT_TARGET=12.0 RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release --features metal
+    # Metal-enabled staticlib references Metal.framework symbols the
+    # linker must resolve explicitly (`-framework Metal`); Foundation
+    # auto-links on Apple platforms but is listed for parity with the
+    # SwiftPM `Cera` target's linkerSettings.
     swiftc \
         cera-ffi/tests/swift/main.swift \
         cera-ffi/bindings/swift/cera_ffi.swift \
         -import-objc-header cera-ffi/bindings/swift/cera_ffiFFI.h \
         -L target/aarch64-apple-darwin/release \
         -lcera_ffi \
+        -framework Metal \
         -o target/cera-swift-smoke
     target/cera-swift-smoke
 

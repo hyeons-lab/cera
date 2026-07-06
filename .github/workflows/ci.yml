@@ -664,11 +664,23 @@ jobs:
         # CI runner doesn't have `just` installed by default and
         # adding a setup-just step for a single-recipe job would be
         # more weight than the recipe itself.
+        # Metal-enabled slices (`--features metal`): the Metal backend is
+        # iOS-portable (Shared storage + system_default device) and
+        # becomes the Auto-preferred GPU backend on every slice, with CPU
+        # fallback. The `Cera` SwiftPM target links Metal.framework +
+        # Foundation (Package.swift `linkerSettings`).
+        #
+        # Deployment-target env pins the slices to Package.swift's
+        # `.macOS(.v12)` / `.iOS(.v15)` so a newer runner SDK doesn't
+        # stamp a higher `minos` (which warns at consumer link time).
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          IPHONEOS_DEPLOYMENT_TARGET: "15.0"
         run: |
           set -euo pipefail
-          cargo build -p cera-ffi --target aarch64-apple-ios --release
-          cargo build -p cera-ffi --target aarch64-apple-ios-sim --release
-          cargo build -p cera-ffi --target aarch64-apple-darwin --release
+          cargo build -p cera-ffi --target aarch64-apple-ios --release --features metal
+          cargo build -p cera-ffi --target aarch64-apple-ios-sim --release --features metal
+          cargo build -p cera-ffi --target aarch64-apple-darwin --release --features metal
           OUT=target/xcframework-build
           rm -rf "$OUT"
           mkdir -p "$OUT/headers"
@@ -744,6 +756,7 @@ jobs:
               -import-objc-header cera-ffi/bindings/swift/cera_ffiFFI.h \
               -L target/aarch64-apple-darwin/release \
               -lcera_ffi \
+              -framework Metal \
               -o /tmp/cera-swift-smoke
           /tmp/cera-swift-smoke
       - name: Verify XCFramework slices

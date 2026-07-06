@@ -54,7 +54,7 @@ Four tiers with runtime dispatch:
 1. **`cpu.rs`** — scalar reference implementations operating on raw `&[f32]` slices (no Tensor in the hot path)
 2. **`simd.rs`** — NEON (aarch64) and AVX2 (x86_64) optimized `vec_dot` kernels with compile-time + runtime dispatch
 3. **`wgpu.rs`** — cross-platform GPU backend (`gpu` feature). Functional: WGSL GEMV/GEMM kernels (incl. quantized `gemm_q8_0`/`gemm_q4_0`), the ViT vision encoder, and decode + batched prefill for both LFM2 and dense transformers (llama/qwen2/qwen3/granite)
-4. **`metal/`** — native Apple Metal backend (`metal` feature, macOS) with MSL kernels — the `Auto`-preferred GPU backend, running decode + batched prefill for LFM2 and dense transformers plus the ViT vision encoder
+4. **`metal/`** — native Apple Metal backend (`metal` feature, macOS + iOS) with MSL kernels — the `Auto`-preferred GPU backend, running decode + batched prefill for LFM2 and dense transformers plus the ViT vision encoder. The shipped `CeraFFI.xcframework` (SwiftPM) is Metal-enabled across all three arm64 slices (iOS device, iOS Simulator, native macOS)
 
 ### Models (`model/`)
 

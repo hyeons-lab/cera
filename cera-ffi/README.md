@@ -288,12 +288,18 @@ targets: [
 or in Xcode via **File → Add Package Dependencies…** with the same
 URL. Then `import Cera`.
 
-**CPU-only.** The shipped `CeraFFI.xcframework` is built without the
-`metal` feature, so inference runs on the CPU (Accelerate / NEON) on
-device, the Simulator, and native macOS. A Metal-accelerated iOS
-slice is a planned follow-up. The framework carries three arm64-only
-slices — `ios-arm64`, `ios-arm64-simulator`, `macos-arm64` — so the
-package targets `.iOS(.v15)` / `.macOS(.v12)` (no x86_64).
+**Metal GPU.** The shipped `CeraFFI.xcframework` is built **with** the
+`metal` feature, so inference prefers the native Metal backend (Auto
+probes Metal → CPU) on device, the Simulator, and native macOS,
+falling back to the CPU (Accelerate / NEON) when Metal is unavailable.
+Because the slices are Metal-enabled *static* libraries, the `Cera`
+SwiftPM target links `Metal.framework` + `Foundation` explicitly
+(`linkerSettings` in `Package.swift`) — a `.binaryTarget` static lib
+does not auto-link the system frameworks its symbols reference, so
+without those a consumer would hit undefined-symbol link errors. The
+framework carries three arm64-only slices — `ios-arm64`,
+`ios-arm64-simulator`, `macos-arm64` — so the package targets
+`.iOS(.v15)` / `.macOS(.v12)` (no x86_64).
 
 How it resolves:
 
