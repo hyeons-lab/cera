@@ -1,0 +1,43 @@
+# XcodeGen spec for the CeraChat example app.
+#
+# project.yml is the source of truth. The generated CeraChat.xcodeproj is
+# git-ignored — regenerate it after cloning (`brew install xcodegen`):
+#     xcodegen generate
+# (run from this directory), then open CeraChat.xcodeproj in Xcode.
+name: CeraChat
+options:
+  bundleIdPrefix: com.hyeonslab
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+# Pull the published Cera SwiftPM package. SwiftPM maps the `v`-prefixed
+# release tags (v0.2.4, …) onto these SemVer bounds automatically, so
+# `from: 0.2.4` resolves to the v0.2.4 release's Metal-enabled XCFramework.
+packages:
+  Cera:
+    url: https://github.com/hyeons-lab/cera
+    from: "0.2.4"
+
+targets:
+  CeraChat:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Sources
+    dependencies:
+      - package: Cera
+        product: Cera
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hyeonslab.cerachat
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # Let Xcode synthesize the Info.plist (SwiftUI App lifecycle).
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_CFBundleDisplayName: CeraChat
