@@ -269,33 +269,76 @@ CeraFFI.xcframework/
 
 ### Swift Package Manager consumption
 
-Drop the `CeraFFI.xcframework` into your SPM package alongside the
-generated Swift binding (`cera_ffi.swift` from
-`cera-ffi/bindings/swift/`):
+The repo root ships a consumable **`Cera`** SwiftPM package. Add it to
+any iOS / macOS app the usual way:
 
 ```swift
 // Package.swift
-let package = Package(
-    name: "MyApp",
-    targets: [
-        .target(
-            name: "CeraFFISwift",
-            dependencies: [.target(name: "CeraFFI")],
-            path: "Sources/CeraFFISwift",
-            // cera_ffi.swift goes here.
-        ),
-        .binaryTarget(
-            name: "CeraFFI",
-            path: "Frameworks/CeraFFI.xcframework"
-        ),
-    ]
-)
+dependencies: [
+    .package(url: "https://github.com/hyeons-lab/cera", from: "0.2.3"),
+],
+targets: [
+    .target(
+        name: "MyApp",
+        dependencies: [.product(name: "Cera", package: "cera")]
+    ),
+]
 ```
 
-For a remote-pulled XCFramework via SPM, package the framework into
-a zip + checksum it (`swift package compute-checksum`) and reference
-the URL in your `Package.swift` — out of scope for this crate but
-the pattern is standard SPM.
+or in Xcode via **File → Add Package Dependencies…** with the same
+URL. Then `import Cera`.
+
+**CPU-only.** The shipped `CeraFFI.xcframework` is built without the
+`metal` feature, so inference runs on the CPU (Accelerate / NEON) on
+device, the Simulator, and native macOS. A Metal-accelerated iOS
+slice is a planned follow-up. The framework carries three arm64-only
+slices — `ios-arm64`, `ios-arm64-simulator`, `macos-arm64` — so the
+package targets `.iOS(.v15)` / `.macOS(.v12)` (no x86_64).
+
+How it resolves:
+
+- The root `Package.swift` declares a remote
+  `.binaryTarget(name: "CeraFFI", url: …/releases/download/v<version>/CeraFFI.xcframework.zip, checksum: …)`
+  — SPM downloads the prebuilt XCFramework from the matching GitHub
+  release, so consumers never compile Rust.
+- A thin `Cera` Swift target holds the UniFFI-generated wrapper
+  (`cera-ffi/apple/Sources/Cera/cera_ffi.swift`, a committed copy of
+  the vendored `cera-ffi/bindings/swift/cera_ffi.swift`) and depends on
+  `CeraFFI` so `import cera_ffiFFI` resolves against the XCFramework's
+  clang module.
+
+The `url` + `checksum` are checked in with the literal placeholders
+`RELEASE_VERSION` / `RELEASE_CHECKSUM`; the `release` job in
+`.github/workflows/publish.yml` rewrites them per release, commits the
+result to the default branch, and points the `v<version>` tag at that
+commit so `.package(url:, from:)` resolves the tag with a valid
+checksum.
+
+**Releasing / validating locally.** `just spm-xcframework-zip` builds,
+zips, and prints the `swift package compute-checksum` of the
+XCFramework (the manual counterpart to the workflow's `build-spm`
+job). To validate the package end-to-end, build the framework and
+temporarily point the binary target at the local path:
+
+```bash
+just apple-xcframework
+# in Package.swift, swap the remote .binaryTarget(url:checksum:) for:
+#   .binaryTarget(name: "CeraFFI",
+#                 path: "target/xcframework-build/CeraFFI.xcframework")
+swift build   # compiles cera_ffi.swift against the local macOS slice
+```
+
+Revert to the url/placeholder form before committing. After
+regenerating the Swift bindings, run `just spm-sync-binding` to keep
+the package's `cera_ffi.swift` copy byte-identical to the vendored one.
+
+For a **local, vendored** XCFramework instead of the remote release
+(e.g. an app that bundles its own build), drop `CeraFFI.xcframework`
+into your package and reference it by path:
+
+```swift
+.binaryTarget(name: "CeraFFI", path: "Frameworks/CeraFFI.xcframework")
+```
 
 ### CI artifact
 
