@@ -183,9 +183,10 @@ engine.free();
 ### LoRA adapters & hidden states
 
 Load a LoRA adapter from bytes (GGUF or PEFT `.safetensors`) and attach it to a
-session — applied at inference time, never merged, so it hot-swaps / unloads per
-request. Then pull per-token hidden states out of the engine (reflecting the
-active adapter) for classifier / embedding heads.
+session — applied at inference time, never merged, so it hot-swaps freely (and
+detaches on demand with `session.removeLora()`). Then pull per-token hidden
+states out of the engine (reflecting the active adapter) for classifier /
+embedding heads.
 
 ```js
 import { LoraAdapters } from '@hyeons-lab/cera-wasm';
@@ -196,11 +197,11 @@ const adapters = LoraAdapters.fromSafetensorsBytes(safetensorsBytes, undefined);
 session.attachLora(adapters);          // hot-swap-able; session.removeLora() to detach
 session.hasLora();                     // → true
 
-const tokens = tokenizer.encode('a transcript chunk');
+const tokens = engine.tokenizer.encode('a transcript chunk'); // Uint32Array
 const pooled = session.hiddenStatesMeanPooled(tokens);  // Float32Array, length hiddenSize
 const perToken = session.hiddenStatesForTokens(tokens); // Float32Array, tokens.length * hiddenSize
 
-adapters.free();
+adapters.free();  // frees the JS handle; the attached copy stays live in the session
 ```
 
 ### Reproducibility (seeded sampler)

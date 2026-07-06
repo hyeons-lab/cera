@@ -70,10 +70,12 @@ cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead 
 
 Run `cera <command> --help` for the full flag list. Common `run` flags:
 `--max-tokens` (default 256), `--temperature` (default 0.7), `--device`
-(`cpu` / `gpu` / `auto`, default `auto`), `--grammar` / `--json`, and `--lora`
-to attach a LoRA adapter. `run`, `chat`, and `embed` all accept `--lora <PATH>`
-(a llama.cpp `.gguf` or PEFT `.safetensors` adapter); it applies to every
-forward pass — generation and hidden-state extraction alike.
+(`cpu` / `gpu` / `metal` / `auto`, default `auto`), `--grammar` / `--json`, and
+`--lora` to attach a LoRA adapter. `run`, `chat`, and `embed` all accept `--lora
+<PATH>` (a llama.cpp `.gguf` or PEFT `.safetensors` adapter); it applies to every
+forward pass — generation and hidden-state extraction alike. For a PEFT
+`.safetensors` adapter whose `alpha` differs from its rank, pass `--lora-alpha
+<ALPHA>` (`scale = alpha / rank`; `.gguf` adapters carry alpha in their metadata).
 
 ## License
 

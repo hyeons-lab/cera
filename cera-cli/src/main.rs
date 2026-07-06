@@ -379,6 +379,12 @@ enum Command {
         /// Attach a LoRA adapter (.gguf or PEFT .safetensors) for this session.
         #[arg(long, value_name = "PATH")]
         lora: Option<String>,
+
+        /// LoRA `alpha` for a PEFT `.safetensors` adapter (`scale = alpha /
+        /// rank`); defaults to `alpha = rank` (scale = 1). Ignored for `.gguf`
+        /// adapters, which carry alpha in their own metadata.
+        #[arg(long, value_name = "ALPHA", requires = "lora")]
+        lora_alpha: Option<f32>,
     },
 
     /// Inspect a GGUF model file.
@@ -497,6 +503,12 @@ enum Command {
         /// Attach a LoRA adapter (.gguf or PEFT .safetensors) for this session.
         #[arg(long, value_name = "PATH")]
         lora: Option<String>,
+
+        /// LoRA `alpha` for a PEFT `.safetensors` adapter (`scale = alpha /
+        /// rank`); defaults to `alpha = rank` (scale = 1). Ignored for `.gguf`
+        /// adapters, which carry alpha in their own metadata.
+        #[arg(long, value_name = "ALPHA", requires = "lora")]
+        lora_alpha: Option<f32>,
     },
 
     /// Extract hidden-state embeddings for a prompt.
@@ -565,6 +577,12 @@ enum Command {
         /// Attach a LoRA adapter (.gguf or PEFT .safetensors) for this session.
         #[arg(long, value_name = "PATH")]
         lora: Option<String>,
+
+        /// LoRA `alpha` for a PEFT `.safetensors` adapter (`scale = alpha /
+        /// rank`); defaults to `alpha = rank` (scale = 1). Ignored for `.gguf`
+        /// adapters, which carry alpha in their own metadata.
+        #[arg(long, value_name = "ALPHA", requires = "lora")]
+        lora_alpha: Option<f32>,
     },
 
     /// Tokenize text and print token IDs (for comparison with HuggingFace).
@@ -1108,7 +1126,11 @@ fn load_engine_from_spec(
 /// the adapter's own metadata). Dimensions are validated against the model by
 /// `attach_lora_adapters`, so a mismatched adapter errors clearly rather than
 /// corrupting output.
-fn attach_lora(session: &mut cera::Session, lora: &Option<String>) -> Result<()> {
+fn attach_lora(
+    session: &mut cera::Session,
+    lora: &Option<String>,
+    lora_alpha: Option<f32>,
+) -> Result<()> {
     if let Some(p) = lora {
         let path = Path::new(p);
         let is_safetensors = path
@@ -1116,7 +1138,7 @@ fn attach_lora(session: &mut cera::Session, lora: &Option<String>) -> Result<()>
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
         let adapters = if is_safetensors {
-            cera::lora::LoraAdapterWeights::from_safetensors(path, None)
+            cera::lora::LoraAdapterWeights::from_safetensors(path, lora_alpha)
         } else {
             cera::lora::LoraAdapterWeights::from_gguf(path)
         }
@@ -1547,6 +1569,7 @@ fn main() -> Result<()> {
             ubatch_size,
             n_keep,
             lora,
+            lora_alpha,
         } => {
             // Compile the grammar (if any) up front so a malformed GBNF fails fast,
             // before the engine loads ~1 GB of weights. `--json` uses a bundled grammar;
@@ -1640,7 +1663,7 @@ fn main() -> Result<()> {
                     n_keep,
                     ..Default::default()
                 });
-                attach_lora(&mut session, &lora)?;
+                attach_lora(&mut session, &lora, lora_alpha)?;
                 // Honored by `append_chat_with_images` below (and any
                 // later append) — bounds each image's encoded long side.
                 session.set_image_max_long_size(max_long_size);
@@ -1772,7 +1795,7 @@ fn main() -> Result<()> {
                     n_keep,
                     ..Default::default()
                 });
-                attach_lora(&mut session, &lora)?;
+                attach_lora(&mut session, &lora, lora_alpha)?;
 
                 let prefill_start = std::time::Instant::now();
                 if let Some(sys) = &system {
@@ -2077,7 +2100,7 @@ fn main() -> Result<()> {
                     n_keep,
                     ..Default::default()
                 });
-                attach_lora(&mut session, &lora)?;
+                attach_lora(&mut session, &lora, lora_alpha)?;
 
                 let prefill_start = std::time::Instant::now();
                 session.append_tokens(&tokens)?;
@@ -2141,6 +2164,7 @@ fn main() -> Result<()> {
             per_token,
             json,
             lora,
+            lora_alpha,
         } => {
             let engine = resolve_engine(
                 model.as_deref(),
@@ -2156,14 +2180,14 @@ fn main() -> Result<()> {
             // from deep inside `hidden_states_*`).
             if !engine.model().supports_hidden_states() {
                 anyhow::bail!(
-                    "model/backend `{}` does not support hidden-state extraction; \
-                     try `--device cpu`",
+                    "hidden-state extraction is not implemented for the `{}` model on \
+                     this backend; try `--device cpu`",
                     engine.metadata().architecture
                 );
             }
 
             let mut session = engine.new_session(cera::SessionConfig::default());
-            attach_lora(&mut session, &lora)?;
+            attach_lora(&mut session, &lora, lora_alpha)?;
 
             // Tokenize with the session's tokenizer so the ids match the model's
             // vocab exactly (same path `hidden_states_for_text` would take).
@@ -2265,6 +2289,7 @@ fn main() -> Result<()> {
             seed,
             no_tui,
             lora,
+            lora_alpha,
         } => {
             use std::io::BufRead;
 
@@ -2306,7 +2331,7 @@ fn main() -> Result<()> {
                 seed,
                 ..Default::default()
             });
-            attach_lora(&mut session, &lora)?;
+            attach_lora(&mut session, &lora, lora_alpha)?;
 
             let mut history: Vec<cera::tokenizer::ChatMessage> = Vec::new();
             // Parallel to `history`: each entry holds the images
@@ -3501,6 +3526,32 @@ mod tests {
             panic!("expected `chat --lora` to parse, got: {:?}", chat.err());
         };
         assert_eq!(lora.as_deref(), Some("/tmp/a.gguf"));
+
+        let embed = Cli::try_parse_from([
+            "cera",
+            "embed",
+            "-m",
+            "/tmp/x",
+            "-p",
+            "hi",
+            "--lora",
+            "/tmp/a.safetensors",
+            "--lora-alpha",
+            "16",
+        ]);
+        let Ok(Cli {
+            command: Command::Embed {
+                lora, lora_alpha, ..
+            },
+        }) = embed
+        else {
+            panic!(
+                "expected `embed --lora --lora-alpha` to parse, got: {:?}",
+                embed.err()
+            );
+        };
+        assert_eq!(lora.as_deref(), Some("/tmp/a.safetensors"));
+        assert_eq!(lora_alpha, Some(16.0));
     }
 
     /// `embed` requires `--prompt`, accepts a model source, and exposes
