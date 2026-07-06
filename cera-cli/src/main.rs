@@ -1159,6 +1159,23 @@ fn json_f32(v: &f32) -> String {
     }
 }
 
+/// Write one `[hidden_size]` row of an `embed` result to `w` — comma-separated
+/// (`json`, non-finite → `null`) or space-separated. Streams value-by-value so
+/// a long `--per-token` result never materializes the whole matrix as strings.
+fn write_embed_row<W: std::io::Write>(w: &mut W, row: &[f32], json: bool) -> std::io::Result<()> {
+    for (j, v) in row.iter().enumerate() {
+        if j > 0 {
+            write!(w, "{}", if json { "," } else { " " })?;
+        }
+        if json {
+            write!(w, "{}", json_f32(v))?;
+        } else {
+            write!(w, "{v}")?;
+        }
+    }
+    Ok(())
+}
+
 /// Configure the engine's KV prefix cache from the four CLI flags shared by
 /// `Run` and `Chat`. Encapsulates the `<root>/kv` derivation rule + the
 /// `--no-cache` short-circuit so both subcommands stay in sync.
@@ -2197,34 +2214,58 @@ fn main() -> Result<()> {
             }
             let hidden_size = session.hidden_size();
 
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut w = std::io::BufWriter::new(stdout.lock());
+
             if per_token {
                 let flat = session.hidden_states_for_tokens(&tokens)?;
-                let rows: Vec<&[f32]> = flat.chunks_exact(hidden_size).collect();
+                // The backend must return exactly [tokens × hidden_size]; a
+                // mismatch would let `chunks_exact` silently drop a remainder.
+                anyhow::ensure!(
+                    flat.len() == tokens.len() * hidden_size,
+                    "hidden-state buffer length {} != tokens ({}) × hidden_size ({})",
+                    flat.len(),
+                    tokens.len(),
+                    hidden_size
+                );
                 if json {
-                    let json_rows: Vec<String> = rows
-                        .iter()
-                        .map(|row| {
-                            let vals: Vec<String> = row.iter().map(json_f32).collect();
-                            format!("[{}]", vals.join(","))
-                        })
-                        .collect();
-                    println!("[{}]", json_rows.join(","));
+                    // Stream row-by-row so a long prompt never materializes the
+                    // whole [T*hidden_size] output as strings at once.
+                    write!(w, "[")?;
+                    for (i, row) in flat.chunks_exact(hidden_size).enumerate() {
+                        if i > 0 {
+                            write!(w, ",")?;
+                        }
+                        write!(w, "[")?;
+                        write_embed_row(&mut w, row, true)?;
+                        write!(w, "]")?;
+                    }
+                    writeln!(w, "]")?;
                 } else {
-                    for row in rows {
-                        let line: Vec<String> = row.iter().map(|v| v.to_string()).collect();
-                        println!("{}", line.join(" "));
+                    for row in flat.chunks_exact(hidden_size) {
+                        write_embed_row(&mut w, row, false)?;
+                        writeln!(w)?;
                     }
                 }
             } else {
                 let pooled = session.hidden_states_mean_pooled(&tokens)?;
+                anyhow::ensure!(
+                    pooled.len() == hidden_size,
+                    "pooled hidden-state length {} != hidden_size {}",
+                    pooled.len(),
+                    hidden_size
+                );
                 if json {
-                    let vals: Vec<String> = pooled.iter().map(json_f32).collect();
-                    println!("[{}]", vals.join(","));
+                    write!(w, "[")?;
+                    write_embed_row(&mut w, &pooled, true)?;
+                    writeln!(w, "]")?;
                 } else {
-                    let line: Vec<String> = pooled.iter().map(|v| v.to_string()).collect();
-                    println!("{}", line.join(" "));
+                    write_embed_row(&mut w, &pooled, false)?;
+                    writeln!(w)?;
                 }
             }
+            w.flush()?;
         }
         Command::ListBundles { quants } => {
             // One HTTP round-trip; sorted output. Quants are
