@@ -57,7 +57,7 @@ pub fn configure_thread_pool() -> usize {
 
 /// Returns the number of performance cores on macOS (Apple Silicon).
 /// Uses `sysctlbyname("hw.perflevel0.logicalcpu")` directly — no subprocess.
-#[cfg(all(target_os = "macos", feature = "parallel"))]
+#[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "parallel"))]
 fn performance_core_count() -> Option<usize> {
     unsafe extern "C" {
         fn sysctlbyname(
@@ -87,7 +87,7 @@ fn performance_core_count() -> Option<usize> {
     }
 }
 
-#[cfg(all(not(target_os = "macos"), feature = "parallel"))]
+#[cfg(all(not(any(target_os = "macos", target_os = "ios")), feature = "parallel"))]
 fn performance_core_count() -> Option<usize> {
     None
 }

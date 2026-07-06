@@ -42,10 +42,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # BLAS providers: Apple Accelerate on macOS (unlocks AMX), OpenBLAS elsewhere.
 # Only the provider crate for the current target is pulled in, so cross-platform
 # builds with the `blas` feature work out of the box on supported hosts.
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 accelerate-src = { workspace = true, optional = true }
 
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(not(any(target_os = "macos", target_os = "ios")))'.dependencies]
 openblas-src = { workspace = true, optional = true }
 
 # wasm32 portability deps, scoped by sub-target.

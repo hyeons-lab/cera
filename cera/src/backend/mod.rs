@@ -11,7 +11,7 @@ pub mod wgpu;
 #[cfg(feature = "gpu")]
 pub mod wgsl_pp;
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal;
 
 /// Compute operations supported by backends.

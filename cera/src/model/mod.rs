@@ -5,13 +5,16 @@ pub mod transformer;
 #[cfg(feature = "gpu")]
 pub mod gpu_lfm2;
 
-#[cfg(any(feature = "gpu", all(feature = "metal", target_os = "macos")))]
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
 pub(crate) mod gpu_weight_source;
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_lfm2;
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_audio_decoder;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -498,7 +501,7 @@ pub fn load_model_gpu(
 }
 
 /// Load a model with native Metal acceleration.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub fn load_model_metal(
     gguf: GgufFile,
     path: &std::path::Path,

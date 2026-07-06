@@ -330,7 +330,10 @@ pub(crate) fn dequantize_row(gguf: &GgufFile, wref: &WeightRef, row_idx: usize) 
 /// Used by the GPU loaders to upload non-quantized-kernel dtypes as F32.
 /// The metal loader references weights via mmap offsets and never dequantizes,
 /// so this is dead under `metal` alone (live under `gpu`).
-#[cfg(any(feature = "gpu", all(feature = "metal", target_os = "macos")))]
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 pub(crate) fn dequantize_weight(gguf: &GgufFile, wref: &WeightRef) -> Vec<f32> {
     let mut out = vec![0.0f32; wref.m * wref.k];

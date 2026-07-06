@@ -1237,7 +1237,7 @@ fn load_text_model(
         BackendPreference::Gpu => Err(CeraError::Backend(
             "GPU backend not available (compile with --features gpu)".into(),
         )),
-        #[cfg(all(feature = "metal", target_os = "macos"))]
+        #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
         BackendPreference::Metal => {
             let p = path.ok_or_else(|| {
                 CeraError::Backend("Metal backend requires a file path (not from_bytes)".into())
@@ -1245,7 +1245,7 @@ fn load_text_model(
             model::load_model_metal(gguf, p, cfg.context_size)
                 .map_err(|e| CeraError::Backend(format!("Metal model load failed: {e}")))
         }
-        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
         BackendPreference::Metal => Err(CeraError::Backend(
             "Metal backend not available (compile with --features metal on macOS)".into(),
         )),
@@ -1270,7 +1270,7 @@ fn load_text_model_auto(
     }
 
     // Metal → wgpu → CPU. Mirrors the CLI's previous `load_model_auto`.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
     if let Some(p) = path {
         match model::load_model_metal(clone_gguf_like(&gguf, p)?, p, context_size) {
             Ok(m) => {
@@ -1327,7 +1327,10 @@ fn load_text_model_auto(
 /// this helper.
 #[cfg(all(
     feature = "mmap",
-    any(all(feature = "metal", target_os = "macos"), feature = "gpu")
+    any(
+        all(feature = "metal", any(target_os = "macos", target_os = "ios")),
+        feature = "gpu"
+    )
 ))]
 fn clone_gguf_like(_: &GgufFile, path: &Path) -> Result<GgufFile, CeraError> {
     GgufFile::open(path)
