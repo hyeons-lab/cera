@@ -12,11 +12,11 @@
 // Pull in the provider so its #[link] attribute takes effect at link time.
 // We never reference its symbols directly; the `use` alone is enough because
 // its lib.rs has `#[link(name = "...", kind = "framework")]`.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[allow(unused_imports)]
 use accelerate_src as _;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[allow(unused_imports)]
 use openblas_src as _;
 

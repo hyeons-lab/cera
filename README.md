@@ -62,11 +62,11 @@ or you can pin one:
 | Backend | `--device` | Platforms | Notes |
 |---------|-----------|-----------|-------|
 | **CPU** | `cpu` | everywhere | Scalar reference + **NEON** (aarch64) / **AVX2** (x86_64) kernels; optional **Accelerate/OpenBLAS** via the `blas` feature |
-| **Native Metal** | `metal` | macOS | Hand-written MSL shaders, single-encoder dispatch, GPU argmax |
+| **Native Metal** | `metal` | macOS, iOS | Hand-written MSL shaders, single-encoder dispatch, GPU argmax |
 | **wgpu** | `gpu` | macOS, Linux, Windows, browser | WGSL shaders over **Metal / Vulkan / DX12 / WebGPU** |
 
-`--device auto` uses native Metal on macOS and wgpu where a GPU is available,
-falling back to CPU otherwise.
+`--device auto` uses native Metal on macOS and iOS, and wgpu where a GPU is
+available, falling back to CPU otherwise.
 
 ### Quantization
 
@@ -84,7 +84,7 @@ One Rust core, consumed from many places:
 | **CLI** | [`cera-cli`](cera-cli/) | the `cera` binary |
 | **Kotlin / Swift / Python** | [`cera-ffi`](cera-ffi/) (UniFFI) | JVM, Apple platforms |
 | **Android** | [`cera-ffi-kotlin`](cera-ffi-kotlin/) | Android apps (AAR) |
-| **iOS / macOS** | [`Package.swift`](Package.swift) (SwiftPM XCFramework) | Apple apps (`.package(url:)`) — CPU-only for now |
+| **iOS / macOS** | [`Package.swift`](Package.swift) (SwiftPM XCFramework) | Apple apps (`.package(url:)`) — Metal GPU (Auto: Metal → CPU) |
 | **Flutter / Dart** | [`cera-ffi-flutter`](cera-ffi-flutter/) | cross-platform mobile |
 | **Browser / Node** | [`cera-wasm`](cera-wasm/) (`@hyeons-lab/cera-wasm`) | WebAssembly + WebGPU |
 

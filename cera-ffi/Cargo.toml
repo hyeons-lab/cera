@@ -38,6 +38,12 @@ required-features = ["bindgen"]
 # don't need it and shouldn't pay for the extra dep cost.
 bindgen = ["uniffi/cli"]
 
+# Light up cera's Metal GPU backend in the built cdylib/staticlib. Only valid on
+# Apple targets (the `metal` crate is macOS/iOS-only) — the Apple XCFramework
+# slices (`just apple-xcframework`) build with `--features metal`; other targets
+# must not enable it.
+metal = ["cera/metal"]
+
 # Opt-in feature for the Dart/Flutter bindings (cera-ffi-flutter). The Dart
 # generator (uniffi-bindgen-dart) calls `uniffi_ffibuffer_*` trampolines —
 # extra scaffolding functions that pass args/returns through an FfiBuffer —

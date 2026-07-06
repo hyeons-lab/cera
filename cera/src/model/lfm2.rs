@@ -2524,7 +2524,10 @@ impl Model for Lfm2Model {
 // `conv_*` refs; attention layers expose `attn_*` refs + QK-norm. LFM2 has no
 // QKV bias / untied output / Llama-3 freq-factors, uses NEOX RoPE, identity
 // scalars, and supports the batched-prefill GPU path.
-#[cfg(any(feature = "gpu", all(feature = "metal", target_os = "macos")))]
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
 impl crate::model::gpu_weight_source::GpuWeightSource for Lfm2Model {
     fn config(&self) -> &ModelConfig {
         &self.config

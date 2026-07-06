@@ -153,7 +153,10 @@ pub trait VitGpuOps {
 /// upload. F32 weights are copied directly; quantized dtypes go row-by-row.
 /// Only the GPU/Metal backends use this (the wgpu/Metal `upload_weight` impls);
 /// gated to match so the default (no-backend) build doesn't flag it as dead.
-#[cfg(any(feature = "gpu", all(feature = "metal", target_os = "macos")))]
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
 fn dequant_weight(w: &MmapWeight) -> Vec<f32> {
     if let Some(f) = w.try_as_f32() {
         return f.to_vec();
@@ -1017,7 +1020,7 @@ impl VitGpuOps for WgpuVitOps {
 /// their packed bytes and run the simdgroup `gemm_q8_0`/`gemm_q4_0` kernels;
 /// f32 weights (or quant dtypes without a GEMM kernel) fall back to the scalar
 /// `vit_linear` gemv on a dequantized f32 buffer.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub enum MetalVitWeight {
     /// Dequantized f32 buffer, `[out_dim, in_dim]` row-major.
     Dense(metal::Buffer),
@@ -1032,7 +1035,7 @@ pub enum MetalVitWeight {
 /// MSL kernels. Each op runs in its own command buffer and blocks on
 /// `wait_until_completed`, so `download` always sees current data (unified
 /// memory on Apple Silicon).
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub struct MetalVitOps {
     ctx: crate::backend::metal::MetalContext,
     p_linear: metal::ComputePipelineState,
@@ -1047,7 +1050,7 @@ pub struct MetalVitOps {
     p_add: metal::ComputePipelineState,
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 impl MetalVitOps {
     pub fn new(ctx: crate::backend::metal::MetalContext) -> Result<Self> {
         use crate::backend::metal::shaders;
@@ -1200,7 +1203,7 @@ impl MetalVitOps {
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 impl VitGpuOps for MetalVitOps {
     type Buf = metal::Buffer;
     type Weight = MetalVitWeight;
@@ -1378,13 +1381,13 @@ impl VisionGpuEncode for WgpuVisionEncoder {
     }
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 struct MetalVisionEncoder {
     ops: MetalVitOps,
     weights: GpuVitWeights<MetalVitOps>,
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 impl VisionGpuEncode for MetalVisionEncoder {
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
         encode_image_gpu(&self.ops, &self.weights, pixels, grid_w, grid_h)
@@ -1429,7 +1432,7 @@ fn try_wgpu_vision_encoder(
     None
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 fn try_metal_vision_encoder(
     weights: &VisionEncoderWeights,
 ) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
@@ -1443,7 +1446,7 @@ fn try_metal_vision_encoder(
     }))
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
+#[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
 fn try_metal_vision_encoder(
     _weights: &VisionEncoderWeights,
 ) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
@@ -1452,7 +1455,10 @@ fn try_metal_vision_encoder(
 
 #[cfg(all(
     test,
-    any(feature = "gpu", all(feature = "metal", target_os = "macos"))
+    any(
+        feature = "gpu",
+        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    )
 ))]
 mod tests {
     use super::*;
@@ -1672,7 +1678,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
     #[test]
     fn test_metal_encode_image_parity() {
         let ctx = match crate::backend::metal::MetalContext::new() {
@@ -1688,7 +1694,7 @@ mod tests {
     /// pure 5e-2 absolute bound was flaky here: the largest-magnitude element
     /// (~4.5) drifts ~0.0505 (1.1% rel), tipping the bound on some Metal
     /// hardware while every other element is well within it.
-    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
     #[test]
     fn test_metal_encode_image_parity_q8_0() {
         let ctx = match crate::backend::metal::MetalContext::new() {

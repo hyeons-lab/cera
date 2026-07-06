@@ -1,6 +1,6 @@
 // swift-tools-version:5.9
 //
-// Cera — consumable Swift Package for the cera inference engine (CPU-only).
+// Cera — consumable Swift Package for the cera inference engine.
 //
 // Consume it from any iOS / macOS app:
 //
@@ -11,11 +11,14 @@
 // `v<version>` GitHub release, so consumers never compile Rust — they only
 // download the arm64 XCFramework and the thin Swift wrapper below.
 //
-// ── CPU-only ────────────────────────────────────────────────────────────────
-// The shipped XCFramework is built WITHOUT the `metal` feature (see
-// `just apple-xcframework`). Inference runs on the CPU (Accelerate/NEON) on
-// device, Simulator, and native macOS. A Metal-accelerated iOS slice is a
-// planned follow-up; it is intentionally out of scope here.
+// ── Metal GPU ───────────────────────────────────────────────────────────────
+// The shipped XCFramework is built WITH the `metal` feature (see
+// `just apple-xcframework`). Inference prefers the native Metal backend
+// (Auto probes Metal → CPU) on device, Simulator, and native macOS, falling
+// back to the CPU (Accelerate/NEON) when Metal is unavailable. Because the
+// slices are Metal-enabled *static* libs, the `Cera` target links
+// `Metal.framework` + `Foundation` explicitly below — a `.binaryTarget`
+// static lib does not auto-link the system frameworks its symbols reference.
 //
 // ── Slices ──────────────────────────────────────────────────────────────────
 // The XCFramework carries three arm64-only slices — ios-arm64 (device),
@@ -78,7 +81,22 @@ let package = Package(
         .target(
             name: "Cera",
             dependencies: ["CeraFFI"],
-            path: "cera-ffi/apple/Sources/Cera"
+            path: "cera-ffi/apple/Sources/Cera",
+            // The XCFramework is a Metal-enabled *static* library. A
+            // `.binaryTarget` static lib does NOT auto-link the system
+            // frameworks its symbols reference, so consumers must link
+            // them explicitly or they hit undefined-symbol errors at
+            // link time. The Metal backend references Metal.framework
+            // (device / command queue / MSL pipeline objects) and
+            // Foundation (Metal's Objective-C runtime dependency).
+            // Accelerate is NOT listed: the Rust `accelerate-src` dep is
+            // wired for the native-macOS BLAS path only and the linker
+            // resolves it from the staticlib without a framework flag on
+            // the slices we ship — adding it here would be dead weight.
+            linkerSettings: [
+                .linkedFramework("Metal"),
+                .linkedFramework("Foundation"),
+            ]
         ),
     ]
 )

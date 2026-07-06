@@ -531,17 +531,28 @@ jobs:
             exit 1
           fi
       - name: Build CeraFFI.xcframework
-        # Mirrors `just apple-xcframework` (CPU-only — no `metal` feature).
-        # Inlined because the runner has no `just`.
+        # Mirrors `just apple-xcframework` (Metal-enabled — `--features
+        # metal`). Inlined because the runner has no `just`.
+        #
+        # Deployment-target env pins the slices to Package.swift's
+        # `.macOS(.v12)` / `.iOS(.v15)` so a newer runner SDK doesn't
+        # stamp a higher `minos` (which warns at consumer link time).
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          IPHONEOS_DEPLOYMENT_TARGET: "15.0"
         run: |
           set -euo pipefail
           # RUSTFLAGS="" clears .cargo/config.toml's `target-cpu=native` for the
           # aarch64-apple-darwin slice — otherwise the runner's specific
           # microarch (M2/M3/M4) leaks into the shipped staticlib and SIGILLs on
           # older Apple Silicon (M1). Matches the `just apple-xcframework` guard.
-          RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release
-          RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios-sim --release
-          RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release
+          #
+          # `--features metal` ships the Metal GPU backend in every slice
+          # (Auto probes Metal → CPU). Consumers link Metal.framework +
+          # Foundation via Package.swift `linkerSettings`.
+          RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release --features metal
+          RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios-sim --release --features metal
+          RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release --features metal
           OUT=target/xcframework-build
           rm -rf "$OUT"
           mkdir -p "$OUT/headers"
