@@ -18,7 +18,7 @@ bindings, and [`cera-wasm`](https://github.com/hyeons-lab/cera/tree/main/cera-wa
 
 ```toml
 [dependencies]
-cera = "0.1"
+cera = "0.2"
 ```
 
 ## Supported models
