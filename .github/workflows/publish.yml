@@ -662,8 +662,12 @@ jobs:
             -e "s|checksum: \"[0-9a-f]\{64\}\"|checksum: \"${CHECKSUM}\"|" \
             Package.swift
           rm -f Package.swift.bak
-          # Fail loud if a placeholder survived or the real values are missing.
-          if grep -q 'RELEASE_VERSION\|RELEASE_CHECKSUM' Package.swift; then
+          # Fail loud if a placeholder survived in the ACTUAL url/checksum
+          # values. Match only the placeholder USAGE (`download/vRELEASE_VERSION/`
+          # and `checksum: "RELEASE_CHECKSUM"`), NOT the doc comment above that
+          # names the tokens in backticks — a bare `RELEASE_VERSION` match there
+          # would false-positive even after a correct rewrite.
+          if grep -qE 'download/vRELEASE_VERSION/|checksum: "RELEASE_CHECKSUM"' Package.swift; then
             echo "::error::Package.swift still has placeholders after rewrite" >&2
             exit 1
           fi
