@@ -640,10 +640,11 @@ jobs:
           path: release-assets
 
       # Pin the root Package.swift to this release's XCFramework (real URL +
-      # checksum), commit it to the default branch, and force-move the
-      # v<version> tag onto that commit — so `.package(url:, from:)` resolves
-      # the tag with a checksum that matches the attached zip. Idempotent: a
-      # rerun with identical inputs makes no commit and just re-points the tag.
+      # checksum) in a LOCAL commit and point the v<version> tag at it — the pin
+      # is never pushed to the default branch (its ruleset forbids direct
+      # pushes); only the tag is pushed. `.package(url:, from:)` resolves the
+      # tag, whose Package.swift checksum matches the attached zip. Idempotent:
+      # a rerun re-pins a fresh commit and force-moves the tag.
       - name: Pin Package.swift + tag (SPM)
         if: ${{ needs.build-spm.result == 'success' }}
         env:
