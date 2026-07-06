@@ -292,6 +292,9 @@ URL. Then `import Cera`.
 `metal` feature, so inference prefers the native Metal backend (Auto
 probes Metal → CPU) on device, the Simulator, and native macOS,
 falling back to the CPU (Accelerate / NEON) when Metal is unavailable.
+The iOS Metal path is validated on the iOS **Simulator** (byte-identical
+to CPU output); real-device validation on a physical iPhone/iPad is
+recommended before relying on it in production.
 Because the slices are Metal-enabled *static* libraries, the `Cera`
 SwiftPM target links `Metal.framework` + `Foundation` explicitly
 (`linkerSettings` in `Package.swift`) — a `.binaryTarget` static lib
