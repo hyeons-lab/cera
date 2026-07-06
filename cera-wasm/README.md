@@ -56,7 +56,7 @@ module (the entry self-loads the wasm via `fs.readFileSync`).
 ```js
 import { ceraVersion, Manifest } from '@hyeons-lab/cera-wasm';
 
-console.log(ceraVersion());  // e.g. "0.1.0"
+console.log(ceraVersion());  // e.g. "0.2.2"
 
 const res = await fetch('/path/to/manifest.json');
 const bytes = new Uint8Array(await res.arrayBuffer());
@@ -178,6 +178,32 @@ console.log('decode ms:', summary.decodeMs);
 
 session.free();
 engine.free();
+```
+
+### LoRA adapters & hidden states
+
+Load a LoRA adapter from bytes (GGUF or PEFT `.safetensors`) and attach it to a
+session — applied at inference time, never merged, so it hot-swaps freely (and
+detaches on demand with `session.removeLora()`). Then pull per-token hidden
+states out of the engine (reflecting the active adapter) for classifier /
+embedding heads.
+
+```js
+import { LoraAdapters } from '@hyeons-lab/cera-wasm';
+
+// Pass your PEFT adapter's `lora_alpha` (from its adapter_config.json) as the
+// 2nd arg; `undefined` ⇒ alpha defaults to the rank (scale = 1). The loader
+// does not read adapter_config.json for you.
+const adapters = LoraAdapters.fromSafetensorsBytes(safetensorsBytes, undefined);
+// ...or LoraAdapters.fromGgufBytes(ggufBytes)
+session.attachLora(adapters);          // hot-swap-able; session.removeLora() to detach
+session.hasLora();                     // → true
+
+const tokens = engine.tokenizer.encode('a transcript chunk'); // Uint32Array
+const pooled = session.hiddenStatesMeanPooled(tokens);  // Float32Array, length hiddenSize
+const perToken = session.hiddenStatesForTokens(tokens); // Float32Array, tokens.length * hiddenSize
+
+adapters.free();  // frees the JS handle; the attached copy stays live in the session
 ```
 
 ### Reproducibility (seeded sampler)
