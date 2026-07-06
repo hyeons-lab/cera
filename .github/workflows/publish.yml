@@ -59,6 +59,10 @@ on:
         description: 'Maven Central (cera-ffi Kotlin)'
         type: boolean
         default: true
+      spm:
+        description: 'Swift Package Manager (CeraFFI.xcframework — rewrites Package.swift + retags on real runs)'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -499,10 +503,77 @@ jobs:
           ./gradlew publishAndReleaseToMavenCentral -PVERSION_NAME="${VERSION}" \
             --no-daemon --stacktrace
 
+  # ── Swift Package Manager (CeraFFI.xcframework) ────────────────────────────
+  build-spm:
+    name: Build SwiftPM XCFramework
+    needs: version
+    if: ${{ github.event.inputs.spm == 'true' }}
+    # Apple Silicon runner — the XCFramework is arm64-only; `xcodebuild
+    # -create-xcframework` + `swift package compute-checksum` must run on an
+    # arm64 host (mirrors the ci.yml apple-xcframework job's macos-15 pin).
+    runs-on: macos-15
+    timeout-minutes: 40
+    outputs:
+      checksum: ${{ steps.zip.outputs.checksum }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-02
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Assert arm64 host
+        run: |
+          set -euo pipefail
+          ARCH=$(uname -m)
+          if [ "$ARCH" != "arm64" ]; then
+            echo "::error::expected arm64 host for arm64-only xcframework, got '$ARCH'" >&2
+            exit 1
+          fi
+      - name: Build CeraFFI.xcframework
+        # Mirrors `just apple-xcframework` (CPU-only — no `metal` feature).
+        # Inlined because the runner has no `just`.
+        run: |
+          set -euo pipefail
+          # RUSTFLAGS="" clears .cargo/config.toml's `target-cpu=native` for the
+          # aarch64-apple-darwin slice — otherwise the runner's specific
+          # microarch (M2/M3/M4) leaks into the shipped staticlib and SIGILLs on
+          # older Apple Silicon (M1). Matches the `just apple-xcframework` guard.
+          RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release
+          RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios-sim --release
+          RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release
+          OUT=target/xcframework-build
+          rm -rf "$OUT"
+          mkdir -p "$OUT/headers"
+          cp cera-ffi/bindings/swift/cera_ffiFFI.h "$OUT/headers/"
+          cp cera-ffi/bindings/swift/cera_ffiFFI.modulemap "$OUT/headers/module.modulemap"
+          xcodebuild -create-xcframework \
+              -library target/aarch64-apple-ios/release/libcera_ffi.a -headers "$OUT/headers" \
+              -library target/aarch64-apple-ios-sim/release/libcera_ffi.a -headers "$OUT/headers" \
+              -library target/aarch64-apple-darwin/release/libcera_ffi.a -headers "$OUT/headers" \
+              -output "$OUT/CeraFFI.xcframework"
+      - name: Zip + compute-checksum
+        id: zip
+        run: |
+          set -euo pipefail
+          ( cd target/xcframework-build && zip -r CeraFFI.xcframework.zip CeraFFI.xcframework >/dev/null )
+          # Run compute-checksum from the repo root (the root Package.swift makes
+          # this a valid package context). The checksum is over the EXACT zip we
+          # upload, and the release job bakes this same value into Package.swift,
+          # so the pair is internally consistent regardless of zip determinism.
+          CS=$(swift package compute-checksum target/xcframework-build/CeraFFI.xcframework.zip)
+          echo "checksum=$CS" >> "$GITHUB_OUTPUT"
+          echo "CeraFFI.xcframework.zip checksum: $CS"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: spm-xcframework
+          path: target/xcframework-build/CeraFFI.xcframework.zip
+          if-no-files-found: error
+
   # ── Tag + GitHub release (the canonical release event) ─────────────────────
   release:
     name: Tag & GitHub Release
-    needs: [version, publish-crates, build-cli, publish-npm, jvm-native-libs, publish-jvm]
+    needs: [version, publish-crates, build-cli, publish-npm, jvm-native-libs, publish-jvm, build-spm]
     # Real runs only, and only once every enabled leg succeeded. Disabled legs
     # are `skipped` (not `failure`), so they don't block the tag; any actual
     # failure does. `jvm-native-libs` is gated too: if it fails, `publish-jvm`
@@ -519,16 +590,38 @@ jobs:
           && needs.publish-npm.result != 'failure'
           && needs.jvm-native-libs.result != 'failure'
           && needs.publish-jvm.result != 'failure'
+          && needs.build-spm.result != 'failure'
           && (github.event.inputs.crates == 'true'
               || github.event.inputs.cli == 'true'
               || github.event.inputs.npm == 'true'
-              || github.event.inputs.jvm == 'true') }}
+              || github.event.inputs.jvm == 'true'
+              || github.event.inputs.spm == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Least privilege: only this job creates the tag / release.
     permissions:
       contents: write
     steps:
+      # Working tree — needed only for the SPM leg (Package.swift rewrite +
+      # tag move). Checkout FIRST: actions/checkout cleans the workspace, so
+      # the artifact downloads below (which land in release-assets/) must come
+      # after it or they'd be wiped.
+      #
+      # Branch protection: the default branch's ruleset forbids direct pushes
+      # (bypass_actors: []), so the SPM pin is NEVER pushed to it. The pin step
+      # commits the checksum-rewritten Package.swift locally and points the
+      # v<version> TAG at that commit (tags aren't covered by the branch
+      # ruleset). Consumers resolve the tag; the default branch keeps the
+      # placeholder Package.swift. Uses GITHUB_TOKEN (needs `contents: write`,
+      # set on this job) for the tag push only.
+      - name: Checkout default branch
+        if: ${{ needs.build-spm.result == 'success' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: true
+
       # CLI binaries to attach — present only when the `cli` leg ran.
       - name: Download CLI artifacts
         if: ${{ needs.build-cli.result == 'success' }}
@@ -538,15 +631,85 @@ jobs:
           merge-multiple: true
           path: release-assets
 
+      # SPM XCFramework zip to attach — present only when the `spm` leg ran.
+      - name: Download SPM XCFramework
+        if: ${{ needs.build-spm.result == 'success' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: spm-xcframework
+          path: release-assets
+
+      # Pin the root Package.swift to this release's XCFramework (real URL +
+      # checksum) in a LOCAL commit and point the v<version> tag at it — the pin
+      # is never pushed to the default branch (its ruleset forbids direct
+      # pushes); only the tag is pushed. `.package(url:, from:)` resolves the
+      # tag, whose Package.swift checksum matches the attached zip. Idempotent:
+      # a rerun re-pins a fresh commit and force-moves the tag.
+      - name: Pin Package.swift + tag (SPM)
+        if: ${{ needs.build-spm.result == 'success' }}
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          CHECKSUM: ${{ needs.build-spm.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          # Rewrite handles BOTH the first-release placeholders and a rerun
+          # where real values were already substituted (all four subs are
+          # idempotent).
+          sed -i.bak \
+            -e "s|releases/download/vRELEASE_VERSION/|releases/download/v${VERSION}/|" \
+            -e "s|releases/download/v[0-9][0-9A-Za-z.+-]*/CeraFFI\.xcframework\.zip|releases/download/v${VERSION}/CeraFFI.xcframework.zip|" \
+            -e "s|checksum: \"RELEASE_CHECKSUM\"|checksum: \"${CHECKSUM}\"|" \
+            -e "s|checksum: \"[0-9a-f]\{64\}\"|checksum: \"${CHECKSUM}\"|" \
+            Package.swift
+          rm -f Package.swift.bak
+          # Fail loud if a placeholder survived or the real values are missing.
+          if grep -q 'RELEASE_VERSION\|RELEASE_CHECKSUM' Package.swift; then
+            echo "::error::Package.swift still has placeholders after rewrite" >&2
+            exit 1
+          fi
+          grep -q "download/v${VERSION}/CeraFFI.xcframework.zip" Package.swift
+          grep -q "checksum: \"${CHECKSUM}\"" Package.swift
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The default branch is protected by a ruleset (bypass_actors: [], so
+          # even GITHUB_TOKEN can't push to it) — do NOT push the pin there.
+          # Instead create the checksum-pinned commit locally (parent = the
+          # merged release commit) and point the v<version> tag at it.
+          # `.package(url:, from:)` resolves the TAG, which carries the correct
+          # Package.swift + checksum; the default branch keeps the placeholder
+          # form (only a `branch: "main"` SPM dep would see it, which isn't the
+          # documented path). Tags are NOT covered by the branch ruleset, so the
+          # (force-)tag push is allowed. The sed always turns placeholders into
+          # real values, so there is always something to commit.
+          git add Package.swift
+          # Normally main carries placeholders so there is always a diff; guard
+          # the anomalous no-diff case (main already pinned) so `set -e` + an
+          # empty `git commit` can't abort the release — just tag current HEAD.
+          if git diff --cached --quiet; then
+            echo "Package.swift already pinned for v${VERSION} — tagging current HEAD"
+          else
+            git commit -m "chore(spm): pin CeraFFI.xcframework for v${VERSION}"
+          fi
+          SHA=$(git rev-parse HEAD)
+          git tag -f "v${VERSION}" "$SHA"
+          git push -f origin "refs/tags/v${VERSION}"
+          echo "Tag v${VERSION} -> ${SHA} (pinned Package.swift; default branch untouched)"
+
       # Idempotent: action-gh-release updates an existing tag/release in place
       # and re-uploads assets, so re-running after a partial publish is safe.
+      # When the SPM leg ran, the tag already exists (pushed above) at the
+      # Package.swift-pinned commit, and softprops attaches the release to it
+      # rather than re-creating it at the workflow SHA.
       - name: Create tag and GitHub release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.version.outputs.version }}
           name: v${{ needs.version.outputs.version }}
           generate_release_notes: true
-          # Binaries are attached when the CLI leg ran; tolerate their absence
-          # so a crates-only / npm-only release still cuts the tag.
+          # Assets are attached per-leg; tolerate any absence so a subset
+          # release (e.g. crates-only) still cuts the tag.
           fail_on_unmatched_files: false
-          files: release-assets/**/cera-*
+          files: |
+            release-assets/**/cera-*
+            release-assets/**/CeraFFI.xcframework.zip
