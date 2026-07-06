@@ -112,6 +112,36 @@ let engine = CeraEngine::from_bundle_id("LFM2.5-1.2B-Instruct-GGUF", "Q4_0", cfg
 `top_k == 1`) selects deterministic greedy decoding; otherwise sampling is
 stochastic. Min-p and repetition penalty apply on the stochastic path only.
 
+## LoRA adapters & hidden states
+
+Load a LoRA adapter — a llama.cpp GGUF (from `convert_lora_to_gguf`) or a PEFT
+`.safetensors` — and attach it to a `Session`. The delta is applied at inference
+time (`y += scale·B·(A·x)`), **never merged into the weights**, so the base model
+stays quantized and adapters hot-swap / unload per request. Runs on CPU, Metal,
+and wgpu (batched-GEMM prefill + decode) and is dimension-checked at attach.
+
+```rust
+use cera::lora::LoraAdapterWeights;
+
+let adapters = LoraAdapterWeights::from_safetensors(path, None)?; // or ::from_gguf(path)
+session.attach_lora_adapters(adapters)?;   // hot-swap-able; applies to every forward
+// ... generate / extract hidden states with the adapter active ...
+session.remove_lora_adapters();
+```
+
+Pull the per-token last-layer hidden state (post-final-RMSNorm — the llama.cpp
+`--pooling none` vector) straight out of the engine, reflecting the active
+adapter. This is the classifier / embedding path (e.g. a section router: `LFM2.5`
++ a `route_section` LoRA + a small linear head over the mean-pooled state):
+
+```rust
+let hs = session.hidden_states_for_tokens(&tokens)?;      // [T * hidden_size], row-major
+let pooled = session.hidden_states_mean_pooled(&tokens)?; // [hidden_size]
+```
+
+Both are also exposed over the FFI (`LoraAdapters` / `attachLora` /
+`hiddenStatesMeanPooled`) and WASM bindings.
+
 ## Feature flags
 
 Default-on features keep desktop/CLI builds full-featured; turn them off to

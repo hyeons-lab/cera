@@ -33,6 +33,8 @@ filesystem tree manually" workaround.
 | 14 | `BundleRepo::cache_size` + `clear_cache` for mobile cache mgmt |
 | 15 | Parity harness (`cera-parity` Kotlin/Swift legs + perf gate) |
 | 16+ | Session-API expansion: `Session::append_audio` placeholder, `Session::clear_cancel`, `CeraEngine::is_special_token`, `CeraEngine::context_size` resolved getter |
+| 17+ | Hidden-states extraction: `Session::hidden_states_for_tokens` / `_for_text` (LE-f32 `Data`/`ByteArray`), `hidden_states_mean_pooled` (`[Float]`), `hidden_size` |
+| 18+ | LoRA adapters: `LoraAdapters` object (`from_gguf` / `from_safetensors`), `Session::attach_lora` / `remove_lora` / `has_lora`, `FfiError::LoraParse` |
 | later | Maven Central / SwiftPM remote publishing |
 
 Don't add FFI exposure to `cera` directly — the `cera` crate keeps its

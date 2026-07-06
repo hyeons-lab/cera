@@ -180,6 +180,29 @@ session.free();
 engine.free();
 ```
 
+### LoRA adapters & hidden states
+
+Load a LoRA adapter from bytes (GGUF or PEFT `.safetensors`) and attach it to a
+session — applied at inference time, never merged, so it hot-swaps / unloads per
+request. Then pull per-token hidden states out of the engine (reflecting the
+active adapter) for classifier / embedding heads.
+
+```js
+import { LoraAdapters } from '@hyeons-lab/cera-wasm';
+
+// alpha is undefined ⇒ scale = 1 (PEFT keeps alpha in adapter_config.json)
+const adapters = LoraAdapters.fromSafetensorsBytes(safetensorsBytes, undefined);
+// ...or LoraAdapters.fromGgufBytes(ggufBytes)
+session.attachLora(adapters);          // hot-swap-able; session.removeLora() to detach
+session.hasLora();                     // → true
+
+const tokens = tokenizer.encode('a transcript chunk');
+const pooled = session.hiddenStatesMeanPooled(tokens);  // Float32Array, length hiddenSize
+const perToken = session.hiddenStatesForTokens(tokens); // Float32Array, tokens.length * hiddenSize
+
+adapters.free();
+```
+
 ### Reproducibility (seeded sampler)
 
 Pass a `SessionConfig` with a fixed `seed` to `newSession` so the
