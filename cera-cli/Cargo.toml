@@ -18,7 +18,7 @@ path = "src/main.rs"
 # `remote` enables `BundleRepo` + `CeraEngine::from_bundle_id`, which the CLI's
 # `--bundle-id` / `--quant` flags route through. Pulls reqwest + rustls + sha2
 # (~30 deps) but that's the cost of HTTP-cached bundle downloads.
-cera = { path = "../cera", version = "0.2.1", features = ["remote"] }
+cera = { path = "../cera", version = "0.2.2", features = ["remote"] }
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true

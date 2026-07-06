@@ -37,7 +37,7 @@ crate-type = ["cdylib", "rlib"]
 # The opt-in `parallel` feature on this crate flips
 # `cera/parallel` on for threaded wasm builds — see the [features]
 # table below.
-cera = { path = "../cera", version = "0.2.1", default-features = false }
+cera = { path = "../cera", version = "0.2.2", default-features = false }
 wasm-bindgen.workspace = true
 # Used only by the JsError mapping helper to format cera's anyhow-typed
 # errors with `{:#}` (full chain). No native heuristics or backtraces;
