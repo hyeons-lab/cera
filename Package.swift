@@ -75,8 +75,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "CeraFFI",
-            url: "https://github.com/hyeons-lab/cera/releases/download/vRELEASE_VERSION/CeraFFI.xcframework.zip",
-            checksum: "RELEASE_CHECKSUM"
+            url: "https://github.com/hyeons-lab/cera/releases/download/v0.2.5/CeraFFI.xcframework.zip",
+            checksum: "9f5dfd3d0ec747cc3b483054e5860c7c2237c8b20d6db9b53be4d81bd715cae9"
         ),
         .target(
             name: "Cera",
