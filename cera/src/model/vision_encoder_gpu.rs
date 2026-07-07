@@ -652,7 +652,7 @@ pub enum WgpuVitWeight {
     },
 }
 
-/// wgpu implementation of [`VitGpuOps`]. Owns the [`GpuContext`] and the compute
+/// wgpu implementation of [`VitGpuOps`]. Owns the [`GpuContext`](crate::backend::wgpu::GpuContext) and the compute
 /// pipelines (compiled once) so it can be cached for the session's lifetime.
 /// Bind groups are created per dispatch (cheap relative to the kernel work).
 #[cfg(feature = "gpu")]

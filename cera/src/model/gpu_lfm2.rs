@@ -478,7 +478,7 @@ pub struct GpuLfm2Model {
     /// command encoder and reads back logits.
     infer_lock: Mutex<()>,
     /// Lazily-allocated scratch KV/conv for [`Self::hidden_states`] (see
-    /// [`HsScratch`]). Built on first use via [`Self::hs_scratch`] so a
+    /// `HsScratch`). Built on first use via [`Self::hs_scratch`] so a
     /// generation-only load pays no extra KV VRAM. Selected over the generation
     /// caches by `use_hs_scratch`, which is only toggled while holding
     /// `infer_lock`, so `Relaxed` ordering suffices.
@@ -2922,7 +2922,7 @@ impl GpuLfm2Model {
 
     /// Async (wasm/WebGPU) greedy decode step. Runs the full forward + argmax
     /// on the GPU, then reads back the single argmax token id without blocking
-    /// — the wasm-compatible analog of [`Self::forward_greedy_inner`].
+    /// — the wasm-compatible analog of `Self::forward_greedy_inner`.
     ///
     /// The blocking version's `submit_and_wait`'s `device.poll(Maintain::Wait)`
     /// is a no-op on the WebGPU backend (the browser owns the queue), so we
@@ -4315,7 +4315,7 @@ impl Model for GpuLfm2Model {
     /// Per-token post-final-norm hidden states, row-major `[n * hidden_size]`
     /// (llama.cpp `--pooling none`). Reuses `forward_inner_compute` per token
     /// (which drives the KV offset + attention window from `gpu_state.seq_len`):
-    /// routes KV to the dedicated [`HsScratch`] caches via `use_hs_scratch` and
+    /// routes KV to the dedicated `HsScratch` caches via `use_hs_scratch` and
     /// drives `seq_len` from 0, so it's a fresh-context extraction on scratch KV
     /// that never touches the generation caches — the GPU analog of the CPU
     /// path's separate scratch state. Reads back the in-place post-`output_norm`
