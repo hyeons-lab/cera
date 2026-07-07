@@ -672,14 +672,15 @@ impl MetalLfm2Model {
         let output_norm = ctx.upload_f32(src.output_norm_weight());
 
         let upload_weight = |wref: &WeightRef| -> MetalWeight {
-            // Layer projection matmuls route through `encode_gemm` (batched,
-            // Q4_0/Q8_0 only) and `encode_gemv` (Q4_0/Q8_0/Q4_K/Q6_K + an explicit
-            // F32 arm). Q4_K/Q6_K have native GEMV kernels and use the per-token
-            // prefill path (prefill dispatch gates the batched GEMM behind
-            // Q4_0/Q8_0). Q4_K_M is a mixed scheme — most projections Q4_K, but
-            // ffn_down and some attn_v are Q6_K — so both are required to load such
-            // a model. Any other dtype (F16, …) hits the GEMV `gemv_f32` fallback
-            // and is silently reinterpreted as f32 → garbage; reject it here.
+            // Layer projection matmuls route through `encode_gemm` (batched
+            // simdgroup GEMM for Q4_0/Q8_0, self-guarding per-token GEMV fallback
+            // for anything else) and `encode_gemv` (Q4_0/Q8_0/Q4_K/Q6_K + an
+            // explicit F32 arm). Q4_K/Q6_K have native GEMV kernels; production
+            // prefill routes them per-token. Q4_K_M is a mixed scheme — most
+            // projections Q4_K, but ffn_down and some attn_v are Q6_K — so both are
+            // required to load such a model. Any other dtype (F16, …) hits the GEMV
+            // `gemv_f32` fallback and is silently reinterpreted as f32 → garbage;
+            // reject it here.
             assert!(
                 matches!(
                     wref.dtype,
@@ -1418,12 +1419,14 @@ impl MetalLfm2Model {
         y_stride: u32,
         accumulate: bool,
     ) {
-        debug_assert!(
-            w.dtype == DType::Q4_0 || w.dtype == DType::Q8_0,
-            "GEMM only supports Q4_0 and Q8_0, got {:?}",
-            w.dtype
-        );
-        if n < GEMM_MIN_N || w.k % 32 != 0 {
+        // Only Q4_0/Q8_0 have a batched simdgroup-matrix GEMM. Any other dtype
+        // (Q4_K / Q6_K after the Q4_K_M work; F32) is routed to the per-token GEMV
+        // fallback below — so `encode_gemm` is self-guarding and safe to call with
+        // any layer-weight dtype, not just from the production prefill (which gates
+        // the batched call itself). Without this, a Q4_K weight would fall through
+        // to the `_ => gemm_q4_0` arm and read 144-byte blocks with 18-byte strides.
+        let batched = matches!(w.dtype, DType::Q4_0 | DType::Q8_0);
+        if !batched || n < GEMM_MIN_N || w.k % 32 != 0 {
             if w.dtype == DType::Q4_0 {
                 return self.encode_gemv_batch(
                     enc,
@@ -1852,8 +1855,9 @@ impl MetalLfm2Model {
             ),
             DType::Q4KM => (
                 // Native Q4_K super-block GEMV: NR=2 rows/TG, 32 threads. Also the
-                // per-token prefill path for Q4_K weights (batched GEMM stays
-                // Q4_0/Q8_0 only, so `encode_gemm` never sees Q4_K).
+                // per-token prefill path for Q4_K weights — production prefill gates
+                // the batched GEMM behind Q4_0/Q8_0, and `encode_gemm` self-guards
+                // (routes any other dtype here per-token) as a backstop.
                 if accumulate {
                     &self.pipelines.gemv_q4_k_accum
                 } else {
