@@ -2211,15 +2211,19 @@ fn main() -> Result<()> {
 
             // Tokenize with the session's tokenizer so the ids match the model's
             // vocab exactly (same path `hidden_states_for_text` would take).
-            let mut tokens = session.tokenizer().encode(&prompt);
-            if add_bos {
-                // Prepend BOS so the pooled vector matches a head trained with
-                // `add_bos_token=true` (BOS is included in the mean). No-op if the
-                // model declares no BOS id.
-                if let Some(bos) = session.tokenizer().bos_token() {
-                    tokens.insert(0, bos);
-                }
-            }
+            let encoded = session.tokenizer().encode(&prompt);
+            // Prepend BOS (if requested and the model declares one) so the pooled
+            // vector matches a head trained with `add_bos_token=true` (BOS is
+            // included in the mean). Build the vec with BOS first rather than an
+            // O(n) `insert(0, …)` that shifts the whole prompt.
+            let bos = if add_bos {
+                session.tokenizer().bos_token()
+            } else {
+                None
+            };
+            let mut tokens = Vec::with_capacity(encoded.len() + usize::from(bos.is_some()));
+            tokens.extend(bos);
+            tokens.extend_from_slice(&encoded);
             if tokens.is_empty() {
                 anyhow::bail!("prompt tokenized to zero tokens; nothing to embed");
             }
