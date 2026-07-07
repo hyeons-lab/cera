@@ -320,7 +320,7 @@ jobs:
           # than a broken CI check, so remove every apt source referencing that
           # host, matched by content (covers both .list and deb822 .sources).
           while IFS= read -r f; do
-            sudo rm -f "$f"
+            sudo rm -f -- "$f"
           done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
           sudo apt-get update && sudo apt-get install -y binaryen
 

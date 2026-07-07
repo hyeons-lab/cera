@@ -121,7 +121,7 @@ jobs:
           # host, matched by content so it catches both the legacy .list and the
           # deb822 .sources files (azure-cli uses .sources) regardless of name.
           while IFS= read -r f; do
-            sudo rm -f "$f"
+            sudo rm -f -- "$f"
           done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
           sudo apt-get update
           sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
@@ -235,7 +235,7 @@ jobs:
           # Remove every apt source referencing packages.microsoft.com — see the
           # lavapipe job for why (intermittent invalid InRelease breaks update).
           while IFS= read -r f; do
-            sudo rm -f "$f"
+            sudo rm -f -- "$f"
           done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
           sudo apt-get update && sudo apt-get install -y binaryen
       - name: Build cera-wasm npm package
@@ -354,7 +354,7 @@ jobs:
           # Remove every apt source referencing packages.microsoft.com — see the
           # lavapipe job for why (intermittent invalid InRelease breaks update).
           while IFS= read -r f; do
-            sudo rm -f "$f"
+            sudo rm -f -- "$f"
           done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
           sudo apt-get update && sudo apt-get install -y binaryen
       - name: Build cera-wasm npm package (threaded)
@@ -896,7 +896,7 @@ jobs:
           # Remove every apt source referencing packages.microsoft.com — see the
           # lavapipe job for why (intermittent invalid InRelease breaks update).
           while IFS= read -r f; do
-            sudo rm -f "$f"
+            sudo rm -f -- "$f"
           done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
           sudo apt-get update && sudo apt-get install -y libopenblas-dev
       - name: Cache downloaded test models
