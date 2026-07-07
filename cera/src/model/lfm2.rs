@@ -503,10 +503,10 @@ impl Lfm2Model {
         // LoRA on the conv in_proj — `proj += scale·B·(A·hidden)`, applied to the
         // full 3·hidden output before it is split into the B/C/x gates. Matches
         // llama.cpp applying the adapter to `shortconv.in_proj` on conv layers.
-        if let Some(lora) = &lora {
-            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::ShortconvInProj) {
-                crate::lora::apply_decode(t, hidden, proj, &mut state.scratch.lora_tmp);
-            }
+        if let Some(lora) = &lora
+            && let Some(t) = lora.get(layer, crate::lora::LoraTarget::ShortconvInProj)
+        {
+            crate::lora::apply_decode(t, hidden, proj, &mut state.scratch.lora_tmp);
         }
 
         // Split: b, c, x
@@ -553,10 +553,10 @@ impl Lfm2Model {
         self.gemv(out_proj, conv_scratch, out_buf);
         // LoRA on the conv out_proj — `out_buf += scale·B·(A·conv_scratch)`, where
         // conv_scratch is the gated conv output that feeds out_proj.
-        if let Some(lora) = &lora {
-            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::ShortconvOutProj) {
-                crate::lora::apply_decode(t, conv_scratch, out_buf, &mut state.scratch.lora_tmp);
-            }
+        if let Some(lora) = &lora
+            && let Some(t) = lora.get(layer, crate::lora::LoraTarget::ShortconvOutProj)
+        {
+            crate::lora::apply_decode(t, conv_scratch, out_buf, &mut state.scratch.lora_tmp);
         }
         // Result is now in state.scratch.out[..hidden_size]
     }
@@ -1127,6 +1127,9 @@ impl Lfm2Model {
                         // LoRA on the conv in_proj — `proj_mat[3hs×n] += scale·B·(A·normed)`,
                         // applied to the full projection before the B/C/x split. Mirrors
                         // the per-token `forward_conv_block` path for the batched prefill.
+                        // `proj_mat` is sized `proj_rows = max(3·hs, hs+2·max_kv_dim)`, which
+                        // can exceed `3·hs`; slice to the conv's `3·hs` rows so the length
+                        // matches `apply_prefill`'s `t.d × n` contract exactly.
                         if let Some(lora) = &lora
                             && let Some(t) =
                                 lora.get(layer, crate::lora::LoraTarget::ShortconvInProj)
@@ -1134,7 +1137,7 @@ impl Lfm2Model {
                             crate::lora::apply_prefill(
                                 t,
                                 &normed,
-                                &mut proj_mat,
+                                &mut proj_mat[..3 * hs * n],
                                 n,
                                 &mut state.scratch.lora_tmp,
                             );

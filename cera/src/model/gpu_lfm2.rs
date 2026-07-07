@@ -255,7 +255,9 @@ impl WgpuLoraAdapter {
     /// projections feed the residual `scaled_add_inplace`, which scales their
     /// result by `residual_mult` before the residual add — so those two targets'
     /// LoRA delta must carry the same factor (folded into `B` here). The other
-    /// five targets don't feed the residual add, so they use `scale` alone.
+    /// seven targets (incl. the shortconv projections, whose out_proj folds into
+    /// the residual via a plain `add_inplace`, not the scaled path) use `scale`
+    /// alone.
     fn upload(ctx: &GpuContext, w: &LoraAdapterWeights, residual_mult: f32) -> Self {
         let mut layers = Vec::with_capacity(w.n_layers());
         for layer in 0..w.n_layers() {
