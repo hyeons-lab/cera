@@ -242,7 +242,7 @@ struct WgpuLoraTarget {
 /// order) low-rank factors. Built from a CPU [`LoraAdapterWeights`] via
 /// [`WgpuLoraAdapter::upload`] and cached on the model (Arc-pointer-keyed LRU).
 struct WgpuLoraAdapter {
-    layers: Vec<[Option<WgpuLoraTarget>; 7]>,
+    layers: Vec<[Option<WgpuLoraTarget>; 9]>,
 }
 
 impl WgpuLoraAdapter {
@@ -255,11 +255,13 @@ impl WgpuLoraAdapter {
     /// projections feed the residual `scaled_add_inplace`, which scales their
     /// result by `residual_mult` before the residual add — so those two targets'
     /// LoRA delta must carry the same factor (folded into `B` here). The other
-    /// five targets don't feed the residual add, so they use `scale` alone.
+    /// seven targets (incl. the shortconv projections, whose out_proj folds into
+    /// the residual via a plain `add_inplace`, not the scaled path) use `scale`
+    /// alone.
     fn upload(ctx: &GpuContext, w: &LoraAdapterWeights, residual_mult: f32) -> Self {
         let mut layers = Vec::with_capacity(w.n_layers());
         for layer in 0..w.n_layers() {
-            let mut targets: [Option<WgpuLoraTarget>; 7] = Default::default();
+            let mut targets: [Option<WgpuLoraTarget>; 9] = Default::default();
             for target in LoraTarget::ALL {
                 let Some(t) = w.get(layer, target) else {
                     continue;
@@ -2135,6 +2137,16 @@ impl GpuLfm2Model {
                         &in_bg_tmp
                     }
                 };
+                // LoRA conv in_proj delta (`conv_proj_buf += scale·B·(A·normed)`),
+                // added into the full 3·hidden projection before the fused conv
+                // reads the B/C/x gates. Bind groups built before the pass opens.
+                let in_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::ShortconvInProj);
+                let in_lora_bgs = in_lora.map(|t| {
+                    (
+                        t,
+                        self.lora_target_bgs(t, &self.normed_buf, &self.conv_proj_buf),
+                    )
+                });
                 // Pass 1: rmsnorm + in_proj (after hidden→normed copy).
                 Self::encode_copy(
                     &mut enc,
@@ -2151,6 +2163,9 @@ impl GpuLfm2Model {
                     });
                     self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
                     self.dispatch_gemv_into(&mut pass, in_w, in_bg);
+                    if let Some((t, (bg_a, bg_b))) = &in_lora_bgs {
+                        self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
+                    }
                 }
 
                 // Pre-create BGs for passes 2 and 3. The fused conv shader reads
@@ -2197,6 +2212,16 @@ impl GpuLfm2Model {
                         &out_bg_tmp
                     }
                 };
+                // LoRA conv out_proj delta (`out_buf += scale·B·(A·conv_gate)`),
+                // added before the plain `add_inplace` folds `out_buf` into the
+                // residual — scale-only (not residual_mult), matching the CPU path.
+                let out_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::ShortconvOutProj);
+                let out_lora_bgs = out_lora.map(|t| {
+                    (
+                        t,
+                        self.lora_target_bgs(t, &self.conv_gate_buf, &self.out_buf),
+                    )
+                });
                 let add_p = &self.elementwise_hs_params;
                 let add_bg = self
                     .ctx
@@ -2244,6 +2269,9 @@ impl GpuLfm2Model {
                         timestamp_writes: self.ctx.begin_profile_span("conv_post"),
                     });
                     self.dispatch_gemv_into(&mut pass, out_w, out_bg);
+                    if let Some((t, (bg_a, bg_b))) = &out_lora_bgs {
+                        self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
+                    }
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.add_inplace,
@@ -3646,6 +3674,18 @@ impl GpuLfm2Model {
                     hs_u,
                     3 * hs_u,
                 );
+                // LoRA conv in_proj — must run before the fused conv1d overwrites
+                // `prefill_normed_buf` (which still holds the rmsnorm output that
+                // feeds the LoRA `A`).
+                self.encode_lora_hook_batched(
+                    &mut enc,
+                    lora.as_ref(),
+                    layer,
+                    LoraTarget::ShortconvInProj,
+                    &self.prefill_normed_buf,
+                    &self.prefill_proj_buf,
+                    n_u,
+                );
 
                 // Phase 3: fused conv1d (1 dispatch over all N tokens;
                 // rolling buffer state walks sequentially per channel).
@@ -3670,6 +3710,17 @@ impl GpuLfm2Model {
                     hs_u,
                     hs_u,
                     hs_u,
+                );
+                // LoRA conv out_proj — input is the post-conv gated output (now in
+                // `prefill_normed_buf`), accumulated into the residual scratch.
+                self.encode_lora_hook_batched(
+                    &mut enc,
+                    lora.as_ref(),
+                    layer,
+                    LoraTarget::ShortconvOutProj,
+                    &self.prefill_normed_buf,
+                    &self.prefill_gate_buf,
+                    n_u,
                 );
             } else {
                 // Attention layer.

@@ -583,6 +583,13 @@ enum Command {
         /// adapters, which carry alpha in their own metadata.
         #[arg(long, value_name = "ALPHA", requires = "lora")]
         lora_alpha: Option<f32>,
+
+        /// Prepend the model's BOS token before pooling — matches
+        /// `add_bos_token=true` classifier/embedder heads (and llama.cpp's
+        /// embedding CLI, which prepends BOS by default). Off by default so the
+        /// CLI stays byte-identical to `hidden_states_for_text`.
+        #[arg(long)]
+        add_bos: bool,
     },
 
     /// Tokenize text and print token IDs (for comparison with HuggingFace).
@@ -2177,6 +2184,7 @@ fn main() -> Result<()> {
             json,
             lora,
             lora_alpha,
+            add_bos,
         } => {
             let engine = resolve_engine(
                 model.as_deref(),
@@ -2203,7 +2211,19 @@ fn main() -> Result<()> {
 
             // Tokenize with the session's tokenizer so the ids match the model's
             // vocab exactly (same path `hidden_states_for_text` would take).
-            let tokens = session.tokenizer().encode(&prompt);
+            let encoded = session.tokenizer().encode(&prompt);
+            // Prepend BOS (if requested and the model declares one) so the pooled
+            // vector matches a head trained with `add_bos_token=true` (BOS is
+            // included in the mean). Build the vec with BOS first rather than an
+            // O(n) `insert(0, …)` that shifts the whole prompt.
+            let bos = if add_bos {
+                session.tokenizer().bos_token()
+            } else {
+                None
+            };
+            let mut tokens = Vec::with_capacity(encoded.len() + usize::from(bos.is_some()));
+            tokens.extend(bos);
+            tokens.extend_from_slice(&encoded);
             if tokens.is_empty() {
                 anyhow::bail!("prompt tokenized to zero tokens; nothing to embed");
             }
