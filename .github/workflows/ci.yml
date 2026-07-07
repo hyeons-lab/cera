@@ -28,7 +28,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        # `--all-targets` lints tests, benches, and examples too — without it
+        # clippy skips those compile targets, so lints living in test modules
+        # (e.g. `needless_update`, `items_after_test_module`) slip through CI.
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   # Rustdoc lint. Runs on macOS so `--all-features` can enable the macOS-only
   # `metal` backend (a Linux runner can't compile it), giving the doc build
