@@ -22,20 +22,21 @@ constant constexpr uint NSG = 2;  // simdgroups per TG
 
 struct Params { uint m; uint k; };
 
-kernel void gemv_q6_k(
-    const device uchar* a [[buffer(0)]],    // raw Q6_K bytes
-    const device float* x [[buffer(1)]],
-    device float* y [[buffer(2)]],
-    constant Params& params [[buffer(3)]],
-    uint tiisg [[thread_index_in_simdgroup]],
-    uint sgitg [[simdgroup_index_in_threadgroup]],
-    uint tg_id [[threadgroup_position_in_grid]]
+// Compute the two per-row simd-reduced dot products for this simdgroup's rows.
+// `first_row` and `totals[NR]` (the reduced sums, valid on every lane) are
+// returned so both the plain and the accumulate kernels can share the math.
+static inline void gemv_q6_k_compute(
+    const device uchar* a,
+    const device float* x,
+    constant Params& params,
+    uint tiisg, uint sgitg, uint tg_id,
+    thread uint& first_row,
+    thread float* totals
 ) {
-    uint m = params.m;
     uint k = params.k;
     uint nb = k / QK_K;
     uint row_bytes = nb * Q6K_BYTES;
-    uint first_row = (tg_id * NSG + sgitg) * NR;
+    first_row = (tg_id * NSG + sgitg) * NR;
 
     // Per-row base byte pointers.
     device const uchar* row_base[NR];
@@ -111,9 +112,46 @@ kernel void gemv_q6_k(
     // Reduce each row across the simdgroup.
     #pragma clang loop unroll(full)
     for (uint row = 0u; row < NR; row++) {
-        float total = simd_sum(sumf[row]);
-        if (tiisg == 0u && first_row + row < m) {
-            y[first_row + row] = total;
+        totals[row] = simd_sum(sumf[row]);
+    }
+}
+
+kernel void gemv_q6_k(
+    const device uchar* a [[buffer(0)]],    // raw Q6_K bytes
+    const device float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant Params& params [[buffer(3)]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tg_id [[threadgroup_position_in_grid]]
+) {
+    uint first_row;
+    float totals[NR];
+    gemv_q6_k_compute(a, x, params, tiisg, sgitg, tg_id, first_row, totals);
+    #pragma clang loop unroll(full)
+    for (uint row = 0u; row < NR; row++) {
+        if (tiisg == 0u && first_row + row < params.m) {
+            y[first_row + row] = totals[row];
+        }
+    }
+}
+
+kernel void gemv_q6_k_accum(
+    const device uchar* a [[buffer(0)]],
+    const device float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant Params& params [[buffer(3)]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tg_id [[threadgroup_position_in_grid]]
+) {
+    uint first_row;
+    float totals[NR];
+    gemv_q6_k_compute(a, x, params, tiisg, sgitg, tg_id, first_row, totals);
+    #pragma clang loop unroll(full)
+    for (uint row = 0u; row < NR; row++) {
+        if (tiisg == 0u && first_row + row < params.m) {
+            y[first_row + row] += totals[row];
         }
     }
 }
