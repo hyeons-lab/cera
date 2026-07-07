@@ -89,19 +89,23 @@ kernel void gemv_q4_0(
     const device float* x [[buffer(1)]],
     device float* y [[buffer(2)]],
     constant Params& params [[buffer(3)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg_id [[threadgroup_position_in_grid]]
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 tg_id [[threadgroup_position_in_grid]]
 ) {
     uint m = params.m;
     uint k = params.k;
-    uint row_base = tg_id * ROWS_PER_TG;
+    // Linearize the 2-D dispatch grid (host uses sz2d(min(groups,65535),
+    // ceil(groups/65535))) so m/ROWS_PER_TG > 65535 — e.g. a Qwen/Gemma-vocab
+    // Q4_0 logit projection — maps to distinct threadgroups instead of aliasing.
+    uint tgi = tg_id.x + tg_id.y * 65535u;
+    uint row_base = tgi * ROWS_PER_TG;
 
     uint nb = k / 32;
     uint row_bytes = nb * BLOCK_BYTES;
 
     float sums[ROWS_PER_TG] = {0};
 
-    uint bi = tid;
+    uint bi = tid.x;
     while (bi < nb) {
         uint col_base = bi * 32;
         float xl[32];
@@ -116,7 +120,7 @@ kernel void gemv_q4_0(
 
     for (uint r = 0; r < ROWS_PER_TG; r++) {
         float total = simd_sum(sums[r]);
-        if (tid == 0 && row_base + r < m) {
+        if (tid.x == 0 && row_base + r < m) {
             y[row_base + r] = total;
         }
     }
@@ -172,18 +176,22 @@ kernel void gemv_q4_0_accum(
     const device float* x [[buffer(1)]],
     device float* y [[buffer(2)]],
     constant Params& params [[buffer(3)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg_id [[threadgroup_position_in_grid]]
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 tg_id [[threadgroup_position_in_grid]]
 ) {
     uint m = params.m;
     uint k = params.k;
-    uint row_base = tg_id * ROWS_PER_TG;
+    // Linearize the 2-D dispatch grid (host uses sz2d(min(groups,65535),
+    // ceil(groups/65535))) so m/ROWS_PER_TG > 65535 — e.g. a Qwen/Gemma-vocab
+    // Q4_0 logit projection — maps to distinct threadgroups instead of aliasing.
+    uint tgi = tg_id.x + tg_id.y * 65535u;
+    uint row_base = tgi * ROWS_PER_TG;
 
     uint nb = k / 32;
     uint row_bytes = nb * BLOCK_BYTES;
 
     float sums[ROWS_PER_TG] = {0};
-    uint bi = tid;
+    uint bi = tid.x;
     while (bi < nb) {
         uint col_base = bi * 32;
         float xl[32];
@@ -198,7 +206,7 @@ kernel void gemv_q4_0_accum(
 
     for (uint r = 0; r < ROWS_PER_TG; r++) {
         float total = simd_sum(sums[r]);
-        if (tid == 0 && row_base + r < m) {
+        if (tid.x == 0 && row_base + r < m) {
             y[row_base + r] += total;
         }
     }
