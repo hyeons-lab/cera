@@ -182,6 +182,7 @@ pub mod shaders {
     pub const RMSNORM_BATCH: &str = include_str!("shaders/rmsnorm_batch.metal");
     pub const CONV1D_FUSED: &str = include_str!("shaders/conv1d_fused.metal");
     pub const GEMM_Q4_0: &str = include_str!("shaders/gemm_q4_0.metal");
+    pub const GEMM_Q4_K: &str = include_str!("shaders/gemm_q4_k.metal");
     pub const GEMM_Q8_0: &str = include_str!("shaders/gemm_q8_0.metal");
     pub const GEMM_F32: &str = include_str!("shaders/gemm_f32.metal");
     pub const GEMV_Q8_0: &str = include_str!("shaders/gemv_q8_0.metal");

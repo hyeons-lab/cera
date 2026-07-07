@@ -239,6 +239,7 @@ struct MetalPipelines {
     #[allow(dead_code)]
     conv1d_fused: ComputePipelineState,
     gemm_q4_0: ComputePipelineState,
+    gemm_q4_k: ComputePipelineState,
     gemm_q8_0: ComputePipelineState,
     /// Batched f32 NT GEMM `C = Lhs · Rhsᵀ` for the prefill LoRA down-projection
     /// (`Tmp = X · Aᵀ`).
@@ -587,6 +588,7 @@ impl MetalLfm2Model {
             add_rmsnorm_batch: ctx.create_pipeline(shaders::RMSNORM_BATCH, "add_rmsnorm_batch")?,
             conv1d_fused: ctx.create_pipeline(shaders::CONV1D_FUSED, "conv1d_fused")?,
             gemm_q4_0: ctx.create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0")?,
+            gemm_q4_k: ctx.create_pipeline(shaders::GEMM_Q4_K, "gemm_q4_k")?,
             gemm_q8_0: ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0")?,
             gemm_f32_nt: ctx.create_pipeline(shaders::GEMM_F32, "gemm_f32_nt")?,
             gemm_f32_nt_accum: ctx.create_pipeline(shaders::GEMM_F32, "gemm_f32_nt_accum")?,
@@ -1404,6 +1406,13 @@ impl MetalLfm2Model {
         );
     }
 
+    /// Whether a weight dtype has a batched simdgroup-matrix GEMM kernel. The
+    /// prefill dispatch uses this to choose the batched `encode_gemm` over the
+    /// per-token GEMV loop; `encode_gemm` self-guards for anything else regardless.
+    fn is_batched_gemm_dtype(dtype: DType) -> bool {
+        matches!(dtype, DType::Q4_0 | DType::Q8_0 | DType::Q4KM)
+    }
+
     /// True GEMM with simdgroup matrix ops. Falls back to batch GEMV for small n.
     #[allow(clippy::too_many_arguments)]
     fn encode_gemm(
@@ -1419,14 +1428,14 @@ impl MetalLfm2Model {
         y_stride: u32,
         accumulate: bool,
     ) {
-        // Only Q4_0/Q8_0 have a batched simdgroup-matrix GEMM. Any other dtype
-        // (Q4_K / Q6_K after the Q4_K_M work; F32) is routed to the per-token GEMV
-        // fallback below — so `encode_gemm` is self-guarding and safe to call with
-        // any layer-weight dtype, not just from the production prefill (which gates
-        // the batched call itself). Without this, a Q4_K weight would fall through
-        // to the `_ => gemm_q4_0` arm and read 144-byte blocks with 18-byte strides.
-        let batched = matches!(w.dtype, DType::Q4_0 | DType::Q8_0);
-        if !batched || n < GEMM_MIN_N || w.k % 32 != 0 {
+        // Q4_0/Q8_0/Q4_K have a batched simdgroup-matrix GEMM. Any other dtype
+        // (Q6_K, F32) is routed to the per-token GEMV fallback below — so
+        // `encode_gemm` is self-guarding and safe to call with any layer-weight
+        // dtype. Q4_K's GEMM consumes whole 256-element super-blocks, so it needs
+        // `k % 256 == 0` (vs 32 for Q4_0/Q8_0); a non-conforming k also falls back.
+        let batched = matches!(w.dtype, DType::Q4_0 | DType::Q8_0 | DType::Q4KM);
+        let block_k = if w.dtype == DType::Q4KM { 256 } else { 32 };
+        if !batched || n < GEMM_MIN_N || w.k % block_k != 0 {
             if w.dtype == DType::Q4_0 {
                 return self.encode_gemv_batch(
                     enc,
@@ -1495,6 +1504,7 @@ impl MetalLfm2Model {
         let tg_cols = n.div_ceil(32);
         let gemm_pipeline = match w.dtype {
             DType::Q8_0 => &self.pipelines.gemm_q8_0,
+            DType::Q4KM => &self.pipelines.gemm_q4_k,
             _ => &self.pipelines.gemm_q4_0,
         };
         enc.set_compute_pipeline_state(gemm_pipeline);
@@ -3834,7 +3844,7 @@ impl MetalLfm2Model {
                 let w_out = lw.conv_out_proj.as_ref().unwrap();
 
                 // Phase 2: batch in_proj (GEMM for Q4_0/Q8_0, per-token GEMV for others)
-                if w_in.dtype == DType::Q4_0 || w_in.dtype == DType::Q8_0 {
+                if Self::is_batched_gemm_dtype(w_in.dtype) {
                     self.encode_gemm(
                         enc,
                         w_in,
@@ -3898,7 +3908,7 @@ impl MetalLfm2Model {
                 }
 
                 // Phase 6: out_proj GEMM → gate_buf scratch (no add yet — fused into FFN norm)
-                if w_out.dtype == DType::Q4_0 || w_out.dtype == DType::Q8_0 {
+                if Self::is_batched_gemm_dtype(w_out.dtype) {
                     self.encode_gemm(
                         enc,
                         w_out,
@@ -3952,7 +3962,7 @@ impl MetalLfm2Model {
                 let w_q = lw.attn_q.as_ref().unwrap();
                 let w_k = lw.attn_k.as_ref().unwrap();
                 let w_v = lw.attn_v.as_ref().unwrap();
-                if w_q.dtype == DType::Q4_0 || w_q.dtype == DType::Q8_0 {
+                if Self::is_batched_gemm_dtype(w_q.dtype) {
                     // Q → prefill_proj_buf, stride = q_dim
                     self.encode_gemm(
                         enc,
@@ -4147,7 +4157,7 @@ impl MetalLfm2Model {
                 // Attn output proj GEMM → gate_buf scratch (fused into FFN norm
                 // below). Input stride is q_dim (concatenated head outputs).
                 let w_o = lw.attn_output.as_ref().unwrap();
-                if w_o.dtype == DType::Q4_0 || w_o.dtype == DType::Q8_0 {
+                if Self::is_batched_gemm_dtype(w_o.dtype) {
                     self.encode_gemm(
                         enc,
                         w_o,
@@ -4204,8 +4214,8 @@ impl MetalLfm2Model {
                 self.scalars.residual,
             );
             // gate+up GEMM (1 dispatch each for all N tokens)
-            if (lw.ffn_gate.dtype == DType::Q4_0 || lw.ffn_gate.dtype == DType::Q8_0)
-                && (lw.ffn_up.dtype == DType::Q4_0 || lw.ffn_up.dtype == DType::Q8_0)
+            if Self::is_batched_gemm_dtype(lw.ffn_gate.dtype)
+                && Self::is_batched_gemm_dtype(lw.ffn_up.dtype)
             {
                 self.encode_gemm(
                     enc,
@@ -4287,7 +4297,7 @@ impl MetalLfm2Model {
                 enc.dispatch_thread_groups(grid, sz1d(256));
             }
             // FFN down GEMM → normed_buf scratch (add fused into next layer's norm).
-            if lw.ffn_down.dtype == DType::Q4_0 || lw.ffn_down.dtype == DType::Q8_0 {
+            if Self::is_batched_gemm_dtype(lw.ffn_down.dtype) {
                 self.encode_gemm(
                     enc,
                     &lw.ffn_down,
