@@ -319,8 +319,8 @@ jobs:
           # ("NOSPLIT"), which fails `apt-get update`. A broken release is worse
           # than a broken CI check, so remove every apt source referencing that
           # host, matched by content (covers both .list and deb822 .sources).
-          grep -rl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null \
-            | while IFS= read -r f; do sudo rm -f "$f"; done || true
+          files=$(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
+          for f in $files; do sudo rm -f "$f"; done
           sudo apt-get update && sudo apt-get install -y binaryen
 
       - uses: actions/setup-node@v6
