@@ -592,6 +592,60 @@ enum Command {
         add_bos: bool,
     },
 
+    /// Dump the next-token logits over the full vocabulary for a prompt.
+    ///
+    /// Runs a single prefill and prints the `[vocab_size]` logit vector for the
+    /// last token (the distribution the sampler would draw from). Useful for
+    /// cross-backend parity checks — diff the same prompt's logits across
+    /// `--device cpu` and `--device metal`. `--top-k` prints the K
+    /// highest-scoring `(token_id, logit)` pairs instead of the whole vector.
+    Logits {
+        /// Path to the model: a `.gguf` file, a `.json` LeapBundles manifest, or
+        /// a directory containing exactly one `.json` manifest. Mutually
+        /// exclusive with `--bundle-id` / `--quant`.
+        #[arg(short, long, conflicts_with_all = ["bundle_id", "quant"])]
+        model: Option<String>,
+
+        /// LeapBundles bundle id (pairs with `--quant`). See `cera list-bundles`.
+        #[arg(long, requires = "quant")]
+        bundle_id: Option<String>,
+
+        /// Quantization label for `--bundle-id` (e.g. `Q4_0`, `Q8_0`).
+        #[arg(long, requires = "bundle_id")]
+        quant: Option<String>,
+
+        /// Cache root for `--bundle-id` downloads. Default: `$HOME/.cache/cera`.
+        #[arg(long)]
+        cache_dir: Option<String>,
+
+        /// The prompt to score. Overridden by `--token-ids` when set.
+        #[arg(short, long)]
+        prompt: Option<String>,
+
+        /// Raw token IDs (comma-separated). Overrides `--prompt` when set — use
+        /// to score an exact token sequence without tokenizer ambiguity.
+        #[arg(long)]
+        token_ids: Option<String>,
+
+        /// Device to use: cpu, gpu, metal, or auto.
+        #[arg(long, default_value = "auto")]
+        device: String,
+
+        /// Max context window size. Default 4096.
+        #[arg(long, default_value_t = 4096)]
+        context_size: usize,
+
+        /// Print only the top-K `(token_id, logit)` pairs (descending) instead
+        /// of the full vocab vector. `0` (default) dumps the whole vector.
+        #[arg(long, default_value_t = 0)]
+        top_k: usize,
+
+        /// Output as a JSON array (`[..]` full vector, or `[[id,logit],..]` for
+        /// `--top-k`) instead of space-separated / tabular text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Tokenize text and print token IDs (for comparison with HuggingFace).
     Tokenize {
         /// Path to the GGUF model file.
@@ -1176,6 +1230,18 @@ fn write_embed_row<W: std::io::Write>(w: &mut W, row: &[f32], json: bool) -> std
         }
     }
     Ok(())
+}
+
+/// Write one logit straight into `w` (no intermediate `String` — the full-vocab
+/// dump is ~152k values). In JSON mode a non-finite value becomes `null` (JSON
+/// has no NaN/inf literal); otherwise the native `{v}` rendering (`NaN`/`inf`)
+/// is kept for human/plain-text output.
+fn write_logit<W: std::io::Write>(w: &mut W, v: f32, json: bool) -> std::io::Result<()> {
+    if json && !v.is_finite() {
+        write!(w, "null")
+    } else {
+        write!(w, "{v}")
+    }
 }
 
 /// Configure the engine's KV prefix cache from the four CLI flags shared by
@@ -2279,6 +2345,125 @@ fn main() -> Result<()> {
                     write_embed_row(&mut w, &pooled, false)?;
                     writeln!(w)?;
                 }
+            }
+            w.flush()?;
+        }
+        Command::Logits {
+            model,
+            bundle_id,
+            quant,
+            cache_dir,
+            prompt,
+            token_ids,
+            device,
+            context_size,
+            top_k,
+            json,
+        } => {
+            let engine = resolve_engine(
+                model.as_deref(),
+                bundle_id.as_deref(),
+                quant.as_deref(),
+                cache_dir.as_deref(),
+                &device,
+                context_size,
+            )?;
+            let mut session = engine.new_session(cera::SessionConfig::default());
+
+            // `--token-ids` scores an exact sequence (no tokenizer ambiguity);
+            // otherwise tokenize the prompt with the model's own vocab.
+            let tokens: Vec<u32> = if let Some(ids) = token_ids.as_deref() {
+                ids.split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse::<u32>())
+                    .collect::<Result<_, _>>()
+                    .context("parsing --token-ids as comma-separated u32")?
+            } else {
+                let p = prompt
+                    .as_deref()
+                    .context("provide --prompt or --token-ids")?;
+                session.tokenizer().encode(p)
+            };
+            anyhow::ensure!(!tokens.is_empty(), "no tokens to score");
+            // `--token-ids` is the only path that injects raw ids (tokenizer
+            // output is always in-vocab). Bound-check before prefill: an
+            // out-of-vocab id otherwise indexes the embedding table past its
+            // end — a clean panic on CPU but a silent out-of-bounds mmap read
+            // (garbage logits) on Metal.
+            let vocab = session.model().config().vocab_size;
+            if let Some(&bad) = tokens.iter().find(|&&t| (t as usize) >= vocab) {
+                anyhow::bail!("token id {bad} is out of range for vocab_size {vocab}");
+            }
+
+            // Prefill; `last_logits` then holds the next-token distribution for
+            // the final token.
+            session.append_tokens(&tokens)?;
+            let logits = session
+                .last_logits()
+                .context("no logits produced (prefill was cancelled or empty)")?;
+
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut w = std::io::BufWriter::new(stdout.lock());
+            if top_k > 0 {
+                // Partial top-K by logit, descending. Ties broken by lower id.
+                // `total_cmp` is a strict total order (required by the unstable
+                // sorts); a NaN logit is sunk to -inf so it can never spuriously
+                // rank as a top prediction.
+                let mut idx: Vec<usize> = (0..logits.len()).collect();
+                let k = top_k.min(idx.len());
+                let cmp = |a: &usize, b: &usize| {
+                    let la = if logits[*a].is_nan() {
+                        f32::NEG_INFINITY
+                    } else {
+                        logits[*a]
+                    };
+                    let lb = if logits[*b].is_nan() {
+                        f32::NEG_INFINITY
+                    } else {
+                        logits[*b]
+                    };
+                    lb.total_cmp(&la).then(a.cmp(b))
+                };
+                idx.select_nth_unstable_by(k.saturating_sub(1), cmp);
+                idx.truncate(k);
+                idx.sort_unstable_by(cmp);
+                if json {
+                    write!(w, "[")?;
+                    for (i, &id) in idx.iter().enumerate() {
+                        if i > 0 {
+                            write!(w, ",")?;
+                        }
+                        write!(w, "[{},", id)?;
+                        write_logit(&mut w, logits[id], true)?;
+                        write!(w, "]")?;
+                    }
+                    writeln!(w, "]")?;
+                } else {
+                    for &id in &idx {
+                        write!(w, "{}\t", id)?;
+                        write_logit(&mut w, logits[id], false)?;
+                        writeln!(w)?;
+                    }
+                }
+            } else if json {
+                write!(w, "[")?;
+                for (i, &v) in logits.iter().enumerate() {
+                    if i > 0 {
+                        write!(w, ",")?;
+                    }
+                    write_logit(&mut w, v, true)?;
+                }
+                writeln!(w, "]")?;
+            } else {
+                for (i, &v) in logits.iter().enumerate() {
+                    if i > 0 {
+                        write!(w, " ")?;
+                    }
+                    write_logit(&mut w, v, false)?;
+                }
+                writeln!(w)?;
             }
             w.flush()?;
         }
