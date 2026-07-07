@@ -38,7 +38,11 @@ use crate::model::weights::MmapWeight;
 /// `const_sync_tests::max_vit_tokens_matches_attention_shader_scratch`.
 pub const MAX_VIT_TOKENS: usize = 1024;
 
+// Co-located with `MAX_VIT_TOKENS` on purpose: this const-sync check must run in
+// default CI (`#[cfg(test)]` only, no GPU/feature gate), unlike the feature-gated
+// `tests` module at the end of the file, so it can't be folded into it.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod const_sync_tests {
     use super::MAX_VIT_TOKENS;
 
@@ -652,7 +656,7 @@ pub enum WgpuVitWeight {
     },
 }
 
-/// wgpu implementation of [`VitGpuOps`]. Owns the [`GpuContext`] and the compute
+/// wgpu implementation of [`VitGpuOps`]. Owns the [`GpuContext`](crate::backend::wgpu::GpuContext) and the compute
 /// pipelines (compiled once) so it can be cached for the session's lifetime.
 /// Bind groups are created per dispatch (cheap relative to the kernel work).
 #[cfg(feature = "gpu")]

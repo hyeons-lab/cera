@@ -22,6 +22,10 @@ fn write_manifest(dir: &Path, name: &str, json: &str) -> PathBuf {
 }
 
 fn cpu_cfg() -> EngineConfig {
+    // `..Default::default()` fills `bundle_repo`, which only exists under the
+    // `remote` feature; without it the field set is complete and clippy flags
+    // the update as needless — a feature-conditional false positive.
+    #[allow(clippy::needless_update)]
     EngineConfig {
         context_size: 256,
         backend: BackendPreference::Cpu,

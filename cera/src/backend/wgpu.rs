@@ -420,7 +420,7 @@ impl GpuContext {
         }
     }
 
-    /// Async f32 readback. See [`Self::begin_download`].
+    /// Async f32 readback. See `Self::begin_download`.
     pub async fn download_f32_async(
         &self,
         buffer: &wgpu::Buffer,
@@ -436,7 +436,7 @@ impl GpuContext {
         Ok(out)
     }
 
-    /// Async u32 readback (argmax token id). See [`Self::begin_download`].
+    /// Async u32 readback (argmax token id). See `Self::begin_download`.
     pub async fn download_u32_async(
         &self,
         buffer: &wgpu::Buffer,

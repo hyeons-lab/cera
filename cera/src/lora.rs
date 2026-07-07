@@ -336,7 +336,7 @@ impl LoraAdapterWeights {
 const MAX_LORA_LAYERS: usize = 8192;
 
 /// Maximum supported LoRA rank. Adapters above this are rejected at load
-/// ([`LoraTargetWeights::new`]), which lets GPU backends size a fixed rank-width
+/// (`LoraTargetWeights::new`), which lets GPU backends size a fixed rank-width
 /// scratch buffer (the Metal `lora_tmp`) with no out-of-bounds risk. Real
 /// adapters are rank ≤ ~64; this bound is deliberately generous.
 pub const MAX_LORA_RANK: usize = 512;

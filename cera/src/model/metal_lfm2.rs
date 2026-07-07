@@ -394,7 +394,7 @@ pub struct MetalLfm2Model {
     kv_shift_scratch: Buffer,
     state: MetalState,
     /// Lazily-allocated scratch KV/conv for [`Self::hidden_states`] (see
-    /// [`HsScratch`]). Built on first use via [`Self::hs_scratch`] so a
+    /// `HsScratch`). Built on first use via [`Self::hs_scratch`] so a
     /// generation-only load pays no extra KV VRAM. Selected over the generation
     /// caches by `use_hs_scratch`, which is only toggled while holding
     /// `infer_lock`, so the flag needs no stronger ordering than `Relaxed`.
@@ -453,7 +453,7 @@ pub struct MetalLfm2Model {
     active_lora: Mutex<Option<Arc<MetalLoraAdapter>>>,
     /// Scratch for the LoRA down-projection result (`tmp = A·x`). Sized to
     /// [`cera::lora::MAX_LORA_RANK`] f32; the loader rejects any adapter whose
-    /// rank exceeds that ([`LoraTargetWeights::new`]), so a `gemv_f32` writing
+    /// rank exceeds that (`LoraTargetWeights::new`), so a `gemv_f32` writing
     /// `rank` rows here can never overrun.
     lora_tmp: Buffer,
     /// Scratch for the batched-prefill LoRA down-projection result
@@ -2894,7 +2894,7 @@ impl Model for MetalLfm2Model {
 
     /// Per-token post-final-norm hidden states, row-major `[n * hidden_size]`
     /// (matching llama.cpp `--pooling none`). Runs a fresh-context prefill
-    /// against the dedicated [`HsScratch`] caches (selected via `use_hs_scratch`),
+    /// against the dedicated `HsScratch` caches (selected via `use_hs_scratch`),
     /// so it never touches the generation KV — the GPU analog of the CPU path's
     /// separate scratch state. `_state` is unused: Metal keeps its KV on the
     /// model, not the caller's `InferenceState`. Positions run `0..n`, so the
