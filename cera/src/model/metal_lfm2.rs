@@ -657,6 +657,17 @@ impl MetalLfm2Model {
              dtype {embedding_dtype:?}; only F32, Q4_0, Q8_0, Q6_K, and Q4_K are \
              supported",
         );
+        // `dequant_embedding_row` (and the GEMV kernels) stride rows as
+        // `hs / block * block_bytes`; a hidden size not divisible by the dtype's
+        // block size truncates that stride and mis-reads rows. GGUF validates
+        // `numel % block == 0` but not the inner dimension alone, so assert the
+        // Metal kernel precondition here.
+        anyhow::ensure!(
+            hs % embedding_dtype.block_size() == 0,
+            "token_embd.weight hidden size {hs} is not divisible by {embedding_dtype:?} \
+             block size {} (Metal needs block-aligned rows)",
+            embedding_dtype.block_size(),
+        );
 
         // Untied output projection (`output.weight`). `wref.start` is an absolute
         // file offset (data_offset + raw), so it maps directly onto `mmap_buf`
@@ -682,6 +693,15 @@ impl MetalLfm2Model {
              {output_dtype:?} (token_embd.weight / output.weight); only F32, Q4_0, \
              Q8_0, Q6_K, and Q4_K are supported",
         );
+        // Logit projection contracts over `hs`; `encode_gemv_output` strides rows
+        // by `hs / block * block_bytes`, so `hs` must be block-aligned for the
+        // effective output dtype (tied embedding or untied `output.weight`).
+        anyhow::ensure!(
+            hs % output_dtype.block_size() == 0,
+            "logit-projection inner dim {hs} is not divisible by {output_dtype:?} block \
+             size {} (Metal needs block-aligned rows)",
+            output_dtype.block_size(),
+        );
 
         // output_norm is small (hs f32 = 4KB) — still copy since it's not in the mmap
         // tensor data region in a usable format (f32 vs mmap'd bytes).
@@ -705,6 +725,17 @@ impl MetalLfm2Model {
                 "Metal backend has no layer-weight GEMM/GEMV kernel for dtype {:?}; \
                  only Q4_0, Q8_0, Q4_K, Q6_K, and F32 projection weights are supported",
                 wref.dtype
+            );
+            // The GEMM/GEMV kernels stride each row by `k / block * block_bytes`, so
+            // the inner dim `k` must be block-aligned. GGUF only guarantees
+            // `numel (= m*k) % block == 0`; assert the per-row precondition here.
+            anyhow::ensure!(
+                wref.k % wref.dtype.block_size() == 0,
+                "layer weight inner dim k={} is not divisible by {:?} block size {} \
+                 (Metal needs block-aligned rows)",
+                wref.k,
+                wref.dtype,
+                wref.dtype.block_size(),
             );
             // Use byte offset into the shared mmap buffer instead of copying.
             let mmap_offset = wref.start as u64;
