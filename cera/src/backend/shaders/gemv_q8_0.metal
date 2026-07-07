@@ -21,7 +21,7 @@ kernel void gemv_q8_0(
     const device float* src1 [[buffer(1)]],
     device float* dst [[buffer(2)]],
     constant Params& params [[buffer(3)]],
-    uint tg_id [[threadgroup_position_in_grid]],
+    uint3 tg_id [[threadgroup_position_in_grid]],
     uint tiisg [[thread_index_in_simdgroup]]
 ) {
     const uint m = params.m;
@@ -29,11 +29,16 @@ kernel void gemv_q8_0(
     const uint nb = k / QK8_0;
     const uint row_bytes = nb * BLOCK_BYTES;
 
+    // Linearize the 2-D dispatch grid (host uses sz2d(min(groups,65535),
+    // ceil(groups/65535))) so m/NR > 65535 — e.g. a Qwen/Gemma-vocab Q8_0 logit
+    // projection — still maps to distinct threadgroups instead of aliasing on x.
+    const uint tgi = tg_id.x + tg_id.y * 65535u;
+
     const short ix = tiisg / (NW/NQ);  // 0..7: which block in the stride
     const short il = tiisg % (NW/NQ);  // 0..3: which 8-element chunk
 
     for (short r = 0; r < NR; r++) {
-        const uint row = tg_id * NR + r;
+        const uint row = tgi * NR + r;
         if (row >= m) continue;
 
         const device uchar* row_ptr = src0 + row * row_bytes;
@@ -72,7 +77,7 @@ kernel void gemv_q8_0_accum(
     const device float* src1 [[buffer(1)]],
     device float* dst [[buffer(2)]],
     constant Params& params [[buffer(3)]],
-    uint tg_id [[threadgroup_position_in_grid]],
+    uint3 tg_id [[threadgroup_position_in_grid]],
     uint tiisg [[thread_index_in_simdgroup]]
 ) {
     const uint m = params.m;
@@ -80,11 +85,14 @@ kernel void gemv_q8_0_accum(
     const uint nb = k / QK8_0;
     const uint row_bytes = nb * BLOCK_BYTES;
 
+    // See gemv_q8_0: linearize the 2-D dispatch grid for large m.
+    const uint tgi = tg_id.x + tg_id.y * 65535u;
+
     const short ix = tiisg / (NW/NQ);
     const short il = tiisg % (NW/NQ);
 
     for (short r = 0; r < NR; r++) {
-        const uint row = tg_id * NR + r;
+        const uint row = tgi * NR + r;
         if (row >= m) continue;
 
         const device uchar* row_ptr = src0 + row * row_bytes;

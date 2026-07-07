@@ -22,26 +22,44 @@ constant constexpr uint NSG = 2;  // simdgroups per TG
 
 struct Params { uint m; uint k; };
 
-kernel void gemv_q6_k(
-    const device uchar* a [[buffer(0)]],    // raw Q6_K bytes
-    const device float* x [[buffer(1)]],
-    device float* y [[buffer(2)]],
-    constant Params& params [[buffer(3)]],
-    uint tiisg [[thread_index_in_simdgroup]],
-    uint sgitg [[simdgroup_index_in_threadgroup]],
-    uint tg_id [[threadgroup_position_in_grid]]
+// Compute the two per-row simd-reduced dot products for this simdgroup's rows.
+// `first_row` and `totals[NR]` (the reduced sums, valid on every lane) are
+// returned so both the plain and the accumulate kernels can share the math.
+static inline void gemv_q6_k_compute(
+    const device uchar* a,
+    const device float* x,
+    constant Params& params,
+    uint tiisg, uint sgitg, uint tg_id,
+    thread uint& first_row,
+    thread float* totals
 ) {
-    uint m = params.m;
     uint k = params.k;
     uint nb = k / QK_K;
     uint row_bytes = nb * Q6K_BYTES;
-    uint first_row = (tg_id * NSG + sgitg) * NR;
+    first_row = (tg_id * NSG + sgitg) * NR;
 
-    // Per-row base byte pointers.
+    // Guard the `params.m - 1u` clamp below against underflow. `m == 0` never
+    // dispatches a threadgroup (grid = ceil(m/4) = 0), so this is unreachable for
+    // real weights, but keep the kernel safe for an empty/malformed dispatch.
+    // `first_row` is already set above; zero-init `totals` so both out-params are
+    // fully defined even though the callers' `row < m` writeback reads neither.
+    if (params.m == 0u) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0u; r < NR; r++) {
+            totals[r] = 0.0f;
+        }
+        return;
+    }
+
+    // Per-row base byte pointers. Clamp out-of-range rows (the last threadgroup's
+    // simdgroups when m isn't a multiple of NR*NSG) to the final valid row so the
+    // weight reads stay in-bounds; their totals are discarded by the writeback
+    // bounds check in the callers.
     device const uchar* row_base[NR];
     #pragma clang loop unroll(full)
     for (uint r = 0; r < NR; r++) {
-        row_base[r] = a + (first_row + r) * row_bytes;
+        uint safe_row = min(first_row + r, params.m - 1u);
+        row_base[r] = a + safe_row * row_bytes;
     }
 
     // Thread-layout constants (llama.cpp's mul_mv_q6_K_f32_impl).
@@ -111,9 +129,49 @@ kernel void gemv_q6_k(
     // Reduce each row across the simdgroup.
     #pragma clang loop unroll(full)
     for (uint row = 0u; row < NR; row++) {
-        float total = simd_sum(sumf[row]);
-        if (tiisg == 0u && first_row + row < m) {
-            y[first_row + row] = total;
+        totals[row] = simd_sum(sumf[row]);
+    }
+}
+
+kernel void gemv_q6_k(
+    const device uchar* a [[buffer(0)]],    // raw Q6_K bytes
+    const device float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant Params& params [[buffer(3)]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint3 tg_id [[threadgroup_position_in_grid]]
+) {
+    uint first_row;
+    float totals[NR];
+    // Linearize the 2-D dispatch grid so m > 65535 * NR * NSG still maps cleanly.
+    uint tgi = tg_id.x + tg_id.y * 65535u;
+    gemv_q6_k_compute(a, x, params, tiisg, sgitg, tgi, first_row, totals);
+    #pragma clang loop unroll(full)
+    for (uint row = 0u; row < NR; row++) {
+        if (tiisg == 0u && first_row + row < params.m) {
+            y[first_row + row] = totals[row];
+        }
+    }
+}
+
+kernel void gemv_q6_k_accum(
+    const device uchar* a [[buffer(0)]],
+    const device float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant Params& params [[buffer(3)]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint3 tg_id [[threadgroup_position_in_grid]]
+) {
+    uint first_row;
+    float totals[NR];
+    uint tgi = tg_id.x + tg_id.y * 65535u;
+    gemv_q6_k_compute(a, x, params, tiisg, sgitg, tgi, first_row, totals);
+    #pragma clang loop unroll(full)
+    for (uint row = 0u; row < NR; row++) {
+        if (tiisg == 0u && first_row + row < params.m) {
+            y[first_row + row] += totals[row];
         }
     }
 }

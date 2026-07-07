@@ -648,6 +648,17 @@ impl Session {
         self.model.config().hidden_size
     }
 
+    /// The `[vocab_size]` logits for the **last** processed token, i.e. the
+    /// next-token distribution the sampler draws from. `Some` immediately after
+    /// a successful [`Self::append_tokens`] / [`Self::append_text`]; `None`
+    /// before any input has been appended, and cleared to `None` on a cancelled
+    /// or partial prefill and on a context shift. Read it right after an
+    /// `append_*` call — e.g. backend parity checks comparing the same prompt's
+    /// logits across `--device cpu` vs `metal`.
+    pub fn last_logits(&self) -> Option<&[f32]> {
+        self.last_logits.as_deref()
+    }
+
     /// Extract the model's **per-token** last-layer hidden states (post-final
     /// RMSNorm, matching llama.cpp `--pooling none`) for `tokens`.
     ///

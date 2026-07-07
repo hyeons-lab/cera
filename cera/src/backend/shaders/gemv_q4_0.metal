@@ -89,19 +89,32 @@ kernel void gemv_q4_0(
     const device float* x [[buffer(1)]],
     device float* y [[buffer(2)]],
     constant Params& params [[buffer(3)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg_id [[threadgroup_position_in_grid]]
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 tg_id [[threadgroup_position_in_grid]]
 ) {
     uint m = params.m;
     uint k = params.k;
-    uint row_base = tg_id * ROWS_PER_TG;
+    // Linearize the 2-D dispatch grid (host uses sz2d(min(groups,65535),
+    // ceil(groups/65535))) so m/ROWS_PER_TG > 65535 — e.g. a Qwen/Gemma-vocab
+    // Q4_0 logit projection — maps to distinct threadgroups instead of aliasing.
+    uint tgi = tg_id.x + tg_id.y * 65535u;
+    uint row_base = tgi * ROWS_PER_TG;
+
+    // Rounding groups up to a full second grid row (ceil(groups/65535)*65535)
+    // launches surplus threadgroups whose row_base >= m. Bail before the block
+    // loop so process_block() never reads weight bytes for an out-of-range row
+    // (an out-of-bounds device read → GPU command-buffer fault). Uniform across
+    // the threadgroup (row_base derives from tg_id), so simd_sum stays balanced.
+    if (row_base >= m) {
+        return;
+    }
 
     uint nb = k / 32;
     uint row_bytes = nb * BLOCK_BYTES;
 
     float sums[ROWS_PER_TG] = {0};
 
-    uint bi = tid;
+    uint bi = tid.x;
     while (bi < nb) {
         uint col_base = bi * 32;
         float xl[32];
@@ -109,14 +122,18 @@ kernel void gemv_q4_0(
             xl[i] = x[col_base + i];
         }
         for (uint r = 0; r < ROWS_PER_TG; r++) {
-            sums[r] += process_block(row_base + r, bi, row_bytes, a, xl);
+            // Odd m: the last valid threadgroup has row_base == m-1, so r==1 is
+            // out of range — guard the read (writeback is guarded separately).
+            if (row_base + r < m) {
+                sums[r] += process_block(row_base + r, bi, row_bytes, a, xl);
+            }
         }
         bi += 32;
     }
 
     for (uint r = 0; r < ROWS_PER_TG; r++) {
         float total = simd_sum(sums[r]);
-        if (tid == 0 && row_base + r < m) {
+        if (tid.x == 0 && row_base + r < m) {
             y[row_base + r] = total;
         }
     }
@@ -172,18 +189,28 @@ kernel void gemv_q4_0_accum(
     const device float* x [[buffer(1)]],
     device float* y [[buffer(2)]],
     constant Params& params [[buffer(3)]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg_id [[threadgroup_position_in_grid]]
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 tg_id [[threadgroup_position_in_grid]]
 ) {
     uint m = params.m;
     uint k = params.k;
-    uint row_base = tg_id * ROWS_PER_TG;
+    // Linearize the 2-D dispatch grid (host uses sz2d(min(groups,65535),
+    // ceil(groups/65535))) so m/ROWS_PER_TG > 65535 — e.g. a Qwen/Gemma-vocab
+    // Q4_0 logit projection — maps to distinct threadgroups instead of aliasing.
+    uint tgi = tg_id.x + tg_id.y * 65535u;
+    uint row_base = tgi * ROWS_PER_TG;
+
+    // See gemv_q4_0: surplus threadgroups (row_base >= m) must bail before the
+    // block loop so process_block() never issues an out-of-bounds device read.
+    if (row_base >= m) {
+        return;
+    }
 
     uint nb = k / 32;
     uint row_bytes = nb * BLOCK_BYTES;
 
     float sums[ROWS_PER_TG] = {0};
-    uint bi = tid;
+    uint bi = tid.x;
     while (bi < nb) {
         uint col_base = bi * 32;
         float xl[32];
@@ -191,14 +218,17 @@ kernel void gemv_q4_0_accum(
             xl[i] = x[col_base + i];
         }
         for (uint r = 0; r < ROWS_PER_TG; r++) {
-            sums[r] += process_block(row_base + r, bi, row_bytes, a, xl);
+            // Odd m: r==1 of the last valid threadgroup is out of range.
+            if (row_base + r < m) {
+                sums[r] += process_block(row_base + r, bi, row_bytes, a, xl);
+            }
         }
         bi += 32;
     }
 
     for (uint r = 0; r < ROWS_PER_TG; r++) {
         float total = simd_sum(sums[r]);
-        if (tid == 0 && row_base + r < m) {
+        if (tid.x == 0 && row_base + r < m) {
             y[row_base + r] += total;
         }
     }

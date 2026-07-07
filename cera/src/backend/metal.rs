@@ -165,6 +165,7 @@ pub mod shaders {
     pub const GEMV_F32: &str = include_str!("shaders/gemv_f32.metal");
     pub const GEMV_F16: &str = include_str!("shaders/gemv_f16.metal");
     pub const GEMV_Q6_K: &str = include_str!("shaders/gemv_q6_k.metal");
+    pub const GEMV_Q4_K: &str = include_str!("shaders/gemv_q4_k.metal");
     pub const ELEMENTWISE: &str = include_str!("shaders/elementwise.metal");
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.metal");
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.metal");
@@ -181,6 +182,7 @@ pub mod shaders {
     pub const RMSNORM_BATCH: &str = include_str!("shaders/rmsnorm_batch.metal");
     pub const CONV1D_FUSED: &str = include_str!("shaders/conv1d_fused.metal");
     pub const GEMM_Q4_0: &str = include_str!("shaders/gemm_q4_0.metal");
+    pub const GEMM_Q4_K: &str = include_str!("shaders/gemm_q4_k.metal");
     pub const GEMM_Q8_0: &str = include_str!("shaders/gemm_q8_0.metal");
     pub const GEMM_F32: &str = include_str!("shaders/gemm_f32.metal");
     pub const GEMV_Q8_0: &str = include_str!("shaders/gemv_q8_0.metal");
