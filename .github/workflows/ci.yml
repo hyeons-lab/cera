@@ -114,6 +114,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Mesa lavapipe (software Vulkan)
         run: |
+          # Drop packages.microsoft.com apt sources first: they intermittently
+          # serve an invalid InRelease ("NOSPLIT"), which fails `apt-get update`
+          # on the GitHub ubuntu image even though we only need Ubuntu-mirror
+          # packages. Removing them makes the update immune to that outage.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/azure-cli.list
           sudo apt-get update
           sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
       - name: Show Vulkan adapter
@@ -222,7 +228,12 @@ jobs:
         with:
           version: 'v0.14.0'
       - name: Install binaryen (provides wasm-opt)
-        run: sudo apt-get update && sudo apt-get install -y binaryen
+        run: |
+          # Drop packages.microsoft.com apt sources first — see the lavapipe
+          # job for why (intermittent invalid InRelease breaks apt-get update).
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update && sudo apt-get install -y binaryen
       - name: Build cera-wasm npm package
         # `--scope hyeons-lab` matches the package name advertised in
         # cera-wasm/README.md (`@hyeons-lab/cera-wasm`). `--out-dir`
@@ -335,7 +346,12 @@ jobs:
         with:
           version: 'v0.14.0'
       - name: Install binaryen (provides wasm-opt)
-        run: sudo apt-get update && sudo apt-get install -y binaryen
+        run: |
+          # Drop packages.microsoft.com apt sources first — see the lavapipe
+          # job for why (intermittent invalid InRelease breaks apt-get update).
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update && sudo apt-get install -y binaryen
       - name: Build cera-wasm npm package (threaded)
         # Flag breakdown lives in the justfile next to
         # `WASM_MT_RUSTFLAGS`. Keep this command in lockstep —
@@ -871,7 +887,12 @@ jobs:
       # the `cfg(target_arch = "aarch64")` gate that previously made
       # `--features blas` a no-op on this runner.
       - name: Install OpenBLAS
-        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+        run: |
+          # Drop packages.microsoft.com apt sources first — see the lavapipe
+          # job for why (intermittent invalid InRelease breaks apt-get update).
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update && sudo apt-get install -y libopenblas-dev
       - name: Cache downloaded test models
         uses: actions/cache@v5
         with:
