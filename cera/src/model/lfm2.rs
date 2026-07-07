@@ -463,6 +463,11 @@ impl Lfm2Model {
         let out_proj = refs.shortconv_out_proj.as_ref().unwrap();
         let conv_weight = self.conv_weights[layer].as_ref().unwrap();
 
+        // Cloned once (cheap Arc bump) so the adapter can be read while the base
+        // scratch buffers stay mutably borrowed — same pattern as
+        // `forward_attn_block`.
+        let lora = state.lora.clone();
+
         // in_proj: hidden → 3*hidden (uses pre-quantized Q8_0 data when available)
         let proj = &mut state.scratch.conv_proj[..3 * hidden_size];
         #[cfg(target_arch = "aarch64")]
@@ -494,6 +499,15 @@ impl Lfm2Model {
         }
         #[cfg(not(target_arch = "aarch64"))]
         self.gemv(in_proj, hidden, proj);
+
+        // LoRA on the conv in_proj — `proj += scale·B·(A·hidden)`, applied to the
+        // full 3·hidden output before it is split into the B/C/x gates. Matches
+        // llama.cpp applying the adapter to `shortconv.in_proj` on conv layers.
+        if let Some(lora) = &lora {
+            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::ShortconvInProj) {
+                crate::lora::apply_decode(t, hidden, proj, &mut state.scratch.lora_tmp);
+            }
+        }
 
         // Split: b, c, x
         let (b, rest) = proj.split_at(hidden_size);
@@ -537,6 +551,13 @@ impl Lfm2Model {
 
         // out_proj: hidden → hidden, write result into out_buf
         self.gemv(out_proj, conv_scratch, out_buf);
+        // LoRA on the conv out_proj — `out_buf += scale·B·(A·conv_scratch)`, where
+        // conv_scratch is the gated conv output that feeds out_proj.
+        if let Some(lora) = &lora {
+            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::ShortconvOutProj) {
+                crate::lora::apply_decode(t, conv_scratch, out_buf, &mut state.scratch.lora_tmp);
+            }
+        }
         // Result is now in state.scratch.out[..hidden_size]
     }
 
@@ -1103,6 +1124,22 @@ impl Lfm2Model {
                             hs,
                         );
 
+                        // LoRA on the conv in_proj — `proj_mat[3hs×n] += scale·B·(A·normed)`,
+                        // applied to the full projection before the B/C/x split. Mirrors
+                        // the per-token `forward_conv_block` path for the batched prefill.
+                        if let Some(lora) = &lora
+                            && let Some(t) =
+                                lora.get(layer, crate::lora::LoraTarget::ShortconvInProj)
+                        {
+                            crate::lora::apply_prefill(
+                                t,
+                                &normed,
+                                &mut proj_mat,
+                                n,
+                                &mut state.scratch.lora_tmp,
+                            );
+                        }
+
                         // Phase 2: Per-token sequential conv using pre-computed projections
                         let kernel_size = cfg.conv_kernel_size.unwrap_or(3);
                         let d_conv = kernel_size - 1;
@@ -1181,6 +1218,22 @@ impl Lfm2Model {
                             n,
                             hs,
                         );
+
+                        // LoRA on the conv out_proj — `block_out[hs×n] += scale·B·(A·in)`,
+                        // where `in` is the gated conv output (`out_proj_input`), before
+                        // the residual add.
+                        if let Some(lora) = &lora
+                            && let Some(t) =
+                                lora.get(layer, crate::lora::LoraTarget::ShortconvOutProj)
+                        {
+                            crate::lora::apply_prefill(
+                                t,
+                                &out_proj_input,
+                                &mut block_out,
+                                n,
+                                &mut state.scratch.lora_tmp,
+                            );
+                        }
                         true
                     } else {
                         false

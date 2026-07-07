@@ -30,9 +30,11 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::gguf::GgufFile;
 
-/// The standard linear-projection targets a v1 adapter can modify: the four
-/// attention projections and the three FFN projections. (LFM2's gated-conv
-/// `in_proj`/`out_proj` are not v1 targets.)
+/// The linear-projection targets an adapter can modify: the four attention
+/// projections, the three FFN projections, and LFM2's two gated-conv
+/// (`shortconv`) projections. llama.cpp's `convert_lora_to_gguf` emits deltas for
+/// all of these, so cera adapts them all — otherwise an adapter trained against
+/// llama.cpp is only partially applied and the resulting hidden states diverge.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LoraTarget {
     AttnQ,
@@ -42,11 +44,15 @@ pub enum LoraTarget {
     FfnGate,
     FfnUp,
     FfnDown,
+    /// LFM2 gated-conv input projection (`shortconv.in_proj`), `hidden → 3·hidden`.
+    ShortconvInProj,
+    /// LFM2 gated-conv output projection (`shortconv.out_proj`), `hidden → hidden`.
+    ShortconvOutProj,
 }
 
 impl LoraTarget {
-    /// All seven targets, in `index()` order.
-    pub const ALL: [LoraTarget; 7] = [
+    /// All nine targets, in `index()` order.
+    pub const ALL: [LoraTarget; 9] = [
         LoraTarget::AttnQ,
         LoraTarget::AttnK,
         LoraTarget::AttnV,
@@ -54,9 +60,11 @@ impl LoraTarget {
         LoraTarget::FfnGate,
         LoraTarget::FfnUp,
         LoraTarget::FfnDown,
+        LoraTarget::ShortconvInProj,
+        LoraTarget::ShortconvOutProj,
     ];
 
-    /// Dense array index (0..7) for `LoraLayer::targets`.
+    /// Dense array index (0..9) for `LoraLayer::targets`.
     pub fn index(self) -> usize {
         match self {
             LoraTarget::AttnQ => 0,
@@ -66,6 +74,8 @@ impl LoraTarget {
             LoraTarget::FfnGate => 4,
             LoraTarget::FfnUp => 5,
             LoraTarget::FfnDown => 6,
+            LoraTarget::ShortconvInProj => 7,
+            LoraTarget::ShortconvOutProj => 8,
         }
     }
 
@@ -79,6 +89,8 @@ impl LoraTarget {
             LoraTarget::FfnGate => "ffn_gate",
             LoraTarget::FfnUp => "ffn_up",
             LoraTarget::FfnDown => "ffn_down",
+            LoraTarget::ShortconvInProj => "shortconv.in_proj",
+            LoraTarget::ShortconvOutProj => "shortconv.out_proj",
         }
     }
 
@@ -97,6 +109,9 @@ impl LoraTarget {
             "mlp.gate_proj" => Some(LoraTarget::FfnGate),
             "mlp.up_proj" => Some(LoraTarget::FfnUp),
             "mlp.down_proj" => Some(LoraTarget::FfnDown),
+            // LFM2 gated-conv (`Lfm2ShortConv` submodule `conv`) projections.
+            "conv.in_proj" => Some(LoraTarget::ShortconvInProj),
+            "conv.out_proj" => Some(LoraTarget::ShortconvOutProj),
             _ => None,
         }
     }
@@ -157,10 +172,10 @@ impl LoraTargetWeights {
     }
 }
 
-/// The (up to seven) target deltas for one transformer layer.
+/// The (up to nine) target deltas for one transformer layer.
 #[derive(Default)]
 pub struct LoraLayer {
-    targets: [Option<LoraTargetWeights>; 7],
+    targets: [Option<LoraTargetWeights>; 9],
 }
 
 /// A loaded LoRA adapter: per-layer low-rank deltas plus scaling.
@@ -228,6 +243,10 @@ impl LoraAdapterWeights {
                         (config.hidden_size, config.intermediate_size)
                     }
                     LoraTarget::FfnDown => (config.intermediate_size, config.hidden_size),
+                    // LFM2 shortconv `in_proj` fans hidden → 3·hidden (the B/C/x
+                    // gates); `out_proj` maps hidden → hidden.
+                    LoraTarget::ShortconvInProj => (config.hidden_size, 3 * config.hidden_size),
+                    LoraTarget::ShortconvOutProj => (config.hidden_size, config.hidden_size),
                 };
                 ensure!(
                     t.k == want_k && t.d == want_d,
@@ -701,6 +720,15 @@ mod tests {
             parse_gguf_lora_name("blk.0.ffn_down.weight.lora_b"),
             Some((0, LoraTarget::FfnDown, false))
         );
+        // LFM2 gated-conv (shortconv) projections — the dotted stem must round-trip.
+        assert_eq!(
+            parse_gguf_lora_name("blk.4.shortconv.in_proj.weight.lora_a"),
+            Some((4, LoraTarget::ShortconvInProj, true))
+        );
+        assert_eq!(
+            parse_gguf_lora_name("blk.15.shortconv.out_proj.weight.lora_b"),
+            Some((15, LoraTarget::ShortconvOutProj, false))
+        );
         // Non-lora / unknown target / malformed → None.
         assert_eq!(parse_gguf_lora_name("blk.3.attn_q.weight"), None);
         assert_eq!(parse_gguf_lora_name("blk.3.attn_norm.weight.lora_a"), None);
@@ -720,6 +748,15 @@ mod tests {
         assert_eq!(
             parse_peft_lora_name("model.layers.2.self_attn.o_proj.lora_A.weight"),
             Some((2, LoraTarget::AttnOutput, true))
+        );
+        // LFM2 gated-conv projections — dotted module name must round-trip.
+        assert_eq!(
+            parse_peft_lora_name("base_model.model.model.layers.0.conv.in_proj.lora_A.weight"),
+            Some((0, LoraTarget::ShortconvInProj, true))
+        );
+        assert_eq!(
+            parse_peft_lora_name("model.layers.3.conv.out_proj.lora_B.weight"),
+            Some((3, LoraTarget::ShortconvOutProj, false))
         );
         // Not a lora tensor / unknown module.
         assert_eq!(

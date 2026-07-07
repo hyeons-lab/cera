@@ -96,7 +96,7 @@ struct MetalLoraTarget {
 /// order) low-rank factors. Built from a CPU [`LoraAdapterWeights`] via
 /// [`MetalLoraAdapter::upload`] and cached on the model (Arc-pointer-keyed LRU).
 struct MetalLoraAdapter {
-    layers: Vec<[Option<MetalLoraTarget>; 7]>,
+    layers: Vec<[Option<MetalLoraTarget>; 9]>,
 }
 
 impl MetalLoraAdapter {
@@ -109,12 +109,13 @@ impl MetalLoraAdapter {
     /// 1.0 for all archs except Granite). The base attn-output / ffn-down
     /// projections feed `encode_residual_proj`, which scales their result by
     /// `residual_mult` before the residual add — so those two targets' LoRA delta
-    /// must carry the same factor (folded into `B` here). The other five targets
-    /// don't feed the residual add, so they use `scale` alone.
+    /// must carry the same factor (folded into `B` here). The other seven targets
+    /// (incl. the shortconv projections, whose out_proj accumulates via a plain
+    /// residual add) don't feed the scaled residual, so they use `scale` alone.
     fn upload(ctx: &MetalContext, w: &LoraAdapterWeights, residual_mult: f32) -> Self {
         let mut layers = Vec::with_capacity(w.n_layers());
         for layer in 0..w.n_layers() {
-            let mut targets: [Option<MetalLoraTarget>; 7] = Default::default();
+            let mut targets: [Option<MetalLoraTarget>; 9] = Default::default();
             for target in LoraTarget::ALL {
                 let Some(t) = w.get(layer, target) else {
                     continue;
@@ -3802,6 +3803,17 @@ impl MetalLfm2Model {
                         );
                     }
                 }
+                // LoRA conv in_proj — before the fused conv1d overwrites
+                // `prefill_normed_buf` (which still holds the rmsnorm output).
+                self.encode_lora_hook_batched(
+                    enc,
+                    lora.as_ref(),
+                    layer,
+                    LoraTarget::ShortconvInProj,
+                    &self.prefill_normed_buf,
+                    &self.prefill_proj_buf,
+                    n,
+                );
 
                 // Phase 3-5: batched fused conv1d (1 dispatch for ALL N tokens)
                 {
@@ -3857,6 +3869,17 @@ impl MetalLfm2Model {
                         );
                     }
                 }
+                // LoRA conv out_proj — input is the post-conv gated output (now in
+                // `prefill_normed_buf`), accumulated into the residual scratch.
+                self.encode_lora_hook_batched(
+                    enc,
+                    lora.as_ref(),
+                    layer,
+                    LoraTarget::ShortconvOutProj,
+                    &self.prefill_normed_buf,
+                    &self.prefill_gate_buf,
+                    n,
+                );
             } else {
                 // Attention: batch Q/K/V projections, then sequential attention.
                 // Decoupled head_dim (Qwen3): Q stride is q_dim = n_heads*head_dim,
@@ -5215,6 +5238,16 @@ impl MetalLfm2Model {
                     &self.normed_buf,
                     &self.conv_proj_buf,
                 );
+                // LoRA conv in_proj delta into the full [x|c|b] projection, before
+                // the fused conv reads its gates.
+                self.encode_lora_hook(
+                    enc,
+                    lora.as_ref(),
+                    i,
+                    LoraTarget::ShortconvInProj,
+                    &self.normed_buf,
+                    &self.conv_proj_buf,
+                );
                 self.encode_conv1d_fused(
                     enc,
                     &self.conv_proj_buf,
@@ -5232,6 +5265,17 @@ impl MetalLfm2Model {
                 self.encode_gemv_weight_accumulate(
                     enc,
                     lw.conv_out_proj.as_ref().unwrap(),
+                    &self.conv_gate_buf,
+                    &self.hidden_buf,
+                );
+                // LoRA conv out_proj delta — input is the gated conv output,
+                // accumulated into the residual (same buffer the base out_proj
+                // accumulates into). Scale-only, matching the CPU path.
+                self.encode_lora_hook(
+                    enc,
+                    lora.as_ref(),
+                    i,
+                    LoraTarget::ShortconvOutProj,
                     &self.conv_gate_buf,
                     &self.hidden_buf,
                 );

@@ -210,6 +210,38 @@ fn lora_noop_and_effect() {
         assert!(out.iter().all(|x| x.is_finite()), "{label}: finite output");
     }
 
+    // (b') Shortconv hooks live on GatedConv layers (in_proj: hs→3·hs,
+    // out_proj: hs→hs). Check each fires (effect) and is a bit-identical no-op
+    // when B = 0 — separately, so a missing hook in either can't be masked.
+    let conv_layer = cfg
+        .block_types
+        .iter()
+        .position(|b| *b == BlockType::GatedConv)
+        .expect("LFM2 has a GatedConv layer");
+    for (label, tgt) in [
+        ("conv in_proj", ("conv.in_proj", hs, 3 * hs)),
+        ("conv out_proj", ("conv.out_proj", hs, hs)),
+    ] {
+        let eff = synth_adapter_io(conv_layer, &[tgt], 4, 0.1, 1.0, 16.0);
+        eff.validate_dims(cfg).expect("shortconv adapter validates");
+        let out = run(&*model, &tokens, Some(eff));
+        assert_ne!(out, base, "{label} LoRA must change the hidden states");
+        assert!(out.iter().all(|x| x.is_finite()), "{label}: finite output");
+    }
+    let sc_zero = synth_adapter_io(
+        conv_layer,
+        &[("conv.in_proj", hs, 3 * hs), ("conv.out_proj", hs, hs)],
+        4,
+        0.3,
+        0.0,
+        8.0,
+    );
+    assert_eq!(
+        run(&*model, &tokens, Some(sc_zero)),
+        base,
+        "B=0 shortconv adapter must be a bit-identical no-op"
+    );
+
     // (c) validate_dims: a matching adapter is accepted; one with the wrong
     // input width (a different model) is rejected up front.
     assert!(
@@ -357,5 +389,40 @@ fn lora_batched_matches_per_token() {
         lora_max < 1e-3 * logit_scale,
         "adapter batched vs per-token max_abs {lora_max:.6e} exceeds 1e-3 × logit_scale \
          ({logit_scale:.4}) — the batched LoRA hook likely diverges"
+    );
+
+    // Shortconv (conv-layer) LoRA: the batched-prefill conv hooks
+    // (`apply_prefill` on in_proj / out_proj) must match the per-token conv
+    // hooks (`apply_decode`) too. A shortconv-only adapter on a real conv layer
+    // isolates that path from the attention/FFN hooks above.
+    let conv_layer = cfg
+        .block_types
+        .iter()
+        .position(|b| *b == BlockType::GatedConv)
+        .expect("LFM2 has a GatedConv layer");
+    let sc = synth_adapter_io(
+        conv_layer,
+        &[("conv.in_proj", hs, 3 * hs), ("conv.out_proj", hs, hs)],
+        4,
+        0.08,
+        0.05,
+        8.0,
+    );
+    sc.validate_dims(cfg).expect("shortconv adapter validates");
+    let sc_batched = batched(Some(sc.clone()));
+    let (sc_cos, sc_max) = compare(&sc_batched, &per_token(Some(sc.clone())));
+    eprintln!("  shortconv: cos={sc_cos:.8} max_abs={sc_max:.6e}");
+    assert!(
+        sc_cos > 0.9999,
+        "shortconv batched vs per-token cosine {sc_cos:.8} must exceed 0.9999"
+    );
+    assert_ne!(
+        sc_batched, base_logits,
+        "shortconv adapter must alter the logits"
+    );
+    assert!(
+        sc_max < 1e-3 * logit_scale,
+        "shortconv batched vs per-token max_abs {sc_max:.6e} exceeds 1e-3 × logit_scale \
+         ({logit_scale:.4}) — the batched conv LoRA hook likely diverges"
     );
 }
