@@ -643,6 +643,20 @@ impl MetalLfm2Model {
             .get("token_embd.weight")
             .map(|t| t.dtype)
             .ok_or_else(|| anyhow::anyhow!("missing token_embd.weight"))?;
+        // `dequant_embedding_row` has F32 / Q4_0 / Q8_0 / Q6_K / Q4_K per-row
+        // dequant arms; any other embedding dtype (F16/BF16, …) falls through its
+        // f32 arm, which mis-sizes the row as `hs * 4` and reads garbage / past the
+        // mmap. Reject at load rather than at the first token lookup. (For tied
+        // models the output check below is equivalent; untied models need this.)
+        anyhow::ensure!(
+            matches!(
+                embedding_dtype,
+                DType::F32 | DType::Q4_0 | DType::Q8_0 | DType::Q6K | DType::Q4KM
+            ),
+            "Metal backend has no embedding-lookup dequant for token_embd.weight \
+             dtype {embedding_dtype:?}; only F32, Q4_0, Q8_0, Q6_K, and Q4_K are \
+             supported",
+        );
 
         // Untied output projection (`output.weight`). `wref.start` is an absolute
         // file offset (data_offset + raw), so it maps directly onto `mmap_buf`
@@ -673,17 +687,17 @@ impl MetalLfm2Model {
         // tensor data region in a usable format (f32 vs mmap'd bytes).
         let output_norm = ctx.upload_f32(src.output_norm_weight());
 
-        let upload_weight = |wref: &WeightRef| -> MetalWeight {
+        let upload_weight = |wref: &WeightRef| -> anyhow::Result<MetalWeight> {
             // Layer projection matmuls route through `encode_gemm` (batched
-            // simdgroup GEMM for Q4_0/Q8_0, self-guarding per-token GEMV fallback
-            // for anything else) and `encode_gemv` (Q4_0/Q8_0/Q4_K/Q6_K + an
-            // explicit F32 arm). Q4_K/Q6_K have native GEMV kernels; production
-            // prefill routes them per-token. Q4_K_M is a mixed scheme — most
-            // projections Q4_K, but ffn_down and some attn_v are Q6_K — so both are
-            // required to load such a model. Any other dtype (F16, …) hits the GEMV
-            // `gemv_f32` fallback and is silently reinterpreted as f32 → garbage;
-            // reject it here.
-            assert!(
+            // simdgroup GEMM for Q4_0/Q8_0/Q4_K, self-guarding per-token GEMV
+            // fallback for anything else) and `encode_gemv` (Q4_0/Q8_0/Q4_K/Q6_K +
+            // an explicit F32 arm). Q4_K and Q6_K both have native GEMV kernels;
+            // prefill batches Q4_K via `gemm_q4_k` (n ≥ GEMM_MIN_N) and keeps Q6_K
+            // per-token. Q4_K_M is a mixed scheme — most projections Q4_K, but
+            // ffn_down and some attn_v are Q6_K — so both are required to load such
+            // a model. Any other dtype (F16, …) hits the GEMV `gemv_f32` fallback
+            // and is silently reinterpreted as f32 → garbage; reject it here.
+            anyhow::ensure!(
                 matches!(
                     wref.dtype,
                     DType::Q4_0 | DType::Q8_0 | DType::Q4KM | DType::Q6K | DType::F32
@@ -696,13 +710,13 @@ impl MetalLfm2Model {
             let mmap_offset = wref.start as u64;
             let params_buf =
                 ctx.upload_bytes(bytemuck::cast_slice(&[wref.m as u32, wref.k as u32]));
-            MetalWeight {
+            Ok(MetalWeight {
                 mmap_offset,
                 dtype: wref.dtype,
                 m: wref.m as u32,
                 k: wref.k as u32,
                 params_buf,
-            }
+            })
         };
         // Optional small-f32 upload (per-head QK-norm / QKV bias).
         let upload_opt_f32 =
@@ -712,9 +726,9 @@ impl MetalLfm2Model {
         for i in 0..config.n_layers {
             let attn_norm = ctx.upload_f32(src.attn_norm_weight(i));
             let ffn_norm = ctx.upload_f32(src.ffn_norm_weight(i));
-            let ffn_gate = upload_weight(src.ffn_gate_ref(i));
-            let ffn_up = upload_weight(src.ffn_up_ref(i));
-            let ffn_down = upload_weight(src.ffn_down_ref(i));
+            let ffn_gate = upload_weight(src.ffn_gate_ref(i))?;
+            let ffn_up = upload_weight(src.ffn_up_ref(i))?;
+            let ffn_down = upload_weight(src.ffn_down_ref(i))?;
             let is_conv = config.block_types[i] == BlockType::GatedConv;
             let (conv_in_proj, conv_out_proj, conv_weight) = if is_conv {
                 let ip = src.conv_in_proj_ref(i).expect("conv layer missing in_proj");
@@ -722,8 +736,8 @@ impl MetalLfm2Model {
                     .conv_out_proj_ref(i)
                     .expect("conv layer missing out_proj");
                 (
-                    Some(upload_weight(ip)),
-                    Some(upload_weight(op)),
+                    Some(upload_weight(ip)?),
+                    Some(upload_weight(op)?),
                     Some(
                         ctx.upload_f32(src.conv_weight(i).expect("conv layer missing conv weight")),
                     ),
@@ -738,16 +752,16 @@ impl MetalLfm2Model {
                 (
                     Some(upload_weight(
                         src.attn_q_ref(i).expect("attn layer missing q"),
-                    )),
+                    )?),
                     Some(upload_weight(
                         src.attn_k_ref(i).expect("attn layer missing k"),
-                    )),
+                    )?),
                     Some(upload_weight(
                         src.attn_v_ref(i).expect("attn layer missing v"),
-                    )),
+                    )?),
                     Some(upload_weight(
                         src.attn_output_ref(i).expect("attn layer missing output"),
-                    )),
+                    )?),
                     upload_opt_f32(src.attn_q_norm_weight(i)),
                     upload_opt_f32(src.attn_k_norm_weight(i)),
                 )
@@ -998,7 +1012,9 @@ impl MetalLfm2Model {
             DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, dst),
             DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, dst),
             _ => {
-                // f32: direct copy
+                // f32: direct copy. `from_weight_source` rejects any embedding
+                // dtype outside {F32,Q4_0,Q8_0,Q6_K,Q4_K} at load, so this arm is
+                // only ever reached for genuine F32 (row_bytes == hs * 4 above).
                 let src = bytemuck::cast_slice::<u8, f32>(row_data);
                 dst.copy_from_slice(src);
             }
@@ -1864,10 +1880,10 @@ impl MetalLfm2Model {
                 32u64,
             ),
             DType::Q4KM => (
-                // Native Q4_K super-block GEMV: NR=2 rows/TG, 32 threads. Also the
-                // per-token prefill path for Q4_K weights — production prefill gates
-                // the batched GEMM behind Q4_0/Q8_0, and `encode_gemm` self-guards
-                // (routes any other dtype here per-token) as a backstop.
+                // Native Q4_K super-block GEMV: NR=2 rows/TG, 32 threads. Used for
+                // decode, and for prefill tiles too small for the batched
+                // `gemm_q4_k` (n < GEMM_MIN_N or k % 256 != 0), which `encode_gemm`
+                // routes back here via its self-guard.
                 if accumulate {
                     &self.pipelines.gemv_q4_k_accum
                 } else {
@@ -3843,7 +3859,7 @@ impl MetalLfm2Model {
                 let w_in = lw.conv_in_proj.as_ref().unwrap();
                 let w_out = lw.conv_out_proj.as_ref().unwrap();
 
-                // Phase 2: batch in_proj (GEMM for Q4_0/Q8_0, per-token GEMV for others)
+                // Phase 2: batch in_proj (batched GEMM for Q4_0/Q8_0/Q4_K, per-token GEMV for others)
                 if Self::is_batched_gemm_dtype(w_in.dtype) {
                     self.encode_gemm(
                         enc,
