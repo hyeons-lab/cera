@@ -38,6 +38,19 @@ static inline void gemv_q6_k_compute(
     uint row_bytes = nb * Q6K_BYTES;
     first_row = (tg_id * NSG + sgitg) * NR;
 
+    // Guard the `params.m - 1u` clamp below against underflow. `m == 0` never
+    // dispatches a threadgroup (grid = ceil(m/4) = 0), so this is unreachable for
+    // real weights, but keep the kernel safe for an empty/malformed dispatch.
+    // `first_row` is already set above; zero-init `totals` so both out-params are
+    // fully defined even though the callers' `row < m` writeback reads neither.
+    if (params.m == 0u) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0u; r < NR; r++) {
+            totals[r] = 0.0f;
+        }
+        return;
+    }
+
     // Per-row base byte pointers. Clamp out-of-range rows (the last threadgroup's
     // simdgroups when m isn't a multiple of NR*NSG) to the final valid row so the
     // weight reads stay in-bounds; their totals are discarded by the writeback
