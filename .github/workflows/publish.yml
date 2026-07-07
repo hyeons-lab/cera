@@ -314,13 +314,14 @@ jobs:
 
       - name: Install binaryen (provides wasm-opt)
         run: |
-          # Drop packages.microsoft.com apt sources first: they intermittently
-          # serve an invalid InRelease ("NOSPLIT"), which fails `apt-get update`
-          # on the GitHub ubuntu image even though we only need Ubuntu-mirror
-          # packages. A broken release is worse than a broken CI check, so the
-          # publish path needs the same guard as ci.yml.
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
-                     /etc/apt/sources.list.d/azure-cli.list
+          # packages.microsoft.com apt sources ship preinstalled on the GitHub
+          # ubuntu image and intermittently serve an invalid InRelease
+          # ("NOSPLIT"), which fails `apt-get update`. A broken release is worse
+          # than a broken CI check, so remove every apt source referencing that
+          # host, matched by content (covers both .list and deb822 .sources).
+          while IFS= read -r f; do
+            sudo rm -f -- "$f"
+          done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
           sudo apt-get update && sudo apt-get install -y binaryen
 
       - uses: actions/setup-node@v6
