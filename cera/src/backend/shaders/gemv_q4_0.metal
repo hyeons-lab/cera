@@ -100,6 +100,15 @@ kernel void gemv_q4_0(
     uint tgi = tg_id.x + tg_id.y * 65535u;
     uint row_base = tgi * ROWS_PER_TG;
 
+    // Rounding groups up to a full second grid row (ceil(groups/65535)*65535)
+    // launches surplus threadgroups whose row_base >= m. Bail before the block
+    // loop so process_block() never reads weight bytes for an out-of-range row
+    // (an out-of-bounds device read → GPU command-buffer fault). Uniform across
+    // the threadgroup (row_base derives from tg_id), so simd_sum stays balanced.
+    if (row_base >= m) {
+        return;
+    }
+
     uint nb = k / 32;
     uint row_bytes = nb * BLOCK_BYTES;
 
@@ -113,7 +122,11 @@ kernel void gemv_q4_0(
             xl[i] = x[col_base + i];
         }
         for (uint r = 0; r < ROWS_PER_TG; r++) {
-            sums[r] += process_block(row_base + r, bi, row_bytes, a, xl);
+            // Odd m: the last valid threadgroup has row_base == m-1, so r==1 is
+            // out of range — guard the read (writeback is guarded separately).
+            if (row_base + r < m) {
+                sums[r] += process_block(row_base + r, bi, row_bytes, a, xl);
+            }
         }
         bi += 32;
     }
@@ -187,6 +200,12 @@ kernel void gemv_q4_0_accum(
     uint tgi = tg_id.x + tg_id.y * 65535u;
     uint row_base = tgi * ROWS_PER_TG;
 
+    // See gemv_q4_0: surplus threadgroups (row_base >= m) must bail before the
+    // block loop so process_block() never issues an out-of-bounds device read.
+    if (row_base >= m) {
+        return;
+    }
+
     uint nb = k / 32;
     uint row_bytes = nb * BLOCK_BYTES;
 
@@ -199,7 +218,10 @@ kernel void gemv_q4_0_accum(
             xl[i] = x[col_base + i];
         }
         for (uint r = 0; r < ROWS_PER_TG; r++) {
-            sums[r] += process_block(row_base + r, bi, row_bytes, a, xl);
+            // Odd m: r==1 of the last valid threadgroup is out of range.
+            if (row_base + r < m) {
+                sums[r] += process_block(row_base + r, bi, row_bytes, a, xl);
+            }
         }
         bi += 32;
     }

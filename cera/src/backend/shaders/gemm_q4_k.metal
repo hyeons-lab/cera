@@ -6,9 +6,11 @@ using namespace metal;
 // Same tiled `kernel_mul_mm` framework as gemm_q4_0 (64×32 output tile, 8×8
 // simdgroup ops, 128 threads / 4 simdgroups), specialized to the Q4_K
 // super-block: nl = QK_K/16 = 16 sixteen-element tiles per 256-element block.
-// `dequantize_q4_K` decodes tile `il` (0..15) to match cera's
-// `dequantize_q4_k_m_block` (quant.rs) — so the batched prefill GEMM produces the
-// same result as the per-token `gemv_q4_k` path.
+// `dequantize_q4_K` decodes tile `il` (0..15) with the same bit layout as cera's
+// `dequantize_q4_k_m_block` (quant.rs). Like gemm_q4_0/gemm_q8_0, the dequantized
+// weights are rounded to `half` before the simdgroup matmul, so this matches the
+// f32 per-token `gemv_q4_k` / CPU path within f16 tolerance (argmax preserved),
+// not bit-for-bit.
 //
 // Dispatch: (ceil(n/32), ceil(m/64)) TGs × 128 threads. Threadgroup memory: 8 KB.
 

@@ -1478,11 +1478,19 @@ impl MetalLfm2Model {
         // Q4_0/Q8_0/Q4_K have a batched simdgroup-matrix GEMM. Any other dtype
         // (Q6_K, F32) is routed to the per-token GEMV fallback below — so
         // `encode_gemm` is self-guarding and safe to call with any layer-weight
-        // dtype. Q4_K's GEMM consumes whole 256-element super-blocks, so it needs
-        // `k % 256 == 0` (vs 32 for Q4_0/Q8_0); a non-conforming k also falls back.
-        let batched = matches!(w.dtype, DType::Q4_0 | DType::Q8_0 | DType::Q4KM);
-        let block_k = if w.dtype == DType::Q4KM { 256 } else { 32 };
-        if !batched || n < GEMM_MIN_N || w.k % block_k != 0 {
+        // dtype. Q4_K's GEMM consumes whole super-blocks, so it needs
+        // `k % block_size() == 0` (256 for Q4_K, 32 for Q4_0/Q8_0); a
+        // non-conforming k also falls back.
+        //
+        // `accumulate` also forces the fallback: the batched GEMM kernels always
+        // plain-store (their params slot for it is `_pad`), so routing an
+        // accumulating call through them would silently drop the add. The GEMV
+        // fallbacks below honor `accumulate`, so gating on it here keeps the
+        // contract correct-by-construction rather than relying on every caller
+        // passing `false`.
+        let batched = Self::is_batched_gemm_dtype(w.dtype);
+        let block_k = w.dtype.block_size() as u32;
+        if !batched || accumulate || n < GEMM_MIN_N || w.k % block_k != 0 {
             if w.dtype == DType::Q4_0 {
                 return self.encode_gemv_batch(
                     enc,

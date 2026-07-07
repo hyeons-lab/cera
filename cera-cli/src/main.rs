@@ -627,6 +627,12 @@ enum Command {
         #[arg(long)]
         token_ids: Option<String>,
 
+        /// Prepend the model's BOS token to the tokenized `--prompt` (ignored for
+        /// `--token-ids`, which is taken verbatim). Match llama.cpp, which
+        /// prepends BOS by default, when diffing distributions against it.
+        #[arg(long)]
+        add_bos: bool,
+
         /// Device to use: cpu, gpu, metal, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
@@ -2355,6 +2361,7 @@ fn main() -> Result<()> {
             cache_dir,
             prompt,
             token_ids,
+            add_bos,
             device,
             context_size,
             top_k,
@@ -2371,7 +2378,8 @@ fn main() -> Result<()> {
             let mut session = engine.new_session(cera::SessionConfig::default());
 
             // `--token-ids` scores an exact sequence (no tokenizer ambiguity);
-            // otherwise tokenize the prompt with the model's own vocab.
+            // otherwise tokenize the prompt with the model's own vocab, optionally
+            // prepending BOS (`--add-bos`) so distributions line up with llama.cpp.
             let tokens: Vec<u32> = if let Some(ids) = token_ids.as_deref() {
                 ids.split(',')
                     .map(|s| s.trim())
@@ -2383,7 +2391,16 @@ fn main() -> Result<()> {
                 let p = prompt
                     .as_deref()
                     .context("provide --prompt or --token-ids")?;
-                session.tokenizer().encode(p)
+                let encoded = session.tokenizer().encode(p);
+                let bos = if add_bos {
+                    session.tokenizer().bos_token()
+                } else {
+                    None
+                };
+                let mut t = Vec::with_capacity(encoded.len() + usize::from(bos.is_some()));
+                t.extend(bos);
+                t.extend_from_slice(&encoded);
+                t
             };
             anyhow::ensure!(!tokens.is_empty(), "no tokens to score");
             // `--token-ids` is the only path that injects raw ids (tokenizer
