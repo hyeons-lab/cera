@@ -38,11 +38,15 @@ static inline void gemv_q6_k_compute(
     uint row_bytes = nb * Q6K_BYTES;
     first_row = (tg_id * NSG + sgitg) * NR;
 
-    // Per-row base byte pointers.
+    // Per-row base byte pointers. Clamp out-of-range rows (the last threadgroup's
+    // simdgroups when m isn't a multiple of NR*NSG) to the final valid row so the
+    // weight reads stay in-bounds; their totals are discarded by the writeback
+    // bounds check in the callers.
     device const uchar* row_base[NR];
     #pragma clang loop unroll(full)
     for (uint r = 0; r < NR; r++) {
-        row_base[r] = a + (first_row + r) * row_bytes;
+        uint safe_row = min(first_row + r, params.m - 1u);
+        row_base[r] = a + safe_row * row_bytes;
     }
 
     // Thread-layout constants (llama.cpp's mul_mv_q6_K_f32_impl).
@@ -123,11 +127,13 @@ kernel void gemv_q6_k(
     constant Params& params [[buffer(3)]],
     uint tiisg [[thread_index_in_simdgroup]],
     uint sgitg [[simdgroup_index_in_threadgroup]],
-    uint tg_id [[threadgroup_position_in_grid]]
+    uint3 tg_id [[threadgroup_position_in_grid]]
 ) {
     uint first_row;
     float totals[NR];
-    gemv_q6_k_compute(a, x, params, tiisg, sgitg, tg_id, first_row, totals);
+    // Linearize the 2-D dispatch grid so m > 65535 * NR * NSG still maps cleanly.
+    uint tgi = tg_id.x + tg_id.y * 65535u;
+    gemv_q6_k_compute(a, x, params, tiisg, sgitg, tgi, first_row, totals);
     #pragma clang loop unroll(full)
     for (uint row = 0u; row < NR; row++) {
         if (tiisg == 0u && first_row + row < params.m) {
@@ -143,11 +149,12 @@ kernel void gemv_q6_k_accum(
     constant Params& params [[buffer(3)]],
     uint tiisg [[thread_index_in_simdgroup]],
     uint sgitg [[simdgroup_index_in_threadgroup]],
-    uint tg_id [[threadgroup_position_in_grid]]
+    uint3 tg_id [[threadgroup_position_in_grid]]
 ) {
     uint first_row;
     float totals[NR];
-    gemv_q6_k_compute(a, x, params, tiisg, sgitg, tg_id, first_row, totals);
+    uint tgi = tg_id.x + tg_id.y * 65535u;
+    gemv_q6_k_compute(a, x, params, tiisg, sgitg, tgi, first_row, totals);
     #pragma clang loop unroll(full)
     for (uint row = 0u; row < NR; row++) {
         if (tiisg == 0u && first_row + row < params.m) {

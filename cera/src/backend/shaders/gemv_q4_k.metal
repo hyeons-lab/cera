@@ -67,12 +67,15 @@ kernel void gemv_q4_k(
     const device float* x [[buffer(1)]],
     device float* y [[buffer(2)]],
     constant Params& params [[buffer(3)]],
-    uint tg_id [[threadgroup_position_in_grid]],
+    uint3 tg_id [[threadgroup_position_in_grid]],
     uint tiisg [[thread_index_in_simdgroup]]
 ) {
     const uint m = params.m;
     const uint nb = params.k / QK_K;
     const uint row_bytes = nb * Q4K_BYTES;
+    // Linearize the 2-D dispatch grid (`sz2d(min(groups,65535), ceil(groups/65535))`)
+    // so `m > 65535 * NR` still maps every threadgroup to a distinct row.
+    const uint tgi = tg_id.x + tg_id.y * 65535u;
 
     const uint e0 = tiisg * 8u;      // 0,8,...,248 across the 256-element block
     const uint j = e0 / 64u;         // 0..3
@@ -82,7 +85,7 @@ kernel void gemv_q4_k(
     const uint qbase = 32u * j + (o % 32u);
 
     for (short r = 0; r < NR; r++) {
-        const uint row = tg_id * NR + r;
+        const uint row = tgi * NR + r;
         if (row >= m) continue;
         float sumf = gemv_q4_k_row_dot(a + row * row_bytes, x, nb, e0, sub, qbase, hi);
         float total = simd_sum(sumf);
@@ -97,12 +100,13 @@ kernel void gemv_q4_k_accum(
     const device float* x [[buffer(1)]],
     device float* y [[buffer(2)]],
     constant Params& params [[buffer(3)]],
-    uint tg_id [[threadgroup_position_in_grid]],
+    uint3 tg_id [[threadgroup_position_in_grid]],
     uint tiisg [[thread_index_in_simdgroup]]
 ) {
     const uint m = params.m;
     const uint nb = params.k / QK_K;
     const uint row_bytes = nb * Q4K_BYTES;
+    const uint tgi = tg_id.x + tg_id.y * 65535u;
 
     const uint e0 = tiisg * 8u;
     const uint j = e0 / 64u;
@@ -112,7 +116,7 @@ kernel void gemv_q4_k_accum(
     const uint qbase = 32u * j + (o % 32u);
 
     for (short r = 0; r < NR; r++) {
-        const uint row = tg_id * NR + r;
+        const uint row = tgi * NR + r;
         if (row >= m) continue;
         float sumf = gemv_q4_k_row_dot(a + row * row_bytes, x, nb, e0, sub, qbase, hi);
         float total = simd_sum(sumf);
