@@ -25,10 +25,10 @@ use crate::turboquant::{
 /// allocation failure: both mean "this KV won't fit," the caller's recovery is
 /// identical (skip the model), and `requested_bytes` reports the attempted size.
 /// Callers that derive `len` from a multiplication guard that multiply first
-/// (the f32 KV path via `checked_mul`, the compressed buffers via
-/// [`checked_elems`]) so a `usize` wrap can't silently under-reserve; `len` here
-/// is a valid element count, and `try_reserve_exact` itself covers the
-/// `len * size_of::<T>()` byte-size overflow.
+/// via [`checked_elems`] (both the f32 KV path and the compressed buffers) so a
+/// `usize` wrap can't silently under-reserve; `len` here is a valid element
+/// count, and `try_reserve_exact` itself covers the `len * size_of::<T>()`
+/// byte-size overflow.
 pub(crate) fn try_alloc<T>(len: usize) -> Result<Vec<T>, CeraError> {
     let mut v: Vec<T> = Vec::new();
     v.try_reserve_exact(len)
@@ -42,9 +42,16 @@ pub(crate) fn try_alloc<T>(len: usize) -> Result<Vec<T>, CeraError> {
 /// silently under-reserve the buffer and reintroduce an infallible realloc, so
 /// map overflow to `OutOfMemory` (the intended size is absurd) rather than let
 /// it slip past [`try_alloc`]. Used where a buffer length is `capacity * per`.
-pub(crate) fn checked_elems(count: usize, per: usize) -> Result<usize, CeraError> {
+///
+/// `T` is the element type the resulting length feeds into `try_alloc::<T>`, so
+/// the `OutOfMemory` diagnostic reports the intended **byte** size
+/// (`count * per * size_of::<T>()`, saturating), consistent with `try_alloc`'s
+/// own `requested_bytes` — not a bare element count.
+pub(crate) fn checked_elems<T>(count: usize, per: usize) -> Result<usize, CeraError> {
     count.checked_mul(per).ok_or(CeraError::OutOfMemory {
-        requested_bytes: (count as u64).saturating_mul(per as u64),
+        requested_bytes: (count as u64)
+            .saturating_mul(per as u64)
+            .saturating_mul(std::mem::size_of::<T>() as u64),
     })
 }
 
@@ -336,7 +343,7 @@ impl InferenceState {
                         // max_seq_len from a malformed GGUF) surfaces as a
                         // recoverable OutOfMemory — same as a genuinely
                         // too-large KV — rather than aborting the process.
-                        let kv_capacity = checked_elems(capacity, kv_dim)?;
+                        let kv_capacity = checked_elems::<f32>(capacity, kv_dim)?;
                         let compressed_keys = if compress_keys && n_kv_heads > 0 {
                             Some(CompressedKeyCache::try_new(
                                 n_kv_heads,
