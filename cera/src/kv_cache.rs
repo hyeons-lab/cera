@@ -55,6 +55,17 @@ pub(crate) fn checked_elems<T>(count: usize, per: usize) -> Result<usize, CeraEr
     })
 }
 
+/// A zero-filled `f32` buffer of length `len`, reserved fallibly. Reserves via
+/// [`try_alloc`] (→ [`CeraError::OutOfMemory`] instead of aborting) and then
+/// `resize`s to zero-fill within that reservation, so no further allocation
+/// occurs. Used for the fixed-size scratch/conv buffers so every allocation in
+/// the constructor is recoverable, not just the context-scaled KV caches.
+fn zeroed_f32(len: usize) -> Result<Vec<f32>, CeraError> {
+    let mut v = try_alloc::<f32>(len)?;
+    v.resize(len, 0.0);
+    Ok(v)
+}
+
 /// KV cache compression mode. Passed to `InferenceState::from_config_with_compression`
 /// (or via `GenerateConfig::kv_compression`) — that single call sets up everything
 /// TurboQuant needs: the per-layer rotation states, the compressed key/value
@@ -397,7 +408,7 @@ impl InferenceState {
                         })
                     }
                     BlockType::GatedConv => Ok(LayerState::Conv {
-                        buffer: vec![0.0; checked_elems::<f32>(d_conv, config.hidden_size)?],
+                        buffer: zeroed_f32(checked_elems::<f32>(d_conv, config.hidden_size)?)?,
                     }),
                 }
             })
@@ -407,17 +418,17 @@ impl InferenceState {
             layers,
             seq_len: 0,
             scratch: ScratchBuffers {
-                normed: vec![0.0; config.hidden_size],
-                ffn_input: vec![0.0; config.hidden_size],
-                conv_proj: vec![0.0; checked_elems::<f32>(3, config.hidden_size)?],
-                conv_scratch: vec![0.0; config.hidden_size],
-                q: vec![0.0; q_dim],
-                k: vec![0.0; max_kv_dim],
-                v: vec![0.0; max_kv_dim],
-                attn_out: vec![0.0; q_dim],
-                gate: vec![0.0; config.intermediate_size],
-                up: vec![0.0; config.intermediate_size],
-                out: vec![0.0; config.hidden_size],
+                normed: zeroed_f32(config.hidden_size)?,
+                ffn_input: zeroed_f32(config.hidden_size)?,
+                conv_proj: zeroed_f32(checked_elems::<f32>(3, config.hidden_size)?)?,
+                conv_scratch: zeroed_f32(config.hidden_size)?,
+                q: zeroed_f32(q_dim)?,
+                k: zeroed_f32(max_kv_dim)?,
+                v: zeroed_f32(max_kv_dim)?,
+                attn_out: zeroed_f32(q_dim)?,
+                gate: zeroed_f32(config.intermediate_size)?,
+                up: zeroed_f32(config.intermediate_size)?,
+                out: zeroed_f32(config.hidden_size)?,
                 scores: Vec::new(),    // grows with seq_len during inference
                 q8_scales: Vec::new(), // resized per GEMV input dimension (max of hidden/intermediate)
                 q8_quants: Vec::new(), // resized per GEMV input dimension
