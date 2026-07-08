@@ -160,6 +160,32 @@ impl MetalLoraAdapter {
     }
 }
 
+/// hd=64 prefill-attention threadgroup-memory footprint (bytes) for a query
+/// block of `qpt` queries, matching the layout in
+/// `encode_attention_prefill_batch` (`attention_prefill.metal`, C=64):
+/// q_tg + kv_tile (half) + scores + out_tg + state + rescales (float).
+fn prefill_attn_smem_hd64(qpt: usize) -> usize {
+    2 * qpt * 64        // q_tg    (half)
+        + 2 * 64 * 64   // kv_tile (half, C=64)
+        + 4 * qpt * 64  // scores  (float)
+        + 4 * qpt * 64  // out_tg  (float)
+        + 4 * qpt * 2   // state
+        + 4 * qpt // rescales
+}
+
+/// Resolve the hd=64 prefill query block, clamping `requested` (8/16/32) down to
+/// the largest block whose threadgroup memory fits `dev_max_bytes`. QPT=32 needs
+/// 28.4 KB and QPT=16 needs 18.2 KB — both exceed the 16 KB cap on Apple GPU
+/// family ≤3 (A9/A10, supported at iOS 15), which fall back to QPT=8 (13.1 KB).
+/// The result is guaranteed to fit the device, so the dispatch never oversubs
+/// threadgroup memory. (Only used when head_dim==64; hd≠64 is forced to 8.)
+fn resolve_prefill_qpt(requested: u32, dev_max_bytes: usize) -> u32 {
+    [32u32, 16, 8]
+        .into_iter()
+        .find(|&q| q <= requested && prefill_attn_smem_hd64(q as usize) <= dev_max_bytes)
+        .unwrap_or(8)
+}
+
 struct MetalPipelines {
     gemv_f32: ComputePipelineState,
     /// `y[row] += dot(A[row,:], x)` — the accumulate epilogue for the LoRA
@@ -441,11 +467,12 @@ pub struct MetalLfm2Model {
     /// `CERA_PROFILE=noattn` — skip attention dispatches across all forward
     /// paths (decode + prefill) so timing reflects non-attention work.
     skip_attn: bool,
-    /// `CERA_ATTN_QPT` — prefill attention query-block size (queries per
-    /// threadgroup). Default 32; `CERA_ATTN_QPT=8|16` overrides. Honored only
-    /// for head_dim=64 (hd=128 can't fit a larger block in 32 KB shmem — the
-    /// dispatch forces 8 there). Raising the block amortizes the O(n²) K/V
-    /// device reads over more queries (Iter 6); 32 is the measured sweet spot.
+    /// Prefill attention query-block size (queries per threadgroup) for hd=64.
+    /// Prefer 32 (measured sweet spot; amortizes the O(n²) K/V device reads),
+    /// `CERA_ATTN_QPT=8|16` requests otherwise, then `resolve_prefill_qpt`
+    /// clamps to what the device's threadgroup memory holds (family ≤3 / 16 KB
+    /// falls back to 8). Always ∈ {8,16,32} and always fits the device. Honored
+    /// only for head_dim=64; the dispatch forces 8 for hd=128.
     prefill_qpt: u32,
     /// Unique model identifier (GGUF file path). Used as part of the cache
     /// fingerprint so different models with the same architecture don't collide.
@@ -932,6 +959,16 @@ impl MetalLfm2Model {
         // Batched-prefill LoRA scratch: rank × n_tokens for the largest chunk.
         let lora_tmp_batched = make_buf(crate::lora::MAX_LORA_RANK * max_pref);
 
+        // Resolve before the struct literal moves `ctx` (borrows `ctx.device`).
+        let prefill_qpt = resolve_prefill_qpt(
+            match std::env::var("CERA_ATTN_QPT").as_deref() {
+                Ok("8") => 8,
+                Ok("16") => 16,
+                _ => 32,
+            },
+            ctx.device.max_threadgroup_memory_length() as usize,
+        );
+
         Ok(Self {
             hidden_buf: make_buf(hs),
             normed_buf: make_buf(hs),
@@ -1003,17 +1040,11 @@ impl MetalLfm2Model {
             force_flash: std::env::var("CERA_FLASH").as_deref() == Ok("1"),
             attn_mode: std::env::var("CERA_ATTN").unwrap_or_default(),
             skip_attn: std::env::var("CERA_PROFILE").as_deref() == Ok("noattn"),
-            // QPT=32 is the hd=64 default: +11% prefill @ p4096 cold (larger
-            // under sustained load, where the 4×-lower K/V device traffic also
-            // throttles less), neutral at short prompts (≤256), correctness
-            // identical to QPT=8 (test_prefill_qpt_parity). `CERA_ATTN_QPT`
-            // overrides to 8 or 16 for A/B; 16 is a net loss (1 TG/SM without
-            // enough bandwidth payoff). No effect on hd≠64 (forced to 8).
-            prefill_qpt: match std::env::var("CERA_ATTN_QPT").as_deref() {
-                Ok("8") => 8,
-                Ok("16") => 16,
-                _ => 32,
-            },
+            // Prefill attention query block (hd=64), resolved above. QPT=32
+            // preferred: +11% prefill @ p4096 cold (larger under sustained
+            // load); `resolve_prefill_qpt` clamps to device threadgroup memory
+            // (family ≤3 / 16 KB falls back to 8). See the field doc + helper.
+            prefill_qpt,
             model_id: model_id.into_owned(),
             lora_lru: Mutex::new(Vec::new()),
             active_lora: Mutex::new(None),
@@ -2820,11 +2851,12 @@ impl MetalLfm2Model {
     }
 
     /// Dispatch one `attention_prefill` kernel call against (q_buf, k_cache,
-    /// v_cache) writing to `out_buf`. Kernel layout constants (Q_PER_TG=8,
-    /// C=32, N_THREADS=256) are defined in `attention_prefill.metal`; this
-    /// helper is the single authoritative Rust side for them, so both the
-    /// production prefill path and the per-phase profiled path stay in sync
-    /// when the kernel is tuned.
+    /// v_cache) writing to `out_buf`. Kernel layout constants (query block
+    /// QPT ∈ {8,16,32}, C=64, N_THREADS=256) are defined in
+    /// `attention_prefill.metal`; this helper is the single authoritative Rust
+    /// side for the threadgroup-memory sizing and grid, so both the production
+    /// prefill path and the per-phase profiled path stay in sync when the
+    /// kernel is tuned.
     #[allow(clippy::too_many_arguments)]
     fn encode_attention_prefill_batch(
         &self,
@@ -6110,5 +6142,23 @@ impl MetalLfm2Model {
                 );
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod prefill_qpt_tests {
+    use super::resolve_prefill_qpt;
+
+    #[test]
+    fn clamps_query_block_to_device_threadgroup_memory() {
+        // 32 KB device (Apple GPU family 4+ / A11+ / M-series): honor request.
+        assert_eq!(resolve_prefill_qpt(32, 32768), 32);
+        assert_eq!(resolve_prefill_qpt(16, 32768), 16);
+        assert_eq!(resolve_prefill_qpt(8, 32768), 8);
+        // 16 KB device (family ≤3 / A9 / A10): QPT=32 (28.4 KB) and QPT=16
+        // (18.2 KB) both overflow → fall back to QPT=8 (13.1 KB).
+        assert_eq!(resolve_prefill_qpt(32, 16384), 8);
+        assert_eq!(resolve_prefill_qpt(16, 16384), 8);
+        assert_eq!(resolve_prefill_qpt(8, 16384), 8);
     }
 }

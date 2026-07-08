@@ -217,10 +217,11 @@ fn test_classic_vs_splitk_attention_parity() {
 /// the QPT=8 baseline. QPT only changes how many queries a threadgroup owns
 /// (K/V-bandwidth amortization) — the math is unchanged, so any divergence is
 /// a generalization bug (a mis-offset q_tile loop, a softmax row skipped, an
-/// unused row not scrubbed). The prompt is long (~180 tokens) on purpose: it
-/// spans multiple C=64 K/V chunks *and* multiple QPT=32 query-blocks with
-/// partial tails, so the row-tile loops and the `q >= n_q` guards are all
-/// exercised. hd=64 (450M) is the only head_dim with QPT variants.
+/// unused row not scrubbed). The prompt is long (~325 tokens) on purpose: it
+/// spans ~6 C=64 K/V chunks *and* ~11 QPT=32 query-blocks, and 325 is not a
+/// multiple of 32 so the final block is partial (n_q=5) — the row-tile loops
+/// and the `q >= n_q` scrubbing guards are all exercised. hd=64 (450M) is the
+/// only head_dim with QPT variants.
 #[test]
 #[ignore]
 fn test_prefill_qpt_parity() {
