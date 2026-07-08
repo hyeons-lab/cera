@@ -125,9 +125,10 @@ impl CpuFeatures {
         i8mm: false,
     };
 
-    /// Human-readable one-line summary for CLI `inspect` / bug reports, e.g.
-    /// `cpu: tier=avx2 [avx2 fma]` or `cpu: tier=neon+dotprod [neon dotprod]`.
-    pub fn report(&self) -> String {
+    /// The active SIMD feature flags in a stable, arch-independent order.
+    /// Shared by [`CpuFeatures::report`] and [`CpuFeatures::descriptor`] so the
+    /// two never drift.
+    fn active_flags(&self) -> Vec<&'static str> {
         let mut flags: Vec<&str> = Vec::new();
         for (on, name) in [
             (self.avx2, "avx2"),
@@ -143,7 +144,32 @@ impl CpuFeatures {
                 flags.push(name);
             }
         }
-        format!("cpu: tier={} [{}]", self.tier.label(), flags.join(" "))
+        flags
+    }
+
+    /// Human-readable one-line summary for CLI `inspect` / bug reports, e.g.
+    /// `cpu: tier=avx2 [avx2 fma]` or `cpu: tier=neon+dotprod [neon dotprod]`.
+    pub fn report(&self) -> String {
+        format!(
+            "cpu: tier={} [{}]",
+            self.tier.label(),
+            self.active_flags().join(" ")
+        )
+    }
+
+    /// Compact, stable CPU-variant descriptor for telemetry — the active SIMD
+    /// features joined by commas, e.g. `"neon,dotprod,i8mm"` or `"avx2,fma"`,
+    /// falling back to the tier label (e.g. `"scalar"`) when no accelerated
+    /// features are present. Deterministic on a given host, so it can key a
+    /// benchmark submission's CPU-variant field (the analog of llama.cpp's ggml
+    /// CPU-backend descriptor).
+    pub fn descriptor(&self) -> String {
+        let flags = self.active_flags();
+        if flags.is_empty() {
+            self.tier.label().to_string()
+        } else {
+            flags.join(",")
+        }
     }
 
     /// Verify the host can safely run cera's compiled kernels.
@@ -261,6 +287,32 @@ mod tests {
         assert!(CpuTier::Scalar < CpuTier::Neon);
         assert!(CpuTier::Neon < CpuTier::NeonDotprod);
         assert!(CpuTier::NeonDotprod < CpuTier::NeonI8mm);
+    }
+
+    #[test]
+    fn descriptor_is_compact_sorted_and_never_empty() {
+        // Scalar host with no accelerated features → the tier label, never "".
+        assert_eq!(CpuFeatures::NONE.descriptor(), "scalar");
+
+        // aarch64-shape flags join comma-separated in the stable order.
+        let neon = CpuFeatures {
+            tier: CpuTier::NeonI8mm,
+            neon: true,
+            dotprod: true,
+            i8mm: true,
+            ..CpuFeatures::NONE
+        };
+        assert_eq!(neon.descriptor(), "neon,dotprod,i8mm");
+
+        // x86-shape flags likewise; report() shares the same active-flag set.
+        let x86 = CpuFeatures {
+            tier: CpuTier::Avx2,
+            avx2: true,
+            fma: true,
+            ..CpuFeatures::NONE
+        };
+        assert_eq!(x86.descriptor(), "avx2,fma");
+        assert!(x86.report().contains("[avx2 fma]"));
     }
 
     #[test]
