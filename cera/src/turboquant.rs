@@ -10,7 +10,7 @@ use half::f16;
 use std::f32::consts::PI;
 
 use crate::CeraError;
-use crate::kv_cache::try_alloc;
+use crate::kv_cache::{checked_elems, try_alloc};
 
 // ── Randomized Hadamard Transform ──────────────────────────────────────────
 
@@ -387,8 +387,8 @@ impl CompressedKeyCache {
     /// `Vec`s (length `n_kv_heads`) are small and allocated infallibly; only the
     /// `capacity`-scaled inner buffers go through the fallible path.
     pub fn try_new(n_kv_heads: usize, head_dim: usize, capacity: usize) -> Result<Self, CeraError> {
-        let polar_bytes = head_dim / 4;
-        let jl_bytes = head_dim / 8;
+        let polar_len = checked_elems(capacity, head_dim / 4)?;
+        let jl_len = checked_elems(capacity, head_dim / 8)?;
         let mut polar_data = Vec::with_capacity(n_kv_heads);
         let mut jl_data = Vec::with_capacity(n_kv_heads);
         let mut norms = Vec::with_capacity(n_kv_heads);
@@ -396,8 +396,8 @@ impl CompressedKeyCache {
         let mut norms_f32 = Vec::with_capacity(n_kv_heads);
         let mut residual_norms_f32 = Vec::with_capacity(n_kv_heads);
         for _ in 0..n_kv_heads {
-            polar_data.push(try_alloc::<u8>(capacity * polar_bytes)?);
-            jl_data.push(try_alloc::<u8>(capacity * jl_bytes)?);
+            polar_data.push(try_alloc::<u8>(polar_len)?);
+            jl_data.push(try_alloc::<u8>(jl_len)?);
             norms.push(try_alloc::<u16>(capacity)?);
             residual_norms.push(try_alloc::<u16>(capacity)?);
             norms_f32.push(try_alloc::<f32>(capacity)?);
@@ -482,12 +482,12 @@ impl CompressedValueCache {
 
     /// Fallible constructor — see [`CompressedKeyCache::try_new`].
     pub fn try_new(n_kv_heads: usize, head_dim: usize, capacity: usize) -> Result<Self, CeraError> {
-        let polar_bytes = head_dim / 4;
+        let polar_len = checked_elems(capacity, head_dim / 4)?;
         let mut polar_data = Vec::with_capacity(n_kv_heads);
         let mut norms = Vec::with_capacity(n_kv_heads);
         let mut norms_f32 = Vec::with_capacity(n_kv_heads);
         for _ in 0..n_kv_heads {
-            polar_data.push(try_alloc::<u8>(capacity * polar_bytes)?);
+            polar_data.push(try_alloc::<u8>(polar_len)?);
             norms.push(try_alloc::<u16>(capacity)?);
             norms_f32.push(try_alloc::<f32>(capacity)?);
         }
