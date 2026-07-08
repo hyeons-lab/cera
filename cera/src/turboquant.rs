@@ -381,20 +381,21 @@ impl CompressedKeyCache {
         Self::try_new(n_kv_heads, head_dim, capacity).expect("compressed key cache allocation")
     }
 
-    /// Fallible constructor — reserves the per-head buffers via `try_reserve`,
+    /// Fallible constructor — reserves every buffer via `try_reserve`,
     /// returning [`CeraError::OutOfMemory`] instead of aborting when a large
-    /// (high-`capacity`) compressed cache can't be allocated. The per-head outer
-    /// `Vec`s (length `n_kv_heads`) are small and allocated infallibly; only the
-    /// `capacity`-scaled inner buffers go through the fallible path.
+    /// (high-`capacity`) compressed cache — or a malformed, oversized
+    /// `n_kv_heads` — can't be allocated. Both the per-head outer `Vec`s (length
+    /// `n_kv_heads`) and the `capacity`-scaled inner buffers go through the
+    /// fallible path.
     pub fn try_new(n_kv_heads: usize, head_dim: usize, capacity: usize) -> Result<Self, CeraError> {
         let polar_len = checked_elems::<u8>(capacity, head_dim / 4)?;
         let jl_len = checked_elems::<u8>(capacity, head_dim / 8)?;
-        let mut polar_data = Vec::with_capacity(n_kv_heads);
-        let mut jl_data = Vec::with_capacity(n_kv_heads);
-        let mut norms = Vec::with_capacity(n_kv_heads);
-        let mut residual_norms = Vec::with_capacity(n_kv_heads);
-        let mut norms_f32 = Vec::with_capacity(n_kv_heads);
-        let mut residual_norms_f32 = Vec::with_capacity(n_kv_heads);
+        let mut polar_data = try_alloc::<Vec<u8>>(n_kv_heads)?;
+        let mut jl_data = try_alloc::<Vec<u8>>(n_kv_heads)?;
+        let mut norms = try_alloc::<Vec<u16>>(n_kv_heads)?;
+        let mut residual_norms = try_alloc::<Vec<u16>>(n_kv_heads)?;
+        let mut norms_f32 = try_alloc::<Vec<f32>>(n_kv_heads)?;
+        let mut residual_norms_f32 = try_alloc::<Vec<f32>>(n_kv_heads)?;
         for _ in 0..n_kv_heads {
             polar_data.push(try_alloc::<u8>(polar_len)?);
             jl_data.push(try_alloc::<u8>(jl_len)?);
@@ -483,9 +484,9 @@ impl CompressedValueCache {
     /// Fallible constructor — see [`CompressedKeyCache::try_new`].
     pub fn try_new(n_kv_heads: usize, head_dim: usize, capacity: usize) -> Result<Self, CeraError> {
         let polar_len = checked_elems::<u8>(capacity, head_dim / 4)?;
-        let mut polar_data = Vec::with_capacity(n_kv_heads);
-        let mut norms = Vec::with_capacity(n_kv_heads);
-        let mut norms_f32 = Vec::with_capacity(n_kv_heads);
+        let mut polar_data = try_alloc::<Vec<u8>>(n_kv_heads)?;
+        let mut norms = try_alloc::<Vec<u16>>(n_kv_heads)?;
+        let mut norms_f32 = try_alloc::<Vec<f32>>(n_kv_heads)?;
         for _ in 0..n_kv_heads {
             polar_data.push(try_alloc::<u8>(polar_len)?);
             norms.push(try_alloc::<u16>(capacity)?);
