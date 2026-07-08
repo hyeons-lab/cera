@@ -964,6 +964,9 @@ impl MetalLfm2Model {
             match std::env::var("CERA_ATTN_QPT").as_deref() {
                 Ok("8") => 8,
                 Ok("16") => 16,
+                // Explicit so the supported set {8,16,32} is self-documenting;
+                // unset / unrecognized also falls through to the 32 default.
+                Ok("32") => 32,
                 _ => 32,
             },
             ctx.device.max_threadgroup_memory_length() as usize,
