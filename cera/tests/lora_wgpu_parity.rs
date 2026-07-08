@@ -101,7 +101,7 @@ fn synth_adapter(
 }
 
 fn run(model: &dyn Model, tokens: &[u32], lora: Option<Arc<LoraAdapterWeights>>) -> Vec<f32> {
-    let mut state = InferenceState::for_prefill(model.config(), tokens.len());
+    let mut state = InferenceState::for_prefill(model.config(), tokens.len()).unwrap();
     state.lora = lora;
     model.hidden_states(tokens, &mut state)
 }
@@ -231,7 +231,7 @@ fn prefill_logits(
     tokens: &[u32],
     lora: Option<Arc<LoraAdapterWeights>>,
 ) -> Vec<f32> {
-    let mut state = InferenceState::for_prefill(model.config(), tokens.len());
+    let mut state = InferenceState::for_prefill(model.config(), tokens.len()).unwrap();
     state.lora = lora;
     model.forward_prefill(tokens, 0, &mut state)
 }

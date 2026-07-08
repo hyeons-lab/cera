@@ -228,7 +228,7 @@ pub fn run_rust(args: &RunArgs<'_>) -> Result<(Vec<u32>, Option<u64>)> {
         seed: Some(args.seed),
         ..Default::default()
     };
-    let mut session = engine.new_session(session_cfg);
+    let mut session = engine.new_session(session_cfg).unwrap();
 
     if !args.prompt.is_empty() {
         session
@@ -285,7 +285,7 @@ pub fn run_ffi(args: &RunArgs<'_>) -> Result<(Vec<u32>, Option<u64>)> {
         seed: Some(args.seed),
         ..Default::default()
     };
-    let session = engine.new_session(session_cfg);
+    let session = engine.new_session(session_cfg).unwrap();
 
     if !args.prompt.is_empty() {
         session

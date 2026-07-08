@@ -31,14 +31,14 @@ fn bench_decode(model_path: &Path, n_tokens: usize, runs: usize) -> f64 {
     let gguf = cera::gguf::GgufFile::open(model_path).unwrap();
     let model = MetalLfm2Model::from_gguf(gguf, model_path, 8192).unwrap();
     let cfg = model.config();
-    let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
 
     // Warmup
     let _ = model.forward(&[1], 0, &mut state);
 
     let mut tok_per_sec = Vec::new();
     for _ in 0..runs {
-        state = cera::kv_cache::InferenceState::from_config(cfg);
+        state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
         // Prefill a short prompt
         let _ = model.forward(&[1], 0, &mut state);
 
@@ -73,7 +73,7 @@ fn bench_prefill(model_path: &Path, n_tokens: usize, runs: usize) -> f64 {
 
     // Warmup with unique tokens (offset 9999 to avoid cache collisions with runs).
     let warmup_tokens: Vec<u32> = (0..n_tokens as u32).map(|i| i % 1000 + 9999).collect();
-    let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let _ = model.forward_prefill(&warmup_tokens, 0, &mut state);
 
     let mut tok_per_sec = Vec::new();
@@ -83,7 +83,7 @@ fn bench_prefill(model_path: &Path, n_tokens: usize, runs: usize) -> f64 {
         let tokens: Vec<u32> = (0..n_tokens as u32)
             .map(|i| (i.wrapping_mul(7) + run as u32 * 3571 + 1) % 50000 + 1)
             .collect();
-        let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+        let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
         let t0 = Instant::now();
         let _ = model.forward_prefill(&tokens, 0, &mut state);
         let elapsed = t0.elapsed().as_secs_f64();
@@ -179,12 +179,12 @@ fn test_prefill_scaling_profile() {
     for &n in &[1, 4, 8, 16, 32, 64, 128, 256, 512] {
         let tokens: Vec<u32> = (0..n as u32).map(|i| i % 1000 + 1).collect();
         // warmup
-        let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+        let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
         let _ = model.forward_prefill(&tokens, 0, &mut state);
         // measure best of 3
         let mut best = f64::MAX;
         for _ in 0..3 {
-            let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+            let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
             let t0 = Instant::now();
             let _ = model.forward_prefill(&tokens, 0, &mut state);
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -252,7 +252,7 @@ fn test_batched_prefill_logits_match_sequential() {
     let gguf_seq = cera::gguf::GgufFile::open(&path).unwrap();
     let model_seq = MetalLfm2Model::from_gguf(gguf_seq, &path, 8192).unwrap();
     let cfg = model_seq.config();
-    let mut state_seq = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state_seq = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let mut logits_seq = Vec::new();
     for (i, &tok) in tokens.iter().enumerate() {
         logits_seq = model_seq.forward(&[tok], i, &mut state_seq);
@@ -261,7 +261,7 @@ fn test_batched_prefill_logits_match_sequential() {
     // Prefill: forward_prefill() all tokens at once.
     let gguf_pf = cera::gguf::GgufFile::open(&path).unwrap();
     let model_pf = MetalLfm2Model::from_gguf(gguf_pf, &path, 8192).unwrap();
-    let mut state_pf = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state_pf = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let logits_pf = model_pf.forward_prefill(&tokens, 0, &mut state_pf);
 
     // Compare: cosine similarity and max abs diff.
@@ -335,7 +335,7 @@ fn test_batched_prefill_partial_last_chunk() {
         let gguf_seq = cera::gguf::GgufFile::open(&path).unwrap();
         let model_seq = MetalLfm2Model::from_gguf(gguf_seq, &path, 8192).unwrap();
         let cfg = model_seq.config();
-        let mut state_seq = cera::kv_cache::InferenceState::from_config(cfg);
+        let mut state_seq = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
         let mut logits_seq = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {
             logits_seq = model_seq.forward(&[tok], i, &mut state_seq);
@@ -343,7 +343,7 @@ fn test_batched_prefill_partial_last_chunk() {
 
         let gguf_pf = cera::gguf::GgufFile::open(&path).unwrap();
         let model_pf = MetalLfm2Model::from_gguf(gguf_pf, &path, 8192).unwrap();
-        let mut state_pf = cera::kv_cache::InferenceState::from_config(cfg);
+        let mut state_pf = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
         let logits_pf = model_pf.forward_prefill(&tokens, 0, &mut state_pf);
 
         assert_eq!(
@@ -391,11 +391,11 @@ fn test_gemm_crossover() {
 
     for &n in &[4, 8, 12, 16, 24, 32] {
         let tokens: Vec<u32> = (0..n as u32).map(|i| i % 1000 + 1).collect();
-        let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+        let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
         let _ = model.forward_prefill(&tokens, 0, &mut state);
         let mut best = f64::MAX;
         for _ in 0..5 {
-            let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+            let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
             let t0 = Instant::now();
             let _ = model.forward_prefill(&tokens, 0, &mut state);
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -427,12 +427,12 @@ fn test_gemm_microbench() {
     // Run full prefill to warm up, then measure with different n
     for &n in &[32, 64, 128, 256] {
         let tokens: Vec<u32> = (0..n as u32).map(|i| i % 1000 + 1).collect();
-        let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+        let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
         let _ = model.forward_prefill(&tokens, 0, &mut state);
 
         let mut best = f64::MAX;
         for _ in 0..5 {
-            let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+            let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
             let t0 = Instant::now();
             let _ = model.forward_prefill(&tokens, 0, &mut state);
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -475,13 +475,13 @@ fn test_gemm_isolation() {
     let tokens: Vec<u32> = (0..n as u32).map(|i| i % 1000 + 1).collect();
 
     // warmup
-    let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let _ = model.forward_prefill(&tokens, 0, &mut state);
 
     // measure
     let mut times = Vec::new();
     for _ in 0..5 {
-        let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+        let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
         let t0 = Instant::now();
         let _ = model.forward_prefill(&tokens, 0, &mut state);
         times.push(t0.elapsed().as_secs_f64() * 1000.0);
@@ -547,11 +547,11 @@ fn test_prefill_phase_profile() {
     let tokens: Vec<u32> = (0..n as u32).map(|i| i % 1000 + 1).collect();
 
     // Warmup.
-    let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let _ = model.forward_prefill_profiled(&tokens, 0, &mut state);
 
     // Profiled run.
-    let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let timings = model.forward_prefill_profiled(&tokens, 0, &mut state);
 
     let (total_us, cats) = aggregate_prefill_phases(&timings);
@@ -621,11 +621,11 @@ fn test_prefix_cache_correctness() {
     let tokens: Vec<u32> = (0..64u32).map(|i| i % 1000 + 1).collect();
 
     // First call: cache miss → full prefill.
-    let mut state1 = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state1 = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let logits1 = model.forward_prefill(&tokens, 0, &mut state1);
 
     // Second call: cache hit → should restore and produce identical logits.
-    let mut state2 = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state2 = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let t0 = Instant::now();
     let logits2 = model.forward_prefill(&tokens, 0, &mut state2);
     let hit_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -648,7 +648,7 @@ fn test_prefix_cache_correctness() {
     // Third call: prefix match with extra tokens.
     let mut extended = tokens.clone();
     extended.extend_from_slice(&[42, 43, 44, 45]);
-    let mut state3 = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state3 = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let logits3 = model.forward_prefill(&extended, 0, &mut state3);
     eprintln!(
         "  Extended prefill (64+4 tokens): logits[0]={:.4}",
@@ -689,7 +689,7 @@ fn test_prefix_cache_cold_roundtrip() {
     }
 
     // Prefill — triggers auto-cache (warm + cold).
-    let mut state1 = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state1 = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let logits1 = model1.forward_prefill(&tokens, 0, &mut state1);
 
     // Verify cold file exists.
@@ -713,7 +713,7 @@ fn test_prefix_cache_cold_roundtrip() {
     }
 
     // Prefill with same tokens — should hit cold cache.
-    let mut state2 = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state2 = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let t0 = Instant::now();
     let logits2 = model2.forward_prefill(&tokens, 0, &mut state2);
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -751,13 +751,13 @@ fn test_q8_0_gemv_parity() {
     let cfg = model.config();
 
     // Run a single forward pass.
-    let mut state_metal = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state_metal = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let logits_metal = model.forward(&[1], 0, &mut state_metal);
 
     // Also run on CPU for reference.
     let gguf2 = cera::gguf::GgufFile::open(&path).unwrap();
     let cpu_model = cera::model::load_model(gguf2, None, 8192).unwrap();
-    let mut state_cpu = cera::kv_cache::InferenceState::from_config(cpu_model.config());
+    let mut state_cpu = cera::kv_cache::InferenceState::from_config(cpu_model.config()).unwrap();
     let logits_cpu = cpu_model.forward(&[1], 0, &mut state_cpu);
 
     // Compare.
@@ -815,13 +815,13 @@ fn test_q8_0_prefill_parity() {
         max_cold_bytes: 0,
     });
     let cfg = model.config();
-    let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let logits_metal = model.forward_prefill(&tokens, 0, &mut state);
 
     // CPU reference
     let gguf2 = cera::gguf::GgufFile::open(&path).unwrap();
     let cpu_model = cera::model::load_model(gguf2, None, 8192).unwrap();
-    let mut state_cpu = cera::kv_cache::InferenceState::from_config(cpu_model.config());
+    let mut state_cpu = cera::kv_cache::InferenceState::from_config(cpu_model.config()).unwrap();
     let logits_cpu = cpu_model.forward_prefill(&tokens, 0, &mut state_cpu);
 
     let mut max_diff = 0.0f32;
@@ -992,10 +992,10 @@ fn test_450m_prefill_phase_profile() {
     let n = 128;
     let tokens: Vec<u32> = (0..n as u32).map(|i| i % 1000 + 1).collect();
 
-    let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let _ = model.forward_prefill_profiled(&tokens, 0, &mut state);
 
-    let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let timings = model.forward_prefill_profiled(&tokens, 0, &mut state);
 
     let (total_us, cats) = aggregate_prefill_phases(&timings);
@@ -1125,11 +1125,11 @@ fn profile_longctx_run(model_name: &str, n: usize) {
     let tokens: Vec<u32> = (0..n as u32).map(|i| i % 1000 + 1).collect();
 
     // Warmup.
-    let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let _ = model.forward_prefill_profiled(&tokens, 0, &mut state);
 
     // Measured.
-    let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let timings = model.forward_prefill_profiled(&tokens, 0, &mut state);
 
     let (total_us, cats) = aggregate_prefill_phases(&timings);
@@ -1224,14 +1224,14 @@ fn bench_prefill_from_embeddings(model_path: &Path, n_frames: usize) -> (f64, f6
     // allocations dirty, etc. so the first measured run isn't an
     // outlier.
     {
-        let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+        let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
         for j in 0..n_frames.min(4) {
             let frame = &embeddings[j * hidden_size..(j + 1) * hidden_size];
             let _ = model_a.forward_from_embedding(frame, j, &mut state);
         }
     }
     {
-        let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+        let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
         let _ = model_b.forward_prefill_from_embeddings(&embeddings, n_frames, 0, &mut state);
     }
 
@@ -1242,7 +1242,7 @@ fn bench_prefill_from_embeddings(model_path: &Path, n_frames: usize) -> (f64, f6
     let mut best_loop_ms = f64::MAX;
     for _ in 0..3 {
         model_a.restore_state(&zero_state_a);
-        let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+        let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
         let t0 = Instant::now();
         for j in 0..n_frames {
             let frame = &embeddings[j * hidden_size..(j + 1) * hidden_size];
@@ -1256,7 +1256,7 @@ fn bench_prefill_from_embeddings(model_path: &Path, n_frames: usize) -> (f64, f6
     let mut best_batched_ms = f64::MAX;
     for _ in 0..3 {
         model_b.restore_state(&zero_state_b);
-        let mut state = cera::kv_cache::InferenceState::from_config(cfg);
+        let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
         let t0 = Instant::now();
         let _ = model_b.forward_prefill_from_embeddings(&embeddings, n_frames, 0, &mut state);
         let ms = t0.elapsed().as_secs_f64() * 1000.0;

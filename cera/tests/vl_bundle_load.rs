@@ -195,7 +195,7 @@ fn vl_bundle_loads_text_only() {
         "rendered chat template tokenized to nothing — encoder is broken"
     );
 
-    let mut session = engine.new_session(Default::default());
+    let mut session = engine.new_session(Default::default()).unwrap();
     session
         .append_tokens(&prompt_tokens)
         .expect("prefill should succeed against a VL bundle's LFM2 LLM");
@@ -375,7 +375,7 @@ fn vl_bundle_appends_synthetic_image() {
         ],
     }];
 
-    let mut session = engine.new_session(Default::default());
+    let mut session = engine.new_session(Default::default()).unwrap();
     session
         .append_chat_with_images(&messages, &[&img_bytes], true)
         .expect("append_chat_with_images should succeed end-to-end");
@@ -442,12 +442,12 @@ fn vl_bundle_appends_synthetic_image() {
     // a no-op, if the chat path ignores the session default, or if the
     // old cascaded downscale→upscale re-inflated the grid back.
     let uncapped_pos = {
-        let mut s = engine.new_session(Default::default());
+        let mut s = engine.new_session(Default::default()).unwrap();
         s.append_chat_with_images(&messages, &[&img_bytes], true)
             .expect("uncapped chat append");
         s.position()
     };
-    let mut capped = engine.new_session(Default::default());
+    let mut capped = engine.new_session(Default::default()).unwrap();
     capped.set_image_max_long_size(Some(128));
     capped
         .append_chat_with_images(&messages, &[&img_bytes], true)
@@ -543,7 +543,7 @@ fn vl_bundle_gpu_path_generates() {
         ],
     }];
 
-    let mut session = engine.new_session(Default::default());
+    let mut session = engine.new_session(Default::default()).unwrap();
     session
         .append_chat_with_images(&messages, &[&img_bytes], true)
         .expect("append_chat_with_images (GPU path) should succeed end-to-end");

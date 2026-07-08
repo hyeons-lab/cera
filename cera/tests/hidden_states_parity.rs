@@ -77,14 +77,14 @@ fn check_gpu_matches_cpu(gpu: &dyn Model, path: &Path, label: &str) {
         cpu.supports_hidden_states(),
         "CPU LFM2 must support hidden_states"
     );
-    let mut cpu_state = InferenceState::for_prefill(cpu.config(), tokens.len());
+    let mut cpu_state = InferenceState::for_prefill(cpu.config(), tokens.len()).unwrap();
     let cpu_hidden = cpu.hidden_states(&tokens, &mut cpu_state);
 
     assert!(
         gpu.supports_hidden_states(),
         "{label} LFM2 must support hidden_states"
     );
-    let mut gpu_state = InferenceState::for_prefill(gpu.config(), tokens.len());
+    let mut gpu_state = InferenceState::for_prefill(gpu.config(), tokens.len()).unwrap();
     let gpu_hidden = gpu.hidden_states(&tokens, &mut gpu_state);
 
     let d = cpu.config().hidden_size;
@@ -116,7 +116,7 @@ fn check_gpu_matches_cpu(gpu: &dyn Model, path: &Path, label: &str) {
     // scratch would perturb the conv rolling state and diverge sharply; use a
     // tight tolerance rather than bit-exact equality so ULP-level GPU
     // accumulation noise across two command buffers can't flake the gate.
-    let mut s2 = InferenceState::for_prefill(gpu.config(), tokens.len());
+    let mut s2 = InferenceState::for_prefill(gpu.config(), tokens.len()).unwrap();
     let again = gpu.hidden_states(&tokens, &mut s2);
     assert_eq!(again.len(), gpu_hidden.len(), "reproducibility: shape");
     let max_abs = again

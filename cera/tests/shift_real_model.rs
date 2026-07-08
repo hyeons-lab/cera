@@ -152,7 +152,7 @@ fn run_shift_through_real_model(backend: BackendPreference) {
     };
 
     let shift_count = run_with_shift_counter(|counter| {
-        let mut session = engine.new_session(cfg);
+        let mut session = engine.new_session(cfg).unwrap();
 
         // Shift can ONLY fire when prior context already occupies
         // `>= n_keep + shift_needed` cells — the first append must

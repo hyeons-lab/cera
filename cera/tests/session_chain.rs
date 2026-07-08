@@ -36,7 +36,7 @@ use cera::{
 fn make_session(model: Box<dyn Model>, tokenizer: BpeTokenizer, config: SessionConfig) -> Session {
     let model: Arc<dyn Model> = Arc::from(model);
     let tokenizer = Arc::new(tokenizer);
-    Session::new(model, tokenizer, ModalityCapabilities::text_only(), config)
+    Session::new(model, tokenizer, ModalityCapabilities::text_only(), config).unwrap()
 }
 
 /// Locate a text-path GGUF for the tests. Prefers the `CERA_MODEL` env var;
@@ -291,7 +291,7 @@ fn reset_reseeds_sampler_for_reproducibility() {
     let mut sink_a = CollectSink(Vec::new());
     session.generate(&opts, &mut sink_a).unwrap();
 
-    session.reset();
+    session.reset().unwrap();
     session.append_tokens(&prompt_toks).unwrap();
     let mut sink_b = CollectSink(Vec::new());
     session.generate(&opts, &mut sink_b).unwrap();
@@ -381,7 +381,8 @@ fn stochastic_split_matches_single_call_under_seed() {
                 seed: Some(999),
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         session.append_tokens(&prompt_toks).unwrap();
         let mut sink = CollectSink(Vec::new());
         session.generate(&stochastic_opts(8), &mut sink).unwrap();
@@ -399,7 +400,8 @@ fn stochastic_split_matches_single_call_under_seed() {
                 seed: Some(999),
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         session.append_tokens(&prompt_toks).unwrap();
         let mut sink1 = CollectSink(Vec::new());
         session.generate(&stochastic_opts(4), &mut sink1).unwrap();
@@ -523,7 +525,8 @@ fn append_embeddings_advances_position_and_sets_logits() {
             image_in: false,
         },
         SessionConfig::default(),
-    );
+    )
+    .unwrap();
 
     // Tiny deterministic stand-in for a real encoder output. The
     // numbers are arbitrary — we're not asserting numerical
@@ -587,7 +590,7 @@ fn forward_prefill_from_embeddings_matches_per_frame_loop() {
 
     // Path A: loop forward_from_embedding per frame (the trait
     // default's behavior, exercised here directly).
-    let mut state_a = cera::kv_cache::InferenceState::from_config(&cfg);
+    let mut state_a = cera::kv_cache::InferenceState::from_config(&cfg).unwrap();
     let mut last_a: Vec<f32> = Vec::new();
     for j in 0..n {
         let frame = &embeddings[j * hidden_size..(j + 1) * hidden_size];
@@ -595,7 +598,7 @@ fn forward_prefill_from_embeddings_matches_per_frame_loop() {
     }
 
     // Path B: single batched call.
-    let mut state_b = cera::kv_cache::InferenceState::from_config(&cfg);
+    let mut state_b = cera::kv_cache::InferenceState::from_config(&cfg).unwrap();
     let last_b = model_b.forward_prefill_from_embeddings(&embeddings, n, 0, &mut state_b);
 
     assert_eq!(
@@ -674,7 +677,7 @@ fn metal_forward_prefill_from_embeddings_matches_per_frame_loop() {
         .collect();
 
     // Path A: trait default (per-frame forward_from_embedding loop).
-    let mut state_a = cera::kv_cache::InferenceState::from_config(&cfg);
+    let mut state_a = cera::kv_cache::InferenceState::from_config(&cfg).unwrap();
     let mut last_a: Vec<f32> = Vec::new();
     for j in 0..n {
         let frame = &embeddings[j * hidden_size..(j + 1) * hidden_size];
@@ -682,7 +685,7 @@ fn metal_forward_prefill_from_embeddings_matches_per_frame_loop() {
     }
 
     // Path B: this PR's batched override.
-    let mut state_b = cera::kv_cache::InferenceState::from_config(&cfg);
+    let mut state_b = cera::kv_cache::InferenceState::from_config(&cfg).unwrap();
     let last_b = model_b.forward_prefill_from_embeddings(&embeddings, n, 0, &mut state_b);
 
     assert_eq!(
@@ -777,11 +780,11 @@ fn metal_concurrent_forward_prefill_does_not_corrupt() {
     let prompt_par_a = prompt_a.clone();
     let prompt_par_b = prompt_b.clone();
     let h_a = thread::spawn(move || {
-        let mut state = cera::kv_cache::InferenceState::from_config(model_par_a.config());
+        let mut state = cera::kv_cache::InferenceState::from_config(model_par_a.config()).unwrap();
         model_par_a.forward_prefill(&prompt_par_a, 0, &mut state)
     });
     let h_b = thread::spawn(move || {
-        let mut state = cera::kv_cache::InferenceState::from_config(model_par_b.config());
+        let mut state = cera::kv_cache::InferenceState::from_config(model_par_b.config()).unwrap();
         model_par_b.forward_prefill(&prompt_par_b, 0, &mut state)
     });
     let parallel_a = h_a.join().unwrap();
@@ -871,7 +874,8 @@ fn append_audio_without_encoder_returns_backend_error() {
             image_in: false,
         },
         SessionConfig::default(),
-    );
+    )
+    .unwrap();
 
     let pcm = vec![0.0f32; 16_000];
     let err = session.append_audio(&pcm, 16_000).unwrap_err();
@@ -935,7 +939,8 @@ fn append_audio_wrong_sample_rate_returns_backend_error() {
             image_in: false,
         },
         SessionConfig::default(),
-    );
+    )
+    .unwrap();
     session.attach_audio_encoder(encoder);
 
     let pcm = vec![0.0f32; 16_000];
@@ -991,7 +996,8 @@ fn append_audio_end_to_end() {
             image_in: false,
         },
         SessionConfig::default(),
-    );
+    )
+    .unwrap();
 
     let mmproj = cera::gguf::GgufFile::open_arc(&mmproj_path).unwrap();
     let encoder = Arc::new(AudioEncoderWeights::from_gguf(&mmproj).unwrap());
@@ -1086,9 +1092,10 @@ fn reset_preserves_attached_audio_encoder() {
             image_in: false,
         },
         SessionConfig::default(),
-    );
+    )
+    .unwrap();
     session.attach_audio_encoder(encoder);
-    session.reset();
+    session.reset().unwrap();
 
     // After reset, calling append_audio should hit the
     // dimension-mismatch path (encoder is for LFM2.5-Audio, model
@@ -1163,7 +1170,8 @@ fn append_audio_dimension_mismatch_returns_backend_error() {
             image_in: false,
         },
         SessionConfig::default(),
-    );
+    )
+    .unwrap();
     session.attach_audio_encoder(encoder);
 
     let pcm = vec![0.0f32; 16_000];
@@ -1208,7 +1216,7 @@ fn engine_auto_attaches_audio_encoder_from_bundle() {
         "engine should eagerly load mmproj for audio bundles"
     );
 
-    let mut session = engine.new_session(SessionConfig::default());
+    let mut session = engine.new_session(SessionConfig::default()).unwrap();
 
     // 0.5 s of synthetic deterministic noise — same fixture the
     // direct-attach test uses; not asserting on token quality.
@@ -1426,7 +1434,8 @@ fn asr_real_audio_matches_input_phrase() {
             image_in: false,
         },
         SessionConfig::default(),
-    );
+    )
+    .unwrap();
 
     let mmproj = cera::gguf::GgufFile::open_arc(&mmproj_path).unwrap();
     let encoder = Arc::new(AudioEncoderWeights::from_gguf(&mmproj).unwrap());

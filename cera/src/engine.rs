@@ -509,13 +509,13 @@ impl CeraEngine {
     /// `&self`; the engine keeps the originals live for every session
     /// it handed out. The session's [`ModalityCapabilities`] is derived
     /// from the manifest's `inference_type`.
-    pub fn new_session(&self, cfg: SessionConfig) -> Session {
+    pub fn new_session(&self, cfg: SessionConfig) -> Result<Session, CeraError> {
         let mut session = Session::new(
             Arc::clone(&self.model),
             Arc::clone(&self.tokenizer),
             self.capabilities(),
             cfg,
-        );
+        )?;
         // Auto-attach the eagerly-loaded audio encoder so callers
         // can `session.append_audio(...)` directly without first
         // loading + attaching the mmproj GGUF. Encoder is shared
@@ -534,7 +534,7 @@ impl CeraEngine {
         if let Some(gpu) = &self.gpu_vision_encoder {
             session.attach_gpu_vision_encoder(Arc::clone(gpu));
         }
-        session
+        Ok(session)
     }
 
     /// Reserved special-token names, in priority order, that mark the audio
@@ -623,7 +623,7 @@ impl CeraEngine {
 
         let split = Self::split_tokens_at_marker(&toks, marker_id, marker_name)?;
 
-        let mut session = self.new_session(SessionConfig::default());
+        let mut session = self.new_session(SessionConfig::default())?;
         if split > 0 {
             session.append_tokens(&toks[..split])?;
         }

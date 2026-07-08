@@ -1753,7 +1753,7 @@ fn main() -> Result<()> {
                     ubatch_size,
                     n_keep,
                     ..Default::default()
-                });
+                })?;
                 attach_lora(&mut session, &lora, lora_alpha)?;
                 // Honored by `append_chat_with_images` below (and any
                 // later append) — bounds each image's encoded long side.
@@ -1885,7 +1885,7 @@ fn main() -> Result<()> {
                     ubatch_size,
                     n_keep,
                     ..Default::default()
-                });
+                })?;
                 attach_lora(&mut session, &lora, lora_alpha)?;
 
                 let prefill_start = std::time::Instant::now();
@@ -2190,7 +2190,7 @@ fn main() -> Result<()> {
                     ubatch_size,
                     n_keep,
                     ..Default::default()
-                });
+                })?;
                 attach_lora(&mut session, &lora, lora_alpha)?;
 
                 let prefill_start = std::time::Instant::now();
@@ -2278,7 +2278,7 @@ fn main() -> Result<()> {
                 );
             }
 
-            let mut session = engine.new_session(cera::SessionConfig::default());
+            let mut session = engine.new_session(cera::SessionConfig::default())?;
             attach_lora(&mut session, &lora, lora_alpha)?;
 
             // Tokenize with the session's tokenizer so the ids match the model's
@@ -2375,7 +2375,7 @@ fn main() -> Result<()> {
                 &device,
                 context_size,
             )?;
-            let mut session = engine.new_session(cera::SessionConfig::default());
+            let mut session = engine.new_session(cera::SessionConfig::default())?;
 
             // `--token-ids` scores an exact sequence (no tokenizer ambiguity);
             // otherwise tokenize the prompt with the model's own vocab, optionally
@@ -2588,7 +2588,7 @@ fn main() -> Result<()> {
             let mut session = engine.new_session(cera::SessionConfig {
                 seed,
                 ..Default::default()
-            });
+            })?;
             attach_lora(&mut session, &lora, lora_alpha)?;
 
             let mut history: Vec<cera::tokenizer::ChatMessage> = Vec::new();
@@ -3046,7 +3046,9 @@ fn main() -> Result<()> {
                 let mut scratch_history = history.clone();
                 let mut scratch_images = history_images.clone();
                 let prefill_outcome: Result<(), String> = loop {
-                    session.reset();
+                    if let Err(e) = session.reset() {
+                        break Err(format!("session reset failed: {e}"));
+                    }
                     // Recompute per attempt: a truncation step may have
                     // dropped the last image-bearing turn, in which case
                     // the conversation is now text-only and the chat
@@ -3340,7 +3342,7 @@ fn main() -> Result<()> {
                     seed: None,
                     ubatch_size,
                     ..Default::default()
-                });
+                })?;
                 let prefill_start = std::time::Instant::now();
                 session.append_tokens(&tokens)?;
                 let prefill_elapsed = prefill_start.elapsed();

@@ -92,7 +92,7 @@ fn greedy_decode(
     prefill: Prefill,
 ) -> Vec<Step> {
     let mut state =
-        InferenceState::from_config_with_compression(model.config(), &KvCompression::None);
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
     let mut logits = match prefill {
         Prefill::Batched => model.forward_prefill(prompt_tokens, 0, &mut state),
         Prefill::PerToken => {
@@ -463,10 +463,10 @@ fn check_metal_profiled_prefill(model_file: &str, prompt: &str) -> Option<Result
         .expect("metal load (profiled)");
 
     let cfg = prod.config();
-    let mut state_a = InferenceState::from_config(cfg);
+    let mut state_a = InferenceState::from_config(cfg).unwrap();
     let prod_logits = prod.forward_prefill(&tokens, 0, &mut state_a);
 
-    let mut state_b = InferenceState::from_config(prof.config());
+    let mut state_b = InferenceState::from_config(prof.config()).unwrap();
     let _timings = prof.forward_prefill_profiled(&tokens, 0, &mut state_b);
     let prof_logits = prof.read_logits();
 

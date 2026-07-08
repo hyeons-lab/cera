@@ -114,7 +114,7 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, f32, usize, usize)> {
     // (a) Sequential per-token path.
     let gguf_seq = cera::gguf::GgufFile::open(&path).unwrap();
     let model_seq = cera::model::load_model(gguf_seq, None, 8192).unwrap();
-    let mut state_seq = cera::kv_cache::InferenceState::from_config(model_seq.config());
+    let mut state_seq = cera::kv_cache::InferenceState::from_config(model_seq.config()).unwrap();
     let mut logits_seq = Vec::new();
     for (i, &tok) in tokens.iter().enumerate() {
         logits_seq = model_seq.forward(&[tok], i, &mut state_seq);
@@ -123,7 +123,7 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, f32, usize, usize)> {
     // (b) Batched prefill path.
     let gguf_pre = cera::gguf::GgufFile::open(&path).unwrap();
     let model_pre = cera::model::load_model(gguf_pre, None, 8192).unwrap();
-    let mut state_pre = cera::kv_cache::InferenceState::from_config(model_pre.config());
+    let mut state_pre = cera::kv_cache::InferenceState::from_config(model_pre.config()).unwrap();
     let logits_pre = model_pre.forward_prefill(tokens, 0, &mut state_pre);
 
     assert_eq!(logits_pre.len(), logits_seq.len(), "logit length mismatch");

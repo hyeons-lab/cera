@@ -62,7 +62,7 @@ fn top_k(logits: &[f32], k: usize) -> Vec<usize> {
 /// sampled as the first generated token.
 fn prefill_and_next_logits(model: &dyn Model, tokens: &[u32], cm: KvCompression) -> Vec<f32> {
     let cfg = model.config();
-    let mut state = InferenceState::from_config_with_compression(cfg, &cm);
+    let mut state = InferenceState::from_config_with_compression(cfg, &cm).unwrap();
     model.forward_prefill(tokens, 0, &mut state)
 }
 

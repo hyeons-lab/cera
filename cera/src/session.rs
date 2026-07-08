@@ -218,6 +218,8 @@ pub enum CeraError {
     LoraDimMismatch(String),
     #[error("backend: {0}")]
     Backend(String),
+    #[error("out of memory: could not allocate {requested_bytes} bytes")]
+    OutOfMemory { requested_bytes: u64 },
     #[error("io: {0}")]
     Io(#[from] io::Error),
 }
@@ -393,7 +395,7 @@ impl Session {
         tokenizer: Arc<BpeTokenizer>,
         capabilities: ModalityCapabilities,
         config: SessionConfig,
-    ) -> Self {
+    ) -> Result<Self, CeraError> {
         let model_cfg = model.config();
         let max_seq_len = config
             .max_seq_len
@@ -447,7 +449,8 @@ impl Session {
             );
         }
 
-        let state = InferenceState::from_config_with_compression(model_cfg, &config.kv_compression);
+        let state =
+            InferenceState::from_config_with_compression(model_cfg, &config.kv_compression)?;
 
         let sampler_cfg = SamplerConfig {
             seed: config.seed,
@@ -455,7 +458,7 @@ impl Session {
         };
         let sampler = Sampler::new(sampler_cfg);
 
-        Self {
+        Ok(Self {
             model,
             tokenizer,
             state,
@@ -475,7 +478,7 @@ impl Session {
             hs_scratch: None,
             hs_scratch_cap: 0,
             lora: None,
-        }
+        })
     }
 
     /// Attach an audio encoder so [`Self::append_audio`] can encode
@@ -623,10 +626,10 @@ impl Session {
     /// `SessionConfig::seed` so a seeded session is fully reproducible after
     /// reset. Does NOT touch the engine-level disk prefix cache (which lives
     /// on `CeraEngine`, not `Session`).
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self) -> Result<(), CeraError> {
         let model_cfg = self.model.config();
         self.state =
-            InferenceState::from_config_with_compression(model_cfg, &self.config.kv_compression);
+            InferenceState::from_config_with_compression(model_cfg, &self.config.kv_compression)?;
         // Re-apply the attached adapter to the rebuilt state (preserved across reset).
         self.state.lora = self.lora.clone();
         self.current_pos = 0;
@@ -639,6 +642,7 @@ impl Session {
             ..SamplerConfig::default()
         };
         self.sampler = Sampler::new(sampler_cfg);
+        Ok(())
     }
 
     /// The model's hidden dimension `D` — the per-token width of the vectors
@@ -715,15 +719,15 @@ impl Session {
         // full-context KV cache up front.
         let rebuild = self.hs_scratch.is_none() || self.hs_scratch_cap < n;
         if rebuild {
-            self.hs_scratch = Some(InferenceState::for_prefill(model.config(), n));
+            self.hs_scratch = Some(InferenceState::for_prefill(model.config(), n)?);
             self.hs_scratch_cap = n;
         }
-        // `get_or_insert_with` (over `as_mut().unwrap()`) keeps clippy's
-        // `unnecessary_unwrap` quiet given the `is_none()` in `rebuild` above;
-        // the closure never runs (the slot is `Some` after the rebuild block).
+        // The slot is always `Some` after the rebuild block (rebuild covers the
+        // `is_none()` case), so this unwrap never fires.
         let state = self
             .hs_scratch
-            .get_or_insert_with(|| InferenceState::for_prefill(model.config(), n));
+            .as_mut()
+            .expect("hs_scratch is Some after the rebuild block");
         if !rebuild {
             state.clear_for_reuse();
         }

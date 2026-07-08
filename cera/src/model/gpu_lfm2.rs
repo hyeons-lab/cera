@@ -4381,7 +4381,7 @@ impl Model for GpuLfm2Model {
 
         // `forward_inner_compute` needs a `&mut InferenceState` for its `seq_len`
         // bookkeeping only (wgpu KV lives on the model), so a throwaway suffices.
-        let mut dummy = InferenceState::for_prefill(&self.config, 1);
+        let mut dummy = InferenceState::for_prefill(&self.config, 1).unwrap();
         let mut out = Vec::with_capacity(tokens.len() * hs);
         for (pos, &token) in tokens.iter().enumerate() {
             let token_id = token as usize;

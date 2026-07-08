@@ -16,12 +16,12 @@ fn embedding_roundtrip() {
     let cfg = model.config().clone();
 
     // Path A: normal forward for 2 tokens
-    let mut state_a = cera::kv_cache::InferenceState::from_config(&cfg);
+    let mut state_a = cera::kv_cache::InferenceState::from_config(&cfg).unwrap();
     let logits_a_t0 = model.forward(&[1], 0, &mut state_a);
     let logits_a_t1 = model.forward(&[5242], 1, &mut state_a); // "Paris"
 
     // Path B: forward_embedding for token 0, then forward_from_embedding for token 1
-    let mut state_b = cera::kv_cache::InferenceState::from_config(&cfg);
+    let mut state_b = cera::kv_cache::InferenceState::from_config(&cfg).unwrap();
     let emb = model.forward_embedding(&[1], 0, &mut state_b);
     // feed embedding back → should produce same logits as normal forward
     let logits_b = model.forward_from_embedding(&emb, 1, &mut state_b);

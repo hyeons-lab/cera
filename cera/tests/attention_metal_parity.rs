@@ -65,7 +65,8 @@ fn generate_greedy(model_path: &Path, prompt: &str, max_tokens: usize) -> Vec<u3
             seed: None,
             ..Default::default()
         },
-    );
+    )
+    .unwrap();
     session.append_tokens(&prompt_toks).unwrap();
 
     let opts = GenerateOpts {
