@@ -337,12 +337,14 @@ impl InferenceState {
                 match bt {
                     BlockType::Attention => {
                         let n_kv_heads = config.kv_heads_per_layer[layer_idx];
-                        let kv_dim = n_kv_heads * head_dim;
-                        // Guard the multiply (a usize wrap would silently
+                        // Guard both multiplies (a usize wrap would silently
                         // under-reserve). A config bug (e.g. wildly large
-                        // max_seq_len from a malformed GGUF) surfaces as a
-                        // recoverable OutOfMemory — same as a genuinely
-                        // too-large KV — rather than aborting the process.
+                        // max_seq_len, n_kv_heads, or head_dim from a malformed
+                        // GGUF) surfaces as a recoverable OutOfMemory — same as
+                        // a genuinely too-large KV — rather than aborting the
+                        // process. kv_dim counts f32 slots per token, so its
+                        // overflow guard uses the same f32-sized helper.
+                        let kv_dim = checked_elems::<f32>(n_kv_heads, head_dim)?;
                         let kv_capacity = checked_elems::<f32>(capacity, kv_dim)?;
                         let compressed_keys = if compress_keys && n_kv_heads > 0 {
                             Some(CompressedKeyCache::try_new(
