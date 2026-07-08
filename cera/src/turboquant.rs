@@ -9,6 +9,9 @@
 use half::f16;
 use std::f32::consts::PI;
 
+use crate::CeraError;
+use crate::kv_cache::try_alloc;
+
 // ── Randomized Hadamard Transform ──────────────────────────────────────────
 
 /// Pre-computed random sign flips for RHT rotation and QJL projection.
@@ -371,32 +374,45 @@ pub struct CompressedKeyCache {
 }
 
 impl CompressedKeyCache {
-    /// Create a new empty compressed key cache.
+    /// Create a new empty compressed key cache. Panics on allocation failure —
+    /// convenience for tests with small fixed capacities; production code that
+    /// must tolerate OOM uses [`Self::try_new`].
     pub fn new(n_kv_heads: usize, head_dim: usize, capacity: usize) -> Self {
+        Self::try_new(n_kv_heads, head_dim, capacity).expect("compressed key cache allocation")
+    }
+
+    /// Fallible constructor — reserves the per-head buffers via `try_reserve`,
+    /// returning [`CeraError::OutOfMemory`] instead of aborting when a large
+    /// (high-`capacity`) compressed cache can't be allocated. The per-head outer
+    /// `Vec`s (length `n_kv_heads`) are small and allocated infallibly; only the
+    /// `capacity`-scaled inner buffers go through the fallible path.
+    pub fn try_new(n_kv_heads: usize, head_dim: usize, capacity: usize) -> Result<Self, CeraError> {
         let polar_bytes = head_dim / 4;
         let jl_bytes = head_dim / 8;
-        Self {
-            polar_data: (0..n_kv_heads)
-                .map(|_| Vec::with_capacity(capacity * polar_bytes))
-                .collect(),
-            jl_data: (0..n_kv_heads)
-                .map(|_| Vec::with_capacity(capacity * jl_bytes))
-                .collect(),
-            norms: (0..n_kv_heads)
-                .map(|_| Vec::with_capacity(capacity))
-                .collect(),
-            residual_norms: (0..n_kv_heads)
-                .map(|_| Vec::with_capacity(capacity))
-                .collect(),
-            norms_f32: (0..n_kv_heads)
-                .map(|_| Vec::with_capacity(capacity))
-                .collect(),
-            residual_norms_f32: (0..n_kv_heads)
-                .map(|_| Vec::with_capacity(capacity))
-                .collect(),
+        let mut polar_data = Vec::with_capacity(n_kv_heads);
+        let mut jl_data = Vec::with_capacity(n_kv_heads);
+        let mut norms = Vec::with_capacity(n_kv_heads);
+        let mut residual_norms = Vec::with_capacity(n_kv_heads);
+        let mut norms_f32 = Vec::with_capacity(n_kv_heads);
+        let mut residual_norms_f32 = Vec::with_capacity(n_kv_heads);
+        for _ in 0..n_kv_heads {
+            polar_data.push(try_alloc::<u8>(capacity * polar_bytes)?);
+            jl_data.push(try_alloc::<u8>(capacity * jl_bytes)?);
+            norms.push(try_alloc::<u16>(capacity)?);
+            residual_norms.push(try_alloc::<u16>(capacity)?);
+            norms_f32.push(try_alloc::<f32>(capacity)?);
+            residual_norms_f32.push(try_alloc::<f32>(capacity)?);
+        }
+        Ok(Self {
+            polar_data,
+            jl_data,
+            norms,
+            residual_norms,
+            norms_f32,
+            residual_norms_f32,
             head_dim,
             n_kv_heads,
-        }
+        })
     }
 
     /// Number of cached key vectors per head.
@@ -458,22 +474,30 @@ pub struct CompressedValueCache {
 }
 
 impl CompressedValueCache {
-    /// Create a new empty compressed value cache.
+    /// Create a new empty compressed value cache. Panics on allocation failure;
+    /// production code that must tolerate OOM uses [`Self::try_new`].
     pub fn new(n_kv_heads: usize, head_dim: usize, capacity: usize) -> Self {
+        Self::try_new(n_kv_heads, head_dim, capacity).expect("compressed value cache allocation")
+    }
+
+    /// Fallible constructor — see [`CompressedKeyCache::try_new`].
+    pub fn try_new(n_kv_heads: usize, head_dim: usize, capacity: usize) -> Result<Self, CeraError> {
         let polar_bytes = head_dim / 4;
-        Self {
-            polar_data: (0..n_kv_heads)
-                .map(|_| Vec::with_capacity(capacity * polar_bytes))
-                .collect(),
-            norms: (0..n_kv_heads)
-                .map(|_| Vec::with_capacity(capacity))
-                .collect(),
-            norms_f32: (0..n_kv_heads)
-                .map(|_| Vec::with_capacity(capacity))
-                .collect(),
+        let mut polar_data = Vec::with_capacity(n_kv_heads);
+        let mut norms = Vec::with_capacity(n_kv_heads);
+        let mut norms_f32 = Vec::with_capacity(n_kv_heads);
+        for _ in 0..n_kv_heads {
+            polar_data.push(try_alloc::<u8>(capacity * polar_bytes)?);
+            norms.push(try_alloc::<u16>(capacity)?);
+            norms_f32.push(try_alloc::<f32>(capacity)?);
+        }
+        Ok(Self {
+            polar_data,
+            norms,
+            norms_f32,
             head_dim,
             n_kv_heads,
-        }
+        })
     }
 
     /// Number of cached value vectors per head.

@@ -7,26 +7,33 @@ use std::path::PathBuf;
 use crate::CeraError;
 use crate::model::{BlockType, ModelConfig};
 use crate::time::Instant;
-
-/// Reserve capacity for `len` `f32`s, returning [`CeraError::OutOfMemory`]
-/// instead of aborting the process when the allocation can't be satisfied.
-/// Used for the per-layer KV caches, whose size (`capacity * kv_dim`) is the
-/// dominant, config-driven allocation — the one that OOMs when a model's
-/// context is too large for the device. Returns an empty `Vec` with the
-/// capacity reserved (filled during inference), matching `Vec::with_capacity`.
-fn try_alloc_f32(len: usize) -> Result<Vec<f32>, CeraError> {
-    let mut v: Vec<f32> = Vec::new();
-    v.try_reserve_exact(len)
-        .map_err(|_| CeraError::OutOfMemory {
-            requested_bytes: (len as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
-        })?;
-    Ok(v)
-}
-
 use crate::turboquant::{
     CompressedKeyCache, CompressedValueCache, EncodeScratch, QueryRotationScratch, RotationState,
     TurboQuantConfig,
 };
+
+/// Reserve capacity for `len` values of `T`, returning [`CeraError::OutOfMemory`]
+/// instead of aborting the process when the allocation can't be satisfied. Used
+/// for the config-driven KV-cache buffers — the uncompressed per-layer f32
+/// caches (`capacity * kv_dim`) and the per-head compressed buffers under
+/// TurboQuant — the dominant allocations that OOM when a model's context is too
+/// large for the device. Returns an empty `Vec` with the capacity reserved
+/// (filled during inference), matching `Vec::with_capacity`.
+///
+/// `TryReserveError::CapacityOverflow` (a request larger than the allocator can
+/// ever satisfy) is intentionally folded into `OutOfMemory` alongside a true
+/// allocation failure: both mean "this KV won't fit," the caller's recovery is
+/// identical (skip the model), and `requested_bytes` reports the attempted size.
+/// Element-count overflow is already caught by the `checked_mul` at the KV call
+/// site, so only an absurd byte size can reach here.
+pub(crate) fn try_alloc<T>(len: usize) -> Result<Vec<T>, CeraError> {
+    let mut v: Vec<T> = Vec::new();
+    v.try_reserve_exact(len)
+        .map_err(|_| CeraError::OutOfMemory {
+            requested_bytes: (len as u64).saturating_mul(std::mem::size_of::<T>() as u64),
+        })?;
+    Ok(v)
+}
 
 /// KV cache compression mode. Passed to `InferenceState::from_config_with_compression`
 /// (or via `GenerateConfig::kv_compression`) — that single call sets up everything
@@ -319,20 +326,20 @@ impl InferenceState {
                             .checked_mul(kv_dim)
                             .expect("KV cache capacity overflow: capacity * kv_dim");
                         let compressed_keys = if compress_keys && n_kv_heads > 0 {
-                            Some(CompressedKeyCache::new(
+                            Some(CompressedKeyCache::try_new(
                                 n_kv_heads,
                                 head_dim,
                                 initial_capacity,
-                            ))
+                            )?)
                         } else {
                             None
                         };
                         let compressed_values = if compress_values && n_kv_heads > 0 {
-                            Some(CompressedValueCache::new(
+                            Some(CompressedValueCache::try_new(
                                 n_kv_heads,
                                 head_dim,
                                 initial_capacity,
-                            ))
+                            )?)
                         } else {
                             None
                         };
@@ -340,19 +347,19 @@ impl InferenceState {
                         // `max_seq_len * kv_dim` floats so writes never trigger
                         // Vec doubling/reallocation. This is the dominant,
                         // config-driven allocation, so it's done fallibly
-                        // (`try_alloc_f32`) — an over-large context returns
+                        // (`try_alloc`) — an over-large context returns
                         // `OutOfMemory` instead of aborting the process. When
                         // TurboQuant compression is active for that side, the
                         // f32 vec stays empty and the compressed cache stores it.
                         let key_cache = if compress_keys && n_kv_heads > 0 {
                             Vec::new()
                         } else {
-                            try_alloc_f32(kv_capacity)?
+                            try_alloc::<f32>(kv_capacity)?
                         };
                         let value_cache = if compress_values && n_kv_heads > 0 {
                             Vec::new()
                         } else {
-                            try_alloc_f32(kv_capacity)?
+                            try_alloc::<f32>(kv_capacity)?
                         };
                         Ok(LayerState::Attention {
                             key_cache,
