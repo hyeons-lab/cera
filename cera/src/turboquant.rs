@@ -10,7 +10,7 @@ use half::f16;
 use std::f32::consts::PI;
 
 use crate::CeraError;
-use crate::kv_cache::{checked_elems, try_alloc};
+use crate::kv_cache::{checked_elems, try_alloc, zeroed};
 
 // ── Randomized Hadamard Transform ──────────────────────────────────────────
 
@@ -25,33 +25,43 @@ pub struct RotationState {
 }
 
 impl RotationState {
-    /// Create rotation state from a deterministic seed.
-    /// Use `seed XOR layer_idx` for per-layer independence.
+    /// Create rotation state from a deterministic seed. Panics on allocation
+    /// failure — test convenience; production code that must tolerate OOM uses
+    /// [`Self::try_from_seed`].
     pub fn from_seed(seed: u64, head_dim: usize) -> Self {
+        Self::try_from_seed(seed, head_dim).expect("rotation state allocation")
+    }
+
+    /// Fallible constructor — reserves the sign vectors via `try_reserve`
+    /// (→ [`CeraError::OutOfMemory`]) instead of aborting. Use `seed XOR
+    /// layer_idx` for per-layer independence.
+    pub fn try_from_seed(seed: u64, head_dim: usize) -> Result<Self, CeraError> {
         assert!(
             head_dim.is_power_of_two(),
             "head_dim must be power of 2 for WHT"
         );
-        let polar_signs = generate_signs(seed, head_dim);
+        let polar_signs = generate_signs(seed, head_dim)?;
         // Use a different seed for JL to ensure independence
         let jl_signs = generate_signs(
             seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1),
             head_dim,
-        );
-        Self {
+        )?;
+        Ok(Self {
             polar_signs,
             jl_signs,
             head_dim,
-        }
+        })
     }
 }
 
-/// Generate `n` random ±1.0 sign flips from a seed using xoshiro256**.
-fn generate_signs(seed: u64, n: usize) -> Vec<f32> {
+/// Generate `n` random ±1.0 sign flips from a seed using xoshiro256**. Reserves
+/// fallibly (→ [`CeraError::OutOfMemory`]); `extend` fills within the
+/// reservation, so no further allocation occurs.
+fn generate_signs(seed: u64, n: usize) -> Result<Vec<f32>, CeraError> {
     let mut rng = Xoshiro256SS::new(seed);
-    (0..n)
-        .map(|_| if rng.next_bit() { 1.0 } else { -1.0 })
-        .collect()
+    let mut signs = try_alloc::<f32>(n)?;
+    signs.extend((0..n).map(|_| if rng.next_bit() { 1.0 } else { -1.0 }));
+    Ok(signs)
 }
 
 /// Minimal xoshiro256** PRNG — just enough for sign bit generation.
@@ -373,6 +383,19 @@ pub struct CompressedKeyCache {
     pub n_kv_heads: usize,
 }
 
+/// Allocate `n` per-head buffers, each an empty `Vec<T>` with `inner_len`
+/// capacity reserved fallibly. Both the outer `Vec` and every inner buffer go
+/// through [`try_alloc`] (→ [`CeraError::OutOfMemory`]), so nothing here aborts
+/// on OOM. Inner buffers are left empty (filled at append time), matching the
+/// f32 KV caches. Shared by both compressed-cache constructors.
+fn per_head_bufs<T>(n: usize, inner_len: usize) -> Result<Vec<Vec<T>>, CeraError> {
+    let mut outer = try_alloc::<Vec<T>>(n)?;
+    for _ in 0..n {
+        outer.push(try_alloc::<T>(inner_len)?);
+    }
+    Ok(outer)
+}
+
 impl CompressedKeyCache {
     /// Create a new empty compressed key cache. Panics on allocation failure —
     /// convenience for tests with small fixed capacities; production code that
@@ -390,27 +413,13 @@ impl CompressedKeyCache {
     pub fn try_new(n_kv_heads: usize, head_dim: usize, capacity: usize) -> Result<Self, CeraError> {
         let polar_len = checked_elems::<u8>(capacity, head_dim / 4)?;
         let jl_len = checked_elems::<u8>(capacity, head_dim / 8)?;
-        let mut polar_data = try_alloc::<Vec<u8>>(n_kv_heads)?;
-        let mut jl_data = try_alloc::<Vec<u8>>(n_kv_heads)?;
-        let mut norms = try_alloc::<Vec<u16>>(n_kv_heads)?;
-        let mut residual_norms = try_alloc::<Vec<u16>>(n_kv_heads)?;
-        let mut norms_f32 = try_alloc::<Vec<f32>>(n_kv_heads)?;
-        let mut residual_norms_f32 = try_alloc::<Vec<f32>>(n_kv_heads)?;
-        for _ in 0..n_kv_heads {
-            polar_data.push(try_alloc::<u8>(polar_len)?);
-            jl_data.push(try_alloc::<u8>(jl_len)?);
-            norms.push(try_alloc::<u16>(capacity)?);
-            residual_norms.push(try_alloc::<u16>(capacity)?);
-            norms_f32.push(try_alloc::<f32>(capacity)?);
-            residual_norms_f32.push(try_alloc::<f32>(capacity)?);
-        }
         Ok(Self {
-            polar_data,
-            jl_data,
-            norms,
-            residual_norms,
-            norms_f32,
-            residual_norms_f32,
+            polar_data: per_head_bufs::<u8>(n_kv_heads, polar_len)?,
+            jl_data: per_head_bufs::<u8>(n_kv_heads, jl_len)?,
+            norms: per_head_bufs::<u16>(n_kv_heads, capacity)?,
+            residual_norms: per_head_bufs::<u16>(n_kv_heads, capacity)?,
+            norms_f32: per_head_bufs::<f32>(n_kv_heads, capacity)?,
+            residual_norms_f32: per_head_bufs::<f32>(n_kv_heads, capacity)?,
             head_dim,
             n_kv_heads,
         })
@@ -484,18 +493,10 @@ impl CompressedValueCache {
     /// Fallible constructor — see [`CompressedKeyCache::try_new`].
     pub fn try_new(n_kv_heads: usize, head_dim: usize, capacity: usize) -> Result<Self, CeraError> {
         let polar_len = checked_elems::<u8>(capacity, head_dim / 4)?;
-        let mut polar_data = try_alloc::<Vec<u8>>(n_kv_heads)?;
-        let mut norms = try_alloc::<Vec<u16>>(n_kv_heads)?;
-        let mut norms_f32 = try_alloc::<Vec<f32>>(n_kv_heads)?;
-        for _ in 0..n_kv_heads {
-            polar_data.push(try_alloc::<u8>(polar_len)?);
-            norms.push(try_alloc::<u16>(capacity)?);
-            norms_f32.push(try_alloc::<f32>(capacity)?);
-        }
         Ok(Self {
-            polar_data,
-            norms,
-            norms_f32,
+            polar_data: per_head_bufs::<u8>(n_kv_heads, polar_len)?,
+            norms: per_head_bufs::<u16>(n_kv_heads, capacity)?,
+            norms_f32: per_head_bufs::<f32>(n_kv_heads, capacity)?,
             head_dim,
             n_kv_heads,
         })
@@ -532,12 +533,22 @@ pub struct EncodeScratch {
 }
 
 impl EncodeScratch {
+    /// Panics on allocation failure — test convenience; production code that
+    /// must tolerate OOM uses [`Self::try_new`].
     pub fn new(head_dim: usize) -> Self {
-        Self {
-            rot: vec![0.0; head_dim],
-            polar_packed: vec![0u8; head_dim / 4],
-            jl_packed: vec![0u8; head_dim / 8],
-        }
+        Self::try_new(head_dim).expect("encode scratch allocation")
+    }
+
+    /// Fallible constructor — reserves the scratch buffers via `try_reserve`,
+    /// returning [`CeraError::OutOfMemory`] instead of aborting. Sizes are tiny
+    /// (`head_dim`-scaled) but kept fallible so the whole compressed-KV
+    /// construction path is uniformly recoverable.
+    pub fn try_new(head_dim: usize) -> Result<Self, CeraError> {
+        Ok(Self {
+            rot: zeroed(head_dim, 0.0f32)?,
+            polar_packed: zeroed(head_dim / 4, 0u8)?,
+            jl_packed: zeroed(head_dim / 8, 0u8)?,
+        })
     }
 }
 
@@ -775,12 +786,22 @@ pub struct QueryRotationScratch {
 }
 
 impl QueryRotationScratch {
+    /// Panics on allocation failure — test convenience; production code that
+    /// must tolerate OOM uses [`Self::try_new`].
     pub fn new(n_heads: usize, head_dim: usize) -> Self {
-        Self {
-            q_rot: vec![0.0; n_heads * head_dim],
-            q_jl: vec![0.0; n_heads * head_dim],
-            q_jl_total_sums: vec![0.0; n_heads],
-        }
+        Self::try_new(n_heads, head_dim).expect("query rotation scratch allocation")
+    }
+
+    /// Fallible constructor — reserves the scratch buffers via `try_reserve`
+    /// (→ [`CeraError::OutOfMemory`]) and guards the `n_heads * head_dim`
+    /// multiply against `usize` overflow, matching the KV path.
+    pub fn try_new(n_heads: usize, head_dim: usize) -> Result<Self, CeraError> {
+        let q_dim = checked_elems::<f32>(n_heads, head_dim)?;
+        Ok(Self {
+            q_rot: zeroed(q_dim, 0.0f32)?,
+            q_jl: zeroed(q_dim, 0.0f32)?,
+            q_jl_total_sums: zeroed(n_heads, 0.0f32)?,
+        })
     }
 }
 

@@ -55,15 +55,20 @@ pub(crate) fn checked_elems<T>(count: usize, per: usize) -> Result<usize, CeraEr
     })
 }
 
-/// A zero-filled `f32` buffer of length `len`, reserved fallibly. Reserves via
+/// A `fill`-initialized buffer of length `len`, reserved fallibly. Reserves via
 /// [`try_alloc`] (→ [`CeraError::OutOfMemory`] instead of aborting) and then
-/// `resize`s to zero-fill within that reservation, so no further allocation
-/// occurs. Used for the fixed-size scratch/conv buffers so every allocation in
-/// the constructor is recoverable, not just the context-scaled KV caches.
-fn zeroed_f32(len: usize) -> Result<Vec<f32>, CeraError> {
-    let mut v = try_alloc::<f32>(len)?;
-    v.resize(len, 0.0);
+/// `resize`s to fill within that reservation, so no further allocation occurs.
+/// Used for the fixed-size scratch/conv buffers so every allocation in the
+/// constructor is recoverable, not just the context-scaled KV caches.
+pub(crate) fn zeroed<T: Clone>(len: usize, fill: T) -> Result<Vec<T>, CeraError> {
+    let mut v = try_alloc::<T>(len)?;
+    v.resize(len, fill);
     Ok(v)
+}
+
+/// [`zeroed`] specialized to zero-filled `f32` scratch buffers.
+fn zeroed_f32(len: usize) -> Result<Vec<f32>, CeraError> {
+    zeroed(len, 0.0)
 }
 
 /// KV cache compression mode. Passed to `InferenceState::from_config_with_compression`
@@ -332,26 +337,28 @@ impl InferenceState {
                 KvCompression::TurboQuant { seed, .. } => *seed,
                 KvCompression::None => 0,
             };
-            let rotations: Vec<Option<RotationState>> = config
-                .block_types
-                .iter()
-                .enumerate()
-                .map(|(layer_idx, bt)| match bt {
-                    BlockType::Attention => {
-                        Some(RotationState::from_seed(seed ^ layer_idx as u64, head_dim))
-                    }
+            // Reserve the outer Vec fallibly too (layer-count-scaled), so no
+            // allocation on this path can abort — each RotationState is already
+            // built via the fallible try_from_seed.
+            let mut rotations = try_alloc::<Option<RotationState>>(config.block_types.len())?;
+            for (layer_idx, bt) in config.block_types.iter().enumerate() {
+                rotations.push(match bt {
+                    BlockType::Attention => Some(RotationState::try_from_seed(
+                        seed ^ layer_idx as u64,
+                        head_dim,
+                    )?),
                     BlockType::GatedConv => None,
-                })
-                .collect();
+                });
+            }
             (rotations, Some(TurboQuantConfig::for_head_dim(head_dim)))
         } else {
             (Vec::new(), None)
         };
-        let layers = config
-            .block_types
-            .iter()
-            .enumerate()
-            .map(|(layer_idx, bt)| -> Result<LayerState, CeraError> {
+        // Reserve the outer Vec<LayerState> fallibly (layer-count-scaled), then
+        // push each layer, so every allocation on this path is recoverable.
+        let mut layers = try_alloc::<LayerState>(config.block_types.len())?;
+        for layer in config.block_types.iter().enumerate().map(
+            |(layer_idx, bt)| -> Result<LayerState, CeraError> {
                 match bt {
                     BlockType::Attention => {
                         let n_kv_heads = config.kv_heads_per_layer[layer_idx];
@@ -383,13 +390,15 @@ impl InferenceState {
                             None
                         };
                         // Pre-allocate the f32 KV cache to exactly
-                        // `max_seq_len * kv_dim` floats so writes never trigger
-                        // Vec doubling/reallocation. This is the dominant,
-                        // config-driven allocation, so it's done fallibly
+                        // `capacity * kv_dim` floats (capacity = the session's
+                        // requested context, ≤ model max_seq_len) so writes never
+                        // trigger Vec doubling/reallocation. Like every other
+                        // allocation in this constructor it's fallible
                         // (`try_alloc`) — an over-large context returns
-                        // `OutOfMemory` instead of aborting the process. When
-                        // TurboQuant compression is active for that side, the
-                        // f32 vec stays empty and the compressed cache stores it.
+                        // `OutOfMemory` instead of aborting the process — but this
+                        // is the dominant, context-scaled one. When TurboQuant
+                        // compression is active for that side, the f32 vec stays
+                        // empty and the compressed cache stores it.
                         let key_cache = if compress_keys && n_kv_heads > 0 {
                             Vec::new()
                         } else {
@@ -411,8 +420,10 @@ impl InferenceState {
                         buffer: zeroed_f32(checked_elems::<f32>(d_conv, config.hidden_size)?)?,
                     }),
                 }
-            })
-            .collect::<Result<Vec<_>, CeraError>>()?;
+            },
+        ) {
+            layers.push(layer?);
+        }
 
         Ok(Self {
             layers,
@@ -442,12 +453,12 @@ impl InferenceState {
             // encode; QueryRotationScratch is shared between key score
             // computation and value weighted-sum reconstruction.
             tq_encode_scratch: if tq_enabled {
-                Some(EncodeScratch::new(head_dim))
+                Some(EncodeScratch::try_new(head_dim)?)
             } else {
                 None
             },
             tq_query_scratch: if tq_enabled {
-                Some(QueryRotationScratch::new(config.n_heads, head_dim))
+                Some(QueryRotationScratch::try_new(config.n_heads, head_dim)?)
             } else {
                 None
             },
