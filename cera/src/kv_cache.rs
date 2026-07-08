@@ -277,7 +277,7 @@ impl InferenceState {
     /// KV-cache capacity to `capacity` cells instead of `config.max_seq_len`.
     /// Backs [`Self::for_prefill`]. `capacity` should be pre-clamped to
     /// `[1, max_seq_len]`; appending beyond it just triggers normal Vec growth.
-    fn from_config_capped(
+    pub(crate) fn from_config_capped(
         config: &ModelConfig,
         compression: &KvCompression,
         capacity: usize,

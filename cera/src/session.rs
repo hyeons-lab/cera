@@ -449,8 +449,13 @@ impl Session {
             );
         }
 
+        // Cap the KV allocation to the session's requested context, not the
+        // model's full `max_seq_len`. The session enforces `ContextOverflow` at
+        // `max_seq_len`, so the cache never needs to grow past it — allocating
+        // the full model context would waste (and risk OOMing on) memory a
+        // small-context session will never use.
         let state =
-            InferenceState::from_config_with_compression(model_cfg, &config.kv_compression)?;
+            InferenceState::from_config_capped(model_cfg, &config.kv_compression, max_seq_len)?;
 
         let sampler_cfg = SamplerConfig {
             seed: config.seed,
@@ -628,8 +633,13 @@ impl Session {
     /// on `CeraEngine`, not `Session`).
     pub fn reset(&mut self) -> Result<(), CeraError> {
         let model_cfg = self.model.config();
-        self.state =
-            InferenceState::from_config_with_compression(model_cfg, &self.config.kv_compression)?;
+        // Match `Session::new`: cap KV to the session's `max_seq_len`, not the
+        // model's full context, so reset doesn't re-inflate to the full cache.
+        self.state = InferenceState::from_config_capped(
+            model_cfg,
+            &self.config.kv_compression,
+            self.max_seq_len,
+        )?;
         // Re-apply the attached adapter to the rebuilt state (preserved across reset).
         self.state.lora = self.lora.clone();
         self.current_pos = 0;
