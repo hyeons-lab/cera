@@ -331,13 +331,12 @@ impl InferenceState {
                     BlockType::Attention => {
                         let n_kv_heads = config.kv_heads_per_layer[layer_idx];
                         let kv_dim = n_kv_heads * head_dim;
-                        // Use checked_mul so a config bug (e.g. wildly large
+                        // Guard the multiply (a usize wrap would silently
+                        // under-reserve). A config bug (e.g. wildly large
                         // max_seq_len from a malformed GGUF) surfaces as a
-                        // clean panic instead of a wrapped capacity that
-                        // silently reintroduces reallocs.
-                        let kv_capacity = capacity
-                            .checked_mul(kv_dim)
-                            .expect("KV cache capacity overflow: capacity * kv_dim");
+                        // recoverable OutOfMemory — same as a genuinely
+                        // too-large KV — rather than aborting the process.
+                        let kv_capacity = checked_elems(capacity, kv_dim)?;
                         let compressed_keys = if compress_keys && n_kv_heads > 0 {
                             Some(CompressedKeyCache::try_new(
                                 n_kv_heads,
