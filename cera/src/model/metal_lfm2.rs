@@ -2903,9 +2903,13 @@ impl MetalLfm2Model {
         // hd=64/128 specialize head_dim (constexpr inner-loop bounds + MMA
         // strides ⇒ full unroll); any other head_dim falls back to the runtime
         // kernel. hd=64 additionally supports larger query blocks (QPT 16/32,
-        // honored via `prefill_qpt`) that amortize the O(n²) K/V device reads
-        // over more queries. QPT is forced to 8 for hd≠64 — hd=128's QPT=16
-        // needs 32.2 KB shmem, over M1's 32 KB threadgroup-memory cap.
+        // honored via the device-clamped `prefill_qpt`) that amortize the O(n²)
+        // K/V device reads over more queries. QPT is forced to 8 for hd≠64 —
+        // hd=128's QPT=16 needs 32.2 KB shmem, over M1's 32 KB cap. (hd=128 at
+        // the forced QPT=8 already needs 24.1 KB, so hd=128 prefill requires
+        // Apple GPU family 4+ regardless — unchanged, pre-existing; only the
+        // hd=64 block size is device-clamped, since 8/16/32 straddle the 16 KB
+        // family-≤3 limit.)
         let qpt: u32 = if head_dim == 64 { self.prefill_qpt } else { 8 };
         let pipeline = match (head_dim, qpt) {
             (64, 16) => &self.pipelines.attention_prefill_hd64_q16,
