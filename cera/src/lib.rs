@@ -9,6 +9,19 @@
 /// re-reading the manifest themselves.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Short git SHA of this build, embedded by `build.rs`. Best-effort: `"unknown"`
+/// when git was unavailable at build time (a packaged source build). Can be
+/// pinned via the `CERA_GIT_SHA` build-env override.
+pub const GIT_SHA: &str = env!("CERA_GIT_SHA");
+
+/// Build provenance for telemetry — `"<version>+<git-sha>"`, e.g.
+/// `"0.2.5+1a2b3c4d5e6f"`. This is the analog of the llama.cpp build commit that
+/// a benchmark harness records alongside results to identify exactly which
+/// engine build produced them.
+pub fn build_info() -> String {
+    format!("{VERSION}+{GIT_SHA}")
+}
+
 pub mod audio_engine;
 pub mod backend;
 #[cfg(feature = "remote")]
@@ -30,6 +43,7 @@ pub mod par;
 pub mod quant;
 pub mod sampler;
 pub mod session;
+pub mod sysmem;
 pub mod tensor;
 pub mod time;
 pub mod tokenizer;
@@ -44,3 +58,19 @@ pub use session::{
     CeraError, FinishReason, GenerateOpts, GenerateSummary, ModalityCapabilities, ModalitySink,
     Session, SessionConfig,
 };
+pub use sysmem::{available_memory_bytes, fits_in_available_memory};
+
+#[cfg(test)]
+mod build_info_tests {
+    use super::*;
+
+    #[test]
+    fn build_info_is_version_plus_sha() {
+        let info = build_info();
+        assert_eq!(info, format!("{VERSION}+{GIT_SHA}"));
+        // version prefix, single '+' separator, non-empty sha segment.
+        let (ver, sha) = info.split_once('+').expect("build_info has a '+'");
+        assert_eq!(ver, VERSION);
+        assert!(!sha.is_empty());
+    }
+}
