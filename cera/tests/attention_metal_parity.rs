@@ -211,3 +211,37 @@ fn test_classic_vs_splitk_attention_parity() {
     });
     assert_parity(&classic, &splitk, "splitk");
 }
+
+/// Iter 6: the larger prefill query-block variants (`CERA_ATTN_QPT=16|32`,
+/// `attention_prefill_hd64_q16|q32`) must produce identical greedy tokens to
+/// the QPT=8 baseline. QPT only changes how many queries a threadgroup owns
+/// (K/V-bandwidth amortization) — the math is unchanged, so any divergence is
+/// a generalization bug (a mis-offset q_tile loop, a softmax row skipped, an
+/// unused row not scrubbed). The prompt is long (~180 tokens) on purpose: it
+/// spans multiple C=64 K/V chunks *and* multiple QPT=32 query-blocks with
+/// partial tails, so the row-tile loops and the `q >= n_q` guards are all
+/// exercised. hd=64 (450M) is the only head_dim with QPT variants.
+#[test]
+#[ignore]
+fn test_prefill_qpt_parity() {
+    let Some(path) = find_model("LFM2.5-VL-450M-Q4_0") else {
+        return;
+    };
+    let long_prompt = "In computer science, a cache is a hardware or software \
+        component that stores data so that future requests for that data can be \
+        served faster. "
+        .repeat(12);
+    // Pin the baseline to QPT=8 explicitly (not None) so it stays the true
+    // reference even if the hd=64 default query-block changes.
+    let baseline = with_env("CERA_ATTN_QPT", Some("8"), || {
+        generate_greedy(&path, &long_prompt, N_TOKENS)
+    });
+    let q16 = with_env("CERA_ATTN_QPT", Some("16"), || {
+        generate_greedy(&path, &long_prompt, N_TOKENS)
+    });
+    let q32 = with_env("CERA_ATTN_QPT", Some("32"), || {
+        generate_greedy(&path, &long_prompt, N_TOKENS)
+    });
+    assert_parity(&baseline, &q16, "qpt16");
+    assert_parity(&baseline, &q32, "qpt32");
+}

@@ -255,6 +255,13 @@ struct MetalPipelines {
     /// `attention_prefill` pipeline above.
     attention_prefill_hd64: ComputePipelineState,
     attention_prefill_hd128: ComputePipelineState,
+    /// Iter 6: query-block (QPT) variants of the hd=64 prefill attention
+    /// kernel. Raising QPT (queries per threadgroup) amortizes the O(n²) K/V
+    /// device-memory reads over more queries. hd=128 can't grow past QPT=8
+    /// (QPT=16 → 32.2 KB shmem, over M1's 32 KB cap). Selected by
+    /// `prefill_qpt` (env `CERA_ATTN_QPT`) in `encode_attention_prefill_batch`.
+    attention_prefill_hd64_q16: ComputePipelineState,
+    attention_prefill_hd64_q32: ComputePipelineState,
     qk_norm_rope_batch: ComputePipelineState,
     conv1d_fused_batch: ComputePipelineState,
     kv_shift_k_to_scratch: ComputePipelineState,
@@ -434,6 +441,12 @@ pub struct MetalLfm2Model {
     /// `CERA_PROFILE=noattn` — skip attention dispatches across all forward
     /// paths (decode + prefill) so timing reflects non-attention work.
     skip_attn: bool,
+    /// `CERA_ATTN_QPT` — prefill attention query-block size (queries per
+    /// threadgroup). Default 32; `CERA_ATTN_QPT=8|16` overrides. Honored only
+    /// for head_dim=64 (hd=128 can't fit a larger block in 32 KB shmem — the
+    /// dispatch forces 8 there). Raising the block amortizes the O(n²) K/V
+    /// device reads over more queries (Iter 6); 32 is the measured sweet spot.
+    prefill_qpt: u32,
     /// Unique model identifier (GGUF file path). Used as part of the cache
     /// fingerprint so different models with the same architecture don't collide.
     model_id: String,
@@ -598,6 +611,10 @@ impl MetalLfm2Model {
                 .create_pipeline(shaders::ATTENTION_PREFILL, "attention_prefill_hd64")?,
             attention_prefill_hd128: ctx
                 .create_pipeline(shaders::ATTENTION_PREFILL, "attention_prefill_hd128")?,
+            attention_prefill_hd64_q16: ctx
+                .create_pipeline(shaders::ATTENTION_PREFILL, "attention_prefill_hd64_q16")?,
+            attention_prefill_hd64_q32: ctx
+                .create_pipeline(shaders::ATTENTION_PREFILL, "attention_prefill_hd64_q32")?,
             qk_norm_rope_batch: ctx
                 .create_pipeline(shaders::QK_NORM_ROPE_BATCH, "qk_norm_rope_batch")?,
             conv1d_fused_batch: ctx
@@ -986,6 +1003,17 @@ impl MetalLfm2Model {
             force_flash: std::env::var("CERA_FLASH").as_deref() == Ok("1"),
             attn_mode: std::env::var("CERA_ATTN").unwrap_or_default(),
             skip_attn: std::env::var("CERA_PROFILE").as_deref() == Ok("noattn"),
+            // QPT=32 is the hd=64 default: +11% prefill @ p4096 cold (larger
+            // under sustained load, where the 4×-lower K/V device traffic also
+            // throttles less), neutral at short prompts (≤256), correctness
+            // identical to QPT=8 (test_prefill_qpt_parity). `CERA_ATTN_QPT`
+            // overrides to 8 or 16 for A/B; 16 is a net loss (1 TG/SM without
+            // enough bandwidth payoff). No effect on hd≠64 (forced to 8).
+            prefill_qpt: match std::env::var("CERA_ATTN_QPT").as_deref() {
+                Ok("8") => 8,
+                Ok("16") => 16,
+                _ => 32,
+            },
             model_id: model_id.into_owned(),
             lora_lru: Mutex::new(Vec::new()),
             active_lora: Mutex::new(None),
@@ -2839,14 +2867,19 @@ impl MetalLfm2Model {
             q_stride,
             out_stride,
         ];
-        // Iter 5: dispatch the head_dim-specialized variant when one
-        // exists; fall back to the runtime kernel for any other head_dim
-        // (LLaMA-class models, future LFM2 sizes, etc.). The specialized
-        // kernels resolve the inner-loop bounds + simdgroup_load strides
-        // to constexpr, enabling full unroll of the QK^T and V-MMA loops.
-        let pipeline = match head_dim {
-            64 => &self.pipelines.attention_prefill_hd64,
-            128 => &self.pipelines.attention_prefill_hd128,
+        // Iter 5/6: dispatch the (head_dim, query-block)-specialized variant.
+        // hd=64/128 specialize head_dim (constexpr inner-loop bounds + MMA
+        // strides ⇒ full unroll); any other head_dim falls back to the runtime
+        // kernel. hd=64 additionally supports larger query blocks (QPT 16/32,
+        // honored via `prefill_qpt`) that amortize the O(n²) K/V device reads
+        // over more queries. QPT is forced to 8 for hd≠64 — hd=128's QPT=16
+        // needs 32.2 KB shmem, over M1's 32 KB threadgroup-memory cap.
+        let qpt: u32 = if head_dim == 64 { self.prefill_qpt } else { 8 };
+        let pipeline = match (head_dim, qpt) {
+            (64, 16) => &self.pipelines.attention_prefill_hd64_q16,
+            (64, 32) => &self.pipelines.attention_prefill_hd64_q32,
+            (64, _) => &self.pipelines.attention_prefill_hd64,
+            (128, _) => &self.pipelines.attention_prefill_hd128,
             _ => &self.pipelines.attention_prefill,
         };
         enc.set_compute_pipeline_state(pipeline);
@@ -2860,29 +2893,29 @@ impl MetalLfm2Model {
             params.as_ptr() as *const _,
         );
         // Dynamic threadgroup memory — must match attention_prefill.metal's
-        // layout exactly (Q_PER_TG=8, C=64).
+        // layout exactly (query block = QPT, C=64).
         //
-        // Iter 4 layout mixes precisions: q_tg and kv_tile are `half`
-        // (2 bytes/elem), everything else is `float` (4 bytes/elem).
-        //   q_tg    : half  [Q_PER_TG × hd]     = 16·hd  bytes
-        //   kv_tile : half  [C × hd]            = 128·hd bytes
-        //   scores  : float [Q_PER_TG × C]      = 2048   bytes
-        //   out_tg  : float [Q_PER_TG × hd]     = 32·hd  bytes
-        //   state   : float [Q_PER_TG × 2]      = 64     bytes
-        //   rescales: float [Q_PER_TG]          = 32     bytes
-        // Totals: ~13.1 KB at hd=64 (2 TGs/SM), ~24.1 KB at hd=128
-        // (1 TG/SM) on M1 Max — same occupancy tier as Iter 3.
+        // Mixed precision: q_tg and kv_tile are `half` (2 bytes/elem),
+        // everything else is `float` (4 bytes/elem).
+        //   q_tg    : half  [QPT × hd]
+        //   kv_tile : half  [C × hd]
+        //   scores  : float [QPT × C]
+        //   out_tg  : float [QPT × hd]
+        //   state   : float [QPT × 2]
+        //   rescales: float [QPT]
+        // Totals (hd=64): 13.1 KB @ QPT=8 (2 TGs/SM), 18.2 KB @ QPT=16,
+        // 28.4 KB @ QPT=32 (1 TG/SM); hd=128 @ QPT=8 = 24.1 KB. All ≤ 32 KB.
         let hd_val = head_dim as usize;
-        let half_bytes = 2 * 8 * hd_val        // q_tg (fp16)
+        let qpt_val = qpt as usize;
+        let half_bytes = 2 * qpt_val * hd_val   // q_tg (fp16)
             + 2 * 64 * hd_val; // kv_tile (fp16, C=64)
-        let float_bytes = 4 * 8 * 64            // scores
-            + 4 * 8 * hd_val                    // out_tg
-            + 4 * 8 * 2                         // state
-            + 4 * 8; // rescales
+        let float_bytes = 4 * qpt_val * 64      // scores
+            + 4 * qpt_val * hd_val              // out_tg
+            + 4 * qpt_val * 2                   // state
+            + 4 * qpt_val; // rescales
         let smem_bytes = half_bytes + float_bytes;
         enc.set_threadgroup_memory_length(0, smem_bytes as u64);
-        let q_per_tg = 8u32;
-        let n_tgs = n.div_ceil(q_per_tg) * n_heads;
+        let n_tgs = n.div_ceil(qpt) * n_heads;
         enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(256));
     }
 }
