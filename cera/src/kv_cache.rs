@@ -292,8 +292,15 @@ impl InferenceState {
         // models like Qwen3). `q_dim` (Q projection width = attention output
         // width) can exceed hidden_size.
         let head_dim = config.head_dim;
-        let q_dim = config.n_heads * head_dim;
-        let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * head_dim;
+        // Guard the config-derived scratch/conv buffer-length multiplies: a
+        // `usize` wrap from a malformed GGUF would size a too-small buffer and
+        // panic on a later index, so map overflow to a recoverable OutOfMemory
+        // (same policy as the KV path). All of these size f32 buffers.
+        let q_dim = checked_elems::<f32>(config.n_heads, head_dim)?;
+        let max_kv_dim = checked_elems::<f32>(
+            config.kv_heads_per_layer.iter().copied().max().unwrap_or(0),
+            head_dim,
+        )?;
 
         // Compressed (TurboQuant) caches start at the same per-layer cap as the
         // f32 path, so the compressed-side Vecs also avoid mid-decode reallocs.
@@ -390,7 +397,7 @@ impl InferenceState {
                         })
                     }
                     BlockType::GatedConv => Ok(LayerState::Conv {
-                        buffer: vec![0.0; d_conv * config.hidden_size],
+                        buffer: vec![0.0; checked_elems::<f32>(d_conv, config.hidden_size)?],
                     }),
                 }
             })
@@ -402,7 +409,7 @@ impl InferenceState {
             scratch: ScratchBuffers {
                 normed: vec![0.0; config.hidden_size],
                 ffn_input: vec![0.0; config.hidden_size],
-                conv_proj: vec![0.0; 3 * config.hidden_size],
+                conv_proj: vec![0.0; checked_elems::<f32>(3, config.hidden_size)?],
                 conv_scratch: vec![0.0; config.hidden_size],
                 q: vec![0.0; q_dim],
                 k: vec![0.0; max_kv_dim],
