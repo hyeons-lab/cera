@@ -43,6 +43,7 @@ pub mod par;
 pub mod quant;
 pub mod sampler;
 pub mod session;
+pub mod sysmem;
 pub mod tensor;
 pub mod time;
 pub mod tokenizer;
@@ -57,6 +58,7 @@ pub use session::{
     CeraError, FinishReason, GenerateOpts, GenerateSummary, ModalityCapabilities, ModalitySink,
     Session, SessionConfig,
 };
+pub use sysmem::{available_memory_bytes, fits_in_available_memory};
 
 #[cfg(test)]
 mod build_info_tests {
