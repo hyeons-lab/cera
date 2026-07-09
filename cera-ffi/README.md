@@ -471,7 +471,7 @@ val out = session.generateAsync(GenerateOpts.default())
 let engine = try await CeraEngine.fromBundleIdAsync(
     bundleId: "LFM2-1.2B-GGUF", quant: "Q4_0", config: config
 )
-let session = engine.newSession(config: SessionConfig.default())
+let session = try engine.newSession(config: SessionConfig.default())
 try session.appendText(text: "hello")
 let out = try await session.generateAsync(opts: GenerateOpts.default())
 ```
@@ -713,7 +713,7 @@ if engine.hasChatTemplate() {
         ],
         addGenerationPrompt: true
     )
-    let session = engine.newSession(config: SessionConfig.default())
+    let session = try engine.newSession(config: SessionConfig.default())
     try session.appendText(text: rendered)
     let out = try session.generate(opts: GenerateOpts.default())
     let replyText = engine.decodeTokens(tokens: out.tokens)
