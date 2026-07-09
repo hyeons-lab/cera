@@ -61,6 +61,7 @@ cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead 
 | `run` | Run inference on a prompt — text, optional grammar/JSON, plus audio input for LFM2-Audio bundles. Optional `--lora` adapter. |
 | `chat` | Interactive multi-turn REPL with `/help`, `/clear`, `/exit` slash commands. Optional `--lora` adapter. |
 | `embed` | Extract last-layer hidden-state embeddings for a prompt — mean-pooled by default, `--per-token` for the full matrix, `--json` for array output. |
+| `logits` | Dump the next-token logits over the full vocabulary for a prompt (single prefill) — `--top-k` for the K highest `(token_id, logit)` pairs, `--json` for array output. Handy for cross-backend parity checks. |
 | `inspect` | Inspect a GGUF file's metadata and resolved CPU backend tier. |
 | `cpu` | Print the host's CPU backend tier + detected SIMD features (no model needed). |
 | `tokenize` | Tokenize text and print token IDs (e.g. to compare against HuggingFace). |

@@ -70,7 +70,7 @@ fn main() -> Result<(), cera::CeraError> {
     // A `.gguf` file, a `.json` LeapBundles manifest, or a directory with one.
     let engine = CeraEngine::from_path("model.gguf", EngineConfig::default())?;
 
-    let mut session = engine.new_session(SessionConfig::default());
+    let mut session = engine.new_session(SessionConfig::default())?;
     session.append_text("Once upon a time")?;
 
     let mut sink = Printer { tokenizer: engine.tokenizer() };
