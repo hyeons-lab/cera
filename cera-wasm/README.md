@@ -201,7 +201,7 @@ surface:
 ```js
 const opts = new GenerateOpts();
 opts.setGrammar('root ::= "{" [a-z]+ "}"');  // throws on a malformed grammar
-opts.hasGrammar();     // → true
+opts.hasGrammar;       // → true (getter — property access, no parens)
 // opts.clearGrammar(); // back to unconstrained decoding
 ```
 

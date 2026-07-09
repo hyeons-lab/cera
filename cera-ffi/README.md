@@ -755,7 +755,7 @@ run against the same engine concurrently (each holds its own
 
 | Method | Signature | Notes |
 |---|---|---|
-| `engine.newSession(config)` | `(SessionConfig) -> Arc<Session>` | Per-session knobs (`seed`, `nKeep`, `ubatchSize`, `maxSeqLen`, `kvCompression`). |
+| `engine.newSession(config)` | `(SessionConfig) -> Result<Arc<Session>, FfiError>` | Per-session knobs (`seed`, `nKeep`, `ubatchSize`, `maxSeqLen`, `kvCompression`). Fallible: `OutOfMemory` when the KV cache can't be allocated. |
 | `session.appendText(text)` | `(String) -> Result<(), FfiError>` | Tokenize + push into KV. Convenience over `appendTokens(encodeText(text))`. |
 | `session.appendTokens(tokens)` | `(Vec<u32>) -> Result<(), FfiError>` | Push pre-tokenized IDs. Use when you need explicit BOS/EOS framing. |
 | `session.appendAudio(samples, sampleRate)` | `(Vec<f32>, u32) -> Result<(), FfiError>` | Encode PCM audio (mono `f32`, ~`[-1.0, 1.0]`, `sampleRate` must be 16000) through the bundle's audio mmproj (`AudioEncoderWeights`) and prefill it as soft tokens, for LFM2-Audio bundles. `CeraEngine.newSession` auto-attaches the audio encoder. `EmptyInput` on empty / too-short audio, `UnsupportedModality` on a non-audio model, `Backend` on sample-rate or encoder/LLM mismatch. |
@@ -872,8 +872,8 @@ do {
   honored by *every* image-append path (including chat-template flows),
   so a host can configure the image-encode budget once instead of per
   call. `appendImage`'s explicit argument overrides it for that call.
-- **`engine.transcribe(pcm, sampleRate)`** → `String` is a one-shot ASR
-  convenience on `CeraEngine` (not `Session`): it runs a full prefill +
+- **`engine.transcribe(pcm, sampleRate)`** → `Result<String, FfiError>` is a
+  one-shot ASR convenience on `CeraEngine` (not `Session`): it runs a full prefill +
   greedy decode over mono `f32` PCM using the model's trained
   `"Perform ASR."` chat mode and returns the transcript. Requires an
   audio-capable bundle (`UnsupportedModality` otherwise) and `sampleRate`
