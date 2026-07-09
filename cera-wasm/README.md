@@ -459,7 +459,7 @@ console.log(session.adapter);  // e.g. "<adapter> (BrowserWebGpu)"
 // cache persists across calls, so a second `generate()` continues the
 // same sequence rather than restarting.
 const text = await session.generate('The capital of France is', 32, (piece) => {
-    process.stdout.write(piece);
+    outputEl.textContent += piece;  // stream into the DOM (browser-safe)
 });
 ```
 
