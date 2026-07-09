@@ -102,7 +102,7 @@ func runOnce(_ args: RunArgsOwned) throws -> [UInt32] {
         seed: args.seed,
         ubatchSize: 512
     )
-    let session = engine.newSession(config: sessionCfg)
+    let session = try engine.newSession(config: sessionCfg)
 
     if !args.prompt.isEmpty {
         try session.appendText(text: args.prompt)

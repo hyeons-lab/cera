@@ -222,7 +222,7 @@ pub fn generate_audio(
     anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
 
     let model_config = model.config();
-    let mut state = InferenceState::from_config(model_config);
+    let mut state = InferenceState::from_config(model_config)?;
     let mut sampler = Sampler::new(config.sampler.clone());
     let mut decoder = AudioOutputDecoder::new(
         decoder_weights,

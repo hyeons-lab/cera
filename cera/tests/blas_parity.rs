@@ -79,12 +79,12 @@ fn run_parity(model_name: &str, tokens: &[u32]) -> Option<(f32, f32, usize, usiz
     let gguf_a = cera::gguf::GgufFile::open(&path).unwrap();
     let model_a = cera::model::load_model(gguf_a, None, 8192).unwrap();
     let cfg = model_a.config();
-    let mut state_a = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state_a = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let logits_prefill = model_a.forward_prefill(tokens, 0, &mut state_a);
 
     let gguf_b = cera::gguf::GgufFile::open(&path).unwrap();
     let model_b = cera::model::load_model(gguf_b, None, 8192).unwrap();
-    let mut state_b = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state_b = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let mut logits_seq = Vec::new();
     for (i, &tok) in tokens.iter().enumerate() {
         logits_seq = model_b.forward(&[tok], i, &mut state_b);
@@ -180,7 +180,7 @@ fn test_flash_vs_naive_prefill_parity() {
     let gguf_a = cera::gguf::GgufFile::open(&path).unwrap();
     let model_a = cera::model::load_model(gguf_a, None, 8192).unwrap();
     let cfg = model_a.config();
-    let mut state_a = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state_a = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let logits_naive = model_a.forward_prefill(&tokens_short, 0, &mut state_a);
 
     // Run forward_prefill on the LONG prompt (flash path), but only
@@ -192,7 +192,7 @@ fn test_flash_vs_naive_prefill_parity() {
     // confirm it produces the same result as the first (both use naive).
     let gguf_b = cera::gguf::GgufFile::open(&path).unwrap();
     let model_b = cera::model::load_model(gguf_b, None, 8192).unwrap();
-    let mut state_b = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state_b = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let logits_naive2 = model_b.forward_prefill(&tokens_short, 0, &mut state_b);
 
     // Naive vs naive should be bit-identical.
@@ -206,12 +206,12 @@ fn test_flash_vs_naive_prefill_parity() {
     // logits to a sequential forward() over the same 300 tokens.
     let gguf_c = cera::gguf::GgufFile::open(&path).unwrap();
     let model_c = cera::model::load_model(gguf_c, None, 8192).unwrap();
-    let mut state_c = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state_c = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let logits_flash = model_c.forward_prefill(&tokens_long, 0, &mut state_c);
 
     let gguf_d = cera::gguf::GgufFile::open(&path).unwrap();
     let model_d = cera::model::load_model(gguf_d, None, 8192).unwrap();
-    let mut state_d = cera::kv_cache::InferenceState::from_config(cfg);
+    let mut state_d = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let mut logits_seq = Vec::new();
     for (i, &tok) in tokens_long.iter().enumerate() {
         logits_seq = model_d.forward(&[tok], i, &mut state_d);

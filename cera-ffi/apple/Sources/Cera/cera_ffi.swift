@@ -937,7 +937,7 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
      * engine keeps the shared state live for every session it hands
      * out. Cheap — no model load, just config + state allocation.
      */
-    func newSession(config: SessionConfig)  -> Session
+    func newSession(config: SessionConfig) throws  -> Session
     
     /**
      * Look up a special token by name (e.g. `<|im_start|>`,
@@ -1283,8 +1283,8 @@ open func metadata() -> ModelMetadata  {
      * engine keeps the shared state live for every session it hands
      * out. Cheap — no model load, just config + state allocation.
      */
-open func newSession(config: SessionConfig) -> Session  {
-    return try!  FfiConverterTypeSession_lift(try! rustCall() {
+open func newSession(config: SessionConfig)throws  -> Session  {
+    return try  FfiConverterTypeSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_ceraengine_new_session(
             self.uniffiCloneHandle(),
         FfiConverterTypeSessionConfig_lower(config),$0
@@ -4045,6 +4045,14 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
      */
     case LoraParse(detail: String
     )
+    /**
+     * A large model/KV allocation could not be satisfied — the device is out of
+     * memory for this model at this context size. Returned instead of aborting
+     * the process, so a caller can fall back (smaller model or context) or
+     * surface a clean error. Mirrors `cera::CeraError::OutOfMemory`.
+     */
+    case OutOfMemory(requestedBytes: UInt64
+    )
 
     
 
@@ -4100,6 +4108,9 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             )
         case 11: return .LoraParse(
             detail: try FfiConverterString.read(from: &buf)
+            )
+        case 12: return .OutOfMemory(
+            requestedBytes: try FfiConverterUInt64.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -4164,6 +4175,11 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
         case let .LoraParse(detail):
             writeInt(&buf, Int32(11))
             FfiConverterString.write(detail, into: &buf)
+            
+        
+        case let .OutOfMemory(requestedBytes):
+            writeInt(&buf, Int32(12))
+            FfiConverterUInt64.write(requestedBytes, into: &buf)
             
         }
     }
@@ -4702,7 +4718,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ceraengine_metadata() != 46262) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 54382) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 13030) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790) {

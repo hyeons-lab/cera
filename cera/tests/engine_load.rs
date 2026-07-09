@@ -317,7 +317,7 @@ fn engine_hands_out_session_that_can_append() {
         return;
     };
     let engine = CeraEngine::from_path(&model_path, cpu_cfg()).expect("load");
-    let mut session = engine.new_session(Default::default());
+    let mut session = engine.new_session(Default::default()).unwrap();
     // Just one BOS-ish token to confirm the session shape works.
     let toks = engine.tokenizer().encode("hi");
     assert!(!toks.is_empty(), "tokenizer produced tokens");

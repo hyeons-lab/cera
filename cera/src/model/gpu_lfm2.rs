@@ -4381,7 +4381,12 @@ impl Model for GpuLfm2Model {
 
         // `forward_inner_compute` needs a `&mut InferenceState` for its `seq_len`
         // bookkeeping only (wgpu KV lives on the model), so a throwaway suffices.
-        let mut dummy = InferenceState::for_prefill(&self.config, 1);
+        // 1-token scratch state; the `Model::hidden_states` trait signature
+        // returns `Vec<f32>` (not `Result`), so this can't propagate — but the
+        // allocation is trivially small (~kv_dim floats/layer), so OOM here is
+        // effectively impossible. `expect` documents that.
+        let mut dummy = InferenceState::for_prefill(&self.config, 1)
+            .expect("hidden_states: 1-token scratch InferenceState allocation failed");
         let mut out = Vec::with_capacity(tokens.len() * hs);
         for (pos, &token) in tokens.iter().enumerate() {
             let token_id = token as usize;

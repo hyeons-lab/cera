@@ -99,7 +99,7 @@ fn blas_prefill_matches_aarch64_reference() {
         ubatch_size: 0,
         ..Default::default()
     };
-    let mut session = engine.new_session(cfg);
+    let mut session = engine.new_session(cfg).unwrap();
     session.append_text(PROMPT).expect("append prompt");
 
     struct Collect(Vec<u32>);

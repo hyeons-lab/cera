@@ -4,13 +4,72 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::CeraError;
 use crate::model::{BlockType, ModelConfig};
 use crate::time::Instant;
-
 use crate::turboquant::{
     CompressedKeyCache, CompressedValueCache, EncodeScratch, QueryRotationScratch, RotationState,
     TurboQuantConfig,
 };
+
+/// Reserve capacity for `len` values of `T`, returning [`CeraError::OutOfMemory`]
+/// instead of aborting the process when the allocation can't be satisfied. Used
+/// for the config-driven KV-cache buffers — the uncompressed per-layer f32
+/// caches (`capacity * kv_dim`) and the per-head compressed buffers under
+/// TurboQuant — the dominant allocations that OOM when a model's context is too
+/// large for the device. Returns an empty `Vec` with the capacity reserved
+/// (filled during inference), matching `Vec::with_capacity`.
+///
+/// `TryReserveError::CapacityOverflow` (a request larger than the allocator can
+/// ever satisfy) is intentionally folded into `OutOfMemory` alongside a true
+/// allocation failure: both mean "this KV won't fit," the caller's recovery is
+/// identical (skip the model), and `requested_bytes` reports the attempted size.
+/// Callers that derive `len` from a multiplication guard that multiply first
+/// via [`checked_elems`] (both the f32 KV path and the compressed buffers) so a
+/// `usize` wrap can't silently under-reserve; `len` here is a valid element
+/// count, and `try_reserve_exact` itself covers the `len * size_of::<T>()`
+/// byte-size overflow.
+pub(crate) fn try_alloc<T>(len: usize) -> Result<Vec<T>, CeraError> {
+    let mut v: Vec<T> = Vec::new();
+    v.try_reserve_exact(len)
+        .map_err(|_| CeraError::OutOfMemory {
+            requested_bytes: (len as u64).saturating_mul(std::mem::size_of::<T>() as u64),
+        })?;
+    Ok(v)
+}
+
+/// `count * per` (an element count) with overflow guarded — a `usize` wrap would
+/// silently under-reserve the buffer and reintroduce an infallible realloc, so
+/// map overflow to `OutOfMemory` (the intended size is absurd) rather than let
+/// it slip past [`try_alloc`]. Used where a buffer length is `capacity * per`.
+///
+/// `T` is the element type the resulting length feeds into `try_alloc::<T>`, so
+/// the `OutOfMemory` diagnostic reports the intended **byte** size
+/// (`count * per * size_of::<T>()`, saturating), consistent with `try_alloc`'s
+/// own `requested_bytes` — not a bare element count.
+pub(crate) fn checked_elems<T>(count: usize, per: usize) -> Result<usize, CeraError> {
+    count.checked_mul(per).ok_or(CeraError::OutOfMemory {
+        requested_bytes: (count as u64)
+            .saturating_mul(per as u64)
+            .saturating_mul(std::mem::size_of::<T>() as u64),
+    })
+}
+
+/// A `fill`-initialized buffer of length `len`, reserved fallibly. Reserves via
+/// [`try_alloc`] (→ [`CeraError::OutOfMemory`] instead of aborting) and then
+/// `resize`s to fill within that reservation, so no further allocation occurs.
+/// Used for the fixed-size scratch/conv buffers so every allocation in the
+/// constructor is recoverable, not just the context-scaled KV caches.
+pub(crate) fn zeroed<T: Clone>(len: usize, fill: T) -> Result<Vec<T>, CeraError> {
+    let mut v = try_alloc::<T>(len)?;
+    v.resize(len, fill);
+    Ok(v)
+}
+
+/// [`zeroed`] specialized to zero-filled `f32` scratch buffers.
+fn zeroed_f32(len: usize) -> Result<Vec<f32>, CeraError> {
+    zeroed(len, 0.0)
+}
 
 /// KV cache compression mode. Passed to `InferenceState::from_config_with_compression`
 /// (or via `GenerateConfig::kv_compression`) — that single call sets up everything
@@ -179,7 +238,7 @@ impl InferenceState {
     /// Create inference state matching a model config.
     /// Attention layers get empty KV caches; conv layers get zero-filled rolling buffers.
     /// Scratch buffers are pre-allocated to avoid per-token allocations.
-    pub fn from_config(config: &ModelConfig) -> Self {
+    pub fn from_config(config: &ModelConfig) -> Result<Self, CeraError> {
         Self::from_config_with_compression(config, &KvCompression::None)
     }
 
@@ -188,7 +247,7 @@ impl InferenceState {
     /// like hidden-state extraction. Uncompressed. Capacity is clamped to
     /// `[1, max_seq_len]`, so a per-chunk classifier call reserves ~O(T·kv_dim)
     /// rather than the hundreds of MB a full-context cache would.
-    pub fn for_prefill(config: &ModelConfig, n_tokens: usize) -> Self {
+    pub fn for_prefill(config: &ModelConfig, n_tokens: usize) -> Result<Self, CeraError> {
         let capacity = n_tokens.clamp(1, config.max_seq_len);
         Self::from_config_capped(config, &KvCompression::None, capacity)
     }
@@ -223,7 +282,10 @@ impl InferenceState {
     /// the compressed caches (keys and/or values), the encode scratch, and
     /// the query rotation scratch. The model itself doesn't need to be
     /// "enabled" separately — it reads all TurboQuant state from here.
-    pub fn from_config_with_compression(config: &ModelConfig, compression: &KvCompression) -> Self {
+    pub fn from_config_with_compression(
+        config: &ModelConfig,
+        compression: &KvCompression,
+    ) -> Result<Self, CeraError> {
         Self::from_config_capped(config, compression, config.max_seq_len)
     }
 
@@ -231,11 +293,11 @@ impl InferenceState {
     /// KV-cache capacity to `capacity` cells instead of `config.max_seq_len`.
     /// Backs [`Self::for_prefill`]. `capacity` should be pre-clamped to
     /// `[1, max_seq_len]`; appending beyond it just triggers normal Vec growth.
-    fn from_config_capped(
+    pub(crate) fn from_config_capped(
         config: &ModelConfig,
         compression: &KvCompression,
         capacity: usize,
-    ) -> Self {
+    ) -> Result<Self, CeraError> {
         let kernel_size = config.conv_kernel_size.unwrap_or(3);
         assert!(
             kernel_size >= 2,
@@ -246,8 +308,15 @@ impl InferenceState {
         // models like Qwen3). `q_dim` (Q projection width = attention output
         // width) can exceed hidden_size.
         let head_dim = config.head_dim;
-        let q_dim = config.n_heads * head_dim;
-        let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * head_dim;
+        // Guard the config-derived scratch/conv buffer-length multiplies: a
+        // `usize` wrap from a malformed GGUF would size a too-small buffer and
+        // panic on a later index, so map overflow to a recoverable OutOfMemory
+        // (same policy as the KV path). All of these size f32 buffers.
+        let q_dim = checked_elems::<f32>(config.n_heads, head_dim)?;
+        let max_kv_dim = checked_elems::<f32>(
+            config.kv_heads_per_layer.iter().copied().max().unwrap_or(0),
+            head_dim,
+        )?;
 
         // Compressed (TurboQuant) caches start at the same per-layer cap as the
         // f32 path, so the compressed-side Vecs also avoid mid-decode reallocs.
@@ -268,97 +337,109 @@ impl InferenceState {
                 KvCompression::TurboQuant { seed, .. } => *seed,
                 KvCompression::None => 0,
             };
-            let rotations: Vec<Option<RotationState>> = config
-                .block_types
-                .iter()
-                .enumerate()
-                .map(|(layer_idx, bt)| match bt {
-                    BlockType::Attention => {
-                        Some(RotationState::from_seed(seed ^ layer_idx as u64, head_dim))
-                    }
+            // Reserve the outer Vec fallibly too (layer-count-scaled), so no
+            // allocation on this path can abort — each RotationState is already
+            // built via the fallible try_from_seed.
+            let mut rotations = try_alloc::<Option<RotationState>>(config.block_types.len())?;
+            for (layer_idx, bt) in config.block_types.iter().enumerate() {
+                rotations.push(match bt {
+                    BlockType::Attention => Some(RotationState::try_from_seed(
+                        seed ^ layer_idx as u64,
+                        head_dim,
+                    )?),
                     BlockType::GatedConv => None,
-                })
-                .collect();
+                });
+            }
             (rotations, Some(TurboQuantConfig::for_head_dim(head_dim)))
         } else {
             (Vec::new(), None)
         };
-        let layers = config
-            .block_types
-            .iter()
-            .enumerate()
-            .map(|(layer_idx, bt)| match bt {
-                BlockType::Attention => {
-                    let n_kv_heads = config.kv_heads_per_layer[layer_idx];
-                    let kv_dim = n_kv_heads * head_dim;
-                    // Use checked_mul so a config bug (e.g. wildly large
-                    // max_seq_len from a malformed GGUF) surfaces as a
-                    // clean panic instead of a wrapped capacity that
-                    // silently reintroduces reallocs.
-                    let kv_capacity = capacity
-                        .checked_mul(kv_dim)
-                        .expect("KV cache capacity overflow: capacity * kv_dim");
-                    let compressed_keys = if compress_keys && n_kv_heads > 0 {
-                        Some(CompressedKeyCache::new(
-                            n_kv_heads,
-                            head_dim,
-                            initial_capacity,
-                        ))
-                    } else {
-                        None
-                    };
-                    let compressed_values = if compress_values && n_kv_heads > 0 {
-                        Some(CompressedValueCache::new(
-                            n_kv_heads,
-                            head_dim,
-                            initial_capacity,
-                        ))
-                    } else {
-                        None
-                    };
-                    // Pre-allocate the f32 KV cache to exactly
-                    // `max_seq_len * kv_dim` floats so writes never trigger
-                    // Vec doubling/reallocation. When TurboQuant compression
-                    // is active for that side, the f32 vec stays empty and
-                    // the compressed cache (above) does the storage.
-                    let key_cache = if compress_keys && n_kv_heads > 0 {
-                        Vec::new()
-                    } else {
-                        Vec::with_capacity(kv_capacity)
-                    };
-                    let value_cache = if compress_values && n_kv_heads > 0 {
-                        Vec::new()
-                    } else {
-                        Vec::with_capacity(kv_capacity)
-                    };
-                    LayerState::Attention {
-                        key_cache,
-                        value_cache,
-                        compressed_keys,
-                        compressed_values,
+        // Reserve the outer Vec<LayerState> fallibly (layer-count-scaled), then
+        // push each layer, so every allocation on this path is recoverable.
+        let mut layers = try_alloc::<LayerState>(config.block_types.len())?;
+        for layer in config.block_types.iter().enumerate().map(
+            |(layer_idx, bt)| -> Result<LayerState, CeraError> {
+                match bt {
+                    BlockType::Attention => {
+                        let n_kv_heads = config.kv_heads_per_layer[layer_idx];
+                        // Guard both multiplies (a usize wrap would silently
+                        // under-reserve). A config bug (e.g. wildly large
+                        // max_seq_len, n_kv_heads, or head_dim from a malformed
+                        // GGUF) surfaces as a recoverable OutOfMemory — same as
+                        // a genuinely too-large KV — rather than aborting the
+                        // process. kv_dim counts f32 slots per token, so its
+                        // overflow guard uses the same f32-sized helper.
+                        let kv_dim = checked_elems::<f32>(n_kv_heads, head_dim)?;
+                        let kv_capacity = checked_elems::<f32>(capacity, kv_dim)?;
+                        let compressed_keys = if compress_keys && n_kv_heads > 0 {
+                            Some(CompressedKeyCache::try_new(
+                                n_kv_heads,
+                                head_dim,
+                                initial_capacity,
+                            )?)
+                        } else {
+                            None
+                        };
+                        let compressed_values = if compress_values && n_kv_heads > 0 {
+                            Some(CompressedValueCache::try_new(
+                                n_kv_heads,
+                                head_dim,
+                                initial_capacity,
+                            )?)
+                        } else {
+                            None
+                        };
+                        // Pre-allocate the f32 KV cache to exactly
+                        // `capacity * kv_dim` floats (capacity = the session's
+                        // requested context, ≤ model max_seq_len) so writes never
+                        // trigger Vec doubling/reallocation. Like every other
+                        // allocation in this constructor it's fallible
+                        // (`try_alloc`) — an over-large context returns
+                        // `OutOfMemory` instead of aborting the process — but this
+                        // is the dominant, context-scaled one. When TurboQuant
+                        // compression is active for that side, the f32 vec stays
+                        // empty and the compressed cache stores it.
+                        let key_cache = if compress_keys && n_kv_heads > 0 {
+                            Vec::new()
+                        } else {
+                            try_alloc::<f32>(kv_capacity)?
+                        };
+                        let value_cache = if compress_values && n_kv_heads > 0 {
+                            Vec::new()
+                        } else {
+                            try_alloc::<f32>(kv_capacity)?
+                        };
+                        Ok(LayerState::Attention {
+                            key_cache,
+                            value_cache,
+                            compressed_keys,
+                            compressed_values,
+                        })
                     }
+                    BlockType::GatedConv => Ok(LayerState::Conv {
+                        buffer: zeroed_f32(checked_elems::<f32>(d_conv, config.hidden_size)?)?,
+                    }),
                 }
-                BlockType::GatedConv => LayerState::Conv {
-                    buffer: vec![0.0; d_conv * config.hidden_size],
-                },
-            })
-            .collect();
+            },
+        ) {
+            layers.push(layer?);
+        }
 
-        Self {
+        Ok(Self {
             layers,
             seq_len: 0,
             scratch: ScratchBuffers {
-                normed: vec![0.0; config.hidden_size],
-                ffn_input: vec![0.0; config.hidden_size],
-                conv_proj: vec![0.0; 3 * config.hidden_size],
-                conv_scratch: vec![0.0; config.hidden_size],
-                q: vec![0.0; q_dim],
-                k: vec![0.0; max_kv_dim],
-                v: vec![0.0; max_kv_dim],
-                attn_out: vec![0.0; q_dim],
-                gate: vec![0.0; config.intermediate_size],
-                up: vec![0.0; config.intermediate_size],
-                out: vec![0.0; config.hidden_size],
+                normed: zeroed_f32(config.hidden_size)?,
+                ffn_input: zeroed_f32(config.hidden_size)?,
+                conv_proj: zeroed_f32(checked_elems::<f32>(3, config.hidden_size)?)?,
+                conv_scratch: zeroed_f32(config.hidden_size)?,
+                q: zeroed_f32(q_dim)?,
+                k: zeroed_f32(max_kv_dim)?,
+                v: zeroed_f32(max_kv_dim)?,
+                attn_out: zeroed_f32(q_dim)?,
+                gate: zeroed_f32(config.intermediate_size)?,
+                up: zeroed_f32(config.intermediate_size)?,
+                out: zeroed_f32(config.hidden_size)?,
                 scores: Vec::new(),    // grows with seq_len during inference
                 q8_scales: Vec::new(), // resized per GEMV input dimension (max of hidden/intermediate)
                 q8_quants: Vec::new(), // resized per GEMV input dimension
@@ -372,19 +453,19 @@ impl InferenceState {
             // encode; QueryRotationScratch is shared between key score
             // computation and value weighted-sum reconstruction.
             tq_encode_scratch: if tq_enabled {
-                Some(EncodeScratch::new(head_dim))
+                Some(EncodeScratch::try_new(head_dim)?)
             } else {
                 None
             },
             tq_query_scratch: if tq_enabled {
-                Some(QueryRotationScratch::new(config.n_heads, head_dim))
+                Some(QueryRotationScratch::try_new(config.n_heads, head_dim)?)
             } else {
                 None
             },
             tq_rotations,
             tq_config,
             lora: None,
-        }
+        })
     }
 
     /// Append K and V vectors to an attention layer's cache (uncompressed path).
@@ -1319,7 +1400,7 @@ mod tests {
         let cfg = tiny_config(4, 16); // max_seq_len=64; attn kv_dim = 2*4 = 8
         let n = 5;
         let kv_dim = cfg.kv_heads_per_layer[0] * cfg.head_dim;
-        let state = InferenceState::for_prefill(&cfg, n);
+        let state = InferenceState::for_prefill(&cfg, n).unwrap();
         if let LayerState::Attention {
             key_cache,
             value_cache,
@@ -1334,7 +1415,7 @@ mod tests {
             panic!("layer 0 should be attention");
         }
         // Clamp: a prompt longer than max_seq_len caps at max_seq_len.
-        let big = InferenceState::for_prefill(&cfg, cfg.max_seq_len + 100);
+        let big = InferenceState::for_prefill(&cfg, cfg.max_seq_len + 100).unwrap();
         if let LayerState::Attention { key_cache, .. } = &big.layers[0] {
             assert!(key_cache.capacity() <= cfg.max_seq_len * kv_dim + kv_dim);
         }
@@ -1345,7 +1426,7 @@ mod tests {
     #[test]
     fn clear_for_reuse_resets_but_keeps_capacity() {
         let cfg = tiny_config(4, 16);
-        let mut state = InferenceState::for_prefill(&cfg, 8);
+        let mut state = InferenceState::for_prefill(&cfg, 8).unwrap();
         state.seq_len = 3;
         let (cap_k, cap_v) = if let LayerState::Attention {
             key_cache,
@@ -1392,7 +1473,7 @@ mod tests {
     #[test]
     fn snapshot_restore_round_trip_attention_and_conv() {
         let cfg = tiny_config(4, 16);
-        let mut state = InferenceState::from_config(&cfg);
+        let mut state = InferenceState::from_config(&cfg).unwrap();
 
         // Populate attention layer 0's KV with deterministic values
         // that fit kv_dim = n_kv_heads * head_dim = 2 * 4 = 8.
@@ -1417,7 +1498,7 @@ mod tests {
         let snap = state.snapshot().expect("uncompressed state must snapshot");
 
         // Drop the existing KV by recreating, then restore.
-        let mut fresh = InferenceState::from_config(&cfg);
+        let mut fresh = InferenceState::from_config(&cfg).unwrap();
         fresh.restore(&snap);
 
         match (&fresh.layers[0], &state.layers[0]) {
@@ -1452,9 +1533,9 @@ mod tests {
     #[test]
     fn snapshot_restore_round_trip_empty_state() {
         let cfg = tiny_config(2, 8);
-        let state = InferenceState::from_config(&cfg);
+        let state = InferenceState::from_config(&cfg).unwrap();
         let snap = state.snapshot().expect("empty state still snapshots");
-        let mut fresh = InferenceState::from_config(&cfg);
+        let mut fresh = InferenceState::from_config(&cfg).unwrap();
         fresh.restore(&snap);
         assert_eq!(fresh.seq_len, 0);
     }
@@ -1466,7 +1547,7 @@ mod tests {
     #[test]
     fn snapshot_compressed_state_emits_attention_compressed() {
         let cfg = tiny_config(2, 8);
-        let mut state = InferenceState::from_config(&cfg);
+        let mut state = InferenceState::from_config(&cfg).unwrap();
         // Layer 0 is an attention layer per `tiny_config`. Populate
         // both compressed_keys and compressed_values with a synthetic
         // 1-token compressed cache.
@@ -1499,7 +1580,7 @@ mod tests {
 
         // Restore into a fresh state and assert the polar/jl bytes
         // and norms match the original.
-        let mut fresh = InferenceState::from_config(&cfg);
+        let mut fresh = InferenceState::from_config(&cfg).unwrap();
         // `from_config` (uncompressed) doesn't allocate
         // `compressed_keys` slots; manually wire empty caches so
         // `restore`'s `Some(_)` write target exists.

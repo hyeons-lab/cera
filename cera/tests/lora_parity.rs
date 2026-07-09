@@ -142,7 +142,7 @@ fn synth_adapter_io(
 
 /// Per-token hidden states with an optional adapter set on the state.
 fn run(model: &dyn Model, tokens: &[u32], lora: Option<Arc<LoraAdapterWeights>>) -> Vec<f32> {
-    let mut state = InferenceState::for_prefill(model.config(), tokens.len());
+    let mut state = InferenceState::for_prefill(model.config(), tokens.len()).unwrap();
     state.lora = lora;
     model.hidden_states(tokens, &mut state)
 }
@@ -322,12 +322,12 @@ fn lora_batched_matches_per_token() {
     // adapter-active model. `forward_prefill` returns last-token logits; the
     // per-token loop's last `forward` returns the same.
     let batched = |lora: Option<Arc<LoraAdapterWeights>>| {
-        let mut st = InferenceState::for_prefill(cfg, tokens.len());
+        let mut st = InferenceState::for_prefill(cfg, tokens.len()).unwrap();
         st.lora = lora;
         model.forward_prefill(&tokens, 0, &mut st)
     };
     let per_token = |lora: Option<Arc<LoraAdapterWeights>>| {
-        let mut st = InferenceState::for_prefill(cfg, tokens.len());
+        let mut st = InferenceState::for_prefill(cfg, tokens.len()).unwrap();
         st.lora = lora;
         let mut logits = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {

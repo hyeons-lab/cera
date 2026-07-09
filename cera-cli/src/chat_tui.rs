@@ -856,7 +856,9 @@ fn worker_loop(
         // UI knows about it, plus any drift the offset can't
         // anticipate.
         let prefill_outcome: Result<(), String> = loop {
-            session.reset();
+            if let Err(e) = session.reset() {
+                break Err(format!("session reset failed: {e}"));
+            }
             // Recompute per attempt: a truncation step may have
             // dropped the last image-bearing turn, in which case the
             // conversation is now text-only and the chat template

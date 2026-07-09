@@ -392,10 +392,13 @@ impl CeraEngine {
     /// engine's model and tokenizer, so freeing the engine doesn't
     /// invalidate any in-flight sessions.
     #[wasm_bindgen(js_name = newSession)]
-    pub fn new_session(&self, config: &SessionConfig) -> Session {
-        let inner = self.inner.new_session(config.inner.clone());
+    pub fn new_session(&self, config: &SessionConfig) -> Result<Session, JsError> {
+        let inner = self
+            .inner
+            .new_session(config.inner.clone())
+            .map_err(map_cera_err)?;
         let hidden_size = inner.hidden_size() as u32;
-        Session { inner, hidden_size }
+        Ok(Session { inner, hidden_size })
     }
 }
 
@@ -1299,8 +1302,9 @@ impl Session {
     /// `SharedArrayBuffer`-style schemes, it's on you to
     /// serialize calls.
     #[wasm_bindgen]
-    pub fn reset(&mut self) {
-        self.inner.reset();
+    pub fn reset(&mut self) -> Result<(), JsError> {
+        self.inner.reset().map_err(map_cera_err)?;
+        Ok(())
     }
 
     /// Decode tokens until `opts.maxTokens`, a stop token, EOS, or
@@ -1433,7 +1437,8 @@ mod webgpu {
                 ctx,
             )
             .map_err(map_err)?;
-            let state = cera::kv_cache::InferenceState::from_config(model.config());
+            let state = cera::kv_cache::InferenceState::from_config(model.config())
+                .map_err(crate::map_cera_err)?;
             Ok(WebGpuSession {
                 model,
                 tokenizer,

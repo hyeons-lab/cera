@@ -239,7 +239,8 @@ fn check_model(fixture_dir: &std::path::Path) -> Option<Vec<String>> {
 
         // Gate 2 — per-substep sum checksums. Prefill with the dump active.
         let mut state =
-            InferenceState::from_config_with_compression(model.config(), &KvCompression::None);
+            InferenceState::from_config_with_compression(model.config(), &KvCompression::None)
+                .unwrap();
         oracle_dump::begin();
         let _ = model.forward_prefill(&got_tokens, 0, &mut state);
         let occ = oracle_dump::take();
@@ -312,7 +313,8 @@ fn check_model(fixture_dir: &std::path::Path) -> Option<Vec<String>> {
         let n_predict = index["n_predict"].as_u64().unwrap_or(16) as usize;
         let want_text = fx["greedy_text"].as_str().unwrap().trim_end();
         let mut gstate =
-            InferenceState::from_config_with_compression(model.config(), &KvCompression::None);
+            InferenceState::from_config_with_compression(model.config(), &KvCompression::None)
+                .unwrap();
         let mut logits = model.forward_prefill(&got_tokens, 0, &mut gstate);
         let mut out_tokens: Vec<u32> = Vec::new();
         for _ in 0..n_predict {

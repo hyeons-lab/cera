@@ -1569,7 +1569,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_metadata() != 46262) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 54382) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 13030) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790) {
@@ -3046,10 +3046,11 @@ open class CeraEngine :
      * engine keeps the shared state live for every session it hands
      * out. Cheap — no model load, just config + state allocation.
      */
+    @Throws(FfiException::class)
     override fun `newSession`(`config`: SessionConfig): Session =
         FfiConverterTypeSession.lift(
             callWithHandle {
-                uniffiRustCall { _status ->
+                uniffiRustCallWithError(FfiException) { _status ->
                     UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_new_session(
                         it,
                         FfiConverterTypeSessionConfig.lower(`config`),
@@ -6237,6 +6238,19 @@ sealed class FfiException : kotlin.Exception() {
             get() = "detail=${ `detail` }"
     }
 
+    /**
+     * A large model/KV allocation could not be satisfied — the device is out of
+     * memory for this model at this context size. Returned instead of aborting
+     * the process, so a caller can fall back (smaller model or context) or
+     * surface a clean error. Mirrors `cera::CeraError::OutOfMemory`.
+     */
+    class OutOfMemory(
+        val `requestedBytes`: kotlin.ULong,
+    ) : FfiException() {
+        override val message
+            get() = "requestedBytes=${ `requestedBytes` }"
+    }
+
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<FfiException> {
         override fun lift(error_buf: RustBuffer.ByValue): FfiException = FfiConverterTypeFfiError.lift(error_buf)
     }
@@ -6305,6 +6319,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
             11 -> {
                 FfiException.LoraParse(
                     FfiConverterString.read(buf),
+                )
+            }
+
+            12 -> {
+                FfiException.OutOfMemory(
+                    FfiConverterULong.read(buf),
                 )
             }
 
@@ -6378,6 +6398,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
                 4UL +
                     FfiConverterString.allocationSize(value.`detail`)
             )
+
+            is FfiException.OutOfMemory -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterULong.allocationSize(value.`requestedBytes`)
+            )
         }
 
     override fun write(
@@ -6446,6 +6472,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
             is FfiException.LoraParse -> {
                 buf.putInt(11)
                 FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is FfiException.OutOfMemory -> {
+                buf.putInt(12)
+                FfiConverterULong.write(value.`requestedBytes`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

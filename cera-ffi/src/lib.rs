@@ -204,6 +204,13 @@ pub enum FfiError {
     /// attach time (wrong dimensions). `detail` carries the diagnostic.
     #[error("lora: {detail}")]
     LoraParse { detail: String },
+
+    /// A large model/KV allocation could not be satisfied — the device is out of
+    /// memory for this model at this context size. Returned instead of aborting
+    /// the process, so a caller can fall back (smaller model or context) or
+    /// surface a clean error. Mirrors `cera::CeraError::OutOfMemory`.
+    #[error("out of memory: could not allocate {requested_bytes} bytes")]
+    OutOfMemory { requested_bytes: u64 },
 }
 
 impl From<cera::CeraError> for FfiError {
@@ -226,6 +233,9 @@ impl From<cera::CeraError> for FfiError {
                 FfiError::InvalidToken { id, vocab_size }
             }
             cera::CeraError::Backend(s) => FfiError::Backend { detail: s },
+            cera::CeraError::OutOfMemory { requested_bytes } => {
+                FfiError::OutOfMemory { requested_bytes }
+            }
             cera::CeraError::LoraDimMismatch(s) => FfiError::LoraParse { detail: s },
             cera::CeraError::Io(io_err) => FfiError::Io {
                 detail: io_err.to_string(),
@@ -1602,7 +1612,7 @@ impl Session {
     /// Returns `Result` so a poisoned-mutex case surfaces as an error
     /// instead of panicking across the FFI boundary.
     pub fn reset(&self) -> Result<(), FfiError> {
-        self.lock_inner()?.reset();
+        self.lock_inner()?.reset()?;
         Ok(())
     }
 
@@ -1889,19 +1899,19 @@ impl CeraEngine {
     /// by `Arc` clone. The returned session outlives `&self`; the
     /// engine keeps the shared state live for every session it hands
     /// out. Cheap — no model load, just config + state allocation.
-    pub fn new_session(&self, config: SessionConfig) -> Arc<Session> {
-        let session = self.inner.new_session(config.into());
+    pub fn new_session(&self, config: SessionConfig) -> Result<Arc<Session>, FfiError> {
+        let session = self.inner.new_session(config.into())?;
         let position = session.position_handle();
         let cancel = session.cancel_handle();
         let capabilities = session.capabilities().into();
         let hidden_size = u32::try_from(session.hidden_size()).unwrap_or(u32::MAX);
-        Arc::new(Session {
+        Ok(Arc::new(Session {
             inner: std::sync::Mutex::new(session),
             position,
             cancel,
             capabilities,
             hidden_size,
-        })
+        }))
     }
 }
 
