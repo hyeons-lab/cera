@@ -118,7 +118,12 @@ stochastic. Min-p and repetition penalty apply on the stochastic path only.
 back out, format-aware: `ToolFormat::detect(arch)` picks Pythonic (LFM2) vs
 Hermes JSON (Qwen2.5/Qwen3) from the GGUF architecture.
 
+Continuing from the Quick start (which sets up `engine`, `session`, and the
+chat `messages`, and produces the decoded `reply_text`):
+
 ```rust
+use std::sync::Arc;
+use cera::grammar::Grammar;
 use cera::tools::{ToolDef, ToolFormat, tool_grammar, parse_tool_calls};
 use cera::tokenizer::apply_chat_template_with_tools;
 

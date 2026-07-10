@@ -218,10 +218,11 @@ as a JSON string; `parseToolCalls` returns a JSON string you `JSON.parse`.
 
 ```js
 import {
-  CeraEngine, SessionConfig, GenerateOpts,
+  SessionConfig, GenerateOpts,
   detectToolFormat, ToolFormat, toolGrammar, parseToolCalls,
 } from '@hyeons-lab/cera-wasm';
 
+// `engine` is the CeraEngine from the setup above.
 const tok = engine.tokenizer;
 const tools = JSON.stringify([{
   name: 'get_weather',
@@ -239,7 +240,11 @@ session.appendText(prompt);
 const opts = new GenerateOpts();
 opts.maxTokens = 128;
 // Optional: constrain to a valid call (grammar + lazy start-marker trigger).
-const trigger = tok.specialTokenId('<|tool_call_start|>');
+// The start marker differs by format; it must be a special token in the model's
+// vocab for the trigger to fire (LFM2's is; Hermes markers usually aren't, so
+// this stays unconstrained there — the model still emits a parseable call).
+const startMarker = format === ToolFormat.Hermes ? '<tool_call>' : '<|tool_call_start|>';
+const trigger = tok.specialTokenId(startMarker);
 if (trigger != null) {
   opts.setGrammar(toolGrammar(tools, format));   // JSON-Schema → GBNF
   opts.grammarTriggerTokens = new Uint32Array([trigger]);
