@@ -765,6 +765,10 @@ impl<'a> PyParser<'a> {
             let f: f64 = tok
                 .parse()
                 .map_err(|_| anyhow::anyhow!("bad float '{tok}'"))?;
+            // A literal beyond f64 range (e.g. `1e9999`) parses to ±inf, which
+            // `serde_json` would silently turn into `null`; reject it instead of
+            // dropping the value — same guard as the integer-overflow path below.
+            ensure!(f.is_finite(), "float literal '{tok}' out of range");
             Ok(serde_json::json!(f))
         } else {
             // Prefer an exact integer, but fall back to f64 when the literal
@@ -1022,6 +1026,18 @@ mod tests {
         let text = "<|tool_call_start|>[react(emoji=\"\\uD83D\\uDE00\")]<|tool_call_end|>";
         let calls = parse_tool_calls(text, ToolFormat::Lfm2Pythonic).unwrap();
         assert_eq!(calls[0].arguments["emoji"], "\u{1F600}");
+    }
+
+    #[test]
+    fn lfm2_out_of_range_float_is_error_not_null() {
+        // A float literal beyond f64 range parses to ±inf; serde_json would turn
+        // that into `null`, silently corrupting the argument. Reject instead.
+        let text = "<|tool_call_start|>[f(x=1e9999)]<|tool_call_end|>";
+        assert!(parse_tool_calls(text, ToolFormat::Lfm2Pythonic).is_err());
+        // A normal float still parses.
+        let ok = "<|tool_call_start|>[f(x=1.5)]<|tool_call_end|>";
+        let calls = parse_tool_calls(ok, ToolFormat::Lfm2Pythonic).unwrap();
+        assert_eq!(calls[0].arguments["x"], 1.5);
     }
 
     #[test]

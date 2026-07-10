@@ -1550,12 +1550,17 @@ impl Session {
         // grammar, the grammar starts inactive (`armed = false`): decode samples
         // freely until the model emits a trigger token (e.g. `<|tool_call_start|>`),
         // then the grammar constrains the tool-call interior. On completion it
-        // deactivates again (`triggered_done`) so the model can emit its closing
-        // marker and finish normally. A grammar with no triggers is active from the
-        // first token, preserving the original constrained-decode behavior.
+        // deactivates again (so the model can emit its closing marker and continue)
+        // and the grammar state is reset, so a *later* trigger token re-arms and
+        // constrains the next tool-call section too — the output parser already
+        // recovers multiple sections, and this keeps the constrained path
+        // symmetric with it. A grammar with no triggers is active from the first
+        // token, preserving the original constrained-decode behavior.
         let lazy_trigger = grammar_active && !opts.grammar_trigger_tokens.is_empty();
         let mut armed = grammar_active && !lazy_trigger;
-        let mut triggered_done = false;
+        // Cloned handle used to mint a fresh `GrammarState` when re-arming for a
+        // subsequent section (a completed state can't accept more input).
+        let grammar_for_rearm = opts.grammar.clone();
 
         // Stochastic-only state. Allocating the scratch buffer and syncing
         // the sampler are skipped in greedy mode where neither is touched.
@@ -1634,10 +1639,8 @@ impl Session {
             // grammar, not stop — even if it is also EOS or a stop token. Without
             // this, a trigger token that coincides with a stop token would end
             // generation before the tool-call grammar ever engaged.
-            let is_pending_trigger = lazy_trigger
-                && !armed
-                && !triggered_done
-                && opts.grammar_trigger_tokens.contains(&token);
+            let is_pending_trigger =
+                lazy_trigger && !armed && opts.grammar_trigger_tokens.contains(&token);
 
             // Stop on EOS or an explicit stop token — but while a grammar is
             // *actively* constraining, only once it permits termination. Otherwise
@@ -1666,9 +1669,14 @@ impl Session {
                 state.accept(grammar_mask.as_ref().unwrap().token_bytes(token));
                 // For a lazy tool-call grammar, deactivate once the interior is
                 // complete so the model can emit its closing marker and continue.
+                // Reset to a fresh grammar state so a later trigger token re-arms
+                // and constrains the next section (the just-completed state can't
+                // accept more input); a single-section reply simply never re-arms.
                 if lazy_trigger && state.is_complete() {
                     armed = false;
-                    triggered_done = true;
+                    if let Some(g) = &grammar_for_rearm {
+                        *state = crate::grammar::GrammarState::new(g.clone());
+                    }
                 }
             }
 
