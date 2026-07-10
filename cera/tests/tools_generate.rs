@@ -153,10 +153,19 @@ fn constrained_tool_call_with_lazy_trigger() {
     // Build the constraint grammar + resolve the start-marker trigger token.
     let gbnf = tool_grammar(&tools, format).expect("tool grammar");
     let grammar = Arc::new(Grammar::parse(&gbnf).expect("compile grammar"));
-    let trigger = engine
+    // `special_token_id` is fallible by design: a model whose tool-call markers
+    // aren't registered as special tokens can't drive the lazy trigger. Skip
+    // (don't panic) so this gated test tolerates any `$CERA_TOOLS_TEST_MODEL`.
+    let Some(trigger) = engine
         .tokenizer()
         .special_token_id(format.call_start_marker())
-        .expect("model has the start-marker special token");
+    else {
+        eprintln!(
+            "skipping: model has no `{}` special token for the {format:?} format",
+            format.call_start_marker()
+        );
+        return;
+    };
 
     let mut session = engine
         .new_session(SessionConfig::default())

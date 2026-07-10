@@ -55,25 +55,20 @@ fn tools_render_into_lfm2_template() {
         content: "What's the weather in Paris?".into(),
     }];
 
-    // With a tool, the template's `{% if tools %}` branch must fire.
+    // With a tool, the template's `{% if tools %}` branch must fire. The tool
+    // name appearing in the render is the robust, template-agnostic signal that
+    // it did (asserting on wrapper strings like "List of tools" would be brittle
+    // across GGUF chat-template variants).
     let tools = vec![weather_tool()];
     let with = apply_chat_template_with_tools(&tok, &messages, &tools, true).expect("render");
-    assert!(
-        with.contains("List of tools") || with.contains("tool_list_start"),
-        "tool block missing from rendered prompt:\n{with}"
-    );
     assert!(with.contains("get_weather"), "tool name missing:\n{with}");
 
-    // Without tools the block must be absent — proves we didn't change the
-    // no-tools rendering.
+    // Without tools the tool name must be absent — proves we didn't change the
+    // no-tools rendering and that the block is gated on a non-empty tools list.
     let without =
         apply_chat_template_with_tools(&tok, &messages, &[], true).expect("render no tools");
     assert!(
         !without.contains("get_weather"),
         "tool leaked into no-tools render:\n{without}"
-    );
-    assert!(
-        !without.contains("List of tools"),
-        "tool block present with empty tools:\n{without}"
     );
 }
