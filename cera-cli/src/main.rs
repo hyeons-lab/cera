@@ -2308,6 +2308,15 @@ fn main() -> Result<()> {
                         cera::tools::ToolFormat::Lfm2Pythonic
                     })
                 });
+                // `--constrain-tools` with an empty `--tools` (e.g. `[]`) passes
+                // clap's `requires = "tools"` but has nothing to constrain to,
+                // so it would silently no-op. Fail fast instead.
+                if constrain_tools && tool_format.is_none() {
+                    anyhow::bail!(
+                        "--constrain-tools requires at least one tool in --tools \
+                         (the tool list is empty)"
+                    );
+                }
                 let (effective_grammar, trigger_tokens) =
                     if constrain_tools && let Some(fmt) = tool_format {
                         let gbnf = cera::tools::tool_grammar(&tool_defs, fmt)?;
