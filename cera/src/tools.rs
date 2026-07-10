@@ -204,6 +204,13 @@ pub fn parse_tool_calls(text: &str, format: ToolFormat) -> Result<Vec<ToolCall>>
 /// present, and no-duplicate/ordering constraints — arguments may appear in any
 /// order and any subset. This is a deliberate v1 scope: it guarantees a
 /// well-formed, correctly-typed call without over-constraining the model.
+///
+/// For the LFM2 Pythonic format, tool and argument names must be valid Python
+/// identifiers (`[A-Za-z_][A-Za-z0-9_]*`) — that is what the model was trained
+/// on and what [`parse_tool_calls`] reads back. A name containing e.g. `-` or
+/// `.` would be emitted verbatim by the grammar but not round-trip through the
+/// parser; keep tool/argument names identifier-safe for that format. (The
+/// Hermes JSON format quotes names, so it has no such restriction.)
 pub fn tool_grammar(tools: &[ToolDef], format: ToolFormat) -> Result<String> {
     if tools.is_empty() {
         bail!("tool_grammar: no tools provided");

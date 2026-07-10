@@ -3898,12 +3898,14 @@ public func FfiConverterTypeSessionConfig_lower(_ value: SessionConfig) -> RustB
 
 /**
  * A tool call parsed from model output. Mirrors [`cera::tools::ToolCall`];
- * `arguments_json` is the argument object encoded as a JSON string.
+ * `arguments_json` is the call's arguments encoded as a JSON string.
  */
 public struct ToolCall: Equatable, Hashable {
     public var name: String
     /**
-     * The argument object as a JSON string (e.g. `{"city":"Paris"}`).
+     * The call's arguments as a JSON string — normally an object
+     * (e.g. `{"city":"Paris"}`), but a malformed Hermes/Qwen reply may pass
+     * through a non-object value, so decode defensively.
      */
     public var argumentsJson: String
 
@@ -3911,7 +3913,9 @@ public struct ToolCall: Equatable, Hashable {
     // declare one manually.
     public init(name: String, 
         /**
-         * The argument object as a JSON string (e.g. `{"city":"Paris"}`).
+         * The call's arguments as a JSON string — normally an object
+         * (e.g. `{"city":"Paris"}`), but a malformed Hermes/Qwen reply may pass
+         * through a non-object value, so decode defensively.
          */argumentsJson: String) {
         self.name = name
         self.argumentsJson = argumentsJson

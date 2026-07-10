@@ -6167,12 +6167,14 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
 
 /**
  * A tool call parsed from model output. Mirrors [`cera::tools::ToolCall`];
- * `arguments_json` is the argument object encoded as a JSON string.
+ * `arguments_json` is the call's arguments encoded as a JSON string.
  */
 data class ToolCall(
     var `name`: kotlin.String,
     /**
-     * The argument object as a JSON string (e.g. `{"city":"Paris"}`).
+     * The call's arguments as a JSON string — normally an object
+     * (e.g. `{"city":"Paris"}`), but a malformed Hermes/Qwen reply may pass
+     * through a non-object value, so decode defensively.
      */
     var `argumentsJson`: kotlin.String,
 ) {

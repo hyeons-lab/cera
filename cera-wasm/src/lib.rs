@@ -59,11 +59,13 @@ export interface ToolDef {
 }
 
 /**
- * A tool call parsed from model output by `parseToolCalls`.
+ * A tool call parsed from model output by `parseToolCalls`. `arguments` is
+ * normally an object, but a malformed Hermes/Qwen reply may pass through a
+ * non-object JSON value — narrow before assuming an object map.
  */
 export interface ToolCall {
     name: string;
-    arguments: object;
+    arguments: object | unknown;
 }
 "#;
 
