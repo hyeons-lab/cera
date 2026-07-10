@@ -21,6 +21,10 @@ or in the browser — from a single dependency-free core.
   load through the same session API.
 - **Structured output.** Constrain generation to a GBNF grammar — or one flag
   for guaranteed-valid JSON.
+- **Tool calling.** Give the model a set of tool schemas and parse the calls it
+  makes back out — format-aware (LFM2 Pythonic, Hermes/Qwen JSON), with an
+  optional constrained mode that guarantees a well-formed, correctly-typed call.
+  From the CLI and every binding.
 - **LoRA adapters & embeddings.** Load LoRA adapters at runtime (GGUF or PEFT
   safetensors), hot-swap / unload per session — applied on CPU, Metal, and wgpu,
   never merged — and pull per-token hidden states out of the engine for
@@ -112,6 +116,39 @@ CLI: in Rust set `GenerateOpts.grammar` to a compiled `Grammar` (`Grammar::parse
 while the Kotlin/Swift FFI (`GenerateOpts.grammar`) and browser/Node WASM
 (`GenerateOpts.setGrammar(gbnf)`) take the GBNF string directly and compile it
 natively — so mobile and web apps get the same guaranteed-valid output.
+
+## Tool calling
+
+Give the model a set of tools (OpenAI "function" schemas) and get the calls it
+makes back out as structured data. Cera renders the tools into the model's chat
+template and parses tool calls from the reply — **format-aware**, since the wire
+format isn't interchangeable: LFM2/LFM2.5 emit **Pythonic** calls
+(`[get_weather(city="Paris")]`) while Hermes-style Qwen2.5/Qwen3 emit **JSON**
+(`<tool_call>{"name": …, "arguments": {…}}</tool_call>`). The format is detected
+from the GGUF architecture.
+
+```bash
+# Let the model decide whether/how to call a tool (free text or a call)
+cera run -m model.gguf -p "What's the weather in Paris?" \
+  --tools '[{"name":"get_weather","description":"Get weather for a city",
+             "parameters":{"type":"object",
+               "properties":{"city":{"type":"string"}},"required":["city"]}}]'
+
+# Force a well-formed, correctly-typed call (grammar-constrained)
+cera run -m model.gguf -p "..." --tools @tools.json --constrain-tools
+```
+
+With `--constrain-tools` a **lazy grammar trigger** keeps generation free until
+the model starts a tool call, then constrains the call to a valid function name,
+valid argument names, and correctly-typed values (JSON-Schema → GBNF). In
+`--tools` mode stdout is machine-readable — **only** the JSON array of calls
+(`[]` when the model answered in prose); the assistant reply and timing stream to
+stderr, so `… --tools tools.json | jq` just works.
+
+Available from **every binding**, not just the CLI — Rust (`cera::tools`),
+Kotlin/Swift (`applyChatTemplateWithTools`, `parseToolCalls`, `toolGrammar`,
+`detectToolFormat`), and browser/Node WASM (the same names) — see each crate's
+README for the API surface.
 
 ## LoRA adapters & hidden states
 
@@ -208,7 +245,7 @@ See the [`cera` crate README](cera/README.md) for the full library API.
 
 | Command | Purpose |
 |---------|---------|
-| `run` | One-shot inference — text, optional grammar/JSON, plus image/audio input for VL/Audio bundles |
+| `run` | One-shot inference — text, optional grammar/JSON or tool calling (`--tools`), plus image/audio input for VL/Audio bundles |
 | `chat` | Interactive multi-turn REPL with a persistent KV prefix cache |
 | `inspect` | Dump a GGUF's metadata, tensor shapes, and resolved backend tier |
 | `cpu` | Print the host's CPU backend tier + detected SIMD features (no model needed) |

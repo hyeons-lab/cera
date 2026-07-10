@@ -41,6 +41,12 @@ cera run --bundle-id LFM2.5-1.2B-Instruct --quant Q4_0 --prompt "Hello"
 cera run -m model.gguf -p "List 3 colors as JSON" --json
 cera run -m model.gguf -p "..." --grammar @schema.gbnf
 
+# Tool calling: pass tool schemas (inline JSON or @file). stdout gets ONLY the
+# JSON array of calls (the assistant reply + timing stream to stderr), so it
+# pipes cleanly. Add --constrain-tools to force a valid call.
+cera run -m model.gguf -p "Weather in Paris?" --tools @tools.json | jq .
+cera run -m model.gguf -p "Weather in Paris?" --tools @tools.json --constrain-tools
+
 # Interactive multi-turn chat REPL (keeps the prefix cache warm across turns)
 cera chat --bundle-id LFM2.5-1.2B-Instruct --quant Q4_0
 
@@ -58,7 +64,7 @@ cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead 
 
 | Command | Purpose |
 |---------|---------|
-| `run` | Run inference on a prompt — text, optional grammar/JSON, plus audio input for LFM2-Audio bundles. Optional `--lora` adapter. |
+| `run` | Run inference on a prompt — text, optional grammar/JSON or tool calling (`--tools` / `--constrain-tools`), plus audio input for LFM2-Audio bundles. Optional `--lora` adapter. |
 | `chat` | Interactive multi-turn REPL with `/help`, `/clear`, `/exit` slash commands. Optional `--lora` adapter. |
 | `embed` | Extract last-layer hidden-state embeddings for a prompt — mean-pooled by default, `--per-token` for the full matrix, `--json` for array output. |
 | `logits` | Dump the next-token logits over the full vocabulary for a prompt (single prefill) — `--top-k` for the K highest `(token_id, logit)` pairs, `--json` for array output. Handy for cross-backend parity checks. |
@@ -72,11 +78,16 @@ cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead 
 Run `cera <command> --help` for the full flag list. Common `run` flags:
 `--max-tokens` (default 256), `--temperature` (default 0.7), `--device`
 (`cpu` / `gpu` / `metal` / `auto`, default `auto`), `--grammar` / `--json`, and
-`--lora` to attach a LoRA adapter. `run`, `chat`, and `embed` all accept `--lora
-<PATH>` (a llama.cpp `.gguf` or PEFT `.safetensors` adapter); it applies to every
-forward pass — generation and hidden-state extraction alike. For a PEFT
-`.safetensors` adapter whose `alpha` differs from its rank, pass `--lora-alpha
-<ALPHA>` (`scale = alpha / rank`; `.gguf` adapters carry alpha in their metadata).
+`--lora` to attach a LoRA adapter. For tool calling, `--tools <JSON|@file>`
+passes an array of OpenAI-style function schemas (rendered into the chat
+template; the reply's tool calls are parsed to a JSON array on stdout), and
+`--constrain-tools` (requires `--tools`) forces a well-formed, correctly-typed
+call via a grammar + lazy trigger. `run`, `chat`, and `embed` all accept
+`--lora <PATH>` (a llama.cpp `.gguf` or PEFT `.safetensors` adapter); it applies
+to every forward pass — generation and hidden-state extraction alike. For a PEFT
+`.safetensors` adapter whose `alpha` differs from its rank, pass
+`--lora-alpha <ALPHA>` (`scale = alpha / rank`; `.gguf` adapters carry alpha in
+their metadata).
 
 ## License
 

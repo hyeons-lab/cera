@@ -208,6 +208,61 @@ opts.hasGrammar;       // → true (getter — property access, no parens)
 Each decode step then masks the logits so only grammar-accepted tokens
 are sampled; a later `setGrammar` replaces any grammar set by a prior call.
 
+### Tool calling
+
+Render a set of tools into the prompt, generate, then parse the calls back out.
+The wire format is per-model-family — detect it from the GGUF architecture
+(`detectToolFormat`) or pick one explicitly (`ToolFormat.Lfm2Pythonic` for
+LFM2/LFM2.5, `ToolFormat.Hermes` for Qwen2.5/Qwen3). Tools cross the JS boundary
+as a JSON string; `parseToolCalls` returns a JSON string you `JSON.parse`.
+
+```js
+import {
+  SessionConfig, GenerateOpts,
+  detectToolFormat, ToolFormat, toolGrammar, parseToolCalls,
+} from '@hyeons-lab/cera-wasm';
+
+// `engine` is the CeraEngine from the setup above.
+const tok = engine.tokenizer;
+const tools = JSON.stringify([{
+  name: 'get_weather',
+  description: 'Get the current weather for a city',
+  parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+}]);
+
+const format = detectToolFormat(engine.architecture) ?? ToolFormat.Lfm2Pythonic;
+const prompt = tok.applyChatTemplateWithTools(
+  [{ role: 'user', content: "What's the weather in Paris?" }], tools, true);
+
+const session = engine.newSession(new SessionConfig());
+session.appendText(prompt);
+
+const opts = new GenerateOpts();
+opts.maxTokens = 128;
+// Optional: constrain to a valid call (grammar + lazy start-marker trigger).
+// The start marker differs by format; it must be a special token in the model's
+// vocab for the trigger to fire (LFM2's is; Hermes markers usually aren't, so
+// this stays unconstrained there — the model still emits a parseable call).
+const startMarker = format === ToolFormat.Hermes ? '<tool_call>' : '<|tool_call_start|>';
+const trigger = tok.specialTokenId(startMarker);
+if (trigger != null) {
+  opts.setGrammar(toolGrammar(tools, format));   // JSON-Schema → GBNF
+  opts.grammarTriggerTokens = new Uint32Array([trigger]);
+}
+
+// generate streams the new tokens per flush; accumulate them.
+const acc = [];
+session.generate(opts, (newTokens) => acc.push(...newTokens));
+const reply = tok.decode(acc);
+const calls = JSON.parse(parseToolCalls(reply, format));  // [{ name, arguments }]
+for (const c of calls) console.log(c.name, c.arguments);
+```
+
+`parseToolCalls` returns `[]` (as `"[]"`) when the model answered in prose. With
+the lazy trigger, generation stays unconstrained until the model emits the
+start marker, then the grammar forces a valid function name, valid argument
+names, and correctly-typed values.
+
 ### LoRA adapters & hidden states
 
 Load a LoRA adapter from bytes (GGUF or PEFT `.safetensors`) and attach it to a
