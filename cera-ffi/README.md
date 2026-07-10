@@ -668,6 +668,12 @@ messages without going through `Session::append_text`. Useful for:
 | `engine.isSpecialToken(id)` → `Bool` | Inverse of `specialTokenId` — useful for filtering control tokens out of streamed output before rendering. |
 | `engine.hasChatTemplate()` → `Bool` | Check before render. |
 | `engine.applyChatTemplate(messages, addGenerationPrompt)` → `String` | Render template. |
+| `engine.applyChatTemplateWithTools(messages, tools, addGenerationPrompt)` → `String` | Render the template with a `tools` array so a tool-trained model emits its tool-definition block. Empty `tools` == `applyChatTemplate`. |
+| `engine.toolFormat()` → `ToolFormat?` | Tool-call format auto-detected from the model's architecture (`lfm2Pythonic` / `hermes`), or `null` if unknown. |
+| `engine.toolCallStartToken(format)` → `u32?` | Vocab id of `format`'s start marker (e.g. <code>&lt;|tool_call_start|&gt;</code>), for `GenerateOpts.grammarTriggerTokens` (lazy constrained tool calls). `null` if absent. |
+| `detectToolFormat(architecture)` → `ToolFormat?` | Free function: format for a GGUF architecture string. |
+| `toolGrammar(tools, format)` → `String` | Free function: GBNF that constrains output to a valid call for `tools`. Pair with `grammarTriggerTokens` for lazy constraint. |
+| `parseToolCalls(text, format)` → `[ToolCall]` | Free function: parse tool calls out of generated text. `ToolCall` = `{ name, argumentsJson }`. |
 | `engine.contextSize()` → `u64` | **Requested** engine `context_size` after applying the `0` → model `max_seq_len` default (so callers never see the internal `usize::MAX` sentinel). This is the engine-level config readback, **not** the per-session ceiling — cera clamps the model's `max_seq_len` to `min(requested, gguf_max)` at load time, so `engine.metadata().maxSeqLen` is the effective cap. |
 
 ### Kotlin example
@@ -695,6 +701,34 @@ if (engine.hasChatTemplate()) {
     val replyText = engine.decodeTokens(out.tokens)
     println("Assistant: $replyText")
 }
+
+// Tool calling: render tools into the prompt, then parse calls from the reply.
+val tools = listOf(
+    ToolDef(
+        name = "get_weather",
+        description = "Get the current weather for a city",
+        parametersJson = """{"type":"object",
+            "properties":{"city":{"type":"string"}},"required":["city"]}""",
+    )
+)
+val format = engine.toolFormat() ?: ToolFormat.LFM2_PYTHONIC
+val toolsPrompt = engine.applyChatTemplateWithTools(
+    messages = listOf(ChatMessage(role = "user", content = "Weather in Paris?")),
+    tools = tools,
+    addGenerationPrompt = true,
+)
+val session = engine.newSession(SessionConfig.default())
+session.appendText(toolsPrompt)
+// Optional: constrain to a valid call via grammar + lazy trigger.
+val opts = GenerateOpts.default()
+engine.toolCallStartToken(format)?.let { trigger ->
+    opts.grammar = toolGrammar(tools, format)      // GBNF string
+    opts.grammarTriggerTokens = listOf(trigger)
+}
+val reply = engine.decodeTokens(session.generate(opts).tokens)
+for (call in parseToolCalls(reply, format)) {
+    println("${call.name}(${call.argumentsJson})")
+}
 ```
 
 ### Swift example
@@ -718,6 +752,33 @@ if engine.hasChatTemplate() {
     let out = try session.generate(opts: GenerateOpts.default())
     let replyText = engine.decodeTokens(tokens: out.tokens)
     print("Assistant: \(replyText)")
+}
+
+// Tool calling: render tools into the prompt, then parse calls from the reply.
+let tools = [
+    ToolDef(
+        name: "get_weather",
+        description: "Get the current weather for a city",
+        parametersJson: #"{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}"#
+    )
+]
+let format = engine.toolFormat() ?? .lfm2Pythonic
+let toolsPrompt = try engine.applyChatTemplateWithTools(
+    messages: [ChatMessage(role: "user", content: "Weather in Paris?")],
+    tools: tools,
+    addGenerationPrompt: true
+)
+let toolSession = try engine.newSession(config: SessionConfig.default())
+try toolSession.appendText(text: toolsPrompt)
+// Optional: constrain to a valid call via grammar + lazy trigger.
+var opts = GenerateOpts.default()
+if let trigger = engine.toolCallStartToken(format: format) {
+    opts.grammar = try toolGrammar(tools: tools, format: format)   // GBNF string
+    opts.grammarTriggerTokens = [trigger]
+}
+let reply = engine.decodeTokens(tokens: try toolSession.generate(opts: opts).tokens)
+for call in try parseToolCalls(text: reply, format: format) {
+    print("\(call.name)(\(call.argumentsJson))")
 }
 ```
 

@@ -328,8 +328,8 @@ decode step masks logits to only grammar-accepted tokens. Supports bounded
 repetition `{n,m}` (#196) and is exposed over both FFI (`GenerateOpts.grammar`
 source text) and WASM (`setGrammar`/`clearGrammar`/`hasGrammar`) (#198).
 Byte-level v1: non-ASCII / multi-byte ranges inside char classes are not yet
-supported. JSON-schema→grammar compiler and async FSM-mask overlap remain future
-enhancements.
+supported. The JSON-schema→grammar compiler landed with tool calling (see V2.15);
+async FSM-mask overlap remains a future enhancement.
 
 ### V2.4: KV Cache Serialization — 1-2 weeks ⬜
 Serialize KV cache + conv buffers to .lmkv files, system prompt caching, conversation checkpointing, KV quantization for storage.
@@ -375,6 +375,18 @@ PyO3 bindings, `pip install cera-engine`.
 
 ### V2.14: Kotlin Multiplatform Bindings — 2-3 weeks ✅ DONE
 C ABI via cbindgen + platform-native FFI per KMP target (cinterop, Panama FFM, PanamaPort, JS interop).
+
+### V2.15: Tool Calling — ✅ DONE
+Format-aware tool/function calling (`cera/src/tools.rs`): tool schemas rendered
+into the chat template (`apply_chat_template_with_tools`), and tool calls parsed
+from the reply for both LFM2 **Pythonic** (`[get_weather(city="Paris")]`) and
+Hermes/Qwen **JSON** (`<tool_call>{…}</tool_call>`) — `ToolFormat::detect` picks
+the format from the GGUF architecture. Includes the JSON-schema→GBNF compiler
+noted as a future enhancement under V2.3: `tool_grammar` constrains the call
+(valid function name, argument names, and value types) and a **lazy grammar
+trigger** (`GenerateOpts.grammar_trigger_tokens`) keeps generation free until the
+model starts a call. Exposed across CLI (`--tools` / `--constrain-tools`), FFI
+(Kotlin/Swift), WASM, and Dart. PR #239.
 
 ### V2.17: Flutter / Dart Bindings — 2-3 weeks 🟡 (sync + async + streaming working; only `fromBundleIdAsync` stubbed)
 Expose the engine to Flutter/Dart, reusing the existing `cera-ffi` UniFFI

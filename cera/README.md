@@ -112,6 +112,47 @@ let engine = CeraEngine::from_bundle_id("LFM2.5-1.2B-Instruct-GGUF", "Q4_0", cfg
 `top_k == 1`) selects deterministic greedy decoding; otherwise sampling is
 stochastic. Min-p and repetition penalty apply on the stochastic path only.
 
+## Tool calling
+
+`cera::tools` renders tool schemas into the chat template and parses tool calls
+back out, format-aware: `ToolFormat::detect(arch)` picks Pythonic (LFM2) vs
+Hermes JSON (Qwen2.5/Qwen3) from the GGUF architecture.
+
+```rust
+use cera::tools::{ToolDef, ToolFormat, tool_grammar, parse_tool_calls};
+use cera::tokenizer::apply_chat_template_with_tools;
+
+let tools = vec![ToolDef {
+    name: "get_weather".into(),
+    description: Some("Get the current weather for a city".into()),
+    parameters: serde_json::json!({
+        "type": "object",
+        "properties": { "city": { "type": "string" } },
+        "required": ["city"],
+    }),
+}];
+let format = ToolFormat::detect(&engine.model().config().architecture)
+    .unwrap_or(ToolFormat::Lfm2Pythonic);
+
+// Render tools into the prompt.
+let prompt = apply_chat_template_with_tools(engine.tokenizer(), &messages, &tools, true)?;
+session.append_text(&prompt)?;
+
+// Optional: constrain to a valid call via grammar + lazy start-marker trigger.
+let mut opts = GenerateOpts::default();
+if let Some(trigger) = engine.tokenizer().special_token_id(format.call_start_marker()) {
+    opts.grammar = Some(Arc::new(Grammar::parse(&tool_grammar(&tools, format)?)?));
+    opts.grammar_trigger_tokens = vec![trigger];
+}
+
+// After generating, parse the reply. `ToolCall { name, arguments }`.
+let calls = parse_tool_calls(&reply_text, format)?; // empty vec == answered in prose
+```
+
+The constrained path guarantees a well-formed call (valid function name, valid
+argument names, correctly-typed values via JSON-Schema → GBNF); without it the
+model decides freely whether and how to call a tool.
+
 ## LoRA adapters & hidden states
 
 Load a LoRA adapter — a llama.cpp GGUF (from `convert_lora_to_gguf`) or a PEFT
