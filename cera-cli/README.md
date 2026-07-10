@@ -81,11 +81,12 @@ Run `cera <command> --help` for the full flag list. Common `run` flags:
 passes an array of OpenAI-style function schemas (rendered into the chat
 template; the reply's tool calls are parsed to a JSON array on stdout), and
 `--constrain-tools` (requires `--tools`) forces a well-formed, correctly-typed
-call via a grammar + lazy trigger. `run`, `chat`, and `embed` all accept `--lora
-<PATH>` (a llama.cpp `.gguf` or PEFT `.safetensors` adapter); it applies to every
-forward pass — generation and hidden-state extraction alike. For a PEFT
-`.safetensors` adapter whose `alpha` differs from its rank, pass `--lora-alpha
-<ALPHA>` (`scale = alpha / rank`; `.gguf` adapters carry alpha in their metadata).
+call via a grammar + lazy trigger. `run`, `chat`, and `embed` all accept
+`--lora <PATH>` (a llama.cpp `.gguf` or PEFT `.safetensors` adapter); it applies
+to every forward pass — generation and hidden-state extraction alike. For a PEFT
+`.safetensors` adapter whose `alpha` differs from its rank, pass
+`--lora-alpha <ALPHA>` (`scale = alpha / rank`; `.gguf` adapters carry alpha in
+their metadata).
 
 ## License
 
