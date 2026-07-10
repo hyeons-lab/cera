@@ -2777,8 +2777,7 @@ mod tests {
         let ffi = ToolDef {
             name: "get_weather".into(),
             description: Some("weather".into()),
-            parameters_json: r#"{"type":"object","properties":{"city":{"type":"string"}}}"#
-                .into(),
+            parameters_json: r#"{"type":"object","properties":{"city":{"type":"string"}}}"#.into(),
         };
         let core: cera::tools::ToolDef = ffi.try_into().expect("valid schema");
         assert_eq!(core.name, "get_weather");
@@ -2821,8 +2820,7 @@ mod tests {
         let tools = vec![ToolDef {
             name: "get_weather".into(),
             description: None,
-            parameters_json: r#"{"type":"object","properties":{"city":{"type":"string"}}}"#
-                .into(),
+            parameters_json: r#"{"type":"object","properties":{"city":{"type":"string"}}}"#.into(),
         }];
         let gbnf = tool_grammar(tools, ToolFormat::Lfm2Pythonic).expect("grammar");
         assert!(cera::grammar::Grammar::parse(&gbnf).is_ok());
@@ -2830,7 +2828,10 @@ mod tests {
 
     #[test]
     fn detect_tool_format_ffi() {
-        assert_eq!(detect_tool_format("lfm2".into()), Some(ToolFormat::Lfm2Pythonic));
+        assert_eq!(
+            detect_tool_format("lfm2".into()),
+            Some(ToolFormat::Lfm2Pythonic)
+        );
         assert_eq!(detect_tool_format("qwen3".into()), Some(ToolFormat::Hermes));
         assert_eq!(detect_tool_format("gpt2".into()), None);
     }

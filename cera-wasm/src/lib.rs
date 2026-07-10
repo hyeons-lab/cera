@@ -37,13 +37,33 @@ pub use wasm_bindgen_rayon::init_thread_pool;
 const TS_APPEND: &'static str = r#"
 /**
  * One entry in the chat-message array passed to
- * `Tokenizer.applyChatTemplate`. Mirrors the OpenAI / Anthropic
- * SDK shape — cera currently models only `role` and `content`;
- * tool-calls / function-calls are not yet supported.
+ * `Tokenizer.applyChatTemplate` / `applyChatTemplateWithTools`.
+ * Mirrors the OpenAI / Anthropic SDK shape. For tool results, use
+ * `role: "tool"` with the JSON result string as `content`.
  */
 export interface ChatMessage {
     role: string;
     content: string;
+}
+
+/**
+ * A tool the model may call, in the OpenAI "function" shape. Pass an
+ * array of these (JSON-stringified) to `applyChatTemplateWithTools`
+ * and `toolGrammar`. `parameters` is a JSON Schema object for the
+ * arguments.
+ */
+export interface ToolDef {
+    name: string;
+    description?: string;
+    parameters?: object;
+}
+
+/**
+ * A tool call parsed from model output by `parseToolCalls`.
+ */
+export interface ToolCall {
+    name: string;
+    arguments: object;
 }
 "#;
 
@@ -541,6 +561,83 @@ impl Tokenizer {
         )
         .map_err(map_err)
     }
+
+    /// Like `applyChatTemplate`, but also injects a `tools` array so a
+    /// tool-trained model renders its tool-definition block. `toolsJson` is a
+    /// JSON string encoding an array of `ToolDef` (`[{name, description?,
+    /// parameters?}]`). Throws on invalid `toolsJson` or a render failure.
+    #[wasm_bindgen(js_name = applyChatTemplateWithTools)]
+    pub fn apply_chat_template_with_tools(
+        &self,
+        messages: ChatMessageArray,
+        tools_json: &str,
+        add_generation_prompt: Option<bool>,
+    ) -> Result<String, JsError> {
+        let msgs = parse_chat_messages(messages.as_ref())?;
+        let tools = parse_tool_defs(tools_json)?;
+        cera::tokenizer::apply_chat_template_with_tools(
+            &self.inner,
+            &msgs,
+            &tools,
+            add_generation_prompt.unwrap_or(true),
+        )
+        .map_err(map_err)
+    }
+}
+
+/// The tool-call wire format a model family uses. Get one from
+/// `detectToolFormat(architecture)` or choose explicitly.
+#[wasm_bindgen]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ToolFormat {
+    /// LFM2 / LFM2.5: Pythonic `[get_weather(city="Paris")]`.
+    Lfm2Pythonic,
+    /// Hermes / Qwen: JSON `{"name":…,"arguments":{…}}`.
+    Hermes,
+}
+
+impl From<ToolFormat> for cera::tools::ToolFormat {
+    fn from(f: ToolFormat) -> Self {
+        match f {
+            ToolFormat::Lfm2Pythonic => cera::tools::ToolFormat::Lfm2Pythonic,
+            ToolFormat::Hermes => cera::tools::ToolFormat::Hermes,
+        }
+    }
+}
+
+/// Detect the tool-call format for a model architecture string (`"lfm2"`,
+/// `"qwen3"`, …). Returns `undefined` for architectures with no known
+/// convention.
+#[wasm_bindgen(js_name = detectToolFormat)]
+pub fn detect_tool_format(architecture: &str) -> Option<ToolFormat> {
+    cera::tools::ToolFormat::detect(architecture).map(|f| match f {
+        cera::tools::ToolFormat::Lfm2Pythonic => ToolFormat::Lfm2Pythonic,
+        cera::tools::ToolFormat::Hermes => ToolFormat::Hermes,
+    })
+}
+
+/// Parse tool calls out of generated model text. Returns a JSON string
+/// encoding an array of `ToolCall` (`[{name, arguments}]`) — `JSON.parse` it.
+/// An empty array means the reply had no tool call.
+#[wasm_bindgen(js_name = parseToolCalls)]
+pub fn parse_tool_calls(text: &str, format: ToolFormat) -> Result<String, JsError> {
+    let calls = cera::tools::parse_tool_calls(text, format.into()).map_err(map_err)?;
+    serde_json::to_string(&calls).map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Build a GBNF grammar constraining output to a valid call for one of the
+/// tools in `toolsJson` (a JSON array of `ToolDef`). Feed the result to
+/// `Session.setGrammar` and set `GenerateOpts.grammarTriggerTokens` for a lazy
+/// tool-call trigger.
+#[wasm_bindgen(js_name = toolGrammar)]
+pub fn tool_grammar(tools_json: &str, format: ToolFormat) -> Result<String, JsError> {
+    let tools = parse_tool_defs(tools_json)?;
+    cera::tools::tool_grammar(&tools, format.into()).map_err(map_err)
+}
+
+/// Parse a JSON array of `ToolDef` into the cera core type.
+fn parse_tool_defs(tools_json: &str) -> Result<Vec<cera::tools::ToolDef>, JsError> {
+    serde_json::from_str(tools_json).map_err(|e| JsError::new(&format!("invalid tools JSON: {e}")))
 }
 
 /// Parse a JS-side `[{ role, content }, ...]` array into the cera
@@ -892,6 +989,21 @@ impl GenerateOpts {
     #[wasm_bindgen(setter, js_name = stopTokens)]
     pub fn set_stop_tokens(&mut self, v: Vec<u32>) {
         self.inner.stop_tokens = v;
+    }
+
+    /// Lazy-grammar trigger token IDs (tool calling). When non-empty and a
+    /// grammar is set (`Session.setGrammar`), the grammar stays inactive until
+    /// the model emits one of these tokens (e.g. the tool-call start marker
+    /// from `Tokenizer.specialTokenId`), then constrains the call and
+    /// deactivates on completion. Empty (default) → the grammar is active from
+    /// the first token.
+    #[wasm_bindgen(getter, js_name = grammarTriggerTokens)]
+    pub fn grammar_trigger_tokens(&self) -> Vec<u32> {
+        self.inner.grammar_trigger_tokens.clone()
+    }
+    #[wasm_bindgen(setter, js_name = grammarTriggerTokens)]
+    pub fn set_grammar_trigger_tokens(&mut self, v: Vec<u32>) {
+        self.inner.grammar_trigger_tokens = v;
     }
 
     #[wasm_bindgen(getter, js_name = flushEveryTokens)]
