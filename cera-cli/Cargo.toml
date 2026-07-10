@@ -21,6 +21,8 @@ path = "src/main.rs"
 cera = { path = "../cera", version = "0.2.6", features = ["remote"] }
 anyhow.workspace = true
 clap.workspace = true
+# `--tools` parses tool schemas from JSON and prints parsed tool calls as JSON.
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 # `/image` and `--image` accept `http(s)://` URLs in addition to filesystem

@@ -229,6 +229,20 @@ enum Command {
         #[arg(long, conflicts_with = "grammar")]
         json: bool,
 
+        /// Enable tool calling. Pass an inline JSON array of tool schemas
+        /// (OpenAI "function" shape: `[{"name":..,"description":..,
+        /// "parameters":{JSON Schema}}]`), or `@path/to/tools.json` to read it
+        /// from a file. The tools are rendered into the model's chat template
+        /// and any tool call in the reply is parsed and printed.
+        #[arg(long)]
+        tools: Option<String>,
+
+        /// With `--tools`, constrain the reply to a valid tool call for the
+        /// declared tools (grammar + lazy trigger). Off by default: the model
+        /// decides freely whether/how to call a tool.
+        #[arg(long, requires = "tools")]
+        constrain_tools: bool,
+
         /// Device to use: cpu, gpu, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
@@ -1641,6 +1655,8 @@ fn main() -> Result<()> {
             temperature,
             grammar,
             json,
+            tools,
+            constrain_tools,
             device,
             token_ids,
             context_size,
@@ -1683,6 +1699,23 @@ fn main() -> Result<()> {
                     )),
                     None => None,
                 }
+            };
+
+            // Parse `--tools` up front (fail fast, before weights load). Accepts
+            // an inline JSON array or `@path/to/tools.json`.
+            let tool_defs: Vec<cera::tools::ToolDef> = match &tools {
+                Some(spec) => {
+                    let raw = match spec.strip_prefix('@') {
+                        Some(path) => std::fs::read_to_string(path)
+                            .with_context(|| format!("reading tools file `{path}`"))?,
+                        None => spec.clone(),
+                    };
+                    serde_json::from_str(&raw).context(
+                        "parsing --tools JSON (expected an array of \
+                         {name, description?, parameters} objects)",
+                    )?
+                }
+                None => Vec::new(),
             };
 
             // Resolve `--image` arguments BEFORE engine load so a missing
@@ -1992,7 +2025,31 @@ fn main() -> Result<()> {
 
             // Build token sequence.
             let mut tokens = Vec::new();
-            if system.is_some() || vocoder.is_some() {
+            if !tool_defs.is_empty() {
+                // Tool calling: render the chat template with a `tools` array so
+                // the model's tool-definition block appears. `--system` is
+                // honored as a leading system turn if given.
+                let mut messages = Vec::new();
+                if let Some(sys) = system.as_deref() {
+                    messages.push(cera::tokenizer::ChatMessage {
+                        role: "system".into(),
+                        content: sys.into(),
+                    });
+                }
+                messages.push(cera::tokenizer::ChatMessage {
+                    role: "user".into(),
+                    content: prompt.clone(),
+                });
+                let formatted = cera::tokenizer::apply_chat_template_with_tools(
+                    tokenizer, &messages, &tool_defs, true,
+                )?;
+                eprintln!(
+                    "Chat template applied with {} tool(s) ({} chars)",
+                    tool_defs.len(),
+                    formatted.len()
+                );
+                tokens = tokenizer.encode(&formatted);
+            } else if system.is_some() || vocoder.is_some() {
                 // Use chat template when --system or --vocoder is set.
                 anyhow::ensure!(
                     system.is_some(),
@@ -2197,15 +2254,51 @@ fn main() -> Result<()> {
                 session.append_tokens(&tokens)?;
                 let prefill_elapsed = prefill_start.elapsed();
 
+                // Tool calling: pick the wire format for this model and, when
+                // `--constrain-tools` is set, compile the tool grammar + resolve
+                // the lazy start-marker trigger. Otherwise fall back to any
+                // `--grammar`/`--json` grammar.
+                let tool_format = (!tool_defs.is_empty()).then(|| {
+                    cera::tools::ToolFormat::detect(&engine.model().config().architecture)
+                        .unwrap_or(cera::tools::ToolFormat::Lfm2Pythonic)
+                });
+                let (effective_grammar, trigger_tokens) =
+                    if constrain_tools && let Some(fmt) = tool_format {
+                        let gbnf = cera::tools::tool_grammar(&tool_defs, fmt)?;
+                        let g = std::sync::Arc::new(
+                            cera::grammar::Grammar::parse(&gbnf)
+                                .context("compiling generated tool grammar")?,
+                        );
+                        let trig = tokenizer
+                            .special_token_id(fmt.call_start_marker())
+                            .map(|t| vec![t])
+                            .unwrap_or_default();
+                        (Some(g), trig)
+                    } else {
+                        (grammar_compiled.clone(), Vec::new())
+                    };
+
                 let opts = cera::GenerateOpts {
                     max_tokens: max_tokens as u32,
                     temperature,
-                    grammar: grammar_compiled.clone(),
+                    grammar: effective_grammar,
+                    grammar_trigger_tokens: trigger_tokens,
                     ..Default::default()
                 };
 
-                let mut sink = StdoutSink::new(tokenizer, session.cancel_handle());
-                let summary = session.generate(&opts, &mut sink)?;
+                // With tools, collect the reply (ChatSink streams + buffers) so
+                // tool calls can be parsed out afterward.
+                let summary;
+                let reply_text;
+                if tool_format.is_some() {
+                    let mut sink = ChatSink::new(tokenizer, session.cancel_handle());
+                    summary = session.generate(&opts, &mut sink)?;
+                    reply_text = Some(sink.into_text());
+                } else {
+                    let mut sink = StdoutSink::new(tokenizer, session.cancel_handle());
+                    summary = session.generate(&opts, &mut sink)?;
+                    reply_text = None;
+                }
 
                 let prefill_tps = if prefill_elapsed.as_secs_f64() > 0.0 {
                     tokens.len() as f64 / prefill_elapsed.as_secs_f64()
@@ -2224,6 +2317,28 @@ fn main() -> Result<()> {
                 eprintln!("Generated tokens: {}", summary.tokens_generated);
                 eprintln!("Prefill: {:.1} tok/s", prefill_tps);
                 eprintln!("Decode: {:.1} tok/s", decode_tps);
+
+                // Parse and report any tool calls in the reply.
+                if let (Some(fmt), Some(text)) = (tool_format, reply_text) {
+                    match cera::tools::parse_tool_calls(&text, fmt) {
+                        Ok(calls) if !calls.is_empty() => {
+                            eprintln!("---");
+                            eprintln!("Tool calls ({}):", calls.len());
+                            for (i, c) in calls.iter().enumerate() {
+                                let args = serde_json::to_string(&c.arguments)
+                                    .unwrap_or_else(|_| "<unserializable>".into());
+                                eprintln!("  [{i}] {}({args})", c.name);
+                            }
+                            // Machine-readable form on stdout.
+                            println!(
+                                "{}",
+                                serde_json::to_string(&calls).unwrap_or_else(|_| "[]".into())
+                            );
+                        }
+                        Ok(_) => eprintln!("--- (no tool calls in reply)"),
+                        Err(e) => eprintln!("--- tool-call parse error: {e:#}"),
+                    }
+                }
             }
         }
         Command::Inspect { model } => {
