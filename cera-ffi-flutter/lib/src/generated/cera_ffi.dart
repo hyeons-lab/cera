@@ -252,6 +252,17 @@ class GenerateOpts {
     required this.repetitionPenalty,
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     required this.stopTokens,
+    /// Optional GBNF grammar **source text** constraining the output (e.g. a
+    /// JSON grammar). When absent (the default), decoding is unconstrained. The
+    /// grammar is compiled on the Rust side when generation starts; a malformed
+    /// grammar is reported as a `GrammarParse` error.
+    required this.grammar,
+    /// Lazy-grammar trigger token ids (tool calling). When non-empty and
+    /// `grammar` is set, the grammar stays inactive until the model emits one
+    /// of these tokens (e.g. the tool-call start marker from
+    /// [`CeraEngine::tool_call_start_token`]), then constrains the call and
+    /// deactivates on completion. Empty → `grammar` is active from the start.
+    required this.grammarTriggerTokens,
     /// Ignored under synchronous generate; reserved for streaming.
     required this.flushEveryTokens,
     /// Ignored under synchronous generate; reserved for streaming.
@@ -270,6 +281,17 @@ class GenerateOpts {
   final double repetitionPenalty;
   /// Early-stop IDs (EOS / instruction markers / end-of-turn).
   final List<int> stopTokens;
+  /// Optional GBNF grammar **source text** constraining the output (e.g. a
+  /// JSON grammar). When absent (the default), decoding is unconstrained. The
+  /// grammar is compiled on the Rust side when generation starts; a malformed
+  /// grammar is reported as a `GrammarParse` error.
+  final String? grammar;
+  /// Lazy-grammar trigger token ids (tool calling). When non-empty and
+  /// `grammar` is set, the grammar stays inactive until the model emits one
+  /// of these tokens (e.g. the tool-call start marker from
+  /// [`CeraEngine::tool_call_start_token`]), then constrains the call and
+  /// deactivates on completion. Empty → `grammar` is active from the start.
+  final List<int> grammarTriggerTokens;
   /// Ignored under synchronous generate; reserved for streaming.
   final int flushEveryTokens;
   /// Ignored under synchronous generate; reserved for streaming.
@@ -284,6 +306,8 @@ class GenerateOpts {
       'minP': this.minP,
       'repetitionPenalty': this.repetitionPenalty,
       'stopTokens': this.stopTokens,
+      'grammar': this.grammar,
+      'grammarTriggerTokens': this.grammarTriggerTokens,
       'flushEveryTokens': this.flushEveryTokens,
       'flushEveryMs': this.flushEveryMs,
     };
@@ -298,6 +322,8 @@ class GenerateOpts {
       minP: (json['minP'] as num).toDouble(),
       repetitionPenalty: (json['repetitionPenalty'] as num).toDouble(),
       stopTokens: (json['stopTokens'] as List).map((item) => (item as num).toInt()).toList(),
+      grammar: json['grammar'] == null ? null : json['grammar'] as String,
+      grammarTriggerTokens: (json['grammarTriggerTokens'] as List).map((item) => (item as num).toInt()).toList(),
       flushEveryTokens: (json['flushEveryTokens'] as num).toInt(),
       flushEveryMs: (json['flushEveryMs'] as num).toInt(),
     );
@@ -311,6 +337,8 @@ class GenerateOpts {
     double? minP,
     double? repetitionPenalty,
     List<int>? stopTokens,
+    Object? grammar = _sentinel,
+    List<int>? grammarTriggerTokens,
     int? flushEveryTokens,
     int? flushEveryMs,
   }) {
@@ -322,6 +350,8 @@ class GenerateOpts {
       minP: minP ?? this.minP,
       repetitionPenalty: repetitionPenalty ?? this.repetitionPenalty,
       stopTokens: stopTokens ?? this.stopTokens,
+      grammar: grammar == _sentinel ? this.grammar : grammar as String?,
+      grammarTriggerTokens: grammarTriggerTokens ?? this.grammarTriggerTokens,
       flushEveryTokens: flushEveryTokens ?? this.flushEveryTokens,
       flushEveryMs: flushEveryMs ?? this.flushEveryMs,
     );
@@ -329,16 +359,16 @@ class GenerateOpts {
 
   @override
   String toString() {
-    return 'GenerateOpts(maxTokens: $maxTokens, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs)';
+    return 'GenerateOpts(maxTokens: $maxTokens, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, grammar: $grammar, grammarTriggerTokens: $grammarTriggerTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is GenerateOpts && maxTokens == other.maxTokens && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs;
+      other is GenerateOpts && maxTokens == other.maxTokens && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && grammar == other.grammar && grammarTriggerTokens == other.grammarTriggerTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs;
 
   @override
-  int get hashCode => Object.hash(maxTokens, temperature, topP, topK, minP, repetitionPenalty, stopTokens, flushEveryTokens, flushEveryMs);
+  int get hashCode => Object.hash(maxTokens, temperature, topP, topK, minP, repetitionPenalty, stopTokens, grammar, grammarTriggerTokens, flushEveryTokens, flushEveryMs);
 }
 
 /// Bundle of everything a synchronous `generate` call produces:
@@ -705,6 +735,122 @@ class SessionConfig {
   int get hashCode => Object.hash(maxSeqLen, kvCompression, nKeep, seed, ubatchSize);
 }
 
+/// A tool call parsed from model output. Mirrors [`cera::tools::ToolCall`];
+/// `arguments_json` is the call's arguments encoded as a JSON string.
+class ToolCall {
+  const ToolCall({
+    required this.name,
+    /// The call's arguments as a JSON string — normally an object
+    /// (e.g. `{"city":"Paris"}`), but a malformed Hermes/Qwen reply may pass
+    /// through a non-object value, so decode defensively.
+    required this.argumentsJson,
+  });
+
+  final String name;
+  /// The call's arguments as a JSON string — normally an object
+  /// (e.g. `{"city":"Paris"}`), but a malformed Hermes/Qwen reply may pass
+  /// through a non-object value, so decode defensively.
+  final String argumentsJson;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'name': this.name,
+      'argumentsJson': this.argumentsJson,
+    };
+  }
+
+  factory ToolCall.fromJson(Map<String, dynamic> json) {
+    return ToolCall(
+      name: json['name'] as String,
+      argumentsJson: json['argumentsJson'] as String,
+    );
+  }
+
+  ToolCall copyWith({
+    String? name,
+    String? argumentsJson,
+  }) {
+    return ToolCall(
+      name: name ?? this.name,
+      argumentsJson: argumentsJson ?? this.argumentsJson,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'ToolCall(name: $name, argumentsJson: $argumentsJson)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ToolCall && name == other.name && argumentsJson == other.argumentsJson;
+
+  @override
+  int get hashCode => Object.hash(name, argumentsJson);
+}
+
+/// A tool the model may call. Mirrors [`cera::tools::ToolDef`], but the
+/// JSON Schema for the arguments crosses the boundary as a JSON **string**
+/// (`parameters_json`) since UniFFI has no arbitrary-JSON type. An empty
+/// `parameters_json` means "no parameters".
+class ToolDef {
+  const ToolDef({
+    required this.name,
+    required this.description,
+    /// JSON Schema object for the arguments, as a JSON string (e.g.
+    /// `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
+    required this.parametersJson,
+  });
+
+  final String name;
+  final String? description;
+  /// JSON Schema object for the arguments, as a JSON string (e.g.
+  /// `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
+  final String parametersJson;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'name': this.name,
+      'description': this.description,
+      'parametersJson': this.parametersJson,
+    };
+  }
+
+  factory ToolDef.fromJson(Map<String, dynamic> json) {
+    return ToolDef(
+      name: json['name'] as String,
+      description: json['description'] == null ? null : json['description'] as String,
+      parametersJson: json['parametersJson'] as String,
+    );
+  }
+
+  ToolDef copyWith({
+    String? name,
+    Object? description = _sentinel,
+    String? parametersJson,
+  }) {
+    return ToolDef(
+      name: name ?? this.name,
+      description: description == _sentinel ? this.description : description as String?,
+      parametersJson: parametersJson ?? this.parametersJson,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'ToolDef(name: $name, description: $description, parametersJson: $parametersJson)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ToolDef && name == other.name && description == other.description && parametersJson == other.parametersJson;
+
+  @override
+  int get hashCode => Object.hash(name, description, parametersJson);
+}
+
 /// Compute-backend selector. Mirrors [`cera::BackendPreference`];
 /// kept as a separate type so the `cera` crate doesn't carry UniFFI
 /// annotations.
@@ -950,6 +1096,104 @@ final class FfiErrorBackend extends FfiError {
   int get hashCode => detail.hashCode;
 }
 
+/// The GBNF grammar string passed in `GenerateOpts.grammar` failed to
+/// compile. Grammar compilation happens in the FFI wrapper (the compiled
+/// grammar object can't cross the boundary, so callers pass the source text
+/// and it's parsed here). `detail` carries the parser's diagnostic.
+final class FfiErrorGrammarParse extends FfiError {
+  const FfiErrorGrammarParse({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'FfiErrorGrammarParse(detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiErrorGrammarParse && detail == other.detail;
+
+  @override
+  int get hashCode => detail.hashCode;
+}
+
+/// A token id passed to `hidden_states_for_tokens` (or another
+/// token-taking method) was `>= vocab_size`. Returned as a typed error
+/// rather than tripping the model-layer `assert!` (whose panic would
+/// unwind through the held session lock and poison it). Mirrors
+/// `cera::CeraError::InvalidToken`.
+final class FfiErrorInvalidToken extends FfiError {
+  const FfiErrorInvalidToken({
+    required this.id,
+    required this.vocabSize,
+  });
+  final int id;
+  final int vocabSize;
+
+  @override
+  String toString() {
+    return 'FfiErrorInvalidToken(id: $id, vocabSize: $vocabSize)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiErrorInvalidToken && id == other.id && vocabSize == other.vocabSize;
+
+  @override
+  int get hashCode => Object.hash(id, vocabSize);
+}
+
+/// A LoRA adapter failed to load ([`LoraAdapters::from_gguf`] /
+/// [`LoraAdapters::from_safetensors`]) or was incompatible with the model at
+/// attach time (wrong dimensions). `detail` carries the diagnostic.
+final class FfiErrorLoraParse extends FfiError {
+  const FfiErrorLoraParse({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'FfiErrorLoraParse(detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiErrorLoraParse && detail == other.detail;
+
+  @override
+  int get hashCode => detail.hashCode;
+}
+
+/// A large model/KV allocation could not be satisfied — the device is out of
+/// memory for this model at this context size. Returned instead of aborting
+/// the process, so a caller can fall back (smaller model or context) or
+/// surface a clean error. Mirrors `cera::CeraError::OutOfMemory`.
+final class FfiErrorOutOfMemory extends FfiError {
+  const FfiErrorOutOfMemory({
+    required this.requestedBytes,
+  });
+  final int requestedBytes;
+
+  @override
+  String toString() {
+    return 'FfiErrorOutOfMemory(requestedBytes: $requestedBytes)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiErrorOutOfMemory && requestedBytes == other.requestedBytes;
+
+  @override
+  int get hashCode => requestedBytes.hashCode;
+}
+
 /// Why a decode loop exited. Mirrors [`cera::FinishReason`].
 sealed class FinishReason {
   const FinishReason();
@@ -1018,6 +1262,26 @@ final class FinishReasonContextFull extends FinishReason {
   bool operator ==(Object other) =>
       identical(this, other) ||
       other is FinishReasonContextFull;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+/// A grammar constraint left no token allowed at this step — decoding
+/// stopped because the grammar dead-ended. Only reachable when
+/// `GenerateOpts.grammar` is set.
+final class FinishReasonGrammarDeadEnd extends FinishReason {
+  const FinishReasonGrammarDeadEnd();
+
+  @override
+  String toString() {
+    return 'FinishReasonGrammarDeadEnd()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FinishReasonGrammarDeadEnd;
 
   @override
   int get hashCode => runtimeType.hashCode;
@@ -1094,6 +1358,19 @@ final class KvCompressionTurboQuant extends KvCompression {
 
   @override
   int get hashCode => Object.hash(seed, keys, values);
+}
+
+/// The tool-call wire format a model family uses. Mirrors
+/// [`cera::tools::ToolFormat`]. Get one from
+/// [`CeraEngine::tool_format`] (auto-detected from the model) or set it
+/// explicitly.
+enum ToolFormat {
+  /// LFM2 / LFM2.5: Pythonic `[get_weather(city="Paris")]` in
+  /// `<|tool_call_start|>…<|tool_call_end|>`.
+  lfm2Pythonic,
+  /// Hermes / Qwen: JSON `{"name":…,"arguments":{…}}` in
+  /// `<tool_call>…</tool_call>`.
+  hermes,
 }
 
 /// Typed error surface for `cera-ffi`. Mirrors [`cera::CeraError`] one-
@@ -1264,6 +1541,72 @@ final class FfiErrorExceptionBackend extends FfiErrorException {
   }
 }
 
+/// The GBNF grammar string passed in `GenerateOpts.grammar` failed to
+/// compile. Grammar compilation happens in the FFI wrapper (the compiled
+/// grammar object can't cross the boundary, so callers pass the source text
+/// and it's parsed here). `detail` carries the parser's diagnostic.
+final class FfiErrorExceptionGrammarParse extends FfiErrorException {
+  const FfiErrorExceptionGrammarParse({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'FfiErrorExceptionGrammarParse(detail: $detail)';
+  }
+}
+
+/// A token id passed to `hidden_states_for_tokens` (or another
+/// token-taking method) was `>= vocab_size`. Returned as a typed error
+/// rather than tripping the model-layer `assert!` (whose panic would
+/// unwind through the held session lock and poison it). Mirrors
+/// `cera::CeraError::InvalidToken`.
+final class FfiErrorExceptionInvalidToken extends FfiErrorException {
+  const FfiErrorExceptionInvalidToken({
+    required this.id,
+    required this.vocabSize,
+  });
+  final int id;
+  final int vocabSize;
+
+  @override
+  String toString() {
+    return 'FfiErrorExceptionInvalidToken(id: $id, vocabSize: $vocabSize)';
+  }
+}
+
+/// A LoRA adapter failed to load ([`LoraAdapters::from_gguf`] /
+/// [`LoraAdapters::from_safetensors`]) or was incompatible with the model at
+/// attach time (wrong dimensions). `detail` carries the diagnostic.
+final class FfiErrorExceptionLoraParse extends FfiErrorException {
+  const FfiErrorExceptionLoraParse({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'FfiErrorExceptionLoraParse(detail: $detail)';
+  }
+}
+
+/// A large model/KV allocation could not be satisfied — the device is out of
+/// memory for this model at this context size. Returned instead of aborting
+/// the process, so a caller can fall back (smaller model or context) or
+/// surface a clean error. Mirrors `cera::CeraError::OutOfMemory`.
+final class FfiErrorExceptionOutOfMemory extends FfiErrorException {
+  const FfiErrorExceptionOutOfMemory({
+    required this.requestedBytes,
+  });
+  final int requestedBytes;
+
+  @override
+  String toString() {
+    return 'FfiErrorExceptionOutOfMemory(requestedBytes: $requestedBytes)';
+  }
+}
+
 FfiErrorException _uniffiLiftFfiErrorException(Uint8List bytes) {
   final FfiError value = _uniffiDecodeFfiError(bytes);
   if (value is FfiErrorUnsupportedModality) return const FfiErrorExceptionUnsupportedModality();
@@ -1289,6 +1632,27 @@ FfiErrorException _uniffiLiftFfiErrorException(Uint8List bytes) {
   if (value is FfiErrorBackend) {
     return FfiErrorExceptionBackend(
       detail: value.detail,
+    );
+  }
+  if (value is FfiErrorGrammarParse) {
+    return FfiErrorExceptionGrammarParse(
+      detail: value.detail,
+    );
+  }
+  if (value is FfiErrorInvalidToken) {
+    return FfiErrorExceptionInvalidToken(
+      id: value.id,
+      vocabSize: value.vocabSize,
+    );
+  }
+  if (value is FfiErrorLoraParse) {
+    return FfiErrorExceptionLoraParse(
+      detail: value.detail,
+    );
+  }
+  if (value is FfiErrorOutOfMemory) {
+    return FfiErrorExceptionOutOfMemory(
+      requestedBytes: value.requestedBytes,
     );
   }
   throw StateError('Unknown FfiError error variant while lifting exception: $value');
@@ -1359,6 +1723,31 @@ String _encodeFfiError(FfiError value) {
       'detail': value.detail,
     });
   }
+  if (value is FfiErrorGrammarParse) {
+    return jsonEncode({
+      'tag': 'grammarParse',
+      'detail': value.detail,
+    });
+  }
+  if (value is FfiErrorInvalidToken) {
+    return jsonEncode({
+      'tag': 'invalidToken',
+      'id': value.id,
+      'vocabSize': value.vocabSize,
+    });
+  }
+  if (value is FfiErrorLoraParse) {
+    return jsonEncode({
+      'tag': 'loraParse',
+      'detail': value.detail,
+    });
+  }
+  if (value is FfiErrorOutOfMemory) {
+    return jsonEncode({
+      'tag': 'outOfMemory',
+      'requestedBytes': value.requestedBytes,
+    });
+  }
   throw StateError('Unknown FfiError variant instance: $value');
 }
 
@@ -1395,6 +1784,23 @@ FfiError _decodeFfiError(String raw) {
       return FfiErrorBackend(
         detail: map['detail'] as String,
       );
+    case 'grammarParse':
+      return FfiErrorGrammarParse(
+        detail: map['detail'] as String,
+      );
+    case 'invalidToken':
+      return FfiErrorInvalidToken(
+        id: (map['id'] as num).toInt(),
+        vocabSize: (map['vocabSize'] as num).toInt(),
+      );
+    case 'loraParse':
+      return FfiErrorLoraParse(
+        detail: map['detail'] as String,
+      );
+    case 'outOfMemory':
+      return FfiErrorOutOfMemory(
+        requestedBytes: (map['requestedBytes'] as num).toInt(),
+      );
     default:
       throw StateError('Unknown FfiError variant tag: $tag');
   }
@@ -1421,6 +1827,11 @@ String _encodeFinishReason(FinishReason value) {
       'tag': 'contextFull',
     });
   }
+  if (value is FinishReasonGrammarDeadEnd) {
+    return jsonEncode({
+      'tag': 'grammarDeadEnd',
+    });
+  }
   if (value is FinishReasonError) {
     return jsonEncode({
       'tag': 'error',
@@ -1445,6 +1856,9 @@ FinishReason _decodeFinishReason(String raw) {
       );
     case 'contextFull':
       return FinishReasonContextFull(
+      );
+    case 'grammarDeadEnd':
+      return FinishReasonGrammarDeadEnd(
       );
     case 'error':
       return FinishReasonError(
@@ -1488,6 +1902,21 @@ KvCompression _decodeKvCompression(String raw) {
     default:
       throw StateError('Unknown KvCompression variant tag: $tag');
   }
+}
+
+String _encodeToolFormat(ToolFormat value) {
+  return switch (value) {
+    ToolFormat.lfm2Pythonic => 'lfm2Pythonic',
+    ToolFormat.hermes => 'hermes',
+  };
+}
+
+ToolFormat _decodeToolFormat(String raw) {
+  return switch (raw) {
+    'lfm2Pythonic' => ToolFormat.lfm2Pythonic,
+    'hermes' => ToolFormat.hermes,
+    _ => throw StateError('Unknown ToolFormat variant: $raw'),
+  };
 }
 
 String _encodeFfiErrorException(FfiErrorException value) {
@@ -1536,6 +1965,31 @@ String _encodeFfiErrorException(FfiErrorException value) {
       'detail': value.detail,
     });
   }
+  if (value is FfiErrorExceptionGrammarParse) {
+    return jsonEncode({
+      'tag': 'grammarParse',
+      'detail': value.detail,
+    });
+  }
+  if (value is FfiErrorExceptionInvalidToken) {
+    return jsonEncode({
+      'tag': 'invalidToken',
+      'id': value.id,
+      'vocabSize': value.vocabSize,
+    });
+  }
+  if (value is FfiErrorExceptionLoraParse) {
+    return jsonEncode({
+      'tag': 'loraParse',
+      'detail': value.detail,
+    });
+  }
+  if (value is FfiErrorExceptionOutOfMemory) {
+    return jsonEncode({
+      'tag': 'outOfMemory',
+      'requestedBytes': value.requestedBytes,
+    });
+  }
   throw StateError('Unknown FfiErrorException exception instance: $value');
 }
 
@@ -1567,6 +2021,23 @@ FfiErrorException _decodeFfiErrorException(Object? raw) {
     case 'backend':
       return FfiErrorExceptionBackend(
         detail: map['detail'] as String,
+      );
+    case 'grammarParse':
+      return FfiErrorExceptionGrammarParse(
+        detail: map['detail'] as String,
+      );
+    case 'invalidToken':
+      return FfiErrorExceptionInvalidToken(
+        id: (map['id'] as num).toInt(),
+        vocabSize: (map['vocabSize'] as num).toInt(),
+      );
+    case 'loraParse':
+      return FfiErrorExceptionLoraParse(
+        detail: map['detail'] as String,
+      );
+    case 'outOfMemory':
+      return FfiErrorExceptionOutOfMemory(
+        requestedBytes: (map['requestedBytes'] as num).toInt(),
       );
     default:
       throw StateError('Unknown FfiErrorException exception tag: $tag');
@@ -1603,6 +2074,14 @@ final class KvCompressionFfiCodec {
   static String encode(KvCompression value) => _encodeKvCompression(value);
 
   static KvCompression decode(String raw) => _decodeKvCompression(raw);
+}
+
+final class ToolFormatFfiCodec {
+  const ToolFormatFfiCodec._();
+
+  static String encode(ToolFormat value) => _encodeToolFormat(value);
+
+  static ToolFormat decode(String raw) => _decodeToolFormat(raw);
 }
 
 final class FfiErrorExceptionFfiCodec {
@@ -1773,6 +2252,16 @@ void _uniffiWriteGenerateOpts(GenerateOpts value, _UniFfiBinaryWriter writer) {
   for (final item in value.stopTokens) {
     writer.writeU32(item);
   }
+  if (value.grammar == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeString(value.grammar!);
+  }
+  writer.writeI32(value.grammarTriggerTokens.length);
+  for (final item in value.grammarTriggerTokens) {
+    writer.writeU32(item);
+  }
   writer.writeU32(value.flushEveryTokens);
   writer.writeU32(value.flushEveryMs);
 }
@@ -1792,6 +2281,8 @@ GenerateOpts _uniffiReadGenerateOpts(_UniFfiBinaryReader reader) {
     minP: reader.readF32(),
     repetitionPenalty: reader.readF32(),
     stopTokens: (() { final int __len = reader.readI32(); final out = <int>[]; for (var i = 0; i < __len; i++) { out.add(reader.readU32()); } return out; })(),
+    grammar: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readString(); })(),
+    grammarTriggerTokens: (() { final int __len = reader.readI32(); final out = <int>[]; for (var i = 0; i < __len; i++) { out.add(reader.readU32()); } return out; })(),
     flushEveryTokens: reader.readU32(),
     flushEveryMs: reader.readU32(),
   );
@@ -1982,6 +2473,67 @@ SessionConfig _uniffiDecodeSessionConfig(Uint8List bytes) {
   return value;
 }
 
+void _uniffiWriteToolCall(ToolCall value, _UniFfiBinaryWriter writer) {
+  writer.writeString(value.name);
+  writer.writeString(value.argumentsJson);
+}
+
+Uint8List _uniffiEncodeToolCall(ToolCall value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteToolCall(value, writer);
+  return writer.toBytes();
+}
+
+ToolCall _uniffiReadToolCall(_UniFfiBinaryReader reader) {
+  return ToolCall(
+    name: reader.readString(),
+    argumentsJson: reader.readString(),
+  );
+}
+
+ToolCall _uniffiDecodeToolCall(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadToolCall(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding ToolCall');
+  }
+  return value;
+}
+
+void _uniffiWriteToolDef(ToolDef value, _UniFfiBinaryWriter writer) {
+  writer.writeString(value.name);
+  if (value.description == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeString(value.description!);
+  }
+  writer.writeString(value.parametersJson);
+}
+
+Uint8List _uniffiEncodeToolDef(ToolDef value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteToolDef(value, writer);
+  return writer.toBytes();
+}
+
+ToolDef _uniffiReadToolDef(_UniFfiBinaryReader reader) {
+  return ToolDef(
+    name: reader.readString(),
+    description: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readString(); })(),
+    parametersJson: reader.readString(),
+  );
+}
+
+ToolDef _uniffiDecodeToolDef(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadToolDef(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding ToolDef');
+  }
+  return value;
+}
+
 void _uniffiWriteBackendPreference(BackendPreference value, _UniFfiBinaryWriter writer) {
   final int tag = switch (value) {
     BackendPreference.auto => 1,
@@ -2053,6 +2605,23 @@ void _uniffiWriteFfiError(FfiError value, _UniFfiBinaryWriter writer) {
     writer.writeI32(8);
     writer.writeString(value.detail);
   }
+  else if (value is FfiErrorGrammarParse) {
+    writer.writeI32(9);
+    writer.writeString(value.detail);
+  }
+  else if (value is FfiErrorInvalidToken) {
+    writer.writeI32(10);
+    writer.writeU32(value.id);
+    writer.writeU32(value.vocabSize);
+  }
+  else if (value is FfiErrorLoraParse) {
+    writer.writeI32(11);
+    writer.writeString(value.detail);
+  }
+  else if (value is FfiErrorOutOfMemory) {
+    writer.writeI32(12);
+    writer.writeU64(value.requestedBytes);
+  }
   else {
     throw StateError('Unknown FfiError variant instance: $value');
   }
@@ -2092,6 +2661,23 @@ FfiError _uniffiReadFfiError(_UniFfiBinaryReader reader) {
       return FfiErrorBackend(
         detail: reader.readString(),
       );
+    case 9:
+      return FfiErrorGrammarParse(
+        detail: reader.readString(),
+      );
+    case 10:
+      return FfiErrorInvalidToken(
+        id: reader.readU32(),
+        vocabSize: reader.readU32(),
+      );
+    case 11:
+      return FfiErrorLoraParse(
+        detail: reader.readString(),
+      );
+    case 12:
+      return FfiErrorOutOfMemory(
+        requestedBytes: reader.readU64(),
+      );
     default:
       throw StateError('Unknown FfiError variant tag: $tag');
   }
@@ -2119,8 +2705,11 @@ void _uniffiWriteFinishReason(FinishReason value, _UniFfiBinaryWriter writer) {
   else if (value is FinishReasonContextFull) {
     writer.writeI32(4);
   }
-  else if (value is FinishReasonError) {
+  else if (value is FinishReasonGrammarDeadEnd) {
     writer.writeI32(5);
+  }
+  else if (value is FinishReasonError) {
+    writer.writeI32(6);
     writer.writeString(value.message);
   }
   else {
@@ -2146,6 +2735,8 @@ FinishReason _uniffiReadFinishReason(_UniFfiBinaryReader reader) {
     case 4:
       return const FinishReasonContextFull();
     case 5:
+      return const FinishReasonGrammarDeadEnd();
+    case 6:
       return FinishReasonError(
         message: reader.readString(),
       );
@@ -2209,6 +2800,41 @@ KvCompression _uniffiDecodeKvCompression(Uint8List bytes) {
   return value;
 }
 
+void _uniffiWriteToolFormat(ToolFormat value, _UniFfiBinaryWriter writer) {
+  final int tag = switch (value) {
+    ToolFormat.lfm2Pythonic => 1,
+    ToolFormat.hermes => 2,
+  };
+  writer.writeI32(tag);
+}
+
+Uint8List _uniffiEncodeToolFormat(ToolFormat value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteToolFormat(value, writer);
+  return writer.toBytes();
+}
+
+ToolFormat _uniffiReadToolFormat(_UniFfiBinaryReader reader) {
+  final int tag = reader.readI32();
+  switch (tag) {
+    case 1:
+      return ToolFormat.lfm2Pythonic;
+    case 2:
+      return ToolFormat.hermes;
+    default:
+      throw StateError('Unknown ToolFormat variant tag: $tag');
+  }
+}
+
+ToolFormat _uniffiDecodeToolFormat(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadToolFormat(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding ToolFormat');
+  }
+  return value;
+}
+
 class CeraFfiFfi {
   CeraFfiFfi({ffi.DynamicLibrary? dynamicLibrary, String? libraryPath})
       : _dynamicLibrary = dynamicLibrary,
@@ -2263,6 +2889,36 @@ class CeraFfiFfi {
     if (_checksum_uniffi_cera_ffi_checksum_func_cpu_backend_report != 61086) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_cpu_backend_report`: expected 61086, got $_checksum_uniffi_cera_ffi_checksum_func_cpu_backend_report');
     }
+    final int _checksum_uniffi_cera_ffi_checksum_func_detect_tool_format;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_func_detect_tool_format');
+      _checksum_uniffi_cera_ffi_checksum_func_detect_tool_format = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_detect_tool_format`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_func_detect_tool_format != 18753) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_detect_tool_format`: expected 18753, got $_checksum_uniffi_cera_ffi_checksum_func_detect_tool_format');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_func_parse_tool_calls;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_func_parse_tool_calls');
+      _checksum_uniffi_cera_ffi_checksum_func_parse_tool_calls = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_parse_tool_calls`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_func_parse_tool_calls != 47579) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_parse_tool_calls`: expected 47579, got $_checksum_uniffi_cera_ffi_checksum_func_parse_tool_calls');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_func_tool_grammar;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_func_tool_grammar');
+      _checksum_uniffi_cera_ffi_checksum_func_tool_grammar = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_tool_grammar`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_func_tool_grammar != 41383) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_tool_grammar`: expected 41383, got $_checksum_uniffi_cera_ffi_checksum_func_tool_grammar');
+    }
     final int _checksum_uniffi_cera_ffi_checksum_method_bundlerepo_cache_size;
     try {
       final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_bundlerepo_cache_size');
@@ -2302,6 +2958,16 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template != 38712) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template`: expected 38712, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools');
+      _checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools != 46076) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools`: expected 46076, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_bos_token;
     try {
@@ -2400,8 +3066,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_new_session`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_new_session != 54382) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_new_session`: expected 54382, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_new_session');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_new_session != 13030) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_new_session`: expected 13030, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_new_session');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_special_token_id;
     try {
@@ -2412,6 +3078,26 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_special_token_id != 35790) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_special_token_id`: expected 35790, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_special_token_id');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token');
+      _checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token != 23833) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token`: expected 23833, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_format;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_ceraengine_tool_format');
+      _checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_format = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_tool_format`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_format != 33648) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_tool_format`: expected 33648, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_format');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_transcribe;
     try {
@@ -2442,6 +3128,16 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress != 33688) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress`: expected 33688, got $_checksum_uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_loraadapters_target_count;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_loraadapters_target_count');
+      _checksum_uniffi_cera_ffi_checksum_method_loraadapters_target_count = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_loraadapters_target_count`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_loraadapters_target_count != 23137) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_loraadapters_target_count`: expected 23137, got $_checksum_uniffi_cera_ffi_checksum_method_loraadapters_target_count');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens;
     try {
@@ -2513,6 +3209,16 @@ class CeraFfiFfi {
     if (_checksum_uniffi_cera_ffi_checksum_method_session_append_tokens != 1227) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_tokens`: expected 1227, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_tokens');
     }
+    final int _checksum_uniffi_cera_ffi_checksum_method_session_attach_lora;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_session_attach_lora');
+      _checksum_uniffi_cera_ffi_checksum_method_session_attach_lora = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_attach_lora`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_attach_lora != 28982) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_attach_lora`: expected 28982, got $_checksum_uniffi_cera_ffi_checksum_method_session_attach_lora');
+    }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_cancel;
     try {
       final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_session_cancel');
@@ -2560,8 +3266,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_generate_async`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_generate_async != 10738) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_generate_async`: expected 10738, got $_checksum_uniffi_cera_ffi_checksum_method_session_generate_async');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_generate_async != 58489) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_generate_async`: expected 58489, got $_checksum_uniffi_cera_ffi_checksum_method_session_generate_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming;
     try {
@@ -2580,8 +3286,58 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_generate_streaming_async`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming_async != 57581) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_generate_streaming_async`: expected 57581, got $_checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming_async');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming_async != 12198) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_generate_streaming_async`: expected 12198, got $_checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming_async');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_session_has_lora;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_session_has_lora');
+      _checksum_uniffi_cera_ffi_checksum_method_session_has_lora = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_has_lora`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_has_lora != 13931) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_has_lora`: expected 13931, got $_checksum_uniffi_cera_ffi_checksum_method_session_has_lora');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_session_hidden_size;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_session_hidden_size');
+      _checksum_uniffi_cera_ffi_checksum_method_session_hidden_size = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_hidden_size`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_size != 46607) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_size`: expected 46607, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_size');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_session_hidden_states_for_text');
+      _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_hidden_states_for_text`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text != 54184) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_text`: expected 54184, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens');
+      _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens != 65100) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens`: expected 65100, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled');
+      _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled != 61246) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled`: expected 61246, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_position;
     try {
@@ -2592,6 +3348,16 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_method_session_position != 13264) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_position`: expected 13264, got $_checksum_uniffi_cera_ffi_checksum_method_session_position');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_session_remove_lora;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_session_remove_lora');
+      _checksum_uniffi_cera_ffi_checksum_method_session_remove_lora = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_remove_lora`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_remove_lora != 29534) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_remove_lora`: expected 29534, got $_checksum_uniffi_cera_ffi_checksum_method_session_remove_lora');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_reset;
     try {
@@ -2650,8 +3416,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async != 61537) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async`: expected 61537, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async != 14088) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async`: expected 14088, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_path;
     try {
@@ -2663,6 +3429,26 @@ class CeraFfiFfi {
     if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_path != 64420) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_path`: expected 64420, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_path');
     }
+    final int _checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf');
+      _checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf != 57598) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf`: expected 57598, got $_checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors');
+      _checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors != 11183) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors`: expected 11183, got $_checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors');
+    }
   }
 
   late final ffi.DynamicLibrary _lib = (() {
@@ -2672,6 +3458,8 @@ class CeraFfiFfi {
   })();
 
   late final void Function(ffi.Pointer<Utf8>) _rustStringFree = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<Utf8>), void Function(ffi.Pointer<Utf8>)>('rust_string_free');
+
+  late final void Function(_RustBuffer) _rustBytesFree = _lib.lookupFunction<ffi.Void Function(_RustBuffer), void Function(_RustBuffer)>('rust_bytes_free');
 
   late final _UniFfiRustBuffer Function(_UniFfiForeignBytes bytes, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _uniFfiRustBufferFromBytes = _lib.lookupFunction<_UniFfiRustBuffer Function(_UniFfiForeignBytes bytes, ffi.Pointer<_UniFfiRustCallStatus> outStatus), _UniFfiRustBuffer Function(_UniFfiForeignBytes bytes, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('ffi_cera_ffi_rustbuffer_from_bytes');
   late final void Function(_UniFfiRustBuffer buf, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _uniFfiRustBufferFree = _lib.lookupFunction<ffi.Void Function(_UniFfiRustBuffer buf, ffi.Pointer<_UniFfiRustCallStatus> outStatus), void Function(_UniFfiRustBuffer buf, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('ffi_cera_ffi_rustbuffer_free');
@@ -2760,6 +3548,341 @@ class CeraFfiFfi {
           ..len = (returnBuf + 5).ref.u64
           ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
         rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = utf8.decode(retBytes);
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _detectToolFormatFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_func_detect_tool_format');
+
+  ToolFormat? detectToolFormat(String architecture) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(3);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final Uint8List architectureBytes = Uint8List.fromList(utf8.encode(architecture));
+      final ffi.Pointer<ffi.Uint8> architecturePtr = architectureBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(architectureBytes.length);
+      if (architectureBytes.isNotEmpty) { architecturePtr.asTypedList(architectureBytes.length).setAll(0, architectureBytes); }
+      foreignArgPtrs.add(architecturePtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> architectureFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      architectureFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      architectureFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> architectureForeignPtr = calloc<_UniFfiForeignBytes>();
+      architectureForeignPtr.ref
+        ..len = architectureBytes.length
+        ..data = architecturePtr;
+      final _UniFfiRustBuffer architectureRustBuffer = _uniFfiRustBufferFromBytes(architectureForeignPtr.ref, architectureFromBytesStatusPtr);
+      calloc.free(architectureForeignPtr);
+      final int architectureFromBytesCode = architectureFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer architectureFromBytesErrBuf = architectureFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(architectureFromBytesStatusPtr);
+      if (architectureFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> architectureFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        architectureFromBytesErrBufPtr.ref
+          ..capacity = architectureFromBytesErrBuf.capacity
+          ..len = architectureFromBytesErrBuf.len
+          ..data = architectureFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(architectureFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $architectureFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = architectureRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = architectureRustBuffer.len;
+      (argBuf + 2).ref.ptr = architectureRustBuffer.data.cast<ffi.Void>();
+      _detectToolFormatFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final _UniFfiBinaryReader retReader = _UniFfiBinaryReader(retBytes);
+      final decodedValue = (() { final int __tag = retReader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return _uniffiReadToolFormat(retReader); })();
+      if (!retReader.isDone) {
+        throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');
+      }
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _parseToolCallsFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_func_parse_tool_calls');
+
+  List<ToolCall> parseToolCalls(String text, ToolFormat format) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(6);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final Uint8List textBytes = Uint8List.fromList(utf8.encode(text));
+      final ffi.Pointer<ffi.Uint8> textPtr = textBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(textBytes.length);
+      if (textBytes.isNotEmpty) { textPtr.asTypedList(textBytes.length).setAll(0, textBytes); }
+      foreignArgPtrs.add(textPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> textFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      textFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      textFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> textForeignPtr = calloc<_UniFfiForeignBytes>();
+      textForeignPtr.ref
+        ..len = textBytes.length
+        ..data = textPtr;
+      final _UniFfiRustBuffer textRustBuffer = _uniFfiRustBufferFromBytes(textForeignPtr.ref, textFromBytesStatusPtr);
+      calloc.free(textForeignPtr);
+      final int textFromBytesCode = textFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer textFromBytesErrBuf = textFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(textFromBytesStatusPtr);
+      if (textFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> textFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        textFromBytesErrBufPtr.ref
+          ..capacity = textFromBytesErrBuf.capacity
+          ..len = textFromBytesErrBuf.len
+          ..data = textFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(textFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $textFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = textRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = textRustBuffer.len;
+      (argBuf + 2).ref.ptr = textRustBuffer.data.cast<ffi.Void>();
+      final Uint8List formatBytes = _uniffiEncodeToolFormat(format);
+      final ffi.Pointer<ffi.Uint8> formatPtr = formatBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(formatBytes.length);
+      if (formatBytes.isNotEmpty) { formatPtr.asTypedList(formatBytes.length).setAll(0, formatBytes); }
+      foreignArgPtrs.add(formatPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> formatFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      formatFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      formatFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> formatForeignPtr = calloc<_UniFfiForeignBytes>();
+      formatForeignPtr.ref
+        ..len = formatBytes.length
+        ..data = formatPtr;
+      final _UniFfiRustBuffer formatRustBuffer = _uniFfiRustBufferFromBytes(formatForeignPtr.ref, formatFromBytesStatusPtr);
+      calloc.free(formatForeignPtr);
+      final int formatFromBytesCode = formatFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer formatFromBytesErrBuf = formatFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(formatFromBytesStatusPtr);
+      if (formatFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> formatFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        formatFromBytesErrBufPtr.ref
+          ..capacity = formatFromBytesErrBuf.capacity
+          ..len = formatFromBytesErrBuf.len
+          ..data = formatFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(formatFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $formatFromBytesCode');
+      }
+      (argBuf + 3).ref.u64 = formatRustBuffer.capacity;
+      (argBuf + 4).ref.u64 = formatRustBuffer.len;
+      (argBuf + 5).ref.ptr = formatRustBuffer.data.cast<ffi.Void>();
+      _parseToolCallsFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final _UniFfiBinaryReader retReader = _UniFfiBinaryReader(retBytes);
+      final decodedValue = (() { final int __len = retReader.readI32(); final out = <ToolCall>[]; for (var i = 0; i < __len; i++) { out.add(_uniffiReadToolCall(retReader)); } return out; })();
+      if (!retReader.isDone) {
+        throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');
+      }
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _toolGrammarFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_func_tool_grammar');
+
+  String toolGrammar(List<ToolDef> tools, ToolFormat format) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(6);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final toolsWriter = _UniFfiBinaryWriter();
+      toolsWriter.writeI32(tools.length);
+      for (final item in tools) {
+        _uniffiWriteToolDef(item, toolsWriter);
+      }
+      final Uint8List toolsBytes = toolsWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> toolsPtr = toolsBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(toolsBytes.length);
+      if (toolsBytes.isNotEmpty) { toolsPtr.asTypedList(toolsBytes.length).setAll(0, toolsBytes); }
+      foreignArgPtrs.add(toolsPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> toolsFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      toolsFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      toolsFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> toolsForeignPtr = calloc<_UniFfiForeignBytes>();
+      toolsForeignPtr.ref
+        ..len = toolsBytes.length
+        ..data = toolsPtr;
+      final _UniFfiRustBuffer toolsRustBuffer = _uniFfiRustBufferFromBytes(toolsForeignPtr.ref, toolsFromBytesStatusPtr);
+      calloc.free(toolsForeignPtr);
+      final int toolsFromBytesCode = toolsFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer toolsFromBytesErrBuf = toolsFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(toolsFromBytesStatusPtr);
+      if (toolsFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> toolsFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        toolsFromBytesErrBufPtr.ref
+          ..capacity = toolsFromBytesErrBuf.capacity
+          ..len = toolsFromBytesErrBuf.len
+          ..data = toolsFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(toolsFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $toolsFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = toolsRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = toolsRustBuffer.len;
+      (argBuf + 2).ref.ptr = toolsRustBuffer.data.cast<ffi.Void>();
+      final Uint8List formatBytes = _uniffiEncodeToolFormat(format);
+      final ffi.Pointer<ffi.Uint8> formatPtr = formatBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(formatBytes.length);
+      if (formatBytes.isNotEmpty) { formatPtr.asTypedList(formatBytes.length).setAll(0, formatBytes); }
+      foreignArgPtrs.add(formatPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> formatFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      formatFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      formatFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> formatForeignPtr = calloc<_UniFfiForeignBytes>();
+      formatForeignPtr.ref
+        ..len = formatBytes.length
+        ..data = formatPtr;
+      final _UniFfiRustBuffer formatRustBuffer = _uniFfiRustBufferFromBytes(formatForeignPtr.ref, formatFromBytesStatusPtr);
+      calloc.free(formatForeignPtr);
+      final int formatFromBytesCode = formatFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer formatFromBytesErrBuf = formatFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(formatFromBytesStatusPtr);
+      if (formatFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> formatFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        formatFromBytesErrBufPtr.ref
+          ..capacity = formatFromBytesErrBuf.capacity
+          ..len = formatFromBytesErrBuf.len
+          ..data = formatFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(formatFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $formatFromBytesCode');
+      }
+      (argBuf + 3).ref.u64 = formatRustBuffer.capacity;
+      (argBuf + 4).ref.u64 = formatRustBuffer.len;
+      (argBuf + 5).ref.ptr = formatRustBuffer.data.cast<ffi.Void>();
+      _toolGrammarFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
       final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
@@ -3539,6 +4662,146 @@ class CeraFfiFfi {
     }
   }
 
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineApplyChatTemplateWithToolsFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_ceraengine_apply_chat_template_with_tools');
+
+  String ceraEngineInvokeApplyChatTemplateWithTools(int handle, List<ChatMessage> messages, List<ToolDef> tools, bool addGenerationPrompt) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(8);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _ceraEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      final messagesWriter = _UniFfiBinaryWriter();
+      messagesWriter.writeI32(messages.length);
+      for (final item in messages) {
+        _uniffiWriteChatMessage(item, messagesWriter);
+      }
+      final Uint8List messagesBytes = messagesWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> messagesPtr = messagesBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(messagesBytes.length);
+      if (messagesBytes.isNotEmpty) { messagesPtr.asTypedList(messagesBytes.length).setAll(0, messagesBytes); }
+      foreignArgPtrs.add(messagesPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> messagesFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      messagesFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      messagesFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> messagesForeignPtr = calloc<_UniFfiForeignBytes>();
+      messagesForeignPtr.ref
+        ..len = messagesBytes.length
+        ..data = messagesPtr;
+      final _UniFfiRustBuffer messagesRustBuffer = _uniFfiRustBufferFromBytes(messagesForeignPtr.ref, messagesFromBytesStatusPtr);
+      calloc.free(messagesForeignPtr);
+      final int messagesFromBytesCode = messagesFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer messagesFromBytesErrBuf = messagesFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(messagesFromBytesStatusPtr);
+      if (messagesFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> messagesFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        messagesFromBytesErrBufPtr.ref
+          ..capacity = messagesFromBytesErrBuf.capacity
+          ..len = messagesFromBytesErrBuf.len
+          ..data = messagesFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(messagesFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $messagesFromBytesCode');
+      }
+      (argBuf + 1).ref.u64 = messagesRustBuffer.capacity;
+      (argBuf + 2).ref.u64 = messagesRustBuffer.len;
+      (argBuf + 3).ref.ptr = messagesRustBuffer.data.cast<ffi.Void>();
+      final toolsWriter = _UniFfiBinaryWriter();
+      toolsWriter.writeI32(tools.length);
+      for (final item in tools) {
+        _uniffiWriteToolDef(item, toolsWriter);
+      }
+      final Uint8List toolsBytes = toolsWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> toolsPtr = toolsBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(toolsBytes.length);
+      if (toolsBytes.isNotEmpty) { toolsPtr.asTypedList(toolsBytes.length).setAll(0, toolsBytes); }
+      foreignArgPtrs.add(toolsPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> toolsFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      toolsFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      toolsFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> toolsForeignPtr = calloc<_UniFfiForeignBytes>();
+      toolsForeignPtr.ref
+        ..len = toolsBytes.length
+        ..data = toolsPtr;
+      final _UniFfiRustBuffer toolsRustBuffer = _uniFfiRustBufferFromBytes(toolsForeignPtr.ref, toolsFromBytesStatusPtr);
+      calloc.free(toolsForeignPtr);
+      final int toolsFromBytesCode = toolsFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer toolsFromBytesErrBuf = toolsFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(toolsFromBytesStatusPtr);
+      if (toolsFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> toolsFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        toolsFromBytesErrBufPtr.ref
+          ..capacity = toolsFromBytesErrBuf.capacity
+          ..len = toolsFromBytesErrBuf.len
+          ..data = toolsFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(toolsFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $toolsFromBytesCode');
+      }
+      (argBuf + 4).ref.u64 = toolsRustBuffer.capacity;
+      (argBuf + 5).ref.u64 = toolsRustBuffer.len;
+      (argBuf + 6).ref.ptr = toolsRustBuffer.data.cast<ffi.Void>();
+      (argBuf + 7).ref.i8 = addGenerationPrompt ? 1 : 0;
+      _ceraEngineApplyChatTemplateWithToolsFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (apply_chat_template_with_tools)');
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
   late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineBosTokenFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_ceraengine_bos_token');
 
   int? ceraEngineInvokeBosToken(int handle) {
@@ -4274,6 +5537,10 @@ class CeraFfiFfi {
           ..len = (returnBuf + 3).ref.u64
           ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
         rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
       return Session._(this, (returnBuf + 0).ref.u64);
@@ -4381,6 +5648,173 @@ class CeraFfiFfi {
       } finally {
         _rustStringFree(resultPtr);
       }
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineToolCallStartTokenFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_ceraengine_tool_call_start_token');
+
+  int? ceraEngineInvokeToolCallStartToken(int handle, ToolFormat format) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _ceraEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      final Uint8List formatBytes = _uniffiEncodeToolFormat(format);
+      final ffi.Pointer<ffi.Uint8> formatPtr = formatBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(formatBytes.length);
+      if (formatBytes.isNotEmpty) { formatPtr.asTypedList(formatBytes.length).setAll(0, formatBytes); }
+      foreignArgPtrs.add(formatPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> formatFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      formatFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      formatFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> formatForeignPtr = calloc<_UniFfiForeignBytes>();
+      formatForeignPtr.ref
+        ..len = formatBytes.length
+        ..data = formatPtr;
+      final _UniFfiRustBuffer formatRustBuffer = _uniFfiRustBufferFromBytes(formatForeignPtr.ref, formatFromBytesStatusPtr);
+      calloc.free(formatForeignPtr);
+      final int formatFromBytesCode = formatFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer formatFromBytesErrBuf = formatFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(formatFromBytesStatusPtr);
+      if (formatFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> formatFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        formatFromBytesErrBufPtr.ref
+          ..capacity = formatFromBytesErrBuf.capacity
+          ..len = formatFromBytesErrBuf.len
+          ..data = formatFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(formatFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $formatFromBytesCode');
+      }
+      (argBuf + 1).ref.u64 = formatRustBuffer.capacity;
+      (argBuf + 2).ref.u64 = formatRustBuffer.len;
+      (argBuf + 3).ref.ptr = formatRustBuffer.data.cast<ffi.Void>();
+      _ceraEngineToolCallStartTokenFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<Utf8> resultPtr = (returnBuf + 0).ref.ptr.cast<Utf8>();
+      if (resultPtr == ffi.nullptr) {
+        throw StateError('Rust returned null pointer for tool_call_start_token');
+      }
+      try {
+        final String payload = resultPtr.toDartString();
+        final Object? decoded = jsonDecode(payload);
+        return decoded == null ? null : (decoded as num).toInt();
+      } finally {
+        _rustStringFree(resultPtr);
+      }
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineToolFormatFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_ceraengine_tool_format');
+
+  ToolFormat? ceraEngineInvokeToolFormat(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _ceraEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _ceraEngineToolFormatFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (tool_format)');
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -4695,6 +6129,283 @@ class CeraFfiFfi {
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
       return;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _loraAdaptersFreeRaw = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), void Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('uniffi_cera_ffi_fn_free_loraadapters');
+  late final void Function(int handle) _loraAdaptersFree = (int handle) {
+    final statusPtr = calloc<_UniFfiRustCallStatus>();
+    statusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+    statusPtr.ref.errorBuf
+      ..capacity = 0
+      ..len = 0
+      ..data = ffi.nullptr;
+    _loraAdaptersFreeRaw(handle, statusPtr);
+    calloc.free(statusPtr);
+  };
+
+  late final int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _loraAdaptersClone = _lib.lookupFunction<ffi.Uint64 Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('uniffi_cera_ffi_fn_clone_loraadapters');
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _loraAdaptersCtorFromGgufFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_constructor_loraadapters_from_gguf');
+
+  LoraAdapters loraAdaptersCreateFromGguf(String path) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(3);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final Uint8List pathBytes = Uint8List.fromList(utf8.encode(path));
+      final ffi.Pointer<ffi.Uint8> pathPtr = pathBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(pathBytes.length);
+      if (pathBytes.isNotEmpty) { pathPtr.asTypedList(pathBytes.length).setAll(0, pathBytes); }
+      foreignArgPtrs.add(pathPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> pathFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      pathFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      pathFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> pathForeignPtr = calloc<_UniFfiForeignBytes>();
+      pathForeignPtr.ref
+        ..len = pathBytes.length
+        ..data = pathPtr;
+      final _UniFfiRustBuffer pathRustBuffer = _uniFfiRustBufferFromBytes(pathForeignPtr.ref, pathFromBytesStatusPtr);
+      calloc.free(pathForeignPtr);
+      final int pathFromBytesCode = pathFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer pathFromBytesErrBuf = pathFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(pathFromBytesStatusPtr);
+      if (pathFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> pathFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        pathFromBytesErrBufPtr.ref
+          ..capacity = pathFromBytesErrBuf.capacity
+          ..len = pathFromBytesErrBuf.len
+          ..data = pathFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(pathFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $pathFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = pathRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = pathRustBuffer.len;
+      (argBuf + 2).ref.ptr = pathRustBuffer.data.cast<ffi.Void>();
+      _loraAdaptersCtorFromGgufFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final int handle = (returnBuf + 0).ref.u64;
+      return LoraAdapters._(this, handle);
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _loraAdaptersCtorFromSafetensorsFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_constructor_loraadapters_from_safetensors');
+
+  LoraAdapters loraAdaptersCreateFromSafetensors(String path, double? alpha) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(6);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final Uint8List pathBytes = Uint8List.fromList(utf8.encode(path));
+      final ffi.Pointer<ffi.Uint8> pathPtr = pathBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(pathBytes.length);
+      if (pathBytes.isNotEmpty) { pathPtr.asTypedList(pathBytes.length).setAll(0, pathBytes); }
+      foreignArgPtrs.add(pathPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> pathFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      pathFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      pathFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> pathForeignPtr = calloc<_UniFfiForeignBytes>();
+      pathForeignPtr.ref
+        ..len = pathBytes.length
+        ..data = pathPtr;
+      final _UniFfiRustBuffer pathRustBuffer = _uniFfiRustBufferFromBytes(pathForeignPtr.ref, pathFromBytesStatusPtr);
+      calloc.free(pathForeignPtr);
+      final int pathFromBytesCode = pathFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer pathFromBytesErrBuf = pathFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(pathFromBytesStatusPtr);
+      if (pathFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> pathFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        pathFromBytesErrBufPtr.ref
+          ..capacity = pathFromBytesErrBuf.capacity
+          ..len = pathFromBytesErrBuf.len
+          ..data = pathFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(pathFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $pathFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = pathRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = pathRustBuffer.len;
+      (argBuf + 2).ref.ptr = pathRustBuffer.data.cast<ffi.Void>();
+      final alphaWriter = _UniFfiBinaryWriter();
+      if (alpha == null) {
+        alphaWriter.writeI8(0);
+      } else {
+        alphaWriter.writeI8(1);
+        alphaWriter.writeF32(alpha!);
+      }
+      final Uint8List alphaBytes = alphaWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> alphaPtr = alphaBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(alphaBytes.length);
+      if (alphaBytes.isNotEmpty) { alphaPtr.asTypedList(alphaBytes.length).setAll(0, alphaBytes); }
+      foreignArgPtrs.add(alphaPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> alphaFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      alphaFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      alphaFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> alphaForeignPtr = calloc<_UniFfiForeignBytes>();
+      alphaForeignPtr.ref
+        ..len = alphaBytes.length
+        ..data = alphaPtr;
+      final _UniFfiRustBuffer alphaRustBuffer = _uniFfiRustBufferFromBytes(alphaForeignPtr.ref, alphaFromBytesStatusPtr);
+      calloc.free(alphaForeignPtr);
+      final int alphaFromBytesCode = alphaFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer alphaFromBytesErrBuf = alphaFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(alphaFromBytesStatusPtr);
+      if (alphaFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> alphaFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        alphaFromBytesErrBufPtr.ref
+          ..capacity = alphaFromBytesErrBuf.capacity
+          ..len = alphaFromBytesErrBuf.len
+          ..data = alphaFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(alphaFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $alphaFromBytesCode');
+      }
+      (argBuf + 3).ref.u64 = alphaRustBuffer.capacity;
+      (argBuf + 4).ref.u64 = alphaRustBuffer.len;
+      (argBuf + 5).ref.ptr = alphaRustBuffer.data.cast<ffi.Void>();
+      _loraAdaptersCtorFromSafetensorsFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final int handle = (returnBuf + 0).ref.u64;
+      return LoraAdapters._(this, handle);
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _loraAdaptersTargetCountFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_loraadapters_target_count');
+
+  int loraAdaptersInvokeTargetCount(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _loraAdaptersClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _loraAdaptersTargetCountFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return (returnBuf + 0).ref.u32;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -5482,6 +7193,74 @@ class CeraFfiFfi {
     }
   }
 
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionAttachLoraFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_attach_lora');
+
+  void sessionInvokeAttachLora(int handle, LoraAdapters adapters) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(2);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _sessionClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      (argBuf + 1).ref.u64 = LoraAdaptersFfiCodec.lower(adapters);
+      _sessionAttachLoraFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 0).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 1).ref.u64
+          ..len = (returnBuf + 2).ref.u64
+          ..data = (returnBuf + 3).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
   late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionCancelFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_cancel');
 
   void sessionInvokeCancel(int handle) {
@@ -6220,6 +7999,440 @@ class CeraFfiFfi {
     }
   }
 
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionHasLoraFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_has_lora');
+
+  bool sessionInvokeHasLora(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _sessionClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _sessionHasLoraFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return (returnBuf + 0).ref.i8 == 1;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionHiddenSizeFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_hidden_size');
+
+  int sessionInvokeHiddenSize(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _sessionClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _sessionHiddenSizeFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return (returnBuf + 0).ref.u32;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionHiddenStatesForTextFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_hidden_states_for_text');
+
+  Uint8List sessionInvokeHiddenStatesForText(int handle, String text) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _sessionClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      final Uint8List textBytes = Uint8List.fromList(utf8.encode(text));
+      final ffi.Pointer<ffi.Uint8> textPtr = textBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(textBytes.length);
+      if (textBytes.isNotEmpty) { textPtr.asTypedList(textBytes.length).setAll(0, textBytes); }
+      foreignArgPtrs.add(textPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> textFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      textFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      textFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> textForeignPtr = calloc<_UniFfiForeignBytes>();
+      textForeignPtr.ref
+        ..len = textBytes.length
+        ..data = textPtr;
+      final _UniFfiRustBuffer textRustBuffer = _uniFfiRustBufferFromBytes(textForeignPtr.ref, textFromBytesStatusPtr);
+      calloc.free(textForeignPtr);
+      final int textFromBytesCode = textFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer textFromBytesErrBuf = textFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(textFromBytesStatusPtr);
+      if (textFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> textFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        textFromBytesErrBufPtr.ref
+          ..capacity = textFromBytesErrBuf.capacity
+          ..len = textFromBytesErrBuf.len
+          ..data = textFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(textFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $textFromBytesCode');
+      }
+      (argBuf + 1).ref.u64 = textRustBuffer.capacity;
+      (argBuf + 2).ref.u64 = textRustBuffer.len;
+      (argBuf + 3).ref.ptr = textRustBuffer.data.cast<ffi.Void>();
+      _sessionHiddenStatesForTextFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (hidden_states_for_text)');
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionHiddenStatesForTokensFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_hidden_states_for_tokens');
+
+  Uint8List sessionInvokeHiddenStatesForTokens(int handle, List<int> tokens) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _sessionClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      final tokensWriter = _UniFfiBinaryWriter();
+      tokensWriter.writeI32(tokens.length);
+      for (final item in tokens) {
+        tokensWriter.writeU32(item);
+      }
+      final Uint8List tokensBytes = tokensWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> tokensPtr = tokensBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(tokensBytes.length);
+      if (tokensBytes.isNotEmpty) { tokensPtr.asTypedList(tokensBytes.length).setAll(0, tokensBytes); }
+      foreignArgPtrs.add(tokensPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> tokensFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      tokensFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      tokensFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> tokensForeignPtr = calloc<_UniFfiForeignBytes>();
+      tokensForeignPtr.ref
+        ..len = tokensBytes.length
+        ..data = tokensPtr;
+      final _UniFfiRustBuffer tokensRustBuffer = _uniFfiRustBufferFromBytes(tokensForeignPtr.ref, tokensFromBytesStatusPtr);
+      calloc.free(tokensForeignPtr);
+      final int tokensFromBytesCode = tokensFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer tokensFromBytesErrBuf = tokensFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(tokensFromBytesStatusPtr);
+      if (tokensFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> tokensFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        tokensFromBytesErrBufPtr.ref
+          ..capacity = tokensFromBytesErrBuf.capacity
+          ..len = tokensFromBytesErrBuf.len
+          ..data = tokensFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(tokensFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $tokensFromBytesCode');
+      }
+      (argBuf + 1).ref.u64 = tokensRustBuffer.capacity;
+      (argBuf + 2).ref.u64 = tokensRustBuffer.len;
+      (argBuf + 3).ref.ptr = tokensRustBuffer.data.cast<ffi.Void>();
+      _sessionHiddenStatesForTokensFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (hidden_states_for_tokens)');
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionHiddenStatesMeanPooledFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_hidden_states_mean_pooled');
+
+  List<double> sessionInvokeHiddenStatesMeanPooled(int handle, List<int> tokens) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _sessionClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      final tokensWriter = _UniFfiBinaryWriter();
+      tokensWriter.writeI32(tokens.length);
+      for (final item in tokens) {
+        tokensWriter.writeU32(item);
+      }
+      final Uint8List tokensBytes = tokensWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> tokensPtr = tokensBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(tokensBytes.length);
+      if (tokensBytes.isNotEmpty) { tokensPtr.asTypedList(tokensBytes.length).setAll(0, tokensBytes); }
+      foreignArgPtrs.add(tokensPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> tokensFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      tokensFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      tokensFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> tokensForeignPtr = calloc<_UniFfiForeignBytes>();
+      tokensForeignPtr.ref
+        ..len = tokensBytes.length
+        ..data = tokensPtr;
+      final _UniFfiRustBuffer tokensRustBuffer = _uniFfiRustBufferFromBytes(tokensForeignPtr.ref, tokensFromBytesStatusPtr);
+      calloc.free(tokensForeignPtr);
+      final int tokensFromBytesCode = tokensFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer tokensFromBytesErrBuf = tokensFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(tokensFromBytesStatusPtr);
+      if (tokensFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> tokensFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        tokensFromBytesErrBufPtr.ref
+          ..capacity = tokensFromBytesErrBuf.capacity
+          ..len = tokensFromBytesErrBuf.len
+          ..data = tokensFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(tokensFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $tokensFromBytesCode');
+      }
+      (argBuf + 1).ref.u64 = tokensRustBuffer.capacity;
+      (argBuf + 2).ref.u64 = tokensRustBuffer.len;
+      (argBuf + 3).ref.ptr = tokensRustBuffer.data.cast<ffi.Void>();
+      _sessionHiddenStatesMeanPooledFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (hidden_states_mean_pooled)');
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
   late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionPositionFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_position');
 
   int sessionInvokePosition(int handle) {
@@ -6258,6 +8471,73 @@ class CeraFfiFfi {
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
       return (returnBuf + 0).ref.u32;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionRemoveLoraFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_remove_lora');
+
+  void sessionInvokeRemoveLora(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _sessionClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _sessionRemoveLoraFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 0).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 1).ref.u64
+          ..len = (returnBuf + 2).ref.u64
+          ..data = (returnBuf + 3).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -6652,7 +8932,7 @@ final class CeraEngine {
   /// directory and attach it to the config before calling.
   ///
   /// Cancellation semantics (weaker than [`Session::generate_async`]):
-  /// dropping the returned future drops the [`AbortOnDrop`] guard,
+  /// dropping the returned future drops the `AbortOnDrop` guard,
   /// which calls `AbortHandle::abort` on the spawned task. That
   /// cancels the task if it's still queued on tokio's blocking
   /// pool, so a not-yet-started download never runs. But if the
@@ -6697,6 +8977,14 @@ final class CeraEngine {
   String applyChatTemplate(List<ChatMessage> messages, bool addGenerationPrompt) {
     _ensureOpen();
     return _ffi.ceraEngineInvokeApplyChatTemplate(_handle, messages, addGenerationPrompt);
+  }
+
+  /// Like [`CeraEngine::apply_chat_template`], but also passes a `tools`
+  /// array so a tool-trained model renders its tool-definition block. Pass an
+  /// empty `tools` for identical behavior to the plain call.
+  String applyChatTemplateWithTools(List<ChatMessage> messages, List<ToolDef> tools, bool addGenerationPrompt) {
+    _ensureOpen();
+    return _ffi.ceraEngineInvokeApplyChatTemplateWithTools(_handle, messages, tools, addGenerationPrompt);
   }
 
   /// Beginning-of-sequence token ID, if the model has one.
@@ -6805,6 +9093,22 @@ final class CeraEngine {
   int? specialTokenId(String name) {
     _ensureOpen();
     return _ffi.ceraEngineInvokeSpecialTokenId(_handle, name);
+  }
+
+  /// The token id of `format`'s tool-call start marker (e.g.
+  /// `<|tool_call_start|>`) in this model's vocab, for use as a lazy grammar
+  /// trigger in `GenerateOpts.grammar_trigger_tokens`. `None` if the model's
+  /// tokenizer lacks that special token.
+  int? toolCallStartToken(ToolFormat format) {
+    _ensureOpen();
+    return _ffi.ceraEngineInvokeToolCallStartToken(_handle, format);
+  }
+
+  /// The tool-call format auto-detected from this model's architecture, or
+  /// `None` if the architecture has no known tool convention.
+  ToolFormat? toolFormat() {
+    _ensureOpen();
+    return _ffi.ceraEngineInvokeToolFormat(_handle);
   }
 
   /// Transcribe mono `f32` PCM audio (normalized to roughly `[-1.0, 1.0]`) to text using the
@@ -7047,6 +9351,77 @@ final class DownloadProgressSinkFfiCodec {
   }
 
   static DownloadProgressSink lift(int handle) => _DownloadProgressSinkImpl._(_bindings(), handle);
+}
+
+final class _LoraAdaptersFinalizerToken {
+  const _LoraAdaptersFinalizerToken(this.free, this.handle);
+  final void Function(int) free;
+  final int handle;
+}
+
+/// A loaded LoRA adapter, ready to attach to a [`Session`] via
+/// [`Session::attach_lora`]. Load it once and share the handle across sessions —
+/// it's reference-counted internally, so attaching to multiple sessions doesn't
+/// re-parse or re-allocate the factors.
+final class LoraAdapters {
+  LoraAdapters._(this._ffi, this._handle) {
+    _finalizer.attach(this, _LoraAdaptersFinalizerToken(_ffi._loraAdaptersFree, _handle), detach: this);
+  }
+
+  final CeraFfiFfi _ffi;
+  int _handle;
+  bool _closed = false;
+
+  static final Finalizer<_LoraAdaptersFinalizerToken> _finalizer = Finalizer((token) {
+    token.free(token.handle);
+  });
+
+  bool get isClosed => _closed;
+
+  void close() {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    _finalizer.detach(this);
+    _ffi._loraAdaptersFree(_handle);
+  }
+
+  void _ensureOpen() {
+    if (_closed) {
+      throw StateError('LoraAdapters is closed');
+    }
+  }
+
+  /// Load a llama.cpp-format GGUF adapter (`convert_lora_to_gguf` output) from
+  /// a local path. `alpha` is read from the adapter's `adapter.lora.alpha`
+  /// metadata (missing ⇒ scale = 1).
+  static LoraAdapters fromGguf(String path) {
+    return _bindings().loraAdaptersCreateFromGguf(path);
+  }
+
+  /// Load a PEFT `.safetensors` adapter from a local path. PEFT stores `alpha`
+  /// in a sibling `adapter_config.json`, so pass it explicitly here (`None` ⇒
+  /// scale = 1, i.e. `alpha == rank`).
+  static LoraAdapters fromSafetensors(String path, double? alpha) {
+    return _bindings().loraAdaptersCreateFromSafetensors(path, alpha);
+  }
+
+  /// Number of `(layer, target)` low-rank deltas the adapter carries — for
+  /// diagnostics / logging.
+  int targetCount() {
+    _ensureOpen();
+    return _ffi.loraAdaptersInvokeTargetCount(_handle);
+  }
+
+}
+
+final class LoraAdaptersFfiCodec {
+  const LoraAdaptersFfiCodec._();
+
+  static int lower(LoraAdapters value) => value._handle;
+
+  static LoraAdapters lift(int handle) => LoraAdapters._(_bindings(), handle);
 }
 
 /// Streaming sink for decode output. Foreign callers implement this
@@ -7458,6 +9833,18 @@ final class Session {
     _ffi.sessionInvokeAppendTokens(_handle, tokens);
   }
 
+  /// Attach a [`LoraAdapters`] to this session (generated as `attachLora` in
+  /// Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
+  /// call). It's applied to every subsequent forward pass — generation **and**
+  /// hidden-states extraction — until removed or replaced (hot-swap), and is
+  /// preserved across [`Self::reset`]. Returns [`FfiError::LoraParse`] if the
+  /// adapter's dimensions don't match the loaded model. Only affects tokens
+  /// processed after the call (doesn't retroactively re-adapt cached KV).
+  void attachLora(LoraAdapters adapters) {
+    _ensureOpen();
+    _ffi.sessionInvokeAttachLora(_handle, adapters);
+  }
+
   /// Signal in-flight `generate()` to exit with
   /// `FinishReason::Cancelled` at the next between-token check.
   /// Safe from any thread. No-op if no `generate()` is running.
@@ -7523,7 +9910,7 @@ final class Session {
   /// Either path releases the session mutex; subsequent calls see
   /// a clean session. You can also call [`Session::cancel`]
   /// directly from any thread to trigger the same in-flight exit
-  /// without dropping the future. See [`AsyncCancelGuard`] for the
+  /// without dropping the future. See `AsyncCancelGuard` for the
   /// full rationale.
   ///
   /// On error the wrapper performs the same poisoned-mutex handling
@@ -7588,7 +9975,7 @@ final class Session {
   ///
   /// Cancellation: dropping the returned future fires the same
   /// abort + [`Session::cancel`] pair as [`Session::generate_async`]
-  /// (see [`AsyncCancelGuard`]). For an in-flight decode, the loop
+  /// (see `AsyncCancelGuard`). For an in-flight decode, the loop
   /// exits with [`FinishReason::Cancelled`] and the sink's `on_done`
   /// fires on the blocking worker before the task completes —
   /// foreign consumers get the terminal signal even though they've
@@ -7600,12 +9987,71 @@ final class Session {
     return _ffi.sessionInvokeGenerateStreamingAsync(_handle, opts, sink);
   }
 
+  /// Whether a LoRA adapter is currently attached to this session.
+  bool hasLora() {
+    _ensureOpen();
+    return _ffi.sessionInvokeHasLora(_handle);
+  }
+
+  /// Model hidden dimension `D`. Reshape a raw `[T*D]` byte buffer from
+  /// [`Self::hidden_states_for_tokens`] into `[T][D]` with this. Lock-free
+  /// (cached at construction), so — like `position()` — it's safe to call from
+  /// a `generate_streaming` sink callback.
+  int hiddenSize() {
+    _ensureOpen();
+    return _ffi.sessionInvokeHiddenSize(_handle);
+  }
+
+  /// Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
+  /// (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+  Uint8List hiddenStatesForText(String text) {
+    _ensureOpen();
+    return _ffi.sessionInvokeHiddenStatesForText(_handle, text);
+  }
+
+  /// Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
+  /// `--pooling none` / `llama_get_embeddings_ith` vector) for `tokens`,
+  /// returned as **little-endian f32 bytes**: `n_tokens * hidden_size * 4`
+  /// bytes, row-major, token `t` channel `c` at `(t*D + c) * 4`.
+  ///
+  /// Bytes (UniFFI `Data` in Swift, `ByteArray` in Kotlin) rather than
+  /// `List<Float>` to avoid Kotlin's per-element boxing on the potentially
+  /// large `[T*D]` payload. Swift decodes via `Data.withUnsafeBytes`; reflects
+  /// the active LoRA once that lands. Side-effect-free: does not disturb the
+  /// session's generation KV.
+  ///
+  /// Like `append_*` / `generate`, this holds the session mutex for the
+  /// duration of the compute, so it must NOT be called re-entrantly from
+  /// within a `generate_streaming` sink callback (would self-deadlock).
+  ///
+  /// Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
+  /// doesn't implement hidden-state extraction; `InvalidToken` if any id is
+  /// `>= vocab_size`.
+  Uint8List hiddenStatesForTokens(List<int> tokens) {
+    _ensureOpen();
+    return _ffi.sessionInvokeHiddenStatesForTokens(_handle, tokens);
+  }
+
+  /// Mean-pooled hidden state — a single `[hidden_size]` vector (the common
+  /// classifier path: pool in Rust, ship `D` floats not `T*D`). Returned as
+  /// `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
+  List<double> hiddenStatesMeanPooled(List<int> tokens) {
+    _ensureOpen();
+    return _ffi.sessionInvokeHiddenStatesMeanPooled(_handle, tokens);
+  }
+
   /// Current KV position — how many tokens live in the cache.
   /// Atomic-backed; safe to call from a different thread while
   /// `generate()` is in flight.
   int position() {
     _ensureOpen();
     return _ffi.sessionInvokePosition(_handle);
+  }
+
+  /// Remove any attached LoRA adapter, returning to base-model inference.
+  void removeLora() {
+    _ensureOpen();
+    _ffi.sessionInvokeRemoveLora(_handle);
   }
 
   /// Drop cached state + resample the seed. After `reset()` the
@@ -7667,6 +10113,29 @@ String ceraFfiVersion() {
 /// for telemetry and bug reports (tells you which kernel path actually ran).
 String cpuBackendReport() {
   return _bindings().cpuBackendReport();
+}
+
+/// Detect the tool-call format for a model architecture string (e.g.
+/// `"lfm2"`, `"qwen3"`). Returns `None` for architectures with no known
+/// convention — the caller may still choose a format explicitly.
+ToolFormat? detectToolFormat(String architecture) {
+  return _bindings().detectToolFormat(architecture);
+}
+
+/// Parse tool calls out of generated model text for the given `format`.
+/// Returns an empty list when the reply contains no tool call (the model
+/// answered in prose). Errors only when a call section is present but
+/// unrecoverably malformed.
+List<ToolCall> parseToolCalls(String text, ToolFormat format) {
+  return _bindings().parseToolCalls(text, format);
+}
+
+/// Build a GBNF grammar string constraining output to a valid call for one
+/// of `tools`, in `format`. Put the result in `GenerateOpts.grammar` and set
+/// `GenerateOpts.grammar_trigger_tokens` (see
+/// [`CeraEngine::tool_call_start_token`]) for a lazy tool-call trigger.
+String toolGrammar(List<ToolDef> tools, ToolFormat format) {
+  return _bindings().toolGrammar(tools, format);
 }
 
 
