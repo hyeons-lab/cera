@@ -1078,7 +1078,10 @@ impl Default for SessionConfig {
         let core = cera::SessionConfig::default();
         Self {
             max_seq_len: core.max_seq_len,
-            kv_compression: Some(core.kv_compression.into()),
+            // `None` == "use the default (no) compression" — matches the
+            // foreign-binding `#[uniffi(default = None)]` and the `From` mapping,
+            // so the Rust `Default` and the no-arg `SessionConfig()` agree.
+            kv_compression: None,
             n_keep: core.n_keep,
             seed: core.seed,
             ubatch_size: core.ubatch_size,
