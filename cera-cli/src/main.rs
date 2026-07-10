@@ -2301,11 +2301,21 @@ fn main() -> Result<()> {
                             cera::grammar::Grammar::parse(&gbnf)
                                 .context("compiling generated tool grammar")?,
                         );
-                        let trig = tokenizer
-                            .special_token_id(fmt.call_start_marker())
-                            .map(|t| vec![t])
-                            .unwrap_or_default();
-                        (Some(g), trig)
+                        // The lazy trigger needs the start marker as a single
+                        // special token. Without it the grammar would run
+                        // eagerly from token 0 and force an *unmarked* call the
+                        // parser can't recover — so fail fast rather than
+                        // silently degrade.
+                        let marker = fmt.call_start_marker();
+                        let Some(trig_id) = tokenizer.special_token_id(marker) else {
+                            anyhow::bail!(
+                                "--constrain-tools: this model's tokenizer has no `{marker}` \
+                                 special token (required for the {fmt:?} tool-call format), so \
+                                 the lazy grammar trigger can't be set. This model likely does \
+                                 not support constrained tool calling."
+                            );
+                        };
+                        (Some(g), vec![trig_id])
                     } else {
                         (grammar_compiled.clone(), Vec::new())
                     };
@@ -2351,26 +2361,35 @@ fn main() -> Result<()> {
                 eprintln!("Prefill: {:.1} tok/s", prefill_tps);
                 eprintln!("Decode: {:.1} tok/s", decode_tps);
 
-                // Parse and report any tool calls in the reply.
+                // Parse and report any tool calls in the reply. stdout always
+                // gets a JSON array (possibly `[]`) so automation can tell "no
+                // call" apart from "no output"; the human summary goes to stderr.
+                // `writeln!` (not `println!`) so a closed pipe surfaces as an
+                // ignored error instead of a panic.
                 if let (Some(fmt), Some(text)) = (tool_format, reply_text) {
-                    match cera::tools::parse_tool_calls(&text, fmt) {
-                        Ok(calls) if !calls.is_empty() => {
-                            eprintln!("---");
-                            eprintln!("Tool calls ({}):", calls.len());
-                            for (i, c) in calls.iter().enumerate() {
-                                let args = serde_json::to_string(&c.arguments)
-                                    .unwrap_or_else(|_| "<unserializable>".into());
-                                eprintln!("  [{i}] {}({args})", c.name);
+                    let calls = match cera::tools::parse_tool_calls(&text, fmt) {
+                        Ok(calls) => {
+                            if calls.is_empty() {
+                                eprintln!("--- (no tool calls in reply)");
+                            } else {
+                                eprintln!("---");
+                                eprintln!("Tool calls ({}):", calls.len());
+                                for (i, c) in calls.iter().enumerate() {
+                                    let args = serde_json::to_string(&c.arguments)
+                                        .unwrap_or_else(|_| "<unserializable>".into());
+                                    eprintln!("  [{i}] {}({args})", c.name);
+                                }
                             }
-                            // Machine-readable form on stdout.
-                            println!(
-                                "{}",
-                                serde_json::to_string(&calls).unwrap_or_else(|_| "[]".into())
-                            );
+                            calls
                         }
-                        Ok(_) => eprintln!("--- (no tool calls in reply)"),
-                        Err(e) => eprintln!("--- tool-call parse error: {e:#}"),
-                    }
+                        Err(e) => {
+                            eprintln!("--- tool-call parse error: {e:#}");
+                            Vec::new()
+                        }
+                    };
+                    let json = serde_json::to_string(&calls).unwrap_or_else(|_| "[]".into());
+                    let mut out = std::io::stdout().lock();
+                    let _ = writeln!(out, "{json}");
                 }
             }
         }

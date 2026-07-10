@@ -23,7 +23,7 @@
 //! `<tool_call>…</tool_call>`. [`ToolFormat`] captures the family; parsing and
 //! grammar generation branch on it.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use serde_json::{Map, Value};
 
 /// A tool the model may call. Serializes to the JSON object shape chat
@@ -52,9 +52,12 @@ fn empty_params() -> Value {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub name: String,
-    /// Argument object (`{arg_name: value}`). Always a JSON object; scalar
-    /// argument values keep their parsed JSON type (string/number/bool/null/
-    /// array/object).
+    /// The call's arguments. Normally a JSON object (`{arg_name: value}`) — the
+    /// LFM2 Pythonic parser always produces one, with each argument keeping its
+    /// parsed JSON type. The Hermes parser passes through whatever the model
+    /// emitted under `"arguments"`/`"parameters"`, so a malformed model output
+    /// could in principle yield a non-object value here; consumers that require
+    /// an object should check with [`Value::as_object`].
     pub arguments: Value,
 }
 
@@ -412,9 +415,10 @@ fn hermes_grammar(tools: &[ToolDef]) -> String {
 
 /// Parse `<|tool_call_start|>[name(a="x", b=3), other()]<|tool_call_end|>`.
 ///
-/// The interior is a Python list of function calls. We accept the bare list
-/// with or without the surrounding markers so the same routine handles both
-/// streamed fragments and fully wrapped output.
+/// The interior is a Python list of function calls. Fully-wrapped output (with
+/// markers) is the normal case; a bare `[…]` list with no markers is also
+/// accepted (e.g. constrained decode run eagerly without a trigger token, or a
+/// caller passing just the interior).
 fn parse_lfm2_pythonic(text: &str) -> Result<Vec<ToolCall>> {
     // Walk every `<|tool_call_start|>…<|tool_call_end|>` section, not just the
     // first — a model may emit several sections in one turn, and the Hermes
@@ -422,7 +426,9 @@ fn parse_lfm2_pythonic(text: &str) -> Result<Vec<ToolCall>> {
     // marker is tolerated (the tail is treated as the last section).
     let mut calls = Vec::new();
     let mut rest = text;
+    let mut saw_marker = false;
     while let Some(start) = rest.find("<|tool_call_start|>") {
+        saw_marker = true;
         let after = &rest[start + "<|tool_call_start|>".len()..];
         let (inner, next) = match after.find("<|tool_call_end|>") {
             Some(end) => (&after[..end], &after[end + "<|tool_call_end|>".len()..]),
@@ -430,6 +436,15 @@ fn parse_lfm2_pythonic(text: &str) -> Result<Vec<ToolCall>> {
         };
         parse_pythonic_section(inner.trim(), &mut calls)?;
         rest = next;
+    }
+    // No markers at all → tolerate a bare Pythonic call list, but only when it
+    // actually looks like one (starts with `[`) so ordinary prose isn't
+    // misparsed as a call.
+    if !saw_marker {
+        let trimmed = text.trim();
+        if trimmed.starts_with('[') {
+            parse_pythonic_section(trimmed, &mut calls)?;
+        }
     }
     Ok(calls)
 }
@@ -598,12 +613,14 @@ impl<'a> PyParser<'a> {
                         b'\\' => out.push(b'\\'),
                         b'\'' => out.push(b'\''),
                         b'"' => out.push(b'"'),
-                        // `\uXXXX` → the codepoint's UTF-8 bytes. These escapes
-                        // are permitted by the generated grammar's `tc-esc`, so
-                        // the parser must decode them to agree with constrained
-                        // output. Lone surrogates fall back to U+FFFD.
+                        // `\uXXXX` → the codepoint's UTF-8 bytes, combining a
+                        // `😀`-style UTF-16 surrogate pair into the
+                        // astral codepoint. These escapes are permitted by the
+                        // generated grammar's `tc-esc`, so the parser must decode
+                        // them to agree with constrained output. Lone/unpaired
+                        // surrogates fall back to U+FFFD.
                         b'u' => {
-                            let cp = self.parse_hex4()?;
+                            let cp = self.parse_u_codepoint()?;
                             let ch = char::from_u32(cp).unwrap_or('\u{FFFD}');
                             let mut buf = [0u8; 4];
                             out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
@@ -621,6 +638,28 @@ impl<'a> PyParser<'a> {
             }
         }
         bail!("unterminated string literal")
+    }
+
+    /// Parse a `\uXXXX` escape body (the `\u` is already consumed) into a Unicode
+    /// scalar value, combining a UTF-16 surrogate pair (`😀`) into the
+    /// single astral codepoint it encodes. A lone/unpaired high surrogate is
+    /// returned as-is (the caller maps it to U+FFFD).
+    fn parse_u_codepoint(&mut self) -> Result<u32> {
+        let hi = self.parse_hex4()?;
+        // High surrogate directly followed by `\u` → try to pair it.
+        if (0xD800..=0xDBFF).contains(&hi)
+            && self.s.get(self.i) == Some(&b'\\')
+            && self.s.get(self.i + 1) == Some(&b'u')
+        {
+            self.i += 2; // consume the second `\u`
+            let lo = self.parse_hex4()?;
+            if (0xDC00..=0xDFFF).contains(&lo) {
+                return Ok(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
+            }
+            // Not a valid low surrogate: fall through, yielding the (invalid)
+            // high surrogate → U+FFFD; the malformed low half is dropped.
+        }
+        Ok(hi)
     }
 
     /// Parse exactly four hex digits (a `\uXXXX` escape body) into a codepoint.
@@ -671,6 +710,10 @@ impl<'a> PyParser<'a> {
                     let f: f64 = tok
                         .parse()
                         .map_err(|_| anyhow::anyhow!("bad integer '{tok}'"))?;
+                    // A literal beyond f64 range parses to ±inf, which
+                    // `serde_json` would silently turn into `null`; reject it
+                    // instead of dropping the value.
+                    ensure!(f.is_finite(), "integer literal '{tok}' out of range");
                     Ok(serde_json::json!(f))
                 }
             }
@@ -850,6 +893,18 @@ mod tests {
         let text = "<|tool_call_start|>[wire(amount=10000000000000000000)]<|tool_call_end|>";
         let calls = parse_tool_calls(text, ToolFormat::Lfm2Pythonic).unwrap();
         assert!(calls[0].arguments["amount"].is_number());
+        // A value beyond f64 range must error, not become a silent null.
+        let huge = "9".repeat(400);
+        let text = format!("<|tool_call_start|>[wire(amount={huge})]<|tool_call_end|>");
+        assert!(parse_tool_calls(&text, ToolFormat::Lfm2Pythonic).is_err());
+    }
+
+    #[test]
+    fn lfm2_surrogate_pair_escape() {
+        // `😀` is the UTF-16 encoding of 😀 (U+1F600).
+        let text = "<|tool_call_start|>[react(emoji=\"\\uD83D\\uDE00\")]<|tool_call_end|>";
+        let calls = parse_tool_calls(text, ToolFormat::Lfm2Pythonic).unwrap();
+        assert_eq!(calls[0].arguments["emoji"], "\u{1F600}");
     }
 
     #[test]
@@ -913,6 +968,18 @@ mod tests {
         let text = "<|tool_call_start|>[echo(msg='it\\'s ok')]<|tool_call_end|>";
         let calls = parse_tool_calls(text, ToolFormat::Lfm2Pythonic).unwrap();
         assert_eq!(calls[0].arguments, serde_json::json!({"msg": "it's ok"}));
+    }
+
+    #[test]
+    fn lfm2_bare_list_without_markers() {
+        // No markers at all, but a bare Pythonic list → parsed.
+        let calls =
+            parse_tool_calls("[get_weather(city=\"Paris\")]", ToolFormat::Lfm2Pythonic).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        // Prose that isn't a call → empty, not an error.
+        let calls = parse_tool_calls("no tools here", ToolFormat::Lfm2Pythonic).unwrap();
+        assert!(calls.is_empty());
     }
 
     #[test]
