@@ -55,7 +55,13 @@ fn model_emits_parseable_tool_call() {
 
     let engine = CeraEngine::from_path(&path, EngineConfig::default()).expect("load engine");
     let arch = engine.metadata().architecture.clone();
-    let format = ToolFormat::detect(&arch).unwrap_or(ToolFormat::Lfm2Pythonic);
+    // Skip on an unknown arch: the assertions below decode with `format`, so a
+    // wrong guess (defaulting to Pythonic for a Hermes model, say) would fail
+    // confusingly rather than exercise the real wire format.
+    let Some(format) = ToolFormat::detect(&arch) else {
+        eprintln!("skipping: no known tool-call format for arch '{arch}'");
+        return;
+    };
 
     let tools = vec![ToolDef {
         name: "get_weather".into(),
@@ -128,7 +134,12 @@ fn constrained_tool_call_with_lazy_trigger() {
 
     let engine = CeraEngine::from_path(&path, EngineConfig::default()).expect("load engine");
     let arch = engine.metadata().architecture.clone();
-    let format = ToolFormat::detect(&arch).unwrap_or(ToolFormat::Lfm2Pythonic);
+    // Skip on an unknown arch (see the note in `model_emits_parseable_tool_call`):
+    // the grammar and parser below must match the model's real wire format.
+    let Some(format) = ToolFormat::detect(&arch) else {
+        eprintln!("skipping: no known tool-call format for arch '{arch}'");
+        return;
+    };
 
     let tools = vec![ToolDef {
         name: "get_weather".into(),
