@@ -180,6 +180,216 @@ pub fn parse_tool_calls(text: &str, format: ToolFormat) -> Result<Vec<ToolCall>>
     }
 }
 
+// ── Grammar generation (constrained tool calls) ─────────────────────────────
+
+/// Build a GBNF grammar that constrains output to a valid call for one of
+/// `tools`, in the given `format`. Feed the compiled grammar to
+/// [`crate::grammar::Grammar::parse`] and set it on
+/// [`crate::session::GenerateOpts::grammar`].
+///
+/// The grammar constrains the tool-call **interior** — the marker tokens
+/// (`<|tool_call_start|>` etc.) are special tokens the grammar mask cannot emit,
+/// so they are handled by the lazy trigger instead (see
+/// [`crate::session::GenerateOpts::grammar_trigger_tokens`]). Under a lazy
+/// trigger the model emits the start marker on its own, this grammar constrains
+/// the call, and it deactivates on completion so the model can close the marker.
+///
+/// What is enforced: the call structure, the function name (must be a declared
+/// tool), each argument name (must be one of that tool's schema properties), and
+/// each argument's value **type** (string/integer/number/boolean/array/object,
+/// plus `enum` literal sets). Not yet enforced: that *required* arguments are
+/// present, and no-duplicate/ordering constraints — arguments may appear in any
+/// order and any subset. This is a deliberate v1 scope: it guarantees a
+/// well-formed, correctly-typed call without over-constraining the model.
+pub fn tool_grammar(tools: &[ToolDef], format: ToolFormat) -> Result<String> {
+    if tools.is_empty() {
+        bail!("tool_grammar: no tools provided");
+    }
+    match format {
+        ToolFormat::Lfm2Pythonic => Ok(lfm2_grammar(tools)),
+        ToolFormat::Hermes => Ok(hermes_grammar(tools)),
+    }
+}
+
+/// Shared value/whitespace rules appended to every generated grammar. `bt`
+/// selects boolean/null spelling: Pythonic (`True`/`False`/`None`) vs JSON
+/// (`true`/`false`/`null`). String syntax (double-quoted, JSON escapes) is
+/// common to both.
+fn value_rules(pythonic: bool) -> String {
+    let (t, f, n) = if pythonic {
+        ("\"True\"", "\"False\"", "\"None\"")
+    } else {
+        ("\"true\"", "\"false\"", "\"null\"")
+    };
+    format!(
+        r#"tc-value ::= tc-str | tc-num | tc-bool | tc-null | tc-array | tc-object
+tc-str ::= "\"" tc-char* "\""
+tc-char ::= [^"\\] | "\\" tc-esc
+tc-esc ::= ["\\/bfnrt] | "u" tc-hex tc-hex tc-hex tc-hex
+tc-hex ::= [0-9a-fA-F]
+tc-int ::= "-"? ("0" | [1-9] [0-9]*)
+tc-num ::= tc-int ("." [0-9]+)? ([eE] [-+]? [0-9]+)?
+tc-bool ::= {t} | {f}
+tc-null ::= {n}
+tc-array ::= "[" tc-ws ( tc-value ( tc-ws "," tc-ws tc-value )* )? tc-ws "]"
+tc-object ::= "{{" tc-ws ( tc-str tc-ws ":" tc-ws tc-value ( tc-ws "," tc-ws tc-str tc-ws ":" tc-ws tc-value )* )? tc-ws "}}"
+tc-ws ::= [ \t\n\r]*
+"#,
+    )
+}
+
+/// Escape a string to appear as a GBNF double-quoted literal body.
+fn gbnf_lit(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// GBNF alternation matching a single JSON value as a literal (for `enum`).
+/// Strings become quoted literals; scalars their literal text; anything
+/// exotic falls through to the generic `tc-value`.
+fn enum_literal(v: &Value, pythonic: bool) -> Option<String> {
+    match v {
+        Value::String(s) => Some(gbnf_lit(&format!("\"{s}\""))),
+        Value::Bool(b) => Some(gbnf_lit(match (b, pythonic) {
+            (true, true) => "True",
+            (false, true) => "False",
+            (true, false) => "true",
+            (false, false) => "false",
+        })),
+        Value::Number(n) => Some(gbnf_lit(&n.to_string())),
+        Value::Null => Some(gbnf_lit(if pythonic { "None" } else { "null" })),
+        _ => None,
+    }
+}
+
+/// The value rule (a GBNF fragment, not a named rule) for one property schema.
+fn value_for_schema(schema: &Value, pythonic: bool) -> String {
+    // `enum` overrides type: constrain to the literal set.
+    if let Some(Value::Array(variants)) = schema.get("enum") {
+        let lits: Vec<String> = variants
+            .iter()
+            .filter_map(|v| enum_literal(v, pythonic))
+            .collect();
+        if !lits.is_empty() {
+            return format!("( {} )", lits.join(" | "));
+        }
+    }
+    let ty = schema.get("type").and_then(|t| t.as_str());
+    match ty {
+        Some("string") => "tc-str".into(),
+        Some("integer") => "tc-int".into(),
+        Some("number") => "tc-num".into(),
+        Some("boolean") => "tc-bool".into(),
+        Some("array") => "tc-array".into(),
+        Some("object") => "tc-object".into(),
+        Some("null") => "tc-null".into(),
+        _ => "tc-value".into(),
+    }
+}
+
+/// Properties of a tool's parameter schema, as `(name, subschema)` pairs.
+fn properties(tool: &ToolDef) -> Vec<(String, Value)> {
+    tool.parameters
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default()
+}
+
+/// LFM2 Pythonic grammar: `[ name(arg=value, …), … ]`.
+fn lfm2_grammar(tools: &[ToolDef]) -> String {
+    let mut out = String::new();
+    // A tool call section is a Python list of one or more calls.
+    out.push_str(
+        "root ::= tc-ws \"[\" tc-ws tc-call ( tc-ws \",\" tc-ws tc-call )* tc-ws \"]\" tc-ws\n",
+    );
+    let call_alts: Vec<String> = (0..tools.len()).map(|i| format!("tc-call-{i}")).collect();
+    out.push_str(&format!("tc-call ::= {}\n", call_alts.join(" | ")));
+
+    for (i, tool) in tools.iter().enumerate() {
+        let props = properties(tool);
+        out.push_str(&format!(
+            "tc-call-{i} ::= {} tc-ws \"(\" tc-ws tc-args-{i} tc-ws \")\"\n",
+            gbnf_lit(&tool.name)
+        ));
+        if props.is_empty() {
+            // No parameters → empty arg list.
+            out.push_str(&format!("tc-args-{i} ::= \"\"\n"));
+            continue;
+        }
+        // Any subset, any order, of this tool's named+typed pairs.
+        out.push_str(&format!(
+            "tc-args-{i} ::= ( tc-pair-{i} ( tc-ws \",\" tc-ws tc-pair-{i} )* )?\n"
+        ));
+        let pair_alts: Vec<String> = (0..props.len())
+            .map(|j| format!("tc-pair-{i}-{j}"))
+            .collect();
+        out.push_str(&format!("tc-pair-{i} ::= {}\n", pair_alts.join(" | ")));
+        for (j, (name, schema)) in props.iter().enumerate() {
+            out.push_str(&format!(
+                "tc-pair-{i}-{j} ::= {} tc-ws \"=\" tc-ws {}\n",
+                gbnf_lit(name),
+                value_for_schema(schema, true)
+            ));
+        }
+    }
+    out.push_str(&value_rules(true));
+    out
+}
+
+/// Hermes grammar: `<tool_call>` JSON blocks — but the markers are special
+/// tokens handled by the trigger, so this constrains the JSON object body:
+/// `{"name": "<one of the tools>", "arguments": { … }}`.
+fn hermes_grammar(tools: &[ToolDef]) -> String {
+    let mut out = String::new();
+    out.push_str("root ::= tc-ws tc-call tc-ws\n");
+    let call_alts: Vec<String> = (0..tools.len()).map(|i| format!("tc-call-{i}")).collect();
+    out.push_str(&format!("tc-call ::= {}\n", call_alts.join(" | ")));
+
+    for (i, tool) in tools.iter().enumerate() {
+        let props = properties(tool);
+        // {"name": "tool", "arguments": <args>} — the name *value* is a JSON
+        // string, so it carries its own surrounding quotes.
+        out.push_str(&format!(
+            "tc-call-{i} ::= \"{{\" tc-ws \"\\\"name\\\"\" tc-ws \":\" tc-ws {} tc-ws \",\" tc-ws \"\\\"arguments\\\"\" tc-ws \":\" tc-ws tc-args-{i} tc-ws \"}}\"\n",
+            gbnf_lit(&format!("\"{}\"", tool.name))
+        ));
+        if props.is_empty() {
+            out.push_str(&format!("tc-args-{i} ::= \"{{\" tc-ws \"}}\"\n"));
+            continue;
+        }
+        out.push_str(&format!(
+            "tc-args-{i} ::= \"{{\" tc-ws ( tc-pair-{i} ( tc-ws \",\" tc-ws tc-pair-{i} )* )? tc-ws \"}}\"\n"
+        ));
+        let pair_alts: Vec<String> = (0..props.len())
+            .map(|j| format!("tc-pair-{i}-{j}"))
+            .collect();
+        out.push_str(&format!("tc-pair-{i} ::= {}\n", pair_alts.join(" | ")));
+        for (j, (name, schema)) in props.iter().enumerate() {
+            // JSON key is a quoted string.
+            out.push_str(&format!(
+                "tc-pair-{i}-{j} ::= {} tc-ws \":\" tc-ws {}\n",
+                gbnf_lit(&format!("\"{name}\"")),
+                value_for_schema(schema, false)
+            ));
+        }
+    }
+    out.push_str(&value_rules(false));
+    out
+}
+
 // ── LFM2 Pythonic parser ────────────────────────────────────────────────────
 
 /// Parse `<|tool_call_start|>[name(a="x", b=3), other()]<|tool_call_end|>`.
@@ -591,6 +801,120 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "a");
         assert_eq!(calls[1].name, "b");
+    }
+
+    fn compile(src: &str) -> std::sync::Arc<crate::grammar::Grammar> {
+        std::sync::Arc::new(
+            crate::grammar::Grammar::parse(src)
+                .unwrap_or_else(|e| panic!("grammar failed to compile: {e}\n---\n{src}")),
+        )
+    }
+
+    /// True iff the grammar accepts `bytes` and reaches a complete (terminable)
+    /// state with no leftover requirement.
+    fn accepts_complete(g: &std::sync::Arc<crate::grammar::Grammar>, bytes: &[u8]) -> bool {
+        let mut st = crate::grammar::GrammarState::new(g.clone());
+        if !st.accepts(bytes) {
+            return false;
+        }
+        st.accept(bytes);
+        st.is_complete()
+    }
+
+    fn weather() -> ToolDef {
+        ToolDef {
+            name: "get_weather".into(),
+            description: None,
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer"},
+                    "units": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                },
+                "required": ["city"]
+            }),
+        }
+    }
+
+    #[test]
+    fn lfm2_grammar_accepts_valid_calls() {
+        let g = compile(&tool_grammar(&[weather()], ToolFormat::Lfm2Pythonic).unwrap());
+        assert!(accepts_complete(&g, b"[get_weather(city=\"Paris\")]"));
+        assert!(accepts_complete(
+            &g,
+            b"[get_weather(city=\"Paris\", days=3)]"
+        ));
+        assert!(accepts_complete(
+            &g,
+            b"[get_weather(units=\"celsius\", city=\"Rome\")]"
+        ));
+        assert!(accepts_complete(&g, b"[get_weather()]"));
+    }
+
+    #[test]
+    fn lfm2_grammar_rejects_invalid_calls() {
+        let g = compile(&tool_grammar(&[weather()], ToolFormat::Lfm2Pythonic).unwrap());
+        // Unknown function name.
+        let st = crate::grammar::GrammarState::new(g.clone());
+        assert!(!st.accepts(b"[get_stocks("));
+        // Unknown argument name.
+        let st = crate::grammar::GrammarState::new(g.clone());
+        assert!(!st.accepts(b"[get_weather(country="));
+        // Wrong type for `days` (integer schema, string given).
+        let st = crate::grammar::GrammarState::new(g.clone());
+        assert!(!st.accepts(b"[get_weather(days=\""));
+        // Enum violation for `units`.
+        let st = crate::grammar::GrammarState::new(g.clone());
+        assert!(!st.accepts(b"[get_weather(units=\"kelvin\")"));
+    }
+
+    #[test]
+    fn hermes_grammar_accepts_json_call() {
+        let g = compile(&tool_grammar(&[weather()], ToolFormat::Hermes).unwrap());
+        assert!(accepts_complete(
+            &g,
+            br#"{"name": "get_weather", "arguments": {"city": "Paris"}}"#
+        ));
+        assert!(accepts_complete(
+            &g,
+            br#"{"name": "get_weather", "arguments": {"city": "Rome", "days": 5}}"#
+        ));
+    }
+
+    #[test]
+    fn hermes_grammar_rejects_bad_name() {
+        let g = compile(&tool_grammar(&[weather()], ToolFormat::Hermes).unwrap());
+        let st = crate::grammar::GrammarState::new(g.clone());
+        assert!(!st.accepts(br#"{"name": "get_stocks"#));
+    }
+
+    #[test]
+    fn multi_tool_grammar_alternates() {
+        let tools = vec![
+            weather(),
+            ToolDef {
+                name: "add".into(),
+                description: None,
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}}
+                }),
+            },
+        ];
+        let g = compile(&tool_grammar(&tools, ToolFormat::Lfm2Pythonic).unwrap());
+        assert!(accepts_complete(&g, b"[get_weather(city=\"Paris\")]"));
+        assert!(accepts_complete(&g, b"[add(a=1, b=2)]"));
+        // Multiple calls in one section.
+        assert!(accepts_complete(
+            &g,
+            b"[add(a=1, b=2), get_weather(city=\"X\")]"
+        ));
+    }
+
+    #[test]
+    fn empty_tools_is_error() {
+        assert!(tool_grammar(&[], ToolFormat::Lfm2Pythonic).is_err());
     }
 
     #[test]

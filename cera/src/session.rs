@@ -76,6 +76,15 @@ pub struct GenerateOpts {
     /// logits to only tokens the grammar accepts (EOS only when the grammar is
     /// complete). Forces off the greedy `forward_greedy` fast path. See [`crate::grammar`].
     pub grammar: Option<Arc<crate::grammar::Grammar>>,
+    /// Lazy-grammar trigger tokens (tool calling). When non-empty *and* `grammar`
+    /// is set, the grammar stays **inactive** — decode samples freely — until one
+    /// of these tokens is emitted by the model. From the next step the grammar
+    /// constrains output; once the grammar reaches a complete state it deactivates
+    /// again so the model can emit its closing marker and continue/stop normally.
+    /// Empty → `grammar` (if any) is active from the first token. Mirrors
+    /// llama.cpp's lazy grammar triggers: free text, then a constrained tool call
+    /// only after the start marker appears. See [`crate::tools`].
+    pub grammar_trigger_tokens: Vec<u32>,
     /// Emit `on_text_tokens` at least every N tokens. `0` treats as 1.
     pub flush_every_tokens: u32,
     /// Emit `on_text_tokens` at least every N milliseconds. `0` disables time-based flushing.
@@ -93,6 +102,7 @@ impl Default for GenerateOpts {
             repetition_penalty: 1.0,
             stop_tokens: Vec::new(),
             grammar: None,
+            grammar_trigger_tokens: Vec::new(),
             flush_every_tokens: 16,
             flush_every_ms: 50,
         }
@@ -1528,6 +1538,17 @@ impl Session {
             .as_ref()
             .map(|g| crate::grammar::GrammarState::new(g.clone()));
 
+        // Lazy tool-call trigger. When trigger tokens are supplied alongside a
+        // grammar, the grammar starts inactive (`armed = false`): decode samples
+        // freely until the model emits a trigger token (e.g. `<|tool_call_start|>`),
+        // then the grammar constrains the tool-call interior. On completion it
+        // deactivates again (`triggered_done`) so the model can emit its closing
+        // marker and finish normally. A grammar with no triggers is active from the
+        // first token, preserving the original constrained-decode behavior.
+        let lazy_trigger = grammar_active && !opts.grammar_trigger_tokens.is_empty();
+        let mut armed = grammar_active && !lazy_trigger;
+        let mut triggered_done = false;
+
         // Stochastic-only state. Allocating the scratch buffer and syncing
         // the sampler are skipped in greedy mode where neither is touched.
         let mut sample_scratch: Vec<f32> = if greedy {
@@ -1581,7 +1602,9 @@ impl Session {
             } else {
                 sample_scratch.clear();
                 sample_scratch.extend_from_slice(&logits);
-                if let Some(state) = grammar_state.as_ref() {
+                // Mask only while armed. During the lazy pre-trigger phase (or
+                // after a completed tool call) decode is unconstrained.
+                if armed && let Some(state) = grammar_state.as_ref() {
                     // Mask logits to grammar-allowed tokens (EOS only when complete).
                     let allowed = grammar_mask
                         .as_ref()
@@ -1599,11 +1622,14 @@ impl Session {
                 }
             };
 
-            // Stop on EOS or an explicit stop token — but when a grammar is active, only
-            // once it permits termination. Otherwise an early stop token could truncate
-            // mid-derivation (e.g. exit mid-JSON), breaking the conformance guarantee.
-            // (EOS is already mask-gated to `is_complete`; this also gates `stop_tokens`.)
-            let stop_allowed = grammar_state.as_ref().is_none_or(|s| s.is_complete());
+            // Stop on EOS or an explicit stop token — but while a grammar is
+            // *actively* constraining, only once it permits termination. Otherwise
+            // an early stop token could truncate mid-derivation (e.g. exit mid-JSON),
+            // breaking the conformance guarantee. (EOS is already mask-gated to
+            // `is_complete` while armed; this also gates `stop_tokens`.) When not
+            // armed — the lazy pre-trigger phase or after a completed call — stopping
+            // is always allowed, so free text can end on EOS as usual.
+            let stop_allowed = !armed || grammar_state.as_ref().is_none_or(|s| s.is_complete());
             if stop_allowed
                 && (self.tokenizer.eos_token() == Some(token) || opts.stop_tokens.contains(&token))
             {
@@ -1611,9 +1637,25 @@ impl Session {
                 break;
             }
 
-            // Advance the grammar by the chosen (grammar-valid, non-EOS) token's bytes.
-            if let Some(state) = grammar_state.as_mut() {
+            // Arm the grammar when the model emits a trigger token during the lazy
+            // pre-trigger phase. The trigger token itself (a special marker) is not
+            // part of the interior grammar, so it is not accepted into the state —
+            // constraint begins on the next token.
+            if lazy_trigger
+                && !armed
+                && !triggered_done
+                && opts.grammar_trigger_tokens.contains(&token)
+            {
+                armed = true;
+            } else if armed && let Some(state) = grammar_state.as_mut() {
+                // Advance the grammar by the chosen (grammar-valid, non-EOS) token.
                 state.accept(grammar_mask.as_ref().unwrap().token_bytes(token));
+                // For a lazy tool-call grammar, deactivate once the interior is
+                // complete so the model can emit its closing marker and continue.
+                if lazy_trigger && state.is_complete() {
+                    armed = false;
+                    triggered_done = true;
+                }
             }
 
             pending.push(token);

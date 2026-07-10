@@ -111,3 +111,87 @@ fn model_emits_parseable_tool_call() {
         calls[0]
     );
 }
+
+/// The lazy-trigger + constrained path: free text until `<|tool_call_start|>`,
+/// then the generated grammar forces a well-formed, correctly-typed call.
+#[test]
+fn constrained_tool_call_with_lazy_trigger() {
+    use std::sync::Arc;
+
+    use cera::grammar::Grammar;
+    use cera::tools::tool_grammar;
+
+    let Some(path) = model_path() else {
+        eprintln!("skipping: no tool-trained GGUF (set CERA_TOOLS_TEST_MODEL)");
+        return;
+    };
+
+    let engine = CeraEngine::from_path(&path, EngineConfig::default()).expect("load engine");
+    let arch = engine.metadata().architecture.clone();
+    let format = ToolFormat::detect(&arch).unwrap_or(ToolFormat::Lfm2Pythonic);
+
+    let tools = vec![ToolDef {
+        name: "get_weather".into(),
+        description: Some("Get the current weather for a given city".into()),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "city": { "type": "string", "description": "City name" },
+                "units": { "type": "string", "enum": ["celsius", "fahrenheit"] }
+            },
+            "required": ["city"]
+        }),
+    }];
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: "What is the weather in Tokyo?".into(),
+    }];
+
+    let prompt = apply_chat_template_with_tools(engine.tokenizer(), &messages, &tools, true)
+        .expect("render tools prompt");
+
+    // Build the constraint grammar + resolve the start-marker trigger token.
+    let gbnf = tool_grammar(&tools, format).expect("tool grammar");
+    let grammar = Arc::new(Grammar::parse(&gbnf).expect("compile grammar"));
+    let trigger = engine
+        .tokenizer()
+        .special_token_id(format.call_start_marker())
+        .expect("model has the start-marker special token");
+
+    let mut session = engine
+        .new_session(SessionConfig::default())
+        .expect("session");
+    session.append_text(&prompt).expect("append prompt");
+
+    let sink = Rc::new(RefCell::new(CollectSink {
+        tokens: Vec::new(),
+        done: None,
+    }));
+    let opts = GenerateOpts {
+        max_tokens: 128,
+        temperature: 0.0,
+        grammar: Some(grammar),
+        grammar_trigger_tokens: vec![trigger],
+        ..Default::default()
+    };
+    {
+        let mut s = sink.borrow_mut();
+        session.generate(&opts, &mut *s).expect("generate");
+    }
+
+    let out = engine.tokenizer().decode(&sink.borrow().tokens);
+    eprintln!("--- constrained arch={arch} ---\n{out}\n--- end ---");
+
+    let calls = parse_tool_calls(&out, format).expect("parse tool calls");
+    assert!(!calls.is_empty(), "no tool call under constraint:\n{out}");
+    assert_eq!(calls[0].name, "get_weather");
+    // The grammar guarantees only declared arg names appear.
+    if let Some(obj) = calls[0].arguments.as_object() {
+        for k in obj.keys() {
+            assert!(
+                k == "city" || k == "units",
+                "grammar allowed an undeclared argument '{k}': {out}"
+            );
+        }
+    }
+}
