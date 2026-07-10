@@ -711,13 +711,19 @@ impl<'a> PyParser<'a> {
             && self.s.get(self.i) == Some(&b'\\')
             && self.s.get(self.i + 1) == Some(&b'u')
         {
-            self.i += 2; // consume the second `\u`
+            let before_second = self.i; // start of the trailing `\u…`
+            self.i += 2; // tentatively consume the second `\u`
             let lo = self.parse_hex4()?;
             if (0xDC00..=0xDFFF).contains(&lo) {
                 return Ok(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
             }
-            // Not a valid low surrogate: fall through, yielding the (invalid)
-            // high surrogate → U+FFFD; the malformed low half is dropped.
+            // Not a valid low surrogate: rewind so the trailing escape is
+            // decoded on its own rather than consumed and dropped. A high
+            // surrogate followed by a non-low-surrogate `\u` escape (e.g. the
+            // second escape is `A`) then yields U+FFFD (the unpaired high
+            // surrogate, via the caller) followed by the second escape's own
+            // character, instead of just U+FFFD with the second escape lost.
+            self.i = before_second;
         }
         Ok(hi)
     }
@@ -1016,6 +1022,16 @@ mod tests {
         let text = "<|tool_call_start|>[react(emoji=\"\\uD83D\\uDE00\")]<|tool_call_end|>";
         let calls = parse_tool_calls(text, ToolFormat::Lfm2Pythonic).unwrap();
         assert_eq!(calls[0].arguments["emoji"], "\u{1F600}");
+    }
+
+    #[test]
+    fn lfm2_unpaired_high_surrogate_keeps_following_escape() {
+        // A high surrogate followed by a `\u` escape that is NOT a low surrogate:
+        // the high surrogate becomes U+FFFD, but the second escape (`A`) must
+        // still be decoded — not consumed and dropped.
+        let text = "<|tool_call_start|>[f(s=\"\\uD83D\\u0041\")]<|tool_call_end|>";
+        let calls = parse_tool_calls(text, ToolFormat::Lfm2Pythonic).unwrap();
+        assert_eq!(calls[0].arguments["s"], "\u{FFFD}A");
     }
 
     #[test]
