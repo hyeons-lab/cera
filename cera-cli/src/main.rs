@@ -2384,32 +2384,30 @@ fn main() -> Result<()> {
                 eprintln!("Prefill: {:.1} tok/s", prefill_tps);
                 eprintln!("Decode: {:.1} tok/s", decode_tps);
 
-                // Parse and report any tool calls in the reply. stdout always
-                // gets a JSON array (possibly `[]`) so automation can tell "no
-                // call" apart from "no output"; the human summary goes to stderr.
-                // `writeln!` (not `println!`) so a closed pipe surfaces as an
-                // ignored error instead of a panic.
+                // Parse and report any tool calls in the reply. Three distinct
+                // outcomes so automation can tell them apart:
+                //   - calls found → stdout gets `[{…}]`, exit 0
+                //   - no call     → stdout gets `[]`,    exit 0
+                //   - parse error → stdout gets nothing, non-zero exit (the
+                //                   error propagates), so a *malformed* tool-call
+                //                   section is distinct from "the model didn't
+                //                   call a tool".
+                // The human summary goes to stderr. `writeln!` (not `println!`)
+                // so a closed pipe surfaces as an ignored error, not a panic.
                 if let (Some(fmt), Some(text)) = (tool_format, reply_text) {
-                    let calls = match cera::tools::parse_tool_calls(&text, fmt) {
-                        Ok(calls) => {
-                            if calls.is_empty() {
-                                eprintln!("--- (no tool calls in reply)");
-                            } else {
-                                eprintln!("---");
-                                eprintln!("Tool calls ({}):", calls.len());
-                                for (i, c) in calls.iter().enumerate() {
-                                    let args = serde_json::to_string(&c.arguments)
-                                        .unwrap_or_else(|_| "<unserializable>".into());
-                                    eprintln!("  [{i}] {}({args})", c.name);
-                                }
-                            }
-                            calls
+                    let calls = cera::tools::parse_tool_calls(&text, fmt)
+                        .context("parsing tool calls from model reply")?;
+                    if calls.is_empty() {
+                        eprintln!("--- (no tool calls in reply)");
+                    } else {
+                        eprintln!("---");
+                        eprintln!("Tool calls ({}):", calls.len());
+                        for (i, c) in calls.iter().enumerate() {
+                            let args = serde_json::to_string(&c.arguments)
+                                .unwrap_or_else(|_| "<unserializable>".into());
+                            eprintln!("  [{i}] {}({args})", c.name);
                         }
-                        Err(e) => {
-                            eprintln!("--- tool-call parse error: {e:#}");
-                            Vec::new()
-                        }
-                    };
+                    }
                     let json = serde_json::to_string(&calls).unwrap_or_else(|_| "[]".into());
                     let mut out = std::io::stdout().lock();
                     let _ = writeln!(out, "{json}");

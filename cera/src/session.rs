@@ -1505,6 +1505,14 @@ impl Session {
         // model and never returns logits). When a grammar is active we always take the
         // logits-returning path; `want_greedy` still picks argmax-vs-sample over the
         // *masked* logits, so `--temperature 0 --grammar ...` stays deterministic.
+        //
+        // Trade-off for the lazy tool-call trigger: with a trigger token the grammar
+        // is inactive during the pre-trigger free-text phase, so that span *could*
+        // run on `forward_greedy` and only switch to the logits path once armed.
+        // We keep it on the single logits path for the whole generation instead —
+        // switching kernels mid-loop would complicate the reproducibility-critical
+        // decode body (see the RNG-step note below) for a path that is typically
+        // short. Revisit if pre-trigger prose dominates a real workload.
         let want_greedy = opts.temperature <= 0.0 || opts.top_k == 1;
         let greedy = want_greedy && opts.grammar.is_none();
 
