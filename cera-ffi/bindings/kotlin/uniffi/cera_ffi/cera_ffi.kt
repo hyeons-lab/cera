@@ -838,6 +838,12 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_func_cpu_backend_report(): Int
 
+    external fun uniffi_cera_ffi_checksum_func_detect_tool_format(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_parse_tool_calls(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_tool_grammar(): Int
+
     external fun uniffi_cera_ffi_checksum_method_bundlerepo_cache_size(): Int
 
     external fun uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache(): Int
@@ -845,6 +851,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_bundlerepo_store_dir(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_bos_token(): Int
 
@@ -867,6 +875,10 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_ceraengine_new_session(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_special_token_id(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_tool_format(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_transcribe(): Int
 
@@ -1025,6 +1037,14 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template_with_tools(
+        `ptr`: Long,
+        `messages`: RustBuffer.ByValue,
+        `tools`: RustBuffer.ByValue,
+        `addGenerationPrompt`: Byte,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_method_ceraengine_bos_token(
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -1082,6 +1102,17 @@ internal object UniffiLib {
     external fun uniffi_cera_ffi_fn_method_ceraengine_special_token_id(
         `ptr`: Long,
         `name`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ceraengine_tool_call_start_token(
+        `ptr`: Long,
+        `format`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ceraengine_tool_format(
+        `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
@@ -1310,6 +1341,23 @@ internal object UniffiLib {
 
     external fun uniffi_cera_ffi_fn_func_cpu_backend_report(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_func_detect_tool_format(
+        `architecture`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_parse_tool_calls(
+        `text`: RustBuffer.ByValue,
+        `format`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_tool_grammar(
+        `tools`: RustBuffer.ByValue,
+        `format`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun ffi_cera_ffi_rustbuffer_alloc(
         `size`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -1530,6 +1578,15 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_func_cpu_backend_report() != 61086) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_parse_tool_calls() != 47579) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_tool_grammar() != 41383) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1540,6 +1597,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template() != 38712) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools() != 46076) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token() != 30744) {
@@ -1573,6 +1633,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token() != 23833) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_tool_format() != 33648) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_transcribe() != 9680) {
@@ -2610,6 +2676,17 @@ public interface CeraEngineInterface {
     ): kotlin.String
 
     /**
+     * Like [`CeraEngine::apply_chat_template`], but also passes a `tools`
+     * array so a tool-trained model renders its tool-definition block. Pass an
+     * empty `tools` for identical behavior to the plain call.
+     */
+    fun `applyChatTemplateWithTools`(
+        `messages`: List<ChatMessage>,
+        `tools`: List<ToolDef>,
+        `addGenerationPrompt`: kotlin.Boolean,
+    ): kotlin.String
+
+    /**
      * Beginning-of-sequence token ID, if the model has one.
      * LLaMA-family models typically do; some don't. Honor
      * [`ModelMetadata::add_bos_token`] when deciding whether to
@@ -2705,6 +2782,20 @@ public interface CeraEngineInterface {
      * isn't defined in the tokenizer's vocab.
      */
     fun `specialTokenId`(`name`: kotlin.String): kotlin.UInt?
+
+    /**
+     * The token id of `format`'s tool-call start marker (e.g.
+     * `<|tool_call_start|>`) in this model's vocab, for use as a lazy grammar
+     * trigger in `GenerateOpts.grammar_trigger_tokens`. `None` if the model's
+     * tokenizer lacks that special token.
+     */
+    fun `toolCallStartToken`(`format`: ToolFormat): kotlin.UInt?
+
+    /**
+     * The tool-call format auto-detected from this model's architecture, or
+     * `None` if the architecture has no known tool convention.
+     */
+    fun `toolFormat`(): ToolFormat?
 
     /**
      * Transcribe mono `f32` PCM audio (normalized to roughly `[-1.0, 1.0]`) to text using the
@@ -2858,6 +2949,31 @@ open class CeraEngine :
                     UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template(
                         it,
                         FfiConverterSequenceTypeChatMessage.lower(`messages`),
+                        FfiConverterBoolean.lower(`addGenerationPrompt`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Like [`CeraEngine::apply_chat_template`], but also passes a `tools`
+     * array so a tool-trained model renders its tool-definition block. Pass an
+     * empty `tools` for identical behavior to the plain call.
+     */
+    @Throws(FfiException::class)
+    override fun `applyChatTemplateWithTools`(
+        `messages`: List<ChatMessage>,
+        `tools`: List<ToolDef>,
+        `addGenerationPrompt`: kotlin.Boolean,
+    ): kotlin.String =
+        FfiConverterString.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template_with_tools(
+                        it,
+                        FfiConverterSequenceTypeChatMessage.lower(`messages`),
+                        FfiConverterSequenceTypeToolDef.lower(`tools`),
                         FfiConverterBoolean.lower(`addGenerationPrompt`),
                         _status,
                     )
@@ -3072,6 +3188,41 @@ open class CeraEngine :
                     UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_special_token_id(
                         it,
                         FfiConverterString.lower(`name`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * The token id of `format`'s tool-call start marker (e.g.
+     * `<|tool_call_start|>`) in this model's vocab, for use as a lazy grammar
+     * trigger in `GenerateOpts.grammar_trigger_tokens`. `None` if the model's
+     * tokenizer lacks that special token.
+     */
+    override fun `toolCallStartToken`(`format`: ToolFormat): kotlin.UInt? =
+        FfiConverterOptionalUInt.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_tool_call_start_token(
+                        it,
+                        FfiConverterTypeToolFormat.lower(`format`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * The tool-call format auto-detected from this model's architecture, or
+     * `None` if the architecture has no known tool convention.
+     */
+    override fun `toolFormat`(): ToolFormat? =
+        FfiConverterOptionalTypeToolFormat.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_tool_format(
+                        it,
                         _status,
                     )
                 }
@@ -5674,6 +5825,14 @@ data class GenerateOpts(
      */
     var `grammar`: kotlin.String?,
     /**
+     * Lazy-grammar trigger token ids (tool calling). When non-empty and
+     * `grammar` is set, the grammar stays inactive until the model emits one
+     * of these tokens (e.g. the tool-call start marker from
+     * [`CeraEngine::tool_call_start_token`]), then constrains the call and
+     * deactivates on completion. Empty → `grammar` is active from the start.
+     */
+    var `grammarTriggerTokens`: List<kotlin.UInt>,
+    /**
      * Ignored under synchronous generate; reserved for streaming.
      */
     var `flushEveryTokens`: kotlin.UInt,
@@ -5699,6 +5858,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
             FfiConverterFloat.read(buf),
             FfiConverterSequenceUInt.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterSequenceUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
         )
@@ -5713,6 +5873,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
                 FfiConverterFloat.allocationSize(value.`repetitionPenalty`) +
                 FfiConverterSequenceUInt.allocationSize(value.`stopTokens`) +
                 FfiConverterOptionalString.allocationSize(value.`grammar`) +
+                FfiConverterSequenceUInt.allocationSize(value.`grammarTriggerTokens`) +
                 FfiConverterUInt.allocationSize(value.`flushEveryTokens`) +
                 FfiConverterUInt.allocationSize(value.`flushEveryMs`)
         )
@@ -5729,6 +5890,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
         FfiConverterFloat.write(value.`repetitionPenalty`, buf)
         FfiConverterSequenceUInt.write(value.`stopTokens`, buf)
         FfiConverterOptionalString.write(value.`grammar`, buf)
+        FfiConverterSequenceUInt.write(value.`grammarTriggerTokens`, buf)
         FfiConverterUInt.write(value.`flushEveryTokens`, buf)
         FfiConverterUInt.write(value.`flushEveryMs`, buf)
     }
@@ -6000,6 +6162,91 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
         FfiConverterUInt.write(value.`nKeep`, buf)
         FfiConverterOptionalULong.write(value.`seed`, buf)
         FfiConverterUInt.write(value.`ubatchSize`, buf)
+    }
+}
+
+/**
+ * A tool call parsed from model output. Mirrors [`cera::tools::ToolCall`];
+ * `arguments_json` is the argument object encoded as a JSON string.
+ */
+data class ToolCall(
+    var `name`: kotlin.String,
+    /**
+     * The argument object as a JSON string (e.g. `{"city":"Paris"}`).
+     */
+    var `argumentsJson`: kotlin.String,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeToolCall : FfiConverterRustBuffer<ToolCall> {
+    override fun read(buf: ByteBuffer): ToolCall =
+        ToolCall(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+
+    override fun allocationSize(value: ToolCall) =
+        (
+            FfiConverterString.allocationSize(value.`name`) +
+                FfiConverterString.allocationSize(value.`argumentsJson`)
+        )
+
+    override fun write(
+        value: ToolCall,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`name`, buf)
+        FfiConverterString.write(value.`argumentsJson`, buf)
+    }
+}
+
+/**
+ * A tool the model may call. Mirrors [`cera::tools::ToolDef`], but the
+ * JSON Schema for the arguments crosses the boundary as a JSON **string**
+ * (`parameters_json`) since UniFFI has no arbitrary-JSON type. An empty
+ * `parameters_json` means "no parameters".
+ */
+data class ToolDef(
+    var `name`: kotlin.String,
+    var `description`: kotlin.String?,
+    /**
+     * JSON Schema object for the arguments, as a JSON string (e.g.
+     * `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
+     */
+    var `parametersJson`: kotlin.String,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeToolDef : FfiConverterRustBuffer<ToolDef> {
+    override fun read(buf: ByteBuffer): ToolDef =
+        ToolDef(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+        )
+
+    override fun allocationSize(value: ToolDef) =
+        (
+            FfiConverterString.allocationSize(value.`name`) +
+                FfiConverterOptionalString.allocationSize(value.`description`) +
+                FfiConverterString.allocationSize(value.`parametersJson`)
+        )
+
+    override fun write(
+        value: ToolDef,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`name`, buf)
+        FfiConverterOptionalString.write(value.`description`, buf)
+        FfiConverterString.write(value.`parametersJson`, buf)
     }
 }
 
@@ -6727,6 +6974,52 @@ public object FfiConverterTypeKvCompression : FfiConverterRustBuffer<KvCompressi
 }
 
 /**
+ * The tool-call wire format a model family uses. Mirrors
+ * [`cera::tools::ToolFormat`]. Get one from
+ * [`CeraEngine::tool_format`] (auto-detected from the model) or set it
+ * explicitly.
+ */
+
+enum class ToolFormat {
+    /**
+     * LFM2 / LFM2.5: Pythonic `[get_weather(city="Paris")]` in
+     * `<|tool_call_start|>…<|tool_call_end|>`.
+     */
+    LFM2_PYTHONIC,
+
+    /**
+     * Hermes / Qwen: JSON `{"name":…,"arguments":{…}}` in
+     * `<tool_call>…</tool_call>`.
+     */
+    HERMES,
+
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeToolFormat : FfiConverterRustBuffer<ToolFormat> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            ToolFormat.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: ToolFormat) = 4UL
+
+    override fun write(
+        value: ToolFormat,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+/**
  * @suppress
  */
 public object FfiConverterOptionalUInt : FfiConverterRustBuffer<kotlin.UInt?> {
@@ -6889,6 +7182,38 @@ public object FfiConverterOptionalTypeBundleRepo : FfiConverterRustBuffer<Bundle
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeToolFormat : FfiConverterRustBuffer<ToolFormat?> {
+    override fun read(buf: ByteBuffer): ToolFormat? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeToolFormat.read(buf)
+    }
+
+    override fun allocationSize(value: ToolFormat?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeToolFormat.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: ToolFormat?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeToolFormat.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceUInt : FfiConverterRustBuffer<List<kotlin.UInt>> {
     override fun read(buf: ByteBuffer): List<kotlin.UInt> {
         val len = buf.getInt()
@@ -6971,6 +7296,62 @@ public object FfiConverterSequenceTypeChatMessage : FfiConverterRustBuffer<List<
 }
 
 /**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeToolCall : FfiConverterRustBuffer<List<ToolCall>> {
+    override fun read(buf: ByteBuffer): List<ToolCall> {
+        val len = buf.getInt()
+        return List<ToolCall>(len) {
+            FfiConverterTypeToolCall.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<ToolCall>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeToolCall.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<ToolCall>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeToolCall.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeToolDef : FfiConverterRustBuffer<List<ToolDef>> {
+    override fun read(buf: ByteBuffer): List<ToolDef> {
+        val len = buf.getInt()
+        return List<ToolDef>(len) {
+            FfiConverterTypeToolDef.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<ToolDef>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeToolDef.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<ToolDef>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeToolDef.write(it, buf)
+        }
+    }
+}
+
+/**
  * Version string of the `cera-ffi` crate. Useful as a smoke test
  * from the foreign-language side — if this is callable, the binding
  * pipeline works end-to-end.
@@ -6992,5 +7373,59 @@ fun `cpuBackendReport`(): kotlin.String =
     FfiConverterString.lift(
         uniffiRustCall { _status ->
             UniffiLib.uniffi_cera_ffi_fn_func_cpu_backend_report(_status)
+        },
+    )
+
+/**
+ * Detect the tool-call format for a model architecture string (e.g.
+ * `"lfm2"`, `"qwen3"`). Returns `None` for architectures with no known
+ * convention — the caller may still choose a format explicitly.
+ */
+fun `detectToolFormat`(`architecture`: kotlin.String): ToolFormat? =
+    FfiConverterOptionalTypeToolFormat.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_detect_tool_format(FfiConverterString.lower(`architecture`), _status)
+        },
+    )
+
+/**
+ * Parse tool calls out of generated model text for the given `format`.
+ * Returns an empty list when the reply contains no tool call (the model
+ * answered in prose). Errors only when a call section is present but
+ * unrecoverably malformed.
+ */
+@Throws(FfiException::class)
+fun `parseToolCalls`(
+    `text`: kotlin.String,
+    `format`: ToolFormat,
+): List<ToolCall> =
+    FfiConverterSequenceTypeToolCall.lift(
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_parse_tool_calls(
+                FfiConverterString.lower(`text`),
+                FfiConverterTypeToolFormat.lower(`format`),
+                _status,
+            )
+        },
+    )
+
+/**
+ * Build a GBNF grammar string constraining output to a valid call for one
+ * of `tools`, in `format`. Put the result in `GenerateOpts.grammar` and set
+ * `GenerateOpts.grammar_trigger_tokens` (see
+ * [`CeraEngine::tool_call_start_token`]) for a lazy tool-call trigger.
+ */
+@Throws(FfiException::class)
+fun `toolGrammar`(
+    `tools`: List<ToolDef>,
+    `format`: ToolFormat,
+): kotlin.String =
+    FfiConverterString.lift(
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_tool_grammar(
+                FfiConverterSequenceTypeToolDef.lower(`tools`),
+                FfiConverterTypeToolFormat.lower(`format`),
+                _status,
+            )
         },
     )

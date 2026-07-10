@@ -850,6 +850,13 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
     func applyChatTemplate(messages: [ChatMessage], addGenerationPrompt: Bool) throws  -> String
     
     /**
+     * Like [`CeraEngine::apply_chat_template`], but also passes a `tools`
+     * array so a tool-trained model renders its tool-definition block. Pass an
+     * empty `tools` for identical behavior to the plain call.
+     */
+    func applyChatTemplateWithTools(messages: [ChatMessage], tools: [ToolDef], addGenerationPrompt: Bool) throws  -> String
+    
+    /**
      * Beginning-of-sequence token ID, if the model has one.
      * LLaMA-family models typically do; some don't. Honor
      * [`ModelMetadata::add_bos_token`] when deciding whether to
@@ -945,6 +952,20 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
      * isn't defined in the tokenizer's vocab.
      */
     func specialTokenId(name: String)  -> UInt32?
+    
+    /**
+     * The token id of `format`'s tool-call start marker (e.g.
+     * `<|tool_call_start|>`) in this model's vocab, for use as a lazy grammar
+     * trigger in `GenerateOpts.grammar_trigger_tokens`. `None` if the model's
+     * tokenizer lacks that special token.
+     */
+    func toolCallStartToken(format: ToolFormat)  -> UInt32?
+    
+    /**
+     * The tool-call format auto-detected from this model's architecture, or
+     * `None` if the architecture has no known tool convention.
+     */
+    func toolFormat()  -> ToolFormat?
     
     /**
      * Transcribe mono `f32` PCM audio (normalized to roughly `[-1.0, 1.0]`) to text using the
@@ -1139,6 +1160,22 @@ open func applyChatTemplate(messages: [ChatMessage], addGenerationPrompt: Bool)t
 }
     
     /**
+     * Like [`CeraEngine::apply_chat_template`], but also passes a `tools`
+     * array so a tool-trained model renders its tool-definition block. Pass an
+     * empty `tools` for identical behavior to the plain call.
+     */
+open func applyChatTemplateWithTools(messages: [ChatMessage], tools: [ToolDef], addGenerationPrompt: Bool)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template_with_tools(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypeChatMessage.lower(messages),
+        FfiConverterSequenceTypeToolDef.lower(tools),
+        FfiConverterBool.lower(addGenerationPrompt),$0
+    )
+})
+}
+    
+    /**
      * Beginning-of-sequence token ID, if the model has one.
      * LLaMA-family models typically do; some don't. Honor
      * [`ModelMetadata::add_bos_token`] when deciding whether to
@@ -1302,6 +1339,33 @@ open func specialTokenId(name: String) -> UInt32?  {
     uniffi_cera_ffi_fn_method_ceraengine_special_token_id(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(name),$0
+    )
+})
+}
+    
+    /**
+     * The token id of `format`'s tool-call start marker (e.g.
+     * `<|tool_call_start|>`) in this model's vocab, for use as a lazy grammar
+     * trigger in `GenerateOpts.grammar_trigger_tokens`. `None` if the model's
+     * tokenizer lacks that special token.
+     */
+open func toolCallStartToken(format: ToolFormat) -> UInt32?  {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_ceraengine_tool_call_start_token(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeToolFormat_lower(format),$0
+    )
+})
+}
+    
+    /**
+     * The tool-call format auto-detected from this model's architecture, or
+     * `None` if the architecture has no known tool convention.
+     */
+open func toolFormat() -> ToolFormat?  {
+    return try!  FfiConverterOptionTypeToolFormat.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_ceraengine_tool_format(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -3296,6 +3360,14 @@ public struct GenerateOpts: Equatable, Hashable {
      */
     public var grammar: String?
     /**
+     * Lazy-grammar trigger token ids (tool calling). When non-empty and
+     * `grammar` is set, the grammar stays inactive until the model emits one
+     * of these tokens (e.g. the tool-call start marker from
+     * [`CeraEngine::tool_call_start_token`]), then constrains the call and
+     * deactivates on completion. Empty → `grammar` is active from the start.
+     */
+    public var grammarTriggerTokens: [UInt32]
+    /**
      * Ignored under synchronous generate; reserved for streaming.
      */
     public var flushEveryTokens: UInt32
@@ -3325,6 +3397,13 @@ public struct GenerateOpts: Equatable, Hashable {
          * grammar is reported as a `GrammarParse` error.
          */grammar: String?, 
         /**
+         * Lazy-grammar trigger token ids (tool calling). When non-empty and
+         * `grammar` is set, the grammar stays inactive until the model emits one
+         * of these tokens (e.g. the tool-call start marker from
+         * [`CeraEngine::tool_call_start_token`]), then constrains the call and
+         * deactivates on completion. Empty → `grammar` is active from the start.
+         */grammarTriggerTokens: [UInt32], 
+        /**
          * Ignored under synchronous generate; reserved for streaming.
          */flushEveryTokens: UInt32, 
         /**
@@ -3338,6 +3417,7 @@ public struct GenerateOpts: Equatable, Hashable {
         self.repetitionPenalty = repetitionPenalty
         self.stopTokens = stopTokens
         self.grammar = grammar
+        self.grammarTriggerTokens = grammarTriggerTokens
         self.flushEveryTokens = flushEveryTokens
         self.flushEveryMs = flushEveryMs
     }
@@ -3366,6 +3446,7 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
                 repetitionPenalty: FfiConverterFloat.read(from: &buf), 
                 stopTokens: FfiConverterSequenceUInt32.read(from: &buf), 
                 grammar: FfiConverterOptionString.read(from: &buf), 
+                grammarTriggerTokens: FfiConverterSequenceUInt32.read(from: &buf), 
                 flushEveryTokens: FfiConverterUInt32.read(from: &buf), 
                 flushEveryMs: FfiConverterUInt32.read(from: &buf)
         )
@@ -3380,6 +3461,7 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
         FfiConverterFloat.write(value.repetitionPenalty, into: &buf)
         FfiConverterSequenceUInt32.write(value.stopTokens, into: &buf)
         FfiConverterOptionString.write(value.grammar, into: &buf)
+        FfiConverterSequenceUInt32.write(value.grammarTriggerTokens, into: &buf)
         FfiConverterUInt32.write(value.flushEveryTokens, into: &buf)
         FfiConverterUInt32.write(value.flushEveryMs, into: &buf)
     }
@@ -3811,6 +3893,142 @@ public func FfiConverterTypeSessionConfig_lift(_ buf: RustBuffer) throws -> Sess
 #endif
 public func FfiConverterTypeSessionConfig_lower(_ value: SessionConfig) -> RustBuffer {
     return FfiConverterTypeSessionConfig.lower(value)
+}
+
+
+/**
+ * A tool call parsed from model output. Mirrors [`cera::tools::ToolCall`];
+ * `arguments_json` is the argument object encoded as a JSON string.
+ */
+public struct ToolCall: Equatable, Hashable {
+    public var name: String
+    /**
+     * The argument object as a JSON string (e.g. `{"city":"Paris"}`).
+     */
+    public var argumentsJson: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, 
+        /**
+         * The argument object as a JSON string (e.g. `{"city":"Paris"}`).
+         */argumentsJson: String) {
+        self.name = name
+        self.argumentsJson = argumentsJson
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ToolCall: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeToolCall: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ToolCall {
+        return
+            try ToolCall(
+                name: FfiConverterString.read(from: &buf), 
+                argumentsJson: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ToolCall, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.argumentsJson, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeToolCall_lift(_ buf: RustBuffer) throws -> ToolCall {
+    return try FfiConverterTypeToolCall.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeToolCall_lower(_ value: ToolCall) -> RustBuffer {
+    return FfiConverterTypeToolCall.lower(value)
+}
+
+
+/**
+ * A tool the model may call. Mirrors [`cera::tools::ToolDef`], but the
+ * JSON Schema for the arguments crosses the boundary as a JSON **string**
+ * (`parameters_json`) since UniFFI has no arbitrary-JSON type. An empty
+ * `parameters_json` means "no parameters".
+ */
+public struct ToolDef: Equatable, Hashable {
+    public var name: String
+    public var description: String?
+    /**
+     * JSON Schema object for the arguments, as a JSON string (e.g.
+     * `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
+     */
+    public var parametersJson: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, description: String?, 
+        /**
+         * JSON Schema object for the arguments, as a JSON string (e.g.
+         * `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
+         */parametersJson: String) {
+        self.name = name
+        self.description = description
+        self.parametersJson = parametersJson
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ToolDef: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeToolDef: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ToolDef {
+        return
+            try ToolDef(
+                name: FfiConverterString.read(from: &buf), 
+                description: FfiConverterOptionString.read(from: &buf), 
+                parametersJson: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ToolDef, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.description, into: &buf)
+        FfiConverterString.write(value.parametersJson, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeToolDef_lift(_ buf: RustBuffer) throws -> ToolDef {
+    return try FfiConverterTypeToolDef.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeToolDef_lower(_ value: ToolDef) -> RustBuffer {
+    return FfiConverterTypeToolDef.lower(value)
 }
 
 // Note that we don't yet support `indirect` for enums.
@@ -4392,6 +4610,87 @@ public func FfiConverterTypeKvCompression_lower(_ value: KvCompression) -> RustB
 }
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The tool-call wire format a model family uses. Mirrors
+ * [`cera::tools::ToolFormat`]. Get one from
+ * [`CeraEngine::tool_format`] (auto-detected from the model) or set it
+ * explicitly.
+ */
+
+public enum ToolFormat: Equatable, Hashable {
+    
+    /**
+     * LFM2 / LFM2.5: Pythonic `[get_weather(city="Paris")]` in
+     * `<|tool_call_start|>…<|tool_call_end|>`.
+     */
+    case lfm2Pythonic
+    /**
+     * Hermes / Qwen: JSON `{"name":…,"arguments":{…}}` in
+     * `<tool_call>…</tool_call>`.
+     */
+    case hermes
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ToolFormat: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeToolFormat: FfiConverterRustBuffer {
+    typealias SwiftType = ToolFormat
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ToolFormat {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .lfm2Pythonic
+        
+        case 2: return .hermes
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ToolFormat, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .lfm2Pythonic:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .hermes:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeToolFormat_lift(_ buf: RustBuffer) throws -> ToolFormat {
+    return try FfiConverterTypeToolFormat.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeToolFormat_lower(_ value: ToolFormat) -> RustBuffer {
+    return FfiConverterTypeToolFormat.lower(value)
+}
+
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -4515,6 +4814,30 @@ fileprivate struct FfiConverterOptionTypeBundleRepo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeToolFormat: FfiConverterRustBuffer {
+    typealias SwiftType = ToolFormat?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeToolFormat.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeToolFormat.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
     typealias SwiftType = [UInt32]
 
@@ -4582,6 +4905,56 @@ fileprivate struct FfiConverterSequenceTypeChatMessage: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeChatMessage.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeToolCall: FfiConverterRustBuffer {
+    typealias SwiftType = [ToolCall]
+
+    public static func write(_ value: [ToolCall], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeToolCall.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ToolCall] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ToolCall]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeToolCall.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeToolDef: FfiConverterRustBuffer {
+    typealias SwiftType = [ToolDef]
+
+    public static func write(_ value: [ToolDef], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeToolDef.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ToolDef] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ToolDef]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeToolDef.read(from: &buf))
         }
         return seq
     }
@@ -4657,6 +5030,46 @@ public func cpuBackendReport() -> String  {
     )
 })
 }
+/**
+ * Detect the tool-call format for a model architecture string (e.g.
+ * `"lfm2"`, `"qwen3"`). Returns `None` for architectures with no known
+ * convention — the caller may still choose a format explicitly.
+ */
+public func detectToolFormat(architecture: String) -> ToolFormat?  {
+    return try!  FfiConverterOptionTypeToolFormat.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_detect_tool_format(
+        FfiConverterString.lower(architecture),$0
+    )
+})
+}
+/**
+ * Parse tool calls out of generated model text for the given `format`.
+ * Returns an empty list when the reply contains no tool call (the model
+ * answered in prose). Errors only when a call section is present but
+ * unrecoverably malformed.
+ */
+public func parseToolCalls(text: String, format: ToolFormat)throws  -> [ToolCall]  {
+    return try  FfiConverterSequenceTypeToolCall.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_func_parse_tool_calls(
+        FfiConverterString.lower(text),
+        FfiConverterTypeToolFormat_lower(format),$0
+    )
+})
+}
+/**
+ * Build a GBNF grammar string constraining output to a valid call for one
+ * of `tools`, in `format`. Put the result in `GenerateOpts.grammar` and set
+ * `GenerateOpts.grammar_trigger_tokens` (see
+ * [`CeraEngine::tool_call_start_token`]) for a lazy tool-call trigger.
+ */
+public func toolGrammar(tools: [ToolDef], format: ToolFormat)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_func_tool_grammar(
+        FfiConverterSequenceTypeToolDef.lower(tools),
+        FfiConverterTypeToolFormat_lower(format),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -4679,6 +5092,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_func_cpu_backend_report() != 61086) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_parse_tool_calls() != 47579) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_tool_grammar() != 41383) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4689,6 +5111,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template() != 38712) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools() != 46076) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_bos_token() != 30744) {
@@ -4722,6 +5147,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token() != 23833) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_tool_format() != 33648) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_transcribe() != 9680) {

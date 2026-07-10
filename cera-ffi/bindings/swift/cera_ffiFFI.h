@@ -356,6 +356,11 @@ uint64_t uniffi_cera_ffi_fn_constructor_ceraengine_from_path(RustBuffer path, Ru
 RustBuffer uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template(uint64_t ptr, RustBuffer messages, int8_t add_generation_prompt, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_APPLY_CHAT_TEMPLATE_WITH_TOOLS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_APPLY_CHAT_TEMPLATE_WITH_TOOLS
+RustBuffer uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template_with_tools(uint64_t ptr, RustBuffer messages, RustBuffer tools, int8_t add_generation_prompt, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_BOS_TOKEN
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_BOS_TOKEN
 RustBuffer uniffi_cera_ffi_fn_method_ceraengine_bos_token(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -409,6 +414,16 @@ uint64_t uniffi_cera_ffi_fn_method_ceraengine_new_session(uint64_t ptr, RustBuff
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_SPECIAL_TOKEN_ID
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_SPECIAL_TOKEN_ID
 RustBuffer uniffi_cera_ffi_fn_method_ceraengine_special_token_id(uint64_t ptr, RustBuffer name, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_TOOL_CALL_START_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_TOOL_CALL_START_TOKEN
+RustBuffer uniffi_cera_ffi_fn_method_ceraengine_tool_call_start_token(uint64_t ptr, RustBuffer format, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_TOOL_FORMAT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_TOOL_FORMAT
+RustBuffer uniffi_cera_ffi_fn_method_ceraengine_tool_format(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_TRANSCRIBE
@@ -621,6 +636,21 @@ RustBuffer uniffi_cera_ffi_fn_func_cera_ffi_version(RustCallStatus *_Nonnull out
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CPU_BACKEND_REPORT
 RustBuffer uniffi_cera_ffi_fn_func_cpu_backend_report(RustCallStatus *_Nonnull out_status
     
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_DETECT_TOOL_FORMAT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_DETECT_TOOL_FORMAT
+RustBuffer uniffi_cera_ffi_fn_func_detect_tool_format(RustBuffer architecture, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_PARSE_TOOL_CALLS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_PARSE_TOOL_CALLS
+RustBuffer uniffi_cera_ffi_fn_func_parse_tool_calls(RustBuffer text, RustBuffer format, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_TOOL_GRAMMAR
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_TOOL_GRAMMAR
+RustBuffer uniffi_cera_ffi_fn_func_tool_grammar(RustBuffer tools, RustBuffer format, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_CERA_FFI_RUSTBUFFER_ALLOC
@@ -895,6 +925,24 @@ uint16_t uniffi_cera_ffi_checksum_func_cpu_backend_report(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_DETECT_TOOL_FORMAT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_DETECT_TOOL_FORMAT
+uint16_t uniffi_cera_ffi_checksum_func_detect_tool_format(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_PARSE_TOOL_CALLS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_PARSE_TOOL_CALLS
+uint16_t uniffi_cera_ffi_checksum_func_parse_tool_calls(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_TOOL_GRAMMAR
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_TOOL_GRAMMAR
+uint16_t uniffi_cera_ffi_checksum_func_tool_grammar(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_BUNDLEREPO_CACHE_SIZE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_BUNDLEREPO_CACHE_SIZE
 uint16_t uniffi_cera_ffi_checksum_method_bundlerepo_cache_size(void
@@ -916,6 +964,12 @@ uint16_t uniffi_cera_ffi_checksum_method_bundlerepo_store_dir(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_APPLY_CHAT_TEMPLATE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_APPLY_CHAT_TEMPLATE
 uint16_t uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_APPLY_CHAT_TEMPLATE_WITH_TOOLS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_APPLY_CHAT_TEMPLATE_WITH_TOOLS
+uint16_t uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools(void
     
 );
 #endif
@@ -982,6 +1036,18 @@ uint16_t uniffi_cera_ffi_checksum_method_ceraengine_new_session(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_SPECIAL_TOKEN_ID
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_SPECIAL_TOKEN_ID
 uint16_t uniffi_cera_ffi_checksum_method_ceraengine_special_token_id(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_TOOL_CALL_START_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_TOOL_CALL_START_TOKEN
+uint16_t uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_TOOL_FORMAT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_TOOL_FORMAT
+uint16_t uniffi_cera_ffi_checksum_method_ceraengine_tool_format(void
     
 );
 #endif
