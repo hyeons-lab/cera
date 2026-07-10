@@ -61,6 +61,10 @@ struct ChatSink<'a> {
     tokenizer: &'a BpeTokenizer,
     cancel: Arc<AtomicBool>,
     buffer: String,
+    /// Stream decoded pieces to stderr instead of stdout. Used by the
+    /// tool-calling path so stdout carries only the machine-readable tool-call
+    /// JSON, uncorrupted by the raw reply stream.
+    to_stderr: bool,
 }
 
 impl<'a> ChatSink<'a> {
@@ -69,6 +73,17 @@ impl<'a> ChatSink<'a> {
             tokenizer,
             cancel,
             buffer: String::new(),
+            to_stderr: false,
+        }
+    }
+    /// Like [`Self::new`], but streams the reply to stderr, leaving stdout for
+    /// structured output.
+    fn new_stderr(tokenizer: &'a BpeTokenizer, cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            tokenizer,
+            cancel,
+            buffer: String::new(),
+            to_stderr: true,
         }
     }
     fn into_text(self) -> String {
@@ -82,8 +97,14 @@ impl ModalitySink for ChatSink<'_> {
             return;
         }
         let piece = self.tokenizer.decode(tokens);
-        let mut out = std::io::stdout().lock();
-        if out.write_all(piece.as_bytes()).is_err() || out.flush().is_err() {
+        let write_err = if self.to_stderr {
+            let mut out = std::io::stderr().lock();
+            out.write_all(piece.as_bytes()).is_err() || out.flush().is_err()
+        } else {
+            let mut out = std::io::stdout().lock();
+            out.write_all(piece.as_bytes()).is_err() || out.flush().is_err()
+        };
+        if write_err {
             self.cancel.store(true, Ordering::Relaxed);
             return;
         }
@@ -233,8 +254,10 @@ enum Command {
         /// (OpenAI "function" shape: `[{"name":..,"description":..,
         /// "parameters":{JSON Schema}}]`), or `@path/to/tools.json` to read it
         /// from a file. The tools are rendered into the model's chat template
-        /// and any tool call in the reply is parsed and printed.
-        #[arg(long)]
+        /// and any tool call in the reply is parsed and printed. Text-only:
+        /// conflicts with the image / audio / vocoder / raw-token-ids modes,
+        /// which have their own generation paths.
+        #[arg(long, conflicts_with_all = ["image", "audio_in", "vocoder", "token_ids"])]
         tools: Option<String>,
 
         /// With `--tools`, constrain the reply to a valid tool call for the
@@ -2259,8 +2282,17 @@ fn main() -> Result<()> {
                 // the lazy start-marker trigger. Otherwise fall back to any
                 // `--grammar`/`--json` grammar.
                 let tool_format = (!tool_defs.is_empty()).then(|| {
-                    cera::tools::ToolFormat::detect(&engine.model().config().architecture)
-                        .unwrap_or(cera::tools::ToolFormat::Lfm2Pythonic)
+                    let arch = &engine.model().config().architecture;
+                    cera::tools::ToolFormat::detect(arch).unwrap_or_else(|| {
+                        // No known convention for this architecture — parsing
+                        // could well be wrong, so warn rather than silently
+                        // guessing. LFM2 Pythonic is the fallback.
+                        eprintln!(
+                            "warning: no known tool-call format for architecture '{arch}'; \
+                             assuming LFM2 Pythonic. Tool-call parsing may be incorrect."
+                        );
+                        cera::tools::ToolFormat::Lfm2Pythonic
+                    })
                 });
                 let (effective_grammar, trigger_tokens) =
                     if constrain_tools && let Some(fmt) = tool_format {
@@ -2287,11 +2319,12 @@ fn main() -> Result<()> {
                 };
 
                 // With tools, collect the reply (ChatSink streams + buffers) so
-                // tool calls can be parsed out afterward.
+                // tool calls can be parsed out afterward. Stream it to stderr so
+                // stdout carries only the machine-readable tool-call JSON.
                 let summary;
                 let reply_text;
                 if tool_format.is_some() {
-                    let mut sink = ChatSink::new(tokenizer, session.cancel_handle());
+                    let mut sink = ChatSink::new_stderr(tokenizer, session.cancel_handle());
                     summary = session.generate(&opts, &mut sink)?;
                     reply_text = Some(sink.into_text());
                 } else {

@@ -1622,6 +1622,15 @@ impl Session {
                 }
             };
 
+            // A trigger token pending in the lazy pre-trigger phase must arm the
+            // grammar, not stop — even if it is also EOS or a stop token. Without
+            // this, a trigger token that coincides with a stop token would end
+            // generation before the tool-call grammar ever engaged.
+            let is_pending_trigger = lazy_trigger
+                && !armed
+                && !triggered_done
+                && opts.grammar_trigger_tokens.contains(&token);
+
             // Stop on EOS or an explicit stop token — but while a grammar is
             // *actively* constraining, only once it permits termination. Otherwise
             // an early stop token could truncate mid-derivation (e.g. exit mid-JSON),
@@ -1631,6 +1640,7 @@ impl Session {
             // is always allowed, so free text can end on EOS as usual.
             let stop_allowed = !armed || grammar_state.as_ref().is_none_or(|s| s.is_complete());
             if stop_allowed
+                && !is_pending_trigger
                 && (self.tokenizer.eos_token() == Some(token) || opts.stop_tokens.contains(&token))
             {
                 finish = FinishReason::Stop;
@@ -1641,11 +1651,7 @@ impl Session {
             // pre-trigger phase. The trigger token itself (a special marker) is not
             // part of the interior grammar, so it is not accepted into the state —
             // constraint begins on the next token.
-            if lazy_trigger
-                && !armed
-                && !triggered_done
-                && opts.grammar_trigger_tokens.contains(&token)
-            {
+            if is_pending_trigger {
                 armed = true;
             } else if armed && let Some(state) = grammar_state.as_mut() {
                 // Advance the grammar by the chosen (grammar-valid, non-EOS) token.

@@ -627,7 +627,7 @@ pub fn parse_tool_calls(text: &str, format: ToolFormat) -> Result<String, JsErro
 
 /// Build a GBNF grammar constraining output to a valid call for one of the
 /// tools in `toolsJson` (a JSON array of `ToolDef`). Feed the result to
-/// `Session.setGrammar` and set `GenerateOpts.grammarTriggerTokens` for a lazy
+/// `GenerateOpts.setGrammar` and set `GenerateOpts.grammarTriggerTokens` for a lazy
 /// tool-call trigger.
 #[wasm_bindgen(js_name = toolGrammar)]
 pub fn tool_grammar(tools_json: &str, format: ToolFormat) -> Result<String, JsError> {
@@ -635,8 +635,13 @@ pub fn tool_grammar(tools_json: &str, format: ToolFormat) -> Result<String, JsEr
     cera::tools::tool_grammar(&tools, format.into()).map_err(map_err)
 }
 
-/// Parse a JSON array of `ToolDef` into the cera core type.
+/// Parse a JSON array of `ToolDef` into the cera core type. An empty/blank
+/// string is treated as "no tools" (parity with the FFI empty-list contract),
+/// so callers can pass `""` to render without tools.
 fn parse_tool_defs(tools_json: &str) -> Result<Vec<cera::tools::ToolDef>, JsError> {
+    if tools_json.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     serde_json::from_str(tools_json).map_err(|e| JsError::new(&format!("invalid tools JSON: {e}")))
 }
 
@@ -992,7 +997,7 @@ impl GenerateOpts {
     }
 
     /// Lazy-grammar trigger token IDs (tool calling). When non-empty and a
-    /// grammar is set (`Session.setGrammar`), the grammar stays inactive until
+    /// grammar is set (`GenerateOpts.setGrammar`), the grammar stays inactive until
     /// the model emits one of these tokens (e.g. the tool-call start marker
     /// from `Tokenizer.specialTokenId`), then constrains the call and
     /// deactivates on completion. Empty (default) → the grammar is active from

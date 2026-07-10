@@ -503,9 +503,30 @@ impl TryFrom<ToolDef> for cera::tools::ToolDef {
         let parameters = if t.parameters_json.trim().is_empty() {
             serde_json::json!({ "type": "object", "properties": {} })
         } else {
-            serde_json::from_str(&t.parameters_json).map_err(|e| FfiError::Backend {
-                detail: format!("tool `{}` parameters_json is not valid JSON: {e}", t.name),
-            })?
+            let v: serde_json::Value =
+                serde_json::from_str(&t.parameters_json).map_err(|e| FfiError::Backend {
+                    detail: format!("tool `{}` parameters_json is not valid JSON: {e}", t.name),
+                })?;
+            // A JSON Schema for arguments must be an object; a scalar/array
+            // would silently yield zero constraints and can break the chat
+            // template's `tool.parameters.properties` access.
+            if !v.is_object() {
+                return Err(FfiError::Backend {
+                    detail: format!(
+                        "tool `{}` parameters_json must be a JSON object schema, got {}",
+                        t.name,
+                        match v {
+                            serde_json::Value::Array(_) => "an array",
+                            serde_json::Value::String(_) => "a string",
+                            serde_json::Value::Number(_) => "a number",
+                            serde_json::Value::Bool(_) => "a boolean",
+                            serde_json::Value::Null => "null",
+                            serde_json::Value::Object(_) => "an object",
+                        }
+                    ),
+                });
+            }
+            v
         };
         Ok(cera::tools::ToolDef {
             name: t.name,
@@ -2800,6 +2821,21 @@ mod tests {
         };
         let core: Result<cera::tools::ToolDef, _> = bad.try_into();
         assert!(core.is_err());
+    }
+
+    #[test]
+    fn tool_def_rejects_non_object_parameters() {
+        // A scalar/array schema must error rather than silently yield zero
+        // constraints (and risk breaking the chat template).
+        for bad in ["[]", "42", "\"x\"", "true", "null"] {
+            let d = ToolDef {
+                name: "f".into(),
+                description: None,
+                parameters_json: bad.into(),
+            };
+            let r: Result<cera::tools::ToolDef, _> = d.try_into();
+            assert!(r.is_err(), "parameters_json={bad:?} should be rejected");
+        }
     }
 
     #[test]

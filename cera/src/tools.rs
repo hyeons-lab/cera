@@ -224,7 +224,7 @@ fn value_rules(pythonic: bool) -> String {
     format!(
         r#"tc-value ::= tc-str | tc-num | tc-bool | tc-null | tc-array | tc-object
 tc-str ::= "\"" tc-char* "\""
-tc-char ::= [^"\\] | "\\" tc-esc
+tc-char ::= [^"\\\x00-\x1F] | "\\" tc-esc
 tc-esc ::= ["\\/bfnrt] | "u" tc-hex tc-hex tc-hex tc-hex
 tc-hex ::= [0-9a-fA-F]
 tc-int ::= "-"? ("0" | [1-9] [0-9]*)
@@ -236,6 +236,20 @@ tc-object ::= "{{" tc-ws ( tc-str tc-ws ":" tc-ws tc-value ( tc-ws "," tc-ws tc-
 tc-ws ::= [ \t\n\r]*
 "#,
     )
+}
+
+/// A GBNF literal that matches the JSON encoding of `s`. `s` is first
+/// JSON-escaped (quotes, backslashes, control chars) via serde_json, then the
+/// resulting quoted string is wrapped as a GBNF literal. Correct for both JSON
+/// (Hermes) and pythonic (LFM2) string emission, which agree on the
+/// `\" \\ \n \t` escapes. Without this, a value like `C:\path` would compile to
+/// a grammar literal matching invalid JSON (`"C:\path"`, one backslash) that no
+/// correct emitter can produce — making that value impossible under constraint.
+fn json_str_gbnf(s: &str) -> String {
+    // `serde_json::to_string` on a string is infallible; it yields the quoted,
+    // escaped JSON form (e.g. `"C:\\path"`).
+    let json = serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""));
+    gbnf_lit(&json)
 }
 
 /// Escape a string to appear as a GBNF double-quoted literal body.
@@ -261,7 +275,7 @@ fn gbnf_lit(s: &str) -> String {
 /// exotic falls through to the generic `tc-value`.
 fn enum_literal(v: &Value, pythonic: bool) -> Option<String> {
     match v {
-        Value::String(s) => Some(gbnf_lit(&format!("\"{s}\""))),
+        Value::String(s) => Some(json_str_gbnf(s)),
         Value::Bool(b) => Some(gbnf_lit(match (b, pythonic) {
             (true, true) => "True",
             (false, true) => "False",
@@ -276,14 +290,18 @@ fn enum_literal(v: &Value, pythonic: bool) -> Option<String> {
 
 /// The value rule (a GBNF fragment, not a named rule) for one property schema.
 fn value_for_schema(schema: &Value, pythonic: bool) -> String {
-    // `enum` overrides type: constrain to the literal set.
-    if let Some(Value::Array(variants)) = schema.get("enum") {
-        let lits: Vec<String> = variants
-            .iter()
-            .filter_map(|v| enum_literal(v, pythonic))
-            .collect();
-        if !lits.is_empty() {
-            return format!("( {} )", lits.join(" | "));
+    // `enum` overrides type: constrain to the literal set — but only when
+    // *every* variant is representable as a literal. If any variant is
+    // non-scalar (array/object), fall back to the type rule rather than
+    // silently forbidding those variants (which dropping them would do).
+    if let Some(Value::Array(variants)) = schema.get("enum")
+        && !variants.is_empty()
+    {
+        let lits: Vec<Option<String>> =
+            variants.iter().map(|v| enum_literal(v, pythonic)).collect();
+        if lits.iter().all(Option::is_some) {
+            let joined = lits.into_iter().flatten().collect::<Vec<_>>().join(" | ");
+            return format!("( {joined} )");
         }
     }
     let ty = schema.get("type").and_then(|t| t.as_str());
@@ -364,7 +382,7 @@ fn hermes_grammar(tools: &[ToolDef]) -> String {
         // string, so it carries its own surrounding quotes.
         out.push_str(&format!(
             "tc-call-{i} ::= \"{{\" tc-ws \"\\\"name\\\"\" tc-ws \":\" tc-ws {} tc-ws \",\" tc-ws \"\\\"arguments\\\"\" tc-ws \":\" tc-ws tc-args-{i} tc-ws \"}}\"\n",
-            gbnf_lit(&format!("\"{}\"", tool.name))
+            json_str_gbnf(&tool.name)
         ));
         if props.is_empty() {
             out.push_str(&format!("tc-args-{i} ::= \"{{\" tc-ws \"}}\"\n"));
@@ -381,7 +399,7 @@ fn hermes_grammar(tools: &[ToolDef]) -> String {
             // JSON key is a quoted string.
             out.push_str(&format!(
                 "tc-pair-{i}-{j} ::= {} tc-ws \":\" tc-ws {}\n",
-                gbnf_lit(&format!("\"{name}\"")),
+                json_str_gbnf(name),
                 value_for_schema(schema, false)
             ));
         }
@@ -398,10 +416,26 @@ fn hermes_grammar(tools: &[ToolDef]) -> String {
 /// with or without the surrounding markers so the same routine handles both
 /// streamed fragments and fully wrapped output.
 fn parse_lfm2_pythonic(text: &str) -> Result<Vec<ToolCall>> {
-    let Some(inner) = extract_between(text, "<|tool_call_start|>", "<|tool_call_end|>") else {
-        return Ok(Vec::new());
-    };
-    let inner = inner.trim();
+    // Walk every `<|tool_call_start|>…<|tool_call_end|>` section, not just the
+    // first — a model may emit several sections in one turn, and the Hermes
+    // parser handles multiples, so this stays consistent. A missing final end
+    // marker is tolerated (the tail is treated as the last section).
+    let mut calls = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<|tool_call_start|>") {
+        let after = &rest[start + "<|tool_call_start|>".len()..];
+        let (inner, next) = match after.find("<|tool_call_end|>") {
+            Some(end) => (&after[..end], &after[end + "<|tool_call_end|>".len()..]),
+            None => (after, ""),
+        };
+        parse_pythonic_section(inner.trim(), &mut calls)?;
+        rest = next;
+    }
+    Ok(calls)
+}
+
+/// Parse one `[call, call, …]` section body, appending to `calls`.
+fn parse_pythonic_section(inner: &str, calls: &mut Vec<ToolCall>) -> Result<()> {
     // Strip the outer list brackets if present: `[call, call]` → `call, call`.
     let body = inner
         .strip_prefix('[')
@@ -409,10 +443,9 @@ fn parse_lfm2_pythonic(text: &str) -> Result<Vec<ToolCall>> {
         .unwrap_or(inner)
         .trim();
     if body.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let mut p = PyParser::new(body);
-    let mut calls = Vec::new();
     loop {
         p.skip_ws();
         if p.eof() {
@@ -424,7 +457,7 @@ fn parse_lfm2_pythonic(text: &str) -> Result<Vec<ToolCall>> {
             p.bump();
         }
     }
-    Ok(calls)
+    Ok(())
 }
 
 /// Minimal recursive-descent parser for the Pythonic call subset LFM2 emits:
@@ -538,28 +571,72 @@ impl<'a> PyParser<'a> {
     }
 
     fn parse_string(&mut self) -> Result<Value> {
-        let quote = self.bump().unwrap(); // ' or "
-        let mut out = String::new();
-        while let Some(c) = self.bump() {
-            match c {
-                '\\' => match self.bump() {
-                    Some('n') => out.push('\n'),
-                    Some('t') => out.push('\t'),
-                    Some('r') => out.push('\r'),
-                    Some('\\') => out.push('\\'),
-                    Some('\'') => out.push('\''),
-                    Some('"') => out.push('"'),
-                    Some(other) => {
-                        out.push('\\');
-                        out.push(other);
+        // Work at the byte level: string CONTENT may be multibyte UTF-8
+        // (`city="Zürich"`, emoji, CJK), so accumulate raw bytes and decode
+        // once at the end. `bump()`-as-char would mangle every non-ASCII byte.
+        // The opening quote (`'`/`"`) is ASCII; `parse_value` already confirmed
+        // it, so index it directly.
+        let quote = self.s[self.i];
+        self.i += 1;
+        let mut out: Vec<u8> = Vec::new();
+        while self.i < self.s.len() {
+            let b = self.s[self.i];
+            self.i += 1;
+            match b {
+                b'\\' => {
+                    let Some(&e) = self.s.get(self.i) else {
+                        bail!("unterminated escape in string literal");
+                    };
+                    self.i += 1;
+                    match e {
+                        b'n' => out.push(b'\n'),
+                        b't' => out.push(b'\t'),
+                        b'r' => out.push(b'\r'),
+                        b'b' => out.push(0x08),
+                        b'f' => out.push(0x0C),
+                        b'/' => out.push(b'/'),
+                        b'\\' => out.push(b'\\'),
+                        b'\'' => out.push(b'\''),
+                        b'"' => out.push(b'"'),
+                        // `\uXXXX` → the codepoint's UTF-8 bytes. These escapes
+                        // are permitted by the generated grammar's `tc-esc`, so
+                        // the parser must decode them to agree with constrained
+                        // output. Lone surrogates fall back to U+FFFD.
+                        b'u' => {
+                            let cp = self.parse_hex4()?;
+                            let ch = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                            let mut buf = [0u8; 4];
+                            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                        }
+                        other => {
+                            out.push(b'\\');
+                            out.push(other);
+                        }
                     }
-                    None => bail!("unterminated escape in string literal"),
-                },
-                c if c == quote => return Ok(Value::String(out)),
-                c => out.push(c),
+                }
+                b if b == quote => {
+                    return Ok(Value::String(String::from_utf8_lossy(&out).into_owned()));
+                }
+                b => out.push(b),
             }
         }
         bail!("unterminated string literal")
+    }
+
+    /// Parse exactly four hex digits (a `\uXXXX` escape body) into a codepoint.
+    fn parse_hex4(&mut self) -> Result<u32> {
+        let mut cp = 0u32;
+        for _ in 0..4 {
+            let Some(&b) = self.s.get(self.i) else {
+                bail!("truncated \\u escape in string literal");
+            };
+            let d = (b as char)
+                .to_digit(16)
+                .ok_or_else(|| anyhow::anyhow!("bad hex digit in \\u escape"))?;
+            cp = cp * 16 + d;
+            self.i += 1;
+        }
+        Ok(cp)
     }
 
     fn parse_number(&mut self) -> Result<Value> {
@@ -585,10 +662,18 @@ impl<'a> PyParser<'a> {
                 .map_err(|_| anyhow::anyhow!("bad float '{tok}'"))?;
             Ok(serde_json::json!(f))
         } else {
-            let n: i64 = tok
-                .parse()
-                .map_err(|_| anyhow::anyhow!("bad integer '{tok}'"))?;
-            Ok(serde_json::json!(n))
+            // Prefer an exact integer, but fall back to f64 when the literal
+            // exceeds i64 range rather than failing the whole parse (llama.cpp
+            // treats an out-of-range integer as a number, not an error).
+            match tok.parse::<i64>() {
+                Ok(n) => Ok(serde_json::json!(n)),
+                Err(_) => {
+                    let f: f64 = tok
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("bad integer '{tok}'"))?;
+                    Ok(serde_json::json!(f))
+                }
+            }
         }
     }
 
@@ -703,20 +788,6 @@ fn parse_hermes(text: &str) -> Result<Vec<ToolCall>> {
     Ok(calls)
 }
 
-// ── shared helpers ──────────────────────────────────────────────────────────
-
-/// Return the substring between the first `open` and the first following
-/// `close`. If `open` is present but `close` is not, return everything after
-/// `open` (tolerant tail). Returns `None` only when `open` is absent.
-fn extract_between<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
-    let start = text.find(open)? + open.len();
-    let after = &text[start..];
-    match after.find(close) {
-        Some(end) => Some(&after[..end]),
-        None => Some(after),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,6 +826,77 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].arguments, serde_json::json!({"x": [1, 2, 3]}));
         assert_eq!(calls[1].arguments, serde_json::json!({"y": {"k": "v"}}));
+    }
+
+    #[test]
+    fn lfm2_non_ascii_string_arg() {
+        // Multibyte UTF-8 (umlaut, CJK, emoji) must survive parsing.
+        let text = "<|tool_call_start|>[f(city=\"Zürich\", note=\"日本語 👍\")]<|tool_call_end|>";
+        let calls = parse_tool_calls(text, ToolFormat::Lfm2Pythonic).unwrap();
+        assert_eq!(calls[0].arguments["city"], "Zürich");
+        assert_eq!(calls[0].arguments["note"], "日本語 👍");
+    }
+
+    #[test]
+    fn lfm2_unicode_and_slash_escapes() {
+        let text = "<|tool_call_start|>[open(url=\"http:\\/\\/x.com\\u002Fp\")]<|tool_call_end|>";
+        let calls = parse_tool_calls(text, ToolFormat::Lfm2Pythonic).unwrap();
+        assert_eq!(calls[0].arguments["url"], "http://x.com/p");
+    }
+
+    #[test]
+    fn lfm2_big_integer_falls_back_to_float() {
+        // > i64::MAX must not fail the whole parse.
+        let text = "<|tool_call_start|>[wire(amount=10000000000000000000)]<|tool_call_end|>";
+        let calls = parse_tool_calls(text, ToolFormat::Lfm2Pythonic).unwrap();
+        assert!(calls[0].arguments["amount"].is_number());
+    }
+
+    #[test]
+    fn lfm2_multiple_sections() {
+        // Two separate marker sections → both calls recovered.
+        let text = "<|tool_call_start|>[a(x=1)]<|tool_call_end|> then \
+                    <|tool_call_start|>[b(y=2)]<|tool_call_end|>";
+        let calls = parse_tool_calls(text, ToolFormat::Lfm2Pythonic).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "a");
+        assert_eq!(calls[1].name, "b");
+    }
+
+    #[test]
+    fn enum_with_backslash_value_is_emittable() {
+        // A string enum value with a backslash must compile to a grammar
+        // literal matching VALID JSON (`"C:\\path"`), not the raw bytes.
+        let tools = vec![ToolDef {
+            name: "open".into(),
+            description: None,
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"p": {"type": "string", "enum": ["C:\\path"]}}
+            }),
+        }];
+        let g = compile(&tool_grammar(&tools, ToolFormat::Hermes).unwrap());
+        // The JSON-correct form (two backslashes) must be accepted.
+        assert!(accepts_complete(
+            &g,
+            br#"{"name": "open", "arguments": {"p": "C:\\path"}}"#
+        ));
+    }
+
+    #[test]
+    fn non_scalar_enum_falls_back_to_type() {
+        // enum containing an array variant → must not forbid the array; falls
+        // back to the declared type instead of dropping the non-scalar member.
+        let tools = vec![ToolDef {
+            name: "f".into(),
+            description: None,
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"x": {"type": "array", "enum": [["a"], ["b"]]}}
+            }),
+        }];
+        let g = compile(&tool_grammar(&tools, ToolFormat::Lfm2Pythonic).unwrap());
+        assert!(accepts_complete(&g, b"[f(x=[\"a\"])]"));
     }
 
     #[test]
