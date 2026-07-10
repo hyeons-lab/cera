@@ -449,6 +449,152 @@ impl From<ChatMessage> for cera::tokenizer::ChatMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Tool calling
+// ---------------------------------------------------------------------------
+
+/// The tool-call wire format a model family uses. Mirrors
+/// [`cera::tools::ToolFormat`]. Get one from
+/// [`CeraEngine::tool_format`] (auto-detected from the model) or set it
+/// explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ToolFormat {
+    /// LFM2 / LFM2.5: Pythonic `[get_weather(city="Paris")]` in
+    /// `<|tool_call_start|>…<|tool_call_end|>`.
+    Lfm2Pythonic,
+    /// Hermes / Qwen: JSON `{"name":…,"arguments":{…}}` in
+    /// `<tool_call>…</tool_call>`.
+    Hermes,
+}
+
+impl From<ToolFormat> for cera::tools::ToolFormat {
+    fn from(f: ToolFormat) -> Self {
+        match f {
+            ToolFormat::Lfm2Pythonic => cera::tools::ToolFormat::Lfm2Pythonic,
+            ToolFormat::Hermes => cera::tools::ToolFormat::Hermes,
+        }
+    }
+}
+
+impl From<cera::tools::ToolFormat> for ToolFormat {
+    fn from(f: cera::tools::ToolFormat) -> Self {
+        match f {
+            cera::tools::ToolFormat::Lfm2Pythonic => ToolFormat::Lfm2Pythonic,
+            cera::tools::ToolFormat::Hermes => ToolFormat::Hermes,
+        }
+    }
+}
+
+/// A tool the model may call. Mirrors [`cera::tools::ToolDef`], but the
+/// JSON Schema for the arguments crosses the boundary as a JSON **string**
+/// (`parameters_json`) since UniFFI has no arbitrary-JSON type. An empty
+/// `parameters_json` means "no parameters".
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: Option<String>,
+    /// JSON Schema object for the arguments, as a JSON string (e.g.
+    /// `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
+    pub parameters_json: String,
+}
+
+impl TryFrom<ToolDef> for cera::tools::ToolDef {
+    type Error = FfiError;
+    fn try_from(t: ToolDef) -> Result<Self, FfiError> {
+        let parameters = if t.parameters_json.trim().is_empty() {
+            serde_json::json!({ "type": "object", "properties": {} })
+        } else {
+            let v: serde_json::Value =
+                serde_json::from_str(&t.parameters_json).map_err(|e| FfiError::Backend {
+                    detail: format!("tool `{}` parameters_json is not valid JSON: {e}", t.name),
+                })?;
+            // A JSON Schema for arguments must be an object; a scalar/array
+            // would silently yield zero constraints and can break the chat
+            // template's `tool.parameters.properties` access.
+            if !v.is_object() {
+                return Err(FfiError::Backend {
+                    detail: format!(
+                        "tool `{}` parameters_json must be a JSON object schema, got {}",
+                        t.name,
+                        match v {
+                            serde_json::Value::Array(_) => "an array",
+                            serde_json::Value::String(_) => "a string",
+                            serde_json::Value::Number(_) => "a number",
+                            serde_json::Value::Bool(_) => "a boolean",
+                            serde_json::Value::Null => "null",
+                            serde_json::Value::Object(_) => "an object",
+                        }
+                    ),
+                });
+            }
+            v
+        };
+        Ok(cera::tools::ToolDef {
+            name: t.name,
+            description: t.description,
+            parameters,
+        })
+    }
+}
+
+/// A tool call parsed from model output. Mirrors [`cera::tools::ToolCall`];
+/// `arguments_json` is the call's arguments encoded as a JSON string.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ToolCall {
+    pub name: String,
+    /// The call's arguments as a JSON string — normally an object
+    /// (e.g. `{"city":"Paris"}`), but a malformed Hermes/Qwen reply may pass
+    /// through a non-object value, so decode defensively.
+    pub arguments_json: String,
+}
+
+impl From<cera::tools::ToolCall> for ToolCall {
+    fn from(c: cera::tools::ToolCall) -> Self {
+        ToolCall {
+            name: c.name,
+            arguments_json: serde_json::to_string(&c.arguments)
+                .unwrap_or_else(|_| "{}".to_string()),
+        }
+    }
+}
+
+fn to_core_tools(tools: Vec<ToolDef>) -> Result<Vec<cera::tools::ToolDef>, FfiError> {
+    tools.into_iter().map(TryInto::try_into).collect()
+}
+
+/// Detect the tool-call format for a model architecture string (e.g.
+/// `"lfm2"`, `"qwen3"`). Returns `None` for architectures with no known
+/// convention — the caller may still choose a format explicitly.
+#[uniffi::export]
+pub fn detect_tool_format(architecture: String) -> Option<ToolFormat> {
+    cera::tools::ToolFormat::detect(&architecture).map(Into::into)
+}
+
+/// Parse tool calls out of generated model text for the given `format`.
+/// Returns an empty list when the reply contains no tool call (the model
+/// answered in prose). Errors only when a call section is present but
+/// unrecoverably malformed.
+#[uniffi::export]
+pub fn parse_tool_calls(text: String, format: ToolFormat) -> Result<Vec<ToolCall>, FfiError> {
+    cera::tools::parse_tool_calls(&text, format.into())
+        .map(|calls| calls.into_iter().map(Into::into).collect())
+        .map_err(|e| FfiError::Backend {
+            detail: format!("parse_tool_calls: {e}"),
+        })
+}
+
+/// Build a GBNF grammar string constraining output to a valid call for one
+/// of `tools`, in `format`. Put the result in `GenerateOpts.grammar` and set
+/// `GenerateOpts.grammar_trigger_tokens` (see
+/// [`CeraEngine::tool_call_start_token`]) for a lazy tool-call trigger.
+#[uniffi::export]
+pub fn tool_grammar(tools: Vec<ToolDef>, format: ToolFormat) -> Result<String, FfiError> {
+    let core = to_core_tools(tools)?;
+    cera::tools::tool_grammar(&core, format.into()).map_err(|e| FfiError::Backend {
+        detail: format!("tool_grammar: {e}"),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // BundleRepo
 // ---------------------------------------------------------------------------
 
@@ -819,6 +965,46 @@ impl CeraEngine {
             detail: format!("apply_chat_template: {e}"),
         })
     }
+
+    /// Like [`CeraEngine::apply_chat_template`], but also passes a `tools`
+    /// array so a tool-trained model renders its tool-definition block. Pass an
+    /// empty `tools` for identical behavior to the plain call.
+    pub fn apply_chat_template_with_tools(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDef>,
+        add_generation_prompt: bool,
+    ) -> Result<String, FfiError> {
+        let core_messages: Vec<cera::tokenizer::ChatMessage> =
+            messages.into_iter().map(Into::into).collect();
+        let core_tools = to_core_tools(tools)?;
+        cera::tokenizer::apply_chat_template_with_tools(
+            self.inner.tokenizer(),
+            &core_messages,
+            &core_tools,
+            add_generation_prompt,
+        )
+        .map_err(|e| FfiError::Backend {
+            detail: format!("apply_chat_template_with_tools: {e}"),
+        })
+    }
+
+    /// The tool-call format auto-detected from this model's architecture, or
+    /// `None` if the architecture has no known tool convention.
+    pub fn tool_format(&self) -> Option<ToolFormat> {
+        cera::tools::ToolFormat::detect(&self.inner.model().config().architecture).map(Into::into)
+    }
+
+    /// The token id of `format`'s tool-call start marker (e.g.
+    /// `<|tool_call_start|>`) in this model's vocab, for use as a lazy grammar
+    /// trigger in `GenerateOpts.grammar_trigger_tokens`. `None` if the model's
+    /// tokenizer lacks that special token.
+    pub fn tool_call_start_token(&self, format: ToolFormat) -> Option<u32> {
+        let fmt: cera::tools::ToolFormat = format.into();
+        self.inner
+            .tokenizer()
+            .special_token_id(fmt.call_start_marker())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -933,6 +1119,12 @@ pub struct GenerateOpts {
     /// grammar is compiled on the Rust side when generation starts; a malformed
     /// grammar is reported as a `GrammarParse` error.
     pub grammar: Option<String>,
+    /// Lazy-grammar trigger token ids (tool calling). When non-empty and
+    /// `grammar` is set, the grammar stays inactive until the model emits one
+    /// of these tokens (e.g. the tool-call start marker from
+    /// [`CeraEngine::tool_call_start_token`]), then constrains the call and
+    /// deactivates on completion. Empty → `grammar` is active from the start.
+    pub grammar_trigger_tokens: Vec<u32>,
     /// Ignored under synchronous generate; reserved for streaming.
     pub flush_every_tokens: u32,
     /// Ignored under synchronous generate; reserved for streaming.
@@ -953,6 +1145,7 @@ impl Default for GenerateOpts {
             // Core default is no grammar; the compiled `Arc` has no FFI form, so
             // the mirrored field is the (absent) source string.
             grammar: None,
+            grammar_trigger_tokens: core.grammar_trigger_tokens,
             flush_every_tokens: core.flush_every_tokens,
             flush_every_ms: core.flush_every_ms,
         }
@@ -983,6 +1176,7 @@ impl TryFrom<GenerateOpts> for cera::GenerateOpts {
             repetition_penalty: o.repetition_penalty,
             stop_tokens: o.stop_tokens,
             grammar,
+            grammar_trigger_tokens: o.grammar_trigger_tokens,
             flush_every_tokens: o.flush_every_tokens,
             flush_every_ms: o.flush_every_ms,
         })
@@ -2599,5 +2793,84 @@ mod tests {
             }
             other => panic!("expected Err(Backend), got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_def_json_marshals_to_core() {
+        let ffi = ToolDef {
+            name: "get_weather".into(),
+            description: Some("weather".into()),
+            parameters_json: r#"{"type":"object","properties":{"city":{"type":"string"}}}"#.into(),
+        };
+        let core: cera::tools::ToolDef = ffi.try_into().expect("valid schema");
+        assert_eq!(core.name, "get_weather");
+        assert_eq!(core.parameters["properties"]["city"]["type"], "string");
+
+        // Empty parameters_json → default empty object schema.
+        let bare = ToolDef {
+            name: "ping".into(),
+            description: None,
+            parameters_json: String::new(),
+        };
+        let core: cera::tools::ToolDef = bare.try_into().unwrap();
+        assert_eq!(core.parameters["type"], "object");
+
+        // Malformed schema → error, not panic.
+        let bad = ToolDef {
+            name: "x".into(),
+            description: None,
+            parameters_json: "{not json".into(),
+        };
+        let core: Result<cera::tools::ToolDef, _> = bad.try_into();
+        assert!(core.is_err());
+    }
+
+    #[test]
+    fn tool_def_rejects_non_object_parameters() {
+        // A scalar/array schema must error rather than silently yield zero
+        // constraints (and risk breaking the chat template).
+        for bad in ["[]", "42", "\"x\"", "true", "null"] {
+            let d = ToolDef {
+                name: "f".into(),
+                description: None,
+                parameters_json: bad.into(),
+            };
+            let r: Result<cera::tools::ToolDef, _> = d.try_into();
+            assert!(r.is_err(), "parameters_json={bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn parse_tool_calls_ffi_returns_json_args() {
+        let calls = parse_tool_calls(
+            "<|tool_call_start|>[get_weather(city=\"Paris\")]<|tool_call_end|>".into(),
+            ToolFormat::Lfm2Pythonic,
+        )
+        .expect("parse");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments_json).unwrap();
+        assert_eq!(args["city"], "Paris");
+    }
+
+    #[test]
+    fn tool_grammar_ffi_compiles() {
+        let tools = vec![ToolDef {
+            name: "get_weather".into(),
+            description: None,
+            parameters_json: r#"{"type":"object","properties":{"city":{"type":"string"}}}"#.into(),
+        }];
+        let gbnf = tool_grammar(tools, ToolFormat::Lfm2Pythonic).expect("grammar");
+        assert!(cera::grammar::Grammar::parse(&gbnf).is_ok());
+    }
+
+    #[test]
+    fn detect_tool_format_ffi() {
+        assert_eq!(
+            detect_tool_format("lfm2".into()),
+            Some(ToolFormat::Lfm2Pythonic)
+        );
+        assert_eq!(detect_tool_format("qwen3".into()), Some(ToolFormat::Hermes));
+        assert_eq!(detect_tool_format("gpt2".into()), None);
     }
 }

@@ -76,6 +76,9 @@ tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-t
 # Default features (`parallel`, `mmap`, `std-fs`, `disk-cache`) stay
 # on; `CeraEngine::from_bundle_id` requires both `remote` and `mmap`.
 cera = { path = "../cera", version = "0.2.6", features = ["remote"] }
+# Tool-calling FFI marshals JSON Schemas / tool-call arguments as JSON strings
+# across the boundary (UniFFI has no `serde_json::Value` type).
+serde_json.workspace = true
 
 [dev-dependencies]
 # Full tokio feature set for `#[tokio::test]` so the async unit tests

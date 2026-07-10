@@ -50,8 +50,11 @@ void main(List<String> args) {
     temperature: 0.0,
     topP: 1.0,
     topK: 0,
+    minP: 0.0,
     repetitionPenalty: 1.0,
     stopTokens: <int>[],
+    grammar: null,
+    grammarTriggerTokens: <int>[],
     flushEveryTokens: 0,
     flushEveryMs: 0,
   ));

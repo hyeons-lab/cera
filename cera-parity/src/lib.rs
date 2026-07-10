@@ -176,6 +176,7 @@ fn greedy_opts(max_tokens: u32) -> cera::GenerateOpts {
         repetition_penalty: settings::REPETITION_PENALTY,
         stop_tokens: Vec::new(),
         grammar: None,
+        grammar_trigger_tokens: Vec::new(),
         flush_every_tokens: settings::FLUSH_EVERY_TOKENS,
         flush_every_ms: settings::FLUSH_EVERY_MS,
     }
@@ -194,6 +195,7 @@ fn greedy_opts_ffi(max_tokens: u32) -> cera_ffi::GenerateOpts {
         stop_tokens: Vec::new(),
         // Parity runs decode unconstrained; grammar exercised separately.
         grammar: None,
+        grammar_trigger_tokens: Vec::new(),
         flush_every_tokens: settings::FLUSH_EVERY_TOKENS,
         flush_every_ms: settings::FLUSH_EVERY_MS,
     }

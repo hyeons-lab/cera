@@ -61,6 +61,10 @@ struct ChatSink<'a> {
     tokenizer: &'a BpeTokenizer,
     cancel: Arc<AtomicBool>,
     buffer: String,
+    /// Stream decoded pieces to stderr instead of stdout. Used by the
+    /// tool-calling path so stdout carries only the machine-readable tool-call
+    /// JSON, uncorrupted by the raw reply stream.
+    to_stderr: bool,
 }
 
 impl<'a> ChatSink<'a> {
@@ -69,6 +73,17 @@ impl<'a> ChatSink<'a> {
             tokenizer,
             cancel,
             buffer: String::new(),
+            to_stderr: false,
+        }
+    }
+    /// Like [`Self::new`], but streams the reply to stderr, leaving stdout for
+    /// structured output.
+    fn new_stderr(tokenizer: &'a BpeTokenizer, cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            tokenizer,
+            cancel,
+            buffer: String::new(),
+            to_stderr: true,
         }
     }
     fn into_text(self) -> String {
@@ -82,8 +97,14 @@ impl ModalitySink for ChatSink<'_> {
             return;
         }
         let piece = self.tokenizer.decode(tokens);
-        let mut out = std::io::stdout().lock();
-        if out.write_all(piece.as_bytes()).is_err() || out.flush().is_err() {
+        let write_err = if self.to_stderr {
+            let mut out = std::io::stderr().lock();
+            out.write_all(piece.as_bytes()).is_err() || out.flush().is_err()
+        } else {
+            let mut out = std::io::stdout().lock();
+            out.write_all(piece.as_bytes()).is_err() || out.flush().is_err()
+        };
+        if write_err {
             self.cancel.store(true, Ordering::Relaxed);
             return;
         }
@@ -228,6 +249,22 @@ enum Command {
         /// Shorthand: constrain output to valid JSON (a bundled JSON grammar).
         #[arg(long, conflicts_with = "grammar")]
         json: bool,
+
+        /// Enable tool calling. Pass an inline JSON array of tool schemas
+        /// (OpenAI "function" shape: `[{"name":..,"description":..,
+        /// "parameters":{JSON Schema}}]`), or `@path/to/tools.json` to read it
+        /// from a file. The tools are rendered into the model's chat template
+        /// and any tool call in the reply is parsed and printed. Text-only:
+        /// conflicts with the image / audio / vocoder / raw-token-ids modes,
+        /// which have their own generation paths.
+        #[arg(long, conflicts_with_all = ["image", "audio_in", "vocoder", "token_ids"])]
+        tools: Option<String>,
+
+        /// With `--tools`, constrain the reply to a valid tool call for the
+        /// declared tools (grammar + lazy trigger). Off by default: the model
+        /// decides freely whether/how to call a tool.
+        #[arg(long, requires = "tools")]
+        constrain_tools: bool,
 
         /// Device to use: cpu, gpu, or auto.
         #[arg(long, default_value = "auto")]
@@ -1641,6 +1678,8 @@ fn main() -> Result<()> {
             temperature,
             grammar,
             json,
+            tools,
+            constrain_tools,
             device,
             token_ids,
             context_size,
@@ -1683,6 +1722,37 @@ fn main() -> Result<()> {
                     )),
                     None => None,
                 }
+            };
+
+            // Parse `--tools` up front (fail fast, before weights load). Accepts
+            // an inline JSON array or `@path/to/tools.json`.
+            let tool_defs: Vec<cera::tools::ToolDef> = match &tools {
+                Some(spec) => {
+                    let raw = match spec.strip_prefix('@') {
+                        Some(path) => std::fs::read_to_string(path)
+                            .with_context(|| format!("reading tools file `{path}`"))?,
+                        None => spec.clone(),
+                    };
+                    let defs: Vec<cera::tools::ToolDef> = serde_json::from_str(&raw).context(
+                        "parsing --tools JSON (expected an array of \
+                         {name, description?, parameters} objects)",
+                    )?;
+                    // Each tool's `parameters` must be a JSON Schema object.
+                    // A non-object (e.g. `"parameters": null`) breaks chat
+                    // templates that read `tool.parameters.properties` and
+                    // yields a zero-property grammar — fail fast with the
+                    // offending tool named. Mirrors the FFI-layer check.
+                    for def in &defs {
+                        anyhow::ensure!(
+                            def.parameters.is_object(),
+                            "tool `{}` has non-object `parameters` \
+                             (expected a JSON Schema object)",
+                            def.name
+                        );
+                    }
+                    defs
+                }
+                None => Vec::new(),
             };
 
             // Resolve `--image` arguments BEFORE engine load so a missing
@@ -1992,7 +2062,31 @@ fn main() -> Result<()> {
 
             // Build token sequence.
             let mut tokens = Vec::new();
-            if system.is_some() || vocoder.is_some() {
+            if !tool_defs.is_empty() {
+                // Tool calling: render the chat template with a `tools` array so
+                // the model's tool-definition block appears. `--system` is
+                // honored as a leading system turn if given.
+                let mut messages = Vec::new();
+                if let Some(sys) = system.as_deref() {
+                    messages.push(cera::tokenizer::ChatMessage {
+                        role: "system".into(),
+                        content: sys.into(),
+                    });
+                }
+                messages.push(cera::tokenizer::ChatMessage {
+                    role: "user".into(),
+                    content: prompt.clone(),
+                });
+                let formatted = cera::tokenizer::apply_chat_template_with_tools(
+                    tokenizer, &messages, &tool_defs, true,
+                )?;
+                eprintln!(
+                    "Chat template applied with {} tool(s) ({} chars)",
+                    tool_defs.len(),
+                    formatted.len()
+                );
+                tokens = tokenizer.encode(&formatted);
+            } else if system.is_some() || vocoder.is_some() {
                 // Use chat template when --system or --vocoder is set.
                 anyhow::ensure!(
                     system.is_some(),
@@ -2197,15 +2291,80 @@ fn main() -> Result<()> {
                 session.append_tokens(&tokens)?;
                 let prefill_elapsed = prefill_start.elapsed();
 
+                // Tool calling: pick the wire format for this model and, when
+                // `--constrain-tools` is set, compile the tool grammar + resolve
+                // the lazy start-marker trigger. Otherwise fall back to any
+                // `--grammar`/`--json` grammar.
+                let tool_format = (!tool_defs.is_empty()).then(|| {
+                    let arch = &engine.model().config().architecture;
+                    cera::tools::ToolFormat::detect(arch).unwrap_or_else(|| {
+                        // No known convention for this architecture — parsing
+                        // could well be wrong, so warn rather than silently
+                        // guessing. LFM2 Pythonic is the fallback.
+                        eprintln!(
+                            "warning: no known tool-call format for architecture '{arch}'; \
+                             assuming LFM2 Pythonic. Tool-call parsing may be incorrect."
+                        );
+                        cera::tools::ToolFormat::Lfm2Pythonic
+                    })
+                });
+                // `--constrain-tools` with an empty `--tools` (e.g. `[]`) passes
+                // clap's `requires = "tools"` but has nothing to constrain to,
+                // so it would silently no-op. Fail fast instead.
+                if constrain_tools && tool_format.is_none() {
+                    anyhow::bail!(
+                        "--constrain-tools requires at least one tool in --tools \
+                         (the tool list is empty)"
+                    );
+                }
+                let (effective_grammar, trigger_tokens) =
+                    if constrain_tools && let Some(fmt) = tool_format {
+                        let gbnf = cera::tools::tool_grammar(&tool_defs, fmt)?;
+                        let g = std::sync::Arc::new(
+                            cera::grammar::Grammar::parse(&gbnf)
+                                .context("compiling generated tool grammar")?,
+                        );
+                        // The lazy trigger needs the start marker as a single
+                        // special token. Without it the grammar would run
+                        // eagerly from token 0 and force an *unmarked* call the
+                        // parser can't recover — so fail fast rather than
+                        // silently degrade.
+                        let marker = fmt.call_start_marker();
+                        let Some(trig_id) = tokenizer.special_token_id(marker) else {
+                            anyhow::bail!(
+                                "--constrain-tools: this model's tokenizer has no `{marker}` \
+                                 special token (required for the {fmt:?} tool-call format), so \
+                                 the lazy grammar trigger can't be set. This model likely does \
+                                 not support constrained tool calling."
+                            );
+                        };
+                        (Some(g), vec![trig_id])
+                    } else {
+                        (grammar_compiled.clone(), Vec::new())
+                    };
+
                 let opts = cera::GenerateOpts {
                     max_tokens: max_tokens as u32,
                     temperature,
-                    grammar: grammar_compiled.clone(),
+                    grammar: effective_grammar,
+                    grammar_trigger_tokens: trigger_tokens,
                     ..Default::default()
                 };
 
-                let mut sink = StdoutSink::new(tokenizer, session.cancel_handle());
-                let summary = session.generate(&opts, &mut sink)?;
+                // With tools, collect the reply (ChatSink streams + buffers) so
+                // tool calls can be parsed out afterward. Stream it to stderr so
+                // stdout carries only the machine-readable tool-call JSON.
+                let summary;
+                let reply_text;
+                if tool_format.is_some() {
+                    let mut sink = ChatSink::new_stderr(tokenizer, session.cancel_handle());
+                    summary = session.generate(&opts, &mut sink)?;
+                    reply_text = Some(sink.into_text());
+                } else {
+                    let mut sink = StdoutSink::new(tokenizer, session.cancel_handle());
+                    summary = session.generate(&opts, &mut sink)?;
+                    reply_text = None;
+                }
 
                 let prefill_tps = if prefill_elapsed.as_secs_f64() > 0.0 {
                     tokens.len() as f64 / prefill_elapsed.as_secs_f64()
@@ -2224,6 +2383,35 @@ fn main() -> Result<()> {
                 eprintln!("Generated tokens: {}", summary.tokens_generated);
                 eprintln!("Prefill: {:.1} tok/s", prefill_tps);
                 eprintln!("Decode: {:.1} tok/s", decode_tps);
+
+                // Parse and report any tool calls in the reply. Three distinct
+                // outcomes so automation can tell them apart:
+                //   - calls found → stdout gets `[{…}]`, exit 0
+                //   - no call     → stdout gets `[]`,    exit 0
+                //   - parse error → stdout gets nothing, non-zero exit (the
+                //                   error propagates), so a *malformed* tool-call
+                //                   section is distinct from "the model didn't
+                //                   call a tool".
+                // The human summary goes to stderr. `writeln!` (not `println!`)
+                // so a closed pipe surfaces as an ignored error, not a panic.
+                if let (Some(fmt), Some(text)) = (tool_format, reply_text) {
+                    let calls = cera::tools::parse_tool_calls(&text, fmt)
+                        .context("parsing tool calls from model reply")?;
+                    if calls.is_empty() {
+                        eprintln!("--- (no tool calls in reply)");
+                    } else {
+                        eprintln!("---");
+                        eprintln!("Tool calls ({}):", calls.len());
+                        for (i, c) in calls.iter().enumerate() {
+                            let args = serde_json::to_string(&c.arguments)
+                                .unwrap_or_else(|_| "<unserializable>".into());
+                            eprintln!("  [{i}] {}({args})", c.name);
+                        }
+                    }
+                    let json = serde_json::to_string(&calls).unwrap_or_else(|_| "[]".into());
+                    let mut out = std::io::stdout().lock();
+                    let _ = writeln!(out, "{json}");
+                }
             }
         }
         Command::Inspect { model } => {
