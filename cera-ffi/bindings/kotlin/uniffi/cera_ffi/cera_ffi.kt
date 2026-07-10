@@ -5799,31 +5799,31 @@ public object FfiConverterTypeEngineConfig : FfiConverterRustBuffer<EngineConfig
  * surface stable across that transition.
  */
 data class GenerateOpts(
-    var `maxTokens`: kotlin.UInt,
-    var `temperature`: kotlin.Float,
-    var `topP`: kotlin.Float,
-    var `topK`: kotlin.UInt,
+    var `maxTokens`: kotlin.UInt = 256u,
+    var `temperature`: kotlin.Float = 0.7f,
+    var `topP`: kotlin.Float = 0.9f,
+    var `topK`: kotlin.UInt = 40u,
     /**
      * Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
      * disables it. Honored in the stochastic path.
      */
-    var `minP`: kotlin.Float,
+    var `minP`: kotlin.Float = 0.0f,
     /**
      * Repetition penalty over tokens generated this call. `1.0` disables it.
      * Honored in the stochastic path (greedy/argmax decoding is unaffected).
      */
-    var `repetitionPenalty`: kotlin.Float,
+    var `repetitionPenalty`: kotlin.Float = 1.0f,
     /**
      * Early-stop IDs (EOS / instruction markers / end-of-turn).
      */
-    var `stopTokens`: List<kotlin.UInt>,
+    var `stopTokens`: List<kotlin.UInt> = listOf(),
     /**
      * Optional GBNF grammar **source text** constraining the output (e.g. a
      * JSON grammar). When absent (the default), decoding is unconstrained. The
      * grammar is compiled on the Rust side when generation starts; a malformed
      * grammar is reported as a `GrammarParse` error.
      */
-    var `grammar`: kotlin.String?,
+    var `grammar`: kotlin.String? = null,
     /**
      * Lazy-grammar trigger token ids (tool calling). When non-empty and
      * `grammar` is set, the grammar stays inactive until the model emits one
@@ -5831,15 +5831,15 @@ data class GenerateOpts(
      * [`CeraEngine::tool_call_start_token`]), then constrains the call and
      * deactivates on completion. Empty → `grammar` is active from the start.
      */
-    var `grammarTriggerTokens`: List<kotlin.UInt>,
+    var `grammarTriggerTokens`: List<kotlin.UInt> = listOf(),
     /**
      * Ignored under synchronous generate; reserved for streaming.
      */
-    var `flushEveryTokens`: kotlin.UInt,
+    var `flushEveryTokens`: kotlin.UInt = 16u,
     /**
      * Ignored under synchronous generate; reserved for streaming.
      */
-    var `flushEveryMs`: kotlin.UInt,
+    var `flushEveryMs`: kotlin.UInt = 50u,
 ) {
     companion object
 }
@@ -6109,24 +6109,24 @@ data class SessionConfig(
      * Cap on total tokens held in KV. `None` → model's default
      * `max_seq_len`.
      */
-    var `maxSeqLen`: kotlin.UInt?,
+    var `maxSeqLen`: kotlin.UInt? = null,
     /**
-     * KV cache compression mode.
+     * KV cache compression mode. `None` → no compression (the default).
      */
-    var `kvCompression`: KvCompression,
+    var `kvCompression`: KvCompression? = null,
     /**
      * Pinned-prefix length for Phase-1.5 context shift on overflow.
      * `0` disables shift; overflow returns `ContextOverflow` error.
      */
-    var `nKeep`: kotlin.UInt,
+    var `nKeep`: kotlin.UInt = 0u,
     /**
      * Deterministic sampling seed. `None` = fresh entropy per call.
      */
-    var `seed`: kotlin.ULong?,
+    var `seed`: kotlin.ULong? = null,
     /**
      * Chunked-prefill ubatch size. `0` = monolithic prefill.
      */
-    var `ubatchSize`: kotlin.UInt,
+    var `ubatchSize`: kotlin.UInt = 512u,
 ) {
     companion object
 }
@@ -6138,7 +6138,7 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
     override fun read(buf: ByteBuffer): SessionConfig =
         SessionConfig(
             FfiConverterOptionalUInt.read(buf),
-            FfiConverterTypeKvCompression.read(buf),
+            FfiConverterOptionalTypeKvCompression.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterOptionalULong.read(buf),
             FfiConverterUInt.read(buf),
@@ -6147,7 +6147,7 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
     override fun allocationSize(value: SessionConfig) =
         (
             FfiConverterOptionalUInt.allocationSize(value.`maxSeqLen`) +
-                FfiConverterTypeKvCompression.allocationSize(value.`kvCompression`) +
+                FfiConverterOptionalTypeKvCompression.allocationSize(value.`kvCompression`) +
                 FfiConverterUInt.allocationSize(value.`nKeep`) +
                 FfiConverterOptionalULong.allocationSize(value.`seed`) +
                 FfiConverterUInt.allocationSize(value.`ubatchSize`)
@@ -6158,7 +6158,7 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
         buf: ByteBuffer,
     ) {
         FfiConverterOptionalUInt.write(value.`maxSeqLen`, buf)
-        FfiConverterTypeKvCompression.write(value.`kvCompression`, buf)
+        FfiConverterOptionalTypeKvCompression.write(value.`kvCompression`, buf)
         FfiConverterUInt.write(value.`nKeep`, buf)
         FfiConverterOptionalULong.write(value.`seed`, buf)
         FfiConverterUInt.write(value.`ubatchSize`, buf)
@@ -7177,6 +7177,38 @@ public object FfiConverterOptionalTypeBundleRepo : FfiConverterRustBuffer<Bundle
         } else {
             buf.put(1)
             FfiConverterTypeBundleRepo.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeKvCompression : FfiConverterRustBuffer<KvCompression?> {
+    override fun read(buf: ByteBuffer): KvCompression? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeKvCompression.read(buf)
+    }
+
+    override fun allocationSize(value: KvCompression?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeKvCompression.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: KvCompression?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeKvCompression.write(value, buf)
         }
     }
 }

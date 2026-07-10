@@ -240,33 +240,33 @@ class EngineConfig {
 /// surface stable across that transition.
 class GenerateOpts {
   const GenerateOpts({
-    required this.maxTokens,
-    required this.temperature,
-    required this.topP,
-    required this.topK,
+    this.maxTokens = 256,
+    this.temperature = 0.7,
+    this.topP = 0.9,
+    this.topK = 40,
     /// Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
     /// disables it. Honored in the stochastic path.
-    required this.minP,
+    this.minP = 0.0,
     /// Repetition penalty over tokens generated this call. `1.0` disables it.
     /// Honored in the stochastic path (greedy/argmax decoding is unaffected).
-    required this.repetitionPenalty,
+    this.repetitionPenalty = 1.0,
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
-    required this.stopTokens,
+    this.stopTokens = const [],
     /// Optional GBNF grammar **source text** constraining the output (e.g. a
     /// JSON grammar). When absent (the default), decoding is unconstrained. The
     /// grammar is compiled on the Rust side when generation starts; a malformed
     /// grammar is reported as a `GrammarParse` error.
-    required this.grammar,
+    this.grammar = null,
     /// Lazy-grammar trigger token ids (tool calling). When non-empty and
     /// `grammar` is set, the grammar stays inactive until the model emits one
     /// of these tokens (e.g. the tool-call start marker from
     /// [`CeraEngine::tool_call_start_token`]), then constrains the call and
     /// deactivates on completion. Empty → `grammar` is active from the start.
-    required this.grammarTriggerTokens,
+    this.grammarTriggerTokens = const [],
     /// Ignored under synchronous generate; reserved for streaming.
-    required this.flushEveryTokens,
+    this.flushEveryTokens = 16,
     /// Ignored under synchronous generate; reserved for streaming.
-    required this.flushEveryMs,
+    this.flushEveryMs = 50,
   });
 
   final int maxTokens;
@@ -315,17 +315,17 @@ class GenerateOpts {
 
   factory GenerateOpts.fromJson(Map<String, dynamic> json) {
     return GenerateOpts(
-      maxTokens: (json['maxTokens'] as num).toInt(),
-      temperature: (json['temperature'] as num).toDouble(),
-      topP: (json['topP'] as num).toDouble(),
-      topK: (json['topK'] as num).toInt(),
-      minP: (json['minP'] as num).toDouble(),
-      repetitionPenalty: (json['repetitionPenalty'] as num).toDouble(),
-      stopTokens: (json['stopTokens'] as List).map((item) => (item as num).toInt()).toList(),
-      grammar: json['grammar'] == null ? null : json['grammar'] as String,
-      grammarTriggerTokens: (json['grammarTriggerTokens'] as List).map((item) => (item as num).toInt()).toList(),
-      flushEveryTokens: (json['flushEveryTokens'] as num).toInt(),
-      flushEveryMs: (json['flushEveryMs'] as num).toInt(),
+      maxTokens: json.containsKey('maxTokens') ? (json['maxTokens'] as num).toInt() : 256,
+      temperature: json.containsKey('temperature') ? (json['temperature'] as num).toDouble() : 0.7,
+      topP: json.containsKey('topP') ? (json['topP'] as num).toDouble() : 0.9,
+      topK: json.containsKey('topK') ? (json['topK'] as num).toInt() : 40,
+      minP: json.containsKey('minP') ? (json['minP'] as num).toDouble() : 0.0,
+      repetitionPenalty: json.containsKey('repetitionPenalty') ? (json['repetitionPenalty'] as num).toDouble() : 1.0,
+      stopTokens: json.containsKey('stopTokens') ? (json['stopTokens'] as List).map((item) => (item as num).toInt()).toList() : const [],
+      grammar: json.containsKey('grammar') ? json['grammar'] == null ? null : json['grammar'] as String : null,
+      grammarTriggerTokens: json.containsKey('grammarTriggerTokens') ? (json['grammarTriggerTokens'] as List).map((item) => (item as num).toInt()).toList() : const [],
+      flushEveryTokens: json.containsKey('flushEveryTokens') ? (json['flushEveryTokens'] as num).toInt() : 16,
+      flushEveryMs: json.containsKey('flushEveryMs') ? (json['flushEveryMs'] as num).toInt() : 50,
     );
   }
 
@@ -660,23 +660,23 @@ class SessionConfig {
   const SessionConfig({
     /// Cap on total tokens held in KV. `None` → model's default
     /// `max_seq_len`.
-    required this.maxSeqLen,
-    /// KV cache compression mode.
-    required this.kvCompression,
+    this.maxSeqLen = null,
+    /// KV cache compression mode. `None` → no compression (the default).
+    this.kvCompression = null,
     /// Pinned-prefix length for Phase-1.5 context shift on overflow.
     /// `0` disables shift; overflow returns `ContextOverflow` error.
-    required this.nKeep,
+    this.nKeep = 0,
     /// Deterministic sampling seed. `None` = fresh entropy per call.
-    required this.seed,
+    this.seed = null,
     /// Chunked-prefill ubatch size. `0` = monolithic prefill.
-    required this.ubatchSize,
+    this.ubatchSize = 512,
   });
 
   /// Cap on total tokens held in KV. `None` → model's default
   /// `max_seq_len`.
   final int? maxSeqLen;
-  /// KV cache compression mode.
-  final KvCompression kvCompression;
+  /// KV cache compression mode. `None` → no compression (the default).
+  final KvCompression? kvCompression;
   /// Pinned-prefix length for Phase-1.5 context shift on overflow.
   /// `0` disables shift; overflow returns `ContextOverflow` error.
   final int nKeep;
@@ -688,7 +688,7 @@ class SessionConfig {
   Map<String, dynamic> toJson() {
     return {
       'maxSeqLen': this.maxSeqLen,
-      'kvCompression': KvCompressionFfiCodec.encode(this.kvCompression),
+      'kvCompression': this.kvCompression == null ? null : (() { final __tmp = this.kvCompression!; return KvCompressionFfiCodec.encode(__tmp); })(),
       'nKeep': this.nKeep,
       'seed': this.seed,
       'ubatchSize': this.ubatchSize,
@@ -697,24 +697,24 @@ class SessionConfig {
 
   factory SessionConfig.fromJson(Map<String, dynamic> json) {
     return SessionConfig(
-      maxSeqLen: json['maxSeqLen'] == null ? null : (json['maxSeqLen'] as num).toInt(),
-      kvCompression: KvCompressionFfiCodec.decode(json['kvCompression'] as String),
-      nKeep: (json['nKeep'] as num).toInt(),
-      seed: json['seed'] == null ? null : (json['seed'] as num).toInt(),
-      ubatchSize: (json['ubatchSize'] as num).toInt(),
+      maxSeqLen: json.containsKey('maxSeqLen') ? json['maxSeqLen'] == null ? null : (json['maxSeqLen'] as num).toInt() : null,
+      kvCompression: json.containsKey('kvCompression') ? json['kvCompression'] == null ? null : (() { final __tmp = json['kvCompression']; return KvCompressionFfiCodec.decode(__tmp as String); })() : null,
+      nKeep: json.containsKey('nKeep') ? (json['nKeep'] as num).toInt() : 0,
+      seed: json.containsKey('seed') ? json['seed'] == null ? null : (json['seed'] as num).toInt() : null,
+      ubatchSize: json.containsKey('ubatchSize') ? (json['ubatchSize'] as num).toInt() : 512,
     );
   }
 
   SessionConfig copyWith({
     Object? maxSeqLen = _sentinel,
-    KvCompression? kvCompression,
+    Object? kvCompression = _sentinel,
     int? nKeep,
     Object? seed = _sentinel,
     int? ubatchSize,
   }) {
     return SessionConfig(
       maxSeqLen: maxSeqLen == _sentinel ? this.maxSeqLen : maxSeqLen as int?,
-      kvCompression: kvCompression ?? this.kvCompression,
+      kvCompression: kvCompression == _sentinel ? this.kvCompression : kvCompression as KvCompression?,
       nKeep: nKeep ?? this.nKeep,
       seed: seed == _sentinel ? this.seed : seed as int?,
       ubatchSize: ubatchSize ?? this.ubatchSize,
@@ -2437,7 +2437,12 @@ void _uniffiWriteSessionConfig(SessionConfig value, _UniFfiBinaryWriter writer) 
     writer.writeI8(1);
     writer.writeU32(value.maxSeqLen!);
   }
-  _uniffiWriteKvCompression(value.kvCompression, writer);
+  if (value.kvCompression == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    _uniffiWriteKvCompression(value.kvCompression!, writer);
+  }
   writer.writeU32(value.nKeep);
   if (value.seed == null) {
     writer.writeI8(0);
@@ -2457,7 +2462,7 @@ Uint8List _uniffiEncodeSessionConfig(SessionConfig value) {
 SessionConfig _uniffiReadSessionConfig(_UniFfiBinaryReader reader) {
   return SessionConfig(
     maxSeqLen: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readU32(); })(),
-    kvCompression: _uniffiReadKvCompression(reader),
+    kvCompression: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return _uniffiReadKvCompression(reader); })(),
     nKeep: reader.readU32(),
     seed: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readU64(); })(),
     ubatchSize: reader.readU32(),

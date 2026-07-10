@@ -3378,37 +3378,37 @@ public struct GenerateOpts: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(maxTokens: UInt32, temperature: Float, topP: Float, topK: UInt32, 
+    public init(maxTokens: UInt32 = UInt32(256), temperature: Float = Float(0.7), topP: Float = Float(0.9), topK: UInt32 = UInt32(40), 
         /**
          * Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
          * disables it. Honored in the stochastic path.
-         */minP: Float, 
+         */minP: Float = Float(0.0), 
         /**
          * Repetition penalty over tokens generated this call. `1.0` disables it.
          * Honored in the stochastic path (greedy/argmax decoding is unaffected).
-         */repetitionPenalty: Float, 
+         */repetitionPenalty: Float = Float(1.0), 
         /**
          * Early-stop IDs (EOS / instruction markers / end-of-turn).
-         */stopTokens: [UInt32], 
+         */stopTokens: [UInt32] = [], 
         /**
          * Optional GBNF grammar **source text** constraining the output (e.g. a
          * JSON grammar). When absent (the default), decoding is unconstrained. The
          * grammar is compiled on the Rust side when generation starts; a malformed
          * grammar is reported as a `GrammarParse` error.
-         */grammar: String?, 
+         */grammar: String? = nil, 
         /**
          * Lazy-grammar trigger token ids (tool calling). When non-empty and
          * `grammar` is set, the grammar stays inactive until the model emits one
          * of these tokens (e.g. the tool-call start marker from
          * [`CeraEngine::tool_call_start_token`]), then constrains the call and
          * deactivates on completion. Empty → `grammar` is active from the start.
-         */grammarTriggerTokens: [UInt32], 
+         */grammarTriggerTokens: [UInt32] = [], 
         /**
          * Ignored under synchronous generate; reserved for streaming.
-         */flushEveryTokens: UInt32, 
+         */flushEveryTokens: UInt32 = UInt32(16), 
         /**
          * Ignored under synchronous generate; reserved for streaming.
-         */flushEveryMs: UInt32) {
+         */flushEveryMs: UInt32 = UInt32(50)) {
         self.maxTokens = maxTokens
         self.temperature = temperature
         self.topP = topP
@@ -3803,9 +3803,9 @@ public struct SessionConfig: Equatable, Hashable {
      */
     public var maxSeqLen: UInt32?
     /**
-     * KV cache compression mode.
+     * KV cache compression mode. `None` → no compression (the default).
      */
-    public var kvCompression: KvCompression
+    public var kvCompression: KvCompression?
     /**
      * Pinned-prefix length for Phase-1.5 context shift on overflow.
      * `0` disables shift; overflow returns `ContextOverflow` error.
@@ -3826,20 +3826,20 @@ public struct SessionConfig: Equatable, Hashable {
         /**
          * Cap on total tokens held in KV. `None` → model's default
          * `max_seq_len`.
-         */maxSeqLen: UInt32?, 
+         */maxSeqLen: UInt32? = nil, 
         /**
-         * KV cache compression mode.
-         */kvCompression: KvCompression, 
+         * KV cache compression mode. `None` → no compression (the default).
+         */kvCompression: KvCompression? = nil, 
         /**
          * Pinned-prefix length for Phase-1.5 context shift on overflow.
          * `0` disables shift; overflow returns `ContextOverflow` error.
-         */nKeep: UInt32, 
+         */nKeep: UInt32 = UInt32(0), 
         /**
          * Deterministic sampling seed. `None` = fresh entropy per call.
-         */seed: UInt64?, 
+         */seed: UInt64? = nil, 
         /**
          * Chunked-prefill ubatch size. `0` = monolithic prefill.
-         */ubatchSize: UInt32) {
+         */ubatchSize: UInt32 = UInt32(512)) {
         self.maxSeqLen = maxSeqLen
         self.kvCompression = kvCompression
         self.nKeep = nKeep
@@ -3864,7 +3864,7 @@ public struct FfiConverterTypeSessionConfig: FfiConverterRustBuffer {
         return
             try SessionConfig(
                 maxSeqLen: FfiConverterOptionUInt32.read(from: &buf), 
-                kvCompression: FfiConverterTypeKvCompression.read(from: &buf), 
+                kvCompression: FfiConverterOptionTypeKvCompression.read(from: &buf), 
                 nKeep: FfiConverterUInt32.read(from: &buf), 
                 seed: FfiConverterOptionUInt64.read(from: &buf), 
                 ubatchSize: FfiConverterUInt32.read(from: &buf)
@@ -3873,7 +3873,7 @@ public struct FfiConverterTypeSessionConfig: FfiConverterRustBuffer {
 
     public static func write(_ value: SessionConfig, into buf: inout [UInt8]) {
         FfiConverterOptionUInt32.write(value.maxSeqLen, into: &buf)
-        FfiConverterTypeKvCompression.write(value.kvCompression, into: &buf)
+        FfiConverterOptionTypeKvCompression.write(value.kvCompression, into: &buf)
         FfiConverterUInt32.write(value.nKeep, into: &buf)
         FfiConverterOptionUInt64.write(value.seed, into: &buf)
         FfiConverterUInt32.write(value.ubatchSize, into: &buf)
@@ -4810,6 +4810,30 @@ fileprivate struct FfiConverterOptionTypeBundleRepo: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeBundleRepo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeKvCompression: FfiConverterRustBuffer {
+    typealias SwiftType = KvCompression?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeKvCompression.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeKvCompression.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }

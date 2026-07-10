@@ -1053,15 +1053,20 @@ impl From<cera::kv_cache::KvCompression> for KvCompression {
 pub struct SessionConfig {
     /// Cap on total tokens held in KV. `None` → model's default
     /// `max_seq_len`.
+    #[uniffi(default = None)]
     pub max_seq_len: Option<u32>,
-    /// KV cache compression mode.
-    pub kv_compression: KvCompression,
+    /// KV cache compression mode. `None` → no compression (the default).
+    #[uniffi(default = None)]
+    pub kv_compression: Option<KvCompression>,
     /// Pinned-prefix length for Phase-1.5 context shift on overflow.
     /// `0` disables shift; overflow returns `ContextOverflow` error.
+    #[uniffi(default = 0)]
     pub n_keep: u32,
     /// Deterministic sampling seed. `None` = fresh entropy per call.
+    #[uniffi(default = None)]
     pub seed: Option<u64>,
     /// Chunked-prefill ubatch size. `0` = monolithic prefill.
+    #[uniffi(default = 512)]
     pub ubatch_size: u32,
 }
 
@@ -1073,7 +1078,7 @@ impl Default for SessionConfig {
         let core = cera::SessionConfig::default();
         Self {
             max_seq_len: core.max_seq_len,
-            kv_compression: core.kv_compression.into(),
+            kv_compression: Some(core.kv_compression.into()),
             n_keep: core.n_keep,
             seed: core.seed,
             ubatch_size: core.ubatch_size,
@@ -1085,7 +1090,9 @@ impl From<SessionConfig> for cera::SessionConfig {
     fn from(c: SessionConfig) -> Self {
         cera::SessionConfig {
             max_seq_len: c.max_seq_len,
-            kv_compression: c.kv_compression.into(),
+            // `None` → no compression (the core default), so an omitted
+            // `kv_compression` behaves like `KvCompression::None`.
+            kv_compression: c.kv_compression.map(Into::into).unwrap_or_default(),
             n_keep: c.n_keep,
             seed: c.seed,
             ubatch_size: c.ubatch_size,
@@ -1102,32 +1109,43 @@ impl From<SessionConfig> for cera::SessionConfig {
 /// surface stable across that transition.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct GenerateOpts {
+    #[uniffi(default = 256)]
     pub max_tokens: u32,
+    #[uniffi(default = 0.7)]
     pub temperature: f32,
+    #[uniffi(default = 0.9)]
     pub top_p: f32,
+    #[uniffi(default = 40)]
     pub top_k: u32,
     /// Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
     /// disables it. Honored in the stochastic path.
+    #[uniffi(default = 0.0)]
     pub min_p: f32,
     /// Repetition penalty over tokens generated this call. `1.0` disables it.
     /// Honored in the stochastic path (greedy/argmax decoding is unaffected).
+    #[uniffi(default = 1.0)]
     pub repetition_penalty: f32,
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
+    #[uniffi(default = [])]
     pub stop_tokens: Vec<u32>,
     /// Optional GBNF grammar **source text** constraining the output (e.g. a
     /// JSON grammar). When absent (the default), decoding is unconstrained. The
     /// grammar is compiled on the Rust side when generation starts; a malformed
     /// grammar is reported as a `GrammarParse` error.
+    #[uniffi(default = None)]
     pub grammar: Option<String>,
     /// Lazy-grammar trigger token ids (tool calling). When non-empty and
     /// `grammar` is set, the grammar stays inactive until the model emits one
     /// of these tokens (e.g. the tool-call start marker from
     /// [`CeraEngine::tool_call_start_token`]), then constrains the call and
     /// deactivates on completion. Empty → `grammar` is active from the start.
+    #[uniffi(default = [])]
     pub grammar_trigger_tokens: Vec<u32>,
     /// Ignored under synchronous generate; reserved for streaming.
+    #[uniffi(default = 16)]
     pub flush_every_tokens: u32,
     /// Ignored under synchronous generate; reserved for streaming.
+    #[uniffi(default = 50)]
     pub flush_every_ms: u32,
 }
 

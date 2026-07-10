@@ -461,9 +461,9 @@ async workflow:
 ```kotlin
 // Kotlin coroutine
 val engine = CeraEngine.fromBundleIdAsync("LFM2-1.2B-GGUF", "Q4_0", config)
-val session = engine.newSession(SessionConfig.default())
+val session = engine.newSession(SessionConfig())
 session.appendText("hello")
-val out = session.generateAsync(GenerateOpts.default())
+val out = session.generateAsync(GenerateOpts())
 ```
 
 ```swift
@@ -471,9 +471,9 @@ val out = session.generateAsync(GenerateOpts.default())
 let engine = try await CeraEngine.fromBundleIdAsync(
     bundleId: "LFM2-1.2B-GGUF", quant: "Q4_0", config: config
 )
-let session = try engine.newSession(config: SessionConfig.default())
+let session = try engine.newSession(config: SessionConfig())
 try session.appendText(text: "hello")
-let out = try await session.generateAsync(opts: GenerateOpts.default())
+let out = try await session.generateAsync(opts: GenerateOpts())
 ```
 
 Cancellation: dropping the `fromBundleIdAsync` future drops an
@@ -695,9 +695,9 @@ if (engine.hasChatTemplate()) {
         ),
         addGenerationPrompt = true,
     )
-    val session = engine.newSession(SessionConfig.default())
+    val session = engine.newSession(SessionConfig())
     session.appendText(rendered)
-    val out = session.generate(GenerateOpts.default())
+    val out = session.generate(GenerateOpts())
     val replyText = engine.decodeTokens(out.tokens)
     println("Assistant: $replyText")
 }
@@ -717,10 +717,10 @@ val toolsPrompt = engine.applyChatTemplateWithTools(
     tools = tools,
     addGenerationPrompt = true,
 )
-val session = engine.newSession(SessionConfig.default())
+val session = engine.newSession(SessionConfig())
 session.appendText(toolsPrompt)
 // Optional: constrain to a valid call via grammar + lazy trigger.
-val opts = GenerateOpts.default()
+val opts = GenerateOpts()
 engine.toolCallStartToken(format)?.let { trigger ->
     opts.grammar = toolGrammar(tools, format)      // GBNF string
     opts.grammarTriggerTokens = listOf(trigger)
@@ -747,9 +747,9 @@ if engine.hasChatTemplate() {
         ],
         addGenerationPrompt: true
     )
-    let session = try engine.newSession(config: SessionConfig.default())
+    let session = try engine.newSession(config: SessionConfig())
     try session.appendText(text: rendered)
-    let out = try session.generate(opts: GenerateOpts.default())
+    let out = try session.generate(opts: GenerateOpts())
     let replyText = engine.decodeTokens(tokens: out.tokens)
     print("Assistant: \(replyText)")
 }
@@ -768,10 +768,10 @@ let toolsPrompt = try engine.applyChatTemplateWithTools(
     tools: tools,
     addGenerationPrompt: true
 )
-let toolSession = try engine.newSession(config: SessionConfig.default())
+let toolSession = try engine.newSession(config: SessionConfig())
 try toolSession.appendText(text: toolsPrompt)
 // Optional: constrain to a valid call via grammar + lazy trigger.
-var opts = GenerateOpts.default()
+var opts = GenerateOpts()
 if let trigger = engine.toolCallStartToken(format: format) {
     opts.grammar = try toolGrammar(tools: tools, format: format)   // GBNF string
     opts.grammarTriggerTokens = [trigger]
@@ -835,12 +835,12 @@ run against the same engine concurrently (each holds its own
 ```kotlin
 val engine = CeraEngine.fromPath("...", config)
 
-// Per-session knobs. SessionConfig.default() picks the cera
+// Per-session knobs. SessionConfig() picks the cera
 // defaults (random sampler seed, no nKeep pin, ubatchSize 512).
-val session = engine.newSession(SessionConfig.default())
+val session = engine.newSession(SessionConfig())
 
 session.appendText("Hello, what is the capital of France?")
-val out = session.generate(GenerateOpts.default())
+val out = session.generate(GenerateOpts())
 println("decoded ${out.tokens.size} tokens, finish=${out.summary.finishReason}")
 println(engine.decodeTokens(out.tokens))
 ```
