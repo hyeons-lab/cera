@@ -140,8 +140,10 @@ cera run -m model.gguf -p "..." --tools @tools.json --constrain-tools
 
 With `--constrain-tools` a **lazy grammar trigger** keeps generation free until
 the model starts a tool call, then constrains the call to a valid function name,
-valid argument names, and correctly-typed values (JSON-Schema → GBNF). stdout is
-machine-readable: a JSON array of calls (`[]` when the model answered in prose).
+valid argument names, and correctly-typed values (JSON-Schema → GBNF). In
+`--tools` mode stdout is machine-readable — **only** the JSON array of calls
+(`[]` when the model answered in prose); the assistant reply and timing stream to
+stderr, so `… --tools tools.json | jq` just works.
 
 Available from **every binding**, not just the CLI — Rust (`cera::tools`),
 Kotlin/Swift (`applyChatTemplateWithTools`, `parseToolCalls`, `toolGrammar`,

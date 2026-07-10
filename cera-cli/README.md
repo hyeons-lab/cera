@@ -41,9 +41,10 @@ cera run --bundle-id LFM2.5-1.2B-Instruct --quant Q4_0 --prompt "Hello"
 cera run -m model.gguf -p "List 3 colors as JSON" --json
 cera run -m model.gguf -p "..." --grammar @schema.gbnf
 
-# Tool calling: pass tool schemas (inline JSON or @file); stdout is a JSON array
-# of the calls the model made. Add --constrain-tools to force a valid call.
-cera run -m model.gguf -p "Weather in Paris?" --tools @tools.json
+# Tool calling: pass tool schemas (inline JSON or @file). stdout gets ONLY the
+# JSON array of calls (the assistant reply + timing stream to stderr), so it
+# pipes cleanly. Add --constrain-tools to force a valid call.
+cera run -m model.gguf -p "Weather in Paris?" --tools @tools.json | jq .
 cera run -m model.gguf -p "Weather in Paris?" --tools @tools.json --constrain-tools
 
 # Interactive multi-turn chat REPL (keeps the prefix cache warm across turns)

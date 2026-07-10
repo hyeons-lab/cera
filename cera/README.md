@@ -119,7 +119,9 @@ back out, format-aware: `ToolFormat::detect(arch)` picks Pythonic (LFM2) vs
 Hermes JSON (Qwen2.5/Qwen3) from the GGUF architecture.
 
 Continuing from the Quick start (which sets up `engine`, `session`, and the
-chat `messages`, and produces the decoded `reply_text`):
+chat `messages`, and produces the decoded `reply_text`) — the schema below uses
+the `serde_json` crate, which `cera` does not re-export, so add it to your
+`Cargo.toml`:
 
 ```rust
 use std::sync::Arc;
