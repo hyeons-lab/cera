@@ -484,11 +484,18 @@ fn parse_lfm2_pythonic(text: &str) -> Result<Vec<ToolCall>> {
     }
     // No markers at all → tolerate a bare Pythonic call list, but only when it
     // actually looks like one (starts with `[`) so ordinary prose isn't
-    // misparsed as a call.
+    // misparsed as a call. Without markers there is no explicit call intent, so
+    // a leading `[` that doesn't parse as a call list (ordinary prose, a JSON
+    // array like `[1, 2, 3]`, etc.) is treated as "no tool call" — the error is
+    // swallowed rather than propagated. A *marked* section still errors on a
+    // malformed body (handled above), because the markers assert call intent.
     if !saw_marker {
         let trimmed = text.trim();
         if trimmed.starts_with('[') {
-            parse_pythonic_section(trimmed, &mut calls)?;
+            let mut bare = Vec::new();
+            if parse_pythonic_section(trimmed, &mut bare).is_ok() {
+                calls.append(&mut bare);
+            }
         }
     }
     Ok(calls)
@@ -607,6 +614,14 @@ impl<'a> PyParser<'a> {
 
     fn parse_ident(&mut self) -> String {
         let start = self.i;
+        // Python identifiers are `[A-Za-z_][A-Za-z0-9_]*`: a leading digit is
+        // not an identifier. Enforcing the start char here matches the module
+        // doc and keeps a bracket-leading non-call (`[1, 2, 3]`) from being
+        // read as a call whose name is a number.
+        match self.peek() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => self.i += 1,
+            _ => return String::new(),
+        }
         while let Some(c) = self.peek() {
             if c.is_ascii_alphanumeric() || c == '_' {
                 self.i += 1;
@@ -887,6 +902,30 @@ mod tests {
         assert_eq!(ToolFormat::detect("qwen2.5"), Some(ToolFormat::Hermes));
         assert_eq!(ToolFormat::detect("qwen3"), Some(ToolFormat::Hermes));
         assert_eq!(ToolFormat::detect("gpt2"), None);
+    }
+
+    #[test]
+    fn lfm2_marker_less_non_call_is_empty_not_error() {
+        // A bare `[…]` that isn't a Pythonic call list (JSON array, prose) has
+        // no explicit call intent → "no tool call" (empty vec), not an error.
+        for text in ["[1, 2, 3]", "[just some prose]", "[\"a\", \"b\"]"] {
+            let calls = parse_tool_calls(text, ToolFormat::Lfm2Pythonic).unwrap();
+            assert!(calls.is_empty(), "expected no calls for {text:?}");
+        }
+        // But a marker-delimited malformed body still errors (markers assert
+        // call intent).
+        assert!(
+            parse_tool_calls(
+                "<|tool_call_start|>[1, 2, 3]<|tool_call_end|>",
+                ToolFormat::Lfm2Pythonic
+            )
+            .is_err()
+        );
+        // A genuine bare call list still parses.
+        let calls =
+            parse_tool_calls("[get_weather(city=\"Paris\")]", ToolFormat::Lfm2Pythonic).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
     }
 
     #[test]

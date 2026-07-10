@@ -646,7 +646,21 @@ fn parse_tool_defs(tools_json: &str) -> Result<Vec<cera::tools::ToolDef>, JsErro
     if tools_json.trim().is_empty() {
         return Ok(Vec::new());
     }
-    serde_json::from_str(tools_json).map_err(|e| JsError::new(&format!("invalid tools JSON: {e}")))
+    let defs: Vec<cera::tools::ToolDef> = serde_json::from_str(tools_json)
+        .map_err(|e| JsError::new(&format!("invalid tools JSON: {e}")))?;
+    // Each tool's `parameters` must be a JSON Schema object; a non-object
+    // (e.g. `"parameters": null`) breaks chat templates that read
+    // `tool.parameters.properties` and yields a zero-property grammar. Reject
+    // it here, matching the CLI and UniFFI surfaces.
+    for def in &defs {
+        if !def.parameters.is_object() {
+            return Err(JsError::new(&format!(
+                "tool `{}` has non-object `parameters` (expected a JSON Schema object)",
+                def.name
+            )));
+        }
+    }
+    Ok(defs)
 }
 
 /// Parse a JS-side `[{ role, content }, ...]` array into the cera
