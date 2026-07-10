@@ -152,7 +152,7 @@ final class EngineStore: ObservableObject {
     private static func defaultSessionConfig() -> SessionConfig {
         SessionConfig(
             maxSeqLen: nil, // use the model's own max_seq_len
-            kvCompression: .none, // GPU backends use the f32 KV path anyway
+            kvCompression: nil, // nil == no compression; GPU backends use the f32 KV path anyway
             nKeep: 0,
             seed: nil,
             ubatchSize: 0
