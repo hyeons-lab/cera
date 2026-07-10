@@ -471,7 +471,7 @@ val out = session.generateAsync(GenerateOpts.default())
 let engine = try await CeraEngine.fromBundleIdAsync(
     bundleId: "LFM2-1.2B-GGUF", quant: "Q4_0", config: config
 )
-let session = engine.newSession(config: SessionConfig.default())
+let session = try engine.newSession(config: SessionConfig.default())
 try session.appendText(text: "hello")
 let out = try await session.generateAsync(opts: GenerateOpts.default())
 ```
@@ -713,7 +713,7 @@ if engine.hasChatTemplate() {
         ],
         addGenerationPrompt: true
     )
-    let session = engine.newSession(config: SessionConfig.default())
+    let session = try engine.newSession(config: SessionConfig.default())
     try session.appendText(text: rendered)
     let out = try session.generate(opts: GenerateOpts.default())
     let replyText = engine.decodeTokens(tokens: out.tokens)
@@ -755,10 +755,10 @@ run against the same engine concurrently (each holds its own
 
 | Method | Signature | Notes |
 |---|---|---|
-| `engine.newSession(config)` | `(SessionConfig) -> Arc<Session>` | Per-session knobs (`seed`, `nKeep`, `ubatchSize`, `maxSeqLen`, `kvCompression`). |
+| `engine.newSession(config)` | `(SessionConfig) -> Result<Arc<Session>, FfiError>` | Per-session knobs (`seed`, `nKeep`, `ubatchSize`, `maxSeqLen`, `kvCompression`). Fallible: `OutOfMemory` when the KV cache can't be allocated. |
 | `session.appendText(text)` | `(String) -> Result<(), FfiError>` | Tokenize + push into KV. Convenience over `appendTokens(encodeText(text))`. |
 | `session.appendTokens(tokens)` | `(Vec<u32>) -> Result<(), FfiError>` | Push pre-tokenized IDs. Use when you need explicit BOS/EOS framing. |
-| `session.appendAudio(samples, sampleRate)` | `(Vec<f32>, u32) -> Result<(), FfiError>` | **Placeholder** — wired through to `cera::Session::append_audio`, which is currently a scaffold (always errors). The FFI shape is locked in early so consumers can compile against it; real audio routing lands when `cera::Session::append_audio` is implemented core-side. |
+| `session.appendAudio(samples, sampleRate)` | `(Vec<f32>, u32) -> Result<(), FfiError>` | Encode PCM audio (mono `f32`, ~`[-1.0, 1.0]`, `sampleRate` must be 16000) through the bundle's audio mmproj (`AudioEncoderWeights`) and prefill it as soft tokens, for LFM2-Audio bundles. `CeraEngine.newSession` auto-attaches the audio encoder. `EmptyInput` on empty / too-short audio, `UnsupportedModality` on a non-audio model, `Backend` on sample-rate or encoder/LLM mismatch. |
 | `session.generate(opts)` | `(GenerateOpts) -> Result<GenerateOutput, FfiError>` | Sync decode; returns the full token list + summary in one shot. |
 | `session.generateStreaming(opts, sink)` | `(GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Sync decode with a foreign-trait callback per flush boundary (text tokens or audio frames per the model's modality). Returns the summary only — token IDs flow through the sink. |
 | `session.generateAsync(opts)` | `async (GenerateOpts) -> Result<GenerateOutput, FfiError>` | `spawn_blocking`-backed async twin of `generate`. Cancel by dropping the future. |
@@ -872,6 +872,13 @@ do {
   honored by *every* image-append path (including chat-template flows),
   so a host can configure the image-encode budget once instead of per
   call. `appendImage`'s explicit argument overrides it for that call.
+- **`engine.transcribe(pcm, sampleRate)`** → `Result<String, FfiError>` is a
+  one-shot ASR convenience on `CeraEngine` (not `Session`): it runs a full prefill +
+  greedy decode over mono `f32` PCM using the model's trained
+  `"Perform ASR."` chat mode and returns the transcript. Requires an
+  audio-capable bundle (`UnsupportedModality` otherwise) and `sampleRate`
+  must match the encoder's expected rate. Blocking — wrap it in
+  `spawn_blocking` / `Task.detached` from an async context.
 
 ## Design notes
 

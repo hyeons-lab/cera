@@ -148,12 +148,15 @@ the dylib stays put after build — fine for CI / local dev. Set
 `CERA_PARITY_LIB_DIR=<path>` if you need to override the
 `DYLD_LIBRARY_PATH` the runner sees.
 
-CI runs the gated tests on push to `main` + manual
-`workflow_dispatch` only — not on PRs:
+CI gates parity on push to `main` + manual `workflow_dispatch`
+only — not on PRs. Rather than the `#[ignore]`'d `cargo test`
+targets above, both jobs invoke the `check` CLI with
+`--fail-on-slowdown` (replacing the old `cargo test --ignored`
+step), covering the same leg boundaries plus the perf gate:
 - `Parity Harness (gated)` (`.github/workflows/ci.yml`) runs on
-  Ubuntu and exercises `parity` + `parity_kotlin`.
-- `Parity Harness Swift (gated)` runs on `macos-15` and exercises
-  `parity_swift`.
+  Ubuntu and checks rust ↔ ffi ↔ kotlin-jna.
+- `Parity Harness Swift (gated)` runs on `macos-26` and checks
+  rust ↔ ffi ↔ swift-uniffi.
 
 Both jobs use the cache key `cera-parity-cache-lfm2-350m-q4_0-v1`;
 GitHub's cache pools are OS-segregated so each OS downloads the
@@ -169,8 +172,9 @@ A new binding leg only has to satisfy two contracts:
 2. **Return a `Vec<u32>`** of greedy-decoded token IDs in emission
    order, excluding prompt tokens and any tokenizer-injected `<bos>`.
 
-For an in-process Rust leg, drop a `pub fn run_<name>(args: &RunArgs<'_>) -> Result<Vec<u32>>`
-into [`src/lib.rs`] alongside `run_rust` / `run_ffi`, add a new
+For an in-process Rust leg, drop a `pub fn run_<name>(args: &RunArgs<'_>) -> Result<(Vec<u32>, Option<u64>)>`
+(the token stream plus a wall-clock measurement in ms) into
+[`src/lib.rs`] alongside `run_rust` / `run_ffi`, add a new
 [`Leg`] variant in [`src/main.rs`], and extend `Cmd::Check` to diff
 against it.
 
@@ -208,10 +212,6 @@ how a leg gets there (in-process, subprocess, IPC) is up to the leg.
 
 Things this crate intentionally does **not** do (yet):
 
-- **Performance parity alarm.** A wall-clock-diff threshold (e.g.
-  >15% across legs trips CI) is documented in
-  `devlog/plans/000037-01-ffi-multitarget.md` Phase 2.5 but isn't
-  worth wiring before we have more than one non-Rust leg to compare.
 - **Layer-0 hidden state diff.** Catches divergence earlier than
   token equality but needs per-layer hooks across both APIs; not
   worth the surgery until token-equality misses a bug.

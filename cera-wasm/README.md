@@ -56,7 +56,7 @@ module (the entry self-loads the wasm via `fs.readFileSync`).
 ```js
 import { ceraVersion, Manifest } from '@hyeons-lab/cera-wasm';
 
-console.log(ceraVersion());  // e.g. "0.2.2"
+console.log(ceraVersion());  // e.g. "0.2.6"
 
 const res = await fetch('/path/to/manifest.json');
 const bytes = new Uint8Array(await res.arrayBuffer());
@@ -179,6 +179,34 @@ console.log('decode ms:', summary.decodeMs);
 session.free();
 engine.free();
 ```
+
+### Sampling knobs & constrained decoding
+
+Beyond the fields shown above, `GenerateOpts` also exposes `minP` and
+`repetitionPenalty`. Both apply on the **stochastic path only** — greedy/argmax
+decoding (selected by a temperature of `0` **or** a top-k of `1`) ignores them:
+
+```js
+const opts = new GenerateOpts();
+opts.temperature = 0.8;
+opts.minP = 0.05;               // drop tokens below 5% of the top token's prob
+opts.repetitionPenalty = 1.1;   // penalize already-emitted tokens
+```
+
+Constrain output to a GBNF grammar (e.g. force valid JSON). Unlike the
+other knobs this is a **method**, not a settable property — `setGrammar`
+can throw if the grammar fails to compile, which a plain setter can't
+surface:
+
+```js
+const opts = new GenerateOpts();
+opts.setGrammar('root ::= "{" [a-z]+ "}"');  // throws on a malformed grammar
+opts.hasGrammar;       // → true (getter — property access, no parens)
+// opts.clearGrammar(); // back to unconstrained decoding
+```
+
+Each decode step then masks the logits so only grammar-accepted tokens
+are sampled; a later `setGrammar` replaces any grammar set by a prior call.
 
 ### LoRA adapters & hidden states
 
@@ -403,6 +431,37 @@ browser, or `require('@hyeons-lab/cera-wasm')` from CommonJS Node),
 download the `cera-wasm-pkg-web` or `cera-wasm-pkg-nodejs` artifact
 instead — see the `Install` section above for the per-target
 table.
+
+## GPU acceleration (experimental WebGPU)
+
+An **experimental** WebGPU-backed session lights up when the crate is
+built with the `wgpu` cargo feature (which pulls in `cera/gpu`). It's a
+prototype — **LFM2 only, greedy decode** — with a surface deliberately
+separate from the CPU `Session`: WebGPU can't do blocking GPU readback on
+the JS event loop, so the whole prefill + decode loop is `async`. The
+default builds above are CPU-only; the standard `Session` remains the
+supported path.
+
+```js
+import { WebGpuSession } from '@hyeons-lab/cera-wasm';
+
+// Async constructor — initializes WebGPU (requestAdapter / requestDevice
+// resolve on the event loop), parses the GGUF, and uploads the model to
+// the GPU. `contextSize` defaults to 4096. Throws if WebGPU is
+// unavailable or the bytes aren't a valid LFM2 GGUF.
+const session = await WebGpuSession.create(ggufBytes, 2048);
+
+// Adapter + backend description — confirms the GPU path is live.
+console.log(session.adapter);  // e.g. "<adapter> (BrowserWebGpu)"
+
+// Greedy generate. `onToken(text)` fires per decoded piece as it's
+// produced; the full string is also returned. Stateful: the on-GPU KV
+// cache persists across calls, so a second `generate()` continues the
+// same sequence rather than restarting.
+const text = await session.generate('The capital of France is', 32, (piece) => {
+    outputEl.textContent += piece;  // stream into the DOM (browser-safe)
+});
+```
 
 ## Building from source
 
