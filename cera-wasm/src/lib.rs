@@ -65,7 +65,9 @@ export interface ToolDef {
  */
 export interface ToolCall {
     name: string;
-    arguments: object | unknown;
+    // Usually an object map (see the doc comment above); typed `unknown`
+    // because a malformed reply can pass through a non-object JSON value.
+    arguments: unknown;
 }
 "#;
 

@@ -1733,10 +1733,24 @@ fn main() -> Result<()> {
                             .with_context(|| format!("reading tools file `{path}`"))?,
                         None => spec.clone(),
                     };
-                    serde_json::from_str(&raw).context(
+                    let defs: Vec<cera::tools::ToolDef> = serde_json::from_str(&raw).context(
                         "parsing --tools JSON (expected an array of \
                          {name, description?, parameters} objects)",
-                    )?
+                    )?;
+                    // Each tool's `parameters` must be a JSON Schema object.
+                    // A non-object (e.g. `"parameters": null`) breaks chat
+                    // templates that read `tool.parameters.properties` and
+                    // yields a zero-property grammar — fail fast with the
+                    // offending tool named. Mirrors the FFI-layer check.
+                    for def in &defs {
+                        anyhow::ensure!(
+                            def.parameters.is_object(),
+                            "tool `{}` has non-object `parameters` \
+                             (expected a JSON Schema object)",
+                            def.name
+                        );
+                    }
+                    defs
                 }
                 None => Vec::new(),
             };

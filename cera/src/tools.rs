@@ -146,7 +146,9 @@ impl ToolFormat {
             // Qwen2/Qwen3/most llama.cpp Hermes fine-tunes use the
             // `<tool_call>` JSON convention. Plain "llama" is ambiguous
             // (Llama-3.1 uses bare JSON), so we don't claim it here.
-            "qwen2" | "qwen3" | "qwen3moe" => Some(ToolFormat::Hermes),
+            // Qwen2.5 GGUFs usually report "qwen2", but accept "qwen2.5"
+            // too in case a converter emits the point-release string.
+            "qwen2" | "qwen2.5" | "qwen3" | "qwen3moe" => Some(ToolFormat::Hermes),
             _ => None,
         }
     }
@@ -216,9 +218,45 @@ pub fn tool_grammar(tools: &[ToolDef], format: ToolFormat) -> Result<String> {
         bail!("tool_grammar: no tools provided");
     }
     match format {
-        ToolFormat::Lfm2Pythonic => Ok(lfm2_grammar(tools)),
+        ToolFormat::Lfm2Pythonic => {
+            // The Pythonic grammar emits names verbatim (`name(arg=…)`), and the
+            // parser reads them back as Python identifiers. A name with `-`, `.`,
+            // a leading digit, etc. would compile into a grammar the parser can't
+            // round-trip — the model could satisfy the grammar yet produce output
+            // `parse_tool_calls` rejects. Fail loudly at build time instead.
+            for tool in tools {
+                ensure!(
+                    is_py_ident(&tool.name),
+                    "tool name `{}` is not a valid Python identifier; the LFM2 \
+                     Pythonic format requires [A-Za-z_][A-Za-z0-9_]* names",
+                    tool.name
+                );
+                for (name, _) in properties(tool) {
+                    ensure!(
+                        is_py_ident(&name),
+                        "argument name `{name}` of tool `{}` is not a valid Python \
+                         identifier; the LFM2 Pythonic format requires \
+                         [A-Za-z_][A-Za-z0-9_]* names",
+                        tool.name
+                    );
+                }
+            }
+            Ok(lfm2_grammar(tools))
+        }
         ToolFormat::Hermes => Ok(hermes_grammar(tools)),
     }
+}
+
+/// True when `s` is a valid Python identifier for our purposes:
+/// `[A-Za-z_][A-Za-z0-9_]*` (ASCII). Matches what the Pythonic grammar can emit
+/// and what the Pythonic parser's `parse_ident` reads back.
+fn is_py_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Shared value/whitespace rules appended to every generated grammar. `bt`
@@ -845,8 +883,35 @@ mod tests {
     #[test]
     fn detect_arch() {
         assert_eq!(ToolFormat::detect("lfm2"), Some(ToolFormat::Lfm2Pythonic));
+        assert_eq!(ToolFormat::detect("qwen2"), Some(ToolFormat::Hermes));
+        assert_eq!(ToolFormat::detect("qwen2.5"), Some(ToolFormat::Hermes));
         assert_eq!(ToolFormat::detect("qwen3"), Some(ToolFormat::Hermes));
         assert_eq!(ToolFormat::detect("gpt2"), None);
+    }
+
+    #[test]
+    fn lfm2_grammar_rejects_non_identifier_names() {
+        // A tool name that isn't a Python identifier can't round-trip through
+        // the Pythonic parser, so grammar generation must reject it.
+        let bad_tool = ToolDef {
+            name: "get-weather".into(),
+            description: None,
+            parameters: empty_params(),
+        };
+        assert!(tool_grammar(&[bad_tool], ToolFormat::Lfm2Pythonic).is_err());
+
+        // A bad *argument* name is rejected too.
+        let bad_arg = ToolDef {
+            name: "get_weather".into(),
+            description: None,
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "2fa": { "type": "string" } }
+            }),
+        };
+        assert!(tool_grammar(std::slice::from_ref(&bad_arg), ToolFormat::Lfm2Pythonic).is_err());
+        // The same non-identifier names are fine for Hermes (JSON quotes them).
+        assert!(tool_grammar(&[bad_arg], ToolFormat::Hermes).is_ok());
     }
 
     #[test]
