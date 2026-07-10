@@ -19,7 +19,9 @@ byteorder = "1"
 half = { version = "2", features = ["bytemuck"] }
 memmap2 = "0.9"
 clap = { version = "4", features = ["derive"] }
-minijinja = "2"
+# `json` feature adds the `tojson` filter that tool-trained chat templates
+# (LFM2, Qwen) use to serialize tool schemas / structured content.
+minijinja = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.8"

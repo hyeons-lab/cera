@@ -468,9 +468,30 @@ pub struct ChatMessageMultimodal {
 /// (list-of-items content) work without per-shape branching here —
 /// the chat template itself dispatches on whether `content` is a
 /// string or a list.
+///
+/// For tool calling, use [`apply_chat_template_with_tools`], which also passes
+/// a `tools` array so a template's `{% if tools %}` branch renders.
 pub fn apply_chat_template<M: serde::Serialize>(
     tokenizer: &BpeTokenizer,
     messages: &[M],
+    add_generation_prompt: bool,
+) -> Result<String> {
+    apply_chat_template_with_tools(tokenizer, messages, &[], add_generation_prompt)
+}
+
+/// Like [`apply_chat_template`], but also exposes a `tools` array to the
+/// template so tool-trained models render their tool-definition block.
+///
+/// `tools` serializes to the OpenAI "function" JSON shape
+/// (`{name, description, parameters}`); tool-trained templates iterate it
+/// under `{% if tools %} … {% for tool in tools %}`. An **empty** `tools`
+/// slice is rendered as an empty array, which is falsy in Jinja — so passing
+/// no tools is exactly equivalent to the plain [`apply_chat_template`] and
+/// leaves non-tool templates untouched.
+pub fn apply_chat_template_with_tools<M: serde::Serialize>(
+    tokenizer: &BpeTokenizer,
+    messages: &[M],
+    tools: &[crate::tools::ToolDef],
     add_generation_prompt: bool,
 ) -> Result<String> {
     let template_str = tokenizer
@@ -501,6 +522,7 @@ pub fn apply_chat_template<M: serde::Serialize>(
 
     let ctx = minijinja::context! {
         messages => messages,
+        tools => tools,
         bos_token => bos_token,
         eos_token => eos_token,
         add_generation_prompt => add_generation_prompt,

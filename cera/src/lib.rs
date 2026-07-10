@@ -47,6 +47,7 @@ pub mod sysmem;
 pub mod tensor;
 pub mod time;
 pub mod tokenizer;
+pub mod tools;
 pub mod turboquant;
 
 // Canonical public re-exports for the stateful API. Consumers should
