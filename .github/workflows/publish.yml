@@ -89,7 +89,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
       # Gate the whole release on version consistency: every crate, the Dart
       # pubspec, and the Gradle VERSION_NAME must match the VERSION file. This
       # runs before anything publishes, so a drifted pin/coordinate can't ship.
@@ -119,7 +119,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
 
       - uses: Swatinem/rust-cache@v2
 
@@ -263,7 +263,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
 
       - uses: Swatinem/rust-cache@v2
 
@@ -303,7 +303,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
@@ -389,7 +389,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
@@ -528,7 +528,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - name: Assert arm64 host
