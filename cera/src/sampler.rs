@@ -6,18 +6,27 @@ use rand::rngs::StdRng;
 
 use crate::backend::cpu;
 
-/// NaN-safe CPU argmax. NaN values compare as -inf (never selected).
-pub(crate) fn cpu_argmax(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| {
-            let a = if a.is_nan() { f32::NEG_INFINITY } else { **a };
-            let b = if b.is_nan() { f32::NEG_INFINITY } else { **b };
-            a.total_cmp(&b)
-        })
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+/// NaN-safe argmax over a logits slice: the greedy-decoding token pick.
+///
+/// The strict `>` comparison means a NaN never displaces the running best and,
+/// on an exact tie, the **lowest** index wins — matching both GPU argmax
+/// kernels (`argmax_f32.wgsl` / `argmax_f32.metal`, which use the same `>`) and
+/// llama.cpp's `std::max_element` greedy pick. Public so external harnesses
+/// (e.g. benchmark runners driving [`crate::model::Model`] directly) pick
+/// tokens identically to cera's own greedy decode path across CPU and GPU.
+///
+/// When no finite value is present (empty input, or every logit is NaN) there
+/// is no winner and index `0` is returned.
+pub fn argmax(logits: &[f32]) -> u32 {
+    let mut best_i = 0u32;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best_i = i as u32;
+        }
+    }
+    best_i
 }
 
 /// Configuration for token sampling.
@@ -104,7 +113,7 @@ impl Sampler {
         // (single candidate makes temp/top_p/penalties irrelevant). Greedy
         // skips history bookkeeping too — it's deterministic by contract.
         if self.config.temperature <= 0.0 || self.config.top_k == 1 {
-            return cpu_argmax(logits);
+            return argmax(logits);
         }
 
         // Repetition penalty over already-emitted tokens, before temperature
@@ -377,5 +386,20 @@ mod tests {
         let token = s.sample(&mut logits);
         assert_eq!(token, 1, "argmax picks the largest logit");
         assert!(s.history.is_empty(), "greedy path records no history");
+    }
+
+    #[test]
+    fn argmax_ties_pick_lowest_index() {
+        // Exact tie → lowest index, matching the GPU kernels and llama.cpp.
+        assert_eq!(argmax(&[5.0, 5.0, 1.0]), 0);
+        assert_eq!(argmax(&[1.0, 5.0, 5.0]), 1);
+    }
+
+    #[test]
+    fn argmax_skips_nan_and_handles_empty() {
+        // NaN never wins; all-NaN or empty falls back to index 0.
+        assert_eq!(argmax(&[f32::NAN, 2.0, f32::NAN]), 1);
+        assert_eq!(argmax(&[f32::NAN, f32::NAN]), 0);
+        assert_eq!(argmax(&[]), 0);
     }
 }

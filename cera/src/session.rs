@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use thiserror::Error;
 
-use crate::time::Instant;
+use crate::time::{Duration, Instant};
 
 use crate::kv_cache::{InferenceState, KvCompression};
 use crate::model::Model;
@@ -72,6 +72,13 @@ pub struct GenerateOpts {
     pub repetition_penalty: f32,
     /// If any of these fires, decode stops with `FinishReason::Stop`.
     pub stop_tokens: Vec<u32>,
+    /// Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
+    /// decode always runs to `max_tokens` (or `ContextFull`/cancel). For
+    /// benchmark loops that must cover an exact token count — the analog of
+    /// llama.cpp's `--ignore-eos`. While a `grammar` is actively constraining
+    /// decoding this flag is ignored — the grammar's EOS-on-completion stop
+    /// still applies, so constrained output stays well-formed.
+    pub ignore_eos: bool,
     /// Optional GBNF grammar. When set, decode is constrained: each step masks the
     /// logits to only tokens the grammar accepts (EOS only when the grammar is
     /// complete). Forces off the greedy `forward_greedy` fast path. See [`crate::grammar`].
@@ -101,6 +108,7 @@ impl Default for GenerateOpts {
             min_p: 0.0,
             repetition_penalty: 1.0,
             stop_tokens: Vec::new(),
+            ignore_eos: false,
             grammar: None,
             grammar_trigger_tokens: Vec::new(),
             flush_every_tokens: 16,
@@ -113,7 +121,16 @@ impl Default for GenerateOpts {
 #[derive(Debug, Clone)]
 pub struct GenerateSummary {
     pub tokens_generated: u32,
+    /// Tokens prefilled since the previous `generate()` / `reset()` / session
+    /// creation (llama.cpp `n_p_eval` semantics). Paired with `prompt_eval_ms`
+    /// — both cover the same window — so `prompt_eval_tokens / prompt_eval_ms`
+    /// is a valid prefill throughput even across a reused/multi-turn session.
+    /// Every `generate()` call consumes the accumulator, so a `max_tokens == 0`
+    /// capacity poll attributes the prefill to itself and a later real
+    /// `generate()` reports `0` for it (no double-counting when summing).
     pub prompt_eval_tokens: u32,
+    /// Wall time of the prefill counted by `prompt_eval_tokens`. See that
+    /// field for the windowing / consumption semantics.
     pub prompt_eval_ms: u32,
     pub decode_ms: u32,
     pub finish_reason: FinishReason,
@@ -136,6 +153,14 @@ pub enum FinishReason {
     GrammarDeadEnd,
     /// Other error; the outer `Result` is the authoritative channel.
     Error(String),
+}
+
+/// Saturating `Duration` → whole-milliseconds `u32` for the timing summary
+/// fields. `as_millis()` is `u128`; a plain `as u32` would wrap past
+/// `u32::MAX` ms (~49.7 days of accumulated time), silently reporting a tiny
+/// value. Saturating keeps the metric monotonic instead.
+fn duration_ms_u32(d: Duration) -> u32 {
+    d.as_millis().min(u32::MAX as u128) as u32
 }
 
 /// Streaming output sink. Default-empty methods let text-only consumers
@@ -338,6 +363,15 @@ pub struct Session {
     cancel: Arc<AtomicBool>,
     /// Logits from the last prefill / decode step — seeds the next generate call.
     last_logits: Option<Vec<f32>>,
+    /// Tokens prefilled (`append_tokens` / `append_embeddings`) since the last
+    /// `generate()` consumed them. Paired with `prefill_elapsed` and reported
+    /// as `GenerateSummary::prompt_eval_tokens` so tokens and time cover the
+    /// same window (llama.cpp `n_p_eval` semantics), then reset by `generate`.
+    prefill_tokens: u32,
+    /// Wall time spent in prefill (`append_tokens` / `append_embeddings`)
+    /// since the last `generate()` consumed it. Reported as
+    /// `GenerateSummary::prompt_eval_ms`, then reset, by the next `generate`.
+    prefill_elapsed: Duration,
     /// Copied from config — enforced on `append_tokens`.
     max_seq_len: usize,
     /// What this session can accept / emit, derived from the model's
@@ -486,6 +520,8 @@ impl Session {
             position_atomic: Arc::new(AtomicU32::new(0)),
             cancel: Arc::new(AtomicBool::new(false)),
             last_logits: None,
+            prefill_tokens: 0,
+            prefill_elapsed: Duration::ZERO,
             max_seq_len,
             capabilities,
             config,
@@ -659,6 +695,8 @@ impl Session {
         self.current_pos = 0;
         self.position_atomic.store(0, Ordering::Relaxed);
         self.last_logits = None;
+        self.prefill_tokens = 0;
+        self.prefill_elapsed = Duration::ZERO;
         self.cancel.store(false, Ordering::Relaxed);
         // Re-seed the sampler so deterministic runs stay deterministic after reset().
         let sampler_cfg = SamplerConfig {
@@ -961,6 +999,7 @@ impl Session {
         // Pass `ubatch_size` straight through — the trait method treats
         // 0 as "no chunking" (single chunk = whole input), matching the
         // CLI `--ubatch-size 0` opt-out.
+        let prefill_start = Instant::now();
         let (consumed, logits) = self.model.forward_prefill_chunked(
             tokens,
             self.current_pos,
@@ -968,6 +1007,8 @@ impl Session {
             self.config.ubatch_size as usize,
             &self.cancel,
         );
+        self.prefill_elapsed += prefill_start.elapsed();
+        self.prefill_tokens = self.prefill_tokens.saturating_add(consumed as u32);
         self.current_pos += consumed;
         self.position_atomic
             .store(self.current_pos as u32, Ordering::Relaxed);
@@ -1093,12 +1134,15 @@ impl Session {
         while ti < n_tokens {
             let end = (ti + chunk_size).min(n_tokens);
             let chunk = &embeddings[ti * hidden_size..end * hidden_size];
+            let prefill_start = Instant::now();
             let logits = self.model.forward_prefill_from_embeddings(
                 chunk,
                 end - ti,
                 self.current_pos,
                 &mut self.state,
             );
+            self.prefill_elapsed += prefill_start.elapsed();
+            self.prefill_tokens = self.prefill_tokens.saturating_add((end - ti) as u32);
             self.current_pos += end - ti;
             self.position_atomic
                 .store(self.current_pos as u32, Ordering::Relaxed);
@@ -1449,10 +1493,19 @@ impl Session {
         // prior call shouldn't pre-cancel the next one.
         self.cancel.store(false, Ordering::Relaxed);
 
-        let prompt_eval_tokens = self.current_pos as u32;
-        // Synthetic prompt-eval time: prefill already happened in append_*.
-        // We don't re-time it here. (Real per-chunk timing arrives with 1.4.)
-        let prompt_eval_ms: u32 = 0;
+        // Prefill happened in `append_*`, which accumulated its token count and
+        // wall time on the session. Consume them here — unconditionally, so
+        // EVERY `generate()` call (including the no-op early exits below)
+        // attributes each prefill to exactly the first `generate` that follows
+        // it. That keeps the token/time pair coherent (both cover the same
+        // window) and makes summing `prompt_eval_ms` across summaries exact,
+        // with no double-counting. Resetting is pure telemetry — it touches
+        // neither the RNG nor `last_logits`, so the early exits' zero-decode
+        // contract is preserved.
+        let prompt_eval_tokens = self.prefill_tokens;
+        let prompt_eval_ms = duration_ms_u32(self.prefill_elapsed);
+        self.prefill_tokens = 0;
+        self.prefill_elapsed = Duration::ZERO;
 
         let decode_start = Instant::now();
         let mut finish = FinishReason::MaxTokens;
@@ -1470,7 +1523,7 @@ impl Session {
         // reproducibility and for callers polling capacity.
         if opts.max_tokens == 0 {
             sink.on_done(FinishReason::MaxTokens);
-            let decode_ms = decode_start.elapsed().as_millis() as u32;
+            let decode_ms = duration_ms_u32(decode_start.elapsed());
             return Ok(GenerateSummary {
                 tokens_generated: 0,
                 prompt_eval_tokens,
@@ -1481,7 +1534,7 @@ impl Session {
         }
         if self.current_pos >= self.max_seq_len {
             sink.on_done(FinishReason::ContextFull);
-            let decode_ms = decode_start.elapsed().as_millis() as u32;
+            let decode_ms = duration_ms_u32(decode_start.elapsed());
             return Ok(GenerateSummary {
                 tokens_generated: 0,
                 prompt_eval_tokens,
@@ -1575,12 +1628,12 @@ impl Session {
             Vec::with_capacity(logits.len())
         };
 
-        // Greedy-mode token state: the first token comes from `cpu_argmax`
+        // Greedy-mode token state: the first token comes from `argmax`
         // on the prefill logits; each subsequent iteration's token comes
         // from the previous `forward_greedy()` return value. No RNG is
         // touched in this path — argmax is deterministic.
         let mut greedy_next: u32 = if greedy {
-            crate::sampler::cpu_argmax(&logits)
+            crate::sampler::argmax(&logits)
         } else {
             0
         };
@@ -1633,7 +1686,7 @@ impl Session {
                     }
                 }
                 if want_greedy {
-                    crate::sampler::cpu_argmax(&sample_scratch)
+                    crate::sampler::argmax(&sample_scratch)
                 } else {
                     self.sampler.sample(&mut sample_scratch)
                 }
@@ -1654,7 +1707,16 @@ impl Session {
             // armed — the lazy pre-trigger phase or after a completed call — stopping
             // is always allowed, so free text can end on EOS as usual.
             let stop_allowed = !armed || grammar_state.as_ref().is_none_or(|s| s.is_complete());
-            if stop_allowed
+            // `ignore_eos` runs decode to `max_tokens`, but only suppresses the
+            // stop where it is the model's free choice. While a grammar is
+            // actively constraining (`armed`), the mask permits EOS only once
+            // the grammar is complete and masks it otherwise; honoring that
+            // stop keeps constrained output well-formed and avoids feeding EOS
+            // into a completed `GrammarState` (which would dead-end it). So EOS
+            // / `stop_tokens` are suppressed only when a grammar is NOT armed.
+            let honor_stop = armed || !opts.ignore_eos;
+            if honor_stop
+                && stop_allowed
                 && !is_pending_trigger
                 && (self.tokenizer.eos_token() == Some(token) || opts.stop_tokens.contains(&token))
             {
@@ -1755,7 +1817,7 @@ impl Session {
 
         sink.on_done(finish.clone());
 
-        let decode_ms = decode_start.elapsed().as_millis() as u32;
+        let decode_ms = duration_ms_u32(decode_start.elapsed());
         Ok(GenerateSummary {
             tokens_generated: generated,
             prompt_eval_tokens,
@@ -1854,6 +1916,7 @@ mod tests {
         let o = GenerateOpts::default();
         assert_eq!(o.flush_every_tokens, 16);
         assert_eq!(o.flush_every_ms, 50);
+        assert!(!o.ignore_eos, "EOS must be honored by default");
     }
 
     #[test]

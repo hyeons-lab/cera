@@ -1280,7 +1280,7 @@ impl MetalDepthformer {
                 std::slice::from_raw_parts(self.logits_buf.contents() as *const f32, dec.n_vocab)
             };
             let sampled = if temperature <= 0.0 {
-                crate::sampler::cpu_argmax(logits) as i32
+                crate::sampler::argmax(logits) as i32
             } else {
                 let mut logits_vec = logits.to_vec();
                 let inv_temp = 1.0 / temperature;

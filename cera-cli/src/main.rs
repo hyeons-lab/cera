@@ -3540,6 +3540,10 @@ fn main() -> Result<()> {
                 let opts = cera::GenerateOpts {
                     max_tokens: max_tokens as u32,
                     temperature: 0.0,
+                    // llama-bench semantics: every run must decode exactly
+                    // `max_tokens`, not stop early at EOS — otherwise short
+                    // completions silently shrink the measured sample.
+                    ignore_eos: true,
                     ..Default::default()
                 };
                 let mut sink = NoopSink;

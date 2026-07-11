@@ -252,6 +252,10 @@ class GenerateOpts {
     this.repetitionPenalty = 1.0,
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     this.stopTokens = const [],
+    /// Ignore end-of-generation: EOS and `stopTokens` are not honored, so
+    /// decode always runs to `maxTokens`. For benchmark loops that must cover
+    /// an exact token count.
+    this.ignoreEos = false,
     /// Optional GBNF grammar **source text** constraining the output (e.g. a
     /// JSON grammar). When absent (the default), decoding is unconstrained. The
     /// grammar is compiled on the Rust side when generation starts; a malformed
@@ -281,6 +285,10 @@ class GenerateOpts {
   final double repetitionPenalty;
   /// Early-stop IDs (EOS / instruction markers / end-of-turn).
   final List<int> stopTokens;
+  /// Ignore end-of-generation: EOS and `stopTokens` are not honored, so decode
+  /// always runs to `maxTokens`. For benchmark loops that must cover an exact
+  /// token count.
+  final bool ignoreEos;
   /// Optional GBNF grammar **source text** constraining the output (e.g. a
   /// JSON grammar). When absent (the default), decoding is unconstrained. The
   /// grammar is compiled on the Rust side when generation starts; a malformed
@@ -306,6 +314,7 @@ class GenerateOpts {
       'minP': this.minP,
       'repetitionPenalty': this.repetitionPenalty,
       'stopTokens': this.stopTokens,
+      'ignoreEos': this.ignoreEos,
       'grammar': this.grammar,
       'grammarTriggerTokens': this.grammarTriggerTokens,
       'flushEveryTokens': this.flushEveryTokens,
@@ -322,6 +331,7 @@ class GenerateOpts {
       minP: json.containsKey('minP') ? (json['minP'] as num).toDouble() : 0.0,
       repetitionPenalty: json.containsKey('repetitionPenalty') ? (json['repetitionPenalty'] as num).toDouble() : 1.0,
       stopTokens: json.containsKey('stopTokens') ? (json['stopTokens'] as List).map((item) => (item as num).toInt()).toList() : const [],
+      ignoreEos: json.containsKey('ignoreEos') ? json['ignoreEos'] as bool : false,
       grammar: json.containsKey('grammar') ? json['grammar'] == null ? null : json['grammar'] as String : null,
       grammarTriggerTokens: json.containsKey('grammarTriggerTokens') ? (json['grammarTriggerTokens'] as List).map((item) => (item as num).toInt()).toList() : const [],
       flushEveryTokens: json.containsKey('flushEveryTokens') ? (json['flushEveryTokens'] as num).toInt() : 16,
@@ -337,6 +347,7 @@ class GenerateOpts {
     double? minP,
     double? repetitionPenalty,
     List<int>? stopTokens,
+    bool? ignoreEos,
     Object? grammar = _sentinel,
     List<int>? grammarTriggerTokens,
     int? flushEveryTokens,
@@ -350,6 +361,7 @@ class GenerateOpts {
       minP: minP ?? this.minP,
       repetitionPenalty: repetitionPenalty ?? this.repetitionPenalty,
       stopTokens: stopTokens ?? this.stopTokens,
+      ignoreEos: ignoreEos ?? this.ignoreEos,
       grammar: grammar == _sentinel ? this.grammar : grammar as String?,
       grammarTriggerTokens: grammarTriggerTokens ?? this.grammarTriggerTokens,
       flushEveryTokens: flushEveryTokens ?? this.flushEveryTokens,
@@ -359,16 +371,16 @@ class GenerateOpts {
 
   @override
   String toString() {
-    return 'GenerateOpts(maxTokens: $maxTokens, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, grammar: $grammar, grammarTriggerTokens: $grammarTriggerTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs)';
+    return 'GenerateOpts(maxTokens: $maxTokens, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, ignoreEos: $ignoreEos, grammar: $grammar, grammarTriggerTokens: $grammarTriggerTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is GenerateOpts && maxTokens == other.maxTokens && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && grammar == other.grammar && grammarTriggerTokens == other.grammarTriggerTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs;
+      other is GenerateOpts && maxTokens == other.maxTokens && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && ignoreEos == other.ignoreEos && grammar == other.grammar && grammarTriggerTokens == other.grammarTriggerTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs;
 
   @override
-  int get hashCode => Object.hash(maxTokens, temperature, topP, topK, minP, repetitionPenalty, stopTokens, grammar, grammarTriggerTokens, flushEveryTokens, flushEveryMs);
+  int get hashCode => Object.hash(maxTokens, temperature, topP, topK, minP, repetitionPenalty, stopTokens, ignoreEos, grammar, grammarTriggerTokens, flushEveryTokens, flushEveryMs);
 }
 
 /// Bundle of everything a synchronous `generate` call produces:
@@ -574,6 +586,8 @@ class ModelMetadata {
     /// Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
     /// want to insert a BOS at the head of a raw prompt should honor it.
     required this.addBosToken,
+    /// Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `addBosToken`.
+    required this.addEosToken,
     /// SIMD backend tier the runtime resolved for this host (e.g.
     /// `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
     /// model-specific — surfaced here so consumers fetching metadata also
@@ -590,6 +604,8 @@ class ModelMetadata {
   /// Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
   /// want to insert a BOS at the head of a raw prompt should honor it.
   final bool addBosToken;
+  /// Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `addBosToken`.
+  final bool addEosToken;
   /// SIMD backend tier the runtime resolved for this host (e.g.
   /// `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
   /// model-specific — surfaced here so consumers fetching metadata also
@@ -605,6 +621,7 @@ class ModelMetadata {
       'hasChatTemplate': this.hasChatTemplate,
       'quantization': this.quantization,
       'addBosToken': this.addBosToken,
+      'addEosToken': this.addEosToken,
       'cpuBackend': this.cpuBackend,
     };
   }
@@ -617,6 +634,7 @@ class ModelMetadata {
       hasChatTemplate: json['hasChatTemplate'] as bool,
       quantization: json['quantization'] as String,
       addBosToken: json['addBosToken'] as bool,
+      addEosToken: json['addEosToken'] as bool,
       cpuBackend: json['cpuBackend'] as String,
     );
   }
@@ -628,6 +646,7 @@ class ModelMetadata {
     bool? hasChatTemplate,
     String? quantization,
     bool? addBosToken,
+    bool? addEosToken,
     String? cpuBackend,
   }) {
     return ModelMetadata(
@@ -637,22 +656,23 @@ class ModelMetadata {
       hasChatTemplate: hasChatTemplate ?? this.hasChatTemplate,
       quantization: quantization ?? this.quantization,
       addBosToken: addBosToken ?? this.addBosToken,
+      addEosToken: addEosToken ?? this.addEosToken,
       cpuBackend: cpuBackend ?? this.cpuBackend,
     );
   }
 
   @override
   String toString() {
-    return 'ModelMetadata(architecture: $architecture, maxSeqLen: $maxSeqLen, vocabSize: $vocabSize, hasChatTemplate: $hasChatTemplate, quantization: $quantization, addBosToken: $addBosToken, cpuBackend: $cpuBackend)';
+    return 'ModelMetadata(architecture: $architecture, maxSeqLen: $maxSeqLen, vocabSize: $vocabSize, hasChatTemplate: $hasChatTemplate, quantization: $quantization, addBosToken: $addBosToken, addEosToken: $addEosToken, cpuBackend: $cpuBackend)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is ModelMetadata && architecture == other.architecture && maxSeqLen == other.maxSeqLen && vocabSize == other.vocabSize && hasChatTemplate == other.hasChatTemplate && quantization == other.quantization && addBosToken == other.addBosToken && cpuBackend == other.cpuBackend;
+      other is ModelMetadata && architecture == other.architecture && maxSeqLen == other.maxSeqLen && vocabSize == other.vocabSize && hasChatTemplate == other.hasChatTemplate && quantization == other.quantization && addBosToken == other.addBosToken && addEosToken == other.addEosToken && cpuBackend == other.cpuBackend;
 
   @override
-  int get hashCode => Object.hash(architecture, maxSeqLen, vocabSize, hasChatTemplate, quantization, addBosToken, cpuBackend);
+  int get hashCode => Object.hash(architecture, maxSeqLen, vocabSize, hasChatTemplate, quantization, addBosToken, addEosToken, cpuBackend);
 }
 
 /// Per-session configuration. Mirrors [`cera::SessionConfig`].
@@ -2252,6 +2272,7 @@ void _uniffiWriteGenerateOpts(GenerateOpts value, _UniFfiBinaryWriter writer) {
   for (final item in value.stopTokens) {
     writer.writeU32(item);
   }
+  writer.writeBool(value.ignoreEos);
   if (value.grammar == null) {
     writer.writeI8(0);
   } else {
@@ -2281,6 +2302,7 @@ GenerateOpts _uniffiReadGenerateOpts(_UniFfiBinaryReader reader) {
     minP: reader.readF32(),
     repetitionPenalty: reader.readF32(),
     stopTokens: (() { final int __len = reader.readI32(); final out = <int>[]; for (var i = 0; i < __len; i++) { out.add(reader.readU32()); } return out; })(),
+    ignoreEos: reader.readBool(),
     grammar: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readString(); })(),
     grammarTriggerTokens: (() { final int __len = reader.readI32(); final out = <int>[]; for (var i = 0; i < __len; i++) { out.add(reader.readU32()); } return out; })(),
     flushEveryTokens: reader.readU32(),
@@ -2400,6 +2422,7 @@ void _uniffiWriteModelMetadata(ModelMetadata value, _UniFfiBinaryWriter writer) 
   writer.writeBool(value.hasChatTemplate);
   writer.writeString(value.quantization);
   writer.writeBool(value.addBosToken);
+  writer.writeBool(value.addEosToken);
   writer.writeString(value.cpuBackend);
 }
 
@@ -2417,6 +2440,7 @@ ModelMetadata _uniffiReadModelMetadata(_UniFfiBinaryReader reader) {
     hasChatTemplate: reader.readBool(),
     quantization: reader.readString(),
     addBosToken: reader.readBool(),
+    addEosToken: reader.readBool(),
     cpuBackend: reader.readString(),
   );
 }

@@ -344,6 +344,13 @@ impl CeraEngine {
         self.inner.metadata().add_bos_token
     }
 
+    /// `true` when the GGUF declares `tokenizer.ggml.add_eos_token`. Prefer
+    /// `Tokenizer.encodeSpecial`, which applies this (and BOS) automatically.
+    #[wasm_bindgen(getter, js_name = addEosToken)]
+    pub fn add_eos_token(&self) -> bool {
+        self.inner.metadata().add_eos_token
+    }
+
     /// Modality capability flags reported by the loaded model.
     /// See the `Capabilities` interface in the generated `.d.ts`
     /// for the field shape.
@@ -444,10 +451,21 @@ pub struct Tokenizer {
 impl Tokenizer {
     /// Tokenize a UTF-8 string. Returns the token IDs as a
     /// `Uint32Array`. No BOS/EOS prefix — callers that want them
-    /// should prepend `bosToken` / append `eosToken` manually.
+    /// should prepend `bosToken` / append `eosToken` manually, or use
+    /// `encodeSpecial`.
     #[wasm_bindgen]
     pub fn encode(&self, text: &str) -> Vec<u32> {
         self.inner.encode(text)
+    }
+
+    /// Encode with optional special markers — the analog of llama.cpp's
+    /// `llama_tokenize(..., add_special)`. When `addSpecial` is true, BOS is
+    /// prepended iff the GGUF declares `tokenizer.ggml.add_bos_token` and EOS
+    /// appended iff it declares `tokenizer.ggml.add_eos_token`, so token counts
+    /// match llama.cpp. With `addSpecial = false` this is exactly `encode`.
+    #[wasm_bindgen(js_name = encodeSpecial)]
+    pub fn encode_special(&self, text: &str, add_special: bool) -> Vec<u32> {
+        self.inner.encode_special(text, add_special)
     }
 
     /// Detokenize back to a UTF-8 string. Lossy for tokens whose
@@ -1012,6 +1030,18 @@ impl GenerateOpts {
     #[wasm_bindgen(setter, js_name = stopTokens)]
     pub fn set_stop_tokens(&mut self, v: Vec<u32>) {
         self.inner.stop_tokens = v;
+    }
+
+    /// Ignore end-of-generation: EOS and `stopTokens` are not honored, so
+    /// decode always runs to `maxTokens`. For benchmark loops that must
+    /// cover an exact token count. `false` by default.
+    #[wasm_bindgen(getter, js_name = ignoreEos)]
+    pub fn ignore_eos(&self) -> bool {
+        self.inner.ignore_eos
+    }
+    #[wasm_bindgen(setter, js_name = ignoreEos)]
+    pub fn set_ignore_eos(&mut self, v: bool) {
+        self.inner.ignore_eos = v;
     }
 
     /// Lazy-grammar trigger token IDs (tool calling). When non-empty and a
@@ -1603,11 +1633,15 @@ mod webgpu {
             on_token: &js_sys::Function,
         ) -> Result<String, JsError> {
             let mut ids = self.tokenizer.encode(prompt);
-            // Prepend BOS only at the start of a session. The on-GPU KV cache
-            // persists across `generate` calls, so prepending on a continuation
-            // would inject a BOS at a nonzero position mid-sequence. Also skip
-            // if the encoder already emitted it (chat template / special token).
-            if self.state.seq_len == 0 {
+            // Prepend BOS only at the start of a session, and only when the GGUF
+            // declares `add_bos_token` — a model with a BOS id but
+            // `add_bos_token = false` must not get a spurious leading BOS (which
+            // would desync this path from cera's CLI/session paths and
+            // llama.cpp). The on-GPU KV cache persists across `generate` calls,
+            // so prepending on a continuation would inject a BOS at a nonzero
+            // position mid-sequence. Also skip if the encoder already emitted it
+            // (chat template / special token).
+            if self.state.seq_len == 0 && self.tokenizer.add_bos_token() {
                 if let Some(bos) = self.tokenizer.bos_token() {
                     if ids.first() != Some(&bos) {
                         ids.insert(0, bos);

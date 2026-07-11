@@ -380,7 +380,7 @@ pub trait Model: Send + Sync {
     /// a GPU argmax kernel should override to skip the vocab-sized readback.
     fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
         let logits = self.forward(tokens, pos, state);
-        crate::sampler::cpu_argmax(&logits)
+        crate::sampler::argmax(&logits)
     }
 
     /// GPU memory allocated by this model (bytes). 0 for CPU-only backends.

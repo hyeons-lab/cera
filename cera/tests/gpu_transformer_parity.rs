@@ -39,22 +39,8 @@ use cera::model::load_model;
 use cera::model::load_model_gpu;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use cera::model::load_model_metal;
+use cera::sampler::argmax;
 use cera::tokenizer::BpeTokenizer;
-
-/// Greedy next-token pick — matches `sampler::cpu_argmax` (NaN → -inf,
-/// `total_cmp`, last-index-on-ties).
-fn argmax(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| {
-            let a = if a.is_nan() { f32::NEG_INFINITY } else { **a };
-            let b = if b.is_nan() { f32::NEG_INFINITY } else { **b };
-            a.total_cmp(&b)
-        })
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
-}
 
 fn models_dir() -> PathBuf {
     if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
@@ -470,7 +456,7 @@ fn check_metal_profiled_prefill(model_file: &str, prompt: &str) -> Option<Result
     let _timings = prof.forward_prefill_profiled(&tokens, 0, &mut state_b);
     let prof_logits = prof.read_logits();
 
-    // Reuse the module-level greedy `argmax` (cpu_argmax semantics).
+    // Reuse cera's production greedy `sampler::argmax`.
     let prod_tok = argmax(&prod_logits);
     let prof_tok = argmax(&prof_logits);
     let max_delta = prod_logits

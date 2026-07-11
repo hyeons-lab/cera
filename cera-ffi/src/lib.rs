@@ -368,8 +368,12 @@ pub struct ModelMetadata {
     pub has_chat_template: bool,
     pub quantization: String,
     /// Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
-    /// want to insert a BOS at the head of a raw prompt should honor it.
+    /// want to insert a BOS at the head of a raw prompt should honor it —
+    /// or, better, tokenize via `encode_text_special`, which applies both
+    /// this and `add_eos_token`.
     pub add_bos_token: bool,
+    /// Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `add_bos_token`.
+    pub add_eos_token: bool,
     /// SIMD backend tier the runtime resolved for this host (e.g.
     /// `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
     /// model-specific — surfaced here so consumers fetching metadata also
@@ -387,6 +391,7 @@ impl From<&cera::ModelMetadata> for ModelMetadata {
             has_chat_template: m.has_chat_template,
             quantization: m.quantization.clone(),
             add_bos_token: m.add_bos_token,
+            add_eos_token: m.add_eos_token,
             cpu_backend: cera::cpu_tier().label().to_string(),
         }
     }
@@ -879,6 +884,17 @@ impl CeraEngine {
         self.inner.tokenizer().encode(&text)
     }
 
+    /// Encode `text` with optional special markers — the analog of llama.cpp's
+    /// `llama_tokenize(..., add_special)`. When `add_special` is true, BOS is
+    /// prepended iff the GGUF declares `tokenizer.ggml.add_bos_token` and EOS
+    /// appended iff it declares `tokenizer.ggml.add_eos_token`, so token counts
+    /// match llama.cpp for the same text (benchmark parity). With
+    /// `add_special = false` this is exactly [`Self::encode_text`]. Prefer this
+    /// over hand-prepending BOS via [`ModelMetadata::add_bos_token`].
+    pub fn encode_text_special(&self, text: String, add_special: bool) -> Vec<u32> {
+        self.inner.tokenizer().encode_special(&text, add_special)
+    }
+
     /// Decode token IDs back to text. Out-of-vocab IDs are silently
     /// skipped (omitted from the decoded output) — `BpeTokenizer::decode`
     /// only appends bytes for IDs it has in `vocab.get(id)`. No
@@ -1131,6 +1147,11 @@ pub struct GenerateOpts {
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     #[uniffi(default = [])]
     pub stop_tokens: Vec<u32>,
+    /// Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
+    /// decode always runs to `max_tokens`. For benchmark loops that must
+    /// cover an exact token count.
+    #[uniffi(default = false)]
+    pub ignore_eos: bool,
     /// Optional GBNF grammar **source text** constraining the output (e.g. a
     /// JSON grammar). When absent (the default), decoding is unconstrained. The
     /// grammar is compiled on the Rust side when generation starts; a malformed
@@ -1163,6 +1184,7 @@ impl Default for GenerateOpts {
             min_p: core.min_p,
             repetition_penalty: core.repetition_penalty,
             stop_tokens: core.stop_tokens,
+            ignore_eos: core.ignore_eos,
             // Core default is no grammar; the compiled `Arc` has no FFI form, so
             // the mirrored field is the (absent) source string.
             grammar: None,
@@ -1196,6 +1218,7 @@ impl TryFrom<GenerateOpts> for cera::GenerateOpts {
             min_p: o.min_p,
             repetition_penalty: o.repetition_penalty,
             stop_tokens: o.stop_tokens,
+            ignore_eos: o.ignore_eos,
             grammar,
             grammar_trigger_tokens: o.grammar_trigger_tokens,
             flush_every_tokens: o.flush_every_tokens,
@@ -2553,8 +2576,10 @@ mod tests {
         assert_eq!(core.temperature, default_core.temperature);
         assert_eq!(core.top_p, default_core.top_p);
         assert_eq!(core.top_k, default_core.top_k);
+        assert_eq!(core.min_p, default_core.min_p);
         assert_eq!(core.repetition_penalty, default_core.repetition_penalty);
         assert_eq!(core.stop_tokens, default_core.stop_tokens);
+        assert_eq!(core.ignore_eos, default_core.ignore_eos);
         assert!(core.grammar.is_none());
         assert_eq!(core.flush_every_tokens, default_core.flush_every_tokens);
         assert_eq!(core.flush_every_ms, default_core.flush_every_ms);
