@@ -75,8 +75,9 @@ pub struct GenerateOpts {
     /// Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
     /// decode always runs to `max_tokens` (or `ContextFull`/cancel). For
     /// benchmark loops that must cover an exact token count — the analog of
-    /// llama.cpp's `--ignore-eos`. Not meaningful combined with `grammar`
-    /// (a complete grammar keeps re-permitting only EOS).
+    /// llama.cpp's `--ignore-eos`. While a `grammar` is actively constraining
+    /// decoding this flag is ignored — the grammar's EOS-on-completion stop
+    /// still applies, so constrained output stays well-formed.
     pub ignore_eos: bool,
     /// Optional GBNF grammar. When set, decode is constrained: each step masks the
     /// logits to only tokens the grammar accepts (EOS only when the grammar is
@@ -120,10 +121,16 @@ impl Default for GenerateOpts {
 #[derive(Debug, Clone)]
 pub struct GenerateSummary {
     pub tokens_generated: u32,
+    /// Tokens prefilled since the previous `generate()` / `reset()` / session
+    /// creation (llama.cpp `n_p_eval` semantics). Paired with `prompt_eval_ms`
+    /// — both cover the same window — so `prompt_eval_tokens / prompt_eval_ms`
+    /// is a valid prefill throughput even across a reused/multi-turn session.
+    /// Every `generate()` call consumes the accumulator, so a `max_tokens == 0`
+    /// capacity poll attributes the prefill to itself and a later real
+    /// `generate()` reports `0` for it (no double-counting when summing).
     pub prompt_eval_tokens: u32,
-    /// Wall time of prefill (`append_tokens` / `append_embeddings`) since the
-    /// previous `generate()` / `reset()` / session creation — prefill runs in
-    /// the append calls, so this is accumulated there and consumed here.
+    /// Wall time of the prefill counted by `prompt_eval_tokens`. See that
+    /// field for the windowing / consumption semantics.
     pub prompt_eval_ms: u32,
     pub decode_ms: u32,
     pub finish_reason: FinishReason,
@@ -344,6 +351,11 @@ pub struct Session {
     cancel: Arc<AtomicBool>,
     /// Logits from the last prefill / decode step — seeds the next generate call.
     last_logits: Option<Vec<f32>>,
+    /// Tokens prefilled (`append_tokens` / `append_embeddings`) since the last
+    /// `generate()` consumed them. Paired with `prefill_elapsed` and reported
+    /// as `GenerateSummary::prompt_eval_tokens` so tokens and time cover the
+    /// same window (llama.cpp `n_p_eval` semantics), then reset by `generate`.
+    prefill_tokens: u32,
     /// Wall time spent in prefill (`append_tokens` / `append_embeddings`)
     /// since the last `generate()` consumed it. Reported as
     /// `GenerateSummary::prompt_eval_ms`, then reset, by the next `generate`.
@@ -496,6 +508,7 @@ impl Session {
             position_atomic: Arc::new(AtomicU32::new(0)),
             cancel: Arc::new(AtomicBool::new(false)),
             last_logits: None,
+            prefill_tokens: 0,
             prefill_elapsed: Duration::ZERO,
             max_seq_len,
             capabilities,
@@ -670,6 +683,7 @@ impl Session {
         self.current_pos = 0;
         self.position_atomic.store(0, Ordering::Relaxed);
         self.last_logits = None;
+        self.prefill_tokens = 0;
         self.prefill_elapsed = Duration::ZERO;
         self.cancel.store(false, Ordering::Relaxed);
         // Re-seed the sampler so deterministic runs stay deterministic after reset().
@@ -982,6 +996,7 @@ impl Session {
             &self.cancel,
         );
         self.prefill_elapsed += prefill_start.elapsed();
+        self.prefill_tokens = self.prefill_tokens.saturating_add(consumed as u32);
         self.current_pos += consumed;
         self.position_atomic
             .store(self.current_pos as u32, Ordering::Relaxed);
@@ -1115,6 +1130,7 @@ impl Session {
                 &mut self.state,
             );
             self.prefill_elapsed += prefill_start.elapsed();
+            self.prefill_tokens = self.prefill_tokens.saturating_add((end - ti) as u32);
             self.current_pos += end - ti;
             self.position_atomic
                 .store(self.current_pos as u32, Ordering::Relaxed);
@@ -1465,13 +1481,19 @@ impl Session {
         // prior call shouldn't pre-cancel the next one.
         self.cancel.store(false, Ordering::Relaxed);
 
-        let prompt_eval_tokens = self.current_pos as u32;
-        // Prefill happened in `append_*`, which accumulated its wall time on
-        // the session (`prefill_elapsed`). The main decode path consumes
-        // (resets) it below so the next `generate` reports only newly
-        // appended prefill; the early exits report it WITHOUT resetting,
-        // preserving their zero-side-effect contract.
+        // Prefill happened in `append_*`, which accumulated its token count and
+        // wall time on the session. Consume them here — unconditionally, so
+        // EVERY `generate()` call (including the no-op early exits below)
+        // attributes each prefill to exactly the first `generate` that follows
+        // it. That keeps the token/time pair coherent (both cover the same
+        // window) and makes summing `prompt_eval_ms` across summaries exact,
+        // with no double-counting. Resetting is pure telemetry — it touches
+        // neither the RNG nor `last_logits`, so the early exits' zero-decode
+        // contract is preserved.
+        let prompt_eval_tokens = self.prefill_tokens;
         let prompt_eval_ms = self.prefill_elapsed.as_millis() as u32;
+        self.prefill_tokens = 0;
+        self.prefill_elapsed = Duration::ZERO;
 
         let decode_start = Instant::now();
         let mut finish = FinishReason::MaxTokens;
@@ -1673,7 +1695,15 @@ impl Session {
             // armed — the lazy pre-trigger phase or after a completed call — stopping
             // is always allowed, so free text can end on EOS as usual.
             let stop_allowed = !armed || grammar_state.as_ref().is_none_or(|s| s.is_complete());
-            if !opts.ignore_eos
+            // `ignore_eos` runs decode to `max_tokens`, but only suppresses the
+            // stop where it is the model's free choice. While a grammar is
+            // actively constraining (`armed`), the mask permits EOS only once
+            // the grammar is complete and masks it otherwise; honoring that
+            // stop keeps constrained output well-formed and avoids feeding EOS
+            // into a completed `GrammarState` (which would dead-end it). So EOS
+            // / `stop_tokens` are suppressed only when a grammar is NOT armed.
+            let honor_stop = armed || !opts.ignore_eos;
+            if honor_stop
                 && stop_allowed
                 && !is_pending_trigger
                 && (self.tokenizer.eos_token() == Some(token) || opts.stop_tokens.contains(&token))
@@ -1774,10 +1804,6 @@ impl Session {
         }
 
         sink.on_done(finish.clone());
-
-        // Consumed: the next `generate` reports only prefill that happens
-        // after this point.
-        self.prefill_elapsed = Duration::ZERO;
 
         let decode_ms = decode_start.elapsed().as_millis() as u32;
         Ok(GenerateSummary {

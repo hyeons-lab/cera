@@ -905,6 +905,17 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
     func encodeText(text: String)  -> [UInt32]
     
     /**
+     * Encode `text` with optional special markers — the analog of llama.cpp's
+     * `llama_tokenize(..., add_special)`. When `add_special` is true, BOS is
+     * prepended iff the GGUF declares `tokenizer.ggml.add_bos_token` and EOS
+     * appended iff it declares `tokenizer.ggml.add_eos_token`, so token counts
+     * match llama.cpp for the same text (benchmark parity). With
+     * `add_special = false` this is exactly [`Self::encode_text`]. Prefer this
+     * over hand-prepending BOS via [`ModelMetadata::add_bos_token`].
+     */
+    func encodeTextSpecial(text: String, addSpecial: Bool)  -> [UInt32]
+    
+    /**
      * End-of-sequence / end-of-text token ID, if the model has one.
      * Used as a default stop-token by the sampler; callers can also
      * pass it explicitly in [`GenerateOpts::stop_tokens`].
@@ -1251,6 +1262,25 @@ open func encodeText(text: String) -> [UInt32]  {
     uniffi_cera_ffi_fn_method_ceraengine_encode_text(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(text),$0
+    )
+})
+}
+    
+    /**
+     * Encode `text` with optional special markers — the analog of llama.cpp's
+     * `llama_tokenize(..., add_special)`. When `add_special` is true, BOS is
+     * prepended iff the GGUF declares `tokenizer.ggml.add_bos_token` and EOS
+     * appended iff it declares `tokenizer.ggml.add_eos_token`, so token counts
+     * match llama.cpp for the same text (benchmark parity). With
+     * `add_special = false` this is exactly [`Self::encode_text`]. Prefer this
+     * over hand-prepending BOS via [`ModelMetadata::add_bos_token`].
+     */
+open func encodeTextSpecial(text: String, addSpecial: Bool) -> [UInt32]  {
+    return try!  FfiConverterSequenceUInt32.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_ceraengine_encode_text_special(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(text),
+        FfiConverterBool.lower(addSpecial),$0
     )
 })
 }
@@ -3353,6 +3383,12 @@ public struct GenerateOpts: Equatable, Hashable {
      */
     public var stopTokens: [UInt32]
     /**
+     * Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
+     * decode always runs to `max_tokens`. For benchmark loops that must
+     * cover an exact token count.
+     */
+    public var ignoreEos: Bool
+    /**
      * Optional GBNF grammar **source text** constraining the output (e.g. a
      * JSON grammar). When absent (the default), decoding is unconstrained. The
      * grammar is compiled on the Rust side when generation starts; a malformed
@@ -3391,6 +3427,11 @@ public struct GenerateOpts: Equatable, Hashable {
          * Early-stop IDs (EOS / instruction markers / end-of-turn).
          */stopTokens: [UInt32] = [], 
         /**
+         * Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
+         * decode always runs to `max_tokens`. For benchmark loops that must
+         * cover an exact token count.
+         */ignoreEos: Bool = false, 
+        /**
          * Optional GBNF grammar **source text** constraining the output (e.g. a
          * JSON grammar). When absent (the default), decoding is unconstrained. The
          * grammar is compiled on the Rust side when generation starts; a malformed
@@ -3416,6 +3457,7 @@ public struct GenerateOpts: Equatable, Hashable {
         self.minP = minP
         self.repetitionPenalty = repetitionPenalty
         self.stopTokens = stopTokens
+        self.ignoreEos = ignoreEos
         self.grammar = grammar
         self.grammarTriggerTokens = grammarTriggerTokens
         self.flushEveryTokens = flushEveryTokens
@@ -3445,6 +3487,7 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
                 minP: FfiConverterFloat.read(from: &buf), 
                 repetitionPenalty: FfiConverterFloat.read(from: &buf), 
                 stopTokens: FfiConverterSequenceUInt32.read(from: &buf), 
+                ignoreEos: FfiConverterBool.read(from: &buf), 
                 grammar: FfiConverterOptionString.read(from: &buf), 
                 grammarTriggerTokens: FfiConverterSequenceUInt32.read(from: &buf), 
                 flushEveryTokens: FfiConverterUInt32.read(from: &buf), 
@@ -3460,6 +3503,7 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
         FfiConverterFloat.write(value.minP, into: &buf)
         FfiConverterFloat.write(value.repetitionPenalty, into: &buf)
         FfiConverterSequenceUInt32.write(value.stopTokens, into: &buf)
+        FfiConverterBool.write(value.ignoreEos, into: &buf)
         FfiConverterOptionString.write(value.grammar, into: &buf)
         FfiConverterSequenceUInt32.write(value.grammarTriggerTokens, into: &buf)
         FfiConverterUInt32.write(value.flushEveryTokens, into: &buf)
@@ -5157,6 +5201,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_encode_text() != 52220) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special() != 59360) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_eos_token() != 21294) {

@@ -36,6 +36,7 @@ use cera::kv_cache::{InferenceState, KvCompression};
 use cera::model::Model;
 use cera::model::llama::LlamaModel;
 use cera::model::transformer::oracle_dump;
+use cera::sampler::argmax;
 use cera::tokenizer::BpeTokenizer;
 
 /// Relative difference, robust near zero. Catches gross math bugs (sign flip,
@@ -43,22 +44,6 @@ use cera::tokenizer::BpeTokenizer;
 /// between cera's and llama.cpp's CPU kernels.
 fn rel_diff(a: f64, b: f64) -> f64 {
     (a - b).abs() / (a.abs() + b.abs() + 1e-9)
-}
-
-/// Greedy next-token pick. Mirrors `sampler::cpu_argmax` exactly (NaN → -inf,
-/// `total_cmp`, last-index-on-ties) so the harness reproduces cera's production
-/// `--temperature 0` decode rather than a subtly different argmax.
-fn argmax(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| {
-            let a = if a.is_nan() { f32::NEG_INFINITY } else { **a };
-            let b = if b.is_nan() { f32::NEG_INFINITY } else { **b };
-            a.total_cmp(&b)
-        })
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
 }
 
 /// Per-node relative tolerance for the sum gate. Sized to clear the observed

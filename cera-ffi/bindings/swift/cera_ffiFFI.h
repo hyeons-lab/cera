@@ -386,6 +386,11 @@ RustBuffer uniffi_cera_ffi_fn_method_ceraengine_decode_tokens(uint64_t ptr, Rust
 RustBuffer uniffi_cera_ffi_fn_method_ceraengine_encode_text(uint64_t ptr, RustBuffer text, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_ENCODE_TEXT_SPECIAL
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_ENCODE_TEXT_SPECIAL
+RustBuffer uniffi_cera_ffi_fn_method_ceraengine_encode_text_special(uint64_t ptr, RustBuffer text, int8_t add_special, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_EOS_TOKEN
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_EOS_TOKEN
 RustBuffer uniffi_cera_ffi_fn_method_ceraengine_eos_token(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -1000,6 +1005,12 @@ uint16_t uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_ENCODE_TEXT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_ENCODE_TEXT
 uint16_t uniffi_cera_ffi_checksum_method_ceraengine_encode_text(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_ENCODE_TEXT_SPECIAL
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_ENCODE_TEXT_SPECIAL
+uint16_t uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special(void
     
 );
 #endif

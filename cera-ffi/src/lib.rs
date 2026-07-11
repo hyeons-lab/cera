@@ -879,6 +879,17 @@ impl CeraEngine {
         self.inner.tokenizer().encode(&text)
     }
 
+    /// Encode `text` with optional special markers — the analog of llama.cpp's
+    /// `llama_tokenize(..., add_special)`. When `add_special` is true, BOS is
+    /// prepended iff the GGUF declares `tokenizer.ggml.add_bos_token` and EOS
+    /// appended iff it declares `tokenizer.ggml.add_eos_token`, so token counts
+    /// match llama.cpp for the same text (benchmark parity). With
+    /// `add_special = false` this is exactly [`Self::encode_text`]. Prefer this
+    /// over hand-prepending BOS via [`ModelMetadata::add_bos_token`].
+    pub fn encode_text_special(&self, text: String, add_special: bool) -> Vec<u32> {
+        self.inner.tokenizer().encode_special(&text, add_special)
+    }
+
     /// Decode token IDs back to text. Out-of-vocab IDs are silently
     /// skipped (omitted from the decoded output) — `BpeTokenizer::decode`
     /// only appends bytes for IDs it has in `vocab.get(id)`. No
@@ -2560,8 +2571,10 @@ mod tests {
         assert_eq!(core.temperature, default_core.temperature);
         assert_eq!(core.top_p, default_core.top_p);
         assert_eq!(core.top_k, default_core.top_k);
+        assert_eq!(core.min_p, default_core.min_p);
         assert_eq!(core.repetition_penalty, default_core.repetition_penalty);
         assert_eq!(core.stop_tokens, default_core.stop_tokens);
+        assert_eq!(core.ignore_eos, default_core.ignore_eos);
         assert!(core.grammar.is_none());
         assert_eq!(core.flush_every_tokens, default_core.flush_every_tokens);
         assert_eq!(core.flush_every_ms, default_core.flush_every_ms);

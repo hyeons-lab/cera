@@ -1558,12 +1558,22 @@ fn ignore_eos_forces_exact_token_count() {
     session.append_tokens(&prompt_toks).unwrap();
     let mut sink = CollectSink(Vec::new());
     let summary = session.generate(&greedy_opts(1), &mut sink).unwrap();
-    let first_token = sink.0[0];
-    assert!(
-        summary.prompt_eval_ms > 0,
-        "prefill of a real prompt should report nonzero prompt_eval_ms, got {}",
-        summary.prompt_eval_ms
+    assert_eq!(
+        summary.tokens_generated, 1,
+        "greedy continuation of the probe prompt should emit one token"
     );
+    let first_token = sink.0[0];
+    // prompt_eval_tokens pairs with prompt_eval_ms and equals the tokens
+    // prefilled since the last generate — deterministic, unlike the wall-clock
+    // ms which can truncate to 0 for a sub-millisecond prefill.
+    assert_eq!(summary.prompt_eval_tokens, prompt_toks.len() as u32);
+    // generate() consumed the accumulator: appending N more tokens and
+    // generating again reports exactly N, not the original prompt too.
+    let suffix = &prompt_toks[..prompt_toks.len().min(2)];
+    session.append_tokens(suffix).unwrap();
+    let mut sink_chain = CollectSink(Vec::new());
+    let summary2 = session.generate(&greedy_opts(1), &mut sink_chain).unwrap();
+    assert_eq!(summary2.prompt_eval_tokens, suffix.len() as u32);
 
     // Run 2: the first token as a stop token halts decode before any output.
     session.reset().unwrap();
@@ -1591,4 +1601,53 @@ fn ignore_eos_forces_exact_token_count() {
     assert_eq!(summary.tokens_generated, 8);
     assert_eq!(sink.0.len(), 8);
     assert_eq!(sink.0[0], first_token);
+}
+
+/// `ignore_eos` must NOT apply while a grammar is actively constraining: the
+/// grammar's EOS-on-completion stop still fires, so constrained output stays
+/// well-formed (no stray EOS token, no `GrammarDeadEnd`). Without the
+/// `honor_stop = armed || !ignore_eos` guard, decode would skip the stop, emit
+/// EOS into the stream, feed it to the completed `GrammarState`, and finish
+/// `GrammarDeadEnd`.
+#[test]
+#[ignore]
+fn ignore_eos_does_not_override_active_grammar() {
+    use std::sync::Arc;
+
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available — skipping");
+        return;
+    };
+
+    let gguf = cera::gguf::GgufFile::open(&model_path).unwrap();
+    let tokenizer = cera::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
+    let model = cera::model::load_model(gguf, None, 4096).unwrap();
+    let prompt_toks = tokenizer.encode("Answer:");
+
+    let mut session = make_session(model, tokenizer, SessionConfig::default());
+    session.append_tokens(&prompt_toks).unwrap();
+
+    // A single-word grammar: decode is forced to emit exactly "yes", after
+    // which only EOS is permitted.
+    let grammar = Arc::new(cera::grammar::Grammar::parse(r#"root ::= "yes""#).unwrap());
+    let opts = GenerateOpts {
+        max_tokens: 32,
+        temperature: 0.0,
+        grammar: Some(grammar),
+        ignore_eos: true,
+        ..Default::default()
+    };
+    let mut sink = CollectSink(Vec::new());
+    let summary = session.generate(&opts, &mut sink).unwrap();
+
+    // Stops cleanly on the grammar's EOS, well before max_tokens, and never
+    // dead-ends or leaks EOS into the output.
+    assert!(
+        matches!(summary.finish_reason, FinishReason::Stop),
+        "expected clean Stop, got {:?}",
+        summary.finish_reason
+    );
+    if let Some(eos) = session.tokenizer().eos_token() {
+        assert!(!sink.0.contains(&eos), "EOS must not leak into grammar output");
+    }
 }

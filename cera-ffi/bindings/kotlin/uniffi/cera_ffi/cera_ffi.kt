@@ -864,6 +864,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_encode_text(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special(): Int
+
     external fun uniffi_cera_ffi_checksum_method_ceraengine_eos_token(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template(): Int
@@ -1069,6 +1071,13 @@ internal object UniffiLib {
     external fun uniffi_cera_ffi_fn_method_ceraengine_encode_text(
         `ptr`: Long,
         `text`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ceraengine_encode_text_special(
+        `ptr`: Long,
+        `text`: RustBuffer.ByValue,
+        `addSpecial`: Byte,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
@@ -1615,6 +1624,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text() != 52220) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special() != 59360) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_eos_token() != 21294) {
@@ -2735,6 +2747,20 @@ public interface CeraEngineInterface {
     fun `encodeText`(`text`: kotlin.String): List<kotlin.UInt>
 
     /**
+     * Encode `text` with optional special markers — the analog of llama.cpp's
+     * `llama_tokenize(..., add_special)`. When `add_special` is true, BOS is
+     * prepended iff the GGUF declares `tokenizer.ggml.add_bos_token` and EOS
+     * appended iff it declares `tokenizer.ggml.add_eos_token`, so token counts
+     * match llama.cpp for the same text (benchmark parity). With
+     * `add_special = false` this is exactly [`Self::encode_text`]. Prefer this
+     * over hand-prepending BOS via [`ModelMetadata::add_bos_token`].
+     */
+    fun `encodeTextSpecial`(
+        `text`: kotlin.String,
+        `addSpecial`: kotlin.Boolean,
+    ): List<kotlin.UInt>
+
+    /**
      * End-of-sequence / end-of-text token ID, if the model has one.
      * Used as a default stop-token by the sampler; callers can also
      * pass it explicitly in [`GenerateOpts::stop_tokens`].
@@ -3075,6 +3101,32 @@ open class CeraEngine :
                     UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_encode_text(
                         it,
                         FfiConverterString.lower(`text`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Encode `text` with optional special markers — the analog of llama.cpp's
+     * `llama_tokenize(..., add_special)`. When `add_special` is true, BOS is
+     * prepended iff the GGUF declares `tokenizer.ggml.add_bos_token` and EOS
+     * appended iff it declares `tokenizer.ggml.add_eos_token`, so token counts
+     * match llama.cpp for the same text (benchmark parity). With
+     * `add_special = false` this is exactly [`Self::encode_text`]. Prefer this
+     * over hand-prepending BOS via [`ModelMetadata::add_bos_token`].
+     */
+    override fun `encodeTextSpecial`(
+        `text`: kotlin.String,
+        `addSpecial`: kotlin.Boolean,
+    ): List<kotlin.UInt> =
+        FfiConverterSequenceUInt.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_encode_text_special(
+                        it,
+                        FfiConverterString.lower(`text`),
+                        FfiConverterBoolean.lower(`addSpecial`),
                         _status,
                     )
                 }
@@ -5818,6 +5870,12 @@ data class GenerateOpts(
      */
     var `stopTokens`: List<kotlin.UInt> = listOf(),
     /**
+     * Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
+     * decode always runs to `max_tokens`. For benchmark loops that must
+     * cover an exact token count.
+     */
+    var `ignoreEos`: kotlin.Boolean = false,
+    /**
      * Optional GBNF grammar **source text** constraining the output (e.g. a
      * JSON grammar). When absent (the default), decoding is unconstrained. The
      * grammar is compiled on the Rust side when generation starts; a malformed
@@ -5857,6 +5915,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
             FfiConverterFloat.read(buf),
             FfiConverterFloat.read(buf),
             FfiConverterSequenceUInt.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterSequenceUInt.read(buf),
             FfiConverterUInt.read(buf),
@@ -5872,6 +5931,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
                 FfiConverterFloat.allocationSize(value.`minP`) +
                 FfiConverterFloat.allocationSize(value.`repetitionPenalty`) +
                 FfiConverterSequenceUInt.allocationSize(value.`stopTokens`) +
+                FfiConverterBoolean.allocationSize(value.`ignoreEos`) +
                 FfiConverterOptionalString.allocationSize(value.`grammar`) +
                 FfiConverterSequenceUInt.allocationSize(value.`grammarTriggerTokens`) +
                 FfiConverterUInt.allocationSize(value.`flushEveryTokens`) +
@@ -5889,6 +5949,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
         FfiConverterFloat.write(value.`minP`, buf)
         FfiConverterFloat.write(value.`repetitionPenalty`, buf)
         FfiConverterSequenceUInt.write(value.`stopTokens`, buf)
+        FfiConverterBoolean.write(value.`ignoreEos`, buf)
         FfiConverterOptionalString.write(value.`grammar`, buf)
         FfiConverterSequenceUInt.write(value.`grammarTriggerTokens`, buf)
         FfiConverterUInt.write(value.`flushEveryTokens`, buf)
