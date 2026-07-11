@@ -651,7 +651,11 @@ fn worker_loop(shared: Arc<Shared>, worker_id: usize, pin_core: Option<usize>, s
                 last_epoch = e;
                 break;
             }
-            spins += 1;
+            // Saturating so a long idle wait (huge `CERA_SPIN`, or repeated
+            // spurious park wakeups) can't overflow-panic this worker in debug
+            // builds — a panic here would wedge the pool (`pending` never hits
+            // 0). Matches the `DrainGuard` counter.
+            spins = spins.saturating_add(1);
             if spins < spin_limit {
                 std::hint::spin_loop();
             } else {
