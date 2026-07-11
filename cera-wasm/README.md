@@ -56,7 +56,7 @@ module (the entry self-loads the wasm via `fs.readFileSync`).
 ```js
 import { ceraVersion, Manifest } from '@hyeons-lab/cera-wasm';
 
-console.log(ceraVersion());  // e.g. "0.2.6"
+console.log(ceraVersion());  // e.g. "0.3.0"
 
 const res = await fetch('/path/to/manifest.json');
 const bytes = new Uint8Array(await res.arrayBuffer());

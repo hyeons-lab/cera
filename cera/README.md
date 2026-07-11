@@ -18,8 +18,28 @@ bindings, and [`cera-wasm`](https://github.com/hyeons-lab/cera/tree/main/cera-wa
 
 ```toml
 [dependencies]
-cera = "0.2"
+cera = "0.3"
 ```
+
+## Breaking changes in 0.3.0
+
+0.3.0 adds public fields to two public structs, so it is a minor (not patch)
+release — a `cargo update` from 0.2.x will not pull it in automatically.
+
+- **`GenerateOpts` gained `ignore_eos: bool`** (run decode to exactly
+  `max_tokens`, ignoring EOS/stop tokens — the `llama.cpp --ignore-eos`
+  analog). Code that constructs `GenerateOpts` with an exhaustive struct
+  literal must add the field; prefer `GenerateOpts { .., ..Default::default() }`
+  (defaults to `false`, preserving prior behavior).
+- **`ModelMetadata` gained `add_eos_token: bool`** (mirrors GGUF
+  `tokenizer.ggml.add_eos_token`, alongside the existing `add_bos_token`).
+  This is an engine output type, so it only affects code that exhaustively
+  pattern-matches or constructs it.
+
+Also new (non-breaking): `BpeTokenizer::encode_special` (and the FFI
+`encode_text_special` / wasm `encodeSpecial` wrappers) apply BOS/EOS to match
+`llama.cpp`'s `llama_tokenize`, and `GenerateSummary::prompt_eval_ms` now
+reports real prefill wall time paired with `prompt_eval_tokens`.
 
 ## Supported models
 

@@ -4,7 +4,7 @@
 //
 // Consume it from any iOS / macOS app:
 //
-//     .package(url: "https://github.com/hyeons-lab/cera", from: "0.2.3")
+//     .package(url: "https://github.com/hyeons-lab/cera", from: "0.3.0")
 //
 // then add the `Cera` product as a target dependency. The package pulls a
 // prebuilt `CeraFFI.xcframework` (a `.binaryTarget`) from the matching

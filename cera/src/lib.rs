@@ -15,7 +15,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GIT_SHA: &str = env!("CERA_GIT_SHA");
 
 /// Build provenance for telemetry — `"<version>+<git-sha>"`, e.g.
-/// `"0.2.5+1a2b3c4d5e6f"`. This is the analog of the llama.cpp build commit that
+/// `"0.3.0+1a2b3c4d5e6f"`. This is the analog of the llama.cpp build commit that
 /// a benchmark harness records alongside results to identify exactly which
 /// engine build produced them.
 pub fn build_info() -> String {

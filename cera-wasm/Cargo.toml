@@ -37,7 +37,7 @@ crate-type = ["cdylib", "rlib"]
 # The opt-in `parallel` feature on this crate flips
 # `cera/parallel` on for threaded wasm builds — see the [features]
 # table below.
-cera = { path = "../cera", version = "0.2.8", default-features = false }
+cera = { path = "../cera", version = "0.3.0", default-features = false }
 wasm-bindgen.workspace = true
 # Tool calling: parse tool schemas (JSON strings from JS) and serialize parsed
 # tool calls back to JSON strings across the wasm boundary.
