@@ -188,16 +188,18 @@ impl BpeTokenizer {
     /// special markers in the text, so template-rendered prompts should keep
     /// using plain `encode` (or pass `add_special = false`).
     pub fn encode_special(&self, text: &str, add_special: bool) -> Vec<u32> {
-        let mut result = Vec::new();
-        if add_special
-            && self.add_bos
+        // Common case (and `add_special == false`): return `encode`'s Vec by
+        // move — no extra allocation or copy.
+        if !add_special || (!self.add_bos && !self.add_eos) {
+            return self.encode(text);
+        }
+        let mut result = self.encode(text);
+        if self.add_bos
             && let Some(bos) = self.bos_id
         {
-            result.push(bos);
+            result.insert(0, bos);
         }
-        result.extend(self.encode(text));
-        if add_special
-            && self.add_eos
+        if self.add_eos
             && let Some(eos) = self.eos_id
         {
             result.push(eos);

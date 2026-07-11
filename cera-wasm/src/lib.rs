@@ -344,6 +344,13 @@ impl CeraEngine {
         self.inner.metadata().add_bos_token
     }
 
+    /// `true` when the GGUF declares `tokenizer.ggml.add_eos_token`. Prefer
+    /// `Tokenizer.encodeSpecial`, which applies this (and BOS) automatically.
+    #[wasm_bindgen(getter, js_name = addEosToken)]
+    pub fn add_eos_token(&self) -> bool {
+        self.inner.metadata().add_eos_token
+    }
+
     /// Modality capability flags reported by the loaded model.
     /// See the `Capabilities` interface in the generated `.d.ts`
     /// for the field shape.

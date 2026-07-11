@@ -1648,6 +1648,9 @@ fn ignore_eos_does_not_override_active_grammar() {
         summary.finish_reason
     );
     if let Some(eos) = session.tokenizer().eos_token() {
-        assert!(!sink.0.contains(&eos), "EOS must not leak into grammar output");
+        assert!(
+            !sink.0.contains(&eos),
+            "EOS must not leak into grammar output"
+        );
     }
 }

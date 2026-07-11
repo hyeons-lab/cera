@@ -368,8 +368,12 @@ pub struct ModelMetadata {
     pub has_chat_template: bool,
     pub quantization: String,
     /// Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
-    /// want to insert a BOS at the head of a raw prompt should honor it.
+    /// want to insert a BOS at the head of a raw prompt should honor it —
+    /// or, better, tokenize via `encode_text_special`, which applies both
+    /// this and `add_eos_token`.
     pub add_bos_token: bool,
+    /// Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `add_bos_token`.
+    pub add_eos_token: bool,
     /// SIMD backend tier the runtime resolved for this host (e.g.
     /// `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
     /// model-specific — surfaced here so consumers fetching metadata also
@@ -387,6 +391,7 @@ impl From<&cera::ModelMetadata> for ModelMetadata {
             has_chat_template: m.has_chat_template,
             quantization: m.quantization.clone(),
             add_bos_token: m.add_bos_token,
+            add_eos_token: m.add_eos_token,
             cpu_backend: cera::cpu_tier().label().to_string(),
         }
     }

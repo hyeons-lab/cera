@@ -3749,9 +3749,15 @@ public struct ModelMetadata: Equatable, Hashable {
     public var quantization: String
     /**
      * Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
-     * want to insert a BOS at the head of a raw prompt should honor it.
+     * want to insert a BOS at the head of a raw prompt should honor it —
+     * or, better, tokenize via `encode_text_special`, which applies both
+     * this and `add_eos_token`.
      */
     public var addBosToken: Bool
+    /**
+     * Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `add_bos_token`.
+     */
+    public var addEosToken: Bool
     /**
      * SIMD backend tier the runtime resolved for this host (e.g.
      * `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
@@ -3766,8 +3772,13 @@ public struct ModelMetadata: Equatable, Hashable {
     public init(architecture: String, maxSeqLen: UInt32, vocabSize: UInt32, hasChatTemplate: Bool, quantization: String, 
         /**
          * Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
-         * want to insert a BOS at the head of a raw prompt should honor it.
+         * want to insert a BOS at the head of a raw prompt should honor it —
+         * or, better, tokenize via `encode_text_special`, which applies both
+         * this and `add_eos_token`.
          */addBosToken: Bool, 
+        /**
+         * Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `add_bos_token`.
+         */addEosToken: Bool, 
         /**
          * SIMD backend tier the runtime resolved for this host (e.g.
          * `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
@@ -3781,6 +3792,7 @@ public struct ModelMetadata: Equatable, Hashable {
         self.hasChatTemplate = hasChatTemplate
         self.quantization = quantization
         self.addBosToken = addBosToken
+        self.addEosToken = addEosToken
         self.cpuBackend = cpuBackend
     }
 
@@ -3806,6 +3818,7 @@ public struct FfiConverterTypeModelMetadata: FfiConverterRustBuffer {
                 hasChatTemplate: FfiConverterBool.read(from: &buf), 
                 quantization: FfiConverterString.read(from: &buf), 
                 addBosToken: FfiConverterBool.read(from: &buf), 
+                addEosToken: FfiConverterBool.read(from: &buf), 
                 cpuBackend: FfiConverterString.read(from: &buf)
         )
     }
@@ -3817,6 +3830,7 @@ public struct FfiConverterTypeModelMetadata: FfiConverterRustBuffer {
         FfiConverterBool.write(value.hasChatTemplate, into: &buf)
         FfiConverterString.write(value.quantization, into: &buf)
         FfiConverterBool.write(value.addBosToken, into: &buf)
+        FfiConverterBool.write(value.addEosToken, into: &buf)
         FfiConverterString.write(value.cpuBackend, into: &buf)
     }
 }

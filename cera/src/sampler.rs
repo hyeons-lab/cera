@@ -8,13 +8,15 @@ use crate::backend::cpu;
 
 /// NaN-safe argmax over a logits slice: the greedy-decoding token pick.
 ///
-/// The strict `>` comparison means NaN is never selected (any comparison with
-/// NaN is false) and, on an exact tie, the **lowest** index wins — matching
-/// both GPU argmax kernels (`argmax_f32.wgsl` / `argmax_f32.metal`, which use
-/// the same `>`) and llama.cpp's `std::max_element` greedy pick. Public so
-/// external harnesses (e.g. benchmark runners driving [`crate::model::Model`]
-/// directly) pick tokens identically to cera's own greedy decode path across
-/// CPU and GPU. Empty input returns `0`.
+/// The strict `>` comparison means a NaN never displaces the running best and,
+/// on an exact tie, the **lowest** index wins — matching both GPU argmax
+/// kernels (`argmax_f32.wgsl` / `argmax_f32.metal`, which use the same `>`) and
+/// llama.cpp's `std::max_element` greedy pick. Public so external harnesses
+/// (e.g. benchmark runners driving [`crate::model::Model`] directly) pick
+/// tokens identically to cera's own greedy decode path across CPU and GPU.
+///
+/// When no finite value is present (empty input, or every logit is NaN) there
+/// is no winner and index `0` is returned.
 pub fn argmax(logits: &[f32]) -> u32 {
     let mut best_i = 0u32;
     let mut best_v = f32::NEG_INFINITY;

@@ -155,6 +155,14 @@ pub enum FinishReason {
     Error(String),
 }
 
+/// Saturating `Duration` → whole-milliseconds `u32` for the timing summary
+/// fields. `as_millis()` is `u128`; a plain `as u32` would wrap past
+/// `u32::MAX` ms (~49.7 days of accumulated time), silently reporting a tiny
+/// value. Saturating keeps the metric monotonic instead.
+fn duration_ms_u32(d: Duration) -> u32 {
+    d.as_millis().min(u32::MAX as u128) as u32
+}
+
 /// Streaming output sink. Default-empty methods let text-only consumers
 /// override just `on_text_tokens` + `on_done`; audio callers override
 /// `on_audio_frames` as well.
@@ -1491,7 +1499,7 @@ impl Session {
         // neither the RNG nor `last_logits`, so the early exits' zero-decode
         // contract is preserved.
         let prompt_eval_tokens = self.prefill_tokens;
-        let prompt_eval_ms = self.prefill_elapsed.as_millis() as u32;
+        let prompt_eval_ms = duration_ms_u32(self.prefill_elapsed);
         self.prefill_tokens = 0;
         self.prefill_elapsed = Duration::ZERO;
 
@@ -1511,7 +1519,7 @@ impl Session {
         // reproducibility and for callers polling capacity.
         if opts.max_tokens == 0 {
             sink.on_done(FinishReason::MaxTokens);
-            let decode_ms = decode_start.elapsed().as_millis() as u32;
+            let decode_ms = duration_ms_u32(decode_start.elapsed());
             return Ok(GenerateSummary {
                 tokens_generated: 0,
                 prompt_eval_tokens,
@@ -1522,7 +1530,7 @@ impl Session {
         }
         if self.current_pos >= self.max_seq_len {
             sink.on_done(FinishReason::ContextFull);
-            let decode_ms = decode_start.elapsed().as_millis() as u32;
+            let decode_ms = duration_ms_u32(decode_start.elapsed());
             return Ok(GenerateSummary {
                 tokens_generated: 0,
                 prompt_eval_tokens,
@@ -1805,7 +1813,7 @@ impl Session {
 
         sink.on_done(finish.clone());
 
-        let decode_ms = decode_start.elapsed().as_millis() as u32;
+        let decode_ms = duration_ms_u32(decode_start.elapsed());
         Ok(GenerateSummary {
             tokens_generated: generated,
             prompt_eval_tokens,

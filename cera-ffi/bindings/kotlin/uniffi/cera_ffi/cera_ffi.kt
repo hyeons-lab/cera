@@ -6107,9 +6107,15 @@ data class ModelMetadata(
     var `quantization`: kotlin.String,
     /**
      * Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
-     * want to insert a BOS at the head of a raw prompt should honor it.
+     * want to insert a BOS at the head of a raw prompt should honor it —
+     * or, better, tokenize via `encode_text_special`, which applies both
+     * this and `add_eos_token`.
      */
     var `addBosToken`: kotlin.Boolean,
+    /**
+     * Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `add_bos_token`.
+     */
+    var `addEosToken`: kotlin.Boolean,
     /**
      * SIMD backend tier the runtime resolved for this host (e.g.
      * `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
@@ -6134,6 +6140,7 @@ public object FfiConverterTypeModelMetadata : FfiConverterRustBuffer<ModelMetada
             FfiConverterBoolean.read(buf),
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterString.read(buf),
         )
 
@@ -6145,6 +6152,7 @@ public object FfiConverterTypeModelMetadata : FfiConverterRustBuffer<ModelMetada
                 FfiConverterBoolean.allocationSize(value.`hasChatTemplate`) +
                 FfiConverterString.allocationSize(value.`quantization`) +
                 FfiConverterBoolean.allocationSize(value.`addBosToken`) +
+                FfiConverterBoolean.allocationSize(value.`addEosToken`) +
                 FfiConverterString.allocationSize(value.`cpuBackend`)
         )
 
@@ -6158,6 +6166,7 @@ public object FfiConverterTypeModelMetadata : FfiConverterRustBuffer<ModelMetada
         FfiConverterBoolean.write(value.`hasChatTemplate`, buf)
         FfiConverterString.write(value.`quantization`, buf)
         FfiConverterBoolean.write(value.`addBosToken`, buf)
+        FfiConverterBoolean.write(value.`addEosToken`, buf)
         FfiConverterString.write(value.`cpuBackend`, buf)
     }
 }

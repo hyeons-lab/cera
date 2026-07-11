@@ -165,8 +165,12 @@ pub struct ModelMetadata {
     pub has_chat_template: bool,
     pub quantization: String,
     /// Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
-    /// want to insert a BOS at the head of a raw prompt should honor it.
+    /// want to insert a BOS at the head of a raw prompt should honor it —
+    /// or, better, tokenize via `BpeTokenizer::encode_special`, which applies
+    /// both this and `add_eos_token`.
     pub add_bos_token: bool,
+    /// Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `add_bos_token`.
+    pub add_eos_token: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1347,6 +1351,7 @@ fn build_metadata(
         has_chat_template,
         quantization,
         add_bos_token: tokenizer.add_bos_token(),
+        add_eos_token: tokenizer.add_eos_token(),
     }
 }
 

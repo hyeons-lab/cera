@@ -586,6 +586,8 @@ class ModelMetadata {
     /// Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
     /// want to insert a BOS at the head of a raw prompt should honor it.
     required this.addBosToken,
+    /// Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `addBosToken`.
+    required this.addEosToken,
     /// SIMD backend tier the runtime resolved for this host (e.g.
     /// `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
     /// model-specific — surfaced here so consumers fetching metadata also
@@ -602,6 +604,8 @@ class ModelMetadata {
   /// Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
   /// want to insert a BOS at the head of a raw prompt should honor it.
   final bool addBosToken;
+  /// Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `addBosToken`.
+  final bool addEosToken;
   /// SIMD backend tier the runtime resolved for this host (e.g.
   /// `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
   /// model-specific — surfaced here so consumers fetching metadata also
@@ -617,6 +621,7 @@ class ModelMetadata {
       'hasChatTemplate': this.hasChatTemplate,
       'quantization': this.quantization,
       'addBosToken': this.addBosToken,
+      'addEosToken': this.addEosToken,
       'cpuBackend': this.cpuBackend,
     };
   }
@@ -629,6 +634,7 @@ class ModelMetadata {
       hasChatTemplate: json['hasChatTemplate'] as bool,
       quantization: json['quantization'] as String,
       addBosToken: json['addBosToken'] as bool,
+      addEosToken: json['addEosToken'] as bool,
       cpuBackend: json['cpuBackend'] as String,
     );
   }
@@ -640,6 +646,7 @@ class ModelMetadata {
     bool? hasChatTemplate,
     String? quantization,
     bool? addBosToken,
+    bool? addEosToken,
     String? cpuBackend,
   }) {
     return ModelMetadata(
@@ -649,22 +656,23 @@ class ModelMetadata {
       hasChatTemplate: hasChatTemplate ?? this.hasChatTemplate,
       quantization: quantization ?? this.quantization,
       addBosToken: addBosToken ?? this.addBosToken,
+      addEosToken: addEosToken ?? this.addEosToken,
       cpuBackend: cpuBackend ?? this.cpuBackend,
     );
   }
 
   @override
   String toString() {
-    return 'ModelMetadata(architecture: $architecture, maxSeqLen: $maxSeqLen, vocabSize: $vocabSize, hasChatTemplate: $hasChatTemplate, quantization: $quantization, addBosToken: $addBosToken, cpuBackend: $cpuBackend)';
+    return 'ModelMetadata(architecture: $architecture, maxSeqLen: $maxSeqLen, vocabSize: $vocabSize, hasChatTemplate: $hasChatTemplate, quantization: $quantization, addBosToken: $addBosToken, addEosToken: $addEosToken, cpuBackend: $cpuBackend)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is ModelMetadata && architecture == other.architecture && maxSeqLen == other.maxSeqLen && vocabSize == other.vocabSize && hasChatTemplate == other.hasChatTemplate && quantization == other.quantization && addBosToken == other.addBosToken && cpuBackend == other.cpuBackend;
+      other is ModelMetadata && architecture == other.architecture && maxSeqLen == other.maxSeqLen && vocabSize == other.vocabSize && hasChatTemplate == other.hasChatTemplate && quantization == other.quantization && addBosToken == other.addBosToken && addEosToken == other.addEosToken && cpuBackend == other.cpuBackend;
 
   @override
-  int get hashCode => Object.hash(architecture, maxSeqLen, vocabSize, hasChatTemplate, quantization, addBosToken, cpuBackend);
+  int get hashCode => Object.hash(architecture, maxSeqLen, vocabSize, hasChatTemplate, quantization, addBosToken, addEosToken, cpuBackend);
 }
 
 /// Per-session configuration. Mirrors [`cera::SessionConfig`].
@@ -2414,6 +2422,7 @@ void _uniffiWriteModelMetadata(ModelMetadata value, _UniFfiBinaryWriter writer) 
   writer.writeBool(value.hasChatTemplate);
   writer.writeString(value.quantization);
   writer.writeBool(value.addBosToken);
+  writer.writeBool(value.addEosToken);
   writer.writeString(value.cpuBackend);
 }
 
@@ -2431,6 +2440,7 @@ ModelMetadata _uniffiReadModelMetadata(_UniFfiBinaryReader reader) {
     hasChatTemplate: reader.readBool(),
     quantization: reader.readString(),
     addBosToken: reader.readBool(),
+    addEosToken: reader.readBool(),
     cpuBackend: reader.readString(),
   );
 }
