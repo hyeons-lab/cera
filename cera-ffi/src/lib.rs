@@ -1131,6 +1131,11 @@ pub struct GenerateOpts {
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     #[uniffi(default = [])]
     pub stop_tokens: Vec<u32>,
+    /// Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
+    /// decode always runs to `max_tokens`. For benchmark loops that must
+    /// cover an exact token count.
+    #[uniffi(default = false)]
+    pub ignore_eos: bool,
     /// Optional GBNF grammar **source text** constraining the output (e.g. a
     /// JSON grammar). When absent (the default), decoding is unconstrained. The
     /// grammar is compiled on the Rust side when generation starts; a malformed
@@ -1163,6 +1168,7 @@ impl Default for GenerateOpts {
             min_p: core.min_p,
             repetition_penalty: core.repetition_penalty,
             stop_tokens: core.stop_tokens,
+            ignore_eos: core.ignore_eos,
             // Core default is no grammar; the compiled `Arc` has no FFI form, so
             // the mirrored field is the (absent) source string.
             grammar: None,
@@ -1196,6 +1202,7 @@ impl TryFrom<GenerateOpts> for cera::GenerateOpts {
             min_p: o.min_p,
             repetition_penalty: o.repetition_penalty,
             stop_tokens: o.stop_tokens,
+            ignore_eos: o.ignore_eos,
             grammar,
             grammar_trigger_tokens: o.grammar_trigger_tokens,
             flush_every_tokens: o.flush_every_tokens,

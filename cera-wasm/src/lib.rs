@@ -1014,6 +1014,18 @@ impl GenerateOpts {
         self.inner.stop_tokens = v;
     }
 
+    /// Ignore end-of-generation: EOS and `stopTokens` are not honored, so
+    /// decode always runs to `maxTokens`. For benchmark loops that must
+    /// cover an exact token count. `false` by default.
+    #[wasm_bindgen(getter, js_name = ignoreEos)]
+    pub fn ignore_eos(&self) -> bool {
+        self.inner.ignore_eos
+    }
+    #[wasm_bindgen(setter, js_name = ignoreEos)]
+    pub fn set_ignore_eos(&mut self, v: bool) {
+        self.inner.ignore_eos = v;
+    }
+
     /// Lazy-grammar trigger token IDs (tool calling). When non-empty and a
     /// grammar is set (`GenerateOpts.setGrammar`), the grammar stays inactive until
     /// the model emits one of these tokens (e.g. the tool-call start marker

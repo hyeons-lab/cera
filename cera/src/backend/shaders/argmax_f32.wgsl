@@ -3,7 +3,7 @@
 // Single-workgroup, 256 threads. Each thread strides through `x` finding its
 // local (max_val, max_idx); then a tree reduction over workgroup memory
 // collapses to thread 0, which writes the global argmax. Tie-break: the
-// lower index wins (matches CPU `cpu_argmax`'s `>` comparator + iter order).
+// lower index wins (matches CPU `argmax`'s `>` comparator + iter order).
 //
 // Bind group 0:
 //   @binding(0) x: array<f32>     (read-only logits)
@@ -33,7 +33,7 @@ fn argmax_f32(@builtin(local_invocation_id) lid: vec3<u32>) {
     while i < n {
         let v = x[i];
         // Strict `>`: tie-break favors the lower index (the value already
-        // recorded), matching `cpu_argmax`'s behavior.
+        // recorded), matching `argmax`'s behavior.
         if v > local_max {
             local_max = v;
             local_idx = i;

@@ -2777,7 +2777,7 @@ mod tests {
             (50000, 12345), // vocab-sized
         ];
         for &(n, plant_idx) in cases {
-            // Build a non-monotonic vector so `cpu_argmax`-style tie-break
+            // Build a non-monotonic vector so `argmax`-style tie-break
             // edge cases don't accidentally pass via "highest index wins".
             let mut x: Vec<f32> = (0..n)
                 .map(|i| ((i as i32 * 31 + 7) % 211) as f32 / 211.0)

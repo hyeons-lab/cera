@@ -29,6 +29,10 @@ pub struct BpeTokenizer {
     bos_id: Option<u32>,
     /// EOS token ID.
     eos_id: Option<u32>,
+    /// GGUF `tokenizer.ggml.add_bos_token`: whether `encode_special` prepends BOS.
+    add_bos: bool,
+    /// GGUF `tokenizer.ggml.add_eos_token`: whether `encode_special` appends EOS.
+    add_eos: bool,
     /// Chat template (Jinja2 format) if present.
     chat_template: Option<String>,
     /// Pre-compiled pretokenizer regex.
@@ -99,6 +103,16 @@ impl BpeTokenizer {
         let bos_id = gguf.get_u32("tokenizer.ggml.bos_token_id");
         let eos_id = gguf.get_u32("tokenizer.ggml.eos_token_id");
 
+        // Whether `encode_special` should add BOS/EOS. Absent keys default to
+        // `false`, matching llama.cpp's default for BPE-family tokenizers (the
+        // only family cera implements).
+        let add_bos = gguf
+            .get_bool("tokenizer.ggml.add_bos_token")
+            .unwrap_or(false);
+        let add_eos = gguf
+            .get_bool("tokenizer.ggml.add_eos_token")
+            .unwrap_or(false);
+
         // Extract chat template. Pre-strip Jinja2 `{% generation %}`
         // / `{% endgeneration %}` block markers at load time so the
         // stored template is already minijinja-compatible — saves
@@ -123,6 +137,8 @@ impl BpeTokenizer {
             special_tokens,
             bos_id,
             eos_id,
+            add_bos,
+            add_eos,
             chat_template,
             pretokenize_re,
             digits_split_bare,
@@ -155,6 +171,36 @@ impl BpeTokenizer {
                     }
                 }
             }
+        }
+        result
+    }
+
+    /// Encode text, optionally adding the model's special BOS/EOS markers —
+    /// the analog of llama.cpp's `llama_tokenize(..., add_special)`.
+    ///
+    /// With `add_special == true`, BOS is prepended when the GGUF declares
+    /// `tokenizer.ggml.add_bos_token` (and a BOS id exists), and EOS is
+    /// appended when it declares `tokenizer.ggml.add_eos_token` — so token
+    /// counts match llama.cpp for the same text. With `add_special == false`
+    /// this is exactly [`Self::encode`].
+    ///
+    /// Note this is orthogonal to chat templating: templates render their own
+    /// special markers in the text, so template-rendered prompts should keep
+    /// using plain `encode` (or pass `add_special = false`).
+    pub fn encode_special(&self, text: &str, add_special: bool) -> Vec<u32> {
+        let mut result = Vec::new();
+        if add_special
+            && self.add_bos
+            && let Some(bos) = self.bos_id
+        {
+            result.push(bos);
+        }
+        result.extend(self.encode(text));
+        if add_special
+            && self.add_eos
+            && let Some(eos) = self.eos_id
+        {
+            result.push(eos);
         }
         result
     }
@@ -364,6 +410,18 @@ impl BpeTokenizer {
     /// EOS token ID.
     pub fn eos_token(&self) -> Option<u32> {
         self.eos_id
+    }
+
+    /// GGUF `tokenizer.ggml.add_bos_token` — whether [`Self::encode_special`]
+    /// prepends BOS. `false` when the key is absent.
+    pub fn add_bos_token(&self) -> bool {
+        self.add_bos
+    }
+
+    /// GGUF `tokenizer.ggml.add_eos_token` — whether [`Self::encode_special`]
+    /// appends EOS. `false` when the key is absent.
+    pub fn add_eos_token(&self) -> bool {
+        self.add_eos
     }
 
     /// Get the chat template string if present.
@@ -748,6 +806,8 @@ mod tests {
             special_tokens: HashMap::new(),
             bos_id: None,
             eos_id: None,
+            add_bos: false,
+            add_eos: false,
             chat_template: None,
             pretokenize_re: build_pretokenize_regex("lfm2"),
             digits_split_bare: false,
@@ -767,6 +827,49 @@ mod tests {
         assert_eq!(table[b'0' as usize], '0');
         // Newline (0x0A) should NOT map to itself (it's a control char)
         assert_ne!(table[0x0A], '\n');
+    }
+
+    #[test]
+    fn encode_special_prepends_bos_when_declared() {
+        let mut tok = make_test_tokenizer();
+        tok.bos_id = Some(1000);
+        tok.add_bos = true;
+        let plain = tok.encode("hello");
+        let special = tok.encode_special("hello", true);
+        assert_eq!(special[0], 1000);
+        assert_eq!(&special[1..], &plain[..]);
+        // add_special = false is exactly `encode`.
+        assert_eq!(tok.encode_special("hello", false), plain);
+    }
+
+    #[test]
+    fn encode_special_without_metadata_flag_is_plain_encode() {
+        let mut tok = make_test_tokenizer();
+        // BOS id exists, but the GGUF didn't declare add_bos_token.
+        tok.bos_id = Some(1000);
+        assert_eq!(tok.encode_special("hello", true), tok.encode("hello"));
+    }
+
+    #[test]
+    fn encode_special_flag_without_bos_id_is_noop() {
+        let mut tok = make_test_tokenizer();
+        // Flag declared, but the vocab has no BOS token to prepend.
+        tok.add_bos = true;
+        assert_eq!(tok.encode_special("hello", true), tok.encode("hello"));
+    }
+
+    #[test]
+    fn encode_special_appends_eos_and_handles_empty_text() {
+        let mut tok = make_test_tokenizer();
+        tok.eos_id = Some(1001);
+        tok.add_eos = true;
+        let special = tok.encode_special("hello", true);
+        assert_eq!(special.last(), Some(&1001));
+        assert_eq!(&special[..special.len() - 1], &tok.encode("hello")[..]);
+        // Empty text still emits the declared markers.
+        tok.bos_id = Some(1000);
+        tok.add_bos = true;
+        assert_eq!(tok.encode_special("", true), vec![1000, 1001]);
     }
 
     #[test]
@@ -866,6 +969,8 @@ mod tests {
             special_tokens: HashMap::new(),
             bos_id: None,
             eos_id: None,
+            add_bos: false,
+            add_eos: false,
             chat_template: None,
             pretokenize_re: build_pretokenize_regex(pre),
             digits_split_bare: pre == "refact",
@@ -941,6 +1046,8 @@ mod tests {
             special_tokens: HashMap::new(),
             bos_id: None,
             eos_id: None,
+            add_bos: false,
+            add_eos: false,
             chat_template: None,
             pretokenize_re: build_pretokenize_regex("lfm2"),
             digits_split_bare: false,

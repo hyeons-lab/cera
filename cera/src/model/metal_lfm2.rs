@@ -3134,7 +3134,7 @@ impl Model for MetalLfm2Model {
         // reentrant).
         if self.profile_timer.is_some() || self.gpu_timer.is_some() {
             let logits = self.forward(tokens, _pos, state);
-            return crate::sampler::cpu_argmax(&logits);
+            return crate::sampler::argmax(&logits);
         }
 
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");

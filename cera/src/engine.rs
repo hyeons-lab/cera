@@ -395,9 +395,6 @@ impl CeraEngine {
 
         let tokenizer = BpeTokenizer::from_gguf(&gguf)
             .map_err(|e| CeraError::Backend(format!("loading tokenizer: {e}")))?;
-        let add_bos_token = gguf
-            .get_bool("tokenizer.ggml.add_bos_token")
-            .unwrap_or(false);
         // Extract `general.file_type` BEFORE `load_text_model` consumes
         // the gguf — that's the only place this metadata exists, and
         // we need it for the metadata's quantization label.
@@ -409,13 +406,7 @@ impl CeraEngine {
         // at the engine boundary. `Arc::from(Box<T>)` is documented on
         // `Arc` for exactly this sizing dance (including `T: ?Sized`).
         let model: Arc<dyn Model> = Arc::from(load_text_model(gguf, path, &cfg)?);
-        let metadata = build_metadata(
-            model.as_ref(),
-            &tokenizer,
-            &manifest,
-            add_bos_token,
-            quantization,
-        );
+        let metadata = build_metadata(model.as_ref(), &tokenizer, &manifest, quantization);
         // Eager mmproj load for audio + VL bundles. Gated on
         // `path.is_some()` because hermetic constructors
         // (`from_bytes` / `from_reader`) shouldn't surreptitiously
@@ -1341,7 +1332,6 @@ fn build_metadata(
     model: &dyn Model,
     tokenizer: &BpeTokenizer,
     manifest: &Manifest,
-    add_bos_token: bool,
     quantization: String,
 ) -> ModelMetadata {
     let cfg = model.config();
@@ -1356,7 +1346,7 @@ fn build_metadata(
         vocab_size: cfg.vocab_size as u32,
         has_chat_template,
         quantization,
-        add_bos_token,
+        add_bos_token: tokenizer.add_bos_token(),
     }
 }
 

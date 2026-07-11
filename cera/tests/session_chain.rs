@@ -1532,3 +1532,63 @@ fn asr_real_audio_matches_input_phrase() {
          got {normalized:?} (raw: {decoded:?})"
     );
 }
+
+/// `GenerateOpts::ignore_eos` must disable BOTH stop conditions (EOS and
+/// `stop_tokens`) so a benchmark decode covers exactly `max_tokens` forward
+/// passes. Deterministic construction: learn the first greedy token, make it
+/// a stop token, and confirm the same decode (a) stops immediately without
+/// `ignore_eos` and (b) runs to `max_tokens` with it. Greedy decoding makes
+/// the first token identical across the three runs.
+#[test]
+#[ignore]
+fn ignore_eos_forces_exact_token_count() {
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available — skipping");
+        return;
+    };
+
+    let gguf = cera::gguf::GgufFile::open(&model_path).unwrap();
+    let tokenizer = cera::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
+    let model = cera::model::load_model(gguf, None, 4096).unwrap();
+    let prompt_toks = tokenizer.encode("The capital of France is");
+
+    let mut session = make_session(model, tokenizer, SessionConfig::default());
+
+    // Run 1: learn the first greedy token.
+    session.append_tokens(&prompt_toks).unwrap();
+    let mut sink = CollectSink(Vec::new());
+    let summary = session.generate(&greedy_opts(1), &mut sink).unwrap();
+    let first_token = sink.0[0];
+    assert!(
+        summary.prompt_eval_ms > 0,
+        "prefill of a real prompt should report nonzero prompt_eval_ms, got {}",
+        summary.prompt_eval_ms
+    );
+
+    // Run 2: the first token as a stop token halts decode before any output.
+    session.reset().unwrap();
+    session.append_tokens(&prompt_toks).unwrap();
+    let stop_opts = GenerateOpts {
+        stop_tokens: vec![first_token],
+        ..greedy_opts(8)
+    };
+    let mut sink = CollectSink(Vec::new());
+    let summary = session.generate(&stop_opts, &mut sink).unwrap();
+    assert!(matches!(summary.finish_reason, FinishReason::Stop));
+    assert_eq!(summary.tokens_generated, 0);
+
+    // Run 3: same stop token, but ignore_eos overrides it (and EOS) — decode
+    // covers exactly max_tokens.
+    session.reset().unwrap();
+    session.append_tokens(&prompt_toks).unwrap();
+    let ignore_opts = GenerateOpts {
+        ignore_eos: true,
+        ..stop_opts
+    };
+    let mut sink = CollectSink(Vec::new());
+    let summary = session.generate(&ignore_opts, &mut sink).unwrap();
+    assert!(matches!(summary.finish_reason, FinishReason::MaxTokens));
+    assert_eq!(summary.tokens_generated, 8);
+    assert_eq!(sink.0.len(), 8);
+    assert_eq!(sink.0[0], first_token);
+}

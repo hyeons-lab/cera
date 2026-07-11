@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use thiserror::Error;
 
-use crate::time::Instant;
+use crate::time::{Duration, Instant};
 
 use crate::kv_cache::{InferenceState, KvCompression};
 use crate::model::Model;
@@ -72,6 +72,12 @@ pub struct GenerateOpts {
     pub repetition_penalty: f32,
     /// If any of these fires, decode stops with `FinishReason::Stop`.
     pub stop_tokens: Vec<u32>,
+    /// Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
+    /// decode always runs to `max_tokens` (or `ContextFull`/cancel). For
+    /// benchmark loops that must cover an exact token count — the analog of
+    /// llama.cpp's `--ignore-eos`. Not meaningful combined with `grammar`
+    /// (a complete grammar keeps re-permitting only EOS).
+    pub ignore_eos: bool,
     /// Optional GBNF grammar. When set, decode is constrained: each step masks the
     /// logits to only tokens the grammar accepts (EOS only when the grammar is
     /// complete). Forces off the greedy `forward_greedy` fast path. See [`crate::grammar`].
@@ -101,6 +107,7 @@ impl Default for GenerateOpts {
             min_p: 0.0,
             repetition_penalty: 1.0,
             stop_tokens: Vec::new(),
+            ignore_eos: false,
             grammar: None,
             grammar_trigger_tokens: Vec::new(),
             flush_every_tokens: 16,
@@ -114,6 +121,9 @@ impl Default for GenerateOpts {
 pub struct GenerateSummary {
     pub tokens_generated: u32,
     pub prompt_eval_tokens: u32,
+    /// Wall time of prefill (`append_tokens` / `append_embeddings`) since the
+    /// previous `generate()` / `reset()` / session creation — prefill runs in
+    /// the append calls, so this is accumulated there and consumed here.
     pub prompt_eval_ms: u32,
     pub decode_ms: u32,
     pub finish_reason: FinishReason,
@@ -334,6 +344,10 @@ pub struct Session {
     cancel: Arc<AtomicBool>,
     /// Logits from the last prefill / decode step — seeds the next generate call.
     last_logits: Option<Vec<f32>>,
+    /// Wall time spent in prefill (`append_tokens` / `append_embeddings`)
+    /// since the last `generate()` consumed it. Reported as
+    /// `GenerateSummary::prompt_eval_ms`, then reset, by the next `generate`.
+    prefill_elapsed: Duration,
     /// Copied from config — enforced on `append_tokens`.
     max_seq_len: usize,
     /// What this session can accept / emit, derived from the model's
@@ -482,6 +496,7 @@ impl Session {
             position_atomic: Arc::new(AtomicU32::new(0)),
             cancel: Arc::new(AtomicBool::new(false)),
             last_logits: None,
+            prefill_elapsed: Duration::ZERO,
             max_seq_len,
             capabilities,
             config,
@@ -655,6 +670,7 @@ impl Session {
         self.current_pos = 0;
         self.position_atomic.store(0, Ordering::Relaxed);
         self.last_logits = None;
+        self.prefill_elapsed = Duration::ZERO;
         self.cancel.store(false, Ordering::Relaxed);
         // Re-seed the sampler so deterministic runs stay deterministic after reset().
         let sampler_cfg = SamplerConfig {
@@ -957,6 +973,7 @@ impl Session {
         // Pass `ubatch_size` straight through — the trait method treats
         // 0 as "no chunking" (single chunk = whole input), matching the
         // CLI `--ubatch-size 0` opt-out.
+        let prefill_start = Instant::now();
         let (consumed, logits) = self.model.forward_prefill_chunked(
             tokens,
             self.current_pos,
@@ -964,6 +981,7 @@ impl Session {
             self.config.ubatch_size as usize,
             &self.cancel,
         );
+        self.prefill_elapsed += prefill_start.elapsed();
         self.current_pos += consumed;
         self.position_atomic
             .store(self.current_pos as u32, Ordering::Relaxed);
@@ -1089,12 +1107,14 @@ impl Session {
         while ti < n_tokens {
             let end = (ti + chunk_size).min(n_tokens);
             let chunk = &embeddings[ti * hidden_size..end * hidden_size];
+            let prefill_start = Instant::now();
             let logits = self.model.forward_prefill_from_embeddings(
                 chunk,
                 end - ti,
                 self.current_pos,
                 &mut self.state,
             );
+            self.prefill_elapsed += prefill_start.elapsed();
             self.current_pos += end - ti;
             self.position_atomic
                 .store(self.current_pos as u32, Ordering::Relaxed);
@@ -1446,9 +1466,12 @@ impl Session {
         self.cancel.store(false, Ordering::Relaxed);
 
         let prompt_eval_tokens = self.current_pos as u32;
-        // Synthetic prompt-eval time: prefill already happened in append_*.
-        // We don't re-time it here. (Real per-chunk timing arrives with 1.4.)
-        let prompt_eval_ms: u32 = 0;
+        // Prefill happened in `append_*`, which accumulated its wall time on
+        // the session (`prefill_elapsed`). The main decode path consumes
+        // (resets) it below so the next `generate` reports only newly
+        // appended prefill; the early exits report it WITHOUT resetting,
+        // preserving their zero-side-effect contract.
+        let prompt_eval_ms = self.prefill_elapsed.as_millis() as u32;
 
         let decode_start = Instant::now();
         let mut finish = FinishReason::MaxTokens;
@@ -1571,12 +1594,12 @@ impl Session {
             Vec::with_capacity(logits.len())
         };
 
-        // Greedy-mode token state: the first token comes from `cpu_argmax`
+        // Greedy-mode token state: the first token comes from `argmax`
         // on the prefill logits; each subsequent iteration's token comes
         // from the previous `forward_greedy()` return value. No RNG is
         // touched in this path — argmax is deterministic.
         let mut greedy_next: u32 = if greedy {
-            crate::sampler::cpu_argmax(&logits)
+            crate::sampler::argmax(&logits)
         } else {
             0
         };
@@ -1629,7 +1652,7 @@ impl Session {
                     }
                 }
                 if want_greedy {
-                    crate::sampler::cpu_argmax(&sample_scratch)
+                    crate::sampler::argmax(&sample_scratch)
                 } else {
                     self.sampler.sample(&mut sample_scratch)
                 }
@@ -1650,7 +1673,8 @@ impl Session {
             // armed — the lazy pre-trigger phase or after a completed call — stopping
             // is always allowed, so free text can end on EOS as usual.
             let stop_allowed = !armed || grammar_state.as_ref().is_none_or(|s| s.is_complete());
-            if stop_allowed
+            if !opts.ignore_eos
+                && stop_allowed
                 && !is_pending_trigger
                 && (self.tokenizer.eos_token() == Some(token) || opts.stop_tokens.contains(&token))
             {
@@ -1751,6 +1775,10 @@ impl Session {
 
         sink.on_done(finish.clone());
 
+        // Consumed: the next `generate` reports only prefill that happens
+        // after this point.
+        self.prefill_elapsed = Duration::ZERO;
+
         let decode_ms = decode_start.elapsed().as_millis() as u32;
         Ok(GenerateSummary {
             tokens_generated: generated,
@@ -1850,6 +1878,7 @@ mod tests {
         let o = GenerateOpts::default();
         assert_eq!(o.flush_every_tokens, 16);
         assert_eq!(o.flush_every_ms, 50);
+        assert!(!o.ignore_eos, "EOS must be honored by default");
     }
 
     #[test]

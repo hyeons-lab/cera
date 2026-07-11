@@ -6,8 +6,13 @@ use rand::rngs::StdRng;
 
 use crate::backend::cpu;
 
-/// NaN-safe CPU argmax. NaN values compare as -inf (never selected).
-pub(crate) fn cpu_argmax(logits: &[f32]) -> u32 {
+/// NaN-safe argmax over a logits slice: the greedy-decoding token pick.
+///
+/// NaN values compare as `-inf` (never selected); ties break to the lowest
+/// index (matching the GPU argmax kernels). Public so external harnesses
+/// (e.g. benchmark runners driving [`crate::model::Model`] directly) pick
+/// tokens identically to cera's own greedy decode path.
+pub fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
         .enumerate()
@@ -104,7 +109,7 @@ impl Sampler {
         // (single candidate makes temp/top_p/penalties irrelevant). Greedy
         // skips history bookkeeping too — it's deterministic by contract.
         if self.config.temperature <= 0.0 || self.config.top_k == 1 {
-            return cpu_argmax(logits);
+            return argmax(logits);
         }
 
         // Repetition penalty over already-emitted tokens, before temperature

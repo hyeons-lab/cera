@@ -527,7 +527,7 @@ pub fn sample_audio_frame(
 
         // Sample (greedy if temperature <= 0, otherwise top-k).
         let sampled = if temperature <= 0.0 {
-            crate::sampler::cpu_argmax(&logits) as i32
+            crate::sampler::argmax(&logits) as i32
         } else {
             // Temperature scaling + top-k sampling.
             let inv_temp = 1.0 / temperature;
