@@ -43,6 +43,11 @@ crossterm = "0.28"
 # Tiny dep — just a static `char → width` table.
 unicode-width = "0.2"
 
+# `dlopen`/`dlsym` for the runtime-resolved NDK thermal API (src/thermal.rs).
+# Already in the dependency graph via cera's affinity pinning on these targets.
+[target.'cfg(target_os = "android")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true
 

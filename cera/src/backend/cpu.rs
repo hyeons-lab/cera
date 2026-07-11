@@ -4,48 +4,61 @@
 
 // ── Thread pool configuration ──────────────────────────────────────────────
 
-/// Configure rayon's global thread pool to use only performance cores.
+/// Warm the compute pools and size rayon's global pool to performance cores.
 ///
-/// On Apple Silicon, the efficiency cores (E-cores) have lower clock speed
-/// and share memory bandwidth. Including them in rayon's pool creates
-/// straggler threads that slow down synchronized `par_chunks_mut` dispatches
-/// — measured as a 12% decode regression on M1 Max (58.6 vs 66.4 tok/s).
+/// The GEMV/GEMM row hot path runs on the persistent
+/// [`super::threadpool::RowPool`]s, sized from the detected topology —
+/// `CERA_THREADS` overrides the prefill width, `CERA_DECODE_THREADS` the
+/// decode width (see `super::calibrate`). `RAYON_NUM_THREADS` governs only
+/// the residual rayon sites (dequantization, VL preprocessing); it does
+/// **not** constrain the RowPools.
 ///
-/// This function queries `hw.perflevel0.logicalcpu` (the P-core count) and
-/// configures rayon to use at most that many threads. If the user has set
-/// `RAYON_NUM_THREADS`, that takes precedence (rayon respects it before our
-/// `build_global` call). On non-macOS or if the sysctl fails, rayon's
-/// default (all logical cores) is used.
+/// P-cores only, because efficiency cores have lower clock speed and share
+/// memory bandwidth: including them creates straggler threads on synchronized
+/// dispatches — measured as a 12% decode regression on M1 Max (58.6 vs 66.4
+/// tok/s) back on the rayon path.
 ///
 /// Must be called once before any rayon work (e.g., early in `main()`).
 /// Returns the number of threads configured.
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub fn configure_thread_pool() -> usize {
-    // If the user explicitly set RAYON_NUM_THREADS, respect it.
-    if std::env::var("RAYON_NUM_THREADS").is_ok() {
-        return rayon::current_num_threads();
-    }
+    // Warm both row-parallel pools — spawns and pins their workers now rather
+    // than lazily on the first GEMV. The prefill pool's width is the headline
+    // thread count; the decode pool is intentionally narrower (memory-bound).
+    let _ = super::threadpool::RowPool::decode().num_threads();
+    let pool_threads = super::threadpool::RowPool::prefill().num_threads();
 
-    let n = performance_core_count().unwrap_or(0);
-    if n == 0 {
-        return rayon::current_num_threads();
-    }
-
-    // build_global() can only succeed once per process. If rayon's global
-    // pool was already initialized (e.g. by another caller, a test harness,
-    // or a dependency), we can't apply the P-core limit here — surface that
-    // by warning and returning the actual current thread count so callers
-    // don't get a misleading value.
-    match rayon::ThreadPoolBuilder::new()
-        .num_threads(n)
-        .build_global()
-    {
-        Ok(()) => n,
-        Err(err) => {
-            tracing::warn!("failed to configure rayon global thread pool to {n} threads: {err}");
-            rayon::current_num_threads()
+    // Also size rayon's global pool for the remaining `par_chunks_mut` sites
+    // (prefill GEMM, VL preprocessing), unless the user pinned
+    // RAYON_NUM_THREADS.
+    if std::env::var("RAYON_NUM_THREADS").is_err() {
+        let n = super::cpu_features::performance_core_count();
+        // build_global() succeeds at most once per process; if rayon was
+        // already initialized (test harness, dependency), the P-core cap
+        // doesn't apply to those residual sites — surface that.
+        if let Err(err) = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+        {
+            tracing::warn!(
+                "cera: rayon global pool already initialized; P-core cap ({n}) not applied to residual rayon sites: {err}"
+            );
         }
     }
+
+    pool_threads
+}
+
+/// On `wasm32` the row hot path runs on rayon (wasm-bindgen-rayon web
+/// workers — see [`par_rows`]), and the pool is built by JS calling
+/// `initThreadPool`, never here. Deliberately does NOT touch rayon: querying
+/// `current_num_threads()` before `initThreadPool` would force-instantiate
+/// the default global registry (1 thread on wasm, since std spawn fails) and
+/// make `initThreadPool`'s own `build_global` fail — permanently locking a
+/// threaded build to a single thread.
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn configure_thread_pool() -> usize {
+    1
 }
 
 /// No-op stub for builds without the `parallel` feature. Returns `1`
@@ -53,43 +66,6 @@ pub fn configure_thread_pool() -> usize {
 #[cfg(not(feature = "parallel"))]
 pub fn configure_thread_pool() -> usize {
     1
-}
-
-/// Returns the number of performance cores on macOS (Apple Silicon).
-/// Uses `sysctlbyname("hw.perflevel0.logicalcpu")` directly — no subprocess.
-#[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "parallel"))]
-fn performance_core_count() -> Option<usize> {
-    unsafe extern "C" {
-        fn sysctlbyname(
-            name: *const std::ffi::c_char,
-            oldp: *mut std::ffi::c_void,
-            oldlenp: *mut usize,
-            newp: *const std::ffi::c_void,
-            newlen: usize,
-        ) -> i32;
-    }
-    let name = c"hw.perflevel0.logicalcpu";
-    let mut value: i32 = 0;
-    let mut size = std::mem::size_of::<i32>();
-    let ret = unsafe {
-        sysctlbyname(
-            name.as_ptr(),
-            &mut value as *mut _ as *mut std::ffi::c_void,
-            &mut size,
-            std::ptr::null(),
-            0,
-        )
-    };
-    if ret == 0 && value > 0 {
-        Some(value as usize)
-    } else {
-        None
-    }
-}
-
-#[cfg(all(not(any(target_os = "macos", target_os = "ios")), feature = "parallel"))]
-fn performance_core_count() -> Option<usize> {
-    None
 }
 
 use crate::quant::{
@@ -217,12 +193,33 @@ pub fn matmul_q4km_f32(a_quant: &[u8], b: &[f32], c: &mut [f32], m: usize, n: us
 
 // ── GEMV (matrix-vector multiply) ──────────────────────────────────────────
 
-/// Parallel for_each with chunking to prevent over-splitting.
-/// Each thread gets at least `min_rows` rows to amortize rayon dispatch overhead.
+/// Row-parallel `for_each`: applies `f` to each element of `y`. Under
+/// `parallel` this dispatches through the persistent
+/// [`super::threadpool::RowPool`] (see that module for why not rayon), where
+/// `min_rows` gates how many workers participate — each participating worker
+/// gets at least that many rows, but the dynamic steal units within a worker
+/// are smaller. Otherwise it runs serially.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + Sync + Send) {
-    #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
+    super::threadpool::RowPool::decode().dispatch_rows(y, 1, min_rows, |row, slice| {
+        f((row, &mut slice[0]));
+    });
+}
+
+/// On `wasm32` std threads can't spawn, so a `RowPool` would silently degrade
+/// to a single worker. Route through rayon instead — the threaded wasm builds
+/// back it with web workers via `wasm-bindgen-rayon`'s `initThreadPool`.
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + Sync + Send) {
     use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
-    let chunk_size = (y.len() / crate::par::current_num_threads()).max(min_rows);
+    // Rayon's fork-join barrier rides web workers here — far pricier per task
+    // than the native pool's steal units — so floor the chunk size at the
+    // rayon-era 512 rather than the RowPool-tuned `min_rows` (default 128),
+    // preserving the pre-RowPool wasm task granularity.
+    const WASM_MIN_CHUNK_ROWS: usize = 512;
+    let chunk_size = (y.len() / crate::par::current_num_threads())
+        .max(min_rows)
+        .max(WASM_MIN_CHUNK_ROWS);
     y.par_chunks_mut(chunk_size)
         .enumerate()
         .for_each(|(ci, chunk)| {
@@ -233,8 +230,16 @@ pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + 
         });
 }
 
-/// Like `par_rows` but for GEMM output where each "row" is `n` contiguous f32 elements.
-/// `f` receives (row_index, &mut [f32; n]).
+#[cfg(not(feature = "parallel"))]
+pub fn par_rows(y: &mut [f32], _min_rows: usize, f: impl Fn((usize, &mut f32))) {
+    for (i, yi) in y.iter_mut().enumerate() {
+        f((i, yi));
+    }
+}
+
+/// Like [`par_rows`] but each "row" is `n` contiguous f32 elements (GEMM
+/// output). `f` receives `(row_index, &mut [f32; n])`.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub fn par_rows_n(
     y: &mut [f32],
     n: usize,
@@ -245,10 +250,26 @@ pub fn par_rows_n(
     if n == 0 || y.is_empty() {
         return;
     }
-    #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
+    super::threadpool::RowPool::prefill().dispatch_rows(y, n, min_rows, |row, row_slice| {
+        f((row, row_slice));
+    });
+}
+
+/// See the `wasm32` note on [`par_rows`].
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn par_rows_n(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    debug_assert_ne!(n, 0, "par_rows_n: n must be > 0");
+    if n == 0 || y.is_empty() {
+        return;
+    }
     use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
     let m = y.len() / n;
-    let rows_per_chunk = (m / crate::par::current_num_threads()).max(min_rows);
+    let rows_per_chunk = (m / crate::par::current_num_threads()).max(min_rows.max(1));
     let elems_per_chunk = rows_per_chunk * n;
     y.par_chunks_mut(elems_per_chunk)
         .enumerate()
@@ -258,6 +279,17 @@ pub fn par_rows_n(
                 f((base_row + j, row));
             }
         });
+}
+
+#[cfg(not(feature = "parallel"))]
+pub fn par_rows_n(y: &mut [f32], n: usize, _min_rows: usize, f: impl Fn((usize, &mut [f32]))) {
+    debug_assert_ne!(n, 0, "par_rows_n: n must be > 0");
+    if n == 0 || y.is_empty() {
+        return;
+    }
+    for (j, row) in y.chunks_mut(n).enumerate() {
+        f((j, row));
+    }
 }
 
 #[allow(clippy::ptr_arg)]
@@ -306,8 +338,50 @@ pub fn gemv_q4_0_f32(
     }
 }
 
-/// Minimum output dimension to use parallel GEMV (avoid rayon overhead for small ops).
-pub const GEMV_PAR_THRESHOLD: usize = 256;
+/// Default minimum output dimension to parallelize a GEMV — below this the
+/// per-dispatch barrier costs more than the split saves.
+pub const GEMV_PAR_THRESHOLD_DEFAULT: usize = 256;
+
+/// Minimum output dimension to use parallel GEMV, resolved once. `CERA_PAR_THRESHOLD`
+/// overrides [`GEMV_PAR_THRESHOLD_DEFAULT`] for tuning the parallel/serial cutoff
+/// per device (small decode GEMVs may not pay for the threadpool barrier).
+#[cfg(feature = "parallel")]
+pub fn gemv_par_threshold() -> usize {
+    use std::sync::OnceLock;
+    static THRESHOLD: OnceLock<usize> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        super::cpu_features::env_usize("CERA_PAR_THRESHOLD").unwrap_or(GEMV_PAR_THRESHOLD_DEFAULT)
+    })
+}
+
+/// Without `parallel`, GEMVs never parallelize — the threshold is effectively
+/// infinite, so callers always take the serial path.
+#[cfg(not(feature = "parallel"))]
+pub fn gemv_par_threshold() -> usize {
+    usize::MAX
+}
+
+/// Default minimum rows a decode-GEMV worker is given before another worker is
+/// added. With the persistent chunk-stealing pool the per-chunk cost is low, so
+/// this can be small — smaller lets narrow projections (e.g. GQA K/V, ≤ kv_dim
+/// rows) parallelize instead of falling to the serial `active == 1` path.
+pub const GEMV_MIN_ROWS_DEFAULT: usize = 128;
+
+/// Minimum rows per worker for decode GEMVs, resolved once. `CERA_MIN_ROWS`
+/// overrides [`GEMV_MIN_ROWS_DEFAULT`] for per-device tuning.
+#[cfg(feature = "parallel")]
+pub fn gemv_min_rows() -> usize {
+    use std::sync::OnceLock;
+    static MIN_ROWS: OnceLock<usize> = OnceLock::new();
+    *MIN_ROWS.get_or_init(|| {
+        super::cpu_features::env_usize("CERA_MIN_ROWS").unwrap_or(GEMV_MIN_ROWS_DEFAULT)
+    })
+}
+
+#[cfg(not(feature = "parallel"))]
+pub fn gemv_min_rows() -> usize {
+    GEMV_MIN_ROWS_DEFAULT
+}
 
 /// Quantize f32 vector to Q8_0 format for use with `gemv_q4_0_with_q8`.
 /// Returns (scales, quants). On aarch64, uses NEON-vectorized quantization.
@@ -412,8 +486,8 @@ pub fn gemv_q8_0_f32(
             *yi = sum;
         };
 
-        if m >= GEMV_PAR_THRESHOLD {
-            par_rows(y, 512, compute_row);
+        if m >= gemv_par_threshold() {
+            par_rows(y, gemv_min_rows(), compute_row);
         } else {
             y.iter_mut().enumerate().for_each(compute_row);
         }
@@ -463,8 +537,8 @@ pub fn gemv_q6k_f32(
             *yi = sum;
         };
 
-        if m >= GEMV_PAR_THRESHOLD {
-            par_rows(y, 512, compute_row);
+        if m >= gemv_par_threshold() {
+            par_rows(y, gemv_min_rows(), compute_row);
         } else {
             y.iter_mut().enumerate().for_each(compute_row);
         }
@@ -491,8 +565,8 @@ pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
         *yi = sum;
     };
 
-    if m >= GEMV_PAR_THRESHOLD {
-        par_rows(y, 512, compute_row);
+    if m >= gemv_par_threshold() {
+        par_rows(y, gemv_min_rows(), compute_row);
     } else {
         y.iter_mut().enumerate().for_each(compute_row);
     }
@@ -3359,67 +3433,72 @@ mod tests {
     fn microbench_gemv_q4_0() {
         use std::time::Instant;
 
-        // Build a *local* rayon pool sized to P-cores. Using `build_global`
-        // here would silently fail because cargo's test harness initializes
-        // rayon early — `pool.install` instead applies the P-core limit only
-        // for the closure body via rayon's thread-local current-pool.
-        let n_threads = performance_core_count().unwrap_or(8);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(n_threads)
-            .build()
-            .expect("local pool build");
+        // The GEMV row loop runs on the persistent decode RowPool — rayon no
+        // longer applies here. Touching the pool up front warms it (including
+        // any calibration sweep) *before* the timed region, and reports the
+        // width actually used.
+        let n_threads = crate::backend::threadpool::RowPool::decode().num_threads();
+        let m = 6912; // FFN gate rows
+        let k = 2048; // hidden_size
+        let iters = 200;
 
-        pool.install(|| {
-            let m = 6912; // FFN gate rows
-            let k = 2048; // hidden_size
-            let iters = 200;
+        // Random Q4_0 weight
+        let blocks_per_row = k / 32;
+        let row_bytes = blocks_per_row * size_of::<crate::quant::BlockQ4_0>();
+        let mut weight = vec![0u8; m * row_bytes];
+        let mut s: u64 = 0xdead_beef;
+        for b in weight.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (s >> 33) as u8;
+        }
 
-            // Random Q4_0 weight
-            let blocks_per_row = k / 32;
-            let row_bytes = blocks_per_row * size_of::<crate::quant::BlockQ4_0>();
-            let mut weight = vec![0u8; m * row_bytes];
-            let mut s: u64 = 0xdead_beef;
-            for b in weight.iter_mut() {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-                *b = (s >> 33) as u8;
-            }
+        // Random input, pre-quantized to Q8_0
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i * 31) % 127) as f32 * 0.01 - 0.5)
+            .collect();
+        let (x_scales, x_quants) = quantize_f32_to_q8_0(&x);
+        let mut y = vec![0.0f32; m];
 
-            // Random input, pre-quantized to Q8_0
-            let x: Vec<f32> = (0..k)
-                .map(|i| ((i * 31) % 127) as f32 * 0.01 - 0.5)
-                .collect();
-            let (x_scales, x_quants) = quantize_f32_to_q8_0(&x);
-            let mut y = vec![0.0f32; m];
+        // Warmup
+        gemv_q4_0_with_q8(&weight, &x_scales, &x_quants, &mut y, m, k);
 
-            // Warmup
+        let t0 = Instant::now();
+        for _ in 0..iters {
             gemv_q4_0_with_q8(&weight, &x_scales, &x_quants, &mut y, m, k);
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        let per_call = elapsed / iters as f64;
 
-            let t0 = Instant::now();
-            for _ in 0..iters {
-                gemv_q4_0_with_q8(&weight, &x_scales, &x_quants, &mut y, m, k);
-            }
-            let elapsed = t0.elapsed().as_secs_f64();
-            let per_call = elapsed / iters as f64;
+        let weight_bytes = m * row_bytes;
+        let input_bytes = x_scales.len() * 4 + x_quants.len();
+        let total_bytes = weight_bytes + input_bytes;
+        let bw_gbps = (total_bytes as f64 / per_call) / 1e9;
 
-            let weight_bytes = m * row_bytes;
-            let input_bytes = x_scales.len() * 4 + x_quants.len();
-            let total_bytes = weight_bytes + input_bytes;
-            let bw_gbps = (total_bytes as f64 / per_call) / 1e9;
+        eprintln!("\n=== GEMV Q4_0×Q8_0 microbench (m={m}, k={k}) ===");
+        eprintln!("  per-call: {:.1} µs", per_call * 1e6);
+        eprintln!("  weight:   {:.2} MB", weight_bytes as f64 / 1e6);
+        eprintln!("  bandwidth: {:.1} GB/s", bw_gbps);
+        eprintln!("  decode pool threads: {n_threads}");
 
-            eprintln!("\n=== GEMV Q4_0×Q8_0 microbench (m={m}, k={k}) ===");
-            eprintln!("  per-call: {:.1} µs", per_call * 1e6);
-            eprintln!("  weight:   {:.2} MB", weight_bytes as f64 / 1e6);
-            eprintln!("  bandwidth: {:.1} GB/s", bw_gbps);
-            eprintln!("  rayon threads: {n_threads} (local pool, P-cores)");
+        // Also measure a large GEMV (output projection shape)
+        let m_large = 65536;
+        let mut weight_large = vec![0u8; m_large * row_bytes];
+        for b in weight_large.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (s >> 33) as u8;
+        }
+        let mut y_large = vec![0.0f32; m_large];
+        gemv_q4_0_with_q8(
+            &weight_large,
+            &x_scales,
+            &x_quants,
+            &mut y_large,
+            m_large,
+            k,
+        );
 
-            // Also measure a large GEMV (output projection shape)
-            let m_large = 65536;
-            let mut weight_large = vec![0u8; m_large * row_bytes];
-            for b in weight_large.iter_mut() {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-                *b = (s >> 33) as u8;
-            }
-            let mut y_large = vec![0.0f32; m_large];
+        let t0 = Instant::now();
+        for _ in 0..20 {
             gemv_q4_0_with_q8(
                 &weight_large,
                 &x_scales,
@@ -3428,27 +3507,15 @@ mod tests {
                 m_large,
                 k,
             );
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        let per_call = elapsed / 20.0;
+        let weight_bytes_large = m_large * row_bytes;
+        let bw_large = ((weight_bytes_large + input_bytes) as f64 / per_call) / 1e9;
 
-            let t0 = Instant::now();
-            for _ in 0..20 {
-                gemv_q4_0_with_q8(
-                    &weight_large,
-                    &x_scales,
-                    &x_quants,
-                    &mut y_large,
-                    m_large,
-                    k,
-                );
-            }
-            let elapsed = t0.elapsed().as_secs_f64();
-            let per_call = elapsed / 20.0;
-            let weight_bytes_large = m_large * row_bytes;
-            let bw_large = ((weight_bytes_large + input_bytes) as f64 / per_call) / 1e9;
-
-            eprintln!("\n=== GEMV Q4_0×Q8_0 large (m={m_large}, k={k}) ===");
-            eprintln!("  per-call: {:.1} µs", per_call * 1e6);
-            eprintln!("  weight:   {:.2} MB", weight_bytes_large as f64 / 1e6);
-            eprintln!("  bandwidth: {:.1} GB/s", bw_large);
-        });
+        eprintln!("\n=== GEMV Q4_0×Q8_0 large (m={m_large}, k={k}) ===");
+        eprintln!("  per-call: {:.1} µs", per_call * 1e6);
+        eprintln!("  weight:   {:.2} MB", weight_bytes_large as f64 / 1e6);
+        eprintln!("  bandwidth: {:.1} GB/s", bw_large);
     }
 }

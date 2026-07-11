@@ -1678,6 +1678,7 @@ mod tests {
     /// ```bash
     /// cargo test -p cera from_gguf_real_lfm2a_audio_mmproj -- --ignored --nocapture
     /// ```
+    #[cfg(feature = "mmap")]
     #[test]
     #[ignore = "needs ~/.leap/models/LFM2.5-Audio-1.5B-Q4_0/mmproj-...gguf locally"]
     fn from_gguf_real_lfm2a_audio_mmproj() {

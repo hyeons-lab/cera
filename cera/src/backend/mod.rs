@@ -2,6 +2,14 @@ pub mod cpu;
 pub mod cpu_features;
 pub mod simd;
 
+// Not on wasm32: std threads can't spawn there, so the row hot path routes
+// through rayon/wasm-bindgen-rayon instead (see `cpu::par_rows`).
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub mod threadpool;
+
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+mod calibrate;
+
 #[cfg(feature = "blas")]
 pub mod blas;
 
