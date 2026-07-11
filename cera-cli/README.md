@@ -89,6 +89,16 @@ to every forward pass — generation and hidden-state extraction alike. For a PE
 `--lora-alpha <ALPHA>` (`scale = alpha / rank`; `.gguf` adapters carry alpha in
 their metadata).
 
+### CPU tuning
+
+The CPU backend auto-detects thread count and core affinity per device. To pin
+them for benchmarking or tuning, set `CERA_DECODE_THREADS=<n>` (fixed decode
+width), `CERA_THREADS=<n>` (detected perf-core count), or `CERA_PIN=0` (disable
+affinity) — see the [crate README](../cera/README.md#cpu-threading--tuning) for
+the full list. On Android, `bench` also prints the device's thermal headroom
+per run (a sustained CPU benchmark heats the SoC within seconds, so a raw tok/s
+figure otherwise conflates the change under test with thermal drift).
+
 ## License
 
 Apache-2.0 OR MIT.

@@ -198,7 +198,7 @@ shrink the crate for `wasm32-unknown-unknown` or embedded targets
 
 | Feature | Default | What it adds |
 |---------|:------:|--------------|
-| `parallel` | ✅ | Rayon-parallel kernels |
+| `parallel` | ✅ | Multi-threaded CPU kernels (persistent affinity-pinned threadpool on native; rayon on wasm) |
 | `std-fs` | ✅ | Filesystem access (paths, caches) |
 | `mmap` | ✅ | Memory-mapped GGUF loading (⇒ `std-fs`) |
 | `disk-cache` | ✅ | Cold KV-cache tier on disk (⇒ `std-fs`) |
@@ -211,6 +211,29 @@ shrink the crate for `wasm32-unknown-unknown` or embedded targets
 
 MSRV: Rust 1.85 (edition 2024). The `avx512` tier needs 1.89+; disable it to
 build on 1.85–1.88 (x86 then caps at AVX2).
+
+## CPU threading & tuning
+
+On native targets the CPU backend dispatches GEMV/GEMM rows through a
+persistent, affinity-pinned worker pool (not a per-call fork-join), with dynamic
+chunk-stealing so faster cores absorb more work on heterogeneous big.LITTLE
+mobile. Decode runs on the detected performance cores; prefill uses all of them.
+This fixes the multi-core decode collapse on Android big.LITTLE and lets decode
+scale across the performance cores. Everything is auto-detected per device — the
+environment variables below only override for tuning:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `CERA_DECODE_THREADS` | detected perf-core count | Decode worker count — a fixed `<n>`, or `auto`. Clamped to the detected performance cores. |
+| `CERA_THREADS` | detected perf-core count | Override the detected performance-core count (moves the auto width for both pools). |
+| `CERA_MIN_ROWS` | 128 | Minimum output rows a decode-GEMV worker takes before another joins. |
+| `CERA_PAR_THRESHOLD` | 256 | Minimum output dimension before a GEMV parallelizes; smaller GEMVs stay serial. |
+| `CERA_SPIN` | 100000 | Spin iterations before an idle worker parks. |
+| `CERA_PIN` | on | `0` / `false` / `off` disables affinity pinning (for hosts that manage thread placement themselves). |
+| `CERA_CPU_TIER` | auto | Force a lower CPU SIMD tier (downgrade only) — for parity testing on capable hardware. |
+
+Affinity pinning applies on Linux/Android with a detected heterogeneous
+topology; homogeneous hosts and macOS run unpinned.
 
 ## License
 
