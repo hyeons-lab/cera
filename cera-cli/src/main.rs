@@ -2356,17 +2356,15 @@ fn main() -> Result<()> {
                 // With tools, collect the reply (ChatSink streams + buffers) so
                 // tool calls can be parsed out afterward. Stream it to stderr so
                 // stdout carries only the machine-readable tool-call JSON.
-                let summary;
-                let reply_text;
-                if tool_format.is_some() {
+                let (summary, reply_text) = if tool_format.is_some() {
                     let mut sink = ChatSink::new_stderr(tokenizer, session.cancel_handle());
-                    summary = session.generate(&opts, &mut sink)?;
-                    reply_text = Some(sink.into_text());
+                    let summary = session.generate(&opts, &mut sink)?;
+                    (summary, Some(sink.into_text()))
                 } else {
                     let mut sink = StdoutSink::new(tokenizer, session.cancel_handle());
-                    summary = session.generate(&opts, &mut sink)?;
-                    reply_text = None;
-                }
+                    let summary = session.generate(&opts, &mut sink)?;
+                    (summary, None)
+                };
 
                 let prefill_tps = if prefill_elapsed.as_secs_f64() > 0.0 {
                     tokens.len() as f64 / prefill_elapsed.as_secs_f64()
