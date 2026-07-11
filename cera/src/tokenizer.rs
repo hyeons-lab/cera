@@ -188,22 +188,30 @@ impl BpeTokenizer {
     /// special markers in the text, so template-rendered prompts should keep
     /// using plain `encode` (or pass `add_special = false`).
     pub fn encode_special(&self, text: &str, add_special: bool) -> Vec<u32> {
-        // Common case (and `add_special == false`): return `encode`'s Vec by
-        // move — no extra allocation or copy.
-        if !add_special || (!self.add_bos && !self.add_eos) {
+        let bos = if add_special && self.add_bos {
+            self.bos_id
+        } else {
+            None
+        };
+        let eos = if add_special && self.add_eos {
+            self.eos_id
+        } else {
+            None
+        };
+        // Common case (and `add_special == false`): no markers to add, so
+        // return `encode`'s Vec by move — no extra allocation or copy.
+        if bos.is_none() && eos.is_none() {
             return self.encode(text);
         }
-        let mut result = self.encode(text);
-        if self.add_bos
-            && let Some(bos) = self.bos_id
-        {
-            result.insert(0, bos);
-        }
-        if self.add_eos
-            && let Some(eos) = self.eos_id
-        {
-            result.push(eos);
-        }
+        // Build with exact capacity and append the encoded tokens once —
+        // avoids the O(n) `insert(0, bos)` memmove. `Option` iterates as 0/1
+        // items, so `extend` prepends/appends the marker when present.
+        let encoded = self.encode(text);
+        let mut result =
+            Vec::with_capacity(encoded.len() + bos.is_some() as usize + eos.is_some() as usize);
+        result.extend(bos);
+        result.extend_from_slice(&encoded);
+        result.extend(eos);
         result
     }
 
