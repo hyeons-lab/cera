@@ -29,8 +29,10 @@ release — a `cargo update` from 0.2.x will not pull it in automatically.
 - **`GenerateOpts` gained `ignore_eos: bool`** (run decode to exactly
   `max_tokens`, ignoring EOS/stop tokens — the `llama.cpp --ignore-eos`
   analog). Code that constructs `GenerateOpts` with an exhaustive struct
-  literal must add the field; prefer `GenerateOpts { .., ..Default::default() }`
-  (defaults to `false`, preserving prior behavior).
+  literal must add the field; prefer functional-update syntax —
+  `GenerateOpts { max_tokens: 256, ..Default::default() }` — which stays
+  source-compatible across field additions. It defaults to `false`,
+  preserving prior behavior.
 - **`ModelMetadata` gained `add_eos_token: bool`** (mirrors GGUF
   `tokenizer.ggml.add_eos_token`, alongside the existing `add_bos_token`).
   This is an engine output type, so it only affects code that exhaustively
