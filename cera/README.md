@@ -2,10 +2,8 @@
 
 Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
-> **Note:** This project is a learning experiment — built to explore LLM
-> inference internals, GGUF parsing, quantization, and SIMD/GPU compute in Rust.
-> Not intended for production use. See the [project README](https://github.com/hyeons-lab/cera)
-> for benchmarks and design notes.
+> See the [project README](https://github.com/hyeons-lab/cera) for
+> benchmarks and design notes.
 
 `cera` is the core library: GGUF loading, a quantized CPU kernel stack
 (AVX2/AVX-512, NEON dotprod/i8mm) with optional wgpu GPU and BLAS backends, a
