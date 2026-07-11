@@ -239,16 +239,20 @@ build on 1.85–1.88 (x86 then caps at AVX2).
 On native targets the CPU backend dispatches GEMV/GEMM rows through a
 persistent, affinity-pinned worker pool (not a per-call fork-join), with dynamic
 chunk-stealing so faster cores absorb more work on heterogeneous big.LITTLE
-mobile. Decode runs on the detected performance cores (capped at 12, which only
-bites on large homogeneous hosts where every logical CPU counts as a "perf
-core"); prefill uses all of them. This fixes the multi-core decode collapse on
-Android big.LITTLE and lets decode scale across the performance cores.
-Everything is auto-detected per device — the environment variables below only
-override for tuning:
+mobile. Decode runs on the detected performance cores; prefill uses all of them.
+Two independent auto-caps bound the width: on heterogeneous big.LITTLE parts
+(Linux/Android) detection keeps at most 6 big cores (both pools), and on the
+homogeneous fallback — desktop/server/macOS, where sysfs detection is skipped
+and every logical CPU counts as a "perf core" — decode is separately capped at
+12 while prefill uses all. This fixes the multi-core decode collapse on Android
+big.LITTLE and lets decode scale across the performance cores. Everything is
+auto-detected per device — the environment variables below only override for
+tuning (`CERA_THREADS` moves the detected count past either cap in both
+directions):
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `CERA_DECODE_THREADS` | detected perf-core count (auto-capped at 12) | Decode worker count — a fixed `<n>`, or `auto`. A fixed value is clamped to the detected performance cores; the 12 cap applies only to `auto`. |
+| `CERA_DECODE_THREADS` | detected perf cores (≤6 heterogeneous, ≤12 homogeneous) | Decode worker count — a fixed `<n>`, or `auto`. A fixed value is clamped to the detected performance cores; the 12 cap applies only to the homogeneous `auto` path (heterogeneous big.LITTLE detection already caps big cores at 6). |
 | `CERA_THREADS` | detected perf-core count | Override the detected performance-core count (moves the auto width for both pools). |
 | `CERA_MIN_ROWS` | 128 | Minimum output rows a decode-GEMV worker takes before another joins. |
 | `CERA_PAR_THRESHOLD` | 256 | Minimum output dimension before a GEMV parallelizes; smaller GEMVs stay serial. |
