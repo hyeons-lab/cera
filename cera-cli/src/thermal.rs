@@ -18,7 +18,7 @@ pub use imp::ThermalMonitor;
 
 #[cfg(target_os = "android")]
 mod imp {
-    use libc::{RTLD_NOW, dlopen, dlsym};
+    use libc::{RTLD_NOW, dlclose, dlopen, dlsym};
     use std::ffi::c_void;
     use std::os::raw::c_int;
 
@@ -29,6 +29,7 @@ mod imp {
     /// A live handle to the platform thermal service. Sampling is a cheap,
     /// non-blocking forecast query.
     pub struct ThermalMonitor {
+        lib: *mut c_void,
         manager: *mut c_void,
         release: ReleaseFn,
         headroom: HeadroomFn,
@@ -40,7 +41,9 @@ mod imp {
         pub fn new() -> Option<Self> {
             // SAFETY: standard dlopen/dlsym probing. The resolved symbols have
             // the AThermal ABI declared above; a `data*`→`fn*` transmute is the
-            // documented dlsym pattern and sound on every Android ABI.
+            // documented dlsym pattern and sound on every Android ABI. Every
+            // early return `dlclose`s the handle so a failed probe doesn't leak
+            // it; the success path stores it and closes it in `Drop`.
             unsafe {
                 let lib = dlopen(c"libandroid.so".as_ptr().cast(), RTLD_NOW);
                 if lib.is_null() {
@@ -50,6 +53,7 @@ mod imp {
                 let release = dlsym(lib, c"AThermal_releaseManager".as_ptr().cast());
                 let headroom = dlsym(lib, c"AThermal_getThermalHeadroom".as_ptr().cast());
                 if acquire.is_null() || release.is_null() || headroom.is_null() {
+                    dlclose(lib);
                     return None;
                 }
                 let acquire: AcquireFn = std::mem::transmute(acquire);
@@ -57,9 +61,11 @@ mod imp {
                 let headroom: HeadroomFn = std::mem::transmute(headroom);
                 let manager = acquire();
                 if manager.is_null() {
+                    dlclose(lib);
                     return None;
                 }
                 Some(Self {
+                    lib,
                     manager,
                     release,
                     headroom,
@@ -79,8 +85,13 @@ mod imp {
 
     impl Drop for ThermalMonitor {
         fn drop(&mut self) {
-            // SAFETY: `manager` was acquired in `new` and released exactly once.
-            unsafe { (self.release)(self.manager) }
+            // SAFETY: `manager` was acquired in `new` and is released exactly
+            // once here; `lib` came from the matching `dlopen` and is closed
+            // after the manager so the release fn stays valid through the call.
+            unsafe {
+                (self.release)(self.manager);
+                dlclose(self.lib);
+            }
         }
     }
 }

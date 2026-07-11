@@ -238,8 +238,7 @@ pub struct RowPool {
 
 /// Whether affinity pinning is enabled (`CERA_PIN=0`/`false`/`off`,
 /// case-insensitive, disables it — for host apps that manage thread placement
-/// and don't want cera's permanent caller pin). Resolved once. `pub(crate)` so
-/// calibration can skip the sweep when its pools would run unpinned.
+/// and don't want cera's permanent caller pin). Resolved once.
 pub(crate) fn pinning_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -268,14 +267,11 @@ impl RowPool {
         })
     }
 
-    /// Narrow pool for memory-bound per-token work — decode GEMV
-    /// ([`super::cpu::par_rows`]). Single-token decode is memory-bandwidth
-    /// bound, so its thread sweet spot is where the SoC memory bus saturates —
-    /// a per-device property no topology query exposes. The width therefore
-    /// comes from `super::calibrate::decode_thread_count`: a measured,
-    /// per-device-cached bandwidth calibration where workers can be pinned
-    /// (a capped perf-core count elsewhere), overridable with
-    /// `CERA_DECODE_THREADS=<n>` (`=auto` forces recalibration).
+    /// Narrow pool for per-token work — decode GEMV
+    /// ([`super::cpu::par_rows`]). Sized to the detected performance-core count
+    /// via `super::calibrate::decode_thread_count`, which on heterogeneous
+    /// big.LITTLE is decode's measured optimum (it scales cleanly across all
+    /// big cores). Overridable with `CERA_DECODE_THREADS=<n>`.
     pub fn decode() -> &'static RowPool {
         static POOL: OnceLock<RowPool> = OnceLock::new();
         POOL.get_or_init(|| {

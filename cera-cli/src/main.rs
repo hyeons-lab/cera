@@ -1667,8 +1667,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Warm the compute pools + size rayon to P-cores. After `Cli::parse()` so
-    // `--help` / parse errors don't pay the pool spawn (and, on a cold cache,
-    // the decode-thread calibration sweep).
+    // `--help` / parse errors don't pay the pool spawn.
     cera::backend::cpu::configure_thread_pool();
 
     match cli.command {

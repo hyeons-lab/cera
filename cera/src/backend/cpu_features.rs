@@ -301,13 +301,16 @@ pub struct CoreTopology {
     pub pin_cores: Vec<usize>,
 }
 
-/// Upper bound on auto-detected compute threads. Decode GEMV is memory-
-/// bandwidth-bound, so beyond roughly the big-core count more threads only add
-/// barrier/scheduling overhead and power draw (measured on a Tensor G5:
-/// llama.cpp plateaus at 4 big cores, 70.9 vs 69.9 tok/s at 6). `CERA_THREADS`
-/// overrides this in both directions for tuning. The *unpinned* decode path
-/// has its own, separate ceiling (`calibrate::DECODE_UNPINNED_MAX`); keep the
-/// two in mind together when retuning either.
+/// Upper bound on the auto-detected big-core count (and thus decode/prefill
+/// pool width). Decode scales across the performance cores but plateaus around
+/// the big-core count, beyond which more threads only add barrier/scheduling
+/// overhead and power draw; 6 covers current big.LITTLE mobile (Tensor G5,
+/// Snapdragon 8-series) with a sensible power/thermal margin. On a SoC with
+/// more than 6 performance cores (e.g. an 8-prime part) this leaves a couple
+/// idle — deliberately conservative; `CERA_THREADS` overrides in both
+/// directions for tuning. The homogeneous/unpinned decode fallback has its own,
+/// separate ceiling (`calibrate::DECODE_MAX_AUTO`); keep the two in mind
+/// together when retuning either.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const MAX_AUTO_THREADS: usize = 6;
 
