@@ -407,8 +407,8 @@ pub(crate) mod neon {
                 *yi = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
             };
 
-            if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
-                crate::backend::cpu::par_rows(y, 512, compute_row);
+            if y.len() >= super::super::cpu::gemv_par_threshold() {
+                crate::backend::cpu::par_rows(y, crate::backend::cpu::gemv_min_rows(), compute_row);
             } else {
                 y.iter_mut().enumerate().for_each(compute_row);
             }
@@ -516,8 +516,8 @@ pub(crate) mod neon {
                 *yi = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
             };
 
-            if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
-                crate::backend::cpu::par_rows(y, 512, compute_row);
+            if y.len() >= super::super::cpu::gemv_par_threshold() {
+                crate::backend::cpu::par_rows(y, crate::backend::cpu::gemv_min_rows(), compute_row);
             } else {
                 y.iter_mut().enumerate().for_each(compute_row);
             }
@@ -671,8 +671,8 @@ pub(crate) mod neon {
                 *yi = sumf;
             };
 
-            if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
-                crate::backend::cpu::par_rows(y, 512, compute_row);
+            if y.len() >= super::super::cpu::gemv_par_threshold() {
+                crate::backend::cpu::par_rows(y, crate::backend::cpu::gemv_min_rows(), compute_row);
             } else {
                 y.iter_mut().enumerate().for_each(compute_row);
             }
@@ -917,7 +917,7 @@ pub(crate) mod neon {
                 }
             };
 
-            if m >= super::super::cpu::GEMV_PAR_THRESHOLD {
+            if m >= super::super::cpu::gemv_par_threshold() {
                 crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
             } else {
                 out.chunks_mut(n).enumerate().for_each(compute_row);
@@ -1011,7 +1011,7 @@ pub(crate) mod neon {
                 }
             };
 
-            if m >= super::super::cpu::GEMV_PAR_THRESHOLD {
+            if m >= super::super::cpu::gemv_par_threshold() {
                 crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
             } else {
                 out.chunks_mut(n).enumerate().for_each(compute_row);
@@ -1123,8 +1123,8 @@ pub(crate) mod neon {
             }
             *yi = vaddvq_f32(sumv);
         };
-        if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
-            super::super::cpu::par_rows(y, 512, compute_row);
+        if y.len() >= super::super::cpu::gemv_par_threshold() {
+            super::super::cpu::par_rows(y, super::super::cpu::gemv_min_rows(), compute_row);
         } else {
             y.iter_mut().enumerate().for_each(compute_row);
         }
@@ -1161,8 +1161,8 @@ pub(crate) mod neon {
             }
             *yi = vaddvq_f32(sumv);
         };
-        if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
-            super::super::cpu::par_rows(y, 512, compute_row);
+        if y.len() >= super::super::cpu::gemv_par_threshold() {
+            super::super::cpu::par_rows(y, super::super::cpu::gemv_min_rows(), compute_row);
         } else {
             y.iter_mut().enumerate().for_each(compute_row);
         }
@@ -1209,7 +1209,7 @@ pub(crate) mod neon {
                 row[j] = vaddvq_f32(sumv);
             }
         };
-        if m >= super::super::cpu::GEMV_PAR_THRESHOLD {
+        if m >= super::super::cpu::gemv_par_threshold() {
             super::super::cpu::par_rows_n(out, n, 256, compute_row);
         } else {
             out.chunks_mut(n).enumerate().for_each(compute_row);
@@ -1254,7 +1254,7 @@ pub(crate) mod neon {
                 row[j] = vaddvq_f32(sumv);
             }
         };
-        if m >= super::super::cpu::GEMV_PAR_THRESHOLD {
+        if m >= super::super::cpu::gemv_par_threshold() {
             super::super::cpu::par_rows_n(out, n, 256, compute_row);
         } else {
             out.chunks_mut(n).enumerate().for_each(compute_row);
@@ -1275,8 +1275,8 @@ pub(crate) mod neon {
             }
             *yi = sum;
         };
-        if y.len() >= super::super::cpu::GEMV_PAR_THRESHOLD {
-            super::super::cpu::par_rows(y, 512, compute_row);
+        if y.len() >= super::super::cpu::gemv_par_threshold() {
+            super::super::cpu::par_rows(y, super::super::cpu::gemv_min_rows(), compute_row);
         } else {
             y.iter_mut().enumerate().for_each(compute_row);
         }

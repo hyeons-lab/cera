@@ -189,6 +189,12 @@ impl CpuFeatures {
 /// Raw, uncached detection. Prefer [`cpu_features`] — this is exposed only for
 /// tests that need a fresh probe.
 pub fn detect() -> CpuFeatures {
+    // Only the x86_64 / aarch64 blocks below mutate `f`; on other targets
+    // (e.g. wasm32) it's built once and returned as-is.
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(unused_mut)
+    )]
     let mut f = CpuFeatures::NONE;
 
     #[cfg(target_arch = "x86_64")]
@@ -276,9 +282,282 @@ pub fn cpu_tier() -> CpuTier {
     cpu_features().tier
 }
 
+// ── CPU core topology (thread-pool sizing + affinity) ───────────────────────
+
+/// Performance-core topology for sizing the compute thread pool and pinning
+/// its workers.
+///
+/// `perf_core_count` is how many compute threads to run; `pin_cores` are the OS
+/// core indices to pin those workers to via `sched_setaffinity` (Linux/Android
+/// only — empty elsewhere, where the OS scheduler or Darwin QoS handles
+/// placement and affinity masks are inert).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreTopology {
+    /// Number of compute worker threads to run (always ≥ 1).
+    pub perf_core_count: usize,
+    /// OS core indices to pin workers to, fastest-first. Empty when the
+    /// platform has no usable affinity; when shorter than `perf_core_count`,
+    /// the surplus workers run unpinned.
+    pub pin_cores: Vec<usize>,
+}
+
+/// Upper bound on the auto-detected big-core count (and thus decode/prefill
+/// pool width). Decode scales across the performance cores but plateaus around
+/// the big-core count, beyond which more threads only add barrier/scheduling
+/// overhead and power draw; 6 covers current big.LITTLE mobile (Tensor G5,
+/// Snapdragon 8-series) with a sensible power/thermal margin. On a SoC with
+/// more than 6 performance cores (e.g. an 8-prime part) this leaves a couple
+/// idle — deliberately conservative; `CERA_THREADS` overrides in both
+/// directions for tuning. The homogeneous/unpinned decode fallback has its own,
+/// separate ceiling (`calibrate::DECODE_MAX_AUTO`); keep the two in mind
+/// together when retuning either.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const MAX_AUTO_THREADS: usize = 6;
+
+/// Highest plausible CPU index to probe in sysfs. A hard bound so a malformed
+/// `/sys` can't loop unboundedly; real parts are far below this.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const MAX_CPUS: usize = 512;
+
+/// `cpu_capacity` (kernel EAS scale, 1024 = fastest core on the SoC) at/above
+/// which a core counts as a performance core. Prime + performance clusters on
+/// current Android big.LITTLE parts sit at/above `CAP_MID`; efficiency cores
+/// sit well below (e.g. Tensor G5: E=207, P=824, prime=1024).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const CAP_MID: u32 = 400;
+
+/// Resolved core topology for this host, detected once and cached.
+pub fn core_topology() -> &'static CoreTopology {
+    static TOPOLOGY: OnceLock<CoreTopology> = OnceLock::new();
+    TOPOLOGY.get_or_init(detect_topology)
+}
+
+/// Parse a `usize ≥ 1` from an environment variable; `None` when unset,
+/// unparsable, or zero. Shared by the `CERA_*` tuning knobs.
+pub(crate) fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+}
+
+/// Number of performance cores to run compute threads on (convenience over
+/// [`core_topology`]). Always ≥ 1.
+pub fn performance_core_count() -> usize {
+    core_topology().perf_core_count
+}
+
+/// Uncached topology detection. Prefer [`core_topology`]; exposed for tests.
+///
+/// Precedence: a valid `CERA_THREADS` override sets the thread count (workers
+/// still pin to the detected perf cores where available); otherwise the
+/// platform detector picks the perf-core count; otherwise all logical cores.
+pub fn detect_topology() -> CoreTopology {
+    let forced = env_usize("CERA_THREADS");
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(topo) = detect_topology_sysfs() {
+        return apply_thread_override(topo, forced);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if let Some(count) = macos_perf_core_count() {
+        return apply_thread_override(
+            CoreTopology {
+                perf_core_count: count,
+                pin_cores: Vec::new(),
+            },
+            forced,
+        );
+    }
+
+    // Fallback: all logical cores, unpinned (the override still applies).
+    let n = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1);
+    apply_thread_override(
+        CoreTopology {
+            perf_core_count: n,
+            pin_cores: Vec::new(),
+        },
+        forced,
+    )
+}
+
+/// Apply a `CERA_THREADS` override to a detected topology: set the thread count
+/// and pin at most that many of the detected cores (fastest-first). Pure, so
+/// the override policy is testable without touching process env.
+fn apply_thread_override(mut topo: CoreTopology, forced: Option<usize>) -> CoreTopology {
+    if let Some(n) = forced {
+        topo.perf_core_count = n;
+        // Never pin more cores than were detected; surplus workers run unpinned.
+        topo.pin_cores.truncate(n);
+    }
+    topo
+}
+
+/// Detect performance cores from Linux/Android sysfs. Prefers `cpu_capacity`
+/// (kernel EAS), falls back to `cpufreq/cpuinfo_max_freq`. Returns `None` for
+/// **homogeneous** topologies as well as unreadable ones (→ caller uses the
+/// all-cores, unpinned fallback): the cap/pinning policy exists for
+/// heterogeneous big.LITTLE parts, and applying it to a homogeneous many-core
+/// desktop/server would shrink its pool for no reason.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn detect_topology_sysfs() -> Option<CoreTopology> {
+    // (cpu_index, weight) with higher weight = faster; ranked fastest-first.
+    let caps = read_per_cpu_u32("cpu_capacity");
+    let mut cores: Vec<(usize, u32)>;
+
+    if !caps.is_empty() {
+        // Homogeneous capacities (desktop/server arch_topology) → fallback.
+        if caps.iter().all(|&(_, c)| c == caps[0].1) {
+            return None;
+        }
+        cores = caps.into_iter().filter(|&(_, c)| c >= CAP_MID).collect();
+    } else {
+        // No cpu_capacity — rank the top frequency cluster instead.
+        let freqs = read_per_cpu_u32("cpufreq/cpuinfo_max_freq");
+        let max = freqs.iter().map(|&(_, f)| f).max()?;
+        // Keep cores within 15% of the fastest — the top (big/prime) cluster.
+        // If *every* core clears the cutoff the machine is homogeneous → fallback.
+        let cutoff = (max / 100) * 85;
+        if freqs.iter().all(|&(_, f)| f >= cutoff) {
+            return None;
+        }
+        cores = freqs.into_iter().filter(|&(_, f)| f >= cutoff).collect();
+    }
+
+    if cores.is_empty() {
+        return None;
+    }
+    // Drop SMT siblings: on x86 hybrid parts (which reach this via the
+    // frequency path — no `cpu_capacity` on x86) both hyperthreads of each
+    // P-core clear the cutoff, and pinning two workers to one physical core
+    // halves its throughput. Two CPUs are siblings iff they report the same
+    // `thread_siblings_list` — keyed on that set, NOT on `core_id`, which
+    // Linux restarts per *cluster* on multi-cluster ARM device trees (e.g.
+    // gs101's map is [0,1,2,3, 0,1, 0,1]) and would wrongly discard whole
+    // big/prime clusters as "siblings". ARM cores list only themselves, so
+    // this is a no-op there.
+    let sibling_sets: std::collections::HashMap<usize, String> =
+        read_per_cpu_trimmed("topology/thread_siblings_list")
+            .into_iter()
+            .collect();
+    let mut seen_sets = std::collections::HashSet::new();
+    cores.retain(|&(cpu, _)| match sibling_sets.get(&cpu) {
+        Some(set) => seen_sets.insert(set.clone()),
+        // Unknown siblings → treat as its own physical core.
+        None => true,
+    });
+
+    // Fastest-first (higher weight first; break ties by lower index for
+    // determinism), then cap.
+    cores.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    cores.truncate(MAX_AUTO_THREADS);
+    let pin_cores: Vec<usize> = cores.iter().map(|&(i, _)| i).collect();
+    Some(CoreTopology {
+        perf_core_count: pin_cores.len(),
+        pin_cores,
+    })
+}
+
+/// Read `/sys/devices/system/cpu/cpuN/<file>` (trimmed) for every present
+/// CPU. The scan ends at the first missing `cpuN` *directory*; an unreadable
+/// file on a present CPU is skipped, not treated as end-of-list — an offline
+/// core (hotplug, `nosmt`) loses its `cpufreq` dir while later cores are
+/// still very much present, and breaking there would truncate the topology
+/// to whatever enumerated before the hole.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_per_cpu_trimmed(file: &str) -> Vec<(usize, String)> {
+    let mut values = Vec::new();
+    for cpu in 0..MAX_CPUS {
+        let dir = format!("/sys/devices/system/cpu/cpu{cpu}");
+        if !std::path::Path::new(&dir).is_dir() {
+            break;
+        }
+        if let Ok(s) = std::fs::read_to_string(format!("{dir}/{file}")) {
+            values.push((cpu, s.trim().to_string()));
+        }
+    }
+    values
+}
+
+/// [`read_per_cpu_trimmed`], parsed as `u32` (unparsable entries skipped).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_per_cpu_u32(file: &str) -> Vec<(usize, u32)> {
+    read_per_cpu_trimmed(file)
+        .into_iter()
+        .filter_map(|(cpu, s)| s.parse().ok().map(|v| (cpu, v)))
+        .collect()
+}
+
+/// Performance-core count on Apple Silicon via `hw.perflevel0.logicalcpu`
+/// (no subprocess). `None` if the sysctl is unavailable — or under Miri,
+/// which cannot interpret the foreign call; the topology sits on the GEMV
+/// hot path, and returning `None` keeps the full test suite Miri-runnable
+/// via the `available_parallelism` fallback.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn macos_perf_core_count() -> Option<usize> {
+    if cfg!(miri) {
+        return None;
+    }
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            oldp: *mut std::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *const std::ffi::c_void,
+            newlen: usize,
+        ) -> i32;
+    }
+    let name = c"hw.perflevel0.logicalcpu";
+    let mut value: i32 = 0;
+    let mut size = std::mem::size_of::<i32>();
+    let ret = unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            &mut value as *mut _ as *mut std::ffi::c_void,
+            &mut size,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if ret == 0 && value > 0 {
+        Some(value as usize)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn topology_has_at_least_one_thread() {
+        let topo = detect_topology();
+        assert!(topo.perf_core_count >= 1);
+        // Cached accessor agrees with a fresh detect (modulo env, which both read).
+        assert_eq!(core_topology().perf_core_count, performance_core_count());
+    }
+
+    #[test]
+    fn thread_override_sets_count_and_caps_pins() {
+        let base = CoreTopology {
+            perf_core_count: 3,
+            pin_cores: vec![7, 6, 5],
+        };
+        // Fewer threads than detected cores → pin the fastest N.
+        let two = apply_thread_override(base.clone(), Some(2));
+        assert_eq!(two.perf_core_count, 2);
+        assert_eq!(two.pin_cores, vec![7, 6]);
+        // More threads than detected cores → keep all pins, surplus unpinned.
+        let five = apply_thread_override(base.clone(), Some(5));
+        assert_eq!(five.perf_core_count, 5);
+        assert_eq!(five.pin_cores, vec![7, 6, 5]);
+        // No override → unchanged.
+        assert_eq!(apply_thread_override(base.clone(), None), base);
+    }
 
     #[test]
     fn tier_ordering_is_monotonic_per_arch() {

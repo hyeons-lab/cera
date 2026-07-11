@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 mod chat_tui;
 mod image_source;
 mod signal;
+mod thermal;
 
 /// Decode tokens to stdout as they stream. Used by the `run` command.
 ///
@@ -1663,10 +1664,11 @@ fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    // Configure rayon to use P-cores only on Apple Silicon.
-    cera::backend::cpu::configure_thread_pool();
-
     let cli = Cli::parse();
+
+    // Warm the compute pools + size rayon to P-cores. After `Cli::parse()` so
+    // `--help` / parse errors don't pay the pool spawn.
+    cera::backend::cpu::configure_thread_pool();
 
     match cli.command {
         Command::Run {
@@ -3556,6 +3558,16 @@ fn main() -> Result<()> {
                 Ok((prefill_tps, decode_tps))
             };
 
+            // Thermal-headroom sampling (Android). A sustained CPU benchmark
+            // heats the SoC within seconds, so annotate each run with headroom
+            // (0.0 cool → 1.0 throttling threshold) to tell a real throughput
+            // change from thermal drift. `None` off-Android / pre-API-30.
+            let thermal = thermal::ThermalMonitor::new();
+            let sample_headroom = || thermal.as_ref().and_then(|t| t.headroom(0));
+            if let Some(h) = sample_headroom() {
+                eprintln!("thermal headroom before warmup: {h:.2} (0=cool, 1.0=throttling)");
+            }
+
             for i in 0..warmup {
                 eprintln!("warmup {}/{}", i + 1, warmup);
                 let _ = run_once()?;
@@ -3563,10 +3575,18 @@ fn main() -> Result<()> {
 
             let mut decode_tps = Vec::with_capacity(runs);
             let mut prefill_tps = Vec::with_capacity(runs);
+            let mut headrooms = Vec::with_capacity(runs);
             for i in 0..runs {
                 let (pf, dc) = run_once()?;
+                let suffix = match sample_headroom() {
+                    Some(h) => {
+                        headrooms.push(h);
+                        format!(" | headroom={h:.2}")
+                    }
+                    None => String::new(),
+                };
                 eprintln!(
-                    "run {}/{}: prefill={pf:.0} decode={dc:.1} tok/s",
+                    "run {}/{}: prefill={pf:.0} decode={dc:.1} tok/s{suffix}",
                     i + 1,
                     runs
                 );
@@ -3579,6 +3599,18 @@ fn main() -> Result<()> {
             eprintln!(
                 "decode tok/s: p50={p50:.1} p10={p10:.1} p90={p90:.1} mean={mean:.1} stddev={stddev:.1} (n={runs})"
             );
+            if !headrooms.is_empty() {
+                let hmin = headrooms.iter().cloned().fold(f32::INFINITY, f32::min);
+                let hmax = headrooms.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                eprintln!("thermal headroom over runs: min={hmin:.2} max={hmax:.2}");
+                if hmax >= 0.95 {
+                    eprintln!(
+                        "WARNING: headroom reached {hmax:.2} — device was throttling; \
+                         decode tok/s is thermally limited, not a stable ceiling. \
+                         Cool the device (or reduce --runs/--max-tokens) and re-measure."
+                    );
+                }
+            }
             let (p10, p50, p90, mean, stddev) = summarize(prefill_tps);
             eprintln!(
                 "prefill tok/s: p50={p50:.0} p10={p10:.0} p90={p90:.0} mean={mean:.0} stddev={stddev:.0} (n={runs})"

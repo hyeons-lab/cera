@@ -1457,215 +1457,223 @@ mod tests {
         assert_eq!(c.backend, BackendPreference::Auto);
     }
 
-    #[test]
-    fn is_remote_url_covers_http_https() {
-        assert!(is_remote_url("http://example.com/x.gguf"));
-        assert!(is_remote_url("HTTPS://example.com/x.gguf"));
-        assert!(!is_remote_url("/local/path.gguf"));
-        assert!(!is_remote_url("./rel/path.gguf"));
-        assert!(!is_remote_url("file:///local/path.gguf"));
-    }
+    /// URL / manifest-resolution helpers are `mmap`-gated; grouping their
+    /// tests in one gated module means new ones inherit the gate instead of
+    /// each needing its own attribute.
+    #[cfg(feature = "mmap")]
+    mod resolution {
+        use super::*;
 
-    #[test]
-    fn has_extension_case_insensitive() {
-        assert!(has_extension(Path::new("foo.gguf"), "gguf"));
-        assert!(has_extension(Path::new("foo.GGUF"), "gguf"));
-        assert!(has_extension(Path::new("foo.json"), "json"));
-        assert!(!has_extension(Path::new("foo.txt"), "gguf"));
-        assert!(!has_extension(Path::new("foo"), "gguf"));
-    }
+        #[test]
+        fn is_remote_url_covers_http_https() {
+            assert!(is_remote_url("http://example.com/x.gguf"));
+            assert!(is_remote_url("HTTPS://example.com/x.gguf"));
+            assert!(!is_remote_url("/local/path.gguf"));
+            assert!(!is_remote_url("./rel/path.gguf"));
+            assert!(!is_remote_url("file:///local/path.gguf"));
+        }
 
-    #[test]
-    fn resolve_url_or_path_rejects_remote_without_repo() {
-        let cfg = EngineConfig::default();
-        let e = resolve_url_or_path("https://hf.co/x.gguf", None, &cfg)
-            .expect_err("remote URL must error without a BundleRepo");
-        let msg = format!("{e}");
-        // Without the `remote` feature or with `bundle_repo = None`, the
-        // error should steer the user toward the fix.
-        assert!(
-            msg.contains("remote URL"),
-            "error should mention remote URL; got `{msg}`"
-        );
-        #[cfg(feature = "remote")]
-        assert!(
-            msg.contains("bundle_repo"),
-            "error under `remote` feature should point at the config field; got `{msg}`"
-        );
-        #[cfg(not(feature = "remote"))]
-        assert!(
-            msg.contains("`remote` feature"),
-            "error without `remote` feature should point at enabling it; got `{msg}`"
-        );
-    }
+        #[test]
+        fn has_extension_case_insensitive() {
+            assert!(has_extension(Path::new("foo.gguf"), "gguf"));
+            assert!(has_extension(Path::new("foo.GGUF"), "gguf"));
+            assert!(has_extension(Path::new("foo.json"), "json"));
+            assert!(!has_extension(Path::new("foo.txt"), "gguf"));
+            assert!(!has_extension(Path::new("foo"), "gguf"));
+        }
 
-    #[test]
-    fn resolve_url_or_path_rejects_file_scheme() {
-        let cfg = EngineConfig::default();
-        let e = resolve_url_or_path("file:///models/x.gguf", None, &cfg)
-            .expect_err("file:// URIs aren't supported yet");
-        let msg = format!("{e}");
-        assert!(
-            msg.contains("file://") && msg.contains("cera doesn't parse file URIs"),
-            "error should point at the file:// limitation; got `{msg}`"
-        );
-    }
+        #[test]
+        fn resolve_url_or_path_rejects_remote_without_repo() {
+            let cfg = EngineConfig::default();
+            let e = resolve_url_or_path("https://hf.co/x.gguf", None, &cfg)
+                .expect_err("remote URL must error without a BundleRepo");
+            let msg = format!("{e}");
+            // Without the `remote` feature or with `bundle_repo = None`, the
+            // error should steer the user toward the fix.
+            assert!(
+                msg.contains("remote URL"),
+                "error should mention remote URL; got `{msg}`"
+            );
+            #[cfg(feature = "remote")]
+            assert!(
+                msg.contains("bundle_repo"),
+                "error under `remote` feature should point at the config field; got `{msg}`"
+            );
+            #[cfg(not(feature = "remote"))]
+            assert!(
+                msg.contains("`remote` feature"),
+                "error without `remote` feature should point at enabling it; got `{msg}`"
+            );
+        }
 
-    #[test]
-    fn strip_file_scheme_preserves_case() {
-        assert_eq!(
-            strip_file_scheme("FILE:///Models/Foo.gguf"),
-            Some("/Models/Foo.gguf")
-        );
-        assert_eq!(strip_file_scheme("file://./rel"), Some("./rel"));
-        assert_eq!(strip_file_scheme("https://x/y"), None);
-        assert_eq!(strip_file_scheme("/abs/path"), None);
-    }
+        #[test]
+        fn resolve_url_or_path_rejects_file_scheme() {
+            let cfg = EngineConfig::default();
+            let e = resolve_url_or_path("file:///models/x.gguf", None, &cfg)
+                .expect_err("file:// URIs aren't supported yet");
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("file://") && msg.contains("cera doesn't parse file URIs"),
+                "error should point at the file:// limitation; got `{msg}`"
+            );
+        }
 
-    #[test]
-    fn resolve_url_or_path_joins_relative_against_base() {
-        let cfg = EngineConfig::default();
-        let base = PathBuf::from("/models/bundles");
-        let got = resolve_url_or_path("LFM2-1.2B-Q4_0.gguf", Some(&base), &cfg).unwrap();
-        assert_eq!(got, PathBuf::from("/models/bundles/LFM2-1.2B-Q4_0.gguf"));
-    }
+        #[test]
+        fn strip_file_scheme_preserves_case() {
+            assert_eq!(
+                strip_file_scheme("FILE:///Models/Foo.gguf"),
+                Some("/Models/Foo.gguf")
+            );
+            assert_eq!(strip_file_scheme("file://./rel"), Some("./rel"));
+            assert_eq!(strip_file_scheme("https://x/y"), None);
+            assert_eq!(strip_file_scheme("/abs/path"), None);
+        }
 
-    #[test]
-    fn resolve_url_or_path_keeps_absolute_unchanged() {
-        let cfg = EngineConfig::default();
-        let base = PathBuf::from("/models/bundles");
-        let got = resolve_url_or_path("/opt/foo.gguf", Some(&base), &cfg).unwrap();
-        assert_eq!(got, PathBuf::from("/opt/foo.gguf"));
-    }
+        #[test]
+        fn resolve_url_or_path_joins_relative_against_base() {
+            let cfg = EngineConfig::default();
+            let base = PathBuf::from("/models/bundles");
+            let got = resolve_url_or_path("LFM2-1.2B-Q4_0.gguf", Some(&base), &cfg).unwrap();
+            assert_eq!(got, PathBuf::from("/models/bundles/LFM2-1.2B-Q4_0.gguf"));
+        }
 
-    /// Regression guard: the resolver must touch every file field, not
-    /// just `files.model`. Previously `resolve_primary_model_path` only
-    /// handled the primary, silently leaving audio / VL / extras
-    /// fields as raw URLs — which then broke downstream consumers.
-    #[test]
-    fn resolve_all_manifest_files_walks_every_field() {
-        use crate::manifest::{GenerationDefaults, InferenceType, Manifest, ManifestFiles};
+        #[test]
+        fn resolve_url_or_path_keeps_absolute_unchanged() {
+            let cfg = EngineConfig::default();
+            let base = PathBuf::from("/models/bundles");
+            let got = resolve_url_or_path("/opt/foo.gguf", Some(&base), &cfg).unwrap();
+            assert_eq!(got, PathBuf::from("/opt/foo.gguf"));
+        }
 
-        let base = PathBuf::from("/models/bundles");
-        let mut extras = std::collections::HashMap::new();
-        extras.insert("cover_art".to_string(), "cover.png".to_string());
-        extras.insert("config".to_string(), "/abs/config.toml".to_string());
+        /// Regression guard: the resolver must touch every file field, not
+        /// just `files.model`. Previously `resolve_primary_model_path` only
+        /// handled the primary, silently leaving audio / VL / extras
+        /// fields as raw URLs — which then broke downstream consumers.
+        #[test]
+        fn resolve_all_manifest_files_walks_every_field() {
+            use crate::manifest::{GenerationDefaults, InferenceType, Manifest, ManifestFiles};
 
-        let mut manifest = Manifest {
-            inference_type: InferenceType::LlamaCppLfm2AudioV1,
-            schema_version: "1.0.0".to_string(),
-            files: ManifestFiles {
-                model: "model.gguf".to_string(),
-                multimodal_projector: Some("mmproj.gguf".to_string()),
-                audio_decoder: Some("decoder.gguf".to_string()),
-                audio_tokenizer: Some("tokenizer.safetensors".to_string()),
-                extras,
-            },
-            chat_template: None,
-            generation_defaults: GenerationDefaults::Other {
+            let base = PathBuf::from("/models/bundles");
+            let mut extras = std::collections::HashMap::new();
+            extras.insert("cover_art".to_string(), "cover.png".to_string());
+            extras.insert("config".to_string(), "/abs/config.toml".to_string());
+
+            let mut manifest = Manifest {
+                inference_type: InferenceType::LlamaCppLfm2AudioV1,
+                schema_version: "1.0.0".to_string(),
+                files: ManifestFiles {
+                    model: "model.gguf".to_string(),
+                    multimodal_projector: Some("mmproj.gguf".to_string()),
+                    audio_decoder: Some("decoder.gguf".to_string()),
+                    audio_tokenizer: Some("tokenizer.safetensors".to_string()),
+                    extras,
+                },
+                chat_template: None,
+                generation_defaults: GenerationDefaults::Other {
+                    raw: serde_json::Value::Null,
+                },
                 raw: serde_json::Value::Null,
-            },
-            raw: serde_json::Value::Null,
-        };
+            };
 
-        let cfg = EngineConfig::default();
-        resolve_all_manifest_files(&mut manifest, Some(&base), &cfg).unwrap();
+            let cfg = EngineConfig::default();
+            resolve_all_manifest_files(&mut manifest, Some(&base), &cfg).unwrap();
 
-        assert_eq!(manifest.files.model, "/models/bundles/model.gguf");
-        assert_eq!(
-            manifest.files.multimodal_projector.as_deref(),
-            Some("/models/bundles/mmproj.gguf")
-        );
-        assert_eq!(
-            manifest.files.audio_decoder.as_deref(),
-            Some("/models/bundles/decoder.gguf")
-        );
-        assert_eq!(
-            manifest.files.audio_tokenizer.as_deref(),
-            Some("/models/bundles/tokenizer.safetensors")
-        );
-        assert_eq!(
-            manifest.files.extras.get("cover_art").map(String::as_str),
-            Some("/models/bundles/cover.png")
-        );
-        // Absolute extras stay absolute.
-        assert_eq!(
-            manifest.files.extras.get("config").map(String::as_str),
-            Some("/abs/config.toml")
-        );
-    }
+            assert_eq!(manifest.files.model, "/models/bundles/model.gguf");
+            assert_eq!(
+                manifest.files.multimodal_projector.as_deref(),
+                Some("/models/bundles/mmproj.gguf")
+            );
+            assert_eq!(
+                manifest.files.audio_decoder.as_deref(),
+                Some("/models/bundles/decoder.gguf")
+            );
+            assert_eq!(
+                manifest.files.audio_tokenizer.as_deref(),
+                Some("/models/bundles/tokenizer.safetensors")
+            );
+            assert_eq!(
+                manifest.files.extras.get("cover_art").map(String::as_str),
+                Some("/models/bundles/cover.png")
+            );
+            // Absolute extras stay absolute.
+            assert_eq!(
+                manifest.files.extras.get("config").map(String::as_str),
+                Some("/abs/config.toml")
+            );
+        }
 
-    #[test]
-    fn resolve_all_manifest_files_none_optionals_stay_none() {
-        use crate::manifest::{GenerationDefaults, InferenceType, Manifest, ManifestFiles};
-        let mut manifest = Manifest {
-            inference_type: InferenceType::LlamaCppTextToText,
-            schema_version: "1.0.0".to_string(),
-            files: ManifestFiles {
-                model: "/abs/model.gguf".to_string(),
-                multimodal_projector: None,
-                audio_decoder: None,
-                audio_tokenizer: None,
+        #[test]
+        fn resolve_all_manifest_files_none_optionals_stay_none() {
+            use crate::manifest::{GenerationDefaults, InferenceType, Manifest, ManifestFiles};
+            let mut manifest = Manifest {
+                inference_type: InferenceType::LlamaCppTextToText,
+                schema_version: "1.0.0".to_string(),
+                files: ManifestFiles {
+                    model: "/abs/model.gguf".to_string(),
+                    multimodal_projector: None,
+                    audio_decoder: None,
+                    audio_tokenizer: None,
+                    extras: std::collections::HashMap::new(),
+                },
+                chat_template: None,
+                generation_defaults: GenerationDefaults::Other {
+                    raw: serde_json::Value::Null,
+                },
+                raw: serde_json::Value::Null,
+            };
+            let cfg = EngineConfig::default();
+            resolve_all_manifest_files(&mut manifest, None, &cfg).unwrap();
+            assert!(manifest.files.multimodal_projector.is_none());
+            assert!(manifest.files.audio_decoder.is_none());
+            assert!(manifest.files.audio_tokenizer.is_none());
+        }
+
+        #[test]
+        fn find_single_manifest_zero_and_many() {
+            let dir = tempfile::tempdir().unwrap();
+            let e0 = find_single_manifest(dir.path()).expect_err("empty dir must error");
+            assert!(format!("{e0}").contains("no .json manifest"));
+
+            std::fs::write(dir.path().join("a.json"), b"{}").unwrap();
+            let got = find_single_manifest(dir.path()).unwrap();
+            assert_eq!(got.file_name().unwrap(), "a.json");
+
+            std::fs::write(dir.path().join("b.json"), b"{}").unwrap();
+            let e2 =
+                find_single_manifest(dir.path()).expect_err("two manifests must error (ambiguous)");
+            let msg = format!("{e2}");
+            assert!(msg.contains("2 .json manifests"), "{msg}");
+            assert!(msg.contains("a.json") && msg.contains("b.json"), "{msg}");
+        }
+
+        #[test]
+        fn synthesize_manifest_from_files_preserves_aux() {
+            let files = ModelFiles {
+                model: PathBuf::from("/m/model.gguf"),
+                multimodal_projector: Some(PathBuf::from("/m/mmproj.gguf")),
+                audio_decoder: Some(PathBuf::from("/m/ad.gguf")),
+                audio_tokenizer: Some(PathBuf::from("/m/at.safetensors")),
                 extras: std::collections::HashMap::new(),
-            },
-            chat_template: None,
-            generation_defaults: GenerationDefaults::Other {
-                raw: serde_json::Value::Null,
-            },
-            raw: serde_json::Value::Null,
-        };
-        let cfg = EngineConfig::default();
-        resolve_all_manifest_files(&mut manifest, None, &cfg).unwrap();
-        assert!(manifest.files.multimodal_projector.is_none());
-        assert!(manifest.files.audio_decoder.is_none());
-        assert!(manifest.files.audio_tokenizer.is_none());
-    }
-
-    #[test]
-    fn find_single_manifest_zero_and_many() {
-        let dir = tempfile::tempdir().unwrap();
-        let e0 = find_single_manifest(dir.path()).expect_err("empty dir must error");
-        assert!(format!("{e0}").contains("no .json manifest"));
-
-        std::fs::write(dir.path().join("a.json"), b"{}").unwrap();
-        let got = find_single_manifest(dir.path()).unwrap();
-        assert_eq!(got.file_name().unwrap(), "a.json");
-
-        std::fs::write(dir.path().join("b.json"), b"{}").unwrap();
-        let e2 =
-            find_single_manifest(dir.path()).expect_err("two manifests must error (ambiguous)");
-        let msg = format!("{e2}");
-        assert!(msg.contains("2 .json manifests"), "{msg}");
-        assert!(msg.contains("a.json") && msg.contains("b.json"), "{msg}");
-    }
-
-    #[test]
-    fn synthesize_manifest_from_files_preserves_aux() {
-        let files = ModelFiles {
-            model: PathBuf::from("/m/model.gguf"),
-            multimodal_projector: Some(PathBuf::from("/m/mmproj.gguf")),
-            audio_decoder: Some(PathBuf::from("/m/ad.gguf")),
-            audio_tokenizer: Some(PathBuf::from("/m/at.safetensors")),
-            extras: std::collections::HashMap::new(),
-            inference_type: Some(InferenceType::LlamaCppLfm2AudioV1),
-            chat_template: None,
-        };
-        let m = synthesize_manifest_from_files(&files).unwrap();
-        assert_eq!(m.inference_type, InferenceType::LlamaCppLfm2AudioV1);
-        assert_eq!(m.files.model, "/m/model.gguf");
-        assert_eq!(
-            m.files.multimodal_projector.as_deref(),
-            Some("/m/mmproj.gguf")
-        );
-        assert_eq!(m.files.audio_decoder.as_deref(), Some("/m/ad.gguf"));
-        assert_eq!(
-            m.files.audio_tokenizer.as_deref(),
-            Some("/m/at.safetensors")
-        );
-        assert!(matches!(
-            m.generation_defaults,
-            crate::manifest::GenerationDefaults::Audio { .. }
-        ));
+                inference_type: Some(InferenceType::LlamaCppLfm2AudioV1),
+                chat_template: None,
+            };
+            let m = synthesize_manifest_from_files(&files).unwrap();
+            assert_eq!(m.inference_type, InferenceType::LlamaCppLfm2AudioV1);
+            assert_eq!(m.files.model, "/m/model.gguf");
+            assert_eq!(
+                m.files.multimodal_projector.as_deref(),
+                Some("/m/mmproj.gguf")
+            );
+            assert_eq!(m.files.audio_decoder.as_deref(), Some("/m/ad.gguf"));
+            assert_eq!(
+                m.files.audio_tokenizer.as_deref(),
+                Some("/m/at.safetensors")
+            );
+            assert!(matches!(
+                m.generation_defaults,
+                crate::manifest::GenerationDefaults::Audio { .. }
+            ));
+        }
     }
 
     #[test]

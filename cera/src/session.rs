@@ -271,6 +271,9 @@ pub fn can_shift(
 /// composed of `usize` fields (`Text { start, end }`) — letting the
 /// walk loop in [`Session::append_chat_with_images`] match on
 /// `*seg` without the borrow-checker friction.
+// Only `append_chat_with_images` (gated on `vl-preprocess`) consumes the splice
+// plan, so the segment type and its walker are dead without that feature.
+#[cfg(feature = "vl-preprocess")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChatTemplateSegment {
     Text { start: usize, end: usize },
@@ -288,6 +291,7 @@ pub(crate) enum ChatTemplateSegment {
 /// would be a no-op anyway, but keeping the segment list tight
 /// makes the unit-test assertions cleaner and the walk loop
 /// branch-free on the empty case.
+#[cfg(feature = "vl-preprocess")]
 pub(crate) fn splice_image_markers(
     tokens: &[u32],
     image_marker_id: u32,
@@ -1877,6 +1881,7 @@ mod tests {
 
     /// Token stream with no `<image>` markers collapses to a single
     /// `Text` segment covering the whole range.
+    #[cfg(feature = "vl-preprocess")]
     #[test]
     fn splice_image_markers_no_markers_one_text_run() {
         let segs = splice_image_markers(&[1, 2, 3, 4], 99);
@@ -1884,6 +1889,7 @@ mod tests {
     }
 
     /// Single mid-stream marker splits into Text - Image - Text.
+    #[cfg(feature = "vl-preprocess")]
     #[test]
     fn splice_image_markers_mid_stream() {
         let segs = splice_image_markers(&[1, 2, 99, 3, 4], 99);
@@ -1899,6 +1905,7 @@ mod tests {
 
     /// Marker at index 0: leading text run is elided so the segment
     /// list stays tight (no zero-length spans).
+    #[cfg(feature = "vl-preprocess")]
     #[test]
     fn splice_image_markers_at_start() {
         let segs = splice_image_markers(&[99, 1, 2], 99);
@@ -1912,6 +1919,7 @@ mod tests {
     }
 
     /// Marker at the final index: trailing text run is elided.
+    #[cfg(feature = "vl-preprocess")]
     #[test]
     fn splice_image_markers_at_end() {
         let segs = splice_image_markers(&[1, 2, 99], 99);
@@ -1925,6 +1933,7 @@ mod tests {
     }
 
     /// Two adjacent markers: empty-text-run between them is elided.
+    #[cfg(feature = "vl-preprocess")]
     #[test]
     fn splice_image_markers_adjacent_markers() {
         let segs = splice_image_markers(&[1, 99, 99, 2], 99);
@@ -1941,6 +1950,7 @@ mod tests {
 
     /// Two well-separated markers — the canonical multi-image case.
     /// Verifies image count round-trips for caller validation.
+    #[cfg(feature = "vl-preprocess")]
     #[test]
     fn splice_image_markers_two_separated() {
         let segs = splice_image_markers(&[1, 99, 2, 99, 3], 99);
@@ -1962,6 +1972,7 @@ mod tests {
     }
 
     /// All-marker stream — no text runs at all.
+    #[cfg(feature = "vl-preprocess")]
     #[test]
     fn splice_image_markers_all_markers() {
         let segs = splice_image_markers(&[99, 99, 99], 99);
@@ -1976,6 +1987,7 @@ mod tests {
     }
 
     /// Empty stream — empty segment list.
+    #[cfg(feature = "vl-preprocess")]
     #[test]
     fn splice_image_markers_empty() {
         let segs = splice_image_markers(&[], 99);

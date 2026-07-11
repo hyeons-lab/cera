@@ -48,6 +48,13 @@ accelerate-src = { workspace = true, optional = true }
 [target.'cfg(not(any(target_os = "macos", target_os = "ios")))'.dependencies]
 openblas-src = { workspace = true, optional = true }
 
+# `sched_setaffinity` + `cpu_set_t` for pinning the compute thread pool's
+# workers to performance cores. Linux + Android only (Darwin ignores affinity
+# masks, uses QoS); used solely by `backend::threadpool` under the `parallel`
+# feature. Already in the tree transitively, so this adds no new build cost.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+
 # wasm32 portability deps, scoped by sub-target.
 #
 # `web-time` works on every wasm32 flavor (browser, Node, WASI) and is
