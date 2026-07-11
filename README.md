@@ -292,6 +292,14 @@ LFM2 family. On an M1 Max with Q4_0 weights, the native Metal backend decodes
 roughly **2× faster than llama.cpp** across tested VL and Audio models; prefill
 leads at short prompts and trails at long ones.
 
+On CPU, rows dispatch through a persistent, affinity-pinned threadpool with
+dynamic chunk-stealing rather than a per-GEMV fork-join. This fixes the
+multi-core decode collapse on Android big.LITTLE and scales decode across the
+performance cores (Tensor G5, LFM2 Q4_0, warm: CPU decode matches or beats
+llama.cpp). Thread placement and count auto-detect per device; the `CERA_*`
+override knobs are documented under
+**[*CPU threading & tuning*](cera/README.md#cpu-threading--tuning)**.
+
 Detailed methodology, per-model tables (decode + prefill vs llama.cpp), the
 Accelerate/AMX BLAS results, and the backend optimization notes live in
 **[`benchmarks/README.md`](benchmarks/README.md)**.

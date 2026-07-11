@@ -18,8 +18,30 @@ bindings, and [`cera-wasm`](https://github.com/hyeons-lab/cera/tree/main/cera-wa
 
 ```toml
 [dependencies]
-cera = "0.2"
+cera = "0.3"
 ```
+
+## Breaking changes in 0.3.0
+
+0.3.0 adds public fields to two public structs, so it is a minor (not patch)
+release — a `cargo update` from 0.2.x will not pull it in automatically.
+
+- **`GenerateOpts` gained `ignore_eos: bool`** (run decode to exactly
+  `max_tokens`, ignoring EOS/stop tokens — the `llama.cpp --ignore-eos`
+  analog). Code that constructs `GenerateOpts` with an exhaustive struct
+  literal must add the field; prefer functional-update syntax —
+  `GenerateOpts { max_tokens: 256, ..Default::default() }` — which stays
+  source-compatible across field additions. It defaults to `false`,
+  preserving prior behavior.
+- **`ModelMetadata` gained `add_eos_token: bool`** (mirrors GGUF
+  `tokenizer.ggml.add_eos_token`, alongside the existing `add_bos_token`).
+  This is an engine output type, so it only affects code that exhaustively
+  pattern-matches or constructs it.
+
+Also new (non-breaking): `BpeTokenizer::encode_special` (and the FFI
+`encode_text_special` / wasm `encodeSpecial` wrappers) apply BOS/EOS to match
+`llama.cpp`'s `llama_tokenize`, and `GenerateSummary::prompt_eval_ms` now
+reports real prefill wall time paired with `prompt_eval_tokens`.
 
 ## Supported models
 
@@ -198,7 +220,7 @@ shrink the crate for `wasm32-unknown-unknown` or embedded targets
 
 | Feature | Default | What it adds |
 |---------|:------:|--------------|
-| `parallel` | ✅ | Rayon-parallel kernels |
+| `parallel` | ✅ | Multi-threaded CPU kernels (persistent affinity-pinned threadpool on native; rayon on wasm) |
 | `std-fs` | ✅ | Filesystem access (paths, caches) |
 | `mmap` | ✅ | Memory-mapped GGUF loading (⇒ `std-fs`) |
 | `disk-cache` | ✅ | Cold KV-cache tier on disk (⇒ `std-fs`) |
@@ -211,6 +233,35 @@ shrink the crate for `wasm32-unknown-unknown` or embedded targets
 
 MSRV: Rust 1.85 (edition 2024). The `avx512` tier needs 1.89+; disable it to
 build on 1.85–1.88 (x86 then caps at AVX2).
+
+## CPU threading & tuning
+
+On native targets the CPU backend dispatches GEMV/GEMM rows through a
+persistent, affinity-pinned worker pool (not a per-call fork-join), with dynamic
+chunk-stealing so faster cores absorb more work on heterogeneous big.LITTLE
+mobile. Decode runs on the detected performance cores; prefill uses all of them.
+Two independent auto-caps bound the width: on heterogeneous big.LITTLE parts
+(Linux/Android) detection keeps at most 6 big cores (both pools), and on the
+homogeneous fallback — desktop/server/macOS, where sysfs detection is skipped
+and every logical CPU counts as a "perf core" — decode is separately capped at
+12 while prefill uses all. This fixes the multi-core decode collapse on Android
+big.LITTLE and lets decode scale across the performance cores. Everything is
+auto-detected per device — the environment variables below only override for
+tuning (`CERA_THREADS` moves the detected count past either cap in both
+directions):
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `CERA_DECODE_THREADS` | detected perf cores (≤6 heterogeneous, ≤12 homogeneous) | Decode worker count — a fixed `<n>`, or `auto`. A fixed value is clamped to the detected performance cores; the 12 cap applies only to the homogeneous `auto` path (heterogeneous big.LITTLE detection already caps big cores at 6). |
+| `CERA_THREADS` | detected perf-core count | Override the detected performance-core count (moves the auto width for both pools). |
+| `CERA_MIN_ROWS` | 128 | Minimum output rows a decode-GEMV worker takes before another joins. |
+| `CERA_PAR_THRESHOLD` | 256 | Minimum output dimension before a GEMV parallelizes; smaller GEMVs stay serial. |
+| `CERA_SPIN` | 100000 | Spin iterations before an idle worker parks. |
+| `CERA_PIN` | on | `0` / `false` / `off` disables affinity pinning (for hosts that manage thread placement themselves). |
+| `CERA_CPU_TIER` | auto | Force a lower CPU SIMD tier (downgrade only) — for parity testing on capable hardware. |
+
+Affinity pinning applies on Linux/Android with a detected heterogeneous
+topology; homogeneous hosts and macOS run unpinned.
 
 ## License
 
