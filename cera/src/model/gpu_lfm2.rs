@@ -171,6 +171,7 @@ struct GpuPipelines {
     gemm_f32_nt_accum: wgpu::ComputePipeline,
     gemv_q4_0: wgpu::ComputePipeline,
     gemv_q4_0_fast: wgpu::ComputePipeline,
+    gemv_q5_k: wgpu::ComputePipeline,
     gemv_q6_k: wgpu::ComputePipeline,
     gemv_q8_0: wgpu::ComputePipeline,
     add_inplace: wgpu::ComputePipeline,
@@ -652,6 +653,7 @@ impl GpuLfm2Model {
                 "gemv_q4_0_fast",
                 "gemv_q4_0_fast",
             ),
+            gemv_q5_k: ctx.create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k", "gemv_q5_k"),
             gemv_q6_k: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k", "gemv_q6_k"),
             gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0", "gemv_q8_0"),
             add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "add"),
@@ -747,18 +749,24 @@ impl GpuLfm2Model {
         let output_norm = ctx.upload_f32(src.output_norm_weight(), "output_norm");
 
         let upload_weight = |wref: &WeightRef, name: &str| -> GpuWeight {
-            let (buf, dtype) = if matches!(wref.dtype, DType::Q4_0 | DType::Q8_0 | DType::Q6K) {
-                // Q4_0/Q8_0 have native GEMV+GEMM kernels; Q6K has a native GEMV
-                // (`gemv_q6_k`) used by decode and the per-token prefill fallback,
-                // so it stays quantized too (~4.9× less VRAM than dequantizing to
-                // f32: Q6K is 210 B / 256 elems ≈ 0.82 B/elem vs 4 B/elem for f32).
+            let (buf, dtype) = if matches!(
+                wref.dtype,
+                DType::Q4_0 | DType::Q8_0 | DType::Q6K | DType::Q5KM
+            ) {
+                // Q4_0/Q8_0 have native GEMV+GEMM kernels; Q6K and Q5KM have
+                // native GEMV kernels (`gemv_q6_k` / `gemv_q5_k`) used by decode
+                // and the per-token prefill fallback, so they stay quantized too
+                // (~4.9× / 5.8× less VRAM than dequantizing to f32: Q6K is 210 B
+                // and Q5KM 176 B per 256 elems vs 4 B/elem = 1024 B for f32).
                 // Q4KM still dequantizes below until its kernels land (B2).
                 //
                 // The shaders bind this buffer as `array<u32>` and do u32 reads.
-                // `upload_storage`/`create_buffer_init` round the buffer size up to
-                // COPY_BUFFER_ALIGNMENT (4 B) and zero the tail, so a Q6K row
-                // (`nb*210` B, not a 4-multiple) is safe to index as u32 — the same
-                // guarantee Q4_0 (18 B/block) and Q8_0 (34 B/block) already rely on.
+                // `upload_storage`/`create_buffer_init` round the buffer size up
+                // to COPY_BUFFER_ALIGNMENT (4 B) and zero the tail, so a row whose
+                // byte length isn't a multiple of 4 is still safe to index as u32.
+                // Q5KM (`nb*176` B) is already 4-aligned; Q6K (`nb*210`), Q4_0
+                // (18 B/block), and Q8_0 (34 B/block) are not, and rely on that
+                // round-up guarantee.
                 let data = src.weight_bytes(wref);
                 (ctx.upload_storage(data, name), wref.dtype)
             } else {
@@ -1453,6 +1461,8 @@ impl GpuLfm2Model {
             DType::Q4_0 => (&self.pipelines.gemv_q4_0_fast, 4, "gemv_q4"),
             DType::Q8_0 => (&self.pipelines.gemv_q8_0, 8, "gemv_q8"),
             DType::Q6K => (&self.pipelines.gemv_q6_k, 2, "gemv_q6"),
+            // gemv_q5_k uses NR=2 rows per workgroup (must match the shader).
+            DType::Q5KM => (&self.pipelines.gemv_q5_k, 2, "gemv_q5k"),
             _ => (&self.pipelines.gemv_f32, 8, "gemv_f32"),
         }
     }
