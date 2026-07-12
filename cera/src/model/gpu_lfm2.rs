@@ -750,8 +750,15 @@ impl GpuLfm2Model {
             let (buf, dtype) = if matches!(wref.dtype, DType::Q4_0 | DType::Q8_0 | DType::Q6K) {
                 // Q4_0/Q8_0 have native GEMV+GEMM kernels; Q6K has a native GEMV
                 // (`gemv_q6_k`) used by decode and the per-token prefill fallback,
-                // so it stays quantized too (~7× less VRAM than dequantizing to
-                // f32). Q4KM still dequantizes below until its kernels land (B2).
+                // so it stays quantized too (~4.9× less VRAM than dequantizing to
+                // f32: Q6K is 210 B / 256 elems ≈ 0.82 B/elem vs 4 B/elem for f32).
+                // Q4KM still dequantizes below until its kernels land (B2).
+                //
+                // The shaders bind this buffer as `array<u32>` and do u32 reads.
+                // `upload_storage`/`create_buffer_init` round the buffer size up to
+                // COPY_BUFFER_ALIGNMENT (4 B) and zero the tail, so a Q6K row
+                // (`nb*210` B, not a 4-multiple) is safe to index as u32 — the same
+                // guarantee Q4_0 (18 B/block) and Q8_0 (34 B/block) already rely on.
                 let data = src.weight_bytes(wref);
                 (ctx.upload_storage(data, name), wref.dtype)
             } else {

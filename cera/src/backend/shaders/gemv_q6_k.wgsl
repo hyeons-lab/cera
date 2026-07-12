@@ -1,9 +1,10 @@
 // Q6_K GEMV — Metal kernel layout with per-byte reads.
 // Wired into the wgpu GEMV dispatch (Q6K weights stay quantized in VRAM,
-// ~7× smaller than dequantizing to f32). Compute is bound by per-byte u32
-// load+shift+mask overhead and regressed vs f32 on macOS wgpu in earlier
-// measurement, so the primary win is VRAM/bandwidth (matters most on
-// mobile Adreno/Mali); byte-extraction throughput is a future optimization.
+// ~4.9× smaller than dequantizing to f32: 210 B / 256 elems ≈ 0.82 B/elem
+// vs 4 B/elem). Compute is bound by per-byte u32 load+shift+mask overhead and
+// regressed vs f32 on macOS wgpu in earlier measurement, so the primary win is
+// VRAM/bandwidth (matters most on mobile Adreno/Mali); byte-extraction
+// throughput is a future optimization.
 //
 // NR=2 rows per WG, 32 threads. Dispatch: ceil(m/2).
 
