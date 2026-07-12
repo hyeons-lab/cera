@@ -1792,6 +1792,17 @@ impl GpuLfm2Model {
         seq_len: u32,
         scale: f32,
     ) {
+        // flash_attention.wgsl sizes `q_shared` / `acc` at 128 f32, so head_dim
+        // must fit. Every current LFM2 / dense model uses head_dim ∈ {64, 128},
+        // but assert loudly rather than let a larger head_dim silently corrupt
+        // the output via clamped out-of-bounds workgroup-array writes. (The
+        // replaced classic kernel had no such bound — this makes the flash
+        // kernel's limit an explicit contract instead of silent garbage.)
+        assert!(
+            head_dim <= 128,
+            "wgpu flash_attention supports head_dim <= 128 (q_shared/acc are \
+             sized 128); got {head_dim}"
+        );
         let params: [u32; 8] = [
             n_heads,
             n_kv_heads,
