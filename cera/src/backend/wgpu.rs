@@ -726,6 +726,7 @@ pub mod shaders {
     pub const ROPE: &str = include_str!("shaders/rope.wgsl");
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.wgsl");
     pub const ATTENTION: &str = include_str!("shaders/attention.wgsl");
+    pub const FLASH_ATTENTION: &str = include_str!("shaders/flash_attention.wgsl");
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
     pub const CONV1D: &str = include_str!("shaders/conv1d.wgsl");
     pub const CONV1D_FUSED: &str = include_str!("shaders/conv1d_fused.wgsl");
@@ -2873,6 +2874,124 @@ mod tests {
                 expected[i],
                 result[i]
             );
+        }
+    }
+
+    #[test]
+    fn test_gpu_flash_attention_matches_classic() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let classic = ctx.create_pipeline(shaders::ATTENTION, "attention", "attention");
+        let flash = ctx.create_pipeline(
+            shaders::FLASH_ATTENTION,
+            "flash_attention",
+            "flash_attention",
+        );
+
+        // Dispatch an attention pipeline over `bindings` (in binding-index order)
+        // with one workgroup per head; return the `out` contents.
+        let run = |pipeline: &wgpu::ComputePipeline,
+                   bindings: &[&wgpu::Buffer],
+                   out: &wgpu::Buffer,
+                   out_len: usize,
+                   n_heads: u32|
+         -> Vec<f32> {
+            let entries: Vec<wgpu::BindGroupEntry> = bindings
+                .iter()
+                .enumerate()
+                .map(|(i, b)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: b.as_entire_binding(),
+                })
+                .collect();
+            let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &entries,
+            });
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(n_heads, 1, 1);
+            }
+            ctx.queue.submit(Some(enc.finish()));
+            ctx.download_f32(out, out_len)
+        };
+
+        // (n_heads, n_kv_heads, head_dim, seq_len). Covers single-token,
+        // sub-tile, exactly-one-tile, and multi-tile (>256) seq_len, hd 64/128,
+        // and GQA (n_kv_heads < n_heads).
+        let configs = [
+            (4u32, 4u32, 64u32, 1u32),
+            (4, 4, 64, 7),
+            (8, 2, 64, 300),
+            (4, 4, 128, 256),
+            (6, 3, 128, 1000),
+        ];
+
+        for (n_heads, n_kv_heads, head_dim, seq_len) in configs {
+            let kv_dim = n_kv_heads * head_dim;
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let q: Vec<f32> = (0..n_heads * head_dim)
+                .map(|i| ((i * 7 + 3) % 17) as f32 * 0.1 - 0.8)
+                .collect();
+            let k: Vec<f32> = (0..seq_len * kv_dim)
+                .map(|i| ((i * 13 + 5) % 23) as f32 * 0.05 - 0.55)
+                .collect();
+            let v: Vec<f32> = (0..seq_len * kv_dim)
+                .map(|i| ((i * 11 + 1) % 19) as f32 * 0.05 - 0.45)
+                .collect();
+            let params: [u32; 8] = [
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_dim,
+                seq_len,
+                scale.to_bits(),
+                0,
+                0,
+            ];
+
+            let q_buf = ctx.upload_f32(&q, "q");
+            let k_buf = ctx.upload_f32(&k, "k");
+            let v_buf = ctx.upload_f32(&v, "v");
+            let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+            let out_len = (n_heads * head_dim) as usize;
+            let out_c = ctx.create_storage_rw(out_len as u64 * 4, "out_classic");
+            let out_f = ctx.create_storage_rw(out_len as u64 * 4, "out_flash");
+            let scores = ctx.create_storage_rw((n_heads * seq_len) as u64 * 4, "scores");
+
+            let classic_out = run(
+                &classic,
+                &[&q_buf, &k_buf, &v_buf, &out_c, &scores, &params_buf],
+                &out_c,
+                out_len,
+                n_heads,
+            );
+            let flash_out = run(
+                &flash,
+                &[&q_buf, &k_buf, &v_buf, &out_f, &params_buf],
+                &out_f,
+                out_len,
+                n_heads,
+            );
+
+            for i in 0..out_len {
+                let diff = (classic_out[i] - flash_out[i]).abs();
+                let tol = 1e-3 + 1e-3 * classic_out[i].abs();
+                assert!(
+                    diff <= tol,
+                    "flash≠classic at cfg (h={n_heads},kv={n_kv_heads},hd={head_dim},\
+                     seq={seq_len}) idx {i}: classic={}, flash={}, diff={diff}",
+                    classic_out[i],
+                    flash_out[i],
+                );
+            }
         }
     }
 

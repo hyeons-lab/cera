@@ -192,6 +192,7 @@ struct GpuPipelines {
     /// scratch (the memcpy halves use `copy_buffer_to_buffer`). See `shift_kv`.
     kv_shift: wgpu::ComputePipeline,
     attention: wgpu::ComputePipeline,
+    flash_attention: wgpu::ComputePipeline,
     conv1d_fused: wgpu::ComputePipeline,
     argmax_f32: wgpu::ComputePipeline,
     // ── Batched-prefill pipelines ─────────────────────────────────────
@@ -402,7 +403,6 @@ pub struct GpuLfm2Model {
     kv_shift_scratch: wgpu::Buffer,
     attn_out_buf: wgpu::Buffer, // [hidden_size]
     logits_buf: wgpu::Buffer,   // [vocab_size]
-    scores_buf: wgpu::Buffer,   // [n_heads × max_seq_len]
     /// 4 bytes — receives argmax(logits) as a single u32. Cached so
     /// `forward_greedy` doesn't allocate per call. The `download_u32`
     /// readback over this 4-byte buffer is the wasm-async-friendly
@@ -682,6 +682,11 @@ impl GpuLfm2Model {
             rope: ctx.create_pipeline(shaders::ROPE, "rope", "rope"),
             kv_shift: ctx.create_pipeline(shaders::KV_SHIFT, "kv_shift", "kv_shift"),
             attention: ctx.create_pipeline(shaders::ATTENTION, "attention", "attention"),
+            flash_attention: ctx.create_pipeline(
+                shaders::FLASH_ATTENTION,
+                "flash_attention",
+                "flash_attention",
+            ),
             conv1d_fused: ctx.create_pipeline(
                 shaders::CONV1D_FUSED,
                 "conv1d_fused",
@@ -908,7 +913,6 @@ impl GpuLfm2Model {
         let kv_shift_scratch = f(max_seq_len * max_kv_dim, "kv_shift_scratch");
         let attn_out_buf = f(q_dim, "attn_out");
         let logits_buf = f(config.vocab_size, "logits");
-        let scores_buf = f(config.n_heads * max_seq_len, "scores");
         let conv_proj_buf = f(3 * hs, "conv_proj");
         let conv_gate_buf = f(hs, "conv_gate");
 
@@ -1096,7 +1100,6 @@ impl GpuLfm2Model {
             kv_shift_scratch,
             attn_out_buf,
             logits_buf,
-            scores_buf,
             argmax_out_buf,
             argmax_params,
             argmax_bg,
@@ -1810,7 +1813,7 @@ impl GpuLfm2Model {
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
-                layout: &self.pipelines.attention.get_bind_group_layout(0),
+                layout: &self.pipelines.flash_attention.get_bind_group_layout(0),
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -1830,20 +1833,16 @@ impl GpuLfm2Model {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: self.scores_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
                         resource: params_buf.as_entire_binding(),
                     },
                 ],
             });
         self.encode(
             enc,
-            &self.pipelines.attention,
+            &self.pipelines.flash_attention,
             &bg,
             (n_heads, 1, 1),
-            "attention",
+            "flash_attention",
         );
     }
 
