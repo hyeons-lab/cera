@@ -171,6 +171,7 @@ struct GpuPipelines {
     gemm_f32_nt_accum: wgpu::ComputePipeline,
     gemv_q4_0: wgpu::ComputePipeline,
     gemv_q4_0_fast: wgpu::ComputePipeline,
+    gemv_q4_k: wgpu::ComputePipeline,
     gemv_q5_k: wgpu::ComputePipeline,
     gemv_q6_k: wgpu::ComputePipeline,
     gemv_q8_0: wgpu::ComputePipeline,
@@ -205,6 +206,7 @@ struct GpuPipelines {
     mul_mat_reg_tile_q4_0_vec: wgpu::ComputePipeline,
     mul_mat_reg_tile_q4_0_scalar: wgpu::ComputePipeline,
     gemm_q8_0: wgpu::ComputePipeline,
+    gemm_q4_k: wgpu::ComputePipeline,
     attention_prefill: wgpu::ComputePipeline,
 }
 
@@ -653,6 +655,7 @@ impl GpuLfm2Model {
                 "gemv_q4_0_fast",
                 "gemv_q4_0_fast",
             ),
+            gemv_q4_k: ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k", "gemv_q4_k"),
             gemv_q5_k: ctx.create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k", "gemv_q5_k"),
             gemv_q6_k: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k", "gemv_q6_k"),
             gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0", "gemv_q8_0"),
@@ -714,6 +717,7 @@ impl GpuLfm2Model {
                 false,
             ),
             gemm_q8_0: ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0", "gemm_q8_0"),
+            gemm_q4_k: ctx.create_pipeline(shaders::GEMM_Q4_K, "gemm_q4_k", "gemm_q4_k"),
             attention_prefill: ctx.create_pipeline(
                 shaders::ATTENTION_PREFILL,
                 "attention_prefill",
@@ -751,14 +755,14 @@ impl GpuLfm2Model {
         let upload_weight = |wref: &WeightRef, name: &str| -> GpuWeight {
             let (buf, dtype) = if matches!(
                 wref.dtype,
-                DType::Q4_0 | DType::Q8_0 | DType::Q6K | DType::Q5KM
+                DType::Q4_0 | DType::Q8_0 | DType::Q4KM | DType::Q5KM | DType::Q6K
             ) {
-                // Q4_0/Q8_0 have native GEMV+GEMM kernels; Q6K and Q5KM have
+                // Q4_0/Q8_0/Q4KM have native GEMV+GEMM kernels; Q6K and Q5KM have
                 // native GEMV kernels (`gemv_q6_k` / `gemv_q5_k`) used by decode
-                // and the per-token prefill fallback, so they stay quantized too
-                // (~4.9× / 5.8× less VRAM than dequantizing to f32: Q6K is 210 B
-                // and Q5KM 176 B per 256 elems vs 4 B/elem = 1024 B for f32).
-                // Q4KM still dequantizes below until its kernels land (B2).
+                // and the per-token prefill fallback. All stay quantized on the
+                // GPU rather than dequantizing to f32: ~7× less VRAM for Q4KM
+                // (144 B / 256 elems = 0.5625 B/elem vs 4 B/elem), ~5.8× for Q5KM
+                // (176 B), and ~4.9× for Q6K (210 B).
                 //
                 // The shaders bind this buffer as `array<u32>` and do u32 reads.
                 // `upload_storage`/`create_buffer_init` round the buffer size up
@@ -1454,12 +1458,14 @@ impl GpuLfm2Model {
         w: &GpuWeight,
     ) -> (&wgpu::ComputePipeline, u32, &'static str) {
         // rows-per-workgroup MUST match each shader's `NR`/`ROWS_PER_WG`
-        // constant: gemv_q4_0_fast=4, gemv_q8_0=8, gemv_q6_k=2, gemv_f32=8. A
-        // mismatch over-dispatches and the shaders bounds-check only writes, not
-        // weight reads, so a too-small value reads past the weight buffer.
+        // constant: gemv_q4_0_fast=4, gemv_q8_0=8, gemv_q4_k=2, gemv_q5_k=2,
+        // gemv_q6_k=2, gemv_f32=8. A mismatch over-dispatches and the shaders
+        // bounds-check only writes, not weight reads, so a too-small value reads
+        // past the weight buffer.
         match w.tensor.dtype {
             DType::Q4_0 => (&self.pipelines.gemv_q4_0_fast, 4, "gemv_q4"),
             DType::Q8_0 => (&self.pipelines.gemv_q8_0, 8, "gemv_q8"),
+            DType::Q4KM => (&self.pipelines.gemv_q4_k, 2, "gemv_q4k"),
             DType::Q6K => (&self.pipelines.gemv_q6_k, 2, "gemv_q6"),
             // gemv_q5_k uses NR=2 rows per workgroup (must match the shader).
             DType::Q5KM => (&self.pipelines.gemv_q5_k, 2, "gemv_q5k"),
@@ -3008,11 +3014,14 @@ impl GpuLfm2Model {
 //     `start_pos`; conv rolling state and KV cache writes carry across).
 //   * `1 <= n <= MAX_PREFILL_TOKENS` per call (asserted).
 //   * `start_pos + n <= max_seq_len` (asserted).
-//   * All matmul weights must be Q4_0 (the LFM2 Q4_0 GGUF default).
-//     Non-Q4_0 paths fall through to the per-token loop at the dispatcher.
+//   * Every matmul weight must have a batched GEMM kernel — Q4_0
+//     (mul_mat_reg_tile), Q8_0 (gemm_q8_0), or Q4KM (gemm_q4_k). Any other
+//     dtype (F32, Q6K, Q5KM, …) makes `all_matmul_weights_batched_supported`
+//     return false and the whole prompt falls through to the per-token GEMV
+//     loop at the dispatcher.
 //
-// The non-Q4_0 fallback (an f32 `gemm_f32` shader, or per-token gemv with
-// offset bindings) can land in a follow-up PR without disturbing this
+// Extending the batched path to further dtypes (e.g. a Q6K/Q5KM GEMM, or an
+// f32 `gemm_f32` fallback) can land in a follow-up PR without disturbing this
 // contract.
 //
 // Per-dispatch overhead note: each `encode_*` helper builds a fresh
@@ -3033,8 +3042,8 @@ impl GpuLfm2Model {
 
 impl GpuLfm2Model {
     /// Returns true iff every matmul weight on every layer has a batched
-    /// prefill kernel. Q4_0 uses the register-tiled path; Q8_0 uses the
-    /// conservative batched GEMV-shaped path.
+    /// prefill kernel. Q4_0 uses the register-tiled path; Q8_0 and Q4KM use the
+    /// conservative batched GEMV-shaped path (gemm_q8_0 / gemm_q4_k).
     /// precondition for `forward_prefill_batched_locked` to take the
     /// batched path. Cheap O(n_layers) walk; not memoized because it's
     /// called once per `forward_prefill` invocation.
@@ -3052,7 +3061,7 @@ impl GpuLfm2Model {
                 lw.conv_out_proj.as_ref(),
             ];
             for w in weights.into_iter().flatten() {
-                if !matches!(w.tensor.dtype, DType::Q4_0 | DType::Q8_0) {
+                if !matches!(w.tensor.dtype, DType::Q4_0 | DType::Q8_0 | DType::Q4KM) {
                     return false;
                 }
             }
@@ -3199,8 +3208,8 @@ impl GpuLfm2Model {
         y_stride: u32,
     ) {
         debug_assert!(
-            matches!(w.tensor.dtype, DType::Q4_0 | DType::Q8_0),
-            "encode_mul_mat_reg_tile only supports Q4_0/Q8_0 weights"
+            matches!(w.tensor.dtype, DType::Q4_0 | DType::Q8_0 | DType::Q4KM),
+            "encode_mul_mat_reg_tile only supports Q4_0/Q8_0/Q4KM weights"
         );
         let m = w.tensor.shape[0] as u32;
         let (pipeline, wg_m, wg_n, label) = match w.tensor.dtype {
@@ -3232,11 +3241,24 @@ impl GpuLfm2Model {
                 );
                 (&self.pipelines.gemm_q8_0, wg_m, n, "gemm_q8")
             }
+            DType::Q4KM => {
+                // gemm_q4_k mirrors gemm_q8_0's ROWS_PER_WG=8 batched shape and
+                // likewise indexes the row tile with `wid.x` directly (`wid.y`
+                // is the token axis), so the same 65535 row-tile guard applies.
+                let wg_m = m.div_ceil(8);
+                debug_assert!(
+                    wg_m <= 65535,
+                    "gemm_q4_k row tiles {wg_m} exceed the 65535 dispatch \
+                     limit (m={m}); Q4_K batched prefill needs a flattened \
+                     dispatch for weights this large"
+                );
+                (&self.pipelines.gemm_q4_k, wg_m, n, "gemm_q4k")
+            }
             // Unreachable in practice: the batched path is only entered when
             // `all_matmul_weights_batched_supported()` already confirmed every
-            // weight is Q4_0/Q8_0. The debug_assert above documents the same
-            // precondition; this arm is the release-mode backstop.
-            _ => unreachable!("batched prefill only supports Q4_0/Q8_0"),
+            // weight is Q4_0/Q8_0/Q4KM. The debug_assert above documents the
+            // same precondition; this arm is the release-mode backstop.
+            _ => unreachable!("batched prefill only supports Q4_0/Q8_0/Q4KM"),
         };
 
         let params: [u32; 6] = [m, k, n, x_stride, y_stride, 0];
