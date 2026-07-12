@@ -61,14 +61,12 @@ fn q4k_mn(sb: u32, sub: u32) -> u32 {
     return (rb(sb + sub + 4u) >> 4u) | ((rb(sb + sub) >> 6u) << 4u);
 }
 
-// Full 256-element dot of super-block `bi` of row `row` against the staged
-// activations `xl` (indices 0..256 within this super-block).
-fn process_block_q4_k(
-    row: u32,
-    bi: u32,
-    row_bytes: u32,
-    xl: ptr<function, array<f32, 256>>,
-) -> f32 {
+// Full 256-element dot of super-block `bi` of row `row` against the token's
+// activations, read directly from `x` at `x_base` (the super-block's base
+// offset within the token row). Reading `x` directly instead of staging all 256
+// activations into a per-thread array keeps register pressure low (the 8 rows in
+// a workgroup re-read the same block, but those reads hit the L2 cache).
+fn process_block_q4_k(row: u32, bi: u32, row_bytes: u32, x_base: u32) -> f32 {
     let blk = row * row_bytes + bi * Q4K_BYTES;
     let d = rf16(blk);
     let dmin = rf16(blk + 2u);
@@ -86,8 +84,8 @@ fn process_block_q4_k(
             let qb = rb(qs + 32u * j + l);
             let lo = f32(qb & 0x0Fu);
             let hivar = f32(qb >> 4u);
-            sum += (scale_lo * lo - min_lo) * (*xl)[base + l];
-            sum += (scale_hi * hivar - min_hi) * (*xl)[base + l + 32u];
+            sum += (scale_lo * lo - min_lo) * x[x_base + base + l];
+            sum += (scale_hi * hivar - min_hi) * x[x_base + base + l + 32u];
         }
     }
     return sum;
@@ -118,18 +116,12 @@ fn gemm_q4_k(
     var bi = tid;
     while bi < nb {
         let x_base = token_base + bi * QK_K;
-        var xl: array<f32, 256>;
-        for (var i = 0u; i < QK_K; i += 1u) {
-            xl[i] = x[x_base + i];
-        }
-
         for (var r = 0u; r < ROWS_PER_WG; r += 1u) {
             let row = row_base + r;
             if row < m {
-                sums[r] += process_block_q4_k(row, bi, row_bytes, &xl);
+                sums[r] += process_block_q4_k(row, bi, row_bytes, x_base);
             }
         }
-
         bi += WG_SIZE;
     }
 
