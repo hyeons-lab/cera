@@ -302,7 +302,21 @@ pub(crate) fn dequantize_row_into(
         wref.m
     );
     let data = weight_data(gguf, wref);
-    let row_bytes = wref.k / wref.dtype.block_size() * wref.dtype.block_bytes();
+    // `row_bytes` divides by the block size; a `k` that isn't a whole number of
+    // blocks would truncate the stride and silently drop each row's tail (the
+    // downstream `dequantize_*_row` only `debug_assert`s the length, so release
+    // builds would dequantize garbage). Well-formed GGUF K-quant rows are always
+    // a multiple of 256, so this only fires on a malformed file — fail loudly
+    // rather than corrupt the row.
+    let block_size = wref.dtype.block_size();
+    assert_eq!(
+        wref.k % block_size,
+        0,
+        "dequantize_row: k ({}) is not a multiple of the {:?} block size ({block_size})",
+        wref.k,
+        wref.dtype,
+    );
+    let row_bytes = wref.k / block_size * wref.dtype.block_bytes();
     let row_start = row_idx * row_bytes;
     let row_data = &data[row_start..row_start + row_bytes];
 
@@ -311,6 +325,7 @@ pub(crate) fn dequantize_row_into(
         DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, out),
         DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, out),
         DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, out),
+        DType::Q5KM => crate::quant::dequantize_q5_k_row(row_data, out),
         DType::F32 => {
             let floats: &[f32] = bytemuck::cast_slice(row_data);
             out.copy_from_slice(floats);

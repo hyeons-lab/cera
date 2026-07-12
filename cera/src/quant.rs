@@ -69,6 +69,27 @@ pub struct BlockQ6K {
 
 const _: () = assert!(size_of::<BlockQ6K>() == 210);
 
+/// Q5_K quantization block: 256 values in 176 bytes.
+///
+/// Layout (from ggml-common.h `block_q5_K`):
+///   d: f16 (2 bytes) — super-block scale for the 6-bit sub-block scales
+///   dmin: f16 (2 bytes) — super-block scale for the 6-bit sub-block mins
+///   scales: [u8; 12] — 8 sub-block scales + 8 mins, 6-bit packed (identical
+///     layout to Q4_K, decoded via `decode_q4km_scales`)
+///   qh: [u8; 32] — the 5th (high) bit of each of the 256 quants
+///   qs: [u8; 128] — the low 4 bits of each of the 256 quants
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ5K {
+    pub d: u16,    // f16 stored as raw bits
+    pub dmin: u16, // f16 stored as raw bits
+    pub scales: [u8; 12],
+    pub qh: [u8; 32],
+    pub qs: [u8; 128],
+}
+
+const _: () = assert!(size_of::<BlockQ5K>() == 176);
+
 // ── Q4_0 dequantization ─────────────────────────────────────────────────────
 
 /// Dequantize a single Q4_0 block to 32 f32 values.
@@ -465,6 +486,125 @@ pub fn vec_dot_q6_k_f32_scalar(block: &BlockQ6K, y: &[f32]) -> f32 {
 /// Dot product of a Q6_K block with an f32 vector. Dispatches to best available impl.
 pub fn vec_dot_q6_k_f32(block: &BlockQ6K, y: &[f32]) -> f32 {
     vec_dot_q6_k_f32_scalar(block, y)
+}
+
+// ── Q5_K dequantization ────────────────────────────────────────────────────
+
+/// Dequantize a single Q5_K block to 256 f32 values.
+///
+/// Ported from llama.cpp's `dequantize_row_q5_K`. Q5_K shares Q4_K's 6-bit
+/// scale/min packing (`decode_q4km_scales`); the extra `qh` plane supplies the
+/// 5th bit of each quant. The 256 values are produced in 4 iterations of 64:
+/// each iteration decodes two sub-blocks (low nibbles then high nibbles of the
+/// same 32 `qs` bytes) and folds in `qh` via the `u1`/`u2` bit selectors, which
+/// start at bit 0/1 and shift left by 2 each iteration so all 8 `qh` bits are
+/// consumed across the 4×2 halves.
+pub fn dequantize_q5_k_block(block: &BlockQ5K) -> [f32; 256] {
+    let d = f16::from_bits(block.d).to_f32();
+    let dmin = f16::from_bits(block.dmin).to_f32();
+    let (sc, mn) = decode_q4km_scales(&block.scales);
+    let ql = &block.qs; // low 4 bits
+    let qh = &block.qh; // high (5th) bit
+
+    let mut out = [0.0f32; 256];
+    let mut qi = 0usize; // index into ql (qs), advances by 32 each iteration
+    let mut yi = 0usize; // output index
+    let mut u1: u8 = 1;
+    let mut u2: u8 = 2;
+
+    for j in 0..4 {
+        let d1 = d * sc[j * 2] as f32;
+        let m1 = dmin * mn[j * 2] as f32;
+        let d2 = d * sc[j * 2 + 1] as f32;
+        let m2 = dmin * mn[j * 2 + 1] as f32;
+
+        for l in 0..32 {
+            let hi = if qh[l] & u1 != 0 { 16.0 } else { 0.0 };
+            out[yi + l] = d1 * ((ql[qi + l] & 0xF) as f32 + hi) - m1;
+        }
+        for l in 0..32 {
+            let hi = if qh[l] & u2 != 0 { 16.0 } else { 0.0 };
+            out[yi + l + 32] = d2 * ((ql[qi + l] >> 4) as f32 + hi) - m2;
+        }
+        qi += 32;
+        yi += 64;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+
+    out
+}
+
+/// Dequantize a row of Q5_K blocks. `src` is raw bytes, `dst` is f32 output.
+pub fn dequantize_q5_k_row(src: &[u8], dst: &mut [f32]) {
+    let block_size = size_of::<BlockQ5K>();
+    let n_blocks = src.len() / block_size;
+    debug_assert_eq!(src.len() % block_size, 0);
+    debug_assert_eq!(dst.len(), n_blocks * 256);
+
+    for i in 0..n_blocks {
+        let block_bytes = &src[i * block_size..(i + 1) * block_size];
+        // SAFETY: BlockQ5K is repr(C, packed) and we've verified the slice length
+        let block = unsafe { &*(block_bytes.as_ptr() as *const BlockQ5K) };
+        let values = dequantize_q5_k_block(block);
+        dst[i * 256..(i + 1) * 256].copy_from_slice(&values);
+    }
+}
+
+/// Dot product of a Q5_K block with an f32 vector of length 256. Scalar version.
+///
+/// Same accumulation structure as `vec_dot_q4_k_m_f32_scalar`, extended with
+/// the `qh` 5th-bit plane. Mathematically equal to `dot(dequant(block), y)`.
+pub fn vec_dot_q5_k_f32_scalar(block: &BlockQ5K, y: &[f32]) -> f32 {
+    debug_assert_eq!(y.len(), 256);
+
+    let d = f16::from_bits(block.d).to_f32();
+    let dmin = f16::from_bits(block.dmin).to_f32();
+    let (sc, mn) = decode_q4km_scales(&block.scales);
+    let ql = &block.qs;
+    let qh = &block.qh;
+
+    let mut sumf = 0.0f32;
+    let mut qi = 0usize;
+    let mut yi = 0usize;
+    let mut u1: u8 = 1;
+    let mut u2: u8 = 2;
+
+    for j in 0..4 {
+        let sc1 = sc[j * 2] as f32;
+        let mn1 = mn[j * 2] as f32;
+        let sc2 = sc[j * 2 + 1] as f32;
+        let mn2 = mn[j * 2 + 1] as f32;
+
+        let mut sum1 = 0.0f32;
+        let mut sum2 = 0.0f32;
+        let mut sum_mn1 = 0.0f32;
+        let mut sum_mn2 = 0.0f32;
+
+        for l in 0..32 {
+            let hi1 = if qh[l] & u1 != 0 { 16.0 } else { 0.0 };
+            let hi2 = if qh[l] & u2 != 0 { 16.0 } else { 0.0 };
+            let q1 = (ql[qi + l] & 0xF) as f32 + hi1;
+            let q2 = (ql[qi + l] >> 4) as f32 + hi2;
+            sum1 += q1 * y[yi + l];
+            sum2 += q2 * y[yi + l + 32];
+            sum_mn1 += y[yi + l];
+            sum_mn2 += y[yi + l + 32];
+        }
+
+        sumf += d * (sc1 * sum1 + sc2 * sum2) - dmin * (mn1 * sum_mn1 + mn2 * sum_mn2);
+        qi += 32;
+        yi += 64;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+
+    sumf
+}
+
+/// Dot product of a Q5_K block with an f32 vector. Dispatches to best available impl.
+pub fn vec_dot_q5_k_f32(block: &BlockQ5K, y: &[f32]) -> f32 {
+    vec_dot_q5_k_f32_scalar(block, y)
 }
 
 // ── Dispatch functions ──────────────────────────────────────────────────────
@@ -869,6 +1009,119 @@ mod tests {
         assert!(
             (got - expected).abs() < 1e-2,
             "vec_dot Q6_K mismatch: got {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn test_q5_k_block_is_176_bytes() {
+        // Guards the repr(C, packed) field order/size against silent drift —
+        // the row/vec_dot code reinterprets raw GGUF bytes as BlockQ5K.
+        assert_eq!(size_of::<BlockQ5K>(), 176);
+    }
+
+    #[test]
+    fn test_dequantize_q5_k_all_zero_quants() {
+        // qs=0 (low nibble 0), qh=0 (5th bit 0) → every quant is 0, so each
+        // output = d1*0 - m1 = -min. With dmin=0 the whole block is 0.0.
+        let mut block = BlockQ5K {
+            d: f16::from_f32(1.0).to_bits(),
+            dmin: f16::from_f32(0.0).to_bits(),
+            scales: [0u8; 12],
+            qh: [0u8; 32],
+            qs: [0u8; 128],
+        };
+        // sc[0..4]=1, mn[0..4]=0 (bytes 0-3 hold sc low6, bytes 4-7 hold mn low6)
+        for s in block.scales.iter_mut().take(4) {
+            *s = 1;
+        }
+        let out = dequantize_q5_k_block(&block);
+        for (i, &v) in out.iter().enumerate() {
+            assert!(v.abs() < 1e-5, "expected ~0.0 at {i}, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_dequantize_q5_k_high_bit_extends_range() {
+        // A single quant with low nibble = 0xF and its qh bit set must decode to
+        // (15 + 16) = 31, i.e. the 5-bit max — proving the qh plane is applied.
+        // Value 0 is the first low-nibble sub-block (selector u1 = bit 0 of qh[0]).
+        let mut block = BlockQ5K {
+            d: f16::from_f32(1.0).to_bits(),
+            dmin: f16::from_f32(0.0).to_bits(),
+            scales: [0u8; 12],
+            qh: [0u8; 32],
+            qs: [0u8; 128],
+        };
+        block.scales[0] = 1; // sc[0] = 1
+        block.qs[0] = 0x0F; // value 0: low nibble = 15
+        block.qh[0] = 0x01; // value 0: 5th bit set → +16
+        let out = dequantize_q5_k_block(&block);
+        assert!(
+            (out[0] - 31.0).abs() < 1e-4,
+            "expected 31.0 (15 + 16) at index 0, got {}",
+            out[0]
+        );
+        // Without the high bit, value 1 (low nibble of qs[1]=0) stays 0.
+        assert!(
+            out[1].abs() < 1e-4,
+            "expected 0.0 at index 1, got {}",
+            out[1]
+        );
+    }
+
+    #[test]
+    fn test_vec_dot_q5_k_matches_dequantize() {
+        // vec_dot must equal dot(dequant(block), y) for varied scales/quants/qh.
+        let mut block = BlockQ5K {
+            d: f16::from_f32(0.5).to_bits(),
+            dmin: f16::from_f32(0.125).to_bits(),
+            scales: [0u8; 12],
+            qh: [0u8; 32],
+            qs: [0u8; 128],
+        };
+        // Varied 6-bit scales/mins across the 12 packed bytes.
+        for (i, s) in block.scales.iter_mut().enumerate() {
+            *s = ((i * 7 + 3) % 64) as u8;
+        }
+        for (i, b) in block.qs.iter_mut().enumerate() {
+            *b = ((i % 7) as u8) | (((i % 11) as u8) << 4);
+        }
+        for (i, b) in block.qh.iter_mut().enumerate() {
+            *b = ((i * 37) % 256) as u8;
+        }
+
+        let y: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.01).collect();
+
+        let dequantized = dequantize_q5_k_block(&block);
+        let expected: f32 = dequantized.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
+        let got = vec_dot_q5_k_f32(&block, &y);
+
+        assert!(
+            (got - expected).abs() < 1e-2,
+            "vec_dot Q5_K mismatch: got {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn test_dequantize_q5_k_row_multiple_blocks() {
+        // Two blocks back-to-back must dequantize independently into 512 floats.
+        let mut bytes = vec![0u8; 2 * size_of::<BlockQ5K>()];
+        // Block 0 d=1.0 at offset 0..2; block 1 d=2.0 at offset 176..178.
+        bytes[0..2].copy_from_slice(&f16::from_f32(1.0).to_bits().to_le_bytes());
+        let b1 = size_of::<BlockQ5K>();
+        bytes[b1..b1 + 2].copy_from_slice(&f16::from_f32(2.0).to_bits().to_le_bytes());
+        // sc[0]=1 for both blocks (scales byte 0 is at offset 4 within each block).
+        bytes[4] = 1;
+        bytes[b1 + 4] = 1;
+        // One nonzero quant in block 1 (value 0, low nibble 3, no high bit).
+        bytes[b1 + 4 + 12 + 32] = 0x03; // qs starts after d,dmin,scales,qh
+        let mut dst = vec![0.0f32; 512];
+        dequantize_q5_k_row(&bytes, &mut dst);
+        // Block 1's value 0 = d(2.0) * sc(1) * 3 = 6.0.
+        assert!(
+            (dst[256] - 6.0).abs() < 1e-3,
+            "expected 6.0 at block-1 value 0, got {}",
+            dst[256]
         );
     }
 

@@ -8,6 +8,7 @@ pub enum DType {
     U8,
     Q4_0,
     Q4KM,
+    Q5KM,
     Q8_0,
     Q6K,
 }
@@ -22,7 +23,7 @@ impl DType {
             DType::BF16 => Some(2),
             DType::I32 => Some(4),
             DType::U8 => Some(1),
-            DType::Q4_0 | DType::Q4KM | DType::Q8_0 | DType::Q6K => None,
+            DType::Q4_0 | DType::Q4KM | DType::Q5KM | DType::Q8_0 | DType::Q6K => None,
         }
     }
 
@@ -31,6 +32,7 @@ impl DType {
         match self {
             DType::Q4_0 => 32,
             DType::Q4KM => 256,
+            DType::Q5KM => 256,
             DType::Q8_0 => 32,
             DType::Q6K => 256,
             _ => 1,
@@ -42,6 +44,7 @@ impl DType {
         match self {
             DType::Q4_0 => 18,
             DType::Q4KM => 144,
+            DType::Q5KM => 176,
             DType::Q8_0 => 34,
             DType::Q6K => 210,
             DType::F32 => 4,
@@ -154,6 +157,11 @@ impl Tensor {
                 crate::quant::dequantize_q4_k_m_row(&self.data, &mut out);
                 out
             }
+            DType::Q5KM => {
+                let mut out = vec![0.0f32; self.numel()];
+                crate::quant::dequantize_q5_k_row(&self.data, &mut out);
+                out
+            }
             DType::Q6K => {
                 let mut out = vec![0.0f32; self.numel()];
                 crate::quant::dequantize_q6_k_row(&self.data, &mut out);
@@ -192,6 +200,9 @@ mod tests {
         assert_eq!(DType::Q8_0.block_bytes(), 34);
         assert_eq!(DType::Q4KM.block_size(), 256);
         assert_eq!(DType::Q4KM.block_bytes(), 144);
+        assert_eq!(DType::Q5KM.block_size(), 256);
+        assert_eq!(DType::Q5KM.block_bytes(), 176);
+        assert_eq!(DType::Q5KM.element_size(), None);
         assert_eq!(DType::F32.element_size(), Some(4));
     }
 }
