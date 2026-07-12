@@ -679,6 +679,102 @@ pub(crate) mod neon {
         }
     }
 
+    /// NEON Q4_K × Q8_0 integer GEMV with pre-quantized input.
+    ///
+    /// Q4_K superblock = 256 values = 8 sub-blocks of 32, each with a 6-bit
+    /// scale `sc` and 6-bit min `mn`. Dequant is `w = d·sc·q − dmin·mn` (q in
+    /// 0..15, no zero-point offset). Dotting a weight row with activations x
+    /// gives, per sub-block s: `d·sc_s·Σ(q·xq) − dmin·mn_s·Σ(xq)`, then scaled by
+    /// the Q8_0 input scale `xs[s]`. Q8_0 input blocks are 32-wide, aligning 1:1
+    /// with the sub-blocks; `Σ(xq)` (the min term) is `vdotq_s32` against an
+    /// all-ones vector. The nibble/scale layout mirrors `vec_dot_q4_k_m_f32`:
+    /// 4 groups of 64 values over 32 qs bytes, low nibble → sub-block 2j, high
+    /// nibble → sub-block 2j+1.
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn gemv_q4k_q8_0_neon_dotprod(
+        a_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(k % 256, 0, "Q4_K GEMV: k must be divisible by 256");
+        unsafe {
+            let blocks_per_row = k / 256;
+            let row_bytes = blocks_per_row * size_of::<BlockQ4KM>();
+            let a_base = a_quant.as_ptr() as usize;
+            let xq_base = x_quants.as_ptr() as usize;
+            let xs_base = x_scales.as_ptr() as usize;
+
+            let compute_row = move |(i, yi): (usize, &mut f32)| unsafe {
+                let row_start = i * row_bytes;
+                let mask_0f = vdupq_n_u8(0x0F);
+                let ones = vdupq_n_s8(1);
+                let z = vdupq_n_s32(0);
+                let mut sumf = 0.0f32;
+
+                for bi in 0..blocks_per_row {
+                    let blk =
+                        &*((a_base + row_start + bi * size_of::<BlockQ4KM>()) as *const BlockQ4KM);
+                    let d = f16::from_bits(blk.d).to_f32();
+                    let dmin = f16::from_bits(blk.dmin).to_f32();
+
+                    // Decode the 8 sub-block 6-bit scales and mins (shared with
+                    // the scalar/f32 paths, so the packing can't drift).
+                    let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
+
+                    let qs = blk.qs.as_ptr();
+                    let xq_off = bi * 256;
+
+                    for j in 0..4 {
+                        let qb0 = vld1q_u8(qs.add(j * 32));
+                        let qb1 = vld1q_u8(qs.add(j * 32 + 16));
+
+                        // Low nibbles → sub-block 2j; high nibbles → sub-block 2j+1.
+                        // 4-bit quants are 0..15, so they stay positive as i8.
+                        let wlo0 = vreinterpretq_s8_u8(vandq_u8(qb0, mask_0f));
+                        let wlo1 = vreinterpretq_s8_u8(vandq_u8(qb1, mask_0f));
+                        let whi0 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb0));
+                        let whi1 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb1));
+
+                        let sblo = 2 * j;
+                        let sbhi = 2 * j + 1;
+                        let xlo0 = vld1q_s8((xq_base as *const i8).add(xq_off + sblo * 32));
+                        let xlo1 = vld1q_s8((xq_base as *const i8).add(xq_off + sblo * 32 + 16));
+                        let xhi0 = vld1q_s8((xq_base as *const i8).add(xq_off + sbhi * 32));
+                        let xhi1 = vld1q_s8((xq_base as *const i8).add(xq_off + sbhi * 32 + 16));
+
+                        // Σ(q·xq) per sub-block (integer dot).
+                        let dp_lo = vaddvq_s32(vdotq_s32(vdotq_s32(z, wlo0, xlo0), wlo1, xlo1));
+                        let dp_hi = vaddvq_s32(vdotq_s32(vdotq_s32(z, whi0, xhi0), whi1, xhi1));
+                        // Σ(xq) per sub-block (min term), via dot with all-ones.
+                        let sx_lo = vaddvq_s32(vdotq_s32(vdotq_s32(z, ones, xlo0), ones, xlo1));
+                        let sx_hi = vaddvq_s32(vdotq_s32(vdotq_s32(z, ones, xhi0), ones, xhi1));
+
+                        let xs_lo = *(xs_base as *const f32).add((xq_off + sblo * 32) / 32);
+                        let xs_hi = *(xs_base as *const f32).add((xq_off + sbhi * 32) / 32);
+
+                        sumf += xs_lo
+                            * (d * sc[sblo] as f32 * dp_lo as f32
+                                - dmin * mn[sblo] as f32 * sx_lo as f32);
+                        sumf += xs_hi
+                            * (d * sc[sbhi] as f32 * dp_hi as f32
+                                - dmin * mn[sbhi] as f32 * sx_hi as f32);
+                    }
+                }
+
+                *yi = sumf;
+            };
+
+            if y.len() >= super::super::cpu::gemv_par_threshold() {
+                crate::backend::cpu::par_rows(y, crate::backend::cpu::gemv_min_rows(), compute_row);
+            } else {
+                y.iter_mut().enumerate().for_each(compute_row);
+            }
+        }
+    }
+
     /// Batched GEMM: C[m, n] = A_q4_0[m, k] @ B_q8_0[k, n].
     ///
     /// `b_scales` layout: n columns × blocks_per_col, i.e. b_scales[j * nb + b]
@@ -1040,6 +1136,38 @@ pub(crate) mod neon {
             }
         } else {
             gemv_q6k_fallback(a_quant, x, y, k);
+        }
+    }
+
+    /// NEON Q4_K GEMV: y[m] = A_q4_k[m,k] @ x_f32[k]. Quantizes x to Q8_0 into
+    /// the caller-provided scratch then runs the integer dotprod kernel; on
+    /// baseline NEON (no FEAT_DotProd) it defers to the exact-f32
+    /// `backend::cpu::gemv_q4km_f32`.
+    pub unsafe fn gemv_q4k_f32_neon(
+        a_quant: &[u8],
+        x: &[f32],
+        y: &mut [f32],
+        _m: usize,
+        k: usize,
+        q8_scales: &mut Vec<f32>,
+        q8_quants: &mut Vec<i8>,
+    ) {
+        // Shape checks matching the scalar `gemv_q4km_f32`; in particular
+        // `k % 256 == 0`, else `blocks_per_row = k / 256` would silently
+        // truncate the row instead of failing.
+        debug_assert_eq!(x.len(), k);
+        debug_assert_eq!(y.len(), _m);
+        debug_assert_eq!(k % 256, 0, "Q4_K GEMV: k must be divisible by 256");
+        if cpu_features().tier >= CpuTier::NeonDotprod {
+            unsafe {
+                let n_blocks = k / 32;
+                q8_scales.resize(n_blocks, 0.0);
+                q8_quants.resize(k, 0);
+                quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
+                gemv_q4k_q8_0_neon_dotprod(a_quant, q8_scales, q8_quants, y, _m, k);
+            }
+        } else {
+            crate::backend::cpu::gemv_q4km_f32(a_quant, x, y, _m, k);
         }
     }
 
@@ -1707,6 +1835,78 @@ pub(crate) mod neon {
             let mut y_fb = vec![0.0f32; m];
             gemv_q6k_fallback(&a, &xf, &mut y_fb, k);
             assert_close(&y_dot, &y_fb);
+        }
+
+        fn random_q4km(st: &mut u64) -> BlockQ4KM {
+            let mut scales = [0u8; 12];
+            let mut qs = [0u8; 128];
+            for b in scales.iter_mut() {
+                *b = (lcg(st).abs() * 255.0) as i32 as u8;
+            }
+            for b in qs.iter_mut() {
+                *b = (lcg(st).abs() * 255.0) as i32 as u8;
+            }
+            BlockQ4KM {
+                d: f16::from_f32(0.02 + lcg(st).abs() * 0.05).to_bits(),
+                dmin: f16::from_f32(0.01 + lcg(st).abs() * 0.03).to_bits(),
+                scales,
+                qs,
+            }
+        }
+
+        #[test]
+        fn q4k_gemv_dotprod_matches_scalar() {
+            if !require_simd_or_skip("dotprod", cpu_features().dotprod) {
+                return;
+            }
+            // 2 super-blocks/row (k=512) × 5 rows: exercises multi-block
+            // accumulation and the per-sub-block scale/min indexing.
+            let (m, k, nb) = (5usize, 512usize, 2usize);
+            let mut st = 0xcafe_f00du64;
+            let blocks: Vec<BlockQ4KM> = (0..m * nb).map(|_| random_q4km(&mut st)).collect();
+            let a = blocks_to_bytes(&blocks);
+            let x: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+            let (xs, xq) = quantize_col(&x);
+
+            let mut y_dot = vec![0.0f32; m];
+            unsafe { gemv_q4k_q8_0_neon_dotprod(&a, &xs, &xq, &mut y_dot, m, k) };
+            // The scalar path consumes the SAME quantized activations
+            // (reconstructed to f32), so the integer-dot and scalar/f32 paths
+            // agree up to fp accumulation order.
+            let xf = reconstruct_q8_0_input(&xs, &xq, k);
+            let mut y_fb = vec![0.0f32; m];
+            crate::backend::cpu::gemv_q4km_f32(&a, &xf, &mut y_fb, m, k);
+            assert_close(&y_dot, &y_fb);
+        }
+
+        #[test]
+        fn q4k_gemv_wrapper_matches_exact_f32() {
+            if !require_simd_or_skip("dotprod", cpu_features().dotprod) {
+                return;
+            }
+            // End-to-end: the wrapper quantizes x to Q8_0 internally, so compare
+            // against the exact-f32 reference with a tolerance that admits the
+            // ~1% relative error of Q8_0 activation quantization.
+            let (m, k, nb) = (4usize, 256usize, 1usize);
+            let mut st = 0x00c0_ffeeu64;
+            let blocks: Vec<BlockQ4KM> = (0..m * nb).map(|_| random_q4km(&mut st)).collect();
+            let a = blocks_to_bytes(&blocks);
+            let x: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+
+            let mut s = Vec::new();
+            let mut q = Vec::new();
+            let mut y_dot = vec![0.0f32; m];
+            unsafe { gemv_q4k_f32_neon(&a, &x, &mut y_dot, m, k, &mut s, &mut q) };
+
+            let mut y_exact = vec![0.0f32; m];
+            crate::backend::cpu::gemv_q4km_f32(&a, &x, &mut y_exact, m, k);
+
+            for (i, (&yd, &ye)) in y_dot.iter().zip(&y_exact).enumerate() {
+                assert!(
+                    (yd - ye).abs() <= 3e-2 * (1.0 + ye.abs()),
+                    "row {i}: dotprod={yd} exact={ye}"
+                );
+            }
         }
 
         #[test]

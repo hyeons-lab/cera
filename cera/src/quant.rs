@@ -254,7 +254,7 @@ pub fn vec_dot_q8_0_f32_scalar(block: &BlockQ8_0, y: &[f32]) -> f32 {
 ///           m  = (scales[j+4] >> 4)   | ((scales[j-0] >> 6) << 4)
 ///
 /// Returns (scales[8], mins[8]).
-fn decode_q4km_scales(scales: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
+pub(crate) fn decode_q4km_scales(scales: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
     let mut sc = [0u8; 8];
     let mut mn = [0u8; 8];
 
