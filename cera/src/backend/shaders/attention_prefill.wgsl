@@ -1,7 +1,8 @@
 // Batched attention prefill: N queries × n_heads in one dispatch.
 //
-// One workgroup per (head, query) pair, mirroring the structure of the
-// per-query `attention.wgsl` but with:
+// One workgroup per (head, query) pair. Structurally a per-query decode
+// attention (materialized scores → softmax → weighted V sum), extended to a
+// batch of queries with:
 //   - Per-query position for the causal mask (`pos_q = start_pos + q_idx`):
 //     score for token t > pos_q is -∞ before softmax.
 //   - Batched Q input (n_queries × q_stride floats, head h at offset
@@ -19,7 +20,7 @@
 // PR 2.C-full has a working batched signature to wire forward_prefill
 // against.
 //
-// Constraint (matches `attention.wgsl`): seq_len ≤ 65536 and
+// Constraint: seq_len ≤ 65536 and
 // `head_dim` is the per-head dimension implied by `params.head_dim`.
 //
 // Contract: caller MUST pass `max_seq ≥ start_pos + n_queries`. The K/V
