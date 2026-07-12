@@ -1,6 +1,8 @@
 // Q4_K (Q4_K_M) GEMV — port of gemv_q4_k.metal to the workgroup-reduction idiom
-// used by gemv_q6_k.wgsl (WGSL has no portable simd_sum). Matches cera's
-// `dequantize_q4_k_m_block` (quant.rs) bit-for-bit.
+// used by gemv_q6_k.wgsl (WGSL has no portable simd_sum). The per-element
+// dequant matches cera's `dequantize_q4_k_m_block` (quant.rs); the final GEMV
+// sum matches the CPU path within f32 roundoff (the parallel reduction changes
+// accumulation order), which the tolerance-based parity test allows.
 //
 // Q4_K super-block: 256 elements, 144 bytes:
 //   d      — f16 super-block scale (bytes 0..2)
@@ -22,6 +24,10 @@
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<storage, read> params: vec2<u32>;
+
+// `get_wid` flattens the 2-D dispatch grid so m > 65535*NR rows still map to
+// distinct rows (gemv_workgroups folds the row overflow into wid.y).
+#include "common_decls.tmpl"
 
 const QK_K: u32 = 256u;
 const Q4K_BYTES: u32 = 144u;
@@ -68,7 +74,7 @@ fn gemv_q4_k(
     let nb = k / QK_K;
     let row_bytes = nb * Q4K_BYTES;
     let tiisg = lid.x;
-    let first_row = wid.x * NR;
+    let first_row = get_wid(wid) * NR;
 
     let e0 = tiisg * 8u;      // 0,8,...,248 across the 256-element block
     let j = e0 / 64u;         // 0..3

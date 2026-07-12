@@ -2611,8 +2611,9 @@ mod tests {
 
     /// Q4_K (Q4_K_M) GEMV parity: synthesize Q4_K blocks, dequantize on CPU with
     /// the production `dequantize_q4_k_m_block`, GEMV on the wgpu `gemv_q4_k`
-    /// kernel, compare. Guards the B2 wiring (Q4KM stays quantized on the GPU and
-    /// is served by `gemv_q4_k` in `gemv_pipeline_rows_label`, NR=2 → ceil(m/2)).
+    /// kernel, compare. Validates the `gemv_q4_k` shader itself (the kernel
+    /// `gemv_pipeline_rows_label` dispatches for Q4KM, NR=2 → ceil(m/2)); it runs
+    /// the pipeline directly and does not exercise `GpuLfm2Model`'s host dispatch.
     #[test]
     fn test_gpu_gemv_q4_k() {
         use crate::quant::{BlockQ4KM, dequantize_q4_k_m_block};
@@ -2932,9 +2933,10 @@ mod tests {
 
     /// Q4_K (Q4_K_M) batched GEMM parity: synthesize Q4_K blocks, dequantize on
     /// CPU with `dequantize_q4_k_m_block`, run the wgpu `gemm_q4_k` kernel over a
-    /// multi-token batch with padded x_stride/y_stride, compare. Guards the B2
-    /// batched-prefill wiring (ROWS_PER_WG=8 → dispatch ceil(m/8)); m not a
-    /// multiple of 8 exercises the partial row tile.
+    /// multi-token batch with padded x_stride/y_stride, compare. Validates the
+    /// `gemm_q4_k` shader itself (ROWS_PER_WG=8 → dispatch ceil(m/8), strides,
+    /// partial tiles when m is not a multiple of 8); it runs the pipeline directly
+    /// and does not exercise `GpuLfm2Model`'s host-side batched-prefill gating.
     #[test]
     fn test_gpu_gemm_q4_k_parity() {
         use crate::quant::{BlockQ4KM, dequantize_q4_k_m_block};
