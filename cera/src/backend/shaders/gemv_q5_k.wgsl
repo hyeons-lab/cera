@@ -1,6 +1,7 @@
 // Q5_K GEMV: y[row] = Σ dequant(W_q5k[row, i]) × x[i].
-// Matches cera's `dequantize_q5_k_block` / `vec_dot_q5_k_f32_scalar` (quant.rs)
-// bit-for-bit.
+// Uses the same dequant as cera's `dequantize_q5_k_block` /
+// `vec_dot_q5_k_f32_scalar` (quant.rs); results match up to floating-point
+// roundoff from the parallel (workgroup) reduction order.
 //
 // Q5_K super-block: 256 elements, 176 bytes:
 //   d      — f16 super-block scale                 (bytes 0..2)
@@ -80,6 +81,14 @@ fn gemv_q5_k(
 
     for (var row = 0u; row < NR; row += 1u) {
         let rr = first_row + row;
+        // Skip the odd-tail row (rr == m when m is not a multiple of NR): its
+        // y write is already guarded below, and skipping avoids out-of-range
+        // weight-buffer reads. `partials` is zero-initialized, so the reduction
+        // treats the skipped row as 0. `partials[0]` (row 0) is always valid —
+        // the dispatch count ceil(m/NR) guarantees first_row < m.
+        if rr >= m {
+            continue;
+        }
         var acc: f32 = 0.0;
         for (var ib = 0u; ib < nb; ib += 1u) {
             let blk = rr * row_bytes + ib * Q5K_BYTES;
