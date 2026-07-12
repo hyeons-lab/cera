@@ -5,12 +5,29 @@
 //
 // Dispatch: (ceil(m/8), 1, 1) workgroups
 
+// Weight A. With `F16_A` defined (the `gemv_f16` pipeline) it is stored as f16,
+// two values per u32, so the LM head takes half the VRAM; activations (`x`) and
+// accumulation stay f32. Without it (`gemv_f32`) A is plain f32.
+#ifdef F16_A
+@group(0) @binding(0) var<storage, read> a: array<u32>;
+#else
 @group(0) @binding(0) var<storage, read> a: array<f32>;
+#endif
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<storage, read> params: vec4<u32>;
 
 #include "common_decls.tmpl"
+
+// Load weight element `idx` of the row-major A[m, k] as f32.
+fn load_a(idx: u32) -> f32 {
+#ifdef F16_A
+    let pair = unpack2x16float(a[idx / 2u]);
+    return select(pair.y, pair.x, (idx & 1u) == 0u);
+#else
+    return a[idx];
+#endif
+}
 
 const NR: u32 = 8u;
 const WG_SIZE: u32 = 32u;
@@ -39,7 +56,7 @@ fn gemv_f32(
         let xv = x[col];
         for (var r = 0u; r < NR; r += 1u) {
             if r0 + r < m {
-                sums[r] += a[(r0 + r) * k + col] * xv;
+                sums[r] += load_a((r0 + r) * k + col) * xv;
             }
         }
         col += 32u;
@@ -95,7 +112,7 @@ fn gemv_f32_accum(
         let xv = x[col];
         for (var r = 0u; r < NR; r += 1u) {
             if r0 + r < m {
-                sums[r] += a[(r0 + r) * k + col] * xv;
+                sums[r] += load_a((r0 + r) * k + col) * xv;
             }
         }
         col += 32u;
