@@ -3,7 +3,8 @@
 // 8 rows per workgroup, 32 threads. x is loaded once per WG
 // and reused across 8 rows — 8× less x bandwidth than 1-row-per-WG.
 //
-// Dispatch: (ceil(m/8), 1, 1) workgroups
+// Dispatch: 2-D grid (ceil(m/8) folded across x/y via `get_wid`) so m > 65535*8
+// rows still map to distinct rows.
 
 // Weight A. With `F16_A` defined (the `gemv_f16` pipeline) it is stored as f16,
 // two values per u32, so the LM head takes half the VRAM; activations (`x`) and

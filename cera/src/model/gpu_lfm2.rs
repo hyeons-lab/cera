@@ -443,7 +443,7 @@ pub struct GpuLfm2Model {
     // — 7 u32, updated per token; must stay in sync with rope.wgsl's params array.
     rope_params: wgpu::Buffer,
     attn_params: wgpu::Buffer, // [n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale, 0, 0] — updated per token
-    gemv_f32_tile_params: Vec<wgpu::Buffer>, // [rows, k, row_base, 0] per output-projection tile
+    gemv_tile_params: Vec<wgpu::Buffer>, // [rows, k, row_base, 0] per output-projection tile
     // Conv scratch
     conv_proj_buf: wgpu::Buffer, // [3 × hidden_size]
     conv_gate_buf: wgpu::Buffer, // [hidden_size] — fused conv writes here, out_proj reads
@@ -1031,18 +1031,17 @@ impl GpuLfm2Model {
         };
         let attn_params = ctx.create_storage_rw(8 * 4, "attn_params");
         // The LM head is stored as f16 (2 bytes/elem) — see `encode_gemv_f16`.
-        let gemv_f32_tile_rows = gemv_tile_rows(
+        let lm_head_tile_rows = gemv_tile_rows(
             config.vocab_size as u32,
             hs as u32,
             ctx.max_storage_buffer_binding_size,
             ctx.min_storage_buffer_offset_alignment,
             2,
         );
-        let gemv_f32_tile_count = (config.vocab_size as u32).div_ceil(gemv_f32_tile_rows);
-        let mut gemv_f32_tile_params = Vec::with_capacity(gemv_f32_tile_count as usize);
-        for i in 0..gemv_f32_tile_count {
-            gemv_f32_tile_params
-                .push(ctx.create_storage_rw(4 * 4, &format!("gemv_f32_tile_params.{i}")));
+        let lm_head_tile_count = (config.vocab_size as u32).div_ceil(lm_head_tile_rows);
+        let mut gemv_tile_params = Vec::with_capacity(lm_head_tile_count as usize);
+        for i in 0..lm_head_tile_count {
+            gemv_tile_params.push(ctx.create_storage_rw(4 * 4, &format!("gemv_tile_params.{i}")));
         }
 
         // Argmax I/O buffers. `argmax_params` is uploaded once with
@@ -1131,7 +1130,7 @@ impl GpuLfm2Model {
             per_head_norm_params,
             rope_params,
             attn_params,
-            gemv_f32_tile_params,
+            gemv_tile_params,
             conv_proj_buf,
             conv_gate_buf,
             prefill_batch_buf,
@@ -1715,9 +1714,9 @@ impl GpuLfm2Model {
             let rows = (m - row_start).min(tile_rows);
             let weight_offset = u64::from(row_start) * row_bytes;
             let params_buf = self
-                .gemv_f32_tile_params
+                .gemv_tile_params
                 .get(tile_idx)
-                .expect("preallocated f32 GEMV tile params");
+                .expect("preallocated LM-head GEMV tile params");
             self.ctx.queue.write_buffer(
                 params_buf,
                 0,
@@ -1735,7 +1734,14 @@ impl GpuLfm2Model {
                             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                 buffer: weight,
                                 offset: weight_offset,
-                                size: wgpu::BufferSize::new(u64::from(rows) * row_bytes),
+                                // Bind as `array<u32>` (f16 packed 2/u32), so the
+                                // size must be a whole number of u32s. A final tile
+                                // whose `rows*k` is odd (only when `k` is odd) would
+                                // otherwise be 2-mod-4 and drop its last f16 pair;
+                                // round up (the buffer is 4-byte padded at upload).
+                                size: wgpu::BufferSize::new(
+                                    (u64::from(rows) * row_bytes).div_ceil(4) * 4,
+                                ),
                             }),
                         },
                         wgpu::BindGroupEntry {
@@ -4771,34 +4777,51 @@ mod tests {
         assert_eq!(gemv_tile_rows(1000, 512, 1 << 30, 256, 2), 1000);
         assert_eq!(gemv_tile_rows(1000, 512, 1 << 30, 256, 4), 1000);
 
-        // `k` chosen so a row is NOT a multiple of the offset alignment, so the
-        // row-alignment rounding actually does work (row_bytes=200, align=256 →
-        // gcd 8 → rows must be a multiple of 32).
+        // `k` values chosen so a row is NOT a multiple of the offset alignment,
+        // so the row-alignment rounding actually does work: k=100 (row_bytes 200
+        // for f16, gcd 8 with 256) and k=99 — odd, so the f16 row_bytes 198 is
+        // 2-mod-4, exercising the non-whole-u32 row case the round-up in
+        // `encode_gemv_f16_tiled` guards.
         let m = 131_072u32;
-        let k = 100u32;
         let align = 256u64;
-        for &elem in &[2u64, 4u64] {
-            let row_bytes = u64::from(k) * elem;
-            for &max_binding in &[1u64 << 20, 4 << 20, 512 << 10] {
-                let rows = gemv_tile_rows(m, k, max_binding, align, elem);
-                assert!(rows > 0, "elem={elem} max={max_binding}");
-                assert!(
-                    u64::from(rows) * row_bytes <= max_binding,
-                    "tile exceeds max_binding (elem={elem}, max={max_binding})",
-                );
-                // Offsets are multiples of `rows * row_bytes`, so that product must
-                // be a multiple of the offset alignment.
-                assert_eq!(
-                    (u64::from(rows) * row_bytes) % align,
-                    0,
-                    "tile byte size not offset-aligned (elem={elem}, max={max_binding})",
-                );
+        for &k in &[100u32, 99u32] {
+            for &elem in &[2u64, 4u64] {
+                let row_bytes = u64::from(k) * elem;
+                for &max_binding in &[1u64 << 20, 4 << 20, 512 << 10] {
+                    let rows = gemv_tile_rows(m, k, max_binding, align, elem);
+                    assert!(rows > 0, "k={k} elem={elem} max={max_binding}");
+                    assert!(
+                        u64::from(rows) * row_bytes <= max_binding,
+                        "tile exceeds max_binding (k={k}, elem={elem}, max={max_binding})",
+                    );
+                    // Offsets are multiples of `rows * row_bytes`, so that product
+                    // must be a multiple of the offset alignment.
+                    assert_eq!(
+                        (u64::from(rows) * row_bytes) % align,
+                        0,
+                        "tile byte size not offset-aligned (k={k}, elem={elem}, max={max_binding})",
+                    );
+                    // The final tile's binding size is rounded up to a whole u32
+                    // (`array<u32>` view). Offset + rounded size must still land
+                    // inside the 4-byte-padded weight buffer.
+                    let final_rows = m % rows;
+                    if final_rows > 0 {
+                        let offset = u64::from(m - final_rows) * row_bytes;
+                        let bound = (u64::from(final_rows) * row_bytes).div_ceil(4) * 4;
+                        let padded_buf = (u64::from(m) * row_bytes).div_ceil(4) * 4;
+                        assert_eq!(offset % 4, 0, "offset not u32-aligned (k={k}, elem={elem})");
+                        assert!(
+                            offset + bound <= padded_buf,
+                            "final tile rounded binding overruns padded buffer (k={k}, elem={elem})",
+                        );
+                    }
+                }
             }
         }
 
         // Same head, same binding: f16 packs at least as many rows per tile as f32.
         let mb = 1u64 << 20;
-        assert!(gemv_tile_rows(m, k, mb, align, 2) >= gemv_tile_rows(m, k, mb, align, 4));
+        assert!(gemv_tile_rows(m, 100, mb, align, 2) >= gemv_tile_rows(m, 100, mb, align, 4));
     }
 
     /// `encode_copy` treats all three args as f32-element COUNTS: source float
