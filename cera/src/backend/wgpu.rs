@@ -718,6 +718,7 @@ pub mod shaders {
     pub const QK_NORM_ROPE_BATCH: &str = include_str!("shaders/qk_norm_rope_batch.wgsl");
     pub const CONV1D_FUSED_BATCH: &str = include_str!("shaders/conv1d_fused_batch.wgsl");
     pub const GEMM_Q4_0: &str = include_str!("shaders/gemm_q4_0.wgsl");
+    pub const GEMM_Q4_K: &str = include_str!("shaders/gemm_q4_k.wgsl");
     pub const GEMM_Q8_0: &str = include_str!("shaders/gemm_q8_0.wgsl");
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.wgsl");
     pub const SOFTMAX: &str = include_str!("shaders/softmax.wgsl");
@@ -2922,6 +2923,128 @@ mod tests {
                 assert!(
                     diff < 1e-3,
                     "Q8_0 GEMM mismatch at token {t}, row {row}: cpu={}, gpu={}, diff={diff}",
+                    expected[idx],
+                    got[idx]
+                );
+            }
+        }
+    }
+
+    /// Q4_K (Q4_K_M) batched GEMM parity: synthesize Q4_K blocks, dequantize on
+    /// CPU with `dequantize_q4_k_m_block`, run the wgpu `gemm_q4_k` kernel over a
+    /// multi-token batch with padded x_stride/y_stride, compare. Guards the B2
+    /// batched-prefill wiring (ROWS_PER_WG=8 → dispatch ceil(m/8)); m not a
+    /// multiple of 8 exercises the partial row tile.
+    #[test]
+    fn test_gpu_gemm_q4_k_parity() {
+        use crate::quant::{BlockQ4KM, dequantize_q4_k_m_block};
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let m = 11u32;
+        let k = 512u32; // 2 super-blocks per row
+        let n = 3u32;
+        let x_stride = k + 4;
+        let y_stride = m + 5;
+        let qk_k = 256usize;
+        let nb = k as usize / qk_k;
+
+        // Synthetic Q4_K weights + their f32 dequantization (CPU reference).
+        let mut raw = Vec::with_capacity(m as usize * nb * 144);
+        let mut w_f32 = vec![0.0f32; m as usize * k as usize];
+        for row in 0..m as usize {
+            for b in 0..nb {
+                let mut blk = BlockQ4KM {
+                    d: half::f16::from_f32(0.02 + (row as f32 * 0.004).sin() * 0.003).to_bits(),
+                    dmin: half::f16::from_f32(0.01 + (b as f32 * 0.002)).to_bits(),
+                    scales: [0u8; 12],
+                    qs: [0u8; 128],
+                };
+                for (i, v) in blk.scales.iter_mut().enumerate() {
+                    *v = ((row * 5 + b * 7 + i * 3) & 0xFF) as u8;
+                }
+                for (i, v) in blk.qs.iter_mut().enumerate() {
+                    *v = ((row * 37 + b * 13 + i) & 0xFF) as u8;
+                }
+                let dq = dequantize_q4_k_m_block(&blk);
+                let off = row * k as usize + b * qk_k;
+                w_f32[off..off + qk_k].copy_from_slice(&dq);
+                raw.extend_from_slice(&blk.d.to_le_bytes());
+                raw.extend_from_slice(&blk.dmin.to_le_bytes());
+                raw.extend_from_slice(&blk.scales);
+                raw.extend_from_slice(&blk.qs);
+            }
+        }
+
+        let mut x_batch = vec![0.0f32; (n * x_stride) as usize];
+        for t in 0..n as usize {
+            for i in 0..k as usize {
+                x_batch[t * x_stride as usize + i] =
+                    ((t as f32 + 1.0) * (i as f32 - 200.0)) * 0.0007;
+            }
+        }
+
+        let mut expected = vec![0.0f32; (n * y_stride) as usize];
+        for t in 0..n as usize {
+            let x_slice = &x_batch[t * x_stride as usize..t * x_stride as usize + k as usize];
+            for row in 0..m as usize {
+                let mut acc = 0.0f32;
+                for i in 0..k as usize {
+                    acc += w_f32[row * k as usize + i] * x_slice[i];
+                }
+                expected[t * y_stride as usize + row] = acc;
+            }
+        }
+
+        let a_buf = ctx.upload_storage(&raw, "gemm_q4k_weights");
+        let x_buf = ctx.upload_f32(&x_batch, "gemm_q4k_x");
+        let y_buf = ctx.create_storage_rw(((n * y_stride) as u64) * 4, "gemm_q4k_y");
+        let params: [u32; 6] = [m, k, n, x_stride, y_stride, 0];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "gemm_q4k_params");
+
+        let pipeline = ctx.create_pipeline(shaders::GEMM_Q4_K, "gemm_q4_k", "gemm_q4_k");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(m.div_ceil(8), n, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+
+        let got = ctx.download_f32(&y_buf, (n * y_stride) as usize);
+        for t in 0..n as usize {
+            for row in 0..m as usize {
+                let idx = t * y_stride as usize + row;
+                let denom = expected[idx].abs().max(1.0);
+                let rel = (expected[idx] - got[idx]).abs() / denom;
+                assert!(
+                    rel < 5e-3,
+                    "Q4_K GEMM mismatch at token {t}, row {row}: cpu={}, gpu={}, rel={rel:.2e}",
                     expected[idx],
                     got[idx]
                 );

@@ -206,6 +206,7 @@ struct GpuPipelines {
     mul_mat_reg_tile_q4_0_vec: wgpu::ComputePipeline,
     mul_mat_reg_tile_q4_0_scalar: wgpu::ComputePipeline,
     gemm_q8_0: wgpu::ComputePipeline,
+    gemm_q4_k: wgpu::ComputePipeline,
     attention_prefill: wgpu::ComputePipeline,
 }
 
@@ -716,6 +717,7 @@ impl GpuLfm2Model {
                 false,
             ),
             gemm_q8_0: ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0", "gemm_q8_0"),
+            gemm_q4_k: ctx.create_pipeline(shaders::GEMM_Q4_K, "gemm_q4_k", "gemm_q4_k"),
             attention_prefill: ctx.create_pipeline(
                 shaders::ATTENTION_PREFILL,
                 "attention_prefill",
@@ -3037,8 +3039,8 @@ impl GpuLfm2Model {
 
 impl GpuLfm2Model {
     /// Returns true iff every matmul weight on every layer has a batched
-    /// prefill kernel. Q4_0 uses the register-tiled path; Q8_0 uses the
-    /// conservative batched GEMV-shaped path.
+    /// prefill kernel. Q4_0 uses the register-tiled path; Q8_0 and Q4KM use the
+    /// conservative batched GEMV-shaped path (gemm_q8_0 / gemm_q4_k).
     /// precondition for `forward_prefill_batched_locked` to take the
     /// batched path. Cheap O(n_layers) walk; not memoized because it's
     /// called once per `forward_prefill` invocation.
@@ -3056,7 +3058,7 @@ impl GpuLfm2Model {
                 lw.conv_out_proj.as_ref(),
             ];
             for w in weights.into_iter().flatten() {
-                if !matches!(w.tensor.dtype, DType::Q4_0 | DType::Q8_0) {
+                if !matches!(w.tensor.dtype, DType::Q4_0 | DType::Q8_0 | DType::Q4KM) {
                     return false;
                 }
             }
@@ -3203,8 +3205,8 @@ impl GpuLfm2Model {
         y_stride: u32,
     ) {
         debug_assert!(
-            matches!(w.tensor.dtype, DType::Q4_0 | DType::Q8_0),
-            "encode_mul_mat_reg_tile only supports Q4_0/Q8_0 weights"
+            matches!(w.tensor.dtype, DType::Q4_0 | DType::Q8_0 | DType::Q4KM),
+            "encode_mul_mat_reg_tile only supports Q4_0/Q8_0/Q4KM weights"
         );
         let m = w.tensor.shape[0] as u32;
         let (pipeline, wg_m, wg_n, label) = match w.tensor.dtype {
@@ -3236,11 +3238,24 @@ impl GpuLfm2Model {
                 );
                 (&self.pipelines.gemm_q8_0, wg_m, n, "gemm_q8")
             }
+            DType::Q4KM => {
+                // gemm_q4_k mirrors gemm_q8_0's ROWS_PER_WG=8 batched shape and
+                // likewise indexes the row tile with `wid.x` directly (`wid.y`
+                // is the token axis), so the same 65535 row-tile guard applies.
+                let wg_m = m.div_ceil(8);
+                debug_assert!(
+                    wg_m <= 65535,
+                    "gemm_q4_k row tiles {wg_m} exceed the 65535 dispatch \
+                     limit (m={m}); Q4_K batched prefill needs a flattened \
+                     dispatch for weights this large"
+                );
+                (&self.pipelines.gemm_q4_k, wg_m, n, "gemm_q4k")
+            }
             // Unreachable in practice: the batched path is only entered when
             // `all_matmul_weights_batched_supported()` already confirmed every
-            // weight is Q4_0/Q8_0. The debug_assert above documents the same
-            // precondition; this arm is the release-mode backstop.
-            _ => unreachable!("batched prefill only supports Q4_0/Q8_0"),
+            // weight is Q4_0/Q8_0/Q4KM. The debug_assert above documents the
+            // same precondition; this arm is the release-mode backstop.
+            _ => unreachable!("batched prefill only supports Q4_0/Q8_0/Q4KM"),
         };
 
         let params: [u32; 6] = [m, k, n, x_stride, y_stride, 0];
