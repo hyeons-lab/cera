@@ -762,10 +762,11 @@ impl GpuLfm2Model {
                 //
                 // The shaders bind this buffer as `array<u32>` and do u32 reads.
                 // `upload_storage`/`create_buffer_init` round the buffer size up
-                // to COPY_BUFFER_ALIGNMENT (4 B) and zero the tail, so a Q6K/Q5KM
-                // row (`nb*210` / `nb*176` B, not a 4-multiple) is safe to index
-                // as u32 — the same guarantee Q4_0 (18 B/block) and Q8_0 (34
-                // B/block) already rely on.
+                // to COPY_BUFFER_ALIGNMENT (4 B) and zero the tail, so a row whose
+                // byte length isn't a multiple of 4 is still safe to index as u32.
+                // Q5KM (`nb*176` B) is already 4-aligned; Q6K (`nb*210`), Q4_0
+                // (18 B/block), and Q8_0 (34 B/block) are not, and rely on that
+                // round-up guarantee.
                 let data = src.weight_bytes(wref);
                 (ctx.upload_storage(data, name), wref.dtype)
             } else {
