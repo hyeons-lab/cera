@@ -1475,8 +1475,10 @@ impl GpuLfm2Model {
 
     fn gemv_workgroups(&self, w: &GpuWeight) -> (u32, u32, u32) {
         let (_, rows_per_wg, _) = self.gemv_pipeline_rows_label(w);
-        let rows = (w.tensor.shape[0] as u32).div_ceil(rows_per_wg);
-        (rows.min(65535), rows.div_ceil(65535), 1)
+        let row_groups = (w.tensor.shape[0] as u32).div_ceil(rows_per_wg);
+        // Flatten into (x, y) so m > MAX_WG*rows_per_wg rows still map to distinct
+        // row groups; the shaders recover the flat index via `get_wid`.
+        crate::backend::wgpu::gemv_row_workgroups(row_groups)
     }
 
     fn dispatch_gemv_into(

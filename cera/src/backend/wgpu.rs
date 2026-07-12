@@ -756,6 +756,17 @@ pub fn kv_shift_workgroups(total_threads: u32) -> (u32, u32, u32) {
     (wg.min(MAX_WG), wg.div_ceil(MAX_WG), 1)
 }
 
+/// 2-D-flattened workgroup grid for a GEMV that dispatches one workgroup per
+/// `rows_per_wg` output rows, i.e. `row_groups = ceil(m / rows_per_wg)`. Pins the
+/// X extent to exactly [`MAX_WG`] once the count spills into Y so the kernel's
+/// `get_wid = wid.x + wid.y * MAX_WG` recovers a gap-free, overlap-free row-group
+/// index over `[0, row_groups)`. Shared source of truth for
+/// `GpuLfm2Model::gemv_workgroups` and the flattening test so the host grid and
+/// the shader's `get_wid` can't drift.
+pub fn gemv_row_workgroups(row_groups: u32) -> (u32, u32, u32) {
+    (row_groups.min(MAX_WG), row_groups.div_ceil(MAX_WG), 1)
+}
+
 /// Typed parameters for the wgpu `kv_shift` WGSL kernel (`shaders/kv_shift.wgsl`).
 ///
 /// Marshalled to an 8-element `array<u32>` storage buffer via
@@ -888,6 +899,53 @@ mod tests {
         assert_eq!(p.total_threads(), 19 * 2 * (16 / 2)); // 304
         assert_eq!(p.dispatch_dims(), kv_shift_workgroups(p.total_threads()));
         assert_eq!(p.dispatch_dims(), (2, 1, 1));
+    }
+
+    /// The GEMV row grid must let the shaders' `get_wid = wid.x + wid.y * MAX_WG`
+    /// recover every dispatched row group exactly once, including when the count
+    /// spills into Y (`m > MAX_WG * rows_per_wg`, the path `gemv_q4_k`/`gemv_q6_k`/
+    /// `gemv_q8_0`/`gemv_f32` rely on). Pure host-side math — no GPU buffer.
+    #[test]
+    fn gemv_row_workgroups_flattening_is_gap_free() {
+        let counts = [
+            1u32,
+            MAX_WG - 1,
+            MAX_WG,           // exactly MAX_WG groups, still Y == 1
+            MAX_WG + 1,       // first count that spills into Y
+            2 * MAX_WG + 7,   // ~2 rows in Y, non-multiple of MAX_WG
+            3 * MAX_WG - 100, // ~3 rows in Y
+        ];
+        for &rg in &counts {
+            let (gx, gy, gz) = gemv_row_workgroups(rg);
+            assert_eq!(gz, 1, "z extent is always 1 (row_groups={rg})");
+            // Once the grid spills into Y, X must be exactly MAX_WG or `get_wid`'s
+            // stride mis-tiles (double-computes / skips rows).
+            if gy > 1 {
+                assert_eq!(
+                    gx, MAX_WG,
+                    "X must be pinned to MAX_WG when Y>1 (row_groups={rg})"
+                );
+            }
+            assert!(
+                (gx as u64) * (gy as u64) >= rg as u64,
+                "grid {gx}x{gy} under-covers row_groups={rg}",
+            );
+            // Every flat index in [0, rg) maps into the dispatched grid and
+            // round-trips through get_wid. O(rg).
+            for fw in 0..rg {
+                let x = fw % MAX_WG;
+                let y = fw / MAX_WG;
+                assert!(
+                    x < gx && y < gy,
+                    "flat {fw} maps to ({x},{y}) outside grid {gx}x{gy} (row_groups={rg})",
+                );
+                assert_eq!(
+                    x + y * MAX_WG,
+                    fw,
+                    "get_wid recovery is not the inverse (row_groups={rg})"
+                );
+            }
+        }
     }
 
     #[test]
