@@ -2981,15 +2981,51 @@ mod tests {
                 n_heads,
             );
 
+            // CPU ground-truth attention (driver-independent). The classic GPU
+            // kernel is NOT a reliable oracle at seq_len > 256 on every driver
+            // (naga SPIR-V vs MSL), so assert flash against this instead; keep
+            // classic in the panic message for context.
+            let gs = (n_heads / n_kv_heads) as usize;
+            let hd = head_dim as usize;
+            let kvd = kv_dim as usize;
+            let sl = seq_len as usize;
+            let mut cpu_ref = vec![0.0f32; out_len];
+            for h in 0..n_heads as usize {
+                let kvo = (h / gs) * hd;
+                let mut scores = vec![0.0f32; sl];
+                let mut mx = f32::NEG_INFINITY;
+                for (t, s) in scores.iter_mut().enumerate() {
+                    let mut dot = 0.0f32;
+                    for d in 0..hd {
+                        dot += q[h * hd + d] * k[t * kvd + kvo + d];
+                    }
+                    *s = dot * scale;
+                    mx = mx.max(*s);
+                }
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                for d in 0..hd {
+                    let mut a = 0.0f32;
+                    for (t, s) in scores.iter().enumerate() {
+                        a += s * v[t * kvd + kvo + d];
+                    }
+                    cpu_ref[h * hd + d] = a / sum;
+                }
+            }
+
             for i in 0..out_len {
-                let diff = (classic_out[i] - flash_out[i]).abs();
-                let tol = 1e-3 + 1e-3 * classic_out[i].abs();
+                let diff = (flash_out[i] - cpu_ref[i]).abs();
+                let tol = 1e-3 + 1e-3 * cpu_ref[i].abs();
                 assert!(
                     diff <= tol,
-                    "flash≠classic at cfg (h={n_heads},kv={n_kv_heads},hd={head_dim},\
-                     seq={seq_len}) idx {i}: classic={}, flash={}, diff={diff}",
-                    classic_out[i],
+                    "flash≠cpu at cfg (h={n_heads},kv={n_kv_heads},hd={head_dim},\
+                     seq={seq_len}) idx {i}: cpu={}, flash={}, classic={}, diff={diff}",
+                    cpu_ref[i],
                     flash_out[i],
+                    classic_out[i],
                 );
             }
         }
