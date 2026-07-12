@@ -13,6 +13,10 @@
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<storage, read> params: vec2<u32>;
 
+// `get_wid` flattens the 2-D dispatch grid so m > 65535*NR rows still map to
+// distinct rows (gemv_workgroups folds the row overflow into wid.y).
+#include "common_decls.tmpl"
+
 const QK_K: u32 = 256u;
 const Q6K_BYTES: u32 = 210u;
 const NR: u32 = 2u;
@@ -45,7 +49,7 @@ fn gemv_q6_k(
     let nb = k / QK_K;
     let row_bytes = nb * Q6K_BYTES;
     let tiisg = lid.x;
-    let first_row = wid.x * NR;
+    let first_row = get_wid(wid) * NR;
 
     let tid_l = tiisg / 2u;
     let ix  = tiisg & 1u;
