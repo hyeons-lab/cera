@@ -10,6 +10,11 @@
 // tile). Results match the classic kernel up to floating-point roundoff (online
 // vs batched softmax accumulation order).
 //
+// The tree reductions are inlined (not helper functions) and all barriers sit at
+// kernel scope, mirroring attention.wgsl / the gemv kernels — naga's SPIR-V path
+// (lavapipe/Vulkan) miscompiles `workgroupBarrier()` reached through a function
+// call inside a loop, so this file keeps every barrier in the entry point.
+//
 // Constraints (asserted host-side in encode_attention):
 //   - head_dim <= 128 (bounds `q_shared` and `acc`).
 //   - decode: the single query attends all cached KV, so no causal mask.
@@ -34,54 +39,13 @@ const TILE: u32 = 256u;
 const MAX_HEAD_DIM: u32 = 128u;
 const NEG_INF: f32 = -3.402823e+38;
 
-var<workgroup> q_shared: array<f32, 128>;   // MAX_HEAD_DIM
-var<workgroup> acc: array<f32, 128>;        // per-dim output accumulator
+var<workgroup> q_shared: array<f32, 128>;    // MAX_HEAD_DIM
+var<workgroup> acc: array<f32, 128>;         // per-dim output accumulator
 var<workgroup> tile_scores: array<f32, 256>; // TILE
-var<workgroup> red: array<f32, 256>;        // reduction scratch
-var<workgroup> wg_rmax: f32;                 // running max (shared)
-var<workgroup> wg_rsum: f32;                 // running denominator (shared)
-var<workgroup> wg_new_max: f32;
-var<workgroup> wg_corr: f32;                 // exp(old_max - new_max)
-
-// Max-reduce `red[0..256]` in place; result in red[0]. Barriers are in uniform
-// control flow (the caller invokes this from the uniform tile loop).
-fn reduce_max(tid: u32) {
-    if tid < 128u { red[tid] = max(red[tid], red[tid + 128u]); }
-    workgroupBarrier();
-    if tid < 64u { red[tid] = max(red[tid], red[tid + 64u]); }
-    workgroupBarrier();
-    if tid < 32u { red[tid] = max(red[tid], red[tid + 32u]); }
-    workgroupBarrier();
-    if tid < 16u { red[tid] = max(red[tid], red[tid + 16u]); }
-    workgroupBarrier();
-    if tid < 8u { red[tid] = max(red[tid], red[tid + 8u]); }
-    workgroupBarrier();
-    if tid < 4u { red[tid] = max(red[tid], red[tid + 4u]); }
-    workgroupBarrier();
-    if tid < 2u { red[tid] = max(red[tid], red[tid + 2u]); }
-    workgroupBarrier();
-    if tid < 1u { red[tid] = max(red[tid], red[tid + 1u]); }
-    workgroupBarrier();
-}
-
-fn reduce_sum(tid: u32) {
-    if tid < 128u { red[tid] += red[tid + 128u]; }
-    workgroupBarrier();
-    if tid < 64u { red[tid] += red[tid + 64u]; }
-    workgroupBarrier();
-    if tid < 32u { red[tid] += red[tid + 32u]; }
-    workgroupBarrier();
-    if tid < 16u { red[tid] += red[tid + 16u]; }
-    workgroupBarrier();
-    if tid < 8u { red[tid] += red[tid + 8u]; }
-    workgroupBarrier();
-    if tid < 4u { red[tid] += red[tid + 4u]; }
-    workgroupBarrier();
-    if tid < 2u { red[tid] += red[tid + 2u]; }
-    workgroupBarrier();
-    if tid < 1u { red[tid] += red[tid + 1u]; }
-    workgroupBarrier();
-}
+var<workgroup> red: array<f32, 256>;         // reduction scratch
+// Running online-softmax state, broadcast to all threads via workgroup memory.
+// [0]=running max, [1]=running sum, [2]=this tile's new max, [3]=correction.
+var<workgroup> st: array<f32, 4>;
 
 @compute @workgroup_size(256, 1, 1)
 fn flash_attention(
@@ -102,7 +66,7 @@ fn flash_attention(
     let kv_h_offset = kv_head * head_dim;
     let q_offset = head * head_dim;
 
-    // seq_len == 0 would divide by rsum == 0 → NaN. Write zeros and bail.
+    // seq_len == 0 would divide by st[1] == 0 → NaN. Write zeros and bail.
     if seq_len == 0u {
         if tid < head_dim {
             out[q_offset + tid] = 0.0;
@@ -116,8 +80,8 @@ fn flash_attention(
         acc[tid] = 0.0;
     }
     if tid == 0u {
-        wg_rmax = NEG_INF;
-        wg_rsum = 0.0;
+        st[0] = NEG_INF; // running max
+        st[1] = 0.0;     // running sum
     }
     workgroupBarrier();
 
@@ -135,21 +99,37 @@ fn flash_attention(
             score = dot * scale;
         }
         tile_scores[tid] = score;
+
+        // ── tile max (inlined tree reduction over `red`) ──
         red[tid] = score;
         workgroupBarrier();
-        reduce_max(tid);
-        let tmax = red[0];
+        if tid < 128u { red[tid] = max(red[tid], red[tid + 128u]); }
         workgroupBarrier();
+        if tid < 64u { red[tid] = max(red[tid], red[tid + 64u]); }
+        workgroupBarrier();
+        if tid < 32u { red[tid] = max(red[tid], red[tid + 32u]); }
+        workgroupBarrier();
+        if tid < 16u { red[tid] = max(red[tid], red[tid + 16u]); }
+        workgroupBarrier();
+        if tid < 8u { red[tid] = max(red[tid], red[tid + 8u]); }
+        workgroupBarrier();
+        if tid < 4u { red[tid] = max(red[tid], red[tid + 4u]); }
+        workgroupBarrier();
+        if tid < 2u { red[tid] = max(red[tid], red[tid + 2u]); }
+        workgroupBarrier();
+        if tid < 1u { red[tid] = max(red[tid], red[tid + 1u]); }
+        workgroupBarrier();
+        let tmax = red[0];
 
         // new running max + correction factor (published by thread 0)
         if tid == 0u {
-            let nm = max(wg_rmax, tmax);
-            wg_new_max = nm;
-            wg_corr = exp(wg_rmax - nm); // first tile: exp(-inf) = 0
+            let nm = max(st[0], tmax);
+            st[2] = nm;
+            st[3] = exp(st[0] - nm); // first tile: exp(-inf) = 0
         }
         workgroupBarrier();
-        let nm = wg_new_max;
-        let corr = wg_corr;
+        let nm = st[2];
+        let corr = st[3];
 
         // p = exp(score - nm); reuse tile_scores to hold the exponentials.
         var p = 0.0;
@@ -157,11 +137,27 @@ fn flash_attention(
             p = exp(tile_scores[tid] - nm);
         }
         tile_scores[tid] = p;
+
+        // ── tile sum (inlined tree reduction over `red`) ──
         red[tid] = p;
         workgroupBarrier();
-        reduce_sum(tid);
-        let tsum = red[0];
+        if tid < 128u { red[tid] += red[tid + 128u]; }
         workgroupBarrier();
+        if tid < 64u { red[tid] += red[tid + 64u]; }
+        workgroupBarrier();
+        if tid < 32u { red[tid] += red[tid + 32u]; }
+        workgroupBarrier();
+        if tid < 16u { red[tid] += red[tid + 16u]; }
+        workgroupBarrier();
+        if tid < 8u { red[tid] += red[tid + 8u]; }
+        workgroupBarrier();
+        if tid < 4u { red[tid] += red[tid + 4u]; }
+        workgroupBarrier();
+        if tid < 2u { red[tid] += red[tid + 2u]; }
+        workgroupBarrier();
+        if tid < 1u { red[tid] += red[tid + 1u]; }
+        workgroupBarrier();
+        let tsum = red[0];
 
         // rescale the accumulator by the correction and add this tile's V.
         if tid < head_dim {
@@ -176,15 +172,15 @@ fn flash_attention(
             acc[tid] = a;
         }
         if tid == 0u {
-            wg_rsum = wg_rsum * corr + tsum;
-            wg_rmax = nm;
+            st[1] = st[1] * corr + tsum;
+            st[0] = nm;
         }
-        // Barrier before the next tile reuses tile_scores/red and reads acc.
+        // Barrier before the next tile reuses tile_scores/red and reads acc/st.
         workgroupBarrier();
         base += TILE;
     }
 
     if tid < head_dim {
-        out[q_offset + tid] = acc[tid] / wg_rsum;
+        out[q_offset + tid] = acc[tid] / st[1];
     }
 }
