@@ -707,6 +707,7 @@ pub mod shaders {
     pub const GEMM_F32: &str = include_str!("shaders/gemm_f32.wgsl");
     pub const GEMV_Q4_0: &str = include_str!("shaders/gemv_q4_0.wgsl");
     pub const GEMV_Q4_0_FAST: &str = include_str!("shaders/gemv_q4_0_fast.wgsl");
+    pub const GEMV_Q4_K: &str = include_str!("shaders/gemv_q4_k.wgsl");
     pub const GEMV_Q5_K: &str = include_str!("shaders/gemv_q5_k.wgsl");
     pub const GEMV_Q6_K: &str = include_str!("shaders/gemv_q6_k.wgsl");
     pub const GEMV_Q8_0: &str = include_str!("shaders/gemv_q8_0.wgsl");
@@ -2601,6 +2602,116 @@ mod tests {
             assert!(
                 rel < 5e-3,
                 "Q6_K GEMV mismatch at row {i}: cpu={}, gpu={}, rel={rel:.2e}",
+                expected[i],
+                result[i]
+            );
+        }
+    }
+
+    /// Q4_K (Q4_K_M) GEMV parity: synthesize Q4_K blocks, dequantize on CPU with
+    /// the production `dequantize_q4_k_m_block`, GEMV on the wgpu `gemv_q4_k`
+    /// kernel, compare. Guards the B2 wiring (Q4KM stays quantized on the GPU and
+    /// is served by `gemv_q4_k` in `gemv_pipeline_rows_label`, NR=2 → ceil(m/2)).
+    #[test]
+    fn test_gpu_gemv_q4_k() {
+        use crate::quant::{BlockQ4KM, dequantize_q4_k_m_block};
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        // m odd to exercise the ceil(m/2) tail workgroup; k a multiple of 256.
+        let m = 65u32;
+        let k = 512u32; // 2 super-blocks per row
+        let qk_k = 256usize;
+        let nb = k as usize / qk_k;
+
+        // Synthetic Q4_K weights serialized into the exact GGUF block layout the
+        // shader reads (d | dmin | scales[12] | qs[128] = 144 bytes).
+        let mut raw = Vec::with_capacity(m as usize * nb * 144);
+        let mut expected_f32 = vec![0.0f32; m as usize * k as usize];
+        for row in 0..m as usize {
+            for b in 0..nb {
+                let mut blk = BlockQ4KM {
+                    d: half::f16::from_f32(0.02 + (row as f32 * 0.004).sin() * 0.003).to_bits(),
+                    dmin: half::f16::from_f32(0.01 + (b as f32 * 0.002)).to_bits(),
+                    scales: [0u8; 12],
+                    qs: [0u8; 128],
+                };
+                for (i, v) in blk.scales.iter_mut().enumerate() {
+                    *v = ((row * 5 + b * 7 + i * 3) & 0xFF) as u8;
+                }
+                for (i, v) in blk.qs.iter_mut().enumerate() {
+                    *v = ((row * 37 + b * 13 + i) & 0xFF) as u8;
+                }
+                let dq = dequantize_q4_k_m_block(&blk);
+                let row_off = row * k as usize + b * qk_k;
+                expected_f32[row_off..row_off + qk_k].copy_from_slice(&dq);
+                raw.extend_from_slice(&blk.d.to_le_bytes());
+                raw.extend_from_slice(&blk.dmin.to_le_bytes());
+                raw.extend_from_slice(&blk.scales);
+                raw.extend_from_slice(&blk.qs);
+            }
+        }
+
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.017).cos()).collect();
+
+        // CPU reference: y[r] = Σ weight_f32[r][i] × x[i].
+        let mut expected = vec![0.0f32; m as usize];
+        for (row, exp) in expected.iter_mut().enumerate() {
+            let mut s = 0.0f32;
+            for i in 0..k as usize {
+                s += expected_f32[row * k as usize + i] * x[i];
+            }
+            *exp = s;
+        }
+
+        let a_buf = ctx.upload_storage(&raw, "A_q4k");
+        let x_buf = ctx.upload_f32(&x, "x");
+        let y_buf = ctx.create_storage_rw((m as u64) * 4, "y");
+        let params = [m, k, 0u32, 0u32];
+        let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k", "gemv_q4_k");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(m.div_ceil(2), 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+
+        let result = ctx.download_f32(&y_buf, m as usize);
+        for i in 0..m as usize {
+            let denom = expected[i].abs().max(1.0);
+            let rel = (expected[i] - result[i]).abs() / denom;
+            assert!(
+                rel < 5e-3,
+                "Q4_K GEMV mismatch at row {i}: cpu={}, gpu={}, rel={rel:.2e}",
                 expected[i],
                 result[i]
             );

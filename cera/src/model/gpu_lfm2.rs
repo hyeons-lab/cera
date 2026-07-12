@@ -171,6 +171,7 @@ struct GpuPipelines {
     gemm_f32_nt_accum: wgpu::ComputePipeline,
     gemv_q4_0: wgpu::ComputePipeline,
     gemv_q4_0_fast: wgpu::ComputePipeline,
+    gemv_q4_k: wgpu::ComputePipeline,
     gemv_q5_k: wgpu::ComputePipeline,
     gemv_q6_k: wgpu::ComputePipeline,
     gemv_q8_0: wgpu::ComputePipeline,
@@ -653,6 +654,7 @@ impl GpuLfm2Model {
                 "gemv_q4_0_fast",
                 "gemv_q4_0_fast",
             ),
+            gemv_q4_k: ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k", "gemv_q4_k"),
             gemv_q5_k: ctx.create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k", "gemv_q5_k"),
             gemv_q6_k: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k", "gemv_q6_k"),
             gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0", "gemv_q8_0"),
@@ -751,14 +753,14 @@ impl GpuLfm2Model {
         let upload_weight = |wref: &WeightRef, name: &str| -> GpuWeight {
             let (buf, dtype) = if matches!(
                 wref.dtype,
-                DType::Q4_0 | DType::Q8_0 | DType::Q6K | DType::Q5KM
+                DType::Q4_0 | DType::Q8_0 | DType::Q4KM | DType::Q5KM | DType::Q6K
             ) {
-                // Q4_0/Q8_0 have native GEMV+GEMM kernels; Q6K and Q5KM have
+                // Q4_0/Q8_0/Q4KM have native GEMV+GEMM kernels; Q6K and Q5KM have
                 // native GEMV kernels (`gemv_q6_k` / `gemv_q5_k`) used by decode
-                // and the per-token prefill fallback, so they stay quantized too
-                // (~4.9× / 5.8× less VRAM than dequantizing to f32: Q6K is 210 B
-                // and Q5KM 176 B per 256 elems vs 4 B/elem = 1024 B for f32).
-                // Q4KM still dequantizes below until its kernels land (B2).
+                // and the per-token prefill fallback. All stay quantized on the
+                // GPU rather than dequantizing to f32: ~7× less VRAM for Q4KM
+                // (144 B / 256 elems = 0.5625 B/elem vs 4 B/elem), ~5.8× for Q5KM
+                // (176 B), and ~4.9× for Q6K (210 B).
                 //
                 // The shaders bind this buffer as `array<u32>` and do u32 reads.
                 // `upload_storage`/`create_buffer_init` round the buffer size up
@@ -1454,12 +1456,14 @@ impl GpuLfm2Model {
         w: &GpuWeight,
     ) -> (&wgpu::ComputePipeline, u32, &'static str) {
         // rows-per-workgroup MUST match each shader's `NR`/`ROWS_PER_WG`
-        // constant: gemv_q4_0_fast=4, gemv_q8_0=8, gemv_q6_k=2, gemv_f32=8. A
-        // mismatch over-dispatches and the shaders bounds-check only writes, not
-        // weight reads, so a too-small value reads past the weight buffer.
+        // constant: gemv_q4_0_fast=4, gemv_q8_0=8, gemv_q4_k=2, gemv_q5_k=2,
+        // gemv_q6_k=2, gemv_f32=8. A mismatch over-dispatches and the shaders
+        // bounds-check only writes, not weight reads, so a too-small value reads
+        // past the weight buffer.
         match w.tensor.dtype {
             DType::Q4_0 => (&self.pipelines.gemv_q4_0_fast, 4, "gemv_q4"),
             DType::Q8_0 => (&self.pipelines.gemv_q8_0, 8, "gemv_q8"),
+            DType::Q4KM => (&self.pipelines.gemv_q4_k, 2, "gemv_q4k"),
             DType::Q6K => (&self.pipelines.gemv_q6_k, 2, "gemv_q6"),
             // gemv_q5_k uses NR=2 rows per workgroup (must match the shader).
             DType::Q5KM => (&self.pipelines.gemv_q5_k, 2, "gemv_q5k"),
