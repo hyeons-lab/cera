@@ -756,15 +756,16 @@ pub fn kv_shift_workgroups(total_threads: u32) -> (u32, u32, u32) {
     (wg.min(MAX_WG), wg.div_ceil(MAX_WG), 1)
 }
 
-/// 2-D-flattened workgroup grid for a GEMV that dispatches one workgroup per
-/// `rows_per_wg` output rows, i.e. `row_groups = ceil(m / rows_per_wg)`. Pins the
-/// X extent to exactly [`MAX_WG`] once the count spills into Y so the kernel's
-/// `get_wid = wid.x + wid.y * MAX_WG` recovers a gap-free, overlap-free row-group
-/// index over `[0, row_groups)`. Shared source of truth for
-/// `GpuLfm2Model::gemv_workgroups` and the flattening test so the host grid and
-/// the shader's `get_wid` can't drift.
-pub fn gemv_row_workgroups(row_groups: u32) -> (u32, u32, u32) {
-    (row_groups.min(MAX_WG), row_groups.div_ceil(MAX_WG), 1)
+/// 2-D-flattened workgroup grid for a `count` of workgroups whose kernel
+/// recovers a linear index via `get_wid = wid.x + wid.y * MAX_WG`. Typically the
+/// GEMV row-group count `ceil(m / rows_per_wg)`, but also the LoRA batched-GEMM
+/// workgroup counts (`n * rank`, `n * d`) — any dispatch that flattens a 1-D
+/// count into (x, y). Pins the X extent to exactly [`MAX_WG`] once the count
+/// spills into Y so `get_wid` recovers a gap-free, overlap-free index over
+/// `[0, count)`. Shared source of truth for `GpuLfm2Model::gemv_workgroups` and
+/// the flattening test so the host grid and the shader's `get_wid` can't drift.
+pub fn gemv_row_workgroups(count: u32) -> (u32, u32, u32) {
+    (count.min(MAX_WG), count.div_ceil(MAX_WG), 1)
 }
 
 /// Typed parameters for the wgpu `kv_shift` WGSL kernel (`shaders/kv_shift.wgsl`).

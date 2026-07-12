@@ -1282,7 +1282,7 @@ impl GpuLfm2Model {
             pass,
             &self.pipelines.gemv_f32,
             bg_a,
-            (a_groups.min(65535), a_groups.div_ceil(65535), 1),
+            crate::backend::wgpu::gemv_row_workgroups(a_groups),
         );
         // out += B_scaled·tmp — m = d rows.
         let b_groups = t.d.div_ceil(GEMV_F32_ROWS_PER_WG);
@@ -1290,7 +1290,7 @@ impl GpuLfm2Model {
             pass,
             &self.pipelines.gemv_f32_accum,
             bg_b,
-            (b_groups.min(65535), b_groups.div_ceil(65535), 1),
+            crate::backend::wgpu::gemv_row_workgroups(b_groups),
         );
     }
 
@@ -1380,7 +1380,7 @@ impl GpuLfm2Model {
             enc,
             &self.pipelines.gemm_f32_nt,
             &bg1,
-            (total1.min(65535), total1.div_ceil(65535), 1),
+            crate::backend::wgpu::gemv_row_workgroups(total1),
             "lora_batched_a",
         );
 
@@ -1417,7 +1417,7 @@ impl GpuLfm2Model {
             enc,
             &self.pipelines.gemm_f32_nt_accum,
             &bg2,
-            (total2.min(65535), total2.div_ceil(65535), 1),
+            crate::backend::wgpu::gemv_row_workgroups(total2),
             "lora_batched_b",
         );
     }
