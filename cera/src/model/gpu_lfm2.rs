@@ -90,7 +90,10 @@ fn gemv_tile_rows(m: u32, k: u32, max_binding: u64, offset_alignment: u64, elem_
     const ROWS_PER_WG: u64 = 8;
 
     let row_bytes = u64::from(k) * elem_size;
-    let full_bytes = u64::from(m) * row_bytes;
+    // Round to a whole u32: the weight is bound as `array<u32>`, so the true
+    // binding size is padded up (matches `encode_gemv_f16`'s tiled/non-tiled
+    // decision). Keeps the two "fits one binding" checks in agreement.
+    let full_bytes = (u64::from(m) * row_bytes).div_ceil(4) * 4;
     if full_bytes <= max_binding {
         return m;
     }
@@ -1641,7 +1644,12 @@ impl GpuLfm2Model {
         m: u32,
         k: u32,
     ) {
-        let weight_bytes = u64::from(m) * u64::from(k) * 2;
+        // Compare the true binding size: the f16 buffer is u32-addressed, so its
+        // `as_entire_binding` size is rounded up to a whole u32 (matching the
+        // `upload_f32_as_f16` padding and the tiled round-up). Without this, an
+        // adapter whose `max_binding` is not itself a multiple of 4 could take
+        // the non-tiled path and then fail binding validation.
+        let weight_bytes = (u64::from(m) * u64::from(k) * 2).div_ceil(4) * 4;
         let max_binding = self.ctx.max_storage_buffer_binding_size;
         if weight_bytes > max_binding {
             self.encode_gemv_f16_tiled(enc, weight, input, output, m, k);
@@ -1680,7 +1688,7 @@ impl GpuLfm2Model {
             enc,
             &self.pipelines.gemv_f16,
             &bg,
-            (groups.min(65535), groups.div_ceil(65535), 1),
+            crate::backend::wgpu::gemv_row_workgroups(groups),
             "gemv_f16",
         );
     }
@@ -1763,7 +1771,7 @@ impl GpuLfm2Model {
                 enc,
                 &self.pipelines.gemv_f16,
                 &bg,
-                (groups.min(65535), groups.div_ceil(65535), 1),
+                crate::backend::wgpu::gemv_row_workgroups(groups),
                 "gemv_f16_tiled",
             );
             row_start += rows;
