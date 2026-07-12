@@ -3014,11 +3014,14 @@ impl GpuLfm2Model {
 //     `start_pos`; conv rolling state and KV cache writes carry across).
 //   * `1 <= n <= MAX_PREFILL_TOKENS` per call (asserted).
 //   * `start_pos + n <= max_seq_len` (asserted).
-//   * All matmul weights must be Q4_0 (the LFM2 Q4_0 GGUF default).
-//     Non-Q4_0 paths fall through to the per-token loop at the dispatcher.
+//   * Every matmul weight must have a batched GEMM kernel — Q4_0
+//     (mul_mat_reg_tile), Q8_0 (gemm_q8_0), or Q4KM (gemm_q4_k). Any other
+//     dtype (F32, Q6K, Q5KM, …) makes `all_matmul_weights_batched_supported`
+//     return false and the whole prompt falls through to the per-token GEMV
+//     loop at the dispatcher.
 //
-// The non-Q4_0 fallback (an f32 `gemm_f32` shader, or per-token gemv with
-// offset bindings) can land in a follow-up PR without disturbing this
+// Extending the batched path to further dtypes (e.g. a Q6K/Q5KM GEMM, or an
+// f32 `gemm_f32` fallback) can land in a follow-up PR without disturbing this
 // contract.
 //
 // Per-dispatch overhead note: each `encode_*` helper builds a fresh
