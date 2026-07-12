@@ -719,7 +719,7 @@ impl GpuLfm2Model {
             ),
         };
 
-        // Upload weights: Q4_0/Q8_0 stay quantized, others dequantized to f32.
+        // Upload weights: Q4_0/Q8_0/Q6K stay quantized, others dequantized to f32.
         let emb_tensor = src.gguf().get_tensor("token_embd.weight")?;
         // The GPU `embedding` buffer feeds the (tied) logit projection and must
         // stay UNSCALED. The CPU-side `embedding_f32` cache feeds the input
@@ -747,12 +747,23 @@ impl GpuLfm2Model {
         let output_norm = ctx.upload_f32(src.output_norm_weight(), "output_norm");
 
         let upload_weight = |wref: &WeightRef, name: &str| -> GpuWeight {
-            let (buf, dtype) = if matches!(wref.dtype, DType::Q4_0 | DType::Q8_0) {
+            let (buf, dtype) = if matches!(wref.dtype, DType::Q4_0 | DType::Q8_0 | DType::Q6K) {
+                // Q4_0/Q8_0 have native GEMV+GEMM kernels; Q6K has a native GEMV
+                // (`gemv_q6_k`) used by decode and the per-token prefill fallback,
+                // so it stays quantized too (~4.9× less VRAM than dequantizing to
+                // f32: Q6K is 210 B / 256 elems ≈ 0.82 B/elem vs 4 B/elem for f32).
+                // Q4KM still dequantizes below until its kernels land (B2).
+                //
+                // The shaders bind this buffer as `array<u32>` and do u32 reads.
+                // `upload_storage`/`create_buffer_init` round the buffer size up to
+                // COPY_BUFFER_ALIGNMENT (4 B) and zero the tail, so a Q6K row
+                // (`nb*210` B, not a 4-multiple) is safe to index as u32 — the same
+                // guarantee Q4_0 (18 B/block) and Q8_0 (34 B/block) already rely on.
                 let data = src.weight_bytes(wref);
                 (ctx.upload_storage(data, name), wref.dtype)
             } else {
                 // TODO: Upload as F16 to save bandwidth (requires F16-aware matmul shaders
-                // in Phase B.1). For now we dequantize all non-Q4_0 to F32.
+                // in Phase B.1). For now we dequantize the remaining quant types to F32.
                 let f32_data = src.dequantize_weight(wref);
                 (ctx.upload_f32(&f32_data, name), DType::F32)
             };
@@ -1435,12 +1446,13 @@ impl GpuLfm2Model {
         w: &GpuWeight,
     ) -> (&wgpu::ComputePipeline, u32, &'static str) {
         // rows-per-workgroup MUST match each shader's `NR`/`ROWS_PER_WG`
-        // constant: gemv_q4_0_fast=4, gemv_q8_0=8, gemv_f32=8. A mismatch
-        // over-dispatches and the shaders bounds-check only writes, not
+        // constant: gemv_q4_0_fast=4, gemv_q8_0=8, gemv_q6_k=2, gemv_f32=8. A
+        // mismatch over-dispatches and the shaders bounds-check only writes, not
         // weight reads, so a too-small value reads past the weight buffer.
         match w.tensor.dtype {
             DType::Q4_0 => (&self.pipelines.gemv_q4_0_fast, 4, "gemv_q4"),
             DType::Q8_0 => (&self.pipelines.gemv_q8_0, 8, "gemv_q8"),
+            DType::Q6K => (&self.pipelines.gemv_q6_k, 2, "gemv_q6"),
             _ => (&self.pipelines.gemv_f32, 8, "gemv_f32"),
         }
     }
