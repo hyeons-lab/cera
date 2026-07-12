@@ -725,7 +725,6 @@ pub mod shaders {
     pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.wgsl");
     pub const ROPE: &str = include_str!("shaders/rope.wgsl");
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.wgsl");
-    pub const ATTENTION: &str = include_str!("shaders/attention.wgsl");
     pub const FLASH_ATTENTION: &str = include_str!("shaders/flash_attention.wgsl");
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
     pub const CONV1D: &str = include_str!("shaders/conv1d.wgsl");
@@ -2970,13 +2969,12 @@ mod tests {
     }
 
     #[test]
-    fn test_gpu_flash_attention_matches_classic() {
+    fn test_gpu_flash_attention_matches_cpu() {
         let ctx = match GpuContext::new() {
             Ok(ctx) => ctx,
             Err(_) => return,
         };
 
-        let classic = ctx.create_pipeline(shaders::ATTENTION, "attention", "attention");
         let flash = ctx.create_pipeline(
             shaders::FLASH_ATTENTION,
             "flash_attention",
@@ -3054,17 +3052,8 @@ mod tests {
             let v_buf = ctx.upload_f32(&v, "v");
             let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
             let out_len = (n_heads * head_dim) as usize;
-            let out_c = ctx.create_storage_rw(out_len as u64 * 4, "out_classic");
             let out_f = ctx.create_storage_rw(out_len as u64 * 4, "out_flash");
-            let scores = ctx.create_storage_rw((n_heads * seq_len) as u64 * 4, "scores");
 
-            let classic_out = run(
-                &classic,
-                &[&q_buf, &k_buf, &v_buf, &out_c, &scores, &params_buf],
-                &out_c,
-                out_len,
-                n_heads,
-            );
             let flash_out = run(
                 &flash,
                 &[&q_buf, &k_buf, &v_buf, &out_f, &params_buf],
@@ -3073,10 +3062,10 @@ mod tests {
                 n_heads,
             );
 
-            // CPU ground-truth attention (driver-independent). The classic GPU
-            // kernel is NOT a reliable oracle at seq_len > 256 on every driver
-            // (naga SPIR-V vs MSL), so assert flash against this instead; keep
-            // classic in the panic message for context.
+            // CPU ground-truth attention (driver-independent). Flash is asserted
+            // against this rather than a second GPU kernel because a GPU oracle
+            // is not reliable across every driver at seq_len > 256 (naga SPIR-V
+            // vs MSL); the CPU reference is the same on all of them.
             let gs = (n_heads / n_kv_heads) as usize;
             let hd = head_dim as usize;
             let kvd = kv_dim as usize;
@@ -3114,10 +3103,9 @@ mod tests {
                 assert!(
                     diff <= tol,
                     "flash≠cpu at cfg (h={n_heads},kv={n_kv_heads},hd={head_dim},\
-                     seq={seq_len}) idx {i}: cpu={}, flash={}, classic={}, diff={diff}",
+                     seq={seq_len}) idx {i}: cpu={}, flash={}, diff={diff}",
                     cpu_ref[i],
                     flash_out[i],
-                    classic_out[i],
                 );
             }
         }

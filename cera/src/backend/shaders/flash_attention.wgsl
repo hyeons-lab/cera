@@ -1,19 +1,18 @@
 // FlashAttention (Dao 2022) for one query vector — the decode path.
 //
 // Online-softmax, single tiled pass over the KV cache with bounded workgroup
-// memory (TILE scores, not seq_len). Replaces the classic `attention.wgsl`
-// which materializes all scores into an external `scores_buf` scratch and runs
-// three passes; flash needs no scratch buffer (5 bindings vs 6) and reads each
-// K/V row once.
+// memory (TILE scores, not seq_len) and no external scores scratch buffer:
+// 5 bindings, each K/V row read once. Matches a plain batched-softmax reference
+// up to floating-point roundoff (online vs batched accumulation order); the
+// wgpu-side test asserts it against a CPU ground truth.
 //
 // One workgroup per head, 256 threads, TILE=256 (one KV timestep per thread per
-// tile). Results match the classic kernel up to floating-point roundoff (online
-// vs batched softmax accumulation order).
+// tile).
 //
 // The tree reductions are inlined (not helper functions) and all barriers sit at
-// kernel scope, mirroring attention.wgsl / the gemv kernels — naga's SPIR-V path
-// (lavapipe/Vulkan) miscompiles `workgroupBarrier()` reached through a function
-// call inside a loop, so this file keeps every barrier in the entry point.
+// kernel scope, mirroring the gemv kernels — naga's SPIR-V path (lavapipe/Vulkan)
+// miscompiles `workgroupBarrier()` reached through a function call inside a loop,
+// so this file keeps every barrier in the entry point.
 //
 // Constraints (asserted host-side in encode_attention):
 //   - head_dim <= 128 (bounds `q_shared` and `acc`).
