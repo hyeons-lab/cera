@@ -83,11 +83,17 @@ fn lcm_u64(a: u64, b: u64) -> u64 {
     (a / gcd_u64(a, b)) * b
 }
 
-fn f32_gemv_tile_rows(m: u32, k: u32, max_binding: u64, offset_alignment: u64) -> u32 {
+/// Rows per tile for the tiled LM-head GEMV, so each tile's weight sub-binding
+/// fits `max_binding` and starts at a `offset_alignment`-aligned byte offset.
+/// `elem_size` is the weight element size (4 for f32, 2 for f16).
+fn gemv_tile_rows(m: u32, k: u32, max_binding: u64, offset_alignment: u64, elem_size: u64) -> u32 {
     const ROWS_PER_WG: u64 = 8;
 
-    let row_bytes = u64::from(k) * 4;
-    let full_bytes = u64::from(m) * row_bytes;
+    let row_bytes = u64::from(k) * elem_size;
+    // Round to a whole u32: the weight is bound as `array<u32>`, so the true
+    // binding size is padded up (matches `encode_gemv_f16`'s tiled/non-tiled
+    // decision). Keeps the two "fits one binding" checks in agreement.
+    let full_bytes = (u64::from(m) * row_bytes).div_ceil(4) * 4;
     if full_bytes <= max_binding {
         return m;
     }
@@ -95,12 +101,12 @@ fn f32_gemv_tile_rows(m: u32, k: u32, max_binding: u64, offset_alignment: u64) -
     let max_rows = (max_binding / row_bytes) as u32;
     assert!(
         max_rows > 0,
-        "GPU max storage binding size {} is too small for one f32 GEMV row of {} bytes",
+        "GPU max storage binding size {} is too small for one GEMV row of {} bytes",
         max_binding,
         row_bytes
     );
 
-    let offset_alignment = offset_alignment.max(4);
+    let offset_alignment = offset_alignment.max(elem_size.max(4));
     let row_alignment = (offset_alignment / gcd_u64(row_bytes, offset_alignment)).max(1) as u32;
     let tile_alignment = lcm_u64(u64::from(row_alignment), ROWS_PER_WG) as u32;
     let tile_rows = if max_rows >= tile_alignment {
@@ -112,7 +118,7 @@ fn f32_gemv_tile_rows(m: u32, k: u32, max_binding: u64, offset_alignment: u64) -
     };
     assert!(
         tile_rows > 0 && (u64::from(tile_rows) * row_bytes) % offset_alignment == 0,
-        "GPU storage binding alignment {} cannot be satisfied for f32 GEMV rows of {} bytes",
+        "GPU storage binding alignment {} cannot be satisfied for GEMV rows of {} bytes",
         offset_alignment,
         row_bytes
     );
@@ -160,6 +166,10 @@ struct GpuLayerWeights {
 #[allow(dead_code)]
 struct GpuPipelines {
     gemv_f32: wgpu::ComputePipeline,
+    /// `gemv_f32` compiled with `F16_A` — reads the weight matrix as f16 (2 per
+    /// u32) instead of f32. Serves the f16 LM head (embedding / output.weight)
+    /// on the logit-projection path; activations and accumulation stay f32.
+    gemv_f16: wgpu::ComputePipeline,
     /// `y[row] += dot(A[row,:], x)` — the accumulate epilogue for the LoRA
     /// up-projection (`out += B_scaled·tmp`).
     gemv_f32_accum: wgpu::ComputePipeline,
@@ -436,7 +446,7 @@ pub struct GpuLfm2Model {
     // — 7 u32, updated per token; must stay in sync with rope.wgsl's params array.
     rope_params: wgpu::Buffer,
     attn_params: wgpu::Buffer, // [n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale, 0, 0] — updated per token
-    gemv_f32_tile_params: Vec<wgpu::Buffer>, // [rows, k, row_base, 0] per output-projection tile
+    gemv_tile_params: Vec<wgpu::Buffer>, // [rows, k, row_base, 0] per output-projection tile
     // Conv scratch
     conv_proj_buf: wgpu::Buffer, // [3 × hidden_size]
     conv_gate_buf: wgpu::Buffer, // [hidden_size] — fused conv writes here, out_proj reads
@@ -638,6 +648,12 @@ impl GpuLfm2Model {
         // Create pipelines
         let pipelines = GpuPipelines {
             gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32"),
+            gemv_f16: ctx.create_pipeline_with_defines(
+                shaders::GEMV_F32,
+                "gemv_f32",
+                "gemv_f16",
+                &[("F16_A", "1")],
+            ),
             gemv_f32_accum: ctx.create_pipeline(
                 shaders::GEMV_F32,
                 "gemv_f32_accum",
@@ -734,7 +750,11 @@ impl GpuLfm2Model {
         // tied-embedding Granite gets the scale on input only, exactly like the
         // CPU LlamaModel (`scale_inplace` after `dequantize_row`).
         let embedding_raw = emb_tensor.to_f32_vec();
-        let embedding = ctx.upload_f32(&embedding_raw, "token_embd.weight");
+        // The GPU `embedding` buffer feeds only the (tied) logit projection via
+        // `encode_gemv_f16`, so it is stored as f16 (half the VRAM of the largest
+        // tensor). The separate CPU `embedding_f32` cache below stays f32 for the
+        // input-embedding lookup.
+        let embedding = ctx.upload_f32_as_f16(&embedding_raw, "token_embd.weight");
         let mut embedding_f32 = embedding_raw;
         if scalars.embedding != 1.0 {
             for v in embedding_f32.iter_mut() {
@@ -880,11 +900,12 @@ impl GpuLfm2Model {
             });
         }
 
-        // Untied output projection (`output.weight`), dequantized to f32 like
-        // the embedding table. `None` ⇒ tied embeddings (reuse `embedding`).
+        // Untied output projection (`output.weight`), dequantized then stored as
+        // f16 like the embedding table (feeds only `encode_gemv_f16`). `None` ⇒
+        // tied embeddings (reuse `embedding`).
         let output_weight = src
             .output_ref()
-            .map(|wref| ctx.upload_f32(&src.dequantize_weight(wref), "output.weight"));
+            .map(|wref| ctx.upload_f32_as_f16(&src.dequantize_weight(wref), "output.weight"));
 
         // Create scratch buffers
         let f = |size: usize, name: &str| ctx.create_storage_rw((size * 4) as u64, name);
@@ -1012,17 +1033,18 @@ impl GpuLfm2Model {
             None => ctx.upload_f32(&[1.0f32], "rope_freqs_dummy"),
         };
         let attn_params = ctx.create_storage_rw(8 * 4, "attn_params");
-        let gemv_f32_tile_rows = f32_gemv_tile_rows(
+        // The LM head is stored as f16 (2 bytes/elem) — see `encode_gemv_f16`.
+        let lm_head_tile_rows = gemv_tile_rows(
             config.vocab_size as u32,
             hs as u32,
             ctx.max_storage_buffer_binding_size,
             ctx.min_storage_buffer_offset_alignment,
+            2,
         );
-        let gemv_f32_tile_count = (config.vocab_size as u32).div_ceil(gemv_f32_tile_rows);
-        let mut gemv_f32_tile_params = Vec::with_capacity(gemv_f32_tile_count as usize);
-        for i in 0..gemv_f32_tile_count {
-            gemv_f32_tile_params
-                .push(ctx.create_storage_rw(4 * 4, &format!("gemv_f32_tile_params.{i}")));
+        let lm_head_tile_count = (config.vocab_size as u32).div_ceil(lm_head_tile_rows);
+        let mut gemv_tile_params = Vec::with_capacity(lm_head_tile_count as usize);
+        for i in 0..lm_head_tile_count {
+            gemv_tile_params.push(ctx.create_storage_rw(4 * 4, &format!("gemv_tile_params.{i}")));
         }
 
         // Argmax I/O buffers. `argmax_params` is uploaded once with
@@ -1111,7 +1133,7 @@ impl GpuLfm2Model {
             per_head_norm_params,
             rope_params,
             attn_params,
-            gemv_f32_tile_params,
+            gemv_tile_params,
             conv_proj_buf,
             conv_gate_buf,
             prefill_batch_buf,
@@ -1260,7 +1282,7 @@ impl GpuLfm2Model {
             pass,
             &self.pipelines.gemv_f32,
             bg_a,
-            (a_groups.min(65535), a_groups.div_ceil(65535), 1),
+            crate::backend::wgpu::gemv_row_workgroups(a_groups),
         );
         // out += B_scaled·tmp — m = d rows.
         let b_groups = t.d.div_ceil(GEMV_F32_ROWS_PER_WG);
@@ -1268,7 +1290,7 @@ impl GpuLfm2Model {
             pass,
             &self.pipelines.gemv_f32_accum,
             bg_b,
-            (b_groups.min(65535), b_groups.div_ceil(65535), 1),
+            crate::backend::wgpu::gemv_row_workgroups(b_groups),
         );
     }
 
@@ -1358,7 +1380,7 @@ impl GpuLfm2Model {
             enc,
             &self.pipelines.gemm_f32_nt,
             &bg1,
-            (total1.min(65535), total1.div_ceil(65535), 1),
+            crate::backend::wgpu::gemv_row_workgroups(total1),
             "lora_batched_a",
         );
 
@@ -1395,7 +1417,7 @@ impl GpuLfm2Model {
             enc,
             &self.pipelines.gemm_f32_nt_accum,
             &bg2,
-            (total2.min(65535), total2.div_ceil(65535), 1),
+            crate::backend::wgpu::gemv_row_workgroups(total2),
             "lora_batched_b",
         );
     }
@@ -1610,8 +1632,10 @@ impl GpuLfm2Model {
         self.encode(enc, pipeline, bg, self.gemv_workgroups(w), label);
     }
 
-    /// Encode f32 GEMV (for tied embeddings output projection which stays f32).
-    fn encode_gemv_f32(
+    /// Encode the LM-head GEMV (logit projection). The weight (`embedding` tied /
+    /// `output.weight` untied) is stored as f16 — see `gemv_f16` — so activations
+    /// stay f32 while the largest GPU tensor takes half the VRAM.
+    fn encode_gemv_f16(
         &self,
         enc: &mut wgpu::CommandEncoder,
         weight: &wgpu::Buffer,
@@ -1620,10 +1644,15 @@ impl GpuLfm2Model {
         m: u32,
         k: u32,
     ) {
-        let weight_bytes = u64::from(m) * u64::from(k) * 4;
+        // Compare the true binding size: the f16 buffer is u32-addressed, so its
+        // `as_entire_binding` size is rounded up to a whole u32 (matching the
+        // `upload_f32_as_f16` padding and the tiled round-up). Without this, an
+        // adapter whose `max_binding` is not itself a multiple of 4 could take
+        // the non-tiled path and then fail binding validation.
+        let weight_bytes = (u64::from(m) * u64::from(k) * 2).div_ceil(4) * 4;
         let max_binding = self.ctx.max_storage_buffer_binding_size;
         if weight_bytes > max_binding {
-            self.encode_gemv_f32_tiled(enc, weight, input, output, m, k);
+            self.encode_gemv_f16_tiled(enc, weight, input, output, m, k);
             return;
         }
 
@@ -1634,7 +1663,7 @@ impl GpuLfm2Model {
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
-                layout: &self.pipelines.gemv_f32.get_bind_group_layout(0),
+                layout: &self.pipelines.gemv_f16.get_bind_group_layout(0),
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -1657,17 +1686,17 @@ impl GpuLfm2Model {
         let groups = m.div_ceil(8);
         self.encode(
             enc,
-            &self.pipelines.gemv_f32,
+            &self.pipelines.gemv_f16,
             &bg,
-            (groups.min(65535), groups.div_ceil(65535), 1),
-            "gemv_f32",
+            crate::backend::wgpu::gemv_row_workgroups(groups),
+            "gemv_f16",
         );
     }
 
-    /// Encode f32 GEMV in row tiles for adapters with small
+    /// Encode the f16 LM-head GEMV in row tiles for adapters with small
     /// max_storage_buffer_binding_size limits. The tied embedding/output
     /// projection can exceed those limits even though each row slice is legal.
-    fn encode_gemv_f32_tiled(
+    fn encode_gemv_f16_tiled(
         &self,
         enc: &mut wgpu::CommandEncoder,
         weight: &wgpu::Buffer,
@@ -1676,25 +1705,26 @@ impl GpuLfm2Model {
         m: u32,
         k: u32,
     ) {
-        let row_bytes = u64::from(k) * 4;
+        let row_bytes = u64::from(k) * 2;
         let max_binding = self.ctx.max_storage_buffer_binding_size;
-        let tile_rows = f32_gemv_tile_rows(
+        let tile_rows = gemv_tile_rows(
             m,
             k,
             max_binding,
             self.ctx.min_storage_buffer_offset_alignment,
+            2, // f16 weight element size
         );
 
-        let layout = self.pipelines.gemv_f32.get_bind_group_layout(0);
+        let layout = self.pipelines.gemv_f16.get_bind_group_layout(0);
         let mut row_start = 0u32;
         let mut tile_idx = 0usize;
         while row_start < m {
             let rows = (m - row_start).min(tile_rows);
             let weight_offset = u64::from(row_start) * row_bytes;
             let params_buf = self
-                .gemv_f32_tile_params
+                .gemv_tile_params
                 .get(tile_idx)
-                .expect("preallocated f32 GEMV tile params");
+                .expect("preallocated LM-head GEMV tile params");
             self.ctx.queue.write_buffer(
                 params_buf,
                 0,
@@ -1712,7 +1742,14 @@ impl GpuLfm2Model {
                             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                 buffer: weight,
                                 offset: weight_offset,
-                                size: wgpu::BufferSize::new(u64::from(rows) * row_bytes),
+                                // Bind as `array<u32>` (f16 packed 2/u32), so the
+                                // size must be a whole number of u32s. A final tile
+                                // whose `rows*k` is odd (only when `k` is odd) would
+                                // otherwise be 2-mod-4 and drop its last f16 pair;
+                                // round up (the buffer is 4-byte padded at upload).
+                                size: wgpu::BufferSize::new(
+                                    (u64::from(rows) * row_bytes).div_ceil(4) * 4,
+                                ),
                             }),
                         },
                         wgpu::BindGroupEntry {
@@ -1732,10 +1769,10 @@ impl GpuLfm2Model {
             let groups = rows.div_ceil(8);
             self.encode(
                 enc,
-                &self.pipelines.gemv_f32,
+                &self.pipelines.gemv_f16,
                 &bg,
-                (groups.min(65535), groups.div_ceil(65535), 1),
-                "gemv_f32_tiled",
+                crate::backend::wgpu::gemv_row_workgroups(groups),
+                "gemv_f16_tiled",
             );
             row_start += rows;
             tile_idx += 1;
@@ -2852,7 +2889,7 @@ impl GpuLfm2Model {
             cfg.rms_norm_eps,
         );
         let out_proj = self.output_weight.as_ref().unwrap_or(&self.embedding);
-        self.encode_gemv_f32(
+        self.encode_gemv_f16(
             &mut enc,
             out_proj,
             &self.hidden_buf,
@@ -4152,7 +4189,7 @@ impl GpuLfm2Model {
         // Output projection. Untied models (`output.weight`) project through
         // it; tied models reuse the embedding table. Mirrors the decode path.
         let out_proj = self.output_weight.as_ref().unwrap_or(&self.embedding);
-        self.encode_gemv_f32(
+        self.encode_gemv_f16(
             &mut enc,
             out_proj,
             &self.hidden_buf,
@@ -4734,6 +4771,65 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// The tiled LM-head GEMV binds weight row-slices at byte offset
+    /// `row_start * k * elem_size`; every such offset must be a multiple of the
+    /// adapter's storage-buffer offset alignment and every tile must fit
+    /// `max_binding`. `gemv_tile_rows` picks the rows-per-tile that guarantees
+    /// both, for f16 (elem=2, the LM head) and f32 (elem=4). Pure host math.
+    #[test]
+    fn gemv_tile_rows_fits_and_aligns() {
+        use super::gemv_tile_rows;
+        // Whole matrix fits one binding → single tile.
+        assert_eq!(gemv_tile_rows(1000, 512, 1 << 30, 256, 2), 1000);
+        assert_eq!(gemv_tile_rows(1000, 512, 1 << 30, 256, 4), 1000);
+
+        // `k` values chosen so a row is NOT a multiple of the offset alignment,
+        // so the row-alignment rounding actually does work: k=100 (row_bytes 200
+        // for f16, gcd 8 with 256) and k=99 — odd, so the f16 row_bytes 198 is
+        // 2-mod-4, exercising the non-whole-u32 row case the round-up in
+        // `encode_gemv_f16_tiled` guards.
+        let m = 131_072u32;
+        let align = 256u64;
+        for &k in &[100u32, 99u32] {
+            for &elem in &[2u64, 4u64] {
+                let row_bytes = u64::from(k) * elem;
+                for &max_binding in &[1u64 << 20, 4 << 20, 512 << 10] {
+                    let rows = gemv_tile_rows(m, k, max_binding, align, elem);
+                    assert!(rows > 0, "k={k} elem={elem} max={max_binding}");
+                    assert!(
+                        u64::from(rows) * row_bytes <= max_binding,
+                        "tile exceeds max_binding (k={k}, elem={elem}, max={max_binding})",
+                    );
+                    // Offsets are multiples of `rows * row_bytes`, so that product
+                    // must be a multiple of the offset alignment.
+                    assert_eq!(
+                        (u64::from(rows) * row_bytes) % align,
+                        0,
+                        "tile byte size not offset-aligned (k={k}, elem={elem}, max={max_binding})",
+                    );
+                    // The final tile's binding size is rounded up to a whole u32
+                    // (`array<u32>` view). Offset + rounded size must still land
+                    // inside the 4-byte-padded weight buffer.
+                    let final_rows = m % rows;
+                    if final_rows > 0 {
+                        let offset = u64::from(m - final_rows) * row_bytes;
+                        let bound = (u64::from(final_rows) * row_bytes).div_ceil(4) * 4;
+                        let padded_buf = (u64::from(m) * row_bytes).div_ceil(4) * 4;
+                        assert_eq!(offset % 4, 0, "offset not u32-aligned (k={k}, elem={elem})");
+                        assert!(
+                            offset + bound <= padded_buf,
+                            "final tile rounded binding overruns padded buffer (k={k}, elem={elem})",
+                        );
+                    }
+                }
+            }
+        }
+
+        // Same head, same binding: f16 packs at least as many rows per tile as f32.
+        let mb = 1u64 << 20;
+        assert!(gemv_tile_rows(m, 100, mb, align, 2) >= gemv_tile_rows(m, 100, mb, align, 4));
     }
 
     /// `encode_copy` treats all three args as f32-element COUNTS: source float

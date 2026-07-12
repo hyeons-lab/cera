@@ -756,15 +756,16 @@ pub fn kv_shift_workgroups(total_threads: u32) -> (u32, u32, u32) {
     (wg.min(MAX_WG), wg.div_ceil(MAX_WG), 1)
 }
 
-/// 2-D-flattened workgroup grid for a GEMV that dispatches one workgroup per
-/// `rows_per_wg` output rows, i.e. `row_groups = ceil(m / rows_per_wg)`. Pins the
-/// X extent to exactly [`MAX_WG`] once the count spills into Y so the kernel's
-/// `get_wid = wid.x + wid.y * MAX_WG` recovers a gap-free, overlap-free row-group
-/// index over `[0, row_groups)`. Shared source of truth for
-/// `GpuLfm2Model::gemv_workgroups` and the flattening test so the host grid and
-/// the shader's `get_wid` can't drift.
-pub fn gemv_row_workgroups(row_groups: u32) -> (u32, u32, u32) {
-    (row_groups.min(MAX_WG), row_groups.div_ceil(MAX_WG), 1)
+/// 2-D-flattened workgroup grid for a `count` of workgroups whose kernel
+/// recovers a linear index via `get_wid = wid.x + wid.y * MAX_WG`. Typically the
+/// GEMV row-group count `ceil(m / rows_per_wg)`, but also the LoRA batched-GEMM
+/// workgroup counts (`n * rank`, `n * d`) — any dispatch that flattens a 1-D
+/// count into (x, y). Pins the X extent to exactly [`MAX_WG`] once the count
+/// spills into Y so `get_wid` recovers a gap-free, overlap-free index over
+/// `[0, count)`. Shared source of truth for `GpuLfm2Model::gemv_workgroups` and
+/// the flattening test so the host grid and the shader's `get_wid` can't drift.
+pub fn gemv_row_workgroups(count: u32) -> (u32, u32, u32) {
+    (count.min(MAX_WG), count.div_ceil(MAX_WG), 1)
 }
 
 /// Typed parameters for the wgpu `kv_shift` WGSL kernel (`shaders/kv_shift.wgsl`).
@@ -1091,6 +1092,97 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "GEMV mismatch at row {i}: cpu={}, gpu={}, diff={diff}",
+                expected[i],
+                result[i]
+            );
+        }
+    }
+
+    /// f16-weight GEMV parity: the `gemv_f16` pipeline (gemv_f32.wgsl compiled
+    /// with `F16_A`) reads the weight matrix as f16 packed two-per-u32. Pack
+    /// synthetic weights to f16, run the kernel, and compare to a CPU reference
+    /// computed from the *f16-rounded* weights (so the check isolates the shader's
+    /// unpack/index logic from f16 rounding). Odd `m` exercises the tail rows.
+    #[test]
+    fn test_gpu_gemv_f16() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let m = 9u32;
+        let k = 64u32; // m*k even → whole u32 words
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 - 288.0) * 0.013).collect();
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 - 31.0) * 0.05).collect();
+
+        // Pack A to f16, two values per u32 (low half = even index).
+        let a_f16: Vec<f16> = a.iter().map(|&v| f16::from_f32(v)).collect();
+        let mut a_packed = Vec::with_capacity((m * k) as usize / 2);
+        for pair in a_f16.chunks(2) {
+            let lo = pair[0].to_bits() as u32;
+            let hi = pair[1].to_bits() as u32;
+            a_packed.push(lo | (hi << 16));
+        }
+
+        // CPU reference from the f16-rounded weights.
+        let mut expected = vec![0.0f32; m as usize];
+        for i in 0..m as usize {
+            for j in 0..k as usize {
+                expected[i] += a_f16[i * k as usize + j].to_f32() * x[j];
+            }
+        }
+
+        let a_buf = ctx.upload_storage(bytemuck::cast_slice(&a_packed), "A_f16");
+        let x_buf = ctx.upload_f32(&x, "x");
+        let y_buf = ctx.create_storage_rw((m as u64) * 4, "y");
+        let params = [m, k, 0u32, 0u32];
+        let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline_with_defines(
+            shaders::GEMV_F32,
+            "gemv_f32",
+            "gemv_f16",
+            &[("F16_A", "1")],
+        );
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gemv_f16"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(m.div_ceil(8), 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+
+        let result = ctx.download_f32(&y_buf, m as usize);
+        for i in 0..m as usize {
+            let denom = expected[i].abs().max(1.0);
+            let rel = (expected[i] - result[i]).abs() / denom;
+            assert!(
+                rel < 2e-3,
+                "f16 GEMV mismatch at row {i}: cpu={}, gpu={}, rel={rel:.2e}",
                 expected[i],
                 result[i]
             );
