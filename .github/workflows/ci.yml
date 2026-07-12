@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Version drift check
@@ -47,7 +47,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
       - name: Rustdoc (deny warnings, all features incl. metal)
         env:
@@ -65,7 +65,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --workspace
@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
       - name: Print resolved CPU tier
         run: cargo run -q -p cera-cli -- cpu
@@ -110,7 +110,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
       - name: Install Mesa lavapipe (software Vulkan)
         run: |
@@ -139,7 +139,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
       - name: Build release
         run: cargo build --workspace --release
@@ -179,7 +179,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Check wasm32 compile
@@ -224,7 +224,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - uses: jetli/wasm-pack-action@v0.4.0
@@ -337,7 +337,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
           targets: wasm32-unknown-unknown
           # `rust-src` is required for `-Z build-std`; the std
           # rebuild is what makes atomics-aware sync primitives
@@ -369,7 +369,8 @@ jobs:
             -C link-arg=--export=__wasm_init_tls \
             -C link-arg=--export=__tls_size \
             -C link-arg=--export=__tls_align \
-            -C link-arg=--export=__tls_base" \
+            -C link-arg=--export=__tls_base \
+            -C link-arg=--export=__heap_base" \
           wasm-pack build cera-wasm \
             --target ${{ matrix.target }} \
             --release \
@@ -464,7 +465,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
       - name: Install ktlint
         # Pin the ktlint version + verify its sha256 so the formatter
@@ -542,7 +543,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
           targets: ${{ matrix.rust_target }}
       - uses: Swatinem/rust-cache@v2
       # Install NDK. Pin to r27c — a validated stable release the
@@ -681,7 +682,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - name: Show runner info
@@ -883,7 +884,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
       # OpenBLAS provides cblas_sgemm for the cera `blas` feature
       # (linked via `openblas-src` / `cblas-sys`, see cera/Cargo.toml).
@@ -947,7 +948,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
       # JDK 21 (Temurin) for the Kotlin runner. The cera ecosystem
       # baselines on JDK 21 (per the user's global CLAUDE.md note that
@@ -1037,7 +1038,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-04-02
+          toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
       - name: Cache downloaded parity fixtures
         uses: actions/cache@v5

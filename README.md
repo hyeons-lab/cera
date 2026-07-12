@@ -4,10 +4,6 @@
 on your laptop's CPU, an Apple GPU, a cross-platform Vulkan/DX12 GPU, a phone,
 or in the browser — from a single dependency-free core.
 
-> **Note:** Cera is a learning experiment — built to explore LLM inference
-> internals, GGUF parsing, quantization, and SIMD/GPU compute in Rust. It's
-> functional and reasonably fast, but not intended for production use.
-
 ## Why Cera
 
 - **No Python, no runtime.** Pure Rust. The CLI is a single binary; the

@@ -1,6 +1,10 @@
+// `stdarch_neon_dotprod` stabilized in 1.99.0-nightly, so it's no longer gated
+// here (keeping it would trip the `stable_features` lint). `stdarch_neon_i8mm`
+// and `stdarch_aarch64_prefetch` are still unstable — remove them from this
+// list as they stabilize.
 #![cfg_attr(
     target_arch = "aarch64",
-    feature(stdarch_neon_dotprod, stdarch_aarch64_prefetch, stdarch_neon_i8mm)
+    feature(stdarch_aarch64_prefetch, stdarch_neon_i8mm)
 )]
 
 /// Crate version, sourced from `Cargo.toml` at compile time. Useful

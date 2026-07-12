@@ -451,12 +451,16 @@ wasm-node:
 #                            matches what `wasm-bindgen-rayon`'s docs
 #                            recommend.
 #   --export=__wasm_init_tls + __tls_size + __tls_align + __tls_base
+#                          + __heap_base
 #                            wasm-bindgen-cli's threading transform
 #                            looks these up by name in the export
 #                            table. LLD generates them when shared
 #                            memory is on but doesn't auto-export them
-#                            — without these four flags wasm-bindgen
-#                            fails with `failed to find __wasm_init_tls`.
+#                            — without these flags wasm-bindgen fails
+#                            with `failed to find __wasm_init_tls`
+#                            (and, since the LLD in nightly-2026-07-10
+#                            stopped auto-exporting it, `failed to find
+#                            __heap_base for injecting thread id`).
 WASM_MT_RUSTFLAGS := "-C target-feature=+atomics,+bulk-memory,+mutable-globals" + \
     " -C link-arg=--shared-memory" + \
     " -C link-arg=--import-memory" + \
@@ -464,7 +468,8 @@ WASM_MT_RUSTFLAGS := "-C target-feature=+atomics,+bulk-memory,+mutable-globals" 
     " -C link-arg=--export=__wasm_init_tls" + \
     " -C link-arg=--export=__tls_size" + \
     " -C link-arg=--export=__tls_align" + \
-    " -C link-arg=--export=__tls_base"
+    " -C link-arg=--export=__tls_base" + \
+    " -C link-arg=--export=__heap_base"
 
 # Build the `--target web` threaded variant — `pkg-web-mt/`.
 # Browser consumers `await initThreadPool(navigator.hardwareConcurrency)`
