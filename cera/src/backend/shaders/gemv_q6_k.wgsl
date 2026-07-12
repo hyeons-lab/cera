@@ -73,6 +73,13 @@ fn gemv_q6_k(
         }
 
         for (var row = 0u; row < NR; row += 1u) {
+            // Skip the weight reads for out-of-range rows: on an odd `m` the tail
+            // workgroup's second row (`first_row + 1 == m`) would otherwise index
+            // `bb = m * row_bytes + ...` past the end of the weight buffer. The
+            // writes below are already guarded; sumf1 stays 0 for the skipped row.
+            if first_row + row >= m {
+                continue;
+            }
             let bb = (first_row + row) * row_bytes + b * Q6K_BYTES;
             let ql1 = bb + q_offset_l;
             let ql2 = ql1 + 32u;
