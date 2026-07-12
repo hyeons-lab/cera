@@ -191,7 +191,6 @@ struct GpuPipelines {
     /// n_keep context shift: re-rotate retained K cells by `R(-shift)` into
     /// scratch (the memcpy halves use `copy_buffer_to_buffer`). See `shift_kv`.
     kv_shift: wgpu::ComputePipeline,
-    attention: wgpu::ComputePipeline,
     flash_attention: wgpu::ComputePipeline,
     conv1d_fused: wgpu::ComputePipeline,
     argmax_f32: wgpu::ComputePipeline,
@@ -681,7 +680,6 @@ impl GpuLfm2Model {
             softmax: ctx.create_pipeline(shaders::SOFTMAX, "softmax", "softmax"),
             rope: ctx.create_pipeline(shaders::ROPE, "rope", "rope"),
             kv_shift: ctx.create_pipeline(shaders::KV_SHIFT, "kv_shift", "kv_shift"),
-            attention: ctx.create_pipeline(shaders::ATTENTION, "attention", "attention"),
             flash_attention: ctx.create_pipeline(
                 shaders::FLASH_ATTENTION,
                 "flash_attention",
