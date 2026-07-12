@@ -257,6 +257,7 @@ impl MmapWeight {
             DType::Q4_0 => crate::quant::dequantize_q4_0_row(bytes, dst),
             DType::Q8_0 => crate::quant::dequantize_q8_0_row(bytes, dst),
             DType::Q4KM => crate::quant::dequantize_q4_k_m_row(bytes, dst),
+            DType::Q5KM => crate::quant::dequantize_q5_k_row(bytes, dst),
             DType::Q6K => crate::quant::dequantize_q6_k_row(bytes, dst),
             other => panic!("MmapWeight::dequantize_row: unsupported dtype {other:?}"),
         }

@@ -311,6 +311,7 @@ pub(crate) fn dequantize_row_into(
         DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, out),
         DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, out),
         DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, out),
+        DType::Q5KM => crate::quant::dequantize_q5_k_row(row_data, out),
         DType::F32 => {
             let floats: &[f32] = bytemuck::cast_slice(row_data);
             out.copy_from_slice(floats);

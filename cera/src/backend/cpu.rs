@@ -69,7 +69,8 @@ pub fn configure_thread_pool() -> usize {
 }
 
 use crate::quant::{
-    BlockQ4_0, BlockQ4KM, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q4_k_m_f32, vec_dot_q8_0_f32,
+    BlockQ4_0, BlockQ4KM, BlockQ5K, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q4_k_m_f32,
+    vec_dot_q5_k_f32, vec_dot_q8_0_f32,
 };
 #[cfg(not(target_arch = "aarch64"))]
 use crate::quant::{BlockQ6K, vec_dot_q6_k_f32};
@@ -572,6 +573,33 @@ pub fn gemv_q4km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     }
 }
 
+/// Q5_K GEMV: `y[m] = A_q5km[m,k] @ x[k]`. Parallelized across rows.
+pub fn gemv_q5km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(y.len(), m);
+    debug_assert_eq!(k % 256, 0, "Q5_K GEMV: k must be divisible by 256");
+    let blocks_per_row = k / 256;
+    let row_bytes = blocks_per_row * size_of::<BlockQ5K>();
+    debug_assert_eq!(a_quant.len(), m * row_bytes);
+
+    let compute_row = |(i, yi): (usize, &mut f32)| {
+        let row_start = i * row_bytes;
+        let mut sum = 0.0f32;
+        for bi in 0..blocks_per_row {
+            let offset = row_start + bi * size_of::<BlockQ5K>();
+            let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ5K) };
+            sum += vec_dot_q5_k_f32(block, &x[bi * 256..(bi + 1) * 256]);
+        }
+        *yi = sum;
+    };
+
+    if m >= gemv_par_threshold() {
+        par_rows(y, gemv_min_rows(), compute_row);
+    } else {
+        y.iter_mut().enumerate().for_each(compute_row);
+    }
+}
+
 /// F32 GEMV: `y[m] = A_f32[m,k] @ x[k]`.
 pub fn gemv_f32(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
@@ -641,6 +669,7 @@ pub fn gemv_dispatch(
             }
         }
         DType::Q4KM => gemv_q4km_f32(data, x, y, m, k),
+        DType::Q5KM => gemv_q5km_f32(data, x, y, m, k),
         _ => panic!("gemv_dispatch: unsupported dtype {:?}", dtype),
     }
 }
