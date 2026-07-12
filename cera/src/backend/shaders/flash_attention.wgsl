@@ -39,10 +39,10 @@ const TILE: u32 = 256u;
 const MAX_HEAD_DIM: u32 = 128u;
 const NEG_INF: f32 = -3.402823e+38;
 
-var<workgroup> q_shared: array<f32, 128>;    // MAX_HEAD_DIM
-var<workgroup> acc: array<f32, 128>;         // per-dim output accumulator
-var<workgroup> tile_scores: array<f32, 256>; // TILE
-var<workgroup> red: array<f32, 256>;         // reduction scratch
+var<workgroup> q_shared: array<f32, MAX_HEAD_DIM>;
+var<workgroup> acc: array<f32, MAX_HEAD_DIM>;   // per-dim output accumulator
+var<workgroup> tile_scores: array<f32, TILE>;
+var<workgroup> red: array<f32, TILE>;           // reduction scratch
 // Running online-softmax state, broadcast to all threads via workgroup memory.
 // [0]=running max, [1]=running sum, [2]=this tile's new max, [3]=correction.
 var<workgroup> st: array<f32, 4>;

@@ -1792,16 +1792,32 @@ impl GpuLfm2Model {
         seq_len: u32,
         scale: f32,
     ) {
-        // flash_attention.wgsl sizes `q_shared` / `acc` at 128 f32, so head_dim
-        // must fit. Every current LFM2 / dense model uses head_dim ∈ {64, 128},
-        // but assert loudly rather than let a larger head_dim silently corrupt
-        // the output via clamped out-of-bounds workgroup-array writes. (The
-        // replaced classic kernel had no such bound — this makes the flash
-        // kernel's limit an explicit contract instead of silent garbage.)
+        // flash_attention.wgsl sizes `q_shared` / `acc` at MAX_HEAD_DIM (128) f32,
+        // so head_dim must fit. Every current LFM2 / dense model uses head_dim ∈
+        // {64, 128}, but assert loudly rather than let a larger head_dim silently
+        // corrupt the output via clamped out-of-bounds workgroup-array writes. (The
+        // replaced classic kernel had no such bound — this makes the flash kernel's
+        // limit an explicit contract instead of silent garbage.)
         assert!(
             head_dim <= 128,
             "wgpu flash_attention supports head_dim <= 128 (q_shared/acc are \
              sized 128); got {head_dim}"
+        );
+        // The kernel derives `group_size = n_heads / n_kv_heads` and
+        // `kv_head = head / group_size`, then reads a head_dim-wide slice at
+        // `kv_head * head_dim` within each kv_dim-strided KV row. Enforce the GQA
+        // invariants it assumes so a malformed config fails fast here instead of
+        // dividing by zero or reading out of bounds on the GPU.
+        assert!(
+            n_kv_heads > 0 && n_heads % n_kv_heads == 0,
+            "wgpu flash_attention requires n_kv_heads > 0 and n_heads divisible by \
+             n_kv_heads; got n_heads={n_heads}, n_kv_heads={n_kv_heads}"
+        );
+        assert_eq!(
+            kv_dim,
+            n_kv_heads * head_dim,
+            "wgpu flash_attention requires kv_dim == n_kv_heads * head_dim; got \
+             kv_dim={kv_dim}, n_kv_heads={n_kv_heads}, head_dim={head_dim}"
         );
         let params: [u32; 8] = [
             n_heads,
