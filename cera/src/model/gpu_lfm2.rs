@@ -1601,7 +1601,7 @@ impl GpuLfm2Model {
 
     /// Submit encoder and wait for GPU to finish.
     fn submit_and_wait(&self, enc: wgpu::CommandEncoder) {
-        self.ctx.queue.submit(Some(enc.finish()));
+        self.ctx.submit_encoder(enc);
         self.ctx.device.poll(wgpu::Maintain::Wait);
     }
 
@@ -2898,7 +2898,7 @@ impl GpuLfm2Model {
                     self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
                 }
             }
-            self.ctx.queue.submit(Some(enc.finish()));
+            self.ctx.submit_encoder(enc);
         }
 
         // 3. Output norm + projection. Untied models project through
@@ -3038,7 +3038,7 @@ impl GpuLfm2Model {
             self.ctx.reset_profiler();
             let mut enc = self.new_encoder();
             self.encode_argmax_pass(&mut enc);
-            self.ctx.queue.submit(Some(enc.finish()));
+            self.ctx.submit_encoder(enc);
             self.ctx.finish_profiler();
 
             self.ctx
@@ -4409,7 +4409,7 @@ impl GpuLfm2Model {
                 enc.clear_buffer(conv_buf, 0, None);
             }
         }
-        self.ctx.queue.submit(Some(enc.finish()));
+        self.ctx.submit_encoder(enc);
     }
 }
 

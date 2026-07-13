@@ -31,26 +31,41 @@ in this runtime, so the GPU row is cera-CPU-vs-cera-GPU only.
 
 ## GPU I/O counters (`cera bench --gpu-io`)
 
-These are the numbers that killed the "GPU is latency-bound on round-trips"
-theory — see `GPU_FINDINGS_CORRECTION.md` (this directory). They are **identical** on Mac and
-Adreno, while throughput differs 4-13x:
+> **These numbers were wrong in the first cut of this doc** (1.0 submits/token,
+> 0.045 prefill submits/prompt-token). The counter only saw submits routed through
+> `submit_encoder`, and the model bypassed it with direct `queue.submit` calls, so
+> it was counting the logits readback and nothing else. Every submit is now routed
+> through the choke point. The full post-mortem is in `GPU_FINDINGS_CORRECTION.md`.
 
-| | Mac (wgpu) | Android (Adreno) |
-|---|---:|---:|
-| decode submits / token | 1.0 | 1.0 |
-| decode readbacks / token | 1.0 | 1.0 |
-| decode readback **bytes** / token | 4 | 4 |
-| prefill submits / prompt-token | 0.045 | 0.045 |
+Prompt 512, greedy decode:
 
-Read: the forward pass is **already one submit per token**, and greedy decode
-**already samples on the GPU** (4-byte token-id readback, not vocab logits).
-Prefill is **already batched**. So round-trip count is not the GPU bottleneck —
-the Adreno *kernels* are. Any GPU change must therefore be justified by a
-per-kernel timing (T5b), not by a round-trip count.
+| | LFM2-VL-450M **Q4_0** (Mac) | LFM2.5-350M **Q4_K_M** (Mac) | LFM2.5-350M **Q4_K_M** (Adreno) |
+|---|---:|---:|---:|
+| decode submits / token | **19.0** | **19.0** | **19.0** |
+| decode readbacks / token | 1.0 | 1.0 | 1.0 |
+| decode readback **bytes** / token | 4 | 4 | 4 |
+| **prefill submits** (512-tok prompt) | **25** | **8728** | **8728** |
 
-Caveat: `bench` decodes greedily (temp=0), which takes the on-GPU argmax path.
-The **non-greedy** path still downloads full vocab logits per token — invisible
-to these numbers by construction.
+Read:
+
+- **Decode issues 19 submits per token** — one per layer, plus argmax. The forward
+  pass is *not* batched into a single command buffer (T6).
+- Greedy decode **does** sample on the GPU: the readback is a 4-byte token id, not
+  vocab logits. That part was always true.
+- **Prefill batching is gated on quantization, not platform.** The batched path
+  requires every matmul weight to be `Q4_0`/`Q8_0`/`Q4_K`. A `Q4_K_M` file carries
+  **11 Q6_K tensors**, which fails the check, so prefill **silently** falls back to
+  the per-token loop — 8728 submits instead of 25. The same model does this on Mac
+  too; it is not an Adreno effect (T8).
+
+Because of that gate, the Mac-vs-Adreno rows in earlier revisions of this doc
+compared a **Q4_0** model on Mac against a **Q4_K_M** model on Adreno — i.e. the
+batched path against the fallback path. Same-model gaps are **3.3x prefill** and
+**2.3x decode**, not the 13x/4x reported before.
+
+Caveat: `bench` decodes greedily (temp=0), which takes the on-GPU argmax path. The
+**non-greedy** path still downloads full vocab logits per token — invisible to
+these numbers by construction.
 
 ## Reproduce
 

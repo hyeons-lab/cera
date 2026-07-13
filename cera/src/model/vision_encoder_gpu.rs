@@ -794,7 +794,7 @@ impl WgpuVitOps {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
         }
-        self.ctx.queue.submit(Some(enc.finish()));
+        self.ctx.submit_encoder(enc);
     }
 
     /// Quantized `y[tokens, out_dim] = x[tokens, in_dim] · wᵀ` via the

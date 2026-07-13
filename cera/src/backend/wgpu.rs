@@ -19,11 +19,16 @@ use half::f16;
 /// they turn "the GPU is stalling on round-trips" into a number a change can be
 /// held to.
 ///
-/// Worth knowing before you reach for them: on this backend the answer already
-/// came back **no**. Decode measures 1.0 submits and 1.0 readbacks (4 bytes) per
-/// token on both Apple and Adreno hardware — identical structure, yet Adreno is
-/// several times slower. Round-trips are not the bottleneck there; the kernels
-/// are. See `benchmarks/BASELINE.md`.
+/// Worth knowing before you reach for them: decode currently measures **19 submits
+/// per token** — roughly one per layer — and 1.0 readbacks of 4 bytes (greedy
+/// sampling already runs argmax on-GPU). So the submit count is a live suspect, not
+/// a settled one.
+///
+/// An earlier revision of this comment claimed 1.0 submits/token. That was the
+/// counter measuring itself: only `submit_encoder` incremented it, and the model
+/// bypassed it with direct `queue.submit` calls. If you add a new submit path, route
+/// it through `GpuContext::submit_encoder` or these numbers start lying again.
+/// See `benchmarks/GPU_FINDINGS_CORRECTION.md`.
 ///
 /// The counters are plain relaxed atomics incremented unconditionally: a
 /// `fetch_add` next to a real GPU submit is free, and gating them behind an env

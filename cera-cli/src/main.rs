@@ -3701,13 +3701,15 @@ fn main() -> Result<()> {
                     if io_tokens == 0 {
                         eprintln!("gpu I/O: no tokens decoded — nothing to report");
                     } else {
-                        let t = io_tokens as f64;
+                        let decode = cera::backend::wgpu::io_stats::GpuIoStats {
+                            submits: io_submits,
+                            readbacks: io_readbacks,
+                            readback_bytes: io_readback_bytes,
+                        };
+                        let (sub_pt, rb_pt, bytes_pt) = decode.per_token(io_tokens);
                         eprintln!(
-                            "gpu I/O (decode): {:.1} submits/token, {:.1} readbacks/token, \
-                             {:.0} readback bytes/token (over {io_tokens} tokens)",
-                            io_submits as f64 / t,
-                            io_readbacks as f64 / t,
-                            io_readback_bytes as f64 / t,
+                            "gpu I/O (decode): {sub_pt:.1} submits/token, {rb_pt:.1} readbacks/token, \
+                             {bytes_pt:.0} readback bytes/token (over {io_tokens} tokens)",
                         );
                         // A batched prefill should be ~one submit for the whole
                         // pass. A submit *per prompt token* means prefill is
