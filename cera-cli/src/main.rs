@@ -1372,6 +1372,65 @@ fn gpu_io_snapshot() -> (u64, u64, u64) {
     (0, 0, 0)
 }
 
+/// Print the `--gpu-io` report. Paired with a no-op-ish `cfg(not(gpu))` twin below,
+/// mirroring `gpu_io_snapshot`: the counters live behind the `gpu` feature, so the
+/// reporting has to be gated at compile time, not with a runtime `cfg!`.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn report_gpu_io(
+    submits: u64,
+    readbacks: u64,
+    readback_bytes: u64,
+    tokens: u64,
+    pf_submits: u64,
+    pf_readbacks: u64,
+    pf_tokens: u64,
+) {
+    use cera::backend::wgpu::io_stats::GpuIoStats;
+
+    if tokens == 0 {
+        eprintln!("gpu I/O: no tokens decoded — nothing to report");
+        return;
+    }
+    let decode = GpuIoStats {
+        submits,
+        readbacks,
+        readback_bytes,
+    };
+    let (sub_pt, rb_pt, bytes_pt) = decode.per_token(tokens);
+    eprintln!(
+        "gpu I/O (decode): {sub_pt:.1} submits/token, {rb_pt:.1} readbacks/token, \
+         {bytes_pt:.0} readback bytes/token (over {tokens} tokens)",
+    );
+    // A batched prefill is ~one submit for the whole pass. A submit *per prompt
+    // token* means prefill is secretly looping the decode path — which is exactly
+    // what a quant that fails the batched-GEMM dtype check does.
+    if pf_tokens > 0 {
+        let prefill = GpuIoStats {
+            submits: pf_submits,
+            readbacks: pf_readbacks,
+            readback_bytes: 0,
+        };
+        let (pf_sub_pt, _, _) = prefill.per_token(pf_tokens);
+        eprintln!(
+            "gpu I/O (prefill): {pf_submits} submits, {pf_readbacks} readbacks total \
+             ({pf_sub_pt:.3} submits/prompt-token over {pf_tokens} tokens)",
+        );
+    }
+    if submits == 0 && readbacks == 0 {
+        eprintln!(
+            "  (all zero — the active backend is not wgpu; \
+             these counters only instrument the wgpu path)"
+        );
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+#[allow(clippy::too_many_arguments)]
+fn report_gpu_io(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64, _: u64) {
+    eprintln!("gpu I/O: unavailable — cera-cli was built without the `gpu` feature");
+}
+
 /// (p10, p50, p90, mean, stddev)
 fn summarize(mut xs: Vec<f64>) -> (f64, f64, f64, f64, f64) {
     assert!(!xs.is_empty());
@@ -3697,45 +3756,15 @@ fn main() -> Result<()> {
             );
 
             if gpu_io {
-                if cfg!(feature = "gpu") {
-                    if io_tokens == 0 {
-                        eprintln!("gpu I/O: no tokens decoded — nothing to report");
-                    } else {
-                        let decode = cera::backend::wgpu::io_stats::GpuIoStats {
-                            submits: io_submits,
-                            readbacks: io_readbacks,
-                            readback_bytes: io_readback_bytes,
-                        };
-                        let (sub_pt, rb_pt, bytes_pt) = decode.per_token(io_tokens);
-                        eprintln!(
-                            "gpu I/O (decode): {sub_pt:.1} submits/token, {rb_pt:.1} readbacks/token, \
-                             {bytes_pt:.0} readback bytes/token (over {io_tokens} tokens)",
-                        );
-                        // A batched prefill should be ~one submit for the whole
-                        // pass. A submit *per prompt token* means prefill is
-                        // secretly looping the decode path — which would explain
-                        // a prefill rate that never exceeds decode.
-                        if pf_tokens > 0 {
-                            eprintln!(
-                                "gpu I/O (prefill): {} submits, {} readbacks total \
-                                 ({:.3} submits/prompt-token over {pf_tokens} tokens)",
-                                pf_submits,
-                                pf_readbacks,
-                                pf_submits as f64 / pf_tokens as f64,
-                            );
-                        }
-                        if io_submits == 0 && io_readbacks == 0 {
-                            eprintln!(
-                                "  (all zero — the active backend is not wgpu; \
-                                 these counters only instrument the wgpu path)"
-                            );
-                        }
-                    }
-                } else {
-                    eprintln!(
-                        "gpu I/O: unavailable — cera-cli was built without the `gpu` feature"
-                    );
-                }
+                report_gpu_io(
+                    io_submits,
+                    io_readbacks,
+                    io_readback_bytes,
+                    io_tokens,
+                    pf_submits,
+                    pf_readbacks,
+                    pf_tokens,
+                );
             }
         }
     }
