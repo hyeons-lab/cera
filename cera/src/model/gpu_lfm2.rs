@@ -3114,14 +3114,13 @@ impl GpuLfm2Model {
 //     `start_pos`; conv rolling state and KV cache writes carry across).
 //   * `1 <= n <= MAX_PREFILL_TOKENS` per call (asserted).
 //   * `start_pos + n <= max_seq_len` (asserted).
-//   * Every matmul weight must have a batched GEMM kernel — Q4_0
-//     (mul_mat_reg_tile), Q4KM/Q6K (mul_mat_reg_tile with a K-quant shmem
-//     loader), or Q8_0 (gemm_q8_0). Any other
-//     dtype (F32, Q6K, Q5KM, …) makes `all_matmul_weights_batched_supported`
-//     return false and the whole prompt falls through to the per-token GEMV
-//     loop at the dispatcher.
+//   * Every matmul weight must have a batched GEMM kernel — Q4_0 and Q4KM/Q6K
+//     (mul_mat_reg_tile, the K-quants via a K-quant shmem loader), or Q8_0
+//     (gemm_q8_0). Any other dtype (F32, Q5KM, …) makes
+//     `unbatchable_matmul_weight` return the offending tensor and the whole
+//     prompt falls through to the per-token GEMV loop at the dispatcher.
 //
-// Extending the batched path to further dtypes (e.g. a Q6K/Q5KM GEMM, or an
+// Extending the batched path to further dtypes (e.g. a Q5KM loader, or an
 // f32 `gemm_f32` fallback) can land in a follow-up PR without disturbing this
 // contract.
 //
@@ -3145,9 +3144,9 @@ impl GpuLfm2Model {
     /// The first matmul weight that has no batched prefill kernel, as
     /// `(layer, tensor name, dtype)` — or `None` when every weight has one, which
     /// is the precondition for `forward_prefill_batched_locked` to take the batched
-    /// path. Q4_0 uses the register-tiled path; Q8_0, Q4KM and Q6K use the
-    /// Q4KM and Q6K use the same register-tiled kernel with a K-quant shmem loader;
-    /// Q8_0 still uses the conservative batched GEMV-shaped path (gemm_q8_0).
+    /// path. Q4_0 uses the register-tiled path; Q4KM and Q6K use that same
+    /// register-tiled kernel with a K-quant shmem loader; Q8_0 still uses the
+    /// conservative batched GEMV-shaped path (gemm_q8_0).
     ///
     /// Returns the *offender*, not a bare `bool`, because one unsupported tensor
     /// silently drops the whole prompt onto the per-token loop — ~340x the submits

@@ -3544,7 +3544,7 @@ mod tests {
         let a_buf = ctx.upload_storage(&raw, "gemm_q6k_weights");
         let x_buf = ctx.upload_f32(&x_batch, "gemm_q6k_x");
         let y_buf = ctx.create_storage_rw(((n * y_stride) as u64) * 4, "gemm_q6k_y");
-        let params: [u32; 6] = [m, k, n, x_stride, y_stride, 0];
+        let params: [u32; 5] = [m, k, n, x_stride, y_stride];
         let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "gemm_q6k_params");
 
         // The register-tiled kernel with the Q6_K shmem loader — the same pipeline

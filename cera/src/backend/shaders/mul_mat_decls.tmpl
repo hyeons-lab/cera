@@ -52,6 +52,11 @@ fn load_src0_f32_at(byte_offset: u32) -> f32 {
     let packed = unpack2x16float(load_src0_u16_at(byte_offset));
     return f32(packed[0]);
 }
+
+fn load_src0_byte_at(byte_offset: u32) -> u32 {
+    let word = src0[byte_offset / 4u];
+    return (word >> ((byte_offset & 3u) * 8u)) & 0xFFu;
+}
 #endif
 
 #ifdef INIT_SRC0_SHMEM_FLOAT
@@ -154,11 +159,6 @@ fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
 const Q4K_BLOCK_SIZE = 256u;
 const Q4K_BLOCK_BYTES = 144u;
 
-fn load_src0_byte_at(byte_offset: u32) -> u32 {
-    let word = src0[byte_offset / 4u];
-    return (word >> ((byte_offset & 3u) * 8u)) & 0xFFu;
-}
-
 // 6-bit sub-scale / min unpack — port of `decode_q4km_scales` (quant.rs).
 fn q4k_sc(sb: u32, sub: u32) -> u32 {
     if (sub < 4u) {
@@ -236,11 +236,6 @@ fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
 // TILE_K divides the 256-element super-block.
 const Q6K_BLOCK_SIZE = 256u;
 const Q6K_BLOCK_BYTES = 210u;
-
-fn load_src0_byte_at(byte_offset: u32) -> u32 {
-    let word = src0[byte_offset / 4u];
-    return (word >> ((byte_offset & 3u) * 8u)) & 0xFFu;
-}
 
 fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
     let PARAMS_BLOCKS_K = (params.k + Q6K_BLOCK_SIZE - 1u) / Q6K_BLOCK_SIZE;
