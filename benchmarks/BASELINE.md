@@ -45,6 +45,11 @@ Prompt 512, greedy decode:
 | decode readbacks / token | 1.0 | 1.0 | 1.0 |
 | decode readback **bytes** / token | 4 | 4 | 4 |
 | **prefill submits** (512-tok prompt) | **25** | **8728** | **8728** |
+| prefill readbacks (512-tok prompt) | 23 | 23 | n/m |
+| prefill readback **bytes** (512-tok prompt) | 12,926,976 | 12,926,976 | n/m |
+
+`n/m` = not measured; the prefill readback counters postdate the Adreno run and
+re-measuring needs the device.
 
 Read:
 
@@ -57,12 +62,12 @@ Read:
   **11 Q6_K tensors**, which fails the check, so prefill **silently** falls back to
   the per-token loop — 8728 submits instead of 25. The same model does this on Mac
   too; it is not an Adreno effect (T8).
-- **Prefill reads back ~12.9 MB** (23 readbacks) for Q4_K_M/512 on Mac — decode's
-  per-token readback is 4 bytes, but prefill's is not negligible and is worth its
-  own look. Unlike the submit count, the readback count does *not* scale with the
-  fallback: 23 either way. Measured after the counters were fixed; the Q4_0 column
-  is unmeasured here because the local `LFM-450M-Q4_0.gguf` is a corrupt (non-GGUF)
-  file.
+- **Prefill reads back ~12.9 MB per 512-token prompt** (23 readbacks), against
+  decode's 4 bytes/token. Not negligible, and its own optimization target.
+- **That readback volume is identical on both paths** — 23 readbacks and
+  12,926,976 bytes whether prefill runs batched (Q4_0, 25 submits) or falls back
+  (Q4_K_M, 8728 submits). So the readbacks are *not* a symptom of the fallback
+  above; fixing the dtype gate will not touch them. Two independent problems.
 
 Because of that gate, the Mac-vs-Adreno rows in earlier revisions of this doc
 compared a **Q4_0** model on Mac against a **Q4_K_M** model on Adreno — i.e. the
