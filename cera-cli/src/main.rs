@@ -3652,9 +3652,10 @@ fn main() -> Result<()> {
                     ..Default::default()
                 };
                 let mut sink = NoopSink;
-                // Scope the GPU I/O counters to decode only: prefill is one
-                // batched pass, but decode pays a round-trip *per token*, and
-                // that per-token cost is what dominates GPU decode.
+                // Scope these counters to decode only, so the decode rates are
+                // per decoded token and not diluted by prefill (measured
+                // separately above — its submit count varies wildly depending
+                // on whether the batched path was taken).
                 let io_before = gpu_io_snapshot();
                 let summary = session.generate(&opts, &mut sink)?;
                 let io_after = gpu_io_snapshot();
