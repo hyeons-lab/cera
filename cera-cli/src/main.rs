@@ -787,10 +787,13 @@ enum Command {
         ubatch_size: u32,
 
         /// Report GPU I/O counters (queue submits and GPU→CPU readbacks, per
-        /// decoded token) alongside throughput. Decode on a mobile GPU is
-        /// dominated by per-token round-trips rather than math, so these are
-        /// the numbers that show whether a change actually removed them.
-        /// No-op on non-GPU backends.
+        /// decoded token) alongside throughput. Use these to check whether a
+        /// change actually removed per-token round-trips, instead of assuming
+        /// it did.
+        ///
+        /// Only the wgpu backend is instrumented — the counters read zero on
+        /// CPU *and* on other GPU backends (e.g. Metal), which is reported
+        /// explicitly rather than printed as a misleading 0.0 submits/token.
         #[arg(long)]
         gpu_io: bool,
     },

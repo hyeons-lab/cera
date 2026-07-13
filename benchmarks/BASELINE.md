@@ -32,7 +32,7 @@ in this runtime, so the GPU row is cera-CPU-vs-cera-GPU only.
 ## GPU I/O counters (`cera bench --gpu-io`)
 
 These are the numbers that killed the "GPU is latency-bound on round-trips"
-theory — see `GPU_FINDINGS_CORRECTION.md`. They are **identical** on Mac and
+theory — see `GPU_FINDINGS_CORRECTION.md` (this directory). They are **identical** on Mac and
 Adreno, while throughput differs 4-13x:
 
 | | Mac (wgpu) | Android (Adreno) |

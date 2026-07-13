@@ -13,10 +13,17 @@ use half::f16;
 
 /// GPU I/O counters — queue submits and GPU→CPU readbacks.
 ///
-/// Decode on a mobile GPU is dominated by per-token CPU/GPU round-trips, not by
-/// math: every submit costs a driver round-trip and every readback forces a
-/// pipeline flush. These counters make that cost a *number* rather than an
-/// inference, so a change that claims to remove round-trips can be held to it.
+/// Every submit costs a driver round-trip and every readback forces a pipeline
+/// flush, so round-trip count is a plausible suspect whenever GPU decode is
+/// slow. These counters exist to *test* that suspicion rather than assume it:
+/// they turn "the GPU is stalling on round-trips" into a number a change can be
+/// held to.
+///
+/// Worth knowing before you reach for them: on this backend the answer already
+/// came back **no**. Decode measures 1.0 submits and 1.0 readbacks (4 bytes) per
+/// token on both Apple and Adreno hardware — identical structure, yet Adreno is
+/// several times slower. Round-trips are not the bottleneck there; the kernels
+/// are. See `benchmarks/BASELINE.md`.
 ///
 /// The counters are plain relaxed atomics incremented unconditionally: a
 /// `fetch_add` next to a real GPU submit is free, and gating them behind an env

@@ -45,7 +45,7 @@ done
 [[ -n "$MODEL" ]] || { echo "--model <name.gguf> is required" >&2; exit 2; }
 
 if [[ -z "$SERIAL" ]]; then
-  n=$(adb devices | grep -cE "\sdevice$" || true)
+  n=$(adb devices | grep -cE "[[:space:]]device$" || true)
   if [[ "$n" -ne 1 ]]; then
     echo "error: $n adb devices attached — pass --serial (or set CERA_ANDROID_SERIAL)." >&2
     adb devices >&2
@@ -54,6 +54,8 @@ if [[ -z "$SERIAL" ]]; then
 fi
 ADB=(adb)
 [[ -n "$SERIAL" ]] && ADB=(adb -s "$SERIAL")
+
+"${ADB[@]}" shell "mkdir -p $DEVICE_DIR"
 
 # Push simpleperf from the NDK if the device doesn't already have it.
 if ! "${ADB[@]}" shell "test -x $DEVICE_DIR/simpleperf" 2>/dev/null; then

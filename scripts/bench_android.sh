@@ -50,7 +50,7 @@ done
 # More than one device (phone + emulator) is the common case on a dev box, and
 # adb errors out rather than picking one — so require an explicit serial.
 if [[ -z "$SERIAL" ]]; then
-  n=$(adb devices | grep -cE "\sdevice$" || true)
+  n=$(adb devices | grep -cE "[[:space:]]device$" || true)
   if [[ "$n" -ne 1 ]]; then
     echo "error: $n adb devices attached — pass --serial (or set CERA_ANDROID_SERIAL)." >&2
     adb devices >&2
@@ -124,8 +124,8 @@ if [[ -n "$LLAMA_BENCH" ]]; then
 -m $DEVICE_DIR/$MODEL -t $t -p $PROMPT -n $DECODE -r $RUNS -o md" 2>&1) || true
     echo "$out" >> "$LOG"
     # llama-bench md rows: | model | size | params | backend | threads | test | t/s |
-    pp=$(grep -E "\|\s*pp$PROMPT\s*\|" <<<"$out" | sed -n 's/.*|\s*\([0-9.]*\) ±.*/\1/p' | head -1)
-    tg=$(grep -E "\|\s*tg$DECODE\s*\|" <<<"$out" | sed -n 's/.*|\s*\([0-9.]*\) ±.*/\1/p' | head -1)
+    pp=$(grep -E "\|[[:space:]]*pp$PROMPT[[:space:]]*\|" <<<"$out" | sed -n "s/.*|[[:space:]]*\\([0-9.]*\\) ±.*/\\1/p" | head -1)
+    tg=$(grep -E "\|[[:space:]]*tg$DECODE[[:space:]]*\|" <<<"$out" | sed -n "s/.*|[[:space:]]*\\([0-9.]*\\) ±.*/\\1/p" | head -1)
     echo "llama.cpp,cpu,t$t-$mask,${pp:-NA},${tg:-NA},NA,NA" >> "$OUT"
     echo "  -> pp=$pp tg=$tg" | tee -a "$LOG"
   done
