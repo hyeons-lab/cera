@@ -700,9 +700,17 @@ pub(crate) mod neon {
         k: usize,
     ) {
         debug_assert_eq!(k % 256, 0, "Q4_K GEMV: k must be divisible by 256");
+        debug_assert_eq!(y.len(), _m, "Q4_K GEMV: y.len() must equal m");
         unsafe {
             let blocks_per_row = k / 256;
             let row_bytes = blocks_per_row * size_of::<BlockQ4KM>();
+            // Guards the unsafe per-row pointer math below (mirrors the scalar
+            // `gemv_q4km_f32`): each of the m rows reads `row_bytes` from a_quant.
+            debug_assert_eq!(
+                a_quant.len(),
+                _m * row_bytes,
+                "Q4_K GEMV: a_quant size mismatch"
+            );
             let a_base = a_quant.as_ptr() as usize;
             let xq_base = x_quants.as_ptr() as usize;
             let xs_base = x_scales.as_ptr() as usize;
