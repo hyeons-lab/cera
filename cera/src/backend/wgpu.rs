@@ -11,6 +11,78 @@ use crate::backend::wgsl_pp::Preprocessor;
 use crate::tensor::DType;
 use half::f16;
 
+/// GPU I/O counters — queue submits and GPU→CPU readbacks.
+///
+/// Decode on a mobile GPU is dominated by per-token CPU/GPU round-trips, not by
+/// math: every submit costs a driver round-trip and every readback forces a
+/// pipeline flush. These counters make that cost a *number* rather than an
+/// inference, so a change that claims to remove round-trips can be held to it.
+///
+/// The counters are plain relaxed atomics incremented unconditionally: a
+/// `fetch_add` next to a real GPU submit is free, and gating them behind an env
+/// var would mean threading a flag through every encoder path for no measurable
+/// gain. Reporting is opt-in at the call site (see `cera bench --gpu-io`), so
+/// default output is unchanged.
+pub mod io_stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static SUBMITS: AtomicU64 = AtomicU64::new(0);
+    static READBACKS: AtomicU64 = AtomicU64::new(0);
+    static READBACK_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    /// A snapshot of the GPU I/O counters.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct GpuIoStats {
+        /// Number of `queue.submit` calls.
+        pub submits: u64,
+        /// Number of GPU→CPU readbacks (each forces a pipeline flush).
+        pub readbacks: u64,
+        /// Total bytes read back from the GPU.
+        pub readback_bytes: u64,
+    }
+
+    impl GpuIoStats {
+        /// Per-token rates, given the number of tokens the interval covered.
+        /// Returns zeros when `tokens` is 0 rather than dividing by zero.
+        pub fn per_token(&self, tokens: u64) -> (f64, f64, f64) {
+            if tokens == 0 {
+                return (0.0, 0.0, 0.0);
+            }
+            let t = tokens as f64;
+            (
+                self.submits as f64 / t,
+                self.readbacks as f64 / t,
+                self.readback_bytes as f64 / t,
+            )
+        }
+    }
+
+    pub(crate) fn record_submit() {
+        SUBMITS.fetch_add(1, Relaxed);
+    }
+
+    pub(crate) fn record_readback(bytes: u64) {
+        READBACKS.fetch_add(1, Relaxed);
+        READBACK_BYTES.fetch_add(bytes, Relaxed);
+    }
+
+    /// Snapshot the counters.
+    pub fn snapshot() -> GpuIoStats {
+        GpuIoStats {
+            submits: SUBMITS.load(Relaxed),
+            readbacks: READBACKS.load(Relaxed),
+            readback_bytes: READBACK_BYTES.load(Relaxed),
+        }
+    }
+
+    /// Reset the counters to zero (call before a measured interval).
+    pub fn reset() {
+        SUBMITS.store(0, Relaxed);
+        READBACKS.store(0, Relaxed);
+        READBACK_BYTES.store(0, Relaxed);
+    }
+}
+
 /// GPU compute context: device, queue, and optional timestamp profiling.
 pub struct GpuContext {
     pub device: wgpu::Device,
@@ -110,6 +182,15 @@ impl PendingReadback {
 }
 
 impl GpuContext {
+    /// Finish `enc` and submit it, counting the submit.
+    ///
+    /// Every GPU submit in this backend goes through here, so the submit count
+    /// is exact and there is a single choke point to batch submissions at.
+    pub(crate) fn submit_encoder(&self, enc: wgpu::CommandEncoder) {
+        io_stats::record_submit();
+        self.queue.submit(Some(enc.finish()));
+    }
+
     /// Initialize the GPU: request a high-performance adapter + device
     /// (blocking). Native convenience wrapper around [`Self::new_async`].
     /// Not available on wasm32 — the WebGPU backend can only be driven from
@@ -352,7 +433,7 @@ impl GpuContext {
                 label: Some("download"),
             });
         encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, size);
-        self.queue.submit(Some(encoder.finish()));
+        self.submit_encoder(encoder);
 
         // Map only the requested `0..size` byte range, not the full
         // staging buffer. The cached staging is sized to the largest
@@ -360,6 +441,7 @@ impl GpuContext {
         // entire size every call (e.g. a small `count` after a prior
         // `vocab_size` download would still pay the vocab-sized cost
         // and stale tail bytes would leak into the returned `Vec`).
+        io_stats::record_readback(size);
         let slice = staging.slice(0..size);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -402,8 +484,9 @@ impl GpuContext {
                 label: Some("download-async"),
             });
         encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
-        self.queue.submit(Some(encoder.finish()));
+        self.submit_encoder(encoder);
 
+        io_stats::record_readback(size);
         let (tx, rx) = futures_channel::oneshot::channel();
         staging
             .slice(0..size)
@@ -477,13 +560,14 @@ impl GpuContext {
                 label: Some("download_u32"),
             });
         encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, size);
-        self.queue.submit(Some(encoder.finish()));
+        self.submit_encoder(encoder);
 
         // Map only the requested `0..size` range — see download_f32
         // above for the same reasoning. With a vocab-sized cached
         // staging buffer, mapping the full range turns the 4-byte
         // argmax readback into a vocab-sized copy on every greedy
         // step, defeating the optimization.
+        io_stats::record_readback(size);
         let slice = staging.slice(0..size);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -533,8 +617,9 @@ impl GpuContext {
                 label: Some("download_f16"),
             });
         encoder.copy_buffer_to_buffer(buffer, 0, staging, 0, aligned_size);
-        self.queue.submit(Some(encoder.finish()));
+        self.submit_encoder(encoder);
 
+        io_stats::record_readback(aligned_size);
         let slice = staging.slice(0..aligned_size);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -654,7 +739,7 @@ impl GpuContext {
             0,
             (n_queries as u64) * 8,
         );
-        self.queue.submit(Some(enc.finish()));
+        self.submit_encoder(enc);
 
         let slice = profiler.read_buf.slice(..((n_queries as u64) * 8));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1083,7 +1168,7 @@ mod tests {
             // One workgroup per row (simple V1)
             pass.dispatch_workgroups(m, 1, 1);
         }
-        ctx.queue.submit(Some(encoder.finish()));
+        ctx.submit_encoder(encoder);
 
         let result = ctx.download_f32(&y_buf, m as usize);
 
@@ -1174,7 +1259,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(m.div_ceil(8), 1, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let result = ctx.download_f32(&y_buf, m as usize);
         for i in 0..m as usize {
@@ -1228,7 +1313,7 @@ mod tests {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
         ctx.device.poll(wgpu::Maintain::Wait);
     }
 
@@ -1597,7 +1682,7 @@ mod tests {
             let wg_n = n.div_ceil(8 * 4);
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
         ctx.device.poll(wgpu::Maintain::Wait);
 
         let result = ctx.download_f32(&y_buf, (n * m) as usize);
@@ -1710,7 +1795,7 @@ mod tests {
             let wg_n = n.div_ceil(8 * 4);
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
         ctx.device.poll(wgpu::Maintain::Wait);
 
         let result = ctx.download_f32(&y_buf, (n * y_stride) as usize);
@@ -1826,7 +1911,7 @@ mod tests {
             let wg_n = n.div_ceil(8 * 4);
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
         ctx.device.poll(wgpu::Maintain::Wait);
 
         let result = ctx.download_f32(&y_buf, (n * m) as usize);
@@ -1931,7 +2016,7 @@ mod tests {
             let wg_n = n.div_ceil(8 * 4);
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
         ctx.device.poll(wgpu::Maintain::Wait);
 
         let result = ctx.download_f32(&y_buf, (n * m) as usize);
@@ -2015,7 +2100,7 @@ mod tests {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(m, 1, 1);
         }
-        ctx.queue.submit(Some(encoder.finish()));
+        ctx.submit_encoder(encoder);
 
         let result = ctx.download_f32(&y_buf, m as usize);
 
@@ -2093,7 +2178,7 @@ mod tests {
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(m, 1, 1);
             }
-            ctx.queue.submit(Some(enc.finish()));
+            ctx.submit_encoder(enc);
         }
         ctx.device.poll(wgpu::Maintain::Wait);
 
@@ -2108,7 +2193,7 @@ mod tests {
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(m, 1, 1);
             }
-            ctx.queue.submit(Some(enc.finish()));
+            ctx.submit_encoder(enc);
         }
         ctx.device.poll(wgpu::Maintain::Wait);
         let elapsed = start.elapsed();
@@ -2243,7 +2328,7 @@ mod tests {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
         }
-        ctx.queue.submit(Some(encoder.finish()));
+        ctx.submit_encoder(encoder);
 
         let result = ctx.download_f32(&a_buf, n as usize);
         for i in 0..n as usize {
@@ -2307,7 +2392,7 @@ mod tests {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
         }
-        ctx.queue.submit(Some(encoder.finish()));
+        ctx.submit_encoder(encoder);
 
         let result = ctx.download_f32(&gate_buf, n as usize);
         for i in 0..n as usize {
@@ -2371,7 +2456,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let result = ctx.download_f32(&x_buf, n as usize);
         for i in 0..n as usize {
@@ -2428,7 +2513,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let result = ctx.download_f32(&x_buf, n as usize);
         let sum: f32 = result.iter().sum();
@@ -2541,7 +2626,7 @@ mod tests {
             // Shader processes 8 rows per workgroup
             pass.dispatch_workgroups(m.div_ceil(8), 1, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let result = ctx.download_f32(&y_buf, m as usize);
         for i in 0..m as usize {
@@ -2630,7 +2715,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(m.div_ceil(8), 1, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let result = ctx.download_f32(&y_buf, m as usize);
         for i in 0..m as usize {
@@ -2744,7 +2829,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(m.div_ceil(2), 1, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let result = ctx.download_f32(&y_buf, m as usize);
         for i in 0..m as usize {
@@ -2855,7 +2940,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(m.div_ceil(2), 1, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let result = ctx.download_f32(&y_buf, m as usize);
         for i in 0..m as usize {
@@ -2953,7 +3038,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(m.div_ceil(2), 1, 1); // NR=2
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let result = ctx.download_f32(&y_buf, m as usize);
         for i in 0..m as usize {
@@ -3009,7 +3094,7 @@ mod tests {
                 pass.set_bind_group(0, &bg, &[]);
                 pass.dispatch_workgroups(n_heads, 1, 1);
             }
-            ctx.queue.submit(Some(enc.finish()));
+            ctx.submit_encoder(enc);
             ctx.download_f32(out, out_len)
         };
 
@@ -3207,7 +3292,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(m.div_ceil(8), n, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let got = ctx.download_f32(&y_buf, (n * y_stride) as usize);
         for t in 0..n as usize {
@@ -3329,7 +3414,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(m.div_ceil(8), n, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let got = ctx.download_f32(&y_buf, (n * y_stride) as usize);
         for t in 0..n as usize {
@@ -3486,7 +3571,7 @@ mod tests {
                 pass.set_bind_group(0, &bg, &[]);
                 pass.dispatch_workgroups(m.div_ceil(case.rows_per_wg), 1, 1);
             }
-            ctx.queue.submit(Some(enc.finish()));
+            ctx.submit_encoder(enc);
 
             let result = ctx.download_f32(&y_buf, m as usize);
             for (i, (&exp, &got)) in case.expected.iter().zip(&result).enumerate() {
@@ -3557,7 +3642,7 @@ mod tests {
                 pass.set_bind_group(0, &bg, &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
-            ctx.queue.submit(Some(enc.finish()));
+            ctx.submit_encoder(enc);
 
             let out = ctx.download_u32(&out_buf, 1);
             assert_eq!(
@@ -3601,7 +3686,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
         let out = ctx.download_u32(&out_buf, 1);
         assert_eq!(
             out[0], 100,
@@ -3680,7 +3765,7 @@ mod tests {
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
-            ctx.queue.submit(Some(enc.finish()));
+            ctx.submit_encoder(enc);
             // u32 readback via the same staging path used for f32 elsewhere.
             let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
@@ -3690,7 +3775,8 @@ mod tests {
             });
             let mut enc = ctx.device.create_command_encoder(&Default::default());
             enc.copy_buffer_to_buffer(&buf, 0, &staging, 0, 4);
-            ctx.queue.submit(Some(enc.finish()));
+            ctx.submit_encoder(enc);
+            io_stats::record_readback(4);
             let slice = staging.slice(..);
             let (tx, rx) = std::sync::mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -3779,7 +3865,7 @@ mod tests {
                 pass.set_bind_group(0, &bg, &[]);
                 pass.dispatch_workgroups(1, 1, 1);
             }
-            ctx.queue.submit(Some(enc.finish()));
+            ctx.submit_encoder(enc);
             let out = ctx.download_f32(&scratch, n as usize);
             reference[row_start..row_end].copy_from_slice(&out);
         }
@@ -3827,7 +3913,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(batch, 1, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
         let batched = ctx.download_f32(&dst_buf, (n * batch) as usize);
 
         // Allow ~1e-3 absolute slack — same threshold the per-vector
@@ -3989,7 +4075,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(n_tokens * (n_heads + n_kv_heads), 1, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let got_q = ctx.download_f32(&q_buf, q_batch.len());
         let got_k = ctx.download_f32(&k_buf, k_batch.len());
@@ -4174,7 +4260,7 @@ mod tests {
                 pass.set_bind_group(0, &bg, &[]);
                 pass.dispatch_workgroups(n_tokens * (n_heads + n_kv_heads), 1, 1);
             }
-            ctx.queue.submit(Some(enc.finish()));
+            ctx.submit_encoder(enc);
 
             let got_q = ctx.download_f32(&q_buf, q_batch.len());
             let got_k = ctx.download_f32(&k_buf, k_batch.len());
@@ -4338,7 +4424,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(hs.div_ceil(256) as u32, 1, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let got_out = ctx.download_f32(&out_buf, ref_out.len());
         let got_rb = ctx.download_f32(&rb_buf, ref_rb.len());
@@ -4485,7 +4571,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(hs.div_ceil(256) as u32, 1, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let got_out = ctx.download_f32(&out_buf, ref_out.len());
         let got_rb = ctx.download_f32(&rb_buf, ref_rb.len());
@@ -4618,7 +4704,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(m.div_ceil(4), n, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let got = ctx.download_f32(&y_buf, (n * y_stride) as usize);
 
@@ -4724,7 +4810,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(batch, 1, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
         let batched = ctx.download_f32(&dst_buf, (n * batch) as usize);
 
         for i in 0..(n * batch) as usize {
@@ -4900,7 +4986,7 @@ mod tests {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(n_heads, n_queries, 1);
         }
-        ctx.queue.submit(Some(enc.finish()));
+        ctx.submit_encoder(enc);
 
         let got = ctx.download_f32(&out_buf, ref_out.len());
 

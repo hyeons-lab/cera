@@ -785,6 +785,14 @@ enum Command {
         /// but slower prefill. 0 disables chunking (monolithic).
         #[arg(long, default_value_t = 512)]
         ubatch_size: u32,
+
+        /// Report GPU I/O counters (queue submits and GPU→CPU readbacks, per
+        /// decoded token) alongside throughput. Decode on a mobile GPU is
+        /// dominated by per-token round-trips rather than math, so these are
+        /// the numbers that show whether a change actually removed them.
+        /// No-op on non-GPU backends.
+        #[arg(long)]
+        gpu_io: bool,
     },
 
     /// List bundles published on `huggingface.co/LiquidAI/LeapBundles`.
@@ -1328,6 +1336,37 @@ fn configure_prefix_cache(
         max_warm_bytes: cache_warm_mb * 1024 * 1024,
         max_cold_bytes: cache_disk_gb * 1024 * 1024 * 1024,
     });
+}
+
+/// One measured `bench` run: throughput plus the GPU I/O the *decode* phase
+/// cost. The I/O fields stay zero unless the wgpu backend is active.
+struct RunStats {
+    prefill_tps: f64,
+    decode_tps: f64,
+    decode_submits: u64,
+    decode_readbacks: u64,
+    decode_readback_bytes: u64,
+    decode_tokens: u64,
+    prefill_submits: u64,
+    prefill_readbacks: u64,
+    prefill_tokens: u64,
+}
+
+/// `(submits, readbacks, readback_bytes)` from the wgpu backend's counters.
+///
+/// Zeros when the `gpu` feature is off: the counters live in the wgpu backend,
+/// so there is nothing to read. Zeros also mean "not wgpu" at runtime (e.g. the
+/// CPU or Metal backend is active), which `--gpu-io` reports explicitly rather
+/// than silently printing a misleading 0.0 submits/token.
+#[cfg(feature = "gpu")]
+fn gpu_io_snapshot() -> (u64, u64, u64) {
+    let s = cera::backend::wgpu::io_stats::snapshot();
+    (s.submits, s.readbacks, s.readback_bytes)
+}
+
+#[cfg(not(feature = "gpu"))]
+fn gpu_io_snapshot() -> (u64, u64, u64) {
+    (0, 0, 0)
 }
 
 /// (p10, p50, p90, mean, stddev)
@@ -3450,6 +3489,7 @@ fn main() -> Result<()> {
             no_cache,
             kv_cache_keys,
             ubatch_size,
+            gpu_io,
         } => {
             anyhow::ensure!(runs >= 1, "--runs must be >= 1");
             if std::env::var("CERA_PROFILE").is_ok() {
@@ -3524,16 +3564,21 @@ fn main() -> Result<()> {
             );
 
             // Greedy (temp=0): deterministic, bench-friendly. NoopSink swallows tokens.
-            let run_once = || -> Result<(f64, f64)> {
+            let run_once = || -> Result<RunStats> {
                 let mut session = engine.new_session(cera::SessionConfig {
                     kv_compression: kv_compression.clone(),
                     seed: None,
                     ubatch_size,
                     ..Default::default()
                 })?;
+                // Prefill is one batched pass in principle — if it turns out to
+                // issue a submit per prompt token, that alone explains a prefill
+                // rate that never exceeds decode.
+                let io_prefill_before = gpu_io_snapshot();
                 let prefill_start = std::time::Instant::now();
                 session.append_tokens(&tokens)?;
                 let prefill_elapsed = prefill_start.elapsed();
+                let io_prefill_after = gpu_io_snapshot();
 
                 let opts = cera::GenerateOpts {
                     max_tokens: max_tokens as u32,
@@ -3545,7 +3590,12 @@ fn main() -> Result<()> {
                     ..Default::default()
                 };
                 let mut sink = NoopSink;
+                // Scope the GPU I/O counters to decode only: prefill is one
+                // batched pass, but decode pays a round-trip *per token*, and
+                // that per-token cost is what dominates GPU decode.
+                let io_before = gpu_io_snapshot();
                 let summary = session.generate(&opts, &mut sink)?;
+                let io_after = gpu_io_snapshot();
 
                 let prefill_tps = if prefill_elapsed.as_secs_f64() > 0.0 {
                     tokens.len() as f64 / prefill_elapsed.as_secs_f64()
@@ -3557,7 +3607,17 @@ fn main() -> Result<()> {
                 } else {
                     0.0
                 };
-                Ok((prefill_tps, decode_tps))
+                Ok(RunStats {
+                    prefill_tps,
+                    decode_tps,
+                    decode_submits: io_after.0.saturating_sub(io_before.0),
+                    decode_readbacks: io_after.1.saturating_sub(io_before.1),
+                    decode_readback_bytes: io_after.2.saturating_sub(io_before.2),
+                    decode_tokens: summary.tokens_generated as u64,
+                    prefill_submits: io_prefill_after.0.saturating_sub(io_prefill_before.0),
+                    prefill_readbacks: io_prefill_after.1.saturating_sub(io_prefill_before.1),
+                    prefill_tokens: tokens.len() as u64,
+                })
             };
 
             // Thermal-headroom sampling (Android). A sustained CPU benchmark
@@ -3578,8 +3638,16 @@ fn main() -> Result<()> {
             let mut decode_tps = Vec::with_capacity(runs);
             let mut prefill_tps = Vec::with_capacity(runs);
             let mut headrooms = Vec::with_capacity(runs);
+            let mut io_submits = 0u64;
+            let mut io_readbacks = 0u64;
+            let mut io_readback_bytes = 0u64;
+            let mut io_tokens = 0u64;
+            let mut pf_submits = 0u64;
+            let mut pf_readbacks = 0u64;
+            let mut pf_tokens = 0u64;
             for i in 0..runs {
-                let (pf, dc) = run_once()?;
+                let r = run_once()?;
+                let (pf, dc) = (r.prefill_tps, r.decode_tps);
                 let suffix = match sample_headroom() {
                     Some(h) => {
                         headrooms.push(h);
@@ -3594,6 +3662,13 @@ fn main() -> Result<()> {
                 );
                 decode_tps.push(dc);
                 prefill_tps.push(pf);
+                io_submits += r.decode_submits;
+                io_readbacks += r.decode_readbacks;
+                io_readback_bytes += r.decode_readback_bytes;
+                io_tokens += r.decode_tokens;
+                pf_submits += r.prefill_submits;
+                pf_readbacks += r.prefill_readbacks;
+                pf_tokens += r.prefill_tokens;
             }
             eprintln!();
 
@@ -3617,6 +3692,46 @@ fn main() -> Result<()> {
             eprintln!(
                 "prefill tok/s: p50={p50:.0} p10={p10:.0} p90={p90:.0} mean={mean:.0} stddev={stddev:.0} (n={runs})"
             );
+
+            if gpu_io {
+                if cfg!(feature = "gpu") {
+                    if io_tokens == 0 {
+                        eprintln!("gpu I/O: no tokens decoded — nothing to report");
+                    } else {
+                        let t = io_tokens as f64;
+                        eprintln!(
+                            "gpu I/O (decode): {:.1} submits/token, {:.1} readbacks/token, \
+                             {:.0} readback bytes/token (over {io_tokens} tokens)",
+                            io_submits as f64 / t,
+                            io_readbacks as f64 / t,
+                            io_readback_bytes as f64 / t,
+                        );
+                        // A batched prefill should be ~one submit for the whole
+                        // pass. A submit *per prompt token* means prefill is
+                        // secretly looping the decode path — which would explain
+                        // a prefill rate that never exceeds decode.
+                        if pf_tokens > 0 {
+                            eprintln!(
+                                "gpu I/O (prefill): {} submits, {} readbacks total \
+                                 ({:.3} submits/prompt-token over {pf_tokens} tokens)",
+                                pf_submits,
+                                pf_readbacks,
+                                pf_submits as f64 / pf_tokens as f64,
+                            );
+                        }
+                        if io_submits == 0 && io_readbacks == 0 {
+                            eprintln!(
+                                "  (all zero — the active backend is not wgpu; \
+                                 these counters only instrument the wgpu path)"
+                            );
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "gpu I/O: unavailable — cera-cli was built without the `gpu` feature"
+                    );
+                }
+            }
         }
     }
 
