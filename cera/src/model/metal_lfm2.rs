@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use metal::{Buffer, ComputePipelineState, MTLResourceOptions, MTLSize, NSUInteger};
 
-use crate::backend::metal::{MetalContext, shaders};
+use crate::backend::metal::{
+    KvShiftKParams, MetalContext, QkNormRopeBatchParams, QkNormRopeParams, shaders,
+};
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
 use crate::lora::{LoraAdapterWeights, LoraTarget};
@@ -938,7 +940,7 @@ impl MetalLfm2Model {
         let has_freq_factors = src.rope_freqs().is_some();
         let rope_freqs_buf = match src.rope_freqs() {
             Some(rf) => ctx.upload_f32(rf),
-            None => ctx.upload_f32(&[1.0f32]),
+            None => ctx.freq_factors_dummy(),
         };
         // Granite logit-scale divide: 1/logit_scale, applied via scale_f32. None
         // when identity (every other arch).
@@ -1867,7 +1869,11 @@ impl MetalLfm2Model {
         enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
         enc.set_buffer(1, Some(input), input_off_bytes);
         enc.set_buffer(2, Some(&self.gemv_splitk_partials), 0);
-        enc.set_bytes(3, 12, split_params.as_ptr() as *const _);
+        enc.set_bytes(
+            3,
+            std::mem::size_of_val(&split_params) as u64,
+            split_params.as_ptr() as *const _,
+        );
         enc.dispatch_thread_groups(grid, sz1d(64));
 
         // Phase B: Merge. One thread per row. Dispatching total threads
@@ -1880,7 +1886,11 @@ impl MetalLfm2Model {
         enc.set_compute_pipeline_state(merge_pipeline);
         enc.set_buffer(0, Some(&self.gemv_splitk_partials), 0);
         enc.set_buffer(1, Some(output), output_off_bytes);
-        enc.set_bytes(2, 12, split_params.as_ptr() as *const _);
+        enc.set_bytes(
+            2,
+            std::mem::size_of_val(&split_params) as u64,
+            split_params.as_ptr() as *const _,
+        );
         enc.dispatch_threads(sz1d(w.m as u64), sz1d(256));
     }
 
@@ -2398,28 +2408,23 @@ impl MetalLfm2Model {
         let has_qk_norm = q_norm_w.is_some() && k_norm_w.is_some();
         let q_norm = q_norm_w.unwrap_or(&self.rope_freqs_buf);
         let k_norm = k_norm_w.unwrap_or(&self.rope_freqs_buf);
-        let params: [u32; 9] = [
+        let params = QkNormRopeParams {
             pos,
             n_heads,
             n_kv_heads,
             head_dim,
             eps_bits,
             freq_base_bits,
-            self.rope_type,
-            self.has_freq_factors as u32,
-            has_qk_norm as u32,
-        ];
+            rope_type: self.rope_type,
+            has_freq_factors: self.has_freq_factors as u32,
+            has_qk_norm: has_qk_norm as u32,
+        };
         enc.set_compute_pipeline_state(&self.pipelines.qk_norm_rope);
         enc.set_buffer(0, Some(q), q_off_bytes);
         enc.set_buffer(1, Some(k), k_off_bytes);
         enc.set_buffer(2, Some(q_norm), 0);
         enc.set_buffer(3, Some(k_norm), 0);
-        enc.set_bytes(
-            4,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
-        enc.set_buffer(5, Some(&self.rope_freqs_buf), 0);
+        params.bind(enc, &self.rope_freqs_buf);
         enc.dispatch_thread_groups(sz1d((n_heads + n_kv_heads) as u64), sz1d(256));
     }
 
@@ -2445,34 +2450,26 @@ impl MetalLfm2Model {
         let has_qk_norm = q_norm_w.is_some() && k_norm_w.is_some();
         let q_norm = q_norm_w.unwrap_or(&self.rope_freqs_buf);
         let k_norm = k_norm_w.unwrap_or(&self.rope_freqs_buf);
-        // 12 u32: [start_pos, n_tokens, n_heads, n_kv_heads, head_dim, eps_bits,
-        // freq_base_bits, rope_type, q_stride, k_stride, has_freq_factors,
-        // has_qk_norm].
-        let params: [u32; 12] = [
+        let params = QkNormRopeBatchParams {
             start_pos,
-            n,
+            n_tokens: n,
             n_heads,
             n_kv_heads,
             head_dim,
-            self.config.rms_norm_eps.to_bits(),
-            self.config.rope_theta.to_bits(),
-            self.rope_type,
+            eps_bits: self.config.rms_norm_eps.to_bits(),
+            freq_base_bits: self.config.rope_theta.to_bits(),
+            rope_type: self.rope_type,
             q_stride,
             k_stride,
-            self.has_freq_factors as u32,
-            has_qk_norm as u32,
-        ];
+            has_freq_factors: self.has_freq_factors as u32,
+            has_qk_norm: has_qk_norm as u32,
+        };
         enc.set_compute_pipeline_state(&self.pipelines.qk_norm_rope_batch);
         enc.set_buffer(0, Some(q_batch), 0);
         enc.set_buffer(1, Some(k_batch), 0);
         enc.set_buffer(2, Some(q_norm), 0);
         enc.set_buffer(3, Some(k_norm), 0);
-        enc.set_bytes(
-            4,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
-        enc.set_buffer(5, Some(&self.rope_freqs_buf), 0);
+        params.bind(enc, &self.rope_freqs_buf);
         let tg_count = n * (n_heads + n_kv_heads);
         enc.dispatch_thread_groups(sz1d(tg_count as u64), sz1d(256));
     }
@@ -3687,25 +3684,13 @@ impl MetalLfm2Model {
                 enc.set_compute_pipeline_state(&self.pipelines.kv_shift_k_to_scratch);
                 enc.set_buffer(0, Some(k_cache), 0);
                 enc.set_buffer(1, Some(&self.kv_shift_scratch), 0);
-                #[repr(C)]
-                #[derive(Copy, Clone)]
-                struct KParams {
-                    n_keep: u32,
-                    shift: u32,
-                    new_seq_len: u32,
-                    n_kv_heads: u32,
-                    head_dim: u32,
-                    freq_base_bits: u32,
-                    delta_pos: i32,
-                    // RoPE pair layout (0 = NeoX, 1 = NORM/interleaved) and the
-                    // Llama-3 freq-factors flag must match the forward
-                    // `qk_norm_rope` dispatch so the delta-rotation composes —
-                    // a NORM model shifted with the NeoX layout mis-rotates.
-                    rope_type: u32,
-                    has_freq_factors: u32,
-                    _pad: u32,
-                }
-                let kparams = KParams {
+                // `rope_type` / `has_freq_factors` must match the forward
+                // `qk_norm_rope` dispatch so the delta-rotation composes — a
+                // NORM model shifted with the NeoX layout mis-rotates.
+                // `bind` also sets slot 3 (`rope_freqs_buf`, a `[1.0]` dummy
+                // for plain-RoPE models), which the kernel declares
+                // unconditionally and Metal requires to be live.
+                KvShiftKParams {
                     n_keep: n_keep as u32,
                     shift: shift as u32,
                     new_seq_len: new_seq_len as u32,
@@ -3716,17 +3701,8 @@ impl MetalLfm2Model {
                     rope_type: self.rope_type,
                     has_freq_factors: u32::from(self.has_freq_factors),
                     _pad: 0,
-                };
-                enc.set_bytes(
-                    2,
-                    std::mem::size_of::<KParams>() as u64,
-                    &kparams as *const _ as *const _,
-                );
-                // Bound at slot 3 even when `has_freq_factors` is false: the
-                // kernel only reads it on the Llama-3 path, but Metal requires
-                // every referenced buffer binding to be set. `rope_freqs_buf`
-                // is a `[1.0]` dummy for plain-RoPE models.
-                enc.set_buffer(3, Some(&self.rope_freqs_buf), 0);
+                }
+                .bind(enc, &self.rope_freqs_buf);
                 let half_dim = head_dim / 2;
                 let total = (retained * n_kv_heads * half_dim) as u64;
                 enc.dispatch_thread_groups(sz1d(total.div_ceil(256)), sz1d(256));

@@ -5,7 +5,7 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
-use cera::backend::metal::{MetalContext, shaders};
+use cera::backend::metal::{KvShiftKParams, MetalContext, QkNormRopeParams, shaders};
 use metal::MTLSize;
 
 fn tg_size(w: u64) -> MTLSize {
@@ -1012,6 +1012,20 @@ fn test_classic_vs_splitk_attention_synthetic() {
 // loader relies on: the elementwise scaled-add / scale, the residual-scaled
 // fused add+rmsnorm, and the rope-only / freq-factors arms of qk_norm_rope.
 
+/// RMS-norm epsilon. Shared by the kernel dispatch and the CPU reference so the
+/// two cannot silently disagree.
+const EPS: f32 = 1e-5;
+
+/// Per-head RMS-norm reference — matches `qk_norm_rope.metal`'s `head_rmsnorm`.
+/// Runs before RoPE when `has_qk_norm == 1` (LFM2 / Qwen3 / the audio decoder).
+fn head_rmsnorm_ref(buf: &mut [f32], w: &[f32], head_dim: usize) {
+    let sum_sq: f32 = buf.iter().map(|v| v * v).sum();
+    let inv_rms = 1.0 / (sum_sq / head_dim as f32 + EPS).sqrt();
+    for (v, &wi) in buf.iter_mut().zip(w) {
+        *v = *v * inv_rms * wi;
+    }
+}
+
 /// NeoX RoPE reference (split-halves pairing) with optional Llama-3 freq
 /// factors — matches `qk_norm_rope.metal`'s `head_rope` for `rope_type == 0`.
 fn rope_neox_ref(
@@ -1153,28 +1167,34 @@ fn run_qk_norm_rope(
     freq_base: f32,
     rope_type: u32,
     freq_factors: Option<&[f32]>,
+    qk_norm: Option<(&[f32], &[f32])>,
 ) -> (Vec<f32>, Vec<f32>) {
     let q_buf = ctx.upload_f32(q);
     let k_buf = ctx.upload_f32(k);
-    // has_qk_norm = 0 ⇒ rope-only; bind a 1-elt dummy at the norm slots.
-    let dummy = ctx.upload_f32(&[1.0f32]);
+    // Slots 2/3 are the per-head Q/K norm weights. When `has_qk_norm == 0` the kernel
+    // never reads them, but the bindings are declared unconditionally — so bind a dummy.
+    let (q_norm_buf, k_norm_buf) = match qk_norm {
+        Some((qw, kw)) => (ctx.upload_f32(qw), ctx.upload_f32(kw)),
+        None => (ctx.freq_factors_dummy(), ctx.freq_factors_dummy()),
+    };
     let ff_buf = match freq_factors {
         Some(ff) => ctx.upload_f32(ff),
-        None => ctx.upload_f32(&[1.0f32]),
+        None => ctx.freq_factors_dummy(),
     };
-    let has_ff = freq_factors.is_some() as u32;
-    let params: [u32; 9] = [
+    // Shared with the production dispatch (`cera::backend::metal`) rather than a private
+    // array. This harness is the shader's oracle — a private copy of the layout is exactly
+    // how the sibling oracle came to dispatch the kernel wrong and validate against NaN.
+    let params = QkNormRopeParams {
         pos,
         n_heads,
         n_kv_heads,
         head_dim,
-        1e-5f32.to_bits(),
-        freq_base.to_bits(),
+        eps_bits: EPS.to_bits(),
+        freq_base_bits: freq_base.to_bits(),
         rope_type,
-        has_ff,
-        0, // has_qk_norm = 0 (rope-only)
-    ];
-    let p_buf = ctx.upload_bytes(bytemuck::cast_slice(&params));
+        has_freq_factors: freq_factors.is_some() as u32,
+        has_qk_norm: qk_norm.is_some() as u32,
+    };
     let pipe = ctx
         .create_pipeline(shaders::QK_NORM_ROPE, "qk_norm_rope")
         .expect("compile");
@@ -1183,10 +1203,9 @@ fn run_qk_norm_rope(
     enc.set_compute_pipeline_state(&pipe);
     enc.set_buffer(0, Some(&q_buf), 0);
     enc.set_buffer(1, Some(&k_buf), 0);
-    enc.set_buffer(2, Some(&dummy), 0);
-    enc.set_buffer(3, Some(&dummy), 0);
-    enc.set_buffer(4, Some(&p_buf), 0);
-    enc.set_buffer(5, Some(&ff_buf), 0);
+    enc.set_buffer(2, Some(&q_norm_buf), 0);
+    enc.set_buffer(3, Some(&k_norm_buf), 0);
+    params.bind(enc, &ff_buf);
     enc.dispatch_thread_groups(tg_size((n_heads + n_kv_heads) as u64), tg_size(256));
     enc.end_encoding();
     cb.commit();
@@ -1238,6 +1257,7 @@ fn test_qk_norm_rope_rope_only() {
         head_dim as u32,
         freq_base,
         0,
+        None,
         None,
     );
     assert_close("qk_norm_rope rope-only Q", &exp_q, &got_q, 1e-4);
@@ -1291,6 +1311,7 @@ fn test_qk_norm_rope_freq_factors() {
         freq_base,
         0,
         Some(&ff),
+        None,
     );
     assert_close("qk_norm_rope freq_factors Q", &exp_q, &got_q, 1e-4);
     assert_close("qk_norm_rope freq_factors K", &exp_k, &got_k, 1e-4);
@@ -1369,6 +1390,7 @@ fn test_qk_norm_rope_norm() {
         freq_base,
         1, // NORM
         None,
+        None,
     );
     assert_close("qk_norm_rope NORM Q", &exp_q, &got_q, 1e-4);
     assert_close("qk_norm_rope NORM K", &exp_k, &got_k, 1e-4);
@@ -1444,9 +1466,65 @@ fn test_qk_norm_rope_norm_freq_factors() {
         freq_base,
         1, // NORM
         Some(&ff),
+        None,
     );
     assert_close("qk_norm_rope NORM+ff Q", &exp_q, &got_q, 1e-4);
     assert_close("qk_norm_rope NORM+ff K", &exp_k, &got_k, 1e-4);
+}
+
+/// `has_qk_norm = 1` — per-head RMS-norm *then* RoPE.
+///
+/// This is the arm the audio decoder and LFM2/Qwen3 actually dispatch, and until now
+/// nothing exercised it: every other `qk_norm_rope` test here is rope-only. That gap is
+/// not incidental — `has_qk_norm` is one of the two fields whose addition to the MSL
+/// `Params` caused the NaN this suite exists to catch, and a kernel can only mis-read a
+/// field on the path that reads it. Asserting non-unit norm weights (not all-1.0) means a
+/// dropped or mis-bound `q_norm_w`/`k_norm_w` changes the result instead of cancelling out.
+#[test]
+fn test_qk_norm_rope_qk_norm() {
+    let Some(ctx) = setup() else { return };
+    let (n_heads, n_kv_heads, head_dim) = (2usize, 1usize, 8usize);
+    let pos = 3u32;
+    let freq_base = 10_000.0f32;
+    let q: Vec<f32> = (0..n_heads * head_dim)
+        .map(|i| (i as f32 * 0.11).sin() + 0.3)
+        .collect();
+    let k: Vec<f32> = (0..n_kv_heads * head_dim)
+        .map(|i| (i as f32 * 0.09).cos() - 0.2)
+        .collect();
+    // Distinct, non-unit Q/K norm weights: if the kernel swapped the two bindings or read
+    // a dummy, the expected values move.
+    let q_norm: Vec<f32> = (0..head_dim).map(|i| 0.5 + i as f32 * 0.1).collect();
+    let k_norm: Vec<f32> = (0..head_dim).map(|i| 1.5 - i as f32 * 0.1).collect();
+
+    let mut exp_q = q.clone();
+    for h in 0..n_heads {
+        let head = &mut exp_q[h * head_dim..(h + 1) * head_dim];
+        head_rmsnorm_ref(head, &q_norm, head_dim);
+        rope_neox_ref(head, pos, head_dim, freq_base, None);
+    }
+    let mut exp_k = k.clone();
+    for h in 0..n_kv_heads {
+        let head = &mut exp_k[h * head_dim..(h + 1) * head_dim];
+        head_rmsnorm_ref(head, &k_norm, head_dim);
+        rope_neox_ref(head, pos, head_dim, freq_base, None);
+    }
+
+    let (got_q, got_k) = run_qk_norm_rope(
+        &ctx,
+        &q,
+        &k,
+        pos,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        freq_base,
+        0,
+        None,
+        Some((&q_norm, &k_norm)),
+    );
+    assert_close("qk_norm_rope qk-norm Q", &exp_q, &got_q, 1e-4);
+    assert_close("qk_norm_rope qk-norm K", &exp_k, &got_k, 1e-4);
 }
 
 // ── kv_shift_k_to_scratch: NeoX + NORM RoPE delta parity ────────────────────
@@ -1509,21 +1587,22 @@ fn run_kv_shift_k(
     let retained = new_seq_len - n_keep;
     let k_buf = upload_f16_from_f32(ctx, k_cache_f32);
     let scratch = ctx.create_buffer((retained * kv_dim * 2) as u64); // f16
-    let ff_buf = freq_factors.map_or_else(|| ctx.upload_f32(&[1.0f32]), |ff| ctx.upload_f32(ff));
-    let delta_pos = -(shift as i32);
-    let params: [u32; 10] = [
-        n_keep as u32,
-        shift as u32,
-        new_seq_len as u32,
-        n_kv_heads as u32,
-        head_dim as u32,
-        freq_base.to_bits(),
-        delta_pos as u32, // two's-complement bits; kernel reads as int
+    let ff_buf = freq_factors.map_or_else(|| ctx.freq_factors_dummy(), |ff| ctx.upload_f32(ff));
+    // Shared type, not a private array — see `run_qk_norm_rope`. It also removes the
+    // hand-written `delta_pos as u32` two's-complement pun: the field is typed `i32`,
+    // matching the kernel's `int`.
+    let params = KvShiftKParams {
+        n_keep: n_keep as u32,
+        shift: shift as u32,
+        new_seq_len: new_seq_len as u32,
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        freq_base_bits: freq_base.to_bits(),
+        delta_pos: -(shift as i32),
         rope_type,
-        freq_factors.is_some() as u32,
-        0,
-    ];
-    let p_buf = ctx.upload_bytes(bytemuck::cast_slice(&params));
+        has_freq_factors: freq_factors.is_some() as u32,
+        _pad: 0,
+    };
     let pipe = ctx
         .create_pipeline(shaders::KV_SHIFT, "kv_shift_k_to_scratch")
         .expect("compile");
@@ -1532,8 +1611,7 @@ fn run_kv_shift_k(
     enc.set_compute_pipeline_state(&pipe);
     enc.set_buffer(0, Some(&k_buf), 0);
     enc.set_buffer(1, Some(&scratch), 0);
-    enc.set_buffer(2, Some(&p_buf), 0);
-    enc.set_buffer(3, Some(&ff_buf), 0);
+    params.bind(enc, &ff_buf);
     let total = (retained * n_kv_heads * (head_dim / 2)) as u64;
     enc.dispatch_thread_groups(tg_size(total.div_ceil(256)), tg_size(256));
     enc.end_encoding();
