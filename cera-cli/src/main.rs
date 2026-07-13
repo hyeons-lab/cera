@@ -1341,18 +1341,43 @@ fn configure_prefix_cache(
     });
 }
 
-/// One measured `bench` run: throughput plus the GPU I/O the *decode* phase
-/// cost. The I/O fields stay zero unless the wgpu backend is active.
+/// The GPU I/O one phase of a run cost, and the tokens it covered. Stays zero
+/// unless the wgpu backend is active.
+#[derive(Debug, Clone, Copy, Default)]
+struct PhaseIo {
+    submits: u64,
+    readbacks: u64,
+    readback_bytes: u64,
+    tokens: u64,
+}
+
+impl PhaseIo {
+    /// The I/O charged between two `gpu_io_snapshot()` calls.
+    fn between(before: (u64, u64, u64), after: (u64, u64, u64), tokens: u64) -> Self {
+        Self {
+            submits: after.0.saturating_sub(before.0),
+            readbacks: after.1.saturating_sub(before.1),
+            readback_bytes: after.2.saturating_sub(before.2),
+            tokens,
+        }
+    }
+
+    /// Sum across runs. Tokens add too, so the per-token rates stay weighted by
+    /// how many tokens each run actually contributed.
+    fn accumulate(&mut self, other: Self) {
+        self.submits += other.submits;
+        self.readbacks += other.readbacks;
+        self.readback_bytes += other.readback_bytes;
+        self.tokens += other.tokens;
+    }
+}
+
+/// One measured `bench` run: throughput plus the GPU I/O each phase cost.
 struct RunStats {
     prefill_tps: f64,
     decode_tps: f64,
-    decode_submits: u64,
-    decode_readbacks: u64,
-    decode_readback_bytes: u64,
-    decode_tokens: u64,
-    prefill_submits: u64,
-    prefill_readbacks: u64,
-    prefill_tokens: u64,
+    decode_io: PhaseIo,
+    prefill_io: PhaseIo,
 }
 
 /// `(submits, readbacks, readback_bytes)` from the wgpu backend's counters.
@@ -1376,48 +1401,43 @@ fn gpu_io_snapshot() -> (u64, u64, u64) {
 /// mirroring `gpu_io_snapshot`: the counters live behind the `gpu` feature, so the
 /// reporting has to be gated at compile time, not with a runtime `cfg!`.
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
-fn report_gpu_io(
-    submits: u64,
-    readbacks: u64,
-    readback_bytes: u64,
-    tokens: u64,
-    pf_submits: u64,
-    pf_readbacks: u64,
-    pf_tokens: u64,
-) {
+fn report_gpu_io(decode: PhaseIo, prefill: PhaseIo) {
     use cera::backend::wgpu::io_stats::GpuIoStats;
 
-    if tokens == 0 {
+    let stats = |p: PhaseIo| GpuIoStats {
+        submits: p.submits,
+        readbacks: p.readbacks,
+        readback_bytes: p.readback_bytes,
+    };
+
+    if decode.tokens == 0 {
         eprintln!("gpu I/O: no tokens decoded — nothing to report");
         return;
     }
-    let decode = GpuIoStats {
-        submits,
-        readbacks,
-        readback_bytes,
-    };
-    let (sub_pt, rb_pt, bytes_pt) = decode.per_token(tokens);
+    let (sub_pt, rb_pt, bytes_pt) = stats(decode).per_token(decode.tokens);
+    let d_tokens = decode.tokens;
     eprintln!(
         "gpu I/O (decode): {sub_pt:.1} submits/token, {rb_pt:.1} readbacks/token, \
-         {bytes_pt:.0} readback bytes/token (over {tokens} tokens)",
+         {bytes_pt:.0} readback bytes/token (over {d_tokens} tokens)",
     );
     // A batched prefill is ~one submit for the whole pass. A submit *per prompt
     // token* means prefill is secretly looping the decode path — which is exactly
     // what a quant that fails the batched-GEMM dtype check does.
-    if pf_tokens > 0 {
-        let prefill = GpuIoStats {
-            submits: pf_submits,
-            readbacks: pf_readbacks,
-            readback_bytes: 0,
-        };
-        let (pf_sub_pt, _, _) = prefill.per_token(pf_tokens);
+    if prefill.tokens > 0 {
+        let (pf_sub_pt, _, _) = stats(prefill).per_token(prefill.tokens);
+        let (pf_submits, pf_readbacks, pf_bytes, pf_tokens) = (
+            prefill.submits,
+            prefill.readbacks,
+            prefill.readback_bytes,
+            prefill.tokens,
+        );
         eprintln!(
-            "gpu I/O (prefill): {pf_submits} submits, {pf_readbacks} readbacks total \
+            "gpu I/O (prefill): {pf_submits} submits, {pf_readbacks} readbacks, \
+             {pf_bytes} readback bytes total \
              ({pf_sub_pt:.3} submits/prompt-token over {pf_tokens} tokens)",
         );
     }
-    if submits == 0 && readbacks == 0 {
+    if decode.submits == 0 && decode.readbacks == 0 {
         eprintln!(
             "  (all zero — the active backend is not wgpu; \
              these counters only instrument the wgpu path)"
@@ -1426,8 +1446,7 @@ fn report_gpu_io(
 }
 
 #[cfg(not(feature = "gpu"))]
-#[allow(clippy::too_many_arguments)]
-fn report_gpu_io(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64, _: u64) {
+fn report_gpu_io(_: PhaseIo, _: PhaseIo) {
     eprintln!("gpu I/O: unavailable — cera-cli was built without the `gpu` feature");
 }
 
@@ -3673,13 +3692,16 @@ fn main() -> Result<()> {
                 Ok(RunStats {
                     prefill_tps,
                     decode_tps,
-                    decode_submits: io_after.0.saturating_sub(io_before.0),
-                    decode_readbacks: io_after.1.saturating_sub(io_before.1),
-                    decode_readback_bytes: io_after.2.saturating_sub(io_before.2),
-                    decode_tokens: summary.tokens_generated as u64,
-                    prefill_submits: io_prefill_after.0.saturating_sub(io_prefill_before.0),
-                    prefill_readbacks: io_prefill_after.1.saturating_sub(io_prefill_before.1),
-                    prefill_tokens: tokens.len() as u64,
+                    decode_io: PhaseIo::between(
+                        io_before,
+                        io_after,
+                        summary.tokens_generated as u64,
+                    ),
+                    prefill_io: PhaseIo::between(
+                        io_prefill_before,
+                        io_prefill_after,
+                        tokens.len() as u64,
+                    ),
                 })
             };
 
@@ -3701,13 +3723,8 @@ fn main() -> Result<()> {
             let mut decode_tps = Vec::with_capacity(runs);
             let mut prefill_tps = Vec::with_capacity(runs);
             let mut headrooms = Vec::with_capacity(runs);
-            let mut io_submits = 0u64;
-            let mut io_readbacks = 0u64;
-            let mut io_readback_bytes = 0u64;
-            let mut io_tokens = 0u64;
-            let mut pf_submits = 0u64;
-            let mut pf_readbacks = 0u64;
-            let mut pf_tokens = 0u64;
+            let mut decode_io = PhaseIo::default();
+            let mut prefill_io = PhaseIo::default();
             for i in 0..runs {
                 let r = run_once()?;
                 let (pf, dc) = (r.prefill_tps, r.decode_tps);
@@ -3725,13 +3742,8 @@ fn main() -> Result<()> {
                 );
                 decode_tps.push(dc);
                 prefill_tps.push(pf);
-                io_submits += r.decode_submits;
-                io_readbacks += r.decode_readbacks;
-                io_readback_bytes += r.decode_readback_bytes;
-                io_tokens += r.decode_tokens;
-                pf_submits += r.prefill_submits;
-                pf_readbacks += r.prefill_readbacks;
-                pf_tokens += r.prefill_tokens;
+                decode_io.accumulate(r.decode_io);
+                prefill_io.accumulate(r.prefill_io);
             }
             eprintln!();
 
@@ -3757,15 +3769,7 @@ fn main() -> Result<()> {
             );
 
             if gpu_io {
-                report_gpu_io(
-                    io_submits,
-                    io_readbacks,
-                    io_readback_bytes,
-                    io_tokens,
-                    pf_submits,
-                    pf_readbacks,
-                    pf_tokens,
-                );
+                report_gpu_io(decode_io, prefill_io);
             }
         }
     }

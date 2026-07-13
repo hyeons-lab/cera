@@ -57,6 +57,12 @@ Read:
   **11 Q6_K tensors**, which fails the check, so prefill **silently** falls back to
   the per-token loop — 8728 submits instead of 25. The same model does this on Mac
   too; it is not an Adreno effect (T8).
+- **Prefill reads back ~12.9 MB** (23 readbacks) for Q4_K_M/512 on Mac — decode's
+  per-token readback is 4 bytes, but prefill's is not negligible and is worth its
+  own look. Unlike the submit count, the readback count does *not* scale with the
+  fallback: 23 either way. Measured after the counters were fixed; the Q4_0 column
+  is unmeasured here because the local `LFM-450M-Q4_0.gguf` is a corrupt (non-GGUF)
+  file.
 
 Because of that gate, the Mac-vs-Adreno rows in earlier revisions of this doc
 compared a **Q4_0** model on Mac against a **Q4_K_M** model on Adreno — i.e. the
