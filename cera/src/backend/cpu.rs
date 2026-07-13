@@ -424,6 +424,11 @@ pub fn gemv_with_preq(
         DType::Q6K => unsafe {
             crate::backend::simd::neon::gemv_q6k_q8_0_neon(a_quant, x_scales, x_quants, y, m, k)
         },
+        // NOTE: no Q4KM arm here on purpose. Routing Q4_K through a pre-quantized
+        // dispatcher measured a consistent ~5% *regression* vs re-quantizing in
+        // `gemv_dispatch` (interleaved A/B, LFM2.5-350M-Q4_K_M decode) — the
+        // per-call Q8_0 quantization is cheap next to the GEMV, and the shared-
+        // buffer path loses activation cache locality. Q4_K falls through below.
         _ => gemv_dispatch(dtype, a_quant, x_f32, y, m, k, None),
     }
 }
@@ -668,7 +673,22 @@ pub fn gemv_dispatch(
                 gemv_q6k_f32(data, x, y, m, k, &mut s, &mut q);
             }
         }
-        DType::Q4KM => gemv_q4km_f32(data, x, y, m, k),
+        DType::Q4KM => {
+            #[cfg(target_arch = "aarch64")]
+            if let Some((scales, quants)) = q8_scratch {
+                unsafe {
+                    crate::backend::simd::neon::gemv_q4k_f32_neon(data, x, y, m, k, scales, quants);
+                }
+            } else {
+                let mut s = Vec::new();
+                let mut q = Vec::new();
+                unsafe {
+                    crate::backend::simd::neon::gemv_q4k_f32_neon(data, x, y, m, k, &mut s, &mut q);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            gemv_q4km_f32(data, x, y, m, k);
+        }
         DType::Q5KM => gemv_q5km_f32(data, x, y, m, k),
         _ => panic!("gemv_dispatch: unsupported dtype {:?}", dtype),
     }
