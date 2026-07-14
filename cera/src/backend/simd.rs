@@ -904,7 +904,12 @@ pub(crate) mod neon {
                                 let xb = bi * 8 + s;
                                 let dsc = d * sc[s] as f32;
                                 let dmn = dmin * mn[s] as f32;
-                                for (jj, a) in acc.iter_mut().enumerate().take(cols) {
+                                // `acc_j`, not `a` — `a` is the weight base pointer in
+                                // the enclosing scope, and shadowing it inside an
+                                // `unsafe` block is how a future edit reaching for the
+                                // weights silently gets an `&mut f32` and reads
+                                // arbitrary memory.
+                                for (jj, acc_j) in acc.iter_mut().enumerate().take(cols) {
                                     let j = j0 + jj;
                                     let xp = bq.add(j * k + xb * 32);
                                     let x0 = vld1q_s8(xp);
@@ -912,7 +917,7 @@ pub(crate) mod neon {
                                     let dp = vaddvq_s32(vdotq_s32(vdotq_s32(z, w0, x0), w1, x1));
                                     let xs = *bs.add(j * nb32 + xb);
                                     let sx = *cs.add(j * nb32 + xb);
-                                    *a += xs * (dsc * dp as f32 - dmn * sx as f32);
+                                    *acc_j += xs * (dsc * dp as f32 - dmn * sx as f32);
                                 }
                             }
                         }
@@ -1083,9 +1088,9 @@ pub(crate) mod neon {
         }
     }
 
-    /// Q6_K × Q8_0 GEMM dispatcher. Requires `dotprod`; see
-    /// [`k_quant_gemm_available`]. Returns `false` without writing `out` when the
-    /// CPU cannot run it, so the caller can fall back rather than ship zeros.
+    /// Q6_K × Q8_0 GEMM dispatcher. Requires `dotprod` and `k % 256 == 0`; see
+    /// [`gemm_q4_k_q8_0_neon`] for why the `k` check lives here rather than only in
+    /// the caller's gate. Returns `false` without writing `out` when it cannot run.
     #[allow(dead_code)]
     pub unsafe fn gemm_q6_k_q8_0_neon(
         a_quant: &[u8],
@@ -1096,7 +1101,7 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) -> bool {
-        if !k_quant_gemm_available() {
+        if !k_quant_gemm_available() || k % 256 != 0 {
             return false;
         }
         unsafe { gemm_q6_k_q8_0_neon_dotprod(a_quant, b_scales, b_quants, out, m, n, k) };
@@ -1988,8 +1993,15 @@ pub(crate) mod neon {
     }
 
     /// Q4_K × Q8_0 GEMM dispatcher. Requires `dotprod`; see
-    /// [`k_quant_gemm_available`]. Returns `false` without writing `out` when the
-    /// CPU cannot run it, so the caller can fall back rather than ship zeros.
+    /// [`k_quant_gemm_available`]. Returns `false` without writing `out` when this
+    /// CPU or this `k` cannot run it, so the caller can fall back rather than ship
+    /// a wrong answer.
+    ///
+    /// The `k % 256` check is here, not only in the caller's gate: superblocks are
+    /// 256 wide, so a `k` that is not a multiple of 256 would make `sb = k / 256`
+    /// silently drop the tail of every dot product — a truncated matmul, in release,
+    /// with no assert. A guard that lives only in the gate is a guard the next caller
+    /// can walk past.
     #[allow(dead_code)]
     pub unsafe fn gemm_q4_k_q8_0_neon(
         a_quant: &[u8],
@@ -2000,7 +2012,7 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) -> bool {
-        if !k_quant_gemm_available() {
+        if !k_quant_gemm_available() || k % 256 != 0 {
             return false;
         }
         unsafe { gemm_q4_k_q8_0_neon_dotprod(a_quant, b_scales, b_quants, out, m, n, k) };
@@ -2279,18 +2291,26 @@ pub(crate) mod neon {
             }
         }
 
-        /// The Q6_K GEMM against an independent f32 model of what it should compute.
+        /// The Q6_K GEMM must agree with the existing Q6_K GEMV run column-by-column
+        /// on the *same* pre-quantized inputs.
         ///
-        /// There is no Q6_K int8 GEMV to use as an oracle (that kernel does not
-        /// exist), so this reconstructs the expected result from the *trusted*
-        /// `dequantize_q6_k_row` and the dequantized Q8_0 activations
-        /// (`xs · xq`). It therefore shares **none** of the kernel's index math —
-        /// the 6-bit assembly, the 16-wide sub-block scales, and the `bi*8 + nh*4 + g`
-        /// input-block mapping are all independently checked.
+        /// The GEMV (`gemv_q6k_q8_0_neon_dotprod`) is the right oracle precisely
+        /// because it is what the per-token path runs: both consume identical Q8_0
+        /// activations and the same int8 dot, so agreement must be near-exact and any
+        /// gap is a real bug rather than quantization noise. It is *not* independent of
+        /// the kernel's index math — a shared misunderstanding of the 6-bit layout would
+        /// pass — so the absolute correctness of that layout rests on the GEMV's own
+        /// chain down to `vec_dot_q6_k_f32` / `dequantize_q6_k_block`, which is already
+        /// covered. What this pins down is the thing that actually broke: that the
+        /// batched form reproduces the per-token form exactly.
+        ///
+        /// (The first cut of this test used a dequantized-f32 reference at 1e-3 on the
+        /// mistaken belief that no Q6_K int8 GEMV existed. It does. That tolerance was
+        /// wide enough to pass a kernel the model-level parity test then caught.)
         ///
         /// `n = 11` straddles `KQ_COLS` (8) so the column tail is exercised.
         #[test]
-        fn q6k_gemm_matches_dequantized_reference() {
+        fn q6k_gemm_matches_gemv_per_column() {
             if !require_simd_or_skip("dotprod", cpu_features().dotprod) {
                 return;
             }
@@ -2373,7 +2393,11 @@ pub(crate) mod neon {
         /// invisible at k=512, but enough to move the model's logits.
         #[test]
         fn q4k_gemm_bit_exact_vs_gemv_at_model_shapes() {
-            if !cpu_features().dotprod {
+            // `require_simd_or_skip`, not a bare `return`: on a host without dotprod a
+            // bare return reports a green test that asserted nothing, and this is the
+            // test that catches accumulation-order bugs. `CERA_REQUIRE_SIMD=dotprod`
+            // turns that skip into a hard failure on CI hardware that should have it.
+            if !require_simd_or_skip("dotprod", cpu_features().dotprod) {
                 return;
             }
             for &(m, n, k) in &[(4608usize, 64usize, 1024usize), (1024, 64, 4608)] {
@@ -2430,7 +2454,9 @@ pub(crate) mod neon {
         /// the same bug reads as 5.5e-6 and slips through any reasonable tolerance.
         #[test]
         fn q6k_gemm_bit_exact_vs_gemv_at_model_shapes() {
-            if !cpu_features().dotprod {
+            // See the Q4_K twin: a bare `return` here would vacuously pass the very
+            // test that caught the Q6_K accumulation-order bug.
+            if !require_simd_or_skip("dotprod", cpu_features().dotprod) {
                 return;
             }
             for &(m, n, k) in &[(1024usize, 64usize, 4608usize), (5, 11, 512)] {

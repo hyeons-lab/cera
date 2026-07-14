@@ -171,24 +171,34 @@ pub(crate) fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
 
 /// The weight dtypes the batched prefill GEMM can consume.
 ///
-/// **This is the single source of truth for the fast path.** Every caller gate
-/// (`lfm2.rs`, `llama.rs`) and both implementations (`gemm_preq`,
-/// `try_blas_prefill_gemm`) must agree, or a model silently loses batched prefill —
-/// which is exactly what happened: the gates admitted only `Q4_0 | Q8_0`, and a
-/// `Q4_K_M` file (which is *not* uniformly Q4_K — it mixes Q4_K, Q6_K, and often
-/// Q5_K) matched none of them, so **every layer fell back to the per-token GEMV
-/// loop, silently**. Add a dtype here only once *both* implementations handle it.
+/// **This is the single source of truth for the LFM2 fast path.** The LFM2 gates and
+/// both implementations (`gemm_preq`, `try_blas_prefill_gemm`) must agree, or a model
+/// silently loses batched prefill — which is exactly what happened: the gates admitted
+/// only `Q4_0 | Q8_0`, and a `Q4_K_M` file (which is *not* uniformly Q4_K — it mixes
+/// Q4_K, Q6_K, and often Q5_K) matched none of them, so **every layer fell back to the
+/// per-token GEMV loop, silently**. Add a dtype here only once *both* implementations
+/// handle it.
+///
+/// `llama.rs` deliberately does **not** call this: its gate stays Q4_0/Q8_0-only until
+/// there is a dense-transformer fixture that actually exercises a widened path (see the
+/// comment at its gate). Its dtype set is a strict subset of this one, so it can only
+/// be over-conservative, never wrong — but do not assume widening this function widens
+/// llama too.
 ///
 /// The K-quant arm is **runtime**-gated, not just dtype-gated: the Q4_K/Q6_K int8
 /// GEMMs exist only in `dotprod` form. If this admitted them on a CPU without
 /// FEAT_DotProd, `gemm_preq` would decline and the matmul would be *silently
-/// skipped* — zeros, not slowness. Under `blas` the question is moot: that path
-/// dequantizes to f32 and SGEMMs, so it handles any dtype it can dequantize.
+/// skipped* — and because the callers reuse one output buffer across layers, that is
+/// not even zeros, it is the *previous layer's* activations. Under `blas` the question
+/// is moot: that path dequantizes to f32 and SGEMMs, so it handles any dtype it can
+/// dequantize.
+///
 /// `k` is the weight's inner dimension: K-quant superblocks are 256 wide, so a
 /// `k` that is not a multiple of 256 cannot be handled (GGUF should never produce
 /// one — a row that short could not have been K-quantized in the first place — but
 /// "the format guarantees it" is precisely how the last two silent fallbacks got
 /// written, so it is checked rather than assumed).
+#[cfg(any(target_arch = "aarch64", feature = "blas"))]
 pub(crate) fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
     match dtype {
         DType::Q4_0 | DType::Q8_0 => true,
@@ -199,6 +209,12 @@ pub(crate) fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
 
 /// Whether the K-quant batched GEMM can actually run here — see
 /// [`batched_gemm_supports`].
+///
+/// Cfg'd to the targets that have a batched path at all (the caller gates carry the
+/// same cfg). Without it this is dead code on x86_64/wasm without `blas`, which the
+/// CI lint job (`cargo clippy --workspace --all-targets -- -D warnings`, ubuntu, no
+/// `blas`) turns into a hard error — an aarch64 dev machine cannot reproduce that.
+#[cfg(any(target_arch = "aarch64", feature = "blas"))]
 fn k_quant_gemm_available() -> bool {
     // BLAS dequantizes the weight and SGEMMs, so it needs no int8 kernel.
     #[cfg(feature = "blas")]
@@ -225,6 +241,7 @@ fn k_quant_gemm_available() -> bool {
 /// ~4x prefill on CPU (T1) and ~340x the submits on GPU (T8) before anyone noticed,
 /// both times because the fallback said nothing. If prefill is slow and this is
 /// quiet, the dtypes are not the reason.
+#[cfg(any(target_arch = "aarch64", feature = "blas"))]
 pub(crate) fn warn_unbatchable(tensor: &str, dtype: DType) {
     use std::sync::Mutex;
     // A Vec, not a HashSet: `DType` is not `Hash`, the set holds a handful of
@@ -323,29 +340,62 @@ pub(crate) fn gemm_preq(
             crate::backend::simd::neon::gemm_q8_0_q8_0_neon(data, b_scales, b_quants, out, m, n, k);
             true
         },
-        // K-quants: dotprod-only, so these can decline at runtime. `batched_gemm_supports`
-        // asks the same question up front, so a gated caller never reaches the `false`.
-        DType::Q4KM => unsafe {
-            crate::backend::simd::neon::gemm_q4_k_q8_0_neon(data, b_scales, b_quants, out, m, n, k)
-        },
-        DType::Q6K => unsafe {
-            crate::backend::simd::neon::gemm_q6_k_q8_0_neon(data, b_scales, b_quants, out, m, n, k)
-        },
+        // K-quants: dotprod-only and 256-aligned, so these *can* decline at runtime.
+        // `batched_gemm_supports` asks the same question up front, so a gated caller
+        // never reaches a `false` — but if it ever did, the quiet `false` would be far
+        // worse than slow: callers ignore this return AND reuse one output buffer across
+        // layers, so `out` would hold the **previous layer's activations**. Route the
+        // decline through the same loud path as an unknown dtype.
+        DType::Q4KM => {
+            let ran = unsafe {
+                crate::backend::simd::neon::gemm_q4_k_q8_0_neon(
+                    data, b_scales, b_quants, out, m, n, k,
+                )
+            };
+            if !ran {
+                report_uncomputed_gemm(wref.dtype, k);
+            }
+            ran
+        }
+        DType::Q6K => {
+            let ran = unsafe {
+                crate::backend::simd::neon::gemm_q6_k_q8_0_neon(
+                    data, b_scales, b_quants, out, m, n, k,
+                )
+            };
+            if !ran {
+                report_uncomputed_gemm(wref.dtype, k);
+            }
+            ran
+        }
         // Reaching here means a caller gated on `batched_gemm_supports` and got a
-        // different answer than this match — i.e. the two drifted apart. **Callers
-        // ignore this return value**, so a quiet `false` does not merely skip the
-        // fast path: it leaves `out` uncomputed and inference silently produces
-        // garbage. Fail loudly instead of shipping zeros.
+        // different answer than this match — i.e. the two drifted apart.
         dt => {
-            debug_assert!(
-                false,
-                "gemm_preq: dtype {dt:?} is not handled here but `batched_gemm_supports` \
-                 admitted it — the gate and the kernel table have drifted"
-            );
-            tracing::error!("gemm_preq: no batched kernel for {dt:?}; the matmul was NOT computed");
+            report_uncomputed_gemm(dt, k);
             false
         }
     }
+}
+
+/// A batched GEMM was requested for a weight no kernel here can compute.
+///
+/// This must never happen — `batched_gemm_supports` gates it — so treat it as the
+/// invariant break it is. It is *not* a benign "fall back to the slow path": the
+/// callers of `gemm_preq` **ignore its return value**, and they reuse a single output
+/// buffer across layers, so an uncomputed GEMM leaves the previous layer's activations
+/// in `out` and inference produces confident garbage. Panic in debug; in release, at
+/// least say so loudly rather than silently corrupting the forward pass.
+#[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+fn report_uncomputed_gemm(dtype: DType, k: usize) {
+    debug_assert!(
+        false,
+        "gemm_preq: no batched kernel ran for {dtype:?} (k={k}), but `batched_gemm_supports` \
+         admitted it — the gate and the kernel table have drifted. `out` is now stale."
+    );
+    tracing::error!(
+        "gemm_preq: no batched kernel for {dtype:?} (k={k}); the matmul was NOT computed \
+         and the output buffer holds stale data"
+    );
 }
 
 /// Quantize all `n` columns of a column-major `[dim × n]` matrix to Q8_0 (NEON

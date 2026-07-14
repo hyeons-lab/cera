@@ -73,12 +73,43 @@ fn flash_prompt() -> Vec<u32> {
     PROMPT.iter().copied().cycle().take(288).collect()
 }
 
+/// Fail unless the model really is a K-quant mix — i.e. unless this test is
+/// exercising the kernels it claims to.
+///
+/// Without this the test is trivially vacuous: `CERA_LFM2_MODEL` overrides the path
+/// for *any* requested model, so pointing it at a Q8_0 file yields a confident green
+/// "LFM2.5-350M-Q4_K_M … cosine=1.000000" having never touched a Q4_K or Q6_K tensor.
+/// A test that cannot tell you whether it ran the code under test is not a test.
+fn assert_is_k_quant(path: &std::path::Path) {
+    let gguf = cera::gguf::GgufFile::open(path).unwrap();
+    let mut q4k = 0usize;
+    let mut q6k = 0usize;
+    for info in gguf.tensors.values() {
+        match info.dtype {
+            cera::tensor::DType::Q4KM => q4k += 1,
+            cera::tensor::DType::Q6K => q6k += 1,
+            _ => {}
+        }
+    }
+    eprintln!("[parity]   dtype census: {q4k} Q4_K, {q6k} Q6_K tensors");
+    assert!(
+        q4k > 0 && q6k > 0,
+        "{} is not a Q4_K_M mix ({q4k} Q4_K, {q6k} Q6_K) — this test would pass \
+         without ever running the K-quant GEMMs it exists to cover",
+        path.display()
+    );
+}
+
 fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, usize, usize)> {
     #[allow(unused_imports)]
     use cera::model::Model;
 
     let path = find_model(rel)?;
+    // Log the RESOLVED path, not `rel`: with CERA_LFM2_MODEL set they can differ, and
+    // reporting the one you asked for rather than the one you ran is how a green test
+    // lies about what it covered.
     eprintln!("[parity] loading {} ({} tok)", path.display(), tokens.len());
+    assert_is_k_quant(&path);
 
     // (a) Sequential per-token.
     let gguf_seq = cera::gguf::GgufFile::open(&path).unwrap();
@@ -105,6 +136,15 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, usize, usize)> {
 
 fn check(rel: &str, tokens: &[u32]) {
     let Some((cos, top_pre, top_seq)) = run_parity(rel, tokens) else {
+        // Absent fixture normally skips — but a skip that reports PASS is how a gate
+        // goes green forever without ever running. `CERA_REQUIRE_MODEL` makes the
+        // absence a hard failure, so a CI job that is supposed to have the fixture
+        // cannot quietly stop testing. Mirrors `CERA_REQUIRE_SIMD` in `simd.rs`.
+        assert!(
+            std::env::var("CERA_REQUIRE_MODEL").is_err(),
+            "CERA_REQUIRE_MODEL is set but the fixture is absent: {rel} \
+             (set CERA_LFM2_MODEL or CERA_MODEL_ROOT)"
+        );
         eprintln!("[parity] SKIP (absent): {rel}");
         return;
     };
