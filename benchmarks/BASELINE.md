@@ -54,7 +54,10 @@ re-measuring needs the device.
 Read:
 
 - **Decode issues 19 submits per token** — one per layer, plus argmax. The forward
-  pass is *not* batched into a single command buffer (T6).
+  pass is *not* batched into a single command buffer. **This is deliberate, not a
+  bug: batching it into one command buffer was measured at ~30% slower on both Mac
+  and Adreno** (decode is GPU-bound; the per-layer submits overlap GPU execution with
+  CPU encode). T6 is closed WONTFIX — see `GPU_FINDINGS_CORRECTION.md`.
 - Greedy decode **does** sample on the GPU: the readback is a 4-byte token id, not
   vocab logits. That part was always true.
 - **Prefill batching is gated on quantization, not platform.** The batched path
