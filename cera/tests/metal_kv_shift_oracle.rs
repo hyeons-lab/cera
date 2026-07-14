@@ -48,7 +48,7 @@
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use cera::backend::cpu::apply_rope_to_head;
-use cera::backend::metal::{MetalContext, shaders};
+use cera::backend::metal::{KvShiftKParams, MetalContext, shaders};
 use half::f16;
 use metal::{Buffer, MTLSize};
 
@@ -120,20 +120,14 @@ fn kv_shift_k_kernel_matches_cpu_rope_oracle() {
     let scratch_bytes = RETAINED * KV_DIM * 2;
     let scratch = ctx.create_buffer(scratch_bytes as u64);
 
-    // Params struct must match the shader's `KParams` layout exactly.
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct KParams {
-        n_keep: u32,
-        shift: u32,
-        new_seq_len: u32,
-        n_kv_heads: u32,
-        head_dim: u32,
-        freq_base_bits: u32,
-        delta_pos: i32,
-        _pad: u32,
-    }
-    let kparams = KParams {
+    // The params come from `cera::backend::metal` — the same type the production
+    // dispatch uses — rather than a private copy declared here. A private copy is
+    // what broke this test: `kv_shift.metal` grew `rope_type` / `has_freq_factors`
+    // and a `freq_factors` buffer, the shipped code was updated, and the oracle's
+    // stale 8-field struct kept under-filling the params and leaving slot 3 unbound,
+    // so it compared against NaN. Sharing the type means the oracle cannot drift away
+    // from the kernel it exists to police.
+    let kparams = KvShiftKParams {
         n_keep: N_KEEP as u32,
         shift: SHIFT as u32,
         new_seq_len: NEW_SEQ_LEN as u32,
@@ -141,19 +135,22 @@ fn kv_shift_k_kernel_matches_cpu_rope_oracle() {
         head_dim: HEAD_DIM as u32,
         freq_base_bits: FREQ_BASE.to_bits(),
         delta_pos: -(SHIFT as i32),
+        // This test's CPU oracle (`apply_rope_to_head`) rotates split-half pairs and
+        // applies no Llama-3 scaling, so the kernel must be dispatched the same way.
+        rope_type: 0,
+        has_freq_factors: 0,
         _pad: 0,
     };
+    // `has_freq_factors == 0`, but slot 3 is still bound (to a `[1.0]` dummy) because
+    // the kernel declares the binding unconditionally.
+    let freq_factors_dummy = ctx.freq_factors_dummy();
 
     let cmd_buf = ctx.queue.new_command_buffer();
     let enc = cmd_buf.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
     enc.set_buffer(0, Some(&k_cache), 0);
     enc.set_buffer(1, Some(&scratch), 0);
-    enc.set_bytes(
-        2,
-        std::mem::size_of::<KParams>() as u64,
-        &kparams as *const _ as *const _,
-    );
+    kparams.bind(enc, &freq_factors_dummy);
     let half_dim = HEAD_DIM / 2;
     let total = (RETAINED * N_KV_HEADS * half_dim) as u64;
     let groups = MTLSize {

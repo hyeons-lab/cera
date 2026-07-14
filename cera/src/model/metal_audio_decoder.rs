@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState};
 
-use crate::backend::metal::{MetalContext, shaders};
+use crate::backend::metal::{MetalContext, QkNormRopeParams, shaders};
 use crate::gguf::GgufFile;
 use crate::model::audio_decoder::{DetokenizerConfig, DetokenizerWeights};
 
@@ -105,6 +105,10 @@ pub struct MetalAudioDecoder {
     q_buf: Buffer, // [n_head * head_dim]
     k_buf: Buffer, // [n_kv * head_dim]
     v_buf: Buffer, // [n_kv * head_dim]
+    /// 1-element `[1.0]` dummy, always bound at `qk_norm_rope` binding 5.
+    /// This model has no Llama-3 rope scaling, but the kernel declares the
+    /// binding unconditionally and leaving it unbound yields NaN.
+    rope_freqs_dummy: Buffer,
     attn_out_buf: Buffer,
     spectrum_buf: Buffer, // [6 * 1282]
     tokens_buf: Buffer,   // [6 * n_embd]
@@ -288,6 +292,10 @@ impl MetalAudioDecoder {
         let spectrum_size = 6 * (cfg.n_fft / 2 + 1) * 2;
         let ab = |n: usize| ctx.create_buffer((n * 4) as u64);
 
+        // This model has no Llama-3 rope scaling (`has_freq_factors = 0`), but the
+        // kernel declares binding 5 unconditionally — see `freq_factors_dummy`.
+        let rope_freqs_dummy = ctx.freq_factors_dummy();
+
         // Persistent state
         let mut conv_bufs = vec![None; n_layer];
         let mut kv_k = vec![None; n_layer];
@@ -344,6 +352,7 @@ impl MetalAudioDecoder {
             params,
             depthformer,
             layers,
+            rope_freqs_dummy,
             output_norm,
             lin_w,
             lin_b,
@@ -433,7 +442,11 @@ impl MetalAudioDecoder {
         enc.set_compute_pipeline_state(&self.pipes.add_inplace);
         enc.set_buffer(0, Some(output), 0);
         enc.set_buffer(1, Some(scratch), 0);
-        enc.set_bytes(2, 8, params.as_ptr() as *const _);
+        enc.set_bytes(
+            2,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
         enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
     }
 
@@ -476,7 +489,11 @@ impl MetalAudioDecoder {
         enc.set_compute_pipeline_state(&self.pipes.memcpy_f32);
         enc.set_buffer(0, Some(src), src_off);
         enc.set_buffer(1, Some(dst), dst_off);
-        enc.set_bytes(2, 8, params.as_ptr() as *const _);
+        enc.set_bytes(
+            2,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
         enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
     }
 
@@ -495,7 +512,11 @@ impl MetalAudioDecoder {
         enc.set_compute_pipeline_state(&self.pipes.cast_f32_to_f16);
         enc.set_buffer(0, Some(src), 0);
         enc.set_buffer(1, Some(dst), dst_off_bytes);
-        enc.set_bytes(2, 8, params.as_ptr() as *const _);
+        enc.set_bytes(
+            2,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
         enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
     }
 
@@ -515,7 +536,11 @@ impl MetalAudioDecoder {
         enc.set_buffer(0, Some(a), a_off);
         enc.set_buffer(1, Some(b), b_off);
         enc.set_buffer(2, Some(dst), 0);
-        enc.set_bytes(3, 8, params.as_ptr() as *const _);
+        enc.set_bytes(
+            3,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
         enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
     }
 
@@ -684,13 +709,23 @@ impl MetalAudioDecoder {
             self.barrier(enc);
 
             // K norm + RoPE (dispatch only n_kv threadgroups for K heads)
-            let k_rope: [u32; 7] = [pos as u32, 0, n_kv, hd as u32, eps_bits, freq_bits, 0]; // NeoX
+            let k_rope = QkNormRopeParams {
+                pos: pos as u32,
+                n_heads: 0,
+                n_kv_heads: n_kv,
+                head_dim: hd as u32,
+                eps_bits,
+                freq_base_bits: freq_bits,
+                rope_type: 0, // NeoX
+                has_freq_factors: 0,
+                has_qk_norm: 1,
+            };
             enc.set_compute_pipeline_state(&self.pipes.qk_norm_rope);
             enc.set_buffer(0, Some(&self.k_buf), 0);
             enc.set_buffer(1, Some(&self.k_buf), 0);
             enc.set_buffer(2, Some(kn), 0);
             enc.set_buffer(3, Some(kn), 0);
-            enc.set_bytes(4, 28, k_rope.as_ptr() as *const _);
+            k_rope.bind(enc, &self.rope_freqs_dummy);
             enc.dispatch_thread_groups(sz1d(n_kv as u64), sz1d(256));
             self.barrier(enc);
 
@@ -720,13 +755,23 @@ impl MetalAudioDecoder {
             self.barrier(enc);
 
             // Q norm + RoPE (dispatch only n_heads threadgroups for Q heads)
-            let q_rope: [u32; 7] = [pos as u32, n_heads, 0, hd as u32, eps_bits, freq_bits, 0]; // NeoX
+            let q_rope = QkNormRopeParams {
+                pos: pos as u32,
+                n_heads,
+                n_kv_heads: 0,
+                head_dim: hd as u32,
+                eps_bits,
+                freq_base_bits: freq_bits,
+                rope_type: 0, // NeoX
+                has_freq_factors: 0,
+                has_qk_norm: 1,
+            };
             enc.set_compute_pipeline_state(&self.pipes.qk_norm_rope);
             enc.set_buffer(0, Some(&self.q_buf), 0);
             enc.set_buffer(1, Some(&self.q_buf), 0);
             enc.set_buffer(2, Some(qn), 0);
             enc.set_buffer(3, Some(qn), 0);
-            enc.set_bytes(4, 28, q_rope.as_ptr() as *const _);
+            q_rope.bind(enc, &self.rope_freqs_dummy);
             enc.dispatch_thread_groups(sz1d(n_heads as u64), sz1d(256));
             self.barrier(enc);
 
@@ -746,7 +791,11 @@ impl MetalAudioDecoder {
             enc.set_buffer(1, Some(k_cache), 0);
             enc.set_buffer(2, Some(v_cache), 0);
             enc.set_buffer(3, Some(&self.attn_out_buf), 0);
-            enc.set_bytes(4, 32, attn_params.as_ptr() as *const _);
+            enc.set_bytes(
+                4,
+                std::mem::size_of_val(&attn_params) as u64,
+                attn_params.as_ptr() as *const _,
+            );
             enc.dispatch_thread_groups(sz1d(n_heads as u64), sz1d(256));
             self.barrier(enc);
 
@@ -849,7 +898,11 @@ impl MetalAudioDecoder {
                 enc.set_compute_pipeline_state(&self.pipes.add_inplace);
                 enc.set_buffer(0, Some(&self.spectrum_buf), spec_off);
                 enc.set_buffer(1, Some(&self.lin_b), 0);
-                enc.set_bytes(2, 8, bias_params.as_ptr() as *const _);
+                enc.set_bytes(
+                    2,
+                    std::mem::size_of_val(&bias_params) as u64,
+                    bias_params.as_ptr() as *const _,
+                );
                 enc.dispatch_thread_groups(sz1d((bias_n as u64).div_ceil(256)), sz1d(256));
                 self.barrier(enc);
             }
@@ -918,6 +971,8 @@ pub struct MetalDepthformer {
     gate_buf: Buffer,
     up_buf: Buffer,
     logits_buf: Buffer,
+    /// See `MetalAudioDecoder::rope_freqs_dummy`.
+    rope_freqs_dummy: Buffer,
     // KV caches: f32, 6 layers × [max_seq=8, kv_dim]
     kv_k: Vec<Buffer>,
     kv_v: Vec<Buffer>,
@@ -1055,6 +1110,8 @@ impl MetalDepthformer {
         let qkv_dim = q_dim + 2 * kv_dim;
         let buf = |n: usize| ctx.create_buffer((n * 4) as u64);
 
+        let rope_freqs_dummy = ctx.freq_factors_dummy();
+
         let mut kv_k = Vec::with_capacity(df_cfg.n_layer);
         let mut kv_v = Vec::with_capacity(df_cfg.n_layer);
         for _ in 0..df_cfg.n_layer {
@@ -1078,6 +1135,7 @@ impl MetalDepthformer {
             dec_cfg: dec_cfg.clone(),
             pipes,
             layers,
+            rope_freqs_dummy,
             depth_linear_slices,
             codebook_norms,
             codebook_to_logits,
@@ -1181,14 +1239,23 @@ impl MetalDepthformer {
                 self.encode_df_gemv(enc, &lw.wqkv, &self.normed_buf, &self.qkv_buf);
 
                 // QK norm + RoPE (interleaved, rope_type=1)
-                let rope_params: [u32; 7] =
-                    [pos as u32, n_head, n_kv, hd as u32, eps_bits, freq_bits, 1];
+                let rope_params = QkNormRopeParams {
+                    pos: pos as u32,
+                    n_heads: n_head,
+                    n_kv_heads: n_kv,
+                    head_dim: hd as u32,
+                    eps_bits,
+                    freq_base_bits: freq_bits,
+                    rope_type: 1, // interleaved / NORM
+                    has_freq_factors: 0,
+                    has_qk_norm: 1,
+                };
                 enc.set_compute_pipeline_state(&self.pipes.qk_norm_rope);
                 enc.set_buffer(0, Some(&self.qkv_buf), 0); // Q at offset 0
                 enc.set_buffer(1, Some(&self.qkv_buf), (q_dim * 4) as u64); // K at offset q_dim
                 enc.set_buffer(2, Some(&lw.q_norm), 0);
                 enc.set_buffer(3, Some(&lw.k_norm), 0);
-                enc.set_bytes(4, 28, rope_params.as_ptr() as *const _);
+                rope_params.bind(enc, &self.rope_freqs_dummy);
                 enc.dispatch_thread_groups(sz1d((n_head + n_kv) as u64), sz1d(256));
 
                 // KV cache write: cast f32 qkv_buf → f16 cache (flash_attention
@@ -1202,13 +1269,21 @@ impl MetalDepthformer {
                 enc.set_compute_pipeline_state(&self.pipes.cast_f32_to_f16);
                 enc.set_buffer(0, Some(&self.qkv_buf), k_src_off);
                 enc.set_buffer(1, Some(&self.kv_k[il]), cache_off);
-                enc.set_bytes(2, 8, copy_params.as_ptr() as *const _);
+                enc.set_bytes(
+                    2,
+                    std::mem::size_of_val(&copy_params) as u64,
+                    copy_params.as_ptr() as *const _,
+                );
                 enc.dispatch_thread_groups(sz1d((kv_dim as u64).div_ceil(256)), sz1d(256));
                 // Cast V
                 enc.set_compute_pipeline_state(&self.pipes.cast_f32_to_f16);
                 enc.set_buffer(0, Some(&self.qkv_buf), v_src_off);
                 enc.set_buffer(1, Some(&self.kv_v[il]), cache_off);
-                enc.set_bytes(2, 8, copy_params.as_ptr() as *const _);
+                enc.set_bytes(
+                    2,
+                    std::mem::size_of_val(&copy_params) as u64,
+                    copy_params.as_ptr() as *const _,
+                );
                 enc.dispatch_thread_groups(sz1d((kv_dim as u64).div_ceil(256)), sz1d(256));
 
                 // Attention (flash_attention reads `half*` KV)
@@ -1228,7 +1303,11 @@ impl MetalDepthformer {
                 enc.set_buffer(1, Some(&self.kv_k[il]), 0);
                 enc.set_buffer(2, Some(&self.kv_v[il]), 0);
                 enc.set_buffer(3, Some(&self.attn_out_buf), 0);
-                enc.set_bytes(4, 32, attn_params.as_ptr() as *const _);
+                enc.set_bytes(
+                    4,
+                    std::mem::size_of_val(&attn_params) as u64,
+                    attn_params.as_ptr() as *const _,
+                );
                 enc.dispatch_thread_groups(sz1d(n_head as u64), sz1d(256));
 
                 // wo: accum into hidden_buf (residual)
@@ -1342,7 +1421,11 @@ impl MetalDepthformer {
         enc.set_compute_pipeline_state(&self.pipes.add_inplace);
         enc.set_buffer(0, Some(output), 0);
         enc.set_buffer(1, Some(&self.accum_buf), 0);
-        enc.set_bytes(2, 8, params.as_ptr() as *const _);
+        enc.set_bytes(
+            2,
+            std::mem::size_of_val(&params) as u64,
+            params.as_ptr() as *const _,
+        );
         enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
     }
 }
