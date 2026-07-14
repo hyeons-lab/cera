@@ -63,7 +63,7 @@ so the count is real. Prompt 512, greedy decode:
    > ~15–18 ms of GPU work per token vs ~1.6–2.4 ms of CPU encode — so submitting each
    > layer as it is encoded lets the GPU start layer *i* while the CPU builds layer
    > *i+1*. Batching them idles the GPU through the whole encode phase. **A submit
-   > count is a cost proxy, not a cost.** See `000226`.
+   > count is a cost proxy, not a cost.** See PR #259.
 
 3. **"Prefill isn't batched" — TRUE, but for a reason nobody guessed.** A 512-token
    prefill issues **8728 submits** (~17 per prompt-token): it is running the
@@ -99,7 +99,7 @@ prefill disaster was mostly a **quantization gate**, not silicon.
   **→ Superseded 2026-07-14: T6 is CLOSED WONTFIX.** Built it; it is a ~30%
   regression on Mac *and* Adreno (see the postscript above). The submits are cheap
   and they buy GPU/CPU overlap. The decode lever is GPU work per token — fuse
-  kernels, shrink the 19 dispatches, f16 weights/KV — with **T5b (per-kernel GPU
+  kernels, fewer dispatches per layer, f16 weights/KV — with **T5b (per-kernel GPU
   timestamps) first**, since ~15–18 ms/token of GPU time is currently unattributed.
 - **T8 — REFRAMED** from "make the batched prefill GEMM fast on Adreno" to **"let
   the batched prefill GEMM actually run"**: add a batched **Q6_K** kernel (or

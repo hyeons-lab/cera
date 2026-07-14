@@ -2248,8 +2248,9 @@ impl GpuLfm2Model {
         // overlap layers with each other (they are strictly serial through
         // `hidden_buf` and cannot overlap).
         //
-        // If you want decode faster, cut GPU work per token (fuse kernels, shrink the
-        // 19 dispatches, f16 weights/KV) — not the submit count. Profile first: T5b.
+        // If you want decode faster, cut GPU work per token (fuse kernels, fewer
+        // dispatches per layer, f16 weights/KV) — not the submit count. Profile
+        // first: T5b.
         for i in 0..cfg.n_layers {
             let lw = &self.layers[i];
             let mut enc = self.new_encoder();
