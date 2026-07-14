@@ -9,10 +9,12 @@ use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvPrefixCache, LayerState};
 use crate::model::transformer::{self, FfnWeights};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
-// DType is only referenced from the BLAS prefill path and the aarch64 NEON
-// GEMM dispatch (the dtype == Q4_0/Q8_0 checks); on x86_64 without `blas` none
-// of those compile, so the import would be unused. Gate it to match.
-#[cfg(any(feature = "blas", target_arch = "aarch64"))]
+// DType's only remaining uses here are the aarch64 per-token GEMV dispatch
+// (`forward_conv_block`'s Q4_0/Q8_0 checks). The prefill gates used to name dtypes
+// directly too, but they now ask `transformer::batched_gemm_supports`, which takes
+// the dtype as a parameter — so on x86_64 + `blas` this import became unused. Gate
+// it to where it is actually referenced.
+#[cfg(target_arch = "aarch64")]
 use crate::tensor::DType;
 use crate::turboquant;
 
