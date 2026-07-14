@@ -56,6 +56,15 @@ so the count is real. Prompt 512, greedy decode:
    comment that claimed it was. **T6 reopens**; closing it was an artifact of the
    broken counter.
 
+   > **Postscript (2026-07-14): the count is real, but it is not a defect, and T6 is
+   > closed WONTFIX.** Merging the forward pass into one command buffer was built and
+   > measured: submits fall 19 → 3 and decode gets **~30% slower on both platforms**
+   > (Mac 62.0 → 45.3, Adreno 12.4 → 8.6 tok/s). Decode is GPU-execution-bound —
+   > ~15–18 ms of GPU work per token vs ~1.6–2.4 ms of CPU encode — so submitting each
+   > layer as it is encoded lets the GPU start layer *i* while the CPU builds layer
+   > *i+1*. Batching them idles the GPU through the whole encode phase. **A submit
+   > count is a cost proxy, not a cost.** See PR #259.
+
 3. **"Prefill isn't batched" — TRUE, but for a reason nobody guessed.** A 512-token
    prefill issues **8728 submits** (~17 per prompt-token): it is running the
    per-token path 512 times.
@@ -87,6 +96,12 @@ prefill disaster was mostly a **quantization gate**, not silicon.
 
 - **T6 (one submit per token) — REOPENED, now a top GPU lever.** 19 submits per
   token, one per layer, on every platform. Nothing was ever batched.
+  **→ Superseded 2026-07-14: T6 is CLOSED WONTFIX.** Built it; it is a ~30%
+  regression on Mac *and* Adreno (see the postscript above). The submits are cheap
+  and they buy GPU/CPU overlap. The decode lever is GPU work per token — and **T5b
+  has since measured which work**: the quantized GEMV loads, not the submit count and
+  not the weight format. See the T5b entry below; the ~15–18 ms/token that was
+  unattributed when this bullet was written is now broken down in `BASELINE.md`.
 - **T8 — REFRAMED** from "make the batched prefill GEMM fast on Adreno" to **"let
   the batched prefill GEMM actually run"**: add a batched **Q6_K** kernel (or
   dequantize the 11 Q6_K tensors at load) so `Q4_K_M` models stop falling off the
@@ -97,8 +112,21 @@ prefill disaster was mostly a **quantization gate**, not silicon.
 - **T5 (GPU sampling)** — unchanged. Greedy is already on-GPU; the non-greedy path
   still downloads full vocab logits per token. `bench` runs temp=0, so it never
   hits this.
-- **T5b (per-kernel GPU timestamps)** — still worth doing, but no longer the #1
-  task: T6 and T8 are now concrete, measured, and mechanical.
+- **T5b (per-kernel GPU timestamps) — DONE, and it answers the decode question.**
+  It needed **no new code**: `CERA_GPU_PROFILE=1` and the whole `GpuProfiler` already
+  existed and had never been run. The 15–18 ms/token is now attributed (table in
+  `BASELINE.md`). Headline: **the quantized decode GEMVs sustain ~25 GB/s while the
+  f16 GEMV sustains 106 GB/s on the same GPU** — a ~4x gap in achieved bandwidth,
+  with FFN alone at 51% of GPU time.
+- **The decode lever is the quantized GEMV load pattern.** Decode is memory-bound
+  (proved by A/B: the same model at Q8_0 moves 1.89x the FFN bytes and takes 2.10x
+  the time), but the quantized kernels only reach 6.7% of the M1 Max's 400 GB/s. They
+  read weights as scalar `u32` loads with shift/branch byte extraction; `gemv_f16`
+  reads aligned vectors and is 4x more efficient. Fix the reads, not the math.
+- **T7 (f16 weights) — DEAD AS SCOPED.** At the f16 kernel's own 106 GB/s, f16 FFN
+  weights (453 MB) would take ~4.3 ms against Q4_0's 4.49 ms: a wash. Converting
+  weight formats cannot help while the quantized kernels are 4x off their achievable
+  bandwidth. (f16 *KV* is untouched by this and still open.)
 
 ## Lesson
 

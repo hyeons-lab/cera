@@ -2229,8 +2229,29 @@ impl GpuLfm2Model {
             .expect("active_lora poisoned")
             .clone();
 
-        // 2. Per-layer loop — one encoder per layer (block + FFN merged).
-        // Each layer submits independently to maintain CPU-GPU pipeline overlap.
+        // 2. Per-layer loop — one encoder per layer (block + FFN merged), each
+        // submitted independently. That is 16 submits + 1 for the head below, and
+        // the per-token GPU I/O counters will report ~19 submits/token.
+        //
+        // THAT COUNT IS NOT A BUG, AND MERGING THESE INTO ONE COMMAND BUFFER MAKES
+        // DECODE SLOWER. Measured, LFM2 Q4_K_M / Q4_0, one submit per token:
+        //
+        //     Mac (wgpu/Metal)   62.0 -> 45.3 tok/s
+        //     Adreno 840         12.4 ->  8.6 tok/s
+        //
+        // Decode is GPU-execution-bound, not submit-bound: ~15-18 ms of GPU work per
+        // token against only ~1.6-2.4 ms of CPU encode. Submitting each layer as it
+        // is encoded lets the GPU start layer i while the CPU is still building bind
+        // groups for layer i+1. Batch them and the GPU instead sits idle through the
+        // whole encode phase, which is pure loss — the submits themselves are cheap
+        // on both platforms. The overlap is GPU-vs-CPU; it is NOT an attempt to
+        // overlap layers with each other (they are strictly serial through
+        // `hidden_buf` and cannot overlap).
+        //
+        // If you want faster decode, cut GPU work per token — not the submit count.
+        // T5b has already profiled it (`CERA_GPU_PROFILE=1`): decode is memory-bound
+        // inside the quantized GEMVs, which sustain only ~25 GB/s against the f16
+        // GEMV's 106 GB/s on the same GPU. Fix those loads. See `BASELINE.md`.
         for i in 0..cfg.n_layers {
             let lw = &self.layers[i];
             let mut enc = self.new_encoder();

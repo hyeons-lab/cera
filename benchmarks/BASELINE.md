@@ -54,7 +54,10 @@ re-measuring needs the device.
 Read:
 
 - **Decode issues 19 submits per token** — one per layer, plus argmax. The forward
-  pass is *not* batched into a single command buffer (T6).
+  pass is *not* batched into a single command buffer. **This is deliberate, not a
+  bug: batching it into one command buffer was measured at ~30% slower on both Mac
+  and Adreno** (decode is GPU-bound; the per-layer submits overlap GPU execution with
+  CPU encode). T6 is closed WONTFIX — see `GPU_FINDINGS_CORRECTION.md`.
 - Greedy decode **does** sample on the GPU: the readback is a 4-byte token id, not
   vocab logits. That part was always true.
 - **Prefill batching is gated on quantization, not platform.** The batched path
@@ -78,6 +81,56 @@ Caveat: `bench` decodes greedily (temp=0), which takes the on-GPU argmax path. T
 **non-greedy** path still downloads full vocab logits per token — invisible to
 these numbers by construction.
 
+## GPU decode profile (`CERA_GPU_PROFILE=1`)
+
+Per-kernel GPU timestamps. **The profiler already existed** (`GpuContext::profiler`,
+spans in `gpu_lfm2.rs`) and had apparently never been run — T5b needed no new code,
+only the run.
+
+LFM2-VL-450M **Q4_0**, wgpu/Metal, M1 Max (400 GB/s), greedy decode. Control
+(unprofiled) decode is **63.4 tok/s = 15.8 ms/token**; the timestamps themselves cost
+~9%, so treat these as ~9% inflated.
+
+| span | GPU time / token | share |
+|---|---:|---:|
+| `ffn` (16×: rmsnorm + gate/up/down GEMV + silu_mul) | 4492 µs | 51.1% |
+| `gemv_f16` (LM head) | 1265 µs | 14.4% |
+| `conv_pre` (10×) | 926 µs | 10.5% |
+| `attn_pre` (6×) | 732 µs | 8.3% |
+| `flash_attention` (6×) | 476 µs | 5.4% |
+| `conv_post` (10×) | 425 µs | 4.8% |
+| `attn_post` (6×) | 258 µs | 2.9% |
+| `conv_mid` (10×) | 188 µs | 2.1% |
+| `rmsnorm` / `argmax` | 24 / 139 µs | — |
+| **sum of GPU passes** | **~8.9 ms** | |
+
+Read:
+
+- **The quantized decode GEMVs sustain ~25 GB/s; the f16 GEMV sustains 106 GB/s on
+  the same GPU.** That is the decode bottleneck — a ~4x gap, and it is *not* about
+  dequant cost:
+
+  | kernel | bytes/weight | bytes moved | time | achieved BW | % of 400 GB/s |
+  |---|---:|---:|---:|---:|---:|
+  | FFN Q4_0 | 0.5625 | 121 MB | 4.49 ms | 27 GB/s | 6.7% |
+  | FFN Q8_0 | 1.0625 | 229 MB | 9.45 ms | 24 GB/s | 6.1% |
+  | `gemv_f16` (LM head) | 2.0 | 134 MB | 1.27 ms | **106 GB/s** | 26% |
+
+- **Decode is memory-bound, confirmed by A/B, not by inspection.** The same model at
+  Q8_0 moves 1.89x the FFN bytes and takes **2.10x** the FFN time (4.49 → 9.45 ms).
+  Time tracks bytes. An ALU/dequant bound was the obvious story from reading
+  `gemv_q4_0_fast.wgsl` (branchy `u32` shift-extraction per weight byte) and it is
+  **wrong** — Q8_0 is *cheaper* to unpack and got proportionally slower anyway.
+- So the ~4x gap is in **how the bytes are read**, not what is done with them: the
+  quantized kernels fetch via scalar `u32` loads with shift/branch byte extraction;
+  `gemv_f16` reads aligned vectors. Coalescing/vectorization, not quantization.
+- **~44% of decode wall time is outside every GPU pass** (8.9 ms of passes vs 15.8 ms
+  wall). Not recoverable by merging submits — see T6 above.
+- **Fixed cost is ~20 µs per compute pass.** A 1024-element `rmsnorm` takes 24 µs;
+  `conv_mid` 18.8 µs. At 67 passes/token that is ~1.3 ms of pure overhead.
+- Not yet measured on Adreno. T5b was originally scoped there, and the access-pattern
+  penalty is likely worse on a mobile tiler.
+
 ## Reproduce
 
 ```bash
@@ -90,6 +143,10 @@ scripts/profile_android_cpu.sh --model LFM2.5-350M-Q4_K_M.gguf --mask 80
 
 # Mac / desktop matrix
 scripts/bench_matrix.sh
+
+# Per-kernel GPU timestamps (prints a span table per forward pass, to stderr)
+CERA_GPU_PROFILE=1 cera bench -m <model.gguf> --device gpu \
+  --runs 1 --warmup 1 --max-tokens 4 --no-cache
 ```
 
 ## Known measurement traps
