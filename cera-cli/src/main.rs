@@ -785,6 +785,17 @@ enum Command {
         /// but slower prefill. 0 disables chunking (monolithic).
         #[arg(long, default_value_t = 512)]
         ubatch_size: u32,
+
+        /// Report GPU I/O counters (queue submits and GPU→CPU readbacks, per
+        /// decoded token) alongside throughput. Use these to check whether a
+        /// change actually removed per-token round-trips, instead of assuming
+        /// it did.
+        ///
+        /// Only the wgpu backend is instrumented — the counters read zero on
+        /// CPU *and* on other GPU backends (e.g. Metal), which is reported
+        /// explicitly rather than printed as a misleading 0.0 submits/token.
+        #[arg(long)]
+        gpu_io: bool,
     },
 
     /// List bundles published on `huggingface.co/LiquidAI/LeapBundles`.
@@ -1328,6 +1339,115 @@ fn configure_prefix_cache(
         max_warm_bytes: cache_warm_mb * 1024 * 1024,
         max_cold_bytes: cache_disk_gb * 1024 * 1024 * 1024,
     });
+}
+
+/// The GPU I/O one phase of a run cost, and the tokens it covered. Stays zero
+/// unless the wgpu backend is active.
+#[derive(Debug, Clone, Copy, Default)]
+struct PhaseIo {
+    submits: u64,
+    readbacks: u64,
+    readback_bytes: u64,
+    tokens: u64,
+}
+
+impl PhaseIo {
+    /// The I/O charged between two `gpu_io_snapshot()` calls.
+    fn between(before: (u64, u64, u64), after: (u64, u64, u64), tokens: u64) -> Self {
+        Self {
+            submits: after.0.saturating_sub(before.0),
+            readbacks: after.1.saturating_sub(before.1),
+            readback_bytes: after.2.saturating_sub(before.2),
+            tokens,
+        }
+    }
+
+    /// Sum across runs. Tokens add too, so the per-token rates stay weighted by
+    /// how many tokens each run actually contributed.
+    fn accumulate(&mut self, other: Self) {
+        self.submits += other.submits;
+        self.readbacks += other.readbacks;
+        self.readback_bytes += other.readback_bytes;
+        self.tokens += other.tokens;
+    }
+}
+
+/// One measured `bench` run: throughput plus the GPU I/O each phase cost.
+struct RunStats {
+    prefill_tps: f64,
+    decode_tps: f64,
+    decode_io: PhaseIo,
+    prefill_io: PhaseIo,
+}
+
+/// `(submits, readbacks, readback_bytes)` from the wgpu backend's counters.
+///
+/// Zeros when the `gpu` feature is off: the counters live in the wgpu backend,
+/// so there is nothing to read. Zeros also mean "not wgpu" at runtime (e.g. the
+/// CPU or Metal backend is active), which `--gpu-io` reports explicitly rather
+/// than silently printing a misleading 0.0 submits/token.
+#[cfg(feature = "gpu")]
+fn gpu_io_snapshot() -> (u64, u64, u64) {
+    let s = cera::backend::wgpu::io_stats::snapshot();
+    (s.submits, s.readbacks, s.readback_bytes)
+}
+
+#[cfg(not(feature = "gpu"))]
+fn gpu_io_snapshot() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
+/// Print the `--gpu-io` report. Paired with a no-op-ish `cfg(not(gpu))` twin below,
+/// mirroring `gpu_io_snapshot`: the counters live behind the `gpu` feature, so the
+/// reporting has to be gated at compile time, not with a runtime `cfg!`.
+#[cfg(feature = "gpu")]
+fn report_gpu_io(decode: PhaseIo, prefill: PhaseIo) {
+    use cera::backend::wgpu::io_stats::GpuIoStats;
+
+    let stats = |p: PhaseIo| GpuIoStats {
+        submits: p.submits,
+        readbacks: p.readbacks,
+        readback_bytes: p.readback_bytes,
+    };
+
+    if decode.tokens == 0 {
+        eprintln!("gpu I/O: no tokens decoded — nothing to report");
+        return;
+    }
+    let (sub_pt, rb_pt, bytes_pt) = stats(decode).per_token(decode.tokens);
+    let d_tokens = decode.tokens;
+    eprintln!(
+        "gpu I/O (decode): {sub_pt:.1} submits/token, {rb_pt:.1} readbacks/token, \
+         {bytes_pt:.0} readback bytes/token (over {d_tokens} tokens)",
+    );
+    // A batched prefill is ~one submit for the whole pass. A submit *per prompt
+    // token* means prefill is secretly looping the decode path — which is exactly
+    // what a quant that fails the batched-GEMM dtype check does.
+    if prefill.tokens > 0 {
+        let (pf_sub_pt, _, _) = stats(prefill).per_token(prefill.tokens);
+        let (pf_submits, pf_readbacks, pf_bytes, pf_tokens) = (
+            prefill.submits,
+            prefill.readbacks,
+            prefill.readback_bytes,
+            prefill.tokens,
+        );
+        eprintln!(
+            "gpu I/O (prefill): {pf_submits} submits, {pf_readbacks} readbacks, \
+             {pf_bytes} readback bytes total \
+             ({pf_sub_pt:.3} submits/prompt-token over {pf_tokens} tokens)",
+        );
+    }
+    if decode.submits == 0 && decode.readbacks == 0 {
+        eprintln!(
+            "  (all zero — the active backend is not wgpu; \
+             these counters only instrument the wgpu path)"
+        );
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+fn report_gpu_io(_: PhaseIo, _: PhaseIo) {
+    eprintln!("gpu I/O: unavailable — cera-cli was built without the `gpu` feature");
 }
 
 /// (p10, p50, p90, mean, stddev)
@@ -3450,6 +3570,7 @@ fn main() -> Result<()> {
             no_cache,
             kv_cache_keys,
             ubatch_size,
+            gpu_io,
         } => {
             anyhow::ensure!(runs >= 1, "--runs must be >= 1");
             if std::env::var("CERA_PROFILE").is_ok() {
@@ -3524,16 +3645,21 @@ fn main() -> Result<()> {
             );
 
             // Greedy (temp=0): deterministic, bench-friendly. NoopSink swallows tokens.
-            let run_once = || -> Result<(f64, f64)> {
+            let run_once = || -> Result<RunStats> {
                 let mut session = engine.new_session(cera::SessionConfig {
                     kv_compression: kv_compression.clone(),
                     seed: None,
                     ubatch_size,
                     ..Default::default()
                 })?;
+                // Prefill is one batched pass in principle — if it turns out to
+                // issue a submit per prompt token, that alone explains a prefill
+                // rate that never exceeds decode.
+                let io_prefill_before = gpu_io_snapshot();
                 let prefill_start = std::time::Instant::now();
                 session.append_tokens(&tokens)?;
                 let prefill_elapsed = prefill_start.elapsed();
+                let io_prefill_after = gpu_io_snapshot();
 
                 let opts = cera::GenerateOpts {
                     max_tokens: max_tokens as u32,
@@ -3545,7 +3671,13 @@ fn main() -> Result<()> {
                     ..Default::default()
                 };
                 let mut sink = NoopSink;
+                // Scope these counters to decode only, so the decode rates are
+                // per decoded token and not diluted by prefill (measured
+                // separately above — its submit count varies wildly depending
+                // on whether the batched path was taken).
+                let io_before = gpu_io_snapshot();
                 let summary = session.generate(&opts, &mut sink)?;
+                let io_after = gpu_io_snapshot();
 
                 let prefill_tps = if prefill_elapsed.as_secs_f64() > 0.0 {
                     tokens.len() as f64 / prefill_elapsed.as_secs_f64()
@@ -3557,7 +3689,20 @@ fn main() -> Result<()> {
                 } else {
                     0.0
                 };
-                Ok((prefill_tps, decode_tps))
+                Ok(RunStats {
+                    prefill_tps,
+                    decode_tps,
+                    decode_io: PhaseIo::between(
+                        io_before,
+                        io_after,
+                        summary.tokens_generated as u64,
+                    ),
+                    prefill_io: PhaseIo::between(
+                        io_prefill_before,
+                        io_prefill_after,
+                        tokens.len() as u64,
+                    ),
+                })
             };
 
             // Thermal-headroom sampling (Android). A sustained CPU benchmark
@@ -3578,8 +3723,11 @@ fn main() -> Result<()> {
             let mut decode_tps = Vec::with_capacity(runs);
             let mut prefill_tps = Vec::with_capacity(runs);
             let mut headrooms = Vec::with_capacity(runs);
+            let mut decode_io = PhaseIo::default();
+            let mut prefill_io = PhaseIo::default();
             for i in 0..runs {
-                let (pf, dc) = run_once()?;
+                let r = run_once()?;
+                let (pf, dc) = (r.prefill_tps, r.decode_tps);
                 let suffix = match sample_headroom() {
                     Some(h) => {
                         headrooms.push(h);
@@ -3594,6 +3742,8 @@ fn main() -> Result<()> {
                 );
                 decode_tps.push(dc);
                 prefill_tps.push(pf);
+                decode_io.accumulate(r.decode_io);
+                prefill_io.accumulate(r.prefill_io);
             }
             eprintln!();
 
@@ -3617,6 +3767,10 @@ fn main() -> Result<()> {
             eprintln!(
                 "prefill tok/s: p50={p50:.0} p10={p10:.0} p90={p90:.0} mean={mean:.0} stddev={stddev:.0} (n={runs})"
             );
+
+            if gpu_io {
+                report_gpu_io(decode_io, prefill_io);
+            }
         }
     }
 
