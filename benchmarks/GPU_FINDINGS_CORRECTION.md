@@ -98,9 +98,10 @@ prefill disaster was mostly a **quantization gate**, not silicon.
   token, one per layer, on every platform. Nothing was ever batched.
   **→ Superseded 2026-07-14: T6 is CLOSED WONTFIX.** Built it; it is a ~30%
   regression on Mac *and* Adreno (see the postscript above). The submits are cheap
-  and they buy GPU/CPU overlap. The decode lever is GPU work per token — fuse
-  kernels, fewer dispatches per layer, f16 weights/KV — with **T5b (per-kernel GPU
-  timestamps) first**, since ~15–18 ms/token of GPU time is currently unattributed.
+  and they buy GPU/CPU overlap. The decode lever is GPU work per token — and **T5b
+  has since measured which work**: the quantized GEMV loads, not the submit count and
+  not the weight format. See the T5b entry below; the ~15–18 ms/token that was
+  unattributed when this bullet was written is now broken down in `BASELINE.md`.
 - **T8 — REFRAMED** from "make the batched prefill GEMM fast on Adreno" to **"let
   the batched prefill GEMM actually run"**: add a batched **Q6_K** kernel (or
   dequantize the 11 Q6_K tensors at load) so `Q4_K_M` models stop falling off the
