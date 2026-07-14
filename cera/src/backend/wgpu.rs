@@ -19,10 +19,17 @@ use half::f16;
 /// they turn "the GPU is stalling on round-trips" into a number a change can be
 /// held to.
 ///
-/// Worth knowing before you reach for them: decode currently measures **19 submits
-/// per token** — roughly one per layer — and 1.0 readbacks of 4 bytes (greedy
-/// sampling already runs argmax on-GPU). So the submit count is a live suspect, not
-/// a settled one.
+/// Worth knowing before you reach for them: decode measures **19 submits per token**
+/// — roughly one per layer — and 1.0 readbacks of 4 bytes (greedy sampling already
+/// runs argmax on-GPU).
+///
+/// **That submit count is settled, and it is not the problem.** Merging the forward
+/// pass into one command buffer was built and measured: submits fall to 3 and decode
+/// gets ~30% *slower* on both Mac and Adreno, because the per-layer submits overlap
+/// GPU execution with CPU encode (T6, closed WONTFIX — PR #259). Decode is
+/// memory-bound inside the GEMV kernels; use `CERA_GPU_PROFILE=1` for that, not
+/// these counters. Reach for these to check readback volume and to catch a *new*
+/// round-trip regression — not to re-litigate the submit count.
 ///
 /// An earlier revision of this comment claimed 1.0 submits/token. That was the
 /// counter measuring itself: only `submit_encoder` incremented it, and the model

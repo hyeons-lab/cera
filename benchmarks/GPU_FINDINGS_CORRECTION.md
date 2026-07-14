@@ -111,8 +111,21 @@ prefill disaster was mostly a **quantization gate**, not silicon.
 - **T5 (GPU sampling)** — unchanged. Greedy is already on-GPU; the non-greedy path
   still downloads full vocab logits per token. `bench` runs temp=0, so it never
   hits this.
-- **T5b (per-kernel GPU timestamps)** — still worth doing, but no longer the #1
-  task: T6 and T8 are now concrete, measured, and mechanical.
+- **T5b (per-kernel GPU timestamps) — DONE, and it answers the decode question.**
+  It needed **no new code**: `CERA_GPU_PROFILE=1` and the whole `GpuProfiler` already
+  existed and had never been run. The 15–18 ms/token is now attributed (table in
+  `BASELINE.md`). Headline: **the quantized decode GEMVs sustain ~25 GB/s while the
+  f16 GEMV sustains 106 GB/s on the same GPU** — a ~4x gap in achieved bandwidth,
+  with FFN alone at 51% of GPU time.
+- **The decode lever is the quantized GEMV load pattern.** Decode is memory-bound
+  (proved by A/B: the same model at Q8_0 moves 1.89x the FFN bytes and takes 2.10x
+  the time), but the quantized kernels only reach 6.7% of the M1 Max's 400 GB/s. They
+  read weights as scalar `u32` loads with shift/branch byte extraction; `gemv_f16`
+  reads aligned vectors and is 4x more efficient. Fix the reads, not the math.
+- **T7 (f16 weights) — DEAD AS SCOPED.** At the f16 kernel's own 106 GB/s, f16 FFN
+  weights (453 MB) would take ~4.3 ms against Q4_0's 4.49 ms: a wash. Converting
+  weight formats cannot help while the quantized kernels are 4x off their achievable
+  bandwidth. (f16 *KV* is untouched by this and still open.)
 
 ## Lesson
 
