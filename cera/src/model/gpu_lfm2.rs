@@ -42,9 +42,21 @@ const MUL_MAT_TILE_N: u32 = 1;
 const MUL_MAT_TILE_K: u32 = 32;
 
 /// Build a `mul_mat_reg_tile` pipeline for the requested variant.
+///
 /// `use_vec` enables vec4 loads/stores (requires the matrix dimensions and
 /// effective row strides used by each dispatch to be multiples of 4).
-fn build_mul_mat_pipeline(ctx: &GpuContext, label: &str, use_vec: bool) -> wgpu::ComputePipeline {
+/// `src0_loader` selects the shmem dequant path — `"INIT_SRC0_SHMEM_Q4_0"` or
+/// `"INIT_SRC0_SHMEM_Q6_K"`. The rest of the kernel is dtype-agnostic: the loader
+/// decodes weights to f32 in shared memory once per k-tile and the register-tiled
+/// inner loop reuses them across all `WORKGROUP_SIZE_N` token columns. That reuse
+/// is the entire reason this kernel beats the batched-GEMV-shaped `gemm_*`
+/// kernels, which re-dequantize per token.
+fn build_mul_mat_pipeline(
+    ctx: &GpuContext,
+    label: &str,
+    use_vec: bool,
+    src0_loader: &str,
+) -> wgpu::ComputePipeline {
     let wg_m = format!("{MUL_MAT_TILE_WG_M}u");
     let wg_n = format!("{MUL_MAT_TILE_WG_N}u");
     let tile_m = format!("{MUL_MAT_TILE_M}u");
@@ -59,7 +71,7 @@ fn build_mul_mat_pipeline(ctx: &GpuContext, label: &str, use_vec: bool) -> wgpu:
             (variant, ""),
             ("SRC0_INNER_TYPE", "u32"),
             ("SRC1_INNER_TYPE", "f32"),
-            ("INIT_SRC0_SHMEM_Q4_0", ""),
+            (src0_loader, ""),
             ("INIT_SRC1_SHMEM_FLOAT", ""),
             ("WORKGROUP_SIZE_M", &wg_m),
             ("WORKGROUP_SIZE_N", &wg_n),
@@ -216,7 +228,8 @@ struct GpuPipelines {
     mul_mat_reg_tile_q4_0_vec: wgpu::ComputePipeline,
     mul_mat_reg_tile_q4_0_scalar: wgpu::ComputePipeline,
     gemm_q8_0: wgpu::ComputePipeline,
-    gemm_q4_k: wgpu::ComputePipeline,
+    mul_mat_reg_tile_q4_k: wgpu::ComputePipeline,
+    mul_mat_reg_tile_q6_k: wgpu::ComputePipeline,
     attention_prefill: wgpu::ComputePipeline,
 }
 
@@ -391,6 +404,9 @@ pub struct GpuLfm2Model {
     /// Whether the batched-prefill GPU path is enabled (LFM2 only today; the
     /// dense transformers prefill via the per-token decode loop).
     batched_prefill: bool,
+    /// Latches once the "no batched GEMM for this dtype" warning has been emitted,
+    /// so a long generation doesn't repeat it on every `forward_prefill`.
+    batched_fallback_warned: AtomicBool,
     /// Llama-3 RoPE frequency factors (`rope_freqs.weight`), or a 1-element
     /// dummy when the model uses plain RoPE. Always bound (binding 3) on the
     /// decode rope dispatch; `has_freq_factors` in `rope_params` gates its use.
@@ -729,14 +745,35 @@ impl GpuLfm2Model {
             ),
             bias_add: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "bias_add"),
 
-            mul_mat_reg_tile_q4_0_vec: build_mul_mat_pipeline(&ctx, "mul_mat_q4_0_vec", true),
+            mul_mat_reg_tile_q4_0_vec: build_mul_mat_pipeline(
+                &ctx,
+                "mul_mat_q4_0_vec",
+                true,
+                "INIT_SRC0_SHMEM_Q4_0",
+            ),
             mul_mat_reg_tile_q4_0_scalar: build_mul_mat_pipeline(
                 &ctx,
                 "mul_mat_q4_0_scalar",
                 false,
+                "INIT_SRC0_SHMEM_Q4_0",
             ),
             gemm_q8_0: ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0", "gemm_q8_0"),
-            gemm_q4_k: ctx.create_pipeline(shaders::GEMM_Q4_K, "gemm_q4_k", "gemm_q4_k"),
+            // The K-quants go through the register-tiled kernel (weight reuse across
+            // the token tile), NOT the batched-GEMV-shaped gemm_* kernels: those
+            // re-dequantize per token and measured *slower* than the per-token
+            // fallback they were meant to replace.
+            mul_mat_reg_tile_q4_k: build_mul_mat_pipeline(
+                &ctx,
+                "mul_mat_q4_k",
+                false,
+                "INIT_SRC0_SHMEM_Q4_K",
+            ),
+            mul_mat_reg_tile_q6_k: build_mul_mat_pipeline(
+                &ctx,
+                "mul_mat_q6_k",
+                false,
+                "INIT_SRC0_SHMEM_Q6_K",
+            ),
             attention_prefill: ctx.create_pipeline(
                 shaders::ATTENTION_PREFILL,
                 "attention_prefill",
@@ -1106,6 +1143,7 @@ impl GpuLfm2Model {
             rope_type,
             scalars,
             batched_prefill,
+            batched_fallback_warned: AtomicBool::new(false),
             rope_freqs_buf,
             has_freq_factors,
             hidden_buf,
@@ -3076,13 +3114,13 @@ impl GpuLfm2Model {
 //     `start_pos`; conv rolling state and KV cache writes carry across).
 //   * `1 <= n <= MAX_PREFILL_TOKENS` per call (asserted).
 //   * `start_pos + n <= max_seq_len` (asserted).
-//   * Every matmul weight must have a batched GEMM kernel — Q4_0
-//     (mul_mat_reg_tile), Q8_0 (gemm_q8_0), or Q4KM (gemm_q4_k). Any other
-//     dtype (F32, Q6K, Q5KM, …) makes `all_matmul_weights_batched_supported`
-//     return false and the whole prompt falls through to the per-token GEMV
-//     loop at the dispatcher.
+//   * Every matmul weight must have a batched GEMM kernel — Q4_0 and Q4KM/Q6K
+//     (mul_mat_reg_tile, the K-quants via a K-quant shmem loader), or Q8_0
+//     (gemm_q8_0). Any other dtype (F32, Q5KM, …) makes
+//     `unbatchable_matmul_weight` return the offending tensor and the whole
+//     prompt falls through to the per-token GEMV loop at the dispatcher.
 //
-// Extending the batched path to further dtypes (e.g. a Q6K/Q5KM GEMM, or an
+// Extending the batched path to further dtypes (e.g. a Q5KM loader, or an
 // f32 `gemm_f32` fallback) can land in a follow-up PR without disturbing this
 // contract.
 //
@@ -3103,32 +3141,41 @@ impl GpuLfm2Model {
 // shader PR.
 
 impl GpuLfm2Model {
-    /// Returns true iff every matmul weight on every layer has a batched
-    /// prefill kernel. Q4_0 uses the register-tiled path; Q8_0 and Q4KM use the
-    /// conservative batched GEMV-shaped path (gemm_q8_0 / gemm_q4_k).
-    /// precondition for `forward_prefill_batched_locked` to take the
-    /// batched path. Cheap O(n_layers) walk; not memoized because it's
-    /// called once per `forward_prefill` invocation.
-    fn all_matmul_weights_batched_supported(&self) -> bool {
-        for lw in &self.layers {
-            let weights = [
-                Some(&lw.ffn_gate),
-                Some(&lw.ffn_up),
-                Some(&lw.ffn_down),
-                lw.attn_q.as_ref(),
-                lw.attn_k.as_ref(),
-                lw.attn_v.as_ref(),
-                lw.attn_output.as_ref(),
-                lw.conv_in_proj.as_ref(),
-                lw.conv_out_proj.as_ref(),
+    /// The first matmul weight that has no batched prefill kernel, as
+    /// `(layer, tensor name, dtype)` — or `None` when every weight has one, which
+    /// is the precondition for `forward_prefill_batched_locked` to take the batched
+    /// path. Q4_0 uses the register-tiled path; Q4KM and Q6K use that same
+    /// register-tiled kernel with a K-quant shmem loader; Q8_0 still uses the
+    /// conservative batched GEMV-shaped path (gemm_q8_0).
+    ///
+    /// Returns the *offender*, not a bare `bool`, because one unsupported tensor
+    /// silently drops the whole prompt onto the per-token loop — ~340x the submits
+    /// (measured: 8728 vs 25 on a 512-token prefill). A `false` that names nothing
+    /// is how a `Q4_K_M` model — which is *not* uniformly Q4_K; it carries a
+    /// handful of Q6_K tensors — sat on the slow path unnoticed. Cheap
+    /// `O(n_layers)` walk; called once per `forward_prefill`.
+    fn unbatchable_matmul_weight(&self) -> Option<(usize, &'static str, DType)> {
+        for (li, lw) in self.layers.iter().enumerate() {
+            let weights: [(&'static str, Option<&GpuWeight>); 9] = [
+                ("ffn_gate", Some(&lw.ffn_gate)),
+                ("ffn_up", Some(&lw.ffn_up)),
+                ("ffn_down", Some(&lw.ffn_down)),
+                ("attn_q", lw.attn_q.as_ref()),
+                ("attn_k", lw.attn_k.as_ref()),
+                ("attn_v", lw.attn_v.as_ref()),
+                ("attn_output", lw.attn_output.as_ref()),
+                ("conv_in_proj", lw.conv_in_proj.as_ref()),
+                ("conv_out_proj", lw.conv_out_proj.as_ref()),
             ];
-            for w in weights.into_iter().flatten() {
-                if !matches!(w.tensor.dtype, DType::Q4_0 | DType::Q8_0 | DType::Q4KM) {
-                    return false;
+            for (name, w) in weights {
+                let Some(w) = w else { continue };
+                let dt = w.tensor.dtype;
+                if !matches!(dt, DType::Q4_0 | DType::Q8_0 | DType::Q4KM | DType::Q6K) {
+                    return Some((li, name, dt));
                 }
             }
         }
-        true
+        None
     }
 
     /// Encode `rmsnorm_batch`: dst[t, i] = src[t, i] * inv_rms(src[t]) * w[i]
@@ -3254,9 +3301,9 @@ impl GpuLfm2Model {
     }
 
     /// Encode batched 2D matmul: y = weight * x.
-    /// Batched prefill supports quantized Q4_0 and Q8_0 weights. F32 weights
-    /// are not a production path in this model. `x_stride` and `y_stride` are
-    /// measured in f32 elements between consecutive token vectors.
+    /// Batched prefill supports quantized Q4_0, Q8_0, Q4KM and Q6K weights. F32
+    /// weights are not a production path in this model. `x_stride` and `y_stride`
+    /// are measured in f32 elements between consecutive token vectors.
     #[allow(clippy::too_many_arguments)] // tile geometry + strides; splitting hurts clarity
     fn encode_mul_mat_reg_tile(
         &self,
@@ -3270,8 +3317,11 @@ impl GpuLfm2Model {
         y_stride: u32,
     ) {
         debug_assert!(
-            matches!(w.tensor.dtype, DType::Q4_0 | DType::Q8_0 | DType::Q4KM),
-            "encode_mul_mat_reg_tile only supports Q4_0/Q8_0/Q4KM weights"
+            matches!(
+                w.tensor.dtype,
+                DType::Q4_0 | DType::Q8_0 | DType::Q4KM | DType::Q6K
+            ),
+            "encode_mul_mat_reg_tile only supports Q4_0/Q8_0/Q4KM/Q6K weights"
         );
         let m = w.tensor.shape[0] as u32;
         let (pipeline, wg_m, wg_n, label) = match w.tensor.dtype {
@@ -3304,25 +3354,44 @@ impl GpuLfm2Model {
                 (&self.pipelines.gemm_q8_0, wg_m, n, "gemm_q8")
             }
             DType::Q4KM => {
-                // gemm_q4_k mirrors gemm_q8_0's ROWS_PER_WG=8 batched shape and
-                // likewise indexes the row tile with `wid.x` directly (`wid.y`
-                // is the token axis), so the same 65535 row-tile guard applies.
-                let wg_m = m.div_ceil(8);
-                debug_assert!(
-                    wg_m <= 65535,
-                    "gemm_q4_k row tiles {wg_m} exceed the 65535 dispatch \
-                     limit (m={m}); Q4_K batched prefill needs a flattened \
-                     dispatch for weights this large"
-                );
-                (&self.pipelines.gemm_q4_k, wg_m, n, "gemm_q4k")
+                // Same register-tiled geometry as Q4_0/Q6_K — only the shmem dequant
+                // differs. Scalar (not vec4): the packed-byte loader can't guarantee
+                // the multiple-of-4 m/k/stride the vec4 path needs.
+                let wg_m = m.div_ceil(MUL_MAT_TILE_WG_M * MUL_MAT_TILE_M);
+                let wg_n = n.div_ceil(MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N);
+                (
+                    &self.pipelines.mul_mat_reg_tile_q4_k,
+                    wg_m,
+                    wg_n,
+                    "mul_mat_q4k",
+                )
+            }
+            DType::Q6K => {
+                // Same register-tiled geometry as Q4_0 — only the shmem dequant
+                // differs. Scalar (not vec4) because Q6_K rows are 210-byte blocks:
+                // the vec4 path needs m/k/strides all multiples of 4, which the
+                // packed-byte loader does not guarantee.
+                let wg_m = m.div_ceil(MUL_MAT_TILE_WG_M * MUL_MAT_TILE_M);
+                let wg_n = n.div_ceil(MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N);
+                (
+                    &self.pipelines.mul_mat_reg_tile_q6_k,
+                    wg_m,
+                    wg_n,
+                    "mul_mat_q6k",
+                )
             }
             // Unreachable in practice: the batched path is only entered when
-            // `all_matmul_weights_batched_supported()` already confirmed every
-            // weight is Q4_0/Q8_0/Q4KM. The debug_assert above documents the
-            // same precondition; this arm is the release-mode backstop.
-            _ => unreachable!("batched prefill only supports Q4_0/Q8_0/Q4KM"),
+            // `unbatchable_matmul_weight()` returned `None`, i.e. every weight is
+            // Q4_0/Q8_0/Q4KM/Q6K. The debug_assert above documents the same
+            // precondition; this arm is the release-mode backstop.
+            _ => unreachable!("batched prefill only supports Q4_0/Q8_0/Q4KM/Q6K"),
         };
 
+        // 6 words, not 5, because this one buffer feeds two kernels with different
+        // param layouts: `mul_mat_reg_tile`'s `MulMatParams` is a 5-field struct
+        // (the 6th word is ignored), but `gemm_q8_0` declares `array<u32, 6>` and a
+        // 20-byte binding would fail wgpu's min-binding-size validation. Sized to
+        // the union. Tests that drive `mul_mat_reg_tile` alone bind 5.
         let params: [u32; 6] = [m, k, n, x_stride, y_stride, 0];
         let p_buf = self
             .ctx
@@ -4608,22 +4677,37 @@ impl Model for GpuLfm2Model {
             // Try the batched prefill path. Preconditions:
             //   * fresh prefill (start_pos == 0, already checked above)
             //   * non-empty
-            //   * all matmul weights have a batched quantized kernel
-            //     (Q4_0/Q8_0 today; other dtypes fall through to the
-            //     per-token loop)
+            //   * every matmul weight has a batched quantized kernel
+            //     (Q4_0/Q8_0/Q4KM/Q6K); any other dtype falls through to the
+            //     per-token loop
             //   * the model wires the batched-prefill path (`batched_prefill`).
             //     LFM2 and the dense transformers (llama/qwen2/qwen3/mistral/
-            //     granite) all support it; a model whose weights aren't all
-            //     Q4_0/Q8_0 still falls through to the sequential loop below.
+            //     granite) all support it.
+            //
+            // The dtype fallback is *loud*: it costs ~340x the GPU submits, so it
+            // must never again be something a model quietly sits on for months.
             //
             // Long prompts are chunked through the batched path in
             // MAX_PREFILL_TOKENS-sized chunks so the scratch buffers stay
             // bounded. Each chunk advances `start_pos`; conv rolling
             // state and KV cache writes carry across chunks naturally.
-            if !tokens.is_empty()
+            let unbatchable = self.unbatchable_matmul_weight();
+            if let Some((layer, name, dtype)) = unbatchable
+                && !tokens.is_empty()
                 && self.batched_prefill
-                && self.all_matmul_weights_batched_supported()
+                && !self.batched_fallback_warned.swap(true, Ordering::Relaxed)
             {
+                tracing::warn!(
+                    layer,
+                    tensor = name,
+                    ?dtype,
+                    "no batched prefill GEMM for this dtype — falling back to the \
+                     per-token loop, which issues ~340x the GPU submits and makes \
+                     prefill no faster than decode. Add a batched kernel for {dtype:?} \
+                     to put this model back on the fast path.",
+                );
+            }
+            if !tokens.is_empty() && self.batched_prefill && unbatchable.is_none() {
                 // Chunk size respects both the static MAX_PREFILL_TOKENS
                 // budget AND the model's actual `max_seq_len` — otherwise
                 // a caller with `--context-size < 512` would dispatch

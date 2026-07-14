@@ -30,7 +30,7 @@ fn store_shmem(val: f32, idx: u32) {
 #endif
 
 // Helpers for manual dequantization from u32-packed storage
-#if defined(INIT_SRC0_SHMEM_Q4_0) || defined(INIT_SRC0_SHMEM_Q8_0)
+#if defined(INIT_SRC0_SHMEM_Q4_0) || defined(INIT_SRC0_SHMEM_Q8_0) || defined(INIT_SRC0_SHMEM_Q6_K) || defined(INIT_SRC0_SHMEM_Q4_K)
 fn load_src0_u16_at(byte_offset: u32) -> u32 {
     let word = src0[byte_offset / 4u];
     let shift = (byte_offset & 2u) * 8u;
@@ -51,6 +51,11 @@ fn load_src0_u32_at(byte_offset: u32) -> u32 {
 fn load_src0_f32_at(byte_offset: u32) -> f32 {
     let packed = unpack2x16float(load_src0_u16_at(byte_offset));
     return f32(packed[0]);
+}
+
+fn load_src0_byte_at(byte_offset: u32) -> u32 {
+    let word = src0[byte_offset / 4u];
+    return (word >> ((byte_offset & 3u) * 8u)) & 0xFFu;
 }
 #endif
 
@@ -131,6 +136,145 @@ fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
                 shmem[shmem_idx + j] = 0.0;
                 shmem[shmem_idx + j + 16u] = 0.0;
             }
+        }
+    }
+}
+#endif
+
+#ifdef INIT_SRC0_SHMEM_Q4_K
+// Decode Q4_K weights straight into the f32 src0 shmem tile.
+//
+// Same motivation as the Q6_K loader below: `gemm_q4_k` is a batched-GEMV shape
+// that re-dequantizes every weight once per token, so it buys submit count but no
+// compute. Q4_K is the *bulk* of a Q4_K_M model (attn q/k/v/o, ffn gate/up, the
+// conv projections), so leaving it on that shape kept the whole batched path
+// slower than the per-token fallback even after Q6_K was reg-tiled.
+//
+// Q4_K super-block: 256 elems / 144 B — d f16 @0, dmin f16 @2,
+// scales[12] (6-bit packed sub-scales + mins) @4, qs[128] @16.
+//   out[64j + l]      = d*sc[2j]   * (qs[32j+l] & 0xF) - dmin*mn[2j]
+//   out[64j + l + 32] = d*sc[2j+1] * (qs[32j+l] >> 4 ) - dmin*mn[2j+1]
+// Inverting that per output index y: j = y/64, r = y%64, the low nibble and
+// sub-block 2j for r < 32, else the high nibble and 2j+1.
+const Q4K_BLOCK_SIZE = 256u;
+const Q4K_BLOCK_BYTES = 144u;
+
+// 6-bit sub-scale / min unpack — port of `decode_q4km_scales` (quant.rs).
+fn q4k_sc(sb: u32, sub: u32) -> u32 {
+    if (sub < 4u) {
+        return load_src0_byte_at(sb + sub) & 63u;
+    }
+    return (load_src0_byte_at(sb + sub + 4u) & 0x0Fu)
+        | ((load_src0_byte_at(sb + sub - 4u) >> 6u) << 4u);
+}
+
+fn q4k_mn(sb: u32, sub: u32) -> u32 {
+    if (sub < 4u) {
+        return load_src0_byte_at(sb + sub + 4u) & 63u;
+    }
+    return (load_src0_byte_at(sb + sub + 4u) >> 4u)
+        | ((load_src0_byte_at(sb + sub) >> 6u) << 4u);
+}
+
+fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
+    let PARAMS_BLOCKS_K = (params.k + Q4K_BLOCK_SIZE - 1u) / Q4K_BLOCK_SIZE;
+
+    for (var i = thread_id; i < TILE_SRC0_ROWS * TILE_K; i += TOTAL_WORKGROUP_SIZE) {
+        let tile_m = i / TILE_K;
+        let tile_k = i % TILE_K;
+        let shmem_idx = tile_m * TILE_SRC0_STRIDE + tile_k;
+        let global_m = offset_m + tile_m;
+        let global_k = k_outer + tile_k;
+
+        if (global_m < params.m && global_k < params.k) {
+            let blk = global_k / Q4K_BLOCK_SIZE;
+            let y = global_k % Q4K_BLOCK_SIZE;
+            let base = (global_m * PARAMS_BLOCKS_K + blk) * Q4K_BLOCK_BYTES;
+
+            let d = load_src0_f32_at(base);
+            let dmin = load_src0_f32_at(base + 2u);
+            let sb = base + 4u;
+            let qs = base + 16u;
+
+            let j = y / 64u;
+            let r = y % 64u;
+            let l = r % 32u;
+            let hi = r >= 32u;
+            let sub = 2u * j + select(0u, 1u, hi);
+
+            let qb = load_src0_byte_at(qs + 32u * j + l);
+            let nib = select(qb & 0x0Fu, qb >> 4u, hi);
+
+            let sc = f32(q4k_sc(sb, sub));
+            let mn = f32(q4k_mn(sb, sub));
+            shmem[shmem_idx] = d * sc * f32(nib) - dmin * mn;
+        } else {
+            shmem[shmem_idx] = 0.0;
+        }
+    }
+}
+#endif
+
+#ifdef INIT_SRC0_SHMEM_Q6_K
+// Decode Q6_K weights straight into the f32 src0 shmem tile, so the
+// dtype-agnostic register-tiled loop reads plain f32.
+//
+// This is the point of the whole kernel: the *batched-GEMV*-shaped gemm_q6_k
+// re-dequantizes every weight once per token, so at n=512 the weights are decoded
+// 512 times and it is measurably SLOWER than the per-token fallback it replaces
+// (Mac prefill 42 vs 54 tok/s). Here each weight is decoded once per k-tile into
+// shmem and then reused by all WORKGROUP_SIZE_N (=32) token columns.
+//
+// Q6_K super-block: 256 elems / 210 B — ql[128] @0, qh[64] @128,
+// scales[16] (i8) @192, d f16 @208. The packing is *not* contiguous per output
+// index, so we invert `dequantize_q6_k_block`'s (n, l, j) mapping per element:
+//   y = n*128 + j*32 + l   with n in 0..2, j in 0..4, l in 0..32
+//   ql byte : n*64 + l  (+32 when j is odd);  low nibble for j<2, high for j>=2
+//   qh byte : n*32 + l;  bits [2j, 2j+1]
+//   scale   : n*8 + l/16 + 2j   (signed i8)
+// One output element per thread-iteration keeps every lane busy regardless of how
+// TILE_K divides the 256-element super-block.
+const Q6K_BLOCK_SIZE = 256u;
+const Q6K_BLOCK_BYTES = 210u;
+
+fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
+    let PARAMS_BLOCKS_K = (params.k + Q6K_BLOCK_SIZE - 1u) / Q6K_BLOCK_SIZE;
+
+    for (var i = thread_id; i < TILE_SRC0_ROWS * TILE_K; i += TOTAL_WORKGROUP_SIZE) {
+        let tile_m = i / TILE_K;
+        let tile_k = i % TILE_K;
+        let shmem_idx = tile_m * TILE_SRC0_STRIDE + tile_k;
+        let global_m = offset_m + tile_m;
+        let global_k = k_outer + tile_k;
+
+        if (global_m < params.m && global_k < params.k) {
+            let blk = global_k / Q6K_BLOCK_SIZE;
+            let y = global_k % Q6K_BLOCK_SIZE;
+            let base = (global_m * PARAMS_BLOCKS_K + blk) * Q6K_BLOCK_BYTES;
+
+            let n = y / 128u;
+            let r = y % 128u;
+            let j = r / 32u;
+            let l = r % 32u;
+
+            let ql_off = base + n * 64u + l + select(0u, 32u, (j & 1u) == 1u);
+            let qh_off = base + 128u + n * 32u + l;
+            let sc_off = base + 192u + n * 8u + (l / 16u) + 2u * j;
+
+            let qlb = load_src0_byte_at(ql_off);
+            let qhb = load_src0_byte_at(qh_off);
+            let nib = select(qlb & 0x0Fu, qlb >> 4u, j >= 2u);
+            let q = i32(nib | (((qhb >> (2u * j)) & 3u) << 4u)) - 32;
+
+            // Sub-scales are signed 8-bit; reading them unsigned flips every
+            // negative scale and yields plausible-but-wrong logits.
+            let sc_b = load_src0_byte_at(sc_off);
+            let sc = i32(sc_b << 24u) >> 24u;
+
+            let d = load_src0_f32_at(base + 208u);
+            shmem[shmem_idx] = d * f32(sc) * f32(q);
+        } else {
+            shmem[shmem_idx] = 0.0;
         }
     }
 }
