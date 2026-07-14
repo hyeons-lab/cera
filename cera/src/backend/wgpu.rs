@@ -814,8 +814,6 @@ pub mod shaders {
     pub const RMSNORM_BATCH: &str = include_str!("shaders/rmsnorm_batch.wgsl");
     pub const QK_NORM_ROPE_BATCH: &str = include_str!("shaders/qk_norm_rope_batch.wgsl");
     pub const CONV1D_FUSED_BATCH: &str = include_str!("shaders/conv1d_fused_batch.wgsl");
-    pub const GEMM_Q4_0: &str = include_str!("shaders/gemm_q4_0.wgsl");
-    pub const GEMM_Q8_0: &str = include_str!("shaders/gemm_q8_0.wgsl");
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.wgsl");
     pub const SOFTMAX: &str = include_str!("shaders/softmax.wgsl");
     pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.wgsl");
@@ -3207,8 +3205,16 @@ mod tests {
         }
     }
 
+    /// Q8_0 register-tiled GEMM parity: synthesize Q8_0 blocks, dequantize on CPU,
+    /// run the reg-tiled kernel with the Q8_0 shmem loader over a multi-token batch,
+    /// compare.
+    ///
+    /// `m = 11` and `n = 3` are deliberately not multiples of the tile geometry
+    /// (`WORKGROUP_SIZE_M * TILE_M = 32` rows, `WORKGROUP_SIZE_N * TILE_N = 32`
+    /// cols), so the partial-tile bounds checks are exercised rather than assumed.
+    /// The strides are padded past `k`/`m` for the same reason.
     #[test]
-    fn test_gpu_gemm_q8_0_parity() {
+    fn test_gpu_mul_mat_q8_0_parity() {
         let ctx = match GpuContext::new() {
             Ok(ctx) => ctx,
             Err(_) => return,
@@ -3267,13 +3273,32 @@ mod tests {
             }
         }
 
-        let a_buf = ctx.upload_storage(&q8_bytes, "gemm_q8_weights");
-        let x_buf = ctx.upload_f32(&x_batch, "gemm_q8_x");
-        let y_buf = ctx.create_storage_rw(((n * y_stride) as u64) * 4, "gemm_q8_y");
-        let params: [u32; 6] = [m, k, n, x_stride, y_stride, 0];
-        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "gemm_q8_params");
+        let a_buf = ctx.upload_storage(&q8_bytes, "mm_q8_weights");
+        let x_buf = ctx.upload_f32(&x_batch, "mm_q8_x");
+        let y_buf = ctx.create_storage_rw(((n * y_stride) as u64) * 4, "mm_q8_y");
+        let params: [u32; 5] = [m, k, n, x_stride, y_stride];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "mm_q8_params");
 
-        let pipeline = ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0", "gemm_q8_0");
+        // The register-tiled kernel with the Q8_0 shmem loader — the same pipeline
+        // `GpuLfm2Model` builds for Q8_0 prefill. Tile geometry must match
+        // `MUL_MAT_TILE_*` in gpu_lfm2.rs; the dispatch below derives from it.
+        let pipeline = ctx.create_pipeline_with_defines(
+            shaders::MUL_MAT_REG_TILE,
+            "main",
+            "mul_mat_q8_0_test",
+            &[
+                ("SCALAR", ""),
+                ("SRC0_INNER_TYPE", "u32"),
+                ("SRC1_INNER_TYPE", "f32"),
+                ("INIT_SRC0_SHMEM_Q8_0", ""),
+                ("INIT_SRC1_SHMEM_FLOAT", ""),
+                ("WORKGROUP_SIZE_M", "8u"),
+                ("WORKGROUP_SIZE_N", "32u"),
+                ("TILE_M", "4u"),
+                ("TILE_N", "1u"),
+                ("TILE_K", "32u"),
+            ],
+        );
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipeline.get_bind_group_layout(0),
@@ -3301,7 +3326,7 @@ mod tests {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(m.div_ceil(8), n, 1);
+            pass.dispatch_workgroups(m.div_ceil(32), n.div_ceil(32), 1);
         }
         ctx.submit_encoder(enc);
 
@@ -4778,132 +4803,6 @@ mod tests {
                 ref_rb[i],
                 got_rb[i]
             );
-        }
-    }
-
-    /// `gemm_q4_0` parity: batched output[token, row] must match the
-    /// CPU-side dequant + matmul at every (row, token) cell. Uses the
-    /// same Q4_0 layout the gemv tests do (8 rows × small K).
-    #[test]
-    fn test_gpu_gemm_q4_0_parity() {
-        let ctx = match GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(_) => return,
-        };
-
-        let m: u32 = 8;
-        let k: u32 = 64;
-        let n: u32 = 5; // tokens
-        let nb = k / 32;
-        let x_stride = k;
-        let y_stride = m;
-
-        // Build f32 weights, quantize to Q4_0.
-        let weights_f32: Vec<f32> = (0..m * k)
-            .map(|i| ((i * 17 + 3) % 29) as f32 * 0.1 - 1.4)
-            .collect();
-        let mut q4_bytes: Vec<u8> = Vec::new();
-        for row in 0..m as usize {
-            for b in 0..nb as usize {
-                let start = row * k as usize + b * 32;
-                let chunk = &weights_f32[start..start + 32];
-                let max_abs = chunk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-                let scale = max_abs / 7.0;
-                let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-                let d_bits = half::f16::from_f32(scale).to_bits();
-                q4_bytes.push((d_bits & 0xFF) as u8);
-                q4_bytes.push((d_bits >> 8) as u8);
-                for qi in 0..16 {
-                    let lo = ((chunk[qi] * inv).round() + 8.0).clamp(0.0, 15.0) as u8;
-                    let hi = ((chunk[qi + 16] * inv).round() + 8.0).clamp(0.0, 15.0) as u8;
-                    q4_bytes.push(lo | (hi << 4));
-                }
-            }
-        }
-
-        // N input vectors of K floats each, each vector distinct.
-        let mut x_batch: Vec<f32> = Vec::with_capacity((n * x_stride) as usize);
-        for t in 0..n {
-            for i in 0..k {
-                x_batch.push(((t as f32 + 1.0) * (i as f32 - 32.0)) * 0.05);
-            }
-        }
-
-        // ─── CPU reference: dequant Q4_0 + matmul row × x for each token ───
-        let mut expected = vec![0.0f32; (n * m) as usize];
-        for t in 0..n as usize {
-            let x_slice = &x_batch[t * x_stride as usize..(t + 1) * x_stride as usize];
-            for row in 0..m as usize {
-                let mut acc = 0.0f32;
-                for b in 0..nb as usize {
-                    let block_off = (row * nb as usize + b) * 18;
-                    let d_bits = u16::from_le_bytes([q4_bytes[block_off], q4_bytes[block_off + 1]]);
-                    let delta = half::f16::from_bits(d_bits).to_f32();
-                    for qi in 0..16 {
-                        let byte = q4_bytes[block_off + 2 + qi];
-                        let lo = (byte & 0xF) as f32 - 8.0;
-                        let hi = ((byte >> 4) & 0xF) as f32 - 8.0;
-                        acc += lo * delta * x_slice[b * 32 + qi];
-                        acc += hi * delta * x_slice[b * 32 + qi + 16];
-                    }
-                }
-                expected[t * m as usize + row] = acc;
-            }
-        }
-
-        // ─── Batched GPU run ──────────────────────────────────────────────
-        let a_buf = ctx.upload_storage(&q4_bytes, "weights");
-        let x_buf = ctx.upload_f32(&x_batch, "x_batch");
-        let y_buf = ctx.create_storage_rw(((n * y_stride) as u64) * 4, "y_batch");
-        let params: [u32; 6] = [m, k, n, x_stride, y_stride, 0];
-        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
-
-        let pipeline = ctx.create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0", "gemm_q4_0");
-        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: a_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: x_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: y_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: p_buf.as_entire_binding(),
-                },
-            ],
-        });
-        let mut enc = ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(m.div_ceil(4), n, 1);
-        }
-        ctx.submit_encoder(enc);
-
-        let got = ctx.download_f32(&y_buf, (n * y_stride) as usize);
-
-        // Q4_0 quantization noise — same threshold the per-token test uses.
-        for t in 0..n as usize {
-            for row in 0..m as usize {
-                let idx = t * m as usize + row;
-                let diff = (expected[idx] - got[idx]).abs();
-                assert!(
-                    diff < 0.5,
-                    "GEMM Q4_0 mismatch at (token {t}, row {row}): cpu={}, gpu={}, diff={diff}",
-                    expected[idx],
-                    got[idx]
-                );
-            }
         }
     }
 
