@@ -496,29 +496,45 @@ impl LlamaModel {
         // base-weight scratch buffers stay mutably borrowed (disjoint fields).
         let lora = state.lora.clone();
 
-        // The batched-GEMM kernels (NEON `gemm_q{4_0,8_0}_q8_0` and BLAS SGEMM
-        // after `dequantize_q{4_0,8_0}_matrix`) only handle Q4_0/Q8_0. If any
-        // per-layer projection uses another dtype (e.g. Q4KM/Q6K), fall back to
-        // the sequential per-token path so the result stays correct.
-        let all_gemmable = self.layer_refs.iter().all(|r| {
-            [
-                &r.attn_q,
-                &r.attn_k,
-                &r.attn_v,
-                &r.attn_output,
-                &r.ffn_gate,
-                &r.ffn_up,
-                &r.ffn_down,
-            ]
-            .iter()
-            .all(|w| {
-                matches!(
+        // If any per-layer projection uses a dtype the batched GEMM cannot take,
+        // fall back to the sequential per-token path so the result stays correct.
+        //
+        // NOTE: this deliberately still admits only Q4_0/Q8_0, even though LFM2 now
+        // also runs batched Q4_K/Q6_K through the same `gemm_preq`. Widening it here
+        // is a one-line change, but there is no local Q4_K dense-transformer fixture
+        // to exercise it (a Qwen Q4_K_M carries Q5_K tensors, which have no GEMM, so
+        // it would gate off anyway) — and an unexercised fast path is how the Q6_K
+        // accumulation bug got in. Widen it together with a Q5_K GEMM and a fixture
+        // that actually runs `llama_batched_prefill_parity` over it.
+        let mut unbatchable: Option<(&str, crate::tensor::DType)> = None;
+        for r in self.layer_refs.iter() {
+            for (name, w) in [
+                ("attn_q", &r.attn_q),
+                ("attn_k", &r.attn_k),
+                ("attn_v", &r.attn_v),
+                ("attn_output", &r.attn_output),
+                ("ffn_gate", &r.ffn_gate),
+                ("ffn_up", &r.ffn_up),
+                ("ffn_down", &r.ffn_down),
+            ] {
+                if !matches!(
                     w.dtype,
                     crate::tensor::DType::Q4_0 | crate::tensor::DType::Q8_0
-                )
-            })
-        });
-        if !all_gemmable {
+                ) {
+                    unbatchable = Some((name, w.dtype));
+                    break;
+                }
+            }
+            if unbatchable.is_some() {
+                break;
+            }
+        }
+        if let Some((name, dtype)) = unbatchable {
+            // Say so. A gate that declines in silence cost ~4x prefill on LFM2 (T1)
+            // and ~340x the submits on the GPU (T8) before anyone noticed.
+            transformer::warn_unbatchable(name, dtype);
+        }
+        if unbatchable.is_some() {
             // No batched kernel for these dtypes: capture per-token if requested,
             // else fall back to the sequential per-token logit path.
             if let Some(out) = hidden_out {

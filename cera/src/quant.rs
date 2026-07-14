@@ -225,6 +225,58 @@ pub fn dequantize_q8_0_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
         .for_each(|(dst_row, src_row)| dequantize_q8_0_row(src_row, dst_row));
 }
 
+/// Dequantize a Q4_K matrix of shape `[m, k]` (row-major) to `out`.
+///
+/// Superblocks are 256 wide, so `k` must be a multiple of 256 (not 32).
+pub fn dequantize_q4_k_m_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        k % 256,
+        0,
+        "dequantize_q4_k_m_matrix: k must be a multiple of 256"
+    );
+    let row_bytes = (k / 256) * size_of::<BlockQ4KM>();
+    debug_assert_eq!(
+        src.len(),
+        m * row_bytes,
+        "dequantize_q4_k_m_matrix: src length mismatch"
+    );
+    debug_assert_eq!(
+        out.len(),
+        m * k,
+        "dequantize_q4_k_m_matrix: out length mismatch"
+    );
+
+    out.par_chunks_mut(k)
+        .zip(src.par_chunks(row_bytes))
+        .for_each(|(dst_row, src_row)| dequantize_q4_k_m_row(src_row, dst_row));
+}
+
+/// Dequantize a Q6_K matrix of shape `[m, k]` (row-major) to `out`.
+///
+/// Superblocks are 256 wide, so `k` must be a multiple of 256 (not 32).
+pub fn dequantize_q6_k_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        k % 256,
+        0,
+        "dequantize_q6_k_matrix: k must be a multiple of 256"
+    );
+    let row_bytes = (k / 256) * size_of::<BlockQ6K>();
+    debug_assert_eq!(
+        src.len(),
+        m * row_bytes,
+        "dequantize_q6_k_matrix: src length mismatch"
+    );
+    debug_assert_eq!(
+        out.len(),
+        m * k,
+        "dequantize_q6_k_matrix: out length mismatch"
+    );
+
+    out.par_chunks_mut(k)
+        .zip(src.par_chunks(row_bytes))
+        .for_each(|(dst_row, src_row)| dequantize_q6_k_row(src_row, dst_row));
+}
+
 /// Dot product of a Q8_0 block with an f32 vector of length 32. Scalar version.
 pub fn vec_dot_q8_0_f32_scalar(block: &BlockQ8_0, y: &[f32]) -> f32 {
     debug_assert_eq!(y.len(), 32);
