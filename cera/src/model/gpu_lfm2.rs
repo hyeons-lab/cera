@@ -3301,9 +3301,9 @@ impl GpuLfm2Model {
     }
 
     /// Encode batched 2D matmul: y = weight * x.
-    /// Batched prefill supports quantized Q4_0 and Q8_0 weights. F32 weights
-    /// are not a production path in this model. `x_stride` and `y_stride` are
-    /// measured in f32 elements between consecutive token vectors.
+    /// Batched prefill supports quantized Q4_0, Q8_0, Q4KM and Q6K weights. F32
+    /// weights are not a production path in this model. `x_stride` and `y_stride`
+    /// are measured in f32 elements between consecutive token vectors.
     #[allow(clippy::too_many_arguments)] // tile geometry + strides; splitting hurts clarity
     fn encode_mul_mat_reg_tile(
         &self,
@@ -3381,12 +3381,17 @@ impl GpuLfm2Model {
                 )
             }
             // Unreachable in practice: the batched path is only entered when
-            // `all_matmul_weights_batched_supported()` already confirmed every
-            // weight is Q4_0/Q8_0/Q4KM/Q6K. The debug_assert above documents the
-            // same precondition; this arm is the release-mode backstop.
+            // `unbatchable_matmul_weight()` returned `None`, i.e. every weight is
+            // Q4_0/Q8_0/Q4KM/Q6K. The debug_assert above documents the same
+            // precondition; this arm is the release-mode backstop.
             _ => unreachable!("batched prefill only supports Q4_0/Q8_0/Q4KM/Q6K"),
         };
 
+        // 6 words, not 5, because this one buffer feeds two kernels with different
+        // param layouts: `mul_mat_reg_tile`'s `MulMatParams` is a 5-field struct
+        // (the 6th word is ignored), but `gemm_q8_0` declares `array<u32, 6>` and a
+        // 20-byte binding would fail wgpu's min-binding-size validation. Sized to
+        // the union. Tests that drive `mul_mat_reg_tile` alone bind 5.
         let params: [u32; 6] = [m, k, n, x_stride, y_stride, 0];
         let p_buf = self
             .ctx
