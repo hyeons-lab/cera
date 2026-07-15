@@ -255,9 +255,9 @@ pub(crate) fn warn_unbatchable(tensor: &str, dtype: DType) {
     if !guard.contains(&dtype) {
         guard.push(dtype);
         tracing::warn!(
-            "prefill fell back to the per-token path: `{tensor}` is {dtype:?}, which the \
-             batched GEMM does not handle. Prefill will be several times slower than it \
-             should be for this model."
+            "prefill fell back to the per-token path: `{tensor}` is {dtype:?}, which is \
+             not supported on the batched path for this model. Prefill will be several \
+             times slower than it should be."
         );
     }
 }

@@ -1259,7 +1259,7 @@ impl Lfm2Model {
                     let attn_k_ref = refs.attn_k.as_ref().unwrap();
                     let attn_v_ref = refs.attn_v.as_ref().unwrap();
                     let attn_output_ref = refs.attn_output.as_ref().unwrap();
-                    // Require ALL four projections to be Q4_0/Q8_0 — a mixed-dtype
+                    // Require ALL four projections to be batchable — a mixed-dtype
                     // attention block would leave later matrices silently uncomputed
                     // in the batched path and produce wrong outputs.
                     let blas_ok = [
@@ -1951,13 +1951,13 @@ impl Lfm2Model {
                 }
             }
 
-            // FFN: batched GEMM on Q4_0/Q8_0 (reads weights once for all n
-            // tokens). Available on aarch64 (NEON `gemm_preq`) and on any
-            // target with `feature = "blas"` (BLAS SGEMM via
-            // `try_blas_prefill_gemm`). Require all three projections
-            // (gate/up/down) to be Q4_0/Q8_0 — a mixed-dtype FFN block
-            // would leave later matrices silently uncomputed in the
-            // batched path and produce wrong outputs.
+            // FFN: batched GEMM (reads weights once for all n tokens) for the
+            // dtypes `batched_gemm_supports` admits. Available on aarch64 (NEON
+            // `gemm_preq`) and on any target with `feature = "blas"` (BLAS SGEMM
+            // via `try_blas_prefill_gemm`). Require all three projections
+            // (gate/up/down) to be batchable — a mixed-dtype FFN block would
+            // leave later matrices silently uncomputed in the batched path and
+            // produce wrong outputs.
             let refs = &self.layer_refs[layer];
             #[cfg(any(target_arch = "aarch64", feature = "blas"))]
             let used_gemm = if [
@@ -2116,7 +2116,7 @@ impl Lfm2Model {
 
             // Fallback: per-token GEMV. Used on x86_64-no-blas (no batched
             // path compiled), and on any target where the FFN weights
-            // weren't all Q4_0/Q8_0 (`used_gemm = false`).
+            // weren't all batchable (`used_gemm = false`).
             #[cfg(any(target_arch = "aarch64", feature = "blas"))]
             let need_fallback = !used_gemm;
             #[cfg(not(any(target_arch = "aarch64", feature = "blas")))]
