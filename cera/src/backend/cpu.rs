@@ -362,6 +362,38 @@ pub fn gemv_par_threshold() -> usize {
     usize::MAX
 }
 
+/// Default minimum columns per worker for the batched-prefill activation
+/// pre-quantization (`quantize_columns`) RowPool fan-out.
+///
+/// One value with one meaning: a worker is never handed fewer than this many
+/// columns, and — since a single worker's minimum is the smallest split worth
+/// making — fewer than this many columns total run serially on the caller. The
+/// split matters because the batched GEMM already parallelizes over output rows,
+/// so a *serial* pre-quant is the Amdahl term that caps multi-core prefill
+/// (measured as a regression on an 8-core Android big.LITTLE once the parallel
+/// GEMM shrank per core). A column's work (a strided gather + `dim/32` Q8_0
+/// block-quantizes) is lighter than a GEMV output row, so this sits well below
+/// [`GEMV_PAR_THRESHOLD_DEFAULT`].
+///
+/// Only the aarch64 NEON `quantize_columns` (no-`blas` prefill) consumes this.
+#[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+pub const PREQUANT_PAR_MIN_COLS_DEFAULT: usize = 32;
+
+/// Minimum columns per worker for the prefill pre-quant fan-out, resolved once.
+/// `CERA_PREQUANT_MIN_COLS` overrides [`PREQUANT_PAR_MIN_COLS_DEFAULT`] for
+/// per-device tuning — the fan-out is a measured win/loss knob on big.LITTLE, so
+/// it gets a runtime override like its siblings `gemv_par_threshold` /
+/// `gemv_min_rows`, rather than needing a recompile to sweep.
+#[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+pub fn prequant_par_min_cols() -> usize {
+    use std::sync::OnceLock;
+    static MIN_COLS: OnceLock<usize> = OnceLock::new();
+    *MIN_COLS.get_or_init(|| {
+        super::cpu_features::env_usize("CERA_PREQUANT_MIN_COLS")
+            .unwrap_or(PREQUANT_PAR_MIN_COLS_DEFAULT)
+    })
+}
+
 /// Default minimum rows a decode-GEMV worker is given before another worker is
 /// added. With the persistent chunk-stealing pool the per-chunk cost is low, so
 /// this can be small — smaller lets narrow projections (e.g. GQA K/V, ≤ kv_dim

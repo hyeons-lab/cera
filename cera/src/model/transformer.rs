@@ -420,10 +420,65 @@ pub(crate) fn quantize_columns(
         "quantize_columns: dim ({dim}) must be a multiple of 32"
     );
     debug_assert!(
-        col.len() >= dim && scales.len() >= n * (dim / 32) && quants.len() >= n * dim,
+        mat.len() >= dim * n
+            && col.len() >= dim
+            && scales.len() >= n * (dim / 32)
+            && quants.len() >= n * dim,
         "quantize_columns: scratch too small for dim={dim}, n={n}",
     );
     let nb = dim / 32;
+
+    // Fan the per-column quantization out over the **RowPool**, not rayon. Each
+    // column is independent (disjoint `scales`/`quants` slices), so left serial
+    // this is the Amdahl term that caps multi-core prefill — the batched GEMM
+    // downstream parallelizes over rows, so a serial pre-quant does not shrink
+    // per core (a measured multi-core regression on Android big.LITTLE).
+    //
+    // It must ride the same persistent pool the GEMM uses: rayon's fork-join
+    // barrier costs a futex wake + core migration *per dispatch*, and this runs
+    // once per projection, so a rayon fan-out here was measured ~2× *slower*
+    // than serial on Tensor G5 (see `backend::threadpool` docs). `par_rows_n`
+    // dispatches on the RowPool, where a dispatch is an atomic store.
+    //
+    // `par_rows_n` splits `scales` into one `nb`-wide row per column; `quants`
+    // and `mat` are reached through raw pointers, each column touching a
+    // disjoint `quants` span — the same disjoint-`&mut`-via-`usize` handoff the
+    // K-quant GEMM uses. Below the threshold the caller's `col` scratch path
+    // runs (and `dispatch_rows` itself degrades to caller-serial anyway).
+    #[cfg(feature = "parallel")]
+    {
+        // Resolve once so the entry gate and the per-worker granularity are
+        // provably the same value (the "one value, one meaning" contract).
+        let min_cols = cpu::prequant_par_min_cols();
+        if n >= min_cols {
+            let mat_ptr = mat.as_ptr() as usize;
+            let quants_ptr = quants.as_mut_ptr() as usize;
+            cpu::par_rows_n(&mut scales[..n * nb], nb, min_cols, move |(j, sc)| {
+                let mat = mat_ptr as *const f32;
+                // SAFETY: column `j` exclusively owns `quants[j*dim .. (j+1)*dim]`
+                // (columns are disjoint), and `mat` is read-only. Quantize one
+                // Q8_0 block at a time out of a stack gather buffer, so there is
+                // no per-worker heap scratch to thread through the pool.
+                let qcol = (quants_ptr as *mut i8).wrapping_add(j * dim);
+                let mut blk = [0.0f32; 32];
+                for b in 0..nb {
+                    for (t, bt) in blk.iter_mut().enumerate() {
+                        *bt = unsafe { *mat.add((b * 32 + t) * n + j) };
+                    }
+                    unsafe {
+                        let qs = core::slice::from_raw_parts_mut(qcol.add(b * 32), 32);
+                        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                            &blk,
+                            &mut sc[b..b + 1],
+                            qs,
+                        );
+                    }
+                }
+            });
+            return;
+        }
+    }
+
     for j in 0..n {
         for i in 0..dim {
             col[i] = mat[i * n + j];
@@ -863,6 +918,69 @@ pub(crate) fn forward_ffn_block(
             &state.scratch.gate[..intermediate_size],
             &mut state.scratch.out[..hidden_size],
             &mut state.scratch.lora_tmp,
+        );
+    }
+}
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    not(feature = "blas"),
+    feature = "parallel"
+))]
+mod tests {
+    use super::*;
+
+    /// Parallel `quantize_columns` must produce byte-identical output to the
+    /// serial per-column reference. There is no cross-column reduction, so the
+    /// only way the fan-out can differ is a wiring bug (a column written to the
+    /// wrong `scales`/`quants` slice); this asserts it away at a column count
+    /// above `prequant_par_min_cols()`, so the parallel branch is the one exercised.
+    #[test]
+    fn quantize_columns_parallel_matches_serial() {
+        let dim = 256usize;
+        let n = 64usize; // ≥ prequant_par_min_cols() → the parallel branch runs.
+        let nb = dim / 32;
+
+        // Deterministic column-major [dim × n] activation matrix.
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut lcg = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((st >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+        let mat: Vec<f32> = (0..dim * n).map(|_| lcg()).collect();
+
+        let mut col = vec![0.0f32; dim];
+        let mut scales = vec![0.0f32; n * nb];
+        let mut quants = vec![0i8; n * dim];
+        quantize_columns(&mat, dim, n, &mut col, &mut scales, &mut quants);
+
+        // Serial reference: gather each column and quantize it in isolation.
+        let mut ref_scales = vec![0.0f32; n * nb];
+        let mut ref_quants = vec![0i8; n * dim];
+        let mut rc = vec![0.0f32; dim];
+        for j in 0..n {
+            for (i, ci) in rc.iter_mut().enumerate() {
+                *ci = mat[i * n + j];
+            }
+            unsafe {
+                crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                    &rc,
+                    &mut ref_scales[j * nb..(j + 1) * nb],
+                    &mut ref_quants[j * dim..(j + 1) * dim],
+                );
+            }
+        }
+
+        assert_eq!(
+            quants, ref_quants,
+            "parallel quantize_columns quants differ"
+        );
+        assert_eq!(
+            scales, ref_scales,
+            "parallel quantize_columns scales differ"
         );
     }
 }
