@@ -225,6 +225,58 @@ pub fn dequantize_q8_0_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
         .for_each(|(dst_row, src_row)| dequantize_q8_0_row(src_row, dst_row));
 }
 
+/// Dequantize a Q4_K matrix of shape `[m, k]` (row-major) to `out`.
+///
+/// Superblocks are 256 wide, so `k` must be a multiple of 256 (not 32).
+pub fn dequantize_q4_k_m_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        k % 256,
+        0,
+        "dequantize_q4_k_m_matrix: k must be a multiple of 256"
+    );
+    let row_bytes = (k / 256) * size_of::<BlockQ4KM>();
+    debug_assert_eq!(
+        src.len(),
+        m * row_bytes,
+        "dequantize_q4_k_m_matrix: src length mismatch"
+    );
+    debug_assert_eq!(
+        out.len(),
+        m * k,
+        "dequantize_q4_k_m_matrix: out length mismatch"
+    );
+
+    out.par_chunks_mut(k)
+        .zip(src.par_chunks(row_bytes))
+        .for_each(|(dst_row, src_row)| dequantize_q4_k_m_row(src_row, dst_row));
+}
+
+/// Dequantize a Q6_K matrix of shape `[m, k]` (row-major) to `out`.
+///
+/// Superblocks are 256 wide, so `k` must be a multiple of 256 (not 32).
+pub fn dequantize_q6_k_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        k % 256,
+        0,
+        "dequantize_q6_k_matrix: k must be a multiple of 256"
+    );
+    let row_bytes = (k / 256) * size_of::<BlockQ6K>();
+    debug_assert_eq!(
+        src.len(),
+        m * row_bytes,
+        "dequantize_q6_k_matrix: src length mismatch"
+    );
+    debug_assert_eq!(
+        out.len(),
+        m * k,
+        "dequantize_q6_k_matrix: out length mismatch"
+    );
+
+    out.par_chunks_mut(k)
+        .zip(src.par_chunks(row_bytes))
+        .for_each(|(dst_row, src_row)| dequantize_q6_k_row(src_row, dst_row));
+}
+
 /// Dot product of a Q8_0 block with an f32 vector of length 32. Scalar version.
 pub fn vec_dot_q8_0_f32_scalar(block: &BlockQ8_0, y: &[f32]) -> f32 {
     debug_assert_eq!(y.len(), 32);
@@ -907,6 +959,70 @@ mod tests {
                 (v - 3.0).abs() < 1e-3,
                 "mismatch at {i}: got {v}, expected 3.0"
             );
+        }
+    }
+
+    /// The K-quant *matrix* dequantizers must agree with the per-row ones they wrap.
+    ///
+    /// These feed `try_blas_prefill_gemm`, which is the path that actually ships on
+    /// Apple Silicon (`--features blas`) — and the NEON kernels every other test in
+    /// this PR covers are compiled *out* of that build. A row-stride mistake here
+    /// (144 bytes per Q4_K superblock, 210 per Q6_K) would silently misalign every
+    /// weight row and produce wrong logits with the whole suite green.
+    #[test]
+    fn kquant_matrix_dequant_matches_row_dequant() {
+        let mut st = 0x2468_1357u64;
+        let next = |st: &mut u64| {
+            *st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (*st >> 33) as u8
+        };
+
+        // m rows of k=512 (2 superblocks per row) — enough that a bad stride shows.
+        let (m, k) = (3usize, 512usize);
+        let nb = k / 256;
+
+        // Q4_K
+        let mut src = Vec::new();
+        for _ in 0..m * nb {
+            let blk = BlockQ4KM {
+                d: half::f16::from_f32(0.03).to_bits(),
+                dmin: half::f16::from_f32(0.01).to_bits(),
+                scales: std::array::from_fn(|_| next(&mut st)),
+                qs: std::array::from_fn(|_| next(&mut st)),
+            };
+            src.extend_from_slice(unsafe {
+                std::slice::from_raw_parts((&raw const blk) as *const u8, size_of::<BlockQ4KM>())
+            });
+        }
+        let mut got = vec![0.0f32; m * k];
+        dequantize_q4_k_m_matrix(&src, m, k, &mut got);
+        let row_bytes = nb * size_of::<BlockQ4KM>();
+        for i in 0..m {
+            let mut want = vec![0.0f32; k];
+            dequantize_q4_k_m_row(&src[i * row_bytes..(i + 1) * row_bytes], &mut want);
+            assert_eq!(&got[i * k..(i + 1) * k], &want[..], "Q4_K row {i} mismatch");
+        }
+
+        // Q6_K
+        let mut src = Vec::new();
+        for _ in 0..m * nb {
+            let blk = BlockQ6K {
+                ql: std::array::from_fn(|_| next(&mut st)),
+                qh: std::array::from_fn(|_| next(&mut st)),
+                scales: std::array::from_fn(|_| next(&mut st) as i8),
+                d: half::f16::from_f32(0.02).to_bits(),
+            };
+            src.extend_from_slice(unsafe {
+                std::slice::from_raw_parts((&raw const blk) as *const u8, size_of::<BlockQ6K>())
+            });
+        }
+        let mut got = vec![0.0f32; m * k];
+        dequantize_q6_k_matrix(&src, m, k, &mut got);
+        let row_bytes = nb * size_of::<BlockQ6K>();
+        for i in 0..m {
+            let mut want = vec![0.0f32; k];
+            dequantize_q6_k_row(&src[i * row_bytes..(i + 1) * row_bytes], &mut want);
+            assert_eq!(&got[i * k..(i + 1) * k], &want[..], "Q6_K row {i} mismatch");
         }
     }
 

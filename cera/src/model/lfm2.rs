@@ -9,10 +9,12 @@ use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvPrefixCache, LayerState};
 use crate::model::transformer::{self, FfnWeights};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
-// DType is only referenced from the BLAS prefill path and the aarch64 NEON
-// GEMM dispatch (the dtype == Q4_0/Q8_0 checks); on x86_64 without `blas` none
-// of those compile, so the import would be unused. Gate it to match.
-#[cfg(any(feature = "blas", target_arch = "aarch64"))]
+// DType's only remaining uses here are the aarch64 per-token GEMV dispatch
+// (`forward_conv_block`'s Q4_0/Q8_0 checks). The prefill gates used to name dtypes
+// directly too, but they now ask `transformer::batched_gemm_supports`, which takes
+// the dtype as a parameter — so on x86_64 + `blas` this import became unused. Gate
+// it to where it is actually referenced.
+#[cfg(target_arch = "aarch64")]
 use crate::tensor::DType;
 use crate::turboquant;
 
@@ -1079,13 +1081,23 @@ impl Lfm2Model {
                     // --- Conv: batch in_proj + out_proj via GEMM ---
                     let in_proj = refs.shortconv_in_proj.as_ref().unwrap();
                     let out_proj = refs.shortconv_out_proj.as_ref().unwrap();
-                    // Require BOTH projections to be Q4_0/Q8_0: the batched-GEMM
-                    // path (NEON gemm_preq and BLAS SGEMM) only handles those
-                    // dtypes, and a mixed-dtype conv block would leave the second
-                    // matrix silently uncomputed. Any other combo falls through
-                    // to the per-token fallback.
-                    let blas_ok = matches!(in_proj.dtype, DType::Q4_0 | DType::Q8_0)
-                        && matches!(out_proj.dtype, DType::Q4_0 | DType::Q8_0);
+                    // Require BOTH projections to be batchable: a mixed-dtype conv
+                    // block would leave the second matrix silently uncomputed. Any
+                    // other combo falls through to the per-token fallback — loudly,
+                    // because a quiet fallback here costs ~4x prefill.
+                    let blas_ok = [
+                        ("shortconv.in_proj", in_proj),
+                        ("shortconv.out_proj", out_proj),
+                    ]
+                    .into_iter()
+                    .fold(true, |ok, (name, w)| {
+                        if transformer::batched_gemm_supports(w.dtype, w.k) {
+                            ok
+                        } else {
+                            transformer::warn_unbatchable(name, w.dtype);
+                            false
+                        }
+                    });
                     if blas_ok {
                         // Phase 1: Batch in_proj GEMM: normed[hs×n] → proj_mat[3*hs × n]
                         // quantize_columns is only needed for the NEON fallback. With BLAS
@@ -1247,13 +1259,24 @@ impl Lfm2Model {
                     let attn_k_ref = refs.attn_k.as_ref().unwrap();
                     let attn_v_ref = refs.attn_v.as_ref().unwrap();
                     let attn_output_ref = refs.attn_output.as_ref().unwrap();
-                    // Require ALL four projections to be Q4_0/Q8_0 — a mixed-dtype
+                    // Require ALL four projections to be batchable — a mixed-dtype
                     // attention block would leave later matrices silently uncomputed
                     // in the batched path and produce wrong outputs.
-                    let blas_ok = matches!(attn_q_ref.dtype, DType::Q4_0 | DType::Q8_0)
-                        && matches!(attn_k_ref.dtype, DType::Q4_0 | DType::Q8_0)
-                        && matches!(attn_v_ref.dtype, DType::Q4_0 | DType::Q8_0)
-                        && matches!(attn_output_ref.dtype, DType::Q4_0 | DType::Q8_0);
+                    let blas_ok = [
+                        ("attn_q", attn_q_ref),
+                        ("attn_k", attn_k_ref),
+                        ("attn_v", attn_v_ref),
+                        ("attn_output", attn_output_ref),
+                    ]
+                    .into_iter()
+                    .fold(true, |ok, (name, w)| {
+                        if transformer::batched_gemm_supports(w.dtype, w.k) {
+                            ok
+                        } else {
+                            transformer::warn_unbatchable(name, w.dtype);
+                            false
+                        }
+                    });
                     if blas_ok {
                         let head_dim = hs / cfg.n_heads;
                         let n_kv_heads = cfg.kv_heads_per_layer[layer];
@@ -1928,19 +1951,29 @@ impl Lfm2Model {
                 }
             }
 
-            // FFN: batched GEMM on Q4_0/Q8_0 (reads weights once for all n
-            // tokens). Available on aarch64 (NEON `gemm_preq`) and on any
-            // target with `feature = "blas"` (BLAS SGEMM via
-            // `try_blas_prefill_gemm`). Require all three projections
-            // (gate/up/down) to be Q4_0/Q8_0 — a mixed-dtype FFN block
-            // would leave later matrices silently uncomputed in the
-            // batched path and produce wrong outputs.
+            // FFN: batched GEMM (reads weights once for all n tokens) for the
+            // dtypes `batched_gemm_supports` admits. Available on aarch64 (NEON
+            // `gemm_preq`) and on any target with `feature = "blas"` (BLAS SGEMM
+            // via `try_blas_prefill_gemm`). Require all three projections
+            // (gate/up/down) to be batchable — a mixed-dtype FFN block would
+            // leave later matrices silently uncomputed in the batched path and
+            // produce wrong outputs.
             let refs = &self.layer_refs[layer];
             #[cfg(any(target_arch = "aarch64", feature = "blas"))]
-            let used_gemm = if matches!(refs.ffn_gate.dtype, DType::Q4_0 | DType::Q8_0)
-                && matches!(refs.ffn_up.dtype, DType::Q4_0 | DType::Q8_0)
-                && matches!(refs.ffn_down.dtype, DType::Q4_0 | DType::Q8_0)
-            {
+            let used_gemm = if [
+                ("ffn_gate", &refs.ffn_gate),
+                ("ffn_up", &refs.ffn_up),
+                ("ffn_down", &refs.ffn_down),
+            ]
+            .into_iter()
+            .fold(true, |ok, (name, w)| {
+                if transformer::batched_gemm_supports(w.dtype, w.k) {
+                    ok
+                } else {
+                    transformer::warn_unbatchable(name, w.dtype);
+                    false
+                }
+            }) {
                 // Pre-quantize all n columns to Q8_0 — only needed for the NEON fallback.
                 #[cfg(not(feature = "blas"))]
                 transformer::quantize_columns(
@@ -2083,7 +2116,7 @@ impl Lfm2Model {
 
             // Fallback: per-token GEMV. Used on x86_64-no-blas (no batched
             // path compiled), and on any target where the FFN weights
-            // weren't all Q4_0/Q8_0 (`used_gemm = false`).
+            // weren't all batchable (`used_gemm = false`).
             #[cfg(any(target_arch = "aarch64", feature = "blas"))]
             let need_fallback = !used_gemm;
             #[cfg(not(any(target_arch = "aarch64", feature = "blas")))]

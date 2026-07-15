@@ -169,10 +169,103 @@ pub(crate) fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
 // are the NEON fallback that pre-quantizes the input columns to Q8_0 and uses
 // the integer-dot kernels (aarch64, no `blas`).
 
+/// The weight dtypes the batched prefill GEMM can consume.
+///
+/// **This is the single source of truth for the LFM2 fast path.** The LFM2 gates and
+/// both implementations (`gemm_preq`, `try_blas_prefill_gemm`) must agree, or a model
+/// silently loses batched prefill — which is exactly what happened: the gates admitted
+/// only `Q4_0 | Q8_0`, and a `Q4_K_M` file (which is *not* uniformly Q4_K — it mixes
+/// Q4_K, Q6_K, and often Q5_K) matched none of them, so **every layer fell back to the
+/// per-token GEMV loop, silently**. Add a dtype here only once *both* implementations
+/// handle it.
+///
+/// `llama.rs` deliberately does **not** call this: its gate stays Q4_0/Q8_0-only until
+/// there is a dense-transformer fixture that actually exercises a widened path (see the
+/// comment at its gate). Its dtype set is a strict subset of this one, so it can only
+/// be over-conservative, never wrong — but do not assume widening this function widens
+/// llama too.
+///
+/// The K-quant arm is **runtime**-gated, not just dtype-gated: the Q4_K/Q6_K int8
+/// GEMMs exist only in `dotprod` form. If this admitted them on a CPU without
+/// FEAT_DotProd, `gemm_preq` would decline and the matmul would be *silently
+/// skipped* — and because the callers reuse one output buffer across layers, that is
+/// not even zeros, it is the *previous layer's* activations. Under `blas` the question
+/// is moot: that path dequantizes to f32 and SGEMMs, so it handles any dtype it can
+/// dequantize.
+///
+/// `k` is the weight's inner dimension: K-quant superblocks are 256 wide, so a
+/// `k` that is not a multiple of 256 cannot be handled (GGUF should never produce
+/// one — a row that short could not have been K-quantized in the first place — but
+/// "the format guarantees it" is precisely how the last two silent fallbacks got
+/// written, so it is checked rather than assumed).
+#[cfg(any(target_arch = "aarch64", feature = "blas"))]
+pub(crate) fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
+    match dtype {
+        DType::Q4_0 | DType::Q8_0 => true,
+        DType::Q4KM | DType::Q6K => k_quant_gemm_available() && k % 256 == 0,
+        _ => false,
+    }
+}
+
+/// Whether the K-quant batched GEMM can actually run here — see
+/// [`batched_gemm_supports`].
+///
+/// Cfg'd to the targets that have a batched path at all (the caller gates carry the
+/// same cfg). Without it this is dead code on x86_64/wasm without `blas`, which the
+/// CI lint job (`cargo clippy --workspace --all-targets -- -D warnings`, ubuntu, no
+/// `blas`) turns into a hard error — an aarch64 dev machine cannot reproduce that.
+#[cfg(any(target_arch = "aarch64", feature = "blas"))]
+fn k_quant_gemm_available() -> bool {
+    // BLAS dequantizes the weight and SGEMMs, so it needs no int8 kernel.
+    #[cfg(feature = "blas")]
+    {
+        true
+    }
+    #[cfg(all(not(feature = "blas"), target_arch = "aarch64"))]
+    {
+        crate::backend::simd::neon::k_quant_gemm_available()
+    }
+    // No BLAS and no NEON: there is no batched path at all on this target (the
+    // caller gates are themselves cfg'd off), so the answer is moot but must be
+    // `false` rather than optimistic.
+    #[cfg(all(not(feature = "blas"), not(target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+/// Report — once per offending dtype — that a weight knocked prefill off the
+/// batched GEMM path.
+///
+/// A gate that declines in silence is the bug, not the missing kernel. This cost
+/// ~4x prefill on CPU (T1) and ~340x the submits on GPU (T8) before anyone noticed,
+/// both times because the fallback said nothing. If prefill is slow and this is
+/// quiet, the dtypes are not the reason.
+#[cfg(any(target_arch = "aarch64", feature = "blas"))]
+pub(crate) fn warn_unbatchable(tensor: &str, dtype: DType) {
+    use std::sync::Mutex;
+    // A Vec, not a HashSet: `DType` is not `Hash`, the set holds a handful of
+    // entries at most, and deriving `Hash` on a core enum to dedupe a warning
+    // would be the tail wagging the dog.
+    static SEEN: Mutex<Vec<DType>> = Mutex::new(Vec::new());
+    let mut guard = match SEEN.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(), // a poisoned warn-dedupe set must not kill inference
+    };
+    if !guard.contains(&dtype) {
+        guard.push(dtype);
+        tracing::warn!(
+            "prefill fell back to the per-token path: `{tensor}` is {dtype:?}, which is \
+             not supported on the batched path for this model. Prefill will be several \
+             times slower than it should be."
+        );
+    }
+}
+
 /// Prefill GEMM through BLAS: dequantize `wref` into `dequant_scratch[..m*k]`,
 /// then SGEMM `out[m, n] = weight[m, k] @ b[k, n]` in row-major (`b`/`out` are
-/// row-major `[k|m, n]`, stride `n`). Returns `true` for the supported dtypes
-/// (Q4_0 / Q8_0); callers gate on dtype upfront so the `false` arm is defensive.
+/// row-major `[k|m, n]`, stride `n`). Returns `true` for the supported dtypes;
+/// callers gate on dtype upfront so the `false` arm is defensive.
 #[cfg(feature = "blas")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_blas_prefill_gemm(
@@ -195,6 +288,8 @@ pub(crate) fn try_blas_prefill_gemm(
     match wref.dtype {
         DType::Q4_0 => crate::quant::dequantize_q4_0_matrix(data, m, k, dequant),
         DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(data, m, k, dequant),
+        DType::Q4KM => crate::quant::dequantize_q4_k_m_matrix(data, m, k, dequant),
+        DType::Q6K => crate::quant::dequantize_q6_k_matrix(data, m, k, dequant),
         _ => return false,
     }
     crate::backend::blas::sgemm_rowmajor_nn(m, n, k, dequant, b, out);
@@ -245,8 +340,62 @@ pub(crate) fn gemm_preq(
             crate::backend::simd::neon::gemm_q8_0_q8_0_neon(data, b_scales, b_quants, out, m, n, k);
             true
         },
-        _ => false,
+        // K-quants: dotprod-only and 256-aligned, so these *can* decline at runtime.
+        // `batched_gemm_supports` asks the same question up front, so a gated caller
+        // never reaches a `false` — but if it ever did, the quiet `false` would be far
+        // worse than slow: callers ignore this return AND reuse one output buffer across
+        // layers, so `out` would hold the **previous layer's activations**. Route the
+        // decline through the same loud path as an unknown dtype.
+        DType::Q4KM => {
+            let ran = unsafe {
+                crate::backend::simd::neon::gemm_q4_k_q8_0_neon(
+                    data, b_scales, b_quants, out, m, n, k,
+                )
+            };
+            if !ran {
+                report_uncomputed_gemm(wref.dtype, k);
+            }
+            ran
+        }
+        DType::Q6K => {
+            let ran = unsafe {
+                crate::backend::simd::neon::gemm_q6_k_q8_0_neon(
+                    data, b_scales, b_quants, out, m, n, k,
+                )
+            };
+            if !ran {
+                report_uncomputed_gemm(wref.dtype, k);
+            }
+            ran
+        }
+        // Reaching here means a caller gated on `batched_gemm_supports` and got a
+        // different answer than this match — i.e. the two drifted apart.
+        dt => {
+            report_uncomputed_gemm(dt, k);
+            false
+        }
     }
+}
+
+/// A batched GEMM was requested for a weight no kernel here can compute.
+///
+/// This must never happen — `batched_gemm_supports` gates it — so treat it as the
+/// invariant break it is. It is *not* a benign "fall back to the slow path": the
+/// callers of `gemm_preq` **ignore its return value**, and they reuse a single output
+/// buffer across layers, so an uncomputed GEMM leaves the previous layer's activations
+/// in `out` and inference produces confident garbage. Panic in debug; in release, at
+/// least say so loudly rather than silently corrupting the forward pass.
+#[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+fn report_uncomputed_gemm(dtype: DType, k: usize) {
+    debug_assert!(
+        false,
+        "gemm_preq: no batched kernel ran for {dtype:?} (k={k}), but `batched_gemm_supports` \
+         admitted it — the gate and the kernel table have drifted. `out` is now stale."
+    );
+    tracing::error!(
+        "gemm_preq: no batched kernel for {dtype:?} (k={k}); the matmul was NOT computed \
+         and the output buffer holds stale data"
+    );
 }
 
 /// Quantize all `n` columns of a column-major `[dim × n]` matrix to Q8_0 (NEON
@@ -271,10 +420,65 @@ pub(crate) fn quantize_columns(
         "quantize_columns: dim ({dim}) must be a multiple of 32"
     );
     debug_assert!(
-        col.len() >= dim && scales.len() >= n * (dim / 32) && quants.len() >= n * dim,
+        mat.len() >= dim * n
+            && col.len() >= dim
+            && scales.len() >= n * (dim / 32)
+            && quants.len() >= n * dim,
         "quantize_columns: scratch too small for dim={dim}, n={n}",
     );
     let nb = dim / 32;
+
+    // Fan the per-column quantization out over the **RowPool**, not rayon. Each
+    // column is independent (disjoint `scales`/`quants` slices), so left serial
+    // this is the Amdahl term that caps multi-core prefill — the batched GEMM
+    // downstream parallelizes over rows, so a serial pre-quant does not shrink
+    // per core (a measured multi-core regression on Android big.LITTLE).
+    //
+    // It must ride the same persistent pool the GEMM uses: rayon's fork-join
+    // barrier costs a futex wake + core migration *per dispatch*, and this runs
+    // once per projection, so a rayon fan-out here was measured ~2× *slower*
+    // than serial on Tensor G5 (see `backend::threadpool` docs). `par_rows_n`
+    // dispatches on the RowPool, where a dispatch is an atomic store.
+    //
+    // `par_rows_n` splits `scales` into one `nb`-wide row per column; `quants`
+    // and `mat` are reached through raw pointers, each column touching a
+    // disjoint `quants` span — the same disjoint-`&mut`-via-`usize` handoff the
+    // K-quant GEMM uses. Below the threshold the caller's `col` scratch path
+    // runs (and `dispatch_rows` itself degrades to caller-serial anyway).
+    #[cfg(feature = "parallel")]
+    {
+        // Resolve once so the entry gate and the per-worker granularity are
+        // provably the same value (the "one value, one meaning" contract).
+        let min_cols = cpu::prequant_par_min_cols();
+        if n >= min_cols {
+            let mat_ptr = mat.as_ptr() as usize;
+            let quants_ptr = quants.as_mut_ptr() as usize;
+            cpu::par_rows_n(&mut scales[..n * nb], nb, min_cols, move |(j, sc)| {
+                let mat = mat_ptr as *const f32;
+                // SAFETY: column `j` exclusively owns `quants[j*dim .. (j+1)*dim]`
+                // (columns are disjoint), and `mat` is read-only. Quantize one
+                // Q8_0 block at a time out of a stack gather buffer, so there is
+                // no per-worker heap scratch to thread through the pool.
+                let qcol = (quants_ptr as *mut i8).wrapping_add(j * dim);
+                let mut blk = [0.0f32; 32];
+                for b in 0..nb {
+                    for (t, bt) in blk.iter_mut().enumerate() {
+                        *bt = unsafe { *mat.add((b * 32 + t) * n + j) };
+                    }
+                    unsafe {
+                        let qs = core::slice::from_raw_parts_mut(qcol.add(b * 32), 32);
+                        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                            &blk,
+                            &mut sc[b..b + 1],
+                            qs,
+                        );
+                    }
+                }
+            });
+            return;
+        }
+    }
+
     for j in 0..n {
         for i in 0..dim {
             col[i] = mat[i * n + j];
@@ -714,6 +918,69 @@ pub(crate) fn forward_ffn_block(
             &state.scratch.gate[..intermediate_size],
             &mut state.scratch.out[..hidden_size],
             &mut state.scratch.lora_tmp,
+        );
+    }
+}
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    not(feature = "blas"),
+    feature = "parallel"
+))]
+mod tests {
+    use super::*;
+
+    /// Parallel `quantize_columns` must produce byte-identical output to the
+    /// serial per-column reference. There is no cross-column reduction, so the
+    /// only way the fan-out can differ is a wiring bug (a column written to the
+    /// wrong `scales`/`quants` slice); this asserts it away at a column count
+    /// above `prequant_par_min_cols()`, so the parallel branch is the one exercised.
+    #[test]
+    fn quantize_columns_parallel_matches_serial() {
+        let dim = 256usize;
+        let n = 64usize; // ≥ prequant_par_min_cols() → the parallel branch runs.
+        let nb = dim / 32;
+
+        // Deterministic column-major [dim × n] activation matrix.
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut lcg = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((st >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+        let mat: Vec<f32> = (0..dim * n).map(|_| lcg()).collect();
+
+        let mut col = vec![0.0f32; dim];
+        let mut scales = vec![0.0f32; n * nb];
+        let mut quants = vec![0i8; n * dim];
+        quantize_columns(&mat, dim, n, &mut col, &mut scales, &mut quants);
+
+        // Serial reference: gather each column and quantize it in isolation.
+        let mut ref_scales = vec![0.0f32; n * nb];
+        let mut ref_quants = vec![0i8; n * dim];
+        let mut rc = vec![0.0f32; dim];
+        for j in 0..n {
+            for (i, ci) in rc.iter_mut().enumerate() {
+                *ci = mat[i * n + j];
+            }
+            unsafe {
+                crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                    &rc,
+                    &mut ref_scales[j * nb..(j + 1) * nb],
+                    &mut ref_quants[j * dim..(j + 1) * dim],
+                );
+            }
+        }
+
+        assert_eq!(
+            quants, ref_quants,
+            "parallel quantize_columns quants differ"
+        );
+        assert_eq!(
+            scales, ref_scales,
+            "parallel quantize_columns scales differ"
         );
     }
 }

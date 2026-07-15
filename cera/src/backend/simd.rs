@@ -783,6 +783,331 @@ pub(crate) mod neon {
         }
     }
 
+    /// Columns processed per pass in the K-quant GEMMs.
+    ///
+    /// This is the whole point of the GEMM over the GEMV: a Q4_K/Q6_K weight block
+    /// is expensive to decode (nibble/6-bit extraction plus packed sub-block scales),
+    /// and the GEMV pays that cost once per *column*. Decoding once and dotting
+    /// against `KQ_COLS` activation columns amortizes it. 8 keeps the activation
+    /// working set (`8 · k` bytes) inside L1 while the weight row — a few hundred
+    /// bytes — stays hot across all `n / 8` passes.
+    const KQ_COLS: usize = 8;
+
+    /// Σ(xq) for every (column, 32-block) of the pre-quantized activations.
+    ///
+    /// The K-quant min term is `−dmin · mn_s · Σ(xq)`, and `Σ(xq)` depends only on
+    /// the *activation* column — not the weight row. Computing it inside the row
+    /// loop would redo identical work `m` times; hoisting it costs `n · k/32` and
+    /// saves `m · n · k/32` dot-pairs.
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn q8_0_col_sums(b_quants: &[i8], n: usize, k: usize) -> Vec<i32> {
+        unsafe {
+            let nb32 = k / 32;
+            let mut sums = vec![0i32; n * nb32];
+            let ones = vdupq_n_s8(1);
+            let z = vdupq_n_s32(0);
+            for j in 0..n {
+                let base = b_quants.as_ptr().add(j * k);
+                for b in 0..nb32 {
+                    let p = base.add(b * 32);
+                    let x0 = vld1q_s8(p);
+                    let x1 = vld1q_s8(p.add(16));
+                    sums[j * nb32 + b] = vaddvq_s32(vdotq_s32(vdotq_s32(z, ones, x0), ones, x1));
+                }
+            }
+            sums
+        }
+    }
+
+    /// Batched GEMM: C[m, n] = A_q4_k[m, k] @ B_q8_0[k, n].
+    ///
+    /// Same layout contract as the Q4_0 GEMM (`b_scales[j*nb + b]`,
+    /// `b_quants[j*k + ..]`, row-major `out[i*n + j]`), and the same per-sub-block
+    /// math as `gemv_q4k_q8_0_neon_dotprod`:
+    ///
+    /// ```text
+    /// out[i][j] += xs_s · ( d·sc_s·Σ(q·xq) − dmin·mn_s·Σ(xq) )
+    /// ```
+    ///
+    /// A Q4_K superblock is 256 values in 8 sub-blocks of 32, which aligns 1:1 with
+    /// the Q8_0 input blocks — so sub-block `s` of superblock `bi` is input block
+    /// `bi*8 + s`. Nibble layout mirrors `vec_dot_q4_k_m_f32`: 4 groups of 64 values
+    /// over 32 `qs` bytes, low nibble → sub-block `2g`, high nibble → `2g+1`. The
+    /// 6-bit scales come from the shared `quant::decode_q4km_scales`, so the packing
+    /// cannot drift from the scalar path.
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn gemm_q4_k_q8_0_neon_dotprod(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(k % 256, 0, "Q4_K GEMM: k must be divisible by 256");
+        let sb = k / 256;
+        let nb32 = k / 32;
+        let row_bytes = sb * size_of::<BlockQ4KM>();
+        debug_assert_eq!(a_quant.len(), m * row_bytes, "Q4_K GEMM: a_quant size");
+        debug_assert_eq!(b_quants.len(), n * k, "Q4_K GEMM: b_quants size");
+        debug_assert_eq!(b_scales.len(), n * nb32, "Q4_K GEMM: b_scales size");
+        debug_assert_eq!(out.len(), m * n, "Q4_K GEMM: out size");
+
+        unsafe {
+            let col_sums = q8_0_col_sums(b_quants, n, k);
+            let a_ptr = a_quant.as_ptr() as usize;
+            let bq_ptr = b_quants.as_ptr() as usize;
+            let bs_ptr = b_scales.as_ptr() as usize;
+            let cs_ptr = col_sums.as_ptr() as usize;
+
+            let compute_row = move |(i, row_out): (usize, &mut [f32])| unsafe {
+                let a = a_ptr as *const u8;
+                let bq = bq_ptr as *const i8;
+                let bs = bs_ptr as *const f32;
+                let cs = cs_ptr as *const i32;
+                let mask_0f = vdupq_n_u8(0x0F);
+                let z = vdupq_n_s32(0);
+                let row_start = i * row_bytes;
+
+                let mut j0 = 0usize;
+                while j0 < n {
+                    let cols = KQ_COLS.min(n - j0);
+                    let mut acc = [0.0f32; KQ_COLS];
+
+                    for bi in 0..sb {
+                        let blk = &*((a as usize + row_start + bi * size_of::<BlockQ4KM>())
+                            as *const BlockQ4KM);
+                        let d = half::f16::from_bits(blk.d).to_f32();
+                        let dmin = half::f16::from_bits(blk.dmin).to_f32();
+                        let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
+                        let qs = blk.qs.as_ptr();
+
+                        for g in 0..4 {
+                            let qb0 = vld1q_u8(qs.add(g * 32));
+                            let qb1 = vld1q_u8(qs.add(g * 32 + 16));
+                            // 4-bit quants are 0..15, so they stay positive as i8.
+                            let w = [
+                                (
+                                    vreinterpretq_s8_u8(vandq_u8(qb0, mask_0f)),
+                                    vreinterpretq_s8_u8(vandq_u8(qb1, mask_0f)),
+                                    2 * g,
+                                ),
+                                (
+                                    vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb0)),
+                                    vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb1)),
+                                    2 * g + 1,
+                                ),
+                            ];
+
+                            for (w0, w1, s) in w {
+                                let xb = bi * 8 + s;
+                                let dsc = d * sc[s] as f32;
+                                let dmn = dmin * mn[s] as f32;
+                                // `acc_j`, not `a` — `a` is the weight base pointer in
+                                // the enclosing scope, and shadowing it inside an
+                                // `unsafe` block is how a future edit reaching for the
+                                // weights silently gets an `&mut f32` and reads
+                                // arbitrary memory.
+                                for (jj, acc_j) in acc.iter_mut().enumerate().take(cols) {
+                                    let j = j0 + jj;
+                                    let xp = bq.add(j * k + xb * 32);
+                                    let x0 = vld1q_s8(xp);
+                                    let x1 = vld1q_s8(xp.add(16));
+                                    let dp = vaddvq_s32(vdotq_s32(vdotq_s32(z, w0, x0), w1, x1));
+                                    let xs = *bs.add(j * nb32 + xb);
+                                    let sx = *cs.add(j * nb32 + xb);
+                                    *acc_j += xs * (dsc * dp as f32 - dmn * sx as f32);
+                                }
+                            }
+                        }
+                    }
+
+                    row_out[j0..j0 + cols].copy_from_slice(&acc[..cols]);
+                    j0 += cols;
+                }
+            };
+
+            if m >= super::super::cpu::gemv_par_threshold() {
+                crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
+            } else {
+                out.chunks_mut(n).enumerate().for_each(compute_row);
+            }
+        }
+    }
+
+    /// Batched GEMM: C[m, n] = A_q6_k[m, k] @ B_q8_0[k, n].
+    ///
+    /// Same layout contract and 8-column amortization as the Q4_K GEMM, but the
+    /// block geometry is meaningfully different and is the one real trap here:
+    ///
+    /// - **No min term.** Q6_K quants are signed (`−32` offset baked in at decode),
+    ///   so there is no `dmin`/`Σ(xq)` correction — just `d · sc_s · Σ(q·xq)`.
+    /// - **Sub-blocks are 16 wide, not 32.** A Q8_0 input block (32) therefore spans
+    ///   *two* Q6_K scales, unlike Q4_K's clean 1:1. Conveniently a NEON `int8x16`
+    ///   register is exactly one 16-element sub-block, so the 32-value group splits
+    ///   into two registers, each dotted against its own half of the Q8_0 block and
+    ///   scaled independently.
+    ///
+    /// Index math mirrors `dequantize_q6_k_block`: two halves of 128 values
+    /// (`ql_off += 64`, `qh_off += 32`, `sc_off += 8`), each half holding 4 groups of
+    /// 32 whose 6-bit quants are assembled as `(ql nibble) | (qh 2-bit pair) << 4`.
+    /// Group `g` of half `nh` uses scales `sc[nh*8 + 2g + is]` (`is = l/16`) and lands
+    /// on Q8_0 input block `bi*8 + nh*4 + g`.
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn gemm_q6_k_q8_0_neon_dotprod(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(k % 256, 0, "Q6_K GEMM: k must be divisible by 256");
+        let sb = k / 256;
+        let nb32 = k / 32;
+        let row_bytes = sb * size_of::<BlockQ6K>();
+        debug_assert_eq!(a_quant.len(), m * row_bytes, "Q6_K GEMM: a_quant size");
+        debug_assert_eq!(b_quants.len(), n * k, "Q6_K GEMM: b_quants size");
+        debug_assert_eq!(b_scales.len(), n * nb32, "Q6_K GEMM: b_scales size");
+        debug_assert_eq!(out.len(), m * n, "Q6_K GEMM: out size");
+
+        unsafe {
+            let a_ptr = a_quant.as_ptr() as usize;
+            let bq_ptr = b_quants.as_ptr() as usize;
+            let bs_ptr = b_scales.as_ptr() as usize;
+
+            let compute_row = move |(i, row_out): (usize, &mut [f32])| unsafe {
+                let a = a_ptr as *const u8;
+                let bq = bq_ptr as *const i8;
+                let bs = bs_ptr as *const f32;
+                let mask_0f = vdupq_n_u8(0x0F);
+                let mask_03 = vdupq_n_u8(0x03);
+                let off_32 = vdupq_n_s8(32);
+                let z = vdupq_n_s32(0);
+                let row_start = i * row_bytes;
+
+                let mut j0 = 0usize;
+                while j0 < n {
+                    let cols = KQ_COLS.min(n - j0);
+                    let mut acc = [0.0f32; KQ_COLS];
+
+                    for bi in 0..sb {
+                        let blk = &*((a as usize + row_start + bi * size_of::<BlockQ6K>())
+                            as *const BlockQ6K);
+                        let d = half::f16::from_bits(blk.d).to_f32();
+                        let sc = blk.scales;
+                        let ql = blk.ql.as_ptr();
+                        let qh = blk.qh.as_ptr();
+
+                        for nh in 0..2 {
+                            let qlp = ql.add(nh * 64);
+                            let qhp = qh.add(nh * 32);
+                            // `a`/`b` suffix = the two 16-lane sub-blocks (l = 0..15,
+                            // 16..31) of each 32-value group.
+                            let ql_a0 = vld1q_u8(qlp);
+                            let ql_a1 = vld1q_u8(qlp.add(16));
+                            let ql_b0 = vld1q_u8(qlp.add(32));
+                            let ql_b1 = vld1q_u8(qlp.add(48));
+                            let qh0 = vld1q_u8(qhp);
+                            let qh1 = vld1q_u8(qhp.add(16));
+
+                            // 6-bit quant = nibble | (2 high bits << 4), then −32.
+                            // `$qhs` arrives pre-shifted: `vshrq_n_u8::<0>` is illegal
+                            // (N must be 1..=8), so group 0 passes `qh` unshifted.
+                            macro_rules! q6 {
+                                ($lo:expr, $qhs:expr, $hi_nibble:expr) => {{
+                                    let lo = if $hi_nibble {
+                                        vshrq_n_u8::<4>($lo)
+                                    } else {
+                                        vandq_u8($lo, mask_0f)
+                                    };
+                                    let hi = vandq_u8($qhs, mask_03);
+                                    vsubq_s8(
+                                        vreinterpretq_s8_u8(vorrq_u8(lo, vshlq_n_u8::<4>(hi))),
+                                        off_32,
+                                    )
+                                }};
+                            }
+
+                            let groups = [
+                                (q6!(ql_a0, qh0, false), q6!(ql_a1, qh1, false)),
+                                (
+                                    q6!(ql_b0, vshrq_n_u8::<2>(qh0), false),
+                                    q6!(ql_b1, vshrq_n_u8::<2>(qh1), false),
+                                ),
+                                (
+                                    q6!(ql_a0, vshrq_n_u8::<4>(qh0), true),
+                                    q6!(ql_a1, vshrq_n_u8::<4>(qh1), true),
+                                ),
+                                (
+                                    q6!(ql_b0, vshrq_n_u8::<6>(qh0), true),
+                                    q6!(ql_b1, vshrq_n_u8::<6>(qh1), true),
+                                ),
+                            ];
+
+                            // Accumulate in the *same order and grouping* as
+                            // `gemv_q6k_q8_0_neon_dotprod`: half outer, group inner,
+                            // with `d · sc · xs` formed before multiplying the dot.
+                            //
+                            // This is not pedantry. Both orderings are valid math, but
+                            // only this one is **bit-identical** to the per-token path,
+                            // and Q6_K sums terms that nearly cancel: summing a group's
+                            // two halves together first (the obvious structure) drifts
+                            // to 3.4e-4 relative at ffn_down's k=4608 — invisible at
+                            // small k, but enough to move the model's logits (cosine
+                            // 0.9995 vs the 1.000000 the Q4_0 path achieves).
+                            for h in 0..2 {
+                                for (g, (w_h0, w_h1)) in groups.iter().enumerate() {
+                                    let w = if h == 0 { *w_h0 } else { *w_h1 };
+                                    let xb = bi * 8 + nh * 4 + g;
+                                    let d_sc = d * sc[nh * 8 + 2 * g + h] as f32;
+                                    for (jj, acc_j) in acc.iter_mut().enumerate().take(cols) {
+                                        let j = j0 + jj;
+                                        let xv = vld1q_s8(bq.add(j * k + xb * 32 + h * 16));
+                                        let dp = vaddvq_s32(vdotq_s32(z, w, xv));
+                                        let scale = d_sc * *bs.add(j * nb32 + xb);
+                                        *acc_j += scale * dp as f32;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    row_out[j0..j0 + cols].copy_from_slice(&acc[..cols]);
+                    j0 += cols;
+                }
+            };
+
+            if m >= super::super::cpu::gemv_par_threshold() {
+                crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
+            } else {
+                out.chunks_mut(n).enumerate().for_each(compute_row);
+            }
+        }
+    }
+
+    /// Q6_K × Q8_0 GEMM dispatcher. Requires `dotprod` and `k % 256 == 0`; see
+    /// [`gemm_q4_k_q8_0_neon`] for why the `k` check lives here rather than only in
+    /// the caller's gate. Returns `false` without writing `out` when it cannot run.
+    #[allow(dead_code)]
+    pub unsafe fn gemm_q6_k_q8_0_neon(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> bool {
+        if !k_quant_gemm_available() || k % 256 != 0 {
+            return false;
+        }
+        unsafe { gemm_q6_k_q8_0_neon_dotprod(a_quant, b_scales, b_quants, out, m, n, k) };
+        true
+    }
+
     /// Batched GEMM: C[m, n] = A_q4_0[m, k] @ B_q8_0[k, n].
     ///
     /// `b_scales` layout: n columns × blocks_per_col, i.e. b_scales[j * nb + b]
@@ -1654,6 +1979,46 @@ pub(crate) mod neon {
         }
     }
 
+    /// Is the K-quant (Q4_K/Q6_K) int8 GEMM usable on this CPU?
+    ///
+    /// Unlike Q4_0/Q8_0, the K-quant GEMMs have **no baseline-NEON fallback** — they
+    /// exist only in `dotprod` form. Callers must consult this *before* gating a
+    /// weight onto the batched path: if the gate admits a dtype the kernel then
+    /// declines, `gemm_preq` returns `false` and the matmul is **silently skipped**
+    /// (wrong output, not merely slow). Every ARMv8.2+ core ships FEAT_DotProd, so
+    /// the `false` arm is for genuinely ancient hardware, which simply keeps the
+    /// per-token path.
+    pub fn k_quant_gemm_available() -> bool {
+        cpu_features().tier >= CpuTier::NeonDotprod
+    }
+
+    /// Q4_K × Q8_0 GEMM dispatcher. Requires `dotprod`; see
+    /// [`k_quant_gemm_available`]. Returns `false` without writing `out` when this
+    /// CPU or this `k` cannot run it, so the caller can fall back rather than ship
+    /// a wrong answer.
+    ///
+    /// The `k % 256` check is here, not only in the caller's gate: superblocks are
+    /// 256 wide, so a `k` that is not a multiple of 256 would make `sb = k / 256`
+    /// silently drop the tail of every dot product — a truncated matmul, in release,
+    /// with no assert. A guard that lives only in the gate is a guard the next caller
+    /// can walk past.
+    #[allow(dead_code)]
+    pub unsafe fn gemm_q4_k_q8_0_neon(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> bool {
+        if !k_quant_gemm_available() || k % 256 != 0 {
+            return false;
+        }
+        unsafe { gemm_q4_k_q8_0_neon_dotprod(a_quant, b_scales, b_quants, out, m, n, k) };
+        true
+    }
+
     /// Q8_0 × Q8_0 GEMM dispatcher. Prefers i8mm (`vmmlaq_s32`) when the tier is
     /// resolved to it, else dotprod, else the emulated-integer base.
     // Only non-test consumer is `transformer::gemm_preq`, gated
@@ -1859,6 +2224,307 @@ pub(crate) mod neon {
                 dmin: f16::from_f32(0.01 + lcg(st).abs() * 0.03).to_bits(),
                 scales,
                 qs,
+            }
+        }
+
+        /// The Q4_K GEMM must agree with the (already-validated) Q4_K GEMV run
+        /// column-by-column on the *same* pre-quantized inputs.
+        ///
+        /// This is the strong oracle: both consume identical Q8_0 activations, so
+        /// the only legitimate difference is float summation order — no
+        /// quantization error to hide a real bug behind. Comparing against the f32
+        /// scalar instead would need a tolerance wide enough to swallow a dropped
+        /// sub-block.
+        ///
+        /// `n = 11` deliberately straddles `KQ_COLS` (8): one full 8-column pass
+        /// plus a 3-column tail, so a bug in the tail cannot hide.
+        #[test]
+        fn q4k_gemm_matches_gemv_per_column() {
+            if !require_simd_or_skip("dotprod", cpu_features().dotprod) {
+                return;
+            }
+            let (m, n, k) = (7usize, 11usize, 512usize);
+            let nb = k / 256;
+            let mut st = 0xfeed_beefu64;
+            let blocks: Vec<BlockQ4KM> = (0..m * nb).map(|_| random_q4km(&mut st)).collect();
+            let a = blocks_to_bytes(&blocks);
+
+            // Column-major activations: column j is b[j*k .. (j+1)*k].
+            let b: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+            let mut b_scales = vec![0.0f32; n * (k / 32)];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let (s, q) = quantize_col(&b[j * k..(j + 1) * k]);
+                b_scales[j * (k / 32)..(j + 1) * (k / 32)].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+
+            let mut out = vec![0.0f32; m * n];
+            unsafe {
+                gemm_q4_k_q8_0_neon_dotprod(&a, &b_scales, &b_quants, &mut out, m, n, k);
+            }
+
+            // Oracle: the GEMV, once per column, on the identical quantized inputs.
+            for j in 0..n {
+                let mut y = vec![0.0f32; m];
+                unsafe {
+                    gemv_q4k_q8_0_neon_dotprod(
+                        &a,
+                        &b_scales[j * (k / 32)..(j + 1) * (k / 32)],
+                        &b_quants[j * k..(j + 1) * k],
+                        &mut y,
+                        m,
+                        k,
+                    );
+                }
+                for (i, &want) in y.iter().enumerate() {
+                    let got = out[i * n + j];
+                    // Tight: both paths run the *same* int8 arithmetic on the same
+                    // Q8_0 activations, so only float summation order may differ. A
+                    // loose bound here (1e-3) is wide enough to hide a real kernel
+                    // bug — which is exactly what it did on the first cut of this.
+                    assert!(
+                        (got - want).abs() <= 1e-5 * (1.0 + want.abs()),
+                        "col {j} row {i}: gemm={got} gemv={want}"
+                    );
+                }
+            }
+        }
+
+        /// The Q6_K GEMM must agree with the existing Q6_K GEMV run column-by-column
+        /// on the *same* pre-quantized inputs.
+        ///
+        /// The GEMV (`gemv_q6k_q8_0_neon_dotprod`) is the right oracle precisely
+        /// because it is what the per-token path runs: both consume identical Q8_0
+        /// activations and the same int8 dot, so agreement must be near-exact and any
+        /// gap is a real bug rather than quantization noise. It is *not* independent of
+        /// the kernel's index math — a shared misunderstanding of the 6-bit layout would
+        /// pass — so the absolute correctness of that layout rests on the GEMV's own
+        /// chain down to `vec_dot_q6_k_f32` / `dequantize_q6_k_block`, which is already
+        /// covered. What this pins down is the thing that actually broke: that the
+        /// batched form reproduces the per-token form exactly.
+        ///
+        /// (The first cut of this test used a dequantized-f32 reference at 1e-3 on the
+        /// mistaken belief that no Q6_K int8 GEMV existed. It does. That tolerance was
+        /// wide enough to pass a kernel the model-level parity test then caught.)
+        ///
+        /// `n = 11` straddles `KQ_COLS` (8) so the column tail is exercised.
+        #[test]
+        fn q6k_gemm_matches_gemv_per_column() {
+            if !require_simd_or_skip("dotprod", cpu_features().dotprod) {
+                return;
+            }
+            let (m, n, k) = (5usize, 11usize, 512usize);
+            let nb = k / 256;
+            let mut st = 0x0bad_c0deu64;
+
+            let blocks: Vec<crate::quant::BlockQ6K> = (0..m * nb)
+                .map(|_| {
+                    let mut ql = [0u8; 128];
+                    let mut qh = [0u8; 64];
+                    let mut scales = [0i8; 16];
+                    for b in ql.iter_mut() {
+                        *b = (lcg(&mut st).abs() * 255.0) as i32 as u8;
+                    }
+                    for b in qh.iter_mut() {
+                        *b = (lcg(&mut st).abs() * 255.0) as i32 as u8;
+                    }
+                    for s in scales.iter_mut() {
+                        *s = (lcg(&mut st) * 60.0) as i32 as i8;
+                    }
+                    crate::quant::BlockQ6K {
+                        ql,
+                        qh,
+                        scales,
+                        d: half::f16::from_f32(0.02 + lcg(&mut st).abs() * 0.05).to_bits(),
+                    }
+                })
+                .collect();
+            let a = blocks_to_bytes(&blocks);
+
+            let b: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+            let mut b_scales = vec![0.0f32; n * (k / 32)];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let (s, q) = quantize_col(&b[j * k..(j + 1) * k]);
+                b_scales[j * (k / 32)..(j + 1) * (k / 32)].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+
+            let mut out = vec![0.0f32; m * n];
+            unsafe {
+                gemm_q6_k_q8_0_neon_dotprod(&a, &b_scales, &b_quants, &mut out, m, n, k);
+            }
+
+            // Oracle: the existing Q6_K GEMV, once per column, on the identical
+            // quantized inputs — the same int8 arithmetic, so agreement must be
+            // near-exact. (The first cut of this test used a dequantized-f32
+            // reference at 1e-3, which was slack enough to pass a kernel that the
+            // model-level parity test then caught. Use the tightest oracle available.)
+            for j in 0..n {
+                let mut y = vec![0.0f32; m];
+                unsafe {
+                    gemv_q6k_q8_0_neon_dotprod(
+                        &a,
+                        &b_scales[j * (k / 32)..(j + 1) * (k / 32)],
+                        &b_quants[j * k..(j + 1) * k],
+                        &mut y,
+                        m,
+                        k,
+                    );
+                }
+                for (i, &want) in y.iter().enumerate() {
+                    let got = out[i * n + j];
+                    assert!(
+                        (got - want).abs() <= 1e-5 * (1.0 + want.abs()),
+                        "col {j} row {i}: gemm={got} gemv={want}"
+                    );
+                }
+            }
+        }
+
+        /// The Q4_K GEMM must be **bit-exact** against the GEMV at *real model
+        /// shapes*, not merely close.
+        ///
+        /// The small-shape parity tests above cannot see accumulation-order bugs:
+        /// rounding error grows with `k`, and LFM2.5-350M's `ffn_down` has k=4608
+        /// (18 superblocks) against the 512 a unit test reaches for. A Q6_K sibling
+        /// of this test is what caught a real ordering bug worth 3.4e-4 at k=4608 —
+        /// invisible at k=512, but enough to move the model's logits.
+        #[test]
+        fn q4k_gemm_bit_exact_vs_gemv_at_model_shapes() {
+            // `require_simd_or_skip`, not a bare `return`: on a host without dotprod a
+            // bare return reports a green test that asserted nothing, and this is the
+            // test that catches accumulation-order bugs. `CERA_REQUIRE_SIMD=dotprod`
+            // turns that skip into a hard failure on CI hardware that should have it.
+            if !require_simd_or_skip("dotprod", cpu_features().dotprod) {
+                return;
+            }
+            for &(m, n, k) in &[(4608usize, 64usize, 1024usize), (1024, 64, 4608)] {
+                let nb = k / 256;
+                let mut st = 0x1234_9999u64;
+                let blocks: Vec<BlockQ4KM> = (0..m * nb).map(|_| random_q4km(&mut st)).collect();
+                let a = blocks_to_bytes(&blocks);
+                let b: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+                let mut bs = vec![0.0f32; n * (k / 32)];
+                let mut bq = vec![0i8; n * k];
+                for j in 0..n {
+                    let (s2, q2) = quantize_col(&b[j * k..(j + 1) * k]);
+                    bs[j * (k / 32)..(j + 1) * (k / 32)].copy_from_slice(&s2);
+                    bq[j * k..(j + 1) * k].copy_from_slice(&q2);
+                }
+                let mut out = vec![0.0f32; m * n];
+                unsafe { gemm_q4_k_q8_0_neon_dotprod(&a, &bs, &bq, &mut out, m, n, k) };
+                let mut worst = 0.0f32;
+                for j in 0..n {
+                    let mut y = vec![0.0f32; m];
+                    unsafe {
+                        gemv_q4k_q8_0_neon_dotprod(
+                            &a,
+                            &bs[j * (k / 32)..(j + 1) * (k / 32)],
+                            &bq[j * k..(j + 1) * k],
+                            &mut y,
+                            m,
+                            k,
+                        );
+                    }
+                    for (i, &want) in y.iter().enumerate() {
+                        let got = out[i * n + j];
+                        let rel = (got - want).abs() / (1.0 + want.abs());
+                        if rel > worst {
+                            worst = rel;
+                        }
+                    }
+                }
+                assert_eq!(
+                    worst, 0.0,
+                    "Q4_K GEMM m={m} n={n} k={k}: not bit-exact vs the GEMV \
+                     (max_rel={worst:e}) — the batched and per-token paths must run \
+                     the same arithmetic in the same order"
+                );
+            }
+        }
+
+        /// The Q6_K GEMM must be **bit-exact** against the GEMV at real model shapes.
+        ///
+        /// This is the test that caught the bug: summing a group's two 16-wide halves
+        /// together before accumulating (rather than in the GEMV's half-outer order,
+        /// with `d·sc·xs` formed before the dot) drifts to 3.4e-4 relative at
+        /// `ffn_down`'s k=4608, because Q6_K sums terms that nearly cancel. At k=512
+        /// the same bug reads as 5.5e-6 and slips through any reasonable tolerance.
+        #[test]
+        fn q6k_gemm_bit_exact_vs_gemv_at_model_shapes() {
+            // See the Q4_K twin: a bare `return` here would vacuously pass the very
+            // test that caught the Q6_K accumulation-order bug.
+            if !require_simd_or_skip("dotprod", cpu_features().dotprod) {
+                return;
+            }
+            for &(m, n, k) in &[(1024usize, 64usize, 4608usize), (5, 11, 512)] {
+                let nb = k / 256;
+                let mut st = 0x5150_7777u64;
+                let blocks: Vec<crate::quant::BlockQ6K> = (0..m * nb)
+                    .map(|_| {
+                        let mut ql = [0u8; 128];
+                        let mut qh = [0u8; 64];
+                        let mut scales = [0i8; 16];
+                        for b in ql.iter_mut() {
+                            *b = (lcg(&mut st).abs() * 255.0) as i32 as u8;
+                        }
+                        for b in qh.iter_mut() {
+                            *b = (lcg(&mut st).abs() * 255.0) as i32 as u8;
+                        }
+                        for sx in scales.iter_mut() {
+                            *sx = (lcg(&mut st) * 60.0) as i32 as i8;
+                        }
+                        crate::quant::BlockQ6K {
+                            ql,
+                            qh,
+                            scales,
+                            d: half::f16::from_f32(0.02 + lcg(&mut st).abs() * 0.05).to_bits(),
+                        }
+                    })
+                    .collect();
+                let a = blocks_to_bytes(&blocks);
+                let b: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+                let mut bs = vec![0.0f32; n * (k / 32)];
+                let mut bq = vec![0i8; n * k];
+                for j in 0..n {
+                    let (s2, q2) = quantize_col(&b[j * k..(j + 1) * k]);
+                    bs[j * (k / 32)..(j + 1) * (k / 32)].copy_from_slice(&s2);
+                    bq[j * k..(j + 1) * k].copy_from_slice(&q2);
+                }
+                let mut out = vec![0.0f32; m * n];
+                unsafe { gemm_q6_k_q8_0_neon_dotprod(&a, &bs, &bq, &mut out, m, n, k) };
+                let mut worst = 0.0f32;
+                let mut worst_pair = (0.0f32, 0.0f32);
+                for j in 0..n {
+                    let mut y = vec![0.0f32; m];
+                    unsafe {
+                        gemv_q6k_q8_0_neon_dotprod(
+                            &a,
+                            &bs[j * (k / 32)..(j + 1) * (k / 32)],
+                            &bq[j * k..(j + 1) * k],
+                            &mut y,
+                            m,
+                            k,
+                        );
+                    }
+                    for (i, &want) in y.iter().enumerate() {
+                        let got = out[i * n + j];
+                        let rel = (got - want).abs() / (1.0 + want.abs());
+                        if rel > worst {
+                            worst = rel;
+                            worst_pair = (got, want);
+                        }
+                    }
+                }
+                assert_eq!(
+                    worst, 0.0,
+                    "Q6_K GEMM m={m} n={n} k={k}: not bit-exact vs the GEMV \
+                     (max_rel={worst:e}, gemm={} gemv={}) — accumulation order must \
+                     match `gemv_q6k_q8_0_neon_dotprod` exactly",
+                    worst_pair.0, worst_pair.1
+                );
             }
         }
 
