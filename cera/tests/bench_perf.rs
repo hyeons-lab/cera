@@ -1354,3 +1354,171 @@ fn test_metal_prefill_from_embeddings_speedup_1_6b() {
     eprintln!("=== Metal forward_prefill_from_embeddings speedup (1.6B) ===");
     bench_prefill_from_embeddings(&path, 128);
 }
+
+/// Isolation microbenchmark for the batched K-quant GEMM kernels. Dispatches a
+/// single weight-matmul kernel (`gemm_q4_k` or `gemm_q4_0`) at a fixed
+/// (m, k, n) shape, timing GPU-dominated throughput so the Q4_K dequant tax can
+/// be measured and iterated without full-model noise. Weights are random bytes —
+/// the kernel does identical work regardless of value, so timing is unaffected.
+///
+/// Reports ms/iter and TFLOPS. The Q4_K-vs-Q4_0 ratio at the same shape is the
+/// dequant tax (identical simdgroup-matrix framework; only the weight unpack
+/// differs). Measured on M1 Max: Q4_K ~6.7 TFLOPS vs Q4_0 ~7.8 (~16% tax), vs a
+/// ~8.6 TFLOPS matmul-only floor (dequant stubbed). The tax is weight-LOAD
+/// latency, not dequant arithmetic — vectorizing the unpack math moved it ~0%,
+/// while removing the loads recovered the full gap. Hiding it would need a
+/// software-pipelined / wider-N retiling of the k-loop (llama.cpp's identical
+/// kernel_mul_mm pays the same tax). Run: `cargo test -p cera --release
+/// --features metal --test bench_perf gemm_q4k_isolation -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn gemm_q4k_isolation() {
+    use cera::backend::metal::{MetalContext, shaders};
+    use cera::tensor::DType;
+    use metal::MTLSize;
+
+    let ctx = match MetalContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("no Metal device ({e}) — skipping");
+            return;
+        }
+    };
+    eprintln!("=== K-quant GEMM isolation ({}) ===", ctx.device_name);
+
+    let pipe_q4k = ctx
+        .create_pipeline(shaders::GEMM_Q4_K, "gemm_q4_k")
+        .expect("gemm_q4_k pipeline");
+    let pipe_q40 = ctx
+        .create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0")
+        .expect("gemm_q4_0 pipeline");
+
+    // (m, k, n, label) — the dominant LFM2.5-350M prefill GEMM shapes at n=512.
+    let shapes = [
+        (4608usize, 1024usize, 512usize, "conv_ffn_gemm gate/up"),
+        (1024, 4608, 512, "ffn_down"),
+        (1024, 1024, 512, "attn_qkv q"),
+    ];
+
+    // Deterministic pseudo-random byte fill (no RNG / clock — reproducible runs).
+    let fill = |len: usize, seed: usize| -> Vec<u8> {
+        (0..len)
+            .map(|i| ((i.wrapping_mul(2654435761).wrapping_add(seed)) & 0xFF) as u8)
+            .collect()
+    };
+
+    // One kernel dispatch, encoded `iters` times into a single command buffer,
+    // committed once — amortizes CPU submit/encode overhead so the commit→wait
+    // wall time is GPU-dominated (some driver overhead remains; not pure GPU).
+    let bench = |pipeline: &metal::ComputePipelineState,
+                 wbytes: &[u8],
+                 m: usize,
+                 k: usize,
+                 n: usize|
+     -> f64 {
+        let w = ctx.upload_bytes(wbytes);
+        let x = ctx.upload_f32(&vec![0.01f32; k * n]);
+        let y = ctx.create_buffer((m * n * 4) as u64);
+        let params: [u32; 6] = [m as u32, k as u32, n as u32, k as u32, m as u32, 0];
+        let tg_rows = m.div_ceil(64) as u64;
+        let tg_cols = n.div_ceil(32) as u64;
+
+        let encode = |cb: &metal::CommandBufferRef| {
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pipeline);
+            enc.set_buffer(0, Some(&w), 0);
+            enc.set_buffer(1, Some(&x), 0);
+            enc.set_buffer(2, Some(&y), 0);
+            enc.set_bytes(
+                3,
+                std::mem::size_of_val(&params) as u64,
+                params.as_ptr() as *const _,
+            );
+            enc.set_threadgroup_memory_length(0, 8192);
+            enc.dispatch_thread_groups(
+                MTLSize {
+                    width: tg_cols,
+                    height: tg_rows,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            enc.end_encoding();
+        };
+
+        let iters = 50u32;
+        // Warmup.
+        for _ in 0..5 {
+            let cb = ctx.queue.new_command_buffer();
+            encode(cb);
+            cb.commit();
+            cb.wait_until_completed();
+        }
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let cb = ctx.queue.new_command_buffer();
+            for _ in 0..iters {
+                encode(cb);
+            }
+            let t0 = Instant::now();
+            cb.commit();
+            cb.wait_until_completed();
+            let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            if ms < best {
+                best = ms;
+            }
+        }
+        best
+    };
+
+    // Block geometry from the canonical DType definitions so the microbench can't
+    // silently go stale (or mis-size buffers) if a quant layout ever changes.
+    let q4k_bs = DType::Q4KM.block_size();
+    let q4k_bytes = DType::Q4KM.block_bytes();
+    let q40_bs = DType::Q4_0.block_size();
+    let q40_bytes = DType::Q4_0.block_bytes();
+
+    for (m, k, n, label) in shapes {
+        // Weight buffers are sized from these exact block counts; a non-multiple
+        // k would under-size the buffer and cause OOB reads in the shader.
+        assert_eq!(
+            k % q4k_bs,
+            0,
+            "{label}: k={k} must be a multiple of {q4k_bs} (Q4_K block)"
+        );
+        assert_eq!(
+            k % q40_bs,
+            0,
+            "{label}: k={k} must be a multiple of {q40_bs} (Q4_0 block)"
+        );
+        // Keep every shape on the full-tile fast path (64×32 output tile); a
+        // partial tile hits the slow path and would distort the tax measurement.
+        assert_eq!(
+            m % 64,
+            0,
+            "{label}: m={m} must be a multiple of 64 (GEMM output tile)"
+        );
+        assert_eq!(
+            n % 32,
+            0,
+            "{label}: n={n} must be a multiple of 32 (GEMM output tile)"
+        );
+        let nb_q4k = k / q4k_bs;
+        let nb_q40 = k / q40_bs;
+        let w_q4k = fill(m * nb_q4k * q4k_bytes, 1);
+        let w_q40 = fill(m * nb_q40 * q40_bytes, 2);
+        let ms_q4k = bench(&pipe_q4k, &w_q4k, m, k, n);
+        let ms_q40 = bench(&pipe_q40, &w_q40, m, k, n);
+        let gflop = 2.0 * (m * n) as f64 * k as f64 / 1e9;
+        let tflops_q4k = gflop / ms_q4k;
+        let tflops_q40 = gflop / ms_q40;
+        eprintln!(
+            "  {label:22} m={m} k={k} n={n}: q4_k {ms_q4k:.3}ms ({tflops_q4k:.2} TF)  q4_0 {ms_q40:.3}ms ({tflops_q40:.2} TF)  dequant tax {:.1}%",
+            (ms_q4k / ms_q40 - 1.0) * 100.0
+        );
+    }
+}
