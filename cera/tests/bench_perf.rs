@@ -576,6 +576,62 @@ fn test_prefill_phase_profile() {
     }
 }
 
+/// Env-driven per-phase prefill profile for an arbitrary GGUF, so the
+/// GPU-timestamp attribution can target any quant/shape without a hardcoded
+/// model. Set `PROFILE_MODEL_PATH=<abs path.gguf>` and optionally
+/// `PROFILE_N=<tokens>` (default 512). Run with `CERA_PROFILE=gpu` for the
+/// dispatch-overhead-free GPU-timestamp variant.
+#[test]
+#[ignore]
+fn test_env_prefill_phase_profile() {
+    use cera::model::Model;
+    use cera::model::metal_lfm2::MetalLfm2Model;
+
+    let Ok(path) = std::env::var("PROFILE_MODEL_PATH") else {
+        eprintln!("PROFILE_MODEL_PATH unset — skipping");
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let n: usize = std::env::var("PROFILE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
+
+    let gguf = cera::gguf::GgufFile::open(&path).unwrap();
+    let ctx = 8192usize.max(2 * n);
+    let model = MetalLfm2Model::from_gguf(gguf, &path, ctx).unwrap();
+    let cfg = model.config();
+
+    let tokens: Vec<u32> = (0..n as u32).map(|i| i % 1000 + 1).collect();
+
+    // Warmup (hot pipeline cache).
+    let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
+    let _ = model.forward_prefill_profiled(&tokens, 0, &mut state);
+
+    // Measured.
+    let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
+    let timings = model.forward_prefill_profiled(&tokens, 0, &mut state);
+
+    let (total_us, cats) = aggregate_prefill_phases(&timings);
+    eprintln!(
+        "=== ENV Prefill Phase Profile ({}, n={n}) ===",
+        path.display()
+    );
+    eprintln!(
+        "  Total: {:.2} ms ({:.0} tok/s)",
+        total_us / 1000.0,
+        n as f64 / (total_us / 1e6)
+    );
+    eprintln!(
+        "  {:24} {:>10} {:>6} {:>6}",
+        "Phase", "Total us", "Count", "%"
+    );
+    for (cat, total, count) in &cats {
+        let pct = total / total_us * 100.0;
+        eprintln!("  {cat:24} {total:>10.0} {count:>6} {pct:>5.1}%");
+    }
+}
+
 /// Group per-layer-per-phase timings from `forward_prefill_profiled` into
 /// per-category totals, stripping the `L{layer}_` prefix. Returns
 /// `(total_us, Vec<(category, total_us, count)>)` sorted by total
