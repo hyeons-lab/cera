@@ -86,48 +86,50 @@ fn gemv_q5_k(
 
     for (var row = 0u; row < NR; row += 1u) {
         let rr = first_row + row;
-        // Skip the odd-tail row (rr == m when m is not a multiple of NR): its
-        // y write is already guarded below, and skipping avoids out-of-range
-        // weight-buffer reads. `partials` is zero-initialized, so the reduction
-        // treats the skipped row as 0. `partials[0]` (row 0) is always valid —
-        // the dispatch count ceil(m/NR) guarantees first_row < m.
-        if rr >= m {
-            continue;
-        }
         var acc: f32 = 0.0;
-        for (var ib = 0u; ib < nb; ib += 1u) {
-            let blk = rr * row_bytes + ib * Q5K_BYTES;
-            // d, dmin are the two f16 halves of the block's word 0.
-            let ddm = unpack2x16float(a[blk / 4u]);
-            let d = ddm.x;
-            let dmin = ddm.y;
-            // scales occupy bytes 4..16 → three words at word (blk/4 + 1).
-            let sw = blk / 4u + 1u;
-            let s0 = a[sw];
-            let s1 = a[sw + 1u];
-            let s2 = a[sw + 2u];
-            let scale = d * f32(get_sc(s0, s1, s2, sub));
-            let minv = dmin * f32(get_mn(s0, s1, s2, sub));
+        // Skip the compute for the odd-tail row (rr == m when m is not a
+        // multiple of NR): its y write is already guarded below, and skipping
+        // avoids out-of-range weight-buffer reads. `acc` stays 0, and we still
+        // write `partials` below, so the reduction treats the skipped row as 0
+        // without relying on zero-initialized workgroup memory. `partials[0]`
+        // (row 0) is always valid — the dispatch count ceil(m/NR) guarantees
+        // first_row < m.
+        if rr < m {
+            for (var ib = 0u; ib < nb; ib += 1u) {
+                let blk = rr * row_bytes + ib * Q5K_BYTES;
+                // d, dmin are the two f16 halves of the block's word 0.
+                let ddm = unpack2x16float(a[blk / 4u]);
+                let d = ddm.x;
+                let dmin = ddm.y;
+                // scales occupy bytes 4..16 → three words at word (blk/4 + 1).
+                let sw = blk / 4u + 1u;
+                let s0 = a[sw];
+                let s1 = a[sw + 1u];
+                let s2 = a[sw + 2u];
+                let scale = d * f32(get_sc(s0, s1, s2, sub));
+                let minv = dmin * f32(get_mn(s0, s1, s2, sub));
 
-            // This thread's 8 low-nibble bytes (qs, base blk+48) and 8 high-bit
-            // bytes (qh, base blk+16) are each 8 contiguous bytes; qbase/qhbase
-            // are multiples of 8, so each span is exactly two words — load once.
-            let qw = (blk + 48u + qbase) / 4u;
-            let qw0 = a[qw];
-            let qw1 = a[qw + 1u];
-            let hw = (blk + 16u + qhbase) / 4u;
-            let hw0 = a[hw];
-            let hw1 = a[hw + 1u];
-            let xb = ib * QK_K + e0;
+                // This thread's 8 low-nibble bytes (qs, base blk+48) and 8
+                // high-bit bytes (qh, base blk+16) are each 8 contiguous bytes;
+                // qbase/qhbase are multiples of 8, so each span is exactly two
+                // words — load once.
+                let qw = (blk + 48u + qbase) / 4u;
+                let qw0 = a[qw];
+                let qw1 = a[qw + 1u];
+                let hw = (blk + 16u + qhbase) / 4u;
+                let hw0 = a[hw];
+                let hw1 = a[hw + 1u];
+                let xb = ib * QK_K + e0;
 
-            for (var i = 0u; i < 8u; i += 1u) {
-                let sh = (i & 3u) * 8u;
-                let qb = ((select(qw1, qw0, i < 4u)) >> sh) & 0xFFu;
-                let nib = select(qb >> 4u, qb & 0x0Fu, hi == 0u);
-                let hbyte = ((select(hw1, hw0, i < 4u)) >> sh) & 0xFFu;
-                let hib = select(0.0, 16.0, (hbyte & hbit) != 0u);
-                let q5 = f32(nib) + hib;
-                acc += (scale * q5 - minv) * x[xb + i];
+                for (var i = 0u; i < 8u; i += 1u) {
+                    let sh = (i & 3u) * 8u;
+                    let qb = ((select(qw1, qw0, i < 4u)) >> sh) & 0xFFu;
+                    let nib = select(qb >> 4u, qb & 0x0Fu, hi == 0u);
+                    let hbyte = ((select(hw1, hw0, i < 4u)) >> sh) & 0xFFu;
+                    let hib = select(0.0, 16.0, (hbyte & hbit) != 0u);
+                    let q5 = f32(nib) + hib;
+                    acc += (scale * q5 - minv) * x[xb + i];
+                }
             }
         }
         partials[row * WG_SIZE + t] = acc;
