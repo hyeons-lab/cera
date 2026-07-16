@@ -14,7 +14,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState};
 
-use crate::backend::metal::{MetalContext, QkNormRopeParams, shaders};
+use crate::backend::metal::{
+    ElementwiseParams, FlashAttnParams, MetalContext, MetalParams, QkNormRopeParams, shaders,
+};
 use crate::gguf::GgufFile;
 use crate::model::audio_decoder::{DetokenizerConfig, DetokenizerWeights};
 
@@ -438,15 +440,11 @@ impl MetalAudioDecoder {
         self.encode_gemv(enc, w, input, scratch);
         self.barrier(enc);
         let n = w.m;
-        let params: [u32; 2] = [n, 0];
+        let params = ElementwiseParams::new(n);
         enc.set_compute_pipeline_state(&self.pipes.add_inplace);
         enc.set_buffer(0, Some(output), 0);
         enc.set_buffer(1, Some(scratch), 0);
-        enc.set_bytes(
-            2,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 2);
         enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
     }
 
@@ -485,15 +483,11 @@ impl MetalAudioDecoder {
         dst_off: u64,
         n: usize,
     ) {
-        let params: [u32; 2] = [n as u32, 0];
+        let params = ElementwiseParams::new(n as u32);
         enc.set_compute_pipeline_state(&self.pipes.memcpy_f32);
         enc.set_buffer(0, Some(src), src_off);
         enc.set_buffer(1, Some(dst), dst_off);
-        enc.set_bytes(
-            2,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 2);
         enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
     }
 
@@ -508,15 +502,11 @@ impl MetalAudioDecoder {
         dst_off_bytes: u64,
         n: u32,
     ) {
-        let params: [u32; 2] = [n, 0];
+        let params = ElementwiseParams::new(n);
         enc.set_compute_pipeline_state(&self.pipes.cast_f32_to_f16);
         enc.set_buffer(0, Some(src), 0);
         enc.set_buffer(1, Some(dst), dst_off_bytes);
-        enc.set_bytes(
-            2,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 2);
         enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
     }
 
@@ -531,16 +521,12 @@ impl MetalAudioDecoder {
         dst: &Buffer,
         n: usize,
     ) {
-        let params: [u32; 2] = [n as u32, 0];
+        let params = ElementwiseParams::new(n as u32);
         enc.set_compute_pipeline_state(&self.pipes.mul_out);
         enc.set_buffer(0, Some(a), a_off);
         enc.set_buffer(1, Some(b), b_off);
         enc.set_buffer(2, Some(dst), 0);
-        enc.set_bytes(
-            3,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 3);
         enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
     }
 
@@ -776,26 +762,22 @@ impl MetalAudioDecoder {
             self.barrier(enc);
 
             // Attention: attend to ALL cached positions
-            let attn_params: [u32; 8] = [
+            let attn_params = FlashAttnParams {
                 n_heads,
-                n_kv,
-                hd as u32,
-                kv_dim as u32,
-                seq_len as u32,
-                scale.to_bits(),
-                0,
-                0,
-            ];
+                n_kv_heads: n_kv,
+                head_dim: hd as u32,
+                kv_dim: kv_dim as u32,
+                seq_len: seq_len as u32,
+                scale_bits: scale.to_bits(),
+                _pad0: 0,
+                _pad1: 0,
+            };
             enc.set_compute_pipeline_state(&self.pipes.flash_attention);
             enc.set_buffer(0, Some(&self.q_buf), 0);
             enc.set_buffer(1, Some(k_cache), 0);
             enc.set_buffer(2, Some(v_cache), 0);
             enc.set_buffer(3, Some(&self.attn_out_buf), 0);
-            enc.set_bytes(
-                4,
-                std::mem::size_of_val(&attn_params) as u64,
-                attn_params.as_ptr() as *const _,
-            );
+            attn_params.set(enc, 4);
             enc.dispatch_thread_groups(sz1d(n_heads as u64), sz1d(256));
             self.barrier(enc);
 
@@ -894,15 +876,11 @@ impl MetalAudioDecoder {
                 self.barrier(enc);
                 // Add bias
                 let bias_n = spectrum_per_frame as u32;
-                let bias_params: [u32; 2] = [bias_n, 0];
+                let bias_params = ElementwiseParams::new(bias_n);
                 enc.set_compute_pipeline_state(&self.pipes.add_inplace);
                 enc.set_buffer(0, Some(&self.spectrum_buf), spec_off);
                 enc.set_buffer(1, Some(&self.lin_b), 0);
-                enc.set_bytes(
-                    2,
-                    std::mem::size_of_val(&bias_params) as u64,
-                    bias_params.as_ptr() as *const _,
-                );
+                bias_params.set(enc, 2);
                 enc.dispatch_thread_groups(sz1d((bias_n as u64).div_ceil(256)), sz1d(256));
                 self.barrier(enc);
             }
@@ -1264,50 +1242,38 @@ impl MetalDepthformer {
                 let k_src_off = (q_dim * 4) as u64;
                 let v_src_off = ((q_dim + kv_dim) * 4) as u64;
                 let cache_off = (pos * kv_dim * 2) as u64;
-                let copy_params: [u32; 2] = [kv_dim as u32, 0];
+                let copy_params = ElementwiseParams::new(kv_dim as u32);
                 // Cast K
                 enc.set_compute_pipeline_state(&self.pipes.cast_f32_to_f16);
                 enc.set_buffer(0, Some(&self.qkv_buf), k_src_off);
                 enc.set_buffer(1, Some(&self.kv_k[il]), cache_off);
-                enc.set_bytes(
-                    2,
-                    std::mem::size_of_val(&copy_params) as u64,
-                    copy_params.as_ptr() as *const _,
-                );
+                copy_params.set(enc, 2);
                 enc.dispatch_thread_groups(sz1d((kv_dim as u64).div_ceil(256)), sz1d(256));
                 // Cast V
                 enc.set_compute_pipeline_state(&self.pipes.cast_f32_to_f16);
                 enc.set_buffer(0, Some(&self.qkv_buf), v_src_off);
                 enc.set_buffer(1, Some(&self.kv_v[il]), cache_off);
-                enc.set_bytes(
-                    2,
-                    std::mem::size_of_val(&copy_params) as u64,
-                    copy_params.as_ptr() as *const _,
-                );
+                copy_params.set(enc, 2);
                 enc.dispatch_thread_groups(sz1d((kv_dim as u64).div_ceil(256)), sz1d(256));
 
                 // Attention (flash_attention reads `half*` KV)
                 let seq_len = pos + 1;
-                let attn_params: [u32; 8] = [
-                    n_head,
-                    n_kv,
-                    hd as u32,
-                    kv_dim as u32,
-                    seq_len as u32,
-                    scale.to_bits(),
-                    0,
-                    0,
-                ];
+                let attn_params = FlashAttnParams {
+                    n_heads: n_head,
+                    n_kv_heads: n_kv,
+                    head_dim: hd as u32,
+                    kv_dim: kv_dim as u32,
+                    seq_len: seq_len as u32,
+                    scale_bits: scale.to_bits(),
+                    _pad0: 0,
+                    _pad1: 0,
+                };
                 enc.set_compute_pipeline_state(&self.pipes.flash_attention);
                 enc.set_buffer(0, Some(&self.qkv_buf), 0); // Q
                 enc.set_buffer(1, Some(&self.kv_k[il]), 0);
                 enc.set_buffer(2, Some(&self.kv_v[il]), 0);
                 enc.set_buffer(3, Some(&self.attn_out_buf), 0);
-                enc.set_bytes(
-                    4,
-                    std::mem::size_of_val(&attn_params) as u64,
-                    attn_params.as_ptr() as *const _,
-                );
+                attn_params.set(enc, 4);
                 enc.dispatch_thread_groups(sz1d(n_head as u64), sz1d(256));
 
                 // wo: accum into hidden_buf (residual)
@@ -1417,15 +1383,11 @@ impl MetalDepthformer {
         // gemv_f32 → accum_buf, then add_inplace output += accum_buf
         self.encode_df_gemv(enc, w, input, &self.accum_buf);
         let n = w.m;
-        let params: [u32; 2] = [n, 0];
+        let params = ElementwiseParams::new(n);
         enc.set_compute_pipeline_state(&self.pipes.add_inplace);
         enc.set_buffer(0, Some(output), 0);
         enc.set_buffer(1, Some(&self.accum_buf), 0);
-        enc.set_bytes(
-            2,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 2);
         enc.dispatch_thread_groups(sz1d((n as u64).div_ceil(256)), sz1d(256));
     }
 }

@@ -7,160 +7,17 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use metal::{
-    Buffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState, CounterSampleBuffer,
-    CounterSampleBufferDescriptor, Device, Library, MTLResourceOptions, MTLStorageMode,
+    Buffer, CommandQueue, ComputePipelineState, CounterSampleBuffer, CounterSampleBufferDescriptor,
+    Device, Library, MTLResourceOptions, MTLStorageMode,
 };
 
-/// CPU mirror of the `Params` struct in `shaders/qk_norm_rope.metal` (binding 4).
-///
-/// This is a named `#[repr(C)]` type rather than an ad-hoc `[u32; N]` on purpose.
-/// The array form is what allowed a real NaN bug: the kernel's struct grew from 7 to
-/// 9 fields (adding `has_freq_factors` / `has_qk_norm`) and gained a `freq_factors`
-/// buffer at binding 5, but the audio decoder's three call sites kept uploading the old
-/// 7 fields with a *hardcoded* byte length. Nothing failed to compile — the kernel simply
-/// read the two new flags past the end of the upload and, on garbage `has_freq_factors`,
-/// divided by an unbound buffer, producing NaN/Inf and silent audio.
-///
-/// Use [`Self::bind`] to encode it: it sets binding 4 with a `size_of_val`-derived
-/// length and binding 5 in the same call, so neither "wrong length" nor "forgot the
-/// freq_factors buffer" is expressible at a call site.
-///
-/// **Keep the field order and count identical to the MSL struct.** Rust cannot see the
-/// shader, so the `size_of` assert below is the only mechanical link: it turns a change
-/// to *this* struct into a build break, forcing whoever edits it to look at the `.metal`
-/// file.
-///
-/// It does **not** catch a field added on the *shader* side — the exact direction that
-/// caused the NaN. `tests/metal_shaders_parity.rs` dispatches these kernels through this
-/// same type and would catch it, but only where it actually runs: it is gated on
-/// `--features metal`, which no CI job currently passes. Until that job exists, the
-/// shader-side direction is guarded by review, not by the build.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct QkNormRopeParams {
-    pub pos: u32,
-    pub n_heads: u32,
-    pub n_kv_heads: u32,
-    pub head_dim: u32,
-    pub eps_bits: u32,
-    pub freq_base_bits: u32,
-    /// 0 = NeoX (pairs at `[i, i+half]`); 1 = interleaved/NORM (pairs at `[2i, 2i+1]`).
-    pub rope_type: u32,
-    /// 1 ⇒ divide each pair's angle by `freq_factors[d]` (Llama-3 long-context scaling).
-    /// When 0, the buffer passed to [`Self::bind`] is never read — a 1-element dummy is fine.
-    pub has_freq_factors: u32,
-    /// 1 ⇒ per-head RMS-norm of Q/K before RoPE (LFM2 / Qwen3 / the audio decoder);
-    /// 0 ⇒ RoPE only (LLaMA / Qwen2 / Mistral / Granite).
-    pub has_qk_norm: u32,
-}
-
-const _: () = assert!(size_of::<QkNormRopeParams>() == 36); // 9 × uint, qk_norm_rope.metal
-
-impl QkNormRopeParams {
-    /// Bind the params (buffer 4) and the `freq_factors` array (buffer 5).
-    ///
-    /// `freq_factors` must always be a live buffer even when `has_freq_factors == 0`:
-    /// the kernel declares the binding unconditionally, and leaving slot 5 unbound is
-    /// what produced NaN. Pass a 1-element `[1.0]` dummy in that case — `1.0`, not `0.0`,
-    /// so that flipping the flag on can't divide by zero.
-    pub fn bind(&self, enc: &ComputeCommandEncoderRef, freq_factors: &Buffer) {
-        enc.set_bytes(
-            4,
-            std::mem::size_of_val(self) as u64,
-            self as *const Self as *const _,
-        );
-        enc.set_buffer(5, Some(freq_factors), 0);
-    }
-}
-
-/// CPU mirror of the `BatchParams` struct in `shaders/qk_norm_rope_batch.metal`
-/// (binding 4).
-///
-/// The batched prefill sibling of [`QkNormRopeParams`]: same kernel body, but over `n`
-/// tokens with per-token Q/K strides. Kept as its own type because the layouts genuinely
-/// differ — see the field order below. Named for the same reason as its sibling: an
-/// untyped `[u32; N]` lets the shader's struct drift away from the upload silently.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct QkNormRopeBatchParams {
-    pub start_pos: u32,
-    pub n_tokens: u32,
-    pub n_heads: u32,
-    pub n_kv_heads: u32,
-    pub head_dim: u32,
-    pub eps_bits: u32,
-    pub freq_base_bits: u32,
-    pub rope_type: u32,
-    pub q_stride: u32,
-    pub k_stride: u32,
-    pub has_freq_factors: u32,
-    pub has_qk_norm: u32,
-}
-
-const _: () = assert!(size_of::<QkNormRopeBatchParams>() == 48); // 12 × uint
-
-impl QkNormRopeBatchParams {
-    /// Bind the params (buffer 4) and the `freq_factors` array (buffer 5).
-    /// See [`QkNormRopeParams::bind`] — slot 5 must always be live.
-    pub fn bind(&self, enc: &ComputeCommandEncoderRef, freq_factors: &Buffer) {
-        enc.set_bytes(
-            4,
-            std::mem::size_of_val(self) as u64,
-            self as *const Self as *const _,
-        );
-        enc.set_buffer(5, Some(freq_factors), 0);
-    }
-}
-
-/// CPU mirror of the `KParams` struct in `shaders/kv_shift.metal` (binding 2).
-///
-/// Same reasoning as [`QkNormRopeParams`], and the same bug: `kv_shift.metal` also grew
-/// `rope_type` / `has_freq_factors` and a `freq_factors` buffer at binding 3. The
-/// production dispatch was updated; `tests/metal_kv_shift_oracle.rs` kept its own private
-/// copy of the old 8-field layout and never bound slot 3 — so the oracle, the test whose
-/// entire job is to police this kernel, was itself dispatching it wrong and comparing the
-/// resulting NaN against the CPU reference.
-///
-/// Worth being precise about what an under-sized upload does, because it is the reason
-/// this class is dangerous: it is undefined behaviour, not a reliable crash. Here it
-/// happened to produce NaN (an unbound buffer 3 divided into the angle) and the test went
-/// red. Read a different garbage value and the kernel returns *plausible* numbers instead,
-/// and the test goes green over a real miscompute.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KvShiftKParams {
-    pub n_keep: u32,
-    pub shift: u32,
-    pub new_seq_len: u32,
-    pub n_kv_heads: u32,
-    pub head_dim: u32,
-    pub freq_base_bits: u32,
-    /// `-(shift as i32)`: the rotation delta applied to each retained cell.
-    pub delta_pos: i32,
-    /// 0 = NeoX, 1 = NORM/interleaved. Must match the layout the forward pass used —
-    /// shifting a NORM model with the NeoX layout pairs the wrong elements.
-    pub rope_type: u32,
-    /// 1 ⇒ divide each pair's angle by `freq_factors[d]`. See [`QkNormRopeParams`].
-    pub has_freq_factors: u32,
-    pub _pad: u32,
-}
-
-const _: () = assert!(size_of::<KvShiftKParams>() == 40); // 10 × 4B (incl. _pad), kv_shift.metal
-
-impl KvShiftKParams {
-    /// Bind the params (buffer 2) and the `freq_factors` array (buffer 3).
-    ///
-    /// Slot 3 must always be live even when `has_freq_factors == 0` — see
-    /// [`QkNormRopeParams::bind`] for why, and pass a `[1.0]` dummy.
-    pub fn bind(&self, enc: &ComputeCommandEncoderRef, freq_factors: &Buffer) {
-        enc.set_bytes(
-            2,
-            std::mem::size_of_val(self) as u64,
-            self as *const Self as *const _,
-        );
-        enc.set_buffer(3, Some(freq_factors), 0);
-    }
-}
+pub mod params;
+pub use params::{
+    BiasAddParams, Conv1dBatchParams, ElementwiseParams, FlashAttnParams, GemmF32Params,
+    GemvBatchParams, GemvQkvParams, GemvRmsParams, GemvSplitKParams, KvCopyParams, KvShiftKParams,
+    MetalParams, PrefillAttnParams, QkNormRopeBatchParams, QkNormRopeParams, QuantGemmParams,
+    RmsNormBatchParams, RopeParams, ScaleParams, SplitAttnParams,
+};
 
 /// Metal compute context: device, command queue, compiled shader library cache.
 ///

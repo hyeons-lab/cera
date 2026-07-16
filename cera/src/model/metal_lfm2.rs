@@ -10,7 +10,10 @@ use anyhow::Result;
 use metal::{Buffer, ComputePipelineState, MTLResourceOptions, MTLSize, NSUInteger};
 
 use crate::backend::metal::{
-    KvShiftKParams, MetalContext, QkNormRopeBatchParams, QkNormRopeParams, shaders,
+    BiasAddParams, Conv1dBatchParams, ElementwiseParams, FlashAttnParams, GemmF32Params,
+    GemvBatchParams, GemvQkvParams, GemvRmsParams, GemvSplitKParams, KvCopyParams, KvShiftKParams,
+    MetalContext, MetalParams, PrefillAttnParams, QkNormRopeBatchParams, QkNormRopeParams,
+    QuantGemmParams, RmsNormBatchParams, RopeParams, ScaleParams, SplitAttnParams, shaders,
 };
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
@@ -1259,29 +1262,29 @@ impl MetalLfm2Model {
         let f32b = std::mem::size_of::<f32>() as u64;
         // GEMM 1: Tmp[n × rank] = X[n × k] · Aᵀ  (A is [rank × k] row-major).
         let total1 = n as u64 * t.rank as u64;
-        let p1: [u32; 3] = [n as u32, t.rank, t.k];
+        let p1 = GemmF32Params {
+            m: n as u32,
+            n: t.rank,
+            k: t.k,
+        };
         enc.set_compute_pipeline_state(&self.pipelines.gemm_f32_nt);
         enc.set_buffer(0, Some(input), in_off_floats * f32b);
         enc.set_buffer(1, Some(&t.a), 0);
         enc.set_buffer(2, Some(&self.lora_tmp_batched), 0);
-        enc.set_bytes(
-            3,
-            std::mem::size_of_val(&p1) as u64,
-            p1.as_ptr() as *const _,
-        );
+        p1.set(enc, 3);
         enc.dispatch_thread_groups(sz2d(total1.min(65535), total1.div_ceil(65535)), sz1d(32));
         // GEMM 2: Y[n × d] += Tmp[n × rank] · Bᵀ  (B_batched is [d × rank] row-major).
         let total2 = n as u64 * t.d as u64;
-        let p2: [u32; 3] = [n as u32, t.d, t.rank];
+        let p2 = GemmF32Params {
+            m: n as u32,
+            n: t.d,
+            k: t.rank,
+        };
         enc.set_compute_pipeline_state(&self.pipelines.gemm_f32_nt_accum);
         enc.set_buffer(0, Some(&self.lora_tmp_batched), 0);
         enc.set_buffer(1, Some(&t.b_batched), 0);
         enc.set_buffer(2, Some(output), out_off_floats * f32b);
-        enc.set_bytes(
-            3,
-            std::mem::size_of_val(&p2) as u64,
-            p2.as_ptr() as *const _,
-        );
+        p2.set(enc, 3);
         enc.dispatch_thread_groups(sz2d(total2.min(65535), total2.div_ceil(65535)), sz1d(32));
     }
 
@@ -1432,14 +1435,14 @@ impl MetalLfm2Model {
         accumulate: bool,
     ) {
         debug_assert_eq!(w.dtype, DType::Q4_0, "batch GEMV only supports Q4_0");
-        let params: [u32; 6] = [
-            w.m,
-            w.k,
+        let params = GemvBatchParams {
+            m: w.m,
+            k: w.k,
             n,
             x_stride,
             y_stride,
-            if accumulate { 1 } else { 0 },
-        ];
+            accum: u32::from(accumulate),
+        };
         // 2 simdgroups × 4 rows/SG = 8 rows per TG, 4 columns per TG.
         let rows_per_tg = 8u32;
         let cols_per_tg = 4u32;
@@ -1449,11 +1452,7 @@ impl MetalLfm2Model {
         enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
         enc.set_buffer(1, Some(x), x_off_bytes);
         enc.set_buffer(2, Some(y), y_off_bytes);
-        enc.set_bytes(
-            3,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 3);
         enc.dispatch_thread_groups(
             MTLSize {
                 width: row_groups as u64,
@@ -1484,14 +1483,14 @@ impl MetalLfm2Model {
         accumulate: bool,
     ) {
         debug_assert_eq!(w.dtype, DType::Q8_0);
-        let params: [u32; 6] = [
-            w.m,
-            w.k,
+        let params = GemvBatchParams {
+            m: w.m,
+            k: w.k,
             n,
             x_stride,
             y_stride,
-            if accumulate { 1 } else { 0 },
-        ];
+            accum: u32::from(accumulate),
+        };
         let rows_per_tg = 8u32;
         let cols_per_tg = 4u32;
         let row_groups = w.m.div_ceil(rows_per_tg);
@@ -1500,11 +1499,7 @@ impl MetalLfm2Model {
         enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
         enc.set_buffer(1, Some(x), x_off_bytes);
         enc.set_buffer(2, Some(y), y_off_bytes);
-        enc.set_bytes(
-            3,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 3);
         enc.dispatch_thread_groups(
             MTLSize {
                 width: row_groups as u64,
@@ -1613,14 +1608,25 @@ impl MetalLfm2Model {
             }
             return;
         }
-        let params: [u32; 6] = [
-            w.m,
-            w.k,
+        // `accumulate` is deliberately *not* forwarded: these kernels have no accum path
+        // (their sixth slot is `_pad`, which none of them reads), so any accumulating
+        // call was routed to the GEMV fallback by the guard above and cannot reach here.
+        // Writing the flag into `_pad` would look like it worked and silently drop the
+        // add — the previous `[u32; 6]` did exactly that. `QuantGemmParams` names the
+        // field `_pad` so the mistake is no longer expressible.
+        debug_assert!(
+            !accumulate,
+            "quantized GEMM kernels cannot accumulate; the guard above must have \
+             routed this call to the GEMV fallback"
+        );
+        let params = QuantGemmParams {
+            m: w.m,
+            k: w.k,
             n,
             x_stride,
             y_stride,
-            if accumulate { 1 } else { 0 },
-        ];
+            _pad: 0,
+        };
         let tg_rows = w.m.div_ceil(64);
         let tg_cols = n.div_ceil(32);
         let gemm_pipeline = match w.dtype {
@@ -1633,11 +1639,7 @@ impl MetalLfm2Model {
         enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
         enc.set_buffer(1, Some(x), x_off_bytes);
         enc.set_buffer(2, Some(y), y_off_bytes);
-        enc.set_bytes(
-            3,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 3);
         enc.set_threadgroup_memory_length(0, 8192); // 4KB weights + 4KB input
         enc.dispatch_thread_groups(
             MTLSize {
@@ -1689,12 +1691,8 @@ impl MetalLfm2Model {
         enc.set_compute_pipeline_state(&self.pipelines.add_inplace);
         enc.set_buffer(0, Some(dst), dst_off_bytes);
         enc.set_buffer(1, Some(scratch), 0);
-        let params: [u32; 2] = [total, 0];
-        enc.set_bytes(
-            2,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        let params = ElementwiseParams::new(total);
+        params.set(enc, 2);
         enc.dispatch_thread_groups(grid, sz1d(256));
     }
 
@@ -1763,7 +1761,12 @@ impl MetalLfm2Model {
         let m_kv = w_k.m;
         let total_tgs = (m_q + 2 * m_kv) as u64;
         let grid = sz2d(total_tgs.min(65535), total_tgs.div_ceil(65535));
-        let params: [u32; 4] = [m_q, m_kv, w_q.k, 0];
+        let params = GemvQkvParams {
+            m_q,
+            m_kv,
+            k: w_q.k,
+            _pad: 0,
+        };
         enc.set_compute_pipeline_state(&self.pipelines.gemv_q4_0_fast_slim_qkv);
         enc.set_buffer(0, Some(&self.mmap_buf), w_q.mmap_offset);
         enc.set_buffer(1, Some(&self.mmap_buf), w_k.mmap_offset);
@@ -1772,11 +1775,7 @@ impl MetalLfm2Model {
         enc.set_buffer(4, Some(y_q), 0);
         enc.set_buffer(5, Some(y_k), 0);
         enc.set_buffer(6, Some(y_v), 0);
-        enc.set_bytes(
-            7,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 7);
         enc.dispatch_thread_groups(grid, sz1d(32));
     }
 
@@ -1830,7 +1829,12 @@ impl MetalLfm2Model {
         debug_assert_eq!(w_up.dtype, DType::Q4_0);
         let m = w_gate.m;
         let grid = sz2d(m.min(65535) as u64, m.div_ceil(65535) as u64);
-        let params: [u32; 4] = [w_gate.m, w_gate.k, self.config.rms_norm_eps.to_bits(), 0];
+        let params = GemvRmsParams {
+            m: w_gate.m,
+            k: w_gate.k,
+            eps_bits: self.config.rms_norm_eps.to_bits(),
+            _pad: 0,
+        };
         enc.set_compute_pipeline_state(&self.pipelines.gemv_q4_0_fast_rmsnorm_gate_up);
         enc.set_buffer(0, Some(&self.mmap_buf), w_gate.mmap_offset);
         enc.set_buffer(1, Some(&self.mmap_buf), w_up.mmap_offset);
@@ -1838,11 +1842,7 @@ impl MetalLfm2Model {
         enc.set_buffer(3, Some(norm_w), 0);
         enc.set_buffer(4, Some(y_gate), 0);
         enc.set_buffer(5, Some(y_up), 0);
-        enc.set_bytes(
-            6,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 6);
         enc.dispatch_thread_groups(grid, sz1d(32));
     }
 
@@ -1865,18 +1865,18 @@ impl MetalLfm2Model {
         // component and every TG would compute `split_id == 0`.
         let rows_per_split = (w.m as u64).div_ceil(8); // ROWS_PER_TG = 8
         let grid = MTLSize::new(rows_per_split * n_splits as u64, 1, 1);
-        let split_params = [w.m, w.k, n_splits];
+        let split_params = GemvSplitKParams {
+            m: w.m,
+            k: w.k,
+            n_splits,
+        };
 
         // Phase A: Partial GEMV
         enc.set_compute_pipeline_state(&self.pipelines.gemv_q4_0_fast_splitk);
         enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
         enc.set_buffer(1, Some(input), input_off_bytes);
         enc.set_buffer(2, Some(&self.gemv_splitk_partials), 0);
-        enc.set_bytes(
-            3,
-            std::mem::size_of_val(&split_params) as u64,
-            split_params.as_ptr() as *const _,
-        );
+        split_params.set(enc, 3);
         enc.dispatch_thread_groups(grid, sz1d(64));
 
         // Phase B: Merge. One thread per row. Dispatching total threads
@@ -1889,11 +1889,7 @@ impl MetalLfm2Model {
         enc.set_compute_pipeline_state(merge_pipeline);
         enc.set_buffer(0, Some(&self.gemv_splitk_partials), 0);
         enc.set_buffer(1, Some(output), output_off_bytes);
-        enc.set_bytes(
-            2,
-            std::mem::size_of_val(&split_params) as u64,
-            split_params.as_ptr() as *const _,
-        );
+        split_params.set(enc, 2);
         enc.dispatch_threads(sz1d(w.m as u64), sz1d(256));
     }
 
@@ -2129,12 +2125,11 @@ impl MetalLfm2Model {
     ) {
         enc.set_compute_pipeline_state(&self.pipelines.scale_f32);
         enc.set_buffer(0, Some(a), 0);
-        let params: [u32; 2] = [n, scale.to_bits()];
-        enc.set_bytes(
-            1,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        let params = ScaleParams {
+            n,
+            scale_bits: scale.to_bits(),
+        };
+        params.set(enc, 1);
         enc.dispatch_thread_groups(sz1d(n.div_ceil(256) as u64), sz1d(256));
     }
 
@@ -2151,12 +2146,8 @@ impl MetalLfm2Model {
         enc.set_compute_pipeline_state(&self.pipelines.bias_add);
         enc.set_buffer(0, Some(buf), 0);
         enc.set_buffer(1, Some(bias), 0);
-        let params: [u32; 2] = [total, dim];
-        enc.set_bytes(
-            2,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        let params = BiasAddParams { total, dim };
+        params.set(enc, 2);
         enc.dispatch_thread_groups(sz1d(total.div_ceil(256) as u64), sz1d(256));
     }
 
@@ -2172,19 +2163,28 @@ impl MetalLfm2Model {
         n: u32,
         scale: f32,
     ) {
-        let (pipeline, params) = if scale == 1.0 {
-            (&self.pipelines.add_inplace, [n, 0u32])
+        // The two kernels take *different* param structs that happen to be the same width:
+        // `add_inplace` reads `Params { n, _pad }`, `scaled_add_inplace` reads
+        // `ScaleParams { n, scale_bits }`. The shared `[u32; 2]` hid that — a second field
+        // that is padding in one kernel and a live float in the other.
+        let scaled = scale != 1.0;
+        let pipeline = if scaled {
+            &self.pipelines.scaled_add_inplace
         } else {
-            (&self.pipelines.scaled_add_inplace, [n, scale.to_bits()])
+            &self.pipelines.add_inplace
         };
         enc.set_compute_pipeline_state(pipeline);
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
-        enc.set_bytes(
-            2,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        if scaled {
+            ScaleParams {
+                n,
+                scale_bits: scale.to_bits(),
+            }
+            .set(enc, 2);
+        } else {
+            ElementwiseParams::new(n).set(enc, 2);
+        }
         enc.dispatch_thread_groups(sz1d(n.div_ceil(256) as u64), sz1d(256));
     }
 
@@ -2243,24 +2243,19 @@ impl MetalLfm2Model {
         dst_stride: u32,
     ) {
         let hs = self.config.hidden_size as u32;
-        // 5 u32 layout: [n, eps_bits, src_stride, dst_stride, res_scale_bits].
         // `rmsnorm_batch` ignores res_scale (no residual) — pass 1.0.
-        let params: [u32; 5] = [
-            hs,
-            self.config.rms_norm_eps.to_bits(),
+        let params = RmsNormBatchParams {
+            n: hs,
+            eps_bits: self.config.rms_norm_eps.to_bits(),
             src_stride,
             dst_stride,
-            1.0f32.to_bits(),
-        ];
+            res_scale_bits: 1.0f32.to_bits(),
+        };
         enc.set_compute_pipeline_state(&self.pipelines.rmsnorm_batch);
         enc.set_buffer(0, Some(src), src_off_bytes);
         enc.set_buffer(1, Some(dst), dst_off_bytes);
         enc.set_buffer(2, Some(weight), 0);
-        enc.set_bytes(
-            3,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 3);
         enc.dispatch_thread_groups(sz1d(n_tokens as u64), sz1d(256));
     }
 
@@ -2279,25 +2274,20 @@ impl MetalLfm2Model {
         res_scale: f32,
     ) {
         let hs = self.config.hidden_size as u32;
-        // 5 u32 layout: [n, eps_bits, src_stride, dst_stride, res_scale_bits].
         // The kernel does `src += res_scale * residual` then rmsnorm → dst.
         // `res_scale` carries Granite's residual multiplier (1.0 elsewhere).
-        let params: [u32; 5] = [
-            hs,
-            self.config.rms_norm_eps.to_bits(),
-            stride,
-            stride,
-            res_scale.to_bits(),
-        ];
+        let params = RmsNormBatchParams {
+            n: hs,
+            eps_bits: self.config.rms_norm_eps.to_bits(),
+            src_stride: stride,
+            dst_stride: stride,
+            res_scale_bits: res_scale.to_bits(),
+        };
         enc.set_compute_pipeline_state(&self.pipelines.add_rmsnorm_batch);
         enc.set_buffer(0, Some(src), 0);
         enc.set_buffer(1, Some(dst), 0);
         enc.set_buffer(2, Some(weight), 0);
-        enc.set_bytes(
-            3,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 3);
         enc.set_buffer(4, Some(residual), 0);
         enc.dispatch_thread_groups(sz1d(n_tokens as u64), sz1d(256));
     }
@@ -2352,12 +2342,8 @@ impl MetalLfm2Model {
         enc.set_compute_pipeline_state(&self.pipelines.cast_f32_to_f16);
         enc.set_buffer(0, Some(src), 0);
         enc.set_buffer(1, Some(dst), dst_off_bytes);
-        let params: [u32; 2] = [n_elements, 0];
-        enc.set_bytes(
-            2,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        let params = ElementwiseParams::new(n_elements);
+        params.set(enc, 2);
         enc.dispatch_thread_groups(sz1d(n_elements.div_ceil(256) as u64), sz1d(256));
     }
 
@@ -2375,12 +2361,8 @@ impl MetalLfm2Model {
         enc.set_compute_pipeline_state(&self.pipelines.cast_f32_to_f16);
         enc.set_buffer(0, Some(src), src_off_bytes);
         enc.set_buffer(1, Some(dst), dst_off_bytes);
-        let params: [u32; 2] = [n_elements, 0];
-        enc.set_bytes(
-            2,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        let params = ElementwiseParams::new(n_elements);
+        params.set(enc, 2);
         enc.dispatch_thread_groups(sz1d(n_elements.div_ceil(256) as u64), sz1d(256));
     }
 
@@ -2492,23 +2474,19 @@ impl MetalLfm2Model {
     ) {
         // Inline params via set_bytes so the dispatched command carries its own pos value
         // — enables batching multiple tokens with different positions in one command buffer.
-        let params: [u32; 5] = [
+        let params = RopeParams {
             pos,
             n_heads,
             n_kv_heads,
             head_dim,
-            self.config.rope_theta.to_bits(),
-        ];
+            freq_base_bits: self.config.rope_theta.to_bits(),
+        };
         let max_pairs = n_heads.max(n_kv_heads) * (head_dim / 2);
         let grid = sz1d(max_pairs.div_ceil(256) as u64);
         enc.set_compute_pipeline_state(&self.pipelines.rope);
         enc.set_buffer(0, Some(q), 0);
         enc.set_buffer(1, Some(k), k_off_bytes);
-        enc.set_bytes(
-            2,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 2);
         enc.dispatch_thread_groups(grid, sz1d(256));
     }
 
@@ -2621,16 +2599,17 @@ impl MetalLfm2Model {
             .scalars
             .attn
             .unwrap_or_else(|| 1.0f32 / (head_dim as f32).sqrt());
-        let params: [u32; 8] = [
+        // `attention.metal` and `flash_attention.metal` declare the identical `Params`.
+        let params = FlashAttnParams {
             n_heads,
             n_kv_heads,
             head_dim,
             kv_dim,
             seq_len,
-            scale.to_bits(),
-            0,
-            0,
-        ];
+            scale_bits: scale.to_bits(),
+            _pad0: 0,
+            _pad1: 0,
+        };
         // CERA_PROFILE=noattn: skip attention dispatch entirely for profiling.
         // Compare decode tok/s with/without to estimate attention cost.
         // Output will be garbage — this is only for timing.
@@ -2659,16 +2638,16 @@ impl MetalLfm2Model {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(4)
                 .clamp(1, 8);
-            let split_params: [u32; 8] = [
+            let split_params = SplitAttnParams {
                 n_heads,
                 n_kv_heads,
                 head_dim,
                 kv_dim,
                 seq_len,
-                scale.to_bits(),
+                scale_bits: scale.to_bits(),
                 n_splits,
-                0,
-            ];
+                _pad: 0,
+            };
             // Phase A: per-split partial compute.
             enc.set_compute_pipeline_state(&self.pipelines.attention_split_compute);
             enc.set_buffer(0, Some(q), 0);
@@ -2677,11 +2656,7 @@ impl MetalLfm2Model {
             enc.set_buffer(3, Some(&self.splitk_partials_out), 0);
             enc.set_buffer(4, Some(&self.splitk_partials_max), 0);
             enc.set_buffer(5, Some(&self.splitk_partials_sum), 0);
-            enc.set_bytes(
-                6,
-                std::mem::size_of_val(&split_params) as u64,
-                split_params.as_ptr() as *const _,
-            );
+            split_params.set(enc, 6);
             enc.dispatch_thread_groups(sz1d((n_heads * n_splits) as u64), sz1d(256));
             // Phase B: merge across splits.
             enc.set_compute_pipeline_state(&self.pipelines.attention_split_merge);
@@ -2689,11 +2664,7 @@ impl MetalLfm2Model {
             enc.set_buffer(1, Some(&self.splitk_partials_max), 0);
             enc.set_buffer(2, Some(&self.splitk_partials_sum), 0);
             enc.set_buffer(3, Some(out), 0);
-            enc.set_bytes(
-                4,
-                std::mem::size_of_val(&split_params) as u64,
-                split_params.as_ptr() as *const _,
-            );
+            split_params.set(enc, 4);
             enc.dispatch_thread_groups(sz1d(n_heads as u64), sz1d(head_dim.max(32) as u64));
             return;
         }
@@ -2720,11 +2691,7 @@ impl MetalLfm2Model {
         enc.set_buffer(1, Some(k_cache), 0);
         enc.set_buffer(2, Some(v_cache), 0);
         enc.set_buffer(3, Some(out), 0);
-        enc.set_bytes(
-            4,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 4);
         enc.dispatch_thread_groups(sz1d(tg_count), sz1d(256));
     }
 
@@ -2760,16 +2727,16 @@ impl MetalLfm2Model {
             .scalars
             .attn
             .unwrap_or_else(|| 1.0f32 / (head_dim as f32).sqrt());
-        let params: [u32; 8] = [
+        let params = FlashAttnParams {
             n_heads,
             n_kv_heads,
             head_dim,
             kv_dim,
             seq_len,
-            scale.to_bits(),
-            0,
-            0,
-        ];
+            scale_bits: scale.to_bits(),
+            _pad0: 0,
+            _pad1: 0,
+        };
         if self.skip_attn {
             return;
         }
@@ -2794,11 +2761,7 @@ impl MetalLfm2Model {
         enc.set_buffer(1, Some(k_cache), 0);
         enc.set_buffer(2, Some(v_cache), 0);
         enc.set_buffer(3, Some(out), out_off_bytes);
-        enc.set_bytes(
-            4,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 4);
         enc.dispatch_thread_groups(sz1d(tg_count), sz1d(256));
     }
 
@@ -2891,17 +2854,17 @@ impl MetalLfm2Model {
             .scalars
             .attn
             .unwrap_or_else(|| 1.0f32 / (head_dim as f32).sqrt());
-        let params: [u32; 9] = [
+        let params = PrefillAttnParams {
             n_heads,
             n_kv_heads,
             head_dim,
             kv_dim,
             start_pos,
-            n,
-            scale.to_bits(),
+            n_queries: n,
+            scale_bits: scale.to_bits(),
             q_stride,
             out_stride,
-        ];
+        };
         // Iter 5/6: dispatch the (head_dim, query-block)-specialized variant.
         // hd=64/128 specialize head_dim (constexpr inner-loop bounds + MMA
         // strides ⇒ full unroll); any other head_dim falls back to the runtime
@@ -2926,11 +2889,7 @@ impl MetalLfm2Model {
         enc.set_buffer(1, Some(k_cache), 0);
         enc.set_buffer(2, Some(v_cache), 0);
         enc.set_buffer(3, Some(out_buf), 0);
-        enc.set_bytes(
-            4,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 4);
         // Dynamic threadgroup memory — must match attention_prefill.metal's
         // layout exactly (query block = QPT, C=64).
         //
@@ -3764,12 +3723,13 @@ impl MetalLfm2Model {
         enc.set_compute_pipeline_state(&self.pipelines.memcpy_f16_offsets);
         enc.set_buffer(0, Some(src), 0);
         enc.set_buffer(1, Some(dst), 0);
-        let params: [u32; 4] = [n_elements, src_offset_elements, dst_offset_elements, 0];
-        enc.set_bytes(
-            2,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        let params = KvCopyParams {
+            n_elements,
+            src_offset_elements,
+            dst_offset_elements,
+            _pad: 0,
+        };
+        params.set(enc, 2);
         enc.dispatch_thread_groups(sz1d((n_elements as u64).div_ceil(256)), sz1d(256));
         enc.end_encoding();
     }
@@ -3991,25 +3951,21 @@ impl MetalLfm2Model {
                 {
                     let conv_weight = lw.conv_weight.as_ref().unwrap();
                     let d_conv = self.config.conv_kernel_size.unwrap_or(3) - 1;
-                    let params: [u32; 6] = [
-                        hs as u32,
-                        (d_conv + 1) as u32, // kernel_size
-                        d_conv as u32,
-                        n as u32,
-                        (3 * hs) as u32, // proj_stride
-                        hs as u32,       // out_stride
-                    ];
+                    let params = Conv1dBatchParams {
+                        hidden_size: hs as u32,
+                        kernel_size: (d_conv + 1) as u32,
+                        d_conv: d_conv as u32,
+                        n_tokens: n as u32,
+                        proj_stride: (3 * hs) as u32,
+                        out_stride: hs as u32,
+                    };
                     let grid = sz1d((hs as u32).div_ceil(256) as u64);
                     enc.set_compute_pipeline_state(&self.pipelines.conv1d_fused_batch);
                     enc.set_buffer(0, Some(&self.prefill_proj_buf), 0);
                     enc.set_buffer(1, Some(conv_buf), 0);
                     enc.set_buffer(2, Some(conv_weight), 0);
                     enc.set_buffer(3, Some(&self.prefill_normed_buf), 0);
-                    enc.set_bytes(
-                        4,
-                        std::mem::size_of_val(&params) as u64,
-                        params.as_ptr() as *const _,
-                    );
+                    params.set(enc, 4);
                     enc.dispatch_thread_groups(grid, sz1d(256));
                 }
 
@@ -4394,12 +4350,8 @@ impl MetalLfm2Model {
                 enc.set_compute_pipeline_state(&self.pipelines.silu_mul_inplace);
                 enc.set_buffer(0, Some(&self.prefill_gate_buf), 0);
                 enc.set_buffer(1, Some(&self.prefill_up_buf), 0);
-                let params: [u32; 2] = [total, 0];
-                enc.set_bytes(
-                    2,
-                    std::mem::size_of_val(&params) as u64,
-                    params.as_ptr() as *const _,
-                );
+                let params = ElementwiseParams::new(total);
+                params.set(enc, 2);
                 enc.dispatch_thread_groups(grid, sz1d(256));
             }
             // FFN down GEMM → normed_buf scratch (add fused into next layer's norm).
@@ -4653,25 +4605,21 @@ impl MetalLfm2Model {
 
                 run_phase(format!("L{layer}_conv1d"), &|enc| {
                     let d_conv = cfg.conv_kernel_size.unwrap_or(3) - 1;
-                    let params: [u32; 6] = [
-                        hs as u32,
-                        (d_conv + 1) as u32,
-                        d_conv as u32,
-                        n as u32,
-                        (3 * hs) as u32,
-                        hs as u32,
-                    ];
+                    let params = Conv1dBatchParams {
+                        hidden_size: hs as u32,
+                        kernel_size: (d_conv + 1) as u32,
+                        d_conv: d_conv as u32,
+                        n_tokens: n as u32,
+                        proj_stride: (3 * hs) as u32,
+                        out_stride: hs as u32,
+                    };
                     let grid = sz1d((hs as u32).div_ceil(256) as u64);
                     enc.set_compute_pipeline_state(&self.pipelines.conv1d_fused_batch);
                     enc.set_buffer(0, Some(&self.prefill_proj_buf), 0);
                     enc.set_buffer(1, Some(conv_buf), 0);
                     enc.set_buffer(2, Some(lw.conv_weight.as_ref().unwrap()), 0);
                     enc.set_buffer(3, Some(&self.prefill_normed_buf), 0);
-                    enc.set_bytes(
-                        4,
-                        std::mem::size_of_val(&params) as u64,
-                        params.as_ptr() as *const _,
-                    );
+                    params.set(enc, 4);
                     enc.dispatch_thread_groups(grid, sz1d(256));
                 });
 
@@ -4914,12 +4862,8 @@ impl MetalLfm2Model {
                 enc.set_compute_pipeline_state(&self.pipelines.silu_mul_inplace);
                 enc.set_buffer(0, Some(&self.prefill_gate_buf), 0);
                 enc.set_buffer(1, Some(&self.prefill_up_buf), 0);
-                let params: [u32; 2] = [total, 0];
-                enc.set_bytes(
-                    2,
-                    std::mem::size_of_val(&params) as u64,
-                    params.as_ptr() as *const _,
-                );
+                let params = ElementwiseParams::new(total);
+                params.set(enc, 2);
                 enc.dispatch_thread_groups(grid, sz1d(256));
             });
 
