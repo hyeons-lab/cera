@@ -640,7 +640,7 @@ const VIT_MM_TILE_N: u32 = 1;
 const VIT_MM_TILE_K: u32 = 32;
 
 /// A wgpu linear weight `[out_dim, in_dim]` row-major. Mirrors
-/// [`MetalVitWeight`]: quantized weights keep their packed bytes and run the
+/// `MetalVitWeight`: quantized weights keep their packed bytes and run the
 /// register-tiled `mul_mat_reg_tile` GEMM (decoding Q8_0/Q4_0 into shared
 /// memory in-kernel); f32 weights (or quant dtypes without a tiled decoder)
 /// fall back to the same register-tiled `mul_mat_reg_tile` matmul on a

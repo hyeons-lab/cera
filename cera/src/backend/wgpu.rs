@@ -1715,6 +1715,117 @@ mod tests {
         }
     }
 
+    /// Q4_0 reg-tile parity at the **production** vec geometry
+    /// (`MUL_MAT_TILE_M = 8`, `MUL_MAT_TILE_N = 4`, `WORKGROUP_SIZE_N = 32`).
+    /// The other Q4_0 vec test runs TILE_M=4, so its vec4 store loop
+    /// (`for tm in (0..TILE_M step VEC_SIZE=4)`) executes a single iteration;
+    /// TILE_M=8 makes it execute two (rows 0-3 then 4-7). `m = 40` is a multiple
+    /// of 4 (the `use_vec` precondition) yet smaller than the 64-row tile, so both
+    /// vec4 iterations run with valid rows while the partial-tile bounds check is
+    /// still exercised. Guards against a store bug that only appears on the
+    /// second vec4 iteration of the shipped geometry.
+    #[test]
+    fn test_gpu_mul_mat_tile_q4_0_vec_prod_geometry() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+
+        let m: u32 = 40; // multiple of 4 (use_vec precondition), partial vs 64-row tile
+        let k: u32 = 128;
+        let n: u32 = 20; // tokens, partial vs the 128-col tile
+
+        let weights_f32: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 + 3) % 29) as f32 * 0.1 - 1.4)
+            .collect();
+        let q4_bytes = quantize_q4_0_for_test(m as usize, k as usize, &weights_f32);
+
+        let mut x_batch: Vec<f32> = Vec::with_capacity((n * k) as usize);
+        for t in 0..n {
+            for i in 0..k {
+                x_batch.push(((t as f32 + 1.0) * (i as f32 - 64.0)) * 0.05);
+            }
+        }
+
+        let expected = cpu_matmul_q4_0(m as usize, k as usize, n as usize, &q4_bytes, &x_batch);
+
+        let a_buf = ctx.upload_storage(&q4_bytes, "weights");
+        let x_buf = ctx.upload_f32(&x_batch, "x_batch");
+        let y_buf = ctx.create_storage_rw(((n * m) as u64) * 4, "y_batch");
+
+        // MulMatParams: m, k, n, x_stride, y_stride.
+        let params: [u32; 5] = [m, k, n, k, m];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+
+        let pipeline = ctx.create_pipeline_with_defines(
+            shaders::MUL_MAT_REG_TILE,
+            "main",
+            "mul_mat_q4_0_prod_tile_test",
+            &[
+                ("VEC", ""),
+                ("SRC0_INNER_TYPE", "u32"),
+                ("SRC1_INNER_TYPE", "f32"),
+                ("INIT_SRC0_SHMEM_Q4_0", ""),
+                ("INIT_SRC1_SHMEM_FLOAT", ""),
+                ("WORKGROUP_SIZE_M", "8u"),
+                ("WORKGROUP_SIZE_N", "32u"),
+                ("TILE_M", "8u"),
+                ("TILE_N", "4u"),
+                ("TILE_K", "32u"),
+            ],
+        );
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            // WORKGROUP_SIZE_M*TILE_M = 64 rows, WORKGROUP_SIZE_N*TILE_N = 128 cols.
+            let wg_m = m.div_ceil(8 * 8);
+            let wg_n = n.div_ceil(32 * 4);
+            pass.dispatch_workgroups(wg_m, wg_n, 1);
+        }
+        ctx.submit_encoder(enc);
+        ctx.device.poll(wgpu::Maintain::Wait);
+
+        let result = ctx.download_f32(&y_buf, (n * m) as usize);
+        for i in 0..(n * m) as usize {
+            let diff = (result[i] - expected[i]).abs();
+            assert!(
+                diff < 1e-2,
+                "mismatch at {}: {} vs {}",
+                i,
+                result[i],
+                expected[i]
+            );
+        }
+    }
+
     #[test]
     fn test_gpu_mul_mat_tile_scalar_parity() {
         let ctx = match GpuContext::new() {
@@ -3217,7 +3328,7 @@ mod tests {
     /// compare.
     ///
     /// `m = 11` and `n = 3` are deliberately not multiples of the tile geometry
-    /// (`WORKGROUP_SIZE_M * TILE_M = 32` rows, `WORKGROUP_SIZE_N * TILE_N = 32`
+    /// (`WORKGROUP_SIZE_M * TILE_M = 64` rows, `WORKGROUP_SIZE_N * TILE_N = 128`
     /// cols), so the partial-tile bounds checks are exercised rather than assumed.
     /// The strides are padded past `k`/`m` for the same reason.
     #[test]
@@ -3301,8 +3412,9 @@ mod tests {
                 ("INIT_SRC1_SHMEM_FLOAT", ""),
                 ("WORKGROUP_SIZE_M", "8u"),
                 ("WORKGROUP_SIZE_N", "32u"),
-                ("TILE_M", "4u"),
-                ("TILE_N", "1u"),
+                // Production reg-tile geometry (MUL_MAT_TILE_M/N in gpu_lfm2.rs).
+                ("TILE_M", "8u"),
+                ("TILE_N", "4u"),
                 ("TILE_K", "32u"),
             ],
         );
@@ -3333,7 +3445,7 @@ mod tests {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(m.div_ceil(32), n.div_ceil(32), 1);
+            pass.dispatch_workgroups(m.div_ceil(64), n.div_ceil(128), 1);
         }
         ctx.submit_encoder(enc);
 
@@ -3368,7 +3480,7 @@ mod tests {
             Err(_) => return,
         };
 
-        let m = 37u32; // not a multiple of the 32-row tile
+        let m = 37u32; // not a multiple of the 64-row tile
         let k = 512u32;
         let n = 5u32;
         let x_stride = k + 4;
@@ -3440,8 +3552,9 @@ mod tests {
                 ("INIT_SRC1_SHMEM_FLOAT", ""),
                 ("WORKGROUP_SIZE_M", "8u"),
                 ("WORKGROUP_SIZE_N", "32u"),
-                ("TILE_M", "4u"),
-                ("TILE_N", "1u"),
+                // Production reg-tile geometry (MUL_MAT_TILE_M/N in gpu_lfm2.rs).
+                ("TILE_M", "8u"),
+                ("TILE_N", "4u"),
                 ("TILE_K", "32u"),
             ],
         );
@@ -3472,7 +3585,7 @@ mod tests {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(m.div_ceil(32), n.div_ceil(32), 1);
+            pass.dispatch_workgroups(m.div_ceil(64), n.div_ceil(128), 1);
         }
         ctx.submit_encoder(enc);
 
@@ -3594,8 +3707,9 @@ mod tests {
                 ("INIT_SRC1_SHMEM_FLOAT", ""),
                 ("WORKGROUP_SIZE_M", "8u"),
                 ("WORKGROUP_SIZE_N", "32u"),
-                ("TILE_M", "4u"),
-                ("TILE_N", "1u"),
+                // Production reg-tile geometry (MUL_MAT_TILE_M/N in gpu_lfm2.rs).
+                ("TILE_M", "8u"),
+                ("TILE_N", "4u"),
                 ("TILE_K", "32u"),
             ],
         );
@@ -3626,9 +3740,9 @@ mod tests {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            // WORKGROUP_SIZE_M*TILE_M = 32 rows, WORKGROUP_SIZE_N*TILE_N = 32 cols
+            // WORKGROUP_SIZE_M*TILE_M = 64 rows, WORKGROUP_SIZE_N*TILE_N = 128 cols
             // per workgroup — mirrors the Q6_K arm of `encode_mul_mat_reg_tile`.
-            pass.dispatch_workgroups(m.div_ceil(32), n.div_ceil(32), 1);
+            pass.dispatch_workgroups(m.div_ceil(64), n.div_ceil(128), 1);
         }
         ctx.queue.submit(Some(enc.finish()));
 

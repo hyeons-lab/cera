@@ -37,8 +37,15 @@ const MUL_MAT_TILE_WG_M: u32 = 8;
 /// `NR` constant in `gemv_f32.wgsl`. Used to size the LoRA dispatch grids.
 const GEMV_F32_ROWS_PER_WG: u32 = 8;
 const MUL_MAT_TILE_WG_N: u32 = 32;
-const MUL_MAT_TILE_M: u32 = 4;
-const MUL_MAT_TILE_N: u32 = 1;
+// Each thread computes an 8×4 register tile. shmem for the K-quant variant is
+// `(TILE_K+1)·WG_M·TILE_M + TILE_K·WG_N·TILE_N` f32 = (33·64 + 32·128)·4 ≈ 24.8 KB,
+// which EXCEEDS the default WebGPU 16 KB workgroup-storage limit — it fits only
+// because we request the adapter's actual limits (`GpuContext::new` uses
+// `adapter.limits()`; PowerVR/Adreno/Mali expose 32 KB). Raising TILE_N or TILE_M
+// further must re-check `max_compute_workgroup_storage_size`, or pipeline creation
+// fails at runtime on the target GPU.
+const MUL_MAT_TILE_M: u32 = 8;
+const MUL_MAT_TILE_N: u32 = 4;
 const MUL_MAT_TILE_K: u32 = 32;
 
 /// Build a `mul_mat_reg_tile` pipeline for the requested variant.
