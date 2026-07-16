@@ -694,7 +694,24 @@ impl GpuContext {
                 layout: None, // auto-infer from shader
                 module: &module,
                 entry_point: Some(entry_point),
-                compilation_options: Default::default(),
+                // Disable naga's automatic workgroup-memory zeroing prologue (a
+                // cooperative zeroing of up to ~8 KB per workgroup launch, the
+                // size of the reg-tile GEMM's `shmem`) — pure overhead here
+                // because every kernel writes its workgroup memory before
+                // reading it (the reg-tile GEMM fills `shmem` via `init_shmem_*`
+                // before the barrier; `acc` is explicitly zeroed).
+                //
+                // CONTRACT: with this off, `var<workgroup>` memory starts as
+                // undefined garbage, NOT zero. Every WGSL compute kernel built
+                // through this path must write a workgroup-memory slot before
+                // any thread reads it — mind reduction index ranges and lanes
+                // that early-return before writing their slot. A kernel that
+                // relies on zero-init reads garbage with no compile error and
+                // maybe no test failure (see the gemv_q5_k odd-`m` fix).
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
                 cache: None,
             })
     }
