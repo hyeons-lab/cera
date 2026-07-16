@@ -16,8 +16,12 @@
 // `qh` 5th bit, dots with x, and accumulates across all blocks. The 32 partials
 // are reduced in workgroup memory. NR=2 rows per WG. Dispatch: ceil(m/2) × 32.
 //
-// Per-byte u32 reads (like gemv_q6_k.wgsl) — correct but unpack-heavy; the win
-// is keeping the weight quantized (~5.8× less VRAM/bandwidth than the f32 path).
+// Weight loads are vectorized to whole `u32` words (see gemv_q4_k.wgsl for the
+// rationale — T5b measured the per-byte path ~4× off Adreno's achievable
+// bandwidth). PRECONDITION: the Q5_K super-block is 176 bytes (a multiple of
+// 16), so every block base and each of `d/dmin`, `scales`, the per-thread `qs`
+// span and `qh` span is ≥4-byte aligned. The 2-byte-aligned blocks (Q6_K,
+// Q4_0, Q8_0) do not satisfy this and keep the per-byte reads.
 
 @group(0) @binding(0) var<storage, read> a: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
@@ -35,30 +39,27 @@ const WG_SIZE: u32 = 32u;
 
 var<workgroup> partials: array<f32, 64>; // NR * WG_SIZE
 
-// Read one byte from the u32-addressed weight buffer.
-fn rb(off: u32) -> u32 {
-    return (a[off / 4u] >> ((off % 4u) * 8u)) & 0xFFu;
+// Extract byte `b` (0..=11) of the 12-byte scales array from its three
+// preloaded words `s0`/`s1`/`s2` — equals the old `rb(scales_off + b)`.
+fn scb(s0: u32, s1: u32, s2: u32, b: u32) -> u32 {
+    let w = select(select(s2, s1, b < 8u), s0, b < 4u);
+    return (w >> ((b & 3u) * 8u)) & 0xFFu;
 }
 
-// Read a little-endian f16 (two bytes) as f32.
-fn rf16(off: u32) -> f32 {
-    return unpack2x16float(rb(off) | (rb(off + 1u) << 8u)).x;
-}
-
-// 6-bit sub-block scale, sub in 0..8 (`decode_q4km_scales`). `so` = scales byte offset.
-fn get_sc(so: u32, sub: u32) -> u32 {
+// 6-bit sub-block scale, sub in 0..=7 (`decode_q4km_scales`), from preloaded words.
+fn get_sc(s0: u32, s1: u32, s2: u32, sub: u32) -> u32 {
     if sub < 4u {
-        return rb(so + sub) & 63u;
+        return scb(s0, s1, s2, sub) & 63u;
     }
-    return (rb(so + sub + 4u) & 0x0Fu) | ((rb(so + sub - 4u) >> 6u) << 4u);
+    return (scb(s0, s1, s2, sub + 4u) & 0x0Fu) | ((scb(s0, s1, s2, sub - 4u) >> 6u) << 4u);
 }
 
-// 6-bit sub-block min, sub in 0..8.
-fn get_mn(so: u32, sub: u32) -> u32 {
+// 6-bit sub-block min, sub in 0..=7.
+fn get_mn(s0: u32, s1: u32, s2: u32, sub: u32) -> u32 {
     if sub < 4u {
-        return rb(so + sub + 4u) & 63u;
+        return scb(s0, s1, s2, sub + 4u) & 63u;
     }
-    return (rb(so + sub + 4u) >> 4u) | ((rb(so + sub) >> 6u) << 4u);
+    return (scb(s0, s1, s2, sub + 4u) >> 4u) | ((scb(s0, s1, s2, sub) >> 6u) << 4u);
 }
 
 @compute @workgroup_size(32, 1, 1)
@@ -96,20 +97,35 @@ fn gemv_q5_k(
         var acc: f32 = 0.0;
         for (var ib = 0u; ib < nb; ib += 1u) {
             let blk = rr * row_bytes + ib * Q5K_BYTES;
-            let d = rf16(blk);
-            let dmin = rf16(blk + 2u);
-            let so = blk + 4u;
-            let scale = d * f32(get_sc(so, sub));
-            let minv = dmin * f32(get_mn(so, sub));
+            // d, dmin are the two f16 halves of the block's word 0.
+            let ddm = unpack2x16float(a[blk / 4u]);
+            let d = ddm.x;
+            let dmin = ddm.y;
+            // scales occupy bytes 4..16 → three words at word (blk/4 + 1).
+            let sw = blk / 4u + 1u;
+            let s0 = a[sw];
+            let s1 = a[sw + 1u];
+            let s2 = a[sw + 2u];
+            let scale = d * f32(get_sc(s0, s1, s2, sub));
+            let minv = dmin * f32(get_mn(s0, s1, s2, sub));
 
-            let qs_off = blk + 48u + qbase;
-            let qh_off = blk + 16u + qhbase;
+            // This thread's 8 low-nibble bytes (qs, base blk+48) and 8 high-bit
+            // bytes (qh, base blk+16) are each 8 contiguous bytes; qbase/qhbase
+            // are multiples of 8, so each span is exactly two words — load once.
+            let qw = (blk + 48u + qbase) / 4u;
+            let qw0 = a[qw];
+            let qw1 = a[qw + 1u];
+            let hw = (blk + 16u + qhbase) / 4u;
+            let hw0 = a[hw];
+            let hw1 = a[hw + 1u];
             let xb = ib * QK_K + e0;
 
             for (var i = 0u; i < 8u; i += 1u) {
-                let qb = rb(qs_off + i);
+                let sh = (i & 3u) * 8u;
+                let qb = ((select(qw1, qw0, i < 4u)) >> sh) & 0xFFu;
                 let nib = select(qb >> 4u, qb & 0x0Fu, hi == 0u);
-                let hib = select(0.0, 16.0, (rb(qh_off + i) & hbit) != 0u);
+                let hbyte = ((select(hw1, hw0, i < 4u)) >> sh) & 0xFFu;
+                let hib = select(0.0, 16.0, (hbyte & hbit) != 0u);
                 let q5 = f32(nib) + hib;
                 acc += (scale * q5 - minv) * x[xb + i];
             }

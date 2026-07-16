@@ -18,7 +18,17 @@
 // [t*8, t*8+8) of each super-block — all 8 fall in one sub-block/nibble — dots
 // them across every block, then a workgroup tree-reduction sums the 32 threads.
 // Dispatch: ceil(m/2) workgroups. Win is VRAM/bandwidth (Q4_K stays quantized,
-// ~7× smaller than f32); compute is bound by per-byte unpack.
+// ~7× smaller than f32).
+//
+// Weight loads are vectorized to whole `u32` words rather than one byte at a
+// time: T5b measured this decode GEMV running ~4× off Adreno's achievable
+// bandwidth because the naïve `a[off/4] >> shift & 0xFF` per-byte read (the old
+// `rb`) fetched a full word for every byte and did not coalesce under naga.
+// PRECONDITION for the direct word loads below: the Q4_K super-block is 144
+// bytes (a multiple of 16), so every block base and each of `d/dmin` (word-0),
+// `scales` (bytes 4..16), and the per-thread `qs` span is ≥4-byte aligned. This
+// does NOT hold for the 2-byte-aligned blocks (Q6_K 210 B, Q4_0 18 B, Q8_0
+// 34 B) — those need a funnel-shift and keep the per-byte path for now.
 
 @group(0) @binding(0) var<storage, read> a: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
@@ -36,32 +46,27 @@ const WG_SIZE: u32 = 32u;
 
 var<workgroup> partials: array<f32, 64>;
 
-// Read byte `off` from the byte-addressed `a` buffer.
-fn rb(off: u32) -> u32 {
-    return (a[off / 4u] >> ((off % 4u) * 8u)) & 0xFFu;
+// Extract byte `b` (0..=11) of the 12-byte scales array from its three
+// preloaded words `s0`/`s1`/`s2` — equals the old `rb(scales_off + b)`.
+fn scb(s0: u32, s1: u32, s2: u32, b: u32) -> u32 {
+    let w = select(select(s2, s1, b < 8u), s0, b < 4u);
+    return (w >> ((b & 3u) * 8u)) & 0xFFu;
 }
 
-// Read an f16 (little-endian) at byte offset `off` and widen to f32.
-fn rf16(off: u32) -> f32 {
-    let lo = rb(off);
-    let hi = rb(off + 1u);
-    return unpack2x16float(lo | (hi << 8u)).x;
-}
-
-// 6-bit sub-block scale / min unpack — port of `decode_q4km_scales` (quant.rs).
-// `sb` is the byte offset of the 12-byte scales array.
-fn q4k_sc(sb: u32, sub: u32) -> u32 {
+// 6-bit sub-block scale / min unpack — port of `decode_q4km_scales` (quant.rs),
+// reading from the preloaded scales words instead of per-byte buffer fetches.
+fn q4k_sc(s0: u32, s1: u32, s2: u32, sub: u32) -> u32 {
     if sub < 4u {
-        return rb(sb + sub) & 63u;
+        return scb(s0, s1, s2, sub) & 63u;
     }
-    return (rb(sb + sub + 4u) & 0x0Fu) | ((rb(sb + sub - 4u) >> 6u) << 4u);
+    return (scb(s0, s1, s2, sub + 4u) & 0x0Fu) | ((scb(s0, s1, s2, sub - 4u) >> 6u) << 4u);
 }
 
-fn q4k_mn(sb: u32, sub: u32) -> u32 {
+fn q4k_mn(s0: u32, s1: u32, s2: u32, sub: u32) -> u32 {
     if sub < 4u {
-        return rb(sb + sub + 4u) & 63u;
+        return scb(s0, s1, s2, sub + 4u) & 63u;
     }
-    return (rb(sb + sub + 4u) >> 4u) | ((rb(sb + sub) >> 6u) << 4u);
+    return (scb(s0, s1, s2, sub + 4u) >> 4u) | ((scb(s0, s1, s2, sub) >> 6u) << 4u);
 }
 
 @compute @workgroup_size(32, 1, 1)
@@ -99,17 +104,29 @@ fn gemv_q4_k(
                 continue;
             }
             let blk = row * row_bytes + ib * Q4K_BYTES;
-            let d = rf16(blk);
-            let dmin = rf16(blk + 2u);
-            let sb = blk + 4u;
-            let qs = blk + 16u;
+            // d, dmin are the two f16 halves of the block's word 0.
+            let ddm = unpack2x16float(a[blk / 4u]);
+            let d = ddm.x;
+            let dmin = ddm.y;
+            // scales occupy bytes 4..16 → three words at word (blk/4 + 1).
+            let sw = blk / 4u + 1u;
+            let s0 = a[sw];
+            let s1 = a[sw + 1u];
+            let s2 = a[sw + 2u];
 
-            let scale = d * f32(q4k_sc(sb, sub));
-            let minv = dmin * f32(q4k_mn(sb, sub));
+            let scale = d * f32(q4k_sc(s0, s1, s2, sub));
+            let minv = dmin * f32(q4k_mn(s0, s1, s2, sub));
+
+            // This thread's 8 quant nibbles are 8 contiguous bytes of qs (base
+            // blk+16, offset qbase) — qbase is a multiple of 8, so they fall in
+            // exactly two words; load both once instead of eight per-byte reads.
+            let qw = (blk + 16u + qbase) / 4u;
+            let qw0 = a[qw];
+            let qw1 = a[qw + 1u];
 
             var s = 0.0;
             for (var i = 0u; i < 8u; i += 1u) {
-                let qb = rb(qs + qbase + i);
+                let qb = ((select(qw1, qw0, i < 4u)) >> ((i & 3u) * 8u)) & 0xFFu;
                 let nib = select(qb >> 4u, qb & 0x0Fu, hi == 0u);
                 s += (scale * f32(nib) - minv) * xl[i];
             }
