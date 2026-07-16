@@ -39,14 +39,14 @@ const WG_SIZE: u32 = 32u;
 
 var<workgroup> partials: array<f32, 64>; // NR * WG_SIZE
 
-// Extract byte `b` (0..12) of the 12-byte scales array from its three
+// Extract byte `b` (0..=11) of the 12-byte scales array from its three
 // preloaded words `s0`/`s1`/`s2` — equals the old `rb(scales_off + b)`.
 fn scb(s0: u32, s1: u32, s2: u32, b: u32) -> u32 {
     let w = select(select(s2, s1, b < 8u), s0, b < 4u);
     return (w >> ((b & 3u) * 8u)) & 0xFFu;
 }
 
-// 6-bit sub-block scale, sub in 0..8 (`decode_q4km_scales`), from preloaded words.
+// 6-bit sub-block scale, sub in 0..=7 (`decode_q4km_scales`), from preloaded words.
 fn get_sc(s0: u32, s1: u32, s2: u32, sub: u32) -> u32 {
     if sub < 4u {
         return scb(s0, s1, s2, sub) & 63u;
@@ -54,7 +54,7 @@ fn get_sc(s0: u32, s1: u32, s2: u32, sub: u32) -> u32 {
     return (scb(s0, s1, s2, sub + 4u) & 0x0Fu) | ((scb(s0, s1, s2, sub - 4u) >> 6u) << 4u);
 }
 
-// 6-bit sub-block min, sub in 0..8.
+// 6-bit sub-block min, sub in 0..=7.
 fn get_mn(s0: u32, s1: u32, s2: u32, sub: u32) -> u32 {
     if sub < 4u {
         return scb(s0, s1, s2, sub + 4u) & 63u;

@@ -46,7 +46,7 @@ const WG_SIZE: u32 = 32u;
 
 var<workgroup> partials: array<f32, 64>;
 
-// Extract byte `b` (0..12) of the 12-byte scales array from its three
+// Extract byte `b` (0..=11) of the 12-byte scales array from its three
 // preloaded words `s0`/`s1`/`s2` — equals the old `rb(scales_off + b)`.
 fn scb(s0: u32, s1: u32, s2: u32, b: u32) -> u32 {
     let w = select(select(s2, s1, b < 8u), s0, b < 4u);
