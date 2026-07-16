@@ -662,6 +662,34 @@ fn metal_batched_prefill_matches_pertoken() {
     eprintln!("metal batched-vs-pertoken OK across {ran} model(s)");
 }
 
+/// Batched Q6_K prefill GEMM (`gemm_q6_k`) vs the trusted per-token Q6_K GEMV
+/// (`gemv_q6_k`) on an LFM2 Q4_K_M model — where `ffn_down` and some `attn_v`
+/// are stored as Q6_K. The dense `CASES` are Q8_0/Q4_0 and never exercise the
+/// Q6_K GEMM, so this gate covers it specifically. Point `CERA_ORACLE_MODELS_DIR`
+/// at the directory holding the .gguf and set `CERA_METAL_PARITY=1`.
+///
+/// The prompt MUST tokenize to ≥ `GEMM_MIN_N` (16) tokens: below that,
+/// `encode_gemm` falls back to the per-token GEMV for *both* streams, so the
+/// batched GEMM under test never dispatches and the comparison is vacuous. The
+/// prompt below is 29 tokens.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+#[ignore] // run with --ignored + CERA_METAL_PARITY=1
+fn metal_q6k_gemm_batched_vs_pertoken() {
+    if std::env::var("CERA_METAL_PARITY").as_deref() != Ok("1") {
+        eprintln!("skipping: CERA_METAL_PARITY=1 not set");
+        return;
+    }
+    let prompt = "The capital of France is Paris, and the history of the French \
+                  Republic spans many centuries of art, science, philosophy, and \
+                  revolution across Europe.";
+    match check_metal_batched_vs_pertoken("LFM2.5-350M-Q4_K_M.gguf", prompt, 24) {
+        None => eprintln!("LFM2.5-350M-Q4_K_M not present — nothing verified"),
+        Some(Ok(())) => eprintln!("Q6_K GEMM batched-vs-pertoken OK"),
+        Some(Err(e)) => panic!("Q6_K GEMM parity failure:\n{e}"),
+    }
+}
+
 /// Native-Metal output must match the CPU oracle. Catches shared-Metal-path bugs
 /// the batched-vs-pertoken differential is blind to (embedding/residual/attn
 /// scalars, tied-vs-untied output). Covers all four dense archs.

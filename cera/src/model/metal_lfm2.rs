@@ -269,6 +269,7 @@ struct MetalPipelines {
     gemm_q4_0: ComputePipelineState,
     gemm_q4_k: ComputePipelineState,
     gemm_q8_0: ComputePipelineState,
+    gemm_q6_k: ComputePipelineState,
     /// Batched f32 NT GEMM `C = Lhs · Rhsᵀ` for the prefill LoRA down-projection
     /// (`Tmp = X · Aᵀ`).
     gemm_f32_nt: ComputePipelineState,
@@ -632,6 +633,7 @@ impl MetalLfm2Model {
             gemm_q4_0: ctx.create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0")?,
             gemm_q4_k: ctx.create_pipeline(shaders::GEMM_Q4_K, "gemm_q4_k")?,
             gemm_q8_0: ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0")?,
+            gemm_q6_k: ctx.create_pipeline(shaders::GEMM_Q6_K, "gemm_q6_k")?,
             gemm_f32_nt: ctx.create_pipeline(shaders::GEMM_F32, "gemm_f32_nt")?,
             gemm_f32_nt_accum: ctx.create_pipeline(shaders::GEMM_F32, "gemm_f32_nt_accum")?,
             attention_prefill: ctx
@@ -755,14 +757,14 @@ impl MetalLfm2Model {
 
         let upload_weight = |wref: &WeightRef| -> anyhow::Result<MetalWeight> {
             // Layer projection matmuls route through `encode_gemm` (batched
-            // simdgroup GEMM for Q4_0/Q8_0/Q4_K, self-guarding per-token GEMV
+            // simdgroup GEMM for Q4_0/Q8_0/Q4_K/Q6_K, self-guarding per-token GEMV
             // fallback for anything else) and `encode_gemv` (Q4_0/Q8_0/Q4_K/Q6_K +
-            // an explicit F32 arm). Q4_K and Q6_K both have native GEMV kernels;
-            // prefill batches Q4_K via `gemm_q4_k` (n ≥ GEMM_MIN_N) and keeps Q6_K
-            // per-token. Q4_K_M is a mixed scheme — most projections Q4_K, but
-            // ffn_down and some attn_v are Q6_K — so both are required to load such
-            // a model. Any other dtype (F16, …) hits the GEMV `gemv_f32` fallback
-            // and is silently reinterpreted as f32 → garbage; reject it here.
+            // an explicit F32 arm). Q4_K and Q6_K both have native GEMV + batched
+            // GEMM kernels; prefill batches each via `gemm_q4_k` / `gemm_q6_k`
+            // (n ≥ GEMM_MIN_N). Q4_K_M is a mixed scheme — most projections Q4_K,
+            // but ffn_down and some attn_v are Q6_K — so both are required to load
+            // such a model. Any other dtype (F16, …) hits the GEMV `gemv_f32`
+            // fallback and is silently reinterpreted as f32 → garbage; reject here.
             anyhow::ensure!(
                 matches!(
                     wref.dtype,
@@ -1521,7 +1523,7 @@ impl MetalLfm2Model {
     /// prefill dispatch uses this to choose the batched `encode_gemm` over the
     /// per-token GEMV loop; `encode_gemm` self-guards for anything else regardless.
     fn is_batched_gemm_dtype(dtype: DType) -> bool {
-        matches!(dtype, DType::Q4_0 | DType::Q8_0 | DType::Q4KM)
+        matches!(dtype, DType::Q4_0 | DType::Q8_0 | DType::Q4KM | DType::Q6K)
     }
 
     /// True GEMM with simdgroup matrix ops. Falls back to batch GEMV for small n.
@@ -1539,11 +1541,11 @@ impl MetalLfm2Model {
         y_stride: u32,
         accumulate: bool,
     ) {
-        // Q4_0/Q8_0/Q4_K have a batched simdgroup-matrix GEMM. Any other dtype
-        // (Q6_K, F32) is routed to the per-token GEMV fallback below — so
+        // Q4_0/Q8_0/Q4_K/Q6_K have a batched simdgroup-matrix GEMM. Any other
+        // dtype (F32) is routed to the per-token GEMV fallback below — so
         // `encode_gemm` is self-guarding and safe to call with any layer-weight
-        // dtype. Q4_K's GEMM consumes whole super-blocks, so it needs
-        // `k % block_size() == 0` (256 for Q4_K, 32 for Q4_0/Q8_0); a
+        // dtype. The K-quant GEMMs consume whole super-blocks, so they need
+        // `k % block_size() == 0` (256 for Q4_K/Q6_K, 32 for Q4_0/Q8_0); a
         // non-conforming k also falls back.
         //
         // `accumulate` also forces the fallback: the batched GEMM kernels always
@@ -1624,6 +1626,7 @@ impl MetalLfm2Model {
         let gemm_pipeline = match w.dtype {
             DType::Q8_0 => &self.pipelines.gemm_q8_0,
             DType::Q4KM => &self.pipelines.gemm_q4_k,
+            DType::Q6K => &self.pipelines.gemm_q6_k,
             _ => &self.pipelines.gemm_q4_0,
         };
         enc.set_compute_pipeline_state(gemm_pipeline);
