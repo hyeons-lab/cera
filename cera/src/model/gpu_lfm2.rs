@@ -113,6 +113,20 @@ fn f32_binding(buffer: &wgpu::Buffer, len_floats: u64) -> wgpu::BindingResource<
     })
 }
 
+/// Panic if an f32 storage binding of `len_floats` elements would exceed the
+/// adapter's `max_storage_buffer_binding_size`. Shared by every live-range
+/// attention binding so the byte math lives in one place; the multiply
+/// saturates, so an overflow can only over-report and still trip the assert
+/// rather than wrap to a small value that slips past it.
+fn assert_f32_binding_fits(len_floats: u64, max_binding: u64, what: &str) {
+    let bytes = len_floats.saturating_mul(std::mem::size_of::<f32>() as u64);
+    assert!(
+        bytes <= max_binding,
+        "wgpu {what} binding is {bytes} bytes, exceeding adapter \
+         max_storage_buffer_binding_size {max_binding}; context paging is required"
+    );
+}
+
 /// Rows per tile for the tiled LM-head GEMV, so each tile's weight sub-binding
 /// fits `max_binding` and starts at a `offset_alignment`-aligned byte offset.
 /// `elem_size` is the weight element size (4 for f32, 2 for f16).
@@ -1918,12 +1932,10 @@ impl GpuLfm2Model {
              kv_dim={kv_dim}, n_kv_heads={n_kv_heads}, head_dim={head_dim}"
         );
         let kv_live_floats = u64::from(seq_len) * u64::from(kv_dim);
-        let kv_live_bytes = kv_live_floats * std::mem::size_of::<f32>() as u64;
-        assert!(
-            kv_live_bytes <= self.ctx.max_storage_buffer_binding_size,
-            "wgpu flash_attention live KV binding is {kv_live_bytes} bytes, exceeding \
-             adapter max_storage_buffer_binding_size {}; context paging is required",
-            self.ctx.max_storage_buffer_binding_size
+        assert_f32_binding_fits(
+            kv_live_floats,
+            self.ctx.max_storage_buffer_binding_size,
+            "flash_attention live KV",
         );
         let params: [u32; 8] = [
             n_heads,
@@ -3699,20 +3711,16 @@ impl GpuLfm2Model {
         scale: f32,
     ) {
         let kv_live_floats = u64::from(max_seq) * u64::from(kv_dim);
-        let kv_live_bytes = kv_live_floats * std::mem::size_of::<f32>() as u64;
-        assert!(
-            kv_live_bytes <= self.ctx.max_storage_buffer_binding_size,
-            "wgpu attention_prefill live KV binding is {kv_live_bytes} bytes, exceeding \
-             adapter max_storage_buffer_binding_size {}; context paging is required",
-            self.ctx.max_storage_buffer_binding_size
+        assert_f32_binding_fits(
+            kv_live_floats,
+            self.ctx.max_storage_buffer_binding_size,
+            "attention_prefill live KV",
         );
         let scores_live_floats = u64::from(n) * u64::from(n_heads) * u64::from(max_seq);
-        let scores_live_bytes = scores_live_floats * std::mem::size_of::<f32>() as u64;
-        assert!(
-            scores_live_bytes <= self.ctx.max_storage_buffer_binding_size,
-            "wgpu attention_prefill scores binding is {scores_live_bytes} bytes, exceeding \
-             adapter max_storage_buffer_binding_size {}; tiled/paged attention is required",
-            self.ctx.max_storage_buffer_binding_size
+        assert_f32_binding_fits(
+            scores_live_floats,
+            self.ctx.max_storage_buffer_binding_size,
+            "attention_prefill scores",
         );
         let params: [u32; 12] = [
             n_heads,

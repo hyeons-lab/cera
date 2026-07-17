@@ -416,6 +416,16 @@ impl GpuContext {
 
     /// Create a zeroed GPU buffer with read-write storage usage.
     pub fn create_storage_rw(&self, size: u64, label: &str) -> wgpu::Buffer {
+        // Fail fast with the buffer's name if it exceeds the adapter's
+        // `max_buffer_size`. Otherwise wgpu surfaces this asynchronously as an
+        // opaque validation error with no hint at which allocation overflowed —
+        // most likely the full-context KV / scores scratch on a mobile adapter.
+        assert!(
+            size <= self.max_buffer_size,
+            "wgpu storage buffer '{label}' is {size} bytes, exceeding adapter \
+             max_buffer_size {}; a smaller context or paged KV is required",
+            self.max_buffer_size
+        );
         self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size,
