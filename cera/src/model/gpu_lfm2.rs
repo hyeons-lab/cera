@@ -102,6 +102,17 @@ fn lcm_u64(a: u64, b: u64) -> u64 {
     (a / gcd_u64(a, b)) * b
 }
 
+fn f32_binding(buffer: &wgpu::Buffer, len_floats: u64) -> wgpu::BindingResource<'_> {
+    let bytes = len_floats
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+        .expect("f32 storage binding size overflow");
+    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer,
+        offset: 0,
+        size: wgpu::BufferSize::new(bytes.max(4)),
+    })
+}
+
 /// Rows per tile for the tiled LM-head GEMV, so each tile's weight sub-binding
 /// fits `max_binding` and starts at a `offset_alignment`-aligned byte offset.
 /// `elem_size` is the weight element size (4 for f32, 2 for f16).
@@ -1906,6 +1917,14 @@ impl GpuLfm2Model {
             "wgpu flash_attention requires kv_dim == n_kv_heads * head_dim; got \
              kv_dim={kv_dim}, n_kv_heads={n_kv_heads}, head_dim={head_dim}"
         );
+        let kv_live_floats = u64::from(seq_len) * u64::from(kv_dim);
+        let kv_live_bytes = kv_live_floats * std::mem::size_of::<f32>() as u64;
+        assert!(
+            kv_live_bytes <= self.ctx.max_storage_buffer_binding_size,
+            "wgpu flash_attention live KV binding is {kv_live_bytes} bytes, exceeding \
+             adapter max_storage_buffer_binding_size {}; context paging is required",
+            self.ctx.max_storage_buffer_binding_size
+        );
         let params: [u32; 8] = [
             n_heads,
             n_kv_heads,
@@ -1933,11 +1952,11 @@ impl GpuLfm2Model {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: k_cache.as_entire_binding(),
+                        resource: f32_binding(k_cache, kv_live_floats),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: v_cache.as_entire_binding(),
+                        resource: f32_binding(v_cache, kv_live_floats),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
@@ -3679,6 +3698,22 @@ impl GpuLfm2Model {
         out_stride: u32,
         scale: f32,
     ) {
+        let kv_live_floats = u64::from(max_seq) * u64::from(kv_dim);
+        let kv_live_bytes = kv_live_floats * std::mem::size_of::<f32>() as u64;
+        assert!(
+            kv_live_bytes <= self.ctx.max_storage_buffer_binding_size,
+            "wgpu attention_prefill live KV binding is {kv_live_bytes} bytes, exceeding \
+             adapter max_storage_buffer_binding_size {}; context paging is required",
+            self.ctx.max_storage_buffer_binding_size
+        );
+        let scores_live_floats = u64::from(n) * u64::from(n_heads) * u64::from(max_seq);
+        let scores_live_bytes = scores_live_floats * std::mem::size_of::<f32>() as u64;
+        assert!(
+            scores_live_bytes <= self.ctx.max_storage_buffer_binding_size,
+            "wgpu attention_prefill scores binding is {scores_live_bytes} bytes, exceeding \
+             adapter max_storage_buffer_binding_size {}; tiled/paged attention is required",
+            self.ctx.max_storage_buffer_binding_size
+        );
         let params: [u32; 12] = [
             n_heads,
             n_kv_heads,
@@ -3709,11 +3744,11 @@ impl GpuLfm2Model {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: k_cache.as_entire_binding(),
+                        resource: f32_binding(k_cache, kv_live_floats),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: v_cache.as_entire_binding(),
+                        resource: f32_binding(v_cache, kv_live_floats),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
@@ -3721,7 +3756,7 @@ impl GpuLfm2Model {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: self.prefill_scores_buf.as_entire_binding(),
+                        resource: f32_binding(&self.prefill_scores_buf, scores_live_floats),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,

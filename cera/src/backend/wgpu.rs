@@ -109,6 +109,7 @@ pub struct GpuContext {
     pub adapter_name: String,
     pub backend: String,
     pub max_storage_buffer_binding_size: u64,
+    pub max_buffer_size: u64,
     pub min_storage_buffer_offset_alignment: u64,
     pub preprocessor: Preprocessor,
     /// Timestamp profiling (None if TIMESTAMP_QUERY not supported).
@@ -323,6 +324,8 @@ impl GpuContext {
         tracing::info!(
             adapter = %adapter_name,
             backend = %backend,
+            max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size,
+            max_buffer_size = adapter_limits.max_buffer_size,
             min_subgroup_size = adapter_limits.min_subgroup_size,
             "GPU initialized"
         );
@@ -333,6 +336,7 @@ impl GpuContext {
             adapter_name,
             backend,
             max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size as u64,
+            max_buffer_size: adapter_limits.max_buffer_size,
             min_storage_buffer_offset_alignment: adapter_limits.min_storage_buffer_offset_alignment
                 as u64,
             preprocessor,
