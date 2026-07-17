@@ -1715,6 +1715,24 @@ mod tests {
         }
     }
 
+    /// Canary: the reg-tile parity tests below hardcode the production tile
+    /// geometry in their pipeline defines (`TILE_M=8u`, `TILE_N=4u`) and dispatch
+    /// divisors. If the production constants change without those tests being
+    /// updated, the shipped geometry silently loses parity coverage — the exact
+    /// drift that once left the 8×4 GEMM untested. This fails loudly instead.
+    #[test]
+    fn reg_tile_parity_tests_match_production_geometry() {
+        assert_eq!(
+            (
+                crate::model::gpu_lfm2::MUL_MAT_TILE_M,
+                crate::model::gpu_lfm2::MUL_MAT_TILE_N,
+            ),
+            (8, 4),
+            "production reg-tile geometry changed; update the hardcoded TILE_M/TILE_N \
+             defines and dispatch divisors in the mul_mat reg-tile parity tests to match"
+        );
+    }
+
     /// Q4_0 reg-tile parity at the **production** vec geometry
     /// (`MUL_MAT_TILE_M = 8`, `MUL_MAT_TILE_N = 4`, `WORKGROUP_SIZE_N = 32`).
     /// The other Q4_0 vec test runs TILE_M=4, so its vec4 store loop

@@ -44,8 +44,8 @@ const MUL_MAT_TILE_WG_N: u32 = 32;
 // `adapter.limits()`; PowerVR/Adreno/Mali expose 32 KB). Raising TILE_N or TILE_M
 // further must re-check `max_compute_workgroup_storage_size`, or pipeline creation
 // fails at runtime on the target GPU.
-const MUL_MAT_TILE_M: u32 = 8;
-const MUL_MAT_TILE_N: u32 = 4;
+pub(crate) const MUL_MAT_TILE_M: u32 = 8;
+pub(crate) const MUL_MAT_TILE_N: u32 = 4;
 const MUL_MAT_TILE_K: u32 = 32;
 
 /// Build a `mul_mat_reg_tile` pipeline for the requested variant.
