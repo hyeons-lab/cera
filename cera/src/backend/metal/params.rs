@@ -2,11 +2,11 @@
 //! dense-transformer, and audio-decoder inference paths (`metal.rs`,
 //! `metal_lfm2.rs`, `metal_audio_decoder.rs`).
 //!
-//! This is not yet every param struct in `backend/shaders/*.metal`: the ViT vision
-//! encoder (`vision_encoder_gpu.rs` / `MetalVitOps`) still hand-rolls the untyped
-//! `[u32; N]` uploads this module exists to replace, so the NaN class below is closed
-//! for text/audio inference but not crate-wide. Migrating those call sites here is the
-//! remaining work.
+//! This mirrors the `constant … & params` structs across the Metal text, audio, *and*
+//! ViT vision-encoder (`vision_encoder_gpu.rs` / `MetalVitOps`) paths, uploading each via
+//! [`MetalParams::set`] with a `size_of_val`-derived length. The untyped `[u32; N]`
+//! uploads this module exists to replace are gone, so the NaN class below is closed
+//! crate-wide.
 //!
 //! # Why these are named types and not `[u32; N]`
 //!
@@ -403,3 +403,47 @@ pub struct KvCopyParams {
 }
 const _: () = assert!(size_of::<KvCopyParams>() == 16);
 impl MetalParams for KvCopyParams {}
+
+// ── ViT vision encoder ────────────────────────────────────────────────────────────
+
+/// Mirror of `Params` in `shaders/vit_linear.metal` (the dense-weight ViT GEMM).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VitLinearParams {
+    pub m: u32,
+    pub k: u32,
+    pub n: u32,
+    pub _pad: u32,
+}
+const _: () = assert!(size_of::<VitLinearParams>() == 16);
+impl MetalParams for VitLinearParams {}
+
+/// Mirror of `Params` in `shaders/vit_attention.metal` **and** `VitAttnParams` in
+/// `shaders/vit_attention_mma.metal` — the scalar and flash-MMA ViT attention kernels
+/// declare the identical layout, so one type guards both (two `metal_params_layout`
+/// cases). `scale_bits` is `(1/sqrt(head_dim)).to_bits()`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VitAttnParams {
+    pub tokens: u32,
+    pub n_head: u32,
+    pub head_dim: u32,
+    pub scale_bits: u32,
+}
+const _: () = assert!(size_of::<VitAttnParams>() == 16);
+impl MetalParams for VitAttnParams {}
+
+/// Mirror of `Params` in `shaders/layernorm_batch.metal` (the ViT LayerNorm).
+///
+/// Distinct from [`RmsNormBatchParams`]: LayerNorm has no residual-scale field, so it is
+/// four uints, not five. `src_stride`/`dst_stride` are both `dim` in the ViT caller.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerNormBatchParams {
+    pub n: u32,
+    pub eps_bits: u32,
+    pub src_stride: u32,
+    pub dst_stride: u32,
+}
+const _: () = assert!(size_of::<LayerNormBatchParams>() == 16);
+impl MetalParams for LayerNormBatchParams {}
