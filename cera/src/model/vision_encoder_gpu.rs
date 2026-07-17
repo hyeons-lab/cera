@@ -1035,7 +1035,13 @@ pub enum MetalVitWeight {
     },
 }
 
-/// Native-Metal implementation of [`VitGpuOps`]. Mirrors [`WgpuVitOps`] using
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+use crate::backend::metal::params::{
+    BiasAddParams, ElementwiseParams, LayerNormBatchParams, MetalParams, QuantGemmParams,
+    VitAttnParams, VitLinearParams,
+};
+
+/// Native-Metal implementation of [`VitGpuOps`]. Mirrors `WgpuVitOps` using
 /// MSL kernels. Each op runs in its own command buffer and blocks on
 /// `wait_until_completed`, so `download` always sees current data (unified
 /// memory on Apple Silicon).
@@ -1074,13 +1080,14 @@ impl MetalVitOps {
         })
     }
 
-    /// Run one kernel in its own command buffer: bind `bufs` at slots 0.. then
-    /// `params` (as bytes) at the next slot, dispatch, and block until done.
-    fn run(
+    /// Run one kernel in its own command buffer: bind `bufs` at slots 0.. then the typed
+    /// `params` at the next slot (length from `size_of_val`, never a literal), dispatch,
+    /// and block until done.
+    fn run<P: MetalParams>(
         &self,
         pipe: &metal::ComputePipelineState,
         bufs: &[&metal::Buffer],
-        params: &[u8],
+        params: &P,
         grid: metal::MTLSize,
         threads: metal::MTLSize,
     ) {
@@ -1090,11 +1097,7 @@ impl MetalVitOps {
         for (i, b) in bufs.iter().enumerate() {
             enc.set_buffer(i as u64, Some(b), 0);
         }
-        enc.set_bytes(
-            bufs.len() as u64,
-            params.len() as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, bufs.len() as u64);
         enc.dispatch_thread_groups(grid, threads);
         enc.end_encoding();
         cb.commit();
@@ -1116,26 +1119,22 @@ impl MetalVitOps {
         out_dim: usize,
         in_dim: usize,
     ) {
-        // GemmParams { m, k, n, x_stride, y_stride, _pad/accumulate=0 }.
-        let params: [u32; 6] = [
-            out_dim as u32,
-            in_dim as u32,
-            tokens as u32,
-            in_dim as u32,
-            out_dim as u32,
-            0,
-        ];
+        // These GEMM kernels never read `_pad`, so they always plain-store (no accumulate).
+        let params = QuantGemmParams {
+            m: out_dim as u32,
+            k: in_dim as u32,
+            n: tokens as u32,
+            x_stride: in_dim as u32,
+            y_stride: out_dim as u32,
+            _pad: 0,
+        };
         let cb = self.ctx.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(pipe);
         enc.set_buffer(0, Some(wq), 0);
         enc.set_buffer(1, Some(x), 0);
         enc.set_buffer(2, Some(y), 0);
-        enc.set_bytes(
-            3,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 3);
         enc.set_threadgroup_memory_length(0, 8192); // 4 KB weights + 4 KB input
         enc.dispatch_thread_groups(
             // (ceil(tokens/32), ceil(out_dim/64)) tiles × 128 threads (4 simdgroups).
@@ -1169,12 +1168,12 @@ impl MetalVitOps {
     ) {
         const Q_PER_TG: u64 = 8;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let params: [u32; 4] = [
-            tokens as u32,
-            n_head as u32,
-            head_dim as u32,
-            scale.to_bits(),
-        ];
+        let params = VitAttnParams {
+            tokens: tokens as u32,
+            n_head: n_head as u32,
+            head_dim: head_dim as u32,
+            scale_bits: scale.to_bits(),
+        };
         // q_tg + kv_tile (half) + scores + out_tg + state + rescales (f32)
         // = 2·(8+64)·hd + 4·(8·64 + 8·hd + 8·2 + 8) bytes = 176·hd + 2144.
         let shmem = 176 * head_dim as u64 + 2144;
@@ -1191,11 +1190,7 @@ impl MetalVitOps {
         enc.set_buffer(1, Some(k), 0);
         enc.set_buffer(2, Some(v), 0);
         enc.set_buffer(3, Some(out), 0);
-        enc.set_bytes(
-            4,
-            std::mem::size_of_val(&params) as u64,
-            params.as_ptr() as *const _,
-        );
+        params.set(enc, 4);
         enc.set_threadgroup_memory_length(0, shmem);
         enc.dispatch_thread_groups(
             metal::MTLSize::new(n_head as u64 * (tokens as u64).div_ceil(Q_PER_TG), 1, 1),
@@ -1255,11 +1250,16 @@ impl VitGpuOps for MetalVitOps {
                 self.run_gemm_quant(pipe, buf, x, &y, tokens, out_dim, in_dim);
             }
             MetalVitWeight::Dense(wbuf) => {
-                let params: [u32; 4] = [out_dim as u32, in_dim as u32, tokens as u32, 0];
+                let params = VitLinearParams {
+                    m: out_dim as u32,
+                    k: in_dim as u32,
+                    n: tokens as u32,
+                    _pad: 0,
+                };
                 self.run(
                     &self.p_linear,
                     &[wbuf, x, &y],
-                    bytemuck::cast_slice(&params),
+                    &params,
                     metal::MTLSize::new(out_dim as u64, tokens as u64, 1),
                     metal::MTLSize::new(32, 1, 1),
                 );
@@ -1270,11 +1270,14 @@ impl VitGpuOps for MetalVitOps {
 
     fn bias_add(&self, x: &Self::Buf, bias: &Self::Buf, rows: usize, dim: usize) {
         let total = (rows * dim) as u32;
-        let params: [u32; 2] = [total, dim as u32];
+        let params = BiasAddParams {
+            total,
+            dim: dim as u32,
+        };
         self.run(
             &self.p_bias,
             &[x, bias],
-            bytemuck::cast_slice(&params),
+            &params,
             metal::MTLSize::new(total.div_ceil(256) as u64, 1, 1),
             metal::MTLSize::new(256, 1, 1),
         );
@@ -1290,11 +1293,16 @@ impl VitGpuOps for MetalVitOps {
         dim: usize,
     ) -> Self::Buf {
         let dst = self.ctx.create_buffer((rows * dim * 4) as u64);
-        let params: [u32; 4] = [dim as u32, eps.to_bits(), dim as u32, dim as u32];
+        let params = LayerNormBatchParams {
+            n: dim as u32,
+            eps_bits: eps.to_bits(),
+            src_stride: dim as u32,
+            dst_stride: dim as u32,
+        };
         self.run(
             &self.p_layernorm,
             &[src, &dst, weight, bias],
-            bytemuck::cast_slice(&params),
+            &params,
             metal::MTLSize::new(rows as u64, 1, 1),
             metal::MTLSize::new(256, 1, 1),
         );
@@ -1302,11 +1310,10 @@ impl VitGpuOps for MetalVitOps {
     }
 
     fn gelu(&self, x: &Self::Buf, len: usize) {
-        let params: [u32; 2] = [len as u32, 0];
         self.run(
             &self.p_gelu,
             &[x],
-            bytemuck::cast_slice(&params),
+            &ElementwiseParams::new(len as u32),
             metal::MTLSize::new((len as u64).div_ceil(256), 1, 1),
             metal::MTLSize::new(256, 1, 1),
         );
@@ -1332,16 +1339,16 @@ impl VitGpuOps for MetalVitOps {
             self.run_attn_mma(q, k, v, &out, tokens, n_head, head_dim);
         } else {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
-            let params: [u32; 4] = [
-                tokens as u32,
-                n_head as u32,
-                head_dim as u32,
-                scale.to_bits(),
-            ];
+            let params = VitAttnParams {
+                tokens: tokens as u32,
+                n_head: n_head as u32,
+                head_dim: head_dim as u32,
+                scale_bits: scale.to_bits(),
+            };
             self.run(
                 &self.p_attn,
                 &[q, k, v, &out],
-                bytemuck::cast_slice(&params),
+                &params,
                 metal::MTLSize::new(tokens as u64, n_head as u64, 1),
                 metal::MTLSize::new(256, 1, 1),
             );
@@ -1350,11 +1357,10 @@ impl VitGpuOps for MetalVitOps {
     }
 
     fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize) {
-        let params: [u32; 2] = [len as u32, 0];
         self.run(
             &self.p_add,
             &[dst, src],
-            bytemuck::cast_slice(&params),
+            &ElementwiseParams::new(len as u32),
             metal::MTLSize::new((len as u64).div_ceil(256), 1, 1),
             metal::MTLSize::new(256, 1, 1),
         );

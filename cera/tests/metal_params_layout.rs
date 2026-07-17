@@ -221,6 +221,39 @@ fn cases() -> Vec<(usize, &'static str, &'static str, &'static str)> {
             "Params",
             "Conv1dBatchParams",
         ),
+        // ViT vision encoder (`MetalVitOps`).
+        (
+            size_of::<VitLinearParams>(),
+            shaders::VIT_LINEAR,
+            "Params",
+            "VitLinearParams",
+        ),
+        // One `VitAttnParams` mirrors both ViT attention kernels — guard each shader.
+        (
+            size_of::<VitAttnParams>(),
+            shaders::VIT_ATTENTION,
+            "Params",
+            "VitAttnParams (scalar)",
+        ),
+        (
+            size_of::<VitAttnParams>(),
+            shaders::VIT_ATTENTION_MMA,
+            "VitAttnParams",
+            "VitAttnParams (mma)",
+        ),
+        (
+            size_of::<LayerNormBatchParams>(),
+            shaders::LAYERNORM_BATCH,
+            "Params",
+            "LayerNormBatchParams",
+        ),
+        // `ElementwiseParams` is reused for `gelu.metal`, which has its own `Params`.
+        (
+            size_of::<ElementwiseParams>(),
+            shaders::GELU,
+            "Params",
+            "ElementwiseParams (gelu)",
+        ),
     ]
 }
 
