@@ -11,6 +11,8 @@ profiles live alongside this file:
 - [`deltas_table.md`](deltas_table.md) — per-optimization deltas
 - [`profile_longctx.md`](profile_longctx.md) — long-context prefill profiling
 - [`cache_compare.md`](cache_compare.md) — KV-cache comparison
+- [`../docs/GPU_CONTEXT_PERFORMANCE_PLAN.md`](../docs/GPU_CONTEXT_PERFORMANCE_PLAN.md)
+  — wgpu context-size and performance plan based on current GPU findings
 
 ## CPU throughput
 

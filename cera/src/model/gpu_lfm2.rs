@@ -102,6 +102,31 @@ fn lcm_u64(a: u64, b: u64) -> u64 {
     (a / gcd_u64(a, b)) * b
 }
 
+fn f32_binding(buffer: &wgpu::Buffer, len_floats: u64) -> wgpu::BindingResource<'_> {
+    let bytes = len_floats
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+        .expect("f32 storage binding size overflow");
+    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer,
+        offset: 0,
+        size: wgpu::BufferSize::new(bytes.max(4)),
+    })
+}
+
+/// Panic if an f32 storage binding of `len_floats` elements would exceed the
+/// adapter's `max_storage_buffer_binding_size`. Shared by every live-range
+/// attention binding so the byte math lives in one place; the multiply
+/// saturates, so an overflow can only over-report and still trip the assert
+/// rather than wrap to a small value that slips past it.
+fn assert_f32_binding_fits(len_floats: u64, max_binding: u64, what: &str) {
+    let bytes = len_floats.saturating_mul(std::mem::size_of::<f32>() as u64);
+    assert!(
+        bytes <= max_binding,
+        "wgpu {what} binding is {bytes} bytes, exceeding adapter \
+         max_storage_buffer_binding_size {max_binding}; context paging is required"
+    );
+}
+
 /// Rows per tile for the tiled LM-head GEMV, so each tile's weight sub-binding
 /// fits `max_binding` and starts at a `offset_alignment`-aligned byte offset.
 /// `elem_size` is the weight element size (4 for f32, 2 for f16).
@@ -1906,6 +1931,15 @@ impl GpuLfm2Model {
             "wgpu flash_attention requires kv_dim == n_kv_heads * head_dim; got \
              kv_dim={kv_dim}, n_kv_heads={n_kv_heads}, head_dim={head_dim}"
         );
+        // Saturate the element count: on absurd configs an overflow pins to
+        // u64::MAX and trips the binding-size assert below rather than wrapping to
+        // a small value that would bind a too-short range and slip past the guard.
+        let kv_live_floats = u64::from(seq_len).saturating_mul(u64::from(kv_dim));
+        assert_f32_binding_fits(
+            kv_live_floats,
+            self.ctx.max_storage_buffer_binding_size,
+            "flash_attention live KV",
+        );
         let params: [u32; 8] = [
             n_heads,
             n_kv_heads,
@@ -1933,11 +1967,11 @@ impl GpuLfm2Model {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: k_cache.as_entire_binding(),
+                        resource: f32_binding(k_cache, kv_live_floats),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: v_cache.as_entire_binding(),
+                        resource: f32_binding(v_cache, kv_live_floats),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
@@ -3679,6 +3713,24 @@ impl GpuLfm2Model {
         out_stride: u32,
         scale: f32,
     ) {
+        // Saturating multiplies so an overflowing element count pins to u64::MAX
+        // and trips the binding-size asserts below, rather than wrapping to a small
+        // value that would bind a too-short range and slip past the guard. The
+        // scores count multiplies three u32s, whose product can exceed u64.
+        let kv_live_floats = u64::from(max_seq).saturating_mul(u64::from(kv_dim));
+        assert_f32_binding_fits(
+            kv_live_floats,
+            self.ctx.max_storage_buffer_binding_size,
+            "attention_prefill live KV",
+        );
+        let scores_live_floats = u64::from(n)
+            .saturating_mul(u64::from(n_heads))
+            .saturating_mul(u64::from(max_seq));
+        assert_f32_binding_fits(
+            scores_live_floats,
+            self.ctx.max_storage_buffer_binding_size,
+            "attention_prefill scores",
+        );
         let params: [u32; 12] = [
             n_heads,
             n_kv_heads,
@@ -3709,11 +3761,11 @@ impl GpuLfm2Model {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: k_cache.as_entire_binding(),
+                        resource: f32_binding(k_cache, kv_live_floats),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: v_cache.as_entire_binding(),
+                        resource: f32_binding(v_cache, kv_live_floats),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
@@ -3721,7 +3773,7 @@ impl GpuLfm2Model {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: self.prefill_scores_buf.as_entire_binding(),
+                        resource: f32_binding(&self.prefill_scores_buf, scores_live_floats),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,

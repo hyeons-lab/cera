@@ -109,6 +109,7 @@ pub struct GpuContext {
     pub adapter_name: String,
     pub backend: String,
     pub max_storage_buffer_binding_size: u64,
+    pub max_buffer_size: u64,
     pub min_storage_buffer_offset_alignment: u64,
     pub preprocessor: Preprocessor,
     /// Timestamp profiling (None if TIMESTAMP_QUERY not supported).
@@ -323,6 +324,8 @@ impl GpuContext {
         tracing::info!(
             adapter = %adapter_name,
             backend = %backend,
+            max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size,
+            max_buffer_size = adapter_limits.max_buffer_size,
             min_subgroup_size = adapter_limits.min_subgroup_size,
             "GPU initialized"
         );
@@ -333,6 +336,7 @@ impl GpuContext {
             adapter_name,
             backend,
             max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size as u64,
+            max_buffer_size: adapter_limits.max_buffer_size,
             min_storage_buffer_offset_alignment: adapter_limits.min_storage_buffer_offset_alignment
                 as u64,
             preprocessor,
@@ -344,6 +348,7 @@ impl GpuContext {
 
     /// Upload data to a GPU storage buffer.
     pub fn upload_storage(&self, data: &[u8], label: &str) -> wgpu::Buffer {
+        self.assert_within_max_buffer(data.len() as u64, label);
         self.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
@@ -366,6 +371,7 @@ impl GpuContext {
     pub fn upload_f32_as_f16(&self, data: &[f32], label: &str) -> wgpu::Buffer {
         let byte_size = (data.len() * 2) as u64;
         let aligned_size = byte_size.div_ceil(4) * 4;
+        self.assert_within_max_buffer(aligned_size, label);
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: aligned_size,
@@ -410,8 +416,24 @@ impl GpuContext {
         buffer
     }
 
+    /// Fail fast, naming the buffer, when an allocation exceeds the adapter's
+    /// `max_buffer_size`. Otherwise wgpu surfaces this asynchronously as an opaque
+    /// validation error with no hint at which allocation overflowed — most likely
+    /// the full-context KV / scores scratch or a large weight upload on a mobile
+    /// adapter. Shared by every buffer-creating entry point so the diagnostic is
+    /// uniform across scratch buffers and weight uploads.
+    fn assert_within_max_buffer(&self, size: u64, label: &str) {
+        assert!(
+            size <= self.max_buffer_size,
+            "wgpu buffer '{label}' is {size} bytes, exceeding adapter \
+             max_buffer_size {}; a smaller context or paged KV is required",
+            self.max_buffer_size
+        );
+    }
+
     /// Create a zeroed GPU buffer with read-write storage usage.
     pub fn create_storage_rw(&self, size: u64, label: &str) -> wgpu::Buffer {
+        self.assert_within_max_buffer(size, label);
         self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size,

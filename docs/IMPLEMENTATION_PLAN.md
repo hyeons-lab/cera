@@ -319,6 +319,12 @@ Ordered by estimated impact. Many can be worked in parallel.
 ### V2.1: Server + Continuous Batching — 3-4 weeks ⬜
 OpenAI-compatible HTTP server (axum + SSE), continuous batching scheduler, paged attention (replaces contiguous KV cache), request queue, Prometheus metrics, preemption.
 
+> GPU context-size/performance follow-up: see
+> [`GPU_CONTEXT_PERFORMANCE_PLAN.md`](GPU_CONTEXT_PERFORMANCE_PLAN.md). The wgpu
+> backend currently hits adapter storage-binding limits when a full contiguous KV
+> range is too large; the plan breaks this into active-range binding, paged KV,
+> and page-aware tiled flash attention.
+
 ### V2.2: Browser / WASM — 3-4 weeks ✅ DONE
 WASM build (dual: threaded + single-threaded), wasm-bindgen-rayon for multi-threaded CPU, Web Worker architecture, OPFS model caching, JS API + npm package, Chrome enhanced (subgroups, dot4U8Packed, f16), Safari baseline (f16, standard WGSL), feature detection.
 
