@@ -5111,12 +5111,23 @@ mod tests {
     }
 
     fn attn_prefill_fixture() -> AttnPrefillFixture {
-        let n_heads: u32 = 4;
-        let n_kv_heads: u32 = 2; // GQA
-        let head_dim: u32 = 32;
+        // Small case: GQA, non-zero start_pos, sub-tile seq_len.
+        build_attn_prefill_fixture(4, 2, 32, 5, 3)
+    }
+
+    /// Build a prefill-attention fixture (batched Q, causal GQA K/V, and a CPU
+    /// reference output) for the given shape. Q/K/V use bounded (trig) values so
+    /// the softmax stays well-conditioned at any seq_len — the long-KV test drives
+    /// max_seq past several 256-key tiles, where unbounded magnitudes would make
+    /// the softmax degenerate into an argmax.
+    fn build_attn_prefill_fixture(
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        n_queries: u32,
+        start_pos: u32,
+    ) -> AttnPrefillFixture {
         let kv_dim = n_kv_heads * head_dim;
-        let n_queries: u32 = 5;
-        let start_pos: u32 = 3;
         let max_seq = start_pos + n_queries;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let q_stride = n_heads * head_dim;
@@ -5124,12 +5135,24 @@ mod tests {
         let group_size = n_heads / n_kv_heads;
 
         // Build Q (per-token × per-head), K cache (max_seq × kv_dim), V cache.
+        // Bounded trig values keep dot products O(head_dim) regardless of t so the
+        // softmax stays well-conditioned. Channel d == 0 is reserved as a position
+        // ramp: q[..,0] is a fixed positive constant and k[t,..,0] grows linearly
+        // with t, so a key's score rises with its position. This gives the per-tile
+        // maxima real dynamic range across the online-softmax key tiles — the
+        // running-max correction factor is meaningfully < 1 — so the long-KV test
+        // actually exercises the FlashAttention rescale instead of a corr ≈ 1 no-op
+        // (near-periodic trig alone makes every tile's max nearly identical).
         let mut q_batch = vec![0.0f32; (n_queries * q_stride) as usize];
         for q in 0..n_queries {
             for h in 0..n_heads {
                 for d in 0..head_dim {
-                    let v = ((q as f32 + 1.0) * ((h as f32 + 1.0) * (d as f32 + 1.0))) * 0.013;
-                    q_batch[(q * q_stride + h * head_dim + d) as usize] = v;
+                    let val = if d == 0 {
+                        1.0
+                    } else {
+                        (((q + 1) * (h + 1) + d) as f32 * 0.05).sin()
+                    };
+                    q_batch[(q * q_stride + h * head_dim + d) as usize] = val;
                 }
             }
         }
@@ -5138,10 +5161,14 @@ mod tests {
         for t in 0..max_seq {
             for kh in 0..n_kv_heads {
                 for d in 0..head_dim {
-                    let kv = ((t as f32 + 1.0) * (kh as f32 + 1.0) * (d as f32 + 0.5)) * 0.011;
-                    let vv = ((t as f32 + 1.0) * (kh as f32 + 2.0) * (d as f32 + 1.5)) * 0.017;
+                    let kv = if d == 0 {
+                        t as f32 * 0.02 // position ramp (see above)
+                    } else {
+                        (((t + 1) * (kh + 1) + d) as f32 * 0.03).cos()
+                    };
+                    let va = ((t + 1) * (kh + 2) + d) as f32 * 0.02;
                     k_cache[(t * kv_dim + kh * head_dim + d) as usize] = kv;
-                    v_cache[(t * kv_dim + kh * head_dim + d) as usize] = vv;
+                    v_cache[(t * kv_dim + kh * head_dim + d) as usize] = va.sin();
                 }
             }
         }
@@ -5197,186 +5224,45 @@ mod tests {
         }
     }
 
-    /// `attention_prefill` parity: batched attention over N queries matches the
-    /// CPU reference at every (token, head, dim) cell. Covers GQA, non-zero
-    /// start_pos, and a multi-query prefill.
-    #[test]
-    fn test_gpu_attention_prefill_parity() {
-        let ctx = match GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(_) => return,
-        };
-
-        let AttnPrefillFixture {
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            kv_dim,
-            n_queries,
-            start_pos,
-            max_seq,
-            scale,
-            q_stride,
-            out_stride,
-            q_batch,
-            k_cache,
-            v_cache,
-            ref_out,
-        } = attn_prefill_fixture();
-
-        // ─── Batched GPU run ───────────────────────────────────────────────
+    /// Run `attention_prefill` over the whole query batch and return the
+    /// downloaded output. Queries are dispatched in sub-batches of at most `tile`,
+    /// each with its own `q_base` offset — so `tile == n_queries` is the single
+    /// dispatch the production host uses, and a smaller `tile` exercises the
+    /// shader's `q_base` offset arithmetic (q_global / out_offset / causal pos).
+    fn run_gpu_attention_prefill_tiled(
+        ctx: &GpuContext,
+        f: &AttnPrefillFixture,
+        tile: u32,
+    ) -> Vec<f32> {
+        assert!(tile > 0, "tile must be > 0 (0 would never advance q_base)");
         let pipeline = ctx.create_pipeline(
             shaders::ATTENTION_PREFILL,
             "attention_prefill",
             "attention_prefill",
         );
-        let q_buf = ctx.upload_f32(&q_batch, "q");
-        let k_buf = ctx.upload_f32(&k_cache, "k");
-        let v_buf = ctx.upload_f32(&v_cache, "v");
-        let out_buf = ctx.create_storage_rw((ref_out.len() as u64) * 4, "out");
-        // Per-(query, head) scratch slab; sized to max_seq even though most
-        // queries use less.
-        let scores_buf =
-            ctx.create_storage_rw(((n_queries * n_heads * max_seq) as u64) * 4, "scores");
-        let params: [u32; 12] = [
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            kv_dim,
-            max_seq,
-            scale.to_bits(),
-            start_pos,
-            n_queries,
-            q_stride,
-            out_stride,
-            0,
-            0,
-        ];
-        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+        let q_buf = ctx.upload_f32(&f.q_batch, "q");
+        let k_buf = ctx.upload_f32(&f.k_cache, "k");
+        let v_buf = ctx.upload_f32(&f.v_cache, "v");
+        let out_buf = ctx.create_storage_rw((f.ref_out.len() as u64) * 4, "out");
 
-        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: q_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: k_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: v_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: out_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: scores_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: p_buf.as_entire_binding(),
-                },
-            ],
-        });
-        let mut enc = ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(n_heads, n_queries, 1);
-        }
-        ctx.submit_encoder(enc);
-
-        let got = ctx.download_f32(&out_buf, ref_out.len());
-
-        let tol = 1e-4f32;
-        for i in 0..ref_out.len() {
-            let diff = (ref_out[i] - got[i]).abs();
-            assert!(
-                diff < tol,
-                "attention_prefill mismatch at idx {i} \
-                 (token {}, head {}, dim {}): cpu={}, gpu={}, diff={diff}",
-                i / out_stride as usize,
-                (i % out_stride as usize) / head_dim as usize,
-                i % head_dim as usize,
-                ref_out[i],
-                got[i]
-            );
-        }
-    }
-
-    /// `attention_prefill` query-tiling parity: dispatching the query batch in
-    /// several `q_base`-offset sub-batches — each with a scores binding sized to
-    /// only that sub-batch — produces the same output as a single dispatch. This
-    /// is the long-context path in `encode_attention_prefill`, which tiles the
-    /// query dimension so the `scores_buf` binding stays under the adapter's
-    /// storage-binding limit. Validated here independent of the adapter's actual
-    /// limit (this Mac reports 4 GB, so production never tiles locally).
-    #[test]
-    fn test_gpu_attention_prefill_query_tiling() {
-        let ctx = match GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(_) => return,
-        };
-
-        let AttnPrefillFixture {
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            kv_dim,
-            n_queries,
-            start_pos,
-            max_seq,
-            scale,
-            q_stride,
-            out_stride,
-            q_batch,
-            k_cache,
-            v_cache,
-            ref_out,
-        } = attn_prefill_fixture();
-
-        let pipeline = ctx.create_pipeline(
-            shaders::ATTENTION_PREFILL,
-            "attention_prefill",
-            "attention_prefill",
-        );
-        let q_buf = ctx.upload_f32(&q_batch, "q");
-        let k_buf = ctx.upload_f32(&k_cache, "k");
-        let v_buf = ctx.upload_f32(&v_cache, "v");
-        let out_buf = ctx.create_storage_rw((ref_out.len() as u64) * 4, "out");
-
-        // Tile the 5 queries into sub-batches of 2 → q_base = 0, 2, 4. Each
-        // dispatch gets a scores buffer sized to ONLY its sub-batch, proving the
-        // per-dispatch binding shrinks with the tile, and writes into the shared
-        // out_buf at its `q_base` offset.
-        let tile: u32 = 2;
         let mut q_base = 0u32;
-        while q_base < n_queries {
-            let n_sub = (n_queries - q_base).min(tile);
-            let scores_buf =
-                ctx.create_storage_rw(((n_sub * n_heads * max_seq) as u64) * 4, "scores_tile");
+        while q_base < f.n_queries {
+            let n_sub = (f.n_queries - q_base).min(tile);
             let params: [u32; 12] = [
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                kv_dim,
-                max_seq,
-                scale.to_bits(),
-                start_pos,
+                f.n_heads,
+                f.n_kv_heads,
+                f.head_dim,
+                f.kv_dim,
+                f.max_seq,
+                f.scale.to_bits(),
+                f.start_pos,
                 n_sub,
-                q_stride,
-                out_stride,
+                f.q_stride,
+                f.out_stride,
                 q_base,
                 0,
             ];
-            let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params_tile");
+            let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
             let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &pipeline.get_bind_group_layout(0),
@@ -5399,10 +5285,6 @@ mod tests {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: scores_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
                         resource: p_buf.as_entire_binding(),
                     },
                 ],
@@ -5412,26 +5294,196 @@ mod tests {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &bg, &[]);
-                pass.dispatch_workgroups(n_heads, n_sub, 1);
+                pass.dispatch_workgroups(f.n_heads, n_sub, 1);
             }
             ctx.submit_encoder(enc);
             q_base += n_sub;
         }
+        ctx.download_f32(&out_buf, f.ref_out.len())
+    }
 
-        let got = ctx.download_f32(&out_buf, ref_out.len());
-        let tol = 1e-4f32;
-        for i in 0..ref_out.len() {
-            let diff = (ref_out[i] - got[i]).abs();
+    /// Run `attention_prefill` in a single dispatch over the whole query batch (the
+    /// production path) and return the downloaded output.
+    fn run_gpu_attention_prefill(ctx: &GpuContext, f: &AttnPrefillFixture) -> Vec<f32> {
+        run_gpu_attention_prefill_tiled(ctx, f, f.n_queries)
+    }
+
+    /// Assert a downloaded prefill output matches the fixture's CPU reference.
+    /// Tolerance is the flash form `1e-3 + 1e-3·|ref|` — online-softmax
+    /// accumulation order differs from the CPU's batched order, so exact equality
+    /// does not hold (same tolerance as `test_gpu_flash_attention_matches_cpu`).
+    fn assert_attn_prefill_matches(f: &AttnPrefillFixture, got: &[f32], label: &str) {
+        for (i, &g) in got.iter().enumerate() {
+            let r = f.ref_out[i];
+            let tol = 1e-3f32 + 1e-3f32 * r.abs();
+            let diff = (r - g).abs();
             assert!(
-                diff < tol,
-                "tiled attention_prefill mismatch at idx {i} \
-                 (token {}, head {}, dim {}): cpu={}, gpu={}, diff={diff}",
-                i / out_stride as usize,
-                (i % out_stride as usize) / head_dim as usize,
-                i % head_dim as usize,
-                ref_out[i],
-                got[i]
+                diff <= tol,
+                "{label} mismatch at idx {i} (token {}, head {}, dim {}): \
+                 cpu={r}, gpu={g}, diff={diff}",
+                i / f.out_stride as usize,
+                (i % f.out_stride as usize) / f.head_dim as usize,
+                i % f.head_dim as usize,
             );
+        }
+    }
+
+    /// `attention_prefill` parity: batched attention over N queries matches the
+    /// CPU reference at every (token, head, dim) cell. Covers GQA, non-zero
+    /// start_pos, and a multi-query prefill.
+    #[test]
+    fn test_gpu_attention_prefill_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let f = attn_prefill_fixture();
+        let got = run_gpu_attention_prefill(&ctx, &f);
+        assert_attn_prefill_matches(&f, &got, "attention_prefill");
+    }
+
+    /// `attention_prefill` long-KV parity: a causal window spanning several
+    /// 256-key online-softmax tiles (with the boundary landing mid-tile) matches
+    /// the CPU reference. This is the case the pre-flash shader could not run under
+    /// a 128 MiB storage-binding limit — its scores slab was
+    /// `n_queries × n_heads × max_seq`; the flash kernel bounds workgroup memory to
+    /// one TILE regardless of KV depth, so this exercises the running-max rescale
+    /// across tiles.
+    #[test]
+    fn test_gpu_attention_prefill_long_kv() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        // start_pos 900 + 200 queries → last query seq_len 1100 > 4 × TILE(256).
+        let f = build_attn_prefill_fixture(4, 2, 32, 200, 900);
+        assert!(
+            f.max_seq > 4 * 256,
+            "long-KV fixture must span >4 key tiles; got max_seq={}",
+            f.max_seq
+        );
+        let got = run_gpu_attention_prefill(&ctx, &f);
+        assert_attn_prefill_matches(&f, &got, "long-kv attention_prefill");
+    }
+
+    /// `attention_prefill` degenerate causal window: start_pos 0, a single query
+    /// attends exactly one key (seq_len == 1) — guards the single-element tile
+    /// reduction and the seq_len boundary logic.
+    #[test]
+    fn test_gpu_attention_prefill_seq1() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let f = build_attn_prefill_fixture(2, 1, 16, 1, 0);
+        assert_eq!(f.max_seq, 1);
+        let got = run_gpu_attention_prefill(&ctx, &f);
+        assert_attn_prefill_matches(&f, &got, "seq1 attention_prefill");
+    }
+
+    /// `attention_prefill` `q_base` offset: the shader still supports dispatching a
+    /// query sub-batch at a `q_base` offset into `q_batch`/`out_batch` (the
+    /// production host always passes 0, but the param path is live and drives
+    /// `q_global`, `out_offset`, and the causal position). Dispatching the batch in
+    /// `q_base`-offset sub-batches must match the single dispatch — guarding that
+    /// offset arithmetic, which lost its only cover when the query-tiling test was
+    /// removed.
+    #[test]
+    fn test_gpu_attention_prefill_qbase_offset() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let f = attn_prefill_fixture(); // 5 queries → sub-batches at q_base 0, 2, 4
+        let got = run_gpu_attention_prefill_tiled(&ctx, &f, 2);
+        assert_attn_prefill_matches(&f, &got, "q_base-offset attention_prefill");
+    }
+
+    /// `attention_prefill` seq_len==0 bail: with `max_seq` forced to 0 the causal
+    /// window is empty, so the shader must write zeros and return before the final
+    /// `acc / st[1]` (which would be 0/0 → NaN). Built from raw params because the
+    /// fixture always yields `max_seq >= 1`. The output buffer is preset to a
+    /// non-zero sentinel so this proves the bail *overwrites* to zero rather than
+    /// leaving a coincidentally-zeroed buffer.
+    #[test]
+    fn test_gpu_attention_prefill_seq_len_zero() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let n_heads = 2u32;
+        let n_kv_heads = 1u32;
+        let head_dim = 16u32;
+        let kv_dim = n_kv_heads * head_dim;
+        let n = 1u32;
+        let q_stride = n_heads * head_dim;
+        let out_stride = q_stride;
+        let out_len = (n * out_stride) as usize;
+
+        let pipeline = ctx.create_pipeline(
+            shaders::ATTENTION_PREFILL,
+            "attention_prefill",
+            "attention_prefill",
+        );
+        let q_buf = ctx.upload_f32(&vec![0.5f32; (n * q_stride) as usize], "q");
+        // K/V are never read when seq_len==0; bind a single valid row each.
+        let k_buf = ctx.upload_f32(&vec![0.1f32; kv_dim as usize], "k");
+        let v_buf = ctx.upload_f32(&vec![0.2f32; kv_dim as usize], "v");
+        // Sentinel-filled rw output: the bail must overwrite every element to 0.
+        let out_buf = ctx.upload_f32(&vec![7.0f32; out_len], "out");
+        let params: [u32; 12] = [
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_dim,
+            0, // max_seq == 0 → seq_len == 0
+            1.0f32.to_bits(),
+            0, // start_pos
+            n,
+            q_stride,
+            out_stride,
+            0, // q_base
+            0,
+        ];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: q_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: k_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: v_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(n_heads, n, 1);
+        }
+        ctx.submit_encoder(enc);
+
+        let got = ctx.download_f32(&out_buf, out_len);
+        for (i, &g) in got.iter().enumerate() {
+            assert_eq!(g, 0.0, "seq_len==0 must zero output at idx {i}, got {g}");
         }
     }
 }
