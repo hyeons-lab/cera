@@ -1,0 +1,173 @@
+; SPIR-V
+; Version: 1.5
+; Generator: Khronos Slang Compiler; 0
+; Bound: 155
+; Schema: 0
+OpCapability CooperativeMatrixKHR
+OpCapability Int8
+OpCapability UniformAndStorageBuffer8BitAccess
+OpCapability Shader
+OpCapability VulkanMemoryModel
+OpExtension "SPV_KHR_cooperative_matrix"
+OpExtension "SPV_KHR_storage_buffer_storage_class"
+OpExtension "SPV_KHR_vulkan_memory_model"
+OpMemoryModel Logical Vulkan
+OpEntryPoint GLCompute %computeMain "main" %pc %A %B %C %gl_WorkGroupID
+OpExecutionMode %computeMain LocalSize 32 1 1
+
+; Debug Information
+OpSource Slang 1
+OpName %acc "acc"                                   ; id %12
+OpName %acc "acc"                                   ; id %12
+OpName %k "k"                                       ; id %15
+OpName %k "k"                                       ; id %15
+OpName %m0 "m0"                                     ; id %31
+OpName %n0 "n0"                                     ; id %35
+OpName %Params_std430 "Params_std430"               ; id %42
+OpMemberName %Params_std430 0 "M"
+OpMemberName %Params_std430 1 "N"
+OpMemberName %Params_std430 2 "K"
+OpName %pc "pc"                                     ; id %44
+OpName %StructuredBuffer "StructuredBuffer"         ; id %67
+OpMemberName %StructuredBuffer 0 "__member0"
+OpName %A "A"                                       ; id %70
+OpName %B "B"                                       ; id %88
+OpName %k_0 "k"                                     ; id %104
+OpName %RWStructuredBuffer "RWStructuredBuffer"     ; id %130
+OpMemberName %RWStructuredBuffer 0 "__member0"
+OpName %C "C"                                       ; id %133
+OpName %computeMain "computeMain"                   ; id %2
+
+; Annotations
+OpDecorate %gl_WorkGroupID BuiltIn WorkgroupId
+OpDecorate %Params_std430 Block
+OpMemberDecorate %Params_std430 0 Offset 0
+OpMemberDecorate %Params_std430 1 Offset 4
+OpMemberDecorate %Params_std430 2 Offset 8
+OpDecorate %_ptr_StorageBuffer_char ArrayStride 1
+OpDecorate %_runtimearr_char ArrayStride 1
+OpDecorate %StructuredBuffer Block
+OpMemberDecorate %StructuredBuffer 0 Offset 0
+OpDecorate %A Binding 0
+OpDecorate %A DescriptorSet 0
+OpDecorate %A NonWritable
+OpDecorate %B Binding 1
+OpDecorate %B DescriptorSet 0
+OpDecorate %B NonWritable
+OpDecorate %_ptr_StorageBuffer_int ArrayStride 4
+OpDecorate %_runtimearr_int ArrayStride 4
+OpDecorate %RWStructuredBuffer Block
+OpMemberDecorate %RWStructuredBuffer 0 Offset 0
+OpDecorate %C Binding 2
+OpDecorate %C DescriptorSet 0
+
+; Types, variables and constants
+%void = OpTypeVoid
+%3 = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%int_3 = OpConstant %int 3
+%int_64 = OpConstant %int 64
+%int_16 = OpConstant %int 16
+%int_2 = OpConstant %int 2
+%10 = OpTypeCooperativeMatrixKHR %int %int_3 %int_64 %int_16 %int_2
+%_ptr_Function_10 = OpTypePointer Function %10
+%uint = OpTypeInt 32 0
+%_ptr_Function_uint = OpTypePointer Function %uint
+%v3uint = OpTypeVector %uint 3
+%_ptr_Input_v3uint = OpTypePointer Input %v3uint
+%uint_64 = OpConstant %uint 64
+%uint_16 = OpConstant %uint 16
+%int_0 = OpConstant %int 0
+%uint_0 = OpConstant %uint 0
+%Params_std430 = OpTypeStruct %uint %uint %uint     ; Block
+%_ptr_PushConstant_Params_std430 = OpTypePointer PushConstant %Params_std430
+%_ptr_PushConstant_uint = OpTypePointer PushConstant %uint
+%bool = OpTypeBool
+%char = OpTypeInt 8 1
+%58 = OpTypeCooperativeMatrixKHR %char %int_3 %int_64 %int_16 %int_0
+%_ptr_StorageBuffer_char = OpTypePointer StorageBuffer %char    ; ArrayStride 1
+%_runtimearr_char = OpTypeRuntimeArray %char                    ; ArrayStride 1
+%StructuredBuffer = OpTypeStruct %_runtimearr_char              ; Block
+%_ptr_StorageBuffer_StructuredBuffer = OpTypePointer StorageBuffer %StructuredBuffer
+%int_1 = OpConstant %int 1
+%80 = OpTypeCooperativeMatrixKHR %char %int_3 %int_16 %int_16 %int_1
+%_ptr_StorageBuffer_int = OpTypePointer StorageBuffer %int  ; ArrayStride 4
+%_runtimearr_int = OpTypeRuntimeArray %int                  ; ArrayStride 4
+%RWStructuredBuffer = OpTypeStruct %_runtimearr_int         ; Block
+%_ptr_StorageBuffer_RWStructuredBuffer = OpTypePointer StorageBuffer %RWStructuredBuffer
+%gl_WorkGroupID = OpVariable %_ptr_Input_v3uint Input   ; BuiltIn WorkgroupId
+%pc = OpVariable %_ptr_PushConstant_Params_std430 PushConstant
+%A = OpVariable %_ptr_StorageBuffer_StructuredBuffer StorageBuffer  ; Binding 0, DescriptorSet 0, NonWritable
+%B = OpVariable %_ptr_StorageBuffer_StructuredBuffer StorageBuffer  ; Binding 1, DescriptorSet 0, NonWritable
+%C = OpVariable %_ptr_StorageBuffer_RWStructuredBuffer StorageBuffer    ; Binding 2, DescriptorSet 0
+
+; Function computeMain
+%computeMain = OpFunction %void None %3
+%4 = OpLabel
+%acc = OpVariable %_ptr_Function_10 Function
+%k = OpVariable %_ptr_Function_uint Function
+%27 = OpLoad %v3uint %gl_WorkGroupID
+%30 = OpCompositeExtract %uint %27 1
+%m0 = OpIMul %uint %30 %uint_64
+%33 = OpLoad %v3uint %gl_WorkGroupID
+%34 = OpCompositeExtract %uint %33 0
+%n0 = OpIMul %uint %34 %uint_16
+%37 = OpCompositeConstruct %10 %int_0
+OpStore %acc %37
+OpStore %k %uint_0
+OpBranch %16
+%16 = OpLabel
+OpLoopMerge %25 %23 None
+OpBranch %17
+%17 = OpLabel
+OpBranch %18
+%18 = OpLabel
+OpBranch %19
+%19 = OpLabel
+%46 = OpAccessChain %_ptr_PushConstant_uint %pc %int_2
+%47 = OpLoad %uint %46
+%48 = OpLoad %uint %k
+%50 = OpULessThan %bool %48 %47
+OpSelectionMerge %20 None
+OpBranchConditional %50 %20 %24
+%24 = OpLabel
+OpBranch %25
+%20 = OpLabel
+%52 = OpLoad %uint %46
+%53 = OpIMul %uint %m0 %52
+%54 = OpLoad %uint %k
+%55 = OpIAdd %uint %53 %54
+%56 = OpLoad %uint %46
+%141 = OpAccessChain %_ptr_StorageBuffer_char %A %int_0 %55
+%142 = OpCooperativeMatrixLoadKHR %58 %141 %int_0 %56 Aligned 16
+%74 = OpAccessChain %_ptr_PushConstant_uint %pc %int_1
+%75 = OpLoad %uint %74
+%77 = OpIMul %uint %54 %75
+%78 = OpIAdd %uint %77 %n0
+%79 = OpLoad %uint %74
+%146 = OpAccessChain %_ptr_StorageBuffer_char %B %int_0 %78
+%147 = OpCooperativeMatrixLoadKHR %80 %146 %int_0 %79 Aligned 16
+%91 = OpLoad %10 %acc
+%150 = OpCooperativeMatrixMulAddKHR %10 %142 %147 %91 MatrixASignedComponentsKHR|MatrixBSignedComponentsKHR|MatrixCSignedComponentsKHR|MatrixResultSignedComponentsKHR
+OpBranch %21
+%21 = OpLabel
+OpBranch %22
+%22 = OpLabel
+%103 = OpLoad %uint %k
+%k_0 = OpIAdd %uint %103 %uint_16
+OpStore %acc %150
+OpStore %k %k_0
+OpBranch %23
+%23 = OpLabel
+OpBranch %16
+%25 = OpLabel
+%109 = OpAccessChain %_ptr_PushConstant_uint %pc %int_1
+%110 = OpLoad %uint %109
+%111 = OpIMul %uint %m0 %110
+%112 = OpIAdd %uint %111 %n0
+%113 = OpLoad %uint %109
+%114 = OpLoad %10 %acc
+%154 = OpAccessChain %_ptr_StorageBuffer_int %C %int_0 %112
+OpCooperativeMatrixStoreKHR %154 %114 %int_0 %113 Aligned 16
+OpReturn
+OpFunctionEnd

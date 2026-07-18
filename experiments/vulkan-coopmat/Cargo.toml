@@ -12,5 +12,9 @@ publish = false
 name = "coopmat-probe"
 path = "src/main.rs"
 
+[[bin]]
+name = "coopmat-gemm"
+path = "src/bin/gemm.rs"
+
 [dependencies]
 ash = "0.38"
