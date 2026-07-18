@@ -3763,8 +3763,11 @@ impl GpuLfm2Model {
         );
         // The assert above gives `per_query_scores ∈ (0, max_binding_floats]`, so
         // the division is ≥ 1; `.min(n)` then bounds it to the batch (and yields 0
-        // only when n == 0, where the loop below simply never runs).
-        let max_n_sub = ((max_binding_floats / per_query_scores) as u32).min(n);
+        // only when n == 0, where the loop below simply never runs). The `.min` is
+        // done in `u64` space *before* the `as u32` cast so a large binding limit
+        // (division result > u32::MAX) can't truncate to a bogus — possibly 0 —
+        // count; after `.min(u64::from(n))` the value is ≤ n and the cast is exact.
+        let max_n_sub = (max_binding_floats / per_query_scores).min(u64::from(n)) as u32;
 
         let mut q_base = 0u32;
         while q_base < n {

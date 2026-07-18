@@ -36,7 +36,8 @@
 //   @binding(1) k_cache:    array<f32>    seq_len × kv_dim floats
 //   @binding(2) v_cache:    array<f32>    seq_len × kv_dim floats
 //   @binding(3) out_batch:  array<f32>    n_queries × out_stride floats
-//   @binding(4) scores_buf: array<f32>    n_queries × n_heads × max_seq scratch
+//   @binding(4) scores_buf: array<f32>    n_sub_queries × n_heads × max_seq scratch
+//                                          (dispatch-local; addressed by `q_idx`)
 //   @binding(5) params:     array<u32, 12>
 //        ( n_heads, n_kv_heads, head_dim, kv_dim, max_seq, scale_bits,
 //          start_pos, n_queries, q_stride, out_stride, q_base, _pad1 )
