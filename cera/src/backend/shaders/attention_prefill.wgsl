@@ -37,7 +37,12 @@
 //   @binding(3) out_batch: array<f32>    n_queries × out_stride floats (rw)
 //   @binding(4) params:    array<u32, 12>
 //        ( n_heads, n_kv_heads, head_dim, kv_dim, max_seq, scale_bits,
-//          start_pos, n_queries, q_stride, out_stride, q_base, _pad1 )
+//          start_pos, <unused>, q_stride, out_stride, q_base, _pad1 )
+//
+// params[7] is NOT read by the shader — the per-dispatch query count comes from
+// the dispatch Y dimension (`wid.y`), so callers may leave it as any value (the
+// host passes the whole batch size, a sub-batched/tiled dispatch passes its
+// sub-batch size). Do not treat it as authoritative.
 //
 // `q_base` is the index, within `q_batch` / `out_batch`, of the first query in
 // this dispatch, so a caller may still split the query batch across dispatches;
@@ -81,7 +86,7 @@ fn attention_prefill(
     let max_seq = params[4];
     let scale = bitcast<f32>(params[5]);
     let start_pos = params[6];
-    // params[7] (n_queries) is implicit in dispatch.
+    // params[7] is unused: the query count is the dispatch Y dimension (wid.y).
     let q_stride = params[8];
     let out_stride = params[9];
     let q_base = params[10];
