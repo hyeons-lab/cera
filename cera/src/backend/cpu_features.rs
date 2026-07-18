@@ -19,7 +19,7 @@
 //! so a dispatcher can never route to a kernel that doesn't exist. On x86 that
 //! is [`CpuTier::Avx512`] (Q8_0/Q4_0 `vec_dot`; needs the default-on `avx512`
 //! crate feature, else [`CpuTier::Avx2`]); on aarch64 it is [`CpuTier::NeonI8mm`]
-//! (Q8_0 GEMM) down to [`CpuTier::NeonDotprod`]. The raw feature bools (e.g.
+//! (Q8_0/Q4_0 GEMM) down to [`CpuTier::NeonDotprod`]. The raw feature bools (e.g.
 //! [`CpuFeatures::avx512vnni`]) are detected and exposed regardless, for
 //! diagnostics and so future kernels can light up without re-plumbing.
 
@@ -46,8 +46,8 @@ pub enum CpuTier {
     Neon,
     /// aarch64 NEON + dotprod (FEAT_DotProd, `vdotq_s32`).
     NeonDotprod,
-    /// aarch64 NEON + i8mm (FEAT_I8MM, `vmmlaq_s32`) — Q8_0 GEMM only; other ops
-    /// use the dotprod path (i8mm implies dotprod).
+    /// aarch64 NEON + i8mm (FEAT_I8MM, `vmmlaq_s32`) — Q8_0 and Q4_0 GEMM; other
+    /// ops use the dotprod path (i8mm implies dotprod).
     NeonI8mm,
 }
 
