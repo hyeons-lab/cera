@@ -521,9 +521,10 @@ pub struct GpuLfm2Model {
     /// `[MAX_PREFILL_TOKENS × intermediate_size]` — FFN up output;
     /// also reused as scratch for V projections.
     prefill_up_buf: wgpu::Buffer,
-    /// `[MAX_PREFILL_TOKENS × n_heads × max_seq_len]` — per-(query,
-    /// head) scratch slab consumed by `attention_prefill.wgsl`.
-    /// Allocated once; sized to the worst case per the model config.
+    /// Per-(query, head, time) scratch slab consumed by
+    /// `attention_prefill.wgsl`. Allocated once, capped at the adapter's
+    /// storage-binding limit — `encode_attention_prefill` tiles the query
+    /// dimension so no dispatch ever binds more than that.
     prefill_scores_buf: wgpu::Buffer,
     // GPU state
     gpu_state: GpuState,
@@ -1026,8 +1027,19 @@ impl GpuLfm2Model {
         let prefill_proj_buf = f((3 * hs).max(q_dim) * max_pref, "prefill_proj");
         let prefill_gate_buf = f(is.max(max_kv_dim).max(hs) * max_pref, "prefill_gate");
         let prefill_up_buf = f(is.max(max_kv_dim).max(hs) * max_pref, "prefill_up");
-        // attention_prefill scratch: per-(query, head, time) f32 slab.
-        let prefill_scores_buf = f(max_pref * config.n_heads * max_seq_len, "prefill_scores");
+        // attention_prefill scratch: per-(query, head, time) f32 slab. Capped at
+        // the adapter's storage-binding limit: `encode_attention_prefill` tiles the
+        // query dimension so no single dispatch binds more than that many floats, so
+        // allocating the uncapped `max_pref × n_heads × max_seq_len` (256 MB at ctx
+        // 8192) would only waste memory — and could exceed a mobile adapter's
+        // `max_buffer_size`. The cap never truncates a live binding because every
+        // tiled binding is `≤ max_storage_buffer_binding_size / 4` floats by
+        // construction.
+        let scores_binding_cap = (ctx.max_storage_buffer_binding_size / 4) as usize;
+        let prefill_scores_buf = f(
+            (max_pref * config.n_heads * max_seq_len).min(scores_binding_cap),
+            "prefill_scores",
+        );
 
         // Initialize GPU KV caches + conv buffers
         let kernel_size = config.conv_kernel_size.unwrap_or(3);
@@ -3199,14 +3211,17 @@ impl GpuLfm2Model {
 // bind groups for fixed prefill scratch buffers is a clean follow-up
 // optimization. Kept simple here so the refactor is reviewable.
 //
-// `prefill_scores_buf` size note: this scratch is sized to
-// `MAX_PREFILL_TOKENS × n_heads × max_seq_len × 4` bytes (256 MB on
-// LFM2-VL-450M / 512 MB on LFM2.5-VL-1.6B at the default 8192 context).
-// On native macOS this is fine (M1+ unified memory). For wasm / WebGPU
-// tier-1 (256 MB max storage buffer) this becomes load-bearing — the
-// proper fix is a two-pass online softmax in `attention_prefill.wgsl`
-// that doesn't materialize the full scores matrix; queued as a follow-up
-// shader PR.
+// `prefill_scores_buf` size note: this scratch would be
+// `MAX_PREFILL_TOKENS × n_heads × max_seq_len × 4` bytes if bound whole (256 MB
+// on LFM2-VL-450M / 512 MB on LFM2.5-VL-1.6B at the default 8192 context), which
+// exceeds the 128 MB storage-binding limit common on mobile/Vulkan adapters.
+// `encode_attention_prefill` instead tiles the query dimension into sub-batches
+// whose scores binding fits the limit, so the buffer is allocated capped at that
+// limit and each dispatch binds a slice. This unblocks long prompts on
+// binding-limited adapters; a two-pass online-softmax rewrite that never
+// materializes the scores matrix (and also bounds the *key* dimension, for
+// contexts long enough that the K/V binding itself overflows) remains a
+// follow-up shader PR.
 
 impl GpuLfm2Model {
     /// The first matmul weight that has no batched prefill kernel, as
@@ -3713,81 +3728,107 @@ impl GpuLfm2Model {
         out_stride: u32,
         scale: f32,
     ) {
-        // Saturating multiplies so an overflowing element count pins to u64::MAX
-        // and trips the binding-size asserts below, rather than wrapping to a small
-        // value that would bind a too-short range and slip past the guard. The
-        // scores count multiplies three u32s, whose product can exceed u64.
+        // The live K/V binding is `max_seq × kv_dim` regardless of how the query
+        // dimension is tiled below, so guard it once up front. Saturating multiply
+        // so an overflow pins to u64::MAX and trips the assert instead of wrapping
+        // to a small (too-short) range that would slip past the guard. If this
+        // fires the context itself is too long for a contiguous KV binding — the
+        // remaining case that needs key-tiled / paged attention.
         let kv_live_floats = u64::from(max_seq).saturating_mul(u64::from(kv_dim));
         assert_f32_binding_fits(
             kv_live_floats,
             self.ctx.max_storage_buffer_binding_size,
             "attention_prefill live KV",
         );
-        let scores_live_floats = u64::from(n)
-            .saturating_mul(u64::from(n_heads))
-            .saturating_mul(u64::from(max_seq));
-        assert_f32_binding_fits(
-            scores_live_floats,
-            self.ctx.max_storage_buffer_binding_size,
-            "attention_prefill scores",
+
+        // `scores_buf` is `n_sub × n_heads × max_seq` — it grows with the query
+        // count, and at long context the full-`n` slab exceeds the adapter's
+        // storage-binding limit (this is the wall a long prompt hits). Since each
+        // (query, head) workgroup is independent, tile the query dimension into
+        // sub-batches whose scores binding fits, and dispatch each with its own
+        // `q_base`. `scores_buf` is pure per-dispatch scratch, so reusing the same
+        // buffer across sub-batches is safe.
+        let max_binding_floats = self.ctx.max_storage_buffer_binding_size / 4;
+        let per_query_scores = u64::from(n_heads).saturating_mul(u64::from(max_seq));
+        // Checked inline rather than via `assert_f32_binding_fits`: the `> 0`
+        // clause guards the `max_n_sub` division below against divide-by-zero, the
+        // message names the key-tiling escalation this specific case needs, and
+        // `max_binding_floats` is reused for that division anyway.
+        assert!(
+            per_query_scores <= max_binding_floats && per_query_scores > 0,
+            "wgpu attention_prefill: one query's scores row is {per_query_scores} floats, \
+             exceeding adapter max_storage_buffer_binding_size {} ({max_binding_floats} floats); \
+             key-tiled / paged attention is required at this context length",
+            self.ctx.max_storage_buffer_binding_size
         );
-        let params: [u32; 12] = [
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            kv_dim,
-            max_seq,
-            scale.to_bits(),
-            start_pos,
-            n,
-            q_stride,
-            out_stride,
-            0,
-            0,
-        ];
-        let p_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&params), "attention_prefill_params");
-        let bg = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.pipelines.attention_prefill.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: q_batch.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: f32_binding(k_cache, kv_live_floats),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: f32_binding(v_cache, kv_live_floats),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: out_batch.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: f32_binding(&self.prefill_scores_buf, scores_live_floats),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: p_buf.as_entire_binding(),
-                    },
-                ],
-            });
-        self.encode(
-            enc,
-            &self.pipelines.attention_prefill,
-            &bg,
-            (n_heads, n, 1),
-            "attention_prefill",
-        );
+        // The assert above gives `per_query_scores ∈ (0, max_binding_floats]`, so
+        // the division is ≥ 1; `.min(n)` then bounds it to the batch (and yields 0
+        // only when n == 0, where the loop below simply never runs).
+        let max_n_sub = ((max_binding_floats / per_query_scores) as u32).min(n);
+
+        let mut q_base = 0u32;
+        while q_base < n {
+            let n_sub = (n - q_base).min(max_n_sub);
+            let scores_live_floats = u64::from(n_sub).saturating_mul(per_query_scores);
+            let params: [u32; 12] = [
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_dim,
+                max_seq,
+                scale.to_bits(),
+                start_pos,
+                n_sub,
+                q_stride,
+                out_stride,
+                q_base,
+                0,
+            ];
+            let p_buf = self
+                .ctx
+                .upload_storage(bytemuck::cast_slice(&params), "attention_prefill_params");
+            let bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.pipelines.attention_prefill.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: q_batch.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: f32_binding(k_cache, kv_live_floats),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: f32_binding(v_cache, kv_live_floats),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: out_batch.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: f32_binding(&self.prefill_scores_buf, scores_live_floats),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: p_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+            self.encode(
+                enc,
+                &self.pipelines.attention_prefill,
+                &bg,
+                (n_heads, n_sub, 1),
+                "attention_prefill",
+            );
+            q_base += n_sub;
+        }
     }
 
     /// Batched prefill — single-pass over `n` tokens for all layers, then

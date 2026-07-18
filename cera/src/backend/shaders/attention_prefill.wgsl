@@ -39,9 +39,17 @@
 //   @binding(4) scores_buf: array<f32>    n_queries × n_heads × max_seq scratch
 //   @binding(5) params:     array<u32, 12>
 //        ( n_heads, n_kv_heads, head_dim, kv_dim, max_seq, scale_bits,
-//          start_pos, n_queries, q_stride, out_stride, _pad0, _pad1 )
+//          start_pos, n_queries, q_stride, out_stride, q_base, _pad1 )
 //
-// Dispatch: (n_heads, n_queries, 1) workgroups of 256 threads.
+// `q_base` is the index, within `q_batch` / `out_batch`, of the first query in
+// this dispatch. It lets the host tile the query dimension into sub-batches so
+// each dispatch's `scores_buf` binding stays under the adapter storage-binding
+// limit at long context, while `q_batch` / `out_batch` stay bound whole. The
+// dispatch's local `wid.y` (`q_idx`) addresses `scores_buf`; `q_base + q_idx`
+// addresses `q_batch` / `out_batch` and sets the causal position. `q_base = 0`
+// is the single-dispatch case (no tiling).
+//
+// Dispatch: (n_heads, n_sub_queries, 1) workgroups of 256 threads.
 
 @group(0) @binding(0) var<storage, read> q_batch: array<f32>;
 @group(0) @binding(1) var<storage, read> k_cache: array<f32>;
@@ -71,19 +79,25 @@ fn attention_prefill(
     // params[7] (n_queries) is implicit in dispatch.
     let q_stride = params[8];
     let out_stride = params[9];
+    let q_base = params[10];
+
+    // Global query index into q_batch / out_batch (q_base + local q_idx), while
+    // scores_buf is addressed by the local q_idx so its binding only needs to
+    // cover this sub-batch's rows.
+    let q_global = q_base + q_idx;
 
     // Causal seq_len for this query — attend over [0..pos_q]. Clamp
     // against `max_seq` so a caller passing inconsistent params can
     // only cause silent attention-window truncation, never an OOB read
     // of `k_cache` / `v_cache` / `scores_buf` (which are all sized to
     // `max_seq`-multiples).
-    let pos_q = start_pos + q_idx;
+    let pos_q = start_pos + q_global;
     let seq_len = min(pos_q + 1u, max_seq);
 
     let group_size = n_heads / n_kv_heads;
     let kv_head = head / group_size;
     let kv_h_offset = kv_head * head_dim;
-    let q_offset = q_idx * q_stride + head * head_dim;
+    let q_offset = q_global * q_stride + head * head_dim;
 
     // Each (q_idx, head) workgroup gets its own scores slab so concurrent
     // workgroups don't collide. Layout: q_idx-major, then head, then time.
@@ -171,7 +185,7 @@ fn attention_prefill(
     workgroupBarrier();
 
     // ─── Phase 3: weighted V sum → output ──────────────────────────────────
-    let out_offset = q_idx * out_stride + head * head_dim;
+    let out_offset = q_global * out_stride + head * head_dim;
     var d = tid;
     while d < head_dim {
         var val: f32 = 0.0;
