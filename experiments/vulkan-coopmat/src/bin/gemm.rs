@@ -8,7 +8,34 @@ use ash::vk;
 use std::time::Instant;
 
 const COOPMAT_SPV: &[u8] = include_bytes!("../../shaders/gemm_coopmat.spv");
+const COOPMAT_NB_SPV: &[u8] = include_bytes!("../../shaders/gemm_coopmat_nb.spv");
+const COOPMAT_NB8_SPV: &[u8] = include_bytes!("../../shaders/gemm_coopmat_nb8.spv");
 const TILED_SPV: &[u8] = include_bytes!("../../shaders/gemm_tiled.spv");
+
+/// One GEMM kernel: its SPIR-V and how to compute the dispatch grid for (m,k,n).
+struct Kernel {
+    label: &'static str,
+    spv: &'static [u8],
+    groups: fn(u32, u32, u32) -> (u32, u32, u32),
+}
+
+// All coopmat variants converge at ~44 GFLOP/s (~1.6x tiled): output/register
+// blocking buys nothing here — the DXT-48 coopmat unit is throughput-bound, not
+// reuse-bound. tiled: 16x16 threads, one thread per C element. coopmat: one
+// subgroup per 64x16 tile. coopmat_nb: 64x64 block (1 MatA reused across 4 N-tiles,
+// 4 accumulators). coopmat_nb8: 128-wide block (8 accumulators — proves the
+// accumulator dimension scales fine).
+//
+// NOTE: M-blocking (reuse B across M-tiles) is impossible on this hardware — it
+// requires >1 MatA or >1 MatB live at once, and the PowerVR coopmat driver
+// corrupts results whenever more than one MatA/MatB fragment is live in a subgroup
+// (multiple accumulators are fine). See devlog 000241 for the isolation.
+const KERNELS: &[Kernel] = &[
+    Kernel { label: "tiled", spv: TILED_SPV, groups: |m, _, n| (n.div_ceil(16), m.div_ceil(16), 1) },
+    Kernel { label: "coopmat", spv: COOPMAT_SPV, groups: |m, _, n| (n / 16, m / 64, 1) },
+    Kernel { label: "coopmat_nb", spv: COOPMAT_NB_SPV, groups: |m, _, n| (n / 64, m / 64, 1) },
+    Kernel { label: "coopmat_nb8", spv: COOPMAT_NB8_SPV, groups: |m, _, n| (n / 128, m / 64, 1) },
+];
 
 // (M, K, N) — M multiple of 64, N/K multiples of 16 (coopmat tile constraints).
 const SHAPES: &[(u32, u32, u32)] = &[(256, 1024, 1024), (512, 1024, 1024), (512, 1024, 3072)];
@@ -73,12 +100,9 @@ unsafe fn run() {
     let mem_props = instance.get_physical_device_memory_properties(pdev);
     let harness = Harness::new(&device, &mem_props, qf, ts_period);
 
-    let cm_pipe = harness.pipeline(&device, COOPMAT_SPV);
-    let tl_pipe = harness.pipeline(&device, TILED_SPV);
+    let pipes: Vec<vk::Pipeline> = KERNELS.iter().map(|k| harness.pipeline(&device, k.spv)).collect();
 
-    println!("\n{:>5} {:>5} {:>5} | {:>14} {:>10} | {:>14} {:>10} | {:>7}",
-        "M", "K", "N", "coopmat_ms", "GFLOP/s", "tiled_ms", "GFLOP/s", "speedup");
-
+    use std::io::Write;
     let mut first = true;
     for &(m, k, n) in SHAPES {
         let (a, b) = gen_inputs(m, k, n);
@@ -87,17 +111,19 @@ unsafe fn run() {
         // CPU reference (once, on the first/smallest shape — 268M MACs).
         let cpu_ref = if first { Some(cpu_gemm(&a, &b, m, k, n)) } else { None };
 
-        let cm = harness.run(&device, queue, &cm_pipe, &a, &b, m, k, n,
-            (n / 16, m / 64, 1), cpu_ref.as_deref(), "coopmat");
-        let tl = harness.run(&device, queue, &tl_pipe, &a, &b, m, k, n,
-            (n.div_ceil(16), m.div_ceil(16), 1), cpu_ref.as_deref(), "tiled");
-
-        let cm_ms = cm * 1e-6;
-        let tl_ms = tl * 1e-6;
-        println!("{m:>5} {k:>5} {n:>5} | {:>14.4} {:>10.1} | {:>14.4} {:>10.1} | {:>6.2}x",
-            cm_ms, flops / cm, tl_ms, flops / tl, tl / cm);
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
+        println!("\n=== {m} x {k} x {n} ===");
+        println!("{:>14} {:>12} {:>10} {:>9}", "kernel", "ms", "GFLOP/s", "vs_tiled");
+        let mut tiled_ns = f64::NAN;
+        for (kern, pipe) in KERNELS.iter().zip(&pipes) {
+            let ns = harness.run(&device, queue, pipe, &a, &b, m, k, n,
+                (kern.groups)(m, k, n), cpu_ref.as_deref(), kern.label);
+            if kern.label == "tiled" {
+                tiled_ns = ns;
+            }
+            println!("{:>14} {:>12.4} {:>10.1} {:>8.2}x",
+                kern.label, ns * 1e-6, flops / ns, tiled_ns / ns);
+            let _ = std::io::stdout().flush();
+        }
         first = false;
     }
 
