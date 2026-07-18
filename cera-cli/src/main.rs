@@ -54,6 +54,21 @@ impl ModalitySink for NoopSink {
     fn on_done(&mut self, _reason: FinishReason) {}
 }
 
+/// Collects decoded token ids. Used by the hybrid bench's untimed coherence
+/// pass to compare hybrid (GPU-prefill → CPU-decode) output against an all-CPU
+/// run on the same prompt.
+#[derive(Default)]
+struct CollectSink {
+    tokens: Vec<u32>,
+}
+
+impl ModalitySink for CollectSink {
+    fn on_text_tokens(&mut self, tokens: &[u32]) {
+        self.tokens.extend_from_slice(tokens);
+    }
+    fn on_done(&mut self, _reason: FinishReason) {}
+}
+
 /// Streams decoded tokens to stdout *and* accumulates them into a
 /// `String` buffer so the chat REPL can capture the full assistant
 /// reply for the next turn's history. Otherwise mirrors `StdoutSink`'s
@@ -765,7 +780,7 @@ enum Command {
         #[arg(long, default_value_t = 128)]
         max_tokens: usize,
 
-        /// Device to use: cpu, gpu, metal, or auto.
+        /// Device to use: cpu, gpu, metal, auto, or hybrid (wgpu prefill → CPU decode).
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -1462,6 +1477,255 @@ fn summarize(mut xs: Vec<f64>) -> (f64, f64, f64, f64, f64) {
     let mean = xs.iter().sum::<f64>() / n as f64;
     let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
     (p(0.1), p(0.5), p(0.9), mean, var.sqrt())
+}
+
+/// Build the bench prompt token sequence: either `prompt_tokens` synthetic
+/// non-special tokens (fixed prefill length) or the tokenized `prompt` text
+/// (with a leading BOS when the model wants one). Shared by the single-engine
+/// and hybrid bench paths.
+fn build_bench_prompt(
+    tokenizer: &BpeTokenizer,
+    add_bos: bool,
+    prompt: &str,
+    prompt_tokens: Option<usize>,
+) -> Result<Vec<u32>> {
+    let mut tokens = Vec::new();
+    if let Some(n) = prompt_tokens {
+        let vocab_size = tokenizer.vocab_size() as u32;
+        let mut tid = 100u32; // Start after the typical special-token range.
+        while tokens.len() < n {
+            if !tokenizer.is_special_token(tid % vocab_size) {
+                tokens.push(tid % vocab_size);
+            }
+            tid += 1;
+            if tid > vocab_size * 2 + n as u32 {
+                break; // Safety break.
+            }
+        }
+        anyhow::ensure!(
+            tokens.len() == n,
+            "tokenizer only provides {} usable prompt token(s), but {} were requested",
+            tokens.len(),
+            n
+        );
+    } else {
+        if add_bos {
+            if let Some(bos) = tokenizer.bos_token() {
+                tokens.push(bos);
+            }
+        }
+        tokens.extend_from_slice(&tokenizer.encode(prompt));
+    }
+    Ok(tokens)
+}
+
+/// Per-run stats for the hybrid bench.
+struct HybridStats {
+    prefill_tps: f64,
+    decode_tps: f64,
+    handoff_ms: f64,
+    snapshot_bytes: usize,
+}
+
+/// Hybrid bench: prefill the prompt on **wgpu** (fast TTFT), lift the KV+conv
+/// state off that session via [`Session::export_snapshot`], transplant it into a
+/// **CPU** session via [`Session::import_snapshot`], and decode there (fast per-
+/// token on mobile). Reports GPU prefill tok/s, CPU decode tok/s, and the one-time
+/// handoff cost, so the mobile GPU-prefill/CPU-decode crossover can be measured
+/// against plain `--device gpu` / `--device cpu` runs.
+///
+/// wgpu is forced for the prefill side because its KV snapshot is f32 — matching
+/// the CPU decode path (native Metal snapshots are f16). Both sessions run
+/// `KvCompression::None` (the wgpu snapshot is uncompressed).
+#[allow(clippy::too_many_arguments)]
+fn run_hybrid_bench(
+    model: Option<&str>,
+    bundle_id: Option<&str>,
+    quant: Option<&str>,
+    cache_dir: Option<&str>,
+    prompt: &str,
+    prompt_tokens: Option<usize>,
+    runs: usize,
+    warmup: usize,
+    max_tokens: usize,
+    context_size: usize,
+    no_cache: bool,
+) -> Result<()> {
+    anyhow::ensure!(runs >= 1, "--runs must be >= 1");
+    let gpu_engine = resolve_engine(model, bundle_id, quant, cache_dir, "gpu", context_size)?;
+    let cpu_engine = resolve_engine(model, bundle_id, quant, cache_dir, "cpu", context_size)?;
+
+    if no_cache {
+        let empty = || cera::kv_cache::KvCacheConfig {
+            cache_dir: None,
+            max_warm_entries: 0,
+            max_warm_bytes: 0,
+            max_cold_bytes: 0,
+        };
+        gpu_engine.configure_cache(empty());
+        cpu_engine.configure_cache(empty());
+    }
+
+    let tokenizer = cpu_engine.tokenizer();
+    let add_bos = cpu_engine.metadata().add_bos_token;
+    let tokens = build_bench_prompt(tokenizer, add_bos, prompt, prompt_tokens)?;
+
+    let cfg = cpu_engine.model().config();
+    eprintln!(
+        "Hybrid (wgpu prefill → CPU decode) | Model: {} | {} layers | hidden={}",
+        cfg.architecture, cfg.n_layers, cfg.hidden_size
+    );
+    eprintln!(
+        "Prompt tokens: {} | max_tokens: {} | warmup: {} | runs: {}",
+        tokens.len(),
+        max_tokens,
+        warmup,
+        runs
+    );
+
+    // Uncompressed on both sides: the wgpu snapshot is f32, and
+    // `import_snapshot` rejects a compression-mode mismatch.
+    let session_cfg = || cera::SessionConfig {
+        kv_compression: cera::kv_cache::KvCompression::None,
+        seed: None,
+        ..Default::default()
+    };
+
+    // Prefill on wgpu, then transplant the snapshot + last-position logits into a fresh
+    // CPU session ready to decode. Returns the CPU session, the snapshot size, and the
+    // separately-timed prefill and handoff durations. Shared by the timed runs and the
+    // untimed coherence pass so the handoff sequence lives in exactly one place.
+    let prefill_and_handoff = || -> Result<(
+        cera::session::Session,
+        usize,
+        std::time::Duration,
+        std::time::Duration,
+    )> {
+        let mut gpu_session = gpu_engine.new_session(session_cfg())?;
+        let prefill_start = std::time::Instant::now();
+        gpu_session.append_tokens(&tokens)?;
+        let prefill_elapsed = prefill_start.elapsed();
+
+        let handoff_start = std::time::Instant::now();
+        let snapshot = gpu_session.export_snapshot();
+        let snapshot_bytes = snapshot.byte_size();
+        let logits = gpu_session
+            .last_logits()
+            .ok_or_else(|| anyhow::anyhow!("wgpu prefill produced no logits to hand off"))?
+            .to_vec();
+        let mut cpu_session = cpu_engine.new_session(session_cfg())?;
+        cpu_session.import_snapshot(&snapshot, logits)?;
+        let handoff_elapsed = handoff_start.elapsed();
+        Ok((cpu_session, snapshot_bytes, prefill_elapsed, handoff_elapsed))
+    };
+
+    let run_once = || -> Result<HybridStats> {
+        let (mut cpu_session, snapshot_bytes, prefill_elapsed, handoff_elapsed) =
+            prefill_and_handoff()?;
+
+        // Decode on CPU.
+        let opts = cera::GenerateOpts {
+            max_tokens: max_tokens as u32,
+            temperature: 0.0,
+            ignore_eos: true,
+            ..Default::default()
+        };
+        let mut sink = NoopSink;
+        let summary = cpu_session.generate(&opts, &mut sink)?;
+
+        let prefill_tps = if prefill_elapsed.as_secs_f64() > 0.0 {
+            tokens.len() as f64 / prefill_elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        let decode_tps = if summary.decode_ms > 0 {
+            summary.tokens_generated as f64 / (summary.decode_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+        Ok(HybridStats {
+            prefill_tps,
+            decode_tps,
+            handoff_ms: handoff_elapsed.as_secs_f64() * 1000.0,
+            snapshot_bytes,
+        })
+    };
+
+    // Untimed coherence pass: hybrid decode vs all-CPU decode on the same prompt.
+    // Early greedy tokens should match if the KV transplant is numerically sound.
+    {
+        let (mut cpu_session, _bytes, _prefill, _handoff) = prefill_and_handoff()?;
+        let opts = cera::GenerateOpts {
+            max_tokens: 24.min(max_tokens as u32).max(1),
+            temperature: 0.0,
+            ignore_eos: true,
+            ..Default::default()
+        };
+        let mut hy = CollectSink::default();
+        cpu_session.generate(&opts, &mut hy)?;
+
+        // All-CPU reference (CPU prefill + CPU decode) on the identical prompt.
+        let mut ref_session = cpu_engine.new_session(session_cfg())?;
+        ref_session.append_tokens(&tokens)?;
+        let mut rf = CollectSink::default();
+        ref_session.generate(&opts, &mut rf)?;
+
+        let matched = hy
+            .tokens
+            .iter()
+            .zip(&rf.tokens)
+            .take_while(|(a, b)| a == b)
+            .count();
+        eprintln!(
+            "coherence: hybrid vs all-CPU greedy match = {}/{} leading tokens",
+            matched,
+            rf.tokens.len()
+        );
+        eprintln!("  hybrid : {:?}", tokenizer.decode(&hy.tokens));
+        eprintln!("  all-CPU: {:?}", tokenizer.decode(&rf.tokens));
+    }
+
+    for i in 0..warmup {
+        eprintln!("warmup {}/{}", i + 1, warmup);
+        let _ = run_once()?;
+    }
+
+    let mut prefill_tps = Vec::with_capacity(runs);
+    let mut decode_tps = Vec::with_capacity(runs);
+    let mut handoff_ms = Vec::with_capacity(runs);
+    let mut snapshot_bytes = 0usize;
+    for i in 0..runs {
+        let r = run_once()?;
+        eprintln!(
+            "run {}/{}: prefill={:.0} decode={:.1} tok/s | handoff={:.1} ms",
+            i + 1,
+            runs,
+            r.prefill_tps,
+            r.decode_tps,
+            r.handoff_ms
+        );
+        prefill_tps.push(r.prefill_tps);
+        decode_tps.push(r.decode_tps);
+        handoff_ms.push(r.handoff_ms);
+        snapshot_bytes = r.snapshot_bytes;
+    }
+    eprintln!();
+
+    let (p10, p50, p90, mean, stddev) = summarize(prefill_tps);
+    eprintln!(
+        "prefill tok/s (wgpu): p50={p50:.0} p10={p10:.0} p90={p90:.0} mean={mean:.0} stddev={stddev:.0} (n={runs})"
+    );
+    let (p10, p50, p90, mean, stddev) = summarize(decode_tps);
+    eprintln!(
+        "decode tok/s (CPU):   p50={p50:.1} p10={p10:.1} p90={p90:.1} mean={mean:.1} stddev={stddev:.1} (n={runs})"
+    );
+    let (_, hp50, _, hmean, _) = summarize(handoff_ms);
+    eprintln!(
+        "handoff: p50={hp50:.1} ms mean={hmean:.1} ms | snapshot={:.2} MiB",
+        snapshot_bytes as f64 / (1024.0 * 1024.0)
+    );
+
+    Ok(())
 }
 
 /// Read a PCM16 WAV file and return (samples_f32_in_minus1_to_1,
@@ -3579,6 +3843,24 @@ fn main() -> Result<()> {
                 );
             }
 
+            // Hybrid mode: prefill on wgpu, hand off, decode on CPU. Two engines
+            // on the same GGUF, so it can't share the single-engine loop below.
+            if device.eq_ignore_ascii_case("hybrid") {
+                return run_hybrid_bench(
+                    model.as_deref(),
+                    bundle_id.as_deref(),
+                    quant.as_deref(),
+                    cache_dir.as_deref(),
+                    &prompt,
+                    prompt_tokens,
+                    runs,
+                    warmup,
+                    max_tokens,
+                    context_size,
+                    no_cache,
+                );
+            }
+
             let engine = resolve_engine(
                 model.as_deref(),
                 bundle_id.as_deref(),
@@ -3600,35 +3882,7 @@ fn main() -> Result<()> {
                 });
             }
 
-            let mut tokens = Vec::new();
-            if let Some(n) = prompt_tokens {
-                // Generate N tokens by sampling from the vocabulary, skipping special tokens.
-                let vocab_size = tokenizer.vocab_size() as u32;
-                let mut tid = 100; // Start after typical special token range
-                while tokens.len() < n {
-                    if !tokenizer.is_special_token(tid % vocab_size) {
-                        tokens.push(tid % vocab_size);
-                    }
-                    tid += 1;
-                    if tid > vocab_size * 2 + n as u32 {
-                        break; // Safety break
-                    }
-                }
-                if tokens.len() != n {
-                    return Err(anyhow::anyhow!(
-                        "tokenizer only provides {} usable prompt token(s), but {} were requested",
-                        tokens.len(),
-                        n
-                    ));
-                }
-            } else {
-                if add_bos {
-                    if let Some(bos) = tokenizer.bos_token() {
-                        tokens.push(bos);
-                    }
-                }
-                tokens.extend_from_slice(&tokenizer.encode(&prompt));
-            }
+            let tokens = build_bench_prompt(tokenizer, add_bos, &prompt, prompt_tokens)?;
 
             eprintln!(
                 "Model: {} | {} layers | hidden={}",

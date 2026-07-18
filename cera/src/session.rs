@@ -19,7 +19,7 @@ use thiserror::Error;
 
 use crate::time::{Duration, Instant};
 
-use crate::kv_cache::{InferenceState, KvCompression};
+use crate::kv_cache::{InferenceState, KvCompression, LayerSnapshot, LayerState, StateSnapshot};
 use crate::model::Model;
 use crate::model::audio_encoder::AudioEncoderWeights;
 use crate::sampler::{Sampler, SamplerConfig};
@@ -723,6 +723,90 @@ impl Session {
     /// logits across `--device cpu` vs `metal`.
     pub fn last_logits(&self) -> Option<&[f32]> {
         self.last_logits.as_deref()
+    }
+
+    /// Export this session's KV + conv state as a portable [`StateSnapshot`].
+    ///
+    /// Hybrid inference (GPU prefill → CPU decode) uses this to lift the prefilled
+    /// state off a GPU-backed session so a CPU-backed session can continue decoding
+    /// (see [`Self::import_snapshot`]). Only backends whose [`Model::snapshot_state`]
+    /// is implemented (wgpu / Metal) support this — it **panics** on a CPU session,
+    /// whose KV lives on `InferenceState` rather than the model. Native Metal
+    /// snapshots are f16; the CPU decode path expects f32, so pair this with a
+    /// **wgpu** source for the f32 handoff.
+    pub fn export_snapshot(&self) -> StateSnapshot {
+        self.model.snapshot_state()
+    }
+
+    /// Import a [`StateSnapshot`] (from [`Self::export_snapshot`] on another session)
+    /// into this session's state, continuing generation from where the source left
+    /// off. The counterpart of export for the hybrid GPU-prefill → CPU-decode handoff.
+    ///
+    /// `last_logits` must be the source session's [`Self::last_logits`] captured right
+    /// after its prefill: [`Self::generate`] samples the first decoded token from it,
+    /// and this session never ran the prefill that would otherwise populate it.
+    ///
+    /// Position (`current_pos` / [`Self::position`]) is set from `snapshot.seq_len`.
+    ///
+    /// Errors (rather than panicking inside `restore`) if the snapshot is structurally
+    /// incompatible with this session's state: a differing layer count (different model
+    /// / `context_size`), or a per-layer kind or compression-mode mismatch (a GPU
+    /// snapshot is always uncompressed f32, so the importing session must be
+    /// `KvCompression::None` on the same model). Assumes an f32 snapshot — a Metal f16
+    /// snapshot with an odd float count would still trip `restore`'s 4-byte-alignment
+    /// assert; pair this with a wgpu (f32) source, as the hybrid path does.
+    pub fn import_snapshot(
+        &mut self,
+        snapshot: &StateSnapshot,
+        last_logits: Vec<f32>,
+    ) -> Result<(), CeraError> {
+        if snapshot.layers.len() != self.state.layers.len() {
+            return Err(CeraError::Backend(format!(
+                "snapshot layer count {} doesn't match session state layer count {} \
+                 (different model or context_size?)",
+                snapshot.layers.len(),
+                self.state.layers.len()
+            )));
+        }
+        // Per-layer kind + compression check, so every `restore` panic reachable here
+        // (Attention-vs-Conv kind mismatch, per-layer compression-slot mismatch) is
+        // turned into a typed error before `restore` runs.
+        for (i, (snap, layer)) in snapshot.layers.iter().zip(&self.state.layers).enumerate() {
+            let compatible = match (snap, layer) {
+                (
+                    LayerSnapshot::Attention { .. },
+                    LayerState::Attention {
+                        compressed_keys, ..
+                    },
+                ) => compressed_keys.is_none(),
+                (
+                    LayerSnapshot::AttentionCompressed { .. },
+                    LayerState::Attention {
+                        compressed_keys, ..
+                    },
+                ) => compressed_keys.is_some(),
+                (LayerSnapshot::Conv { .. }, LayerState::Conv { .. }) => true,
+                _ => false,
+            };
+            if !compatible {
+                return Err(CeraError::Backend(format!(
+                    "snapshot layer {i} is incompatible with this session's state \
+                     (attention/conv kind or compression-mode mismatch) — a wgpu \
+                     snapshot is uncompressed f32; import into a KvCompression::None \
+                     session on the same model"
+                )));
+            }
+        }
+        self.state.restore(snapshot);
+        let pos = snapshot.seq_len;
+        self.current_pos = pos;
+        self.position_atomic.store(pos as u32, Ordering::Relaxed);
+        self.last_logits = Some(last_logits);
+        // The imported context did not come from this session's own prefill, so clear
+        // the prefill telemetry `generate()` reports as prompt_eval_* (mirrors reset()).
+        self.prefill_tokens = 0;
+        self.prefill_elapsed = Duration::ZERO;
+        Ok(())
     }
 
     /// Extract the model's **per-token** last-layer hidden states (post-final
