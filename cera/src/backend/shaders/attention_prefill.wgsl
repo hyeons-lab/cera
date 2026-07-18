@@ -25,7 +25,8 @@
 //
 // Contract: caller MUST pass `max_seq ≥ start_pos + n_queries`. The K/V
 // cache must contain valid entries for positions `[0, start_pos +
-// n_queries)`, and `scores_buf` is sized `n_queries × n_heads × max_seq`.
+// n_queries)`, and `scores_buf` is sized `n_sub × n_heads × max_seq` — the
+// *dispatch-local* sub-batch, not the whole batch (see `q_base` below).
 // As a defensive belt against caller mismatches, the shader clamps
 // `seq_len = min(pos_q + 1, max_seq)` — under-sized `max_seq` produces
 // truncated (incorrect) attention rather than an OOB read, but the
@@ -40,7 +41,7 @@
 //                                          (dispatch-local; addressed by `q_idx`)
 //   @binding(5) params:     array<u32, 12>
 //        ( n_heads, n_kv_heads, head_dim, kv_dim, max_seq, scale_bits,
-//          start_pos, n_queries, q_stride, out_stride, q_base, _pad1 )
+//          start_pos, n_sub, q_stride, out_stride, q_base, _pad1 )
 //
 // `q_base` is the index, within `q_batch` / `out_batch`, of the first query in
 // this dispatch. It lets the host tile the query dimension into sub-batches so
@@ -77,7 +78,7 @@ fn attention_prefill(
     let max_seq = params[4];
     let scale = bitcast<f32>(params[5]);
     let start_pos = params[6];
-    // params[7] (n_queries) is implicit in dispatch.
+    // params[7] (n_sub, this dispatch's query count) is implicit in dispatch.
     let q_stride = params[8];
     let out_stride = params[9];
     let q_base = params[10];
