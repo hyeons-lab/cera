@@ -1,0 +1,16 @@
+# Standalone experiment crate — detached from the cera workspace on purpose so its
+# `ash` dependency never enters cera's Cargo.lock / MSRV surface.
+[workspace]
+
+[package]
+name = "vulkan-coopmat"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "coopmat-probe"
+path = "src/main.rs"
+
+[dependencies]
+ash = "0.38"
