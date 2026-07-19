@@ -246,14 +246,24 @@ fn llama_batched_prefill_parity_granite() {
     check_both("target/oracle/models/granite-3.1-2b-instruct-Q8_0.gguf");
 }
 
-// ── CI-sized fixture ───────────────────────────────────────────────────────
+// ── CI-sized fixtures ──────────────────────────────────────────────────────
+//
+// One per batched-GEMM weight dtype. `gemm_preq` dispatches on dtype, so a
+// fixture set covering only one leaves the other kernel untested — SmolLM is
+// entirely Q4_0 apart from `token_embd`, which the batched path never scans.
+// Fetched by `scripts/fetch_test_models.sh`; absent fixtures skip.
 
-/// SmolLM-135M: 30-layer llama arch, GQA (9 heads / 3 kv), ctx 2048, every
-/// projection Q4_0 — 88 MB, small enough for `scripts/fetch_test_models.sh` to
-/// pull on each CI run while still covering the grouped-KV batched path and
-/// both the naive and flash branches. The multi-GB fixtures above stay for
-/// local per-arch coverage (Qwen2 bias, Qwen3 QK-norm, Granite scalars), none
-/// of which a single llama-arch file can stand in for.
+/// Q8_0 projections -> `gemm_q8_0_q8_0`. 4 layers, 256 hidden, GQA (16/8),
+/// ctx 2048, vocab 32000 — 21 MB and about a second.
+#[test]
+#[ignore]
+fn llama_batched_prefill_parity_tinystories_20m_q8_0() {
+    check_both("target/oracle/models/TinyStories-LLaMA2-20M-GQA.Q8_0.gguf");
+}
+
+/// Q4_0 projections -> `gemm_q4_0_q8_0`. 30 layers, GQA (9/3), ctx 2048.
+/// The multi-GB fixtures above stay for local per-arch coverage (Qwen2 bias,
+/// Qwen3 QK-norm, Granite scalars), which no single llama-arch file covers.
 #[test]
 #[ignore]
 fn llama_batched_prefill_parity_smollm_135m_q4_0() {

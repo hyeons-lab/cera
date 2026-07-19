@@ -220,14 +220,14 @@ fn check(rel: &str, tokens: &[u32]) {
 #[test]
 #[ignore = "needs a real GGUF; run with --ignored"]
 fn lfm2_q4km_batched_prefill_matches_sequential() {
-    check("target/oracle/models/LFM2.5-350M-Q4_K_M.gguf", PROMPT);
+    check("target/oracle/models/LFM2.5-230M-Q4_K_M.gguf", PROMPT);
 }
 
 #[test]
 #[ignore = "needs a real GGUF; run with --ignored"]
 fn lfm2_q4km_batched_prefill_flash_matches_sequential() {
     check(
-        "target/oracle/models/LFM2.5-350M-Q4_K_M.gguf",
+        "target/oracle/models/LFM2.5-230M-Q4_K_M.gguf",
         &flash_prompt(),
     );
 }

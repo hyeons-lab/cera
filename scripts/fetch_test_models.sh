@@ -8,15 +8,26 @@
 # tensors flow through the whole forward pass.
 #
 # The fixtures below are chosen to be CI-sized rather than representative —
-# together ~310 MB and ~30 s of test time, against the multi-GB files the other
+# together ~262 MB and ~25 s of test time, against the multi-GB files the other
 # parity tests use locally:
 #
+# Chosen to cover one batched-GEMM weight dtype each — the dispatch in
+# `gemm_preq` picks a different kernel per dtype, so a fixture set that misses
+# one leaves that kernel untested:
+#
+#   TinyStories-LLaMA2-20M
+#     -GQA.Q8_0             21 MB   llama arch, GQA (16 heads / 8 kv), ctx 2048,
+#                                   vocab 32000, every projection Q8_0 —
+#                                   `gemm_q8_0_q8_0`. Runs in ~1 s.
 #   SmolLM-135M.Q4_0        88 MB   llama arch, GQA (9 heads / 3 kv), ctx 2048,
-#                                   all projections Q4_0. Exercises the dense
-#                                   transformer batched path on both the naive
-#                                   and flash (>=256 token) branches.
-#   LFM2.5-350M-Q4_K_M     219 MB   LFM2 hybrid, 82 Q4_K + 11 Q6_K tensors —
+#                                   all projections Q4_0 — `gemm_q4_0_q8_0`.
+#                                   ~8 s.
+#   LFM2.5-230M-Q4_K_M     153 MB   LFM2 hybrid, 74 Q4_K + 9 Q6_K tensors —
 #                                   the K-quant GEMM kernels and their gates.
+#                                   ~16 s.
+#
+# Each covers both the naive and the flash (>=256 token) branch, which is why
+# every fixture needs a context length above 288.
 #
 # Idempotent: a file whose checksum already matches is left alone, so this is
 # safe to run on every CI invocation in front of a warm cache. Checksums are
@@ -49,8 +60,9 @@ done
 # a hash of this file, so editing a checksum or adding a row invalidates the
 # cache automatically rather than relying on someone bumping a version suffix.
 MANIFEST=$(cat <<'EOF'
+TinyStories-LLaMA2-20M-GQA.Q8_0.gguf	86cd37850fa561d5ae2a368b9d85fcb87949c0468eda5a6da1cfab45469b1b9b	https://huggingface.co/mradermacher/TinyStories-LLaMA2-20M-256h-4l-GQA-GGUF/resolve/main/TinyStories-LLaMA2-20M-256h-4l-GQA.Q8_0.gguf
 SmolLM-135M.Q4_0.gguf	6429c98b87a4ee1ca12afe14a5d3e4658b4753c17192369485dcc51cbef9a898	https://huggingface.co/QuantFactory/SmolLM-135M-GGUF/resolve/main/SmolLM-135M.Q4_0.gguf
-LFM2.5-350M-Q4_K_M.gguf	7e6f72643caafc9a68256686638c4d7916f2cec76d1df478d4c3ddcd95a6aed4	https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF/resolve/main/LFM2.5-350M-Q4_K_M.gguf
+LFM2.5-230M-Q4_K_M.gguf	7bbd90384d3deffe4c646ec9643b212802d32d4ce417c90a1ec9282100650062	https://huggingface.co/LiquidAI/LFM2.5-230M-GGUF/resolve/main/LFM2.5-230M-Q4_K_M.gguf
 EOF
 )
 
