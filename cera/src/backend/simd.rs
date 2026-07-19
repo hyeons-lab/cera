@@ -3251,11 +3251,20 @@ pub(crate) mod avx512 {
                 let d = _mm512_set1_ps(f16::from_bits(block.delta).to_f32());
                 let quants_ptr = block.quants.as_ptr();
                 let y_ptr = y.as_ptr().add(b * 32);
-                for i in (0..32).step_by(16) {
-                    let q128 = _mm_loadu_si128(quants_ptr.add(i) as *const __m128i);
-                    let qf = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(q128));
-                    acc = _mm512_fmadd_ps(_mm512_mul_ps(d, qf), _mm512_loadu_ps(y_ptr.add(i)), acc);
-                }
+
+                // Written out rather than looped over the two halves so this
+                // mirrors `row_dot_q4_0_f32_avx512` line for line — the two
+                // kernels differ only in how a block is unpacked, and that is
+                // easier to check when their shapes match. Codegen is the same
+                // either way: a 2-iteration constant-bound loop unrolls.
+                let qf_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    quants_ptr as *const __m128i,
+                )));
+                acc = _mm512_fmadd_ps(_mm512_mul_ps(d, qf_lo), _mm512_loadu_ps(y_ptr), acc);
+                let qf_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    quants_ptr.add(16) as *const __m128i,
+                )));
+                acc = _mm512_fmadd_ps(_mm512_mul_ps(d, qf_hi), _mm512_loadu_ps(y_ptr.add(16)), acc);
             }
             _mm512_reduce_add_ps(acc)
         }
