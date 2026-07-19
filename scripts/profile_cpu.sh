@@ -20,6 +20,16 @@
 #   scripts/profile_cpu.sh --model <path.gguf> [--mode prefill|decode|both]
 #                          [--cores 0-15] [--device cpu] [--tool auto|perf|samply]
 #                          [--prompt 512] [--decode 128]
+#                          [--bin ./target/release/cera]
+#
+#   --prompt   prompt length for the *prefill* profile only. The decode profile
+#              fixes its prompt at 32 tokens on purpose — a long prompt there
+#              would put prefill back into a sample meant to isolate decode, so
+#              this is not a knob.
+#   --decode   number of decoded tokens for the decode profile. The prefill
+#              profile fixes `--max-tokens 1` for the mirror-image reason.
+#   --bin      the binary to profile. Defaults to ./target/release/cera; point
+#              it at another build to compare two binaries on one host.
 #
 # Symbols require a non-stripped binary with frame pointers — cera's release
 # profile strips (see Cargo.toml). Prefer `just profile-cpu <model>`, which
