@@ -460,8 +460,10 @@ impl LlamaModel {
     /// prefill). Reads each weight matrix once for all `n` tokens. Column-major
     /// `hidden[hs × n]` (token `j` of channel `i` at `i*n + j`). Numerically
     /// matches the per-token `forward` path. Only compiled where a batched-GEMM
-    /// kernel exists (aarch64 NEON, or any target with the `blas` feature); the
-    /// per-token fallback covers every other build.
+    /// kernel exists (aarch64 NEON, x86_64 AVX-512 VNNI, or any target with the
+    /// `blas` feature); the per-token fallback covers every other build. On
+    /// x86_64 the kernel is additionally a *runtime* property, so the dtype scan
+    /// below also asks `batched_gemm_supports` before committing to this path.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
     /// Batched-GEMM prefill. When `hidden_out` is `Some`, this captures the
     /// per-token post-final-norm hidden states into it (row-major `[n * hs]`),
@@ -517,10 +519,21 @@ impl LlamaModel {
                 ("ffn_up", &r.ffn_up),
                 ("ffn_down", &r.ffn_down),
             ] {
+                // Two independent conditions, and both must hold:
+                //   1. the dtype allowlist above (deliberately narrower than
+                //      `batched_gemm_supports`, which also admits Q4_K/Q6_K), and
+                //   2. whether a kernel can actually run *on this host* — on x86
+                //      the int8 GEMM needs runtime VNNI, and a non-VNNI part must
+                //      stay on the per-token path.
+                // Without (2) a non-VNNI x86 build reaches `gemm_preq`, no kernel
+                // runs, and callers reuse one output buffer across layers — so the
+                // previous layer's activations survive as this layer's result.
+                // Silent wrong numbers, not a crash.
                 if !matches!(
                     w.dtype,
                     crate::tensor::DType::Q4_0 | crate::tensor::DType::Q8_0
-                ) {
+                ) || !transformer::batched_gemm_supports(w.dtype, w.k)
+                {
                     unbatchable = Some((name, w.dtype));
                     break;
                 }

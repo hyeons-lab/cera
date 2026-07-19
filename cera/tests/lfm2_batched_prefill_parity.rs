@@ -7,8 +7,9 @@
 //! crash — it produces *fluent but different* text, which is indistinguishable from
 //! "the model is just like that" by eye.
 //!
-//! Why the bar is tight: on aarch64 the per-token Q4_K/Q6_K GEMVs quantize the
-//! activations to Q8_0 and run the same int8 dot as the batched GEMM, so the two
+//! Why the bar is tight: on aarch64 (NEON) and on x86_64 (AVX-512 VNNI) the
+//! per-token Q4_K/Q6_K GEMVs quantize the activations to Q8_0 and run the same
+//! int8 dot as the batched GEMM, so the two
 //! paths do the *same arithmetic* and differ only in float summation order. Cosine
 //! must therefore be ~1.0 and the argmax must match. (Under `blas` the projections
 //! run through f32 SGEMM instead, a legitimate reduction difference, so the bound is
@@ -19,7 +20,7 @@
 //!   cargo test -p cera --release --test lfm2_batched_prefill_parity -- --ignored --nocapture
 //! ```
 
-#![cfg(any(target_arch = "aarch64", feature = "blas"))]
+#![cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
 
 use std::path::PathBuf;
 
@@ -110,6 +111,7 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, usize, usize)> {
     // lies about what it covered.
     eprintln!("[parity] loading {} ({} tok)", path.display(), tokens.len());
     assert_is_k_quant(&path);
+    assert_batched_path_is_live();
 
     // (a) Sequential per-token.
     let gguf_seq = cera::gguf::GgufFile::open(&path).unwrap();
@@ -132,6 +134,24 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, usize, usize)> {
         argmax(&logits_pre),
         argmax(&logits_seq),
     ))
+}
+
+/// This test is only meaningful if `forward_prefill` actually takes the batched
+/// path. On x86_64 that needs runtime AVX-512 VNNI: without it the model gates
+/// itself back onto the per-token path, and both halves of the comparison become
+/// the *same* code — a guaranteed cosine of 1.0 that proves nothing. The file
+/// header promises "a non-batched target can't silently compare the per-token
+/// path against itself"; the cfg alone stopped delivering that once x86_64 was
+/// admitted, because there the capability is a runtime property, not a compile
+/// -time one.
+fn assert_batched_path_is_live() {
+    #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+    assert!(
+        cera::backend::cpu::int8_gemm_available(),
+        "x86_64 host has no runtime AVX-512 VNNI, so `forward_prefill` falls back \
+         to the per-token path — this test would compare it against itself and \
+         pass vacuously. Run on a VNNI host, or build with `--features blas`."
+    );
 }
 
 fn check(rel: &str, tokens: &[u32]) {
