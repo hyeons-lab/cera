@@ -3258,6 +3258,541 @@ mod avx512 {
     }
 }
 
+// ── x86_64 AVX-512 VNNI (int8 activations) ──────────────────────────────────
+//
+// The quantized-activation path the `avx512` module above defers to: instead of
+// widening int8 weights to f32 and running FMA, quantize the *activations* to
+// Q8_0 once and keep the whole dot product in int8, exactly like the aarch64
+// dotprod/i8mm kernels. `_mm256_dpbusd_epi32` retires 32 int8 MACs per op
+// against `_mm256_fmadd_ps`'s 8 f32 lanes.
+//
+// **Signedness.** VNNI's `dpbusd` takes an *unsigned* first operand and a signed
+// second, but both our operands are signed. The standard fix (llama.cpp uses the
+// same one) is `_mm256_sign_epi8`: `ax = sign(w, w)` is `|w|` (unsigned-safe —
+// even `-128` maps to the byte `0x80` = 128, which is a valid u8 multiplicand),
+// and `sy = sign(a, w)` folds `w`'s sign onto the activation. Their product is
+// `|w| * sign(w) * a == w * a`, and the `w == 0` lanes zero both sides. No
+// correction term, unlike the `-8 * sum(act)` a recentre-first formulation needs.
+//
+// **Accumulation.** Each Q8_0/Q4_0 block carries its own scale, so the int32 dot
+// has to be scaled per block — but the *reduction* does not. Per block we convert
+// the 8 int32 partials to f32 and FMA them into a vector accumulator, then
+// reduce once per row. The `avx512` f32 kernels above instead call
+// `_mm512_reduce_add_ps` per 32-element block; that horizontal reduce is a long
+// dependency chain in the innermost loop.
+//
+// NOTE: not executable on the aarch64 dev host, and needs a VNNI-capable x86
+// (Zen 4/5, Sapphire Rapids). `avx512_vnni_tests` below run only where
+// `is_x86_feature_detected!("avx512vnni")` holds and compare against the scalar
+// reference; elsewhere they skip.
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+pub(crate) mod avx512_vnni {
+    // 1.89 `_mm512_*`/`_mm256_dpbusd_*` intrinsics vs the 1.85 MSRV — same
+    // rationale as the `avx512` module above.
+    #![allow(clippy::incompatible_msrv)]
+    use super::*;
+    use std::arch::x86_64::*;
+
+    /// Horizontal sum of the 8 f32 lanes. Called once per output element, never
+    /// inside the block loop — see the module note on accumulation.
+    #[target_feature(enable = "avx")]
+    unsafe fn hsum256_ps(v: __m256) -> f32 {
+        let hi = _mm256_extractf128_ps(v, 1);
+        let lo = _mm256_castps256_ps128(v);
+        let sum = _mm_add_ps(hi, lo);
+        let shuf = _mm_movehl_ps(sum, sum);
+        let sum = _mm_add_ps(sum, shuf);
+        let shuf = _mm_shuffle_ps(sum, sum, 0x55);
+        _mm_cvtss_f32(_mm_add_ss(sum, shuf))
+    }
+
+    /// int8 dot of one 32-element block → 8 int32 partial sums.
+    ///
+    /// See the module note for why the operands go through `_mm256_sign_epi8`.
+    ///
+    /// **Precondition:** activation bytes must be in `[-127, 127]`. `-128` is
+    /// the one value the sign trick cannot represent — `sign(a, w)` negates `a`
+    /// when `w < 0`, and negating `-128` wraps back to `-128`, silently flipping
+    /// that lane's sign. Weights may be `-128` (only `|w|` is taken, and `0x80`
+    /// is a valid u8 multiplicand); activations may not. Every activation
+    /// reaching here comes from `quantize_f32_to_q8_0_*`, which is bounded by
+    /// `amax / 127` and guards the non-finite case, so it cannot emit `-128`.
+    #[inline]
+    #[target_feature(enable = "avx2,avx512vl,avx512vnni")]
+    unsafe fn dot32(w: __m256i, a: __m256i) -> __m256i {
+        let ax = _mm256_sign_epi8(w, w);
+        let sy = _mm256_sign_epi8(a, w);
+        _mm256_dpbusd_epi32(_mm256_setzero_si256(), ax, sy)
+    }
+
+    /// Unpack one Q4_0 block's 16 nibble-pairs into 32 signed bytes in
+    /// `[-8, 7]`. Low nibbles are elements 0..16, high nibbles 16..32 — the
+    /// same layout the NEON and scalar Q4_0 kernels assume.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn unpack_q4_0(qs: *const u8) -> __m256i {
+        unsafe {
+            let qb = _mm_loadu_si128(qs as *const __m128i);
+            let mask = _mm_set1_epi8(0x0F);
+            let lo = _mm_and_si128(qb, mask);
+            let hi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask);
+            _mm256_sub_epi8(_mm256_set_m128i(hi, lo), _mm256_set1_epi8(8))
+        }
+    }
+
+    /// Quantize `x` to Q8_0 blocks (scales + int8 quants).
+    ///
+    /// Mirrors `quantize_f32_to_q8_0_neon`, including the f16 round-trip of the
+    /// scale: the aarch64 kernels store `d` as f16 because that is what a Q8_0
+    /// block holds on disk, and a GEMV that mixed an f32 `d` here with an f16 `d`
+    /// there would drift from the reference by more than rounding.
+    #[target_feature(enable = "avx512f,avx512vl,avx2")]
+    pub unsafe fn quantize_f32_to_q8_0_avx512(x: &[f32], scales: &mut [f32], quants: &mut [i8]) {
+        unsafe {
+            let k = x.len();
+            debug_assert_eq!(
+                k % 32,
+                0,
+                "quantize_f32_to_q8_0: x.len() must be divisible by 32"
+            );
+            debug_assert!(scales.len() >= k / 32);
+            debug_assert!(quants.len() >= k);
+
+            let abs_mask = _mm512_set1_ps(f32::from_bits(0x7FFF_FFFF));
+            // Indexed rather than `scales.iter_mut().take(..).enumerate()`: the
+            // iterator form measured ~6% slower on prefill (LFM2.5-350M Q4_0,
+            // Zen 5 — 175 vs 190 tok/s median over 3 reps), which is why the
+            // lint is silenced here instead of obeyed.
+            #[allow(clippy::needless_range_loop)]
+            for bi in 0..k / 32 {
+                let scale = &mut scales[bi];
+                let base = bi * 32;
+                let x_ptr = x.as_ptr().add(base);
+                let v0 = _mm512_loadu_ps(x_ptr);
+                let v1 = _mm512_loadu_ps(x_ptr.add(16));
+
+                let amax = _mm512_reduce_max_ps(_mm512_max_ps(
+                    _mm512_and_ps(v0, abs_mask),
+                    _mm512_and_ps(v1, abs_mask),
+                ));
+
+                let d = amax / 127.0;
+                // A near-zero block drives `d` denormal, and then `1.0 / d`
+                // overflows to infinity. `_mm512_cvtps_epi32` maps any non-finite
+                // operand to INT_MIN, which `cvtsepi32_epi8` saturates to -128 —
+                // the one activation value `dot32`'s sign trick cannot represent
+                // (`_mm256_sign_epi8` wraps negating it). The scalar quantizer
+                // saturates the other way (+127), so without this the two
+                // disagree byte-for-byte on the same input. The stored f16 scale
+                // flushes to 0 for every such block, so results are unaffected
+                // either way — but that is a coincidence, not a contract. Pin
+                // both paths to a defined 0.
+                let id = match 1.0 / d {
+                    r if d != 0.0 && r.is_finite() => r,
+                    _ => 0.0,
+                };
+                // Round-trip through f16 so the scale matches a stored Q8_0 block.
+                *scale = f16::from_f32(d).to_f32();
+
+                let idv = _mm512_set1_ps(id);
+                let p0 = _mm512_mul_ps(v0, idv);
+                let p1 = _mm512_mul_ps(v1, idv);
+                // Scrub non-finite lanes to 0 before converting. A NaN
+                // activation — or an infinity, whose product with the guarded
+                // `id` is NaN — converts to INT_MIN on x86 and saturates to
+                // -128, the one value `dot32`'s sign trick cannot represent.
+                // Unlike the denormal case above, a single NaN among otherwise
+                // normal values leaves the block scale perfectly normal, so that
+                // -128 is *live*: it would silently flip that lane's sign
+                // against any negative weight, turning a NaN that should have
+                // propagated into a plausible finite number. Mapping to 0
+                // matches what the scalar path's saturating `as i8` cast
+                // already does, keeping the two byte-identical.
+                let p0 = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask::<_CMP_ORD_Q>(p0, p0), p0);
+                let p1 = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask::<_CMP_ORD_Q>(p1, p1), p1);
+                // Default rounding is round-to-nearest-even, matching NEON's `vcvtnq`.
+                let q0 = _mm512_cvtps_epi32(p0);
+                let q1 = _mm512_cvtps_epi32(p1);
+                let out = quants.as_mut_ptr().add(base);
+                _mm_storeu_si128(out as *mut __m128i, _mm512_cvtsepi32_epi8(q0));
+                _mm_storeu_si128(out.add(16) as *mut __m128i, _mm512_cvtsepi32_epi8(q1));
+            }
+        }
+    }
+
+    /// Dot one Q4_0 weight row against the pre-quantized activation.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    unsafe fn row_dot_q4_0(row: *const u8, x_scales: &[f32], x_quants: &[i8], nb: usize) -> f32 {
+        unsafe {
+            let bsz = size_of::<BlockQ4_0>();
+            let mut acc = _mm256_setzero_ps();
+            for b in 0..nb {
+                let block = &*(row.add(b * bsz) as *const BlockQ4_0);
+                let w = unpack_q4_0(block.qs.as_ptr());
+                let a = _mm256_loadu_si256(x_quants.as_ptr().add(b * 32) as *const __m256i);
+                let scale =
+                    _mm256_set1_ps(f16::from_bits(block.d).to_f32() * *x_scales.get_unchecked(b));
+                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
+            }
+            hsum256_ps(acc)
+        }
+    }
+
+    /// Dot one Q8_0 weight row against the pre-quantized activation.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    unsafe fn row_dot_q8_0(row: *const u8, x_scales: &[f32], x_quants: &[i8], nb: usize) -> f32 {
+        unsafe {
+            let bsz = size_of::<BlockQ8_0>();
+            let mut acc = _mm256_setzero_ps();
+            for b in 0..nb {
+                let block = &*(row.add(b * bsz) as *const BlockQ8_0);
+                let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
+                let a = _mm256_loadu_si256(x_quants.as_ptr().add(b * 32) as *const __m256i);
+                let scale = _mm256_set1_ps(
+                    f16::from_bits(block.delta).to_f32() * *x_scales.get_unchecked(b),
+                );
+                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
+            }
+            hsum256_ps(acc)
+        }
+    }
+
+    /// Q4_0 weights × pre-quantized Q8_0 activations: `y[m] = A[m,k] @ x[k]`.
+    ///
+    /// Row-parallel over the **RowPool** above `gemv_par_threshold()`, matching
+    /// the NEON pre-quantized GEMV — decode dispatches these constantly, and
+    /// rayon's fork-join barrier per call is the wrong trade there.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    pub unsafe fn gemv_q4_0_q8_0_avx512(
+        a_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y: &mut [f32],
+        m: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(k % 32, 0, "Q4_0 GEMV: k must be divisible by 32");
+        let nb = k / 32;
+        let row_bytes = nb * size_of::<BlockQ4_0>();
+        debug_assert_eq!(a_quant.len(), m * row_bytes);
+        debug_assert_eq!(y.len(), m);
+        debug_assert!(x_scales.len() >= nb && x_quants.len() >= k);
+
+        let base = a_quant.as_ptr() as usize;
+        let compute_row = |(i, yi): (usize, &mut f32)| {
+            // SAFETY: row `i` spans `a_quant[i*row_bytes ..][..row_bytes]`, in
+            // bounds by the assert above; `y` rows are disjoint per worker.
+            *yi = unsafe {
+                row_dot_q4_0(
+                    (base as *const u8).add(i * row_bytes),
+                    x_scales,
+                    x_quants,
+                    nb,
+                )
+            };
+        };
+
+        if m >= crate::backend::cpu::gemv_par_threshold() {
+            crate::backend::cpu::par_rows(y, crate::backend::cpu::gemv_min_rows(), compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
+        }
+    }
+
+    /// Q8_0 weights × pre-quantized Q8_0 activations: `y[m] = A[m,k] @ x[k]`.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    pub unsafe fn gemv_q8_0_q8_0_avx512(
+        a_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y: &mut [f32],
+        m: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(k % 32, 0, "Q8_0 GEMV: k must be divisible by 32");
+        let nb = k / 32;
+        let row_bytes = nb * size_of::<BlockQ8_0>();
+        debug_assert_eq!(a_quant.len(), m * row_bytes);
+        debug_assert_eq!(y.len(), m);
+        debug_assert!(x_scales.len() >= nb && x_quants.len() >= k);
+
+        let base = a_quant.as_ptr() as usize;
+        let compute_row = |(i, yi): (usize, &mut f32)| {
+            // SAFETY: as in the Q4_0 GEMV above.
+            *yi = unsafe {
+                row_dot_q8_0(
+                    (base as *const u8).add(i * row_bytes),
+                    x_scales,
+                    x_quants,
+                    nb,
+                )
+            };
+        };
+
+        if m >= crate::backend::cpu::gemv_par_threshold() {
+            crate::backend::cpu::par_rows(y, crate::backend::cpu::gemv_min_rows(), compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
+        }
+    }
+
+    #[cfg(test)]
+    mod avx512_vnni_tests {
+        use super::*;
+
+        /// Uniform `[0, 1)`. Deliberately not the `avx512_tests` `lcg`, which
+        /// returns `[-1, 0)` — the byte-pattern builders below cast to `u8`, and
+        /// a negative float saturates to 0 there, which would quietly test a
+        /// matrix of all-zero nibbles.
+        fn lcg01(state: &mut u64) -> f32 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (*state >> 40) as f32 / (1u64 << 24) as f32
+        }
+
+        /// Tier-test gate; mirrors the one in `avx512_tests`. With
+        /// `CERA_REQUIRE_SIMD=avx512vnni` a missing feature fails instead of
+        /// skipping, so CI on VNNI hardware proves these kernels actually ran.
+        fn require_simd_or_skip(feature: &str, detected: bool) -> bool {
+            if detected {
+                return true;
+            }
+            let required = std::env::var("CERA_REQUIRE_SIMD").unwrap_or_default();
+            assert!(
+                !required.split(',').any(|f| f.trim() == feature),
+                "CERA_REQUIRE_SIMD requires `{feature}` but this host doesn't report it"
+            );
+            false
+        }
+
+        /// Scalar mirror of `quantize_f32_to_q8_0_avx512`, including the f16
+        /// round-trip of `d` and round-to-nearest-even.
+        fn ref_quantize(x: &[f32]) -> (Vec<f32>, Vec<i8>) {
+            let mut scales = Vec::new();
+            let mut quants = Vec::new();
+            for blk in x.chunks(32) {
+                let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                let d = amax / 127.0;
+                // Mirrors the non-finite guard in the kernel under test.
+                let id = match 1.0 / d {
+                    r if d != 0.0 && r.is_finite() => r,
+                    _ => 0.0,
+                };
+                scales.push(f16::from_f32(d).to_f32());
+                for &v in blk {
+                    quants.push((v * id).round_ties_even().clamp(-128.0, 127.0) as i8);
+                }
+            }
+            (scales, quants)
+        }
+
+        /// Exact integer reference for a Q4_0 × Q8_0 dot: the kernel's contract
+        /// is `sum_b d_w[b] * d_x[b] * <nibbles-8, x_quants>`, so the reference
+        /// does that in i32 rather than dequantizing to f32 (which would fold in
+        /// a second, different rounding and make a real mismatch unreadable).
+        fn ref_gemv_q4_0(a: &[u8], xs: &[f32], xq: &[i8], m: usize, k: usize) -> Vec<f32> {
+            let nb = k / 32;
+            let bsz = size_of::<BlockQ4_0>();
+            let mut y = vec![0.0f32; m];
+            for (i, yi) in y.iter_mut().enumerate() {
+                for b in 0..nb {
+                    let blk =
+                        unsafe { &*(a.as_ptr().add(i * nb * bsz + b * bsz) as *const BlockQ4_0) };
+                    let mut acc = 0i32;
+                    for t in 0..16 {
+                        let byte = blk.qs[t];
+                        acc += ((byte & 0xF) as i32 - 8) * xq[b * 32 + t] as i32;
+                        acc += ((byte >> 4) as i32 - 8) * xq[b * 32 + t + 16] as i32;
+                    }
+                    *yi += f16::from_bits(blk.d).to_f32() * xs[b] * acc as f32;
+                }
+            }
+            y
+        }
+
+        fn ref_gemv_q8_0(a: &[u8], xs: &[f32], xq: &[i8], m: usize, k: usize) -> Vec<f32> {
+            let nb = k / 32;
+            let bsz = size_of::<BlockQ8_0>();
+            let mut y = vec![0.0f32; m];
+            for (i, yi) in y.iter_mut().enumerate() {
+                for b in 0..nb {
+                    let blk =
+                        unsafe { &*(a.as_ptr().add(i * nb * bsz + b * bsz) as *const BlockQ8_0) };
+                    let mut acc = 0i32;
+                    for t in 0..32 {
+                        acc += blk.quants[t] as i32 * xq[b * 32 + t] as i32;
+                    }
+                    *yi += f16::from_bits(blk.delta).to_f32() * xs[b] * acc as f32;
+                }
+            }
+            y
+        }
+
+        fn rand_q4_0_rows(m: usize, k: usize, st: &mut u64) -> Vec<u8> {
+            let nb = k / 32;
+            let mut v = Vec::with_capacity(m * nb * size_of::<BlockQ4_0>());
+            for _ in 0..m * nb {
+                v.extend_from_slice(
+                    &f16::from_f32(lcg01(st) * 0.05 + 0.01)
+                        .to_bits()
+                        .to_le_bytes(),
+                );
+                for _ in 0..16 {
+                    v.push((lcg01(st) * 255.0) as u8);
+                }
+            }
+            v
+        }
+
+        fn rand_q8_0_rows(m: usize, k: usize, st: &mut u64) -> Vec<u8> {
+            let nb = k / 32;
+            let mut v = Vec::with_capacity(m * nb * size_of::<BlockQ8_0>());
+            for _ in 0..m * nb {
+                v.extend_from_slice(
+                    &f16::from_f32(lcg01(st) * 0.05 + 0.01)
+                        .to_bits()
+                        .to_le_bytes(),
+                );
+                for _ in 0..32 {
+                    v.push(((lcg01(st) * 254.0) as i32 - 127) as i8 as u8);
+                }
+            }
+            v
+        }
+
+        fn assert_close(got: &[f32], want: &[f32], what: &str) {
+            for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-3 * (1.0 + w.abs()),
+                    "{what}[{i}]: {g} vs {w}"
+                );
+            }
+        }
+
+        #[test]
+        fn quantize_q8_0_avx512_matches_scalar() {
+            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+                return;
+            }
+            let mut st = 0x1357_9bdfu64;
+            let x: Vec<f32> = (0..256).map(|_| lcg01(&mut st) * 4.0 - 2.0).collect();
+            let (ws, wq) = ref_quantize(&x);
+            let mut gs = vec![0.0f32; 8];
+            let mut gq = vec![0i8; 256];
+            unsafe { quantize_f32_to_q8_0_avx512(&x, &mut gs, &mut gq) };
+            assert_eq!(gs, ws, "scales");
+            assert_eq!(gq, wq, "quants");
+        }
+
+        /// An all-zero block makes `d == 0`, so the reciprocal is forced to 0
+        /// rather than inf — check the kernel takes that branch too.
+        #[test]
+        fn quantize_q8_0_avx512_handles_zero_block() {
+            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+                return;
+            }
+            let x = vec![0.0f32; 64];
+            let mut gs = vec![9.0f32; 2];
+            let mut gq = vec![9i8; 64];
+            unsafe { quantize_f32_to_q8_0_avx512(&x, &mut gs, &mut gq) };
+            assert_eq!(gs, vec![0.0, 0.0]);
+            assert!(gq.iter().all(|&q| q == 0));
+        }
+
+        /// Non-finite inputs must not reach `dot32` as `-128`.
+        ///
+        /// Two distinct hazards, both x86-specific: a near-zero block drives `d`
+        /// denormal and `1.0 / d` to infinity, and a NaN activation converts
+        /// straight to INT_MIN. Either saturates to `-128`, the one activation
+        /// value the sign trick cannot represent, while the scalar path
+        /// saturates to `+127`/`0` — so the two quantizers disagreed
+        /// byte-for-byte on the same input.
+        ///
+        /// The mixed cases are the dangerous ones: with one NaN among normal
+        /// values the block scale stays perfectly normal, so the `-128` is live
+        /// and would silently flip that lane's sign against a negative weight,
+        /// converting a NaN that should have propagated into a plausible finite
+        /// number.
+        #[test]
+        fn quantize_q8_0_avx512_non_finite_blocks_match_scalar() {
+            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+                return;
+            }
+            let mut cases: Vec<(&str, Vec<f32>)> = Vec::new();
+            for (label, amax) in [
+                ("small", 1e-30f32),
+                ("denormal-d", 1e-38),
+                ("denormal-d2", 1e-40),
+                ("flush-to-zero", 1e-44),
+                ("all-nan", f32::NAN),
+            ] {
+                let mut x = vec![0.0f32; 32];
+                x[0] = amax;
+                x[1] = -amax;
+                x[2] = amax / 2.0;
+                cases.push((label, x));
+            }
+            // Scale stays normal here, so a stray -128 would be live.
+            let mut mixed_nan = vec![0.25f32; 32];
+            mixed_nan[0] = f32::NAN;
+            mixed_nan[1] = -1.0;
+            cases.push(("nan-with-normal", mixed_nan));
+            let mut mixed_inf = vec![0.25f32; 32];
+            mixed_inf[0] = f32::INFINITY;
+            mixed_inf[1] = -1.0;
+            cases.push(("inf-with-normal", mixed_inf));
+
+            for (label, x) in cases {
+                let (ws, wq) = ref_quantize(&x);
+                let mut gs = vec![0.0f32; 1];
+                let mut gq = vec![0i8; 32];
+                unsafe { quantize_f32_to_q8_0_avx512(&x, &mut gs, &mut gq) };
+
+                assert_eq!(gq, wq, "quants disagree with scalar ({label})");
+                assert!(
+                    gq.iter().all(|&q| q != -128),
+                    "emitted -128, which breaks the dot32 sign trick ({label})"
+                );
+                assert_eq!(gs[0].is_nan(), ws[0].is_nan(), "scale NaN-ness ({label})");
+                if !gs[0].is_nan() {
+                    assert_eq!(gs[0], ws[0], "scale disagrees with scalar ({label})");
+                }
+            }
+        }
+
+        #[test]
+        fn gemv_q4_0_q8_0_avx512_matches_scalar() {
+            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+                return;
+            }
+            let (m, k) = (37, 128); // odd m exercises the row tail
+            let mut st = 0x2468_1357u64;
+            let a = rand_q4_0_rows(m, k, &mut st);
+            let x: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+            let (xs, xq) = ref_quantize(&x);
+            let mut y = vec![0.0f32; m];
+            unsafe { gemv_q4_0_q8_0_avx512(&a, &xs, &xq, &mut y, m, k) };
+            assert_close(&y, &ref_gemv_q4_0(&a, &xs, &xq, m, k), "gemv_q4_0");
+        }
+
+        #[test]
+        fn gemv_q8_0_q8_0_avx512_matches_scalar() {
+            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+                return;
+            }
+            let (m, k) = (37, 128);
+            let mut st = 0x9876_5432u64;
+            let a = rand_q8_0_rows(m, k, &mut st);
+            let x: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+            let (xs, xq) = ref_quantize(&x);
+            let mut y = vec![0.0f32; m];
+            unsafe { gemv_q8_0_q8_0_avx512(&a, &xs, &xq, &mut y, m, k) };
+            assert_close(&y, &ref_gemv_q8_0(&a, &xs, &xq, m, k), "gemv_q8_0");
+        }
+    }
+}
+
 // ── Dispatch ────────────────────────────────────────────────────────────────
 
 /// Best available Q4_0 dot product.
