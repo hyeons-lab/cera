@@ -33,6 +33,14 @@ run *ARGS:
 bench *ARGS:
     cargo run --release --bin cera -- bench {{ARGS}}
 
+# Profile host CPU prefill/decode hotspots (perf or samply).
+# Builds unstripped with frame pointers — the release profile strips, which
+# would leave the profile as bare addresses.
+profile-cpu MODEL *ARGS:
+    CARGO_PROFILE_RELEASE_STRIP=false RUSTFLAGS='-C force-frame-pointers=yes' \
+        cargo build --release -p cera-cli
+    ./scripts/profile_cpu.sh --model {{MODEL}} {{ARGS}}
+
 # Run all CI checks locally (mirrors GitHub Actions)
 ci: fmt clippy test
 
