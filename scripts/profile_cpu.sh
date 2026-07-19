@@ -19,7 +19,7 @@
 # Usage:
 #   scripts/profile_cpu.sh --model <path.gguf> [--mode prefill|decode|both]
 #                          [--cores 0-15] [--device cpu] [--tool auto|perf|samply]
-#                          [--prompt 512] [--decode 128] [--duration 20]
+#                          [--prompt 512] [--decode 128]
 #
 # Symbols require a non-stripped binary with frame pointers — cera's release
 # profile strips (see Cargo.toml), so build the binary for profiling with:
@@ -33,7 +33,6 @@ MODE="both"
 CORES=""
 PROMPT=512
 DECODE=128
-DURATION=20
 TOOL="auto"
 BIN="./target/release/cera"
 
@@ -46,7 +45,6 @@ while [[ $# -gt 0 ]]; do
     --cores)    CORES="$2"; shift 2 ;;
     --prompt)   PROMPT="$2"; shift 2 ;;
     --decode)   DECODE="$2"; shift 2 ;;
-    --duration) DURATION="$2"; shift 2 ;;
     --tool)     TOOL="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -56,14 +54,21 @@ done
 [[ -f "$MODEL" ]] || { echo "error: model not found: $MODEL" >&2; exit 2; }
 [[ -x "$BIN" ]]   || { echo "error: $BIN missing — cargo build --release -p cera-cli" >&2; exit 2; }
 case "$MODE" in prefill|decode|both) ;; *) echo "--mode must be prefill|decode|both" >&2; exit 2 ;; esac
+case "$TOOL" in auto|perf|samply) ;; *) echo "--tool must be auto|perf|samply" >&2; exit 2 ;; esac
 
 OS="$(uname -s)"
 
 # Default core pinning: the first half of the logical CPUs, which on an SMT part
 # is one thread per physical core. Explicit --cores overrides.
+#
+# Floor the half at 1: on a single-core host or a 1-CPU container `NPROC / 2` is
+# 0, and the naive `0-$((NPROC/2-1))` builds the string `0--1`, which taskset
+# rejects.
 if [[ -z "$CORES" && "$OS" == "Linux" ]]; then
   NPROC="$(nproc)"
-  CORES="0-$(( NPROC / 2 - 1 ))"
+  HALF=$(( NPROC / 2 ))
+  (( HALF < 1 )) && HALF=1
+  CORES="0-$(( HALF - 1 ))"
 fi
 
 # A stripped binary profiles as a wall of hex addresses. Say so up front rather
@@ -121,20 +126,37 @@ run_one() {
                --prompt-tokens "$prompt" --max-tokens "$maxtok"
                --runs 3 --warmup 1 --no-cache)
 
+  # Delete any previous capture first. If the recorder then fails, we must not
+  # fall through and report the *last* run's samples as if they were this run's
+  # — a profiler that silently shows stale data defeats the entire point of the
+  # script, which is to make a perf claim falsifiable.
+  rm -f "${out}.data" "${out}.json.gz"
+
   if [[ "$TOOL" == "perf" ]]; then
-    # -g call graphs (needs frame pointers); --  everything after is the workload.
-    perf record -g --freq 999 -o "${out}.data" -- \
-      "${PIN[@]}" "${bench[@]}" >/dev/null 2>&1 || true
+    # -g call graphs (needs frame pointers); -- everything after is the workload.
+    if ! perf record -g --freq 999 -o "${out}.data" -- \
+         "${PIN[@]+"${PIN[@]}"}" "${bench[@]}" >"${out}.log" 2>&1; then
+      echo "error: perf record failed — last lines of ${out}.log:" >&2
+      tail -5 "${out}.log" >&2
+      return 1
+    fi
 
     echo
     echo "==> top symbols (self time)"
-    perf report -i "${out}.data" --stdio --sort symbol --percent-limit 0.5 2>/dev/null \
-      | grep -v '^#' | grep -v '^$' | head -30
+    # `|| true` because `head` closing the pipe SIGPIPEs its producers, and
+    # under `set -o pipefail` that non-zero status would trip `set -e` and kill
+    # the script — which in `--mode both` meant the decode profile never ran.
+    { perf report -i "${out}.data" --stdio --sort symbol --percent-limit 0.5 2>/dev/null \
+        | grep -v '^#' | grep -v '^$' | head -30; } || true
     echo
     echo "    full report: perf report -i ${out}.data"
   else
-    samply record --save-only -o "${out}.json.gz" -- \
-      "${PIN[@]}" "${bench[@]}" >/dev/null 2>&1 || true
+    if ! samply record --save-only -o "${out}.json.gz" -- \
+         "${PIN[@]+"${PIN[@]}"}" "${bench[@]}" >"${out}.log" 2>&1; then
+      echo "error: samply record failed — last lines of ${out}.log:" >&2
+      tail -5 "${out}.log" >&2
+      return 1
+    fi
     echo "    saved: ${out}.json.gz  (view: samply load ${out}.json.gz)"
   fi
 }
