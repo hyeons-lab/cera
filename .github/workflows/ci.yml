@@ -870,8 +870,8 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     # Unlike the other fixture-backed jobs this runs on PRs too. Those pull
-    # multi-hundred-MB bundles for end-to-end checks; this pulls ~310 MB once
-    # and then runs in ~30 s off a warm cache, and it guards the class of bug
+    # multi-hundred-MB bundles for end-to-end checks; this pulls 267 MB once
+    # and then runs in ~25 s off a warm cache, and it guards the class of bug
     # that is invisible without it — a batched GEMM that produces plausible
     # wrong numbers rather than crashing.
     timeout-minutes: 20
@@ -890,8 +890,8 @@ jobs:
             sudo rm -f -- "$f"
           done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
           sudo apt-get update && sudo apt-get install -y libopenblas-dev
-      # On a PR this is the `core` set (262 MB): both int8 GEMM kernels plus the
-      # K-quant path. On a main push or manual dispatch it is `all` (5.1 GB),
+      # On a PR this is the `core` set (267 MB): both int8 GEMM kernels plus the
+      # K-quant path. On a main push or manual dispatch it is `all` (5.5 GB),
       # adding one fixture per dense arch. Two separate cache entries rather
       # than one, so the per-PR restore stays small — GitHub allows 10 GB of
       # cache per repo in total, and a 5 GB entry restored on every PR would

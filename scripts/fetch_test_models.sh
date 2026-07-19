@@ -8,8 +8,13 @@
 # tensors flow through the whole forward pass.
 #
 # The fixtures below are chosen to be CI-sized rather than representative —
-# together ~5.4 GB and ~90 s of test time, against the multi-GB files the other
-# parity tests use locally:
+# together 5.5 GB and ~90 s of test time, against the multi-GB files the other
+# parity tests use locally.
+#
+# Sizes here are decimal (MB = 10^6, GB = 10^9), matching what Hugging Face
+# reports and what GitHub measures cache against. Worth stating because
+# `du -sh` prints GiB while labelling it "G" — mixing the two is how an
+# earlier revision of this header claimed 5.1 GB for a 5.5 GB set.
 #
 # Chosen to cover one batched-GEMM weight dtype each — the dispatch in
 # `gemm_preq` picks a different kernel per dtype, so a fixture set that misses
@@ -19,7 +24,7 @@
 #     -GQA.Q8_0             21 MB   llama arch, GQA (16 heads / 8 kv), ctx 2048,
 #                                   vocab 32000, every projection Q8_0 —
 #                                   `gemm_q8_0_q8_0`. Runs in ~1 s.
-#   SmolLM-135M.Q4_0        88 MB   llama arch, GQA (9 heads / 3 kv), ctx 2048,
+#   SmolLM-135M.Q4_0        92 MB   llama arch, GQA (9 heads / 3 kv), ctx 2048,
 #                                   all projections Q4_0 — `gemm_q4_0_q8_0`.
 #                                   ~8 s.
 #   LFM2.5-230M-Q4_K_M     153 MB   LFM2 hybrid, 74 Q4_K + 9 Q6_K tensors —
@@ -71,8 +76,8 @@
 #   scripts/fetch_test_models.sh [--set core|all] [--dest <dir>]
 #
 # `--set core` (the default) fetches the three fixtures that cover both int8
-# GEMM kernels and the K-quant path — 262 MB, what CI pulls on a PR.
-# `--set all` adds the four per-arch fixtures for a total of 5.1 GB, which is
+# GEMM kernels and the K-quant path — 267 MB, what CI pulls on a PR.
+# `--set all` adds the four per-arch fixtures for a total of 5.5 GB, which is
 # what CI pulls on a main push.
 #
 # Default dest is `target/oracle/models`, where the parity tests look. Point
@@ -132,7 +137,7 @@ case "$SET" in core|all) ;; *) echo "--set must be core|all" >&2; exit 2 ;; esac
 while IFS=$'\t' read -r tier name want url; do
   [[ -n "$name" ]] || continue
   # `core` is the per-PR set: both int8 GEMM kernels plus the K-quant path, at
-  # 262 MB. `all` adds the four per-arch fixtures (5.1 GB), which are worth
+  # 267 MB. `all` adds the four per-arch fixtures (5.5 GB), which are worth
   # caching but not worth pulling on every PR — GitHub allows 10 GB of cache
   # per repo in total, and a 5 GB entry would evict the rust and gradle caches
   # that every other job depends on.
