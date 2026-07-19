@@ -2020,6 +2020,12 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) {
+        debug_assert_eq!(k % 32, 0, "GEMM: k must be divisible by 32");
+        debug_assert_eq!(a_quant.len(), m * (k / 32) * size_of::<BlockQ4_0>());
+        debug_assert_eq!(b_quants.len(), n * k);
+        debug_assert_eq!(b_scales.len(), n * (k / 32));
+        debug_assert_eq!(out.len(), m * n);
+
         let nb = k / 32;
         let bsz = size_of::<BlockQ4_0>();
         let row_bytes = nb * bsz;
