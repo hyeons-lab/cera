@@ -22,9 +22,17 @@
 #                          [--prompt 512] [--decode 128]
 #
 # Symbols require a non-stripped binary with frame pointers — cera's release
-# profile strips (see Cargo.toml), so build the binary for profiling with:
-#   CARGO_PROFILE_RELEASE_STRIP=false RUSTFLAGS='-C force-frame-pointers=yes' \
+# profile strips (see Cargo.toml). Prefer `just profile-cpu <model>`, which
+# builds exactly that binary and then runs this script.
+#
+# Building by hand takes one more flag than it looks: env RUSTFLAGS *replaces*
+# `.cargo/config.toml`'s `[target.*] rustflags`, so passing only the frame
+# -pointer flag drops this host's `target-cpu` and profiles a differently-tuned
+# binary than `just release` ships. Re-state it:
+#   CARGO_PROFILE_RELEASE_STRIP=false \
+#   RUSTFLAGS='-C force-frame-pointers=yes -C target-cpu=x86-64-v3' \
 #     cargo build --release -p cera-cli
+#   # macOS: use `-C target-cpu=native`; aarch64-linux: omit target-cpu.
 set -euo pipefail
 
 MODEL=""
@@ -38,20 +46,21 @@ BIN="./target/release/cera"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --model)    MODEL="$2"; shift 2 ;;
-    --bin)      BIN="$2"; shift 2 ;;
-    --device)   BACKEND="$2"; shift 2 ;;
-    --mode)     MODE="$2"; shift 2 ;;
-    --cores)    CORES="$2"; shift 2 ;;
-    --prompt)   PROMPT="$2"; shift 2 ;;
-    --decode)   DECODE="$2"; shift 2 ;;
-    --tool)     TOOL="$2"; shift 2 ;;
+    --model)    MODEL="${2:?--model requires a value}"; shift 2 ;;
+    --bin)      BIN="${2:?--bin requires a value}"; shift 2 ;;
+    --device)   BACKEND="${2:?--device requires a value}"; shift 2 ;;
+    --mode)     MODE="${2:?--mode requires a value}"; shift 2 ;;
+    --cores)    CORES="${2:?--cores requires a value}"; shift 2 ;;
+    --prompt)   PROMPT="${2:?--prompt requires a value}"; shift 2 ;;
+    --decode)   DECODE="${2:?--decode requires a value}"; shift 2 ;;
+    --tool)     TOOL="${2:?--tool requires a value}"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 [[ -n "$MODEL" ]] || { echo "--model <path.gguf> is required" >&2; exit 2; }
-[[ -f "$MODEL" ]] || { echo "error: model not found: $MODEL" >&2; exit 2; }
+# -e, not -f: the CLI takes a LeapBundle *directory* as a model source too.
+[[ -e "$MODEL" ]] || { echo "error: model not found: $MODEL" >&2; exit 2; }
 [[ -x "$BIN" ]]   || { echo "error: $BIN missing — cargo build --release -p cera-cli" >&2; exit 2; }
 case "$MODE" in prefill|decode|both) ;; *) echo "--mode must be prefill|decode|both" >&2; exit 2 ;; esac
 case "$TOOL" in auto|perf|samply) ;; *) echo "--tool must be auto|perf|samply" >&2; exit 2 ;; esac
@@ -75,7 +84,7 @@ fi
 # than after a 20-second sample.
 if command -v nm >/dev/null 2>&1 && ! nm "$BIN" >/dev/null 2>&1; then
   echo "warning: $BIN has no symbol table (stripped) — the report will be addresses only." >&2
-  echo "         rebuild with CARGO_PROFILE_RELEASE_STRIP=false RUSTFLAGS='-C force-frame-pointers=yes'" >&2
+  echo "         rebuild with 'just profile-cpu' (see the header for the raw cargo invocation)." >&2
 fi
 
 # Pick the profiler. `perf` is preferred because it reports top symbols to the
@@ -92,6 +101,20 @@ if [[ "$TOOL" == "auto" ]]; then
   fi
 fi
 
+# An explicit --tool skipped every check auto-select does, so a typo'd or
+# absent profiler surfaced as a bare "command not found" from inside the run
+# — after the build, and with no hint about which of the two is missing.
+if [[ "$TOOL" == "perf" && "$OS" != "Linux" ]]; then
+  echo "error: perf is Linux-only (this is $OS); use --tool samply." >&2
+  exit 2
+fi
+command -v "$TOOL" >/dev/null 2>&1 || {
+  echo "error: --tool $TOOL is not on PATH. Install it:" >&2
+  echo "  perf:   sudo apt install linux-tools-common linux-tools-\$(uname -r)" >&2
+  echo "  samply: cargo install samply" >&2
+  exit 2
+}
+
 # Both perf and samply need perf_event_open, which is gated by this sysctl.
 if [[ "$OS" == "Linux" && -r /proc/sys/kernel/perf_event_paranoid ]]; then
   PARANOID="$(cat /proc/sys/kernel/perf_event_paranoid)"
@@ -105,9 +128,18 @@ fi
 
 PIN=()
 if [[ -n "$CORES" && "$OS" == "Linux" ]]; then
-  PIN=(taskset -c "$CORES")
+  if command -v taskset >/dev/null 2>&1; then
+    PIN=(taskset -c "$CORES")
+  else
+    # Minimal containers often ship without util-linux. Unpinned sampling is
+    # noisier across a big.LITTLE or boost-happy machine, but it still profiles
+    # — refusing to run at all would be the worse trade.
+    echo "note: taskset not found; running unpinned (hotspots may smear across cores)." >&2
+    CORES=""
+  fi
 elif [[ "$OS" != "Linux" ]]; then
   echo "note: core pinning is Linux-only (taskset); running unpinned on $OS." >&2
+  CORES=""
 fi
 
 # Prefill and decode are separated by starving the other phase: --max-tokens 1
