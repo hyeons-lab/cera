@@ -3199,6 +3199,16 @@ pub(crate) mod avx512 {
     #[target_feature(enable = "avx512f")]
     pub unsafe fn row_dot_q4_0_f32_avx512(row: *const u8, y: &[f32], nb: usize) -> f32 {
         unsafe {
+            // `row` is a raw pointer, so nothing here is bounds-checked: the
+            // caller promises `row` covers `nb` blocks and `y` covers `nb * 32`
+            // floats. Cheap to state, and a debug build turns a silent
+            // out-of-bounds read into a named failure.
+            debug_assert!(
+                y.len() >= nb * 32,
+                "row_dot: y has {} floats, need {}",
+                y.len(),
+                nb * 32
+            );
             let bsz = size_of::<BlockQ4_0>();
             let offset = _mm512_set1_ps(8.0);
             let mask_lo = _mm_set1_epi8(0x0F);
@@ -3224,6 +3234,16 @@ pub(crate) mod avx512 {
     #[target_feature(enable = "avx512f")]
     pub unsafe fn row_dot_q8_0_f32_avx512(row: *const u8, y: &[f32], nb: usize) -> f32 {
         unsafe {
+            // `row` is a raw pointer, so nothing here is bounds-checked: the
+            // caller promises `row` covers `nb` blocks and `y` covers `nb * 32`
+            // floats. Cheap to state, and a debug build turns a silent
+            // out-of-bounds read into a named failure.
+            debug_assert!(
+                y.len() >= nb * 32,
+                "row_dot: y has {} floats, need {}",
+                y.len(),
+                nb * 32
+            );
             let bsz = size_of::<BlockQ8_0>();
             let mut acc = _mm512_setzero_ps();
             for b in 0..nb {
