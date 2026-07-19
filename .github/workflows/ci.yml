@@ -860,6 +860,78 @@ jobs:
           path: target/xcframework-build/CeraFFI.xcframework
           retention-days: 7
 
+  batched-prefill-parity:
+    name: Batched Prefill Parity
+    needs: check
+    runs-on: ubuntu-latest
+    # Unlike the other fixture-backed jobs this runs on PRs too. Those pull
+    # multi-hundred-MB bundles for end-to-end checks; this pulls ~310 MB once
+    # and then runs in ~30 s off a warm cache, and it guards the class of bug
+    # that is invisible without it — a batched GEMM that produces plausible
+    # wrong numbers rather than crashing.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+      - uses: Swatinem/rust-cache@v2
+      # OpenBLAS for the `blas` leg below.
+      - name: Install OpenBLAS
+        run: |
+          # See the integration-test job: a broken packages.microsoft.com
+          # InRelease intermittently breaks apt update on these runners.
+          while IFS= read -r f; do
+            sudo rm -f -- "$f"
+          done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
+          sudo apt-get update && sudo apt-get install -y libopenblas-dev
+      - name: Cache GGUF parity fixtures
+        uses: actions/cache@v5
+        with:
+          path: target/oracle/models
+          # Keyed on a hash of the fetch script rather than a hand-bumped
+          # suffix like the older cache entries: the script holds the fixture
+          # names, URLs and checksums, so any fixture change invalidates the
+          # key on its own and nobody has to remember to bump it.
+          key: cera-parity-fixtures-${{ hashFiles('scripts/fetch_test_models.sh') }}
+          # Restore an older fixture set on a miss. The fetch script verifies
+          # each file's checksum and refetches only what is missing or wrong,
+          # so a one-fixture change costs one download rather than all of them.
+          restore-keys: |
+            cera-parity-fixtures-
+      - name: Fetch GGUF fixtures
+        run: ./scripts/fetch_test_models.sh
+      # The no-blas leg's coverage depends on the runner's ISA, so record what
+      # this one actually is. Without it, a green run is ambiguous between
+      # "batched path verified" and "batched path skipped for lack of VNNI".
+      - name: Report CPU tier
+        run: cargo run --release -q -p cera-cli -- cpu
+      # Leg 1 — deterministic. With `blas` the batched path is OpenBLAS SGEMM,
+      # which every runner has, so this leg cannot skip for lack of hardware
+      # and its green is always meaningful. (`CERA_REQUIRE_BATCHED` is
+      # deliberately NOT set: the liveness check is `cfg(not(feature = "blas"))`,
+      # so under `blas` it compiles out and the variable would assert nothing —
+      # setting it here would look like a guarantee while doing nothing.)
+      - name: Parity (blas batched path)
+        run: |
+          cargo test -p cera --release --features blas \
+            --test llama_batched_prefill_parity \
+            --test lfm2_batched_prefill_parity \
+            -- --ignored --nocapture
+      # Leg 2 — opportunistic. Covers the x86_64 AVX-512 VNNI int8 path, which
+      # is what the CPU backend actually uses in a default build. Deliberately
+      # does NOT set CERA_REQUIRE_BATCHED: GitHub-hosted runners are not
+      # guaranteed to expose VNNI, and a missing instruction set is a coverage
+      # gap to read in the log (the tests print an explicit SKIP line), not a
+      # build failure. Promote this to required once the runner pool is known
+      # to carry it.
+      - name: Parity (native int8 batched path)
+        run: |
+          cargo test -p cera --release \
+            --test llama_batched_prefill_parity \
+            --test lfm2_batched_prefill_parity \
+            -- --ignored --nocapture
+
   integration-test:
     name: Integration Tests (gated)
     needs: check

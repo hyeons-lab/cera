@@ -139,21 +139,41 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, f32, usize, usize)> {
     ))
 }
 
-/// See the note in the file header: on x86_64 the batched path is gated on
-/// runtime AVX-512 VNNI, so without it `forward_prefill` falls back to per-token
-/// and this test would compare that path against itself.
-fn assert_batched_path_is_live() {
+/// Whether `forward_prefill` will actually take the batched path here.
+///
+/// On x86_64 without `blas` that is a *runtime* property (AVX-512 VNNI), not a
+/// cfg: without it the model gates itself back onto the per-token path and both
+/// halves of this comparison become the same code — a guaranteed pass that
+/// proves nothing.
+///
+/// Absent the capability this skips rather than fails, so a non-VNNI dev box or
+/// CI runner does not get a red build for hardware it does not have. Set
+/// `CERA_REQUIRE_BATCHED=1` to turn that skip into a failure — CI sets it on the
+/// leg where the batched path is guaranteed, so a silently-vacuous run there is
+/// caught. Mirrors the `CERA_REQUIRE_SIMD` convention in `simd.rs`.
+fn batched_path_is_live(rel: &str) -> bool {
     #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-    assert!(
-        cera::backend::cpu::int8_gemm_available(),
-        "x86_64 host has no runtime AVX-512 VNNI, so `forward_prefill` falls back \
-         to the per-token path — this test would compare it against itself and \
-         pass vacuously. Run on a VNNI host, or build with `--features blas`."
-    );
+    if !cera::backend::cpu::int8_gemm_available() {
+        let msg = format!(
+            "{rel}: x86_64 host has no runtime AVX-512 VNNI, so `forward_prefill` \
+             falls back to the per-token path — comparing it against itself would \
+             pass vacuously"
+        );
+        assert!(
+            std::env::var("CERA_REQUIRE_BATCHED").as_deref() != Ok("1"),
+            "CERA_REQUIRE_BATCHED=1 but {msg}"
+        );
+        eprintln!("[parity] SKIP (no batched path): {msg}");
+        return false;
+    }
+    let _ = rel;
+    true
 }
 
 fn check(rel: &str, tokens: &[u32]) {
-    assert_batched_path_is_live();
+    if !batched_path_is_live(rel) {
+        return;
+    }
     let Some((cos, max_diff, top_pre, top_seq)) = run_parity(rel, tokens) else {
         eprintln!("[parity] SKIP (absent): {rel}");
         return;
@@ -224,4 +244,18 @@ fn llama_batched_prefill_parity_qwen2() {
 #[ignore]
 fn llama_batched_prefill_parity_granite() {
     check_both("target/oracle/models/granite-3.1-2b-instruct-Q8_0.gguf");
+}
+
+// ── CI-sized fixture ───────────────────────────────────────────────────────
+
+/// SmolLM-135M: 30-layer llama arch, GQA (9 heads / 3 kv), ctx 2048, every
+/// projection Q4_0 — 88 MB, small enough for `scripts/fetch_test_models.sh` to
+/// pull on each CI run while still covering the grouped-KV batched path and
+/// both the naive and flash branches. The multi-GB fixtures above stay for
+/// local per-arch coverage (Qwen2 bias, Qwen3 QK-norm, Granite scalars), none
+/// of which a single llama-arch file can stand in for.
+#[test]
+#[ignore]
+fn llama_batched_prefill_parity_smollm_135m_q4_0() {
+    check_both("target/oracle/models/SmolLM-135M.Q4_0.gguf");
 }
