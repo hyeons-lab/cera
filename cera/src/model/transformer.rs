@@ -96,9 +96,13 @@ pub(crate) fn resolve_weight(gguf: &GgufFile, name: &str) -> Result<WeightRef> {
     // `size_bytes == 0` so `inspect` can still list it (see `gguf.rs`). Catch
     // that here rather than handing a zero-length slice to a kernel that will
     // index it and panic — the caller gets the actual type name instead.
+    // Reports the numeric id alongside the name, matching `GgufFile::tensor_range`:
+    // `ggml_type_name` returns "???" for an id it does not know, so the name alone
+    // would say nothing at all about a type newer than this build.
     ensure!(
         info.size_bytes > 0,
-        "tensor {name}: unsupported quantization type {} — cera cannot run this file",
+        "tensor {name} has unsupported GGML type {} ({}) — cera cannot run this file",
+        info.ggml_type_id,
         crate::gguf::ggml_type_name(info.ggml_type_id)
     );
 
