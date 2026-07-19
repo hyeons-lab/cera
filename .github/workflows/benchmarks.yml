@@ -1,0 +1,110 @@
+name: Benchmarks
+
+# Regular, consistent CPU throughput logs for the LFM2 quants cera ships
+# (Q4_0 / Q4_K_M / Q8_0), so perf regressions and wins are visible over time.
+#
+# Runs on:
+#   - a nightly schedule (fixed-cadence baseline),
+#   - every push to main that touches the compute kernels or model forward paths
+#     (per-merge tracking — the "did this change move prefill/decode" signal),
+#   - manual dispatch (with overridable prompt length / run count).
+#
+# Two runners: `ubuntu-24.04-arm` (Neoverse N2, FEAT_I8MM — where the aarch64
+# SMMLA GEMM kernels actually execute, closest to the mobile target) and
+# `ubuntu-latest` (x86_64 desktop baseline). Absolute tok/s on shared CI runners
+# drifts; the durable signals are the resolved CPU tier (logged each run) and
+# relative movement across commits for the same runner + quant. Results land in
+# the job summary (a markdown table) and as a `bench-results.json` artifact in
+# github-action-benchmark's customBiggerIsBetter format, ready for trend
+# tracking / regression alerts to be layered on later.
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # 07:00 UTC nightly
+  workflow_dispatch:
+    inputs:
+      prompt_tokens:
+        description: "Prefill length (tokens)"
+        default: "512"
+      runs:
+        description: "Measured runs per quant"
+        default: "10"
+  push:
+    branches: [main]
+    paths:
+      - "cera/src/backend/**"
+      - "cera/src/model/**"
+      - "cera/src/quant.rs"
+      - "cera/src/tensor.rs"
+      - "scripts/ci-bench.sh"
+      - ".github/workflows/benchmarks.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Override .cargo/config.toml target-cpu=native — CI runners vary, and we want
+  # the runtime-dispatched kernels (the shipped binaries' behavior), not a build
+  # pinned to one runner's microarch.
+  RUSTFLAGS: ""
+
+jobs:
+  cpu-bench:
+    name: CPU bench (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64-i8mm
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release CLI
+        run: cargo build --release -p cera-cli
+      # Restore/save split (not `actions/cache`) so the model cache is only saved
+      # after a *successful* bench — a failed or partial download can't freeze a
+      # corrupt ~/.cache/cera under the key and poison every future run. Keyed per
+      # arch to avoid the two matrix jobs racing on one key.
+      - name: Restore model bundles
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/cera
+          key: bench-models-LFM2.5-350M-${{ matrix.arch }}-v1
+      - name: Run CPU benchmarks
+        env:
+          BIN: ./target/release/cera
+          ARCH_LABEL: ${{ matrix.arch }}
+          BUNDLE_ID: LFM2.5-350M
+          QUANTS: "Q4_0 Q4_K_M Q8_0"
+          PROMPT_TOKENS: ${{ github.event.inputs.prompt_tokens || '512' }}
+          RUNS: ${{ github.event.inputs.runs || '10' }}
+          WARMUP: "2"
+          MAX_TOKENS: "32"
+        run: bash scripts/ci-bench.sh
+      # Save only on success — a failed bench (e.g. total download outage) leaves
+      # the cache untouched rather than persisting a partial ~/.cache/cera.
+      - name: Save model bundles
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/cera
+          key: bench-models-LFM2.5-350M-${{ matrix.arch }}-v1
+      # `always()` so results (including the partial/empty JSON the script writes
+      # before failing) upload even when the bench step fails — without it the
+      # step defaults to `if: success()` and the `if-no-files-found: error` guard
+      # can never fire.
+      - name: Upload results JSON
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-results-${{ matrix.arch }}
+          path: bench-results.json
+          if-no-files-found: error
