@@ -158,7 +158,12 @@ run_one() {
 
   echo
   echo "======================================================================"
-  echo "==> $label profile: device=$BACKEND cores=${CORES:-all} prompt=$prompt decode=$maxtok"
+  # Label these after the flags actually passed to `cera bench`, not after the
+  # phase. In prefill mode `--max-tokens` is 1 *to starve decode*, so printing
+  # it as "decode=1" read as a decode length of 1 rather than as the knob that
+  # suppresses decode entirely.
+  echo "==> $label profile: device=$BACKEND cores=${CORES:-all} \
+prompt-tokens=$prompt max-tokens=$maxtok"
   echo "======================================================================"
 
   local bench=("$BIN" bench --model "$MODEL" --device "$BACKEND"
