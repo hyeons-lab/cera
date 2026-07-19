@@ -7,6 +7,7 @@ pub enum DType {
     I32,
     U8,
     Q4_0,
+    Q4_1,
     Q4KM,
     Q5KM,
     Q8_0,
@@ -23,7 +24,9 @@ impl DType {
             DType::BF16 => Some(2),
             DType::I32 => Some(4),
             DType::U8 => Some(1),
-            DType::Q4_0 | DType::Q4KM | DType::Q5KM | DType::Q8_0 | DType::Q6K => None,
+            DType::Q4_0 | DType::Q4_1 | DType::Q4KM | DType::Q5KM | DType::Q8_0 | DType::Q6K => {
+                None
+            }
         }
     }
 
@@ -31,6 +34,7 @@ impl DType {
     pub fn block_size(&self) -> usize {
         match self {
             DType::Q4_0 => 32,
+            DType::Q4_1 => 32,
             DType::Q4KM => 256,
             DType::Q5KM => 256,
             DType::Q8_0 => 32,
@@ -43,6 +47,9 @@ impl DType {
     pub fn block_bytes(&self) -> usize {
         match self {
             DType::Q4_0 => 18,
+            // d (f16) + m (f16) + 16 nibble bytes. Two bytes wider than Q4_0,
+            // which carries only a scale.
+            DType::Q4_1 => 20,
             DType::Q4KM => 144,
             DType::Q5KM => 176,
             DType::Q8_0 => 34,

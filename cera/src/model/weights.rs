@@ -255,6 +255,7 @@ impl MmapWeight {
                 }
             }
             DType::Q4_0 => crate::quant::dequantize_q4_0_row(bytes, dst),
+            DType::Q4_1 => crate::quant::dequantize_q4_1_row(bytes, dst),
             DType::Q8_0 => crate::quant::dequantize_q8_0_row(bytes, dst),
             DType::Q4KM => crate::quant::dequantize_q4_k_m_row(bytes, dst),
             DType::Q5KM => crate::quant::dequantize_q5_k_row(bytes, dst),
