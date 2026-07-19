@@ -480,13 +480,29 @@ fn quantize_f32_to_q8_0_scalar(x: &[f32], scales: &mut [f32], quants: &mut [i8])
 /// The arch-neutral entry point for the batched-prefill helpers: the per-arch
 /// kernels each sit behind their own `target_feature`, so they cannot be named
 /// interchangeably at a call site.
-pub fn quantize_f32_to_q8_0_into(x: &[f32], scales: &mut [f32], quants: &mut [i8]) {
-    debug_assert_eq!(
+pub(crate) fn quantize_f32_to_q8_0_into(x: &[f32], scales: &mut [f32], quants: &mut [i8]) {
+    // `assert!`, not `debug_assert!`: this is a safe function that hands its
+    // arguments to `unsafe` SIMD kernels which write `x.len()/32` scales and
+    // `x.len()` quants with no bounds checking of their own. A short buffer is
+    // an out-of-bounds write, and a `debug_assert` would let exactly that
+    // through in the release builds that matter. The hot caller
+    // (`quantize_columns`) reaches here once per 32-element block, so this is
+    // three integer compares against a 32-float gather and quantize.
+    assert_eq!(
         x.len() % 32,
         0,
         "quantize_f32_to_q8_0_into: x.len() must be divisible by 32"
     );
-    debug_assert!(scales.len() >= x.len() / 32 && quants.len() >= x.len());
+    assert!(
+        scales.len() >= x.len() / 32 && quants.len() >= x.len(),
+        "quantize_f32_to_q8_0_into: scales/quants too small for x.len()={} \
+         (need {} scales, {} quants; got {} and {})",
+        x.len(),
+        x.len() / 32,
+        x.len(),
+        scales.len(),
+        quants.len()
+    );
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -543,7 +559,7 @@ pub fn int8_gemm_available() -> bool {
 /// names one function rather than one per architecture.
 #[allow(unused_variables)]
 #[allow(clippy::too_many_arguments)]
-pub fn gemm_preq_dispatch(
+pub(crate) fn gemm_preq_dispatch(
     dtype: DType,
     data: &[u8],
     b_scales: &[f32],

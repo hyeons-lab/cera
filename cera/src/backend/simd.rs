@@ -3554,7 +3554,7 @@ pub(crate) mod avx512_vnni {
     const TILE_N: usize = 4;
 
     /// One output row of the Q4_0 GEMM: `out[j] = <A_row, B_col_j>` for all `n`.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     unsafe fn gemm_q4_0_row(
         row: *const u8,
         b_scales: &[f32],
@@ -3609,7 +3609,7 @@ pub(crate) mod avx512_vnni {
     }
 
     /// One output row of the Q8_0 GEMM.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     unsafe fn gemm_q8_0_row(
         row: *const u8,
         b_scales: &[f32],
@@ -3664,7 +3664,7 @@ pub(crate) mod avx512_vnni {
 
     /// Batched Q4_0 × Q8_0 GEMM: `out[m,n] = A_q4_0[m,k] @ B_q8_0[k,n]`,
     /// parallel over output rows.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     pub unsafe fn gemm_q4_0_q8_0_avx512(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -3719,7 +3719,7 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Batched Q8_0 × Q8_0 GEMM: `out[m,n] = A_q8_0[m,k] @ B_q8_0[k,n]`.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     pub unsafe fn gemm_q8_0_q8_0_avx512(
         a_quant: &[u8],
         b_scales: &[f32],
