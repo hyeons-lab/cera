@@ -8,7 +8,7 @@
 # tensors flow through the whole forward pass.
 #
 # The fixtures below are chosen to be CI-sized rather than representative —
-# together ~1.4 GB and ~55 s of test time, against the multi-GB files the other
+# together ~5.4 GB and ~90 s of test time, against the multi-GB files the other
 # parity tests use locally:
 #
 # Chosen to cover one batched-GEMM weight dtype each — the dispatch in
@@ -33,16 +33,28 @@
 #     -q8_0                531 MB   qwen2: Q/K/V projection biases. ~12 s.
 #   Qwen3-0.6B-Q8_0        639 MB   qwen3: per-head Q/K RMSNorm (QK-norm) and a
 #                                   decoupled head_dim. ~19 s.
+#   Llama-3.2-1B-Instruct
+#     -Q8_0               1321 MB   llama: NORM rope with Llama-3 `rope_freqs`
+#                                   frequency-scaling factors. ~14 s.
+#   granite-3.1-2b-instruct
+#     -Q8_0               2694 MB   granite: the four scalar multipliers
+#                                   (embedding/residual/attention/logit), which
+#                                   the batched path has to apply identically
+#                                   to the per-token one. ~35 s.
+#
+# That is every architecture cera supports on the dense-transformer batched
+# path, plus LFM2. The last two are large; they are here because the cache
+# makes the steady-state cost a checksum pass, and because a scalar or a rope
+# factor applied in one path and not the other is invisible without them.
 #
 # All Q8_0, and that is not incidental. The `q4_0` builds of these repos are
-# not uniformly Q4_0 — Qwen2's carries Q4_1 `ffn_down`, Granite's carries 5
-# Q4_1 plus a Q6_K. cera cannot dequantize Q4_1, so those files panic inside
-# the kernel rather than declining cleanly; the same trap is why the
-# Llama-3.2-1B fixture below is the Q8_0 build. Check the dtype census with
-# `cera inspect` before adding any new fixture.
+# not uniformly Q4_0 — Qwen2's carries a Q4_1 `ffn_down`, Granite's carries 5
+# Q4_1 plus a Q6_K, and the Llama-3.2-1B one has Q4_1 in blocks 0/1. cera
+# cannot dequantize Q4_1, and today the failure is a panic from inside a
+# kernel rather than a clean rejection, so check the dtype census with
+# `cera inspect` before adding any fixture:
 #
-# Still missing: granite (scalar multipliers) and Llama-3 NORM rope with
-# `rope_freqs` factors. Both exist only as ~1.3-2.7 GB Q8_0 builds.
+#   cargo run --release -p cera-cli -- inspect --model <file> | grep -oE "\| Q[A-Z0-9_]+ \|" | sort | uniq -c
 #
 # Each covers both the naive and the flash (>=256 token) branch, which is why
 # every fixture needs a context length above 288.
@@ -64,25 +76,29 @@
 set -euo pipefail
 
 DEST="target/oracle/models"
+SET="core"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dest) DEST="${2:?--dest requires a value}"; shift 2 ;;
+    --set)  SET="${2:?--set requires a value}"; shift 2 ;;
     -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
-# name <TAB> sha256 <TAB> url
+# tier <TAB> name <TAB> sha256 <TAB> url
 # Keep this table the single source of truth: the CI cache key is derived from
 # a hash of this file, so editing a checksum or adding a row invalidates the
 # cache automatically rather than relying on someone bumping a version suffix.
 MANIFEST=$(cat <<'EOF'
-TinyStories-LLaMA2-20M-GQA.Q8_0.gguf	86cd37850fa561d5ae2a368b9d85fcb87949c0468eda5a6da1cfab45469b1b9b	https://huggingface.co/mradermacher/TinyStories-LLaMA2-20M-256h-4l-GQA-GGUF/resolve/main/TinyStories-LLaMA2-20M-256h-4l-GQA.Q8_0.gguf
-SmolLM-135M.Q4_0.gguf	6429c98b87a4ee1ca12afe14a5d3e4658b4753c17192369485dcc51cbef9a898	https://huggingface.co/QuantFactory/SmolLM-135M-GGUF/resolve/main/SmolLM-135M.Q4_0.gguf
-LFM2.5-230M-Q4_K_M.gguf	7bbd90384d3deffe4c646ec9643b212802d32d4ce417c90a1ec9282100650062	https://huggingface.co/LiquidAI/LFM2.5-230M-GGUF/resolve/main/LFM2.5-230M-Q4_K_M.gguf
-qwen2-0_5b-instruct-q8_0.gguf	834f4115ad5a836c9f17716b1577290fda96de3deb881ba45a4d5476fd202e96	https://huggingface.co/Qwen/Qwen2-0.5B-Instruct-GGUF/resolve/main/qwen2-0_5b-instruct-q8_0.gguf
-Qwen3-0.6B-Q8_0.gguf	9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031	https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf
+core	TinyStories-LLaMA2-20M-GQA.Q8_0.gguf	86cd37850fa561d5ae2a368b9d85fcb87949c0468eda5a6da1cfab45469b1b9b	https://huggingface.co/mradermacher/TinyStories-LLaMA2-20M-256h-4l-GQA-GGUF/resolve/main/TinyStories-LLaMA2-20M-256h-4l-GQA.Q8_0.gguf
+core	SmolLM-135M.Q4_0.gguf	6429c98b87a4ee1ca12afe14a5d3e4658b4753c17192369485dcc51cbef9a898	https://huggingface.co/QuantFactory/SmolLM-135M-GGUF/resolve/main/SmolLM-135M.Q4_0.gguf
+core	LFM2.5-230M-Q4_K_M.gguf	7bbd90384d3deffe4c646ec9643b212802d32d4ce417c90a1ec9282100650062	https://huggingface.co/LiquidAI/LFM2.5-230M-GGUF/resolve/main/LFM2.5-230M-Q4_K_M.gguf
+arch	qwen2-0_5b-instruct-q8_0.gguf	834f4115ad5a836c9f17716b1577290fda96de3deb881ba45a4d5476fd202e96	https://huggingface.co/Qwen/Qwen2-0.5B-Instruct-GGUF/resolve/main/qwen2-0_5b-instruct-q8_0.gguf
+arch	Qwen3-0.6B-Q8_0.gguf	9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031	https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf
+arch	Llama-3.2-1B-Instruct-Q8_0.gguf	432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3	https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q8_0.gguf
+arch	granite-3.1-2b-instruct-Q8_0.gguf	883a1094022c40cb05f481fbe236b315cf2ca4f30ff84f8852aa3301e0edde72	https://huggingface.co/bartowski/granite-3.1-2b-instruct-GGUF/resolve/main/granite-3.1-2b-instruct-Q8_0.gguf
 EOF
 )
 
@@ -101,8 +117,18 @@ fi
 fetched=0
 cached=0
 
-while IFS=$'\t' read -r name want url; do
+case "$SET" in core|all) ;; *) echo "--set must be core|all" >&2; exit 2 ;; esac
+
+while IFS=$'\t' read -r tier name want url; do
   [[ -n "$name" ]] || continue
+  # `core` is the per-PR set: both int8 GEMM kernels plus the K-quant path, at
+  # 262 MB. `all` adds the four per-arch fixtures (5.1 GB), which are worth
+  # caching but not worth pulling on every PR — GitHub allows 10 GB of cache
+  # per repo in total, and a 5 GB entry would evict the rust and gradle caches
+  # that every other job depends on.
+  if [[ "$SET" == "core" && "$tier" != "core" ]]; then
+    continue
+  fi
   path="$DEST/$name"
 
   if [[ -f "$path" ]]; then
@@ -137,4 +163,4 @@ while IFS=$'\t' read -r name want url; do
   fetched=$((fetched + 1))
 done <<< "$MANIFEST"
 
-echo "==> fixtures ready in $DEST ($fetched downloaded, $cached cached)"
+echo "==> fixtures ready in $DEST [set=$SET] ($fetched downloaded, $cached cached)"

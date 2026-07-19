@@ -890,6 +890,20 @@ jobs:
             sudo rm -f -- "$f"
           done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
           sudo apt-get update && sudo apt-get install -y libopenblas-dev
+      # On a PR this is the `core` set (262 MB): both int8 GEMM kernels plus the
+      # K-quant path. On a main push or manual dispatch it is `all` (5.1 GB),
+      # adding one fixture per dense arch. Two separate cache entries rather
+      # than one, so the per-PR restore stays small — GitHub allows 10 GB of
+      # cache per repo in total, and a 5 GB entry restored on every PR would
+      # evict the rust and gradle caches the other jobs depend on.
+      - name: Select fixture set
+        id: fixtures
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "set=core" >> "$GITHUB_OUTPUT"
+          else
+            echo "set=all" >> "$GITHUB_OUTPUT"
+          fi
       - name: Cache GGUF parity fixtures
         uses: actions/cache@v5
         with:
@@ -898,14 +912,14 @@ jobs:
           # suffix like the older cache entries: the script holds the fixture
           # names, URLs and checksums, so any fixture change invalidates the
           # key on its own and nobody has to remember to bump it.
-          key: cera-parity-fixtures-${{ hashFiles('scripts/fetch_test_models.sh') }}
+          key: cera-parity-fixtures-${{ steps.fixtures.outputs.set }}-${{ hashFiles('scripts/fetch_test_models.sh') }}
           # Restore an older fixture set on a miss. The fetch script verifies
           # each file's checksum and refetches only what is missing or wrong,
           # so a one-fixture change costs one download rather than all of them.
           restore-keys: |
-            cera-parity-fixtures-
+            cera-parity-fixtures-${{ steps.fixtures.outputs.set }}-
       - name: Fetch GGUF fixtures
-        run: ./scripts/fetch_test_models.sh
+        run: ./scripts/fetch_test_models.sh --set ${{ steps.fixtures.outputs.set }}
       # The no-blas leg's coverage depends on the runner's ISA, so record what
       # this one actually is. Without it, a green run is ambiguous between
       # "batched path verified" and "batched path skipped for lack of VNNI".
