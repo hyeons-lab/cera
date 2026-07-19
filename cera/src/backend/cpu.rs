@@ -403,7 +403,8 @@ pub fn gemv_par_threshold() -> usize {
 /// block-quantizes) is lighter than a GEMV output row, so this sits well below
 /// [`GEMV_PAR_THRESHOLD_DEFAULT`].
 ///
-/// Only the aarch64 NEON `quantize_columns` (no-`blas` prefill) consumes this.
+/// Consumed by the no-`blas` prefill `quantize_columns` on both int8-GEMM
+/// targets: aarch64 NEON and x86_64 AVX-512 VNNI.
 #[cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
     not(feature = "blas")
@@ -494,10 +495,11 @@ pub fn quantize_f32_to_q8_0_into(x: &[f32], scales: &mut [f32], quants: &mut [i8
 
     #[cfg(not(target_arch = "aarch64"))]
     {
+        // Same predicate as the GEMM that consumes this output, by construction:
+        // the quantizer and the kernel must agree, or we would pre-quantize into
+        // a layout nothing can read.
         #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-        if crate::backend::cpu_features::cpu_features().tier
-            >= crate::backend::cpu_features::CpuTier::Avx512Vnni
-        {
+        if int8_gemm_available() {
             unsafe {
                 crate::backend::simd::avx512_vnni::quantize_f32_to_q8_0_avx512(x, scales, quants);
             }

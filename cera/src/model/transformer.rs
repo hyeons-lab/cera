@@ -216,9 +216,12 @@ pub(crate) fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
 /// [`batched_gemm_supports`].
 ///
 /// Cfg'd to the targets that have a batched path at all (the caller gates carry the
-/// same cfg). Without it this is dead code on x86_64/wasm without `blas`, which the
-/// CI lint job (`cargo clippy --workspace --all-targets -- -D warnings`, ubuntu, no
-/// `blas`) turns into a hard error — an aarch64 dev machine cannot reproduce that.
+/// same cfg). Without it this is dead code on wasm and on any target without a
+/// batched path, which the CI lint job (`cargo clippy --workspace --all-targets --
+/// -D warnings`, ubuntu, no `blas`) turns into a hard error — an aarch64 dev
+/// machine cannot reproduce that. It *is* called on x86_64 now (where it returns
+/// `false`, there being no VNNI K-quant GEMM), so this is a lint cfg, not a
+/// statement about which targets reach it.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
 fn k_quant_gemm_available() -> bool {
     // BLAS dequantizes the weight and SGEMMs, so it needs no int8 kernel.
@@ -303,8 +306,11 @@ pub(crate) fn try_blas_prefill_gemm(
     true
 }
 
-/// Batched GEMM with pre-quantized Q8_0 input columns (NEON fallback, no BLAS).
-/// Dispatches on the weight dtype; returns `true` when a kernel ran.
+/// Batched GEMM with pre-quantized Q8_0 input columns (the no-BLAS fallback).
+/// Dispatches on the weight dtype to whichever int8 kernel this target has —
+/// aarch64 NEON or x86_64 AVX-512 VNNI; returns `true` when a kernel ran.
+/// A `false` return means nothing was computed and the caller's output buffer
+/// still holds whatever was in it, so callers must gate rather than ignore it.
 #[cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
     not(feature = "blas")
@@ -377,10 +383,10 @@ fn report_uncomputed_gemm(dtype: DType, k: usize) {
     );
 }
 
-/// Quantize all `n` columns of a column-major `[dim × n]` matrix to Q8_0 (NEON
-/// fallback only). `col` is a scratch column of length ≥ `dim`; `scales`/`quants`
-/// receive the packed `[n][dim/32]` / `[n][dim]` layout the NEON GEMM kernels
-/// consume.
+/// Quantize all `n` columns of a column-major `[dim × n]` matrix to Q8_0
+/// (no-`blas` fallback). `col` is a scratch column of length ≥ `dim`;
+/// `scales`/`quants` receive the packed `[n][dim/32]` / `[n][dim]` layout the
+/// batched int8 GEMM kernels consume — the same layout on NEON and VNNI.
 #[cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
     not(feature = "blas")

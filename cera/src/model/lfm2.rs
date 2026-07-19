@@ -1007,9 +1007,9 @@ impl Lfm2Model {
         let mut up_col = vec![0.0f32; cfg.intermediate_size];
         let mut out_col = vec![0.0f32; hs];
         // Batched projection buffers for conv/attn input projections.
-        // Used by the aarch64+NEON path (`gemm_preq`) and the
-        // any-arch+BLAS path (`try_blas_prefill_gemm`); cfg widened to
-        // `any(aarch64, blas)` so x86_64+blas allocates them too.
+        // Used by the no-`blas` int8 `gemm_preq` path (aarch64 NEON and
+        // x86_64 AVX-512 VNNI) and the any-arch BLAS path
+        // (`try_blas_prefill_gemm`).
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let max_kv_dim =
             cfg.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * (hs / cfg.n_heads);
@@ -1028,7 +1028,8 @@ impl Lfm2Model {
         // Pre-allocated GEMM buffers (reused across layers)
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let is = cfg.intermediate_size;
-        // bq_*/dq_*/inter_col are scratch for the NEON fallback `gemm_preq` path
+        // bq_*/dq_*/inter_col are scratch for the no-`blas` `gemm_preq` path
+        // (aarch64 NEON and x86_64 AVX-512 VNNI)
         // (they hold the pre-quantized Q8_0 input matrix). With BLAS on, the
         // SGEMM path consumes f32 directly and these buffers are not needed.
         #[cfg(all(
