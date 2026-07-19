@@ -30,6 +30,7 @@
 #              profile fixes `--max-tokens 1` for the mirror-image reason.
 #   --bin      the binary to profile. Defaults to ./target/release/cera; point
 #              it at another build to compare two binaries on one host.
+#   -h/--help  print this header.
 #
 # Symbols require a non-stripped binary with frame pointers — cera's release
 # profile strips (see Cargo.toml). Prefer `just profile-cpu <model>`, which
@@ -64,6 +65,10 @@ while [[ $# -gt 0 ]]; do
     --prompt)   PROMPT="${2:?--prompt requires a value}"; shift 2 ;;
     --decode)   DECODE="${2:?--decode requires a value}"; shift 2 ;;
     --tool)     TOOL="${2:?--tool requires a value}"; shift 2 ;;
+    # Prints the comment header above. Matched by leading `#` rather than a
+    # line range, so it cannot drift out of date as the header grows — the
+    # same trap `fetch_test_models.sh` fell into with a hardcoded `sed` range.
+    -h|--help) awk 'NR>1 && /^#/ {print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
