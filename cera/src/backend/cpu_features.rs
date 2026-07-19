@@ -42,6 +42,11 @@ pub enum CpuTier {
     /// `avx512f`). Produced when the default-on `avx512` crate feature is
     /// enabled; disable it for a Rust 1.85-compatible x86 build.
     Avx512,
+    /// x86_64 AVX-512 + VNNI (`avx512vnni` + `avx512vl`) — int8 activations:
+    /// `dpbusd` Q4_0/Q8_0 GEMV, the x86 analogue of [`CpuTier::NeonI8mm`].
+    /// Everything the `Avx512` tier does, faster; other dtypes still route to
+    /// the tier below.
+    Avx512Vnni,
     /// aarch64 baseline NEON.
     Neon,
     /// aarch64 NEON + dotprod (FEAT_DotProd, `vdotq_s32`).
@@ -59,6 +64,7 @@ impl CpuTier {
             CpuTier::Scalar => "scalar",
             CpuTier::Avx2 => "avx2",
             CpuTier::Avx512 => "avx512",
+            CpuTier::Avx512Vnni => "avx512+vnni",
             CpuTier::Neon => "neon",
             CpuTier::NeonDotprod => "neon+dotprod",
             CpuTier::NeonI8mm => "neon+i8mm",
@@ -81,6 +87,8 @@ impl CpuTier {
             "avx2" => Some(CpuTier::Avx2),
             #[cfg(target_arch = "x86_64")]
             "avx512" => Some(CpuTier::Avx512),
+            #[cfg(target_arch = "x86_64")]
+            "vnni" | "avx512+vnni" | "avx512vnni" => Some(CpuTier::Avx512Vnni),
             #[cfg(target_arch = "aarch64")]
             "neon" => Some(CpuTier::Neon),
             #[cfg(target_arch = "aarch64")]
@@ -105,6 +113,7 @@ pub struct CpuFeatures {
     pub fma: bool,
     pub avx512f: bool,
     pub avx512bw: bool,
+    pub avx512vl: bool,
     pub avx512vnni: bool,
     // ── aarch64 ──
     pub neon: bool,
@@ -119,6 +128,7 @@ impl CpuFeatures {
         fma: false,
         avx512f: false,
         avx512bw: false,
+        avx512vl: false,
         avx512vnni: false,
         neon: false,
         dotprod: false,
@@ -135,6 +145,7 @@ impl CpuFeatures {
             (self.fma, "fma"),
             (self.avx512f, "avx512f"),
             (self.avx512bw, "avx512bw"),
+            (self.avx512vl, "avx512vl"),
             (self.avx512vnni, "avx512vnni"),
             (self.neon, "neon"),
             (self.dotprod, "dotprod"),
@@ -203,6 +214,7 @@ pub fn detect() -> CpuFeatures {
         f.fma = is_x86_feature_detected!("fma");
         f.avx512f = is_x86_feature_detected!("avx512f");
         f.avx512bw = is_x86_feature_detected!("avx512bw");
+        f.avx512vl = is_x86_feature_detected!("avx512vl");
         f.avx512vnni = is_x86_feature_detected!("avx512vnni");
         // The Q8_0/Q4_0 AVX-512 kernels need only `avx512f` (the 512-bit FMA is
         // part of AVX512F, not the legacy `fma` feature). But at the Avx512 tier
@@ -212,9 +224,22 @@ pub fn detect() -> CpuFeatures {
         // hypothetical F-without-AVX2 part would fall to Avx2/Scalar, not SIGILL).
         // The kernels use Rust-1.89 `_mm512_*` intrinsics, past the crate's 1.85
         // MSRV, so they live behind the default-on `avx512` feature; with it off
-        // the tier caps at Avx2 and the x86 build stays 1.85-compatible. VNNI is
-        // detected for diagnostics only.
-        f.tier = if f.avx512f && f.avx2 && f.fma && cfg!(feature = "avx512") {
+        // the tier caps at Avx2 and the x86 build stays 1.85-compatible.
+        //
+        // The VNNI tier additionally needs `avx512vl` — the int8 kernels operate
+        // on 256-bit vectors (one Q4_0/Q8_0 block is exactly 32 bytes), and
+        // `_mm256_dpbusd_epi32` is an AVX512VL-encoded form. Every shipping
+        // VNNI part has VL, but requiring it keeps the tier honest rather than
+        // trusting that (a VNNI-without-VL part would SIGILL, not fall back).
+        f.tier = if f.avx512f
+            && f.avx512vl
+            && f.avx512vnni
+            && f.avx2
+            && f.fma
+            && cfg!(feature = "avx512")
+        {
+            CpuTier::Avx512Vnni
+        } else if f.avx512f && f.avx2 && f.fma && cfg!(feature = "avx512") {
             CpuTier::Avx512
         } else if f.avx2 && f.fma {
             CpuTier::Avx2
@@ -608,7 +633,7 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         assert!(matches!(
             t,
-            CpuTier::Scalar | CpuTier::Avx2 | CpuTier::Avx512
+            CpuTier::Scalar | CpuTier::Avx2 | CpuTier::Avx512 | CpuTier::Avx512Vnni
         ));
         #[cfg(target_arch = "aarch64")]
         assert!(matches!(
@@ -652,7 +677,7 @@ mod tests {
         // `parse` is arch-gated, so only the current arch's tiers round-trip.
         let mut tiers = vec![CpuTier::Scalar];
         #[cfg(target_arch = "x86_64")]
-        tiers.extend([CpuTier::Avx2, CpuTier::Avx512]);
+        tiers.extend([CpuTier::Avx2, CpuTier::Avx512, CpuTier::Avx512Vnni]);
         #[cfg(target_arch = "aarch64")]
         tiers.extend([CpuTier::Neon, CpuTier::NeonDotprod, CpuTier::NeonI8mm]);
         for t in tiers {

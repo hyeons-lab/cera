@@ -325,6 +325,28 @@ pub fn gemv_q4_0_f32(
 
     #[cfg(not(target_arch = "aarch64"))]
     {
+        // x86 VNNI: quantize the activation to Q8_0 once, then keep the whole
+        // dot product in int8 (`dpbusd`) instead of widening every weight to
+        // f32. Same shape as the aarch64 branch above; `q8_scales`/`q8_quants`
+        // are the caller's reusable scratch, which is why they are threaded
+        // through this signature at all.
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        if crate::backend::cpu_features::cpu_features().tier
+            >= crate::backend::cpu_features::CpuTier::Avx512Vnni
+        {
+            q8_scales.resize(blocks_per_row, 0.0);
+            q8_quants.resize(k, 0);
+            unsafe {
+                crate::backend::simd::avx512_vnni::quantize_f32_to_q8_0_avx512(
+                    x, q8_scales, q8_quants,
+                );
+                crate::backend::simd::avx512_vnni::gemv_q4_0_q8_0_avx512(
+                    a_quant, q8_scales, q8_quants, y, m, k,
+                );
+            }
+            return;
+        }
+
         let _ = (q8_scales, q8_quants);
         let compute_row = |(i, yi): (usize, &mut f32)| {
             let row_start = i * row_bytes;
@@ -518,6 +540,24 @@ pub fn gemv_q8_0_f32(
 
     #[cfg(not(target_arch = "aarch64"))]
     {
+        // x86 VNNI int8 path — see the note in `gemv_q4_0_f32`.
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        if crate::backend::cpu_features::cpu_features().tier
+            >= crate::backend::cpu_features::CpuTier::Avx512Vnni
+        {
+            q8_scales.resize(blocks_per_row, 0.0);
+            q8_quants.resize(k, 0);
+            unsafe {
+                crate::backend::simd::avx512_vnni::quantize_f32_to_q8_0_avx512(
+                    x, q8_scales, q8_quants,
+                );
+                crate::backend::simd::avx512_vnni::gemv_q8_0_q8_0_avx512(
+                    a_quant, q8_scales, q8_quants, y, m, k,
+                );
+            }
+            return;
+        }
+
         let _ = (q8_scales, q8_quants);
         let compute_row = |(i, yi): (usize, &mut f32)| {
             let row_start = i * row_bytes;
