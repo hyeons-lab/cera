@@ -138,7 +138,14 @@ if [[ -n "$CORES" && "$OS" == "Linux" ]]; then
     CORES=""
   fi
 elif [[ "$OS" != "Linux" ]]; then
-  echo "note: core pinning is Linux-only (taskset); running unpinned on $OS." >&2
+  # Only worth saying if pinning was actually asked for — on macOS the default
+  # is unpinned anyway, and an unconditional note is just noise on every run.
+  # Spelled as if/then, not `[[ … ]] && echo`: under `set -e` that idiom exits
+  # the script when the test is false unless another command follows it, which
+  # makes the line above load-bearing for reasons no reader would guess.
+  if [[ -n "$CORES" ]]; then
+    echo "note: core pinning is Linux-only (taskset); running unpinned on $OS." >&2
+  fi
   CORES=""
 fi
 

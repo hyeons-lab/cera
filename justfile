@@ -57,7 +57,7 @@ profile-cpu MODEL *ARGS:
     echo "==> building with RUSTFLAGS=$FLAGS"
     CARGO_PROFILE_RELEASE_STRIP=false RUSTFLAGS="$FLAGS" \
         cargo build --release -p cera-cli
-    ./scripts/profile_cpu.sh --model {{MODEL}} {{ARGS}}
+    ./scripts/profile_cpu.sh --model "{{MODEL}}" {{ARGS}}
 
 # Run all CI checks locally (mirrors GitHub Actions)
 ci: fmt clippy test
