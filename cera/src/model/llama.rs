@@ -22,7 +22,7 @@ use crate::backend::cpu;
 use crate::backend::cpu::RopeType;
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
-#[cfg(any(target_arch = "aarch64", feature = "blas"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
 use crate::kv_cache::LayerState;
 use crate::model::transformer::{self, AttnDims, AttnExtras, AttnWeights, FfnWeights, WeightRef};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
@@ -462,7 +462,7 @@ impl LlamaModel {
     /// matches the per-token `forward` path. Only compiled where a batched-GEMM
     /// kernel exists (aarch64 NEON, or any target with the `blas` feature); the
     /// per-token fallback covers every other build.
-    #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
     /// Batched-GEMM prefill. When `hidden_out` is `Some`, this captures the
     /// per-token post-final-norm hidden states into it (row-major `[n * hs]`),
     /// skips the logit projection, and returns an empty Vec — the hidden-states
@@ -1216,7 +1216,7 @@ impl Model for LlamaModel {
         // An active LoRA is applied in-batch (via `apply_prefill` after each
         // projection GEMM); non-gemmable dtypes fall back to the per-token decode
         // hooks, which apply it too.
-        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         if tokens.len() > 1 {
             let mut out = Vec::new();
             self.forward_prefill_batched(tokens, 0, state, Some(&mut out));
@@ -1278,7 +1278,7 @@ impl Model for LlamaModel {
         // An active LoRA is applied in-batch (`apply_prefill` after each projection
         // GEMM), so it no longer forces the per-token path; non-gemmable dtypes
         // still fall back to the per-token decode hooks, which apply it too.
-        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         if tokens.len() > 1 && !transformer::oracle_dump::is_active() {
             return self.forward_prefill_batched(tokens, start_pos, state, None);
         }

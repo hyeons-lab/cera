@@ -1010,49 +1010,70 @@ impl Lfm2Model {
         // Used by the aarch64+NEON path (`gemm_preq`) and the
         // any-arch+BLAS path (`try_blas_prefill_gemm`); cfg widened to
         // `any(aarch64, blas)` so x86_64+blas allocates them too.
-        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let max_kv_dim =
             cfg.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * (hs / cfg.n_heads);
-        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let proj_rows = (3 * hs).max(hs + 2 * max_kv_dim);
-        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let mut proj_mat = vec![0.0f32; proj_rows * n];
-        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let mut out_proj_input = vec![0.0f32; hs * n];
-        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let mut q_mat = vec![0.0f32; hs * n];
-        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let mut k_mat = vec![0.0f32; max_kv_dim * n];
-        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let mut v_mat = vec![0.0f32; max_kv_dim * n];
         // Pre-allocated GEMM buffers (reused across layers)
-        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let is = cfg.intermediate_size;
         // bq_*/dq_*/inter_col are scratch for the NEON fallback `gemm_preq` path
         // (they hold the pre-quantized Q8_0 input matrix). With BLAS on, the
         // SGEMM path consumes f32 directly and these buffers are not needed.
-        #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+        #[cfg(all(
+            any(target_arch = "aarch64", target_arch = "x86_64"),
+            not(feature = "blas")
+        ))]
         let nb_hs = hs / 32;
-        #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+        #[cfg(all(
+            any(target_arch = "aarch64", target_arch = "x86_64"),
+            not(feature = "blas")
+        ))]
         let nb_is = is / 32;
-        #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+        #[cfg(all(
+            any(target_arch = "aarch64", target_arch = "x86_64"),
+            not(feature = "blas")
+        ))]
         let mut bq_scales = vec![0.0f32; n * nb_hs];
-        #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+        #[cfg(all(
+            any(target_arch = "aarch64", target_arch = "x86_64"),
+            not(feature = "blas")
+        ))]
         let mut bq_quants = vec![0i8; n * hs];
-        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let mut gate_mat = vec![0.0f32; is * n];
-        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let mut up_mat = vec![0.0f32; is * n];
-        #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+        #[cfg(all(
+            any(target_arch = "aarch64", target_arch = "x86_64"),
+            not(feature = "blas")
+        ))]
         let mut dq_scales = vec![0.0f32; n * nb_is];
-        #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+        #[cfg(all(
+            any(target_arch = "aarch64", target_arch = "x86_64"),
+            not(feature = "blas")
+        ))]
         let mut dq_quants = vec![0i8; n * is];
-        #[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+        #[cfg(all(
+            any(target_arch = "aarch64", target_arch = "x86_64"),
+            not(feature = "blas")
+        ))]
         let mut inter_col = vec![0.0f32; is];
         // Flash attention scratch: contiguous output buffer reused across
         // layers. Sized for the largest possible attention layer (max
         // n_kv_heads * group_size * n * head_dim = hs * n).
-        #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let mut flash_out = vec![0.0f32; hs * n];
 
         for layer in 0..cfg.n_layers {
@@ -1074,7 +1095,7 @@ impl Lfm2Model {
             // Operator: conv or attention — batch projections via GEMM, sequential core
             let is_conv = cfg.block_types[layer] == BlockType::GatedConv;
 
-            #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
             let used_block_gemm = {
                 let refs = &self.layer_refs[layer];
                 if is_conv {
@@ -1878,9 +1899,9 @@ impl Lfm2Model {
             // (no batched path compiled), and on any target where the
             // batched path saw mixed dtypes and bailed (`used_block_gemm
             // = false`).
-            #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
             let need_block_fallback = !used_block_gemm;
-            #[cfg(not(any(target_arch = "aarch64", feature = "blas")))]
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas")))]
             let need_block_fallback = true;
             if need_block_fallback {
                 block_out.fill(0.0);
@@ -1959,7 +1980,7 @@ impl Lfm2Model {
             // leave later matrices silently uncomputed in the batched path and
             // produce wrong outputs.
             let refs = &self.layer_refs[layer];
-            #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
             let used_gemm = if [
                 ("ffn_gate", &refs.ffn_gate),
                 ("ffn_up", &refs.ffn_up),
@@ -2117,9 +2138,9 @@ impl Lfm2Model {
             // Fallback: per-token GEMV. Used on x86_64-no-blas (no batched
             // path compiled), and on any target where the FFN weights
             // weren't all batchable (`used_gemm = false`).
-            #[cfg(any(target_arch = "aarch64", feature = "blas"))]
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
             let need_fallback = !used_gemm;
-            #[cfg(not(any(target_arch = "aarch64", feature = "blas")))]
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas")))]
             let need_fallback = true;
             if need_fallback {
                 ffn_out.fill(0.0);

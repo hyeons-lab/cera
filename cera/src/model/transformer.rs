@@ -198,10 +198,15 @@ pub(crate) fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
 /// one — a row that short could not have been K-quantized in the first place — but
 /// "the format guarantees it" is precisely how the last two silent fallbacks got
 /// written, so it is checked rather than assumed).
-#[cfg(any(target_arch = "aarch64", feature = "blas"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
 pub(crate) fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
     match dtype {
-        DType::Q4_0 | DType::Q8_0 => true,
+        // Not unconditional: on x86 the int8 GEMM needs VNNI, and a non-VNNI
+        // host must stay on the per-token GEMV fallback. Under `blas` the
+        // question is moot — that path dequantizes and SGEMMs.
+        DType::Q4_0 | DType::Q8_0 => {
+            cfg!(feature = "blas") || crate::backend::cpu::int8_gemm_available()
+        }
         DType::Q4KM | DType::Q6K => k_quant_gemm_available() && k % 256 == 0,
         _ => false,
     }
@@ -214,7 +219,7 @@ pub(crate) fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
 /// same cfg). Without it this is dead code on x86_64/wasm without `blas`, which the
 /// CI lint job (`cargo clippy --workspace --all-targets -- -D warnings`, ubuntu, no
 /// `blas`) turns into a hard error — an aarch64 dev machine cannot reproduce that.
-#[cfg(any(target_arch = "aarch64", feature = "blas"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
 fn k_quant_gemm_available() -> bool {
     // BLAS dequantizes the weight and SGEMMs, so it needs no int8 kernel.
     #[cfg(feature = "blas")]
@@ -228,6 +233,8 @@ fn k_quant_gemm_available() -> bool {
     // No BLAS and no NEON: there is no batched path at all on this target (the
     // caller gates are themselves cfg'd off), so the answer is moot but must be
     // `false` rather than optimistic.
+    // No BLAS and no NEON K-quant kernel (x86's VNNI path covers Q4_0/Q8_0
+    // only), so there is no batched K-quant path on this target.
     #[cfg(all(not(feature = "blas"), not(target_arch = "aarch64")))]
     {
         false
@@ -241,7 +248,7 @@ fn k_quant_gemm_available() -> bool {
 /// ~4x prefill on CPU (T1) and ~340x the submits on GPU (T8) before anyone noticed,
 /// both times because the fallback said nothing. If prefill is slow and this is
 /// quiet, the dtypes are not the reason.
-#[cfg(any(target_arch = "aarch64", feature = "blas"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
 pub(crate) fn warn_unbatchable(tensor: &str, dtype: DType) {
     use std::sync::Mutex;
     // A Vec, not a HashSet: `DType` is not `Hash`, the set holds a handful of
@@ -298,7 +305,10 @@ pub(crate) fn try_blas_prefill_gemm(
 
 /// Batched GEMM with pre-quantized Q8_0 input columns (NEON fallback, no BLAS).
 /// Dispatches on the weight dtype; returns `true` when a kernel ran.
-#[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(feature = "blas")
+))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_preq(
     gguf: &GgufFile,
@@ -331,50 +341,16 @@ pub(crate) fn gemm_preq(
     // `quantize_columns` packs column j at the matching `k`-strided offset.
     let b_scales = &b_scales[..n * (k / 32)];
     let b_quants = &b_quants[..n * k];
-    match wref.dtype {
-        DType::Q4_0 => unsafe {
-            crate::backend::simd::neon::gemm_q4_0_q8_0_neon(data, b_scales, b_quants, out, m, n, k);
-            true
-        },
-        DType::Q8_0 => unsafe {
-            crate::backend::simd::neon::gemm_q8_0_q8_0_neon(data, b_scales, b_quants, out, m, n, k);
-            true
-        },
-        // K-quants: dotprod-only and 256-aligned, so these *can* decline at runtime.
-        // `batched_gemm_supports` asks the same question up front, so a gated caller
-        // never reaches a `false` — but if it ever did, the quiet `false` would be far
-        // worse than slow: callers ignore this return AND reuse one output buffer across
-        // layers, so `out` would hold the **previous layer's activations**. Route the
-        // decline through the same loud path as an unknown dtype.
-        DType::Q4KM => {
-            let ran = unsafe {
-                crate::backend::simd::neon::gemm_q4_k_q8_0_neon(
-                    data, b_scales, b_quants, out, m, n, k,
-                )
-            };
-            if !ran {
-                report_uncomputed_gemm(wref.dtype, k);
-            }
-            ran
-        }
-        DType::Q6K => {
-            let ran = unsafe {
-                crate::backend::simd::neon::gemm_q6_k_q8_0_neon(
-                    data, b_scales, b_quants, out, m, n, k,
-                )
-            };
-            if !ran {
-                report_uncomputed_gemm(wref.dtype, k);
-            }
-            ran
-        }
+    let ran = cpu::gemm_preq_dispatch(wref.dtype, data, b_scales, b_quants, out, m, n, k);
+    if !ran {
         // Reaching here means a caller gated on `batched_gemm_supports` and got a
-        // different answer than this match — i.e. the two drifted apart.
-        dt => {
-            report_uncomputed_gemm(dt, k);
-            false
-        }
+        // different answer than the dispatcher — i.e. the two drifted apart. That is
+        // not a benign "fall back to the slow path": the callers of `gemm_preq`
+        // **ignore this return value** and reuse one output buffer across layers, so
+        // an uncomputed GEMM leaves the *previous* layer's activations in `out`.
+        report_uncomputed_gemm(wref.dtype, k);
     }
+    ran
 }
 
 /// A batched GEMM was requested for a weight no kernel here can compute.
@@ -385,7 +361,10 @@ pub(crate) fn gemm_preq(
 /// buffer across layers, so an uncomputed GEMM leaves the previous layer's activations
 /// in `out` and inference produces confident garbage. Panic in debug; in release, at
 /// least say so loudly rather than silently corrupting the forward pass.
-#[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(feature = "blas")
+))]
 fn report_uncomputed_gemm(dtype: DType, k: usize) {
     debug_assert!(
         false,
@@ -402,7 +381,10 @@ fn report_uncomputed_gemm(dtype: DType, k: usize) {
 /// fallback only). `col` is a scratch column of length ≥ `dim`; `scales`/`quants`
 /// receive the packed `[n][dim/32]` / `[n][dim]` layout the NEON GEMM kernels
 /// consume.
-#[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(feature = "blas")
+))]
 pub(crate) fn quantize_columns(
     mat: &[f32],
     dim: usize,
@@ -465,14 +447,9 @@ pub(crate) fn quantize_columns(
                     for (t, bt) in blk.iter_mut().enumerate() {
                         *bt = unsafe { *mat.add((b * 32 + t) * n + j) };
                     }
-                    unsafe {
-                        let qs = core::slice::from_raw_parts_mut(qcol.add(b * 32), 32);
-                        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                            &blk,
-                            &mut sc[b..b + 1],
-                            qs,
-                        );
-                    }
+                    // SAFETY: column `j` exclusively owns this 32-quant span.
+                    let qs = unsafe { core::slice::from_raw_parts_mut(qcol.add(b * 32), 32) };
+                    cpu::quantize_f32_to_q8_0_into(&blk, &mut sc[b..b + 1], qs);
                 }
             });
             return;
@@ -483,13 +460,11 @@ pub(crate) fn quantize_columns(
         for i in 0..dim {
             col[i] = mat[i * n + j];
         }
-        unsafe {
-            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                &col[..dim],
-                &mut scales[j * nb..(j + 1) * nb],
-                &mut quants[j * dim..(j + 1) * dim],
-            );
-        }
+        cpu::quantize_f32_to_q8_0_into(
+            &col[..dim],
+            &mut scales[j * nb..(j + 1) * nb],
+            &mut quants[j * dim..(j + 1) * dim],
+        );
     }
 }
 

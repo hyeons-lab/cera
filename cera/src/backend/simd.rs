@@ -3536,6 +3536,241 @@ pub(crate) mod avx512_vnni {
         }
     }
 
+    // ── Batched prefill GEMM ────────────────────────────────────────────────
+    //
+    // The point of these over a per-token GEMV loop: one weight row is decoded
+    // once and reused across `TILE_N` activation columns, so a prefill of `n`
+    // tokens streams the weight matrix `n / TILE_N` times instead of `n`. Prefill
+    // on x86 is weight-bandwidth bound, so that ratio *is* the speedup.
+    //
+    // Column-major activations: `quantize_columns` packs column `j` contiguously
+    // at `b_quants[j * k ..]` with scales at `b_scales[j * nb ..]`, so each of the
+    // `TILE_N` loads below is a straight 32-byte read.
+
+    /// Activation columns processed per weight decode. Four keeps the tile's
+    /// accumulators plus the decoded weight inside the 16 available ymm
+    /// registers; eight spills on the Q4_0 path (the nibble unpack needs its own
+    /// temporaries) and measured slower.
+    const TILE_N: usize = 4;
+
+    /// One output row of the Q4_0 GEMM: `out[j] = <A_row, B_col_j>` for all `n`.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    unsafe fn gemm_q4_0_row(
+        row: *const u8,
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out_row: &mut [f32],
+        n: usize,
+        nb: usize,
+    ) {
+        unsafe {
+            let bsz = size_of::<BlockQ4_0>();
+            let k = nb * 32;
+            let mut j = 0;
+
+            while j + TILE_N <= n {
+                let mut acc = [_mm256_setzero_ps(); TILE_N];
+                for b in 0..nb {
+                    let block = &*(row.add(b * bsz) as *const BlockQ4_0);
+                    let dw = f16::from_bits(block.d).to_f32();
+                    let w = unpack_q4_0(block.qs.as_ptr());
+                    for (t, a_t) in acc.iter_mut().enumerate() {
+                        let col = j + t;
+                        let a = _mm256_loadu_si256(
+                            b_quants.as_ptr().add(col * k + b * 32) as *const __m256i
+                        );
+                        let scale = _mm256_set1_ps(dw * *b_scales.get_unchecked(col * nb + b));
+                        *a_t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, *a_t);
+                    }
+                }
+                for (t, a_t) in acc.iter().enumerate() {
+                    *out_row.get_unchecked_mut(j + t) = hsum256_ps(*a_t);
+                }
+                j += TILE_N;
+            }
+
+            // Column remainder (n % TILE_N). Same math, one column at a time.
+            while j < n {
+                let mut acc = _mm256_setzero_ps();
+                for b in 0..nb {
+                    let block = &*(row.add(b * bsz) as *const BlockQ4_0);
+                    let w = unpack_q4_0(block.qs.as_ptr());
+                    let a =
+                        _mm256_loadu_si256(b_quants.as_ptr().add(j * k + b * 32) as *const __m256i);
+                    let scale = _mm256_set1_ps(
+                        f16::from_bits(block.d).to_f32() * *b_scales.get_unchecked(j * nb + b),
+                    );
+                    acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
+                }
+                *out_row.get_unchecked_mut(j) = hsum256_ps(acc);
+                j += 1;
+            }
+        }
+    }
+
+    /// One output row of the Q8_0 GEMM.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    unsafe fn gemm_q8_0_row(
+        row: *const u8,
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out_row: &mut [f32],
+        n: usize,
+        nb: usize,
+    ) {
+        unsafe {
+            let bsz = size_of::<BlockQ8_0>();
+            let k = nb * 32;
+            let mut j = 0;
+
+            while j + TILE_N <= n {
+                let mut acc = [_mm256_setzero_ps(); TILE_N];
+                for b in 0..nb {
+                    let block = &*(row.add(b * bsz) as *const BlockQ8_0);
+                    let dw = f16::from_bits(block.delta).to_f32();
+                    let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
+                    for (t, a_t) in acc.iter_mut().enumerate() {
+                        let col = j + t;
+                        let a = _mm256_loadu_si256(
+                            b_quants.as_ptr().add(col * k + b * 32) as *const __m256i
+                        );
+                        let scale = _mm256_set1_ps(dw * *b_scales.get_unchecked(col * nb + b));
+                        *a_t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, *a_t);
+                    }
+                }
+                for (t, a_t) in acc.iter().enumerate() {
+                    *out_row.get_unchecked_mut(j + t) = hsum256_ps(*a_t);
+                }
+                j += TILE_N;
+            }
+
+            while j < n {
+                let mut acc = _mm256_setzero_ps();
+                for b in 0..nb {
+                    let block = &*(row.add(b * bsz) as *const BlockQ8_0);
+                    let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
+                    let a =
+                        _mm256_loadu_si256(b_quants.as_ptr().add(j * k + b * 32) as *const __m256i);
+                    let scale = _mm256_set1_ps(
+                        f16::from_bits(block.delta).to_f32() * *b_scales.get_unchecked(j * nb + b),
+                    );
+                    acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
+                }
+                *out_row.get_unchecked_mut(j) = hsum256_ps(acc);
+                j += 1;
+            }
+        }
+    }
+
+    /// Batched Q4_0 × Q8_0 GEMM: `out[m,n] = A_q4_0[m,k] @ B_q8_0[k,n]`,
+    /// parallel over output rows.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    pub unsafe fn gemm_q4_0_q8_0_avx512(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(k % 32, 0, "GEMM: k must be divisible by 32");
+        let nb = k / 32;
+        let row_bytes = nb * size_of::<BlockQ4_0>();
+        debug_assert_eq!(a_quant.len(), m * row_bytes);
+        debug_assert_eq!(b_quants.len(), n * k);
+        debug_assert_eq!(b_scales.len(), n * nb);
+        debug_assert_eq!(out.len(), m * n);
+
+        #[cfg(feature = "parallel")]
+        {
+            use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+            let base = a_quant.as_ptr() as usize;
+            out.par_chunks_mut(n).enumerate().for_each(|(i, out_row)| {
+                // SAFETY: row `i` reads `a_quant[i*row_bytes ..][..row_bytes]`
+                // (in bounds by the assert above, read-only and shared), and
+                // writes only its own disjoint `out_row` chunk.
+                unsafe {
+                    gemm_q4_0_row(
+                        (base as *const u8).add(i * row_bytes),
+                        b_scales,
+                        b_quants,
+                        out_row,
+                        n,
+                        nb,
+                    );
+                }
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        for (i, out_row) in out.chunks_mut(n).enumerate() {
+            // SAFETY: as in the parallel branch above.
+            unsafe {
+                gemm_q4_0_row(
+                    a_quant.as_ptr().add(i * row_bytes),
+                    b_scales,
+                    b_quants,
+                    out_row,
+                    n,
+                    nb,
+                );
+            }
+        }
+    }
+
+    /// Batched Q8_0 × Q8_0 GEMM: `out[m,n] = A_q8_0[m,k] @ B_q8_0[k,n]`.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    pub unsafe fn gemm_q8_0_q8_0_avx512(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(k % 32, 0, "GEMM: k must be divisible by 32");
+        let nb = k / 32;
+        let row_bytes = nb * size_of::<BlockQ8_0>();
+        debug_assert_eq!(a_quant.len(), m * row_bytes);
+        debug_assert_eq!(b_quants.len(), n * k);
+        debug_assert_eq!(b_scales.len(), n * nb);
+        debug_assert_eq!(out.len(), m * n);
+
+        #[cfg(feature = "parallel")]
+        {
+            use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+            let base = a_quant.as_ptr() as usize;
+            out.par_chunks_mut(n).enumerate().for_each(|(i, out_row)| {
+                // SAFETY: as in the Q4_0 GEMM above.
+                unsafe {
+                    gemm_q8_0_row(
+                        (base as *const u8).add(i * row_bytes),
+                        b_scales,
+                        b_quants,
+                        out_row,
+                        n,
+                        nb,
+                    );
+                }
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        for (i, out_row) in out.chunks_mut(n).enumerate() {
+            // SAFETY: as in the parallel branch above.
+            unsafe {
+                gemm_q8_0_row(
+                    a_quant.as_ptr().add(i * row_bytes),
+                    b_scales,
+                    b_quants,
+                    out_row,
+                    n,
+                    nb,
+                );
+            }
+        }
+    }
+
     #[cfg(test)]
     mod avx512_vnni_tests {
         use super::*;
@@ -3801,6 +4036,87 @@ pub(crate) mod avx512_vnni {
             let mut y = vec![0.0f32; m];
             unsafe { gemv_q8_0_q8_0_avx512(&a, &xs, &xq, &mut y, m, k) };
             assert_close(&y, &ref_gemv_q8_0(&a, &xs, &xq, m, k), "gemv_q8_0");
+        }
+
+        /// The GEMM must agree with the GEMV column-by-column. `n = 7` is
+        /// deliberately not a multiple of `TILE_N`, so this covers both the
+        /// 4-wide tile and the scalar column remainder.
+        #[test]
+        fn gemm_q4_0_avx512_matches_gemv_per_column() {
+            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+                return;
+            }
+            let (m, n, k) = (13, 7, 96);
+            let nb = k / 32;
+            let mut st = 0x0bad_c0deu64;
+            let a = rand_q4_0_rows(m, k, &mut st);
+
+            let mut b_scales = vec![0.0f32; n * nb];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+                let (s, q) = ref_quantize(&col);
+                b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+
+            let mut out = vec![0.0f32; m * n];
+            unsafe { gemm_q4_0_q8_0_avx512(&a, &b_scales, &b_quants, &mut out, m, n, k) };
+
+            for j in 0..n {
+                let mut y = vec![0.0f32; m];
+                unsafe {
+                    gemv_q4_0_q8_0_avx512(
+                        &a,
+                        &b_scales[j * nb..(j + 1) * nb],
+                        &b_quants[j * k..(j + 1) * k],
+                        &mut y,
+                        m,
+                        k,
+                    )
+                };
+                let col: Vec<f32> = (0..m).map(|i| out[i * n + j]).collect();
+                assert_close(&col, &y, &format!("gemm_q4_0 col {j}"));
+            }
+        }
+
+        #[test]
+        fn gemm_q8_0_avx512_matches_gemv_per_column() {
+            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+                return;
+            }
+            let (m, n, k) = (13, 7, 96);
+            let nb = k / 32;
+            let mut st = 0xfeed_face_u64;
+            let a = rand_q8_0_rows(m, k, &mut st);
+
+            let mut b_scales = vec![0.0f32; n * nb];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+                let (s, q) = ref_quantize(&col);
+                b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+
+            let mut out = vec![0.0f32; m * n];
+            unsafe { gemm_q8_0_q8_0_avx512(&a, &b_scales, &b_quants, &mut out, m, n, k) };
+
+            for j in 0..n {
+                let mut y = vec![0.0f32; m];
+                unsafe {
+                    gemv_q8_0_q8_0_avx512(
+                        &a,
+                        &b_scales[j * nb..(j + 1) * nb],
+                        &b_quants[j * k..(j + 1) * k],
+                        &mut y,
+                        m,
+                        k,
+                    )
+                };
+                let col: Vec<f32> = (0..m).map(|i| out[i * n + j]).collect();
+                assert_close(&col, &y, &format!("gemm_q8_0 col {j}"));
+            }
         }
     }
 }
