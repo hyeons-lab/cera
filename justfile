@@ -33,6 +33,32 @@ run *ARGS:
 bench *ARGS:
     cargo run --release --bin cera -- bench {{ARGS}}
 
+# Profile host CPU prefill/decode hotspots (perf or samply).
+# Builds unstripped with frame pointers — the release profile strips, which
+# would leave the profile as bare addresses.
+profile-cpu MODEL *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Env RUSTFLAGS *replaces* `.cargo/config.toml`'s `[target.*] rustflags`; it
+    # does not merge with them. Setting it for the frame pointers therefore
+    # silently dropped this host's `target-cpu`, so the profiled binary was
+    # tuned differently from the one `just release` produces — and a profile of
+    # code that never ships is worse than no profile. Re-state it here.
+    # Keep in sync with `.cargo/config.toml`.
+    case "$(uname -s)-$(uname -m)" in
+      Darwin-*)     TARGET_CPU=native ;;
+      Linux-x86_64) TARGET_CPU=x86-64-v3 ;;
+      *)            TARGET_CPU= ;;   # aarch64-linux: generic baseline, as configured
+    esac
+    FLAGS='-C force-frame-pointers=yes'
+    if [[ -n "$TARGET_CPU" ]]; then
+      FLAGS="$FLAGS -C target-cpu=$TARGET_CPU"
+    fi
+    echo "==> building with RUSTFLAGS=$FLAGS"
+    CARGO_PROFILE_RELEASE_STRIP=false RUSTFLAGS="$FLAGS" \
+        cargo build --release -p cera-cli
+    ./scripts/profile_cpu.sh --model "{{MODEL}}" {{ARGS}}
+
 # Run all CI checks locally (mirrors GitHub Actions)
 ci: fmt clippy test
 
