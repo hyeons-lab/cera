@@ -68,7 +68,12 @@
 # failure mode this guards.)
 #
 # Usage:
-#   scripts/fetch_test_models.sh [--dest <dir>]
+#   scripts/fetch_test_models.sh [--set core|all] [--dest <dir>]
+#
+# `--set core` (the default) fetches the three fixtures that cover both int8
+# GEMM kernels and the K-quant path — 262 MB, what CI pulls on a PR.
+# `--set all` adds the four per-arch fixtures for a total of 5.1 GB, which is
+# what CI pulls on a main push.
 #
 # Default dest is `target/oracle/models`, where the parity tests look. Point
 # `CERA_MODEL_ROOT` at the directory *containing* `target/` to use a checkout

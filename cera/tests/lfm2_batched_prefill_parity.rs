@@ -79,7 +79,7 @@ fn flash_prompt() -> Vec<u32> {
 ///
 /// Without this the test is trivially vacuous: `CERA_LFM2_MODEL` overrides the path
 /// for *any* requested model, so pointing it at a Q8_0 file yields a confident green
-/// "LFM2.5-350M-Q4_K_M … cosine=1.000000" having never touched a Q4_K or Q6_K tensor.
+/// "LFM2.5-230M-Q4_K_M … cosine=1.000000" having never touched a Q4_K or Q6_K tensor.
 /// A test that cannot tell you whether it ran the code under test is not a test.
 fn assert_is_k_quant(path: &std::path::Path) {
     let gguf = cera::gguf::GgufFile::open(path).unwrap();
