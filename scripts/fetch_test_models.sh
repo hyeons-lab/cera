@@ -84,7 +84,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dest) DEST="${2:?--dest requires a value}"; shift 2 ;;
     --set)  SET="${2:?--set requires a value}"; shift 2 ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    # Print the whole comment header rather than a hardcoded line range: the
+    # range was '2,32p' and silently stopped mid-table as the header grew, so
+    # --help documented a subset of the fixtures and looked complete.
+    -h|--help) awk 'NR>1 && /^#/ {print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
