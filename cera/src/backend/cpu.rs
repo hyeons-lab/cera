@@ -348,13 +348,17 @@ pub fn gemv_q4_0_f32(
         }
 
         let _ = (q8_scales, q8_quants);
+        // Resolved once, not once per output row. The tier is a process-wide
+        // constant behind a `OnceLock`, and this closure runs for every row —
+        // 65k+ of them on the logit projection.
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        let use_avx512 = crate::backend::cpu_features::cpu_features().tier
+            >= crate::backend::cpu_features::CpuTier::Avx512;
         let compute_row = |(i, yi): (usize, &mut f32)| {
             // AVX-512 without VNNI: still the f32 path, but reduce once per row
             // rather than once per 32-element block.
             #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-            if crate::backend::cpu_features::cpu_features().tier
-                >= crate::backend::cpu_features::CpuTier::Avx512
-            {
+            if use_avx512 {
                 // SAFETY: row `i` spans `a_quant[i*row_bytes ..][..row_bytes]`.
                 *yi = unsafe {
                     crate::backend::simd::avx512::row_dot_q4_0_f32_avx512(
@@ -748,12 +752,16 @@ pub fn gemv_q8_0_f32(
         }
 
         let _ = (q8_scales, q8_quants);
+        // Resolved once, not once per output row. The tier is a process-wide
+        // constant behind a `OnceLock`, and this closure runs for every row —
+        // 65k+ of them on the logit projection.
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        let use_avx512 = crate::backend::cpu_features::cpu_features().tier
+            >= crate::backend::cpu_features::CpuTier::Avx512;
         let compute_row = |(i, yi): (usize, &mut f32)| {
             // See the note in `gemv_q4_0_f32`.
             #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-            if crate::backend::cpu_features::cpu_features().tier
-                >= crate::backend::cpu_features::CpuTier::Avx512
-            {
+            if use_avx512 {
                 // SAFETY: row `i` spans `a_quant[i*row_bytes ..][..row_bytes]`.
                 *yi = unsafe {
                     crate::backend::simd::avx512::row_dot_q8_0_f32_avx512(
