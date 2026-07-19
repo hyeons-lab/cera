@@ -516,8 +516,9 @@ impl GgufFile {
                 // type. `size_bytes == 0` is the marker that this is NOT really
                 // F32; `get_tensor` and `resolve_weight` both reject on it.
                 // Without that check the tensor reaches a kernel labelled F32
-                // with an empty slice and panics on a slice index, which is how
-                // a Q4_1 `ffn_down` used to surface.
+                // with an empty slice and panics on a slice index. Q4_1 used to
+                // arrive here and is now mapped above; this path covers what is
+                // still unmapped (Q5_0/Q5_1/Q8_1/Q2_K/Q3_K/Q8_K).
                 Err(_) => (DType::F32, 0),
             };
 
