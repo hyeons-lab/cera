@@ -3128,7 +3128,7 @@ mod avx2 {
 // Rust 1.89 (past the 1.85 MSRV), so disabling the feature keeps x86 building on
 // 1.85–1.88 (the tier then caps at AVX2; `detect()` won't produce `Avx512`).
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-mod avx512 {
+pub(crate) mod avx512 {
     // 1.89 `_mm512_*` intrinsics vs the 1.85 MSRV — see the module gate above.
     // The `avx512` feature lets MSRV-sensitive builds opt out; when it's on, the
     // build already requires 1.89, so silence the (correct) lint here.
@@ -3179,6 +3179,65 @@ mod avx512 {
             acc = _mm512_fmadd_ps(hi_f, _mm512_loadu_ps(y_ptr.add(16)), acc);
 
             d * _mm512_reduce_add_ps(acc)
+        }
+    }
+
+    // ── Row kernels ─────────────────────────────────────────────────────────
+    //
+    // The `vec_dot_*` pair above is a *per-block* API, so it has to finish with
+    // `_mm512_reduce_add_ps` on every 32 elements — a ~5-op, long-latency
+    // horizontal collapse in the innermost loop, serialized against the next
+    // block's FMAs. These row kernels keep one vector accumulator across the
+    // whole row and reduce exactly once, at the cost of scaling each block's
+    // contribution by `d` in-vector (two extra `mul_ps` per block) instead of
+    // once in scalar afterwards.
+    //
+    // The per-block entry points stay: `vec_dot_q4_0_f32` / `vec_dot_q8_0_f32`
+    // are public API and are used where only a single block is in hand.
+
+    /// Q4_0 row dot: `<dequant(row), y>` accumulated across `nb` blocks.
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn row_dot_q4_0_f32_avx512(row: *const u8, y: &[f32], nb: usize) -> f32 {
+        unsafe {
+            let bsz = size_of::<BlockQ4_0>();
+            let offset = _mm512_set1_ps(8.0);
+            let mask_lo = _mm_set1_epi8(0x0F);
+            let mut acc = _mm512_setzero_ps();
+            for b in 0..nb {
+                let block = &*(row.add(b * bsz) as *const BlockQ4_0);
+                let d = _mm512_set1_ps(f16::from_bits(block.d).to_f32());
+                let qbytes = _mm_loadu_si128(block.qs.as_ptr() as *const __m128i);
+                let lo = _mm_and_si128(qbytes, mask_lo);
+                let hi = _mm_and_si128(_mm_srli_epi16(qbytes, 4), mask_lo);
+                let y_ptr = y.as_ptr().add(b * 32);
+
+                let lo_f = _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(lo)), offset);
+                acc = _mm512_fmadd_ps(_mm512_mul_ps(d, lo_f), _mm512_loadu_ps(y_ptr), acc);
+                let hi_f = _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(hi)), offset);
+                acc = _mm512_fmadd_ps(_mm512_mul_ps(d, hi_f), _mm512_loadu_ps(y_ptr.add(16)), acc);
+            }
+            _mm512_reduce_add_ps(acc)
+        }
+    }
+
+    /// Q8_0 row dot: `<dequant(row), y>` accumulated across `nb` blocks.
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn row_dot_q8_0_f32_avx512(row: *const u8, y: &[f32], nb: usize) -> f32 {
+        unsafe {
+            let bsz = size_of::<BlockQ8_0>();
+            let mut acc = _mm512_setzero_ps();
+            for b in 0..nb {
+                let block = &*(row.add(b * bsz) as *const BlockQ8_0);
+                let d = _mm512_set1_ps(f16::from_bits(block.delta).to_f32());
+                let quants_ptr = block.quants.as_ptr();
+                let y_ptr = y.as_ptr().add(b * 32);
+                for i in (0..32).step_by(16) {
+                    let q128 = _mm_loadu_si128(quants_ptr.add(i) as *const __m128i);
+                    let qf = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(q128));
+                    acc = _mm512_fmadd_ps(_mm512_mul_ps(d, qf), _mm512_loadu_ps(y_ptr.add(i)), acc);
+                }
+            }
+            _mm512_reduce_add_ps(acc)
         }
     }
 
@@ -3250,6 +3309,70 @@ mod avx512 {
             let y: Vec<f32> = (0..32).map(|_| lcg(&mut st)).collect();
             let got = unsafe { vec_dot_q4_0_f32_avx512(&block, &y) };
             let want = vec_dot_q4_0_f32_scalar(&block, &y);
+            assert!(
+                (got - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                "{got} vs {want}"
+            );
+        }
+
+        /// The row kernels must agree with summing the per-block kernel — that
+        /// equivalence is the whole claim of hoisting the reduction out.
+        #[test]
+        fn row_dot_q4_0_avx512_matches_per_block_sum() {
+            if !require_simd_or_skip("avx512", is_x86_feature_detected!("avx512f")) {
+                return;
+            }
+            let mut st = 0x1122_3344u64;
+            let nb = 5;
+            let mut row = Vec::new();
+            for _ in 0..nb {
+                row.extend_from_slice(&f16::from_f32(0.03).to_bits().to_le_bytes());
+                for _ in 0..16 {
+                    row.push(((lcg(&mut st) + 1.0) * 127.0) as u8);
+                }
+            }
+            let y: Vec<f32> = (0..nb * 32).map(|_| lcg(&mut st)).collect();
+
+            let want: f32 = (0..nb)
+                .map(|b| {
+                    let blk = unsafe {
+                        &*(row.as_ptr().add(b * size_of::<BlockQ4_0>()) as *const BlockQ4_0)
+                    };
+                    vec_dot_q4_0_f32_scalar(blk, &y[b * 32..(b + 1) * 32])
+                })
+                .sum();
+            let got = unsafe { row_dot_q4_0_f32_avx512(row.as_ptr(), &y, nb) };
+            assert!(
+                (got - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                "{got} vs {want}"
+            );
+        }
+
+        #[test]
+        fn row_dot_q8_0_avx512_matches_per_block_sum() {
+            if !require_simd_or_skip("avx512", is_x86_feature_detected!("avx512f")) {
+                return;
+            }
+            let mut st = 0x5566_7788u64;
+            let nb = 5;
+            let mut row = Vec::new();
+            for _ in 0..nb {
+                row.extend_from_slice(&f16::from_f32(0.02).to_bits().to_le_bytes());
+                for _ in 0..32 {
+                    row.push((lcg(&mut st) * 127.0) as i32 as i8 as u8);
+                }
+            }
+            let y: Vec<f32> = (0..nb * 32).map(|_| lcg(&mut st)).collect();
+
+            let want: f32 = (0..nb)
+                .map(|b| {
+                    let blk = unsafe {
+                        &*(row.as_ptr().add(b * size_of::<BlockQ8_0>()) as *const BlockQ8_0)
+                    };
+                    vec_dot_q8_0_f32_scalar(blk, &y[b * 32..(b + 1) * 32])
+                })
+                .sum();
+            let got = unsafe { row_dot_q8_0_f32_avx512(row.as_ptr(), &y, nb) };
             assert!(
                 (got - want).abs() <= 1e-3 * (1.0 + want.abs()),
                 "{got} vs {want}"

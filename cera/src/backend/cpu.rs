@@ -348,7 +348,25 @@ pub fn gemv_q4_0_f32(
         }
 
         let _ = (q8_scales, q8_quants);
+        let base = a_quant.as_ptr() as usize;
         let compute_row = |(i, yi): (usize, &mut f32)| {
+            // AVX-512 without VNNI: still the f32 path, but reduce once per row
+            // rather than once per 32-element block.
+            #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+            if crate::backend::cpu_features::cpu_features().tier
+                >= crate::backend::cpu_features::CpuTier::Avx512
+            {
+                // SAFETY: row `i` spans `a_quant[i*row_bytes ..][..row_bytes]`.
+                *yi = unsafe {
+                    crate::backend::simd::avx512::row_dot_q4_0_f32_avx512(
+                        (base as *const u8).add(i * row_bytes),
+                        x,
+                        blocks_per_row,
+                    )
+                };
+                return;
+            }
+
             let row_start = i * row_bytes;
             let mut sum = 0.0f32;
             for bi in 0..blocks_per_row {
@@ -731,7 +749,24 @@ pub fn gemv_q8_0_f32(
         }
 
         let _ = (q8_scales, q8_quants);
+        let base = a_quant.as_ptr() as usize;
         let compute_row = |(i, yi): (usize, &mut f32)| {
+            // See the note in `gemv_q4_0_f32`.
+            #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+            if crate::backend::cpu_features::cpu_features().tier
+                >= crate::backend::cpu_features::CpuTier::Avx512
+            {
+                // SAFETY: row `i` spans `a_quant[i*row_bytes ..][..row_bytes]`.
+                *yi = unsafe {
+                    crate::backend::simd::avx512::row_dot_q8_0_f32_avx512(
+                        (base as *const u8).add(i * row_bytes),
+                        x,
+                        blocks_per_row,
+                    )
+                };
+                return;
+            }
+
             let row_start = i * row_bytes;
             let mut sum = 0.0f32;
             for bi in 0..blocks_per_row {
