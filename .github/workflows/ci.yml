@@ -67,8 +67,13 @@ jobs:
         with:
           toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
+      # `--no-fail-fast`: without it cargo stops after the first test binary
+      # that fails, so a single flaky unit test silently skips every remaining
+      # binary and the log shows a partial count that looks like a full run.
+      # Chasing an intermittent failure is hard enough with its name; it is
+      # near-impossible when the run that caught it also hid what else broke.
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
   # Validate the aarch64 i8mm Q8_0 GEMM kernel on real ARMv8.6 hardware.
   # GitHub's `ubuntu-24.04-arm` runner is Azure Cobalt 100 (Arm Neoverse N2,
@@ -914,7 +919,7 @@ jobs:
       # setting it here would look like a guarantee while doing nothing.)
       - name: Parity (blas batched path)
         run: |
-          cargo test -p cera --release --features blas \
+          cargo test -p cera --release --features blas --no-fail-fast \
             --test llama_batched_prefill_parity \
             --test lfm2_batched_prefill_parity \
             -- --ignored --nocapture
@@ -927,7 +932,7 @@ jobs:
       # to carry it.
       - name: Parity (native int8 batched path)
         run: |
-          cargo test -p cera --release \
+          cargo test -p cera --release --no-fail-fast \
             --test llama_batched_prefill_parity \
             --test lfm2_batched_prefill_parity \
             -- --ignored --nocapture
