@@ -7,6 +7,7 @@ pub enum DType {
     I32,
     U8,
     Q4_0,
+    Q4_1,
     Q4KM,
     Q5KM,
     Q8_0,
@@ -23,7 +24,9 @@ impl DType {
             DType::BF16 => Some(2),
             DType::I32 => Some(4),
             DType::U8 => Some(1),
-            DType::Q4_0 | DType::Q4KM | DType::Q5KM | DType::Q8_0 | DType::Q6K => None,
+            DType::Q4_0 | DType::Q4_1 | DType::Q4KM | DType::Q5KM | DType::Q8_0 | DType::Q6K => {
+                None
+            }
         }
     }
 
@@ -31,6 +34,7 @@ impl DType {
     pub fn block_size(&self) -> usize {
         match self {
             DType::Q4_0 => 32,
+            DType::Q4_1 => 32,
             DType::Q4KM => 256,
             DType::Q5KM => 256,
             DType::Q8_0 => 32,
@@ -43,6 +47,9 @@ impl DType {
     pub fn block_bytes(&self) -> usize {
         match self {
             DType::Q4_0 => 18,
+            // d (f16) + m (f16) + 16 nibble bytes. Two bytes wider than Q4_0,
+            // which carries only a scale.
+            DType::Q4_1 => 20,
             DType::Q4KM => 144,
             DType::Q5KM => 176,
             DType::Q8_0 => 34,
@@ -147,6 +154,11 @@ impl Tensor {
                 crate::quant::dequantize_q4_0_row(&self.data, &mut out);
                 out
             }
+            DType::Q4_1 => {
+                let mut out = vec![0.0f32; self.numel()];
+                crate::quant::dequantize_q4_1_row(&self.data, &mut out);
+                out
+            }
             DType::Q8_0 => {
                 let mut out = vec![0.0f32; self.numel()];
                 crate::quant::dequantize_q8_0_row(&self.data, &mut out);
@@ -175,6 +187,30 @@ impl Tensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `to_f32_vec` has a panicking catch-all, so every quantized `DType` the
+    /// crate claims to support has to be listed there explicitly. Adding a
+    /// variant without an arm compiles fine and only fails at runtime, which is
+    /// exactly how Q4_1 shipped a panic — assert the mapping instead of relying
+    /// on remembering.
+    #[test]
+    fn to_f32_vec_covers_every_quantized_dtype() {
+        for dtype in [
+            DType::Q4_0,
+            DType::Q4_1,
+            DType::Q4KM,
+            DType::Q5KM,
+            DType::Q8_0,
+            DType::Q6K,
+        ] {
+            let blocks = 2;
+            let data = vec![0u8; blocks * dtype.block_bytes()];
+            let numel = blocks * dtype.block_size();
+            let t = Tensor::new(data, vec![numel], dtype);
+            let out = t.to_f32_vec();
+            assert_eq!(out.len(), numel, "{dtype:?}: wrong element count");
+        }
+    }
 
     #[test]
     fn test_f32_roundtrip() {

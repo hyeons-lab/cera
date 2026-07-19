@@ -9,7 +9,7 @@
 // (compressed key/value caches + the GQA-batched TQ path), which don't belong in this
 // generic helper; likewise LFM2's batched/BLAS prefill is model-specific.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 use crate::backend::cpu;
 use crate::gguf::GgufFile;
@@ -91,6 +91,20 @@ pub(crate) fn resolve_weight(gguf: &GgufFile, name: &str) -> Result<WeightRef> {
     // info.offset is already absolute (data_offset + raw_offset from GGUF)
     let start =
         usize::try_from(info.offset).with_context(|| format!("tensor {name} offset overflow"))?;
+
+    // A tensor whose GGML type cannot be mapped is recorded as F32 with
+    // `size_bytes == 0` so `inspect` can still list it (see `gguf.rs`). Catch
+    // that here rather than handing a zero-length slice to a kernel that will
+    // index it and panic — the caller gets the actual type name instead.
+    // Reports the numeric id alongside the name, matching `GgufFile::tensor_range`:
+    // `ggml_type_name` returns "???" for an id it does not know, so the name alone
+    // would say nothing at all about a type newer than this build.
+    ensure!(
+        info.size_bytes > 0,
+        "tensor {name} has unsupported GGML type {} ({}) — cera cannot run this file",
+        info.ggml_type_id,
+        crate::gguf::ggml_type_name(info.ggml_type_id)
+    );
 
     let size = info.size_bytes;
     let dtype = info.dtype;
@@ -297,6 +311,7 @@ pub(crate) fn try_blas_prefill_gemm(
     let dequant = &mut dequant_scratch[..m * k];
     match wref.dtype {
         DType::Q4_0 => crate::quant::dequantize_q4_0_matrix(data, m, k, dequant),
+        DType::Q4_1 => crate::quant::dequantize_q4_1_matrix(data, m, k, dequant),
         DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(data, m, k, dequant),
         DType::Q4KM => crate::quant::dequantize_q4_k_m_matrix(data, m, k, dequant),
         DType::Q6K => crate::quant::dequantize_q6_k_matrix(data, m, k, dequant),
@@ -509,6 +524,7 @@ pub(crate) fn dequantize_row_into(
         DType::Q6K => crate::quant::dequantize_q6_k_row(row_data, out),
         DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, out),
         DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, out),
+        DType::Q4_1 => crate::quant::dequantize_q4_1_row(row_data, out),
         DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, out),
         DType::Q5KM => crate::quant::dequantize_q5_k_row(row_data, out),
         DType::F32 => {

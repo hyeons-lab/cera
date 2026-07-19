@@ -69,8 +69,8 @@ pub fn configure_thread_pool() -> usize {
 }
 
 use crate::quant::{
-    BlockQ4_0, BlockQ4KM, BlockQ5K, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q4_k_m_f32,
-    vec_dot_q5_k_f32, vec_dot_q8_0_f32,
+    BlockQ4_0, BlockQ4_1, BlockQ4KM, BlockQ5K, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q4_1_f32,
+    vec_dot_q4_k_m_f32, vec_dot_q5_k_f32, vec_dot_q8_0_f32,
 };
 #[cfg(not(target_arch = "aarch64"))]
 use crate::quant::{BlockQ6K, vec_dot_q6_k_f32};
@@ -896,6 +896,41 @@ pub fn gemv_q5km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     }
 }
 
+/// Q4_1 GEMV: `y[m] = A_q4_1[m,k] @ x[k]`.
+///
+/// Scalar only. Q4_1 is a legacy ggml format with no SIMD or GPU kernels in
+/// this tree — it appears almost exclusively as a stray `ffn_down` inside
+/// otherwise-Q4_0 files, so it exists to make those files load and produce
+/// correct output, not to be fast. Anything performance-sensitive should use
+/// the Q4_0 or Q8_0 build of the same model.
+pub fn gemv_q4_1_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(y.len(), m);
+    debug_assert_eq!(k % 32, 0, "Q4_1 GEMV: k must be divisible by 32");
+    let blocks_per_row = k / 32;
+    let row_bytes = blocks_per_row * size_of::<BlockQ4_1>();
+    debug_assert_eq!(a_quant.len(), m * row_bytes);
+
+    let compute_row = |(i, yi): (usize, &mut f32)| {
+        let row_start = i * row_bytes;
+        let mut sum = 0.0f32;
+        for bi in 0..blocks_per_row {
+            let offset = row_start + bi * size_of::<BlockQ4_1>();
+            // SAFETY: row `i` spans `a_quant[i*row_bytes ..][..row_bytes]`, and
+            // the debug_assert above pins `a_quant.len()` to `m * row_bytes`.
+            let block = unsafe { &*(a_quant.as_ptr().add(offset) as *const BlockQ4_1) };
+            sum += vec_dot_q4_1_f32(block, &x[bi * 32..(bi + 1) * 32]);
+        }
+        *yi = sum;
+    };
+
+    if m >= gemv_par_threshold() {
+        par_rows(y, gemv_min_rows(), compute_row);
+    } else {
+        y.iter_mut().enumerate().for_each(compute_row);
+    }
+}
+
 /// F32 GEMV: `y[m] = A_f32[m,k] @ x[k]`.
 pub fn gemv_f32(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
@@ -943,6 +978,7 @@ pub fn gemv_dispatch(
                 gemv_q8_0_f32(data, x, y, m, k, &mut s, &mut q);
             }
         }
+        DType::Q4_1 => gemv_q4_1_f32(data, x, y, m, k),
         DType::F32 => gemv_f32(data, x, y, m, k),
         DType::Q6K => {
             #[cfg(target_arch = "aarch64")]

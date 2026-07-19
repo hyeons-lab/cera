@@ -263,13 +263,14 @@ fn ggml_type_to_dtype(type_id: u32) -> Result<DType> {
         GGML_TYPE_BF16 => Ok(DType::BF16),
         GGML_TYPE_Q8_0 => Ok(DType::Q8_0),
         GGML_TYPE_Q4_0 => Ok(DType::Q4_0),
+        GGML_TYPE_Q4_1 => Ok(DType::Q4_1),
         GGML_TYPE_Q4_K => Ok(DType::Q4KM),
         GGML_TYPE_Q5_K => Ok(DType::Q5KM),
         GGML_TYPE_I32 => Ok(DType::I32),
         GGML_TYPE_Q6_K => Ok(DType::Q6K),
         // Map unsupported-but-parseable types to an error with context
-        GGML_TYPE_Q4_1 | GGML_TYPE_Q5_0 | GGML_TYPE_Q5_1 | GGML_TYPE_Q8_1 | GGML_TYPE_Q2_K
-        | GGML_TYPE_Q3_K | GGML_TYPE_Q8_K => {
+        GGML_TYPE_Q5_0 | GGML_TYPE_Q5_1 | GGML_TYPE_Q8_1 | GGML_TYPE_Q2_K | GGML_TYPE_Q3_K
+        | GGML_TYPE_Q8_K => {
             bail!("quantization type {type_id} not yet supported")
         }
         _ => bail!("unknown GGML type: {type_id}"),
@@ -511,7 +512,14 @@ impl GgufFile {
             // Convert GGML type; unsupported types get a placeholder for inspect
             let (dtype, size_bytes) = match ggml_type_to_dtype(type_id) {
                 Ok(dt) => (dt, tensor_data_size(&shape, dt)?),
-                Err(_) => (DType::F32, 0), // placeholder — get_tensor() will reject
+                // Placeholder so `inspect` can still list the tensor and name its
+                // type. `size_bytes == 0` is the marker that this is NOT really
+                // F32; `get_tensor` and `resolve_weight` both reject on it.
+                // Without that check the tensor reaches a kernel labelled F32
+                // with an empty slice and panics on a slice index. Q4_1 used to
+                // arrive here and is now mapped above; this path covers what is
+                // still unmapped (Q5_0/Q5_1/Q8_1/Q2_K/Q3_K/Q8_K).
+                Err(_) => (DType::F32, 0),
             };
 
             let abs_offset = (data_offset as u64).checked_add(offset).with_context(|| {

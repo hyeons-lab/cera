@@ -19,6 +19,28 @@ pub struct BlockQ4_0 {
 
 const _: () = assert!(size_of::<BlockQ4_0>() == 18);
 
+/// Q4_1 quantization block: 32 values in 20 bytes.
+///
+/// Layout:
+///   d:  f16 (2 bytes) — scale
+///   m:  f16 (2 bytes) — minimum
+///   qs: [u8; 16]      — two 4-bit quants per byte
+///
+/// Differs from Q4_0 in more than the extra field: Q4_0 recenters its nibble
+/// around zero (`(q - 8) * d`), while Q4_1 carries an explicit minimum and does
+/// not recenter (`q * d + m`). The nibble *packing* is identical — element `i`
+/// is the low nibble of `qs[i]` and element `i + 16` the high nibble — so only
+/// the arithmetic changes, not the unpacking.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ4_1 {
+    pub d: u16, // f16 stored as raw bits
+    pub m: u16, // f16 stored as raw bits
+    pub qs: [u8; 16],
+}
+
+const _: () = assert!(size_of::<BlockQ4_1>() == 20);
+
 /// Q8_0 quantization block: 32 values in 34 bytes.
 ///
 /// Layout:
@@ -167,6 +189,96 @@ pub fn vec_dot_q4_0_f32_scalar(block: &BlockQ4_0, y: &[f32]) -> f32 {
         sum += hi as f32 * y[i + 16];
     }
     sum * d
+}
+
+// ── Q4_1 dequantization ─────────────────────────────────────────────────────
+
+/// Dequantize a single Q4_1 block to 32 f32 values.
+///
+/// `q * d + m`, with `q` the raw nibble in `[0, 15]` — no `- 8` recentering.
+pub fn dequantize_q4_1_block(block: &BlockQ4_1) -> [f32; 32] {
+    let d = f16::from_bits(block.d).to_f32();
+    let m = f16::from_bits(block.m).to_f32();
+    let mut out = [0.0f32; 32];
+
+    for i in 0..16 {
+        let byte = block.qs[i];
+        let lo = (byte & 0xF) as i32;
+        let hi = (byte >> 4) as i32;
+        out[i] = lo as f32 * d + m;
+        out[i + 16] = hi as f32 * d + m;
+    }
+    out
+}
+
+/// Dequantize a row of Q4_1 blocks. `src` is raw bytes, `dst` is f32 output.
+pub fn dequantize_q4_1_row(src: &[u8], dst: &mut [f32]) {
+    let block_size = size_of::<BlockQ4_1>();
+    let n_blocks = src.len() / block_size;
+    debug_assert_eq!(src.len() % block_size, 0);
+    debug_assert_eq!(dst.len(), n_blocks * 32);
+
+    for i in 0..n_blocks {
+        let block_bytes = &src[i * block_size..(i + 1) * block_size];
+        // SAFETY: `BlockQ4_1` is `repr(C, packed)` over plain integers, and the
+        // slice above is exactly `size_of::<BlockQ4_1>()` bytes.
+        let block = unsafe { &*(block_bytes.as_ptr() as *const BlockQ4_1) };
+        let values = dequantize_q4_1_block(block);
+        dst[i * 32..(i + 1) * 32].copy_from_slice(&values);
+    }
+}
+
+/// Dequantize a Q4_1 matrix of shape `[m, k]` (row-major) to `out`.
+pub fn dequantize_q4_1_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        k % 32,
+        0,
+        "dequantize_q4_1_matrix: k must be a multiple of 32"
+    );
+    let row_bytes = (k / 32) * size_of::<BlockQ4_1>();
+    debug_assert_eq!(
+        src.len(),
+        m * row_bytes,
+        "dequantize_q4_1_matrix: src length mismatch"
+    );
+    debug_assert_eq!(
+        out.len(),
+        m * k,
+        "dequantize_q4_1_matrix: out length mismatch"
+    );
+
+    out.par_chunks_mut(k)
+        .zip(src.par_chunks(row_bytes))
+        .for_each(|(dst_row, src_row)| dequantize_q4_1_row(src_row, dst_row));
+}
+
+/// Dot product of a Q4_1 block with an f32 vector of length 32.
+///
+/// Scalar only: Q4_1 is a legacy format with no SIMD or GPU kernels in this
+/// tree, so this is the single implementation rather than a reference the
+/// vectorized paths are checked against. Note that the `m` offset would not
+/// carry over to the int8 kernels unchanged — the `dpbusd` sign trick the Q4_0
+/// path relies on assumes a zero-centred quant, so a Q4_1 VNNI kernel would
+/// need a separate correction term.
+///
+/// `sum(q_i * y_i) * d + m * sum(y_i)`: the minimum is a per-block constant, so
+/// it factors out of the dot product rather than being added per element.
+pub fn vec_dot_q4_1_f32(block: &BlockQ4_1, y: &[f32]) -> f32 {
+    debug_assert_eq!(y.len(), 32);
+    let d = f16::from_bits(block.d).to_f32();
+    let m = f16::from_bits(block.m).to_f32();
+    let mut qsum = 0.0f32;
+    let mut ysum = 0.0f32;
+
+    for i in 0..16 {
+        let byte = block.qs[i];
+        let lo = (byte & 0xF) as i32;
+        let hi = (byte >> 4) as i32;
+        qsum += lo as f32 * y[i];
+        qsum += hi as f32 * y[i + 16];
+        ysum += y[i] + y[i + 16];
+    }
+    qsum * d + m * ysum
 }
 
 // ── Q8_0 dequantization ─────────────────────────────────────────────────────
@@ -687,6 +799,112 @@ mod tests {
         BlockQ8_0 {
             delta: f16::from_f32(scale).to_bits(),
             quants,
+        }
+    }
+
+    #[test]
+    fn test_dequantize_q4_1_matches_ggml_formula() {
+        // Reference is llama.cpp's dequantize_row_q4_1:
+        //   x0 = qs[j] & 0x0F;  y[j]      = x0*d + m
+        //   x1 = qs[j] >>   4;  y[j+qk/2] = x1*d + m
+        // Note there is no `- 8`: the minimum replaces the recentering.
+        let mut qs = [0u8; 16];
+        for (i, qsi) in qs.iter_mut().enumerate() {
+            *qsi = (i as u8) | (((15 - i) as u8) << 4);
+        }
+        let d = 0.25f32;
+        let m = -1.5f32;
+        let block = BlockQ4_1 {
+            d: f16::from_f32(d).to_bits(),
+            m: f16::from_f32(m).to_bits(),
+            qs,
+        };
+        let out = dequantize_q4_1_block(&block);
+        let d = f16::from_f32(d).to_f32();
+        let m = f16::from_f32(m).to_f32();
+        for i in 0..16 {
+            let want_lo = i as f32 * d + m;
+            let want_hi = (15 - i) as f32 * d + m;
+            assert!(
+                (out[i] - want_lo).abs() < 1e-5,
+                "lo[{i}]: got {} want {want_lo}",
+                out[i]
+            );
+            assert!(
+                (out[i + 16] - want_hi).abs() < 1e-5,
+                "hi[{i}]: got {} want {want_hi}",
+                out[i + 16]
+            );
+        }
+    }
+
+    /// The minimum is a per-block constant, so `vec_dot` factors it out as
+    /// `m * sum(y)` instead of adding it per element. That is an algebraic
+    /// rearrangement, not the same operation — check it against the literal
+    /// dequantize-then-dot.
+    #[test]
+    fn test_vec_dot_q4_1_matches_dequantize() {
+        let mut st = 0x9e37_79b9u64;
+        let mut lcg = || {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((st >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        for trial in 0..8 {
+            let mut qs = [0u8; 16];
+            for qsi in qs.iter_mut() {
+                *qsi = ((lcg() + 1.0) * 127.0) as u8;
+            }
+            let block = BlockQ4_1 {
+                d: f16::from_f32(0.1 + trial as f32 * 0.05).to_bits(),
+                m: f16::from_f32(lcg()).to_bits(),
+                qs,
+            };
+            let y: Vec<f32> = (0..32).map(|_| lcg()).collect();
+
+            let want: f32 = dequantize_q4_1_block(&block)
+                .iter()
+                .zip(&y)
+                .map(|(a, b)| a * b)
+                .sum();
+            let got = vec_dot_q4_1_f32(&block, &y);
+            assert!(
+                (got - want).abs() <= 1e-4 * (1.0 + want.abs()),
+                "trial {trial}: got {got} want {want}"
+            );
+        }
+    }
+
+    /// A zero `d` with a non-zero `m` is a legal block (a constant row); the
+    /// minimum must survive rather than being multiplied away.
+    #[test]
+    fn test_dequantize_q4_1_zero_scale_keeps_min() {
+        let block = BlockQ4_1 {
+            d: f16::from_f32(0.0).to_bits(),
+            m: f16::from_f32(2.5).to_bits(),
+            qs: [0xAB; 16],
+        };
+        let out = dequantize_q4_1_block(&block);
+        assert!(out.iter().all(|v| (v - 2.5).abs() < 1e-5), "{out:?}");
+    }
+
+    #[test]
+    fn test_dequantize_q4_1_row_matches_block() {
+        let mut bytes = Vec::new();
+        for b in 0..3u16 {
+            bytes.extend_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
+            bytes.extend_from_slice(&f16::from_f32(-0.25).to_bits().to_le_bytes());
+            bytes.extend_from_slice(&[b as u8 | 0x30; 16]);
+        }
+        let mut dst = vec![0.0f32; 96];
+        dequantize_q4_1_row(&bytes, &mut dst);
+        for b in 0..3usize {
+            let block = BlockQ4_1 {
+                d: f16::from_f32(0.5).to_bits(),
+                m: f16::from_f32(-0.25).to_bits(),
+                qs: [b as u8 | 0x30; 16],
+            };
+            let want = dequantize_q4_1_block(&block);
+            assert_eq!(&dst[b * 32..(b + 1) * 32], &want[..], "block {b}");
         }
     }
 
