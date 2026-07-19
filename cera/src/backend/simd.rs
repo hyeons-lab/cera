@@ -3421,7 +3421,7 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Dot one Q4_0 weight row against the pre-quantized activation.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     unsafe fn row_dot_q4_0(row: *const u8, x_scales: &[f32], x_quants: &[i8], nb: usize) -> f32 {
         unsafe {
             let bsz = size_of::<BlockQ4_0>();
@@ -3439,7 +3439,7 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Dot one Q8_0 weight row against the pre-quantized activation.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     unsafe fn row_dot_q8_0(row: *const u8, x_scales: &[f32], x_quants: &[i8], nb: usize) -> f32 {
         unsafe {
             let bsz = size_of::<BlockQ8_0>();
@@ -3462,7 +3462,7 @@ pub(crate) mod avx512_vnni {
     /// Row-parallel over the **RowPool** above `gemv_par_threshold()`, matching
     /// the NEON pre-quantized GEMV — decode dispatches these constantly, and
     /// rayon's fork-join barrier per call is the wrong trade there.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     pub unsafe fn gemv_q4_0_q8_0_avx512(
         a_quant: &[u8],
         x_scales: &[f32],
@@ -3500,7 +3500,7 @@ pub(crate) mod avx512_vnni {
     }
 
     /// Q8_0 weights × pre-quantized Q8_0 activations: `y[m] = A[m,k] @ x[k]`.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2")]
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     pub unsafe fn gemv_q8_0_q8_0_avx512(
         a_quant: &[u8],
         x_scales: &[f32],
@@ -3549,6 +3549,18 @@ pub(crate) mod avx512_vnni {
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             (*state >> 40) as f32 / (1u64 << 24) as f32
+        }
+
+        /// Every feature in these kernels' `#[target_feature]` list, not just
+        /// `avx512vnni`. Calling them needs the whole set, so gating on VNNI
+        /// alone would be UB on a part that reports VNNI without, say, `avx512vl`
+        /// — the same conjunction `cpu_features` requires to pick the tier.
+        fn vnni_kernels_callable() -> bool {
+            is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512vl")
+                && is_x86_feature_detected!("avx512vnni")
+                && is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
         }
 
         /// Tier-test gate; mirrors the one in `avx512_tests`. With
@@ -3672,7 +3684,7 @@ pub(crate) mod avx512_vnni {
 
         #[test]
         fn quantize_q8_0_avx512_matches_scalar() {
-            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
                 return;
             }
             let mut st = 0x1357_9bdfu64;
@@ -3689,7 +3701,7 @@ pub(crate) mod avx512_vnni {
         /// rather than inf — check the kernel takes that branch too.
         #[test]
         fn quantize_q8_0_avx512_handles_zero_block() {
-            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
                 return;
             }
             let x = vec![0.0f32; 64];
@@ -3716,7 +3728,7 @@ pub(crate) mod avx512_vnni {
         /// number.
         #[test]
         fn quantize_q8_0_avx512_non_finite_blocks_match_scalar() {
-            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
                 return;
             }
             let mut cases: Vec<(&str, Vec<f32>)> = Vec::new();
@@ -3763,7 +3775,7 @@ pub(crate) mod avx512_vnni {
 
         #[test]
         fn gemv_q4_0_q8_0_avx512_matches_scalar() {
-            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
                 return;
             }
             let (m, k) = (37, 128); // odd m exercises the row tail
@@ -3778,7 +3790,7 @@ pub(crate) mod avx512_vnni {
 
         #[test]
         fn gemv_q8_0_q8_0_avx512_matches_scalar() {
-            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
                 return;
             }
             let (m, k) = (37, 128);

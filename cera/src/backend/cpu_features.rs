@@ -43,9 +43,9 @@ pub enum CpuTier {
     /// enabled; disable it for a Rust 1.85-compatible x86 build.
     Avx512,
     /// x86_64 AVX-512 + VNNI (`avx512vnni` + `avx512vl`) — int8 activations:
-    /// `dpbusd` Q4_0/Q8_0 GEMV plus the batched prefill GEMM, the x86 analogue
-    /// of [`CpuTier::NeonI8mm`]. Everything the `Avx512` tier does, faster;
-    /// other dtypes still route to the tier below.
+    /// `dpbusd` Q4_0/Q8_0 GEMV, the x86 analogue of [`CpuTier::NeonI8mm`].
+    /// Everything the `Avx512` tier does, faster; other dtypes still route to
+    /// the tier below.
     Avx512Vnni,
     /// aarch64 baseline NEON.
     Neon,
@@ -224,7 +224,8 @@ pub fn detect() -> CpuFeatures {
         // hypothetical F-without-AVX2 part would fall to Avx2/Scalar, not SIGILL).
         // The kernels use Rust-1.89 `_mm512_*` intrinsics, past the crate's 1.85
         // MSRV, so they live behind the default-on `avx512` feature; with it off
-        // the tier caps at Avx2 and the x86 build stays 1.85-compatible. VNNI is
+        // the tier caps at Avx2 and the x86 build stays 1.85-compatible.
+        //
         // The VNNI tier additionally needs `avx512vl` — the int8 kernels operate
         // on 256-bit vectors (one Q4_0/Q8_0 block is exactly 32 bytes), and
         // `_mm256_dpbusd_epi32` is an AVX512VL-encoded form. Every shipping
