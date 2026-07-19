@@ -252,8 +252,14 @@ pub fn dequantize_q4_1_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
         .for_each(|(dst_row, src_row)| dequantize_q4_1_row(src_row, dst_row));
 }
 
-/// Dot product of a Q4_1 block with an f32 vector of length 32. Scalar only —
-/// there is no SIMD Q4_1 kernel, see the note on [`BlockQ4_1`].
+/// Dot product of a Q4_1 block with an f32 vector of length 32.
+///
+/// Scalar only: Q4_1 is a legacy format with no SIMD or GPU kernels in this
+/// tree, so this is the single implementation rather than a reference the
+/// vectorized paths are checked against. Note that the `m` offset would not
+/// carry over to the int8 kernels unchanged — the `dpbusd` sign trick the Q4_0
+/// path relies on assumes a zero-centred quant, so a Q4_1 VNNI kernel would
+/// need a separate correction term.
 ///
 /// `sum(q_i * y_i) * d + m * sum(y_i)`: the minimum is a per-block constant, so
 /// it factors out of the dot product rather than being added per element.
