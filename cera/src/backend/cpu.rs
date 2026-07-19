@@ -326,7 +326,7 @@ pub fn gemv_q4_0_f32(
     #[cfg(not(target_arch = "aarch64"))]
     {
         let _ = (q8_scales, q8_quants);
-        for (i, yi) in y.iter_mut().enumerate() {
+        let compute_row = |(i, yi): (usize, &mut f32)| {
             let row_start = i * row_bytes;
             let mut sum = 0.0f32;
             for bi in 0..blocks_per_row {
@@ -335,6 +335,12 @@ pub fn gemv_q4_0_f32(
                 sum += vec_dot_q4_0_f32(block, &x[bi * 32..(bi + 1) * 32]);
             }
             *yi = sum;
+        };
+
+        if m >= gemv_par_threshold() {
+            par_rows(y, gemv_min_rows(), compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
         }
     }
 }
