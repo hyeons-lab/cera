@@ -72,10 +72,12 @@
 #
 # Default dest is `target/oracle/models`, where the parity tests look. Point
 # `CERA_MODEL_ROOT` at the directory *containing* `target/` to use a checkout
-# other than the current one (a git worktree, say).
+# other than the current one (a git worktree, say) — the same variable the
+# tests resolve fixtures through, so fetching and reading stay in agreement.
+# `--dest` overrides both.
 set -euo pipefail
 
-DEST="target/oracle/models"
+DEST="${CERA_MODEL_ROOT:-.}/target/oracle/models"
 SET="core"
 
 while [[ $# -gt 0 ]]; do

@@ -111,9 +111,6 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, usize, usize)> {
     // lies about what it covered.
     eprintln!("[parity] loading {} ({} tok)", path.display(), tokens.len());
     assert_is_k_quant(&path);
-    if !batched_path_is_live(rel) {
-        return None;
-    }
 
     // (a) Sequential per-token.
     let gguf_seq = cera::gguf::GgufFile::open(&path).unwrap();
@@ -147,9 +144,10 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, usize, usize)> {
 ///
 /// Absent the capability this skips rather than fails, so a non-VNNI dev box or
 /// CI runner does not get a red build for hardware it does not have. Set
-/// `CERA_REQUIRE_BATCHED=1` to turn that skip into a failure — CI sets it on the
-/// leg where the batched path is guaranteed, so a silently-vacuous run there is
-/// caught. Mirrors the `CERA_REQUIRE_SIMD` convention in `simd.rs`.
+/// `CERA_REQUIRE_BATCHED=1` to turn that skip into a failure on a host known to
+/// have the hardware. CI does *not* currently set it: the `blas` leg compiles
+/// this check out entirely (so it would assert nothing), and the native leg runs
+/// on runners with no guaranteed VNNI. Mirrors `CERA_REQUIRE_SIMD` in `simd.rs`.
 fn batched_path_is_live(rel: &str) -> bool {
     #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
     if !cera::backend::cpu::int8_gemm_available() {
@@ -170,6 +168,14 @@ fn batched_path_is_live(rel: &str) -> bool {
 }
 
 fn check(rel: &str, tokens: &[u32]) {
+    // Before `run_parity`, not inside it: `None` from there means "fixture
+    // absent" and is what trips the `CERA_REQUIRE_MODEL` assertion below.
+    // Folding the liveness skip into that same `None` made a present-but
+    // -unusable fixture report as missing — the wrong reason, and under
+    // CERA_REQUIRE_MODEL the wrong failure.
+    if !batched_path_is_live(rel) {
+        return;
+    }
     let Some((cos, top_pre, top_seq)) = run_parity(rel, tokens) else {
         // Absent fixture normally skips — but a skip that reports PASS is how a gate
         // goes green forever without ever running. `CERA_REQUIRE_MODEL` makes the
