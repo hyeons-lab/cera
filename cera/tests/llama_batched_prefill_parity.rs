@@ -18,8 +18,12 @@
 //! (tight on NEON, looser on BLAS) plus top-1 agreement, which catches real
 //! layout/dim/transpose bugs while tolerating f32 reordering.
 //!
-//! Compiled only where the batched path exists (`any(aarch64, blas)`) so a
-//! non-batched target can't silently compare the per-token path against itself.
+//! Compiled only where the batched path exists (`any(aarch64, x86_64, blas)`) so
+//! a non-batched target can't silently compare the per-token path against
+//! itself. On x86_64 that capability is a *runtime* property (AVX-512 VNNI), not
+//! just a cfg, so `assert_batched_path_is_live` re-checks it before comparing —
+//! without VNNI the model falls back to per-token and the comparison would be
+//! vacuous.
 //! Marked `#[ignore]` like the other real-model tests so the mainline
 //! `cargo test --workspace` job (which has no ~GB fixtures) does not report a
 //! meaningless green; run explicitly with fixtures present:
@@ -29,7 +33,7 @@
 //!   cargo test -p cera --release --test llama_batched_prefill_parity -- --ignored --nocapture
 //! ```
 
-#![cfg(any(target_arch = "aarch64", feature = "blas"))]
+#![cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
 
 use std::path::PathBuf;
 
@@ -135,7 +139,21 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, f32, usize, usize)> {
     ))
 }
 
+/// See the note in the file header: on x86_64 the batched path is gated on
+/// runtime AVX-512 VNNI, so without it `forward_prefill` falls back to per-token
+/// and this test would compare that path against itself.
+fn assert_batched_path_is_live() {
+    #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+    assert!(
+        cera::backend::cpu::int8_gemm_available(),
+        "x86_64 host has no runtime AVX-512 VNNI, so `forward_prefill` falls back \
+         to the per-token path — this test would compare it against itself and \
+         pass vacuously. Run on a VNNI host, or build with `--features blas`."
+    );
+}
+
 fn check(rel: &str, tokens: &[u32]) {
+    assert_batched_path_is_live();
     let Some((cos, max_diff, top_pre, top_seq)) = run_parity(rel, tokens) else {
         eprintln!("[parity] SKIP (absent): {rel}");
         return;
@@ -155,8 +173,12 @@ fn check(rel: &str, tokens: &[u32]) {
     //    legitimate f32-vs-int reordering (~0.996), so 0.99 for both paths.
     // top-1 agreement (asserted below) is the discriminating correctness check;
     // a real layout/dim/transpose bug drops cosine far below these or flips it.
-    #[cfg(not(feature = "blas"))]
+    #[cfg(all(not(feature = "blas"), target_arch = "aarch64"))]
     let (min_cos, tier) = (if is_flash { 0.99_f32 } else { 0.9999_f32 }, "NEON");
+    // x86_64 VNNI shares the same Q8_0-quantize + int8-dot arithmetic as NEON,
+    // so it earns the same tight bound — only the label differs.
+    #[cfg(all(not(feature = "blas"), target_arch = "x86_64"))]
+    let (min_cos, tier) = (if is_flash { 0.99_f32 } else { 0.9999_f32 }, "AVX-512 VNNI");
     #[cfg(feature = "blas")]
     let (min_cos, tier) = (0.99_f32, "BLAS");
 

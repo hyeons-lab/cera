@@ -403,8 +403,12 @@ pub fn gemv_par_threshold() -> usize {
 /// block-quantizes) is lighter than a GEMV output row, so this sits well below
 /// [`GEMV_PAR_THRESHOLD_DEFAULT`].
 ///
-/// Only the aarch64 NEON `quantize_columns` (no-`blas` prefill) consumes this.
-#[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+/// Consumed by the no-`blas` prefill `quantize_columns` on both int8-GEMM
+/// targets: aarch64 NEON and x86_64 AVX-512 VNNI.
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(feature = "blas")
+))]
 pub const PREQUANT_PAR_MIN_COLS_DEFAULT: usize = 32;
 
 /// Minimum columns per worker for the prefill pre-quant fan-out, resolved once.
@@ -412,7 +416,10 @@ pub const PREQUANT_PAR_MIN_COLS_DEFAULT: usize = 32;
 /// per-device tuning — the fan-out is a measured win/loss knob on big.LITTLE, so
 /// it gets a runtime override like its siblings `gemv_par_threshold` /
 /// `gemv_min_rows`, rather than needing a recompile to sweep.
-#[cfg(all(target_arch = "aarch64", not(feature = "blas")))]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(feature = "blas")
+))]
 pub fn prequant_par_min_cols() -> usize {
     use std::sync::OnceLock;
     static MIN_COLS: OnceLock<usize> = OnceLock::new();
@@ -442,6 +449,171 @@ pub fn gemv_min_rows() -> usize {
 #[cfg(not(feature = "parallel"))]
 pub fn gemv_min_rows() -> usize {
     GEMV_MIN_ROWS_DEFAULT
+}
+
+/// Portable Q8_0 quantizer. Mirrors the NEON/AVX-512 kernels exactly — same
+/// `amax / 127` scale, same f16 round-trip of `d`, same round-to-nearest-even —
+/// so a host that falls back here produces bit-identical blocks to one that
+/// doesn't.
+#[cfg(not(target_arch = "aarch64"))]
+fn quantize_f32_to_q8_0_scalar(x: &[f32], scales: &mut [f32], quants: &mut [i8]) {
+    for (bi, blk) in x.chunks(32).enumerate() {
+        let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let d = amax / 127.0;
+        // Non-finite guard, matching `quantize_f32_to_q8_0_avx512` — see the
+        // comment there. Keeps this reference byte-identical to the SIMD kernel
+        // for denormal / NaN blocks instead of saturating the opposite way.
+        let id = match 1.0 / d {
+            r if d != 0.0 && r.is_finite() => r,
+            _ => 0.0,
+        };
+        scales[bi] = half::f16::from_f32(d).to_f32();
+        for (t, &v) in blk.iter().enumerate() {
+            quants[bi * 32 + t] = (v * id).round_ties_even().clamp(-128.0, 127.0) as i8;
+        }
+    }
+}
+
+/// Quantize `x` to Q8_0 blocks into caller-owned scratch, dispatched to the best
+/// kernel for the host (NEON, AVX-512+VNNI, else scalar).
+///
+/// The arch-neutral entry point for the batched-prefill helpers: the per-arch
+/// kernels each sit behind their own `target_feature`, so they cannot be named
+/// interchangeably at a call site.
+pub(crate) fn quantize_f32_to_q8_0_into(x: &[f32], scales: &mut [f32], quants: &mut [i8]) {
+    // `assert!`, not `debug_assert!`: this is a safe function that hands its
+    // arguments to `unsafe` SIMD kernels which write `x.len()/32` scales and
+    // `x.len()` quants with no bounds checking of their own. A short buffer is
+    // an out-of-bounds write, and a `debug_assert` would let exactly that
+    // through in the release builds that matter. The hot caller
+    // (`quantize_columns`) reaches here once per 32-element block, so this is
+    // three integer compares against a 32-float gather and quantize.
+    assert_eq!(
+        x.len() % 32,
+        0,
+        "quantize_f32_to_q8_0_into: x.len() must be divisible by 32"
+    );
+    assert!(
+        scales.len() >= x.len() / 32 && quants.len() >= x.len(),
+        "quantize_f32_to_q8_0_into: scales/quants too small for x.len()={} \
+         (need {} scales, {} quants; got {} and {})",
+        x.len(),
+        x.len() / 32,
+        x.len(),
+        scales.len(),
+        quants.len()
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(x, scales, quants);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // Same predicate as the GEMM that consumes this output, by construction:
+        // the quantizer and the kernel must agree, or we would pre-quantize into
+        // a layout nothing can read.
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        if int8_gemm_available() {
+            unsafe {
+                crate::backend::simd::avx512_vnni::quantize_f32_to_q8_0_avx512(x, scales, quants);
+            }
+            return;
+        }
+        quantize_f32_to_q8_0_scalar(x, scales, quants);
+    }
+}
+
+/// Whether this host has an int8 batched GEMM for the pre-quantized prefill path.
+///
+/// **Runtime**, not just compile-time: on x86 the kernels need VNNI, and a
+/// pre-Zen-4 / pre-Sapphire-Rapids box compiled with the `avx512` feature still
+/// has to take the per-token GEMV fallback. `batched_gemm_supports` consults
+/// this, so a host that answers `false` never reaches `gemm_preq` — which
+/// matters because the prefill callers ignore that function's return value and
+/// reuse one output buffer across layers.
+pub fn int8_gemm_available() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        true
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    {
+        crate::backend::cpu_features::cpu_features().tier
+            >= crate::backend::cpu_features::CpuTier::Avx512Vnni
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", feature = "avx512")
+    )))]
+    {
+        false
+    }
+}
+
+/// Batched pre-quantized GEMM: `out[m,n] = A_q[m,k] @ B_q8_0[k,n]`.
+/// Returns `false` when no kernel on this host can compute `dtype`.
+///
+/// The arch dispatch for `transformer::gemm_preq`, kept here so the model layer
+/// names one function rather than one per architecture.
+#[allow(unused_variables)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_dispatch(
+    dtype: DType,
+    data: &[u8],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use crate::backend::simd::neon;
+        match dtype {
+            DType::Q4_0 => {
+                neon::gemm_q4_0_q8_0_neon(data, b_scales, b_quants, out, m, n, k);
+                true
+            }
+            DType::Q8_0 => {
+                neon::gemm_q8_0_q8_0_neon(data, b_scales, b_quants, out, m, n, k);
+                true
+            }
+            // K-quants are dotprod-only and 256-aligned, so these can decline
+            // at runtime even though the dtype is known.
+            DType::Q4KM => neon::gemm_q4_k_q8_0_neon(data, b_scales, b_quants, out, m, n, k),
+            DType::Q6K => neon::gemm_q6_k_q8_0_neon(data, b_scales, b_quants, out, m, n, k),
+            _ => false,
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        if int8_gemm_available() {
+            use crate::backend::simd::avx512_vnni as vnni;
+            // SAFETY: `int8_gemm_available()` proved the VNNI tier; the kernels
+            // re-assert their own length invariants in debug.
+            return unsafe {
+                match dtype {
+                    DType::Q4_0 => {
+                        vnni::gemm_q4_0_q8_0_avx512(data, b_scales, b_quants, out, m, n, k);
+                        true
+                    }
+                    DType::Q8_0 => {
+                        vnni::gemm_q8_0_q8_0_avx512(data, b_scales, b_quants, out, m, n, k);
+                        true
+                    }
+                    // No x86 K-quant int8 GEMM yet — `batched_gemm_supports`
+                    // keeps these off this path.
+                    _ => false,
+                }
+            };
+        }
+        false
+    }
 }
 
 /// Quantize f32 vector to Q8_0 format for use with `gemv_q4_0_with_q8`.
