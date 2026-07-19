@@ -2025,6 +2025,8 @@ pub(crate) mod neon {
         let row_bytes = nb * bsz;
         let m_even = m & !1;
         let n_even = n & !1;
+        let mask_lo = unsafe { vdupq_n_u8(0x0F) };
+        let offset_8 = unsafe { vdupq_n_s8(0x8) };
 
         // Main even×even tiles, parallel over 2-row strips.
         {
@@ -2035,8 +2037,6 @@ pub(crate) mod neon {
                 .enumerate()
                 .for_each(|(p, strip)| {
                     let i = p * 2;
-                    let mask_lo = unsafe { vdupq_n_u8(0x0F) };
-                    let offset_8 = unsafe { vdupq_n_s8(0x8) };
                     for j in (0..n_even).step_by(2) {
                         let (mut s00, mut s01, mut s10, mut s11) = (0.0f32, 0.0, 0.0, 0.0);
                         for bi in 0..nb {
