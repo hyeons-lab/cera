@@ -139,22 +139,52 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, f32, usize, usize)> {
     ))
 }
 
-/// See the note in the file header: on x86_64 the batched path is gated on
-/// runtime AVX-512 VNNI, so without it `forward_prefill` falls back to per-token
-/// and this test would compare that path against itself.
-fn assert_batched_path_is_live() {
+/// Whether `forward_prefill` will actually take the batched path here.
+///
+/// On x86_64 without `blas` that is a *runtime* property (AVX-512 VNNI), not a
+/// cfg: without it the model gates itself back onto the per-token path and both
+/// halves of this comparison become the same code — a guaranteed pass that
+/// proves nothing.
+///
+/// Absent the capability this skips rather than fails, so a non-VNNI dev box or
+/// CI runner does not get a red build for hardware it does not have. Set
+/// `CERA_REQUIRE_BATCHED=1` to turn that skip into a failure on a host known to
+/// have the hardware. CI does *not* currently set it: the `blas` leg compiles
+/// this check out entirely (so it would assert nothing), and the native leg runs
+/// on runners with no guaranteed VNNI. Mirrors `CERA_REQUIRE_SIMD` in `simd.rs`.
+fn batched_path_is_live(rel: &str) -> bool {
     #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-    assert!(
-        cera::backend::cpu::int8_gemm_available(),
-        "x86_64 host has no runtime AVX-512 VNNI, so `forward_prefill` falls back \
-         to the per-token path — this test would compare it against itself and \
-         pass vacuously. Run on a VNNI host, or build with `--features blas`."
-    );
+    if !cera::backend::cpu::int8_gemm_available() {
+        let msg = format!(
+            "{rel}: x86_64 host has no runtime AVX-512 VNNI, so `forward_prefill` \
+             falls back to the per-token path — comparing it against itself would \
+             pass vacuously"
+        );
+        assert!(
+            std::env::var("CERA_REQUIRE_BATCHED").as_deref() != Ok("1"),
+            "CERA_REQUIRE_BATCHED=1 but {msg}"
+        );
+        eprintln!("[parity] SKIP (no batched path): {msg}");
+        return false;
+    }
+    let _ = rel;
+    true
 }
 
 fn check(rel: &str, tokens: &[u32]) {
-    assert_batched_path_is_live();
+    if !batched_path_is_live(rel) {
+        return;
+    }
     let Some((cos, max_diff, top_pre, top_seq)) = run_parity(rel, tokens) else {
+        // Absent fixture normally skips — but a skip that reports PASS is how a
+        // gate goes green forever without ever running. `CERA_REQUIRE_MODEL`
+        // makes the absence a hard failure, so a CI job that is supposed to have
+        // the fixture cannot quietly stop testing. Mirrors the lfm2 twin.
+        assert!(
+            std::env::var("CERA_REQUIRE_MODEL").is_err(),
+            "CERA_REQUIRE_MODEL is set but the fixture is absent: {rel} \
+             (set CERA_MODEL_ROOT)"
+        );
         eprintln!("[parity] SKIP (absent): {rel}");
         return;
     };
@@ -224,4 +254,28 @@ fn llama_batched_prefill_parity_qwen2() {
 #[ignore]
 fn llama_batched_prefill_parity_granite() {
     check_both("target/oracle/models/granite-3.1-2b-instruct-Q8_0.gguf");
+}
+
+// ── CI-sized fixtures ──────────────────────────────────────────────────────
+//
+// One per batched-GEMM weight dtype. `gemm_preq` dispatches on dtype, so a
+// fixture set covering only one leaves the other kernel untested — SmolLM is
+// entirely Q4_0 apart from `token_embd`, which the batched path never scans.
+// Fetched by `scripts/fetch_test_models.sh`; absent fixtures skip.
+
+/// Q8_0 projections -> `gemm_q8_0_q8_0`. 4 layers, 256 hidden, GQA (16/8),
+/// ctx 2048, vocab 32000 — 21 MB and about a second.
+#[test]
+#[ignore]
+fn llama_batched_prefill_parity_tinystories_20m_q8_0() {
+    check_both("target/oracle/models/TinyStories-LLaMA2-20M-GQA.Q8_0.gguf");
+}
+
+/// Q4_0 projections -> `gemm_q4_0_q8_0`. 30 layers, GQA (9/3), ctx 2048.
+/// The multi-GB fixtures above stay for local per-arch coverage (Qwen2 bias,
+/// Qwen3 QK-norm, Granite scalars), which no single llama-arch file covers.
+#[test]
+#[ignore]
+fn llama_batched_prefill_parity_smollm_135m_q4_0() {
+    check_both("target/oracle/models/SmolLM-135M.Q4_0.gguf");
 }

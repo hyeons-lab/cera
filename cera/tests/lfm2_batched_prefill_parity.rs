@@ -79,7 +79,7 @@ fn flash_prompt() -> Vec<u32> {
 ///
 /// Without this the test is trivially vacuous: `CERA_LFM2_MODEL` overrides the path
 /// for *any* requested model, so pointing it at a Q8_0 file yields a confident green
-/// "LFM2.5-350M-Q4_K_M … cosine=1.000000" having never touched a Q4_K or Q6_K tensor.
+/// "LFM2.5-230M-Q4_K_M … cosine=1.000000" having never touched a Q4_K or Q6_K tensor.
 /// A test that cannot tell you whether it ran the code under test is not a test.
 fn assert_is_k_quant(path: &std::path::Path) {
     let gguf = cera::gguf::GgufFile::open(path).unwrap();
@@ -111,7 +111,6 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, usize, usize)> {
     // lies about what it covered.
     eprintln!("[parity] loading {} ({} tok)", path.display(), tokens.len());
     assert_is_k_quant(&path);
-    assert_batched_path_is_live();
 
     // (a) Sequential per-token.
     let gguf_seq = cera::gguf::GgufFile::open(&path).unwrap();
@@ -136,25 +135,47 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, usize, usize)> {
     ))
 }
 
-/// This test is only meaningful if `forward_prefill` actually takes the batched
-/// path. On x86_64 that needs runtime AVX-512 VNNI: without it the model gates
-/// itself back onto the per-token path, and both halves of the comparison become
-/// the *same* code — a guaranteed cosine of 1.0 that proves nothing. The file
-/// header promises "a non-batched target can't silently compare the per-token
-/// path against itself"; the cfg alone stopped delivering that once x86_64 was
-/// admitted, because there the capability is a runtime property, not a compile
-/// -time one.
-fn assert_batched_path_is_live() {
+/// Whether `forward_prefill` will actually take the batched path here.
+///
+/// On x86_64 without `blas` that is a *runtime* property (AVX-512 VNNI), not a
+/// cfg: without it the model gates itself back onto the per-token path and both
+/// halves of this comparison become the same code — a guaranteed pass that
+/// proves nothing.
+///
+/// Absent the capability this skips rather than fails, so a non-VNNI dev box or
+/// CI runner does not get a red build for hardware it does not have. Set
+/// `CERA_REQUIRE_BATCHED=1` to turn that skip into a failure on a host known to
+/// have the hardware. CI does *not* currently set it: the `blas` leg compiles
+/// this check out entirely (so it would assert nothing), and the native leg runs
+/// on runners with no guaranteed VNNI. Mirrors `CERA_REQUIRE_SIMD` in `simd.rs`.
+fn batched_path_is_live(rel: &str) -> bool {
     #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-    assert!(
-        cera::backend::cpu::int8_gemm_available(),
-        "x86_64 host has no runtime AVX-512 VNNI, so `forward_prefill` falls back \
-         to the per-token path — this test would compare it against itself and \
-         pass vacuously. Run on a VNNI host, or build with `--features blas`."
-    );
+    if !cera::backend::cpu::int8_gemm_available() {
+        let msg = format!(
+            "{rel}: x86_64 host has no runtime AVX-512 VNNI, so `forward_prefill` \
+             falls back to the per-token path — comparing it against itself would \
+             pass vacuously"
+        );
+        assert!(
+            std::env::var("CERA_REQUIRE_BATCHED").as_deref() != Ok("1"),
+            "CERA_REQUIRE_BATCHED=1 but {msg}"
+        );
+        eprintln!("[parity] SKIP (no batched path): {msg}");
+        return false;
+    }
+    let _ = rel;
+    true
 }
 
 fn check(rel: &str, tokens: &[u32]) {
+    // Before `run_parity`, not inside it: `None` from there means "fixture
+    // absent" and is what trips the `CERA_REQUIRE_MODEL` assertion below.
+    // Folding the liveness skip into that same `None` made a present-but
+    // -unusable fixture report as missing — the wrong reason, and under
+    // CERA_REQUIRE_MODEL the wrong failure.
+    if !batched_path_is_live(rel) {
+        return;
+    }
     let Some((cos, top_pre, top_seq)) = run_parity(rel, tokens) else {
         // Absent fixture normally skips — but a skip that reports PASS is how a gate
         // goes green forever without ever running. `CERA_REQUIRE_MODEL` makes the
@@ -205,14 +226,14 @@ fn check(rel: &str, tokens: &[u32]) {
 #[test]
 #[ignore = "needs a real GGUF; run with --ignored"]
 fn lfm2_q4km_batched_prefill_matches_sequential() {
-    check("target/oracle/models/LFM2.5-350M-Q4_K_M.gguf", PROMPT);
+    check("target/oracle/models/LFM2.5-230M-Q4_K_M.gguf", PROMPT);
 }
 
 #[test]
 #[ignore = "needs a real GGUF; run with --ignored"]
 fn lfm2_q4km_batched_prefill_flash_matches_sequential() {
     check(
-        "target/oracle/models/LFM2.5-350M-Q4_K_M.gguf",
+        "target/oracle/models/LFM2.5-230M-Q4_K_M.gguf",
         &flash_prompt(),
     );
 }
