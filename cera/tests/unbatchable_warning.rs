@@ -54,7 +54,12 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
     }
 }
 
+/// `#[ignore]` like the other fixture-backed tests: the mainline
+/// `cargo test --workspace` job has no GGUFs, and a test that silently skips
+/// there would report the same green as one that ran. The parity job fetches
+/// fixtures and runs this explicitly with `--ignored`.
 #[test]
+#[ignore = "needs a GGUF fixture; run with --ignored"]
 fn per_token_fallback_emits_a_warning() {
     // SAFETY: single-threaded, first thing in the process to touch the
     // environment, and set before any `cpu_features()` call — the tier is
@@ -84,6 +89,17 @@ fn per_token_fallback_emits_a_warning() {
     // through the public surface that a user would hit: a Q4_0 model whose
     // batched path declines for lack of an int8 kernel.
     let Some(path) = find_fixture("target/oracle/models/SmolLM-135M.Q4_0.gguf") else {
+        // A skip that reports PASS is how a gate goes green forever without
+        // running — the failure mode this whole test exists to prevent. CI sets
+        // CERA_REQUIRE_MODEL on the leg that fetches fixtures, so an absent one
+        // there is a hard failure rather than a quiet no-op. Mirrors the parity
+        // suites.
+        assert!(
+            std::env::var("CERA_REQUIRE_MODEL").is_err(),
+            "CERA_REQUIRE_MODEL is set but the fixture is absent: \
+             target/oracle/models/SmolLM-135M.Q4_0.gguf (run \
+             scripts/fetch_test_models.sh, or set CERA_MODEL_ROOT)"
+        );
         eprintln!("[warn-test] SKIP: fixture absent (scripts/fetch_test_models.sh)");
         return;
     };
