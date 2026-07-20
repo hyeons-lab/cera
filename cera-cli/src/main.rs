@@ -1780,8 +1780,21 @@ fn setup_kv_compression(
 }
 
 fn main() -> Result<()> {
+    // Default to `warn` when RUST_LOG is unset, rather than the empty filter
+    // `from_default_env()` yields — which showed nothing at all.
+    //
+    // The library warns on exactly the conditions a user most needs to hear
+    // about and cannot otherwise see: `warn_unbatchable` fires when prefill
+    // falls off the batched GEMM onto the per-token path, which costs ~4x. That
+    // warning was reachable only by someone who already suspected a problem and
+    // knew to set RUST_LOG — precisely the person who does not need telling.
+    // RUST_LOG still wins when set, so `RUST_LOG=debug` and friends are
+    // unaffected.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
         .init();
 
     let cli = Cli::parse();
