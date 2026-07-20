@@ -3948,22 +3948,18 @@ pub(crate) mod avx512_vnni {
     /// Horizontal sum of 8 i32 lanes.
     #[target_feature(enable = "avx2")]
     unsafe fn hsum256_epi32(v: __m256i) -> i32 {
-        unsafe {
-            let s = _mm_add_epi32(_mm256_extracti128_si256(v, 1), _mm256_castsi256_si128(v));
-            let s = _mm_add_epi32(s, _mm_srli_si128(s, 8));
-            let s = _mm_add_epi32(s, _mm_srli_si128(s, 4));
-            _mm_cvtsi128_si32(s)
-        }
+        let s = _mm_add_epi32(_mm256_extracti128_si256(v, 1), _mm256_castsi256_si128(v));
+        let s = _mm_add_epi32(s, _mm_srli_si128(s, 8));
+        let s = _mm_add_epi32(s, _mm_srli_si128(s, 4));
+        _mm_cvtsi128_si32(s)
     }
 
     /// Horizontal sum of 4 i32 lanes.
     #[target_feature(enable = "avx2")]
     unsafe fn hsum128_epi32(v: __m128i) -> i32 {
-        unsafe {
-            let s = _mm_add_epi32(v, _mm_srli_si128(v, 8));
-            let s = _mm_add_epi32(s, _mm_srli_si128(s, 4));
-            _mm_cvtsi128_si32(s)
-        }
+        let s = _mm_add_epi32(v, _mm_srli_si128(v, 8));
+        let s = _mm_add_epi32(s, _mm_srli_si128(s, 4));
+        _mm_cvtsi128_si32(s)
     }
 
     /// Per-column, per-32-element-block sums of the Q8_0 activation quants:
