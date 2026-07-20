@@ -627,8 +627,14 @@ pub(crate) fn gemm_preq_dispatch(
                         vnni::gemm_q8_0_q8_0_avx512(data, b_scales, b_quants, out, m, n, k);
                         true
                     }
-                    // No x86 K-quant int8 GEMM yet — `batched_gemm_supports`
-                    // keeps these off this path.
+                    DType::Q4KM => {
+                        vnni::gemm_q4_k_q8_0_avx512(data, b_scales, b_quants, out, m, n, k);
+                        true
+                    }
+                    DType::Q6K => {
+                        vnni::gemm_q6_k_q8_0_avx512(data, b_scales, b_quants, out, m, n, k);
+                        true
+                    }
                     _ => false,
                 }
             };
@@ -995,6 +1001,28 @@ pub fn gemv_dispatch(
             }
             #[cfg(not(target_arch = "aarch64"))]
             {
+                // VNNI hosts share arithmetic with the batched GEMM (the GEMV
+                // *is* the GEMM at n = 1), which the parity tests' tight naive
+                // bar depends on.
+                #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+                if int8_gemm_available() {
+                    if let Some((scales, quants)) = q8_scratch {
+                        unsafe {
+                            crate::backend::simd::avx512_vnni::gemv_q6k_f32_avx512(
+                                data, x, y, m, k, scales, quants,
+                            );
+                        }
+                    } else {
+                        let mut s = Vec::new();
+                        let mut q = Vec::new();
+                        unsafe {
+                            crate::backend::simd::avx512_vnni::gemv_q6k_f32_avx512(
+                                data, x, y, m, k, &mut s, &mut q,
+                            );
+                        }
+                    }
+                    return;
+                }
                 let mut s = Vec::new();
                 let mut q = Vec::new();
                 gemv_q6k_f32(data, x, y, m, k, &mut s, &mut q);
@@ -1014,7 +1042,29 @@ pub fn gemv_dispatch(
                 }
             }
             #[cfg(not(target_arch = "aarch64"))]
-            gemv_q4km_f32(data, x, y, m, k);
+            {
+                // See the Q6K arm: int8 GEMV shared with the batched GEMM.
+                #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+                if int8_gemm_available() {
+                    if let Some((scales, quants)) = q8_scratch {
+                        unsafe {
+                            crate::backend::simd::avx512_vnni::gemv_q4k_f32_avx512(
+                                data, x, y, m, k, scales, quants,
+                            );
+                        }
+                    } else {
+                        let mut s = Vec::new();
+                        let mut q = Vec::new();
+                        unsafe {
+                            crate::backend::simd::avx512_vnni::gemv_q4k_f32_avx512(
+                                data, x, y, m, k, &mut s, &mut q,
+                            );
+                        }
+                    }
+                    return;
+                }
+                gemv_q4km_f32(data, x, y, m, k);
+            }
         }
         DType::Q5KM => gemv_q5km_f32(data, x, y, m, k),
         _ => panic!("gemv_dispatch: unsupported dtype {:?}", dtype),

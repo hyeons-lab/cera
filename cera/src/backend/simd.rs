@@ -3923,6 +3923,334 @@ pub(crate) mod avx512_vnni {
         }
     }
 
+    // ── K-quant int8 kernels ────────────────────────────────────────────────
+    //
+    // x86 analogue of the NEON K-quant GEMM family. Two structural differences,
+    // both forced by `vpdpbusd` taking an *unsigned* × signed operand pair:
+    //
+    //  - Q4_K nibbles (0..15) and Q6_K quants (0..63) stay unsigned and go in
+    //    the u8 operand directly — no sign trick, unlike Q4_0, which recenters
+    //    by −8 at decode and needs one.
+    //  - Q6_K's −32 recentering cannot be baked into the weights as NEON does
+    //    (that would make them signed). It is applied algebraically instead:
+    //    Σ((q−32)·a) = Σ(q·a) − 32·Σa, with Σa precomputed per column at
+    //    *16-element* granularity because Q6_K scales are 16-wide.
+    //
+    // `vpdpbusd` (the non-saturating form) is safe here: per-lane sums are
+    // bounded (≤ 4·63·127) and every lane accumulator is hsummed and reset per
+    // sub-block, so the i32 accumulator cannot overflow.
+
+    /// Column tile width. Decoding a K-quant super-block is the expensive part;
+    /// applying each decoded group to `KQ_COLS` activation columns amortizes
+    /// it — mirrors the NEON kernels' choice of 8.
+    const KQ_COLS: usize = 8;
+
+    /// Horizontal sum of 8 i32 lanes.
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum256_epi32(v: __m256i) -> i32 {
+        unsafe {
+            let s = _mm_add_epi32(_mm256_extracti128_si256(v, 1), _mm256_castsi256_si128(v));
+            let s = _mm_add_epi32(s, _mm_srli_si128(s, 8));
+            let s = _mm_add_epi32(s, _mm_srli_si128(s, 4));
+            _mm_cvtsi128_si32(s)
+        }
+    }
+
+    /// Horizontal sum of 4 i32 lanes.
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum128_epi32(v: __m128i) -> i32 {
+        unsafe {
+            let s = _mm_add_epi32(v, _mm_srli_si128(v, 8));
+            let s = _mm_add_epi32(s, _mm_srli_si128(s, 4));
+            _mm_cvtsi128_si32(s)
+        }
+    }
+
+    /// Per-column, per-32-element-block sums of the Q8_0 activation quants:
+    /// `sums[j * (k/32) + b]`. The Q4_K mins term consumes these.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn q8_0_col_sums(b_quants: &[i8], n: usize, k: usize) -> Vec<i32> {
+        unsafe {
+            let nb32 = k / 32;
+            let mut sums = vec![0i32; n * nb32];
+            let ones = _mm256_set1_epi8(1);
+            let z = _mm256_setzero_si256();
+            for j in 0..n {
+                let base = b_quants.as_ptr().add(j * k);
+                for b in 0..nb32 {
+                    let x = _mm256_loadu_si256(base.add(b * 32) as *const __m256i);
+                    sums[j * nb32 + b] = hsum256_epi32(_mm256_dpbusd_epi32(z, ones, x));
+                }
+            }
+            sums
+        }
+    }
+
+    /// Same, at 16-element granularity: `sums16[j * (k/16) + h]`. Q6_K scales
+    /// are 16-wide, so its recentering needs half-block activation sums.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn q8_0_col_sums16(b_quants: &[i8], n: usize, k: usize) -> Vec<i32> {
+        unsafe {
+            let nh = k / 16;
+            let mut sums = vec![0i32; n * nh];
+            let ones = _mm_set1_epi8(1);
+            let z = _mm_setzero_si128();
+            for j in 0..n {
+                let base = b_quants.as_ptr().add(j * k);
+                for h in 0..nh {
+                    let x = _mm_loadu_si128(base.add(h * 16) as *const __m128i);
+                    sums[j * nh + h] = hsum128_epi32(_mm_dpbusd_epi32(z, ones, x));
+                }
+            }
+            sums
+        }
+    }
+
+    /// Batched GEMM: `C[m, n] = A_q4_k[m, k] @ B_q8_0[k, n]`.
+    ///
+    /// Layout contract matches the Q4_0/Q8_0 GEMMs (`b_scales[n][k/32]`,
+    /// `b_quants[n][k]`), structure matches the NEON twin: decode each
+    /// super-block group once, apply to `KQ_COLS` columns. Per sub-block `s`
+    /// the contribution is `xs·(d·sc_s·Σ(q·aq) − dmin·mn_s·Σaq)`.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    pub unsafe fn gemm_q4_k_q8_0_avx512(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(k % 256, 0, "Q4_K GEMM: k must be divisible by 256");
+        let sb = k / 256;
+        let nb32 = k / 32;
+        let row_bytes = sb * size_of::<crate::quant::BlockQ4KM>();
+        debug_assert_eq!(a_quant.len(), m * row_bytes, "Q4_K GEMM: a_quant size");
+        debug_assert_eq!(b_quants.len(), n * k, "Q4_K GEMM: b_quants size");
+        debug_assert_eq!(b_scales.len(), n * nb32, "Q4_K GEMM: b_scales size");
+        debug_assert_eq!(out.len(), m * n, "Q4_K GEMM: out size");
+
+        let col_sums = unsafe { q8_0_col_sums(b_quants, n, k) };
+        let cs: &[i32] = &col_sums;
+
+        // Slices captured by reference — Send, no pointer→usize laundering.
+        let compute_row = |(i, row_out): (usize, &mut [f32])| {
+            // SAFETY: row `i` spans `a_quant[i*row_bytes..][..row_bytes]`; the
+            // debug_asserts above pin every slice length.
+            unsafe {
+                let mask_0f = _mm256_set1_epi8(0x0F);
+                let z = _mm256_setzero_si256();
+                let row_start = i * row_bytes;
+
+                let mut j0 = 0usize;
+                while j0 < n {
+                    let cols = KQ_COLS.min(n - j0);
+                    let mut acc = [0.0f32; KQ_COLS];
+
+                    for bi in 0..sb {
+                        let blk = &*(a_quant
+                            .as_ptr()
+                            .add(row_start + bi * size_of::<crate::quant::BlockQ4KM>())
+                            as *const crate::quant::BlockQ4KM);
+                        let d = half::f16::from_bits(blk.d).to_f32();
+                        let dmin = half::f16::from_bits(blk.dmin).to_f32();
+                        let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
+                        let qs = blk.qs.as_ptr();
+
+                        for g in 0..4 {
+                            // Chunk g: low nibbles = sub-block 2g, high = 2g+1;
+                            // byte l is element l of its sub-block, matching the
+                            // contiguous 32-quant activation block.
+                            let qb = _mm256_loadu_si256(qs.add(g * 32) as *const __m256i);
+                            let w_lo = _mm256_and_si256(qb, mask_0f);
+                            let w_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), mask_0f);
+
+                            for (w, s) in [(w_lo, 2 * g), (w_hi, 2 * g + 1)] {
+                                let xb = bi * 8 + s;
+                                let dsc = d * sc[s] as f32;
+                                let dmn = dmin * mn[s] as f32;
+                                for (jj, acc_j) in acc.iter_mut().enumerate().take(cols) {
+                                    let j = j0 + jj;
+                                    let x =
+                                        _mm256_loadu_si256(b_quants.as_ptr().add(j * k + xb * 32)
+                                            as *const __m256i);
+                                    let dp = hsum256_epi32(_mm256_dpbusd_epi32(z, w, x));
+                                    let xs = *b_scales.get_unchecked(j * nb32 + xb);
+                                    let sx = *cs.get_unchecked(j * nb32 + xb);
+                                    *acc_j += xs * (dsc * dp as f32 - dmn * sx as f32);
+                                }
+                            }
+                        }
+                    }
+
+                    row_out[j0..j0 + cols].copy_from_slice(&acc[..cols]);
+                    j0 += cols;
+                }
+            }
+        };
+
+        if m >= crate::backend::cpu::gemv_par_threshold() {
+            crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
+        } else {
+            out.chunks_mut(n).enumerate().for_each(compute_row);
+        }
+    }
+
+    /// Batched GEMM: `C[m, n] = A_q6_k[m, k] @ B_q8_0[k, n]`.
+    ///
+    /// Q6_K geometry (mirrors `dequantize_q6_k_block`): two 128-value halves per
+    /// super-block (`ql += 64`, `qh += 32`, `sc += 8`); half `nh`, group `g`
+    /// covers elements `nh*128 + g*32..+32` with quants
+    /// `(ql[(g&1)*32 + l] nibble(g<2 ? lo : hi)) | (((qh[l] >> 2g) & 3) << 4)`
+    /// and scales `sc[nh*8 + 2g + is]`, `is = l/16`. Scales are 16-wide, so a
+    /// 32-quant activation block spans two of them — the dpbusd lanes split
+    /// cleanly (lanes 0..3 = first 16 bytes, 4..7 = second 16).
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    pub unsafe fn gemm_q6_k_q8_0_avx512(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(k % 256, 0, "Q6_K GEMM: k must be divisible by 256");
+        let sb = k / 256;
+        let nb32 = k / 32;
+        let nh16 = k / 16;
+        let row_bytes = sb * size_of::<crate::quant::BlockQ6K>();
+        debug_assert_eq!(a_quant.len(), m * row_bytes, "Q6_K GEMM: a_quant size");
+        debug_assert_eq!(b_quants.len(), n * k, "Q6_K GEMM: b_quants size");
+        debug_assert_eq!(b_scales.len(), n * nb32, "Q6_K GEMM: b_scales size");
+        debug_assert_eq!(out.len(), m * n, "Q6_K GEMM: out size");
+
+        let col_sums16 = unsafe { q8_0_col_sums16(b_quants, n, k) };
+        let cs16: &[i32] = &col_sums16;
+
+        let compute_row = |(i, row_out): (usize, &mut [f32])| {
+            // SAFETY: as in `gemm_q4_k_q8_0_avx512`.
+            unsafe {
+                let mask_0f = _mm256_set1_epi8(0x0F);
+                let mask_03 = _mm256_set1_epi8(0x03);
+                let z = _mm256_setzero_si256();
+                let row_start = i * row_bytes;
+
+                let mut j0 = 0usize;
+                while j0 < n {
+                    let cols = KQ_COLS.min(n - j0);
+                    let mut acc = [0.0f32; KQ_COLS];
+
+                    for bi in 0..sb {
+                        let blk = &*(a_quant
+                            .as_ptr()
+                            .add(row_start + bi * size_of::<crate::quant::BlockQ6K>())
+                            as *const crate::quant::BlockQ6K);
+                        let d = half::f16::from_bits(blk.d).to_f32();
+                        let ql = blk.ql.as_ptr();
+                        let qh = blk.qh.as_ptr();
+
+                        for nh in 0..2usize {
+                            let qhb = _mm256_loadu_si256(qh.add(nh * 32) as *const __m256i);
+                            for g in 0..4usize {
+                                let qlb = _mm256_loadu_si256(
+                                    ql.add(nh * 64 + (g & 1) * 32) as *const __m256i
+                                );
+                                let l4 = if g < 2 {
+                                    _mm256_and_si256(qlb, mask_0f)
+                                } else {
+                                    _mm256_and_si256(_mm256_srli_epi16(qlb, 4), mask_0f)
+                                };
+                                // Runtime shift by 2g (0/2/4/6): `srl` with a
+                                // count register — `srli` needs a const.
+                                let h2 = _mm256_and_si256(
+                                    _mm256_srl_epi16(qhb, _mm_cvtsi32_si128(2 * g as i32)),
+                                    mask_03,
+                                );
+                                // h2 ≤ 3, so `<< 4` ≤ 48: stays inside its own
+                                // byte, no bleed across the epi16 lane boundary.
+                                let w = _mm256_or_si256(l4, _mm256_slli_epi16(h2, 4));
+
+                                let sc0 = *blk.scales.get_unchecked(nh * 8 + 2 * g) as f32;
+                                let sc1 = *blk.scales.get_unchecked(nh * 8 + 2 * g + 1) as f32;
+                                let xb = bi * 8 + nh * 4 + g;
+
+                                for (jj, acc_j) in acc.iter_mut().enumerate().take(cols) {
+                                    let j = j0 + jj;
+                                    let x =
+                                        _mm256_loadu_si256(b_quants.as_ptr().add(j * k + xb * 32)
+                                            as *const __m256i);
+                                    let lanes = _mm256_dpbusd_epi32(z, w, x);
+                                    let dp0 = hsum128_epi32(_mm256_castsi256_si128(lanes));
+                                    let dp1 = hsum128_epi32(_mm256_extracti128_si256(lanes, 1));
+                                    let xs = *b_scales.get_unchecked(j * nb32 + xb);
+                                    let sx0 = *cs16.get_unchecked(j * nh16 + xb * 2);
+                                    let sx1 = *cs16.get_unchecked(j * nh16 + xb * 2 + 1);
+                                    *acc_j += xs
+                                        * d
+                                        * (sc0 * (dp0 - 32 * sx0) as f32
+                                            + sc1 * (dp1 - 32 * sx1) as f32);
+                                }
+                            }
+                        }
+                    }
+
+                    row_out[j0..j0 + cols].copy_from_slice(&acc[..cols]);
+                    j0 += cols;
+                }
+            }
+        };
+
+        if m >= crate::backend::cpu::gemv_par_threshold() {
+            crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
+        } else {
+            out.chunks_mut(n).enumerate().for_each(compute_row);
+        }
+    }
+
+    /// Q4_K GEMV: quantize `x` to Q8_0 and run the GEMM with `n = 1`, so the
+    /// decode path and the batched prefill path share arithmetic *by
+    /// construction* — the parity tests' tight naive bar depends on exactly
+    /// that (on aarch64 it holds by both paths sharing the NEON dot; here it
+    /// holds by both paths being the same function).
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    pub unsafe fn gemv_q4k_f32_avx512(
+        a_quant: &[u8],
+        x: &[f32],
+        y: &mut [f32],
+        m: usize,
+        k: usize,
+        q8_scales: &mut Vec<f32>,
+        q8_quants: &mut Vec<i8>,
+    ) {
+        unsafe {
+            q8_scales.resize(k / 32, 0.0);
+            q8_quants.resize(k, 0);
+            quantize_f32_to_q8_0_avx512(x, q8_scales, q8_quants);
+            gemm_q4_k_q8_0_avx512(a_quant, q8_scales, q8_quants, y, m, 1, k);
+        }
+    }
+
+    /// Q6_K GEMV — see [`gemv_q4k_f32_avx512`].
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    pub unsafe fn gemv_q6k_f32_avx512(
+        a_quant: &[u8],
+        x: &[f32],
+        y: &mut [f32],
+        m: usize,
+        k: usize,
+        q8_scales: &mut Vec<f32>,
+        q8_quants: &mut Vec<i8>,
+    ) {
+        unsafe {
+            q8_scales.resize(k / 32, 0.0);
+            q8_quants.resize(k, 0);
+            quantize_f32_to_q8_0_avx512(x, q8_scales, q8_quants);
+            gemm_q6_k_q8_0_avx512(a_quant, q8_scales, q8_quants, y, m, 1, k);
+        }
+    }
+
     #[cfg(test)]
     mod avx512_vnni_tests {
         use super::*;
@@ -4066,6 +4394,118 @@ pub(crate) mod avx512_vnni {
                     (g - w).abs() <= 1e-3 * (1.0 + w.abs()),
                     "{what}[{i}]: {g} vs {w}"
                 );
+            }
+        }
+
+        /// K-quant GEMM vs literal dequantize-then-dot (same quantized
+        /// activations, f64 reference accumulation). Odd `n` exercises the
+        /// KQ_COLS tail; two super-blocks exercise the `bi` loop.
+        #[test]
+        fn gemm_q4_k_avx512_matches_dequant_reference() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            let (m, n, k) = (3usize, 5usize, 512usize);
+            let sb = k / 256;
+            let mut st = 0x51ed_c0deu64;
+
+            // Random Q4_K rows: controlled d/dmin (random f16 bits can be
+            // inf/NaN), fully random scales and nibbles.
+            let row_bytes = sb * size_of::<crate::quant::BlockQ4KM>();
+            let mut a = vec![0u8; m * row_bytes];
+            for (bi, chunk) in a
+                .chunks_mut(size_of::<crate::quant::BlockQ4KM>())
+                .enumerate()
+            {
+                let d = half::f16::from_f32(0.01 + 0.005 * (bi % 7) as f32);
+                let dmin = half::f16::from_f32(0.02 + 0.003 * (bi % 5) as f32);
+                chunk[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+                chunk[2..4].copy_from_slice(&dmin.to_bits().to_le_bytes());
+                for b in chunk[4..].iter_mut() {
+                    *b = (lcg01(&mut st) * 255.0) as u8;
+                }
+            }
+
+            // Random activations, pre-quantized to Q8_0 in the GEMM layout.
+            let mut b_scales = vec![0.0f32; n * (k / 32)];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+                let (cs, cq) = ref_quantize(&col);
+                b_scales[j * (k / 32)..(j + 1) * (k / 32)].copy_from_slice(&cs);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&cq);
+            }
+
+            let mut got = vec![0.0f32; m * n];
+            unsafe { gemm_q4_k_q8_0_avx512(&a, &b_scales, &b_quants, &mut got, m, n, k) };
+
+            for i in 0..m {
+                let mut w = vec![0.0f32; k];
+                crate::quant::dequantize_q4_k_m_row(&a[i * row_bytes..(i + 1) * row_bytes], &mut w);
+                for j in 0..n {
+                    let mut want = 0.0f64;
+                    for e in 0..k {
+                        let xa = b_scales[j * (k / 32) + e / 32] * b_quants[j * k + e] as f32;
+                        want += (w[e] * xa) as f64;
+                    }
+                    let g = got[i * n + j] as f64;
+                    assert!(
+                        (g - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                        "[{i},{j}]: got {g} want {want}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn gemm_q6_k_avx512_matches_dequant_reference() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            let (m, n, k) = (3usize, 5usize, 512usize);
+            let sb = k / 256;
+            let mut st = 0x6b1d_5ca1u64;
+
+            let row_bytes = sb * size_of::<crate::quant::BlockQ6K>();
+            let mut a = vec![0u8; m * row_bytes];
+            for (bi, chunk) in a
+                .chunks_mut(size_of::<crate::quant::BlockQ6K>())
+                .enumerate()
+            {
+                for b in chunk[..208].iter_mut() {
+                    *b = (lcg01(&mut st) * 255.0) as u8;
+                }
+                let d = half::f16::from_f32(0.008 + 0.004 * (bi % 5) as f32);
+                chunk[208..210].copy_from_slice(&d.to_bits().to_le_bytes());
+            }
+
+            let mut b_scales = vec![0.0f32; n * (k / 32)];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+                let (cs, cq) = ref_quantize(&col);
+                b_scales[j * (k / 32)..(j + 1) * (k / 32)].copy_from_slice(&cs);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&cq);
+            }
+
+            let mut got = vec![0.0f32; m * n];
+            unsafe { gemm_q6_k_q8_0_avx512(&a, &b_scales, &b_quants, &mut got, m, n, k) };
+
+            for i in 0..m {
+                let mut w = vec![0.0f32; k];
+                crate::quant::dequantize_q6_k_row(&a[i * row_bytes..(i + 1) * row_bytes], &mut w);
+                for j in 0..n {
+                    let mut want = 0.0f64;
+                    for e in 0..k {
+                        let xa = b_scales[j * (k / 32) + e / 32] * b_quants[j * k + e] as f32;
+                        want += (w[e] * xa) as f64;
+                    }
+                    let g = got[i * n + j] as f64;
+                    assert!(
+                        (g - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                        "[{i},{j}]: got {g} want {want}"
+                    );
+                }
             }
         }
 
