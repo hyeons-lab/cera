@@ -675,8 +675,8 @@ fn build_unicode_to_byte() -> HashMap<char, u8> {
 /// Build the pretokenizer regex based on the `tokenizer.ggml.pre` type.
 ///
 /// Different model families use different pretokenizer patterns:
-/// - "lfm2", "llama3", "llama-v3" → LLAMA3 pattern (case-insensitive contractions,
-///   1-3 digit groups, newline handling)
+/// - "lfm2", "llama3", "llama-v3", "llama-bpe" → LLAMA3 pattern (case-insensitive
+///   contractions, 1-3 digit groups, newline handling)
 /// - "gpt2" → GPT-2 pattern (simpler, case-sensitive contractions)
 /// - Others → defaults to LLAMA3 with a warning
 fn build_pretokenize_regex(pre_type: &str) -> Regex {
@@ -685,7 +685,11 @@ fn build_pretokenize_regex(pre_type: &str) -> Regex {
         // The original's `\s+(?!\S)|\s+` needs lookahead (unsupported by the
         // `regex` crate); the trailing-whitespace-before-word behaviour is
         // emulated in `encode`'s split loop instead, so this arm just uses `\s+`.
-        "lfm2" | "llama3" | "llama-v3" => concat!(
+        // `llama-bpe` is llama.cpp's canonical spelling for this pre type — it
+        // groups "llama3" | "llama-v3" | "llama-bpe" onto LLAMA_VOCAB_PRE_TYPE_LLAMA3.
+        // cera had the first two, so every Llama-3 GGUF warned "unknown ... type
+        // 'llama-bpe'" and then picked LLAMA3 anyway: right pattern, false alarm.
+        "lfm2" | "llama3" | "llama-v3" | "llama-bpe" => concat!(
             r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
             r"|[^\r\n\p{L}\p{N}]?\p{L}+",
             r"|\p{N}{1,3}",

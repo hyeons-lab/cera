@@ -891,10 +891,10 @@ jobs:
           done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
           sudo apt-get update && sudo apt-get install -y libopenblas-dev
       # On a PR this is the `core` set (267 MB): both int8 GEMM kernels plus the
-      # K-quant path. On a main push or manual dispatch it is `all` (5.5 GB),
-      # adding one fixture per dense arch. Two separate cache entries rather
+      # K-quant path. On a main push or manual dispatch it is `all` (6.3 GB),
+      # adding the dense-transformer fixtures. Two separate cache entries rather
       # than one, so the per-PR restore stays small — GitHub allows 10 GB of
-      # cache per repo in total, and a 5 GB entry restored on every PR would
+      # cache per repo in total, and a 6.3 GB entry restored on every PR would
       # evict the rust and gradle caches the other jobs depend on.
       - name: Select fixture set
         id: fixtures
@@ -944,11 +944,24 @@ jobs:
       # gap to read in the log (the tests print an explicit SKIP line), not a
       # build failure. Promote this to required once the runner pool is known
       # to carry it.
+      # `unbatchable_warning` rides along here, not in the main Test job: it
+      # needs a fixture, and that job has none, so there it skips silently and
+      # reports a pass. It is native-leg only — the test is
+      # `cfg(not(feature = "blas"))`, since it forces the fallback by
+      # downgrading the CPU tier, which BLAS ignores.
+      # Deliberately does NOT set CERA_REQUIRE_MODEL. It makes *any* absent
+      # fixture fatal, but this leg fetches only `core` on a PR while granite /
+      # llama3 / qwen2 / qwen3 are `arch`-tier — so it would fail four tests that
+      # are supposed to skip. (It is also an all-or-nothing switch: the tests
+      # check `env::var(..).is_err()`, so even an empty value trips it.) An
+      # absent fixture is already fatal where it matters — `fetch_test_models.sh`
+      # exits non-zero if a download fails.
       - name: Parity (native int8 batched path)
         run: |
           cargo test -p cera --release --no-fail-fast \
             --test llama_batched_prefill_parity \
             --test lfm2_batched_prefill_parity \
+            --test unbatchable_warning \
             -- --ignored --nocapture
 
   integration-test:

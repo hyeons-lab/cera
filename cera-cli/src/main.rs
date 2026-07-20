@@ -1780,9 +1780,31 @@ fn setup_kv_compression(
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // Default to `warn` when RUST_LOG is unset, rather than the empty filter
+    // `from_default_env()` yields — which showed nothing at all.
+    //
+    // The library warns on exactly the conditions a user most needs to hear
+    // about and cannot otherwise see: `warn_unbatchable` fires when prefill
+    // falls off the batched GEMM onto the per-token path, which costs ~4x. That
+    // warning was reachable only by someone who already suspected a problem and
+    // knew to set RUST_LOG — precisely the person who does not need telling.
+    // RUST_LOG still wins when set, so `RUST_LOG=debug` and friends are
+    // unaffected.
+    // Unset and *invalid* are handled differently on purpose.
+    // `try_from_default_env()` fails identically for both, so folding them
+    // together would silently downgrade a typo'd `RUST_LOG=warm` to the default
+    // — the user sees plausible output and never learns their filter was
+    // discarded. Say so on stderr and carry on rather than aborting: a bad log
+    // filter should not stop an inference run.
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(spec) if !spec.trim().is_empty() => tracing_subscriber::EnvFilter::try_new(&spec)
+            .unwrap_or_else(|e| {
+                eprintln!("warning: ignoring invalid RUST_LOG ({spec:?}): {e}; using `warn`");
+                tracing_subscriber::EnvFilter::new("warn")
+            }),
+        _ => tracing_subscriber::EnvFilter::new("warn"),
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
 
