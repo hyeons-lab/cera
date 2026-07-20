@@ -233,9 +233,9 @@ pub(crate) fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
 /// same cfg). Without it this is dead code on wasm and on any target without a
 /// batched path, which the CI lint job (`cargo clippy --workspace --all-targets --
 /// -D warnings`, ubuntu, no `blas`) turns into a hard error — an aarch64 dev
-/// machine cannot reproduce that. It *is* called on x86_64 now (where it returns
-/// `false`, there being no VNNI K-quant GEMM), so this is a lint cfg, not a
-/// statement about which targets reach it.
+/// machine cannot reproduce that. It *is* called on x86_64, where it now answers
+/// for the VNNI K-quant GEMM kernels — so this is a lint cfg, not a statement
+/// about which targets reach it.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
 fn k_quant_gemm_available() -> bool {
     // BLAS dequantizes the weight and SGEMMs, so it needs no int8 kernel.
@@ -250,9 +250,18 @@ fn k_quant_gemm_available() -> bool {
     // No BLAS and no NEON: there is no batched path at all on this target (the
     // caller gates are themselves cfg'd off), so the answer is moot but must be
     // `false` rather than optimistic.
-    // No BLAS and no NEON K-quant kernel (x86's VNNI path covers Q4_0/Q8_0
-    // only), so there is no batched K-quant path on this target.
-    #[cfg(all(not(feature = "blas"), not(target_arch = "aarch64")))]
+    // x86: the VNNI K-quant GEMM shares its availability condition with the
+    // Q4_0/Q8_0 int8 kernels — runtime AVX-512 VNNI, `avx512` feature on.
+    #[cfg(all(not(feature = "blas"), target_arch = "x86_64"))]
+    {
+        crate::backend::cpu::int8_gemm_available()
+    }
+    // No BLAS, no NEON, no VNNI: no batched K-quant path on this target.
+    #[cfg(all(
+        not(feature = "blas"),
+        not(target_arch = "aarch64"),
+        not(target_arch = "x86_64")
+    ))]
     {
         false
     }
