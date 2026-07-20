@@ -891,7 +891,7 @@ jobs:
           done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
           sudo apt-get update && sudo apt-get install -y libopenblas-dev
       # On a PR this is the `core` set (267 MB): both int8 GEMM kernels plus the
-      # K-quant path. On a main push or manual dispatch it is `all` (5.5 GB),
+      # K-quant path. On a main push or manual dispatch it is `all` (6.3 GB),
       # adding one fixture per dense arch. Two separate cache entries rather
       # than one, so the per-PR restore stays small — GitHub allows 10 GB of
       # cache per repo in total, and a 5 GB entry restored on every PR would

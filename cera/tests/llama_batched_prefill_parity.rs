@@ -238,6 +238,21 @@ fn llama_batched_prefill_parity_llama3() {
     check_both("target/oracle/models/Llama-3.2-1B-Instruct-Q8_0.gguf");
 }
 
+/// The dense-transformer K-quant path. Q4_K_M only produces real K-quants when
+/// the row length is divisible by 256 (llama.cpp falls back to a legacy quant
+/// otherwise), so this needs a model with a 256-divisible hidden size —
+/// Llama-3.2-1B at 2048 is 96 Q4_K + 17 Q6_K throughout. A Qwen2-0.5B Q4_K_M
+/// would not do: hidden 896 leaves `896 % 256 = 128`, so its projections are
+/// Q5_0, which cera cannot load at all.
+///
+/// This is the fixture the old allowlist NOTE asked for before widening the
+/// dense gate to admit K-quants.
+#[test]
+#[ignore]
+fn llama_batched_prefill_parity_llama32_1b_q4_k_m() {
+    check_both("target/oracle/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf");
+}
+
 #[test]
 #[ignore]
 fn llama_batched_prefill_parity_qwen3() {

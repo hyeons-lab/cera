@@ -8,7 +8,7 @@
 # tensors flow through the whole forward pass.
 #
 # The fixtures below are chosen to be CI-sized rather than representative —
-# together 5.5 GB and ~90 s of test time, against the multi-GB files the other
+# together 6.3 GB and ~105 s of test time, against the multi-GB files the other
 # parity tests use locally.
 #
 # Sizes here are decimal (MB = 10^6, GB = 10^9), matching what Hugging Face
@@ -41,6 +41,12 @@
 #   Llama-3.2-1B-Instruct
 #     -Q8_0               1321 MB   llama: NORM rope with Llama-3 `rope_freqs`
 #                                   frequency-scaling factors. ~14 s.
+#   Llama-3.2-1B-Instruct
+#     -Q4_K_M              808 MB   the dense-transformer K-quant path: 96 Q4_K
+#                                   + 17 Q6_K. Needs a 256-divisible hidden size
+#                                   (2048) — Q4_K_M on a 896-hidden model like
+#                                   Qwen2-0.5B falls back to Q5_0, which cera
+#                                   cannot load. ~16 s.
 #   granite-3.1-2b-instruct
 #     -Q8_0               2694 MB   granite: the four scalar multipliers
 #                                   (embedding/residual/attention/logit), which
@@ -77,7 +83,7 @@
 #
 # `--set core` (the default) fetches the three fixtures that cover both int8
 # GEMM kernels and the K-quant path — 267 MB, what CI pulls on a PR.
-# `--set all` adds the four per-arch fixtures for a total of 5.5 GB, which is
+# `--set all` adds the five per-arch fixtures for a total of 6.3 GB, which is
 # what CI pulls on a main push.
 #
 # Default dest is `target/oracle/models`, where the parity tests look. Point
@@ -113,6 +119,7 @@ core	LFM2.5-230M-Q4_K_M.gguf	7bbd90384d3deffe4c646ec9643b212802d32d4ce417c90a1ec
 arch	qwen2-0_5b-instruct-q8_0.gguf	834f4115ad5a836c9f17716b1577290fda96de3deb881ba45a4d5476fd202e96	https://huggingface.co/Qwen/Qwen2-0.5B-Instruct-GGUF/resolve/main/qwen2-0_5b-instruct-q8_0.gguf
 arch	Qwen3-0.6B-Q8_0.gguf	9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031	https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf
 arch	Llama-3.2-1B-Instruct-Q8_0.gguf	432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3	https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q8_0.gguf
+arch	Llama-3.2-1B-Instruct-Q4_K_M.gguf	6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83	https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf
 arch	granite-3.1-2b-instruct-Q8_0.gguf	883a1094022c40cb05f481fbe236b315cf2ca4f30ff84f8852aa3301e0edde72	https://huggingface.co/bartowski/granite-3.1-2b-instruct-GGUF/resolve/main/granite-3.1-2b-instruct-Q8_0.gguf
 EOF
 )
@@ -137,7 +144,7 @@ case "$SET" in core|all) ;; *) echo "--set must be core|all" >&2; exit 2 ;; esac
 while IFS=$'\t' read -r tier name want url; do
   [[ -n "$name" ]] || continue
   # `core` is the per-PR set: both int8 GEMM kernels plus the K-quant path, at
-  # 267 MB. `all` adds the four per-arch fixtures (5.5 GB), which are worth
+  # 267 MB. `all` adds the five per-arch fixtures (6.3 GB), which are worth
   # caching but not worth pulling on every PR — GitHub allows 10 GB of cache
   # per repo in total, and a 5 GB entry would evict the rust and gradle caches
   # that every other job depends on.
@@ -164,7 +171,16 @@ while IFS=$'\t' read -r tier name want url; do
   # interrupted run can never leave a half-file that a later run treats as
   # present-and-correct.
   tmp="$path.partial"
-  curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$tmp" "$url"
+  # Remove the fragment if curl dies mid-transfer. `set -e` aborts the script on
+  # a failed download, which skipped the cleanup below and left the .partial on
+  # disk — never mistaken for the real file (that was the point of the suffix),
+  # but repeated failures accumulated multi-hundred-MB fragments. Seen for real:
+  # a 2.5 GB fetch died at 126 MB with an SSL record error.
+  if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$tmp" "$url"; then
+    rm -f "$tmp"
+    echo "error: $name download failed" >&2
+    exit 1
+  fi
 
   got="$(sha256_of "$tmp")"
   if [[ "$got" != "$want" ]]; then

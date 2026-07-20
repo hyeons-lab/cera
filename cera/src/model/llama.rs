@@ -501,13 +501,22 @@ impl LlamaModel {
         // If any per-layer projection uses a dtype the batched GEMM cannot take,
         // fall back to the sequential per-token path so the result stays correct.
         //
-        // NOTE: this deliberately still admits only Q4_0/Q8_0, even though LFM2 now
-        // also runs batched Q4_K/Q6_K through the same `gemm_preq`. Widening it here
-        // is a one-line change, but there is no local Q4_K dense-transformer fixture
-        // to exercise it (a Qwen Q4_K_M carries Q5_K tensors, which have no GEMM, so
-        // it would gate off anyway) — and an unexercised fast path is how the Q6_K
-        // accumulation bug got in. Widen it together with a Q5_K GEMM and a fixture
-        // that actually runs `llama_batched_prefill_parity` over it.
+        // Admits exactly what `batched_gemm_supports` can compute, which now
+        // includes Q4_K/Q6_K on both int8 targets.
+        //
+        // The previous note here said widening needed a Q5_K GEMM first, because
+        // "a Qwen Q4_K_M carries Q5_K tensors". That was wrong on the specifics:
+        // those files carry **Q5_0**, not Q5_K, and cera rejects them at *load*
+        // rather than at this gate — a Q5_K kernel would not have helped.
+        //
+        // The real rule is llama.cpp's: K-quants need a 256-element super-block,
+        // so a tensor whose row length is not divisible by 256 falls back to a
+        // legacy quant. Qwen2-0.5B is hidden=896 (896 % 256 = 128), so its
+        // 896-wide tensors are Q5_0 while its 4864-wide `ffn_down` is Q6_K.
+        // A model with a 256-divisible hidden size is genuinely Q4_K/Q6_K
+        // throughout: Llama-3.2-1B (hidden 2048) is 96 Q4_K + 17 Q6_K + 34 F32,
+        // which is what `llama_batched_prefill_parity_llama32_1b_q4_k_m`
+        // exercises.
         let mut unbatchable: Option<(&str, crate::tensor::DType)> = None;
         for r in self.layer_refs.iter() {
             for (name, w) in [
@@ -519,21 +528,17 @@ impl LlamaModel {
                 ("ffn_up", &r.ffn_up),
                 ("ffn_down", &r.ffn_down),
             ] {
-                // Two independent conditions, and both must hold:
-                //   1. the dtype allowlist above (deliberately narrower than
-                //      `batched_gemm_supports`, which also admits Q4_K/Q6_K), and
-                //   2. whether a kernel can actually run *on this host* — on x86
-                //      the int8 GEMM needs runtime VNNI, and a non-VNNI part must
-                //      stay on the per-token path.
-                // Without (2) a non-VNNI x86 build reaches `gemm_preq`, no kernel
-                // runs, and callers reuse one output buffer across layers — so the
-                // previous layer's activations survive as this layer's result.
-                // Silent wrong numbers, not a crash.
-                if !matches!(
-                    w.dtype,
-                    crate::tensor::DType::Q4_0 | crate::tensor::DType::Q8_0
-                ) || !transformer::batched_gemm_supports(w.dtype, w.k)
-                {
+                // `batched_gemm_supports` answers every half of the question:
+                // the dtype has a kernel at all, that kernel can run *on this
+                // host* (on x86 the int8 GEMM needs runtime VNNI), and for
+                // K-quants that `k % 256 == 0`.
+                //
+                // The host check is the load-bearing one. Without it a non-VNNI
+                // x86 build reaches `gemm_preq`, no kernel runs, and callers
+                // reuse one output buffer across layers — so the previous
+                // layer's activations survive as this layer's result. Silent
+                // wrong numbers, not a crash.
+                if !transformer::batched_gemm_supports(w.dtype, w.k) {
                     unbatchable = Some((name, w.dtype));
                     break;
                 }
