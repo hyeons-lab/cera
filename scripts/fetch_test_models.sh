@@ -149,7 +149,7 @@ while IFS=$'\t' read -r tier name want url; do
   # `core` is the per-PR set: both int8 GEMM kernels plus the K-quant path, at
   # 267 MB. `all` adds the five dense-transformer fixtures (6.3 GB), worth
   # caching but not worth pulling on every PR — GitHub allows 10 GB of cache
-  # per repo in total, and a 5 GB entry would evict the rust and gradle caches
+  # per repo in total, and a 6.3 GB entry would evict the rust and gradle caches
   # that every other job depends on.
   if [[ "$SET" == "core" && "$tier" != "core" ]]; then
     continue

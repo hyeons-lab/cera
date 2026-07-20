@@ -97,10 +97,16 @@ fn per_token_fallback_emits_a_warning() {
     // batched path declines for lack of an int8 kernel.
     let Some(path) = find_fixture("target/oracle/models/SmolLM-135M.Q4_0.gguf") else {
         // A skip that reports PASS is how a gate goes green forever without
-        // running — the failure mode this whole test exists to prevent. CI sets
-        // CERA_REQUIRE_MODEL on the leg that fetches fixtures, so an absent one
-        // there is a hard failure rather than a quiet no-op. Mirrors the parity
-        // suites.
+        // running — the failure mode this whole test exists to prevent.
+        // `CERA_REQUIRE_MODEL=1` turns that skip into a failure, for a caller
+        // who knows the fixture should be there.
+        //
+        // CI does NOT set it, deliberately: the parity leg fetches only the
+        // `core` set on a PR, and the variable is all-or-nothing, so it would
+        // fail the arch-tier tests that are supposed to skip. What guards CI is
+        // upstream instead — `fetch_test_models.sh` exits non-zero if a download
+        // fails, so a fixture cannot go quietly missing there. Mirrors the
+        // parity suites, including their reason for not wiring it into CI.
         assert!(
             std::env::var("CERA_REQUIRE_MODEL").is_err(),
             "CERA_REQUIRE_MODEL is set but the fixture is absent: \

@@ -894,7 +894,7 @@ jobs:
       # K-quant path. On a main push or manual dispatch it is `all` (6.3 GB),
       # adding the dense-transformer fixtures. Two separate cache entries rather
       # than one, so the per-PR restore stays small — GitHub allows 10 GB of
-      # cache per repo in total, and a 5 GB entry restored on every PR would
+      # cache per repo in total, and a 6.3 GB entry restored on every PR would
       # evict the rust and gradle caches the other jobs depend on.
       - name: Select fixture set
         id: fixtures
