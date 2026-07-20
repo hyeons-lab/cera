@@ -23,7 +23,14 @@ use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::layer::SubscriberExt;
 
-/// Collects the rendered message of every `WARN` event from the given target.
+/// Collects the `message` field of every `WARN` event, from any target.
+///
+/// Debug-formatted rather than fully rendered — the assertion only needs a
+/// substring match, and reaching for a real formatter here would pull in
+/// machinery the test does not use. No target filter on purpose: the point is
+/// to prove *something* warned about the fallback, so narrowing to
+/// `cera::model::transformer` would bake this test's expectation into where the
+/// warning happens to live.
 #[derive(Clone, Default)]
 struct WarnCapture(Arc<Mutex<Vec<String>>>);
 

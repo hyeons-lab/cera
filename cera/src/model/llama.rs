@@ -528,10 +528,10 @@ impl LlamaModel {
                 ("ffn_up", &r.ffn_up),
                 ("ffn_down", &r.ffn_down),
             ] {
-                // `batched_gemm_supports` answers every half of the question:
-                // the dtype has a kernel at all, that kernel can run *on this
-                // host* (on x86 the int8 GEMM needs runtime VNNI), and for
-                // K-quants that `k % 256 == 0`.
+                // `batched_gemm_supports` answers all three parts of the
+                // question: the dtype has a kernel at all, that kernel can run
+                // *on this host* (on x86 the int8 GEMM needs runtime VNNI), and
+                // for K-quants that `k % 256 == 0`.
                 //
                 // The host check is the load-bearing one. Without it a non-VNNI
                 // x86 build reaches `gemm_preq`, no kernel runs, and callers

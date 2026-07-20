@@ -193,11 +193,10 @@ pub(crate) fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
 /// per-token GEMV loop, silently**. Add a dtype here only once *both* implementations
 /// handle it.
 ///
-/// `llama.rs` deliberately does **not** call this: its gate stays Q4_0/Q8_0-only until
-/// there is a dense-transformer fixture that actually exercises a widened path (see the
-/// comment at its gate). Its dtype set is a strict subset of this one, so it can only
-/// be over-conservative, never wrong — but do not assume widening this function widens
-/// llama too.
+/// This is the single source of truth: both `lfm2.rs` and `llama.rs` gate on it,
+/// so widening it widens every caller at once. `llama.rs` used to keep a narrower
+/// Q4_0/Q8_0 allowlist of its own, which is why its gate now reads as a plain
+/// call — that duplicate list is gone, not merely satisfied.
 ///
 /// The K-quant arm is **runtime**-gated, not just dtype-gated: the Q4_K/Q6_K int8
 /// GEMMs exist only in `dotprod` form. If this admitted them on a CPU without

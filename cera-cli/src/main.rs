@@ -1790,12 +1790,21 @@ fn main() -> Result<()> {
     // knew to set RUST_LOG — precisely the person who does not need telling.
     // RUST_LOG still wins when set, so `RUST_LOG=debug` and friends are
     // unaffected.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .init();
+    // Unset and *invalid* are handled differently on purpose.
+    // `try_from_default_env()` fails identically for both, so folding them
+    // together would silently downgrade a typo'd `RUST_LOG=warm` to the default
+    // — the user sees plausible output and never learns their filter was
+    // discarded. Say so on stderr and carry on rather than aborting: a bad log
+    // filter should not stop an inference run.
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(spec) if !spec.trim().is_empty() => tracing_subscriber::EnvFilter::try_new(&spec)
+            .unwrap_or_else(|e| {
+                eprintln!("warning: ignoring invalid RUST_LOG ({spec:?}): {e}; using `warn`");
+                tracing_subscriber::EnvFilter::new("warn")
+            }),
+        _ => tracing_subscriber::EnvFilter::new("warn"),
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
 

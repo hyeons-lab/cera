@@ -31,8 +31,11 @@
 #                                   the K-quant GEMM kernels and their gates.
 #                                   ~16 s.
 #
-# Then one per remaining dense arch, since each has a distinct forward path the
-# batched GEMM has to stay in step with. Larger, but the cache amortizes them:
+# Then the dense-transformer fixtures. Mostly one per arch — each has a distinct
+# forward path the batched GEMM has to stay in step with — plus a second Llama
+# build, because arch coverage and *dtype* coverage are different axes: the Q8_0
+# file exercises Llama-3 rope, the Q4_K_M one exercises the K-quant kernels on a
+# dense model. Larger, but the cache amortizes them:
 #
 #   qwen2-0_5b-instruct
 #     -q8_0                531 MB   qwen2: Q/K/V projection biases. ~12 s.
@@ -83,8 +86,8 @@
 #
 # `--set core` (the default) fetches the three fixtures that cover both int8
 # GEMM kernels and the K-quant path — 267 MB, what CI pulls on a PR.
-# `--set all` adds the five per-arch fixtures for a total of 6.3 GB, which is
-# what CI pulls on a main push.
+# `--set all` adds the five dense-transformer fixtures for a total of 6.3 GB,
+# which is what CI pulls on a main push.
 #
 # Default dest is `target/oracle/models`, where the parity tests look. Point
 # `CERA_MODEL_ROOT` at the directory *containing* `target/` to use a checkout
@@ -144,7 +147,7 @@ case "$SET" in core|all) ;; *) echo "--set must be core|all" >&2; exit 2 ;; esac
 while IFS=$'\t' read -r tier name want url; do
   [[ -n "$name" ]] || continue
   # `core` is the per-PR set: both int8 GEMM kernels plus the K-quant path, at
-  # 267 MB. `all` adds the five per-arch fixtures (6.3 GB), which are worth
+  # 267 MB. `all` adds the five dense-transformer fixtures (6.3 GB), worth
   # caching but not worth pulling on every PR — GitHub allows 10 GB of cache
   # per repo in total, and a 5 GB entry would evict the rust and gradle caches
   # that every other job depends on.
