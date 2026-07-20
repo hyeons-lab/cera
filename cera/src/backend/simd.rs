@@ -3221,10 +3221,20 @@ pub(crate) mod avx512 {
                 let hi = _mm_and_si128(_mm_srli_epi16(qbytes, 4), mask_lo);
                 let y_ptr = y.as_ptr().add(b * 32);
 
+                // Sum the block's two halves *before* scaling by `d`, so the
+                // loop-carried `acc` chain takes one FMA per block instead of
+                // two. `acc` is the bottleneck: at ~4-cycle FMA latency, two
+                // dependent FMAs put a floor of ~8 cycles on each block.
+                //
+                // Algebraically identical (`d·a·y + d·b·y == d·(a·y + b·y)`) but
+                // not bit-identical — the halves are summed at a different point,
+                // so rounding differs. That is why the per-block-sum test carries
+                // a tolerance rather than asserting equality.
                 let lo_f = _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(lo)), offset);
-                acc = _mm512_fmadd_ps(_mm512_mul_ps(d, lo_f), _mm512_loadu_ps(y_ptr), acc);
                 let hi_f = _mm512_sub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(hi)), offset);
-                acc = _mm512_fmadd_ps(_mm512_mul_ps(d, hi_f), _mm512_loadu_ps(y_ptr.add(16)), acc);
+                let block_sum = _mm512_mul_ps(lo_f, _mm512_loadu_ps(y_ptr));
+                let block_sum = _mm512_fmadd_ps(hi_f, _mm512_loadu_ps(y_ptr.add(16)), block_sum);
+                acc = _mm512_fmadd_ps(d, block_sum, acc);
             }
             _mm512_reduce_add_ps(acc)
         }
@@ -3257,14 +3267,17 @@ pub(crate) mod avx512 {
                 // kernels differ only in how a block is unpacked, and that is
                 // easier to check when their shapes match. Codegen is the same
                 // either way: a 2-iteration constant-bound loop unrolls.
+                // See `row_dot_q4_0_f32_avx512`: halves summed before scaling
+                // by `d`, so `acc` carries one FMA per block rather than two.
                 let qf_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
                     quants_ptr as *const __m128i,
                 )));
-                acc = _mm512_fmadd_ps(_mm512_mul_ps(d, qf_lo), _mm512_loadu_ps(y_ptr), acc);
                 let qf_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
                     quants_ptr.add(16) as *const __m128i,
                 )));
-                acc = _mm512_fmadd_ps(_mm512_mul_ps(d, qf_hi), _mm512_loadu_ps(y_ptr.add(16)), acc);
+                let block_sum = _mm512_mul_ps(qf_lo, _mm512_loadu_ps(y_ptr));
+                let block_sum = _mm512_fmadd_ps(qf_hi, _mm512_loadu_ps(y_ptr.add(16)), block_sum);
+                acc = _mm512_fmadd_ps(d, block_sum, acc);
             }
             _mm512_reduce_add_ps(acc)
         }
