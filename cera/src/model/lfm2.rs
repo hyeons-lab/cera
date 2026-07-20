@@ -1975,8 +1975,9 @@ impl Lfm2Model {
 
             // FFN: batched GEMM (reads weights once for all n tokens) for the
             // dtypes `batched_gemm_supports` admits. Available on aarch64 (NEON
-            // `gemm_preq`) and on any target with `feature = "blas"` (BLAS SGEMM
-            // via `try_blas_prefill_gemm`). Require all three projections
+            // `gemm_preq`), on x86_64 with runtime AVX-512 VNNI (int8
+            // `gemm_preq`), and on any target with `feature = "blas"` (BLAS
+            // SGEMM via `try_blas_prefill_gemm`). Require all three projections
             // (gate/up/down) to be batchable — a mixed-dtype FFN block would
             // leave later matrices silently uncomputed in the batched path and
             // produce wrong outputs.

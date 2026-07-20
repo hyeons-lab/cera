@@ -233,9 +233,9 @@ pub(crate) fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
 /// same cfg). Without it this is dead code on wasm and on any target without a
 /// batched path, which the CI lint job (`cargo clippy --workspace --all-targets --
 /// -D warnings`, ubuntu, no `blas`) turns into a hard error — an aarch64 dev
-/// machine cannot reproduce that. It *is* called on x86_64 now (where it returns
-/// `false`, there being no VNNI K-quant GEMM), so this is a lint cfg, not a
-/// statement about which targets reach it.
+/// machine cannot reproduce that. It *is* called on x86_64, where it now answers
+/// for the VNNI K-quant GEMM kernels — so this is a lint cfg, not a statement
+/// about which targets reach it.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
 fn k_quant_gemm_available() -> bool {
     // BLAS dequantizes the weight and SGEMMs, so it needs no int8 kernel.

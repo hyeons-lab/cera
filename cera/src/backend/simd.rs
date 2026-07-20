@@ -4509,6 +4509,108 @@ pub(crate) mod avx512_vnni {
             }
         }
 
+        /// The GEMV wrappers against dequantized weights dotted with the
+        /// *quantized* activations (`ref_quantize`, which
+        /// `quantize_q8_0_avx512_matches_scalar` proves bit-identical to the
+        /// kernel quantizer). The GEMM tests above are handed pre-quantized
+        /// activations, so they cannot catch a wrapper bug — a stale scratch
+        /// resize, a swapped scale/quant argument; this exercises the
+        /// quantize-then-dot pipeline against a reference that shares the
+        /// quantization, keeping the bar tight. (Comparing against the raw f32
+        /// activations instead would fold ±½-step quantization noise into the
+        /// tolerance — ~1.4σ misses at 2% on this data — and testing the
+        /// quantizer is not this test's job.)
+        #[test]
+        fn gemv_q4k_avx512_matches_dequant_reference() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            let (m, k) = (8usize, 512usize);
+            let sb = k / 256;
+            let mut st = 0x7a11_ce55u64;
+            let row_bytes = sb * size_of::<crate::quant::BlockQ4KM>();
+            let mut a = vec![0u8; m * row_bytes];
+            for (bi, chunk) in a
+                .chunks_mut(size_of::<crate::quant::BlockQ4KM>())
+                .enumerate()
+            {
+                let d = half::f16::from_f32(0.01 + 0.004 * (bi % 5) as f32);
+                let dmin = half::f16::from_f32(0.015);
+                chunk[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+                chunk[2..4].copy_from_slice(&dmin.to_bits().to_le_bytes());
+                for b in chunk[4..].iter_mut() {
+                    *b = (lcg01(&mut st) * 255.0) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+
+            let mut y = vec![0.0f32; m];
+            let mut scr_s = Vec::new();
+            let mut scr_q = Vec::new();
+            // Pre-dirty the scratch with wrong-sized garbage: the wrapper must
+            // resize and overwrite, not trust what it was handed.
+            scr_s.resize(3, 9.9);
+            scr_q.resize(7, 99);
+            unsafe { gemv_q4k_f32_avx512(&a, &x, &mut y, m, k, &mut scr_s, &mut scr_q) };
+
+            let (xs, xq) = ref_quantize(&x);
+            for i in 0..m {
+                let mut w = vec![0.0f32; k];
+                crate::quant::dequantize_q4_k_m_row(&a[i * row_bytes..(i + 1) * row_bytes], &mut w);
+                let want: f64 = w
+                    .iter()
+                    .enumerate()
+                    .map(|(e, &we)| (we * xs[e / 32] * xq[e] as f32) as f64)
+                    .sum();
+                let g = y[i] as f64;
+                assert!(
+                    (g - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                    "row {i}: got {g} want {want}"
+                );
+            }
+        }
+
+        #[test]
+        fn gemv_q6k_avx512_matches_dequant_reference() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            let (m, k) = (8usize, 512usize);
+            let sb = k / 256;
+            let mut st = 0x2f5e_11d3u64;
+            let row_bytes = sb * size_of::<crate::quant::BlockQ6K>();
+            let mut a = vec![0u8; m * row_bytes];
+            for chunk in a.chunks_mut(size_of::<crate::quant::BlockQ6K>()) {
+                for b in chunk[..208].iter_mut() {
+                    *b = (lcg01(&mut st) * 255.0) as u8;
+                }
+                let d = half::f16::from_f32(0.01);
+                chunk[208..210].copy_from_slice(&d.to_bits().to_le_bytes());
+            }
+            let x: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+
+            let mut y = vec![0.0f32; m];
+            let mut scr_s = Vec::new();
+            let mut scr_q = Vec::new();
+            unsafe { gemv_q6k_f32_avx512(&a, &x, &mut y, m, k, &mut scr_s, &mut scr_q) };
+
+            let (xs, xq) = ref_quantize(&x);
+            for i in 0..m {
+                let mut w = vec![0.0f32; k];
+                crate::quant::dequantize_q6_k_row(&a[i * row_bytes..(i + 1) * row_bytes], &mut w);
+                let want: f64 = w
+                    .iter()
+                    .enumerate()
+                    .map(|(e, &we)| (we * xs[e / 32] * xq[e] as f32) as f64)
+                    .sum();
+                let g = y[i] as f64;
+                assert!(
+                    (g - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                    "row {i}: got {g} want {want}"
+                );
+            }
+        }
+
         #[test]
         fn quantize_q8_0_avx512_matches_scalar() {
             if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
