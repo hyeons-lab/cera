@@ -257,7 +257,7 @@ optimal on any one. The knobs below override them.
 
 | Variable | Effect |
 |----------|--------|
-| `CERA_DECODE_THREADS=<n>\|auto` | Worker count for decode (per-token GEMV). Default is the detected performance-core count capped at 12; clamped to the detected count. |
+| `CERA_DECODE_THREADS=<n>` or `CERA_DECODE_THREADS=auto` | Worker count for decode (per-token GEMV). Default is the detected performance-core count capped at 12; clamped to the detected count. |
 | `CERA_THREADS=<n>` | Overrides the detected performance-core count, which the decode/prefill pools are sized from. |
 | `CERA_CPU_TIER=<tier>` | Caps the SIMD tier (e.g. `avx2`, `avx512`). May only downgrade — useful for A/B-ing a kernel path. |
 | `RUST_LOG=<filter>` | Log level. Defaults to `warn`, which surfaces things like prefill falling back to the slow per-token path. |

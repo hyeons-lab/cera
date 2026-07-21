@@ -3848,11 +3848,6 @@ mod tests {
         );
     }
 
-    /// Microbenchmark: measure GEMV throughput and effective memory bandwidth
-    /// for the Q4_0 × Q8_0 pre-quantized kernel at FFN gate shape.
-    ///
-    /// Run with:
-    /// `cargo test -p cera --release --lib backend::cpu::tests::microbench_gemv_q4_0 -- --ignored --nocapture`
     /// Cost of one `RowPool` dispatch with essentially no work in it — the
     /// synchronization tax decode pays per GEMV.
     ///
@@ -3871,15 +3866,19 @@ mod tests {
     ///
     /// Run with:
     /// `cargo test -p cera --release --lib backend::cpu::tests::microbench_dispatch -- --ignored --nocapture`
-    #[cfg(feature = "parallel")]
+    // This measures native `RowPool` dispatch, and `threadpool::RowPool` is
+    // gated off wasm32 (`par_rows` itself has a wasm impl over web workers), so
+    // `parallel` alone would fail to compile on a threaded wasm build.
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
     #[test]
     #[ignore]
     fn microbench_dispatch() {
         use std::time::Instant;
 
+        // The probe below already forces lazy pool init, so the warm-up loop is
+        // for caller pinning and cache/steal-loop warmth, not init.
         let threads = crate::backend::threadpool::RowPool::decode().num_threads();
 
-        // Warm: the first dispatch pays lazy pool init and caller pinning.
         let mut warm = vec![0.0f32; 4096];
         for _ in 0..100 {
             par_rows(&mut warm, gemv_min_rows(), |(i, v)| *v = i as f32);
@@ -3896,6 +3895,9 @@ mod tests {
                 par_rows(&mut y, gemv_min_rows(), |(_i, v)| *v += 1.0);
             }
             let per = t.elapsed().as_secs_f64() / iters as f64;
+            // Observe `y` so the optimizer cannot elide the trivial body and
+            // leave us timing an empty loop.
+            std::hint::black_box(&y);
             eprintln!(
                 "  rows={rows:<5} {:>7.1} us/dispatch  ->  {:>6.2} ms/token at 113 dispatches",
                 per * 1e6,
@@ -3904,6 +3906,11 @@ mod tests {
         }
     }
 
+    /// Microbenchmark: measure GEMV throughput and effective memory bandwidth
+    /// for the Q4_0 × Q8_0 pre-quantized kernel at FFN gate shape.
+    ///
+    /// Run with:
+    /// `cargo test -p cera --release --lib backend::cpu::tests::microbench_gemv_q4_0 -- --ignored --nocapture`
     #[cfg(all(target_arch = "aarch64", feature = "parallel"))]
     #[test]
     #[ignore]
