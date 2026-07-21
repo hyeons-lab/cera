@@ -3712,11 +3712,46 @@ pub(crate) mod avx512_vnni {
     // at `b_quants[j * k ..]` with scales at `b_scales[j * nb ..]`, so each of the
     // `TILE_N` loads below is a straight 32-byte read.
 
-    /// Activation columns processed per weight decode. Four keeps the tile's
-    /// accumulators plus the decoded weight inside the 16 available ymm
-    /// registers; eight spills on the Q4_0 path (the nibble unpack needs its own
-    /// temporaries) and measured slower.
-    const TILE_N: usize = 4;
+    /// Activation columns processed per weight decode, amortizing the decode
+    /// across the tile.
+    ///
+    /// Was 4, on the reasoning that 8 would spill "the 16 available ymm
+    /// registers". That premise is simply wrong: these kernels are inside
+    /// `#[target_feature(enable = "avx512f,avx512vl,...")]`, so EVEX exposes 32
+    /// vector registers, not 16. 8 accumulators plus the decoded weight fit
+    /// comfortably. (16 genuinely does spill, so the concern was real, just off
+    /// by 2x.)
+    ///
+    /// 8 measures faster than 4 on both dtypes. Interleaved A/B, 8 paired
+    /// rounds, 2048x512x2048, rayon pool pinned to 16 threads: Q4_0 626->660
+    /// GOP/s (+5.6%, paired t=7.15, 8/8 rounds), Q8_0 563->638 (+13.4%, t=16.81,
+    /// 8/8). `microbench_gemm` reproduces this in one command.
+    ///
+    /// Getting a trustworthy number here took two tries, and the method is worth
+    /// recording. Unpinned, this host's run-to-run spread is ~2.8x (an identical
+    /// binary spanned 417-1154 GOP/s), because the GEMM parallelises over rows
+    /// and rayon's pool size/placement varies per process; pinning the pool
+    /// collapses that to ~9%. A first pass also left one arm at a ~0.2s window,
+    /// which on a boosting CPU just samples whatever clock state it landed in.
+    /// Both together made noise ~5x the effect and produced a false regression.
+    /// Interleaving arms controls for drift *between* arms; it does nothing about
+    /// a too-short window or per-process variance in the pool. Interleaving is
+    /// necessary, not sufficient — pin the pool and report the paired statistic.
+    ///
+    /// The tile width is still not where this kernel's time goes: it runs at
+    /// roughly 4% of this host's int8 peak. Each `dpbusd` drags along an
+    /// int32->float convert, a scalar load-multiply-broadcast of the combined
+    /// weight/activation scale, and a float FMA.
+    ///
+    /// Transposing `b_scales` to `[block][col]` is the obvious idea and does
+    /// *not* remove that scalar work: `vpdpbusd` yields 8 int32 lanes that are
+    /// partial sums of the *same* dot product, so the scale is a per-column
+    /// broadcast (`set1`), not a vector of 8 distinct column scales — the
+    /// transpose can only make the tiny scale loads more contiguous, which is
+    /// not the bottleneck. The structural fix is row tiling — process several
+    /// weight rows per tile so each activation load feeds more than one row, as
+    /// the GPU kernel already does (see #267).
+    const TILE_N: usize = 8;
 
     /// One output row of the Q4_0 GEMM: `out[j] = <A_row, B_col_j>` for all `n`.
     #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
@@ -4741,15 +4776,17 @@ pub(crate) mod avx512_vnni {
             assert_close(&y, &ref_gemv_q8_0(&a, &xs, &xq, m, k), "gemv_q8_0");
         }
 
-        /// The GEMM must agree with the GEMV column-by-column. `n = 7` is
-        /// deliberately not a multiple of `TILE_N`, so this covers both the
-        /// 4-wide tile and the scalar column remainder.
+        /// The GEMM must agree with the GEMV column-by-column. `n` is chosen so
+        /// that `n > TILE_N && n % TILE_N != 0`, which covers the vector tile
+        /// loop and the scalar column remainder both. Keep that invariant when
+        /// `TILE_N` changes — a fixed `n` that was fine at one tile width can
+        /// silently degenerate into remainder-only coverage at the next.
         #[test]
         fn gemm_q4_0_avx512_matches_gemv_per_column() {
-            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
                 return;
             }
-            let (m, n, k) = (13, 7, 96);
+            let (m, n, k) = (13, 11, 96);
             let nb = k / 32;
             let mut st = 0x0bad_c0deu64;
             let a = rand_q4_0_rows(m, k, &mut st);
@@ -4783,12 +4820,93 @@ pub(crate) mod avx512_vnni {
             }
         }
 
+        /// Prefill GEMM throughput against this machine's int8 peak.
+        ///
+        /// This GEMM accounts for ~56% of prefill samples (samply, Llama-3.2-1B
+        /// Q8_0, pp512), so its efficiency is the prefill number. Shape is one
+        /// real Llama-1B projection at pp512.
+        ///
+        /// Run with:
+        /// `cargo test -p cera --release --lib backend::simd::avx512_vnni::avx512_vnni_tests::microbench_gemm -- --ignored --nocapture`
         #[test]
-        fn gemm_q8_0_avx512_matches_gemv_per_column() {
-            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+        #[ignore]
+        fn microbench_gemm() {
+            // `vnni_kernels_callable()` is the full conjunction (F/VL/VNNI/AVX2/
+            // FMA); the feature name is just the headline for the skip/require
+            // message. Consistent with the correctness tests, and honours
+            // `CERA_REQUIRE_SIMD=avx512vnni` (fail instead of skip).
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
                 return;
             }
-            let (m, n, k) = (13, 7, 96);
+            use std::time::Instant;
+            let (m, n, k) = (2048usize, 512usize, 2048usize);
+            let nb = k / 32;
+            // 200 iterations, both arms. A ~0.2s window (20 iters) samples
+            // whichever clock state the process lands in and isn't long enough
+            // to resolve a tile-width effect.
+            let iters = 200;
+            let ops = 2.0 * m as f64 * n as f64 * k as f64;
+
+            let run = || {
+                let report = |tag: &str, secs: f64| {
+                    eprintln!(
+                        "=== {tag} {m}x{n}x{k} (TILE_N={TILE_N}) ===\n  {:.1} ms/call   {:.0} GOP/s",
+                        secs * 1e3,
+                        ops / secs / 1e9
+                    );
+                };
+                // Q4_0 first: TILE_N is shared with that kernel, whose nibble
+                // unpack needs extra temporaries, so a tile size good for Q8_0
+                // can regress it.
+                {
+                    let a4 = vec![7u8; m * nb * size_of::<BlockQ4_0>()];
+                    let bs = vec![0.01f32; n * nb];
+                    let bq = vec![3i8; n * k];
+                    let mut c4 = vec![0.0f32; m * n];
+                    unsafe { gemm_q4_0_q8_0_avx512(&a4, &bs, &bq, &mut c4, m, n, k) };
+                    let t = Instant::now();
+                    for _ in 0..iters {
+                        unsafe { gemm_q4_0_q8_0_avx512(&a4, &bs, &bq, &mut c4, m, n, k) };
+                    }
+                    report("gemm_q4_0", t.elapsed().as_secs_f64() / iters as f64);
+                }
+                let a = vec![7u8; m * nb * size_of::<BlockQ8_0>()];
+                let b_scales = vec![0.01f32; n * nb];
+                let b_quants = vec![3i8; n * k];
+                let mut c = vec![0.0f32; m * n];
+
+                unsafe { gemm_q8_0_q8_0_avx512(&a, &b_scales, &b_quants, &mut c, m, n, k) };
+                let t = Instant::now();
+                for _ in 0..iters {
+                    unsafe { gemm_q8_0_q8_0_avx512(&a, &b_scales, &b_quants, &mut c, m, n, k) };
+                }
+                report("gemm_q8_0", t.elapsed().as_secs_f64() / iters as f64);
+            };
+
+            // Pin the pool to the physical (performance) core count so the
+            // number is reproducible. The default rayon pool is all logical
+            // CPUs; with SMT, threads land on siblings differently each run and
+            // this kernel spanned 417-1154 GOP/s on an identical binary — a ~2.8x
+            // swing that dwarfs any tile-width effect. Pinning collapses it to
+            // ~9%. Done here rather than left to `RAYON_NUM_THREADS` so the
+            // benchmark is self-contained.
+            #[cfg(feature = "parallel")]
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(crate::backend::cpu_features::performance_core_count())
+                .build()
+                .expect("build pinned rayon pool")
+                .install(run);
+            #[cfg(not(feature = "parallel"))]
+            run();
+        }
+
+        #[test]
+        fn gemm_q8_0_avx512_matches_gemv_per_column() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            // Same `n > TILE_N && n % TILE_N != 0` invariant as the Q4_0 test.
+            let (m, n, k) = (13, 11, 96);
             let nb = k / 32;
             let mut st = 0xfeed_face_u64;
             let a = rand_q8_0_rows(m, k, &mut st);
