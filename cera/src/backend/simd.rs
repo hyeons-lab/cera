@@ -4776,17 +4776,16 @@ pub(crate) mod avx512_vnni {
             assert_close(&y, &ref_gemv_q8_0(&a, &xs, &xq, m, k), "gemv_q8_0");
         }
 
-        /// The GEMM must agree with the GEMV column-by-column. `n = 7` is
-        /// deliberately not a multiple of `TILE_N`, so this covers both the
-        /// 4-wide tile and the scalar column remainder.
+        /// The GEMM must agree with the GEMV column-by-column. `n` is chosen so
+        /// that `n > TILE_N && n % TILE_N != 0`, which covers the vector tile
+        /// loop and the scalar column remainder both. Keep that invariant when
+        /// `TILE_N` changes — a fixed `n` that was fine at one tile width can
+        /// silently degenerate into remainder-only coverage at the next.
         #[test]
         fn gemm_q4_0_avx512_matches_gemv_per_column() {
-            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
                 return;
             }
-            // n > TILE_N and not a multiple of it, so this exercises both the
-            // 8-wide tile loop and the column remainder (n=7 would only hit the
-            // remainder now that TILE_N is 8).
             let (m, n, k) = (13, 11, 96);
             let nb = k / 32;
             let mut st = 0x0bad_c0deu64;
@@ -4903,11 +4902,10 @@ pub(crate) mod avx512_vnni {
 
         #[test]
         fn gemm_q8_0_avx512_matches_gemv_per_column() {
-            if !require_simd_or_skip("avx512vnni", is_x86_feature_detected!("avx512vnni")) {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
                 return;
             }
-            // n > TILE_N and not a multiple of it: covers the tile loop and the
-            // column remainder both (see the Q4_0 test).
+            // Same `n > TILE_N && n % TILE_N != 0` invariant as the Q4_0 test.
             let (m, n, k) = (13, 11, 96);
             let nb = k / 32;
             let mut st = 0xfeed_face_u64;
