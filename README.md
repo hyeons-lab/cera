@@ -250,6 +250,41 @@ See the [`cera` crate README](cera/README.md) for the full library API.
 | `list-bundles` | List bundles available on `LiquidAI/LeapBundles` |
 | `download-bundles` | Prefetch bundle manifests + model files without loading |
 
+## Tuning
+
+Defaults are chosen to be correct-or-harmless across a wide range of hosts, not
+optimal on any one. The knobs below override them.
+
+| Variable | Effect |
+|----------|--------|
+| `CERA_DECODE_THREADS=<n>` or `CERA_DECODE_THREADS=auto` | Worker count for decode (per-token GEMV). Default is the detected performance-core count capped at 12; clamped to the detected count. |
+| `CERA_THREADS=<n>` | Overrides the detected performance-core count, which the decode/prefill pools are sized from. |
+| `CERA_CPU_TIER=<tier>` | Caps the SIMD tier (e.g. `avx2`, `avx512`). May only downgrade — useful for A/B-ing a kernel path. |
+| `RUST_LOG=<filter>` | Log level. Defaults to `warn`, which surfaces things like prefill falling back to the slow per-token path. |
+
+### Picking a decode thread count
+
+There is no single best value: the optimum reverses with weight-set size.
+Measured on a Ryzen AI MAX+ 395 (16 physical / 32 logical cores), decode tok/s
+from interleaved A/B runs:
+
+| Model | Weights | 12 threads | 20 threads |
+|-------|--------:|-----------:|-----------:|
+| SmolLM-135M Q4_0 | 92 MB | **229–240** | 144–147 |
+| LFM2.5-230M Q4_K_M | 153 MB | 168–186 | 157–178 |
+| Llama-3.2-1B Q4_K_M | 808 MB | 43.5–52.9 | 42.0–45.3 |
+| Llama-3.2-1B Q8_0 | 1321 MB | 37–41 | **50–51** |
+
+Small models are dominated by the per-dispatch barrier, so extra workers are
+overhead — the smallest is **1.6× faster at 12 than at 20**. Large models
+amortize the barrier and want the memory bandwidth — the largest is **1.3×
+faster at 20**. The two in between show no difference beyond run-to-run spread.
+
+If you run one model repeatedly and care about decode latency, measure both
+ends on your own hardware; `cera bench --model <path>` with
+`CERA_DECODE_THREADS` set is enough. Interleave the arms rather than sweeping —
+laptop clocks drift enough to invent a trend that isn't there.
+
 ## Other features
 
 - **Streaming & cancellation** — tokens (and audio frames) arrive through a

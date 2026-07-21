@@ -3848,6 +3848,64 @@ mod tests {
         );
     }
 
+    /// Cost of one `RowPool` dispatch with essentially no work in it — the
+    /// synchronization tax decode pays per GEMV.
+    ///
+    /// Worth having permanently because it settles an argument that recurs:
+    /// decode issues ~113 dispatches per token (Llama-3.2-1B: 16 layers x 7
+    /// GEMVs + logits), so "fuse the GEMVs to cut barriers" sounds compelling
+    /// until the barrier is measured. On a Ryzen AI MAX+ 395 it is ~2 us
+    /// spinning at the default 12 threads (~3 us at 16) — call it 0.2-0.4 ms
+    /// of a 19 ms token, so 1-2%. Halving the dispatch count buys under 1%.
+    ///
+    /// The same run under `CERA_SPIN=0` reports ~240 us at 12 threads (~330 us
+    /// at 16): a 100x jump. Parking and re-waking workers is the expensive
+    /// path, and spin-before-park is what keeps the barrier off the critical
+    /// path — which also means the spin is not free power-wise. Anyone tempted
+    /// to shrink `SPIN_BEFORE_PARK` should look at that number first.
+    ///
+    /// Run with:
+    /// `cargo test -p cera --release --lib backend::cpu::tests::microbench_dispatch -- --ignored --nocapture`
+    // This measures native `RowPool` dispatch, and `threadpool::RowPool` is
+    // gated off wasm32 (`par_rows` itself has a wasm impl over web workers), so
+    // `parallel` alone would fail to compile on a threaded wasm build.
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[test]
+    #[ignore]
+    fn microbench_dispatch() {
+        use std::time::Instant;
+
+        // The probe below already forces lazy pool init, so the warm-up loop is
+        // for caller pinning and cache/steal-loop warmth, not init.
+        let threads = crate::backend::threadpool::RowPool::decode().num_threads();
+
+        let mut warm = vec![0.0f32; 4096];
+        for _ in 0..100 {
+            par_rows(&mut warm, gemv_min_rows(), |(i, v)| *v = i as f32);
+        }
+
+        eprintln!("\n=== RowPool dispatch cost ({threads} decode threads) ===");
+        for rows in [512usize, 2048, 8192] {
+            let mut y = vec![0.0f32; rows];
+            let iters = 2000;
+            // Trivial body on purpose: this measures the barrier and steal
+            // loop, not the kernel.
+            let t = Instant::now();
+            for _ in 0..iters {
+                par_rows(&mut y, gemv_min_rows(), |(_i, v)| *v += 1.0);
+            }
+            let per = t.elapsed().as_secs_f64() / iters as f64;
+            // Observe `y` so the optimizer cannot elide the trivial body and
+            // leave us timing an empty loop.
+            std::hint::black_box(&y);
+            eprintln!(
+                "  rows={rows:<5} {:>7.1} us/dispatch  ->  {:>6.2} ms/token at 113 dispatches",
+                per * 1e6,
+                per * 1e3 * 113.0
+            );
+        }
+    }
+
     /// Microbenchmark: measure GEMV throughput and effective memory bandwidth
     /// for the Q4_0 × Q8_0 pre-quantized kernel at FFN gate shape.
     ///
