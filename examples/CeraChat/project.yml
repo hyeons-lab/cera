@@ -12,8 +12,9 @@ options:
   createIntermediateGroups: true
 
 # Pull the published Cera SwiftPM package. SwiftPM maps the `v`-prefixed
-# release tags (v0.3.0, …) onto these SemVer bounds automatically, so
-# `from: 0.3.0` resolves to the v0.3.0 release's Metal-enabled XCFramework.
+# release tags (v0.3.0, v0.3.1, …) onto these SemVer bounds automatically, so
+# `from: 0.3.0` resolves to the newest 0.3.x release's Metal-enabled
+# XCFramework. The bound only needs bumping when the 0.x minor moves.
 packages:
   Cera:
     url: https://github.com/hyeons-lab/cera

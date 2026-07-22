@@ -19,6 +19,19 @@ bindings, and [`cera-wasm`](https://github.com/hyeons-lab/cera/tree/main/cera-wa
 cera = "0.3"
 ```
 
+## Changes in 0.3.1
+
+A patch release: CPU and GPU performance work, Q5_K/Q4_1 quantization support,
+and a native wgpu flash-attention decode path. No changes to `CeraEngine`,
+`Session`, `GenerateOpts`, or any other type in the public prelude.
+
+One caveat for anyone reaching into backend internals: the dead WGSL kernels
+`backend::wgpu::shaders::{GEMM_Q4_0, GEMM_Q8_0, ATTENTION}` were removed once
+the register-tiled GEMM and flash-attention kernels superseded them. They were
+shader **source text** behind the `gpu` feature, never part of the intended
+API, so this ships as a patch rather than a minor bump — but a `^0.3` consumer
+that named them will need to stop.
+
 ## Breaking changes in 0.3.0
 
 0.3.0 adds public fields to two public structs, so it is a minor (not patch)

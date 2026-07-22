@@ -9,7 +9,10 @@ A Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 V1 is complete, and the project has since grown well beyond the original
 roadmap into **multimodal** territory (vision, audio, TTS) that this plan never
 anticipated. The status legend below uses ✅ done · 🟡 partial · ⬜ not started.
-Published to crates.io / npm / Maven Central / CLI binaries at **0.3.0**.
+Published to crates.io / Maven Central / CLI binaries at **0.3.0**; **0.3.1**
+is the next release target (the publish workflow is a manual dispatch, so this
+lags the version in `VERSION` until it runs). `cera-wasm` is not on npm yet —
+that leg stays disabled until the registry secrets are set up.
 
 **V1 (Phases 0–6):** ✅ pipeline complete. CPU (SIMD + runtime feature dispatch
 + BLAS), wgpu GPU backend, Metal backend, GGUF parser, BPE tokenizer, sampler,
