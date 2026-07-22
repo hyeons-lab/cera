@@ -16,6 +16,37 @@ use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ8_0};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", test))]
 use half::f16;
 
+/// Tier-test gate shared by every SIMD test module in this file.
+///
+/// Returns true when the test should run. A host without `feature` skips
+/// silently by default; if `CERA_REQUIRE_SIMD` lists `feature`, the missing
+/// feature is a hard failure instead — so a CI job on known-capable hardware
+/// proves the kernel actually executed rather than quietly reporting green.
+///
+/// One definition per *crate module*, not one per test module: the skip-vs-fail
+/// rule is a project-wide convention, and a copy per module is how one ends up
+/// with a weaker gate than the CI leg that targets it assumes. There were three
+/// before this change, and the AVX2 module would have made four. The
+/// integration-test binaries under `cera/tests/` still hand-roll it — they are
+/// separate crates and cannot name a `#[cfg(test)]` item in this one.
+///
+/// Cfg'd to the architectures that have a SIMD test module: at module scope a
+/// single `#[cfg(test)]` would be `dead_code` on wasm32/riscv64, which the four
+/// per-module copies this replaced were cfg'd out of. Only `cargo check
+/// --profile test` on such a target shows it, which CI does not run.
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn require_simd_or_skip(feature: &str, detected: bool) -> bool {
+    if detected {
+        return true;
+    }
+    let required = std::env::var("CERA_REQUIRE_SIMD").unwrap_or_default();
+    assert!(
+        !required.split(',').any(|f| f.trim() == feature),
+        "CERA_REQUIRE_SIMD requires `{feature}` but this host doesn't report it"
+    );
+    false
+}
+
 // ── aarch64 NEON ────────────────────────────────────────────────────────────
 
 /// Send+Sync pointer wrapper for parallel GEMV closures.
@@ -2286,22 +2317,7 @@ pub(crate) mod neon {
             }
         }
 
-        /// Tier-test gate. Returns true if the test should run. Normally skips
-        /// (returns false) when the host lacks `feature`; but if the
-        /// `CERA_REQUIRE_SIMD` env var lists `feature`, a missing feature is a
-        /// hard failure — so a dedicated CI job on known-capable hardware proves
-        /// the kernel actually executed rather than silently skipping.
-        fn require_simd_or_skip(feature: &str, detected: bool) -> bool {
-            if detected {
-                return true;
-            }
-            let required = std::env::var("CERA_REQUIRE_SIMD").unwrap_or_default();
-            assert!(
-                !required.split(',').any(|f| f.trim() == feature),
-                "CERA_REQUIRE_SIMD requires `{feature}` but this host doesn't report it"
-            );
-            false
-        }
+        use crate::backend::simd::require_simd_or_skip;
 
         #[test]
         fn q4_0_gemv_fallback_matches_dotprod() {
@@ -3114,11 +3130,17 @@ mod avx2 {
 // ── x86_64 AVX-512 ──────────────────────────────────────────────────────────
 //
 // 512-bit-wide f32 vec_dot kernels — the AVX2 algorithm at double the vector
-// width (16 f32 lanes per op). The x86 hot path is int8-weight × f32-activation,
-// so these stay on the f32-FMA path; a true VNNI int8×int8 GEMV would need a
-// quantized-activation path on x86 (like aarch64's pre-quant kernels) and is a
-// separate, larger change. Only Q8_0 and Q4_0 have AVX-512 kernels; Q4_K_M
-// stays on AVX2 even at the Avx512 tier (the dispatcher routes it there).
+// width (16 f32 lanes per op).
+//
+// HISTORY: these were the x86 hot path back when it was int8-weight ×
+// f32-activation. It no longer is. The int8×int8 GEMV that this comment used to
+// describe as "a separate, larger change" landed, first for VNNI and then for
+// AVX2 via the shared `int8_gemm_kernels!` macro below, and the dispatcher now
+// prefers it at every tier from `Avx2` up. The f32 row kernels here therefore
+// have no production caller left; they are kept, and exercised by `avx512_tests`,
+// only as a measured fallback should the int8 path ever be reverted — see the
+// note in `cpu::gemv_q4_0_f32`. Q4_K/Q6_K likewise moved off f32 and onto the
+// int8 GEMV (`avx2_int8::gemv_q4k_f32` / `gemv_q6k_f32`).
 //
 // NOTE: not executable on the aarch64 dev host. Verified by `avx512_tests`
 // below, which run only where `is_x86_feature_detected!("avx512f")` holds
@@ -3196,6 +3218,13 @@ pub(crate) mod avx512 {
     // are public API and are used where only a single block is in hand.
 
     /// Q4_0 row dot: `<dequant(row), y>` accumulated across `nb` blocks.
+    // Retained without a production caller: the int8 arms in `cpu.rs` return for
+    // every tier from `Avx2` up, so this f32 row-dot is unreachable on any
+    // shipping x86 CPU. It is kept (and still exercised by `avx512_tests`)
+    // because narrowing the int8 gate would need it back, and because #277/#283
+    // tuned it — deleting it would throw that away for a change that is one line
+    // to revert. `allow(dead_code)`, not deletion, states that intent.
+    #[allow(dead_code)]
     #[target_feature(enable = "avx512f")]
     pub unsafe fn row_dot_q4_0_f32_avx512(row: *const u8, y: &[f32], nb: usize) -> f32 {
         unsafe {
@@ -3241,6 +3270,13 @@ pub(crate) mod avx512 {
     }
 
     /// Q8_0 row dot: `<dequant(row), y>` accumulated across `nb` blocks.
+    // Retained without a production caller: the int8 arms in `cpu.rs` return for
+    // every tier from `Avx2` up, so this f32 row-dot is unreachable on any
+    // shipping x86 CPU. It is kept (and still exercised by `avx512_tests`)
+    // because narrowing the int8 gate would need it back, and because #277/#283
+    // tuned it — deleting it would throw that away for a change that is one line
+    // to revert. `allow(dead_code)`, not deletion, states that intent.
+    #[allow(dead_code)]
     #[target_feature(enable = "avx512f")]
     pub unsafe fn row_dot_q8_0_f32_avx512(row: *const u8, y: &[f32], nb: usize) -> f32 {
         unsafe {
@@ -3295,20 +3331,7 @@ pub(crate) mod avx512 {
             ((*state >> 40) as f32 / (1u64 << 24) as f32) - 1.0
         }
 
-        /// Tier-test gate. Skips when the host lacks `feature`, unless
-        /// `CERA_REQUIRE_SIMD` lists it — then a missing feature fails the test,
-        /// so a CI job on AVX-512 hardware proves the kernel actually ran.
-        fn require_simd_or_skip(feature: &str, detected: bool) -> bool {
-            if detected {
-                return true;
-            }
-            let required = std::env::var("CERA_REQUIRE_SIMD").unwrap_or_default();
-            assert!(
-                !required.split(',').any(|f| f.trim() == feature),
-                "CERA_REQUIRE_SIMD requires `{feature}` but this host doesn't report it"
-            );
-            false
-        }
+        use crate::backend::simd::require_simd_or_skip;
 
         #[test]
         fn q8_0_avx512_matches_scalar() {
@@ -3423,7 +3446,7 @@ pub(crate) mod avx512 {
     }
 }
 
-// ── x86_64 AVX-512 VNNI (int8 activations) ──────────────────────────────────
+// ── x86_64 int8 activation kernels (shared by the VNNI and AVX2 tiers) ─────
 //
 // The quantized-activation path the `avx512` module above defers to: instead of
 // widening int8 weights to f32 and running FMA, quantize the *activations* to
@@ -3446,10 +3469,1953 @@ pub(crate) mod avx512 {
 // `_mm512_reduce_add_ps` per 32-element block; that horizontal reduce is a long
 // dependency chain in the innermost loop.
 //
-// NOTE: not executable on the aarch64 dev host, and needs a VNNI-capable x86
-// (Zen 4/5, Sapphire Rapids). `avx512_vnni_tests` below run only where
-// `is_x86_feature_detected!("avx512vnni")` holds and compare against the scalar
-// reference; elsewhere they skip.
+// NOTE: this header covers the SHARED kernel body below (the `int8_gemm_kernels`
+// macro), which both the VNNI and the AVX2 instantiations expand. Statements
+// about `dpbusd` and about EVEX registers describe the VNNI instantiation; the
+// `avx2_int8` module documents where its tier differs. Neither is executable on
+// the aarch64 dev host. Most of `avx512_vnni_tests` runs only where
+// `is_x86_feature_detected!("avx512vnni")` holds, comparing against the scalar
+// reference; elsewhere it skips. The exception is the quantizer group, gated on
+// `quantizer_callable()` — that kernel needs no VNNI, and skipping it on a
+// non-VNNI AVX-512 host would skip it on the host class it exists for.
+// ── Shared int8 GEMM kernels (VNNI / AVX2 instantiations) ───────────────────
+//
+// Every kernel below is 256-bit AVX2 code. The only architecture-specific
+// pieces are the three dot primitives — `dot32` (signed weights, via the
+// `_mm256_sign_epi8` trick), `dot32u` (already-unsigned K-quant weights) and
+// `dot16u` (the 128-bit half, used by `q8_0_col_sums16`) — plus the
+// `#[target_feature]` set and the register-budget-dependent tile constants.
+//
+// `#[target_feature]` is a compile-time property and a VNNI-enabled function
+// will not inline into an AVX2-only one, so the kernels are instantiated once
+// per tier rather than branching at runtime.
+//
+// The macro exists so the two instantiations cannot drift: this body is the
+// single definition of the row-tiled Q4_0/Q8_0 GEMM and the Q4_K/Q6_K GEMM.
+// Each invoking module supplies `dot32`, `dot32u` and `dot16u` before
+// invoking it; omitting one is a compile error far from this comment.
+// Only x86_64 instantiates this; without the cfg it is an `unused macro
+// definition` warning on every aarch64 and wasm32 build, which the CI lint
+// leg (x86 only) would never catch.
+#[cfg(target_arch = "x86_64")]
+macro_rules! int8_gemm_kernels {
+    ($feat:literal, $tile_n:expr, $tile_m:expr, $strip_n:expr, $kq_cols:expr) => {
+        /// Horizontal sum of the 8 f32 lanes. Called once per output element, never
+        /// inside the block loop — see the module note on accumulation.
+        #[target_feature(enable = $feat)]
+        unsafe fn hsum256_ps(v: __m256) -> f32 {
+            let hi = _mm256_extractf128_ps(v, 1);
+            let lo = _mm256_castps256_ps128(v);
+            let sum = _mm_add_ps(hi, lo);
+            let shuf = _mm_movehl_ps(sum, sum);
+            let sum = _mm_add_ps(sum, shuf);
+            let shuf = _mm_shuffle_ps(sum, sum, 0x55);
+            _mm_cvtss_f32(_mm_add_ss(sum, shuf))
+        }
+
+        /// Unpack one Q4_0 block's 16 nibble-pairs into 32 signed bytes in
+        /// `[-8, 7]`. Low nibbles are elements 0..16, high nibbles 16..32 — the
+        /// same layout the NEON and scalar Q4_0 kernels assume.
+        #[inline]
+        #[target_feature(enable = $feat)]
+        unsafe fn unpack_q4_0(qs: *const u8) -> __m256i {
+            unsafe {
+                let qb = _mm_loadu_si128(qs as *const __m128i);
+                let mask = _mm_set1_epi8(0x0F);
+                let lo = _mm_and_si128(qb, mask);
+                let hi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask);
+                _mm256_sub_epi8(_mm256_set_m128i(hi, lo), _mm256_set1_epi8(8))
+            }
+        }
+
+        // ── Batched prefill GEMM ────────────────────────────────────────────────
+        //
+        // The point of these over a per-token GEMV loop: one weight row is decoded
+        // once and reused across `TILE_N` activation columns, so a prefill of `n`
+        // tokens streams the weight matrix `n / TILE_N` times instead of `n`, and the
+        // decode is amortized across the tile.
+        //
+        // NOTE: these per-row kernels are no longer the production path for the
+        // Q4_0/Q8_0 GEMMs — see "Row tiling" below, which processes `TILE_M` rows per
+        // task and reaches them only for the `m % TILE_M` tail. Read that block for
+        // the current cost model; in particular, "weight-bandwidth bound" is the
+        // wrong summary at these shapes (the activation panel is L2-resident and the
+        // binding constraint is loads and uops per `dot32`, not DRAM).
+        //
+        // Column-major activations: `quantize_columns` packs column `j` contiguously
+        // at `b_quants[j * k ..]` with scales at `b_scales[j * nb ..]`, so each of the
+        // `TILE_N` loads below is a straight 32-byte read.
+
+        /// Dot one Q4_0 weight row against the pre-quantized activation.
+        #[target_feature(enable = $feat)]
+        unsafe fn row_dot_q4_0(
+            row: *const u8,
+            x_scales: &[f32],
+            x_quants: &[i8],
+            nb: usize,
+        ) -> f32 {
+            unsafe {
+                let bsz = size_of::<BlockQ4_0>();
+                let mut acc = _mm256_setzero_ps();
+                for b in 0..nb {
+                    let block = &*(row.add(b * bsz) as *const BlockQ4_0);
+                    let w = unpack_q4_0(block.qs.as_ptr());
+                    let a = _mm256_loadu_si256(x_quants.as_ptr().add(b * 32) as *const __m256i);
+                    let scale = _mm256_set1_ps(
+                        f16::from_bits(block.d).to_f32() * *x_scales.get_unchecked(b),
+                    );
+                    acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
+                }
+                hsum256_ps(acc)
+            }
+        }
+
+        /// Dot one Q8_0 weight row against the pre-quantized activation.
+        #[target_feature(enable = $feat)]
+        unsafe fn row_dot_q8_0(
+            row: *const u8,
+            x_scales: &[f32],
+            x_quants: &[i8],
+            nb: usize,
+        ) -> f32 {
+            unsafe {
+                let bsz = size_of::<BlockQ8_0>();
+                let mut acc = _mm256_setzero_ps();
+                for b in 0..nb {
+                    let block = &*(row.add(b * bsz) as *const BlockQ8_0);
+                    let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
+                    let a = _mm256_loadu_si256(x_quants.as_ptr().add(b * 32) as *const __m256i);
+                    let scale = _mm256_set1_ps(
+                        f16::from_bits(block.delta).to_f32() * *x_scales.get_unchecked(b),
+                    );
+                    acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
+                }
+                hsum256_ps(acc)
+            }
+        }
+
+        /// Q4_0 weights × pre-quantized Q8_0 activations: `y[m] = A[m,k] @ x[k]`.
+        ///
+        /// Row-parallel over the **RowPool** above `gemv_par_threshold()`, matching
+        /// the NEON pre-quantized GEMV — decode dispatches these constantly, and
+        /// rayon's fork-join barrier per call is the wrong trade there.
+        #[target_feature(enable = $feat)]
+        pub unsafe fn gemv_q4_0_q8_0(
+            a_quant: &[u8],
+            x_scales: &[f32],
+            x_quants: &[i8],
+            y: &mut [f32],
+            m: usize,
+            k: usize,
+        ) {
+            debug_assert_eq!(k % 32, 0, "Q4_0 GEMV: k must be divisible by 32");
+            let nb = k / 32;
+            let row_bytes = nb * size_of::<BlockQ4_0>();
+            debug_assert_eq!(a_quant.len(), m * row_bytes);
+            debug_assert_eq!(y.len(), m);
+            debug_assert!(x_scales.len() >= nb && x_quants.len() >= k);
+
+            let base = a_quant.as_ptr() as usize;
+            let compute_row = |(i, yi): (usize, &mut f32)| {
+                // SAFETY: row `i` spans `a_quant[i*row_bytes ..][..row_bytes]`, in
+                // bounds by the assert above; `y` rows are disjoint per worker.
+                *yi = unsafe {
+                    row_dot_q4_0(
+                        (base as *const u8).add(i * row_bytes),
+                        x_scales,
+                        x_quants,
+                        nb,
+                    )
+                };
+            };
+
+            if m >= crate::backend::cpu::gemv_par_threshold() {
+                crate::backend::cpu::par_rows(y, crate::backend::cpu::gemv_min_rows(), compute_row);
+            } else {
+                y.iter_mut().enumerate().for_each(compute_row);
+            }
+        }
+
+        /// Q8_0 weights × pre-quantized Q8_0 activations: `y[m] = A[m,k] @ x[k]`.
+        #[target_feature(enable = $feat)]
+        pub unsafe fn gemv_q8_0_q8_0(
+            a_quant: &[u8],
+            x_scales: &[f32],
+            x_quants: &[i8],
+            y: &mut [f32],
+            m: usize,
+            k: usize,
+        ) {
+            debug_assert_eq!(k % 32, 0, "Q8_0 GEMV: k must be divisible by 32");
+            let nb = k / 32;
+            let row_bytes = nb * size_of::<BlockQ8_0>();
+            debug_assert_eq!(a_quant.len(), m * row_bytes);
+            debug_assert_eq!(y.len(), m);
+            debug_assert!(x_scales.len() >= nb && x_quants.len() >= k);
+
+            let base = a_quant.as_ptr() as usize;
+            let compute_row = |(i, yi): (usize, &mut f32)| {
+                // SAFETY: as in the Q4_0 GEMV above.
+                *yi = unsafe {
+                    row_dot_q8_0(
+                        (base as *const u8).add(i * row_bytes),
+                        x_scales,
+                        x_quants,
+                        nb,
+                    )
+                };
+            };
+
+            if m >= crate::backend::cpu::gemv_par_threshold() {
+                crate::backend::cpu::par_rows(y, crate::backend::cpu::gemv_min_rows(), compute_row);
+            } else {
+                y.iter_mut().enumerate().for_each(compute_row);
+            }
+        }
+
+        /// Activation columns processed per weight decode, amortizing the decode
+        /// across the tile.
+        ///
+        /// NOTE: this doc is shared by both instantiations, and every measured
+        /// number and register-count claim below is the **VNNI** one's. The AVX2
+        /// instantiation runs under VEX with 16 ymm registers and takes its own,
+        /// narrower value — see its invocation site.
+        ///
+        /// For VNNI, this was 4, on the reasoning that 8 would spill "the 16
+        /// available ymm registers". That premise is wrong there: those kernels are
+        /// inside `#[target_feature(...)]` enabling AVX-512, so EVEX exposes 32
+        /// vector registers, not 16. 8 accumulators plus the decoded weight fit
+        /// comfortably. (16 genuinely does spill, so the concern was real, just off
+        /// by 2x.) On AVX2 the original 16-register premise does hold, which is why
+        /// the two instantiations disagree.
+        ///
+        /// 8 measures faster than 4 on both dtypes. Interleaved A/B, 8 paired
+        /// rounds, 2048x512x2048, rayon pool fixed at 16 threads: Q4_0 626->660
+        /// GOP/s (+5.6%, paired t=7.15, 8/8 rounds), Q8_0 563->638 (+13.4%, t=16.81,
+        /// 8/8).
+        ///
+        /// CAVEAT: `microbench_gemm` can no longer reproduce that. It drives the
+        /// public GEMMs at m=2048, and since row tiling landed those dispatch every
+        /// full `TILE_M`-row strip to `gemm_*_strip` (which tiles by `STRIP_N`), so
+        /// `TILE_N` has no effect at that shape — the header it prints names a
+        /// constant it is not testing. `TILE_N` now governs only the `m % TILE_M`
+        /// tail, and production out-feature counts are multiples of 4, so it is
+        /// effectively unexercised in production. To re-tune it, drive
+        /// `gemm_*_row` directly or pick an `m` with `m % TILE_M != 0`.
+        ///
+        /// Getting a trustworthy number here took two tries, and the method is worth
+        /// recording. Unpinned, this host's run-to-run spread is ~2.8x (an identical
+        /// binary spanned 417-1154 GOP/s), because the GEMM parallelises over rows
+        /// and rayon's pool size/placement varies per process; pinning the pool
+        /// collapses that to ~9%. A first pass also left one arm at a ~0.2s window,
+        /// which on a boosting CPU just samples whatever clock state it landed in.
+        /// Both together made noise ~5x the effect and produced a false regression.
+        /// Interleaving arms controls for drift *between* arms; it does nothing about
+        /// a too-short window or per-process variance in the pool. Interleaving is
+        /// necessary, not sufficient — pin the pool and report the paired statistic.
+        ///
+        /// The tile width is still not where this kernel's time goes: it runs at
+        /// roughly 4% of this host's int8 peak. Each `dpbusd` drags along an
+        /// int32->float convert, a scalar load-multiply-broadcast of the combined
+        /// weight/activation scale, and a float FMA.
+        ///
+        /// Transposing `b_scales` to `[block][col]` is the obvious idea and does
+        /// *not* remove that scalar work: `vpdpbusd` yields 8 int32 lanes that are
+        /// partial sums of the *same* dot product, so the scale is a per-column
+        /// broadcast (`set1`), not a vector of 8 distinct column scales — the
+        /// transpose can only make the tiny scale loads more contiguous, which is
+        /// not the bottleneck. The structural fix was row tiling — feed each
+        /// activation load to several weight rows, as the GPU kernel does (#267) —
+        /// and that has since shipped: see "Row tiling" below, which also lists the
+        /// headroom that remains.
+        const TILE_N: usize = $tile_n;
+
+        /// One output row of the Q4_0 GEMM: `out[j] = <A_row, B_col_j>` for all `n`.
+        #[target_feature(enable = $feat)]
+        unsafe fn gemm_q4_0_row(
+            row: *const u8,
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out_row: &mut [f32],
+            n: usize,
+            nb: usize,
+        ) {
+            unsafe {
+                let bsz = size_of::<BlockQ4_0>();
+                let k = nb * 32;
+                let mut j = 0;
+
+                while j + TILE_N <= n {
+                    let mut acc = [_mm256_setzero_ps(); TILE_N];
+                    for b in 0..nb {
+                        let block = &*(row.add(b * bsz) as *const BlockQ4_0);
+                        let dw = f16::from_bits(block.d).to_f32();
+                        let w = unpack_q4_0(block.qs.as_ptr());
+                        for (t, a_t) in acc.iter_mut().enumerate() {
+                            let col = j + t;
+                            let a = _mm256_loadu_si256(
+                                b_quants.as_ptr().add(col * k + b * 32) as *const __m256i
+                            );
+                            let scale = _mm256_set1_ps(dw * *b_scales.get_unchecked(col * nb + b));
+                            *a_t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, *a_t);
+                        }
+                    }
+                    for (t, a_t) in acc.iter().enumerate() {
+                        *out_row.get_unchecked_mut(j + t) = hsum256_ps(*a_t);
+                    }
+                    j += TILE_N;
+                }
+
+                // Column remainder (n % TILE_N). Same math, one column at a time.
+                while j < n {
+                    let mut acc = _mm256_setzero_ps();
+                    for b in 0..nb {
+                        let block = &*(row.add(b * bsz) as *const BlockQ4_0);
+                        let w = unpack_q4_0(block.qs.as_ptr());
+                        let a = _mm256_loadu_si256(
+                            b_quants.as_ptr().add(j * k + b * 32) as *const __m256i
+                        );
+                        let scale = _mm256_set1_ps(
+                            f16::from_bits(block.d).to_f32() * *b_scales.get_unchecked(j * nb + b),
+                        );
+                        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
+                    }
+                    *out_row.get_unchecked_mut(j) = hsum256_ps(acc);
+                    j += 1;
+                }
+            }
+        }
+
+        /// One output row of the Q8_0 GEMM.
+        #[target_feature(enable = $feat)]
+        unsafe fn gemm_q8_0_row(
+            row: *const u8,
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out_row: &mut [f32],
+            n: usize,
+            nb: usize,
+        ) {
+            unsafe {
+                let bsz = size_of::<BlockQ8_0>();
+                let k = nb * 32;
+                let mut j = 0;
+
+                while j + TILE_N <= n {
+                    let mut acc = [_mm256_setzero_ps(); TILE_N];
+                    for b in 0..nb {
+                        let block = &*(row.add(b * bsz) as *const BlockQ8_0);
+                        let dw = f16::from_bits(block.delta).to_f32();
+                        let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
+                        for (t, a_t) in acc.iter_mut().enumerate() {
+                            let col = j + t;
+                            let a = _mm256_loadu_si256(
+                                b_quants.as_ptr().add(col * k + b * 32) as *const __m256i
+                            );
+                            let scale = _mm256_set1_ps(dw * *b_scales.get_unchecked(col * nb + b));
+                            *a_t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, *a_t);
+                        }
+                    }
+                    for (t, a_t) in acc.iter().enumerate() {
+                        *out_row.get_unchecked_mut(j + t) = hsum256_ps(*a_t);
+                    }
+                    j += TILE_N;
+                }
+
+                while j < n {
+                    let mut acc = _mm256_setzero_ps();
+                    for b in 0..nb {
+                        let block = &*(row.add(b * bsz) as *const BlockQ8_0);
+                        let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
+                        let a = _mm256_loadu_si256(
+                            b_quants.as_ptr().add(j * k + b * 32) as *const __m256i
+                        );
+                        let scale = _mm256_set1_ps(
+                            f16::from_bits(block.delta).to_f32()
+                                * *b_scales.get_unchecked(j * nb + b),
+                        );
+                        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
+                    }
+                    *out_row.get_unchecked_mut(j) = hsum256_ps(acc);
+                    j += 1;
+                }
+            }
+        }
+
+        // ── Row tiling ──────────────────────────────────────────────────────────
+        //
+        // The per-row kernels above parallelise one weight row per task and re-read
+        // the entire `n*k` activation panel for every row.
+        //
+        // What that costs is **load-port pressure, not DRAM bandwidth** — say this
+        // precisely, because the obvious bandwidth story is wrong and misleads the
+        // next tuning pass. At the benchmark shape (2048x512x2048) the activation
+        // panel is n*k + n*nb*4 = 1.18 MB, so it is L2-resident and those re-reads
+        // are cache hits; the only thing streaming from memory is ~4.3 MB of weights,
+        // read once. The per-row TILE_N=8 kernel issues 1 weight + 1 f16 + 8
+        // activation + 8 scale loads per 8 `dot32` (2.25 loads/dot32); a 4x4 strip
+        // issues 4+4+4+4 per 16 (1.00), and carries 16 independent accumulator chains
+        // instead of 8 to hide `vpdpbusd` latency. That is the mechanism.
+        //
+        // The arithmetic above uses the VNNI instantiation's 8/4/4; substitute the
+        // AVX2 one's 4/2/4 for that tier. The mechanism is the same, the ratios
+        // are not.
+        //
+        // Measured against the per-row driver by `microbench_gemm_rowtile`, 8 paired
+        // rounds with alternating arm order, pseudo-random activations, on an idle
+        // host — three repetitions: **Q8_0 +19.1/+24.1/+21.8%, Q4_0
+        // +19.8/+18.9/+19.0%, 8/8 rounds won in all six** (~250 -> ~305 GOP/s).
+        //
+        // Two measurement notes, both learned the hard way here. Constant-filled
+        // activations inflate *absolute* throughput ~2x (both arms run out of a
+        // trivially-predictable working set) and distort the ratio, so the benchmark
+        // quantizes real pseudo-random columns. And a contended machine collapses the
+        // effect to low single digits while looking like a valid run — take these
+        // numbers on an otherwise idle host or not at all.
+        //
+        // Output is bit-identical to the per-row path. That is enforced per
+        // instantiation, not by the ignored benchmark:
+        // `gemm_avx512_row_tiled_matches_per_row_bit_exact` at the VNNI tile
+        // constants and `avx2_row_tiled_matches_per_row_bit_exact` at the AVX2
+        // ones — the latter needs no VNNI host, which matters because the tile
+        // constants it pins are the ones most x86 hosts actually run.
+        //
+        // Known headroom, in the order worth attacking:
+        //   1. Weight decode is redone per column tile (the 2x factor below is the
+        //      VNNI instantiation's; at the AVX2 constants `TILE_N == STRIP_N`, so
+        //      there is no regression to recover there) — `w`/`dw` are hoisted out of
+        //      the `t` loop but not out of the `j` loop, so a row's blocks are decoded
+        //      n/STRIP_N times against a theoretical `nb`. That is 2x more f16->f32
+        //      converts and `unpack_q4_0` calls than the TILE_N=8 per-row kernel did,
+        //      and is the likeliest reason Q4_0 (which pays the nibble unpack) gains
+        //      less than Q8_0. A per-strip decode buffer is 8 KB, L1-resident.
+        //   2. `_mm256_set1_ps(dw[r] * da)` sits in the innermost loop: 16 broadcasts
+        //      per (block, tile) where 8 would do, on a port that is already busy.
+        //   3. No blocking over `n`. Each strip still walks the whole panel, so at
+        //      large `k` (e.g. ffn_down, k=8192) the panel leaves L2 and the real
+        //      bandwidth story finally does apply.
+        //
+        // The trade-off is granularity: this divides the parallel task count by
+        // `TILE_M`. `m` is a projection's out-feature count, and the small end is a
+        // GQA kv_dim — 128 for a 2-KV-head model, i.e. 32 strips against this host's
+        // 32 workers, one per worker with no stealing slack (an MQA kv_dim of 64
+        // leaves half the pool idle). The strip still wins at those shapes (measured
+        // +184%/+103%/+35% at m=64/128/512, 6/6 rounds) because they are nowhere near
+        // thread-bound, but the pool is underfed there and a 2-D split over strips x
+        // n-panels is the fix if that ever matters.
+
+        /// Weight rows per strip.
+        const TILE_M: usize = $tile_m;
+
+        /// Activation columns per accumulator tile inside a strip. `TILE_M *
+        /// STRIP_N` fp32 accumulators must fit the register file with room for the
+        /// `TILE_M` decoded weights, the shared activation, and temporaries: 4x4 =
+        /// 16 leaves half of EVEX's 32 registers free and measured fastest — for
+        /// the VNNI instantiation. The AVX2 one has 16 VEX registers total and
+        /// uses 2x4; its invocation site carries that reasoning. The
+        /// 24-accumulator shapes (6x4, 4x6) spill and regress; this is distinct from
+        /// the per-row `TILE_N = 8`, which tiles one row against 8 columns.
+        const STRIP_N: usize = $strip_n;
+
+        /// One strip of `TILE_M` consecutive Q8_0 weight rows against all `n`
+        /// columns. `rows` points at the first row; rows are `row_bytes` apart and
+        /// `out` is `TILE_M * n` row-major.
+        #[target_feature(enable = $feat)]
+        unsafe fn gemm_q8_0_strip(
+            rows: *const u8,
+            row_bytes: usize,
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            n: usize,
+            nb: usize,
+        ) {
+            // The kernel indexes `out` unchecked up to `TILE_M * n - 1` and reads
+            // `TILE_M` whole weight rows behind `rows`, so state the output half of
+            // that contract here rather than relying on the caller's arithmetic.
+            debug_assert_eq!(out.len(), TILE_M * n);
+            debug_assert_eq!(b_quants.len(), n * nb * 32);
+            debug_assert_eq!(b_scales.len(), n * nb);
+            unsafe {
+                let bsz = size_of::<BlockQ8_0>();
+                let k = nb * 32;
+                let mut j = 0;
+                // The tile loops carry numeric meaning beyond the index (`col = j +
+                // t`, weight offset `r * row_bytes`, output offset `r * n + j + t`),
+                // so range loops read more directly than zipped iterators.
+                #[allow(clippy::needless_range_loop)]
+                while j + STRIP_N <= n {
+                    let mut acc = [[_mm256_setzero_ps(); STRIP_N]; TILE_M];
+                    for b in 0..nb {
+                        // Decode the TILE_M weight blocks once, reused across cols.
+                        let mut w = [_mm256_setzero_si256(); TILE_M];
+                        let mut dw = [0.0f32; TILE_M];
+                        for r in 0..TILE_M {
+                            let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ8_0);
+                            w[r] = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
+                            dw[r] = f16::from_bits(block.delta).to_f32();
+                        }
+                        for t in 0..STRIP_N {
+                            let col = j + t;
+                            // One activation load, fed to every row in the strip.
+                            let a = _mm256_loadu_si256(
+                                b_quants.as_ptr().add(col * k + b * 32) as *const __m256i
+                            );
+                            let da = *b_scales.get_unchecked(col * nb + b);
+                            for r in 0..TILE_M {
+                                let prod = _mm256_cvtepi32_ps(dot32(w[r], a));
+                                let scale = _mm256_set1_ps(dw[r] * da);
+                                acc[r][t] = _mm256_fmadd_ps(prod, scale, acc[r][t]);
+                            }
+                        }
+                    }
+                    for r in 0..TILE_M {
+                        for t in 0..STRIP_N {
+                            *out.get_unchecked_mut(r * n + j + t) = hsum256_ps(acc[r][t]);
+                        }
+                    }
+                    j += STRIP_N;
+                }
+                // Column remainder (n % STRIP_N). The block loop is outermost so the
+                // single activation load is still shared across the strip's rows and
+                // the TILE_M accumulator chains stay independent — the same reuse the
+                // tile loop gets, just one column wide. Per (row, column) the fmadd
+                // order over `b` is unchanged, so this stays bit-identical to the
+                // per-row kernel.
+                #[allow(clippy::needless_range_loop)]
+                while j < n {
+                    let mut acc = [_mm256_setzero_ps(); TILE_M];
+                    for b in 0..nb {
+                        let a = _mm256_loadu_si256(
+                            b_quants.as_ptr().add(j * k + b * 32) as *const __m256i
+                        );
+                        let da = *b_scales.get_unchecked(j * nb + b);
+                        for r in 0..TILE_M {
+                            let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ8_0);
+                            let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
+                            let scale = _mm256_set1_ps(f16::from_bits(block.delta).to_f32() * da);
+                            acc[r] =
+                                _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc[r]);
+                        }
+                    }
+                    for (r, acc_r) in acc.iter().enumerate() {
+                        *out.get_unchecked_mut(r * n + j) = hsum256_ps(*acc_r);
+                    }
+                    j += 1;
+                }
+            }
+        }
+
+        /// One strip of `TILE_M` consecutive Q4_0 weight rows. Mirrors
+        /// `gemm_q8_0_strip`; the only differences are the block type and the nibble
+        /// unpack that produces each weight register.
+        #[target_feature(enable = $feat)]
+        unsafe fn gemm_q4_0_strip(
+            rows: *const u8,
+            row_bytes: usize,
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            n: usize,
+            nb: usize,
+        ) {
+            // Same unchecked contract as `gemm_q8_0_strip`.
+            debug_assert_eq!(out.len(), TILE_M * n);
+            debug_assert_eq!(b_quants.len(), n * nb * 32);
+            debug_assert_eq!(b_scales.len(), n * nb);
+            unsafe {
+                let bsz = size_of::<BlockQ4_0>();
+                let k = nb * 32;
+                let mut j = 0;
+                #[allow(clippy::needless_range_loop)]
+                while j + STRIP_N <= n {
+                    let mut acc = [[_mm256_setzero_ps(); STRIP_N]; TILE_M];
+                    for b in 0..nb {
+                        let mut w = [_mm256_setzero_si256(); TILE_M];
+                        let mut dw = [0.0f32; TILE_M];
+                        for r in 0..TILE_M {
+                            let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ4_0);
+                            w[r] = unpack_q4_0(block.qs.as_ptr());
+                            dw[r] = f16::from_bits(block.d).to_f32();
+                        }
+                        for t in 0..STRIP_N {
+                            let col = j + t;
+                            let a = _mm256_loadu_si256(
+                                b_quants.as_ptr().add(col * k + b * 32) as *const __m256i
+                            );
+                            let da = *b_scales.get_unchecked(col * nb + b);
+                            for r in 0..TILE_M {
+                                let prod = _mm256_cvtepi32_ps(dot32(w[r], a));
+                                let scale = _mm256_set1_ps(dw[r] * da);
+                                acc[r][t] = _mm256_fmadd_ps(prod, scale, acc[r][t]);
+                            }
+                        }
+                    }
+                    for r in 0..TILE_M {
+                        for t in 0..STRIP_N {
+                            *out.get_unchecked_mut(r * n + j + t) = hsum256_ps(acc[r][t]);
+                        }
+                    }
+                    j += STRIP_N;
+                }
+                // Column remainder — block loop outermost, as in `gemm_q8_0_strip`.
+                // `r` indexes both `acc` and the weight-row offset, so a range loop
+                // is the direct spelling here.
+                #[allow(clippy::needless_range_loop)]
+                while j < n {
+                    let mut acc = [_mm256_setzero_ps(); TILE_M];
+                    for b in 0..nb {
+                        let a = _mm256_loadu_si256(
+                            b_quants.as_ptr().add(j * k + b * 32) as *const __m256i
+                        );
+                        let da = *b_scales.get_unchecked(j * nb + b);
+                        for r in 0..TILE_M {
+                            let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ4_0);
+                            let w = unpack_q4_0(block.qs.as_ptr());
+                            let scale = _mm256_set1_ps(f16::from_bits(block.d).to_f32() * da);
+                            acc[r] =
+                                _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc[r]);
+                        }
+                    }
+                    for (r, acc_r) in acc.iter().enumerate() {
+                        *out.get_unchecked_mut(r * n + j) = hsum256_ps(*acc_r);
+                    }
+                    j += 1;
+                }
+            }
+        }
+
+        /// Batched Q4_0 × Q8_0 GEMM: `out[m,n] = A_q4_0[m,k] @ B_q8_0[k,n]`,
+        /// parallel over strips of `TILE_M` output rows.
+        #[target_feature(enable = $feat)]
+        pub unsafe fn gemm_q4_0_q8_0(
+            a_quant: &[u8],
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            m: usize,
+            n: usize,
+            k: usize,
+        ) {
+            debug_assert_eq!(k % 32, 0, "GEMM: k must be divisible by 32");
+            let nb = k / 32;
+            let row_bytes = nb * size_of::<BlockQ4_0>();
+            debug_assert_eq!(a_quant.len(), m * row_bytes);
+            debug_assert_eq!(b_quants.len(), n * k);
+            debug_assert_eq!(b_scales.len(), n * nb);
+            debug_assert_eq!(out.len(), m * n);
+
+            // One `TILE_M`-row strip per chunk; the final chunk may be short
+            // (`m % TILE_M`) and is finished row-by-row.
+            //
+            // This must stay a closure inside this `#[target_feature]` fn: closures
+            // inherit the enclosing function's feature set, so the strip and row
+            // kernels inline here with this instantiation's codegen. Hoisting it
+            // to a free `fn` would silently drop the features and un-inline both
+            // kernels.
+            let handle = |out_chunk: &mut [f32], s: usize| {
+                // Strip `s` owns rows `s * TILE_M ..` — `rows_here` of them, which is
+                // `TILE_M` for every chunk but a short final one. Compare against the
+                // exact byte length rather than a truncating division so a chunk that
+                // is not a whole number of rows takes the row path instead of
+                // silently entering the strip kernel.
+                let rows_here = out_chunk.len() / n;
+                // SAFETY: strip `s` reads `a_quant[s * TILE_M * row_bytes ..]` for
+                // `rows_here * row_bytes` bytes — up to `TILE_M * row_bytes`, not one
+                // row — which is in bounds because `out.len() == m * n` bounds `s` and
+                // `a_quant.len() == m * row_bytes`. Reads are shared and read-only;
+                // the write goes only to this task's disjoint `out_chunk`.
+                unsafe {
+                    let rows = a_quant.as_ptr().add(s * TILE_M * row_bytes);
+                    if out_chunk.len() == TILE_M * n {
+                        gemm_q4_0_strip(rows, row_bytes, b_scales, b_quants, out_chunk, n, nb);
+                    } else {
+                        debug_assert_eq!(out_chunk.len(), rows_here * n);
+                        for (r, out_row) in out_chunk.chunks_mut(n).enumerate() {
+                            gemm_q4_0_row(
+                                rows.add(r * row_bytes),
+                                b_scales,
+                                b_quants,
+                                out_row,
+                                n,
+                                nb,
+                            );
+                        }
+                    }
+                }
+            };
+
+            #[cfg(feature = "parallel")]
+            {
+                use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+                out.par_chunks_mut(TILE_M * n)
+                    .enumerate()
+                    .for_each(|(s, out_chunk)| handle(out_chunk, s));
+            }
+            #[cfg(not(feature = "parallel"))]
+            for (s, out_chunk) in out.chunks_mut(TILE_M * n).enumerate() {
+                handle(out_chunk, s);
+            }
+        }
+
+        /// Batched Q8_0 × Q8_0 GEMM: `out[m,n] = A_q8_0[m,k] @ B_q8_0[k,n]`.
+        #[target_feature(enable = $feat)]
+        pub unsafe fn gemm_q8_0_q8_0(
+            a_quant: &[u8],
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            m: usize,
+            n: usize,
+            k: usize,
+        ) {
+            debug_assert_eq!(k % 32, 0, "GEMM: k must be divisible by 32");
+            let nb = k / 32;
+            let row_bytes = nb * size_of::<BlockQ8_0>();
+            debug_assert_eq!(a_quant.len(), m * row_bytes);
+            debug_assert_eq!(b_quants.len(), n * k);
+            debug_assert_eq!(b_scales.len(), n * nb);
+            debug_assert_eq!(out.len(), m * n);
+
+            // One `TILE_M`-row strip per chunk; short final chunk row-by-row. Must
+            // stay a closure for the target-feature reason given in the Q4_0 GEMM.
+            let handle = |out_chunk: &mut [f32], s: usize| {
+                let rows_here = out_chunk.len() / n;
+                // SAFETY: as in the Q4_0 GEMM above — up to `TILE_M * row_bytes`.
+                unsafe {
+                    let rows = a_quant.as_ptr().add(s * TILE_M * row_bytes);
+                    if out_chunk.len() == TILE_M * n {
+                        gemm_q8_0_strip(rows, row_bytes, b_scales, b_quants, out_chunk, n, nb);
+                    } else {
+                        debug_assert_eq!(out_chunk.len(), rows_here * n);
+                        for (r, out_row) in out_chunk.chunks_mut(n).enumerate() {
+                            gemm_q8_0_row(
+                                rows.add(r * row_bytes),
+                                b_scales,
+                                b_quants,
+                                out_row,
+                                n,
+                                nb,
+                            );
+                        }
+                    }
+                }
+            };
+
+            #[cfg(feature = "parallel")]
+            {
+                use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+                out.par_chunks_mut(TILE_M * n)
+                    .enumerate()
+                    .for_each(|(s, out_chunk)| handle(out_chunk, s));
+            }
+            #[cfg(not(feature = "parallel"))]
+            for (s, out_chunk) in out.chunks_mut(TILE_M * n).enumerate() {
+                handle(out_chunk, s);
+            }
+        }
+
+        // ── K-quant int8 kernels ────────────────────────────────────────────────
+        //
+        // NOT row-tiled, deliberately — measured, not assumed. The Q4_0/Q8_0 GEMMs
+        // above process `TILE_M` weight rows per task ("Row tiling"); these stay
+        // per-row. Q4_K/Q6_K reduce each `vpdpbusd` to a scalar immediately (an hsum
+        // per block) and carry a per-sub-block scale plus a mins correction, so there
+        // is no vector-accumulator ILP for tiling to expose — only activation-load
+        // reuse, against much heavier per-block work. A row-tiled Q4_K prototype
+        // measured **-9.3% at 4x8 and -17% at 4x4, 0/8 rounds won in both**. Q6_K was
+        // not prototyped; it shares the structure with more per-block work still (qh
+        // reconstruction, two hsums per column). Note also that the K-quant GEMV *is*
+        // this GEMM at n=1, so tiling here would have to not regress decode.
+        //
+        // x86 analogue of the NEON K-quant GEMM family. Two structural differences,
+        // both forced by `vpdpbusd` taking an *unsigned* × signed operand pair:
+        //
+        //  - Q4_K nibbles (0..15) and Q6_K quants (0..63) stay unsigned and go in
+        //    the u8 operand directly — no sign trick, unlike Q4_0, which recenters
+        //    by −8 at decode and needs one.
+        //  - Q6_K's −32 recentering cannot be baked into the weights as NEON does
+        //    (that would make them signed). It is applied algebraically instead:
+        //    Σ((q−32)·a) = Σ(q·a) − 32·Σa, with Σa precomputed per column at
+        //    *16-element* granularity because Q6_K scales are 16-wide.
+        //
+        // `vpdpbusd` (the non-saturating form) is safe here: per-lane sums are
+        // bounded (≤ 4·63·127) and every lane accumulator is hsummed and reset per
+        // sub-block, so the i32 accumulator cannot overflow.
+        //
+        // The AVX2 instantiation's `dot32u` DOES saturate its i16 intermediate,
+        // so it needs the tighter bound, and it holds: `maddubs` sums two
+        // adjacent products, peaking at 2·63·127 = 16002 against 32767. See the
+        // `avx2_int8` module header for the same argument over every caller.
+
+        /// Column tile width. Decoding a K-quant super-block is the expensive part;
+        /// applying each decoded group to `KQ_COLS` activation columns amortizes
+        /// it — mirrors the NEON kernels' choice of 8. (The AVX2 instantiation
+        /// passes 4, for the register budget reason at its invocation site.)
+        const KQ_COLS: usize = $kq_cols;
+
+        /// Horizontal sum of 8 i32 lanes.
+        #[target_feature(enable = $feat)]
+        unsafe fn hsum256_epi32(v: __m256i) -> i32 {
+            let s = _mm_add_epi32(_mm256_extracti128_si256(v, 1), _mm256_castsi256_si128(v));
+            let s = _mm_add_epi32(s, _mm_srli_si128(s, 8));
+            let s = _mm_add_epi32(s, _mm_srli_si128(s, 4));
+            _mm_cvtsi128_si32(s)
+        }
+
+        /// Horizontal sum of 4 i32 lanes.
+        #[target_feature(enable = $feat)]
+        unsafe fn hsum128_epi32(v: __m128i) -> i32 {
+            let s = _mm_add_epi32(v, _mm_srli_si128(v, 8));
+            let s = _mm_add_epi32(s, _mm_srli_si128(s, 4));
+            _mm_cvtsi128_si32(s)
+        }
+
+        /// Per-column, per-32-element-block sums of the Q8_0 activation quants:
+        /// `sums[j * (k/32) + b]`. The Q4_K mins term consumes these.
+        #[target_feature(enable = $feat)]
+        unsafe fn q8_0_col_sums(b_quants: &[i8], n: usize, k: usize) -> Vec<i32> {
+            unsafe {
+                let nb32 = k / 32;
+                let mut sums = vec![0i32; n * nb32];
+                let ones = _mm256_set1_epi8(1);
+                for j in 0..n {
+                    let base = b_quants.as_ptr().add(j * k);
+                    for b in 0..nb32 {
+                        let x = _mm256_loadu_si256(base.add(b * 32) as *const __m256i);
+                        sums[j * nb32 + b] = hsum256_epi32(dot32u(ones, x));
+                    }
+                }
+                sums
+            }
+        }
+
+        /// Same, at 16-element granularity: `sums16[j * (k/16) + h]`. Q6_K scales
+        /// are 16-wide, so its recentering needs half-block activation sums.
+        #[target_feature(enable = $feat)]
+        unsafe fn q8_0_col_sums16(b_quants: &[i8], n: usize, k: usize) -> Vec<i32> {
+            unsafe {
+                let nh = k / 16;
+                let mut sums = vec![0i32; n * nh];
+                let ones = _mm_set1_epi8(1);
+                for j in 0..n {
+                    let base = b_quants.as_ptr().add(j * k);
+                    for h in 0..nh {
+                        let x = _mm_loadu_si128(base.add(h * 16) as *const __m128i);
+                        sums[j * nh + h] = hsum128_epi32(dot16u(ones, x));
+                    }
+                }
+                sums
+            }
+        }
+
+        /// Batched GEMM: `C[m, n] = A_q4_k[m, k] @ B_q8_0[k, n]`.
+        ///
+        /// Layout contract matches the Q4_0/Q8_0 GEMMs (`b_scales[n][k/32]`,
+        /// `b_quants[n][k]`), structure matches the NEON twin: decode each
+        /// super-block group once, apply to `KQ_COLS` columns. Per sub-block `s`
+        /// the contribution is `xs·(d·sc_s·Σ(q·aq) − dmin·mn_s·Σaq)`.
+        #[target_feature(enable = $feat)]
+        pub unsafe fn gemm_q4_k_q8_0(
+            a_quant: &[u8],
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            m: usize,
+            n: usize,
+            k: usize,
+        ) {
+            debug_assert_eq!(k % 256, 0, "Q4_K GEMM: k must be divisible by 256");
+            let sb = k / 256;
+            let nb32 = k / 32;
+            let row_bytes = sb * size_of::<crate::quant::BlockQ4KM>();
+            debug_assert_eq!(a_quant.len(), m * row_bytes, "Q4_K GEMM: a_quant size");
+            debug_assert_eq!(b_quants.len(), n * k, "Q4_K GEMM: b_quants size");
+            debug_assert_eq!(b_scales.len(), n * nb32, "Q4_K GEMM: b_scales size");
+            debug_assert_eq!(out.len(), m * n, "Q4_K GEMM: out size");
+
+            let col_sums = unsafe { q8_0_col_sums(b_quants, n, k) };
+            let cs: &[i32] = &col_sums;
+
+            // Slices captured by reference — Send, no pointer→usize laundering.
+            let compute_row = |(i, row_out): (usize, &mut [f32])| {
+                // SAFETY: row `i` spans `a_quant[i*row_bytes..][..row_bytes]`; the
+                // debug_asserts above pin every slice length.
+                unsafe {
+                    let mask_0f = _mm256_set1_epi8(0x0F);
+                    let row_start = i * row_bytes;
+
+                    let mut j0 = 0usize;
+                    while j0 < n {
+                        let cols = KQ_COLS.min(n - j0);
+                        let mut acc = [0.0f32; KQ_COLS];
+
+                        for bi in 0..sb {
+                            let blk = &*(a_quant
+                                .as_ptr()
+                                .add(row_start + bi * size_of::<crate::quant::BlockQ4KM>())
+                                as *const crate::quant::BlockQ4KM);
+                            let d = half::f16::from_bits(blk.d).to_f32();
+                            let dmin = half::f16::from_bits(blk.dmin).to_f32();
+                            let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
+                            let qs = blk.qs.as_ptr();
+
+                            for g in 0..4 {
+                                // Chunk g: low nibbles = sub-block 2g, high = 2g+1;
+                                // byte l is element l of its sub-block, matching the
+                                // contiguous 32-quant activation block.
+                                let qb = _mm256_loadu_si256(qs.add(g * 32) as *const __m256i);
+                                let w_lo = _mm256_and_si256(qb, mask_0f);
+                                let w_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), mask_0f);
+
+                                for (w, s) in [(w_lo, 2 * g), (w_hi, 2 * g + 1)] {
+                                    let xb = bi * 8 + s;
+                                    let dsc = d * sc[s] as f32;
+                                    let dmn = dmin * mn[s] as f32;
+                                    for (jj, acc_j) in acc.iter_mut().enumerate().take(cols) {
+                                        let j = j0 + jj;
+                                        let x = _mm256_loadu_si256(
+                                            b_quants.as_ptr().add(j * k + xb * 32)
+                                                as *const __m256i,
+                                        );
+                                        let dp = hsum256_epi32(dot32u(w, x));
+                                        let xs = *b_scales.get_unchecked(j * nb32 + xb);
+                                        let sx = *cs.get_unchecked(j * nb32 + xb);
+                                        *acc_j += xs * (dsc * dp as f32 - dmn * sx as f32);
+                                    }
+                                }
+                            }
+                        }
+
+                        row_out[j0..j0 + cols].copy_from_slice(&acc[..cols]);
+                        j0 += cols;
+                    }
+                }
+            };
+
+            if m >= crate::backend::cpu::gemv_par_threshold() {
+                crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
+            } else {
+                out.chunks_mut(n).enumerate().for_each(compute_row);
+            }
+        }
+
+        /// Batched GEMM: `C[m, n] = A_q6_k[m, k] @ B_q8_0[k, n]`.
+        ///
+        /// Q6_K geometry (mirrors `dequantize_q6_k_block`): two 128-value halves per
+        /// super-block (`ql += 64`, `qh += 32`, `sc += 8`); half `nh`, group `g`
+        /// covers elements `nh*128 + g*32..+32` with quants
+        /// `(ql[(g&1)*32 + l] nibble(g<2 ? lo : hi)) | (((qh[l] >> 2g) & 3) << 4)`
+        /// and scales `sc[nh*8 + 2g + is]`, `is = l/16`. Scales are 16-wide, so a
+        /// 32-quant activation block spans two of them — the dpbusd lanes split
+        /// cleanly (lanes 0..3 = first 16 bytes, 4..7 = second 16).
+        #[target_feature(enable = $feat)]
+        pub unsafe fn gemm_q6_k_q8_0(
+            a_quant: &[u8],
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            m: usize,
+            n: usize,
+            k: usize,
+        ) {
+            debug_assert_eq!(k % 256, 0, "Q6_K GEMM: k must be divisible by 256");
+            let sb = k / 256;
+            let nb32 = k / 32;
+            let nh16 = k / 16;
+            let row_bytes = sb * size_of::<crate::quant::BlockQ6K>();
+            debug_assert_eq!(a_quant.len(), m * row_bytes, "Q6_K GEMM: a_quant size");
+            debug_assert_eq!(b_quants.len(), n * k, "Q6_K GEMM: b_quants size");
+            debug_assert_eq!(b_scales.len(), n * nb32, "Q6_K GEMM: b_scales size");
+            debug_assert_eq!(out.len(), m * n, "Q6_K GEMM: out size");
+
+            let col_sums16 = unsafe { q8_0_col_sums16(b_quants, n, k) };
+            let cs16: &[i32] = &col_sums16;
+
+            let compute_row = |(i, row_out): (usize, &mut [f32])| {
+                // SAFETY: as in `gemm_q4_k_q8_0`.
+                unsafe {
+                    let mask_0f = _mm256_set1_epi8(0x0F);
+                    let mask_03 = _mm256_set1_epi8(0x03);
+                    let row_start = i * row_bytes;
+
+                    let mut j0 = 0usize;
+                    while j0 < n {
+                        let cols = KQ_COLS.min(n - j0);
+                        let mut acc = [0.0f32; KQ_COLS];
+
+                        for bi in 0..sb {
+                            let blk = &*(a_quant
+                                .as_ptr()
+                                .add(row_start + bi * size_of::<crate::quant::BlockQ6K>())
+                                as *const crate::quant::BlockQ6K);
+                            let d = half::f16::from_bits(blk.d).to_f32();
+                            let ql = blk.ql.as_ptr();
+                            let qh = blk.qh.as_ptr();
+
+                            for nh in 0..2usize {
+                                let qhb = _mm256_loadu_si256(qh.add(nh * 32) as *const __m256i);
+                                for g in 0..4usize {
+                                    let qlb = _mm256_loadu_si256(
+                                        ql.add(nh * 64 + (g & 1) * 32) as *const __m256i
+                                    );
+                                    let l4 = if g < 2 {
+                                        _mm256_and_si256(qlb, mask_0f)
+                                    } else {
+                                        _mm256_and_si256(_mm256_srli_epi16(qlb, 4), mask_0f)
+                                    };
+                                    // Runtime shift by 2g (0/2/4/6): `srl` with a
+                                    // count register — `srli` needs a const.
+                                    let h2 = _mm256_and_si256(
+                                        _mm256_srl_epi16(qhb, _mm_cvtsi32_si128(2 * g as i32)),
+                                        mask_03,
+                                    );
+                                    // h2 ≤ 3, so `<< 4` ≤ 48: stays inside its own
+                                    // byte, no bleed across the epi16 lane boundary.
+                                    let w = _mm256_or_si256(l4, _mm256_slli_epi16(h2, 4));
+
+                                    let sc0 = *blk.scales.get_unchecked(nh * 8 + 2 * g) as f32;
+                                    let sc1 = *blk.scales.get_unchecked(nh * 8 + 2 * g + 1) as f32;
+                                    let xb = bi * 8 + nh * 4 + g;
+
+                                    for (jj, acc_j) in acc.iter_mut().enumerate().take(cols) {
+                                        let j = j0 + jj;
+                                        let x = _mm256_loadu_si256(
+                                            b_quants.as_ptr().add(j * k + xb * 32)
+                                                as *const __m256i,
+                                        );
+                                        let lanes = dot32u(w, x);
+                                        let dp0 = hsum128_epi32(_mm256_castsi256_si128(lanes));
+                                        let dp1 = hsum128_epi32(_mm256_extracti128_si256(lanes, 1));
+                                        let xs = *b_scales.get_unchecked(j * nb32 + xb);
+                                        let sx0 = *cs16.get_unchecked(j * nh16 + xb * 2);
+                                        let sx1 = *cs16.get_unchecked(j * nh16 + xb * 2 + 1);
+                                        *acc_j += xs
+                                            * d
+                                            * (sc0 * (dp0 - 32 * sx0) as f32
+                                                + sc1 * (dp1 - 32 * sx1) as f32);
+                                    }
+                                }
+                            }
+                        }
+
+                        row_out[j0..j0 + cols].copy_from_slice(&acc[..cols]);
+                        j0 += cols;
+                    }
+                }
+            };
+
+            if m >= crate::backend::cpu::gemv_par_threshold() {
+                crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
+            } else {
+                out.chunks_mut(n).enumerate().for_each(compute_row);
+            }
+        }
+
+        /// Q4_K GEMV: quantize `x` to Q8_0 and run this tier's GEMM at `n = 1`.
+        ///
+        /// Emitted per tier so decode and batched prefill share arithmetic **by
+        /// construction** — not by two implementations happening to agree.
+        /// Shipping the GEMM without it is a live trap: with the AVX2 GEMM wired
+        /// up and decode still on the f32 `vec_dot` path, LFM2.5-230M-Q4_K_M
+        /// scored cosine 0.999335 against the parity tests' 0.9999 naive bar
+        /// (VNNI, where both paths already matched, scores exactly 1.000000).
+        /// aarch64 gets the same property from both paths sharing the NEON dot.
+        ///
+        /// The quantizer is the crate's dispatching one, so it is by definition
+        /// the same function prefill's `quantize_columns` reaches on this host —
+        /// the other half of the invariant. Which arm it picks (see
+        /// `cpu::avx512_quantizer_available`) does not matter here precisely
+        /// because both sides of the invariant go through the same call.
+        #[target_feature(enable = $feat)]
+        pub unsafe fn gemv_q4k_f32(
+            a_quant: &[u8],
+            x: &[f32],
+            y: &mut [f32],
+            m: usize,
+            k: usize,
+            q8_scales: &mut Vec<f32>,
+            q8_quants: &mut Vec<i8>,
+        ) {
+            unsafe {
+                q8_scales.resize(k / 32, 0.0);
+                q8_quants.resize(k, 0);
+                crate::backend::cpu::quantize_f32_to_q8_0_into(x, q8_scales, q8_quants);
+                gemm_q4_k_q8_0(a_quant, q8_scales, q8_quants, y, m, 1, k);
+            }
+        }
+
+        /// Q6_K GEMV — see [`gemv_q4k_f32`] for why this shares the GEMM.
+        #[target_feature(enable = $feat)]
+        pub unsafe fn gemv_q6k_f32(
+            a_quant: &[u8],
+            x: &[f32],
+            y: &mut [f32],
+            m: usize,
+            k: usize,
+            q8_scales: &mut Vec<f32>,
+            q8_quants: &mut Vec<i8>,
+        ) {
+            unsafe {
+                q8_scales.resize(k / 32, 0.0);
+                q8_quants.resize(k, 0);
+                crate::backend::cpu::quantize_f32_to_q8_0_into(x, q8_scales, q8_quants);
+                gemm_q6_k_q8_0(a_quant, q8_scales, q8_quants, y, m, 1, k);
+            }
+        }
+    };
+}
+
+// ── x86_64 AVX2 int8 (VNNI-free `dpbusd` emulation) ─────────────────────────
+//
+// The same int8 GEMM kernels, for hosts without AVX-512 VNNI. That is not a
+// niche: every Zen 1-3 and every pre-Ice-Lake Intel part lands here, as does
+// Skylake-X (AVX-512 but no VNNI). Before this module they all took the
+// per-token GEMV fallback for prefill, which `warn_unbatchable` reports as
+// "several times slower than it should be" — accurately.
+//
+// **The emulation.** `vpdpbusd(0, u, s)` is `_mm256_maddubs_epi16` (u8 x i8 ->
+// i16, pairwise-summed) followed by `_mm256_madd_epi16` against ones (i16 pairs
+// -> i32). Two instructions instead of one, and `maddubs` saturates its i16
+// intermediate — so the emulation is only equal to VNNI while that intermediate
+// cannot overflow.
+//
+// **Why it cannot.** `maddubs` sums two adjacent products into one i16, so the
+// bound is `2 * max|w| * max|a|` against 32767:
+//
+//   - `dot32`   Q8_0 weights: `2 * 128 * 127 = 32512`  (fits, 255 to spare)
+//   - `dot32`   Q4_0 weights, `[-8, 7]`: `2 * 8 * 127 = 2032`
+//   - `dot32u`  Q4_K weights, `0..15`:   `2 * 15 * 127 = 3810`
+//   - `dot32u`  Q6_K weights, `0..63`:   `2 * 63 * 127 = 16002`
+//   - `dot32u`  activation sums (`w = 1`): `2 * 1 * 127 = 254`
+//
+// The `127` is not an assumption: it is the same precondition `dot32` already
+// documents for the sign trick, enforced by the quantizers. The Q8_0 case is the
+// tight one and it is tight *because* weights may be `-128` while activations
+// may not — had both been unbounded i8 this would overflow and the emulation
+// would be wrong.
+//
+// So this is exact, not approximate: the `avx2_*_matches_vnni_bit_exact` tests
+// below assert the two produce identical bits on a VNNI host, over inputs that
+// include the `-128` weight extreme.
+//
+// THE `-128` ACTIVATION CORNER, worked through because "exact" is a strong word
+// and the `[-127, 127]` precondition is not quite a theorem. A block whose
+// `amax` is subnormal loses so much precision in `d = amax / 127` that
+// `v * (1/d)` can overshoot and clamp to `-128` — see `dot32`'s precondition
+// doc. Exactness survives it anyway, and the reason is the *sign* of the
+// product, not its magnitude: the sign trick forms `|w| * sign(a, w)`, and a
+// `+128` second operand is unreachable (it would need `a = +128`, or `a = -128`
+// against a positive weight, which `sign` leaves negative). So the extreme pair
+// is `2 * 128 * -128 = -32768` — exactly `i16::MIN`, representable, not
+// saturated. Positive products stay capped at `2 * 128 * 127 = 32512`. Such a
+// block also has `f16::from_f32(d) == 0.0`, so it contributes nothing either
+// way; the point is that even its raw dot matches `dpbusd`.
+//
+// **Registers.** VEX exposes 16 vector registers, not EVEX's 32, so the tile
+// constants are narrower than the VNNI instantiation's — a 4x4 strip would be
+// 16 accumulators before a single weight or activation register. That reasoning
+// picks the right values but predicts a much larger effect than measurement
+// shows; see the invocation below for the numbers and their caveat.
+//
+// Note this module needs no `avx512` crate feature: `maddubs`/`madd` are
+// SSSE3/SSE2-era intrinsics, stable well before the 1.85 MSRV.
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod avx2_int8 {
+    use super::*;
+    use std::arch::x86_64::*;
+
+    /// `vpdpbusd(0, w, a)` for an already-unsigned `w`, without VNNI.
+    ///
+    /// **Precondition:** `2 * max(w) * max|a| <= 32767`, or the `maddubs` i16
+    /// intermediate saturates and the result silently stops matching VNNI. The
+    /// module note above enumerates every caller against that bound.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot32u(w: __m256i, a: __m256i) -> __m256i {
+        _mm256_madd_epi16(_mm256_maddubs_epi16(w, a), _mm256_set1_epi16(1))
+    }
+
+    /// 128-bit `dot32u`, for Q6_K's 16-element sub-block activation sums. Same
+    /// saturation bound as the 256-bit form — the lane width does not change
+    /// what `maddubs` accumulates into an i16.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot16u(w: __m128i, a: __m128i) -> __m128i {
+        _mm_madd_epi16(_mm_maddubs_epi16(w, a), _mm_set1_epi16(1))
+    }
+
+    /// `vpdpbusd(0, |w|, sign(a, w))` for signed weights, without VNNI.
+    ///
+    /// Identical sign trick to the VNNI `dot32`, and identical precondition:
+    /// activations must be in `[-127, 127]`, since `_mm256_sign_epi8` cannot
+    /// negate `-128`. Weights may be `-128`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot32(w: __m256i, a: __m256i) -> __m256i {
+        unsafe { dot32u(_mm256_sign_epi8(w, w), _mm256_sign_epi8(a, w)) }
+    }
+
+    // 16 VEX registers, so the tiles are narrower than the VNNI instantiation's
+    // 8/4/4/8: TILE_N=4 per-row columns, and a 2x4 (8-accumulator) strip, which
+    // leaves room for the 2 decoded weights, 4 activations, and scale temps.
+    //
+    // The register argument predicts this correctly but **overstates it**. Both
+    // sets were measured on LFM2.5-350M-Q4_0 pp512, `CERA_CPU_TIER=avx2`, pool
+    // pinned at 16, alternating arm order, 3 reps: narrow won 3/3 at 203/204/198
+    // vs 200/199/196 tok/s — about 2%, not the collapse an outright spill would
+    // cause. 4/4/4/4 and 8/2/4/8 measured in between. So: keep the narrow tiles,
+    // but do not read this as "the wide tiles spill catastrophically".
+    //
+    // CAVEAT on all four numbers: they come from a Zen 5 part *executing* AVX2,
+    // which renames far more physical registers than the Zen 1-3 / Skylake-X
+    // hosts this module actually targets. The ordering is likely to hold there
+    // and the margin is not. Re-tune on a real AVX2-only part before treating
+    // these as final.
+    int8_gemm_kernels!("avx2,fma", 4, 2, 4, 4);
+
+    #[cfg(test)]
+    mod avx2_int8_tests {
+        //! The AVX2 emulation is claimed to be *exact*, not approximate, so the
+        //! test is equality against VNNI rather than a tolerance — on a host
+        //! that has both. A tolerance-based test here would pass even if
+        //! `maddubs` saturated, which is the one failure mode worth catching.
+        //!
+        //! The VNNI comparisons need a host with *both* ISAs, and the
+        //! GitHub-hosted x86 pool is not guaranteed to provide one — AVX2 is,
+        //! VNNI is not, and AVX2-only is precisely where these kernels run. So
+        //! the suite is split by what it *requires*, not by what it asserts:
+        //!
+        //!   - `#[cfg(feature = "avx512")]` + `both_callable()`: the three
+        //!     `*_matches_vnni_bit_exact` tests. The strongest check there is,
+        //!     and the only one that can confirm the emulation is exact rather
+        //!     than merely close — but it needs a VNNI host, so treat it as
+        //!     opportunistic. `CERA_REQUIRE_SIMD=avx512vnni` turns its skip into
+        //!     a failure where the hardware is known.
+        //!   - Everything else: no VNNI dependency, no `avx512` crate feature.
+        //!     These carry the CI coverage, and `CERA_REQUIRE_SIMD=avx2` (set by
+        //!     the x86 CI leg) turns their skip into a failure. Note that
+        //!     `avx2_row_tiled_matches_per_row_bit_exact` is bit-exact too — it
+        //!     compares the strip kernel against the per-row one, which needs
+        //!     only AVX2.
+        //!
+        //! Deliberately not enumerated by name here: a list in a comment is one
+        //! renamed test away from lying about its own coverage.
+        use super::*;
+        use crate::quant::{BlockQ4_0, BlockQ8_0};
+
+        // The comparison target only exists when the `avx512` feature is on —
+        // this module deliberately does not depend on it, so under
+        // `--no-default-features` the three `*_matches_vnni_bit_exact` tests
+        // compile out and every other test in the module still runs.
+        #[cfg(feature = "avx512")]
+        use super::super::avx512_vnni as vnni;
+
+        use crate::backend::simd::require_simd_or_skip;
+
+        /// Every feature in these kernels' `#[target_feature]` list, not a subset:
+        /// calling one without all of them detected is UB. Named rather than
+        /// spelled out per test so adding a feature to the kernels is one edit,
+        /// not six — a missed copy is a test that runs where the kernel is
+        /// illegal. Mirrors `vnni_kernels_callable` in the VNNI module.
+        fn avx2_kernels_callable() -> bool {
+            is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+        }
+
+        #[cfg(feature = "avx512")]
+        fn both_callable() -> bool {
+            // Every feature in the VNNI kernels' `#[target_feature]` set, not a
+            // subset: calling one without all of them detected is UB, which is
+            // the same reason `vnni_kernels_callable` lists all five.
+            is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
+                && is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512vl")
+                && is_x86_feature_detected!("avx512vnni")
+        }
+
+        fn lcg(st: &mut u64) -> u64 {
+            *st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *st >> 33
+        }
+
+        /// Q8_0 weight rows that deliberately include `-128`.
+        ///
+        /// `-128` is the tight case for the emulation: `2 * 128 * 127 = 32512`
+        /// is the closest any caller comes to the *positive* i16 saturation
+        /// point (the module header works through the negative direction, which
+        /// reaches `i16::MIN` exactly and is therefore representable), and it
+        /// is also the value the sign trick handles only on the weight side.
+        /// The existing `rand_q8_0_rows` helper draws from `[-127, 127]` and so
+        /// never exercises it.
+        fn q8_0_rows_with_extremes(m: usize, k: usize, st: &mut u64) -> Vec<u8> {
+            let nb = k / 32;
+            let mut v = Vec::with_capacity(m * nb * size_of::<BlockQ8_0>());
+            for blk in 0..m * nb {
+                v.extend_from_slice(
+                    &half::f16::from_f32(0.01 + 0.003 * (blk % 5) as f32)
+                        .to_bits()
+                        .to_le_bytes(),
+                );
+                for t in 0..32 {
+                    // Seed the saturation worst case deterministically rather
+                    // than hoping for it: `maddubs` sums two *adjacent* products
+                    // into one i16, so the tight case is two neighbouring
+                    // `-128` weights, which is what lanes 0 and 1 force. Leaving
+                    // it to the RNG would hit it about 1 pair in 65536. The
+                    // matching activation lanes in `activations` carry a single
+                    // sign per pair so the two products add instead of
+                    // cancelling — see the note there.
+                    let q: i8 = match t {
+                        0 | 1 => -128,
+                        2 | 3 => 127,
+                        4 => -127,
+                        _ => (lcg(st) % 256) as i32 as i8,
+                    };
+                    v.push(q as u8);
+                }
+            }
+            v
+        }
+
+        fn q4_0_rows(m: usize, k: usize, st: &mut u64) -> Vec<u8> {
+            let nb = k / 32;
+            let mut v = Vec::with_capacity(m * nb * size_of::<BlockQ4_0>());
+            for blk in 0..m * nb {
+                v.extend_from_slice(
+                    &half::f16::from_f32(0.01 + 0.004 * (blk % 7) as f32)
+                        .to_bits()
+                        .to_le_bytes(),
+                );
+                for _ in 0..16 {
+                    v.push((lcg(st) % 256) as u8);
+                }
+            }
+            v
+        }
+
+        /// Random Q4_K and Q6_K weight rows sharing one RNG stream.
+        ///
+        /// `d`/`dmin` are controlled rather than random bytes: random f16 bits
+        /// can be inf/NaN, and a NaN output would compare bit-equal to itself
+        /// and prove nothing in the bit-exactness test. Everything else — the
+        /// 6-bit scales, the nibbles, the qh bits — is fully random.
+        fn k_quant_rows(m: usize, sb: usize, st: &mut u64) -> (Vec<u8>, Vec<u8>) {
+            let q4_sz = size_of::<crate::quant::BlockQ4KM>();
+            let mut q4k = vec![0u8; m * sb * q4_sz];
+            for (bi, chunk) in q4k.chunks_mut(q4_sz).enumerate() {
+                let d = half::f16::from_f32(0.01 + 0.005 * (bi % 7) as f32);
+                let dmin = half::f16::from_f32(0.02 + 0.003 * (bi % 5) as f32);
+                chunk[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+                chunk[2..4].copy_from_slice(&dmin.to_bits().to_le_bytes());
+                for b in chunk[4..].iter_mut() {
+                    *b = (lcg(st) % 256) as u8;
+                }
+            }
+            let q6_sz = size_of::<crate::quant::BlockQ6K>();
+            let mut q6k = vec![0u8; m * sb * q6_sz];
+            for (bi, chunk) in q6k.chunks_mut(q6_sz).enumerate() {
+                for b in chunk[..q6_sz - 2].iter_mut() {
+                    *b = (lcg(st) % 256) as u8;
+                }
+                // Derived, not the literal 208 the older fixtures hardcode: a
+                // change to `BlockQ6K` should move this, not silently corrupt it.
+                let d = half::f16::from_f32(0.01 + 0.004 * (bi % 6) as f32);
+                chunk[q6_sz - 2..].copy_from_slice(&d.to_bits().to_le_bytes());
+            }
+            (q4k, q6k)
+        }
+
+        /// Activation columns at the `[-127, 127]` bound the kernels require.
+        ///
+        /// The extreme lanes are placed to *add* rather than cancel against
+        /// `q8_0_rows_with_extremes`. `maddubs` folds two adjacent products
+        /// into one i16, and the sign trick rewrites the pair as
+        /// `|w| * sign(a, w)`, so a pair only approaches the i16 bound when
+        /// both products land on the same sign. Lanes 0|1 face `-128` weights
+        /// and lanes 2|3 face `+127` weights; giving each pair a single
+        /// activation sign yields `-32512` and `-32258` respectively — the two
+        /// closest approaches any caller makes to `32767`. Opposite signs
+        /// within a pair would sum to zero and test nothing.
+        fn activations(n: usize, k: usize, st: &mut u64) -> (Vec<f32>, Vec<i8>) {
+            let nb = k / 32;
+            let mut scales = vec![0.0f32; n * nb];
+            let mut quants = vec![0i8; n * k];
+            for j in 0..n {
+                for b in 0..nb {
+                    scales[j * nb + b] = 0.02 + 0.001 * ((j + b) % 9) as f32;
+                    for t in 0..32 {
+                        quants[j * k + b * 32 + t] = match t {
+                            0 | 1 => 127,
+                            2 | 3 => -127,
+                            _ => ((lcg(st) % 255) as i32 - 127) as i8,
+                        };
+                    }
+                }
+            }
+            (scales, quants)
+        }
+
+        #[cfg(feature = "avx512")]
+        fn assert_same_bits(avx2: &[f32], vnni: &[f32], tag: &str) {
+            for (i, (a, v)) in avx2.iter().zip(vnni).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    v.to_bits(),
+                    "{tag}: AVX2 emulation diverged from VNNI at index {i} ({a} vs {v})"
+                );
+            }
+        }
+
+        /// Shapes chosen to hit both tile paths and both remainders: full
+        /// strips plus an `m % TILE_M` tail, full tiles plus an `n % STRIP_N`
+        /// remainder, and an `n` below the tile width entirely.
+        const SHAPES: [(usize, usize); 4] = [(9, 7), (8, 8), (3, 2), (16, 5)];
+
+        /// Exact integer reference: the kernel's contract is
+        /// `sum_b d_w[b] * d_x[b] * <weights, activations>`, done in i32 rather
+        /// than by dequantizing to f32, so a mismatch is unambiguous instead of
+        /// being folded into a second rounding.
+        fn ref_gemm(
+            weights: &[u8],
+            bs: &[f32],
+            bq: &[i8],
+            m: usize,
+            n: usize,
+            k: usize,
+            q4: bool,
+        ) -> Vec<f32> {
+            let nb = k / 32;
+            let bsz = if q4 {
+                size_of::<BlockQ4_0>()
+            } else {
+                size_of::<BlockQ8_0>()
+            };
+            let mut out = vec![0.0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut sum = 0.0f32;
+                    for b in 0..nb {
+                        let off = i * nb * bsz + b * bsz;
+                        let (dw, acc) = if q4 {
+                            let blk = unsafe { &*(weights.as_ptr().add(off) as *const BlockQ4_0) };
+                            let mut acc = 0i32;
+                            for t in 0..16 {
+                                let byte = blk.qs[t];
+                                acc += ((byte & 0xF) as i32 - 8) * bq[j * k + b * 32 + t] as i32;
+                                acc +=
+                                    ((byte >> 4) as i32 - 8) * bq[j * k + b * 32 + t + 16] as i32;
+                            }
+                            (half::f16::from_bits(blk.d).to_f32(), acc)
+                        } else {
+                            let blk = unsafe { &*(weights.as_ptr().add(off) as *const BlockQ8_0) };
+                            let mut acc = 0i32;
+                            for t in 0..32 {
+                                acc += blk.quants[t] as i32 * bq[j * k + b * 32 + t] as i32;
+                            }
+                            (half::f16::from_bits(blk.delta).to_f32(), acc)
+                        };
+                        sum += dw * bs[j * nb + b] * acc as f32;
+                    }
+                    out[i * n + j] = sum;
+                }
+            }
+            out
+        }
+
+        /// Runs on any AVX2 host, including one with no VNNI — where the
+        /// VNNI comparisons skip and this is the check that remains.
+        ///
+        /// The `1e-5` bound is chosen, not inherited, and it is worth being
+        /// precise about what it does and does not catch.
+        ///
+        /// It catches what this test exists for: `maddubs` saturating (which
+        /// moves the i32 accumulator by hundreds), a mis-scaled block, a
+        /// transposed index — errors that are a large fraction of the output.
+        /// It does *not* catch a single unit of the i32 accumulator on the Q8_0
+        /// arm: one unit is `d_w * d_x` absolute against an output built from
+        /// an accumulator of order 1e5, i.e. ~2e-6 relative, which sits inside
+        /// `1e-5` no matter how the fixture is scaled. That is a property of
+        /// `k`, not of the bound — a relative check cannot resolve one unit in
+        /// 1e5 without dropping below f32 summation noise (~1e-7). The Q4_0 arm,
+        /// whose accumulators are ~64x smaller, is the sensitive half.
+        ///
+        /// Bit-exact single-unit coverage comes from elsewhere and is not this
+        /// test's job: `avx2_row_tiled_matches_per_row_bit_exact` (no VNNI
+        /// needed) and the three `*_matches_vnni_bit_exact` tests compare bit
+        /// patterns, where one unit is a failure by construction.
+        ///
+        /// Mutation-checked rather than argued: injecting a one-unit per-lane
+        /// error into `dot32u` — which accumulates over lanes and blocks into
+        /// something this bound can see — fails this test, and removing it
+        /// passes. Honesty about that check: the `1e-3` this test used to carry
+        /// also failed on that mutation. What `1e-3` did not have was margin.
+        /// A saturating `maddubs` clamps an i16 that wanted to be larger, so
+        /// the error is the overshoot: marginal cases cost a unit or two, but a
+        /// genuinely out-of-range weight/activation pair costs hundreds — order
+        /// 1e-3 relative at this fixture, i.e. landing right on the old bound.
+        /// `1e-5` puts two orders between the bound and that case.
+        #[test]
+        fn avx2_gemm_matches_integer_reference() {
+            if !require_simd_or_skip("avx2", avx2_kernels_callable()) {
+                return;
+            }
+            let k = 128;
+            for (m, n) in SHAPES {
+                let mut st = 0x77aa_33ccu64;
+                let q4 = q4_0_rows(m, k, &mut st);
+                let q8 = q8_0_rows_with_extremes(m, k, &mut st);
+                let (bs, bq) = activations(n, k, &mut st);
+
+                let mut got = vec![0.0f32; m * n];
+                unsafe { gemm_q4_0_q8_0(&q4, &bs, &bq, &mut got, m, n, k) };
+                let want = ref_gemm(&q4, &bs, &bq, m, n, k, true);
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-5 * w.abs().max(1.0),
+                        "q4_0 {m}x{n} index {i}: {g} vs reference {w}"
+                    );
+                }
+
+                let mut got = vec![0.0f32; m * n];
+                unsafe { gemm_q8_0_q8_0(&q8, &bs, &bq, &mut got, m, n, k) };
+                let want = ref_gemm(&q8, &bs, &bq, m, n, k, false);
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-5 * w.abs().max(1.0),
+                        "q8_0 {m}x{n} index {i}: {g} vs reference {w}"
+                    );
+                }
+            }
+        }
+
+        /// GEMV coverage that runs on any AVX2 host.
+        ///
+        /// The GEMVs are NOT the GEMM at n=1 for Q4_0/Q8_0 — they go through
+        /// `row_dot_q4_0`/`row_dot_q8_0`, which the tiled GEMM never touches —
+        /// so the GEMM test above does not cover them. They are the production
+        /// decode path on every non-VNNI x86 host, where a wrong result is wrong
+        /// tokens rather than a crash.
+        #[test]
+        fn avx2_gemv_matches_integer_reference() {
+            if !require_simd_or_skip("avx2", avx2_kernels_callable()) {
+                return;
+            }
+            let k = 128;
+            for m in [1usize, 3, 8, 9, 16] {
+                let mut st = 0x2244_6688u64;
+                let q4 = q4_0_rows(m, k, &mut st);
+                let q8 = q8_0_rows_with_extremes(m, k, &mut st);
+                // One activation column, in the GEMV (not column-major) layout.
+                let (xs, xq) = activations(1, k, &mut st);
+
+                let mut got = vec![0.0f32; m];
+                unsafe { gemv_q4_0_q8_0(&q4, &xs, &xq, &mut got, m, k) };
+                let want = ref_gemm(&q4, &xs, &xq, m, 1, k, true);
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-5 * w.abs().max(1.0),
+                        "q4_0 gemv m={m} row {i}: {g} vs reference {w}"
+                    );
+                }
+
+                let mut got = vec![0.0f32; m];
+                unsafe { gemv_q8_0_q8_0(&q8, &xs, &xq, &mut got, m, k) };
+                let want = ref_gemm(&q8, &xs, &xq, m, 1, k, false);
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-5 * w.abs().max(1.0),
+                        "q8_0 gemv m={m} row {i}: {g} vs reference {w}"
+                    );
+                }
+            }
+        }
+
+        /// Row tiling must not change a single bit, at the AVX2 constants.
+        ///
+        /// The VNNI module has this property test already, but only at *its*
+        /// tile constants (8/4/4/8) and only on a host with VNNI. The shipping
+        /// AVX2 constants are 4/2/4/4, and a CI runner is not guaranteed to have
+        /// VNNI, so without this the strip kernel's agreement with the per-row
+        /// kernel can go unpinned exactly where the code runs. The integer-reference test
+        /// above would not catch a divergence that stays inside its `1e-5`
+        /// bound; equality of bit patterns admits nothing.
+        #[test]
+        fn avx2_row_tiled_matches_per_row_bit_exact() {
+            if !require_simd_or_skip("avx2", avx2_kernels_callable()) {
+                return;
+            }
+            // (m, n) against TILE_M = 2, STRIP_N = 4, TILE_N = 4: full strips
+            // plus a tail row, full tiles plus a column remainder, and both
+            // dimensions below one tile.
+            let shapes = [(13, 11), (16, 8), (1, 5), (8, 2), (9, 4), (3, 4)];
+            let k = 96;
+            let nb = k / 32;
+
+            for (m, n) in shapes {
+                let mut st = 0x9e37_79b9u64 ^ ((m * 131 + n) as u64);
+                let (b_scales, b_quants) = activations(n, k, &mut st);
+
+                let a4 = q4_0_rows(m, k, &mut st);
+                let a8 = q8_0_rows_with_extremes(m, k, &mut st);
+
+                let mut tiled = vec![0.0f32; m * n];
+                let mut per_row = vec![0.0f32; m * n];
+                unsafe { gemm_q4_0_q8_0(&a4, &b_scales, &b_quants, &mut tiled, m, n, k) };
+                let row_bytes = nb * size_of::<BlockQ4_0>();
+                for (r, out_row) in per_row.chunks_mut(n).enumerate() {
+                    // SAFETY: row `r` is in bounds — `a4` holds `m` rows of
+                    // `row_bytes`, and `out_row` is exactly `n` wide.
+                    unsafe {
+                        gemm_q4_0_row(
+                            a4.as_ptr().add(r * row_bytes),
+                            &b_scales,
+                            &b_quants,
+                            out_row,
+                            n,
+                            nb,
+                        )
+                    };
+                }
+                assert_same_bits_untiled(&per_row, &tiled, "q4_0", m, n);
+
+                let mut tiled = vec![0.0f32; m * n];
+                let mut per_row = vec![0.0f32; m * n];
+                unsafe { gemm_q8_0_q8_0(&a8, &b_scales, &b_quants, &mut tiled, m, n, k) };
+                let row_bytes = nb * size_of::<BlockQ8_0>();
+                for (r, out_row) in per_row.chunks_mut(n).enumerate() {
+                    // SAFETY: as above, for the Q8_0 row stride.
+                    unsafe {
+                        gemm_q8_0_row(
+                            a8.as_ptr().add(r * row_bytes),
+                            &b_scales,
+                            &b_quants,
+                            out_row,
+                            n,
+                            nb,
+                        )
+                    };
+                }
+                assert_same_bits_untiled(&per_row, &tiled, "q8_0", m, n);
+            }
+        }
+
+        /// Exact bit-pattern equality, reporting the first differing element.
+        fn assert_same_bits_untiled(per_row: &[f32], tiled: &[f32], tag: &str, m: usize, n: usize) {
+            if let Some((i, (x, y))) = per_row
+                .iter()
+                .zip(tiled)
+                .enumerate()
+                .find(|(_, (x, y))| x.to_bits() != y.to_bits())
+            {
+                panic!(
+                    "{tag} row-tiled diverged at {m}x{n} index {i} (row {}, col {}): \
+                     per-row {x:e} vs tiled {y:e}",
+                    i / n,
+                    i % n,
+                );
+            }
+        }
+
+        /// The gate must be ON here, not merely off at `Scalar`.
+        ///
+        /// `int8_gemm_gate.rs` and `unbatchable_warning.rs` assert only the
+        /// negative direction (false at `Scalar`). If `avx2_int8_available()`
+        /// regressed to require VNNI, every non-VNNI x86 host would silently
+        /// drop back to per-token prefill, both of those would still pass, and
+        /// the parity tests would print SKIP and report green — the exact
+        /// "green forever without running" failure they exist to prevent.
+        #[test]
+        fn avx2_host_reports_int8_gemm_available() {
+            // Two separate questions, and conflating them has now produced the
+            // same bug twice in this file's history:
+            //
+            //   1. Does the *hardware* have avx2+fma? That is what
+            //      `CERA_REQUIRE_SIMD=avx2` asks about, so it is the CPUID
+            //      check — a host without the ISA skips (or fails where CI says
+            //      the ISA is present).
+            //   2. Did the *tier* resolve to `Avx2` or above? A deliberate
+            //      `CERA_CPU_TIER=scalar` run on capable hardware answers no,
+            //      and that is not a failure — it is `int8_gemm_gate.rs`
+            //      pulling its lever. Skip rather than assert.
+            //
+            // Gating (1) on the tier made `CERA_CPU_TIER=scalar
+            // CERA_REQUIRE_SIMD=avx2` a hard failure; gating (2) on CPUID made
+            // the assert fire under a plain downgrade.
+            if !require_simd_or_skip("avx2", avx2_kernels_callable()) {
+                return;
+            }
+            if crate::backend::cpu_features::cpu_features().tier
+                < crate::backend::cpu_features::CpuTier::Avx2
+            {
+                return;
+            }
+            assert!(
+                crate::backend::cpu::int8_gemm_available(),
+                "avx2+fma detected and the tier is Avx2 or better, but \
+                 int8_gemm_available() is false — batched prefill and int8 \
+                 decode would silently disable on every AVX2 host"
+            );
+        }
+
+        /// A VNNI host must actually dispatch to the VNNI kernels.
+        ///
+        /// The emulation is bit-exact with `dpbusd`, which means no numeric
+        /// assertion anywhere can tell the two apart — and every VNNI test calls
+        /// `vnni::*` directly rather than through the dispatcher. So an arm that
+        /// stopped selecting VNNI would cost the whole native-`dpbusd` speedup
+        /// on every Zen 4/5 and Ice Lake host while CI stayed green forever.
+        /// Verified: narrowing `vnni_int8_available()` to `> Avx512Vnni` —
+        /// which no x86 tier satisfies, so VNNI is never selected — passed the
+        /// entire suite before this test existed.
+        #[cfg(feature = "avx512")]
+        #[test]
+        fn vnni_host_reports_vnni_kernels_available() {
+            if !require_simd_or_skip("avx512vnni", both_callable()) {
+                return;
+            }
+            // Same split as above: CPUID says the hardware can, the tier says
+            // whether we chose to. A downgrade run skips instead of failing.
+            if crate::backend::cpu_features::cpu_features().tier
+                < crate::backend::cpu_features::CpuTier::Avx512Vnni
+            {
+                return;
+            }
+            assert!(
+                super::super::super::cpu::vnni_int8_available(),
+                "host has VNNI and the tier resolved to Avx512Vnni, but \
+                 vnni_int8_available() is false — every VNNI host would run the \
+                 AVX2 emulation instead, at no numeric cost and full speed cost"
+            );
+        }
+
+        /// The K-quant decode path, on any AVX2 host.
+        ///
+        /// `gemv_q4k_f32`/`gemv_q6k_f32` are the whole Q4_K/Q6_K decode path on
+        /// every non-VNNI x86 box. They are thin, but "thin" is where a wrong
+        /// scratch resize or a transposed `n`/`k` lives, and the failure mode is
+        /// wrong tokens rather than a crash.
+        #[test]
+        fn avx2_k_quant_gemv_matches_gemm() {
+            if !require_simd_or_skip("avx2", avx2_kernels_callable()) {
+                return;
+            }
+            let (m, k) = (5usize, 512usize);
+            let sb = k / 256;
+            let mut st = 0x4b1d_7e11u64;
+            let (q4k, q6k) = k_quant_rows(m, sb, &mut st);
+
+            // A real f32 activation vector — the wrappers quantize it themselves,
+            // which is precisely the step under test.
+            let x: Vec<f32> = (0..k)
+                .map(|_| (lcg(&mut st) % 2001) as f32 / 1000.0 - 1.0)
+                .collect();
+            // The GEMM reference consumes the same activation, quantized by the
+            // same function the wrapper uses, at n = 1.
+            let mut xs = vec![0.0f32; k / 32];
+            let mut xq = vec![0i8; k];
+            crate::backend::cpu::quantize_f32_to_q8_0_into(&x, &mut xs, &mut xq);
+
+            for (tag, w) in [("q4_k", &q4k), ("q6_k", &q6k)] {
+                let (mut got, mut want) = (vec![0.0f32; m], vec![0.0f32; m]);
+                // Deliberately pre-dirtied and oversized: the wrapper must resize
+                // both scratch buffers, and a stale tail must not be read.
+                let mut s_scratch = vec![7.0f32; k];
+                let mut q_scratch = vec![7i8; k * 2];
+                unsafe {
+                    if tag == "q4_k" {
+                        gemv_q4k_f32(w, &x, &mut got, m, k, &mut s_scratch, &mut q_scratch);
+                        gemm_q4_k_q8_0(w, &xs, &xq, &mut want, m, 1, k);
+                    } else {
+                        gemv_q6k_f32(w, &x, &mut got, m, k, &mut s_scratch, &mut q_scratch);
+                        gemm_q6_k_q8_0(w, &xs, &xq, &mut want, m, 1, k);
+                    }
+                }
+                for (i, (g, wv)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        wv.to_bits(),
+                        "{tag} gemv row {i}: {g} vs gemm-at-n=1 {wv}"
+                    );
+                }
+            }
+        }
+
+        /// The invariant the parity bar rests on: decode and batched prefill must
+        /// compute the same thing.
+        ///
+        /// For Q4_K/Q6_K that holds by construction (the GEMV *is* the GEMM at
+        /// n = 1). For Q4_0/Q8_0 it does NOT — the GEMV runs `row_dot_*` while
+        /// the GEMM runs the tiled strip kernel — so it needs asserting, at the
+        /// AVX2 tile constants specifically. Without this, retuning TILE_M or
+        /// STRIP_N could break the 0.9999 parity bar with no unit test failing
+        /// on the hosts that run this code.
+        #[test]
+        fn avx2_gemv_matches_gemm_at_n1() {
+            if !require_simd_or_skip("avx2", avx2_kernels_callable()) {
+                return;
+            }
+            let k = 128;
+            for m in [1usize, 2, 3, 8, 9] {
+                let mut st = 0x33cc_55aau64;
+                let q4 = q4_0_rows(m, k, &mut st);
+                let q8 = q8_0_rows_with_extremes(m, k, &mut st);
+                let (xs, xq) = activations(1, k, &mut st);
+                for (tag, w, q4_0) in [("q4_0", &q4, true), ("q8_0", &q8, false)] {
+                    let (mut gemv, mut gemm) = (vec![0.0f32; m], vec![0.0f32; m]);
+                    unsafe {
+                        if q4_0 {
+                            gemv_q4_0_q8_0(w, &xs, &xq, &mut gemv, m, k);
+                            gemm_q4_0_q8_0(w, &xs, &xq, &mut gemm, m, 1, k);
+                        } else {
+                            gemv_q8_0_q8_0(w, &xs, &xq, &mut gemv, m, k);
+                            gemm_q8_0_q8_0(w, &xs, &xq, &mut gemm, m, 1, k);
+                        }
+                    }
+                    for (i, (a, b)) in gemv.iter().zip(&gemm).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{tag} m={m} row {i}: gemv {a} != gemm-at-n=1 {b} — decode and \
+                             prefill have diverged, which breaks the parity bar"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// K-quant coverage that runs on any AVX2 host.
+        ///
+        /// Mirrors `gemm_q4_k_avx512_matches_dequant_reference` but without the
+        /// VNNI gate. Without this, the Q4_K/Q6_K AVX2 kernels — live for every
+        /// Q4_K_M model on every non-VNNI x86 box, and carrying the recentring
+        /// and mins arithmetic that `q8_0_col_sums`/`dot16u` feed — are executed
+        /// by no test on the hosts that actually run them.
+        #[test]
+        fn avx2_k_quant_gemm_matches_dequant_reference() {
+            if !require_simd_or_skip("avx2", avx2_kernels_callable()) {
+                return;
+            }
+            let (m, n, k) = (3usize, 5usize, 512usize);
+            let sb = k / 256;
+            let mut st = 0x9f1e_2d3cu64;
+            let (q4k, q6k) = k_quant_rows(m, sb, &mut st);
+            let (bs, bq) = activations(n, k, &mut st);
+
+            let q4_row = sb * size_of::<crate::quant::BlockQ4KM>();
+            let q6_row = sb * size_of::<crate::quant::BlockQ6K>();
+            for (tag, weights, row_bytes) in [("q4_k", &q4k, q4_row), ("q6_k", &q6k, q6_row)] {
+                let mut got = vec![0.0f32; m * n];
+                unsafe {
+                    if tag == "q4_k" {
+                        gemm_q4_k_q8_0(weights, &bs, &bq, &mut got, m, n, k);
+                    } else {
+                        gemm_q6_k_q8_0(weights, &bs, &bq, &mut got, m, n, k);
+                    }
+                }
+                for i in 0..m {
+                    let mut w = vec![0.0f32; k];
+                    let row = &weights[i * row_bytes..(i + 1) * row_bytes];
+                    if tag == "q4_k" {
+                        crate::quant::dequantize_q4_k_m_row(row, &mut w);
+                    } else {
+                        crate::quant::dequantize_q6_k_row(row, &mut w);
+                    }
+                    for j in 0..n {
+                        let mut want = 0.0f64;
+                        for e in 0..k {
+                            let xa = bs[j * (k / 32) + e / 32] * bq[j * k + e] as f32;
+                            want += (w[e] * xa) as f64;
+                        }
+                        let g = got[i * n + j] as f64;
+                        assert!(
+                            // 1e-5, not the 1e-3 the older VNNI fixtures use:
+                            // instrumented, the real error here is 4e-6..1.7e-4,
+                            // and at 1e-3 a +/-1 error in the Q6_K recentring
+                            // term passes. This still leaves ~50x headroom.
+                            (g - want).abs() <= 1e-5 * (1.0 + want.abs()),
+                            "{tag} [{i},{j}]: got {g} want {want}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        #[cfg(feature = "avx512")]
+        fn avx2_q8_0_gemm_matches_vnni_bit_exact() {
+            if !require_simd_or_skip("avx512vnni", both_callable()) {
+                return;
+            }
+            let k = 128;
+            for (m, n) in SHAPES {
+                let mut st = 0xabcd_1234u64;
+                let w = q8_0_rows_with_extremes(m, k, &mut st);
+                let (bs, bq) = activations(n, k, &mut st);
+                let mut got = vec![0.0f32; m * n];
+                let mut want = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q8_0_q8_0(&w, &bs, &bq, &mut got, m, n, k);
+                    vnni::gemm_q8_0_q8_0(&w, &bs, &bq, &mut want, m, n, k);
+                }
+                assert_same_bits(&got, &want, &format!("q8_0 {m}x{n}"));
+            }
+        }
+
+        #[test]
+        #[cfg(feature = "avx512")]
+        fn avx2_q4_0_gemm_matches_vnni_bit_exact() {
+            if !require_simd_or_skip("avx512vnni", both_callable()) {
+                return;
+            }
+            let k = 128;
+            for (m, n) in SHAPES {
+                let mut st = 0x5eed_9911u64;
+                let w = q4_0_rows(m, k, &mut st);
+                let (bs, bq) = activations(n, k, &mut st);
+                let mut got = vec![0.0f32; m * n];
+                let mut want = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_0_q8_0(&w, &bs, &bq, &mut got, m, n, k);
+                    vnni::gemm_q4_0_q8_0(&w, &bs, &bq, &mut want, m, n, k);
+                }
+                assert_same_bits(&got, &want, &format!("q4_0 {m}x{n}"));
+            }
+        }
+
+        #[test]
+        #[cfg(feature = "avx512")]
+        fn avx2_k_quant_gemm_matches_vnni_bit_exact() {
+            if !require_simd_or_skip("avx512vnni", both_callable()) {
+                return;
+            }
+            let (m, n, k) = (3usize, 5usize, 512usize);
+            let sb = k / 256;
+            let mut st = 0x1357_2468u64;
+
+            let (q4k, q6k) = k_quant_rows(m, sb, &mut st);
+
+            let (bs, bq) = activations(n, k, &mut st);
+            for (tag, weights, is_q4k) in [("q4_k", &q4k, true), ("q6_k", &q6k, false)] {
+                let mut got = vec![0.0f32; m * n];
+                let mut want = vec![0.0f32; m * n];
+                unsafe {
+                    if is_q4k {
+                        gemm_q4_k_q8_0(weights, &bs, &bq, &mut got, m, n, k);
+                        vnni::gemm_q4_k_q8_0(weights, &bs, &bq, &mut want, m, n, k);
+                    } else {
+                        gemm_q6_k_q8_0(weights, &bs, &bq, &mut got, m, n, k);
+                        vnni::gemm_q6_k_q8_0(weights, &bs, &bq, &mut want, m, n, k);
+                    }
+                }
+                assert_same_bits(&got, &want, tag);
+            }
+        }
+    }
+}
+
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 pub(crate) mod avx512_vnni {
     // 1.89 `_mm512_*`/`_mm256_dpbusd_*` intrinsics vs the 1.85 MSRV — same
@@ -3458,17 +5424,21 @@ pub(crate) mod avx512_vnni {
     use super::*;
     use std::arch::x86_64::*;
 
-    /// Horizontal sum of the 8 f32 lanes. Called once per output element, never
-    /// inside the block loop — see the module note on accumulation.
-    #[target_feature(enable = "avx")]
-    unsafe fn hsum256_ps(v: __m256) -> f32 {
-        let hi = _mm256_extractf128_ps(v, 1);
-        let lo = _mm256_castps256_ps128(v);
-        let sum = _mm_add_ps(hi, lo);
-        let shuf = _mm_movehl_ps(sum, sum);
-        let sum = _mm_add_ps(sum, shuf);
-        let shuf = _mm_shuffle_ps(sum, sum, 0x55);
-        _mm_cvtss_f32(_mm_add_ss(sum, shuf))
+    /// Unsigned-weight int8 dot: the K-quant kernels hand `dpbusd` weights that
+    /// are already unsigned (Q4_K 0..15, Q6_K 0..63, or a literal 1 when summing
+    /// activations), so they need no sign trick — the instruction's operand
+    /// contract is met directly.
+    #[inline]
+    #[target_feature(enable = "avx2,avx512vl,avx512vnni")]
+    unsafe fn dot32u(w: __m256i, a: __m256i) -> __m256i {
+        _mm256_dpbusd_epi32(_mm256_setzero_si256(), w, a)
+    }
+
+    /// 128-bit `dot32u`, for Q6_K's 16-element sub-block activation sums.
+    #[inline]
+    #[target_feature(enable = "avx2,avx512vl,avx512vnni")]
+    unsafe fn dot16u(w: __m128i, a: __m128i) -> __m128i {
+        _mm_dpbusd_epi32(_mm_setzero_si128(), w, a)
     }
 
     /// int8 dot of one 32-element block → 8 int32 partial sums.
@@ -3480,8 +5450,14 @@ pub(crate) mod avx512_vnni {
     /// when `w < 0`, and negating `-128` wraps back to `-128`, silently flipping
     /// that lane's sign. Weights may be `-128` (only `|w|` is taken, and `0x80`
     /// is a valid u8 multiplicand); activations may not. Every activation
-    /// reaching here comes from `quantize_f32_to_q8_0_*`, which is bounded by
-    /// `amax / 127` and guards the non-finite case, so it cannot emit `-128`.
+    /// reaching here comes from `quantize_f32_to_q8_0_*`, which scales by
+    /// `127 / amax` and guards the non-finite case, so the rounded magnitude is
+    /// 127 (the worst case observed by exhaustive search over the f32 exponent
+    /// range is 127.00003, which rounds to 127). The one input that could reach
+    /// the quantizer's `-128.0` clamp is a block whose `amax` is denormal, where
+    /// `d = amax / 127` loses enough precision that `v * (1/d)` overshoots; that
+    /// block is harmless for a second reason — its `f16` scale is exactly 0.0,
+    /// so the lane contributes nothing whatever its sign.
     #[inline]
     #[target_feature(enable = "avx2,avx512vl,avx512vnni")]
     unsafe fn dot32(w: __m256i, a: __m256i) -> __m256i {
@@ -3490,20 +5466,9 @@ pub(crate) mod avx512_vnni {
         _mm256_dpbusd_epi32(_mm256_setzero_si256(), ax, sy)
     }
 
-    /// Unpack one Q4_0 block's 16 nibble-pairs into 32 signed bytes in
-    /// `[-8, 7]`. Low nibbles are elements 0..16, high nibbles 16..32 — the
-    /// same layout the NEON and scalar Q4_0 kernels assume.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    unsafe fn unpack_q4_0(qs: *const u8) -> __m256i {
-        unsafe {
-            let qb = _mm_loadu_si128(qs as *const __m128i);
-            let mask = _mm_set1_epi8(0x0F);
-            let lo = _mm_and_si128(qb, mask);
-            let hi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask);
-            _mm256_sub_epi8(_mm256_set_m128i(hi, lo), _mm256_set1_epi8(8))
-        }
-    }
+    // EVEX exposes 32 vector registers here, so the tiles are the wide ones:
+    // TILE_N=8 per-row columns, and a 4x4 (16-accumulator) row-tiled strip.
+    int8_gemm_kernels!("avx512f,avx512vl,avx512vnni,avx2,fma", 8, 4, 4, 8);
 
     /// Quantize `x` to Q8_0 blocks (scales + int8 quants).
     ///
@@ -3585,978 +5550,6 @@ pub(crate) mod avx512_vnni {
         }
     }
 
-    /// Dot one Q4_0 weight row against the pre-quantized activation.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    unsafe fn row_dot_q4_0(row: *const u8, x_scales: &[f32], x_quants: &[i8], nb: usize) -> f32 {
-        unsafe {
-            let bsz = size_of::<BlockQ4_0>();
-            let mut acc = _mm256_setzero_ps();
-            for b in 0..nb {
-                let block = &*(row.add(b * bsz) as *const BlockQ4_0);
-                let w = unpack_q4_0(block.qs.as_ptr());
-                let a = _mm256_loadu_si256(x_quants.as_ptr().add(b * 32) as *const __m256i);
-                let scale =
-                    _mm256_set1_ps(f16::from_bits(block.d).to_f32() * *x_scales.get_unchecked(b));
-                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
-            }
-            hsum256_ps(acc)
-        }
-    }
-
-    /// Dot one Q8_0 weight row against the pre-quantized activation.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    unsafe fn row_dot_q8_0(row: *const u8, x_scales: &[f32], x_quants: &[i8], nb: usize) -> f32 {
-        unsafe {
-            let bsz = size_of::<BlockQ8_0>();
-            let mut acc = _mm256_setzero_ps();
-            for b in 0..nb {
-                let block = &*(row.add(b * bsz) as *const BlockQ8_0);
-                let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
-                let a = _mm256_loadu_si256(x_quants.as_ptr().add(b * 32) as *const __m256i);
-                let scale = _mm256_set1_ps(
-                    f16::from_bits(block.delta).to_f32() * *x_scales.get_unchecked(b),
-                );
-                acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
-            }
-            hsum256_ps(acc)
-        }
-    }
-
-    /// Q4_0 weights × pre-quantized Q8_0 activations: `y[m] = A[m,k] @ x[k]`.
-    ///
-    /// Row-parallel over the **RowPool** above `gemv_par_threshold()`, matching
-    /// the NEON pre-quantized GEMV — decode dispatches these constantly, and
-    /// rayon's fork-join barrier per call is the wrong trade there.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    pub unsafe fn gemv_q4_0_q8_0_avx512(
-        a_quant: &[u8],
-        x_scales: &[f32],
-        x_quants: &[i8],
-        y: &mut [f32],
-        m: usize,
-        k: usize,
-    ) {
-        debug_assert_eq!(k % 32, 0, "Q4_0 GEMV: k must be divisible by 32");
-        let nb = k / 32;
-        let row_bytes = nb * size_of::<BlockQ4_0>();
-        debug_assert_eq!(a_quant.len(), m * row_bytes);
-        debug_assert_eq!(y.len(), m);
-        debug_assert!(x_scales.len() >= nb && x_quants.len() >= k);
-
-        let base = a_quant.as_ptr() as usize;
-        let compute_row = |(i, yi): (usize, &mut f32)| {
-            // SAFETY: row `i` spans `a_quant[i*row_bytes ..][..row_bytes]`, in
-            // bounds by the assert above; `y` rows are disjoint per worker.
-            *yi = unsafe {
-                row_dot_q4_0(
-                    (base as *const u8).add(i * row_bytes),
-                    x_scales,
-                    x_quants,
-                    nb,
-                )
-            };
-        };
-
-        if m >= crate::backend::cpu::gemv_par_threshold() {
-            crate::backend::cpu::par_rows(y, crate::backend::cpu::gemv_min_rows(), compute_row);
-        } else {
-            y.iter_mut().enumerate().for_each(compute_row);
-        }
-    }
-
-    /// Q8_0 weights × pre-quantized Q8_0 activations: `y[m] = A[m,k] @ x[k]`.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    pub unsafe fn gemv_q8_0_q8_0_avx512(
-        a_quant: &[u8],
-        x_scales: &[f32],
-        x_quants: &[i8],
-        y: &mut [f32],
-        m: usize,
-        k: usize,
-    ) {
-        debug_assert_eq!(k % 32, 0, "Q8_0 GEMV: k must be divisible by 32");
-        let nb = k / 32;
-        let row_bytes = nb * size_of::<BlockQ8_0>();
-        debug_assert_eq!(a_quant.len(), m * row_bytes);
-        debug_assert_eq!(y.len(), m);
-        debug_assert!(x_scales.len() >= nb && x_quants.len() >= k);
-
-        let base = a_quant.as_ptr() as usize;
-        let compute_row = |(i, yi): (usize, &mut f32)| {
-            // SAFETY: as in the Q4_0 GEMV above.
-            *yi = unsafe {
-                row_dot_q8_0(
-                    (base as *const u8).add(i * row_bytes),
-                    x_scales,
-                    x_quants,
-                    nb,
-                )
-            };
-        };
-
-        if m >= crate::backend::cpu::gemv_par_threshold() {
-            crate::backend::cpu::par_rows(y, crate::backend::cpu::gemv_min_rows(), compute_row);
-        } else {
-            y.iter_mut().enumerate().for_each(compute_row);
-        }
-    }
-
-    // ── Batched prefill GEMM ────────────────────────────────────────────────
-    //
-    // The point of these over a per-token GEMV loop: one weight row is decoded
-    // once and reused across `TILE_N` activation columns, so a prefill of `n`
-    // tokens streams the weight matrix `n / TILE_N` times instead of `n`, and the
-    // decode is amortized across the tile.
-    //
-    // NOTE: these per-row kernels are no longer the production path for the
-    // Q4_0/Q8_0 GEMMs — see "Row tiling" below, which processes `TILE_M` rows per
-    // task and reaches them only for the `m % TILE_M` tail. Read that block for
-    // the current cost model; in particular, "weight-bandwidth bound" is the
-    // wrong summary at these shapes (the activation panel is L2-resident and the
-    // binding constraint is loads and uops per `dot32`, not DRAM).
-    //
-    // Column-major activations: `quantize_columns` packs column `j` contiguously
-    // at `b_quants[j * k ..]` with scales at `b_scales[j * nb ..]`, so each of the
-    // `TILE_N` loads below is a straight 32-byte read.
-
-    /// Activation columns processed per weight decode, amortizing the decode
-    /// across the tile.
-    ///
-    /// Was 4, on the reasoning that 8 would spill "the 16 available ymm
-    /// registers". That premise is simply wrong: these kernels are inside
-    /// `#[target_feature(enable = "avx512f,avx512vl,...")]`, so EVEX exposes 32
-    /// vector registers, not 16. 8 accumulators plus the decoded weight fit
-    /// comfortably. (16 genuinely does spill, so the concern was real, just off
-    /// by 2x.)
-    ///
-    /// 8 measures faster than 4 on both dtypes. Interleaved A/B, 8 paired
-    /// rounds, 2048x512x2048, rayon pool fixed at 16 threads: Q4_0 626->660
-    /// GOP/s (+5.6%, paired t=7.15, 8/8 rounds), Q8_0 563->638 (+13.4%, t=16.81,
-    /// 8/8).
-    ///
-    /// CAVEAT: `microbench_gemm` can no longer reproduce that. It drives the
-    /// public GEMMs at m=2048, and since row tiling landed those dispatch every
-    /// full `TILE_M`-row strip to `gemm_*_strip` (which tiles by `STRIP_N`), so
-    /// `TILE_N` has no effect at that shape — the header it prints names a
-    /// constant it is not testing. `TILE_N` now governs only the `m % TILE_M`
-    /// tail, and production out-feature counts are multiples of 4, so it is
-    /// effectively unexercised in production. To re-tune it, drive
-    /// `gemm_*_row` directly or pick an `m` with `m % TILE_M != 0`.
-    ///
-    /// Getting a trustworthy number here took two tries, and the method is worth
-    /// recording. Unpinned, this host's run-to-run spread is ~2.8x (an identical
-    /// binary spanned 417-1154 GOP/s), because the GEMM parallelises over rows
-    /// and rayon's pool size/placement varies per process; pinning the pool
-    /// collapses that to ~9%. A first pass also left one arm at a ~0.2s window,
-    /// which on a boosting CPU just samples whatever clock state it landed in.
-    /// Both together made noise ~5x the effect and produced a false regression.
-    /// Interleaving arms controls for drift *between* arms; it does nothing about
-    /// a too-short window or per-process variance in the pool. Interleaving is
-    /// necessary, not sufficient — pin the pool and report the paired statistic.
-    ///
-    /// The tile width is still not where this kernel's time goes: it runs at
-    /// roughly 4% of this host's int8 peak. Each `dpbusd` drags along an
-    /// int32->float convert, a scalar load-multiply-broadcast of the combined
-    /// weight/activation scale, and a float FMA.
-    ///
-    /// Transposing `b_scales` to `[block][col]` is the obvious idea and does
-    /// *not* remove that scalar work: `vpdpbusd` yields 8 int32 lanes that are
-    /// partial sums of the *same* dot product, so the scale is a per-column
-    /// broadcast (`set1`), not a vector of 8 distinct column scales — the
-    /// transpose can only make the tiny scale loads more contiguous, which is
-    /// not the bottleneck. The structural fix was row tiling — feed each
-    /// activation load to several weight rows, as the GPU kernel does (#267) —
-    /// and that has since shipped: see "Row tiling" below, which also lists the
-    /// headroom that remains.
-    const TILE_N: usize = 8;
-
-    /// One output row of the Q4_0 GEMM: `out[j] = <A_row, B_col_j>` for all `n`.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    unsafe fn gemm_q4_0_row(
-        row: *const u8,
-        b_scales: &[f32],
-        b_quants: &[i8],
-        out_row: &mut [f32],
-        n: usize,
-        nb: usize,
-    ) {
-        unsafe {
-            let bsz = size_of::<BlockQ4_0>();
-            let k = nb * 32;
-            let mut j = 0;
-
-            while j + TILE_N <= n {
-                let mut acc = [_mm256_setzero_ps(); TILE_N];
-                for b in 0..nb {
-                    let block = &*(row.add(b * bsz) as *const BlockQ4_0);
-                    let dw = f16::from_bits(block.d).to_f32();
-                    let w = unpack_q4_0(block.qs.as_ptr());
-                    for (t, a_t) in acc.iter_mut().enumerate() {
-                        let col = j + t;
-                        let a = _mm256_loadu_si256(
-                            b_quants.as_ptr().add(col * k + b * 32) as *const __m256i
-                        );
-                        let scale = _mm256_set1_ps(dw * *b_scales.get_unchecked(col * nb + b));
-                        *a_t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, *a_t);
-                    }
-                }
-                for (t, a_t) in acc.iter().enumerate() {
-                    *out_row.get_unchecked_mut(j + t) = hsum256_ps(*a_t);
-                }
-                j += TILE_N;
-            }
-
-            // Column remainder (n % TILE_N). Same math, one column at a time.
-            while j < n {
-                let mut acc = _mm256_setzero_ps();
-                for b in 0..nb {
-                    let block = &*(row.add(b * bsz) as *const BlockQ4_0);
-                    let w = unpack_q4_0(block.qs.as_ptr());
-                    let a =
-                        _mm256_loadu_si256(b_quants.as_ptr().add(j * k + b * 32) as *const __m256i);
-                    let scale = _mm256_set1_ps(
-                        f16::from_bits(block.d).to_f32() * *b_scales.get_unchecked(j * nb + b),
-                    );
-                    acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
-                }
-                *out_row.get_unchecked_mut(j) = hsum256_ps(acc);
-                j += 1;
-            }
-        }
-    }
-
-    /// One output row of the Q8_0 GEMM.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    unsafe fn gemm_q8_0_row(
-        row: *const u8,
-        b_scales: &[f32],
-        b_quants: &[i8],
-        out_row: &mut [f32],
-        n: usize,
-        nb: usize,
-    ) {
-        unsafe {
-            let bsz = size_of::<BlockQ8_0>();
-            let k = nb * 32;
-            let mut j = 0;
-
-            while j + TILE_N <= n {
-                let mut acc = [_mm256_setzero_ps(); TILE_N];
-                for b in 0..nb {
-                    let block = &*(row.add(b * bsz) as *const BlockQ8_0);
-                    let dw = f16::from_bits(block.delta).to_f32();
-                    let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
-                    for (t, a_t) in acc.iter_mut().enumerate() {
-                        let col = j + t;
-                        let a = _mm256_loadu_si256(
-                            b_quants.as_ptr().add(col * k + b * 32) as *const __m256i
-                        );
-                        let scale = _mm256_set1_ps(dw * *b_scales.get_unchecked(col * nb + b));
-                        *a_t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, *a_t);
-                    }
-                }
-                for (t, a_t) in acc.iter().enumerate() {
-                    *out_row.get_unchecked_mut(j + t) = hsum256_ps(*a_t);
-                }
-                j += TILE_N;
-            }
-
-            while j < n {
-                let mut acc = _mm256_setzero_ps();
-                for b in 0..nb {
-                    let block = &*(row.add(b * bsz) as *const BlockQ8_0);
-                    let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
-                    let a =
-                        _mm256_loadu_si256(b_quants.as_ptr().add(j * k + b * 32) as *const __m256i);
-                    let scale = _mm256_set1_ps(
-                        f16::from_bits(block.delta).to_f32() * *b_scales.get_unchecked(j * nb + b),
-                    );
-                    acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
-                }
-                *out_row.get_unchecked_mut(j) = hsum256_ps(acc);
-                j += 1;
-            }
-        }
-    }
-
-    // ── Row tiling ──────────────────────────────────────────────────────────
-    //
-    // The per-row kernels above parallelise one weight row per task and re-read
-    // the entire `n*k` activation panel for every row.
-    //
-    // What that costs is **load-port pressure, not DRAM bandwidth** — say this
-    // precisely, because the obvious bandwidth story is wrong and misleads the
-    // next tuning pass. At the benchmark shape (2048x512x2048) the activation
-    // panel is n*k + n*nb*4 = 1.18 MB, so it is L2-resident and those re-reads
-    // are cache hits; the only thing streaming from memory is ~4.3 MB of weights,
-    // read once. The per-row TILE_N=8 kernel issues 1 weight + 1 f16 + 8
-    // activation + 8 scale loads per 8 `dot32` (2.25 loads/dot32); a 4x4 strip
-    // issues 4+4+4+4 per 16 (1.00), and carries 16 independent accumulator chains
-    // instead of 8 to hide `vpdpbusd` latency. That is the mechanism.
-    //
-    // Measured against the per-row driver by `microbench_gemm_rowtile`, 8 paired
-    // rounds with alternating arm order, pseudo-random activations, on an idle
-    // host — three repetitions: **Q8_0 +19.1/+24.1/+21.8%, Q4_0
-    // +19.8/+18.9/+19.0%, 8/8 rounds won in all six** (~250 -> ~305 GOP/s).
-    //
-    // Two measurement notes, both learned the hard way here. Constant-filled
-    // activations inflate *absolute* throughput ~2x (both arms run out of a
-    // trivially-predictable working set) and distort the ratio, so the benchmark
-    // quantizes real pseudo-random columns. And a contended machine collapses the
-    // effect to low single digits while looking like a valid run — take these
-    // numbers on an otherwise idle host or not at all.
-    //
-    // Output is bit-identical to the per-row path; that is enforced by
-    // `gemm_avx512_row_tiled_matches_per_row_bit_exact`, which runs in CI, not by
-    // the ignored benchmark.
-    //
-    // Known headroom, in the order worth attacking:
-    //   1. Weight decode is redone per column tile — `w`/`dw` are hoisted out of
-    //      the `t` loop but not out of the `j` loop, so a row's blocks are decoded
-    //      n/STRIP_N times against a theoretical `nb`. That is 2x more f16->f32
-    //      converts and `unpack_q4_0` calls than the TILE_N=8 per-row kernel did,
-    //      and is the likeliest reason Q4_0 (which pays the nibble unpack) gains
-    //      less than Q8_0. A per-strip decode buffer is 8 KB, L1-resident.
-    //   2. `_mm256_set1_ps(dw[r] * da)` sits in the innermost loop: 16 broadcasts
-    //      per (block, tile) where 8 would do, on a port that is already busy.
-    //   3. No blocking over `n`. Each strip still walks the whole panel, so at
-    //      large `k` (e.g. ffn_down, k=8192) the panel leaves L2 and the real
-    //      bandwidth story finally does apply.
-    //
-    // The trade-off is granularity: this divides the parallel task count by
-    // `TILE_M`. `m` is a projection's out-feature count, and the small end is a
-    // GQA kv_dim — 128 for a 2-KV-head model, i.e. 32 strips against this host's
-    // 32 workers, one per worker with no stealing slack (an MQA kv_dim of 64
-    // leaves half the pool idle). The strip still wins at those shapes (measured
-    // +184%/+103%/+35% at m=64/128/512, 6/6 rounds) because they are nowhere near
-    // thread-bound, but the pool is underfed there and a 2-D split over strips x
-    // n-panels is the fix if that ever matters.
-
-    /// Weight rows per strip.
-    const TILE_M: usize = 4;
-
-    /// Activation columns per accumulator tile inside a strip. `TILE_M *
-    /// STRIP_N` fp32 accumulators must fit the register file with room for the
-    /// `TILE_M` decoded weights, the shared activation, and temporaries: 4x4 =
-    /// 16 leaves half of EVEX's 32 registers free and measured fastest. The
-    /// 24-accumulator shapes (6x4, 4x6) spill and regress; this is distinct from
-    /// the per-row `TILE_N = 8`, which tiles one row against 8 columns.
-    const STRIP_N: usize = 4;
-
-    /// One strip of `TILE_M` consecutive Q8_0 weight rows against all `n`
-    /// columns. `rows` points at the first row; rows are `row_bytes` apart and
-    /// `out` is `TILE_M * n` row-major.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    unsafe fn gemm_q8_0_strip(
-        rows: *const u8,
-        row_bytes: usize,
-        b_scales: &[f32],
-        b_quants: &[i8],
-        out: &mut [f32],
-        n: usize,
-        nb: usize,
-    ) {
-        // The kernel indexes `out` unchecked up to `TILE_M * n - 1` and reads
-        // `TILE_M` whole weight rows behind `rows`, so state the output half of
-        // that contract here rather than relying on the caller's arithmetic.
-        debug_assert_eq!(out.len(), TILE_M * n);
-        debug_assert_eq!(b_quants.len(), n * nb * 32);
-        debug_assert_eq!(b_scales.len(), n * nb);
-        unsafe {
-            let bsz = size_of::<BlockQ8_0>();
-            let k = nb * 32;
-            let mut j = 0;
-            // The tile loops carry numeric meaning beyond the index (`col = j +
-            // t`, weight offset `r * row_bytes`, output offset `r * n + j + t`),
-            // so range loops read more directly than zipped iterators.
-            #[allow(clippy::needless_range_loop)]
-            while j + STRIP_N <= n {
-                let mut acc = [[_mm256_setzero_ps(); STRIP_N]; TILE_M];
-                for b in 0..nb {
-                    // Decode the TILE_M weight blocks once, reused across cols.
-                    let mut w = [_mm256_setzero_si256(); TILE_M];
-                    let mut dw = [0.0f32; TILE_M];
-                    for r in 0..TILE_M {
-                        let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ8_0);
-                        w[r] = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
-                        dw[r] = f16::from_bits(block.delta).to_f32();
-                    }
-                    for t in 0..STRIP_N {
-                        let col = j + t;
-                        // One activation load, fed to every row in the strip.
-                        let a = _mm256_loadu_si256(
-                            b_quants.as_ptr().add(col * k + b * 32) as *const __m256i
-                        );
-                        let da = *b_scales.get_unchecked(col * nb + b);
-                        for r in 0..TILE_M {
-                            let prod = _mm256_cvtepi32_ps(dot32(w[r], a));
-                            let scale = _mm256_set1_ps(dw[r] * da);
-                            acc[r][t] = _mm256_fmadd_ps(prod, scale, acc[r][t]);
-                        }
-                    }
-                }
-                for r in 0..TILE_M {
-                    for t in 0..STRIP_N {
-                        *out.get_unchecked_mut(r * n + j + t) = hsum256_ps(acc[r][t]);
-                    }
-                }
-                j += STRIP_N;
-            }
-            // Column remainder (n % STRIP_N). The block loop is outermost so the
-            // single activation load is still shared across the strip's rows and
-            // the TILE_M accumulator chains stay independent — the same reuse the
-            // tile loop gets, just one column wide. Per (row, column) the fmadd
-            // order over `b` is unchanged, so this stays bit-identical to the
-            // per-row kernel.
-            #[allow(clippy::needless_range_loop)]
-            while j < n {
-                let mut acc = [_mm256_setzero_ps(); TILE_M];
-                for b in 0..nb {
-                    let a =
-                        _mm256_loadu_si256(b_quants.as_ptr().add(j * k + b * 32) as *const __m256i);
-                    let da = *b_scales.get_unchecked(j * nb + b);
-                    for r in 0..TILE_M {
-                        let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ8_0);
-                        let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
-                        let scale = _mm256_set1_ps(f16::from_bits(block.delta).to_f32() * da);
-                        acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc[r]);
-                    }
-                }
-                for (r, acc_r) in acc.iter().enumerate() {
-                    *out.get_unchecked_mut(r * n + j) = hsum256_ps(*acc_r);
-                }
-                j += 1;
-            }
-        }
-    }
-
-    /// One strip of `TILE_M` consecutive Q4_0 weight rows. Mirrors
-    /// `gemm_q8_0_strip`; the only differences are the block type and the nibble
-    /// unpack that produces each weight register.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    unsafe fn gemm_q4_0_strip(
-        rows: *const u8,
-        row_bytes: usize,
-        b_scales: &[f32],
-        b_quants: &[i8],
-        out: &mut [f32],
-        n: usize,
-        nb: usize,
-    ) {
-        // Same unchecked contract as `gemm_q8_0_strip`.
-        debug_assert_eq!(out.len(), TILE_M * n);
-        debug_assert_eq!(b_quants.len(), n * nb * 32);
-        debug_assert_eq!(b_scales.len(), n * nb);
-        unsafe {
-            let bsz = size_of::<BlockQ4_0>();
-            let k = nb * 32;
-            let mut j = 0;
-            #[allow(clippy::needless_range_loop)]
-            while j + STRIP_N <= n {
-                let mut acc = [[_mm256_setzero_ps(); STRIP_N]; TILE_M];
-                for b in 0..nb {
-                    let mut w = [_mm256_setzero_si256(); TILE_M];
-                    let mut dw = [0.0f32; TILE_M];
-                    for r in 0..TILE_M {
-                        let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ4_0);
-                        w[r] = unpack_q4_0(block.qs.as_ptr());
-                        dw[r] = f16::from_bits(block.d).to_f32();
-                    }
-                    for t in 0..STRIP_N {
-                        let col = j + t;
-                        let a = _mm256_loadu_si256(
-                            b_quants.as_ptr().add(col * k + b * 32) as *const __m256i
-                        );
-                        let da = *b_scales.get_unchecked(col * nb + b);
-                        for r in 0..TILE_M {
-                            let prod = _mm256_cvtepi32_ps(dot32(w[r], a));
-                            let scale = _mm256_set1_ps(dw[r] * da);
-                            acc[r][t] = _mm256_fmadd_ps(prod, scale, acc[r][t]);
-                        }
-                    }
-                }
-                for r in 0..TILE_M {
-                    for t in 0..STRIP_N {
-                        *out.get_unchecked_mut(r * n + j + t) = hsum256_ps(acc[r][t]);
-                    }
-                }
-                j += STRIP_N;
-            }
-            // Column remainder — block loop outermost, as in `gemm_q8_0_strip`.
-            // `r` indexes both `acc` and the weight-row offset, so a range loop
-            // is the direct spelling here.
-            #[allow(clippy::needless_range_loop)]
-            while j < n {
-                let mut acc = [_mm256_setzero_ps(); TILE_M];
-                for b in 0..nb {
-                    let a =
-                        _mm256_loadu_si256(b_quants.as_ptr().add(j * k + b * 32) as *const __m256i);
-                    let da = *b_scales.get_unchecked(j * nb + b);
-                    for r in 0..TILE_M {
-                        let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ4_0);
-                        let w = unpack_q4_0(block.qs.as_ptr());
-                        let scale = _mm256_set1_ps(f16::from_bits(block.d).to_f32() * da);
-                        acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc[r]);
-                    }
-                }
-                for (r, acc_r) in acc.iter().enumerate() {
-                    *out.get_unchecked_mut(r * n + j) = hsum256_ps(*acc_r);
-                }
-                j += 1;
-            }
-        }
-    }
-
-    /// Batched Q4_0 × Q8_0 GEMM: `out[m,n] = A_q4_0[m,k] @ B_q8_0[k,n]`,
-    /// parallel over strips of `TILE_M` output rows.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    pub unsafe fn gemm_q4_0_q8_0_avx512(
-        a_quant: &[u8],
-        b_scales: &[f32],
-        b_quants: &[i8],
-        out: &mut [f32],
-        m: usize,
-        n: usize,
-        k: usize,
-    ) {
-        debug_assert_eq!(k % 32, 0, "GEMM: k must be divisible by 32");
-        let nb = k / 32;
-        let row_bytes = nb * size_of::<BlockQ4_0>();
-        debug_assert_eq!(a_quant.len(), m * row_bytes);
-        debug_assert_eq!(b_quants.len(), n * k);
-        debug_assert_eq!(b_scales.len(), n * nb);
-        debug_assert_eq!(out.len(), m * n);
-
-        // One `TILE_M`-row strip per chunk; the final chunk may be short
-        // (`m % TILE_M`) and is finished row-by-row.
-        //
-        // This must stay a closure inside this `#[target_feature]` fn: closures
-        // inherit the enclosing function's feature set, so the strip and row
-        // kernels inline here with AVX-512 codegen. Hoisting it to a free `fn`
-        // would silently drop the features and un-inline both kernels.
-        let handle = |out_chunk: &mut [f32], s: usize| {
-            // Strip `s` owns rows `s * TILE_M ..` — `rows_here` of them, which is
-            // `TILE_M` for every chunk but a short final one. Compare against the
-            // exact byte length rather than a truncating division so a chunk that
-            // is not a whole number of rows takes the row path instead of
-            // silently entering the strip kernel.
-            let rows_here = out_chunk.len() / n;
-            // SAFETY: strip `s` reads `a_quant[s * TILE_M * row_bytes ..]` for
-            // `rows_here * row_bytes` bytes — up to `TILE_M * row_bytes`, not one
-            // row — which is in bounds because `out.len() == m * n` bounds `s` and
-            // `a_quant.len() == m * row_bytes`. Reads are shared and read-only;
-            // the write goes only to this task's disjoint `out_chunk`.
-            unsafe {
-                let rows = a_quant.as_ptr().add(s * TILE_M * row_bytes);
-                if out_chunk.len() == TILE_M * n {
-                    gemm_q4_0_strip(rows, row_bytes, b_scales, b_quants, out_chunk, n, nb);
-                } else {
-                    debug_assert_eq!(out_chunk.len(), rows_here * n);
-                    for (r, out_row) in out_chunk.chunks_mut(n).enumerate() {
-                        gemm_q4_0_row(rows.add(r * row_bytes), b_scales, b_quants, out_row, n, nb);
-                    }
-                }
-            }
-        };
-
-        #[cfg(feature = "parallel")]
-        {
-            use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
-            out.par_chunks_mut(TILE_M * n)
-                .enumerate()
-                .for_each(|(s, out_chunk)| handle(out_chunk, s));
-        }
-        #[cfg(not(feature = "parallel"))]
-        for (s, out_chunk) in out.chunks_mut(TILE_M * n).enumerate() {
-            handle(out_chunk, s);
-        }
-    }
-
-    /// Batched Q8_0 × Q8_0 GEMM: `out[m,n] = A_q8_0[m,k] @ B_q8_0[k,n]`.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    pub unsafe fn gemm_q8_0_q8_0_avx512(
-        a_quant: &[u8],
-        b_scales: &[f32],
-        b_quants: &[i8],
-        out: &mut [f32],
-        m: usize,
-        n: usize,
-        k: usize,
-    ) {
-        debug_assert_eq!(k % 32, 0, "GEMM: k must be divisible by 32");
-        let nb = k / 32;
-        let row_bytes = nb * size_of::<BlockQ8_0>();
-        debug_assert_eq!(a_quant.len(), m * row_bytes);
-        debug_assert_eq!(b_quants.len(), n * k);
-        debug_assert_eq!(b_scales.len(), n * nb);
-        debug_assert_eq!(out.len(), m * n);
-
-        // One `TILE_M`-row strip per chunk; short final chunk row-by-row. Must
-        // stay a closure for the target-feature reason given in the Q4_0 GEMM.
-        let handle = |out_chunk: &mut [f32], s: usize| {
-            let rows_here = out_chunk.len() / n;
-            // SAFETY: as in the Q4_0 GEMM above — up to `TILE_M * row_bytes`.
-            unsafe {
-                let rows = a_quant.as_ptr().add(s * TILE_M * row_bytes);
-                if out_chunk.len() == TILE_M * n {
-                    gemm_q8_0_strip(rows, row_bytes, b_scales, b_quants, out_chunk, n, nb);
-                } else {
-                    debug_assert_eq!(out_chunk.len(), rows_here * n);
-                    for (r, out_row) in out_chunk.chunks_mut(n).enumerate() {
-                        gemm_q8_0_row(rows.add(r * row_bytes), b_scales, b_quants, out_row, n, nb);
-                    }
-                }
-            }
-        };
-
-        #[cfg(feature = "parallel")]
-        {
-            use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
-            out.par_chunks_mut(TILE_M * n)
-                .enumerate()
-                .for_each(|(s, out_chunk)| handle(out_chunk, s));
-        }
-        #[cfg(not(feature = "parallel"))]
-        for (s, out_chunk) in out.chunks_mut(TILE_M * n).enumerate() {
-            handle(out_chunk, s);
-        }
-    }
-
-    // ── K-quant int8 kernels ────────────────────────────────────────────────
-    //
-    // NOT row-tiled, deliberately — measured, not assumed. The Q4_0/Q8_0 GEMMs
-    // above process `TILE_M` weight rows per task ("Row tiling"); these stay
-    // per-row. Q4_K/Q6_K reduce each `vpdpbusd` to a scalar immediately (an hsum
-    // per block) and carry a per-sub-block scale plus a mins correction, so there
-    // is no vector-accumulator ILP for tiling to expose — only activation-load
-    // reuse, against much heavier per-block work. A row-tiled Q4_K prototype
-    // measured **-9.3% at 4x8 and -17% at 4x4, 0/8 rounds won in both**. Q6_K was
-    // not prototyped; it shares the structure with more per-block work still (qh
-    // reconstruction, two hsums per column). Note also that the K-quant GEMV *is*
-    // this GEMM at n=1, so tiling here would have to not regress decode.
-    //
-    // x86 analogue of the NEON K-quant GEMM family. Two structural differences,
-    // both forced by `vpdpbusd` taking an *unsigned* × signed operand pair:
-    //
-    //  - Q4_K nibbles (0..15) and Q6_K quants (0..63) stay unsigned and go in
-    //    the u8 operand directly — no sign trick, unlike Q4_0, which recenters
-    //    by −8 at decode and needs one.
-    //  - Q6_K's −32 recentering cannot be baked into the weights as NEON does
-    //    (that would make them signed). It is applied algebraically instead:
-    //    Σ((q−32)·a) = Σ(q·a) − 32·Σa, with Σa precomputed per column at
-    //    *16-element* granularity because Q6_K scales are 16-wide.
-    //
-    // `vpdpbusd` (the non-saturating form) is safe here: per-lane sums are
-    // bounded (≤ 4·63·127) and every lane accumulator is hsummed and reset per
-    // sub-block, so the i32 accumulator cannot overflow.
-
-    /// Column tile width. Decoding a K-quant super-block is the expensive part;
-    /// applying each decoded group to `KQ_COLS` activation columns amortizes
-    /// it — mirrors the NEON kernels' choice of 8.
-    const KQ_COLS: usize = 8;
-
-    /// Horizontal sum of 8 i32 lanes.
-    #[target_feature(enable = "avx2")]
-    unsafe fn hsum256_epi32(v: __m256i) -> i32 {
-        let s = _mm_add_epi32(_mm256_extracti128_si256(v, 1), _mm256_castsi256_si128(v));
-        let s = _mm_add_epi32(s, _mm_srli_si128(s, 8));
-        let s = _mm_add_epi32(s, _mm_srli_si128(s, 4));
-        _mm_cvtsi128_si32(s)
-    }
-
-    /// Horizontal sum of 4 i32 lanes.
-    #[target_feature(enable = "avx2")]
-    unsafe fn hsum128_epi32(v: __m128i) -> i32 {
-        let s = _mm_add_epi32(v, _mm_srli_si128(v, 8));
-        let s = _mm_add_epi32(s, _mm_srli_si128(s, 4));
-        _mm_cvtsi128_si32(s)
-    }
-
-    /// Per-column, per-32-element-block sums of the Q8_0 activation quants:
-    /// `sums[j * (k/32) + b]`. The Q4_K mins term consumes these.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    unsafe fn q8_0_col_sums(b_quants: &[i8], n: usize, k: usize) -> Vec<i32> {
-        unsafe {
-            let nb32 = k / 32;
-            let mut sums = vec![0i32; n * nb32];
-            let ones = _mm256_set1_epi8(1);
-            let z = _mm256_setzero_si256();
-            for j in 0..n {
-                let base = b_quants.as_ptr().add(j * k);
-                for b in 0..nb32 {
-                    let x = _mm256_loadu_si256(base.add(b * 32) as *const __m256i);
-                    sums[j * nb32 + b] = hsum256_epi32(_mm256_dpbusd_epi32(z, ones, x));
-                }
-            }
-            sums
-        }
-    }
-
-    /// Same, at 16-element granularity: `sums16[j * (k/16) + h]`. Q6_K scales
-    /// are 16-wide, so its recentering needs half-block activation sums.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    unsafe fn q8_0_col_sums16(b_quants: &[i8], n: usize, k: usize) -> Vec<i32> {
-        unsafe {
-            let nh = k / 16;
-            let mut sums = vec![0i32; n * nh];
-            let ones = _mm_set1_epi8(1);
-            let z = _mm_setzero_si128();
-            for j in 0..n {
-                let base = b_quants.as_ptr().add(j * k);
-                for h in 0..nh {
-                    let x = _mm_loadu_si128(base.add(h * 16) as *const __m128i);
-                    sums[j * nh + h] = hsum128_epi32(_mm_dpbusd_epi32(z, ones, x));
-                }
-            }
-            sums
-        }
-    }
-
-    /// Batched GEMM: `C[m, n] = A_q4_k[m, k] @ B_q8_0[k, n]`.
-    ///
-    /// Layout contract matches the Q4_0/Q8_0 GEMMs (`b_scales[n][k/32]`,
-    /// `b_quants[n][k]`), structure matches the NEON twin: decode each
-    /// super-block group once, apply to `KQ_COLS` columns. Per sub-block `s`
-    /// the contribution is `xs·(d·sc_s·Σ(q·aq) − dmin·mn_s·Σaq)`.
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    pub unsafe fn gemm_q4_k_q8_0_avx512(
-        a_quant: &[u8],
-        b_scales: &[f32],
-        b_quants: &[i8],
-        out: &mut [f32],
-        m: usize,
-        n: usize,
-        k: usize,
-    ) {
-        debug_assert_eq!(k % 256, 0, "Q4_K GEMM: k must be divisible by 256");
-        let sb = k / 256;
-        let nb32 = k / 32;
-        let row_bytes = sb * size_of::<crate::quant::BlockQ4KM>();
-        debug_assert_eq!(a_quant.len(), m * row_bytes, "Q4_K GEMM: a_quant size");
-        debug_assert_eq!(b_quants.len(), n * k, "Q4_K GEMM: b_quants size");
-        debug_assert_eq!(b_scales.len(), n * nb32, "Q4_K GEMM: b_scales size");
-        debug_assert_eq!(out.len(), m * n, "Q4_K GEMM: out size");
-
-        let col_sums = unsafe { q8_0_col_sums(b_quants, n, k) };
-        let cs: &[i32] = &col_sums;
-
-        // Slices captured by reference — Send, no pointer→usize laundering.
-        let compute_row = |(i, row_out): (usize, &mut [f32])| {
-            // SAFETY: row `i` spans `a_quant[i*row_bytes..][..row_bytes]`; the
-            // debug_asserts above pin every slice length.
-            unsafe {
-                let mask_0f = _mm256_set1_epi8(0x0F);
-                let z = _mm256_setzero_si256();
-                let row_start = i * row_bytes;
-
-                let mut j0 = 0usize;
-                while j0 < n {
-                    let cols = KQ_COLS.min(n - j0);
-                    let mut acc = [0.0f32; KQ_COLS];
-
-                    for bi in 0..sb {
-                        let blk = &*(a_quant
-                            .as_ptr()
-                            .add(row_start + bi * size_of::<crate::quant::BlockQ4KM>())
-                            as *const crate::quant::BlockQ4KM);
-                        let d = half::f16::from_bits(blk.d).to_f32();
-                        let dmin = half::f16::from_bits(blk.dmin).to_f32();
-                        let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
-                        let qs = blk.qs.as_ptr();
-
-                        for g in 0..4 {
-                            // Chunk g: low nibbles = sub-block 2g, high = 2g+1;
-                            // byte l is element l of its sub-block, matching the
-                            // contiguous 32-quant activation block.
-                            let qb = _mm256_loadu_si256(qs.add(g * 32) as *const __m256i);
-                            let w_lo = _mm256_and_si256(qb, mask_0f);
-                            let w_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), mask_0f);
-
-                            for (w, s) in [(w_lo, 2 * g), (w_hi, 2 * g + 1)] {
-                                let xb = bi * 8 + s;
-                                let dsc = d * sc[s] as f32;
-                                let dmn = dmin * mn[s] as f32;
-                                for (jj, acc_j) in acc.iter_mut().enumerate().take(cols) {
-                                    let j = j0 + jj;
-                                    let x =
-                                        _mm256_loadu_si256(b_quants.as_ptr().add(j * k + xb * 32)
-                                            as *const __m256i);
-                                    let dp = hsum256_epi32(_mm256_dpbusd_epi32(z, w, x));
-                                    let xs = *b_scales.get_unchecked(j * nb32 + xb);
-                                    let sx = *cs.get_unchecked(j * nb32 + xb);
-                                    *acc_j += xs * (dsc * dp as f32 - dmn * sx as f32);
-                                }
-                            }
-                        }
-                    }
-
-                    row_out[j0..j0 + cols].copy_from_slice(&acc[..cols]);
-                    j0 += cols;
-                }
-            }
-        };
-
-        if m >= crate::backend::cpu::gemv_par_threshold() {
-            crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
-        } else {
-            out.chunks_mut(n).enumerate().for_each(compute_row);
-        }
-    }
-
-    /// Batched GEMM: `C[m, n] = A_q6_k[m, k] @ B_q8_0[k, n]`.
-    ///
-    /// Q6_K geometry (mirrors `dequantize_q6_k_block`): two 128-value halves per
-    /// super-block (`ql += 64`, `qh += 32`, `sc += 8`); half `nh`, group `g`
-    /// covers elements `nh*128 + g*32..+32` with quants
-    /// `(ql[(g&1)*32 + l] nibble(g<2 ? lo : hi)) | (((qh[l] >> 2g) & 3) << 4)`
-    /// and scales `sc[nh*8 + 2g + is]`, `is = l/16`. Scales are 16-wide, so a
-    /// 32-quant activation block spans two of them — the dpbusd lanes split
-    /// cleanly (lanes 0..3 = first 16 bytes, 4..7 = second 16).
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    pub unsafe fn gemm_q6_k_q8_0_avx512(
-        a_quant: &[u8],
-        b_scales: &[f32],
-        b_quants: &[i8],
-        out: &mut [f32],
-        m: usize,
-        n: usize,
-        k: usize,
-    ) {
-        debug_assert_eq!(k % 256, 0, "Q6_K GEMM: k must be divisible by 256");
-        let sb = k / 256;
-        let nb32 = k / 32;
-        let nh16 = k / 16;
-        let row_bytes = sb * size_of::<crate::quant::BlockQ6K>();
-        debug_assert_eq!(a_quant.len(), m * row_bytes, "Q6_K GEMM: a_quant size");
-        debug_assert_eq!(b_quants.len(), n * k, "Q6_K GEMM: b_quants size");
-        debug_assert_eq!(b_scales.len(), n * nb32, "Q6_K GEMM: b_scales size");
-        debug_assert_eq!(out.len(), m * n, "Q6_K GEMM: out size");
-
-        let col_sums16 = unsafe { q8_0_col_sums16(b_quants, n, k) };
-        let cs16: &[i32] = &col_sums16;
-
-        let compute_row = |(i, row_out): (usize, &mut [f32])| {
-            // SAFETY: as in `gemm_q4_k_q8_0_avx512`.
-            unsafe {
-                let mask_0f = _mm256_set1_epi8(0x0F);
-                let mask_03 = _mm256_set1_epi8(0x03);
-                let z = _mm256_setzero_si256();
-                let row_start = i * row_bytes;
-
-                let mut j0 = 0usize;
-                while j0 < n {
-                    let cols = KQ_COLS.min(n - j0);
-                    let mut acc = [0.0f32; KQ_COLS];
-
-                    for bi in 0..sb {
-                        let blk = &*(a_quant
-                            .as_ptr()
-                            .add(row_start + bi * size_of::<crate::quant::BlockQ6K>())
-                            as *const crate::quant::BlockQ6K);
-                        let d = half::f16::from_bits(blk.d).to_f32();
-                        let ql = blk.ql.as_ptr();
-                        let qh = blk.qh.as_ptr();
-
-                        for nh in 0..2usize {
-                            let qhb = _mm256_loadu_si256(qh.add(nh * 32) as *const __m256i);
-                            for g in 0..4usize {
-                                let qlb = _mm256_loadu_si256(
-                                    ql.add(nh * 64 + (g & 1) * 32) as *const __m256i
-                                );
-                                let l4 = if g < 2 {
-                                    _mm256_and_si256(qlb, mask_0f)
-                                } else {
-                                    _mm256_and_si256(_mm256_srli_epi16(qlb, 4), mask_0f)
-                                };
-                                // Runtime shift by 2g (0/2/4/6): `srl` with a
-                                // count register — `srli` needs a const.
-                                let h2 = _mm256_and_si256(
-                                    _mm256_srl_epi16(qhb, _mm_cvtsi32_si128(2 * g as i32)),
-                                    mask_03,
-                                );
-                                // h2 ≤ 3, so `<< 4` ≤ 48: stays inside its own
-                                // byte, no bleed across the epi16 lane boundary.
-                                let w = _mm256_or_si256(l4, _mm256_slli_epi16(h2, 4));
-
-                                let sc0 = *blk.scales.get_unchecked(nh * 8 + 2 * g) as f32;
-                                let sc1 = *blk.scales.get_unchecked(nh * 8 + 2 * g + 1) as f32;
-                                let xb = bi * 8 + nh * 4 + g;
-
-                                for (jj, acc_j) in acc.iter_mut().enumerate().take(cols) {
-                                    let j = j0 + jj;
-                                    let x =
-                                        _mm256_loadu_si256(b_quants.as_ptr().add(j * k + xb * 32)
-                                            as *const __m256i);
-                                    let lanes = _mm256_dpbusd_epi32(z, w, x);
-                                    let dp0 = hsum128_epi32(_mm256_castsi256_si128(lanes));
-                                    let dp1 = hsum128_epi32(_mm256_extracti128_si256(lanes, 1));
-                                    let xs = *b_scales.get_unchecked(j * nb32 + xb);
-                                    let sx0 = *cs16.get_unchecked(j * nh16 + xb * 2);
-                                    let sx1 = *cs16.get_unchecked(j * nh16 + xb * 2 + 1);
-                                    *acc_j += xs
-                                        * d
-                                        * (sc0 * (dp0 - 32 * sx0) as f32
-                                            + sc1 * (dp1 - 32 * sx1) as f32);
-                                }
-                            }
-                        }
-                    }
-
-                    row_out[j0..j0 + cols].copy_from_slice(&acc[..cols]);
-                    j0 += cols;
-                }
-            }
-        };
-
-        if m >= crate::backend::cpu::gemv_par_threshold() {
-            crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
-        } else {
-            out.chunks_mut(n).enumerate().for_each(compute_row);
-        }
-    }
-
-    /// Q4_K GEMV: quantize `x` to Q8_0 and run the GEMM with `n = 1`, so the
-    /// decode path and the batched prefill path share arithmetic *by
-    /// construction* — the parity tests' tight naive bar depends on exactly
-    /// that (on aarch64 it holds by both paths sharing the NEON dot; here it
-    /// holds by both paths being the same function).
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    pub unsafe fn gemv_q4k_f32_avx512(
-        a_quant: &[u8],
-        x: &[f32],
-        y: &mut [f32],
-        m: usize,
-        k: usize,
-        q8_scales: &mut Vec<f32>,
-        q8_quants: &mut Vec<i8>,
-    ) {
-        unsafe {
-            q8_scales.resize(k / 32, 0.0);
-            q8_quants.resize(k, 0);
-            quantize_f32_to_q8_0_avx512(x, q8_scales, q8_quants);
-            gemm_q4_k_q8_0_avx512(a_quant, q8_scales, q8_quants, y, m, 1, k);
-        }
-    }
-
-    /// Q6_K GEMV — see [`gemv_q4k_f32_avx512`].
-    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
-    pub unsafe fn gemv_q6k_f32_avx512(
-        a_quant: &[u8],
-        x: &[f32],
-        y: &mut [f32],
-        m: usize,
-        k: usize,
-        q8_scales: &mut Vec<f32>,
-        q8_quants: &mut Vec<i8>,
-    ) {
-        unsafe {
-            q8_scales.resize(k / 32, 0.0);
-            q8_quants.resize(k, 0);
-            quantize_f32_to_q8_0_avx512(x, q8_scales, q8_quants);
-            gemm_q6_k_q8_0_avx512(a_quant, q8_scales, q8_quants, y, m, 1, k);
-        }
-    }
-
     #[cfg(test)]
     mod avx512_vnni_tests {
         use super::*;
@@ -4584,23 +5577,37 @@ pub(crate) mod avx512_vnni {
                 && is_x86_feature_detected!("fma")
         }
 
-        /// Tier-test gate; mirrors the one in `avx512_tests`. With
-        /// `CERA_REQUIRE_SIMD=avx512vnni` a missing feature fails instead of
-        /// skipping, so CI on VNNI hardware proves these kernels actually ran.
-        fn require_simd_or_skip(feature: &str, detected: bool) -> bool {
-            if detected {
-                return true;
-            }
-            let required = std::env::var("CERA_REQUIRE_SIMD").unwrap_or_default();
-            assert!(
-                !required.split(',').any(|f| f.trim() == feature),
-                "CERA_REQUIRE_SIMD requires `{feature}` but this host doesn't report it"
-            );
-            false
+        /// The quantizer's own feature set — strictly weaker than the kernels'.
+        ///
+        /// `quantize_f32_to_q8_0_avx512` declares `avx512f,avx512vl,avx2` and
+        /// uses no `dpbusd`, and `cpu::avx512_quantizer_available` dispatches to
+        /// it at the plain `Avx512` tier. Gating its tests on
+        /// `vnni_kernels_callable()` would skip them on exactly the host class
+        /// that widening was for — the one where scalar-vs-AVX-512 bit equality
+        /// newly became load-bearing.
+        fn quantizer_callable() -> bool {
+            is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512vl")
+                && is_x86_feature_detected!("avx2")
+                // Not in the kernel's `#[target_feature]` list, but
+                // `avx512_quantizer_available` gates on `tier >= Avx512`, which
+                // `detect()` only awards with `fma`. Matching the predicate
+                // keeps the test from opening where the predicate would not.
+                && is_x86_feature_detected!("fma")
         }
 
-        /// Scalar mirror of `quantize_f32_to_q8_0_avx512`, including the f16
-        /// round-trip of `d` and round-to-nearest-even.
+        use crate::backend::simd::require_simd_or_skip;
+
+        /// Independently written mirror of the Q8_0 quantizer contract: f16
+        /// round-trip of `d`, round-to-nearest-even, the non-finite guard.
+        ///
+        /// Deliberately NOT a call to `cpu::quantize_f32_to_q8_0_scalar`, even
+        /// though that is now reachable from here. This is the *oracle* — the
+        /// only thing in the tree that pins either quantizer to a
+        /// separately-written statement of the spec. Delegating would turn
+        /// `quantize_q8_0_avx512_matches_scalar` into production-vs-production,
+        /// which `quantize_q8_0_scalar_matches_avx512` already covers, and would
+        /// leave a shared misreading of the spec undetectable.
         fn ref_quantize(x: &[f32]) -> (Vec<f32>, Vec<i8>) {
             let mut scales = Vec::new();
             let mut quants = Vec::new();
@@ -4743,7 +5750,7 @@ pub(crate) mod avx512_vnni {
             }
 
             let mut got = vec![0.0f32; m * n];
-            unsafe { gemm_q4_k_q8_0_avx512(&a, &b_scales, &b_quants, &mut got, m, n, k) };
+            unsafe { gemm_q4_k_q8_0(&a, &b_scales, &b_quants, &mut got, m, n, k) };
 
             for i in 0..m {
                 let mut w = vec![0.0f32; k];
@@ -4795,7 +5802,7 @@ pub(crate) mod avx512_vnni {
             }
 
             let mut got = vec![0.0f32; m * n];
-            unsafe { gemm_q6_k_q8_0_avx512(&a, &b_scales, &b_quants, &mut got, m, n, k) };
+            unsafe { gemm_q6_k_q8_0(&a, &b_scales, &b_quants, &mut got, m, n, k) };
 
             for i in 0..m {
                 let mut w = vec![0.0f32; k];
@@ -4857,7 +5864,7 @@ pub(crate) mod avx512_vnni {
             // resize and overwrite, not trust what it was handed.
             scr_s.resize(3, 9.9);
             scr_q.resize(7, 99);
-            unsafe { gemv_q4k_f32_avx512(&a, &x, &mut y, m, k, &mut scr_s, &mut scr_q) };
+            unsafe { gemv_q4k_f32(&a, &x, &mut y, m, k, &mut scr_s, &mut scr_q) };
 
             let (xs, xq) = ref_quantize(&x);
             for i in 0..m {
@@ -4898,7 +5905,7 @@ pub(crate) mod avx512_vnni {
             let mut y = vec![0.0f32; m];
             let mut scr_s = Vec::new();
             let mut scr_q = Vec::new();
-            unsafe { gemv_q6k_f32_avx512(&a, &x, &mut y, m, k, &mut scr_s, &mut scr_q) };
+            unsafe { gemv_q6k_f32(&a, &x, &mut y, m, k, &mut scr_s, &mut scr_q) };
 
             let (xs, xq) = ref_quantize(&x);
             for i in 0..m {
@@ -4919,7 +5926,7 @@ pub(crate) mod avx512_vnni {
 
         #[test]
         fn quantize_q8_0_avx512_matches_scalar() {
-            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+            if !require_simd_or_skip("avx512", quantizer_callable()) {
                 return;
             }
             let mut st = 0x1357_9bdfu64;
@@ -4932,11 +5939,70 @@ pub(crate) mod avx512_vnni {
             assert_eq!(gq, wq, "quants");
         }
 
+        /// The *production* scalar quantizer, bit-for-bit against the AVX-512
+        /// one.
+        ///
+        /// `quantize_q8_0_avx512_matches_scalar` above compares against
+        /// `ref_quantize`, an independently written oracle — which proves the
+        /// kernel matches the spec, not that it matches the code every other
+        /// host runs. The interop claim that actually ships is different:
+        /// `quantize_f32_to_q8_0_into` picks one of these two by tier, decode and
+        /// prefill both go through it, and the AVX2 GEMM consumes whichever it
+        /// produced. If the
+        /// two ever disagree, a host that quantizes activations one way and
+        /// weights another gets silently wrong logits — no panic, no warning.
+        ///
+        /// Includes the `-127`/`127` bound cases and an all-zero block, where
+        /// `d == 0` forces the reciprocal branch that differs most between the
+        /// two implementations.
+        #[test]
+        fn quantize_q8_0_scalar_matches_avx512() {
+            if !require_simd_or_skip("avx512", quantizer_callable()) {
+                return;
+            }
+            let mut st = 0x2468_ace0u64;
+            let mut x: Vec<f32> = (0..320).map(|_| lcg01(&mut st) * 8.0 - 4.0).collect();
+            // Block 1: every lane subnormal, so `1.0 / d` overflows to
+            // infinity. This is the *discriminating* block — it is
+            // the only input where the two implementations could disagree, and
+            // it is what the non-finite guards on both sides exist for. A single
+            // tiny lane among normal ones proves nothing: `amax` comes from the
+            // whole block, so one `1e-30` next to a `3.9` leaves `d` normal.
+            // amax ~1e-40: subnormal, but not so small that `d = amax / 127`
+            // (~1e-42 here) underflows to exactly zero — at that point both
+            // sides take the `d == 0` branch and agree for the wrong reason.
+            // Here `d` is a nonzero subnormal and `1.0 / d` overflows to
+            // infinity, which is the case the guards actually handle.
+            for (t, v) in x[32..64].iter_mut().enumerate() {
+                *v = f32::from_bits(71_000 + (t as u32 % 11) * 37);
+            }
+            // Block 2: all zero, the `d == 0` branch.
+            x[64..96].fill(0.0);
+            // And the bound cases in an otherwise ordinary block.
+            x[100] = -7.5;
+            x[101] = 7.5;
+
+            let nb = x.len() / 32;
+            let (mut ss, mut sq) = (vec![0.0f32; nb], vec![0i8; x.len()]);
+            let (mut vs, mut vq) = (vec![0.0f32; nb], vec![0i8; x.len()]);
+            crate::backend::cpu::quantize_f32_to_q8_0_scalar(&x, &mut ss, &mut sq);
+            unsafe { quantize_f32_to_q8_0_avx512(&x, &mut vs, &mut vq) };
+
+            for (b, (a, v)) in ss.iter().zip(&vs).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    v.to_bits(),
+                    "block {b} scale: scalar {a:e} vs avx512 {v:e}"
+                );
+            }
+            assert_eq!(sq, vq, "quantized bytes diverged");
+        }
+
         /// An all-zero block makes `d == 0`, so the reciprocal is forced to 0
         /// rather than inf — check the kernel takes that branch too.
         #[test]
         fn quantize_q8_0_avx512_handles_zero_block() {
-            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+            if !require_simd_or_skip("avx512", quantizer_callable()) {
                 return;
             }
             let x = vec![0.0f32; 64];
@@ -4963,7 +6029,7 @@ pub(crate) mod avx512_vnni {
         /// number.
         #[test]
         fn quantize_q8_0_avx512_non_finite_blocks_match_scalar() {
-            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+            if !require_simd_or_skip("avx512", quantizer_callable()) {
                 return;
             }
             let mut cases: Vec<(&str, Vec<f32>)> = Vec::new();
@@ -5009,7 +6075,7 @@ pub(crate) mod avx512_vnni {
         }
 
         #[test]
-        fn gemv_q4_0_q8_0_avx512_matches_scalar() {
+        fn gemv_q4_0_q8_0_matches_scalar() {
             if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
                 return;
             }
@@ -5019,12 +6085,12 @@ pub(crate) mod avx512_vnni {
             let x: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
             let (xs, xq) = ref_quantize(&x);
             let mut y = vec![0.0f32; m];
-            unsafe { gemv_q4_0_q8_0_avx512(&a, &xs, &xq, &mut y, m, k) };
+            unsafe { gemv_q4_0_q8_0(&a, &xs, &xq, &mut y, m, k) };
             assert_close(&y, &ref_gemv_q4_0(&a, &xs, &xq, m, k), "gemv_q4_0");
         }
 
         #[test]
-        fn gemv_q8_0_q8_0_avx512_matches_scalar() {
+        fn gemv_q8_0_q8_0_matches_scalar() {
             if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
                 return;
             }
@@ -5034,7 +6100,7 @@ pub(crate) mod avx512_vnni {
             let x: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
             let (xs, xq) = ref_quantize(&x);
             let mut y = vec![0.0f32; m];
-            unsafe { gemv_q8_0_q8_0_avx512(&a, &xs, &xq, &mut y, m, k) };
+            unsafe { gemv_q8_0_q8_0(&a, &xs, &xq, &mut y, m, k) };
             assert_close(&y, &ref_gemv_q8_0(&a, &xs, &xq, m, k), "gemv_q8_0");
         }
 
@@ -5074,12 +6140,12 @@ pub(crate) mod avx512_vnni {
             }
 
             let mut out = vec![0.0f32; m * n];
-            unsafe { gemm_q4_0_q8_0_avx512(&a, &b_scales, &b_quants, &mut out, m, n, k) };
+            unsafe { gemm_q4_0_q8_0(&a, &b_scales, &b_quants, &mut out, m, n, k) };
 
             for j in 0..n {
                 let mut y = vec![0.0f32; m];
                 unsafe {
-                    gemv_q4_0_q8_0_avx512(
+                    gemv_q4_0_q8_0(
                         &a,
                         &b_scales[j * nb..(j + 1) * nb],
                         &b_quants[j * k..(j + 1) * k],
@@ -5137,7 +6203,7 @@ pub(crate) mod avx512_vnni {
                 let a4 = rand_q4_0_rows(m, k, &mut st);
                 let mut tiled = vec![0.0f32; m * n];
                 let mut per_row = vec![0.0f32; m * n];
-                unsafe { gemm_q4_0_q8_0_avx512(&a4, &b_scales, &b_quants, &mut tiled, m, n, k) };
+                unsafe { gemm_q4_0_q8_0(&a4, &b_scales, &b_quants, &mut tiled, m, n, k) };
                 let row_bytes4 = nb * size_of::<BlockQ4_0>();
                 for (r, out_row) in per_row.chunks_mut(n).enumerate() {
                     // SAFETY: row `r` is in bounds of `a4` (m rows of row_bytes4).
@@ -5158,7 +6224,7 @@ pub(crate) mod avx512_vnni {
                 let a8 = rand_q8_0_rows(m, k, &mut st);
                 let mut tiled = vec![0.0f32; m * n];
                 let mut per_row = vec![0.0f32; m * n];
-                unsafe { gemm_q8_0_q8_0_avx512(&a8, &b_scales, &b_quants, &mut tiled, m, n, k) };
+                unsafe { gemm_q8_0_q8_0(&a8, &b_scales, &b_quants, &mut tiled, m, n, k) };
                 let row_bytes8 = nb * size_of::<BlockQ8_0>();
                 for (r, out_row) in per_row.chunks_mut(n).enumerate() {
                     // SAFETY: row `r` is in bounds of `a8` (m rows of row_bytes8).
@@ -5245,10 +6311,10 @@ pub(crate) mod avx512_vnni {
                     let bs = vec![0.01f32; n * nb];
                     let bq = vec![3i8; n * k];
                     let mut c4 = vec![0.0f32; m * n];
-                    unsafe { gemm_q4_0_q8_0_avx512(&a4, &bs, &bq, &mut c4, m, n, k) };
+                    unsafe { gemm_q4_0_q8_0(&a4, &bs, &bq, &mut c4, m, n, k) };
                     let t = Instant::now();
                     for _ in 0..iters {
-                        unsafe { gemm_q4_0_q8_0_avx512(&a4, &bs, &bq, &mut c4, m, n, k) };
+                        unsafe { gemm_q4_0_q8_0(&a4, &bs, &bq, &mut c4, m, n, k) };
                     }
                     report("gemm_q4_0", t.elapsed().as_secs_f64() / iters as f64);
                 }
@@ -5257,10 +6323,10 @@ pub(crate) mod avx512_vnni {
                 let b_quants = vec![3i8; n * k];
                 let mut c = vec![0.0f32; m * n];
 
-                unsafe { gemm_q8_0_q8_0_avx512(&a, &b_scales, &b_quants, &mut c, m, n, k) };
+                unsafe { gemm_q8_0_q8_0(&a, &b_scales, &b_quants, &mut c, m, n, k) };
                 let t = Instant::now();
                 for _ in 0..iters {
-                    unsafe { gemm_q8_0_q8_0_avx512(&a, &b_scales, &b_quants, &mut c, m, n, k) };
+                    unsafe { gemm_q8_0_q8_0(&a, &b_scales, &b_quants, &mut c, m, n, k) };
                 }
                 report("gemm_q8_0", t.elapsed().as_secs_f64() / iters as f64);
             };
@@ -5441,9 +6507,7 @@ pub(crate) mod avx512_vnni {
                         for _ in 0..iters {
                             if tiled {
                                 unsafe {
-                                    gemm_q8_0_q8_0_avx512(
-                                        &a, &b_scales, &b_quants, &mut c_new, m, n, k,
-                                    )
+                                    gemm_q8_0_q8_0(&a, &b_scales, &b_quants, &mut c_new, m, n, k)
                                 };
                             } else {
                                 unsafe {
@@ -5471,9 +6535,7 @@ pub(crate) mod avx512_vnni {
                         for _ in 0..iters {
                             if tiled {
                                 unsafe {
-                                    gemm_q4_0_q8_0_avx512(
-                                        &a, &b_scales, &b_quants, &mut c_new, m, n, k,
-                                    )
+                                    gemm_q4_0_q8_0(&a, &b_scales, &b_quants, &mut c_new, m, n, k)
                                 };
                             } else {
                                 unsafe {
@@ -5517,12 +6579,12 @@ pub(crate) mod avx512_vnni {
             }
 
             let mut out = vec![0.0f32; m * n];
-            unsafe { gemm_q8_0_q8_0_avx512(&a, &b_scales, &b_quants, &mut out, m, n, k) };
+            unsafe { gemm_q8_0_q8_0(&a, &b_scales, &b_quants, &mut out, m, n, k) };
 
             for j in 0..n {
                 let mut y = vec![0.0f32; m];
                 unsafe {
-                    gemv_q8_0_q8_0_avx512(
+                    gemv_q8_0_q8_0(
                         &a,
                         &b_scales[j * nb..(j + 1) * nb],
                         &b_quants[j * k..(j + 1) * k],

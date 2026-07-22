@@ -1008,7 +1008,7 @@ impl Lfm2Model {
         let mut out_col = vec![0.0f32; hs];
         // Batched projection buffers for conv/attn input projections.
         // Used by the no-`blas` int8 `gemm_preq` path (aarch64 NEON and
-        // x86_64 AVX-512 VNNI) and the any-arch BLAS path
+        // x86_64 int8, VNNI or AVX2) and the any-arch BLAS path
         // (`try_blas_prefill_gemm`).
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let max_kv_dim =
@@ -1029,7 +1029,7 @@ impl Lfm2Model {
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let is = cfg.intermediate_size;
         // bq_*/dq_*/inter_col are scratch for the no-`blas` `gemm_preq` path
-        // (aarch64 NEON and x86_64 AVX-512 VNNI)
+        // (aarch64 NEON and x86_64 int8, VNNI or AVX2)
         // (they hold the pre-quantized Q8_0 input matrix). With BLAS on, the
         // SGEMM path consumes f32 directly and these buffers are not needed.
         #[cfg(all(
@@ -1146,13 +1146,19 @@ impl Lfm2Model {
                                 &mut state.scratch.dequant_weight_scratch,
                             );
                         }
+                        // Sliced, like the LoRA call below: `proj_mat` is sized
+                        // `max(3*hs, hs + 2*kv_dim) * n` because it is shared
+                        // with the attention projection, so it can be longer
+                        // than this GEMM's `3*hs*n` output. `gemm_preq` slices
+                        // defensively too, but the invariant belongs where the
+                        // over-long buffer is created.
                         #[cfg(not(feature = "blas"))]
                         transformer::gemm_preq(
                             &self.gguf,
                             in_proj,
                             &bq_scales,
                             &bq_quants,
-                            &mut proj_mat,
+                            &mut proj_mat[..3 * hs * n],
                             3 * hs,
                             n,
                             hs,
@@ -1975,7 +1981,7 @@ impl Lfm2Model {
 
             // FFN: batched GEMM (reads weights once for all n tokens) for the
             // dtypes `batched_gemm_supports` admits. Available on aarch64 (NEON
-            // `gemm_preq`), on x86_64 with runtime AVX-512 VNNI (int8
+            // `gemm_preq`), on x86_64 with runtime avx2+fma (int8
             // `gemm_preq`), and on any target with `feature = "blas"` (BLAS
             // SGEMM via `try_blas_prefill_gemm`). Require all three projections
             // (gate/up/down) to be batchable — a mixed-dtype FFN block would

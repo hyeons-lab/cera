@@ -460,8 +460,8 @@ impl LlamaModel {
     /// prefill). Reads each weight matrix once for all `n` tokens. Column-major
     /// `hidden[hs × n]` (token `j` of channel `i` at `i*n + j`). Numerically
     /// matches the per-token `forward` path. Only compiled where a batched-GEMM
-    /// kernel exists (aarch64 NEON, x86_64 AVX-512 VNNI, or any target with the
-    /// `blas` feature); the per-token fallback covers every other build. On
+    /// kernel exists (aarch64 NEON, x86_64 int8 — VNNI or AVX2 — or any target
+    /// with the `blas` feature); the per-token fallback covers the rest. On
     /// x86_64 the kernel is additionally a *runtime* property, so the dtype scan
     /// below also asks `batched_gemm_supports` before committing to this path.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
@@ -530,10 +530,10 @@ impl LlamaModel {
             ] {
                 // `batched_gemm_supports` answers all three parts of the
                 // question: the dtype has a kernel at all, that kernel can run
-                // *on this host* (on x86 the int8 GEMM needs runtime VNNI), and
+                // *on this host* (on x86 the int8 GEMM needs runtime avx2+fma), and
                 // for K-quants that `k % 256 == 0`.
                 //
-                // The host check is the load-bearing one. Without it a non-VNNI
+                // The host check is the load-bearing one. Without it a Scalar-tier
                 // x86 build reaches `gemm_preq`, no kernel runs, and callers
                 // reuse one output buffer across layers — so the previous
                 // layer's activations survive as this layer's result. Silent

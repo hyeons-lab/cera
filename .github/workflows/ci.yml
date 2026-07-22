@@ -73,7 +73,56 @@ jobs:
       # Chasing an intermittent failure is hard enough with its name; it is
       # near-impossible when the run that caught it also hid what else broke.
       - name: Run tests
+        env:
+          # Turn a silent skip into a failure for the x86 int8 kernels, the same
+          # way the `simd-i8mm` leg below does for aarch64. Every GitHub-hosted
+          # x86 runner has AVX2, and the AVX2 int8 GEMM/GEMV is now the default
+          # x86 production path, so a skip here means feature detection broke —
+          # not that the host is incapable. Scoped to the x86 leg because that
+          # is where the requirement means something: on `macos-latest` (arm64)
+          # the `avx2_int8` module is cfg'd out entirely, so nothing would ever
+          # consult the variable and setting it would assert nothing.
+          CERA_REQUIRE_SIMD: ${{ matrix.os == 'ubuntu-latest' && 'avx2' || '' }}
         run: cargo test --workspace --no-fail-fast
+
+  # x86_64 with the default-on `avx512` crate feature OFF.
+  #
+  # That feature exists so the crate still builds on Rust 1.85-1.88, where the
+  # `_mm512_*` intrinsics are not yet stable; with it off, x86 caps at the
+  # `Avx2` tier and the AVX2 int8 kernels become the whole int8 path. Nothing
+  # else in CI covers that combination — the `--no-default-features` matrix
+  # above targets wasm32 only — and it has broken before: a `#[cfg(feature =
+  # "avx512")]` on a helper the AVX2 tests call took the config down while every
+  # other leg stayed green.
+  #
+  # Tests, not just `check`: the point is that the AVX2 kernels are exercised
+  # without their VNNI comparison target, which is a compile-time *and* runtime
+  # property. `CERA_REQUIRE_SIMD=avx2` keeps them from reporting green by
+  # skipping.
+  x86-no-avx512:
+    name: x86_64 without the avx512 feature
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+      - uses: Swatinem/rust-cache@v2
+      # No "print the resolved tier" step here, unlike the other SIMD legs.
+      # `cera-cli` has no passthrough for cera's `avx512` feature, so
+      # `cera-cli -- cpu` would build cera with defaults and print the
+      # avx512-enabled tier — a diagnostic for a configuration this job is
+      # specifically not testing. `CERA_REQUIRE_SIMD=avx2` below is the real
+      # assertion that the intended tier was reached.
+      - name: Test without avx512
+        env:
+          CERA_REQUIRE_SIMD: avx2
+        run: >
+          cargo test -p cera --no-default-features
+          --features parallel,mmap,std-fs,disk-cache,vl-preprocess
+          --no-fail-fast
 
   # Validate the aarch64 i8mm Q8_0 GEMM kernel on real ARMv8.6 hardware.
   # GitHub's `ubuntu-24.04-arm` runner is Azure Cobalt 100 (Arm Neoverse N2,
@@ -922,7 +971,8 @@ jobs:
         run: ./scripts/fetch_test_models.sh --set ${{ steps.fixtures.outputs.set }}
       # The no-blas leg's coverage depends on the runner's ISA, so record what
       # this one actually is. Without it, a green run is ambiguous between
-      # "batched path verified" and "batched path skipped for lack of VNNI".
+      # "batched path verified" and "batched path skipped for lack of avx2+fma"
+      # (the bar used to be VNNI; the AVX2 int8 kernels lowered it).
       - name: Report CPU tier
         run: cargo run --release -q -p cera-cli -- cpu
       # Leg 1 — deterministic. With `blas` the batched path is OpenBLAS SGEMM,
@@ -937,13 +987,19 @@ jobs:
             --test llama_batched_prefill_parity \
             --test lfm2_batched_prefill_parity \
             -- --ignored --nocapture
-      # Leg 2 — opportunistic. Covers the x86_64 AVX-512 VNNI int8 path, which
-      # is what the CPU backend actually uses in a default build. Deliberately
-      # does NOT set CERA_REQUIRE_BATCHED: GitHub-hosted runners are not
-      # guaranteed to expose VNNI, and a missing instruction set is a coverage
-      # gap to read in the log (the tests print an explicit SKIP line), not a
-      # build failure. Promote this to required once the runner pool is known
-      # to carry it.
+      # Leg 2 — opportunistic. Covers the x86_64 int8 path, which is what the
+      # CPU backend actually uses in a default build. Deliberately does NOT set
+      # CERA_REQUIRE_BATCHED, and a missing instruction set is a coverage gap to
+      # read in the log (the tests print an explicit SKIP line), not a build
+      # failure.
+      #
+      # The original reason for that caution — "runners are not guaranteed to
+      # expose VNNI" — no longer applies: the int8 GEMM/GEMV are now instantiated
+      # at the AVX2 tier too (`dpbusd` emulated with `maddubs`), so any avx2+fma
+      # runner exercises the batched path, and every GitHub-hosted x86 runner has
+      # AVX2. Promoting this leg to required by setting CERA_REQUIRE_BATCHED=1 is
+      # now a one-line change; it is left off here only because flipping a leg
+      # from advisory to blocking is a policy call, not a technical one.
       # `unbatchable_warning` rides along here, not in the main Test job: it
       # needs a fixture, and that job has none, so there it skips silently and
       # reports a pass. It is native-leg only — the test is

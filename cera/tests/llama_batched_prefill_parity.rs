@@ -20,10 +20,10 @@
 //!
 //! Compiled only where the batched path exists (`any(aarch64, x86_64, blas)`) so
 //! a non-batched target can't silently compare the per-token path against
-//! itself. On x86_64 that capability is a *runtime* property (AVX-512 VNNI), not
-//! just a cfg, so `assert_batched_path_is_live` re-checks it before comparing —
-//! without VNNI the model falls back to per-token and the comparison would be
-//! vacuous.
+//! itself. On x86_64 that capability is a *runtime* property (avx2+fma at
+//! minimum), not just a cfg, so `assert_batched_path_is_live` re-checks it
+//! before comparing — below that the model falls back to per-token and the
+//! comparison would be vacuous.
 //! Marked `#[ignore]` like the other real-model tests so the mainline
 //! `cargo test --workspace` job (which has no ~GB fixtures) does not report a
 //! meaningless green; run explicitly with fixtures present:
@@ -141,22 +141,23 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, f32, usize, usize)> {
 
 /// Whether `forward_prefill` will actually take the batched path here.
 ///
-/// On x86_64 without `blas` that is a *runtime* property (AVX-512 VNNI), not a
-/// cfg: without it the model gates itself back onto the per-token path and both
-/// halves of this comparison become the same code — a guaranteed pass that
-/// proves nothing.
+/// On x86_64 without `blas` that is a *runtime* property (avx2+fma at minimum),
+/// not a cfg: without it the model gates itself back onto the per-token path
+/// and both halves of this comparison become the same code — a guaranteed pass
+/// that proves nothing.
 ///
-/// Absent the capability this skips rather than fails, so a non-VNNI dev box or
+/// Absent the capability this skips rather than fails, so a Scalar-tier dev box
 /// CI runner does not get a red build for hardware it does not have. Set
 /// `CERA_REQUIRE_BATCHED=1` to turn that skip into a failure on a host known to
 /// have the hardware. CI does *not* currently set it: the `blas` leg compiles
 /// this check out entirely (so it would assert nothing), and the native leg runs
-/// on runners with no guaranteed VNNI. Mirrors `CERA_REQUIRE_SIMD` in `simd.rs`.
+/// on runners with no guaranteed int8 support. Mirrors `CERA_REQUIRE_SIMD`
+/// in `simd.rs`.
 fn batched_path_is_live(rel: &str) -> bool {
     #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
     if !cera::backend::cpu::int8_gemm_available() {
         let msg = format!(
-            "{rel}: x86_64 host has no runtime AVX-512 VNNI, so `forward_prefill` \
+            "{rel}: x86_64 host has no runtime int8 GEMM (needs avx2+fma), so `forward_prefill` \
              falls back to the per-token path — comparing it against itself would \
              pass vacuously"
         );
@@ -205,10 +206,15 @@ fn check(rel: &str, tokens: &[u32]) {
     // a real layout/dim/transpose bug drops cosine far below these or flips it.
     #[cfg(all(not(feature = "blas"), target_arch = "aarch64"))]
     let (min_cos, tier) = (if is_flash { 0.99_f32 } else { 0.9999_f32 }, "NEON");
-    // x86_64 VNNI shares the same Q8_0-quantize + int8-dot arithmetic as NEON,
-    // so it earns the same tight bound — only the label differs.
+    // The x86 int8 path — VNNI or the AVX2 emulation — shares the same
+    // Q8_0-quantize + int8-dot arithmetic as NEON, and (since the AVX2 GEMV
+    // landed) decode routes through the very same kernels on both tiers, so it
+    // earns the same tight bound — only the label differs.
     #[cfg(all(not(feature = "blas"), target_arch = "x86_64"))]
-    let (min_cos, tier) = (if is_flash { 0.99_f32 } else { 0.9999_f32 }, "AVX-512 VNNI");
+    let (min_cos, tier) = (
+        if is_flash { 0.99_f32 } else { 0.9999_f32 },
+        "x86 int8 (VNNI or AVX2)",
+    );
     #[cfg(feature = "blas")]
     let (min_cos, tier) = (0.99_f32, "BLAS");
 

@@ -7,11 +7,11 @@
 //! crash — it produces *fluent but different* text, which is indistinguishable from
 //! "the model is just like that" by eye.
 //!
-//! Why the bar is tight: on aarch64 (NEON) and on x86_64 (AVX-512 VNNI) the
-//! per-token Q4_K/Q6_K GEMVs quantize the activations to Q8_0 and run the same
-//! int8 dot as the batched GEMM, so the two
-//! paths do the *same arithmetic* and differ only in float summation order. Cosine
-//! must therefore be ~1.0 and the argmax must match. (Under `blas` the projections
+//! Why the bar is tight: on aarch64 (NEON) and on x86_64 (int8: VNNI or the
+//! AVX2 emulation) the per-token Q4_K/Q6_K GEMVs quantize the activations to
+//! Q8_0 and run the same int8 dot as the batched GEMM, so the two paths do the
+//! *same arithmetic* and differ only in float summation order. Cosine must
+//! therefore be ~1.0 and the argmax must match. (Under `blas` the projections
 //! run through f32 SGEMM instead, a legitimate reduction difference, so the bound is
 //! looser — mirroring `llama_batched_prefill_parity`.)
 //!
@@ -137,22 +137,23 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, usize, usize)> {
 
 /// Whether `forward_prefill` will actually take the batched path here.
 ///
-/// On x86_64 without `blas` that is a *runtime* property (AVX-512 VNNI), not a
-/// cfg: without it the model gates itself back onto the per-token path and both
-/// halves of this comparison become the same code — a guaranteed pass that
-/// proves nothing.
+/// On x86_64 without `blas` that is a *runtime* property (avx2+fma at minimum),
+/// not a cfg: without it the model gates itself back onto the per-token path
+/// and both halves of this comparison become the same code — a guaranteed pass
+/// that proves nothing.
 ///
-/// Absent the capability this skips rather than fails, so a non-VNNI dev box or
+/// Absent the capability this skips rather than fails, so a Scalar-tier dev box
 /// CI runner does not get a red build for hardware it does not have. Set
 /// `CERA_REQUIRE_BATCHED=1` to turn that skip into a failure on a host known to
 /// have the hardware. CI does *not* currently set it: the `blas` leg compiles
 /// this check out entirely (so it would assert nothing), and the native leg runs
-/// on runners with no guaranteed VNNI. Mirrors `CERA_REQUIRE_SIMD` in `simd.rs`.
+/// on runners with no guaranteed int8 support. Mirrors `CERA_REQUIRE_SIMD`
+/// in `simd.rs`.
 fn batched_path_is_live(rel: &str) -> bool {
     #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
     if !cera::backend::cpu::int8_gemm_available() {
         let msg = format!(
-            "{rel}: x86_64 host has no runtime AVX-512 VNNI, so `forward_prefill` \
+            "{rel}: x86_64 host has no runtime int8 GEMM (needs avx2+fma), so `forward_prefill` \
              falls back to the per-token path — comparing it against itself would \
              pass vacuously"
         );
