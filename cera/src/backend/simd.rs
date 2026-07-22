@@ -3705,8 +3705,15 @@ pub(crate) mod avx512_vnni {
     //
     // The point of these over a per-token GEMV loop: one weight row is decoded
     // once and reused across `TILE_N` activation columns, so a prefill of `n`
-    // tokens streams the weight matrix `n / TILE_N` times instead of `n`. Prefill
-    // on x86 is weight-bandwidth bound, so that ratio *is* the speedup.
+    // tokens streams the weight matrix `n / TILE_N` times instead of `n`, and the
+    // decode is amortized across the tile.
+    //
+    // NOTE: these per-row kernels are no longer the production path for the
+    // Q4_0/Q8_0 GEMMs — see "Row tiling" below, which processes `TILE_M` rows per
+    // task and reaches them only for the `m % TILE_M` tail. Read that block for
+    // the current cost model; in particular, "weight-bandwidth bound" is the
+    // wrong summary at these shapes (the activation panel is L2-resident and the
+    // binding constraint is loads and uops per `dot32`, not DRAM).
     //
     // Column-major activations: `quantize_columns` packs column `j` contiguously
     // at `b_quants[j * k ..]` with scales at `b_scales[j * nb ..]`, so each of the
@@ -3723,9 +3730,18 @@ pub(crate) mod avx512_vnni {
     /// by 2x.)
     ///
     /// 8 measures faster than 4 on both dtypes. Interleaved A/B, 8 paired
-    /// rounds, 2048x512x2048, rayon pool pinned to 16 threads: Q4_0 626->660
+    /// rounds, 2048x512x2048, rayon pool fixed at 16 threads: Q4_0 626->660
     /// GOP/s (+5.6%, paired t=7.15, 8/8 rounds), Q8_0 563->638 (+13.4%, t=16.81,
-    /// 8/8). `microbench_gemm` reproduces this in one command.
+    /// 8/8).
+    ///
+    /// CAVEAT: `microbench_gemm` can no longer reproduce that. It drives the
+    /// public GEMMs at m=2048, and since row tiling landed those dispatch every
+    /// full `TILE_M`-row strip to `gemm_*_strip` (which tiles by `STRIP_N`), so
+    /// `TILE_N` has no effect at that shape — the header it prints names a
+    /// constant it is not testing. `TILE_N` now governs only the `m % TILE_M`
+    /// tail, and production out-feature counts are multiples of 4, so it is
+    /// effectively unexercised in production. To re-tune it, drive
+    /// `gemm_*_row` directly or pick an `m` with `m % TILE_M != 0`.
     ///
     /// Getting a trustworthy number here took two tries, and the method is worth
     /// recording. Unpinned, this host's run-to-run spread is ~2.8x (an identical
@@ -3748,9 +3764,10 @@ pub(crate) mod avx512_vnni {
     /// partial sums of the *same* dot product, so the scale is a per-column
     /// broadcast (`set1`), not a vector of 8 distinct column scales — the
     /// transpose can only make the tiny scale loads more contiguous, which is
-    /// not the bottleneck. The structural fix is row tiling — process several
-    /// weight rows per tile so each activation load feeds more than one row, as
-    /// the GPU kernel already does (see #267).
+    /// not the bottleneck. The structural fix was row tiling — feed each
+    /// activation load to several weight rows, as the GPU kernel does (#267) —
+    /// and that has since shipped: see "Row tiling" below, which also lists the
+    /// headroom that remains.
     const TILE_N: usize = 8;
 
     /// One output row of the Q4_0 GEMM: `out[j] = <A_row, B_col_j>` for all `n`.
@@ -3862,8 +3879,236 @@ pub(crate) mod avx512_vnni {
         }
     }
 
+    // ── Row tiling ──────────────────────────────────────────────────────────
+    //
+    // The per-row kernels above parallelise one weight row per task and re-read
+    // the entire `n*k` activation panel for every row.
+    //
+    // What that costs is **load-port pressure, not DRAM bandwidth** — say this
+    // precisely, because the obvious bandwidth story is wrong and misleads the
+    // next tuning pass. At the benchmark shape (2048x512x2048) the activation
+    // panel is n*k + n*nb*4 = 1.18 MB, so it is L2-resident and those re-reads
+    // are cache hits; the only thing streaming from memory is ~4.3 MB of weights,
+    // read once. The per-row TILE_N=8 kernel issues 1 weight + 1 f16 + 8
+    // activation + 8 scale loads per 8 `dot32` (2.25 loads/dot32); a 4x4 strip
+    // issues 4+4+4+4 per 16 (1.00), and carries 16 independent accumulator chains
+    // instead of 8 to hide `vpdpbusd` latency. That is the mechanism.
+    //
+    // Measured against the per-row driver by `microbench_gemm_rowtile`, 8 paired
+    // rounds with alternating arm order, pseudo-random activations, on an idle
+    // host — three repetitions: **Q8_0 +19.1/+24.1/+21.8%, Q4_0
+    // +19.8/+18.9/+19.0%, 8/8 rounds won in all six** (~250 -> ~305 GOP/s).
+    //
+    // Two measurement notes, both learned the hard way here. Constant-filled
+    // activations inflate *absolute* throughput ~2x (both arms run out of a
+    // trivially-predictable working set) and distort the ratio, so the benchmark
+    // quantizes real pseudo-random columns. And a contended machine collapses the
+    // effect to low single digits while looking like a valid run — take these
+    // numbers on an otherwise idle host or not at all.
+    //
+    // Output is bit-identical to the per-row path; that is enforced by
+    // `gemm_avx512_row_tiled_matches_per_row_bit_exact`, which runs in CI, not by
+    // the ignored benchmark.
+    //
+    // Known headroom, in the order worth attacking:
+    //   1. Weight decode is redone per column tile — `w`/`dw` are hoisted out of
+    //      the `t` loop but not out of the `j` loop, so a row's blocks are decoded
+    //      n/STRIP_N times against a theoretical `nb`. That is 2x more f16->f32
+    //      converts and `unpack_q4_0` calls than the TILE_N=8 per-row kernel did,
+    //      and is the likeliest reason Q4_0 (which pays the nibble unpack) gains
+    //      less than Q8_0. A per-strip decode buffer is 8 KB, L1-resident.
+    //   2. `_mm256_set1_ps(dw[r] * da)` sits in the innermost loop: 16 broadcasts
+    //      per (block, tile) where 8 would do, on a port that is already busy.
+    //   3. No blocking over `n`. Each strip still walks the whole panel, so at
+    //      large `k` (e.g. ffn_down, k=8192) the panel leaves L2 and the real
+    //      bandwidth story finally does apply.
+    //
+    // The trade-off is granularity: this divides the parallel task count by
+    // `TILE_M`. `m` is a projection's out-feature count, and the small end is a
+    // GQA kv_dim — 128 for a 2-KV-head model, i.e. 32 strips against this host's
+    // 32 workers, one per worker with no stealing slack (an MQA kv_dim of 64
+    // leaves half the pool idle). The strip still wins at those shapes (measured
+    // +184%/+103%/+35% at m=64/128/512, 6/6 rounds) because they are nowhere near
+    // thread-bound, but the pool is underfed there and a 2-D split over strips x
+    // n-panels is the fix if that ever matters.
+
+    /// Weight rows per strip.
+    const TILE_M: usize = 4;
+
+    /// Activation columns per accumulator tile inside a strip. `TILE_M *
+    /// STRIP_N` fp32 accumulators must fit the register file with room for the
+    /// `TILE_M` decoded weights, the shared activation, and temporaries: 4x4 =
+    /// 16 leaves half of EVEX's 32 registers free and measured fastest. The
+    /// 24-accumulator shapes (6x4, 4x6) spill and regress; this is distinct from
+    /// the per-row `TILE_N = 8`, which tiles one row against 8 columns.
+    const STRIP_N: usize = 4;
+
+    /// One strip of `TILE_M` consecutive Q8_0 weight rows against all `n`
+    /// columns. `rows` points at the first row; rows are `row_bytes` apart and
+    /// `out` is `TILE_M * n` row-major.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn gemm_q8_0_strip(
+        rows: *const u8,
+        row_bytes: usize,
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        n: usize,
+        nb: usize,
+    ) {
+        // The kernel indexes `out` unchecked up to `TILE_M * n - 1` and reads
+        // `TILE_M` whole weight rows behind `rows`, so state the output half of
+        // that contract here rather than relying on the caller's arithmetic.
+        debug_assert_eq!(out.len(), TILE_M * n);
+        debug_assert_eq!(b_quants.len(), n * nb * 32);
+        debug_assert_eq!(b_scales.len(), n * nb);
+        unsafe {
+            let bsz = size_of::<BlockQ8_0>();
+            let k = nb * 32;
+            let mut j = 0;
+            // The tile loops carry numeric meaning beyond the index (`col = j +
+            // t`, weight offset `r * row_bytes`, output offset `r * n + j + t`),
+            // so range loops read more directly than zipped iterators.
+            #[allow(clippy::needless_range_loop)]
+            while j + STRIP_N <= n {
+                let mut acc = [[_mm256_setzero_ps(); STRIP_N]; TILE_M];
+                for b in 0..nb {
+                    // Decode the TILE_M weight blocks once, reused across cols.
+                    let mut w = [_mm256_setzero_si256(); TILE_M];
+                    let mut dw = [0.0f32; TILE_M];
+                    for r in 0..TILE_M {
+                        let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ8_0);
+                        w[r] = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
+                        dw[r] = f16::from_bits(block.delta).to_f32();
+                    }
+                    for t in 0..STRIP_N {
+                        let col = j + t;
+                        // One activation load, fed to every row in the strip.
+                        let a = _mm256_loadu_si256(
+                            b_quants.as_ptr().add(col * k + b * 32) as *const __m256i
+                        );
+                        let da = *b_scales.get_unchecked(col * nb + b);
+                        for r in 0..TILE_M {
+                            let prod = _mm256_cvtepi32_ps(dot32(w[r], a));
+                            let scale = _mm256_set1_ps(dw[r] * da);
+                            acc[r][t] = _mm256_fmadd_ps(prod, scale, acc[r][t]);
+                        }
+                    }
+                }
+                for r in 0..TILE_M {
+                    for t in 0..STRIP_N {
+                        *out.get_unchecked_mut(r * n + j + t) = hsum256_ps(acc[r][t]);
+                    }
+                }
+                j += STRIP_N;
+            }
+            // Column remainder (n % STRIP_N). The block loop is outermost so the
+            // single activation load is still shared across the strip's rows and
+            // the TILE_M accumulator chains stay independent — the same reuse the
+            // tile loop gets, just one column wide. Per (row, column) the fmadd
+            // order over `b` is unchanged, so this stays bit-identical to the
+            // per-row kernel.
+            #[allow(clippy::needless_range_loop)]
+            while j < n {
+                let mut acc = [_mm256_setzero_ps(); TILE_M];
+                for b in 0..nb {
+                    let a =
+                        _mm256_loadu_si256(b_quants.as_ptr().add(j * k + b * 32) as *const __m256i);
+                    let da = *b_scales.get_unchecked(j * nb + b);
+                    for r in 0..TILE_M {
+                        let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ8_0);
+                        let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
+                        let scale = _mm256_set1_ps(f16::from_bits(block.delta).to_f32() * da);
+                        acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc[r]);
+                    }
+                }
+                for (r, acc_r) in acc.iter().enumerate() {
+                    *out.get_unchecked_mut(r * n + j) = hsum256_ps(*acc_r);
+                }
+                j += 1;
+            }
+        }
+    }
+
+    /// One strip of `TILE_M` consecutive Q4_0 weight rows. Mirrors
+    /// `gemm_q8_0_strip`; the only differences are the block type and the nibble
+    /// unpack that produces each weight register.
+    #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+    unsafe fn gemm_q4_0_strip(
+        rows: *const u8,
+        row_bytes: usize,
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        n: usize,
+        nb: usize,
+    ) {
+        // Same unchecked contract as `gemm_q8_0_strip`.
+        debug_assert_eq!(out.len(), TILE_M * n);
+        debug_assert_eq!(b_quants.len(), n * nb * 32);
+        debug_assert_eq!(b_scales.len(), n * nb);
+        unsafe {
+            let bsz = size_of::<BlockQ4_0>();
+            let k = nb * 32;
+            let mut j = 0;
+            #[allow(clippy::needless_range_loop)]
+            while j + STRIP_N <= n {
+                let mut acc = [[_mm256_setzero_ps(); STRIP_N]; TILE_M];
+                for b in 0..nb {
+                    let mut w = [_mm256_setzero_si256(); TILE_M];
+                    let mut dw = [0.0f32; TILE_M];
+                    for r in 0..TILE_M {
+                        let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ4_0);
+                        w[r] = unpack_q4_0(block.qs.as_ptr());
+                        dw[r] = f16::from_bits(block.d).to_f32();
+                    }
+                    for t in 0..STRIP_N {
+                        let col = j + t;
+                        let a = _mm256_loadu_si256(
+                            b_quants.as_ptr().add(col * k + b * 32) as *const __m256i
+                        );
+                        let da = *b_scales.get_unchecked(col * nb + b);
+                        for r in 0..TILE_M {
+                            let prod = _mm256_cvtepi32_ps(dot32(w[r], a));
+                            let scale = _mm256_set1_ps(dw[r] * da);
+                            acc[r][t] = _mm256_fmadd_ps(prod, scale, acc[r][t]);
+                        }
+                    }
+                }
+                for r in 0..TILE_M {
+                    for t in 0..STRIP_N {
+                        *out.get_unchecked_mut(r * n + j + t) = hsum256_ps(acc[r][t]);
+                    }
+                }
+                j += STRIP_N;
+            }
+            // Column remainder — block loop outermost, as in `gemm_q8_0_strip`.
+            // `r` indexes both `acc` and the weight-row offset, so a range loop
+            // is the direct spelling here.
+            #[allow(clippy::needless_range_loop)]
+            while j < n {
+                let mut acc = [_mm256_setzero_ps(); TILE_M];
+                for b in 0..nb {
+                    let a =
+                        _mm256_loadu_si256(b_quants.as_ptr().add(j * k + b * 32) as *const __m256i);
+                    let da = *b_scales.get_unchecked(j * nb + b);
+                    for r in 0..TILE_M {
+                        let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ4_0);
+                        let w = unpack_q4_0(block.qs.as_ptr());
+                        let scale = _mm256_set1_ps(f16::from_bits(block.d).to_f32() * da);
+                        acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc[r]);
+                    }
+                }
+                for (r, acc_r) in acc.iter().enumerate() {
+                    *out.get_unchecked_mut(r * n + j) = hsum256_ps(*acc_r);
+                }
+                j += 1;
+            }
+        }
+    }
+
     /// Batched Q4_0 × Q8_0 GEMM: `out[m,n] = A_q4_0[m,k] @ B_q8_0[k,n]`,
-    /// parallel over output rows.
+    /// parallel over strips of `TILE_M` output rows.
     #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
     pub unsafe fn gemm_q4_0_q8_0_avx512(
         a_quant: &[u8],
@@ -3882,39 +4127,48 @@ pub(crate) mod avx512_vnni {
         debug_assert_eq!(b_scales.len(), n * nb);
         debug_assert_eq!(out.len(), m * n);
 
+        // One `TILE_M`-row strip per chunk; the final chunk may be short
+        // (`m % TILE_M`) and is finished row-by-row.
+        //
+        // This must stay a closure inside this `#[target_feature]` fn: closures
+        // inherit the enclosing function's feature set, so the strip and row
+        // kernels inline here with AVX-512 codegen. Hoisting it to a free `fn`
+        // would silently drop the features and un-inline both kernels.
+        let handle = |out_chunk: &mut [f32], s: usize| {
+            // Strip `s` owns rows `s * TILE_M ..` — `rows_here` of them, which is
+            // `TILE_M` for every chunk but a short final one. Compare against the
+            // exact byte length rather than a truncating division so a chunk that
+            // is not a whole number of rows takes the row path instead of
+            // silently entering the strip kernel.
+            let rows_here = out_chunk.len() / n;
+            // SAFETY: strip `s` reads `a_quant[s * TILE_M * row_bytes ..]` for
+            // `rows_here * row_bytes` bytes — up to `TILE_M * row_bytes`, not one
+            // row — which is in bounds because `out.len() == m * n` bounds `s` and
+            // `a_quant.len() == m * row_bytes`. Reads are shared and read-only;
+            // the write goes only to this task's disjoint `out_chunk`.
+            unsafe {
+                let rows = a_quant.as_ptr().add(s * TILE_M * row_bytes);
+                if out_chunk.len() == TILE_M * n {
+                    gemm_q4_0_strip(rows, row_bytes, b_scales, b_quants, out_chunk, n, nb);
+                } else {
+                    debug_assert_eq!(out_chunk.len(), rows_here * n);
+                    for (r, out_row) in out_chunk.chunks_mut(n).enumerate() {
+                        gemm_q4_0_row(rows.add(r * row_bytes), b_scales, b_quants, out_row, n, nb);
+                    }
+                }
+            }
+        };
+
         #[cfg(feature = "parallel")]
         {
             use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
-            let base = a_quant.as_ptr() as usize;
-            out.par_chunks_mut(n).enumerate().for_each(|(i, out_row)| {
-                // SAFETY: row `i` reads `a_quant[i*row_bytes ..][..row_bytes]`
-                // (in bounds by the assert above, read-only and shared), and
-                // writes only its own disjoint `out_row` chunk.
-                unsafe {
-                    gemm_q4_0_row(
-                        (base as *const u8).add(i * row_bytes),
-                        b_scales,
-                        b_quants,
-                        out_row,
-                        n,
-                        nb,
-                    );
-                }
-            });
+            out.par_chunks_mut(TILE_M * n)
+                .enumerate()
+                .for_each(|(s, out_chunk)| handle(out_chunk, s));
         }
         #[cfg(not(feature = "parallel"))]
-        for (i, out_row) in out.chunks_mut(n).enumerate() {
-            // SAFETY: as in the parallel branch above.
-            unsafe {
-                gemm_q4_0_row(
-                    a_quant.as_ptr().add(i * row_bytes),
-                    b_scales,
-                    b_quants,
-                    out_row,
-                    n,
-                    nb,
-                );
-            }
+        for (s, out_chunk) in out.chunks_mut(TILE_M * n).enumerate() {
+            handle(out_chunk, s);
         }
     }
 
@@ -3937,41 +4191,49 @@ pub(crate) mod avx512_vnni {
         debug_assert_eq!(b_scales.len(), n * nb);
         debug_assert_eq!(out.len(), m * n);
 
+        // One `TILE_M`-row strip per chunk; short final chunk row-by-row. Must
+        // stay a closure for the target-feature reason given in the Q4_0 GEMM.
+        let handle = |out_chunk: &mut [f32], s: usize| {
+            let rows_here = out_chunk.len() / n;
+            // SAFETY: as in the Q4_0 GEMM above — up to `TILE_M * row_bytes`.
+            unsafe {
+                let rows = a_quant.as_ptr().add(s * TILE_M * row_bytes);
+                if out_chunk.len() == TILE_M * n {
+                    gemm_q8_0_strip(rows, row_bytes, b_scales, b_quants, out_chunk, n, nb);
+                } else {
+                    debug_assert_eq!(out_chunk.len(), rows_here * n);
+                    for (r, out_row) in out_chunk.chunks_mut(n).enumerate() {
+                        gemm_q8_0_row(rows.add(r * row_bytes), b_scales, b_quants, out_row, n, nb);
+                    }
+                }
+            }
+        };
+
         #[cfg(feature = "parallel")]
         {
             use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
-            let base = a_quant.as_ptr() as usize;
-            out.par_chunks_mut(n).enumerate().for_each(|(i, out_row)| {
-                // SAFETY: as in the Q4_0 GEMM above.
-                unsafe {
-                    gemm_q8_0_row(
-                        (base as *const u8).add(i * row_bytes),
-                        b_scales,
-                        b_quants,
-                        out_row,
-                        n,
-                        nb,
-                    );
-                }
-            });
+            out.par_chunks_mut(TILE_M * n)
+                .enumerate()
+                .for_each(|(s, out_chunk)| handle(out_chunk, s));
         }
         #[cfg(not(feature = "parallel"))]
-        for (i, out_row) in out.chunks_mut(n).enumerate() {
-            // SAFETY: as in the parallel branch above.
-            unsafe {
-                gemm_q8_0_row(
-                    a_quant.as_ptr().add(i * row_bytes),
-                    b_scales,
-                    b_quants,
-                    out_row,
-                    n,
-                    nb,
-                );
-            }
+        for (s, out_chunk) in out.chunks_mut(TILE_M * n).enumerate() {
+            handle(out_chunk, s);
         }
     }
 
     // ── K-quant int8 kernels ────────────────────────────────────────────────
+    //
+    // NOT row-tiled, deliberately — measured, not assumed. The Q4_0/Q8_0 GEMMs
+    // above process `TILE_M` weight rows per task ("Row tiling"); these stay
+    // per-row. Q4_K/Q6_K reduce each `vpdpbusd` to a scalar immediately (an hsum
+    // per block) and carry a per-sub-block scale plus a mins correction, so there
+    // is no vector-accumulator ILP for tiling to expose — only activation-load
+    // reuse, against much heavier per-block work. A row-tiled Q4_K prototype
+    // measured **-9.3% at 4x8 and -17% at 4x4, 0/8 rounds won in both**. Q6_K was
+    // not prototyped; it shares the structure with more per-block work still (qh
+    // reconstruction, two hsums per column). Note also that the K-quant GEMV *is*
+    // this GEMM at n=1, so tiling here would have to not regress decode.
     //
     // x86 analogue of the NEON K-quant GEMM family. Two structural differences,
     // both forced by `vpdpbusd` taking an *unsigned* × signed operand pair:
@@ -4776,11 +5038,22 @@ pub(crate) mod avx512_vnni {
             assert_close(&y, &ref_gemv_q8_0(&a, &xs, &xq, m, k), "gemv_q8_0");
         }
 
-        /// The GEMM must agree with the GEMV column-by-column. `n` is chosen so
-        /// that `n > TILE_N && n % TILE_N != 0`, which covers the vector tile
-        /// loop and the scalar column remainder both. Keep that invariant when
-        /// `TILE_N` changes — a fixed `n` that was fine at one tile width can
-        /// silently degenerate into remainder-only coverage at the next.
+        /// The GEMM must agree with the GEMV column-by-column.
+        ///
+        /// The shape is load-bearing, and now on three constants, not one. Keep
+        /// ALL of these true when any of them is retuned — a fixed `(m, n)` that
+        /// was fine at one tiling can silently degenerate into partial coverage
+        /// at the next, with the suite still green:
+        ///   - `n > TILE_N && n % TILE_N != 0` — the per-row kernel's tile loop
+        ///     and its column remainder (reached via the `m % TILE_M` tail).
+        ///   - `n > STRIP_N && n % STRIP_N != 0` — the strip kernel's tile loop
+        ///     and its column remainder.
+        ///   - `m > TILE_M && m % TILE_M != 0` — full strips plus the short final
+        ///     strip that falls back to the per-row kernel.
+        ///
+        /// `gemm_avx512_row_tiled_matches_per_row_bit_exact` covers the same
+        /// branches across several shapes and is the better guard; this test adds
+        /// an independent oracle (the GEMV) rather than another shape.
         #[test]
         fn gemm_q4_0_avx512_matches_gemv_per_column() {
             if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
@@ -4820,6 +5093,111 @@ pub(crate) mod avx512_vnni {
             }
         }
 
+        /// The row-tiled drivers must be **bit-identical** to driving the per-row
+        /// kernels directly — a column's accumulator chain is the same fmadd
+        /// sequence in the same order either way, so any difference is a bug.
+        ///
+        /// This is the guard for the property the row-tiling comment asserts, and
+        /// it runs in CI (unlike `microbench_gemm_rowtile`, which is `#[ignore]`d).
+        /// Data is pseudo-random, not a repeated constant: with uniform inputs a
+        /// transposed index or a wrong row offset still yields identical output,
+        /// so a constant-filled comparison cannot see the bug class row tiling
+        /// introduces.
+        ///
+        /// Shapes are chosen to cover every path, and each is annotated with what
+        /// it exercises so the coverage survives a `TILE_M`/`STRIP_N` retune.
+        #[test]
+        fn gemm_avx512_row_tiled_matches_per_row_bit_exact() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            // (m, n): full strips + tail rows, full tiles + column remainder.
+            let shapes = [
+                (13, 11), // 3 strips + 1 tail row; 2 tiles + 3 remainder cols
+                (16, 8),  // exact strips, exact tiles: no remainder at all
+                (3, 5),   // m < TILE_M: every row on the tail path
+                (8, 2),   // n < STRIP_N: tiled loop never runs, all remainder
+                (9, 4),   // exactly one tile wide, 2 strips + 1 tail row
+            ];
+            let k = 96;
+            let nb = k / 32;
+
+            for (m, n) in shapes {
+                let mut st = 0x51de_0000u64 ^ ((m * 131 + n) as u64);
+                let mut b_scales = vec![0.0f32; n * nb];
+                let mut b_quants = vec![0i8; n * k];
+                for j in 0..n {
+                    let col: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+                    let (s, q) = ref_quantize(&col);
+                    b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                    b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+                }
+
+                // Q4_0
+                let a4 = rand_q4_0_rows(m, k, &mut st);
+                let mut tiled = vec![0.0f32; m * n];
+                let mut per_row = vec![0.0f32; m * n];
+                unsafe { gemm_q4_0_q8_0_avx512(&a4, &b_scales, &b_quants, &mut tiled, m, n, k) };
+                let row_bytes4 = nb * size_of::<BlockQ4_0>();
+                for (r, out_row) in per_row.chunks_mut(n).enumerate() {
+                    // SAFETY: row `r` is in bounds of `a4` (m rows of row_bytes4).
+                    unsafe {
+                        gemm_q4_0_row(
+                            a4.as_ptr().add(r * row_bytes4),
+                            &b_scales,
+                            &b_quants,
+                            out_row,
+                            n,
+                            nb,
+                        )
+                    };
+                }
+                assert_bits_eq(&per_row, &tiled, "q4_0", m, n);
+
+                // Q8_0
+                let a8 = rand_q8_0_rows(m, k, &mut st);
+                let mut tiled = vec![0.0f32; m * n];
+                let mut per_row = vec![0.0f32; m * n];
+                unsafe { gemm_q8_0_q8_0_avx512(&a8, &b_scales, &b_quants, &mut tiled, m, n, k) };
+                let row_bytes8 = nb * size_of::<BlockQ8_0>();
+                for (r, out_row) in per_row.chunks_mut(n).enumerate() {
+                    // SAFETY: row `r` is in bounds of `a8` (m rows of row_bytes8).
+                    unsafe {
+                        gemm_q8_0_row(
+                            a8.as_ptr().add(r * row_bytes8),
+                            &b_scales,
+                            &b_quants,
+                            out_row,
+                            n,
+                            nb,
+                        )
+                    };
+                }
+                assert_bits_eq(&per_row, &tiled, "q8_0", m, n);
+            }
+        }
+
+        /// Exact bit-pattern equality, reporting the first differing element.
+        fn assert_bits_eq(per_row: &[f32], tiled: &[f32], tag: &str, m: usize, n: usize) {
+            if let Some((i, (x, y))) = per_row
+                .iter()
+                .zip(tiled)
+                .enumerate()
+                .find(|(_, (x, y))| x.to_bits() != y.to_bits())
+            {
+                panic!(
+                    "{tag} row-tiled diverged at {}x{} index {i} (row {}, col {}): \
+                     per-row {x:e} ({:#010x}) vs tiled {y:e} ({:#010x})",
+                    m,
+                    n,
+                    i / n,
+                    i % n,
+                    x.to_bits(),
+                    y.to_bits()
+                );
+            }
+        }
+
         /// Prefill GEMM throughput against this machine's int8 peak.
         ///
         /// This GEMM accounts for ~56% of prefill samples (samply, Llama-3.2-1B
@@ -4848,16 +5226,20 @@ pub(crate) mod avx512_vnni {
             let ops = 2.0 * m as f64 * n as f64 * k as f64;
 
             let run = || {
+                // m is a multiple of TILE_M, so every chunk is a full strip and
+                // this measures the row-tiled path (TILE_M x STRIP_N). It does
+                // NOT measure TILE_N — that governs only the `m % TILE_M` tail —
+                // so the header names the constants actually under test.
                 let report = |tag: &str, secs: f64| {
                     eprintln!(
-                        "=== {tag} {m}x{n}x{k} (TILE_N={TILE_N}) ===\n  {:.1} ms/call   {:.0} GOP/s",
+                        "=== {tag} {m}x{n}x{k} (TILE_M={TILE_M}, STRIP_N={STRIP_N}) ===\n  {:.1} ms/call   {:.0} GOP/s",
                         secs * 1e3,
                         ops / secs / 1e9
                     );
                 };
-                // Q4_0 first: TILE_N is shared with that kernel, whose nibble
-                // unpack needs extra temporaries, so a tile size good for Q8_0
-                // can regress it.
+                // Q4_0 first: the tile constants are shared with that kernel,
+                // whose nibble unpack needs extra temporaries, so a tile size
+                // good for Q8_0 can regress it.
                 {
                     let a4 = vec![7u8; m * nb * size_of::<BlockQ4_0>()];
                     let bs = vec![0.01f32; n * nb];
@@ -4894,10 +5276,224 @@ pub(crate) mod avx512_vnni {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(crate::backend::cpu_features::performance_core_count())
                 .build()
-                .expect("build pinned rayon pool")
+                .expect("build fixed-size rayon pool")
                 .install(run);
             #[cfg(not(feature = "parallel"))]
             run();
+        }
+
+        // ── Row-tiling A/B (task #17) ───────────────────────────────────────
+        //
+        // The production GEMM drivers are now row-tiled (`gemm_*_strip`). These
+        // per-row reference drivers reproduce the pre-tiling behaviour — one
+        // weight row per task — so `microbench_gemm_rowtile` can measure the
+        // shipped kernels against the design they replaced, in one process on
+        // the same pinned rayon pool. Read the paired win/loss line, not the
+        // means (see `microbench_gemm` for why).
+
+        /// Pre-row-tiling Q8_0 driver: one weight row per task.
+        #[cfg(feature = "parallel")]
+        #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+        unsafe fn ref_gemm_q8_0_perrow(
+            a_quant: &[u8],
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            n: usize,
+            k: usize,
+        ) {
+            use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+            let nb = k / 32;
+            let row_bytes = nb * size_of::<BlockQ8_0>();
+            let base = a_quant.as_ptr() as usize;
+            out.par_chunks_mut(n).enumerate().for_each(|(i, out_row)| {
+                // SAFETY: row `i` reads its own `row_bytes` span; writes `out_row`.
+                unsafe {
+                    gemm_q8_0_row(
+                        (base as *const u8).wrapping_add(i * row_bytes),
+                        b_scales,
+                        b_quants,
+                        out_row,
+                        n,
+                        nb,
+                    );
+                }
+            });
+        }
+
+        /// Pre-row-tiling Q4_0 driver: one weight row per task.
+        #[cfg(feature = "parallel")]
+        #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+        unsafe fn ref_gemm_q4_0_perrow(
+            a_quant: &[u8],
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            n: usize,
+            k: usize,
+        ) {
+            use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+            let nb = k / 32;
+            let row_bytes = nb * size_of::<BlockQ4_0>();
+            let base = a_quant.as_ptr() as usize;
+            out.par_chunks_mut(n).enumerate().for_each(|(i, out_row)| {
+                // SAFETY: as in `ref_gemm_q8_0_perrow`.
+                unsafe {
+                    gemm_q4_0_row(
+                        (base as *const u8).wrapping_add(i * row_bytes),
+                        b_scales,
+                        b_quants,
+                        out_row,
+                        n,
+                        nb,
+                    );
+                }
+            });
+        }
+
+        /// A/B of the production row-tiled GEMM against the per-row reference it
+        /// replaced, for both dtypes, in one process.
+        ///
+        /// ```text
+        /// cargo test -p cera --release --lib microbench_gemm_rowtile -- --ignored --nocapture
+        /// ```
+        ///
+        /// `--release` is not optional: in a debug build the intrinsics are
+        /// unoptimised and the run takes hours rather than ~45 s.
+        ///
+        /// Read the paired win/loss line, not the means. Both arms run inside a
+        /// rayon pool of **fixed size** (the performance-core count) — the pool is
+        /// sized, not affinity-pinned; workers are still placed by the OS. Sizing
+        /// alone is what collapses the spread, because the variance comes from
+        /// rayon's per-process pool *size*, not from placement (see
+        /// `microbench_gemm` for the measured numbers).
+        ///
+        /// Parallel-only: both arms are thread-pool drivers, so there is nothing
+        /// to compare in a serial build.
+        #[cfg(feature = "parallel")]
+        #[test]
+        #[ignore]
+        fn microbench_gemm_rowtile() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            use std::time::Instant;
+            let (m, n, k) = (2048usize, 512usize, 2048usize);
+            let nb = k / 32;
+            let ops = 2.0 * m as f64 * n as f64 * k as f64;
+            let iters = 200;
+            let rounds = 8;
+            // Varied activations, not a repeated constant. Correctness aside (the
+            // bit-exact guard is a real test now), uniform data lets the branch
+            // predictor and the caches behave in ways real activations do not.
+            let mut st = 0x7ea1_c0deu64;
+            let mut b_scales = vec![0.0f32; n * nb];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+                let (s, q) = ref_quantize(&col);
+                b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+
+            // Paired rounds. The arm order ALTERNATES on round parity: a fixed
+            // order would let the second arm always inherit the first arm's cache
+            // and clock state, and that bias has constant sign — which is exactly
+            // what a genuine win also looks like in the rounds-won statistic.
+            // Interleaving alone does not fix this; alternating does.
+            fn report(tag: &str, rounds: usize, bench: &mut dyn FnMut(bool) -> f64) {
+                let (mut wins, mut sref, mut snew) = (0usize, 0.0f64, 0.0f64);
+                eprintln!("\n=== {tag} row-tile A/B (TILE_M={TILE_M}, STRIP_N={STRIP_N}) ===");
+                for r in 0..rounds {
+                    let (g_ref, g_new) = if r % 2 == 0 {
+                        let a = bench(false);
+                        (a, bench(true))
+                    } else {
+                        let b = bench(true);
+                        (bench(false), b)
+                    };
+                    if g_new > g_ref {
+                        wins += 1;
+                    }
+                    sref += g_ref;
+                    snew += g_new;
+                    let first = if r % 2 == 0 { "ref" } else { "new" };
+                    eprintln!(
+                        "  round {r} ({first} first):  per-row {g_ref:.0}   row-tiled {g_new:.0} GOP/s"
+                    );
+                }
+                eprintln!(
+                    "  mean:    per-row {:.0}   row-tiled {:.0} GOP/s   {:+.1}%   tiled wins {wins}/{rounds}",
+                    sref / rounds as f64,
+                    snew / rounds as f64,
+                    (snew - sref) / sref * 100.0
+                );
+            }
+
+            let run = || {
+                {
+                    let mut wst = 0x1234_abcdu64;
+                    let a = rand_q8_0_rows(m, k, &mut wst);
+                    let mut c_ref = vec![0.0f32; m * n];
+                    let mut c_new = vec![0.0f32; m * n];
+                    let mut bench = |tiled: bool| -> f64 {
+                        let t = Instant::now();
+                        for _ in 0..iters {
+                            if tiled {
+                                unsafe {
+                                    gemm_q8_0_q8_0_avx512(
+                                        &a, &b_scales, &b_quants, &mut c_new, m, n, k,
+                                    )
+                                };
+                            } else {
+                                unsafe {
+                                    ref_gemm_q8_0_perrow(&a, &b_scales, &b_quants, &mut c_ref, n, k)
+                                };
+                            }
+                        }
+                        let secs = t.elapsed().as_secs_f64();
+                        // Observe the outputs so the timed calls cannot be folded
+                        // away as dead stores: the inputs are loop-invariant and
+                        // nothing downstream reads the results.
+                        std::hint::black_box((&c_ref, &c_new));
+                        ops / (secs / iters as f64) / 1e9
+                    };
+                    report("gemm_q8_0", rounds, &mut bench);
+                }
+
+                {
+                    let mut wst = 0xfeed_5eedu64;
+                    let a = rand_q4_0_rows(m, k, &mut wst);
+                    let mut c_ref = vec![0.0f32; m * n];
+                    let mut c_new = vec![0.0f32; m * n];
+                    let mut bench = |tiled: bool| -> f64 {
+                        let t = Instant::now();
+                        for _ in 0..iters {
+                            if tiled {
+                                unsafe {
+                                    gemm_q4_0_q8_0_avx512(
+                                        &a, &b_scales, &b_quants, &mut c_new, m, n, k,
+                                    )
+                                };
+                            } else {
+                                unsafe {
+                                    ref_gemm_q4_0_perrow(&a, &b_scales, &b_quants, &mut c_ref, n, k)
+                                };
+                            }
+                        }
+                        let secs = t.elapsed().as_secs_f64();
+                        std::hint::black_box((&c_ref, &c_new));
+                        ops / (secs / iters as f64) / 1e9
+                    };
+                    report("gemm_q4_0", rounds, &mut bench);
+                }
+            };
+
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(crate::backend::cpu_features::performance_core_count())
+                .build()
+                .expect("build fixed-size rayon pool")
+                .install(run);
         }
 
         #[test]
