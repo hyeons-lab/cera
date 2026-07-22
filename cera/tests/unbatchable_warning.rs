@@ -12,10 +12,14 @@
 //! when the batched path declines, so a future change that makes the fallback
 //! silent fails here instead of in someone's throughput numbers.
 //!
-//! `CERA_CPU_TIER=avx512` is the lever: it caps the tier below `Avx512Vnni`, so
+//! `CERA_CPU_TIER=scalar` is the lever: it caps the tier below `Avx2`, so
 //! `int8_gemm_available()` is false, `batched_gemm_supports` declines every
 //! dtype, and prefill must fall back. The tier is cached in a `OnceLock` and read
 //! once per process, which is why this is its own test binary with a single test.
+//!
+//! The lever used to be `avx512`, which worked while the x86 int8 GEMM required
+//! VNNI. The AVX2 kernels made every tier from `Avx2` up capable, so `scalar` is
+//! now the only x86 tier that forces the fallback this test needs.
 
 #![cfg(all(target_arch = "x86_64", not(feature = "blas")))]
 
@@ -72,13 +76,13 @@ fn per_token_fallback_emits_a_warning() {
     // environment, and set before any `cpu_features()` call — the tier is
     // cached, so this binary holds exactly one test.
     unsafe {
-        std::env::set_var("CERA_CPU_TIER", "avx512");
+        std::env::set_var("CERA_CPU_TIER", "scalar");
     }
 
     let tier = cera::backend::cpu_features::cpu_features().tier;
     assert!(
-        tier < cera::backend::cpu_features::CpuTier::Avx512Vnni,
-        "CERA_CPU_TIER=avx512 did not downgrade the tier (got {tier:?}); without \
+        tier < cera::backend::cpu_features::CpuTier::Avx2,
+        "CERA_CPU_TIER=scalar did not downgrade the tier (got {tier:?}); without \
          the downgrade the batched path would still run and this test would be \
          asserting nothing"
     );

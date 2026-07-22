@@ -132,6 +132,55 @@ pub(crate) fn weight_data<'a>(gguf: &'a GgufFile, wref: &WeightRef) -> &'a [u8] 
     &gguf.mmap_data()[wref.start..wref.start + wref.size]
 }
 
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    /// The K-quant super-block guard must actually decline.
+    ///
+    /// `batched_gemm_supports` had no test coverage at all: deleting
+    /// `&& k % 256 == 0` passed the entire suite, because the only thing that
+    /// exercised this function was the `#[ignore]`d real-model parity suite.
+    /// With the guard gone, a K-quant layer whose `k` is not a super-block
+    /// multiple reaches `gemm_preq_dispatch` and hits its block-alignment
+    /// assert — a release panic on a real model, where the intended behaviour
+    /// is a clean fall back to per-token GEMV.
+    #[test]
+    fn k_quant_batched_gemm_requires_whole_superblocks() {
+        for k in [32usize, 128, 255, 257, 384] {
+            assert!(
+                !batched_gemm_supports(DType::Q4KM, k),
+                "Q4KM admitted k={k}, which is not a multiple of 256"
+            );
+            assert!(
+                !batched_gemm_supports(DType::Q6K, k),
+                "Q6K admitted k={k}, which is not a multiple of 256"
+            );
+        }
+        // The positive direction, so the test cannot pass by the gate being
+        // stuck closed. Aligned `k` is admitted exactly when a kernel exists.
+        let expect = k_quant_gemm_available();
+        for k in [256usize, 512, 2048] {
+            assert_eq!(
+                batched_gemm_supports(DType::Q4KM, k),
+                expect,
+                "Q4KM at aligned k={k} disagrees with k_quant_gemm_available()"
+            );
+        }
+    }
+
+    /// Dtypes with no int8 kernel must decline whatever the host.
+    #[test]
+    fn unsupported_dtypes_are_never_batched() {
+        for dtype in [DType::Q4_1, DType::Q5KM, DType::F16, DType::F32] {
+            assert!(
+                !batched_gemm_supports(dtype, 256),
+                "{dtype:?} was admitted to the batched path with no kernel to run it"
+            );
+        }
+    }
+}
+
 /// GEMV dispatch without scratch buffers.
 pub(crate) fn gemv(gguf: &GgufFile, wref: &WeightRef, x: &[f32], y: &mut [f32]) {
     let data = weight_data(gguf, wref);
@@ -212,11 +261,21 @@ pub(crate) fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
 /// "the format guarantees it" is precisely how the last two silent fallbacks got
 /// written, so it is checked rather than assumed).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
-pub(crate) fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
+/// `#[doc(hidden)] pub` so `int8_gemm_gate.rs` can assert on the gate itself,
+/// not just on the predicate it consults. That binary forces
+/// `CERA_CPU_TIER=scalar` in a dedicated process, which a unit test cannot do —
+/// and asserting only on `cpu::int8_gemm_available()` left every arm of this
+/// function replaceable with `true` without a single test failing. Not part of
+/// the supported API.
+#[doc(hidden)]
+pub fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
     match dtype {
-        // Not unconditional: on x86 the int8 GEMM needs VNNI, and a non-VNNI
-        // host must stay on the per-token GEMV fallback. Under `blas` the
-        // question is moot — that path dequantizes and SGEMMs.
+        // Not unconditional: x86 needs avx2+fma at minimum, so a Scalar-tier
+        // host must stay on the per-token GEMV fallback. This used to require
+        // VNNI; the AVX2 kernels (`dpbusd` emulated with `maddubs`) lowered the
+        // bar to every tier from `Avx2` up, which is why the predicate is a tier
+        // comparison and not a VNNI check. Under `blas` the question is moot —
+        // that path dequantizes and SGEMMs.
         DType::Q4_0 | DType::Q8_0 => {
             cfg!(feature = "blas") || crate::backend::cpu::int8_gemm_available()
         }
@@ -233,8 +292,8 @@ pub(crate) fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
 /// batched path, which the CI lint job (`cargo clippy --workspace --all-targets --
 /// -D warnings`, ubuntu, no `blas`) turns into a hard error — an aarch64 dev
 /// machine cannot reproduce that. It *is* called on x86_64, where it now answers
-/// for the VNNI K-quant GEMM kernels — so this is a lint cfg, not a statement
-/// about which targets reach it.
+/// for the x86 K-quant GEMM kernels (VNNI and AVX2 alike) — so this is a lint
+/// cfg, not a statement about which targets reach it.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
 fn k_quant_gemm_available() -> bool {
     // BLAS dequantizes the weight and SGEMMs, so it needs no int8 kernel.
@@ -246,16 +305,15 @@ fn k_quant_gemm_available() -> bool {
     {
         crate::backend::simd::neon::k_quant_gemm_available()
     }
-    // No BLAS and no NEON: there is no batched path at all on this target (the
-    // caller gates are themselves cfg'd off), so the answer is moot but must be
-    // `false` rather than optimistic.
-    // x86: the VNNI K-quant GEMM shares its availability condition with the
-    // Q4_0/Q8_0 int8 kernels — runtime AVX-512 VNNI, `avx512` feature on.
+    // x86: the K-quant GEMM shares its availability condition with the
+    // Q4_0/Q8_0 int8 kernels. Both are emitted by the same macro and both are
+    // instantiated at the VNNI and AVX2 tiers, so this needs neither VNNI nor
+    // the `avx512` crate feature — just avx2+fma.
     #[cfg(all(not(feature = "blas"), target_arch = "x86_64"))]
     {
         crate::backend::cpu::int8_gemm_available()
     }
-    // No BLAS, no NEON, no VNNI: no batched K-quant path on this target.
+    // No BLAS, no NEON, no x86 int8: no batched K-quant path on this target.
     #[cfg(all(
         not(feature = "blas"),
         not(target_arch = "aarch64"),
@@ -331,7 +389,8 @@ pub(crate) fn try_blas_prefill_gemm(
 
 /// Batched GEMM with pre-quantized Q8_0 input columns (the no-BLAS fallback).
 /// Dispatches on the weight dtype to whichever int8 kernel this target has —
-/// aarch64 NEON or x86_64 AVX-512 VNNI; returns `true` when a kernel ran.
+/// aarch64 NEON, or x86_64 int8 (VNNI or the AVX2 emulation). Returns `true`
+/// when a kernel ran.
 /// A `false` return means nothing was computed and the caller's output buffer
 /// still holds whatever was in it, so callers must gate rather than ignore it.
 #[cfg(all(
@@ -370,6 +429,18 @@ pub(crate) fn gemm_preq(
     // `quantize_columns` packs column j at the matching `k`-strided offset.
     let b_scales = &b_scales[..n * (k / 32)];
     let b_quants = &b_quants[..n * k];
+    // Same treatment for `out`, and for a sharper reason than tidiness: the
+    // kernels derive their row/strip index from `out.len()`, not from `m`, so an
+    // over-long buffer walks past row `m` and reads weights out of bounds.
+    //
+    // One in-tree caller hands us exactly that: LFM2's short-conv `in_proj`
+    // GEMM passes `m = 3*hs` into `proj_mat`, which is sized
+    // `max(3*hs, hs + 2*kv_dim) * n` because it is shared with the attention
+    // projection. That exceeds `m*n` whenever `kv_dim > hs`. No shipping GQA
+    // config does that — kv_dim is always the smaller one — so it is latent
+    // rather than live, but the fix belongs here, where every caller passes
+    // through, rather than at the one site that happens to trip it.
+    let out = &mut out[..m * n];
     let ran = cpu::gemm_preq_dispatch(wref.dtype, data, b_scales, b_quants, out, m, n, k);
     if !ran {
         // Reaching here means a caller gated on `batched_gemm_supports` and got a
@@ -409,7 +480,7 @@ fn report_uncomputed_gemm(dtype: DType, k: usize) {
 /// Quantize all `n` columns of a column-major `[dim × n]` matrix to Q8_0
 /// (no-`blas` fallback). `col` is a scratch column of length ≥ `dim`;
 /// `scales`/`quants` receive the packed `[n][dim/32]` / `[n][dim]` layout the
-/// batched int8 GEMM kernels consume — the same layout on NEON and VNNI.
+/// batched int8 GEMM kernels consume — the same layout on NEON, VNNI, and AVX2.
 #[cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
     not(feature = "blas")

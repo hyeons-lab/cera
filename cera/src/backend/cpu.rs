@@ -310,6 +310,7 @@ pub fn gemv_q4_0_f32(
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
     debug_assert_eq!(k % 32, 0, "Q4_0 GEMV: k must be divisible by 32");
+
     let blocks_per_row = k / 32;
     let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
     debug_assert_eq!(a_quant.len(), m * row_bytes);
@@ -325,22 +326,49 @@ pub fn gemv_q4_0_f32(
 
     #[cfg(not(target_arch = "aarch64"))]
     {
-        // x86 VNNI: quantize the activation to Q8_0 once, then keep the whole
-        // dot product in int8 (`dpbusd`) instead of widening every weight to
-        // f32. Same shape as the aarch64 branch above; `q8_scales`/`q8_quants`
+        // x86 int8: quantize the activation to Q8_0 once, then keep the whole
+        // dot product in int8 instead of widening every weight to f32 —
+        // `dpbusd` on the VNNI arm, the `maddubs` emulation on the AVX2 one.
+        // Same shape as the aarch64 branch above; `q8_scales`/`q8_quants`
         // are the caller's reusable scratch, which is why they are threaded
         // through this signature at all.
+        // `vnni_int8_available()`, not a hand-rolled tier compare: this predicate
+        // and the one selecting the quantizer must not drift, and since the AVX2
+        // int8 kernels landed they are two different predicates.
         #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-        if crate::backend::cpu_features::cpu_features().tier
-            >= crate::backend::cpu_features::CpuTier::Avx512Vnni
-        {
+        if vnni_int8_available() {
             q8_scales.resize(blocks_per_row, 0.0);
             q8_quants.resize(k, 0);
+            // SAFETY: the tier predicate above proved the kernel's feature set,
+            // and the scratch was just sized to the lengths it asserts.
+            // `quantize_f32_to_q8_0_into`, not a per-tier quantizer: it already
+            // dispatches, and naming it here is what makes decode and prefill
+            // provably quantize through the same function.
             unsafe {
-                crate::backend::simd::avx512_vnni::quantize_f32_to_q8_0_avx512(
-                    x, q8_scales, q8_quants,
+                quantize_f32_to_q8_0_into(x, q8_scales, q8_quants);
+                crate::backend::simd::avx512_vnni::gemv_q4_0_q8_0(
+                    a_quant, q8_scales, q8_quants, y, m, k,
                 );
-                crate::backend::simd::avx512_vnni::gemv_q4_0_q8_0_avx512(
+            }
+            return;
+        }
+
+        // No VNNI but AVX2: the emulated int8 GEMV. Decode has to take the same
+        // arithmetic as batched prefill or the parity bar breaks — see
+        // `avx2_int8::gemv_q4k_f32` for the measurement behind that, and
+        // `tests/avx2_decode_prefill_identity.rs` for the guard.
+        #[cfg(target_arch = "x86_64")]
+        if avx2_int8_available() {
+            q8_scales.resize(blocks_per_row, 0.0);
+            q8_quants.resize(k, 0);
+            // SAFETY: the tier predicate above proved the kernel's feature set,
+            // and the scratch was just sized to the lengths it asserts.
+            // `quantize_f32_to_q8_0_into`, not a per-tier quantizer: it already
+            // dispatches, and naming it here is what makes decode and prefill
+            // provably quantize through the same function.
+            unsafe {
+                quantize_f32_to_q8_0_into(x, q8_scales, q8_quants);
+                crate::backend::simd::avx2_int8::gemv_q4_0_q8_0(
                     a_quant, q8_scales, q8_quants, y, m, k,
                 );
             }
@@ -348,28 +376,18 @@ pub fn gemv_q4_0_f32(
         }
 
         let _ = (q8_scales, q8_quants);
-        // Resolved once, not once per output row. The tier is a process-wide
-        // constant behind a `OnceLock`, and this closure runs for every row —
-        // 65k+ of them on the logit projection.
-        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-        let use_avx512 = crate::backend::cpu_features::cpu_features().tier
-            >= crate::backend::cpu_features::CpuTier::Avx512;
+        // The AVX-512 f32 row-dot dispatch that used to sit here is gone. The
+        // int8 arms above return for every tier from `Avx2` up, so it was
+        // unreachable on every shipping x86 CPU — including at `Scalar`, where
+        // its own tier guard is false. Two reasons it had to go rather than
+        // merely being shadowed: the int8 GEMV measured faster even on an
+        // AVX-512 host (31.5 -> 41.6 tok/s decode at `CERA_CPU_TIER=avx512`),
+        // and decode must run the same arithmetic as batched prefill or the
+        // parity bar breaks. The kernels themselves
+        // (`simd::avx512::row_dot_{q4_0,q8_0}_f32_avx512`) are kept and still
+        // unit-tested, so restoring the dispatch is a small change if the int8
+        // path ever needs narrowing.
         let compute_row = |(i, yi): (usize, &mut f32)| {
-            // AVX-512 without VNNI: still the f32 path, but reduce once per row
-            // rather than once per 32-element block.
-            #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-            if use_avx512 {
-                // SAFETY: row `i` spans `a_quant[i*row_bytes ..][..row_bytes]`.
-                *yi = unsafe {
-                    crate::backend::simd::avx512::row_dot_q4_0_f32_avx512(
-                        a_quant.as_ptr().add(i * row_bytes),
-                        x,
-                        blocks_per_row,
-                    )
-                };
-                return;
-            }
-
             let row_start = i * row_bytes;
             let mut sum = 0.0f32;
             for bi in 0..blocks_per_row {
@@ -425,7 +443,7 @@ pub fn gemv_par_threshold() -> usize {
 /// [`GEMV_PAR_THRESHOLD_DEFAULT`].
 ///
 /// Consumed by the no-`blas` prefill `quantize_columns` on both int8-GEMM
-/// targets: aarch64 NEON and x86_64 AVX-512 VNNI.
+/// targets: aarch64 NEON and x86_64 int8 (VNNI or AVX2).
 #[cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
     not(feature = "blas")
@@ -477,7 +495,7 @@ pub fn gemv_min_rows() -> usize {
 /// so a host that falls back here produces bit-identical blocks to one that
 /// doesn't.
 #[cfg(not(target_arch = "aarch64"))]
-fn quantize_f32_to_q8_0_scalar(x: &[f32], scales: &mut [f32], quants: &mut [i8]) {
+pub(crate) fn quantize_f32_to_q8_0_scalar(x: &[f32], scales: &mut [f32], quants: &mut [i8]) {
     for (bi, blk) in x.chunks(32).enumerate() {
         let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
         let d = amax / 127.0;
@@ -501,7 +519,10 @@ fn quantize_f32_to_q8_0_scalar(x: &[f32], scales: &mut [f32], quants: &mut [i8])
 /// The arch-neutral entry point for the batched-prefill helpers: the per-arch
 /// kernels each sit behind their own `target_feature`, so they cannot be named
 /// interchangeably at a call site.
-pub(crate) fn quantize_f32_to_q8_0_into(x: &[f32], scales: &mut [f32], quants: &mut [i8]) {
+/// `#[doc(hidden)] pub` for the same reason as `gemm_preq_dispatch` — the
+/// decode/prefill identity test has to quantize its own activation column.
+#[doc(hidden)]
+pub fn quantize_f32_to_q8_0_into(x: &[f32], scales: &mut [f32], quants: &mut [i8]) {
     // `assert!`, not `debug_assert!`: this is a safe function that hands its
     // arguments to `unsafe` SIMD kernels which write `x.len()/32` scales and
     // `x.len()` quants with no bounds checking of their own. A short buffer is
@@ -532,11 +553,40 @@ pub(crate) fn quantize_f32_to_q8_0_into(x: &[f32], scales: &mut [f32], quants: &
 
     #[cfg(not(target_arch = "aarch64"))]
     {
-        // Same predicate as the GEMM that consumes this output, by construction:
-        // the quantizer and the kernel must agree, or we would pre-quantize into
-        // a layout nothing can read.
+        // NOT `int8_gemm_available`: this quantizer is built from `_mm512_*`
+        // intrinsics, so the predicate has to answer "can this host execute
+        // AVX-512", not "does this host have some int8 GEMM". Since the AVX2
+        // int8 kernels landed those differ, and the wider predicate would hand
+        // AVX-512 code to an AVX2-only host — a SIGILL, not a wrong answer.
+        //
+        // Not `vnni_int8_available()` either. `quantize_f32_to_q8_0_avx512`
+        // declares `avx512f,avx512vl,avx2` and uses no `dpbusd`, so requiring
+        // VNNI would deny it to every Skylake-X-class host — which, since the
+        // int8 arms now shadow the f32 row-dot, is a host that quantizes on
+        // every projection. Hence the dedicated `avx512_quantizer_available()`.
+        //
+        // Do not read that as a measured win: A/B'd on LFM2.5-230M-Q4_K_M at
+        // `CERA_CPU_TIER=avx512`, pool pinned at 16, n=20, the two arms are
+        // indistinguishable (decode p50 75.7 vs 76.1, stddev ~7; prefill 212 vs
+        // 203, stddev ~58). The quantize is O(k) against a GEMV's O(m*k), so
+        // that is the expected result. This is a correctness-of-predicate fix —
+        // the old gate demanded an instruction set the kernel never uses — and
+        // it may matter more on a real Skylake-X, where AVX2 is not being
+        // executed by a Zen 5.
+        //
+        // Still deliberately not done: an AVX2 quantizer. Below the `Avx512`
+        // tier every int8 prefill AND decode pays *scalar* quantization, since
+        // the only vectorized quantizer here is the `_mm512_*` one. That is a
+        // known, accepted cost — deferred, not overlooked.
+        //
+        // Which arm runs does not change the bytes:
+        // `quantize_q8_0_scalar_matches_avx512` pins the scalar fallback to the
+        // AVX-512 kernel
+        // bit-for-bit. That is what lets decode and prefill share this one
+        // dispatcher without the parity bar noticing which arm ran, and what
+        // lets the AVX2 GEMM consume scalar-quantized activations.
         #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-        if int8_gemm_available() {
+        if avx512_quantizer_available() {
             unsafe {
                 crate::backend::simd::avx512_vnni::quantize_f32_to_q8_0_avx512(x, scales, quants);
             }
@@ -546,28 +596,73 @@ pub(crate) fn quantize_f32_to_q8_0_into(x: &[f32], scales: &mut [f32], quants: &
     }
 }
 
+/// Whether `quantize_f32_to_q8_0_avx512` is callable on this host.
+///
+/// Deliberately not `vnni_int8_available()`: the quantizer needs
+/// `avx512f,avx512vl,avx2` and no VNNI, and it is reached from the int8 GEMV and
+/// from prefill's `quantize_columns` alike. `avx512vl` is not implied by the
+/// `Avx512` tier, so it is checked as a raw feature; the tier compare is what
+/// keeps `CERA_CPU_TIER` a working downgrade lever.
+///
+/// `#[doc(hidden)] pub` so `avx512_quantizer_gate.rs` can pin it at a *forced*
+/// tier. That binary exists because an in-process test cannot do the job twice
+/// over: on a VNNI host `>= Avx512` and `>= Avx512Vnni` are both true, so a
+/// re-narrowed predicate is invisible; and gating such a test on raw CPUID
+/// instead would fire it under a deliberate `CERA_CPU_TIER` downgrade. Forcing
+/// the tier in a dedicated process resolves both. Not part of the supported
+/// API.
+#[doc(hidden)]
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+pub fn avx512_quantizer_available() -> bool {
+    let f = crate::backend::cpu_features::cpu_features();
+    f.tier >= crate::backend::cpu_features::CpuTier::Avx512 && f.avx512vl && f.avx2
+}
+
+/// Whether the AVX-512 VNNI int8 kernels are callable on this host.
+///
+/// Distinct from [`int8_gemm_available`] because the two answer different
+/// questions: this one selects a *kernel*, while `int8_gemm_available` asks only
+/// whether *some* int8 GEMM exists. The AVX-512 activation quantizer is gated by
+/// neither — it has its own [`avx512_quantizer_available`], because it needs no
+/// VNNI.
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+pub(crate) fn vnni_int8_available() -> bool {
+    crate::backend::cpu_features::cpu_features().tier
+        >= crate::backend::cpu_features::CpuTier::Avx512Vnni
+}
+
+/// Whether the VNNI-free AVX2 int8 kernels are callable on this host.
+///
+/// The `Avx2` tier already implies `avx2` + `fma`, which is the whole
+/// requirement: the emulation is built from `_mm256_maddubs_epi16` and
+/// `_mm256_madd_epi16`, both AVX2, and needs nothing above it. No `avx512` crate
+/// feature either, so this holds on an `--no-default-features` build too.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn avx2_int8_available() -> bool {
+    crate::backend::cpu_features::cpu_features().tier >= crate::backend::cpu_features::CpuTier::Avx2
+}
+
 /// Whether this host has an int8 batched GEMM for the pre-quantized prefill path.
 ///
-/// **Runtime**, not just compile-time: on x86 the kernels need VNNI, and a
-/// pre-Zen-4 / pre-Sapphire-Rapids box compiled with the `avx512` feature still
-/// has to take the per-token GEMV fallback. `batched_gemm_supports` consults
-/// this, so a host that answers `false` never reaches `gemm_preq` — which
-/// matters because the prefill callers ignore that function's return value and
-/// reuse one output buffer across layers.
+/// **Runtime**, not just compile-time. On x86 every tier from `Avx2` up now
+/// satisfies it, backed by two implementations of one kernel body: VNNI runs
+/// `vpdpbusd` directly, `Avx2` and `Avx512` emulate it (see the `avx2_int8`
+/// module). `batched_gemm_supports` consults this, so a
+/// host that answers `false` never reaches `gemm_preq` — which matters because
+/// the prefill callers ignore that function's return value and reuse one output
+/// buffer across layers.
 pub fn int8_gemm_available() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
         true
     }
-    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    #[cfg(target_arch = "x86_64")]
     {
-        crate::backend::cpu_features::cpu_features().tier
-            >= crate::backend::cpu_features::CpuTier::Avx512Vnni
+        // Not `|| vnni_...`: the VNNI tier is strictly above `Avx2` in the
+        // ordering, so the AVX2 predicate already covers it.
+        avx2_int8_available()
     }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        all(target_arch = "x86_64", feature = "avx512")
-    )))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         false
     }
@@ -580,7 +675,14 @@ pub fn int8_gemm_available() -> bool {
 /// names one function rather than one per architecture.
 #[allow(unused_variables)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn gemm_preq_dispatch(
+// `#[doc(hidden)] pub` rather than `pub(crate)` so a dedicated integration-test
+// binary can drive it. The invariant worth testing here — decode and batched
+// prefill produce the same bits — is only interesting at a *forced* CPU tier,
+// and `CERA_CPU_TIER` is read once per process into a `OnceLock`, so it cannot
+// be exercised from a unit test sharing a process with 300 others. Not part of
+// the supported API; same pattern as `transformer::oracle_dump`.
+#[doc(hidden)]
+pub fn gemm_preq_dispatch(
     dtype: DType,
     data: &[u8],
     b_scales: &[f32],
@@ -590,6 +692,38 @@ pub(crate) fn gemm_preq_dispatch(
     n: usize,
     k: usize,
 ) -> bool {
+    // `assert!`, not `debug_assert!`: this is a safe `pub` fn (see the note
+    // above) and every kernel below indexes unchecked off these lengths. A
+    // release build with an inconsistent m/n/k would read out of bounds — UB
+    // reached from safe code. O(1) against an O(m*n*k) GEMM.
+    let blocks = k / dtype.block_size();
+    assert!(
+        k % dtype.block_size() == 0,
+        "gemm_preq_dispatch: k={k} is not a multiple of {:?}'s block size",
+        dtype
+    );
+    assert!(
+        data.len() >= m * blocks * dtype.block_bytes(),
+        "gemm_preq_dispatch: weights are {} bytes, need {} for {m}x{k} {:?}",
+        data.len(),
+        m * blocks * dtype.block_bytes(),
+        dtype
+    );
+    // `out` is `==`, not `>=`: the kernels derive their strip/row index from
+    // `out.len()` rather than from `m`, so an over-long output buffer walks past
+    // row `m` and reads weights out of bounds. `>=` here would read as a
+    // guarantee it does not provide — and would also undercut the `data` assert
+    // above, whose sufficiency depends on the row count being exactly `m`.
+    assert!(
+        b_quants.len() >= n * k && b_scales.len() >= n * (k / 32) && out.len() == m * n,
+        "gemm_preq_dispatch: activation/output buffers wrong for {m}x{n}x{k} \
+         (quants {}, scales {}, out {} — out must be exactly {})",
+        b_quants.len(),
+        b_scales.len(),
+        out.len(),
+        m * n
+    );
+
     #[cfg(target_arch = "aarch64")]
     unsafe {
         use crate::backend::simd::neon;
@@ -612,32 +746,52 @@ pub(crate) fn gemm_preq_dispatch(
 
     #[cfg(not(target_arch = "aarch64"))]
     {
-        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-        if int8_gemm_available() {
-            use crate::backend::simd::avx512_vnni as vnni;
-            // SAFETY: `int8_gemm_available()` proved the VNNI tier; the kernels
-            // re-assert their own length invariants in debug.
-            return unsafe {
+        // The two x86 tiers run the *same* kernel bodies — `int8_gemm_kernels!`
+        // instantiates them once for VNNI and once for AVX2 under identical
+        // names — so the dtype allowlist is written once here. Spelling it out
+        // per tier is how a newly supported dtype ends up wired on one tier and
+        // silently declined on the other.
+        #[cfg(target_arch = "x86_64")]
+        macro_rules! x86_int8_gemm {
+            ($m:path) => {{
+                use $m as kern;
                 match dtype {
                     DType::Q4_0 => {
-                        vnni::gemm_q4_0_q8_0_avx512(data, b_scales, b_quants, out, m, n, k);
+                        kern::gemm_q4_0_q8_0(data, b_scales, b_quants, out, m, n, k);
                         true
                     }
                     DType::Q8_0 => {
-                        vnni::gemm_q8_0_q8_0_avx512(data, b_scales, b_quants, out, m, n, k);
+                        kern::gemm_q8_0_q8_0(data, b_scales, b_quants, out, m, n, k);
                         true
                     }
                     DType::Q4KM => {
-                        vnni::gemm_q4_k_q8_0_avx512(data, b_scales, b_quants, out, m, n, k);
+                        kern::gemm_q4_k_q8_0(data, b_scales, b_quants, out, m, n, k);
                         true
                     }
                     DType::Q6K => {
-                        vnni::gemm_q6_k_q8_0_avx512(data, b_scales, b_quants, out, m, n, k);
+                        kern::gemm_q6_k_q8_0(data, b_scales, b_quants, out, m, n, k);
                         true
                     }
                     _ => false,
                 }
-            };
+            }};
+        }
+
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        if vnni_int8_available() {
+            // SAFETY: `vnni_int8_available()` proved the VNNI tier; the kernels
+            // re-assert their own length invariants in debug.
+            return unsafe { x86_int8_gemm!(crate::backend::simd::avx512_vnni) };
+        }
+
+        // No VNNI: the same kernels, with `dpbusd` emulated on AVX2. Reached by
+        // every Zen 1-3 / pre-Ice-Lake host, and by Skylake-X (AVX-512, no
+        // VNNI). Needs no `avx512` crate feature.
+        #[cfg(target_arch = "x86_64")]
+        if avx2_int8_available() {
+            // SAFETY: `avx2_int8_available()` proved avx2+fma; the kernels
+            // re-assert their own length invariants in debug.
+            return unsafe { x86_int8_gemm!(crate::backend::simd::avx2_int8) };
         }
         false
     }
@@ -724,6 +878,7 @@ pub fn gemv_q8_0_f32(
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
     debug_assert_eq!(k % 32, 0, "Q8_0 GEMV: k must be divisible by 32");
+
     let blocks_per_row = k / 32;
     let row_bytes = blocks_per_row * size_of::<BlockQ8_0>();
     debug_assert_eq!(a_quant.len(), m * row_bytes);
@@ -740,17 +895,43 @@ pub fn gemv_q8_0_f32(
     #[cfg(not(target_arch = "aarch64"))]
     {
         // x86 VNNI int8 path — see the note in `gemv_q4_0_f32`.
+        // `vnni_int8_available()`, not a hand-rolled tier compare: this predicate
+        // and the one selecting the quantizer must not drift, and since the AVX2
+        // int8 kernels landed they are two different predicates.
         #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-        if crate::backend::cpu_features::cpu_features().tier
-            >= crate::backend::cpu_features::CpuTier::Avx512Vnni
-        {
+        if vnni_int8_available() {
             q8_scales.resize(blocks_per_row, 0.0);
             q8_quants.resize(k, 0);
+            // SAFETY: the tier predicate above proved the kernel's feature set,
+            // and the scratch was just sized to the lengths it asserts.
+            // `quantize_f32_to_q8_0_into`, not a per-tier quantizer: it already
+            // dispatches, and naming it here is what makes decode and prefill
+            // provably quantize through the same function.
             unsafe {
-                crate::backend::simd::avx512_vnni::quantize_f32_to_q8_0_avx512(
-                    x, q8_scales, q8_quants,
+                quantize_f32_to_q8_0_into(x, q8_scales, q8_quants);
+                crate::backend::simd::avx512_vnni::gemv_q8_0_q8_0(
+                    a_quant, q8_scales, q8_quants, y, m, k,
                 );
-                crate::backend::simd::avx512_vnni::gemv_q8_0_q8_0_avx512(
+            }
+            return;
+        }
+
+        // No VNNI but AVX2: the emulated int8 GEMV. Decode has to take the same
+        // arithmetic as batched prefill or the parity bar breaks — see
+        // `avx2_int8::gemv_q4k_f32` for the measurement behind that, and
+        // `tests/avx2_decode_prefill_identity.rs` for the guard.
+        #[cfg(target_arch = "x86_64")]
+        if avx2_int8_available() {
+            q8_scales.resize(blocks_per_row, 0.0);
+            q8_quants.resize(k, 0);
+            // SAFETY: the tier predicate above proved the kernel's feature set,
+            // and the scratch was just sized to the lengths it asserts.
+            // `quantize_f32_to_q8_0_into`, not a per-tier quantizer: it already
+            // dispatches, and naming it here is what makes decode and prefill
+            // provably quantize through the same function.
+            unsafe {
+                quantize_f32_to_q8_0_into(x, q8_scales, q8_quants);
+                crate::backend::simd::avx2_int8::gemv_q8_0_q8_0(
                     a_quant, q8_scales, q8_quants, y, m, k,
                 );
             }
@@ -758,27 +939,9 @@ pub fn gemv_q8_0_f32(
         }
 
         let _ = (q8_scales, q8_quants);
-        // Resolved once, not once per output row. The tier is a process-wide
-        // constant behind a `OnceLock`, and this closure runs for every row —
-        // 65k+ of them on the logit projection.
-        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-        let use_avx512 = crate::backend::cpu_features::cpu_features().tier
-            >= crate::backend::cpu_features::CpuTier::Avx512;
+        // The AVX-512 f32 row-dot that used to sit here is gone for the same
+        // measured reason it is gone from `gemv_q4_0_f32` — see the note there.
         let compute_row = |(i, yi): (usize, &mut f32)| {
-            // See the note in `gemv_q4_0_f32`.
-            #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-            if use_avx512 {
-                // SAFETY: row `i` spans `a_quant[i*row_bytes ..][..row_bytes]`.
-                *yi = unsafe {
-                    crate::backend::simd::avx512::row_dot_q8_0_f32_avx512(
-                        a_quant.as_ptr().add(i * row_bytes),
-                        x,
-                        blocks_per_row,
-                    )
-                };
-                return;
-            }
-
             let row_start = i * row_bytes;
             let mut sum = 0.0f32;
             for bi in 0..blocks_per_row {
@@ -965,6 +1128,33 @@ pub fn gemv_dispatch(
     k: usize,
     q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
 ) {
+    // The K-quant arms below all say the same thing: run `$f` with the caller's
+    // Q8_0 scratch when it lent us one, otherwise with a pair of local `Vec`s.
+    // Written out, that is 12-18 lines per (dtype x tier) pair and six pairs;
+    // the repetition is how the NEON, VNNI and AVX2 arms drift apart.
+    //
+    // `q8_scratch` is moved by the `Some` arm, which is sound only because each
+    // expansion `return`s: the move sits on a diverging path, so a later
+    // expansion still sees it live.
+    // Cfg'd for the same reason `int8_gemm_kernels!` is: an uninvoked
+    // `macro_rules!` is an `unused macro definition` warning on every target
+    // with no SIMD K-quant GEMV (wasm32, riscv64), and the clippy leg that
+    // would catch it runs on x86 only.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    macro_rules! kq_gemv {
+        ($f:path) => {{
+            match q8_scratch {
+                Some((scales, quants)) => unsafe { $f(data, x, y, m, k, scales, quants) },
+                None => {
+                    let mut s = Vec::new();
+                    let mut q = Vec::new();
+                    unsafe { $f(data, x, y, m, k, &mut s, &mut q) }
+                }
+            }
+            return;
+        }};
+    }
+
     match dtype {
         DType::Q4_0 => {
             if let Some((scales, quants)) = q8_scratch {
@@ -988,40 +1178,22 @@ pub fn gemv_dispatch(
         DType::F32 => gemv_f32(data, x, y, m, k),
         DType::Q6K => {
             #[cfg(target_arch = "aarch64")]
-            if let Some((scales, quants)) = q8_scratch {
-                unsafe {
-                    crate::backend::simd::neon::gemv_q6k_f32_neon(data, x, y, m, k, scales, quants);
-                }
-            } else {
-                let mut s = Vec::new();
-                let mut q = Vec::new();
-                unsafe {
-                    crate::backend::simd::neon::gemv_q6k_f32_neon(data, x, y, m, k, &mut s, &mut q);
-                }
-            }
+            kq_gemv!(crate::backend::simd::neon::gemv_q6k_f32_neon);
             #[cfg(not(target_arch = "aarch64"))]
             {
                 // VNNI hosts share arithmetic with the batched GEMM (the GEMV
                 // *is* the GEMM at n = 1), which the parity tests' tight naive
                 // bar depends on.
                 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-                if int8_gemm_available() {
-                    if let Some((scales, quants)) = q8_scratch {
-                        unsafe {
-                            crate::backend::simd::avx512_vnni::gemv_q6k_f32_avx512(
-                                data, x, y, m, k, scales, quants,
-                            );
-                        }
-                    } else {
-                        let mut s = Vec::new();
-                        let mut q = Vec::new();
-                        unsafe {
-                            crate::backend::simd::avx512_vnni::gemv_q6k_f32_avx512(
-                                data, x, y, m, k, &mut s, &mut q,
-                            );
-                        }
-                    }
-                    return;
+                if vnni_int8_available() {
+                    kq_gemv!(crate::backend::simd::avx512_vnni::gemv_q6k_f32);
+                }
+
+                // Same invariant one tier down: the AVX2 int8 GEMV is the AVX2
+                // GEMM at n = 1, so decode and prefill stay identical there too.
+                #[cfg(target_arch = "x86_64")]
+                if avx2_int8_available() {
+                    kq_gemv!(crate::backend::simd::avx2_int8::gemv_q6k_f32);
                 }
                 let mut s = Vec::new();
                 let mut q = Vec::new();
@@ -1030,38 +1202,20 @@ pub fn gemv_dispatch(
         }
         DType::Q4KM => {
             #[cfg(target_arch = "aarch64")]
-            if let Some((scales, quants)) = q8_scratch {
-                unsafe {
-                    crate::backend::simd::neon::gemv_q4k_f32_neon(data, x, y, m, k, scales, quants);
-                }
-            } else {
-                let mut s = Vec::new();
-                let mut q = Vec::new();
-                unsafe {
-                    crate::backend::simd::neon::gemv_q4k_f32_neon(data, x, y, m, k, &mut s, &mut q);
-                }
-            }
+            kq_gemv!(crate::backend::simd::neon::gemv_q4k_f32_neon);
             #[cfg(not(target_arch = "aarch64"))]
             {
                 // See the Q6K arm: int8 GEMV shared with the batched GEMM.
                 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-                if int8_gemm_available() {
-                    if let Some((scales, quants)) = q8_scratch {
-                        unsafe {
-                            crate::backend::simd::avx512_vnni::gemv_q4k_f32_avx512(
-                                data, x, y, m, k, scales, quants,
-                            );
-                        }
-                    } else {
-                        let mut s = Vec::new();
-                        let mut q = Vec::new();
-                        unsafe {
-                            crate::backend::simd::avx512_vnni::gemv_q4k_f32_avx512(
-                                data, x, y, m, k, &mut s, &mut q,
-                            );
-                        }
-                    }
-                    return;
+                if vnni_int8_available() {
+                    kq_gemv!(crate::backend::simd::avx512_vnni::gemv_q4k_f32);
+                }
+
+                // Same invariant one tier down: the AVX2 int8 GEMV is the AVX2
+                // GEMM at n = 1, so decode and prefill stay identical there too.
+                #[cfg(target_arch = "x86_64")]
+                if avx2_int8_available() {
+                    kq_gemv!(crate::backend::simd::avx2_int8::gemv_q4k_f32);
                 }
                 gemv_q4km_f32(data, x, y, m, k);
             }
@@ -2869,6 +3023,186 @@ pub fn scale_inplace(a: &mut [f32], s: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `gemm_preq_dispatch` length guards must actually fire.
+    ///
+    /// Those asserts are the entire justification for `gemm_preq_dispatch`
+    /// being a safe `pub` fn that hands unchecked lengths to `unsafe` kernels —
+    /// and nothing pinned them: replacing all three with tautologies passed the
+    /// whole suite. `out` is the subtle one. The kernels derive their strip/row
+    /// index from `out.len()`, not from `m`, so an *over-long* `out` walks past
+    /// row `m` and reads weights out of bounds — which is why the contract is
+    /// `==` and not `>=`, and why this case gets its own test.
+    mod gemm_preq_guards {
+        use super::*;
+        use crate::tensor::DType;
+
+        /// A well-formed Q8_0 call: 2 rows, 1 column, k = 64.
+        fn args() -> (Vec<u8>, Vec<f32>, Vec<i8>, Vec<f32>) {
+            let (m, n, k) = (2usize, 1usize, 64usize);
+            let nb = k / 32;
+            (
+                vec![0u8; m * nb * DType::Q8_0.block_bytes()],
+                vec![0.0f32; n * nb],
+                vec![0i8; n * k],
+                vec![0.0f32; m * n],
+            )
+        }
+
+        #[test]
+        #[should_panic(expected = "out must be exactly")]
+        fn over_long_out_is_rejected() {
+            let (data, bs, bq, mut out) = args();
+            out.push(0.0);
+            gemm_preq_dispatch(DType::Q8_0, &data, &bs, &bq, &mut out, 2, 1, 64);
+        }
+
+        #[test]
+        #[should_panic(expected = "out must be exactly")]
+        fn short_out_is_rejected() {
+            let (data, bs, bq, mut out) = args();
+            out.pop();
+            gemm_preq_dispatch(DType::Q8_0, &data, &bs, &bq, &mut out, 2, 1, 64);
+        }
+
+        #[test]
+        #[should_panic(expected = "weights are")]
+        fn short_weights_are_rejected() {
+            let (mut data, bs, bq, mut out) = args();
+            data.truncate(DType::Q8_0.block_bytes());
+            gemm_preq_dispatch(DType::Q8_0, &data, &bs, &bq, &mut out, 2, 1, 64);
+        }
+
+        #[test]
+        #[should_panic(expected = "not a multiple")]
+        fn unaligned_k_is_rejected() {
+            let (data, bs, bq, mut out) = args();
+            gemm_preq_dispatch(DType::Q8_0, &data, &bs, &bq, &mut out, 2, 1, 60);
+        }
+
+        /// The well-formed call must NOT panic, or the four above would pass
+        /// against a guard that rejects everything.
+        #[test]
+        fn well_formed_call_is_accepted() {
+            let (data, bs, bq, mut out) = args();
+            gemm_preq_dispatch(DType::Q8_0, &data, &bs, &bq, &mut out, 2, 1, 64);
+        }
+    }
+
+    /// `gemv_dispatch` must reach the right kernel for every int8 dtype.
+    ///
+    /// The kernels themselves are unit-tested in `simd.rs`, but nothing drove
+    /// the *dispatcher* on x86: the tier arms added for AVX2 (and the K-quant
+    /// `kq_gemv!` expansions) were reached only by the `#[ignore]`d real-model
+    /// parity suite. A dtype mis-wire — a Q6K arm calling `gemv_q4k_f32` — would
+    /// have produced garbage logits with nothing in `cargo test` objecting.
+    ///
+    /// Covers the four dtypes with int8 kernels. `Q4_1`, `Q5KM` and `F32` take
+    /// scalar arms this change does not touch and are not driven here.
+    ///
+    /// The reference dequantizes the weight and does the dot in f32, so it is
+    /// independent of every int8 path under test. The bound is loose on purpose:
+    /// this asserts "the right kernel ran", not "the arithmetic is exact" —
+    /// exactness is the job of the tests next to each kernel. A wrong kernel is
+    /// off by orders of magnitude, not by 2%.
+    #[test]
+    fn gemv_dispatch_matches_dequantized_reference() {
+        use crate::tensor::DType;
+
+        // k must satisfy every dtype's block alignment at once: 256 for the
+        // K-quants, 32 for Q4_0/Q8_0.
+        let (m, k) = (7usize, 256usize);
+        let mut st = 0x5eed_1234u64;
+        let mut next = move || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (st >> 33) as u32
+        };
+
+        let x: Vec<f32> = (0..k)
+            .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+            .collect();
+
+        for dtype in [DType::Q4_0, DType::Q8_0, DType::Q4KM, DType::Q6K] {
+            let nb = k / dtype.block_size();
+            let bb = dtype.block_bytes();
+            let mut data: Vec<u8> = (0..m * nb * bb).map(|_| (next() % 256) as u8).collect();
+            // Random bytes in a scale field decode to inf/NaN, which would make
+            // the reference itself meaningless (NaN fails this bound rather than
+            // passing it, so the test would be flaky, not vacuous). Everything
+            // else — nibbles, 6-bit scales, qh — stays fully random.
+            for (bi, blk) in data.chunks_mut(bb).enumerate() {
+                let d = half::f16::from_f32(0.01 + 0.004 * (bi % 7) as f32);
+                match dtype {
+                    // scale first
+                    DType::Q4_0 | DType::Q8_0 | DType::Q4KM => {
+                        blk[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+                    }
+                    // scale last
+                    DType::Q6K => {
+                        let n = blk.len();
+                        blk[n - 2..].copy_from_slice(&d.to_bits().to_le_bytes());
+                    }
+                    _ => unreachable!(),
+                }
+                if dtype == DType::Q4KM {
+                    let dmin = half::f16::from_f32(0.02 + 0.003 * (bi % 5) as f32);
+                    blk[2..4].copy_from_slice(&dmin.to_bits().to_le_bytes());
+                }
+            }
+
+            // f32 reference, independent of every int8 kernel.
+            let mut w = vec![0.0f32; m * k];
+            match dtype {
+                DType::Q4_0 => crate::quant::dequantize_q4_0_matrix(&data, m, k, &mut w),
+                DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(&data, m, k, &mut w),
+                DType::Q4KM => crate::quant::dequantize_q4_k_m_matrix(&data, m, k, &mut w),
+                DType::Q6K => crate::quant::dequantize_q6_k_matrix(&data, m, k, &mut w),
+                _ => unreachable!(),
+            }
+            let want: Vec<f32> = (0..m)
+                .map(|i| (0..k).map(|j| w[i * k + j] * x[j]).sum())
+                .collect();
+
+            // Both scratch modes: production decode always lends a buffer
+            // (`model/weights.rs`), so `None` alone would leave the arm that
+            // actually ships untested. The results must agree — the scratch is
+            // an allocation optimization, not a numeric one.
+            let mut got = vec![0.0f32; m];
+            gemv_dispatch(dtype, &data, &x, &mut got, m, k, None);
+
+            let mut scratch_s = vec![7.0f32; 1];
+            let mut scratch_q = vec![7i8; 1];
+            let mut got_scratch = vec![0.0f32; m];
+            gemv_dispatch(
+                dtype,
+                &data,
+                &x,
+                &mut got_scratch,
+                m,
+                k,
+                Some((&mut scratch_s, &mut scratch_q)),
+            );
+            for (i, (a, b)) in got.iter().zip(&got_scratch).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{dtype:?} row {i}: lending scratch changed the result \
+                     ({a} vs {b}) — the two `kq_gemv!` arms have diverged"
+                );
+            }
+
+            let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1.0);
+            for (i, (g, wv)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - wv).abs() <= 0.02 * scale,
+                    "{dtype:?} row {i}: dispatch gave {g}, dequantized reference {wv} \
+                     — a wrong kernel, not a rounding difference"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_matmul_f32_identity() {

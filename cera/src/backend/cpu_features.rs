@@ -17,11 +17,15 @@
 //!
 //! [`CpuFeatures::tier`] reports the best tier cera actually has *kernels* for,
 //! so a dispatcher can never route to a kernel that doesn't exist. On x86 that
-//! is [`CpuTier::Avx512`] (Q8_0/Q4_0 `vec_dot`; needs the default-on `avx512`
-//! crate feature, else [`CpuTier::Avx2`]); on aarch64 it is [`CpuTier::NeonI8mm`]
-//! (Q8_0/Q4_0 GEMM) down to [`CpuTier::NeonDotprod`]. The raw feature bools (e.g.
-//! [`CpuFeatures::avx512vnni`]) are detected and exposed regardless, for
-//! diagnostics and so future kernels can light up without re-plumbing.
+//! is [`CpuTier::Avx512Vnni`] (native `dpbusd` int8 GEMM/GEMV; needs the
+//! default-on `avx512` crate feature) down through [`CpuTier::Avx512`] to
+//! [`CpuTier::Avx2`], which runs the same int8 kernels with `dpbusd` emulated
+//! and is therefore the floor for the whole x86 int8 path; on aarch64 it is
+//! [`CpuTier::NeonI8mm`] (Q8_0/Q4_0 GEMM) down to [`CpuTier::NeonDotprod`].
+//!
+//! The raw feature bools (e.g. [`CpuFeatures::avx512vnni`]) are detected and
+//! exposed regardless, for diagnostics and so future kernels can light up
+//! without re-plumbing.
 
 use std::sync::OnceLock;
 
@@ -36,16 +40,24 @@ use std::sync::OnceLock;
 pub enum CpuTier {
     /// Portable scalar reference path. Always available.
     Scalar,
-    /// x86_64 AVX2 + FMA.
+    /// x86_64 AVX2 + FMA. Also the threshold for the x86 int8 GEMM/GEMV path:
+    /// `dpbusd` is emulated with `maddubs`+`madd` here, so every tier from this
+    /// one up runs the same int8 kernels for Q4_0/Q8_0/Q4_K/Q6_K.
     Avx2,
-    /// x86_64 AVX-512 — 512-bit f32 `vec_dot` for Q8_0/Q4_0 (needs only
-    /// `avx512f`). Produced when the default-on `avx512` crate feature is
-    /// enabled; disable it for a Rust 1.85-compatible x86 build.
+    /// x86_64 AVX-512 (needs only `avx512f`). Produced when the default-on
+    /// `avx512` crate feature is enabled; disable it for a Rust
+    /// 1.85-compatible x86 build.
+    ///
+    /// Its own contribution is now narrow: the 512-bit f32 `vec_dot` for
+    /// Q8_0/Q4_0, plus the AVX-512 activation quantizer (which needs
+    /// `avx512vl` on top). The production GEMM and GEMV at this tier are the
+    /// [`CpuTier::Avx2`] int8 kernels — see `cpu::avx512_quantizer_available`.
     Avx512,
-    /// x86_64 AVX-512 + VNNI (`avx512vnni` + `avx512vl`) — int8 activations:
-    /// `dpbusd` Q4_0/Q8_0 GEMV, the x86 analogue of [`CpuTier::NeonI8mm`].
-    /// Everything the `Avx512` tier does, faster; other dtypes still route to
-    /// the tier below.
+    /// x86_64 AVX-512 + VNNI (`avx512vnni` + `avx512vl`) — the x86 analogue of
+    /// [`CpuTier::NeonI8mm`]. Runs the same int8 kernels as [`CpuTier::Avx2`]
+    /// with a native `dpbusd` instead of the emulation, wider tiles, and a
+    /// 512-bit activation quantizer. This tier is a speed difference, not a
+    /// capability one — the dtype coverage is identical.
     Avx512Vnni,
     /// aarch64 baseline NEON.
     Neon,
