@@ -172,7 +172,10 @@ fn batched_path_is_live(rel: &str) -> bool {
     true
 }
 
-fn check(rel: &str, tokens: &[u32]) {
+/// `repacked` is true when this model's projection weights take the x86 8-row
+/// interleave prefill GEMM (Q4_0 / Q4_K). That kernel's reduction differs from
+/// the per-token GEMV's, so its naive bound is relaxed below — see the threshold.
+fn check(rel: &str, tokens: &[u32], repacked: bool) {
     if !batched_path_is_live(rel) {
         return;
     }
@@ -197,22 +200,37 @@ fn check(rel: &str, tokens: &[u32]) {
 
     // Threshold by (path, feature):
     //  - naive NEON: shares the per-token path's Q8_0-quantize + int8-dot, so
-    //    bit-identical (cosine = 1.0) → tight 0.9999 bound.
+    //    bit-identical (cosine = 1.0) → tight 0.9999 bound. NEON does not repack,
+    //    so `repacked` does not loosen it.
+    //  - naive x86, repacked weights: Q4_0/Q4_K projections take the 8-row
+    //    interleave prefill GEMM, whose reduction (deferred `-8·Σa` / mins
+    //    correction, no per-column hsum) differs from the per-token GEMV's — a
+    //    legitimate reordering, not the bit-identical arithmetic the tight bar
+    //    assumes. Q4_0 lands ~0.995, Q4_K ~0.9996, so use the 0.99 bound the
+    //    codebase already applies to the other legitimate reorderings (flash,
+    //    BLAS). The GEMV is untouched, so decode is unaffected.
     //  - flash (n ≥ 256): online-softmax + tiling reorder the reduction (cosine
     //    ~0.999), so use the 0.99 bound `blas_parity.rs` established for flash.
     //  - BLAS: projections go through f32 SGEMM while decode stays Q8_0, a
     //    legitimate f32-vs-int reordering (~0.996), so 0.99 for both paths.
     // top-1 agreement (asserted below) is the discriminating correctness check;
-    // a real layout/dim/transpose bug drops cosine far below these or flips it.
+    // a real layout/dim/transpose bug drops cosine far below these or flips it,
+    // and the kernels carry their own tight (1e-5) equivalence unit tests.
+    #[cfg(any(feature = "blas", target_arch = "aarch64"))]
+    let _ = repacked; // only the x86 non-blas bound reads it
     #[cfg(all(not(feature = "blas"), target_arch = "aarch64"))]
     let (min_cos, tier) = (if is_flash { 0.99_f32 } else { 0.9999_f32 }, "NEON");
     // The x86 int8 path — VNNI or the AVX2 emulation — shares the same
-    // Q8_0-quantize + int8-dot arithmetic as NEON, and (since the AVX2 GEMV
-    // landed) decode routes through the very same kernels on both tiers, so it
-    // earns the same tight bound — only the label differs.
+    // Q8_0-quantize + int8-dot arithmetic as NEON for non-repacked weights, and
+    // (since the AVX2 GEMV landed) decode routes through the very same kernels on
+    // both tiers, so those earn the same tight bound — only the label differs.
     #[cfg(all(not(feature = "blas"), target_arch = "x86_64"))]
     let (min_cos, tier) = (
-        if is_flash { 0.99_f32 } else { 0.9999_f32 },
+        if is_flash || repacked {
+            0.99_f32
+        } else {
+            0.9999_f32
+        },
         "x86 int8 (VNNI or AVX2)",
     );
     #[cfg(feature = "blas")]
@@ -229,9 +247,9 @@ fn check(rel: &str, tokens: &[u32]) {
 }
 
 /// Check both the naive (24-token) and flash (288-token) batched-prefill paths.
-fn check_both(rel: &str) {
-    check(rel, PROMPT);
-    check(rel, &flash_prompt());
+fn check_both(rel: &str, repacked: bool) {
+    check(rel, PROMPT, repacked);
+    check(rel, &flash_prompt(), repacked);
 }
 
 #[test]
@@ -241,7 +259,10 @@ fn llama_batched_prefill_parity_llama3() {
     // The Q8_0 build is used (fully supported); the repo's `Llama-3.2-1B-Q4_0`
     // GGUF carries Q4_1 ffn_down layers in blocks 0/1, a dtype cera can't
     // dequantize, so neither the batched nor the per-token path can run it.
-    check_both("target/oracle/models/Llama-3.2-1B-Instruct-Q8_0.gguf");
+    check_both(
+        "target/oracle/models/Llama-3.2-1B-Instruct-Q8_0.gguf",
+        false,
+    );
 }
 
 /// The dense-transformer K-quant path. Q4_K_M only produces real K-quants when
@@ -256,25 +277,31 @@ fn llama_batched_prefill_parity_llama3() {
 #[test]
 #[ignore]
 fn llama_batched_prefill_parity_llama32_1b_q4_k_m() {
-    check_both("target/oracle/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf");
+    check_both(
+        "target/oracle/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        true,
+    );
 }
 
 #[test]
 #[ignore]
 fn llama_batched_prefill_parity_qwen3() {
-    check_both("target/oracle/models/Qwen3-0.6B-Q8_0.gguf");
+    check_both("target/oracle/models/Qwen3-0.6B-Q8_0.gguf", false);
 }
 
 #[test]
 #[ignore]
 fn llama_batched_prefill_parity_qwen2() {
-    check_both("target/oracle/models/qwen2-0_5b-instruct-q8_0.gguf");
+    check_both("target/oracle/models/qwen2-0_5b-instruct-q8_0.gguf", false);
 }
 
 #[test]
 #[ignore]
 fn llama_batched_prefill_parity_granite() {
-    check_both("target/oracle/models/granite-3.1-2b-instruct-Q8_0.gguf");
+    check_both(
+        "target/oracle/models/granite-3.1-2b-instruct-Q8_0.gguf",
+        false,
+    );
 }
 
 // ── CI-sized fixtures ──────────────────────────────────────────────────────
@@ -289,7 +316,10 @@ fn llama_batched_prefill_parity_granite() {
 #[test]
 #[ignore]
 fn llama_batched_prefill_parity_tinystories_20m_q8_0() {
-    check_both("target/oracle/models/TinyStories-LLaMA2-20M-GQA.Q8_0.gguf");
+    check_both(
+        "target/oracle/models/TinyStories-LLaMA2-20M-GQA.Q8_0.gguf",
+        false,
+    );
 }
 
 /// Q4_0 projections -> `gemm_q4_0_q8_0`. 30 layers, GQA (9/3), ctx 2048.
@@ -298,5 +328,5 @@ fn llama_batched_prefill_parity_tinystories_20m_q8_0() {
 #[test]
 #[ignore]
 fn llama_batched_prefill_parity_smollm_135m_q4_0() {
-    check_both("target/oracle/models/SmolLM-135M.Q4_0.gguf");
+    check_both("target/oracle/models/SmolLM-135M.Q4_0.gguf", true);
 }
