@@ -668,6 +668,142 @@ pub fn int8_gemm_available() -> bool {
     }
 }
 
+// ── Q4_0 weight repacking (8-row interleave, prefill only) ───────────────────
+//
+// The repacked prefill GEMM (`simd::*::gemm_q4_0_8x8_q8_0`) interleaves 8 weight
+// rows so the 8 int32 lanes of one `dpbusd` are 8 output rows, which removes the
+// per-column hsum the standard-layout kernel pays. `repack_q4_0_8x8` builds that
+// layout once at load; `q4_0_repack_supported` decides whether a given weight
+// qualifies; `gemm_preq_repacked_dispatch` runs the kernel. Prefill only — the
+// win is amortizing the removed reduction across prefill columns; decode (n=1)
+// is dispatch-bound and keeps the standard mmap layout.
+
+/// Repack `m x k` standard Q4_0 weight rows into the 8-row-interleaved layout
+/// consumed by `gemm_q4_0_8x8_q8_0`, plus the per-(super-row, block) f32 row
+/// scales. Requires `m % 8 == 0` and `k % 32 == 0` (see [`q4_0_repack_supported`]).
+///
+/// Returns `(packed, scales)`. In `packed`, byte `i` of k-group `g`'s 16 bytes
+/// (at `(sr*nb + b)*128 + g*16 + i`) holds row `8*sr + i/4` in its low nibble
+/// and row `8*sr + 4 + i/4` in its high nibble, both at k-element `4*g + i%4` —
+/// exactly what the kernel's low/high nibble unpack reassembles into a
+/// lane-per-row weight vector. `scales[(sr*nb + b)*8 + r]` is row `8*sr + r`'s
+/// f32 scale for block `b`. The nibble footprint is unchanged (144 bytes per
+/// super-row block = 8× a `BlockQ4_0`).
+pub(crate) fn repack_q4_0_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
+    assert!(
+        m.is_multiple_of(8),
+        "repack_q4_0_8x8: m must be a multiple of 8"
+    );
+    assert!(
+        k.is_multiple_of(32),
+        "repack_q4_0_8x8: k must be a multiple of 32"
+    );
+    let nb = k / 32;
+    let bsz = size_of::<crate::quant::BlockQ4_0>();
+    assert_eq!(
+        src.len(),
+        m * nb * bsz,
+        "repack_q4_0_8x8: src is {} bytes, need {} for {m}x{k}",
+        src.len(),
+        m * nb * bsz,
+    );
+    let sr_count = m / 8;
+    let mut packed = vec![0u8; sr_count * nb * 128];
+    let mut scales = vec![0.0f32; sr_count * nb * 8];
+    // Nibble of `row`, block `b`, element `e` (0..32) in the standard layout:
+    // e<16 is the low nibble of qs[e], e>=16 the high nibble of qs[e-16].
+    let nibble = |row: usize, b: usize, e: usize| -> u8 {
+        let qs = (row * nb + b) * bsz + 2; // skip the 2-byte f16 scale
+        if e < 16 {
+            src[qs + e] & 0x0F
+        } else {
+            src[qs + e - 16] >> 4
+        }
+    };
+    for sr in 0..sr_count {
+        for b in 0..nb {
+            for r in 0..8 {
+                let off = ((8 * sr + r) * nb + b) * bsz;
+                scales[(sr * nb + b) * 8 + r] =
+                    half::f16::from_le_bytes([src[off], src[off + 1]]).to_f32();
+            }
+            for g in 0..8usize {
+                for i in 0..16usize {
+                    let e = 4 * g + (i % 4);
+                    let lo = nibble(8 * sr + i / 4, b, e);
+                    let hi = nibble(8 * sr + 4 + i / 4, b, e);
+                    packed[(sr * nb + b) * 128 + g * 16 + i] = lo | (hi << 4);
+                }
+            }
+        }
+    }
+    (packed, scales)
+}
+
+/// Whether a Q4_0 weight of shape `m x k` should be repacked for prefill on this
+/// host: needs the x86 int8 kernels, a whole number of 8-row super-rows, and
+/// Q8_0-block-aligned `k`. A weight that fails this keeps the standard layout and
+/// the standard kernel — correctness is identical, only prefill is slower.
+#[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+pub(crate) fn q4_0_repack_supported(m: usize, k: usize) -> bool {
+    m.is_multiple_of(8) && k.is_multiple_of(32) && int8_gemm_available()
+}
+
+/// Run the repacked-Q4_0 prefill GEMM on whichever x86 int8 tier this host has
+/// (VNNI, or the AVX2 emulation). Returns `true` when a kernel ran. A `false`
+/// return means nothing was computed — `q4_0_repack_supported` gates the repack
+/// at load, so it cannot happen for a weight that was actually repacked, but the
+/// caller must still treat it as the invariant break it is (the output buffer is
+/// reused across layers).
+#[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_preq_repacked_dispatch(
+    packed: &[u8],
+    scales: &[f32],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    let nb = k / 32;
+    assert!(
+        k.is_multiple_of(32) && m.is_multiple_of(8),
+        "gemm_preq_repacked_dispatch: need k%32==0 and m%8==0, got m={m} k={k}"
+    );
+    assert!(
+        packed.len() >= (m / 8) * nb * 128 && scales.len() >= (m / 8) * nb * 8,
+        "gemm_preq_repacked_dispatch: repacked weights too small for {m}x{k}"
+    );
+    assert!(
+        b_quants.len() >= n * k && b_scales.len() >= n * nb && out.len() == m * n,
+        "gemm_preq_repacked_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
+    );
+
+    #[cfg(feature = "avx512")]
+    if vnni_int8_available() {
+        // SAFETY: `vnni_int8_available()` proved the VNNI tier; the kernel
+        // re-asserts its own length invariants in debug.
+        unsafe {
+            crate::backend::simd::avx512_vnni::gemm_q4_0_8x8_q8_0(
+                packed, scales, b_scales, b_quants, out, m, n, k,
+            );
+        }
+        return true;
+    }
+    if avx2_int8_available() {
+        // SAFETY: `avx2_int8_available()` proved avx2+fma; same as above.
+        unsafe {
+            crate::backend::simd::avx2_int8::gemm_q4_0_8x8_q8_0(
+                packed, scales, b_scales, b_quants, out, m, n, k,
+            );
+        }
+        return true;
+    }
+    false
+}
+
 /// Batched pre-quantized GEMM: `out[m,n] = A_q[m,k] @ B_q8_0[k,n]`.
 /// Returns `false` when no kernel on this host can compute `dtype`.
 ///

@@ -4155,6 +4155,157 @@ macro_rules! int8_gemm_kernels {
             }
         }
 
+        // ── Repacked Q4_0 prefill GEMM (8-row interleave) ───────────────────
+        //
+        // `gemm_q4_0_q8_0` above produces, per `dot32`, 8 int32 lanes that are
+        // partial sums of ONE (row, col) dot, so it reduces them — deferred into
+        // `facc`, one `hsum256_ps` per column. This kernel consumes a weight
+        // layout (`repack_q4_0_8x8`, built once at load) that interleaves 8 rows
+        // so the 8 lanes of one `dpbusd` are 8 DISTINCT OUTPUT ROWS for a shared
+        // column. That removes the hsum entirely: the reduction becomes a plain
+        // lane-per-row accumulate, weights load contiguously, and each 4-element
+        // activation group is broadcast with one `set1_epi32`.
+        //
+        // Q4_0's `d·(q−8)` splits the same way the Q4_K mins term does: keep the
+        // nibbles unsigned (`q` in 0..15) for `dpbusd`, and carry the `−8` as a
+        // per-(column, block) `−8·d_row·d_act·Σa` correction (`sum_a` from
+        // `q8_0_col_sums`). So `eff = Σqa − 8·Σa` in float, then one
+        // `fmadd(eff, scale8, facc)` per block, where `scale8` is the 8 rows'
+        // weight scales times the activation scale.
+        //
+        // The packed layout stores nibbles (144 bytes per (super-row, block) =
+        // 8× a `BlockQ4_0`, same 4-bit footprint as standard). Byte `i` of a
+        // k-group's 16 packed bytes pairs row `i/4` (low nibble) with row
+        // `i/4 + 4` (high nibble) at k-element `i%4`, which is exactly what the
+        // standard low/high nibble unpack (`set_m128i(hi, lo)`) reassembles into
+        // the 32-byte, lane-per-row weight vector.
+        //
+        // `m % 8 == 0` is a precondition — `q4_0_repack_supported` gates the
+        // repack at load, so a weight with a ragged row count is never repacked
+        // and takes the standard kernel instead.
+        #[allow(clippy::too_many_arguments)]
+        #[target_feature(enable = $feat)]
+        pub unsafe fn gemm_q4_0_8x8_q8_0(
+            packed: &[u8],
+            scales: &[f32],
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            m: usize,
+            n: usize,
+            k: usize,
+        ) {
+            debug_assert_eq!(m % 8, 0, "repacked Q4_0 GEMM: m must be a multiple of 8");
+            debug_assert_eq!(k % 32, 0, "repacked Q4_0 GEMM: k must be divisible by 32");
+            let nb = k / 32;
+            debug_assert_eq!(out.len(), m * n);
+            debug_assert_eq!(packed.len(), (m / 8) * nb * 128);
+            debug_assert_eq!(scales.len(), (m / 8) * nb * 8);
+            debug_assert_eq!(b_quants.len(), n * k);
+            debug_assert_eq!(b_scales.len(), n * nb);
+
+            // Per-(column, block) activation sums for the `−8` offset correction.
+            let col_sums = unsafe { q8_0_col_sums(b_quants, n, k) };
+            let cs: &[i32] = &col_sums;
+            let mask = _mm_set1_epi8(0x0F);
+
+            // Unpack one k-group's 16 packed bytes into the 32-byte, lane-per-row
+            // unsigned weight vector (rows 0..3 in the low 128, 4..7 in the high).
+            let unpack = |p: *const u8| -> __m256i {
+                unsafe {
+                    let qb = _mm_loadu_si128(p as *const __m128i);
+                    let lo = _mm_and_si128(qb, mask);
+                    let hi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask);
+                    _mm256_set_m128i(hi, lo)
+                }
+            };
+
+            // One accumulator strip = the 8 output rows of a super-row, across a
+            // tile of `TILE_N` columns (weight decode amortized over the tile).
+            let compute = |sr: usize, chunk: &mut [f32]| unsafe {
+                // `chunk[r*n + j] == out[(8*sr + r)*n + j]`.
+                let mut j = 0;
+                while j + TILE_N <= n {
+                    let mut facc = [_mm256_setzero_ps(); TILE_N];
+                    for b in 0..nb {
+                        let mut acc = [_mm256_setzero_si256(); TILE_N];
+                        let pbase = (sr * nb + b) * 128;
+                        for g in 0..8usize {
+                            let w = unpack(packed.as_ptr().add(pbase + g * 16));
+                            for (t, acc_t) in acc.iter_mut().enumerate() {
+                                let col = j + t;
+                                let a4 = (b_quants.as_ptr().add(col * k + b * 32 + g * 4)
+                                    as *const i32)
+                                    .read_unaligned();
+                                *acc_t = _mm256_add_epi32(*acc_t, dot32u(w, _mm256_set1_epi32(a4)));
+                            }
+                        }
+                        let d_row8 = _mm256_loadu_ps(scales.as_ptr().add((sr * nb + b) * 8));
+                        for (t, facc_t) in facc.iter_mut().enumerate() {
+                            let col = j + t;
+                            let d_a = *b_scales.get_unchecked(col * nb + b);
+                            let scale8 = _mm256_mul_ps(d_row8, _mm256_set1_ps(d_a));
+                            let sum_a = *cs.get_unchecked(col * nb + b);
+                            let eff = _mm256_sub_ps(
+                                _mm256_cvtepi32_ps(acc[t]),
+                                _mm256_set1_ps(8.0 * sum_a as f32),
+                            );
+                            *facc_t = _mm256_fmadd_ps(eff, scale8, *facc_t);
+                        }
+                    }
+                    for (t, facc_t) in facc.iter().enumerate() {
+                        let mut tmp = [0.0f32; 8];
+                        _mm256_storeu_ps(tmp.as_mut_ptr(), *facc_t);
+                        for (r, &v) in tmp.iter().enumerate() {
+                            *chunk.get_unchecked_mut(r * n + j + t) = v;
+                        }
+                    }
+                    j += TILE_N;
+                }
+                // Column remainder (`n % TILE_N`), one column at a time.
+                while j < n {
+                    let mut facc = _mm256_setzero_ps();
+                    for b in 0..nb {
+                        let mut acc = _mm256_setzero_si256();
+                        let pbase = (sr * nb + b) * 128;
+                        for g in 0..8usize {
+                            let w = unpack(packed.as_ptr().add(pbase + g * 16));
+                            let a4 = (b_quants.as_ptr().add(j * k + b * 32 + g * 4) as *const i32)
+                                .read_unaligned();
+                            acc = _mm256_add_epi32(acc, dot32u(w, _mm256_set1_epi32(a4)));
+                        }
+                        let d_row8 = _mm256_loadu_ps(scales.as_ptr().add((sr * nb + b) * 8));
+                        let d_a = *b_scales.get_unchecked(j * nb + b);
+                        let scale8 = _mm256_mul_ps(d_row8, _mm256_set1_ps(d_a));
+                        let sum_a = *cs.get_unchecked(j * nb + b);
+                        let eff = _mm256_sub_ps(
+                            _mm256_cvtepi32_ps(acc),
+                            _mm256_set1_ps(8.0 * sum_a as f32),
+                        );
+                        facc = _mm256_fmadd_ps(eff, scale8, facc);
+                    }
+                    let mut tmp = [0.0f32; 8];
+                    _mm256_storeu_ps(tmp.as_mut_ptr(), facc);
+                    for (r, &v) in tmp.iter().enumerate() {
+                        *chunk.get_unchecked_mut(r * n + j) = v;
+                    }
+                    j += 1;
+                }
+            };
+
+            #[cfg(feature = "parallel")]
+            {
+                use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+                out.par_chunks_mut(8 * n)
+                    .enumerate()
+                    .for_each(|(sr, chunk)| compute(sr, chunk));
+            }
+            #[cfg(not(feature = "parallel"))]
+            for (sr, chunk) in out.chunks_mut(8 * n).enumerate() {
+                compute(sr, chunk);
+            }
+        }
+
         /// Batched Q8_0 × Q8_0 GEMM: `out[m,n] = A_q8_0[m,k] @ B_q8_0[k,n]`.
         #[target_feature(enable = $feat)]
         pub unsafe fn gemm_q8_0_q8_0(
@@ -5131,6 +5282,35 @@ pub(crate) mod avx2_int8 {
                     };
                 }
                 assert_same_bits_untiled(&per_row, &tiled, "q8_0", m, n);
+            }
+        }
+
+        /// Repacked Q4_0 (8-row interleave) must match the integer reference at
+        /// the AVX2 tile constants, on any AVX2 host (no VNNI needed) — the
+        /// coverage that remains where the VNNI equivalence test skips. `m` is a
+        /// whole number of 8-row super-rows (the repack precondition); `n`
+        /// spans full tiles, a column remainder, and below one tile.
+        #[test]
+        fn avx2_gemm_q4_0_8x8_matches_reference() {
+            if !require_simd_or_skip("avx2", avx2_kernels_callable()) {
+                return;
+            }
+            let k = 128;
+            for (m, n) in [(8usize, 7usize), (16, 4), (8, 1), (24, 5), (8, 3)] {
+                let mut st = 0x5b8f_2a1du64 ^ ((m * 131 + n) as u64);
+                let q4 = q4_0_rows(m, k, &mut st);
+                let (bs, bq) = activations(n, k, &mut st);
+
+                let (packed, scales) = crate::backend::cpu::repack_q4_0_8x8(&q4, m, k);
+                let mut got = vec![0.0f32; m * n];
+                unsafe { gemm_q4_0_8x8_q8_0(&packed, &scales, &bs, &bq, &mut got, m, n, k) };
+                let want = ref_gemm(&q4, &bs, &bq, m, n, k, true);
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-5 * w.abs().max(1.0),
+                        "q4_0 repack {m}x{n} index {i}: {g} vs reference {w}"
+                    );
+                }
             }
         }
 
@@ -6922,6 +7102,148 @@ pub(crate) mod avx512_vnni {
                     };
                     report("gemm_q6_k", rounds, &mut bench);
                 }
+            };
+
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(crate::backend::cpu_features::performance_core_count())
+                .build()
+                .expect("build fixed-size rayon pool")
+                .install(run);
+        }
+
+        // ── Repacked Q4_0 GEMM: equivalence + A/B ───────────────────────────
+        //
+        // The production kernel (`gemm_q4_0_8x8_q8_0`, above in the macro) and
+        // its load-time layout builder (`cpu::repack_q4_0_8x8`) are exercised
+        // here: the equivalence test pins bit-for-bit agreement with the
+        // standard-layout `gemm_q4_0_q8_0`, and `microbench_gemm_q4_0_8x8` A/Bs
+        // the two in one process (no rebuild across machine states).
+
+        /// Repacked Q4_0 GEMM must match the standard-layout production kernel
+        /// (same weights, same activations). Odd `n` exercises the column tail;
+        /// two super-blocks of `k` exercise the block loop; `m = 16` is two
+        /// super-rows.
+        #[cfg(feature = "parallel")]
+        #[test]
+        fn gemm_q4_0_8x8_matches_reference() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            let (m, n, k) = (16usize, 5usize, 512usize);
+            let nb = k / 32;
+            let mut st = 0x9a1e_c0deu64;
+            let a = rand_q4_0_rows(m, k, &mut st);
+
+            let mut b_scales = vec![0.0f32; n * nb];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+                let (s, q) = ref_quantize(&col);
+                b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+
+            let mut want = vec![0.0f32; m * n];
+            unsafe { gemm_q4_0_q8_0(&a, &b_scales, &b_quants, &mut want, m, n, k) };
+
+            let (packed, scales) = crate::backend::cpu::repack_q4_0_8x8(&a, m, k);
+            let mut got = vec![0.0f32; m * n];
+            unsafe {
+                gemm_q4_0_8x8_q8_0(&packed, &scales, &b_scales, &b_quants, &mut got, m, n, k)
+            };
+            assert_close(&got, &want, "q4_0_8x8 vs standard-layout gemm_q4_0");
+        }
+
+        /// A/B: repacked 8-row-interleave Q4_0 GEMM vs the production
+        /// standard-layout kernel. Same discipline as `microbench_gemm_rowtile`.
+        ///
+        /// ```text
+        /// cargo test -p cera --release --lib microbench_gemm_q4_0_8x8 -- --ignored --nocapture
+        /// ```
+        #[cfg(feature = "parallel")]
+        #[test]
+        #[ignore]
+        fn microbench_gemm_q4_0_8x8() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            use std::time::Instant;
+            let (m, n, k) = (2048usize, 512usize, 2048usize);
+            let nb = k / 32;
+            let ops = 2.0 * m as f64 * n as f64 * k as f64;
+            let iters = 200;
+            let rounds = 8;
+            let mut st = 0x8b1d_c0deu64;
+            let mut b_scales = vec![0.0f32; n * nb];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+                let (s, q) = ref_quantize(&col);
+                b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+
+            let mut wst = 0x1234_abcdu64;
+            let a = rand_q4_0_rows(m, k, &mut wst);
+            let (packed, scales) = crate::backend::cpu::repack_q4_0_8x8(&a, m, k);
+            let mut c_ref = vec![0.0f32; m * n];
+            let mut c_new = vec![0.0f32; m * n];
+            unsafe { gemm_q4_0_q8_0(&a, &b_scales, &b_quants, &mut c_ref, m, n, k) };
+            unsafe {
+                gemm_q4_0_8x8_q8_0(&packed, &scales, &b_scales, &b_quants, &mut c_new, m, n, k)
+            };
+            assert_close(&c_new, &c_ref, "q4_0_8x8 repacked vs standard-layout");
+
+            let report = |bench: &mut dyn FnMut(bool) -> f64| {
+                let (mut wins, mut sref, mut snew) = (0usize, 0.0f64, 0.0f64);
+                eprintln!("\n=== gemm_q4_0 repack (8x8) A/B ===");
+                for r in 0..rounds {
+                    let (g_ref, g_new) = if r % 2 == 0 {
+                        let a = bench(false);
+                        (a, bench(true))
+                    } else {
+                        let b = bench(true);
+                        (bench(false), b)
+                    };
+                    if g_new > g_ref {
+                        wins += 1;
+                    }
+                    sref += g_ref;
+                    snew += g_new;
+                    let first = if r % 2 == 0 { "std" } else { "repack" };
+                    eprintln!(
+                        "  round {r} ({first} first):  standard {g_ref:.0}   repacked {g_new:.0} GOP/s"
+                    );
+                }
+                eprintln!(
+                    "  mean:    standard {:.0}   repacked {:.0} GOP/s   {:+.1}%   repacked wins {wins}/{rounds}",
+                    sref / rounds as f64,
+                    snew / rounds as f64,
+                    (snew - sref) / sref * 100.0
+                );
+            };
+
+            let run = || {
+                let mut bench = |repacked: bool| -> f64 {
+                    let t = Instant::now();
+                    for _ in 0..iters {
+                        if repacked {
+                            unsafe {
+                                gemm_q4_0_8x8_q8_0(
+                                    &packed, &scales, &b_scales, &b_quants, &mut c_new, m, n, k,
+                                )
+                            };
+                        } else {
+                            unsafe {
+                                gemm_q4_0_q8_0(&a, &b_scales, &b_quants, &mut c_ref, m, n, k)
+                            };
+                        }
+                    }
+                    let secs = t.elapsed().as_secs_f64();
+                    std::hint::black_box((&c_ref, &c_new));
+                    ops / (secs / iters as f64) / 1e9
+                };
+                report(&mut bench);
             };
 
             rayon::ThreadPoolBuilder::new()
