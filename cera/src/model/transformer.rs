@@ -74,6 +74,10 @@ pub mod oracle_dump {
 /// (not a view into the mmap) because the layout differs from GGUF's. Prefill
 /// only — decode keeps the standard mmap layout — so this is kept *alongside*
 /// the mmap weights, costing one extra Q4_0-sized copy for each repacked weight.
+///
+/// Gated to the one config that reads it — the x86 no-BLAS prefill path — so it
+/// does not read as dead code where `gemm_preq`'s repacked branch is compiled out.
+#[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
 #[derive(Clone)]
 pub(crate) struct RepackedQ40 {
     pub packed: Vec<u8>,
@@ -82,6 +86,7 @@ pub(crate) struct RepackedQ40 {
     pub k: usize,
 }
 
+#[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
 impl std::fmt::Debug for RepackedQ40 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print the buffers — they can be hundreds of MiB.
@@ -104,8 +109,10 @@ pub(crate) struct WeightRef {
     pub m: usize,
     pub k: usize,
     /// Set by [`WeightRef::with_repack`] for Q4_0 projection weights on hosts
-    /// with the x86 int8 kernels. `None` everywhere else (other dtypes, other
-    /// targets, ragged row counts, or weights that never hit the batched GEMM).
+    /// with the x86 int8 kernels. `None` when unset (other dtypes, ragged row
+    /// counts, or weights that never hit the batched GEMM). The field exists
+    /// only on the target/feature combo whose `gemm_preq` reads it.
+    #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
     pub repacked: Option<std::sync::Arc<RepackedQ40>>,
 }
 
@@ -173,6 +180,7 @@ pub(crate) fn resolve_weight(gguf: &GgufFile, name: &str) -> Result<WeightRef> {
         dtype,
         m,
         k,
+        #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
         repacked: None,
     })
 }

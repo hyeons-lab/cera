@@ -689,6 +689,9 @@ pub fn int8_gemm_available() -> bool {
 /// lane-per-row weight vector. `scales[(sr*nb + b)*8 + r]` is row `8*sr + r`'s
 /// f32 scale for block `b`. The nibble footprint is unchanged (144 bytes per
 /// super-row block = 8× a `BlockQ4_0`).
+///
+/// x86-only: the only consumer, `gemm_q4_0_8x8_q8_0`, is an x86 int8 kernel.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn repack_q4_0_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
     assert!(
         m.is_multiple_of(8),
