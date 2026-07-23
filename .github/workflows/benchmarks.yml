@@ -17,6 +17,13 @@ name: Benchmarks
 # the job summary (a markdown table) and as a `bench-results.json` artifact in
 # github-action-benchmark's customBiggerIsBetter format, ready for trend
 # tracking / regression alerts to be layered on later.
+#
+# Each run also benchmarks upstream **llama.cpp** on the *same* GGUFs (pinned
+# commit, built once and cached, native ISA to match cera's runtime dispatch) and
+# adds `llama` + `gap (llama/cera)` columns to the summary table. This is
+# best-effort context, not a gate: if the llama build or a model load fails, the
+# comparison degrades to `n/a` and the cera measurement (the tracked JSON) is
+# unaffected. The gap is the competitive signal the isolated cera numbers lack.
 
 on:
   schedule:
@@ -48,6 +55,11 @@ env:
   # the runtime-dispatched kernels (the shipped binaries' behavior), not a build
   # pinned to one runner's microarch.
   RUSTFLAGS: ""
+  # Upstream llama.cpp pin for the head-to-head — a commit verified to support the
+  # `lfm2` arch these bundles use. Single source of truth: both the build step and
+  # both llama.cpp cache keys interpolate it, so bumping the pin (and `-v<n>`)
+  # here re-keys the cache automatically — no separate SHA-prefix to keep in sync.
+  LLAMA_COMMIT: fb38d6f278a4a391b8db1a16ee5946db3766459c
 
 jobs:
   cpu-bench:
@@ -78,6 +90,55 @@ jobs:
         with:
           path: ~/.cache/cera
           key: bench-models-LFM2.5-350M-${{ matrix.arch }}-v1
+      # Upstream llama.cpp for the head-to-head, pinned (`LLAMA_COMMIT`, top-level
+      # env) + cached + built native so it runs the same ISA cera's runtime
+      # dispatch picks. The whole thing is best-effort (`continue-on-error` on both
+      # build and save): a failure leaves `LLAMA_BENCH` unset, so `ci-bench.sh`
+      # runs cera-only and the job still passes. Both cache keys interpolate
+      # `LLAMA_COMMIT`, so bumping the pin re-keys them automatically.
+      - name: Restore llama.cpp build
+        id: llama-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/llamacpp/build
+          key: llamacpp-${{ env.LLAMA_COMMIT }}-${{ matrix.runner }}-v1
+      - name: Build llama.cpp (llama-bench)
+        id: llama
+        continue-on-error: true
+        run: |
+          set -e
+          BENCH="$HOME/llamacpp/build/bin/llama-bench"
+          # Rebuild if the binary is missing OR a *cached* one can no longer run
+          # (e.g. the runner image bumped glibc/libstdc++ under it) — `-h` exits 0
+          # on a healthy binary and non-zero if it can't even load, so this
+          # self-heals on an image change instead of serving a dead binary until
+          # the cache key is bumped by hand.
+          if [ ! -x "$BENCH" ] || ! "$BENCH" -h >/dev/null 2>&1; then
+            rm -rf "$HOME/llamacpp"
+            # Shallow single-commit fetch — pulls just the pinned tree, not the
+            # full history (github.com allows fetching a specific SHA). Only runs
+            # on a cache miss / self-heal, so the saving is a rare-path speedup.
+            git init -q "$HOME/llamacpp"
+            git -C "$HOME/llamacpp" fetch -q --depth 1 \
+              https://github.com/ggml-org/llama.cpp.git "$LLAMA_COMMIT"
+            git -C "$HOME/llamacpp" checkout -q FETCH_HEAD
+            cmake -S "$HOME/llamacpp" -B "$HOME/llamacpp/build" \
+              -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON \
+              -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF \
+              -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF
+            cmake --build "$HOME/llamacpp/build" --target llama-bench -j"$(nproc)"
+          fi
+          echo "LLAMA_BENCH=$BENCH" >> "$GITHUB_ENV"
+      # Save only on a fresh build (cache miss) — re-saving an existing key is a
+      # `ReserveCacheError` warning at best. `continue-on-error` so a transient
+      # cache-service failure never fails the (already-measured) benchmark job.
+      - name: Save llama.cpp build
+        if: steps.llama.outcome == 'success' && steps.llama-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/llamacpp/build
+          key: llamacpp-${{ env.LLAMA_COMMIT }}-${{ matrix.runner }}-v1
       - name: Run CPU benchmarks
         env:
           BIN: ./target/release/cera
@@ -88,6 +149,15 @@ jobs:
           RUNS: ${{ github.event.inputs.runs || '10' }}
           WARMUP: "2"
           MAX_TOKENS: "32"
+          # Thread count is left at each engine's *shipping default* — cera
+          # auto-calibrates (and its decode pool's optimum is not always all-core,
+          # so forcing a fixed count would measure something other than what ships),
+          # and llama-bench uses its own default. The comparison is therefore
+          # "cera as shipped vs llama as shipped". On a hyperthreaded runner the two
+          # defaults can differ (cera counts logical cores, llama physical), so read
+          # the gap as indicative, not a controlled micro-benchmark — consistent
+          # with this job's stated "relative movement across commits" purpose.
+          # (`LLAMA_THREADS` in ci-bench.sh can pin llama-bench if ever needed.)
         run: bash scripts/ci-bench.sh
       # Save only on success — a failed bench (e.g. total download outage) leaves
       # the cache untouched rather than persisting a partial ~/.cache/cera.
