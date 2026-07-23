@@ -4214,16 +4214,23 @@ macro_rules! int8_gemm_kernels {
 
         // ── K-quant int8 kernels ────────────────────────────────────────────────
         //
-        // NOT row-tiled, deliberately — measured, not assumed. The Q4_0/Q8_0 GEMMs
-        // above process `TILE_M` weight rows per task ("Row tiling"); these stay
-        // per-row. Q4_K/Q6_K reduce each `vpdpbusd` to a scalar immediately (an hsum
-        // per block) and carry a per-sub-block scale plus a mins correction, so there
-        // is no vector-accumulator ILP for tiling to expose — only activation-load
-        // reuse, against much heavier per-block work. A row-tiled Q4_K prototype
-        // measured **-9.3% at 4x8 and -17% at 4x4, 0/8 rounds won in both**. Q6_K was
-        // not prototyped; it shares the structure with more per-block work still (qh
-        // reconstruction, two hsums per column). Note also that the K-quant GEMV *is*
-        // this GEMM at n=1, so tiling here would have to not regress decode.
+        // Like the Q4_0/Q8_0 GEMMs above, these defer the `vpdpbusd`/`dot32u`
+        // reduction: the 8 dot lanes stay in a per-column float accumulator
+        // (`facc`), scaled per sub-block, and collapse with a single `hsum256_ps`
+        // per column at the end — not an hsum per (sub-block, column). The Q4_K
+        // mins term and the Q6_K −32 recentering carry no dot lanes, so they
+        // accumulate as scalars (`macc`) alongside.
+        //
+        // Still NOT row-tiled. The Q4_0/Q8_0 GEMMs process `TILE_M` weight rows per
+        // task ("Row tiling"); these stay per-row. A row-tiled Q4_K prototype once
+        // measured **-9.3% at 4x8 and -17% at 4x4, 0/8 rounds won** — but that was
+        // against the *old* per-block-hsum structure, whose "no vector-accumulator
+        // ILP to reuse" premise this deferral removed, so the number no longer
+        // describes the kernel; row-tiling on the deferred structure is simply
+        // unmeasured. Each sub-block still carries a per-sub-block scale and a mins
+        // correction (heavier per-block work than Q4_0/Q8_0), and the K-quant GEMV
+        // *is* this GEMM at n=1, so any tiling here would also have to not regress
+        // decode.
         //
         // x86 analogue of the NEON K-quant GEMM family. Two structural differences,
         // both forced by `vpdpbusd` taking an *unsigned* × signed operand pair:
@@ -4237,8 +4244,9 @@ macro_rules! int8_gemm_kernels {
         //    *16-element* granularity because Q6_K scales are 16-wide.
         //
         // `vpdpbusd` (the non-saturating form) is safe here: per-lane sums are
-        // bounded (≤ 4·63·127) and every lane accumulator is hsummed and reset per
-        // sub-block, so the i32 accumulator cannot overflow.
+        // bounded (≤ 4·63·127) and each `dot32u` result is converted to float and
+        // accumulated there per sub-block — the i32 lanes from one call are never
+        // fed back into another, so the i32 accumulator cannot overflow.
         //
         // The AVX2 instantiation's `dot32u` DOES saturate its i16 intermediate,
         // so it needs the tighter bound, and it holds: `maddubs` sums two
@@ -4345,7 +4353,16 @@ macro_rules! int8_gemm_kernels {
                     let mut j0 = 0usize;
                     while j0 < n {
                         let cols = KQ_COLS.min(n - j0);
-                        let mut acc = [0.0f32; KQ_COLS];
+                        // Defer the reduction: `dp = Σ_lane dot32u(w,x)[lane]` and
+                        // the answer is `Σ_s xs·dsc·dp - Σ_s xs·dmn·sx`. Since the
+                        // lane-sum is linear, `Σ_s (xs·dsc)·dp = hsum(Σ_s (xs·dsc)·
+                        // lanes)`, so the 8 dpbusd lanes stay in a float vector
+                        // accumulator and collapse with a single hsum per column at
+                        // the end — the same structure the Q4_0/Q8_0 kernels use,
+                        // instead of an hsum per (sub-block, column). The mins term
+                        // carries no dot lanes, so it accumulates as a scalar.
+                        let mut facc = [_mm256_setzero_ps(); KQ_COLS];
+                        let mut macc = [0.0f32; KQ_COLS];
 
                         for bi in 0..sb {
                             let blk = &*(a_quant
@@ -4369,22 +4386,26 @@ macro_rules! int8_gemm_kernels {
                                     let xb = bi * 8 + s;
                                     let dsc = d * sc[s] as f32;
                                     let dmn = dmin * mn[s] as f32;
-                                    for (jj, acc_j) in acc.iter_mut().enumerate().take(cols) {
+                                    for jj in 0..cols {
                                         let j = j0 + jj;
                                         let x = _mm256_loadu_si256(
                                             b_quants.as_ptr().add(j * k + xb * 32)
                                                 as *const __m256i,
                                         );
-                                        let dp = hsum256_epi32(dot32u(w, x));
+                                        let lanes = _mm256_cvtepi32_ps(dot32u(w, x));
                                         let xs = *b_scales.get_unchecked(j * nb32 + xb);
                                         let sx = *cs.get_unchecked(j * nb32 + xb);
-                                        *acc_j += xs * (dsc * dp as f32 - dmn * sx as f32);
+                                        let scale = _mm256_set1_ps(xs * dsc);
+                                        facc[jj] = _mm256_fmadd_ps(lanes, scale, facc[jj]);
+                                        macc[jj] += xs * dmn * sx as f32;
                                     }
                                 }
                             }
                         }
 
-                        row_out[j0..j0 + cols].copy_from_slice(&acc[..cols]);
+                        for jj in 0..cols {
+                            *row_out.get_unchecked_mut(j0 + jj) = hsum256_ps(facc[jj]) - macc[jj];
+                        }
                         j0 += cols;
                     }
                 }
@@ -4439,7 +4460,16 @@ macro_rules! int8_gemm_kernels {
                     let mut j0 = 0usize;
                     while j0 < n {
                         let cols = KQ_COLS.min(n - j0);
-                        let mut acc = [0.0f32; KQ_COLS];
+                        // Deferred reduction, as in the Q4_K kernel — but a 32-quant
+                        // group here spans two 16-wide Q6_K scales, so the 8 dpbusd
+                        // lanes carry two distinct scales: lanes 0..3 (first 16
+                        // elements) weight by `sc0`, lanes 4..7 by `sc1`. A per-lane
+                        // scale vector `[sc0×4, sc1×4]·d` folds both into one fmadd,
+                        // so the two hsum128s per (group, column) become one
+                        // hsum256 per column. The −32 recentering has no dot lanes,
+                        // so it accumulates as a scalar.
+                        let mut facc = [_mm256_setzero_ps(); KQ_COLS];
+                        let mut macc = [0.0f32; KQ_COLS];
 
                         for bi in 0..sb {
                             let blk = &*(a_quant
@@ -4447,6 +4477,7 @@ macro_rules! int8_gemm_kernels {
                                 .add(row_start + bi * size_of::<crate::quant::BlockQ6K>())
                                 as *const crate::quant::BlockQ6K);
                             let d = half::f16::from_bits(blk.d).to_f32();
+                            let d32 = d * 32.0;
                             let ql = blk.ql.as_ptr();
                             let qh = blk.qh.as_ptr();
 
@@ -4474,29 +4505,33 @@ macro_rules! int8_gemm_kernels {
                                     let sc0 = *blk.scales.get_unchecked(nh * 8 + 2 * g) as f32;
                                     let sc1 = *blk.scales.get_unchecked(nh * 8 + 2 * g + 1) as f32;
                                     let xb = bi * 8 + nh * 4 + g;
+                                    // [sc0,sc0,sc0,sc0, sc1,sc1,sc1,sc1] · d — the
+                                    // column loop only broadcasts and folds in `xs`.
+                                    let sc_split_d =
+                                        _mm256_set_m128(_mm_set1_ps(sc1 * d), _mm_set1_ps(sc0 * d));
 
-                                    for (jj, acc_j) in acc.iter_mut().enumerate().take(cols) {
+                                    for jj in 0..cols {
                                         let j = j0 + jj;
                                         let x = _mm256_loadu_si256(
                                             b_quants.as_ptr().add(j * k + xb * 32)
                                                 as *const __m256i,
                                         );
-                                        let lanes = dot32u(w, x);
-                                        let dp0 = hsum128_epi32(_mm256_castsi256_si128(lanes));
-                                        let dp1 = hsum128_epi32(_mm256_extracti128_si256(lanes, 1));
+                                        let lanes = _mm256_cvtepi32_ps(dot32u(w, x));
                                         let xs = *b_scales.get_unchecked(j * nb32 + xb);
                                         let sx0 = *cs16.get_unchecked(j * nh16 + xb * 2);
                                         let sx1 = *cs16.get_unchecked(j * nh16 + xb * 2 + 1);
-                                        *acc_j += xs
-                                            * d
-                                            * (sc0 * (dp0 - 32 * sx0) as f32
-                                                + sc1 * (dp1 - 32 * sx1) as f32);
+                                        let scale = _mm256_mul_ps(sc_split_d, _mm256_set1_ps(xs));
+                                        facc[jj] = _mm256_fmadd_ps(lanes, scale, facc[jj]);
+                                        macc[jj] +=
+                                            xs * d32 * (sc0 * sx0 as f32 + sc1 * sx1 as f32);
                                     }
                                 }
                             }
                         }
 
-                        row_out[j0..j0 + cols].copy_from_slice(&acc[..cols]);
+                        for jj in 0..cols {
+                            *row_out.get_unchecked_mut(j0 + jj) = hsum256_ps(facc[jj]) - macc[jj];
+                        }
                         j0 += cols;
                     }
                 }
@@ -6590,6 +6625,310 @@ pub(crate) mod avx512_vnni {
                 let col: Vec<f32> = (0..m).map(|i| out[i * n + j]).collect();
                 assert_close(&col, &y, &format!("gemm_q8_0 col {j}"));
             }
+        }
+
+        // ── K-quant deferred-hsum A/B ───────────────────────────────────────
+        //
+        // The production K-quant GEMMs above defer the dpbusd reduction into a
+        // per-column float accumulator (one hsum per column), the way the
+        // Q4_0/Q8_0 kernels do. These references reproduce the *previous*
+        // structure — an int hsum per (sub-block, column) — so the two can be
+        // A/B'd in one process without a rebuild across machine states.
+
+        #[cfg(feature = "parallel")]
+        #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+        unsafe fn ref_gemm_q4_k_hsum(
+            a_quant: &[u8],
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            n: usize,
+            k: usize,
+        ) {
+            let sb = k / 256;
+            let nb32 = k / 32;
+            let row_bytes = sb * size_of::<crate::quant::BlockQ4KM>();
+            let col_sums = unsafe { q8_0_col_sums(b_quants, n, k) };
+            let cs: &[i32] = &col_sums;
+            let compute_row = |(i, row_out): (usize, &mut [f32])| unsafe {
+                let mask_0f = _mm256_set1_epi8(0x0F);
+                let row_start = i * row_bytes;
+                let mut j0 = 0usize;
+                while j0 < n {
+                    let cols = KQ_COLS.min(n - j0);
+                    let mut acc = [0.0f32; KQ_COLS];
+                    for bi in 0..sb {
+                        let blk = &*(a_quant
+                            .as_ptr()
+                            .add(row_start + bi * size_of::<crate::quant::BlockQ4KM>())
+                            as *const crate::quant::BlockQ4KM);
+                        let d = half::f16::from_bits(blk.d).to_f32();
+                        let dmin = half::f16::from_bits(blk.dmin).to_f32();
+                        let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
+                        let qs = blk.qs.as_ptr();
+                        for g in 0..4 {
+                            let qb = _mm256_loadu_si256(qs.add(g * 32) as *const __m256i);
+                            let w_lo = _mm256_and_si256(qb, mask_0f);
+                            let w_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), mask_0f);
+                            for (w, s) in [(w_lo, 2 * g), (w_hi, 2 * g + 1)] {
+                                let xb = bi * 8 + s;
+                                let dsc = d * sc[s] as f32;
+                                let dmn = dmin * mn[s] as f32;
+                                for (jj, acc_j) in acc.iter_mut().enumerate().take(cols) {
+                                    let j = j0 + jj;
+                                    let x =
+                                        _mm256_loadu_si256(b_quants.as_ptr().add(j * k + xb * 32)
+                                            as *const __m256i);
+                                    let dp = hsum256_epi32(dot32u(w, x));
+                                    let xs = *b_scales.get_unchecked(j * nb32 + xb);
+                                    let sx = *cs.get_unchecked(j * nb32 + xb);
+                                    *acc_j += xs * (dsc * dp as f32 - dmn * sx as f32);
+                                }
+                            }
+                        }
+                    }
+                    row_out[j0..j0 + cols].copy_from_slice(&acc[..cols]);
+                    j0 += cols;
+                }
+            };
+            crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
+        }
+
+        #[cfg(feature = "parallel")]
+        #[target_feature(enable = "avx512f,avx512vl,avx512vnni,avx2,fma")]
+        unsafe fn ref_gemm_q6_k_hsum(
+            a_quant: &[u8],
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            n: usize,
+            k: usize,
+        ) {
+            let sb = k / 256;
+            let nb32 = k / 32;
+            let nh16 = k / 16;
+            let row_bytes = sb * size_of::<crate::quant::BlockQ6K>();
+            let col_sums16 = unsafe { q8_0_col_sums16(b_quants, n, k) };
+            let cs16: &[i32] = &col_sums16;
+            let compute_row = |(i, row_out): (usize, &mut [f32])| unsafe {
+                let mask_0f = _mm256_set1_epi8(0x0F);
+                let mask_03 = _mm256_set1_epi8(0x03);
+                let row_start = i * row_bytes;
+                let mut j0 = 0usize;
+                while j0 < n {
+                    let cols = KQ_COLS.min(n - j0);
+                    let mut acc = [0.0f32; KQ_COLS];
+                    for bi in 0..sb {
+                        let blk = &*(a_quant
+                            .as_ptr()
+                            .add(row_start + bi * size_of::<crate::quant::BlockQ6K>())
+                            as *const crate::quant::BlockQ6K);
+                        let d = half::f16::from_bits(blk.d).to_f32();
+                        let ql = blk.ql.as_ptr();
+                        let qh = blk.qh.as_ptr();
+                        for nh in 0..2usize {
+                            let qhb = _mm256_loadu_si256(qh.add(nh * 32) as *const __m256i);
+                            for g in 0..4usize {
+                                let qlb = _mm256_loadu_si256(
+                                    ql.add(nh * 64 + (g & 1) * 32) as *const __m256i
+                                );
+                                let l4 = if g < 2 {
+                                    _mm256_and_si256(qlb, mask_0f)
+                                } else {
+                                    _mm256_and_si256(_mm256_srli_epi16(qlb, 4), mask_0f)
+                                };
+                                let h2 = _mm256_and_si256(
+                                    _mm256_srl_epi16(qhb, _mm_cvtsi32_si128(2 * g as i32)),
+                                    mask_03,
+                                );
+                                let w = _mm256_or_si256(l4, _mm256_slli_epi16(h2, 4));
+                                let sc0 = *blk.scales.get_unchecked(nh * 8 + 2 * g) as f32;
+                                let sc1 = *blk.scales.get_unchecked(nh * 8 + 2 * g + 1) as f32;
+                                let xb = bi * 8 + nh * 4 + g;
+                                for (jj, acc_j) in acc.iter_mut().enumerate().take(cols) {
+                                    let j = j0 + jj;
+                                    let x =
+                                        _mm256_loadu_si256(b_quants.as_ptr().add(j * k + xb * 32)
+                                            as *const __m256i);
+                                    let lanes = dot32u(w, x);
+                                    let dp0 = hsum128_epi32(_mm256_castsi256_si128(lanes));
+                                    let dp1 = hsum128_epi32(_mm256_extracti128_si256(lanes, 1));
+                                    let xs = *b_scales.get_unchecked(j * nb32 + xb);
+                                    let sx0 = *cs16.get_unchecked(j * nh16 + xb * 2);
+                                    let sx1 = *cs16.get_unchecked(j * nh16 + xb * 2 + 1);
+                                    *acc_j += xs
+                                        * d
+                                        * (sc0 * (dp0 - 32 * sx0) as f32
+                                            + sc1 * (dp1 - 32 * sx1) as f32);
+                                }
+                            }
+                        }
+                    }
+                    row_out[j0..j0 + cols].copy_from_slice(&acc[..cols]);
+                    j0 += cols;
+                }
+            };
+            crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
+        }
+
+        fn rand_q4_k_rows(m: usize, k: usize, st: &mut u64) -> Vec<u8> {
+            let sb = k / 256;
+            let bsz = size_of::<crate::quant::BlockQ4KM>();
+            let mut a = vec![0u8; m * sb * bsz];
+            for (bi, chunk) in a.chunks_mut(bsz).enumerate() {
+                let d = half::f16::from_f32(0.01 + 0.005 * (bi % 7) as f32);
+                let dmin = half::f16::from_f32(0.02 + 0.003 * (bi % 5) as f32);
+                chunk[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+                chunk[2..4].copy_from_slice(&dmin.to_bits().to_le_bytes());
+                for b in chunk[4..].iter_mut() {
+                    *b = (lcg01(st) * 255.0) as u8;
+                }
+            }
+            a
+        }
+
+        fn rand_q6_k_rows(m: usize, k: usize, st: &mut u64) -> Vec<u8> {
+            let sb = k / 256;
+            let bsz = size_of::<crate::quant::BlockQ6K>();
+            let mut a = vec![0u8; m * sb * bsz];
+            for (bi, chunk) in a.chunks_mut(bsz).enumerate() {
+                for b in chunk[..208].iter_mut() {
+                    *b = (lcg01(st) * 255.0) as u8;
+                }
+                let d = half::f16::from_f32(0.008 + 0.004 * (bi % 5) as f32);
+                chunk[208..210].copy_from_slice(&d.to_bits().to_le_bytes());
+            }
+            a
+        }
+
+        /// In-process A/B of the deferred-hsum K-quant GEMMs against the
+        /// per-block-hsum references above, for both Q4_K and Q6_K.
+        ///
+        /// ```text
+        /// cargo test -p cera --release --lib microbench_gemm_kquant -- --ignored --nocapture
+        /// ```
+        ///
+        /// Same discipline as `microbench_gemm_rowtile`: fixed-size rayon pool,
+        /// paired rounds with the arm order alternating on round parity, real
+        /// pseudo-random activations. Read the wins line, not the means.
+        #[cfg(feature = "parallel")]
+        #[test]
+        #[ignore]
+        fn microbench_gemm_kquant() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            use std::time::Instant;
+            let (m, n, k) = (2048usize, 512usize, 2048usize);
+            let nb = k / 32;
+            let ops = 2.0 * m as f64 * n as f64 * k as f64;
+            let iters = 200;
+            let rounds = 8;
+            let mut st = 0x4b1d_c0deu64;
+            let mut b_scales = vec![0.0f32; n * nb];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+                let (s, q) = ref_quantize(&col);
+                b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+
+            fn report(tag: &str, rounds: usize, bench: &mut dyn FnMut(bool) -> f64) {
+                let (mut wins, mut sref, mut snew) = (0usize, 0.0f64, 0.0f64);
+                eprintln!("\n=== {tag} deferred-hsum A/B ===");
+                for r in 0..rounds {
+                    let (g_ref, g_new) = if r % 2 == 0 {
+                        let a = bench(false);
+                        (a, bench(true))
+                    } else {
+                        let b = bench(true);
+                        (bench(false), b)
+                    };
+                    if g_new > g_ref {
+                        wins += 1;
+                    }
+                    sref += g_ref;
+                    snew += g_new;
+                    let first = if r % 2 == 0 { "ref" } else { "new" };
+                    eprintln!(
+                        "  round {r} ({first} first):  per-block-hsum {g_ref:.0}   deferred {g_new:.0} GOP/s"
+                    );
+                }
+                eprintln!(
+                    "  mean:    per-block-hsum {:.0}   deferred {:.0} GOP/s   {:+.1}%   deferred wins {wins}/{rounds}",
+                    sref / rounds as f64,
+                    snew / rounds as f64,
+                    (snew - sref) / sref * 100.0
+                );
+            }
+
+            let run = || {
+                {
+                    let mut wst = 0x2222_abcdu64;
+                    let a = rand_q4_k_rows(m, k, &mut wst);
+                    let mut c_ref = vec![0.0f32; m * n];
+                    let mut c_new = vec![0.0f32; m * n];
+                    // Self-check before trusting the timing: the deferred kernel
+                    // and the per-block-hsum reference must agree.
+                    unsafe { gemm_q4_k_q8_0(&a, &b_scales, &b_quants, &mut c_new, m, n, k) };
+                    unsafe { ref_gemm_q4_k_hsum(&a, &b_scales, &b_quants, &mut c_ref, n, k) };
+                    assert_close(&c_new, &c_ref, "q4_k deferred vs per-block-hsum");
+                    let mut bench = |deferred: bool| -> f64 {
+                        let t = Instant::now();
+                        for _ in 0..iters {
+                            if deferred {
+                                unsafe {
+                                    gemm_q4_k_q8_0(&a, &b_scales, &b_quants, &mut c_new, m, n, k)
+                                };
+                            } else {
+                                unsafe {
+                                    ref_gemm_q4_k_hsum(&a, &b_scales, &b_quants, &mut c_ref, n, k)
+                                };
+                            }
+                        }
+                        let secs = t.elapsed().as_secs_f64();
+                        std::hint::black_box((&c_ref, &c_new));
+                        ops / (secs / iters as f64) / 1e9
+                    };
+                    report("gemm_q4_k", rounds, &mut bench);
+                }
+
+                {
+                    let mut wst = 0x3333_5eedu64;
+                    let a = rand_q6_k_rows(m, k, &mut wst);
+                    let mut c_ref = vec![0.0f32; m * n];
+                    let mut c_new = vec![0.0f32; m * n];
+                    // Self-check before trusting the timing, as for Q4_K.
+                    unsafe { gemm_q6_k_q8_0(&a, &b_scales, &b_quants, &mut c_new, m, n, k) };
+                    unsafe { ref_gemm_q6_k_hsum(&a, &b_scales, &b_quants, &mut c_ref, n, k) };
+                    assert_close(&c_new, &c_ref, "q6_k deferred vs per-block-hsum");
+                    let mut bench = |deferred: bool| -> f64 {
+                        let t = Instant::now();
+                        for _ in 0..iters {
+                            if deferred {
+                                unsafe {
+                                    gemm_q6_k_q8_0(&a, &b_scales, &b_quants, &mut c_new, m, n, k)
+                                };
+                            } else {
+                                unsafe {
+                                    ref_gemm_q6_k_hsum(&a, &b_scales, &b_quants, &mut c_ref, n, k)
+                                };
+                            }
+                        }
+                        let secs = t.elapsed().as_secs_f64();
+                        std::hint::black_box((&c_ref, &c_new));
+                        ops / (secs / iters as f64) / 1e9
+                    };
+                    report("gemm_q6_k", rounds, &mut bench);
+                }
+            };
+
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(crate::backend::cpu_features::performance_core_count())
+                .build()
+                .expect("build fixed-size rayon pool")
+                .install(run);
         }
     }
 }
