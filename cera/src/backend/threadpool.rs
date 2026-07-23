@@ -673,10 +673,8 @@ fn worker_loop(shared: Arc<Shared>, worker_id: usize, pin_core: Option<usize>, s
         // masks, silently unpinning parked workers. One ~µs syscall per
         // worker per token at most — parks only happen in the ms-scale
         // inter-token gaps, never between the µs-apart GEMVs of one token.
-        if parked {
-            if let Some(core) = pin_core {
-                let _ = pin_current_thread_to_core(core);
-            }
+        if parked && let Some(core) = pin_core {
+            let _ = pin_current_thread_to_core(core);
         }
         // SAFETY: the Acquire load of `epoch` above synchronizes with the
         // dispatcher's Release bump, so this fresh `Job` (written before that

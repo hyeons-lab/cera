@@ -3146,15 +3146,12 @@ mod avx2 {
 // below, which run only where `is_x86_feature_detected!("avx512f")` holds
 // (e.g. Zen 4/5, Skylake-X), comparing each kernel against the scalar reference.
 //
-// Behind the default-on `avx512` crate feature: the `_mm512_*` intrinsics need
-// Rust 1.89 (past the 1.85 MSRV), so disabling the feature keeps x86 building on
-// 1.85–1.88 (the tier then caps at AVX2; `detect()` won't produce `Avx512`).
+// Behind the default-on `avx512` crate feature: disabling it caps x86 at the
+// AVX2 tier (`detect()` won't produce `Avx512`). The `_mm512_*` intrinsics need
+// Rust 1.89, which is the crate MSRV, so the gate is about hardware coverage,
+// not toolchain support.
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 pub(crate) mod avx512 {
-    // 1.89 `_mm512_*` intrinsics vs the 1.85 MSRV — see the module gate above.
-    // The `avx512` feature lets MSRV-sensitive builds opt out; when it's on, the
-    // build already requires 1.89, so silence the (correct) lint here.
-    #![allow(clippy::incompatible_msrv)]
     use super::*;
     use std::arch::x86_64::*;
 
@@ -4619,7 +4616,7 @@ macro_rules! int8_gemm_kernels {
 // shows; see the invocation below for the numbers and their caveat.
 //
 // Note this module needs no `avx512` crate feature: `maddubs`/`madd` are
-// SSSE3/SSE2-era intrinsics, stable well before the 1.85 MSRV.
+// SSSE3/SSE2-era intrinsics, stable well before the crate MSRV.
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod avx2_int8 {
     use super::*;
@@ -5418,9 +5415,6 @@ pub(crate) mod avx2_int8 {
 
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 pub(crate) mod avx512_vnni {
-    // 1.89 `_mm512_*`/`_mm256_dpbusd_*` intrinsics vs the 1.85 MSRV — same
-    // rationale as the `avx512` module above.
-    #![allow(clippy::incompatible_msrv)]
     use super::*;
     use std::arch::x86_64::*;
 

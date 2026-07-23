@@ -315,7 +315,7 @@ fn tensor_data_size(shape: &[usize], dtype: DType) -> Result<usize> {
             .context("tensor size overflow")
     } else {
         ensure!(
-            numel % block_size == 0,
+            numel.is_multiple_of(block_size),
             "tensor element count {numel} is not divisible by block size {block_size}"
         );
         (numel / block_size)

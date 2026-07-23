@@ -630,14 +630,14 @@ impl InferenceState {
         // wise so we don't depend on the snapshot's allocator alignment.
         fn decode_f32_into(dst: &mut Vec<f32>, src: &[u8]) {
             assert!(
-                src.len() % 4 == 0,
+                src.len().is_multiple_of(4),
                 "snapshot byte length {} not a multiple of 4",
                 src.len()
             );
             dst.clear();
             dst.reserve(src.len() / 4);
-            for chunk in src.chunks_exact(4) {
-                dst.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            for chunk in src.as_chunks::<4>().0 {
+                dst.push(f32::from_le_bytes(*chunk));
             }
         }
 
@@ -1023,27 +1023,26 @@ impl KvPrefixCache {
         };
 
         // If the best hit came from the cold tier, promote it to warm.
-        if let Some((snapshot, len)) = &best {
-            if !self
+        if let Some((snapshot, len)) = &best
+            && !self
                 .warm
                 .values()
                 .any(|e| e.tokens.len() >= *len && tokens.starts_with(&e.tokens))
-            {
-                let hash = hash_tokens(&tokens[..*len]);
-                let snap_bytes = snapshot.byte_size() as u64;
-                self.evict_warm_if_needed(snap_bytes);
-                if let Some(old) = self.warm.insert(
-                    hash,
-                    CacheEntry {
-                        tokens: tokens[..*len].to_vec(),
-                        snapshot: snapshot.clone(),
-                        last_used: Cell::new(Instant::now()),
-                    },
-                ) {
-                    self.warm_bytes -= old.snapshot.byte_size() as u64;
-                }
-                self.warm_bytes += snap_bytes;
+        {
+            let hash = hash_tokens(&tokens[..*len]);
+            let snap_bytes = snapshot.byte_size() as u64;
+            self.evict_warm_if_needed(snap_bytes);
+            if let Some(old) = self.warm.insert(
+                hash,
+                CacheEntry {
+                    tokens: tokens[..*len].to_vec(),
+                    snapshot: snapshot.clone(),
+                    last_used: Cell::new(Instant::now()),
+                },
+            ) {
+                self.warm_bytes -= old.snapshot.byte_size() as u64;
             }
+            self.warm_bytes += snap_bytes;
         }
 
         best
@@ -1100,10 +1099,10 @@ impl KvPrefixCache {
                 .iter()
                 .min_by_key(|(_, e)| e.last_used.get())
                 .map(|(k, _)| *k);
-            if let Some(key) = oldest {
-                if let Some(removed) = self.warm.remove(&key) {
-                    self.warm_bytes -= removed.snapshot.byte_size() as u64;
-                }
+            if let Some(key) = oldest
+                && let Some(removed) = self.warm.remove(&key)
+            {
+                self.warm_bytes -= removed.snapshot.byte_size() as u64;
             }
         }
     }
@@ -1198,11 +1197,11 @@ impl KvPrefixCache {
             let prefix = &tokens[..prefix_len];
             let hash = hash_tokens(prefix);
             let path = dir.join(self.cold_filename(hash));
-            if path.exists() {
-                if let Some(snapshot) = self.load_cold_file(&path, tokens) {
-                    best = Some(snapshot);
-                    break; // longest prefix first, so first match is best
-                }
+            if path.exists()
+                && let Some(snapshot) = self.load_cold_file(&path, tokens)
+            {
+                best = Some(snapshot);
+                break; // longest prefix first, so first match is best
             }
         }
 

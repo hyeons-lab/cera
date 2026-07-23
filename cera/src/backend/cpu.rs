@@ -698,7 +698,7 @@ pub fn gemm_preq_dispatch(
     // reached from safe code. O(1) against an O(m*n*k) GEMM.
     let blocks = k / dtype.block_size();
     assert!(
-        k % dtype.block_size() == 0,
+        k.is_multiple_of(dtype.block_size()),
         "gemm_preq_dispatch: k={k} is not a multiple of {:?}'s block size",
         dtype
     );
@@ -1539,8 +1539,8 @@ pub fn conv1d(
     debug_assert!(groups > 0, "groups must be > 0");
     debug_assert!(kernel_size > 0, "kernel_size must be > 0");
     debug_assert_eq!(input.len(), in_channels * t_in);
-    debug_assert!(in_channels % groups == 0);
-    debug_assert!(out_channels % groups == 0);
+    debug_assert!(in_channels.is_multiple_of(groups));
+    debug_assert!(out_channels.is_multiple_of(groups));
     if let Some(b) = bias {
         debug_assert_eq!(b.len(), out_channels);
     }
@@ -1663,8 +1663,8 @@ pub fn conv2d(
     debug_assert!(kh > 0, "kh must be > 0");
     debug_assert!(kw > 0, "kw must be > 0");
     debug_assert_eq!(input.len(), in_channels * h_in * w_in);
-    debug_assert!(in_channels % groups == 0);
-    debug_assert!(out_channels % groups == 0);
+    debug_assert!(in_channels.is_multiple_of(groups));
+    debug_assert!(out_channels.is_multiple_of(groups));
     if let Some(b) = bias {
         debug_assert_eq!(b.len(), out_channels);
     }
@@ -2229,6 +2229,64 @@ pub fn flash_attention_gqa_cpu(
             return;
         }
     }
+    // x86 AVX-512 kernel: 16-wide zmm, needs head_dim a multiple of 16. Checked
+    // before the AVX2 path so an AVX-512 host uses the wider kernel; a head_dim
+    // that is a multiple of 8 but not 16 falls through to AVX2 below.
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    {
+        if head_dim.is_multiple_of(16) && head_dim <= 256 && is_x86_feature_detected!("avx512f") {
+            unsafe {
+                flash_attention_gqa_avx512(
+                    q_mat,
+                    k_cache,
+                    v_cache,
+                    out,
+                    n_heads_start,
+                    group_size,
+                    n_queries,
+                    q_stride,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    start_pos,
+                );
+            }
+            return;
+        }
+    }
+    // x86 AVX2+FMA kernel: needs head_dim a multiple of 8 (one ymm = 8 f32) and
+    // <= 256 (the acc/q register-array bound). Runtime-detected so a Haswell
+    // baseline build still falls back to scalar on a host without AVX2. Q/K/V
+    // are all f32 here (the KV cache is f32 on CPU), so this is plain FMA, not
+    // an int8 kernel — no tier gate beyond the CPUID check.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if head_dim.is_multiple_of(8)
+            && head_dim <= 256
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            unsafe {
+                flash_attention_gqa_avx2(
+                    q_mat,
+                    k_cache,
+                    v_cache,
+                    out,
+                    n_heads_start,
+                    group_size,
+                    n_queries,
+                    q_stride,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    start_pos,
+                );
+            }
+            return;
+        }
+    }
     flash_attention_gqa_scalar(
         q_mat,
         k_cache,
@@ -2339,6 +2397,343 @@ fn flash_attention_gqa_scalar(
             let out_off = (g * n_queries + j) * head_dim;
             for d in 0..head_dim {
                 out[out_off + d] = acc[d] * inv_sum;
+            }
+        }
+    }
+}
+
+/// AVX2+FMA flash attention, structurally mirroring `flash_attention_gqa_neon`:
+/// the QK dot and the weighted-V accumulate are vectorized (256-bit lanes), the
+/// online-softmax bookkeeping stays scalar and calls the identical `ggml_expf`,
+/// so the only numeric divergence from the scalar path is the summation order
+/// of the two dot products — the same divergence NEON already has, well inside
+/// the parity suite's cosine>0.99 flash bar.
+///
+/// Requires `head_dim % 8 == 0` and `head_dim <= 256` (both enforced by the
+/// dispatcher). Q is gathered from the stride-`q_stride` column layout into a
+/// contiguous buffer once per query, then loaded into registers.
+///
+/// # Safety
+/// Caller must ensure AVX2 and FMA are available (the dispatcher CPUID-checks),
+/// and that the buffers are sized for the head range, `q_stride`, `kv_dim`, and
+/// `start_pos + n_queries` (same contract as the scalar/NEON kernels).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+unsafe fn flash_attention_gqa_avx2(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads_start: usize,
+    group_size: usize,
+    n_queries: usize,
+    q_stride: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        /// Horizontal sum of a `__m256` (matches `simd::hsum_avx`).
+        #[target_feature(enable = "avx2")]
+        unsafe fn hsum256(v: __m256) -> f32 {
+            let hi = _mm256_extractf128_ps(v, 1);
+            let lo = _mm256_castps256_ps128(v);
+            let s128 = _mm_add_ps(lo, hi);
+            let s64 = _mm_add_ps(s128, _mm_movehl_ps(s128, s128));
+            let s32 = _mm_add_ss(s64, _mm_shuffle_ps(s64, s64, 1));
+            _mm_cvtss_f32(s32)
+        }
+
+        // Buffer-sizing tripwires, mirroring `flash_attention_gqa_neon`. The
+        // dispatcher checks `head_dim`, but the caller still owns the q/k/v/out
+        // sizing contract; without these a violation is silent UB.
+        debug_assert!(
+            q_mat.len() >= ((n_heads_start + group_size) * head_dim - 1) * q_stride + n_queries,
+            "q_mat too small for the given head range and q_stride"
+        );
+        debug_assert!(
+            (start_pos + n_queries == 0)
+                || k_cache.len() >= (start_pos + n_queries - 1) * kv_dim + kv_h_offset + head_dim,
+            "k_cache too small"
+        );
+        debug_assert!(
+            (start_pos + n_queries == 0)
+                || v_cache.len() >= (start_pos + n_queries - 1) * kv_dim + kv_h_offset + head_dim,
+            "v_cache too small"
+        );
+        debug_assert!(
+            out.len() >= group_size * n_queries * head_dim,
+            "out buffer too small for contiguous [group_size, n_queries, head_dim] output"
+        );
+
+        // 256 / 8 = 32 vectors max (head_dim <= 256, multiple of 8).
+        const MAX_VECS: usize = 32;
+        let n_vecs = head_dim / 8;
+
+        let q_ptr = q_mat.as_ptr();
+        let k_ptr = k_cache.as_ptr();
+        let v_ptr = v_cache.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+
+        let mut q_vecs = [_mm256_setzero_ps(); MAX_VECS];
+        let mut acc_vecs = [_mm256_setzero_ps(); MAX_VECS];
+        let mut q_gather = [0.0f32; 256];
+        let mut tile_scores = [0.0f32; FLASH_TILE_KV];
+
+        for g in 0..group_size {
+            let h = n_heads_start + g;
+            let h_off = h * head_dim;
+
+            for j in 0..n_queries {
+                let max_kv = start_pos + j + 1;
+
+                // Gather Q[h, j] from the stride-q_stride column layout into a
+                // contiguous buffer, then into registers. One gather per query,
+                // amortized over max_kv KV positions.
+                for d in 0..head_dim {
+                    q_gather[d] = *q_ptr.add((h_off + d) * q_stride + j);
+                }
+                for i in 0..n_vecs {
+                    q_vecs[i] = _mm256_loadu_ps(q_gather.as_ptr().add(i * 8));
+                    acc_vecs[i] = _mm256_setzero_ps();
+                }
+
+                let mut running_max = f32::NEG_INFINITY;
+                let mut running_sum = 0.0f64;
+
+                for kv_start in (0..max_kv).step_by(FLASH_TILE_KV) {
+                    let kv_end = (kv_start + FLASH_TILE_KV).min(max_kv);
+                    let tile_len = kv_end - kv_start;
+
+                    // QK dot products for the tile. Two independent lane
+                    // accumulators to hide the FMA latency (mirrors NEON).
+                    for ti in 0..tile_len {
+                        let k_off = (kv_start + ti) * kv_dim + kv_h_offset;
+                        let mut s0 = _mm256_setzero_ps();
+                        let mut s1 = _mm256_setzero_ps();
+                        let mut i = 0;
+                        while i + 2 <= n_vecs {
+                            let k0 = _mm256_loadu_ps(k_ptr.add(k_off + i * 8));
+                            let k1 = _mm256_loadu_ps(k_ptr.add(k_off + i * 8 + 8));
+                            s0 = _mm256_fmadd_ps(q_vecs[i], k0, s0);
+                            s1 = _mm256_fmadd_ps(q_vecs[i + 1], k1, s1);
+                            i += 2;
+                        }
+                        if i < n_vecs {
+                            let k0 = _mm256_loadu_ps(k_ptr.add(k_off + i * 8));
+                            s0 = _mm256_fmadd_ps(q_vecs[i], k0, s0);
+                        }
+                        tile_scores[ti] = hsum256(_mm256_add_ps(s0, s1)) * scale;
+                    }
+
+                    // Online softmax: tile max (scalar, identical to the
+                    // scalar/NEON kernels so the exp reduction order matches).
+                    let mut tile_max = f32::NEG_INFINITY;
+                    for ti in 0..tile_len {
+                        if tile_scores[ti] > tile_max {
+                            tile_max = tile_scores[ti];
+                        }
+                    }
+                    let new_max = running_max.max(tile_max);
+
+                    let rescale = if running_max > f32::NEG_INFINITY {
+                        ggml_expf(running_max - new_max)
+                    } else {
+                        0.0
+                    };
+
+                    let mut tile_sum = 0.0f64;
+                    for ti in 0..tile_len {
+                        tile_scores[ti] = ggml_expf(tile_scores[ti] - new_max);
+                        tile_sum += tile_scores[ti] as f64;
+                    }
+
+                    // Rescale accumulator by the online-softmax factor.
+                    let rescale_v = _mm256_set1_ps(rescale);
+                    for i in 0..n_vecs {
+                        acc_vecs[i] = _mm256_mul_ps(acc_vecs[i], rescale_v);
+                    }
+
+                    // acc += score * V.
+                    for ti in 0..tile_len {
+                        let s = _mm256_set1_ps(tile_scores[ti]);
+                        let v_base = (kv_start + ti) * kv_dim + kv_h_offset;
+                        for i in 0..n_vecs {
+                            let v = _mm256_loadu_ps(v_ptr.add(v_base + i * 8));
+                            acc_vecs[i] = _mm256_fmadd_ps(s, v, acc_vecs[i]);
+                        }
+                    }
+
+                    running_sum = running_sum * rescale as f64 + tile_sum;
+                    running_max = new_max;
+                }
+
+                let inv_sum = (1.0 / running_sum) as f32;
+                let inv_sum_v = _mm256_set1_ps(inv_sum);
+                let out_off = (g * n_queries + j) * head_dim;
+                for i in 0..n_vecs {
+                    let r = _mm256_mul_ps(acc_vecs[i], inv_sum_v);
+                    _mm256_storeu_ps(out_ptr.add(out_off + i * 8), r);
+                }
+            }
+        }
+    }
+}
+
+/// AVX-512 flash attention — the 512-bit twin of `flash_attention_gqa_avx2`,
+/// same structure and same scalar online-softmax, 16-wide zmm lanes. Used when
+/// `head_dim % 16 == 0` and the host has AVX-512F; the dispatcher falls back to
+/// the AVX2 kernel for `head_dim` that is a multiple of 8 but not 16.
+///
+/// # Safety
+/// Caller must ensure AVX-512F is available (the dispatcher CPUID-checks) and
+/// that the buffers satisfy the same sizing contract as the scalar kernel.
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+unsafe fn flash_attention_gqa_avx512(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads_start: usize,
+    group_size: usize,
+    n_queries: usize,
+    q_stride: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        // Buffer-sizing tripwires, mirroring `flash_attention_gqa_neon`. The
+        // dispatcher checks `head_dim`, but the caller still owns the q/k/v/out
+        // sizing contract; without these a violation is silent UB.
+        debug_assert!(
+            q_mat.len() >= ((n_heads_start + group_size) * head_dim - 1) * q_stride + n_queries,
+            "q_mat too small for the given head range and q_stride"
+        );
+        debug_assert!(
+            (start_pos + n_queries == 0)
+                || k_cache.len() >= (start_pos + n_queries - 1) * kv_dim + kv_h_offset + head_dim,
+            "k_cache too small"
+        );
+        debug_assert!(
+            (start_pos + n_queries == 0)
+                || v_cache.len() >= (start_pos + n_queries - 1) * kv_dim + kv_h_offset + head_dim,
+            "v_cache too small"
+        );
+        debug_assert!(
+            out.len() >= group_size * n_queries * head_dim,
+            "out buffer too small for contiguous [group_size, n_queries, head_dim] output"
+        );
+
+        // 256 / 16 = 16 vectors max (head_dim <= 256, multiple of 16).
+        const MAX_VECS: usize = 16;
+        let n_vecs = head_dim / 16;
+
+        let q_ptr = q_mat.as_ptr();
+        let k_ptr = k_cache.as_ptr();
+        let v_ptr = v_cache.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+
+        let mut q_vecs = [_mm512_setzero_ps(); MAX_VECS];
+        let mut acc_vecs = [_mm512_setzero_ps(); MAX_VECS];
+        let mut q_gather = [0.0f32; 256];
+        let mut tile_scores = [0.0f32; FLASH_TILE_KV];
+
+        for g in 0..group_size {
+            let h = n_heads_start + g;
+            let h_off = h * head_dim;
+
+            for j in 0..n_queries {
+                let max_kv = start_pos + j + 1;
+
+                for d in 0..head_dim {
+                    q_gather[d] = *q_ptr.add((h_off + d) * q_stride + j);
+                }
+                for i in 0..n_vecs {
+                    q_vecs[i] = _mm512_loadu_ps(q_gather.as_ptr().add(i * 16));
+                    acc_vecs[i] = _mm512_setzero_ps();
+                }
+
+                let mut running_max = f32::NEG_INFINITY;
+                let mut running_sum = 0.0f64;
+
+                for kv_start in (0..max_kv).step_by(FLASH_TILE_KV) {
+                    let kv_end = (kv_start + FLASH_TILE_KV).min(max_kv);
+                    let tile_len = kv_end - kv_start;
+
+                    for ti in 0..tile_len {
+                        let k_off = (kv_start + ti) * kv_dim + kv_h_offset;
+                        let mut s0 = _mm512_setzero_ps();
+                        let mut s1 = _mm512_setzero_ps();
+                        let mut i = 0;
+                        while i + 2 <= n_vecs {
+                            let k0 = _mm512_loadu_ps(k_ptr.add(k_off + i * 16));
+                            let k1 = _mm512_loadu_ps(k_ptr.add(k_off + i * 16 + 16));
+                            s0 = _mm512_fmadd_ps(q_vecs[i], k0, s0);
+                            s1 = _mm512_fmadd_ps(q_vecs[i + 1], k1, s1);
+                            i += 2;
+                        }
+                        if i < n_vecs {
+                            let k0 = _mm512_loadu_ps(k_ptr.add(k_off + i * 16));
+                            s0 = _mm512_fmadd_ps(q_vecs[i], k0, s0);
+                        }
+                        tile_scores[ti] = _mm512_reduce_add_ps(_mm512_add_ps(s0, s1)) * scale;
+                    }
+
+                    let mut tile_max = f32::NEG_INFINITY;
+                    for ti in 0..tile_len {
+                        if tile_scores[ti] > tile_max {
+                            tile_max = tile_scores[ti];
+                        }
+                    }
+                    let new_max = running_max.max(tile_max);
+
+                    let rescale = if running_max > f32::NEG_INFINITY {
+                        ggml_expf(running_max - new_max)
+                    } else {
+                        0.0
+                    };
+
+                    let mut tile_sum = 0.0f64;
+                    for ti in 0..tile_len {
+                        tile_scores[ti] = ggml_expf(tile_scores[ti] - new_max);
+                        tile_sum += tile_scores[ti] as f64;
+                    }
+
+                    let rescale_v = _mm512_set1_ps(rescale);
+                    for i in 0..n_vecs {
+                        acc_vecs[i] = _mm512_mul_ps(acc_vecs[i], rescale_v);
+                    }
+
+                    for ti in 0..tile_len {
+                        let s = _mm512_set1_ps(tile_scores[ti]);
+                        let v_base = (kv_start + ti) * kv_dim + kv_h_offset;
+                        for i in 0..n_vecs {
+                            let v = _mm512_loadu_ps(v_ptr.add(v_base + i * 16));
+                            acc_vecs[i] = _mm512_fmadd_ps(s, v, acc_vecs[i]);
+                        }
+                    }
+
+                    running_sum = running_sum * rescale as f64 + tile_sum;
+                    running_max = new_max;
+                }
+
+                let inv_sum = (1.0 / running_sum) as f32;
+                let inv_sum_v = _mm512_set1_ps(inv_sum);
+                let out_off = (g * n_queries + j) * head_dim;
+                for i in 0..n_vecs {
+                    let r = _mm512_mul_ps(acc_vecs[i], inv_sum_v);
+                    _mm512_storeu_ps(out_ptr.add(out_off + i * 16), r);
+                }
             }
         }
     }
@@ -2942,7 +3337,7 @@ fn rope_norm_pairs(
 ) {
     let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
     let mut theta_base = theta_start;
-    for (i, pair) in head.chunks_exact_mut(2).enumerate() {
+    for (i, pair) in head.as_chunks_mut::<2>().0.iter_mut().enumerate() {
         let ff = freq_factors.map_or(1.0, |f| f[i]);
         let theta = theta_base / ff;
         let (sin_t, cos_t) = theta.sin_cos();
@@ -3023,6 +3418,251 @@ pub fn scale_inplace(a: &mut [f32], s: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SIMD flash-attention kernels must agree with the scalar reference
+    /// across every supported `head_dim`, group size, and prompt length.
+    ///
+    /// The scalar kernel is the oracle: `flash_attention_gqa_cpu` dispatches to
+    /// the SIMD kernels on x86, so a bug there would silently corrupt every
+    /// dense-transformer prefill on this host. The SIMD kernels are NOT
+    /// bit-identical to scalar (the QK dot and V accumulate sum in a different
+    /// lane order — the same divergence NEON already carries), so the bar is a
+    /// tight relative one, not equality: max |simd - scalar| / (|scalar| + eps)
+    /// well under the parity suite's cosine>0.99 flash bound.
+    ///
+    /// The `*_matches_scalar_across_head_dims` tests call each kernel *directly*
+    /// by name, so their `head_dim` list varies `n_vecs` for tail coverage (the
+    /// `if i < n_vecs` QK-dot tail fires at odd counts: head_dim/8 = 9 at 72,
+    /// head_dim/16 = 5 at 80), NOT the dispatch path. Routing itself — the
+    /// `% 16 → avx512, else % 8 → avx2` selection and the CPUID gates — is
+    /// covered separately by `dispatcher_routes_to_a_correct_kernel`, and both
+    /// `start_pos` regimes (fresh vs continuation prefill) are covered throughout.
+    #[cfg(target_arch = "x86_64")]
+    mod flash_attention_simd {
+        use super::*;
+
+        /// Deterministic pseudo-random f32 in roughly [-1, 1].
+        fn lcg(state: &mut u64) -> f32 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((*state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        }
+
+        /// Relative L2 deviation `||b - a|| / ||a||`. This is the vector-level
+        /// metric the flash parity bar (cosine) is built on; a per-element
+        /// relative error is the wrong tool here because the softmax-weighted
+        /// output has legitimately near-zero elements that make any small
+        /// absolute wobble look enormous in relative terms.
+        fn rel_l2(a: &[f32], b: &[f32]) -> f32 {
+            let num: f64 = a
+                .iter()
+                .zip(b)
+                .map(|(&x, &y)| ((x - y) as f64).powi(2))
+                .sum();
+            let den: f64 = a.iter().map(|&x| (x as f64).powi(2)).sum();
+            (num.sqrt() / (den.sqrt() + 1e-12)) as f32
+        }
+
+        /// Build one GQA config and assert the chosen `kernel` agrees with the
+        /// scalar reference. `start_pos` is the absolute position of the first
+        /// query: 0 is a fresh prefill, >0 a continuation prefill where queries
+        /// attend to `start_pos` prior tokens already in the KV cache (the
+        /// multi-turn / prefix-cache-reuse regime). `kernel` is `"avx2"`,
+        /// `"avx512"`, or `"dispatch"` — the last routes through
+        /// `flash_attention_gqa_cpu`, exercising the CPUID + head_dim routing
+        /// rather than a kernel by name.
+        fn check(head_dim: usize, start_pos: usize, kernel: &str) {
+            // One KV head with a group of query heads, a prompt long enough to
+            // span multiple FLASH_TILE_KV tiles (32), and a non-tile-aligned
+            // length so the tile tail is exercised.
+            let group_size = 3;
+            let n_kv_heads = 2;
+            let n_heads = n_kv_heads * group_size;
+            let n = 70usize; // > 2*FLASH_TILE_KV, not a multiple of 32
+            let kv_len = start_pos + n; // KV cache holds prior context + queries
+            let kv_dim = n_kv_heads * head_dim;
+            let q_dim = n_heads * head_dim;
+            let scale = 1.0 / (head_dim as f32).sqrt();
+
+            let mut st = 0x1234_5678_9abc_def0u64 ^ (head_dim as u64) ^ ((start_pos as u64) << 40);
+            // q_mat is [q_dim, n] column-major (stride n).
+            let q: Vec<f32> = (0..q_dim * n).map(|_| lcg(&mut st)).collect();
+            let k: Vec<f32> = (0..kv_len * kv_dim).map(|_| lcg(&mut st)).collect();
+            let v: Vec<f32> = (0..kv_len * kv_dim).map(|_| lcg(&mut st)).collect();
+
+            // Compare per KV head, matching the dispatcher's per-head calls.
+            for kv_h in 0..n_kv_heads {
+                let n_heads_start = kv_h * group_size;
+                let kv_h_offset = kv_h * head_dim;
+                let mut out_ref = vec![0.0f32; group_size * n * head_dim];
+                // The scalar kernel is the oracle for the very kernels the
+                // dispatcher would pick — call it directly, bypassing dispatch.
+                flash_attention_gqa_scalar(
+                    &q,
+                    &k,
+                    &v,
+                    &mut out_ref,
+                    n_heads_start,
+                    group_size,
+                    n,
+                    n,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    start_pos,
+                );
+
+                let mut out_simd = vec![0.0f32; group_size * n * head_dim];
+                match kernel {
+                    "avx2" => unsafe {
+                        flash_attention_gqa_avx2(
+                            &q,
+                            &k,
+                            &v,
+                            &mut out_simd,
+                            n_heads_start,
+                            group_size,
+                            n,
+                            n,
+                            kv_dim,
+                            kv_h_offset,
+                            head_dim,
+                            scale,
+                            start_pos,
+                        );
+                    },
+                    #[cfg(feature = "avx512")]
+                    "avx512" => unsafe {
+                        flash_attention_gqa_avx512(
+                            &q,
+                            &k,
+                            &v,
+                            &mut out_simd,
+                            n_heads_start,
+                            group_size,
+                            n,
+                            n,
+                            kv_dim,
+                            kv_h_offset,
+                            head_dim,
+                            scale,
+                            start_pos,
+                        );
+                    },
+                    // Routes through the real dispatcher (CPUID + head_dim
+                    // selection), so the "% 16 → avx512, else % 8 → avx2, else
+                    // scalar" routing and the feature-detection gates are covered.
+                    "dispatch" => flash_attention_gqa_cpu(
+                        &q,
+                        &k,
+                        &v,
+                        &mut out_simd,
+                        n_heads_start,
+                        group_size,
+                        n,
+                        n,
+                        kv_dim,
+                        kv_h_offset,
+                        head_dim,
+                        scale,
+                        start_pos,
+                    ),
+                    other => panic!("unknown kernel {other}"),
+                }
+
+                let rel = rel_l2(&out_ref, &out_simd);
+                // FMA-vs-separate-mul-add rounding on a head_dim-length dot,
+                // propagated through the online softmax, lands ~1e-6. 1e-4 is
+                // two orders of margin yet still ~O(1) below what a transposed
+                // index or wrong offset (cosine collapse) would produce.
+                assert!(
+                    rel < 1e-4,
+                    "{kernel} head_dim={head_dim} start_pos={start_pos} kv_h={kv_h}: \
+                     relative L2 deviation {rel:e} exceeds 1e-4 vs scalar reference"
+                );
+            }
+        }
+
+        /// start_pos values: 0 (fresh prefill) and 37 (continuation prefill —
+        /// non-tile-aligned so the causal `max_kv = start_pos + j + 1` bound and
+        /// the start_pos-dependent K/V offsets are exercised, not just the
+        /// start_pos=0 fast path).
+        const START_POS: [usize; 2] = [0, 37];
+
+        #[test]
+        fn avx2_matches_scalar_across_head_dims() {
+            if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+                if std::env::var("CERA_REQUIRE_SIMD")
+                    .unwrap_or_default()
+                    .split(',')
+                    .any(|f| f.trim() == "avx2")
+                {
+                    panic!("CERA_REQUIRE_SIMD=avx2 but avx2/fma not detected");
+                }
+                eprintln!("[flash-avx2] SKIP: avx2/fma not detected");
+                return;
+            }
+            // 72 is a multiple of 8 but not 16 and gives an odd n_vecs=9,
+            // exercising the QK-dot loop tail.
+            for hd in [64usize, 72, 128, 256] {
+                for sp in START_POS {
+                    check(hd, sp, "avx2");
+                }
+            }
+        }
+
+        #[cfg(feature = "avx512")]
+        #[test]
+        fn avx512_matches_scalar_across_head_dims() {
+            if !is_x86_feature_detected!("avx512f") {
+                if std::env::var("CERA_REQUIRE_SIMD")
+                    .unwrap_or_default()
+                    .split(',')
+                    .any(|f| f.trim() == "avx512")
+                {
+                    panic!("CERA_REQUIRE_SIMD=avx512 but avx512f not detected");
+                }
+                eprintln!("[flash-avx512] SKIP: avx512f not detected");
+                return;
+            }
+            // 80 gives an odd n_vecs=5 (80/16), exercising the AVX-512 loop tail.
+            for hd in [64usize, 80, 128, 256] {
+                for sp in START_POS {
+                    check(hd, sp, "avx512");
+                }
+            }
+        }
+
+        /// The dispatcher (`flash_attention_gqa_cpu`) itself: its `% 16 → avx512,
+        /// else % 8 → avx2, else scalar` routing plus the CPUID gates. Whatever
+        /// it selects on this host must match the scalar reference. head_dim 64
+        /// takes the widest path the host offers; 72 forces the
+        /// multiple-of-8-not-16 → AVX2 fallthrough even on an AVX-512 host — the
+        /// branch no real model's head_dim hits, so nothing else covers it.
+        #[test]
+        fn dispatcher_routes_to_a_correct_kernel() {
+            if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+                // Below AVX2 the dispatcher falls through to scalar, which is the
+                // oracle — the comparison would be scalar-vs-scalar, vacuous.
+                if std::env::var("CERA_REQUIRE_SIMD")
+                    .unwrap_or_default()
+                    .split(',')
+                    .any(|f| f.trim() == "avx2")
+                {
+                    panic!("CERA_REQUIRE_SIMD=avx2 but avx2/fma not detected");
+                }
+                eprintln!("[flash-dispatch] SKIP: avx2/fma not detected");
+                return;
+            }
+            for hd in [64usize, 72] {
+                for sp in START_POS {
+                    check(hd, sp, "dispatch");
+                }
+            }
+        }
+    }
 
     /// The `gemm_preq_dispatch` length guards must actually fire.
     ///

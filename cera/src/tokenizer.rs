@@ -339,11 +339,11 @@ impl BpeTokenizer {
 
             for i in 0..tokens.len() - 1 {
                 let pair = (tokens[i].clone(), tokens[i + 1].clone());
-                if let Some(&rank) = self.merge_ranks.get(&pair) {
-                    if rank < best_rank {
-                        best_rank = rank;
-                        best_idx = i;
-                    }
+                if let Some(&rank) = self.merge_ranks.get(&pair)
+                    && rank < best_rank
+                {
+                    best_rank = rank;
+                    best_idx = i;
                 }
             }
 
@@ -762,10 +762,12 @@ fn build_pretokenize_regex(pre_type: &str) -> Regex {
 /// - Regular UTF-8 strings as-is
 fn unescape_token(s: &str) -> Vec<u8> {
     // Handle byte tokens: <0xHH>
-    if s.starts_with("<0x") && s.ends_with('>') && s.len() == 6 {
-        if let Ok(byte) = u8::from_str_radix(&s[3..5], 16) {
-            return vec![byte];
-        }
+    if s.starts_with("<0x")
+        && s.ends_with('>')
+        && s.len() == 6
+        && let Ok(byte) = u8::from_str_radix(&s[3..5], 16)
+    {
+        return vec![byte];
     }
 
     // Handle sentencepiece space marker

@@ -550,13 +550,18 @@ pub fn relative_pos_emb(n_frames: usize) -> Vec<f32> {
     let inv_freq = inv_freq_cached();
     let n_frames_f = n_frames as f64;
 
-    for (pos, row) in pos_emb.chunks_exact_mut(POS_EMB_DIM).enumerate() {
+    for (pos, row) in pos_emb
+        .as_chunks_mut::<POS_EMB_DIM>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
         // Signed relative shift: pos=0 → max-positive,
         // pos=seq_len-1 → max-negative. Computed in f64 directly
         // rather than via i64 cast so the math doesn't wrap on
         // unusual `pos` values.
         let rel_pos = n_frames_f - pos as f64 - 1.0;
-        for (i, pair) in row.chunks_exact_mut(2).enumerate() {
+        for (i, pair) in row.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             let (sin, cos) = ((rel_pos * inv_freq[i]) as f32).sin_cos();
             pair[0] = sin;
             pair[1] = cos;
@@ -961,7 +966,7 @@ pub fn conformer_self_attention_forward(
 ) {
     assert!(n_head > 0, "n_head must be > 0");
     assert!(
-        n_embd % n_head == 0,
+        n_embd.is_multiple_of(n_head),
         "n_embd ({n_embd}) must be divisible by n_head ({n_head})"
     );
     if t == 0 {

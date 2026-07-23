@@ -314,7 +314,7 @@ pub fn quantize_scalar(val: f32, boundaries: &[f32; 3]) -> u8 {
 pub fn pack_2bit(indices: &[u8], out: &mut [u8]) {
     debug_assert_eq!(indices.len() % 4, 0);
     debug_assert_eq!(out.len(), indices.len() / 4);
-    for (i, chunk) in indices.chunks_exact(4).enumerate() {
+    for (i, chunk) in indices.as_chunks::<4>().0.iter().enumerate() {
         out[i] = chunk[0] | (chunk[1] << 2) | (chunk[2] << 4) | (chunk[3] << 6);
     }
 }
@@ -334,7 +334,7 @@ pub fn unpack_2bit(packed: &[u8], out: &mut [u8]) {
 pub fn pack_1bit(signs: &[bool], out: &mut [u8]) {
     debug_assert_eq!(signs.len() % 8, 0);
     debug_assert_eq!(out.len(), signs.len() / 8);
-    for (i, chunk) in signs.chunks_exact(8).enumerate() {
+    for (i, chunk) in signs.as_chunks::<8>().0.iter().enumerate() {
         let mut byte = 0u8;
         for (j, &s) in chunk.iter().enumerate() {
             if s {
@@ -1187,7 +1187,7 @@ pub fn decode_compressed_keys(buf: &[u8]) -> Option<CompressedKeyCache> {
     // Reject corrupted headers up front: jl_bytes = head_dim/8 must
     // be integer, polar packs 4 elements per byte (head_dim/4), and
     // head_dim must be > 0.
-    if head_dim == 0 || head_dim % 8 != 0 {
+    if head_dim == 0 || !head_dim.is_multiple_of(8) {
         return None;
     }
     let polar_per = head_dim / 4;
@@ -1290,7 +1290,7 @@ pub fn decode_compressed_values(buf: &[u8]) -> Option<CompressedValueCache> {
     let seq_len = h.seq_len as usize;
     // Reject corrupted headers up front: PolarQuant packs 4 elements
     // per byte so head_dim must be divisible by 4 (and >0).
-    if head_dim == 0 || head_dim % 4 != 0 {
+    if head_dim == 0 || !head_dim.is_multiple_of(4) {
         return None;
     }
     let polar_per = head_dim / 4;

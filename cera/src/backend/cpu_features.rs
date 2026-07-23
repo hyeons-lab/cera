@@ -45,8 +45,8 @@ pub enum CpuTier {
     /// one up runs the same int8 kernels for Q4_0/Q8_0/Q4_K/Q6_K.
     Avx2,
     /// x86_64 AVX-512 (needs only `avx512f`). Produced when the default-on
-    /// `avx512` crate feature is enabled; disable it for a Rust
-    /// 1.85-compatible x86 build.
+    /// `avx512` crate feature is enabled; disable it to cap the x86 tier at
+    /// AVX2.
     ///
     /// Its own contribution is now narrow: the 512-bit f32 `vec_dot` for
     /// Q8_0/Q4_0, plus the AVX-512 activation quantizer (which needs
@@ -234,9 +234,8 @@ pub fn detect() -> CpuFeatures {
         // require those too: no shipping AVX-512F CPU lacks them, but it keeps
         // the tier honest about every kernel it can dispatch to (e.g. a
         // hypothetical F-without-AVX2 part would fall to Avx2/Scalar, not SIGILL).
-        // The kernels use Rust-1.89 `_mm512_*` intrinsics, past the crate's 1.85
-        // MSRV, so they live behind the default-on `avx512` feature; with it off
-        // the tier caps at Avx2 and the x86 build stays 1.85-compatible.
+        // The kernels use `_mm512_*` intrinsics, so they live behind the
+        // default-on `avx512` feature; with it off the tier caps at Avx2.
         //
         // The VNNI tier additionally needs `avx512vl` — the int8 kernels operate
         // on 256-bit vectors (one Q4_0/Q8_0 block is exactly 32 bytes), and
@@ -297,10 +296,10 @@ fn apply_env_override(f: CpuFeatures) -> CpuFeatures {
 /// Pure core of [`apply_env_override`], split out so the downgrade-only policy
 /// is testable without touching process-global env (which races parallel tests).
 fn with_tier_override(mut f: CpuFeatures, forced: Option<CpuTier>) -> CpuFeatures {
-    if let Some(t) = forced {
-        if t < f.tier {
-            f.tier = t;
-        }
+    if let Some(t) = forced
+        && t < f.tier
+    {
+        f.tier = t;
     }
     f
 }

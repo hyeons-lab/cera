@@ -407,7 +407,7 @@ pub fn encode_image_gpu<O: VitGpuOps>(
         "vision encoder config has scale_factor=0"
     );
     anyhow::ensure!(
-        grid_w % cfg.scale_factor == 0 && grid_h % cfg.scale_factor == 0,
+        grid_w.is_multiple_of(cfg.scale_factor) && grid_h.is_multiple_of(cfg.scale_factor),
         "grid {grid_w}×{grid_h} not divisible by scale_factor ({})",
         cfg.scale_factor,
     );

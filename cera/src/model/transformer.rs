@@ -279,7 +279,7 @@ pub fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
         DType::Q4_0 | DType::Q8_0 => {
             cfg!(feature = "blas") || crate::backend::cpu::int8_gemm_available()
         }
-        DType::Q4KM | DType::Q6K => k_quant_gemm_available() && k % 256 == 0,
+        DType::Q4KM | DType::Q6K => k_quant_gemm_available() && k.is_multiple_of(256),
         _ => false,
     }
 }

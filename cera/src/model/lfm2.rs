@@ -157,7 +157,7 @@ impl Lfm2Model {
             if is_attn {
                 let n_kv = kv_heads as usize;
                 anyhow::ensure!(
-                    n_kv > 0 && n_heads % n_kv == 0,
+                    n_kv > 0 && n_heads.is_multiple_of(n_kv),
                     "layer {i}: n_kv_heads ({n_kv}) must be > 0 and divide n_heads ({n_heads})"
                 );
                 block_types.push(BlockType::Attention);

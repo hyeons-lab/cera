@@ -288,13 +288,13 @@ pub(crate) fn download_to(
         }
     };
 
-    if let Some(exp) = expected.as_deref() {
-        if exp != actual_hex {
-            let _ = fs::remove_file(&partial);
-            return Err(CeraError::Backend(format!(
-                "integrity check failed for {url}: expected sha256:{exp}, got sha256:{actual_hex}"
-            )));
-        }
+    if let Some(exp) = expected.as_deref()
+        && exp != actual_hex
+    {
+        let _ = fs::remove_file(&partial);
+        return Err(CeraError::Backend(format!(
+            "integrity check failed for {url}: expected sha256:{exp}, got sha256:{actual_hex}"
+        )));
     }
 
     // `fs::rename` on Windows fails if `dest` exists (POSIX would

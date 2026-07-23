@@ -70,7 +70,7 @@ Self-contained BPE tokenizer that loads vocab, merges, and special tokens direct
 
 ## Conventions
 
-- Edition 2024, MSRV 1.85
+- Edition 2024, MSRV 1.89 (the `avx512` feature's `_mm512_*` intrinsics need 1.89)
 - `.cargo/config.toml` sets native CPU feature flags per target architecture
 - `wgpu` is wired into `cera/Cargo.toml` as an optional dependency behind the `gpu` feature (Metal backend behind `metal`)
 - Error handling: `anyhow` with `ensure!` / `with_context()` / `bail!`

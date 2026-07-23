@@ -141,10 +141,10 @@ fn per_token_fallback_emits_a_warning() {
 /// `CERA_MODEL_ROOT`.
 fn find_fixture(rel: &str) -> Option<std::path::PathBuf> {
     let mut roots: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        if let Some(parent) = std::path::PathBuf::from(&manifest).parent() {
-            roots.push(parent.to_path_buf());
-        }
+    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR")
+        && let Some(parent) = std::path::PathBuf::from(&manifest).parent()
+    {
+        roots.push(parent.to_path_buf());
     }
     if let Ok(cwd) = std::env::current_dir() {
         roots.push(cwd);
