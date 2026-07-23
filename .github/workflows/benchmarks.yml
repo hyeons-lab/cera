@@ -107,7 +107,12 @@ jobs:
         run: |
           set -e
           BENCH="$HOME/llamacpp/build/bin/llama-bench"
-          if [ ! -x "$BENCH" ]; then
+          # Rebuild if the binary is missing OR a *cached* one can no longer run
+          # (e.g. the runner image bumped glibc/libstdc++ under it) — `-h` exits 0
+          # on a healthy binary and non-zero if it can't even load, so this
+          # self-heals on an image change instead of serving a dead binary until
+          # the cache key is bumped by hand.
+          if [ ! -x "$BENCH" ] || ! "$BENCH" -h >/dev/null 2>&1; then
             rm -rf "$HOME/llamacpp"
             git clone https://github.com/ggml-org/llama.cpp.git "$HOME/llamacpp"
             git -C "$HOME/llamacpp" checkout "$LLAMA_COMMIT"

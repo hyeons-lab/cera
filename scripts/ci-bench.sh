@@ -160,7 +160,7 @@ fail_row() {
 
 # Table header + separator for the active layout.
 if [ "$LLAMA_ON" -eq 1 ]; then
-  THEAD="| quant | cera prefill | llama prefill | gap | cera decode | llama decode | gap |"
+  THEAD="| quant | cera prefill | llama prefill | gap (p) | cera decode | llama decode | gap (d) |"
   TSEP="|---|---|---|---|---|---|---|"
 else
   THEAD="| quant | prefill p50 tok/s | decode p50 tok/s |"
