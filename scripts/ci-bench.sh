@@ -115,10 +115,13 @@ llama_bench_model() {
 
 # "gap" = llama / cera, one decimal + `x`. Both sides are *mean* tok/s (see the
 # call site — cera's mean, not p50, so the ratio is like-for-like against
-# llama-bench's mean). `n/a` unless both are positive numbers.
+# llama-bench's mean). `n/a` unless both are positive numbers. A non-numeric
+# cell ("n/a") coerces to 0 under `+0`, so `>0` alone rejects it — simpler and
+# more portable than an `x+0==x` numeric-string probe, and it also rejects a
+# parsed-but-nonpositive 0/negative that a bare `==` check would let through.
 gap() {
   awk -v c="$1" -v l="$2" 'BEGIN{
-    if (c+0==c && l+0==l && c+0>0) printf "%.1fx", l/c; else printf "n/a"
+    if (c+0>0 && l+0>0) printf "%.1fx", l/c; else printf "n/a"
   }'
 }
 

@@ -55,6 +55,11 @@ env:
   # the runtime-dispatched kernels (the shipped binaries' behavior), not a build
   # pinned to one runner's microarch.
   RUSTFLAGS: ""
+  # Upstream llama.cpp pin for the head-to-head — a commit verified to support the
+  # `lfm2` arch these bundles use. Single source of truth: both the build step and
+  # both llama.cpp cache keys interpolate it, so bumping the pin (and `-v<n>`)
+  # here re-keys the cache automatically — no separate SHA-prefix to keep in sync.
+  LLAMA_COMMIT: fb38d6f278a4a391b8db1a16ee5946db3766459c
 
 jobs:
   cpu-bench:
@@ -85,25 +90,21 @@ jobs:
         with:
           path: ~/.cache/cera
           key: bench-models-LFM2.5-350M-${{ matrix.arch }}-v1
-      # Upstream llama.cpp for the head-to-head, pinned + cached + built native so
-      # it runs the same ISA cera's runtime dispatch picks. `LLAMA_COMMIT` is a
-      # commit verified to support the `lfm2` arch these bundles use. The whole
-      # thing is best-effort (`continue-on-error` on both build and save): a
-      # failure leaves `LLAMA_BENCH` unset, so `ci-bench.sh` runs cera-only and
-      # the job still passes. When changing `LLAMA_COMMIT`, bump the SHA prefix in
-      # BOTH cache keys below (and `-v<n>`); a stale key would serve the old build
-      # for the new pin.
+      # Upstream llama.cpp for the head-to-head, pinned (`LLAMA_COMMIT`, top-level
+      # env) + cached + built native so it runs the same ISA cera's runtime
+      # dispatch picks. The whole thing is best-effort (`continue-on-error` on both
+      # build and save): a failure leaves `LLAMA_BENCH` unset, so `ci-bench.sh`
+      # runs cera-only and the job still passes. Both cache keys interpolate
+      # `LLAMA_COMMIT`, so bumping the pin re-keys them automatically.
       - name: Restore llama.cpp build
         id: llama-cache
         uses: actions/cache/restore@v4
         with:
           path: ~/llamacpp/build
-          key: llamacpp-fb38d6f2-${{ matrix.runner }}-v1
+          key: llamacpp-${{ env.LLAMA_COMMIT }}-${{ matrix.runner }}-v1
       - name: Build llama.cpp (llama-bench)
         id: llama
         continue-on-error: true
-        env:
-          LLAMA_COMMIT: fb38d6f278a4a391b8db1a16ee5946db3766459c
         run: |
           set -e
           BENCH="$HOME/llamacpp/build/bin/llama-bench"
@@ -114,8 +115,13 @@ jobs:
           # the cache key is bumped by hand.
           if [ ! -x "$BENCH" ] || ! "$BENCH" -h >/dev/null 2>&1; then
             rm -rf "$HOME/llamacpp"
-            git clone https://github.com/ggml-org/llama.cpp.git "$HOME/llamacpp"
-            git -C "$HOME/llamacpp" checkout "$LLAMA_COMMIT"
+            # Shallow single-commit fetch — pulls just the pinned tree, not the
+            # full history (github.com allows fetching a specific SHA). Only runs
+            # on a cache miss / self-heal, so the saving is a rare-path speedup.
+            git init -q "$HOME/llamacpp"
+            git -C "$HOME/llamacpp" fetch -q --depth 1 \
+              https://github.com/ggml-org/llama.cpp.git "$LLAMA_COMMIT"
+            git -C "$HOME/llamacpp" checkout -q FETCH_HEAD
             cmake -S "$HOME/llamacpp" -B "$HOME/llamacpp/build" \
               -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON \
               -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF \
@@ -132,7 +138,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/llamacpp/build
-          key: llamacpp-fb38d6f2-${{ matrix.runner }}-v1
+          key: llamacpp-${{ env.LLAMA_COMMIT }}-${{ matrix.runner }}-v1
       - name: Run CPU benchmarks
         env:
           BIN: ./target/release/cera
