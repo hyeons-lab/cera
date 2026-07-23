@@ -858,6 +858,12 @@ pub(crate) fn repack_q4_k_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f
     let mut packed = vec![0u8; sr_count * nb32 * 128];
     let mut dsc = vec![0.0f32; sr_count * nb32 * 8];
     let mut dmn = vec![0.0f32; sr_count * nb32 * 8];
+    // Field offsets within `BlockQ4KM`, derived from the struct rather than
+    // hard-coded, so this repack stays correct if the block layout ever moves.
+    const D_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, d);
+    const DMIN_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, dmin);
+    const SC_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, scales);
+    const QS_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, qs);
     // Nibble of `row`, 32-block `block` (0..nb32), element `e` (0..32). `block`
     // selects super-block `bi = block/8` and sub-block `s = block%8`; sub-block
     // `s` lives in the low (s even) or high (s odd) nibbles of the super-block's
@@ -865,7 +871,7 @@ pub(crate) fn repack_q4_k_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f
     let nibble = |row: usize, block: usize, e: usize| -> u8 {
         let bi = block / 8;
         let s = block % 8;
-        let qs = (row * sb + bi) * bsz + 16; // skip d(2) + dmin(2) + scales(12)
+        let qs = (row * sb + bi) * bsz + QS_OFF;
         let byte = src[qs + (s / 2) * 32 + e];
         if s.is_multiple_of(2) {
             byte & 0x0F
@@ -877,9 +883,11 @@ pub(crate) fn repack_q4_k_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f
         for bi in 0..sb {
             for r in 0..8 {
                 let off = ((8 * sr + r) * sb + bi) * bsz;
-                let d = half::f16::from_le_bytes([src[off], src[off + 1]]).to_f32();
-                let dmin = half::f16::from_le_bytes([src[off + 2], src[off + 3]]).to_f32();
-                let scales_bytes: &[u8; 12] = src[off + 4..off + 16].try_into().unwrap();
+                let d = half::f16::from_le_bytes([src[off + D_OFF], src[off + D_OFF + 1]]).to_f32();
+                let dmin = half::f16::from_le_bytes([src[off + DMIN_OFF], src[off + DMIN_OFF + 1]])
+                    .to_f32();
+                let scales_bytes: &[u8; 12] =
+                    src[off + SC_OFF..off + SC_OFF + 12].try_into().unwrap();
                 let (sc, mn) = crate::quant::decode_q4km_scales(scales_bytes);
                 for s in 0..8 {
                     let block = bi * 8 + s;
