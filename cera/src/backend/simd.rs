@@ -4173,16 +4173,24 @@ macro_rules! int8_gemm_kernels {
         // `fmadd(eff, scale8, facc)` per block, where `scale8` is the 8 rows'
         // weight scales times the activation scale.
         //
-        // The packed layout stores nibbles (144 bytes per (super-row, block) =
-        // 8× a `BlockQ4_0`, same 4-bit footprint as standard). Byte `i` of a
-        // k-group's 16 packed bytes pairs row `i/4` (low nibble) with row
-        // `i/4 + 4` (high nibble) at k-element `i%4`, which is exactly what the
-        // standard low/high nibble unpack (`set_m128i(hi, lo)`) reassembles into
-        // the 32-byte, lane-per-row weight vector.
+        // The packed layout stores the nibbles (128 bytes per (super-row,
+        // block) = 8× a `BlockQ4_0`'s 16 `qs` bytes, so the *nibble* footprint
+        // is unchanged; the scales are stored separately, as f32, by
+        // `repack_q4_0_8x8`). Byte `i` of a k-group's 16 packed bytes pairs row
+        // `i/4` (low nibble) with row `i/4 + 4` (high nibble) at k-element
+        // `i%4`, which is exactly what the standard low/high nibble unpack
+        // (`set_m128i(hi, lo)`) reassembles into the 32-byte, lane-per-row
+        // weight vector.
         //
         // `m % 8 == 0` is a precondition — `q4_0_repack_supported` gates the
         // repack at load, so a weight with a ragged row count is never repacked
         // and takes the standard kernel instead.
+        //
+        // `allow(dead_code)` under `blas`: the sole caller
+        // `gemm_preq_repacked_dispatch` is `cfg(not(blas))`, so a non-test
+        // `--features blas` lib build has no caller (the tests still do). Same
+        // pattern the other `blas`-dead kernels here carry.
+        #[cfg_attr(feature = "blas", allow(dead_code))]
         #[allow(clippy::too_many_arguments)]
         #[target_feature(enable = $feat)]
         pub unsafe fn gemm_q4_0_8x8_q8_0(
@@ -7115,21 +7123,26 @@ pub(crate) mod avx512_vnni {
         //
         // The production kernel (`gemm_q4_0_8x8_q8_0`, above in the macro) and
         // its load-time layout builder (`cpu::repack_q4_0_8x8`) are exercised
-        // here: the equivalence test pins bit-for-bit agreement with the
-        // standard-layout `gemm_q4_0_q8_0`, and `microbench_gemm_q4_0_8x8` A/Bs
-        // the two in one process (no rebuild across machine states).
+        // here: the equivalence test pins agreement with an independent
+        // dequantize-then-dot reference (f64 accumulation), and
+        // `microbench_gemm_q4_0_8x8` A/Bs the repacked kernel against the
+        // standard-layout one in one process (no rebuild across machine states).
 
-        /// Repacked Q4_0 GEMM must match the standard-layout production kernel
-        /// (same weights, same activations). Odd `n` exercises the column tail;
-        /// two super-blocks of `k` exercise the block loop; `m = 16` is two
-        /// super-rows.
-        #[cfg(feature = "parallel")]
+        /// Repacked Q4_0 GEMM vs a literal dequantize-then-dot reference (same
+        /// quantized activations, f64 accumulation) — independent of both
+        /// production kernels, so a shared misreading of the `−8`/scale contract
+        /// cannot pass it vacuously.
+        ///
+        /// `n = 13` is one full `TILE_N` tile plus a remainder on BOTH tiers
+        /// (VNNI `TILE_N=8`: 8+5; AVX2 `TILE_N=4`: 12+1) — the earlier `n=5`
+        /// entered only the remainder loop on VNNI, leaving the main tiled path
+        /// untested. `m = 16` is two super-rows; `k = 512` is 16 blocks.
         #[test]
         fn gemm_q4_0_8x8_matches_reference() {
             if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
                 return;
             }
-            let (m, n, k) = (16usize, 5usize, 512usize);
+            let (m, n, k) = (16usize, 13usize, 512usize);
             let nb = k / 32;
             let mut st = 0x9a1e_c0deu64;
             let a = rand_q4_0_rows(m, k, &mut st);
@@ -7143,15 +7156,35 @@ pub(crate) mod avx512_vnni {
                 b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
             }
 
+            // Independent reference: dequantize the Q4_0 weights to f32, then dot
+            // against the dequantized activations in f64.
+            let mut wdeq = vec![0.0f32; m * k];
+            crate::quant::dequantize_q4_0_matrix(&a, m, k, &mut wdeq);
             let mut want = vec![0.0f32; m * n];
-            unsafe { gemm_q4_0_q8_0(&a, &b_scales, &b_quants, &mut want, m, n, k) };
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0.0f64;
+                    for e in 0..k {
+                        let xa = b_scales[j * nb + e / 32] * b_quants[j * k + e] as f32;
+                        acc += (wdeq[i * k + e] * xa) as f64;
+                    }
+                    want[i * n + j] = acc as f32;
+                }
+            }
 
             let (packed, scales) = crate::backend::cpu::repack_q4_0_8x8(&a, m, k);
             let mut got = vec![0.0f32; m * n];
             unsafe {
                 gemm_q4_0_8x8_q8_0(&packed, &scales, &b_scales, &b_quants, &mut got, m, n, k)
             };
-            assert_close(&got, &want, "q4_0_8x8 vs standard-layout gemm_q4_0");
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-5 * w.abs().max(1.0),
+                    "q4_0_8x8 [{},{}]: {g} vs reference {w}",
+                    i / n,
+                    i % n,
+                );
+            }
         }
 
         /// A/B: repacked 8-row-interleave Q4_0 GEMM vs the production
