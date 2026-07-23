@@ -4713,10 +4713,28 @@ macro_rules! int8_gemm_kernels {
                 }
             };
 
-            if m >= crate::backend::cpu::gemv_par_threshold() {
-                crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
-            } else {
+            if m < crate::backend::cpu::gemv_par_threshold() {
+                // Too few rows to amortize any fork-join — serial, matching the
+                // Q4_0/Q8_0 GEMV tails, which also gate their `par_rows` call on
+                // this threshold.
                 out.chunks_mut(n).enumerate().for_each(compute_row);
+            } else if n == 1 {
+                // Decode (n == 1): route the per-token GEMV through the *decode*
+                // pool, not the wide prefill pool `par_rows_n` uses. Fanning a
+                // 1-column K-quant GEMV across every core is dominated by
+                // fork-join overhead — the per-row work is tiny — so it runs no
+                // faster than serial while burning every core spinning. Q4_0/Q8_0
+                // decode already gates the same `par_rows` call this way; this
+                // brings K-quants in line. The math is unchanged (same
+                // `compute_row`), so decode stays bit-identical to the batched
+                // GEMM at n = 1.
+                crate::backend::cpu::par_rows(
+                    out,
+                    crate::backend::cpu::gemv_min_rows(),
+                    |(row, yv)| compute_row((row, core::slice::from_mut(yv))),
+                );
+            } else {
+                crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
             }
         }
 
@@ -4839,10 +4857,28 @@ macro_rules! int8_gemm_kernels {
                 }
             };
 
-            if m >= crate::backend::cpu::gemv_par_threshold() {
-                crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
-            } else {
+            if m < crate::backend::cpu::gemv_par_threshold() {
+                // Too few rows to amortize any fork-join — serial, matching the
+                // Q4_0/Q8_0 GEMV tails, which also gate their `par_rows` call on
+                // this threshold.
                 out.chunks_mut(n).enumerate().for_each(compute_row);
+            } else if n == 1 {
+                // Decode (n == 1): route the per-token GEMV through the *decode*
+                // pool, not the wide prefill pool `par_rows_n` uses. Fanning a
+                // 1-column K-quant GEMV across every core is dominated by
+                // fork-join overhead — the per-row work is tiny — so it runs no
+                // faster than serial while burning every core spinning. Q4_0/Q8_0
+                // decode already gates the same `par_rows` call this way; this
+                // brings K-quants in line. The math is unchanged (same
+                // `compute_row`), so decode stays bit-identical to the batched
+                // GEMM at n = 1.
+                crate::backend::cpu::par_rows(
+                    out,
+                    crate::backend::cpu::gemv_min_rows(),
+                    |(row, yv)| compute_row((row, core::slice::from_mut(yv))),
+                );
+            } else {
+                crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
             }
         }
 
