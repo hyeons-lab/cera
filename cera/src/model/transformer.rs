@@ -69,31 +69,53 @@ pub mod oracle_dump {
 
 // ── Pre-resolved weight reference ───────────────────────────────────────────
 
-/// A weight's `m x k` Q4_0 body, repacked at load into the 8-row-interleaved
-/// layout the prefill GEMM (`cpu::gemm_preq_repacked_dispatch`) consumes. Owned
-/// (not a view into the mmap) because the layout differs from GGUF's. Prefill
-/// only — decode keeps the standard mmap layout — so this is kept *alongside*
-/// the mmap weights, costing one extra Q4_0-sized copy for each repacked weight.
+/// The 8-row-interleaved payload of a weight repacked at load for the prefill
+/// GEMM. One variant per repackable dtype; each holds the packed nibbles plus
+/// that dtype's baked scales (Q4_0: one f32 row scale per block; Q4_K: per-row
+/// `d·sc` and `dmin·mn` products). Owned (not a view into the mmap) because the
+/// layout differs from GGUF's, and kept *alongside* the mmap weights — prefill
+/// only, decode keeps the standard mmap layout — so it costs roughly one extra
+/// weight-sized copy for each repacked weight.
+#[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+#[derive(Clone)]
+pub(crate) enum Repacked {
+    Q40 {
+        packed: Vec<u8>,
+        scales: Vec<f32>,
+    },
+    Q4K {
+        packed: Vec<u8>,
+        dsc: Vec<f32>,
+        dmn: Vec<f32>,
+    },
+}
+
+/// A weight's `m x k` body repacked into the layout the prefill GEMM
+/// (`cpu::gemm_preq_repacked_*_dispatch`) consumes.
 ///
 /// Gated to the one config that reads it — the x86 no-BLAS prefill path — so it
 /// does not read as dead code where `gemm_preq`'s repacked branch is compiled out.
 #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
 #[derive(Clone)]
-pub(crate) struct RepackedQ40 {
-    pub packed: Vec<u8>,
-    pub scales: Vec<f32>,
+pub(crate) struct RepackedWeight {
+    pub kind: Repacked,
     pub m: usize,
     pub k: usize,
 }
 
 #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-impl std::fmt::Debug for RepackedQ40 {
+impl std::fmt::Debug for RepackedWeight {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print the buffers — they can be hundreds of MiB.
-        f.debug_struct("RepackedQ40")
+        let (tag, packed_len) = match &self.kind {
+            Repacked::Q40 { packed, .. } => ("Q4_0", packed.len()),
+            Repacked::Q4K { packed, .. } => ("Q4_K", packed.len()),
+        };
+        f.debug_struct("RepackedWeight")
+            .field("kind", &tag)
             .field("m", &self.m)
             .field("k", &self.k)
-            .field("packed_len", &self.packed.len())
+            .field("packed_len", &packed_len)
             .finish()
     }
 }
@@ -108,12 +130,12 @@ pub(crate) struct WeightRef {
     pub dtype: DType,
     pub m: usize,
     pub k: usize,
-    /// Set by [`WeightRef::with_repack`] for Q4_0 projection weights on hosts
-    /// with the x86 int8 kernels. `None` when unset (other dtypes, ragged row
-    /// counts, or weights that never hit the batched GEMM). The field exists
+    /// Set by [`WeightRef::with_repack`] for Q4_0 / Q4_K projection weights on
+    /// hosts with the x86 int8 kernels. `None` when unset (other dtypes, ragged
+    /// row counts, or weights that never hit the batched GEMM). The field exists
     /// only on the target/feature combo whose `gemm_preq` reads it.
     #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-    pub repacked: Option<std::sync::Arc<RepackedQ40>>,
+    pub repacked: Option<std::sync::Arc<RepackedWeight>>,
 }
 
 impl WeightRef {
@@ -125,14 +147,25 @@ impl WeightRef {
     #[allow(unused_variables, unused_mut)]
     pub(crate) fn with_repack(mut self, gguf: &GgufFile) -> Self {
         #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-        if self.dtype == DType::Q4_0 && cpu::q4_0_repack_supported(self.m, self.k) {
-            let (packed, scales) = cpu::repack_q4_0_8x8(weight_data(gguf, &self), self.m, self.k);
-            self.repacked = Some(std::sync::Arc::new(RepackedQ40 {
-                packed,
-                scales,
-                m: self.m,
-                k: self.k,
-            }));
+        {
+            let kind = if self.dtype == DType::Q4_0 && cpu::q4_0_repack_supported(self.m, self.k) {
+                let (packed, scales) =
+                    cpu::repack_q4_0_8x8(weight_data(gguf, &self), self.m, self.k);
+                Some(Repacked::Q40 { packed, scales })
+            } else if self.dtype == DType::Q4KM && cpu::q4_k_repack_supported(self.m, self.k) {
+                let (packed, dsc, dmn) =
+                    cpu::repack_q4_k_8x8(weight_data(gguf, &self), self.m, self.k);
+                Some(Repacked::Q4K { packed, dsc, dmn })
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                self.repacked = Some(std::sync::Arc::new(RepackedWeight {
+                    kind,
+                    m: self.m,
+                    k: self.k,
+                }));
+            }
         }
         self
     }
@@ -501,17 +534,22 @@ pub(crate) fn gemm_preq(
     // through, rather than at the one site that happens to trip it.
     let out = &mut out[..m * n];
 
-    // A repacked Q4_0 weight (8-row interleave, built once at load) takes the
+    // A repacked weight (8-row interleave, built once at load) takes the
     // dedicated prefill kernel — no per-column hsum. Only present on x86 hosts
-    // with the int8 kernels, and only for weights that pass
-    // `q4_0_repack_supported`, so this is a no-op fall-through everywhere else.
+    // with the int8 kernels, and only for weights that pass the dtype's
+    // `*_repack_supported`, so this is a no-op fall-through everywhere else.
     #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
     if let Some(rp) = &wref.repacked {
         debug_assert_eq!(rp.m, m, "gemm_preq: repacked m mismatch");
         debug_assert_eq!(rp.k, k, "gemm_preq: repacked k mismatch");
-        let ran = cpu::gemm_preq_repacked_dispatch(
-            &rp.packed, &rp.scales, b_scales, b_quants, out, m, n, k,
-        );
+        let ran = match &rp.kind {
+            Repacked::Q40 { packed, scales } => cpu::gemm_preq_repacked_q4_0_dispatch(
+                packed, scales, b_scales, b_quants, out, m, n, k,
+            ),
+            Repacked::Q4K { packed, dsc, dmn } => cpu::gemm_preq_repacked_q4_k_dispatch(
+                packed, dsc, dmn, b_scales, b_quants, out, m, n, k,
+            ),
+        };
         if !ran {
             report_uncomputed_gemm(wref.dtype, k);
         }

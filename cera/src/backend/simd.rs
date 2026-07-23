@@ -4187,7 +4187,7 @@ macro_rules! int8_gemm_kernels {
         // and takes the standard kernel instead.
         //
         // `allow(dead_code)` under `blas`: the sole caller
-        // `gemm_preq_repacked_dispatch` is `cfg(not(blas))`, so a non-test
+        // `gemm_preq_repacked_q4_0_dispatch` is `cfg(not(blas))`, so a non-test
         // `--features blas` lib build has no caller (the tests still do). Same
         // pattern the other `blas`-dead kernels here carry.
         #[cfg_attr(feature = "blas", allow(dead_code))]
@@ -4291,6 +4291,149 @@ macro_rules! int8_gemm_kernels {
                             _mm256_set1_ps(8.0 * sum_a as f32),
                         );
                         facc = _mm256_fmadd_ps(eff, scale8, facc);
+                    }
+                    let mut tmp = [0.0f32; 8];
+                    _mm256_storeu_ps(tmp.as_mut_ptr(), facc);
+                    for (r, &v) in tmp.iter().enumerate() {
+                        *chunk.get_unchecked_mut(r * n + j) = v;
+                    }
+                    j += 1;
+                }
+            };
+
+            #[cfg(feature = "parallel")]
+            {
+                use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+                out.par_chunks_mut(8 * n)
+                    .enumerate()
+                    .for_each(|(sr, chunk)| compute(sr, chunk));
+            }
+            #[cfg(not(feature = "parallel"))]
+            for (sr, chunk) in out.chunks_mut(8 * n).enumerate() {
+                compute(sr, chunk);
+            }
+        }
+
+        /// Batched Q4_K × Q8_0 GEMM on the 8-row-interleaved layout
+        /// (`repack_q4_k_8x8`): `out[m,n] = A_q4_k[m,k] @ B_q8_0[k,n]`.
+        ///
+        /// The Q4_K twin of `gemm_q4_0_8x8_q8_0`. A Q4_K super-block is 8
+        /// sub-blocks of 32, so its `k/32` 32-element blocks index the packed
+        /// nibbles exactly as Q4_0's do, and the 8 `dpbusd` lanes of a k-group are
+        /// 8 output rows for a shared column — no per-column hsum. What differs is
+        /// the reduction: each 32-block carries its own per-row scale
+        /// `dsc = d·sc_s` and min `dmn = dmin·mn_s` (baked at repack), so the
+        /// contribution is `xs·(dsc·Σqa − dmn·Σa)` per row, with `Σa` the column
+        /// sum (`q8_0_col_sums`) and `xs` the activation scale. Both terms are now
+        /// per-row *vectors* — the mins term is a scalar in the standard kernel,
+        /// where a column resolves to one row.
+        ///
+        /// `allow(dead_code)` under `blas`: the sole caller
+        /// `gemm_preq_repacked_q4_k_dispatch` is `cfg(not(blas))`.
+        #[cfg_attr(feature = "blas", allow(dead_code))]
+        #[allow(clippy::too_many_arguments)]
+        #[target_feature(enable = $feat)]
+        pub unsafe fn gemm_q4_k_8x8_q8_0(
+            packed: &[u8],
+            dsc: &[f32],
+            dmn: &[f32],
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            m: usize,
+            n: usize,
+            k: usize,
+        ) {
+            debug_assert_eq!(m % 8, 0, "repacked Q4_K GEMM: m must be a multiple of 8");
+            debug_assert_eq!(k % 256, 0, "repacked Q4_K GEMM: k must be divisible by 256");
+            let nb32 = k / 32;
+            debug_assert_eq!(out.len(), m * n);
+            debug_assert_eq!(packed.len(), (m / 8) * nb32 * 128);
+            debug_assert_eq!(dsc.len(), (m / 8) * nb32 * 8);
+            debug_assert_eq!(dmn.len(), (m / 8) * nb32 * 8);
+            debug_assert_eq!(b_quants.len(), n * k);
+            debug_assert_eq!(b_scales.len(), n * nb32);
+
+            // Per-(column, 32-block) activation sums for the mins term.
+            let col_sums = unsafe { q8_0_col_sums(b_quants, n, k) };
+            let cs: &[i32] = &col_sums;
+            let mask = _mm_set1_epi8(0x0F);
+
+            // Unpack one k-group's 16 packed bytes into the 32-byte, lane-per-row
+            // unsigned weight vector (rows 0..3 in the low 128, 4..7 in the high).
+            let unpack = |p: *const u8| -> __m256i {
+                unsafe {
+                    let qb = _mm_loadu_si128(p as *const __m128i);
+                    let lo = _mm_and_si128(qb, mask);
+                    let hi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask);
+                    _mm256_set_m128i(hi, lo)
+                }
+            };
+
+            // One accumulator strip = the 8 output rows of a super-row, across a
+            // tile of `TILE_N` columns.
+            let compute = |sr: usize, chunk: &mut [f32]| unsafe {
+                // `chunk[r*n + j] == out[(8*sr + r)*n + j]`.
+                let mut j = 0;
+                while j + TILE_N <= n {
+                    let mut facc = [_mm256_setzero_ps(); TILE_N];
+                    for block in 0..nb32 {
+                        let mut acc = [_mm256_setzero_si256(); TILE_N];
+                        let pbase = (sr * nb32 + block) * 128;
+                        for g in 0..8usize {
+                            let w = unpack(packed.as_ptr().add(pbase + g * 16));
+                            for (t, acc_t) in acc.iter_mut().enumerate() {
+                                let col = j + t;
+                                let a4 = (b_quants.as_ptr().add(col * k + block * 32 + g * 4)
+                                    as *const i32)
+                                    .read_unaligned();
+                                *acc_t = _mm256_add_epi32(*acc_t, dot32u(w, _mm256_set1_epi32(a4)));
+                            }
+                        }
+                        let sbase = (sr * nb32 + block) * 8;
+                        let dsc8 = _mm256_loadu_ps(dsc.as_ptr().add(sbase));
+                        let dmn8 = _mm256_loadu_ps(dmn.as_ptr().add(sbase));
+                        for (t, facc_t) in facc.iter_mut().enumerate() {
+                            let col = j + t;
+                            let xs = *b_scales.get_unchecked(col * nb32 + block);
+                            let sx = *cs.get_unchecked(col * nb32 + block);
+                            // facc += xs·dsc8·acc − xs·dmn8·sx, per row lane.
+                            let eff = _mm256_mul_ps(dsc8, _mm256_set1_ps(xs));
+                            *facc_t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[t]), eff, *facc_t);
+                            *facc_t =
+                                _mm256_fnmadd_ps(dmn8, _mm256_set1_ps(xs * sx as f32), *facc_t);
+                        }
+                    }
+                    for (t, facc_t) in facc.iter().enumerate() {
+                        let mut tmp = [0.0f32; 8];
+                        _mm256_storeu_ps(tmp.as_mut_ptr(), *facc_t);
+                        for (r, &v) in tmp.iter().enumerate() {
+                            *chunk.get_unchecked_mut(r * n + j + t) = v;
+                        }
+                    }
+                    j += TILE_N;
+                }
+                // Column remainder (`n % TILE_N`), one column at a time.
+                while j < n {
+                    let mut facc = _mm256_setzero_ps();
+                    for block in 0..nb32 {
+                        let mut acc = _mm256_setzero_si256();
+                        let pbase = (sr * nb32 + block) * 128;
+                        for g in 0..8usize {
+                            let w = unpack(packed.as_ptr().add(pbase + g * 16));
+                            let a4 = (b_quants.as_ptr().add(j * k + block * 32 + g * 4)
+                                as *const i32)
+                                .read_unaligned();
+                            acc = _mm256_add_epi32(acc, dot32u(w, _mm256_set1_epi32(a4)));
+                        }
+                        let sbase = (sr * nb32 + block) * 8;
+                        let dsc8 = _mm256_loadu_ps(dsc.as_ptr().add(sbase));
+                        let dmn8 = _mm256_loadu_ps(dmn.as_ptr().add(sbase));
+                        let xs = *b_scales.get_unchecked(j * nb32 + block);
+                        let sx = *cs.get_unchecked(j * nb32 + block);
+                        let eff = _mm256_mul_ps(dsc8, _mm256_set1_ps(xs));
+                        facc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc), eff, facc);
+                        facc = _mm256_fnmadd_ps(dmn8, _mm256_set1_ps(xs * sx as f32), facc);
                     }
                     let mut tmp = [0.0f32; 8];
                     _mm256_storeu_ps(tmp.as_mut_ptr(), facc);
@@ -5317,6 +5460,84 @@ pub(crate) mod avx2_int8 {
                     assert!(
                         (g - w).abs() <= 1e-5 * w.abs().max(1.0),
                         "q4_0 repack {m}x{n} index {i}: {g} vs reference {w}"
+                    );
+                }
+            }
+        }
+
+        /// Independent f64 reference for the repacked Q4_K GEMM: dequantize each
+        /// element as `d·sc_s·q − dmin·mn_s` (q unsigned 0..15), dot with the
+        /// activations, scale by the per-block activation scale, in f64. Shares
+        /// no structure with the kernel, so a mismatch is unambiguous.
+        fn ref_gemm_q4_k(
+            a: &[u8],
+            bs: &[f32],
+            bq: &[i8],
+            m: usize,
+            n: usize,
+            k: usize,
+        ) -> Vec<f32> {
+            let sb = k / 256;
+            let nb32 = k / 32;
+            let bsz = size_of::<crate::quant::BlockQ4KM>();
+            let mut out = vec![0.0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut sum = 0.0f64;
+                    for bi in 0..sb {
+                        let blk = unsafe {
+                            &*(a.as_ptr().add((i * sb + bi) * bsz)
+                                as *const crate::quant::BlockQ4KM)
+                        };
+                        let d = half::f16::from_bits(blk.d).to_f32() as f64;
+                        let dmin = half::f16::from_bits(blk.dmin).to_f32() as f64;
+                        let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
+                        for s in 0..8 {
+                            let block = bi * 8 + s;
+                            let (mut dp, mut sa) = (0i64, 0i64);
+                            for e in 0..32 {
+                                let byte = blk.qs[(s / 2) * 32 + e];
+                                let q = if s.is_multiple_of(2) {
+                                    byte & 0x0F
+                                } else {
+                                    byte >> 4
+                                } as i64;
+                                let av = bq[j * k + block * 32 + e] as i64;
+                                dp += q * av;
+                                sa += av;
+                            }
+                            let xs = bs[j * nb32 + block] as f64;
+                            sum += xs
+                                * (d * sc[s] as f64 * dp as f64 - dmin * mn[s] as f64 * sa as f64);
+                        }
+                    }
+                    out[i * n + j] = sum as f32;
+                }
+            }
+            out
+        }
+
+        #[test]
+        fn avx2_gemm_q4_k_8x8_matches_reference() {
+            if !require_simd_or_skip("avx2", avx2_kernels_callable()) {
+                return;
+            }
+            // k=512 is two super-blocks; shapes hit full column tiles, a
+            // remainder, n below the tile width, and multiple super-rows.
+            let k = 512;
+            for (m, n) in [(8usize, 7usize), (16, 4), (8, 1), (24, 5), (8, 3)] {
+                let mut st = 0x71b3_c0deu64 ^ ((m * 131 + n) as u64);
+                let (q4k, _q6k) = k_quant_rows(m, k / 256, &mut st);
+                let (bs, bq) = activations(n, k, &mut st);
+
+                let (packed, dsc, dmn) = crate::backend::cpu::repack_q4_k_8x8(&q4k, m, k);
+                let mut got = vec![0.0f32; m * n];
+                unsafe { gemm_q4_k_8x8_q8_0(&packed, &dsc, &dmn, &bs, &bq, &mut got, m, n, k) };
+                let want = ref_gemm_q4_k(&q4k, &bs, &bq, m, n, k);
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-4 * w.abs().max(1.0),
+                        "q4_k repack {m}x{n} index {i}: {g} vs reference {w}"
                     );
                 }
             }
@@ -7269,6 +7490,181 @@ pub(crate) mod avx512_vnni {
                         } else {
                             unsafe {
                                 gemm_q4_0_q8_0(&a, &b_scales, &b_quants, &mut c_ref, m, n, k)
+                            };
+                        }
+                    }
+                    let secs = t.elapsed().as_secs_f64();
+                    std::hint::black_box((&c_ref, &c_new));
+                    ops / (secs / iters as f64) / 1e9
+                };
+                report(&mut bench);
+            };
+
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(crate::backend::cpu_features::performance_core_count())
+                .build()
+                .expect("build fixed-size rayon pool")
+                .install(run);
+        }
+
+        // ── Repacked Q4_K GEMM: equivalence + A/B ───────────────────────────
+        //
+        // The Q4_K twin of the block above: `gemm_q4_k_8x8_q8_0` (in the macro)
+        // and its layout builder (`cpu::repack_q4_k_8x8`), pinned against an
+        // independent dequantize-then-dot reference and A/B'd against the
+        // standard-layout `gemm_q4_k_q8_0`.
+
+        /// Repacked Q4_K GEMM vs a literal dequantize-then-dot reference. Reuses
+        /// `dequantize_q4_k_m_block` (the shipped, separately-tested dequant), so
+        /// it shares no arithmetic with the int8 kernel — a wrong scale/min or a
+        /// mispacked nibble cannot pass it vacuously.
+        ///
+        /// `n = 13` is a full `TILE_N` tile plus a remainder on both tiers; `m =
+        /// 16` is two super-rows; `k = 512` is two super-blocks.
+        #[test]
+        fn gemm_q4_k_8x8_matches_reference() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            let (m, n, k) = (16usize, 13usize, 512usize);
+            let nb = k / 32;
+            let sb = k / 256;
+            let bsz = size_of::<crate::quant::BlockQ4KM>();
+            let mut st = 0x4b1d_c0deu64;
+            let a = rand_q4_k_rows(m, k, &mut st);
+
+            let mut b_scales = vec![0.0f32; n * nb];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+                let (s, q) = ref_quantize(&col);
+                b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+
+            // Independent reference: dequantize the Q4_K weights block-by-block to
+            // f32, then dot against the dequantized activations in f64.
+            let mut wdeq = vec![0.0f32; m * k];
+            for i in 0..m {
+                for bi in 0..sb {
+                    let blk = unsafe {
+                        &*(a.as_ptr().add((i * sb + bi) * bsz) as *const crate::quant::BlockQ4KM)
+                    };
+                    let vals = crate::quant::dequantize_q4_k_m_block(blk);
+                    wdeq[i * k + bi * 256..i * k + bi * 256 + 256].copy_from_slice(&vals);
+                }
+            }
+            let mut want = vec![0.0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0.0f64;
+                    for e in 0..k {
+                        let xa = b_scales[j * nb + e / 32] * b_quants[j * k + e] as f32;
+                        acc += (wdeq[i * k + e] * xa) as f64;
+                    }
+                    want[i * n + j] = acc as f32;
+                }
+            }
+
+            let (packed, dsc, dmn) = crate::backend::cpu::repack_q4_k_8x8(&a, m, k);
+            let mut got = vec![0.0f32; m * n];
+            unsafe {
+                gemm_q4_k_8x8_q8_0(&packed, &dsc, &dmn, &b_scales, &b_quants, &mut got, m, n, k)
+            };
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-4 * w.abs().max(1.0),
+                    "q4_k_8x8 [{},{}]: {g} vs reference {w}",
+                    i / n,
+                    i % n,
+                );
+            }
+        }
+
+        /// A/B: repacked 8-row-interleave Q4_K GEMM vs the production
+        /// standard-layout kernel.
+        ///
+        /// ```text
+        /// cargo test -p cera --release --lib microbench_gemm_q4_k_8x8 -- --ignored --nocapture
+        /// ```
+        #[cfg(feature = "parallel")]
+        #[test]
+        #[ignore]
+        fn microbench_gemm_q4_k_8x8() {
+            if !require_simd_or_skip("avx512vnni", vnni_kernels_callable()) {
+                return;
+            }
+            use std::time::Instant;
+            let (m, n, k) = (2048usize, 512usize, 2048usize);
+            let nb = k / 32;
+            let ops = 2.0 * m as f64 * n as f64 * k as f64;
+            let iters = 200;
+            let rounds = 8;
+            let mut st = 0x2c1d_c0deu64;
+            let mut b_scales = vec![0.0f32; n * nb];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg01(&mut st) * 2.0 - 1.0).collect();
+                let (s, q) = ref_quantize(&col);
+                b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+
+            let mut wst = 0x5678_abcdu64;
+            let a = rand_q4_k_rows(m, k, &mut wst);
+            let (packed, dsc, dmn) = crate::backend::cpu::repack_q4_k_8x8(&a, m, k);
+            let mut c_ref = vec![0.0f32; m * n];
+            let mut c_new = vec![0.0f32; m * n];
+            unsafe { gemm_q4_k_q8_0(&a, &b_scales, &b_quants, &mut c_ref, m, n, k) };
+            unsafe {
+                gemm_q4_k_8x8_q8_0(
+                    &packed, &dsc, &dmn, &b_scales, &b_quants, &mut c_new, m, n, k,
+                )
+            };
+            assert_close(&c_new, &c_ref, "q4_k_8x8 repacked vs standard-layout");
+
+            let report = |bench: &mut dyn FnMut(bool) -> f64| {
+                let (mut wins, mut sref, mut snew) = (0usize, 0.0f64, 0.0f64);
+                eprintln!("\n=== gemm_q4_k repack (8x8) A/B ===");
+                for r in 0..rounds {
+                    let (g_ref, g_new) = if r % 2 == 0 {
+                        let a = bench(false);
+                        (a, bench(true))
+                    } else {
+                        let b = bench(true);
+                        (bench(false), b)
+                    };
+                    if g_new > g_ref {
+                        wins += 1;
+                    }
+                    sref += g_ref;
+                    snew += g_new;
+                    let first = if r % 2 == 0 { "std" } else { "repack" };
+                    eprintln!(
+                        "  round {r} ({first} first):  standard {g_ref:.0}   repacked {g_new:.0} GOP/s"
+                    );
+                }
+                eprintln!(
+                    "  mean:    standard {:.0}   repacked {:.0} GOP/s   {:+.1}%   repacked wins {wins}/{rounds}",
+                    sref / rounds as f64,
+                    snew / rounds as f64,
+                    (snew - sref) / sref * 100.0
+                );
+            };
+
+            let run = || {
+                let mut bench = |repacked: bool| -> f64 {
+                    let t = Instant::now();
+                    for _ in 0..iters {
+                        if repacked {
+                            unsafe {
+                                gemm_q4_k_8x8_q8_0(
+                                    &packed, &dsc, &dmn, &b_scales, &b_quants, &mut c_new, m, n, k,
+                                )
+                            };
+                        } else {
+                            unsafe {
+                                gemm_q4_k_q8_0(&a, &b_scales, &b_quants, &mut c_ref, m, n, k)
                             };
                         }
                     }
