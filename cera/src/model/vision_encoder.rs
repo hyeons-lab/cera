@@ -153,7 +153,7 @@ impl VisionEncoderConfig {
             gguf.get_u32(KEY_PATCH_SIZE)
                 .with_context(|| format!("missing `{KEY_PATCH_SIZE}`"))? as usize;
         anyhow::ensure!(
-            patch_size > 0 && image_size % patch_size == 0,
+            patch_size > 0 && image_size.is_multiple_of(patch_size),
             "image_size ({image_size}) must be a positive multiple of patch_size ({patch_size})"
         );
         let n_trained_patches = (image_size / patch_size).pow(2);
@@ -480,7 +480,7 @@ impl VisionEncoderWeights {
             "vision encoder config has scale_factor=0; refusing to divide by zero"
         );
         anyhow::ensure!(
-            grid_w % cfg.scale_factor == 0 && grid_h % cfg.scale_factor == 0,
+            grid_w.is_multiple_of(cfg.scale_factor) && grid_h.is_multiple_of(cfg.scale_factor),
             "grid {grid_w}×{grid_h} not divisible by scale_factor ({})",
             cfg.scale_factor,
         );
@@ -953,7 +953,7 @@ pub(crate) fn pixel_shuffle(
 ) -> Vec<f32> {
     let sf = cfg.scale_factor;
     debug_assert!(
-        sf > 0 && grid_w % sf == 0 && grid_h % sf == 0,
+        sf > 0 && grid_w.is_multiple_of(sf) && grid_h.is_multiple_of(sf),
         "patch grid {grid_w}×{grid_h} must be divisible by scale_factor ({sf})"
     );
     let new_w = grid_w / sf;
@@ -1098,7 +1098,7 @@ fn load_vit_block(
     // `n_head > 0` first to avoid the modulo's div-by-zero on a
     // corrupt mmproj reporting `n_head = 0`.
     anyhow::ensure!(
-        cfg.n_head > 0 && n_embd % cfg.n_head == 0,
+        cfg.n_head > 0 && n_embd.is_multiple_of(cfg.n_head),
         "n_embd ({n_embd}) not divisible by n_head ({})",
         cfg.n_head,
     );

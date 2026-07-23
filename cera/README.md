@@ -242,8 +242,8 @@ shrink the crate for `wasm32-unknown-unknown` or embedded targets
 | `blas` | — | Opt-in GEMM accelerator |
 | `remote` | — | `BundleRepo` HTTP download + SHA-256 (⇒ `std-fs`) |
 
-MSRV: Rust 1.85 (edition 2024). The `avx512` tier needs 1.89+; disable it to
-build on 1.85–1.88 (x86 then caps at AVX2).
+MSRV: Rust 1.89 (edition 2024). The default-on `avx512` feature enables the
+AVX-512 tier on x86; disabling it caps that tier at AVX2.
 
 ## CPU threading & tuning
 

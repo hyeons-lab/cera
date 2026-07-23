@@ -683,22 +683,28 @@ impl SafeTensors {
             "F32" => {
                 ensure!(raw.len() == expect_bytes(4)?, "F32 byte count mismatch");
                 Ok(raw
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect())
             }
             "F16" => {
                 ensure!(raw.len() == expect_bytes(2)?, "F16 byte count mismatch");
                 Ok(raw
-                    .chunks_exact(2)
-                    .map(|c| half::f16::from_le_bytes(c.try_into().unwrap()).to_f32())
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| half::f16::from_le_bytes(*c).to_f32())
                     .collect())
             }
             "BF16" => {
                 ensure!(raw.len() == expect_bytes(2)?, "BF16 byte count mismatch");
                 Ok(raw
-                    .chunks_exact(2)
-                    .map(|c| half::bf16::from_le_bytes(c.try_into().unwrap()).to_f32())
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| half::bf16::from_le_bytes(*c).to_f32())
                     .collect())
             }
             other => bail!("unsupported safetensors dtype for LoRA: {other}"),

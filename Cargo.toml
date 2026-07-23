@@ -5,7 +5,7 @@ resolver = "3"
 [workspace.package]
 version = "0.3.1"
 edition = "2024"
-rust-version = "1.85"  # minimum; edition 2024 requires 1.85+
+rust-version = "1.89"  # edition 2024 needs 1.85+; the avx512 `_mm512_*` intrinsics need 1.89
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/hyeons-lab/cera"
 

@@ -66,19 +66,18 @@ pub fn decode_thread_count(topo: &CoreTopology) -> usize {
 
     if let Ok(v) = std::env::var("CERA_DECODE_THREADS") {
         let v = v.trim();
-        if !v.eq_ignore_ascii_case("auto") {
-            if let Ok(n) = v.parse::<usize>() {
-                if n >= 1 {
-                    if n > max_t {
-                        tracing::warn!(
-                            "cera: CERA_DECODE_THREADS={n} exceeds the {max_t} detected \
-                             performance cores; clamping to {max_t} (set CERA_THREADS to \
-                             raise the detected count)"
-                        );
-                    }
-                    return n.min(max_t);
-                }
+        if !v.eq_ignore_ascii_case("auto")
+            && let Ok(n) = v.parse::<usize>()
+            && n >= 1
+        {
+            if n > max_t {
+                tracing::warn!(
+                    "cera: CERA_DECODE_THREADS={n} exceeds the {max_t} detected \
+                     performance cores; clamping to {max_t} (set CERA_THREADS to \
+                     raise the detected count)"
+                );
             }
+            return n.min(max_t);
         }
     }
 

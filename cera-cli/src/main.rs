@@ -2145,15 +2145,13 @@ fn main() -> Result<()> {
                     // Plain audio-in: BOS (when the model wants it),
                     // optional --prompt as a leading text prefix, then
                     // audio. No template, no system role.
-                    if add_bos {
-                        if let Some(bos) = tokenizer.bos_token() {
-                            session.append_tokens(&[bos])?;
-                        }
+                    if add_bos && let Some(bos) = tokenizer.bos_token() {
+                        session.append_tokens(&[bos])?;
                     }
-                    if let Some(p) = &prompt {
-                        if !p.is_empty() {
-                            session.append_text(p)?;
-                        }
+                    if let Some(p) = &prompt
+                        && !p.is_empty()
+                    {
+                        session.append_text(p)?;
                     }
                     session.append_audio(&pcm, sr)?;
                 }
@@ -2259,10 +2257,8 @@ fn main() -> Result<()> {
                     .map(|s| s.trim().parse::<u32>())
                     .collect::<Result<Vec<_>, _>>()?;
             } else {
-                if add_bos {
-                    if let Some(bos) = tokenizer.bos_token() {
-                        tokens.push(bos);
-                    }
+                if add_bos && let Some(bos) = tokenizer.bos_token() {
+                    tokens.push(bos);
                 }
                 tokens.extend_from_slice(&tokenizer.encode(prompt));
             }
@@ -3644,10 +3640,8 @@ fn main() -> Result<()> {
                     ));
                 }
             } else {
-                if add_bos {
-                    if let Some(bos) = tokenizer.bos_token() {
-                        tokens.push(bos);
-                    }
+                if add_bos && let Some(bos) = tokenizer.bos_token() {
+                    tokens.push(bos);
                 }
                 tokens.extend_from_slice(&tokenizer.encode(&prompt));
             }

@@ -140,7 +140,7 @@ impl LlamaModel {
             .with_context(|| format!("missing {prefix}.attention.head_count_kv"))?
             as usize;
         ensure!(
-            n_heads > 0 && n_kv_heads > 0 && n_heads % n_kv_heads == 0,
+            n_heads > 0 && n_kv_heads > 0 && n_heads.is_multiple_of(n_kv_heads),
             "n_heads ({n_heads}) must be a positive multiple of n_kv_heads ({n_kv_heads})"
         );
         // Qwen GGUFs typically omit `{prefix}.vocab_size`; derive it from the
@@ -619,9 +619,11 @@ impl LlamaModel {
         // loses. Mirrors LFM2's measured crossover (~pp256 on Apple Silicon).
         const FLASH_ATTN_THRESHOLD: usize = 256;
         let use_flash = n >= FLASH_ATTN_THRESHOLD;
-        // Per-KV-head attention output, [n_kv_heads][group_size * n * head_dim],
-        // scattered back into out_proj_input after the flash pass. Reused across
-        // layers; empty (unused) below the threshold.
+        // Per-query-head attention output, [n_heads][n * head_dim], scattered
+        // back into out_proj_input after the flash pass. (Byte-identical to the
+        // old per-KV-head [n_kv_heads][group_size * n * head_dim] layout, since
+        // head h = kv_h*group_size + g sits at h*n*head_dim either way.) Reused
+        // across layers; empty (unused) below the threshold.
         let mut flash_out = if use_flash {
             vec![0.0f32; n_heads * n * head_dim]
         } else {
@@ -861,25 +863,39 @@ impl LlamaModel {
                 _ => unreachable!("dense transformer layer is always Attention"),
             };
             if use_flash {
-                // Flash attention (tiled + rayon), parallel across KV heads. Each
-                // KV head writes a contiguous [group_size * n * head_dim] chunk;
-                // par_chunks_mut hands out disjoint &mut so there's no aliasing.
-                let chunk_size = group_size * n * head_dim;
-                let flash_buf = &mut flash_out[..n_kv_heads * chunk_size];
+                // Flash attention (tiled + rayon), parallel across *query heads*,
+                // not KV heads. Splitting per-KV-head caps parallelism at
+                // n_kv_heads (8 for Llama-3.2-1B) — half-idle on a 16-core host,
+                // which a pp2048 profile showed as the dominant prefill cost once
+                // attention's O(n^2) term grew. One task per query head gives
+                // n_heads-way (32) parallelism; group members of one KV head
+                // re-read that head's K/V, but at these sizes those reads hit L3,
+                // and full core utilization more than pays for it.
+                //
+                // The output layout is byte-identical to the per-KV-head split:
+                // KV head kv_h's chunk was [group_size, n, head_dim] at offset
+                // kv_h*group_size*n*head_dim, and group member g at
+                // +g*n*head_dim — i.e. head h = kv_h*group_size + g sits at
+                // exactly h*n*head_dim. So a flat per-head chunking writes the
+                // same bytes; the scatter below is unchanged. Bit-identical
+                // because each (head, query) output is computed independently.
+                let head_chunk = n * head_dim;
+                let flash_buf = &mut flash_out[..n_heads * head_chunk];
                 let q_ref = &q_mat[..];
                 #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
                 use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
                 flash_buf
-                    .par_chunks_mut(chunk_size)
+                    .par_chunks_mut(head_chunk)
                     .enumerate()
-                    .for_each(|(kv_h, chunk)| {
+                    .for_each(|(h, chunk)| {
+                        let kv_h = h / group_size;
                         cpu::flash_attention_gqa_cpu(
                             q_ref,
                             k_cache,
                             v_cache,
                             chunk,
-                            kv_h * group_size,
-                            group_size,
+                            h,
+                            1,
                             n,
                             n,
                             kv_dim,
@@ -892,16 +908,14 @@ impl LlamaModel {
                 // Scatter flash_out [n_heads, n, head_dim] → out_proj_input [q_dim,
                 // n] (stride-n columns). d-then-j inner order keeps out writes
                 // sequential (stride 1) with small-stride reads from flash_buf.
-                for kv_h in 0..n_kv_heads {
-                    for g in 0..group_size {
-                        let h = kv_h * group_size + g;
-                        let src_base = kv_h * chunk_size + g * n * head_dim;
-                        for d in 0..head_dim {
-                            let row_idx = (h * head_dim + d) * n;
-                            for j in 0..n {
-                                out_proj_input[row_idx + j] =
-                                    flash_buf[src_base + j * head_dim + d];
-                            }
+                // Head h's block sits at h*n*head_dim (the per-head chunking
+                // above), so the old kv_h/g nesting collapses to a flat h loop.
+                for h in 0..n_heads {
+                    let src_base = h * n * head_dim;
+                    for d in 0..head_dim {
+                        let row_idx = (h * head_dim + d) * n;
+                        for j in 0..n {
+                            out_proj_input[row_idx + j] = flash_buf[src_base + j * head_dim + d];
                         }
                     }
                 }
