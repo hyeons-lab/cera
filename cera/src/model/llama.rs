@@ -250,17 +250,27 @@ impl LlamaModel {
                 attn_v_bias.push(None);
             }
 
+            // `.with_repack` on the projection weights only: these are the ones
+            // that hit the batched prefill GEMM at `n > 1`. token_embd / output
+            // are deliberately excluded (their prefill GEMM is `n = 1`).
             layer_refs.push(LayerWeightRefs {
-                attn_q: transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_q.weight"))?,
-                attn_k: transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_k.weight"))?,
-                attn_v: transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_v.weight"))?,
+                attn_q: transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_q.weight"))?
+                    .with_repack(&gguf),
+                attn_k: transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_k.weight"))?
+                    .with_repack(&gguf),
+                attn_v: transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_v.weight"))?
+                    .with_repack(&gguf),
                 attn_output: transformer::resolve_weight(
                     &gguf,
                     &format!("blk.{i}.attn_output.weight"),
-                )?,
-                ffn_gate: transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_gate.weight"))?,
-                ffn_up: transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_up.weight"))?,
-                ffn_down: transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_down.weight"))?,
+                )?
+                .with_repack(&gguf),
+                ffn_gate: transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_gate.weight"))?
+                    .with_repack(&gguf),
+                ffn_up: transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_up.weight"))?
+                    .with_repack(&gguf),
+                ffn_down: transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_down.weight"))?
+                    .with_repack(&gguf),
             });
         }
 

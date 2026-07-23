@@ -69,6 +69,35 @@ pub mod oracle_dump {
 
 // ── Pre-resolved weight reference ───────────────────────────────────────────
 
+/// A weight's `m x k` Q4_0 body, repacked at load into the 8-row-interleaved
+/// layout the prefill GEMM (`cpu::gemm_preq_repacked_dispatch`) consumes. Owned
+/// (not a view into the mmap) because the layout differs from GGUF's. Prefill
+/// only — decode keeps the standard mmap layout — so this is kept *alongside*
+/// the mmap weights, costing one extra Q4_0-sized copy for each repacked weight.
+///
+/// Gated to the one config that reads it — the x86 no-BLAS prefill path — so it
+/// does not read as dead code where `gemm_preq`'s repacked branch is compiled out.
+#[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+#[derive(Clone)]
+pub(crate) struct RepackedQ40 {
+    pub packed: Vec<u8>,
+    pub scales: Vec<f32>,
+    pub m: usize,
+    pub k: usize,
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+impl std::fmt::Debug for RepackedQ40 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the buffers — they can be hundreds of MiB.
+        f.debug_struct("RepackedQ40")
+            .field("m", &self.m)
+            .field("k", &self.k)
+            .field("packed_len", &self.packed.len())
+            .finish()
+    }
+}
+
 /// Pre-resolved reference to a quantized weight in the mmap. Computed once at
 /// load time to avoid HashMap lookups during inference. Semantics match
 /// `lfm2::WeightRef`.
@@ -79,6 +108,34 @@ pub(crate) struct WeightRef {
     pub dtype: DType,
     pub m: usize,
     pub k: usize,
+    /// Set by [`WeightRef::with_repack`] for Q4_0 projection weights on hosts
+    /// with the x86 int8 kernels. `None` when unset (other dtypes, ragged row
+    /// counts, or weights that never hit the batched GEMM). The field exists
+    /// only on the target/feature combo whose `gemm_preq` reads it.
+    #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+    pub repacked: Option<std::sync::Arc<RepackedQ40>>,
+}
+
+impl WeightRef {
+    /// Repack this weight for the prefill GEMM if it qualifies, returning the
+    /// (possibly augmented) ref. Call at projection-weight resolution sites; do
+    /// **not** call for embeddings / the output projection, whose prefill GEMM
+    /// runs at `n = 1` (last column only), where the repacked layout gives
+    /// nothing and the extra copy is pure waste.
+    #[allow(unused_variables, unused_mut)]
+    pub(crate) fn with_repack(mut self, gguf: &GgufFile) -> Self {
+        #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+        if self.dtype == DType::Q4_0 && cpu::q4_0_repack_supported(self.m, self.k) {
+            let (packed, scales) = cpu::repack_q4_0_8x8(weight_data(gguf, &self), self.m, self.k);
+            self.repacked = Some(std::sync::Arc::new(RepackedQ40 {
+                packed,
+                scales,
+                m: self.m,
+                k: self.k,
+            }));
+        }
+        self
+    }
 }
 
 /// Resolve a tensor name to a pre-computed byte range in the mmap.
@@ -123,6 +180,8 @@ pub(crate) fn resolve_weight(gguf: &GgufFile, name: &str) -> Result<WeightRef> {
         dtype,
         m,
         k,
+        #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+        repacked: None,
     })
 }
 
@@ -441,6 +500,24 @@ pub(crate) fn gemm_preq(
     // rather than live, but the fix belongs here, where every caller passes
     // through, rather than at the one site that happens to trip it.
     let out = &mut out[..m * n];
+
+    // A repacked Q4_0 weight (8-row interleave, built once at load) takes the
+    // dedicated prefill kernel — no per-column hsum. Only present on x86 hosts
+    // with the int8 kernels, and only for weights that pass
+    // `q4_0_repack_supported`, so this is a no-op fall-through everywhere else.
+    #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+    if let Some(rp) = &wref.repacked {
+        debug_assert_eq!(rp.m, m, "gemm_preq: repacked m mismatch");
+        debug_assert_eq!(rp.k, k, "gemm_preq: repacked k mismatch");
+        let ran = cpu::gemm_preq_repacked_dispatch(
+            &rp.packed, &rp.scales, b_scales, b_quants, out, m, n, k,
+        );
+        if !ran {
+            report_uncomputed_gemm(wref.dtype, k);
+        }
+        return ran;
+    }
+
     let ran = cpu::gemm_preq_dispatch(wref.dtype, data, b_scales, b_quants, out, m, n, k);
     if !ran {
         // Reaching here means a caller gated on `batched_gemm_supports` and got a

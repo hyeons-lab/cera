@@ -232,21 +232,32 @@ impl Lfm2Model {
 
         let mut layer_refs = Vec::with_capacity(n_layers);
         for (i, bt) in block_types.iter().enumerate() {
-            let ffn_gate = Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_gate.weight"))?;
-            let ffn_up = Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_up.weight"))?;
-            let ffn_down = Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_down.weight"))?;
+            // `.with_repack` on every projection weight (all hit the batched
+            // prefill GEMM at `n > 1`); token_embd is excluded above.
+            let ffn_gate = Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_gate.weight"))?
+                .with_repack(&gguf);
+            let ffn_up =
+                Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_up.weight"))?.with_repack(&gguf);
+            let ffn_down = Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_down.weight"))?
+                .with_repack(&gguf);
 
             let (shortconv_in_proj, shortconv_out_proj, attn_q, attn_k, attn_v, attn_output) =
                 if *bt == BlockType::GatedConv {
                     (
-                        Some(Self::resolve_weight(
-                            &gguf,
-                            &format!("blk.{i}.shortconv.in_proj.weight"),
-                        )?),
-                        Some(Self::resolve_weight(
-                            &gguf,
-                            &format!("blk.{i}.shortconv.out_proj.weight"),
-                        )?),
+                        Some(
+                            Self::resolve_weight(
+                                &gguf,
+                                &format!("blk.{i}.shortconv.in_proj.weight"),
+                            )?
+                            .with_repack(&gguf),
+                        ),
+                        Some(
+                            Self::resolve_weight(
+                                &gguf,
+                                &format!("blk.{i}.shortconv.out_proj.weight"),
+                            )?
+                            .with_repack(&gguf),
+                        ),
                         None,
                         None,
                         None,
@@ -256,22 +267,22 @@ impl Lfm2Model {
                     (
                         None,
                         None,
-                        Some(Self::resolve_weight(
-                            &gguf,
-                            &format!("blk.{i}.attn_q.weight"),
-                        )?),
-                        Some(Self::resolve_weight(
-                            &gguf,
-                            &format!("blk.{i}.attn_k.weight"),
-                        )?),
-                        Some(Self::resolve_weight(
-                            &gguf,
-                            &format!("blk.{i}.attn_v.weight"),
-                        )?),
-                        Some(Self::resolve_weight(
-                            &gguf,
-                            &format!("blk.{i}.attn_output.weight"),
-                        )?),
+                        Some(
+                            Self::resolve_weight(&gguf, &format!("blk.{i}.attn_q.weight"))?
+                                .with_repack(&gguf),
+                        ),
+                        Some(
+                            Self::resolve_weight(&gguf, &format!("blk.{i}.attn_k.weight"))?
+                                .with_repack(&gguf),
+                        ),
+                        Some(
+                            Self::resolve_weight(&gguf, &format!("blk.{i}.attn_v.weight"))?
+                                .with_repack(&gguf),
+                        ),
+                        Some(
+                            Self::resolve_weight(&gguf, &format!("blk.{i}.attn_output.weight"))?
+                                .with_repack(&gguf),
+                        ),
                     )
                 };
 
