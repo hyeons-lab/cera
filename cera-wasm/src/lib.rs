@@ -848,7 +848,10 @@ impl SessionConfig {
     #[wasm_bindgen(getter, js_name = kvCompression)]
     pub fn kv_compression(&self) -> Option<TurboQuantConfig> {
         match &self.inner.kv_compression {
-            cera::kv_cache::KvCompression::None => None,
+            // f16 KV isn't a TurboQuant config; the wasm binding doesn't expose
+            // an f16 knob yet, so it reads back as "no TurboQuant" (None). A
+            // dedicated wasm f16 API is a follow-up.
+            cera::kv_cache::KvCompression::None | cera::kv_cache::KvCompression::F16 => None,
             cera::kv_cache::KvCompression::TurboQuant { seed, keys, values } => {
                 Some(TurboQuantConfig {
                     seed: *seed,

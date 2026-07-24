@@ -4590,8 +4590,8 @@ public func FfiConverterTypeFinishReason_lower(_ value: FinishReason) -> RustBuf
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
  * KV-cache compression mode. Mirrors [`cera::kv_cache::KvCompression`].
- * `TurboQuant` is honored by the CPU backend only; Metal / GPU ignore
- * the setting and use the f32 path.
+ * `F16` and `TurboQuant` are honored by the CPU backend only; Metal / GPU
+ * ignore the setting and use the f32 path.
  */
 
 public enum KvCompression: Equatable, Hashable {
@@ -4600,6 +4600,11 @@ public enum KvCompression: Equatable, Hashable {
      * No compression — f32 keys and values (default).
      */
     case none
+    /**
+     * f16 KV cache — half-precision keys + values (2 bytes/elem), ~2× less KV
+     * bandwidth at decode-at-depth. Near-lossless. CPU dense-transformer path.
+     */
+    case f16
     /**
      * TurboQuant compression. Both `keys` + `values` true is the
      * production configuration; toggling them individually is
@@ -4631,7 +4636,9 @@ public struct FfiConverterTypeKvCompression: FfiConverterRustBuffer {
         
         case 1: return .none
         
-        case 2: return .turboQuant(seed: try FfiConverterUInt64.read(from: &buf), keys: try FfiConverterBool.read(from: &buf), values: try FfiConverterBool.read(from: &buf)
+        case 2: return .f16
+        
+        case 3: return .turboQuant(seed: try FfiConverterUInt64.read(from: &buf), keys: try FfiConverterBool.read(from: &buf), values: try FfiConverterBool.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -4646,8 +4653,12 @@ public struct FfiConverterTypeKvCompression: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
         
         
-        case let .turboQuant(seed,keys,values):
+        case .f16:
             writeInt(&buf, Int32(2))
+        
+        
+        case let .turboQuant(seed,keys,values):
+            writeInt(&buf, Int32(3))
             FfiConverterUInt64.write(seed, into: &buf)
             FfiConverterBool.write(keys, into: &buf)
             FfiConverterBool.write(values, into: &buf)

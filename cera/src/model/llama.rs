@@ -788,16 +788,27 @@ impl LlamaModel {
             // K/V to the f32 cache. Destructure the cache once (not per token)
             // and reserve the whole prompt's growth up front (matches lfm2) so
             // the per-token extend_from_slice doesn't repeatedly reallocate.
-            let (key_cache, value_cache) = match &mut state.layers[layer] {
-                LayerState::Attention {
-                    key_cache,
-                    value_cache,
-                    ..
-                } => (key_cache, value_cache),
-                _ => unreachable!("dense transformer layer is always Attention"),
-            };
-            key_cache.reserve(n * kv_dim);
-            value_cache.reserve(n * kv_dim);
+            // f16 KV: append converts to half; Pass B widens back to an f32
+            // scratch (below) so the existing flash/naive kernels are unchanged.
+            let use_f16 = state.kv_f16;
+            let (key_cache, value_cache, key_cache_f16, value_cache_f16) =
+                match &mut state.layers[layer] {
+                    LayerState::Attention {
+                        key_cache,
+                        value_cache,
+                        key_cache_f16,
+                        value_cache_f16,
+                        ..
+                    } => (key_cache, value_cache, key_cache_f16, value_cache_f16),
+                    _ => unreachable!("dense transformer layer is always Attention"),
+                };
+            if use_f16 {
+                key_cache_f16.reserve(n * kv_dim);
+                value_cache_f16.reserve(n * kv_dim);
+            } else {
+                key_cache.reserve(n * kv_dim);
+                value_cache.reserve(n * kv_dim);
+            }
             for j in 0..n {
                 let pos = start_pos + j;
                 let q = &mut state.scratch.q[..q_dim];
@@ -858,18 +869,52 @@ impl LlamaModel {
                     q_mat[i * n + j] = q[i];
                 }
 
-                // Append K, V to the f32 cache (destructured once above the loop).
-                key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
-                value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
+                // Append K, V to the cache (destructured once above the loop).
+                if use_f16 {
+                    key_cache_f16.extend(
+                        state.scratch.k[..kv_dim]
+                            .iter()
+                            .map(|&x| half::f16::from_f32(x).to_bits()),
+                    );
+                    value_cache_f16.extend(
+                        state.scratch.v[..kv_dim]
+                            .iter()
+                            .map(|&x| half::f16::from_f32(x).to_bits()),
+                    );
+                } else {
+                    key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
+                    value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
+                }
             }
 
             // Pass B: GQA attention over the now-complete KV cache → out_proj_input.
+            // In f16 mode, widen the half cache into f32 scratch once per layer so
+            // the flash/naive kernels below stay f32-only (prefill isn't the
+            // decode-at-depth hot path; native f16 flash is a follow-up).
+            let k_widen: Vec<f32>;
+            let v_widen: Vec<f32>;
             let (k_cache, v_cache) = match &state.layers[layer] {
                 LayerState::Attention {
                     key_cache,
                     value_cache,
+                    key_cache_f16,
+                    value_cache_f16,
                     ..
-                } => (key_cache.as_slice(), value_cache.as_slice()),
+                } => {
+                    if use_f16 {
+                        k_widen = key_cache_f16
+                            .iter()
+                            .map(|&b| half::f16::from_bits(b).to_f32())
+                            .collect();
+                        v_widen = value_cache_f16
+                            .iter()
+                            .map(|&b| half::f16::from_bits(b).to_f32())
+                            .collect();
+                        (k_widen.as_slice(), v_widen.as_slice())
+                    } else {
+                        (key_cache.as_slice(), value_cache.as_slice())
+                    }
+                }
                 _ => unreachable!("dense transformer layer is always Attention"),
             };
             if use_flash {
@@ -1245,6 +1290,10 @@ impl LlamaModel {
 
 impl Model for LlamaModel {
     fn supports_hidden_states(&self) -> bool {
+        true
+    }
+
+    fn f16_kv_supported(&self) -> bool {
         true
     }
 

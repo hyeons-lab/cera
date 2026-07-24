@@ -670,6 +670,7 @@ impl Lfm2Model {
             value_cache,
             compressed_keys,
             compressed_values,
+            ..
         } = &mut state.layers[layer]
         {
             let tq_ok =
@@ -719,6 +720,7 @@ impl Lfm2Model {
                     value_cache,
                     compressed_keys,
                     compressed_values,
+                    ..
                 } => (
                     compressed_keys.as_ref(),
                     compressed_values.as_ref(),
@@ -1448,6 +1450,7 @@ impl Lfm2Model {
                             value_cache,
                             compressed_keys,
                             compressed_values,
+                            ..
                         } = &mut state.layers[layer]
                         {
                             match (will_compress_kv, compressed_keys.as_mut()) {
@@ -1545,6 +1548,7 @@ impl Lfm2Model {
                                 value_cache,
                                 compressed_keys,
                                 compressed_values,
+                                ..
                             } = &mut state.layers[layer]
                             {
                                 match (will_compress_kv, compressed_keys.as_mut()) {
@@ -1687,6 +1691,7 @@ impl Lfm2Model {
                                         value_cache,
                                         compressed_keys,
                                         compressed_values,
+                                        ..
                                     } => (
                                         compressed_keys.as_ref(),
                                         compressed_values.as_ref(),

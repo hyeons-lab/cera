@@ -84,6 +84,12 @@ pub enum KvCompression {
     /// No compression — keys and values stored as f32 (default).
     #[default]
     None,
+    /// f16 KV cache — keys and values stored as IEEE-754 half precision
+    /// (2 bytes/elem instead of 4), halving the KV bytes streamed per decode
+    /// token. Near-lossless (f16 has 10 mantissa bits; attention is robust to
+    /// it — this is what llama.cpp uses by default). CPU decode path only;
+    /// accumulation stays f32 for softmax stability.
+    F16,
     /// TurboQuant compression. Keys and values can be toggled independently
     /// for debugging (e.g. to isolate how much drift each side contributes).
     /// The common production configuration sets both `keys` and `values` to
@@ -108,11 +114,19 @@ impl KvCompression {
     }
 
     /// Returns `(compress_keys, compress_values)` for the current mode.
+    /// f16 is not TurboQuant "compression" in this sense — it reports `false`
+    /// so the TurboQuant setup paths stay off; the f16 slots are driven by
+    /// [`Self::is_f16`] instead.
     pub fn flags(&self) -> (bool, bool) {
         match self {
-            Self::None => (false, false),
+            Self::None | Self::F16 => (false, false),
             Self::TurboQuant { keys, values, .. } => (*keys, *values),
         }
+    }
+
+    /// Whether the KV cache is stored in f16 (half precision).
+    pub fn is_f16(&self) -> bool {
+        matches!(self, Self::F16)
     }
 }
 
@@ -123,6 +137,13 @@ pub enum LayerState {
     Attention {
         key_cache: Vec<f32>,
         value_cache: Vec<f32>,
+        /// f16 key cache (IEEE-754 half bits). Populated when `KvCompression::F16`
+        /// is active; `key_cache` stays empty in that mode. Time-major
+        /// `[seq_len × kv_dim]`, same layout as `key_cache`.
+        key_cache_f16: Vec<u16>,
+        /// f16 value cache (IEEE-754 half bits). Populated when `KvCompression::F16`
+        /// is active; `value_cache` stays empty in that mode.
+        value_cache_f16: Vec<u16>,
         /// Compressed key cache (populated when TurboQuant is active; key_cache stays empty).
         compressed_keys: Option<CompressedKeyCache>,
         /// Compressed value cache (populated when TurboQuant is active; value_cache stays empty).
@@ -194,6 +215,11 @@ pub struct InferenceState {
     pub tq_rotations: Vec<Option<RotationState>>,
     /// Shared TurboQuant config (Lloyd-Max centroids, derived from head_dim).
     pub tq_config: Option<TurboQuantConfig>,
+    /// Whether the attention KV caches are stored in f16 (`KvCompression::F16`).
+    /// Set once at construction; the CPU forward paths read it to choose the
+    /// f16 append + f16-widening attention kernels over the f32 path. Reliable
+    /// even before the first token (when both cache vecs are empty).
+    pub kv_f16: bool,
 }
 
 impl InferenceState {
@@ -204,6 +230,8 @@ impl InferenceState {
                 .map(|_| LayerState::Attention {
                     key_cache: Vec::new(),
                     value_cache: Vec::new(),
+                    key_cache_f16: Vec::new(),
+                    value_cache_f16: Vec::new(),
                     compressed_keys: None,
                     compressed_values: None,
                 })
@@ -232,6 +260,7 @@ impl InferenceState {
             tq_rotations: Vec::new(),
             tq_config: None,
             lora: None,
+            kv_f16: false,
         }
     }
 
@@ -265,10 +294,14 @@ impl InferenceState {
                 LayerState::Attention {
                     key_cache,
                     value_cache,
+                    key_cache_f16,
+                    value_cache_f16,
                     ..
                 } => {
                     key_cache.clear();
                     value_cache.clear();
+                    key_cache_f16.clear();
+                    value_cache_f16.clear();
                 }
                 LayerState::Conv { buffer } => buffer.iter_mut().for_each(|x| *x = 0.0),
             }
@@ -322,6 +355,9 @@ impl InferenceState {
         // f32 path, so the compressed-side Vecs also avoid mid-decode reallocs.
         let initial_capacity = capacity;
         let (compress_keys, compress_values) = compression.flags();
+        // f16 KV: the f32 slots stay empty and the `*_f16` slots hold the cache
+        // (half the bytes). Independent of the TurboQuant `compress_*` axis.
+        let use_f16 = compression.is_f16();
 
         // TurboQuant requires power-of-2 head_dim for the Walsh-Hadamard Transform.
         // If the requirement isn't met, silently fall back to uncompressed f32.
@@ -335,7 +371,7 @@ impl InferenceState {
         let (tq_rotations, tq_config) = if tq_enabled {
             let seed = match compression {
                 KvCompression::TurboQuant { seed, .. } => *seed,
-                KvCompression::None => 0,
+                KvCompression::None | KvCompression::F16 => 0,
             };
             // Reserve the outer Vec fallibly too (layer-count-scaled), so no
             // allocation on this path can abort — each RotationState is already
@@ -399,19 +435,35 @@ impl InferenceState {
                         // is the dominant, context-scaled one. When TurboQuant
                         // compression is active for that side, the f32 vec stays
                         // empty and the compressed cache stores it.
-                        let key_cache = if compress_keys && n_kv_heads > 0 {
+                        // In f16 mode the f32 vecs stay empty and the `*_f16`
+                        // vecs are pre-allocated to `capacity * kv_dim` u16 slots
+                        // (half the bytes of the f32 path), same anti-realloc
+                        // reservation. Otherwise the f16 vecs stay empty.
+                        let key_cache = if (compress_keys && n_kv_heads > 0) || use_f16 {
                             Vec::new()
                         } else {
                             try_alloc::<f32>(kv_capacity)?
                         };
-                        let value_cache = if compress_values && n_kv_heads > 0 {
+                        let value_cache = if (compress_values && n_kv_heads > 0) || use_f16 {
                             Vec::new()
                         } else {
                             try_alloc::<f32>(kv_capacity)?
+                        };
+                        let key_cache_f16 = if use_f16 && n_kv_heads > 0 {
+                            try_alloc::<u16>(kv_capacity)?
+                        } else {
+                            Vec::new()
+                        };
+                        let value_cache_f16 = if use_f16 && n_kv_heads > 0 {
+                            try_alloc::<u16>(kv_capacity)?
+                        } else {
+                            Vec::new()
                         };
                         Ok(LayerState::Attention {
                             key_cache,
                             value_cache,
+                            key_cache_f16,
+                            value_cache_f16,
                             compressed_keys,
                             compressed_values,
                         })
@@ -465,6 +517,7 @@ impl InferenceState {
             tq_rotations,
             tq_config,
             lora: None,
+            kv_f16: use_f16,
         })
     }
 
@@ -478,6 +531,35 @@ impl InferenceState {
         {
             key_cache.extend_from_slice(k);
             value_cache.extend_from_slice(v);
+        }
+    }
+
+    /// Append K and V to an attention layer's f16 cache, converting each f32 to
+    /// IEEE-754 half on the way in. Used when `KvCompression::F16` is active.
+    pub fn append_kv_f16(&mut self, layer: usize, k: &[f32], v: &[f32]) {
+        if let LayerState::Attention {
+            key_cache_f16,
+            value_cache_f16,
+            ..
+        } = &mut self.layers[layer]
+        {
+            key_cache_f16.extend(k.iter().map(|&x| half::f16::from_f32(x).to_bits()));
+            value_cache_f16.extend(v.iter().map(|&x| half::f16::from_f32(x).to_bits()));
+        }
+    }
+
+    /// Borrow the f16 key and value caches for an attention layer (IEEE-754 half
+    /// bits, time-major `[seq_len × kv_dim]`). Panics on a non-attention layer.
+    pub fn kv_cache_f16(&self, layer: usize) -> (&[u16], &[u16]) {
+        if let LayerState::Attention {
+            key_cache_f16,
+            value_cache_f16,
+            ..
+        } = &self.layers[layer]
+        {
+            (key_cache_f16, value_cache_f16)
+        } else {
+            panic!("kv_cache_f16 called on non-attention layer {layer}");
         }
     }
 
@@ -583,9 +665,17 @@ impl InferenceState {
                 LayerState::Attention {
                     key_cache,
                     value_cache,
+                    key_cache_f16,
+                    value_cache_f16,
                     compressed_keys,
                     compressed_values,
                 } => {
+                    // f16 KV isn't representable in the current on-disk snapshot
+                    // shape; refuse the whole snapshot so the caller falls back
+                    // to a cold prefill (same conservative policy as mixed-TQ).
+                    if !key_cache_f16.is_empty() || !value_cache_f16.is_empty() {
+                        return None;
+                    }
                     let snap = match (compressed_keys, compressed_values) {
                         (None, None) => LayerSnapshot::Attention {
                             k_data: bytemuck::cast_slice(key_cache).to_vec(),
@@ -647,12 +737,20 @@ impl InferenceState {
                     LayerState::Attention {
                         key_cache,
                         value_cache,
+                        key_cache_f16,
+                        value_cache_f16,
                         ..
                     },
                     LayerSnapshot::Attention { k_data, v_data },
                 ) => {
                     decode_f32_into(key_cache, k_data);
                     decode_f32_into(value_cache, v_data);
+                    // Defensive: an f32 snapshot restored into an f16-configured
+                    // state must not leave stale f16 data. Not reachable today
+                    // (snapshot() refuses f16 → this arm only meets f32 state),
+                    // but keeps the two representations from ever coexisting.
+                    key_cache_f16.clear();
+                    value_cache_f16.clear();
                 }
                 (
                     LayerState::Attention {
@@ -660,6 +758,7 @@ impl InferenceState {
                         value_cache,
                         compressed_keys,
                         compressed_values,
+                        ..
                     },
                     LayerSnapshot::AttentionCompressed { keys, values },
                 ) => {
@@ -769,6 +868,11 @@ impl InferenceState {
             !self.is_compressed(),
             "shift_kv_with_rope called on a TurboQuant-compressed state; \
              shifting compressed caches is not yet supported"
+        );
+        assert!(
+            !self.kv_f16,
+            "shift_kv_with_rope called on an f16 KV state; \
+             shifting f16 caches is not yet supported"
         );
         assert_eq!(
             n_kv_heads_per_layer.len(),
@@ -1418,6 +1522,79 @@ mod tests {
         if let LayerState::Attention { key_cache, .. } = &big.layers[0] {
             assert!(key_cache.capacity() <= cfg.max_seq_len * kv_dim + kv_dim);
         }
+    }
+
+    /// `KvCompression::F16` allocates the f16 slots (f32 slots empty), append
+    /// converts to half and round-trips within f16 precision, and the snapshot
+    /// path refuses f16 (so the caller cold-prefills instead of corrupting).
+    #[test]
+    fn f16_kv_stores_half_and_snapshot_gated() {
+        let cfg = tiny_config(4, 16); // attn layers 0,2; kv_dim = 2*4 = 8
+        let kv_dim = cfg.kv_heads_per_layer[0] * cfg.head_dim;
+        let mut state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::F16).unwrap();
+        assert!(state.kv_f16, "F16 compression must set kv_f16");
+        if let LayerState::Attention {
+            key_cache,
+            key_cache_f16,
+            ..
+        } = &state.layers[0]
+        {
+            assert!(key_cache.is_empty(), "f32 slot stays empty under f16");
+            assert!(
+                key_cache_f16.capacity() >= cfg.max_seq_len * kv_dim,
+                "f16 slot pre-allocated to full context"
+            );
+        } else {
+            panic!("layer 0 should be attention");
+        }
+
+        let k: Vec<f32> = (0..kv_dim).map(|i| i as f32 * 0.1 - 0.3).collect();
+        let v: Vec<f32> = (0..kv_dim).map(|i| i as f32 * -0.05 + 0.2).collect();
+        state.append_kv_f16(0, &k, &v);
+        let (k16, v16) = state.kv_cache_f16(0);
+        assert_eq!(k16.len(), kv_dim);
+        assert_eq!(v16.len(), kv_dim);
+        for (i, &b) in k16.iter().enumerate() {
+            let got = half::f16::from_bits(b).to_f32();
+            assert!(
+                (got - k[i]).abs() < 1e-2,
+                "f16 roundtrip drift at {i}: {got} vs {}",
+                k[i]
+            );
+        }
+
+        state.seq_len = 1;
+        assert!(
+            state.snapshot().is_none(),
+            "f16 KV must refuse to snapshot (cold-prefill fallback)"
+        );
+    }
+
+    /// The sliding-window RoPE shift is not yet implemented for f16 KV, so it
+    /// must hard-panic rather than silently corrupt the cache.
+    #[test]
+    #[should_panic(expected = "f16 KV state")]
+    fn shift_kv_panics_on_f16() {
+        let cfg = tiny_config(2, 16); // layer 0 attention, layer 1 conv
+        let kv_dim = cfg.kv_heads_per_layer[0] * cfg.head_dim;
+        let mut state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::F16).unwrap();
+        let k = vec![0.1f32; kv_dim];
+        let v = vec![0.2f32; kv_dim];
+        state.append_kv_f16(0, &k, &v);
+        state.append_kv_f16(0, &k, &v);
+        state.seq_len = 2;
+        let n_kv = cfg.kv_heads_per_layer.clone();
+        state.shift_kv_with_rope(
+            0,
+            1,
+            cfg.rope_theta,
+            cfg.head_dim,
+            &n_kv,
+            crate::backend::cpu::RopeType::Neox,
+            None,
+        );
     }
 
     /// `clear_for_reuse` zeroes seq_len and empties KV/conv buffers while KEEPING

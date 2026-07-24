@@ -271,17 +271,20 @@ pub enum CeraError {
 /// All four must hold:
 /// - `supports_kv_shift`: backend opted in via [`Model::supports_kv_shift`]
 /// - `n_keep > 0`: user wants to preserve a prefix
-/// - `!is_compressed`: TurboQuant caches aren't shiftable yet
+/// - `!cache_unshiftable`: neither TurboQuant nor f16 caches are shiftable yet
+///   (both would corrupt on the in-place RoPE delta, so the overflow arm must
+///   fall through to `ContextOverflow` instead of calling `shift_kv_with_rope`,
+///   which hard-asserts against them)
 /// - `current_pos >= n_keep + shift_needed`: the pinned prefix leaves
 ///   at least `shift_needed` rotatable cells to drop
 pub fn can_shift(
     supports_kv_shift: bool,
     n_keep: usize,
-    is_compressed: bool,
+    cache_unshiftable: bool,
     current_pos: usize,
     shift_needed: usize,
 ) -> bool {
-    supports_kv_shift && n_keep > 0 && !is_compressed && current_pos >= n_keep + shift_needed
+    supports_kv_shift && n_keep > 0 && !cache_unshiftable && current_pos >= n_keep + shift_needed
 }
 
 /// One slice of a tokenized chat template, distinguishing text runs
@@ -466,18 +469,23 @@ impl Session {
                  n_keep to enable shifting."
             );
         }
-        // Likewise, `n_keep > 0` + TurboQuant is a no-op because the
-        // overflow arm gates on `!is_compressed()`. Warn once so the
-        // user knows their n_keep value is being silently ignored on
-        // overflow.
+        // Likewise, `n_keep > 0` + a non-shiftable KV cache (TurboQuant
+        // or f16) is a no-op because the overflow arm gates the shift out
+        // (`can_shift`'s `cache_unshiftable`). Warn once so the user knows
+        // their n_keep value is being silently ignored on overflow.
         if config.n_keep > 0 && !matches!(config.kv_compression, KvCompression::None) {
+            let mode = match config.kv_compression {
+                KvCompression::F16 => "f16",
+                _ => "TurboQuant",
+            };
             tracing::warn!(
                 target: "cera::session",
                 n_keep = config.n_keep,
-                "n_keep configured alongside TurboQuant KV compression; \
-                 shift not yet supported for compressed caches, so \
-                 overflow will still return ContextOverflow. Disable \
-                 compression to enable n_keep."
+                kv_mode = mode,
+                "n_keep configured alongside a non-shiftable KV cache \
+                 ({mode}); shift not yet supported for these caches, so \
+                 overflow will return ContextOverflow. Use f32 KV to \
+                 enable n_keep."
             );
         }
         // Backend must opt in to shift (CPU LFM2 today; Metal is a
@@ -960,15 +968,16 @@ impl Session {
         if new_end > self.max_seq_len {
             // `n_keep` context shift (Phase 1.5): if the backend
             // supports shift, the session was configured with
-            // `n_keep > 0`, the state isn't TurboQuant-compressed, and
-            // the pinned prefix leaves room to drop — shift to make
+            // `n_keep > 0`, the cache is shiftable (neither TurboQuant
+            // nor f16 — both would corrupt on the in-place RoPE delta),
+            // and the pinned prefix leaves room to drop — shift to make
             // room. Otherwise fall through to the typed ContextOverflow.
             let n_keep = self.config.n_keep as usize;
             let shift_needed = new_end - self.max_seq_len;
             if !can_shift(
                 self.model.supports_kv_shift(),
                 n_keep,
-                self.state.is_compressed(),
+                self.state.is_compressed() || self.state.kv_f16,
                 self.current_pos,
                 shift_needed,
             ) {
@@ -1093,7 +1102,7 @@ impl Session {
             if !can_shift(
                 self.model.supports_kv_shift(),
                 n_keep,
-                self.state.is_compressed(),
+                self.state.is_compressed() || self.state.kv_f16,
                 self.current_pos,
                 shift_needed,
             ) {
@@ -1909,6 +1918,26 @@ mod tests {
         assert_eq!(c.n_keep, 0);
         assert_eq!(c.ubatch_size, 512);
         assert!(matches!(c.kv_compression, KvCompression::None));
+    }
+
+    /// A non-shiftable KV cache (TurboQuant *or* f16) must block the shift so
+    /// the overflow arm returns `ContextOverflow` instead of calling
+    /// `shift_kv_with_rope` (which hard-asserts against both). Regression guard:
+    /// the call sites pass `is_compressed() || kv_f16`, not `is_compressed()`
+    /// alone — the latter is false for f16 and would let the shift panic.
+    #[test]
+    fn can_shift_blocks_unshiftable_caches() {
+        // Happy path: shiftable f32 cache with room to drop.
+        assert!(can_shift(true, 4, false, 100, 8));
+        // Un-shiftable (TQ or f16) blocks the shift regardless of room.
+        assert!(!can_shift(true, 4, true, 100, 8));
+        // Other gates still apply.
+        assert!(!can_shift(false, 4, false, 100, 8), "backend must opt in");
+        assert!(
+            !can_shift(true, 0, false, 100, 8),
+            "n_keep=0 disables shift"
+        );
+        assert!(!can_shift(true, 4, false, 10, 8), "no room to drop");
     }
 
     #[test]

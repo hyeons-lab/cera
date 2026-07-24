@@ -2475,6 +2475,216 @@ unsafe fn attn_values_neon(
     }
 }
 
+// ── f16 KV attention (widen-on-read) ────────────────────────────────────────
+
+/// Convert one IEEE-754 half (raw bits) to f32. On aarch64/x86 with hardware
+/// f16 this lowers to a single `fcvt`/`vcvtph2ps`; otherwise `half`'s software
+/// path. Accumulation downstream stays f32 for softmax stability.
+#[inline(always)]
+fn f16_to_f32(bits: u16) -> f32 {
+    half::f16::from_bits(bits).to_f32()
+}
+
+/// f16 variant of [`attn_scores`]: `k_cache` holds IEEE-754 half bits (2
+/// bytes/elem, half the memory traffic of the f32 path), widened to f32 on
+/// read. `q_head` stays f32; the dot accumulates in f32.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn attn_scores_f16(
+    q_head: &[f32],
+    k_cache: &[u16],
+    scores: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    seq_len: usize,
+) {
+    debug_assert!(q_head.len() >= head_dim);
+    debug_assert!(scores.len() >= seq_len);
+    if seq_len > 0 {
+        debug_assert!(k_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        attn_scores_f16_neon(
+            q_head,
+            k_cache,
+            scores,
+            kv_dim,
+            kv_h_offset,
+            head_dim,
+            scale,
+            seq_len,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for t in 0..seq_len {
+        let mut dot = 0.0f32;
+        let k_off = t * kv_dim + kv_h_offset;
+        for d in 0..head_dim {
+            dot += q_head[d] * f16_to_f32(k_cache[k_off + d]);
+        }
+        scores[t] = dot * scale;
+    }
+}
+
+/// f16 variant of [`attn_values`]: `v_cache` holds IEEE-754 half bits, widened
+/// to f32 on read. The weighted sum accumulates in f32.
+#[allow(clippy::needless_range_loop)]
+pub fn attn_values_f16(
+    scores: &[f32],
+    v_cache: &[u16],
+    attn_out: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    seq_len: usize,
+) {
+    debug_assert!(scores.len() >= seq_len);
+    debug_assert!(attn_out.len() >= head_dim);
+    if seq_len > 0 {
+        debug_assert!(v_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        attn_values_f16_neon(
+            scores,
+            v_cache,
+            attn_out,
+            kv_dim,
+            kv_h_offset,
+            head_dim,
+            seq_len,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        attn_out[..head_dim].fill(0.0);
+        for t in 0..seq_len {
+            let s = scores[t];
+            let v_base = t * kv_dim + kv_h_offset;
+            for d in 0..head_dim {
+                attn_out[d] += s * f16_to_f32(v_cache[v_base + d]);
+            }
+        }
+    }
+}
+
+/// NEON f16→f32-widening score kernel. Uses the hardware FCVTL widen
+/// (`vcvt_f32_f16`) — the conversion is what makes f16 KV a decode-at-depth
+/// win (a software widen is dominated by GQA re-reading each KV element
+/// `group_size×` per token and measured *slower* than f32). The intrinsic
+/// stabilized in Rust 1.94, which sets this crate's MSRV. FCVTL itself is
+/// baseline ARMv8.0 — only f16 *arithmetic* needs FEAT_FP16 — so no runtime
+/// tier gate is required.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[target_feature(enable = "neon")]
+unsafe fn attn_scores_f16_neon(
+    q_head: &[f32],
+    k_cache: &[u16],
+    scores: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    seq_len: usize,
+) {
+    use std::arch::aarch64::*;
+    // Safety: caller ensures buffer bounds; intrinsics require unsafe in Edition 2024.
+    unsafe {
+        let q_ptr = q_head.as_ptr();
+        let k_ptr = k_cache.as_ptr();
+
+        const MAX_Q_VECS: usize = 32;
+        let n_q_vecs = head_dim / 4;
+        debug_assert!(n_q_vecs <= MAX_Q_VECS, "head_dim > 128 not supported");
+        let mut q_vecs = [vdupq_n_f32(0.0); MAX_Q_VECS];
+        for i in 0..n_q_vecs {
+            q_vecs[i] = vld1q_f32(q_ptr.add(i * 4));
+        }
+
+        for t in 0..seq_len {
+            let k_off = t * kv_dim + kv_h_offset;
+            let mut sum0 = vdupq_n_f32(0.0);
+            let mut sum1 = vdupq_n_f32(0.0);
+
+            let mut d = 0usize;
+            let mut qi = 0usize;
+            while d + 8 <= head_dim {
+                // Load 8 f16, widen each 4-lane group to f32 (FCVTL).
+                let k0 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(k_ptr.add(k_off + d))));
+                let k1 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(k_ptr.add(k_off + d + 4))));
+                sum0 = vfmaq_f32(sum0, q_vecs[qi], k0);
+                sum1 = vfmaq_f32(sum1, q_vecs[qi + 1], k1);
+                d += 8;
+                qi += 2;
+            }
+            if d + 4 <= head_dim {
+                let k0 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(k_ptr.add(k_off + d))));
+                sum0 = vfmaq_f32(sum0, q_vecs[qi], k0);
+                d += 4;
+            }
+            let mut total = vaddvq_f32(vaddq_f32(sum0, sum1));
+            while d < head_dim {
+                total += *q_ptr.add(d) * f16_to_f32(*k_ptr.add(k_off + d));
+                d += 1;
+            }
+            scores[t] = total * scale;
+        }
+    }
+}
+
+/// NEON f16→f32-widening weighted-sum kernel. See [`attn_scores_f16_neon`] on
+/// the FCVTL / MSRV rationale.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::needless_range_loop)]
+#[target_feature(enable = "neon")]
+unsafe fn attn_values_f16_neon(
+    scores: &[f32],
+    v_cache: &[u16],
+    attn_out: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    seq_len: usize,
+) {
+    use std::arch::aarch64::*;
+    // Safety: caller ensures buffer bounds; intrinsics require unsafe in Edition 2024.
+    unsafe {
+        let v_ptr = v_cache.as_ptr();
+        let out_ptr = attn_out.as_mut_ptr();
+
+        const MAX_ACC_VECS: usize = 32;
+        let n_vec = head_dim / 4;
+        let n_tail = head_dim % 4;
+        debug_assert!(n_vec <= MAX_ACC_VECS, "head_dim > 128 not supported");
+        let mut acc = [vdupq_n_f32(0.0); MAX_ACC_VECS];
+
+        for t in 0..seq_len {
+            let s = vdupq_n_f32(scores[t]);
+            let v_base = t * kv_dim + kv_h_offset;
+            for i in 0..n_vec {
+                let v = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(v_ptr.add(v_base + i * 4))));
+                acc[i] = vfmaq_f32(acc[i], s, v);
+            }
+        }
+
+        for i in 0..n_vec {
+            vst1q_f32(out_ptr.add(i * 4), acc[i]);
+        }
+        let tail_start = n_vec * 4;
+        for dd in 0..n_tail {
+            let mut val = 0.0f32;
+            for t in 0..seq_len {
+                val +=
+                    scores[t] * f16_to_f32(*v_ptr.add(t * kv_dim + kv_h_offset + tail_start + dd));
+            }
+            *out_ptr.add(tail_start + dd) = val;
+        }
+    }
+}
+
 // ── Flash attention (tiled, online softmax) ────────────────────────────────
 
 const FLASH_TILE_KV: usize = 32;
@@ -5153,6 +5363,103 @@ mod tests {
         let mut scores = vec![];
         attn_scores(&[0.0; 64], &[], &mut scores, 64, 0, 64, 0.125, 0);
         assert!(scores.is_empty());
+    }
+
+    /// The f16 attention kernels must match a scalar dot over the *same*
+    /// f16-widened values — this isolates kernel logic (widen + reduce) from
+    /// f16 rounding, so any drift is a kernel bug, not precision. Runs
+    /// `head_dim` through the 8-wide, 4-wide, and scalar-tail code paths.
+    fn check_attn_f16_kernels(head_dim: usize) {
+        let n_kv_heads = 2;
+        let kv_dim = n_kv_heads * head_dim;
+        let kv_h_off = head_dim; // second KV head
+        let seq_len = 13;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..head_dim).map(|i| (i as f32 - 8.0) * 0.05).collect();
+        let k32: Vec<f32> = (0..seq_len * kv_dim)
+            .map(|i| ((i * 7 + 3) % 31) as f32 * 0.04 - 0.6)
+            .collect();
+        let v32: Vec<f32> = (0..seq_len * kv_dim)
+            .map(|i| ((i * 11 + 5) % 29) as f32 * 0.03 - 0.4)
+            .collect();
+        // f16-encode, then widen back — the exact values both the kernel and the
+        // scalar reference operate on.
+        let k16: Vec<u16> = k32
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+        let v16: Vec<u16> = v32
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+        let k_ref: Vec<f32> = k16.iter().map(|&b| f16_to_f32(b)).collect();
+        let v_ref: Vec<f32> = v16.iter().map(|&b| f16_to_f32(b)).collect();
+
+        // scores
+        let mut expected = vec![0.0f32; seq_len];
+        attn_scores_scalar(
+            &q,
+            &k_ref,
+            &mut expected,
+            kv_dim,
+            kv_h_off,
+            head_dim,
+            scale,
+            seq_len,
+        );
+        let mut actual = vec![0.0f32; seq_len];
+        attn_scores_f16(
+            &q,
+            &k16,
+            &mut actual,
+            kv_dim,
+            kv_h_off,
+            head_dim,
+            scale,
+            seq_len,
+        );
+        for t in 0..seq_len {
+            let diff = (expected[t] - actual[t]).abs();
+            assert!(
+                diff < 1e-4,
+                "attn_scores_f16 mismatch (head_dim={head_dim}) at t={t}: \
+                 expected={}, actual={}, diff={diff}",
+                expected[t],
+                actual[t]
+            );
+        }
+
+        // values: fresh arbitrary weights, same widened v for kernel + reference
+        let scores: Vec<f32> = (0..seq_len)
+            .map(|i| (i as f32 + 1.0) / seq_len as f32)
+            .collect();
+        let mut vexp = vec![0.0f32; head_dim];
+        attn_values_scalar(
+            &scores, &v_ref, &mut vexp, kv_dim, kv_h_off, head_dim, seq_len,
+        );
+        let mut vact = vec![0.0f32; head_dim];
+        attn_values_f16(
+            &scores, &v16, &mut vact, kv_dim, kv_h_off, head_dim, seq_len,
+        );
+        for d in 0..head_dim {
+            let diff = (vexp[d] - vact[d]).abs();
+            assert!(
+                diff < 1e-4,
+                "attn_values_f16 mismatch (head_dim={head_dim}) at d={d}: \
+                 expected={}, actual={}, diff={diff}",
+                vexp[d],
+                vact[d]
+            );
+        }
+    }
+
+    #[test]
+    fn test_attn_f16_matches_scalar_over_widened() {
+        check_attn_f16_kernels(64); // 8-wide only
+        check_attn_f16_kernels(12); // 8-wide + 4-wide
+        check_attn_f16_kernels(10); // 8-wide + scalar-2 tail
+        check_attn_f16_kernels(6); // 4-wide + scalar-2 tail
     }
 
     #[test]

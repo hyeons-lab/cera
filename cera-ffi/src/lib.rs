@@ -1028,13 +1028,16 @@ impl CeraEngine {
 // ---------------------------------------------------------------------------
 
 /// KV-cache compression mode. Mirrors [`cera::kv_cache::KvCompression`].
-/// `TurboQuant` is honored by the CPU backend only; Metal / GPU ignore
-/// the setting and use the f32 path.
+/// `F16` and `TurboQuant` are honored by the CPU backend only; Metal / GPU
+/// ignore the setting and use the f32 path.
 #[derive(Debug, Clone, Default, uniffi::Enum)]
 pub enum KvCompression {
     /// No compression — f32 keys and values (default).
     #[default]
     None,
+    /// f16 KV cache — half-precision keys + values (2 bytes/elem), ~2× less KV
+    /// bandwidth at decode-at-depth. Near-lossless. CPU dense-transformer path.
+    F16,
     /// TurboQuant compression. Both `keys` + `values` true is the
     /// production configuration; toggling them individually is
     /// primarily for debugging the drift contribution of each side.
@@ -1046,6 +1049,7 @@ impl From<KvCompression> for cera::kv_cache::KvCompression {
     fn from(c: KvCompression) -> Self {
         match c {
             KvCompression::None => cera::kv_cache::KvCompression::None,
+            KvCompression::F16 => cera::kv_cache::KvCompression::F16,
             KvCompression::TurboQuant { seed, keys, values } => {
                 cera::kv_cache::KvCompression::TurboQuant { seed, keys, values }
             }
@@ -1057,6 +1061,7 @@ impl From<cera::kv_cache::KvCompression> for KvCompression {
     fn from(c: cera::kv_cache::KvCompression) -> Self {
         match c {
             cera::kv_cache::KvCompression::None => KvCompression::None,
+            cera::kv_cache::KvCompression::F16 => KvCompression::F16,
             cera::kv_cache::KvCompression::TurboQuant { seed, keys, values } => {
                 KvCompression::TurboQuant { seed, keys, values }
             }
