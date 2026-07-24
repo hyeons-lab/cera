@@ -90,8 +90,9 @@ jobs:
   # With the feature off, x86 caps at the `Avx2` tier and the AVX2 int8 kernels
   # become the whole int8 path — the configuration that runs on any x86 host
   # without AVX-512 silicon. (The feature also gates the `_mm512_*` intrinsics,
-  # which need Rust 1.89; that is now the crate MSRV, so the old "still builds on
-  # 1.85-1.88" rationale no longer applies — the hardware-coverage reason does.)
+  # which need Rust 1.89 — below the crate's current 1.94 MSRV — so the old
+  # "still builds on 1.85-1.88" rationale no longer applies; the
+  # hardware-coverage reason does.)
   # Nothing else in CI covers this combination — the `--no-default-features`
   # matrix above targets wasm32 only — and it has broken before: a `#[cfg(feature
   # = "avx512")]` on a helper the AVX2 tests call took the config down while every

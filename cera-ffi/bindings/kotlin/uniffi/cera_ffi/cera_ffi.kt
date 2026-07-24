@@ -6955,14 +6955,20 @@ public object FfiConverterTypeFinishReason : FfiConverterRustBuffer<FinishReason
 
 /**
  * KV-cache compression mode. Mirrors [`cera::kv_cache::KvCompression`].
- * `TurboQuant` is honored by the CPU backend only; Metal / GPU ignore
- * the setting and use the f32 path.
+ * `F16` and `TurboQuant` are honored by the CPU backend only; Metal / GPU
+ * ignore the setting and use the f32 path.
  */
 sealed class KvCompression {
     /**
      * No compression — f32 keys and values (default).
      */
     object None : KvCompression()
+
+    /**
+     * f16 KV cache — half-precision keys + values (2 bytes/elem), ~2× less KV
+     * bandwidth at decode-at-depth. Near-lossless. CPU dense-transformer path.
+     */
+    object F16 : KvCompression()
 
     /**
      * TurboQuant compression. Both `keys` + `values` true is the
@@ -6992,6 +6998,10 @@ public object FfiConverterTypeKvCompression : FfiConverterRustBuffer<KvCompressi
             }
 
             2 -> {
+                KvCompression.F16
+            }
+
+            3 -> {
                 KvCompression.TurboQuant(
                     FfiConverterULong.read(buf),
                     FfiConverterBoolean.read(buf),
@@ -7007,6 +7017,13 @@ public object FfiConverterTypeKvCompression : FfiConverterRustBuffer<KvCompressi
     override fun allocationSize(value: KvCompression) =
         when (value) {
             is KvCompression.None -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is KvCompression.F16 -> {
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 (
                     4UL
@@ -7034,8 +7051,13 @@ public object FfiConverterTypeKvCompression : FfiConverterRustBuffer<KvCompressi
                 Unit
             }
 
-            is KvCompression.TurboQuant -> {
+            is KvCompression.F16 -> {
                 buf.putInt(2)
+                Unit
+            }
+
+            is KvCompression.TurboQuant -> {
+                buf.putInt(3)
                 FfiConverterULong.write(value.`seed`, buf)
                 FfiConverterBoolean.write(value.`keys`, buf)
                 FfiConverterBoolean.write(value.`values`, buf)

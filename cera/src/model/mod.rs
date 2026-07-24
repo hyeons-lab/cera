@@ -427,6 +427,15 @@ pub trait Model: Send + Sync {
     fn turboquant_supported(&self) -> bool {
         false
     }
+
+    /// Whether this model honors an f16 KV cache (`KvCompression::F16`) in its
+    /// forward pass. Like `turboquant_supported`, this is driven by
+    /// `KvCompression` on the `InferenceState`; the model just needs to read/
+    /// write the `*_f16` slots. Currently the CPU dense transformer
+    /// (`LlamaModel`) does; the CLI falls back to f32 KV otherwise.
+    fn f16_kv_supported(&self) -> bool {
+        false
+    }
 }
 
 /// Load a model from a GGUF file, dispatching on the architecture.

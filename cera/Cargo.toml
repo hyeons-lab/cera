@@ -153,8 +153,8 @@ vl-preprocess = ["dep:image"]
 # x86_64 AVX-512 kernels: the vec_dot tier (Q8_0/Q4_0) and the f32
 # flash-attention kernel. Default-on for out-of-box performance on AVX-512
 # hosts; disabling it caps the x86 tier at AVX2 (the AVX2 kernels then carry the
-# whole int8 + attention path). The `_mm512_*` intrinsics require Rust 1.89,
-# which is the crate MSRV, so this gate is now purely about hardware coverage,
-# not toolchain support. No-op on non-x86.
+# whole int8 + attention path). The `_mm512_*` intrinsics require Rust 1.89
+# (below the crate's current 1.94 MSRV), so this gate is purely about hardware
+# coverage, not toolchain support. No-op on non-x86.
 avx512 = []
 default = ["parallel", "mmap", "std-fs", "disk-cache", "vl-preprocess", "avx512"]

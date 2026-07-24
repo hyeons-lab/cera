@@ -935,15 +935,32 @@ pub(crate) fn forward_attn_block(
         ),
     }
 
-    // Append K, V to the f32 cache.
+    // Append K, V to the cache (f16 or f32). `kv_f16` is read before the
+    // mutable layer borrow; the f32 `scratch` fields are a disjoint borrow.
+    let use_f16 = state.kv_f16;
     if let LayerState::Attention {
         key_cache,
         value_cache,
+        key_cache_f16,
+        value_cache_f16,
         ..
     } = &mut state.layers[layer]
     {
-        key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
-        value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
+        if use_f16 {
+            key_cache_f16.extend(
+                state.scratch.k[..kv_dim]
+                    .iter()
+                    .map(|&x| half::f16::from_f32(x).to_bits()),
+            );
+            value_cache_f16.extend(
+                state.scratch.v[..kv_dim]
+                    .iter()
+                    .map(|&x| half::f16::from_f32(x).to_bits()),
+            );
+        } else {
+            key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
+            value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
+        }
     }
 
     // GQA: grouped query attention over the full KV cache.
@@ -953,15 +970,29 @@ pub(crate) fn forward_attn_block(
         .attn_scale
         .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
     {
-        let (k_cache, v_cache) = match &state.layers[layer] {
+        // Bind both representations; only the active one is non-empty. The
+        // per-head loop branches on `use_f16` (constant across the call, so the
+        // predictor nails it) to widen f16 KV on read or use f32 directly.
+        let (k_cache, v_cache, k_cache_f16, v_cache_f16) = match &state.layers[layer] {
             LayerState::Attention {
                 key_cache,
                 value_cache,
+                key_cache_f16,
+                value_cache_f16,
                 ..
-            } => (key_cache.as_slice(), value_cache.as_slice()),
+            } => (
+                key_cache.as_slice(),
+                value_cache.as_slice(),
+                key_cache_f16.as_slice(),
+                value_cache_f16.as_slice(),
+            ),
             _ => panic!("expected Attention state for layer {layer}"),
         };
-        let seq_len = k_cache.len() / kv_dim;
+        let seq_len = if use_f16 {
+            k_cache_f16.len() / kv_dim
+        } else {
+            k_cache.len() / kv_dim
+        };
         let attn_out = &mut state.scratch.attn_out[..q_dim];
         let q = &state.scratch.q[..q_dim];
         let scores = &mut state.scratch.scores;
@@ -970,26 +1001,50 @@ pub(crate) fn forward_attn_block(
             let kv_h = h / group_size;
             let q_head = &q[h * head_dim..(h + 1) * head_dim];
             let kv_h_offset = kv_h * head_dim;
-            cpu::attn_scores(
-                q_head,
-                k_cache,
-                scores,
-                kv_dim,
-                kv_h_offset,
-                head_dim,
-                scale,
-                seq_len,
-            );
-            cpu::softmax_inplace(scores);
-            cpu::attn_values(
-                scores,
-                v_cache,
-                &mut attn_out[h * head_dim..(h + 1) * head_dim],
-                kv_dim,
-                kv_h_offset,
-                head_dim,
-                seq_len,
-            );
+            let head_out = &mut attn_out[h * head_dim..(h + 1) * head_dim];
+            if use_f16 {
+                cpu::attn_scores_f16(
+                    q_head,
+                    k_cache_f16,
+                    scores,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    seq_len,
+                );
+                cpu::softmax_inplace(scores);
+                cpu::attn_values_f16(
+                    scores,
+                    v_cache_f16,
+                    head_out,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    seq_len,
+                );
+            } else {
+                cpu::attn_scores(
+                    q_head,
+                    k_cache,
+                    scores,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    seq_len,
+                );
+                cpu::softmax_inplace(scores);
+                cpu::attn_values(
+                    scores,
+                    v_cache,
+                    head_out,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    seq_len,
+                );
+            }
         }
     }
 

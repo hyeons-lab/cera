@@ -3993,8 +3993,8 @@ mod avx2 {
 //
 // Behind the default-on `avx512` crate feature: disabling it caps x86 at the
 // AVX2 tier (`detect()` won't produce `Avx512`). The `_mm512_*` intrinsics need
-// Rust 1.89, which is the crate MSRV, so the gate is about hardware coverage,
-// not toolchain support.
+// Rust 1.89 (below the crate's current 1.94 MSRV), so the gate is about
+// hardware coverage, not toolchain support.
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 pub(crate) mod avx512 {
     use super::*;

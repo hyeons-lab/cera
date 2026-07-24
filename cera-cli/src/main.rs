@@ -390,7 +390,7 @@ enum Command {
         #[arg(long)]
         no_cache: bool,
 
-        /// KV cache key compression: f32 (default) or tq3 (TurboQuant 3-bit).
+        /// KV cache mode: f32 (default), f16 (half-precision), or tq3 (TurboQuant 3-bit).
         #[arg(long, default_value = "f32")]
         kv_cache_keys: String,
 
@@ -777,7 +777,7 @@ enum Command {
         #[arg(long)]
         no_cache: bool,
 
-        /// KV cache key compression: f32 (default) or tq3 (TurboQuant 3-bit).
+        /// KV cache mode: f32 (default), f16 (half-precision), or tq3 (TurboQuant 3-bit).
         #[arg(long, default_value = "f32")]
         kv_cache_keys: String,
 
@@ -1744,6 +1744,8 @@ fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<()> {
 ///
 /// Modes:
 /// - `f32` / `none`: uncompressed (default)
+/// - `f16`: half-precision KV cache (2 bytes/elem, ~2× less KV bandwidth at
+///   decode). CPU dense-transformer path; falls back to f32 on other models.
 /// - `tq3` / `turboquant`: TurboQuant on both keys (3-bit) and values (2-bit)
 /// - `tq3-keys`: TurboQuant keys only (values stay f32) — debugging
 /// - `tq3-values`: TurboQuant values only (keys stay f32) — debugging
@@ -1756,11 +1758,21 @@ fn setup_kv_compression(
 
     let (keys, values) = match kv_cache_mode {
         "f32" | "none" => return Ok(KvCompression::None),
+        "f16" => {
+            if model.f16_kv_supported() {
+                eprintln!("f16 KV cache enabled (half-precision keys + values)");
+                return Ok(KvCompression::F16);
+            }
+            eprintln!(
+                "warning: f16 KV not supported by this model/backend; falling back to f32 KV"
+            );
+            return Ok(KvCompression::None);
+        }
         "tq3" | "turboquant" => (true, true),
         "tq3-keys" => (true, false),
         "tq3-values" => (false, true),
         other => anyhow::bail!(
-            "unknown --kv-cache-keys mode: {other} (use f32, tq3, tq3-keys, or tq3-values)"
+            "unknown --kv-cache-keys mode: {other} (use f32, f16, tq3, tq3-keys, or tq3-values)"
         ),
     };
 
