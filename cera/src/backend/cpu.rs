@@ -1042,6 +1042,9 @@ pub fn gemm_preq_dispatch(
                 neon::gemm_q8_0_q8_0_neon(data, b_scales, b_quants, out, m, n, k);
                 true
             }
+            // Q4_1, like the K-quants, is dotprod-only (its min term reuses their
+            // col-sum machinery), so it too can decline at runtime.
+            DType::Q4_1 => neon::gemm_q4_1_q8_0_neon(data, b_scales, b_quants, out, m, n, k),
             // K-quants are dotprod-only and 256-aligned, so these can decline
             // at runtime even though the dtype is known.
             DType::Q4KM => neon::gemm_q4_k_q8_0_neon(data, b_scales, b_quants, out, m, n, k),
@@ -1068,6 +1071,10 @@ pub fn gemm_preq_dispatch(
                     }
                     DType::Q8_0 => {
                         kern::gemm_q8_0_q8_0(data, b_scales, b_quants, out, m, n, k);
+                        true
+                    }
+                    DType::Q4_1 => {
+                        kern::gemm_q4_1_q8_0(data, b_scales, b_quants, out, m, n, k);
                         true
                     }
                     DType::Q4KM => {
