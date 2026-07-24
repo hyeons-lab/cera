@@ -272,10 +272,12 @@ mod gate_tests {
         }
     }
 
-    /// Q4_1 has an int8 GEMM (and a BLAS dequant path), so it is batched exactly when
-    /// the K-quant int8 path is available — but with no 256-alignment requirement,
-    /// since Q4_1 blocks are 32 wide. `k = 96` (not a multiple of 256) proves the
-    /// distinction: a K-quant would decline there, Q4_1 must not.
+    /// Q4_1 is batched exactly when `k_quant_gemm_available()` holds — the shared
+    /// predicate is true for the int8 dotprod/AVX2 kernels *and* the BLAS dequant+SGEMM
+    /// path, which is why the test asserts against that predicate rather than naming one
+    /// backend. Unlike the K-quants there is no 256-alignment requirement, since Q4_1
+    /// blocks are 32 wide. `k = 96` (not a multiple of 256) proves the distinction: a
+    /// K-quant would decline there, Q4_1 must not.
     #[test]
     fn q4_1_is_batched_when_the_int8_path_is_available() {
         let expect = k_quant_gemm_available();

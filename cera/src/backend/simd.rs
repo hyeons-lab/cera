@@ -985,8 +985,8 @@ pub(crate) mod neon {
     /// Q4_1's `m` raises the value where the K-quant `dmin` subtracts. A Q4_1 block is 32
     /// values, aligning 1:1 with the Q8_0 input blocks, so weight block `bi` dots input
     /// block `bi` with no superblock bookkeeping. Nibble layout mirrors
-    /// `dequantize_q4_1_block`: low nibble of `qs[t]` → value `t`, high nibble → value
-    /// `t + 16`, so the low/high halves pair with input halves `x0`/`x1`.
+    /// `dequantize_q4_1_block`: low nibble of `qs[t]` → element index `t`, high nibble →
+    /// index `t + 16`, so the low/high halves pair with input halves `x0`/`x1`.
     #[target_feature(enable = "neon,dotprod")]
     unsafe fn gemm_q4_1_q8_0_neon_dotprod(
         a_quant: &[u8],
@@ -1031,8 +1031,9 @@ pub(crate) mod neon {
                             as *const BlockQ4_1);
                         let d = half::f16::from_bits(blk.d).to_f32();
                         let mmin = half::f16::from_bits(blk.m).to_f32();
-                        // Low nibbles → values 0..15, high nibbles → values 16..31; both
-                        // stay in `[0, 15]`, so they are non-negative as `i8`.
+                        // Low nibbles → element indices 0..16, high nibbles → 16..32;
+                        // the nibble *values* are all in `[0, 15]`, so they are
+                        // non-negative as `i8`.
                         let qb = vld1q_u8(blk.qs.as_ptr());
                         let w_lo = vreinterpretq_s8_u8(vandq_u8(qb, mask_0f));
                         let w_hi = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb));
@@ -5010,8 +5011,8 @@ macro_rules! int8_gemm_kernels {
         /// unlike the K-quant `dmin` which subtracts) and there are no sub-block
         /// scales — a Q4_1 block maps 1:1 onto a Q8_0 activation block. The 16 `qs`
         /// bytes expand to a 32-lane weight vector matching `dequantize_q4_1_block`'s
-        /// order: low nibbles → values `0..16` (lane-0 half), high nibbles → `16..32`
-        /// (lane-1 half).
+        /// order: low nibbles → element indices `0..16` (lane-0 half), high nibbles →
+        /// `16..32` (lane-1 half). The nibble values themselves are all in `[0, 15]`.
         #[target_feature(enable = $feat)]
         pub unsafe fn gemm_q4_1_q8_0(
             a_quant: &[u8],
@@ -5053,9 +5054,9 @@ macro_rules! int8_gemm_kernels {
                                 as *const crate::quant::BlockQ4_1);
                             let d = half::f16::from_bits(blk.d).to_f32();
                             let mmin = half::f16::from_bits(blk.m).to_f32();
-                            // 16 packed bytes → 32 nibble values. Low nibbles fill the
-                            // low 128-bit lane (values 0..16), high nibbles the high
-                            // lane (16..32), matching the contiguous activation block.
+                            // 16 packed bytes → 32 weight values. Low nibbles fill the
+                            // low 128-bit lane (element indices 0..16), high nibbles the
+                            // high lane (16..32), matching the contiguous activation block.
                             let qb = _mm_loadu_si128(blk.qs.as_ptr() as *const __m128i);
                             let lo = _mm_and_si128(qb, mask128);
                             let hi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask128);
