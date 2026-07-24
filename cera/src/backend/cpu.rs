@@ -293,6 +293,61 @@ pub fn par_rows_n(y: &mut [f32], n: usize, _min_rows: usize, f: impl Fn((usize, 
     }
 }
 
+/// Like [`par_rows_n`] but with an explicit steal-chunk floor. Pass
+/// `min_chunk_rows = 1` for *few but expensive* rows (e.g. one flash-attention
+/// head per row) so every row is its own steal unit and all `active` workers
+/// participate — the default floor (`MIN_CHUNK_ROWS`) is tuned for many cheap
+/// rows and would collapse a small heavy set onto a couple of workers. See
+/// [`super::threadpool::RowPool::dispatch_rows_chunked`].
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub fn par_rows_n_chunked(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    min_chunk_rows: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    debug_assert_ne!(n, 0, "par_rows_n_chunked: n must be > 0");
+    if n == 0 || y.is_empty() {
+        return;
+    }
+    super::threadpool::RowPool::prefill().dispatch_rows_chunked(
+        y,
+        n,
+        min_rows,
+        min_chunk_rows,
+        |row, row_slice| {
+            f((row, row_slice));
+        },
+    );
+}
+
+/// See the `wasm32` note on [`par_rows`]. `min_chunk_rows` is irrelevant here:
+/// the rayon-backed wasm path uses a static `m / num_threads` split with no
+/// steal-chunk concept, so the native chunk collapse it guards against cannot
+/// arise — this simply delegates to [`par_rows_n`].
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn par_rows_n_chunked(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    _min_chunk_rows: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    par_rows_n(y, n, min_rows, f);
+}
+
+#[cfg(not(feature = "parallel"))]
+pub fn par_rows_n_chunked(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    _min_chunk_rows: usize,
+    f: impl Fn((usize, &mut [f32])),
+) {
+    par_rows_n(y, n, min_rows, f);
+}
+
 #[allow(clippy::ptr_arg)]
 /// Q4_0 GEMV: `y[m] = A_q4_0[m,k] @ x[k]`.
 ///

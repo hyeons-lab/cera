@@ -946,29 +946,37 @@ impl LlamaModel {
                 let head_chunk = n * head_dim;
                 let flash_buf = &mut flash_out[..n_heads * head_chunk];
                 let q_ref = &q_mat[..];
-                #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
-                use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
-                flash_buf
-                    .par_chunks_mut(head_chunk)
-                    .enumerate()
-                    .for_each(|(h, chunk)| {
-                        let kv_h = h / group_size;
-                        cpu::flash_attention_gqa_cpu(
-                            q_ref,
-                            k_cache,
-                            v_cache,
-                            chunk,
-                            h,
-                            1,
-                            n,
-                            n,
-                            kv_dim,
-                            kv_h * head_dim,
-                            head_dim,
-                            scale,
-                            start_pos,
-                        );
-                    });
+                // Fan out over query heads via `par_rows_n_chunked` — the pinned
+                // RowPool on native, rayon on wasm32. On native this shares the
+                // one prefill pool with the GEMM instead of a second full-width
+                // pool spin-waiting through attention's phase (the
+                // oversubscription the GEMM consolidation removed). Each
+                // query head is one "row" of `head_chunk = n * head_dim`; the
+                // per-(head, query) reductions are independent, so which worker
+                // runs which head does not change the result — bit-identical.
+                //
+                // `min_chunk_rows = 1`: a head is a heavy row, and there are only
+                // `n_heads` of them (32 for Llama-1B), so the default steal floor
+                // would hand all heads to 2 workers. One head per steal unit lets
+                // every worker take a head.
+                cpu::par_rows_n_chunked(flash_buf, head_chunk, 1, 1, |(h, chunk)| {
+                    let kv_h = h / group_size;
+                    cpu::flash_attention_gqa_cpu(
+                        q_ref,
+                        k_cache,
+                        v_cache,
+                        chunk,
+                        h,
+                        1,
+                        n,
+                        n,
+                        kv_dim,
+                        kv_h * head_dim,
+                        head_dim,
+                        scale,
+                        start_pos,
+                    );
+                });
                 // Scatter flash_out [n_heads, n, head_dim] → out_proj_input [q_dim,
                 // n] (stride-n columns). d-then-j inner order keeps out writes
                 // sequential (stride 1) with small-stride reads from flash_buf.
