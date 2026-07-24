@@ -662,15 +662,21 @@ impl Lfm2Model {
         let tq_rotation = state.tq_rotations.get(layer).and_then(|r| r.as_ref());
         let tq_config = state.tq_config.as_ref();
 
+        // f16 KV: append converts to half + the naive read path widens on read.
+        // Mutually exclusive with TurboQuant (a distinct KvCompression variant),
+        // so `use_f16` is never true alongside the TQ branches below.
+        let use_f16 = state.kv_f16;
+
         // Append K, V to cache. Keys and values are compressed independently —
         // whichever side has a CompressedKvCache present gets the TurboQuant
-        // path; the other side falls through to the f32 cache.
+        // path; the other side falls through to the f32 (or f16) cache.
         if let LayerState::Attention {
             key_cache,
             value_cache,
+            key_cache_f16,
+            value_cache_f16,
             compressed_keys,
             compressed_values,
-            ..
         } = &mut state.layers[layer]
         {
             let tq_ok =
@@ -685,6 +691,13 @@ impl Lfm2Model {
                         tq_config.unwrap(),
                         k_cache_tq,
                         state.tq_encode_scratch.as_mut().unwrap(),
+                    );
+                }
+                _ if use_f16 => {
+                    key_cache_f16.extend(
+                        state.scratch.k[..kv_dim]
+                            .iter()
+                            .map(|&x| half::f16::from_f32(x).to_bits()),
                     );
                 }
                 _ => {
@@ -703,6 +716,13 @@ impl Lfm2Model {
                         state.tq_encode_scratch.as_mut().unwrap(),
                     );
                 }
+                _ if use_f16 => {
+                    value_cache_f16.extend(
+                        state.scratch.v[..kv_dim]
+                            .iter()
+                            .map(|&x| half::f16::from_f32(x).to_bits()),
+                    );
+                }
                 _ => {
                     value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
                 }
@@ -714,18 +734,21 @@ impl Lfm2Model {
         let scale = 1.0 / (head_dim as f32).sqrt();
         {
             // Access layers and scratch as disjoint fields to avoid whole-state borrow
-            let (ck, cv, k_cache, v_cache) = match &state.layers[layer] {
+            let (ck, cv, k_cache, v_cache, k_cache_f16, v_cache_f16) = match &state.layers[layer] {
                 LayerState::Attention {
                     key_cache,
                     value_cache,
+                    key_cache_f16,
+                    value_cache_f16,
                     compressed_keys,
                     compressed_values,
-                    ..
                 } => (
                     compressed_keys.as_ref(),
                     compressed_values.as_ref(),
                     key_cache.as_slice(),
                     value_cache.as_slice(),
+                    key_cache_f16.as_slice(),
+                    value_cache_f16.as_slice(),
                 ),
                 _ => panic!("expected Attention state for layer {layer}"),
             };
@@ -744,6 +767,8 @@ impl Lfm2Model {
                 ck.unwrap().seq_len()
             } else if use_tq_values {
                 cv.unwrap().seq_len()
+            } else if use_f16 {
+                k_cache_f16.len() / kv_dim
             } else {
                 k_cache.len() / kv_dim
             };
@@ -834,31 +859,57 @@ impl Lfm2Model {
                     }
                 }
             } else {
+                // Non-TQ path: f16 (widen-on-read) or f32. Only the active
+                // representation is non-empty; branch on `use_f16` per head.
                 scores.resize(seq_len, 0.0);
                 for h in 0..cfg.n_heads {
                     let kv_h = h / group_size;
                     let q_head = &q[h * head_dim..(h + 1) * head_dim];
                     let kv_h_offset = kv_h * head_dim;
-                    cpu::attn_scores(
-                        q_head,
-                        k_cache,
-                        scores,
-                        kv_dim,
-                        kv_h_offset,
-                        head_dim,
-                        scale,
-                        seq_len,
-                    );
-                    cpu::softmax_inplace(scores);
-                    cpu::attn_values(
-                        scores,
-                        v_cache,
-                        &mut attn_out[h * head_dim..(h + 1) * head_dim],
-                        kv_dim,
-                        kv_h_offset,
-                        head_dim,
-                        seq_len,
-                    );
+                    let head_out = &mut attn_out[h * head_dim..(h + 1) * head_dim];
+                    if use_f16 {
+                        cpu::attn_scores_f16(
+                            q_head,
+                            k_cache_f16,
+                            scores,
+                            kv_dim,
+                            kv_h_offset,
+                            head_dim,
+                            scale,
+                            seq_len,
+                        );
+                        cpu::softmax_inplace(scores);
+                        cpu::attn_values_f16(
+                            scores,
+                            v_cache_f16,
+                            head_out,
+                            kv_dim,
+                            kv_h_offset,
+                            head_dim,
+                            seq_len,
+                        );
+                    } else {
+                        cpu::attn_scores(
+                            q_head,
+                            k_cache,
+                            scores,
+                            kv_dim,
+                            kv_h_offset,
+                            head_dim,
+                            scale,
+                            seq_len,
+                        );
+                        cpu::softmax_inplace(scores);
+                        cpu::attn_values(
+                            scores,
+                            v_cache,
+                            head_out,
+                            kv_dim,
+                            kv_h_offset,
+                            head_dim,
+                            seq_len,
+                        );
+                    }
                 }
             }
         }
@@ -1089,6 +1140,14 @@ impl Lfm2Model {
         // n_kv_heads * group_size * n * head_dim = hs * n).
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
         let mut flash_out = vec![0.0f32; hs * n];
+        // f16 mode only: reused across layers to widen the half KV cache to f32
+        // for the (f32-only) flash/naive attention kernels. Hoisted out of the
+        // layer loop so each widen reuses one allocation instead of a fresh Vec
+        // per layer. Stay empty (no alloc) on the f32/TurboQuant paths.
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+        let mut kv_widen_k: Vec<f32> = Vec::new();
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+        let mut kv_widen_v: Vec<f32> = Vec::new();
 
         for layer in 0..cfg.n_layers {
             // RMSnorm each column independently
@@ -1440,6 +1499,13 @@ impl Lfm2Model {
                         let will_read_compressed_kv = tq_rotation.is_some()
                             && tq_config.is_some()
                             && state.tq_query_scratch.is_some();
+                        // f16 KV: append converts to half; Pass B widens back to
+                        // an f32 scratch so the flash/naive kernels stay f32-only.
+                        // Mutually exclusive with TurboQuant (a distinct
+                        // KvCompression variant), so `use_f16` is never true
+                        // alongside the `will_compress_kv`/`will_read_compressed_kv`
+                        // branches.
+                        let use_f16 = state.kv_f16;
 
                         // Pre-reserve KV cache to avoid repeated reallocations.
                         // Keys and values are handled independently — whichever
@@ -1448,9 +1514,10 @@ impl Lfm2Model {
                         if let LayerState::Attention {
                             key_cache,
                             value_cache,
+                            key_cache_f16,
+                            value_cache_f16,
                             compressed_keys,
                             compressed_values,
-                            ..
                         } = &mut state.layers[layer]
                         {
                             match (will_compress_kv, compressed_keys.as_mut()) {
@@ -1474,6 +1541,9 @@ impl Lfm2Model {
                                         v.reserve(n);
                                     }
                                 }
+                                _ if use_f16 => {
+                                    key_cache_f16.reserve(n * kv_dim);
+                                }
                                 _ => {
                                     key_cache.reserve(n * kv_dim);
                                 }
@@ -1489,6 +1559,9 @@ impl Lfm2Model {
                                     for v in c.norms_f32.iter_mut() {
                                         v.reserve(n);
                                     }
+                                }
+                                _ if use_f16 => {
+                                    value_cache_f16.reserve(n * kv_dim);
                                 }
                                 _ => {
                                     value_cache.reserve(n * kv_dim);
@@ -1546,9 +1619,10 @@ impl Lfm2Model {
                             if let LayerState::Attention {
                                 key_cache,
                                 value_cache,
+                                key_cache_f16,
+                                value_cache_f16,
                                 compressed_keys,
                                 compressed_values,
-                                ..
                             } = &mut state.layers[layer]
                             {
                                 match (will_compress_kv, compressed_keys.as_mut()) {
@@ -1561,6 +1635,13 @@ impl Lfm2Model {
                                             tq_config.unwrap(),
                                             k_cache_tq,
                                             state.tq_encode_scratch.as_mut().unwrap(),
+                                        );
+                                    }
+                                    _ if use_f16 => {
+                                        key_cache_f16.extend(
+                                            state.scratch.k[..kv_dim]
+                                                .iter()
+                                                .map(|&x| half::f16::from_f32(x).to_bits()),
                                         );
                                     }
                                     _ => {
@@ -1577,6 +1658,13 @@ impl Lfm2Model {
                                             tq_config.unwrap(),
                                             v_cache_tq,
                                             state.tq_encode_scratch.as_mut().unwrap(),
+                                        );
+                                    }
+                                    _ if use_f16 => {
+                                        value_cache_f16.extend(
+                                            state.scratch.v[..kv_dim]
+                                                .iter()
+                                                .map(|&x| half::f16::from_f32(x).to_bits()),
                                         );
                                     }
                                     _ => {
@@ -1610,6 +1698,32 @@ impl Lfm2Model {
                         const FLASH_ATTN_THRESHOLD: usize = 256;
                         let use_flash = !use_tq && n >= FLASH_ATTN_THRESHOLD;
 
+                        // f16 mode: widen the half KV cache into the reused f32
+                        // scratch ONCE (mirrors the dense path) so the f32-only
+                        // flash/naive kernels below can read it. Only one of
+                        // flash/tq/naive runs per layer, and TQ is never f16, so
+                        // a single widen here covers whichever branch is taken.
+                        if use_f16
+                            && let LayerState::Attention {
+                                key_cache_f16,
+                                value_cache_f16,
+                                ..
+                            } = &state.layers[layer]
+                        {
+                            kv_widen_k.clear();
+                            kv_widen_k.extend(
+                                key_cache_f16
+                                    .iter()
+                                    .map(|&b| half::f16::from_bits(b).to_f32()),
+                            );
+                            kv_widen_v.clear();
+                            kv_widen_v.extend(
+                                value_cache_f16
+                                    .iter()
+                                    .map(|&b| half::f16::from_bits(b).to_f32()),
+                            );
+                        }
+
                         if use_flash {
                             // f32 path: flash attention over the full KV cache,
                             // parallel across KV heads via rayon.
@@ -1619,13 +1733,19 @@ impl Lfm2Model {
                             // par_chunks_mut so there's no aliased &mut.
                             // After the par_iter we scatter-copy back to
                             // out_proj_input in stride-n layout for Phase 3.
-                            let (k_cache, v_cache) = match &state.layers[layer] {
-                                LayerState::Attention {
-                                    key_cache,
-                                    value_cache,
-                                    ..
-                                } => (key_cache.as_slice(), value_cache.as_slice()),
-                                _ => unreachable!(),
+                            // f16 reads the pre-widened f32 scratch (above); f32
+                            // reads the cache directly. Flash kernel stays f32-only.
+                            let (k_cache, v_cache) = if use_f16 {
+                                (kv_widen_k.as_slice(), kv_widen_v.as_slice())
+                            } else {
+                                match &state.layers[layer] {
+                                    LayerState::Attention {
+                                        key_cache,
+                                        value_cache,
+                                        ..
+                                    } => (key_cache.as_slice(), value_cache.as_slice()),
+                                    _ => unreachable!(),
+                                }
                             };
                             let chunk_size = group_size * n * head_dim;
                             let flash_len = n_kv_heads * chunk_size;
@@ -1810,13 +1930,21 @@ impl Lfm2Model {
                             // attention (no tiling, no rayon). Faster than
                             // flash attention when n < FLASH_ATTN_THRESHOLD
                             // because the attention portion is trivially small.
-                            let (k_cache, v_cache) = match &state.layers[layer] {
-                                LayerState::Attention {
-                                    key_cache,
-                                    value_cache,
-                                    ..
-                                } => (key_cache.as_slice(), value_cache.as_slice()),
-                                _ => unreachable!(),
+                            // f16 reads the pre-widened f32 scratch (above); f32
+                            // reads the cache directly. The widened slice's
+                            // len()/kv_dim equals the real seq_len, so the
+                            // per-token seq_len clamp below is unchanged.
+                            let (k_cache, v_cache) = if use_f16 {
+                                (kv_widen_k.as_slice(), kv_widen_v.as_slice())
+                            } else {
+                                match &state.layers[layer] {
+                                    LayerState::Attention {
+                                        key_cache,
+                                        value_cache,
+                                        ..
+                                    } => (key_cache.as_slice(), value_cache.as_slice()),
+                                    _ => unreachable!(),
+                                }
                             };
                             state.scratch.scores.reserve((start_pos + n) * group_size);
                             for j in 0..n {
@@ -2341,6 +2469,10 @@ impl Lfm2Model {
 
 impl Model for Lfm2Model {
     fn supports_hidden_states(&self) -> bool {
+        true
+    }
+
+    fn f16_kv_supported(&self) -> bool {
         true
     }
 

@@ -432,7 +432,7 @@ pub trait Model: Send + Sync {
     /// forward pass. Like `turboquant_supported`, this is driven by
     /// `KvCompression` on the `InferenceState`; the model just needs to read/
     /// write the `*_f16` slots. Currently the CPU dense transformer
-    /// (`LlamaModel`) does; the CLI falls back to f32 KV otherwise.
+    /// (`LlamaModel`) and `Lfm2Model` do; the CLI falls back to f32 KV otherwise.
     fn f16_kv_supported(&self) -> bool {
         false
     }
