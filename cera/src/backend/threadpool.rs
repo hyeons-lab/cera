@@ -434,7 +434,30 @@ impl RowPool {
     where
         F: Fn(usize, &mut [f32]) + Sync,
     {
-        debug_assert!(n >= 1, "dispatch_rows: n must be ≥ 1");
+        self.dispatch_rows_chunked(y, n, min_rows, MIN_CHUNK_ROWS, f);
+    }
+
+    /// Like [`RowPool::dispatch_rows`], but with an explicit steal-chunk floor.
+    ///
+    /// `dispatch_rows` floors the steal chunk at `MIN_CHUNK_ROWS` (tuned for many
+    /// *cheap* rows, e.g. a GEMV's output rows, where sub-`MIN_CHUNK_ROWS` chunks
+    /// would spend more on steal bookkeeping than on the row). That floor
+    /// *under-parallelizes* the opposite shape — few rows, each expensive: flash
+    /// attention hands one whole *head* per row, so 32 heads at a 16-row floor
+    /// collapse to 2 steal chunks = 2 busy workers, 14 idle. Such callers pass
+    /// `min_chunk_rows = 1` so every heavy row is its own steal unit and all
+    /// `active` workers participate.
+    pub fn dispatch_rows_chunked<F>(
+        &self,
+        y: &mut [f32],
+        n: usize,
+        min_rows: usize,
+        min_chunk_rows: usize,
+        f: F,
+    ) where
+        F: Fn(usize, &mut [f32]) + Sync,
+    {
+        debug_assert!(n >= 1, "dispatch_rows_chunked: n must be ≥ 1");
         if n == 0 || y.is_empty() {
             return;
         }
@@ -443,7 +466,7 @@ impl RowPool {
         // Split off any trailing partial row now; it runs on the caller after
         // the full rows (the parallel body only handles exact rows).
         let (body, tail) = y.split_at_mut(total_rows * n);
-        self.dispatch_body(body, n, total_rows, min_rows, &f);
+        self.dispatch_body(body, n, total_rows, min_rows, min_chunk_rows, &f);
         if !tail.is_empty() {
             f(total_rows, tail);
         }
@@ -451,8 +474,15 @@ impl RowPool {
 
     /// The parallel body of [`RowPool::dispatch_rows`]: exactly `total_rows`
     /// full rows of `n` elements (`y.len() == total_rows * n`).
-    fn dispatch_body<F>(&self, y: &mut [f32], n: usize, total_rows: usize, min_rows: usize, f: &F)
-    where
+    fn dispatch_body<F>(
+        &self,
+        y: &mut [f32],
+        n: usize,
+        total_rows: usize,
+        min_rows: usize,
+        min_chunk_rows: usize,
+        f: &F,
+    ) where
         F: Fn(usize, &mut [f32]) + Sync,
     {
         if total_rows == 0 {
@@ -491,10 +521,10 @@ impl RowPool {
 
         // Chunk finer than one-range-per-worker so a fast core can steal extra
         // chunks to balance out a slow one. ~`STEAL_CHUNKS_PER_WORKER` chunks per
-        // active worker, floored at `MIN_CHUNK_ROWS`.
+        // active worker, floored at the caller's `min_chunk_rows`.
         let chunk_rows = total_rows
             .div_ceil(active * STEAL_CHUNKS_PER_WORKER)
-            .max(MIN_CHUNK_ROWS);
+            .max(min_chunk_rows.max(1));
 
         // Publish the job, then join the steal loop as worker 0.
         //

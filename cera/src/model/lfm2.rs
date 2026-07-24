@@ -1726,13 +1726,30 @@ impl Lfm2Model {
 
                         if use_flash {
                             // f32 path: flash attention over the full KV cache,
-                            // parallel across KV heads via rayon.
+                            // parallel across *query heads* via `par_rows_n_chunked`
+                            // — the pinned RowPool on native, rayon on wasm32. On
+                            // native this shares the one prefill pool with the GEMM
+                            // instead of a second full-width pool spin-waiting
+                            // through attention's phase (the oversubscription the
+                            // GEMM consolidation removed).
                             //
-                            // Each KV head writes to a contiguous chunk of
-                            // flash_out [group_size * n * head_dim], split via
-                            // par_chunks_mut so there's no aliased &mut.
-                            // After the par_iter we scatter-copy back to
-                            // out_proj_input in stride-n layout for Phase 3.
+                            // Splitting per KV head (the pre-widening layout)
+                            // capped parallelism at n_kv_heads — half-idle on a
+                            // core-count host, the same under-utilization #289
+                            // fixed for the dense transformers. One row per query
+                            // head gives n_heads-way; group members of one KV head
+                            // re-read that head's K/V (an L3 hit at these sizes),
+                            // and full core use more than pays for it.
+                            //
+                            // Byte-identical to the per-KV-head split: KV head
+                            // kv_h's block was [group_size, n, head_dim] at
+                            // kv_h*group_size*n*head_dim, member g at +g*n*head_dim
+                            // — i.e. head h = kv_h*group_size + g at exactly
+                            // h*n*head_dim. So per-head chunking writes the same
+                            // bytes and the scatter collapses to a flat h loop.
+                            // Bit-identical: each (head, query) output is computed
+                            // independently.
+                            //
                             // f16 reads the pre-widened f32 scratch (above); f32
                             // reads the cache directly. Flash kernel stays f32-only.
                             let (k_cache, v_cache) = if use_f16 {
@@ -1747,50 +1764,48 @@ impl Lfm2Model {
                                     _ => unreachable!(),
                                 }
                             };
-                            let chunk_size = group_size * n * head_dim;
-                            let flash_len = n_kv_heads * chunk_size;
-                            let flash_buf = &mut flash_out[..flash_len];
+                            let n_heads = cfg.n_heads;
+                            let head_chunk = n * head_dim;
+                            let flash_buf = &mut flash_out[..n_heads * head_chunk];
                             let q_ref = &q_mat[..];
 
-                            #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
-                            use crate::par::{
-                                IndexedParallelIterator, ParallelIterator, ParallelSliceMut,
-                            };
-                            flash_buf.par_chunks_mut(chunk_size).enumerate().for_each(
-                                |(kv_h, chunk)| {
-                                    cpu::flash_attention_gqa_cpu(
-                                        q_ref,
-                                        k_cache,
-                                        v_cache,
-                                        chunk,
-                                        kv_h * group_size,
-                                        group_size,
-                                        n,
-                                        n,
-                                        kv_dim,
-                                        kv_h * head_dim,
-                                        head_dim,
-                                        scale,
-                                        start_pos,
-                                    );
-                                },
-                            );
+                            // `min_chunk_rows = 1`: a head is a heavy row and there
+                            // are only n_heads of them, so the default steal floor
+                            // would hand all heads to a couple of workers. One head
+                            // per steal unit lets every worker take a head.
+                            cpu::par_rows_n_chunked(flash_buf, head_chunk, 1, 1, |(h, chunk)| {
+                                let kv_h = h / group_size;
+                                cpu::flash_attention_gqa_cpu(
+                                    q_ref,
+                                    k_cache,
+                                    v_cache,
+                                    chunk,
+                                    h,
+                                    1,
+                                    n,
+                                    n,
+                                    kv_dim,
+                                    kv_h * head_dim,
+                                    head_dim,
+                                    scale,
+                                    start_pos,
+                                );
+                            });
 
                             // Scatter-copy: flash_buf [n_heads, n, head_dim]
-                            // → out_proj_input [hs, n] stride-n.
-                            // Loop order d-then-j gives sequential writes to
-                            // out_proj_input (stride 1) and small-stride reads
-                            // from flash_buf (stride head_dim).
-                            for kv_h in 0..n_kv_heads {
-                                for g in 0..group_size {
-                                    let h = kv_h * group_size + g;
-                                    let src_base = kv_h * chunk_size + g * n * head_dim;
-                                    for d in 0..head_dim {
-                                        let row_idx = (h * head_dim + d) * n;
-                                        for j in 0..n {
-                                            out_proj_input[row_idx + j] =
-                                                flash_buf[src_base + j * head_dim + d];
-                                        }
+                            // → out_proj_input [hs, n] stride-n. Loop order
+                            // d-then-j gives sequential writes to out_proj_input
+                            // (stride 1) and small-stride reads from flash_buf
+                            // (stride head_dim). Head h's block sits at
+                            // h*n*head_dim, so the old kv_h/g nesting collapses to
+                            // a flat h loop.
+                            for h in 0..n_heads {
+                                let src_base = h * n * head_dim;
+                                for d in 0..head_dim {
+                                    let row_idx = (h * head_dim + d) * n;
+                                    for j in 0..n {
+                                        out_proj_input[row_idx + j] =
+                                            flash_buf[src_base + j * head_dim + d];
                                     }
                                 }
                             }
