@@ -2313,10 +2313,267 @@ pub(crate) mod neon {
         cpu_features().tier >= CpuTier::NeonDotprod
     }
 
+    /// Scalar Q4_K dot for one output cell `(i, j)`, used for the odd row/column
+    /// remainders of the i8mm 2×2 tiling. Mirrors the per-sub-block math of
+    /// [`gemm_q4_k_q8_0_neon_dotprod`] — `Σ_s xs_s·(d·sc_s·Σ(q·xq) − dmin·mn_s·Σ(xq))`
+    /// — with the 4-bit weight nibbles taken *unsigned* (no −8 recenter; the min
+    /// term carries the offset) and the same nibble layout (group `g = s/2`, low
+    /// nibble → sub-block `2g`, high → `2g+1`; first 16 lanes from `qs[g*32..]`,
+    /// next 16 from `qs[g*32+16..]`).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_q4_k_scalar_dot(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        i: usize,
+        j: usize,
+        sb: usize,
+        k: usize,
+        row_bytes: usize,
+    ) -> f32 {
+        let nb32 = k / 32;
+        let mut acc = 0.0f32;
+        for bi in 0..sb {
+            let blk = unsafe {
+                &*(a_quant
+                    .as_ptr()
+                    .add(i * row_bytes + bi * size_of::<BlockQ4KM>())
+                    as *const BlockQ4KM)
+            };
+            let d = half::f16::from_bits(blk.d).to_f32();
+            let dmin = half::f16::from_bits(blk.dmin).to_f32();
+            let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
+            for s in 0..8 {
+                let g = s / 2;
+                let is_high = s & 1 == 1;
+                let xb = bi * 8 + s;
+                let mut dp = 0i32;
+                let mut xsum = 0i32;
+                for l in 0..16 {
+                    let b_first = blk.qs[g * 32 + l];
+                    let b_second = blk.qs[g * 32 + 16 + l];
+                    let (q0, q1) = if is_high {
+                        ((b_first >> 4) as i32, (b_second >> 4) as i32)
+                    } else {
+                        ((b_first & 0x0F) as i32, (b_second & 0x0F) as i32)
+                    };
+                    let x0 = b_quants[j * k + xb * 32 + l] as i32;
+                    let x1 = b_quants[j * k + xb * 32 + 16 + l] as i32;
+                    dp += q0 * x0 + q1 * x1;
+                    xsum += x0 + x1;
+                }
+                let xs = b_scales[j * nb32 + xb];
+                acc += xs * (d * sc[s] as f32 * dp as f32 - dmin * mn[s] as f32 * xsum as f32);
+            }
+        }
+        acc
+    }
+
+    /// i8mm Q4_K × Q8_0 GEMM. Same 2×2-tile `vmmlaq_s32` structure as
+    /// [`gemm_q4_0_q8_0_neon_i8mm`], but with Q4_K's superblock geometry: 8
+    /// sub-blocks of 32, each carrying its own 6-bit scale/min, plus the min
+    /// correction `− dmin·mn_s·Σ(xq)` — so the 4-bit weight nibbles stay *unsigned*
+    /// (no −8 recenter, unlike Q4_0). Each sub-block's `int32` `Σ(q·xq)` for the
+    /// 2×2 tile comes from four `vmmlaq_s32`s over the 8-lane chunks, and each of
+    /// the four output cells then applies its own `xs·(d·sc_s·dp − dmin·mn_s·sx)`
+    /// in f32. The sub-block order (superblock `bi`, group `g`, then `s = 2g, 2g+1`)
+    /// matches [`gemm_q4_k_q8_0_neon_dotprod`] exactly, so the accumulated f32 is
+    /// bit-identical (the `dp`/`sx` integers are the same regardless of instruction).
+    /// Odd row/col remainders fall back to [`gemm_q4_k_scalar_dot`].
+    #[target_feature(enable = "neon,i8mm")]
+    unsafe fn gemm_q4_k_q8_0_neon_i8mm(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(k % 256, 0, "Q4_K GEMM: k must be divisible by 256");
+        let sb = k / 256;
+        let nb32 = k / 32;
+        let row_bytes = sb * size_of::<BlockQ4KM>();
+        debug_assert_eq!(a_quant.len(), m * row_bytes, "Q4_K GEMM: a_quant size");
+        debug_assert_eq!(b_quants.len(), n * k, "Q4_K GEMM: b_quants size");
+        debug_assert_eq!(b_scales.len(), n * nb32, "Q4_K GEMM: b_scales size");
+        debug_assert_eq!(out.len(), m * n, "Q4_K GEMM: out size");
+
+        let col_sums = unsafe { q8_0_col_sums(b_quants, n, k) };
+        let m_even = m & !1;
+        let n_even = n & !1;
+
+        {
+            #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
+            use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+            let cs = col_sums.as_slice();
+            out[..m_even * n]
+                .par_chunks_mut(2 * n)
+                .enumerate()
+                .for_each(|(p, strip)| {
+                    let i = p * 2;
+                    let mask_0f = unsafe { vdupq_n_u8(0x0F) };
+                    for j in (0..n_even).step_by(2) {
+                        let (mut s00, mut s01, mut s10, mut s11) = (0.0f32, 0.0, 0.0, 0.0);
+                        for bi in 0..sb {
+                            let (wb0, wb1) = unsafe {
+                                (
+                                    &*(a_quant
+                                        .as_ptr()
+                                        .add(i * row_bytes + bi * size_of::<BlockQ4KM>())
+                                        as *const BlockQ4KM),
+                                    &*(a_quant
+                                        .as_ptr()
+                                        .add((i + 1) * row_bytes + bi * size_of::<BlockQ4KM>())
+                                        as *const BlockQ4KM),
+                                )
+                            };
+                            let d0 = half::f16::from_bits(wb0.d).to_f32();
+                            let dmin0 = half::f16::from_bits(wb0.dmin).to_f32();
+                            let d1 = half::f16::from_bits(wb1.d).to_f32();
+                            let dmin1 = half::f16::from_bits(wb1.dmin).to_f32();
+                            let (sc0, mn0) = crate::quant::decode_q4km_scales(&wb0.scales);
+                            let (sc1, mn1) = crate::quant::decode_q4km_scales(&wb1.scales);
+                            let qs0 = wb0.qs.as_ptr();
+                            let qs1 = wb1.qs.as_ptr();
+
+                            for g in 0..4 {
+                                // Both weight rows' nibble bytes for this group's two
+                                // 16-lane halves (`b0` = lanes 0..15, `b1` = 16..31).
+                                let (r0b0, r0b1, r1b0, r1b1) = unsafe {
+                                    (
+                                        vld1q_u8(qs0.add(g * 32)),
+                                        vld1q_u8(qs0.add(g * 32 + 16)),
+                                        vld1q_u8(qs1.add(g * 32)),
+                                        vld1q_u8(qs1.add(g * 32 + 16)),
+                                    )
+                                };
+                                // Low nibble → sub-block 2g, high nibble → 2g+1; quants
+                                // are 0..15, positive in i8, so no recenter.
+                                let subs = unsafe {
+                                    [
+                                        (
+                                            2 * g,
+                                            vreinterpretq_s8_u8(vandq_u8(r0b0, mask_0f)),
+                                            vreinterpretq_s8_u8(vandq_u8(r0b1, mask_0f)),
+                                            vreinterpretq_s8_u8(vandq_u8(r1b0, mask_0f)),
+                                            vreinterpretq_s8_u8(vandq_u8(r1b1, mask_0f)),
+                                        ),
+                                        (
+                                            2 * g + 1,
+                                            vreinterpretq_s8_u8(vshrq_n_u8::<4>(r0b0)),
+                                            vreinterpretq_s8_u8(vshrq_n_u8::<4>(r0b1)),
+                                            vreinterpretq_s8_u8(vshrq_n_u8::<4>(r1b0)),
+                                            vreinterpretq_s8_u8(vshrq_n_u8::<4>(r1b1)),
+                                        ),
+                                    ]
+                                };
+
+                                for (s, w0f, w0s, w1f, w1s) in subs {
+                                    let xb = bi * 8 + s;
+                                    // 8-lane chunks in element order: 0..8, 8..16,
+                                    // 16..24, 24..32 (matching the Q8_0 activation).
+                                    let a_row0 = unsafe {
+                                        [
+                                            vget_low_s8(w0f),
+                                            vget_high_s8(w0f),
+                                            vget_low_s8(w0s),
+                                            vget_high_s8(w0s),
+                                        ]
+                                    };
+                                    let a_row1 = unsafe {
+                                        [
+                                            vget_low_s8(w1f),
+                                            vget_high_s8(w1f),
+                                            vget_low_s8(w1s),
+                                            vget_high_s8(w1s),
+                                        ]
+                                    };
+                                    let acc = unsafe {
+                                        let mut acc = vdupq_n_s32(0);
+                                        for c in 0..4 {
+                                            let off = c * 8;
+                                            // a: row0 = weight i, row1 = weight i+1.
+                                            let av = vcombine_s8(a_row0[c], a_row1[c]);
+                                            // b: row0 = input col j, row1 = col j+1.
+                                            let bv = vcombine_s8(
+                                                vld1_s8(
+                                                    b_quants.as_ptr().add(j * k + xb * 32 + off),
+                                                ),
+                                                vld1_s8(
+                                                    b_quants
+                                                        .as_ptr()
+                                                        .add((j + 1) * k + xb * 32 + off),
+                                                ),
+                                            );
+                                            acc = vmmlaq_s32(acc, av, bv);
+                                        }
+                                        acc
+                                    };
+                                    // Lanes: [dp(i,j), dp(i,j+1), dp(i+1,j), dp(i+1,j+1)].
+                                    let (dp00, dp01, dp10, dp11) = unsafe {
+                                        (
+                                            vgetq_lane_s32::<0>(acc) as f32,
+                                            vgetq_lane_s32::<1>(acc) as f32,
+                                            vgetq_lane_s32::<2>(acc) as f32,
+                                            vgetq_lane_s32::<3>(acc) as f32,
+                                        )
+                                    };
+                                    let dsc0 = d0 * sc0[s] as f32;
+                                    let dmn0 = dmin0 * mn0[s] as f32;
+                                    let dsc1 = d1 * sc1[s] as f32;
+                                    let dmn1 = dmin1 * mn1[s] as f32;
+                                    let xs_j = b_scales[j * nb32 + xb];
+                                    let xs_j1 = b_scales[(j + 1) * nb32 + xb];
+                                    let sx_j = cs[j * nb32 + xb] as f32;
+                                    let sx_j1 = cs[(j + 1) * nb32 + xb] as f32;
+                                    s00 += xs_j * (dsc0 * dp00 - dmn0 * sx_j);
+                                    s01 += xs_j1 * (dsc0 * dp01 - dmn0 * sx_j1);
+                                    s10 += xs_j * (dsc1 * dp10 - dmn1 * sx_j);
+                                    s11 += xs_j1 * (dsc1 * dp11 - dmn1 * sx_j1);
+                                }
+                            }
+                        }
+                        strip[j] = s00;
+                        strip[j + 1] = s01;
+                        strip[n + j] = s10;
+                        strip[n + j + 1] = s11;
+                    }
+                    // Odd last column within this strip.
+                    if n_even < n {
+                        let j = n - 1;
+                        strip[j] = gemm_q4_k_scalar_dot(
+                            a_quant, b_scales, b_quants, i, j, sb, k, row_bytes,
+                        );
+                        strip[n + j] = gemm_q4_k_scalar_dot(
+                            a_quant,
+                            b_scales,
+                            b_quants,
+                            i + 1,
+                            j,
+                            sb,
+                            k,
+                            row_bytes,
+                        );
+                    }
+                });
+        }
+
+        // Odd last row (covers all columns).
+        if m_even < m {
+            let i = m - 1;
+            for j in 0..n {
+                out[i * n + j] =
+                    gemm_q4_k_scalar_dot(a_quant, b_scales, b_quants, i, j, sb, k, row_bytes);
+            }
+        }
+    }
+
     /// Q4_K × Q8_0 GEMM dispatcher. Requires `dotprod`; see
-    /// [`k_quant_gemm_available`]. Returns `false` without writing `out` when this
-    /// CPU or this `k` cannot run it, so the caller can fall back rather than ship
-    /// a wrong answer.
+    /// [`k_quant_gemm_available`]. Prefers the i8mm (`vmmlaq_s32`) kernel when the
+    /// tier resolves to it, else the dotprod kernel. Returns `false` without
+    /// writing `out` when this CPU or this `k` cannot run it, so the caller can
+    /// fall back rather than ship a wrong answer.
     ///
     /// The `k % 256` check is here, not only in the caller's gate: superblocks are
     /// 256 wide, so a `k` that is not a multiple of 256 would make `sb = k / 256`
@@ -2336,7 +2593,12 @@ pub(crate) mod neon {
         if !k_quant_gemm_available() || k % 256 != 0 {
             return false;
         }
-        unsafe { gemm_q4_k_q8_0_neon_dotprod(a_quant, b_scales, b_quants, out, m, n, k) };
+        match cpu_features().tier {
+            CpuTier::NeonI8mm => unsafe {
+                gemm_q4_k_q8_0_neon_i8mm(a_quant, b_scales, b_quants, out, m, n, k)
+            },
+            _ => unsafe { gemm_q4_k_q8_0_neon_dotprod(a_quant, b_scales, b_quants, out, m, n, k) },
+        }
         true
     }
 
@@ -3147,6 +3409,78 @@ pub(crate) mod neon {
                 };
                 assert_close(&out_dot, &out_i8mm);
             }
+        }
+
+        /// i8mm Q4_K GEMM vs the dotprod kernel. Same gating as
+        /// [`q4_0_gemm_i8mm_matches_dotprod`] — skips on the dev host (M1 has no
+        /// i8mm), enforced on the `simd-i8mm` CI job. Covers odd m and n for the
+        /// scalar-remainder paths; `k` is a multiple of 256 (superblock width),
+        /// with 512 straddling two superblocks.
+        #[test]
+        fn q4_k_gemm_i8mm_matches_dotprod() {
+            if !require_simd_or_skip("i8mm", std::arch::is_aarch64_feature_detected!("i8mm")) {
+                return;
+            }
+            for &(m, n, k) in &[(4usize, 4usize, 256usize), (5, 3, 512), (2, 7, 256)] {
+                let nb = k / 256;
+                let mut st = 0x1234_5678u64 ^ ((m * 131 + n * 17 + k) as u64);
+                let blocks: Vec<BlockQ4KM> = (0..m * nb).map(|_| random_q4km(&mut st)).collect();
+                let a = blocks_to_bytes(&blocks);
+                let mut b_scales = vec![0.0f32; n * (k / 32)];
+                let mut b_quants = vec![0i8; n * k];
+                for j in 0..n {
+                    let col: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+                    let (s, q) = quantize_col(&col);
+                    b_scales[j * (k / 32)..(j + 1) * (k / 32)].copy_from_slice(&s);
+                    b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+                }
+
+                let mut out_dot = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_k_q8_0_neon_dotprod(&a, &b_scales, &b_quants, &mut out_dot, m, n, k)
+                };
+                let mut out_i8mm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_k_q8_0_neon_i8mm(&a, &b_scales, &b_quants, &mut out_i8mm, m, n, k)
+                };
+                assert_close(&out_dot, &out_i8mm);
+            }
+        }
+
+        /// The Q4_K scalar remainder helper (odd row/col tails of the i8mm tiling)
+        /// must reproduce the dotprod kernel cell-for-cell. This runs on `dotprod`
+        /// alone — so unlike the i8mm parity test it actually executes on hosts
+        /// without i8mm, validating the nibble layout and min correction of
+        /// [`gemm_q4_k_scalar_dot`] on the dev host.
+        #[test]
+        fn q4_k_scalar_dot_matches_dotprod() {
+            if !require_simd_or_skip("dotprod", cpu_features().dotprod) {
+                return;
+            }
+            let (m, n, k) = (3usize, 5usize, 512usize);
+            let sb = k / 256;
+            let row_bytes = sb * size_of::<BlockQ4KM>();
+            let mut st = 0xabcd_1234u64;
+            let blocks: Vec<BlockQ4KM> = (0..m * sb).map(|_| random_q4km(&mut st)).collect();
+            let a = blocks_to_bytes(&blocks);
+            let mut b_scales = vec![0.0f32; n * (k / 32)];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+                let (s, q) = quantize_col(&col);
+                b_scales[j * (k / 32)..(j + 1) * (k / 32)].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+            let mut out_dot = vec![0.0f32; m * n];
+            unsafe { gemm_q4_k_q8_0_neon_dotprod(&a, &b_scales, &b_quants, &mut out_dot, m, n, k) };
+            let mut out_scalar = vec![0.0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    out_scalar[i * n + j] =
+                        gemm_q4_k_scalar_dot(&a, &b_scales, &b_quants, i, j, sb, k, row_bytes);
+                }
+            }
+            assert_close(&out_dot, &out_scalar);
         }
     }
 }
