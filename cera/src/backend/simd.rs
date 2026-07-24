@@ -4654,6 +4654,78 @@ macro_rules! int8_gemm_kernels {
 
                     let mut j0 = 0usize;
                     while j0 < n {
+                        // Decode fast path (n == 1): the single output column has
+                        // ONE `facc` chain, so the per-sub-block `fmadd` is
+                        // latency-bound (each depends on the previous). Split it
+                        // across `NACC` independent accumulators, cycling sub-blocks
+                        // round-robin, so the chains overlap and hide the fmadd
+                        // latency — the same trick the multi-column tile below gets
+                        // for free from its independent columns (which is why that
+                        // path is NOT multi-accumulated: `KQ_COLS * NACC` vectors
+                        // would spill).
+                        //
+                        // Gated on `n == 1`, NOT `cols == 1`: the float reduction
+                        // order differs from the tiled path, so a single-column
+                        // *remainder* of a wider GEMM (n % KQ_COLS == 1) would break
+                        // the AVX2/VNNI cross-tier bit-identity the prefill path
+                        // holds (the two tiers tile at different widths). Decode is
+                        // the only n == 1 caller and its parity is a cosine floor
+                        // (already relaxed by the #292 repack), not bit-exact, so it
+                        // absorbs the reorder; prefill stays bit-identical.
+                        if n == 1 {
+                            // Fixed at 4: the round-robin mask (`& (NACC - 1)`)
+                            // needs a power of two and the tree-reduce below
+                            // hardcodes `facc[0..4]` — not a free tuning knob.
+                            const NACC: usize = 4;
+                            let j = j0;
+                            let mut facc = [_mm256_setzero_ps(); NACC];
+                            let mut macc = 0.0f32;
+                            let mut slot = 0usize;
+                            for bi in 0..sb {
+                                let blk = &*(a_quant
+                                    .as_ptr()
+                                    .add(row_start + bi * size_of::<crate::quant::BlockQ4KM>())
+                                    as *const crate::quant::BlockQ4KM);
+                                let d = half::f16::from_bits(blk.d).to_f32();
+                                let dmin = half::f16::from_bits(blk.dmin).to_f32();
+                                let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
+                                let qs = blk.qs.as_ptr();
+                                for g in 0..4 {
+                                    let qb = _mm256_loadu_si256(qs.add(g * 32) as *const __m256i);
+                                    let w_lo = _mm256_and_si256(qb, mask_0f);
+                                    let w_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), mask_0f);
+                                    for (w, s) in [(w_lo, 2 * g), (w_hi, 2 * g + 1)] {
+                                        let xb = bi * 8 + s;
+                                        let dsc = d * sc[s] as f32;
+                                        let dmn = dmin * mn[s] as f32;
+                                        let x = _mm256_loadu_si256(
+                                            b_quants.as_ptr().add(j * k + xb * 32)
+                                                as *const __m256i,
+                                        );
+                                        let lanes = _mm256_cvtepi32_ps(dot32u(w, x));
+                                        let xs = *b_scales.get_unchecked(j * nb32 + xb);
+                                        let sx = *cs.get_unchecked(j * nb32 + xb);
+                                        let scale = _mm256_set1_ps(xs * dsc);
+                                        // `slot` is masked to 0..NACC, so this is
+                                        // in-bounds — skip the bounds check in the
+                                        // innermost decode loop (matches the
+                                        // `get_unchecked` idiom used for the loads
+                                        // above).
+                                        let acc = facc.get_unchecked_mut(slot);
+                                        *acc = _mm256_fmadd_ps(lanes, scale, *acc);
+                                        macc += xs * dmn * sx as f32;
+                                        slot = (slot + 1) & (NACC - 1);
+                                    }
+                                }
+                            }
+                            // Tree-reduce the NACC accumulators, then one hsum.
+                            let f01 = _mm256_add_ps(facc[0], facc[1]);
+                            let f23 = _mm256_add_ps(facc[2], facc[3]);
+                            let f = _mm256_add_ps(f01, f23);
+                            *row_out.get_unchecked_mut(j) = hsum256_ps(f) - macc;
+                            j0 += 1;
+                            continue;
+                        }
                         let cols = KQ_COLS.min(n - j0);
                         // Defer the reduction: `dp = Σ_lane dot32u(w,x)[lane]` and
                         // the answer is `Σ_s xs·dsc·dp - Σ_s xs·dmn·sx`. Since the
@@ -4779,6 +4851,81 @@ macro_rules! int8_gemm_kernels {
 
                     let mut j0 = 0usize;
                     while j0 < n {
+                        // Decode fast path (n == 1) — mirrors the Q4_K kernel's:
+                        // the single column's one `facc` chain is latency-bound, so
+                        // split it across `NACC` independent accumulators cycled
+                        // round-robin. See the Q4_K `n == 1` block for the full
+                        // rationale, the `n == 1` (not `cols == 1`) gate, and why
+                        // the tiled path stays single-accumulator.
+                        if n == 1 {
+                            // Fixed at 4 — see the Q4_K block: the round-robin mask
+                            // and the tree-reduce below both hardcode it.
+                            const NACC: usize = 4;
+                            let j = j0;
+                            let mut facc = [_mm256_setzero_ps(); NACC];
+                            let mut macc = 0.0f32;
+                            let mut slot = 0usize;
+                            for bi in 0..sb {
+                                let blk = &*(a_quant
+                                    .as_ptr()
+                                    .add(row_start + bi * size_of::<crate::quant::BlockQ6K>())
+                                    as *const crate::quant::BlockQ6K);
+                                let d = half::f16::from_bits(blk.d).to_f32();
+                                let d32 = d * 32.0;
+                                let ql = blk.ql.as_ptr();
+                                let qh = blk.qh.as_ptr();
+                                for nh in 0..2usize {
+                                    let qhb = _mm256_loadu_si256(qh.add(nh * 32) as *const __m256i);
+                                    for g in 0..4usize {
+                                        let qlb = _mm256_loadu_si256(
+                                            ql.add(nh * 64 + (g & 1) * 32) as *const __m256i,
+                                        );
+                                        let l4 = if g < 2 {
+                                            _mm256_and_si256(qlb, mask_0f)
+                                        } else {
+                                            _mm256_and_si256(_mm256_srli_epi16(qlb, 4), mask_0f)
+                                        };
+                                        let h2 = _mm256_and_si256(
+                                            _mm256_srl_epi16(qhb, _mm_cvtsi32_si128(2 * g as i32)),
+                                            mask_03,
+                                        );
+                                        let w = _mm256_or_si256(l4, _mm256_slli_epi16(h2, 4));
+                                        let sc0 = *blk.scales.get_unchecked(nh * 8 + 2 * g) as f32;
+                                        let sc1 =
+                                            *blk.scales.get_unchecked(nh * 8 + 2 * g + 1) as f32;
+                                        let xb = bi * 8 + nh * 4 + g;
+                                        let sc_split_d = _mm256_set_m128(
+                                            _mm_set1_ps(sc1 * d),
+                                            _mm_set1_ps(sc0 * d),
+                                        );
+                                        let x = _mm256_loadu_si256(
+                                            b_quants.as_ptr().add(j * k + xb * 32)
+                                                as *const __m256i,
+                                        );
+                                        let lanes = _mm256_cvtepi32_ps(dot32u(w, x));
+                                        let xs = *b_scales.get_unchecked(j * nb32 + xb);
+                                        let sx0 = *cs16.get_unchecked(j * nh16 + xb * 2);
+                                        let sx1 = *cs16.get_unchecked(j * nh16 + xb * 2 + 1);
+                                        let scale = _mm256_mul_ps(sc_split_d, _mm256_set1_ps(xs));
+                                        // `slot` is masked to 0..NACC, so this is
+                                        // in-bounds — skip the bounds check in the
+                                        // innermost decode loop (matches the
+                                        // `get_unchecked` idiom used for the loads
+                                        // above).
+                                        let acc = facc.get_unchecked_mut(slot);
+                                        *acc = _mm256_fmadd_ps(lanes, scale, *acc);
+                                        macc += xs * d32 * (sc0 * sx0 as f32 + sc1 * sx1 as f32);
+                                        slot = (slot + 1) & (NACC - 1);
+                                    }
+                                }
+                            }
+                            let f01 = _mm256_add_ps(facc[0], facc[1]);
+                            let f23 = _mm256_add_ps(facc[2], facc[3]);
+                            let f = _mm256_add_ps(f01, f23);
+                            *row_out.get_unchecked_mut(j) = hsum256_ps(f) - macc;
+                            j0 += 1;
+                            continue;
+                        }
                         let cols = KQ_COLS.min(n - j0);
                         // Deferred reduction, as in the Q4_K kernel — but a 32-quant
                         // group here spans two 16-wide Q6_K scales, so the 8 dpbusd
@@ -5775,46 +5922,52 @@ pub(crate) mod avx2_int8 {
             if !require_simd_or_skip("avx2", avx2_kernels_callable()) {
                 return;
             }
-            let (m, n, k) = (3usize, 5usize, 512usize);
+            let (m, k) = (3usize, 512usize);
             let sb = k / 256;
             let mut st = 0x9f1e_2d3cu64;
             let (q4k, q6k) = k_quant_rows(m, sb, &mut st);
-            let (bs, bq) = activations(n, k, &mut st);
 
             let q4_row = sb * size_of::<crate::quant::BlockQ4KM>();
             let q6_row = sb * size_of::<crate::quant::BlockQ6K>();
-            for (tag, weights, row_bytes) in [("q4_k", &q4k, q4_row), ("q6_k", &q6k, q6_row)] {
-                let mut got = vec![0.0f32; m * n];
-                unsafe {
-                    if tag == "q4_k" {
-                        gemm_q4_k_q8_0(weights, &bs, &bq, &mut got, m, n, k);
-                    } else {
-                        gemm_q6_k_q8_0(weights, &bs, &bq, &mut got, m, n, k);
-                    }
-                }
-                for i in 0..m {
-                    let mut w = vec![0.0f32; k];
-                    let row = &weights[i * row_bytes..(i + 1) * row_bytes];
-                    if tag == "q4_k" {
-                        crate::quant::dequantize_q4_k_m_row(row, &mut w);
-                    } else {
-                        crate::quant::dequantize_q6_k_row(row, &mut w);
-                    }
-                    for j in 0..n {
-                        let mut want = 0.0f64;
-                        for e in 0..k {
-                            let xa = bs[j * (k / 32) + e / 32] * bq[j * k + e] as f32;
-                            want += (w[e] * xa) as f64;
+            // `n = 5` exercises the KQ_COLS-tiled path; `n = 1` the decode
+            // multi-accumulator fast path (the `n == 1` gate), whose float
+            // reduction order differs from the tiled path — cover both on this
+            // tier since there is no separate AVX2 GEMV test for the n=1 kernel.
+            for n in [5usize, 1usize] {
+                let (bs, bq) = activations(n, k, &mut st);
+                for (tag, weights, row_bytes) in [("q4_k", &q4k, q4_row), ("q6_k", &q6k, q6_row)] {
+                    let mut got = vec![0.0f32; m * n];
+                    unsafe {
+                        if tag == "q4_k" {
+                            gemm_q4_k_q8_0(weights, &bs, &bq, &mut got, m, n, k);
+                        } else {
+                            gemm_q6_k_q8_0(weights, &bs, &bq, &mut got, m, n, k);
                         }
-                        let g = got[i * n + j] as f64;
-                        assert!(
-                            // 1e-5, not the 1e-3 the older VNNI fixtures use:
-                            // instrumented, the real error here is 4e-6..1.7e-4,
-                            // and at 1e-3 a +/-1 error in the Q6_K recentring
-                            // term passes. This still leaves ~50x headroom.
-                            (g - want).abs() <= 1e-5 * (1.0 + want.abs()),
-                            "{tag} [{i},{j}]: got {g} want {want}"
-                        );
+                    }
+                    for i in 0..m {
+                        let mut w = vec![0.0f32; k];
+                        let row = &weights[i * row_bytes..(i + 1) * row_bytes];
+                        if tag == "q4_k" {
+                            crate::quant::dequantize_q4_k_m_row(row, &mut w);
+                        } else {
+                            crate::quant::dequantize_q6_k_row(row, &mut w);
+                        }
+                        for j in 0..n {
+                            let mut want = 0.0f64;
+                            for e in 0..k {
+                                let xa = bs[j * (k / 32) + e / 32] * bq[j * k + e] as f32;
+                                want += (w[e] * xa) as f64;
+                            }
+                            let g = got[i * n + j] as f64;
+                            assert!(
+                                // 1e-5, not the 1e-3 the older VNNI fixtures use:
+                                // instrumented, the real error here is 4e-6..1.7e-4,
+                                // and at 1e-3 a +/-1 error in the Q6_K recentring
+                                // term passes. This still leaves ~50x headroom.
+                                (g - want).abs() <= 1e-5 * (1.0 + want.abs()),
+                                "{tag} n={n} [{i},{j}]: got {g} want {want}"
+                            );
+                        }
                     }
                 }
             }
