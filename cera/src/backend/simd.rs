@@ -1215,9 +1215,264 @@ pub(crate) mod neon {
         }
     }
 
+    /// Scalar per-cell Q6_K × Q8_0 dot for the odd row/col remainders of the i8mm
+    /// tiling. Mirrors `gemm_q6_k_q8_0_neon_dotprod`'s 6-bit decode and its
+    /// `for nh { for h { for g } }` accumulation order (with `d·sc·xs` formed before
+    /// the multiply), so a remainder cell is bit-identical to the batched path.
+    // Remainder helper for the i8mm Q6_K kernel, reachable (non-test) only via
+    // `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
+    // --all-features (blas on), live under the default CI gate.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_q6_k_scalar_dot(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        i: usize,
+        j: usize,
+        sb: usize,
+        k: usize,
+        row_bytes: usize,
+    ) -> f32 {
+        let nb32 = k / 32;
+        let mut acc = 0.0f32;
+        for bi in 0..sb {
+            let blk = unsafe {
+                &*(a_quant
+                    .as_ptr()
+                    .add(i * row_bytes + bi * size_of::<BlockQ6K>())
+                    as *const BlockQ6K)
+            };
+            let d = half::f16::from_bits(blk.d).to_f32();
+            let sc = blk.scales;
+            for nh in 0..2 {
+                for h in 0..2 {
+                    for g in 0..4 {
+                        let xb = bi * 8 + nh * 4 + g;
+                        let d_sc = d * sc[nh * 8 + 2 * g + h] as f32;
+                        let xs = b_scales[j * nb32 + xb];
+                        let mut s = 0i32;
+                        for l in 0..16 {
+                            // 6-bit decode matching the `q6!` macro: ql_a (offset 0)
+                            // for g∈{0,2}, ql_b (offset 32) for g∈{1,3}; low nibble for
+                            // g<2, high for g≥2; the 2 high bits are qh[h*16+l] >> (2·g).
+                            let ql_group_off = if g % 2 == 0 { 0 } else { 32 };
+                            let ql_idx = nh * 64 + ql_group_off + h * 16 + l;
+                            let nibble = if g >= 2 {
+                                blk.ql[ql_idx] >> 4
+                            } else {
+                                blk.ql[ql_idx] & 0x0F
+                            };
+                            let hi2 = (blk.qh[nh * 32 + h * 16 + l] >> (2 * g)) & 0x03;
+                            let w6 = ((nibble | (hi2 << 4)) as i32) - 32;
+                            s += w6 * b_quants[j * k + xb * 32 + h * 16 + l] as i32;
+                        }
+                        acc += (d_sc * xs) * s as f32;
+                    }
+                }
+            }
+        }
+        acc
+    }
+
+    /// i8mm Q6_K × Q8_0 GEMM. Same 2×2-tile `vmmlaq_s32` structure as the Q4_0/Q4_K
+    /// i8mm kernels, parallelized across 2-row strips. Q6_K has **no min term**
+    /// (its quants are signed, −32 baked in at decode), so unlike Q4_K there is no
+    /// col-sum correction. The 6-bit decode (ql nibble | qh 2 bits, −32) and the
+    /// 16-wide sub-block scales are copied verbatim from
+    /// `gemm_q6_k_q8_0_neon_dotprod`, and its `for nh { for h { for g } }`
+    /// accumulation order (scale formed before the multiply) is preserved — so the
+    /// result is **bit-identical** to the dotprod path: the integer dots are exact
+    /// (SMMLA and SDOT compute the same integer), and only the f32 scaling order
+    /// matters, which matches. Odd row/col remainders use `gemm_q6_k_scalar_dot`.
+    // i8mm dispatch target of `gemm_q6_k_q8_0_neon`; dead under --all-features (blas
+    // on), live under the default CI gate — same as the Q4_0/Q4_K i8mm kernels.
+    #[allow(dead_code)]
+    #[target_feature(enable = "neon,i8mm")]
+    unsafe fn gemm_q6_k_q8_0_neon_i8mm(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(k % 256, 0, "Q6_K GEMM: k must be divisible by 256");
+        let sb = k / 256;
+        let nb32 = k / 32;
+        let row_bytes = sb * size_of::<BlockQ6K>();
+        debug_assert_eq!(a_quant.len(), m * row_bytes, "Q6_K GEMM: a_quant size");
+        debug_assert_eq!(b_quants.len(), n * k, "Q6_K GEMM: b_quants size");
+        debug_assert_eq!(b_scales.len(), n * nb32, "Q6_K GEMM: b_scales size");
+        debug_assert_eq!(out.len(), m * n, "Q6_K GEMM: out size");
+
+        let m_even = m & !1;
+        let n_even = n & !1;
+
+        // Main even×even tiles, parallel over 2-row strips.
+        {
+            #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
+            use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+            out[..m_even * n]
+                .par_chunks_mut(2 * n)
+                .enumerate()
+                .for_each(|(p, strip)| {
+                    let i = p * 2;
+                    // SAFETY: NEON+i8mm intrinsics; every load is bounded by the
+                    // debug_asserts above and the 2×2 tile indices stay < m_even/n_even.
+                    unsafe {
+                        let mask_0f = vdupq_n_u8(0x0F);
+                        let mask_03 = vdupq_n_u8(0x03);
+                        let off_32 = vdupq_n_s8(32);
+                        // 6-bit decode, verbatim from the dotprod kernel.
+                        macro_rules! q6 {
+                            ($lo:expr, $qhs:expr, $hi_nibble:expr) => {{
+                                let lo = if $hi_nibble {
+                                    vshrq_n_u8::<4>($lo)
+                                } else {
+                                    vandq_u8($lo, mask_0f)
+                                };
+                                let hi = vandq_u8($qhs, mask_03);
+                                vsubq_s8(
+                                    vreinterpretq_s8_u8(vorrq_u8(lo, vshlq_n_u8::<4>(hi))),
+                                    off_32,
+                                )
+                            }};
+                        }
+                        // 4 groups × (h0, h1) int8x16 sub-blocks for one block, one half.
+                        macro_rules! decode_groups {
+                            ($blk:expr, $nh:expr) => {{
+                                let qlp = $blk.ql.as_ptr().add($nh * 64);
+                                let qhp = $blk.qh.as_ptr().add($nh * 32);
+                                let ql_a0 = vld1q_u8(qlp);
+                                let ql_a1 = vld1q_u8(qlp.add(16));
+                                let ql_b0 = vld1q_u8(qlp.add(32));
+                                let ql_b1 = vld1q_u8(qlp.add(48));
+                                let qh0 = vld1q_u8(qhp);
+                                let qh1 = vld1q_u8(qhp.add(16));
+                                [
+                                    (q6!(ql_a0, qh0, false), q6!(ql_a1, qh1, false)),
+                                    (
+                                        q6!(ql_b0, vshrq_n_u8::<2>(qh0), false),
+                                        q6!(ql_b1, vshrq_n_u8::<2>(qh1), false),
+                                    ),
+                                    (
+                                        q6!(ql_a0, vshrq_n_u8::<4>(qh0), true),
+                                        q6!(ql_a1, vshrq_n_u8::<4>(qh1), true),
+                                    ),
+                                    (
+                                        q6!(ql_b0, vshrq_n_u8::<6>(qh0), true),
+                                        q6!(ql_b1, vshrq_n_u8::<6>(qh1), true),
+                                    ),
+                                ]
+                            }};
+                        }
+
+                        for j in (0..n_even).step_by(2) {
+                            let (mut s00, mut s01, mut s10, mut s11) = (0.0f32, 0.0, 0.0, 0.0);
+                            for bi in 0..sb {
+                                let blk0 = &*(a_quant
+                                    .as_ptr()
+                                    .add(i * row_bytes + bi * size_of::<BlockQ6K>())
+                                    as *const BlockQ6K);
+                                let blk1 = &*(a_quant
+                                    .as_ptr()
+                                    .add((i + 1) * row_bytes + bi * size_of::<BlockQ6K>())
+                                    as *const BlockQ6K);
+                                let dw0 = half::f16::from_bits(blk0.d).to_f32();
+                                let dw1 = half::f16::from_bits(blk1.d).to_f32();
+                                let sc0 = blk0.scales;
+                                let sc1 = blk1.scales;
+                                for nh in 0..2 {
+                                    let groups0 = decode_groups!(blk0, nh);
+                                    let groups1 = decode_groups!(blk1, nh);
+                                    for h in 0..2 {
+                                        for g in 0..4 {
+                                            let xb = bi * 8 + nh * 4 + g;
+                                            let w0 =
+                                                if h == 0 { groups0[g].0 } else { groups0[g].1 };
+                                            let w1 =
+                                                if h == 0 { groups1[g].0 } else { groups1[g].1 };
+                                            // 16-value sub-block dot for cols j, j+1 via two
+                                            // 8-lane SMMLA chunks. Lanes:
+                                            // [W_i·B_j, W_i·B_{j+1}, W_{i+1}·B_j, W_{i+1}·B_{j+1}].
+                                            let xvj = vld1q_s8(
+                                                b_quants.as_ptr().add(j * k + xb * 32 + h * 16),
+                                            );
+                                            let xvj1 = vld1q_s8(
+                                                b_quants
+                                                    .as_ptr()
+                                                    .add((j + 1) * k + xb * 32 + h * 16),
+                                            );
+                                            let mut acc = vdupq_n_s32(0);
+                                            let av0 = vcombine_s8(vget_low_s8(w0), vget_low_s8(w1));
+                                            let bv0 =
+                                                vcombine_s8(vget_low_s8(xvj), vget_low_s8(xvj1));
+                                            acc = vmmlaq_s32(acc, av0, bv0);
+                                            let av1 =
+                                                vcombine_s8(vget_high_s8(w0), vget_high_s8(w1));
+                                            let bv1 =
+                                                vcombine_s8(vget_high_s8(xvj), vget_high_s8(xvj1));
+                                            acc = vmmlaq_s32(acc, av1, bv1);
+                                            let dp00 = vgetq_lane_s32::<0>(acc) as f32;
+                                            let dp01 = vgetq_lane_s32::<1>(acc) as f32;
+                                            let dp10 = vgetq_lane_s32::<2>(acc) as f32;
+                                            let dp11 = vgetq_lane_s32::<3>(acc) as f32;
+                                            let idx = nh * 8 + 2 * g + h;
+                                            let d_sc0 = dw0 * sc0[idx] as f32;
+                                            let d_sc1 = dw1 * sc1[idx] as f32;
+                                            let xsj = *b_scales.as_ptr().add(j * nb32 + xb);
+                                            let xsj1 = *b_scales.as_ptr().add((j + 1) * nb32 + xb);
+                                            s00 += (d_sc0 * xsj) * dp00;
+                                            s01 += (d_sc0 * xsj1) * dp01;
+                                            s10 += (d_sc1 * xsj) * dp10;
+                                            s11 += (d_sc1 * xsj1) * dp11;
+                                        }
+                                    }
+                                }
+                            }
+                            strip[j] = s00;
+                            strip[j + 1] = s01;
+                            strip[n + j] = s10;
+                            strip[n + j + 1] = s11;
+                        }
+                    }
+                    // Odd last column within this strip.
+                    if n_even < n {
+                        let j = n - 1;
+                        strip[j] = gemm_q6_k_scalar_dot(
+                            a_quant, b_scales, b_quants, i, j, sb, k, row_bytes,
+                        );
+                        strip[n + j] = gemm_q6_k_scalar_dot(
+                            a_quant,
+                            b_scales,
+                            b_quants,
+                            i + 1,
+                            j,
+                            sb,
+                            k,
+                            row_bytes,
+                        );
+                    }
+                });
+        }
+
+        // Odd last row (covers all columns).
+        if m_even < m {
+            let i = m - 1;
+            for j in 0..n {
+                out[i * n + j] =
+                    gemm_q6_k_scalar_dot(a_quant, b_scales, b_quants, i, j, sb, k, row_bytes);
+            }
+        }
+    }
+
     /// Q6_K × Q8_0 GEMM dispatcher. Requires `dotprod` and `k % 256 == 0`; see
     /// [`gemm_q4_k_q8_0_neon`] for why the `k` check lives here rather than only in
-    /// the caller's gate. Returns `false` without writing `out` when it cannot run.
+    /// the caller's gate. Prefers the i8mm (`vmmlaq_s32`) kernel when the tier
+    /// resolves to it, else dotprod. Returns `false` without writing `out` when it
+    /// cannot run.
     #[allow(dead_code)]
     pub unsafe fn gemm_q6_k_q8_0_neon(
         a_quant: &[u8],
@@ -1231,7 +1486,12 @@ pub(crate) mod neon {
         if !k_quant_gemm_available() || k % 256 != 0 {
             return false;
         }
-        unsafe { gemm_q6_k_q8_0_neon_dotprod(a_quant, b_scales, b_quants, out, m, n, k) };
+        match cpu_features().tier {
+            CpuTier::NeonI8mm => unsafe {
+                gemm_q6_k_q8_0_neon_i8mm(a_quant, b_scales, b_quants, out, m, n, k)
+            },
+            _ => unsafe { gemm_q6_k_q8_0_neon_dotprod(a_quant, b_scales, b_quants, out, m, n, k) },
+        }
         true
     }
 
@@ -2981,38 +3241,10 @@ pub(crate) mod neon {
             let nb = k / 256;
             let mut st = 0x0bad_c0deu64;
 
-            let blocks: Vec<crate::quant::BlockQ6K> = (0..m * nb)
-                .map(|_| {
-                    let mut ql = [0u8; 128];
-                    let mut qh = [0u8; 64];
-                    let mut scales = [0i8; 16];
-                    for b in ql.iter_mut() {
-                        *b = (lcg(&mut st).abs() * 255.0) as i32 as u8;
-                    }
-                    for b in qh.iter_mut() {
-                        *b = (lcg(&mut st).abs() * 255.0) as i32 as u8;
-                    }
-                    for s in scales.iter_mut() {
-                        *s = (lcg(&mut st) * 60.0) as i32 as i8;
-                    }
-                    crate::quant::BlockQ6K {
-                        ql,
-                        qh,
-                        scales,
-                        d: half::f16::from_f32(0.02 + lcg(&mut st).abs() * 0.05).to_bits(),
-                    }
-                })
-                .collect();
+            let blocks: Vec<crate::quant::BlockQ6K> =
+                (0..m * nb).map(|_| random_q6k(&mut st)).collect();
             let a = blocks_to_bytes(&blocks);
-
-            let b: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
-            let mut b_scales = vec![0.0f32; n * (k / 32)];
-            let mut b_quants = vec![0i8; n * k];
-            for j in 0..n {
-                let (s, q) = quantize_col(&b[j * k..(j + 1) * k]);
-                b_scales[j * (k / 32)..(j + 1) * (k / 32)].copy_from_slice(&s);
-                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
-            }
+            let (b_scales, b_quants) = random_q8_cols(n, k, &mut st);
 
             let mut out = vec![0.0f32; m * n];
             unsafe {
@@ -3041,6 +3273,111 @@ pub(crate) mod neon {
                     assert!(
                         (got - want).abs() <= 1e-5 * (1.0 + want.abs()),
                         "col {j} row {i}: gemm={got} gemv={want}"
+                    );
+                }
+            }
+        }
+
+        /// Random Q6_K block: random 6-bit quants (ql/qh) and int8 sub-block scales,
+        /// controlled `d` (random f16 bits could be inf/NaN). Follows the `random_q4km`
+        /// helper convention; shared by the Q6_K GEMM/GEMV parity tests.
+        fn random_q6k(st: &mut u64) -> crate::quant::BlockQ6K {
+            let mut ql = [0u8; 128];
+            let mut qh = [0u8; 64];
+            let mut scales = [0i8; 16];
+            for b in ql.iter_mut() {
+                *b = (lcg(st).abs() * 255.0) as i32 as u8;
+            }
+            for b in qh.iter_mut() {
+                *b = (lcg(st).abs() * 255.0) as i32 as u8;
+            }
+            for s in scales.iter_mut() {
+                *s = (lcg(st) * 60.0) as i32 as i8;
+            }
+            crate::quant::BlockQ6K {
+                ql,
+                qh,
+                scales,
+                d: half::f16::from_f32(0.02 + lcg(st).abs() * 0.05).to_bits(),
+            }
+        }
+
+        /// Build `n` Q8_0 activation columns of length `k` from random f32.
+        fn random_q8_cols(n: usize, k: usize, st: &mut u64) -> (Vec<f32>, Vec<i8>) {
+            let b: Vec<f32> = (0..n * k).map(|_| lcg(st)).collect();
+            let mut b_scales = vec![0.0f32; n * (k / 32)];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let (s, q) = quantize_col(&b[j * k..(j + 1) * k]);
+                b_scales[j * (k / 32)..(j + 1) * (k / 32)].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+            (b_scales, b_quants)
+        }
+
+        /// The i8mm Q6_K GEMM must agree with the dotprod kernel on identical inputs.
+        /// Runs on the `simd-i8mm` CI job (self-skips on non-i8mm hosts, e.g. M1).
+        /// The gate requires BOTH i8mm and dotprod: the body runs the dotprod
+        /// reference, and the i8mm kernel's scalar-remainder fallback is dotprod-free
+        /// but the reference is not. Shapes cover odd m (5) and odd n (3, 7) so the
+        /// 2×2-tile remainder paths are exercised; k = 512 straddles two superblocks.
+        #[test]
+        fn q6_k_gemm_i8mm_matches_dotprod() {
+            if !require_simd_or_skip(
+                "i8mm",
+                std::arch::is_aarch64_feature_detected!("i8mm")
+                    && std::arch::is_aarch64_feature_detected!("dotprod"),
+            ) {
+                return;
+            }
+            for &(m, n, k) in &[(4usize, 4usize, 256usize), (5, 3, 512), (2, 7, 256)] {
+                let sb = k / 256;
+                let mut st = 0x9e37_79b9u64 ^ ((m * 131 + n * 17 + k) as u64);
+                let blocks: Vec<crate::quant::BlockQ6K> =
+                    (0..m * sb).map(|_| random_q6k(&mut st)).collect();
+                let a = blocks_to_bytes(&blocks);
+                let (b_scales, b_quants) = random_q8_cols(n, k, &mut st);
+
+                let mut out_dot = vec![0.0f32; m * n];
+                let mut out_i8mm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q6_k_q8_0_neon_dotprod(&a, &b_scales, &b_quants, &mut out_dot, m, n, k);
+                    gemm_q6_k_q8_0_neon_i8mm(&a, &b_scales, &b_quants, &mut out_i8mm, m, n, k);
+                }
+                assert_close(&out_dot, &out_i8mm);
+            }
+        }
+
+        /// The Q6_K scalar remainder helper (odd row/col tails of the i8mm tiling)
+        /// must reproduce the dotprod kernel cell-for-cell. Runs on any `dotprod`
+        /// host, so it executes on the dev machine — unlike the i8mm parity test it
+        /// actually validates the shared 6-bit decode + accumulation math locally.
+        #[test]
+        fn q6_k_scalar_dot_matches_dotprod() {
+            if !require_simd_or_skip("dotprod", cpu_features().dotprod) {
+                return;
+            }
+            let (m, n, k) = (4usize, 5usize, 512usize);
+            let sb = k / 256;
+            let row_bytes = sb * size_of::<crate::quant::BlockQ6K>();
+            let mut st = 0x51ed_270bu64;
+            let blocks: Vec<crate::quant::BlockQ6K> =
+                (0..m * sb).map(|_| random_q6k(&mut st)).collect();
+            let a = blocks_to_bytes(&blocks);
+            let (b_scales, b_quants) = random_q8_cols(n, k, &mut st);
+
+            let mut out_dot = vec![0.0f32; m * n];
+            unsafe {
+                gemm_q6_k_q8_0_neon_dotprod(&a, &b_scales, &b_quants, &mut out_dot, m, n, k);
+            }
+            for i in 0..m {
+                for j in 0..n {
+                    let got =
+                        gemm_q6_k_scalar_dot(&a, &b_scales, &b_quants, i, j, sb, k, row_bytes);
+                    let want = out_dot[i * n + j];
+                    assert!(
+                        (got - want).abs() <= 1e-5 * (1.0 + want.abs()),
+                        "row {i} col {j}: scalar={got} dotprod={want}"
                     );
                 }
             }
@@ -3125,37 +3462,10 @@ pub(crate) mod neon {
             for &(m, n, k) in &[(1024usize, 64usize, 4608usize), (5, 11, 512)] {
                 let nb = k / 256;
                 let mut st = 0x5150_7777u64;
-                let blocks: Vec<crate::quant::BlockQ6K> = (0..m * nb)
-                    .map(|_| {
-                        let mut ql = [0u8; 128];
-                        let mut qh = [0u8; 64];
-                        let mut scales = [0i8; 16];
-                        for b in ql.iter_mut() {
-                            *b = (lcg(&mut st).abs() * 255.0) as i32 as u8;
-                        }
-                        for b in qh.iter_mut() {
-                            *b = (lcg(&mut st).abs() * 255.0) as i32 as u8;
-                        }
-                        for sx in scales.iter_mut() {
-                            *sx = (lcg(&mut st) * 60.0) as i32 as i8;
-                        }
-                        crate::quant::BlockQ6K {
-                            ql,
-                            qh,
-                            scales,
-                            d: half::f16::from_f32(0.02 + lcg(&mut st).abs() * 0.05).to_bits(),
-                        }
-                    })
-                    .collect();
+                let blocks: Vec<crate::quant::BlockQ6K> =
+                    (0..m * nb).map(|_| random_q6k(&mut st)).collect();
                 let a = blocks_to_bytes(&blocks);
-                let b: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
-                let mut bs = vec![0.0f32; n * (k / 32)];
-                let mut bq = vec![0i8; n * k];
-                for j in 0..n {
-                    let (s2, q2) = quantize_col(&b[j * k..(j + 1) * k]);
-                    bs[j * (k / 32)..(j + 1) * (k / 32)].copy_from_slice(&s2);
-                    bq[j * k..(j + 1) * k].copy_from_slice(&q2);
-                }
+                let (bs, bq) = random_q8_cols(n, k, &mut st);
                 let mut out = vec![0.0f32; m * n];
                 unsafe { gemm_q6_k_q8_0_neon_dotprod(&a, &bs, &bq, &mut out, m, n, k) };
                 let mut worst = 0.0f32;
