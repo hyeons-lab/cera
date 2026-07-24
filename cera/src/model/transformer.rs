@@ -264,10 +264,26 @@ mod gate_tests {
     /// Dtypes with no int8 kernel must decline whatever the host.
     #[test]
     fn unsupported_dtypes_are_never_batched() {
-        for dtype in [DType::Q4_1, DType::Q5KM, DType::F16, DType::F32] {
+        for dtype in [DType::Q5KM, DType::F16, DType::F32] {
             assert!(
                 !batched_gemm_supports(dtype, 256),
                 "{dtype:?} was admitted to the batched path with no kernel to run it"
+            );
+        }
+    }
+
+    /// Q4_1 has an int8 GEMM (and a BLAS dequant path), so it is batched exactly when
+    /// the K-quant int8 path is available — but with no 256-alignment requirement,
+    /// since Q4_1 blocks are 32 wide. `k = 96` (not a multiple of 256) proves the
+    /// distinction: a K-quant would decline there, Q4_1 must not.
+    #[test]
+    fn q4_1_is_batched_when_the_int8_path_is_available() {
+        let expect = k_quant_gemm_available();
+        for k in [32usize, 96, 256, 2048] {
+            assert_eq!(
+                batched_gemm_supports(DType::Q4_1, k),
+                expect,
+                "Q4_1 at k={k} disagrees with k_quant_gemm_available()"
             );
         }
     }
@@ -371,6 +387,12 @@ pub fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
         DType::Q4_0 | DType::Q8_0 => {
             cfg!(feature = "blas") || crate::backend::cpu::int8_gemm_available()
         }
+        // Q4_1's int8 GEMM reuses the K-quants' dotprod col-sum machinery (its `m`
+        // term needs `Σ(activation)` exactly as their `dmin` term does), so it shares
+        // their availability predicate — dotprod on aarch64, AVX2-int8 on x86, or the
+        // dequant+SGEMM BLAS path. Unlike the K-quants there is no 256-alignment
+        // requirement: Q4_1 blocks are 32 wide.
+        DType::Q4_1 => k_quant_gemm_available(),
         DType::Q4KM | DType::Q6K => k_quant_gemm_available() && k.is_multiple_of(256),
         _ => false,
     }

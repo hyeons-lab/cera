@@ -3,9 +3,12 @@
 // Platform-specific implementations behind cfg gates.
 // The dispatch functions select the best available implementation at compile time.
 
-#[cfg(target_arch = "aarch64")]
-use crate::quant::BlockQ6K;
+// `BlockQ4_1` / `BlockQ6K` are used only by the aarch64 NEON kernels below (the
+// x86 macro kernels reference `crate::quant::…` fully-qualified), so importing
+// them unconditionally trips `-D unused-imports` on x86.
 use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ8_0};
+#[cfg(target_arch = "aarch64")]
+use crate::quant::{BlockQ4_1, BlockQ6K};
 // `half::f16` is consumed by the NEON / AVX2 kernels below and by the
 // `#[cfg(test)] mod tests` further down (the tests aren't arch-gated and
 // use `f16::from_f32` to seed quantized blocks). Including `test` in the
@@ -951,6 +954,98 @@ pub(crate) mod neon {
                                     *acc_j += xs * (dsc * dp as f32 - dmn * sx as f32);
                                 }
                             }
+                        }
+                    }
+
+                    row_out[j0..j0 + cols].copy_from_slice(&acc[..cols]);
+                    j0 += cols;
+                }
+            };
+
+            if m >= super::super::cpu::gemv_par_threshold() {
+                crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
+            } else {
+                out.chunks_mut(n).enumerate().for_each(compute_row);
+            }
+        }
+    }
+
+    /// Batched GEMM: C[m, n] = A_q4_1[m, k] @ B_q8_0[k, n].
+    ///
+    /// Q4_1 dequant is `w = d·q + m` with `q ∈ [0, 15]` — no `−8` recentering. Against
+    /// a Q8_0-quantized activation column (`x = xs · xq`), the per-32-block contribution
+    /// is
+    ///
+    /// ```text
+    /// out[i][j] += xs · ( d·Σ(q·xq) + m·Σ(xq) )
+    /// ```
+    ///
+    /// `Σ(q·xq)` is the int8 dot; `Σ(xq)` is the activation block-sum, hoisted once per
+    /// column by [`q8_0_col_sums`] exactly like the Q4_K min term — but **added**, since
+    /// Q4_1's `m` raises the value where the K-quant `dmin` subtracts. A Q4_1 block is 32
+    /// values, aligning 1:1 with the Q8_0 input blocks, so weight block `bi` dots input
+    /// block `bi` with no superblock bookkeeping. Nibble layout mirrors
+    /// `dequantize_q4_1_block`: low nibble of `qs[t]` → value `t`, high nibble → value
+    /// `t + 16`, so the low/high halves pair with input halves `x0`/`x1`.
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn gemm_q4_1_q8_0_neon_dotprod(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(k % 32, 0, "Q4_1 GEMM: k must be divisible by 32");
+        let nb = k / 32;
+        let row_bytes = nb * size_of::<BlockQ4_1>();
+        debug_assert_eq!(a_quant.len(), m * row_bytes, "Q4_1 GEMM: a_quant size");
+        debug_assert_eq!(b_quants.len(), n * k, "Q4_1 GEMM: b_quants size");
+        debug_assert_eq!(b_scales.len(), n * nb, "Q4_1 GEMM: b_scales size");
+        debug_assert_eq!(out.len(), m * n, "Q4_1 GEMM: out size");
+
+        unsafe {
+            let col_sums = q8_0_col_sums(b_quants, n, k);
+            let a_ptr = a_quant.as_ptr() as usize;
+            let bq_ptr = b_quants.as_ptr() as usize;
+            let bs_ptr = b_scales.as_ptr() as usize;
+            let cs_ptr = col_sums.as_ptr() as usize;
+
+            let compute_row = move |(i, row_out): (usize, &mut [f32])| unsafe {
+                let a = a_ptr as *const u8;
+                let bq = bq_ptr as *const i8;
+                let bs = bs_ptr as *const f32;
+                let cs = cs_ptr as *const i32;
+                let mask_0f = vdupq_n_u8(0x0F);
+                let z = vdupq_n_s32(0);
+                let row_start = i * row_bytes;
+
+                let mut j0 = 0usize;
+                while j0 < n {
+                    let cols = KQ_COLS.min(n - j0);
+                    let mut acc = [0.0f32; KQ_COLS];
+
+                    for bi in 0..nb {
+                        let blk = &*((a as usize + row_start + bi * size_of::<BlockQ4_1>())
+                            as *const BlockQ4_1);
+                        let d = half::f16::from_bits(blk.d).to_f32();
+                        let mmin = half::f16::from_bits(blk.m).to_f32();
+                        // Low nibbles → values 0..15, high nibbles → values 16..31; both
+                        // stay in `[0, 15]`, so they are non-negative as `i8`.
+                        let qb = vld1q_u8(blk.qs.as_ptr());
+                        let w_lo = vreinterpretq_s8_u8(vandq_u8(qb, mask_0f));
+                        let w_hi = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb));
+
+                        for (jj, acc_j) in acc.iter_mut().enumerate().take(cols) {
+                            let j = j0 + jj;
+                            let xp = bq.add(j * k + bi * 32);
+                            let x0 = vld1q_s8(xp);
+                            let x1 = vld1q_s8(xp.add(16));
+                            let dp = vaddvq_s32(vdotq_s32(vdotq_s32(z, w_lo, x0), w_hi, x1));
+                            let xs = *bs.add(j * nb + bi);
+                            let sx = *cs.add(j * nb + bi);
+                            *acc_j += xs * (d * dp as f32 + mmin * sx as f32);
                         }
                     }
 
@@ -2244,6 +2339,29 @@ pub(crate) mod neon {
         true
     }
 
+    /// Q4_1 × Q8_0 GEMM dispatcher. Requires `dotprod` — like the K-quants, Q4_1 has
+    /// no baseline-NEON fallback (the min term reuses [`q8_0_col_sums`], which is
+    /// `dotprod`-only). Returns `false` without writing `out` when this CPU cannot run
+    /// it, so the caller falls back to the per-token path rather than shipping a wrong
+    /// answer. Unlike the K-quants there is no `k % 256` constraint: Q4_1 blocks are 32
+    /// wide, so any `k` divisible by 32 (guaranteed by the `gemm_preq` wrapper) is fine.
+    #[allow(dead_code)]
+    pub unsafe fn gemm_q4_1_q8_0_neon(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> bool {
+        if !k_quant_gemm_available() {
+            return false;
+        }
+        unsafe { gemm_q4_1_q8_0_neon_dotprod(a_quant, b_scales, b_quants, out, m, n, k) };
+        true
+    }
+
     /// Q8_0 × Q8_0 GEMM dispatcher. Prefers i8mm (`vmmlaq_s32`) when the tier is
     /// resolved to it, else dotprod, else the emulated-integer base.
     // Only non-test consumer is `transformer::gemm_preq`, gated
@@ -2496,6 +2614,78 @@ pub(crate) mod neon {
                     assert!(
                         (got - want).abs() <= 1e-5 * (1.0 + want.abs()),
                         "col {j} row {i}: gemm={got} gemv={want}"
+                    );
+                }
+            }
+        }
+
+        /// The Q4_1 GEMM must agree with the scalar `vec_dot_q4_1_f32` reference run
+        /// column-by-column on the *same* Q8_0-quantized activations. `vec_dot_q4_1_f32`
+        /// owns the canonical `d·Σ(q·y) + m·Σy` layout and is independently tested, so a
+        /// disagreement is a real bug in the GEMM's nibble decode or min term, not
+        /// quantization noise. The tolerance is `1e-4` (not the `1e-5` the Q4_K test can
+        /// afford) because the oracle reconstructs f32 activations and dots in float,
+        /// whereas the kernel keeps the dot in exact int8 — so their float summation
+        /// order genuinely differs. `n = 11` straddles `KQ_COLS` (8): a full 8-column
+        /// pass plus a 3-column tail, so a tail bug cannot hide.
+        #[test]
+        fn q4_1_gemm_matches_scalar_vec_dot() {
+            if !require_simd_or_skip("dotprod", cpu_features().dotprod) {
+                return;
+            }
+            let (m, n, k) = (7usize, 11usize, 128usize);
+            let nb = k / 32;
+            let mut st = 0x0451_1a1au64;
+            let blocks: Vec<BlockQ4_1> = (0..m * nb)
+                .map(|_| {
+                    let mut qs = [0u8; 16];
+                    for b in qs.iter_mut() {
+                        *b = (lcg(&mut st).abs() * 255.0) as i32 as u8;
+                    }
+                    BlockQ4_1 {
+                        d: f16::from_f32(0.03 + lcg(&mut st).abs() * 0.1).to_bits(),
+                        m: f16::from_f32(lcg(&mut st) * 0.5).to_bits(),
+                        qs,
+                    }
+                })
+                .collect();
+            let a = blocks_to_bytes(&blocks);
+
+            // Column-major activations: column j is b[j*k .. (j+1)*k].
+            let b: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+            let mut b_scales = vec![0.0f32; n * nb];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let (s, q) = quantize_col(&b[j * k..(j + 1) * k]);
+                b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+
+            let mut out = vec![0.0f32; m * n];
+            unsafe { gemm_q4_1_q8_0_neon_dotprod(&a, &b_scales, &b_quants, &mut out, m, n, k) };
+
+            // Oracle: reconstruct each activation column from its Q8_0 (scale·quant) and
+            // dot it against the Q4_1 weight blocks with the scalar reference.
+            for j in 0..n {
+                let mut x = vec![0.0f32; k];
+                for bi in 0..nb {
+                    let s = b_scales[j * nb + bi];
+                    for t in 0..32 {
+                        x[bi * 32 + t] = s * b_quants[j * k + bi * 32 + t] as f32;
+                    }
+                }
+                for i in 0..m {
+                    let mut want = 0.0f32;
+                    for bi in 0..nb {
+                        want += crate::quant::vec_dot_q4_1_f32(
+                            &blocks[i * nb + bi],
+                            &x[bi * 32..(bi + 1) * 32],
+                        );
+                    }
+                    let got = out[i * n + j];
+                    assert!(
+                        (got - want).abs() <= 1e-4 * (1.0 + want.abs()),
+                        "col {j} row {i}: gemm={got} scalar={want}"
                     );
                 }
             }
@@ -4810,6 +5000,104 @@ macro_rules! int8_gemm_kernels {
             }
         }
 
+        /// Batched GEMM: `C[m, n] = A_q4_1[m, k] @ B_q8_0[k, n]`.
+        ///
+        /// Q4_1 dequant is `w = d·q + m`, `q ∈ [0, 15]` (no `−8` recenter). Per
+        /// 32-element block the contribution to column `j` is
+        /// `xs·(d·Σ(q·aq) + m·Σaq)` — the same deferred-reduction structure as
+        /// `gemm_q4_k_q8_0` (dot lanes accumulate in `facc`, the block-sum term in
+        /// `macc`), but the sum term is **added** (Q4_1's `m` is a raising offset,
+        /// unlike the K-quant `dmin` which subtracts) and there are no sub-block
+        /// scales — a Q4_1 block maps 1:1 onto a Q8_0 activation block. The 16 `qs`
+        /// bytes expand to a 32-lane weight vector matching `dequantize_q4_1_block`'s
+        /// order: low nibbles → values `0..16` (lane-0 half), high nibbles → `16..32`
+        /// (lane-1 half).
+        #[target_feature(enable = $feat)]
+        pub unsafe fn gemm_q4_1_q8_0(
+            a_quant: &[u8],
+            b_scales: &[f32],
+            b_quants: &[i8],
+            out: &mut [f32],
+            m: usize,
+            n: usize,
+            k: usize,
+        ) {
+            debug_assert_eq!(k % 32, 0, "Q4_1 GEMM: k must be divisible by 32");
+            let nb = k / 32;
+            let row_bytes = nb * size_of::<crate::quant::BlockQ4_1>();
+            debug_assert_eq!(a_quant.len(), m * row_bytes, "Q4_1 GEMM: a_quant size");
+            debug_assert_eq!(b_quants.len(), n * k, "Q4_1 GEMM: b_quants size");
+            debug_assert_eq!(b_scales.len(), n * nb, "Q4_1 GEMM: b_scales size");
+            debug_assert_eq!(out.len(), m * n, "Q4_1 GEMM: out size");
+
+            let col_sums = unsafe { q8_0_col_sums(b_quants, n, k) };
+            let cs: &[i32] = &col_sums;
+
+            let compute_row = |(i, row_out): (usize, &mut [f32])| {
+                // SAFETY: row `i` spans `a_quant[i*row_bytes..][..row_bytes]`; the
+                // debug_asserts above pin every slice length.
+                unsafe {
+                    let mask128 = _mm_set1_epi8(0x0F);
+                    let row_start = i * row_bytes;
+
+                    let mut j0 = 0usize;
+                    while j0 < n {
+                        let cols = KQ_COLS.min(n - j0);
+                        let mut facc = [_mm256_setzero_ps(); KQ_COLS];
+                        let mut macc = [0.0f32; KQ_COLS];
+
+                        for bi in 0..nb {
+                            let blk = &*(a_quant
+                                .as_ptr()
+                                .add(row_start + bi * size_of::<crate::quant::BlockQ4_1>())
+                                as *const crate::quant::BlockQ4_1);
+                            let d = half::f16::from_bits(blk.d).to_f32();
+                            let mmin = half::f16::from_bits(blk.m).to_f32();
+                            // 16 packed bytes → 32 nibble values. Low nibbles fill the
+                            // low 128-bit lane (values 0..16), high nibbles the high
+                            // lane (16..32), matching the contiguous activation block.
+                            let qb = _mm_loadu_si128(blk.qs.as_ptr() as *const __m128i);
+                            let lo = _mm_and_si128(qb, mask128);
+                            let hi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask128);
+                            let w = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+
+                            for jj in 0..cols {
+                                let j = j0 + jj;
+                                let x = _mm256_loadu_si256(
+                                    b_quants.as_ptr().add(j * k + bi * 32) as *const __m256i
+                                );
+                                let lanes = _mm256_cvtepi32_ps(dot32u(w, x));
+                                let xs = *b_scales.get_unchecked(j * nb + bi);
+                                let sx = *cs.get_unchecked(j * nb + bi);
+                                // Fold the weight (`d`) and activation (`xs`) scales into
+                                // one per-(block,column) factor, as the Q4_K kernel does.
+                                let scale = _mm256_set1_ps(xs * d);
+                                facc[jj] = _mm256_fmadd_ps(lanes, scale, facc[jj]);
+                                macc[jj] += xs * mmin * sx as f32;
+                            }
+                        }
+
+                        for jj in 0..cols {
+                            *row_out.get_unchecked_mut(j0 + jj) = hsum256_ps(facc[jj]) + macc[jj];
+                        }
+                        j0 += cols;
+                    }
+                }
+            };
+
+            if m < crate::backend::cpu::gemv_par_threshold() {
+                out.chunks_mut(n).enumerate().for_each(compute_row);
+            } else if n == 1 {
+                crate::backend::cpu::par_rows(
+                    out,
+                    crate::backend::cpu::gemv_min_rows(),
+                    |(row, yv)| compute_row((row, core::slice::from_mut(yv))),
+                );
+            } else {
+                crate::backend::cpu::par_rows_n(out, n, 64, compute_row);
+            }
+        }
+
         /// Batched GEMM: `C[m, n] = A_q6_k[m, k] @ B_q8_0[k, n]`.
         ///
         /// Q6_K geometry (mirrors `dequantize_q6_k_block`): two 128-value halves per
@@ -5103,6 +5391,7 @@ macro_rules! int8_gemm_kernels {
 //   - `dot32`   Q8_0 weights: `2 * 128 * 127 = 32512`  (fits, 255 to spare)
 //   - `dot32`   Q4_0 weights, `[-8, 7]`: `2 * 8 * 127 = 2032`
 //   - `dot32u`  Q4_K weights, `0..15`:   `2 * 15 * 127 = 3810`
+//   - `dot32u`  Q4_1 weights, `0..15`:   `2 * 15 * 127 = 3810`
 //   - `dot32u`  Q6_K weights, `0..63`:   `2 * 63 * 127 = 16002`
 //   - `dot32u`  activation sums (`w = 1`): `2 * 1 * 127 = 254`
 //
@@ -5303,6 +5592,31 @@ pub(crate) mod avx2_int8 {
             for blk in 0..m * nb {
                 v.extend_from_slice(
                     &half::f16::from_f32(0.01 + 0.004 * (blk % 7) as f32)
+                        .to_bits()
+                        .to_le_bytes(),
+                );
+                for _ in 0..16 {
+                    v.push((lcg(st) % 256) as u8);
+                }
+            }
+            v
+        }
+
+        /// Random Q4_1 weight rows (20-byte blocks: `d`, `m`, 16 nibble bytes).
+        /// `d`/`m` are controlled rather than random f16 bits (which can be
+        /// inf/NaN); the nibbles are random. `m` is deliberately negative on some
+        /// blocks so the `+m·Σ(x)` term is genuinely exercised in both signs.
+        fn q4_1_rows(m: usize, k: usize, st: &mut u64) -> Vec<u8> {
+            let nb = k / 32;
+            let mut v = Vec::with_capacity(m * nb * size_of::<crate::quant::BlockQ4_1>());
+            for blk in 0..m * nb {
+                v.extend_from_slice(
+                    &half::f16::from_f32(0.01 + 0.004 * (blk % 7) as f32)
+                        .to_bits()
+                        .to_le_bytes(),
+                );
+                v.extend_from_slice(
+                    &half::f16::from_f32(-0.05 + 0.02 * (blk % 5) as f32)
                         .to_bits()
                         .to_le_bytes(),
                 );
@@ -5969,6 +6283,53 @@ pub(crate) mod avx2_int8 {
                             );
                         }
                     }
+                }
+            }
+        }
+
+        /// Q4_1 coverage that runs on any AVX2 host.
+        ///
+        /// The x86 `gemm_q4_1_q8_0` has no aarch64 twin to lean on for these
+        /// hosts and carries the `+m·Σ(x)` min term (the piece most likely to
+        /// harbor a lane-packing or sign bug), so it needs its own parity bar —
+        /// the same reason `avx2_k_quant_gemm_matches_dequant_reference` exists
+        /// for the K-quant kernels. Reference: dequantize each Q4_1 row and dot it
+        /// against the reconstructed Q8_0 activations in f64.
+        #[test]
+        fn avx2_gemm_q4_1_matches_dequant_reference() {
+            if !require_simd_or_skip("avx2", avx2_kernels_callable()) {
+                return;
+            }
+            // n = 11 straddles KQ_COLS (8): a full 8-column pass plus a 3-column
+            // tail, so a bug at the x86 kernel's full-width→tail column boundary
+            // cannot hide (the sibling K-quant test uses n=5 and only ever hits
+            // the tail; this new kernel warrants the wider case).
+            let (m, n, k) = (3usize, 11usize, 512usize);
+            let mut st = 0x0451_7b3du64;
+            let weights = q4_1_rows(m, k, &mut st);
+            let (bs, bq) = activations(n, k, &mut st);
+            let row_bytes = (k / 32) * size_of::<crate::quant::BlockQ4_1>();
+
+            let mut got = vec![0.0f32; m * n];
+            unsafe { gemm_q4_1_q8_0(&weights, &bs, &bq, &mut got, m, n, k) };
+
+            for i in 0..m {
+                let mut w = vec![0.0f32; k];
+                crate::quant::dequantize_q4_1_row(
+                    &weights[i * row_bytes..(i + 1) * row_bytes],
+                    &mut w,
+                );
+                for j in 0..n {
+                    let mut want = 0.0f64;
+                    for e in 0..k {
+                        let xa = bs[j * (k / 32) + e / 32] * bq[j * k + e] as f32;
+                        want += (w[e] * xa) as f64;
+                    }
+                    let g = got[i * n + j] as f64;
+                    assert!(
+                        (g - want).abs() <= 1e-5 * (1.0 + want.abs()),
+                        "q4_1 [{i},{j}]: got {g} want {want}"
+                    );
                 }
             }
         }

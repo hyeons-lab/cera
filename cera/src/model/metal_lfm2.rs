@@ -198,6 +198,8 @@ struct MetalPipelines {
     gemv_f32_accum: ComputePipelineState,
     gemv_q4_0: ComputePipelineState,
     gemv_q4_0_accum: ComputePipelineState,
+    gemv_q4_1: ComputePipelineState,
+    gemv_q4_1_accum: ComputePipelineState,
     gemv_q4_0_fast: ComputePipelineState,
     #[allow(dead_code)]
     gemv_f16: ComputePipelineState,
@@ -270,6 +272,7 @@ struct MetalPipelines {
     #[allow(dead_code)]
     conv1d_fused: ComputePipelineState,
     gemm_q4_0: ComputePipelineState,
+    gemm_q4_1: ComputePipelineState,
     gemm_q4_k: ComputePipelineState,
     gemm_q8_0: ComputePipelineState,
     gemm_q6_k: ComputePipelineState,
@@ -571,6 +574,8 @@ impl MetalLfm2Model {
             gemv_f32_accum: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32_accum")?,
             gemv_q4_0: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0")?,
             gemv_q4_0_accum: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0_accum")?,
+            gemv_q4_1: ctx.create_pipeline(shaders::GEMV_Q4_1, "gemv_q4_1")?,
+            gemv_q4_1_accum: ctx.create_pipeline(shaders::GEMV_Q4_1, "gemv_q4_1_accum")?,
             gemv_q4_0_fast: ctx.create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast")?,
             gemv_f16: ctx.create_pipeline(shaders::GEMV_F16, "gemv_f16")?,
             gemv_q6_k: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k")?,
@@ -634,6 +639,7 @@ impl MetalLfm2Model {
             add_rmsnorm_batch: ctx.create_pipeline(shaders::RMSNORM_BATCH, "add_rmsnorm_batch")?,
             conv1d_fused: ctx.create_pipeline(shaders::CONV1D_FUSED, "conv1d_fused")?,
             gemm_q4_0: ctx.create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0")?,
+            gemm_q4_1: ctx.create_pipeline(shaders::GEMM_Q4_1, "gemm_q4_1")?,
             gemm_q4_k: ctx.create_pipeline(shaders::GEMM_Q4_K, "gemm_q4_k")?,
             gemm_q8_0: ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0")?,
             gemm_q6_k: ctx.create_pipeline(shaders::GEMM_Q6_K, "gemm_q6_k")?,
@@ -771,10 +777,10 @@ impl MetalLfm2Model {
             anyhow::ensure!(
                 matches!(
                     wref.dtype,
-                    DType::Q4_0 | DType::Q8_0 | DType::Q4KM | DType::Q6K | DType::F32
+                    DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q4KM | DType::Q6K | DType::F32
                 ),
                 "Metal backend has no layer-weight GEMM/GEMV kernel for dtype {:?}; \
-                 only Q4_0, Q8_0, Q4_K, Q6_K, and F32 projection weights are supported",
+                 only Q4_0, Q4_1, Q8_0, Q4_K, Q6_K, and F32 projection weights are supported",
                 wref.dtype
             );
             // The GEMM/GEMV kernels stride each row by `k / block * block_bytes`, so
@@ -1518,7 +1524,10 @@ impl MetalLfm2Model {
     /// prefill dispatch uses this to choose the batched `encode_gemm` over the
     /// per-token GEMV loop; `encode_gemm` self-guards for anything else regardless.
     fn is_batched_gemm_dtype(dtype: DType) -> bool {
-        matches!(dtype, DType::Q4_0 | DType::Q8_0 | DType::Q4KM | DType::Q6K)
+        matches!(
+            dtype,
+            DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q4KM | DType::Q6K
+        )
     }
 
     /// True GEMM with simdgroup matrix ops. Falls back to batch GEMV for small n.
@@ -1631,6 +1640,7 @@ impl MetalLfm2Model {
         let tg_cols = n.div_ceil(32);
         let gemm_pipeline = match w.dtype {
             DType::Q8_0 => &self.pipelines.gemm_q8_0,
+            DType::Q4_1 => &self.pipelines.gemm_q4_1,
             DType::Q4KM => &self.pipelines.gemm_q4_k,
             DType::Q6K => &self.pipelines.gemm_q6_k,
             _ => &self.pipelines.gemm_q4_0,
@@ -1980,6 +1990,18 @@ impl MetalLfm2Model {
                     ),
                 }
             }
+            DType::Q4_1 => (
+                // Q4_1 tensors are rare (a few mixed-quant `ffn_down` per model), so
+                // only the basic 2-rows/TG kernel is provided — no slim/fast/split-K
+                // variants like Q4_0. Correct and adequate for the handful of rows.
+                if accumulate {
+                    &self.pipelines.gemv_q4_1_accum
+                } else {
+                    &self.pipelines.gemv_q4_1
+                },
+                w.m.div_ceil(2),
+                32u64,
+            ),
             DType::Q8_0 => (
                 if accumulate {
                     &self.pipelines.gemv_q8_0_accum
