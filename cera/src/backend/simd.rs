@@ -3418,7 +3418,17 @@ pub(crate) mod neon {
         /// with 512 straddling two superblocks.
         #[test]
         fn q4_k_gemm_i8mm_matches_dotprod() {
-            if !require_simd_or_skip("i8mm", std::arch::is_aarch64_feature_detected!("i8mm")) {
+            // The body needs BOTH features: it runs the dotprod reference kernel, and
+            // the i8mm kernel itself calls the dotprod `q8_0_col_sums` for the min
+            // term. FEAT_I8MM (v8.6) implies FEAT_DotProd (v8.2) on any conformant
+            // core — and the dispatcher only reaches the i8mm kernel at tier
+            // `NeonI8mm`, which requires dotprod — but gate on both here so the test
+            // matches what it executes rather than relying on that implication.
+            if !require_simd_or_skip(
+                "i8mm",
+                std::arch::is_aarch64_feature_detected!("i8mm")
+                    && std::arch::is_aarch64_feature_detected!("dotprod"),
+            ) {
                 return;
             }
             for &(m, n, k) in &[(4usize, 4usize, 256usize), (5, 3, 512), (2, 7, 256)] {
