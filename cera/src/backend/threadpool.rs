@@ -22,18 +22,39 @@
 //! from [`super::cpu_features::core_topology`].
 //!
 //! Per dispatch, the caller writes a `Job` (output base pointer, chunk size,
-//! type-erased closure + monomorphized trampoline), bumps `epoch` (Release),
+//! type-erased closure + monomorphized trampoline) and bumps `state` (Release) —
+//! an atomic whose high bits are the **epoch** (workers wake when it changes) —
 //! then joins the steal loop as worker 0. Background workers observe the new
-//! `epoch` (Acquire) and, alongside the caller, **claim contiguous row chunks**
+//! epoch (Acquire) and, alongside the caller, **claim contiguous row chunks**
 //! from a shared `next_chunk` atomic until the row space is exhausted — dynamic
 //! work-stealing, so faster cores grab more chunks and every worker reaches the
-//! barrier together (heterogeneous big.LITTLE load balancing). Each worker then
-//! `fetch_sub`s a `pending` counter; the caller spins on `pending == 0`
-//! (Acquire) before returning. That Release/Acquire pair both (a) publishes the
-//! `Job` to workers and (b) establishes happens-before for every worker's writes
-//! to the output, so the disjoint `&mut` handoff is sound and the caller may read
-//! the output once it returns. (Each chunk index is claimed by exactly one
-//! worker, so chunks are disjoint row ranges.)
+//! barrier together (heterogeneous big.LITTLE load balancing). Each participating
+//! worker then `fetch_sub`s a `pending` counter; the caller spins on `pending ==
+//! 0` (Acquire) before returning. That Release/Acquire pair both (a) publishes
+//! the `Job` to workers and (b) establishes happens-before for every worker's
+//! writes to the output, so the disjoint `&mut` handoff is sound and the caller
+//! may read the output once it returns. (Each chunk index is claimed by exactly
+//! one worker, so chunks are disjoint row ranges.)
+//!
+//! **Active-sized barrier (prefill pool).** Only the `active` workers a dispatch
+//! needs (worker 0 = caller included) run and decrement `pending`; the rest read
+//! the same packed `state`, see `id >= active`, and skip without touching `job`
+//! or `pending`. So the barrier's shared-line `fetch_sub` storm — which bounces
+//! across the CCD fabric on a multi-die host — costs O(active), not O(pool): a
+//! small GEMM no longer drags cores it can't fill through the barrier, and idle
+//! workers are left to park (spinning them back up re-reads the cross-die
+//! `state` and measured the win back away). Packing `active` *with* the epoch is
+//! what makes this race-free: an idle worker can't read an `active` from a newer
+//! epoch than the one it observed, so it never runs a `job` the dispatcher has
+//! already retired. `active` is chosen from the row count and, for prefill GEMMs,
+//! an arithmetic-work cap (see `GEMM_WORK_PER_WORKER`).
+//!
+//! The **decode pool** instead uses a *full* barrier (`Shared::active_barrier ==
+//! false`): every worker decrements and is kept unparked. Decode alternates many
+//! tiny GEMVs (few active) with the huge vocab GEMV (all active), and keeping the
+//! whole pool hot beats parking/re-waking it — the active-sized barrier measured
+//! −15% there. Decode is memory-bound and narrow, so it never pays the multi-die
+//! barrier tax the prefill GEMMs do.
 //!
 //! Between GEMVs (µs apart) workers spin. Between tokens (ms idle) a bounded spin
 //! falls back to [`std::thread::park`]; the caller `unpark`s on the next
@@ -128,6 +149,10 @@ struct Job {
     /// Total rows = `y.len() / n`.
     total_rows: usize,
     /// Workers participating this dispatch (`≤` pool size), worker 0 included.
+    /// Read by the *full*-barrier (decode) worker path to decide whether it runs,
+    /// keeping that path byte-identical to the pre-active-barrier pool. The
+    /// active-barrier (prefill) path instead reads `active` from the packed
+    /// `state` (so an idle worker can skip without touching `job`).
     active: usize,
     /// Type-erased `&F` — the per-row closure, borrowed for the dispatch.
     closure: *const (),
@@ -160,12 +185,26 @@ unsafe fn trampoline<F: Fn(usize, &mut [f32]) + Sync>(
 
 /// Shared state between the dispatcher and the background workers.
 struct Shared {
-    /// Bumped once per dispatch; workers wake when it changes.
-    epoch: AtomicU64,
+    /// Active-sized barrier (prefill pool) vs full barrier (decode pool). When
+    /// `true`, only the `active` workers a dispatch needs decrement `pending`
+    /// (`pending == active - 1`) and idle workers skip untouched — the O(active)
+    /// barrier that unblocks small prefill GEMMs. When `false`, *every* worker
+    /// decrements (`pending == num_threads - 1`), keeping the whole pool engaged
+    /// each dispatch: decode alternates tiny GEMVs with the huge vocab GEMV and
+    /// wants all workers hot (an active-sized barrier there measured −15% decode,
+    /// as parking then re-waking workers costs more than it saves). Immutable
+    /// after `build`.
+    active_barrier: bool,
+    /// Packed `(epoch, active)` — see [`pack_state`]. Bumped once per dispatch;
+    /// workers wake when the epoch changes and read `active` from the same load.
+    state: AtomicU64,
     /// Next unclaimed chunk index. Active workers (and the caller) claim chunks
-    /// via `fetch_add`; reset to 0 before each dispatch's `epoch` bump.
+    /// via `fetch_add`; reset to 0 before each dispatch's `state` bump.
     next_chunk: AtomicUsize,
-    /// Active background workers still running the current job.
+    /// Background workers the dispatcher still waits on, reaching 0 when the
+    /// dispatch has drained. Under the active-sized barrier this is `active - 1`
+    /// (only participating workers decrement); under the full barrier it is
+    /// `num_threads - 1` (every background worker decrements).
     pending: AtomicUsize,
     /// Set on drop to release the workers.
     shutdown: AtomicBool,
@@ -187,6 +226,82 @@ const STEAL_CHUNKS_PER_WORKER: usize = 4;
 /// Floor on chunk size: below this, per-chunk atomic + kernel-setup overhead
 /// starts to matter and contiguous streaming gets choppy.
 const MIN_CHUNK_ROWS: usize = 16;
+
+/// Default MAC count assigned to one prefill-GEMM worker before another is
+/// added (the [`RowPool::dispatch_rows_work`] cap). A small GEMM — a tiny model
+/// and/or a short prompt — has little total arithmetic to share; spreading it
+/// across every core makes them contend on the dispatch barrier and the memory
+/// bus for no compute payoff. Because the barrier's `fetch_sub` now runs only
+/// across the `active` workers (the packed-`active` protocol, see
+/// [`pack_state`]), capping `active` at `total_macs / GEMM_WORK_PER_WORKER`
+/// keeps that shared-line storm off the cores the GEMM can't fill — decisive on
+/// a multi-CCD host, where an unneeded worker's `fetch_sub` bounces the barrier
+/// line across the inter-die fabric.
+///
+/// **There is no globally correct value; do not "fix" this without data.**
+/// Measured on a Ryzen AI MAX+ 395 (16 Zen 5 cores = 2×8-core CCDs, VNNI),
+/// prefill tok/s of this build vs origin, interleaved 2-binary A/B:
+///
+/// | model               | pp64  | pp512 |
+/// |---------------------|------:|------:|
+/// | SmolLM-135M Q4_0     |  +93% |  +38% |
+/// | LFM2.5-230M Q4_K_M   |  +24% |  +15% |
+/// | Llama-3.2-1B Q8_0    |  +15% |   +4% |
+///
+/// The win is largest where the arithmetic is smallest (tiny model / short
+/// prompt); the big model, whose GEMMs stay above the cap, still gains (its
+/// narrow k/v projections and short-prompt GEMMs cap down). A larger quantum
+/// (≥ ~96M here) over-caps and *regresses* short prompts; this value is the
+/// conservative end of the safe range, so it caps only genuinely small GEMMs and
+/// stays correct-or-harmless on the single-CCD / high-bandwidth hosts it was not
+/// measured on.
+/// `CERA_GEMM_WORK_PER_WORKER` overrides it for per-device tuning, matching the
+/// `CERA_MIN_ROWS` / `CERA_PREQUANT_MIN_COLS` knob style.
+const GEMM_WORK_PER_WORKER_DEFAULT: usize = 48_000_000;
+
+/// Resolved [`GEMM_WORK_PER_WORKER_DEFAULT`], read once. Uses the same
+/// [`env_usize`](super::cpu_features::env_usize) parser as `CERA_MIN_ROWS` /
+/// `CERA_PREQUANT_MIN_COLS` (trimmed, `>= 1`), so a `0`, whitespace-padded, or
+/// unparseable override falls back to the default — the knob can only retune the
+/// threshold, never zero it (a `0` quantum would divide-by-zero the cap).
+fn gemm_work_per_worker() -> usize {
+    static Q: OnceLock<usize> = OnceLock::new();
+    *Q.get_or_init(|| {
+        super::cpu_features::env_usize("CERA_GEMM_WORK_PER_WORKER")
+            .unwrap_or(GEMM_WORK_PER_WORKER_DEFAULT)
+    })
+}
+
+/// The pool's dispatch state, packed into one atomic so a worker learns both
+/// facts from a single load: the **epoch** (high bits, bumped once per dispatch
+/// — workers wake when it changes) and the **active** worker count (low
+/// [`ACTIVE_BITS`]; how many workers, worker 0 = caller included, run this
+/// dispatch). Packing them is what lets an *idle* worker (`id >= active`) skip a
+/// dispatch without reading the overwritable `job` or touching `pending`: it can
+/// never read an `active` that belongs to a different epoch than the one it just
+/// observed, so there is no torn `(epoch, active)` pair and no double-run. The
+/// barrier then waits on only `active - 1` background workers, so a small GEMM
+/// never wakes the far CCD — whose cross-fabric `pending`/steal traffic is the
+/// tax that made a 16-wide prefill dispatch slower than an 8-wide one.
+const ACTIVE_BITS: u64 = 16;
+const ACTIVE_MASK: u64 = (1 << ACTIVE_BITS) - 1;
+
+#[inline]
+fn pack_state(epoch: u64, active: usize) -> u64 {
+    debug_assert!(
+        active as u64 <= ACTIVE_MASK,
+        "active {active} exceeds ACTIVE_MASK ({ACTIVE_MASK})"
+    );
+    (epoch << ACTIVE_BITS) | (active as u64 & ACTIVE_MASK)
+}
+#[inline]
+fn state_epoch(state: u64) -> u64 {
+    state >> ACTIVE_BITS
+}
+#[inline]
+fn state_active(state: u64) -> usize {
+    (state & ACTIVE_MASK) as usize
+}
 
 /// Claim and run chunks from `shared.next_chunk` until the row space is
 /// exhausted. Shared by the caller (worker 0) and every active background
@@ -263,7 +378,10 @@ impl RowPool {
         static POOL: OnceLock<RowPool> = OnceLock::new();
         POOL.get_or_init(|| {
             let topo = super::cpu_features::core_topology();
-            RowPool::build(topo.perf_core_count, &topo.pin_cores)
+            // Active-sized barrier: prefill GEMMs vary widely in size, and a
+            // small one is better run on the few cores its work can fill than
+            // dragged across the whole pool's barrier (see `Shared::active_barrier`).
+            RowPool::build(topo.perf_core_count, &topo.pin_cores, true)
         })
     }
 
@@ -277,7 +395,9 @@ impl RowPool {
         POOL.get_or_init(|| {
             let topo = super::cpu_features::core_topology();
             let n = super::calibrate::decode_thread_count(topo);
-            RowPool::build(n, &topo.pin_cores)
+            // Full barrier: decode wants every worker hot across its tiny-GEMV /
+            // huge-vocab-GEMV mix (see `Shared::active_barrier`).
+            RowPool::build(n, &topo.pin_cores, false)
         })
     }
 
@@ -286,8 +406,11 @@ impl RowPool {
     /// empty ⇒ no pinning (macOS/desktop). Spawn failures degrade the thread
     /// count rather than panicking. The pool pins *and claims the process-wide
     /// caller pin for* whatever thread first dispatches.
-    fn build(num_threads: usize, pin_cores: &[usize]) -> RowPool {
-        let num_threads = num_threads.max(1);
+    fn build(num_threads: usize, pin_cores: &[usize], active_barrier: bool) -> RowPool {
+        // `active` (≤ num_threads) is packed into the low `ACTIVE_BITS` of the
+        // dispatch state; no real host has this many cores, but keep the pool
+        // within the field rather than silently corrupt the epoch above it.
+        let num_threads = num_threads.max(1).min(ACTIVE_MASK as usize);
         // Spin iterations before an idle worker parks. `CERA_SPIN` overrides the
         // default for tuning the spin-vs-park trade-off on a given device.
         let spin_limit = std::env::var("CERA_SPIN")
@@ -295,7 +418,8 @@ impl RowPool {
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(SPIN_BEFORE_PARK);
         let shared = Arc::new(Shared {
-            epoch: AtomicU64::new(0),
+            active_barrier,
+            state: AtomicU64::new(0),
             next_chunk: AtomicUsize::new(0),
             pending: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
@@ -457,7 +581,49 @@ impl RowPool {
     ) where
         F: Fn(usize, &mut [f32]) + Sync,
     {
-        debug_assert!(n >= 1, "dispatch_rows_chunked: n must be ≥ 1");
+        self.dispatch_inner(y, n, min_rows, min_chunk_rows, 0, f);
+    }
+
+    /// Like [`RowPool::dispatch_rows`], but caps the active worker count by the
+    /// dispatch's total arithmetic so a small GEMM doesn't fork wider than its
+    /// work can fill. `depth` is the contraction length `k`; total work is
+    /// `y.len() * depth` MACs, capped at `total_macs / GEMM_WORK_PER_WORKER`
+    /// workers. Under the active-sized barrier only those workers take part, so
+    /// trimming the count for a narrow GEMM directly sheds the barrier +
+    /// memory-bus contention its work can't amortize — on a tiny model (or a
+    /// short prompt) a large prefill win. Uses the default steal-chunk floor.
+    ///
+    /// `depth == 0` disables the work cap (the plain row-count gate), so callers
+    /// with no depth notion keep the previous behaviour.
+    pub fn dispatch_rows_work<F>(
+        &self,
+        y: &mut [f32],
+        n: usize,
+        min_rows: usize,
+        depth: usize,
+        f: F,
+    ) where
+        F: Fn(usize, &mut [f32]) + Sync,
+    {
+        self.dispatch_inner(y, n, min_rows, MIN_CHUNK_ROWS, depth, f);
+    }
+
+    /// Shared body of the `dispatch_rows*` family: split off any trailing
+    /// partial row (run on the caller, matching serial `chunks_mut(n)`
+    /// semantics), then run the exact rows in parallel. `depth` feeds the
+    /// work-based active cap (`0` = no cap); `min_chunk_rows` the steal floor.
+    fn dispatch_inner<F>(
+        &self,
+        y: &mut [f32],
+        n: usize,
+        min_rows: usize,
+        min_chunk_rows: usize,
+        depth: usize,
+        f: F,
+    ) where
+        F: Fn(usize, &mut [f32]) + Sync,
+    {
+        debug_assert!(n >= 1, "dispatch_inner: n must be ≥ 1");
         if n == 0 || y.is_empty() {
             return;
         }
@@ -466,7 +632,7 @@ impl RowPool {
         // Split off any trailing partial row now; it runs on the caller after
         // the full rows (the parallel body only handles exact rows).
         let (body, tail) = y.split_at_mut(total_rows * n);
-        self.dispatch_body(body, n, total_rows, min_rows, min_chunk_rows, &f);
+        self.dispatch_body(body, n, total_rows, min_rows, min_chunk_rows, depth, &f);
         if !tail.is_empty() {
             f(total_rows, tail);
         }
@@ -474,6 +640,7 @@ impl RowPool {
 
     /// The parallel body of [`RowPool::dispatch_rows`]: exactly `total_rows`
     /// full rows of `n` elements (`y.len() == total_rows * n`).
+    #[allow(clippy::too_many_arguments)] // internal fan-out knobs, all load-bearing
     fn dispatch_body<F>(
         &self,
         y: &mut [f32],
@@ -481,6 +648,7 @@ impl RowPool {
         total_rows: usize,
         min_rows: usize,
         min_chunk_rows: usize,
+        depth: usize,
         f: &F,
     ) where
         F: Fn(usize, &mut [f32]) + Sync,
@@ -492,7 +660,22 @@ impl RowPool {
         // `active` = how many workers participate, gated by `min_rows` so small
         // ops don't wake the whole pool. Within `active`, work is stolen (below).
         let rows_per_worker = total_rows.div_ceil(self.num_threads).max(min_rows);
-        let active = total_rows.div_ceil(rows_per_worker).min(self.num_threads);
+        let mut active = total_rows.div_ceil(rows_per_worker).min(self.num_threads);
+
+        // Work cap: a GEMM with little total arithmetic can't keep the whole
+        // pool busy, and only the `active` workers chosen here take part in the
+        // barrier (`pending == active - 1`), so trimming `active` for a narrow
+        // GEMM directly avoids waking — and cross-fabric-taxing — cores it can't
+        // fill. Cap `active` so each participating worker gets ≥ one work
+        // quantum. `total_rows * n` is the output element count; `* depth` (the
+        // contraction length `k`) makes it the MAC count. `depth == 0` disables
+        // the cap (element-wise / no-depth callers), preserving their prior
+        // width.
+        if depth != 0 {
+            let total_macs = total_rows.saturating_mul(n).saturating_mul(depth);
+            let work_cap = (total_macs / gemm_work_per_worker()).clamp(1, self.num_threads);
+            active = active.min(work_cap);
+        }
 
         // One dispatch owns the pool at a time. If another thread is mid-
         // dispatch (or a closure re-entered the pool), fall back to the serial
@@ -552,30 +735,53 @@ impl RowPool {
         if self.shared.panicked.load(Ordering::Relaxed) {
             drop(self.take_panic_payload());
         }
-        // SAFETY: no worker reads `job` until it observes the `epoch` bump below,
-        // which is Released after this write; the previous dispatch already
-        // drained (`pending == 0`) before releasing the dispatch lock.
+        // SAFETY: no worker reads `job` until it observes the `state` epoch bump
+        // below, which is Released after this write; the previous dispatch
+        // already drained (`pending == 0`) before releasing the dispatch lock.
         unsafe {
             *self.shared.job.get() = Some(job);
         }
         // Reset the chunk cursor for this dispatch (ordered before workers can
-        // claim by the `epoch` Release/Acquire below).
+        // claim by the `state` Release/Acquire below).
         self.shared.next_chunk.store(0, Ordering::Relaxed);
-        // Every spawned worker decrements `pending` this epoch — including the
-        // ones that do no work (`id >= active`) — so the dispatcher waits for
-        // *all* of them to finish reading `job` before it can overwrite it on
-        // the next dispatch. Without this full barrier an idle worker's `job`
-        // read races the next write (a data race Miri catches). Because the
-        // dispatcher blocks until fully drained before bumping `epoch` again,
-        // each worker observes every epoch exactly once (no skipped epochs).
-        self.shared
-            .pending
-            .store(self.num_threads - 1, Ordering::Release);
-        self.shared.epoch.fetch_add(1, Ordering::Release);
-        // Wake any parked workers. Unparking a non-participating (idle) worker is
-        // harmless — it observes the epoch, sees `id >= active`, and re-waits.
-        for h in &self.workers {
-            h.thread().unpark();
+        // Publish the dispatch. Two barrier shapes (see `Shared::active_barrier`):
+        //
+        // - **Active-sized (prefill):** only the `active` workers (worker 0 =
+        //   caller included) take part, so `pending == active - 1` and only they
+        //   are unparked. An idle worker (`id >= active`) reads the packed `state`,
+        //   sees it's idle, and skips — never touching `job` or `pending`, so its
+        //   `fetch_sub` never bounces the barrier line across the CCD fabric. This
+        //   is race-free because `active` is packed *with* the epoch (see
+        //   [`pack_state`]): an idle worker can't read an `active` from a newer
+        //   epoch than the one it observed, so it never acts on a retired `job`.
+        //   The dispatcher drains fully before the next epoch bump, so each active
+        //   worker observes every epoch it participates in exactly once.
+        //
+        // - **Full (decode):** byte-identical to the pre-active-barrier pool —
+        //   `pending == num_threads - 1`, a plain `state.fetch_add(1)` that just
+        //   changes the word so workers wake (this pool never unpacks `state`, so
+        //   which bits move is irrelevant — it's only a monotonic change-detector),
+        //   all workers unparked, and each worker decides via `job.active`. Decode
+        //   is narrow and memory-bound and wants the whole pool kept hot across
+        //   its tiny-GEMV / huge-vocab-GEMV mix, so it pays neither the
+        //   active-sizing nor the packed-`state` plumbing.
+        if self.shared.active_barrier {
+            self.shared.pending.store(active - 1, Ordering::Release);
+            let next_epoch = state_epoch(self.shared.state.load(Ordering::Relaxed)) + 1;
+            self.shared
+                .state
+                .store(pack_state(next_epoch, active), Ordering::Release);
+            for h in self.workers.iter().take(active - 1) {
+                h.thread().unpark();
+            }
+        } else {
+            self.shared
+                .pending
+                .store(self.num_threads - 1, Ordering::Release);
+            self.shared.state.fetch_add(1, Ordering::Release);
+            for h in &self.workers {
+                h.thread().unpark();
+            }
         }
 
         // From here until the barrier drains, workers hold raw pointers into
@@ -650,8 +856,14 @@ impl Drop for DrainGuard<'_> {
 impl Drop for RowPool {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::Release);
-        // Bump epoch + unpark so spinning/parked workers observe shutdown.
-        self.shared.epoch.fetch_add(1, Ordering::Release);
+        // Bump the epoch + unpark so spinning/parked workers observe shutdown.
+        // `fetch_add(1 << ACTIVE_BITS)` steps the epoch field (leaving the stale
+        // `active` bits — they don't matter): `shutdown` is Released *before*
+        // this store, so any worker that Acquire-observes the new epoch also
+        // sees `shutdown == true` and returns before reading `job`.
+        self.shared
+            .state
+            .fetch_add(1 << ACTIVE_BITS, Ordering::Release);
         for h in &self.workers {
             h.thread().unpark();
         }
@@ -667,18 +879,49 @@ fn worker_loop(shared: Arc<Shared>, worker_id: usize, pin_core: Option<usize>, s
     if let Some(core) = pin_core {
         let _ = pin_current_thread_to_core(core);
     }
-    let mut last_epoch = 0u64;
+    // Run this worker's chunks of `job`, catching a closure panic so the worker
+    // still reaches its `pending` decrement (a dead worker would wedge the pool);
+    // the dispatcher re-raises the panic on the calling thread after the drain.
+    let run_job = |shared: &Shared, job: &Job| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            steal_and_run(shared, job);
+        }));
+        if let Err(payload) = result {
+            let mut slot = shared
+                .panic_payload
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if slot.is_none() {
+                *slot = Some(payload);
+                drop(slot);
+            } else {
+                // Another worker already stored its payload. Leak this one rather
+                // than dropping it here: a payload whose `Drop` panics would unwind
+                // past the `pending` decrement below and wedge the pool.
+                drop(slot);
+                std::mem::forget(payload);
+            }
+            shared.panicked.store(true, Ordering::Release);
+        }
+    };
+
+    let mut last_state = 0u64;
     loop {
-        // Wait for a new epoch (or shutdown).
+        // Wait for a new dispatch (or shutdown). Every dispatch changes the
+        // `state` word — the active-sized barrier bumps the epoch in the high bits
+        // (`pack_state`), the full barrier `fetch_add(1)`s the low bits as a bare
+        // counter — so a raw-value change is the wake signal in either mode.
         let mut spins = 0u32;
         let mut parked = false;
+        let state;
         loop {
             if shared.shutdown.load(Ordering::Acquire) {
                 return;
             }
-            let e = shared.epoch.load(Ordering::Acquire);
-            if e != last_epoch {
-                last_epoch = e;
+            let st = shared.state.load(Ordering::Acquire);
+            if st != last_state {
+                last_state = st;
+                state = st;
                 break;
             }
             // Saturating so a long idle wait (huge `CERA_SPIN`, or repeated
@@ -706,46 +949,38 @@ fn worker_loop(shared: Arc<Shared>, worker_id: usize, pin_core: Option<usize>, s
         if parked && let Some(core) = pin_core {
             let _ = pin_current_thread_to_core(core);
         }
-        // SAFETY: the Acquire load of `epoch` above synchronizes with the
-        // dispatcher's Release bump, so this fresh `Job` (written before that
-        // bump) is visible and its pointers are live until we decrement below.
-        let job = match unsafe { *shared.job.get() } {
-            Some(job) => job,
-            None => continue,
-        };
-        if worker_id < job.active {
-            // Steal contiguous chunks until the row space is exhausted (fast
-            // cores claim more, balancing heterogeneous cores). A panicking
-            // closure is caught so this worker still reaches the `pending`
-            // decrement below — otherwise the dispatcher (and every future
-            // dispatch) would wait forever on a dead worker. The dispatcher
-            // re-raises the panic on the calling thread after the drain.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                steal_and_run(&shared, &job);
-            }));
-            if let Err(payload) = result {
-                let mut slot = shared
-                    .panic_payload
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                if slot.is_none() {
-                    *slot = Some(payload);
-                    drop(slot);
-                } else {
-                    // Another worker already stored its payload. Leak this one
-                    // rather than dropping it here: a payload whose `Drop`
-                    // panics would unwind past the `pending` decrement below
-                    // and wedge the pool.
-                    drop(slot);
-                    std::mem::forget(payload);
-                }
-                shared.panicked.store(true, Ordering::Release);
+        // SAFETY (both arms): the Acquire load of `state` above synchronizes with
+        // the dispatcher's Release bump, so the fresh `Job` (written before that
+        // bump) is visible and its pointers are live until this worker decrements
+        // `pending` below.
+        if shared.active_barrier {
+            // Active-sized barrier: `active` rides the same atomic as the epoch
+            // (see [`pack_state`]), so it can't name a newer dispatch whose `job`
+            // the dispatcher has retired. An idle worker (`id >= active`) skips
+            // *entirely* — no `job` read, no `pending` touch — so its `fetch_sub`
+            // never bounces the barrier line across the CCD fabric.
+            if worker_id >= state_active(state) {
+                continue;
             }
+            if let Some(job) = unsafe { *shared.job.get() } {
+                run_job(&shared, &job);
+            }
+            shared.pending.fetch_sub(1, Ordering::Release);
+        } else {
+            // Full barrier: byte-identical to the pre-active-barrier pool. Every
+            // worker reads `job`, runs iff `id < job.active`, and decrements — so
+            // the dispatcher's `pending == num_threads - 1` wait covers every
+            // worker's `job` access this epoch. A `None` job (only on the
+            // shutdown/spurious path) skips the decrement, as before.
+            let job = match unsafe { *shared.job.get() } {
+                Some(job) => job,
+                None => continue,
+            };
+            if worker_id < job.active {
+                run_job(&shared, &job);
+            }
+            shared.pending.fetch_sub(1, Ordering::Release);
         }
-        // Signal completion *after* the `job` read + any work — including idle
-        // workers (`id >= job.active`) — so the dispatcher's `pending == 0` wait
-        // covers every worker's access to `job` this epoch (see `dispatch_rows`).
-        shared.pending.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -776,27 +1011,30 @@ mod tests {
     #[test]
     fn dispatch_matches_serial_across_shapes_and_threads() {
         // Fill each row with a function of its absolute index; compare pool
-        // output to the serial reference for several sizes, `n`, and pool sizes.
-        for &num_threads in &[1usize, 2, 4, 7] {
-            let pool = RowPool::build(num_threads, &[]);
-            for &n in &[1usize, 3, 8] {
-                for &total_rows in &[0usize, 1, 5, 256, 1000] {
-                    let len = total_rows * n;
-                    let mut got = vec![0.0f32; len];
-                    let mut want = vec![0.0f32; len];
-                    let fill = |row: usize, slice: &mut [f32]| {
-                        for (k, v) in slice.iter_mut().enumerate() {
-                            *v = (row * 100 + k) as f32;
+        // output to the serial reference for several sizes, `n`, and pool sizes,
+        // under both barrier modes (active-sized = prefill, full = decode).
+        for &active_barrier in &[true, false] {
+            for &num_threads in &[1usize, 2, 4, 7] {
+                let pool = RowPool::build(num_threads, &[], active_barrier);
+                for &n in &[1usize, 3, 8] {
+                    for &total_rows in &[0usize, 1, 5, 256, 1000] {
+                        let len = total_rows * n;
+                        let mut got = vec![0.0f32; len];
+                        let mut want = vec![0.0f32; len];
+                        let fill = |row: usize, slice: &mut [f32]| {
+                            for (k, v) in slice.iter_mut().enumerate() {
+                                *v = (row * 100 + k) as f32;
+                            }
+                        };
+                        pool.dispatch_rows(&mut got, n, 64, fill);
+                        for row in 0..total_rows {
+                            fill(row, &mut want[row * n..row * n + n]);
                         }
-                    };
-                    pool.dispatch_rows(&mut got, n, 64, fill);
-                    for row in 0..total_rows {
-                        fill(row, &mut want[row * n..row * n + n]);
+                        assert_eq!(
+                            got, want,
+                            "mismatch: barrier={active_barrier} threads={num_threads} n={n} rows={total_rows}"
+                        );
                     }
-                    assert_eq!(
-                        got, want,
-                        "mismatch: threads={num_threads} n={n} rows={total_rows}"
-                    );
                 }
             }
         }
@@ -807,7 +1045,7 @@ mod tests {
         // A concurrency-stress check for the disjoint partition: each row adds 1
         // to a counter; after dispatch every counter must be exactly 1 (no lost
         // or double writes).
-        let pool = RowPool::build(4, &[]);
+        let pool = RowPool::build(4, &[], true);
         let total_rows = 10_000usize;
         let mut counts = vec![0.0f32; total_rows];
         pool.dispatch_rows(&mut counts, 1, 1, |_row, slice| {
@@ -820,7 +1058,7 @@ mod tests {
     fn repeated_dispatches_reuse_workers() {
         // Same pool, many dispatches — exercises the epoch/park/unpark cycle and
         // confirms the workers stay correct across rounds.
-        let pool = RowPool::build(4, &[]);
+        let pool = RowPool::build(4, &[], true);
         let mut y = vec![0.0f32; 2048];
         for iter in 0..50 {
             pool.dispatch_rows(&mut y, 1, 1, |row, slice| {
@@ -833,8 +1071,68 @@ mod tests {
     }
 
     #[test]
+    fn varying_active_across_dispatches_is_correct() {
+        // Stress the idle→active transition that the packed-(epoch, active)
+        // barrier must get right: on a wide pool, alternate a 1-row dispatch
+        // (only worker 0 active, every background worker idle) with a full-width
+        // one, many times. A worker idle one epoch must participate correctly the
+        // next — and an idle worker must never touch `job`/`pending` for an epoch
+        // it skipped (a double-run or missed decrement would corrupt the next
+        // dispatch). Each dispatch fully overwrites `y`, so any stale/double run
+        // or lost row is caught. Run under Miri, this exercises the data-race and
+        // Stacked-Borrows discipline of the `active`-gated `job` read. Both
+        // barrier modes: the active-sized barrier is where idle workers skip the
+        // decrement, but the full barrier's idle-worker decrement must stay sound
+        // under the same swing too.
+        for &active_barrier in &[true, false] {
+            for &num_threads in &[2usize, 4, 8] {
+                let pool = RowPool::build(num_threads, &[], active_barrier);
+                for iter in 0..60usize {
+                    // Swing `active` between 1 (narrow) and the full width.
+                    let total_rows = if iter % 2 == 0 { 1 } else { 2048 };
+                    let mut y = vec![0.0f32; total_rows];
+                    pool.dispatch_rows(&mut y, 1, 1, |row, slice| slice[0] = (row + iter) as f32);
+                    for (row, &v) in y.iter().enumerate() {
+                        assert_eq!(
+                            v,
+                            (row + iter) as f32,
+                            "barrier={active_barrier} threads={num_threads} iter={iter} row={row}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_rows_work_matches_serial() {
+        // The work-cap only changes *how many* (and thus which) workers run a
+        // row, never the per-row result. Across depths (⇒ different `active`
+        // caps) the output must still equal the serial reference, with no row
+        // lost when the cap idles most of the pool.
+        let pool = RowPool::build(8, &[], true);
+        for &depth in &[0usize, 1, 4096, 1_000_000] {
+            for &total_rows in &[0usize, 1, 3, 64, 500] {
+                let n = 4;
+                let mut got = vec![0.0f32; total_rows * n];
+                let mut want = vec![0.0f32; total_rows * n];
+                let fill = |row: usize, slice: &mut [f32]| {
+                    for (k, v) in slice.iter_mut().enumerate() {
+                        *v = (row * 7 + k) as f32;
+                    }
+                };
+                pool.dispatch_rows_work(&mut got, n, 1, depth, fill);
+                for row in 0..total_rows {
+                    fill(row, &mut want[row * n..row * n + n]);
+                }
+                assert_eq!(got, want, "depth={depth} rows={total_rows}");
+            }
+        }
+    }
+
+    #[test]
     fn single_thread_pool_runs_serially() {
-        let pool = RowPool::build(1, &[]);
+        let pool = RowPool::build(1, &[], true);
         assert_eq!(pool.num_threads(), 1);
         let mut y = vec![0.0f32; 100];
         pool.dispatch_rows(&mut y, 1, 1, |row, slice| slice[0] = row as f32);
@@ -845,7 +1143,7 @@ mod tests {
     fn trailing_partial_row_matches_serial_chunks() {
         // y.len() % n != 0: the tail must be visited with the short slice,
         // exactly like the serial `chunks_mut(n)` fallback.
-        let pool = RowPool::build(4, &[]);
+        let pool = RowPool::build(4, &[], true);
         let n = 8usize;
         let len = 8 * 300 + 5; // 300 full rows + a 5-element tail
         let mut got = vec![0.0f32; len];
@@ -866,7 +1164,7 @@ mod tests {
     fn concurrent_dispatchers_are_safe() {
         // Two threads dispatching on the same pool simultaneously: the loser of
         // the dispatch lock runs serially — both outputs must still be exact.
-        let pool = RowPool::build(4, &[]);
+        let pool = RowPool::build(4, &[], true);
         for _ in 0..20 {
             let mut a = vec![0.0f32; 4096];
             let mut b = vec![0.0f32; 4096];
@@ -882,7 +1180,7 @@ mod tests {
 
     #[test]
     fn worker_panic_propagates_and_pool_survives() {
-        let pool = RowPool::build(4, &[]);
+        let pool = RowPool::build(4, &[], true);
         let mut y = vec![0.0f32; 4096];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             pool.dispatch_rows(&mut y, 1, 1, |row, slice| {
