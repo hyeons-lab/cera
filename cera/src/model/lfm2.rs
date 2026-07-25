@@ -774,11 +774,11 @@ impl Lfm2Model {
             };
             let attn_out = &mut state.scratch.attn_out[..cfg.hidden_size];
             let q = &state.scratch.q[..cfg.hidden_size];
-            let scores = &mut state.scratch.scores;
 
             if use_tq_keys || use_tq_values {
                 // GQA batched path — one score buffer per group, shared
                 // between the key score and value weighted-sum stages.
+                let scores = &mut state.scratch.scores;
                 let rotation = tq_rotation.unwrap();
                 let cfg_tq = tq_config.unwrap();
                 let qr_scratch = state.tq_query_scratch.as_mut().unwrap();
@@ -860,57 +860,32 @@ impl Lfm2Model {
                 }
             } else {
                 // Non-TQ path: f16 (widen-on-read) or f32. Only the active
-                // representation is non-empty; branch on `use_f16` per head.
-                scores.resize(seq_len, 0.0);
-                for h in 0..cfg.n_heads {
-                    let kv_h = h / group_size;
-                    let q_head = &q[h * head_dim..(h + 1) * head_dim];
-                    let kv_h_offset = kv_h * head_dim;
-                    let head_out = &mut attn_out[h * head_dim..(h + 1) * head_dim];
-                    if use_f16 {
-                        cpu::attn_scores_f16(
-                            q_head,
-                            k_cache_f16,
-                            scores,
-                            kv_dim,
-                            kv_h_offset,
-                            head_dim,
-                            scale,
-                            seq_len,
-                        );
-                        cpu::softmax_inplace(scores);
-                        cpu::attn_values_f16(
-                            scores,
-                            v_cache_f16,
-                            head_out,
-                            kv_dim,
-                            kv_h_offset,
-                            head_dim,
-                            seq_len,
-                        );
-                    } else {
-                        cpu::attn_scores(
-                            q_head,
-                            k_cache,
-                            scores,
-                            kv_dim,
-                            kv_h_offset,
-                            head_dim,
-                            scale,
-                            seq_len,
-                        );
-                        cpu::softmax_inplace(scores);
-                        cpu::attn_values(
-                            scores,
-                            v_cache,
-                            head_out,
-                            kv_dim,
-                            kv_h_offset,
-                            head_dim,
-                            seq_len,
-                        );
+                // representation is non-empty. Shared with the dense
+                // transformers, which run the identical head loop.
+                let kv = if use_f16 {
+                    transformer::KvView::F16 {
+                        k: k_cache_f16,
+                        v: v_cache_f16,
                     }
-                }
+                } else {
+                    transformer::KvView::F32 {
+                        k: k_cache,
+                        v: v_cache,
+                    }
+                };
+                transformer::decode_attention(
+                    q,
+                    &kv,
+                    &transformer::DecodeAttnDims {
+                        n_heads: cfg.n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        scale,
+                        seq_len,
+                    },
+                    attn_out,
+                    &mut state.scratch.scores,
+                );
             }
         }
 
@@ -1813,6 +1788,13 @@ impl Lfm2Model {
                             // TurboQuant path: per-token attention using the
                             // compressed KV cache. Re-extract post-RoPE Q from
                             // q_mat for each token.
+                            // `reserve` counts from the current length, and a
+                            // preceding decode may have left this buffer laid
+                            // out as one row per head. Drop that layout first so
+                            // the hint means "capacity for this prefill" rather
+                            // than "decode arena plus this prefill"; the loop
+                            // below resizes and the kernels fully overwrite.
+                            state.scratch.scores.clear();
                             state.scratch.scores.reserve((start_pos + n) * group_size);
                             for j in 0..n {
                                 let q = &mut state.scratch.q[..hs];
@@ -1961,6 +1943,13 @@ impl Lfm2Model {
                                     _ => unreachable!(),
                                 }
                             };
+                            // `reserve` counts from the current length, and a
+                            // preceding decode may have left this buffer laid
+                            // out as one row per head. Drop that layout first so
+                            // the hint means "capacity for this prefill" rather
+                            // than "decode arena plus this prefill"; the loop
+                            // below resizes and the kernels fully overwrite.
+                            state.scratch.scores.clear();
                             state.scratch.scores.reserve((start_pos + n) * group_size);
                             for j in 0..n {
                                 let seq_len = (start_pos + j + 1).min(k_cache.len() / kv_dim);
