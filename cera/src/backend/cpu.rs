@@ -348,6 +348,62 @@ pub fn par_rows_n_chunked(
     par_rows_n(y, n, min_rows, f);
 }
 
+/// Like [`par_rows_n`] but caps the active worker count by the dispatch's total
+/// arithmetic, so a small prefill GEMM doesn't fork wider than its work can
+/// fill. `depth` is the contraction length `k`; total work is `y.len() * depth`
+/// MACs. Used by the x86 int8 batched GEMM, whose rows are cheap enough that a
+/// tiny model (or a short prompt) is better run on a few cores than the whole
+/// pool. See [`super::threadpool::RowPool::dispatch_rows_work`].
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub fn par_rows_n_work(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    depth: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    debug_assert_ne!(n, 0, "par_rows_n_work: n must be > 0");
+    if n == 0 || y.is_empty() {
+        return;
+    }
+    super::threadpool::RowPool::prefill().dispatch_rows_work(
+        y,
+        n,
+        min_rows,
+        depth,
+        |row, row_slice| {
+            f((row, row_slice));
+        },
+    );
+}
+
+/// See the `wasm32` note on [`par_rows`]. `depth` is irrelevant here: the
+/// rayon-backed wasm path uses a static `m / num_threads` split with no shared
+/// per-dispatch barrier to amortize, so the whole-pool-synchronization cost the
+/// work cap guards against does not arise — this simply delegates to
+/// [`par_rows_n`].
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn par_rows_n_work(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    _depth: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    par_rows_n(y, n, min_rows, f);
+}
+
+#[cfg(not(feature = "parallel"))]
+pub fn par_rows_n_work(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    _depth: usize,
+    f: impl Fn((usize, &mut [f32])),
+) {
+    par_rows_n(y, n, min_rows, f);
+}
+
 #[allow(clippy::ptr_arg)]
 /// Q4_0 GEMV: `y[m] = A_q4_0[m,k] @ x[k]`.
 ///

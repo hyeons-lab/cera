@@ -4994,8 +4994,11 @@ macro_rules! int8_gemm_kernels {
             // models, whose GEMMs are too short to let the idle pool park). Each
             // `TILE_M`-row strip is one "row" of `TILE_M * n` here; a trailing
             // partial strip drops to the caller, where `handle` runs it per-row.
+            // `par_rows_n_work`'s `k` caps the worker count by this GEMM's total
+            // arithmetic (`m * n * k`), so a narrow GEMM stays on the few cores
+            // its work can fill instead of paying the whole pool's barrier.
             #[cfg(feature = "parallel")]
-            crate::backend::cpu::par_rows_n(out, TILE_M * n, 1, |(s, out_chunk)| {
+            crate::backend::cpu::par_rows_n_work(out, TILE_M * n, 1, k, |(s, out_chunk)| {
                 handle(out_chunk, s)
             });
             #[cfg(not(feature = "parallel"))]
@@ -5151,14 +5154,16 @@ macro_rules! int8_gemm_kernels {
             };
 
             // Fan out over the pinned RowPool, not rayon — see the `TILE_M` GEMM
-            // above for why prefill uses one pool. Each interleaved 8-row
-            // super-row is one "row" of `8 * n`. `m` is a multiple of 8 (the
-            // repack precondition, `debug_assert`ed above), so the strips tile
-            // `out` exactly — there is never a partial super-row, and `compute`
-            // (which writes all 8 rows unconditionally) is only ever handed a
-            // full one.
+            // above for why prefill uses one pool (and why `k` caps the worker
+            // count by total arithmetic). Each interleaved 8-row super-row is one
+            // "row" of `8 * n`. `m` is a multiple of 8 (the repack precondition,
+            // `debug_assert`ed above), so the strips tile `out` exactly — there
+            // is never a partial super-row, and `compute` (which writes all 8
+            // rows unconditionally) is only ever handed a full one.
             #[cfg(feature = "parallel")]
-            crate::backend::cpu::par_rows_n(out, 8 * n, 1, |(sr, chunk)| compute(sr, chunk));
+            crate::backend::cpu::par_rows_n_work(out, 8 * n, 1, k, |(sr, chunk)| {
+                compute(sr, chunk)
+            });
             #[cfg(not(feature = "parallel"))]
             for (sr, chunk) in out.chunks_mut(8 * n).enumerate() {
                 compute(sr, chunk);
@@ -5296,14 +5301,16 @@ macro_rules! int8_gemm_kernels {
             };
 
             // Fan out over the pinned RowPool, not rayon — see the `TILE_M` GEMM
-            // above for why prefill uses one pool. Each interleaved 8-row
-            // super-row is one "row" of `8 * n`. `m` is a multiple of 8 (the
-            // repack precondition, `debug_assert`ed above), so the strips tile
-            // `out` exactly — there is never a partial super-row, and `compute`
-            // (which writes all 8 rows unconditionally) is only ever handed a
-            // full one.
+            // above for why prefill uses one pool (and why `k` caps the worker
+            // count by total arithmetic). Each interleaved 8-row super-row is one
+            // "row" of `8 * n`. `m` is a multiple of 8 (the repack precondition,
+            // `debug_assert`ed above), so the strips tile `out` exactly — there
+            // is never a partial super-row, and `compute` (which writes all 8
+            // rows unconditionally) is only ever handed a full one.
             #[cfg(feature = "parallel")]
-            crate::backend::cpu::par_rows_n(out, 8 * n, 1, |(sr, chunk)| compute(sr, chunk));
+            crate::backend::cpu::par_rows_n_work(out, 8 * n, 1, k, |(sr, chunk)| {
+                compute(sr, chunk)
+            });
             #[cfg(not(feature = "parallel"))]
             for (sr, chunk) in out.chunks_mut(8 * n).enumerate() {
                 compute(sr, chunk);
@@ -5361,8 +5368,11 @@ macro_rules! int8_gemm_kernels {
             // models, whose GEMMs are too short to let the idle pool park). Each
             // `TILE_M`-row strip is one "row" of `TILE_M * n` here; a trailing
             // partial strip drops to the caller, where `handle` runs it per-row.
+            // `par_rows_n_work`'s `k` caps the worker count by this GEMM's total
+            // arithmetic (`m * n * k`), so a narrow GEMM stays on the few cores
+            // its work can fill instead of paying the whole pool's barrier.
             #[cfg(feature = "parallel")]
-            crate::backend::cpu::par_rows_n(out, TILE_M * n, 1, |(s, out_chunk)| {
+            crate::backend::cpu::par_rows_n_work(out, TILE_M * n, 1, k, |(s, out_chunk)| {
                 handle(out_chunk, s)
             });
             #[cfg(not(feature = "parallel"))]
