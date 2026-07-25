@@ -838,6 +838,14 @@ pub(crate) enum KvView<'a> {
 
 /// Shapes for one decode attention pass (a single query position attending over
 /// `seq_len` cached positions).
+///
+/// `n_heads` must be a positive multiple of `n_kv_heads` (the GQA invariant).
+/// Both model families enforce it when they parse the GGUF — `LlamaConfig` and
+/// `Lfm2Config` each `ensure!` it at load — so this is a contract for future
+/// constructors, not a runtime risk on the shipped paths. It matters because
+/// `group_size` is a truncating divide: a non-multiple would place the last
+/// heads' `kv_h_offset` past the end of a KV row, which the attention kernels
+/// would read straight through in release builds.
 pub(crate) struct DecodeAttnDims {
     pub n_heads: usize,
     pub n_kv_heads: usize,
@@ -982,6 +990,12 @@ pub(crate) fn decode_attention(
     attn_out: &mut [f32],
     scratch: &mut Vec<f32>,
 ) {
+    debug_assert!(
+        d.n_kv_heads > 0 && d.n_heads.is_multiple_of(d.n_kv_heads),
+        "GQA invariant: n_heads ({}) must be a positive multiple of n_kv_heads ({})",
+        d.n_heads,
+        d.n_kv_heads
+    );
     let work = d
         .n_heads
         .saturating_mul(d.seq_len)
@@ -1002,11 +1016,17 @@ pub(crate) fn decode_attention(
         return;
     }
 
-    let stride = d.seq_len + d.head_dim;
+    let stride = d.seq_len.saturating_add(d.head_dim);
+    // Saturating, not wrapping: a wrap here would silently hand out a *short*
+    // arena that the row dispatch and the gather below would then index as if
+    // it were `n_heads * stride` long. Saturating turns the same absurd shape
+    // into a failed allocation instead. (No real config comes close — this is
+    // the cheap way to keep a garbage `DecodeAttnDims` from becoming UB.)
+    //
     // Not cleared: every element of every row is fully written below
     // (`attn_scores*` fills `[..seq_len]`, `attn_values*` fills the head output),
     // so `resize` only has to zero the bytes it grows by.
-    scratch.resize(d.n_heads * stride, 0.0);
+    scratch.resize(d.n_heads.saturating_mul(stride), 0.0);
     // One head per row *and* per steal unit: there are only `n_heads` of them and
     // each is heavy, so the default steal floor would hand them all to a couple
     // of workers.

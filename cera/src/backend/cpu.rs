@@ -2496,18 +2496,26 @@ pub fn attn_scores(
     if seq_len > 0 {
         debug_assert!(k_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
     }
+    // NEON pre-loads Q into a fixed 32 × `float32x4` array, so head_dim > 128
+    // would index past it. No shipped model is that wide, but head_dim is a
+    // runtime value here and the kernel's own check is a `debug_assert!`, so
+    // gate rather than trust the caller: over 128 this falls through to the
+    // scalar loop below.
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        attn_scores_neon(
-            q_head,
-            k_cache,
-            scores,
-            kv_dim,
-            kv_h_offset,
-            head_dim,
-            scale,
-            seq_len,
-        );
+    if head_dim <= 128 {
+        unsafe {
+            attn_scores_neon(
+                q_head,
+                k_cache,
+                scores,
+                kv_dim,
+                kv_h_offset,
+                head_dim,
+                scale,
+                seq_len,
+            );
+        }
+        return;
     }
     // x86 AVX2+FMA: needs head_dim a multiple of 8 (one ymm) and <= 256 (the
     // `q_vecs` array bound). Runtime-detected, so a baseline build on a pre-AVX2
@@ -2541,7 +2549,6 @@ pub fn attn_scores(
             return;
         }
     }
-    #[cfg(not(target_arch = "aarch64"))]
     for t in 0..seq_len {
         let mut dot = 0.0f32;
         let k_off = t * kv_dim + kv_h_offset;
@@ -2569,17 +2576,21 @@ pub fn attn_values(
     if seq_len > 0 {
         debug_assert!(v_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
     }
+    // head_dim > 128 overruns the NEON accumulator array — see `attn_scores`.
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        attn_values_neon(
-            scores,
-            v_cache,
-            attn_out,
-            kv_dim,
-            kv_h_offset,
-            head_dim,
-            seq_len,
-        );
+    if head_dim <= 128 {
+        unsafe {
+            attn_values_neon(
+                scores,
+                v_cache,
+                attn_out,
+                kv_dim,
+                kv_h_offset,
+                head_dim,
+                seq_len,
+            );
+        }
+        return;
     }
     // x86 AVX2+FMA — same gate and rationale as `attn_scores`.
     #[cfg(target_arch = "x86_64")]
@@ -2603,15 +2614,12 @@ pub fn attn_values(
             return;
         }
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        attn_out[..head_dim].fill(0.0);
-        for t in 0..seq_len {
-            let s = scores[t];
-            let v_base = t * kv_dim + kv_h_offset;
-            for d in 0..head_dim {
-                attn_out[d] += s * v_cache[v_base + d];
-            }
+    attn_out[..head_dim].fill(0.0);
+    for t in 0..seq_len {
+        let s = scores[t];
+        let v_base = t * kv_dim + kv_h_offset;
+        for d in 0..head_dim {
+            attn_out[d] += s * v_cache[v_base + d];
         }
     }
 }
@@ -2897,18 +2905,22 @@ pub fn attn_scores_f16(
     if seq_len > 0 {
         debug_assert!(k_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
     }
+    // head_dim > 128 overruns the NEON Q array — see `attn_scores`.
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        attn_scores_f16_neon(
-            q_head,
-            k_cache,
-            scores,
-            kv_dim,
-            kv_h_offset,
-            head_dim,
-            scale,
-            seq_len,
-        );
+    if head_dim <= 128 {
+        unsafe {
+            attn_scores_f16_neon(
+                q_head,
+                k_cache,
+                scores,
+                kv_dim,
+                kv_h_offset,
+                head_dim,
+                scale,
+                seq_len,
+            );
+        }
+        return;
     }
     // x86 AVX2+FMA+F16C — same gate as the f32 `attn_scores`, plus `f16c` for
     // the hardware `vcvtph2ps` widen (without it the scalar `f16_to_f32` per
@@ -2936,7 +2948,6 @@ pub fn attn_scores_f16(
             return;
         }
     }
-    #[cfg(not(target_arch = "aarch64"))]
     for t in 0..seq_len {
         let mut dot = 0.0f32;
         let k_off = t * kv_dim + kv_h_offset;
@@ -2964,17 +2975,21 @@ pub fn attn_values_f16(
     if seq_len > 0 {
         debug_assert!(v_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
     }
+    // head_dim > 128 overruns the NEON accumulator array — see `attn_scores`.
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        attn_values_f16_neon(
-            scores,
-            v_cache,
-            attn_out,
-            kv_dim,
-            kv_h_offset,
-            head_dim,
-            seq_len,
-        );
+    if head_dim <= 128 {
+        unsafe {
+            attn_values_f16_neon(
+                scores,
+                v_cache,
+                attn_out,
+                kv_dim,
+                kv_h_offset,
+                head_dim,
+                seq_len,
+            );
+        }
+        return;
     }
     // x86 AVX2+FMA+F16C — same gate and rationale as `attn_scores_f16`.
     #[cfg(target_arch = "x86_64")]
@@ -2999,15 +3014,12 @@ pub fn attn_values_f16(
             return;
         }
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        attn_out[..head_dim].fill(0.0);
-        for t in 0..seq_len {
-            let s = scores[t];
-            let v_base = t * kv_dim + kv_h_offset;
-            for d in 0..head_dim {
-                attn_out[d] += s * f16_to_f32(v_cache[v_base + d]);
-            }
+    attn_out[..head_dim].fill(0.0);
+    for t in 0..seq_len {
+        let s = scores[t];
+        let v_base = t * kv_dim + kv_h_offset;
+        for d in 0..head_dim {
+            attn_out[d] += s * f16_to_f32(v_cache[v_base + d]);
         }
     }
 }
@@ -6086,13 +6098,14 @@ mod tests {
             check_attn_f32_kernels(hd);
             check_attn_f16_kernels(hd);
         }
-        // 32 `__m256` = the full `MAX_Q_VECS`/`MAX_ACC_VECS` the AVX2 kernels
-        // size for, and the top of the dispatcher's `head_dim <= 256` gate.
-        #[cfg(target_arch = "x86_64")]
-        {
-            check_attn_f32_kernels(256);
-            check_attn_f16_kernels(256);
-        }
+        // 256 exercises a different path per arch and both need covering: on
+        // x86 it is 32 `__m256` — the full `MAX_Q_VECS`/`MAX_ACC_VECS` the AVX2
+        // kernels size for, and the top of the dispatcher's `head_dim <= 256`
+        // gate — while on aarch64 it is past the NEON kernels' 128 ceiling, so
+        // it checks that the dispatcher really does fall through to scalar
+        // instead of overrunning their fixed-size arrays.
+        check_attn_f32_kernels(256);
+        check_attn_f16_kernels(256);
     }
 
     #[test]
