@@ -6087,11 +6087,14 @@ mod tests {
     /// So that branch of hand-written unsafe SIMD was unexercised; 8/24/40/56/72
     /// cover it.
     ///
-    /// Capped at 128 because the NEON kernels hold Q and the accumulators in a
-    /// `32 × float32x4` array — `head_dim <= 128` — and, unlike the AVX2 arm,
-    /// aarch64 dispatches to them with no `head_dim` gate. Anything above 128
-    /// here would index that array out of bounds on Apple silicon, where CI runs
-    /// `cargo test`, so the AVX2 ceiling of 256 is exercised x86-only.
+    /// The 8..128 band is what both vector arms accept directly. 256 is added on
+    /// top and lands on a *different* path per arch, which is why it runs
+    /// everywhere rather than x86-only: on x86 it is the top of the AVX2
+    /// dispatcher's `head_dim <= 256` gate, and on aarch64 it is past the NEON
+    /// kernels' 128 ceiling (they hold Q and the accumulators in a
+    /// `32 × float32x4` array), so it pins down the dispatcher's fall-through to
+    /// scalar. That fall-through is the half this host cannot run — CI's Apple
+    /// silicon `cargo test` is what actually exercises it.
     #[test]
     fn test_attn_kernels_across_head_dims() {
         for &hd in &[8usize, 16, 24, 32, 40, 48, 56, 64, 72, 128] {

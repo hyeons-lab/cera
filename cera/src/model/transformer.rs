@@ -1475,9 +1475,13 @@ mod decode_attn_tests {
     /// Mirror of `decode_attention`'s `fan_out` gate, so a test can assert which
     /// branch it actually exercised.
     fn would_fan_out(d: &DecodeAttnDims) -> bool {
-        d.n_heads > 1
-            && d.n_heads * d.seq_len * d.head_dim >= decode_attn_par_min_work()
-            && cpu::decode_par_threads() > 1
+        // Saturating, matching `decode_attention` exactly — a mirror that
+        // computes the work term differently is not a mirror.
+        let work = d
+            .n_heads
+            .saturating_mul(d.seq_len)
+            .saturating_mul(d.head_dim);
+        d.n_heads > 1 && work >= decode_attn_par_min_work() && cpu::decode_par_threads() > 1
     }
 
     /// `expect_fan_out` is what the shape should do *on a host that can fan out*
