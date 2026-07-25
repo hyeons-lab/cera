@@ -307,19 +307,36 @@ pub fn par_rows_n_chunked(
     min_chunk_rows: usize,
     f: impl Fn((usize, &mut [f32])) + Sync + Send,
 ) {
-    debug_assert_ne!(n, 0, "par_rows_n_chunked: n must be > 0");
-    if n == 0 || y.is_empty() {
-        return;
-    }
-    super::threadpool::RowPool::prefill().dispatch_rows_chunked(
+    par_rows_n_chunked_on(
+        super::threadpool::RowPool::prefill(),
         y,
         n,
         min_rows,
         min_chunk_rows,
-        |row, row_slice| {
-            f((row, row_slice));
-        },
+        f,
     );
+}
+
+/// Shared body of [`par_rows_n_chunked`] and [`par_rows_n_chunked_decode`]. The
+/// pool is the only thing that differs between them; keeping it a parameter here
+/// means the choice is explicit at each public wrapper rather than buried in a
+/// duplicated body.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn par_rows_n_chunked_on(
+    pool: &'static super::threadpool::RowPool,
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    min_chunk_rows: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    debug_assert_ne!(n, 0, "par_rows_n_chunked_on: n must be > 0");
+    if n == 0 || y.is_empty() {
+        return;
+    }
+    pool.dispatch_rows_chunked(y, n, min_rows, min_chunk_rows, |row, row_slice| {
+        f((row, row_slice));
+    });
 }
 
 /// See the `wasm32` note on [`par_rows`]. `min_chunk_rows` is irrelevant here:
@@ -346,6 +363,75 @@ pub fn par_rows_n_chunked(
     f: impl Fn((usize, &mut [f32])),
 ) {
     par_rows_n(y, n, min_rows, f);
+}
+
+/// Decode-pool twin of [`par_rows_n_chunked`]. Decode-time attention sits
+/// between GEMVs that already dispatch on
+/// [`super::threadpool::RowPool::decode`], so fanning its head loop out on that
+/// same narrow pool keeps one pool hot rather than waking the wide prefill pool
+/// (and leaving the decode pool spinning) for a few microseconds of work.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub fn par_rows_n_chunked_decode(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    min_chunk_rows: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    par_rows_n_chunked_on(
+        super::threadpool::RowPool::decode(),
+        y,
+        n,
+        min_rows,
+        min_chunk_rows,
+        f,
+    );
+}
+
+/// See the `wasm32` note on [`par_rows`]; rayon has no decode/prefill pool split
+/// to honour, so this is [`par_rows_n_chunked`] verbatim.
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn par_rows_n_chunked_decode(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    min_chunk_rows: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    par_rows_n_chunked(y, n, min_rows, min_chunk_rows, f);
+}
+
+#[cfg(not(feature = "parallel"))]
+pub fn par_rows_n_chunked_decode(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    min_chunk_rows: usize,
+    f: impl Fn((usize, &mut [f32])),
+) {
+    par_rows_n_chunked(y, n, min_rows, min_chunk_rows, f);
+}
+
+/// How many workers a [`par_rows_n_chunked_decode`] dispatch can spread across.
+/// Callers that must build a per-worker scratch layout *before* dispatching use
+/// this to skip that work when the answer is one — a single-core host,
+/// `CERA_DECODE_THREADS=1`, or a pool degraded by a failed spawn — where the
+/// fan-out would allocate and copy for a loop that then runs on the calling
+/// thread anyway.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub fn decode_par_threads() -> usize {
+    super::threadpool::RowPool::decode().num_threads()
+}
+
+/// See the `wasm32` note on [`par_rows`]: rayon there, not a `RowPool`.
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn decode_par_threads() -> usize {
+    crate::par::current_num_threads()
+}
+
+#[cfg(not(feature = "parallel"))]
+pub fn decode_par_threads() -> usize {
+    1
 }
 
 /// Like [`par_rows_n`] but caps the active worker count by the dispatch's total
@@ -2410,20 +2496,59 @@ pub fn attn_scores(
     if seq_len > 0 {
         debug_assert!(k_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
     }
+    // NEON pre-loads Q into a fixed 32 × `float32x4` array, so head_dim > 128
+    // would index past it. No shipped model is that wide, but head_dim is a
+    // runtime value here and the kernel's own check is a `debug_assert!`, so
+    // gate rather than trust the caller: over 128 this falls through to the
+    // scalar loop below.
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        attn_scores_neon(
-            q_head,
-            k_cache,
-            scores,
-            kv_dim,
-            kv_h_offset,
-            head_dim,
-            scale,
-            seq_len,
-        );
+    if head_dim <= 128 {
+        unsafe {
+            attn_scores_neon(
+                q_head,
+                k_cache,
+                scores,
+                kv_dim,
+                kv_h_offset,
+                head_dim,
+                scale,
+                seq_len,
+            );
+        }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    // x86 AVX2+FMA: needs head_dim a multiple of 8 (one ymm) and <= 256 (the
+    // `q_vecs` array bound). Runtime-detected, so a baseline build on a pre-AVX2
+    // host still falls through to the scalar loop below. Q and the KV cache are
+    // f32 here, so this is plain FMA — no int8 tier gate. (AVX-512 is
+    // deliberately not added: at head_dim=64 — the shape the models benchmarked
+    // here use, though 128 is also common (Qwen2/Mistral-7B) — the sibling flash
+    // kernel measured a *tie* with AVX2. The scalar loop this replaces was
+    // latency-bound on its serial dependency chain; once vectorized, what is
+    // left is streaming the KV cache, and wider vectors do not make memory
+    // faster.)
+    #[cfg(target_arch = "x86_64")]
+    {
+        if head_dim.is_multiple_of(8)
+            && head_dim <= 256
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            unsafe {
+                attn_scores_avx2(
+                    q_head,
+                    k_cache,
+                    scores,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    seq_len,
+                );
+            }
+            return;
+        }
+    }
     for t in 0..seq_len {
         let mut dot = 0.0f32;
         let k_off = t * kv_dim + kv_h_offset;
@@ -2451,27 +2576,50 @@ pub fn attn_values(
     if seq_len > 0 {
         debug_assert!(v_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
     }
+    // head_dim > 128 overruns the NEON accumulator array — see `attn_scores`.
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        attn_values_neon(
-            scores,
-            v_cache,
-            attn_out,
-            kv_dim,
-            kv_h_offset,
-            head_dim,
-            seq_len,
-        );
+    if head_dim <= 128 {
+        unsafe {
+            attn_values_neon(
+                scores,
+                v_cache,
+                attn_out,
+                kv_dim,
+                kv_h_offset,
+                head_dim,
+                seq_len,
+            );
+        }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    // x86 AVX2+FMA — same gate and rationale as `attn_scores`.
+    #[cfg(target_arch = "x86_64")]
     {
-        attn_out[..head_dim].fill(0.0);
-        for t in 0..seq_len {
-            let s = scores[t];
-            let v_base = t * kv_dim + kv_h_offset;
-            for d in 0..head_dim {
-                attn_out[d] += s * v_cache[v_base + d];
+        if head_dim.is_multiple_of(8)
+            && head_dim <= 256
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            unsafe {
+                attn_values_avx2(
+                    scores,
+                    v_cache,
+                    attn_out,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    seq_len,
+                );
             }
+            return;
+        }
+    }
+    attn_out[..head_dim].fill(0.0);
+    for t in 0..seq_len {
+        let s = scores[t];
+        let v_base = t * kv_dim + kv_h_offset;
+        for d in 0..head_dim {
+            attn_out[d] += s * v_cache[v_base + d];
         }
     }
 }
@@ -2586,6 +2734,148 @@ unsafe fn attn_values_neon(
     }
 }
 
+/// Horizontal sum of a `__m256` (matches `simd::hsum_avx`). Shared by the
+/// x86 attention kernels below and `flash_attention_gqa_avx2`.
+///
+/// `#[inline]` because this sits in the innermost loop of every scores kernel,
+/// where a call would swamp the four instructions it wraps. (A nested `fn` was
+/// never a guarantee either — it codegens like any other — so this is the hint
+/// that was always wanted, not a replacement for one hoisting lost.)
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let hi = _mm256_extractf128_ps(v, 1);
+    let lo = _mm256_castps256_ps128(v);
+    let s128 = _mm_add_ps(lo, hi);
+    let s64 = _mm_add_ps(s128, _mm_movehl_ps(s128, s128));
+    let s32 = _mm_add_ss(s64, _mm_shuffle_ps(s64, s64, 1));
+    _mm_cvtss_f32(s32)
+}
+
+/// AVX2+FMA [`attn_scores`]: the decode-path QK dot, 8 f32 per ymm.
+///
+/// Structurally mirrors [`attn_scores_neon`] — Q is laid out once ahead of the
+/// timestep loop (it is constant across `t`), and each key row runs a pair of
+/// independent FMA chains, so the per-`t` dot is not one serial dependency
+/// chain. Before this, x86 ran the scalar fallback: at decode-time depth that
+/// loop was ~33% of the main thread (samply, Llama-3.2-1B-Q4_K_M at depth 1024).
+///
+/// Deliberately no claim about *where* `q_vecs` lives. It is a fixed-size array
+/// indexed by a runtime `i` over a runtime `n_q_vecs`, so whether LLVM promotes
+/// it to ymm depends on how far it specializes the trip count. Disassembling the
+/// release build shows a `head_dim`-specialized cascade that keeps Q in
+/// registers for some shapes and spills in others — unsurprising, since x86-64
+/// has 16 ymm against `MAX_Q_VECS = 32`. Treat residency as a compiler decision
+/// that moves with `head_dim` and toolchain, not a property of this code; the
+/// dependable win is the vectorized FMA chains replacing the scalar loop. Gains
+/// were measured at head_dim=64; other shapes are tested but unmeasured.
+///
+/// Requires `head_dim % 8 == 0` and `head_dim <= 256` (the `q_vecs` bound), both
+/// checked by the dispatcher, so there is no scalar tail here.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn attn_scores_avx2(
+    q_head: &[f32],
+    k_cache: &[f32],
+    scores: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    seq_len: usize,
+) {
+    use std::arch::x86_64::*;
+    // SAFETY: the dispatcher checked the CPU features and `head_dim`; the
+    // caller's debug_asserts cover the buffer extents each load below touches.
+    unsafe {
+        let q_ptr = q_head.as_ptr();
+        let k_ptr = k_cache.as_ptr();
+
+        // Pre-load Q once (constant across all timesteps). 32 ymm = head_dim 256.
+        const MAX_Q_VECS: usize = 32;
+        let n_q_vecs = head_dim / 8;
+        debug_assert!(n_q_vecs <= MAX_Q_VECS, "head_dim > 256 not supported");
+        let mut q_vecs = [_mm256_setzero_ps(); MAX_Q_VECS];
+        for i in 0..n_q_vecs {
+            q_vecs[i] = _mm256_loadu_ps(q_ptr.add(i * 8));
+        }
+
+        for t in 0..seq_len {
+            let k_off = t * kv_dim + kv_h_offset;
+            // Two accumulators so the FMAs pipeline instead of serializing.
+            let mut sum0 = _mm256_setzero_ps();
+            let mut sum1 = _mm256_setzero_ps();
+            let mut i = 0usize;
+            while i + 2 <= n_q_vecs {
+                let k0 = _mm256_loadu_ps(k_ptr.add(k_off + i * 8));
+                let k1 = _mm256_loadu_ps(k_ptr.add(k_off + (i + 1) * 8));
+                sum0 = _mm256_fmadd_ps(q_vecs[i], k0, sum0);
+                sum1 = _mm256_fmadd_ps(q_vecs[i + 1], k1, sum1);
+                i += 2;
+            }
+            if i < n_q_vecs {
+                let k0 = _mm256_loadu_ps(k_ptr.add(k_off + i * 8));
+                sum0 = _mm256_fmadd_ps(q_vecs[i], k0, sum0);
+            }
+            scores[t] = hsum256(_mm256_add_ps(sum0, sum1)) * scale;
+        }
+    }
+}
+
+/// AVX2+FMA [`attn_values`]: the decode-path score-weighted V sum.
+///
+/// Mirrors [`attn_values_neon`] — the output row is accumulated across the whole
+/// timestep loop and written to `attn_out` once at the end, so V streams through
+/// with one FMA per 8 lanes.
+///
+/// As in [`attn_scores_avx2`], make no assumption about where `acc` lives: it is
+/// a runtime-indexed fixed-size array, so residency is LLVM's call and varies
+/// with `head_dim`. What the accumulator reliably buys is a small contiguous
+/// destination for the FMA chain instead of striding `attn_out` once per
+/// timestep. head_dim=64 is the only shape measured.
+///
+/// Requires `head_dim % 8 == 0` and `head_dim <= 256` (dispatcher-checked), so
+/// there is no scalar tail.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::needless_range_loop)]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn attn_values_avx2(
+    scores: &[f32],
+    v_cache: &[f32],
+    attn_out: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    seq_len: usize,
+) {
+    use std::arch::x86_64::*;
+    // SAFETY: as `attn_scores_avx2`.
+    unsafe {
+        let v_ptr = v_cache.as_ptr();
+        let out_ptr = attn_out.as_mut_ptr();
+
+        const MAX_ACC_VECS: usize = 32;
+        let n_vec = head_dim / 8;
+        debug_assert!(n_vec <= MAX_ACC_VECS, "head_dim > 256 not supported");
+        let mut acc = [_mm256_setzero_ps(); MAX_ACC_VECS];
+
+        for t in 0..seq_len {
+            let s = _mm256_set1_ps(scores[t]);
+            let v_base = t * kv_dim + kv_h_offset;
+            for i in 0..n_vec {
+                let v = _mm256_loadu_ps(v_ptr.add(v_base + i * 8));
+                acc[i] = _mm256_fmadd_ps(s, v, acc[i]);
+            }
+        }
+        for i in 0..n_vec {
+            _mm256_storeu_ps(out_ptr.add(i * 8), acc[i]);
+        }
+    }
+}
+
 // ── f16 KV attention (widen-on-read) ────────────────────────────────────────
 
 /// Convert one IEEE-754 half (raw bits) to f32. On aarch64/x86 with hardware
@@ -2615,20 +2905,49 @@ pub fn attn_scores_f16(
     if seq_len > 0 {
         debug_assert!(k_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
     }
+    // head_dim > 128 overruns the NEON Q array — see `attn_scores`.
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        attn_scores_f16_neon(
-            q_head,
-            k_cache,
-            scores,
-            kv_dim,
-            kv_h_offset,
-            head_dim,
-            scale,
-            seq_len,
-        );
+    if head_dim <= 128 {
+        unsafe {
+            attn_scores_f16_neon(
+                q_head,
+                k_cache,
+                scores,
+                kv_dim,
+                kv_h_offset,
+                head_dim,
+                scale,
+                seq_len,
+            );
+        }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    // x86 AVX2+FMA+F16C — same gate as the f32 `attn_scores`, plus `f16c` for
+    // the hardware `vcvtph2ps` widen (without it the scalar `f16_to_f32` per
+    // element would dominate whatever the vector loop saved).
+    #[cfg(target_arch = "x86_64")]
+    {
+        if head_dim.is_multiple_of(8)
+            && head_dim <= 256
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && is_x86_feature_detected!("f16c")
+        {
+            unsafe {
+                attn_scores_f16_avx2(
+                    q_head,
+                    k_cache,
+                    scores,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    seq_len,
+                );
+            }
+            return;
+        }
+    }
     for t in 0..seq_len {
         let mut dot = 0.0f32;
         let k_off = t * kv_dim + kv_h_offset;
@@ -2656,27 +2975,51 @@ pub fn attn_values_f16(
     if seq_len > 0 {
         debug_assert!(v_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
     }
+    // head_dim > 128 overruns the NEON accumulator array — see `attn_scores`.
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        attn_values_f16_neon(
-            scores,
-            v_cache,
-            attn_out,
-            kv_dim,
-            kv_h_offset,
-            head_dim,
-            seq_len,
-        );
+    if head_dim <= 128 {
+        unsafe {
+            attn_values_f16_neon(
+                scores,
+                v_cache,
+                attn_out,
+                kv_dim,
+                kv_h_offset,
+                head_dim,
+                seq_len,
+            );
+        }
+        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    // x86 AVX2+FMA+F16C — same gate and rationale as `attn_scores_f16`.
+    #[cfg(target_arch = "x86_64")]
     {
-        attn_out[..head_dim].fill(0.0);
-        for t in 0..seq_len {
-            let s = scores[t];
-            let v_base = t * kv_dim + kv_h_offset;
-            for d in 0..head_dim {
-                attn_out[d] += s * f16_to_f32(v_cache[v_base + d]);
+        if head_dim.is_multiple_of(8)
+            && head_dim <= 256
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && is_x86_feature_detected!("f16c")
+        {
+            unsafe {
+                attn_values_f16_avx2(
+                    scores,
+                    v_cache,
+                    attn_out,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    seq_len,
+                );
             }
+            return;
+        }
+    }
+    attn_out[..head_dim].fill(0.0);
+    for t in 0..seq_len {
+        let s = scores[t];
+        let v_base = t * kv_dim + kv_h_offset;
+        for d in 0..head_dim {
+            attn_out[d] += s * f16_to_f32(v_cache[v_base + d]);
         }
     }
 }
@@ -2792,6 +3135,109 @@ unsafe fn attn_values_f16_neon(
                     scores[t] * f16_to_f32(*v_ptr.add(t * kv_dim + kv_h_offset + tail_start + dd));
             }
             *out_ptr.add(tail_start + dd) = val;
+        }
+    }
+}
+
+/// AVX2+FMA+F16C [`attn_scores_f16`]: the f16-KV QK dot.
+///
+/// Same shape as [`attn_scores_avx2`], but each 8-lane key group is widened from
+/// half with one `vcvtph2ps` instead of eight scalar `f16_to_f32` calls. The
+/// dot still accumulates in f32, so the result matches the scalar path's
+/// widen-then-multiply exactly as closely as the f32 kernel matches its own.
+///
+/// Requires `head_dim % 8 == 0` and `head_dim <= 256` (dispatcher-checked).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn attn_scores_f16_avx2(
+    q_head: &[f32],
+    k_cache: &[u16],
+    scores: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    seq_len: usize,
+) {
+    use std::arch::x86_64::*;
+    // SAFETY: the dispatcher checked the CPU features and `head_dim`; the
+    // caller's debug_asserts cover the buffer extents each load below touches.
+    unsafe {
+        let q_ptr = q_head.as_ptr();
+        let k_ptr = k_cache.as_ptr();
+
+        const MAX_Q_VECS: usize = 32;
+        let n_q_vecs = head_dim / 8;
+        debug_assert!(n_q_vecs <= MAX_Q_VECS, "head_dim > 256 not supported");
+        let mut q_vecs = [_mm256_setzero_ps(); MAX_Q_VECS];
+        for i in 0..n_q_vecs {
+            q_vecs[i] = _mm256_loadu_ps(q_ptr.add(i * 8));
+        }
+
+        for t in 0..seq_len {
+            let k_off = t * kv_dim + kv_h_offset;
+            let mut sum0 = _mm256_setzero_ps();
+            let mut sum1 = _mm256_setzero_ps();
+            let mut i = 0usize;
+            while i + 2 <= n_q_vecs {
+                // 8 halves (128 bits) → 8 f32 (256 bits) per `vcvtph2ps`.
+                let k0 = _mm256_cvtph_ps(_mm_loadu_si128(k_ptr.add(k_off + i * 8).cast()));
+                let k1 = _mm256_cvtph_ps(_mm_loadu_si128(k_ptr.add(k_off + (i + 1) * 8).cast()));
+                sum0 = _mm256_fmadd_ps(q_vecs[i], k0, sum0);
+                sum1 = _mm256_fmadd_ps(q_vecs[i + 1], k1, sum1);
+                i += 2;
+            }
+            if i < n_q_vecs {
+                let k0 = _mm256_cvtph_ps(_mm_loadu_si128(k_ptr.add(k_off + i * 8).cast()));
+                sum0 = _mm256_fmadd_ps(q_vecs[i], k0, sum0);
+            }
+            scores[t] = hsum256(_mm256_add_ps(sum0, sum1)) * scale;
+        }
+    }
+}
+
+/// AVX2+FMA+F16C [`attn_values_f16`]: the f16-KV score-weighted V sum.
+///
+/// Same shape as [`attn_values_avx2`], widening each 8-lane V group with one
+/// `vcvtph2ps`. Accumulates in f32 across the timestep loop and writes
+/// `attn_out` once at the end; see [`attn_values_avx2`] on why the accumulator's
+/// storage class is not something to rely on.
+///
+/// Requires `head_dim % 8 == 0` and `head_dim <= 256` (dispatcher-checked).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::needless_range_loop)]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn attn_values_f16_avx2(
+    scores: &[f32],
+    v_cache: &[u16],
+    attn_out: &mut [f32],
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    seq_len: usize,
+) {
+    use std::arch::x86_64::*;
+    // SAFETY: as `attn_scores_f16_avx2`.
+    unsafe {
+        let v_ptr = v_cache.as_ptr();
+        let out_ptr = attn_out.as_mut_ptr();
+
+        const MAX_ACC_VECS: usize = 32;
+        let n_vec = head_dim / 8;
+        debug_assert!(n_vec <= MAX_ACC_VECS, "head_dim > 256 not supported");
+        let mut acc = [_mm256_setzero_ps(); MAX_ACC_VECS];
+
+        for t in 0..seq_len {
+            let s = _mm256_set1_ps(scores[t]);
+            let v_base = t * kv_dim + kv_h_offset;
+            for i in 0..n_vec {
+                let v = _mm256_cvtph_ps(_mm_loadu_si128(v_ptr.add(v_base + i * 8).cast()));
+                acc[i] = _mm256_fmadd_ps(s, v, acc[i]);
+            }
+        }
+        for i in 0..n_vec {
+            _mm256_storeu_ps(out_ptr.add(i * 8), acc[i]);
         }
     }
 }
@@ -3071,17 +3517,6 @@ unsafe fn flash_attention_gqa_avx2(
 ) {
     use std::arch::x86_64::*;
     unsafe {
-        /// Horizontal sum of a `__m256` (matches `simd::hsum_avx`).
-        #[target_feature(enable = "avx2")]
-        unsafe fn hsum256(v: __m256) -> f32 {
-            let hi = _mm256_extractf128_ps(v, 1);
-            let lo = _mm256_castps256_ps128(v);
-            let s128 = _mm_add_ps(lo, hi);
-            let s64 = _mm_add_ps(s128, _mm_movehl_ps(s128, s128));
-            let s32 = _mm_add_ss(s64, _mm_shuffle_ps(s64, s64, 1));
-            _mm_cvtss_f32(s32)
-        }
-
         // Buffer-sizing tripwires, mirroring `flash_attention_gqa_neon`. The
         // dispatcher checks `head_dim`, but the caller still owns the q/k/v/out
         // sizing contract; without these a violation is silent UB.
@@ -5571,6 +6006,109 @@ mod tests {
         check_attn_f16_kernels(12); // 8-wide + 4-wide
         check_attn_f16_kernels(10); // 8-wide + scalar-2 tail
         check_attn_f16_kernels(6); // 4-wide + scalar-2 tail
+    }
+
+    /// f32 twin of [`check_attn_f16_kernels`]: dispatcher output vs the scalar
+    /// reference for one `head_dim`.
+    fn check_attn_f32_kernels(head_dim: usize) {
+        let n_kv_heads = 2;
+        let kv_dim = n_kv_heads * head_dim;
+        let kv_h_off = head_dim; // second KV head
+        let seq_len = 13;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q: Vec<f32> = (0..head_dim).map(|i| (i as f32 - 8.0) * 0.05).collect();
+        let k: Vec<f32> = (0..seq_len * kv_dim)
+            .map(|i| ((i * 7 + 3) % 31) as f32 * 0.04 - 0.6)
+            .collect();
+        let v: Vec<f32> = (0..seq_len * kv_dim)
+            .map(|i| ((i * 11 + 5) % 29) as f32 * 0.03 - 0.4)
+            .collect();
+
+        let mut expected = vec![0.0f32; seq_len];
+        attn_scores_scalar(
+            &q,
+            &k,
+            &mut expected,
+            kv_dim,
+            kv_h_off,
+            head_dim,
+            scale,
+            seq_len,
+        );
+        let mut actual = vec![0.0f32; seq_len];
+        attn_scores(
+            &q,
+            &k,
+            &mut actual,
+            kv_dim,
+            kv_h_off,
+            head_dim,
+            scale,
+            seq_len,
+        );
+        for t in 0..seq_len {
+            let diff = (expected[t] - actual[t]).abs();
+            assert!(
+                diff < 1e-5,
+                "attn_scores mismatch (head_dim={head_dim}) at t={t}: \
+                 expected={}, actual={}, diff={diff}",
+                expected[t],
+                actual[t]
+            );
+        }
+
+        let scores: Vec<f32> = (0..seq_len)
+            .map(|i| (i as f32 + 1.0) / seq_len as f32)
+            .collect();
+        let mut vexp = vec![0.0f32; head_dim];
+        attn_values_scalar(&scores, &v, &mut vexp, kv_dim, kv_h_off, head_dim, seq_len);
+        let mut vact = vec![0.0f32; head_dim];
+        attn_values(&scores, &v, &mut vact, kv_dim, kv_h_off, head_dim, seq_len);
+        for d in 0..head_dim {
+            let diff = (vexp[d] - vact[d]).abs();
+            assert!(
+                diff < 1e-5,
+                "attn_values mismatch (head_dim={head_dim}) at d={d}: \
+                 expected={}, actual={}, diff={diff}",
+                vexp[d],
+                vact[d]
+            );
+        }
+    }
+
+    /// Sweep the `head_dim` shapes the vectorized decode kernels accept.
+    ///
+    /// The AVX2 score kernels consume Q two `__m256` at a time and finish with a
+    /// one-vector remainder, so that remainder only runs when `head_dim / 8` is
+    /// **odd** — i.e. `head_dim ≡ 8 (mod 16)`. 64 is the only AVX2-eligible size
+    /// among the fixed-size tests (the f16 test's 12/10/6 fail the
+    /// `head_dim % 8 == 0` gate and fall to scalar), and 64 is 8 vectors — even.
+    /// So that branch of hand-written unsafe SIMD was unexercised; 8/24/40/56/72
+    /// cover it.
+    ///
+    /// The 8..128 band is what both vector arms accept directly. 256 is added on
+    /// top and lands on a *different* path per arch, which is why it runs
+    /// everywhere rather than x86-only: on x86 it is the top of the AVX2
+    /// dispatcher's `head_dim <= 256` gate, and on aarch64 it is past the NEON
+    /// kernels' 128 ceiling (they hold Q and the accumulators in a
+    /// `32 × float32x4` array), so it pins down the dispatcher's fall-through to
+    /// scalar. That fall-through is the half this host cannot run — CI's Apple
+    /// silicon `cargo test` is what actually exercises it.
+    #[test]
+    fn test_attn_kernels_across_head_dims() {
+        for &hd in &[8usize, 16, 24, 32, 40, 48, 56, 64, 72, 128] {
+            check_attn_f32_kernels(hd);
+            check_attn_f16_kernels(hd);
+        }
+        // 256 exercises a different path per arch and both need covering: on
+        // x86 it is 32 `__m256` — the full `MAX_Q_VECS`/`MAX_ACC_VECS` the AVX2
+        // kernels size for, and the top of the dispatcher's `head_dim <= 256`
+        // gate — while on aarch64 it is past the NEON kernels' 128 ceiling, so
+        // it checks that the dispatcher really does fall through to scalar
+        // instead of overrunning their fixed-size arrays.
+        check_attn_f32_kernels(256);
+        check_attn_f16_kernels(256);
     }
 
     #[test]

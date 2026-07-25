@@ -818,6 +818,229 @@ pub(crate) struct AttnDims<'a> {
     pub rope_freqs: Option<&'a [f32]>,
 }
 
+// ── Decode-time GQA attention ───────────────────────────────────────────────
+
+/// The KV cache one decode attention pass reads. A layer stores exactly one
+/// representation, so this is an enum rather than both pairs plus a `use_f16`
+/// discriminant — the "only one of these is populated" invariant is then
+/// unrepresentable instead of a promise a caller has to keep.
+pub(crate) enum KvView<'a> {
+    F32 {
+        k: &'a [f32],
+        v: &'a [f32],
+    },
+    /// Widened to f32 on read by the `*_f16` kernels.
+    F16 {
+        k: &'a [u16],
+        v: &'a [u16],
+    },
+}
+
+/// Shapes for one decode attention pass (a single query position attending over
+/// `seq_len` cached positions).
+///
+/// `n_heads` must be a positive multiple of `n_kv_heads` (the GQA invariant).
+/// Both model families enforce it when they parse the GGUF — `LlamaConfig` and
+/// `Lfm2Config` each `ensure!` it at load — so this is a contract for future
+/// constructors, not a runtime risk on the shipped paths. It matters because
+/// `group_size` is a truncating divide: a non-multiple would place the last
+/// heads' `kv_h_offset` past the end of a KV row, which the attention kernels
+/// would read straight through in release builds.
+pub(crate) struct DecodeAttnDims {
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub scale: f32,
+    pub seq_len: usize,
+}
+
+impl DecodeAttnDims {
+    /// Query heads per KV head (GQA fan-in).
+    #[inline]
+    fn group_size(&self) -> usize {
+        self.n_heads / self.n_kv_heads
+    }
+
+    /// Row stride of the KV cache.
+    #[inline]
+    fn kv_dim(&self) -> usize {
+        self.n_kv_heads * self.head_dim
+    }
+}
+
+/// Score-MACs (`n_heads * seq_len * head_dim`) below which the head loop runs on
+/// the calling thread, so a degenerate shape (one head, a cache one position
+/// deep) doesn't pay for a dispatch it cannot fill. Override with
+/// `CERA_DECODE_ATTN_PAR_MIN_WORK`; `env_usize` keeps only values `>= 1`, so use
+/// `=1` (not `=0`) to force the pool arm — `0` is rejected and leaves the
+/// default in place.
+///
+/// This is a floor, not a measured crossover — a shallow-depth sweep on a
+/// 16-core host (forcing each arm with the env override) found the pool arm
+/// ahead at *every* depth tried, on both a 9-head 135M model and a 32-head 1B:
+///
+/// ```text
+///   prompt depth    16     32     64    128    256
+///   SmolLM-135M   +10.7%  +5.4%  +6.7% +15.6% +24.4%
+///   Llama-3.2-1B   +3.2%  +3.8%  +5.2%  +6.0%  +8.9%
+/// ```
+///
+/// The lowest-work run there (SmolLM at depth 16) starts at 9216 score-MACs and
+/// still wins, so the gate sits just under that. Everything at or above it was
+/// measured faster on the pool; below it is unmeasured territory where the whole
+/// pass costs microseconds either way.
+const DECODE_ATTN_PAR_MIN_WORK_DEFAULT: usize = 8_192;
+
+fn decode_attn_par_min_work() -> usize {
+    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        crate::backend::cpu_features::env_usize("CERA_DECODE_ATTN_PAR_MIN_WORK")
+            .unwrap_or(DECODE_ATTN_PAR_MIN_WORK_DEFAULT)
+    })
+}
+
+/// One query head: scores over the cache, softmax, value accumulation.
+fn decode_attn_head(
+    q: &[f32],
+    kv: &KvView<'_>,
+    d: &DecodeAttnDims,
+    h: usize,
+    scores: &mut [f32],
+    head_out: &mut [f32],
+) {
+    let q_head = &q[h * d.head_dim..(h + 1) * d.head_dim];
+    let kv_h_offset = (h / d.group_size()) * d.head_dim;
+    match kv {
+        KvView::F16 { k, v } => {
+            cpu::attn_scores_f16(
+                q_head,
+                k,
+                scores,
+                d.kv_dim(),
+                kv_h_offset,
+                d.head_dim,
+                d.scale,
+                d.seq_len,
+            );
+            cpu::softmax_inplace(scores);
+            cpu::attn_values_f16(
+                scores,
+                v,
+                head_out,
+                d.kv_dim(),
+                kv_h_offset,
+                d.head_dim,
+                d.seq_len,
+            );
+        }
+        KvView::F32 { k, v } => {
+            cpu::attn_scores(
+                q_head,
+                k,
+                scores,
+                d.kv_dim(),
+                kv_h_offset,
+                d.head_dim,
+                d.scale,
+                d.seq_len,
+            );
+            cpu::softmax_inplace(scores);
+            cpu::attn_values(
+                scores,
+                v,
+                head_out,
+                d.kv_dim(),
+                kv_h_offset,
+                d.head_dim,
+                d.seq_len,
+            );
+        }
+    }
+}
+
+/// Decode-time grouped-query attention over the whole KV cache, writing
+/// `attn_out[q_dim]`. Shared by the dense transformers and LFM2's non-TurboQuant
+/// path — the two head loops were identical.
+///
+/// The heads run on the decode pool when all three of: more than one head, work
+/// at or above [`decode_attn_par_min_work`] (the default constant, unless
+/// `CERA_DECODE_ATTN_PAR_MIN_WORK` moves it), and a decode pool wider than one
+/// worker. Otherwise the loop stays on the calling thread.
+/// `scratch` is then laid out as `n_heads` rows of `seq_len + head_dim`: each
+/// head's own score buffer followed by its own output. Fusing the two into one
+/// arena is what makes the loop parallelizable at all — the serial version
+/// reuses a single score buffer across heads, which becomes a write-write race
+/// the moment two heads run at once, and the dispatch API hands each row exactly
+/// one mutable slice. The tail copy back into `attn_out` is `q_dim` floats,
+/// negligible against the `n_heads * seq_len * head_dim` reductions above it.
+///
+/// That layout costs memory: `scratch` grows from `seq_len` floats to
+/// `n_heads * (seq_len + head_dim)`, an `n_heads`-fold jump — ~4 MB at 32k
+/// context on a 32-head model, against ~128 KB for the serial buffer. It is one
+/// per-session allocation, not per-layer, and each worker touches only its own
+/// row, so locality is unaffected; but on a memory-budgeted target that factor
+/// is the price of the fan-out.
+///
+/// Bit-identical to the serial loop either way: heads are independent, so which
+/// worker runs which head cannot change a result.
+pub(crate) fn decode_attention(
+    q: &[f32],
+    kv: &KvView<'_>,
+    d: &DecodeAttnDims,
+    attn_out: &mut [f32],
+    scratch: &mut Vec<f32>,
+) {
+    debug_assert!(
+        d.n_kv_heads > 0 && d.n_heads.is_multiple_of(d.n_kv_heads),
+        "GQA invariant: n_heads ({}) must be a positive multiple of n_kv_heads ({})",
+        d.n_heads,
+        d.n_kv_heads
+    );
+    let work = d
+        .n_heads
+        .saturating_mul(d.seq_len)
+        .saturating_mul(d.head_dim);
+    // Build the fused arena only when a dispatch can actually spread the heads.
+    // With one usable worker — no `parallel` feature, a single-core host,
+    // `CERA_DECODE_THREADS=1`, a pool degraded by a failed spawn — the arena and
+    // the gather below are pure overhead for a loop that runs on this thread
+    // regardless.
+    let fan_out =
+        d.n_heads > 1 && work >= decode_attn_par_min_work() && cpu::decode_par_threads() > 1;
+    if !fan_out {
+        scratch.resize(d.seq_len, 0.0);
+        for h in 0..d.n_heads {
+            let head_out = &mut attn_out[h * d.head_dim..(h + 1) * d.head_dim];
+            decode_attn_head(q, kv, d, h, scratch.as_mut_slice(), head_out);
+        }
+        return;
+    }
+
+    let stride = d.seq_len.saturating_add(d.head_dim);
+    // Saturating, not wrapping: a wrap here would silently hand out a *short*
+    // arena that the row dispatch and the gather below would then index as if
+    // it were `n_heads * stride` long. Saturating turns the same absurd shape
+    // into a failed allocation instead. (No real config comes close — this is
+    // the cheap way to keep a garbage `DecodeAttnDims` from becoming UB.)
+    //
+    // Not cleared: every element of every row is fully written below
+    // (`attn_scores*` fills `[..seq_len]`, `attn_values*` fills the head output),
+    // so `resize` only has to zero the bytes it grows by.
+    scratch.resize(d.n_heads.saturating_mul(stride), 0.0);
+    // One head per row *and* per steal unit: there are only `n_heads` of them and
+    // each is heavy, so the default steal floor would hand them all to a couple
+    // of workers.
+    cpu::par_rows_n_chunked_decode(scratch, stride, 1, 1, |(h, row)| {
+        let (scores, head_out) = row.split_at_mut(d.seq_len);
+        decode_attn_head(q, kv, d, h, scores, head_out);
+    });
+    for h in 0..d.n_heads {
+        let src = h * stride + d.seq_len;
+        attn_out[h * d.head_dim..(h + 1) * d.head_dim]
+            .copy_from_slice(&scratch[src..src + d.head_dim]);
+    }
+}
+
 /// Run one attention block for a single token. Writes the post-output-projection
 /// result into `state.scratch.out[..hidden_size]`. The pre-normed hidden state
 /// `hidden` is expected to already be RMSNorm'd by the caller (and, on aarch64,
@@ -963,16 +1186,16 @@ pub(crate) fn forward_attn_block(
         }
     }
 
-    // GQA: grouped query attention over the full KV cache.
-    let group_size = n_heads / n_kv_heads;
+    // GQA: grouped query attention over the full KV cache. The head→KV-head
+    // mapping is derived inside `decode_attention` from `n_kv_heads`.
     // Default softmax scale 1/sqrt(head_dim); Granite overrides via attn_scale.
     let scale = dims
         .attn_scale
         .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
     {
         // Bind both representations; only the active one is non-empty. The
-        // per-head loop branches on `use_f16` (constant across the call, so the
-        // predictor nails it) to widen f16 KV on read or use f32 directly.
+        // `use_f16` choice is made once below, when building the `KvView` — the
+        // head loop itself no longer carries the discriminant.
         let (k_cache, v_cache, k_cache_f16, v_cache_f16) = match &state.layers[layer] {
             LayerState::Attention {
                 key_cache,
@@ -995,57 +1218,30 @@ pub(crate) fn forward_attn_block(
         };
         let attn_out = &mut state.scratch.attn_out[..q_dim];
         let q = &state.scratch.q[..q_dim];
-        let scores = &mut state.scratch.scores;
-        scores.resize(seq_len, 0.0);
-        for h in 0..n_heads {
-            let kv_h = h / group_size;
-            let q_head = &q[h * head_dim..(h + 1) * head_dim];
-            let kv_h_offset = kv_h * head_dim;
-            let head_out = &mut attn_out[h * head_dim..(h + 1) * head_dim];
-            if use_f16 {
-                cpu::attn_scores_f16(
-                    q_head,
-                    k_cache_f16,
-                    scores,
-                    kv_dim,
-                    kv_h_offset,
-                    head_dim,
-                    scale,
-                    seq_len,
-                );
-                cpu::softmax_inplace(scores);
-                cpu::attn_values_f16(
-                    scores,
-                    v_cache_f16,
-                    head_out,
-                    kv_dim,
-                    kv_h_offset,
-                    head_dim,
-                    seq_len,
-                );
-            } else {
-                cpu::attn_scores(
-                    q_head,
-                    k_cache,
-                    scores,
-                    kv_dim,
-                    kv_h_offset,
-                    head_dim,
-                    scale,
-                    seq_len,
-                );
-                cpu::softmax_inplace(scores);
-                cpu::attn_values(
-                    scores,
-                    v_cache,
-                    head_out,
-                    kv_dim,
-                    kv_h_offset,
-                    head_dim,
-                    seq_len,
-                );
+        let kv = if use_f16 {
+            KvView::F16 {
+                k: k_cache_f16,
+                v: v_cache_f16,
             }
-        }
+        } else {
+            KvView::F32 {
+                k: k_cache,
+                v: v_cache,
+            }
+        };
+        decode_attention(
+            q,
+            &kv,
+            &DecodeAttnDims {
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                scale,
+                seq_len,
+            },
+            attn_out,
+            &mut state.scratch.scores,
+        );
     }
 
     // Output projection: attn_out (n_heads * head_dim) → out (hidden_size).
@@ -1252,5 +1448,210 @@ mod tests {
             scales, ref_scales,
             "parallel quantize_columns scales differ"
         );
+    }
+}
+
+// Not gated on `parallel`: `decode_attention` compiles either way, and the
+// serial branch is the *only* branch without the feature — precisely the
+// configuration that most needs the coverage.
+#[cfg(test)]
+mod decode_attn_tests {
+    use super::*;
+
+    /// Reference: the serial head loop `decode_attention` replaced, driven
+    /// through the same per-head primitive so the only thing under test is the
+    /// fan-out plumbing — head→row mapping, the fused `scores | out` arena, and
+    /// the gather back into `attn_out`.
+    fn serial_reference(q: &[f32], kv: &KvView<'_>, d: &DecodeAttnDims) -> Vec<f32> {
+        let mut out = vec![0.0f32; d.n_heads * d.head_dim];
+        let mut scores = vec![0.0f32; d.seq_len];
+        for h in 0..d.n_heads {
+            let head_out = &mut out[h * d.head_dim..(h + 1) * d.head_dim];
+            decode_attn_head(q, kv, d, h, &mut scores, head_out);
+        }
+        out
+    }
+
+    /// Mirror of `decode_attention`'s `fan_out` gate, so a test can assert which
+    /// branch it actually exercised.
+    fn would_fan_out(d: &DecodeAttnDims) -> bool {
+        // Saturating, matching `decode_attention` exactly — a mirror that
+        // computes the work term differently is not a mirror.
+        let work = d
+            .n_heads
+            .saturating_mul(d.seq_len)
+            .saturating_mul(d.head_dim);
+        d.n_heads > 1 && work >= decode_attn_par_min_work() && cpu::decode_par_threads() > 1
+    }
+
+    /// `expect_fan_out` is what the shape should do *on a host that can fan out*
+    /// — i.e. with the `parallel` feature and a multi-worker decode pool. Without
+    /// those, `decode_attention` always takes the serial branch and the
+    /// assertion is skipped, because there is nothing else it could do. Checking
+    /// this is what stops `decode_attention_parallel_matches_serial` from
+    /// quietly degrading into comparing the serial branch against itself if the
+    /// gate default is raised or the shapes here drift below it.
+    fn run_case(
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        expect_fan_out: bool,
+    ) {
+        let kv_dim = n_kv_heads * head_dim;
+        let mut st = 0x2545_F491_4F6C_DD1Du64;
+        let mut lcg = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            (st >> 40) as f32 / 8_388_608.0 - 1.0
+        };
+        let q: Vec<f32> = (0..n_heads * head_dim).map(|_| lcg()).collect();
+        let k: Vec<f32> = (0..seq_len * kv_dim).map(|_| lcg()).collect();
+        let v: Vec<f32> = (0..seq_len * kv_dim).map(|_| lcg()).collect();
+        let k_f16: Vec<u16> = k
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+        let v_f16: Vec<u16> = v
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+
+        for use_f16 in [false, true] {
+            let kv = if use_f16 {
+                KvView::F16 {
+                    k: &k_f16,
+                    v: &v_f16,
+                }
+            } else {
+                KvView::F32 { k: &k, v: &v }
+            };
+            let d = DecodeAttnDims {
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                scale: 1.0 / (head_dim as f32).sqrt(),
+                seq_len,
+            };
+            // Skipped when the gate is overridden, since the override moves the
+            // very threshold this is asserting against — otherwise anyone who
+            // exports `CERA_DECODE_ATTN_PAR_MIN_WORK` to tune sees the suite
+            // fail in a test that is working exactly as intended.
+            let gate_overridden = std::env::var_os("CERA_DECODE_ATTN_PAR_MIN_WORK").is_some();
+            if cfg!(feature = "parallel") && !gate_overridden && cpu::decode_par_threads() > 1 {
+                assert_eq!(
+                    would_fan_out(&d),
+                    expect_fan_out,
+                    "case (n_heads={n_heads}, seq_len={seq_len}) took the wrong \
+                     branch — this test would not be checking what it claims"
+                );
+            }
+            let want = serial_reference(&q, &kv, &d);
+            let mut got = vec![0.0f32; n_heads * head_dim];
+            // Deliberately undersized: `decode_attention` must grow and re-lay-out
+            // whatever it is handed, exactly as it does when depth advances.
+            let mut scratch = vec![0.0f32; 1];
+            decode_attention(&q, &kv, &d, &mut got, &mut scratch);
+            assert_eq!(
+                got, want,
+                "decode_attention differs (n_heads={n_heads}, seq_len={seq_len}, use_f16={use_f16})"
+            );
+        }
+    }
+
+    /// Above the work gate the heads run on the decode pool; the result must be
+    /// bit-identical to the serial loop (heads are independent, so scheduling
+    /// cannot change a value).
+    #[test]
+    fn decode_attention_parallel_matches_serial() {
+        // 8 * 256 * 64 = 131072 MACs ≥ DECODE_ATTN_PAR_MIN_WORK_DEFAULT.
+        run_case(8, 2, 64, 256, true);
+        // GQA with group_size 1 (MHA) and an odd head count, still above the gate.
+        run_case(7, 7, 64, 512, true);
+    }
+
+    /// Below the gate the same call must take the serial branch and agree too —
+    /// this is the branch that reuses one score buffer across heads.
+    ///
+    /// Each case trips a different one of the three `fan_out` conditions, so the
+    /// serial path is reached the way each guard would reach it in production:
+    /// under the work gate, and with a single head (a shape that would dispatch
+    /// one row and gain nothing). The third guard, a one-worker decode pool, is
+    /// not reachable from a test — the pool is a process-global built once from
+    /// the environment — so it is covered by inspection only.
+    #[test]
+    fn decode_attention_serial_branch_matches_reference() {
+        // 8 * 8 * 64 = 4096 MACs, under DECODE_ATTN_PAR_MIN_WORK_DEFAULT.
+        run_case(8, 2, 64, 8, false);
+        // n_heads == 1: over the work gate, but nothing to spread.
+        run_case(1, 1, 64, 4096, false);
+    }
+
+    /// Depth grows by one position per token, so the fused arena is re-laid-out
+    /// on every call and crosses the gate mid-sequence. Walking depths through
+    /// the boundary catches a stale-stride or stale-contents bug that a single
+    /// fixed depth would miss.
+    ///
+    /// Run for both cache representations: f16 reads the same arena through a
+    /// different kernel pair, so a stride bug could show up in one and not the
+    /// other. One `scratch` spans the whole walk, as in a real session.
+    #[test]
+    fn decode_attention_across_growing_depth() {
+        let n_heads = 8;
+        let n_kv_heads = 2;
+        let head_dim = 64;
+        let kv_dim = n_kv_heads * head_dim;
+        let max_len = 160;
+        let mut st = 0x853C_49E6_748F_EA9Bu64;
+        let mut lcg = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            (st >> 40) as f32 / 8_388_608.0 - 1.0
+        };
+        let q: Vec<f32> = (0..n_heads * head_dim).map(|_| lcg()).collect();
+        let k: Vec<f32> = (0..max_len * kv_dim).map(|_| lcg()).collect();
+        let v: Vec<f32> = (0..max_len * kv_dim).map(|_| lcg()).collect();
+        let k_f16: Vec<u16> = k
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+        let v_f16: Vec<u16> = v
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+
+        for use_f16 in [false, true] {
+            let mut scratch = Vec::new();
+            for seq_len in 1..=max_len {
+                let n = seq_len * kv_dim;
+                let kv = if use_f16 {
+                    KvView::F16 {
+                        k: &k_f16[..n],
+                        v: &v_f16[..n],
+                    }
+                } else {
+                    KvView::F32 {
+                        k: &k[..n],
+                        v: &v[..n],
+                    }
+                };
+                let d = DecodeAttnDims {
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    scale: 1.0 / (head_dim as f32).sqrt(),
+                    seq_len,
+                };
+                let want = serial_reference(&q, &kv, &d);
+                let mut got = vec![0.0f32; n_heads * head_dim];
+                decode_attention(&q, &kv, &d, &mut got, &mut scratch);
+                assert_eq!(
+                    got, want,
+                    "decode_attention differs at seq_len={seq_len} (use_f16={use_f16})"
+                );
+            }
+        }
     }
 }
