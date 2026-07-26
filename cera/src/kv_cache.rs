@@ -134,6 +134,48 @@ impl KvCompression {
     pub fn is_f16(&self) -> bool {
         matches!(self, Self::F16)
     }
+
+    /// Prefix-cache namespace tag for this mode — `""` for plain f32, else a
+    /// `"…:"`-terminated discriminator to prepend to a backend's cache id.
+    ///
+    /// The KV prefix cache's disk tier is keyed by model path (plus a backend
+    /// prefix), so without this every KV mode over the same GGUF and
+    /// `--cache-dir` shares one namespace. A snapshot from one mode then
+    /// permanently shadows another's for the same prefix: the restore-time
+    /// compatibility gate turns the longest match into a miss and does *not* fall
+    /// back to a shorter compatible entry, so the other mode stays cold on every
+    /// subsequent run, not just once. (Measured on wgpu: 134.7 → 10.3 tok/s
+    /// prefill, sticky.)
+    ///
+    /// Two things beyond the mode name are load-bearing:
+    /// - **The seed**, because it drives the per-layer randomized Hadamard
+    ///   rotations. Restore validates only shape (`head_dim` / `n_kv_heads` /
+    ///   `seq_len`), which a different-seed blob passes — so a shared namespace
+    ///   would decode a prefix in the wrong basis and silently corrupt attention
+    ///   rather than miss.
+    /// - **Which sides are compressed**, since keys-only and values-only produce
+    ///   genuinely different cache contents from both-sides and from f32.
+    ///
+    /// A TurboQuant config compressing neither side is *not* tagged: it degrades
+    /// to an f32 cache in `from_config_capped`, so its contents really are f32's
+    /// and separating them would only waste entries.
+    ///
+    /// Callers must tag with the mode their state actually ended up in, not the one
+    /// requested — a backend that falls back to f32 (unsupported `head_dim`, or a
+    /// single-sided request on GPU) must use the f32 tag so it shares the f32
+    /// namespace it is now writing into.
+    pub fn cache_tag(&self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::F16 => "f16:".to_string(),
+            Self::TurboQuant { seed, keys, values } => match (keys, values) {
+                (false, false) => String::new(),
+                (true, true) => format!("tq3kv-s{seed}:"),
+                (true, false) => format!("tq3k-s{seed}:"),
+                (false, true) => format!("tq3v-s{seed}:"),
+            },
+        }
+    }
 }
 
 /// Per-layer inference state.
@@ -1143,6 +1185,69 @@ impl InferenceState {
         }
 
         self.seq_len = new_seq_len;
+    }
+}
+
+#[cfg(test)]
+mod cache_tag_tests {
+    use super::KvCompression;
+
+    /// Every mode whose cache *contents* differ must get a distinct tag, and modes
+    /// whose contents are identical must share one. Without this, snapshots from
+    /// different modes collide in the prefix cache's disk namespace and one
+    /// permanently shadows the other for the same prefix.
+    #[test]
+    fn distinct_modes_get_distinct_tags() {
+        let f32_tag = KvCompression::None.cache_tag();
+        let f16_tag = KvCompression::F16.cache_tag();
+        let both = KvCompression::turboquant(42).cache_tag();
+        let keys_only = KvCompression::TurboQuant {
+            seed: 42,
+            keys: true,
+            values: false,
+        }
+        .cache_tag();
+        let values_only = KvCompression::TurboQuant {
+            seed: 42,
+            keys: false,
+            values: true,
+        }
+        .cache_tag();
+        // A different seed means different rotations, and restore validates only
+        // shape — so sharing a namespace would decode a prefix in the wrong basis
+        // rather than miss.
+        let other_seed = KvCompression::turboquant(7).cache_tag();
+
+        let tags = [
+            &f32_tag,
+            &f16_tag,
+            &both,
+            &keys_only,
+            &values_only,
+            &other_seed,
+        ];
+        for (i, a) in tags.iter().enumerate() {
+            for b in tags.iter().skip(i + 1) {
+                assert_ne!(a, b, "two modes share a cache tag: {a:?} vs {b:?}");
+            }
+        }
+        assert_eq!(f32_tag, "", "plain f32 must be the untagged default");
+    }
+
+    /// Compressing neither side degrades to an f32 cache in
+    /// `from_config_capped`, so its contents really are f32's — separating the two
+    /// namespaces would only waste entries.
+    #[test]
+    fn turboquant_with_no_sides_shares_the_f32_namespace() {
+        assert_eq!(
+            KvCompression::TurboQuant {
+                seed: 42,
+                keys: false,
+                values: false,
+            }
+            .cache_tag(),
+            KvCompression::None.cache_tag()
+        );
     }
 }
 

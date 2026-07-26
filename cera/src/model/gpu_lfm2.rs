@@ -563,6 +563,10 @@ pub struct GpuLfm2Model {
     /// whole of `configure_kv_compression` holds `infer_lock`, so the ordering is
     /// unobservable to other threads.
     kv_mode: OnceLock<Option<TqMode>>,
+    /// Prefix-cache namespace tag for the mode this model resolved to
+    /// (`KvCompression::cache_tag`). Empty until configured, which is the correct
+    /// tag for the f32 default.
+    kv_cache_tag: OnceLock<String>,
     /// Caller-supplied identifier (typically the GGUF file path) used to
     /// namespace prefix-cache disk files. Prefixed with `"wgpu:"` before
     /// being fed to `model_fingerprint` so wgpu's f32 disk-cache files
@@ -1237,6 +1241,7 @@ impl GpuLfm2Model {
             use_hs_scratch: AtomicBool::new(false),
             tq: OnceLock::new(),
             kv_mode: OnceLock::new(),
+            kv_cache_tag: OnceLock::new(),
             prefix_cache,
             model_id,
             lora_lru: Mutex::new(Vec::new()),
@@ -2288,20 +2293,10 @@ impl GpuLfm2Model {
     /// (which rebuilds the cache) because the engine configures the cache before
     /// the session configures compression.
     fn cache_namespace(&self) -> String {
-        let mode = match self.kv_mode.get() {
-            // The seed is part of the identity, not just the mode: it drives the
-            // per-layer randomized Hadamard rotations, so a cache written under
-            // one seed decodes to garbage under another. `restore_layer` only
-            // validates shape (head_dim / n_kv_heads / seq_len), which a
-            // different-seed blob passes — so without the seed here, two sessions
-            // over the same GGUF and `--cache-dir` with different seeds would
-            // silently attend in the wrong basis.
-            Some(Some(m)) => format!("tq3-s{}:", m.seed),
-            // Not yet configured behaves as f32 — the mode-setting path rebuilds
-            // the cache, so an early `configure_cache` can't leave a stale tag.
-            Some(None) | None => String::new(),
-        };
-        format!("wgpu:{mode}{}", self.model_id)
+        // Not yet configured behaves as f32 (the empty tag) — the mode-setting path
+        // rebuilds the cache, so an early `configure_cache` can't leave a stale tag.
+        let tag = self.kv_cache_tag.get().map(String::as_str).unwrap_or("");
+        format!("wgpu:{tag}{}", self.model_id)
     }
 
     /// The GPU-resident TurboQuant cache, when the session configured one and
@@ -5189,6 +5184,14 @@ impl Model for GpuLfm2Model {
             assert!(self.tq.set(cache).is_ok(), "tq cache set race");
         }
         let _ = self.kv_mode.set(want);
+        // Tag with the mode the cache will actually hold, not the one requested: a
+        // TurboQuant request this backend can't serve resolved to f32 above, and
+        // must share the f32 namespace it is now writing into.
+        let _ = self.kv_cache_tag.set(if want.is_some() {
+            compression.cache_tag()
+        } else {
+            KvCompression::None.cache_tag()
+        });
 
         // Re-namespace the prefix cache now that the mode is known. The engine
         // calls `configure_cache` at load time, before any session exists, so the

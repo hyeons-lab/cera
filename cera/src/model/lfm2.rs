@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 
 use crate::backend::cpu;
 use crate::gguf::GgufFile;
-use crate::kv_cache::{InferenceState, KvPrefixCache, LayerState};
+use crate::kv_cache::{InferenceState, KvCompression, KvPrefixCache, LayerState};
 use crate::model::transformer::{self, FfnWeights};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 // DType's only remaining uses here are the aarch64 per-token GEMV dispatch
@@ -77,9 +77,26 @@ pub struct Lfm2Model {
     /// Defaults to `KvCacheConfig::default()` (warm-only) at
     /// construction time so warm hits work without explicit config.
     prefix_cache: Mutex<KvPrefixCache>,
+    /// Prefix-cache namespace tag for the KV mode this model's sessions use
+    /// (`KvCompression::cache_tag`). Set by `configure_kv_compression`; empty
+    /// until then, which is the correct tag for the f32 default.
+    ///
+    /// The model, not the state, owns this because the cache's `model_fingerprint`
+    /// is fixed when the cache is built — whereas the mode arrives later, with the
+    /// session.
+    kv_cache_tag: Mutex<String>,
 }
 
 impl Lfm2Model {
+    /// Prefix-cache namespace: the `"cpu:"` backend prefix, the KV-mode tag, and
+    /// the model id. The backend prefix keeps CPU entries away from wgpu's and
+    /// Metal's (their state shapes differ even where the byte format matches); the
+    /// mode tag keeps f32, f16, and each TurboQuant configuration apart.
+    fn cache_namespace(&self) -> String {
+        let tag = self.kv_cache_tag.lock().expect("kv_cache_tag poisoned");
+        format!("cpu:{tag}{}", self.model_id)
+    }
+
     /// Construct without a model identifier. Equivalent to
     /// `from_gguf_with_id(gguf, context_size, "")`. Warm prefix cache
     /// works after `Model::configure_cache`; disk cache (when
@@ -318,6 +335,7 @@ impl Lfm2Model {
             layer_refs,
             model_id,
             prefix_cache,
+            kv_cache_tag: Mutex::new(String::new()),
         })
     }
 
@@ -2714,11 +2732,50 @@ impl Model for Lfm2Model {
     }
 
     fn configure_cache(&self, config: crate::kv_cache::KvCacheConfig) {
+        let id = self.cache_namespace();
         *self
             .prefix_cache
             .lock()
-            .expect("prefix_cache mutex poisoned") =
-            KvPrefixCache::new(config, &self.config, &format!("cpu:{}", self.model_id));
+            .expect("prefix_cache mutex poisoned") = KvPrefixCache::new(config, &self.config, &id);
+    }
+
+    /// The CPU backend allocates its KV from `InferenceState`, so there is nothing
+    /// to build here — but the prefix cache's namespace still has to reflect the
+    /// mode, or snapshots from different KV modes collide on disk. See
+    /// [`KvCompression::cache_tag`] for what that collision costs.
+    ///
+    /// Unlike the GPU backends this imposes no first-call-wins constraint: no
+    /// buffers are sized by the mode, so re-tagging for a later session with a
+    /// different mode is safe. Rebuilding drops the warm tier, which is the point —
+    /// those entries belong to the previous mode's namespace.
+    fn configure_kv_compression(
+        &self,
+        compression: &KvCompression,
+    ) -> Result<(), crate::CeraError> {
+        // The state resolves a TurboQuant request with a non-power-of-two head_dim
+        // to plain f32 (`from_config_capped`), so tag with what the cache will
+        // actually hold, not what was asked for.
+        let resolved =
+            if compression.flags() != (false, false) && !self.config.head_dim.is_power_of_two() {
+                KvCompression::None.cache_tag()
+            } else {
+                compression.cache_tag()
+            };
+        let mut tag = self.kv_cache_tag.lock().expect("kv_cache_tag poisoned");
+        if *tag == resolved {
+            return Ok(());
+        }
+        *tag = resolved;
+        drop(tag);
+
+        let id = self.cache_namespace();
+        let mut cache = self
+            .prefix_cache
+            .lock()
+            .expect("prefix_cache mutex poisoned");
+        let cache_config = cache.config.clone();
+        *cache = KvPrefixCache::new(cache_config, &self.config, &id);
+        Ok(())
     }
 
     fn forward_prefill_from_embeddings(
