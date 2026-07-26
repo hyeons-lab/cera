@@ -4,7 +4,9 @@
 
 // ── Thread pool configuration ──────────────────────────────────────────────
 
-/// Warm the compute pools and size rayon's global pool to performance cores.
+/// Warm the prefill pool and size rayon's global pool to performance cores.
+///
+/// The decode pool is intentionally left cold — see the body for why.
 ///
 /// The GEMV/GEMM row hot path runs on the persistent
 /// [`super::threadpool::RowPool`]s, sized from the detected topology —
@@ -22,10 +24,18 @@
 /// Returns the number of threads configured.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub fn configure_thread_pool() -> usize {
-    // Warm both row-parallel pools — spawns and pins their workers now rather
-    // than lazily on the first GEMV. The prefill pool's width is the headline
-    // thread count; the decode pool is intentionally narrower (memory-bound).
-    let _ = super::threadpool::RowPool::decode().num_threads();
+    // Warm the prefill pool — spawns and pins its workers now rather than
+    // lazily on the first GEMM. Its width is the headline thread count.
+    //
+    // The **decode** pool is deliberately not warmed here. Its width depends on
+    // the loaded model's `DecodeShape` (see `backend::calibrate`), and this
+    // runs from `main()` before any model exists — warming it here would freeze
+    // the pool at the model-less fallback width and silently disable
+    // shape-based sizing. It builds on the first decode GEMV instead, which is
+    // after `load_model` has registered the shape. That defers its worker spawn
+    // into the first token rather than startup — unmeasured, but it is one
+    // thread spawn per worker, once per process, against a decode that already
+    // takes milliseconds per token.
     let pool_threads = super::threadpool::RowPool::prefill().num_threads();
 
     // Also size rayon's global pool for the remaining `par_chunks_mut` sites
@@ -6250,11 +6260,14 @@ mod tests {
     /// synchronization tax decode pays per GEMV.
     ///
     /// Worth having permanently because it settles an argument that recurs:
-    /// decode issues ~113 dispatches per token (Llama-3.2-1B: 16 layers x 7
-    /// GEMVs + logits), so "fuse the GEMVs to cut barriers" sounds compelling
-    /// until the barrier is measured. On a Ryzen AI MAX+ 395 it is ~2 us
-    /// spinning at the default 12 threads (~3 us at 16) — call it 0.2-0.4 ms
-    /// of a 19 ms token, so 1-2%. Halving the dispatch count buys under 1%.
+    /// decode issues on the order of 100 dispatches per token (Llama-3.2-1B
+    /// measures 129: 16 layers x 7 GEMVs, one attention fan-out each, plus
+    /// logits), so "fuse the GEMVs to cut barriers" sounds compelling until the
+    /// barrier is measured. On a Ryzen AI MAX+ 395 it is ~2 us spinning at 12
+    /// threads (~3 us at 16) — call it 0.2-0.4 ms of a 19 ms token, so 1-2%.
+    /// Halving the dispatch count buys under 1%. (The per-token dispatch count
+    /// is model-specific — 25 to 257 across the set in `backend::calibrate` —
+    /// and is now what sizes the decode pool; see `DecodeShape`.)
     ///
     /// The same run under `CERA_SPIN=0` reports ~240 us at 12 threads (~330 us
     /// at 16): a 100x jump. Parking and re-waking workers is the expensive

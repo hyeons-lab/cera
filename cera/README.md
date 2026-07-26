@@ -251,20 +251,31 @@ disabling it caps that tier at AVX2.
 On native targets the CPU backend dispatches GEMV/GEMM rows through a
 persistent, affinity-pinned worker pool (not a per-call fork-join), with dynamic
 chunk-stealing so faster cores absorb more work on heterogeneous big.LITTLE
-mobile. Decode runs on the detected performance cores; prefill uses all of them.
-Two independent auto-caps bound the width: on heterogeneous big.LITTLE parts
-(Linux/Android) detection keeps at most 6 big cores (both pools), and on the
-homogeneous fallback — desktop/server/macOS, where sysfs detection is skipped
-and every logical CPU counts as a "perf core" — decode is separately capped at
-12 while prefill uses all. This fixes the multi-core decode collapse on Android
-big.LITTLE and lets decode scale across the performance cores. Everything is
-auto-detected per device — the environment variables below only override for
-tuning (`CERA_THREADS` moves the detected count past either cap in both
-directions):
+mobile. On heterogeneous big.LITTLE parts (Linux/Android) detection keeps at
+most 6 big cores for both pools, which fixes the multi-core decode collapse
+there. Elsewhere — desktop/server (where sysfs detection is skipped and every
+logical CPU counts as a "perf core") and macOS (where the P-core count comes
+from `hw.perflevel0`) — prefill
+uses all of them while **decode is sized from the loaded model** (see "How the
+decode thread count is chosen" in the top-level README): small models that
+spread a token across many small pool dispatches run narrow, large ones that
+move more bytes per dispatch run wide. Where that sizing does not apply —
+heterogeneous parts, or a host whose physical core count cannot be detected
+(Windows, BSD, Intel macOS) — the previous flat cap applies as before (≤12
+homogeneous, ≤6 on big.LITTLE). Both pools are process-wide singletons, so the
+decode width is sized from the **first** model loaded into a process and stays
+there for any loaded after it — it does not re-size per load. Everything else is
+auto-detected per device; the
+environment variables below only override for tuning (`CERA_THREADS` moves the
+detected count, which both pools size from):
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `CERA_DECODE_THREADS` | detected perf cores (≤6 heterogeneous, ≤12 homogeneous) | Decode worker count — a fixed `<n>`, or `auto`. A fixed value is clamped to the detected performance cores; the 12 cap applies only to the homogeneous `auto` path (heterogeneous big.LITTLE detection already caps big cores at 6). |
+| `CERA_DECODE_THREADS` | `auto` | Decode worker count. A fixed `<n>` pins the width and overrides the automatic sizing (clamped to the detected performance cores); `auto` selects the model-based sizing below. |
+| `CERA_DECODE_SIZING` | on | `0` / `false` / `off` disables model-aware decode sizing, falling back to the flat cap (detected perf cores, ≤6 heterogeneous / ≤12 homogeneous). |
+| `CERA_DECODE_NARROW` | `physical / 2`, capped at 12 | Decode width for barrier-bound models (below the bytes-per-dispatch threshold); never exceeds the wide arm. Setting it also forces sizing on where it would otherwise be declined (on a host whose physical core count is undetectable, both arms must be pinned). |
+| `CERA_DECODE_WIDE` | `physical + physical / 4`, capped at 24 | Decode width for bandwidth-bound models, clamped to the detected cores. Setting it also forces sizing on where it would otherwise be declined (on a host whose physical core count is undetectable, both arms must be pinned). |
+| `CERA_DECODE_BPD_KB` | 2500 | Bytes-per-dispatch threshold (decimal KB) separating the two arms above. Unlike the two widths, this does **not** force sizing on where it is declined — it moves the threshold, it does not pin a width. |
 | `CERA_THREADS` | detected perf-core count | Override the detected performance-core count (moves the auto width for both pools). |
 | `CERA_MIN_ROWS` | 128 | Minimum output rows a decode-GEMV worker takes before another joins. |
 | `CERA_PAR_THRESHOLD` | 256 | Minimum output dimension before a GEMV parallelizes; smaller GEMVs stay serial. |

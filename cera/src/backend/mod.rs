@@ -8,7 +8,7 @@ pub mod simd;
 pub mod threadpool;
 
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-mod calibrate;
+pub(crate) mod calibrate;
 
 #[cfg(feature = "blas")]
 pub mod blas;

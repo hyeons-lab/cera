@@ -459,20 +459,40 @@ pub fn load_model(
     let model_id = path
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    match arch.as_str() {
-        "lfm2" => Ok(Box::new(lfm2::Lfm2Model::from_gguf_with_id(
-            gguf,
-            context_size,
-            model_id,
-        )?)),
-        // Classic Mistral ships as arch "llama" (the `"mistral"` GGUF arch
-        // string does not exist in llama.cpp; Mistral 3.x/4.x are the distinct
-        // "mistral3"/"mistral4" archs with different layouts, not served here).
-        "qwen2" | "qwen3" | "llama" | "granite" => Ok(Box::new(
-            llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?,
-        )),
-        other => bail!("unsupported architecture: {other}"),
+    // Read the decode shape while the GGUF is still ours (the constructors take
+    // it by value); it is registered only if one of them succeeds, below.
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    let shape = crate::backend::calibrate::DecodeShape::from_gguf(&gguf);
+
+    let model: Box<dyn Model> =
+        match arch.as_str() {
+            "lfm2" => Box::new(lfm2::Lfm2Model::from_gguf_with_id(
+                gguf,
+                context_size,
+                model_id,
+            )?),
+            // Classic Mistral ships as arch "llama" (the `"mistral"` GGUF arch
+            // string does not exist in llama.cpp; Mistral 3.x/4.x are the distinct
+            // "mistral3"/"mistral4" archs with different layouts, not served here).
+            "qwen2" | "qwen3" | "llama" | "granite" => Box::new(
+                llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?,
+            ),
+            other => bail!("unsupported architecture: {other}"),
+        };
+
+    // Size the decode pool to this model rather than a flat cap. Registered
+    // only now, after a constructor actually returned a model:
+    // `set_decode_shape` is first-writer-wins, so pinning the process from a
+    // load that then failed — unsupported arch, missing tensor, bad metadata —
+    // would size every later model after one that never ran. Nothing between
+    // here and the first decoded token can build the pool. CPU path only; the
+    // GPU/Metal loaders don't drive the CPU decode pool. Gated exactly like
+    // `backend::calibrate`, which exists only where the `RowPool` does.
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    if let Some(shape) = shape {
+        crate::backend::calibrate::set_decode_shape(shape);
     }
+    Ok(model)
 }
 
 /// Load a model with GPU acceleration.

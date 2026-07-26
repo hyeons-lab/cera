@@ -257,33 +257,74 @@ optimal on any one. The knobs below override them.
 
 | Variable | Effect |
 |----------|--------|
-| `CERA_DECODE_THREADS=<n>` or `CERA_DECODE_THREADS=auto` | Worker count for decode (per-token GEMV). Default is the detected performance-core count capped at 12; clamped to the detected count. |
+| `CERA_DECODE_THREADS=<n>` or `CERA_DECODE_THREADS=auto` | Worker count for decode (per-token GEMV). A fixed `<n>` overrides the automatic sizing below (clamped to the detected count); `auto` selects it. |
+| `CERA_DECODE_SIZING=off` | Disable model-aware decode sizing (`0` / `false` / `off`, case-insensitive) and fall back to the flat cap (detected perf cores — ≤12 homogeneous, ≤6 on big.LITTLE). Use this to A/B the sizing on a new machine. |
+| `CERA_DECODE_NARROW=<n>` / `CERA_DECODE_WIDE=<n>` | Override the two widths the sizing picks between. Defaults derive from the physical core count — `physical/2` capped at 12, and `physical + physical/4` capped at 24; the narrow arm never exceeds the wide one. Setting either also forces sizing on where it would otherwise be declined; on a host whose physical core count is undetectable, both must be pinned. |
+| `CERA_DECODE_BPD_KB=<n>` | Bytes-per-dispatch threshold (decimal KB) separating the narrow arm from the wide one. Default 2500. Unlike the two above, this does not force sizing on where it is declined — it moves the threshold, it does not pin a width. |
 | `CERA_THREADS=<n>` | Overrides the detected performance-core count, which the decode/prefill pools are sized from. |
 | `CERA_CPU_TIER=<tier>` | Caps the SIMD tier (e.g. `avx2`, `avx512`). May only downgrade — useful for A/B-ing a kernel path. |
 | `RUST_LOG=<filter>` | Log level. Defaults to `warn`, which surfaces things like prefill falling back to the slow per-token path. |
 
-### Picking a decode thread count
+### How the decode thread count is chosen
 
-There is no single best value: the optimum reverses with weight-set size.
-Measured on a Ryzen AI MAX+ 395 (16 physical / 32 logical cores), decode tok/s
-from interleaved A/B runs:
+Decode width is sized from the **loaded model**, because there is no single best
+value — and, less obviously, model *size* does not predict it. Measured on a
+Ryzen AI MAX+ 395 (16 physical / 32 logical), decode tok/s change going from 12
+to 20 workers:
 
-| Model | Weights | 12 threads | 20 threads |
-|-------|--------:|-----------:|-----------:|
-| SmolLM-135M Q4_0 | 92 MB | **229–240** | 144–147 |
-| LFM2.5-230M Q4_K_M | 153 MB | 168–186 | 157–178 |
-| Llama-3.2-1B Q4_K_M | 808 MB | 43.5–52.9 | 42.0–45.3 |
-| Llama-3.2-1B Q8_0 | 1321 MB | 37–41 | **50–51** |
+| Model | Weights | Bytes/dispatch | 12 → 20 |
+|-------|--------:|---------------:|--------:|
+| TinyStories-20M Q8_0 | 21 MB | 0.84 MB | −47% |
+| SmolLM-135M Q4_0 | 92 MB | 0.51 MB | −11% |
+| LFM2.5-350M Q8_0 | 379 MB | 3.83 MB | **+29%** |
+| SmolLM-360M Q8_0 | 386 MB | 1.50 MB | **−7%** |
+| Llama-3.2-1B Q8_0 | 1321 MB | 10.24 MB | **+38%** |
 
-Small models are dominated by the per-dispatch barrier, so extra workers are
-overhead — the smallest is **1.6× faster at 12 than at 20**. Large models
-amortize the barrier and want the memory bandwidth — the largest is **1.3×
-faster at 20**. The two in between show no difference beyond run-to-run spread.
+Note the middle two: near-identical weight bytes, opposite answers. What
+separates them is how many **pool dispatches** a token is split across — LFM2
+issues 99 per token against SmolLM-360M's 257, so each dispatch amortizes 2.6×
+more work against the same fixed barrier cost. Below ~2.5 MB per dispatch decode
+is barrier-bound and wants fewer workers; above it decode is bandwidth-bound and
+wants more.
 
-If you run one model repeatedly and care about decode latency, measure both
-ends on your own hardware; `cera bench --model <path>` with
-`CERA_DECODE_THREADS` set is enough. Interleave the arms rather than sweeping —
-laptop clocks drift enough to invent a trend that isn't there.
+cera computes that ratio from the GGUF at load and picks a narrow or wide width
+accordingly. A/B against the old flat cap of 12 — same binary, interleaved,
+`CERA_DECODE_SIZING=off` vs on, the five models above at two prompt depths —
+gave **+19% mean over those 10 cells with no cell slower** (small models gain
+too: they get *fewer* than 12 workers). Scored differently, against each model's
+own best measured width across the full 12-model set, the rule reaches 98.1% of
+peak versus 90.1% for the flat cap; one combo near the threshold
+(LFM2.5-350M Q4_0) lands on the narrow arm when its measurement mildly preferred
+the wide one, which is the cost that average already includes.
+
+The pool itself is a process-wide singleton, built once on the first decode
+dispatch, so the width comes from the **first** model loaded into a process and
+stays there for any loaded after it — it does not re-size per load. (The thread
+count was already inherited that way before this sizing existed.) Embedders
+running several models in one process should pick the knobs below for whichever
+model's decode matters, or load that one first.
+
+This is calibrated on one x86 host. The sizing steps aside — leaving the
+previous flat-cap behaviour — in two cases. On heterogeneous parts, because
+decode there measured best across *all* big cores (that evidence is from ARM
+big.LITTLE; x86 hybrid parts decline by the same argument, without the direct
+measurement). And on hosts whose physical core count cannot be detected
+(Windows, BSD, Intel macOS), where deriving a width from the *logical* count
+would overshoot badly. Pinning a width forces it on anyway, for sweeping a
+machine it has not been tuned against — one arm is enough on a heterogeneous
+host, both are required where the physical core count is undetectable.
+
+**Apple Silicon is sized, not declined.** M-series parts are heterogeneous in
+hardware, but cera detects only their P-cores, so neither decline case applies:
+an M4 Max gets 12 workers for large models (its full P-core count — there is no
+SMT for the wide arm to spend) and 6 for small ones. That narrow arm is the
+part of this that has *not* been measured off x86.
+
+If you run one model repeatedly and care about decode latency, it is still
+worth measuring: `cera bench --model <path>` with `CERA_DECODE_THREADS` set
+sweeps a fixed width, and `CERA_DECODE_SIZING=off` gives you the old default to
+compare against. Interleave the arms rather than sweeping — laptop clocks drift
+enough to invent a trend that isn't there.
 
 ## Other features
 

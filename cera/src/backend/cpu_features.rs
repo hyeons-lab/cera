@@ -344,9 +344,11 @@ pub struct CoreTopology {
 /// Snapdragon 8-series) with a sensible power/thermal margin. On a SoC with
 /// more than 6 performance cores (e.g. an 8-prime part) this leaves a couple
 /// idle — deliberately conservative; `CERA_THREADS` overrides in both
-/// directions for tuning. The homogeneous/unpinned decode fallback has its own,
-/// separate ceiling (`calibrate::DECODE_MAX_AUTO`); keep the two in mind
-/// together when retuning either.
+/// directions for tuning. Decode has two further ceilings of its own, both in
+/// `calibrate`: `DECODE_WIDTH_MAX` bounds the wide arm of the model-sized path,
+/// and `DECODE_MAX_AUTO` is both the flat fallback for hosts that path declines
+/// *and* the ceiling on its narrow arm. Keep all three in mind when retuning
+/// any of them.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const MAX_AUTO_THREADS: usize = 6;
 
@@ -377,10 +379,77 @@ pub(crate) fn env_usize(name: &str) -> Option<usize> {
         .filter(|&n| n >= 1)
 }
 
+/// Whether an environment variable explicitly switches a feature **off**
+/// (`0` / `false` / `off`, case-insensitive). Unset ⇒ `false` (leave it on).
+/// Shared by the `CERA_*` kill switches so they all spell "off" the same way.
+///
+/// Gated with its callers (`threadpool::pinning_enabled`,
+/// `calibrate::sizing_enabled`), which exist only where the `RowPool` does.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub(crate) fn env_disabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            ["0", "false", "off"]
+                .iter()
+                .any(|d| v.eq_ignore_ascii_case(d))
+        })
+        .unwrap_or(false)
+}
+
 /// Number of performance cores to run compute threads on (convenience over
 /// [`core_topology`]). Always ≥ 1.
 pub fn performance_core_count() -> usize {
     core_topology().perf_core_count
+}
+
+/// Physical (non-SMT) core count, cached. `None` when the platform gives us no
+/// way to tell — Windows, BSD, Intel macOS.
+///
+/// Distinct from [`performance_core_count`], which on a homogeneous host is
+/// *all logical* CPUs — double the physical count on an SMT part. Decode sizing
+/// has to tell those apart: measured on Zen 5 (16 physical / 32 logical),
+/// decode peaked at 20 workers and collapsed at 32 (Llama-1B Q8_0: 29.7 → 17.9
+/// tok/s), i.e. *some* SMT helps and full logical width badly does not.
+///
+/// **Returns `Option` on purpose.** Substituting the logical count when
+/// detection fails is not conservative — it is the opposite: a caller deriving
+/// a width from `physical` would then derive it from *logical* and land on
+/// exactly the full-width configuration measured above as catastrophic.
+/// Callers must decide explicitly what to do when the answer is unknown.
+pub fn physical_core_count() -> Option<usize> {
+    static COUNT: OnceLock<Option<usize>> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(n) = linux_physical_cores() {
+            return Some(n);
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(n) = macos_sysctl_usize(c"hw.perflevel0.physicalcpu") {
+            return Some(n);
+        }
+        None
+    })
+}
+
+/// Count distinct `thread_siblings_list` sets — SMT siblings share one, so the
+/// number of sets is the physical core count.
+///
+/// Keyed on the sibling set, **not** `core_id`: Linux restarts `core_id` per
+/// *cluster* on multi-cluster ARM device trees (gs101 maps [0,1,2,3, 0,1, 0,1]),
+/// so keying on it would collapse whole big/prime clusters into one core. This
+/// is the same key, and the same reasoning, as the SMT-sibling drop in
+/// [`detect_topology_sysfs`]. Reuses [`read_per_cpu_trimmed`], which ends the
+/// scan at a missing `cpuN` *directory* rather than at the first unreadable
+/// file, so one offline core cannot truncate the count.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_physical_cores() -> Option<usize> {
+    let sets = read_per_cpu_trimmed("topology/thread_siblings_list");
+    if sets.is_empty() {
+        return None;
+    }
+    let distinct: std::collections::HashSet<&str> = sets.iter().map(|(_, s)| s.as_str()).collect();
+    Some(distinct.len())
 }
 
 /// Uncached topology detection. Prefer [`core_topology`]; exposed for tests.
@@ -534,6 +603,15 @@ fn read_per_cpu_u32(file: &str) -> Vec<(usize, u32)> {
 /// via the `available_parallelism` fallback.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn macos_perf_core_count() -> Option<usize> {
+    macos_sysctl_usize(c"hw.perflevel0.logicalcpu")
+}
+
+/// Read a positive `i32` sysctl by name. `None` if the sysctl is unavailable —
+/// or under Miri, which cannot interpret the foreign call; the topology sits on
+/// the GEMV hot path, and returning `None` keeps the full test suite
+/// Miri-runnable via the `available_parallelism` fallback.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn macos_sysctl_usize(name: &std::ffi::CStr) -> Option<usize> {
     if cfg!(miri) {
         return None;
     }
@@ -546,7 +624,6 @@ fn macos_perf_core_count() -> Option<usize> {
             newlen: usize,
         ) -> i32;
     }
-    let name = c"hw.perflevel0.logicalcpu";
     let mut value: i32 = 0;
     let mut size = std::mem::size_of::<i32>();
     let ret = unsafe {
@@ -558,11 +635,7 @@ fn macos_perf_core_count() -> Option<usize> {
             0,
         )
     };
-    if ret == 0 && value > 0 {
-        Some(value as usize)
-    } else {
-        None
-    }
+    (ret == 0 && value > 0).then_some(value as usize)
 }
 
 #[cfg(test)]
