@@ -1407,13 +1407,33 @@ impl KvPrefixCache {
         }
     }
 
-    /// Find the longest cached prefix matching the start of `tokens`.
-    /// Checks both warm and cold tiers and returns whichever has the longer match.
+    /// Find the longest cached **strict** prefix of `tokens` — an entry covering
+    /// `[0, len)` with `len < tokens.len()`. Checks both warm and cold tiers and
+    /// returns whichever has the longer match.
+    ///
+    /// Strictness is not a detail, it is the contract every consumer already
+    /// enforces: a full-length hit would leave `use_len == tokens.len()`, and the
+    /// restored state already reflects "after all tokens", so re-running the last
+    /// token would advance the conv rolling buffer one position past where it
+    /// belongs (conv layers don't gate on `seq_len`). `Lfm2Model::forward_prefill`
+    /// and both GPU backends therefore skip full hits.
+    ///
+    /// Returning them anyway made the cache **effectively single-use per token
+    /// sequence**: run a prompt once and `insert` stores a full-length entry for
+    /// it; ask the same question again and that entry is the longest match, so the
+    /// caller rejects it and falls through to a cold prefill *without* falling back
+    /// to the shorter, perfectly usable prefix sitting right there. Measured on
+    /// LFM2-VL-450M: a genuine prefix hit prefills at ~17k tok/s (f32) / ~20k
+    /// (tq3), versus ~840 / ~367 cold — so the shadowed lookup was giving up a
+    /// 20-55x speedup on every repeat query.
+    ///
+    /// Filtering here rather than in each backend keeps warm and cold consistent
+    /// and fixes all three backends at once.
     pub fn find_longest_prefix(&mut self, tokens: &[u32]) -> Option<(StateSnapshot, usize)> {
         let warm_hit = self
             .warm
             .values()
-            .filter(|e| tokens.starts_with(&e.tokens))
+            .filter(|e| e.tokens.len() < tokens.len() && tokens.starts_with(&e.tokens))
             .max_by_key(|e| e.tokens.len())
             .map(|e| {
                 e.last_used.set(Instant::now());
@@ -1621,9 +1641,16 @@ impl KvPrefixCache {
     fn find_cold_prefix(&self, dir: &Path, tokens: &[u32]) -> Option<StateSnapshot> {
         // Check specific filenames by pre-computing hashes for all prefixes,
         // longest first. This avoids reading the entire directory.
+        //
+        // The range stops at `tokens.len() - 1`: only STRICT prefixes are useful
+        // (see `find_longest_prefix`). Including the full length would match the
+        // entry this very query wrote last time, which every caller then rejects —
+        // and because the scan `break`s on its first match, it would never fall
+        // back to the shorter usable one. A 1-token input has no strict prefix, so
+        // the loop is correctly empty.
         let mut best: Option<StateSnapshot> = None;
 
-        for prefix_len in (1..=tokens.len()).rev() {
+        for prefix_len in (1..tokens.len()).rev() {
             let prefix = &tokens[..prefix_len];
             let hash = hash_tokens(prefix);
             let path = dir.join(self.cold_filename(hash));
@@ -1838,6 +1865,54 @@ mod tests {
         }
     }
 
+    /// A cached entry covering *all* of `tokens` must not shadow a shorter, usable
+    /// one.
+    ///
+    /// Every consumer rejects a full-length hit (the restored state already
+    /// reflects "after all tokens", so re-running the last token would over-advance
+    /// the conv rolling buffer). But `insert` stores a full-length entry after each
+    /// prefill, so returning them made the cache effectively single-use per token
+    /// sequence: the second time the same prompt arrived, the full-length entry was
+    /// the longest match, the caller rejected it, and the lookup never fell back to
+    /// the strict prefix sitting right there. That cost a 20-55x prefill speedup on
+    /// every repeat query.
+    #[test]
+    fn full_length_entry_does_not_shadow_a_shorter_prefix() {
+        let cfg = tiny_config(2, 8);
+        let mut cache = KvPrefixCache::new(
+            KvCacheConfig {
+                cache_dir: None,
+                ..KvCacheConfig::default()
+            },
+            &cfg,
+            "test",
+        );
+        let snapshot = |seq_len: usize| StateSnapshot {
+            layers: Vec::new(),
+            seq_len,
+        };
+        let tokens = [1u32, 2, 3, 4];
+
+        // Only a full-length entry exists → no usable hit.
+        cache.insert(&tokens, snapshot(tokens.len()));
+        assert!(
+            cache.find_longest_prefix(&tokens).is_none(),
+            "a full-length entry was returned; the caller can only reject it"
+        );
+
+        // Add a strict prefix. It must now be found even though the (longer)
+        // full-length entry is still present — this is the regression.
+        cache.insert(&tokens[..2], snapshot(2));
+        let (_, len) = cache
+            .find_longest_prefix(&tokens)
+            .expect("strict prefix must be found past the full-length entry");
+        assert_eq!(len, 2);
+
+        // A longer strict prefix still wins over a shorter one.
+        cache.insert(&tokens[..3], snapshot(3));
+        assert_eq!(cache.find_longest_prefix(&tokens).expect("hit").1, 3);
+    }
+
     /// `for_prefill` must cap the pre-allocated KV cache to the prompt length,
     /// NOT `max_seq_len` — the whole point of the hidden-states scratch path.
     #[test]
@@ -2037,8 +2112,14 @@ mod tests {
         // The cache requires seq_len == token count; we appended one token.
         let tokens = [42u32];
         cache.save_cold(&dir, &tokens, &snap);
+        // Look up a LONGER sequence: `find_cold_prefix` only returns strict
+        // prefixes (a full-length hit is unusable — see `find_longest_prefix`), so
+        // the saved 1-token entry has to be read back as the prefix of something
+        // longer. This test is about the `type_tag = 3` serialization, not the
+        // matching policy.
+        let query = [42u32, 43];
         let restored = cache
-            .find_cold_prefix(&dir, &tokens)
+            .find_cold_prefix(&dir, &query)
             .expect("disk round-trip must find the f16 entry");
         assert_eq!(restored.seq_len, snap.seq_len);
         match &restored.layers[0] {
