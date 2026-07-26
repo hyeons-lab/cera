@@ -1696,13 +1696,10 @@ mod tests {
             "main",
             "mul_mat_q4_0_tile_test",
             &[
-                ("VEC", ""),
                 ("SRC0_INNER_TYPE", "u32"),
-                ("SRC1_INNER_TYPE", "f32"),
                 ("INIT_SRC0_SHMEM_Q4_0", ""),
-                ("INIT_SRC1_SHMEM_FLOAT", ""),
-                ("WORKGROUP_SIZE_M", "8u"),
-                ("WORKGROUP_SIZE_N", "8u"),
+                ("WORKGROUP_SIZE_M", "16u"),
+                ("WORKGROUP_SIZE_N", "16u"),
                 ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
                 ("TILE_K", "32u"),
@@ -1739,8 +1736,8 @@ mod tests {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            let wg_m = m.div_ceil(8 * 4);
-            let wg_n = n.div_ceil(8 * 4);
+            let wg_m = m.div_ceil(16 * 4);
+            let wg_n = n.div_ceil(16 * 4);
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
@@ -1761,42 +1758,54 @@ mod tests {
     }
 
     /// Canary: the reg-tile parity tests below hardcode the production tile
-    /// geometry in their pipeline defines (`TILE_M=8u`, `TILE_N=4u`) and dispatch
-    /// divisors. If the production constants change without those tests being
-    /// updated, the shipped geometry silently loses parity coverage — the exact
-    /// drift that once left the 8×4 GEMM untested. This fails loudly instead.
+    /// geometry in their pipeline defines (`WORKGROUP_SIZE_M/N=16u`, `TILE_M=4u`,
+    /// `TILE_N=4u`, `TILE_K=32u`) and in their `div_ceil(16 * 4)` divisors. If the
+    /// production constants change without those tests being updated, the shipped
+    /// geometry silently loses parity coverage — the exact drift that once left
+    /// the shipped GEMM untested. This fails loudly instead.
+    ///
+    /// All five constants, not just the thread tile: the workgroup dims feed both
+    /// the defines and the divisors, and TILE_K is hardcoded in every test's
+    /// defines, so a change to any of them alone would drift the tests off
+    /// production just as completely.
     #[test]
     fn reg_tile_parity_tests_match_production_geometry() {
+        use crate::model::gpu_lfm2::{
+            MUL_MAT_TILE_K, MUL_MAT_TILE_M, MUL_MAT_TILE_N, MUL_MAT_TILE_WG_M, MUL_MAT_TILE_WG_N,
+        };
         assert_eq!(
             (
-                crate::model::gpu_lfm2::MUL_MAT_TILE_M,
-                crate::model::gpu_lfm2::MUL_MAT_TILE_N,
+                MUL_MAT_TILE_WG_M,
+                MUL_MAT_TILE_WG_N,
+                MUL_MAT_TILE_M,
+                MUL_MAT_TILE_N,
+                MUL_MAT_TILE_K,
             ),
-            (8, 4),
-            "production reg-tile geometry changed; update the hardcoded TILE_M/TILE_N \
-             defines and dispatch divisors in the mul_mat reg-tile parity tests to match"
+            (16, 16, 4, 4, 32),
+            "production reg-tile geometry changed; update the hardcoded \
+             WORKGROUP_SIZE_M/N + TILE_M/TILE_N defines and the div_ceil dispatch \
+             divisors in the mul_mat reg-tile parity tests to match"
         );
     }
 
-    /// Q4_0 reg-tile parity at the **production** vec geometry
-    /// (`MUL_MAT_TILE_M = 8`, `MUL_MAT_TILE_N = 4`, `WORKGROUP_SIZE_N = 32`).
-    /// The other Q4_0 vec test runs TILE_M=4, so its vec4 store loop
-    /// (`for tm in (0..TILE_M step VEC_SIZE=4)`) executes a single iteration;
-    /// TILE_M=8 makes it execute two (rows 0-3 then 4-7). `m = 40` is a multiple
-    /// of 4 (the `use_vec` precondition) yet smaller than the 64-row tile, so both
-    /// vec4 iterations run with valid rows while the partial-tile bounds check is
-    /// still exercised. Guards against a store bug that only appears on the
-    /// second vec4 iteration of the shipped geometry.
+    /// Q4_0 reg-tile parity on a **ragged** shape at the production geometry.
+    ///
+    /// `m = 41` and `n = 21` are both smaller than the 64×64 output tile and
+    /// neither is a multiple of 4, so every partial-tile path runs: the loaders'
+    /// `global_m`/`global_n` bounds checks, and `store_col`'s per-row tail branch
+    /// (the `row + 3 >= params.m` arm) rather than its 4-row fast path. What
+    /// this adds over the other ragged tests is doing it at the *production*
+    /// workgroup geometry with both dims partial at once.
     #[test]
-    fn test_gpu_mul_mat_tile_q4_0_vec_prod_geometry() {
+    fn test_gpu_mul_mat_tile_q4_0_ragged_prod_geometry() {
         let ctx = match GpuContext::new() {
             Ok(ctx) => ctx,
             Err(_) => return,
         };
 
-        let m: u32 = 40; // multiple of 4 (use_vec precondition), partial vs 64-row tile
+        let m: u32 = 41; // not a multiple of 4 -> store_col's per-row tail branch
         let k: u32 = 128;
-        let n: u32 = 20; // tokens, partial vs the 128-col tile
+        let n: u32 = 21; // tokens, partial vs the 64-col tile
 
         let weights_f32: Vec<f32> = (0..m * k)
             .map(|i| ((i * 17 + 3) % 29) as f32 * 0.1 - 1.4)
@@ -1825,14 +1834,11 @@ mod tests {
             "main",
             "mul_mat_q4_0_prod_tile_test",
             &[
-                ("VEC", ""),
                 ("SRC0_INNER_TYPE", "u32"),
-                ("SRC1_INNER_TYPE", "f32"),
                 ("INIT_SRC0_SHMEM_Q4_0", ""),
-                ("INIT_SRC1_SHMEM_FLOAT", ""),
-                ("WORKGROUP_SIZE_M", "8u"),
-                ("WORKGROUP_SIZE_N", "32u"),
-                ("TILE_M", "8u"),
+                ("WORKGROUP_SIZE_M", "16u"),
+                ("WORKGROUP_SIZE_N", "16u"),
+                ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
                 ("TILE_K", "32u"),
             ],
@@ -1868,9 +1874,9 @@ mod tests {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            // WORKGROUP_SIZE_M*TILE_M = 64 rows, WORKGROUP_SIZE_N*TILE_N = 128 cols.
-            let wg_m = m.div_ceil(8 * 8);
-            let wg_n = n.div_ceil(32 * 4);
+            // WORKGROUP_SIZE_M*TILE_M = 64 rows, WORKGROUP_SIZE_N*TILE_N = 64 cols.
+            let wg_m = m.div_ceil(16 * 4);
+            let wg_n = n.div_ceil(16 * 4);
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
@@ -1889,17 +1895,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_gpu_mul_mat_tile_scalar_parity() {
+    /// f32 reg-tile parity on one `(m, k, n)` with padded row strides.
+    ///
+    /// Shared by the cases below so the ragged-`k` coverage is a parameter
+    /// rather than a sixth copy of ~90 lines of setup.
+    fn check_mul_mat_tile_f32(m: u32, k: u32, n: u32) {
         let ctx = match GpuContext::new() {
             Ok(ctx) => ctx,
             Err(_) => return,
         };
 
-        // m=30 is NOT a multiple of 4, forcing SCALAR variant
-        let m: u32 = 30;
-        let k: u32 = 128;
-        let n: u32 = 16;
         let x_stride: u32 = k + 3;
         let y_stride: u32 = m + 5;
 
@@ -1936,15 +1941,12 @@ mod tests {
         let pipeline = ctx.create_pipeline_with_defines(
             shaders::MUL_MAT_REG_TILE,
             "main",
-            "mul_mat_tile_scalar_test",
+            "mul_mat_tile_f32_strided_test",
             &[
-                ("SCALAR", ""),
                 ("SRC0_INNER_TYPE", "f32"),
-                ("SRC1_INNER_TYPE", "f32"),
                 ("INIT_SRC0_SHMEM_FLOAT", ""),
-                ("INIT_SRC1_SHMEM_FLOAT", ""),
-                ("WORKGROUP_SIZE_M", "8u"),
-                ("WORKGROUP_SIZE_N", "8u"),
+                ("WORKGROUP_SIZE_M", "16u"),
+                ("WORKGROUP_SIZE_N", "16u"),
                 ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
                 ("TILE_K", "32u"),
@@ -1981,8 +1983,8 @@ mod tests {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            let wg_m = m.div_ceil(8 * 4);
-            let wg_n = n.div_ceil(8 * 4);
+            let wg_m = m.div_ceil(16 * 4);
+            let wg_n = n.div_ceil(16 * 4);
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
@@ -2002,6 +2004,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `k` is a multiple of TILE_K (32) — the aligned case, and `m = 30` also
+    /// exercises partial-tile row handling.
+    #[test]
+    fn test_gpu_mul_mat_tile_f32_strided_parity() {
+        check_mul_mat_tile_f32(30, 128, 16);
+    }
+
+    /// `k = 100` is NOT a multiple of TILE_K (32), so the final k-tile is
+    /// partial. The kernel's inner loop runs a full TILE_K with no tail check
+    /// and depends entirely on the loaders zeroing past `params.k`; every other
+    /// reg-tile test uses an aligned `k`, so without this that load-bearing
+    /// behaviour has no coverage. Reachable in production via the ViT's dense
+    /// `p_linear` path, whose `in_dim` is not constrained to 32.
+    #[test]
+    fn test_gpu_mul_mat_tile_f32_ragged_k_parity() {
+        check_mul_mat_tile_f32(30, 100, 16);
     }
 
     #[test]
@@ -2052,13 +2072,10 @@ mod tests {
             "main",
             "mul_mat_tile_test",
             &[
-                ("VEC", ""),
                 ("SRC0_INNER_TYPE", "f32"),
-                ("SRC1_INNER_TYPE", "f32"),
                 ("INIT_SRC0_SHMEM_FLOAT", ""),
-                ("INIT_SRC1_SHMEM_FLOAT", ""),
-                ("WORKGROUP_SIZE_M", "8u"),
-                ("WORKGROUP_SIZE_N", "8u"),
+                ("WORKGROUP_SIZE_M", "16u"),
+                ("WORKGROUP_SIZE_N", "16u"),
                 ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
                 ("TILE_K", "32u"),
@@ -2095,10 +2112,10 @@ mod tests {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            // Tests build pipelines with WORKGROUP_SIZE_*=8 and TILE_*=4,
-            // so each workgroup covers 8*4 = 32 rows AND cols.
-            let wg_m = m.div_ceil(8 * 4);
-            let wg_n = n.div_ceil(8 * 4);
+            // Tests build pipelines with WORKGROUP_SIZE_*=16 and TILE_*=4,
+            // so each workgroup covers 16*4 = 64 rows AND cols.
+            let wg_m = m.div_ceil(16 * 4);
+            let wg_n = n.div_ceil(16 * 4);
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
@@ -2117,17 +2134,17 @@ mod tests {
         }
     }
 
-    /// Q4_0 SCALAR parity — exercises the variant the production
-    /// fallback uses when `m` isn't a multiple of 4. The VEC test
-    /// above leaves this path untouched.
+    /// Q4_0 parity on a shape whose `m` is not a multiple of 4. The
+    /// VEC/SCALAR pipeline split is gone, so what this adds over the
+    /// sibling tests is the ragged-row path, not a second variant.
     #[test]
-    fn test_gpu_mul_mat_tile_q4_0_scalar_parity() {
+    fn test_gpu_mul_mat_tile_q4_0_ragged_rows_parity() {
         let ctx = match GpuContext::new() {
             Ok(ctx) => ctx,
             Err(_) => return,
         };
 
-        // m=30 forces the SCALAR pipeline; k stays block-aligned (Q4_0
+        // m=30 exercises the partial-tile row path; k stays block-aligned (Q4_0
         // requires k % 32 == 0).
         let m: u32 = 30;
         let k: u32 = 128;
@@ -2157,15 +2174,12 @@ mod tests {
         let pipeline = ctx.create_pipeline_with_defines(
             shaders::MUL_MAT_REG_TILE,
             "main",
-            "mul_mat_q4_0_scalar_test",
+            "mul_mat_q4_0_ragged_rows_test",
             &[
-                ("SCALAR", ""),
                 ("SRC0_INNER_TYPE", "u32"),
-                ("SRC1_INNER_TYPE", "f32"),
                 ("INIT_SRC0_SHMEM_Q4_0", ""),
-                ("INIT_SRC1_SHMEM_FLOAT", ""),
-                ("WORKGROUP_SIZE_M", "8u"),
-                ("WORKGROUP_SIZE_N", "8u"),
+                ("WORKGROUP_SIZE_M", "16u"),
+                ("WORKGROUP_SIZE_N", "16u"),
                 ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
                 ("TILE_K", "32u"),
@@ -2202,8 +2216,8 @@ mod tests {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            let wg_m = m.div_ceil(8 * 4);
-            let wg_n = n.div_ceil(8 * 4);
+            let wg_m = m.div_ceil(16 * 4);
+            let wg_n = n.div_ceil(16 * 4);
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
@@ -3391,7 +3405,7 @@ mod tests {
     /// compare.
     ///
     /// `m = 11` and `n = 3` are deliberately not multiples of the tile geometry
-    /// (`WORKGROUP_SIZE_M * TILE_M = 64` rows, `WORKGROUP_SIZE_N * TILE_N = 128`
+    /// (`WORKGROUP_SIZE_M * TILE_M = 64` rows, `WORKGROUP_SIZE_N * TILE_N = 64`
     /// cols), so the partial-tile bounds checks are exercised rather than assumed.
     /// The strides are padded past `k`/`m` for the same reason.
     #[test]
@@ -3468,15 +3482,12 @@ mod tests {
             "main",
             "mul_mat_q8_0_test",
             &[
-                ("SCALAR", ""),
                 ("SRC0_INNER_TYPE", "u32"),
-                ("SRC1_INNER_TYPE", "f32"),
                 ("INIT_SRC0_SHMEM_Q8_0", ""),
-                ("INIT_SRC1_SHMEM_FLOAT", ""),
-                ("WORKGROUP_SIZE_M", "8u"),
-                ("WORKGROUP_SIZE_N", "32u"),
+                ("WORKGROUP_SIZE_M", "16u"),
+                ("WORKGROUP_SIZE_N", "16u"),
                 // Production reg-tile geometry (MUL_MAT_TILE_M/N in gpu_lfm2.rs).
-                ("TILE_M", "8u"),
+                ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
                 ("TILE_K", "32u"),
             ],
@@ -3508,7 +3519,7 @@ mod tests {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(m.div_ceil(64), n.div_ceil(128), 1);
+            pass.dispatch_workgroups(m.div_ceil(64), n.div_ceil(64), 1);
         }
         ctx.submit_encoder(enc);
 
@@ -3608,15 +3619,12 @@ mod tests {
             "main",
             "mul_mat_q4_k_test",
             &[
-                ("SCALAR", ""),
                 ("SRC0_INNER_TYPE", "u32"),
-                ("SRC1_INNER_TYPE", "f32"),
                 ("INIT_SRC0_SHMEM_Q4_K", ""),
-                ("INIT_SRC1_SHMEM_FLOAT", ""),
-                ("WORKGROUP_SIZE_M", "8u"),
-                ("WORKGROUP_SIZE_N", "32u"),
+                ("WORKGROUP_SIZE_M", "16u"),
+                ("WORKGROUP_SIZE_N", "16u"),
                 // Production reg-tile geometry (MUL_MAT_TILE_M/N in gpu_lfm2.rs).
-                ("TILE_M", "8u"),
+                ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
                 ("TILE_K", "32u"),
             ],
@@ -3648,7 +3656,7 @@ mod tests {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(m.div_ceil(64), n.div_ceil(128), 1);
+            pass.dispatch_workgroups(m.div_ceil(64), n.div_ceil(64), 1);
         }
         ctx.submit_encoder(enc);
 
@@ -3669,11 +3677,12 @@ mod tests {
     }
 
     /// Q6_K batched GEMM parity: synthesize Q6_K blocks, dequantize on CPU with
-    /// `dequantize_q6_k_block`, run the wgpu `gemm_q6_k` kernel over a multi-token
-    /// batch with padded x_stride/y_stride, compare.
+    /// `dequantize_q6_k_block`, run `mul_mat_reg_tile` with the Q6_K shmem loader
+    /// over a multi-token batch with padded x_stride/y_stride, compare.
     ///
-    /// `m = 11` is deliberately not a multiple of ROWS_PER_WG (8), so the tail
-    /// workgroup runs a partial tile and the write guard is exercised. The
+    /// `m = 11` is deliberately smaller than the 64-row tile, so the tail
+    /// workgroup runs a partial tile and `store_col`'s write guards are
+    /// exercised. The
     /// `scales` generator straddles zero: Q6_K sub-scales are **i8**, and reading
     /// them as unsigned is the obvious way to get this kernel subtly wrong while
     /// still producing plausible-looking numbers — mutating `ri8` to drop the sign
@@ -3763,15 +3772,12 @@ mod tests {
             "main",
             "mul_mat_q6_k_test",
             &[
-                ("SCALAR", ""),
                 ("SRC0_INNER_TYPE", "u32"),
-                ("SRC1_INNER_TYPE", "f32"),
                 ("INIT_SRC0_SHMEM_Q6_K", ""),
-                ("INIT_SRC1_SHMEM_FLOAT", ""),
-                ("WORKGROUP_SIZE_M", "8u"),
-                ("WORKGROUP_SIZE_N", "32u"),
+                ("WORKGROUP_SIZE_M", "16u"),
+                ("WORKGROUP_SIZE_N", "16u"),
                 // Production reg-tile geometry (MUL_MAT_TILE_M/N in gpu_lfm2.rs).
-                ("TILE_M", "8u"),
+                ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
                 ("TILE_K", "32u"),
             ],
@@ -3803,9 +3809,9 @@ mod tests {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            // WORKGROUP_SIZE_M*TILE_M = 64 rows, WORKGROUP_SIZE_N*TILE_N = 128 cols
-            // per workgroup — mirrors the Q6_K arm of `encode_mul_mat_reg_tile`.
-            pass.dispatch_workgroups(m.div_ceil(64), n.div_ceil(128), 1);
+            // WORKGROUP_SIZE_M*TILE_M = 64 rows, WORKGROUP_SIZE_N*TILE_N = 64 cols
+            // per workgroup — matches `encode_mul_mat_reg_tile`'s shared geometry.
+            pass.dispatch_workgroups(m.div_ceil(64), n.div_ceil(64), 1);
         }
         ctx.queue.submit(Some(enc.finish()));
 

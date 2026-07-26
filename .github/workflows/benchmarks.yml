@@ -1,7 +1,8 @@
 name: Benchmarks
 
-# Regular, consistent CPU throughput logs for the LFM2 quants cera ships
-# (Q4_0 / Q4_K_M / Q8_0), so perf regressions and wins are visible over time.
+# Regular, consistent throughput logs for the LFM2 quants cera ships
+# (Q4_0 / Q4_K_M / Q8_0), on CPU and on both GPU backends, so perf regressions
+# and wins are visible over time.
 #
 # Runs on:
 #   - a nightly schedule (fixed-cadence baseline),
@@ -9,16 +10,25 @@ name: Benchmarks
 #     (per-merge tracking — the "did this change move prefill/decode" signal),
 #   - manual dispatch (with overridable prompt length / run count).
 #
-# Two runners: `ubuntu-24.04-arm` (Neoverse N2, FEAT_I8MM — where the aarch64
-# SMMLA GEMM kernels actually execute, closest to the mobile target) and
-# `ubuntu-latest` (x86_64 desktop baseline). Absolute tok/s on shared CI runners
-# drifts; the durable signals are the resolved CPU tier (logged each run) and
-# relative movement across commits for the same runner + quant. Results land in
+# Three runners. CPU: `ubuntu-24.04-arm` (Neoverse N2, FEAT_I8MM — where the
+# aarch64 SMMLA GEMM kernels actually execute, closest to the mobile target) and
+# `ubuntu-latest` (x86_64 desktop baseline). GPU: `macos-latest` (Apple Silicon,
+# the only hosted runner with a real GPU). Absolute tok/s on shared CI runners
+# drifts; the durable signals are the resolved backend (CPU tier, or the GPU
+# adapter, logged each run) and relative movement across commits for the same
+# runner + device + quant. Results land in
 # the job summary (a markdown table) and as a `bench-results.json` artifact in
 # github-action-benchmark's customBiggerIsBetter format, ready for trend
 # tracking / regression alerts to be layered on later.
 #
-# Each run also benchmarks upstream **llama.cpp** on the *same* GGUFs (pinned
+# Alongside the CPU matrix there are two GPU jobs: `gpu-bench`, the same
+# end-to-end sweep against
+# both the native `metal` and the portable `gpu` (wgpu) backends, and
+# `gpu-gemm-microbench`, which times the wgpu prefill GEMM in isolation. The
+# microbench exists because the kernel is where wgpu perf has actually moved by
+# orders of magnitude, and an end-to-end number dilutes that.
+#
+# Each CPU run also benchmarks upstream **llama.cpp** on the *same* GGUFs (pinned
 # commit, built once and cached, native ISA to match cera's runtime dispatch) and
 # adds `llama` + `gap (llama/cera)` columns to the summary table. This is
 # best-effort context, not a gate: if the llama build or a model load fails, the
@@ -43,6 +53,7 @@ on:
       - "cera/src/model/**"
       - "cera/src/quant.rs"
       - "cera/src/tensor.rs"
+      - "cera/examples/wgpu_gemm_bench.rs"
       - "scripts/ci-bench.sh"
       - ".github/workflows/benchmarks.yml"
 
@@ -178,3 +189,156 @@ jobs:
           name: bench-results-${{ matrix.arch }}
           path: bench-results.json
           if-no-files-found: error
+
+  # End-to-end GPU throughput, both backends, on the only hosted runner with a
+  # real GPU (macos-latest is Apple Silicon). `metal` is the native backend;
+  # `gpu` is the portable wgpu one, which is the number that historically drifts
+  # — it ran ~100x behind Metal on prefill until the reg-tile GEMM was rewritten
+  # to keep its accumulators in registers, and nothing in CI would have caught
+  # that. Both devices run the same `ci-bench.sh` as the CPU job, so the table,
+  # JSON and summary formats match.
+  #
+  # No llama.cpp overlay here: `LLAMA_BENCH` is left unset, so the script runs
+  # cera-only. Metal-vs-Metal against upstream is worth adding later, but it is a
+  # separate build (and a separate argument about thread/backend defaults) from
+  # what this job is for, which is tracking cera against its own history.
+  gpu-bench:
+    name: GPU bench (${{ matrix.device }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [metal, gpu]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+      # rust-cache keys on `github.job`, which is identical for both matrix
+      # legs, so they share an entry either way. `shared-key` just makes that
+      # explicit and stable rather than incidental: the two legs build the same
+      # artifacts (`--features gpu,metal`) and differ only in `--device`.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpu-bench
+      - name: Build release CLI (gpu + metal)
+        run: cargo build --release -p cera-cli --features gpu,metal
+      # One key for both legs: they download the byte-identical bundle. (The CPU
+      # job keys per-arch because those are different runners with different
+      # binaries; here only the `--device` flag differs.)
+      - name: Restore model bundles
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/cera
+          key: bench-models-LFM2.5-350M-macos-v1
+      - name: Run GPU benchmarks
+        env:
+          BIN: ./target/release/cera
+          ARCH_LABEL: macos-arm64
+          DEVICE: ${{ matrix.device }}
+          BUNDLE_ID: LFM2.5-350M
+          QUANTS: "Q4_0 Q4_K_M Q8_0"
+          PROMPT_TOKENS: ${{ github.event.inputs.prompt_tokens || '512' }}
+          RUNS: ${{ github.event.inputs.runs || '10' }}
+          WARMUP: "2"
+          MAX_TOKENS: "32"
+          # Adapter identity is logged at info by each backend, under its own
+          # target — without it the run records only `device=metal|gpu` and a
+          # runner-image GPU swap would be invisible in the trend. The leading
+          # `warn` matters: a target-only directive sets the global default to
+          # OFF, which would silence the deliberately-loud "no batched prefill
+          # GEMM for this dtype" warning that announces the exact regression
+          # this job hunts.
+          RUST_LOG: "warn,cera::backend::wgpu=info,cera::backend::metal=info"
+        run: bash scripts/ci-bench.sh
+      - name: Save model bundles
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/cera
+          key: bench-models-LFM2.5-350M-macos-v1
+      - name: Upload results JSON
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-results-gpu-${{ matrix.device }}
+          path: bench-results.json
+          if-no-files-found: error
+
+  # Kernel-level guard for the wgpu prefill GEMM.
+  #
+  # The end-to-end job above would catch a big regression, but it mixes the GEMM
+  # with attention, conv, norms and the LM head, and it depends on a model
+  # download. This runs `mul_mat_reg_tile` alone on the real LFM2 projection
+  # shapes and reports GFLOP/s per dtype, so a change that puts the accumulators
+  # back in thread-local memory (~76 GFLOP/s vs ~1300 on an M-series GPU — an
+  # order of magnitude, not a few percent) shows up as an unmissable number with
+  # no model and no network.
+  gpu-gemm-microbench:
+    name: GPU GEMM microbench
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+      - uses: Swatinem/rust-cache@v2
+      # Build and run as separate steps, and capture stdout only: piping
+      # `cargo run 2>&1` would fold the whole compile log into `gemm-bench.txt`
+      # and from there into the job summary on any cache miss.
+      - name: Build microbenchmark
+        run: cargo build --release -p cera --features gpu --example wgpu_gemm_bench
+      - name: Run mul_mat_reg_tile microbenchmark
+        run: |
+          set -euo pipefail
+          ./target/release/examples/wgpu_gemm_bench | tee gemm-bench.txt
+      # customBiggerIsBetter, same shape as the throughput jobs' JSON, so all
+      # three feed one trend view. Keyed by dtype+shape since that is the axis a
+      # kernel regression moves.
+      - name: Convert to benchmark JSON
+        if: always()
+        run: |
+          set -euo pipefail
+          # The run step may never have executed (checkout/toolchain failure), in
+          # which case there is nothing to convert and failing here would mask
+          # the real error.
+          [ -f gemm-bench.txt ] || { echo "no gemm-bench.txt — skipping"; exit 0; }
+          # Anchor on the "<number> GFLOP/s" token rather than a field offset:
+          # `SHADER=` diff mode appends a trailing `rel_err=...`, which would
+          # silently shift $(NF-1) onto the wrong value.
+          {
+            echo "["
+            awk '
+              match($0, /[0-9.]+ GFLOP\/s/) {
+                v = substr($0, RSTART, RLENGTH); sub(/ GFLOP\/s/, "", v)
+                printf "%s  {\"name\": \"gemm %s %s\", \"unit\": \"GFLOP/s\", \"value\": %s}",
+                       (n++ ? ",\n" : ""), $1, $2, v
+              }
+              END { printf "\n" }
+            ' gemm-bench.txt
+            echo "]"
+          } > gemm-bench.json
+          cat gemm-bench.json
+      - name: Summary
+        if: always()
+        run: |
+          [ -f gemm-bench.txt ] || exit 0
+          {
+            echo "### wgpu \`mul_mat_reg_tile\` microbench (macos-arm64)"
+            echo
+            echo '```'
+            cat gemm-bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gemm-bench-results
+          path: |
+            gemm-bench.json
+            gemm-bench.txt
+          # `warn`, not `error`: the guards above intentionally produce no files
+          # when the benchmark step never ran, and that case is already reported
+          # by the failing step itself.
+          if-no-files-found: warn

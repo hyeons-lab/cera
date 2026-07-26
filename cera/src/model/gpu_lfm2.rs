@@ -33,37 +33,60 @@ const MAX_PREFILL_TOKENS: usize = 512;
 // receives these via preprocessor #defines below; keeping a single
 // source of truth here means dispatch geometry can never drift out of
 // sync with the kernel.
-const MUL_MAT_TILE_WG_M: u32 = 8;
+pub(crate) const MUL_MAT_TILE_WG_M: u32 = 16;
 
 /// Rows emitted per workgroup by `gemv_f32` / `gemv_f32_accum` — MUST match the
 /// `NR` constant in `gemv_f32.wgsl`. Used to size the LoRA dispatch grids.
 const GEMV_F32_ROWS_PER_WG: u32 = 8;
-const MUL_MAT_TILE_WG_N: u32 = 32;
-// Each thread computes an 8×4 register tile. shmem for the K-quant variant is
-// `(TILE_K+1)·WG_M·TILE_M + TILE_K·WG_N·TILE_N` f32 = (33·64 + 32·128)·4 ≈ 24.8 KB,
-// which EXCEEDS the default WebGPU 16 KB workgroup-storage limit — it fits only
-// because we request the adapter's actual limits (`GpuContext::new` uses
-// `adapter.limits()`; PowerVR/Adreno/Mali expose 32 KB). Raising TILE_N or TILE_M
-// further must re-check `max_compute_workgroup_storage_size`, or pipeline creation
-// fails at runtime on the target GPU.
-pub(crate) const MUL_MAT_TILE_M: u32 = 8;
+pub(crate) const MUL_MAT_TILE_WG_N: u32 = 16;
+// Each thread computes a 4×4 register tile held in four named `vec4<f32>`s;
+// `mul_mat_reg_tile.wgsl` hand-unrolls for exactly that shape, so TILE_M and
+// TILE_N are not free parameters — see the accumulator note in the shader.
+// 256 threads per workgroup covering a 64×64 output tile.
+//
+// shmem is `TILE_K·(TILE_ROWS+4) + TILE_K·(TILE_COLS+4)` f32 = (32·68)·2·4 =
+// 17408 B ≈ 17.0 KiB, which EXCEEDS the default WebGPU 16 KB workgroup-storage limit — it
+// fits only because we request the adapter's actual limits (`GpuContext::new`
+// uses `adapter.limits()`; PowerVR/Adreno/Mali expose 32 KB). Raising
+// WORKGROUP_SIZE_M/N or TILE_K must re-check
+// `max_compute_workgroup_storage_size`, or pipeline creation fails at runtime
+// on the target GPU.
+//
+// This geometry won a sweep on an M1 Max at the real LFM2 projection shapes
+// (8×32, 32×8, 16×8, 8×16, 32×16, 16×32, 8×8 and TILE_K 16/32/64 were all
+// worse). Re-run `cera/examples/wgpu_gemm_bench.rs` before changing it.
+pub(crate) const MUL_MAT_TILE_M: u32 = 4;
 pub(crate) const MUL_MAT_TILE_N: u32 = 4;
-const MUL_MAT_TILE_K: u32 = 32;
+pub(crate) const MUL_MAT_TILE_K: u32 = 32;
 
-/// Build a `mul_mat_reg_tile` pipeline for the requested variant.
+// The two invariants `mul_mat_reg_tile.wgsl` and its Q4_0 loader depend on, as
+// compile-time checks rather than comments. Violating either produces silently
+// wrong numbers, not a shader compile error: a non-4 thread tile makes each
+// thread compute a fraction of the tile the host dispatched for, and a TILE_K
+// that is not a multiple of 8 lets the Q4_0 loader's 8-element run straddle a
+// block boundary and write past the staged tile.
+const _: () = assert!(
+    MUL_MAT_TILE_M == 4 && MUL_MAT_TILE_N == 4,
+    "mul_mat_reg_tile.wgsl hand-unrolls a 4x4 thread tile; re-unroll it before \
+     changing MUL_MAT_TILE_M/N"
+);
+const _: () = assert!(
+    MUL_MAT_TILE_K.is_multiple_of(8),
+    "the Q4_0 shmem loader stages 8 consecutive k per thread and indexes within \
+     one 32-element block; TILE_K must be a multiple of 8"
+);
+
+/// Build a `mul_mat_reg_tile` pipeline for the requested src0 dtype.
 ///
-/// `use_vec` enables vec4 loads/stores (requires the matrix dimensions and
-/// effective row strides used by each dispatch to be multiples of 4).
 /// `src0_loader` selects the shmem dequant path — one of
 /// `"INIT_SRC0_SHMEM_{Q4_0,Q8_0,Q4_K,Q6_K}"`. The rest of the kernel is
 /// dtype-agnostic: the loader decodes weights to f32 in shared memory once per
 /// k-tile and the register-tiled inner loop reuses them across all
-/// `WORKGROUP_SIZE_N` token columns. That reuse is the entire reason this kernel
+/// `TILE_COLS` token columns. That reuse is the entire reason this kernel
 /// beats the batched-GEMV-shaped `gemm_*` kernels, which re-dequantize per token.
 fn build_mul_mat_pipeline(
     ctx: &GpuContext,
     label: &str,
-    use_vec: bool,
     src0_loader: &str,
 ) -> wgpu::ComputePipeline {
     let wg_m = format!("{MUL_MAT_TILE_WG_M}u");
@@ -71,17 +94,13 @@ fn build_mul_mat_pipeline(
     let tile_m = format!("{MUL_MAT_TILE_M}u");
     let tile_n = format!("{MUL_MAT_TILE_N}u");
     let tile_k = format!("{MUL_MAT_TILE_K}u");
-    let variant = if use_vec { "VEC" } else { "SCALAR" };
     ctx.create_pipeline_with_defines(
         shaders::MUL_MAT_REG_TILE,
         "main",
         label,
         &[
-            (variant, ""),
             ("SRC0_INNER_TYPE", "u32"),
-            ("SRC1_INNER_TYPE", "f32"),
             (src0_loader, ""),
-            ("INIT_SRC1_SHMEM_FLOAT", ""),
             ("WORKGROUP_SIZE_M", &wg_m),
             ("WORKGROUP_SIZE_N", &wg_n),
             ("TILE_M", &tile_m),
@@ -268,8 +287,7 @@ struct GpuPipelines {
     /// QKV bias; absent on every other arch.
     bias_add: wgpu::ComputePipeline,
 
-    mul_mat_reg_tile_q4_0_vec: wgpu::ComputePipeline,
-    mul_mat_reg_tile_q4_0_scalar: wgpu::ComputePipeline,
+    mul_mat_reg_tile_q4_0: wgpu::ComputePipeline,
     mul_mat_reg_tile_q8_0: wgpu::ComputePipeline,
     mul_mat_reg_tile_q4_k: wgpu::ComputePipeline,
     mul_mat_reg_tile_q6_k: wgpu::ComputePipeline,
@@ -809,16 +827,9 @@ impl GpuLfm2Model {
             ),
             bias_add: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "bias_add"),
 
-            mul_mat_reg_tile_q4_0_vec: build_mul_mat_pipeline(
+            mul_mat_reg_tile_q4_0: build_mul_mat_pipeline(
                 &ctx,
-                "mul_mat_q4_0_vec",
-                true,
-                "INIT_SRC0_SHMEM_Q4_0",
-            ),
-            mul_mat_reg_tile_q4_0_scalar: build_mul_mat_pipeline(
-                &ctx,
-                "mul_mat_q4_0_scalar",
-                false,
+                "mul_mat_q4_0",
                 "INIT_SRC0_SHMEM_Q4_0",
             ),
             // Every quantized weight goes through the register-tiled kernel (weight
@@ -829,19 +840,16 @@ impl GpuLfm2Model {
             mul_mat_reg_tile_q8_0: build_mul_mat_pipeline(
                 &ctx,
                 "mul_mat_q8_0",
-                false,
                 "INIT_SRC0_SHMEM_Q8_0",
             ),
             mul_mat_reg_tile_q4_k: build_mul_mat_pipeline(
                 &ctx,
                 "mul_mat_q4_k",
-                false,
                 "INIT_SRC0_SHMEM_Q4_K",
             ),
             mul_mat_reg_tile_q6_k: build_mul_mat_pipeline(
                 &ctx,
                 "mul_mat_q6_k",
-                false,
                 "INIT_SRC0_SHMEM_Q6_K",
             ),
             attention_prefill: ctx.create_pipeline(
@@ -3548,64 +3556,21 @@ impl GpuLfm2Model {
             "encode_mul_mat_reg_tile only supports Q4_0/Q8_0/Q4KM/Q6K weights"
         );
         let m = w.tensor.shape[0] as u32;
-        let (pipeline, wg_m, wg_n, label) = match w.tensor.dtype {
-            DType::Q4_0 => {
-                let use_vec = m % 4 == 0 && k % 4 == 0 && x_stride % 4 == 0 && y_stride % 4 == 0;
-                let pipeline = if use_vec {
-                    &self.pipelines.mul_mat_reg_tile_q4_0_vec
-                } else {
-                    &self.pipelines.mul_mat_reg_tile_q4_0_scalar
-                };
-                let wg_m = m.div_ceil(MUL_MAT_TILE_WG_M * MUL_MAT_TILE_M);
-                let wg_n = n.div_ceil(MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N);
-                (pipeline, wg_m, wg_n, "mul_mat_tile")
-            }
-            DType::Q8_0 => {
-                // Same register-tiled geometry as Q4_0 — only the shmem dequant
-                // differs. Scalar (not vec4): the packed-byte loader can't guarantee
-                // the multiple-of-4 m/k/stride the vec4 path needs.
-                let wg_m = m.div_ceil(MUL_MAT_TILE_WG_M * MUL_MAT_TILE_M);
-                let wg_n = n.div_ceil(MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N);
-                (
-                    &self.pipelines.mul_mat_reg_tile_q8_0,
-                    wg_m,
-                    wg_n,
-                    "mul_mat_q8_0",
-                )
-            }
-            DType::Q4KM => {
-                // Same register-tiled geometry as Q4_0/Q6_K — only the shmem dequant
-                // differs. Scalar (not vec4): the packed-byte loader can't guarantee
-                // the multiple-of-4 m/k/stride the vec4 path needs.
-                let wg_m = m.div_ceil(MUL_MAT_TILE_WG_M * MUL_MAT_TILE_M);
-                let wg_n = n.div_ceil(MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N);
-                (
-                    &self.pipelines.mul_mat_reg_tile_q4_k,
-                    wg_m,
-                    wg_n,
-                    "mul_mat_q4k",
-                )
-            }
-            DType::Q6K => {
-                // Same register-tiled geometry as Q4_0 — only the shmem dequant
-                // differs. Scalar (not vec4) because Q6_K rows are 210-byte blocks:
-                // the vec4 path needs m/k/strides all multiples of 4, which the
-                // packed-byte loader does not guarantee.
-                let wg_m = m.div_ceil(MUL_MAT_TILE_WG_M * MUL_MAT_TILE_M);
-                let wg_n = n.div_ceil(MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N);
-                (
-                    &self.pipelines.mul_mat_reg_tile_q6_k,
-                    wg_m,
-                    wg_n,
-                    "mul_mat_q6k",
-                )
-            }
+        // Every dtype shares one register-tiled geometry — only the shmem dequant
+        // loader differs, and the kernel is dtype-agnostic past it.
+        let (pipeline, label) = match w.tensor.dtype {
+            DType::Q4_0 => (&self.pipelines.mul_mat_reg_tile_q4_0, "mul_mat_tile"),
+            DType::Q8_0 => (&self.pipelines.mul_mat_reg_tile_q8_0, "mul_mat_q8_0"),
+            DType::Q4KM => (&self.pipelines.mul_mat_reg_tile_q4_k, "mul_mat_q4k"),
+            DType::Q6K => (&self.pipelines.mul_mat_reg_tile_q6_k, "mul_mat_q6k"),
             // Unreachable in practice: the batched path is only entered when
             // `unbatchable_matmul_weight()` returned `None`, i.e. every weight is
             // Q4_0/Q8_0/Q4KM/Q6K. The debug_assert above documents the same
             // precondition; this arm is the release-mode backstop.
             _ => unreachable!("batched prefill only supports Q4_0/Q8_0/Q4KM/Q6K"),
         };
+        let wg_m = m.div_ceil(MUL_MAT_TILE_WG_M * MUL_MAT_TILE_M);
+        let wg_n = n.div_ceil(MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N);
 
         // Matches `mul_mat_reg_tile`'s 5-field `MulMatParams`. This was 6 words while
         // the Q8_0 arm still dispatched `gemm_q8_0`, whose `params: array<u32, 6>` is
@@ -3973,12 +3938,16 @@ impl GpuLfm2Model {
     /// final output norm + LM head on the last token only.
     ///
     /// Preconditions (caller-enforced):
-    ///   * `start_pos == 0`. (Continuation prefills go through the
-    ///     per-token loop.)
     ///   * `1 <= tokens.len() <= MAX_PREFILL_TOKENS`.
-    ///   * All matmul weights on every layer are Q4_0
-    ///     (`all_matmul_weights_q4_0() == true`).
+    ///   * Every matmul weight has a batched kernel
+    ///     (`unbatchable_matmul_weight() == None`).
     ///   * Caller already holds `infer_lock`.
+    ///
+    /// `start_pos` may be non-zero: `Model::forward_prefill_chunked` splits a
+    /// prompt into ubatch-sized chunks and this runs once per chunk with an
+    /// advancing position. Conv rolling state and KV writes carry across chunks
+    /// naturally. Do NOT re-add a `start_pos == 0` gate on the caller side — it
+    /// silently dropped every chunk after the first onto the per-token loop.
     ///
     /// Mirrors `MetalLfm2Model::prefill_layers_and_logits`
     /// (metal_lfm2.rs:2906); the Metal version is the canonical
@@ -4958,12 +4927,14 @@ impl Model for GpuLfm2Model {
         // Reset internal seq_len so repeated generate() calls (bench) work.
         self.gpu_state.seq_len.store(start_pos, Ordering::Relaxed);
 
-        // Fresh prefill (`start_pos == 0`) runs the batched-GEMM path — including
-        // with a LoRA active, which now applies in-batch (two NT GEMMs per target)
-        // rather than forcing the per-token fallback. The prefix cache is still
-        // bypassed with an adapter, though: cached KV is base-model-only, so
-        // restoring it and adapting only the tail would corrupt the result (and
-        // inserting adapter-modified KV would poison the cache for later base runs).
+        // Fresh-prefill-only work: the prefix-cache lookup and zeroing the conv
+        // rolling buffers. The batched-GEMM path itself runs at ANY `start_pos`
+        // (see below) — including with a LoRA active, which applies in-batch (two
+        // NT GEMMs per target) rather than forcing the per-token fallback. The
+        // prefix cache is still bypassed with an adapter: cached KV is
+        // base-model-only, so restoring it and adapting only the tail would
+        // corrupt the result (and inserting adapter-modified KV would poison the
+        // cache for later base runs).
         if start_pos == 0 {
             // Cache lookup only for base-model prefills.
             let hit = (!lora_active)
@@ -5028,75 +4999,86 @@ impl Model for GpuLfm2Model {
             // generation can't leak in. Cache hits skip this
             // (`restore_state_locked` rewrites the buffers from
             // the snapshot). Mirrors the equivalent fix on Metal.
+            //
+            // A continuation (`start_pos > 0`) must NOT reach here: its conv
+            // rolling state is exactly what the previous chunk left behind.
             self.zero_conv_buffers_locked();
-
-            // Try the batched prefill path. Preconditions:
-            //   * fresh prefill (start_pos == 0, already checked above)
-            //   * non-empty
-            //   * every matmul weight has a batched quantized kernel
-            //     (Q4_0/Q8_0/Q4KM/Q6K); any other dtype falls through to the
-            //     per-token loop
-            //   * the model wires the batched-prefill path (`batched_prefill`).
-            //     LFM2 and the dense transformers (llama/qwen2/qwen3/mistral/
-            //     granite) all support it.
-            //
-            // The dtype fallback is *loud*: it costs ~340x the GPU submits, so it
-            // must never again be something a model quietly sits on for months.
-            //
-            // Long prompts are chunked through the batched path in
-            // MAX_PREFILL_TOKENS-sized chunks so the scratch buffers stay
-            // bounded. Each chunk advances `start_pos`; conv rolling
-            // state and KV cache writes carry across chunks naturally.
-            let unbatchable = self.unbatchable_matmul_weight();
-            if let Some((layer, name, dtype)) = unbatchable
-                && !tokens.is_empty()
-                && self.batched_prefill
-                && !self.batched_fallback_warned.swap(true, Ordering::Relaxed)
-            {
-                tracing::warn!(
-                    layer,
-                    tensor = name,
-                    ?dtype,
-                    "no batched prefill GEMM for this dtype — falling back to the \
-                     per-token loop, which issues ~340x the GPU submits and makes \
-                     prefill no faster than decode. Add a batched kernel for {dtype:?} \
-                     to put this model back on the fast path.",
-                );
-            }
-            if !tokens.is_empty() && self.batched_prefill && unbatchable.is_none() {
-                // Chunk size respects both the static MAX_PREFILL_TOKENS
-                // budget AND the model's actual `max_seq_len` — otherwise
-                // a caller with `--context-size < 512` would dispatch
-                // batched chunks larger than the KV cache and OOB on the
-                // copy_buffer_to_buffer write.
-                let chunk_size = self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS);
-                let mut logits = Vec::new();
-                let mut pos = 0usize;
-                while pos < tokens.len() {
-                    let end = (pos + chunk_size).min(tokens.len());
-                    // `start_pos + pos` rather than `pos`: defensive against
-                    // a future caller passing non-zero start_pos through
-                    // this branch (today the outer `if start_pos == 0`
-                    // gate makes them equal).
-                    logits = self.forward_prefill_batched_locked(
-                        &tokens[pos..end],
-                        start_pos + pos,
-                        state,
-                    );
-                    pos = end;
-                }
-                // Only cache base-model KV — an adapted run's KV must never be reused.
-                if !lora_active {
-                    self.prefix_cache
-                        .lock()
-                        .expect("prefix_cache mutex poisoned")
-                        .insert(tokens, self.snapshot_state_locked());
-                }
-                return logits;
-            }
         }
 
-        // Cache miss (or continuation prefill): full prefill loop.
+        // Try the batched prefill path. Preconditions:
+        //   * non-empty
+        //   * every matmul weight has a batched quantized kernel
+        //     (Q4_0/Q8_0/Q4KM/Q6K); any other dtype falls through to the
+        //     per-token loop
+        //   * the model wires the batched-prefill path (`batched_prefill`).
+        //     LFM2 and the dense transformers (llama/qwen2/qwen3/mistral/
+        //     granite) all support it.
+        //
+        // Deliberately NOT gated on `start_pos == 0`. `forward_prefill_chunked`
+        // (model/mod.rs) splits a prompt into ubatch-sized chunks and calls this
+        // once per chunk with an advancing `start_pos`; gating the batched path
+        // on a fresh prefill silently dropped every chunk after the first onto
+        // the per-token loop, so any prompt longer than one ubatch ran most of
+        // itself at decode speed (measured: p=1024 took 8730 GPU submits, of
+        // which ~8700 were the second chunk going token-by-token). Metal's
+        // `forward_prefill` has always run its batched inner path for any
+        // `start_pos`; this matches it. Only the prefix-cache lookup/insert and
+        // the conv zeroing are fresh-prefill-only.
+        //
+        // The dtype fallback is *loud*: it costs ~340x the GPU submits, so it
+        // must never again be something a model quietly sits on for months.
+        //
+        // Long prompts are chunked through the batched path in
+        // MAX_PREFILL_TOKENS-sized chunks so the scratch buffers stay
+        // bounded. Each chunk advances `start_pos`; conv rolling
+        // state and KV cache writes carry across chunks naturally.
+        let unbatchable = self.unbatchable_matmul_weight();
+        if let Some((layer, name, dtype)) = unbatchable
+            && !tokens.is_empty()
+            && self.batched_prefill
+            && !self.batched_fallback_warned.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                layer,
+                tensor = name,
+                ?dtype,
+                "no batched prefill GEMM for this dtype — falling back to the \
+                 per-token loop, which issues ~340x the GPU submits and makes \
+                 prefill no faster than decode. Add a batched kernel for {dtype:?} \
+                 to put this model back on the fast path.",
+            );
+        }
+        if !tokens.is_empty() && self.batched_prefill && unbatchable.is_none() {
+            // Chunk size respects both the static MAX_PREFILL_TOKENS
+            // budget AND the model's actual `max_seq_len` — otherwise
+            // a caller with `--context-size < 512` would dispatch
+            // batched chunks larger than the KV cache and OOB on the
+            // copy_buffer_to_buffer write.
+            let chunk_size = self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS);
+            let mut logits = Vec::new();
+            let mut pos = 0usize;
+            while pos < tokens.len() {
+                let end = (pos + chunk_size).min(tokens.len());
+                logits =
+                    self.forward_prefill_batched_locked(&tokens[pos..end], start_pos + pos, state);
+                pos = end;
+            }
+            // Only cache base-model KV — an adapted run's KV must never be
+            // reused — and only for a prefill that started at 0, since the cache
+            // key is the whole prefix. A continuation chunk's `tokens` is a
+            // fragment, not a prefix.
+            if start_pos == 0 && !lora_active {
+                self.prefix_cache
+                    .lock()
+                    .expect("prefix_cache mutex poisoned")
+                    .insert(tokens, self.snapshot_state_locked());
+            }
+            return logits;
+        }
+
+        // Per-token fallback. Reached only when the batched path above declined:
+        // empty input, a model without `batched_prefill`, or an unbatchable dtype.
+        // Continuation chunks no longer land here — they take the batched path.
         // Sequential single-token forward via the lock-free body — calling
         // `self.forward()` here would re-acquire the (non-reentrant)
         // `infer_lock` we already hold and deadlock.

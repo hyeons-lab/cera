@@ -186,6 +186,17 @@ jobs:
         run: vulkaninfo --summary || true
       - name: Run wgpu kernel + host-logic tests
         run: cargo test -p cera --features gpu --lib --test wgpu_kv_shift_oracle
+      # The GEMM microbenchmark carries `required-features = ["gpu"]`, so the
+      # `check` job's `cargo clippy --all-targets` (no features) skips it and
+      # nothing else in PR-time CI compiles it. Without this a change that breaks
+      # it merges green and only fails later, in the nightly benchmark job — and
+      # this is the tool `MUL_MAT_TILE_*` tells you to re-run before retuning.
+      # Compile only: lavapipe would "run" it, but a software-Vulkan GFLOP/s
+      # number is meaningless and the sweep is slow. `check`, not `clippy` --
+      # clippy here would newly lint the whole gpu-featured lib and fail on
+      # pre-existing warnings in code this has nothing to do with.
+      - name: Check the GEMM microbenchmark compiles
+        run: cargo check -p cera --features gpu --example wgpu_gemm_bench
 
   build-release:
     name: Release Build
