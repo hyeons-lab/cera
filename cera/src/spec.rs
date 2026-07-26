@@ -60,6 +60,69 @@ impl SpecStats {
     }
 }
 
+/// Result of verifying one draft against the target in a single forward.
+pub struct VerifyResult {
+    /// The accepted draft prefix, in order — the longest run of drafted tokens
+    /// whose value equals the target's greedy argmax at that position. May be
+    /// empty (first draft already mismatched). Never longer than the draft.
+    pub accepted: Vec<u32>,
+    /// The target's logits for the position immediately after the guaranteed
+    /// token plus `accepted` — the "bonus" token when every draft matched, or
+    /// the correcting token at the first mismatch. Length == vocab.
+    pub follow_logits: Vec<f32>,
+}
+
+/// Verify `[guaranteed, draft...]` in a single target forward and accept the
+/// longest greedy-matching draft prefix.
+///
+/// On entry `state.seq_len` is `old`, the position the guaranteed token will
+/// occupy — it is **not** yet in the KV. The batch `[guaranteed, draft...]` is
+/// fed at `[old .. old + 1 + draft.len()]`, appending all of them; on return the
+/// KV holds exactly the guaranteed token plus the accepted drafts (rejected
+/// drafts are truncated away), i.e. `state.seq_len == old + 1 + accepted.len()`.
+///
+/// This is pure verification — it does **not** consult EOS / stop tokens / token
+/// budgets. Callers that must stop partway through the accepted run emit the
+/// accepted tokens under their own stop policy and then `state.truncate_to` back
+/// to the number they kept (and ignore `follow_logits`). Keeping the policy in
+/// the caller lets both the standalone [`greedy_generate_spec`] driver and the
+/// streaming `Session` path share this exact accept/truncate logic.
+pub fn verify_draft(
+    model: &dyn crate::model::Model,
+    state: &mut crate::kv_cache::InferenceState,
+    guaranteed: u32,
+    draft: &[u32],
+    vocab: usize,
+) -> VerifyResult {
+    use crate::sampler::argmax;
+
+    let old = state.seq_len;
+    let mut batch = Vec::with_capacity(1 + draft.len());
+    batch.push(guaranteed);
+    batch.extend_from_slice(draft);
+    let all = model.forward_prefill_logits_all(&batch, old, state);
+    debug_assert_eq!(all.len(), batch.len() * vocab);
+
+    // Row j predicts the token at position old+j+1, i.e. the token that should
+    // follow batch[j]. Accept draft[j] while it equals that argmax.
+    let mut accepted = Vec::new();
+    for (j, &q) in draft.iter().enumerate() {
+        if argmax(&all[j * vocab..(j + 1) * vocab]) != q {
+            break;
+        }
+        accepted.push(q);
+    }
+    let m = accepted.len();
+    // Keep the guaranteed token + m accepted drafts; drop the rejected tail.
+    state.truncate_to(old + 1 + m);
+    // Row m holds the logits for the position after the last kept token.
+    let follow_logits = all[m * vocab..(m + 1) * vocab].to_vec();
+    VerifyResult {
+        accepted,
+        follow_logits,
+    }
+}
+
 /// Greedy speculative decoding with prompt-lookup drafting. Produces output that
 /// is **token-for-token identical** to greedy decoding of `model` (the target's
 /// argmax at every position is the ground truth; drafts only shortcut the
@@ -69,7 +132,7 @@ impl SpecStats {
 /// and `k` configure the drafter. Returns the generated tokens (excluding the
 /// prompt) and acceptance stats.
 ///
-/// Dense (pure-attention) models only in Phase 1 — [`InferenceState::truncate_to`]
+/// Dense (pure-attention) models only in Phase 1 — [`crate::kv_cache::InferenceState::truncate_to`]
 /// panics on LFM2 conv layers, which are not position-indexed.
 pub fn greedy_generate_spec(
     model: &dyn crate::model::Model,
@@ -103,11 +166,18 @@ pub fn greedy_generate_spec(
         if out.len() >= max_new {
             break;
         }
-        // The next greedy token is always correct — emit it up front.
+        // The next greedy token is always correct. Stop semantics match a plain
+        // greedy decode and the `Session` spec path: an EOS token is NOT emitted
+        // (checked before the push), while the `max_new` budget cap DOES emit the
+        // token and then stops. Keeping these identical to `Session` is what lets
+        // `session_spec_matches_standalone_driver` cross-check the two paths.
         let t = argmax(&next_logits);
+        if is_eos(t) {
+            break;
+        }
         out.push(t);
         history.push(t);
-        if is_eos(t) || out.len() >= max_new {
+        if out.len() >= max_new {
             break;
         }
 
@@ -118,41 +188,38 @@ pub fn greedy_generate_spec(
             continue;
         }
 
-        // Verify [t, draft...] in one forward: row j predicts position old+j+1.
+        // Verify [t, draft...] in one forward and accept the longest matching
+        // prefix (KV truncated to keep only the accepted run).
         let old = state.seq_len;
-        let mut batch = Vec::with_capacity(1 + draft.len());
-        batch.push(t);
-        batch.extend_from_slice(&draft);
-        let all = model.forward_prefill_logits_all(&batch, old, state);
-        debug_assert_eq!(all.len(), batch.len() * vocab);
         stats.rounds += 1;
         stats.drafted += draft.len();
+        let vr = verify_draft(model, state, t, &draft, vocab);
 
-        // Accept drafts while the target's greedy argmax matches.
-        let mut m = 0usize;
+        // Emit accepted drafts under the greedy stop policy (budget / EOS), each
+        // checked BEFORE the emit so a stopped token is neither counted nor kept
+        // in the KV. On an early stop, roll the KV back to the tokens actually
+        // kept and drop the unused `follow_logits`.
+        let mut kept = 0usize;
         let mut stopped = false;
-        for (j, &q) in draft.iter().enumerate() {
-            let a = argmax(&all[j * vocab..(j + 1) * vocab]);
-            if a != q {
+        for &q in &vr.accepted {
+            if out.len() >= max_new || is_eos(q) {
+                stopped = true;
                 break;
             }
             out.push(q);
             history.push(q);
-            m += 1;
+            kept += 1;
             stats.accepted += 1;
-            if is_eos(q) || out.len() >= max_new {
-                stopped = true;
-                break;
-            }
         }
-        // Keep t + m accepted drafts in the KV; drop the rejected tail.
-        state.truncate_to(old + 1 + m);
+        if kept < vr.accepted.len() {
+            state.truncate_to(old + 1 + kept);
+        }
         if stopped {
             break;
         }
-        // Row m holds the target's logits for the next position (the "bonus"
-        // token when all drafts matched, or the correcting token at a mismatch).
-        next_logits = all[m * vocab..(m + 1) * vocab].to_vec();
+        // Every accepted draft was emitted; `follow_logits` predicts the next
+        // position (the "bonus" token, or the correcting token at a mismatch).
+        next_logits = vr.follow_logits;
     }
 
     (out, stats)

@@ -49,12 +49,45 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     dot / (na * nb)
 }
 
+/// Streaming sink for the Session spec tests: collects every emitted token in
+/// order so the test can compare the token stream.
+struct Collect(Vec<u32>);
+impl cera::ModalitySink for Collect {
+    fn on_text_tokens(&mut self, t: &[u32]) {
+        self.0.extend_from_slice(t);
+    }
+    fn on_done(&mut self, _r: cera::FinishReason) {}
+}
+
+/// Build a fresh text-only `Session` over `path` with the config the spec
+/// Session tests share: an uncompressed KV (so spec engages) and monolithic
+/// prefill (`ubatch_size = 0`, so the Session's prefill logits match the
+/// standalone driver's `forward_prefill`). `max_seq_len` bounds the context.
+fn build_spec_session(path: &std::path::Path, max_seq_len: Option<u32>) -> cera::Session {
+    use std::sync::Arc;
+
+    let gguf = cera::gguf::GgufFile::open(path).unwrap();
+    let tokenizer = cera::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
+    let model: Arc<dyn cera::model::Model> =
+        Arc::from(cera::model::load_model(gguf, None, 8192).unwrap());
+    cera::Session::new(
+        model,
+        Arc::new(tokenizer),
+        cera::ModalityCapabilities::text_only(),
+        cera::SessionConfig {
+            kv_compression: cera::kv_cache::KvCompression::None,
+            seed: None,
+            ubatch_size: 0,
+            max_seq_len,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
 #[test]
 #[ignore = "needs a real dense GGUF; set CERA_DENSE_MODEL"]
 fn all_logits_argmax_matches_per_token_forward() {
-    #[allow(unused_imports)]
-    use cera::model::Model;
-
     let Some(path) = find_dense_model() else {
         return;
     };
@@ -113,9 +146,6 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 #[ignore = "needs a real dense GGUF; set CERA_DENSE_MODEL"]
 fn truncate_to_restores_kv_exactly() {
-    #[allow(unused_imports)]
-    use cera::model::Model;
-
     let Some(path) = find_dense_model() else {
         return;
     };
@@ -192,9 +222,6 @@ fn greedy_reference(
 #[test]
 #[ignore = "needs a real dense GGUF; set CERA_DENSE_MODEL"]
 fn greedy_spec_matches_greedy_exactly() {
-    #[allow(unused_imports)]
-    use cera::model::Model;
-
     let Some(path) = find_dense_model() else {
         return;
     };
@@ -251,8 +278,8 @@ fn greedy_spec_matches_greedy_exactly() {
     // still differ from *per-token* greedy at a near-tie, because spec verifies
     // with a batched GEMM while per-token greedy uses the GEMV path (the same
     // batched-vs-sequential difference `blas_parity` documents). If they diverge,
-    // prove the divergence is exactly that: a batched re-forward over the agreed
-    // prefix must predict spec's token, not a bug in the accept/truncate logic.
+    // prove the divergence is exactly that — a floating-point near-tie — and not
+    // a bug in the accept/truncate logic.
     if reference != spec {
         let i = reference
             .iter()
@@ -264,9 +291,15 @@ fn greedy_spec_matches_greedy_exactly() {
             reference[i], spec[i]
         );
 
-        // Agreed prefix = prompt ++ reference[..i]; batched-forward it and read
-        // the argmax predicting position i. Causal per-position logits are
-        // batch-shape-independent, so this reproduces the verifier's own row.
+        // Re-forward the agreed prefix (prompt ++ reference[..i]) and read the
+        // logits predicting position i, to compare spec's token against the
+        // reference's on a common footing. NOTE: this is a *different* batch
+        // shape than the short mid-sequence verify batch that actually produced
+        // spec[i], so at a genuine near-tie the two argmaxes can land on
+        // opposite sides — we therefore assert a small logit *gap*, not argmax
+        // equality. What a real accept/truncate bug cannot fake is the gap:
+        // emitting the wrong token (a rejected draft, a shifted row) would leave
+        // spec[i] many logits below the max, not a hair away from it.
         let mut seq = prompt.clone();
         seq.extend_from_slice(&reference[..i]);
         let gv = cera::gguf::GgufFile::open(&path).unwrap();
@@ -278,15 +311,212 @@ fn greedy_spec_matches_greedy_exactly() {
         let batched_pred = argmax(last) as u32;
         let g_spec = last[spec[i] as usize];
         let g_ref = last[reference[i] as usize];
+        let gap = (g_spec - g_ref).abs();
         println!(
-            "batched verifier argmax at pos {i} = {batched_pred}; logit(spec)={g_spec:.4} logit(ref)={g_ref:.4} gap={:.4}",
-            (g_spec - g_ref).abs()
+            "batched verifier argmax at pos {i} = {batched_pred}; logit(spec)={g_spec:.4} logit(ref)={g_ref:.4} gap={gap:.4}"
         );
-        assert_eq!(
-            batched_pred, spec[i],
-            "spec[{i}] must equal the batched verifier's own argmax (else accept/truncate is buggy)"
+        // 0.05 is ~2 orders of magnitude above the observed tie gaps (~1e-3) yet
+        // far below any real bug's deficit (many logits). Both tokens are valid
+        // greedy choices within this margin.
+        assert!(
+            gap < 0.05,
+            "spec[{i}]={} sits {gap:.4} below reference[{i}]={} under the batched \
+             re-forward — too large for a near-tie flip; accept/truncate likely buggy",
+            spec[i],
+            reference[i]
         );
     } else {
         println!("greedy-spec matched per-token greedy exactly (no near-tie flips)");
     }
+}
+
+/// Session wiring oracle: `Session::generate` with `spec` set must emit exactly
+/// the same tokens as the standalone `greedy_generate_spec` driver on the same
+/// prompt/config. Both drive the identical forward sequence (monolithic prefill
+/// via `ubatch_size = 0`, then the shared `verify_draft` accept/truncate loop),
+/// so equality is exact — this pins the `Session` layer (emit/flush, stop
+/// policy, `truncate_to` on partial accept, `current_pos` bookkeeping) against
+/// the tested core, catching any drift the core's own oracle can't see.
+#[test]
+#[ignore = "needs a real dense GGUF; set CERA_DENSE_MODEL"]
+fn session_spec_matches_standalone_driver() {
+    use cera::{GenerateOpts, SpecDecode};
+
+    let Some(path) = find_dense_model() else {
+        return;
+    };
+    // Repetitive prompt so drafts actually hit (same rationale as the oracle).
+    let prompt: Vec<u32> = vec![
+        1, 450, 6635, 3290, 373, 278, 1775, 29889, 450, 6635, 3290, 373, 278,
+    ];
+    let max_new = 64u32;
+    let sd = SpecDecode { ngram: 2, k: 6 };
+
+    // Standalone driver reference.
+    let gr = cera::gguf::GgufFile::open(&path).unwrap();
+    let mr = cera::model::load_model(gr, None, 8192).unwrap();
+    let cfg = mr.config();
+    let mut sr = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
+    let (driver, dstats) = cera::spec::greedy_generate_spec(
+        mr.as_ref(),
+        &mut sr,
+        &prompt,
+        max_new as usize,
+        &[], // ignore EOS, matching ignore_eos below
+        sd.ngram,
+        sd.k,
+    );
+    assert!(
+        dstats.accepted > 0,
+        "expected accepted drafts (else the shared path is untested)"
+    );
+
+    // Session path: same weights, monolithic prefill + uncompressed KV (see
+    // `build_spec_session`). A separate model instance is deterministic.
+    let mut session = build_spec_session(&path, None);
+    session.append_tokens(&prompt).unwrap();
+    let mut sink = Collect(Vec::new());
+    let summary = session
+        .generate(
+            &GenerateOpts {
+                max_tokens: max_new,
+                temperature: 0.0,
+                ignore_eos: true,
+                spec: Some(sd),
+                ..Default::default()
+            },
+            &mut sink,
+        )
+        .unwrap();
+
+    println!(
+        "session spec: {} tokens (finish {:?}); driver: {} tokens",
+        sink.0.len(),
+        summary.finish_reason,
+        driver.len()
+    );
+    assert_eq!(
+        summary.tokens_generated as usize,
+        driver.len(),
+        "session must generate the same count as the driver"
+    );
+    assert_eq!(
+        sink.0, driver,
+        "Session spec-decode output must equal the standalone driver token-for-token"
+    );
+    // Session must land `current_pos` exactly at prompt + generated (KV holds
+    // every emitted token — no rejected-draft cells left behind).
+    assert_eq!(
+        session.position() as usize,
+        prompt.len() + driver.len(),
+        "current_pos must equal prompt + generated after a spec run"
+    );
+}
+
+/// Stop-token contract: a spec run that honors stops must behave exactly like a
+/// plain greedy decode at a stop — the stop token is NOT streamed, NOT counted,
+/// and its KV is NOT appended (so `position()` stays put). We force this on the
+/// very first token by setting `stop_tokens` to the model's own first argmax:
+/// the guaranteed-token stop path must then emit nothing and leave the session
+/// exactly at the prompt. This covers the branch the `ignore_eos` oracles skip.
+#[test]
+#[ignore = "needs a real dense GGUF; set CERA_DENSE_MODEL"]
+fn session_spec_honors_stop_without_emitting_it() {
+    use cera::{FinishReason, GenerateOpts, SpecDecode};
+
+    let Some(path) = find_dense_model() else {
+        return;
+    };
+    let prompt: Vec<u32> = vec![
+        1, 450, 6635, 3290, 373, 278, 1775, 29889, 450, 6635, 3290, 373, 278,
+    ];
+
+    // Learn the model's first greedy token via a monolithic prefill, so we can
+    // make it a stop token below. The Session prefills the same way (ubatch=0).
+    let gr = cera::gguf::GgufFile::open(&path).unwrap();
+    let mr = cera::model::load_model(gr, None, 8192).unwrap();
+    let cfg = mr.config();
+    let mut sr = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
+    let prefill = mr.forward_prefill(&prompt, 0, &mut sr);
+    let first = argmax(&prefill) as u32;
+
+    let mut session = build_spec_session(&path, None);
+    session.append_tokens(&prompt).unwrap();
+    let mut sink = Collect(Vec::new());
+    let summary = session
+        .generate(
+            &GenerateOpts {
+                max_tokens: 64,
+                temperature: 0.0,
+                ignore_eos: false,
+                stop_tokens: vec![first],
+                spec: Some(SpecDecode { ngram: 2, k: 6 }),
+                ..Default::default()
+            },
+            &mut sink,
+        )
+        .unwrap();
+
+    assert!(
+        matches!(summary.finish_reason, FinishReason::Stop),
+        "expected Stop, got {:?}",
+        summary.finish_reason
+    );
+    assert_eq!(
+        summary.tokens_generated, 0,
+        "stop token must not be counted"
+    );
+    assert!(sink.0.is_empty(), "stop token must not be streamed");
+    assert_eq!(
+        session.position() as usize,
+        prompt.len(),
+        "stop token's KV must not be appended (position stays at the prompt)"
+    );
+}
+
+/// Context bound: a verify round appends up to `1 + k` tokens, so the drafter is
+/// clamped to keep the KV within `max_seq_len`. With a tight `max_seq_len` and a
+/// repetitive prompt (drafts fire), the spec run must stop at `ContextFull`
+/// without overshooting the bound — `position()` never exceeds `max_seq_len`.
+#[test]
+#[ignore = "needs a real dense GGUF; set CERA_DENSE_MODEL"]
+fn session_spec_respects_max_seq_len() {
+    use cera::{FinishReason, GenerateOpts, SpecDecode};
+
+    let Some(path) = find_dense_model() else {
+        return;
+    };
+    let prompt: Vec<u32> = vec![
+        1, 450, 6635, 3290, 373, 278, 1775, 29889, 450, 6635, 3290, 373, 278,
+    ];
+    // Leave only a few token-slots after the prompt — smaller than k, so a full
+    // draft would overshoot if unclamped.
+    let cap = prompt.len() + 3;
+
+    let mut session = build_spec_session(&path, Some(cap as u32));
+    session.append_tokens(&prompt).unwrap();
+    let mut sink = Collect(Vec::new());
+    let summary = session
+        .generate(
+            &GenerateOpts {
+                max_tokens: 256, // large, so max_seq_len is the binding limit
+                temperature: 0.0,
+                ignore_eos: true,
+                spec: Some(SpecDecode { ngram: 2, k: 6 }),
+                ..Default::default()
+            },
+            &mut sink,
+        )
+        .unwrap();
+
+    assert!(
+        session.position() as usize <= cap,
+        "spec decode overshot max_seq_len: position {} > cap {cap}",
+        session.position()
+    );
+    assert!(
+        matches!(summary.finish_reason, FinishReason::ContextFull),
+        "expected ContextFull at the bound, got {:?}",
+        summary.finish_reason
+    );
 }
