@@ -778,13 +778,20 @@ impl InferenceState {
                     },
                     LayerSnapshot::Attention { k_data, v_data },
                 ) => {
+                    // Symmetric backstop to the AttentionF16 arm: an f32
+                    // snapshot must not restore into an f16 state (it would
+                    // populate the f32 slots while the model reads the empty
+                    // f16 slots → silent garbage). The lfm2 gate is the primary
+                    // guard; panic loudly if it's ever bypassed.
+                    assert!(
+                        !kv_f16,
+                        "f32 Attention snapshot restored into an f16 state — \
+                         caller must gate on the snapshot/live compression mode"
+                    );
                     decode_f32_into(key_cache, k_data);
                     decode_f32_into(value_cache, v_data);
-                    // Defensive: an f32 snapshot restored into an f16-configured
-                    // state must not leave stale f16 data. The cross-mode gate in
-                    // `Lfm2Model::forward_prefill` normally rejects an f32
-                    // snapshot against an f16 state, but keep the two
-                    // representations from ever coexisting regardless.
+                    // Keep the two representations from ever coexisting (f16
+                    // slots stay empty on the f32 path).
                     key_cache_f16.clear();
                     value_cache_f16.clear();
                 }
@@ -1568,10 +1575,20 @@ impl KvPrefixCache {
                     layers.push(LayerSnapshot::AttentionCompressed { keys, values });
                 }
                 3 => {
-                    layers.push(LayerSnapshot::AttentionF16 {
-                        k_data: l.k_data()?.bytes().to_vec(),
-                        v_data: l.v_data()?.bytes().to_vec(),
-                    });
+                    let k_data = l.k_data()?.bytes().to_vec();
+                    let v_data = l.v_data()?.bytes().to_vec();
+                    // Validate the f16 blob shape at load time (mirrors the
+                    // tag-2 TurboQuant validation): u16 half-bits are 2 bytes
+                    // each and K/V are the same length, so a corrupted entry
+                    // surfaces as a cache miss (None) here instead of panicking
+                    // later in `restore`'s `decode_u16_into` (`len % 2 == 0`).
+                    if !k_data.len().is_multiple_of(2)
+                        || !v_data.len().is_multiple_of(2)
+                        || k_data.len() != v_data.len()
+                    {
+                        return None;
+                    }
+                    layers.push(LayerSnapshot::AttentionF16 { k_data, v_data });
                 }
                 _ => return None,
             }
@@ -1852,6 +1869,25 @@ mod tests {
         let mut f32_state =
             InferenceState::from_config_with_compression(&cfg, &KvCompression::None).unwrap();
         f32_state.restore(&snap); // must panic on the AttentionF16 arm's kv_f16 assert
+    }
+
+    /// Reverse backstop: restoring an f32 `Attention` snapshot into an
+    /// f16-configured state must panic (else the f16 session gets f32 slots
+    /// populated while it reads the empty f16 slots — silent garbage).
+    #[test]
+    #[should_panic(expected = "f32 Attention snapshot restored into an f16 state")]
+    fn restore_f32_snapshot_into_f16_state_panics() {
+        let cfg = tiny_config(2, 16);
+        let kv_dim = cfg.kv_heads_per_layer[0] * cfg.head_dim;
+        let mut f32_state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::None).unwrap();
+        f32_state.append_kv(0, &vec![0.5f32; kv_dim], &vec![-0.5f32; kv_dim]);
+        f32_state.seq_len = 1;
+        let snap = f32_state.snapshot().expect("f32 snapshots");
+
+        let mut f16_state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::F16).unwrap();
+        f16_state.restore(&snap); // must panic on the Attention arm's !kv_f16 assert
     }
 
     /// f16 snapshot survives the disk (flatbuffer `type_tag = 3`) round-trip:

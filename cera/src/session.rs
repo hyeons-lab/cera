@@ -264,11 +264,11 @@ pub enum CeraError {
 // ---------------------------------------------------------------------------
 
 /// Decide whether `append_tokens` may run a `n_keep` context shift
-/// instead of returning `ContextOverflow`. Pure 4-input predicate,
+/// instead of returning `ContextOverflow`. Pure 5-input predicate,
 /// extracted from the overflow arm so it can be unit-tested without
 /// spinning up a full `Session` (which needs a real `BpeTokenizer`).
 ///
-/// All four must hold:
+/// All of these must hold:
 /// - `supports_kv_shift`: backend opted in via [`Model::supports_kv_shift`]
 /// - `n_keep > 0`: user wants to preserve a prefix
 /// - `!cache_unshiftable`: the cache isn't TurboQuant-compressed (compressed
