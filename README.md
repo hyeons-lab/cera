@@ -258,7 +258,7 @@ optimal on any one. The knobs below override them.
 | Variable | Effect |
 |----------|--------|
 | `CERA_DECODE_THREADS=<n>` or `CERA_DECODE_THREADS=auto` | Worker count for decode (per-token GEMV). A fixed `<n>` overrides the automatic sizing below (clamped to the detected count); `auto` selects it. |
-| `CERA_DECODE_SIZING=off` | Disable model-aware decode sizing and fall back to the flat cap (detected perf cores — ≤12 homogeneous, ≤6 on big.LITTLE). Use this to A/B the sizing on a new machine. |
+| `CERA_DECODE_SIZING=off` | Disable model-aware decode sizing (`0` / `false` / `off`, case-insensitive) and fall back to the flat cap (detected perf cores — ≤12 homogeneous, ≤6 on big.LITTLE). Use this to A/B the sizing on a new machine. |
 | `CERA_DECODE_NARROW=<n>` / `CERA_DECODE_WIDE=<n>` | Override the two widths the sizing picks between. Defaults derive from the physical core count — `physical/2` capped at 12, and `physical + physical/4` capped at 24; the narrow arm never exceeds the wide one. Setting either also forces sizing on where it would otherwise be declined; on a host whose physical core count is undetectable, both must be pinned. |
 | `CERA_DECODE_BPD_KB=<n>` | Bytes-per-dispatch threshold (decimal KB) separating the narrow arm from the wide one. Default 2500. Unlike the two above, this does not force sizing on where it is declined — it moves the threshold, it does not pin a width. |
 | `CERA_THREADS=<n>` | Overrides the detected performance-core count, which the decode/prefill pools are sized from. |
@@ -296,6 +296,13 @@ own best measured width across the full 12-model set, the rule reaches 98.1% of
 peak versus 90.1% for the flat cap; one combo near the threshold
 (LFM2.5-350M Q4_0) lands on the narrow arm when its measurement mildly preferred
 the wide one, which is the cost that average already includes.
+
+The pool itself is a process-wide singleton, built once on the first decode
+dispatch, so the width comes from the **first** model loaded into a process and
+stays there for any loaded after it — it does not re-size per load. (The thread
+count was already inherited that way before this sizing existed.) Embedders
+running several models in one process should pick the knobs below for whichever
+model's decode matters, or load that one first.
 
 This is calibrated on one x86 host. The sizing steps aside — leaving the
 previous flat-cap behaviour — in two cases. On heterogeneous parts, because

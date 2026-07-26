@@ -262,7 +262,10 @@ spread a token across many small pool dispatches run narrow, large ones that
 move more bytes per dispatch run wide. Where that sizing does not apply —
 heterogeneous parts, or a host whose physical core count cannot be detected
 (Windows, BSD, Intel macOS) — the previous flat cap applies as before (≤12
-homogeneous, ≤6 on big.LITTLE). Everything is auto-detected per device; the
+homogeneous, ≤6 on big.LITTLE). Both pools are process-wide singletons, so the
+decode width is sized from the **first** model loaded into a process and stays
+there for any loaded after it — it does not re-size per load. Everything else is
+auto-detected per device; the
 environment variables below only override for tuning (`CERA_THREADS` moves the
 detected count, which both pools size from):
 
