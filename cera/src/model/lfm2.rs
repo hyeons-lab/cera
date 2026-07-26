@@ -78,13 +78,24 @@ pub struct Lfm2Model {
     /// construction time so warm hits work without explicit config.
     prefix_cache: Mutex<KvPrefixCache>,
     /// Prefix-cache namespace tag for the KV mode this model's sessions use
-    /// (`KvCompression::cache_tag`). Set by `configure_kv_compression`; empty
-    /// until then, which is the correct tag for the f32 default.
+    /// (`KvCompression::cache_tag`). `None` until `configure_kv_compression` runs;
+    /// the empty string is the tag for the f32 default, which is why this is an
+    /// `Option` rather than just `""`.
     ///
-    /// The model, not the state, owns this because the cache's `model_fingerprint`
-    /// is fixed when the cache is built — whereas the mode arrives later, with the
-    /// session.
-    kv_cache_tag: Mutex<String>,
+    /// The model owns this, but the mode is a *per-session* knob — so the two only
+    /// stay consistent because configuration is first-call-wins. See
+    /// `configure_kv_compression`.
+    kv_cache_tag: Mutex<Option<String>>,
+}
+
+/// Render a cache tag for the `KvCompressionConflict` message — the empty tag is
+/// the f32 default, which reads better spelled out.
+fn describe_cache_tag(tag: &str) -> String {
+    if tag.is_empty() {
+        "f32".to_string()
+    } else {
+        tag.trim_end_matches(':').to_string()
+    }
 }
 
 impl Lfm2Model {
@@ -94,7 +105,14 @@ impl Lfm2Model {
     /// mode tag keeps f32, f16, and each TurboQuant configuration apart.
     fn cache_namespace(&self) -> String {
         let tag = self.kv_cache_tag.lock().expect("kv_cache_tag poisoned");
-        format!("cpu:{tag}{}", self.model_id)
+        Self::namespace_for(tag.as_deref().unwrap_or(""), &self.model_id)
+    }
+
+    /// The namespace string itself, taking the tag by value so a caller already
+    /// holding the tag lock doesn't have to re-acquire it (see
+    /// `configure_kv_compression`, which updates the tag and the cache atomically).
+    fn namespace_for(tag: &str, model_id: &str) -> String {
+        format!("cpu:{tag}{model_id}")
     }
 
     /// Construct without a model identifier. Equivalent to
@@ -335,7 +353,7 @@ impl Lfm2Model {
             layer_refs,
             model_id,
             prefix_cache,
-            kv_cache_tag: Mutex::new(String::new()),
+            kv_cache_tag: Mutex::new(None),
         })
     }
 
@@ -2744,35 +2762,47 @@ impl Model for Lfm2Model {
     /// mode, or snapshots from different KV modes collide on disk. See
     /// [`KvCompression::cache_tag`] for what that collision costs.
     ///
-    /// Unlike the GPU backends this imposes no first-call-wins constraint: no
-    /// buffers are sized by the mode, so re-tagging for a later session with a
-    /// different mode is safe. Rebuilding drops the warm tier, which is the point —
-    /// those entries belong to the previous mode's namespace.
+    /// **First call wins**, matching the trait contract and the GPU backends: a
+    /// later call with a *different* mode returns
+    /// [`crate::CeraError::KvCompressionConflict`].
+    ///
+    /// That restriction is not about allocation here — nothing is sized by the mode
+    /// on CPU. It is because the tag lives on the *model* while `KvCompression` is a
+    /// *per-session* knob, and one model owns one prefix cache. Letting a second
+    /// session re-tag would leave the first still writing snapshots, now into the
+    /// second's namespace. For two TurboQuant seeds that is silent corruption rather
+    /// than a miss: the compatibility gate only checks that both sides are
+    /// compressed, and `InferenceState::restore` never validates the seed, so the
+    /// first session's KV would be decoded in the wrong Hadamard basis. Two sessions
+    /// in different KV modes need two model instances.
     fn configure_kv_compression(
         &self,
         compression: &KvCompression,
     ) -> Result<(), crate::CeraError> {
-        // The state resolves a TurboQuant request with a non-power-of-two head_dim
-        // to plain f32 (`from_config_capped`), so tag with what the cache will
-        // actually hold, not what was asked for.
-        let resolved =
-            if compression.flags() != (false, false) && !self.config.head_dim.is_power_of_two() {
-                KvCompression::None.cache_tag()
-            } else {
-                compression.cache_tag()
-            };
-        let mut tag = self.kv_cache_tag.lock().expect("kv_cache_tag poisoned");
-        if *tag == resolved {
-            return Ok(());
-        }
-        *tag = resolved;
-        drop(tag);
+        let resolved = compression.resolved_for(&self.config).cache_tag();
 
-        let id = self.cache_namespace();
+        // Cache lock outside, tag lock inside, so the tag and the cache's namespace
+        // move as one unit. Dropping the tag guard before rebuilding would let two
+        // concurrent calls land tag=Y with the cache fingerprinted X — the
+        // cross-mode collision this exists to prevent. `configure_cache` takes the
+        // tag lock and releases it before taking the cache lock, so no cycle.
         let mut cache = self
             .prefix_cache
             .lock()
             .expect("prefix_cache mutex poisoned");
+        let mut tag = self.kv_cache_tag.lock().expect("kv_cache_tag poisoned");
+        match tag.as_deref() {
+            Some(existing) if existing == resolved => return Ok(()),
+            Some(existing) => {
+                return Err(crate::CeraError::KvCompressionConflict {
+                    configured: describe_cache_tag(existing),
+                    requested: describe_cache_tag(&resolved),
+                });
+            }
+            None => {}
+        }
+        let id = Self::namespace_for(&resolved, &self.model_id);
+        *tag = Some(resolved);
         let cache_config = cache.config.clone();
         *cache = KvPrefixCache::new(cache_config, &self.config, &id);
         Ok(())

@@ -439,9 +439,12 @@ pub trait Model: Send + Sync {
 
     /// Tell a backend whose KV lives on the model (not on `InferenceState`)
     /// which compression mode the session wants, so it can allocate the right
-    /// caches. Called by `Session::new` / `Session::reset` before any forward
-    /// pass; a no-op for the CPU backends, whose caches are allocated by
-    /// `InferenceState::from_config_with_compression` instead.
+    /// caches. Called by `Session::new` / `Session::reset` before any forward pass.
+    ///
+    /// The CPU backends allocate their KV from `InferenceState` instead, so they
+    /// have nothing to build — but `Lfm2Model` still implements this to namespace
+    /// its prefix cache by mode (see `KvCompression::cache_tag`), so it is not a
+    /// no-op there either.
     ///
     /// Allocation has to be deferred this way because a GPU model is loaded
     /// before the session that configures it exists: allocating the f32 caches

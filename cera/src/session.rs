@@ -483,8 +483,9 @@ impl Session {
             );
         }
         // Backends whose KV lives on the model (the GPU paths) allocate their
-        // caches from this call; the CPU backends read the mode off `state`
-        // instead and no-op here. It runs BEFORE the capability warnings below
+        // caches from this call. The CPU backends allocate from `state` instead but
+        // still use this to namespace their prefix cache by mode. It runs BEFORE
+        // the capability warnings below
         // because a backend's `supports_kv_shift()` can depend on the configured
         // mode (wgpu reports `false` once TurboQuant is active), and it must
         // precede the first forward pass either way.

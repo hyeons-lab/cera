@@ -5187,8 +5187,11 @@ impl Model for GpuLfm2Model {
         // Tag with the mode the cache will actually hold, not the one requested: a
         // TurboQuant request this backend can't serve resolved to f32 above, and
         // must share the f32 namespace it is now writing into.
+        // Tag with the mode the cache will actually hold. `resolved_for` covers the
+        // head_dim downgrade; `want.is_none()` additionally covers the GPU-only
+        // restrictions (single-sided TurboQuant), which also land on f32 KV here.
         let _ = self.kv_cache_tag.set(if want.is_some() {
-            compression.cache_tag()
+            compression.resolved_for(&self.config).cache_tag()
         } else {
             KvCompression::None.cache_tag()
         });
@@ -5201,7 +5204,8 @@ impl Model for GpuLfm2Model {
         // already correctly namespaced, and rebuilding would discard its warm tier
         // for nothing. The warm tier is empty here regardless (no forward has run
         // on this instance yet).
-        if want.is_some() {
+        let tag_changed = self.kv_cache_tag.get().is_some_and(|t| !t.is_empty());
+        if tag_changed {
             let id = self.cache_namespace();
             let mut cache = self
                 .prefix_cache

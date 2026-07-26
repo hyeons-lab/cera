@@ -135,6 +135,22 @@ impl KvCompression {
         matches!(self, Self::F16)
     }
 
+    /// The mode a state built from `config` will *actually* use.
+    ///
+    /// `from_config_capped` silently downgrades TurboQuant to plain f32 when
+    /// `head_dim` isn't a power of two (the Walsh-Hadamard transform needs it), so
+    /// anything deriving identity from the mode — the prefix-cache tag especially —
+    /// has to ask what was resolved, not what was requested. Keeping that rule here
+    /// beside the allocator that applies it stops the two from drifting.
+    pub fn resolved_for(&self, config: &ModelConfig) -> Self {
+        let (keys, values) = self.flags();
+        if (keys || values) && !config.head_dim.is_power_of_two() {
+            Self::None
+        } else {
+            self.clone()
+        }
+    }
+
     /// Prefix-cache namespace tag for this mode — `""` for plain f32, else a
     /// `"…:"`-terminated discriminator to prepend to a backend's cache id.
     ///
@@ -1462,11 +1478,16 @@ impl KvPrefixCache {
         };
 
         // If the best hit came from the cold tier, promote it to warm.
+        // The `< tokens.len()` bound matches the lookup filter above: a full-length
+        // warm entry can never be returned, so treating it as "we already have
+        // something at least as good" would block promotion forever and re-read the
+        // multi-MB cold file on every call.
         if let Some((snapshot, len)) = &best
-            && !self
-                .warm
-                .values()
-                .any(|e| e.tokens.len() >= *len && tokens.starts_with(&e.tokens))
+            && !self.warm.values().any(|e| {
+                e.tokens.len() >= *len
+                    && e.tokens.len() < tokens.len()
+                    && tokens.starts_with(&e.tokens)
+            })
         {
             let hash = hash_tokens(&tokens[..*len]);
             let snap_bytes = snapshot.byte_size() as u64;
@@ -1863,6 +1884,45 @@ mod tests {
                 .collect(),
             scalars: crate::model::ScalarMultipliers::default(),
         }
+    }
+
+    /// The COLD tier's strict-prefix range, pinned directly.
+    ///
+    /// Reverting `find_cold_prefix`'s `1..tokens.len()` back to `1..=tokens.len()`
+    /// left the whole suite green before this test existed — the warm-tier test
+    /// below doesn't touch the disk path, and `f16_snapshot_disk_round_trips` hits
+    /// under either range. This asserts the boundary itself.
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn cold_tier_ignores_a_full_length_entry() {
+        let cfg = tiny_config(2, 16);
+        let dir = std::env::temp_dir().join(format!("cera_cold_strict_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = KvPrefixCache::new(KvCacheConfig::default(), &cfg, "cpu:test");
+        let snapshot = |seq_len: usize| StateSnapshot {
+            layers: Vec::new(),
+            seq_len,
+        };
+        let tokens = [7u32, 8, 9];
+
+        // Saved at exactly the query length → unusable, must not be returned.
+        cache.save_cold(&dir, &tokens, &snapshot(tokens.len()));
+        assert!(
+            cache.find_cold_prefix(&dir, &tokens).is_none(),
+            "cold tier returned a full-length entry; every caller rejects it, and \
+             the scan breaks on its first match so a shorter one would be skipped"
+        );
+
+        // A strict prefix of the same query must still be found.
+        cache.save_cold(&dir, &tokens[..2], &snapshot(2));
+        assert_eq!(
+            cache
+                .find_cold_prefix(&dir, &tokens)
+                .expect("strict prefix must be found")
+                .seq_len,
+            2
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A cached entry covering *all* of `tokens` must not shadow a shorter, usable
