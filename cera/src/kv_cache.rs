@@ -679,13 +679,19 @@ impl InferenceState {
                     compressed_values,
                 } => {
                     let snap = if kv_f16 {
-                        // f16 KV: cast the u16 half-bit slots to raw bytes. f16
-                        // and TurboQuant are mutually exclusive
+                        // f16 KV: serialize the u16 half-bits **little-endian**
+                        // to match the documented on-disk format and `restore`'s
+                        // `u16::from_le_bytes` decode (a native-endian
+                        // `bytemuck::cast_slice` would byte-swap on a big-endian
+                        // host). f16 and TurboQuant are mutually exclusive
                         // (`from_config_with_compression` picks one), so the
                         // compressed slots are always `None` here.
                         LayerSnapshot::AttentionF16 {
-                            k_data: bytemuck::cast_slice(key_cache_f16).to_vec(),
-                            v_data: bytemuck::cast_slice(value_cache_f16).to_vec(),
+                            k_data: key_cache_f16.iter().flat_map(|h| h.to_le_bytes()).collect(),
+                            v_data: value_cache_f16
+                                .iter()
+                                .flat_map(|h| h.to_le_bytes())
+                                .collect(),
                         }
                     } else {
                         match (compressed_keys, compressed_values) {
