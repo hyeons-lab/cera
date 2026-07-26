@@ -141,10 +141,10 @@ impl TqAttnParams {
         ]
     }
 
-    /// The QJL estimator scale for a given `head_dim` — `sqrt(pi/2)/d`, matching
-    /// `attn_scores_turboquant_gqa`.
+    /// The QJL estimator scale for a given `head_dim`. Delegates to
+    /// [`crate::turboquant::qjl_scale`] so there is one definition.
     pub fn qjl_scale_for(head_dim: usize) -> f32 {
-        (std::f32::consts::PI / 2.0).sqrt() / head_dim as f32
+        crate::turboquant::qjl_scale(head_dim)
     }
 }
 
@@ -206,11 +206,15 @@ impl TqGpuCache {
         mode: TqMode,
     ) -> Result<Self, CeraError> {
         let head_dim = config.head_dim;
-        assert!(
-            head_dim_supported(head_dim),
-            "TqGpuCache built for unsupported head_dim {head_dim}; \
-             callers must gate on TqMode::from_compression"
-        );
+        // The in-crate caller gates on `TqMode::from_compression`, but this type is
+        // `pub` (the oracle tests construct it directly), so surface a typed error
+        // rather than aborting the caller's process.
+        if !head_dim_supported(head_dim) {
+            return Err(CeraError::Backend(format!(
+                "TurboQuant does not support head_dim {head_dim} (needs a power of \
+                 two <= 128 that is a multiple of 32)"
+            )));
+        }
         let layout = TqLayout::new(head_dim);
         let n_layers = config.block_types.len();
 
@@ -227,18 +231,12 @@ impl TqGpuCache {
             match bt {
                 BlockType::Attention => {
                     let n_kv_heads = config.kv_heads_per_layer[i];
-                    // Guard each multiply where it happens, via the same helper the
-                    // CPU KV path uses, so an absurd config surfaces as a
-                    // recoverable `OutOfMemory` carrying the real intended byte
-                    // size rather than a `usize` wrap that under-allocates the
-                    // cache and turns every later write into an OOB.
+                    // `TqLayout` owns the region formula and guards its own
+                    // multiplies, so production and the oracle tests can't drift
+                    // apart on the sizing.
                     let vecs = checked_elems::<u32>(n_kv_heads, max_seq_len)?;
-                    let k_bytes = words_to_bytes(checked_elems::<u32>(
-                        vecs,
-                        layout.polar_words + layout.jl_words + 1,
-                    )?);
-                    let v_bytes =
-                        words_to_bytes(checked_elems::<u32>(vecs, layout.polar_words + 1)?);
+                    let k_bytes = words_to_bytes(layout.key_words(vecs)?);
+                    let v_bytes = words_to_bytes(layout.value_words(vecs)?);
                     layers.push(Some(TqLayerCache {
                         keys: ctx.create_storage_rw(k_bytes, &format!("l{i}.tq_keys")),
                         values: ctx.create_storage_rw(v_bytes, &format!("l{i}.tq_values")),
@@ -793,9 +791,13 @@ impl TqGpuCache {
     }
 }
 
-/// A 4-byte-element count as a byte count. Infallible: `words` is already a
-/// `checked_elems`-guarded element count, and widening it to `u64` before the
-/// `* 4` can't overflow. Callers guard the multiply that *produced* `words`.
+/// A 4-byte-element count as a byte count.
+///
+/// Callers guard the multiply that *produced* `words` (via `checked_elems`), which
+/// is the one that can realistically overflow. This `* 4` is unguarded: it would
+/// need `words > u64::MAX / 4`, unreachable for any `n_kv_heads × max_seq_len ×
+/// head_dim` a device could address, and `usize` bounds `words` well below it on
+/// every supported target.
 fn words_to_bytes(words: usize) -> u64 {
     words as u64 * 4
 }

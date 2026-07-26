@@ -1788,13 +1788,13 @@ fn setup_kv_compression(
             if values { "2-bit" } else { "f32" }
         );
         // `turboquant_supported()` is a per-backend capability probe, not a
-        // per-mode one: the GPU backends implement only the both-sides mode and
-        // fall back to f32 for these two. Say so here rather than let the line
-        // above be contradicted by a `tracing::warn` the user may not have on.
+        // per-mode one: the GPU backends implement only the both-sides mode. State
+        // that as a capability rather than a fallback warning — on `--device cpu`,
+        // which is where these modes are meant to be used, nothing falls back.
         if !(keys && values) {
             eprintln!(
-                "note: single-sided TurboQuant is a CPU-only debugging mode; \
-                 the GPU backends fall back to f32 KV for it"
+                "note: single-sided TurboQuant runs on the CPU backend only; \
+                 the GPU backends support `tq3` (both sides) and use f32 KV for this mode"
             );
         }
         Ok(KvCompression::TurboQuant { seed, keys, values })

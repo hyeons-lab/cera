@@ -1389,11 +1389,24 @@ impl TqMode {
 
 /// Human-readable name for a configured mode, for the
 /// `CeraError::KvCompressionConflict` message.
+///
+/// `cfg`-gated on `gpu`: the wgpu backend is its only caller, so without this a
+/// default or `--features metal` build (which is what the shipped iOS/macOS
+/// xcframework is compiled with) would warn that it is never used.
+#[cfg(feature = "gpu")]
 pub(crate) fn describe_kv_mode(mode: &Option<TqMode>) -> String {
     match mode {
         Some(m) => format!("turboquant(seed={})", m.seed),
         None => "f32".to_string(),
     }
+}
+
+/// QJL inner-product estimator scale, `sqrt(pi/2) / head_dim` (arXiv:2504.19874
+/// §3.2). The single definition shared by the CPU scalar path, both GPU attention
+/// kernels' params, and the oracle tests — duplicating it once let the Metal test
+/// hardcode a copy that a change to the estimator would silently miss.
+pub fn qjl_scale(head_dim: usize) -> f32 {
+    (std::f32::consts::PI / 2.0).sqrt() / head_dim as f32
 }
 
 /// Packed u32 words per element group, derived from `head_dim`. Mirrors the
@@ -1419,13 +1432,20 @@ impl TqLayout {
 
     /// u32 words in a layer's key buffer: `[polar | jl | norms]` for `vecs`
     /// (kv_head, timestep) slots.
-    pub fn key_words(&self, vecs: usize) -> usize {
-        vecs * (self.polar_words + self.jl_words + 1)
+    ///
+    /// Guards the multiply (→ [`CeraError::OutOfMemory`] carrying the intended byte
+    /// size) rather than leaving each caller to do it: a `usize` wrap here would
+    /// under-allocate the cache and turn every later write into an out-of-bounds.
+    /// Fallible so production and the oracle tests share one formula instead of
+    /// keeping a guarded copy next to an unguarded one.
+    pub fn key_words(&self, vecs: usize) -> Result<usize, CeraError> {
+        checked_elems::<u32>(vecs, self.polar_words + self.jl_words + 1)
     }
 
-    /// u32 words in a layer's value buffer: `[polar | norms]`.
-    pub fn value_words(&self, vecs: usize) -> usize {
-        vecs * (self.polar_words + 1)
+    /// u32 words in a layer's value buffer: `[polar | norms]`. Guarded like
+    /// [`Self::key_words`].
+    pub fn value_words(&self, vecs: usize) -> Result<usize, CeraError> {
+        checked_elems::<u32>(vecs, self.polar_words + 1)
     }
 
     /// `u32`-word offsets of the key regions (`jl`, `norms`), given `vecs`

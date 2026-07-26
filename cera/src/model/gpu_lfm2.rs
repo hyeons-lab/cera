@@ -558,9 +558,10 @@ pub struct GpuLfm2Model {
     /// The compression mode this model has been configured for: `Some(mode)` for
     /// TurboQuant, `None` for f32 KV. Distinct from `tq` because a request the
     /// backend can't serve (single-sided TurboQuant, unsupported `head_dim`)
-    /// records f32 here while leaving `tq` empty — and because it must be set
-    /// before any allocation happens so a conflicting second session is rejected
-    /// rather than silently handed the wrong cache layout.
+    /// records f32 here while leaving `tq` empty. Set *after* the cache is built,
+    /// so a failed (OOM) allocation leaves the model still reconfigurable; the
+    /// whole of `configure_kv_compression` holds `infer_lock`, so the ordering is
+    /// unobservable to other threads.
     kv_mode: OnceLock<Option<TqMode>>,
     /// Caller-supplied identifier (typically the GGUF file path) used to
     /// namespace prefix-cache disk files. Prefixed with `"wgpu:"` before
@@ -2288,10 +2289,17 @@ impl GpuLfm2Model {
     /// the session configures compression.
     fn cache_namespace(&self) -> String {
         let mode = match self.kv_mode.get() {
-            Some(Some(_)) => "tq3:",
+            // The seed is part of the identity, not just the mode: it drives the
+            // per-layer randomized Hadamard rotations, so a cache written under
+            // one seed decodes to garbage under another. `restore_layer` only
+            // validates shape (head_dim / n_kv_heads / seq_len), which a
+            // different-seed blob passes — so without the seed here, two sessions
+            // over the same GGUF and `--cache-dir` with different seeds would
+            // silently attend in the wrong basis.
+            Some(Some(m)) => format!("tq3-s{}:", m.seed),
             // Not yet configured behaves as f32 — the mode-setting path rebuilds
             // the cache, so an early `configure_cache` can't leave a stale tag.
-            Some(None) | None => "",
+            Some(None) | None => String::new(),
         };
         format!("wgpu:{mode}{}", self.model_id)
     }
@@ -4941,14 +4949,13 @@ impl Model for GpuLfm2Model {
                         .find_longest_prefix(tokens)
                 })
                 .flatten()
-                // Compression-mode gate. The warm tier can only hold entries this
-                // instance wrote (one mode per instance), but the disk tier is
-                // namespaced by model path alone, so an f32 and a TurboQuant
-                // session over the same model share cache files. A mismatched
-                // entry has no slot to restore into, so treat it as a miss rather
-                // than let `restore_state_locked` panic. Dropping the longest
-                // match this way can hide a shorter compatible one; a cold prefill
-                // is the acceptable cost of not namespacing the mode on disk.
+                // Compression-mode gate. `cache_namespace` now folds the mode and
+                // seed into the disk fingerprint, so a cross-mode entry should be
+                // unreachable — this is a defensive backstop, not the primary
+                // guard, because the alternative on a namespace bug is
+                // `restore_state_locked` panicking or restoring a cache the
+                // kernels misread. Keep both: the filter is nearly free, and it
+                // degrades a namespacing regression to a cold prefill.
                 .filter(|(snapshot, _)| snapshot.is_compressed() == self.tq_cache().is_some());
             if let Some((snapshot, prefix_len)) = hit {
                 // Strict-prefix hits only. A `prefix_len == tokens.len()`
@@ -5187,15 +5194,19 @@ impl Model for GpuLfm2Model {
         // calls `configure_cache` at load time, before any session exists, so the
         // cache it built is tagged for the default (f32) mode; leaving it that way
         // would let a compressed snapshot land in the f32 disk namespace and
-        // shadow it. Rebuilding drops the warm tier, which is empty at this point
-        // (no forward has run on this instance).
-        let id = self.cache_namespace();
-        let mut cache = self
-            .prefix_cache
-            .lock()
-            .expect("prefix_cache mutex poisoned");
-        let cache_config = cache.config.clone();
-        *cache = KvPrefixCache::new(cache_config, &self.config, &id);
+        // shadow it. Only needed when the tag actually changes — the f32 case is
+        // already correctly namespaced, and rebuilding would discard its warm tier
+        // for nothing. The warm tier is empty here regardless (no forward has run
+        // on this instance yet).
+        if want.is_some() {
+            let id = self.cache_namespace();
+            let mut cache = self
+                .prefix_cache
+                .lock()
+                .expect("prefix_cache mutex poisoned");
+            let cache_config = cache.config.clone();
+            *cache = KvPrefixCache::new(cache_config, &self.config, &id);
+        }
         Ok(())
     }
 
