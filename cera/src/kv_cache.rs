@@ -940,6 +940,67 @@ impl InferenceState {
         self.seq_len = snapshot.seq_len;
     }
 
+    /// Truncate the KV cache to its first `len` positions, dropping the tail
+    /// `[len .. seq_len)` from every attention layer, and set `seq_len = len`.
+    ///
+    /// This is the speculative-decoding rollback: after verifying K drafted
+    /// tokens, the rejected ones' K/V cells (appended at the tail) are dropped so
+    /// the next forward continues from the accepted boundary. Unlike
+    /// [`Self::shift_kv_with_rope`], **no RoPE fixup is needed** — surviving cells
+    /// keep their original absolute positions, so this is a plain `Vec::truncate`.
+    ///
+    /// Preconditions (enforced in all builds):
+    /// - `len <= seq_len`
+    /// - `!self.is_compressed()` — TurboQuant caches have no tail-truncate.
+    /// - No `Conv` layers — LFM2's gated-conv state is not position-indexed, so a
+    ///   KV tail-truncate cannot roll it back (spec-decode is dense-only in Phase 1).
+    pub fn truncate_to(&mut self, len: usize) {
+        assert!(
+            len <= self.seq_len,
+            "truncate_to({len}) exceeds seq_len {}",
+            self.seq_len
+        );
+        assert!(
+            !self.is_compressed(),
+            "truncate_to called on a TurboQuant-compressed state; not supported"
+        );
+        if len == self.seq_len {
+            return;
+        }
+        let seq_len = self.seq_len;
+        // Truncate one time-major `[seq_len × kv_dim]` cache to `len` positions.
+        // `kv_dim = cache.len() / seq_len` (exact — the cache is a whole multiple
+        // of `seq_len`); an empty cache (the inactive f32/f16 slot) is a no-op.
+        fn trunc<T>(cache: &mut Vec<T>, seq_len: usize, len: usize) {
+            if cache.is_empty() {
+                return;
+            }
+            let kv_dim = cache.len() / seq_len;
+            cache.truncate(len * kv_dim);
+        }
+        for layer in &mut self.layers {
+            match layer {
+                LayerState::Attention {
+                    key_cache,
+                    value_cache,
+                    key_cache_f16,
+                    value_cache_f16,
+                    ..
+                } => {
+                    trunc(key_cache, seq_len, len);
+                    trunc(value_cache, seq_len, len);
+                    trunc(key_cache_f16, seq_len, len);
+                    trunc(value_cache_f16, seq_len, len);
+                }
+                LayerState::Conv { .. } => panic!(
+                    "truncate_to called on a state with Conv layers (LFM2); conv state \
+                     is not position-indexed and cannot be tail-truncated"
+                ),
+            }
+        }
+        self.seq_len = len;
+    }
+
     /// Drop KV cells `[n_keep .. n_keep + shift)` from every attention
     /// layer, slide the tail down, and re-apply RoPE so each shifted
     /// cell's stored K encodes its new absolute position rather than
