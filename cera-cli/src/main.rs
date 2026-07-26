@@ -1820,8 +1820,9 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Warm the compute pools + size rayon to P-cores. After `Cli::parse()` so
-    // `--help` / parse errors don't pay the pool spawn.
+    // Warm the prefill pool + size rayon to P-cores. After `Cli::parse()` so
+    // `--help` / parse errors don't pay the pool spawn. (The decode pool stays
+    // lazy so it can be sized from the model loaded later.)
     cera::backend::cpu::configure_thread_pool();
 
     match cli.command {

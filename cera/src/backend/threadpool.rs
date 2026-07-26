@@ -3,9 +3,12 @@
 //!
 //! ## Why this exists (vs. rayon)
 //!
-//! Single-token decode issues ~50–100 GEMVs (one per projection per layer, plus
-//! the vocab output). Above [`super::cpu::gemv_par_threshold`] each parallelizes
-//! through [`super::cpu::par_rows`] / [`super::cpu::par_rows_n`]. With rayon that
+//! Single-token decode issues tens to hundreds of GEMVs (one per projection per
+//! layer that clears the parallel threshold, plus the vocab output) — 25 to 257
+//! across the models measured in [`super::calibrate`], which is why the decode
+//! pool's width is derived from the loaded model rather than a constant. Above
+//! [`super::cpu::gemv_par_threshold`] each parallelizes through
+//! [`super::cpu::par_rows`] / [`super::cpu::par_rows_n`]. With rayon that
 //! is a `par_chunks_mut().for_each()` — a **fork-join with a park/unpark barrier
 //! per GEMV**. On Android big.LITTLE the per-dispatch cost (futex wake + core
 //! migration + scheduler scatter) dwarfs the tiny per-GEMV compute, so more
@@ -356,16 +359,7 @@ pub struct RowPool {
 /// and don't want cera's permanent caller pin). Resolved once.
 pub(crate) fn pinning_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !std::env::var("CERA_PIN")
-            .map(|v| {
-                let v = v.trim();
-                ["0", "false", "off"]
-                    .iter()
-                    .any(|d| v.eq_ignore_ascii_case(d))
-            })
-            .unwrap_or(false)
-    })
+    *ENABLED.get_or_init(|| !super::cpu_features::env_disabled("CERA_PIN"))
 }
 
 impl RowPool {
@@ -386,10 +380,17 @@ impl RowPool {
     }
 
     /// Narrow pool for per-token work — decode GEMV
-    /// ([`super::cpu::par_rows`]). Sized to the detected performance-core count
-    /// via `super::calibrate::decode_thread_count`, which on heterogeneous
-    /// big.LITTLE is decode's measured optimum (it scales cleanly across all
-    /// big cores). Overridable with `CERA_DECODE_THREADS=<n>`.
+    /// ([`super::cpu::par_rows`]). Width comes from
+    /// `super::calibrate::decode_thread_count`, which sizes it from the loaded
+    /// model's `DecodeShape` (bytes per pool dispatch) on a homogeneous host,
+    /// and on heterogeneous big.LITTLE keeps the full big-core set — decode's
+    /// measured optimum there. Overridable with `CERA_DECODE_THREADS=<n>`.
+    ///
+    /// **Whoever touches this `OnceLock` first freezes the width for the
+    /// process.** That is why `super::cpu::configure_thread_pool` deliberately
+    /// does not warm it: it runs before any model is loaded, so warming it
+    /// there would pin the pool to the model-less fallback and silently disable
+    /// shape-based sizing. Keep it lazy.
     pub fn decode() -> &'static RowPool {
         static POOL: OnceLock<RowPool> = OnceLock::new();
         POOL.get_or_init(|| {
