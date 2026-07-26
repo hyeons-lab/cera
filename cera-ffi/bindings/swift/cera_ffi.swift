@@ -4333,6 +4333,16 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
      */
     case OutOfMemory(requestedBytes: UInt64
     )
+    /**
+     * A backend's KV-cache compression mode is fixed by the first session that
+     * configures it — the compressed and uncompressed caches have different
+     * buffer layouts (and the uncompressed one is f32 on CPU/wgpu but f16 on
+     * Metal), so only the configured one is ever allocated. Two sessions wanting
+     * different modes need two `CeraModel` instances. Mirrors
+     * `cera::CeraError::KvCompressionConflict`.
+     */
+    case KvCompressionConflict(configured: String, requested: String
+    )
 
     
 
@@ -4391,6 +4401,10 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             )
         case 12: return .OutOfMemory(
             requestedBytes: try FfiConverterUInt64.read(from: &buf)
+            )
+        case 13: return .KvCompressionConflict(
+            configured: try FfiConverterString.read(from: &buf), 
+            requested: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -4460,6 +4474,12 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
         case let .OutOfMemory(requestedBytes):
             writeInt(&buf, Int32(12))
             FfiConverterUInt64.write(requestedBytes, into: &buf)
+            
+        
+        case let .KvCompressionConflict(configured,requested):
+            writeInt(&buf, Int32(13))
+            FfiConverterString.write(configured, into: &buf)
+            FfiConverterString.write(requested, into: &buf)
             
         }
     }

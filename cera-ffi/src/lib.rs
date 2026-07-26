@@ -212,9 +212,10 @@ pub enum FfiError {
     #[error("out of memory: could not allocate {requested_bytes} bytes")]
     OutOfMemory { requested_bytes: u64 },
 
-    /// A GPU backend's KV-cache compression mode is fixed by the first session
-    /// that configures it — the compressed and f32 caches have different buffer
-    /// layouts and only the configured one is allocated. Two sessions wanting
+    /// A backend's KV-cache compression mode is fixed by the first session that
+    /// configures it — the compressed and uncompressed caches have different
+    /// buffer layouts (and the uncompressed one is f32 on CPU/wgpu but f16 on
+    /// Metal), so only the configured one is ever allocated. Two sessions wanting
     /// different modes need two `CeraModel` instances. Mirrors
     /// `cera::CeraError::KvCompressionConflict`.
     #[error(

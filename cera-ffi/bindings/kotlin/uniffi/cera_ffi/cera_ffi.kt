@@ -6570,6 +6570,22 @@ sealed class FfiException : kotlin.Exception() {
             get() = "requestedBytes=${ `requestedBytes` }"
     }
 
+    /**
+     * A backend's KV-cache compression mode is fixed by the first session that
+     * configures it — the compressed and uncompressed caches have different
+     * buffer layouts (and the uncompressed one is f32 on CPU/wgpu but f16 on
+     * Metal), so only the configured one is ever allocated. Two sessions wanting
+     * different modes need two `CeraModel` instances. Mirrors
+     * `cera::CeraError::KvCompressionConflict`.
+     */
+    class KvCompressionConflict(
+        val `configured`: kotlin.String,
+        val `requested`: kotlin.String,
+    ) : FfiException() {
+        override val message
+            get() = "configured=${ `configured` }, requested=${ `requested` }"
+    }
+
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<FfiException> {
         override fun lift(error_buf: RustBuffer.ByValue): FfiException = FfiConverterTypeFfiError.lift(error_buf)
     }
@@ -6644,6 +6660,13 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
             12 -> {
                 FfiException.OutOfMemory(
                     FfiConverterULong.read(buf),
+                )
+            }
+
+            13 -> {
+                FfiException.KvCompressionConflict(
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
                 )
             }
 
@@ -6723,6 +6746,13 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
                 4UL +
                     FfiConverterULong.allocationSize(value.`requestedBytes`)
             )
+
+            is FfiException.KvCompressionConflict -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`configured`) +
+                    FfiConverterString.allocationSize(value.`requested`)
+            )
         }
 
     override fun write(
@@ -6797,6 +6827,13 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
             is FfiException.OutOfMemory -> {
                 buf.putInt(12)
                 FfiConverterULong.write(value.`requestedBytes`, buf)
+                Unit
+            }
+
+            is FfiException.KvCompressionConflict -> {
+                buf.putInt(13)
+                FfiConverterString.write(value.`configured`, buf)
+                FfiConverterString.write(value.`requested`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
