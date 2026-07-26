@@ -5,7 +5,7 @@
 //!
 //! Single-token decode issues tens to hundreds of GEMVs (one per projection per
 //! layer that clears the parallel threshold, plus the vocab output) — 25 to 257
-//! across the models measured in [`super::calibrate`], which is why the decode
+//! across the models measured in `super::calibrate`, which is why the decode
 //! pool's width is derived from the loaded model rather than a constant. Above
 //! [`super::cpu::gemv_par_threshold`] each parallelizes through
 //! [`super::cpu::par_rows`] / [`super::cpu::par_rows_n`]. With rayon that
