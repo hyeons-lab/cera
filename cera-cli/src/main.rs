@@ -1787,6 +1787,16 @@ fn setup_kv_compression(
             if keys { "3-bit" } else { "f32" },
             if values { "2-bit" } else { "f32" }
         );
+        // `turboquant_supported()` is a per-backend capability probe, not a
+        // per-mode one: the GPU backends implement only the both-sides mode and
+        // fall back to f32 for these two. Say so here rather than let the line
+        // above be contradicted by a `tracing::warn` the user may not have on.
+        if !(keys && values) {
+            eprintln!(
+                "note: single-sided TurboQuant is a CPU-only debugging mode; \
+                 the GPU backends fall back to f32 KV for it"
+            );
+        }
         Ok(KvCompression::TurboQuant { seed, keys, values })
     } else {
         eprintln!(

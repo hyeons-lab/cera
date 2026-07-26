@@ -482,6 +482,14 @@ impl Session {
                  n_keep to enable shifting."
             );
         }
+        // Backends whose KV lives on the model (the GPU paths) allocate their
+        // caches from this call; the CPU backends read the mode off `state`
+        // instead and no-op here. It runs BEFORE the capability warnings below
+        // because a backend's `supports_kv_shift()` can depend on the configured
+        // mode (wgpu reports `false` once TurboQuant is active), and it must
+        // precede the first forward pass either way.
+        model.configure_kv_compression(&config.kv_compression)?;
+
         // Likewise, `n_keep > 0` + a TurboQuant-compressed KV cache is a
         // no-op because the overflow arm gates the shift out
         // (`can_shift`'s `cache_unshiftable`). f16 KV *is* shiftable now
@@ -520,11 +528,6 @@ impl Session {
         // `max_seq_len`, so the cache never needs to grow past it — allocating
         // the full model context would waste (and risk OOMing on) memory a
         // small-context session will never use.
-        // Backends whose KV lives on the model (the GPU paths) allocate their
-        // caches from this call; the CPU backends read the mode off `state`
-        // instead and no-op here. Must precede the first forward pass.
-        model.configure_kv_compression(&config.kv_compression)?;
-
         let state =
             InferenceState::from_config_capped(model_cfg, &config.kv_compression, max_seq_len)?;
 

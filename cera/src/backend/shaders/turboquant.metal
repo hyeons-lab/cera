@@ -156,11 +156,14 @@ kernel void tq_encode_keys(
     red[tid] = x * x;
     const float norm = sqrt(tq_reduce_sum(red, tid));
     const bool is_zero = norm < TQ_EPS;
-    const float safe_norm = select(norm, 1.0f, is_zero);
+    // Reciprocal-multiply, not divide: the CPU reference computes
+    // `k_head[i] * (1.0 / norm)`, and matching it removes a per-element 1-ulp
+    // divergence from the packed indices.
+    const float inv_norm = 1.0f / select(norm, 1.0f, is_zero);
 
     // 2. normalize + PolarQuant RHT.
     if (tid < head_dim) {
-        rot[tid] = x / safe_norm * signs[params.sign_off + tid];
+        rot[tid] = x * inv_norm * signs[params.sign_off + tid];
     }
     tq_wht(rot, head_dim, tid);
     if (tid < head_dim) { rot[tid] *= inv_sqrt_d; }
@@ -180,7 +183,7 @@ kernel void tq_encode_keys(
     if (tid < head_dim) { rot[tid] = r; }
     const float residual_norm = sqrt(tq_reduce_sum(red, tid));
     const bool no_residual = residual_norm < TQ_EPS;
-    const float safe_rnorm = select(residual_norm, 1.0f, no_residual);
+    const float inv_rnorm = 1.0f / select(residual_norm, 1.0f, no_residual);
 
     tq_pack_polar(idxs, out, slot * polar_words, polar_words, tid, is_zero);
 
@@ -188,7 +191,7 @@ kernel void tq_encode_keys(
     // 1/sqrt(head_dim) normalization is skipped — a positive scalar, and only the
     // sign of each component survives into the packed bits.
     if (tid < head_dim) {
-        rot[tid] = rot[tid] / safe_rnorm * signs[params.sign_off + head_dim + tid];
+        rot[tid] = rot[tid] * inv_rnorm * signs[params.sign_off + head_dim + tid];
     }
     tq_wht(rot, head_dim, tid);
     if (tid < jl_words) {
@@ -235,10 +238,10 @@ kernel void tq_encode_values(
     red[tid] = x * x;
     const float norm = sqrt(tq_reduce_sum(red, tid));
     const bool is_zero = norm < TQ_EPS;
-    const float safe_norm = select(norm, 1.0f, is_zero);
+    const float inv_norm = 1.0f / select(norm, 1.0f, is_zero);
 
     if (tid < head_dim) {
-        rot[tid] = x / safe_norm * signs[params.sign_off + tid];
+        rot[tid] = x * inv_norm * signs[params.sign_off + tid];
     }
     tq_wht(rot, head_dim, tid);
     if (tid < head_dim) {

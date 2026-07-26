@@ -47,6 +47,15 @@
 //   - head_dim is a power of two (Walsh-Hadamard), <= 128 (bounds the workgroup
 //     arrays), and a multiple of 32 (whole JL sign words).
 //
+// ── Why this file repeats what turboquant.metal factors out ────────────────
+// The MSL port hoists the tree reduction and the Walsh-Hadamard butterfly into
+// `tq_reduce_sum` / `tq_wht`. This file deliberately inlines both: naga's SPIR-V
+// path (lavapipe/Vulkan) miscompiles `workgroupBarrier()` reached through a
+// function call inside a loop, and the butterfly's barrier is exactly that. The
+// same constraint is why `flash_attention.wgsl` and the gemv kernels keep every
+// barrier at entry-point scope. Metal has no such bug, so the MSL side is free to
+// factor — and does, which is also why the two files' line counts differ.
+//
 // ── Uniform control flow ───────────────────────────────────────────────────
 // Reads from `var<workgroup>` are non-uniform under WGSL's uniformity analysis,
 // so no `workgroupBarrier()` may sit inside a branch predicated on one. The
@@ -182,13 +191,15 @@ fn tq_encode_keys(
     workgroupBarrier();
     let norm = sqrt(red[0]);
     let is_zero = norm < EPS;
-    // Divide by 1.0 rather than ~0 for a zero vector; the packed words are
-    // forced to 0 at the write sites, so the rotation's result is discarded.
-    let safe_norm = select(norm, 1.0, is_zero);
+    // Reciprocal-multiply, not divide: the CPU reference computes
+    // `k_head[i] * (1.0 / norm)`, and matching it removes a per-element 1-ulp
+    // divergence from the packed indices. The `select` avoids 1/~0 for a zero
+    // vector; its packed words are forced to 0 at the write sites anyway.
+    let inv_norm = 1.0 / select(norm, 1.0, is_zero);
 
     // ── 2. normalize + PolarQuant RHT ──
     if tid < head_dim {
-        rot[tid] = x / safe_norm * signs[params.sign_off + tid];
+        rot[tid] = x * inv_norm * signs[params.sign_off + tid];
     }
     var stride = 1u;
     while stride < head_dim {
@@ -238,7 +249,8 @@ fn tq_encode_keys(
     workgroupBarrier();
     let residual_norm = sqrt(red[0]);
     let no_residual = residual_norm < EPS;
-    let safe_rnorm = select(residual_norm, 1.0, no_residual);
+    // Reciprocal-multiply for the same reason as `inv_norm` above.
+    let inv_rnorm = 1.0 / select(residual_norm, 1.0, no_residual);
 
     // Pack the 2-bit indices: one thread per output word, 16 elements each.
     if tid < polar_words {
@@ -251,7 +263,7 @@ fn tq_encode_keys(
 
     // ── 4. QJL: normalize the residual, second RHT, pack sign bits ──
     if tid < head_dim {
-        rot[tid] = rot[tid] / safe_rnorm * signs[params.sign_off + head_dim + tid];
+        rot[tid] = rot[tid] * inv_rnorm * signs[params.sign_off + head_dim + tid];
     }
     var s = 1u;
     while s < head_dim {
@@ -334,10 +346,10 @@ fn tq_encode_values(
     workgroupBarrier();
     let norm = sqrt(red[0]);
     let is_zero = norm < EPS;
-    let safe_norm = select(norm, 1.0, is_zero);
+    let inv_norm = 1.0 / select(norm, 1.0, is_zero);
 
     if tid < head_dim {
-        rot[tid] = x / safe_norm * signs[params.sign_off + tid];
+        rot[tid] = x * inv_norm * signs[params.sign_off + tid];
     }
     var stride = 1u;
     while stride < head_dim {

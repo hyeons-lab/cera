@@ -16,6 +16,7 @@
 
 use crate::CeraError;
 use crate::backend::wgpu::GpuContext;
+use crate::kv_cache::checked_elems;
 use crate::model::{BlockType, ModelConfig};
 use crate::turboquant::{
     CompressedKeyCache, CompressedValueCache, RotationState, TurboQuantConfig,
@@ -24,8 +25,10 @@ use crate::turboquant::{
 };
 // The packed-layout and mode types are backend-agnostic and live with the
 // algorithm; re-exported so `model::gpu_turboquant::{TqLayout, TqMode}` stays a
-// valid path for callers and tests.
-pub use crate::turboquant::{TqLayout, TqMode, describe_kv_mode, head_dim_supported};
+// valid path for callers and tests. `describe_kv_mode` is crate-internal (an
+// error-message formatter, not API) so it is imported, not re-exported.
+pub(crate) use crate::turboquant::describe_kv_mode;
+pub use crate::turboquant::{TqLayout, TqMode, head_dim_supported};
 
 /// Params slots per attention layer in the shared slab: encode-keys,
 /// encode-values, rotate-q, attention.
@@ -35,8 +38,11 @@ const SLOT_ENCODE_VALUES: usize = 1;
 const SLOT_ROTATE_Q: usize = 2;
 const SLOT_ATTENTION: usize = 3;
 
-/// Bytes actually consumed by either params struct (16 x 4-byte scalars). The
-/// slab pads each slot out to the device's storage-binding offset alignment.
+/// Bytes actually consumed by either params struct. The slab pads each slot out
+/// to the device's storage-binding offset alignment; this is the size the bind
+/// group binds, so it must equal the struct the shader reads. Asserted against
+/// `TqParams` below (the `TqAttnParams` `[u32; 16]` encoding is the same width),
+/// mirroring the `size_of` guards in `backend/metal/params.rs`.
 const PARAMS_BYTES: usize = 64;
 
 /// Encode / rotate params. Mirrors the `TqParams` struct in `turboquant.wgsl` —
@@ -73,6 +79,8 @@ pub struct TqParams {
     pub b2: f32,
     pub _pad: u32,
 }
+
+const _: () = assert!(size_of::<TqParams>() == PARAMS_BYTES);
 
 impl TqParams {
     /// Fill the centroid + boundary fields from a [`TurboQuantConfig`].
@@ -219,14 +227,18 @@ impl TqGpuCache {
             match bt {
                 BlockType::Attention => {
                     let n_kv_heads = config.kv_heads_per_layer[i];
-                    let vecs =
-                        n_kv_heads
-                            .checked_mul(max_seq_len)
-                            .ok_or(CeraError::OutOfMemory {
-                                requested_bytes: u64::MAX,
-                            })?;
-                    let k_bytes = words_to_bytes(layout.key_words(vecs))?;
-                    let v_bytes = words_to_bytes(layout.value_words(vecs))?;
+                    // Guard each multiply where it happens, via the same helper the
+                    // CPU KV path uses, so an absurd config surfaces as a
+                    // recoverable `OutOfMemory` carrying the real intended byte
+                    // size rather than a `usize` wrap that under-allocates the
+                    // cache and turns every later write into an OOB.
+                    let vecs = checked_elems::<u32>(n_kv_heads, max_seq_len)?;
+                    let k_bytes = words_to_bytes(checked_elems::<u32>(
+                        vecs,
+                        layout.polar_words + layout.jl_words + 1,
+                    )?);
+                    let v_bytes =
+                        words_to_bytes(checked_elems::<u32>(vecs, layout.polar_words + 1)?);
                     layers.push(Some(TqLayerCache {
                         keys: ctx.create_storage_rw(k_bytes, &format!("l{i}.tq_keys")),
                         values: ctx.create_storage_rw(v_bytes, &format!("l{i}.tq_values")),
@@ -238,13 +250,9 @@ impl TqGpuCache {
         }
 
         // Rotated-query scratch: two head-wide regions plus one sum per (row, head).
-        let q_rows = q_cap * config.n_heads;
-        let qrot_floats = q_rows
-            .checked_mul(2 * head_dim + 1)
-            .ok_or(CeraError::OutOfMemory {
-                requested_bytes: u64::MAX,
-            })?;
-        let qrot = ctx.create_storage_rw(words_to_bytes(qrot_floats)?, "tq_qrot");
+        let q_rows = checked_elems::<f32>(q_cap, config.n_heads)?;
+        let qrot_floats = checked_elems::<f32>(q_rows, 2 * head_dim + 1)?;
+        let qrot = ctx.create_storage_rw(words_to_bytes(qrot_floats), "tq_qrot");
 
         // One params slot per (layer, purpose), each padded out to the device's
         // storage-binding offset alignment so a bind group can address it.
@@ -507,7 +515,9 @@ impl TqGpuCache {
         });
         // One workgroup per (row, head); the grid spills into Y past MAX_WG and
         // the kernel recovers the flat index with `get_wid`.
-        let grid = grid_2d(groups as u32);
+        // Shared with the GEMV kernels' `get_wid` contract — one helper so the
+        // host-side flattening can't drift from what the shaders decode.
+        let grid = crate::backend::wgpu::gemv_row_workgroups(groups as u32);
         let ts = ctx.begin_profile_span(label);
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some(label),
@@ -515,7 +525,7 @@ impl TqGpuCache {
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bg, &[]);
-        pass.dispatch_workgroups(grid.0, grid.1, 1);
+        pass.dispatch_workgroups(grid.0, grid.1, grid.2);
     }
 
     /// Causal attention for `n_tokens` query rows against the compressed cache.
@@ -705,10 +715,11 @@ impl TqGpuCache {
     /// Upload a `(TQK1, TQV1)` blob pair into one layer's cache. Inverse of
     /// [`Self::snapshot_layer`].
     ///
-    /// Returns `false` — without touching the cache — when the blobs don't
-    /// decode or don't match this layer's shape, so the caller can treat it as a
+    /// Returns `None` — without touching the cache — when the blobs don't decode
+    /// or don't match this layer's shape, so the caller can treat it as a
     /// prefix-cache miss instead of restoring a cache the kernels will misread.
-    /// Returns the restored sequence length on success.
+    /// On success returns the restored sequence length, which the caller should
+    /// cross-check against the snapshot's own `seq_len`.
     pub fn restore_layer(
         &self,
         ctx: &GpuContext,
@@ -782,27 +793,9 @@ impl TqGpuCache {
     }
 }
 
-/// `words * 4` as a byte count, with the multiply guarded. A `usize` wrap would
-/// under-allocate the cache and turn every later write into an OOB, so a
-/// malformed (absurd) config surfaces as a recoverable `OutOfMemory` — the same
-/// policy `kv_cache::checked_elems` applies on the CPU side.
-fn words_to_bytes(words: usize) -> Result<u64, CeraError> {
-    words
-        .checked_mul(4)
-        .map(|b| b as u64)
-        .ok_or(CeraError::OutOfMemory {
-            requested_bytes: u64::MAX,
-        })
-}
-
-/// Split `groups` workgroups into a 2-D grid that respects the per-dimension cap,
-/// pinning X to exactly `MAX_WG` once the count spills into Y so the kernel's
-/// `get_wid` (`x + y * MAX_WG`) recovers the flat index.
-fn grid_2d(groups: u32) -> (u32, u32) {
-    let max = crate::backend::wgpu::MAX_WG;
-    if groups <= max {
-        (groups, 1)
-    } else {
-        (max, groups.div_ceil(max))
-    }
+/// A 4-byte-element count as a byte count. Infallible: `words` is already a
+/// `checked_elems`-guarded element count, and widening it to `u64` before the
+/// `* 4` can't overflow. Callers guard the multiply that *produced* `words`.
+fn words_to_bytes(words: usize) -> u64 {
+    words as u64 * 4
 }

@@ -3,11 +3,22 @@
 //! reference in `cera::turboquant`, on the same fixed inputs, **without** loading
 //! any model weights.
 //!
-//! Running both suites against one oracle is the point: the WGSL and MSL kernels
-//! must produce a bit-identical packed cache, because the `TQK1`/`TQV1`
-//! prefix-cache blobs are shared across CPU, wgpu, and Metal. The encode test
-//! asserts exact byte equality with the CPU packing, so if the two GPU backends
-//! ever diverge, one of these two files fails.
+//! Running both suites against one oracle is the point: the `TQK1`/`TQV1`
+//! prefix-cache blobs are shared across CPU, wgpu, and Metal, so both GPU
+//! backends are pinned to the same reference rather than to each other.
+//!
+//! ## What byte equality does and does not guarantee
+//!
+//! The encode tests assert exact byte equality with the CPU packing **on these
+//! fixed inputs**, and that is a strong check on the bit layout. It is not a
+//! guarantee that the two always agree: the GPU computes the vector norm with a
+//! tree reduction where the CPU sums sequentially, so a rotated coordinate landing
+//! within an ulp of a Lloyd-Max decision boundary can quantize to a different
+//! 2-bit index. That has been observed at longer sequence lengths (one index in a
+//! 33 KB blob). What *is* guaranteed is the format: the region layout, the
+//! LSB-first bit packing, and the f16 norm words are identical, so a snapshot
+//! written by any backend decodes exactly on any other. Treat a byte mismatch here
+//! as a layout regression to investigate, not as proof of a logic bug.
 //!
 //! See the wgpu suite's header for the determinism and tolerance rationale; both
 //! use the same LCG inputs and the same `2e-4` float tolerance.
@@ -155,11 +166,12 @@ fn cpu_encode(
     k: &[f32],
     v: &[f32],
     kv_dim: usize,
+    n: usize,
 ) -> (CompressedKeyCache, CompressedValueCache) {
-    let mut keys = CompressedKeyCache::new(N_KV_HEADS, fx.head_dim, SEQ_LEN);
-    let mut values = CompressedValueCache::new(N_KV_HEADS, fx.head_dim, SEQ_LEN);
+    let mut keys = CompressedKeyCache::new(N_KV_HEADS, fx.head_dim, n);
+    let mut values = CompressedValueCache::new(N_KV_HEADS, fx.head_dim, n);
     let mut scratch = EncodeScratch::new(fx.head_dim);
-    for t in 0..SEQ_LEN {
+    for t in 0..n {
         compress_and_append_keys(
             &k[t * kv_dim..(t + 1) * kv_dim],
             N_KV_HEADS,
@@ -191,7 +203,7 @@ fn check_encode(ctx: &MetalContext, head_dim: usize) {
     let mut rng = Lcg::new(11);
     let k = rng.fill(SEQ_LEN * kv_dim);
     let v = rng.fill(SEQ_LEN * kv_dim);
-    let (cpu_keys, cpu_values) = cpu_encode(&fx, &k, &v, kv_dim);
+    let (cpu_keys, cpu_values) = cpu_encode(&fx, &k, &v, kv_dim, SEQ_LEN);
 
     let pw = fx.layout.polar_words;
     let jw = fx.layout.jl_words;
@@ -317,21 +329,30 @@ fn check_rotate_q(ctx: &MetalContext, head_dim: usize) {
     }
 }
 
-fn check_attention(ctx: &MetalContext, head_dim: usize) {
+/// `seq_len` is a parameter so a case longer than the kernel's `TQA_TILE = 256`
+/// exercises the multi-tile online-softmax path — the running max, the `corr`
+/// rescale, and the cross-tile reuse of `tile_scores` / `tile_vnorm` / `red`.
+/// MSL threadgroup memory is likewise not zero-initialized on entry, and the
+/// barrier structure is its own code, so the wgpu suite's multi-tile case does not
+/// cover it.
+fn check_attention(ctx: &MetalContext, head_dim: usize, seq_len: usize) {
     let fx = Fixture::new(head_dim);
     let kv_dim = N_KV_HEADS * head_dim;
     let q_dim = N_HEADS * head_dim;
     let scale = 1.0 / (head_dim as f32).sqrt();
     let group_size = N_HEADS / N_KV_HEADS;
+    // Above the live length so the per-head region stride stays under test.
+    let cache_cap = seq_len + 5;
 
     let mut rng = Lcg::new(37);
-    let k = rng.fill(SEQ_LEN * kv_dim);
-    let v = rng.fill(SEQ_LEN * kv_dim);
-    let q = rng.fill(SEQ_LEN * q_dim);
-    let (cpu_keys, cpu_values) = cpu_encode(&fx, &k, &v, kv_dim);
+    let k = rng.fill(seq_len * kv_dim);
+    let v = rng.fill(seq_len * kv_dim);
+    let q = rng.fill(seq_len * q_dim);
+    let (cpu_keys, cpu_values) = cpu_encode(&fx, &k, &v, kv_dim, seq_len);
 
-    let vecs = N_KV_HEADS * MAX_SEQ;
-    let enc_params = fx.encode_params(SEQ_LEN, N_KV_HEADS, kv_dim);
+    let vecs = N_KV_HEADS * cache_cap;
+    let mut enc_params = fx.encode_params(seq_len, N_KV_HEADS, kv_dim);
+    enc_params.max_seq_len = cache_cap as u32;
     let key_words = run_tq_kernel(
         ctx,
         "tq_encode_keys",
@@ -339,7 +360,7 @@ fn check_attention(ctx: &MetalContext, head_dim: usize) {
         fx.layout.key_words(vecs),
         &fx.signs,
         &enc_params,
-        SEQ_LEN * N_KV_HEADS,
+        seq_len * N_KV_HEADS,
     );
     let value_words = run_tq_kernel(
         ctx,
@@ -348,18 +369,19 @@ fn check_attention(ctx: &MetalContext, head_dim: usize) {
         fx.layout.value_words(vecs),
         &fx.signs,
         &enc_params,
-        SEQ_LEN * N_KV_HEADS,
+        seq_len * N_KV_HEADS,
     );
-    let rot_params = fx.encode_params(SEQ_LEN, N_HEADS, q_dim);
-    let region = SEQ_LEN * N_HEADS * head_dim;
+    let mut rot_params = fx.encode_params(seq_len, N_HEADS, q_dim);
+    rot_params.q_cap = seq_len as u32;
+    let region = seq_len * N_HEADS * head_dim;
     let qrot_words = run_tq_kernel(
         ctx,
         "tq_rotate_q",
         &q,
-        2 * region + SEQ_LEN * N_HEADS,
+        2 * region + seq_len * N_HEADS,
         &fx.signs,
         &rot_params,
-        SEQ_LEN * N_HEADS,
+        seq_len * N_HEADS,
     );
 
     let c = &fx.config.centroids;
@@ -367,10 +389,10 @@ fn check_attention(ctx: &MetalContext, head_dim: usize) {
         n_heads: N_HEADS as u32,
         n_kv_heads: N_KV_HEADS as u32,
         head_dim: head_dim as u32,
-        max_seq: SEQ_LEN as u32,
+        max_seq: seq_len as u32,
         start_pos: 0,
         scale,
-        q_cap: SEQ_LEN as u32,
+        q_cap: seq_len as u32,
         out_stride: q_dim as u32,
         qjl_scale: (std::f32::consts::PI / 2.0).sqrt() / head_dim as f32,
         sign_off: fx.sign_off as u32,
@@ -379,7 +401,7 @@ fn check_attention(ctx: &MetalContext, head_dim: usize) {
         c2: c[2],
         c3: c[3],
         q_base: 0,
-        cache_cap: MAX_SEQ as u32,
+        cache_cap: cache_cap as u32,
     };
     let got = run_attention(
         ctx,
@@ -388,13 +410,13 @@ fn check_attention(ctx: &MetalContext, head_dim: usize) {
         &value_words,
         &fx.signs,
         &attn_params,
-        SEQ_LEN * q_dim,
+        seq_len * q_dim,
         N_HEADS,
-        SEQ_LEN,
+        seq_len,
     );
 
     let mut scratch = QueryRotationScratch::new(N_HEADS, head_dim);
-    for t_q in 0..SEQ_LEN {
+    for t_q in 0..seq_len {
         let live = t_q + 1;
         rotate_queries(
             &q[t_q * q_dim..(t_q + 1) * q_dim],
@@ -530,6 +552,15 @@ fn rotate_q_matches_cpu() {
 #[test]
 fn attention_matches_cpu() {
     let Some(ctx) = context() else { return };
-    check_attention(&ctx, 64);
-    check_attention(&ctx, 128);
+    check_attention(&ctx, 64, SEQ_LEN);
+    check_attention(&ctx, 128, SEQ_LEN);
+}
+
+/// Longer than `TQA_TILE = 256`, so the multi-tile online softmax runs. See
+/// `check_attention`'s doc.
+#[test]
+fn attention_matches_cpu_multi_tile() {
+    let Some(ctx) = context() else { return };
+    check_attention(&ctx, 64, 600);
+    check_attention(&ctx, 128, 600);
 }

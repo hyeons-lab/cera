@@ -19,6 +19,19 @@
 //!    GPU cache produces must be byte-identical to the CPU backend's `TQK1`/`TQV1`
 //!    encoding (so the two are mutually loadable), and must round-trip.
 //!
+//! ## What byte equality does and does not guarantee
+//!
+//! The encode tests assert exact byte equality with the CPU packing **on these
+//! fixed inputs**, and that is a strong check on the bit layout. It is not a
+//! guarantee that the two always agree: the GPU computes the vector norm with a
+//! tree reduction where the CPU sums sequentially, so a rotated coordinate landing
+//! within an ulp of a Lloyd-Max decision boundary can quantize to a different
+//! 2-bit index. That has been observed at longer sequence lengths (one index in a
+//! 33 KB blob). What *is* guaranteed is the format: the region layout, the
+//! LSB-first bit packing, and the f16 norm words are identical, so a snapshot
+//! written by any backend decodes exactly on any other. Treat a byte mismatch here
+//! as a layout regression to investigate, not as proof of a logic bug.
+//!
 //! ## Determinism
 //!
 //! Inputs come from a fixed LCG, never `rand`. The GPU norm is a tree reduction
@@ -193,17 +206,18 @@ fn run_tq_kernel(
     ctx.download_u32(&dst_buf, out_words)
 }
 
-/// CPU-side compressed caches for `k` / `v` (`SEQ_LEN × kv_dim` row-major).
+/// CPU-side compressed caches for `n` rows of `k` / `v` (`n × kv_dim` row-major).
 fn cpu_encode(
     fx: &Fixture,
     k: &[f32],
     v: &[f32],
     kv_dim: usize,
+    n: usize,
 ) -> (CompressedKeyCache, CompressedValueCache) {
-    let mut keys = CompressedKeyCache::new(N_KV_HEADS, fx.head_dim, SEQ_LEN);
-    let mut values = CompressedValueCache::new(N_KV_HEADS, fx.head_dim, SEQ_LEN);
+    let mut keys = CompressedKeyCache::new(N_KV_HEADS, fx.head_dim, n);
+    let mut values = CompressedValueCache::new(N_KV_HEADS, fx.head_dim, n);
     let mut scratch = EncodeScratch::new(fx.head_dim);
-    for t in 0..SEQ_LEN {
+    for t in 0..n {
         compress_and_append_keys(
             &k[t * kv_dim..(t + 1) * kv_dim],
             N_KV_HEADS,
@@ -234,7 +248,7 @@ fn check_encode(ctx: &GpuContext, head_dim: usize) {
     let mut rng = Lcg::new(11);
     let k = rng.fill(SEQ_LEN * kv_dim);
     let v = rng.fill(SEQ_LEN * kv_dim);
-    let (cpu_keys, cpu_values) = cpu_encode(&fx, &k, &v, kv_dim);
+    let (cpu_keys, cpu_values) = cpu_encode(&fx, &k, &v, kv_dim, SEQ_LEN);
 
     let pw = fx.layout.polar_words;
     let jw = fx.layout.jl_words;
@@ -365,22 +379,41 @@ fn check_rotate_q(ctx: &GpuContext, head_dim: usize) {
 
 /// Test 3: `flash_attention_tq` reproduces the CPU compressed read path for every
 /// causal query row.
-fn check_attention(ctx: &GpuContext, head_dim: usize) {
+/// `seq_len` is a parameter so a case longer than the kernel's `TILE = 256` can
+/// exercise the multi-tile online-softmax path — the running max, the `corr`
+/// rescale of `acc` / `st[1]`, and the cross-tile reuse of `tile_scores` /
+/// `tile_vnorm` / `red`. That is the state most exposed to the
+/// `zero_initialize_workgroup_memory: false` contract, and a single-tile case
+/// leaves all of it unexecuted even though prefill past 256 tokens is the norm.
+///
+/// `q_splits` dispatches the query batch in that many equal chunks, giving every
+/// chunk after the first a non-zero `q_base`, so the kernel's
+/// `q_global = q_base + q_idx` addressing is covered rather than left as
+/// untested generality.
+fn check_attention(ctx: &GpuContext, head_dim: usize, seq_len: usize, q_splits: usize) {
+    assert!(
+        seq_len.is_multiple_of(q_splits),
+        "test setup: seq_len {seq_len} must divide evenly into {q_splits} splits"
+    );
     let fx = Fixture::new(head_dim);
     let kv_dim = N_KV_HEADS * head_dim;
     let q_dim = N_HEADS * head_dim;
     let scale = 1.0 / (head_dim as f32).sqrt();
     let group_size = N_HEADS / N_KV_HEADS;
+    // Keep the cache capacity above the live length so the per-head region stride
+    // stays under test at every `seq_len`.
+    let cache_cap = seq_len + 5;
 
     let mut rng = Lcg::new(37);
-    let k = rng.fill(SEQ_LEN * kv_dim);
-    let v = rng.fill(SEQ_LEN * kv_dim);
-    let q = rng.fill(SEQ_LEN * q_dim);
-    let (cpu_keys, cpu_values) = cpu_encode(&fx, &k, &v, kv_dim);
+    let k = rng.fill(seq_len * kv_dim);
+    let v = rng.fill(seq_len * kv_dim);
+    let q = rng.fill(seq_len * q_dim);
+    let (cpu_keys, cpu_values) = cpu_encode(&fx, &k, &v, kv_dim, seq_len);
 
     // GPU: encode into the packed caches, rotate the queries, run attention.
-    let vecs = N_KV_HEADS * MAX_SEQ;
-    let enc_params = fx.encode_params(SEQ_LEN, N_KV_HEADS, kv_dim);
+    let vecs = N_KV_HEADS * cache_cap;
+    let mut enc_params = fx.encode_params(seq_len, N_KV_HEADS, kv_dim);
+    enc_params.max_seq_len = cache_cap as u32;
     let key_words = run_tq_kernel(
         ctx,
         "tq_encode_keys",
@@ -388,7 +421,7 @@ fn check_attention(ctx: &GpuContext, head_dim: usize) {
         fx.layout.key_words(vecs),
         &fx.signs,
         &enc_params,
-        SEQ_LEN * N_KV_HEADS,
+        seq_len * N_KV_HEADS,
     );
     let value_words = run_tq_kernel(
         ctx,
@@ -397,50 +430,62 @@ fn check_attention(ctx: &GpuContext, head_dim: usize) {
         fx.layout.value_words(vecs),
         &fx.signs,
         &enc_params,
-        SEQ_LEN * N_KV_HEADS,
+        seq_len * N_KV_HEADS,
     );
-    let rot_params = fx.encode_params(SEQ_LEN, N_HEADS, q_dim);
-    let region = SEQ_LEN * N_HEADS * head_dim;
+    let mut rot_params = fx.encode_params(seq_len, N_HEADS, q_dim);
+    rot_params.q_cap = seq_len as u32;
+    let region = seq_len * N_HEADS * head_dim;
     let qrot_words = run_tq_kernel(
         ctx,
         "tq_rotate_q",
         &q,
-        2 * region + SEQ_LEN * N_HEADS,
+        2 * region + seq_len * N_HEADS,
         &fx.signs,
         &rot_params,
-        SEQ_LEN * N_HEADS,
+        seq_len * N_HEADS,
     );
 
-    let attn_params = TqAttnParams {
-        n_heads: N_HEADS as u32,
-        n_kv_heads: N_KV_HEADS as u32,
-        head_dim: head_dim as u32,
-        max_seq: SEQ_LEN as u32,
-        start_pos: 0,
-        scale,
-        q_cap: SEQ_LEN as u32,
-        out_stride: q_dim as u32,
-        qjl_scale: TqAttnParams::qjl_scale_for(head_dim),
-        sign_off: fx.sign_off as u32,
-        centroids: fx.config.centroids,
-        q_base: 0,
-        cache_cap: MAX_SEQ as u32,
-    };
-    let got = run_attention(
-        ctx,
-        &qrot_words,
-        &key_words,
-        &value_words,
-        &fx.signs,
-        &attn_params,
-        SEQ_LEN * q_dim,
-        N_HEADS,
-        SEQ_LEN,
-    );
+    // Dispatch the query batch in `q_splits` chunks. Each writes only its own
+    // rows of `out`, so the chunks' results are merged by writing into one buffer
+    // across successive dispatches.
+    let rows_per_split = seq_len / q_splits;
+    let mut got = vec![0.0f32; seq_len * q_dim];
+    for split in 0..q_splits {
+        let q_base = split * rows_per_split;
+        let attn_params = TqAttnParams {
+            n_heads: N_HEADS as u32,
+            n_kv_heads: N_KV_HEADS as u32,
+            head_dim: head_dim as u32,
+            max_seq: seq_len as u32,
+            start_pos: 0,
+            scale,
+            q_cap: seq_len as u32,
+            out_stride: q_dim as u32,
+            qjl_scale: TqAttnParams::qjl_scale_for(head_dim),
+            sign_off: fx.sign_off as u32,
+            centroids: fx.config.centroids,
+            q_base: q_base as u32,
+            cache_cap: cache_cap as u32,
+        };
+        let chunk = run_attention(
+            ctx,
+            &qrot_words,
+            &key_words,
+            &value_words,
+            &fx.signs,
+            &attn_params,
+            seq_len * q_dim,
+            N_HEADS,
+            rows_per_split,
+        );
+        let lo = q_base * q_dim;
+        let hi = lo + rows_per_split * q_dim;
+        got[lo..hi].copy_from_slice(&chunk[lo..hi]);
+    }
 
     // CPU reference, per causal query row.
     let mut scratch = QueryRotationScratch::new(N_HEADS, head_dim);
-    for t_q in 0..SEQ_LEN {
+    for t_q in 0..seq_len {
         let live = t_q + 1;
         rotate_queries(
             &q[t_q * q_dim..(t_q + 1) * q_dim],
@@ -585,7 +630,7 @@ fn check_snapshot_roundtrip(ctx: &GpuContext, head_dim: usize) {
     let mut rng = Lcg::new(59);
     let k = rng.fill(SEQ_LEN * kv_dim);
     let v = rng.fill(SEQ_LEN * kv_dim);
-    let (cpu_keys, cpu_values) = cpu_encode(&fx, &k, &v, kv_dim);
+    let (cpu_keys, cpu_values) = cpu_encode(&fx, &k, &v, kv_dim, SEQ_LEN);
 
     // A config whose every layer is attention, so `LAYER` is a valid index and
     // each layer gets its own buffers to move data between.
@@ -703,8 +748,18 @@ fn rotate_q_matches_cpu() {
 #[test]
 fn attention_matches_cpu() {
     let Some(ctx) = context() else { return };
-    check_attention(&ctx, 64);
-    check_attention(&ctx, 128);
+    check_attention(&ctx, 64, SEQ_LEN, 1);
+    check_attention(&ctx, 128, SEQ_LEN, 1);
+}
+
+/// Longer than the kernel's `TILE = 256`, and dispatched in two query chunks, so
+/// the multi-tile online softmax and the `q_base` offset are both executed. See
+/// `check_attention`'s doc for why a single-tile case is not enough.
+#[test]
+fn attention_matches_cpu_multi_tile_and_split_queries() {
+    let Some(ctx) = context() else { return };
+    check_attention(&ctx, 64, 600, 2);
+    check_attention(&ctx, 128, 600, 2);
 }
 
 #[test]

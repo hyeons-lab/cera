@@ -1389,7 +1389,7 @@ impl TqMode {
 
 /// Human-readable name for a configured mode, for the
 /// `CeraError::KvCompressionConflict` message.
-pub fn describe_kv_mode(mode: &Option<TqMode>) -> String {
+pub(crate) fn describe_kv_mode(mode: &Option<TqMode>) -> String {
     match mode {
         Some(m) => format!("turboquant(seed={})", m.seed),
         None => "f32".to_string(),
@@ -1428,7 +1428,8 @@ impl TqLayout {
         vecs * (self.polar_words + 1)
     }
 
-    /// Byte offsets of the key regions, given `vecs` slots.
+    /// `u32`-word offsets of the key regions (`jl`, `norms`), given `vecs`
+    /// slots. Callers scale to bytes themselves.
     pub fn key_regions(&self, vecs: usize) -> (usize, usize) {
         let jl_off = vecs * self.polar_words;
         (jl_off, jl_off + vecs * self.jl_words)

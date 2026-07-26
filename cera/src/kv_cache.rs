@@ -1250,6 +1250,11 @@ impl StateSnapshot {
 }
 
 /// Configuration for the KV prefix cache.
+///
+/// `Clone` so a backend can rebuild its cache under a new namespace without the
+/// caller re-supplying the config — the wgpu backend does this when a session
+/// configures KV compression, to keep compressed and f32 disk entries apart.
+#[derive(Clone)]
 pub struct KvCacheConfig {
     /// Directory for cold-tier (disk) cache files. None = disk caching disabled.
     pub cache_dir: Option<PathBuf>,

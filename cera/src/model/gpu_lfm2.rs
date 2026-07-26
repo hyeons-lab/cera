@@ -2222,7 +2222,10 @@ impl GpuLfm2Model {
     /// site fail loudly instead of quietly allocating the memory compression was
     /// meant to save (and then reading a cache nothing writes).
     fn f32_kv(&self) -> &Vec<Option<(wgpu::Buffer, wgpu::Buffer)>> {
-        debug_assert!(
+        // A real `assert!`, not `debug_assert!`: release is precisely the build
+        // where a mis-gated call site's `max_seq_len x kv_dim` f32 allocation
+        // matters, and this is not a hot path.
+        assert!(
             self.tq.get().is_none(),
             "f32 KV cache requested while TurboQuant is active"
         );
@@ -2266,6 +2269,31 @@ impl GpuLfm2Model {
             self.f32_kv()
         };
         caches[i].as_ref().unwrap()
+    }
+
+    /// Prefix-cache namespace for this model instance.
+    ///
+    /// The KV-compression mode is part of it, not just the model path: a
+    /// compressed snapshot and an f32 one have different layouts, and the disk
+    /// tier is shared by every session over the same model. Without the mode in
+    /// the namespace, a TurboQuant session's entry permanently shadows the f32
+    /// entry for the same prefix — the lookup-time mode filter turns the longest
+    /// match into a miss and never falls back to a shorter compatible one, so the
+    /// f32 session stays cold on *every* subsequent run, not just once. Same trick
+    /// the `"wgpu:"` / `"cpu:"` / `"metal:"` prefixes already use to keep backends
+    /// apart.
+    ///
+    /// Called from `configure_cache` and again from `configure_kv_compression`
+    /// (which rebuilds the cache) because the engine configures the cache before
+    /// the session configures compression.
+    fn cache_namespace(&self) -> String {
+        let mode = match self.kv_mode.get() {
+            Some(Some(_)) => "tq3:",
+            // Not yet configured behaves as f32 — the mode-setting path rebuilds
+            // the cache, so an early `configure_cache` can't leave a stale tag.
+            Some(None) | None => "",
+        };
+        format!("wgpu:{mode}{}", self.model_id)
     }
 
     /// The GPU-resident TurboQuant cache, when the session configured one and
@@ -4696,10 +4724,23 @@ impl GpuLfm2Model {
                              on `StateSnapshot::is_compressed`"
                         )
                     });
-                    assert!(
-                        tq.restore_layer(&self.ctx, i, keys, values).is_some(),
-                        "invalid or shape-mismatched TurboQuant blob in snapshot \
-                         at layer {i}"
+                    // Cross-check the decoded length against the snapshot's own
+                    // `seq_len`, which is what `gpu_state.seq_len` is set from
+                    // below: a disagreement would leave the kernels reading
+                    // compressed slots nothing wrote.
+                    let restored =
+                        tq.restore_layer(&self.ctx, i, keys, values)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "invalid or shape-mismatched TurboQuant blob in \
+                                 snapshot at layer {i}"
+                                )
+                            });
+                    assert_eq!(
+                        restored, snapshot.seq_len,
+                        "layer {i}: restored TurboQuant seq_len {restored} disagrees \
+                         with the snapshot's {}",
+                        snapshot.seq_len
                     );
                 }
                 LayerSnapshot::AttentionF16 { .. } => {
@@ -5058,11 +5099,11 @@ impl Model for GpuLfm2Model {
     }
 
     fn configure_cache(&self, config: crate::kv_cache::KvCacheConfig) {
+        let id = self.cache_namespace();
         *self
             .prefix_cache
             .lock()
-            .expect("prefix_cache mutex poisoned") =
-            KvPrefixCache::new(config, &self.config, &format!("wgpu:{}", self.model_id));
+            .expect("prefix_cache mutex poisoned") = KvPrefixCache::new(config, &self.config, &id);
     }
 
     /// Public Model trait surface for `_locked` snapshot/restore so
@@ -5141,6 +5182,20 @@ impl Model for GpuLfm2Model {
             assert!(self.tq.set(cache).is_ok(), "tq cache set race");
         }
         let _ = self.kv_mode.set(want);
+
+        // Re-namespace the prefix cache now that the mode is known. The engine
+        // calls `configure_cache` at load time, before any session exists, so the
+        // cache it built is tagged for the default (f32) mode; leaving it that way
+        // would let a compressed snapshot land in the f32 disk namespace and
+        // shadow it. Rebuilding drops the warm tier, which is empty at this point
+        // (no forward has run on this instance).
+        let id = self.cache_namespace();
+        let mut cache = self
+            .prefix_cache
+            .lock()
+            .expect("prefix_cache mutex poisoned");
+        let cache_config = cache.config.clone();
+        *cache = KvPrefixCache::new(cache_config, &self.config, &id);
         Ok(())
     }
 
