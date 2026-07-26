@@ -5,6 +5,13 @@ pub mod transformer;
 #[cfg(feature = "gpu")]
 pub mod gpu_lfm2;
 
+// Public for the shader-oracle tests: they drive the TurboQuant kernels through
+// the same `TqParams` / `TqAttnParams` layouts production uses, so a field
+// reorder can't pass the test while breaking the engine. Same rationale as
+// `backend::wgpu::KvShiftParams`.
+#[cfg(feature = "gpu")]
+pub mod gpu_turboquant;
+
 #[cfg(any(
     feature = "gpu",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
@@ -421,11 +428,41 @@ pub trait Model: Send + Sync {
 
     /// Whether this model/backend supports TurboQuant KV cache compression.
     /// Used by the CLI to decide whether to request compression or fall back
-    /// to f32. TurboQuant is fully driven by `KvCompression` on the
-    /// `InferenceState`; models just need to honor the compressed buffers in
-    /// their forward pass. Currently only the CPU `Lfm2Model` does.
+    /// to f32. On CPU, TurboQuant is fully driven by `KvCompression` on the
+    /// `InferenceState`; the GPU backends additionally need
+    /// [`Self::configure_kv_compression`] to build their GPU-resident
+    /// compressed cache. Implemented by the CPU `Lfm2Model` and both GPU
+    /// backends.
     fn turboquant_supported(&self) -> bool {
         false
+    }
+
+    /// Tell a backend whose KV lives on the model (not on `InferenceState`)
+    /// which compression mode the session wants, so it can allocate the right
+    /// caches. Called by `Session::new` / `Session::reset` before any forward
+    /// pass; a no-op for the CPU backends, whose caches are allocated by
+    /// `InferenceState::from_config_with_compression` instead.
+    ///
+    /// Allocation has to be deferred this way because a GPU model is loaded
+    /// before the session that configures it exists: allocating the f32 caches
+    /// eagerly and freeing them on the first TurboQuant session would create
+    /// exactly the transient memory peak compression is meant to avoid.
+    ///
+    /// **First call wins.** A second call with a *different* mode returns
+    /// [`CeraError::KvCompressionConflict`] rather than silently leaving the
+    /// allocated buffers disagreeing with the kernels — two sessions wanting
+    /// different modes need two model instances. Re-configuring the same mode
+    /// (as `Session::reset` does) is a no-op.
+    ///
+    /// A request the backend can't serve — a single-sided TurboQuant debug mode,
+    /// or an incompatible `head_dim` — is NOT an error: the backend logs a
+    /// warning and stays on f32 KV, matching the CPU's silent fallback for a
+    /// non-power-of-two `head_dim`.
+    fn configure_kv_compression(
+        &self,
+        _compression: &crate::kv_cache::KvCompression,
+    ) -> Result<(), crate::CeraError> {
+        Ok(())
     }
 
     /// Whether this model honors an f16 KV cache (`KvCompression::F16`) in its

@@ -255,6 +255,18 @@ pub enum CeraError {
     Backend(String),
     #[error("out of memory: could not allocate {requested_bytes} bytes")]
     OutOfMemory { requested_bytes: u64 },
+    /// A GPU backend's KV-cache compression mode is fixed by the first session
+    /// that configures it, because the compressed and f32 caches have different
+    /// buffer layouts and only the configured one is allocated. Two sessions
+    /// wanting different modes need two model instances.
+    #[error(
+        "model already configured for KV compression mode `{configured}`; \
+         cannot reconfigure to `{requested}` — create a separate model instance"
+    )]
+    KvCompressionConflict {
+        configured: String,
+        requested: String,
+    },
     #[error("io: {0}")]
     Io(#[from] io::Error),
 }
@@ -508,6 +520,11 @@ impl Session {
         // `max_seq_len`, so the cache never needs to grow past it — allocating
         // the full model context would waste (and risk OOMing on) memory a
         // small-context session will never use.
+        // Backends whose KV lives on the model (the GPU paths) allocate their
+        // caches from this call; the CPU backends read the mode off `state`
+        // instead and no-op here. Must precede the first forward pass.
+        model.configure_kv_compression(&config.kv_compression)?;
+
         let state =
             InferenceState::from_config_capped(model_cfg, &config.kv_compression, max_seq_len)?;
 
@@ -688,6 +705,11 @@ impl Session {
     /// reset. Does NOT touch the engine-level disk prefix cache (which lives
     /// on `CeraEngine`, not `Session`).
     pub fn reset(&mut self) -> Result<(), CeraError> {
+        // Re-assert the mode (a no-op for an unchanged one) so a GPU backend
+        // that was somehow reset out of its compressed configuration rebuilds
+        // before the next forward.
+        self.model
+            .configure_kv_compression(&self.config.kv_compression)?;
         let model_cfg = self.model.config();
         // Match `Session::new`: cap KV to the session's `max_seq_len`, not the
         // model's full context, so reset doesn't re-inflate to the full cache.
