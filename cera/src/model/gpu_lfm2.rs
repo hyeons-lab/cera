@@ -44,20 +44,36 @@ pub(crate) const MUL_MAT_TILE_WG_N: u32 = 16;
 // TILE_N are not free parameters — see the accumulator note in the shader.
 // 256 threads per workgroup covering a 64×64 output tile.
 //
-// shmem is `TILE_K·(TILE_ROWS+4) + TILE_K·(TILE_COLS+4)` f32 = (32·68)·2·4 =
-// 17408 B ≈ 17.0 KiB, which EXCEEDS the default WebGPU 16 KB workgroup-storage limit — it
-// fits only because we request the adapter's actual limits (`GpuContext::new`
-// uses `adapter.limits()`; PowerVR/Adreno/Mali expose 32 KB). Raising
-// WORKGROUP_SIZE_M/N or TILE_K must re-check
-// `max_compute_workgroup_storage_size`, or pipeline creation fails at runtime
-// on the target GPU.
+// shmem is `TILE_K·(TILE_ROWS+4) + TILE_K·(TILE_COLS+4)` f32 = (16·68)·2·4 =
+// 8704 B ≈ 8.5 KiB, inside the 16 KiB `max_compute_workgroup_storage_size` that
+// WebGPU guarantees on every adapter — so this runs on a spec-minimum device
+// (notably a browser via cera-wasm), not only where the adapter reports more.
+// The `const _` below enforces it.
 //
-// This geometry won a sweep on an M1 Max at the real LFM2 projection shapes
-// (8×32, 32×8, 16×8, 8×16, 32×16, 16×32, 8×8 and TILE_K 16/32/64 were all
-// worse). Re-run `cera/examples/wgpu_gemm_bench.rs` before changing it.
+// TILE_K=16 over 32 is a deliberate, measured platform trade, end-to-end prefill
+// p50, interleaved: on a Pixel 9 Pro XL (Mali-G715) it is +8-10% at p=128/512/
+// 1024 (p=2048 not measured there); on an M1 Max it is +4-8% at p=512/1024/2048
+// and **-15% at p=128**, where two column tiles is too little work to hide the
+// doubled barrier count. Taken because mobile is the constrained target, the
+// absolute latency trade favours it (p=128 costs ~22 ms, p=512 saves ~31 ms),
+// and 8.5 KiB is what clears the WebGPU floor above. The p=128 regression was
+// accepted, not missed.
+//
+// One Q4_0-specific quirk of TILE_K=16, noted so it is not rediscovered as a
+// bug: its loader stages 8 consecutive k per thread, so a 64×16 src0 tile is
+// 1024 elements against 256 threads × 8 = 2048, and threads 128..255 idle
+// through staging (at TILE_K=32 all 256 participated). Measured cost: none —
+// Q4_0 runs 1353 GFLOP/s on an M1 Max, ahead of f32 (1269), Q4_K (1275) and
+// Q6_K (1311). Staging is a small share of a k-tile's work.
+//
+// 16×16 also won the workgroup sweep on both parts (8×32, 32×8, 16×8, 8×16, 8×8
+// were worse on each; 32×16 and 16×32 were tried on the M1 Max only). Re-run
+// `cera/examples/wgpu_gemm_bench.rs` on BOTH before changing any of it — and
+// confirm end-to-end, because the microbench only measures n=512, exactly the
+// shape that made TILE_K=16 look like a free win on Apple too.
 pub(crate) const MUL_MAT_TILE_M: u32 = 4;
 pub(crate) const MUL_MAT_TILE_N: u32 = 4;
-pub(crate) const MUL_MAT_TILE_K: u32 = 32;
+pub(crate) const MUL_MAT_TILE_K: u32 = 16;
 
 // The two invariants `mul_mat_reg_tile.wgsl` and its Q4_0 loader depend on, as
 // compile-time checks rather than comments. Violating either produces silently
@@ -74,6 +90,38 @@ const _: () = assert!(
     MUL_MAT_TILE_K.is_multiple_of(8),
     "the Q4_0 shmem loader stages 8 consecutive k per thread and indexes within \
      one 32-element block; TILE_K must be a multiple of 8"
+);
+// 16384 B is WebGPU's guaranteed `max_compute_workgroup_storage_size`. Staying
+// inside it is what lets this pipeline build on a spec-minimum adapter instead
+// of only where `adapter.limits()` reports more; `GpuContext` has no fallback
+// path, so exceeding it is a hard failure at load, not a slow path.
+//
+// This has to be a compile-time check because nothing else catches it:
+// **native wgpu 24 does not validate this limit**. Measured directly — a device
+// created with `wgpu::Limits::default()` (max 16384) accepted compute pipelines
+// declaring 17408 B and even 32768 B of workgroup storage without a validation
+// error. Browsers (Dawn) do enforce it, so an over-budget kernel is invisible on
+// every desktop and CI run and only fails once it reaches WebGPU. A runtime test
+// on native would be vacuous; this assert is not.
+const _: () = assert!(
+    (MUL_MAT_TILE_K * (MUL_MAT_TILE_WG_M * MUL_MAT_TILE_M + 4)
+        + MUL_MAT_TILE_K * (MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N + 4))
+        * 4
+        <= 16384,
+    "reg-tile shmem must stay within WebGPU's guaranteed 16 KiB workgroup-storage \
+     limit so the pipeline builds on a spec-minimum adapter"
+);
+// The other guaranteed limit this geometry sits against, and for the same
+// reason: WebGPU promises only 256 for `max_compute_invocations_per_workgroup`
+// (and 256 for `max_compute_workgroup_size_x`), which 16×16 hits exactly.
+// `GpuContext::new` requests `adapter.limits()` — 1024 on an M1 Max — so a wider
+// workgroup would build and run on every desktop and CI adapter and fail only in
+// a browser. Note the sweep candidates named above: 32×16 and 16×32 are 512
+// threads and would break a spec-minimum device.
+const _: () = assert!(
+    MUL_MAT_TILE_WG_M * MUL_MAT_TILE_WG_N <= 256,
+    "reg-tile workgroup must stay within WebGPU's guaranteed 256 invocations per \
+     workgroup so the pipeline builds on a spec-minimum adapter"
 );
 
 /// Build a `mul_mat_reg_tile` pipeline for the requested src0 dtype.

@@ -1702,7 +1702,7 @@ mod tests {
                 ("WORKGROUP_SIZE_N", "16u"),
                 ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
-                ("TILE_K", "32u"),
+                ("TILE_K", "16u"),
             ],
         );
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1759,7 +1759,7 @@ mod tests {
 
     /// Canary: the reg-tile parity tests below hardcode the production tile
     /// geometry in their pipeline defines (`WORKGROUP_SIZE_M/N=16u`, `TILE_M=4u`,
-    /// `TILE_N=4u`, `TILE_K=32u`) and in their `div_ceil(16 * 4)` divisors. If the
+    /// `TILE_N=4u`, `TILE_K=16u`) and in their `div_ceil(16 * 4)` divisors. If the
     /// production constants change without those tests being updated, the shipped
     /// geometry silently loses parity coverage — the exact drift that once left
     /// the shipped GEMM untested. This fails loudly instead.
@@ -1781,7 +1781,7 @@ mod tests {
                 MUL_MAT_TILE_N,
                 MUL_MAT_TILE_K,
             ),
-            (16, 16, 4, 4, 32),
+            (16, 16, 4, 4, 16),
             "production reg-tile geometry changed; update the hardcoded \
              WORKGROUP_SIZE_M/N + TILE_M/TILE_N defines and the div_ceil dispatch \
              divisors in the mul_mat reg-tile parity tests to match"
@@ -1840,7 +1840,7 @@ mod tests {
                 ("WORKGROUP_SIZE_N", "16u"),
                 ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
-                ("TILE_K", "32u"),
+                ("TILE_K", "16u"),
             ],
         );
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1949,7 +1949,7 @@ mod tests {
                 ("WORKGROUP_SIZE_N", "16u"),
                 ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
-                ("TILE_K", "32u"),
+                ("TILE_K", "16u"),
             ],
         );
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2006,14 +2006,14 @@ mod tests {
         }
     }
 
-    /// `k` is a multiple of TILE_K (32) — the aligned case, and `m = 30` also
+    /// `k` is a multiple of TILE_K (16) — the aligned case, and `m = 30` also
     /// exercises partial-tile row handling.
     #[test]
     fn test_gpu_mul_mat_tile_f32_strided_parity() {
         check_mul_mat_tile_f32(30, 128, 16);
     }
 
-    /// `k = 100` is NOT a multiple of TILE_K (32), so the final k-tile is
+    /// `k = 100` is NOT a multiple of TILE_K (16), so the final k-tile is
     /// partial. The kernel's inner loop runs a full TILE_K with no tail check
     /// and depends entirely on the loaders zeroing past `params.k`; every other
     /// reg-tile test uses an aligned `k`, so without this that load-bearing
@@ -2078,7 +2078,7 @@ mod tests {
                 ("WORKGROUP_SIZE_N", "16u"),
                 ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
-                ("TILE_K", "32u"),
+                ("TILE_K", "16u"),
             ],
         );
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2182,7 +2182,7 @@ mod tests {
                 ("WORKGROUP_SIZE_N", "16u"),
                 ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
-                ("TILE_K", "32u"),
+                ("TILE_K", "16u"),
             ],
         );
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3489,7 +3489,7 @@ mod tests {
                 // Production reg-tile geometry (MUL_MAT_TILE_M/N in gpu_lfm2.rs).
                 ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
-                ("TILE_K", "32u"),
+                ("TILE_K", "16u"),
             ],
         );
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3626,7 +3626,7 @@ mod tests {
                 // Production reg-tile geometry (MUL_MAT_TILE_M/N in gpu_lfm2.rs).
                 ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
-                ("TILE_K", "32u"),
+                ("TILE_K", "16u"),
             ],
         );
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3779,7 +3779,7 @@ mod tests {
                 // Production reg-tile geometry (MUL_MAT_TILE_M/N in gpu_lfm2.rs).
                 ("TILE_M", "4u"),
                 ("TILE_N", "4u"),
-                ("TILE_K", "32u"),
+                ("TILE_K", "16u"),
             ],
         );
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
