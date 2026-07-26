@@ -736,6 +736,10 @@ pub(crate) mod neon {
     ) {
         debug_assert_eq!(k % 256, 0, "Q4_K GEMV: k must be divisible by 256");
         debug_assert_eq!(y.len(), _m, "Q4_K GEMV: y.len() must equal m");
+        debug_assert!(
+            x_scales.len() >= k / 32 && x_quants.len() >= k,
+            "Q4_K GEMV: activation scratch too small"
+        );
         unsafe {
             let blocks_per_row = k / 256;
             let row_bytes = blocks_per_row * size_of::<BlockQ4KM>();
@@ -760,7 +764,7 @@ pub(crate) mod neon {
             // original with `sx_*` merely hoisted — keeping the GEMV bit-exact against
             // the batched GEMM (a tested invariant), which uses the same helper.
             let x_qsums = q8_0_col_sums(x_quants, 1, k);
-            let xqs_base = x_qsums.as_ptr() as usize;
+            let xqs: &[i32] = &x_qsums;
 
             let compute_row = move |(i, yi): (usize, &mut f32)| unsafe {
                 let row_start = i * row_bytes;
@@ -803,10 +807,9 @@ pub(crate) mod neon {
                         let dp_lo = vaddvq_s32(vdotq_s32(vdotq_s32(z, wlo0, xlo0), wlo1, xlo1));
                         let dp_hi = vaddvq_s32(vdotq_s32(vdotq_s32(z, whi0, xhi0), whi1, xhi1));
 
-                        // Σ(xq) per sub-block (min term), precomputed once per
-                        // activation block above (replaces the per-row all-ones dot).
-                        let sx_lo = *(xqs_base as *const i32).add(xq_off / 32 + sblo);
-                        let sx_hi = *(xqs_base as *const i32).add(xq_off / 32 + sbhi);
+                        // Σ(xq) per sub-block (min term), precomputed above.
+                        let sx_lo = *xqs.get_unchecked(xq_off / 32 + sblo);
+                        let sx_hi = *xqs.get_unchecked(xq_off / 32 + sbhi);
 
                         let xs_lo = *(xs_base as *const f32).add((xq_off + sblo * 32) / 32);
                         let xs_hi = *(xs_base as *const f32).add((xq_off + sbhi * 32) / 32);
