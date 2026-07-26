@@ -16,17 +16,16 @@
 
 use crate::CeraError;
 use crate::backend::wgpu::GpuContext;
-use crate::kv_cache::KvCompression;
 use crate::model::{BlockType, ModelConfig};
 use crate::turboquant::{
     CompressedKeyCache, CompressedValueCache, RotationState, TurboQuantConfig,
     decode_compressed_keys, decode_compressed_values, encode_compressed_keys,
     encode_compressed_values,
 };
-
-/// Workgroup width of the encode / rotate kernels — must match the
-/// `@workgroup_size` in `turboquant.wgsl`, which also caps `head_dim`.
-const TQ_WG: usize = 128;
+// The packed-layout and mode types are backend-agnostic and live with the
+// algorithm; re-exported so `model::gpu_turboquant::{TqLayout, TqMode}` stays a
+// valid path for callers and tests.
+pub use crate::turboquant::{TqLayout, TqMode, describe_kv_mode, head_dim_supported};
 
 /// Params slots per attention layer in the shared slab: encode-keys,
 /// encode-values, rotate-q, attention.
@@ -36,100 +35,9 @@ const SLOT_ENCODE_VALUES: usize = 1;
 const SLOT_ROTATE_Q: usize = 2;
 const SLOT_ATTENTION: usize = 3;
 
-/// Bytes actually consumed by either params struct (16 × 4-byte scalars). The
+/// Bytes actually consumed by either params struct (16 x 4-byte scalars). The
 /// slab pads each slot out to the device's storage-binding offset alignment.
 const PARAMS_BYTES: usize = 64;
-
-/// Does the compressed path support this `head_dim`?
-///
-/// - power of two — the Walsh-Hadamard transform requires it (so does the CPU
-///   path, which silently falls back to f32 otherwise);
-/// - `<= TQ_WG` — the kernels' workgroup arrays are sized for it, and one thread
-///   covers one element;
-/// - multiple of 32 — the QJL sign bits pack 32 per `u32`, so a non-multiple
-///   would leave a partial word.
-///
-/// Every supported model has `head_dim ∈ {64, 128}`.
-pub fn head_dim_supported(head_dim: usize) -> bool {
-    head_dim.is_power_of_two() && head_dim <= TQ_WG && head_dim.is_multiple_of(32)
-}
-
-/// The subset of [`KvCompression::TurboQuant`] the GPU backends implement.
-///
-/// Only "both sides compressed" is supported. `keys`/`values` exist on the CPU
-/// variant as debugging knobs for isolating which side contributes drift;
-/// honoring them here would mean binding the f32 caches alongside the compressed
-/// ones, which overflows the 8-storage-buffer floor that mobile adapters sit at.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct TqMode {
-    /// Seeds the per-layer rotations as `seed ^ layer_idx`, matching the CPU.
-    pub seed: u64,
-}
-
-impl TqMode {
-    /// The GPU-supported mode for `compression`, or `None` when the compressed
-    /// path can't serve it — a non-TurboQuant mode, a single-sided (debug)
-    /// TurboQuant mode, or an incompatible `head_dim`. `None` means "run the f32
-    /// path"; callers warn so a silently-ignored request is visible.
-    pub fn from_compression(compression: &KvCompression, head_dim: usize) -> Option<Self> {
-        match compression {
-            KvCompression::TurboQuant {
-                seed,
-                keys: true,
-                values: true,
-            } if head_dim_supported(head_dim) => Some(Self { seed: *seed }),
-            _ => None,
-        }
-    }
-}
-
-/// Human-readable name for a configured mode, for the
-/// [`CeraError::KvCompressionConflict`] message.
-pub fn describe_kv_mode(mode: &Option<TqMode>) -> String {
-    match mode {
-        Some(m) => format!("turboquant(seed={})", m.seed),
-        None => "f32".to_string(),
-    }
-}
-
-/// Packed u32 words per element group, derived from `head_dim`. Mirrors the
-/// region arithmetic in `turboquant.wgsl`.
-#[derive(Clone, Copy)]
-pub struct TqLayout {
-    pub head_dim: usize,
-    /// 2-bit PolarQuant indices, 16 per u32.
-    pub polar_words: usize,
-    /// 1-bit QJL signs, 32 per u32.
-    pub jl_words: usize,
-}
-
-impl TqLayout {
-    pub fn new(head_dim: usize) -> Self {
-        debug_assert!(head_dim_supported(head_dim));
-        Self {
-            head_dim,
-            polar_words: head_dim / 16,
-            jl_words: head_dim / 32,
-        }
-    }
-
-    /// u32 words in a layer's key buffer: `[polar | jl | norms]` for `vecs`
-    /// (kv_head, timestep) slots.
-    pub fn key_words(&self, vecs: usize) -> usize {
-        vecs * (self.polar_words + self.jl_words + 1)
-    }
-
-    /// u32 words in a layer's value buffer: `[polar | norms]`.
-    pub fn value_words(&self, vecs: usize) -> usize {
-        vecs * (self.polar_words + 1)
-    }
-
-    /// Byte offsets of the key regions, given `vecs` slots.
-    pub fn key_regions(&self, vecs: usize) -> (usize, usize) {
-        let jl_off = vecs * self.polar_words;
-        (jl_off, jl_off + vecs * self.jl_words)
-    }
-}
 
 /// Encode / rotate params. Mirrors the `TqParams` struct in `turboquant.wgsl` —
 /// all 16 fields are 4-byte scalars, so the WGSL and Rust layouts agree without
@@ -401,23 +309,24 @@ impl TqGpuCache {
     ///
     /// - `n_tokens` — rows in this batch (1 for decode).
     /// - `start_pos` — absolute position of row 0.
-    /// - `q_src_stride` — elements per row in the Q source buffer (`q_dim`). The
-    ///   K/V row stride is derived per layer as `n_kv_heads * head_dim`, which is
-    ///   that layer's `kv_dim` — passing it in would be a footgun on models whose
-    ///   KV head count varies by layer.
-    /// - `out_stride` — elements per row in the attention output.
     /// - `scale` — softmax scale (Granite overrides `1/sqrt(head_dim)`).
+    ///
+    /// Every row stride is derived rather than passed: the Q source and the
+    /// attention output are both `q_dim = n_heads * head_dim` wide (heads
+    /// concatenated per row), and each layer's K/V rows are `n_kv_heads *
+    /// head_dim`. Deriving them keeps a caller from pairing this batch's params
+    /// with another layout's strides, and is correct on models whose KV head count
+    /// varies by layer.
     pub fn write_params(
         &self,
         ctx: &GpuContext,
         config: &ModelConfig,
         n_tokens: usize,
         start_pos: usize,
-        q_src_stride: usize,
-        out_stride: usize,
         scale: f32,
     ) {
         let head_dim = self.layout.head_dim;
+        let q_dim = config.n_heads * head_dim;
         let mut slab = vec![0u8; self.layers.len() * SLOTS_PER_LAYER * self.slot_stride];
 
         for (i, layer) in self.layers.iter().enumerate() {
@@ -440,7 +349,7 @@ impl TqGpuCache {
             // Rotation runs over QUERY heads and reads the Q buffer.
             let rot = TqParams {
                 n_heads: config.n_heads as u32,
-                src_stride: q_src_stride as u32,
+                src_stride: q_dim as u32,
                 ..base
             };
             self.put(&mut slab, i, SLOT_ROTATE_Q, bytemuck::bytes_of(&rot));
@@ -452,7 +361,7 @@ impl TqGpuCache {
                 start_pos: start_pos as u32,
                 scale,
                 q_cap: self.q_cap as u32,
-                out_stride: out_stride as u32,
+                out_stride: q_dim as u32,
                 qjl_scale: TqAttnParams::qjl_scale_for(head_dim),
                 sign_off,
                 centroids: self.config.centroids,

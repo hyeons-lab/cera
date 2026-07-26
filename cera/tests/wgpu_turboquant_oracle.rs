@@ -610,16 +610,7 @@ fn check_snapshot_roundtrip(ctx: &GpuContext, head_dim: usize) {
     let tq = TqGpuCache::new(ctx, &config, MAX_SEQ, SEQ_LEN, TqMode { seed: SEED })
         .expect("TqGpuCache allocation");
 
-    let q_dim = N_HEADS * head_dim;
-    tq.write_params(
-        ctx,
-        &config,
-        SEQ_LEN,
-        0,
-        q_dim,
-        q_dim,
-        1.0 / (head_dim as f32).sqrt(),
-    );
+    tq.write_params(ctx, &config, SEQ_LEN, 0, 1.0 / (head_dim as f32).sqrt());
     let k_buf = ctx.upload_f32(&k, "k_src");
     let v_buf = ctx.upload_f32(&v, "v_src");
     let mut enc = ctx

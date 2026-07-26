@@ -2337,7 +2337,6 @@ impl GpuLfm2Model {
         // of the per-layer encoders below. One decode row, appended at the
         // current seq_len; Q and the attention output are both `q_dim`-strided.
         if let Some(tq) = self.tq_cache() {
-            let q_dim = cfg.n_heads * cfg.head_dim;
             let scale = self
                 .scalars
                 .attn
@@ -2347,8 +2346,6 @@ impl GpuLfm2Model {
                 cfg,
                 1,
                 self.gpu_state.seq_len.load(Ordering::Relaxed),
-                q_dim,
-                q_dim,
                 scale,
             );
         }
@@ -3975,12 +3972,11 @@ impl GpuLfm2Model {
         // lives in `prefill_proj_buf` and the attention output in
         // `prefill_normed_buf`, both `q_dim`-strided.
         if let Some(tq) = self.tq_cache() {
-            let q_dim = cfg.n_heads * cfg.head_dim;
             let scale = self
                 .scalars
                 .attn
                 .unwrap_or_else(|| 1.0 / (cfg.head_dim as f32).sqrt());
-            tq.write_params(&self.ctx, cfg, n, start_pos, q_dim, q_dim, scale);
+            tq.write_params(&self.ctx, cfg, n, start_pos, scale);
         }
 
         // ─── Stage embeddings into prefill_batch_buf ──────────────────────

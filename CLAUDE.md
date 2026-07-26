@@ -62,7 +62,7 @@ Four tiers with runtime dispatch:
 - **LFM2 / LFM2.5** (`lfm2` arch, hybrid attention + gated-conv) — plus vision (LFM2-VL) and audio (LFM2-Audio) modalities.
 - **Dense transformers** (`llama` arch — also Qwen2/3, classic Mistral, Granite).
 
-TurboQuant KV-cache compression is CPU-only (`Lfm2Model`); the GPU backends fall back to f32 KV.
+TurboQuant KV-cache compression runs on CPU (`Lfm2Model`) and wgpu (`GpuLfm2Model`), for decode and chunked prefill, with cross-backend-compatible prefix-cache snapshots. The GPU path needs `head_dim` a power of two ≤ 128 and a multiple of 32, and only supports compressing keys *and* values (the single-sided `tq3-keys` / `tq3-values` debug modes fall back to f32 KV). The Metal backend has the kernels (`turboquant.metal`, `flash_attention_tq.metal`, covered by `tests/metal_turboquant_oracle.rs`) but its KV is not routed through them yet, so it falls back to f16 KV. `n_keep` shift is unsupported on compressed caches everywhere — it needs raw K to re-rotate.
 
 ### Tokenizer (`tokenizer.rs`)
 

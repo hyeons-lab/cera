@@ -16,7 +16,7 @@ pub use params::{
     BiasAddParams, Conv1dBatchParams, ElementwiseParams, FlashAttnParams, GemmF32Params,
     GemvBatchParams, GemvQkvParams, GemvRmsParams, GemvSplitKParams, KvCopyParams, KvShiftKParams,
     MetalParams, PrefillAttnParams, QkNormRopeBatchParams, QkNormRopeParams, QuantGemmParams,
-    RmsNormBatchParams, RopeParams, ScaleParams, SplitAttnParams,
+    RmsNormBatchParams, RopeParams, ScaleParams, SplitAttnParams, TqAttnParams, TqParams,
 };
 
 /// Metal compute context: device, command queue, compiled shader library cache.
@@ -214,6 +214,12 @@ pub mod shaders {
     pub const QK_NORM_ROPE_BATCH: &str = include_str!("shaders/qk_norm_rope_batch.metal");
     pub const CONV1D_FUSED_BATCH: &str = include_str!("shaders/conv1d_fused_batch.metal");
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.metal");
+    /// TurboQuant KV compression: `tq_encode_keys`, `tq_encode_values`,
+    /// `tq_rotate_q` (three kernels in one source).
+    pub const TURBOQUANT: &str = include_str!("shaders/turboquant.metal");
+    /// FlashAttention over a TurboQuant-compressed cache — serves decode
+    /// (`n_queries = 1`) and chunked prefill from one kernel.
+    pub const FLASH_ATTENTION_TQ: &str = include_str!("shaders/flash_attention_tq.metal");
     // Vision-encoder (ViT) kernels.
     pub const VIT_LINEAR: &str = include_str!("shaders/vit_linear.metal");
     pub const LAYERNORM_BATCH: &str = include_str!("shaders/layernorm_batch.metal");

@@ -211,6 +211,20 @@ pub enum FfiError {
     /// surface a clean error. Mirrors `cera::CeraError::OutOfMemory`.
     #[error("out of memory: could not allocate {requested_bytes} bytes")]
     OutOfMemory { requested_bytes: u64 },
+
+    /// A GPU backend's KV-cache compression mode is fixed by the first session
+    /// that configures it — the compressed and f32 caches have different buffer
+    /// layouts and only the configured one is allocated. Two sessions wanting
+    /// different modes need two `CeraModel` instances. Mirrors
+    /// `cera::CeraError::KvCompressionConflict`.
+    #[error(
+        "model already configured for KV compression mode `{configured}`; \
+         cannot reconfigure to `{requested}` — create a separate model instance"
+    )]
+    KvCompressionConflict {
+        configured: String,
+        requested: String,
+    },
 }
 
 impl From<cera::CeraError> for FfiError {
@@ -236,6 +250,13 @@ impl From<cera::CeraError> for FfiError {
             cera::CeraError::OutOfMemory { requested_bytes } => {
                 FfiError::OutOfMemory { requested_bytes }
             }
+            cera::CeraError::KvCompressionConflict {
+                configured,
+                requested,
+            } => FfiError::KvCompressionConflict {
+                configured,
+                requested,
+            },
             cera::CeraError::LoraDimMismatch(s) => FfiError::LoraParse { detail: s },
             cera::CeraError::Io(io_err) => FfiError::Io {
                 detail: io_err.to_string(),

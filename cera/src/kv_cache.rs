@@ -77,8 +77,14 @@ fn zeroed_f32(len: usize) -> Result<Vec<f32>, CeraError> {
 /// caches, and the scratch buffers. **No separate `enable_turboquant` call on
 /// the model is required.**
 ///
-/// TurboQuant is currently honored only by the CPU backend (`Lfm2Model`); on the
-/// Metal/GPU backends this setting is ignored and the f32 KV path is used.
+/// TurboQuant is honored by the CPU backend (`Lfm2Model`) and by wgpu
+/// (`GpuLfm2Model`). The GPU path additionally needs
+/// [`crate::model::Model::configure_kv_compression`] — which `Session` calls —
+/// to build its GPU-resident compressed cache, and it only implements the
+/// both-sides mode: a single-sided (debug) request, or a `head_dim` its kernels
+/// can't handle, warns and falls back to f32 KV. The native Metal backend has the
+/// kernels but does not route its KV through them yet, so this setting is still
+/// ignored there.
 #[derive(Clone, Debug, Default)]
 pub enum KvCompression {
     /// No compression — keys and values stored as f32 (default).

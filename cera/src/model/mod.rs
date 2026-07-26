@@ -449,7 +449,7 @@ pub trait Model: Send + Sync {
     /// exactly the transient memory peak compression is meant to avoid.
     ///
     /// **First call wins.** A second call with a *different* mode returns
-    /// [`CeraError::KvCompressionConflict`] rather than silently leaving the
+    /// [`crate::CeraError::KvCompressionConflict`] rather than silently leaving the
     /// allocated buffers disagreeing with the kernels — two sessions wanting
     /// different modes need two model instances. Re-configuring the same mode
     /// (as `Session::reset` does) is a no-op.

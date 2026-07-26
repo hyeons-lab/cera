@@ -1747,8 +1747,13 @@ fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<()> {
 /// - `f16`: half-precision KV cache (2 bytes/elem, ~2× less KV bandwidth at
 ///   decode). CPU dense-transformer path; falls back to f32 on other models.
 /// - `tq3` / `turboquant`: TurboQuant on both keys (3-bit) and values (2-bit)
-/// - `tq3-keys`: TurboQuant keys only (values stay f32) — debugging
-/// - `tq3-values`: TurboQuant values only (keys stay f32) — debugging
+/// - `tq3-keys`: TurboQuant keys only (values stay f32) — debugging, CPU only
+/// - `tq3-values`: TurboQuant values only (keys stay f32) — debugging, CPU only
+///
+/// The single-sided modes exist to isolate how much drift each side contributes.
+/// The GPU backends implement only the both-sides mode and fall back to f32 KV for
+/// the other two (with a warning from the backend), so use `--device cpu` when
+/// bisecting drift.
 fn setup_kv_compression(
     model: &dyn cera::model::Model,
     kv_cache_mode: &str,

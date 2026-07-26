@@ -291,6 +291,65 @@ pub struct FlashAttnParams {
 const _: () = assert!(size_of::<FlashAttnParams>() == 32);
 impl MetalParams for FlashAttnParams {}
 
+/// Mirror of `TqParams` in `shaders/turboquant.metal` — the encode and
+/// query-rotation kernels.
+///
+/// Layout-identical to the WGSL `TqParams` in `turboquant.wgsl` and to the wgpu
+/// host mirror in `model::gpu_turboquant`, so the three backends share one
+/// definition of the packed cache. Field meanings are documented there.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TqParams {
+    pub n_tokens: u32,
+    /// KV heads for the encode kernels, query heads for `tq_rotate_q`.
+    pub n_heads: u32,
+    pub head_dim: u32,
+    pub src_stride: u32,
+    pub dst_pos: u32,
+    /// Cache capacity in timesteps — the per-head stride of every region.
+    pub max_seq_len: u32,
+    pub sign_off: u32,
+    pub q_cap: u32,
+    pub c0: f32,
+    pub c1: f32,
+    pub c2: f32,
+    pub c3: f32,
+    pub b0: f32,
+    pub b1: f32,
+    pub b2: f32,
+    pub _pad: u32,
+}
+const _: () = assert!(size_of::<TqParams>() == 64);
+impl MetalParams for TqParams {}
+
+/// Mirror of `TqAttnParams` in `shaders/flash_attention_tq.metal`.
+///
+/// `max_seq` is the causal clamp (`start_pos + n_queries`); `cache_cap` is the
+/// per-head region stride. Both are needed — see the shader header.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TqAttnParams {
+    pub n_heads: u32,
+    pub n_kv_heads: u32,
+    pub head_dim: u32,
+    pub max_seq: u32,
+    pub start_pos: u32,
+    pub scale: f32,
+    pub q_cap: u32,
+    pub out_stride: u32,
+    /// QJL inner-product estimator scale, `sqrt(pi/2) / head_dim`.
+    pub qjl_scale: f32,
+    pub sign_off: u32,
+    pub c0: f32,
+    pub c1: f32,
+    pub c2: f32,
+    pub c3: f32,
+    pub q_base: u32,
+    pub cache_cap: u32,
+}
+const _: () = assert!(size_of::<TqAttnParams>() == 64);
+impl MetalParams for TqAttnParams {}
+
 /// Mirror of `SplitParams` in `shaders/attention_splitk.metal`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
