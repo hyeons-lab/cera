@@ -663,6 +663,11 @@ impl InferenceState {
     /// for that turn.
     pub fn snapshot(&self) -> Option<StateSnapshot> {
         let mut layers = Vec::with_capacity(self.layers.len());
+        // `kv_f16` is the authoritative mode flag (set once at construction),
+        // reliable even for a zero-token layer whose `*_f16` slots are still
+        // empty — so every attention layer of an f16 state snapshots as
+        // `AttentionF16`, matching the `is_f16()` restore gate.
+        let kv_f16 = self.kv_f16;
         for l in &self.layers {
             match l {
                 LayerState::Attention {
@@ -673,23 +678,34 @@ impl InferenceState {
                     compressed_keys,
                     compressed_values,
                 } => {
-                    // f16 KV isn't representable in the current on-disk snapshot
-                    // shape; refuse the whole snapshot so the caller falls back
-                    // to a cold prefill (same conservative policy as mixed-TQ).
-                    if !key_cache_f16.is_empty() || !value_cache_f16.is_empty() {
-                        return None;
-                    }
-                    let snap = match (compressed_keys, compressed_values) {
-                        (None, None) => LayerSnapshot::Attention {
-                            k_data: bytemuck::cast_slice(key_cache).to_vec(),
-                            v_data: bytemuck::cast_slice(value_cache).to_vec(),
-                        },
-                        (Some(k), Some(v)) => LayerSnapshot::AttentionCompressed {
-                            keys: crate::turboquant::encode_compressed_keys(k),
-                            values: crate::turboquant::encode_compressed_values(v),
-                        },
-                        // Mixed-mode: refuse the whole snapshot.
-                        (Some(_), None) | (None, Some(_)) => return None,
+                    let snap = if kv_f16 {
+                        // f16 KV: serialize the u16 half-bits **little-endian**
+                        // to match the documented on-disk format and `restore`'s
+                        // `u16::from_le_bytes` decode (a native-endian
+                        // `bytemuck::cast_slice` would byte-swap on a big-endian
+                        // host). f16 and TurboQuant are mutually exclusive
+                        // (`from_config_with_compression` picks one), so the
+                        // compressed slots are always `None` here.
+                        LayerSnapshot::AttentionF16 {
+                            k_data: key_cache_f16.iter().flat_map(|h| h.to_le_bytes()).collect(),
+                            v_data: value_cache_f16
+                                .iter()
+                                .flat_map(|h| h.to_le_bytes())
+                                .collect(),
+                        }
+                    } else {
+                        match (compressed_keys, compressed_values) {
+                            (None, None) => LayerSnapshot::Attention {
+                                k_data: bytemuck::cast_slice(key_cache).to_vec(),
+                                v_data: bytemuck::cast_slice(value_cache).to_vec(),
+                            },
+                            (Some(k), Some(v)) => LayerSnapshot::AttentionCompressed {
+                                keys: crate::turboquant::encode_compressed_keys(k),
+                                values: crate::turboquant::encode_compressed_values(v),
+                            },
+                            // Mixed-mode: refuse the whole snapshot.
+                            (Some(_), None) | (None, Some(_)) => return None,
+                        }
                     };
                     layers.push(snap);
                 }
@@ -734,6 +750,28 @@ impl InferenceState {
             }
         }
 
+        // f16 sibling of `decode_f32_into`: the source is raw IEEE-754 half
+        // bits (2 bytes/elem), decoded element-wise so we don't depend on the
+        // snapshot allocator's alignment for a `u16` cast.
+        fn decode_u16_into(dst: &mut Vec<u16>, src: &[u8]) {
+            assert!(
+                src.len().is_multiple_of(2),
+                "f16 snapshot byte length {} not a multiple of 2",
+                src.len()
+            );
+            dst.clear();
+            dst.reserve(src.len() / 2);
+            for chunk in src.as_chunks::<2>().0 {
+                dst.push(u16::from_le_bytes(*chunk));
+            }
+        }
+
+        // Captured before the mutable layer borrow; the `AttentionF16` arm
+        // asserts on it (symmetric with the compressed arm's slot assert) so a
+        // mode-mismatched snapshot panics loudly instead of silently writing
+        // f16 bytes into an f32-configured state. The lfm2.rs compatibility gate
+        // is the primary guard; this is the backstop.
+        let kv_f16 = self.kv_f16;
         for (layer, snap) in self.layers.iter_mut().zip(snapshot.layers.iter()) {
             match (layer, snap) {
                 (
@@ -746,14 +784,45 @@ impl InferenceState {
                     },
                     LayerSnapshot::Attention { k_data, v_data },
                 ) => {
+                    // Symmetric backstop to the AttentionF16 arm: an f32
+                    // snapshot must not restore into an f16 state (it would
+                    // populate the f32 slots while the model reads the empty
+                    // f16 slots → silent garbage). The lfm2 gate is the primary
+                    // guard; panic loudly if it's ever bypassed.
+                    assert!(
+                        !kv_f16,
+                        "f32 Attention snapshot restored into an f16 state — \
+                         caller must gate on the snapshot/live compression mode"
+                    );
                     decode_f32_into(key_cache, k_data);
                     decode_f32_into(value_cache, v_data);
-                    // Defensive: an f32 snapshot restored into an f16-configured
-                    // state must not leave stale f16 data. Not reachable today
-                    // (snapshot() refuses f16 → this arm only meets f32 state),
-                    // but keeps the two representations from ever coexisting.
+                    // Keep the two representations from ever coexisting (f16
+                    // slots stay empty on the f32 path).
                     key_cache_f16.clear();
                     value_cache_f16.clear();
+                }
+                (
+                    LayerState::Attention {
+                        key_cache,
+                        value_cache,
+                        key_cache_f16,
+                        value_cache_f16,
+                        ..
+                    },
+                    LayerSnapshot::AttentionF16 { k_data, v_data },
+                ) => {
+                    assert!(
+                        kv_f16,
+                        "AttentionF16 snapshot restored into a non-f16 state — \
+                         caller must gate on `LayerSnapshot::is_f16()` matching \
+                         the live `kv_f16` mode"
+                    );
+                    decode_u16_into(key_cache_f16, k_data);
+                    decode_u16_into(value_cache_f16, v_data);
+                    // f32 caches are unused under f16; clear them so stale data
+                    // from a prior uncompressed restore can't leak.
+                    key_cache.clear();
+                    value_cache.clear();
                 }
                 (
                     LayerState::Attention {
@@ -824,6 +893,12 @@ impl InferenceState {
     /// result is identical to freshly rotating the raw K for `p_new`.
     /// V is NOT rotated by RoPE — only the two drain calls touch V.
     ///
+    /// f16 KV states (`kv_f16`) shift the `*_f16` half-precision slots the same
+    /// way: the drain is over the same element range, and each K head is
+    /// **widened to f32, delta-rotated with the same helper, then narrowed back
+    /// to f16** (`head_dim ≤ 128`). f16 rounding makes this near-exact, not
+    /// bit-exact, vs a fresh f16 encode at `p_new`.
+    ///
     /// `seq_len` is decremented by `shift`. Compressed (TurboQuant)
     /// layers are **not** shifted — callers must check
     /// [`Self::is_compressed`] first; this method panics otherwise.
@@ -872,11 +947,6 @@ impl InferenceState {
             "shift_kv_with_rope called on a TurboQuant-compressed state; \
              shifting compressed caches is not yet supported"
         );
-        assert!(
-            !self.kv_f16,
-            "shift_kv_with_rope called on an f16 KV state; \
-             shifting f16 caches is not yet supported"
-        );
         assert_eq!(
             n_kv_heads_per_layer.len(),
             self.layers.len(),
@@ -885,15 +955,112 @@ impl InferenceState {
             self.layers.len(),
         );
 
+        // `kv_f16` is a whole-state flag captured before the mutable layer
+        // iteration; in f16 mode the `*_f16` slots hold the cache and the f32
+        // slots are empty (and vice versa). The delta RoPE re-encoding is
+        // identical for both — only the storage width (and the widen/narrow
+        // around the rotation) differs.
+        let kv_f16 = self.kv_f16;
+        // The f16 path widens each K head into a fixed stack buffer before
+        // rotating; `head_dim` is bounded by attention hardware (≤ 128 for
+        // every supported model). Assert eagerly (f16 only) so a malformed
+        // config can't index past the buffer; the f32 path never allocates it.
+        if kv_f16 {
+            assert!(
+                head_dim <= 128,
+                "head_dim {head_dim} exceeds the f16 shift widen buffer (128)"
+            );
+        }
         let new_seq_len = self.seq_len - shift;
+        let seq_len = self.seq_len;
+        let delta = -(shift as i32);
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if let LayerState::Attention {
                 key_cache,
                 value_cache,
+                key_cache_f16,
+                value_cache_f16,
                 ..
             } = layer
             {
+                if kv_f16 {
+                    // ── f16 path ──────────────────────────────────────────
+                    // Layer has no KV yet — nothing to shift.
+                    if key_cache_f16.is_empty() && value_cache_f16.is_empty() {
+                        continue;
+                    }
+                    // Same invariants as the f32 path, on the u16 caches:
+                    // equal lengths, a clean multiple of `seq_len` (in u16
+                    // units — the element count is identical to f32).
+                    assert_eq!(
+                        key_cache_f16.len(),
+                        value_cache_f16.len(),
+                        "f16 KV cache length mismatch: key={} value={}",
+                        key_cache_f16.len(),
+                        value_cache_f16.len()
+                    );
+                    assert!(seq_len > 0, "attention layer has KV but seq_len is 0");
+                    assert_eq!(
+                        key_cache_f16.len() % seq_len,
+                        0,
+                        "f16 KV cache length {} not a multiple of seq_len {}",
+                        key_cache_f16.len(),
+                        seq_len
+                    );
+                    let n_kv_heads = n_kv_heads_per_layer[layer_idx];
+                    let kv_dim = key_cache_f16.len() / seq_len;
+                    assert_eq!(
+                        n_kv_heads * head_dim,
+                        kv_dim,
+                        "layer {layer_idx}: n_kv_heads*head_dim ({}) != cached kv_dim ({})",
+                        n_kv_heads * head_dim,
+                        kv_dim
+                    );
+                    let drop_start = n_keep * kv_dim;
+                    let drop_end = (n_keep + shift) * kv_dim;
+                    key_cache_f16.drain(drop_start..drop_end);
+                    value_cache_f16.drain(drop_start..drop_end);
+
+                    // Re-rotate K cells now at [n_keep, new_seq_len) by
+                    // R(-shift): widen the f16 head to f32, apply the SAME
+                    // delta-RoPE helper as the f32 path, narrow back to f16.
+                    // V is not RoPE'd.
+                    let mut head_buf = [0.0f32; 128];
+                    for t in n_keep..new_seq_len {
+                        let row_base = t * kv_dim;
+                        for h in 0..n_kv_heads {
+                            let head_start = row_base + h * head_dim;
+                            let head = &mut key_cache_f16[head_start..head_start + head_dim];
+                            let buf = &mut head_buf[..head_dim];
+                            for (dst, &bits) in buf.iter_mut().zip(head.iter()) {
+                                *dst = half::f16::from_bits(bits).to_f32();
+                            }
+                            match rope_type {
+                                crate::backend::cpu::RopeType::Neox => {
+                                    crate::backend::cpu::apply_rope_delta_to_head(
+                                        buf, delta, head_dim, rope_theta,
+                                    )
+                                }
+                                crate::backend::cpu::RopeType::Norm => {
+                                    crate::backend::cpu::apply_rope_norm_delta_to_head(
+                                        buf,
+                                        delta,
+                                        head_dim,
+                                        rope_theta,
+                                        freq_factors,
+                                    )
+                                }
+                            }
+                            for (dst, &x) in head.iter_mut().zip(buf.iter()) {
+                                *dst = half::f16::from_f32(x).to_bits();
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // ── f32 path ──────────────────────────────────────────────
                 // Layer has no KV yet — nothing to shift. Reaches here
                 // for models whose first `n_layers - 1` layers were
                 // populated but the last one wasn't; guard defensively.
@@ -911,16 +1078,16 @@ impl InferenceState {
                     key_cache.len(),
                     value_cache.len()
                 );
-                assert!(self.seq_len > 0, "attention layer has KV but seq_len is 0");
+                assert!(seq_len > 0, "attention layer has KV but seq_len is 0");
                 assert_eq!(
-                    key_cache.len() % self.seq_len,
+                    key_cache.len() % seq_len,
                     0,
                     "KV cache length {} not a multiple of seq_len {}",
                     key_cache.len(),
-                    self.seq_len
+                    seq_len
                 );
                 let n_kv_heads = n_kv_heads_per_layer[layer_idx];
-                let kv_dim = key_cache.len() / self.seq_len;
+                let kv_dim = key_cache.len() / seq_len;
                 // Sanity: declared kv_dim matches what's actually stored.
                 // An off-by-one here (wrong head count passed in) would
                 // silently corrupt the per-head RoPE application below,
@@ -942,7 +1109,6 @@ impl InferenceState {
                 // Re-rotate K cells now at positions [n_keep, new_seq_len).
                 // Their stored K was rotated for (new_pos + shift); apply
                 // R(-shift) to re-encode as new_pos. V is not RoPE'd.
-                let delta = -(shift as i32);
                 for t in n_keep..new_seq_len {
                     let row_base = t * kv_dim;
                     for h in 0..n_kv_heads {
@@ -1008,6 +1174,17 @@ pub enum LayerSnapshot {
         keys: Vec<u8>,
         values: Vec<u8>,
     },
+    /// f16 (IEEE-754 half) KV bytes. Captured from an attention layer whose
+    /// `key_cache_f16`/`value_cache_f16` slots hold the cache
+    /// (`KvCompression::F16`). `k_data`/`v_data` are the raw little-endian u16
+    /// half-bits — half the width of the f32 `Attention` variant. Distinct from
+    /// `Attention` so the restore-time cross-mode gate can reject an f16 snapshot
+    /// against an f32 state (and vice versa) before a byte-width mismatch
+    /// corrupts the cache.
+    AttentionF16 {
+        k_data: Vec<u8>,
+        v_data: Vec<u8>,
+    },
     Conv {
         buffer: Vec<u8>,
     },
@@ -1023,6 +1200,15 @@ impl LayerSnapshot {
     pub fn is_compressed(&self) -> bool {
         matches!(self, LayerSnapshot::AttentionCompressed { .. })
     }
+
+    /// `true` iff this snapshot was captured from an f16 (`KvCompression::F16`)
+    /// attention layer. Mirrors [`Self::is_compressed`]; callers gate `restore`
+    /// on this matching the target state's `kv_f16` flag so an f16 snapshot is
+    /// never restored into an f32 state (or vice versa) — the byte widths
+    /// differ, so a cross-mode restore would corrupt the cache.
+    pub fn is_f16(&self) -> bool {
+        matches!(self, LayerSnapshot::AttentionF16 { .. })
+    }
 }
 
 impl StateSnapshot {
@@ -1032,6 +1218,7 @@ impl StateSnapshot {
             .map(|l| match l {
                 LayerSnapshot::Attention { k_data, v_data } => k_data.len() + v_data.len(),
                 LayerSnapshot::AttentionCompressed { keys, values } => keys.len() + values.len(),
+                LayerSnapshot::AttentionF16 { k_data, v_data } => k_data.len() + v_data.len(),
                 LayerSnapshot::Conv { buffer } => buffer.len(),
             })
             .sum()
@@ -1044,6 +1231,15 @@ impl StateSnapshot {
     /// `restore`.
     pub fn is_compressed(&self) -> bool {
         self.layers.iter().any(LayerSnapshot::is_compressed)
+    }
+
+    /// `true` iff any attention layer in this snapshot is f16
+    /// (`AttentionF16`). Used by `Lfm2Model::forward_prefill`'s
+    /// cross-mode gate to reject an f16 snapshot against an f32
+    /// (or compressed) live state — their byte widths differ, so a
+    /// cross-mode restore would corrupt the cache.
+    pub fn is_f16(&self) -> bool {
+        self.layers.iter().any(LayerSnapshot::is_f16)
     }
 }
 
@@ -1239,10 +1435,16 @@ impl KvPrefixCache {
             flatbuffers::FlatBufferBuilder::with_capacity(snapshot.byte_size() + 1024);
 
         // Build layers. type_tag taxonomy:
-        //   0 = Attention (raw f32/f16 KV bytes; backend-defined).
+        //   0 = Attention (raw KV bytes at the BACKEND-NATIVE width — f32 on
+        //       CPU/wgpu, f16 on Metal; the byte length implicitly carries it).
         //   1 = Conv (raw f32 rolling buffer bytes).
         //   2 = AttentionCompressed (TurboQuant; k_data=encoded keys
         //       blob "TQK1...", v_data=encoded values blob "TQV1...").
+        //   3 = AttentionF16 (CPU `KvCompression::F16`; raw IEEE-754 half bits,
+        //       k_data/v_data are little-endian u16 half-widths — no schema
+        //       change, the generic LayerData {type_tag, k_data, v_data} carries
+        //       it. Distinct from Metal's f16-in-tag-0 because a CPU f16 session
+        //       must not restore a tag-0 f32 snapshot; the lfm2 gate enforces it).
         let mut layer_offsets = Vec::with_capacity(snapshot.layers.len());
         for layer in &snapshot.layers {
             let (tag, k_off, v_off) = match layer {
@@ -1259,6 +1461,11 @@ impl KvPrefixCache {
                     let k = builder.create_vector(keys);
                     let v = builder.create_vector(values);
                     (2u8, Some(k), Some(v))
+                }
+                LayerSnapshot::AttentionF16 { k_data, v_data } => {
+                    let k = builder.create_vector(k_data);
+                    let v = builder.create_vector(v_data);
+                    (3u8, Some(k), Some(v))
                 }
             };
             let ld = crate::generated::cera::cache::LayerData::create(
@@ -1372,6 +1579,22 @@ impl KvPrefixCache {
                         return None;
                     }
                     layers.push(LayerSnapshot::AttentionCompressed { keys, values });
+                }
+                3 => {
+                    let k_data = l.k_data()?.bytes().to_vec();
+                    let v_data = l.v_data()?.bytes().to_vec();
+                    // Validate the f16 blob shape at load time (mirrors the
+                    // tag-2 TurboQuant validation): u16 half-bits are 2 bytes
+                    // each and K/V are the same length, so a corrupted entry
+                    // surfaces as a cache miss (None) here instead of panicking
+                    // later in `restore`'s `decode_u16_into` (`len % 2 == 0`).
+                    if !k_data.len().is_multiple_of(2)
+                        || !v_data.len().is_multiple_of(2)
+                        || k_data.len() != v_data.len()
+                    {
+                        return None;
+                    }
+                    layers.push(LayerSnapshot::AttentionF16 { k_data, v_data });
                 }
                 _ => return None,
             }
@@ -1529,9 +1752,9 @@ mod tests {
 
     /// `KvCompression::F16` allocates the f16 slots (f32 slots empty), append
     /// converts to half and round-trips within f16 precision, and the snapshot
-    /// path refuses f16 (so the caller cold-prefills instead of corrupting).
+    /// path now emits `AttentionF16` for every attention layer.
     #[test]
-    fn f16_kv_stores_half_and_snapshot_gated() {
+    fn f16_kv_stores_half_and_snapshots() {
         let cfg = tiny_config(4, 16); // attn layers 0,2; kv_dim = 2*4 = 8
         let kv_dim = cfg.kv_heads_per_layer[0] * cfg.head_dim;
         let mut state =
@@ -1568,36 +1791,240 @@ mod tests {
         }
 
         state.seq_len = 1;
-        assert!(
-            state.snapshot().is_none(),
-            "f16 KV must refuse to snapshot (cold-prefill fallback)"
-        );
+        let snap = state.snapshot().expect("f16 KV must snapshot");
+        // Every attention layer of an f16 state snapshots as AttentionF16,
+        // even the one we didn't append to (empty u16 bytes) — the mode flag,
+        // not the slot contents, drives the variant.
+        for (i, l) in snap.layers.iter().enumerate() {
+            match &state.layers[i] {
+                LayerState::Attention { .. } => assert!(
+                    l.is_f16(),
+                    "attention layer {i} must snapshot as AttentionF16"
+                ),
+                LayerState::Conv { .. } => {
+                    assert!(matches!(l, LayerSnapshot::Conv { .. }))
+                }
+            }
+        }
     }
 
-    /// The sliding-window RoPE shift is not yet implemented for f16 KV, so it
-    /// must hard-panic rather than silently corrupt the cache.
+    /// An f16 `InferenceState` snapshots to `AttentionF16` and restores back
+    /// into a fresh f16 state byte-exactly (the u16 half-bits and seq_len must
+    /// round-trip losslessly through the prefix-cache path).
     #[test]
-    #[should_panic(expected = "f16 KV state")]
-    fn shift_kv_panics_on_f16() {
-        let cfg = tiny_config(2, 16); // layer 0 attention, layer 1 conv
+    fn f16_snapshot_restore_round_trips() {
+        let cfg = tiny_config(4, 16); // attn layers 0,2; kv_dim = 2*4 = 8
         let kv_dim = cfg.kv_heads_per_layer[0] * cfg.head_dim;
         let mut state =
             InferenceState::from_config_with_compression(&cfg, &KvCompression::F16).unwrap();
-        let k = vec![0.1f32; kv_dim];
-        let v = vec![0.2f32; kv_dim];
-        state.append_kv_f16(0, &k, &v);
-        state.append_kv_f16(0, &k, &v);
+
+        // Populate both attention layers with two tokens of deterministic KV.
+        for layer in [0usize, 2] {
+            for t in 0..2 {
+                let k: Vec<f32> = (0..kv_dim)
+                    .map(|i| (layer as f32) + 0.1 * t as f32 + 0.01 * i as f32)
+                    .collect();
+                let v: Vec<f32> = k.iter().map(|x| -x).collect();
+                state.append_kv_f16(layer, &k, &v);
+            }
+        }
         state.seq_len = 2;
-        let n_kv = cfg.kv_heads_per_layer.clone();
+
+        let snap = state.snapshot().expect("f16 state must snapshot");
+        for layer in [0usize, 2] {
+            assert!(
+                snap.layers[layer].is_f16(),
+                "attention layer {layer} must snapshot as AttentionF16"
+            );
+        }
+
+        // Restore into a fresh f16 state and assert byte-exact round-trip.
+        let mut fresh =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::F16).unwrap();
+        fresh.restore(&snap);
+        assert_eq!(fresh.seq_len, state.seq_len);
+        for layer in [0usize, 2] {
+            let (ko, vo) = state.kv_cache_f16(layer);
+            let (kr, vr) = fresh.kv_cache_f16(layer);
+            assert_eq!(
+                kr, ko,
+                "f16 key cache must round-trip exactly (layer {layer})"
+            );
+            assert_eq!(
+                vr, vo,
+                "f16 value cache must round-trip exactly (layer {layer})"
+            );
+        }
+    }
+
+    /// Corruption backstop: restoring an `AttentionF16` snapshot into an
+    /// f32-configured state must panic (not silently write u16 bytes into the
+    /// f32 slots). The lfm2 compatibility gate is the primary guard; this
+    /// asserts the `restore()` backstop behind it.
+    #[test]
+    #[should_panic(expected = "AttentionF16 snapshot restored into a non-f16 state")]
+    fn restore_f16_snapshot_into_f32_state_panics() {
+        let cfg = tiny_config(2, 16); // layer 0 attention, layer 1 conv
+        let kv_dim = cfg.kv_heads_per_layer[0] * cfg.head_dim;
+        let mut f16_state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::F16).unwrap();
+        f16_state.append_kv_f16(0, &vec![0.5f32; kv_dim], &vec![-0.5f32; kv_dim]);
+        f16_state.seq_len = 1;
+        let snap = f16_state.snapshot().expect("f16 snapshots");
+
+        let mut f32_state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::None).unwrap();
+        f32_state.restore(&snap); // must panic on the AttentionF16 arm's kv_f16 assert
+    }
+
+    /// Reverse backstop: restoring an f32 `Attention` snapshot into an
+    /// f16-configured state must panic (else the f16 session gets f32 slots
+    /// populated while it reads the empty f16 slots — silent garbage).
+    #[test]
+    #[should_panic(expected = "f32 Attention snapshot restored into an f16 state")]
+    fn restore_f32_snapshot_into_f16_state_panics() {
+        let cfg = tiny_config(2, 16);
+        let kv_dim = cfg.kv_heads_per_layer[0] * cfg.head_dim;
+        let mut f32_state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::None).unwrap();
+        f32_state.append_kv(0, &vec![0.5f32; kv_dim], &vec![-0.5f32; kv_dim]);
+        f32_state.seq_len = 1;
+        let snap = f32_state.snapshot().expect("f32 snapshots");
+
+        let mut f16_state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::F16).unwrap();
+        f16_state.restore(&snap); // must panic on the Attention arm's !kv_f16 assert
+    }
+
+    /// f16 snapshot survives the disk (flatbuffer `type_tag = 3`) round-trip:
+    /// `save_cold` → `find_cold_prefix` returns the same `AttentionF16` bytes.
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn f16_snapshot_disk_round_trips() {
+        let cfg = tiny_config(2, 16);
+        let kv_dim = cfg.kv_heads_per_layer[0] * cfg.head_dim;
+        let mut state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::F16).unwrap();
+        let k: Vec<f32> = (0..kv_dim).map(|i| 0.1 * i as f32 - 0.3).collect();
+        let v: Vec<f32> = k.iter().map(|x| -x).collect();
+        state.append_kv_f16(0, &k, &v);
+        state.seq_len = 1;
+        let snap = state.snapshot().expect("f16 snapshots");
+        let (k0, v0) = match &snap.layers[0] {
+            LayerSnapshot::AttentionF16 { k_data, v_data } => (k_data.clone(), v_data.clone()),
+            _ => panic!("source layer 0 should be AttentionF16"),
+        };
+
+        let dir = std::env::temp_dir().join(format!("cera_f16_disk_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = KvPrefixCache::new(KvCacheConfig::default(), &cfg, "cpu:test");
+        // The cache requires seq_len == token count; we appended one token.
+        let tokens = [42u32];
+        cache.save_cold(&dir, &tokens, &snap);
+        let restored = cache
+            .find_cold_prefix(&dir, &tokens)
+            .expect("disk round-trip must find the f16 entry");
+        assert_eq!(restored.seq_len, snap.seq_len);
+        match &restored.layers[0] {
+            LayerSnapshot::AttentionF16 { k_data, v_data } => {
+                assert_eq!(*k_data, k0, "f16 key bytes must survive disk round-trip");
+                assert_eq!(*v_data, v0, "f16 value bytes must survive disk round-trip");
+            }
+            _ => panic!("restored layer 0 should be AttentionF16 (type_tag 3)"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After an f16 `n_keep` shift, a shifted K head decodes (within f16
+    /// tolerance) to the value a fresh RoPE at the new position would produce
+    /// from the same raw K — the widen→rotate→narrow path composes the delta
+    /// rotation exactly like the f32 shift does. V is drained but unrotated.
+    #[test]
+    fn f16_shift_reencodes_like_fresh() {
+        let head_dim = 16usize;
+        let n_kv_heads = 2usize;
+        let kv_dim = n_kv_heads * head_dim;
+        let seq_len = 12usize;
+        let n_keep = 3usize;
+        let shift = 4usize;
+        let freq_base = 10_000.0f32;
+
+        // A 2-layer config: layer 0 attention, layer 1 conv. head_dim=16 →
+        // hidden_size = n_heads(4) * head_dim = 64.
+        let mut cfg = tiny_config(2, 64);
+        cfg.head_dim = head_dim;
+        cfg.n_kv_heads = n_kv_heads;
+        cfg.kv_heads_per_layer = vec![n_kv_heads, 0];
+        cfg.max_seq_len = 64;
+
+        let mut state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::F16).unwrap();
+
+        // Raw (pre-RoPE) K per (head, dim); the same raw is used at every
+        // position so the oracle is a pure function of the new position.
+        let raw = |h: usize, d: usize| 0.1 * (h as f32) + 0.01 * (d as f32);
+
+        // Fill each position's K with the raw values rotated for that position
+        // (mirroring the forward pass), and V with the unrotated raw.
+        for t in 0..seq_len {
+            let mut k = vec![0.0f32; kv_dim];
+            let mut v = vec![0.0f32; kv_dim];
+            for h in 0..n_kv_heads {
+                let mut head: Vec<f32> = (0..head_dim).map(|d| raw(h, d)).collect();
+                crate::backend::cpu::apply_rope_delta_to_head(
+                    &mut head, t as i32, head_dim, freq_base,
+                );
+                for d in 0..head_dim {
+                    k[h * head_dim + d] = head[d];
+                    v[h * head_dim + d] = raw(h, d);
+                }
+            }
+            state.append_kv_f16(0, &k, &v);
+        }
+        state.seq_len = seq_len;
+
         state.shift_kv_with_rope(
-            0,
-            1,
-            cfg.rope_theta,
-            cfg.head_dim,
-            &n_kv,
+            n_keep,
+            shift,
+            freq_base,
+            head_dim,
+            &cfg.kv_heads_per_layer,
             crate::backend::cpu::RopeType::Neox,
             None,
         );
+
+        let new_seq_len = seq_len - shift;
+        assert_eq!(state.seq_len, new_seq_len);
+        let (k16, v16) = state.kv_cache_f16(0);
+        assert_eq!(k16.len(), new_seq_len * kv_dim);
+
+        // Tail cells: the cell now at t_new was at t_old = t_new + shift; its
+        // stored K must decode to a fresh RoPE for t_new. V stays unrotated.
+        for t_new in n_keep..new_seq_len {
+            for h in 0..n_kv_heads {
+                let mut oracle: Vec<f32> = (0..head_dim).map(|d| raw(h, d)).collect();
+                crate::backend::cpu::apply_rope_delta_to_head(
+                    &mut oracle,
+                    t_new as i32,
+                    head_dim,
+                    freq_base,
+                );
+                for (d, &oracle_d) in oracle.iter().enumerate() {
+                    let idx = t_new * kv_dim + h * head_dim + d;
+                    let got_k = half::f16::from_bits(k16[idx]).to_f32();
+                    assert!(
+                        (got_k - oracle_d).abs() < 1e-2,
+                        "K reencode drift at t_new={t_new} h={h} d={d}: {got_k} vs {oracle_d}"
+                    );
+                    let got_v = half::f16::from_bits(v16[idx]).to_f32();
+                    assert!(
+                        (got_v - raw(h, d)).abs() < 1e-2,
+                        "V must stay unrotated at t_new={t_new} h={h} d={d}: {got_v} vs {}",
+                        raw(h, d)
+                    );
+                }
+            }
+        }
     }
 
     /// `clear_for_reuse` zeroes seq_len and empties KV/conv buffers while KEEPING

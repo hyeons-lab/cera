@@ -3589,6 +3589,18 @@ impl MetalLfm2Model {
                          a cross-backend cache-namespace leak."
                     );
                 }
+                LayerSnapshot::AttentionF16 { .. } => {
+                    // Unreachable for the same reason as AttentionCompressed:
+                    // f16 KV is a CPU-only `KvCompression::F16` mode, and the
+                    // `"metal:"` vs `"cpu:"` model_id fingerprint namespaces
+                    // keep a Metal session from loading a CPU-written f16 entry.
+                    panic!(
+                        "MetalLfm2Model::restore_state_locked received an f16 \
+                         snapshot at layer {i}; Metal stores its own f16 KV in \
+                         tag-0 Attention snapshots. This indicates a \
+                         cross-backend cache-namespace leak."
+                    );
+                }
             }
         }
         self.state

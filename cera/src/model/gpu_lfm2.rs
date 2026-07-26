@@ -4532,6 +4532,17 @@ impl GpuLfm2Model {
                          a cross-backend cache-namespace leak."
                     );
                 }
+                LayerSnapshot::AttentionF16 { .. } => {
+                    // Unreachable for the same reason as AttentionCompressed:
+                    // f16 KV is CPU-only, and the `"wgpu:"` vs `"cpu:"` model_id
+                    // fingerprint namespaces prevent a wgpu session from loading
+                    // a CPU-written f16 entry. Panic on the hard error path.
+                    panic!(
+                        "GpuLfm2Model::restore_state_locked received an f16 \
+                         snapshot at layer {i}; wgpu uses f32 KV. This indicates \
+                         a cross-backend cache-namespace leak."
+                    );
+                }
             }
         }
         self.gpu_state
