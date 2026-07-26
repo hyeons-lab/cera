@@ -720,8 +720,9 @@ pub(crate) mod neon {
     /// 0..15, no zero-point offset). Dotting a weight row with activations x
     /// gives, per sub-block s: `d·sc_s·Σ(q·xq) − dmin·mn_s·Σ(xq)`, then scaled by
     /// the Q8_0 input scale `xs[s]`. Q8_0 input blocks are 32-wide, aligning 1:1
-    /// with the sub-blocks; `Σ(xq)` (the min term) is `vdotq_s32` against an
-    /// all-ones vector. The nibble/scale layout mirrors `vec_dot_q4_k_m_f32`:
+    /// with the sub-blocks; `Σ(xq)` (the min term) depends only on the activation,
+    /// so it is precomputed once per call via `q8_0_col_sums` rather than re-derived
+    /// per weight row. The nibble/scale layout mirrors `vec_dot_q4_k_m_f32`:
     /// 4 groups of 64 values over 32 qs bytes, low nibble → sub-block 2j, high
     /// nibble → sub-block 2j+1.
     #[target_feature(enable = "neon,dotprod")]
@@ -749,10 +750,21 @@ pub(crate) mod neon {
             let xq_base = x_quants.as_ptr() as usize;
             let xs_base = x_scales.as_ptr() as usize;
 
+            // Precompute the per-32-block activation quant sums `Σ x_quants[b*32..]`
+            // once via the shared `q8_0_col_sums` helper (a single activation column,
+            // `n = 1`). These are the min term's `Σxq` factor, which depends only on the
+            // activation — not the weight row — so hoisting them out of the row loop
+            // removes the per-row `vdotq_s32(ones, xq)` that otherwise re-derives Σxq for
+            // every one of the `m` rows (half the inner-loop dots). The stored value is
+            // the integer sum, so the float expression below is byte-for-byte the
+            // original with `sx_*` merely hoisted — keeping the GEMV bit-exact against
+            // the batched GEMM (a tested invariant), which uses the same helper.
+            let x_qsums = q8_0_col_sums(x_quants, 1, k);
+            let xqs_base = x_qsums.as_ptr() as usize;
+
             let compute_row = move |(i, yi): (usize, &mut f32)| unsafe {
                 let row_start = i * row_bytes;
                 let mask_0f = vdupq_n_u8(0x0F);
-                let ones = vdupq_n_s8(1);
                 let z = vdupq_n_s32(0);
                 let mut sumf = 0.0f32;
 
@@ -790,9 +802,11 @@ pub(crate) mod neon {
                         // Σ(q·xq) per sub-block (integer dot).
                         let dp_lo = vaddvq_s32(vdotq_s32(vdotq_s32(z, wlo0, xlo0), wlo1, xlo1));
                         let dp_hi = vaddvq_s32(vdotq_s32(vdotq_s32(z, whi0, xhi0), whi1, xhi1));
-                        // Σ(xq) per sub-block (min term), via dot with all-ones.
-                        let sx_lo = vaddvq_s32(vdotq_s32(vdotq_s32(z, ones, xlo0), ones, xlo1));
-                        let sx_hi = vaddvq_s32(vdotq_s32(vdotq_s32(z, ones, xhi0), ones, xhi1));
+
+                        // Σ(xq) per sub-block (min term), precomputed once per
+                        // activation block above (replaces the per-row all-ones dot).
+                        let sx_lo = *(xqs_base as *const i32).add(xq_off / 32 + sblo);
+                        let sx_hi = *(xqs_base as *const i32).add(xq_off / 32 + sbhi);
 
                         let xs_lo = *(xs_base as *const f32).add((xq_off + sblo * 32) / 32);
                         let xs_hi = *(xs_base as *const f32).add((xq_off + sbhi * 32) / 32);
