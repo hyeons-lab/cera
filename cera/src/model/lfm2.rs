@@ -2861,9 +2861,9 @@ impl Model for Lfm2Model {
     }
 
     fn supports_kv_shift(&self) -> bool {
-        // CPU LFM2 implements shift with RoPE re-rotation. Metal's
-        // override stays at the trait default (false) until its
-        // GPU-side shift shader lands.
+        // CPU LFM2 implements shift with RoPE re-rotation. The wgpu and
+        // Metal overrides mirror this with a GPU-side shift shader, and
+        // report `false` only while a TurboQuant cache is active.
         true
     }
 

@@ -104,6 +104,15 @@ fn lcm_u64(a: u64, b: u64) -> u64 {
     (a / gcd_u64(a, b)) * b
 }
 
+/// Byte size of a `rows x cols` f32 KV slab, widened to `u64` before multiplying.
+///
+/// This backend also builds for `wasm32`, where `usize` is 32 bits and a large
+/// `max_seq_len x kv_dim x 4` wraps, silently sizing the cache to the wrapped
+/// remainder.
+fn kv_slab_bytes(rows: usize, cols: usize) -> u64 {
+    rows as u64 * cols as u64 * 4
+}
+
 fn f32_binding(buffer: &wgpu::Buffer, len_floats: u64) -> wgpu::BindingResource<'_> {
     let bytes = len_floats
         .checked_mul(std::mem::size_of::<f32>() as u64)
@@ -1027,7 +1036,8 @@ impl GpuLfm2Model {
         // already allocate `max_kv_dim` floats, so an attention-free
         // (`max_kv_dim == 0`) config would fail there first; LFM2 always has
         // attention layers, so `max_kv_dim` is never 0 in practice anyway.
-        let kv_shift_scratch = f(max_seq_len * max_kv_dim, "kv_shift_scratch");
+        let kv_shift_scratch =
+            ctx.create_storage_rw(kv_slab_bytes(max_seq_len, max_kv_dim), "kv_shift_scratch");
         let attn_out_buf = f(q_dim, "attn_out");
         let logits_buf = f(config.vocab_size, "logits");
         let conv_proj_buf = f(3 * hs, "conv_proj");
@@ -2073,8 +2083,11 @@ impl GpuLfm2Model {
             }
             let n_kv_heads = cfg.kv_heads_per_layer[layer_idx];
             let kv_dim = n_kv_heads * head_dim;
-            // f32 only — `Model::supports_kv_shift` reports `false` under
-            // TurboQuant, so this path is never reached with a compressed cache.
+            // f32 only. `Session::can_shift` keeps a compressed cache out — it
+            // needs both `supports_kv_shift` (false while `self.tq` is set) and
+            // `!state.is_compressed()`, the latter also covering a request this
+            // backend downgraded but the state-side cache compressed anyway.
+            // `shift_kv` re-asserts the same condition as a backstop.
             let (k_cache, v_cache) = self.f32_kv()[layer_idx]
                 .as_ref()
                 .expect("attention layer missing GPU kv_caches entry");
@@ -2207,8 +2220,9 @@ impl GpuLfm2Model {
             for i in 0..cfg.n_layers {
                 if cfg.block_types[i] == BlockType::Attention {
                     let kv_dim = cfg.kv_heads_per_layer[i] * head_dim;
-                    let k = f(max_seq_len * kv_dim, &format!("hs.l{i}.k"));
-                    let v = f(max_seq_len * kv_dim, &format!("hs.l{i}.v"));
+                    let bytes = kv_slab_bytes(max_seq_len, kv_dim);
+                    let k = self.ctx.create_storage_rw(bytes, &format!("hs.l{i}.k"));
+                    let v = self.ctx.create_storage_rw(bytes, &format!("hs.l{i}.v"));
                     kv.push(Some((k, v)));
                     conv.push(None);
                 } else {
@@ -2243,7 +2257,7 @@ impl GpuLfm2Model {
             for i in 0..cfg.n_layers {
                 if cfg.block_types[i] == BlockType::Attention {
                     let kv_dim = cfg.kv_heads_per_layer[i] * head_dim;
-                    let bytes = (max_seq_len * kv_dim * 4) as u64;
+                    let bytes = kv_slab_bytes(max_seq_len, kv_dim);
                     kv.push(Some((
                         self.ctx.create_storage_rw(bytes, &format!("l{i}.k_cache")),
                         self.ctx.create_storage_rw(bytes, &format!("l{i}.v_cache")),
@@ -5184,12 +5198,12 @@ impl Model for GpuLfm2Model {
             assert!(self.tq.set(cache).is_ok(), "tq cache set race");
         }
         let _ = self.kv_mode.set(want);
-        // Tag with the mode the cache will actually hold, not the one requested: a
-        // TurboQuant request this backend can't serve resolved to f32 above, and
-        // must share the f32 namespace it is now writing into.
-        // Tag with the mode the cache will actually hold. `resolved_for` covers the
-        // head_dim downgrade; `want.is_none()` additionally covers the GPU-only
-        // restrictions (single-sided TurboQuant), which also land on f32 KV here.
+        // Tag with the mode the cache will actually hold, not the one requested, so
+        // a downgraded request shares the f32 namespace it is now writing into.
+        // Every downgrade — an unsupported `head_dim` as well as the GPU-only
+        // restrictions (single-sided TurboQuant) — leaves `want` as `None` and lands
+        // in the f32 arm below; `resolved_for` is then a no-op, since
+        // `want.is_some()` already implies the `head_dim` it re-checks.
         let _ = self.kv_cache_tag.set(if want.is_some() {
             compression.resolved_for(&self.config).cache_tag()
         } else {
@@ -5248,9 +5262,11 @@ impl Model for GpuLfm2Model {
             n_keep + shift <= cur_len,
             "shift range out of bounds: n_keep={n_keep} + shift={shift} > seq_len={cur_len}",
         );
-        // The wgpu KV cache is dense f32 — TurboQuant compression is a CPU-only
-        // feature, so a compressed state should never reach this backend. Match
-        // the Metal gate so a caller branching on the flag surfaces fast.
+        // Shifting a compressed cache is not implemented. `Session::can_shift`
+        // gates it on `state.is_compressed()` — true when *either* side is
+        // packed — which is the condition re-asserted here. `supports_kv_shift`
+        // above is narrower: it tracks `self.tq`, which stays empty for a
+        // request this backend downgraded but the state-side cache compressed.
         assert!(
             !state.is_compressed(),
             "shift_kv called on a TurboQuant-compressed state; \

@@ -434,8 +434,9 @@ pub trait Model: Send + Sync {
     }
 
     /// Whether this model/backend supports TurboQuant KV cache compression.
-    /// Used by the CLI to decide whether to request compression or fall back
-    /// to f32. On CPU, TurboQuant is fully driven by `KvCompression` on the
+    /// Used by the CLI to decide whether to request compression or fall back to
+    /// the backend's uncompressed KV (f32 on CPU and wgpu, f16 on native
+    /// Metal). On CPU, TurboQuant is fully driven by `KvCompression` on the
     /// `InferenceState`; the GPU backends additionally need
     /// [`Self::configure_kv_compression`] to build their GPU-resident
     /// compressed cache. Implemented by the CPU `Lfm2Model` and both GPU
@@ -466,8 +467,9 @@ pub trait Model: Send + Sync {
     ///
     /// A request the backend can't serve — a single-sided TurboQuant debug mode,
     /// or an incompatible `head_dim` — is NOT an error: the backend logs a
-    /// warning and stays on f32 KV, matching the CPU's silent fallback for a
-    /// non-power-of-two `head_dim`.
+    /// warning and stays on its uncompressed KV (f32 on wgpu, f16 on native
+    /// Metal), matching the CPU's silent fallback for a non-power-of-two
+    /// `head_dim`.
     fn configure_kv_compression(
         &self,
         _compression: &crate::kv_cache::KvCompression,
@@ -479,7 +481,8 @@ pub trait Model: Send + Sync {
     /// forward pass. Like `turboquant_supported`, this is driven by
     /// `KvCompression` on the `InferenceState`; the model just needs to read/
     /// write the `*_f16` slots. Currently the CPU dense transformer
-    /// (`LlamaModel`) and `Lfm2Model` do; the CLI falls back to f32 KV otherwise.
+    /// (`LlamaModel`) and `Lfm2Model` do; otherwise the CLI falls back to the
+    /// backend's uncompressed KV (f32 on CPU and wgpu, f16 on native Metal).
     fn f16_kv_supported(&self) -> bool {
         false
     }

@@ -3423,10 +3423,11 @@ impl Model for MetalLfm2Model {
             assert!(self.tq.set(cache).is_ok(), "tq cache set race");
         }
         let _ = self.kv_mode.set(want);
-        // Tag with the mode the cache will actually hold, not the one requested:
-        // `resolved_for` covers the head_dim downgrade; `want.is_none()`
-        // additionally covers the GPU-only restrictions (single-sided
-        // TurboQuant), which also land on f16 KV here.
+        // Tag with the mode the cache will actually hold, not the one requested.
+        // Every downgrade — an unsupported `head_dim` as well as the GPU-only
+        // restrictions (single-sided TurboQuant) — leaves `want` as `None` and
+        // lands on f16 KV here; `resolved_for` is then a no-op, since
+        // `want.is_some()` already implies the `head_dim` it re-checks.
         //
         // Note the f16 case takes `KvCompression::None`'s empty tag, not
         // `F16`'s: this backend's *uncompressed* cache has always been f16, so
@@ -3627,14 +3628,15 @@ impl Model for MetalLfm2Model {
             n_keep + shift <= cur_len,
             "shift range out of bounds: n_keep={n_keep} + shift={shift} > seq_len={cur_len}",
         );
-        // TurboQuant-compressed caches aren't supported on the Metal
-        // path either — the GPU buffer holds dense f16 K/V, but the
-        // Session-side compression flag still has to match the CPU
-        // gate semantics for caller code that branches on it.
+        // Shifting a compressed cache is not implemented. `Session::can_shift`
+        // gates it on `state.is_compressed()` — true when *either* side is
+        // packed — which is the condition re-asserted here. `supports_kv_shift`
+        // above is narrower: it tracks `self.tq`, which stays empty for a
+        // request this backend downgraded but the state-side cache compressed.
         assert!(
             !state.is_compressed(),
             "shift_kv called on a TurboQuant-compressed state; \
-             shifting compressed caches is not yet supported on Metal"
+             shifting compressed caches is not supported on the Metal backend"
         );
 
         let cfg = &self.config;

@@ -203,8 +203,7 @@ single-sided debug modes `tq3-keys` / `tq3-values` fall back to the backend's
 uncompressed KV there (f32 on wgpu, f16 on Metal) with a warning. `--n-keep`
 context shift is not supported with any TurboQuant mode on any backend.
 
-See the [`cera` crate README](cera/README.md) and `cera/src/turboquant.rs` for the
-algorithm (PolarQuant + QJL) and the full compression/quality tables.
+See `cera/src/turboquant.rs` for the algorithm (PolarQuant + QJL).
 
 ## Quick start
 

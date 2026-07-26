@@ -409,8 +409,9 @@ enum Command {
         /// `--n-keep` >= `--context-size` is a no-op) and (b) the prompt
         /// itself fits (overflow still occurs if the raw prompt is
         /// larger than the window). Not supported with any TurboQuant
-        /// KV-cache mode (`tq3`, `tq3-keys`, `tq3-values`) — shifting
-        /// compressed caches lands in a follow-up.
+        /// KV-cache mode (`tq3`, `tq3-keys`, `tq3-values`) — shifting a
+        /// compressed cache is not implemented, and the gate trips when
+        /// either side is compressed.
         #[arg(long, default_value_t = 0)]
         n_keep: u32,
 
@@ -1745,15 +1746,16 @@ fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<()> {
 /// Modes:
 /// - `f32` / `none`: uncompressed (default)
 /// - `f16`: half-precision KV cache (2 bytes/elem, ~2× less KV bandwidth at
-///   decode). CPU dense-transformer path; falls back to f32 on other models.
+///   decode). CPU LFM2 and dense-transformer paths; a model that doesn't
+///   implement it falls back to the backend's uncompressed KV.
 /// - `tq3` / `turboquant`: TurboQuant on both keys (3-bit) and values (2-bit)
 /// - `tq3-keys`: TurboQuant keys only (values stay f32) — debugging, CPU only
 /// - `tq3-values`: TurboQuant values only (keys stay f32) — debugging, CPU only
 ///
 /// The single-sided modes exist to isolate how much drift each side contributes.
-/// The GPU backends implement only the both-sides mode and fall back to f32 KV for
-/// the other two (with a warning from the backend), so use `--device cpu` when
-/// bisecting drift.
+/// The GPU backends implement only the both-sides mode and fall back to their
+/// uncompressed KV for the other two — f32 on wgpu, f16 on native Metal (with a
+/// warning from the backend) — so use `--device cpu` when bisecting drift.
 fn setup_kv_compression(
     model: &dyn cera::model::Model,
     kv_cache_mode: &str,
@@ -1769,7 +1771,8 @@ fn setup_kv_compression(
                 return Ok(KvCompression::F16);
             }
             eprintln!(
-                "warning: f16 KV not supported by this model/backend; falling back to f32 KV"
+                "warning: this model/backend doesn't honor the f16 KV \
+                 setting; using its own uncompressed KV instead"
             );
             return Ok(KvCompression::None);
         }

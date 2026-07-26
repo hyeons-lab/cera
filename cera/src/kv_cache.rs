@@ -77,24 +77,24 @@ fn zeroed_f32(len: usize) -> Result<Vec<f32>, CeraError> {
 /// caches, and the scratch buffers. **No separate `enable_turboquant` call on
 /// the model is required.**
 ///
-/// TurboQuant is honored by the CPU backend (`Lfm2Model`) and by wgpu
-/// (`GpuLfm2Model`). The GPU path additionally needs
-/// [`crate::model::Model::configure_kv_compression`] — which `Session` calls —
-/// to build its GPU-resident compressed cache, and it only implements the
-/// both-sides mode: a single-sided (debug) request, or a `head_dim` its kernels
-/// can't handle, warns and falls back to f32 KV. The native Metal backend has the
-/// kernels but does not route its KV through them yet, so this setting is still
-/// ignored there.
+/// TurboQuant is honored by the CPU backend (`Lfm2Model`) and by both GPU
+/// backends (`GpuLfm2Model` and `MetalLfm2Model`). The GPU paths additionally
+/// need [`crate::model::Model::configure_kv_compression`] — which `Session`
+/// calls — to build their GPU-resident compressed caches, and they only
+/// implement the both-sides mode: a single-sided (debug) request, or a
+/// `head_dim` their kernels can't handle, warns and falls back to the backend's
+/// uncompressed KV (f32 on wgpu, f16 on Metal).
 #[derive(Clone, Debug, Default)]
 pub enum KvCompression {
-    /// No compression — keys and values stored as f32 (default).
+    /// No compression — the backend's uncompressed KV: f32 on CPU and wgpu,
+    /// f16 on native Metal, whose cache has always been half precision.
     #[default]
     None,
     /// f16 KV cache — keys and values stored as IEEE-754 half precision
     /// (2 bytes/elem instead of 4), halving the KV bytes streamed per decode
     /// token. Near-lossless (f16 has 10 mantissa bits; attention is robust to
-    /// it — this is what llama.cpp uses by default). CPU decode path only;
-    /// accumulation stays f32 for softmax stability.
+    /// it — this is what llama.cpp uses by default). CPU LFM2 and dense
+    /// transformer paths; accumulation stays f32 for softmax stability.
     F16,
     /// TurboQuant compression. Keys and values can be toggled independently
     /// for debugging (e.g. to isolate how much drift each side contributes).
@@ -177,9 +177,11 @@ impl KvCompression {
     /// and separating them would only waste entries.
     ///
     /// Callers must tag with the mode their state actually ended up in, not the one
-    /// requested — a backend that falls back to f32 (unsupported `head_dim`, or a
-    /// single-sided request on GPU) must use the f32 tag so it shares the f32
-    /// namespace it is now writing into.
+    /// requested — a backend that falls back to its uncompressed KV (unsupported
+    /// `head_dim`, or a single-sided request on GPU) must use the uncompressed
+    /// tag so it shares the namespace it is now writing into. Metal's
+    /// uncompressed cache is f16 but still takes `None`'s tag; see the note in
+    /// `MetalLfm2Model::configure_kv_compression`.
     pub fn cache_tag(&self) -> String {
         match self {
             Self::None => String::new(),
@@ -1009,7 +1011,7 @@ impl InferenceState {
         assert!(
             !self.is_compressed(),
             "shift_kv_with_rope called on a TurboQuant-compressed state; \
-             shifting compressed caches is not yet supported"
+             shifting compressed caches is not supported"
         );
         assert_eq!(
             n_kv_heads_per_layer.len(),

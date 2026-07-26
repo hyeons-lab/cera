@@ -839,6 +839,9 @@ impl SessionConfig {
     ///   Setting both gets a warning at session creation and the
     ///   `nKeep` value is ignored on KV overflow (the cache
     ///   overflows hard instead of shifting). Pick one.
+    /// - This config drives the CPU session only. `WebGpuSession`
+    ///   takes no [`SessionConfig`], so the WebGPU path always
+    ///   runs uncompressed f32 KV regardless of this setting.
     ///
     /// Setting this consumes the JS-side `TurboQuantConfig`
     /// handle (wasm-bindgen's `Option<T>` parameter shape). Read

@@ -487,8 +487,8 @@ impl Session {
         // still use this to namespace their prefix cache by mode. It runs BEFORE
         // the capability warnings below
         // because a backend's `supports_kv_shift()` can depend on the configured
-        // mode (wgpu reports `false` once TurboQuant is active), and it must
-        // precede the first forward pass either way.
+        // mode (wgpu and Metal both report `false` once TurboQuant is active),
+        // and it must precede the first forward pass either way.
         model.configure_kv_compression(&config.kv_compression)?;
 
         // Likewise, `n_keep > 0` + a TurboQuant-compressed KV cache is a
@@ -502,25 +502,25 @@ impl Session {
                 target: "cera::session",
                 n_keep = config.n_keep,
                 "n_keep configured alongside TurboQuant KV compression; \
-                 shift not yet supported for compressed caches, so overflow \
-                 will return ContextOverflow. Use f32 or f16 KV to enable \
-                 n_keep."
+                 shifting compressed caches is not implemented, so overflow \
+                 will return ContextOverflow. The gate trips when either side \
+                 is compressed. Use f32 or f16 KV to enable n_keep."
             );
         }
-        // Backend must opt in to shift (CPU LFM2 today; Metal is a
-        // follow-up). If the user set `n_keep > 0` on a backend that
-        // doesn't implement shift, overflow still returns
-        // ContextOverflow — tell them why instead of letting them
-        // discover it the hard way.
+        // Backend must opt in to shift. CPU, wgpu and Metal all do for RoPE
+        // architectures, so in practice this fires on a GPU backend whose
+        // TurboQuant cache makes `supports_kv_shift()` report `false`. If the
+        // user set `n_keep > 0` there, overflow still returns ContextOverflow —
+        // tell them why instead of letting them discover it the hard way.
         if config.n_keep > 0 && !model.supports_kv_shift() {
             tracing::warn!(
                 target: "cera::session",
                 n_keep = config.n_keep,
                 architecture = model_cfg.architecture.as_str(),
                 "n_keep configured but this backend doesn't support KV shift; \
-                 overflow will still return ContextOverflow. CPU backend \
-                 (BackendPreference::Cpu) supports shift today; Metal / GPU \
-                 paths land in a follow-up."
+                 overflow will still return ContextOverflow. CPU, wgpu and \
+                 Metal all implement the shift for RoPE architectures, so the \
+                 usual cause is a TurboQuant-compressed cache."
             );
         }
 
