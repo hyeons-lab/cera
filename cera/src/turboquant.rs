@@ -1358,9 +1358,12 @@ pub fn head_dim_supported(head_dim: usize) -> bool {
 /// The subset of [`crate::kv_cache::KvCompression::TurboQuant`] the GPU backends implement.
 ///
 /// Only "both sides compressed" is supported. `keys`/`values` exist on the CPU
-/// variant as debugging knobs for isolating which side contributes drift;
-/// honoring them here would mean binding the f32 caches alongside the compressed
-/// ones, which overflows the 8-storage-buffer floor that mobile adapters sit at.
+/// variant as debugging knobs for isolating which side contributes drift; there are
+/// no single-sided GPU kernels, so honoring them would mean binding an uncompressed
+/// cache alongside the compressed one for the other side. On wgpu that overflows the
+/// 8-storage-buffer floor mobile adapters sit at, which is what originally ruled it
+/// out; Metal's binding budget is far higher, so there the reason is simply that the
+/// kernels don't exist rather than that they couldn't be bound.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TqMode {
     /// Seeds the per-layer rotations as `seed ^ layer_idx`, matching the CPU.
@@ -1370,8 +1373,9 @@ pub struct TqMode {
 impl TqMode {
     /// The GPU-supported mode for `compression`, or `None` when the compressed
     /// path can't serve it — a non-TurboQuant mode, a single-sided (debug)
-    /// TurboQuant mode, or an incompatible `head_dim`. `None` means "run the f32
-    /// path"; callers warn so a silently-ignored request is visible.
+    /// TurboQuant mode, or an incompatible `head_dim`. `None` means "run the
+    /// backend's uncompressed path" (f32 on wgpu, f16 on Metal); callers warn so a
+    /// silently-ignored request is visible.
     pub fn from_compression(
         compression: &crate::kv_cache::KvCompression,
         head_dim: usize,
@@ -1390,14 +1394,18 @@ impl TqMode {
 /// Human-readable name for a configured mode, for the
 /// `CeraError::KvCompressionConflict` message.
 ///
-/// `cfg`-gated on `gpu`: the wgpu backend is its only caller, so without this a
-/// default or `--features metal` build (which is what the shipped iOS/macOS
-/// xcframework is compiled with) would warn that it is never used.
-#[cfg(feature = "gpu")]
+/// `cfg`-gated on the two GPU backends that call it: a default build (no GPU
+/// feature) would otherwise warn that it is never used.
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
 pub(crate) fn describe_kv_mode(mode: &Option<TqMode>) -> String {
     match mode {
         Some(m) => format!("turboquant(seed={})", m.seed),
-        None => "f32".to_string(),
+        // Deliberately not "f32": the uncompressed cache is f32 on wgpu but f16 on
+        // Metal, and this string goes into a user-facing conflict error.
+        None => "uncompressed".to_string(),
     }
 }
 
@@ -1454,6 +1462,64 @@ impl TqLayout {
         let jl_off = vecs * self.polar_words;
         (jl_off, jl_off + vecs * self.jl_words)
     }
+
+    /// `u32`-word offset of the value cache's norm region, given `vecs` slots.
+    /// The value layout is `[polar | norms]`, so this is the whole polar region.
+    ///
+    /// Trivial, but it lived open-coded as `vecs * polar_words` at four sites
+    /// across the two GPU backends' snapshot and restore paths. A layout change
+    /// has to be reflected in every one of them, and getting it wrong produces a
+    /// plausible-but-wrong cache rather than a compile error — so it belongs next
+    /// to [`Self::key_regions`], which owns the same arithmetic for keys.
+    pub fn value_norm_offset(&self, vecs: usize) -> usize {
+        vecs * self.polar_words
+    }
+
+    /// A `u32`-word count as a byte count.
+    ///
+    /// Callers guard the multiply that *produced* `words` (via [`Self::key_words`]
+    /// / [`Self::value_words`], which use `checked_elems`), which is the one that
+    /// can realistically overflow. This `* 4` is unguarded: it would need `words >
+    /// u64::MAX / 4`, unreachable for any `n_kv_heads × max_seq_len × head_dim` a
+    /// device could address, and `usize` bounds `words` well below it on every
+    /// supported target.
+    pub fn words_to_bytes(words: usize) -> u64 {
+        words as u64 * 4
+    }
+
+    /// Do a decoded blob pair's shapes match this layout and a layer's KV head
+    /// count? `Some(seq_len)` when they do.
+    ///
+    /// Shared by both GPU backends' `restore_layer`, which return `None` — leaving
+    /// the cache untouched — so the caller can treat a mismatch as a prefix-cache
+    /// miss rather than restore a cache the kernels will misread.
+    pub fn blobs_match(
+        &self,
+        keys: &CompressedKeyCache,
+        values: &CompressedValueCache,
+        n_kv_heads: usize,
+        max_seq_len: usize,
+    ) -> Option<usize> {
+        let seq_len = keys.seq_len();
+        let ok = keys.head_dim == self.head_dim
+            && values.head_dim == self.head_dim
+            && keys.n_kv_heads == n_kv_heads
+            && values.n_kv_heads == n_kv_heads
+            && values.seq_len() == seq_len
+            && seq_len <= max_seq_len;
+        ok.then_some(seq_len)
+    }
+}
+
+/// The typed error a GPU backend returns when asked for a `head_dim` the
+/// compressed kernels can't serve. One definition so the two backends' messages
+/// can't drift apart, and so [`head_dim_supported`]'s conditions are stated in
+/// exactly one place.
+pub fn unsupported_head_dim(head_dim: usize) -> CeraError {
+    CeraError::Backend(format!(
+        "TurboQuant does not support head_dim {head_dim} (needs a power of two \
+         <= 128 that is a multiple of 32)"
+    ))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

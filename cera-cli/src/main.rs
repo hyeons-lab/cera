@@ -1791,16 +1791,23 @@ fn setup_kv_compression(
         // per-mode one: the GPU backends implement only the both-sides mode. State
         // that as a capability rather than a fallback warning — on `--device cpu`,
         // which is where these modes are meant to be used, nothing falls back.
+        //
+        // The fallback KV type is deliberately left unnamed here: it is f32 on CPU
+        // and wgpu but f16 on the native Metal backend, and this helper doesn't know
+        // which backend resolved. The backend logs the concrete type itself when it
+        // downgrades a request.
         if !(keys && values) {
             eprintln!(
                 "note: single-sided TurboQuant runs on the CPU backend only; \
-                 the GPU backends support `tq3` (both sides) and use f32 KV for this mode"
+                 the GPU backends support `tq3` (both sides) and use their \
+                 uncompressed KV for this mode"
             );
         }
         Ok(KvCompression::TurboQuant { seed, keys, values })
     } else {
         eprintln!(
-            "warning: TurboQuant not supported by this model/backend; falling back to f32 KV"
+            "warning: TurboQuant not supported by this model/backend; \
+             falling back to uncompressed KV"
         );
         Ok(KvCompression::None)
     }

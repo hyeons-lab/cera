@@ -30,10 +30,13 @@
 #![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 
 use cera::backend::metal::{MetalContext, MetalParams, TqAttnParams, TqParams, shaders};
+use cera::model::metal_turboquant::{TQ_ATTN_THREADS, TQ_THREADS, TqMetalCache, TqMode};
+use cera::model::{BlockType, ModelConfig, ScalarMultipliers};
 use cera::turboquant::{
     CompressedKeyCache, CompressedValueCache, EncodeScratch, QueryRotationScratch, RotationState,
     TqLayout, TurboQuantConfig, attn_scores_turboquant_gqa, attn_values_turboquant_gqa,
-    compress_and_append_keys, compress_and_append_values, rotate_queries,
+    compress_and_append_keys, compress_and_append_values, encode_compressed_keys,
+    encode_compressed_values, rotate_queries,
 };
 use metal::MTLSize;
 
@@ -48,11 +51,6 @@ const N_HEADS: usize = 4;
 /// Non-zero so the params' `sign_off` is exercised.
 const LAYER: usize = 3;
 const TOL: f32 = 2e-4;
-/// Threads per threadgroup for the encode / rotate kernels — must match `TQ_WG`
-/// in `turboquant.metal`.
-const TQ_WG: u64 = 128;
-/// Threads per threadgroup for `flash_attention_tq` — must match its tile width.
-const ATTN_TG: u64 = 256;
 
 struct Lcg(u64);
 
@@ -146,7 +144,10 @@ fn run_tq_kernel(
     enc.set_buffer(1, Some(&dst_buf), 0);
     enc.set_buffer(2, Some(&signs_buf), 0);
     params.set(enc, 3);
-    enc.dispatch_thread_groups(MTLSize::new(groups as u64, 1, 1), MTLSize::new(TQ_WG, 1, 1));
+    enc.dispatch_thread_groups(
+        MTLSize::new(groups as u64, 1, 1),
+        MTLSize::new(TQ_THREADS, 1, 1),
+    );
     enc.end_encoding();
     cmd.commit();
     cmd.wait_until_completed();
@@ -335,12 +336,15 @@ fn check_rotate_q(ctx: &MetalContext, head_dim: usize) {
 /// MSL threadgroup memory is likewise not zero-initialized on entry, and the
 /// barrier structure is its own code, so the wgpu suite's multi-tile case does not
 /// cover it.
-fn check_attention(ctx: &MetalContext, head_dim: usize, seq_len: usize) {
+fn check_attention(ctx: &MetalContext, head_dim: usize, seq_len: usize, q_splits: usize) {
+    assert!(
+        seq_len.is_multiple_of(q_splits),
+        "test setup: seq_len {seq_len} must divide evenly into {q_splits} splits"
+    );
     let fx = Fixture::new(head_dim);
     let kv_dim = N_KV_HEADS * head_dim;
     let q_dim = N_HEADS * head_dim;
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let group_size = N_HEADS / N_KV_HEADS;
     // Above the live length so the per-head region stride stays under test.
     let cache_cap = seq_len + 5;
 
@@ -384,38 +388,81 @@ fn check_attention(ctx: &MetalContext, head_dim: usize, seq_len: usize) {
         seq_len * N_HEADS,
     );
 
+    // Dispatch the query batch in `q_splits` chunks. Each chunk writes only its
+    // own rows, so `q_base` — the offset into the rotated-query scratch — is what
+    // makes a split dispatch read the right rows. Mirrors the wgpu suite.
     let c = &fx.config.centroids;
-    let attn_params = TqAttnParams {
-        n_heads: N_HEADS as u32,
-        n_kv_heads: N_KV_HEADS as u32,
-        head_dim: head_dim as u32,
-        max_seq: seq_len as u32,
-        start_pos: 0,
-        scale,
-        q_cap: seq_len as u32,
-        out_stride: q_dim as u32,
-        qjl_scale: cera::turboquant::qjl_scale(head_dim),
-        sign_off: fx.sign_off as u32,
-        c0: c[0],
-        c1: c[1],
-        c2: c[2],
-        c3: c[3],
-        q_base: 0,
-        cache_cap: cache_cap as u32,
-    };
-    let got = run_attention(
-        ctx,
-        &qrot_words,
-        &key_words,
-        &value_words,
-        &fx.signs,
-        &attn_params,
-        seq_len * q_dim,
-        N_HEADS,
-        seq_len,
-    );
+    let rows_per_split = seq_len / q_splits;
+    let mut got = vec![0.0f32; seq_len * q_dim];
+    for split in 0..q_splits {
+        let q_base = split * rows_per_split;
+        let attn_params = TqAttnParams {
+            n_heads: N_HEADS as u32,
+            n_kv_heads: N_KV_HEADS as u32,
+            head_dim: head_dim as u32,
+            max_seq: seq_len as u32,
+            start_pos: 0,
+            scale,
+            q_cap: seq_len as u32,
+            out_stride: q_dim as u32,
+            qjl_scale: cera::turboquant::qjl_scale(head_dim),
+            sign_off: fx.sign_off as u32,
+            c0: c[0],
+            c1: c[1],
+            c2: c[2],
+            c3: c[3],
+            q_base: q_base as u32,
+            cache_cap: cache_cap as u32,
+        };
+        let chunk = run_attention(
+            ctx,
+            &qrot_words,
+            &key_words,
+            &value_words,
+            &fx.signs,
+            &attn_params,
+            seq_len * q_dim,
+            N_HEADS,
+            rows_per_split,
+        );
+        let lo = q_base * q_dim;
+        let hi = lo + rows_per_split * q_dim;
+        got[lo..hi].copy_from_slice(&chunk[lo..hi]);
+    }
 
+    let want = cpu_attention(&fx, &q, &cpu_keys, &cpu_values, seq_len, scale);
+    for (i, &w) in want.iter().enumerate() {
+        assert_close(
+            got[i],
+            w,
+            &format!(
+                "hd={head_dim} attn out t_q={} i={} (q_splits={q_splits})",
+                i / q_dim,
+                i % q_dim
+            ),
+        );
+    }
+}
+
+/// The CPU reference for causal compressed attention over `seq_len` query rows:
+/// for each row, GQA scores against the live prefix, a batched softmax, then the
+/// value read with its inverse rotation. Returns `seq_len * q_dim` floats.
+///
+/// Shared by the kernel-level test and the `TqMetalCache`-level one so both are
+/// pinned to one reference — the whole point of having a CPU oracle at all.
+fn cpu_attention(
+    fx: &Fixture,
+    q: &[f32],
+    cpu_keys: &CompressedKeyCache,
+    cpu_values: &CompressedValueCache,
+    seq_len: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let head_dim = fx.head_dim;
+    let q_dim = N_HEADS * head_dim;
+    let group_size = N_HEADS / N_KV_HEADS;
     let mut scratch = QueryRotationScratch::new(N_HEADS, head_dim);
+    let mut out = Vec::with_capacity(seq_len * q_dim);
     for t_q in 0..seq_len {
         let live = t_q + 1;
         rotate_queries(
@@ -430,7 +477,7 @@ fn check_attention(ctx: &MetalContext, head_dim: usize, seq_len: usize) {
             let group_start = kv_head * group_size;
             let mut scores = vec![0.0f32; group_size * live];
             attn_scores_turboquant_gqa(
-                &cpu_keys,
+                cpu_keys,
                 kv_head,
                 group_start,
                 group_size,
@@ -454,7 +501,7 @@ fn check_attention(ctx: &MetalContext, head_dim: usize, seq_len: usize) {
                 }
             }
             attn_values_turboquant_gqa(
-                &cpu_values,
+                cpu_values,
                 kv_head,
                 group_start,
                 group_size,
@@ -466,14 +513,9 @@ fn check_attention(ctx: &MetalContext, head_dim: usize, seq_len: usize) {
                 &fx.config,
             );
         }
-        for (i, &want) in expected.iter().enumerate() {
-            assert_close(
-                got[t_q * q_dim + i],
-                want,
-                &format!("hd={head_dim} attn out t_q={t_q} i={i}"),
-            );
-        }
+        out.extend_from_slice(&expected);
     }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -508,13 +550,211 @@ fn run_attention(
     enc.set_buffer(5, Some(&signs_buf), 0);
     enc.dispatch_thread_groups(
         MTLSize::new(n_heads as u64, n_queries as u64, 1),
-        MTLSize::new(ATTN_TG, 1, 1),
+        MTLSize::new(TQ_ATTN_THREADS, 1, 1),
     );
     enc.end_encoding();
     cmd.commit();
     cmd.wait_until_completed();
 
     ctx.read_f32(&out_buf, out_floats)
+}
+
+/// A config whose every layer is attention, so `LAYER` is a valid index and each
+/// layer gets its own buffers. Shared by the two `TqMetalCache`-level tests.
+fn host_config(head_dim: usize) -> ModelConfig {
+    let n_layers = LAYER + 1;
+    ModelConfig {
+        architecture: "lfm2".into(),
+        n_layers,
+        hidden_size: N_HEADS * head_dim,
+        intermediate_size: N_HEADS * head_dim,
+        n_heads: N_HEADS,
+        n_kv_heads: N_KV_HEADS,
+        head_dim,
+        vocab_size: 32,
+        max_seq_len: MAX_SEQ,
+        rope_theta: 10_000.0,
+        rms_norm_eps: 1e-5,
+        block_types: vec![BlockType::Attention; n_layers],
+        conv_kernel_size: Some(3),
+        kv_heads_per_layer: vec![N_KV_HEADS; n_layers],
+        scalars: ScalarMultipliers::default(),
+    }
+}
+
+/// Test 5: the full compressed read path driven through `TqMetalCache`'s own API
+/// — `encode_kv` in two chunks, then `rotate_queries` + `attention` — rather than
+/// through hand-built params.
+///
+/// This is the only coverage of the host-side params construction, which the
+/// kernel-level tests can't reach because they supply every field themselves.
+/// Mutation-verified: swapping `cache_cap` for the causal clamp, zeroing
+/// `sign_off`, or narrowing `q_cap` or `out_stride` each fail *only* this test.
+///
+/// Exercised in both shapes the engine uses:
+///
+/// - **prefill**: all rows at once, `start_pos = 0`;
+/// - **decode**: one row, `start_pos = seq_len - 1`, reading the history the
+///   earlier `encode_kv` chunks wrote.
+///
+/// The cache capacity (`MAX_SEQ`) stays above the live length (`SEQ_LEN`) so
+/// `cache_cap` — the per-head region stride — is distinguishable from the live
+/// length; conflating them reads the wrong head's slots.
+///
+/// One asymmetry worth knowing, since the module and shader headers warn against
+/// conflating `max_seq` with `cache_cap`: only one direction is observable. The
+/// kernel computes `seq_len = min(pos_q + 1, max_seq)`, so passing a `max_seq`
+/// *larger* than the true causal clamp is a no-op (the per-row limit already
+/// binds) and no test can catch it. Passing it where `cache_cap` belongs, or
+/// passing a `max_seq` that is too small, does change results.
+fn check_host_api(ctx: &MetalContext, head_dim: usize) {
+    let fx = Fixture::new(head_dim);
+    let kv_dim = N_KV_HEADS * head_dim;
+    let q_dim = N_HEADS * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut rng = Lcg::new(71);
+    let k = rng.fill(SEQ_LEN * kv_dim);
+    let v = rng.fill(SEQ_LEN * kv_dim);
+    let q = rng.fill(SEQ_LEN * q_dim);
+    let (cpu_keys, cpu_values) = cpu_encode(&fx, &k, &v, kv_dim, SEQ_LEN);
+    let want = cpu_attention(&fx, &q, &cpu_keys, &cpu_values, SEQ_LEN, scale);
+
+    let config = host_config(head_dim);
+    let tq = TqMetalCache::new(ctx, &config, MAX_SEQ, SEQ_LEN, TqMode { seed: SEED })
+        .expect("TqMetalCache allocation");
+    let out = ctx.create_buffer((SEQ_LEN * q_dim * 4) as u64);
+
+    // Encode in two chunks so `start_pos` (the kernel's `dst_pos`) is exercised
+    // rather than always being 0 — the chunked-prefill shape.
+    let split = 3;
+    let k_buf = ctx.upload_f32(&k);
+    let v_buf = ctx.upload_f32(&v);
+    let q_buf = ctx.upload_f32(&q);
+    let cmd = ctx.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    tq.encode_kv(enc, LAYER, &k_buf, &v_buf, split, 0);
+    // Second chunk reads from row `split` of the same source buffers.
+    let k_tail = ctx.upload_f32(&k[split * kv_dim..]);
+    let v_tail = ctx.upload_f32(&v[split * kv_dim..]);
+    tq.encode_kv(enc, LAYER, &k_tail, &v_tail, SEQ_LEN - split, split);
+    // Prefill shape: every query row at once, against the whole encoded prefix.
+    tq.rotate_queries(enc, LAYER, &q_buf, SEQ_LEN, N_HEADS);
+    tq.attention(enc, LAYER, &out, SEQ_LEN, N_HEADS, 0, scale);
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let got = ctx.read_f32(&out, SEQ_LEN * q_dim);
+    for (i, &w) in want.iter().enumerate() {
+        assert_close(
+            got[i],
+            w,
+            &format!(
+                "hd={head_dim} host prefill t_q={} i={}",
+                i / q_dim,
+                i % q_dim
+            ),
+        );
+    }
+
+    // Decode shape: one query row at `start_pos = SEQ_LEN - 1`, which must attend
+    // over the full history and land in row 0 of a 1-row output.
+    let last = SEQ_LEN - 1;
+    let q_last = ctx.upload_f32(&q[last * q_dim..]);
+    let out1 = ctx.create_buffer((q_dim * 4) as u64);
+    let cmd = ctx.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    tq.rotate_queries(enc, LAYER, &q_last, 1, N_HEADS);
+    tq.attention(enc, LAYER, &out1, 1, N_HEADS, last, scale);
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let got1 = ctx.read_f32(&out1, q_dim);
+    for (i, &w) in want[last * q_dim..].iter().enumerate() {
+        assert_close(got1[i], w, &format!("hd={head_dim} host decode i={i}"));
+    }
+}
+
+/// Test 4: the prefix-cache snapshot of a Metal-resident compressed cache is
+/// byte-identical to what the CPU backend would write for the same KV, and
+/// restoring it reproduces the cache exactly.
+///
+/// This is the only test that drives `TqMetalCache` — the host module — rather
+/// than the raw kernels, so it also covers the layer buffer sizing, the
+/// per-layer sign offsets, and the strided region offsets the host computes.
+///
+/// Byte equality against `encode_compressed_keys` is the whole point: it is what
+/// makes a snapshot written on Metal loadable on CPU or wgpu, and it means the
+/// packed Metal layout really is the CPU layout plus a stride.
+fn check_snapshot_roundtrip(ctx: &MetalContext, head_dim: usize) {
+    let fx = Fixture::new(head_dim);
+    let kv_dim = N_KV_HEADS * head_dim;
+    let mut rng = Lcg::new(59);
+    let k = rng.fill(SEQ_LEN * kv_dim);
+    let v = rng.fill(SEQ_LEN * kv_dim);
+    let (cpu_keys, cpu_values) = cpu_encode(&fx, &k, &v, kv_dim, SEQ_LEN);
+
+    let config = host_config(head_dim);
+    let tq = TqMetalCache::new(ctx, &config, MAX_SEQ, SEQ_LEN, TqMode { seed: SEED })
+        .expect("TqMetalCache allocation");
+
+    let k_buf = ctx.upload_f32(&k);
+    let v_buf = ctx.upload_f32(&v);
+    let cmd = ctx.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    tq.encode_kv(enc, LAYER, &k_buf, &v_buf, SEQ_LEN, 0);
+    enc.end_encoding();
+    cmd.commit();
+    // The snapshot reads the buffer's mapped contents, so the encode must have
+    // landed first — the same wait the forward paths do before snapshotting.
+    cmd.wait_until_completed();
+
+    let (keys_blob, values_blob) = tq.snapshot_layer(LAYER, SEQ_LEN);
+    assert_eq!(
+        keys_blob,
+        encode_compressed_keys(&cpu_keys),
+        "hd={head_dim} TQK1 snapshot differs from the CPU encoding"
+    );
+    assert_eq!(
+        values_blob,
+        encode_compressed_values(&cpu_values),
+        "hd={head_dim} TQV1 snapshot differs from the CPU encoding"
+    );
+
+    // Restore into a DIFFERENT layer's buffers and re-snapshot: equality proves
+    // the upload lands at the same strided offsets the readback gathers from.
+    assert_eq!(
+        tq.restore_layer(0, &keys_blob, &values_blob),
+        Some(SEQ_LEN),
+        "hd={head_dim} restore rejected a blob it wrote itself"
+    );
+    let (keys_again, values_again) = tq.snapshot_layer(0, SEQ_LEN);
+    assert_eq!(
+        keys_again, keys_blob,
+        "hd={head_dim} key restore round-trip"
+    );
+    assert_eq!(
+        values_again, values_blob,
+        "hd={head_dim} value restore round-trip"
+    );
+
+    // A malformed blob must be rejected rather than partially applied — the
+    // caller turns `None` into a prefix-cache miss.
+    assert_eq!(
+        tq.restore_layer(0, &keys_blob[..keys_blob.len() - 1], &values_blob),
+        None,
+        "hd={head_dim} truncated TQK1 blob was accepted"
+    );
+    assert_eq!(
+        tq.restore_layer(0, &values_blob, &keys_blob),
+        None,
+        "hd={head_dim} swapped key/value blobs were accepted"
+    );
+
+    // An empty cache still round-trips through a header-only blob.
+    let (empty_k, empty_v) = tq.snapshot_layer(0, 0);
+    assert_eq!(tq.restore_layer(0, &empty_k, &empty_v), Some(0));
 }
 
 fn assert_close(got: f32, want: f32, what: &str) {
@@ -552,15 +792,33 @@ fn rotate_q_matches_cpu() {
 #[test]
 fn attention_matches_cpu() {
     let Some(ctx) = context() else { return };
-    check_attention(&ctx, 64, SEQ_LEN);
-    check_attention(&ctx, 128, SEQ_LEN);
+    check_attention(&ctx, 64, SEQ_LEN, 1);
+    check_attention(&ctx, 128, SEQ_LEN, 1);
 }
 
-/// Longer than `TQA_TILE = 256`, so the multi-tile online softmax runs. See
+/// Longer than `TQA_TILE = 256`, and dispatched in two query chunks, so the
+/// multi-tile online softmax and the `q_base` offset are both executed. See
 /// `check_attention`'s doc.
 #[test]
-fn attention_matches_cpu_multi_tile() {
+fn attention_matches_cpu_multi_tile_and_split_queries() {
     let Some(ctx) = context() else { return };
-    check_attention(&ctx, 64, 600);
-    check_attention(&ctx, 128, 600);
+    check_attention(&ctx, 64, 600, 2);
+    check_attention(&ctx, 128, 600, 2);
+}
+
+#[test]
+fn snapshot_roundtrips_and_matches_cpu_blobs() {
+    let Some(ctx) = context() else { return };
+    check_snapshot_roundtrip(&ctx, 64);
+    check_snapshot_roundtrip(&ctx, 128);
+}
+
+/// Drives `TqMetalCache`'s own API end to end (chunked encode → rotate →
+/// attention, in both the prefill and decode shapes) so the host-side params
+/// construction is covered, not just the kernels. See `check_host_api`.
+#[test]
+fn host_api_matches_cpu() {
+    let Some(ctx) = context() else { return };
+    check_host_api(&ctx, 64);
+    check_host_api(&ctx, 128);
 }

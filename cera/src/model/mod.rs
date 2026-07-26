@@ -21,6 +21,13 @@ pub(crate) mod gpu_weight_source;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_lfm2;
 
+// Metal mirror of `gpu_turboquant`, public for the same reason (the oracle tests
+// drive it). `//` not `///`, matching `gpu_turboquant` above: the module's own
+// `//!` header is what should render, and this note is about the source, not the
+// API.
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub mod metal_turboquant;
+
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_audio_decoder;
 

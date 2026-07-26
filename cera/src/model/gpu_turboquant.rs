@@ -210,10 +210,7 @@ impl TqGpuCache {
         // `pub` (the oracle tests construct it directly), so surface a typed error
         // rather than aborting the caller's process.
         if !head_dim_supported(head_dim) {
-            return Err(CeraError::Backend(format!(
-                "TurboQuant does not support head_dim {head_dim} (needs a power of \
-                 two <= 128 that is a multiple of 32)"
-            )));
+            return Err(crate::turboquant::unsupported_head_dim(head_dim));
         }
         let layout = TqLayout::new(head_dim);
         let n_layers = config.block_types.len();
@@ -235,8 +232,8 @@ impl TqGpuCache {
                     // multiplies, so production and the oracle tests can't drift
                     // apart on the sizing.
                     let vecs = checked_elems::<u32>(n_kv_heads, max_seq_len)?;
-                    let k_bytes = words_to_bytes(layout.key_words(vecs)?);
-                    let v_bytes = words_to_bytes(layout.value_words(vecs)?);
+                    let k_bytes = TqLayout::words_to_bytes(layout.key_words(vecs)?);
+                    let v_bytes = TqLayout::words_to_bytes(layout.value_words(vecs)?);
                     layers.push(Some(TqLayerCache {
                         keys: ctx.create_storage_rw(k_bytes, &format!("l{i}.tq_keys")),
                         values: ctx.create_storage_rw(v_bytes, &format!("l{i}.tq_values")),
@@ -250,7 +247,7 @@ impl TqGpuCache {
         // Rotated-query scratch: two head-wide regions plus one sum per (row, head).
         let q_rows = checked_elems::<f32>(q_cap, config.n_heads)?;
         let qrot_floats = checked_elems::<f32>(q_rows, 2 * head_dim + 1)?;
-        let qrot = ctx.create_storage_rw(words_to_bytes(qrot_floats), "tq_qrot");
+        let qrot = ctx.create_storage_rw(TqLayout::words_to_bytes(qrot_floats), "tq_qrot");
 
         // One params slot per (layer, purpose), each padded out to the device's
         // storage-binding offset alignment so a bind group can address it.
@@ -628,7 +625,7 @@ impl TqGpuCache {
         let jw = self.layout.jl_words;
         let cap = self.max_seq_len;
         let (jl_off, norm_off) = self.layout.key_regions(n * cap);
-        let v_norm_off = n * cap * pw;
+        let v_norm_off = self.layout.value_norm_offset(n * cap);
 
         // Scratch layout mirrors the read order below: key polar, key jl, key
         // norms, value polar, value norms — every head's live slice back to back.
@@ -728,17 +725,10 @@ impl TqGpuCache {
         let l = self.layer(layer)?;
         let keys = decode_compressed_keys(keys_blob)?;
         let values = decode_compressed_values(values_blob)?;
-        let head_dim = self.layout.head_dim;
-        let seq_len = keys.seq_len();
-        if keys.head_dim != head_dim
-            || values.head_dim != head_dim
-            || keys.n_kv_heads != l.n_kv_heads
-            || values.n_kv_heads != l.n_kv_heads
-            || values.seq_len() != seq_len
-            || seq_len > self.max_seq_len
-        {
-            return None;
-        }
+        // Shape gate lives on `TqLayout` so both GPU backends apply the same one.
+        let seq_len = self
+            .layout
+            .blobs_match(&keys, &values, l.n_kv_heads, self.max_seq_len)?;
         if seq_len == 0 {
             return Some(0);
         }
@@ -748,7 +738,7 @@ impl TqGpuCache {
         let cap = self.max_seq_len;
         let n = l.n_kv_heads;
         let (jl_off, norm_off) = self.layout.key_regions(n * cap);
-        let v_norm_off = n * cap * pw;
+        let v_norm_off = self.layout.value_norm_offset(n * cap);
 
         // Each region is contiguous across timesteps within a head, so one write
         // per (head, region) covers it. Bytes past `seq_len` are left as-is; the
@@ -789,15 +779,4 @@ impl TqGpuCache {
         }
         Some(seq_len)
     }
-}
-
-/// A 4-byte-element count as a byte count.
-///
-/// Callers guard the multiply that *produced* `words` (via `checked_elems`), which
-/// is the one that can realistically overflow. This `* 4` is unguarded: it would
-/// need `words > u64::MAX / 4`, unreachable for any `n_kv_heads × max_seq_len ×
-/// head_dim` a device could address, and `usize` bounds `words` well below it on
-/// every supported target.
-fn words_to_bytes(words: usize) -> u64 {
-    words as u64 * 4
 }
