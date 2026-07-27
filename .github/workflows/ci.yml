@@ -247,6 +247,24 @@ jobs:
         # cera-wasm-pack job doesn't enable.
         if: matrix.features == '--no-default-features --features gpu'
         run: cargo check -p cera-wasm --features wgpu --target wasm32-unknown-unknown
+      - name: Lint cera-wasm rustdoc
+        # The `doc` job runs rustdoc on the HOST target, and `cera-wasm` is
+        # wasm32-only — so nothing there documents this crate, and a broken
+        # intra-doc link in it reaches `main` unnoticed (one did). The pack jobs
+        # build wasm32 but never run rustdoc. This is the crate's only rustdoc
+        # coverage.
+        #
+        # Rides the same gpu matrix entry as the check above so `--features wgpu`
+        # documents the `WebGpuSession` surface too, and so it runs once rather
+        # than once per feature combo.
+        #
+        # Worth more here than the usual "keep docs tidy": wasm-bindgen copies
+        # doc comments verbatim into `cera_wasm.d.ts`, so these strings are
+        # shipped API documentation for JS/TS consumers.
+        if: matrix.features == '--no-default-features --features gpu'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p cera-wasm --features wgpu --no-deps --lib --target wasm32-unknown-unknown
 
   cera-wasm-pack:
     # Multi-target wasm-pack build. Each matrix entry produces one
