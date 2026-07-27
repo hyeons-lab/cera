@@ -246,7 +246,7 @@ fn map_cera_err(err: cera::CeraError) -> JsError {
 /// to model metadata and the tokenizer.
 ///
 /// JS callers fetch the GGUF (e.g. via `fetch().arrayBuffer()`), pass
-/// the bytes to [`CeraEngine.fromGgufBytes`], and use the returned
+/// the bytes to `CeraEngine.fromGgufBytes`, and use the returned
 /// handle to read model info or pull a `Tokenizer`. Session-based
 /// inference (`generate`, streaming) is intentionally not exposed yet
 /// — that shape needs an async/streaming design that lives in a
