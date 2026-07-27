@@ -1432,6 +1432,21 @@ impl Model for LlamaModel {
             let mut hidden = Vec::new();
             let _ = self.forward_prefill_batched(tokens, start_pos, state, Some(&mut hidden));
             debug_assert_eq!(hidden.len(), n * hs, "hidden capture must be [n * hs]");
+            // KNOWN COST, deliberately left for a follow-up: this reads the LM
+            // head `n` times, once per `project_logits` GEMV. That partly works
+            // against the reason speculative decoding exists — verifying `1 + k`
+            // tokens in one forward is supposed to amortize the weight read, and
+            // the LM head is the single largest matrix in the model
+            // (`hidden_size x vocab`), so at k = 4-8 it is re-streamed 5-9x.
+            //
+            // The fix is the `quantize_columns` + `gemm_preq` pair used for every
+            // other projection in this file: one `[vocab x n] = [vocab x hs] *
+            // [hs x n]` GEMM. It is not a drop-in — `gemm_preq` is column-major
+            // in `n`, so it needs a transpose to the `[n x vocab]` row-major
+            // layout `verify_draft` indexes, plus the `batched_gemm_supports`
+            // dtype gate (a Q5_K LM head has no GEMM kernel) with this loop as
+            // the fallback. Worth doing with a benchmark behind it rather than
+            // bolted onto this phase.
             let mut logits = Vec::with_capacity(n * vocab);
             for j in 0..n {
                 let row = &hidden[j * hs..(j + 1) * hs];

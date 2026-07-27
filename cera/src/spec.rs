@@ -101,7 +101,20 @@ pub fn verify_draft(
     batch.push(guaranteed);
     batch.extend_from_slice(draft);
     let all = model.forward_prefill_logits_all(&batch, old, state);
-    debug_assert_eq!(all.len(), batch.len() * vocab);
+    // A real assert, not `debug_assert`: everything below slices `all` by
+    // `j * vocab`, so a backend returning the wrong row count would otherwise
+    // surface in release as an out-of-range slice panic several lines away, or —
+    // worse, if it returned *more* than expected — as silently reading the wrong
+    // row and accepting a draft token the target never predicted. This is once
+    // per verification round, not per token.
+    assert_eq!(
+        all.len(),
+        batch.len() * vocab,
+        "forward_prefill_logits_all returned {} logits for {} positions x vocab {vocab}; \
+         the row-major [n x vocab] contract is what lets `verify_draft` index row j",
+        all.len(),
+        batch.len()
+    );
 
     // Row j predicts the token at position old+j+1, i.e. the token that should
     // follow batch[j]. Accept draft[j] while it equals that argmax.
@@ -147,9 +160,27 @@ pub fn greedy_generate_spec(
 
     let mut out: Vec<u32> = Vec::new();
     let mut stats = SpecStats::default();
+    // The three documented preconditions, enforced at the boundary. Each has a
+    // failure mode that is much harder to read further in: a stale `state` makes
+    // every position off by `seq_len` (wrong output, no panic); a compressed
+    // cache reaches `truncate_to`'s own assert several frames deep, after the KV
+    // has already been written; and a model without all-position logits panics
+    // inside `verify_draft`'s row indexing.
     assert!(
         model.supports_all_logits(),
         "greedy_generate_spec requires forward_prefill_logits_all support"
+    );
+    assert_eq!(
+        state.seq_len, 0,
+        "greedy_generate_spec requires a fresh InferenceState (seq_len == 0); \
+         this one holds {} positions, so the prompt would prefill after them and \
+         every position would be offset",
+        state.seq_len
+    );
+    assert!(
+        !state.is_compressed(),
+        "greedy_generate_spec requires an uncompressed KV cache: verification \
+         rewinds with `truncate_to`, which TurboQuant's packed layout cannot do"
     );
     if prompt.is_empty() || max_new == 0 {
         return (out, stats);

@@ -335,6 +335,31 @@ pub fn can_shift(
     supports_kv_shift && n_keep > 0 && !cache_unshiftable && current_pos >= n_keep + shift_needed
 }
 
+/// Mirror an `n_keep` KV shift in the spec-decode drafting history.
+///
+/// `shift_kv` evicts KV cells `[n_keep .. n_keep + shift)`, so drop exactly that
+/// range — not an equal count off the front. Front-trimming keeps the length
+/// right and the contents wrong twice over: it discards the pinned prefix, which
+/// is still in the KV and is usually the most re-used text (a system prompt),
+/// while keeping the tokens the shift actually evicted. Both push
+/// [`crate::spec::prompt_lookup_draft`] toward n-grams that no longer precede the
+/// current position, costing rejected drafts and wasted verify rounds.
+///
+/// A free function, like [`can_shift`], so the range arithmetic is testable
+/// without standing up a model. Alignment is approximate by design — nothing
+/// pins the history to the KV index-for-index (a partial prefill advances them
+/// differently, and `append_embeddings` adds KV positions with no token ids at
+/// all) — which is why drafting is a heuristic whose every token `verify_draft`
+/// re-derives.
+pub(crate) fn shift_token_history(history: &mut Vec<u32>, n_keep: usize, shift: usize) {
+    if history.is_empty() {
+        return;
+    }
+    let start = n_keep.min(history.len());
+    let end = (n_keep + shift).min(history.len());
+    history.drain(start..end);
+}
+
 /// One slice of a tokenized chat template, distinguishing text runs
 /// from image-marker positions. `Text { start, end }` is a half-open
 /// index range into the same `tokens` slice that
@@ -1062,16 +1087,21 @@ impl Session {
             self.model.shift_kv(&mut self.state, n_keep, shift_needed);
             let before = self.current_pos;
             self.current_pos -= shift_needed;
-            // Keep the spec-decode drafting history bounded and roughly aligned
-            // with the shifted KV. The n_keep shift drops `shift_needed` tokens
-            // after the pinned prefix; trimming the front by the same count is
-            // an approximation (drafting is a heuristic — see `token_history`),
-            // not an exact mirror. The guard skips the no-op drain before any
-            // prefill has populated the history.
-            if !self.token_history.is_empty() {
-                let drop = shift_needed.min(self.token_history.len());
-                self.token_history.drain(..drop);
-            }
+            // Mirror the shift in the drafting history: `shift_kv` drops KV cells
+            // `[n_keep .. n_keep + shift_needed)`, so drop exactly that range here
+            // rather than an equal count off the front. Front-trimming keeps the
+            // length right but the *contents* wrong in both directions — it
+            // discards the pinned prefix, which is still in the KV and is often
+            // the most re-used text (a system prompt), while retaining the tokens
+            // the shift actually evicted. Both errors push `prompt_lookup_draft`
+            // toward n-grams that no longer precede the current position, costing
+            // rejected drafts and wasted verify rounds.
+            //
+            // Still an approximation, not a guarantee: nothing pins
+            // `token_history` to the KV index-for-index (a partial prefill
+            // advances them differently), which is why drafting is a heuristic
+            // whose output `verify_draft` re-derives regardless.
+            shift_token_history(&mut self.token_history, n_keep, shift_needed);
             self.position_atomic
                 .store(self.current_pos as u32, Ordering::Relaxed);
             // Pre-shift `last_logits` corresponded to position `before - 1`;
@@ -1200,6 +1230,18 @@ impl Session {
             self.model.shift_kv(&mut self.state, n_keep, shift_needed);
             let before = self.current_pos;
             self.current_pos -= shift_needed;
+            // Mirror the shift in the drafting history, same range as
+            // `append_tokens`. Two reasons it matters even though this path
+            // appends *embeddings*, which have no token ids to record:
+            //  - without it the history keeps entries for evicted positions, so
+            //    drafts are proposed from text no longer in the KV;
+            //  - a session alternating `append_tokens` (which grows the history)
+            //    with embedding appends that shift would grow it without bound
+            //    while the KV stays capped at `max_seq_len`.
+            // The history is inherently a partial view here — the embedding
+            // positions themselves are never recorded — which is why drafting off
+            // it is a heuristic that `verify_draft` re-derives regardless.
+            shift_token_history(&mut self.token_history, n_keep, shift_needed);
             self.position_atomic
                 .store(self.current_pos as u32, Ordering::Relaxed);
             self.last_logits = None;
@@ -1865,6 +1907,17 @@ impl Session {
             }
 
             pending.push(token);
+            // Record here too, not just on the spec path's `emit!`. A session can
+            // mix the two — spec engages only for plain greedy on a dense model
+            // with uncompressed KV, so grammar, sampling, a compressed cache, or
+            // `opts.spec = None` all land here — and `token_history` is meant to
+            // mirror what the KV holds. Skipping it would leave a later
+            // spec-enabled `generate()` drafting against a history with a hole in
+            // it: every n-gram spanning the gap matches text that never preceded
+            // the current position, so the drafts are rejected and the round is
+            // wasted. Output stays correct either way (`verify_draft` re-derives
+            // every token), which is exactly why the gap would go unnoticed.
+            self.token_history.push(token);
             generated += 1;
 
             let should_flush_n = pending.len() >= flush_n;
@@ -2243,6 +2296,37 @@ mod tests {
     /// `shift_kv_with_rope` (which hard-asserts against compressed caches).
     /// f16 KV is now shiftable, so the call sites pass `is_compressed()` alone
     /// (no `|| kv_f16`).
+    #[test]
+    fn shift_history_drops_the_evicted_middle_not_the_front() {
+        // KV holds [0..8); a shift of 3 with n_keep = 2 evicts cells [2..5).
+        let mut h: Vec<u32> = (0..8).collect();
+        shift_token_history(&mut h, 2, 3);
+        // The pinned prefix 0,1 survives — it is still in the KV — and 2,3,4 go.
+        assert_eq!(h, vec![0, 1, 5, 6, 7]);
+        // The front-draining it replaced would have produced [3,4,5,6,7]:
+        // prefix gone, evicted 3 and 4 kept. Same length, wrong contents.
+        assert_ne!(h, vec![3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn shift_history_clamps_a_short_history() {
+        // The history is not pinned to the KV index-for-index, so the range can
+        // reach past its end; clamping must not panic or truncate the prefix.
+        let mut h: Vec<u32> = vec![9, 8, 7];
+        shift_token_history(&mut h, 2, 100);
+        assert_eq!(h, vec![9, 8]);
+
+        // n_keep alone past the end leaves it untouched.
+        let mut h2: Vec<u32> = vec![9, 8, 7];
+        shift_token_history(&mut h2, 50, 4);
+        assert_eq!(h2, vec![9, 8, 7]);
+
+        // Empty is a no-op (the pre-prefill case).
+        let mut h3: Vec<u32> = Vec::new();
+        shift_token_history(&mut h3, 2, 3);
+        assert!(h3.is_empty());
+    }
+
     #[test]
     fn can_shift_blocks_unshiftable_caches() {
         // Happy path: shiftable f32/f16 cache with room to drop.

@@ -975,6 +975,18 @@ impl InferenceState {
             if cache.is_empty() {
                 return;
             }
+            // `kv_dim` is recovered by division, so a cache that is not a whole
+            // multiple of `seq_len` would yield a wrong stride and truncate to a
+            // boundary mid-vector — leaving a cache that still looks well-formed
+            // and decodes to plausible garbage. Assert the invariant instead of
+            // propagating it silently.
+            assert_eq!(
+                cache.len() % seq_len,
+                0,
+                "KV cache length {} is not a multiple of seq_len {seq_len}; \
+                 cannot recover kv_dim to truncate on a vector boundary",
+                cache.len()
+            );
             let kv_dim = cache.len() / seq_len;
             cache.truncate(len * kv_dim);
         }

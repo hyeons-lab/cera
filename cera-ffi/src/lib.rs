@@ -1255,6 +1255,14 @@ impl TryFrom<GenerateOpts> for cera::GenerateOpts {
             grammar_trigger_tokens: o.grammar_trigger_tokens,
             flush_every_tokens: o.flush_every_tokens,
             flush_every_ms: o.flush_every_ms,
+            // Not exposed over FFI yet. Speculative decoding is dense-CPU only in
+            // this phase, while the mobile bindings' usual target is LFM2 on
+            // Metal, so there is nothing to opt into here. Listed explicitly
+            // rather than filled from `..Default::default()` on purpose: this
+            // mirror enumerates every field so that adding one to the core struct
+            // breaks the FFI build loudly — a stable ABI surface should not
+            // silently inherit a new default.
+            spec: None,
         })
     }
 }
