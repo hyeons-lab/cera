@@ -219,6 +219,7 @@ jobs:
           cargo test -p cera --features gpu \
             --test gpu_lfm2_prefill_equivalence \
             --test gpu_lfm2_prefill_dispatch \
+            --test gpu_lfm2_decode_passes \
             -- --nocapture
       # The GEMM microbenchmark carries `required-features = ["gpu"]`, so the
       # `check` job's `cargo clippy --all-targets` (no features) skips it and

@@ -1366,6 +1366,7 @@ fn configure_prefix_cache(
 #[derive(Debug, Clone, Copy, Default)]
 struct PhaseIo {
     submits: u64,
+    passes: u64,
     readbacks: u64,
     readback_bytes: u64,
     tokens: u64,
@@ -1373,11 +1374,12 @@ struct PhaseIo {
 
 impl PhaseIo {
     /// The I/O charged between two `gpu_io_snapshot()` calls.
-    fn between(before: (u64, u64, u64), after: (u64, u64, u64), tokens: u64) -> Self {
+    fn between(before: (u64, u64, u64, u64), after: (u64, u64, u64, u64), tokens: u64) -> Self {
         Self {
             submits: after.0.saturating_sub(before.0),
-            readbacks: after.1.saturating_sub(before.1),
-            readback_bytes: after.2.saturating_sub(before.2),
+            passes: after.1.saturating_sub(before.1),
+            readbacks: after.2.saturating_sub(before.2),
+            readback_bytes: after.3.saturating_sub(before.3),
             tokens,
         }
     }
@@ -1386,6 +1388,7 @@ impl PhaseIo {
     /// how many tokens each run actually contributed.
     fn accumulate(&mut self, other: Self) {
         self.submits += other.submits;
+        self.passes += other.passes;
         self.readbacks += other.readbacks;
         self.readback_bytes += other.readback_bytes;
         self.tokens += other.tokens;
@@ -1407,14 +1410,14 @@ struct RunStats {
 /// CPU or Metal backend is active), which `--gpu-io` reports explicitly rather
 /// than silently printing a misleading 0.0 submits/token.
 #[cfg(feature = "gpu")]
-fn gpu_io_snapshot() -> (u64, u64, u64) {
+fn gpu_io_snapshot() -> (u64, u64, u64, u64) {
     let s = cera::backend::wgpu::io_stats::snapshot();
-    (s.submits, s.readbacks, s.readback_bytes)
+    (s.submits, s.passes, s.readbacks, s.readback_bytes)
 }
 
 #[cfg(not(feature = "gpu"))]
-fn gpu_io_snapshot() -> (u64, u64, u64) {
-    (0, 0, 0)
+fn gpu_io_snapshot() -> (u64, u64, u64, u64) {
+    (0, 0, 0, 0)
 }
 
 /// Print the `--gpu-io` report. Paired with a no-op-ish `cfg(not(gpu))` twin below,
@@ -1426,6 +1429,7 @@ fn report_gpu_io(decode: PhaseIo, prefill: PhaseIo) {
 
     let stats = |p: PhaseIo| GpuIoStats {
         submits: p.submits,
+        passes: p.passes,
         readbacks: p.readbacks,
         readback_bytes: p.readback_bytes,
     };
@@ -1436,9 +1440,14 @@ fn report_gpu_io(decode: PhaseIo, prefill: PhaseIo) {
     }
     let (sub_pt, rb_pt, bytes_pt) = stats(decode).per_token(decode.tokens);
     let d_tokens = decode.tokens;
+    // Passes are reported alongside submits because they are the lever that
+    // actually moved decode: identical dispatches cost 2.65x more split across
+    // N passes than batched into one (#318).
+    let passes_pt = stats(decode).passes as f64 / decode.tokens as f64;
     eprintln!(
-        "gpu I/O (decode): {sub_pt:.1} submits/token, {rb_pt:.1} readbacks/token, \
-         {bytes_pt:.0} readback bytes/token (over {d_tokens} tokens)",
+        "gpu I/O (decode): {sub_pt:.1} submits/token, {passes_pt:.1} passes/token, \
+         {rb_pt:.1} readbacks/token, {bytes_pt:.0} readback bytes/token \
+         (over {d_tokens} tokens)",
     );
     // A batched prefill is ~one submit for the whole pass. A submit *per prompt
     // token* means prefill is secretly looping the decode path — which is exactly
