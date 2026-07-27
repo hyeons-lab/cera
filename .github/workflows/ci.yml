@@ -186,6 +186,40 @@ jobs:
         run: vulkaninfo --summary || true
       - name: Run wgpu kernel + host-logic tests
         run: cargo test -p cera --features gpu --lib --test wgpu_kv_shift_oracle
+      # Model-backed GPU tests need a fixture, and until now no job had both a
+      # GPU and a GGUF: this one has the adapter but fetched nothing, while
+      # `parity` fetches fixtures and builds without `--features gpu`. So the
+      # wgpu LFM2 prefill path had no end-to-end coverage at all.
+      #
+      # Only the `core` set (~270 MB) — it holds LFM2.5-230M-Q4_K_M, which is
+      # what these tests want. `arch`-tier is 6.3 GB and buys nothing here.
+      - name: Cache GGUF fixtures
+        uses: actions/cache@v4
+        with:
+          path: target/oracle/models
+          key: cera-parity-fixtures-core-${{ hashFiles('scripts/fetch_test_models.sh') }}
+          restore-keys: |
+            cera-parity-fixtures-core-
+      - name: Fetch GGUF fixtures
+        run: ./scripts/fetch_test_models.sh --set core
+      # `CERA_REQUIRE_MODEL` makes an absent fixture fatal. Safe to set here
+      # (unlike in `parity`, which fetches only `core` on a PR while four of its
+      # tests want `arch`-tier models): everything below is satisfied by `core`,
+      # so a skip would mean the job went green without running anything.
+      #
+      # Debug, not `--release`, to reuse the artifacts the step above just
+      # built: a release build here would recompile the whole dependency graph
+      # on a 2-core runner against this job's 20-minute cap. The tests are
+      # dispatch-bound rather than CPU-bound (~9 s debug locally), so the
+      # optimizer buys little.
+      - name: Run wgpu LFM2 prefill equivalence + dispatch guard
+        env:
+          CERA_REQUIRE_MODEL: 1
+        run: |
+          cargo test -p cera --features gpu \
+            --test gpu_lfm2_prefill_equivalence \
+            --test gpu_lfm2_prefill_dispatch \
+            -- --nocapture
       # The GEMM microbenchmark carries `required-features = ["gpu"]`, so the
       # `check` job's `cargo clippy --all-targets` (no features) skips it and
       # nothing else in PR-time CI compiles it. Without this a change that breaks
