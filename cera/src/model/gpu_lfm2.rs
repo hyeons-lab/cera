@@ -172,7 +172,7 @@ fn gemv_tile_rows(m: u32, k: u32, max_binding: u64, offset_alignment: u64, elem_
         max_rows
     };
     assert!(
-        tile_rows > 0 && (u64::from(tile_rows) * row_bytes) % offset_alignment == 0,
+        tile_rows > 0 && (u64::from(tile_rows) * row_bytes).is_multiple_of(offset_alignment),
         "GPU storage binding alignment {} cannot be satisfied for GEMV rows of {} bytes",
         offset_alignment,
         row_bytes
@@ -1950,7 +1950,7 @@ impl GpuLfm2Model {
         // invariants it assumes so a malformed config fails fast here instead of
         // dividing by zero or reading out of bounds on the GPU.
         assert!(
-            n_kv_heads > 0 && n_heads % n_kv_heads == 0,
+            n_kv_heads > 0 && n_heads.is_multiple_of(n_kv_heads),
             "wgpu flash_attention requires n_kv_heads > 0 and n_heads divisible by \
              n_kv_heads; got n_heads={n_heads}, n_kv_heads={n_kv_heads}"
         );
@@ -3306,6 +3306,22 @@ impl GpuLfm2Model {
     pub fn gpu_info(&self) -> (&str, &str) {
         (&self.ctx.adapter_name, &self.ctx.backend)
     }
+
+    /// The KV-cache mode this model actually resolved to, as a human-readable
+    /// label: `"turboquant(seed=N)"` or `"uncompressed"`.
+    ///
+    /// This reports the *effective* mode, not the requested one, and that
+    /// distinction is the whole point: `configure_kv_compression` downgrades a
+    /// request it can't serve (single-sided TurboQuant, or a `head_dim` the
+    /// kernels reject) to uncompressed KV with only a `tracing::warn!`. A caller
+    /// that can't see the log — a browser via `cera-wasm`, notably — otherwise
+    /// has no way to tell a compressed session from a silently uncompressed one.
+    ///
+    /// Reads `"uncompressed"` before `configure_kv_compression` has run, which is
+    /// the correct label for the f32 default.
+    pub fn kv_mode_label(&self) -> String {
+        describe_kv_mode(self.kv_mode.get().unwrap_or(&None))
+    }
 }
 
 // === Batched prefill — encode helpers + main method ========================
@@ -3534,7 +3550,10 @@ impl GpuLfm2Model {
         let m = w.tensor.shape[0] as u32;
         let (pipeline, wg_m, wg_n, label) = match w.tensor.dtype {
             DType::Q4_0 => {
-                let use_vec = m % 4 == 0 && k % 4 == 0 && x_stride % 4 == 0 && y_stride % 4 == 0;
+                let use_vec = m.is_multiple_of(4)
+                    && k.is_multiple_of(4)
+                    && x_stride.is_multiple_of(4)
+                    && y_stride.is_multiple_of(4);
                 let pipeline = if use_vec {
                     &self.pipelines.mul_mat_reg_tile_q4_0_vec
                 } else {
@@ -3871,7 +3890,7 @@ impl GpuLfm2Model {
         // kv_head = head / group_size, a head_dim-wide slice at kv_head * head_dim
         // within each kv_dim-strided KV row). Fail fast on a malformed config.
         assert!(
-            n_kv_heads > 0 && n_heads % n_kv_heads == 0,
+            n_kv_heads > 0 && n_heads.is_multiple_of(n_kv_heads),
             "wgpu attention_prefill requires n_kv_heads > 0 and n_heads divisible \
              by n_kv_heads; got n_heads={n_heads}, n_kv_heads={n_kv_heads}"
         );

@@ -329,8 +329,9 @@ cfg.seed = 42n;        // BigInt — wasm-bindgen maps Rust u64 to JS BigInt
 //   cera logs a warning and falls back to f32 if not — no JS
 //   error.
 // - Applies to `engine.newSession(cfg)` only. `WebGpuSession`
-//   takes no `SessionConfig`, so the WebGPU path always runs
-//   uncompressed f32 KV regardless of this setting.
+//   takes no `SessionConfig` — pass a `TurboQuantConfig` as the
+//   third argument of `WebGpuSession.create` instead, and read
+//   `session.kvCompression` for the mode that took effect.
 // - Don't combine with `cfg.nKeep > 0` (context-shift); cera
 //   warns at session creation and ignores nKeep on overflow.
 const tq = new TurboQuantConfig(1234n);  // ctor sets keys + values = true
@@ -501,16 +502,30 @@ default builds above are CPU-only; the standard `Session` remains the
 supported path.
 
 ```js
-import { WebGpuSession } from '@hyeons-lab/cera-wasm';
+import { WebGpuSession, TurboQuantConfig } from '@hyeons-lab/cera-wasm';
 
 // Async constructor — initializes WebGPU (requestAdapter / requestDevice
 // resolve on the event loop), parses the GGUF, and uploads the model to
 // the GPU. `contextSize` defaults to 4096. Throws if WebGPU is
 // unavailable or the bytes aren't a valid LFM2 GGUF.
-const session = await WebGpuSession.create(ggufBytes, 2048);
+//
+// The optional third argument requests TurboQuant on the GPU-resident KV
+// cache (~3-bit keys / ~2-bit values). Omit it — or pass null — for
+// uncompressed f32 KV; existing two-argument calls are unaffected. Like
+// the `SessionConfig` setter, `create` CONSUMES the config handle, so
+// build a fresh one per session rather than reusing it.
+const session = await WebGpuSession.create(ggufBytes, 2048, new TurboQuantConfig(1234n));
 
 // Adapter + backend description — confirms the GPU path is live.
 console.log(session.adapter);  // e.g. "<adapter> (BrowserWebGpu)"
+
+// The mode that ACTUALLY took effect — "turboquant(seed=N)" or
+// "uncompressed". Two things silently downgrade to f32: a head_dim that
+// isn't a power of two <= 128 and a multiple of 32, and a single-sided
+// config (the WebGPU kernels only compress keys AND values together, so
+// the `tq.keys = false` debug toggle above falls back here). Neither
+// reaches the browser console, so this getter is the only way to tell.
+console.log(session.kvCompression);
 
 // Greedy generate. `onToken(text)` fires per decoded piece as it's
 // produced; the full string is also returned. Stateful: the on-GPU KV

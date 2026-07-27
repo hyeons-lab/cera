@@ -1335,7 +1335,7 @@ impl VitGpuOps for MetalVitOps {
         // would need ~46 KB and blow the 32 KB threadgroup limit on Apple M1.
         // 128 keeps it at ~24 KB and covers every current LFM2 ViT (hd ∈ {64,
         // 128}); larger head dims fall back to the scalar kernel.
-        if head_dim % 8 == 0 && head_dim <= 128 {
+        if head_dim.is_multiple_of(8) && head_dim <= 128 {
             self.run_attn_mma(q, k, v, &out, tokens, n_head, head_dim);
         } else {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -1495,7 +1495,7 @@ mod tests {
         assert_eq!(cols % 32, 0, "Q8_0 cols must be a multiple of 32");
         let data = rnd(rows * cols, seed);
         let mut bytes = Vec::with_capacity(rows * (cols / 32) * 34);
-        for block in data.chunks_exact(32) {
+        for block in data.as_chunks::<32>().0 {
             let amax = block.iter().fold(0f32, |m, &x| m.max(x.abs()));
             let d = amax / 127.0;
             let id = if d != 0.0 { 1.0 / d } else { 0.0 };
@@ -1515,7 +1515,7 @@ mod tests {
         assert_eq!(cols % 32, 0, "Q4_0 cols must be a multiple of 32");
         let data = rnd(rows * cols, seed);
         let mut bytes = Vec::with_capacity(rows * (cols / 32) * 18);
-        for block in data.chunks_exact(32) {
+        for block in data.as_chunks::<32>().0 {
             let max_abs = block.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
             let scale = max_abs / 7.0;
             let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };

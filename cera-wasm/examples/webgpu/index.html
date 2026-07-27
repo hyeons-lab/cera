@@ -45,6 +45,13 @@
       <input type="text" id="prompt" value="The capital of France is" />
     </div>
     <div class="row">
+      <label for="kvmode">KV cache:</label>
+      <select id="kvmode">
+        <option value="none">uncompressed f32</option>
+        <option value="tq3">TurboQuant (3-bit keys / 2-bit values)</option>
+      </select>
+    </div>
+    <div class="row">
       <label for="maxtok">Max tokens:</label>
       <input type="number" id="maxtok" value="64" min="1" max="2048" />
       <button id="run" disabled>Generate</button>
@@ -53,7 +60,7 @@
     <div id="out"></div>
 
     <script type="module">
-      import init, { WebGpuSession, ceraVersion } from "./pkg/cera_wasm.js";
+      import init, { WebGpuSession, TurboQuantConfig, ceraVersion } from "./pkg/cera_wasm.js";
 
       const $ = (id) => document.getElementById(id);
       const statusEl = $("status");
@@ -62,7 +69,21 @@
       const setStatus = (m) => (statusEl.textContent = m);
 
       let session = null;
-      let loadedName = null;
+
+      // Latch every control for the duration of a load or a generate, so only
+      // one operation is ever in flight. That single invariant is what keeps the
+      // `free()` in buildSession safe — with concurrent builds possible, a
+      // finished build could free a session a running `generate` still held
+      // (use-after-free across the wasm boundary), and out-of-order completions
+      // could leave the live session in a different KV mode than the dropdown
+      // shows. Latching is also what stops two rapid toggles from holding two
+      // full GGUF copies and two GPU uploads at once.
+      const setBusy = (busy) => {
+        $("model").disabled = busy;
+        $("kvmode").disabled = busy;
+        // Never arm Run without a live session — a failed load leaves none.
+        runBtn.disabled = busy || session === null;
+      };
 
       await init();
       if (!("gpu" in navigator)) {
@@ -71,28 +92,57 @@
         setStatus(`Ready (cera ${ceraVersion()}). Pick an LFM2 GGUF to begin.`);
       }
 
-      // (Re)build the GPU session whenever a new model file is chosen.
-      $("model").addEventListener("change", async (e) => {
-        const file = e.target.files?.[0];
+      // (Re)build the GPU session from the currently selected file + KV mode.
+      // The KV mode is fixed at construction, so changing it has to rebuild the
+      // session — hence one builder driven by both controls rather than inline
+      // in the file-picker handler.
+      async function buildSession() {
+        const file = $("model").files?.[0];
         if (!file) return;
-        runBtn.disabled = true;
+        setBusy(true);
+        // Hand the old session's GPU buffers and linear memory back now rather
+        // than waiting for the FinalizationRegistry — toggling the KV dropdown a
+        // few times on a real GGUF would otherwise strand a full model per
+        // toggle, in the very demo meant to show KV memory going down. Safe to
+        // free unconditionally because the controls are latched: nothing else
+        // can be holding this session.
+        session?.free();
         session = null;
         try {
           setStatus(`Reading ${file.name} (${(file.size / 1e6).toFixed(1)} MB)…`);
           const bytes = new Uint8Array(await file.arrayBuffer());
           setStatus("Initializing WebGPU + uploading model to GPU…");
           const t0 = performance.now();
+          // Built here, immediately before the call that consumes it: `create`
+          // takes ownership of the handle, so one built earlier would leak if
+          // the read above threw. Fixed seed, not a random one — the seed drives
+          // the per-layer Hadamard rotations, so pinning it keeps runs
+          // reproducible.
+          const kv = $("kvmode").value === "tq3" ? new TurboQuantConfig(42n) : null;
           // Static async constructor → resolves once the device is up and
           // the weights are uploaded.
-          session = await WebGpuSession.create(bytes, 4096);
-          loadedName = file.name;
+          session = await WebGpuSession.create(bytes, 4096, kv);
           const dt = ((performance.now() - t0) / 1000).toFixed(1);
-          setStatus(`Loaded ${loadedName} in ${dt}s · ${session.adapter}`);
-          runBtn.disabled = false;
+          // Report the EFFECTIVE mode, not the requested one. A model whose
+          // head_dim the compressed kernels can't handle falls back to f32, and
+          // nothing surfaces in the console (cera-wasm installs no tracing
+          // subscriber), so echoing the request would claim compression that
+          // isn't running.
+          setStatus(
+            `Loaded ${file.name} in ${dt}s · ${session.adapter} · KV: ${session.kvCompression}`,
+          );
         } catch (err) {
           setStatus(`❌ Load failed: ${err}`);
+        } finally {
+          setBusy(false);
         }
-      });
+      }
+
+      $("model").addEventListener("change", buildSession);
+      // Re-upload the weights on a KV-mode switch. Wasteful, but this is a demo
+      // and the alternative — leaving the old session live — would silently
+      // generate with the previous mode while the dropdown claims otherwise.
+      $("kvmode").addEventListener("change", buildSession);
 
       runBtn.addEventListener("click", async () => {
         if (!session) return;
@@ -102,7 +152,9 @@
         const parsedMax = parseInt($("maxtok").value, 10);
         const maxTokens = Number.isFinite(parsedMax) && parsedMax > 0 ? parsedMax : 64;
         outEl.textContent = prompt;
-        runBtn.disabled = true;
+        // Latches the model picker and KV dropdown too, so a rebuild can't free
+        // this session while `generate` is still awaiting on it.
+        setBusy(true);
         setStatus("Generating on GPU…");
         const t0 = performance.now();
         let n = 0;
@@ -118,7 +170,7 @@
         } catch (err) {
           setStatus(`❌ Generate failed: ${err}`);
         } finally {
-          runBtn.disabled = false;
+          setBusy(false);
         }
       });
     </script>

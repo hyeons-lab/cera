@@ -3298,7 +3298,7 @@ pub fn flash_attention_gqa_cpu(
     // Fall back to scalar for unsupported dimensions.
     #[cfg(target_arch = "aarch64")]
     {
-        if head_dim % 4 == 0 && head_dim <= 128 {
+        if head_dim.is_multiple_of(4) && head_dim <= 128 {
             unsafe {
                 flash_attention_gqa_neon(
                     q_mat,
@@ -3864,7 +3864,7 @@ unsafe fn flash_attention_gqa_neon(
 
         let n_vecs = head_dim / 4;
         debug_assert!(
-            head_dim % 4 == 0 && n_vecs <= 32,
+            head_dim.is_multiple_of(4) && n_vecs <= 32,
             "head_dim must be a multiple of 4 and <= 128"
         );
 

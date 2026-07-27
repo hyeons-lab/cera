@@ -752,7 +752,7 @@ fn read_string_field(
 /// defaults: `maxSeqLen=null` → engine's effective max, `nKeep=0`,
 /// `seed=null`, `ubatchSize=512`, `kvCompression=null`).
 ///
-/// Set `kvCompression` to a [`TurboQuantConfig`] to compress the
+/// Set `kvCompression` to a `TurboQuantConfig` to compress the
 /// KV cache (~3 bits/elem for keys, ~2 bits/elem for values).
 /// See the per-property doc for trade-offs.
 #[wasm_bindgen]
@@ -822,7 +822,7 @@ impl SessionConfig {
 
     /// KV cache compression configuration. `null` (default) stores
     /// keys and values as f32 — best fidelity, biggest memory
-    /// footprint. Set to a [`TurboQuantConfig`] to **request**
+    /// footprint. Set to a `TurboQuantConfig` to **request**
     /// TurboQuant compression — keys to ~3 bits/elem, values to
     /// ~2 bits/elem (plus f16 norms per block); the same `seed`
     /// reproduces the same per-layer Hadamard rotations
@@ -839,9 +839,14 @@ impl SessionConfig {
     ///   Setting both gets a warning at session creation and the
     ///   `nKeep` value is ignored on KV overflow (the cache
     ///   overflows hard instead of shifting). Pick one.
-    /// - This config drives the CPU session only. `WebGpuSession`
-    ///   takes no [`SessionConfig`], so the WebGPU path always
-    ///   runs uncompressed f32 KV regardless of this setting.
+    /// - This config drives the CPU session. `WebGpuSession` takes
+    ///   no `SessionConfig` — it accepts its own `kvCompression`
+    ///   argument on `create` instead, and its `kvCompression`
+    ///   getter reports the mode that actually took effect. Its
+    ///   `head_dim` constraint is stricter than the CPU's: a power
+    ///   of two that is also `<= 128` and a multiple of 32, and
+    ///   keys *and* values must both be compressed (a single-sided
+    ///   debug config falls back to f32 there).
     ///
     /// Setting this consumes the JS-side `TurboQuantConfig`
     /// handle (wasm-bindgen's `Option<T>` parameter shape). Read
@@ -866,14 +871,24 @@ impl SessionConfig {
     }
     #[wasm_bindgen(setter, js_name = kvCompression)]
     pub fn set_kv_compression(&mut self, v: Option<TurboQuantConfig>) {
-        self.inner.kv_compression = match v {
-            None => cera::kv_cache::KvCompression::None,
-            Some(tqc) => cera::kv_cache::KvCompression::TurboQuant {
-                seed: tqc.seed,
-                keys: tqc.keys,
-                values: tqc.values,
-            },
-        };
+        self.inner.kv_compression = to_kv_compression(v.as_ref());
+    }
+}
+
+/// `Option<TurboQuantConfig>` → the engine's `KvCompression`.
+///
+/// Shared by the CPU [`SessionConfig`] setter and `WebGpuSession::create` so the
+/// two entry points cannot drift on what `null` means or on which fields get
+/// carried across. `None` maps to `KvCompression::None`, i.e. the backend's
+/// uncompressed KV — f32 on both the CPU and WebGPU paths.
+fn to_kv_compression(v: Option<&TurboQuantConfig>) -> cera::kv_cache::KvCompression {
+    match v {
+        None => cera::kv_cache::KvCompression::None,
+        Some(tqc) => cera::kv_cache::KvCompression::TurboQuant {
+            seed: tqc.seed,
+            keys: tqc.keys,
+            values: tqc.values,
+        },
     }
 }
 
@@ -1586,10 +1601,40 @@ mod webgpu {
         /// state. `contextSize` defaults to 4096. Throws if WebGPU is
         /// unavailable, the bytes aren't a valid LFM2 GGUF, or the device
         /// rejects the model.
+        ///
+        /// `kvCompression` is optional and defaults to `null` (uncompressed f32
+        /// KV), so existing two-argument callers are unaffected. Pass a
+        /// `TurboQuantConfig` to request TurboQuant on the GPU-resident cache:
+        /// keys to ~3 bits/elem and values to ~2, plus an f16 norm per block, so
+        /// against f32's 32 bits the KV slabs shrink ~10.7x rather than the ~12.8x
+        /// the bit rates alone suggest. Concretely, for LFM2-1.2B (6 attention
+        /// layers, 8 KV heads x head_dim 64) that is 24 KiB per token down to
+        /// 2.25 KiB — at a 16K context, ~403 MB of GPU-side KV becomes ~38 MB.
+        ///
+        /// Setting this **consumes** the JS-side `TurboQuantConfig` handle
+        /// (wasm-bindgen's by-value `Option<T>` parameter shape), exactly like
+        /// the `SessionConfig.kvCompression` setter. Reusing one handle across
+        /// two `create` calls — two sessions, or a retry after a failed load —
+        /// throws "null pointer passed to rust" on the second. Build a fresh
+        /// config per session.
+        ///
+        /// The request can be **silently downgraded**: the WebGPU kernels need a
+        /// `head_dim` that is a power of two, `<= 128`, and a multiple of 32, and
+        /// they only implement compressing keys *and* values together. Anything
+        /// else falls back to uncompressed KV. The engine records that as a
+        /// `tracing::warn!`, and `cera-wasm` installs no tracing subscriber, so
+        /// **nothing reaches the browser console** — reading the `kvCompression`
+        /// getter afterwards is the only way to tell.
+        //
+        // No rustdoc intra-doc links in the doc block above: wasm-bindgen copies
+        // doc comments verbatim into `cera_wasm.d.ts`, so a `crate::`- or
+        // `Self::`-qualified link ships to TS consumers as raw markdown pointing
+        // at a Rust path they cannot follow. Plain code spans only.
         #[wasm_bindgen(js_name = create)]
         pub async fn create(
             bytes: Vec<u8>,
             context_size: Option<u32>,
+            kv_compression: Option<crate::TurboQuantConfig>,
         ) -> Result<WebGpuSession, JsError> {
             let ctx = cera::backend::wgpu::GpuContext::new_async()
                 .await
@@ -1608,6 +1653,31 @@ mod webgpu {
                 ctx,
             )
             .map_err(map_err)?;
+            // Builds the GPU-resident compressed cache. Must run before the first
+            // forward pass — `Session::new` calls it at the same point.
+            let compression = crate::to_kv_compression(kv_compression.as_ref());
+            model
+                .configure_kv_compression(&compression)
+                .map_err(crate::map_cera_err)?;
+            // `from_config`, not `from_config_with_compression`: on this path the
+            // KV cache lives entirely on the GPU. `GpuLfm2Model` reads its
+            // TurboQuant state from its own `tq` cache and never from
+            // `InferenceState` — which does carry compression state
+            // (`tq_config`, `tq_rotations`, `kv_f16`, the per-layer compressed
+            // slots), this backend just ignores all of it — so passing the mode
+            // here would allocate CPU-side *compressed* caches that nothing
+            // reads. `cera::Session` does pass it, because it also serves the CPU
+            // backends whose caches *are* InferenceState-backed.
+            //
+            // Known waste, pre-dating the compression wiring: `from_config` still
+            // reserves the full uncompressed CPU-side KV — a separate
+            // `max_seq_len × kv_dim × 4 B` vector for keys *and* values, per
+            // attention layer — which this path also never reads. It is the same
+            // shape as the GPU slab TurboQuant shrinks, so at the 16K context
+            // quoted on `create` it is ~403 MB of wasm linear memory: numerically
+            // the entire saving being advertised. The compression win is real
+            // GPU-side but is NOT reflected in browser memory until this
+            // allocation is capped, which is the obvious follow-up.
             let state = cera::kv_cache::InferenceState::from_config(model.config())
                 .map_err(crate::map_cera_err)?;
             Ok(WebGpuSession {
@@ -1616,6 +1686,17 @@ mod webgpu {
                 state,
                 eos,
             })
+        }
+
+        /// The KV-cache mode this session actually resolved to:
+        /// `"turboquant(seed=N)"` or `"uncompressed"`.
+        ///
+        /// Read this after `create` to confirm a TurboQuant request was honored —
+        /// a downgrade is silent in the browser, so this is the only JS-visible
+        /// signal that compression is off. See `create` for what causes one.
+        #[wasm_bindgen(getter, js_name = kvCompression)]
+        pub fn kv_compression(&self) -> String {
+            self.model.kv_mode_label()
         }
 
         /// Adapter + backend description of the WebGPU device (e.g.

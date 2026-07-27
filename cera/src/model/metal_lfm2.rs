@@ -746,7 +746,7 @@ impl MetalLfm2Model {
         // `numel % block == 0` but not the inner dimension alone, so assert the
         // Metal kernel precondition here.
         anyhow::ensure!(
-            hs % embedding_dtype.block_size() == 0,
+            hs.is_multiple_of(embedding_dtype.block_size()),
             "token_embd.weight hidden size {hs} is not divisible by {embedding_dtype:?} \
              block size {} (Metal needs block-aligned rows)",
             embedding_dtype.block_size(),
@@ -780,7 +780,7 @@ impl MetalLfm2Model {
         // by `hs / block * block_bytes`, so `hs` must be block-aligned for the
         // effective output dtype (tied embedding or untied `output.weight`).
         anyhow::ensure!(
-            hs % output_dtype.block_size() == 0,
+            hs.is_multiple_of(output_dtype.block_size()),
             "logit-projection inner dim {hs} is not divisible by {output_dtype:?} block \
              size {} (Metal needs block-aligned rows)",
             output_dtype.block_size(),
@@ -813,7 +813,7 @@ impl MetalLfm2Model {
             // the inner dim `k` must be block-aligned. GGUF only guarantees
             // `numel (= m*k) % block == 0`; assert the per-row precondition here.
             anyhow::ensure!(
-                wref.k % wref.dtype.block_size() == 0,
+                wref.k.is_multiple_of(wref.dtype.block_size()),
                 "layer weight inner dim k={} is not divisible by {:?} block size {} \
                  (Metal needs block-aligned rows)",
                 wref.k,
@@ -1612,7 +1612,7 @@ impl MetalLfm2Model {
         // passing `false`.
         let batched = Self::is_batched_gemm_dtype(w.dtype);
         let block_k = w.dtype.block_size() as u32;
-        if !batched || accumulate || n < GEMM_MIN_N || w.k % block_k != 0 {
+        if !batched || accumulate || n < GEMM_MIN_N || !w.k.is_multiple_of(block_k) {
             if w.dtype == DType::Q4_0 {
                 return self.encode_gemv_batch(
                     enc,
@@ -2003,9 +2003,9 @@ impl MetalLfm2Model {
                         //   m=3072: slim 42.2µs, fast 31.9µs (fast -24%)
                         //   m=4096: slim 45.8µs, fast 27.0µs (fast -41%)
                         //   m=65536: slim 155µs, fast 122µs (fast -21%)
-                        if w.m % 8 == 0 && w.m >= 3072 {
+                        if w.m.is_multiple_of(8) && w.m >= 3072 {
                             2
-                        } else if w.m % 2 == 0 {
+                        } else if w.m.is_multiple_of(2) {
                             1
                         } else {
                             0
@@ -2662,7 +2662,7 @@ impl MetalLfm2Model {
         // Out-of-bounds threadgroup writes would corrupt adjacent slots.
         // Also head_dim % 4 == 0 is required by the float4-from-half4 Q·K path.
         assert!(
-            head_dim <= 128 && head_dim % 4 == 0,
+            head_dim <= 128 && head_dim.is_multiple_of(4),
             "encode_attention requires head_dim ≤ 128 and divisible by 4, got {}",
             head_dim,
         );
@@ -2790,7 +2790,7 @@ impl MetalLfm2Model {
         // head_dim ≤ MAX_HEAD_DIM=128 and head_dim % 4 == 0 for the
         // float4-from-half4 Q·K path.
         assert!(
-            head_dim <= 128 && head_dim % 4 == 0,
+            head_dim <= 128 && head_dim.is_multiple_of(4),
             "encode_attention_q_offset requires head_dim ≤ 128 and divisible by 4, got {}",
             head_dim,
         );
@@ -2917,7 +2917,7 @@ impl MetalLfm2Model {
         //   - hd <= 256 (final-normalize + write-out loops bound by hd)
         //   - hd % 8 == 0 (simdgroup_matrix 8×8 tile alignment on head_dim)
         assert!(
-            head_dim <= 256 && head_dim % 8 == 0,
+            head_dim <= 256 && head_dim.is_multiple_of(8),
             "attention_prefill requires head_dim <= 256 and divisible by 8, got {}",
             head_dim,
         );

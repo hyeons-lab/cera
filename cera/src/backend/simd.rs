@@ -1500,7 +1500,7 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) -> bool {
-        if !k_quant_gemm_available() || k % 256 != 0 {
+        if !k_quant_gemm_available() || !k.is_multiple_of(256) {
             return false;
         }
         match cpu_features().tier {
@@ -2867,7 +2867,7 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) -> bool {
-        if !k_quant_gemm_available() || k % 256 != 0 {
+        if !k_quant_gemm_available() || !k.is_multiple_of(256) {
             return false;
         }
         match cpu_features().tier {

@@ -284,7 +284,7 @@ fn synth_adapter_io_varied(
         // B[out_dim×rank]: varies by (o, r), sign flips by output-channel parity —
         // a channel-scramble bug reorders these and collapses the cosine.
         let fb = |o: usize, r: usize| {
-            let sign = if o % 2 == 0 { 1.0 } else { -1.0 };
+            let sign = if o.is_multiple_of(2) { 1.0 } else { -1.0 };
             b * sign * (1.0 + 0.5 * ((o + 2 * r) % 7) as f32)
         };
         push(
