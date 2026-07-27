@@ -1399,6 +1399,73 @@ impl Model for LlamaModel {
         logits
     }
 
+    fn supports_all_logits(&self) -> bool {
+        true
+    }
+
+    fn forward_prefill_logits_all(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        assert!(
+            !tokens.is_empty(),
+            "forward_prefill_logits_all requires at least one token"
+        );
+        assert_eq!(
+            start_pos, state.seq_len,
+            "forward_prefill_logits_all: start_pos ({start_pos}) must equal state.seq_len ({})",
+            state.seq_len
+        );
+        let n = tokens.len();
+        let vocab = self.config.vocab_size;
+
+        // Fast path: one batched pass captures every token's post-final-norm
+        // hidden state, then project each row to logits. Reuses the tested
+        // batched-prefill KV append (same gate as `forward_prefill`). The
+        // oracle-dump harness needs the per-token substep records, so defer to
+        // the per-token path when it is active.
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+        if n > 1 && !transformer::oracle_dump::is_active() {
+            let hs = self.config.hidden_size;
+            let mut hidden = Vec::new();
+            let _ = self.forward_prefill_batched(tokens, start_pos, state, Some(&mut hidden));
+            debug_assert_eq!(hidden.len(), n * hs, "hidden capture must be [n * hs]");
+            // KNOWN COST, deliberately left for a follow-up: this reads the LM
+            // head `n` times, once per `project_logits` GEMV. That partly works
+            // against the reason speculative decoding exists — verifying `1 + k`
+            // tokens in one forward is supposed to amortize the weight read, and
+            // the LM head is the single largest matrix in the model
+            // (`hidden_size x vocab`), so at k = 4-8 it is re-streamed 5-9x.
+            //
+            // The fix is the `quantize_columns` + `gemm_preq` pair used for every
+            // other projection in this file: one `[vocab x n] = [vocab x hs] *
+            // [hs x n]` GEMM. It is not a drop-in — `gemm_preq` is column-major
+            // in `n`, so it needs a transpose to the `[n x vocab]` row-major
+            // layout `verify_draft` indexes, plus the `batched_gemm_supports`
+            // dtype gate (a Q5_K LM head has no GEMM kernel) with this loop as
+            // the fallback. Worth doing with a benchmark behind it rather than
+            // bolted onto this phase.
+            let mut logits = Vec::with_capacity(n * vocab);
+            for j in 0..n {
+                let row = &hidden[j * hs..(j + 1) * hs];
+                let row_logits = self.project_logits(row, state);
+                logits.extend_from_slice(&row_logits);
+            }
+            return logits;
+        }
+
+        // Fallback (single token, no batched kernel, or oracle active): each
+        // `forward` returns that position's logits and appends its K/V cell.
+        let mut logits = Vec::with_capacity(n * vocab);
+        for (i, &token) in tokens.iter().enumerate() {
+            let l = self.forward(&[token], start_pos + i, state);
+            logits.extend_from_slice(&l);
+        }
+        logits
+    }
+
     fn config(&self) -> &ModelConfig {
         &self.config
     }

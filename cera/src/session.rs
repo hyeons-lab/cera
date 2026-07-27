@@ -56,6 +56,32 @@ impl Default for SessionConfig {
     }
 }
 
+/// Speculative-decoding configuration for [`GenerateOpts::spec`].
+///
+/// Prompt-lookup (n-gram) drafting with greedy verification: the drafter guesses
+/// the next tokens from the most recent earlier occurrence of the last `ngram`
+/// tokens and the target verifies up to `k` of them in a single forward. No
+/// draft model, so zero extra weight memory — ideal for the memory-bandwidth-
+/// bound mobile decode this targets. Output is a valid greedy decode regardless
+/// of draft quality (every emitted token is the target's argmax); a poor draft
+/// only lowers the acceptance rate. See [`crate::spec`].
+#[derive(Debug, Clone, Copy)]
+pub struct SpecDecode {
+    /// Length of the trailing n-gram matched to locate a draft. Smaller matches
+    /// more often (higher draft rate) but less precisely.
+    pub ngram: usize,
+    /// Maximum draft length verified per round (the speculation depth).
+    pub k: usize,
+}
+
+impl Default for SpecDecode {
+    fn default() -> Self {
+        // ngram=2 finds matches readily on repetitive text; k=6 balances the
+        // win-when-accepted against the wasted compute on rejection.
+        Self { ngram: 2, k: 6 }
+    }
+}
+
 /// Per-call generation options.
 #[derive(Debug, Clone)]
 pub struct GenerateOpts {
@@ -96,6 +122,14 @@ pub struct GenerateOpts {
     pub flush_every_tokens: u32,
     /// Emit `on_text_tokens` at least every N milliseconds. `0` disables time-based flushing.
     pub flush_every_ms: u32,
+    /// Speculative decoding. `None` disables it (default). When set, decode uses
+    /// speculative verification **only** on the plain greedy path (`temperature
+    /// <= 0` or `top_k == 1`, no grammar) with a dense model that supports
+    /// all-position logits and an uncompressed (f32/f16) KV cache; any other
+    /// configuration falls back to the normal decode path transparently. Output
+    /// is identical to a greedy decode — this is a throughput optimization, not
+    /// a behavior change. See [`SpecDecode`] and [`crate::spec`].
+    pub spec: Option<SpecDecode>,
 }
 
 impl Default for GenerateOpts {
@@ -113,6 +147,7 @@ impl Default for GenerateOpts {
             grammar_trigger_tokens: Vec::new(),
             flush_every_tokens: 16,
             flush_every_ms: 50,
+            spec: None,
         }
     }
 }
@@ -300,6 +335,31 @@ pub fn can_shift(
     supports_kv_shift && n_keep > 0 && !cache_unshiftable && current_pos >= n_keep + shift_needed
 }
 
+/// Mirror an `n_keep` KV shift in the spec-decode drafting history.
+///
+/// `shift_kv` evicts KV cells `[n_keep .. n_keep + shift)`, so drop exactly that
+/// range — not an equal count off the front. Front-trimming keeps the length
+/// right and the contents wrong twice over: it discards the pinned prefix, which
+/// is still in the KV and is usually the most re-used text (a system prompt),
+/// while keeping the tokens the shift actually evicted. Both push
+/// [`crate::spec::prompt_lookup_draft`] toward n-grams that no longer precede the
+/// current position, costing rejected drafts and wasted verify rounds.
+///
+/// A free function, like [`can_shift`], so the range arithmetic is testable
+/// without standing up a model. Alignment is approximate by design — nothing
+/// pins the history to the KV index-for-index (a partial prefill advances them
+/// differently, and `append_embeddings` adds KV positions with no token ids at
+/// all) — which is why drafting is a heuristic whose every token `verify_draft`
+/// re-derives.
+pub(crate) fn shift_token_history(history: &mut Vec<u32>, n_keep: usize, shift: usize) {
+    if history.is_empty() {
+        return;
+    }
+    let start = n_keep.min(history.len());
+    let end = (n_keep + shift).min(history.len());
+    history.drain(start..end);
+}
+
 /// One slice of a tokenized chat template, distinguishing text runs
 /// from image-marker positions. `Text { start, end }` is a half-open
 /// index range into the same `tokens` slice that
@@ -373,6 +433,17 @@ pub struct Session {
     sampler: Sampler,
     /// Total tokens currently in KV.
     current_pos: usize,
+    /// Running token sequence (prompt + emitted) used only as context for the
+    /// speculative-decoding prompt-lookup drafter (`GenerateOpts::spec`). It is
+    /// a drafting *heuristic*, never a correctness input — every drafted token
+    /// is verified against the target's logits — so it need not stay perfectly
+    /// aligned with the KV under exotic `n_keep` context shifts (which only
+    /// trim it approximately). Accumulated on every prefill (`append_tokens`)
+    /// so a spec run has prompt context from the first call, but *consumed*
+    /// only by the drafter; its `u32`-per-token footprint is negligible beside
+    /// the KV cache, so it is recorded unconditionally rather than gated on
+    /// whether `spec` will ever be set.
+    token_history: Vec<u32>,
     /// Mirror of `current_pos` for lock-free external reads via `position()`.
     position_atomic: Arc<AtomicU32>,
     /// External cancel flag. Checked between tokens during decode.
@@ -544,6 +615,7 @@ impl Session {
             state,
             sampler,
             current_pos: 0,
+            token_history: Vec::new(),
             position_atomic: Arc::new(AtomicU32::new(0)),
             cancel: Arc::new(AtomicBool::new(false)),
             last_logits: None,
@@ -725,6 +797,7 @@ impl Session {
         // Re-apply the attached adapter to the rebuilt state (preserved across reset).
         self.state.lora = self.lora.clone();
         self.current_pos = 0;
+        self.token_history.clear();
         self.position_atomic.store(0, Ordering::Relaxed);
         self.last_logits = None;
         self.prefill_tokens = 0;
@@ -1014,6 +1087,21 @@ impl Session {
             self.model.shift_kv(&mut self.state, n_keep, shift_needed);
             let before = self.current_pos;
             self.current_pos -= shift_needed;
+            // Mirror the shift in the drafting history: `shift_kv` drops KV cells
+            // `[n_keep .. n_keep + shift_needed)`, so drop exactly that range here
+            // rather than an equal count off the front. Front-trimming keeps the
+            // length right but the *contents* wrong in both directions — it
+            // discards the pinned prefix, which is still in the KV and is often
+            // the most re-used text (a system prompt), while retaining the tokens
+            // the shift actually evicted. Both errors push `prompt_lookup_draft`
+            // toward n-grams that no longer precede the current position, costing
+            // rejected drafts and wasted verify rounds.
+            //
+            // Still an approximation, not a guarantee: nothing pins
+            // `token_history` to the KV index-for-index (a partial prefill
+            // advances them differently), which is why drafting is a heuristic
+            // whose output `verify_draft` re-derives regardless.
+            shift_token_history(&mut self.token_history, n_keep, shift_needed);
             self.position_atomic
                 .store(self.current_pos as u32, Ordering::Relaxed);
             // Pre-shift `last_logits` corresponded to position `before - 1`;
@@ -1044,6 +1132,9 @@ impl Session {
         self.prefill_elapsed += prefill_start.elapsed();
         self.prefill_tokens = self.prefill_tokens.saturating_add(consumed as u32);
         self.current_pos += consumed;
+        // Record the prefilled tokens as spec-decode drafting context (only the
+        // portion actually consumed into the KV on a partial/cancelled prefill).
+        self.token_history.extend_from_slice(&tokens[..consumed]);
         self.position_atomic
             .store(self.current_pos as u32, Ordering::Relaxed);
         if consumed < tokens.len() {
@@ -1139,6 +1230,18 @@ impl Session {
             self.model.shift_kv(&mut self.state, n_keep, shift_needed);
             let before = self.current_pos;
             self.current_pos -= shift_needed;
+            // Mirror the shift in the drafting history, same range as
+            // `append_tokens`. Two reasons it matters even though this path
+            // appends *embeddings*, which have no token ids to record:
+            //  - without it the history keeps entries for evicted positions, so
+            //    drafts are proposed from text no longer in the KV;
+            //  - a session alternating `append_tokens` (which grows the history)
+            //    with embedding appends that shift would grow it without bound
+            //    while the KV stays capped at `max_seq_len`.
+            // The history is inherently a partial view here — the embedding
+            // positions themselves are never recorded — which is why drafting off
+            // it is a heuristic that `verify_draft` re-derives regardless.
+            shift_token_history(&mut self.token_history, n_keep, shift_needed);
             self.position_atomic
                 .store(self.current_pos as u32, Ordering::Relaxed);
             self.last_logits = None;
@@ -1607,6 +1710,29 @@ impl Session {
         let want_greedy = opts.temperature <= 0.0 || opts.top_k == 1;
         let greedy = want_greedy && opts.grammar.is_none();
 
+        // Speculative-decoding fast path. Engages only on the plain greedy path
+        // (implied by `greedy`, which already excludes grammar) with a dense
+        // model that can return all-position logits and an uncompressed KV
+        // cache — verifying K drafted tokens in one forward amortizes the single
+        // weight-read a bandwidth-bound decode is limited by. Output is a valid
+        // greedy decode; see `generate_greedy_spec` and `crate::spec`. Any other
+        // configuration falls through to the normal decode loop below.
+        if let Some(sd) = opts.spec
+            && greedy
+            && self.model.supports_all_logits()
+            && !self.state.is_compressed()
+        {
+            return self.generate_greedy_spec(
+                opts,
+                sink,
+                sd,
+                logits,
+                prompt_eval_tokens,
+                prompt_eval_ms,
+                decode_start,
+            );
+        }
+
         // Grammar matcher + per-token output-byte mask. The mask depends only on the
         // tokenizer (not the grammar), so build it once (O(vocab)) and cache it on the
         // session; subsequent grammar-constrained calls reuse it. It's `take`n into a
@@ -1781,6 +1907,17 @@ impl Session {
             }
 
             pending.push(token);
+            // Record here too, not just on the spec path's `emit!`. A session can
+            // mix the two — spec engages only for plain greedy on a dense model
+            // with uncompressed KV, so grammar, sampling, a compressed cache, or
+            // `opts.spec = None` all land here — and `token_history` is meant to
+            // mirror what the KV holds. Skipping it would leave a later
+            // spec-enabled `generate()` drafting against a history with a hole in
+            // it: every n-gram spanning the gap matches text that never preceded
+            // the current position, so the drafts are rejected and the round is
+            // wasted. Output stays correct either way (`verify_draft` re-derives
+            // every token), which is exactly why the gap would go unnoticed.
+            self.token_history.push(token);
             generated += 1;
 
             let should_flush_n = pending.len() >= flush_n;
@@ -1847,6 +1984,215 @@ impl Session {
             self.last_logits = None;
         } else {
             self.last_logits = Some(logits);
+        }
+
+        sink.on_done(finish.clone());
+
+        let decode_ms = duration_ms_u32(decode_start.elapsed());
+        Ok(GenerateSummary {
+            tokens_generated: generated,
+            prompt_eval_tokens,
+            prompt_eval_ms,
+            decode_ms,
+            finish_reason: finish,
+        })
+    }
+
+    /// Greedy decode with speculative verification (prompt-lookup drafting).
+    /// Reached from [`Self::generate`] when `opts.spec` is set and the run is
+    /// eligible (see the branch there). `next_logits` is the prefill/last-step
+    /// logit vector predicting the token at `current_pos`.
+    ///
+    /// Emits the same token stream as a plain greedy decode — every token is the
+    /// target's argmax at its position — but verifies up to `k` drafted tokens
+    /// per forward, so an accepted run costs a single weight-read. The core
+    /// accept/verify/truncate step is shared with the standalone
+    /// [`crate::spec::greedy_generate_spec`] oracle via
+    /// [`crate::spec::verify_draft`]; this method layers the `Session` concerns
+    /// on top: streaming via `sink`, `stop_tokens` / EOS / `ignore_eos`,
+    /// cancellation, context-full, telemetry, and `current_pos` / `last_logits`
+    /// chaining.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_greedy_spec<S: ModalitySink + ?Sized>(
+        &mut self,
+        opts: &GenerateOpts,
+        sink: &mut S,
+        sd: SpecDecode,
+        mut next_logits: Vec<f32>,
+        prompt_eval_tokens: u32,
+        prompt_eval_ms: u32,
+        decode_start: Instant,
+    ) -> Result<GenerateSummary, CeraError> {
+        use crate::sampler::argmax;
+
+        let vocab = next_logits.len();
+        let eos = self.tokenizer.eos_token();
+        // EOS / stop tokens end decode unless the caller asked to ignore them
+        // (e.g. a fixed-length benchmark loop). Mirrors the normal loop's
+        // `honor_stop` for the no-grammar case.
+        let honor_stop = !opts.ignore_eos;
+        let flush_n = opts.flush_every_tokens.max(1) as usize;
+        let flush_ms = opts.flush_every_ms;
+
+        let mut pending: Vec<u32> = Vec::with_capacity(flush_n);
+        let mut last_flush = Instant::now();
+        let mut generated: u32 = 0;
+        let mut finish = FinishReason::MaxTokens;
+        let mut stats = crate::spec::SpecStats::default();
+
+        // Emit one token to the stream: buffer it, flush on the count/time
+        // threshold. Returns nothing — stop/budget decisions stay in the loop.
+        macro_rules! emit {
+            ($tok:expr) => {{
+                let tok = $tok;
+                pending.push(tok);
+                self.token_history.push(tok);
+                generated += 1;
+                let flush = pending.len() >= flush_n
+                    || (flush_ms > 0 && last_flush.elapsed().as_millis() >= flush_ms as u128);
+                if flush {
+                    sink.on_text_tokens(&pending);
+                    pending.clear();
+                    last_flush = Instant::now();
+                }
+            }};
+        }
+        let is_stop =
+            |tok: u32| honor_stop && (eos == Some(tok) || opts.stop_tokens.contains(&tok));
+
+        loop {
+            if self.cancel.load(Ordering::Relaxed) {
+                finish = FinishReason::Cancelled;
+                break;
+            }
+            if generated >= opts.max_tokens {
+                break;
+            }
+            if self.current_pos >= self.max_seq_len {
+                finish = FinishReason::ContextFull;
+                break;
+            }
+
+            // The target's argmax at the current position — always correct. Like
+            // the normal greedy loop, a stop token ends decode *without* being
+            // streamed, counted, or KV-appended, so the spec token stream and
+            // `tokens_generated` are identical to a plain greedy decode.
+            let t = argmax(&next_logits);
+            if is_stop(t) {
+                finish = FinishReason::Stop;
+                break;
+            }
+            // `t`'s KV is not in the cache yet; a forward below (plain or the
+            // verify batch) adds it.
+            emit!(t);
+            if generated >= opts.max_tokens {
+                // `t` is the final token: add its KV (so `current_pos` matches
+                // the emitted stream for chaining) and stop. Use `forward_greedy`
+                // to mirror the normal greedy loop's final step — on GPU backends
+                // with a native argmax it also skips the vocab-sized readback we'd
+                // only discard (on CPU it costs the same as `forward`).
+                let _ = self
+                    .model
+                    .forward_greedy(&[t], self.current_pos, &mut self.state);
+                self.current_pos += 1;
+                self.position_atomic
+                    .store(self.current_pos as u32, Ordering::Relaxed);
+                break;
+            }
+
+            // Draft from the running history (now including `t`), clamped so the
+            // verify batch — which appends `1 + draft.len()` tokens at
+            // `[old .. old + 1 + draft.len()]` — cannot push the KV past
+            // `max_seq_len`. Room after `t` is `max_seq_len - current_pos - 1`
+            // (>= 0 since the loop-top guard ensured `current_pos < max_seq_len`).
+            // An empty draft (no n-gram match, or no room) means a plain step.
+            let room = self.max_seq_len - self.current_pos - 1;
+            let mut draft = crate::spec::prompt_lookup_draft(&self.token_history, sd.ngram, sd.k);
+            if draft.len() > room {
+                draft.truncate(room);
+            }
+            if draft.is_empty() {
+                next_logits = self.model.forward(&[t], self.current_pos, &mut self.state);
+                self.current_pos += 1;
+                self.position_atomic
+                    .store(self.current_pos as u32, Ordering::Relaxed);
+                continue;
+            }
+
+            // Verify [t, draft...] in one forward; the KV is left holding `t`
+            // plus the accepted drafts.
+            let old = self.current_pos;
+            stats.rounds += 1;
+            stats.drafted += draft.len();
+            let vr =
+                crate::spec::verify_draft(self.model.as_ref(), &mut self.state, t, &draft, vocab);
+
+            // Emit accepted drafts under the stop / budget policy. On an early
+            // stop, roll the KV back to the tokens actually kept.
+            let mut kept = 0usize;
+            let mut stopped = false;
+            for &q in &vr.accepted {
+                if generated >= opts.max_tokens {
+                    stopped = true;
+                    break;
+                }
+                // Same stop semantics as the guaranteed token and the normal
+                // loop: a stop token is not streamed or counted, and `kept`
+                // excludes it so the `truncate_to` below drops its KV cell.
+                if is_stop(q) {
+                    finish = FinishReason::Stop;
+                    stopped = true;
+                    break;
+                }
+                emit!(q);
+                stats.accepted += 1;
+                kept += 1;
+            }
+            if kept < vr.accepted.len() {
+                self.state.truncate_to(old + 1 + kept);
+            }
+            self.current_pos = old + 1 + kept;
+            // Publish progress per round (not just once at the end) so external
+            // `position()` readers track a spec run the way they track the
+            // normal per-token loop.
+            self.position_atomic
+                .store(self.current_pos as u32, Ordering::Relaxed);
+            if stopped {
+                break;
+            }
+            // Every accepted draft was emitted; `follow_logits` predicts the
+            // next position (the bonus token, or the correction at a mismatch).
+            next_logits = vr.follow_logits;
+        }
+
+        if !pending.is_empty() {
+            sink.on_text_tokens(&pending);
+        }
+
+        self.position_atomic
+            .store(self.current_pos as u32, Ordering::Relaxed);
+
+        // Chaining: mirror the greedy path in `generate`. With tokens emitted, a
+        // forward advanced the KV and `next_logits` is stale relative to the
+        // saved contract (greedy chaining re-appends), so clear it. With nothing
+        // emitted (cancel/context-full before the first token) the prefill
+        // distribution is still valid — restore it so the session stays usable.
+        if generated > 0 {
+            self.last_logits = None;
+        } else {
+            self.last_logits = Some(next_logits);
+        }
+
+        // Acceptance telemetry (diagnostics / bench). Cheap and only logged.
+        if stats.drafted > 0 {
+            tracing::debug!(
+                target: "cera::spec",
+                drafted = stats.drafted,
+                accepted = stats.accepted,
+                rounds = stats.rounds,
+                acceptance = stats.acceptance_rate(),
+                "speculative decode round summary"
+            );
         }
 
         sink.on_done(finish.clone());
@@ -1950,6 +2296,37 @@ mod tests {
     /// `shift_kv_with_rope` (which hard-asserts against compressed caches).
     /// f16 KV is now shiftable, so the call sites pass `is_compressed()` alone
     /// (no `|| kv_f16`).
+    #[test]
+    fn shift_history_drops_the_evicted_middle_not_the_front() {
+        // KV holds [0..8); a shift of 3 with n_keep = 2 evicts cells [2..5).
+        let mut h: Vec<u32> = (0..8).collect();
+        shift_token_history(&mut h, 2, 3);
+        // The pinned prefix 0,1 survives — it is still in the KV — and 2,3,4 go.
+        assert_eq!(h, vec![0, 1, 5, 6, 7]);
+        // The front-draining it replaced would have produced [3,4,5,6,7]:
+        // prefix gone, evicted 3 and 4 kept. Same length, wrong contents.
+        assert_ne!(h, vec![3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn shift_history_clamps_a_short_history() {
+        // The history is not pinned to the KV index-for-index, so the range can
+        // reach past its end; clamping must not panic or truncate the prefix.
+        let mut h: Vec<u32> = vec![9, 8, 7];
+        shift_token_history(&mut h, 2, 100);
+        assert_eq!(h, vec![9, 8]);
+
+        // n_keep alone past the end leaves it untouched.
+        let mut h2: Vec<u32> = vec![9, 8, 7];
+        shift_token_history(&mut h2, 50, 4);
+        assert_eq!(h2, vec![9, 8, 7]);
+
+        // Empty is a no-op (the pre-prefill case).
+        let mut h3: Vec<u32> = Vec::new();
+        shift_token_history(&mut h3, 2, 3);
+        assert!(h3.is_empty());
+    }
+
     #[test]
     fn can_shift_blocks_unshiftable_caches() {
         // Happy path: shiftable f32/f16 cache with room to drop.

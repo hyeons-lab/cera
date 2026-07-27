@@ -797,6 +797,25 @@ enum Command {
         /// explicitly rather than printed as a misleading 0.0 submits/token.
         #[arg(long)]
         gpu_io: bool,
+
+        /// Enable greedy speculative decoding (prompt-lookup drafting) for the
+        /// decode phase. Verifies K drafted tokens per forward, so a
+        /// bandwidth-bound decode amortizes its single weight-read over the
+        /// accepted run — the win shows on repetitive / long-context prompts.
+        /// Output is identical to greedy decode. Only engages on dense models
+        /// with an uncompressed (f32/f16) KV cache; otherwise it's a no-op.
+        #[arg(long)]
+        spec: bool,
+
+        /// Trailing n-gram length the prompt-lookup drafter matches. Only used
+        /// with `--spec`.
+        #[arg(long, default_value_t = 2)]
+        spec_ngram: usize,
+
+        /// Max draft length verified per speculative round (speculation depth).
+        /// Only used with `--spec`.
+        #[arg(long, default_value_t = 6)]
+        spec_k: usize,
     },
 
     /// List bundles published on `huggingface.co/LiquidAI/LeapBundles`.
@@ -3627,8 +3646,15 @@ fn main() -> Result<()> {
             kv_cache_keys,
             ubatch_size,
             gpu_io,
+            spec,
+            spec_ngram,
+            spec_k,
         } => {
             anyhow::ensure!(runs >= 1, "--runs must be >= 1");
+            if spec {
+                anyhow::ensure!(spec_ngram >= 1, "--spec-ngram must be >= 1");
+                anyhow::ensure!(spec_k >= 1, "--spec-k must be >= 1");
+            }
             if std::env::var("CERA_PROFILE").is_ok() {
                 eprintln!(
                     "warning: CERA_PROFILE is set — bench numbers will be inflated by profile overhead"
@@ -3697,6 +3723,27 @@ fn main() -> Result<()> {
                 warmup,
                 runs
             );
+            if spec {
+                // Speculative decode only engages on a dense model with an
+                // uncompressed KV cache; flag when it will silently no-op so the
+                // measured number isn't mistaken for a spec result. Test against
+                // the resolved `kv_compression` (which already reflects any
+                // unsupported-mode fallback to f32), not the raw flag string —
+                // every TurboQuant variant is compressed, only f32/f16 are not.
+                let compressed = matches!(
+                    kv_compression,
+                    cera::kv_cache::KvCompression::TurboQuant { .. }
+                );
+                let engages = engine.model().supports_all_logits() && !compressed;
+                eprintln!(
+                    "Speculative decode: ON (ngram={spec_ngram}, k={spec_k}){}",
+                    if engages {
+                        String::new()
+                    } else {
+                        " — NOTE: model/KV not eligible, decode falls back to non-spec".to_string()
+                    }
+                );
+            }
 
             // Greedy (temp=0): deterministic, bench-friendly. NoopSink swallows tokens.
             let run_once = || -> Result<RunStats> {
@@ -3722,6 +3769,10 @@ fn main() -> Result<()> {
                     // `max_tokens`, not stop early at EOS — otherwise short
                     // completions silently shrink the measured sample.
                     ignore_eos: true,
+                    spec: spec.then_some(cera::SpecDecode {
+                        ngram: spec_ngram,
+                        k: spec_k,
+                    }),
                     ..Default::default()
                 };
                 let mut sink = NoopSink;

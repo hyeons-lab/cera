@@ -940,6 +940,79 @@ impl InferenceState {
         self.seq_len = snapshot.seq_len;
     }
 
+    /// Truncate the KV cache to its first `len` positions, dropping the tail
+    /// `[len .. seq_len)` from every attention layer, and set `seq_len = len`.
+    ///
+    /// This is the speculative-decoding rollback: after verifying K drafted
+    /// tokens, the rejected ones' K/V cells (appended at the tail) are dropped so
+    /// the next forward continues from the accepted boundary. Unlike
+    /// [`Self::shift_kv_with_rope`], **no RoPE fixup is needed** — surviving cells
+    /// keep their original absolute positions, so this is a plain `Vec::truncate`.
+    ///
+    /// Preconditions (enforced in all builds):
+    /// - `len <= seq_len`
+    /// - `!self.is_compressed()` — TurboQuant caches have no tail-truncate.
+    /// - No `Conv` layers — LFM2's gated-conv state is not position-indexed, so a
+    ///   KV tail-truncate cannot roll it back (spec-decode is dense-only in Phase 1).
+    pub fn truncate_to(&mut self, len: usize) {
+        assert!(
+            len <= self.seq_len,
+            "truncate_to({len}) exceeds seq_len {}",
+            self.seq_len
+        );
+        assert!(
+            !self.is_compressed(),
+            "truncate_to called on a TurboQuant-compressed state; not supported"
+        );
+        if len == self.seq_len {
+            return;
+        }
+        let seq_len = self.seq_len;
+        // Truncate one time-major `[seq_len × kv_dim]` cache to `len` positions.
+        // `kv_dim = cache.len() / seq_len` (exact — the cache is a whole multiple
+        // of `seq_len`); an empty cache (the inactive f32/f16 slot) is a no-op.
+        fn trunc<T>(cache: &mut Vec<T>, seq_len: usize, len: usize) {
+            if cache.is_empty() {
+                return;
+            }
+            // `kv_dim` is recovered by division, so a cache that is not a whole
+            // multiple of `seq_len` would yield a wrong stride and truncate to a
+            // boundary mid-vector — leaving a cache that still looks well-formed
+            // and decodes to plausible garbage. Assert the invariant instead of
+            // propagating it silently.
+            assert_eq!(
+                cache.len() % seq_len,
+                0,
+                "KV cache length {} is not a multiple of seq_len {seq_len}; \
+                 cannot recover kv_dim to truncate on a vector boundary",
+                cache.len()
+            );
+            let kv_dim = cache.len() / seq_len;
+            cache.truncate(len * kv_dim);
+        }
+        for layer in &mut self.layers {
+            match layer {
+                LayerState::Attention {
+                    key_cache,
+                    value_cache,
+                    key_cache_f16,
+                    value_cache_f16,
+                    ..
+                } => {
+                    trunc(key_cache, seq_len, len);
+                    trunc(value_cache, seq_len, len);
+                    trunc(key_cache_f16, seq_len, len);
+                    trunc(value_cache_f16, seq_len, len);
+                }
+                LayerState::Conv { .. } => panic!(
+                    "truncate_to called on a state with Conv layers (LFM2); conv state \
+                     is not position-indexed and cannot be tail-truncated"
+                ),
+            }
+        }
+        self.seq_len = len;
+    }
+
     /// Drop KV cells `[n_keep .. n_keep + shift)` from every attention
     /// layer, slide the tail down, and re-apply RoPE so each shifted
     /// cell's stored K encodes its new absolute position rather than
@@ -2001,6 +2074,166 @@ mod tests {
         if let LayerState::Attention { key_cache, .. } = &big.layers[0] {
             assert!(key_cache.capacity() <= cfg.max_seq_len * kv_dim + kv_dim);
         }
+    }
+
+    /// Model-free coverage for `truncate_to` (used by speculative decoding to
+    /// roll back rejected drafts): it must reset `seq_len` and cut every
+    /// attention layer's cache to exactly `len * kv_dim`, byte-for-byte equal to
+    /// the prefix present at that length. The `#[ignore]` model test proves the
+    /// *logits* round-trip; this pins the pure `Vec` math in CI (which the model
+    /// tests can't, per the repo's ignore-gated-oracle pattern).
+    #[test]
+    fn truncate_to_cuts_caches_to_prefix() {
+        // Dense (all-attention) config — `truncate_to` panics on Conv layers.
+        let mut cfg = tiny_config(2, 16);
+        cfg.architecture = "llama".into();
+        cfg.block_types = vec![BlockType::Attention; 2];
+        cfg.kv_heads_per_layer = vec![2; 2];
+        let kv_dim = cfg.kv_heads_per_layer[0] * cfg.head_dim; // 2 * 4 = 8
+
+        let mut state = InferenceState::from_config(&cfg).unwrap();
+        // Append R rows of distinct KV to every attention layer (value = a
+        // function of (token, dim) so any mis-slice is caught).
+        let r = 6usize;
+        for layer in &mut state.layers {
+            if let LayerState::Attention {
+                key_cache,
+                value_cache,
+                ..
+            } = layer
+            {
+                for t in 0..r {
+                    for d in 0..kv_dim {
+                        key_cache.push((t * 100 + d) as f32);
+                        value_cache.push(-((t * 100 + d) as f32));
+                    }
+                }
+            }
+        }
+        state.seq_len = r;
+
+        // Record the length-L prefix that must survive the truncation.
+        let l = 4usize;
+        let mut expect_k = Vec::new();
+        let mut expect_v = Vec::new();
+        for layer in &state.layers {
+            if let LayerState::Attention {
+                key_cache,
+                value_cache,
+                ..
+            } = layer
+            {
+                expect_k.push(key_cache[..l * kv_dim].to_vec());
+                expect_v.push(value_cache[..l * kv_dim].to_vec());
+            }
+        }
+
+        state.truncate_to(l);
+        assert_eq!(
+            state.seq_len, l,
+            "seq_len must drop to the truncation length"
+        );
+        let mut li = 0;
+        for layer in &state.layers {
+            if let LayerState::Attention {
+                key_cache,
+                value_cache,
+                ..
+            } = layer
+            {
+                assert_eq!(key_cache.len(), l * kv_dim, "key cache cut to len*kv_dim");
+                assert_eq!(
+                    value_cache.len(),
+                    l * kv_dim,
+                    "value cache cut to len*kv_dim"
+                );
+                assert_eq!(
+                    key_cache, &expect_k[li],
+                    "surviving keys must be the prefix"
+                );
+                assert_eq!(
+                    value_cache, &expect_v[li],
+                    "surviving values must be the prefix"
+                );
+                li += 1;
+            }
+        }
+        assert_eq!(li, 2, "both attention layers must have been checked");
+
+        // Truncating to the current length is a no-op.
+        state.truncate_to(l);
+        assert_eq!(state.seq_len, l);
+    }
+
+    /// f16 companion to `truncate_to_cuts_caches_to_prefix`: an `F16` KV state
+    /// (uncompressed, so spec-decode `truncate_to` is legal) must cut the
+    /// `key_cache_f16`/`value_cache_f16` half-precision slots to the length-L
+    /// prefix. Covers the `trunc` calls on the f16 caches that the f32 test
+    /// leaves on their `is_empty()` early-return.
+    #[test]
+    fn truncate_to_cuts_f16_caches_to_prefix() {
+        let mut cfg = tiny_config(2, 16);
+        cfg.architecture = "llama".into();
+        cfg.block_types = vec![BlockType::Attention; 2];
+        cfg.kv_heads_per_layer = vec![2; 2];
+        let kv_dim = cfg.kv_heads_per_layer[0] * cfg.head_dim; // 8
+
+        let mut state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::F16).unwrap();
+        assert!(!state.is_compressed(), "F16 KV is not `is_compressed`");
+
+        let r = 6usize;
+        for layer in &mut state.layers {
+            if let LayerState::Attention {
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            } = layer
+            {
+                for t in 0..r {
+                    for d in 0..kv_dim {
+                        key_cache_f16.push((t * 100 + d) as u16);
+                        value_cache_f16.push((t * 10 + d) as u16);
+                    }
+                }
+            }
+        }
+        state.seq_len = r;
+
+        let l = 4usize;
+        state.truncate_to(l);
+        assert_eq!(state.seq_len, l);
+        let mut li = 0;
+        for layer in &state.layers {
+            if let LayerState::Attention {
+                key_cache,
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            } = layer
+            {
+                assert!(key_cache.is_empty(), "f32 slot stays empty under f16");
+                assert_eq!(
+                    key_cache_f16.len(),
+                    l * kv_dim,
+                    "f16 keys cut to len*kv_dim"
+                );
+                assert_eq!(
+                    value_cache_f16.len(),
+                    l * kv_dim,
+                    "f16 values cut to len*kv_dim"
+                );
+                // Prefix values are (t*100+d) / (t*10+d); confirm the first and
+                // last surviving rows are intact (no shifted slice).
+                assert_eq!(key_cache_f16[0], 0);
+                assert_eq!(
+                    key_cache_f16[(l - 1) * kv_dim + (kv_dim - 1)],
+                    (300 + 7) as u16
+                );
+                li += 1;
+            }
+        }
+        assert_eq!(li, 2, "both attention layers must have been checked");
     }
 
     /// `KvCompression::F16` allocates the f16 slots (f32 slots empty), append

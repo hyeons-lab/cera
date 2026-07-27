@@ -180,6 +180,13 @@ fn greedy_opts(max_tokens: u32) -> cera::GenerateOpts {
         grammar_trigger_tokens: Vec::new(),
         flush_every_tokens: settings::FLUSH_EVERY_TOKENS,
         flush_every_ms: settings::FLUSH_EVERY_MS,
+        // Off, and it must stay off here: this harness exists to prove cera-core
+        // and cera-ffi produce identical output, and its sister `greedy_opts_ffi`
+        // has no such knob to mirror. Speculative decoding is output-identical to
+        // greedy by construction, so enabling it would not change the comparison
+        // — but it would put one side on a different code path for no coverage
+        // gain, which is the opposite of what a parity harness is for.
+        spec: None,
     }
 }
 

@@ -183,6 +183,31 @@ pub trait Model: Send + Sync {
         logits
     }
 
+    /// Batched forward returning logits at EVERY position, row-major
+    /// `[tokens.len() * vocab_size]` — as opposed to [`Self::forward_prefill`],
+    /// which returns only the last position. Appends all tokens' K/V to `state`
+    /// exactly like `forward_prefill` (so `start_pos` must equal `state.seq_len`).
+    ///
+    /// This is the verification primitive for speculative decoding: feed the
+    /// drafted tokens, read the target's own next-token logits at each position
+    /// to accept/reject the drafts in a single weight-read. Default: unsupported
+    /// (empty `Vec`); callers must gate on [`Self::supports_all_logits`].
+    fn forward_prefill_logits_all(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _ = (tokens, start_pos, state);
+        Vec::new()
+    }
+
+    /// Whether [`Self::forward_prefill_logits_all`] is implemented for this model
+    /// (the speculative-decoding gate). Default `false`.
+    fn supports_all_logits(&self) -> bool {
+        false
+    }
+
     /// Cancelable chunked prefill. Splits `tokens` into `ubatch`-sized slices,
     /// calls [`Self::forward_prefill`] per chunk, and polls `cancel` between
     /// chunks so long prompts can be interrupted without blocking the

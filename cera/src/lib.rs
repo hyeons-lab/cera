@@ -47,6 +47,7 @@ pub mod par;
 pub mod quant;
 pub mod sampler;
 pub mod session;
+pub mod spec;
 pub mod sysmem;
 pub mod tensor;
 pub mod time;
@@ -61,7 +62,7 @@ pub use backend::cpu_features::{CpuFeatures, CpuTier, cpu_features, cpu_tier};
 pub use engine::{BackendPreference, CeraEngine, EngineConfig, ModelFiles, ModelMetadata};
 pub use session::{
     CeraError, FinishReason, GenerateOpts, GenerateSummary, ModalityCapabilities, ModalitySink,
-    Session, SessionConfig,
+    Session, SessionConfig, SpecDecode,
 };
 pub use sysmem::{available_memory_bytes, fits_in_available_memory};
 
