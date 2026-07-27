@@ -513,11 +513,7 @@ impl TqGpuCache {
         // Shared with the GEMV kernels' `get_wid` contract — one helper so the
         // host-side flattening can't drift from what the shaders decode.
         let grid = crate::backend::wgpu::gemv_row_workgroups(groups as u32);
-        let ts = ctx.begin_profile_span(label);
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(label),
-            timestamp_writes: ts,
-        });
+        let mut pass = ctx.begin_pass(enc, label);
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(grid.0, grid.1, grid.2);
@@ -570,11 +566,7 @@ impl TqGpuCache {
                 },
             ],
         });
-        let ts = ctx.begin_profile_span("flash_attention_tq");
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("flash_attention_tq"),
-            timestamp_writes: ts,
-        });
+        let mut pass = ctx.begin_pass(enc, "flash_attention_tq");
         pass.set_pipeline(&self.pipelines.attention);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(n_heads as u32, n_tokens as u32, 1);

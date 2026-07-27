@@ -2432,6 +2432,25 @@ impl GpuLfm2Model {
     /// decoding (`forward_greedy_inner`). This split lets the wasm-async
     /// path avoid the vocab-sized blocking download every step.
     fn forward_inner_compute(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) {
+        self.forward_inner_compute_tail(tokens, pos, state, false);
+    }
+
+    /// As [`Self::forward_inner_compute`], but optionally encodes the greedy
+    /// argmax into the *same* encoder as the output projection.
+    ///
+    /// Worth the extra parameter. The argmax used to get its own encoder and its
+    /// own `submit_and_wait`, which cost ~1.3 ms per token against the kernel's
+    /// own ~0.13 ms of GPU time: a blocking submit drains the pipeline no matter
+    /// how little work it carries, so the second one was paying full stall price
+    /// for a single-workgroup dispatch. Folding it in leaves one stall per decode
+    /// step instead of two.
+    fn forward_inner_compute_tail(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut InferenceState,
+        append_argmax: bool,
+    ) {
         assert_eq!(tokens.len(), 1, "GPU forward expects single token");
         let token_id = tokens[0] as usize;
         let cfg = &self.config;
@@ -3292,6 +3311,9 @@ impl GpuLfm2Model {
             );
             drop(pass);
         }
+        if append_argmax {
+            self.encode_argmax_pass(&mut enc);
+        }
         self.submit_and_wait(enc);
 
         // 4. Update seq_len + profile bookkeeping. Logits are now in
@@ -3302,12 +3324,6 @@ impl GpuLfm2Model {
         self.ctx.finish_profiler();
     }
 
-    /// Greedy single-token forward: runs the same kernels as
-    /// [`forward_inner`] but replaces the vocab-sized logits download
-    /// with a 4-byte argmax readback. Cuts per-token PCIe/USB-C
-    /// readback from `vocab_size * 4` bytes to `4` bytes — the
-    /// wasm-async-friendly path, since a 4-byte map_async still
-    /// blocks the JS event loop briefly but doesn't transfer megabytes.
     /// Encode the argmax compute pass into `enc`. Shared by the sync and async
     /// greedy paths so the kernel / bind-group / dispatch live in one place.
     fn encode_argmax_pass(&self, enc: &mut wgpu::CommandEncoder) {
@@ -3317,21 +3333,17 @@ impl GpuLfm2Model {
         pass.dispatch_workgroups(1, 1, 1);
     }
 
+    /// Greedy single-token forward: runs the same kernels as
+    /// [`forward_inner`] but replaces the vocab-sized logits download
+    /// with a 4-byte argmax readback. Cuts per-token PCIe/USB-C
+    /// readback from `vocab_size * 4` bytes to `4` bytes — the
+    /// wasm-async-friendly path, since a 4-byte map_async still
+    /// blocks the JS event loop briefly but doesn't transfer megabytes.
     fn forward_greedy_inner(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
-        self.forward_inner_compute(tokens, pos, state);
-
-        // Encode + submit the argmax pass on its own. Could be folded
-        // into the output-projection encoder for one fewer submission,
-        // but that's a `forward_inner_compute` refactor we're keeping
-        // out of this PR.
-        self.ctx.reset_profiler();
-        let mut enc = self.new_encoder();
-        self.encode_argmax_pass(&mut enc);
-        self.submit_and_wait(enc);
-        self.ctx.finish_profiler();
-
-        let out = self.ctx.download_u32(&self.argmax_out_buf, 1);
-        out[0]
+        // The argmax rides along in the output projection's encoder, so a decode
+        // step is one submit-and-stall, not two.
+        self.forward_inner_compute_tail(tokens, pos, state, true);
+        self.ctx.download_u32(&self.argmax_out_buf, 1)[0]
     }
 
     /// Async-path prefill step: run the forward and update the KV cache
@@ -3371,13 +3383,7 @@ impl GpuLfm2Model {
             let _lora_guard = self.resolve_lora(state);
             // Keep the KV-write slot in lockstep with the RoPE position.
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
-            self.forward_inner_compute(&[token], pos, state);
-
-            self.ctx.reset_profiler();
-            let mut enc = self.new_encoder();
-            self.encode_argmax_pass(&mut enc);
-            self.ctx.submit_encoder(enc);
-            self.ctx.finish_profiler();
+            self.forward_inner_compute_tail(&[token], pos, state, true);
 
             self.ctx
                 .begin_download(&self.argmax_out_buf, std::mem::size_of::<u32>() as u64)

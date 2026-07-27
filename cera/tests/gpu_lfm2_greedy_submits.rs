@@ -1,15 +1,18 @@
-//! Compute-pass budget for wgpu LFM2 decode.
+//! Queue-submit budget for wgpu greedy decode.
 //!
-//! Pass count is a real perf lever and an invisible one. Identical dispatches
-//! cost **2.65x more** split across N compute passes than batched into one
-//! (measured on an M1 Max), and a pass boundary costs GPU time — a pipeline
-//! drain — not just CPU encode. Decode issued 58 passes/token until #318 merged
-//! the conv block's three into one, worth +17% decode.
+//! A blocking submit costs far more than the work it carries. The greedy argmax
+//! used to get its own encoder and its own `submit_and_wait`, and that second
+//! stall cost ~1.3 ms/token against the argmax kernel's own ~0.13 ms of GPU
+//! time — a pipeline drain charged for one single-workgroup dispatch. Folding it
+//! into the output projection's encoder took decode from 59 to 84 tok/s
+//! (+39%, LFM2.5-230M-Q4_K_M on an M1 Max).
 //!
-//! Nothing about the *output* changes when that regresses. It is the same class
-//! of defect as the chunked-prefill bug in #316: correct logits, 100x the
-//! dispatches, invisible to every correctness assertion. So it gets a counter
-//! assertion, like the dispatch guard next door.
+//! That is 17 -> 16 submits per token, and nothing about the *output* changes if
+//! it regresses — the tokens are identical either way. Same invisible-regression
+//! class as the compute-pass budget next door, so it gets the same treatment.
+//!
+//! Note this is the *greedy* path (`Model::forward_greedy`), not `forward`:
+//! only greedy runs the argmax, so only greedy can regress this way.
 //!
 //! ## Why this test is alone in its own file
 //!
@@ -30,14 +33,13 @@ use cera::model::load_model_gpu;
 /// real PR coverage rather than the skip-as-pass an `arch`-tier model gets.
 const FIXTURE: &str = "LFM2.5-230M-Q4_K_M.gguf";
 
-/// Measured 43 on a 14-layer model after #318 (58 before it). The bound sits
-/// above that with room for a layer-count-proportional kernel addition, and far
-/// enough below 58 to fail if the conv block's passes are ever re-split.
+/// Measured 16 on a 14-layer model after the argmax fold (17 before it). One
+/// submit per layer plus one for the output projection + argmax tail.
 ///
-/// Deliberately absolute rather than per-layer: the fixture is pinned, so an
-/// absolute number is checkable by hand and does not silently rescale if the
-/// per-layer structure changes.
-const MAX_PASSES_PER_TOKEN: u64 = 50;
+/// The bound is the measured value, not a loose ceiling: re-splitting the tail
+/// is the specific regression this guards, and it is worth exactly one submit —
+/// so a budget with slack in it would not catch the thing it exists to catch.
+const MAX_SUBMITS_PER_TOKEN: u64 = 16;
 
 fn models_dir() -> PathBuf {
     if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
@@ -47,7 +49,7 @@ fn models_dir() -> PathBuf {
 }
 
 #[test]
-fn decode_stays_within_its_compute_pass_budget() {
+fn greedy_decode_stays_within_its_submit_budget() {
     let path = models_dir().join(FIXTURE);
     if !path.exists() {
         assert!(
@@ -89,28 +91,28 @@ fn decode_stays_within_its_compute_pass_budget() {
     let _ = model.forward_prefill(&prompt, 0, &mut state);
 
     io_stats::reset();
-    let _ = model.forward(&[5u32], state.seq_len, &mut state);
+    let _ = model.forward_greedy(&[5u32], state.seq_len, &mut state);
     let stats = io_stats::snapshot();
 
     let layers = model.config().n_layers;
     eprintln!(
-        "[gpu-lfm2] decode: {} passes, {} submits ({} layers)",
-        stats.passes, stats.submits, layers,
+        "[gpu-lfm2] greedy decode: {} submits, {} passes ({} layers)",
+        stats.submits, stats.passes, layers,
     );
 
     assert!(
-        stats.passes > 0,
-        "counted zero compute passes — `GpuContext::begin_pass` is being \
-         bypassed, so this budget is not measuring anything"
+        stats.submits > 0,
+        "counted zero submits — `GpuContext::submit_encoder` is being bypassed, \
+         so this budget is not measuring anything"
     );
     assert!(
-        stats.passes <= MAX_PASSES_PER_TOKEN,
-        "decode issued {} compute passes for one token, over the {MAX_PASSES_PER_TOKEN} \
-         budget ({layers} layers). A pass boundary is not free — the same \
-         dispatches cost ~2.65x more split across passes than batched into one. \
-         Check whether a block that used to share a pass was split, or whether a \
-         new `encode_copy` landed between dispatches (a copy is an encoder \
-         operation and forces the pass to end).",
-        stats.passes,
+        stats.submits <= MAX_SUBMITS_PER_TOKEN,
+        "greedy decode issued {} queue submits for one token, over the \
+         {MAX_SUBMITS_PER_TOKEN} budget ({layers} layers). A blocking submit \
+         drains the pipeline regardless of how little work it carries: the \
+         argmax's own submit cost ~10x the argmax kernel. Check whether the \
+         argmax (or another tail step) went back to its own encoder instead of \
+         riding along in the output projection's.",
+        stats.submits,
     );
 }
