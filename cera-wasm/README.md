@@ -518,6 +518,18 @@ import { WebGpuSession, TurboQuantConfig } from '@hyeons-lab/cera-wasm';
 // second session silently runs uncompressed.
 const session = await WebGpuSession.create(ggufBytes, 2048, new TurboQuantConfig(1234n));
 
+// To request TurboQuant but keep the default contextSize, pass an explicit
+// placeholder for argument 2 — `undefined` and `null` both work (the generated
+// signature is `context_size?: number | null`):
+//
+//   await WebGpuSession.create(ggufBytes, undefined, new TurboQuantConfig(1234n));
+//
+// Do NOT collapse it to `create(ggufBytes, tq)`. TypeScript rejects that, but
+// plain JS does not: in a release build the config object is coerced by
+// `>>> 0` to a contextSize of 0 and the compression argument goes missing, so
+// you get an unusable session with no compression and no error. (A `--dev`
+// build throws instead, so this only bites in release.)
+
 // Adapter + backend description — confirms the GPU path is live.
 console.log(session.adapter);  // e.g. "<adapter> (BrowserWebGpu)"
 

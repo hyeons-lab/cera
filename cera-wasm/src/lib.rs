@@ -1619,6 +1619,23 @@ mod webgpu {
         /// 24 KiB per token down to 2.25 KiB — at a 16K context, 384 MiB
         /// (~403 MB) of GPU-side KV becomes 36 MiB (~38 MB).
         ///
+        /// Both trailing parameters are optional, so to request compression while
+        /// keeping the default `contextSize`, pass an explicit placeholder for
+        /// argument 2. The generated signature is
+        /// `context_size?: number | null`, and `undefined` and `null` both mean
+        /// "use the default":
+        ///
+        /// ```js
+        /// await WebGpuSession.create(bytes, undefined, new TurboQuantConfig(1234n));
+        /// ```
+        ///
+        /// Do **not** collapse that to `create(bytes, tqConfig)`. TypeScript
+        /// rejects it, but plain JS does not: in a release build the config
+        /// object is coerced by `>>> 0` to a `contextSize` of 0 and the
+        /// compression argument goes missing, yielding an unusable session with
+        /// no compression and no error. (A `--dev` build throws on the argument
+        /// type assertion instead, so this only bites in release.)
+        ///
         /// Setting this **consumes** the JS-side `TurboQuantConfig` handle
         /// (wasm-bindgen's by-value `Option<T>` parameter shape), exactly like
         /// the `SessionConfig.kvCompression` setter. Build a fresh config per

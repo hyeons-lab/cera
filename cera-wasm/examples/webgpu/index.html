@@ -70,14 +70,18 @@
 
       let session = null;
 
-      // Latch every control for the duration of a load or a generate, so only
-      // one operation is ever in flight. That single invariant is what keeps the
-      // `free()` in buildSession safe — with concurrent builds possible, a
-      // finished build could free a session a running `generate` still held
-      // (use-after-free across the wasm boundary), and out-of-order completions
-      // could leave the live session in a different KV mode than the dropdown
-      // shows. Latching is also what stops two rapid toggles from holding two
-      // full GGUF copies and two GPU uploads at once.
+      // Latch the two controls that rebuild the session — the file picker and
+      // the KV dropdown — plus Run, so only one operation is ever in flight.
+      // That single invariant is what keeps the `free()` in buildSession safe:
+      // with concurrent builds possible, a finished build could free a session a
+      // running `generate` still held (use-after-free across the wasm boundary),
+      // and out-of-order completions could leave the live session in a different
+      // KV mode than the dropdown shows. It also stops two rapid toggles from
+      // holding two full GGUF copies and two GPU uploads at once.
+      //
+      // Prompt and max-tokens are deliberately left editable: `generate` reads
+      // both into locals before its first `await`, so editing them mid-run
+      // cannot affect the call in flight — only the next one.
       const setBusy = (busy) => {
         $("model").disabled = busy;
         $("kvmode").disabled = busy;
