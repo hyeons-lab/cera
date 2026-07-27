@@ -585,6 +585,12 @@ pub struct GpuLfm2Model {
     /// readback over this 4-byte buffer is the wasm-async-friendly
     /// replacement for downloading `vocab_size * 4` bytes of logits.
     argmax_out_buf: wgpu::Buffer,
+    /// 4-byte `MAP_READ` sink the argmax result is copied into inside the
+    /// output projection's submission, so reading it back costs a map callback
+    /// rather than a second GPU round trip. Owned rather than the shared
+    /// `download_*` staging buffer: the copy is encoded well before the map, and
+    /// a concurrent download would otherwise clobber it in between.
+    argmax_readback_buf: wgpu::Buffer,
     /// Pre-uploaded `vec2<u32>{ vocab_size, 0 }` for the argmax shader.
     /// Held to keep the buffer alive for the cached `argmax_bg`'s
     /// reference; not directly read after construction.
@@ -1245,6 +1251,7 @@ impl GpuLfm2Model {
         // vocab_size; `argmax_out_buf` is a 4-byte sink. Bind group is
         // built after `pipelines` exists below.
         let argmax_out_buf = ctx.create_storage_rw(4, "argmax_out");
+        let argmax_readback_buf = ctx.create_readback_buffer(4, "argmax_readback");
         let argmax_params = ctx.upload_storage(
             bytemuck::cast_slice(&[config.vocab_size as u32, 0u32]),
             "argmax_params",
@@ -1314,6 +1321,7 @@ impl GpuLfm2Model {
             attn_out_buf,
             logits_buf,
             argmax_out_buf,
+            argmax_readback_buf,
             argmax_params,
             argmax_bg,
             rmsnorm_hs_params,
@@ -3313,6 +3321,10 @@ impl GpuLfm2Model {
         }
         if append_argmax {
             self.encode_argmax_pass(&mut enc);
+            // Stage the 4-byte result in this same submission. On its own it is
+            // another GPU round trip (~1.5 ms) for a 4-byte copy — the handoff
+            // is cheap, waiting for the submission to execute and signal is not.
+            enc.copy_buffer_to_buffer(&self.argmax_out_buf, 0, &self.argmax_readback_buf, 0, 4);
         }
         self.submit_and_wait(enc);
 
@@ -3343,7 +3355,7 @@ impl GpuLfm2Model {
         // The argmax rides along in the output projection's encoder, so a decode
         // step is one submit-and-stall, not two.
         self.forward_inner_compute_tail(tokens, pos, state, true);
-        self.ctx.download_u32(&self.argmax_out_buf, 1)[0]
+        self.ctx.read_mapped_u32(&self.argmax_readback_buf, 1)[0]
     }
 
     /// Async-path prefill step: run the forward and update the KV cache

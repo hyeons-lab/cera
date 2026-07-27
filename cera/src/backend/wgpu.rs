@@ -462,6 +462,61 @@ impl GpuContext {
         })
     }
 
+    /// A dedicated `MAP_READ` buffer for a readback that happens every step.
+    ///
+    /// The `download_*` helpers share one cached staging buffer and hold its
+    /// lock across copy-submit-map-unmap, which makes each call atomic but also
+    /// means the copy cannot be encoded anywhere but inside that call. A caller
+    /// that wants the copy to ride along in a submission it is already making
+    /// (see [`Self::read_mapped_u32`]) needs a buffer it owns outright — sharing
+    /// the cached one would let a concurrent download land between the encode
+    /// and the map.
+    pub fn create_readback_buffer(&self, size: u64, label: &str) -> wgpu::Buffer {
+        self.assert_within_max_buffer(size, label);
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Map and read a `MAP_READ` buffer whose copy has already been submitted.
+    ///
+    /// The point is what it does *not* do: no encoder, no submit. Staging the
+    /// copy inside a submission that is happening anyway and then calling this
+    /// costs a map callback; doing the same work through [`Self::download_u32`]
+    /// costs a second GPU round trip, which measured ~1.5 ms for a 4-byte copy
+    /// against ~8 µs of CPU-side handoff — the wait is for the submission to
+    /// execute and signal, and does not care how little it carries.
+    ///
+    /// The caller is responsible for having submitted that copy first; this
+    /// reads whatever the buffer currently holds.
+    pub fn read_mapped_u32(&self, staging: &wgpu::Buffer, count: usize) -> Vec<u32> {
+        let size = (count * std::mem::size_of::<u32>()) as u64;
+        assert!(
+            staging.size() >= size,
+            "readback buffer is {} bytes but {size} were requested",
+            staging.size(),
+        );
+        io_stats::record_readback(size);
+        let slice = staging.slice(0..size);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).ok();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .expect("GPU readback channel closed")
+            .expect("GPU readback failed");
+
+        let data = slice.get_mapped_range();
+        let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        result
+    }
+
     /// Read f32 data back from a GPU buffer (blocking). Reuses a cached
     /// staging buffer to avoid per-token allocation.
     pub fn download_f32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<f32> {

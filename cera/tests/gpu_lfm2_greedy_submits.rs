@@ -1,15 +1,20 @@
 //! Queue-submit budget for wgpu greedy decode.
 //!
-//! A blocking submit costs far more than the work it carries. The greedy argmax
-//! used to get its own encoder and its own `submit_and_wait`, and that second
-//! stall cost ~1.3 ms/token against the argmax kernel's own ~0.13 ms of GPU
-//! time — a pipeline drain charged for one single-workgroup dispatch. Folding it
-//! into the output projection's encoder took decode from 59 to 84 tok/s
-//! (+39%, LFM2.5-230M-Q4_K_M on an M1 Max).
+//! A GPU round trip costs far more than the work it carries, and greedy decode
+//! was making two it did not need:
 //!
-//! That is 17 -> 16 submits per token, and nothing about the *output* changes if
-//! it regresses — the tokens are identical either way. Same invisible-regression
-//! class as the compute-pass budget next door, so it gets the same treatment.
+//! - the argmax got its own encoder and its own `submit_and_wait` — a pipeline
+//!   drain charged for one single-workgroup dispatch (~1.3 ms against the
+//!   kernel's own ~0.13 ms);
+//! - the 4-byte result readback then submitted *again* to copy it to staging
+//!   (~1.5 ms, of which only ~8 µs was the CPU-side handoff).
+//!
+//! Both now ride along in the output projection's submission: 17 -> 15 submits
+//! per token, decode 60 -> 112 tok/s (LFM2.5-230M-Q4_K_M, M1 Max).
+//!
+//! Nothing about the *output* changes if this regresses — the tokens are
+//! identical either way. Same invisible-regression class as the compute-pass
+//! budget next door, so it gets the same treatment.
 //!
 //! Note this is the *greedy* path (`Model::forward_greedy`), not `forward`:
 //! only greedy runs the argmax, so only greedy can regress this way.
@@ -33,13 +38,15 @@ use cera::model::load_model_gpu;
 /// real PR coverage rather than the skip-as-pass an `arch`-tier model gets.
 const FIXTURE: &str = "LFM2.5-230M-Q4_K_M.gguf";
 
-/// Measured 16 on a 14-layer model after the argmax fold (17 before it). One
-/// submit per layer plus one for the output projection + argmax tail.
+/// Measured 15 on a 14-layer model (17 before the two folds): one submit per
+/// layer, plus one carrying the output projection, the argmax, and the copy that
+/// stages the result for readback.
 ///
-/// The bound is the measured value, not a loose ceiling: re-splitting the tail
-/// is the specific regression this guards, and it is worth exactly one submit —
-/// so a budget with slack in it would not catch the thing it exists to catch.
-const MAX_SUBMITS_PER_TOKEN: u64 = 16;
+/// The bound is the measured value, not a loose ceiling: splitting either fold
+/// back out is the specific regression this guards, and each is worth exactly
+/// one submit — a budget with slack in it would not catch what it exists to
+/// catch.
+const MAX_SUBMITS_PER_TOKEN: u64 = 15;
 
 fn models_dir() -> PathBuf {
     if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
@@ -108,11 +115,12 @@ fn greedy_decode_stays_within_its_submit_budget() {
     assert!(
         stats.submits <= MAX_SUBMITS_PER_TOKEN,
         "greedy decode issued {} queue submits for one token, over the \
-         {MAX_SUBMITS_PER_TOKEN} budget ({layers} layers). A blocking submit \
-         drains the pipeline regardless of how little work it carries: the \
-         argmax's own submit cost ~10x the argmax kernel. Check whether the \
-         argmax (or another tail step) went back to its own encoder instead of \
-         riding along in the output projection's.",
+         {MAX_SUBMITS_PER_TOKEN} budget ({layers} layers). A submit costs a GPU \
+         round trip regardless of how little work it carries — the argmax's own \
+         submit cost ~10x the argmax kernel, and staging its 4-byte result cost \
+         another ~1.5 ms. Check whether the argmax, or the copy that stages it \
+         for readback, went back to its own encoder instead of riding along in \
+         the output projection's.",
         stats.submits,
     );
 }
