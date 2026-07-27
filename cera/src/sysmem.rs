@@ -143,11 +143,18 @@ mod tests {
     /// Deliberately asserts only on the `Some`/`None` shape and on the one
     /// comparison that cannot move — `0` fits in any figure, however the live
     /// sample drifts. The value-level behaviour is covered above.
+    ///
+    /// In particular it does **not** assert `avail > 0`. `MemAvailable` is the
+    /// kernel's estimate and is clamped at zero, so `Some(0)` is a legitimate
+    /// reading under real memory pressure or a tight cgroup limit — asserting
+    /// otherwise would reintroduce exactly the kind of environment-dependent
+    /// failure this test was rewritten to remove. A zero reading still means the
+    /// platform *can* answer, which is all this test is about.
     #[test]
     fn public_fits_matches_platform_support() {
         match available_memory_bytes() {
-            Some(avail) => {
-                assert!(avail > 0);
+            Some(_) => {
+                // Zero fits in any figure, including zero.
                 assert_eq!(fits_in_available_memory(0, 0), Some(true));
             }
             None => {
