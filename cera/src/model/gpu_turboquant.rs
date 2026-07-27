@@ -608,6 +608,14 @@ impl TqGpuCache {
         let l = self
             .layer(layer)
             .expect("snapshot_layer on a layer without a compressed cache");
+        // Mirrors `MetalTqCache::snapshot_layer` and `restore_layer`'s rejection.
+        // Without it a caller passing a stale longer length would read past the live
+        // region and, for the last head, past the allocation.
+        assert!(
+            seq_len <= self.max_seq_len,
+            "snapshot_layer: seq_len {seq_len} exceeds the cache capacity {}",
+            self.max_seq_len
+        );
         let head_dim = self.layout.head_dim;
         let n = l.n_kv_heads;
 
@@ -632,7 +640,7 @@ impl TqGpuCache {
         let k_polar = seq_len * pw;
         let k_jl = seq_len * jw;
         let total = n * (k_polar + k_jl + seq_len) + n * (k_polar + seq_len);
-        let scratch = ctx.create_storage_rw((total * 4) as u64, "tq_snapshot_gather");
+        let scratch = ctx.create_storage_rw(TqLayout::words_to_bytes(total), "tq_snapshot_gather");
 
         let mut enc = ctx
             .device
@@ -643,10 +651,10 @@ impl TqGpuCache {
         let mut gather = |src: &wgpu::Buffer, src_word: usize, words: usize, dst: &mut usize| {
             enc.copy_buffer_to_buffer(
                 src,
-                (src_word * 4) as u64,
+                TqLayout::words_to_bytes(src_word),
                 &scratch,
-                (*dst * 4) as u64,
-                (words * 4) as u64,
+                TqLayout::words_to_bytes(*dst),
+                TqLayout::words_to_bytes(words),
             );
             *dst += words;
         };
@@ -745,11 +753,14 @@ impl TqGpuCache {
         // kernels only read up to the restored seq_len.
         let mut norm_words = Vec::with_capacity(seq_len);
         for h in 0..n {
-            ctx.queue
-                .write_buffer(&l.keys, ((h * cap * pw) * 4) as u64, &keys.polar_data[h]);
             ctx.queue.write_buffer(
                 &l.keys,
-                ((jl_off + h * cap * jw) * 4) as u64,
+                TqLayout::words_to_bytes(h * cap * pw),
+                &keys.polar_data[h],
+            );
+            ctx.queue.write_buffer(
+                &l.keys,
+                TqLayout::words_to_bytes(jl_off + h * cap * jw),
                 &keys.jl_data[h],
             );
             norm_words.clear();
@@ -760,20 +771,20 @@ impl TqGpuCache {
             }
             ctx.queue.write_buffer(
                 &l.keys,
-                ((norm_off + h * cap) * 4) as u64,
+                TqLayout::words_to_bytes(norm_off + h * cap),
                 bytemuck::cast_slice(&norm_words),
             );
 
             ctx.queue.write_buffer(
                 &l.values,
-                ((h * cap * pw) * 4) as u64,
+                TqLayout::words_to_bytes(h * cap * pw),
                 &values.polar_data[h],
             );
             norm_words.clear();
             norm_words.extend(values.norms[h].iter().map(|&b| u32::from(b)));
             ctx.queue.write_buffer(
                 &l.values,
-                ((v_norm_off + h * cap) * 4) as u64,
+                TqLayout::words_to_bytes(v_norm_off + h * cap),
                 bytemuck::cast_slice(&norm_words),
             );
         }
