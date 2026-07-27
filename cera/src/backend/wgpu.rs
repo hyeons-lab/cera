@@ -71,15 +71,17 @@ pub mod io_stats {
     }
 
     impl GpuIoStats {
-        /// Per-token rates, given the number of tokens the interval covered.
+        /// Per-token rates — `(submits, passes, readbacks, readback_bytes)`, in
+        /// field order — given the number of tokens the interval covered.
         /// Returns zeros when `tokens` is 0 rather than dividing by zero.
-        pub fn per_token(&self, tokens: u64) -> (f64, f64, f64) {
+        pub fn per_token(&self, tokens: u64) -> (f64, f64, f64, f64) {
             if tokens == 0 {
-                return (0.0, 0.0, 0.0);
+                return (0.0, 0.0, 0.0, 0.0);
             }
             let t = tokens as f64;
             (
                 self.submits as f64 / t,
+                self.passes as f64 / t,
                 self.readbacks as f64 / t,
                 self.readback_bytes as f64 / t,
             )

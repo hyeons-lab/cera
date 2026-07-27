@@ -2574,11 +2574,16 @@ impl GpuLfm2Model {
                     hs as u64,
                 );
 
-                // Pre-create BGs for passes 2 and 3. The fused conv shader reads
-                // x/c/b directly from `conv_proj_buf` at offsets 0/hs/2*hs and
-                // writes output to `conv_gate_buf` (where the post-conv out_proj
-                // gemv reads from) — replaces the prior mul1 + conv1d + mul2
-                // sequence and the three encoder copies that fed it.
+                // Bind groups for the conv and out_proj stages. Built here,
+                // before the pass opens, because a `ComputePass` borrows the
+                // encoder — creating a bind group mid-pass would not compile,
+                // and hoisting them is what lets the whole block be one pass.
+                //
+                // The fused conv shader reads x/c/b directly from
+                // `conv_proj_buf` at offsets 0/hs/2*hs and writes output to
+                // `conv_gate_buf` (where the post-conv out_proj gemv reads
+                // from) — replaces the prior mul1 + conv1d + mul2 sequence and
+                // the three encoder copies that fed it.
                 let conv_p = &self.conv1d_params;
                 let conv_fused_bg = self
                     .ctx

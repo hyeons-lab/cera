@@ -1440,12 +1440,11 @@ fn report_gpu_io(decode: PhaseIo, prefill: PhaseIo) {
         eprintln!("gpu I/O: no tokens decoded — nothing to report");
         return;
     }
-    let (sub_pt, rb_pt, bytes_pt) = stats(decode).per_token(decode.tokens);
-    let d_tokens = decode.tokens;
     // Passes are reported alongside submits because they are the lever that
     // actually moved decode: identical dispatches cost 2.65x more split across
     // N passes than batched into one (#318).
-    let passes_pt = stats(decode).passes as f64 / decode.tokens as f64;
+    let (sub_pt, passes_pt, rb_pt, bytes_pt) = stats(decode).per_token(decode.tokens);
+    let d_tokens = decode.tokens;
     eprintln!(
         "gpu I/O (decode): {sub_pt:.1} submits/token, {passes_pt:.1} passes/token, \
          {rb_pt:.1} readbacks/token, {bytes_pt:.0} readback bytes/token \
@@ -1455,7 +1454,7 @@ fn report_gpu_io(decode: PhaseIo, prefill: PhaseIo) {
     // token* means prefill is secretly looping the decode path — which is exactly
     // what a quant that fails the batched-GEMM dtype check does.
     if prefill.tokens > 0 {
-        let (pf_sub_pt, _, _) = stats(prefill).per_token(prefill.tokens);
+        let (pf_sub_pt, _, _, _) = stats(prefill).per_token(prefill.tokens);
         let (pf_submits, pf_readbacks, pf_bytes, pf_tokens) = (
             prefill.submits,
             prefill.readbacks,
