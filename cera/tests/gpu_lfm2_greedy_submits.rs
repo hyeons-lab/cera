@@ -120,7 +120,7 @@ fn greedy_decode_stays_within_its_submit_budget() {
          submit cost ~10x the argmax kernel, and staging its 4-byte result cost \
          another ~1.5 ms. Check whether the argmax, or the copy that stages it \
          for readback, went back to its own encoder instead of riding along in \
-         the output projection's.",
+         the output projection's encoder.",
         stats.submits,
     );
 }

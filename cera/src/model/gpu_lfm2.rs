@@ -727,6 +727,26 @@ pub struct GpuLfm2Model {
     lora_params_pool: Mutex<(Vec<wgpu::Buffer>, usize)>,
 }
 
+/// What the decode tail appends after the output projection.
+///
+/// Both greedy paths want the argmax dispatch in that encoder rather than one of
+/// their own — a submit costs a GPU round trip regardless of how little it
+/// carries. They differ on the readback: the blocking path stages it into the
+/// model's `argmax_readback_buf` in the same submission, so reading it costs a
+/// map instead of a second round trip, while the async path reads through
+/// `begin_download`'s per-call buffer (which it can hold across an `.await`
+/// without another caller clobbering it) and would gain nothing but a dead copy
+/// from staging as well.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TailArgmax {
+    /// Nothing — the caller wants the full logits buffer.
+    None,
+    /// Argmax dispatch only.
+    Dispatch,
+    /// Argmax dispatch plus the copy that stages its result for readback.
+    DispatchAndStage,
+}
+
 impl GpuLfm2Model {
     /// Construct without a model identifier. Equivalent to
     /// `from_gguf_with_id(gguf, context_size, "")`. Warm prefix cache
@@ -2440,24 +2460,25 @@ impl GpuLfm2Model {
     /// decoding (`forward_greedy_inner`). This split lets the wasm-async
     /// path avoid the vocab-sized blocking download every step.
     fn forward_inner_compute(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) {
-        self.forward_inner_compute_tail(tokens, pos, state, false);
+        self.forward_inner_compute_tail(tokens, pos, state, TailArgmax::None);
     }
 
-    /// As [`Self::forward_inner_compute`], but optionally encodes the greedy
-    /// argmax into the *same* encoder as the output projection.
+    /// As [`Self::forward_inner_compute`], but also encodes the greedy argmax —
+    /// and optionally its readback copy — into the *same* encoder as the output
+    /// projection. See [`TailArgmax`] for why the two are separable.
     ///
     /// Worth the extra parameter. The argmax used to get its own encoder and its
     /// own `submit_and_wait`, which cost ~1.3 ms per token against the kernel's
-    /// own ~0.13 ms of GPU time: a blocking submit drains the pipeline no matter
-    /// how little work it carries, so the second one was paying full stall price
-    /// for a single-workgroup dispatch. Folding it in leaves one stall per decode
+    /// own ~0.13 ms of GPU time: a submit costs a GPU round trip no matter how
+    /// little work it carries, so the second one was paying full stall price for
+    /// a single-workgroup dispatch. Folding it in leaves one stall per decode
     /// step instead of two.
     fn forward_inner_compute_tail(
         &self,
         tokens: &[u32],
         pos: usize,
         state: &mut InferenceState,
-        append_argmax: bool,
+        argmax: TailArgmax,
     ) {
         assert_eq!(tokens.len(), 1, "GPU forward expects single token");
         let token_id = tokens[0] as usize;
@@ -3319,8 +3340,10 @@ impl GpuLfm2Model {
             );
             drop(pass);
         }
-        if append_argmax {
+        if argmax != TailArgmax::None {
             self.encode_argmax_pass(&mut enc);
+        }
+        if argmax == TailArgmax::DispatchAndStage {
             // Stage the 4-byte result in this same submission. On its own it is
             // another GPU round trip (~1.5 ms) for a 4-byte copy — the handoff
             // is cheap, waiting for the submission to execute and signal is not.
@@ -3354,7 +3377,7 @@ impl GpuLfm2Model {
     fn forward_greedy_inner(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
         // The argmax rides along in the output projection's encoder, so a decode
         // step is one submit-and-stall, not two.
-        self.forward_inner_compute_tail(tokens, pos, state, true);
+        self.forward_inner_compute_tail(tokens, pos, state, TailArgmax::DispatchAndStage);
         self.ctx.read_mapped_u32(&self.argmax_readback_buf, 1)[0]
     }
 
@@ -3376,10 +3399,11 @@ impl GpuLfm2Model {
     /// on the GPU, then reads back the single argmax token id without blocking
     /// — the wasm-compatible analog of `Self::forward_greedy_inner`.
     ///
-    /// The blocking version's `submit_and_wait`'s `device.poll(Maintain::Wait)`
-    /// is a no-op on the WebGPU backend (the browser owns the queue), so we
-    /// submit the argmax pass directly; the readback is ordered after it on the
-    /// same queue. The GPU compute + submit run under `infer_lock` (serialising
+    /// The argmax rides along in the output projection's encoder, as on the
+    /// blocking path; that encoder's `submit_and_wait` reduces to a plain submit
+    /// here, because `device.poll(Maintain::Wait)` is a no-op on the WebGPU
+    /// backend (the browser owns the queue). The readback is ordered after it on
+    /// the same queue. The GPU compute + submit run under `infer_lock` (serialising
     /// shared scratch + GPU state against any other forward, like the sync
     /// `Model` methods); the lock is released before the `.await` (a per-call
     /// staging buffer makes the readback self-contained, so this is safe and
@@ -3395,7 +3419,10 @@ impl GpuLfm2Model {
             let _lora_guard = self.resolve_lora(state);
             // Keep the KV-write slot in lockstep with the RoPE position.
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
-            self.forward_inner_compute_tail(&[token], pos, state, true);
+            // `Dispatch`, not `DispatchAndStage`: this path reads through
+            // `begin_download`'s per-call buffer, so staging into the shared one
+            // would be a copy nothing reads.
+            self.forward_inner_compute_tail(&[token], pos, state, TailArgmax::Dispatch);
 
             self.ctx
                 .begin_download(&self.argmax_out_buf, std::mem::size_of::<u32>() as u64)
