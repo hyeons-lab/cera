@@ -664,6 +664,15 @@ const VIT_MM_TILE_K: u32 = 16;
 // two geometries are identical, so make that enforced rather than aspirational.
 // They can be retuned together, but not apart: the ViT's failure mode is a
 // swallowed pipeline-creation panic that silently drops vision to CPU.
+//
+// Asserted equal rather than *defined* as `= gpu_lfm2::MUL_MAT_TILE_*`, which
+// would look tidier and is a standing review suggestion. Aliasing would make a
+// text-path retune silently retune the ViT, and that is the one thing this
+// block exists to prevent: the geometry here is UNMEASURED on the ViT (see
+// above), so a value chosen from the text path's sweep is a value nobody has
+// justified for this kernel. The assert turns such a change into a compile
+// error naming both sites, which is the point where someone has to decide
+// whether the ViT should follow. Keep them separate.
 #[cfg(feature = "gpu")]
 const _: () = assert!(
     VIT_MM_TILE_M == 4 && VIT_MM_TILE_N == 4,
