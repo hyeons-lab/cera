@@ -374,6 +374,15 @@ LFM2 family. On an M1 Max with Q4_0 weights, the native Metal backend decodes
 roughly **2× faster than llama.cpp** across tested VL and Audio models; prefill
 leads at short prompts and trails at long ones.
 
+On the cross-platform **wgpu** backend, decode is **1.78x faster than it was**
+on the same model and machine (LFM2-VL-450M Q4_0, M1 Max: 63.4 to 112.8 tok/s),
+from four changes: removing register spills in the quantized GEMV kernels,
+merging the LFM2 conv block into one compute pass, deleting two per-token GPU
+round trips that carried almost no work, and running the LM head on the weight as
+GGUF stores it instead of a dequantized f16 copy (which also gives back ~79 MB of
+VRAM on a 230M model). The per-kernel breakdown, and what did *not* work, are in
+[`benchmarks/BASELINE.md`](benchmarks/BASELINE.md).
+
 On CPU, rows dispatch through a persistent, affinity-pinned threadpool with
 dynamic chunk-stealing rather than a per-GEMV fork-join. This fixes the
 multi-core decode collapse on Android big.LITTLE and scales decode across the
@@ -384,7 +393,9 @@ override knobs are documented under
 
 Detailed methodology, per-model tables (decode + prefill vs llama.cpp), the
 Accelerate/AMX BLAS results, and the backend optimization notes live in
-**[`benchmarks/README.md`](benchmarks/README.md)**.
+**[`benchmarks/README.md`](benchmarks/README.md)**. Numbers there are tagged with
+the commit and device they were measured on — some sections are older than
+others, and the Android GPU row in particular predates the wgpu work above.
 
 ## License
 

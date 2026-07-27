@@ -128,11 +128,58 @@ prefill disaster was mostly a **quantization gate**, not silicon.
   weight formats cannot help while the quantized kernels are 4x off their achievable
   bandwidth. (f16 *KV* is untouched by this and still open.)
 
+## Round 3 — extrapolating one successful ablation (wrong)
+
+#318 merged the LFM2 conv block's three compute passes into one and measured
+**+17% decode**, five reps out of five. From that I derived a per-pass cost of
+~38–50 µs, wrote it into `BASELINE.md` and the devlog, and planned the obvious
+follow-up: merge the attention and FFN passes too, for an estimated further ~18%.
+
+The first step landed exactly the predicted pass reduction (42 → 36) and bought
+**nothing** — 59.2 → 58.9 tok/s wall-clock, 5626 → 5632 µs of GPU pass time. A
+boundary in that path is worth **~6 µs**, not ~38. Worse, when A/B'd separately
+the merges were *costing* ~15%: the same branch measured +18% with them and +39%
+without. They were implemented, measured, and reverted rather than shipped.
+
+**The error:** a cost-per-unit derived from one successful change is a
+description of that change, not a model of the system. This was the second time —
+#316 reported "~0.45 ms fixed cost per dispatch" from a straight-line fit through
+two points of a curve, and that was wrong too.
+
+## Round 4 — what the time was actually going to (right, eventually)
+
+Having stopped extrapolating, the next move was to decompose a token instead of
+theorising about it. On an 11 ms decode step:
+
+| segment | time | |
+|---|---:|---|
+| layer-loop CPU encode | 1.30 ms | not the bottleneck |
+| tail, ending in `submit_and_wait` | 6.44 ms | real GPU execution |
+| **argmax's own blocking submit** | **1.30 ms** | for a 0.13 ms kernel |
+| **4-byte result readback** | **1.34 ms** | its own second submit |
+
+Two of the three GPU round trips per token were carrying essentially nothing.
+Folding both into the output projection's submission took decode **60.2 → 111.5
+tok/s (~1.85×)** — more than every kernel and pass optimisation before it
+combined, from a change that deletes code (#319).
+
+One near-miss worth recording: probing the readback showed *submit 8 µs, map+poll
+1.52 ms*, which reads like "the cost is the map, so folding the copy cannot
+help." That is wrong — the poll waits for **that submission** to execute and
+signal. Acting on the first reading would have skipped a +75% fix.
+
 ## Lesson
 
 Round 1: I inferred root causes from reading code, and was wrong. Round 2: I
 measured — but never validated the instrument — and was wrong again, and *more*
-confidently, because now I had numbers.
+confidently, because now I had numbers. Round 3: I measured correctly, then
+generalised a single result into a cost model and spent a branch on it. Round 4
+worked because it decomposed the thing being optimised before optimising it.
+
+The recurring failure is not bad measurement — it is **reasoning past the
+measurement**: one number, extended into a story about the system. The habit that
+catches it is cheap: before optimising a component, account for the whole budget
+and check the component is actually in it.
 
 A counter wired into one code path does not measure the system; it measures that
 path. The check that would have caught this takes a minute: confirm the count

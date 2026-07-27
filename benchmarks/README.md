@@ -7,8 +7,16 @@ Measured on Apple M-series (aarch64), single-socket, unless noted. All models
 loaded from GGUF with memory-mapped weights. Raw per-run data and long-context
 profiles live alongside this file:
 
-- [`results_table.md`](results_table.md) — full result grid
-- [`deltas_table.md`](deltas_table.md) — per-optimization deltas
+- [`BASELINE.md`](BASELINE.md) — **the reference numbers**: Android CPU vs
+  llama.cpp, GPU I/O counters, and the per-kernel GPU decode profile. Every
+  section carries the commit and device it was measured on; check that before
+  quoting one.
+- [`GPU_FINDINGS_CORRECTION.md`](GPU_FINDINGS_CORRECTION.md) — four rounds of
+  wrong GPU conclusions and what each one cost. Worth reading before starting a
+  GPU perf task; it is mostly a catalogue of ways to over-read a number.
+- [`deltas_table.md`](deltas_table.md) — full cera-vs-llama.cpp grid (45 configs:
+  prefill, decode, RSS, footprint, with ratios). Supersedes the old
+  `results_table.md`, which held the same 45 runs split one-engine-per-row.
 - [`profile_longctx.md`](profile_longctx.md) — long-context prefill profiling
 - [`cache_compare.md`](cache_compare.md) — KV-cache comparison
 - [`../docs/GPU_CONTEXT_PERFORMANCE_PLAN.md`](../docs/GPU_CONTEXT_PERFORMANCE_PLAN.md)
@@ -91,7 +99,10 @@ Two GPU backends with runtime selection via `--device`:
   tested Q4_0 models; prefill is competitive at short prompts and trails at long
   prompts (tracked in [`profile_longctx.md`](profile_longctx.md)).
 - **wgpu** (`--device gpu`, cross-platform) — WGSL shaders targeting
-  Metal/Vulkan/DX12/WebGPU. Portable but slower due to API translation overhead.
+  Metal/Vulkan/DX12/WebGPU. Still behind native Metal, but the gap is smaller
+  than it was: decode on LFM2-VL-450M Q4_0 / M1 Max went 63.4 → 112.8 tok/s
+  (**1.78×**) across #316/#318/#319/#320. Per-kernel breakdown in
+  [`BASELINE.md`](BASELINE.md).
 
 ### Decode throughput vs llama.cpp (greedy, M1 Max, Q4_0)
 
@@ -167,6 +178,20 @@ llama-bench -m model.gguf -p 4096 -n 0 -ngl 99 -r 20
 - **Compute pass batching** — 300 passes → ~80 per token (+30%)
 - **Fast Q4_0 GEMV** — ported Metal algorithm to WGSL with subgroupAdd
 - **Multi-row f32 GEMV** — 8 rows per workgroup, 8× less input bandwidth
+- **Unspilled decode GEMVs** (#316) — loop-indexed WGSL locals are not registers;
+  naming them individually removed the spill (+17% Q4_0, +18% Q4_K_M)
+- **Conv block in one compute pass** (#318) — the three passes were separated
+  only by bind-group construction, which never needed a boundary (+17%)
+- **No spare GPU round trips in decode** (#319) — the greedy argmax had its own
+  blocking submit and its 4-byte readback submitted again; both now ride along in
+  the output projection's submission, 17 → 15 submits/token (**~1.85×**)
+- **LM head on the stored weight** (#320) — the logit projection read a
+  dequantized f16 copy of the largest tensor in the model; the quantized GEMV
+  kernels read it as GGUF stores it (+10%, and ~79 MB less VRAM)
+
+What did **not** work is recorded too — merging the attention/FFN compute passes
+measured neutral-to-negative and was reverted. See
+[`GPU_FINDINGS_CORRECTION.md`](GPU_FINDINGS_CORRECTION.md).
 
 ### CPU
 

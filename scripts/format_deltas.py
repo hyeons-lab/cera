@@ -1,4 +1,18 @@
+"""Format benchmark_results.csv into benchmarks/deltas_table.md.
+
+One row per (model, prompt, gen) with cera and llama.cpp side by side plus their
+ratio. This replaced scripts/format_results.py, which emitted the same 45 runs
+split one-engine-per-row into benchmarks/results_table.md — strictly less
+information from the same CSV, so both the script and its output were dropped.
+
+Writes the file and echoes it, so a run is reviewable in the terminal and lands
+in the repo in one step.
+"""
+
 import csv
+import pathlib
+
+OUT = pathlib.Path(__file__).resolve().parent.parent / 'benchmarks' / 'deltas_table.md'
 
 with open('benchmark_results.csv') as f:
     reader = csv.DictReader(f)
@@ -56,4 +70,7 @@ for key in sorted(data.keys()):
     
     lines.append(f"| {key[0]} | {key[1]} | {key[2]} | {p_str} | {d_str} | {r_str} | {f_str} |")
 
-print('\n'.join(lines))
+table = '\n'.join(lines)
+OUT.write_text(table + '\n')
+print(table)
+print(f"\nwrote {OUT}")

@@ -6,7 +6,19 @@ profile/counter movement is not evidence.
 
 **Model:** LFM2.5-350M-Q4_K_M (the most common real-world quant).
 **Settings:** prefill 512 / decode 128, `--no-cache`, medians (p50) over >=5 runs.
-**Commit:** `c6f845d` (main, incl. #254 Q4_K NEON int8-dotprod GEMV).
+
+**Sections carry their own provenance — they were not all measured at once:**
+
+| section | measured at | device |
+|---|---|---|
+| Android CPU/GPU table below | `c6f845d` (incl. #254) | Pixel 10 Pro Fold |
+| GPU I/O counters | mixed — see the † note | Mac / Adreno |
+| GPU decode profile | `0f00dec` (incl. #316, #318, #319, #320) | M1 Max |
+
+**The Android GPU row has not been re-measured since `c6f845d`** and predates
+every wgpu decode change listed above. Do not read it as current: the same work
+is worth 1.78× on an M1 Max, and the Android number will have moved by some
+unknown amount. Re-running it needs the device.
 
 ## Android — Pixel 10 Pro Fold (Tensor G5), on a fan
 
@@ -18,7 +30,7 @@ CPU has `asimddp` + `i8mm`.
 | **cera** CPU | default RowPool | **102** | **70.3** |
 | cera CPU | pinned prime (`taskset 80`) | 113 | 66.1 |
 | cera CPU | pinned perf cluster (`taskset 7c`) | 49 | 46.5 |
-| **cera** GPU | wgpu / Vulkan | **12** | **11.2** |
+| **cera** GPU | wgpu / Vulkan (stale — see above) | 12 | 11.2 |
 | llama.cpp | `-t 1` pinned prime | 170.6 | 73.3 |
 | llama.cpp | `-t 5` pinned perf | 261.1 | **85.7** |
 | llama.cpp | `-t 6` pinned perf+prime | **393.5** | 70.8 |
@@ -41,9 +53,14 @@ Prompt 512, greedy decode:
 
 | | LFM2-VL-450M **Q4_0** (Mac) | LFM2.5-350M **Q4_K_M** (Mac) | LFM2.5-350M **Q4_K_M** (Adreno) |
 |---|---:|---:|---:|
-| decode submits / token | **19.0** | **19.0** | **19.0** |
+| decode submits / token | **17.0** *(was 19)* | 19.0 † | 19.0 † |
+| decode compute passes / token | **47.0** *(was 67)* | n/m | n/m |
 | decode readbacks / token | 1.0 | 1.0 | 1.0 |
 | decode readback **bytes** / token | 4 | 4 | 4 |
+
+† Not re-measured since #319; the mechanism that removed two submits is
+model-independent, so expect 17 there too (one submit per layer, plus one tail).
+The pass counter postdates #318.
 | **prefill submits** (512-tok prompt) | **25** | **8728** | **8728** |
 | prefill readbacks (512-tok prompt) | 23 | 23 | n/m |
 | prefill readback **bytes** (512-tok prompt) | 12,926,976 | 12,926,976 | n/m |
@@ -53,11 +70,19 @@ re-measuring needs the device.
 
 Read:
 
-- **Decode issues 19 submits per token** — one per layer, plus argmax. The forward
-  pass is *not* batched into a single command buffer. **This is deliberate, not a
-  bug: batching it into one command buffer was measured at ~30% slower on both Mac
-  and Adreno** (decode is GPU-bound; the per-layer submits overlap GPU execution with
-  CPU encode). T6 is closed WONTFIX — see `GPU_FINDINGS_CORRECTION.md`.
+- **Decode issues one submit per layer plus one tail submit** (17 for this
+  16-layer model). Merging the *per-layer* submits into a single command buffer
+  remains WONTFIX: it measured ~30% slower on both Mac and Adreno, because decode
+  is GPU-bound and the per-layer submits overlap GPU execution with CPU encode
+  (T6, see `GPU_FINDINGS_CORRECTION.md`).
+- **The tail used to be three submits, and two of them were pure waste** (#319).
+  The greedy argmax had its own encoder and its own blocking submit, and the
+  4-byte result readback submitted *again* to stage the copy. A submit costs a GPU
+  round trip regardless of payload — ~1.3 ms for a kernel doing 0.13 ms of work,
+  and ~1.5 ms to move four bytes. Both now ride along in the output projection's
+  submission. This is the opposite of T6 and does not contradict it: what is
+  expensive is a *blocking* round trip that carries nothing, not per-layer
+  pipelining.
 - Greedy decode **does** sample on the GPU: the readback is a 4-byte token id, not
   vocab logits. That part was always true.
 - **Prefill batching is gated on quantization, not platform.** The batched path
@@ -83,53 +108,65 @@ these numbers by construction.
 
 ## GPU decode profile (`CERA_GPU_PROFILE=1`)
 
-Per-kernel GPU timestamps. **The profiler already existed** (`GpuContext::profiler`,
-spans in `gpu_lfm2.rs`) and had apparently never been run — T5b needed no new code,
-only the run.
+Per-kernel GPU timestamps. LFM2-VL-450M **Q4_0**, wgpu/Metal, M1 Max (400 GB/s),
+greedy decode, `--no-cache`.
 
-LFM2-VL-450M **Q4_0**, wgpu/Metal, M1 Max (400 GB/s), greedy decode. Control
-(unprofiled) decode is **63.4 tok/s = 15.8 ms/token**; the timestamps themselves cost
-~9%, so treat these as ~9% inflated.
+Both columns are the same model on the same machine with the same command, so
+they are directly comparable. "before" is this doc's original measurement (commit
+`c6f845d`); "now" is after #316 (GEMV register spill), #318 (conv block in one
+pass), #319 (decode round trips) and #320 (LM head on the stored weight).
 
-| span | GPU time / token | share |
-|---|---:|---:|
-| `ffn` (16×: rmsnorm + gate/up/down GEMV + silu_mul) | 4492 µs | 51.1% |
-| `gemv_f16` (LM head) | 1265 µs | 14.4% |
-| `conv_pre` (10×) | 926 µs | 10.5% |
-| `attn_pre` (6×) | 732 µs | 8.3% |
-| `flash_attention` (6×) | 476 µs | 5.4% |
-| `conv_post` (10×) | 425 µs | 4.8% |
-| `attn_post` (6×) | 258 µs | 2.9% |
-| `conv_mid` (10×) | 188 µs | 2.1% |
-| `rmsnorm` / `argmax` | 24 / 139 µs | — |
-| **sum of GPU passes** | **~8.9 ms** | |
+| span | before | now | |
+|---|---:|---:|---|
+| `ffn` (16×) | 4492 µs | **3234 µs** | −28% (#316) |
+| conv block (10×) | 1539 µs *(pre+mid+post)* | **1062 µs** *(one `conv` span)* | −31% (#316, #318) |
+| LM head (1×) | 1265 µs *(`gemv_f16`)* | **856 µs** *(`lm_head`)* | −32% (#320) |
+| `attn_pre` (6×) | 732 µs | 647 µs | |
+| `flash_attention` (6×) | 476 µs | 524 µs | |
+| `attn_post` (6×) | 258 µs | 221 µs | |
+| `rmsnorm` / `argmax` | 24 / 139 µs | 27 / 130 µs | |
+| **sum of GPU passes** | **~8.9 ms** | **~6.7 ms** | |
+| **decode, unprofiled** | **63.4 tok/s** (15.8 ms/token) | **112.8 tok/s** (8.9 ms/token) | **1.78×** |
+
+Profiling overhead is ~18% here (93.0 tok/s profiled vs 112.8 unprofiled), so
+treat the span times as inflated by roughly that much.
 
 Read:
 
-- **The quantized decode GEMVs sustain ~25 GB/s; the f16 GEMV sustains 106 GB/s on
-  the same GPU.** That is the decode bottleneck — a ~4x gap, and it is *not* about
-  dequant cost:
+- **The quantized GEMVs are still the bottleneck, and still the biggest remaining
+  lever.** In production they sustain ~26 GB/s where the f16 kernel does ~93 GB/s
+  on the same GPU. `ffn` alone is 48% of GPU pass time. The gap is in *how the
+  bytes are read* — the quantized kernels fetch via scalar `u32` loads with
+  shift/branch byte extraction, `gemv_f16` reads aligned vectors. #316 closed part
+  of it by removing register spills; the load pattern itself is untouched.
 
-  | kernel | bytes/weight | bytes moved | time | achieved BW | % of 400 GB/s |
-  |---|---:|---:|---:|---:|---:|
-  | FFN Q4_0 | 0.5625 | 121 MB | 4.49 ms | 27 GB/s | 6.7% |
-  | FFN Q8_0 | 1.0625 | 229 MB | 9.45 ms | 24 GB/s | 6.1% |
-  | `gemv_f16` (LM head) | 2.0 | 134 MB | 1.27 ms | **106 GB/s** | 26% |
+  Measure the kernels in isolation with `cargo run --release -p cera --features
+  gpu --example wgpu_gemv_bench`. **Only its `m=65536` rows are trustworthy** — it
+  issues each iteration in its own compute pass, so ~38 µs of pass overhead
+  dominates the smaller shapes. At `m=65536`: q4_k 43, q4_0 53, q6_k 54, q8_0 33,
+  **f32 145 GB/s**.
 
-- **Decode is memory-bound, confirmed by A/B, not by inspection.** The same model at
-  Q8_0 moves 1.89x the FFN bytes and takes **2.10x** the FFN time (4.49 → 9.45 ms).
-  Time tracks bytes. An ALU/dequant bound was the obvious story from reading
-  `gemv_q4_0_fast.wgsl` (branchy `u32` shift-extraction per weight byte) and it is
-  **wrong** — Q8_0 is *cheaper* to unpack and got proportionally slower anyway.
-- So the ~4x gap is in **how the bytes are read**, not what is done with them: the
-  quantized kernels fetch via scalar `u32` loads with shift/branch byte extraction;
-  `gemv_f16` reads aligned vectors. Coalescing/vectorization, not quantization.
-- **~44% of decode wall time is outside every GPU pass** (8.9 ms of passes vs 15.8 ms
-  wall). Not recoverable by merging submits — see T6 above.
-- **Fixed cost is ~20 µs per compute pass.** A 1024-element `rmsnorm` takes 24 µs;
-  `conv_mid` 18.8 µs. At 67 passes/token that is ~1.3 ms of pure overhead.
-- Not yet measured on Adreno. T5b was originally scoped there, and the access-pattern
-  penalty is likely worse on a mobile tiler.
+- **Decode is memory-bound, confirmed by A/B, not by inspection.** The same model
+  at Q8_0 moves 1.89× the FFN bytes and took **2.10×** the FFN time. Time tracks
+  bytes. An ALU/dequant bound was the obvious story from reading
+  `gemv_q4_0_fast.wgsl` and it is **wrong** — Q8_0 is *cheaper* to unpack and got
+  proportionally slower anyway.
+
+- **~24% of decode wall time is now outside every GPU pass** (6.7 ms of passes vs
+  8.9 ms wall), down from ~44%. #319 is what closed it, by removing two blocking
+  GPU round trips from the tail. The earlier claim that this gap was "not
+  recoverable by merging submits" was right about *submits* and wrong as a general
+  conclusion — see `GPU_FINDINGS_CORRECTION.md`, round 3.
+
+- **Compute-pass count is NOT a general lever — do not re-derive one from #318.**
+  Merging the conv block's three passes into one was worth +17%, but merging
+  passes in the attention/FFN path measured **neutral-to-negative**: a boundary
+  there is worth ~6 µs, not the ~20–38 µs the conv result implied, and carrying
+  those merges cost ~15%. Implemented, measured, reverted (#319). A cost-per-unit
+  derived from one successful change describes that change, not the system.
+
+- Not yet measured on Adreno. The access-pattern penalty is likely worse on a
+  mobile tiler.
 
 ## Reproduce
 
