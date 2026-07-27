@@ -154,7 +154,7 @@ impl Tile {
             wg_n: env_u32("WG_N", 16),
             tile_m: env_u32("TILE_M", 4),
             tile_n: env_u32("TILE_N", 4),
-            tile_k: env_u32("TILE_K", 32),
+            tile_k: env_u32("TILE_K", 16),
         }
     }
 

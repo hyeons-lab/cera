@@ -621,8 +621,8 @@ pub fn encode_image_gpu<O: VitGpuOps>(
 // ── wgpu backend implementation ──────────────────────────────────────────────
 
 // Register-tiled `mul_mat_reg_tile` config for the ViT GEMMs. Each workgroup
-// computes a (WG_M·TILE_M)×(WG_N·TILE_N) = 64×32 output tile with WG_M·WG_N =
-// 128 threads, staging a TILE_K=32 slice of decoded weights + activations into
+// computes a (WG_M·TILE_M)×(WG_N·TILE_N) = 64×64 output tile with WG_M·WG_N =
+// 256 threads, staging a TILE_K=16 slice of decoded weights + activations into
 // shared memory per step (so weights are reused across the token tile instead
 // of re-read per token like the batched-GEMV kernels).
 //
@@ -631,27 +631,48 @@ pub fn encode_image_gpu<O: VitGpuOps>(
 // higher TILE_N measured slower; that was an artifact of the accumulator array
 // spilling out of registers, which the shader rewrite fixed.
 //
-// DELIBERATELY narrower than the text path's 16×16 (`MUL_MAT_TILE_*` in
-// gpu_lfm2.rs). shmem is `TILE_K·(TILE_ROWS+4) + TILE_K·(TILE_COLS+4)` f32:
-// 16×16 would need ~17.0 KiB, over the 16 KiB WebGPU `max_compute_workgroup_-
-// storage_size` floor. The text path already requires an adapter above that
-// floor and has no fallback, but the ViT does: `WgpuVitOps::new` catches the
-// pipeline-creation panic and `try_wgpu_vision_encoder`'s `.ok()?` drops vision
-// to the CPU encoder — silently, as a perf cliff rather than an error. 16×8
-// keeps it at ~13.0 KiB so a spec-minimum adapter still gets the GPU encoder.
+// Identical to the text path's geometry (`MUL_MAT_TILE_*` in gpu_lfm2.rs). It
+// was briefly narrower — 16×8 — purely to stay under the 16 KiB WebGPU
+// workgroup-storage floor while the text path used TILE_K=32 and needed 17.0
+// KiB. At TILE_K=16 both are 8.5 KiB, so the constraint that forced them apart
+// is gone.
+//
+// Staying under the 16 KiB floor matters more here than on the text path:
+// `WgpuVitOps::new` catches a pipeline-creation panic and
+// `try_wgpu_vision_encoder`'s `.ok()?` then drops vision to the CPU encoder
+// silently, as a perf cliff rather than an error.
+//
+// UNMEASURED on the ViT specifically, and taken for uniformity rather than for
+// throughput: widening WG_N 8 -> 16 doubles the output tile to 64×64 on token
+// counts no sweep covered, and a projector input below 64 columns is then mostly
+// padding. The measured TILE_K trade-off recorded against `MUL_MAT_TILE_K` in
+// gpu_lfm2.rs is the text path's; do not read this widening as having the same
+// backing.
 #[cfg(feature = "gpu")]
 const VIT_MM_WG_M: u32 = 16;
 #[cfg(feature = "gpu")]
-const VIT_MM_WG_N: u32 = 8;
+const VIT_MM_WG_N: u32 = 16;
 #[cfg(feature = "gpu")]
 const VIT_MM_TILE_M: u32 = 4;
 #[cfg(feature = "gpu")]
 const VIT_MM_TILE_N: u32 = 4;
 #[cfg(feature = "gpu")]
-const VIT_MM_TILE_K: u32 = 32;
+const VIT_MM_TILE_K: u32 = 16;
 
-// Same two invariants the text path asserts (gpu_lfm2.rs), plus the workgroup-
-// storage bound that is the whole reason this geometry differs from it.
+// Same invariants the text path asserts (gpu_lfm2.rs), plus the workgroup-storage
+// bound and an explicit tie to the text constants — the comment above says the
+// two geometries are identical, so make that enforced rather than aspirational.
+// They can be retuned together, but not apart: the ViT's failure mode is a
+// swallowed pipeline-creation panic that silently drops vision to CPU.
+//
+// Asserted equal rather than *defined* as `= gpu_lfm2::MUL_MAT_TILE_*`, which
+// would look tidier and is a standing review suggestion. Aliasing would make a
+// text-path retune silently retune the ViT, and that is the one thing this
+// block exists to prevent: the geometry here is UNMEASURED on the ViT (see
+// above), so a value chosen from the text path's sweep is a value nobody has
+// justified for this kernel. The assert turns such a change into a compile
+// error naming both sites, which is the point where someone has to decide
+// whether the ViT should follow. Keep them separate.
 #[cfg(feature = "gpu")]
 const _: () = assert!(
     VIT_MM_TILE_M == 4 && VIT_MM_TILE_N == 4,
@@ -659,14 +680,23 @@ const _: () = assert!(
 );
 #[cfg(feature = "gpu")]
 const _: () = assert!(
+    VIT_MM_WG_M == crate::model::gpu_lfm2::MUL_MAT_TILE_WG_M
+        && VIT_MM_WG_N == crate::model::gpu_lfm2::MUL_MAT_TILE_WG_N
+        && VIT_MM_TILE_M == crate::model::gpu_lfm2::MUL_MAT_TILE_M
+        && VIT_MM_TILE_N == crate::model::gpu_lfm2::MUL_MAT_TILE_N
+        && VIT_MM_TILE_K == crate::model::gpu_lfm2::MUL_MAT_TILE_K,
+    "the ViT and text reg-tile geometries are documented as identical; retune \
+     them together or split the comment too"
+);
+#[cfg(feature = "gpu")]
+const _: () = assert!(
     VIT_MM_TILE_K.is_multiple_of(8),
     "the Q4_0 shmem loader stages 8 consecutive k per thread"
 );
 // 16384 B = the 16 KiB WebGPU `max_compute_workgroup_storage_size` floor. At
-// 16x8 this evaluates to 13312 B; 16x16 would be 17408 and fail here, which is
-// the whole reason the ViT geometry differs from the text path's. A compile
-// error is the right failure mode: at runtime `WgpuVitOps::new` swallows the
-// pipeline-creation panic and vision silently drops to the CPU encoder.
+// 16x16 / TILE_K=16 this evaluates to 8704 B. A compile error is the right
+// failure mode: at runtime `WgpuVitOps::new` swallows the pipeline-creation
+// panic and vision silently drops to the CPU encoder.
 #[cfg(feature = "gpu")]
 const _: () = assert!(
     (VIT_MM_TILE_K * (VIT_MM_WG_M * VIT_MM_TILE_M + 4)
@@ -1567,7 +1597,10 @@ mod tests {
             Some(d) => panic!("synth_encoder_quant: unsupported dtype {d:?}"),
             None => f32_weight(rows, cols, seed),
         };
-        // All linear in_dims (k) must be multiples of the matmul's TILE_K=32:
+        // All linear in_dims (k) must be multiples of 32 — the quant block size
+        // asserted by `q8_0_weight`/`q4_0_weight` above, NOT the matmul's TILE_K (the
+        // kernel handles a ragged final k-tile; `test_gpu_mul_mat_tile_f32_ragged_k_parity`
+        // covers that):
         //   patch in_dim = 3·patch_size² = 192; q/k/v/o/ffn_up = n_embd = 32;
         //   ffn_down = n_ff = 64; mm.1 = n_embd·sf² = 128; mm.2 = intermediate = 64.
         let patch_size = 8;
