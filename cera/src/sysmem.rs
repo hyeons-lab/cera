@@ -44,15 +44,30 @@ fn parse_mem_available_kib(meminfo: &str) -> Option<u64> {
         .and_then(|kib| kib.parse::<u64>().ok())
 }
 
+/// The fit predicate itself, against a caller-supplied `available` figure.
+///
+/// Split out from [`fits_in_available_memory`] so the boundary behaviour can be
+/// tested against fixed numbers. Testing it through the public function means
+/// sampling live memory twice — once to pick the input, once inside the call —
+/// and asserting on a value that moves in between, which is a race rather than
+/// a test (see `fits_is_exact_at_the_boundary`).
+fn fits_within(required_bytes: u64, headroom_bytes: u64, available: u64) -> bool {
+    required_bytes.saturating_add(headroom_bytes) <= available
+}
+
 /// Whether `required_bytes` fits in currently-available physical memory leaving
 /// at least `headroom_bytes` free. `None` when available memory can't be queried
 /// (see [`available_memory_bytes`]) — the caller then decides whether to proceed.
 ///
 /// `headroom_bytes` is the caller's safety margin for fragmentation, other live
 /// allocations, and the OS low-memory killer; there is no baked-in policy here.
+///
+/// The answer is a snapshot: it reflects one `/proc/meminfo` read and is stale
+/// the moment it returns. Callers use it to skip an obviously-too-large model,
+/// not as a guarantee that the load will succeed.
 pub fn fits_in_available_memory(required_bytes: u64, headroom_bytes: u64) -> Option<bool> {
     let available = available_memory_bytes()?;
-    Some(required_bytes.saturating_add(headroom_bytes) <= available)
+    Some(fits_within(required_bytes, headroom_bytes, available))
 }
 
 #[cfg(test)]
@@ -74,17 +89,66 @@ mod tests {
         assert_eq!(parse_mem_available_kib(""), None);
     }
 
+    /// The fit boundary, against fixed numbers rather than a live sample.
+    ///
+    /// This replaces an assertion that read `available_memory_bytes()` and then
+    /// called `fits_in_available_memory(avail + 1, 0)` expecting `Some(false)`.
+    /// That is a TOCTOU race: the public function samples `/proc/meminfo`
+    /// *again*, and if free memory rose in between — a page cache reclaim, a
+    /// sibling test's allocation being dropped — then `avail + 1` fits after all
+    /// and the assertion inverts. It failed exactly that way on a busy CI runner.
     #[test]
-    fn fits_contract_holds_when_available_known() {
+    fn fits_is_exact_at_the_boundary() {
+        assert!(fits_within(0, 0, 0), "zero always fits, even in nothing");
+        assert!(fits_within(100, 0, 100), "exactly available must fit");
+        assert!(!fits_within(101, 0, 100), "one byte over must not");
+    }
+
+    #[test]
+    fn headroom_is_deducted_from_the_budget() {
+        assert!(fits_within(60, 40, 100), "required + headroom == available");
+        assert!(
+            !fits_within(61, 40, 100),
+            "one byte over once headroom is paid"
+        );
+        assert!(
+            !fits_within(0, 101, 100),
+            "headroom alone can exceed available"
+        );
+    }
+
+    /// `required + headroom` must not wrap. A plain `+` would overflow (panic in
+    /// debug, wrap in release) and a wrapped sum is a *small* number, which
+    /// would report a colossal request as fitting comfortably.
+    ///
+    /// Note the one case `saturating_add` cannot distinguish: when the sum
+    /// saturates to `u64::MAX` and `available` is also `u64::MAX`, it compares
+    /// equal and reports a fit. Left alone deliberately — `available` comes from
+    /// `MemAvailable`, so reaching `u64::MAX` would mean 16 exabytes of free
+    /// RAM. Asserting the "right" answer there would mean carrying a
+    /// `checked_add` branch for a state that cannot occur.
+    #[test]
+    fn oversized_request_saturates_rather_than_wrapping() {
+        assert!(
+            !fits_within(u64::MAX, 1, 100),
+            "saturation must not wrap a colossal request into a fit"
+        );
+        assert!(!fits_within(u64::MAX - 1, 10, 1000));
+        assert!(!fits_within(1, u64::MAX, 1000), "headroom overflows too");
+    }
+
+    /// The platform wiring: that `fits_in_available_memory` agrees with
+    /// `available_memory_bytes` about whether this platform can answer at all.
+    ///
+    /// Deliberately asserts only on the `Some`/`None` shape and on the one
+    /// comparison that cannot move — `0` fits in any figure, however the live
+    /// sample drifts. The value-level behaviour is covered above.
+    #[test]
+    fn public_fits_matches_platform_support() {
         match available_memory_bytes() {
             Some(avail) => {
                 assert!(avail > 0);
-                // Zero always fits; more-than-available never does.
                 assert_eq!(fits_in_available_memory(0, 0), Some(true));
-                assert_eq!(
-                    fits_in_available_memory(avail.saturating_add(1), 0),
-                    Some(false)
-                );
             }
             None => {
                 // Platform without support (e.g. macOS): fits is likewise None.
