@@ -319,8 +319,8 @@ cfg.seed = 42n;        // BigInt — wasm-bindgen maps Rust u64 to JS BigInt
 //                           // session.cancel() checkpoints during long prompts
 
 // Optional: turn on TurboQuant KV compression. Compresses keys to
-// ~3 bits/elem and values to ~2 bits/elem (plus f16 norms per
-// block). Pass an explicit seed so the per-layer Hadamard
+// ~3 bits/elem and values to ~2 bits/elem (plus a norm word per
+// vector). Pass an explicit seed so the per-layer Hadamard
 // rotations are reproducible — paired with `cfg.seed` above this
 // keeps the whole session bitwise-identical across runs.
 //
@@ -512,19 +512,22 @@ import { WebGpuSession, TurboQuantConfig } from '@hyeons-lab/cera-wasm';
 // The optional third argument requests TurboQuant on the GPU-resident KV
 // cache (~3-bit keys / ~2-bit values). Omit it — or pass null — for
 // uncompressed f32 KV; existing two-argument calls are unaffected. Like
-// the `SessionConfig` setter, `create` CONSUMES the config handle, so
-// build a fresh one per session rather than reusing it.
+// the `SessionConfig` setter, `create` CONSUMES the config handle. Build a
+// fresh one per session: a reused handle does NOT throw in a release build,
+// it lowers to a null pointer that Rust reads as "no compression", so the
+// second session silently runs uncompressed.
 const session = await WebGpuSession.create(ggufBytes, 2048, new TurboQuantConfig(1234n));
 
 // Adapter + backend description — confirms the GPU path is live.
 console.log(session.adapter);  // e.g. "<adapter> (BrowserWebGpu)"
 
 // The mode that ACTUALLY took effect — "turboquant(seed=N)" or
-// "uncompressed". Two things silently downgrade to f32: a head_dim that
-// isn't a power of two <= 128 and a multiple of 32, and a single-sided
-// config (the WebGPU kernels only compress keys AND values together, so
-// the `tq.keys = false` debug toggle above falls back here). Neither
-// reaches the browser console, so this getter is the only way to tell.
+// "uncompressed". Three things silently downgrade to f32: a head_dim that
+// isn't a power of two <= 128 and a multiple of 32; a single-sided config
+// (the WebGPU kernels only compress keys AND values together, so the
+// `tq.keys = false` debug toggle above falls back here); and reusing an
+// already-consumed config handle, as noted above. None of them reach the
+// browser console, so this getter is the only way to tell.
 console.log(session.kvCompression);
 
 // Greedy generate. `onToken(text)` fires per decoded piece as it's

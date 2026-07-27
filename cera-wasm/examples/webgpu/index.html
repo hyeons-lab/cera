@@ -100,15 +100,16 @@
         const file = $("model").files?.[0];
         if (!file) return;
         setBusy(true);
-        // Hand the old session's GPU buffers and linear memory back now rather
-        // than waiting for the FinalizationRegistry — toggling the KV dropdown a
-        // few times on a real GGUF would otherwise strand a full model per
-        // toggle, in the very demo meant to show KV memory going down. Safe to
-        // free unconditionally because the controls are latched: nothing else
-        // can be holding this session.
-        session?.free();
-        session = null;
         try {
+          // Free eagerly rather than waiting for the FinalizationRegistry —
+          // toggling the KV dropdown a few times on a real GGUF would otherwise
+          // strand a whole model per toggle, in the demo meant to show KV memory
+          // going down. Inside the `try` because a trapped wasm module makes even
+          // `free()` throw, which outside it would skip the `finally` and latch
+          // every control with no way back but a reload.
+          const stale = session;
+          session = null;
+          stale?.free();
           setStatus(`Reading ${file.name} (${(file.size / 1e6).toFixed(1)} MB)…`);
           const bytes = new Uint8Array(await file.arrayBuffer());
           setStatus("Initializing WebGPU + uploading model to GPU…");
