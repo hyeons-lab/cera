@@ -2524,7 +2524,10 @@ impl GpuLfm2Model {
                         self.lora_target_bgs(t, &self.normed_buf, &self.conv_proj_buf),
                     )
                 });
-                // Pass 1: rmsnorm + in_proj (after hidden→normed copy).
+                // `rmsnorm` normalizes in place, so the residual input has to be
+                // preserved before it runs. This copy is the only encoder
+                // operation in the whole conv block, which is what lets the
+                // three stages below share one compute pass.
                 Self::encode_copy(
                     &mut enc,
                     &self.hidden_buf,
@@ -2533,17 +2536,6 @@ impl GpuLfm2Model {
                     0,
                     hs as u64,
                 );
-                {
-                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("conv_pre"),
-                        timestamp_writes: self.ctx.begin_profile_span("conv_pre"),
-                    });
-                    self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
-                    self.dispatch_gemv_into(&mut pass, in_w, in_bg);
-                    if let Some((t, (bg_a, bg_b))) = &in_lora_bgs {
-                        self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
-                    }
-                }
 
                 // Pre-create BGs for passes 2 and 3. The fused conv shader reads
                 // x/c/b directly from `conv_proj_buf` at offsets 0/hs/2*hs and
@@ -2622,29 +2614,41 @@ impl GpuLfm2Model {
                         ],
                     });
 
-                // Pass 2: fused conv block (bx = x*b → conv → c*conv_out).
-                // One dispatch replaces the prior mul1 + conv1d + mul2 trio
-                // plus three encoder copies that extracted x/c/b from the
-                // proj buffer into separate per-channel buffers.
+                // The whole conv block in ONE compute pass: rmsnorm + in_proj,
+                // the fused conv, then out_proj + residual add.
+                //
+                // These were three passes (`conv_pre` / `conv_mid` /
+                // `conv_post`) with nothing but bind-group construction between
+                // them — CPU-side work that does not need a pass boundary. A
+                // pass boundary is not free: the same dispatches cost 2.65x more
+                // split across N passes than batched into one (measured, M1 Max),
+                // and decode was issuing 58 passes per token.
+                //
+                // Correctness is unchanged. WebGPU orders dispatches within a
+                // compute pass and makes each one's writes visible to the next,
+                // which is what the `ffn` pass below has always relied on — it
+                // runs the same shape of dependent chain (rmsnorm → gate/up →
+                // silu_mul → down → add) in a single pass.
+                //
+                // The cost is profiling granularity: timestamps are per-pass, so
+                // the three spans collapse into one `conv`. See the `Profiling`
+                // note in the module docs.
                 {
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("conv_mid"),
-                        timestamp_writes: self.ctx.begin_profile_span("conv_mid"),
+                        label: Some("conv"),
+                        timestamp_writes: self.ctx.begin_profile_span("conv"),
                     });
+                    self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
+                    self.dispatch_gemv_into(&mut pass, in_w, in_bg);
+                    if let Some((t, (bg_a, bg_b))) = &in_lora_bgs {
+                        self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
+                    }
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.conv1d_fused,
                         &conv_fused_bg,
                         (hs32.div_ceil(256), 1, 1),
                     );
-                }
-
-                // Pass 3: out_proj + add.
-                {
-                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("conv_post"),
-                        timestamp_writes: self.ctx.begin_profile_span("conv_post"),
-                    });
                     self.dispatch_gemv_into(&mut pass, out_w, out_bg);
                     if let Some((t, (bg_a, bg_b))) = &out_lora_bgs {
                         self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
