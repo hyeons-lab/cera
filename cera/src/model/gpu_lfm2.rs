@@ -3306,6 +3306,22 @@ impl GpuLfm2Model {
     pub fn gpu_info(&self) -> (&str, &str) {
         (&self.ctx.adapter_name, &self.ctx.backend)
     }
+
+    /// The KV-cache mode this model actually resolved to, as a human-readable
+    /// label: `"turboquant(seed=N)"` or `"uncompressed"`.
+    ///
+    /// This reports the *effective* mode, not the requested one, and that
+    /// distinction is the whole point: `configure_kv_compression` downgrades a
+    /// request it can't serve (single-sided TurboQuant, or a `head_dim` the
+    /// kernels reject) to uncompressed KV with only a `tracing::warn!`. A caller
+    /// that can't see the log — a browser via `cera-wasm`, notably — otherwise
+    /// has no way to tell a compressed session from a silently uncompressed one.
+    ///
+    /// Reads `"uncompressed"` before `configure_kv_compression` has run, which is
+    /// the correct label for the f32 default.
+    pub fn kv_mode_label(&self) -> String {
+        describe_kv_mode(self.kv_mode.get().unwrap_or(&None))
+    }
 }
 
 // === Batched prefill — encode helpers + main method ========================

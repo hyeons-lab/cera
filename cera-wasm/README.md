@@ -319,8 +319,8 @@ cfg.seed = 42n;        // BigInt — wasm-bindgen maps Rust u64 to JS BigInt
 //                           // session.cancel() checkpoints during long prompts
 
 // Optional: turn on TurboQuant KV compression. Compresses keys to
-// ~3 bits/elem and values to ~2 bits/elem (plus f16 norms per
-// block). Pass an explicit seed so the per-layer Hadamard
+// ~3 bits/elem and values to ~2 bits/elem (plus a norm word per
+// vector). Pass an explicit seed so the per-layer Hadamard
 // rotations are reproducible — paired with `cfg.seed` above this
 // keeps the whole session bitwise-identical across runs.
 //
@@ -329,8 +329,9 @@ cfg.seed = 42n;        // BigInt — wasm-bindgen maps Rust u64 to JS BigInt
 //   cera logs a warning and falls back to f32 if not — no JS
 //   error.
 // - Applies to `engine.newSession(cfg)` only. `WebGpuSession`
-//   takes no `SessionConfig`, so the WebGPU path always runs
-//   uncompressed f32 KV regardless of this setting.
+//   takes no `SessionConfig` — pass a `TurboQuantConfig` as the
+//   third argument of `WebGpuSession.create` instead, and read
+//   `session.kvCompression` for the mode that took effect.
 // - Don't combine with `cfg.nKeep > 0` (context-shift); cera
 //   warns at session creation and ignores nKeep on overflow.
 const tq = new TurboQuantConfig(1234n);  // ctor sets keys + values = true
@@ -501,16 +502,45 @@ default builds above are CPU-only; the standard `Session` remains the
 supported path.
 
 ```js
-import { WebGpuSession } from '@hyeons-lab/cera-wasm';
+import { WebGpuSession, TurboQuantConfig } from '@hyeons-lab/cera-wasm';
 
 // Async constructor — initializes WebGPU (requestAdapter / requestDevice
 // resolve on the event loop), parses the GGUF, and uploads the model to
 // the GPU. `contextSize` defaults to 4096. Throws if WebGPU is
 // unavailable or the bytes aren't a valid LFM2 GGUF.
-const session = await WebGpuSession.create(ggufBytes, 2048);
+//
+// The optional third argument requests TurboQuant on the GPU-resident KV
+// cache (~3-bit keys / ~2-bit values). Omit it — or pass null — for
+// uncompressed f32 KV; existing two-argument calls are unaffected. Like
+// the `SessionConfig` setter, `create` CONSUMES the config handle. Build a
+// fresh one per session: a reused handle does NOT throw in a release build,
+// it lowers to a null pointer that Rust reads as "no compression", so the
+// second session silently runs uncompressed.
+const session = await WebGpuSession.create(ggufBytes, 2048, new TurboQuantConfig(1234n));
+
+// To request TurboQuant but keep the default contextSize, pass an explicit
+// placeholder for argument 2 — `undefined` and `null` both work (the generated
+// signature is `context_size?: number | null`):
+//
+//   await WebGpuSession.create(ggufBytes, undefined, new TurboQuantConfig(1234n));
+//
+// Do NOT collapse it to `create(ggufBytes, tq)`. TypeScript rejects that, but
+// plain JS does not: in a release build the config object is coerced by
+// `>>> 0` to a contextSize of 0 and the compression argument goes missing, so
+// you get an unusable session with no compression and no error. (A `--dev`
+// build throws instead, so this only bites in release.)
 
 // Adapter + backend description — confirms the GPU path is live.
 console.log(session.adapter);  // e.g. "<adapter> (BrowserWebGpu)"
+
+// The mode that ACTUALLY took effect — "turboquant(seed=N)" or
+// "uncompressed". Three things silently downgrade to f32: a head_dim that
+// isn't a power of two <= 128 and a multiple of 32; a single-sided config
+// (the WebGPU kernels only compress keys AND values together, so the
+// `tq.keys = false` debug toggle above falls back here); and reusing an
+// already-consumed config handle, as noted above. None of them reach the
+// browser console, so this getter is the only way to tell.
+console.log(session.kvCompression);
 
 // Greedy generate. `onToken(text)` fires per decoded piece as it's
 // produced; the full string is also returned. Stateful: the on-GPU KV

@@ -6,8 +6,10 @@
 fn load_f32_bin(path: &str) -> Vec<f32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 

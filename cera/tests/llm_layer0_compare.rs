@@ -124,8 +124,10 @@ fn llm_layer0_conv_standalone() {
     if std::path::Path::new("/tmp/cera_llm_layer0.bin").exists() {
         let run_layers_l0: Vec<f32> = std::fs::read("/tmp/cera_llm_layer0.bin")
             .unwrap()
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         let n = output.len().min(run_layers_l0.len());
         let exact = (0..n)
