@@ -220,6 +220,7 @@ jobs:
             --test gpu_lfm2_prefill_equivalence \
             --test gpu_lfm2_prefill_dispatch \
             --test gpu_lfm2_decode_passes \
+            --test gpu_lfm2_greedy_submits \
             -- --nocapture
       # The GEMM microbenchmark carries `required-features = ["gpu"]`, so the
       # `check` job's `cargo clippy --all-targets` (no features) skips it and

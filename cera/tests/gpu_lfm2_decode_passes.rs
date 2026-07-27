@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use cera::backend::wgpu::io_stats;
 use cera::gguf::GgufFile;
 use cera::kv_cache::{InferenceState, KvCompression};
-use cera::model::{Model, load_model_gpu};
+use cera::model::load_model_gpu;
 
 /// The `core` fixture set's LFM2 model — fetched on pull requests, so this has
 /// real PR coverage rather than the skip-as-pass an `arch`-tier model gets.
