@@ -46,6 +46,7 @@ pub mod io_stats {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
     static SUBMITS: AtomicU64 = AtomicU64::new(0);
+    static PASSES: AtomicU64 = AtomicU64::new(0);
     static READBACKS: AtomicU64 = AtomicU64::new(0);
     static READBACK_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -54,6 +55,15 @@ pub mod io_stats {
     pub struct GpuIoStats {
         /// Number of `queue.submit` calls.
         pub submits: u64,
+        /// Number of compute passes begun.
+        ///
+        /// Tracked separately from `submits` because they are independent
+        /// levers and only this one turned out to matter: identical dispatches
+        /// cost 2.65x more split across N passes than batched into one, and a
+        /// pass boundary costs real GPU time (a pipeline drain), not just CPU
+        /// encode. Decode issued 58 passes/token before PR #318 merged the conv
+        /// block's three into one.
+        pub passes: u64,
         /// Number of GPU→CPU readbacks (each forces a pipeline flush).
         pub readbacks: u64,
         /// Total bytes read back from the GPU.
@@ -61,15 +71,17 @@ pub mod io_stats {
     }
 
     impl GpuIoStats {
-        /// Per-token rates, given the number of tokens the interval covered.
+        /// Per-token rates — `(submits, passes, readbacks, readback_bytes)`, in
+        /// field order — given the number of tokens the interval covered.
         /// Returns zeros when `tokens` is 0 rather than dividing by zero.
-        pub fn per_token(&self, tokens: u64) -> (f64, f64, f64) {
+        pub fn per_token(&self, tokens: u64) -> (f64, f64, f64, f64) {
             if tokens == 0 {
-                return (0.0, 0.0, 0.0);
+                return (0.0, 0.0, 0.0, 0.0);
             }
             let t = tokens as f64;
             (
                 self.submits as f64 / t,
+                self.passes as f64 / t,
                 self.readbacks as f64 / t,
                 self.readback_bytes as f64 / t,
             )
@@ -78,6 +90,10 @@ pub mod io_stats {
 
     pub(crate) fn record_submit() {
         SUBMITS.fetch_add(1, Relaxed);
+    }
+
+    pub(crate) fn record_pass() {
+        PASSES.fetch_add(1, Relaxed);
     }
 
     pub(crate) fn record_readback(bytes: u64) {
@@ -89,6 +105,7 @@ pub mod io_stats {
     pub fn snapshot() -> GpuIoStats {
         GpuIoStats {
             submits: SUBMITS.load(Relaxed),
+            passes: PASSES.load(Relaxed),
             readbacks: READBACKS.load(Relaxed),
             readback_bytes: READBACK_BYTES.load(Relaxed),
         }
@@ -97,6 +114,7 @@ pub mod io_stats {
     /// Reset the counters to zero (call before a measured interval).
     pub fn reset() {
         SUBMITS.store(0, Relaxed);
+        PASSES.store(0, Relaxed);
         READBACKS.store(0, Relaxed);
         READBACK_BYTES.store(0, Relaxed);
     }
@@ -738,8 +756,34 @@ impl GpuContext {
             })
     }
 
-    /// Get timestamp_writes for a compute pass (if profiling enabled).
-    /// Returns (begin_query_idx, end_query_idx) for later resolution.
+    /// Begin a compute pass, counting it and attaching a profiling span.
+    ///
+    /// Use this rather than `CommandEncoder::begin_compute_pass` directly.
+    /// Nothing in the type system enforces that — `begin_compute_pass` is still
+    /// reachable — so it is a convention, and `io_stats::passes` is only as
+    /// honest as the callers. That is exactly how `submits` went wrong before
+    /// #255: the model bypassed the counter with direct `queue.submit` calls and
+    /// it reported 1.0 submits/token against a real 19. Pass count is a real
+    /// perf lever (see `io_stats::GpuIoStats::passes`), so it is worth keeping the
+    /// convention; `gpu_lfm2_decode_passes.rs` asserts the count is non-zero,
+    /// which catches a wholesale bypass but not a single stray call site.
+    pub fn begin_pass<'a>(
+        &'a self,
+        enc: &'a mut wgpu::CommandEncoder,
+        label: &str,
+    ) -> wgpu::ComputePass<'a> {
+        io_stats::record_pass();
+        enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(label),
+            timestamp_writes: self.begin_profile_span(label),
+        })
+    }
+
+    /// Get `timestamp_writes` for a compute pass, when profiling is enabled.
+    ///
+    /// Reserves a query pair and records `(label, begin_idx, end_idx)` for later
+    /// resolution; `None` when there is no profiler or the query budget is
+    /// spent. Prefer [`Self::begin_pass`], which calls this and counts the pass.
     pub fn begin_profile_span(&self, label: &str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
         use std::sync::atomic::Ordering;
         let profiler = self.profiler.as_ref()?;
