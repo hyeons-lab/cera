@@ -882,7 +882,7 @@ impl SessionConfig {
     }
 }
 
-/// `Option<TurboQuantConfig>` → the engine's `KvCompression`.
+/// `Option<&TurboQuantConfig>` → the engine's `KvCompression`.
 ///
 /// Shared by the CPU [`SessionConfig`] setter and `WebGpuSession::create` so the
 /// two entry points cannot drift on what `null` means or on which fields get
