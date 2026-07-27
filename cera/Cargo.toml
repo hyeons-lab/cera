@@ -110,6 +110,10 @@ features = ["fragile-send-sync-non-atomic-wasm"]
 name = "wgpu_gemm_bench"
 required-features = ["gpu"]
 
+[[example]]
+name = "wgpu_gemv_bench"
+required-features = ["gpu"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true

@@ -69,6 +69,21 @@ fn q4k_mn(s0: u32, s1: u32, s2: u32, sub: u32) -> u32 {
     return (scb(s0, s1, s2, sub + 4u) >> 4u) | ((scb(s0, s1, s2, sub) >> 6u) << 4u);
 }
 
+/// Dequantized weight from byte `byte` (0..3, a byte index within the 32-bit
+/// word `w`). Which *nibble* of that byte is taken is a separate choice, made by
+/// `hi`: `hi == 0` takes the low nibble, otherwise the high one.
+///
+/// `byte` is a literal at every call site, so the shift folds at compile time.
+/// That is the point of unrolling the caller: the rolled loop selected the word
+/// (`select(qw1, qw0, i < 4u)`) and the byte (`(i & 3u) * 8u`) from a loop
+/// variable, neither of which the backend can fold, turning eight FMAs into
+/// eight FMAs plus a register select and a variable shift each.
+fn dq(w: u32, byte: u32, hi: u32, scale: f32, minv: f32) -> f32 {
+    let qb = (w >> (byte * 8u)) & 0xFFu;
+    let nib = select(qb >> 4u, qb & 0x0Fu, hi == 0u);
+    return scale * f32(nib) - minv;
+}
+
 @compute @workgroup_size(32, 1, 1)
 fn gemv_q4_k(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -92,11 +107,19 @@ fn gemv_q4_k(
     var sumf1: f32 = 0.0;
 
     for (var ib = 0u; ib < nb; ib += 1u) {
+        // Named scalars rather than `array<f32, 8>`. A loop-indexed local array
+        // is not reliably promoted to registers, and these 8 values are read
+        // once per row per block — the kernel's hot path. Same pathology as
+        // gemv_q4_0_fast.wgsl and the prefill GEMM (#311).
         let x_off = ib * QK_K + e0;
-        var xl: array<f32, 8>;
-        for (var i = 0u; i < 8u; i += 1u) {
-            xl[i] = x[x_off + i];
-        }
+        let xl0 = x[x_off + 0u];
+        let xl1 = x[x_off + 1u];
+        let xl2 = x[x_off + 2u];
+        let xl3 = x[x_off + 3u];
+        let xl4 = x[x_off + 4u];
+        let xl5 = x[x_off + 5u];
+        let xl6 = x[x_off + 6u];
+        let xl7 = x[x_off + 7u];
 
         for (var r = 0u; r < NR; r += 1u) {
             let row = first_row + r;
@@ -124,12 +147,17 @@ fn gemv_q4_k(
             let qw0 = a[qw];
             let qw1 = a[qw + 1u];
 
+            // Unrolled in the original i = 0..7 order, so the accumulation
+            // order — and therefore the result — is unchanged.
             var s = 0.0;
-            for (var i = 0u; i < 8u; i += 1u) {
-                let qb = ((select(qw1, qw0, i < 4u)) >> ((i & 3u) * 8u)) & 0xFFu;
-                let nib = select(qb >> 4u, qb & 0x0Fu, hi == 0u);
-                s += (scale * f32(nib) - minv) * xl[i];
-            }
+            s += dq(qw0, 0u, hi, scale, minv) * xl0;
+            s += dq(qw0, 1u, hi, scale, minv) * xl1;
+            s += dq(qw0, 2u, hi, scale, minv) * xl2;
+            s += dq(qw0, 3u, hi, scale, minv) * xl3;
+            s += dq(qw1, 0u, hi, scale, minv) * xl4;
+            s += dq(qw1, 1u, hi, scale, minv) * xl5;
+            s += dq(qw1, 2u, hi, scale, minv) * xl6;
+            s += dq(qw1, 3u, hi, scale, minv) * xl7;
             if r == 0u { sumf0 += s; } else { sumf1 += s; }
         }
     }
