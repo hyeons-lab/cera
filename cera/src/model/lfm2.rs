@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 
 use crate::backend::cpu;
 use crate::gguf::GgufFile;
-use crate::kv_cache::{InferenceState, KvPrefixCache, LayerState};
+use crate::kv_cache::{InferenceState, KvCompression, KvPrefixCache, LayerState};
 use crate::model::transformer::{self, FfnWeights};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 // DType's only remaining uses here are the aarch64 per-token GEMV dispatch
@@ -77,9 +77,44 @@ pub struct Lfm2Model {
     /// Defaults to `KvCacheConfig::default()` (warm-only) at
     /// construction time so warm hits work without explicit config.
     prefix_cache: Mutex<KvPrefixCache>,
+    /// Prefix-cache namespace tag for the KV mode this model's sessions use
+    /// (`KvCompression::cache_tag`). `None` until `configure_kv_compression` runs;
+    /// the empty string is the tag for the f32 default, which is why this is an
+    /// `Option` rather than just `""`.
+    ///
+    /// The model owns this, but the mode is a *per-session* knob — so the two only
+    /// stay consistent because configuration is first-call-wins. See
+    /// `configure_kv_compression`.
+    kv_cache_tag: Mutex<Option<String>>,
+}
+
+/// Render a cache tag for the `KvCompressionConflict` message — the empty tag is
+/// the f32 default, which reads better spelled out.
+fn describe_cache_tag(tag: &str) -> String {
+    if tag.is_empty() {
+        "f32".to_string()
+    } else {
+        tag.trim_end_matches(':').to_string()
+    }
 }
 
 impl Lfm2Model {
+    /// Prefix-cache namespace: the `"cpu:"` backend prefix, the KV-mode tag, and
+    /// the model id. The backend prefix keeps CPU entries away from wgpu's and
+    /// Metal's (their state shapes differ even where the byte format matches); the
+    /// mode tag keeps f32, f16, and each TurboQuant configuration apart.
+    fn cache_namespace(&self) -> String {
+        let tag = self.kv_cache_tag.lock().expect("kv_cache_tag poisoned");
+        Self::namespace_for(tag.as_deref().unwrap_or(""), &self.model_id)
+    }
+
+    /// The namespace string itself, taking the tag by value so a caller already
+    /// holding the tag lock doesn't have to re-acquire it (see
+    /// `configure_kv_compression`, which updates the tag and the cache atomically).
+    fn namespace_for(tag: &str, model_id: &str) -> String {
+        format!("cpu:{tag}{model_id}")
+    }
+
     /// Construct without a model identifier. Equivalent to
     /// `from_gguf_with_id(gguf, context_size, "")`. Warm prefix cache
     /// works after `Model::configure_cache`; disk cache (when
@@ -318,6 +353,7 @@ impl Lfm2Model {
             layer_refs,
             model_id,
             prefix_cache,
+            kv_cache_tag: Mutex::new(None),
         })
     }
 
@@ -2714,11 +2750,62 @@ impl Model for Lfm2Model {
     }
 
     fn configure_cache(&self, config: crate::kv_cache::KvCacheConfig) {
+        let id = self.cache_namespace();
         *self
             .prefix_cache
             .lock()
-            .expect("prefix_cache mutex poisoned") =
-            KvPrefixCache::new(config, &self.config, &format!("cpu:{}", self.model_id));
+            .expect("prefix_cache mutex poisoned") = KvPrefixCache::new(config, &self.config, &id);
+    }
+
+    /// The CPU backend allocates its KV from `InferenceState`, so there is nothing
+    /// to build here — but the prefix cache's namespace still has to reflect the
+    /// mode, or snapshots from different KV modes collide on disk. See
+    /// [`KvCompression::cache_tag`] for what that collision costs.
+    ///
+    /// **First call wins**, matching the trait contract and the GPU backends: a
+    /// later call with a *different* mode returns
+    /// [`crate::CeraError::KvCompressionConflict`].
+    ///
+    /// That restriction is not about allocation here — nothing is sized by the mode
+    /// on CPU. It is because the tag lives on the *model* while `KvCompression` is a
+    /// *per-session* knob, and one model owns one prefix cache. Letting a second
+    /// session re-tag would leave the first still writing snapshots, now into the
+    /// second's namespace. For two TurboQuant seeds that is silent corruption rather
+    /// than a miss: the compatibility gate only checks that both sides are
+    /// compressed, and `InferenceState::restore` never validates the seed, so the
+    /// first session's KV would be decoded in the wrong Hadamard basis. Two sessions
+    /// in different KV modes need two model instances.
+    fn configure_kv_compression(
+        &self,
+        compression: &KvCompression,
+    ) -> Result<(), crate::CeraError> {
+        let resolved = compression.resolved_for(&self.config).cache_tag();
+
+        // Cache lock outside, tag lock inside, so the tag and the cache's namespace
+        // move as one unit. Dropping the tag guard before rebuilding would let two
+        // concurrent calls land tag=Y with the cache fingerprinted X — the
+        // cross-mode collision this exists to prevent. `configure_cache` takes the
+        // tag lock and releases it before taking the cache lock, so no cycle.
+        let mut cache = self
+            .prefix_cache
+            .lock()
+            .expect("prefix_cache mutex poisoned");
+        let mut tag = self.kv_cache_tag.lock().expect("kv_cache_tag poisoned");
+        match tag.as_deref() {
+            Some(existing) if existing == resolved => return Ok(()),
+            Some(existing) => {
+                return Err(crate::CeraError::KvCompressionConflict {
+                    configured: describe_cache_tag(existing),
+                    requested: describe_cache_tag(&resolved),
+                });
+            }
+            None => {}
+        }
+        let id = Self::namespace_for(&resolved, &self.model_id);
+        *tag = Some(resolved);
+        let cache_config = cache.config.clone();
+        *cache = KvPrefixCache::new(cache_config, &self.config, &id);
+        Ok(())
     }
 
     fn forward_prefill_from_embeddings(
@@ -2774,9 +2861,9 @@ impl Model for Lfm2Model {
     }
 
     fn supports_kv_shift(&self) -> bool {
-        // CPU LFM2 implements shift with RoPE re-rotation. Metal's
-        // override stays at the trait default (false) until its
-        // GPU-side shift shader lands.
+        // CPU LFM2 implements shift with RoPE re-rotation. The wgpu and
+        // Metal overrides mirror this with a GPU-side shift shader, and
+        // report `false` only while a TurboQuant cache is active.
         true
     }
 

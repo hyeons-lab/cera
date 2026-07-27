@@ -185,15 +185,25 @@ LFM2 — compressing the KV cache to **~3 bits/key + ~2 bits/value (~12× vs f32
 with near-lossless quality and **no calibration**. On a 1.6B LFM2 model at 4K
 tokens that's ~192 MB → ~16 MB of KV, with decode staying within ±5% of f32.
 
-Enable it on the CLI (CPU backend):
+Enable it on the CLI:
 
 ```bash
 cera run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3 --device cpu
+cera run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3 --device gpu     # wgpu
+cera run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3 --device metal   # native Metal
 ```
 
-> Currently **CPU-only** (the Metal/wgpu backends fall back to f32 KV). See the
-> [`cera` crate README](cera/README.md) and `cera/src/turboquant.rs` for the
-> algorithm (PolarQuant + QJL) and the full compression/quality tables.
+Supported on **all three** backends — CPU, wgpu, and native Metal — for both
+decode and chunked prefill. On the GPU backends the compressed cache lives in GPU
+buffers and the prefix-cache snapshots are byte-compatible with the CPU's, so all
+three write the same `TQK1`/`TQV1` blob format. Two GPU-specific restrictions:
+`head_dim` must be a power of two ≤ 128 and a multiple of 32 (every supported
+model is 64 or 128), and only the both-sides mode (`tq3`) is available — the
+single-sided debug modes `tq3-keys` / `tq3-values` fall back to the backend's
+uncompressed KV there (f32 on wgpu, f16 on Metal) with a warning. `--n-keep`
+context shift is not supported with any TurboQuant mode on any backend.
+
+See `cera/src/turboquant.rs` for the algorithm (PolarQuant + QJL).
 
 ## Quick start
 

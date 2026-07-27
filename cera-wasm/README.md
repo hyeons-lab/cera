@@ -328,6 +328,9 @@ cfg.seed = 42n;        // BigInt — wasm-bindgen maps Rust u64 to JS BigInt
 // - Only kicks in when the model's `head_dim` is a power of two.
 //   cera logs a warning and falls back to f32 if not — no JS
 //   error.
+// - Applies to `engine.newSession(cfg)` only. `WebGpuSession`
+//   takes no `SessionConfig`, so the WebGPU path always runs
+//   uncompressed f32 KV regardless of this setting.
 // - Don't combine with `cfg.nKeep > 0` (context-shift); cera
 //   warns at session creation and ignores nKeep on overflow.
 const tq = new TurboQuantConfig(1234n);  // ctor sets keys + values = true

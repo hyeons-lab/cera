@@ -867,6 +867,12 @@ pub mod shaders {
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.wgsl");
     pub const FLASH_ATTENTION: &str = include_str!("shaders/flash_attention.wgsl");
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
+    /// TurboQuant KV compression: `tq_encode_keys`, `tq_encode_values`,
+    /// `tq_rotate_q` (three entry points in one module).
+    pub const TURBOQUANT: &str = include_str!("shaders/turboquant.wgsl");
+    /// FlashAttention over a TurboQuant-compressed cache — serves decode
+    /// (`n_queries = 1`) and chunked prefill from one entry point.
+    pub const FLASH_ATTENTION_TQ: &str = include_str!("shaders/flash_attention_tq.wgsl");
     pub const CONV1D: &str = include_str!("shaders/conv1d.wgsl");
     pub const CONV1D_FUSED: &str = include_str!("shaders/conv1d_fused.wgsl");
     // Vision-encoder (ViT) kernels.

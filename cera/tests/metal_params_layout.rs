@@ -247,6 +247,18 @@ fn cases() -> Vec<(usize, &'static str, &'static str, &'static str)> {
             "Params",
             "LayerNormBatchParams",
         ),
+        (
+            size_of::<TqParams>(),
+            shaders::TURBOQUANT,
+            "TqParams",
+            "TqParams",
+        ),
+        (
+            size_of::<TqAttnParams>(),
+            shaders::FLASH_ATTENTION_TQ,
+            "TqAttnParams",
+            "TqAttnParams",
+        ),
         // `ElementwiseParams` is reused for `gelu.metal`, which has its own `Params`.
         (
             size_of::<ElementwiseParams>(),

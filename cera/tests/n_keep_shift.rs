@@ -510,7 +510,8 @@ fn can_shift_gate_all_branches() {
         "all conditions hold → can_shift"
     );
 
-    // Backend doesn't support shift (Metal today, non-RoPE archs).
+    // Backend doesn't support shift (a GPU backend holding a TurboQuant cache,
+    // or a non-RoPE arch).
     assert!(
         !can_shift(false, 4, false, 28, 4),
         "supports_kv_shift=false → ContextOverflow"

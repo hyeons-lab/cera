@@ -77,18 +77,24 @@ fn zeroed_f32(len: usize) -> Result<Vec<f32>, CeraError> {
 /// caches, and the scratch buffers. **No separate `enable_turboquant` call on
 /// the model is required.**
 ///
-/// TurboQuant is currently honored only by the CPU backend (`Lfm2Model`); on the
-/// Metal/GPU backends this setting is ignored and the f32 KV path is used.
+/// TurboQuant is honored by the CPU backend (`Lfm2Model`) and by both GPU
+/// backends (`GpuLfm2Model` and `MetalLfm2Model`). The GPU paths additionally
+/// need [`crate::model::Model::configure_kv_compression`] — which `Session`
+/// calls — to build their GPU-resident compressed caches, and they only
+/// implement the both-sides mode: a single-sided (debug) request, or a
+/// `head_dim` their kernels can't handle, warns and falls back to the backend's
+/// uncompressed KV (f32 on wgpu, f16 on Metal).
 #[derive(Clone, Debug, Default)]
 pub enum KvCompression {
-    /// No compression — keys and values stored as f32 (default).
+    /// No compression — the backend's uncompressed KV: f32 on CPU and wgpu,
+    /// f16 on native Metal, whose cache has always been half precision.
     #[default]
     None,
     /// f16 KV cache — keys and values stored as IEEE-754 half precision
     /// (2 bytes/elem instead of 4), halving the KV bytes streamed per decode
     /// token. Near-lossless (f16 has 10 mantissa bits; attention is robust to
-    /// it — this is what llama.cpp uses by default). CPU decode path only;
-    /// accumulation stays f32 for softmax stability.
+    /// it — this is what llama.cpp uses by default). CPU LFM2 and dense
+    /// transformer paths; accumulation stays f32 for softmax stability.
     F16,
     /// TurboQuant compression. Keys and values can be toggled independently
     /// for debugging (e.g. to isolate how much drift each side contributes).
@@ -127,6 +133,66 @@ impl KvCompression {
     /// Whether the KV cache is stored in f16 (half precision).
     pub fn is_f16(&self) -> bool {
         matches!(self, Self::F16)
+    }
+
+    /// The mode a state built from `config` will *actually* use.
+    ///
+    /// `from_config_capped` silently downgrades TurboQuant to plain f32 when
+    /// `head_dim` isn't a power of two (the Walsh-Hadamard transform needs it), so
+    /// anything deriving identity from the mode — the prefix-cache tag especially —
+    /// has to ask what was resolved, not what was requested. Keeping that rule here
+    /// beside the allocator that applies it stops the two from drifting.
+    pub fn resolved_for(&self, config: &ModelConfig) -> Self {
+        let (keys, values) = self.flags();
+        if (keys || values) && !config.head_dim.is_power_of_two() {
+            Self::None
+        } else {
+            self.clone()
+        }
+    }
+
+    /// Prefix-cache namespace tag for this mode — `""` for plain f32, else a
+    /// `"…:"`-terminated discriminator to prepend to a backend's cache id.
+    ///
+    /// The KV prefix cache's disk tier is keyed by model path (plus a backend
+    /// prefix), so without this every KV mode over the same GGUF and
+    /// `--cache-dir` shares one namespace. A snapshot from one mode then
+    /// permanently shadows another's for the same prefix: the restore-time
+    /// compatibility gate turns the longest match into a miss and does *not* fall
+    /// back to a shorter compatible entry, so the other mode stays cold on every
+    /// subsequent run, not just once. (Measured on wgpu: 134.7 → 10.3 tok/s
+    /// prefill, sticky.)
+    ///
+    /// Two things beyond the mode name are load-bearing:
+    /// - **The seed**, because it drives the per-layer randomized Hadamard
+    ///   rotations. Restore validates only shape (`head_dim` / `n_kv_heads` /
+    ///   `seq_len`), which a different-seed blob passes — so a shared namespace
+    ///   would decode a prefix in the wrong basis and silently corrupt attention
+    ///   rather than miss.
+    /// - **Which sides are compressed**, since keys-only and values-only produce
+    ///   genuinely different cache contents from both-sides and from f32.
+    ///
+    /// A TurboQuant config compressing neither side is *not* tagged: it degrades
+    /// to an f32 cache in `from_config_capped`, so its contents really are f32's
+    /// and separating them would only waste entries.
+    ///
+    /// Callers must tag with the mode their state actually ended up in, not the one
+    /// requested — a backend that falls back to its uncompressed KV (unsupported
+    /// `head_dim`, or a single-sided request on GPU) must use the uncompressed
+    /// tag so it shares the namespace it is now writing into. Metal's
+    /// uncompressed cache is f16 but still takes `None`'s tag; see the note in
+    /// `MetalLfm2Model::configure_kv_compression`.
+    pub fn cache_tag(&self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::F16 => "f16:".to_string(),
+            Self::TurboQuant { seed, keys, values } => match (keys, values) {
+                (false, false) => String::new(),
+                (true, true) => format!("tq3kv-s{seed}:"),
+                (true, false) => format!("tq3k-s{seed}:"),
+                (false, true) => format!("tq3v-s{seed}:"),
+            },
+        }
     }
 }
 
@@ -945,7 +1011,7 @@ impl InferenceState {
         assert!(
             !self.is_compressed(),
             "shift_kv_with_rope called on a TurboQuant-compressed state; \
-             shifting compressed caches is not yet supported"
+             shifting compressed caches is not supported"
         );
         assert_eq!(
             n_kv_heads_per_layer.len(),
@@ -1140,6 +1206,69 @@ impl InferenceState {
     }
 }
 
+#[cfg(test)]
+mod cache_tag_tests {
+    use super::KvCompression;
+
+    /// Every mode whose cache *contents* differ must get a distinct tag, and modes
+    /// whose contents are identical must share one. Without this, snapshots from
+    /// different modes collide in the prefix cache's disk namespace and one
+    /// permanently shadows the other for the same prefix.
+    #[test]
+    fn distinct_modes_get_distinct_tags() {
+        let f32_tag = KvCompression::None.cache_tag();
+        let f16_tag = KvCompression::F16.cache_tag();
+        let both = KvCompression::turboquant(42).cache_tag();
+        let keys_only = KvCompression::TurboQuant {
+            seed: 42,
+            keys: true,
+            values: false,
+        }
+        .cache_tag();
+        let values_only = KvCompression::TurboQuant {
+            seed: 42,
+            keys: false,
+            values: true,
+        }
+        .cache_tag();
+        // A different seed means different rotations, and restore validates only
+        // shape — so sharing a namespace would decode a prefix in the wrong basis
+        // rather than miss.
+        let other_seed = KvCompression::turboquant(7).cache_tag();
+
+        let tags = [
+            &f32_tag,
+            &f16_tag,
+            &both,
+            &keys_only,
+            &values_only,
+            &other_seed,
+        ];
+        for (i, a) in tags.iter().enumerate() {
+            for b in tags.iter().skip(i + 1) {
+                assert_ne!(a, b, "two modes share a cache tag: {a:?} vs {b:?}");
+            }
+        }
+        assert_eq!(f32_tag, "", "plain f32 must be the untagged default");
+    }
+
+    /// Compressing neither side degrades to an f32 cache in
+    /// `from_config_capped`, so its contents really are f32's — separating the two
+    /// namespaces would only waste entries.
+    #[test]
+    fn turboquant_with_no_sides_shares_the_f32_namespace() {
+        assert_eq!(
+            KvCompression::TurboQuant {
+                seed: 42,
+                keys: false,
+                values: false,
+            }
+            .cache_tag(),
+            KvCompression::None.cache_tag()
+        );
+    }
+}
+
 // ── KV Prefix Cache ─────────────────────────────────────────────────────
 
 /// Snapshot of model KV + conv state after prefilling a token sequence.
@@ -1244,6 +1373,11 @@ impl StateSnapshot {
 }
 
 /// Configuration for the KV prefix cache.
+///
+/// `Clone` so a backend can rebuild its cache under a new namespace without the
+/// caller re-supplying the config — the wgpu backend does this when a session
+/// configures KV compression, to keep compressed and f32 disk entries apart.
+#[derive(Clone)]
 pub struct KvCacheConfig {
     /// Directory for cold-tier (disk) cache files. None = disk caching disabled.
     pub cache_dir: Option<PathBuf>,
@@ -1291,13 +1425,33 @@ impl KvPrefixCache {
         }
     }
 
-    /// Find the longest cached prefix matching the start of `tokens`.
-    /// Checks both warm and cold tiers and returns whichever has the longer match.
+    /// Find the longest cached **strict** prefix of `tokens` — an entry covering
+    /// `[0, len)` with `len < tokens.len()`. Checks both warm and cold tiers and
+    /// returns whichever has the longer match.
+    ///
+    /// Strictness is not a detail, it is the contract every consumer already
+    /// enforces: a full-length hit would leave `use_len == tokens.len()`, and the
+    /// restored state already reflects "after all tokens", so re-running the last
+    /// token would advance the conv rolling buffer one position past where it
+    /// belongs (conv layers don't gate on `seq_len`). `Lfm2Model::forward_prefill`
+    /// and both GPU backends therefore skip full hits.
+    ///
+    /// Returning them anyway made the cache **effectively single-use per token
+    /// sequence**: run a prompt once and `insert` stores a full-length entry for
+    /// it; ask the same question again and that entry is the longest match, so the
+    /// caller rejects it and falls through to a cold prefill *without* falling back
+    /// to the shorter, perfectly usable prefix sitting right there. Measured on
+    /// LFM2-VL-450M: a genuine prefix hit prefills at ~17k tok/s (f32) / ~20k
+    /// (tq3), versus ~840 / ~367 cold — so the shadowed lookup was giving up a
+    /// 20-55x speedup on every repeat query.
+    ///
+    /// Filtering here rather than in each backend keeps warm and cold consistent
+    /// and fixes all three backends at once.
     pub fn find_longest_prefix(&mut self, tokens: &[u32]) -> Option<(StateSnapshot, usize)> {
         let warm_hit = self
             .warm
             .values()
-            .filter(|e| tokens.starts_with(&e.tokens))
+            .filter(|e| e.tokens.len() < tokens.len() && tokens.starts_with(&e.tokens))
             .max_by_key(|e| e.tokens.len())
             .map(|e| {
                 e.last_used.set(Instant::now());
@@ -1326,11 +1480,16 @@ impl KvPrefixCache {
         };
 
         // If the best hit came from the cold tier, promote it to warm.
+        // The `< tokens.len()` bound matches the lookup filter above: a full-length
+        // warm entry can never be returned, so treating it as "we already have
+        // something at least as good" would block promotion forever and re-read the
+        // multi-MB cold file on every call.
         if let Some((snapshot, len)) = &best
-            && !self
-                .warm
-                .values()
-                .any(|e| e.tokens.len() >= *len && tokens.starts_with(&e.tokens))
+            && !self.warm.values().any(|e| {
+                e.tokens.len() >= *len
+                    && e.tokens.len() < tokens.len()
+                    && tokens.starts_with(&e.tokens)
+            })
         {
             let hash = hash_tokens(&tokens[..*len]);
             let snap_bytes = snapshot.byte_size() as u64;
@@ -1505,9 +1664,16 @@ impl KvPrefixCache {
     fn find_cold_prefix(&self, dir: &Path, tokens: &[u32]) -> Option<StateSnapshot> {
         // Check specific filenames by pre-computing hashes for all prefixes,
         // longest first. This avoids reading the entire directory.
+        //
+        // The range stops at `tokens.len() - 1`: only STRICT prefixes are useful
+        // (see `find_longest_prefix`). Including the full length would match the
+        // entry this very query wrote last time, which every caller then rejects —
+        // and because the scan `break`s on its first match, it would never fall
+        // back to the shorter usable one. A 1-token input has no strict prefix, so
+        // the loop is correctly empty.
         let mut best: Option<StateSnapshot> = None;
 
-        for prefix_len in (1..=tokens.len()).rev() {
+        for prefix_len in (1..tokens.len()).rev() {
             let prefix = &tokens[..prefix_len];
             let hash = hash_tokens(prefix);
             let path = dir.join(self.cold_filename(hash));
@@ -1722,6 +1888,93 @@ mod tests {
         }
     }
 
+    /// The COLD tier's strict-prefix range, pinned directly.
+    ///
+    /// Reverting `find_cold_prefix`'s `1..tokens.len()` back to `1..=tokens.len()`
+    /// left the whole suite green before this test existed — the warm-tier test
+    /// below doesn't touch the disk path, and `f16_snapshot_disk_round_trips` hits
+    /// under either range. This asserts the boundary itself.
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn cold_tier_ignores_a_full_length_entry() {
+        let cfg = tiny_config(2, 16);
+        let dir = std::env::temp_dir().join(format!("cera_cold_strict_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = KvPrefixCache::new(KvCacheConfig::default(), &cfg, "cpu:test");
+        let snapshot = |seq_len: usize| StateSnapshot {
+            layers: Vec::new(),
+            seq_len,
+        };
+        let tokens = [7u32, 8, 9];
+
+        // Saved at exactly the query length → unusable, must not be returned.
+        cache.save_cold(&dir, &tokens, &snapshot(tokens.len()));
+        assert!(
+            cache.find_cold_prefix(&dir, &tokens).is_none(),
+            "cold tier returned a full-length entry; every caller rejects it, and \
+             the scan breaks on its first match so a shorter one would be skipped"
+        );
+
+        // A strict prefix of the same query must still be found.
+        cache.save_cold(&dir, &tokens[..2], &snapshot(2));
+        assert_eq!(
+            cache
+                .find_cold_prefix(&dir, &tokens)
+                .expect("strict prefix must be found")
+                .seq_len,
+            2
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cached entry covering *all* of `tokens` must not shadow a shorter, usable
+    /// one.
+    ///
+    /// Every consumer rejects a full-length hit (the restored state already
+    /// reflects "after all tokens", so re-running the last token would over-advance
+    /// the conv rolling buffer). But `insert` stores a full-length entry after each
+    /// prefill, so returning them made the cache effectively single-use per token
+    /// sequence: the second time the same prompt arrived, the full-length entry was
+    /// the longest match, the caller rejected it, and the lookup never fell back to
+    /// the strict prefix sitting right there. That cost a 20-55x prefill speedup on
+    /// every repeat query.
+    #[test]
+    fn full_length_entry_does_not_shadow_a_shorter_prefix() {
+        let cfg = tiny_config(2, 8);
+        let mut cache = KvPrefixCache::new(
+            KvCacheConfig {
+                cache_dir: None,
+                ..KvCacheConfig::default()
+            },
+            &cfg,
+            "test",
+        );
+        let snapshot = |seq_len: usize| StateSnapshot {
+            layers: Vec::new(),
+            seq_len,
+        };
+        let tokens = [1u32, 2, 3, 4];
+
+        // Only a full-length entry exists → no usable hit.
+        cache.insert(&tokens, snapshot(tokens.len()));
+        assert!(
+            cache.find_longest_prefix(&tokens).is_none(),
+            "a full-length entry was returned; the caller can only reject it"
+        );
+
+        // Add a strict prefix. It must now be found even though the (longer)
+        // full-length entry is still present — this is the regression.
+        cache.insert(&tokens[..2], snapshot(2));
+        let (_, len) = cache
+            .find_longest_prefix(&tokens)
+            .expect("strict prefix must be found past the full-length entry");
+        assert_eq!(len, 2);
+
+        // A longer strict prefix still wins over a shorter one.
+        cache.insert(&tokens[..3], snapshot(3));
+        assert_eq!(cache.find_longest_prefix(&tokens).expect("hit").1, 3);
+    }
+
     /// `for_prefill` must cap the pre-allocated KV cache to the prompt length,
     /// NOT `max_seq_len` — the whole point of the hidden-states scratch path.
     #[test]
@@ -1921,8 +2174,14 @@ mod tests {
         // The cache requires seq_len == token count; we appended one token.
         let tokens = [42u32];
         cache.save_cold(&dir, &tokens, &snap);
+        // Look up a LONGER sequence: `find_cold_prefix` only returns strict
+        // prefixes (a full-length hit is unusable — see `find_longest_prefix`), so
+        // the saved 1-token entry has to be read back as the prefix of something
+        // longer. This test is about the `type_tag = 3` serialization, not the
+        // matching policy.
+        let query = [42u32, 43];
         let restored = cache
-            .find_cold_prefix(&dir, &tokens)
+            .find_cold_prefix(&dir, &query)
             .expect("disk round-trip must find the f16 entry");
         assert_eq!(restored.seq_len, snap.seq_len);
         match &restored.layers[0] {

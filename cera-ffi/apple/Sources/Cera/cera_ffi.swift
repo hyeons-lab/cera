@@ -4310,14 +4310,18 @@ public func FfiConverterTypeFinishReason_lower(_ value: FinishReason) -> RustBuf
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
  * KV-cache compression mode. Mirrors [`cera::kv_cache::KvCompression`].
- * `TurboQuant` is honored by the CPU backend only; Metal / GPU ignore
- * the setting and use the f32 path.
+ * `TurboQuant` is honored by the CPU backend and by both GPU backends (wgpu
+ * and native Metal). The GPU paths implement the both-sides mode only: a
+ * single-sided (debug) request, or a `head_dim` their kernels can't handle,
+ * warns and falls back to that backend's uncompressed KV (f32 on wgpu, f16 on
+ * Metal).
  */
 
 public enum KvCompression: Equatable, Hashable {
     
     /**
-     * No compression — f32 keys and values (default).
+     * No compression — the backend's uncompressed KV: f32 on CPU and wgpu,
+     * f16 on native Metal, whose cache has always been half precision.
      */
     case none
     /**

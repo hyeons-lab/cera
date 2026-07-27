@@ -81,8 +81,10 @@ token. Both cache hits skip that work for cells that were already computed:
   numbers above used `--warmup 0` so iter 1 (cold) is included in the
   default-cache row, which is exactly what surfaces the cold-vs-warm
   contrast.
-- TurboQuant (`--kv-cache-keys tq3`) compressed states are *not*
-  cached today — `InferenceState::snapshot` returns `None` when any
-  layer is compressed. Same gate the `n_keep` shift uses; the
-  `LayerSnapshot::Attention { k_data, v_data }` shape doesn't model
-  per-block scales, so the prefix cache stays disabled for that path.
+- TurboQuant (`--kv-cache-keys tq3`) compressed states *are* cached:
+  `LayerSnapshot::AttentionCompressed` models the packed blocks. That
+  already worked on CPU (`InferenceState::snapshot`); the GPU TurboQuant
+  work extended it to wgpu and Metal, which build the same `StateSnapshot`
+  in their own `snapshot_state_locked`. The CPU path still returns `None`
+  for a single-sided layer — `AttentionCompressed` holds both sides as
+  packed blobs, with no slot for an uncompressed one.

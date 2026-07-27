@@ -4333,6 +4333,16 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
      */
     case OutOfMemory(requestedBytes: UInt64
     )
+    /**
+     * A backend's KV-cache compression mode is fixed by the first session that
+     * configures it — the compressed and uncompressed caches have different
+     * buffer layouts (and the uncompressed one is f32 on CPU/wgpu but f16 on
+     * Metal), so only the configured one is ever allocated. Two sessions wanting
+     * different modes need two `CeraModel` instances. Mirrors
+     * `cera::CeraError::KvCompressionConflict`.
+     */
+    case KvCompressionConflict(configured: String, requested: String
+    )
 
     
 
@@ -4391,6 +4401,10 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             )
         case 12: return .OutOfMemory(
             requestedBytes: try FfiConverterUInt64.read(from: &buf)
+            )
+        case 13: return .KvCompressionConflict(
+            configured: try FfiConverterString.read(from: &buf), 
+            requested: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -4460,6 +4474,12 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
         case let .OutOfMemory(requestedBytes):
             writeInt(&buf, Int32(12))
             FfiConverterUInt64.write(requestedBytes, into: &buf)
+            
+        
+        case let .KvCompressionConflict(configured,requested):
+            writeInt(&buf, Int32(13))
+            FfiConverterString.write(configured, into: &buf)
+            FfiConverterString.write(requested, into: &buf)
             
         }
     }
@@ -4590,19 +4610,24 @@ public func FfiConverterTypeFinishReason_lower(_ value: FinishReason) -> RustBuf
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
  * KV-cache compression mode. Mirrors [`cera::kv_cache::KvCompression`].
- * `F16` and `TurboQuant` are honored by the CPU backend only; Metal / GPU
- * ignore the setting and use the f32 path.
+ * `TurboQuant` is honored by the CPU backend and by both GPU backends (wgpu
+ * and native Metal). The GPU paths implement the both-sides mode only: a
+ * single-sided (debug) request, or a `head_dim` their kernels can't handle,
+ * warns and falls back to that backend's uncompressed KV (f32 on wgpu, f16 on
+ * Metal). `F16` is honored by the CPU backend only.
  */
 
 public enum KvCompression: Equatable, Hashable {
     
     /**
-     * No compression — f32 keys and values (default).
+     * No compression — the backend's uncompressed KV: f32 on CPU and wgpu,
+     * f16 on native Metal, whose cache has always been half precision.
      */
     case none
     /**
      * f16 KV cache — half-precision keys + values (2 bytes/elem), ~2× less KV
-     * bandwidth at decode-at-depth. Near-lossless. CPU dense-transformer path.
+     * bandwidth at decode-at-depth. Near-lossless. CPU LFM2 and
+     * dense-transformer paths.
      */
     case f16
     /**

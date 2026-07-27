@@ -211,6 +211,21 @@ pub enum FfiError {
     /// surface a clean error. Mirrors `cera::CeraError::OutOfMemory`.
     #[error("out of memory: could not allocate {requested_bytes} bytes")]
     OutOfMemory { requested_bytes: u64 },
+
+    /// A backend's KV-cache compression mode is fixed by the first session that
+    /// configures it — the compressed and uncompressed caches have different
+    /// buffer layouts (and the uncompressed one is f32 on CPU/wgpu but f16 on
+    /// Metal), so only the configured one is ever allocated. Two sessions wanting
+    /// different modes need two `CeraModel` instances. Mirrors
+    /// `cera::CeraError::KvCompressionConflict`.
+    #[error(
+        "model already configured for KV compression mode `{configured}`; \
+         cannot reconfigure to `{requested}` — create a separate model instance"
+    )]
+    KvCompressionConflict {
+        configured: String,
+        requested: String,
+    },
 }
 
 impl From<cera::CeraError> for FfiError {
@@ -236,6 +251,13 @@ impl From<cera::CeraError> for FfiError {
             cera::CeraError::OutOfMemory { requested_bytes } => {
                 FfiError::OutOfMemory { requested_bytes }
             }
+            cera::CeraError::KvCompressionConflict {
+                configured,
+                requested,
+            } => FfiError::KvCompressionConflict {
+                configured,
+                requested,
+            },
             cera::CeraError::LoraDimMismatch(s) => FfiError::LoraParse { detail: s },
             cera::CeraError::Io(io_err) => FfiError::Io {
                 detail: io_err.to_string(),
@@ -1028,15 +1050,20 @@ impl CeraEngine {
 // ---------------------------------------------------------------------------
 
 /// KV-cache compression mode. Mirrors [`cera::kv_cache::KvCompression`].
-/// `F16` and `TurboQuant` are honored by the CPU backend only; Metal / GPU
-/// ignore the setting and use the f32 path.
+/// `TurboQuant` is honored by the CPU backend and by both GPU backends (wgpu
+/// and native Metal). The GPU paths implement the both-sides mode only: a
+/// single-sided (debug) request, or a `head_dim` their kernels can't handle,
+/// warns and falls back to that backend's uncompressed KV (f32 on wgpu, f16 on
+/// Metal). `F16` is honored by the CPU backend only.
 #[derive(Debug, Clone, Default, uniffi::Enum)]
 pub enum KvCompression {
-    /// No compression — f32 keys and values (default).
+    /// No compression — the backend's uncompressed KV: f32 on CPU and wgpu,
+    /// f16 on native Metal, whose cache has always been half precision.
     #[default]
     None,
     /// f16 KV cache — half-precision keys + values (2 bytes/elem), ~2× less KV
-    /// bandwidth at decode-at-depth. Near-lossless. CPU dense-transformer path.
+    /// bandwidth at decode-at-depth. Near-lossless. CPU LFM2 and
+    /// dense-transformer paths.
     F16,
     /// TurboQuant compression. Both `keys` + `values` true is the
     /// production configuration; toggling them individually is

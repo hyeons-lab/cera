@@ -11,11 +11,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::Result;
 
+use crate::CeraError;
 use crate::backend::cpu::RopeType;
 use crate::backend::wgpu::{GpuContext, GpuTensor, KvShiftParams, shaders};
 use crate::gguf::GgufFile;
-use crate::kv_cache::{InferenceState, KvPrefixCache, LayerSnapshot, StateSnapshot};
+use crate::kv_cache::{InferenceState, KvCompression, KvPrefixCache, LayerSnapshot, StateSnapshot};
 use crate::lora::{LoraAdapterWeights, LoraTarget};
+use crate::model::gpu_turboquant::{TqGpuCache, TqMode, describe_kv_mode};
 use crate::model::gpu_weight_source::GpuWeightSource;
 use crate::model::transformer::WeightRef;
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
@@ -100,6 +102,15 @@ fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
 
 fn lcm_u64(a: u64, b: u64) -> u64 {
     (a / gcd_u64(a, b)) * b
+}
+
+/// Byte size of a `rows x cols` f32 KV slab, widened to `u64` before multiplying.
+///
+/// This backend also builds for `wasm32`, where `usize` is 32 bits and a large
+/// `max_seq_len x kv_dim x 4` wraps, silently sizing the cache to the wrapped
+/// remainder.
+fn kv_slab_bytes(rows: usize, cols: usize) -> u64 {
+    rows as u64 * cols as u64 * 4
 }
 
 fn f32_binding(buffer: &wgpu::Buffer, len_floats: u64) -> wgpu::BindingResource<'_> {
@@ -372,8 +383,17 @@ impl WgpuLoraAdapter {
 /// GPU-resident inference state (KV cache + conv rolling buffers).
 #[allow(dead_code)]
 struct GpuState {
-    /// Per attention layer: (key_cache, value_cache) buffers, pre-allocated.
-    kv_caches: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>,
+    /// Per attention layer: (key_cache, value_cache) f32 buffers.
+    ///
+    /// Allocated **lazily**, on the first `active_kv` (see
+    /// [`GpuLfm2Model::f32_kv`]). A model is loaded before the session that
+    /// configures its KV compression exists, so allocating the full
+    /// `max_seq_len × kv_dim` f32 slabs up front and freeing them once a
+    /// TurboQuant session arrives would create exactly the transient memory peak
+    /// compression exists to avoid. Under TurboQuant this `OnceLock` is never
+    /// initialized and the packed buffers in `GpuLfm2Model::tq` hold the cache
+    /// instead.
+    kv_caches: OnceLock<Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>>,
     /// Per conv layer: rolling buffer.
     conv_buffers: Vec<Option<wgpu::Buffer>>,
     seq_len: AtomicUsize,
@@ -540,6 +560,22 @@ pub struct GpuLfm2Model {
     /// `infer_lock`, so `Relaxed` ordering suffices.
     hs_scratch: OnceLock<HsScratch>,
     use_hs_scratch: AtomicBool,
+    /// GPU-resident TurboQuant KV cache, built by
+    /// [`Model::configure_kv_compression`] when a session asks for it. `None` ⇒
+    /// the f32 KV path. Written once, under `infer_lock`.
+    tq: OnceLock<TqGpuCache>,
+    /// The compression mode this model has been configured for: `Some(mode)` for
+    /// TurboQuant, `None` for f32 KV. Distinct from `tq` because a request the
+    /// backend can't serve (single-sided TurboQuant, unsupported `head_dim`)
+    /// records f32 here while leaving `tq` empty. Set *after* the cache is built,
+    /// so a failed (OOM) allocation leaves the model still reconfigurable; the
+    /// whole of `configure_kv_compression` holds `infer_lock`, so the ordering is
+    /// unobservable to other threads.
+    kv_mode: OnceLock<Option<TqMode>>,
+    /// Prefix-cache namespace tag for the mode this model resolved to
+    /// (`KvCompression::cache_tag`). Empty until configured, which is the correct
+    /// tag for the f32 default.
+    kv_cache_tag: OnceLock<String>,
     /// Caller-supplied identifier (typically the GGUF file path) used to
     /// namespace prefix-cache disk files. Prefixed with `"wgpu:"` before
     /// being fed to `model_fingerprint` so wgpu's f32 disk-cache files
@@ -1000,7 +1036,8 @@ impl GpuLfm2Model {
         // already allocate `max_kv_dim` floats, so an attention-free
         // (`max_kv_dim == 0`) config would fail there first; LFM2 always has
         // attention layers, so `max_kv_dim` is never 0 in practice anyway.
-        let kv_shift_scratch = f(max_seq_len * max_kv_dim, "kv_shift_scratch");
+        let kv_shift_scratch =
+            ctx.create_storage_rw(kv_slab_bytes(max_seq_len, max_kv_dim), "kv_shift_scratch");
         let attn_out_buf = f(q_dim, "attn_out");
         let logits_buf = f(config.vocab_size, "logits");
         let conv_proj_buf = f(3 * hs, "conv_proj");
@@ -1023,27 +1060,23 @@ impl GpuLfm2Model {
         let prefill_gate_buf = f(is.max(max_kv_dim).max(hs) * max_pref, "prefill_gate");
         let prefill_up_buf = f(is.max(max_kv_dim).max(hs) * max_pref, "prefill_up");
 
-        // Initialize GPU KV caches + conv buffers
+        // Conv rolling buffers are always needed and are tiny (`d_conv × hs`), so
+        // they stay eager. The f32 KV caches are context-scaled and mode-dependent,
+        // so they are built on first use — see `GpuState::kv_caches`.
         let kernel_size = config.conv_kernel_size.unwrap_or(3);
         let d_conv = kernel_size - 1;
-        let mut kv_caches = Vec::with_capacity(config.n_layers);
         let mut conv_buffers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
             if config.block_types[i] == BlockType::Attention {
-                let kv_dim = config.kv_heads_per_layer[i] * head_dim;
-                let k_cache = f(max_seq_len * kv_dim, &format!("l{i}.k_cache"));
-                let v_cache = f(max_seq_len * kv_dim, &format!("l{i}.v_cache"));
-                kv_caches.push(Some((k_cache, v_cache)));
                 conv_buffers.push(None);
             } else {
-                kv_caches.push(None);
                 let cb = f(d_conv * hs, &format!("l{i}.conv_buf"));
                 conv_buffers.push(Some(cb));
             }
         }
 
         let gpu_state = GpuState {
-            kv_caches,
+            kv_caches: OnceLock::new(),
             conv_buffers,
             seq_len: AtomicUsize::new(0),
             max_seq_len,
@@ -1216,6 +1249,9 @@ impl GpuLfm2Model {
             infer_lock: Mutex::new(()),
             hs_scratch: OnceLock::new(),
             use_hs_scratch: AtomicBool::new(false),
+            tq: OnceLock::new(),
+            kv_mode: OnceLock::new(),
+            kv_cache_tag: OnceLock::new(),
             prefix_cache,
             model_id,
             lora_lru: Mutex::new(Vec::new()),
@@ -2047,7 +2083,12 @@ impl GpuLfm2Model {
             }
             let n_kv_heads = cfg.kv_heads_per_layer[layer_idx];
             let kv_dim = n_kv_heads * head_dim;
-            let (k_cache, v_cache) = self.gpu_state.kv_caches[layer_idx]
+            // f32 only. `Session::can_shift` keeps a compressed cache out — it
+            // needs both `supports_kv_shift` (false while `self.tq` is set) and
+            // `!state.is_compressed()`, the latter also covering a request this
+            // backend downgraded but the state-side cache compressed anyway.
+            // `shift_kv` re-asserts the same condition as a backstop.
+            let (k_cache, v_cache) = self.f32_kv()[layer_idx]
                 .as_ref()
                 .expect("attention layer missing GPU kv_caches entry");
 
@@ -2179,8 +2220,9 @@ impl GpuLfm2Model {
             for i in 0..cfg.n_layers {
                 if cfg.block_types[i] == BlockType::Attention {
                     let kv_dim = cfg.kv_heads_per_layer[i] * head_dim;
-                    let k = f(max_seq_len * kv_dim, &format!("hs.l{i}.k"));
-                    let v = f(max_seq_len * kv_dim, &format!("hs.l{i}.v"));
+                    let bytes = kv_slab_bytes(max_seq_len, kv_dim);
+                    let k = self.ctx.create_storage_rw(bytes, &format!("hs.l{i}.k"));
+                    let v = self.ctx.create_storage_rw(bytes, &format!("hs.l{i}.v"));
                     kv.push(Some((k, v)));
                     conv.push(None);
                 } else {
@@ -2192,9 +2234,49 @@ impl GpuLfm2Model {
         })
     }
 
+    /// The f32 generation KV caches, allocated on first use.
+    ///
+    /// Never reached while TurboQuant is active: every KV write and attention
+    /// read on that path goes through `self.tq`, so the `OnceLock` stays empty
+    /// and the f32 slabs are never allocated. The assert makes a mis-gated call
+    /// site fail loudly instead of quietly allocating the memory compression was
+    /// meant to save (and then reading a cache nothing writes).
+    fn f32_kv(&self) -> &Vec<Option<(wgpu::Buffer, wgpu::Buffer)>> {
+        // A real `assert!`, not `debug_assert!`: release is precisely the build
+        // where a mis-gated call site's `max_seq_len x kv_dim` f32 allocation
+        // matters, and this is not a hot path.
+        assert!(
+            self.tq.get().is_none(),
+            "f32 KV cache requested while TurboQuant is active"
+        );
+        self.gpu_state.kv_caches.get_or_init(|| {
+            let cfg = &self.config;
+            let head_dim = cfg.head_dim;
+            let max_seq_len = self.gpu_state.max_seq_len;
+            let mut kv = Vec::with_capacity(cfg.n_layers);
+            for i in 0..cfg.n_layers {
+                if cfg.block_types[i] == BlockType::Attention {
+                    let kv_dim = cfg.kv_heads_per_layer[i] * head_dim;
+                    let bytes = kv_slab_bytes(max_seq_len, kv_dim);
+                    kv.push(Some((
+                        self.ctx.create_storage_rw(bytes, &format!("l{i}.k_cache")),
+                        self.ctx.create_storage_rw(bytes, &format!("l{i}.v_cache")),
+                    )));
+                } else {
+                    kv.push(None);
+                }
+            }
+            kv
+        })
+    }
+
     /// The attention KV cache for layer `i` — the hidden-states scratch cache
     /// when [`Self::hidden_states`] is running (`use_hs_scratch`), else the
     /// generation cache. Panics on a conv layer (no KV).
+    ///
+    /// f32 only. `hidden_states` deliberately runs uncompressed (it is a
+    /// one-shot full-precision pass on its own scratch caches), which is why the
+    /// scratch arm is reachable even under TurboQuant.
     #[inline]
     fn active_kv(&self, i: usize) -> &(wgpu::Buffer, wgpu::Buffer) {
         let caches = if self.use_hs_scratch.load(Ordering::Relaxed) {
@@ -2204,9 +2286,42 @@ impl GpuLfm2Model {
                 .expect("hs_scratch built before use_hs_scratch is set")
                 .kv
         } else {
-            &self.gpu_state.kv_caches
+            self.f32_kv()
         };
         caches[i].as_ref().unwrap()
+    }
+
+    /// Prefix-cache namespace for this model instance.
+    ///
+    /// The KV-compression mode is part of it, not just the model path: a
+    /// compressed snapshot and an f32 one have different layouts, and the disk
+    /// tier is shared by every session over the same model. Without the mode in
+    /// the namespace, a TurboQuant session's entry permanently shadows the f32
+    /// entry for the same prefix — the lookup-time mode filter turns the longest
+    /// match into a miss and never falls back to a shorter compatible one, so the
+    /// f32 session stays cold on *every* subsequent run, not just once. Same trick
+    /// the `"wgpu:"` / `"cpu:"` / `"metal:"` prefixes already use to keep backends
+    /// apart.
+    ///
+    /// Called from `configure_cache` and again from `configure_kv_compression`
+    /// (which rebuilds the cache) because the engine configures the cache before
+    /// the session configures compression.
+    fn cache_namespace(&self) -> String {
+        // Not yet configured behaves as f32 (the empty tag) — the mode-setting path
+        // rebuilds the cache, so an early `configure_cache` can't leave a stale tag.
+        let tag = self.kv_cache_tag.get().map(String::as_str).unwrap_or("");
+        format!("wgpu:{tag}{}", self.model_id)
+    }
+
+    /// The GPU-resident TurboQuant cache, when the session configured one and
+    /// this pass is a generation pass. `hidden_states` runs uncompressed on its
+    /// own scratch caches, so it always sees `None` here.
+    #[inline]
+    fn tq_cache(&self) -> Option<&TqGpuCache> {
+        if self.use_hs_scratch.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.tq.get()
     }
 
     /// The conv rolling buffer for layer `i` — scratch vs generation.
@@ -2262,6 +2377,23 @@ impl GpuLfm2Model {
             .lock()
             .expect("active_lora poisoned")
             .clone();
+
+        // Stage the TurboQuant shader params for every layer in one write, ahead
+        // of the per-layer encoders below. One decode row, appended at the
+        // current seq_len; Q and the attention output are both `q_dim`-strided.
+        if let Some(tq) = self.tq_cache() {
+            let scale = self
+                .scalars
+                .attn
+                .unwrap_or_else(|| 1.0 / (cfg.head_dim as f32).sqrt());
+            tq.write_params(
+                &self.ctx,
+                cfg,
+                1,
+                self.gpu_state.seq_len.load(Ordering::Relaxed),
+                scale,
+            );
+        }
 
         // 2. Per-layer loop — one encoder per layer (block + FFN merged), each
         // submitted independently. That is 16 submits + 1 for the head below, and
@@ -2728,48 +2860,66 @@ impl GpuLfm2Model {
                     );
                 }
 
-                // KV cache copies (encoder-level), then pass 2: attention + out_proj + add.
-                let (k_cache, v_cache) = self.active_kv(i);
+                // KV cache write (encoder-level), then pass 2: attention +
+                // out_proj + add.
                 let seq_len = self.gpu_state.seq_len.load(Ordering::Relaxed);
-                let kv_offset_floats = (seq_len * kv_dim as usize) as u64;
-                Self::encode_copy(
-                    &mut enc,
-                    &self.k_buf,
-                    0,
-                    k_cache,
-                    kv_offset_floats,
-                    kv_dim as u64,
-                );
-                Self::encode_copy(
-                    &mut enc,
-                    &self.v_buf,
-                    0,
-                    v_cache,
-                    kv_offset_floats,
-                    kv_dim as u64,
-                );
-
-                let attn_seq_len = (seq_len + 1) as u32;
                 // Granite overrides the softmax scale with its attention
                 // multiplier; every other arch uses 1/sqrt(head_dim).
                 let scale = self
                     .scalars
                     .attn
                     .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
-                // Attention BG (changes per token due to seq_len).
-                self.encode_attention(
-                    &mut enc,
-                    &self.q_buf,
-                    k_cache,
-                    v_cache,
-                    &self.attn_out_buf,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    kv_dim,
-                    attn_seq_len,
-                    scale,
-                );
+                if let Some(tq) = self.tq_cache() {
+                    // Compressed path: the two f32 memcpys become encode
+                    // dispatches, and attention reads the packed cache. Params for
+                    // every layer were staged once before this encoder (see
+                    // `forward_inner_compute`).
+                    tq.encode_kv(&self.ctx, &mut enc, i, &self.k_buf, &self.v_buf, 1);
+                    tq.rotate_queries(&self.ctx, &mut enc, i, &self.q_buf, 1, n_heads as usize);
+                    tq.attention(
+                        &self.ctx,
+                        &mut enc,
+                        i,
+                        &self.attn_out_buf,
+                        1,
+                        n_heads as usize,
+                    );
+                } else {
+                    let (k_cache, v_cache) = self.active_kv(i);
+                    let kv_offset_floats = (seq_len * kv_dim as usize) as u64;
+                    Self::encode_copy(
+                        &mut enc,
+                        &self.k_buf,
+                        0,
+                        k_cache,
+                        kv_offset_floats,
+                        kv_dim as u64,
+                    );
+                    Self::encode_copy(
+                        &mut enc,
+                        &self.v_buf,
+                        0,
+                        v_cache,
+                        kv_offset_floats,
+                        kv_dim as u64,
+                    );
+
+                    let attn_seq_len = (seq_len + 1) as u32;
+                    // Attention BG (changes per token due to seq_len).
+                    self.encode_attention(
+                        &mut enc,
+                        &self.q_buf,
+                        k_cache,
+                        v_cache,
+                        &self.attn_out_buf,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        kv_dim,
+                        attn_seq_len,
+                        scale,
+                    );
+                }
                 // out_proj + add — batch into one pass.
                 let out_w = lw.attn_output.as_ref().unwrap();
                 let out_bg_tmp;
@@ -3862,6 +4012,18 @@ impl GpuLfm2Model {
             .expect("active_lora poisoned")
             .clone();
 
+        // Stage the TurboQuant shader params for every layer in one write, before
+        // the encoders below are submitted. `n` rows appended at `start_pos`; Q
+        // lives in `prefill_proj_buf` and the attention output in
+        // `prefill_normed_buf`, both `q_dim`-strided.
+        if let Some(tq) = self.tq_cache() {
+            let scale = self
+                .scalars
+                .attn
+                .unwrap_or_else(|| 1.0 / (cfg.head_dim as f32).sqrt());
+            tq.write_params(&self.ctx, cfg, n, start_pos, scale);
+        }
+
         // ─── Stage embeddings into prefill_batch_buf ──────────────────────
         // CPU-side gather + one queue.write_buffer (the `embedding_f32`
         // table is pre-dequantized at load time and lives on the host).
@@ -4005,7 +4167,6 @@ impl GpuLfm2Model {
                 let kv_dim = n_kv_heads * head_dim;
                 let n_heads = cfg.n_heads as u32;
                 let q_dim = n_heads * head_dim;
-                let (k_cache, v_cache) = self.gpu_state.kv_caches[layer].as_ref().unwrap();
 
                 let w_q = lw.attn_q.as_ref().unwrap();
                 let w_k = lw.attn_k.as_ref().unwrap();
@@ -4111,55 +4272,89 @@ impl GpuLfm2Model {
                     kv_dim,
                 );
 
-                // Phase C: bulk-write K/V into the cache. The KV cache is
-                // `max_seq_len × kv_dim` f32; write `n × kv_dim` floats starting
-                // at row `start_pos × kv_dim`. `encode_copy` is a no-shader
-                // memcpy that scales these f32 counts to bytes internally.
-                let kv_off_floats = (start_pos * kv_dim as usize) as u64;
-                let kv_chunk_floats = (n * kv_dim as usize) as u64;
-                Self::encode_copy(
-                    &mut enc,
-                    &self.prefill_gate_buf,
-                    0,
-                    k_cache,
-                    kv_off_floats,
-                    kv_chunk_floats,
-                );
-                Self::encode_copy(
-                    &mut enc,
-                    &self.prefill_up_buf,
-                    0,
-                    v_cache,
-                    kv_off_floats,
-                    kv_chunk_floats,
-                );
-
-                // Phase D: batched causal attention. Q stride and the output
-                // stride are both `q_dim` (concatenated head outputs). Granite
-                // overrides the softmax scale via `scalars.attn`; every other
-                // arch uses 1/sqrt(head_dim).
-                let max_seq_for_kv = (start_pos + n) as u32;
+                // Phase C: bulk-write K/V into the cache, then Phase D: batched
+                // causal attention. Q stride and the output stride are both
+                // `q_dim` (concatenated head outputs). Granite overrides the
+                // softmax scale via `scalars.attn`; every other arch uses
+                // 1/sqrt(head_dim).
                 let attn_scale = self
                     .scalars
                     .attn
                     .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
-                self.encode_attention_prefill(
-                    &mut enc,
-                    &self.prefill_proj_buf,
-                    k_cache,
-                    v_cache,
-                    &self.prefill_normed_buf,
-                    n_u,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    kv_dim,
-                    max_seq_for_kv,
-                    start_pos as u32,
-                    q_dim,
-                    q_dim,
-                    attn_scale,
-                );
+                if let Some(tq) = self.tq_cache() {
+                    // Compressed path. The chunk's K/V are compressed into the
+                    // cache first, so the causal attention below reads this
+                    // chunk's own positions plus the history earlier chunks wrote
+                    // — the reason prefill can't stay on the f32 path once the
+                    // cache is compressed.
+                    tq.encode_kv(
+                        &self.ctx,
+                        &mut enc,
+                        layer,
+                        &self.prefill_gate_buf,
+                        &self.prefill_up_buf,
+                        n,
+                    );
+                    tq.rotate_queries(
+                        &self.ctx,
+                        &mut enc,
+                        layer,
+                        &self.prefill_proj_buf,
+                        n,
+                        n_heads as usize,
+                    );
+                    tq.attention(
+                        &self.ctx,
+                        &mut enc,
+                        layer,
+                        &self.prefill_normed_buf,
+                        n,
+                        n_heads as usize,
+                    );
+                } else {
+                    // The KV cache is `max_seq_len × kv_dim` f32; write
+                    // `n × kv_dim` floats starting at row `start_pos × kv_dim`.
+                    // `encode_copy` is a no-shader memcpy that scales these f32
+                    // counts to bytes internally.
+                    let (k_cache, v_cache) = self.active_kv(layer);
+                    let kv_off_floats = (start_pos * kv_dim as usize) as u64;
+                    let kv_chunk_floats = (n * kv_dim as usize) as u64;
+                    Self::encode_copy(
+                        &mut enc,
+                        &self.prefill_gate_buf,
+                        0,
+                        k_cache,
+                        kv_off_floats,
+                        kv_chunk_floats,
+                    );
+                    Self::encode_copy(
+                        &mut enc,
+                        &self.prefill_up_buf,
+                        0,
+                        v_cache,
+                        kv_off_floats,
+                        kv_chunk_floats,
+                    );
+
+                    let max_seq_for_kv = (start_pos + n) as u32;
+                    self.encode_attention_prefill(
+                        &mut enc,
+                        &self.prefill_proj_buf,
+                        k_cache,
+                        v_cache,
+                        &self.prefill_normed_buf,
+                        n_u,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        kv_dim,
+                        max_seq_for_kv,
+                        start_pos as u32,
+                        q_dim,
+                        q_dim,
+                        attn_scale,
+                    );
+                }
 
                 // Phase E: output projection (`q_dim → hs`) → prefill_gate_buf
                 // (residual scratch; FFN's add_rmsnorm_batch fuses the add).
@@ -4455,14 +4650,20 @@ impl GpuLfm2Model {
         let download_exact =
             |buf: &wgpu::Buffer, count: usize| -> Vec<f32> { self.ctx.download_f32(buf, count) };
 
+        let tq = self.tq_cache();
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             if cfg.block_types[i] == BlockType::Attention {
+                if let Some(tq) = tq {
+                    // Compressed cache: emit the same `TQK1`/`TQV1` blobs the CPU
+                    // backend writes, so the two are mutually loadable.
+                    let (keys, values) = tq.snapshot_layer(&self.ctx, i, seq_len);
+                    layers.push(LayerSnapshot::AttentionCompressed { keys, values });
+                    continue;
+                }
                 let kv_dim = cfg.kv_heads_per_layer[i] * head_dim;
                 let count = seq_len * kv_dim;
-                let (k_buf, v_buf) = self.gpu_state.kv_caches[i]
-                    .as_ref()
-                    .expect("attention layer must have KV buffers");
+                let (k_buf, v_buf) = self.active_kv(i);
                 let k_floats = download_exact(k_buf, count);
                 let v_floats = download_exact(v_buf, count);
                 layers.push(LayerSnapshot::Attention {
@@ -4501,9 +4702,13 @@ impl GpuLfm2Model {
                         BlockType::Attention,
                         "snapshot layer {i} attention vs state config"
                     );
-                    let (k_buf, v_buf) = self.gpu_state.kv_caches[i]
-                        .as_ref()
-                        .expect("attention layer must have KV buffers");
+                    assert!(
+                        self.tq_cache().is_none(),
+                        "f32 Attention snapshot restored into a TurboQuant-configured \
+                         wgpu model at layer {i}; the lookup gate in forward_prefill \
+                         must reject a mode-mismatched snapshot"
+                    );
+                    let (k_buf, v_buf) = self.active_kv(i);
                     self.ctx.queue.write_buffer(k_buf, 0, k_data);
                     self.ctx.queue.write_buffer(v_buf, 0, v_data);
                 }
@@ -4518,18 +4723,41 @@ impl GpuLfm2Model {
                         .expect("conv layer must have rolling buffer");
                     self.ctx.queue.write_buffer(conv_buf, 0, buffer);
                 }
-                LayerSnapshot::AttentionCompressed { .. } => {
-                    // Unreachable in normal operation: wgpu doesn't
-                    // configure TurboQuant compression. `model_id`
-                    // is `"wgpu:..."` vs CPU's `"cpu:..."`, separating
-                    // their on-disk namespaces. Panic on the hard
-                    // error path so an accidental cross-namespace
-                    // load surfaces fast instead of corrupting state.
-                    panic!(
-                        "GpuLfm2Model::restore_state_locked received \
-                         a TurboQuant-compressed snapshot at layer {i}; \
-                         wgpu does not support TurboQuant. This indicates \
-                         a cross-backend cache-namespace leak."
+                LayerSnapshot::AttentionCompressed { keys, values } => {
+                    assert_eq!(
+                        cfg.block_types[i],
+                        BlockType::Attention,
+                        "snapshot layer {i} attention vs state config"
+                    );
+                    // Reaching here without a compressed cache means the
+                    // lookup-time mode gate was bypassed: the compressed blobs
+                    // have no f32 slot to land in, so restoring would leave the
+                    // kernels reading whatever was in the f32 cache before.
+                    let tq = self.tq_cache().unwrap_or_else(|| {
+                        panic!(
+                            "GpuLfm2Model::restore_state_locked received a \
+                             TurboQuant-compressed snapshot at layer {i} but this \
+                             model is not TurboQuant-configured; callers must gate \
+                             on `StateSnapshot::is_compressed`"
+                        )
+                    });
+                    // Cross-check the decoded length against the snapshot's own
+                    // `seq_len`, which is what `gpu_state.seq_len` is set from
+                    // below: a disagreement would leave the kernels reading
+                    // compressed slots nothing wrote.
+                    let restored =
+                        tq.restore_layer(&self.ctx, i, keys, values)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "invalid or shape-mismatched TurboQuant blob in \
+                                 snapshot at layer {i}"
+                                )
+                            });
+                    assert_eq!(
+                        restored, snapshot.seq_len,
+                        "layer {i}: restored TurboQuant seq_len {restored} disagrees \
+                         with the snapshot's {}",
+                        snapshot.seq_len
                     );
                 }
                 LayerSnapshot::AttentionF16 { .. } => {
@@ -4729,7 +4957,15 @@ impl Model for GpuLfm2Model {
                         .expect("prefix_cache mutex poisoned")
                         .find_longest_prefix(tokens)
                 })
-                .flatten();
+                .flatten()
+                // Compression-mode gate. `cache_namespace` now folds the mode and
+                // seed into the disk fingerprint, so a cross-mode entry should be
+                // unreachable — this is a defensive backstop, not the primary
+                // guard, because the alternative on a namespace bug is
+                // `restore_state_locked` panicking or restoring a cache the
+                // kernels misread. Keep both: the filter is nearly free, and it
+                // degrades a namespacing regression to a cold prefill.
+                .filter(|(snapshot, _)| snapshot.is_compressed() == self.tq_cache().is_some());
             if let Some((snapshot, prefix_len)) = hit {
                 // Strict-prefix hits only. A `prefix_len == tokens.len()`
                 // hit would force `use_len = tokens.len() - 1`, but the
@@ -4879,11 +5115,11 @@ impl Model for GpuLfm2Model {
     }
 
     fn configure_cache(&self, config: crate::kv_cache::KvCacheConfig) {
+        let id = self.cache_namespace();
         *self
             .prefix_cache
             .lock()
-            .expect("prefix_cache mutex poisoned") =
-            KvPrefixCache::new(config, &self.config, &format!("wgpu:{}", self.model_id));
+            .expect("prefix_cache mutex poisoned") = KvPrefixCache::new(config, &self.config, &id);
     }
 
     /// Public Model trait surface for `_locked` snapshot/restore so
@@ -4900,11 +5136,111 @@ impl Model for GpuLfm2Model {
         self.restore_state_locked(snapshot);
     }
 
+    fn turboquant_supported(&self) -> bool {
+        // Gated on `head_dim`: the compressed kernels need a power-of-two
+        // `head_dim` that is <= 128 and a multiple of 32. Reporting the real
+        // capability here lets the CLI warn and fall back to f32 up front rather
+        // than have `configure_kv_compression` silently ignore the request.
+        crate::model::gpu_turboquant::head_dim_supported(self.config.head_dim)
+    }
+
+    fn configure_kv_compression(&self, compression: &KvCompression) -> Result<(), CeraError> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let want = TqMode::from_compression(compression, self.config.head_dim);
+
+        // Requests the compressed path can't serve fall back to f32 rather than
+        // erroring, matching the CPU's silent fallback for a non-power-of-two
+        // head_dim. Warn so a silently-downgraded request is visible.
+        if want.is_none() && matches!(compression, KvCompression::TurboQuant { .. }) {
+            tracing::warn!(
+                target: "cera::gpu",
+                head_dim = self.config.head_dim,
+                "TurboQuant requested but not supported for this configuration on \
+                 the wgpu backend (needs keys+values compression and a \
+                 power-of-two head_dim <= 128 that is a multiple of 32); \
+                 falling back to f32 KV"
+            );
+        }
+
+        // First call wins. The compressed and f32 caches have different layouts
+        // and only the configured one is ever allocated, so a mode change after
+        // the fact can't be honored — reject it instead of handing the kernels a
+        // cache they don't match.
+        if let Some(&configured) = self.kv_mode.get() {
+            if configured != want {
+                return Err(CeraError::KvCompressionConflict {
+                    configured: describe_kv_mode(&configured),
+                    requested: describe_kv_mode(&want),
+                });
+            }
+            // Same mode → no-op (this is the `Session::reset` path). The two
+            // records must agree: `kv_mode` is what we promised, `tq.mode` is what
+            // was actually built.
+            debug_assert_eq!(
+                self.tq.get().map(|t| t.mode),
+                configured,
+                "kv_mode and the built TurboQuant cache disagree"
+            );
+            return Ok(());
+        }
+
+        if let Some(mode) = want {
+            let q_cap = self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS);
+            let cache = TqGpuCache::new(
+                &self.ctx,
+                &self.config,
+                self.gpu_state.max_seq_len,
+                q_cap,
+                mode,
+            )?;
+            // `set` can only fail if another thread won the race, which
+            // `infer_lock` rules out.
+            assert!(self.tq.set(cache).is_ok(), "tq cache set race");
+        }
+        let _ = self.kv_mode.set(want);
+        // Tag with the mode the cache will actually hold, not the one requested, so
+        // a downgraded request shares the f32 namespace it is now writing into.
+        // Every downgrade — an unsupported `head_dim` as well as the GPU-only
+        // restrictions (single-sided TurboQuant) — leaves `want` as `None` and lands
+        // in the f32 arm below; `resolved_for` is then a no-op, since
+        // `want.is_some()` already implies the `head_dim` it re-checks.
+        let _ = self.kv_cache_tag.set(if want.is_some() {
+            compression.resolved_for(&self.config).cache_tag()
+        } else {
+            KvCompression::None.cache_tag()
+        });
+
+        // Re-namespace the prefix cache now that the mode is known. The engine
+        // calls `configure_cache` at load time, before any session exists, so the
+        // cache it built is tagged for the default (f32) mode; leaving it that way
+        // would let a compressed snapshot land in the f32 disk namespace and
+        // shadow it. Only needed when the tag actually changes — the f32 case is
+        // already correctly namespaced, and rebuilding would discard its warm tier
+        // for nothing. The warm tier is empty here regardless (no forward has run
+        // on this instance yet).
+        let tag_changed = self.kv_cache_tag.get().is_some_and(|t| !t.is_empty());
+        if tag_changed {
+            let id = self.cache_namespace();
+            let mut cache = self
+                .prefix_cache
+                .lock()
+                .expect("prefix_cache mutex poisoned");
+            let cache_config = cache.config.clone();
+            *cache = KvPrefixCache::new(cache_config, &self.config, &id);
+        }
+        Ok(())
+    }
+
     fn supports_kv_shift(&self) -> bool {
         // Mirror of CPU `Lfm2Model` / Metal `MetalLfm2Model` — the wgpu backend
         // implements the GPU-side shift via the `kv_shift` WGSL kernel +
         // `copy_buffer_to_buffer`. See `Self::shift_kv`.
-        true
+        //
+        // Not implemented for the compressed cache: the shift re-rotates stored K
+        // by a RoPE delta, which needs the raw vectors, and TurboQuant only keeps
+        // 2-bit rotated indices. Report `false` so `Session` warns accurately
+        // instead of promising a shift the overflow path will refuse.
+        self.tq.get().is_none()
     }
 
     fn shift_kv(&self, state: &mut InferenceState, n_keep: usize, shift: usize) {
@@ -4926,9 +5262,11 @@ impl Model for GpuLfm2Model {
             n_keep + shift <= cur_len,
             "shift range out of bounds: n_keep={n_keep} + shift={shift} > seq_len={cur_len}",
         );
-        // The wgpu KV cache is dense f32 — TurboQuant compression is a CPU-only
-        // feature, so a compressed state should never reach this backend. Match
-        // the Metal gate so a caller branching on the flag surfaces fast.
+        // Shifting a compressed cache is not implemented. `Session::can_shift`
+        // gates it on `state.is_compressed()` — true when *either* side is
+        // packed — which is the condition re-asserted here. `supports_kv_shift`
+        // above is narrower: it tracks `self.tq`, which stays empty for a
+        // request this backend downgraded but the state-side cache compressed.
         assert!(
             !state.is_compressed(),
             "shift_kv called on a TurboQuant-compressed state; \
