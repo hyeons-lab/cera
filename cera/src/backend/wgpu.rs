@@ -754,15 +754,17 @@ impl GpuContext {
             })
     }
 
-    /// Get timestamp_writes for a compute pass (if profiling enabled).
-    /// Returns (begin_query_idx, end_query_idx) for later resolution.
     /// Begin a compute pass, counting it and attaching a profiling span.
     ///
-    /// **The** place compute passes are created. `io_stats::passes` is only
-    /// meaningful if nothing bypasses this — the same mistake `submits` made
-    /// before #255, where the model called `queue.submit` directly and the
-    /// counter quietly measured itself. Pass count is a real perf lever (see
-    /// `GpuIoStats::passes`), so it needs a choke point, not a convention.
+    /// Use this rather than `CommandEncoder::begin_compute_pass` directly.
+    /// Nothing in the type system enforces that — `begin_compute_pass` is still
+    /// reachable — so it is a convention, and `io_stats::passes` is only as
+    /// honest as the callers. That is exactly how `submits` went wrong before
+    /// #255: the model bypassed the counter with direct `queue.submit` calls and
+    /// it reported 1.0 submits/token against a real 19. Pass count is a real
+    /// perf lever (see `io_stats::GpuIoStats::passes`), so it is worth keeping the
+    /// convention; `gpu_lfm2_decode_passes.rs` asserts the count is non-zero,
+    /// which catches a wholesale bypass but not a single stray call site.
     pub fn begin_pass<'a>(
         &'a self,
         enc: &'a mut wgpu::CommandEncoder,
@@ -775,6 +777,11 @@ impl GpuContext {
         })
     }
 
+    /// Get `timestamp_writes` for a compute pass, when profiling is enabled.
+    ///
+    /// Reserves a query pair and records `(label, begin_idx, end_idx)` for later
+    /// resolution; `None` when there is no profiler or the query budget is
+    /// spent. Prefer [`Self::begin_pass`], which calls this and counts the pass.
     pub fn begin_profile_span(&self, label: &str) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
         use std::sync::atomic::Ordering;
         let profiler = self.profiler.as_ref()?;

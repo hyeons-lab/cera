@@ -1403,7 +1403,9 @@ struct RunStats {
     prefill_io: PhaseIo,
 }
 
-/// `(submits, readbacks, readback_bytes)` from the wgpu backend's counters.
+/// `(submits, passes, readbacks, readback_bytes)` from the wgpu backend's
+/// counters, in that order — `PhaseIo::between` indexes the tuple positionally,
+/// so the order is load-bearing.
 ///
 /// Zeros when the `gpu` feature is off: the counters live in the wgpu backend,
 /// so there is nothing to read. Zeros also mean "not wgpu" at runtime (e.g. the
