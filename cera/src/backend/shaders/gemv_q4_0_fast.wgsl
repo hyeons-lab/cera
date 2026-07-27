@@ -91,33 +91,49 @@ fn gemv_q4_0_fast(
 
     var ib = ix;
     while ib < nb {
-        // Stage 16 pre-scaled activations in named registers (see header).
-        let y0 = x[yb_off + 0u];
-        let y1 = x[yb_off + 1u] / 256.0;
-        let y2 = x[yb_off + 2u];
-        let y3 = x[yb_off + 3u] / 256.0;
-        let y4 = x[yb_off + 4u];
-        let y5 = x[yb_off + 5u] / 256.0;
-        let y6 = x[yb_off + 6u];
-        let y7 = x[yb_off + 7u] / 256.0;
-        let y8 = x[yb_off + 16u] / 16.0;
-        let y9 = x[yb_off + 17u] / 4096.0;
-        let y10 = x[yb_off + 18u] / 16.0;
-        let y11 = x[yb_off + 19u] / 4096.0;
-        let y12 = x[yb_off + 20u] / 16.0;
-        let y13 = x[yb_off + 21u] / 4096.0;
-        let y14 = x[yb_off + 22u] / 16.0;
-        let y15 = x[yb_off + 23u] / 4096.0;
+        // Load each activation from the storage buffer EXACTLY ONCE, then
+        // derive both the pre-scaled `y*` and the `sumy*` bias from registers.
+        // The pointer version (and a first cut of this one) read each element
+        // twice — once to stage it, once to accumulate `sumy` — which is 16
+        // redundant storage loads per block per thread in the hot loop.
+        let a0 = x[yb_off + 0u];
+        let a1 = x[yb_off + 1u];
+        let a2 = x[yb_off + 2u];
+        let a3 = x[yb_off + 3u];
+        let a4 = x[yb_off + 4u];
+        let a5 = x[yb_off + 5u];
+        let a6 = x[yb_off + 6u];
+        let a7 = x[yb_off + 7u];
+        let a8 = x[yb_off + 16u];
+        let a9 = x[yb_off + 17u];
+        let a10 = x[yb_off + 18u];
+        let a11 = x[yb_off + 19u];
+        let a12 = x[yb_off + 20u];
+        let a13 = x[yb_off + 21u];
+        let a14 = x[yb_off + 22u];
+        let a15 = x[yb_off + 23u];
+
+        // Pre-scaled activations, staged in named registers (see header).
+        let y0 = a0;
+        let y1 = a1 / 256.0;
+        let y2 = a2;
+        let y3 = a3 / 256.0;
+        let y4 = a4;
+        let y5 = a5 / 256.0;
+        let y6 = a6;
+        let y7 = a7 / 256.0;
+        let y8 = a8 / 16.0;
+        let y9 = a9 / 4096.0;
+        let y10 = a10 / 16.0;
+        let y11 = a11 / 4096.0;
+        let y12 = a12 / 16.0;
+        let y13 = a13 / 4096.0;
+        let y14 = a14 / 16.0;
+        let y15 = a15 / 4096.0;
 
         // Same summation order as the original `sumy0 + sumy1` accumulation.
-        let sumy0 = (x[yb_off + 0u] + x[yb_off + 1u])
-            + (x[yb_off + 2u] + x[yb_off + 3u])
-            + (x[yb_off + 4u] + x[yb_off + 5u])
-            + (x[yb_off + 6u] + x[yb_off + 7u]);
-        let sumy1 = (x[yb_off + 16u] + x[yb_off + 17u])
-            + (x[yb_off + 18u] + x[yb_off + 19u])
-            + (x[yb_off + 20u] + x[yb_off + 21u])
-            + (x[yb_off + 22u] + x[yb_off + 23u]);
+        let sumy0 = (a0 + a1) + (a2 + a3) + (a4 + a5) + (a6 + a7);
+        let sumy1 = (a8 + a9) + (a10 + a11) + (a12 + a13) + (a14 + a15);
         let sumy_total = sumy0 + sumy1;
 
         for (var r = 0u; r < NR; r += 1u) {

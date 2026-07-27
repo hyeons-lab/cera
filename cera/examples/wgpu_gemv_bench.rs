@@ -4,12 +4,27 @@
 //! PR #311: an end-to-end tok/s number cannot tell "this kernel is slow" from
 //! "there are too many of them", and it cannot be swept. This is the decode
 //! equivalent — it times one GEMV kernel on the real projection shapes and
-//! reports **achieved bandwidth**, which is the number that matters because
-//! decode is memory-bound (BASELINE.md: time tracks bytes, 1.89x bytes ->
-//! 2.10x time).
+//! reports **achieved bandwidth**.
 //!
-//! Bandwidth, not GFLOP/s: a GEMV does 2 flops per weight byte-ish, so the
-//! roofline is bandwidth and GFLOP/s just obscures how far off peak it is.
+//! Bandwidth is the right *unit* — a GEMV streams weights, so the roofline is
+//! bandwidth and GFLOP/s obscures how far off peak it is — but read the number
+//! as "how much of the roofline is being used", **not** as "this kernel is
+//! bandwidth-bound". Decode GEMVs here are frequently bound by something else:
+//!
+//! - `gemv_q4_k` was *instruction*-bound. It took the same wall time as the
+//!   dense f32 GEMV while moving 7x fewer bytes; unrolling its dequant loop was
+//!   worth 1.42x with no change in bytes moved.
+//! - At small `m` every kernel — including the dense f32 control — sits in a
+//!   per-dispatch overhead floor, so the bandwidth column there measures the
+//!   dispatch, not the kernel.
+//!
+//! `BASELINE.md`'s "time tracks bytes" result (1.89x bytes -> 2.10x time) came
+//! from a Q8_0-vs-Q4_0 A/B. Those two are bandwidth-limited; it does not
+//! generalize across the family.
+//!
+//! Practical consequence: **ablate at large `m`** (65536), where the floor is
+//! amortized, and keep the f32 control in the table — it is what distinguishes a
+//! harness floor from a kernel defect.
 //!
 //! ```text
 //! cargo run --release --features gpu --example wgpu_gemv_bench

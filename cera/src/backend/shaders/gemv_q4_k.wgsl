@@ -69,7 +69,9 @@ fn q4k_mn(s0: u32, s1: u32, s2: u32, sub: u32) -> u32 {
     return (scb(s0, s1, s2, sub + 4u) >> 4u) | ((scb(s0, s1, s2, sub) >> 6u) << 4u);
 }
 
-/// Dequantized weight for nibble `byte` (0..3) of word `w`.
+/// Dequantized weight from byte `byte` (0..3, a byte index within the 32-bit
+/// word `w`). Which *nibble* of that byte is taken is a separate choice, made by
+/// `hi`: `hi == 0` takes the low nibble, otherwise the high one.
 ///
 /// `byte` is a literal at every call site, so the shift folds at compile time.
 /// That is the point of unrolling the caller: the rolled loop selected the word
