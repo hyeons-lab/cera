@@ -620,24 +620,62 @@ pub fn encode_image_gpu<O: VitGpuOps>(
 
 // ── wgpu backend implementation ──────────────────────────────────────────────
 
-// Register-tiled `mul_mat_reg_tile` config for the ViT quantized GEMM. Each
-// workgroup computes a (WG_M·TILE_M)×(WG_N·TILE_N) = 32×32 output tile with
-// WG_M·WG_N = 256 threads, staging a TILE_K=32 slice of decoded weights +
-// activations into shared memory per step (so weights are reused across the
-// token tile instead of re-read per token like the batched-GEMV kernels).
-// 256 threads (WG_M·WG_N) with a 32×32 output tile. Higher TILE_N (more work
-// per thread, fewer threads) measured *slower* on Apple GPUs — occupancy beats
-// the better arithmetic intensity here.
+// Register-tiled `mul_mat_reg_tile` config for the ViT GEMMs. Each workgroup
+// computes a (WG_M·TILE_M)×(WG_N·TILE_N) = 64×32 output tile with WG_M·WG_N =
+// 128 threads, staging a TILE_K=32 slice of decoded weights + activations into
+// shared memory per step (so weights are reused across the token tile instead
+// of re-read per token like the batched-GEMV kernels).
+//
+// The shader hand-unrolls a 4×4 thread tile, so TILE_M/TILE_N are not free (see
+// `mul_mat_reg_tile.wgsl`). A previous 32×32 tile here used TILE_N=1 because
+// higher TILE_N measured slower; that was an artifact of the accumulator array
+// spilling out of registers, which the shader rewrite fixed.
+//
+// DELIBERATELY narrower than the text path's 16×16 (`MUL_MAT_TILE_*` in
+// gpu_lfm2.rs). shmem is `TILE_K·(TILE_ROWS+4) + TILE_K·(TILE_COLS+4)` f32:
+// 16×16 would need ~17.0 KiB, over the 16 KiB WebGPU `max_compute_workgroup_-
+// storage_size` floor. The text path already requires an adapter above that
+// floor and has no fallback, but the ViT does: `WgpuVitOps::new` catches the
+// pipeline-creation panic and `try_wgpu_vision_encoder`'s `.ok()?` drops vision
+// to the CPU encoder — silently, as a perf cliff rather than an error. 16×8
+// keeps it at ~13.0 KiB so a spec-minimum adapter still gets the GPU encoder.
 #[cfg(feature = "gpu")]
-const VIT_MM_WG_M: u32 = 8;
+const VIT_MM_WG_M: u32 = 16;
 #[cfg(feature = "gpu")]
-const VIT_MM_WG_N: u32 = 32;
+const VIT_MM_WG_N: u32 = 8;
 #[cfg(feature = "gpu")]
 const VIT_MM_TILE_M: u32 = 4;
 #[cfg(feature = "gpu")]
-const VIT_MM_TILE_N: u32 = 1;
+const VIT_MM_TILE_N: u32 = 4;
 #[cfg(feature = "gpu")]
 const VIT_MM_TILE_K: u32 = 32;
+
+// Same two invariants the text path asserts (gpu_lfm2.rs), plus the workgroup-
+// storage bound that is the whole reason this geometry differs from it.
+#[cfg(feature = "gpu")]
+const _: () = assert!(
+    VIT_MM_TILE_M == 4 && VIT_MM_TILE_N == 4,
+    "mul_mat_reg_tile.wgsl hand-unrolls a 4x4 thread tile"
+);
+#[cfg(feature = "gpu")]
+const _: () = assert!(
+    VIT_MM_TILE_K.is_multiple_of(8),
+    "the Q4_0 shmem loader stages 8 consecutive k per thread"
+);
+// 16384 B = the 16 KiB WebGPU `max_compute_workgroup_storage_size` floor. At
+// 16x8 this evaluates to 13312 B; 16x16 would be 17408 and fail here, which is
+// the whole reason the ViT geometry differs from the text path's. A compile
+// error is the right failure mode: at runtime `WgpuVitOps::new` swallows the
+// pipeline-creation panic and vision silently drops to the CPU encoder.
+#[cfg(feature = "gpu")]
+const _: () = assert!(
+    (VIT_MM_TILE_K * (VIT_MM_WG_M * VIT_MM_TILE_M + 4)
+        + VIT_MM_TILE_K * (VIT_MM_WG_N * VIT_MM_TILE_N + 4))
+        * 4
+        <= 16384,
+    "ViT reg-tile shmem must stay within the 16 KiB WebGPU floor so a \
+     spec-minimum adapter keeps the GPU vision encoder"
+);
 
 /// A wgpu linear weight `[out_dim, in_dim]` row-major. Mirrors
 /// `MetalVitWeight`: quantized weights keep their packed bytes and run the
@@ -684,40 +722,17 @@ impl WgpuVitOps {
         // `.ok()?` — instead of aborting `CeraEngine` construction on a weak or
         // non-conformant adapter.
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            // f32 batched matmul via the SCALAR mul_mat variant (handles any m).
-            let p_linear = ctx.create_pipeline_with_defines(
-                shaders::MUL_MAT_REG_TILE,
-                "main",
-                "vit_linear",
-                &[
-                    ("SCALAR", ""),
-                    ("SRC0_INNER_TYPE", "f32"),
-                    ("SRC1_INNER_TYPE", "f32"),
-                    ("INIT_SRC0_SHMEM_FLOAT", ""),
-                    ("INIT_SRC1_SHMEM_FLOAT", ""),
-                    ("WORKGROUP_SIZE_M", "8u"),
-                    ("WORKGROUP_SIZE_N", "8u"),
-                    ("TILE_M", "4u"),
-                    ("TILE_N", "4u"),
-                    ("TILE_K", "32u"),
-                ],
-            );
-            // Register-tiled quantized GEMM: decode Q8_0/Q4_0 weight blocks into
-            // shared memory in-kernel and reuse them across the token tile.
             let (wg_m, wg_n) = (format!("{VIT_MM_WG_M}u"), format!("{VIT_MM_WG_N}u"));
             let (tile_m, tile_n) = (format!("{VIT_MM_TILE_M}u"), format!("{VIT_MM_TILE_N}u"));
             let tile_k = format!("{VIT_MM_TILE_K}u");
-            let mk_quant = |label: &str, init_src0: &str| {
+            let mk_mul_mat = |label: &str, src0_ty: &str, init_src0: &str| {
                 ctx.create_pipeline_with_defines(
                     shaders::MUL_MAT_REG_TILE,
                     "main",
                     label,
                     &[
-                        ("SCALAR", ""),
-                        ("SRC0_INNER_TYPE", "u32"),
-                        ("SRC1_INNER_TYPE", "f32"),
+                        ("SRC0_INNER_TYPE", src0_ty),
                         (init_src0, ""),
-                        ("INIT_SRC1_SHMEM_FLOAT", ""),
                         ("WORKGROUP_SIZE_M", &wg_m),
                         ("WORKGROUP_SIZE_N", &wg_n),
                         ("TILE_M", &tile_m),
@@ -726,6 +741,11 @@ impl WgpuVitOps {
                     ],
                 )
             };
+            // f32 batched matmul — the dequantized-weight fallback path.
+            let p_linear = mk_mul_mat("vit_linear", "f32", "INIT_SRC0_SHMEM_FLOAT");
+            // Register-tiled quantized GEMM: decode Q8_0/Q4_0 weight blocks into
+            // shared memory in-kernel and reuse them across the token tile.
+            let mk_quant = |label: &str, init_src0: &str| mk_mul_mat(label, "u32", init_src0);
             let p_mul_mat_q8_0 = mk_quant("vit_mul_mat_q8_0", "INIT_SRC0_SHMEM_Q8_0");
             let p_mul_mat_q4_0 = mk_quant("vit_mul_mat_q4_0", "INIT_SRC0_SHMEM_Q4_0");
             Self {
@@ -898,8 +918,10 @@ impl VitGpuOps for WgpuVitOps {
                 let p_buf = self
                     .ctx
                     .upload_storage(bytemuck::cast_slice(&params), "vit_linear_params");
-                let wg_m = (out_dim as u32).div_ceil(32);
-                let wg_n = (tokens as u32).div_ceil(32);
+                // Derived from the constants, not a hardcoded tile size: this
+                // dispatch and `mul_mat`'s below share one pipeline geometry.
+                let wg_m = (out_dim as u32).div_ceil(VIT_MM_WG_M * VIT_MM_TILE_M);
+                let wg_n = (tokens as u32).div_ceil(VIT_MM_WG_N * VIT_MM_TILE_N);
                 self.dispatch(&self.p_linear, &[buf, x, &y, &p_buf], (wg_m, wg_n, 1));
             }
         }
@@ -1472,6 +1494,7 @@ fn try_metal_vision_encoder(
 ))]
 mod tests {
     use super::*;
+
     use crate::model::vision_encoder::{PatchEmbedWeights, ProjectorWeights, VitBlockWeights};
     use crate::model::weights::MmapWeight;
     use crate::tensor::DType;

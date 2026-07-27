@@ -102,6 +102,14 @@ workspace = true
 optional = true
 features = ["fragile-send-sync-non-atomic-wasm"]
 
+# Uses `backend::wgpu`, which is `#[cfg(feature = "gpu")]`. Without
+# `required-features` cargo builds it for every `--all-targets` /
+# `cargo test --workspace` invocation — neither of which passes `--features
+# gpu` in CI — and the whole workspace fails to compile.
+[[example]]
+name = "wgpu_gemm_bench"
+required-features = ["gpu"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true

@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# CI CPU benchmark: sweeps the LFM2 quants cera actually ships (Q4_0/Q4_K_M/Q8_0)
-# and records prefill + decode tok/s in a stable, parseable form. Designed to run
-# on the `ubuntu-24.04-arm` runner (Neoverse N2, FEAT_I8MM) — where the aarch64
-# SMMLA GEMM kernels actually execute — and on `ubuntu-latest` (x86_64) as the
-# desktop baseline. Absolute tok/s on shared CI runners drifts run-to-run; the
-# durable signals are (a) the resolved CPU tier and (b) relative movement across
-# commits for the same runner + quant.
+# CI throughput benchmark: sweeps the LFM2 quants cera actually ships
+# (Q4_0/Q4_K_M/Q8_0) and records prefill + decode tok/s in a stable, parseable
+# form. Designed to run on the `ubuntu-24.04-arm` runner (Neoverse N2,
+# FEAT_I8MM) — where the aarch64 SMMLA GEMM kernels actually execute — and on
+# `ubuntu-latest` (x86_64) as the desktop baseline. `DEVICE` also points it at
+# the GPU backends on a macOS runner. Absolute tok/s on shared CI runners drifts
+# run-to-run; the durable signals are (a) the resolved backend tier and (b)
+# relative movement across commits for the same runner + device + quant.
 #
 # Inputs (env):
 #   BIN            path to the release `cera` binary        (default ./target/release/cera)
 #   ARCH_LABEL     label for this runner in output          (default: uname -m)
+#   DEVICE         backend: cpu | gpu | metal                (default cpu). `gpu`
+#                  is the portable wgpu backend, `metal` the native one; both
+#                  need the binary built with the matching feature. Deliberately
+#                  NOT `auto`: it resolves by availability, so two different
+#                  backends would land in one trend series under one key.
 #   BUNDLE_ID      LeapBundles model id                     (default LFM2.5-350M)
 #   QUANTS         space-separated quant labels             (default "Q4_0 Q4_K_M Q8_0")
 #   PROMPT_TOKENS  prefill length                           (default 512)
@@ -36,6 +42,7 @@ set -euo pipefail
 
 BIN="${BIN:-./target/release/cera}"
 ARCH_LABEL="${ARCH_LABEL:-$(uname -m)}"
+DEVICE="${DEVICE:-cpu}"
 BUNDLE_ID="${BUNDLE_ID:-LFM2.5-350M}"
 QUANTS="${QUANTS:-Q4_0 Q4_K_M Q8_0}"
 PROMPT_TOKENS="${PROMPT_TOKENS:-512}"
@@ -50,6 +57,13 @@ LLAMA_THREADS="${LLAMA_THREADS:-}"
 
 # Whether the llama.cpp comparison is active for this run.
 LLAMA_ON=0
+# The llama overlay runs llama-bench with `-ngl 0` (CPU only), so pairing it with
+# a GPU cera run would label a GPU-vs-CPU ratio as a like-for-like "gap". Refuse
+# the combination rather than publish a misleading number.
+if [ "${DEVICE:-cpu}" != "cpu" ] && [ -n "${LLAMA_BENCH:-}" ]; then
+  echo "note: DEVICE=${DEVICE} — ignoring LLAMA_BENCH (the overlay is CPU-only, -ngl 0)" >&2
+  LLAMA_BENCH=""
+fi
 if [ -n "$LLAMA_BENCH" ] && [ -x "$LLAMA_BENCH" ]; then
   LLAMA_ON=1
 fi
@@ -125,9 +139,17 @@ gap() {
   }'
 }
 
-# Resolved CPU tier — the single most important line for interpreting the numbers
-# (e.g. `neon+i8mm` means the SMMLA GEMM path is live; `neon+dotprod` means it is not).
-TIER="$("$BIN" cpu 2>/dev/null || echo 'cpu: tier=unknown')"
+# Resolved CPU tier — the single most important line for interpreting a CPU run
+# (e.g. `neon+i8mm` means the SMMLA GEMM path is live; `neon+dotprod` means it is
+# not). On a GPU device it describes the host, not what is being measured, so
+# label the device instead. The GPU's identity comes from the backend's
+# adapter line, which is logged at `info` — the caller must set RUST_LOG for it
+# to appear (the benchmarks workflow's GPU job does).
+if [ "$DEVICE" = "cpu" ]; then
+  TIER="$("$BIN" cpu 2>/dev/null || echo 'cpu: tier=unknown')"
+else
+  TIER="device=$DEVICE"
+fi
 echo "runner arch: $ARCH_LABEL"
 echo "$TIER"
 echo "params: bundle=$BUNDLE_ID prompt_tokens=$PROMPT_TOKENS max_tokens=$MAX_TOKENS runs=$RUNS warmup=$WARMUP"
@@ -145,7 +167,11 @@ ok_count=0
 
 emit_json() {
   # $1 metric ("prefill"/"decode"), $2 quant, $3 value(tok/s)
-  local name="$1 ${BUNDLE_ID} $2 (${ARCH_LABEL})"
+  # Series names are the trend-tracking key, so build them from one template —
+  # a second copy is a silently forked history when the two drift.
+  local suffix=""
+  [ "$DEVICE" != "cpu" ] && suffix="/${DEVICE}"
+  local name="$1 ${BUNDLE_ID} $2 (${ARCH_LABEL}${suffix})"
   local entry
   entry=$(printf '  {"name": "%s", "unit": "tok/s", "value": %s}' "$name" "$3")
   if [ -z "$json_entries" ]; then json_entries="$entry"; else json_entries="$json_entries,
@@ -171,12 +197,12 @@ else
 fi
 
 for quant in $QUANTS; do
-  echo "=== bench $BUNDLE_ID $quant (cpu) ==="
+  echo "=== bench $BUNDLE_ID $quant ($DEVICE) ==="
   out=""
   if ! out=$("$BIN" bench \
       --bundle-id "$BUNDLE_ID" --quant "$quant" \
       --cache-dir "$CACHE_DIR" \
-      --device cpu \
+      --device "$DEVICE" \
       --prompt-tokens "$PROMPT_TOKENS" --max-tokens "$MAX_TOKENS" \
       --runs "$RUNS" --warmup "$WARMUP" --no-cache \
       --context-size "$CONTEXT_SIZE" 2>&1); then
@@ -267,7 +293,7 @@ printf '%s' "$md_rows"
 # Markdown summary for the Actions UI.
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   {
-    echo "### CPU bench — $BUNDLE_ID ($ARCH_LABEL)"
+    echo "### Bench — $BUNDLE_ID ($ARCH_LABEL)"
     echo
     echo "\`$TIER\` · prompt_tokens=$PROMPT_TOKENS · max_tokens=$MAX_TOKENS · runs=$RUNS"
     if [ "$LLAMA_ON" -eq 1 ]; then
