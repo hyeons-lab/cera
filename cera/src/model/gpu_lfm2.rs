@@ -3,6 +3,40 @@
 // All weights are dequantized to f32 at load time and uploaded to GPU buffers.
 // The full forward pass runs in a single CommandEncoder per token — only the
 // logits vector is read back to CPU.
+//
+// # Compute passes are a perf lever, and a scarce one
+//
+// Batch as many dispatches into one compute pass as correctness allows. The same
+// dispatches measured **2.65x** more expensive split across N passes than
+// batched into one (M1 Max), and a pass boundary costs GPU time — a pipeline
+// drain — not just CPU encode. Decode issued 58 passes/token before the conv
+// block's three were merged into one; that alone was +17% decode.
+//
+// Two things force a boundary, and only two:
+//
+// - **An `encode_copy`.** A buffer-to-buffer copy is an *encoder* operation and
+//   cannot be issued inside a pass, so every copy ends one and starts another.
+//   Most of these exist because a kernel is in-place (`rmsnorm` normalizes its
+//   buffer, so the caller stages a scratch copy first); an out-of-place variant
+//   removes the copy and the boundary with it.
+// - **A readback.**
+//
+// Dependencies do *not*: WebGPU orders dispatches within a compute pass and
+// makes each one's writes visible to the next, which is what the `ffn` and
+// `conv` blocks rely on to run their whole dependent chain in one pass.
+//
+// `io_stats::passes` counts them and `gpu_lfm2_decode_passes.rs` holds decode to
+// a budget, because this regresses invisibly — the output is identical either
+// way.
+//
+// ## Profiling
+//
+// GPU timestamps are attached **per pass**, so merging passes merges their
+// profile spans: the `conv` span covers what used to be `conv_pre` / `conv_mid`
+// / `conv_post`, and `CERA_GPU_PROFILE=1` can no longer time those stages
+// separately. That is the standing cost of the batching above. If per-kernel
+// timing for a merged block is needed, split it only while the profiler is
+// enabled rather than unconditionally.
 
 use std::sync::Arc;
 use std::sync::Mutex;
