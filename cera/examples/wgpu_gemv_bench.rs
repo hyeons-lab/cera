@@ -78,7 +78,15 @@ fn synth_weights(dtype: DType, m: usize, k: usize) -> Vec<u8> {
     let (elems, bytes) = block_geom(dtype);
     assert_eq!(k % elems, 0, "k must be a multiple of the block size");
     let total = m * (k / elems) * bytes;
-    (0..total).map(|i| 0x30u8 + (i * 7 % 8) as u8).collect()
+    let mut out: Vec<u8> = (0..total).map(|i| 0x30u8 + (i * 7 % 8) as u8).collect();
+    // Pad to a whole `u32`. The shaders bind this as `array<u32>`, and the
+    // 2-byte-aligned block sizes make the total a non-multiple of 4 for some
+    // shapes — e.g. Q6_K (210 B) at an odd `m`. `upload_storage` already rounds
+    // up to COPY_BUFFER_ALIGNMENT and zeroes the tail, so this is not fixing an
+    // observed failure (m=3 k=256 runs fine). It is here so the benchmark does
+    // not silently depend on that, given `M=`/`K=` invite arbitrary shapes.
+    out.resize(total.next_multiple_of(4), 0);
+    out
 }
 
 fn main() -> anyhow::Result<()> {
