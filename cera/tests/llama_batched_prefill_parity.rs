@@ -4,7 +4,10 @@
 //! For each model that is present locally, two fresh `InferenceState`s compute:
 //!   (a) sequential per-token logits: `forward` per token, last token's logits;
 //!   (b) batched `forward_prefill` over the whole token slice.
-//! The last-token logits must agree by cosine similarity + identical argmax.
+//! The last-token logits must agree by cosine similarity, plus a top-1 check
+//! that is tie-tolerant: a differing argmax passes only when the reference rates
+//! the two candidates within [`TIE_FRACTION`] of its logit range (see there for
+//! the Granite case that forced it).
 //! This exercises every dense arch feature — Llama-3 NORM RoPE with
 //! freq_factors, Qwen3 per-head QK-norm + decoupled head_dim (NEOX), Qwen2 QKV
 //! bias (NEOX), and Granite's four scalar multipliers.
@@ -105,9 +108,78 @@ fn flash_prompt() -> Vec<u32> {
     PROMPT.iter().copied().cycle().take(288).collect()
 }
 
-/// Returns `(cosine, max_abs_diff, argmax_batched, argmax_sequential)` for the
-/// last-token logits, or `None` when the fixture is absent.
-fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, f32, usize, usize)> {
+/// Fraction of the reference's logit range within which two candidates count as
+/// tied, so a differing argmax is float reordering rather than a real defect.
+///
+/// Granite-3.1-2b at the 24-token prompt is the case that forced this: its top
+/// two logits are `299` = 8.2572 and `3265` = 8.2363, a separation of 2.09e-2
+/// against a range of 23.72 — 0.09% of the span, and *smaller than the 3.5e-1
+/// max-abs difference the two paths legitimately show*. Which one wins is
+/// decided by reduction order, so it differs by host: aarch64 + Accelerate picks
+/// `299` on both paths, x86_64 + OpenBLAS picks `299` batched and `3265`
+/// sequentially. A strict `assert_eq!` on argmax therefore encodes the reduction
+/// order of whichever machine happened to run it.
+///
+/// The window is deliberately anchored to the reference alone, not to the
+/// observed diff — a bound derived from the thing under test would widen to
+/// accommodate any regression. Cosine stays the discriminating check: a real
+/// layout/dim/transpose bug drops it far below the per-tier floor, which is
+/// asserted independently and unchanged.
+const TIE_FRACTION: f32 = 2e-2;
+
+/// Whether the two paths agree on the top token, tolerating a genuine near-tie.
+///
+/// `seq` is the reference (sequential) logits; both indices are scored against
+/// it so the verdict does not depend on the batched path's own values.
+fn top1_agrees(seq: &[f32], top_pre: usize, top_seq: usize) -> bool {
+    top_pre == top_seq || (seq[top_seq] - seq[top_pre]).abs() <= tie_eps(seq)
+}
+
+/// The tie window for a logit vector: [`TIE_FRACTION`] of its full range.
+fn tie_eps(seq: &[f32]) -> f32 {
+    let (lo, hi) = seq
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+    TIE_FRACTION * (hi - lo)
+}
+
+/// How far the reference separates its own best and second-best tokens.
+///
+/// This is the fragility signal, and it is reported on every run — including the
+/// ones that agree. The gap between the two paths' *picks* is zero whenever they
+/// match, so it says nothing until the day it fails; this says "granite is
+/// 2.09e-2 from flipping" while the test is still green.
+fn ref_top2_gap(seq: &[f32]) -> f32 {
+    let (mut best, mut second) = (f32::MIN, f32::MIN);
+    for &v in seq {
+        if v > best {
+            second = best;
+            best = v;
+        } else if v > second {
+            second = v;
+        }
+    }
+    best - second
+}
+
+/// Outcome of one batched-vs-sequential comparison.
+struct Parity {
+    cos: f32,
+    max_diff: f32,
+    top_pre: usize,
+    top_seq: usize,
+    /// Top-1 verdict, already tie-adjusted (see [`top1_agrees`]).
+    top1_ok: bool,
+    /// The reference's own best-vs-runner-up separation (see [`ref_top2_gap`]).
+    ref_gap: f32,
+    /// How far apart the reference rates the two paths' picks; 0 when they agree.
+    flip_gap: f32,
+    /// The tie window this comparison was judged against.
+    eps: f32,
+}
+
+/// Runs both paths and scores them, or `None` when the fixture is absent.
+fn run_parity(rel: &str, tokens: &[u32]) -> Option<Parity> {
     // Bring `Model` into scope so the boxed trait object's methods resolve.
     #[allow(unused_imports)]
     use cera::model::Model;
@@ -131,12 +203,17 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, f32, usize, usize)> {
     let logits_pre = model_pre.forward_prefill(tokens, 0, &mut state_pre);
 
     assert_eq!(logits_pre.len(), logits_seq.len(), "logit length mismatch");
-    Some((
-        cosine(&logits_pre, &logits_seq),
-        max_abs_diff(&logits_pre, &logits_seq),
-        argmax(&logits_pre),
-        argmax(&logits_seq),
-    ))
+    let (top_pre, top_seq) = (argmax(&logits_pre), argmax(&logits_seq));
+    Some(Parity {
+        cos: cosine(&logits_pre, &logits_seq),
+        max_diff: max_abs_diff(&logits_pre, &logits_seq),
+        top_pre,
+        top_seq,
+        top1_ok: top1_agrees(&logits_seq, top_pre, top_seq),
+        ref_gap: ref_top2_gap(&logits_seq),
+        flip_gap: (logits_seq[top_seq] - logits_seq[top_pre]).abs(),
+        eps: tie_eps(&logits_seq),
+    })
 }
 
 /// Whether `forward_prefill` will actually take the batched path here.
@@ -184,7 +261,7 @@ fn check(rel: &str, tokens: &[u32], x86_naive_floor: f32) {
     if !batched_path_is_live(rel) {
         return;
     }
-    let Some((cos, max_diff, top_pre, top_seq)) = run_parity(rel, tokens) else {
+    let Some(p) = run_parity(rel, tokens) else {
         // Absent fixture normally skips — but a skip that reports PASS is how a
         // gate goes green forever without ever running. `CERA_REQUIRE_MODEL`
         // makes the absence a hard failure, so a CI job that is supposed to have
@@ -199,8 +276,22 @@ fn check(rel: &str, tokens: &[u32], x86_naive_floor: f32) {
     };
     let is_flash = tokens.len() >= 256;
     let path = if is_flash { "flash" } else { "naive" };
+    let Parity {
+        cos,
+        max_diff,
+        top_pre,
+        top_seq,
+        top1_ok,
+        ref_gap,
+        flip_gap,
+        eps,
+    } = p;
+    // `ref_gap` and `eps` are printed on every run, not just failures: a model
+    // whose top-2 sit inside the tie window is one reduction-order nudge from
+    // flipping, and that is worth seeing while the test is still green.
     eprintln!(
-        "[parity] {rel} [{path}]: cosine={cos:.6} max_abs_diff={max_diff:.4e} argmax pre={top_pre} seq={top_seq}"
+        "[parity] {rel} [{path}]: cosine={cos:.6} max_abs_diff={max_diff:.4e} \
+         argmax pre={top_pre} seq={top_seq} ref_top2_gap={ref_gap:.4e} tie_eps={eps:.4e}"
     );
 
     // Threshold by (path, feature):
@@ -242,9 +333,12 @@ fn check(rel: &str, tokens: &[u32], x86_naive_floor: f32) {
         cos > min_cos,
         "{rel} [{path}]: batched-prefill vs sequential cosine = {cos} (< {min_cos} on the {tier} path) — likely a layout/dim/transpose bug"
     );
-    assert_eq!(
-        top_pre, top_seq,
-        "{rel} [{path}]: batched-prefill argmax {top_pre} != sequential argmax {top_seq}"
+    assert!(
+        top1_ok,
+        "{rel} [{path}]: batched-prefill argmax {top_pre} != sequential argmax {top_seq}, \
+         and they are not tied — the reference separates them by {flip_gap:.4e}, wider \
+         than the tie window {eps:.4e} ({TIE_FRACTION:.0e} of its logit range). A flip \
+         this far apart is a real disagreement, not reduction order"
     );
 }
 
@@ -340,4 +434,71 @@ fn llama_batched_prefill_parity_tinystories_20m_q8_0() {
 #[ignore]
 fn llama_batched_prefill_parity_smollm_135m_q4_0() {
     check_both("target/oracle/models/SmolLM-135M.Q4_0.gguf", FLOOR_Q4_0);
+}
+
+/// Unit tests for the tie rule itself. These need no fixture, so they run in the
+/// ordinary `cargo test` job — the fixture-backed tests above are `#[ignore]`d
+/// and, on a PR, granite is not even downloaded (the parity job fetches the
+/// `core` set there), so without these the rule would have no CI coverage at all
+/// until a main-branch push.
+#[cfg(test)]
+mod tie_rule {
+    use super::{TIE_FRACTION, tie_eps, top1_agrees};
+
+    /// The real Granite-3.1-2b logits that motivated the rule, measured on the
+    /// 24-token prompt: top-2 are 299 and 3265, separated by 2.09e-2 against a
+    /// range of 23.72. Index 0 stands in for the -15.46 floor.
+    fn granite_like() -> Vec<f32> {
+        let mut v = vec![-15.4587_f32; 8];
+        v[1] = 8.257178; // token 299 — sequential argmax on aarch64/Accelerate
+        v[2] = 8.236296; // token 3265 — sequential argmax on x86_64/OpenBLAS
+        v[3] = 7.619644;
+        v
+    }
+
+    #[test]
+    fn identical_argmax_agrees() {
+        let seq = granite_like();
+        assert!(top1_agrees(&seq, 1, 1));
+    }
+
+    /// The exact CI failure: the two hosts disagree on which of the top-2 wins.
+    #[test]
+    fn granite_top2_flip_is_a_tie() {
+        let seq = granite_like();
+        let gap = (seq[1] - seq[2]).abs();
+        assert!(
+            gap < tie_eps(&seq),
+            "measured Granite gap {gap} should sit inside the window {}",
+            tie_eps(&seq)
+        );
+        assert!(
+            top1_agrees(&seq, 1, 2),
+            "flip between the tied top-2 must pass"
+        );
+        assert!(top1_agrees(&seq, 2, 1), "and must be symmetric");
+    }
+
+    /// A flip to a genuinely lower logit is still a failure — the rule must not
+    /// have degenerated into "any argmax is fine".
+    #[test]
+    fn distant_flip_still_fails() {
+        let seq = granite_like();
+        assert!(
+            !top1_agrees(&seq, 3, 1),
+            "0.64 apart is well outside the window and must not be excused"
+        );
+        assert!(!top1_agrees(&seq, 0, 1), "and neither is the -15.46 floor");
+    }
+
+    /// The window scales with the reference's own range rather than being a
+    /// fixed logit delta, so a model with a wider spread is not held to a
+    /// tighter relative bar.
+    #[test]
+    fn window_scales_with_range() {
+        let narrow = vec![0.0_f32, 1.0];
+        let wide = vec![0.0_f32, 70.0];
+        assert!(tie_eps(&narrow) < tie_eps(&wide));
+        assert_eq!(tie_eps(&wide), TIE_FRACTION * 70.0);
+    }
 }
