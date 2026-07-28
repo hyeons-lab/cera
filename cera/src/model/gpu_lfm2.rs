@@ -292,18 +292,6 @@ struct GpuWeight {
     cached_bg: Option<wgpu::BindGroup>,
 }
 
-/// Whether `dtype` has a native quantized GEMV kernel — i.e. whether
-/// `gemv_pipeline_rows_label` maps it to something other than the f32 fallback.
-///
-/// Kept next to that function on purpose: adding a kernel there without adding
-/// the dtype here silently leaves weights being dequantized.
-fn has_quantized_gemv(dtype: DType) -> bool {
-    matches!(
-        dtype,
-        DType::Q4_0 | DType::Q8_0 | DType::Q4KM | DType::Q5KM | DType::Q6K
-    )
-}
-
 /// How the logit projection is computed.
 ///
 /// Both variants compute the same product. They differ in what the weight costs
@@ -1035,31 +1023,39 @@ impl GpuLfm2Model {
                 src.gguf().tensor_data("token_embd.weight")?,
             ),
         };
-        let lm_head_quantized_bytes = lm_head_bytes.len() as u64;
+        // Compare the size the buffer will actually be *bound* at, not the raw
+        // GGUF length: `upload_storage` rounds up to COPY_BUFFER_ALIGNMENT, and
+        // Q6_K (210 B/block), Q4_0 (18 B) and Q8_0 (34 B) are all 2 mod 4, so an
+        // odd block count does round up. Same reasoning as `encode_gemv_f16`'s
+        // tiled/non-tiled check — on an adapter whose `max_binding` is not itself
+        // a multiple of 4, comparing the raw length could pick this path and then
+        // fail binding validation.
+        let lm_head_bound_bytes = (lm_head_bytes.len() as u64).div_ceil(4) * 4;
+        // `[m, k, 0, 0]`; identical for both variants, so it is built once.
+        let lm_head_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[
+                config.vocab_size as u32,
+                config.hidden_size as u32,
+                0u32,
+                0u32,
+            ]),
+            "lm_head.params",
+        );
         // Take the quantized path only if the whole weight also fits one storage
         // binding — the GEMV kernels bind it entire, whereas the f16 path can
         // fall back to `encode_gemv_f16_tiled`. Quantized is the smaller of the
         // two, so this rejects only weights the f16 path would have had to tile
         // anyway.
-        let lm_head = if has_quantized_gemv(lm_head_dtype)
-            && lm_head_quantized_bytes <= ctx.max_storage_buffer_binding_size
+        let lm_head = if Self::has_quantized_gemv(lm_head_dtype)
+            && lm_head_bound_bytes <= ctx.max_storage_buffer_binding_size
         {
-            let params_buf = ctx.upload_storage(
-                bytemuck::cast_slice(&[
-                    config.vocab_size as u32,
-                    config.hidden_size as u32,
-                    0u32,
-                    0u32,
-                ]),
-                "lm_head.params",
-            );
             LmHead::Quantized(GpuWeight {
                 tensor: GpuTensor {
                     buffer: ctx.upload_storage(lm_head_bytes, "lm_head"),
                     dtype: lm_head_dtype,
                     shape: vec![config.vocab_size, config.hidden_size],
                 },
-                params_buf,
+                params_buf: lm_head_params,
                 cached_bg: None,
             })
         } else {
@@ -1071,15 +1067,7 @@ impl GpuLfm2Model {
             };
             LmHead::F16 {
                 weight: f16_weight,
-                params: ctx.upload_storage(
-                    bytemuck::cast_slice(&[
-                        config.vocab_size as u32,
-                        config.hidden_size as u32,
-                        0u32,
-                        0u32,
-                    ]),
-                    "lm_head.params",
-                ),
+                params: lm_head_params,
             }
         };
 
@@ -1341,19 +1329,25 @@ impl GpuLfm2Model {
             None => ctx.upload_f32(&[1.0f32], "rope_freqs_dummy"),
         };
         let attn_params = ctx.create_storage_rw(8 * 4, "attn_params");
-        // The LM head is stored as f16 (2 bytes/elem) — see `encode_gemv_f16`.
-        let lm_head_tile_rows = gemv_tile_rows(
-            config.vocab_size as u32,
-            hs as u32,
-            ctx.max_storage_buffer_binding_size,
-            ctx.min_storage_buffer_offset_alignment,
-            2,
-        );
-        let lm_head_tile_count = (config.vocab_size as u32).div_ceil(lm_head_tile_rows);
-        let mut gemv_tile_params = Vec::with_capacity(lm_head_tile_count as usize);
-        for i in 0..lm_head_tile_count {
-            gemv_tile_params.push(ctx.create_storage_rw(4 * 4, &format!("gemv_tile_params.{i}")));
-        }
+        // Row-tile params for `encode_gemv_f16_tiled`, which only the f16 LM head
+        // can reach — the quantized variant binds its weight entire or is not
+        // chosen at all. Empty on that path rather than allocated and unused.
+        // The `2` is the f16 element size, matching what those tiles bind.
+        let gemv_tile_params = if matches!(lm_head, LmHead::F16 { .. }) {
+            let tile_rows = gemv_tile_rows(
+                config.vocab_size as u32,
+                hs as u32,
+                ctx.max_storage_buffer_binding_size,
+                ctx.min_storage_buffer_offset_alignment,
+                2,
+            );
+            let tile_count = (config.vocab_size as u32).div_ceil(tile_rows);
+            (0..tile_count)
+                .map(|i| ctx.create_storage_rw(4 * 4, &format!("gemv_tile_params.{i}")))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Argmax I/O buffers. `argmax_params` is uploaded once with
         // vocab_size; `argmax_out_buf` is a 4-byte sink. Bind group is
@@ -1805,6 +1799,20 @@ impl GpuLfm2Model {
         }
     }
 
+    /// Whether `dtype` has a native quantized GEMV kernel — i.e. whether
+    /// [`Self::gemv_pipeline_rows_label`] maps it to something other than the
+    /// f32 fallback.
+    ///
+    /// Immediately above on purpose: adding a kernel there without adding the
+    /// dtype here silently leaves the LM head being dequantized to f16, which
+    /// costs throughput and VRAM and nothing fails.
+    fn has_quantized_gemv(dtype: DType) -> bool {
+        matches!(
+            dtype,
+            DType::Q4_0 | DType::Q8_0 | DType::Q4KM | DType::Q5KM | DType::Q6K
+        )
+    }
+
     fn gemv_workgroups(&self, w: &GpuWeight) -> (u32, u32, u32) {
         let (_, rows_per_wg, _) = self.gemv_pipeline_rows_label(w);
         let row_groups = (w.tensor.shape[0] as u32).div_ceil(rows_per_wg);
@@ -1948,9 +1956,6 @@ impl GpuLfm2Model {
         self.encode(enc, pipeline, bg, self.gemv_workgroups(w), label);
     }
 
-    /// Encode the LM-head GEMV (logit projection). The weight (`embedding` tied /
-    /// `output.weight` untied) is stored as f16 — see `gemv_f16` — so activations
-    /// stay f32 while the largest GPU tensor takes half the VRAM.
     /// Encode the logit projection.
     ///
     /// One dispatch either way; the variant decides which kernel reads which
