@@ -133,48 +133,111 @@ treat the span times as inflated by roughly that much.
 
 Read:
 
-- **The quantized GEMVs are still the bottleneck, and still the biggest remaining
-  lever.** In production they sustain ~26 GB/s where the f16 kernel does ~93 GB/s
-  on the same GPU. `ffn` alone is 48% of GPU pass time. The gap is in *how the
-  bytes are read* — the quantized kernels fetch via scalar `u32` loads with
-  shift/branch byte extraction, `gemv_f16` reads aligned vectors. #316 closed part
-  of it by removing register spills, and the q6_k load pattern is now fixed too.
+- **The quantized GEMVs are still the bottleneck.** In production they sustain
+  ~26 GB/s where the f16 kernel does ~93 GB/s on the same GPU, and `ffn` alone is
+  48% of GPU pass time.
 
-  **But the FFN's ~26 GB/s is not a load-pattern limit, and treating it as one
-  overestimates the prize.** Ablation: deleting q4_k's redundant per-block header
-  loads (all 32 threads re-read the same 4 words) is worth **+24% at m=65536 and
-  exactly nothing at FFN shapes** — 13.3 vs 13.2 GB/s. Sweeping m for q4_k gives
-  9.4 / 13.2 / 22.1 / 25.9 / 31.2 / 48.0 GB/s at m = 1024 … 65536, climbing
-  monotonically and never plateauing: at FFN shapes there is a fixed per-dispatch
-  cost the kernel never amortizes, so it is latency/occupancy-bound, not
-  bandwidth-bound. Load work pays on the LM head and on nothing else in decode.
+  Earlier revisions of this doc had the isolated-vs-in-model gap the other way
+  round — the microbenchmark reading ~13 GB/s where production sustained ~26 GB/s
+  — and treated that inversion as an open puzzle. It was the benchmark, and that
+  puzzle is gone. Whether a gap remains in the other direction cannot be said
+  until the harness is trustworthy again; see below.
 
-  Measure the kernels in isolation with `cargo run --release -p cera --features
-  gpu --example wgpu_gemv_bench`. At `m=65536`, the bandwidth-bound row:
+  The standing explanation has been *how the bytes are read* — quantized kernels
+  fetch via scalar `u32` loads with shift/branch byte extraction where `gemv_f16`
+  reads aligned vectors. That held for two kernels (#316 register spills, #321
+  q6_k byte-at-a-time loads) but **it is not a general law, and it failed the last
+  time it was applied**: three q4_k rewrites aimed at its load pattern produced no
+  net win, and the one that most reduced loads per element was the one that
+  regressed. Treat "read the bytes better" as a hypothesis to A/B per kernel, not
+  as a diagnosis that transfers.
 
-  | kernel | GB/s | vs f32 |
-  |---|---:|---:|
-  | f32 | **202** | — |
-  | q4_0 | 113 | 56% |
-  | q6_k | 113 | 56% |
-  | q4_k | 48 | 24% |
-  | q8_0 | 34 | 17% |
+  **RETRACTED (2026-07-27): there is no "FFN per-dispatch floor".** This section
+  used to claim that at FFN shapes a fixed per-dispatch cost dominates and no
+  kernel amortizes it, citing a q4_k m-sweep of 9.4 / 13.2 / 22.1 / 25.9 / 31.2 /
+  48.0 GB/s that climbed monotonically and never plateaued. That sweep, and the
+  whole GEMV table that used to sit here, were measured with a benchmark bug: a
+  cell's number depended on **where it sat in the table**, and whichever kernel
+  ran first absorbed a large penalty. `q6_k` at ffn gate/up reports **0.0305 ms
+  running last and 0.0952 ms running first**; reversing the kernel order moves the
+  penalty to whatever is now first. q4_k was listed first, so its whole row —
+  including the sweep that produced the "floor" — was the artifact. Fixed by
+  running the table twice and reporting the second round; a 750 ms global clock
+  ramp was tried first and does **not** fix it, so the mechanism is not clock ramp
+  and is still unidentified.
 
-  **Still only trust the `m=65536` row.** The bench used to open a compute pass
-  per iteration, charging ~38 µs of pass overhead to every measurement; that is
-  fixed, and it moved q4_0 from 53 to 113 GB/s and f32 from 145 to 202 — the
-  earlier figures in this file understated the kernels by up to 2.1x. Even
-  corrected, the small-m rows report ~13 GB/s where a real FFN pass sustains ~26,
-  for reasons not yet explained. Rotating output buffers to break write-after-write
-  chains between iterations was tried and changed nothing, so that is not it.
+  **A second harness defect was then found — the third overall in this benchmark,
+  counting the one #321 fixed — and no replacement table is published here.**
+  Every measurement also carried one blocking submit + `poll(Wait)` — a
+  GPU round trip costing ~1.0-1.5 ms whatever it carries — amortised over `ITERS`
+  and never subtracted. So a cell read `T + C/ITERS`, not `T`. It is worst exactly
+  where the kernel is cheapest: `q6_k` at ffn gate/up measured **46.0 / 63.6 /
+  79.3 GB/s at ITERS = 50 / 200 / 1000**, and fitting that gives C ~ 1.16 ms, one
+  round trip. The bench now uses two-point timing (`run(n)` and `run(2n)`,
+  differenced) which cancels C exactly — but differencing two noisy measurements
+  raises variance, and the resulting per-cell numbers do not yet replicate tightly
+  enough to publish. A 7-run table measured after fixing the first defect but
+  before finding this one was drafted here and then withdrawn; an independent
+  replication had already failed to reproduce its `ffn down` row.
 
-  q6_k reaching parity with q4_0 is recent — it read weights a byte at a time,
-  reloading the same word up to four times, until that was fixed.
+  **So: the retractions below stand, and no per-kernel bandwidth ranking is
+  currently authoritative.** Retracting a wrong number does not require a right
+  one, and publishing a third table that also fails to replicate would repeat the
+  error this section exists to record. What survives is what held under *every*
+  measurement regime tried — the buggy table, the 7-run table, the ITERS sweeps,
+  and an independent replication:
 
-  **q8_0 is the obvious next target** at 34 GB/s. q4_k already word-loads its
-  quants (its super-block is 4-byte aligned, so it never needed the funnel shift);
-  what it still does is re-read the same 4 header words in all 32 threads, worth
-  +24% at m=65536 in ablation and nothing at FFN shapes.
+  - **There is no "FFN per-dispatch floor."** q6_k and the f32 control both run
+    far above the claimed 13-26 GB/s ceiling at FFN shapes under every regime. A
+    real size-dependent cost exists — the f32 control rises monotonically with `m`
+    at fixed k=1024 — but not the hard floor that was published.
+  - **q4_k is not ~3x slower than q4_0.** They are close at every FFN shape under
+    every regime, at identical bytes/element (144/256 == 18/32 == 0.5625). Which
+    of the two leads at a given shape moves with the measurement regime, so no
+    ordering is claimed; the ~3x gap is simply not there.
+  - **q4_k is materially behind at the LM head**, by roughly a quarter to a third,
+    reproducibly and in the most stable shape measured.
+  - **q8_0 is the worst kernel by a wide margin at the FFN and LM-head shapes**,
+    far outside any noise seen here, and is the best remaining target. (At
+    `attn qkv/out` — the noisiest shape measured — it is not separable from q4_0,
+    so the claim is not made there.) Size the work from a fresh
+    in-model measurement, not from this harness: in isolation it looks ~40% less
+    efficient per byte than q4_0, while the in-model A/B below implies ~10%
+    (1.89x bytes for 2.10x time). That disagreement is unresolved.
+
+  **Before publishing a GEMV table again**, characterise the variance of
+  `cera/examples/wgpu_gemv_bench`:
+  fix the two defects found here (done), then establish how many runs a cell needs
+  to replicate, and verify by permuting kernel order *and* sweeping `ITERS` —
+  both must leave the conclusion unchanged. Until then prefer an **ABBA A/B within
+  one process** on the specific pair in question, which is what the kernel-variant
+  results below rest on and why they are still quoted.
+
+  ```bash
+  # medians of >=3; cells printing `noise` need a larger ITERS
+  cargo run --release -p cera --features gpu --example wgpu_gemv_bench
+  ITERS=1000 cargo run --release -p cera --features gpu --example wgpu_gemv_bench
+  ```
+
+  Three q4_k kernel variants were written and A/B'd against the original, ABBA
+  ordered, with q4_k held in a fixed non-first slot. **None was a net win and all
+  were discarded.** Recorded here so they are not re-attempted blind:
+
+  **Change in wall time vs the original kernel — negative is faster.**
+
+  | variant | ffn gate/up | lm head |
+  |---|---|---|
+  | 16 elems/thread + block interleave, hoisted scales | −11% | **+18%** |
+  | hoisted scale-byte indexing alone | +17% | +15% |
+  | 16 elems/thread + block interleave alone | −8% (noisy) | **+4.9%** (tight) |
+
+  Hoisting the scale-byte indexing out of the block loop was actively worse at
+  every shape: it keeps six extra registers live for the whole kernel to save
+  `select`s the backend was already folding. The thread remap won at ffn gate/up
+  but cost a tight, reproducible regression at the LM head — more live registers
+  per thread means fewer resident threadgroups, and at m=65536 occupancy is what
+  buys the latency hiding. Trading a certain LM-head regression for a noisy FFN
+  gain is a bad deal on this GPU and a worse one on mobile.
 
 - **Decode is memory-bound, confirmed by A/B, not by inspection.** The same model
   at Q8_0 moves 1.89× the FFN bytes and took **2.10×** the FFN time. Time tracks
@@ -195,8 +258,10 @@ Read:
   those merges cost ~15%. Implemented, measured, reverted (#319). A cost-per-unit
   derived from one successful change describes that change, not the system.
 
-- Not yet measured on Adreno. The access-pattern penalty is likely worse on a
-  mobile tiler.
+- Not yet measured on Adreno. Every number in this section is M1 Max, and the
+  register/occupancy trades that decided the q4_k variants above will differ on a
+  mobile tiler with a tighter register budget — so which kernel wins may differ
+  too, not just by how much.
 
 ## Reproduce
 

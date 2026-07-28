@@ -94,11 +94,25 @@ const VARIANTS: &[Variant] = &[
     },
 ];
 
-fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+/// Reads a **positive** `u32` from the environment, falling back to `default`
+/// only when the variable is absent.
+///
+/// A variable that is set but unparseable is a hard error rather than a silent
+/// fall back. The tile knobs are self-correcting — the header echoes the
+/// geometry actually compiled — but **`ITERS` is echoed nowhere**, so a mistyped
+/// value silently re-measures the default, and `ITERS=0` divided `elapsed` by
+/// zero.
+fn env_u32(key: &str, default: u32) -> anyhow::Result<u32> {
+    let Some(raw) = std::env::var_os(key) else {
+        return Ok(default);
+    };
+    let raw = raw.to_string_lossy();
+    let value: u32 = raw
+        .trim()
+        .parse()
+        .with_context(|| format!("{key}={raw:?} is not a u32"))?;
+    ensure!(value > 0, "{key} must be at least 1, got 0");
+    Ok(value)
 }
 
 /// Deterministic pseudo-random packed-quant bytes — a constant fill would let a
@@ -148,14 +162,14 @@ struct Tile {
 }
 
 impl Tile {
-    fn from_env() -> Self {
-        Self {
-            wg_m: env_u32("WG_M", 16),
-            wg_n: env_u32("WG_N", 16),
-            tile_m: env_u32("TILE_M", 4),
-            tile_n: env_u32("TILE_N", 4),
-            tile_k: env_u32("TILE_K", 16),
-        }
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            wg_m: env_u32("WG_M", 16)?,
+            wg_n: env_u32("WG_N", 16)?,
+            tile_m: env_u32("TILE_M", 4)?,
+            tile_n: env_u32("TILE_N", 4)?,
+            tile_k: env_u32("TILE_K", 16)?,
+        })
     }
 
     fn defines(&self, v: &Variant) -> Vec<(String, String)> {
@@ -203,7 +217,7 @@ fn main() -> anyhow::Result<()> {
             .with_context(|| format!("failed to read SHADER={path}"))?,
         None => shaders::MUL_MAT_REG_TILE.to_string(),
     };
-    let tile = Tile::from_env();
+    let tile = Tile::from_env()?;
     ensure!(
         tile.tile_m == 4 && tile.tile_n == 4,
         "TILE_M/TILE_N must be 4: mul_mat_reg_tile.wgsl hand-unrolls a 4x4 thread \
@@ -218,7 +232,7 @@ fn main() -> anyhow::Result<()> {
          per thread — got {}",
         tile.tile_k,
     );
-    let iters = env_u32("ITERS", 20);
+    let iters = env_u32("ITERS", 20)?;
     // Mirrors the production shader's shmem sizing; an experimental kernel may
     // lay its tiles out differently, so this is a guide, not a guarantee.
     let shmem = (tile.tile_k * (tile.wg_m * tile.tile_m + 4)

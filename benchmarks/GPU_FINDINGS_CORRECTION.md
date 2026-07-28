@@ -1,8 +1,15 @@
-# GPU root-cause: two rounds of being wrong
+# GPU root-cause: five rounds of being wrong
 
-This document has been wrong twice. Both times the error had the same shape —
-trusting a number without checking what it actually counted — so the history is
-kept rather than quietly overwritten.
+This document records five rounds of getting the GPU story wrong, kept rather
+than quietly overwritten. They do not all share one shape:
+
+- **Rounds 1-2 and 5** — trusting a number without checking what it actually
+  counted (code-reading inferences, a counter wired into one code path, a
+  benchmark that scored kernels by their position in its own table).
+- **Round 3** — a *correct* measurement generalised into a cost model for the
+  whole system.
+- **Round 4** — what finally worked: decompose the budget before optimising a
+  part of it.
 
 ## Round 1 — the code-reading inferences (wrong)
 
@@ -123,6 +130,15 @@ prefill disaster was mostly a **quantization gate**, not silicon.
   the time), but the quantized kernels only reach 6.7% of the M1 Max's 400 GB/s. They
   read weights as scalar `u32` loads with shift/branch byte extraction; `gemv_f16`
   reads aligned vectors and is 4x more efficient. Fix the reads, not the math.
+
+  > **→ Partly superseded 2026-07-28 (see Round 5).** "Fix the reads" held for two
+  > kernels — #316's register spills and #321's byte-at-a-time q6_k loads — but it
+  > is not a general law. Three q4_k rewrites aimed squarely at its load pattern
+  > produced no net win, and the variant that most reduced loads per element was
+  > the one that regressed (occupancy, not bandwidth). Treat "read the bytes
+  > better" as a per-kernel hypothesis to A/B, not a diagnosis that transfers.
+  > The "6.7% of peak" figure itself is **unaffected** — it comes from
+  > `CERA_GPU_PROFILE` in-model, not from the microbenchmark, and still stands.
 - **T7 (f16 weights) — DEAD AS SCOPED.** At the f16 kernel's own 106 GB/s, f16 FFN
   weights (453 MB) would take ~4.3 ms against Q4_0's 4.49 ms: a wash. Converting
   weight formats cannot help while the quantized kernels are 4x off their achievable
@@ -168,6 +184,46 @@ One near-miss worth recording: probing the readback showed *submit 8 µs, map+po
 help." That is wrong — the poll waits for **that submission** to execute and
 signal. Acting on the first reading would have skipped a +75% fix.
 
+## Round 5 — the microbenchmark scored kernels by table position (wrong)
+
+`cera/examples/wgpu_gemv_bench` reported a kernel's bandwidth as a function of
+**where it sat in the kernel x shape table**, not only of the kernel. `q6_k` at
+the ffn gate/up shape reads **0.0305 ms running last and 0.0952 ms running
+first**; reversing the kernel order moves the penalty to whatever is now first.
+
+`q4_k` was listed first, so it wore that penalty in every table this bench ever
+printed. Two published conclusions came out of that and both were false:
+
+| published claim | what it actually is |
+|---|---|
+| an "FFN per-dispatch floor" no kernel amortises | no such floor; it came from a q4_k m-sweep taken under the bug |
+| q4_k is ~3x q4_0's time at identical bytes/element | they are close at every FFN shape under every measurement regime tried; the 3x is not there |
+
+Fixed by running the whole table twice and reporting only the second round. A
+750 ms global clock-ramp warmup was tried first and measurably does **not** fix
+it, so the mechanism is not clock ramp and is still unidentified; a residual of
+up to ~19% remains on one kernel per run, so differences under ~20% from this
+harness are not meaningful.
+
+This is the **second of three** instrument defects found in `wgpu_gemv_bench`.
+#321 fixed the first (one compute pass per iteration, worth up to 2.1x at the
+LM-head shape: 53 -> 113 GB/s). The third surfaced while writing this entry:
+every measurement also carried one blocking submit + `poll(Wait)` — a ~1.0-1.5 ms
+round trip — amortised over `ITERS` and never subtracted, so a cell read
+`T + C/ITERS`. `q6_k` at ffn gate/up read 46.0 / 63.6 / 79.3 GB/s at
+ITERS = 50 / 200 / 1000; the fit gives C ~ 1.16 ms, one round trip. Now removed by
+two-point timing, at the cost of higher variance — which is why no replacement
+GEMV table is published.
+
+None of the three was caught by reading the harness. The first two surfaced when a
+result refused to behave — here, a q4_k rewrite that failed to move the number it
+targeted; the third when the `ITERS` sweep was finally run while writing this
+entry. Three q4_k kernel variants were built and A/B'd off the bad premise before
+the premise itself was checked; none shipped.
+
+The checks that would have caught them are two lines of process: **permute the order
+and require the numbers to agree, and sweep `ITERS` and require the same.**
+
 ## Lesson
 
 Round 1: I inferred root causes from reading code, and was wrong. Round 2: I
@@ -189,3 +245,9 @@ count. They didn't, and I never asked.
 And when comparing two platforms, hold the model fixed. Half of "Adreno is
 terrible" was Adreno running a different code path than the machine it was being
 compared against.
+
+Round 5 is round 2 again in a different costume: an unvalidated instrument, and
+numbers confident enough to plan a branch around. The instrument-level check is
+the cheap one and it keeps being the one skipped — for a counter, confirm the
+count scales with something predictable; for a benchmark, confirm a measurement
+does not depend on the order things were measured in.

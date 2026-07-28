@@ -3154,16 +3154,46 @@ mod tests {
     /// the pipeline directly and does not exercise `GpuLfm2Model`'s host dispatch.
     #[test]
     fn test_gpu_gemv_q4_k() {
-        use crate::quant::{BlockQ4KM, dequantize_q4_k_m_block};
         let ctx = match GpuContext::new() {
             Ok(ctx) => ctx,
             Err(_) => return,
         };
+        let pipeline = ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k", "gemv_q4_k");
+        // The kernel dispatches ceil(m/2) workgroups of 32 threads, each thread
+        // owning 8 of a super-block's 256 elements and walking every block
+        // (`ib` 0..nb). So the edge cases are the row guard and the block-loop
+        // trip count:
+        //   m odd     — the tail workgroup's second row is past the end. Two
+        //               separate guards cover it: `row >= m` skips the weight
+        //               reads (which would run off the end of `a`), and
+        //               `first_row + 1u < m` suppresses the write to `y[m]`
+        //   m == 1    — one row, so the guard is all there is
+        //   nb 1,2,3,4 — the block loop's trip count, including the single-block
+        //               case where it runs exactly once
+        for &(m, k) in &[
+            (65u32, 512u32), // odd m, nb = 2
+            (65, 256),       // odd m, nb = 1
+            (66, 768),       // even m, nb = 3
+            (1, 256),        // single row, nb = 1
+            (2, 1024),       // exactly one workgroup, nb = 4
+        ] {
+            gemv_q4_k_case(&ctx, &pipeline, m, k);
+        }
+    }
 
-        // m odd to exercise the ceil(m/2) tail workgroup; k a multiple of 256.
-        let m = 65u32;
-        let k = 512u32; // 2 super-blocks per row
+    /// One `(m, k)` case for [`test_gpu_gemv_q4_k`].
+    fn gemv_q4_k_case(ctx: &GpuContext, pipeline: &wgpu::ComputePipeline, m: u32, k: u32) {
+        use crate::quant::{BlockQ4KM, dequantize_q4_k_m_block};
         let qk_k = 256usize;
+        // Whole super-blocks only, asserted because the failure is silent: the
+        // shader truncates `nb = k / QK_K` exactly as this does, so both sides
+        // drop the same tail columns, agree, and the case *passes*. Callers pick
+        // `k` to hit a specific block-loop trip count, so silently getting a
+        // different one defeats the point of the table.
+        assert!(
+            k > 0 && (k as usize).is_multiple_of(qk_k),
+            "k must be a positive multiple of {qk_k}, got {k}"
+        );
         let nb = k as usize / qk_k;
 
         // Synthetic Q4_K weights serialized into the exact GGUF block layout the
@@ -3212,38 +3242,12 @@ mod tests {
         let params = [m, k, 0u32, 0u32];
         let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
-        let pipeline = ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k", "gemv_q4_k");
-        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: a_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: x_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: y_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: params_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut enc = ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(m.div_ceil(2), 1, 1);
-        }
-        ctx.submit_encoder(enc);
+        run_kernel(
+            ctx,
+            pipeline,
+            &[&a_buf, &x_buf, &y_buf, &params_buf],
+            (m.div_ceil(2), 1, 1),
+        );
 
         let result = ctx.download_f32(&y_buf, m as usize);
         for i in 0..m as usize {
@@ -3251,7 +3255,7 @@ mod tests {
             let rel = (expected[i] - result[i]).abs() / denom;
             assert!(
                 rel < 5e-3,
-                "Q4_K GEMV mismatch at row {i}: cpu={}, gpu={}, rel={rel:.2e}",
+                "Q4_K GEMV mismatch at m={m} k={k} row {i}: cpu={}, gpu={}, rel={rel:.2e}",
                 expected[i],
                 result[i]
             );
