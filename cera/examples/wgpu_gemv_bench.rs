@@ -198,13 +198,30 @@ fn main() -> anyhow::Result<()> {
             });
 
             let groups = m.div_ceil(kern.rows_per_wg);
+            // All iterations share ONE compute pass. A pass boundary costs ~38 us
+            // on an M1 Max, so a pass per iteration charged that to every
+            // measurement — at FFN shapes (~0.05 ms of real work) it dominated and
+            // the kernel under test disappeared beneath it. It is why this bench
+            // used to report q4_0 at 53 GB/s for the LM-head shape where it
+            // actually sustains 113. Dispatches inside a pass still execute in
+            // order, so the dependency chain is unchanged.
+            //
+            // Rotating several output buffers was also tried, on the theory that
+            // identical repeated dispatches serialize write-after-write and turn
+            // this into a latency measurement. It changed nothing (13.2 -> 13.1
+            // GB/s at the FFN shape), so WAW is not what limits the small-m rows;
+            // not kept. Those rows are still well short of what production
+            // sustains for reasons not yet explained — treat the large-m row as
+            // the trustworthy one.
             let run = |count: u32| {
                 let mut enc = ctx.device.create_command_encoder(&Default::default());
-                for _ in 0..count {
+                {
                     let mut pass = enc.begin_compute_pass(&Default::default());
                     pass.set_pipeline(&pipeline);
                     pass.set_bind_group(0, &bg, &[]);
-                    pass.dispatch_workgroups(groups, 1, 1);
+                    for _ in 0..count {
+                        pass.dispatch_workgroups(groups, 1, 1);
+                    }
                 }
                 ctx.queue.submit(Some(enc.finish()));
                 ctx.device.poll(wgpu::Maintain::Wait);
