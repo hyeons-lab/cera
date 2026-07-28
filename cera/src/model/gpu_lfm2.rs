@@ -1882,11 +1882,15 @@ impl GpuLfm2Model {
         // The LM head runs once per token over fixed buffers, so its bind group
         // is as cacheable as the per-layer ones. (The f16 variant builds its own;
         // it is a single dispatch and not worth another field.)
-        if let LmHead::Quantized(w) = &self.lm_head {
-            let bg = self.make_gemv_bg(w, &self.hidden_buf, &self.logits_buf);
-            if let LmHead::Quantized(w) = &mut self.lm_head {
-                w.cached_bg = Some(bg);
-            }
+        // Built then stored, rather than one `&mut` match: `make_gemv_bg` takes
+        // `&self`, so it cannot be called while `self.lm_head` is borrowed
+        // mutably. The bind group has to exist before the field is touched.
+        let lm_head_bg = match &self.lm_head {
+            LmHead::Quantized(w) => Some(self.make_gemv_bg(w, &self.hidden_buf, &self.logits_buf)),
+            LmHead::F16 { .. } => None,
+        };
+        if let (Some(bg), LmHead::Quantized(w)) = (lm_head_bg, &mut self.lm_head) {
+            w.cached_bg = Some(bg);
         }
     }
 
