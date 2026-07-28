@@ -3185,6 +3185,15 @@ mod tests {
     fn gemv_q4_k_case(ctx: &GpuContext, pipeline: &wgpu::ComputePipeline, m: u32, k: u32) {
         use crate::quant::{BlockQ4KM, dequantize_q4_k_m_block};
         let qk_k = 256usize;
+        // Whole super-blocks only, asserted because the failure is silent: the
+        // shader truncates `nb = k / QK_K` exactly as this does, so both sides
+        // drop the same tail columns, agree, and the case *passes*. Callers pick
+        // `k` to hit a specific block-loop trip count, so silently getting a
+        // different one defeats the point of the table.
+        assert!(
+            k > 0 && (k as usize).is_multiple_of(qk_k),
+            "k must be a positive multiple of {qk_k}, got {k}"
+        );
         let nb = k as usize / qk_k;
 
         // Synthetic Q4_K weights serialized into the exact GGUF block layout the

@@ -59,14 +59,53 @@
 //! Cells that print `noise` had a two-point difference too small to resolve; raise
 //! `ITERS`. Take medians of >=3 runs, and permute the kernel order to confirm.
 
+use anyhow::{Context, ensure};
 use cera::backend::wgpu::{GpuContext, shaders};
 use cera::tensor::DType;
 
-fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+/// Reads a **positive** `u32` from the environment, falling back to `default`
+/// only when the variable is absent.
+///
+/// A variable that is set but unparseable is a hard error rather than a silent
+/// fall back. The shape knobs are self-correcting — the table prints the `m`/`k`
+/// it actually ran — but **`ITERS` is echoed nowhere**, so a mistyped `ITERS=100O`
+/// silently re-measures the default and an `ITERS` sweep comes back looking
+/// ITERS-independent — which is exactly the check the two-point timing below has
+/// to survive.
+///
+/// Zero is rejected because it is not meaningful at any of the call sites:
+/// `ITERS=0` divides the two-point difference by zero, and `M=0` / `K=0` build
+/// empty buffers.
+fn env_u32(key: &str, default: u32) -> anyhow::Result<u32> {
+    let Some(raw) = std::env::var_os(key) else {
+        return Ok(default);
+    };
+    let raw = raw.to_string_lossy();
+    let value: u32 = raw
+        .trim()
+        .parse()
+        .with_context(|| format!("{key}={raw:?} is not a u32"))?;
+    ensure!(value > 0, "{key} must be at least 1, got 0");
+    Ok(value)
+}
+
+/// [`env_u32`] for the one `f64` knob, with the same fail-fast contract. The
+/// footer does print the effective figure, so this is about not *accepting* a
+/// mistyped `PEAK_GBS` rather than about it being invisible.
+fn env_f64(key: &str, default: f64) -> anyhow::Result<f64> {
+    let Some(raw) = std::env::var_os(key) else {
+        return Ok(default);
+    };
+    let raw = raw.to_string_lossy();
+    let value: f64 = raw
+        .trim()
+        .parse()
+        .with_context(|| format!("{key}={raw:?} is not an f64"))?;
+    ensure!(
+        value.is_finite() && value > 0.0,
+        "{key} must be a finite positive number, got {value}"
+    );
+    Ok(value)
 }
 
 /// One kernel under test.
@@ -125,12 +164,30 @@ fn main() -> anyhow::Result<()> {
     // 200, not 50: two-point timing differences two measurements, so the kernel
     // work has to be large enough next to the fixed round trip for the difference
     // to resolve. At 50 several cells per run came back unresolvable.
-    let iters = env_u32("ITERS", 200);
+    let iters = env_u32("ITERS", 200)?;
+    // The second timing point. Derived once here rather than as `iters * 2` at
+    // the call site, so the bound is checked where it is computed.
+    let iters_2n = iters
+        .checked_mul(2)
+        .context("ITERS is too large: the second timing point runs 2x ITERS")?;
 
     // `M=..K=..` overrides the shape table with a single custom shape, for
     // sweeping one dimension while the other is held fixed.
-    let custom = (std::env::var("M").is_ok() || std::env::var("K").is_ok())
-        .then(|| vec![(env_u32("M", 2816), env_u32("K", 1024), "custom")]);
+    let custom = if std::env::var_os("M").is_some() || std::env::var_os("K").is_some() {
+        let (m, k) = (env_u32("M", 2816)?, env_u32("K", 1024)?);
+        // Checked here, before the run starts. `synth_weights` would otherwise
+        // catch it partway through, but its message names only "the block size"
+        // and not which one, so `K=1000` panics with an unexplained "left: 232".
+        // 256 is the strictest block size in the table — Q4_K and Q6_K — and a
+        // multiple of every other one.
+        ensure!(
+            k.is_multiple_of(256),
+            "K must be a multiple of 256 (the Q4_K/Q6_K super-block), got {k}"
+        );
+        Some(vec![(m, k, "custom")])
+    } else {
+        None
+    };
 
     // Real LFM2 projection shapes. `(m, k, label)`.
     let default_shapes: &[(u32, u32, &str)] = &[
@@ -187,10 +244,7 @@ fn main() -> anyhow::Result<()> {
 
     // M1 Max unified memory. Only used for the "% peak" column; override for
     // other hardware.
-    let peak_gbs = std::env::var("PEAK_GBS")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(400.0);
+    let peak_gbs = env_f64("PEAK_GBS", 400.0)?;
 
     // The whole table runs TWICE and only the second round is reported.
     //
@@ -333,7 +387,7 @@ fn main() -> anyhow::Result<()> {
                 };
                 let t_2n = {
                     let t0 = std::time::Instant::now();
-                    run(iters * 2);
+                    run(iters_2n);
                     t0.elapsed()
                 };
                 // Saturating: under noise the difference can come out below zero,
