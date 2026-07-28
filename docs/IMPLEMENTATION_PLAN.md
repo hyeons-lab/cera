@@ -9,7 +9,7 @@ A Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 V1 is complete, and the project has since grown well beyond the original
 roadmap into **multimodal** territory (vision, audio, TTS) that this plan never
 anticipated. The status legend below uses ✅ done · 🟡 partial · ⬜ not started.
-Published to crates.io / Maven Central / CLI binaries at **0.3.0**; **0.3.1**
+Published to crates.io / Maven Central / CLI binaries at **0.3.1**; **0.4.0**
 is the next release target (the publish workflow is a manual dispatch, so this
 lags the version in `VERSION` until it runs). `cera-wasm` is not on npm yet —
 that leg stays disabled until the registry secrets are set up.
@@ -45,9 +45,9 @@ earlier "GPU is LFM2-only" limitation is gone (see #177/#192/#193/#194/#200).
 | V2.4 KV cache serialization (.lmkv) | ⬜ | |
 | V2.5 Prefix caching (radix) | ⬜ | |
 | V2.5b TurboQuant KV compression | ✅ | `cera/src/turboquant.rs` |
-| V2.6 More quant formats | 🟡 | Q6_K added; Q2/Q3/Q5_K, IQ, GPTQ, AWQ, FP8 remain |
+| V2.6 More quant formats | 🟡 | Q4_1/Q5_K/Q6_K added; Q2/Q3, IQ, GPTQ, AWQ, FP8 remain |
 | V2.7 Per-shape kernel tuning | ⬜ | no `cera tune` / autotune |
-| V2.8 Speculative decoding | ⬜ | |
+| V2.8 Speculative decoding | 🟡 | Prompt-lookup (n-gram) drafting shipped, CPU dense only; draft-model variant remains |
 | V2.9 LoRA adapters | ✅ | `cera/src/lora.rs`; runtime apply on CPU + Metal + wgpu; FFI/WASM |
 | — Hidden-states extraction | ✅ | `Model::hidden_states` (CPU/Metal/wgpu) + FFI/WASM; classifier/embedding path |
 | V2.10 MoE support | ⬜ | |
@@ -349,14 +349,34 @@ Radix tree for in-memory prefix matching, LRU eviction, scheduler integration. 5
 ### V2.5b: TurboQuant KV Cache Compression — 1-2 weeks ✅ DONE
 Google Research's data-oblivious KV cache compression (ICLR 2026). Compresses KV cache to 3-3.5 bits with zero accuracy loss.
 
-### V2.6: More Quantization Formats — 1 week per format 🟡 PARTIAL (Q6_K done)
-Q2_K through Q6_K, IQ quants, GPTQ, AWQ, FP8, in-situ quantization.
+### V2.6: More Quantization Formats — 1 week per format 🟡 PARTIAL (Q4_1, Q5_K, Q6_K added here; Q4_0/Q4_K_M/Q8_0 shipped in V1)
+Remaining: Q2_K, Q3_K, IQ quants, GPTQ, AWQ, FP8, in-situ quantization.
 
 ### V2.7: Per-Shape Kernel Tuning (GEMV/MMVQ) — 1-2 weeks ⬜
 Profile-guided kernel optimization for quantized decode (batch=1 GEMV). Instead of using one-size-fits-all thread/block configs for all layers, profile each unique (quant_type, N, K) shape on the target GPU and apply optimal nwarps/rows_per_block at runtime. Inspired by [kernel-anvil](https://github.com/apollosenvy/kernel-anvil) which demonstrated 2.25x decode speedup on Qwen3.5-27B Q4_K_M (12→27 tok/s on RX 7900 XTX) by auto-tuning llama.cpp's MMVQ kernels per model shape. Key insight: a 1024-row GQA projection and a 17408-row FFN layer have very different optimal configs. The bottleneck classification (bandwidth-bound vs occupancy-limited vs compute-bound) determines the sweep strategy. For cera: implement shape-aware dispatch in wgpu compute shaders (WGSL workgroup size, rows per invocation) and optionally in CPU SIMD (loop tiling). Store per-model configs as JSON; profile on first run or via `cera tune` command.
 
-### V2.8: Speculative Decoding — 1-2 weeks ⬜
-Draft model + verification, self-speculative. 1.3-2x decode speedup.
+### V2.8: Speculative Decoding — 🟡 PARTIAL
+Shipped as **prompt-lookup (n-gram) drafting** with greedy verification — *no*
+draft model, so no extra weight memory. The drafter reuses the sequence itself:
+it matches the trailing `ngram` tokens against an earlier occurrence and offers
+what followed, and the target verifies up to `k` of them in one forward. Every
+emitted token is the target's own argmax, so the result is a valid greedy decode
+— but not bit-identical to a sequential one, since the verifier forwards a batch
+where a sequential loop forwards one token at a time, and a near-tie can flip
+(#310's own test recorded exactly one such divergence at 81% acceptance).
+Exposed as `GenerateOpts::spec` / `SpecDecode` and on the CLI as
+`cera bench --spec`.
+
+Known cost, deliberately deferred (see the `KNOWN COST` block in
+`llama.rs::forward_prefill_logits_all`): the verify path projects logits with one
+GEMV per position, so the LM head is re-streamed `1 + k` times per round instead
+of once. The fix is a single `[vocab x n]` GEMM via `quantize_columns` +
+`gemm_preq`, needing a transpose and a dtype gate.
+
+Currently engages on the CPU dense (`llama`-family) path only — it requires
+`Model::supports_all_logits()`, which only `LlamaModel` implements — and needs
+an uncompressed KV cache. Remaining: a real draft-model variant, and extending
+all-position logits to LFM2 and the GPU models.
 
 ### V2.9: LoRA Adapters — ✅ DONE
 Runtime LoRA apply (`y += scale·B·(A·x)`, **never merged** — base weights stay

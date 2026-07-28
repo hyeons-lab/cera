@@ -71,7 +71,7 @@ cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead 
 | `inspect` | Inspect a GGUF file's metadata and resolved CPU backend tier. |
 | `cpu` | Print the host's CPU backend tier + detected SIMD features (no model needed). |
 | `tokenize` | Tokenize text and print token IDs (e.g. to compare against HuggingFace). |
-| `bench` | Measure decode throughput (tok/s) with p10/p50/p90/mean/stddev over N runs. |
+| `bench` | Measure decode throughput (tok/s) with p10/p50/p90/mean/stddev over N runs. `--spec` (plus `--spec-ngram` / `--spec-k`) measures greedy speculative decoding; `--gpu-io` reports wgpu submits, compute passes, and readbacks per token. |
 | `list-bundles` | List bundles on `LiquidAI/LeapBundles` (add `--quants` for per-bundle quants). |
 | `download-bundles` | Download bundle manifests + model files without loading them. |
 

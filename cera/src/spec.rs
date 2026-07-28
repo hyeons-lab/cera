@@ -138,10 +138,17 @@ pub fn verify_draft(
     }
 }
 
-/// Greedy speculative decoding with prompt-lookup drafting. Produces output that
-/// is **token-for-token identical** to greedy decoding of `model` (the target's
-/// argmax at every position is the ground truth; drafts only shortcut the
-/// weight-reads), so it can be verified against a plain greedy loop.
+/// Greedy speculative decoding with prompt-lookup drafting. Every emitted token
+/// is the target's argmax at its position — drafts only shortcut the
+/// weight-reads, never the decision — so the result is a valid greedy decode.
+///
+/// It is **not** guaranteed token-for-token equal to a *sequential* greedy loop.
+/// Verification forwards the drafted tokens as a batch (`n > 1` takes the
+/// batched-GEMM path in `forward_prefill_logits_all`) where a sequential loop
+/// forwards one token at a time through a GEMV. The two reduction orders are
+/// not bit-equal, so where the top two logits are near-tied the two paths can
+/// pick opposite sides. Oracle tests therefore bound the logit gap rather than
+/// asserting argmax equality against a plain greedy run.
 ///
 /// The `state` must be fresh (`seq_len == 0`). `eos` lists stop tokens. `ngram`
 /// and `k` configure the drafter. Returns the generated tokens (excluding the
@@ -454,7 +461,7 @@ mod tests {
         /// `truncate_kv`, so they pin the call sites without ever running the
         /// default body. Gutting that default to a no-op passes both, and every
         /// other non-ignored test in the workspace: its only other coverage is
-        /// the `#[ignore]`d `greedy_spec_matches_greedy_exactly`, and even that
+        /// the `#[ignore]`d `greedy_spec_matches_greedy_within_tie_tolerance`, and even that
         /// catches it only on a fixture whose rounds actually reject a draft
         /// (Llama-3.2-1B does; on Qwen3-0.6B every round accepts in full, so every
         /// rewind is the free `len == seq_len` case and a no-op default passes).

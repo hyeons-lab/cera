@@ -35,9 +35,10 @@ Two gate signals per prompt (see `cera/tests/fixtures/oracle/<model>/*.json`):
 ```bash
 scripts/oracle/vendor_llama_cpp.sh        # clone+build pinned llama.cpp (~target/, gitignored)
 
-# Fixture models (gitignored). Q8_0 — uniform, fully supported by cera, tightest
-# numeric match. NB: Qwen's "Q4_0" GGUFs store ffn_down as Q4_1, which cera
-# doesn't support; use Q8_0.
+# Fixture models (gitignored). Q8_0 — uniform, and the tightest numeric match,
+# which is what an oracle fixture wants. NB: Qwen's "Q4_0" GGUFs store ffn_down
+# as Q4_1; cera does load Q4_1 now, but a mixed-quant file makes a numeric
+# comparison harder to attribute, so prefer Q8_0 here.
 hf download Qwen/Qwen2-0.5B-Instruct-GGUF     qwen2-0_5b-instruct-q8_0.gguf     --local-dir target/oracle/models
 hf download Qwen/Qwen3-0.6B-GGUF              Qwen3-0.6B-Q8_0.gguf              --local-dir target/oracle/models
 hf download bartowski/Llama-3.2-1B-Instruct-GGUF   Llama-3.2-1B-Instruct-Q8_0.gguf   --local-dir target/oracle/models

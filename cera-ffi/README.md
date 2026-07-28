@@ -35,7 +35,7 @@ filesystem tree manually" workaround.
 | 16+ | Session-API expansion: `Session::append_audio` placeholder, `Session::clear_cancel`, `CeraEngine::is_special_token`, `CeraEngine::context_size` resolved getter |
 | 17+ | Hidden-states extraction: `Session::hidden_states_for_tokens` / `_for_text` (LE-f32 `Data`/`ByteArray`), `hidden_states_mean_pooled` (`[Float]`), `hidden_size` |
 | 18+ | LoRA adapters: `LoraAdapters` object (`from_gguf` / `from_safetensors`), `Session::attach_lora` / `remove_lora` / `has_lora`, `FfiError::LoraParse` |
-| later | Maven Central / SwiftPM remote publishing |
+| 19+ | Maven Central (`com.hyeons-lab:cera-ffi-{jvm,android}`) + SwiftPM remote publishing (`.package(url:)` against a prebuilt `CeraFFI.xcframework`) — both shipped |
 
 Don't add FFI exposure to `cera` directly — the `cera` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -275,7 +275,7 @@ any iOS / macOS app the usual way:
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/hyeons-lab/cera", from: "0.3.0"),
+    .package(url: "https://github.com/hyeons-lab/cera", from: "0.4.0"),
 ],
 targets: [
     .target(
