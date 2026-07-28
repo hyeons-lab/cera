@@ -138,13 +138,40 @@ Read:
   on the same GPU. `ffn` alone is 48% of GPU pass time. The gap is in *how the
   bytes are read* — the quantized kernels fetch via scalar `u32` loads with
   shift/branch byte extraction, `gemv_f16` reads aligned vectors. #316 closed part
-  of it by removing register spills; the load pattern itself is untouched.
+  of it by removing register spills, and the q6_k load pattern is now fixed too.
+
+  **But the FFN's ~26 GB/s is not a load-pattern limit, and treating it as one
+  overestimates the prize.** Ablation: deleting q4_k's redundant per-block header
+  loads (all 32 threads re-read the same 4 words) is worth **+24% at m=65536 and
+  exactly nothing at FFN shapes** — 13.3 vs 13.2 GB/s. Sweeping m for q4_k gives
+  9.4 / 13.2 / 22.1 / 25.9 / 31.2 / 48.0 GB/s at m = 1024 … 65536, climbing
+  monotonically and never plateauing: at FFN shapes there is a fixed per-dispatch
+  cost the kernel never amortizes, so it is latency/occupancy-bound, not
+  bandwidth-bound. Load work pays on the LM head and on nothing else in decode.
 
   Measure the kernels in isolation with `cargo run --release -p cera --features
-  gpu --example wgpu_gemv_bench`. **Only its `m=65536` rows are trustworthy** — it
-  issues each iteration in its own compute pass, so ~38 µs of pass overhead
-  dominates the smaller shapes. At `m=65536`: q4_k 43, q4_0 53, q6_k 54, q8_0 33,
-  **f32 145 GB/s**.
+  gpu --example wgpu_gemv_bench`. At `m=65536`, the bandwidth-bound row:
+
+  | kernel | GB/s | vs f32 |
+  |---|---:|---:|
+  | f32 | **202** | — |
+  | q4_0 | 113 | 56% |
+  | q6_k | 113 | 56% |
+  | q4_k | 48 | 24% |
+  | q8_0 | 34 | 17% |
+
+  **Still only trust the `m=65536` row.** The bench used to open a compute pass
+  per iteration, charging ~38 µs of pass overhead to every measurement; that is
+  fixed, and it moved q4_0 from 53 to 113 GB/s and f32 from 145 to 202 — the
+  earlier figures in this file understated the kernels by up to 2.1x. Even
+  corrected, the small-m rows report ~13 GB/s where a real FFN pass sustains ~26,
+  for reasons not yet explained. Rotating output buffers to break write-after-write
+  chains between iterations was tried and changed nothing, so that is not it.
+
+  q6_k reaching parity with q4_0 is recent — it read weights a byte at a time,
+  reloading the same word up to four times, until that was fixed. **q4_k and q8_0
+  have not had the same treatment and are the obvious next targets**: q4_k is what
+  every FFN matrix in a Q4_K_M model uses.
 
 - **Decode is memory-bound, confirmed by A/B, not by inspection.** The same model
   at Q8_0 moves 1.89× the FFN bytes and took **2.10×** the FFN time. Time tracks
