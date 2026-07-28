@@ -28,6 +28,37 @@ fn rb(off: u32) -> u32 {
     return (a[off / 4u] >> ((off % 4u) * 8u)) & 0xFFu;
 }
 
+// Four consecutive bytes at an arbitrary byte offset, as one u32.
+//
+// Q6_K blocks are 210 bytes, so a block's base is not 4-aligned and its byte
+// runs straddle word boundaries — which is why this kernel originally read one
+// byte at a time. Each `rb` costs a full `a[]` load, so four consecutive bytes
+// loaded the same word up to four times over. This funnel-shifts two loads into
+// the four bytes instead: half the loads for the same data, and the shift is
+// register work.
+//
+// The offsets this is called with share `off % 4` across the workgroup (the
+// per-thread part is always a multiple of 4), so `sh` is workgroup-uniform.
+fn rw(off: u32) -> u32 {
+    let w = off / 4u;
+    let sh = (off & 3u) * 8u;
+    // `x << 32u` is undefined in WGSL, so mask the high word out when the offset
+    // is already aligned rather than shifting by 32.
+    let hi_sh = (32u - sh) & 31u;
+    return (a[w] >> sh) | select(a[w + 1u] << hi_sh, 0u, sh == 0u);
+}
+
+/// The four 6-bit weights sharing one high-bits byte, in the kernel's
+/// `q6_1..q6_4` order (which maps to `sums.x..sums.w`).
+fn q6_lane(q1: u32, q2: u32, qhv: u32) -> vec4<f32> {
+    return vec4<f32>(
+        f32(i32((q1 & 0x0Fu) | ((qhv & 0x03u) << 4u)) - 32),
+        f32(i32((q2 & 0x0Fu) | ((qhv & 0x0Cu) << 2u)) - 32),
+        f32(i32((q1 >> 4u) | (qhv & 0x30u)) - 32),
+        f32(i32((q2 >> 4u) | ((qhv & 0xC0u) >> 2u)) - 32),
+    );
+}
+
 fn ri8(off: u32) -> i32 {
     let b = rb(off);
     return i32(b) - select(0, 256, (b & 0x80u) != 0u);
@@ -68,13 +99,14 @@ fn gemv_q6_k(
     var b = ix;
     while b < nb {
         let yb = b * QK_K + y_offset;
-        var yl: array<f32, 16>;
-        for (var l = 0u; l < 4u; l += 1u) {
-            yl[4u * l + 0u] = x[yb + l + 0u];
-            yl[4u * l + 1u] = x[yb + l + 32u];
-            yl[4u * l + 2u] = x[yb + l + 64u];
-            yl[4u * l + 3u] = x[yb + l + 96u];
-        }
+        // Four `vec4`s of activations rather than an `array<f32, 16>` indexed by
+        // the loop variable. A loop-indexed local array is not reliably promoted
+        // to registers — same pathology #316 fixed in gemv_q4_0_fast / gemv_q4_k
+        // — and these are read once per row per block in the hot path.
+        let ylv0 = vec4<f32>(x[yb + 0u], x[yb + 32u], x[yb + 64u], x[yb + 96u]);
+        let ylv1 = vec4<f32>(x[yb + 1u], x[yb + 33u], x[yb + 65u], x[yb + 97u]);
+        let ylv2 = vec4<f32>(x[yb + 2u], x[yb + 34u], x[yb + 66u], x[yb + 98u]);
+        let ylv3 = vec4<f32>(x[yb + 3u], x[yb + 35u], x[yb + 67u], x[yb + 99u]);
 
         for (var row = 0u; row < NR; row += 1u) {
             // Skip the weight reads for out-of-range rows: on an odd `m` the tail
@@ -91,22 +123,18 @@ fn gemv_q6_k(
             let sc  = bb + 192u + is_off;
             let d_off = bb + 208u;
 
+            // Three word loads for the twelve bytes the old `l` loop read one
+            // at a time. Unrolled in the same l = 0..3 order, so the f32
+            // accumulation order — and the result — is unchanged.
+            let w1 = rw(ql1);
+            let w2 = rw(ql2);
+            let wh = rw(qh);
+
             var sums = vec4<f32>(0.0);
-            for (var l = 0u; l < 4u; l += 1u) {
-                let q1 = rb(ql1 + l);
-                let q2 = rb(ql2 + l);
-                let qhv = rb(qh + l);
-
-                let q6_1 = i32((q1 & 0x0Fu) | ((qhv & 0x03u) << 4u)) - 32;
-                let q6_2 = i32((q2 & 0x0Fu) | ((qhv & 0x0Cu) << 2u)) - 32;
-                let q6_3 = i32((q1 >> 4u)   | ( qhv & 0x30u        )) - 32;
-                let q6_4 = i32((q2 >> 4u)   | ((qhv & 0xC0u) >> 2u )) - 32;
-
-                sums[0] += yl[4u * l + 0u] * f32(q6_1);
-                sums[1] += yl[4u * l + 1u] * f32(q6_2);
-                sums[2] += yl[4u * l + 2u] * f32(q6_3);
-                sums[3] += yl[4u * l + 3u] * f32(q6_4);
-            }
+            sums += q6_lane(w1 & 0xFFu, w2 & 0xFFu, wh & 0xFFu) * ylv0;
+            sums += q6_lane((w1 >> 8u) & 0xFFu, (w2 >> 8u) & 0xFFu, (wh >> 8u) & 0xFFu) * ylv1;
+            sums += q6_lane((w1 >> 16u) & 0xFFu, (w2 >> 16u) & 0xFFu, (wh >> 16u) & 0xFFu) * ylv2;
+            sums += q6_lane(w1 >> 24u, w2 >> 24u, wh >> 24u) * ylv3;
 
             let dblk = rf16(d_off);
             let s0 = f32(ri8(sc));
