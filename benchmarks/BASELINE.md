@@ -169,9 +169,12 @@ Read:
   chains between iterations was tried and changed nothing, so that is not it.
 
   q6_k reaching parity with q4_0 is recent — it read weights a byte at a time,
-  reloading the same word up to four times, until that was fixed. **q4_k and q8_0
-  have not had the same treatment and are the obvious next targets**: q4_k is what
-  every FFN matrix in a Q4_K_M model uses.
+  reloading the same word up to four times, until that was fixed.
+
+  **q8_0 is the obvious next target** at 34 GB/s. q4_k already word-loads its
+  quants (its super-block is 4-byte aligned, so it never needed the funnel shift);
+  what it still does is re-read the same 4 header words in all 32 threads, worth
+  +24% at m=65536 in ablation and nothing at FFN shapes.
 
 - **Decode is memory-bound, confirmed by A/B, not by inspection.** The same model
   at Q8_0 moves 1.89× the FFN bytes and took **2.10×** the FFN time. Time tracks

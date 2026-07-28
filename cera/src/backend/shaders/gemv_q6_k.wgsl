@@ -37,8 +37,18 @@ fn rb(off: u32) -> u32 {
 // the four bytes instead: half the loads for the same data, and the shift is
 // register work.
 //
-// The offsets this is called with share `off % 4` across the workgroup (the
-// per-thread part is always a multiple of 4), so `sh` is workgroup-uniform.
+// `select`, not a branch, on purpose. `sh` is NOT uniform across the workgroup:
+// `b` starts at `ix = tiisg & 1u` and steps by 2, so adjacent lanes work on
+// even/odd blocks, and `Q6K_BYTES % 4 == 2` makes their block bases differ by 2
+// mod 4. An `if (sh == 0u)` would therefore split every workgroup 16/16 and
+// serialize both halves, to save one load on the aligned half. Measured, because
+// the branch looks like the cheaper form: it costs **41%** at the LM-head shape
+// (120.8 -> 70.7 GB/s) and about a third everywhere else. Do not "simplify" this
+// back to a branch.
+//
+// The unselected `a[w + 1u]` can read one word past the buffer when `off` is
+// aligned and lands on the final word. That is well-defined in WGSL — storage
+// accesses are bounds-checked — and the value is discarded by the `select`.
 fn rw(off: u32) -> u32 {
     let w = off / 4u;
     let sh = (off & 3u) * 8u;
@@ -125,7 +135,14 @@ fn gemv_q6_k(
 
             // Three word loads for the twelve bytes the old `l` loop read one
             // at a time. Unrolled in the same l = 0..3 order, so the f32
-            // accumulation order — and the result — is unchanged.
+            // accumulation *order* is unchanged.
+            //
+            // Not bit-identical everywhere, though: as `vec4` madds this appears
+            // to contract into FMA where the scalar form did not, so results can
+            // differ in the last bits. Measured against the previous kernel on the
+            // LM head (m=65536): max abs 2.0e-6, max rel 2.4e-3, cosine
+            // 1.0000000000, same argmax. For reference the CPU-vs-GPU gap on the
+            // same logits is 0.27 abs, five orders of magnitude larger.
             let w1 = rw(ql1);
             let w2 = rw(ql2);
             let wh = rw(qh);
