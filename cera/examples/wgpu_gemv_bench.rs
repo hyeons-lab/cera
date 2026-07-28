@@ -9,27 +9,55 @@
 //! Bandwidth is the right *unit* — a GEMV streams weights, so the roofline is
 //! bandwidth and GFLOP/s obscures how far off peak it is — but read the number
 //! as "how much of the roofline is being used", **not** as "this kernel is
-//! bandwidth-bound". Decode GEMVs here are frequently bound by something else:
-//!
-//! - `gemv_q4_k` was *instruction*-bound. It took the same wall time as the
-//!   dense f32 GEMV while moving 7x fewer bytes; unrolling its dequant loop was
-//!   worth 1.42x with no change in bytes moved.
-//! - At small `m` every kernel — including the dense f32 control — sits in a
-//!   per-dispatch overhead floor, so the bandwidth column there measures the
-//!   dispatch, not the kernel.
+//! bandwidth-bound". A quantized GEMV here can be instruction-bound: unrolling
+//! `gemv_q4_k`'s dequant loop was worth 1.42x with no change in bytes moved.
+//! (The stronger claim this doc used to make — that q4_k took the *same wall
+//! time* as the dense f32 GEMV while moving 7x fewer bytes — came from the
+//! positional bug described below and does not hold — q4_k is several times
+//! faster than the f32 GEMV at every shape measured since.)
 //!
 //! `BASELINE.md`'s "time tracks bytes" result (1.89x bytes -> 2.10x time) came
-//! from a Q8_0-vs-Q4_0 A/B. Those two are bandwidth-limited; it does not
-//! generalize across the family.
+//! from an in-model Q8_0-vs-Q4_0 A/B, and does not generalize across the family.
+//! It is also **currently unreconciled with this bench**, which makes q8_0 look
+//! substantially further behind q4_0 per byte than the in-model A/B's ~10%.
+//! Both cannot describe the same pair.
 //!
-//! Practical consequence: **ablate at large `m`** (65536), where the floor is
-//! amortized, and keep the f32 control in the table — it is what distinguishes a
-//! harness floor from a kernel defect.
+//! **This harness has three times reported kernel differences that were its own,
+//! and two of those reached `BASELINE.md` as published findings.**
+//!
+//! 1. A compute pass opened per iteration, charging a boundary to every
+//!    measurement (fixed in #321; see `run`).
+//! 2. A cell's number depending on its **position in the table** — whichever
+//!    kernel ran first looked ~3x slow. Published as an "FFN per-dispatch floor"
+//!    and as a q4_k-specific defect; neither was real (see the two-round loop in
+//!    `main`).
+//! 3. One blocking submit + `poll(Wait)` per measurement — a ~1.0-1.5 ms GPU
+//!    round trip — amortised over `ITERS` and never subtracted, so a cell read
+//!    `T + C/ITERS` (see the two-point timing in the cell body).
+//!
+//! All three are fixed. **Do not treat this bench's absolute numbers as
+//! authoritative until its variance has been characterised** — differencing two
+//! timings removes defect 3's bias at the cost of higher variance, and per-cell
+//! results do not yet replicate tightly. The durable guidance:
+//!
+//! - Prefer an **A/B within one process**, ABBA-ordered, over comparing absolute
+//!   numbers across runs. That is what the kernel-variant results in
+//!   `BASELINE.md` rest on, and why they survived all three defects.
+//! - Keep the **f32 control** in the table; it is what separates a harness
+//!   artifact from a kernel property.
+//! - Validate the instrument, not just the result: **permute the kernel order and
+//!   sweep `ITERS`** — a real difference survives both, and those two checks are
+//!   exactly what catch defects 2 and 3 respectively. Neither was found by reading
+//!   this file: defect 2 surfaced when a kernel rewrite failed to move the number
+//!   it targeted, defect 3 when the `ITERS` sweep was finally run during review.
 //!
 //! ```text
-//! cargo run --release --features gpu --example wgpu_gemv_bench
-//! ITERS=50 cargo run --release --features gpu --example wgpu_gemv_bench
+//! cargo run --release -p cera --features gpu --example wgpu_gemv_bench
+//! ITERS=1000 cargo run --release -p cera --features gpu --example wgpu_gemv_bench
 //! ```
+//!
+//! Cells that print `noise` had a two-point difference too small to resolve; raise
+//! `ITERS`. Take medians of >=3 runs, and permute the kernel order to confirm.
 
 use cera::backend::wgpu::{GpuContext, shaders};
 use cera::tensor::DType;
@@ -58,9 +86,10 @@ fn block_geom(dtype: DType) -> (usize, usize) {
         DType::Q8_0 => (32, 34),
         DType::Q4KM => (256, 144),
         DType::Q6K => (256, 210),
-        // Dense f32: the control. `gemv_f32` is the best-behaved kernel in the
-        // family (106 GB/s as `gemv_f16` in BASELINE.md), so if it shows the
-        // same per-dispatch floor the floor is the harness, not the kernel.
+        // Dense f32: the control, and the reason to keep it in the table. It is
+        // the best-behaved kernel here, by a wide margin at the LM-head shape, so
+        // when it moves with a quantized kernel the cause is the harness, not the
+        // kernel — which is how the positional bug in `main` was caught.
         DType::F32 => (1, 4),
         other => panic!("unsupported dtype {other:?}"),
     }
@@ -93,7 +122,10 @@ fn main() -> anyhow::Result<()> {
     let ctx = GpuContext::new()?;
     eprintln!("adapter: {} ({})", ctx.adapter_name, ctx.backend);
 
-    let iters = env_u32("ITERS", 50);
+    // 200, not 50: two-point timing differences two measurements, so the kernel
+    // work has to be large enough next to the fixed round trip for the difference
+    // to resolve. At 50 several cells per run came back unresolvable.
+    let iters = env_u32("ITERS", 200);
 
     // `M=..K=..` overrides the shape table with a single custom shape, for
     // sweeping one dimension while the other is held fixed.
@@ -160,93 +192,202 @@ fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(400.0);
 
-    for kern in kernels {
-        for &(m, k, label) in shapes {
-            let weight_bytes = synth_weights(kern.dtype, m as usize, k as usize);
-            let x: Vec<f32> = (0..k)
-                .map(|i| ((i * 13 + 7) % 251) as f32 * 0.01 - 1.25)
-                .collect();
+    // The whole table runs TWICE and only the second round is reported.
+    //
+    // A cell's number otherwise depends on where it sits in the table, and the
+    // per-cell `run(2)` warmup does not fix that. Measured: `q6_k` at ffn gate/up
+    // reports 0.0305 ms when its kernel runs last and 0.0952 ms when it runs
+    // first, and reversing the kernel order moves the penalty to whatever is now
+    // first — so it is positional, not a property of the kernel. q4_k was listed
+    // first, so it wore that penalty in every table this bench printed before
+    // this fix, which is how it came to be written up as ~3x slower than q4_0 at
+    // identical bytes/element. It is not.
+    //
+    // A 750 ms global clock-ramp warmup was tried first and measurably did NOT
+    // remove the effect, so the mechanism is not clock ramp and is still
+    // unidentified. A discarded first pass sidesteps it without needing the
+    // mechanism — by the time anything is reported, every cell has already run in
+    // full. So do not replace this with a cheaper-looking global warmup; that was
+    // measured and rejected.
+    //
+    // It is not fully fixed, only reduced: forward and reversed runs now agree
+    // within ~3-5% for most kernels, but one per run still moves by up to ~19%.
+    // The verification is a forward vs reversed kernel-order run — if a change
+    // here makes those disagree by more than that, it made things worse.
+    //
+    // Separately: one pipeline per kernel, built once. Each cell used to compile
+    // its own, so a 5x4 table cost 40 shader compiles across the two rounds and
+    // every measurement leaned on `run(2)` to absorb a fresh compile — one more
+    // uncontrolled per-cell variable in a harness whose residual positional
+    // effect is still unexplained.
+    let pipelines: Vec<wgpu::ComputePipeline> = kernels
+        .iter()
+        .map(|kern| ctx.create_pipeline(kern.shader, kern.entry, kern.entry))
+        .collect();
 
-            let a_buf = ctx.upload_storage(&weight_bytes, "A");
-            let x_buf = ctx.upload_f32(&x, "x");
-            let y_buf = ctx.create_storage_rw(u64::from(m) * 4, "y");
-            let params = [m, k, 0u32, 0u32];
-            let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+    for round in 0..2 {
+        for (kern, pipeline) in kernels.iter().zip(&pipelines) {
+            for &(m, k, label) in shapes {
+                let weight_bytes = synth_weights(kern.dtype, m as usize, k as usize);
+                let x: Vec<f32> = (0..k)
+                    .map(|i| ((i * 13 + 7) % 251) as f32 * 0.01 - 1.25)
+                    .collect();
 
-            let pipeline = ctx.create_pipeline(kern.shader, kern.entry, kern.entry);
-            let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &pipeline.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: a_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: x_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: y_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: params_buf.as_entire_binding(),
-                    },
-                ],
-            });
+                let a_buf = ctx.upload_storage(&weight_bytes, "A");
+                let x_buf = ctx.upload_f32(&x, "x");
+                let y_buf = ctx.create_storage_rw(u64::from(m) * 4, "y");
+                let params = [m, k, 0u32, 0u32];
+                let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
-            let groups = m.div_ceil(kern.rows_per_wg);
-            // All iterations share ONE compute pass. A pass boundary costs ~38 us
-            // on an M1 Max, so a pass per iteration charged that to every
-            // measurement — at FFN shapes (~0.05 ms of real work) it dominated and
-            // the kernel under test disappeared beneath it. It is why this bench
-            // used to report q4_0 at 53 GB/s for the LM-head shape where it
-            // actually sustains 113. Dispatches inside a pass still execute in
-            // order, so the dependency chain is unchanged.
-            //
-            // Rotating several output buffers was also tried, on the theory that
-            // identical repeated dispatches serialize write-after-write and turn
-            // this into a latency measurement. It changed nothing (13.2 -> 13.1
-            // GB/s at the FFN shape), so WAW is not what limits the small-m rows;
-            // not kept. Those rows are still well short of what production
-            // sustains for reasons not yet explained — treat the large-m row as
-            // the trustworthy one.
-            let run = |count: u32| {
-                let mut enc = ctx.device.create_command_encoder(&Default::default());
-                {
-                    let mut pass = enc.begin_compute_pass(&Default::default());
-                    pass.set_pipeline(&pipeline);
-                    pass.set_bind_group(0, &bg, &[]);
-                    for _ in 0..count {
-                        pass.dispatch_workgroups(groups, 1, 1);
+                let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &pipeline.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: a_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: x_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: y_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: params_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+
+                let groups = m.div_ceil(kern.rows_per_wg);
+                // All iterations share ONE compute pass. A pass per iteration charged
+                // a boundary to every measurement, which is why this bench used to
+                // report q4_0 at 53 GB/s for the LM-head shape where #321 then
+                // measured 113. Dispatches inside a pass still execute in order, so
+                // the dependency chain is unchanged.
+                //
+                // Deliberately no flat per-boundary cost quoted here. An earlier
+                // version of this comment asserted ~38 us, carried over from #318's
+                // conv-block result, and that does not survive its own example: at
+                // this shape #321 moved q4_0 from 53 to 113 GB/s, i.e. 37.7 MB in
+                // 712 us against 334 us, so the boundary it removed was worth
+                // ~378 us — an order of magnitude off 38. BASELINE.md retracts the
+                // generalization directly: a boundary in the attention path measured
+                // ~6 us. The cost is shape-dependent, not a constant of the machine.
+                //
+                // Both figures above are from the single-point timing this file has
+                // since replaced, so treat them as the order-of-magnitude argument
+                // they are and not as current measurements.
+                //
+                // Rotating several output buffers was also tried, on the theory that
+                // identical repeated dispatches serialize write-after-write and turn
+                // this into a latency measurement. It changed nothing, so WAW is not
+                // what limits the small-m rows; not kept.
+                //
+                // That experiment was chasing "the FFN rows read far below what
+                // production sustains", which was itself the positional bug the
+                // two-round loop in `main` now fixes — so treat its premise, and the
+                // ~13 GB/s FFN figures this comment used to quote, as withdrawn.
+                let run = |count: u32| {
+                    let mut enc = ctx.device.create_command_encoder(&Default::default());
+                    {
+                        let mut pass = enc.begin_compute_pass(&Default::default());
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, &bg, &[]);
+                        for _ in 0..count {
+                            pass.dispatch_workgroups(groups, 1, 1);
+                        }
                     }
+                    ctx.queue.submit(Some(enc.finish()));
+                    ctx.device.poll(wgpu::Maintain::Wait);
+                };
+
+                // First touch of this cell's freshly uploaded buffers. It no longer
+                // absorbs a shader compile — the pipelines are built once, above —
+                // and it cannot fix table position or the fixed round-trip cost;
+                // those are the two-round loop's and the two-point timing's jobs
+                // respectively. Keep it for the buffer warm-up alone.
+                run(2);
+
+                // Two-point timing: `run(n)` and `run(2n)` differ by exactly `n`
+                // dispatches, so the difference cancels every fixed per-measurement
+                // cost. Each `run` ends in one blocking submit + `poll(Wait)`, and a
+                // GPU round trip costs ~1.0-1.5 ms whatever it carries. Timing a
+                // single `run(iters)` and dividing buries that whole round trip in
+                // the per-iteration number.
+                //
+                // It is not a rounding error, and it is worst exactly where the
+                // kernel is cheapest: `q6_k` at ffn gate/up measured 46.0 / 63.6 /
+                // 79.3 GB/s at ITERS = 50 / 200 / 1000 under the old single-point
+                // timing. Fitting `per_iter = T + C/iters` to that gives C ~ 1.16 ms,
+                // i.e. one round trip. A table built that way is ITERS-dependent and
+                // silently compresses cheap shapes against expensive ones — the same
+                // artifact as the "per-dispatch floor" this file's history retracts.
+                let t_n = {
+                    let t0 = std::time::Instant::now();
+                    run(iters);
+                    t0.elapsed()
+                };
+                let t_2n = {
+                    let t0 = std::time::Instant::now();
+                    run(iters * 2);
+                    t0.elapsed()
+                };
+                // Saturating: under noise the difference can come out below zero,
+                // which would otherwise panic on `Duration` subtraction.
+                let per_iter = t_2n.saturating_sub(t_n).as_secs_f64() / f64::from(iters);
+
+                // Round 0 exists only to have run; nothing about it is reported.
+                if round == 0 {
+                    continue;
                 }
-                ctx.queue.submit(Some(enc.finish()));
-                ctx.device.poll(wgpu::Maintain::Wait);
-            };
 
-            run(2); // warmup: shader compile + clock ramp
-            let t0 = std::time::Instant::now();
-            run(iters);
-            let per_iter = t0.elapsed().as_secs_f64() / f64::from(iters);
+                // Reject cells whose two-point difference is not resolvable, rather
+                // than printing the reciprocal of noise as a measurement.
+                //
+                // `t_2n / t_n = (C + 2nT) / (C + nT)`: it tends to 2 when the kernel
+                // work `nT` dominates the fixed round trip `C`, and to 1 when `C`
+                // dominates. Near 1 the difference is mostly noise and `bytes /
+                // per_iter` explodes. This is not theoretical — at the old default of
+                // `ITERS=50`, `q4_k ffn down` printed **8927.9 GB/s, 2232% of an M1
+                // Max's 400**, sitting in the table looking like a result.
+                //
+                // Requiring a 1.2x growth means `nT` is at least roughly a quarter of
+                // `C`. The test is on the ratio, not on GB/s against `peak_gbs`,
+                // because a small weight buffer can legitimately exceed DRAM peak out
+                // of cache — so "above peak" is not by itself proof of nonsense,
+                // whereas "doubling the work did not lengthen the run" is.
+                //
+                // If cells come back `noise`, raise `ITERS`.
+                let resolvable = t_2n.as_secs_f64() >= t_n.as_secs_f64() * 1.2;
+                if per_iter <= 0.0 || !resolvable {
+                    println!(
+                        "{:<6} {:<14} {:>6} {:>6} {:>10} {:>10} {:>9}",
+                        kern.name, label, m, k, "noise", "noise", "noise"
+                    );
+                    continue;
+                }
 
-            let (be, bb) = block_geom(kern.dtype);
-            let bytes = f64::from(m) * f64::from(k) * (bb as f64 / be as f64);
-            let gbs = bytes / per_iter / 1e9;
-            println!(
-                "{:<6} {:<14} {:>6} {:>6} {:>10.4} {:>10.1} {:>8.1}%",
-                kern.name,
-                label,
-                m,
-                k,
-                per_iter * 1e3,
-                gbs,
-                100.0 * gbs / peak_gbs,
-            );
+                let (be, bb) = block_geom(kern.dtype);
+                let bytes = f64::from(m) * f64::from(k) * (bb as f64 / be as f64);
+                let gbs = bytes / per_iter / 1e9;
+                println!(
+                    "{:<6} {:<14} {:>6} {:>6} {:>10.4} {:>10.1} {:>8.1}%",
+                    kern.name,
+                    label,
+                    m,
+                    k,
+                    per_iter * 1e3,
+                    gbs,
+                    100.0 * gbs / peak_gbs,
+                );
+            }
         }
     }
+
     println!("\n* % of {peak_gbs} GB/s (override with PEAK_GBS)");
     Ok(())
 }
