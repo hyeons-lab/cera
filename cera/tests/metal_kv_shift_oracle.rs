@@ -47,8 +47,11 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
+mod common;
+
 use cera::backend::cpu::apply_rope_to_head;
-use cera::backend::metal::{KvShiftKParams, MetalContext, shaders};
+use cera::backend::metal::{KvShiftKParams, shaders};
+use common::metal_context;
 use half::f16;
 use metal::{Buffer, MTLSize};
 
@@ -74,7 +77,7 @@ fn read_f16_as_f32(buf: &Buffer, src_off_bytes: usize, count: usize) -> Vec<f32>
 
 #[test]
 fn kv_shift_k_kernel_matches_cpu_rope_oracle() {
-    let ctx = MetalContext::new().expect("Metal context");
+    let Some(ctx) = metal_context() else { return };
     let pipeline = ctx
         .create_pipeline(shaders::KV_SHIFT, "kv_shift_k_to_scratch")
         .expect("compile kv_shift_k_to_scratch");

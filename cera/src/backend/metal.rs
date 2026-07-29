@@ -186,6 +186,7 @@ pub mod shaders {
     pub const GEMV_F16: &str = include_str!("shaders/gemv_f16.metal");
     pub const GEMV_Q6_K: &str = include_str!("shaders/gemv_q6_k.metal");
     pub const GEMV_Q4_K: &str = include_str!("shaders/gemv_q4_k.metal");
+    pub const GEMV_Q5_K: &str = include_str!("shaders/gemv_q5_k.metal");
     pub const ELEMENTWISE: &str = include_str!("shaders/elementwise.metal");
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.metal");
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.metal");
@@ -205,6 +206,7 @@ pub mod shaders {
     pub const GEMM_Q4_1: &str = include_str!("shaders/gemm_q4_1.metal");
     pub const GEMV_Q4_1: &str = include_str!("shaders/gemv_q4_1.metal");
     pub const GEMM_Q4_K: &str = include_str!("shaders/gemm_q4_k.metal");
+    pub const GEMM_Q5_K: &str = include_str!("shaders/gemm_q5_k.metal");
     pub const GEMM_Q8_0: &str = include_str!("shaders/gemm_q8_0.metal");
     pub const GEMM_Q6_K: &str = include_str!("shaders/gemm_q6_k.metal");
     pub const GEMM_F32: &str = include_str!("shaders/gemm_f32.metal");
@@ -235,6 +237,18 @@ pub mod shaders {
 mod tests {
     use super::*;
 
+    /// `CERA_REQUIRE_METAL=1` makes a missing device a failure rather than a
+    /// pass, so the CI leg that targets known-capable hardware proves this ran.
+    /// Same skip-vs-fail convention as `CERA_REQUIRE_SIMD` / `CERA_REQUIRE_GPU`;
+    /// the integration suites get it from `tests/common::metal_context`, which a
+    /// library test cannot name.
+    fn require_metal(err: &anyhow::Error) {
+        assert!(
+            std::env::var("CERA_REQUIRE_METAL").as_deref() != Ok("1"),
+            "CERA_REQUIRE_METAL=1 but no Metal device is available ({err})"
+        );
+    }
+
     #[test]
     fn test_metal_context_init() {
         let ctx = MetalContext::new();
@@ -244,6 +258,7 @@ mod tests {
                 assert!(!ctx.device_name.is_empty());
             }
             Err(e) => {
+                require_metal(&e);
                 println!("No Metal device available: {e}");
             }
         }
@@ -253,7 +268,10 @@ mod tests {
     fn test_metal_buffer_roundtrip() {
         let ctx = match MetalContext::new() {
             Ok(ctx) => ctx,
-            Err(_) => return,
+            Err(e) => {
+                require_metal(&e);
+                return;
+            }
         };
         let data: Vec<f32> = (0..256).map(|i| i as f32 * 0.1).collect();
         let buf = ctx.upload_f32(&data);

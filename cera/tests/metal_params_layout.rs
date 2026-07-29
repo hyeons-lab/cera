@@ -123,6 +123,12 @@ fn cases() -> Vec<(usize, &'static str, &'static str, &'static str)> {
         ),
         (
             size_of::<QuantGemmParams>(),
+            shaders::GEMM_Q5_K,
+            "GemmParams",
+            "QuantGemmParams (q5_k)",
+        ),
+        (
+            size_of::<QuantGemmParams>(),
             shaders::GEMM_Q6_K,
             "GemmParams",
             "QuantGemmParams (q6_k)",
