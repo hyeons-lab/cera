@@ -17,8 +17,8 @@ cargo test -p cera -- <test_name>
 cargo test -p cera <module>::tests       # e.g. quant::tests, gguf::tests
 
 # CLI commands (working features)
-cargo run -p cera-cli -- inspect <path.gguf>
-cargo run -p cera-cli -- tokenize <path.gguf> "text"
+cargo run -p cera-cli -- inspect --model <path.gguf>
+cargo run -p cera-cli -- tokenize --model <path.gguf> --text "text"
 ```
 
 **Always run `cargo fmt` before committing.** CI enforces `cargo fmt --check` and will fail on unformatted code.
@@ -43,7 +43,7 @@ Both validate offsets with checked arithmetic (`checked_add`, `usize::try_from`)
 
 ### Tensor & Quantization (`tensor.rs`, `quant.rs`)
 
-`DType` enum covers dense types (F32, F16, BF16) and quantized types (Q4_0, Q4KM, Q8_0). Each quantized format has:
+`DType` enum covers dense types (F32, F16, BF16) and quantized types (Q4_0, Q4_1, Q4KM, Q5KM, Q8_0, Q6K) — the `Q4KM`/`Q5KM` names are historical; they map from the `Q4_K`/`Q5_K` *tensor* types, not the `_M` file types. Each quantized format has:
 - A block struct (e.g. `BlockQ4_0`, `BlockQ4KM`, `BlockQ8_0`)
 - `dequantize_*()` — block/row to f32
 - `vec_dot_*()` — dot product without full dequantization

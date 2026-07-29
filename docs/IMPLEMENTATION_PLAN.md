@@ -45,7 +45,7 @@ earlier "GPU is LFM2-only" limitation is gone (see #177/#192/#193/#194/#200).
 | V2.4 KV cache serialization (.lmkv) | ⬜ | |
 | V2.5 Prefix caching (radix) | ⬜ | |
 | V2.5b TurboQuant KV compression | ✅ | `cera/src/turboquant.rs` |
-| V2.6 More quant formats | 🟡 | Q4_1/Q5_K/Q6_K added; Q2/Q3, IQ, GPTQ, AWQ, FP8 remain |
+| V2.6 More quant formats | 🟡 | Tensor types Q4_1 and Q5_K added since V1 (Q5_K runs on CPU + wgpu + Metal); Q2_K/Q3_K, Q5_0/Q5_1, IQ, GPTQ, AWQ, FP8 remain |
 | V2.7 Per-shape kernel tuning | ⬜ | no `cera tune` / autotune |
 | V2.8 Speculative decoding | 🟡 | Prompt-lookup (n-gram) drafting shipped, CPU dense only; draft-model variant remains |
 | V2.9 LoRA adapters | ✅ | `cera/src/lora.rs`; runtime apply on CPU + Metal + wgpu; FFI/WASM |
@@ -349,8 +349,17 @@ Radix tree for in-memory prefix matching, LRU eviction, scheduler integration. 5
 ### V2.5b: TurboQuant KV Cache Compression — 1-2 weeks ✅ DONE
 Google Research's data-oblivious KV cache compression (ICLR 2026). Compresses KV cache to 3-3.5 bits with zero accuracy loss.
 
-### V2.6: More Quantization Formats — 1 week per format 🟡 PARTIAL (Q4_1, Q5_K, Q6_K added here; Q4_0/Q4_K_M/Q8_0 shipped in V1)
-Remaining: Q2_K, Q3_K, IQ quants, GPTQ, AWQ, FP8, in-situ quantization.
+### V2.6: More Quantization Formats — 1 week per format 🟡 PARTIAL
+Added since V1: the **Q4_1** (#280) and **Q5_K** (#246) tensor types. V1 already
+shipped Q4_0, Q8_0, Q4_K, and Q6_K — this document calls Q4_K by its file-type
+name `Q4_K_M` elsewhere, though the loader dispatches on the `Q4_K` tensor type.
+Q5_K runs on all three backends — CPU, wgpu, and Metal (`metal_lfm2.rs` wires
+`gemv_q5_k` / `gemm_q5_k`, added in #324).
+
+Remaining: Q2_K, Q3_K, Q5_0, Q5_1, IQ quants, GPTQ, AWQ, FP8, in-situ
+quantization. Q5_0/Q5_1 matter more than their obscurity suggests — llama.cpp
+falls back to them for tensors whose rows are not a multiple of 256, so they turn
+up inside otherwise-supported K-quant files.
 
 ### V2.7: Per-Shape Kernel Tuning (GEMV/MMVQ) — 1-2 weeks ⬜
 Profile-guided kernel optimization for quantized decode (batch=1 GEMV). Instead of using one-size-fits-all thread/block configs for all layers, profile each unique (quant_type, N, K) shape on the target GPU and apply optimal nwarps/rows_per_block at runtime. Inspired by [kernel-anvil](https://github.com/apollosenvy/kernel-anvil) which demonstrated 2.25x decode speedup on Qwen3.5-27B Q4_K_M (12→27 tok/s on RX 7900 XTX) by auto-tuning llama.cpp's MMVQ kernels per model shape. Key insight: a 1024-row GQA projection and a 17408-row FFN layer have very different optimal configs. The bottleneck classification (bandwidth-bound vs occupancy-limited vs compute-bound) determines the sweep strategy. For cera: implement shape-aware dispatch in wgpu compute shaders (WGSL workgroup size, rows per invocation) and optionally in CPU SIMD (loop tiling). Store per-model configs as JSON; profile on first run or via `cera tune` command.

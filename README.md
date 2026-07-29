@@ -70,9 +70,26 @@ available, falling back to CPU otherwise.
 
 ### Quantization
 
-Weights load in **Q4_0**, **Q4_1**, **Q8_0**, **Q6_K**, **Q4_K_M**, and
-**Q5_K_M**; dense **F32 / F16 / BF16** are also supported. Activations are
-dynamically quantized to Q8_0 for fast integer GEMV on CPU.
+Weights run in **Q4_0**, **Q4_1**, **Q8_0**, **Q4_K**, **Q5_K**, and **Q6_K**,
+plus dense **F32**. Activations are dynamically quantized to Q8_0 for fast
+integer GEMV on CPU.
+
+Those are GGML *tensor* types, and dispatch is per tensor — so what decides
+whether a file runs is the mix inside it, not its `Q4_K_M`-style label. K-quant
+downloads usually work, but the label is not a guarantee: llama.cpp substitutes
+Q5_0 / Q5_1 / IQ4_NL for tensors whose rows are not a multiple of 256, and cera
+has no kernel for those. `cera inspect --model <file>` lists the per-tensor types,
+and an unsupported one fails at weight resolution naming the tensor rather than
+failing anonymously — with the type name too, for the types cera knows about (an
+IQ type reports its numeric id).
+
+Backends are not uniform, so a file that runs on one may not run on another. On
+native Metal, Q4_1 works as a projection weight but not as `token_embd` /
+`output`; `--device auto` falls back to wgpu or CPU on its own, while
+`--device metal` reports the gap. F16/BF16
+tensors parse, and are dequantized on the LoRA, vision, and audio paths, but the
+transformer weight and token-embedding paths have no kernel for them — an
+F16-weight LLM is not a supported configuration.
 
 ## Language bindings
 
