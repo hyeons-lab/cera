@@ -770,9 +770,9 @@ impl MetalLfm2Model {
         // arm (or, pre-guard, be silently reinterpreted as f32) and produce garbage
         // logits. Reject it at load time rather than at the first decode.
         // `output_dtype` is the effective projection dtype for both the untied
-        // (`output.weight`) and tied (embedding) cases — note the per-row embedding
-        // *lookup* (`dequant_embedding_row`) supports more dtypes than this
-        // *projection*.
+        // (`output.weight`) and tied (embedding) cases. The per-row embedding
+        // *lookup* (`dequant_embedding_row`) and this *projection* now accept the
+        // same dtype set, so the two gates stay in lockstep.
         anyhow::ensure!(
             matches!(
                 output_dtype,

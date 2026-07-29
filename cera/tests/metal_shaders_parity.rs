@@ -603,7 +603,9 @@ fn test_gemv_q5_k() {
         enc.set_buffer(1, Some(&x_buf), 0);
         enc.set_buffer(2, Some(y_buf), 0);
         enc.set_buffer(3, Some(&p_buf), 0);
-        enc.dispatch_thread_groups(tg_size((m / 2) as u64), tg_size(32));
+        // NR = 2 rows per threadgroup -> ceil(m/2) groups so an odd m still
+        // covers the final row (truncating m/2 would silently drop it).
+        enc.dispatch_thread_groups(tg_size((m as u64).div_ceil(2)), tg_size(32));
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
