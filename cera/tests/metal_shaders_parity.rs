@@ -515,6 +515,114 @@ fn test_gemv_q6_k() {
     assert_close("gemv_q6_k", &y_ref, &y_gpu, 5e-3);
 }
 
+/// One `m` case of Q4_K GEMV parity vs the CPU `dequantize_q4_k_m_block`
+/// reference, exercising BOTH entry points (plain store and `_accum` add). `k`
+/// is fixed at 512 (2 super-blocks). `scales`/`qs` are on coprime strides so a
+/// wrong scale/min lane or a mis-split nibble cannot cancel out.
+fn run_gemv_q4_k(ctx: &MetalContext, m: u32) {
+    use cera::quant::{BlockQ4KM, dequantize_q4_k_m_block};
+    let k = 512u32; // = 2 super-blocks per row
+    let qk_k = 256usize;
+    let nb = k as usize / qk_k;
+
+    let mut raw = Vec::with_capacity(m as usize * nb * 144);
+    let mut expected_f32 = vec![0.0f32; m as usize * k as usize];
+    for row in 0..m as usize {
+        for b in 0..nb {
+            let mut blk = BlockQ4KM {
+                d: half::f16::from_f32(0.01 + (row as f32 * 0.003).sin() * 0.002).to_bits(),
+                dmin: half::f16::from_f32(0.004 + (row as f32 * 0.002).cos() * 0.001).to_bits(),
+                scales: [0u8; 12],
+                qs: [0u8; 128],
+            };
+            for i in 0..12 {
+                blk.scales[i] = ((row * 5 + b * 3 + i) & 0xFF) as u8;
+            }
+            for i in 0..128 {
+                blk.qs[i] = ((row * 37 + b * 13 + i) & 0xFF) as u8;
+            }
+            let dq = dequantize_q4_k_m_block(&blk);
+            let row_off = row * k as usize + b * qk_k;
+            expected_f32[row_off..row_off + qk_k].copy_from_slice(&dq);
+            // Serialize in `BlockQ4KM` field order: d, dmin, scales, qs.
+            raw.extend_from_slice(&blk.d.to_le_bytes());
+            raw.extend_from_slice(&blk.dmin.to_le_bytes());
+            raw.extend_from_slice(&blk.scales);
+            raw.extend_from_slice(&blk.qs);
+        }
+    }
+    raw.extend_from_slice(&[0u8; 16]); // safety pad
+
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.013).sin()).collect();
+
+    let mut y_ref = vec![0.0f32; m as usize];
+    for row in 0..m as usize {
+        let mut s = 0.0f32;
+        for i in 0..k as usize {
+            s += expected_f32[row * k as usize + i] * x[i];
+        }
+        y_ref[row] = s;
+    }
+
+    let a_buf = ctx.upload_bytes(&raw);
+    let x_buf = ctx.upload_f32(&x);
+    let p_buf = ctx.upload_bytes(bytemuck::cast_slice(&[m, k]));
+
+    let dispatch = |entry: &str, y_buf: &metal::Buffer| {
+        let pl = ctx.create_pipeline(shaders::GEMV_Q4_K, entry).unwrap();
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pl);
+        enc.set_buffer(0, Some(&a_buf), 0);
+        enc.set_buffer(1, Some(&x_buf), 0);
+        enc.set_buffer(2, Some(y_buf), 0);
+        enc.set_buffer(3, Some(&p_buf), 0);
+        // 4 rows/TG (NR=2 × NSG=2), 64 threads. ceil(m/4) groups so a ragged m
+        // still covers its final rows (the last TG clamps the overshoot).
+        enc.dispatch_thread_groups(tg_size((m as u64).div_ceil(4)), tg_size(64));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    };
+
+    // Scale the tolerance to the output magnitude, like `test_gemv_q5_k`: |y|
+    // reaches a few hundred here, where f32 reassociation between the kernel's
+    // simd_sum tree and the sequential CPU sum grows with magnitude. A real
+    // decode error (wrong scale/min lane, mis-split nibble) moves an element by
+    // order-1, far above this bound.
+    let scale = y_ref.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    assert!(scale > 0.0, "degenerate reference");
+    let tol = 1e-4 * scale;
+
+    let y_buf = ctx.create_buffer((m as u64) * 4);
+    dispatch("gemv_q4_k", &y_buf);
+    let y_gpu = ctx.read_f32(&y_buf, m as usize);
+    assert_close("gemv_q4_k", &y_ref, &y_gpu, tol);
+
+    // `_accum` differs only in `+=` vs `=`, but it drives the ffn_down residual
+    // path — seed the output so a plain store would fail it.
+    let seed: Vec<f32> = (0..m).map(|i| (i as f32 * 0.017).cos()).collect();
+    let y_acc = ctx.upload_f32(&seed);
+    dispatch("gemv_q4_k_accum", &y_acc);
+    let got = ctx.read_f32(&y_acc, m as usize);
+    let want: Vec<f32> = y_ref.iter().zip(&seed).map(|(a, b)| a + b).collect();
+    assert_close("gemv_q4_k_accum", &want, &got, tol);
+}
+
+/// Q4_K GEMV parity. The kernel is a port of llama.cpp's `mul_mv_q4_K_f32_impl`
+/// (uint16 loads, in-place low/high-nibble accumulation with 1/256 + 1/16
+/// correction factors, `dmin*min` bias hoisted through a running `sumy`). That
+/// rewrite from the old per-byte scalar kernel had no shader-level parity test —
+/// only the end-to-end prefill equivalence, which never exercises a
+/// decode-shaped GEMV. Covers a clean multi-TG `m` and a ragged one (not a
+/// multiple of NR*NSG=4) so the last-threadgroup row clamp/guard is executed.
+#[test]
+fn test_gemv_q4_k() {
+    let Some(ctx) = setup() else { return };
+    run_gemv_q4_k(&ctx, 512); // clean: 128 TGs × 2 simdgroups, every row valid
+    run_gemv_q4_k(&ctx, 510); // ragged: last TG's rows 510/511 clamped to m-1
+}
+
 /// Build `m` rows of synthetic Q5_K weights: the packed bytes as the shaders read
 /// them, plus the f32 values the CPU reference produces from the same blocks.
 ///
