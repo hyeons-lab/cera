@@ -75,6 +75,61 @@ pub struct LlamaModel {
     model_id: String,
 }
 
+/// Report — once per distinct reason — that the batched LM-head projection
+/// declined, so speculative verification is paying a per-position LM-head read
+/// again.
+///
+/// A free function, like the [`transformer::warn_unbatchable`] it is
+/// deliberately *not* sharing: it touches no model state, and the contrast is
+/// the point. That helper's message says prefill fell back to the per-token
+/// path, which is false here — the layers can all be batchable while only the
+/// head is not — and its dedupe set is process-global and keyed on dtype alone,
+/// so warning through it would permanently suppress the genuine whole-model
+/// prefill warning for that dtype, for every model loaded later in the process.
+///
+/// Keyed on the reason string rather than a dtype so a future second decline
+/// path could not be masked by the first. Bounded by construction: there is one
+/// call site today and the reason is formatted from model metadata fixed at
+/// load, so the set holds at most one entry per distinct head in the process.
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(feature = "blas")
+))]
+fn warn_lm_head_unbatched(reason: &str) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut guard = match SEEN.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(), // a poisoned warn-dedupe set must not kill inference
+    };
+    if !guard.iter().any(|s| s == reason) {
+        guard.push(reason.to_string());
+        tracing::warn!(
+            "batched LM-head projection declined ({reason}); speculative \
+             verification will re-read the output matrix once per verified \
+             position instead of once per round"
+        );
+    }
+}
+
+/// Force the batched LM-head projection to decline, for A/B measurement.
+///
+/// `CERA_LM_HEAD_NO_GEMM=1` puts the projection back on the per-row loop the
+/// GEMM replaced. Without it the "before" half of the A/B in
+/// `tests/spec_lm_head_bench.rs` can only be reproduced by hand-editing this
+/// file, which makes a headline perf number unfalsifiable the moment its author
+/// moves on. Same lever-for-measurement role as `CERA_CPU_TIER`.
+///
+/// Read once per process — this sits in the verification hot path.
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(feature = "blas")
+))]
+fn lm_head_gemm_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var("CERA_LM_HEAD_NO_GEMM").as_deref() == Ok("1"))
+}
+
 impl LlamaModel {
     /// Construct without a model identifier.
     #[allow(dead_code)]
@@ -252,7 +307,9 @@ impl LlamaModel {
 
             // `.with_repack` on the projection weights only: these are the ones
             // that hit the batched prefill GEMM at `n > 1`. token_embd / output
-            // are deliberately excluded (their prefill GEMM is `n = 1`).
+            // stay excluded, though no longer because the head runs at `n = 1` —
+            // see `WeightRef::with_repack` for why that reason expired and what
+            // would have to be measured to change this.
             layer_refs.push(LayerWeightRefs {
                 attn_q: transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_q.weight"))?
                     .with_repack(&gguf),
@@ -281,6 +338,60 @@ impl LlamaModel {
         } else {
             None
         };
+
+        // The LM head must be able to produce `vocab_size` logits from a
+        // `hidden_size` vector. Checked at load because every logit projection
+        // in this file trusts it in release: the GEMV kernels take their row
+        // count from the *output buffer* rather than from `wref.m` (see
+        // `gemm_preq`'s docs and `cpu::par_rows(y, ..)` in the SIMD kernels), so
+        // a head with fewer rows than `vocab_size` reads past the end of the
+        // weight on every decode step, not merely on the batched path. A
+        // mismatched `k` overruns the activation the same way. Neither is
+        // reachable on a well-formed GGUF; rejecting the file beats undefined
+        // behaviour that only shows up as plausible garbage.
+        {
+            let head = output_ref.as_ref().unwrap_or(&embd_ref);
+            let head_name = if output_ref.is_some() {
+                "output.weight"
+            } else {
+                "token_embd.weight"
+            };
+            ensure!(
+                head.k == config.hidden_size,
+                "LM head `{head_name}` has k={} but hidden_size is {}",
+                head.k,
+                config.hidden_size
+            );
+            ensure!(
+                head.m >= config.vocab_size,
+                "LM head `{head_name}` has {} rows, fewer than vocab_size {}",
+                head.m,
+                config.vocab_size
+            );
+            ensure!(
+                config.hidden_size.is_multiple_of(32),
+                "hidden_size {} is not a multiple of 32, which the Q8_0 \
+                 activation quantization on both logit paths requires",
+                config.hidden_size
+            );
+            // Both logit paths quantize the activation to Q8_0, whose blocks are
+            // 32 wide, so `hidden_size` must be a whole number of them. This is
+            // NOT a batched-path-only constraint and must not be a decline: the
+            // per-row `project_logits` fallback asserts the same thing one frame
+            // deeper — `quantize_to_scratch` on aarch64,
+            // `cpu::quantize_f32_to_q8_0_into` on the x86 int8 tiers, both hard
+            // `assert!`s — and where no int8 kernel runs at all the scalar GEMV
+            // truncates `k / 32` and mis-reads every row instead. No path
+            // tolerates it, so reject the file rather than defer to a fallback
+            // that will only fail later and worse.
+            //
+            // Checked rather than treated as implied by the dtype:
+            // `batched_gemm_supports` constrains `k` only for K-quants
+            // (`k % 256`), and GGUF validates a tensor's *total* element count
+            // against its block size rather than its per-row `k`, so a
+            // Q4_0/Q8_0 head with an unaligned `hidden_size` clears every other
+            // gate.
+        }
 
         // Llama-3 RoPE frequency scaling (`rope_scaling: llama3`): per-pair factors
         // that divide each rotation angle, applied by llama.cpp on every rope call.
@@ -464,6 +575,134 @@ impl LlamaModel {
         }
         transformer::oracle_dump::record("result_output", &logits);
         logits
+    }
+
+    /// Project `n` post-final-norm hidden states to logits in ONE GEMM, reading
+    /// the LM head once for all of them. Input is row-major `[n × hs]` (the
+    /// `forward_prefill_batched` hidden capture); output is row-major
+    /// `[n × vocab]`, the layout `spec::verify_draft` indexes by row.
+    ///
+    /// This exists for speculative decoding. Verifying `1 + k` drafted tokens in
+    /// one forward is supposed to amortize a single pass over the weights, but a
+    /// per-row `project_logits` loop re-streams `hidden_size × vocab` — the
+    /// largest tensor in the model — once per position, which gives most of that
+    /// back.
+    ///
+    /// A/B on Llama-3.2-1B-Q4_0 (M1 Max), interleaved in one binary via
+    /// `tests/spec_lm_head_bench.rs` — `CERA_LM_HEAD_NO_GEMM=1` runs the
+    /// "before" half — three rounds, comparing minima:
+    ///
+    /// | `n` | per-row | batched |
+    /// |-----|---------|---------|
+    /// | 2   | 19.5 ms | 19.0 ms |
+    /// | 4   | 31.6 ms | 25.4 ms |
+    /// | 7   | 57.2 ms | 42.3 ms |
+    /// | 9   | 67.3 ms | 53.6 ms |
+    ///
+    /// `n = 7` is the default `k = 6` draft: **~26% off a verification round**.
+    /// Least-squares over those four rows puts the marginal cost of one more
+    /// verified position at **~7.09 ms → ~5.05 ms**. (The benchmark prints its
+    /// own fit over medians, which runs a little higher — medians carry the
+    /// background load these minima exclude.)
+    ///
+    /// That ~2.04 ms/position is one LM-head read: despite the model's `Q4_0`
+    /// name its tied head (`token_embd.weight`) is stored **Q6_K**, so at
+    /// hs 2048 × vocab 128256 it is ~205 MiB — ~105 GB/s, well under this
+    /// machine's peak, so the read is a real bandwidth term rather than a
+    /// saturated one. What remains scales with `n` because it is per-token
+    /// arithmetic, not a second amortizable weight read. Absolute ms are
+    /// machine- and thermal-dependent; the ratio is the durable number.
+    ///
+    /// Returns `None` — leaving the caller on the per-row path — in exactly
+    /// three cases: the LM head's dtype has no batched kernel here;
+    /// `CERA_LM_HEAD_NO_GEMM=1` asked for the fallback; or `gemm_preq` reports
+    /// that nothing ran. The last is a release-build safety net rather than an
+    /// expected outcome, since it means the gate and the kernel table have
+    /// drifted, and `gemm_preq` trips a `debug_assert` on it first.
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(feature = "blas")
+    ))]
+    fn project_logits_batched(&self, hidden: &[f32], n: usize) -> Option<Vec<f32>> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let vocab = cfg.vocab_size;
+        // A tied head IS `token_embd.weight`; naming it that way keeps the
+        // warning below from sending an operator after an `output.weight` the
+        // GGUF does not contain.
+        let (head_name, out_ref) = match self.output_ref.as_ref() {
+            Some(r) => ("output.weight", r),
+            None => ("token_embd.weight", &self.embd_ref),
+        };
+        // `k == hs`, `m >= vocab`, and `hs % 32 == 0` are enforced at load
+        // (`from_gguf_with_id`), which is what lets the GEMM index the weight,
+        // the quantizer take whole Q8_0 blocks, and the transpose slice `vocab`
+        // rows, none of them re-checking here.
+        debug_assert_eq!(hidden.len(), n * hs, "hidden must be row-major [n * hs]");
+        debug_assert_eq!(out_ref.k, hs);
+        debug_assert!(out_ref.m >= vocab);
+        debug_assert!(hs.is_multiple_of(32));
+
+        if lm_head_gemm_disabled() {
+            return None; // CERA_LM_HEAD_NO_GEMM=1; asked for, so not a warning.
+        }
+        // The one decline that warns. Falling back is not *wrong* — the per-row
+        // path computes the same projection, to within f32 accumulation order —
+        // so no correctness test can see it, and the only symptom is the
+        // per-position LM-head read quietly coming back. That shape of silence
+        // is how this repo lost ~4x on CPU prefill and ~340x on GPU submits.
+        if !transformer::batched_gemm_supports(out_ref.dtype, hs) {
+            warn_lm_head_unbatched(&format!(
+                "`{head_name}` is {:?}, which has no batched GEMM kernel here",
+                out_ref.dtype
+            ));
+            return None;
+        }
+
+        // The GEMM's row count is the weight's, not `vocab`: an embedding table
+        // used as a tied LM head may carry padding rows beyond the vocabulary
+        // (see the `token_id < vocab_size` bound in `forward_prefill_batched`).
+        // Computing them and dropping them in the transpose below keeps this
+        // agreeing with `gemm_preq`'s `wref.m == m` contract; no shipping model
+        // pads enough for the wasted rows to matter. Asserted `>= vocab` above.
+        let rows = out_ref.m;
+
+        // Quantize the activations straight out of `hidden`. No transpose:
+        // `quantize_columns` exists to gather column `j` out of a column-major
+        // matrix, but a row-major `[n × hs]` capture already stores position
+        // `j`'s hidden vector contiguously at `hidden[j*hs..]` — which is
+        // precisely the column the gather would rebuild. Feeding the rows
+        // directly produces byte-identical `scales`/`quants` in the same packed
+        // `[n][hs/32]` / `[n][hs]` layout the int8 GEMM consumes.
+        let nb = hs / 32;
+        let mut bq_scales = vec![0.0f32; n * nb];
+        let mut bq_quants = vec![0i8; n * hs];
+        for j in 0..n {
+            cpu::quantize_f32_to_q8_0_into(
+                &hidden[j * hs..(j + 1) * hs],
+                &mut bq_scales[j * nb..(j + 1) * nb],
+                &mut bq_quants[j * hs..(j + 1) * hs],
+            );
+        }
+
+        let mut out = vec![0.0f32; rows * n];
+        if !transformer::gemm_preq(
+            &self.gguf, out_ref, &bq_scales, &bq_quants, &mut out, rows, n, hs,
+        ) {
+            return None;
+        }
+
+        // Column-major `[rows × n]` → the row-major `[n × vocab]` layout
+        // `verify_draft` slices by row, dropping any pad rows.
+        let mut logits = vec![0.0f32; n * vocab];
+        transformer::gemm_out_to_rows(&out, rows, n, vocab, &mut logits);
+
+        // Granite divides logits by `logits_scaling`; identity elsewhere. Applied
+        // over the whole buffer here, per row inside `project_logits`.
+        if cfg.scalars.logit != 1.0 {
+            cpu::scale_inplace(&mut logits, 1.0 / cfg.scalars.logit);
+        }
+        Some(logits)
     }
 
     /// Batched-GEMM CPU prefill for the dense transformer (mirrors LFM2's CPU
@@ -1421,9 +1660,9 @@ impl Model for LlamaModel {
         let n = tokens.len();
         let vocab = self.config.vocab_size;
 
-        // Fast path: one batched pass captures every token's post-final-norm
-        // hidden state, then project each row to logits. Reuses the tested
-        // batched-prefill KV append (same gate as `forward_prefill`). The
+        // One batched pass captures every token's post-final-norm hidden state,
+        // then the projection below turns all of them into logits. Reuses the
+        // tested batched-prefill KV append (same gate as `forward_prefill`). The
         // oracle-dump harness needs the per-token substep records, so defer to
         // the per-token path when it is active.
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
@@ -1432,21 +1671,23 @@ impl Model for LlamaModel {
             let mut hidden = Vec::new();
             let _ = self.forward_prefill_batched(tokens, start_pos, state, Some(&mut hidden));
             debug_assert_eq!(hidden.len(), n * hs, "hidden capture must be [n * hs]");
-            // KNOWN COST, deliberately left for a follow-up: this reads the LM
-            // head `n` times, once per `project_logits` GEMV. That partly works
-            // against the reason speculative decoding exists — verifying `1 + k`
-            // tokens in one forward is supposed to amortize the weight read, and
-            // the LM head is the single largest matrix in the model
-            // (`hidden_size x vocab`), so at k = 4-8 it is re-streamed 5-9x.
-            //
-            // The fix is the `quantize_columns` + `gemm_preq` pair used for every
-            // other projection in this file: one `[vocab x n] = [vocab x hs] *
-            // [hs x n]` GEMM. It is not a drop-in — `gemm_preq` is column-major
-            // in `n`, so it needs a transpose to the `[n x vocab]` row-major
-            // layout `verify_draft` indexes, plus the `batched_gemm_supports`
-            // dtype gate (a Q5_K LM head has no GEMM kernel) with this loop as
-            // the fallback. Worth doing with a benchmark behind it rather than
-            // bolted onto this phase.
+
+            // Projection, preferred form: one `[rows x n] = [rows x hs] * [hs x n]`
+            // GEMM, so the LM head is read once for all `n` positions instead
+            // of once each. It declines to the per-row loop below when the head's
+            // dtype has no batched kernel (a Q5_K head, or an x86 host below the
+            // AVX2 tier) — see `project_logits_batched` for the full list.
+            #[cfg(not(feature = "blas"))]
+            if let Some(logits) = self.project_logits_batched(&hidden, n) {
+                return logits;
+            }
+
+            // Per-row fallback. Also the `blas` path: `try_blas_prefill_gemm`
+            // dequantizes the whole `[m x k]` weight into scratch first, which
+            // for an LM head is `vocab x hidden_size` — ~1 GB of f32 on
+            // Llama-3.2-1B, against ~67 MB for the largest per-layer projection
+            // it is normally used for. Not worth a chunked variant until someone
+            // is actually speculating on a BLAS build.
             let mut logits = Vec::with_capacity(n * vocab);
             for j in 0..n {
                 let row = &hidden[j * hs..(j + 1) * hs];

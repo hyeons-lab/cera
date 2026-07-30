@@ -282,6 +282,7 @@ detected count, which both pools size from):
 | `CERA_SPIN` | 100000 | Spin iterations before an idle worker parks. |
 | `CERA_PIN` | on | `0` / `false` / `off` disables affinity pinning (for hosts that manage thread placement themselves). |
 | `CERA_CPU_TIER` | auto | Force a lower CPU SIMD tier (downgrade only) — for parity testing on capable hardware. |
+| `CERA_LM_HEAD_NO_GEMM` | unset | `1` puts the LM-head projection in `forward_prefill_logits_all` back on the per-row loop the batched GEMM replaced, so both halves of a speculative-decoding A/B run from one binary. Measurement lever only — both paths compute the same projection, to within f32 accumulation order. |
 
 Affinity pinning applies on Linux/Android with a detected heterogeneous
 topology; homogeneous hosts and macOS run unpinned.
