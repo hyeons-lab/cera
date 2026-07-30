@@ -12,7 +12,9 @@ using namespace metal;
 //   qs      — 128 bytes, 256 low-4-bit quants (bytes 48..176)
 //
 // Q5_K is Q4_K plus the `qh` plane, and shares its 6-bit scale/min packing
-// (`decode_q4km_scales`), so this is `gemv_q4_k.metal` with one extra term.
+// (`decode_q4km_scales`). This kernel is still the simple per-thread scalar
+// version; `gemv_q4_k.metal` has since been rewritten to the llama.cpp
+// uint16-load / 4-rows-per-TG kernel, so the two no longer share a structure.
 //
 // Dequant (per sub-block j in 0..4, l in 0..32):
 //   out[64j + l]      = d*sc[2j]   * ((qs[32j+l] & 0xF) + 16*bit(qh[l], 2j))   - dmin*mn[2j]
@@ -27,13 +29,11 @@ using namespace metal;
 // decodes that sub-block's scale/min, dots with x, then simd_sum reduces the row.
 // Dispatch: ceil(m/2) threadgroups × 32 threads.
 //
-// NR stays at 2 to match `gemv_q4_k`. That is inherited, not tuned here: the
-// widening to 4/8 was measured on the *wgpu* Q4_K twin and regressed there
-// (#316, 47.8 -> 45.9 -> 45.3 tok/s) — at m≈1024 the larger tile leaves too few
-// threadgroups to fill the GPU, and `x` stays cached, so the activation re-reads
-// a bigger tile would save never reach DRAM. Neither the backend nor the dtype
-// matches this kernel, so treat it as an untested default rather than a result;
-// Metal Q5_K has not been swept.
+// This is the un-ported layout. `gemv_q4_k` was moved to the llama.cpp
+// uint16-load / 4-rows-per-TG kernel and gained ~30% on Metal decode, so the
+// earlier "widening regressed on the wgpu twin (#316)" caution does *not* carry
+// over here — the obvious follow-up is to port Q5_K the same way (add the `qh`
+// term to `gemv_q4_k`'s inner loop). Metal Q5_K has not been swept.
 
 constant constexpr uint QK_K = 256;
 constant constexpr uint Q5K_BYTES = 176;
@@ -42,7 +42,8 @@ constant constexpr short NR = 2;
 struct Params { uint m; uint k; };
 
 // 6-bit sub-block scale / min unpack — port of `decode_q4km_scales` in quant.rs.
-// Identical to `gemv_q4_k.metal`: Q5_K reuses Q4_K's scale packing verbatim.
+// Q5_K reuses Q4_K's scale/min packing verbatim (the CPU `dequantize_q4_k_m_block`
+// and `dequantize_q5_k_block` share `decode_q4km_scales`).
 static inline uchar q5k_get_sc(device const uchar* s, uint sub) {
     return sub < 4 ? (s[sub] & 63u)
                    : ((s[sub + 4] & 0x0Fu) | ((s[sub - 4] >> 6) << 4));
