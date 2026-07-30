@@ -185,7 +185,7 @@ jobs:
       - name: Show Vulkan adapter
         run: vulkaninfo --summary || true
       - name: Run wgpu kernel + host-logic tests
-        run: cargo test -p cera --features gpu --lib --test wgpu_kv_shift_oracle
+        run: cargo test -p cera --features gpu --lib --test wgpu_kv_shift_oracle --test wgpu_mul_mat_parity
       # Model-backed GPU tests need a fixture, and until now no job had both a
       # GPU and a GGUF: this one has the adapter but fetched nothing, while
       # `parity` fetches fixtures and builds without `--features gpu`. So the

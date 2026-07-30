@@ -20,7 +20,7 @@ fn store_sa(tile_m: u32, tile_k: u32, value: f32) {
 }
 
 // Helpers for manual dequantization from u32-packed storage.
-#if defined(INIT_SRC0_SHMEM_Q4_0) || defined(INIT_SRC0_SHMEM_Q8_0) || defined(INIT_SRC0_SHMEM_Q6_K) || defined(INIT_SRC0_SHMEM_Q4_K)
+#if defined(INIT_SRC0_SHMEM_Q4_0) || defined(INIT_SRC0_SHMEM_Q8_0) || defined(INIT_SRC0_SHMEM_Q6_K) || defined(INIT_SRC0_SHMEM_Q4_K) || defined(INIT_SRC0_SHMEM_Q5_K)
 fn load_src0_u32_at(byte_offset: u32) -> u32 {
     let word_idx = byte_offset / 4u;
     let shift = (byte_offset & 3u) * 8u;
@@ -234,6 +234,76 @@ fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
             let sc = i32(sc_b << 24u) >> 24u;
 
             v = load_src0_f32_at(base + 208u) * f32(sc) * f32(q);
+        }
+        store_sa(tile_m, tile_k, v);
+    }
+}
+#endif
+
+#ifdef INIT_SRC0_SHMEM_Q5_K
+// Q5_K super-block: 256 elems / 176 B — d f16 @0, dmin f16 @2,
+// scales[12] (6-bit packed sub-scales + mins, identical to Q4_K) @4,
+// qh[32] (the 5th-bit plane) @16, qs[128] (low 4 bits) @48.
+//   out[64j + l]      = d*sc[2j]   * ((qs[32j+l] & 0xF) + fifth) - dmin*mn[2j]
+//   out[64j + l + 32] = d*sc[2j+1] * ((qs[32j+l] >> 4 ) + fifth) - dmin*mn[2j+1]
+// where `fifth` is 16 when the qh bit for that element is set, else 0 (the code
+// local `hi` below is a different thing: the bool high-nibble selector r>=32).
+// The qh plane is indexed by `l` (= y%32) alone — the same 32 bytes serve all `j`
+// sub-blocks, consuming bit `sub` (= 2j for the low nibble, 2j+1 for the high).
+// So this is the Q4_K loader with `qs` at byte 48 instead of 16 and the extra
+// `+fifth` term; the 6-bit scale/min unpack is byte-for-byte the same.
+// Inverting per output index y: j = y/64, r = y%64, low nibble and sub-block 2j
+// for r < 32, else the high nibble and 2j+1; l = y%32.
+const Q5K_BLOCK_SIZE = 256u;
+const Q5K_BLOCK_BYTES = 176u;
+
+// 6-bit sub-scale / min unpack — identical to `q4k_sc`/`q4k_mn`, redeclared here
+// because each pipeline compiles the template with exactly one loader define, so
+// the Q4_K helpers are not in scope for the Q5_K build.
+fn q5k_sc(sb_base: u32, sub: u32) -> u32 {
+    if (sub < 4u) {
+        return load_src0_byte_at(sb_base + sub) & 63u;
+    }
+    return (load_src0_byte_at(sb_base + sub + 4u) & 0x0Fu)
+        | ((load_src0_byte_at(sb_base + sub - 4u) >> 6u) << 4u);
+}
+
+fn q5k_mn(sb_base: u32, sub: u32) -> u32 {
+    if (sub < 4u) {
+        return load_src0_byte_at(sb_base + sub + 4u) & 63u;
+    }
+    return (load_src0_byte_at(sb_base + sub + 4u) >> 4u)
+        | ((load_src0_byte_at(sb_base + sub) >> 6u) << 4u);
+}
+
+fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
+    let blocks_k = (params.k + Q5K_BLOCK_SIZE - 1u) / Q5K_BLOCK_SIZE;
+
+    for (var i = thread_id; i < TILE_ROWS * TILE_K; i += TOTAL_WORKGROUP_SIZE) {
+        let tile_m = i / TILE_K;
+        let tile_k = i % TILE_K;
+        let global_m = offset_m + tile_m;
+        let global_k = k_outer + tile_k;
+
+        var v = 0.0;
+        if (global_m < params.m && global_k < params.k) {
+            let base = (global_m * blocks_k + global_k / Q5K_BLOCK_SIZE) * Q5K_BLOCK_BYTES;
+            let y = global_k % Q5K_BLOCK_SIZE;
+            let j = y / 64u;
+            let r = y % 64u;
+            let hi = r >= 32u;
+            let sub = 2u * j + select(0u, 1u, hi);
+            let l = y % 32u;
+            let sb_base = base + 4u;
+
+            let qb = load_src0_byte_at(base + 48u + 32u * j + l);
+            let nib = select(qb & 0x0Fu, qb >> 4u, hi);
+            // 5th bit: qh byte at base+16+l, bit `sub`; contributes +16 when set.
+            let qhb = load_src0_byte_at(base + 16u + l);
+            let fifth = f32(((qhb >> sub) & 1u) * 16u);
+
+            v = load_src0_f32_at(base) * f32(q5k_sc(sb_base, sub)) * (f32(nib) + fifth)
+                - load_src0_f32_at(base + 2u) * f32(q5k_mn(sb_base, sub));
         }
         store_sa(tile_m, tile_k, v);
     }
