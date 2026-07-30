@@ -234,6 +234,78 @@ jobs:
       - name: Check the GEMM microbenchmark compiles
         run: cargo check -p cera --features gpu --example wgpu_gemm_bench
 
+  # Metal kernels *executed*, not merely compiled.
+  #
+  # Nothing else in CI runs an MSL kernel. `metal` is not a default feature, so
+  # the `macos-latest` leg of `test` builds none of it. `cargo doc
+  # --all-features` compiles the metal-gated Rust and stops there, and the
+  # XCFramework job does run a binary — but its Swift smoke test exercises the
+  # FFI surface without loading a model, so it dispatches no kernel either. MSL
+  # is compiled at *runtime* through `new_library_with_source`, so a syntax or
+  # semantic error in a `.metal` shader is invisible to all of them; it surfaces
+  # when a kernel is first dispatched on a real device, i.e. in front of a user.
+  #
+  # Scope is the suites that build their inputs in-process and need no GGUF, so
+  # this leg stays network-free. The model-loading Metal parity tests each carry
+  # their own gate (`CERA_TEST_DOWNLOAD`, `CERA_LORA_METAL_PARITY`, a cached
+  # model under `$HOME`) and stay out of it.
+  #
+  # `CERA_REQUIRE_METAL=1` turns "no Metal device" into a hard failure for the
+  # suites that consult it — `metal_shaders_parity`, `metal_turboquant_oracle`,
+  # `metal_kv_shift_oracle`, i.e. everything here that dispatches a kernel — so
+  # those cannot report green on an empty test set. Mirrors `CERA_REQUIRE_GPU`
+  # above and `CERA_REQUIRE_SIMD`; the two device-touching `--lib` tests honour
+  # it too. `metal_params_layout` and `prefill_qpt_tests` are the only
+  # device-optional pieces here — they check struct layouts and a pure helper.
+  metal:
+    name: Metal kernels (macos)
+    needs: check
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      CERA_REQUIRE_METAL: 1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+      - uses: Swatinem/rust-cache@v2
+      # Filtered like the `simd-i8mm` leg: these are the only `metal`-gated
+      # unit tests in the library, and an unfiltered `--lib` would re-run the
+      # whole crate suite that `test (macos-latest)` already covers.
+      #
+      # libtest exits 0 when a filter matches nothing, so renaming either module
+      # would turn this step into a silent no-op. Assert the count first — same
+      # exhaustive-check discipline as the Android ABI `readelf` assertion and
+      # the XCFramework slice verification.
+      - name: Metal-gated unit tests
+        run: |
+          set -euo pipefail
+          FILTERS="metal::tests:: prefill_qpt_tests::"
+          # shellcheck disable=SC2086
+          # `|| true`: grep -c exits 1 on zero matches, which under `set -e`
+          # would abort here — precisely in the case this check exists to
+          # report, and before the annotation below could explain why.
+          COUNT=$(cargo test -p cera --features metal --lib -- --list $FILTERS \
+                  | grep -c ': test$' || true)
+          if [ "$COUNT" -ne 3 ]; then
+            echo "::error::expected 3 metal-gated lib tests, found $COUNT — did a module get renamed? Update the filters in this job." >&2
+            exit 1
+          fi
+          # `--nocapture` so `test_metal_context_init`'s device name reaches the
+          # log: every sibling hardware leg identifies its device (gpu-tests
+          # prints the Vulkan adapter, simd-i8mm the CPU tier), and this is the
+          # leg whose whole premise is that the kernels ran on real silicon.
+          # shellcheck disable=SC2086
+          cargo test -p cera --features metal --lib -- --nocapture $FILTERS
+      - name: Shader suites (dispatch real kernels)
+        run: |
+          cargo test -p cera --features metal --no-fail-fast \
+            --test metal_shaders_parity \
+            --test metal_turboquant_oracle \
+            --test metal_kv_shift_oracle \
+            --test metal_params_layout
+
   build-release:
     name: Release Build
     needs: check

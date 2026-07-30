@@ -29,6 +29,9 @@
 
 #![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 
+mod common;
+use common::metal_context as context;
+
 use cera::backend::metal::{MetalContext, MetalParams, TqAttnParams, TqParams, shaders};
 use cera::model::metal_turboquant::{TQ_ATTN_THREADS, TQ_THREADS, TqMetalCache, TqMode};
 use cera::model::{BlockType, ModelConfig, ScalarMultipliers};
@@ -763,16 +766,6 @@ fn assert_close(got: f32, want: f32, what: &str) {
         diff < TOL,
         "{what}: got={got} want={want} diff={diff} (tol={TOL})"
     );
-}
-
-fn context() -> Option<MetalContext> {
-    match MetalContext::new() {
-        Ok(ctx) => Some(ctx),
-        Err(e) => {
-            eprintln!("skipping: no Metal device ({e})");
-            None
-        }
-    }
 }
 
 #[test]

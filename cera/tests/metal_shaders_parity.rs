@@ -5,7 +5,10 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
+mod common;
+
 use cera::backend::metal::{KvShiftKParams, MetalContext, QkNormRopeParams, shaders};
+use common::metal_context as setup;
 use metal::MTLSize;
 
 fn tg_size(w: u64) -> MTLSize {
@@ -14,10 +17,6 @@ fn tg_size(w: u64) -> MTLSize {
         height: 1,
         depth: 1,
     }
-}
-
-fn setup() -> Option<MetalContext> {
-    MetalContext::new().ok()
 }
 
 fn assert_close(name: &str, a: &[f32], b: &[f32], tol: f32) {
@@ -514,6 +513,212 @@ fn test_gemv_q6_k() {
     cb.wait_until_completed();
     let y_gpu = ctx.read_f32(&y_buf, m as usize);
     assert_close("gemv_q6_k", &y_ref, &y_gpu, 5e-3);
+}
+
+/// Build `m` rows of synthetic Q5_K weights: the packed bytes as the shaders read
+/// them, plus the f32 values the CPU reference produces from the same blocks.
+///
+/// Shared by the GEMV and GEMM tests so both are provably pinned to identical
+/// inputs. The `qh` / `scales` / `qs` strides are mutually coprime so every one
+/// of the 8 `qh` bits is exercised and a wrong bit selector cannot cancel out
+/// against a wrong base index.
+fn synth_q5_k_rows(m: u32, nb: usize) -> (Vec<u8>, Vec<f32>) {
+    use cera::quant::{BlockQ5K, dequantize_q5_k_block};
+    let qk_k = 256usize;
+    let mut raw = Vec::with_capacity(m as usize * nb * 176);
+    let mut w_f32 = vec![0.0f32; m as usize * nb * qk_k];
+    for row in 0..m as usize {
+        for b in 0..nb {
+            let mut blk = BlockQ5K {
+                d: half::f16::from_f32(0.01 + (row as f32 * 0.003).sin() * 0.002).to_bits(),
+                dmin: half::f16::from_f32(0.004 + (row as f32 * 0.002).cos() * 0.001).to_bits(),
+                scales: [0u8; 12],
+                qh: [0u8; 32],
+                qs: [0u8; 128],
+            };
+            for i in 0..12 {
+                blk.scales[i] = ((row * 5 + b * 3 + i) & 0xFF) as u8;
+            }
+            for i in 0..32 {
+                blk.qh[i] = ((row * 11 + b * 7 + i) & 0xFF) as u8;
+            }
+            for i in 0..128 {
+                blk.qs[i] = ((row * 37 + b * 13 + i) & 0xFF) as u8;
+            }
+            let dq = dequantize_q5_k_block(&blk);
+            let off = (row * nb + b) * qk_k;
+            w_f32[off..off + qk_k].copy_from_slice(&dq);
+            // Serialize in `BlockQ5K` field order — d/dmin lead here, unlike Q6_K
+            // where `d` trails the quants.
+            raw.extend_from_slice(&blk.d.to_le_bytes());
+            raw.extend_from_slice(&blk.dmin.to_le_bytes());
+            raw.extend_from_slice(&blk.scales);
+            raw.extend_from_slice(&blk.qh);
+            raw.extend_from_slice(&blk.qs);
+        }
+    }
+    raw.extend_from_slice(&[0u8; 16]); // safety pad
+    (raw, w_f32)
+}
+
+/// Q5_K GEMV parity against the CPU `dequantize_q5_k_block` reference.
+///
+/// Q5_K is Q4_K plus the `qh` high-bit plane, and the plane is the whole risk in
+/// the kernel: `qh` is indexed by `l` alone (the same 32 bytes serve all four
+/// sub-block iterations, consuming bit pairs `2j`/`2j+1`), where every other
+/// field is indexed by `32j + l`. `synth_q5_k_rows` keeps `qh` dense and
+/// non-uniform so a wrong shift or a wrong base index cannot cancel out.
+#[test]
+fn test_gemv_q5_k() {
+    let Some(ctx) = setup() else { return };
+    let m = 512u32;
+    let k = 512u32; // = 2 super-blocks per row
+    let qk_k = 256usize;
+    let nb = k as usize / qk_k;
+
+    let (raw, expected_f32) = synth_q5_k_rows(m, nb);
+
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.013).sin()).collect();
+
+    let mut y_ref = vec![0.0f32; m as usize];
+    for row in 0..m as usize {
+        let mut s = 0.0f32;
+        for i in 0..k as usize {
+            s += expected_f32[row * k as usize + i] * x[i];
+        }
+        y_ref[row] = s;
+    }
+
+    let a_buf = ctx.upload_bytes(&raw);
+    let x_buf = ctx.upload_f32(&x);
+    let p_buf = ctx.upload_bytes(bytemuck::cast_slice(&[m, k]));
+
+    // NR = 2 rows per threadgroup, 32 threads (one simdgroup).
+    let dispatch = |entry: &str, y_buf: &metal::Buffer| {
+        let pl = ctx.create_pipeline(shaders::GEMV_Q5_K, entry).unwrap();
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pl);
+        enc.set_buffer(0, Some(&a_buf), 0);
+        enc.set_buffer(1, Some(&x_buf), 0);
+        enc.set_buffer(2, Some(y_buf), 0);
+        enc.set_buffer(3, Some(&p_buf), 0);
+        // NR = 2 rows per threadgroup -> ceil(m/2) groups so an odd m still
+        // covers the final row (truncating m/2 would silently drop it).
+        enc.dispatch_thread_groups(tg_size((m as u64).div_ceil(2)), tg_size(32));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    };
+
+    // Scaled to the output magnitude, as `test_gemm_q5_k` is: |y| reaches ~1e3
+    // here, where f32 reassociation between the kernel's simd_sum tree and the
+    // sequential CPU sum is already ~1e-3, so an absolute 5e-3 would leave only
+    // a few x of headroom. A wrong `qh` bit moves an element by 16*scale, which
+    // is orders above this bound either way.
+    let scale = y_ref.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    assert!(scale > 0.0, "degenerate reference");
+    let tol = 1e-4 * scale;
+
+    let y_buf = ctx.create_buffer((m as u64) * 4);
+    dispatch("gemv_q5_k", &y_buf);
+    let y_gpu = ctx.read_f32(&y_buf, m as usize);
+    assert_close("gemv_q5_k", &y_ref, &y_gpu, tol);
+
+    // The `_accum` variant differs only in `+=` vs `=`, but it is what the
+    // ffn_down residual path uses — seed the output so a plain store would fail.
+    let seed: Vec<f32> = (0..m).map(|i| (i as f32 * 0.017).cos()).collect();
+    let y_acc = ctx.upload_f32(&seed);
+    dispatch("gemv_q5_k_accum", &y_acc);
+    let got = ctx.read_f32(&y_acc, m as usize);
+    let want: Vec<f32> = y_ref.iter().zip(&seed).map(|(a, b)| a + b).collect();
+    assert_close("gemv_q5_k_accum", &want, &got, tol);
+}
+
+/// Batched Q5_K GEMM parity against the CPU `dequantize_q5_k_block` reference.
+///
+/// Unlike the GEMV, this kernel rounds dequantized weights to `half` before the
+/// simdgroup matmul, so it is equal to the f32 reference only within f16
+/// tolerance — the bound below is relative to the output scale for that reason,
+/// not absolute. That is loose enough to pass f16 rounding and still tight
+/// enough that any `qh`/scale/stride decode error fails it: a wrong high bit
+/// shifts an element by `16 * dl`, which is order-of-magnitude, not 1e-3.
+///
+/// Both output paths are covered. m=64/n=32 fills one tile exactly and takes the
+/// `simdgroup_store` fast path; m=68/n=20 is ragged on both axes and takes the
+/// threadgroup-bounce path, which has its own indexing.
+///
+/// The ragged `m` is 68, not an arbitrary 70, because the bounce path casts
+/// `dst + col * y_stride` to `device float4`, which needs `y_stride % 4 == 0`.
+/// 70 leaves every odd column 8-byte aligned, and a misaligned vector access is
+/// undefined in MSL — a failure there would read as a kernel bug when it was
+/// really a test-geometry choice. Whether every production `y_stride` satisfies
+/// that is *not* asserted anywhere (they are model-config-derived: `3*hs`,
+/// `q_dim`, `kv_dim`, …), so this is an untested precondition of the bounce
+/// path rather than an established property.
+#[test]
+fn test_gemm_q5_k() {
+    let Some(ctx) = setup() else { return };
+    let k = 512u32; // 2 super-blocks per row
+    let qk_k = 256usize;
+    let nb = k as usize / qk_k;
+
+    for &(m, n) in &[(64u32, 32u32), (68u32, 20u32)] {
+        let (raw, w_f32) = synth_q5_k_rows(m, nb);
+
+        // src1 is [n, k] row-major with stride `x_stride`; dst is indexed
+        // `row + col * y_stride`.
+        let x: Vec<f32> = (0..n as usize * k as usize)
+            .map(|i| (i as f32 * 0.011).sin() * 0.05)
+            .collect();
+        let mut y_ref = vec![0.0f32; n as usize * m as usize];
+        for col in 0..n as usize {
+            for row in 0..m as usize {
+                let mut s = 0.0f32;
+                for i in 0..k as usize {
+                    s += w_f32[row * k as usize + i] * x[col * k as usize + i];
+                }
+                y_ref[row + col * m as usize] = s;
+            }
+        }
+
+        let a_buf = ctx.upload_bytes(&raw);
+        let x_buf = ctx.upload_f32(&x);
+        let y_buf = ctx.create_buffer((n as u64) * (m as u64) * 4);
+        let p_buf = ctx.upload_bytes(bytemuck::cast_slice(&[m, k, n, k, m, 0u32]));
+        let pl = ctx
+            .create_pipeline(shaders::GEMM_Q5_K, "gemm_q5_k")
+            .unwrap();
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pl);
+        enc.set_buffer(0, Some(&a_buf), 0);
+        enc.set_buffer(1, Some(&x_buf), 0);
+        enc.set_buffer(2, Some(&y_buf), 0);
+        enc.set_buffer(3, Some(&p_buf), 0);
+        enc.set_threadgroup_memory_length(0, 8192);
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: n.div_ceil(32) as u64,
+                height: m.div_ceil(64) as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let y_gpu = ctx.read_f32(&y_buf, n as usize * m as usize);
+
+        let scale = y_ref.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let tol = 5e-3 * scale;
+        assert!(scale > 0.0, "degenerate reference for {m}x{n}");
+        assert_close(&format!("gemm_q5_k {m}x{n}"), &y_ref, &y_gpu, tol);
+    }
 }
 
 /// Fast Q4_0 GEMV (llama.cpp-style) parity vs classic gemv_q4_0.
