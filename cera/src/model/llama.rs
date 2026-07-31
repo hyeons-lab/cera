@@ -26,6 +26,13 @@ use crate::kv_cache::InferenceState;
 use crate::kv_cache::LayerState;
 use crate::model::transformer::{self, AttnDims, AttnExtras, AttnWeights, FfnWeights, WeightRef};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
+// Only the batched-LM-head warning path names `DType` unqualified; every other
+// reference is fully qualified. Gate the import to that path so `--features blas`
+// and non-int8 targets do not see it as unused under clippy's `-D warnings`.
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(feature = "blas")
+))]
 use crate::tensor::DType;
 
 // ── Per-layer weight references ─────────────────────────────────────────────
