@@ -317,8 +317,17 @@ fn greedy_spec_matches_greedy_exactly() {
 /// prompt/config. Both drive the identical forward sequence (monolithic prefill
 /// via `ubatch_size = 0`, then the shared `verify_draft` accept/truncate loop),
 /// so equality is exact — this pins the `Session` layer (emit/flush, stop
-/// policy, `truncate_to` on partial accept, `current_pos` bookkeeping) against
+/// policy, `truncate_kv` on partial accept, `current_pos` bookkeeping) against
 /// the tested core, catching any drift the core's own oracle can't see.
+///
+/// Note what it does *not* pin: the `Session`'s partial-accept `truncate_kv`
+/// call. That line can be deleted with this test still green. Reaching it means
+/// the emit loop broke, so the generate loop breaks a few statements later
+/// without anything reading `seq_len` or the KV again, and `current_pos` is
+/// assigned from `old + 1 + kept` independently of the rewind. Catching it would
+/// take a second `generate` on the same session whose budget landed strictly
+/// inside an accepted run; the stub-model guards in `spec::tests` cannot build a
+/// `Session` at all. Left uncovered deliberately, and noted at the call site.
 #[test]
 #[ignore = "needs a real dense GGUF; set CERA_DENSE_MODEL"]
 fn session_spec_matches_standalone_driver() {

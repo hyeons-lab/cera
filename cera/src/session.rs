@@ -2138,7 +2138,7 @@ impl Session {
                 }
                 // Same stop semantics as the guaranteed token and the normal
                 // loop: a stop token is not streamed or counted, and `kept`
-                // excludes it so the `truncate_to` below drops its KV cell.
+                // excludes it so the rewind below drops its KV cell.
                 if is_stop(q) {
                     finish = FinishReason::Stop;
                     stopped = true;
@@ -2149,7 +2149,10 @@ impl Session {
                 kept += 1;
             }
             if kept < vr.accepted.len() {
-                self.state.truncate_to(old + 1 + kept);
+                // `truncate_kv`, not `state.truncate_to`: see the trait method.
+                // No test covers this line; the reason is recorded on
+                // `session_spec_matches_standalone_driver`.
+                self.model.truncate_kv(&mut self.state, old + 1 + kept);
             }
             self.current_pos = old + 1 + kept;
             // Publish progress per round (not just once at the end) so external
