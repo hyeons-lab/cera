@@ -410,9 +410,12 @@ const FLOOR_Q4_K: f32 = 0.999; // Q4_K repack: mins-only correction (~0.9996)
 #[ignore]
 fn llama_batched_prefill_parity_llama3() {
     // Llama-3.2-1B: arch "llama", NORM RoPE with Llama-3 `rope_freqs` factors.
-    // The Q8_0 build is used (fully supported); the repo's `Llama-3.2-1B-Q4_0`
-    // GGUF carries Q4_1 ffn_down layers in blocks 0/1, a dtype cera can't
-    // dequantize, so neither the batched nor the per-token path can run it.
+    // The Q8_0 build is used: it is the fully-supported one and holds
+    // `FLOOR_TIGHT`. (The repo's `Llama-3.2-1B-Q4_0` GGUF carries Q4_1
+    // `ffn_down` layers in blocks 0/1, which was the stated reason it could not
+    // be used here. That was true when written, before #280 added Q4_1 to the
+    // per-token path and #296 to the batched one. So if a Q4_0-side fixture is
+    // ever wanted, Q4_1 is no longer what blocks it.)
     check_both(
         "target/oracle/models/Llama-3.2-1B-Instruct-Q8_0.gguf",
         FLOOR_TIGHT,
