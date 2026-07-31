@@ -217,6 +217,10 @@ fn lm_head_gate(gguf: &cera::gguf::GgufFile, hidden_size: usize) -> (bool, Strin
 /// narrowing to a module would bake a test's expectation into where the warning
 /// happens to live. `tests/unbatchable_warning.rs` predates this and carries its
 /// own x86-only copy; new callers should use this one.
+///
+/// The level filter is pinned by `warn_capture_keeps_warn_and_error_only` in
+/// `tests/spec_lm_head_bench.rs`, because `tracing::Level`'s ordering is by
+/// verbosity and so reads backwards: `ERROR` is the *smallest* level.
 #[derive(Clone, Default)]
 pub struct WarnCapture(pub std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 

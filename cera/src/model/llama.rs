@@ -26,6 +26,7 @@ use crate::kv_cache::InferenceState;
 use crate::kv_cache::LayerState;
 use crate::model::transformer::{self, AttnDims, AttnExtras, AttnWeights, FfnWeights, WeightRef};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
+use crate::tensor::DType;
 
 // ── Per-layer weight references ─────────────────────────────────────────────
 
@@ -75,9 +76,9 @@ pub struct LlamaModel {
     model_id: String,
 }
 
-/// Report — once per distinct reason — that the batched LM-head projection
-/// declined, so speculative verification is paying a per-position LM-head read
-/// again.
+/// Report, once per distinct `(head, dtype)`, that the batched LM-head
+/// projection declined, so speculative verification is paying a per-position
+/// LM-head read again.
 ///
 /// A free function, like the [`transformer::warn_unbatchable`] it is
 /// deliberately *not* sharing: it touches no model state, and the contrast is
@@ -87,27 +88,36 @@ pub struct LlamaModel {
 /// so warning through it would permanently suppress the genuine whole-model
 /// prefill warning for that dtype, for every model loaded later in the process.
 ///
-/// Keyed on the reason string rather than a dtype so a future second decline
-/// path could not be masked by the first. Bounded by construction: there is one
-/// call site today and the reason is formatted from model metadata fixed at
-/// load, so the set holds at most one entry per distinct head in the process.
+/// Keyed on `(head, dtype)`, and taking those unformatted rather than a built
+/// message, so the dedupe compares the values themselves instead of prose about
+/// them. The caller reaches this once per verification round for as long as the
+/// model is loaded, and every call after the first reports a decline already
+/// reported, so there is no reason to build a string to throw away. Both fields
+/// come from model metadata fixed at load, so `SEEN` holds one entry per
+/// distinct `(head, dtype)` pair, however many models load.
+///
+/// One call site today. A second decline path for the same head and dtype would
+/// be masked by the first and should pass its own discriminator rather than rely
+/// on the message text differing.
 #[cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
     not(feature = "blas")
 ))]
-fn warn_lm_head_unbatched(reason: &str) {
+fn warn_lm_head_unbatched(head: &str, dtype: DType) {
     use std::sync::Mutex;
-    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    // A Vec, not a HashSet: `DType` is not `Hash`, and the set is tiny. Same
+    // reasoning as `transformer::warn_unbatchable`.
+    static SEEN: Mutex<Vec<(String, DType)>> = Mutex::new(Vec::new());
     let mut guard = match SEEN.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(), // a poisoned warn-dedupe set must not kill inference
     };
-    if !guard.iter().any(|s| s == reason) {
-        guard.push(reason.to_string());
+    if !guard.iter().any(|(h, d)| h == head && *d == dtype) {
+        guard.push((head.to_string(), dtype));
         tracing::warn!(
-            "batched LM-head projection declined ({reason}); speculative \
-             verification will re-read the output matrix once per verified \
-             position instead of once per round"
+            "batched LM-head projection declined (`{head}` is {dtype:?}, which has \
+             no batched GEMM kernel here); speculative verification will re-read \
+             the output matrix once per verified position instead of once per round"
         );
     }
 }
@@ -652,10 +662,7 @@ impl LlamaModel {
         // per-position LM-head read quietly coming back. That shape of silence
         // is how this repo lost ~4x on CPU prefill and ~340x on GPU submits.
         if !transformer::batched_gemm_supports(out_ref.dtype, hs) {
-            warn_lm_head_unbatched(&format!(
-                "`{head_name}` is {:?}, which has no batched GEMM kernel here",
-                out_ref.dtype
-            ));
+            warn_lm_head_unbatched(head_name, out_ref.dtype);
             return None;
         }
 

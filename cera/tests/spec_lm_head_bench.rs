@@ -235,3 +235,44 @@ fn lm_head_cost_vs_verification_batch() {
          the same machine — see the module docs."
     );
 }
+
+/// `WarnCapture`'s level filter keeps WARN and ERROR and drops everything more
+/// verbose.
+///
+/// Worth pinning because the predicate reads backwards. `tracing::Level` orders
+/// by *verbosity*, so `TRACE > DEBUG > INFO > WARN > ERROR` (`tracing_core`
+/// inverts the comparison in its `impl Ord`), and `level > Level::WARN`
+/// therefore selects the chatty end, not the severe one. Inverting it would turn
+/// the benchmark's fallback self-check into either a pass that ignores a real
+/// decline warning or a failure on any stray `info!`.
+///
+/// This test needs no model, so unlike the benchmark beside it, it is not
+/// `#[ignore]`d and does run in the default `cargo test --workspace`.
+#[test]
+fn warn_capture_keeps_warn_and_error_only() {
+    let warns = WarnCapture::default();
+    {
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warns.clone()));
+        tracing::error!("kept-error");
+        tracing::warn!("kept-warn");
+        tracing::info!("dropped-info");
+        tracing::debug!("dropped-debug");
+        tracing::trace!("dropped-trace");
+    }
+
+    let got = warns.messages();
+    assert_eq!(
+        got.len(),
+        2,
+        "expected exactly the ERROR and WARN events, got {got:?}"
+    );
+    assert!(
+        got.iter().any(|m| m.contains("kept-error")),
+        "ERROR was dropped, so the level comparison is inverted: {got:?}"
+    );
+    assert!(
+        got.iter().any(|m| m.contains("kept-warn")),
+        "WARN was dropped: {got:?}"
+    );
+}

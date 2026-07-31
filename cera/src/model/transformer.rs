@@ -652,7 +652,7 @@ fn report_uncomputed_gemm(dtype: DType, k: usize) {
 pub(crate) fn gemm_out_to_rows(src: &[f32], rows: usize, n: usize, cols: usize, dst: &mut [f32]) {
     assert!(
         cols <= rows,
-        "cannot take {cols} columns from a {rows}-row GEMM result"
+        "cannot take a {cols}-row prefix of a {rows}-row GEMM result"
     );
     assert_eq!(src.len(), rows * n, "src must be column-major [rows * n]");
     assert_eq!(dst.len(), n * cols, "dst must be row-major [n * cols]");
