@@ -140,10 +140,22 @@ pub(crate) struct WeightRef {
 
 impl WeightRef {
     /// Repack this weight for the prefill GEMM if it qualifies, returning the
-    /// (possibly augmented) ref. Call at projection-weight resolution sites; do
-    /// **not** call for embeddings / the output projection, whose prefill GEMM
-    /// runs at `n = 1` (last column only), where the repacked layout gives
-    /// nothing and the extra copy is pure waste.
+    /// (possibly augmented) ref. Call at projection-weight resolution sites.
+    ///
+    /// Do **not** call it for `token_embd.weight` in its *embedding* role: rows
+    /// are read one at a time by token id (`dequantize_row_into`), never as a
+    /// GEMM, so the repacked layout is unusable there and the copy is pure cost.
+    ///
+    /// The output projection is currently also excluded, but its original
+    /// reason expired: it used to be that the head's prefill GEMM ran at
+    /// `n = 1` (last column only), so a repacked layout bought nothing. That is
+    /// no longer true — `LlamaModel::project_logits_batched` runs the head at
+    /// `n = 1 + k` for a `k`-token speculative draft. Whether repacking it pays
+    /// is now an open, x86-only question — the repack covers Q4_0 and Q4_K, so a
+    /// head of either dtype would qualify, though the common Q6_K tied head does
+    /// not. It wants a measurement, not an assumption: the extra copy and its
+    /// resident memory are still real, and speculative decoding is off by
+    /// default.
     #[allow(unused_variables, unused_mut)]
     pub(crate) fn with_repack(mut self, gguf: &GgufFile) -> Self {
         #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
@@ -584,9 +596,11 @@ pub(crate) fn gemm_preq(
     if !ran {
         // Reaching here means a caller gated on `batched_gemm_supports` and got a
         // different answer than the dispatcher — i.e. the two drifted apart. That is
-        // not a benign "fall back to the slow path": the callers of `gemm_preq`
-        // **ignore this return value** and reuse one output buffer across layers, so
-        // an uncomputed GEMM leaves the *previous* layer's activations in `out`.
+        // not a benign "fall back to the slow path": the per-layer callers of
+        // `gemm_preq` **ignore this return value** and reuse one output buffer
+        // across layers, so an uncomputed GEMM leaves the *previous* layer's
+        // activations in `out`. (`LlamaModel::project_logits_batched` is the one
+        // caller that does check it, and has a per-row path to fall back to.)
         report_uncomputed_gemm(wref.dtype, k);
     }
     ran
@@ -596,10 +610,11 @@ pub(crate) fn gemm_preq(
 ///
 /// This must never happen — `batched_gemm_supports` gates it — so treat it as the
 /// invariant break it is. It is *not* a benign "fall back to the slow path": the
-/// callers of `gemm_preq` **ignore its return value**, and they reuse a single output
-/// buffer across layers, so an uncomputed GEMM leaves the previous layer's activations
-/// in `out` and inference produces confident garbage. Panic in debug; in release, at
-/// least say so loudly rather than silently corrupting the forward pass.
+/// callers of `gemm_preq` **ignore its return value** — `LlamaModel::project_logits_batched`
+/// is the one exception, declining to its per-row fallback — and they reuse a single
+/// output buffer across layers, so for the rest an uncomputed GEMM leaves the previous
+/// layer's activations in `out` and inference produces confident garbage. Panic in debug;
+/// in release, at least say so loudly rather than silently corrupting the forward pass.
 #[cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
     not(feature = "blas")
@@ -614,6 +629,41 @@ fn report_uncomputed_gemm(dtype: DType, k: usize) {
         "gemm_preq: no batched kernel for {dtype:?} (k={k}); the matmul was NOT computed \
          and the output buffer holds stale data"
     );
+}
+
+/// Transpose a column-major `[rows × n]` GEMM result (element `(i, j)` at
+/// `i * n + j`, the layout [`gemm_preq`] writes) into a row-major `[n × cols]`
+/// buffer, dropping rows `cols..rows`.
+///
+/// The drop is what lets a tied LM head work: an embedding table reused as the
+/// output projection can carry padding rows past the vocabulary, and the GEMM
+/// must be told the weight's true row count while the caller wants only the
+/// real ones.
+///
+/// A free function so the index arithmetic is testable without a GGUF: every
+/// test that reaches it through a real model is `#[ignore]`d behind a
+/// multi-hundred-MB fixture, so CI would otherwise never execute it — and a
+/// swapped index here is silent, returning another position's logits rather
+/// than failing.
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(feature = "blas")
+))]
+pub(crate) fn gemm_out_to_rows(src: &[f32], rows: usize, n: usize, cols: usize, dst: &mut [f32]) {
+    assert!(
+        cols <= rows,
+        "cannot take a {cols}-row prefix of a {rows}-row GEMM result"
+    );
+    assert_eq!(src.len(), rows * n, "src must be column-major [rows * n]");
+    assert_eq!(dst.len(), n * cols, "dst must be row-major [n * cols]");
+    // Destination-contiguous: the inner loop fills one output row, so stores
+    // stream. The loads stride by `n` floats, which at the small `n`
+    // speculative decoding uses keeps several consecutive `i` per cache line.
+    for (j, row) in dst.chunks_exact_mut(cols).enumerate() {
+        for (i, d) in row.iter_mut().enumerate() {
+            *d = src[i * n + j];
+        }
+    }
 }
 
 /// Quantize all `n` columns of a column-major `[dim × n]` matrix to Q8_0
@@ -1396,6 +1446,40 @@ pub(crate) fn forward_ffn_block(
 ))]
 mod tests {
     use super::*;
+
+    /// `gemm_out_to_rows` must invert the GEMM's column-major layout, so output
+    /// row `j` holds feature `i` at `j * cols + i` — including when the weight
+    /// has more rows than the vocabulary and the extra ones must be dropped.
+    ///
+    /// Checked against an independently written index expression rather than a
+    /// hand-typed expected array: the value `i * 100 + j` encodes both indices,
+    /// so a swap or stride error lands on a value that identifies the mistake.
+    /// The `cols < rows` case is the one a square test cannot see — getting it
+    /// wrong shifts every logit past the first position by the pad width.
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(feature = "blas")
+    ))]
+    #[test]
+    fn gemm_out_to_rows_transposes_and_drops_pad_rows() {
+        // (rows, n, cols): square first, then a padded head.
+        for (rows, n, cols) in [(5usize, 3usize, 5usize), (6, 2, 4)] {
+            let src: Vec<f32> = (0..rows)
+                .flat_map(|i| (0..n).map(move |j| (i * 100 + j) as f32))
+                .collect();
+            let mut dst = vec![0.0f32; n * cols];
+            gemm_out_to_rows(&src, rows, n, cols, &mut dst);
+            for j in 0..n {
+                for i in 0..cols {
+                    assert_eq!(
+                        dst[j * cols + i],
+                        (i * 100 + j) as f32,
+                        "rows={rows} n={n} cols={cols}: slot (j={j}, i={i})"
+                    );
+                }
+            }
+        }
+    }
 
     /// Parallel `quantize_columns` must produce byte-identical output to the
     /// serial per-column reference. There is no cross-column reduction, so the

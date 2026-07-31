@@ -273,6 +273,7 @@ optimal on any one. The knobs below override them.
 | `CERA_DECODE_BPD_KB=<n>` | Bytes-per-dispatch threshold (decimal KB) separating the narrow arm from the wide one. Default 2500. Unlike the two above, this does not force sizing on where it is declined — it moves the threshold, it does not pin a width. |
 | `CERA_THREADS=<n>` | Overrides the detected performance-core count, which the decode/prefill pools are sized from. |
 | `CERA_CPU_TIER=<tier>` | Caps the SIMD tier (e.g. `avx2`, `avx512`). May only downgrade — useful for A/B-ing a kernel path. |
+| `CERA_LM_HEAD_NO_GEMM=1` | Puts the LM-head projection in `forward_prefill_logits_all` back on the per-row loop the batched GEMM replaced, so both halves of a speculative-decoding A/B run from the same binary. Measurement lever only — both paths compute the same projection, to within f32 accumulation order. |
 | `RUST_LOG=<filter>` | Log level. Defaults to `warn`, which surfaces things like prefill falling back to the slow per-token path. |
 
 ### How the decode thread count is chosen

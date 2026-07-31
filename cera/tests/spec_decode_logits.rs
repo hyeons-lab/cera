@@ -5,34 +5,16 @@
 //! If the batched all-logits argmax ever diverged from the per-token argmax,
 //! greedy-spec output could differ from greedy output.
 //!
-//! `#[ignore]` because it needs a real dense GGUF. Resolve order:
-//!   1. `CERA_DENSE_MODEL` = absolute path to a dense (llama/qwen2/qwen3) gguf
-//!   2. `~/.leap/models/<name>/<name>.gguf` for a small default name
+//! `#[ignore]` because it needs a real dense GGUF — see
+//! `common::dense_model_or_skip` for the resolve order and for
+//! `CERA_REQUIRE_DENSE_MODEL`, which turns a missing fixture into a hard failure
+//! instead of a silent skip.
 //!
 //! Run: `cargo test -p cera --release --test spec_decode_logits -- --ignored --nocapture`
 
-use std::path::PathBuf;
+mod common;
 
-fn find_dense_model() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CERA_DENSE_MODEL") {
-        let p = PathBuf::from(p);
-        if p.exists() {
-            return Some(p);
-        }
-        eprintln!("CERA_DENSE_MODEL set but not found: {}", p.display());
-    }
-    let name = "Llama-3.2-1B-Instruct-Q8_0";
-    let p = PathBuf::from(std::env::var("HOME").ok()?)
-        .join(".leap/models")
-        .join(name)
-        .join(format!("{name}.gguf"));
-    if p.exists() {
-        Some(p)
-    } else {
-        eprintln!("no dense model (set CERA_DENSE_MODEL); skipping");
-        None
-    }
-}
+use common::dense_model_or_skip;
 
 fn argmax(v: &[f32]) -> usize {
     v.iter()
@@ -88,7 +70,7 @@ fn build_spec_session(path: &std::path::Path, max_seq_len: Option<u32>) -> cera:
 #[test]
 #[ignore = "needs a real dense GGUF; set CERA_DENSE_MODEL"]
 fn all_logits_argmax_matches_per_token_forward() {
-    let Some(path) = find_dense_model() else {
+    let Some(path) = dense_model_or_skip() else {
         return;
     };
 
@@ -146,7 +128,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 #[ignore = "needs a real dense GGUF; set CERA_DENSE_MODEL"]
 fn truncate_to_restores_kv_exactly() {
-    let Some(path) = find_dense_model() else {
+    let Some(path) = dense_model_or_skip() else {
         return;
     };
     let tokens: Vec<u32> = vec![1, 15043, 3186, 297, 4223, 29889, 306, 626];
@@ -222,7 +204,7 @@ fn greedy_reference(
 #[test]
 #[ignore = "needs a real dense GGUF; set CERA_DENSE_MODEL"]
 fn greedy_spec_matches_greedy_exactly() {
-    let Some(path) = find_dense_model() else {
+    let Some(path) = dense_model_or_skip() else {
         return;
     };
     // A repetitive prompt so prompt-lookup drafts actually hit and the
@@ -342,7 +324,7 @@ fn greedy_spec_matches_greedy_exactly() {
 fn session_spec_matches_standalone_driver() {
     use cera::{GenerateOpts, SpecDecode};
 
-    let Some(path) = find_dense_model() else {
+    let Some(path) = dense_model_or_skip() else {
         return;
     };
     // Repetitive prompt so drafts actually hit (same rationale as the oracle).
@@ -424,7 +406,7 @@ fn session_spec_matches_standalone_driver() {
 fn session_spec_honors_stop_without_emitting_it() {
     use cera::{FinishReason, GenerateOpts, SpecDecode};
 
-    let Some(path) = find_dense_model() else {
+    let Some(path) = dense_model_or_skip() else {
         return;
     };
     let prompt: Vec<u32> = vec![
@@ -483,7 +465,7 @@ fn session_spec_honors_stop_without_emitting_it() {
 fn session_spec_respects_max_seq_len() {
     use cera::{FinishReason, GenerateOpts, SpecDecode};
 
-    let Some(path) = find_dense_model() else {
+    let Some(path) = dense_model_or_skip() else {
         return;
     };
     let prompt: Vec<u32> = vec![
@@ -519,4 +501,39 @@ fn session_spec_respects_max_seq_len() {
         "expected ContextFull at the bound, got {:?}",
         summary.finish_reason
     );
+}
+
+/// Coverage guard for the batched LM-head projection, which is a *performance*
+/// property no correctness assertion can see.
+///
+/// `forward_prefill_logits_all` projects all `n` positions in one
+/// `[rows x n] = [rows x hs] * [hs x n]` GEMM, so the LM head — the largest
+/// tensor in the model — is read once per verification round instead of once
+/// per verified position. It falls back to a per-row loop when the head's dtype
+/// has no batched kernel. Both paths return correct logits, so a fixture whose
+/// head is not GEMM-able would pass every other test in this file while
+/// measuring nothing: on Llama-3.2-1B-Q4_0 an `n = 7` round costs ~57 ms on the
+/// fallback against ~42 ms on the GEMM.
+///
+/// Assert the fixture actually reaches the fast path. If this fails, the model
+/// is fine — the *benchmark* is lying.
+///
+/// The cfg must match `project_logits_batched`'s exactly, including
+/// `not(feature = "blas")`. Under `blas` the batched projection is compiled out
+/// entirely, while `batched_gemm_supports` still answers `true` for the dtypes
+/// whose arms short-circuit on `cfg!(feature = "blas")` — so a looser cfg here
+/// would assert "the fixture reaches the fast path" on a build that has no fast
+/// path, precisely the false pass this test exists to prevent.
+#[test]
+#[ignore = "needs a real dense GGUF; set CERA_DENSE_MODEL"]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(feature = "blas")
+))]
+fn batched_all_logits_reaches_the_lm_head_gemm() {
+    let Some(path) = dense_model_or_skip() else {
+        return;
+    };
+    let (_model, detail) = common::dense_gemm_head_fixture(&path);
+    println!("reaches the batched projection: {detail}");
 }

@@ -11,6 +11,10 @@
 //!
 //! [`metal_context`] is the shared skip-vs-fail gate used by every Metal
 //! suite that dispatches a kernel.
+//!
+//! [`dense_model_or_skip`] resolves the dense GGUF the speculative-decoding
+//! suite and LM-head benchmark share, and [`dense_gemm_head_fixture`] loads it
+//! while asserting it actually reaches the batched LM-head projection.
 
 #![allow(dead_code)]
 
@@ -45,6 +49,221 @@ pub fn metal_context() -> Option<cera::backend::metal::MetalContext> {
             );
             eprintln!("skipping: no Metal device ({e})");
             None
+        }
+    }
+}
+
+/// Resolve a dense (llama/qwen2/qwen3) GGUF for the speculative-decoding tests
+/// and benchmark, or skip the calling test.
+///
+/// Resolve order:
+///   1. `CERA_DENSE_MODEL` — absolute path to a dense gguf
+///   2. `~/.leap/models/Llama-3.2-1B-Instruct-Q8_0/…`
+///   3. `<repo>/models/Llama-3.2-1B-Q4_0.gguf`
+///
+/// Step 2 comes first because it was the pre-existing default for this suite,
+/// and the order decides which GEMM kernels get exercised — demoting it would
+/// silently re-point six existing tests at a different quant.
+///
+/// **Both defaults miss on a typical checkout**, so in practice pass
+/// `CERA_DENSE_MODEL`: step 3 is crate-relative, and `models/` is gitignored and
+/// lives only in the main checkout, while this repo's workflow mandates working
+/// in a git worktree. A path pinned there that does not exist is a hard error,
+/// not a fallback. `CERA_REQUIRE_DENSE_MODEL=1` likewise turns a missing fixture
+/// into a failure rather than a skip — same convention as `metal_context` above,
+/// for the same reason: a suite that skips reports green on an empty test set.
+///
+/// Shared rather than copied per binary because the spec suite and the LM-head
+/// benchmark must resolve the *same* fixture, or the suite's coverage guard says
+/// nothing about what the benchmark timed.
+///
+/// Callers: `spec_decode_logits`, `spec_lm_head_bench`.
+pub fn dense_model_or_skip() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    if let Ok(p) = std::env::var("CERA_DENSE_MODEL") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+        // Hard failure, not a fallback: an explicitly pinned path is stronger
+        // evidence of intent than an unset variable, so a typo must not resolve
+        // silently to a default fixture at a different quant and report a number
+        // for a model the operator did not choose.
+        panic!(
+            "CERA_DENSE_MODEL={} does not exist (unset it to use the defaults)",
+            p.display()
+        );
+    }
+
+    let mut tried: Vec<PathBuf> = Vec::new();
+
+    if let Ok(home) = std::env::var("HOME") {
+        let name = "Llama-3.2-1B-Instruct-Q8_0";
+        let leap = PathBuf::from(home)
+            .join(".leap/models")
+            .join(name)
+            .join(format!("{name}.gguf"));
+        if leap.exists() {
+            return Some(leap);
+        }
+        tried.push(leap);
+    }
+
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models/Llama-3.2-1B-Q4_0.gguf");
+    if repo.exists() {
+        return Some(repo);
+    }
+    tried.push(repo);
+
+    let tried = tried
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(
+        std::env::var("CERA_REQUIRE_DENSE_MODEL").as_deref() != Ok("1"),
+        "CERA_REQUIRE_DENSE_MODEL=1 but no dense model found (CERA_DENSE_MODEL unset; tried {tried})"
+    );
+    eprintln!("skipping: no dense model (CERA_DENSE_MODEL unset; tried {tried})");
+    None
+}
+
+/// Load `path` and assert it is a dense model that actually exercises the
+/// batched LM-head projection, returning the model and a description of the
+/// head for the caller to print.
+///
+/// Both the coverage guard and the benchmark need exactly this preamble, and it
+/// is the *pairing* — dense model AND GEMM-able head — that makes either of them
+/// meaningful: the head check alone would approve an LFM2 GGUF, which has a
+/// `token_embd.weight` but never reaches this code, and the dense check alone
+/// would approve a Q5_K head that silently takes the per-row path.
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(feature = "blas")
+))]
+pub fn dense_gemm_head_fixture(path: &std::path::Path) -> (Box<dyn cera::model::Model>, String) {
+    let gguf = cera::gguf::GgufFile::open(path).unwrap();
+    let model =
+        cera::model::load_model(cera::gguf::GgufFile::open(path).unwrap(), None, 8192).unwrap();
+    assert!(
+        model.supports_all_logits(),
+        "fixture is not a dense model with all-position logits, so it does not \
+         exercise the batched LM-head projection at all"
+    );
+    let hs = model.config().hidden_size;
+    let (reached, detail) = lm_head_gate(&gguf, hs);
+    assert!(
+        reached,
+        "{detail} — the batched LM-head projection would decline on this \
+         fixture, so anything measured against it is the per-row fallback"
+    );
+    (model, detail)
+}
+
+/// Mirror of `LlamaModel::project_logits_batched`'s dtype gate: `(reached,
+/// detail)`, where `detail` names the failing condition or the head that will be
+/// used.
+///
+/// Does not mirror the projection's `m >= vocab_size`, `k == hidden_size`, or
+/// `hidden_size % 32` checks — those are rejected at model load, so a fixture
+/// violating any of them fails loudly rather than quietly measuring the
+/// fallback. Nor does it consult `CERA_LM_HEAD_NO_GEMM`: that lever is the
+/// operator deliberately selecting the per-row path, and the benchmark reports
+/// it separately.
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(feature = "blas")
+))]
+fn lm_head_gate(gguf: &cera::gguf::GgufFile, hidden_size: usize) -> (bool, String) {
+    let Some(head) = gguf
+        .tensors
+        .get("output.weight")
+        .or_else(|| gguf.tensors.get("token_embd.weight"))
+    else {
+        return (
+            false,
+            "model has neither output.weight nor token_embd.weight".into(),
+        );
+    };
+    if !cera::model::transformer::batched_gemm_supports(head.dtype, hidden_size) {
+        return (
+            false,
+            format!(
+                "LM head `{}` is {:?} (hs={hidden_size}) — no batched GEMM kernel here",
+                head.name, head.dtype
+            ),
+        );
+    }
+    (true, format!("LM head `{}` ({:?})", head.name, head.dtype))
+}
+
+/// Collects the message of every `WARN`/`ERROR` event, from any target.
+///
+/// `cargo test` installs no subscriber, so warnings a test needs to observe —
+/// the fallback notices this codebase emits instead of failing — otherwise go
+/// nowhere. Install with:
+///
+/// ```ignore
+/// let warns = WarnCapture::default();
+/// let _guard = tracing::subscriber::set_default(
+///     tracing_subscriber::registry().with(warns.clone()));
+/// ```
+///
+/// `set_default` is thread-local, so the events must be emitted on the calling
+/// thread — true of every fallback warning in `model/` today.
+///
+/// No target filter on purpose: the point is to prove *something* warned, so
+/// narrowing to a module would bake a test's expectation into where the warning
+/// happens to live. `tests/unbatchable_warning.rs` predates this and carries its
+/// own x86-only copy; new callers should use this one.
+///
+/// The level filter is pinned by `warn_capture_keeps_warn_and_error_only` in
+/// `tests/spec_lm_head_bench.rs`, because `tracing::Level`'s ordering is by
+/// verbosity and so reads backwards: `ERROR` is the *smallest* level.
+#[derive(Clone, Default)]
+pub struct WarnCapture(pub std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl WarnCapture {
+    /// Everything captured so far. A poisoned mutex yields the contents anyway
+    /// rather than an empty list — a capture that reads as "nothing warned"
+    /// after a panic would turn a self-check into a silent pass.
+    pub fn messages(&self) -> Vec<String> {
+        match self.0.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() > tracing::Level::WARN {
+            return;
+        }
+        struct Visit(Option<String>);
+        impl tracing::field::Visit for Visit {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        let mut v = Visit(None);
+        event.record(&mut v);
+        // Events with no `message` field still matter — record the target so a
+        // caller printing the capture does not show a bare empty line.
+        let msg =
+            v.0.unwrap_or_else(|| format!("<no message> target={}", event.metadata().target()));
+        // Recover from poisoning on the write side too: a dropped message
+        // would leave the caller's self-check reading as "nothing warned".
+        match self.0.lock() {
+            Ok(mut g) => g.push(msg),
+            Err(p) => p.into_inner().push(msg),
         }
     }
 }
