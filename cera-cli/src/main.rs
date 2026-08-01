@@ -1541,10 +1541,8 @@ fn build_bench_prompt(
             n
         );
     } else {
-        if add_bos {
-            if let Some(bos) = tokenizer.bos_token() {
-                tokens.push(bos);
-            }
+        if add_bos && let Some(bos) = tokenizer.bos_token() {
+            tokens.push(bos);
         }
         tokens.extend_from_slice(&tokenizer.encode(prompt));
     }
