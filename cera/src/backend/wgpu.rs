@@ -11,6 +11,37 @@ use crate::backend::wgsl_pp::Preprocessor;
 use crate::tensor::DType;
 use half::f16;
 
+/// Blocking `device.poll(Wait)` that survives the PowerVR Vulkan driver.
+///
+/// wgpu 24's `Maintain::Wait` became wgpu 30's `poll(PollType::Wait) -> Result`.
+/// On some Vulkan drivers (observed on the Pixel's PowerVR) `poll(Wait)` returns
+/// `PollError::Timeout` immediately instead of blocking until the submission
+/// signals, so a bare call would return before the readback is ready. Retry on
+/// `Timeout` until the fence actually signals; on Mac/Metal the first call
+/// already returns `Ok`. Other poll errors are a real bug, so surface them.
+pub(crate) trait DevicePollExt {
+    fn poll_wait(&self);
+}
+
+impl DevicePollExt for wgpu::Device {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_wait(&self) {
+        loop {
+            match self.poll(wgpu::PollType::wait_indefinitely()) {
+                Ok(_) => break,
+                Err(wgpu::PollError::Timeout) => continue,
+                Err(e) => panic!("device.poll(Wait) failed: {e:?}"),
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn poll_wait(&self) {
+        // WebGPU ignores poll; the map callback fires from the JS event loop.
+        let _ = self.poll(wgpu::PollType::Poll);
+    }
+}
+
 /// GPU I/O counters — queue submits and GPU→CPU readbacks.
 ///
 /// Every submit costs a driver round-trip and every readback forces a pipeline
@@ -204,14 +235,14 @@ impl PendingReadback {
         // WebGPU backend ignores `poll`; the await suspends to the JS event
         // loop, which fires the callback.
         #[cfg(not(target_arch = "wasm32"))]
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll_wait();
         self.rx
             .await
             .map_err(|_| anyhow::anyhow!("GPU readback channel closed"))?
             .map_err(|e| anyhow::anyhow!("GPU readback failed: {e:?}"))?;
 
         let slice = self.staging.slice(0..self.size);
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("get_mapped_range failed");
         let bytes = data.to_vec();
         drop(data);
         self.staging.unmap();
@@ -255,9 +286,12 @@ impl GpuContext {
     /// the host must `.await` rather than block. Native callers can use the
     /// blocking [`Self::new`] wrapper.
     pub async fn new_async() -> Result<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            display: None,
         });
 
         let adapter = instance
@@ -287,15 +321,14 @@ impl GpuContext {
         let adapter_limits = adapter.limits();
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("cera-gpu"),
-                    required_features: features,
-                    required_limits: adapter_limits.clone(),
-                    memory_hints: wgpu::MemoryHints::Performance,
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("cera-gpu"),
+                required_features: features,
+                required_limits: adapter_limits.clone(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+            })
             .await
             .map_err(|e| anyhow::anyhow!("failed to request GPU device: {e}"))?;
 
@@ -344,7 +377,6 @@ impl GpuContext {
             backend = %backend,
             max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size,
             max_buffer_size = adapter_limits.max_buffer_size,
-            min_subgroup_size = adapter_limits.min_subgroup_size,
             "GPU initialized"
         );
 
@@ -505,12 +537,12 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             tx.send(r).ok();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll_wait();
         rx.recv()
             .expect("GPU readback channel closed")
             .expect("GPU readback failed");
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("get_mapped_range failed");
         let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging.unmap();
@@ -561,12 +593,12 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).ok();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll_wait();
         rx.recv()
             .expect("GPU readback channel closed")
             .expect("GPU readback failed");
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("get_mapped_range failed");
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging.unmap();
@@ -687,12 +719,12 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             tx.send(r).ok();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll_wait();
         rx.recv()
             .expect("GPU readback channel closed")
             .expect("GPU readback failed");
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("get_mapped_range failed");
         let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging.unmap();
@@ -739,12 +771,12 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             tx.send(r).ok();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll_wait();
         rx.recv()
             .expect("GPU readback channel closed")
             .expect("GPU readback failed");
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("get_mapped_range failed");
         // Slicing to exact byte count before casting to handle potential 2-byte padding.
         let f16_data: &[f16] = bytemuck::cast_slice(&data[0..size as usize]);
         let result: Vec<f32> = f16_data.iter().map(|&x| x.to_f32()).collect();
@@ -903,10 +935,10 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             tx.send(r).ok();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll_wait();
         rx.recv().unwrap().unwrap();
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("get_mapped_range failed");
         let timestamps: &[u64] = bytemuck::cast_slice(&data);
 
         let period_ns = profiler.timestamp_period as f64;
@@ -1474,7 +1506,7 @@ mod tests {
             pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
         }
         ctx.submit_encoder(enc);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
     }
 
     #[test]
@@ -1840,7 +1872,7 @@ mod tests {
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
 
         let result = ctx.download_f32(&y_buf, (n * m) as usize);
         for i in 0..(n * m) as usize {
@@ -1979,7 +2011,7 @@ mod tests {
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
 
         let result = ctx.download_f32(&y_buf, (n * m) as usize);
         for i in 0..(n * m) as usize {
@@ -2087,7 +2119,7 @@ mod tests {
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
 
         let result = ctx.download_f32(&y_buf, (n * y_stride) as usize);
         for t in 0..n as usize {
@@ -2218,7 +2250,7 @@ mod tests {
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
 
         let result = ctx.download_f32(&y_buf, (n * m) as usize);
         for i in 0..(n * m) as usize {
@@ -2320,7 +2352,7 @@ mod tests {
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
 
         let result = ctx.download_f32(&y_buf, (n * m) as usize);
         for i in 0..(n * m) as usize {
@@ -2483,7 +2515,7 @@ mod tests {
             }
             ctx.submit_encoder(enc);
         }
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
 
         // Timed: 100 iterations of single GEMV dispatch
         let iters = 100;
@@ -2498,7 +2530,7 @@ mod tests {
             }
             ctx.submit_encoder(enc);
         }
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
         let elapsed = start.elapsed();
 
         let us_per_gemv = elapsed.as_micros() as f64 / iters as f64;
@@ -4226,9 +4258,7 @@ mod tests {
             });
 
         let make_pipeline = |head_dim: u32| {
-            let mut consts: std::collections::HashMap<String, f64> =
-                std::collections::HashMap::new();
-            consts.insert("HEAD_DIM".to_string(), head_dim as f64);
+            let consts: [(&str, f64); 1] = [("HEAD_DIM", head_dim as f64)];
             ctx.device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(&format!("override_spike_hd{head_dim}")),
@@ -4284,9 +4314,9 @@ mod tests {
             slice.map_async(wgpu::MapMode::Read, move |r| {
                 tx.send(r).ok();
             });
-            ctx.device.poll(wgpu::Maintain::Wait);
+            ctx.device.poll_wait();
             rx.recv().unwrap().unwrap();
-            let data = slice.get_mapped_range();
+            let data = slice.get_mapped_range().expect("get_mapped_range failed");
             let v = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
             drop(data);
             staging.unmap();

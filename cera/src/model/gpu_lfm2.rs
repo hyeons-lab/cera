@@ -47,7 +47,7 @@ use anyhow::Result;
 
 use crate::CeraError;
 use crate::backend::cpu::RopeType;
-use crate::backend::wgpu::{GpuContext, GpuTensor, KvShiftParams, shaders};
+use crate::backend::wgpu::{DevicePollExt, GpuContext, GpuTensor, KvShiftParams, shaders};
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression, KvPrefixCache, LayerSnapshot, StateSnapshot};
 use crate::lora::{LoraAdapterWeights, LoraTarget};
@@ -1935,7 +1935,7 @@ impl GpuLfm2Model {
     /// Submit encoder and wait for GPU to finish.
     fn submit_and_wait(&self, enc: wgpu::CommandEncoder) {
         self.ctx.submit_encoder(enc);
-        self.ctx.device.poll(wgpu::Maintain::Wait);
+        self.ctx.device.poll_wait();
     }
 
     fn new_encoder(&self) -> wgpu::CommandEncoder {
