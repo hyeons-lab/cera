@@ -10,21 +10,21 @@ bindings + the cera-ffi cdylib. Read by the Rust harness
 
 ```
 legs/swift/
-├── Package.swift                 — two-target SPM manifest
+├── Package.swift                 : two-target SPM manifest
 └── Sources/
-    ├── cera_ffiFFI/              — .systemLibrary target
-    │   ├── module.modulemap      — exposes cera_ffiFFI.h as `cera_ffiFFI`
-    │   └── cera_ffiFFI.h         — symlink → ../../../../../cera-ffi/bindings/swift/cera_ffiFFI.h
-    └── CeraParitySwift/          — .executableTarget
-        ├── main.swift            — runner (stdin JSON → bindings → stdout JSON)
-        └── cera_ffi.swift        — symlink → ../../../../../cera-ffi/bindings/swift/cera_ffi.swift
+    ├── cera_ffiFFI/              : .systemLibrary target
+    │   ├── module.modulemap      : exposes cera_ffiFFI.h as `cera_ffiFFI`
+    │   └── cera_ffiFFI.h         : symlink → ../../../../../cera-ffi/bindings/swift/cera_ffiFFI.h
+    └── CeraParitySwift/          : .executableTarget
+        ├── main.swift            : runner (stdin JSON → bindings → stdout JSON)
+        └── cera_ffi.swift        : symlink → ../../../../../cera-ffi/bindings/swift/cera_ffi.swift
 ```
 
 The two binding files are git symlinks (mode 120000), so
 `just bindings` regenerations propagate without a manual copy step.
 The system-library target name is `cera_ffiFFI` exactly because the
 generated `cera_ffi.swift` does `#if canImport(cera_ffiFFI) ; import
-cera_ffiFFI` — any other name and the C FFI declarations fall out of
+cera_ffiFFI`; any other name and the C FFI declarations fall out of
 scope at compile time.
 
 ## Build

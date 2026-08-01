@@ -5,7 +5,7 @@ a `cera` binary for running, chatting with, inspecting, and benchmarking GGUF /
 LeapBundles models locally.
 
 > **Note:** Part of a learning-experiment project exploring LLM inference
-> internals in Rust — see the [project README](https://github.com/hyeons-lab/cera).
+> internals in Rust, see the [project README](https://github.com/hyeons-lab/cera).
 > Not intended for production use.
 
 ## Install
@@ -22,11 +22,11 @@ cargo install cera-cli --features metal   # or gpu
 
 ## Usage
 
-Point at a local model — a `.gguf` file, a `.json` LeapBundles manifest, or a
-directory containing one — or let it auto-download a bundle by id/quant from
+Point at a local model (a `.gguf` file, a `.json` LeapBundles manifest, or a
+directory containing one) or let it auto-download a bundle by id/quant from
 [`huggingface.co/LiquidAI/LeapBundles`](https://huggingface.co/LiquidAI/LeapBundles)
 (cached under `$HOME/.cache/cera`). Supported architectures: `lfm2`,
-`qwen2`/`qwen3`, `llama` (incl. classic Mistral), and `granite` — see the
+`qwen2`/`qwen3`, `llama` (incl. classic Mistral), and `granite`; see the
 [`cera` README](https://github.com/hyeons-lab/cera/tree/main/cera#supported-models)
 for the full list and modality support.
 
@@ -64,10 +64,10 @@ cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead 
 
 | Command | Purpose |
 |---------|---------|
-| `run` | Run inference on a prompt — text, optional grammar/JSON or tool calling (`--tools` / `--constrain-tools`), plus audio input for LFM2-Audio bundles. Optional `--lora` adapter. |
+| `run` | Run inference on a prompt: text, optional grammar/JSON or tool calling (`--tools` / `--constrain-tools`), plus audio input for LFM2-Audio bundles. Optional `--lora` adapter. |
 | `chat` | Interactive multi-turn REPL with `/help`, `/clear`, `/exit` slash commands. Optional `--lora` adapter. |
-| `embed` | Extract last-layer hidden-state embeddings for a prompt — mean-pooled by default, `--per-token` for the full matrix, `--json` for array output. |
-| `logits` | Dump the next-token logits over the full vocabulary for a prompt (single prefill) — `--top-k` for the K highest `(token_id, logit)` pairs, `--json` for array output. Handy for cross-backend parity checks. |
+| `embed` | Extract last-layer hidden-state embeddings for a prompt: mean-pooled by default, `--per-token` for the full matrix, `--json` for array output. |
+| `logits` | Dump the next-token logits over the full vocabulary for a prompt (single prefill): `--top-k` for the K highest `(token_id, logit)` pairs, `--json` for array output. Handy for cross-backend parity checks. |
 | `inspect` | Inspect a GGUF file's metadata and resolved CPU backend tier. |
 | `cpu` | Print the host's CPU backend tier + detected SIMD features (no model needed). |
 | `tokenize` | Tokenize text and print token IDs (e.g. to compare against HuggingFace). |
@@ -84,7 +84,7 @@ template; the reply's tool calls are parsed to a JSON array on stdout), and
 `--constrain-tools` (requires `--tools`) forces a well-formed, correctly-typed
 call via a grammar + lazy trigger. `run`, `chat`, and `embed` all accept
 `--lora <PATH>` (a llama.cpp `.gguf` or PEFT `.safetensors` adapter); it applies
-to every forward pass — generation and hidden-state extraction alike. For a PEFT
+to every forward pass, generation and hidden-state extraction alike. For a PEFT
 `.safetensors` adapter whose `alpha` differs from its rank, pass
 `--lora-alpha <ALPHA>` (`scale = alpha / rank`; `.gguf` adapters carry alpha in
 their metadata).
@@ -94,7 +94,7 @@ their metadata).
 The CPU backend auto-detects thread count and core affinity per device. To pin
 them for benchmarking or tuning, set `CERA_DECODE_THREADS=<n>` (fixed decode
 width), `CERA_THREADS=<n>` (override the detected perf-core count), or
-`CERA_PIN=0` (disable affinity) — see the
+`CERA_PIN=0` (disable affinity); see the
 [crate README](../cera/README.md#cpu-threading--tuning) for
 the full list. On Android, `bench` also prints the device's thermal headroom
 per run (a sustained CPU benchmark heats the SoC within seconds, so a raw tok/s

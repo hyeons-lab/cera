@@ -1,8 +1,8 @@
 # Cera
 
-**A Rust-native LLM inference engine.** Load a GGUF model and run it locally —
+**A Rust-native LLM inference engine.** Load a GGUF model and run it locally,
 on your laptop's CPU, an Apple GPU, a cross-platform Vulkan/DX12 GPU, a phone,
-or in the browser — from a single dependency-free core.
+or in the browser, from a single dependency-free core.
 
 ## Why Cera
 
@@ -12,18 +12,18 @@ or in the browser — from a single dependency-free core.
   (via UniFFI), and the browser (via WebAssembly). Pick CPU or GPU at runtime.
 - **Loads standard GGUF.** Point it at a `.gguf` file, a
   [LeapBundles](https://huggingface.co/LiquidAI/LeapBundles) manifest, or a
-  bundle id — it can auto-download and cache models from Hugging Face.
+  bundle id; it can auto-download and cache models from Hugging Face.
 - **Multimodal.** Text, vision (image → text), and audio (in/out) models all
   load through the same session API.
-- **Structured output.** Constrain generation to a GBNF grammar — or one flag
+- **Structured output.** Constrain generation to a GBNF grammar, or one flag
   for guaranteed-valid JSON.
 - **Tool calling.** Give the model a set of tool schemas and parse the calls it
-  makes back out — format-aware (LFM2 Pythonic, Hermes/Qwen JSON), with an
+  makes back out: format-aware (LFM2 Pythonic, Hermes/Qwen JSON), with an
   optional constrained mode that guarantees a well-formed, correctly-typed call.
   From the CLI and every binding.
 - **LoRA adapters & embeddings.** Load LoRA adapters at runtime (GGUF or PEFT
-  safetensors), hot-swap / unload per session — applied on CPU, Metal, and wgpu,
-  never merged — and pull per-token hidden states out of the engine for
+  safetensors), hot-swap / unload per session (applied on CPU, Metal, and wgpu,
+  never merged) and pull per-token hidden states out of the engine for
   classifier and embedding heads. From every binding.
 
 ## Supported models
@@ -41,17 +41,17 @@ of these architectures loads:
 Every architecture above runs on **all three compute backends** (CPU, Metal, and
 wgpu), with single-token decode and prompt prefill on each. Prefill uses
 batched-GEMM (each weight read once for the whole prompt) on every backend and
-architecture — including CPU for both LFM2 and the dense transformers — with a
+architecture, including CPU for both LFM2 and the dense transformers, with a
 tiled flash-attention path that kicks in for long prompts.
 
 ### Modalities
 
-- **Text → text** — every supported architecture.
-- **Vision (image → text)** — LFM2-VL models. `CeraEngine` auto-attaches the
+- **Text → text**: every supported architecture.
+- **Vision (image → text)**: LFM2-VL models. `CeraEngine` auto-attaches the
   vision encoder; `Session::append_image` runs image → ViT → projector → prefill.
   The ViT encoder runs on the GPU (Metal or wgpu) with a CPU fallback. Verified
   against LFM2.5-VL-450M.
-- **Audio (in / out)** — LFM2-Audio (`lfm2-audio-v1`): feed PCM audio in, and
+- **Audio (in / out)**: LFM2-Audio (`lfm2-audio-v1`): feed PCM audio in, and
   (with a vocoder) decode audio out.
 
 ## Platforms & backends
@@ -74,13 +74,13 @@ Weights run in **Q4_0**, **Q4_1**, **Q8_0**, **Q4_K**, **Q5_K**, and **Q6_K**,
 plus dense **F32**. Activations are dynamically quantized to Q8_0 for fast
 integer GEMV on CPU.
 
-Those are GGML *tensor* types, and dispatch is per tensor — so what decides
+Those are GGML *tensor* types, and dispatch is per tensor, so what decides
 whether a file runs is the mix inside it, not its `Q4_K_M`-style label. K-quant
 downloads usually work, but the label is not a guarantee: llama.cpp substitutes
 Q5_0 / Q5_1 / IQ4_NL for tensors whose rows are not a multiple of 256, and cera
 has no kernel for those. `cera inspect --model <file>` lists the per-tensor types,
 and an unsupported one fails at weight resolution naming the tensor rather than
-failing anonymously — with the type name too, for the types cera knows about (an
+failing anonymously, with the type name too, for the types cera knows about (an
 IQ type reports its numeric id).
 
 Backends are not uniform, so a file that runs on one may not run on another. On
@@ -88,7 +88,7 @@ native Metal, Q4_1 works as a projection weight but not as `token_embd` /
 `output`; `--device auto` falls back to wgpu or CPU on its own, while
 `--device metal` reports the gap. F16/BF16
 tensors parse, and are dequantized on the LoRA, vision, and audio paths, but the
-transformer weight and token-embedding paths have no kernel for them — an
+transformer weight and token-embedding paths have no kernel for them; an
 F16-weight LLM is not a supported configuration.
 
 ## Language bindings
@@ -101,17 +101,17 @@ One Rust core, consumed from many places:
 | **CLI** | [`cera-cli`](cera-cli/) | the `cera` binary |
 | **Kotlin / Swift / Python** | [`cera-ffi`](cera-ffi/) (UniFFI) | JVM, Apple platforms |
 | **Android** | [`cera-ffi-kotlin`](cera-ffi-kotlin/) | Android apps (AAR) |
-| **iOS / macOS** | [`Package.swift`](Package.swift) (SwiftPM XCFramework) | Apple apps (`.package(url:)`) — Metal GPU (Auto: Metal → CPU) |
+| **iOS / macOS** | [`Package.swift`](Package.swift) (SwiftPM XCFramework) | Apple apps (`.package(url:)`), Metal GPU (Auto: Metal → CPU) |
 | **Flutter / Dart** | [`cera-ffi-flutter`](cera-ffi-flutter/) | cross-platform mobile |
 | **Browser / Node** | [`cera-wasm`](cera-wasm/) (`@hyeons-lab/cera-wasm`) | WebAssembly + WebGPU |
 
 A complete SwiftUI example app (streaming chat + embeddings + LoRA) that consumes
-the published Swift Package lives in [`examples/CeraChat`](examples/CeraChat/) —
+the published Swift Package lives in [`examples/CeraChat`](examples/CeraChat/);
 it doubles as a real-device Metal validation harness.
 
 ## Structured output (GBNF grammars)
 
-Force the model's output to match a grammar — useful for JSON, tool calls, or any
+Force the model's output to match a grammar, useful for JSON, tool calls, or any
 schema. Cera ships a byte-level GBNF engine (mirroring llama.cpp's) that masks the
 sampler each step so only grammar-valid tokens can be produced.
 
@@ -128,13 +128,13 @@ Supports literals, character classes, alternation, grouping, and repetition
 CLI: in Rust set `GenerateOpts.grammar` to a compiled `Grammar` (`Grammar::parse(gbnf)?`),
 while the Kotlin/Swift FFI (`GenerateOpts.grammar`) and browser/Node WASM
 (`GenerateOpts.setGrammar(gbnf)`) take the GBNF string directly and compile it
-natively — so mobile and web apps get the same guaranteed-valid output.
+natively, so mobile and web apps get the same guaranteed-valid output.
 
 ## Tool calling
 
 Give the model a set of tools (OpenAI "function" schemas) and get the calls it
 makes back out as structured data. Cera renders the tools into the model's chat
-template and parses tool calls from the reply — **format-aware**, since the wire
+template and parses tool calls from the reply, **format-aware**, since the wire
 format isn't interchangeable: LFM2/LFM2.5 emit **Pythonic** calls
 (`[get_weather(city="Paris")]`) while Hermes-style Qwen2.5/Qwen3 emit **JSON**
 (`<tool_call>{"name": …, "arguments": {…}}</tool_call>`). The format is detected
@@ -154,34 +154,34 @@ cera run -m model.gguf -p "..." --tools @tools.json --constrain-tools
 With `--constrain-tools` a **lazy grammar trigger** keeps generation free until
 the model starts a tool call, then constrains the call to a valid function name,
 valid argument names, and correctly-typed values (JSON-Schema → GBNF). In
-`--tools` mode stdout is machine-readable — **only** the JSON array of calls
+`--tools` mode stdout is machine-readable: **only** the JSON array of calls
 (`[]` when the model answered in prose); the assistant reply and timing stream to
 stderr, so `… --tools tools.json | jq` just works.
 
-Available from **every binding**, not just the CLI — Rust (`cera::tools`),
+Available from **every binding**, not just the CLI: Rust (`cera::tools`),
 Kotlin/Swift (`applyChatTemplateWithTools`, `parseToolCalls`, `toolGrammar`,
-`detectToolFormat`), and browser/Node WASM (the same names) — see each crate's
+`detectToolFormat`), and browser/Node WASM (the same names); see each crate's
 README for the API surface.
 
 ## LoRA adapters & hidden states
 
-**Runtime LoRA.** Load a LoRA adapter — a llama.cpp GGUF (from
-`convert_lora_to_gguf`) or a PEFT `.safetensors` — and attach it to a session. The
+**Runtime LoRA.** Load a LoRA adapter, a llama.cpp GGUF (from
+`convert_lora_to_gguf`) or a PEFT `.safetensors`, and attach it to a session. The
 delta is applied at inference time (`y += scale·B·(A·x)`), **never merged into the
 weights**, so the base model stays quantized and adapters hot-swap / unload per
 request at ~no cost. Runs on **CPU, Metal, and wgpu** (batched-GEMM prefill +
 decode) and is dimension-checked against the model at attach.
 
 **Hidden-states extraction.** Pull the per-token last-layer hidden state
-(post-final-RMSNorm — the llama.cpp `--pooling none` vector) straight out of the
+(post-final-RMSNorm, the llama.cpp `--pooling none` vector) straight out of the
 engine, reflecting the active adapter. This unblocks classifier / extractor /
-embedding heads — e.g. a section router: `LFM2.5` + a `route_section` LoRA + a
+embedding heads, e.g. a section router: `LFM2.5` + a `route_section` LoRA + a
 small linear head over the mean-pooled hidden state.
 
 Both are available from **every binding**:
 
 ```swift
-// Swift / Kotlin (UniFFI) — same shape on both
+// Swift / Kotlin (UniFFI): same shape on both
 let adapters = try LoraAdapters.fromSafetensors(path: p, alpha: nil)
 try session.attachLora(adapters: adapters)               // hot-swap-able
 let pooled = try session.hiddenStatesMeanPooled(tokens: toks)  // [hidden_size]
@@ -198,7 +198,7 @@ const pooled = session.hiddenStatesMeanPooled(tokens); // Float32Array
 
 Cera includes the **first implementation of TurboQuant**
 ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874), Google Research 2025) for
-LFM2 — compressing the KV cache to **~3 bits/key + ~2 bits/value (~12× vs f32)**
+LFM2, compressing the KV cache to **~3 bits/key + ~2 bits/value (~12× vs f32)**
 with near-lossless quality and **no calibration**. On a 1.6B LFM2 model at 4K
 tokens that's ~192 MB → ~16 MB of KV, with decode staying within ±5% of f32.
 
@@ -210,12 +210,12 @@ cera run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3 --device gpu     # wgpu
 cera run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3 --device metal   # native Metal
 ```
 
-Supported on **all three** backends — CPU, wgpu, and native Metal — for both
+Supported on **all three** backends (CPU, wgpu, and native Metal) for both
 decode and chunked prefill. On the GPU backends the compressed cache lives in GPU
 buffers and the prefix-cache snapshots are byte-compatible with the CPU's, so all
 three write the same `TQK1`/`TQV1` blob format. Two GPU-specific restrictions:
 `head_dim` must be a power of two ≤ 128 and a multiple of 32 (every supported
-model is 64 or 128), and only the both-sides mode (`tq3`) is available — the
+model is 64 or 128), and only the both-sides mode (`tq3`) is available; the
 single-sided debug modes `tq3-keys` / `tq3-values` fall back to the backend's
 uncompressed KV there (f32 on wgpu, f16 on Metal) with a warning. `--n-keep`
 context shift is not supported with any TurboQuant mode on any backend.
@@ -268,10 +268,10 @@ See the [`cera` crate README](cera/README.md) for the full library API.
 
 | Command | Purpose |
 |---------|---------|
-| `run` | One-shot inference — text, optional grammar/JSON or tool calling (`--tools`), plus image/audio input for VL/Audio bundles |
+| `run` | One-shot inference: text, optional grammar/JSON or tool calling (`--tools`), plus image/audio input for VL/Audio bundles |
 | `chat` | Interactive multi-turn REPL with a persistent KV prefix cache |
-| `embed` | Extract last-layer hidden-state embeddings — mean-pooled, or `--per-token` for the full matrix |
-| `logits` | Dump next-token logits over the vocabulary (single prefill) — handy for cross-backend parity checks |
+| `embed` | Extract last-layer hidden-state embeddings: mean-pooled, or `--per-token` for the full matrix |
+| `logits` | Dump next-token logits over the vocabulary (single prefill), handy for cross-backend parity checks |
 | `inspect` | Dump a GGUF's metadata, tensor shapes, and resolved backend tier |
 | `cpu` | Print the host's CPU backend tier + detected SIMD features (no model needed) |
 | `tokenize` | Encode text to token IDs (e.g. to compare against Hugging Face) |
@@ -287,18 +287,18 @@ optimal on any one. The knobs below override them.
 | Variable | Effect |
 |----------|--------|
 | `CERA_DECODE_THREADS=<n>` or `CERA_DECODE_THREADS=auto` | Worker count for decode (per-token GEMV). A fixed `<n>` overrides the automatic sizing below (clamped to the detected count); `auto` selects it. |
-| `CERA_DECODE_SIZING=off` | Disable model-aware decode sizing (`0` / `false` / `off`, case-insensitive) and fall back to the flat cap (detected perf cores — ≤12 homogeneous, ≤6 on big.LITTLE). Use this to A/B the sizing on a new machine. |
-| `CERA_DECODE_NARROW=<n>` / `CERA_DECODE_WIDE=<n>` | Override the two widths the sizing picks between. Defaults derive from the physical core count — `physical/2` capped at 12, and `physical + physical/4` capped at 24; the narrow arm never exceeds the wide one. Setting either also forces sizing on where it would otherwise be declined; on a host whose physical core count is undetectable, both must be pinned. |
-| `CERA_DECODE_BPD_KB=<n>` | Bytes-per-dispatch threshold (decimal KB) separating the narrow arm from the wide one. Default 2500. Unlike the two above, this does not force sizing on where it is declined — it moves the threshold, it does not pin a width. |
+| `CERA_DECODE_SIZING=off` | Disable model-aware decode sizing (`0` / `false` / `off`, case-insensitive) and fall back to the flat cap (detected perf cores: ≤12 homogeneous, ≤6 on big.LITTLE). Use this to A/B the sizing on a new machine. |
+| `CERA_DECODE_NARROW=<n>` / `CERA_DECODE_WIDE=<n>` | Override the two widths the sizing picks between. Defaults derive from the physical core count: `physical/2` capped at 12, and `physical + physical/4` capped at 24; the narrow arm never exceeds the wide one. Setting either also forces sizing on where it would otherwise be declined; on a host whose physical core count is undetectable, both must be pinned. |
+| `CERA_DECODE_BPD_KB=<n>` | Bytes-per-dispatch threshold (decimal KB) separating the narrow arm from the wide one. Default 2500. Unlike the two above, this does not force sizing on where it is declined; it moves the threshold, it does not pin a width. |
 | `CERA_THREADS=<n>` | Overrides the detected performance-core count, which the decode/prefill pools are sized from. |
-| `CERA_CPU_TIER=<tier>` | Caps the SIMD tier (e.g. `avx2`, `avx512`). May only downgrade — useful for A/B-ing a kernel path. |
-| `CERA_LM_HEAD_NO_GEMM=1` | Puts the LM-head projection in `forward_prefill_logits_all` back on the per-row loop the batched GEMM replaced, so both halves of a speculative-decoding A/B run from the same binary. Measurement lever only — both paths compute the same projection, to within f32 accumulation order. |
+| `CERA_CPU_TIER=<tier>` | Caps the SIMD tier (e.g. `avx2`, `avx512`). May only downgrade, useful for A/B-ing a kernel path. |
+| `CERA_LM_HEAD_NO_GEMM=1` | Puts the LM-head projection in `forward_prefill_logits_all` back on the per-row loop the batched GEMM replaced, so both halves of a speculative-decoding A/B run from the same binary. Measurement lever only: both paths compute the same projection, to within f32 accumulation order. |
 | `RUST_LOG=<filter>` | Log level. Defaults to `warn`, which surfaces things like prefill falling back to the slow per-token path. |
 
 ### How the decode thread count is chosen
 
 Decode width is sized from the **loaded model**, because there is no single best
-value — and, less obviously, model *size* does not predict it. Measured on a
+value, and, less obviously, model *size* does not predict it. Measured on a
 Ryzen AI MAX+ 395 (16 physical / 32 logical), decode tok/s change going from 12
 to 20 workers:
 
@@ -311,15 +311,15 @@ to 20 workers:
 | Llama-3.2-1B Q8_0 | 1321 MB | 10.24 MB | **+38%** |
 
 Note the middle two: near-identical weight bytes, opposite answers. What
-separates them is how many **pool dispatches** a token is split across — LFM2
+separates them is how many **pool dispatches** a token is split across; LFM2
 issues 99 per token against SmolLM-360M's 257, so each dispatch amortizes 2.6×
 more work against the same fixed barrier cost. Below ~2.5 MB per dispatch decode
 is barrier-bound and wants fewer workers; above it decode is bandwidth-bound and
 wants more.
 
 cera computes that ratio from the GGUF at load and picks a narrow or wide width
-accordingly. A/B against the old flat cap of 12 — same binary, interleaved,
-`CERA_DECODE_SIZING=off` vs on, the five models above at two prompt depths —
+accordingly. A/B against the old flat cap of 12 (same binary, interleaved,
+`CERA_DECODE_SIZING=off` vs on, the five models above at two prompt depths)
 gave **+19% mean over those 10 cells with no cell slower** (small models gain
 too: they get *fewer* than 12 workers). Scored differently, against each model's
 own best measured width across the full 12-model set, the rule reaches 98.1% of
@@ -329,58 +329,58 @@ the wide one, which is the cost that average already includes.
 
 The pool itself is a process-wide singleton, built once on the first decode
 dispatch, so the width comes from the **first** model loaded into a process and
-stays there for any loaded after it — it does not re-size per load. (The thread
+stays there for any loaded after it; it does not re-size per load. (The thread
 count was already inherited that way before this sizing existed.) Embedders
 running several models in one process should pick the knobs below for whichever
 model's decode matters, or load that one first.
 
-This is calibrated on one x86 host. The sizing steps aside — leaving the
-previous flat-cap behaviour — in two cases. On heterogeneous parts, because
+This is calibrated on one x86 host. The sizing steps aside, leaving the
+previous flat-cap behaviour, in two cases. On heterogeneous parts, because
 decode there measured best across *all* big cores (that evidence is from ARM
 big.LITTLE; x86 hybrid parts decline by the same argument, without the direct
 measurement). And on hosts whose physical core count cannot be detected
 (Windows, BSD, Intel macOS), where deriving a width from the *logical* count
 would overshoot badly. Pinning a width forces it on anyway, for sweeping a
-machine it has not been tuned against — one arm is enough on a heterogeneous
+machine it has not been tuned against: one arm is enough on a heterogeneous
 host, both are required where the physical core count is undetectable.
 
 **Apple Silicon is sized, not declined.** M-series parts are heterogeneous in
 hardware, but cera detects only their P-cores, so neither decline case applies:
-an M4 Max gets 12 workers for large models (its full P-core count — there is no
+an M4 Max gets 12 workers for large models (its full P-core count; there is no
 SMT for the wide arm to spend) and 6 for small ones. That narrow arm is the
 part of this that has *not* been measured off x86.
 
 If you run one model repeatedly and care about decode latency, it is still
 worth measuring: `cera bench --model <path>` with `CERA_DECODE_THREADS` set
 sweeps a fixed width, and `CERA_DECODE_SIZING=off` gives you the old default to
-compare against. Interleave the arms rather than sweeping — laptop clocks drift
+compare against. Interleave the arms rather than sweeping; laptop clocks drift
 enough to invent a trend that isn't there.
 
 ## Other features
 
-- **Speculative decoding** — opt-in greedy speculation with prompt-lookup
+- **Speculative decoding**: opt-in greedy speculation with prompt-lookup
   (n-gram) drafting: no draft model, so no extra weight memory. Verifying K
   drafted tokens in one forward amortizes the single weight-read over the
   accepted run, which is where bandwidth-bound decode gets its win. (As of #327
   the LM head is projected for all verified positions in one batched GEMM, so it
   too is read once per round.) Every emitted token is the target's own
-  argmax — a poor draft costs acceptance rate, never
-  correctness — though a near-tie can land differently than a sequential greedy
+  argmax (a poor draft costs acceptance rate, never
+  correctness), though a near-tie can land differently than a sequential greedy
   run, since the verifier forwards a different batch shape. Today it engages on
   the **CPU dense (`llama`-family) path only**, on the plain greedy path with an
   uncompressed KV cache, and falls back transparently everywhere else. On the
   CLI it is exposed on `bench` (`--spec`).
-- **Streaming & cancellation** — tokens (and audio frames) arrive through a
+- **Streaming & cancellation**: tokens (and audio frames) arrive through a
   `ModalitySink` as they decode; `Session::cancel()` interrupts long prompts
   responsively via chunked prefill.
-- **Prefix caching** — warm (in-memory) and cold (on-disk) KV reuse across
+- **Prefix caching**: warm (in-memory) and cold (on-disk) KV reuse across
   sessions, namespaced by model fingerprint, so repeated prompt prefixes skip
   re-prefill.
-- **Chat templates** — Jinja2 (minijinja) rendering straight from GGUF metadata,
+- **Chat templates**: Jinja2 (minijinja) rendering straight from GGUF metadata,
   including multimodal (image + text) messages.
-- **Context shifting** — RoPE re-rotation with `n_keep` prefix pinning, on CPU
+- **Context shifting**: RoPE re-rotation with `n_keep` prefix pinning, on CPU
   and GPU, keeps generation going past the context window.
-- **Built-in BPE tokenizer** — vocab, merges, and special tokens loaded directly
+- **Built-in BPE tokenizer**: vocab, merges, and special tokens loaded directly
   from GGUF; no external tokenizer files.
 
 ## Architecture
@@ -389,19 +389,19 @@ Cera is a Cargo workspace. The core library does GGUF parsing, quantization, the
 compute backends, the models, and the tokenizer; everything else is a thin
 adapter over it.
 
-- **[`cera`](cera/)** — core library
-- **[`cera-cli`](cera-cli/)** — CLI binary (clap)
-- **[`cera-ffi`](cera-ffi/)** — UniFFI bindings (Kotlin / Swift / Python)
-- **[`cera-ffi-kotlin`](cera-ffi-kotlin/)** · **[`cera-ffi-flutter`](cera-ffi-flutter/)** — Android / Flutter packaging
-- **[`cera-wasm`](cera-wasm/)** — `wasm-bindgen` browser / Node bindings
-- **[`cera-parity`](cera-parity/)** — cross-binding parity harness (runs one prompt through every binding and reports drift)
+- **[`cera`](cera/)**: core library
+- **[`cera-cli`](cera-cli/)**: CLI binary (clap)
+- **[`cera-ffi`](cera-ffi/)**: UniFFI bindings (Kotlin / Swift / Python)
+- **[`cera-ffi-kotlin`](cera-ffi-kotlin/)** · **[`cera-ffi-flutter`](cera-ffi-flutter/)**: Android / Flutter packaging
+- **[`cera-wasm`](cera-wasm/)**: `wasm-bindgen` browser / Node bindings
+- **[`cera-parity`](cera-parity/)**: cross-binding parity harness (runs one prompt through every binding and reports drift)
 
 See the [`cera` crate README](cera/README.md) for the module layout, the model
 trait, and the inference loop.
 
 ## Performance
 
-Cera is competitive with — and on decode, often faster than — llama.cpp on the
+Cera is competitive with (and on decode, often faster than) llama.cpp on the
 LFM2 family. On an M1 Max with Q4_0 weights, the native Metal backend decodes
 roughly **2× faster than llama.cpp** across tested VL and Audio models; prefill
 leads at short prompts and trails at long ones.
@@ -412,9 +412,9 @@ from four changes: removing register spills in the quantized GEMV kernels,
 merging the LFM2 conv block into one compute pass, deleting two per-token GPU
 round trips that carried almost no work, and running the LM head on the weight as
 GGUF stores it instead of a dequantized f16 copy (which also gives back ~79 MB of
-VRAM on a 230M model). A fifth change since then — word-loading the Q6_K GEMV
-instead of reading it byte-at-a-time — measured **+11.6%** decode (109.5 to
-122.1 tok/s, ABBA-ordered) on **LFM2.5-230M-Q4_K_M** — a different model from the
+VRAM on a 230M model). A fifth change since then, word-loading the Q6_K GEMV
+instead of reading it byte-at-a-time, measured **+11.6%** decode (109.5 to
+122.1 tok/s, ABBA-ordered) on **LFM2.5-230M-Q4_K_M**, a different model from the
 1.78x row above, so the two do not multiply. That gain is entirely conditional on
 the change before it: measured *without* #320, the same kernel was flat (110.0 vs
 110.5 tok/s), because the only Q6_K matrix in the decode path was one `ffn_down`
@@ -433,7 +433,7 @@ override knobs are documented under
 Detailed methodology, per-model tables (decode + prefill vs llama.cpp), the
 Accelerate/AMX BLAS results, and the backend optimization notes live in
 **[`benchmarks/README.md`](benchmarks/README.md)**. Numbers there are tagged with
-the commit and device they were measured on — some sections are older than
+the commit and device they were measured on; some sections are older than
 others, and the Android GPU row in particular predates the wgpu work above.
 
 ## License

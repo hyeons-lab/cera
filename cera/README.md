@@ -22,21 +22,21 @@ cera = "0.4"
 ## Breaking changes in 0.4.0
 
 0.4.0 adds public fields and enum variants to public types, so it is a minor
-(not patch) release — a `cargo update` from 0.3.x will not pull it in
+(not patch) release; a `cargo update` from 0.3.x will not pull it in
 automatically. No type in `cera` is `#[non_exhaustive]`, so these break any code
 that writes exhaustive struct literals or exhaustive `match`es. Code that keeps
 the default settings sees no behavior change; the one exception is the new
 `KvCompressionConflict` below, which turns a previously-silent mismatch into an
 error.
 
-- **`GenerateOpts` gained `spec: Option<SpecDecode>`** — opt-in greedy
+- **`GenerateOpts` gained `spec: Option<SpecDecode>`**: opt-in greedy
   speculative decoding (see [Speculative decoding](#speculative-decoding)).
   Code that constructs `GenerateOpts` with an exhaustive struct literal must
-  add the field; prefer functional-update syntax —
-  `GenerateOpts { max_tokens: 256, ..Default::default() }` — which stays
+  add the field; prefer functional-update syntax,
+  `GenerateOpts { max_tokens: 256, ..Default::default() }`, which stays
   source-compatible across field additions. It defaults to `None`, preserving
   prior behavior.
-- **`CeraError` gained `KvCompressionConflict`** — returned when a second
+- **`CeraError` gained `KvCompressionConflict`**: returned when a second
   session asks a model for a different KV-compression mode than the one it was
   built with, instead of handing back a cache the kernels do not match.
   Exhaustive `match`es over `CeraError` need a new arm. This is the one item
@@ -75,19 +75,19 @@ One caveat for anyone reaching into backend internals: the dead WGSL kernels
 `backend::wgpu::shaders::{GEMM_Q4_0, GEMM_Q8_0, ATTENTION}` were removed once
 the register-tiled GEMM and flash-attention kernels superseded them. They were
 shader **source text** behind the `gpu` feature, never part of the intended
-API, so this ships as a patch rather than a minor bump — but a `^0.3` consumer
+API, so this ships as a patch rather than a minor bump, but a `^0.3` consumer
 that named them will need to stop.
 
 ## Breaking changes in 0.3.0
 
 0.3.0 adds public fields to two public structs, so it is a minor (not patch)
-release — a `cargo update` from 0.2.x will not pull it in automatically.
+release; a `cargo update` from 0.2.x will not pull it in automatically.
 
 - **`GenerateOpts` gained `ignore_eos: bool`** (run decode to exactly
-  `max_tokens`, ignoring EOS/stop tokens — the `llama.cpp --ignore-eos`
+  `max_tokens`, ignoring EOS/stop tokens, the `llama.cpp --ignore-eos`
   analog). Code that constructs `GenerateOpts` with an exhaustive struct
-  literal must add the field; prefer functional-update syntax —
-  `GenerateOpts { max_tokens: 256, ..Default::default() }` — which stays
+  literal must add the field; prefer functional-update syntax,
+  `GenerateOpts { max_tokens: 256, ..Default::default() }`, which stays
   source-compatible across field additions. It defaults to `false`,
   preserving prior behavior.
 - **`ModelMetadata` gained `add_eos_token: bool`** (mirrors GGUF
@@ -102,7 +102,7 @@ reports real prefill wall time paired with `prompt_eval_tokens`.
 
 ## Supported models
 
-cera loads **GGUF** weights — either a raw `.gguf` file or a
+cera loads **GGUF** weights, either a raw `.gguf` file or a
 [LeapBundles](https://huggingface.co/LiquidAI/LeapBundles) manifest that points
 at one. Dispatch is on the GGUF `general.architecture` string:
 
@@ -194,11 +194,11 @@ stochastic. Min-p and repetition penalty apply on the stochastic path only.
 ## Speculative decoding
 
 `GenerateOpts::spec` opts into greedy speculative decoding with **prompt-lookup
-(n-gram) drafting** — no draft model, so no extra weight memory. The drafter
+(n-gram) drafting**: no draft model, so no extra weight memory. The drafter
 guesses the next tokens from the most recent earlier occurrence of the last
 `ngram` tokens, and the target verifies up to `k` of them in a single forward.
 A target forward reads every weight once, so verifying K drafted tokens in one
-pass amortizes that read over the accepted run — which is why this targets the
+pass amortizes that read over the accepted run, which is why this targets the
 memory-bandwidth wall in CPU decode-at-depth. As of #327 the verify path projects
 all `1 + k` positions' logits in a single batched GEMM, so the LM head (the
 largest matrix in the model) is read once per round rather than once per position;
@@ -215,7 +215,7 @@ let opts = GenerateOpts {
 };
 ```
 
-**Every emitted token is the target's own argmax** — a valid greedy decode, so
+**Every emitted token is the target's own argmax**, a valid greedy decode, so
 a poor draft lowers the acceptance rate without affecting correctness. It is not
 guaranteed bit-identical to a *sequential* greedy run: the verifier forwards a
 batch where a sequential loop forwards one token at a time, and the two
@@ -226,7 +226,7 @@ that reports
 that means **the CPU dense (`llama`-family) path only**: `LlamaModel` is the
 one implementor, and the trait default is `false`, so LFM2 and every GPU model
 fall through. Any other configuration falls back to normal decode transparently
-rather than erroring, so setting `spec` unconditionally is safe — it is a
+rather than erroring, so setting `spec` unconditionally is safe; it is a
 no-op where unsupported.
 
 The CLI exposes it on `bench` (`--spec`, `--spec-ngram`, `--spec-k`) for
@@ -239,7 +239,7 @@ back out, format-aware: `ToolFormat::detect(arch)` picks Pythonic (LFM2) vs
 Hermes JSON (Qwen2.5/Qwen3) from the GGUF architecture.
 
 Continuing from the Quick start (which sets up `engine`, `session`, and the
-chat `messages`, and produces the decoded `reply_text`) — the schema below uses
+chat `messages`, and produces the decoded `reply_text`), the schema below uses
 the `serde_json` crate, which `cera` does not re-export, so add it to your
 `Cargo.toml`:
 
@@ -282,8 +282,8 @@ model decides freely whether and how to call a tool.
 
 ## LoRA adapters & hidden states
 
-Load a LoRA adapter — a llama.cpp GGUF (from `convert_lora_to_gguf`) or a PEFT
-`.safetensors` — and attach it to a `Session`. The delta is applied at inference
+Load a LoRA adapter, a llama.cpp GGUF (from `convert_lora_to_gguf`) or a PEFT
+`.safetensors`, and attach it to a `Session`. The delta is applied at inference
 time (`y += scale·B·(A·x)`), **never merged into the weights**, so the base model
 stays quantized and adapters hot-swap / unload per request. Runs on CPU, Metal,
 and wgpu (batched-GEMM prefill + decode) and is dimension-checked at attach.
@@ -297,7 +297,7 @@ session.attach_lora_adapters(adapters)?;   // hot-swap-able; applies to every fo
 session.remove_lora_adapters();
 ```
 
-Pull the per-token last-layer hidden state (post-final-RMSNorm — the llama.cpp
+Pull the per-token last-layer hidden state (post-final-RMSNorm, the llama.cpp
 `--pooling none` vector) straight out of the engine, reflecting the active
 adapter. This is the classifier / embedding path (e.g. a section router: `LFM2.5`
 + a `route_section` LoRA + a small linear head over the mean-pooled state):
@@ -324,10 +324,10 @@ shrink the crate for `wasm32-unknown-unknown` or embedded targets
 | `disk-cache` | ✅ | Cold KV-cache tier on disk (⇒ `std-fs`) |
 | `vl-preprocess` | ✅ | Image input decode/resize for VL models |
 | `avx512` | ✅ | x86-64 AVX-512 Q8_0/Q4_0 tier (needs Rust 1.89+) |
-| `gpu` | — | wgpu compute backend |
-| `metal` | — | Apple Metal backend (⇒ `mmap`) |
-| `blas` | — | Opt-in GEMM accelerator |
-| `remote` | — | `BundleRepo` HTTP download + SHA-256 (⇒ `std-fs`) |
+| `gpu` | - | wgpu compute backend |
+| `metal` | - | Apple Metal backend (⇒ `mmap`) |
+| `blas` | - | Opt-in GEMM accelerator |
+| `remote` | - | `BundleRepo` HTTP download + SHA-256 (⇒ `std-fs`) |
 
 MSRV: Rust 1.94 (edition 2024; the NEON f16 `vcvt_f32_f16` KV-cache widen needs
 1.94). The default-on `avx512` feature enables the AVX-512 tier on x86;
@@ -340,18 +340,18 @@ persistent, affinity-pinned worker pool (not a per-call fork-join), with dynamic
 chunk-stealing so faster cores absorb more work on heterogeneous big.LITTLE
 mobile. On heterogeneous big.LITTLE parts (Linux/Android) detection keeps at
 most 6 big cores for both pools, which fixes the multi-core decode collapse
-there. Elsewhere — desktop/server (where sysfs detection is skipped and every
+there. Elsewhere, desktop/server (where sysfs detection is skipped and every
 logical CPU counts as a "perf core") and macOS (where the P-core count comes
-from `hw.perflevel0`) — prefill
+from `hw.perflevel0`), prefill
 uses all of them while **decode is sized from the loaded model** (see "How the
 decode thread count is chosen" in the top-level README): small models that
 spread a token across many small pool dispatches run narrow, large ones that
-move more bytes per dispatch run wide. Where that sizing does not apply —
+move more bytes per dispatch run wide. Where that sizing does not apply,
 heterogeneous parts, or a host whose physical core count cannot be detected
-(Windows, BSD, Intel macOS) — the previous flat cap applies as before (≤12
+(Windows, BSD, Intel macOS), the previous flat cap applies as before (≤12
 homogeneous, ≤6 on big.LITTLE). Both pools are process-wide singletons, so the
 decode width is sized from the **first** model loaded into a process and stays
-there for any loaded after it — it does not re-size per load. Everything else is
+there for any loaded after it; it does not re-size per load. Everything else is
 auto-detected per device; the
 environment variables below only override for tuning (`CERA_THREADS` moves the
 detected count, which both pools size from):
@@ -362,14 +362,14 @@ detected count, which both pools size from):
 | `CERA_DECODE_SIZING` | on | `0` / `false` / `off` disables model-aware decode sizing, falling back to the flat cap (detected perf cores, ≤6 heterogeneous / ≤12 homogeneous). |
 | `CERA_DECODE_NARROW` | `physical / 2`, capped at 12 | Decode width for barrier-bound models (below the bytes-per-dispatch threshold); never exceeds the wide arm. Setting it also forces sizing on where it would otherwise be declined (on a host whose physical core count is undetectable, both arms must be pinned). |
 | `CERA_DECODE_WIDE` | `physical + physical / 4`, capped at 24 | Decode width for bandwidth-bound models, clamped to the detected cores. Setting it also forces sizing on where it would otherwise be declined (on a host whose physical core count is undetectable, both arms must be pinned). |
-| `CERA_DECODE_BPD_KB` | 2500 | Bytes-per-dispatch threshold (decimal KB) separating the two arms above. Unlike the two widths, this does **not** force sizing on where it is declined — it moves the threshold, it does not pin a width. |
+| `CERA_DECODE_BPD_KB` | 2500 | Bytes-per-dispatch threshold (decimal KB) separating the two arms above. Unlike the two widths, this does **not** force sizing on where it is declined; it moves the threshold, it does not pin a width. |
 | `CERA_THREADS` | detected perf-core count | Override the detected performance-core count (moves the auto width for both pools). |
 | `CERA_MIN_ROWS` | 128 | Minimum output rows a decode-GEMV worker takes before another joins. |
 | `CERA_PAR_THRESHOLD` | 256 | Minimum output dimension before a GEMV parallelizes; smaller GEMVs stay serial. |
 | `CERA_SPIN` | 100000 | Spin iterations before an idle worker parks. |
 | `CERA_PIN` | on | `0` / `false` / `off` disables affinity pinning (for hosts that manage thread placement themselves). |
-| `CERA_CPU_TIER` | auto | Force a lower CPU SIMD tier (downgrade only) — for parity testing on capable hardware. |
-| `CERA_LM_HEAD_NO_GEMM` | unset | `1` puts the LM-head projection in `forward_prefill_logits_all` back on the per-row loop the batched GEMM replaced, so both halves of a speculative-decoding A/B run from one binary. Measurement lever only — both paths compute the same projection, to within f32 accumulation order. |
+| `CERA_CPU_TIER` | auto | Force a lower CPU SIMD tier (downgrade only), for parity testing on capable hardware. |
+| `CERA_LM_HEAD_NO_GEMM` | unset | `1` puts the LM-head projection in `forward_prefill_logits_all` back on the per-row loop the batched GEMM replaced, so both halves of a speculative-decoding A/B run from one binary. Measurement lever only; both paths compute the same projection, to within f32 accumulation order. |
 
 Affinity pinning applies on Linux/Android with a detected heterogeneous
 topology; homogeneous hosts and macOS run unpinned.

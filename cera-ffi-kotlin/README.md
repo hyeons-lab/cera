@@ -8,7 +8,7 @@ as two artifacts under the `com.hyeons-lab` group:
 | `com.hyeons-lab:cera-ffi-jvm`     | Desktop JVM | bundled in `resources/<jna-prefix>/` (macOS arm64, Linux x64, Windows x64) |
 | `com.hyeons-lab:cera-ffi-android` | Android     | `jniLibs/<abi>/` (arm64-v8a, armeabi-v7a, x86_64, x86) |
 
-Both compile the **same vendored binding** — `cera-ffi/bindings/kotlin/cera_ffi.kt`,
+Both compile the **same vendored binding**: `cera-ffi/bindings/kotlin/cera_ffi.kt`,
 wired in via `srcDir` (no copy) so it never drifts from `just bindings`. JNA loads
 the `cera_ffi` native library from the classpath at runtime.
 
@@ -19,7 +19,7 @@ since Java/Kotlin package syntax forbids dashes.
 
 ## Build & publish
 
-Native libraries are **not** committed — they're built by cargo / cargo-ndk and
+Native libraries are **not** committed; they're built by cargo / cargo-ndk and
 staged before packaging.
 
 ```bash
@@ -36,7 +36,7 @@ CI (the `jvm` leg of `.github/workflows/publish.yml`, manual `workflow_dispatch`
 the native libs per runner (macOS/Linux/Windows + Android NDK), then publishes
 `cera-ffi` to Maven Central via the vanniktech plugin. The version (`VERSION_NAME`
 in `gradle.properties`) tracks the Cargo workspace version, so the Kotlin/Android
-artifacts release under the **same** version as the crates.io and npm artifacts —
+artifacts release under the **same** version as the crates.io and npm artifacts,
 e.g. `0.4.0` everywhere.
 
 - A release version (no `-SNAPSHOT`) is a **real** Maven Central release and is
@@ -47,7 +47,7 @@ e.g. `0.4.0` everywhere.
   `publishAndReleaseToMavenCentral` (uploads, signs, and auto-releases the
   deployment).
 - A `-SNAPSHOT` version instead routes to the snapshot repo and skips signing.
-- Run with `dry_run = true` first — it publishes a `-SNAPSHOT` to your local
+- Run with `dry_run = true` first; it publishes a `-SNAPSHOT` to your local
   Maven repo (`publishToMavenLocal`), needing no token or signing key.
 
 Versions (kotlin, AGP, vanniktech, compile/minSdk) are pinned in

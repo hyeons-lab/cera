@@ -9,7 +9,7 @@
 > `specialTokenId` / `isSpecialToken`), session lifecycle (`reset`
 > / `cancel` / `clearCancel`), and sync streaming text generation
 > via `Session.generate(opts, cb)`. `Session.appendAudio` is wired
-> as a placeholder symbol — the cera-core method is still a
+> as a placeholder symbol; the cera-core method is still a
 > scaffold (always errors); the wasm signature is locked in so JS
 > code stabilizes against the same shape the JVM/Apple bindings
 > expose.
@@ -22,11 +22,11 @@ npm install @hyeons-lab/cera-wasm  # not yet published
 
 For now, download the artifact matching your consumer shape from
 the latest [CI run](https://github.com/hyeons-lab/cera/actions/workflows/ci.yml)
-on `main` — three are produced per build:
+on `main`; three are produced per build:
 
 | Artifact | wasm-pack target | When to use |
 |---|---|---|
-| `cera-wasm-pkg-bundler` | `bundler` | webpack 5+, Vite, Rollup (with wasm plugin), Parcel — the typical app build |
+| `cera-wasm-pkg-bundler` | `bundler` | webpack 5+, Vite, Rollup (with wasm plugin), Parcel: the typical app build |
 | `cera-wasm-pkg-web` | `web` | `<script type="module">` direct in the browser, or any bundler-less ESM workflow |
 | `cera-wasm-pkg-nodejs` | `nodejs` | `require('@hyeons-lab/cera-wasm')` from CommonJS Node, or older Node without ESM `import` |
 
@@ -37,7 +37,7 @@ npm install /path/to/downloaded/pkg-bundler  # or pkg-web / pkg-nodejs
 > **One npm package, three target shapes:** all three artifacts
 > ship `package.json.name` = `@hyeons-lab/cera-wasm` today. The
 > publish workflow (deferred) will resolve the collision before
-> shipping to the registry — likely by publishing each target as
+> shipping to the registry; likely by publishing each target as
 > a separate scoped package (`@hyeons-lab/cera-wasm`,
 > `@hyeons-lab/cera-wasm-web`, `@hyeons-lab/cera-wasm-nodejs`).
 
@@ -45,7 +45,7 @@ npm install /path/to/downloaded/pkg-bundler  # or pkg-web / pkg-nodejs
 
 The examples below assume the **`bundler`** target. The `web`
 target also needs a one-time `await init()` call before the first
-export — see the
+export; see the
 [wasm-pack docs](https://rustwasm.github.io/docs/wasm-pack/tutorials/npm-browser-packages/getting-started.html)
 for the init pattern. The `nodejs` target does **not** need an
 explicit init: `require('@hyeons-lab/cera-wasm')` returns a ready
@@ -83,13 +83,13 @@ const engine = CeraEngine.fromGgufBytes(bytes, 2048);
 
 console.log(engine.architecture);     // "lfm2"
 console.log(engine.maxSeqLen);        // 2048 (clamped to min(contextSize, gguf max))
-console.log(engine.contextSize);      // 2048 — what you passed (or 4096 if omitted)
+console.log(engine.contextSize);      // 2048: what you passed (or 4096 if omitted)
 console.log(engine.vocabSize);
 console.log(engine.quantization);     // "Q4_0", "Q8_0", "BF16", etc.
 console.log(engine.hasChatTemplate);  // true / false
 console.log(engine.addBosToken);      // honor when hand-building token sequences
 
-// Modality capability probe. Plain JS object — no .free() needed,
+// Modality capability probe. Plain JS object; no .free() needed,
 // destructurable. Today every model loaded via fromGgufBytes
 // reports text-only because wasm uses cera's synthetic-text
 // manifest path; a model-aware loader (planned) will surface real
@@ -107,7 +107,7 @@ console.log(tok.decode(ids));           // round-trips to "hello world"
 const imStart = tok.specialTokenId('<|im_start|>');  // number | undefined
 
 // Filter control tokens from a streamed batch before rendering
-// to UI — keeps `<|im_end|>` etc. out of the displayed text.
+// to UI; keeps `<|im_end|>` etc. out of the displayed text.
 const visible = ids.filter(id => !tok.isSpecialToken(id));
 
 // Render the GGUF-embedded Jinja chat template against a message
@@ -128,7 +128,7 @@ engine.free();
 > **Memory note:** `CeraEngine` keeps the entire GGUF resident in
 > wasm linear memory. Always `engine.free()` (or use the
 > `[Symbol.dispose]()` pattern with `using` in TC39 explicit
-> resource management) when you're done — otherwise the model
+> resource management) when you're done; otherwise the model
 > stays alive until the page unloads.
 
 ### Inference (text)
@@ -155,7 +155,7 @@ const opts = new GenerateOpts();
 opts.maxTokens = 64;
 opts.temperature = 0.0;
 // `tok.eosToken` is `number | undefined`. `new Uint32Array([undefined])`
-// silently coerces to `0` — which would stop decoding the moment
+// silently coerces to `0`, which would stop decoding the moment
 // token 0 is produced. Always guard the lookup.
 if (tok.eosToken != null) {
     opts.stopTokens = new Uint32Array([tok.eosToken]);
@@ -163,7 +163,7 @@ if (tok.eosToken != null) {
 
 // Stream tokens as they decode. The callback fires per flush
 // boundary (every `flushEveryTokens` decoded tokens, OR every
-// `flushEveryMs` ms — whichever hits first) with just the *new*
+// `flushEveryMs` ms, whichever hits first) with just the *new*
 // tokens, not the cumulative buffer.
 let acc = [];
 const summary = session.generate(opts, (newTokens) => {
@@ -183,7 +183,7 @@ engine.free();
 ### Sampling knobs & constrained decoding
 
 Beyond the fields shown above, `GenerateOpts` also exposes `minP` and
-`repetitionPenalty`. Both apply on the **stochastic path only** — greedy/argmax
+`repetitionPenalty`. Both apply on the **stochastic path only**; greedy/argmax
 decoding (selected by a temperature of `0` **or** a top-k of `1`) ignores them:
 
 ```js
@@ -194,14 +194,14 @@ opts.repetitionPenalty = 1.1;   // penalize already-emitted tokens
 ```
 
 Constrain output to a GBNF grammar (e.g. force valid JSON). Unlike the
-other knobs this is a **method**, not a settable property — `setGrammar`
+other knobs this is a **method**, not a settable property; `setGrammar`
 can throw if the grammar fails to compile, which a plain setter can't
 surface:
 
 ```js
 const opts = new GenerateOpts();
 opts.setGrammar('root ::= "{" [a-z]+ "}"');  // throws on a malformed grammar
-opts.hasGrammar;       // → true (getter — property access, no parens)
+opts.hasGrammar;       // → true (getter: property access, no parens)
 // opts.clearGrammar(); // back to unconstrained decoding
 ```
 
@@ -211,7 +211,7 @@ are sampled; a later `setGrammar` replaces any grammar set by a prior call.
 ### Tool calling
 
 Render a set of tools into the prompt, generate, then parse the calls back out.
-The wire format is per-model-family — detect it from the GGUF architecture
+The wire format is per-model-family; detect it from the GGUF architecture
 (`detectToolFormat`) or pick one explicitly (`ToolFormat.Lfm2Pythonic` for
 LFM2/LFM2.5, `ToolFormat.Hermes` for Qwen2.5/Qwen3). Tools cross the JS boundary
 as a JSON string; `parseToolCalls` returns a JSON string you `JSON.parse`.
@@ -242,7 +242,7 @@ opts.maxTokens = 128;
 // Optional: constrain to a valid call (grammar + lazy start-marker trigger).
 // The start marker differs by format; it must be a special token in the model's
 // vocab for the trigger to fire (LFM2's is; Hermes markers usually aren't, so
-// this stays unconstrained there — the model still emits a parseable call).
+// this stays unconstrained there; the model still emits a parseable call).
 const startMarker = format === ToolFormat.Hermes ? '<tool_call>' : '<|tool_call_start|>';
 const trigger = tok.specialTokenId(startMarker);
 if (trigger != null) {
@@ -266,7 +266,7 @@ names, and correctly-typed values.
 ### LoRA adapters & hidden states
 
 Load a LoRA adapter from bytes (GGUF or PEFT `.safetensors`) and attach it to a
-session — applied at inference time, never merged, so it hot-swaps freely (and
+session; applied at inference time, never merged, so it hot-swaps freely (and
 detaches on demand with `session.removeLora()`). Then pull per-token hidden
 states out of the engine (reflecting the active adapter) for classifier /
 embedding heads.
@@ -304,14 +304,14 @@ import {
 } from '@hyeons-lab/cera-wasm';
 
 const cfg = new SessionConfig();
-cfg.seed = 42n;        // BigInt — wasm-bindgen maps Rust u64 to JS BigInt
+cfg.seed = 42n;        // BigInt: wasm-bindgen maps Rust u64 to JS BigInt
 
 // You can also tune:
 //   cfg.maxSeqLen = 1024;   // further lower the KV cap below the
 //                           // engine's effective max
 //                           // (= min(engine.contextSize, model.maxSeqLen)).
 //                           // Setting a value above that effective max
-//                           // does NOT raise it — re-construct the engine
+//                           // does NOT raise it; re-construct the engine
 //                           // with a larger contextSize for that.
 //   cfg.nKeep = 16;         // pin the first 16 tokens across context shifts
 //                           // (useful for keeping a system prompt resident)
@@ -321,22 +321,22 @@ cfg.seed = 42n;        // BigInt — wasm-bindgen maps Rust u64 to JS BigInt
 // Optional: turn on TurboQuant KV compression. Compresses keys to
 // ~3 bits/elem and values to ~2 bits/elem (plus a norm word per
 // vector). Pass an explicit seed so the per-layer Hadamard
-// rotations are reproducible — paired with `cfg.seed` above this
+// rotations are reproducible; paired with `cfg.seed` above this
 // keeps the whole session bitwise-identical across runs.
 //
 // Caveats:
 // - Only kicks in when the model's `head_dim` is a power of two.
-//   cera logs a warning and falls back to f32 if not — no JS
+//   cera logs a warning and falls back to f32 if not; no JS
 //   error.
 // - Applies to `engine.newSession(cfg)` only. `WebGpuSession`
-//   takes no `SessionConfig` — pass a `TurboQuantConfig` as the
+//   takes no `SessionConfig`; pass a `TurboQuantConfig` as the
 //   third argument of `WebGpuSession.create` instead, and read
 //   `session.kvCompression` for the mode that took effect.
 // - Don't combine with `cfg.nKeep > 0` (context-shift); cera
 //   warns at session creation and ignores nKeep on overflow.
 const tq = new TurboQuantConfig(1234n);  // ctor sets keys + values = true
 // tq.keys = false;  // flip per-side toggles for debugging
-cfg.kvCompression = tq;  // setter consumes `tq` — read back via getter to inspect
+cfg.kvCompression = tq;  // setter consumes `tq`; read back via getter to inspect
 
 const session = engine.newSession(cfg);
 session.appendText('once upon a time');
@@ -350,7 +350,7 @@ session.generate(opts, (toks) => out.push(...toks));
 
 > **Worker note:** `Session.generate` is **synchronous** and blocks
 > the thread it runs on for the full decode duration (potentially
-> seconds). On the browser main thread that freezes the page —
+> seconds). On the browser main thread that freezes the page;
 > always call from a Web Worker:
 >
 > ```js
@@ -367,7 +367,7 @@ session.generate(opts, (toks) => out.push(...toks));
 > };
 > ```
 >
-> On Node the sync call also blocks the JS event loop — libuv's
+> On Node the sync call also blocks the JS event loop; libuv's
 > background I/O thread pool keeps running, but JS callbacks (HTTP
 > handlers, timers, etc.) queue up and don't fire until generate
 > returns. For server processes that need to handle other requests
@@ -382,7 +382,7 @@ at the next checkpoint.
 
 The catch: JS workers (web + `worker_threads`) are single-threaded.
 While `generate()` is blocking, the worker's own message handlers
-**cannot run** — a `postMessage({ kind: 'cancel' })` from the main
+**cannot run**; a `postMessage({ kind: 'cancel' })` from the main
 thread queues but doesn't dispatch until `generate` returns. So a
 plain JS flag set by an `onmessage` handler can't be updated
 mid-decode.
@@ -412,7 +412,7 @@ and `Cross-Origin-Embedder-Policy: require-corp` headers); transparent
 on Node `worker_threads`.
 
 ```js
-// main thread — only structured-cloneable data crosses the
+// main thread: only structured-cloneable data crosses the
 // postMessage boundary. wasm-bindgen objects (GenerateOpts,
 // Session, etc.) live inside wasm linear memory and would throw
 // on postMessage; pass plain params and construct the object on
@@ -424,7 +424,7 @@ worker.postMessage({ kind: 'generate', params: { maxTokens: 64 } });
 // later, to cancel:
 Atomics.store(cancelFlag, 0, 1);
 
-// worker.js — `generate()` is invoked from inside the message
+// worker.js: `generate()` is invoked from inside the message
 // handler so `cancelFlag` is guaranteed initialized first; running
 // `generate` at top-level would race with `init` and crash on
 // `Atomics.load(undefined, 0)`. The `cancelFlag` null check guards
@@ -461,10 +461,10 @@ without paying `engine.newSession(config)` setup cost again:
 
 | API | KV cache | `position` | Sampler | When to use |
 |---|---|---|---|---|
-| `session.clearCancel()` | preserved | preserved | preserved | "interrupted but continuing" — keep the conversation context, append more tokens, generate again |
-| `session.reset()` | dropped | reset to 0 | re-seeded from `cfg.seed` | "clear conversation" UI button — start fresh |
+| `session.clearCancel()` | preserved | preserved | preserved | "interrupted but continuing": keep the conversation context, append more tokens, generate again |
+| `session.reset()` | dropped | reset to 0 | re-seeded from `cfg.seed` | "clear conversation" UI button: start fresh |
 
-`clearCancel()` takes `&self`, `reset()` takes `&mut self` —
+`clearCancel()` takes `&self`, `reset()` takes `&mut self`;
 remember `reset()` must be invoked outside any in-flight `generate`
 (wasm-bindgen's borrow check rejects re-entry).
 
@@ -488,14 +488,14 @@ for webpack / Rollup / Parcel specifics.
 For no-bundler workflows (`<script type="module">` directly in the
 browser, or `require('@hyeons-lab/cera-wasm')` from CommonJS Node),
 download the `cera-wasm-pkg-web` or `cera-wasm-pkg-nodejs` artifact
-instead — see the `Install` section above for the per-target
+instead; see the `Install` section above for the per-target
 table.
 
 ## GPU acceleration (experimental WebGPU)
 
 An **experimental** WebGPU-backed session lights up when the crate is
 built with the `wgpu` cargo feature (which pulls in `cera/gpu`). It's a
-prototype — **LFM2 only, greedy decode** — with a surface deliberately
+prototype (**LFM2 only, greedy decode**) with a surface deliberately
 separate from the CPU `Session`: WebGPU can't do blocking GPU readback on
 the JS event loop, so the whole prefill + decode loop is `async`. The
 default builds above are CPU-only; the standard `Session` remains the
@@ -504,13 +504,13 @@ supported path.
 ```js
 import { WebGpuSession, TurboQuantConfig } from '@hyeons-lab/cera-wasm';
 
-// Async constructor — initializes WebGPU (requestAdapter / requestDevice
+// Async constructor: initializes WebGPU (requestAdapter / requestDevice
 // resolve on the event loop), parses the GGUF, and uploads the model to
 // the GPU. `contextSize` defaults to 4096. Throws if WebGPU is
 // unavailable or the bytes aren't a valid LFM2 GGUF.
 //
 // The optional third argument requests TurboQuant on the GPU-resident KV
-// cache (~3-bit keys / ~2-bit values). Omit it — or pass null — for
+// cache (~3-bit keys / ~2-bit values). Omit it, or pass null, for
 // uncompressed f32 KV; existing two-argument calls are unaffected. Like
 // the `SessionConfig` setter, `create` CONSUMES the config handle. Build a
 // fresh one per session: a reused handle does NOT throw in a release build,
@@ -519,7 +519,7 @@ import { WebGpuSession, TurboQuantConfig } from '@hyeons-lab/cera-wasm';
 const session = await WebGpuSession.create(ggufBytes, 2048, new TurboQuantConfig(1234n));
 
 // To request TurboQuant but keep the default contextSize, pass an explicit
-// placeholder for argument 2 — `undefined` and `null` both work (the generated
+// placeholder for argument 2: `undefined` and `null` both work (the generated
 // signature is `context_size?: number | null`):
 //
 //   await WebGpuSession.create(ggufBytes, undefined, new TurboQuantConfig(1234n));
@@ -530,10 +530,10 @@ const session = await WebGpuSession.create(ggufBytes, 2048, new TurboQuantConfig
 // you get an unusable session with no compression and no error. (A `--dev`
 // build throws instead, so this only bites in release.)
 
-// Adapter + backend description — confirms the GPU path is live.
+// Adapter + backend description: confirms the GPU path is live.
 console.log(session.adapter);  // e.g. "<adapter> (BrowserWebGpu)"
 
-// The mode that ACTUALLY took effect — "turboquant(seed=N)" or
+// The mode that ACTUALLY took effect: "turboquant(seed=N)" or
 // "uncompressed". Three things silently downgrade to f32: a head_dim that
 // isn't a power of two <= 128 and a multiple of 32; a single-sided config
 // (the WebGPU kernels only compress keys AND values together, so the
@@ -578,7 +578,7 @@ just wasm-node-mt   # CommonJS Node + threads → cera-wasm/pkg-nodejs-mt/
 Both recipes set the atomics target-feature, the
 shared-memory/import-memory link args, and `-Z build-std=panic_abort,std`
 together. Single-threaded `wasm`/`wasm-web`/`wasm-node` recipes are
-unchanged. `--target bundler` is intentionally not provided —
+unchanged. `--target bundler` is intentionally not provided;
 `wasm-bindgen-rayon` doesn't have canonical bundler-side worker glue.
 
 Extra prerequisite (single-threaded builds don't need this): the
@@ -608,13 +608,13 @@ Cross-Origin-Embedder-Policy: require-corp
 
 Without these `initThreadPool` rejects with a `SharedArrayBuffer is
 not defined` error. Most static-file dev servers don't set them by
-default — see the `wasm-bindgen-rayon` README for snippets covering
+default; see the `wasm-bindgen-rayon` README for snippets covering
 Vite, webpack-dev-server, `http-server`, and similar tools.
 
 ### Node usage
 
 `pkg-nodejs-mt/` ships as a CommonJS module, so top-level `await`
-isn't available — wrap the init in an async IIFE (or run the
+isn't available; wrap the init in an async IIFE (or run the
 snippet from a `.mjs` / `"type": "module"` ESM file):
 
 ```js
@@ -627,7 +627,7 @@ const os = require('os');
 })();
 ```
 
-Node has no equivalent of the browser's COOP/COEP gate — the
+Node has no equivalent of the browser's COOP/COEP gate; the
 threaded build runs out-of-the-box on `worker_threads`.
 
 ## License

@@ -6,7 +6,7 @@ prompt = 482 tokens (the test text repeated 30×). Reproduce with
 
 ## Cross-process disk-cache (the mobile-restart scenario)
 
-Each run is a fresh `cera run` invocation — process exits between runs,
+Each run is a fresh `cera run` invocation; the process exits between runs,
 so the in-memory warm cache is gone every time. Only the on-disk cold tier
 (written under `<cache-dir>/kv/`) survives.
 
@@ -52,20 +52,20 @@ iters 2–5 hit the in-memory warm tier.
 
 p10 is the cold first iteration; p50/p90 are warm hits. **Warm hit is
 ~22× faster than cold** (p50 with vs without cache). The mean is skewed
-by the cold first iter — the right number to compare with disk-hit is p50.
+by the cold first iter; the right number to compare with disk-hit is p50.
 
 ## Reading the numbers
 
 Cold prefill does the actual matmul / attention work for every prompt
 token. Both cache hits skip that work for cells that were already computed:
 
-- **Warm hit** is fastest (~66k tok/s) — the snapshot is in-process memory,
+- **Warm hit** is fastest (~66k tok/s); the snapshot is in-process memory,
   so the "prefill" is essentially "copy GPU buffers + run forward on the
   last token to produce logits".
 - **Disk hit** is slower (~10–14k tok/s) than warm because the snapshot
   must be deserialized from FlatBuffers and re-uploaded to GPU. Still
   4–5× faster than re-running the actual prefill on this prompt size.
-- The relative win for both cache hits grows with prompt length —
+- The relative win for both cache hits grows with prompt length;
   longer prompts have more KV to recompute on a cold prefill, so the
   cache savings amortize over more skipped work.
 
@@ -86,5 +86,5 @@ token. Both cache hits skip that work for cells that were already computed:
   already worked on CPU (`InferenceState::snapshot`); the GPU TurboQuant
   work extended it to wgpu and Metal, which build the same `StateSnapshot`
   in their own `snapshot_state_locked`. The CPU path still returns `None`
-  for a single-sided layer — `AttentionCompressed` holds both sides as
+  for a single-sided layer; `AttentionCompressed` holds both sides as
   packed blobs, with no slot for an uncompressed one.
