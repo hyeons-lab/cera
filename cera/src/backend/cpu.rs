@@ -1357,6 +1357,35 @@ pub fn gemv_with_preq(
         DType::Q6K => unsafe {
             crate::backend::simd::neon::gemv_q6k_q8_0_neon(a_quant, x_scales, x_quants, y, m, k)
         },
+        // Q4_1's GEMV *is* the batched GEMM at `n = 1` (see `gemv_q4_1_f32`), and
+        // the caller has already quantized `x` with the same routine that GEMM
+        // expects: `quantize_f32_to_q8_0_neon`, which is what
+        // `quantize_f32_to_q8_0_into` resolves to here. Handing it straight in is
+        // therefore bit-identical to letting the `_` arm re-quantize, and skips
+        // an O(k) quantize per layer per token on the one tensor this matters for
+        // (a mixed-quant GGUF's Q4_1 `ffn_down`, which is the decode hot path).
+        //
+        // Sliced to this GEMM's exact `k`: the kernels assert `n*k` quants and
+        // `n*(k/32)` scales, and while every call site today resizes the scratch
+        // to exactly this `k` immediately beforehand, the sibling arms hand the
+        // full slice to kernels that read `k` elements unchecked, so a slice
+        // that panics is the better failure than one that reads past the end.
+        // Same treatment `transformer::gemm_preq` applies.
+        DType::Q4_1 if q4_1_gemm_available() => {
+            if !gemm_preq_dispatch(
+                DType::Q4_1,
+                a_quant,
+                &x_scales[..k / 32],
+                &x_quants[..k],
+                y,
+                m,
+                1,
+                k,
+            ) {
+                // Predicate and dispatcher disagreed; see `q4_1_gemm_available`.
+                gemv_dispatch(dtype, a_quant, x_f32, y, m, k, None);
+            }
+        }
         // NOTE: no Q4KM arm here on purpose. Routing Q4_K through a pre-quantized
         // dispatcher measured a consistent ~5% *regression* vs re-quantizing in
         // `gemv_dispatch` (interleaved A/B, LFM2.5-350M-Q4_K_M decode) — the
@@ -1585,20 +1614,101 @@ pub fn gemv_q5km_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usiz
     }
 }
 
+/// Whether this host can run the Q4_1 int8 GEMM, i.e. whether the Q4_1 GEMV can
+/// be that GEMM at `n = 1`.
+///
+/// Names the predicates `gemm_preq_dispatch`'s own Q4_1 arms consult rather than
+/// restating them: on aarch64 the NEON dispatcher gates on
+/// `neon::k_quant_gemm_available()` (Q4_1's min term reuses the K-quants'
+/// dotprod col-sum machinery), and on x86 both int8 tiers are exactly
+/// `int8_gemm_available()`.
+///
+/// Only a fast path: it exists to skip an activation quantize that would be
+/// discarded, and every caller still branches on what the dispatcher actually
+/// returned. If the two ever drift, the answer stays correct and
+/// `tests::decode_prefill_identity` fails rather than decode quietly splitting
+/// from prefill again.
+fn q4_1_gemm_available() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::backend::simd::neon::k_quant_gemm_available()
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        int8_gemm_available()
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+#[allow(clippy::ptr_arg)]
 /// Q4_1 GEMV: `y[m] = A_q4_1[m,k] @ x[k]`.
 ///
-/// Scalar only. Q4_1 is a legacy ggml format with no SIMD or GPU kernels in
-/// this tree — it appears almost exclusively as a stray `ffn_down` inside
-/// otherwise-Q4_0 files, so it exists to make those files load and produce
-/// correct output, not to be fast. Anything performance-sensitive should use
-/// the Q4_0 or Q8_0 build of the same model.
-pub fn gemv_q4_1_f32(a_quant: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+/// Runs the batched GEMM at `n = 1` when this host has the Q4_1 int8 kernel, and
+/// falls back to a scalar f32 dot product otherwise. Among the dtypes with an
+/// int8 kernel, Q4_1 was the only one whose GEMV did not reach that kernel's
+/// arithmetic: the rest have a dedicated SIMD GEMV (all four on aarch64, Q4_0
+/// and Q8_0 on x86), and x86's K-quant GEMVs are already the `gemm_*` at `n = 1`
+/// that this arm imitates. (Q5KM and F32 have no int8 kernel at all, so there is
+/// nothing for their scalar GEMVs to diverge from.)
+///
+/// Routing through `gemm_preq_dispatch`, the same function batched prefill
+/// calls, is what makes decode and prefill produce *the same bits*, and that
+/// identity is a correctness property, not a nicety: the two paths otherwise
+/// disagree on where the activations get quantized. The GEMM dots Q4_1 weights
+/// against Q8_0-quantized activations, while a scalar f32 dot leaves them in
+/// full precision, so the same token at the same position lands on different
+/// logits depending on whether it was consumed by prefill or by decode. On
+/// Llama-3.2-1B-Q4_0, an otherwise-Q4_0 file whose blocks 0 and 1 carry a Q4_1
+/// `ffn_down`, two such layers out of sixteen reached 0.38 absolute on logits
+/// spanning ~16, enough to flip an argmax and make speculative decoding
+/// disagree with plain greedy. Guarded by
+/// `tests::decode_prefill_identity::gemv_is_bit_identical_to_gemm_at_n1`.
+///
+/// The scalar fallback does not reintroduce the split: without `blas`,
+/// `batched_gemm_supports` gates Q4_1 on the same predicate the dispatcher does,
+/// so a host with no kernel takes the per-token path for prefill too. Under
+/// `blas` the identity does not hold at all (that build's prefill dequantizes
+/// and SGEMMs in f32, and its `batched_gemm_supports` answers `true`
+/// unconditionally), but that is already true of every other quantized dtype
+/// there, whose GEMVs are int8 all the same, so this brings Q4_1 in line rather
+/// than singling it out.
+///
+/// Q4_1 remains a legacy ggml format that appears almost exclusively as a stray
+/// `ffn_down` inside otherwise-Q4_0 files. Anything performance-sensitive should
+/// use the Q4_0 or Q8_0 build of the same model.
+pub fn gemv_q4_1_f32(
+    a_quant: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+    q8_scales: &mut Vec<f32>,
+    q8_quants: &mut Vec<i8>,
+) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
     debug_assert_eq!(k % 32, 0, "Q4_1 GEMV: k must be divisible by 32");
     let blocks_per_row = k / 32;
     let row_bytes = blocks_per_row * size_of::<BlockQ4_1>();
     debug_assert_eq!(a_quant.len(), m * row_bytes);
+
+    // Ask before quantizing: on a host with no Q4_1 int8 kernel (aarch64 without
+    // dotprod, x86 below Avx2, wasm/riscv) the resize and the O(k) quantize
+    // below would be thrown away on every call.
+    if q4_1_gemm_available() {
+        q8_scales.resize(blocks_per_row, 0.0);
+        q8_quants.resize(k, 0);
+        // `quantize_f32_to_q8_0_into`, not a hand-rolled quantizer: naming the
+        // same function `quantize_columns` calls is what makes the two paths
+        // provably identical rather than incidentally close.
+        quantize_f32_to_q8_0_into(x, q8_scales, q8_quants);
+        if gemm_preq_dispatch(DType::Q4_1, a_quant, q8_scales, q8_quants, y, m, 1, k) {
+            return;
+        }
+    }
 
     let compute_row = |(i, yi): (usize, &mut f32)| {
         let row_start = i * row_bytes;
@@ -1694,7 +1804,15 @@ pub fn gemv_dispatch(
                 gemv_q8_0_f32(data, x, y, m, k, &mut s, &mut q);
             }
         }
-        DType::Q4_1 => gemv_q4_1_f32(data, x, y, m, k),
+        DType::Q4_1 => {
+            if let Some((scales, quants)) = q8_scratch {
+                gemv_q4_1_f32(data, x, y, m, k, scales, quants);
+            } else {
+                let mut s = Vec::new();
+                let mut q = Vec::new();
+                gemv_q4_1_f32(data, x, y, m, k, &mut s, &mut q);
+            }
+        }
         DType::F32 => gemv_f32(data, x, y, m, k),
         DType::Q6K => {
             #[cfg(target_arch = "aarch64")]
@@ -4498,6 +4616,217 @@ pub fn scale_inplace(a: &mut [f32], s: f32) {
 mod tests {
     use super::*;
 
+    /// Deterministic byte source for the kernel fixtures below. Nothing depends
+    /// on the distribution beyond "not all the same"; a fixed stream keeps a
+    /// failure reproducible.
+    fn lcg(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 33) as u32
+    }
+
+    /// Random weight rows with *controlled* block scales.
+    ///
+    /// Random bytes in an f16 scale field decode to inf or NaN. That is fatal in
+    /// different ways for the three tests that use this (a NaN compares bit-equal
+    /// to itself, so the identity tests would hold while proving nothing; the
+    /// dequantized-reference test would go flaky instead), so none of them wants
+    /// it. Nibbles, 6-bit scales and `qh` stay fully random.
+    ///
+    /// Shared rather than written per test, because a per-test copy is how one
+    /// of them ends up not naming a dtype's second f16 field. The one remaining
+    /// duplicate lives in `tests/avx2_decode_prefill_identity.rs`, which cannot
+    /// import a `#[cfg(test)]` item from the library; adding Q4_1 had to be done
+    /// there separately, which is the whole argument in miniature.
+    fn weights(dtype: DType, m: usize, k: usize, st: &mut u64) -> Vec<u8> {
+        let bb = dtype.block_bytes();
+        let nb = k / dtype.block_size();
+        let mut data: Vec<u8> = (0..m * nb * bb).map(|_| (lcg(st) % 256) as u8).collect();
+        for (bi, blk) in data.chunks_mut(bb).enumerate() {
+            let d = half::f16::from_f32(0.01 + 0.004 * (bi % 7) as f32);
+            match dtype {
+                DType::Q4_0 | DType::Q8_0 | DType::Q4_1 | DType::Q4KM => {
+                    blk[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+                }
+                // Q6K keeps its `d` at the end of the block.
+                DType::Q6K => {
+                    let n = blk.len();
+                    blk[n - 2..].copy_from_slice(&d.to_bits().to_le_bytes());
+                }
+                // Panics rather than falling through, so a dtype carrying an f16
+                // field this function does not name cannot be left random.
+                _ => unreachable!("dtype without an int8 kernel"),
+            }
+            // Q4_1's `m` and Q4KM's `dmin` share the slot after `d`, and both are
+            // f16 fields that must not be left random for the same reason.
+            if matches!(dtype, DType::Q4_1 | DType::Q4KM) {
+                let d2 = half::f16::from_f32(0.02 + 0.003 * (bi % 5) as f32);
+                blk[2..4].copy_from_slice(&d2.to_bits().to_le_bytes());
+            }
+        }
+        data
+    }
+
+    /// Decode and batched prefill must run the *same* arithmetic on this host:
+    /// `gemv_dispatch` has to equal `gemm_preq_dispatch` at `n = 1`, bit for bit,
+    /// for every dtype whose dispatchers claim it.
+    ///
+    /// `tests/avx2_decode_prefill_identity.rs` asserts this at a *forced* AVX2
+    /// tier and is therefore x86-only, so nothing watched aarch64. Q4_1's decode
+    /// GEMV dotted f32 activations while its prefill GEMM quantized them to Q8_0
+    /// (see [`gemv_q4_1_f32`] for what that cost), and the split survived every
+    /// test in the tree: the AVX2 binary would have caught it on x86 had it
+    /// listed Q4_1, and nothing at all would have caught it here.
+    ///
+    /// Bit patterns, not a tolerance: "same arithmetic" is the claim, and a
+    /// tolerance would pass while the two sides ran different kernels.
+    mod decode_prefill_identity {
+        use super::*;
+
+        #[test]
+        fn gemv_is_bit_identical_to_gemm_at_n1() {
+            // k = 512 is two K-quant super-blocks (so a wrong super-block stride
+            // shows up) and 16 Q4_0/Q8_0/Q4_1 blocks. m = 7 is deliberately not a
+            // multiple of any kernel's row tile, exercising the row tail.
+            let (m, k) = (7usize, 512usize);
+            let mut st = 0x5eed_1234u64;
+            let x: Vec<f32> = (0..k)
+                .map(|_| (lcg(&mut st) % 4000) as f32 / 1000.0 - 2.0)
+                .collect();
+
+            let mut b_scales = vec![0.0f32; k / 32];
+            let mut b_quants = vec![0i8; k];
+            quantize_f32_to_q8_0_into(&x, &mut b_scales, &mut b_quants);
+
+            // Q4_0 and Q8_0 are asserted everywhere *except* the aarch64 i8mm
+            // tier, where the claim is not true to begin with. `gemm_*_neon_i8mm`
+            // computes `n_even = n & !1`, which is 0 at n = 1, so every cell comes
+            // from the scalar remainder helper instead of the tiled kernel, and
+            // for these two that helper reduces in a different order than the
+            // GEMV decode uses (`neon::gemv_q4_0_q8_0_neon` and
+            // `neon::gemv_q8_0_q8_0_neon` here; `row_dot_*` on x86).
+            //
+            // The other three hold on every tier. Q4_1's dispatcher
+            // (`neon::gemm_q4_1_q8_0_neon`) has no i8mm arm at all, so `n = 1`
+            // runs the same kernel decode does. Q4KM and Q6K do take the i8mm
+            // kernel, but their remainder helpers are written to mirror the
+            // *dotprod* GEMM cell for cell (see `gemm_q4_k_scalar_dot` and
+            // `gemm_q6_k_scalar_dot`), and `q4k_gemm_bit_exact_vs_gemv_at_model_shapes`
+            // and its Q6_K sibling pin that GEMM to the dotprod GEMV, which is
+            // what `gemv_q4k_f32_neon`/`gemv_q6k_f32_neon` call at every tier
+            // from dotprod up, i8mm included. So the chain closes for them.
+            //
+            // The Q4_0/Q8_0 gap is real rather than a test artifact, and it
+            // predates this change: an LFM2 prefill of a single token
+            // (`lfm2.rs`, which unlike `llama.rs` does not gate the batched path
+            // on `tokens.len() > 1`) reaches the GEMM at `n = 1` and would
+            // disagree with `forward` in bits on such a host. Fixing two kernels
+            // blind on hardware this branch cannot run is a separate job.
+            let mut dtypes: Vec<DType> = vec![DType::Q4_1, DType::Q4KM, DType::Q6K];
+            #[cfg(target_arch = "aarch64")]
+            let scalar_remainder_at_n1 = crate::backend::cpu_features::cpu_features().tier
+                == crate::backend::cpu_features::CpuTier::NeonI8mm;
+            #[cfg(not(target_arch = "aarch64"))]
+            let scalar_remainder_at_n1 = false;
+            if !scalar_remainder_at_n1 {
+                dtypes.extend([DType::Q4_0, DType::Q8_0]);
+            }
+
+            let mut ran_any = false;
+            for dtype in dtypes {
+                let data = weights(dtype, m, k, &mut st);
+
+                let mut prefill = vec![0.0f32; m];
+                if !gemm_preq_dispatch(dtype, &data, &b_scales, &b_quants, &mut prefill, m, 1, k) {
+                    // No batched kernel here means prefill takes the per-token
+                    // path too (`batched_gemm_supports` consults the same
+                    // predicate), so there are not two paths to disagree.
+                    continue;
+                }
+                ran_any = true;
+
+                let mut decode = vec![0.0f32; m];
+                gemv_dispatch(dtype, &data, &x, &mut decode, m, k, None);
+
+                // Both buffers start zeroed, so bit-equality would also hold if
+                // neither side computed anything.
+                assert!(
+                    decode.iter().any(|v| *v != 0.0),
+                    "{dtype:?}: decode produced all zeros, so the comparison below \
+                     would pass against an equally empty prefill buffer"
+                );
+
+                for (i, (d, p)) in decode.iter().zip(&prefill).enumerate() {
+                    assert_eq!(
+                        d.to_bits(),
+                        p.to_bits(),
+                        "{dtype:?} row {i}: decode {d:e} vs prefill-at-n=1 {p:e}: \
+                         the decode GEMV is not the prefill GEMM at n=1, so the \
+                         same token yields different logits depending on whether \
+                         it was consumed by prefill or by decode"
+                    );
+                }
+            }
+
+            assert!(
+                ran_any || !int8_gemm_available(),
+                "no dtype reached a batched kernel although this host reports an \
+                 int8 GEMM, so the loop asserted nothing"
+            );
+        }
+
+        /// `gemv_with_preq` must agree with `gemv_dispatch` for Q4_1, bit for
+        /// bit, including when the caller lends an activation scratch longer
+        /// than this `k`.
+        ///
+        /// This is the arm aarch64 production decode actually takes for a Q4_1
+        /// `ffn_down` (`transformer::forward_ffn_block` quantizes the gate
+        /// activation once and hands it to `gemv_preq`), and what makes it
+        /// different from every path the test above drives is precisely the
+        /// part worth pinning: it consumes the *caller's* quantized activation
+        /// rather than quantizing its own, and slices it to this GEMM's `k`.
+        /// A caller quantizing a different vector, or an off-by-one in the
+        /// slice, would change decode logits on the only architecture that
+        /// reaches this code.
+        #[test]
+        #[cfg(target_arch = "aarch64")]
+        fn gemv_with_preq_matches_gemv_dispatch_for_q4_1() {
+            let (m, k) = (7usize, 512usize);
+            let mut st = 0x1dea_5eedu64;
+            let x: Vec<f32> = (0..k)
+                .map(|_| (lcg(&mut st) % 4000) as f32 / 1000.0 - 2.0)
+                .collect();
+            let data = weights(DType::Q4_1, m, k, &mut st);
+
+            // Deliberately over-long, as a scratch shared with a wider
+            // projection would be. The tail must be ignored, not read.
+            let mut scales = vec![0.0f32; k / 32 + 5];
+            let mut quants = vec![0i8; k + 160];
+            quantize_f32_to_q8_0_into(&x, &mut scales[..k / 32], &mut quants[..k]);
+
+            let mut want = vec![0.0f32; m];
+            gemv_dispatch(DType::Q4_1, &data, &x, &mut want, m, k, None);
+            assert!(
+                want.iter().any(|v| *v != 0.0),
+                "reference produced all zeros, so the comparison proves nothing"
+            );
+
+            let mut got = vec![0.0f32; m];
+            gemv_with_preq(DType::Q4_1, &data, &scales, &quants, &x, &mut got, m, k);
+
+            for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "Q4_1 row {i}: gemv_dispatch {a:e} vs gemv_with_preq {b:e}, so \
+                     the pre-quantized decode path is not the path everything else \
+                     is pinned against"
+                );
+            }
+        }
+    }
+
     /// The SIMD flash-attention kernels must agree with the scalar reference
     /// across every supported `head_dim`, group size, and prompt length.
     ///
@@ -4971,8 +5300,17 @@ mod tests {
     /// parity suite. A dtype mis-wire — a Q6K arm calling `gemv_q4k_f32` — would
     /// have produced garbage logits with nothing in `cargo test` objecting.
     ///
-    /// Covers the four dtypes with int8 kernels. `Q4_1`, `Q5KM` and `F32` take
-    /// scalar arms this change does not touch and are not driven here.
+    /// Covers the five dtypes with int8 kernels. `Q5KM` and `F32` take scalar
+    /// arms and are not driven here.
+    ///
+    /// Q4_1 is in the list because it stopped being one of those scalar arms: its
+    /// GEMV now routes through the batched GEMM at `n = 1`. The decode/prefill
+    /// identity test proves only `gemv == gemm`, which two kernels wrong in the
+    /// same way would also satisfy, so the independent f32 reference here is what
+    /// keeps that from being circular, and this is the only test driving
+    /// `gemv_dispatch` with a lent (and deliberately mis-sized) scratch, the arm
+    /// `model/audio_decoder.rs` takes. The kernels themselves are separately
+    /// checked against dequantized references in `simd.rs`.
     ///
     /// The reference dequantizes the weight and does the dot in f32, so it is
     /// independent of every int8 path under test. The bound is loose on purpose:
@@ -4987,50 +5325,30 @@ mod tests {
         // K-quants, 32 for Q4_0/Q8_0.
         let (m, k) = (7usize, 256usize);
         let mut st = 0x5eed_1234u64;
-        let mut next = move || {
-            st = st
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (st >> 33) as u32
-        };
 
         let x: Vec<f32> = (0..k)
-            .map(|_| (next() % 2000) as f32 / 1000.0 - 1.0)
+            .map(|_| (lcg(&mut st) % 2000) as f32 / 1000.0 - 1.0)
             .collect();
 
-        for dtype in [DType::Q4_0, DType::Q8_0, DType::Q4KM, DType::Q6K] {
-            let nb = k / dtype.block_size();
-            let bb = dtype.block_bytes();
-            let mut data: Vec<u8> = (0..m * nb * bb).map(|_| (next() % 256) as u8).collect();
-            // Random bytes in a scale field decode to inf/NaN, which would make
-            // the reference itself meaningless (NaN fails this bound rather than
-            // passing it, so the test would be flaky, not vacuous). Everything
-            // else — nibbles, 6-bit scales, qh — stays fully random.
-            for (bi, blk) in data.chunks_mut(bb).enumerate() {
-                let d = half::f16::from_f32(0.01 + 0.004 * (bi % 7) as f32);
-                match dtype {
-                    // scale first
-                    DType::Q4_0 | DType::Q8_0 | DType::Q4KM => {
-                        blk[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
-                    }
-                    // scale last
-                    DType::Q6K => {
-                        let n = blk.len();
-                        blk[n - 2..].copy_from_slice(&d.to_bits().to_le_bytes());
-                    }
-                    _ => unreachable!(),
-                }
-                if dtype == DType::Q4KM {
-                    let dmin = half::f16::from_f32(0.02 + 0.003 * (bi % 5) as f32);
-                    blk[2..4].copy_from_slice(&dmin.to_bits().to_le_bytes());
-                }
-            }
+        for dtype in [
+            DType::Q4_0,
+            DType::Q8_0,
+            DType::Q4_1,
+            DType::Q4KM,
+            DType::Q6K,
+        ] {
+            // Shared with the identity test: same controlled f16 scale fields,
+            // for a related reason. Random bytes there make the assertion
+            // vacuous; here they make the *reference* meaningless, so the test
+            // goes flaky rather than silently green.
+            let data = weights(dtype, m, k, &mut st);
 
             // f32 reference, independent of every int8 kernel.
             let mut w = vec![0.0f32; m * k];
             match dtype {
                 DType::Q4_0 => crate::quant::dequantize_q4_0_matrix(&data, m, k, &mut w),
                 DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(&data, m, k, &mut w),
+                DType::Q4_1 => crate::quant::dequantize_q4_1_matrix(&data, m, k, &mut w),
                 DType::Q4KM => crate::quant::dequantize_q4_k_m_matrix(&data, m, k, &mut w),
                 DType::Q6K => crate::quant::dequantize_q6_k_matrix(&data, m, k, &mut w),
                 _ => unreachable!(),

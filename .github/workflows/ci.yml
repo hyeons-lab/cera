@@ -145,10 +145,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Print resolved CPU tier
         run: cargo run -q -p cera-cli -- cpu
+      # `decode_prefill_identity` is in the filter because this is the only leg
+      # that runs on i8mm hardware, and that tier is the one where the decode
+      # GEMV and the prefill GEMM at n=1 do not trivially coincide: the i8mm
+      # kernels compute `n_even = n & !1`, so at n=1 every cell comes from their
+      # scalar remainder helper. The test's claim that Q4_1/Q4KM/Q6K still hold
+      # there rests on those helpers mirroring the dotprod GEMM, which no other
+      # job can check. The default `test` matrix is x86 plus an M1 runner
+      # (dotprod, no i8mm), so without this the branch never executes.
       - name: Validate i8mm + NEON fallbacks (fail if i8mm absent)
         env:
           CERA_REQUIRE_SIMD: i8mm
-        run: cargo test -p cera --lib -- cpu_features fallback_tests
+        run: cargo test -p cera --lib -- cpu_features fallback_tests decode_prefill_identity
 
   # Run the wgpu compute kernels on CPU via Mesa's lavapipe (software Vulkan).
   # The `gpu` feature is non-default, so the regular `test` job never compiles

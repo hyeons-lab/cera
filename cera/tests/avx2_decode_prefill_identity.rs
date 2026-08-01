@@ -5,13 +5,19 @@
 //! the f32 `vec_dot`, and LFM2.5-230M-Q4_K_M scored cosine 0.999335 against the
 //! parity tests' 0.9999 bar. The fix was an AVX2 int8 GEMV for every dtype.
 //!
-//! "Same arithmetic" is literal for the K-quants — `gemv_q4k_f32` calls
-//! `gemm_q4_k_q8_0` with `n = 1`, so for those two dtypes this test pins the
-//! *dispatcher wiring* rather than the arithmetic. Q4_0 and Q8_0 are the
+//! "Same arithmetic" is literal for the K-quants and for Q4_1: their GEMVs call
+//! the matching `gemm_*_q8_0` with `n = 1`, so for those dtypes this test pins
+//! the *dispatcher wiring* rather than the arithmetic. Q4_0 and Q8_0 are the
 //! stronger case: their GEMV goes through `row_dot_*`, which the tiled GEMM
 //! never touches, so bit-equality here is a real agreement between two distinct
 //! kernels (the same property `avx2_row_tiled_matches_per_row_bit_exact` pins
 //! between the strip and per-row GEMM kernels).
+//!
+//! Wiring is worth pinning on its own: Q4_1's GEMV did *not* route through the
+//! GEMM until it was made to, and the split (f32 activations in decode, Q8_0 in
+//! prefill) went unnoticed because this list did not name Q4_1. The host-tier
+//! twin of this test lives in `backend::cpu::tests::decode_prefill_identity`,
+//! which covers aarch64, where the regression was actually found.
 //!
 //! Why it is a dedicated test binary: the property only means something at a
 //! forced tier, and `CERA_CPU_TIER` is read once per process into a `OnceLock`.
@@ -56,7 +62,7 @@ fn weights(dtype: DType, m: usize, k: usize, st: &mut u64) -> Vec<u8> {
     for (bi, blk) in data.chunks_mut(bb).enumerate() {
         let d = half::f16::from_f32(0.01 + 0.004 * (bi % 7) as f32);
         match dtype {
-            DType::Q4_0 | DType::Q8_0 | DType::Q4KM => {
+            DType::Q4_0 | DType::Q8_0 | DType::Q4_1 | DType::Q4KM => {
                 blk[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
             }
             DType::Q6K => {
@@ -65,7 +71,9 @@ fn weights(dtype: DType, m: usize, k: usize, st: &mut u64) -> Vec<u8> {
             }
             _ => unreachable!("dtype without an int8 kernel"),
         }
-        if dtype == DType::Q4KM {
+        // Q4_1's `m` and Q4KM's `dmin` share the slot after `d`; both are f16
+        // fields that must not be left random, for the reason above.
+        if matches!(dtype, DType::Q4_1 | DType::Q4KM) {
             let dmin = half::f16::from_f32(0.02 + 0.003 * (bi % 5) as f32);
             blk[2..4].copy_from_slice(&dmin.to_bits().to_le_bytes());
         }
@@ -117,8 +125,8 @@ fn avx2_decode_gemv_is_bit_identical_to_prefill_gemm_at_n1() {
     );
 
     // k = 512 gives two K-quant super-blocks (so a wrong super-block stride is
-    // visible) and 16 Q4_0/Q8_0 blocks. m is deliberately not a multiple of the
-    // AVX2 TILE_M of 2, so the GEMM's row-tail path is exercised too.
+    // visible) and 16 Q4_0/Q8_0/Q4_1 blocks. m is deliberately not a multiple
+    // of the AVX2 TILE_M of 2, so the GEMM's row-tail path is exercised too.
     let (m, k) = (7usize, 512usize);
     let mut st = 0xa5a5_0f0fu64;
     let x: Vec<f32> = (0..k)
@@ -131,7 +139,13 @@ fn avx2_decode_gemv_is_bit_identical_to_prefill_gemm_at_n1() {
     let mut b_quants = vec![0i8; k];
     cpu::quantize_f32_to_q8_0_into(&x, &mut b_scales, &mut b_quants);
 
-    for dtype in [DType::Q4_0, DType::Q8_0, DType::Q4KM, DType::Q6K] {
+    for dtype in [
+        DType::Q4_0,
+        DType::Q8_0,
+        DType::Q4_1,
+        DType::Q4KM,
+        DType::Q6K,
+    ] {
         let data = weights(dtype, m, k, &mut st);
 
         let mut decode = vec![0.0f32; m];
