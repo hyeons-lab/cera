@@ -81,12 +81,13 @@ pub struct VerifyResult {
 /// KV holds exactly the guaranteed token plus the accepted drafts (rejected
 /// drafts are truncated away), i.e. `state.seq_len == old + 1 + accepted.len()`.
 ///
-/// This is pure verification — it does **not** consult EOS / stop tokens / token
+/// This is pure verification: it does **not** consult EOS / stop tokens / token
 /// budgets. Callers that must stop partway through the accepted run emit the
-/// accepted tokens under their own stop policy and then `state.truncate_to` back
-/// to the number they kept (and ignore `follow_logits`). Keeping the policy in
-/// the caller lets both the standalone [`greedy_generate_spec`] driver and the
-/// streaming `Session` path share this exact accept/truncate logic.
+/// accepted tokens under their own stop policy and then rewind, via
+/// [`crate::model::Model::truncate_kv`], back to the number they kept (and
+/// ignore `follow_logits`). Keeping the policy in the caller lets both the
+/// standalone [`greedy_generate_spec`] driver and the streaming `Session` path
+/// share this exact accept/truncate logic.
 pub fn verify_draft(
     model: &dyn crate::model::Model,
     state: &mut crate::kv_cache::InferenceState,
@@ -127,7 +128,8 @@ pub fn verify_draft(
     }
     let m = accepted.len();
     // Keep the guaranteed token + m accepted drafts; drop the rejected tail.
-    state.truncate_to(old + 1 + m);
+    // Through the model, not `state.truncate_to`: see `Model::truncate_kv`.
+    model.truncate_kv(state, old + 1 + m);
     // Row m holds the logits for the position after the last kept token.
     let follow_logits = all[m * vocab..(m + 1) * vocab].to_vec();
     VerifyResult {
@@ -145,8 +147,9 @@ pub fn verify_draft(
 /// and `k` configure the drafter. Returns the generated tokens (excluding the
 /// prompt) and acceptance stats.
 ///
-/// Dense (pure-attention) models only in Phase 1 — [`crate::kv_cache::InferenceState::truncate_to`]
-/// panics on LFM2 conv layers, which are not position-indexed.
+/// Dense (pure-attention) models only for now: verification rewinds the KV, and
+/// [`crate::model::Model::truncate_kv`] panics on an LFM2 conv window. Lifting
+/// this needs a way to rebuild that window, not just an override.
 pub fn greedy_generate_spec(
     model: &dyn crate::model::Model,
     state: &mut crate::kv_cache::InferenceState,
@@ -163,9 +166,9 @@ pub fn greedy_generate_spec(
     // The three documented preconditions, enforced at the boundary. Each has a
     // failure mode that is much harder to read further in: a stale `state` makes
     // every position off by `seq_len` (wrong output, no panic); a compressed
-    // cache reaches `truncate_to`'s own assert several frames deep, after the KV
-    // has already been written; and a model without all-position logits panics
-    // inside `verify_draft`'s row indexing.
+    // cache reaches the assert inside `truncate_to` (via `truncate_kv`) several
+    // frames deep, after the KV has already been written; and a model without
+    // all-position logits panics inside `verify_draft`'s row indexing.
     assert!(
         model.supports_all_logits(),
         "greedy_generate_spec requires forward_prefill_logits_all support"
@@ -180,7 +183,7 @@ pub fn greedy_generate_spec(
     assert!(
         !state.is_compressed(),
         "greedy_generate_spec requires an uncompressed KV cache: verification \
-         rewinds with `truncate_to`, which TurboQuant's packed layout cannot do"
+         rewinds the KV, which TurboQuant's packed layout cannot do"
     );
     if prompt.is_empty() || max_new == 0 {
         return (out, stats);
@@ -243,7 +246,7 @@ pub fn greedy_generate_spec(
             stats.accepted += 1;
         }
         if kept < vr.accepted.len() {
-            state.truncate_to(old + 1 + kept);
+            model.truncate_kv(state, old + 1 + kept);
         }
         if stopped {
             break;
@@ -302,5 +305,272 @@ mod tests {
         let toks = [1u32, 2, 9, 5, 1, 2];
         // pattern = last [1,2] at 4..6; earlier [1,2] at 0 → follow tokens[2..] up to k.
         assert_eq!(prompt_lookup_draft(&toks, 2, 5), vec![9, 5, 1, 2]);
+    }
+
+    /// Every KV rewind on the spec path must go through
+    /// [`crate::model::Model::truncate_kv`], never `state.truncate_to` directly.
+    ///
+    /// No other test can see the difference: the default implementation forwards
+    /// to `truncate_to`, so calling either one produces identical output,
+    /// identical `seq_len`, and identical logits on every model in the tree
+    /// today. The distinction only becomes observable on a backend that overrides
+    /// the method, which is exactly the backend that does not exist yet. Without
+    /// this test the indirection can be undone by a plausible-looking edit and
+    /// nothing goes red until a GPU model silently decodes from the wrong
+    /// positions.
+    ///
+    /// So: a stub model that records the rewinds it is asked to perform, and
+    /// then performs them. If a call site regresses to `state.truncate_to`, the
+    /// recording comes back short while everything else still passes.
+    mod rewind_goes_through_the_model {
+        use super::*;
+        use crate::kv_cache::InferenceState;
+        use crate::model::{BlockType, Model, ModelConfig};
+        use std::sync::Mutex;
+
+        /// Vocabulary size for the stubs, kept tiny so a one-hot row is 8 floats
+        /// rather than a real vocabulary.
+        ///
+        /// The `% VOCAB` wrap in `row` is load-bearing, not defensive: the driver
+        /// test prefills a prompt containing token 7, so `row(7)` indexes 8 and
+        /// would panic without it.
+        const VOCAB: u32 = 8;
+
+        /// A dense (attention-only) config, so the default rewind path applies
+        /// and `truncate_to` never meets a conv layer.
+        fn dense_config() -> ModelConfig {
+            let n_layers = 2;
+            ModelConfig {
+                architecture: "llama".into(),
+                n_layers,
+                hidden_size: 8,
+                intermediate_size: 16,
+                n_heads: 2,
+                n_kv_heads: 2,
+                head_dim: 4,
+                vocab_size: VOCAB as usize,
+                max_seq_len: 64,
+                rope_theta: 10_000.0,
+                rms_norm_eps: 1e-5,
+                block_types: vec![BlockType::Attention; n_layers],
+                conv_kernel_size: None,
+                kv_heads_per_layer: vec![2; n_layers],
+                scalars: crate::model::ScalarMultipliers::default(),
+            }
+        }
+
+        /// Predicts `(t + 1) % VOCAB` after every token, and records the rewinds
+        /// it is asked to perform.
+        struct CyclingStub {
+            config: ModelConfig,
+            /// Lengths passed to `truncate_kv`, in order.
+            rewinds: Mutex<Vec<usize>>,
+        }
+
+        impl CyclingStub {
+            fn new() -> Self {
+                Self {
+                    config: dense_config(),
+                    rewinds: Mutex::new(Vec::new()),
+                }
+            }
+
+            /// One-hot logits selecting `(t + 1) % VOCAB`.
+            fn row(t: u32) -> Vec<f32> {
+                let mut v = vec![0.0f32; VOCAB as usize];
+                v[((t + 1) % VOCAB) as usize] = 1.0;
+                v
+            }
+
+            fn recorded(&self) -> Vec<usize> {
+                self.rewinds.lock().unwrap().clone()
+            }
+        }
+
+        impl Model for CyclingStub {
+            fn config(&self) -> &ModelConfig {
+                &self.config
+            }
+
+            fn forward(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> Vec<f32> {
+                // The KV caches stay empty; `truncate_to` treats an empty cache
+                // as a no-op and only `seq_len` is under test here. The sibling
+                // `DefaultStub` is the one that writes KV.
+                state.seq_len += tokens.len();
+                Self::row(*tokens.last().unwrap())
+            }
+
+            fn forward_prefill_logits_all(
+                &self,
+                tokens: &[u32],
+                _start_pos: usize,
+                state: &mut InferenceState,
+            ) -> Vec<f32> {
+                state.seq_len += tokens.len();
+                tokens.iter().flat_map(|&t| Self::row(t)).collect()
+            }
+
+            fn supports_all_logits(&self) -> bool {
+                true
+            }
+
+            fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
+                self.rewinds.lock().unwrap().push(len);
+                state.truncate_to(len);
+            }
+        }
+
+        /// `verify_draft` rewinds once per round, through the model.
+        ///
+        /// The driver test below would also catch a regression here, in its first
+        /// recorded entry. This one exists to fail first and locally, naming the
+        /// call site rather than a driver run that happens to route through it.
+        #[test]
+        fn verify_draft_rewinds_through_the_model() {
+            let model = CyclingStub::new();
+            let mut state = InferenceState::from_config(model.config()).unwrap();
+
+            // Put the cache at a non-zero position, so a rewind length computed
+            // from the wrong base would not coincidentally match.
+            model.forward_prefill(&[0, 1, 2], 0, &mut state);
+            let old = state.seq_len;
+            assert_eq!(old, 3);
+
+            // After 3 the model predicts 4, then 5, then 6. The third draft
+            // token is wrong, so two are accepted.
+            let vr = verify_draft(&model, &mut state, 3, &[4, 5, 0], VOCAB as usize);
+
+            assert_eq!(vr.accepted, vec![4, 5]);
+            assert_eq!(
+                model.recorded(),
+                vec![old + 1 + 2],
+                "verify_draft must rewind via Model::truncate_kv, once, to the \
+                 guaranteed token plus the accepted drafts"
+            );
+            assert_eq!(state.seq_len, old + 1 + 2);
+        }
+
+        /// The two tests either side of this one drive a stub that *overrides*
+        /// `truncate_kv`, so they pin the call sites without ever running the
+        /// default body. Gutting that default to a no-op passes both, and every
+        /// other non-ignored test in the workspace: its only other coverage is
+        /// the `#[ignore]`d `greedy_spec_matches_greedy_exactly`, and even that
+        /// catches it only on a fixture whose rounds actually reject a draft
+        /// (Llama-3.2-1B does; on Qwen3-0.6B every round accepts in full, so every
+        /// rewind is the free `len == seq_len` case and a no-op default passes).
+        ///
+        /// So: the same rewind through a model that does **not** override, with
+        /// KV actually written, asserting the caches shrank.
+        #[test]
+        fn the_default_truncate_kv_really_rewinds() {
+            /// Same predictions as [`CyclingStub`], but without the override, and
+            /// it writes one f32 per position per layer so `truncate_to` has
+            /// something to cut. `kv_dim` of 1 keeps the arithmetic readable; the
+            /// real stride is irrelevant to what is under test, since
+            /// `truncate_to` recovers it by division.
+            struct DefaultStub(ModelConfig);
+
+            impl Model for DefaultStub {
+                fn config(&self) -> &ModelConfig {
+                    &self.0
+                }
+                fn forward(&self, _: &[u32], _: usize, _: &mut InferenceState) -> Vec<f32> {
+                    // Required by the trait, reached by nothing here: this test
+                    // drives `forward_prefill_logits_all` directly and so does
+                    // `verify_draft`. Delegating would be wrong rather than
+                    // merely unused, since `forward` owes one row and that
+                    // function returns `n`.
+                    unimplemented!("DefaultStub is driven through forward_prefill_logits_all")
+                }
+                fn forward_prefill_logits_all(
+                    &self,
+                    tokens: &[u32],
+                    _start_pos: usize,
+                    state: &mut InferenceState,
+                ) -> Vec<f32> {
+                    for layer in &mut state.layers {
+                        if let crate::kv_cache::LayerState::Attention {
+                            key_cache,
+                            value_cache,
+                            ..
+                        } = layer
+                        {
+                            for &t in tokens {
+                                key_cache.push(t as f32);
+                                value_cache.push(t as f32);
+                            }
+                        }
+                    }
+                    state.seq_len += tokens.len();
+                    tokens.iter().flat_map(|&t| CyclingStub::row(t)).collect()
+                }
+                fn supports_all_logits(&self) -> bool {
+                    true
+                }
+            }
+
+            let model = DefaultStub(dense_config());
+            let mut state = InferenceState::from_config(model.config()).unwrap();
+
+            model.forward_prefill_logits_all(&[0, 1, 2], 0, &mut state);
+            assert_eq!(state.seq_len, 3);
+
+            // Predicts 4 then 5; the third draft token is wrong, so two are kept
+            // and the batch's last two positions must come back out of the KV.
+            let vr = verify_draft(&model, &mut state, 3, &[4, 5, 0], VOCAB as usize);
+            assert_eq!(vr.accepted, vec![4, 5]);
+            assert_eq!(state.seq_len, 6);
+
+            for layer in &state.layers {
+                let crate::kv_cache::LayerState::Attention {
+                    key_cache,
+                    value_cache,
+                    ..
+                } = layer
+                else {
+                    unreachable!("dense config has only attention layers")
+                };
+                // 3 prefilled + [3, 4, 5] kept; the rejected 0 is gone.
+                assert_eq!(
+                    key_cache,
+                    &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+                    "the default truncate_kv did not cut the rejected tail out of \
+                     the key cache"
+                );
+                assert_eq!(value_cache.len(), 6);
+            }
+        }
+
+        /// The driver's *second* rewind, the one that fires when a stop policy
+        /// cuts an accepted run short, also goes through the model. It is a
+        /// separate call site from the one above and regresses independently.
+        #[test]
+        fn early_stop_rewind_goes_through_the_model() {
+            let model = CyclingStub::new();
+            let mut state = InferenceState::from_config(model.config()).unwrap();
+
+            // A full cycle plus two tokens. The prompt predicts `2`, which the
+            // driver emits as the guaranteed token; the drafter then works on
+            // the history `[0..8, 0, 1, 2]`, whose trailing bigram `[1, 2]` also
+            // occurs at index 1, so it drafts that occurrence's continuation
+            // `[3, 4, 5]` and the stub predicts exactly those.
+            let prompt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 0, 1];
+            // `max_new = 3` cuts the accepted run: the round drafts 3 tokens and
+            // the model accepts all of them, but the budget stops after 2.
+            let (out, stats) = greedy_generate_spec(&model, &mut state, &prompt, 3, &[], 2, 3);
+
+            assert_eq!(out, vec![2, 3, 4], "the stub decodes the cycle");
+            assert_eq!(stats.accepted, 2, "budget cut the third accepted draft");
+
+            let old = prompt.len();
+            assert_eq!(
+                model.recorded(),
+                vec![old + 1 + 3, old + 1 + 2],
+                "expected the per-round rewind (all 3 drafts accepted) followed \
+                 by the early-stop rewind (only 2 kept), both through \
+                 Model::truncate_kv"
+            );
+            assert_eq!(state.seq_len, old + 1 + 2);
+        }
     }
 }

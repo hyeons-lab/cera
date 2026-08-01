@@ -204,8 +204,47 @@ pub trait Model: Send + Sync {
 
     /// Whether [`Self::forward_prefill_logits_all`] is implemented for this model
     /// (the speculative-decoding gate). Default `false`.
+    ///
+    /// Flipping this to `true` also opts the model into the KV rewind that
+    /// verification performs, so a backend whose KV or position counter lives
+    /// outside `InferenceState` must override [`Self::truncate_kv`] as well. Read
+    /// that method before enabling this one.
     fn supports_all_logits(&self) -> bool {
         false
+    }
+
+    /// Rewind this model's KV state to the first `len` positions, discarding
+    /// everything after.
+    ///
+    /// The rewind half of speculative decoding: [`crate::spec::verify_draft`]
+    /// appends `1 + draft.len()` tokens and then drops the rejected tail. It goes
+    /// through the model rather than calling [`InferenceState::truncate_to`]
+    /// directly because `InferenceState` only describes the CPU cache. A backend
+    /// holding its KV in device memory keeps its own length counter beside it
+    /// (`GpuLfm2Model` and `MetalLfm2Model` both carry one on the model), so a
+    /// bare `state.truncate_to(len)` would move the CPU-side counter while the
+    /// device slab and its counter stayed put. Every later position is then
+    /// wrong, with no panic and no wrong-looking intermediate value. Overriding
+    /// this is how such a backend stays correct.
+    ///
+    /// **Contract for implementors.** On return `state.seq_len == len`, and every
+    /// backend-private position counter agrees with it. Rejected KV rows need not
+    /// be cleared, since the next round overwrites them in place, but nothing may
+    /// still describe them as live. `len > state.seq_len` is a caller bug and
+    /// should panic. `len == state.seq_len` is not an edge case but the common
+    /// one, since `verify_draft` rewinds unconditionally and every fully-accepted
+    /// round lands there, so keep it free.
+    ///
+    /// An override also replaces the default's two refusals, and both are
+    /// load-bearing: `truncate_to` panics on a TurboQuant-compressed state and on
+    /// an LFM2 conv window, neither of which has a tail to slice. The conv one is
+    /// what currently stands between an LFM2 spec run and a corrupted conv
+    /// window. Keep them, or reject the state before it reaches here.
+    ///
+    /// The default forwards to `state.truncate_to(len)`, which is correct for
+    /// every model whose KV lives entirely in `state`.
+    fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
+        state.truncate_to(len);
     }
 
     /// Cancelable chunked prefill. Splits `tokens` into `ubatch`-sized slices,
