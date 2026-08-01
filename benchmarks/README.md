@@ -11,9 +11,11 @@ profiles live alongside this file:
   llama.cpp, GPU I/O counters, and the per-kernel GPU decode profile. Every
   section carries the commit and device it was measured on; check that before
   quoting one.
-- [`GPU_FINDINGS_CORRECTION.md`](GPU_FINDINGS_CORRECTION.md) — four rounds of
+- [`GPU_FINDINGS_CORRECTION.md`](GPU_FINDINGS_CORRECTION.md) — five rounds of
   wrong GPU conclusions and what each one cost. Worth reading before starting a
-  GPU perf task; it is mostly a catalogue of ways to over-read a number.
+  GPU perf task; it is mostly a catalogue of ways to over-read a number — and
+  round 5 is the microbenchmark itself scoring kernels by their position in the
+  table, so it doubles as a warning about the instrument.
 - [`deltas_table.md`](deltas_table.md) — full cera-vs-llama.cpp grid (45 configs:
   prefill, decode, RSS, footprint, with ratios). Supersedes the old
   `results_table.md`, which held the same 45 runs split one-engine-per-row.

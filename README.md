@@ -70,9 +70,26 @@ available, falling back to CPU otherwise.
 
 ### Quantization
 
-Weights load in **Q4_0**, **Q8_0**, **Q6_K**, and **Q4_K_M**; dense **F32 / F16 /
-BF16** are also supported. Activations are dynamically quantized to Q8_0 for fast
+Weights run in **Q4_0**, **Q4_1**, **Q8_0**, **Q4_K**, **Q5_K**, and **Q6_K**,
+plus dense **F32**. Activations are dynamically quantized to Q8_0 for fast
 integer GEMV on CPU.
+
+Those are GGML *tensor* types, and dispatch is per tensor — so what decides
+whether a file runs is the mix inside it, not its `Q4_K_M`-style label. K-quant
+downloads usually work, but the label is not a guarantee: llama.cpp substitutes
+Q5_0 / Q5_1 / IQ4_NL for tensors whose rows are not a multiple of 256, and cera
+has no kernel for those. `cera inspect --model <file>` lists the per-tensor types,
+and an unsupported one fails at weight resolution naming the tensor rather than
+failing anonymously — with the type name too, for the types cera knows about (an
+IQ type reports its numeric id).
+
+Backends are not uniform, so a file that runs on one may not run on another. On
+native Metal, Q4_1 works as a projection weight but not as `token_embd` /
+`output`; `--device auto` falls back to wgpu or CPU on its own, while
+`--device metal` reports the gap. F16/BF16
+tensors parse, and are dequantized on the LoRA, vision, and audio paths, but the
+transformer weight and token-embedding paths have no kernel for them — an
+F16-weight LLM is not a supported configuration.
 
 ## Language bindings
 
@@ -253,6 +270,8 @@ See the [`cera` crate README](cera/README.md) for the full library API.
 |---------|---------|
 | `run` | One-shot inference — text, optional grammar/JSON or tool calling (`--tools`), plus image/audio input for VL/Audio bundles |
 | `chat` | Interactive multi-turn REPL with a persistent KV prefix cache |
+| `embed` | Extract last-layer hidden-state embeddings — mean-pooled, or `--per-token` for the full matrix |
+| `logits` | Dump next-token logits over the vocabulary (single prefill) — handy for cross-backend parity checks |
 | `inspect` | Dump a GGUF's metadata, tensor shapes, and resolved backend tier |
 | `cpu` | Print the host's CPU backend tier + detected SIMD features (no model needed) |
 | `tokenize` | Encode text to token IDs (e.g. to compare against Hugging Face) |
@@ -339,6 +358,18 @@ enough to invent a trend that isn't there.
 
 ## Other features
 
+- **Speculative decoding** — opt-in greedy speculation with prompt-lookup
+  (n-gram) drafting: no draft model, so no extra weight memory. Verifying K
+  drafted tokens in one forward amortizes the single weight-read over the
+  accepted run, which is where bandwidth-bound decode gets its win. (As of #327
+  the LM head is projected for all verified positions in one batched GEMM, so it
+  too is read once per round.) Every emitted token is the target's own
+  argmax — a poor draft costs acceptance rate, never
+  correctness — though a near-tie can land differently than a sequential greedy
+  run, since the verifier forwards a different batch shape. Today it engages on
+  the **CPU dense (`llama`-family) path only**, on the plain greedy path with an
+  uncompressed KV cache, and falls back transparently everywhere else. On the
+  CLI it is exposed on `bench` (`--spec`).
 - **Streaming & cancellation** — tokens (and audio frames) arrive through a
   `ModalitySink` as they decode; `Session::cancel()` interrupts long prompts
   responsively via chunked prefill.
@@ -381,8 +412,15 @@ from four changes: removing register spills in the quantized GEMV kernels,
 merging the LFM2 conv block into one compute pass, deleting two per-token GPU
 round trips that carried almost no work, and running the LM head on the weight as
 GGUF stores it instead of a dequantized f16 copy (which also gives back ~79 MB of
-VRAM on a 230M model). The per-kernel breakdown, and what did *not* work, are in
-[`benchmarks/BASELINE.md`](benchmarks/BASELINE.md).
+VRAM on a 230M model). A fifth change since then — word-loading the Q6_K GEMV
+instead of reading it byte-at-a-time — measured **+11.6%** decode (109.5 to
+122.1 tok/s, ABBA-ordered) on **LFM2.5-230M-Q4_K_M** — a different model from the
+1.78x row above, so the two do not multiply. That gain is entirely conditional on
+the change before it: measured *without* #320, the same kernel was flat (110.0 vs
+110.5 tok/s), because the only Q6_K matrix in the decode path was one `ffn_down`
+of 42. #320 makes the tied Q6_K embedding the LM head, and that is what the
+faster loads then pay off on. The per-kernel breakdown, and what did *not* work,
+are in [`benchmarks/BASELINE.md`](benchmarks/BASELINE.md).
 
 On CPU, rows dispatch through a persistent, affinity-pinned threadpool with
 dynamic chunk-stealing rather than a per-GEMV fork-join. This fixes the

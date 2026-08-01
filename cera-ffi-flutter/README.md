@@ -75,7 +75,7 @@ CERA_FFI_LIB=../target/debug/libcera_ffi.dylib \
 
 The FFI surface returns token IDs (no detokenizer is exposed yet), so the
 example prints the token count + decode timing. Supported architectures match
-the engine (`lfm2`, `qwen2`, `qwen3` at time of writing).
+the engine (`lfm2`, `llama` incl. classic Mistral, `qwen2`/`qwen3`, `granite`).
 
 ## Native library
 

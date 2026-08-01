@@ -16,8 +16,54 @@ bindings, and [`cera-wasm`](https://github.com/hyeons-lab/cera/tree/main/cera-wa
 
 ```toml
 [dependencies]
-cera = "0.3"
+cera = "0.4"
 ```
+
+## Breaking changes in 0.4.0
+
+0.4.0 adds public fields and enum variants to public types, so it is a minor
+(not patch) release — a `cargo update` from 0.3.x will not pull it in
+automatically. No type in `cera` is `#[non_exhaustive]`, so these break any code
+that writes exhaustive struct literals or exhaustive `match`es. Code that keeps
+the default settings sees no behavior change; the one exception is the new
+`KvCompressionConflict` below, which turns a previously-silent mismatch into an
+error.
+
+- **`GenerateOpts` gained `spec: Option<SpecDecode>`** — opt-in greedy
+  speculative decoding (see [Speculative decoding](#speculative-decoding)).
+  Code that constructs `GenerateOpts` with an exhaustive struct literal must
+  add the field; prefer functional-update syntax —
+  `GenerateOpts { max_tokens: 256, ..Default::default() }` — which stays
+  source-compatible across field additions. It defaults to `None`, preserving
+  prior behavior.
+- **`CeraError` gained `KvCompressionConflict`** — returned when a second
+  session asks a model for a different KV-compression mode than the one it was
+  built with, instead of handing back a cache the kernels do not match.
+  Exhaustive `match`es over `CeraError` need a new arm. This is the one item
+  here that changes runtime behavior: that call used to succeed silently and
+  corrupt the prefix cache.
+- **The f16 KV cache** (added for decode-at-depth) widened four public items in
+  the `cera::kv_cache` module: `KvCompression` gained `F16`, `LayerSnapshot`
+  gained `AttentionF16`, `LayerState::Attention` gained `key_cache_f16` and
+  `value_cache_f16`, and `InferenceState` gained `kv_f16: bool`. Exhaustive
+  `match`es and literals over any of them need updating; matching
+  `LayerState::Attention { .. }` with a rest pattern is unaffected.
+- **Behind the non-default `gpu` feature**, `backend::wgpu::io_stats::GpuIoStats`
+  gained a `passes: u64` counter, and `GpuIoStats::per_token` returns
+  `(f64, f64, f64, f64)` instead of `(f64, f64, f64)`. That one is a signature
+  change rather than an exhaustiveness break, so callers must destructure the
+  extra element. These are debug counters; nothing in the inference path uses
+  them.
+
+Also new (non-breaking): `SpecDecode` and the `cera::spec` module; the `Model`
+trait gained a defaulted `truncate_kv` method, so a backend can override the
+speculative-decoding KV rewind while existing implementors inherit the prior
+behavior unchanged; TurboQuant KV-cache compression now runs on the wgpu and
+native Metal backends, not just CPU. The rest of the release is CPU and GPU
+performance and correctness work, including a batched LM-head projection that
+amortizes the output matrix across all verified positions in speculative decode,
+and a Q4_1 decode path that now matches the batched prefill GEMM bit-for-bit. See
+the [benchmarks](https://github.com/hyeons-lab/cera/tree/main/benchmarks).
 
 ## Changes in 0.3.1
 
@@ -144,6 +190,47 @@ let engine = CeraEngine::from_bundle_id("LFM2.5-1.2B-Instruct-GGUF", "Q4_0", cfg
 `grammar` for constrained / JSON-shaped output. `temperature <= 0` (or
 `top_k == 1`) selects deterministic greedy decoding; otherwise sampling is
 stochastic. Min-p and repetition penalty apply on the stochastic path only.
+
+## Speculative decoding
+
+`GenerateOpts::spec` opts into greedy speculative decoding with **prompt-lookup
+(n-gram) drafting** — no draft model, so no extra weight memory. The drafter
+guesses the next tokens from the most recent earlier occurrence of the last
+`ngram` tokens, and the target verifies up to `k` of them in a single forward.
+A target forward reads every weight once, so verifying K drafted tokens in one
+pass amortizes that read over the accepted run — which is why this targets the
+memory-bandwidth wall in CPU decode-at-depth. As of #327 the verify path projects
+all `1 + k` positions' logits in a single batched GEMM, so the LM head (the
+largest matrix in the model) is read once per round rather than once per position;
+a per-row fallback remains for head dtypes without a batched kernel. The 1.49x
+measured on a repetitive prompt predates that change and did not include its gain.
+
+```rust
+use cera::SpecDecode;
+
+let opts = GenerateOpts {
+    temperature: 0.0,                       // greedy path only
+    spec: Some(SpecDecode { ngram: 2, k: 6 }), // or SpecDecode::default()
+    ..Default::default()
+};
+```
+
+**Every emitted token is the target's own argmax** — a valid greedy decode, so
+a poor draft lowers the acceptance rate without affecting correctness. It is not
+guaranteed bit-identical to a *sequential* greedy run: the verifier forwards a
+batch where a sequential loop forwards one token at a time, and the two
+reduction orders can pick opposite sides of a near-tie. It engages only on the
+plain greedy path (`temperature <= 0` or `top_k == 1`, no grammar), with a model
+that reports
+`supports_all_logits()` and an uncompressed (f32/f16) KV cache. In practice
+that means **the CPU dense (`llama`-family) path only**: `LlamaModel` is the
+one implementor, and the trait default is `false`, so LFM2 and every GPU model
+fall through. Any other configuration falls back to normal decode transparently
+rather than erroring, so setting `spec` unconditionally is safe — it is a
+no-op where unsupported.
+
+The CLI exposes it on `bench` (`--spec`, `--spec-ngram`, `--spec-k`) for
+measuring the win; it is not wired into `run` or `chat`.
 
 ## Tool calling
 

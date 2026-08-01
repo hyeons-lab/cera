@@ -12,13 +12,18 @@ options:
   createIntermediateGroups: true
 
 # Pull the published Cera SwiftPM package. SwiftPM maps the `v`-prefixed
-# release tags (v0.3.0, v0.3.1, …) onto these SemVer bounds automatically, so
-# `from: 0.3.0` resolves to the newest 0.3.x release's Metal-enabled
-# XCFramework. The bound only needs bumping when the 0.x minor moves.
+# release tags (v0.4.0, v0.4.1, …) onto these SemVer bounds automatically.
+#
+# `from:` is `.upToNextMajor`, and SwiftPM applies that literally with no 0.x
+# carve-out — so `from: 0.4.0` means `0.4.0 ..< 1.0.0`, NOT `< 0.5.0`. (Cargo's
+# `^0.4` and npm do carve out 0.x; SwiftPM does not. Use `minorVersion:` here if
+# a 0.x minor bound is ever actually wanted.) The floor is raised on each
+# release so the example demands the XCFramework it was written against; it is
+# not needed to make resolution work.
 packages:
   Cera:
     url: https://github.com/hyeons-lab/cera
-    from: "0.3.0"
+    from: "0.4.0"
 
 targets:
   CeraChat:

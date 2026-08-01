@@ -802,8 +802,10 @@ enum Command {
         /// decode phase. Verifies K drafted tokens per forward, so a
         /// bandwidth-bound decode amortizes its single weight-read over the
         /// accepted run — the win shows on repetitive / long-context prompts.
-        /// Output is identical to greedy decode. Only engages on dense models
-        /// with an uncompressed (f32/f16) KV cache; otherwise it's a no-op.
+        /// Every emitted token is the target's argmax, so this is a valid
+        /// greedy decode (a near-tie may land differently than a sequential
+        /// one). Only engages on CPU dense models with an uncompressed
+        /// (f32/f16) KV cache; otherwise it's a no-op.
         #[arg(long)]
         spec: bool,
 

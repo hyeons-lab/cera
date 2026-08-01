@@ -126,9 +126,13 @@ pub struct GenerateOpts {
     /// speculative verification **only** on the plain greedy path (`temperature
     /// <= 0` or `top_k == 1`, no grammar) with a dense model that supports
     /// all-position logits and an uncompressed (f32/f16) KV cache; any other
-    /// configuration falls back to the normal decode path transparently. Output
-    /// is identical to a greedy decode — this is a throughput optimization, not
-    /// a behavior change. See [`SpecDecode`] and [`crate::spec`].
+    /// configuration falls back to the normal decode path transparently. Every
+    /// emitted token is the target's own argmax, so this is a throughput
+    /// optimization rather than a behavior change — but it is not guaranteed
+    /// bit-identical to a *sequential* greedy run: the verifier forwards a
+    /// batch where a sequential loop forwards one token at a time, and the two
+    /// reduction orders can pick opposite sides of a near-tie. See
+    /// [`SpecDecode`] and [`crate::spec`].
     pub spec: Option<SpecDecode>,
 }
 
@@ -2003,10 +2007,12 @@ impl Session {
     /// eligible (see the branch there). `next_logits` is the prefill/last-step
     /// logit vector predicting the token at `current_pos`.
     ///
-    /// Emits the same token stream as a plain greedy decode — every token is the
-    /// target's argmax at its position — but verifies up to `k` drafted tokens
-    /// per forward, so an accepted run costs a single weight-read. The core
-    /// accept/verify/truncate step is shared with the standalone
+    /// Every emitted token is the target's argmax at its position, so this is a
+    /// valid greedy decode — see [`crate::spec`] for why that is not the same
+    /// as bit-equality with a sequential greedy loop. It verifies up to `k`
+    /// drafted tokens per forward, so an accepted run costs a single
+    /// weight-read. The core accept/verify/truncate step is shared with the
+    /// standalone
     /// [`crate::spec::greedy_generate_spec`] oracle via
     /// [`crate::spec::verify_draft`]; this method layers the `Session` concerns
     /// on top: streaming via `sink`, `stop_tokens` / EOS / `ignore_eos`,
@@ -2075,8 +2081,10 @@ impl Session {
 
             // The target's argmax at the current position — always correct. Like
             // the normal greedy loop, a stop token ends decode *without* being
-            // streamed, counted, or KV-appended, so the spec token stream and
-            // `tokens_generated` are identical to a plain greedy decode.
+            // streamed, counted, or KV-appended, so stop handling contributes no
+            // difference between the spec and plain-greedy token streams. (The
+            // batched verify forward can still flip a near-tie elsewhere — see
+            // `crate::spec`.)
             let t = argmax(&next_logits);
             if is_stop(t) {
                 finish = FinishReason::Stop;
