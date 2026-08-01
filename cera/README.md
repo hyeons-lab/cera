@@ -55,10 +55,15 @@ error.
   extra element. These are debug counters; nothing in the inference path uses
   them.
 
-Also new (non-breaking): `SpecDecode` and the `cera::spec` module; TurboQuant
-KV-cache compression now runs on the wgpu and native Metal backends, not just
-CPU. The rest of the release is CPU and GPU performance work — see the
-[benchmarks](https://github.com/hyeons-lab/cera/tree/main/benchmarks).
+Also new (non-breaking): `SpecDecode` and the `cera::spec` module; the `Model`
+trait gained a defaulted `truncate_kv` method, so a backend can override the
+speculative-decoding KV rewind while existing implementors inherit the prior
+behavior unchanged; TurboQuant KV-cache compression now runs on the wgpu and
+native Metal backends, not just CPU. The rest of the release is CPU and GPU
+performance and correctness work, including a batched LM-head projection that
+amortizes the output matrix across all verified positions in speculative decode,
+and a Q4_1 decode path that now matches the batched prefill GEMM bit-for-bit. See
+the [benchmarks](https://github.com/hyeons-lab/cera/tree/main/benchmarks).
 
 ## Changes in 0.3.1
 
@@ -194,11 +199,11 @@ guesses the next tokens from the most recent earlier occurrence of the last
 `ngram` tokens, and the target verifies up to `k` of them in a single forward.
 A target forward reads every weight once, so verifying K drafted tokens in one
 pass amortizes that read over the accepted run — which is why this targets the
-memory-bandwidth wall in CPU decode-at-depth. One caveat on the current
-implementation: the verify path still projects logits with one GEMV per
-position, so the LM head — the largest matrix in the model — is re-read `1 + k`
-times per round rather than once. That works against the amortization and is a
-known follow-up; the measured win (1.49x on a repetitive prompt) is *net* of it.
+memory-bandwidth wall in CPU decode-at-depth. As of #327 the verify path projects
+all `1 + k` positions' logits in a single batched GEMM, so the LM head (the
+largest matrix in the model) is read once per round rather than once per position;
+a per-row fallback remains for head dtypes without a batched kernel. The 1.49x
+measured on a repetitive prompt predates that change and did not include its gain.
 
 ```rust
 use cera::SpecDecode;

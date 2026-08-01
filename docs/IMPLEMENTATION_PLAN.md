@@ -376,11 +376,11 @@ where a sequential loop forwards one token at a time, and a near-tie can flip
 Exposed as `GenerateOpts::spec` / `SpecDecode` and on the CLI as
 `cera bench --spec`.
 
-Known cost, deliberately deferred (see the `KNOWN COST` block in
-`llama.rs::forward_prefill_logits_all`): the verify path projects logits with one
-GEMV per position, so the LM head is re-streamed `1 + k` times per round instead
-of once. The fix is a single `[vocab x n]` GEMM via `quantize_columns` +
-`gemm_preq`, needing a transpose and a dtype gate.
+Resolved in #327: the verify path now projects all `1 + k` positions' logits in a
+single `[vocab x n]` GEMM via `quantize_columns` + `gemm_preq` (with a transpose
+and a dtype gate), so the LM head is read once per round rather than re-streamed
+once per position. A per-row fallback remains for head dtypes without a batched
+kernel.
 
 Currently engages on the CPU dense (`llama`-family) path only — it requires
 `Model::supports_all_logits()`, which only `LlamaModel` implements — and needs

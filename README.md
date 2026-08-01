@@ -361,9 +361,9 @@ enough to invent a trend that isn't there.
 - **Speculative decoding** — opt-in greedy speculation with prompt-lookup
   (n-gram) drafting: no draft model, so no extra weight memory. Verifying K
   drafted tokens in one forward amortizes the single weight-read over the
-  accepted run, which is where bandwidth-bound decode gets its win. (The LM head
-  is currently still re-read once per verified position — a known follow-up that
-  the measured gain is already net of.) Every emitted token is the target's own
+  accepted run, which is where bandwidth-bound decode gets its win. (As of #327
+  the LM head is projected for all verified positions in one batched GEMM, so it
+  too is read once per round.) Every emitted token is the target's own
   argmax — a poor draft costs acceptance rate, never
   correctness — though a near-tie can land differently than a sequential greedy
   run, since the verifier forwards a different batch shape. Today it engages on
