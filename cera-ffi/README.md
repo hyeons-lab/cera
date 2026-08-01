@@ -200,8 +200,8 @@ and `i686-linux-android` sysroots should drop in cleanly.
 iOS and native Apple Silicon Mac apps can drop the artifact straight
 into their SPM dependency graph.
 
-The framework ships three single-arch slices, **Apple Silicon
-only**:
+The framework ships three single-arch slices (**Apple Silicon
+only**):
 
 - `ios-arm64`: real iPhones / iPads (`aarch64-apple-ios`).
 - `ios-arm64-simulator`: iOS Simulator on Apple Silicon Macs (`aarch64-apple-ios-sim`).
