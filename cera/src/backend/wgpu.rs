@@ -1015,6 +1015,39 @@ impl GpuContext {
         }
     }
 
+    /// Q4_K reg-tile prefill GEMM via SPIR-V passthrough. See `reg_tile_passthrough`.
+    pub fn mul_mat_reg_tile_q4_k_passthrough(&self) -> wgpu::ComputePipeline {
+        // SAFETY: slangc-compiled from mul_mat_reg_tile_q4_k.slang, spirv-val clean.
+        unsafe {
+            self.reg_tile_passthrough(
+                wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/mul_mat_reg_tile_q4_k.spv")),
+                "mul_mat_reg_tile_q4_k_passthrough",
+            )
+        }
+    }
+
+    /// Q5_K reg-tile prefill GEMM via SPIR-V passthrough. See `reg_tile_passthrough`.
+    pub fn mul_mat_reg_tile_q5_k_passthrough(&self) -> wgpu::ComputePipeline {
+        // SAFETY: slangc-compiled from mul_mat_reg_tile_q5_k.slang, spirv-val clean.
+        unsafe {
+            self.reg_tile_passthrough(
+                wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/mul_mat_reg_tile_q5_k.spv")),
+                "mul_mat_reg_tile_q5_k_passthrough",
+            )
+        }
+    }
+
+    /// Q6_K reg-tile prefill GEMM via SPIR-V passthrough. See `reg_tile_passthrough`.
+    pub fn mul_mat_reg_tile_q6_k_passthrough(&self) -> wgpu::ComputePipeline {
+        // SAFETY: slangc-compiled from mul_mat_reg_tile_q6_k.slang, spirv-val clean.
+        unsafe {
+            self.reg_tile_passthrough(
+                wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/mul_mat_reg_tile_q6_k.spv")),
+                "mul_mat_reg_tile_q6_k_passthrough",
+            )
+        }
+    }
+
     /// Begin a compute pass, counting it and attaching a profiling span.
     ///
     /// Use this rather than `CommandEncoder::begin_compute_pass` directly.
