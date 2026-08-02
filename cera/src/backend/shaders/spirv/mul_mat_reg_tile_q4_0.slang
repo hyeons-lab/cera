@@ -70,9 +70,16 @@ void init_shmem_src0(uint thread_id, uint offset_m, uint k_outer) {
 
         uint w = global_k % Q4_0_BLOCK_SIZE;
         uint base = (global_m * blocks_k + global_k / Q4_0_BLOCK_SIZE) * Q4_0_BLOCK_BYTES;
-        float d = (global_m < P.m && global_k < P.k) ? load_src0_f32_at(base) : 0.0;
-        uint q_lo = load_src0_u32_at(base + 2u + (w % 16u));
-        uint q_hi = load_src0_u32_at(base + 6u + (w % 16u));
+        // Gate every src0 read on the row/col being in range, not just `d`.
+        // Overhang threads on a ragged tile compute a `base` past the buffer, and
+        // under SPIR-V passthrough there is no naga-injected bounds check, so an
+        // unconditional load would be a real out-of-bounds read (the masked-off
+        // result is discarded below, but the load still happens). Matches the
+        // Q8_0 kernel, which gates all of its src0 reads the same way.
+        bool in_bounds = global_m < P.m && global_k < P.k;
+        float d = in_bounds ? load_src0_f32_at(base) : 0.0;
+        uint q_lo = in_bounds ? load_src0_u32_at(base + 2u + (w % 16u)) : 0u;
+        uint q_hi = in_bounds ? load_src0_u32_at(base + 6u + (w % 16u)) : 0u;
 
         for (uint j = 0u; j < Q4_0_PER_THREAD; j++) {
             uint byte = (j >= 4u) ? get_byte(q_hi, j & 3u) : get_byte(q_lo, j & 3u);
