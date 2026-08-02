@@ -28,7 +28,7 @@ fn main() {
     // written to OUT_DIR and `include_spirv_raw!`d from there, so slangc is the
     // source of truth. When slangc is unavailable (e.g. CI without a Slang
     // toolchain) we fall back to the committed `.spv` next to the `.slang`, which
-    // a developer with slangc regenerates via `just slang` — a cargo:warning
+    // a developer with slangc regenerates via `just slang`; a cargo:warning
     // flags the fallback so drift is visible.
     if std::env::var_os("CARGO_FEATURE_GPU").is_some() {
         compile_slang_kernels();
@@ -89,15 +89,17 @@ fn compile_slang_kernels() {
 }
 
 /// Locate slangc: `SLANGC` env, then PATH, then the default local install.
+/// Every candidate (including `SLANGC`) is probed with `-v`, so a bad `SLANGC`
+/// value falls through to PATH instead of being reported as a compile failure.
 fn find_slangc() -> Option<String> {
-    if let Some(p) = std::env::var_os("SLANGC") {
-        return Some(p.to_string_lossy().into_owned());
-    }
     let home = std::env::var("HOME").unwrap_or_default();
-    for cand in ["slangc", &format!("{home}/.local/slang/bin/slangc")] {
-        if Command::new(cand).arg("-v").output().is_ok() {
-            return Some(cand.to_string());
-        }
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(p) = std::env::var_os("SLANGC") {
+        candidates.push(p.to_string_lossy().into_owned());
     }
-    None
+    candidates.push("slangc".to_string());
+    candidates.push(format!("{home}/.local/slang/bin/slangc"));
+    candidates
+        .into_iter()
+        .find(|cand| Command::new(cand).arg("-v").output().is_ok())
 }
