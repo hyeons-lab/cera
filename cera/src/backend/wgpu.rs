@@ -29,7 +29,13 @@ impl DevicePollExt for wgpu::Device {
         loop {
             match self.poll(wgpu::PollType::wait_indefinitely()) {
                 Ok(_) => break,
-                Err(wgpu::PollError::Timeout) => continue,
+                Err(wgpu::PollError::Timeout) => {
+                    // PowerVR returns Timeout immediately rather than blocking, so
+                    // this is a spin-retry until the fence signals. Hint the CPU
+                    // it is a spin-wait (cheaper on SMT, lower power).
+                    std::hint::spin_loop();
+                    continue;
+                }
                 Err(e) => panic!("device.poll(Wait) failed: {e:?}"),
             }
         }
@@ -928,6 +934,17 @@ impl GpuContext {
         desc: wgpu::ShaderModuleDescriptorPassthrough<'_>,
         label: &str,
     ) -> wgpu::ComputePipeline {
+        // Defense in depth for the public `mul_mat_reg_tile_*_passthrough` entry
+        // points: a SPIR-V passthrough module is only accepted on Vulkan, and
+        // `create_shader_module_passthrough` would otherwise fail with a fatal
+        // `NotCompiledForBackend` on Metal/DX12/GLES. Fail loudly and early if a
+        // caller forgot to gate on `supports_spirv_passthrough()`.
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
         let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -963,7 +980,15 @@ impl GpuContext {
                 layout: Some(&layout),
                 module: &module,
                 entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    // Match the naga reg-tile pipelines (see above): the kernel
+                    // fills its ~8 KB of `shmem` before reading, so zeroing
+                    // workgroup memory every dispatch is pure overhead. (For a
+                    // raw SPIR-V module wgpu injects no zeroing prologue anyway,
+                    // so this is really for parity with the naga path.)
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
                 cache: None,
             })
     }
