@@ -1205,6 +1205,18 @@ pub mod shaders {
     /// reference so the generated MSL twin can be validated on real Metal
     /// hardware before either replaces its handwritten counterpart.
     pub const SOFTMAX_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax.wgsl"));
+    /// Capability probe, not a kernel: nothing dispatches this. Pins that a
+    /// `__target_switch` metal branch using `linalg::CoopMat` is eliminated
+    /// before entry-point validation, so the same source still emits valid WGSL
+    /// even though WGSL has no cooperative-matrix type. See
+    /// `shaders/slang/coopmat_probe.slang`; asserted in
+    /// `tests/slang_multitarget_parity.rs`.
+    ///
+    /// Deliberately never turned into a pipeline: its `half` operands make the
+    /// emission open with `enable f16`, and cera requests `SHADER_F16` only
+    /// when the adapter reports it.
+    pub const COOPMAT_PROBE_SLANG: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/coopmat_probe.wgsl"));
     pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.wgsl");
     pub const ROPE: &str = include_str!("shaders/rope.wgsl");
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.wgsl");

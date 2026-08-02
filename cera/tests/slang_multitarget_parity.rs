@@ -256,6 +256,68 @@ mod msl {
     }
 }
 
+/// Slang reaches Metal's `simdgroup_matrix` hardware through `linalg::CoopMat`.
+///
+/// This is the finding that decides whether the eight hand-tuned
+/// `simdgroup_matrix` GEMMs (the hot path, and the bulk of any migration) are
+/// portable at all. Asserted on the emitted text because nothing dispatches the
+/// probe and there is no runtime way to observe which instructions were chosen.
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+#[test]
+fn coopmat_probe_reaches_metal_mma() {
+    let src = cera::backend::metal::shaders::COOPMAT_PROBE_SLANG;
+    for op in [
+        "simdgroup_multiply_accumulate",
+        "simdgroup_load",
+        "simdgroup_store",
+    ] {
+        assert!(
+            src.contains(op),
+            "generated MSL is missing {op}; Slang no longer lowers linalg::CoopMat to Metal MMA"
+        );
+    }
+}
+
+/// The same source still emits valid WGSL, even though WGSL has no
+/// cooperative-matrix type.
+///
+/// Unguarded, the `CoopMat` path fails WGSL emission outright with
+/// `E36107 unavailable features in entry point`. It compiles only because
+/// `__target_switch` eliminates the metal branch **before** entry-point
+/// capability validation runs, which is the non-obvious part worth pinning: a
+/// Slang release that reordered those two would break this and nothing else.
+#[cfg(feature = "gpu")]
+#[test]
+fn coopmat_probe_wgsl_falls_back_cleanly() {
+    let src = cera::backend::wgpu::shaders::COOPMAT_PROBE_SLANG;
+    // The entry point is *named* coopmat_probe, so match on syntax the
+    // cooperative-matrix path would actually emit, not on the substring "coop".
+    for leaked in ["CoopMat<", "simdgroup", "subgroupMatrix"] {
+        assert!(
+            !src.contains(leaked),
+            "generated WGSL leaked {leaked}; the metal branch was not eliminated"
+        );
+    }
+    assert!(
+        src.contains("coopmat_probe"),
+        "generated WGSL is missing its entry point"
+    );
+}
+
+/// `half` operands make the WGSL emission require `enable f16`, and cera asks
+/// for `SHADER_F16` only when the adapter reports it (`GpuContext::new`). That
+/// is why nothing builds a pipeline from this probe, and it is the constraint a
+/// real GEMM port has to design around. Pinned so the coupling is not
+/// rediscovered as a device-specific pipeline failure.
+#[cfg(feature = "gpu")]
+#[test]
+fn coopmat_probe_documents_the_f16_requirement() {
+    assert!(
+        cera::backend::wgpu::shaders::COOPMAT_PROBE_SLANG.contains("enable f16"),
+        "probe no longer requires f16; if the operands became f32 this test and the          warning it guards can go"
+    );
+}
+
 /// The generated WGSL must **not** contain subgroup ops: cera never requests
 /// `wgpu::Features::SUBGROUP`, so a wave intrinsic leaking into this target
 /// fails pipeline creation on every device. Text-level because the failure

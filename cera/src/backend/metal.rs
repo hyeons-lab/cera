@@ -199,6 +199,13 @@ pub mod shaders {
     /// this is not the portable-tree fallback. Not yet on the production path:
     /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
     pub const SOFTMAX_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax.metal"));
+    /// Capability probe, not a kernel: nothing dispatches this. Pins that Slang
+    /// reaches Metal's `simdgroup_matrix` hardware through `linalg::CoopMat`,
+    /// which is what decides whether the eight hand-tuned `simdgroup_matrix`
+    /// GEMMs are portable at all. See `shaders/slang/coopmat_probe.slang`;
+    /// asserted in `tests/slang_multitarget_parity.rs`.
+    pub const COOPMAT_PROBE_SLANG: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/coopmat_probe.metal"));
     pub const ROPE: &str = include_str!("shaders/rope.metal");
     pub const QK_NORM_ROPE: &str = include_str!("shaders/qk_norm_rope.metal");
     pub const CONV1D: &str = include_str!("shaders/conv1d.metal");
