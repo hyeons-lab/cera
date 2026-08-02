@@ -11,7 +11,7 @@ Goal: attribute the long-context regression visible in
 real data.
 
 **Review fixes incorporated in this version:**
-- Added chunking to `MetalLfm2Model::forward_prefill_profiled` — the
+- Added chunking to `MetalLfm2Model::forward_prefill_profiled`: the
   initial pass called it with n=1024 and n=4096, overflowing
   `prefill_batch_buf` (capped at `MAX_PREFILL_TOKENS`=512). The
   overflow produced partially-corrupted compute that finished faster
@@ -26,7 +26,7 @@ real data.
   `attention_splitk.metal` all bound K/V caches as `const device float*`,
   while the Rust side stores the caches as f16
   (`encode_cast_f32_to_f16_offsets`). Reading f16 as f32 reinterprets
-  two adjacent f16 values as one f32 — garbage. Only classic
+  two adjacent f16 values as one f32, garbage. Only classic
   `attention.metal` and `attention_prefill.metal` bound correctly as
   `half*`.
   - `flash_attention` auto-activates at `seq_len > 4096`, so any
@@ -43,20 +43,20 @@ real data.
 
 ## 1. Methods used and their limits
 
-Three instruments. Each has a blind spot — none alone gives clean attribution
+Three instruments. Each has a blind spot; none alone gives clean attribution
 of the batched-prefill path that actually produces the benchmark numbers.
 
 | Instrument                                | Path it measures                                    | Blind spot                                                                         |
 |-------------------------------------------|-----------------------------------------------------|------------------------------------------------------------------------------------|
 | `forward_prefill_profiled` (ignored test) | Batched prefill, per-phase                          | Per-phase `wait_until_completed` inflates high-dispatch-count phases; also chunks at MAX_PREFILL_TOKENS=512 so n=4096 runs become 8-chunk sequential (same behavior as production). |
-| `CERA_PROFILE=timing` (CategoryTimer)     | **Only single-token `forward()`** (decode steps)    | Never activates on batched prefill — `forward_prefill_inner` bypasses it.           |
+| `CERA_PROFILE=timing` (CategoryTimer)     | **Only single-token `forward()`** (decode steps)    | Never activates on batched prefill; `forward_prefill_inner` bypasses it.           |
 | `CERA_PROFILE=noattn`                     | Only `encode_attention` and `encode_attention_q_offset` call sites | **Batched prefill uses `encode_attention_prefill`** (line 2477 in `metal_lfm2.rs`) which has no `noattn` check. So noattn does not skip batched-prefill attention. |
 
 Implication: **for batched prefill, we do not have a clean wall-time
 attribution tool**. The best we have is the (per-phase-sync-inflated)
 `forward_prefill_profiled` percentages and the algorithmic O(n²) signature
 of the total-time scaling. Decode attribution via `CERA_PROFILE=timing` is
-clean — the decode loop goes through the single-token `forward()` path.
+clean; the decode loop goes through the single-token `forward()` path.
 
 Adding a `sample_counters_in_buffer`-based profiler to `forward_prefill_inner`
 (≤100 LoC, single command buffer, no per-phase waits) would close this gap
@@ -109,8 +109,8 @@ wall time, not production wall time. Phase counts reflect chunking
 | attn_qkv         | 3005  (4.74%)      | 7326  (2.76%)        | 26490 (1.30%)          | 0.28×                    |
 | attn_outproj     | 2377  (3.75%)      | 5640  (2.13%)        | 22935 (1.13%)          | 0.30×                    |
 | (smaller phases) | ...                | ...                  | ...                    | ...                      |
-| **TOTAL**        | **63328 us**       | **265192 us**        | **2033929 us**         | —                        |
-| tok/s (profiled) | 2021               | 3861                 | 2014                   | —                        |
+| **TOTAL**        | **63328 us**       | **265192 us**        | **2033929 us**         | -                        |
+| tok/s (profiled) | 2021               | 3861                 | 2014                   | -                        |
 
 ### LFM2.5-VL-1.6B-Q4_0
 
@@ -121,8 +121,8 @@ wall time, not production wall time. Phase counts reflect chunking
 | attn_ffn_gemm    | 24303 (14.09%) | 219373 (5.34%)         | 0.28×                    |
 | conv_ffn_down    | 24127 (13.99%) | 203200 (4.95%)         | 0.26×                    |
 | conv_inproj      | 16339 (9.47%)  | 149199 (3.63%)         | 0.29×                    |
-| **TOTAL**        | **172508 us**  | **4107739 us**         | —                        |
-| tok/s (profiled) | 742            | 997                    | —                        |
+| **TOTAL**        | **172508 us**  | **4107739 us**         | -                        |
+| tok/s (profiled) | 742            | 997                    | -                        |
 
 ### Interpretation
 
@@ -170,7 +170,7 @@ All non-attention phases are **flat** per step from ctx=128 to ctx=4096
 
 `attn_kernel` scales **14.8×** over 32× more context, putting it at
 54% of the total per-step budget at ctx=4096. Caveat: this is not one
-continuous attention-compute curve — the decode dispatch routes to
+continuous attention-compute curve; the decode dispatch routes to
 **classic** `attention.metal` for seq_len ≤ 4096 (i.e. ctx=128 and
 ctx=2048 rows) and auto-switches to **flash** `flash_attention.metal`
 for seq_len > 4096 (ctx=4096 row; `metal_lfm2.rs:1626`). Part of the
@@ -200,13 +200,13 @@ directly.
 
 1.6B hidden=2048 vs 450M hidden=1024 (~2×). GEMM phases scale ~4× (hidden²
 for weight count + batch overhead), GEMV/attention scales 2–3× (linear or
-sub-linear). This is the expected scaling — no model-size-specific
+sub-linear). This is the expected scaling; no model-size-specific
 regression beyond what quadratic GEMM predicts.
 
 At p=128 the 1.6B prefill is 3002 tok/s vs published llama.cpp row 2402.5
-(**1.25× — we win**). The "0.68×" regression in `deltas_table.md` must have
+(**1.25×, we win**). The "0.68×" regression in `deltas_table.md` must have
 come from a different test environment (different warmup, cache state, or
-thermal). Not a present regression — deprioritize.
+thermal). Not a present regression, deprioritize.
 
 ---
 
@@ -254,13 +254,13 @@ attribution was prevented by the noattn/prefill routing gap and by the
 per-phase-sync overhead of `forward_prefill_profiled`:
 
 - `forward_prefill_profiled` says attention is 70.33% at p=4096 (450M) and
-  65.70% (1.6B) — inflated but only `attn_kernel` scales super-linearly
+  65.70% (1.6B): inflated but only `attn_kernel` scales super-linearly
   per-token (8.8× / 7.3×); every other phase scales sub-linearly per-token
   (~0.3×) thanks to batched-GEMM amortization.
 - Total-time O(n^1.37) scaling is consistent with attention compute being
   the super-linear contributor on top of linear-scaling GEMM.
 - Algorithmic analysis: classic attention at p=4096 is 4096² × 16 heads
-  × 64 head_dim = 268 Mops per layer per attn layer (6 per model) — far
+  × 64 head_dim = 268 Mops per layer per attn layer (6 per model), far
   more work than any other per-layer phase. Even at 100% GPU utilization
   this dominates for large n.
 
@@ -283,7 +283,7 @@ Scope for the follow-up plan:
    slower? Inspect any `.metal` shader matching `flash_*` and the code
    around `attn_mode == "flash"`. If it's a threadgroup-memory exhaustion
    issue or a register-pressure issue, the rewrite must solve that
-   explicitly — not just re-architect.
+   explicitly, not just re-architect.
 4. **Validation targets** (bench `--device metal --no-cache`, median of
    5 after first discarded):
    - Decode @ ctx=4096 on 450M: **≥2× current** (≥44 tok/s, up from 22
@@ -311,7 +311,7 @@ overhead that inflated small phases in the CPU-wall-clock run.
 
 | Prompt | regular (tok/s) | noattn (tok/s) | attn share (1 - regular/noattn) |
 |--------|----------------:|---------------:|--------------------------------:|
-| 128    | 8086            | 7563           | negative (noise — 7 ms total)   |
+| 128    | 8086            | 7563           | negative (noise, 7 ms total)    |
 | 1024   | 5602            | 11498          | **51%**                         |
 | 4096   | 2226            | 11162          | **80%**                         |
 
@@ -344,7 +344,7 @@ vs the default `CERA_PROFILE` path, 450M @ p=4096:
 | small phases   | 100k+       | 15k          | -85%+     | ~1.0%     |
 | Total          | 2,042 ms    | 1,782 ms     | -13%      | 100%      |
 
-`attn_kernel` absolute time agrees within 0.1% — the one phase large
+`attn_kernel` absolute time agrees within 0.1%: the one phase large
 enough that per-phase dispatch overhead is negligible. All other phases
 shrink substantially under GPU timestamps, which is exactly the expected
 shape: CPU wall clock over-counts dispatch latency on short kernels.
@@ -358,10 +358,10 @@ now agree.
 
 The rewrite's opportunity is larger than the original report implied:
 
-- **Decode @ ctx=4096:** 54% attn share (unchanged from §3) — room for
+- **Decode @ ctx=4096:** 54% attn share (unchanged from §3): room for
   ~2× decode at long context if the kernel is faster.
 - **Prefill @ p=4096:** **80% attn share** (was reported as "directional
-  evidence for 70%") — if the rewrite matches llama.cpp's per-token
+  evidence for 70%"), if the rewrite matches llama.cpp's per-token
   prefill attention cost (flat ~10k tok/s across prompt sizes vs our
   4× regression at p=4096), the upside is closer to **3–4× prefill**,
   not 2×.
@@ -371,6 +371,6 @@ The §7 validation targets still stand as lower bounds:
 - Decode @ ctx=4096 ≥ 44 tok/s (2.0× current).
 
 New lower bound for the rewrite to be worth the complexity: **if attn_kernel
-GPU time at p=4096 doesn't drop by ≥40%, abandon the rewrite** — 80% of
+GPU time at p=4096 doesn't drop by ≥40%, abandon the rewrite**: 80% of
 an un-improved kernel leaves nothing for other phases to make up, and
 the residual gap is then in GEMM batching / conv1d, not attention.

@@ -1,4 +1,4 @@
-# CeraChat — cera iOS example
+# CeraChat: cera iOS example
 
 A small SwiftUI app that runs on-device LLM inference with
 [cera](https://github.com/hyeons-lab/cera) via its published Swift Package. It
@@ -7,13 +7,13 @@ doubles as a real-device **Metal validation** harness: on device the engine's
 
 Three screens:
 
-1. **Load** — download `LFM2.5-1.2B-Instruct / Q4_0` from the LeapBundles
+1. **Load**: download `LFM2.5-1.2B-Instruct / Q4_0` from the LeapBundles
    registry (progress bar), or import a local `.gguf`. Shows model metadata and
    the requested backend.
-2. **Chat** — streaming, multi-turn chat. Each send renders the conversation
+2. **Chat**: streaming, multi-turn chat. Each send renders the conversation
    through the model's chat template, prefills it, and streams the reply
    token-by-token into the assistant bubble.
-3. **Embed / LoRA** — mean-pooled hidden-state embeddings (dimension, first 8
+3. **Embed / LoRA**: mean-pooled hidden-state embeddings (dimension, first 8
    values, L2 norm), plus optional LoRA adapter attach/detach.
 
 ## Add the package to your own app
@@ -80,14 +80,14 @@ _ = try await session.generateStreamingAsync(opts: opts, sink: Sink(engine))
 
 `decodeTokens` reassembles multi-byte UTF-8 / BPE merges correctly, so decode
 the accumulated token run rather than one token at a time. `ModalitySink`
-callbacks fire on the decode worker thread — marshal to `@MainActor` before
+callbacks fire on the decode worker thread; marshal to `@MainActor` before
 touching UI state.
 
 ## Backend note
 
 The app requests `backend: .auto`, which probes **Metal → CPU** at load time.
 There is no FFI to read back which backend actually won, so the UI only ever
-advertises what was *requested* ("Auto (Metal → CPU)") — it does **not** claim
+advertises what was *requested* ("Auto (Metal → CPU)"); it does **not** claim
 to have detected Metal.
 
 ## Build & run
@@ -122,13 +122,13 @@ xcodebuild -project CeraChat.xcodeproj -scheme CeraChat \
 
 On device, tap **Download** on the Load tab (needs network the first run). On
 the Simulator you can either download, import a local `.gguf`, or side-load one
-by setting `CERA_MODEL_PATH` in the scheme's Run environment to a local file —
+by setting `CERA_MODEL_PATH` in the scheme's Run environment to a local file;
 the app auto-loads it on launch.
 
 ### Headless smoke check (CI / simulator)
 
 Setting `CERA_SMOKE_PROMPT` (alongside `CERA_MODEL_PATH`) makes the app run one
-streamed generation after load and print the reply to the console — useful for
+streamed generation after load and print the reply to the console, useful for
 validating the full inference path without driving the UI:
 
 ```bash

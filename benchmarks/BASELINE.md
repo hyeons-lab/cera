@@ -1,18 +1,18 @@
 # Perf baseline
 
 The reference every perf task (T1-T10) diffs against. Re-measure with the same
-commands before claiming a delta — a throughput number without a matching
+commands before claiming a delta: a throughput number without a matching
 profile/counter movement is not evidence.
 
 **Model:** LFM2.5-350M-Q4_K_M (the most common real-world quant).
 **Settings:** prefill 512 / decode 128, `--no-cache`, medians (p50) over >=5 runs.
 
-**Sections carry their own provenance — they were not all measured at once:**
+**Sections carry their own provenance; they were not all measured at once:**
 
 | section | measured at | device |
 |---|---|---|
 | Android CPU/GPU table below | `c6f845d` (incl. #254) | Pixel 10 Pro Fold |
-| GPU I/O counters | mixed — see the † note | Mac / Adreno |
+| GPU I/O counters | mixed, see the † note | Mac / Adreno |
 | GPU decode profile | `0f00dec` (incl. #316, #318, #319, #320) | M1 Max |
 
 **The Android GPU row has not been re-measured since `c6f845d`** and predates
@@ -20,7 +20,7 @@ every wgpu decode change listed above. Do not read it as current: the same work
 is worth 1.78× on an M1 Max, and the Android number will have moved by some
 unknown amount. Re-running it needs the device.
 
-## Android — Pixel 10 Pro Fold (Tensor G5), on a fan
+## Android: Pixel 10 Pro Fold (Tensor G5), on a fan
 
 8 cores: 2 efficiency (cpu0-1) + 5 perf (cpu2-6) + 1 prime (cpu7).
 CPU has `asimddp` + `i8mm`.
@@ -30,7 +30,7 @@ CPU has `asimddp` + `i8mm`.
 | **cera** CPU | default RowPool | **102** | **70.3** |
 | cera CPU | pinned prime (`taskset 80`) | 113 | 66.1 |
 | cera CPU | pinned perf cluster (`taskset 7c`) | 49 | 46.5 |
-| **cera** GPU | wgpu / Vulkan (stale — see above) | 12 | 11.2 |
+| **cera** GPU | wgpu / Vulkan (stale, see above) | 12 | 11.2 |
 | llama.cpp | `-t 1` pinned prime | 170.6 | 73.3 |
 | llama.cpp | `-t 5` pinned perf | 261.1 | **85.7** |
 | llama.cpp | `-t 6` pinned perf+prime | **393.5** | 70.8 |
@@ -78,7 +78,7 @@ Read:
 - **The tail used to be three submits, and two of them were pure waste** (#319).
   The greedy argmax had its own encoder and its own blocking submit, and the
   4-byte result readback submitted *again* to stage the copy. A submit costs a GPU
-  round trip regardless of payload — ~1.3 ms for a kernel doing 0.13 ms of work,
+  round trip regardless of payload: ~1.3 ms for a kernel doing 0.13 ms of work,
   and ~1.5 ms to move four bytes. Both now ride along in the output projection's
   submission. This is the opposite of T6 and does not contradict it: what is
   expensive is a *blocking* round trip that carries nothing, not per-layer
@@ -88,22 +88,22 @@ Read:
 - **Prefill batching is gated on quantization, not platform.** The batched path
   requires every matmul weight to be `Q4_0`/`Q8_0`/`Q4_K`. A `Q4_K_M` file carries
   **11 Q6_K tensors**, which fails the check, so prefill **silently** falls back to
-  the per-token loop — 8728 submits instead of 25. The same model does this on Mac
+  the per-token loop: 8728 submits instead of 25. The same model does this on Mac
   too; it is not an Adreno effect (T8).
 - **Prefill reads back ~12.9 MB per 512-token prompt** (23 readbacks), against
   decode's 4 bytes/token. Not negligible, and its own optimization target.
-- **That readback volume is identical on both paths** — 23 readbacks and
+- **That readback volume is identical on both paths**: 23 readbacks and
   12,926,976 bytes whether prefill runs batched (Q4_0, 25 submits) or falls back
   (Q4_K_M, 8728 submits). So the readbacks are *not* a symptom of the fallback
   above; fixing the dtype gate will not touch them. Two independent problems.
 
 Because of that gate, the Mac-vs-Adreno rows in earlier revisions of this doc
-compared a **Q4_0** model on Mac against a **Q4_K_M** model on Adreno — i.e. the
+compared a **Q4_0** model on Mac against a **Q4_K_M** model on Adreno, i.e. the
 batched path against the fallback path. Same-model gaps are **3.3x prefill** and
 **2.3x decode**, not the 13x/4x reported before.
 
 Caveat: `bench` decodes greedily (temp=0), which takes the on-GPU argmax path. The
-**non-greedy** path still downloads full vocab logits per token — invisible to
+**non-greedy** path still downloads full vocab logits per token, invisible to
 these numbers by construction.
 
 ## GPU decode profile (`CERA_GPU_PROFILE=1`)
@@ -138,12 +138,12 @@ Read:
   48% of GPU pass time.
 
   Earlier revisions of this doc had the isolated-vs-in-model gap the other way
-  round — the microbenchmark reading ~13 GB/s where production sustained ~26 GB/s
-  — and treated that inversion as an open puzzle. It was the benchmark, and that
+  round, the microbenchmark reading ~13 GB/s where production sustained ~26 GB/s,
+  and treated that inversion as an open puzzle. It was the benchmark, and that
   puzzle is gone. Whether a gap remains in the other direction cannot be said
   until the harness is trustworthy again; see below.
 
-  The standing explanation has been *how the bytes are read* — quantized kernels
+  The standing explanation has been *how the bytes are read*: quantized kernels
   fetch via scalar `u32` loads with shift/branch byte extraction where `gemv_f16`
   reads aligned vectors. That held for two kernels (#316 register spills, #321
   q6_k byte-at-a-time loads) but **it is not a general law, and it failed the last
@@ -160,21 +160,21 @@ Read:
   cell's number depended on **where it sat in the table**, and whichever kernel
   ran first absorbed a large penalty. `q6_k` at ffn gate/up reports **0.0305 ms
   running last and 0.0952 ms running first**; reversing the kernel order moves the
-  penalty to whatever is now first. q4_k was listed first, so its whole row —
-  including the sweep that produced the "floor" — was the artifact. Fixed by
+  penalty to whatever is now first. q4_k was listed first, so its whole row,
+  including the sweep that produced the "floor", was the artifact. Fixed by
   running the table twice and reporting the second round; a 750 ms global clock
   ramp was tried first and does **not** fix it, so the mechanism is not clock ramp
   and is still unidentified.
 
-  **A second harness defect was then found — the third overall in this benchmark,
-  counting the one #321 fixed — and no replacement table is published here.**
-  Every measurement also carried one blocking submit + `poll(Wait)` — a
-  GPU round trip costing ~1.0-1.5 ms whatever it carries — amortised over `ITERS`
+  **A second harness defect was then found (the third overall in this benchmark,
+  counting the one #321 fixed), and no replacement table is published here.**
+  Every measurement also carried one blocking submit + `poll(Wait)`, a
+  GPU round trip costing ~1.0-1.5 ms whatever it carries, amortised over `ITERS`
   and never subtracted. So a cell read `T + C/ITERS`, not `T`. It is worst exactly
   where the kernel is cheapest: `q6_k` at ffn gate/up measured **46.0 / 63.6 /
   79.3 GB/s at ITERS = 50 / 200 / 1000**, and fitting that gives C ~ 1.16 ms, one
   round trip. The bench now uses two-point timing (`run(n)` and `run(2n)`,
-  differenced) which cancels C exactly — but differencing two noisy measurements
+  differenced) which cancels C exactly, but differencing two noisy measurements
   raises variance, and the resulting per-cell numbers do not yet replicate tightly
   enough to publish. A 7-run table measured after fixing the first defect but
   before finding this one was drafted here and then withdrawn; an independent
@@ -184,13 +184,13 @@ Read:
   currently authoritative.** Retracting a wrong number does not require a right
   one, and publishing a third table that also fails to replicate would repeat the
   error this section exists to record. What survives is what held under *every*
-  measurement regime tried — the buggy table, the 7-run table, the ITERS sweeps,
-  and an independent replication:
+  measurement regime tried (the buggy table, the 7-run table, the ITERS sweeps,
+  and an independent replication):
 
   - **There is no "FFN per-dispatch floor."** q6_k and the f32 control both run
     far above the claimed 13-26 GB/s ceiling at FFN shapes under every regime. A
-    real size-dependent cost exists — the f32 control rises monotonically with `m`
-    at fixed k=1024 — but not the hard floor that was published.
+    real size-dependent cost exists (the f32 control rises monotonically with `m`
+    at fixed k=1024), but not the hard floor that was published.
   - **q4_k is not ~3x slower than q4_0.** They are close at every FFN shape under
     every regime, at identical bytes/element (144/256 == 18/32 == 0.5625). Which
     of the two leads at a given shape moves with the measurement regime, so no
@@ -199,7 +199,7 @@ Read:
     reproducibly and in the most stable shape measured.
   - **q8_0 is the worst kernel by a wide margin at the FFN and LM-head shapes**,
     far outside any noise seen here, and is the best remaining target. (At
-    `attn qkv/out` — the noisiest shape measured — it is not separable from q4_0,
+    `attn qkv/out`, the noisiest shape measured, it is not separable from q4_0,
     so the claim is not made there.) Size the work from a fresh
     in-model measurement, not from this harness: in isolation it looks ~40% less
     efficient per byte than q4_0, while the in-model A/B below implies ~10%
@@ -208,7 +208,7 @@ Read:
   **Before publishing a GEMV table again**, characterise the variance of
   `cera/examples/wgpu_gemv_bench`:
   fix the two defects found here (done), then establish how many runs a cell needs
-  to replicate, and verify by permuting kernel order *and* sweeping `ITERS` —
+  to replicate, and verify by permuting kernel order *and* sweeping `ITERS`:
   both must leave the conclusion unchanged. Until then prefer an **ABBA A/B within
   one process** on the specific pair in question, which is what the kernel-variant
   results below rest on and why they are still quoted.
@@ -223,7 +223,7 @@ Read:
   ordered, with q4_k held in a fixed non-first slot. **None was a net win and all
   were discarded.** Recorded here so they are not re-attempted blind:
 
-  **Change in wall time vs the original kernel — negative is faster.**
+  **Change in wall time vs the original kernel: negative is faster.**
 
   | variant | ffn gate/up | lm head |
   |---|---|---|
@@ -234,7 +234,7 @@ Read:
   Hoisting the scale-byte indexing out of the block loop was actively worse at
   every shape: it keeps six extra registers live for the whole kernel to save
   `select`s the backend was already folding. The thread remap won at ffn gate/up
-  but cost a tight, reproducible regression at the LM head — more live registers
+  but cost a tight, reproducible regression at the LM head: more live registers
   per thread means fewer resident threadgroups, and at m=65536 occupancy is what
   buys the latency hiding. Trading a certain LM-head regression for a noisy FFN
   gain is a bad deal on this GPU and a worse one on mobile.
@@ -242,16 +242,16 @@ Read:
 - **Decode is memory-bound, confirmed by A/B, not by inspection.** The same model
   at Q8_0 moves 1.89× the FFN bytes and took **2.10×** the FFN time. Time tracks
   bytes. An ALU/dequant bound was the obvious story from reading
-  `gemv_q4_0_fast.wgsl` and it is **wrong** — Q8_0 is *cheaper* to unpack and got
+  `gemv_q4_0_fast.wgsl` and it is **wrong**: Q8_0 is *cheaper* to unpack and got
   proportionally slower anyway.
 
 - **~24% of decode wall time is now outside every GPU pass** (6.7 ms of passes vs
   8.9 ms wall), down from ~44%. #319 is what closed it, by removing two blocking
   GPU round trips from the tail. The earlier claim that this gap was "not
   recoverable by merging submits" was right about *submits* and wrong as a general
-  conclusion — see `GPU_FINDINGS_CORRECTION.md`, round 3.
+  conclusion; see `GPU_FINDINGS_CORRECTION.md`, round 3.
 
-- **Compute-pass count is NOT a general lever — do not re-derive one from #318.**
+- **Compute-pass count is NOT a general lever: do not re-derive one from #318.**
   Merging the conv block's three passes into one was worth +17%, but merging
   passes in the attention/FFN path measured **neutral-to-negative**: a boundary
   there is worth ~6 µs, not the ~20–38 µs the conv result implied, and carrying
@@ -260,7 +260,7 @@ Read:
 
 - Not yet measured on Adreno. Every number in this section is M1 Max, and the
   register/occupancy trades that decided the q4_k variants above will differ on a
-  mobile tiler with a tighter register budget — so which kernel wins may differ
+  mobile tiler with a tighter register budget, so which kernel wins may differ
   too, not just by how much.
 
 ## Reproduce
@@ -288,7 +288,7 @@ CERA_GPU_PROFILE=1 cera bench -m <model.gguf> --device gpu \
   number above is from a pinned config; the pinned re-runs are stable
   (llama `-t 1`: `73.3 ± 0.26`).
 - **Warm the device.** cera's first Android numbers were ~15% low because runs
-  1-2 were cold; `--warmup 2` fixed it. `bench` prints thermal headroom per run —
+  1-2 were cold; `--warmup 2` fixed it. `bench` prints thermal headroom per run;
   if it climbs toward 1.0, the number is thermally limited, not a ceiling.
 - **`--no-cache` matters.** Without it the KV prefix cache makes prefill look
   arbitrarily fast on repeat runs.

@@ -1,4 +1,4 @@
-# Cera — Implementation Plan
+# Cera: Implementation Plan
 
 A Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
@@ -11,18 +11,18 @@ roadmap into **multimodal** territory (vision, audio, TTS) that this plan never
 anticipated. The status legend below uses ✅ done · 🟡 partial · ⬜ not started.
 Published to crates.io / Maven Central / CLI binaries at **0.3.1**; **0.4.0**
 is the next release target (the publish workflow is a manual dispatch, so this
-lags the version in `VERSION` until it runs). `cera-wasm` is not on npm yet —
+lags the version in `VERSION` until it runs). `cera-wasm` is not on npm yet;
 that leg stays disabled until the registry secrets are set up.
 
 **V1 (Phases 0–6):** ✅ pipeline complete. CPU (SIMD + runtime feature dispatch
 + BLAS), wgpu GPU backend, Metal backend, GGUF parser, BPE tokenizer, sampler,
 KV cache, generation engine, HF bundle download, interactive chat TUI, and bench
-command are all shipped — the end-to-end inference pipeline is done. **Phase 4
+command are all shipped; the end-to-end inference pipeline is done. **Phase 4
 model coverage** has since expanded: architecture dispatch now handles `lfm2`,
 `qwen2`, `qwen3`, `llama`, and `granite` on the shared LLaMA/transformer code
 path (classic Mistral ships as arch `llama`, so it is covered too). Only the
 `gemma` and `phi3` arch strings named in Phase 4 remain unwired. The dense
-transformers run on **every backend** — CPU, wgpu, and Metal — with decode +
+transformers run on **every backend** (CPU, wgpu, and Metal) with decode +
 batched-GEMM prefill and a tiled flash-attention path for long prompts; the
 earlier "GPU is LFM2-only" limitation is gone (see #177/#192/#193/#194/#200).
 
@@ -30,8 +30,8 @@ earlier "GPU is LFM2-only" limitation is gone (see #177/#192/#193/#194/#200).
 - LFM2-VL **vision** encoder + preprocessor (image → embeddings), GPU-accelerated
 - LFM2-Audio **audio** encoder/decoder + preprocessor (PCM → embeddings, ASR)
 - **TTS** generation
-- **WASM** build (threaded via wasm-bindgen-rayon + wgpu-on-wasm) — this is V2.2
-- Kotlin Multiplatform FFI (`cera-ffi-kotlin`: android + jvm) — this is V2.14
+- **WASM** build (threaded via wasm-bindgen-rayon + wgpu-on-wasm); this is V2.2
+- Kotlin Multiplatform FFI (`cera-ffi-kotlin`: android + jvm); this is V2.14
 - Batched-GEMM **prefill on all backends** (CPU/wgpu/Metal) + GPU-side KV-shift
 - Sampler: `min_p` and `repetition_penalty` (#180)
 
@@ -41,7 +41,7 @@ earlier "GPU is LFM2-only" limitation is gone (see #177/#192/#193/#194/#200).
 |------|--------|-------|
 | V2.1 Server + continuous batching | ⬜ | no HTTP server, KV cache still contiguous (not paged) |
 | V2.2 Browser / WASM | ✅ | `cera-wasm`, threads, wgpu-on-wasm |
-| V2.3 Structured output (GBNF) | ✅ | `cera/src/grammar.rs` — grammar-constrained decoding + bounded rep `{n,m}`, exposed via FFI + WASM; only non-ASCII char-class ranges remain |
+| V2.3 Structured output (GBNF) | ✅ | `cera/src/grammar.rs`: grammar-constrained decoding + bounded rep `{n,m}`, exposed via FFI + WASM; only non-ASCII char-class ranges remain |
 | V2.4 KV cache serialization (.lmkv) | ⬜ | |
 | V2.5 Prefix caching (radix) | ⬜ | |
 | V2.5b TurboQuant KV compression | ✅ | `cera/src/turboquant.rs` |
@@ -49,17 +49,17 @@ earlier "GPU is LFM2-only" limitation is gone (see #177/#192/#193/#194/#200).
 | V2.7 Per-shape kernel tuning | ⬜ | no `cera tune` / autotune |
 | V2.8 Speculative decoding | 🟡 | Prompt-lookup (n-gram) drafting shipped, CPU dense only; draft-model variant remains |
 | V2.9 LoRA adapters | ✅ | `cera/src/lora.rs`; runtime apply on CPU + Metal + wgpu; FFI/WASM |
-| — Hidden-states extraction | ✅ | `Model::hidden_states` (CPU/Metal/wgpu) + FFI/WASM; classifier/embedding path |
+| - Hidden-states extraction | ✅ | `Model::hidden_states` (CPU/Metal/wgpu) + FFI/WASM; classifier/embedding path |
 | V2.10 MoE support | ⬜ | |
 | V2.11 Multi-GPU | ⬜ | |
 | V2.12 CUDA backend | ⬜ | |
 | V2.13 Python (PyO3) bindings | ⬜ | |
 | V2.14 Kotlin Multiplatform bindings | ✅ | `cera-ffi-kotlin` (android + jvm) |
-| V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter` — sync + async generate, sync + async streaming, `withProgress` all verified; only `fromBundleIdAsync` stubbed |
+| V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter`: sync + async generate, sync + async streaming, `withProgress` all verified; only `fromBundleIdAsync` stubbed |
 | V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core + FFI + GPU (Metal/wgpu) encode shipped, no slicing |
 | V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
 
-**Tally:** original V2 — 4 done (2.2, 2.3, 2.5b, 2.14), 2 partial (2.6, 2.17),
+**Tally:** original V2: 4 done (2.2, 2.3, 2.5b, 2.14), 2 partial (2.6, 2.17),
 10 remaining (2.1, 2.4, 2.5, 2.7–2.13). Plus 2 off-roadmap multimodal tracks
 shipped (V2.15 Vision, V2.16
 Audio/TTS). The largest untouched buckets are the **production server stack**
@@ -78,7 +78,7 @@ Audio/TTS). The largest untouched buckets are the **production server stack**
 
 ---
 
-# V1 — "Load a GGUF, generate text, make it fast"
+# V1: "Load a GGUF, generate text, make it fast"
 
 **Target: 6-8 weeks.** One developer + Claude Code.
 
@@ -140,7 +140,7 @@ Audio/TTS). The largest untouched buckets are the **production server stack**
 **Time: 5-7 days**
 
 ```
-1.1  tensor.rs — Core types:
+1.1  tensor.rs: Core types:
 
      pub enum DType { F32, F16, BF16, I32, U8, Q4_0, Q4KM, Q8_0 }
 
@@ -153,7 +153,7 @@ Audio/TTS). The largest untouched buckets are the **production server stack**
      Methods: shape(), dtype(), numel(), size_bytes(),
      to_f32_vec(), from_f32_vec(), as_f32_slice(), zeros_f32()
 
-1.2  quant.rs — Q4_0, Q4_K_M and Q8_0:
+1.2  quant.rs: Q4_0, Q4_K_M and Q8_0:
 
      Q4_0 block (18 bytes):
        d: f16                  // scale
@@ -171,13 +171,13 @@ Audio/TTS). The largest untouched buckets are the **production server stack**
 
      Implement dequantize and vec_dot for each.
 
-1.3  backend/cpu.rs — Naive reference implementations:
+1.3  backend/cpu.rs: Naive reference implementations:
      fn matmul_f32, matmul_q4_0_f32, matmul_q8_0_f32, matmul_q4km_f32
      fn rmsnorm, silu_inplace, softmax_inplace
      fn rope, conv1d_depthwise
      fn add_inplace, mul_inplace
 
-1.4  backend/simd.rs — SIMD-optimized vec_dot:
+1.4  backend/simd.rs: SIMD-optimized vec_dot:
      NEON (aarch64) and AVX2 (x86_64) implementations
      with compile-time / runtime dispatch.
 ```
@@ -188,16 +188,16 @@ Audio/TTS). The largest untouched buckets are the **production server stack**
 **Time: 3-4 days**
 
 ```
-2.1  gguf.rs — Parser:
+2.1  gguf.rs: Parser:
      - Parse header: magic (0x46554747), version, tensor_count, kv_count
      - Parse KV metadata: all 13 GGUF value types
      - Parse tensor info: name, dims, dtype (with raw ggml_type_id), offset
      - Memory-map tensor data with memmap2 (zero-copy)
      - get_tensor(), tensor_data(), print_inspect()
 
-2.2  cera inspect CLI command — dumps metadata + tensor info
+2.2  cera inspect CLI command: dumps metadata + tensor info
 
-2.3  tokenizer.rs — Minimal BPE:
+2.3  tokenizer.rs: Minimal BPE:
      - Load vocab + merges from GGUF metadata
      - Byte-level BPE encode/decode
      - Special token detection from token_type array
@@ -227,20 +227,20 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
      - Global: token_embd.weight, token_embd_norm.weight
      - Note: lfm2.attention.head_count_kv is an i32 array (per-layer), not scalar
 
-3.2  model/mod.rs — Model loading dispatch:
+3.2  model/mod.rs: Model loading dispatch:
 
      pub struct ModelConfig { ... }
      pub enum BlockType { Attention, GatedConv }
      pub trait Model: Send { fn forward(...), fn config() }
      pub fn load_model(gguf: &GgufFile) -> Result<Box<dyn Model>>
 
-3.3  kv_cache.rs — Simple contiguous KV cache (NOT paged yet).
+3.3  kv_cache.rs: Simple contiguous KV cache (NOT paged yet).
 
-3.4  model/lfm2.rs — LFM2 model struct + forward pass
+3.4  model/lfm2.rs: LFM2 model struct + forward pass
 
-3.5  sampler.rs — greedy, temperature, top_k, top_p, sample
+3.5  sampler.rs: greedy, temperature, top_k, top_p, sample
 
-3.6  engine.rs — Generation loop with prefill + decode
+3.6  engine.rs: Generation loop with prefill + decode
 
 3.7  cera run CLI command
 
@@ -253,7 +253,7 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 **Time: 3-5 days**
 
 ```
-4.1  model/llama.rs — LLaMA is all-attention blocks.   [done: shared path]
+4.1  model/llama.rs: LLaMA is all-attention blocks.   [done: shared path]
 4.2  Architecture variants: llama, mistral, qwen2, qwen3, granite, gemma, phi3  [done: llama/mistral/qwen2/qwen3/granite; gemma/phi3 remain]
 4.3  Test each on a real GGUF. Greedy decoding matches llama.cpp.
 ```
@@ -272,12 +272,12 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 > Status: wgpu backend shipped (matmul, quantized GEMM/GEMV, rmsnorm, silu, rope,
 > softmax, attention, conv1d, element-wise) plus a separate **Metal** backend and
 > shader preprocessor. GPU forward pass now supports **LFM2 and the dense
-> transformers** (llama/qwen2/qwen3/granite) on both wgpu and Metal — decode +
+> transformers** (llama/qwen2/qwen3/granite) on both wgpu and Metal: decode +
 > batched-GEMM prefill, GPU-side KV-shift, and the ViT vision encoder; runs on
 > wasm as well. Subgroup variants implemented with small-subgroup adapter support.
 
 ```
-5.1  backend/wgpu.rs — Device init, buffer pool, weight upload.
+5.1  backend/wgpu.rs: Device init, buffer pool, weight upload.
 5.2  WGSL shaders: matmul, quantized matmul, rmsnorm, silu, rope, softmax,
      attention, conv1d, element-wise ops
 5.3  Subgroup-enhanced variants (feature-detect at init)
@@ -285,7 +285,7 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 5.5  CLI: --device gpu/cpu/auto. Benchmark CPU vs GPU.
 
      Note: V1 shaders use fixed workgroup sizes. Per-shape kernel tuning
-     (V2.7) adds profile-guided dispatch for decode GEMV — significant
+     (V2.7) adds profile-guided dispatch for decode GEMV; significant
      wins on AMD RDNA3 (see kernel-anvil results: 2.25x on 7900 XTX).
      Design shader dispatch to accept configurable workgroup params from
      the start so V2.7 is a config change, not a rewrite.
@@ -315,11 +315,11 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 
 ---
 
-# V2 — Roadmap
+# V2: Roadmap
 
 Ordered by estimated impact. Many can be worked in parallel.
 
-### V2.1: Server + Continuous Batching — 3-4 weeks ⬜
+### V2.1: Server + Continuous Batching, 3-4 weeks ⬜
 OpenAI-compatible HTTP server (axum + SSE), continuous batching scheduler, paged attention (replaces contiguous KV cache), request queue, Prometheus metrics, preemption.
 
 > GPU context-size/performance follow-up: see
@@ -328,10 +328,10 @@ OpenAI-compatible HTTP server (axum + SSE), continuous batching scheduler, paged
 > range is too large; the plan breaks this into active-range binding, paged KV,
 > and page-aware tiled flash attention.
 
-### V2.2: Browser / WASM — 3-4 weeks ✅ DONE
+### V2.2: Browser / WASM, 3-4 weeks ✅ DONE
 WASM build (dual: threaded + single-threaded), wasm-bindgen-rayon for multi-threaded CPU, Web Worker architecture, OPFS model caching, JS API + npm package, Chrome enhanced (subgroups, dot4U8Packed, f16), Safari baseline (f16, standard WGSL), feature detection.
 
-### V2.3: Structured Output — 1-2 weeks ✅ DONE
+### V2.3: Structured Output, 1-2 weeks ✅ DONE
 GBNF grammar parser + grammar-constrained decoding (`cera/src/grammar.rs`): each
 decode step masks logits to only grammar-accepted tokens. Supports bounded
 repetition `{n,m}` (#196) and is exposed over both FFI (`GenerateOpts.grammar`
@@ -340,37 +340,37 @@ Byte-level v1: non-ASCII / multi-byte ranges inside char classes are not yet
 supported. The JSON-schema→grammar compiler landed with tool calling (see V2.15);
 async FSM-mask overlap remains a future enhancement.
 
-### V2.4: KV Cache Serialization — 1-2 weeks ⬜
+### V2.4: KV Cache Serialization, 1-2 weeks ⬜
 Serialize KV cache + conv buffers to .lmkv files, system prompt caching, conversation checkpointing, KV quantization for storage.
 
-### V2.5: Prefix Caching (Radix Attention) — 1-2 weeks ⬜
+### V2.5: Prefix Caching (Radix Attention), 1-2 weeks ⬜
 Radix tree for in-memory prefix matching, LRU eviction, scheduler integration. 5-6x speedup on prefix-heavy workloads.
 
-### V2.5b: TurboQuant KV Cache Compression — 1-2 weeks ✅ DONE
+### V2.5b: TurboQuant KV Cache Compression, 1-2 weeks ✅ DONE
 Google Research's data-oblivious KV cache compression (ICLR 2026). Compresses KV cache to 3-3.5 bits with zero accuracy loss.
 
-### V2.6: More Quantization Formats — 1 week per format 🟡 PARTIAL
+### V2.6: More Quantization Formats, 1 week per format 🟡 PARTIAL
 Added since V1: the **Q4_1** (#280) and **Q5_K** (#246) tensor types. V1 already
-shipped Q4_0, Q8_0, Q4_K, and Q6_K — this document calls Q4_K by its file-type
+shipped Q4_0, Q8_0, Q4_K, and Q6_K; this document calls Q4_K by its file-type
 name `Q4_K_M` elsewhere, though the loader dispatches on the `Q4_K` tensor type.
-Q5_K runs on all three backends — CPU, wgpu, and Metal (`metal_lfm2.rs` wires
+Q5_K runs on all three backends: CPU, wgpu, and Metal (`metal_lfm2.rs` wires
 `gemv_q5_k` / `gemm_q5_k`, added in #324).
 
 Remaining: Q2_K, Q3_K, Q5_0, Q5_1, IQ quants, GPTQ, AWQ, FP8, in-situ
-quantization. Q5_0/Q5_1 matter more than their obscurity suggests — llama.cpp
+quantization. Q5_0/Q5_1 matter more than their obscurity suggests; llama.cpp
 falls back to them for tensors whose rows are not a multiple of 256, so they turn
 up inside otherwise-supported K-quant files.
 
-### V2.7: Per-Shape Kernel Tuning (GEMV/MMVQ) — 1-2 weeks ⬜
+### V2.7: Per-Shape Kernel Tuning (GEMV/MMVQ), 1-2 weeks ⬜
 Profile-guided kernel optimization for quantized decode (batch=1 GEMV). Instead of using one-size-fits-all thread/block configs for all layers, profile each unique (quant_type, N, K) shape on the target GPU and apply optimal nwarps/rows_per_block at runtime. Inspired by [kernel-anvil](https://github.com/apollosenvy/kernel-anvil) which demonstrated 2.25x decode speedup on Qwen3.5-27B Q4_K_M (12→27 tok/s on RX 7900 XTX) by auto-tuning llama.cpp's MMVQ kernels per model shape. Key insight: a 1024-row GQA projection and a 17408-row FFN layer have very different optimal configs. The bottleneck classification (bandwidth-bound vs occupancy-limited vs compute-bound) determines the sweep strategy. For cera: implement shape-aware dispatch in wgpu compute shaders (WGSL workgroup size, rows per invocation) and optionally in CPU SIMD (loop tiling). Store per-model configs as JSON; profile on first run or via `cera tune` command.
 
-### V2.8: Speculative Decoding — 🟡 PARTIAL
-Shipped as **prompt-lookup (n-gram) drafting** with greedy verification — *no*
+### V2.8: Speculative Decoding, 🟡 PARTIAL
+Shipped as **prompt-lookup (n-gram) drafting** with greedy verification: *no*
 draft model, so no extra weight memory. The drafter reuses the sequence itself:
 it matches the trailing `ngram` tokens against an earlier occurrence and offers
 what followed, and the target verifies up to `k` of them in one forward. Every
-emitted token is the target's own argmax, so the result is a valid greedy decode
-— but not bit-identical to a sequential one, since the verifier forwards a batch
+emitted token is the target's own argmax, so the result is a valid greedy decode,
+but not bit-identical to a sequential one, since the verifier forwards a batch
 where a sequential loop forwards one token at a time, and a near-tie can flip
 (#310's own test recorded exactly one such divergence at 81% acceptance).
 Exposed as `GenerateOpts::spec` / `SpecDecode` and on the CLI as
@@ -382,13 +382,13 @@ and a dtype gate), so the LM head is read once per round rather than re-streamed
 once per position. A per-row fallback remains for head dtypes without a batched
 kernel.
 
-Currently engages on the CPU dense (`llama`-family) path only — it requires
-`Model::supports_all_logits()`, which only `LlamaModel` implements — and needs
+Currently engages on the CPU dense (`llama`-family) path only (it requires
+`Model::supports_all_logits()`, which only `LlamaModel` implements) and needs
 an uncompressed KV cache. Remaining: a real draft-model variant, and extending
 all-position logits to LFM2 and the GPU models.
 
-### V2.9: LoRA Adapters — ✅ DONE
-Runtime LoRA apply (`y += scale·B·(A·x)`, **never merged** — base weights stay
+### V2.9: LoRA Adapters, ✅ DONE
+Runtime LoRA apply (`y += scale·B·(A·x)`, **never merged**: base weights stay
 quantized, so hot-swap / unload / per-request selection are free). `cera/src/lora.rs`
 loads GGUF (`convert_lora_to_gguf`) and PEFT `.safetensors` adapters; applied on
 **CPU + Metal + wgpu** (the two GPU backends fold `scale` + Granite `residual_mult`
@@ -396,29 +396,29 @@ into `B` at upload and cache uploads in an `Arc`-keyed LRU); attach/remove/hot-s
 on `Session`, exposed over FFI (`LoraAdapters` + `attachLora`) and WASM. Dim-checked
 at attach; rank capped (`MAX_LORA_RANK`). GPU-vs-CPU parity verified (cosine ≥ 0.995).
 Shipped alongside **hidden-states extraction** (`Model::hidden_states`, post-final-norm
-per-token vectors reflecting the active adapter) — the classifier/embedding path that
+per-token vectors reflecting the active adapter); the classifier/embedding path that
 unblocks section-router / extractor heads. PRs #205–#215.
 
-### V2.10: MoE Support — 2-3 weeks ⬜
+### V2.10: MoE Support, 2-3 weeks ⬜
 Top-K expert routing for Mixtral, LFM2-8B-A1B, LFM2-24B-A2B.
 
-### V2.11: Multi-GPU — 3-4 weeks ⬜
+### V2.11: Multi-GPU, 3-4 weeks ⬜
 Pipeline parallelism, tensor parallelism, CPU offloading.
 
-### V2.12: CUDA Backend — 3-4 weeks ⬜
+### V2.12: CUDA Backend, 3-4 weeks ⬜
 Optional cuBLAS + FlashAttention + CUDA graphs. Requires nvcc.
 
-### V2.13: Python Bindings — 1-2 weeks ⬜
+### V2.13: Python Bindings, 1-2 weeks ⬜
 PyO3 bindings, `pip install cera-engine`.
 
-### V2.14: Kotlin Multiplatform Bindings — 2-3 weeks ✅ DONE
+### V2.14: Kotlin Multiplatform Bindings, 2-3 weeks ✅ DONE
 C ABI via cbindgen + platform-native FFI per KMP target (cinterop, Panama FFM, PanamaPort, JS interop).
 
-### V2.15: Tool Calling — ✅ DONE
+### V2.15: Tool Calling, ✅ DONE
 Format-aware tool/function calling (`cera/src/tools.rs`): tool schemas rendered
 into the chat template (`apply_chat_template_with_tools`), and tool calls parsed
 from the reply for both LFM2 **Pythonic** (`[get_weather(city="Paris")]`) and
-Hermes/Qwen **JSON** (`<tool_call>{…}</tool_call>`) — `ToolFormat::detect` picks
+Hermes/Qwen **JSON** (`<tool_call>{…}</tool_call>`); `ToolFormat::detect` picks
 the format from the GGUF architecture. Includes the JSON-schema→GBNF compiler
 noted as a future enhancement under V2.3: `tool_grammar` constrains the call
 (valid function name, argument names, and value types) and a **lazy grammar
@@ -426,20 +426,20 @@ trigger** (`GenerateOpts.grammar_trigger_tokens`) keeps generation free until th
 model starts a call. Exposed across CLI (`--tools` / `--constrain-tools`), FFI
 (Kotlin/Swift), WASM, and Dart. PR #239.
 
-### V2.17: Flutter / Dart Bindings — 2-3 weeks 🟡 (sync + async + streaming working; only `fromBundleIdAsync` stubbed)
+### V2.17: Flutter / Dart Bindings, 2-3 weeks 🟡 (sync + async + streaming working; only `fromBundleIdAsync` stubbed)
 Expose the engine to Flutter/Dart, reusing the existing `cera-ffi` UniFFI
 surface (the same C ABI that already backs Kotlin + Swift). The
 `cera-ffi-flutter` Dart package ships the generated+patched bindings plus a
 platform-aware native-library loader.
 
 **Working (verified end-to-end):** the synchronous engine API round-trips real
-inference — loaded a Qwen2-0.5B GGUF through `CeraEngine.fromPath` →
+inference: loaded a Qwen2-0.5B GGUF through `CeraEngine.fromPath` →
 `newSession` → `appendText` → `generate` and got tokens back; `cpuBackendReport`
 and structured `FfiError` propagation also confirmed. Delivered:
 - `cera-ffi` gains an **`ffi-buffer`** cargo feature
-  (`uniffi/scaffolding-ffi-buffer-fns`) — the Dart generator calls
+  (`uniffi/scaffolding-ffi-buffer-fns`): the Dart generator calls
   `uniffi_ffibuffer_*` trampolines UniFFI only emits under that flag.
-- `tool/patch_generated_bindings.dart` — deterministic, idempotent post-gen
+- `tool/patch_generated_bindings.dart`: deterministic, idempotent post-gen
   fixups: corrects `rustbuffer`/`rust_future` symbol names + the `.ref.ptr`
   union field, rewrites native-lib resolution (`CERA_FFI_LIB` + platform name),
   synthesizes the `EngineConfig` record encoder, fixes the async-ctor return
@@ -447,34 +447,34 @@ and structured `FfiError` propagation also confirmed. Delivered:
 - `just dart-libs` / `dart-bindings` / `dart-bindings-check` recipes; committed
   generated bindings (analyze clean); `example/cera_generate.dart`.
 
-**Streaming — WORKING (verified end-to-end).** `generate_streaming(opts, sink)`
+**Streaming: WORKING (verified end-to-end).** `generate_streaming(opts, sink)`
 delivers tokens to a Dart-implemented `ModalitySink`: a Qwen2-0.5B run produced
 24 `onTextTokens` callbacks + one `onDone(FinishReasonMaxTokens)`. Getting there
 required vendoring the generator (`third_party/uniffi-bindgen-dart/`, own
-workspace) and five codegen fixes — to be upstreamed to
+workspace) and five codegen fixes, to be upstreamed to
 `nchapman/uniffi-bindgen-dart`:
-1. **Callback-arg lowering** — sink args lower via `<Name>FfiCodec.lower`
-   (registers the Dart impl + installs the vtable), not a raw object write — so
+1. **Callback-arg lowering**: sink args lower via `<Name>FfiCodec.lower`
+   (registers the Dart impl + installs the vtable), not a raw object write, so
    a sink can be passed *into* Rust.
-2. **Foreign-trait vtable-init symbol** — was `<name>_trait_callback_init` (no
+2. **Foreign-trait vtable-init symbol**: was `<name>_trait_callback_init` (no
    such export); now UniFFI's `uniffi_<ns>_fn_init_callback_vtable_<name>`.
-3. **Vtable slot order** — the generator sorted methods alphabetically,
+3. **Vtable slot order**: the generator sorted methods alphabetically,
    misaligning slots vs Rust's declaration order; now preserved for callback
    traits (`onTextTokens, onAudioFrames, onDone`).
-4. **RustBuffer callback-arg ABI** — the generator JSON-encoded complex callback
+4. **RustBuffer callback-arg ABI**: the generator JSON-encoded complex callback
    args (`Pointer<Utf8>`), but stock UniFFI passes a **RustBuffer by value**.
    Added callback-specific FFI mappers (`map_callback_native/dart_ffi_type`,
-   scoped to callback bridges — the non-ffibuffer runtime path is untouched) +
+   scoped to callback bridges, the non-ffibuffer runtime path is untouched) +
    RustBuffer decode via the existing `_UniFfiBinaryReader`/`_uniffiRead<T>`.
    `Vec<u32>`/`Vec<f32>`/enum now decode correctly. 223 vendored tests pass
    (incl. new callback-mapper tests).
-5. **Per-interface `listener` vs `isolateLocal`** — void vtable methods of a
+5. **Per-interface `listener` vs `isolateLocal`**: void vtable methods of a
    callback interface used by any *async* method use `NativeCallable.listener`
    (cross-thread); sync-only interfaces keep `isolateLocal`. Unblocks
    `generate_streaming_async` (see Async below).
 
-**Async — `generateAsync` AND `generateStreamingAsync` WORK.** `generateAsync`
-returns a real `Future` via UniFFI's rust-future poll/complete loop — verified
+**Async: `generateAsync` AND `generateStreamingAsync` WORK.** `generateAsync`
+returns a real `Future` via UniFFI's rust-future poll/complete loop; verified
 async: 24 tokens with the Dart event loop ticking ~45× during decode.
 `generateStreamingAsync` streams tokens to a Dart `ModalitySink` from cera's
 tokio worker thread (16 tokens + `onDone` verified, `example/cera_async.dart`).
@@ -487,12 +487,12 @@ synchronous). So `ModalitySink` (used by `generate_streaming_async`) → listene
 
 Consequence: `listener` callbacks are async, so **sync `generate_streaming`'s
 `ModalitySink` callbacks are now queued** and arrive only when you yield to the
-event loop (drain after the call — `example/cera_stream.dart`; or just use
-`generateStreamingAsync`). `fromBundleIdAsync` stays generator-stubbed — async
+event loop (drain after the call: `example/cera_stream.dart`; or just use
+`generateStreamingAsync`). `fromBundleIdAsync` stays generator-stubbed; async
 constructor returning an object handle needs the object/pointer rust-future
 variant.
 
-**`BundleRepo.withProgress` — VERIFIED.** `DownloadProgressSink.onProgress`
+**`BundleRepo.withProgress`: VERIFIED.** `DownloadProgressSink.onProgress`
 fires synchronously (it stays `isolateLocal`; `fromBundleId` is synchronous) with
 all args RustBuffer-decoded correctly: `url: String`, `bytesDownloaded: u64`,
 `totalBytes: Option<u64>` (`example/cera_progress.dart`, `LFM2-350M-GGUF`).
@@ -505,11 +505,11 @@ drift check into CI; then the upstream PR.
 **Spike result (2026-06-13, `uniffi-bindgen-dart` 0.1.3):** Viable but not
 turnkey. The generator builds against `uniffi_bindgen 0.31.1` (our exact
 version) and emitted ~7,300 lines of Dart from the current `cera-ffi` dylib
-with **zero Rust-side changes** — structs, enums, sync methods, and
+with **zero Rust-side changes**: structs, enums, sync methods, and
 `CeraEngine.transcribe` came out clean (UniFFI checksums matched). After adding
 the `ffi` package dep and an SDK `^3.3.0` constraint, `dart analyze` drops to
 **8 errors, 0 warnings**, and every error sits in the *advanced* FFI surface:
-- callback / foreign-trait sinks — `DownloadProgressSink`, `ModalitySink`
+- callback / foreign-trait sinks: `DownloadProgressSink`, `ModalitySink`
   (download progress + audio-modality streaming) generate invalid casts;
 - async constructor `fromBundleIdAsync` returns `CeraEngine` instead of
   `Future<CeraEngine>`;
@@ -517,11 +517,11 @@ the `ffi` package dep and an SDK `^3.3.0` constraint, `dart analyze` drops to
 
 So the bulk auto-generates, but cera leans hard on exactly the async +
 streaming-callback features 0.1.3 mishandles. Paths forward:
-1. **Narrow the Dart-exposed surface** — generate for the sync core, hand-write
+1. **Narrow the Dart-exposed surface**: generate for the sync core, hand-write
    thin Dart shims for the streaming/async bits.
-2. **Patch/contribute upstream** — the failures are isolated; `uniffi-bindgen-dart`
+2. **Patch/contribute upstream**: the failures are isolated; `uniffi-bindgen-dart`
    is young (0.1.x) and the fixes look tractable.
-3. **flutter_rust_bridge** — separate binding layer, but first-class async +
+3. **flutter_rust_bridge**: separate binding layer, but first-class async +
    `Stream` support (a better fit for token/audio streaming) at the cost of not
    reusing the UniFFI interface.
 
@@ -530,19 +530,19 @@ bindings; fall back to (3) if streaming UX becomes the priority.
 
 ---
 
-## Multimodal (off original roadmap — added retroactively)
+## Multimodal (off original roadmap, added retroactively)
 
 These tracks were not in the original V1/V2 plan but have been built out to
 support the LFM2-VL and LFM2-Audio model families. Documented here so the
 roadmap reflects what actually exists.
 
-### V2.15: Vision (LFM2-VL) — ✅ core shipped
+### V2.15: Vision (LFM2-VL), ✅ core shipped
 Image → text via a CLIP-family ViT encoder with a 2-layer MLP projector
 (`PROJECTOR_TYPE_LFM2`). Shipped:
-- `model/vision_encoder.rs` — ViT encoder weights + tensor mapping, loaded from
+- `model/vision_encoder.rs`: ViT encoder weights + tensor mapping, loaded from
   the `multimodal_projector` GGUF in a VL bundle (`mmproj-*.gguf`). Verified
   against LFM2.5-VL-450M.
-- `model/vision_preprocessor.rs` — PNG/JPEG decode → aspect-preserving dynamic
+- `model/vision_preprocessor.rs`: PNG/JPEG decode → aspect-preserving dynamic
   resize → normalize → `[3×H×W]` NCHW tensor, with 2× pixel-unshuffle to match
   the encoder patch grid.
 - Soft-token prefill into the LLM via `Session::append_chat_with_images`;
@@ -551,7 +551,7 @@ Image → text via a CLIP-family ViT encoder with a 2-layer MLP projector
 - **FFI exposure:** `cera-ffi` `Session.appendImage(bytes, maxLongSize)` exposes
   vision to Kotlin/Swift/Flutter. `maxLongSize` caps the longest side of the
   *encoded* image (shrinks the resize target in a single resample, takes
-  precedence over `image_min_pixels`) — a quality/cost knob. Reachable through
+  precedence over `image_min_pixels`), a quality/cost knob. Reachable through
   every append path (including `append_chat_with_images` and the CLI) via the
   session-default `Session::set_image_max_long_size` / `--max-long-size`; the
   per-call `append_image_with_opts(bytes, max_long_size)` overrides it.
@@ -566,14 +566,14 @@ Image → text via a CLIP-family ViT encoder with a 2-layer MLP projector
   stay on the CPU (small, data-dependent rearrangement).
 
 Remaining:
-- No image slicing/tiling — high-res input is downscaled to a single tile, so
+- No image slicing/tiling: high-res input is downscaled to a single tile, so
   `maxLongSize` lowers cost/resolution but can't raise effective resolution
   above the single-tile budget (≈512²). Slicing is the high-res path.
 - Single projector family (`LFM2`); other VL projector types not mapped.
 - wasm: `cera-wasm` builds with `cera` default features off (no `image` crate),
   so image input is intentionally not exposed there (binary-size choice).
 
-### V2.16: Audio + TTS (LFM2-Audio) — ✅ core shipped
+### V2.16: Audio + TTS (LFM2-Audio), ✅ core shipped
 Full duplex: PCM in (ASR / audio understanding) and PCM out (speech
 generation). Shipped:
 - **Input:** `model/audio_preprocessor.rs` (PCM → log-mel, Slaney scale,
@@ -591,7 +591,7 @@ generation). Shipped:
   backbone to Metal (~165ms→~10-15ms/frame target); ISTFT stays on CPU.
 
 Remaining:
-- Metal-only detokenizer acceleration — no wgpu path; CPU fallback is slow.
+- Metal-only detokenizer acceleration: no wgpu path; CPU fallback is slow.
 - Streaming/real-time output not yet exposed (batch WAV writer only).
 
 ---

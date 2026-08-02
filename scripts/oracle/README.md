@@ -11,7 +11,7 @@ multipliers (they fold into the gated `embd`/`l_out-{i}`/`result_output` sums); 
 ## Design
 
 The source of truth is **llama.cpp running on the exact same quantized GGUF** cera
-loads (not HuggingFace on the unquantized model) — so numeric differences reflect
+loads (not HuggingFace on the unquantized model), so numeric differences reflect
 *implementation* bugs, not quantization noise. The oracle runs **CPU-only**
 (`-ngl 0`) so its float accumulation order matches cera's CPU forward pass.
 
@@ -20,22 +20,22 @@ committed fixtures and needs neither llama.cpp nor these scripts.
 
 Two gate signals per prompt (see `cera/tests/fixtures/oracle/<model>/*.json`):
 
-- **`input_tokens`** — tokenizer parity.
-- **`nodes`** — ordered `(name, op, sum)` per-substep full-tensor checksums from
+- **`input_tokens`**: tokenizer parity.
+- **`nodes`**: ordered `(name, op, sum)` per-substep full-tensor checksums from
   `llama-eval-callback`. Localizes any divergence to the exact sub-step. Key
   layer-0 nodes: `embd → norm → attn_norm → Qcur(MUL_MAT→ADD(bias)→ROPE) →
   Kcur(…→ROPE) → Vcur → kqv_out → ffn_{norm,gate,up,swiglu,out} → l_out`, then
   final `result_norm`/`result_output`. The `ADD` after each Q/K/V `MUL_MAT` is the
   Qwen2 QKV bias; the `ROPE` nodes are the post-rotation checksums (catch the
   NEOX-vs-NORM rope bug). Backend KV-cache view/permute nodes are filtered out.
-- **`greedy_text`** — end-to-end greedy (`--temp 0 --top-k 1`) continuation.
+- **`greedy_text`**: end-to-end greedy (`--temp 0 --top-k 1`) continuation.
 
 ## Regenerating
 
 ```bash
 scripts/oracle/vendor_llama_cpp.sh        # clone+build pinned llama.cpp (~target/, gitignored)
 
-# Fixture models (gitignored). Q8_0 — uniform, and the tightest numeric match,
+# Fixture models (gitignored). Q8_0: uniform, and the tightest numeric match,
 # which is what an oracle fixture wants. NB: Qwen's "Q4_0" GGUFs store ffn_down
 # as Q4_1; cera does load Q4_1 now, but a mixed-quant file makes a numeric
 # comparison harder to attribute, so prefer Q8_0 here.
@@ -64,5 +64,5 @@ DYLD_LIBRARY_PATH=$BIN LD_LIBRARY_PATH=$BIN python3 scripts/oracle/gen_text_orac
 
 The pinned llama.cpp SHA lives in `vendor_llama_cpp.sh`; bump it deliberately and
 regenerate. Text models use upstream `ggml-org/llama.cpp`. (LFM2.5-Audio is not in
-upstream — see `devlog/plans/000150-01-llama-qwen2-support.md` for the audio-only
+upstream, see `devlog/plans/000150-01-llama-qwen2-support.md` for the audio-only
 fork note; not needed here.)

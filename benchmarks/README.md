@@ -7,22 +7,22 @@ Measured on Apple M-series (aarch64), single-socket, unless noted. All models
 loaded from GGUF with memory-mapped weights. Raw per-run data and long-context
 profiles live alongside this file:
 
-- [`BASELINE.md`](BASELINE.md) — **the reference numbers**: Android CPU vs
+- [`BASELINE.md`](BASELINE.md): **the reference numbers**: Android CPU vs
   llama.cpp, GPU I/O counters, and the per-kernel GPU decode profile. Every
   section carries the commit and device it was measured on; check that before
   quoting one.
-- [`GPU_FINDINGS_CORRECTION.md`](GPU_FINDINGS_CORRECTION.md) — five rounds of
+- [`GPU_FINDINGS_CORRECTION.md`](GPU_FINDINGS_CORRECTION.md): five rounds of
   wrong GPU conclusions and what each one cost. Worth reading before starting a
-  GPU perf task; it is mostly a catalogue of ways to over-read a number — and
+  GPU perf task; it is mostly a catalogue of ways to over-read a number, and
   round 5 is the microbenchmark itself scoring kernels by their position in the
   table, so it doubles as a warning about the instrument.
-- [`deltas_table.md`](deltas_table.md) — full cera-vs-llama.cpp grid (45 configs:
+- [`deltas_table.md`](deltas_table.md): full cera-vs-llama.cpp grid (45 configs:
   prefill, decode, RSS, footprint, with ratios). Supersedes the old
   `results_table.md`, which held the same 45 runs split one-engine-per-row.
-- [`profile_longctx.md`](profile_longctx.md) — long-context prefill profiling
-- [`cache_compare.md`](cache_compare.md) — KV-cache comparison
-- [`../docs/GPU_CONTEXT_PERFORMANCE_PLAN.md`](../docs/GPU_CONTEXT_PERFORMANCE_PLAN.md)
-  — wgpu context-size and performance plan based on current GPU findings
+- [`profile_longctx.md`](profile_longctx.md): long-context prefill profiling
+- [`cache_compare.md`](cache_compare.md): KV-cache comparison
+- [`../docs/GPU_CONTEXT_PERFORMANCE_PLAN.md`](../docs/GPU_CONTEXT_PERFORMANCE_PLAN.md):
+  wgpu context-size and performance plan based on current GPU findings
 
 ## CPU throughput
 
@@ -45,25 +45,25 @@ profiles live alongside this file:
 | LFM2.5-1.6B | Q8_0 | 131 | 158 |
 
 > These short-prompt numbers predate the Accelerate BLAS wiring (below). At
-> 32-117 tokens, overhead and per-call dequant cost dilute the BLAS win — the
+> 32-117 tokens, overhead and per-call dequant cost dilute the BLAS win; the
 > long-prompt table further down shows the larger speedup BLAS delivers at scale.
 
 Q4_0 is faster than Q8_0 for both decode and prefill (less weight data to read
 per row), matching llama.cpp behavior. Prefill scales well with prompt length
 due to batched GEMM amortizing weight reads across all tokens.
 
-### CPU prefill via Accelerate / OpenBLAS (Apple AMX) — opt-in
+### CPU prefill via Accelerate / OpenBLAS (Apple AMX): opt-in
 
 The batched prefill GEMM path is gated `#[cfg(any(feature = "blas", target_arch =
 "aarch64"))]`. It's always compiled on **aarch64** (NEON integer GEMM by
 default), and the opt-in `blas` feature swaps in an SGEMM path that also lights
 up on **x86_64**. SGEMM dispatches through Apple's Accelerate framework
 (unlocking the AMX matrix unit) on macOS, or OpenBLAS on Linux (including
-x86_64). So x86_64 gets batched prefill too — but only with `--features blas`; a
+x86_64). So x86_64 gets batched prefill too, but only with `--features blas`; a
 default x86_64 build still falls through to the per-token GEMV loop.
 
 Weights are dequantized row-by-row into a reusable `InferenceState` scratch, then
-multiplied by the f32 input columns — eight call sites per layer (conv in/out
+multiplied by the f32 input columns: eight call sites per layer (conv in/out
 proj, attn Q/K/V/output, FFN gate/up/down).
 
 On LFM2.5-VL-1.6B-Q4_0 with a 2002-token prompt (CPU, M-series):
@@ -75,7 +75,7 @@ On LFM2.5-VL-1.6B-Q4_0 with a 2002-token prompt (CPU, M-series):
 
 That's a **1.91× end-to-end prefill speedup**. A standalone GEMM microbench on
 the ffn_up shape `(m=6912, n=2002, k=2048)` shows Accelerate SGEMM at **1885
-GFLOPs/s** vs the NEON Q4_0 × Q8_0 kernel at **645 GFLOPs/s** — a ~3× kernel
+GFLOPs/s** vs the NEON Q4_0 × Q8_0 kernel at **645 GFLOPs/s**, a ~3× kernel
 speedup, diluted at the end-to-end level by non-GEMM attention compute.
 
 Gated behind the **opt-in** `blas` feature so default builds stay zero-dependency:
@@ -89,18 +89,18 @@ sudo apt-get install libopenblas-dev pkg-config
 cargo build --release -p cera-cli --features blas
 ```
 
-Default builds — `cargo build --release` with no features — use the pure-NEON
+Default builds, `cargo build --release` with no features, use the pure-NEON
 integer GEMM path on aarch64 and need no system libraries.
 
 ## GPU backends
 
 Two GPU backends with runtime selection via `--device`:
 
-- **Native Metal** (`--device metal`, macOS) — hand-written MSL shaders,
+- **Native Metal** (`--device metal`, macOS): hand-written MSL shaders,
   single-encoder dispatch, GPU argmax. Decodes ~2× faster than llama.cpp on all
   tested Q4_0 models; prefill is competitive at short prompts and trails at long
   prompts (tracked in [`profile_longctx.md`](profile_longctx.md)).
-- **wgpu** (`--device gpu`, cross-platform) — WGSL shaders targeting
+- **wgpu** (`--device gpu`, cross-platform): WGSL shaders targeting
   Metal/Vulkan/DX12/WebGPU. Still behind native Metal, but the gap is smaller
   than it was: decode on LFM2-VL-450M Q4_0 / M1 Max went 63.4 → 112.8 tok/s
   (**1.78×**) across #316/#318/#319/#320. Per-kernel breakdown in
@@ -167,40 +167,40 @@ llama-bench -m model.gguf -p 4096 -n 0 -ngl 99 -r 20
 
 ### Metal
 
-- **GPU argmax** — greedy sampling on GPU, avoids 256KB logits readback (+57%)
-- **Q6_K native embedding GEMV** — reads 52 MB Q6_K bytes directly, no f32 dequant
-- **llama.cpp-derived fast Q4_0 GEMV** — pre-scaled y, uint16 nibble loads, sumy bias hoisting
-- **Fused gate+up GEMV** — single dispatch for both FFN projections
-- **Fused QK norm + RoPE** — 3 dispatches → 1 per attention layer
-- **Vectorized attention V loads** — float2 loads in weighted-sum phase
-- **Residual accumulate in GEMV** — `y += W×x` instead of separate add
+- **GPU argmax**: greedy sampling on GPU, avoids 256KB logits readback (+57%)
+- **Q6_K native embedding GEMV**: reads 52 MB Q6_K bytes directly, no f32 dequant
+- **llama.cpp-derived fast Q4_0 GEMV**: pre-scaled y, uint16 nibble loads, sumy bias hoisting
+- **Fused gate+up GEMV**: single dispatch for both FFN projections
+- **Fused QK norm + RoPE**: 3 dispatches → 1 per attention layer
+- **Vectorized attention V loads**: float2 loads in weighted-sum phase
+- **Residual accumulate in GEMV**: `y += W×x` instead of separate add
 
 ### wgpu
 
-- **Compute pass batching** — 300 passes → ~80 per token (+30%)
-- **Fast Q4_0 GEMV** — ported Metal algorithm to WGSL with subgroupAdd
-- **Multi-row f32 GEMV** — 8 rows per workgroup, 8× less input bandwidth
-- **Unspilled decode GEMVs** (#316) — loop-indexed WGSL locals are not registers;
+- **Compute pass batching**: 300 passes → ~80 per token (+30%)
+- **Fast Q4_0 GEMV**: ported Metal algorithm to WGSL with subgroupAdd
+- **Multi-row f32 GEMV**: 8 rows per workgroup, 8× less input bandwidth
+- **Unspilled decode GEMVs** (#316): loop-indexed WGSL locals are not registers;
   naming them individually removed the spill (+17% Q4_0, +18% Q4_K_M)
-- **Conv block in one compute pass** (#318) — the three passes were separated
+- **Conv block in one compute pass** (#318): the three passes were separated
   only by bind-group construction, which never needed a boundary (+17%)
-- **No spare GPU round trips in decode** (#319) — the greedy argmax had its own
+- **No spare GPU round trips in decode** (#319): the greedy argmax had its own
   blocking submit and its 4-byte readback submitted again; both now ride along in
   the output projection's submission, 17 → 15 submits/token (**~1.85×**)
-- **LM head on the stored weight** (#320) — the logit projection read a
+- **LM head on the stored weight** (#320): the logit projection read a
   dequantized f16 copy of the largest tensor in the model; the quantized GEMV
   kernels read it as GGUF stores it (+10%, and ~79 MB less VRAM)
 
-What did **not** work is recorded too — merging the attention/FFN compute passes
+What did **not** work is recorded too: merging the attention/FFN compute passes
 measured neutral-to-negative and was reverted. See
 [`GPU_FINDINGS_CORRECTION.md`](GPU_FINDINGS_CORRECTION.md).
 
 ### CPU
 
-- **Batched GEMM prefill** — reads each weight matrix once for all N tokens (vs N times with per-token GEMV)
-- **8-column grouped Q4_0 GEMM** — decode weight blocks once, dot against 8 input columns
-- **Integer Q4_0/Q8_0/Q6_K GEMV** — quantize activations to Q8_0, integer dot product via `vdotq_s32`
-- **Pre-quantize shared inputs** — one Q8_0 quantization reused across Q/K/V and gate/up projections
-- **NEON attention** — vectorized Q*K scores and softmax*V weighted sums with `vfmaq_f32`
-- **3-phase batched prefill** — batch input projections (GEMM) → sequential core (conv/attention) → batch output projections (GEMM)
+- **Batched GEMM prefill**: reads each weight matrix once for all N tokens (vs N times with per-token GEMV)
+- **8-column grouped Q4_0 GEMM**: decode weight blocks once, dot against 8 input columns
+- **Integer Q4_0/Q8_0/Q6_K GEMV**: quantize activations to Q8_0, integer dot product via `vdotq_s32`
+- **Pre-quantize shared inputs**: one Q8_0 quantization reused across Q/K/V and gate/up projections
+- **NEON attention**: vectorized Q*K scores and softmax*V weighted sums with `vfmaq_f32`
+- **3-phase batched prefill**: batch input projections (GEMM) → sequential core (conv/attention) → batch output projections (GEMM)
 - **Software prefetch** in GEMV/GEMM inner loops

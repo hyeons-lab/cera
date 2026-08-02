@@ -3,14 +3,14 @@
 Flutter/Dart bindings for the [Cera](https://github.com/hyeons-lab/cera)
 inference engine.
 
-This package wraps the **`cera-ffi` UniFFI surface** — the same C ABI that backs
-the Kotlin (`cera-ffi-kotlin`) and Swift bindings — and adds a platform-aware
+This package wraps the **`cera-ffi` UniFFI surface**, the same C ABI that backs
+the Kotlin (`cera-ffi-kotlin`) and Swift bindings, and adds a platform-aware
 native-library loader. The Dart bindings are generated from the compiled
 `cera-ffi` cdylib by `uniffi-bindgen-dart` and then run through a small,
 deterministic patch tool that fixes the generator's known bugs.
 
-> **Status: working (V2.17).** The engine API — model load, sessions,
-> `generate`, `transcribe`, and tokenizer access — works end-to-end, including
+> **Status: working (V2.17).** The engine API (model load, sessions,
+> `generate`, `transcribe`, and tokenizer access) works end-to-end, including
 > the async (`generateAsync`) and streaming-callback (`generateStreaming*`,
 > progress sinks) surfaces, all driven through the vendored generator's
 > callback support. Verified loading a Qwen2 GGUF and streaming tokens into a
@@ -29,7 +29,7 @@ cera-ffi-flutter/
 └── lib/
     ├── cera_ffi_flutter.dart # public barrel (loader + generated bindings)
     └── src/
-        ├── library_loader.dart        # CeraLibrary.open() — platform dylib resolution
+        ├── library_loader.dart        # CeraLibrary.open(): platform dylib resolution
         └── generated/cera_ffi.dart    # generated + patched UniFFI bindings (committed)
 ```
 
@@ -44,7 +44,7 @@ From the **repo root**:
 just dart-bindings        # builds the cdylib (--features ffi-buffer), generates, patches
 ```
 
-`just dart-bindings-check` regenerates + patches in place and fails on a diff —
+`just dart-bindings-check` regenerates + patches in place and fails on a diff,
 the drift guard for the committed bindings.
 
 ### Why a patch step?
@@ -97,32 +97,32 @@ target (Android jniLibs, iOS xcframework, desktop bundles) is follow-up work.
 Tracked in `docs/IMPLEMENTATION_PLAN.md` → **V2.17**:
 
 **Works (verified):**
-- **Sync `generate`** — `example/cera_generate.dart`.
-- **`generateAsync`** — real `Future` via the rust-future poll loop; the event
+- **Sync `generate`**: `example/cera_generate.dart`.
+- **`generateAsync`**: real `Future` via the rust-future poll loop; the event
   loop stays responsive during decode (`example/cera_async.dart`).
-- **Async token streaming** — `Session.generateStreamingAsync(opts, sink)` →
+- **Async token streaming**: `Session.generateStreamingAsync(opts, sink)` →
   Dart `ModalitySink`, streamed live from cera's worker thread
   (`example/cera_async.dart`). **This is the recommended streaming path.**
-- **Sync token streaming** — `Session.generateStreaming(opts, sink)` works too,
+- **Sync token streaming**: `Session.generateStreaming(opts, sink)` works too,
   but `ModalitySink`'s vtable uses `NativeCallable.listener` (so the same vtable
   serves the async path), which delivers callbacks on the event loop. A
   synchronous call blocks the isolate, so its callbacks are **queued and arrive
-  only after you yield** — drain the loop after the call (`example/cera_stream.dart`).
-- **`BundleRepo.withProgress`** — `DownloadProgressSink.onProgress` fires
+  only after you yield**; drain the loop after the call (`example/cera_stream.dart`).
+- **`BundleRepo.withProgress`**: `DownloadProgressSink.onProgress` fires
   synchronously (it's sync-only, so its vtable stays `isolateLocal`), args
   correctly decoded (`example/cera_progress.dart`).
 
 The vendored generator (`third_party/uniffi-bindgen-dart/`) carries six fixes
-that enable all this — to be upstreamed: callback-arg lowering, vtable-init
+that enable all this, to be upstreamed: callback-arg lowering, vtable-init
 symbol, vtable slot order, RustBuffer callback-arg ABI, the per-interface
 `listener`/`isolateLocal` choice, and freeing the RustBuffer callback arguments
 after decode (Rust transfers their ownership to the callback) plus a null
-`errorBuf` on the callback error path — both to avoid per-callback leaks.
+`errorBuf` on the callback error path, both to avoid per-callback leaks.
 
 **Not yet supported (throws `UnsupportedError`):**
-- **`fromBundleIdAsync`** — async constructor returning an object handle; needs
+- **`fromBundleIdAsync`**: async constructor returning an object handle; needs
   the object/pointer rust-future variant.
-- **No detokenizer** over FFI — `generate` returns token IDs.
+- **No detokenizer** over FFI: `generate` returns token IDs.
 
 > The callback vtable's static `NativeCallable`s keep the isolate alive, so a
 > CLI script must `exit()` explicitly (the examples do); a Flutter app stays

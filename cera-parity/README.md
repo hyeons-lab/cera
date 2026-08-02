@@ -1,13 +1,13 @@
 # cera-parity
 
-Parity harness for [cera](../cera) — runs the same prompt through every
+Parity harness for [cera](../cera): runs the same prompt through every
 binding leg and byte-compares the resulting greedy-decoded token
 streams. Divergence between any two legs points to a marshalling bug
 at the FFI layer.
 
 The harness is built around three constraints:
 
-1. **Greedy decoding only.** Temperature 0, top_k 1 — fully
+1. **Greedy decoding only.** Temperature 0, top_k 1: fully
    deterministic regardless of sampler RNG state. Sampling parity
    would just add seed-handling complexity without strengthening the
    bug-detection bar.
@@ -26,7 +26,7 @@ The harness is built around three constraints:
 |---|---|---|
 | `rust` | `cera::CeraEngine` directly (reference) | Shipped |
 | `ffi` | `cera_ffi::CeraEngine` through its Rust public surface | Shipped |
-| `kotlin-jna` | Kotlin runner under `legs/kotlin/` loading `libcera_ffi.{so,dylib}` via JNA — first leg to actually cross the FFI boundary | Shipped (PR 16) |
+| `kotlin-jna` | Kotlin runner under `legs/kotlin/` loading `libcera_ffi.{so,dylib}` via JNA, first leg to actually cross the FFI boundary | Shipped (PR 16) |
 | `swift-uniffi` | Swift runner under `legs/swift/` (SPM), loading the generated UniFFI Swift bindings + `libcera_ffi.dylib` linked at build time. macOS-only. | Shipped (PR 17) |
 | `kotlin-aidl` | Cross-process via `cera-serviceapp` AIDL | Pending (Phase 4.5) |
 
@@ -102,13 +102,13 @@ be wiped independently.
 Two test targets, both env-gated and `#[ignore]`'d so default
 `cargo test` skips them.
 
-### `parity` — rust ↔ ffi
+### `parity`: rust ↔ ffi
 
 ```bash
 CERA_PARITY_RUN=1 cargo test -p cera-parity --test parity -- --ignored
 ```
 
-### `parity_kotlin` — rust ↔ kotlin-jna
+### `parity_kotlin`: rust ↔ kotlin-jna
 
 Build the Kotlin runner once, then run the test:
 
@@ -123,7 +123,7 @@ CERA_PARITY_RUN=1 \
 Set `CERA_PARITY_LIB_DIR=<path>` if `libcera_ffi` is somewhere
 other than `<workspace>/target/debug` (e.g. release build).
 
-### `parity_swift` — rust ↔ swift-uniffi (macOS only)
+### `parity_swift`: rust ↔ swift-uniffi (macOS only)
 
 Build the Swift runner once, then run the test. Run from the
 workspace root; `WS=$(pwd)` keeps the absolute path stable across
@@ -144,12 +144,12 @@ CERA_PARITY_RUN=1 \
 path; `LDFLAGS` is not honored consistently by `swift build`. The
 binary's install_name points at the absolute build-time location of
 `libcera_ffi.dylib` (under `target/debug/`), which works as long as
-the dylib stays put after build — fine for CI / local dev. Set
+the dylib stays put after build, fine for CI / local dev. Set
 `CERA_PARITY_LIB_DIR=<path>` if you need to override the
 `DYLD_LIBRARY_PATH` the runner sees.
 
 CI gates parity on push to `main` + manual `workflow_dispatch`
-only — not on PRs. Rather than the `#[ignore]`'d `cargo test`
+only, not on PRs. Rather than the `#[ignore]`'d `cargo test`
 targets above, both jobs invoke the `check` CLI with
 `--fail-on-slowdown` (replacing the old `cargo test --ignored`
 step), covering the same leg boundaries plus the perf gate:
@@ -191,13 +191,13 @@ For a subprocess leg (Kotlin via JNA, Swift via UniFFI):
 
 Two worked examples ship today:
 
-- `legs/kotlin/` — Gradle subproject + Shadow plugin → fat jar;
+- `legs/kotlin/`: Gradle subproject + Shadow plugin → fat jar;
   vendored binding via `sourceSets.main.kotlin.srcDirs` so the file
   isn't duplicated; `Main.kt` reads stdin / writes stdout in the
   contract shape; `cera_parity::run_kotlin_jna` spawns it.
-- `legs/swift/` — SPM Package with two targets: `cera_ffiFFI`
+- `legs/swift/`: SPM Package with two targets: `cera_ffiFFI`
   (`.systemLibrary` exposing the generated C FFI header via
-  `module.modulemap` — name MUST match what the generated
+  `module.modulemap`; name MUST match what the generated
   `cera_ffi.swift` `canImport`s) and `CeraParitySwift`
   (`.executableTarget` consuming the bindings + linking against
   the cera-ffi cdylib via `-Xlinker -L`). Bindings vendored via
@@ -205,7 +205,7 @@ Two worked examples ship today:
   automatically; `cera_parity::run_swift_uniffi` spawns the
   built binary with `DYLD_LIBRARY_PATH` set.
 
-The token-stream contract is the only thing the harness assumes —
+The token-stream contract is the only thing the harness assumes;
 how a leg gets there (in-process, subprocess, IPC) is up to the leg.
 
 ## Out of scope
