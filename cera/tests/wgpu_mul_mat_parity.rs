@@ -1,12 +1,13 @@
 //! Shader-level parity for the wgpu batched-prefill GEMM (`mul_mat_reg_tile`).
 //!
-//! Q5_K is the first dtype with a shader-level parity test on this kernel —
-//! there was none for the Q4_0/Q8_0/Q4_K/Q6_K loaders, only the end-to-end
-//! `gpu_lfm2_prefill_equivalence` differential, which needs a real GGUF fixture
-//! (and the fixture set carries no Q5_K model, so a Q5_K end-to-end test would
-//! silently skip in CI). This drives the loader on synthetic weights with **no
-//! GGUF and no network**, so it runs anywhere a GPU exists and pins the new
-//! Q5_K dequant loader directly to the CPU `dequantize_q5_k_block` reference.
+//! These tests drive the reg-tile loaders on synthetic weights with **no GGUF
+//! and no network**, so they run anywhere a GPU exists and pin each dequant
+//! loader directly to its CPU reference. The only other coverage is the
+//! end-to-end `gpu_lfm2_prefill_equivalence` differential, which needs a real
+//! GGUF fixture. Q5_K, Q4_0, and Q8_0 have shader-level parity here; the Q4_0
+//! and Q8_0 cases also exercise the slangc SPIR-V passthrough kernels wherever
+//! the backend accepts them (Vulkan). Q4_K and Q6_K still have only the
+//! end-to-end differential.
 //!
 //! The `qh` 5th-bit plane is the whole risk in the Q5_K loader: it is indexed by
 //! `l` (= y%32) alone — the same 32 bytes serve all four sub-blocks, consuming

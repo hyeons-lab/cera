@@ -29,10 +29,13 @@ fmt-fix:
 # build.rs compiles with slangc directly; the checked-in .spv is only the
 # fallback for build hosts without slangc (e.g. CI). Run this after editing a
 # .slang so the fallback stays in sync. Needs slangc on PATH or ~/.local/slang/bin.
+# Use slangc 2026.13.1: the CI drift check byte-compares against that version's
+# output, and SPIR-V is only byte-reproducible within one slangc version.
 slang:
     #!/usr/bin/env bash
     set -euo pipefail
     SLANGC="${SLANGC:-$(command -v slangc || echo "$HOME/.local/slang/bin/slangc")}"
+    "$SLANGC" -v || true  # informational; some slangc builds exit nonzero on -v
     dir=cera/src/backend/shaders/spirv
     for f in "$dir"/*.slang; do
         name=$(basename "$f" .slang)

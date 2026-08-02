@@ -207,7 +207,7 @@ jobs:
             if cmp -s "$RUNNER_TEMP/$name.spv" "$dir/$name.spv"; then
               echo "ok: $name.spv matches slangc $SLANG_VER"
             else
-              echo "::error file=$dir/$name.spv::committed $name.spv is stale; run 'just slang' and commit it"
+              echo "::error file=$dir/$name.spv::committed $name.spv differs from slangc ${SLANG_VER} output; regenerate with slangc ${SLANG_VER} ('just slang') and commit it. SPIR-V is only byte-reproducible within one slangc version."
               rc=1
             fi
           done
