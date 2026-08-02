@@ -303,7 +303,8 @@ impl GpuContext {
             .context("no GPU adapter found")?;
 
         let adapter_name = adapter.get_info().name.clone();
-        let backend = format!("{:?}", adapter.get_info().backend);
+        let backend_kind = adapter.get_info().backend;
+        let backend = format!("{backend_kind:?}");
 
         let profile_requested = std::env::var("CERA_GPU_PROFILE").as_deref() == Ok("1");
         let has_timestamps =
@@ -317,10 +318,15 @@ impl GpuContext {
         }
         // SPIR-V passthrough lets us feed slangc-compiled SPIR-V straight to the
         // Vulkan driver, bypassing naga-30's codegen (which regresses ~28% on
-        // PowerVR prefill). Vulkan-only; absent on Metal, where we fall back to WGSL.
-        if adapter
-            .features()
-            .contains(wgpu::Features::PASSTHROUGH_SHADERS)
+        // PowerVR prefill). wgpu-core only accepts a SPIR-V passthrough module on
+        // the Vulkan backend; Metal, DX12, and GLES advertise PASSTHROUGH_SHADERS
+        // too but reject our `spirv`-only descriptor with NotCompiledForBackend
+        // (a fatal validation error). So request the feature only on Vulkan, where
+        // we actually use it; every other backend falls back to WGSL/naga.
+        if backend_kind == wgpu::Backend::Vulkan
+            && adapter
+                .features()
+                .contains(wgpu::Features::PASSTHROUGH_SHADERS)
         {
             features |= wgpu::Features::PASSTHROUGH_SHADERS;
         }
@@ -852,11 +858,18 @@ impl GpuContext {
             })
     }
 
-    /// True if the device was created with SPIR-V passthrough (Vulkan-only).
+    /// True if the device can take a SPIR-V passthrough module. Only the Vulkan
+    /// backend accepts one: Metal, DX12, and GLES all advertise (and can be
+    /// granted) `PASSTHROUGH_SHADERS`, but wgpu-core rejects a `spirv`-only
+    /// descriptor on those with `NotCompiledForBackend`. We only request the
+    /// feature on Vulkan, so the feature bit alone would already be Vulkan-only;
+    /// the explicit backend check keeps that invariant local to this predicate.
     pub fn supports_spirv_passthrough(&self) -> bool {
-        self.device
-            .features()
-            .contains(wgpu::Features::PASSTHROUGH_SHADERS)
+        self.backend == "Vulkan"
+            && self
+                .device
+                .features()
+                .contains(wgpu::Features::PASSTHROUGH_SHADERS)
     }
 
     /// Build a register-tiled prefill GEMM pipeline from slangc-compiled SPIR-V,

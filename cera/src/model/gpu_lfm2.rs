@@ -194,8 +194,9 @@ fn build_mul_mat_pipeline(
 
 /// Whether to build reg-tile GEMM pipelines from slangc SPIR-V fed straight to
 /// the driver instead of the naga-compiled WGSL. Default ON wherever the device
-/// supports it (Vulkan; Metal/WebGPU lack the feature and fall back to naga
-/// automatically). The slang kernels are bit-identical to naga and avoid naga-30's
+/// accepts SPIR-V passthrough (Vulkan only; Metal/DX12/WebGPU fall back to naga,
+/// see `GpuContext::supports_spirv_passthrough`). The slang kernels are
+/// bit-identical to naga and avoid naga-30's
 /// PowerVR codegen regression (~1.35x Q4_0 / ~1.53x Q8_0 prefill); on GPUs without
 /// that regression they are still correct, just possibly perf-neutral. Only the
 /// ported loaders (Q4_0, Q8_0) are affected; other quant types stay on naga.
