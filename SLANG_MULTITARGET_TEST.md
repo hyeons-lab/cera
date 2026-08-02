@@ -194,6 +194,60 @@ only the ratio did. (Absolute µs are not comparable across the two runs; only t
 within-run interleaved ratio is, which is why the handwritten n=1024 column moved
 too.)
 
+## Round 2: the simdgroup_matrix probe (new, needs a Mac run)
+
+Since the softmax result landed, the branch gained `coopmat_probe.slang`, which
+answers the question that decides whether the eight hand-tuned
+`simdgroup_matrix` GEMMs are portable at all.
+
+**What it establishes.** `linalg::CoopMat` lowers to genuine Metal MMA
+(`simdgroup_load`, `simdgroup_multiply_accumulate`, `simdgroup_store`,
+`make_filled_simdgroup_matrix`), and the *same source* still emits valid WGSL.
+Unguarded it does not: WGSL has no cooperative-matrix type and the entry point
+fails with `E36107 unavailable features in entry point`. It compiles only because
+`__target_switch` eliminates the metal branch **before** entry-point capability
+validation runs. That ordering is undocumented, so it is pinned by a test rather
+than left as a comment.
+
+**Nothing dispatches the probe.** It is a fixed 8x8 with no tiling, no
+threadgroup staging, no ragged edges and no dequant, and the assertions are on
+the emitted shader text, because there is no runtime way to observe which
+instructions the compiler selected.
+
+Two of the three new tests already ran here (they are `gpu`-gated). The third is
+Metal-gated and has **never executed on Apple silicon**:
+
+```sh
+cargo test -p cera --features metal --test slang_multitarget_parity -- --nocapture
+```
+
+Expect **seven** tests now, up from four. The new one to watch:
+
+```
+test coopmat_probe_reaches_metal_mma ... ok
+```
+
+If it fails, the assertion message names the missing instruction. That means
+Slang stopped lowering `linalg::CoopMat` to Metal MMA, which would retire the
+GEMM-porting idea entirely, so it is worth reporting verbatim rather than
+working around.
+
+The other two (`coopmat_probe_wgsl_falls_back_cleanly`,
+`coopmat_probe_documents_the_f16_requirement`) are `gpu`-gated and will not run
+in a `--features metal` build; they pass on Linux already.
+
+**The f16 constraint, since it will bite any real port.** Typing the operands
+`half` makes the WGSL emission open with `enable f16`, and cera requests
+`SHADER_F16` only when the adapter reports it (`GpuContext::new`). This is the
+first shader in the tree to emit `enable f16` at all, and it is why nothing
+builds a pipeline from the probe. A real GEMM port has to keep f32 operands or
+gate on the feature.
+
+**No bench for this one.** `slang_softmax_bench` is unchanged and still only
+compares the two softmax kernels. Timing the probe would measure a single 8x8
+tile, which says nothing about a tiled GEMM, so it would be a number that invites
+over-reading rather than one worth having.
+
 ## Regenerating the committed outputs
 
 Only needed if you edit the `.slang`. Requires slangc 2026.13.1 (the CI drift
