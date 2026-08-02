@@ -289,7 +289,7 @@ fn gemv_tile_rows(m: u32, k: u32, max_binding: u64, offset_alignment: u64, elem_
         max_rows
     };
     assert!(
-        tile_rows > 0 && (u64::from(tile_rows) * row_bytes) % offset_alignment == 0,
+        tile_rows > 0 && (u64::from(tile_rows) * row_bytes).is_multiple_of(offset_alignment),
         "GPU storage binding alignment {} cannot be satisfied for GEMV rows of {} bytes",
         offset_alignment,
         row_bytes
@@ -2226,7 +2226,7 @@ impl GpuLfm2Model {
         // invariants it assumes so a malformed config fails fast here instead of
         // dividing by zero or reading out of bounds on the GPU.
         assert!(
-            n_kv_heads > 0 && n_heads % n_kv_heads == 0,
+            n_kv_heads > 0 && n_heads.is_multiple_of(n_kv_heads),
             "wgpu flash_attention requires n_kv_heads > 0 and n_heads divisible by \
              n_kv_heads; got n_heads={n_heads}, n_kv_heads={n_kv_heads}"
         );
@@ -4135,7 +4135,7 @@ impl GpuLfm2Model {
         // kv_head = head / group_size, a head_dim-wide slice at kv_head * head_dim
         // within each kv_dim-strided KV row). Fail fast on a malformed config.
         assert!(
-            n_kv_heads > 0 && n_heads % n_kv_heads == 0,
+            n_kv_heads > 0 && n_heads.is_multiple_of(n_kv_heads),
             "wgpu attention_prefill requires n_kv_heads > 0 and n_heads divisible \
              by n_kv_heads; got n_heads={n_heads}, n_kv_heads={n_kv_heads}"
         );
