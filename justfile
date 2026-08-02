@@ -25,6 +25,21 @@ fmt:
 fmt-fix:
     cargo fmt
 
+# Recompile the committed Slang SPIR-V fallbacks from their .slang sources.
+# build.rs compiles with slangc directly; the checked-in .spv is only the
+# fallback for build hosts without slangc (e.g. CI). Run this after editing a
+# .slang so the fallback stays in sync. Needs slangc on PATH or ~/.local/slang/bin.
+slang:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SLANGC="${SLANGC:-$(command -v slangc || echo "$HOME/.local/slang/bin/slangc")}"
+    dir=cera/src/backend/shaders/spirv
+    for f in "$dir"/*.slang; do
+        name=$(basename "$f" .slang)
+        echo "==> slangc $name"
+        "$SLANGC" "$f" -target spirv -O3 -entry main -stage compute -o "$dir/$name.spv"
+    done
+
 # Run the CLI with arguments
 run *ARGS:
     cargo run --bin cera -- {{ARGS}}

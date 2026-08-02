@@ -901,9 +901,10 @@ impl GpuContext {
         // advertises PASSTHROUGH_SHADERS (Vulkan), so the driver accepts raw SPIR-V.
         let module = unsafe {
             self.device
-                .create_shader_module_passthrough(wgpu::include_spirv_raw!(
-                    "shaders/spirv/mul_mat_reg_tile_q4_0.spv"
-                ))
+                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/mul_mat_reg_tile_q4_0.spv"
+                )))
         };
         self.device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

@@ -23,4 +23,81 @@ fn main() {
     });
     println!("cargo:rustc-env=CERA_GIT_SHA={sha}");
     println!("cargo:rerun-if-env-changed=CERA_GIT_SHA");
+
+    // Compile the Slang SPIR-V passthrough kernels (gpu feature only). Each is
+    // written to OUT_DIR and `include_spirv_raw!`d from there, so slangc is the
+    // source of truth. When slangc is unavailable (e.g. CI without a Slang
+    // toolchain) we fall back to the committed `.spv` next to the `.slang`, which
+    // a developer with slangc regenerates via `just slang` — a cargo:warning
+    // flags the fallback so drift is visible.
+    if std::env::var_os("CARGO_FEATURE_GPU").is_some() {
+        compile_slang_kernels();
+    }
+}
+
+/// Slang passthrough kernels, by basename under `src/backend/shaders/spirv/`.
+/// Extend as loaders are ported; each needs a `<name>.slang` and a committed
+/// `<name>.spv` fallback.
+const SLANG_KERNELS: &[&str] = &["mul_mat_reg_tile_q4_0"];
+
+fn compile_slang_kernels() {
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR unset");
+    let dir = "src/backend/shaders/spirv";
+    let slangc = find_slangc();
+
+    for name in SLANG_KERNELS {
+        let src = format!("{dir}/{name}.slang");
+        let committed = format!("{dir}/{name}.spv");
+        let out = format!("{out_dir}/{name}.spv");
+        println!("cargo:rerun-if-changed={src}");
+        println!("cargo:rerun-if-changed={committed}");
+
+        let compiled = slangc.as_ref().is_some_and(|sc| {
+            Command::new(sc)
+                .args([
+                    src.as_str(),
+                    "-target",
+                    "spirv",
+                    "-O3",
+                    "-entry",
+                    "main",
+                    "-stage",
+                    "compute",
+                    "-o",
+                    out.as_str(),
+                ])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
+
+        if !compiled {
+            if slangc.is_none() {
+                println!(
+                    "cargo:warning=slangc not found; using committed {name}.spv. Set SLANGC or add ~/.local/slang/bin to PATH to recompile from {name}.slang."
+                );
+            } else {
+                println!(
+                    "cargo:warning=slangc failed on {name}.slang; using committed {name}.spv."
+                );
+            }
+            std::fs::copy(&committed, &out)
+                .unwrap_or_else(|e| panic!("no compiled or committed SPIR-V for {name}: {e}"));
+        }
+    }
+    println!("cargo:rerun-if-env-changed=SLANGC");
+}
+
+/// Locate slangc: `SLANGC` env, then PATH, then the default local install.
+fn find_slangc() -> Option<String> {
+    if let Some(p) = std::env::var_os("SLANGC") {
+        return Some(p.to_string_lossy().into_owned());
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    for cand in ["slangc", &format!("{home}/.local/slang/bin/slangc")] {
+        if Command::new(cand).arg("-v").output().is_ok() {
+            return Some(cand.to_string());
+        }
+    }
+    None
 }
