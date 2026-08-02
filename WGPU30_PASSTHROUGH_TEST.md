@@ -77,6 +77,31 @@ not the GEMM**, which is the more actionable finding here.
 - Only Q4_0 and Q8_0 are ported, and only LFM2 + SmolLM were exercised. No dense
   transformer at scale, no vision path.
 
+## Device matrix (fill in as machines get tested)
+
+One row per device. Two devices are done; the rest is the open work. Vulkan only:
+on Metal and WebGPU the feature is unavailable and both arms run naga, so those
+rows would read 1.00x for a reason that has nothing to do with codegen.
+
+| device | GPU / driver | backend | Q4_0 kernel | Q8_0 kernel | end to end | verdict |
+|--------|--------------|---------|-------------|-------------|-----------|---------|
+| Pixel 10 Pro Fold | Tensor G5 / PowerVR | Vulkan | not measured | not measured | 1.61x / 1.53x | big win, motivated this branch |
+| Ryzen AI MAX+ 395 | Radeon 8060S / AMD 25.30.33.05 | Vulkan | 1.038-1.052x | 1.079-1.088x | 1.035-1.044x | small real win |
+| _(your machine)_ | | | | | | |
+
+To add a row, run the A/B and the kernel timing below, then paste:
+
+- **Q4_0 / Q8_0 kernel**: ratio of the `mul_mat_tile` / `mul_mat_q8_0` span,
+  naga divided by passthrough. Include the `attention_prefill` control ratio in
+  the verdict cell if it moved more than ~1%, since that invalidates the row.
+- **end to end**: the `prefill tok/s` p50 ratio at 512 prompt tokens.
+- **backend**: whatever the `GPU initialized` log line reports. If it is not
+  Vulkan, the row is not measuring this change.
+
+Discrete RDNA, Intel Arc, and Mesa/RADV on native Linux are the interesting gaps.
+A second Vulkan device that shows ~1.0x or worse would reopen the gating question
+that the AMD result currently closes.
+
 ## Reference numbers (Pixel 10 Pro Fold, Tensor G5 / PowerVR, cool)
 
 | model | naga-30 prefill | passthrough prefill | ratio |
