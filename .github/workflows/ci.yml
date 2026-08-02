@@ -171,12 +171,47 @@ jobs:
     timeout-minutes: 20
     env:
       CERA_REQUIRE_GPU: 1
+      # lavapipe is a Vulkan backend, which accepts SPIR-V passthrough, so the
+      # Q4_0/Q8_0 passthrough parity assertions must actually run here (not skip
+      # as they do on the Metal leg). Turns a skip into a failure.
+      CERA_REQUIRE_PASSTHROUGH: 1
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
+      # slangc is the source of truth for the passthrough kernels; the committed
+      # .spv is only a fallback for build hosts without it. This host is one of
+      # those (build.rs uses the committed .spv, and the parity test below runs
+      # exactly that shipped artifact on Vulkan), so recompile the .slang with a
+      # pinned slangc and confirm the committed .spv is not stale. slangc is
+      # fetched to a temp dir and called by absolute path, deliberately NOT on
+      # PATH or in $SLANGC, so it does not change what build.rs compiles.
+      - name: Verify committed SPIR-V matches the Slang sources
+        run: |
+          SLANG_VER=2026.13.1
+          asset="slang-${SLANG_VER}-linux-x86_64.tar.gz"
+          url="https://github.com/shader-slang/slang/releases/download/v${SLANG_VER}/${asset}"
+          curl -fsSL -o "$RUNNER_TEMP/slang.tar.gz" "$url"
+          mkdir -p "$RUNNER_TEMP/slang"
+          tar -xzf "$RUNNER_TEMP/slang.tar.gz" -C "$RUNNER_TEMP/slang"
+          slangc=$(find "$RUNNER_TEMP/slang" -type f -name slangc | head -1)
+          "$slangc" -v || true
+          dir=cera/src/backend/shaders/spirv
+          rc=0
+          for f in "$dir"/*.slang; do
+            name=$(basename "$f" .slang)
+            "$slangc" "$f" -target spirv -O3 -entry main -stage compute \
+              -o "$RUNNER_TEMP/$name.spv"
+            if cmp -s "$RUNNER_TEMP/$name.spv" "$dir/$name.spv"; then
+              echo "ok: $name.spv matches slangc $SLANG_VER"
+            else
+              echo "::error file=$dir/$name.spv::committed $name.spv is stale; run 'just slang' and commit it"
+              rc=1
+            fi
+          done
+          exit $rc
       - name: Install Mesa lavapipe (software Vulkan)
         run: |
           # packages.microsoft.com apt sources ship preinstalled on the GitHub
