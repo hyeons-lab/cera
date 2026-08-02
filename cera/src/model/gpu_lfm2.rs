@@ -193,12 +193,17 @@ fn build_mul_mat_pipeline(
 }
 
 /// Whether to build reg-tile GEMM pipelines from slangc SPIR-V fed straight to
-/// the driver (bypassing naga-30's codegen, which regresses ~28% on PowerVR
-/// prefill) instead of the naga-compiled WGSL. Gated on `CERA_WGPU_SPIRV_PASSTHROUGH=1`
-/// and device support (Vulkan). Both paths produce the same reg-tile interface;
-/// this is the A/B toggle for the wgpu-30 regression.
+/// the driver instead of the naga-compiled WGSL. Default ON wherever the device
+/// supports it (Vulkan; Metal/WebGPU lack the feature and fall back to naga
+/// automatically). The slang kernels are bit-identical to naga and avoid naga-30's
+/// PowerVR codegen regression (~1.35x Q4_0 / ~1.53x Q8_0 prefill); on GPUs without
+/// that regression they are still correct, just possibly perf-neutral. Only the
+/// ported loaders (Q4_0, Q8_0) are affected; other quant types stay on naga.
+///
+/// `CERA_WGPU_SPIRV_PASSTHROUGH=0` forces the naga WGSL path (escape hatch for a
+/// driver that misbehaves on the raw SPIR-V); `=1` is the explicit-on default.
 fn use_spirv_passthrough(ctx: &GpuContext) -> bool {
-    std::env::var("CERA_WGPU_SPIRV_PASSTHROUGH").as_deref() == Ok("1")
+    std::env::var("CERA_WGPU_SPIRV_PASSTHROUGH").as_deref() != Ok("0")
         && ctx.supports_spirv_passthrough()
 }
 
@@ -984,7 +989,7 @@ impl GpuLfm2Model {
             bias_add: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "bias_add"),
 
             mul_mat_reg_tile_q4_0: if use_spirv_passthrough(&ctx) {
-                eprintln!("[cera] mul_mat_reg_tile_q4_0: SPIR-V passthrough (slang)");
+                tracing::debug!("mul_mat_reg_tile_q4_0: SPIR-V passthrough (slang)");
                 ctx.mul_mat_reg_tile_q4_0_passthrough()
             } else {
                 build_mul_mat_pipeline(&ctx, "mul_mat_q4_0", "INIT_SRC0_SHMEM_Q4_0")
@@ -995,7 +1000,7 @@ impl GpuLfm2Model {
             // and no compute, and measured *slower* than the per-token fallback they
             // were meant to replace.
             mul_mat_reg_tile_q8_0: if use_spirv_passthrough(&ctx) {
-                eprintln!("[cera] mul_mat_reg_tile_q8_0: SPIR-V passthrough (slang)");
+                tracing::debug!("mul_mat_reg_tile_q8_0: SPIR-V passthrough (slang)");
                 ctx.mul_mat_reg_tile_q8_0_passthrough()
             } else {
                 build_mul_mat_pipeline(&ctx, "mul_mat_q8_0", "INIT_SRC0_SHMEM_Q8_0")
