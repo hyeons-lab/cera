@@ -42,6 +42,42 @@ impl DevicePollExt for wgpu::Device {
     }
 }
 
+/// The pure backend gate behind [`GpuContext::supports_spirv_passthrough`],
+/// split out so the Vulkan-only invariant is unit-testable without a GPU.
+/// wgpu-core only accepts a `spirv`-only passthrough module on `Backend::Vulkan`;
+/// Metal, DX12, and GLES all advertise `PASSTHROUGH_SHADERS` in wgpu-30 but
+/// reject such a module with `NotCompiledForBackend`, a fatal validation error.
+/// `backend` is the adapter's `Debug` name (`"Vulkan"`, `"Metal"`, ...).
+fn backend_accepts_spirv_passthrough(backend: &str, has_passthrough_feature: bool) -> bool {
+    backend == "Vulkan" && has_passthrough_feature
+}
+
+#[cfg(test)]
+mod passthrough_gate_tests {
+    use super::backend_accepts_spirv_passthrough as gate;
+
+    // Pins the exact regression from the wgpu 24 -> 30 migration: PASSTHROUGH_SHADERS
+    // stopped being Vulkan-exclusive (Metal/DX12/GLES advertise it too), but only
+    // Vulkan accepts a SPIR-V module. Gating on the feature bit alone fatally
+    // errored on those backends. Needs no GPU, so it runs in the lavapipe `--lib`
+    // leg regardless of which adapter is present.
+    #[test]
+    fn only_vulkan_takes_spirv_passthrough() {
+        assert!(
+            gate("Vulkan", true),
+            "Vulkan + feature must take passthrough"
+        );
+        assert!(!gate("Vulkan", false), "no feature => naga fallback");
+        assert!(!gate("Metal", true), "Metal must fall back to naga");
+        assert!(!gate("Dx12", true), "DX12 must fall back to naga");
+        assert!(!gate("Gl", true), "GLES must fall back to naga");
+        assert!(
+            !gate("BrowserWebGpu", true),
+            "WebGPU must fall back to naga"
+        );
+    }
+}
+
 /// GPU I/O counters — queue submits and GPU→CPU readbacks.
 ///
 /// Every submit costs a driver round-trip and every readback forces a pipeline
@@ -864,12 +900,15 @@ impl GpuContext {
     /// descriptor on those with `NotCompiledForBackend`. We only request the
     /// feature on Vulkan, so the feature bit alone would already be Vulkan-only;
     /// the explicit backend check keeps that invariant local to this predicate.
+    /// The decision itself lives in `backend_accepts_spirv_passthrough` so it
+    /// can be unit-tested without a GPU.
     pub fn supports_spirv_passthrough(&self) -> bool {
-        self.backend == "Vulkan"
-            && self
-                .device
+        backend_accepts_spirv_passthrough(
+            &self.backend,
+            self.device
                 .features()
-                .contains(wgpu::Features::PASSTHROUGH_SHADERS)
+                .contains(wgpu::Features::PASSTHROUGH_SHADERS),
+        )
     }
 
     /// Build a register-tiled prefill GEMM pipeline from slangc-compiled SPIR-V,
