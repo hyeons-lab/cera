@@ -151,6 +151,10 @@ fn synth_q6_k(m: u32, k: u32) -> (Vec<u8>, Vec<f32>) {
 /// CPU sum is float reassociation in the tiled GPU accumulation; a dequant,
 /// stride, or ragged-tile bug moves an element far above the tolerance. Shared
 /// by the Q5_K, Q4_0, and Q8_0 cases, naga and SPIR-V passthrough alike.
+// The 8 params (ctx, pipeline, raw + reference weights, m, k, n, label) are all
+// intrinsic to a GEMM check; bundling them into a struct would be noise in a
+// test helper.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_and_check(
     ctx: &GpuContext,
     pipeline: &wgpu::ComputePipeline,
