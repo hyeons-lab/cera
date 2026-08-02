@@ -92,14 +92,41 @@ The four tests fail for different reasons and the distinction matters.
 2. `system_profiler SPDisplaysDataType | head -5` so the GPU is on record.
 3. If anything failed, the full output.
 
-## The performance question is not answered here
+## Then the performance question
 
-Correctness is all these tests check. The question that decides whether Slang
-adoption goes any further is whether the **generated** MSL is as fast as the
-**handwritten** MSL, and there is no harness for that yet: comparing
-`shaders::SOFTMAX_SLANG` against `shaders::SOFTMAX` on identical input needs a
-small bench that does not exist on this branch. Worth building only if the
-correctness run above passes.
+Correctness is all the tests above check. What decides whether Slang adoption
+goes further is whether the **generated** MSL is as fast as the **handwritten**
+one. Run this second, once the parity suite passes:
+
+```sh
+cargo run -p cera --features metal --release --example slang_softmax_bench
+```
+
+Release matters: a debug build measures the harness.
+
+It prints two sections. **Agreement** first, dispatching both kernels on the same
+input at three sizes, because a faster arm that disagrees is not a faster arm.
+Then **timing**, at n = 1024 / 4096 / 16384 / 65536:
+
+```
+       n   handwritten     generated     ratio
+    1024          8.31          8.44     0.985x
+```
+
+`ratio > 1.00` means the generated kernel is faster. Treat anything within a few
+percent of 1.00 as no difference; this is wall-clock timing of a kernel that runs
+in microseconds.
+
+The harness alternates arms every round, discards a warm-up round per size,
+amortizes submit cost over 200 dispatches per timed encoder, and reports the
+median of 7 rounds rather than the mean. That discipline is not ceremony: on the
+AMD host the same style of measurement drifted 4x mid-session, and only the
+interleaved ratio survived it.
+
+If the generated MSL lost its simd path, the bench says so before the table
+rather than leaving you to infer it from a suspiciously round regression.
+
+**What to send back:** the agreement lines and the whole timing table.
 
 Note also that `softmax` is not where the money is. The eight shaders using
 `simdgroup_matrix` (the prefill GEMMs) are the hot path, they are hand-tuned
