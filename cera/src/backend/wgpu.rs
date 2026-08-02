@@ -1198,6 +1198,13 @@ pub mod shaders {
     pub const CONV1D_FUSED_BATCH: &str = include_str!("shaders/conv1d_fused_batch.wgsl");
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.wgsl");
     pub const SOFTMAX: &str = include_str!("shaders/softmax.wgsl");
+    /// Same kernel as [`SOFTMAX`], generated from `shaders/slang/softmax.slang`
+    /// by build.rs rather than hand-written, and byte-identical in contract
+    /// (binding 0 = x in-place, binding 1 = params). Not yet on the production
+    /// path: `tests/slang_multitarget_parity.rs` pins it against the CPU
+    /// reference so the generated MSL twin can be validated on real Metal
+    /// hardware before either replaces its handwritten counterpart.
+    pub const SOFTMAX_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax.wgsl"));
     pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.wgsl");
     pub const ROPE: &str = include_str!("shaders/rope.wgsl");
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.wgsl");

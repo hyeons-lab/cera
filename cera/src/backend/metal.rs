@@ -191,6 +191,14 @@ pub mod shaders {
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.metal");
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.metal");
     pub const SOFTMAX: &str = include_str!("shaders/softmax.metal");
+    /// Same kernel as [`SOFTMAX`], generated from `shaders/slang/softmax.slang`
+    /// by build.rs rather than hand-written, sharing that source with the wgpu
+    /// backend's [`super::super::wgpu::shaders::SOFTMAX_SLANG`]. Contract is
+    /// unchanged (buffer 0 = x in-place, buffer 1 = params) and the two-stage
+    /// `simd_max`/`simd_sum` reduction is preserved via `__target_switch`, so
+    /// this is not the portable-tree fallback. Not yet on the production path:
+    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
+    pub const SOFTMAX_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax.metal"));
     pub const ROPE: &str = include_str!("shaders/rope.metal");
     pub const QK_NORM_ROPE: &str = include_str!("shaders/qk_norm_rope.metal");
     pub const CONV1D: &str = include_str!("shaders/conv1d.metal");
