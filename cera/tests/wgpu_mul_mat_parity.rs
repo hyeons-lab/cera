@@ -253,7 +253,12 @@ fn dispatch_and_check(
 /// Build the production naga reg-tile pipeline for one src0 loader define, with
 /// the exact `MUL_MAT_TILE_*` geometry mirrored above, so the compiled kernel is
 /// byte-for-byte the one `model::gpu_lfm2` builds via `build_mul_mat_pipeline`.
-fn naga_reg_tile(ctx: &GpuContext, label: &str, src0_loader: &str) -> wgpu::ComputePipeline {
+fn naga_reg_tile(
+    ctx: &GpuContext,
+    label: &str,
+    src0_loader: &str,
+    src0_inner: &str,
+) -> wgpu::ComputePipeline {
     let wg_m = format!("{WG_M}u");
     let wg_n = format!("{WG_N}u");
     let tile_m = format!("{TILE_M}u");
@@ -264,7 +269,7 @@ fn naga_reg_tile(ctx: &GpuContext, label: &str, src0_loader: &str) -> wgpu::Comp
         "main",
         label,
         &[
-            ("SRC0_INNER_TYPE", "u32"),
+            ("SRC0_INNER_TYPE", src0_inner),
             (src0_loader, ""),
             ("WORKGROUP_SIZE_M", &wg_m),
             ("WORKGROUP_SIZE_N", &wg_n),
@@ -282,15 +287,15 @@ fn naga_reg_tile(ctx: &GpuContext, label: &str, src0_loader: &str) -> wgpu::Comp
 /// passthrough-or-guard block so `CERA_REQUIRE_PASSTHROUGH` is honored once.
 fn check_k_quants(ctx: &GpuContext, m: u32, k: u32, n: u32) {
     let (raw4, w4) = synth_q4_k(m, k);
-    let naga4 = naga_reg_tile(ctx, "mul_mat_q4_k_parity", "INIT_SRC0_SHMEM_Q4_K");
+    let naga4 = naga_reg_tile(ctx, "mul_mat_q4_k_parity", "INIT_SRC0_SHMEM_Q4_K", "u32");
     dispatch_and_check(ctx, &naga4, &raw4, &w4, m, k, n, "Q4_K naga");
 
     let (raw5, w5) = synth_q5_k(m, k);
-    let naga5 = naga_reg_tile(ctx, "mul_mat_q5_k_parity", "INIT_SRC0_SHMEM_Q5_K");
+    let naga5 = naga_reg_tile(ctx, "mul_mat_q5_k_parity", "INIT_SRC0_SHMEM_Q5_K", "u32");
     dispatch_and_check(ctx, &naga5, &raw5, &w5, m, k, n, "Q5_K naga");
 
     let (raw6, w6) = synth_q6_k(m, k);
-    let naga6 = naga_reg_tile(ctx, "mul_mat_q6_k_parity", "INIT_SRC0_SHMEM_Q6_K");
+    let naga6 = naga_reg_tile(ctx, "mul_mat_q6_k_parity", "INIT_SRC0_SHMEM_Q6_K", "u32");
     dispatch_and_check(ctx, &naga6, &raw6, &w6, m, k, n, "Q6_K naga");
 
     if ctx.supports_spirv_passthrough() {
@@ -368,11 +373,11 @@ fn synth_q8_0(m: u32, k: u32) -> (Vec<u8>, Vec<f32>) {
 /// (software, in CI) Vulkan and pins them to `dequantize_q{4_0,8_0}_matrix`.
 fn check_q4_0_q8_0(ctx: &GpuContext, m: u32, k: u32, n: u32) {
     let (raw4, w4) = synth_q4_0(m, k);
-    let naga4 = naga_reg_tile(ctx, "mul_mat_q4_0_parity", "INIT_SRC0_SHMEM_Q4_0");
+    let naga4 = naga_reg_tile(ctx, "mul_mat_q4_0_parity", "INIT_SRC0_SHMEM_Q4_0", "u32");
     dispatch_and_check(ctx, &naga4, &raw4, &w4, m, k, n, "Q4_0 naga");
 
     let (raw8, w8) = synth_q8_0(m, k);
-    let naga8 = naga_reg_tile(ctx, "mul_mat_q8_0_parity", "INIT_SRC0_SHMEM_Q8_0");
+    let naga8 = naga_reg_tile(ctx, "mul_mat_q8_0_parity", "INIT_SRC0_SHMEM_Q8_0", "u32");
     dispatch_and_check(ctx, &naga8, &raw8, &w8, m, k, n, "Q8_0 naga");
 
     if ctx.supports_spirv_passthrough() {
@@ -396,6 +401,33 @@ fn check_q4_0_q8_0(ctx: &GpuContext, m: u32, k: u32, n: u32) {
             ctx.backend
         );
     }
+}
+
+/// Dense f32 weights for the FLOAT loader. The loader binds src0 as
+/// `array<f32>` and reads directly, so the `raw` bytes ARE the reference f32
+/// values (no packing). Varied and non-degenerate, distinct per (row, col).
+fn synth_f32(m: u32, k: u32) -> (Vec<u8>, Vec<f32>) {
+    let w: Vec<f32> = (0..(m * k))
+        .map(|idx| {
+            let r = (idx / k) as f32;
+            let c = (idx % k) as f32;
+            (r * 0.019 - c * 0.011).cos() * 0.7
+        })
+        .collect();
+    (bytemuck::cast_slice(&w).to_vec(), w)
+}
+
+/// Dense-f32 reg-tile loader: the batched-prefill fallback that `upload_weight`
+/// routes every non-quant dtype through (F16/BF16/F32 sources, Q4_1, Q2_K, all
+/// dequantized to f32 on the GPU). Binds src0 as `array<f32>`
+/// (`SRC0_INNER_TYPE = f32`) and reads through `INIT_SRC0_SHMEM_FLOAT`, matching
+/// `gpu_lfm2`'s `mul_mat_reg_tile_f32` pipeline. Naga only: unlike the quantized
+/// loaders, f32 has no Slang SPIR-V passthrough kernel (the passthrough covers
+/// just the quantized loaders; the dense loader was never naga-regressed).
+fn check_f32(ctx: &GpuContext, m: u32, k: u32, n: u32) {
+    let (raw, w) = synth_f32(m, k);
+    let pipe = naga_reg_tile(ctx, "mul_mat_f32_parity", "INIT_SRC0_SHMEM_FLOAT", "f32");
+    dispatch_and_check(ctx, &pipe, &raw, &w, m, k, n, "F32 naga");
 }
 
 fn setup() -> Option<GpuContext> {
@@ -444,4 +476,19 @@ fn q4_0_q8_0_gemm_ragged_tile() {
     // Ragged in both m (>128, not a multiple of 64) and n (<64): exercises the
     // loader edge masking and the kernel's partial-tile store.
     check_q4_0_q8_0(&ctx, 200, 512, 40);
+}
+
+#[test]
+fn f32_gemm_clean_tile() {
+    let Some(ctx) = setup() else { return };
+    // Exact multiples of the 64×64 tile: no ragged masking.
+    check_f32(&ctx, 128, 256, 64);
+}
+
+#[test]
+fn f32_gemm_ragged_tile() {
+    let Some(ctx) = setup() else { return };
+    // Ragged in both m (>128, not a multiple of 64) and n (<64): exercises the
+    // FLOAT loader's per-element edge masking and the partial-tile store.
+    check_f32(&ctx, 200, 512, 40);
 }
