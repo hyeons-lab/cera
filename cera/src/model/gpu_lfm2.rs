@@ -199,7 +199,8 @@ fn build_mul_mat_pipeline(
 /// bit-identical to naga and avoid naga-30's
 /// PowerVR codegen regression (~1.35x Q4_0 / ~1.53x Q8_0 prefill); on GPUs without
 /// that regression they are still correct, just possibly perf-neutral. Only the
-/// ported loaders (Q4_0, Q8_0) are affected; other quant types stay on naga.
+/// ported reg-tile loaders (Q4_0, Q8_0, and the K-quants Q4_K/Q5_K/Q6_K) are
+/// affected; the dense f16/f32 loader stays on naga.
 ///
 /// `CERA_WGPU_SPIRV_PASSTHROUGH=0` forces the naga WGSL path (escape hatch for a
 /// driver that misbehaves on the raw SPIR-V); `=1` is the explicit-on default.
@@ -1006,21 +1007,24 @@ impl GpuLfm2Model {
             } else {
                 build_mul_mat_pipeline(&ctx, "mul_mat_q8_0", "INIT_SRC0_SHMEM_Q8_0")
             },
-            mul_mat_reg_tile_q4_k: build_mul_mat_pipeline(
-                &ctx,
-                "mul_mat_q4_k",
-                "INIT_SRC0_SHMEM_Q4_K",
-            ),
-            mul_mat_reg_tile_q5_k: build_mul_mat_pipeline(
-                &ctx,
-                "mul_mat_q5_k",
-                "INIT_SRC0_SHMEM_Q5_K",
-            ),
-            mul_mat_reg_tile_q6_k: build_mul_mat_pipeline(
-                &ctx,
-                "mul_mat_q6_k",
-                "INIT_SRC0_SHMEM_Q6_K",
-            ),
+            mul_mat_reg_tile_q4_k: if use_spirv_passthrough(&ctx) {
+                tracing::debug!("mul_mat_reg_tile_q4_k: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q4_k_passthrough()
+            } else {
+                build_mul_mat_pipeline(&ctx, "mul_mat_q4_k", "INIT_SRC0_SHMEM_Q4_K")
+            },
+            mul_mat_reg_tile_q5_k: if use_spirv_passthrough(&ctx) {
+                tracing::debug!("mul_mat_reg_tile_q5_k: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q5_k_passthrough()
+            } else {
+                build_mul_mat_pipeline(&ctx, "mul_mat_q5_k", "INIT_SRC0_SHMEM_Q5_K")
+            },
+            mul_mat_reg_tile_q6_k: if use_spirv_passthrough(&ctx) {
+                tracing::debug!("mul_mat_reg_tile_q6_k: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q6_k_passthrough()
+            } else {
+                build_mul_mat_pipeline(&ctx, "mul_mat_q6_k", "INIT_SRC0_SHMEM_Q6_K")
+            },
             attention_prefill: ctx.create_pipeline(
                 shaders::ATTENTION_PREFILL,
                 "attention_prefill",

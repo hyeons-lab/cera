@@ -38,7 +38,13 @@ fn main() {
 /// Slang passthrough kernels, by basename under `src/backend/shaders/spirv/`.
 /// Extend as loaders are ported; each needs a `<name>.slang` and a committed
 /// `<name>.spv` fallback.
-const SLANG_KERNELS: &[&str] = &["mul_mat_reg_tile_q4_0", "mul_mat_reg_tile_q8_0"];
+const SLANG_KERNELS: &[&str] = &[
+    "mul_mat_reg_tile_q4_0",
+    "mul_mat_reg_tile_q8_0",
+    "mul_mat_reg_tile_q4_k",
+    "mul_mat_reg_tile_q5_k",
+    "mul_mat_reg_tile_q6_k",
+];
 
 fn compile_slang_kernels() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR unset");
