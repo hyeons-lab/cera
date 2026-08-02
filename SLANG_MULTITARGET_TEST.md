@@ -367,6 +367,62 @@ extra is the shape at which it is worst, since a gap that closes as the shape
 grows points at fixed per-dispatch overhead and a gap that does not points at
 the inner loop.
 
+### Round 3 result (Apple M1 Max, 2026-08-02): correct, but ~36% slower
+
+Ran on branch tip `3b8f9a6`, Apple M1 Max (32-core GPU, Metal 4), macOS.
+slangc 2026.13.1 on PATH.
+
+**Correctness: all 8 metal-gated tests pass**, including the two new GEMM tests.
+The ragged epilogue (the one rewrite rather than transcription) is correct:
+
+```
+running 7 tests
+test msl::generated_gemm_keeps_simdgroup_matrix ... ok
+msl gemm_q8_0 64x64x32: worst=0.057 of tolerance OK
+msl gemm_q8_0 70x96x45: worst=0.047 of tolerance OK
+msl gemm_q8_0 10x32x3:  worst=0.061 of tolerance OK
+test msl::gemm_q8_0_slang_matches_reference ... ok
+```
+
+(The suite reports 7 test functions; the eighth metal-gated case is the
+`coopmat_probe_reaches_metal_mma` from Round 2, which also passed. The two
+`gpu`-gated probe tests do not build under `--features metal`.)
+
+**Speed: the generated GEMM is bit-identical but consistently ~0.64x.**
+
+```
+== agreement ==
+  128x256x64    max_abs_diff=0.000e0 (max|ref|=2.019e1)  MATCH (bit-identical)
+  192x128x96    max_abs_diff=0.000e0 (max|ref|=1.848e1)  MATCH (bit-identical)
+
+== timing (us per dispatch, median of 7 rounds, 20 dispatches each) ==
+       m x k x n   handwritten     generated  hand GF/s   gen GF/s     ratio
+   1024x1024x128          80.1         124.3     3352.0     2159.6    0.644x
+   2048x2048x256         320.5         503.7     6700.8     4263.3    0.636x
+   4096x4096x256        1146.8        1798.6     7490.1     4775.9    0.638x
+   2048x2048x512         592.8         913.4     7245.0     4702.0    0.649x
+```
+
+**Read: the gap is in the inner loop, not per-dispatch overhead.** The ratio is
+flat across a 4x span of shapes (0.636 to 0.649), and per this section's own
+rule a gap that does not close as the shape grows points at the inner loop.
+Agreement is bit-identical, so the tiling transcription and the two-round ragged
+epilogue are both correct: this is purely a throughput gap, peak 4776 vs 7490
+GF/s. That matches the two candidate causes named above, both inner-loop:
+
+1. the missing `simdgroup_barrier(mem_flags::mem_none)` scheduling hints between
+   operand loads and the MMAs (Slang exposes no simdgroup-scoped execution
+   barrier), and/or
+2. register spill of the eight live 8x8 accumulators plus six operand registers
+   after Slang's codegen: the type surviving in the emitted text does not prove
+   the allocation survived, and a spill fails no test.
+
+Distinguishing the two is the next step and needs Metal-side inspection (a
+Metal GPU capture / the shipped-vs-generated `.metal` register footprint), not
+another parity run. Verdict: `linalg::CoopMat` reaches the hardware and is
+correct, but the emitter does not yet match the hand-tuned kernel's throughput,
+so this is not a drop-in replacement for the eight GEMMs on speed alone.
+
 ## Regenerating the committed outputs
 
 Only needed if you edit the `.slang`. Requires slangc 2026.13.1 (the CI drift
