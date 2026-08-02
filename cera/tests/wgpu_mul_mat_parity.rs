@@ -15,7 +15,7 @@
 //! or a wrong base index cannot cancel out against the reference.
 #![cfg(feature = "gpu")]
 
-use cera::backend::wgpu::{GpuContext, shaders};
+use cera::backend::wgpu::{DevicePollExt, GpuContext, shaders};
 use cera::quant::{BlockQ5K, dequantize_q5_k_block};
 use half::f16;
 
@@ -164,7 +164,7 @@ fn check(ctx: &GpuContext, m: u32, k: u32, n: u32) {
         pass.dispatch_workgroups(grid.0, grid.1, grid.2);
     }
     ctx.queue.submit(Some(enc.finish()));
-    ctx.device.poll(wgpu::Maintain::Wait);
+    ctx.device.poll_wait();
 
     let y_gpu = ctx.download_f32(&dst, (n * m) as usize);
 

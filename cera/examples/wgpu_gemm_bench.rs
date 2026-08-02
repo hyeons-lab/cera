@@ -21,7 +21,7 @@
 //! computing the wrong thing.
 
 use anyhow::{Context, ensure};
-use cera::backend::wgpu::{GpuContext, shaders};
+use cera::backend::wgpu::{DevicePollExt, GpuContext, shaders};
 
 /// One benchmarked matmul: `dst[n, m] = src0[m, k] * src1[n, k]`.
 struct Shape {
@@ -321,7 +321,7 @@ fn main() -> anyhow::Result<()> {
                     pass.dispatch_workgroups(grid.0, grid.1, grid.2);
                 }
                 ctx.queue.submit(Some(enc.finish()));
-                ctx.device.poll(wgpu::Maintain::Wait);
+                ctx.device.poll_wait();
             };
 
             let dst = ctx.create_storage_rw(dst_len * 4, "dst");

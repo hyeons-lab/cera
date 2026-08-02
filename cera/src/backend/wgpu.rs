@@ -19,7 +19,7 @@ use half::f16;
 /// signals, so a bare call would return before the readback is ready. Retry on
 /// `Timeout` until the fence actually signals; on Mac/Metal the first call
 /// already returns `Ok`. Other poll errors are a real bug, so surface them.
-pub(crate) trait DevicePollExt {
+pub trait DevicePollExt {
     fn poll_wait(&self);
 }
 
@@ -916,7 +916,7 @@ impl GpuContext {
             })
     }
 
-    /// Q4_0 reg-tile prefill GEMM via SPIR-V passthrough. See [`Self::reg_tile_passthrough`].
+    /// Q4_0 reg-tile prefill GEMM via SPIR-V passthrough. See `reg_tile_passthrough`.
     pub fn mul_mat_reg_tile_q4_0_passthrough(&self) -> wgpu::ComputePipeline {
         // SAFETY: slangc-compiled from mul_mat_reg_tile_q4_0.slang, spirv-val clean.
         unsafe {
@@ -927,7 +927,7 @@ impl GpuContext {
         }
     }
 
-    /// Q8_0 reg-tile prefill GEMM via SPIR-V passthrough. See [`Self::reg_tile_passthrough`].
+    /// Q8_0 reg-tile prefill GEMM via SPIR-V passthrough. See `reg_tile_passthrough`.
     pub fn mul_mat_reg_tile_q8_0_passthrough(&self) -> wgpu::ComputePipeline {
         // SAFETY: slangc-compiled from mul_mat_reg_tile_q8_0.slang, spirv-val clean.
         unsafe {

@@ -60,7 +60,7 @@
 //! `ITERS`. Take medians of >=3 runs, and permute the kernel order to confirm.
 
 use anyhow::{Context, ensure};
-use cera::backend::wgpu::{GpuContext, shaders};
+use cera::backend::wgpu::{DevicePollExt, GpuContext, shaders};
 use cera::tensor::DType;
 
 /// Reads a **positive** `u32` from the environment, falling back to `default`
@@ -356,7 +356,7 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     ctx.queue.submit(Some(enc.finish()));
-                    ctx.device.poll(wgpu::Maintain::Wait);
+                    ctx.device.poll_wait();
                 };
 
                 // First touch of this cell's freshly uploaded buffers. It no longer
