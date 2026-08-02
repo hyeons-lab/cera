@@ -47,7 +47,7 @@ use anyhow::Result;
 
 use crate::CeraError;
 use crate::backend::cpu::RopeType;
-use crate::backend::wgpu::{GpuContext, GpuTensor, KvShiftParams, shaders};
+use crate::backend::wgpu::{DevicePollExt, GpuContext, GpuTensor, KvShiftParams, shaders};
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression, KvPrefixCache, LayerSnapshot, StateSnapshot};
 use crate::lora::{LoraAdapterWeights, LoraTarget};
@@ -190,6 +190,22 @@ fn build_mul_mat_pipeline(
             ("TILE_K", &tile_k),
         ],
     )
+}
+
+/// Whether to build reg-tile GEMM pipelines from slangc SPIR-V fed straight to
+/// the driver instead of the naga-compiled WGSL. Default ON wherever the device
+/// accepts SPIR-V passthrough (Vulkan only; Metal/DX12/WebGPU fall back to naga,
+/// see `GpuContext::supports_spirv_passthrough`). The slang kernels are
+/// bit-identical to naga and avoid naga-30's
+/// PowerVR codegen regression (~1.35x Q4_0 / ~1.53x Q8_0 prefill); on GPUs without
+/// that regression they are still correct, just possibly perf-neutral. Only the
+/// ported loaders (Q4_0, Q8_0) are affected; other quant types stay on naga.
+///
+/// `CERA_WGPU_SPIRV_PASSTHROUGH=0` forces the naga WGSL path (escape hatch for a
+/// driver that misbehaves on the raw SPIR-V); `=1` is the explicit-on default.
+fn use_spirv_passthrough(ctx: &GpuContext) -> bool {
+    std::env::var("CERA_WGPU_SPIRV_PASSTHROUGH").as_deref() != Ok("0")
+        && ctx.supports_spirv_passthrough()
 }
 
 fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
@@ -973,21 +989,23 @@ impl GpuLfm2Model {
             ),
             bias_add: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "bias_add"),
 
-            mul_mat_reg_tile_q4_0: build_mul_mat_pipeline(
-                &ctx,
-                "mul_mat_q4_0",
-                "INIT_SRC0_SHMEM_Q4_0",
-            ),
+            mul_mat_reg_tile_q4_0: if use_spirv_passthrough(&ctx) {
+                tracing::debug!("mul_mat_reg_tile_q4_0: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q4_0_passthrough()
+            } else {
+                build_mul_mat_pipeline(&ctx, "mul_mat_q4_0", "INIT_SRC0_SHMEM_Q4_0")
+            },
             // Every quantized weight goes through the register-tiled kernel (weight
             // reuse across the token tile), NOT the batched-GEMV-shaped gemm_* kernels:
             // those re-dequantize the weight once per token, so they buy submit count
             // and no compute, and measured *slower* than the per-token fallback they
             // were meant to replace.
-            mul_mat_reg_tile_q8_0: build_mul_mat_pipeline(
-                &ctx,
-                "mul_mat_q8_0",
-                "INIT_SRC0_SHMEM_Q8_0",
-            ),
+            mul_mat_reg_tile_q8_0: if use_spirv_passthrough(&ctx) {
+                tracing::debug!("mul_mat_reg_tile_q8_0: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q8_0_passthrough()
+            } else {
+                build_mul_mat_pipeline(&ctx, "mul_mat_q8_0", "INIT_SRC0_SHMEM_Q8_0")
+            },
             mul_mat_reg_tile_q4_k: build_mul_mat_pipeline(
                 &ctx,
                 "mul_mat_q4_k",
@@ -1935,7 +1953,7 @@ impl GpuLfm2Model {
     /// Submit encoder and wait for GPU to finish.
     fn submit_and_wait(&self, enc: wgpu::CommandEncoder) {
         self.ctx.submit_encoder(enc);
-        self.ctx.device.poll(wgpu::Maintain::Wait);
+        self.ctx.device.poll_wait();
     }
 
     fn new_encoder(&self) -> wgpu::CommandEncoder {

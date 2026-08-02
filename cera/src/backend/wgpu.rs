@@ -11,6 +11,79 @@ use crate::backend::wgsl_pp::Preprocessor;
 use crate::tensor::DType;
 use half::f16;
 
+/// Blocking `device.poll(Wait)` that survives the PowerVR Vulkan driver.
+///
+/// wgpu 24's `Maintain::Wait` became wgpu 30's `poll(PollType::Wait) -> Result`.
+/// On some Vulkan drivers (observed on the Pixel's PowerVR) `poll(Wait)` returns
+/// `PollError::Timeout` immediately instead of blocking until the submission
+/// signals, so a bare call would return before the readback is ready. Retry on
+/// `Timeout` until the fence actually signals; on Mac/Metal the first call
+/// already returns `Ok`. Other poll errors are a real bug, so surface them.
+pub trait DevicePollExt {
+    fn poll_wait(&self);
+}
+
+impl DevicePollExt for wgpu::Device {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_wait(&self) {
+        loop {
+            match self.poll(wgpu::PollType::wait_indefinitely()) {
+                Ok(_) => break,
+                Err(wgpu::PollError::Timeout) => {
+                    // PowerVR returns Timeout immediately rather than blocking, so
+                    // this is a spin-retry until the fence signals. Hint the CPU
+                    // it is a spin-wait (cheaper on SMT, lower power).
+                    std::hint::spin_loop();
+                    continue;
+                }
+                Err(e) => panic!("device.poll(Wait) failed: {e:?}"),
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn poll_wait(&self) {
+        // WebGPU ignores poll; the map callback fires from the JS event loop.
+        let _ = self.poll(wgpu::PollType::Poll);
+    }
+}
+
+/// The pure backend gate behind [`GpuContext::supports_spirv_passthrough`],
+/// split out so the Vulkan-only invariant is unit-testable without a GPU.
+/// wgpu-core only accepts a `spirv`-only passthrough module on `Backend::Vulkan`;
+/// Metal, DX12, and GLES all advertise `PASSTHROUGH_SHADERS` in wgpu-30 but
+/// reject such a module with `NotCompiledForBackend`, a fatal validation error.
+/// `backend` is the adapter's `Debug` name (`"Vulkan"`, `"Metal"`, ...).
+fn backend_accepts_spirv_passthrough(backend: &str, has_passthrough_feature: bool) -> bool {
+    backend == "Vulkan" && has_passthrough_feature
+}
+
+#[cfg(test)]
+mod passthrough_gate_tests {
+    use super::backend_accepts_spirv_passthrough as gate;
+
+    // Pins the exact regression from the wgpu 24 -> 30 migration: PASSTHROUGH_SHADERS
+    // stopped being Vulkan-exclusive (Metal/DX12/GLES advertise it too), but only
+    // Vulkan accepts a SPIR-V module. Gating on the feature bit alone fatally
+    // errored on those backends. Needs no GPU, so it runs in the lavapipe `--lib`
+    // leg regardless of which adapter is present.
+    #[test]
+    fn only_vulkan_takes_spirv_passthrough() {
+        assert!(
+            gate("Vulkan", true),
+            "Vulkan + feature must take passthrough"
+        );
+        assert!(!gate("Vulkan", false), "no feature => naga fallback");
+        assert!(!gate("Metal", true), "Metal must fall back to naga");
+        assert!(!gate("Dx12", true), "DX12 must fall back to naga");
+        assert!(!gate("Gl", true), "GLES must fall back to naga");
+        assert!(
+            !gate("BrowserWebGpu", true),
+            "WebGPU must fall back to naga"
+        );
+    }
+}
+
 /// GPU I/O counters — queue submits and GPU→CPU readbacks.
 ///
 /// Every submit costs a driver round-trip and every readback forces a pipeline
@@ -204,14 +277,14 @@ impl PendingReadback {
         // WebGPU backend ignores `poll`; the await suspends to the JS event
         // loop, which fires the callback.
         #[cfg(not(target_arch = "wasm32"))]
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll_wait();
         self.rx
             .await
             .map_err(|_| anyhow::anyhow!("GPU readback channel closed"))?
             .map_err(|e| anyhow::anyhow!("GPU readback failed: {e:?}"))?;
 
         let slice = self.staging.slice(0..self.size);
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("get_mapped_range failed");
         let bytes = data.to_vec();
         drop(data);
         self.staging.unmap();
@@ -255,9 +328,12 @@ impl GpuContext {
     /// the host must `.await` rather than block. Native callers can use the
     /// blocking [`Self::new`] wrapper.
     pub async fn new_async() -> Result<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            display: None,
         });
 
         let adapter = instance
@@ -269,7 +345,8 @@ impl GpuContext {
             .context("no GPU adapter found")?;
 
         let adapter_name = adapter.get_info().name.clone();
-        let backend = format!("{:?}", adapter.get_info().backend);
+        let backend_kind = adapter.get_info().backend;
+        let backend = format!("{backend_kind:?}");
 
         let profile_requested = std::env::var("CERA_GPU_PROFILE").as_deref() == Ok("1");
         let has_timestamps =
@@ -281,21 +358,34 @@ impl GpuContext {
         if adapter.features().contains(wgpu::Features::SHADER_F16) {
             features |= wgpu::Features::SHADER_F16;
         }
+        // SPIR-V passthrough lets us feed slangc-compiled SPIR-V straight to the
+        // Vulkan driver, bypassing naga-30's codegen (which regresses ~28% on
+        // PowerVR prefill). wgpu-core only accepts a SPIR-V passthrough module on
+        // the Vulkan backend; Metal, DX12, and GLES advertise PASSTHROUGH_SHADERS
+        // too but reject our `spirv`-only descriptor with NotCompiledForBackend
+        // (a fatal validation error). So request the feature only on Vulkan, where
+        // we actually use it; every other backend falls back to WGSL/naga.
+        if backend_kind == wgpu::Backend::Vulkan
+            && adapter
+                .features()
+                .contains(wgpu::Features::PASSTHROUGH_SHADERS)
+        {
+            features |= wgpu::Features::PASSTHROUGH_SHADERS;
+        }
 
         // Use the adapter's actual limits instead of hardcoding. This avoids
         // failures on GPUs with smaller max_buffer_size (integrated, mobile).
         let adapter_limits = adapter.limits();
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("cera-gpu"),
-                    required_features: features,
-                    required_limits: adapter_limits.clone(),
-                    memory_hints: wgpu::MemoryHints::Performance,
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("cera-gpu"),
+                required_features: features,
+                required_limits: adapter_limits.clone(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+            })
             .await
             .map_err(|e| anyhow::anyhow!("failed to request GPU device: {e}"))?;
 
@@ -344,7 +434,6 @@ impl GpuContext {
             backend = %backend,
             max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size,
             max_buffer_size = adapter_limits.max_buffer_size,
-            min_subgroup_size = adapter_limits.min_subgroup_size,
             "GPU initialized"
         );
 
@@ -505,12 +594,12 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             tx.send(r).ok();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll_wait();
         rx.recv()
             .expect("GPU readback channel closed")
             .expect("GPU readback failed");
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("get_mapped_range failed");
         let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging.unmap();
@@ -561,12 +650,12 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).ok();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll_wait();
         rx.recv()
             .expect("GPU readback channel closed")
             .expect("GPU readback failed");
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("get_mapped_range failed");
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging.unmap();
@@ -687,12 +776,12 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             tx.send(r).ok();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll_wait();
         rx.recv()
             .expect("GPU readback channel closed")
             .expect("GPU readback failed");
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("get_mapped_range failed");
         let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging.unmap();
@@ -739,12 +828,12 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             tx.send(r).ok();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll_wait();
         rx.recv()
             .expect("GPU readback channel closed")
             .expect("GPU readback failed");
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("get_mapped_range failed");
         // Slicing to exact byte count before casting to handle potential 2-byte padding.
         let f16_data: &[f16] = bytemuck::cast_slice(&data[0..size as usize]);
         let result: Vec<f32> = f16_data.iter().map(|&x| x.to_f32()).collect();
@@ -809,6 +898,121 @@ impl GpuContext {
                 },
                 cache: None,
             })
+    }
+
+    /// True if the device can take a SPIR-V passthrough module. Only the Vulkan
+    /// backend accepts one: Metal, DX12, and GLES all advertise (and can be
+    /// granted) `PASSTHROUGH_SHADERS`, but wgpu-core rejects a `spirv`-only
+    /// descriptor on those with `NotCompiledForBackend`. We only request the
+    /// feature on Vulkan, so the feature bit alone would already be Vulkan-only;
+    /// the explicit backend check keeps that invariant local to this predicate.
+    /// The decision itself lives in `backend_accepts_spirv_passthrough` so it
+    /// can be unit-tested without a GPU.
+    pub fn supports_spirv_passthrough(&self) -> bool {
+        backend_accepts_spirv_passthrough(
+            &self.backend,
+            self.device
+                .features()
+                .contains(wgpu::Features::PASSTHROUGH_SHADERS),
+        )
+    }
+
+    /// Build a register-tiled prefill GEMM pipeline from slangc-compiled SPIR-V,
+    /// fed straight to the driver (bypassing naga-30's codegen, which regresses
+    /// ~28% on PowerVR prefill). Every quant loader shares the reg-tile kernel's
+    /// interface, so the explicit bind-group layout (passthrough modules carry no
+    /// reflection) is the same for all: 0/1 = src0/src1 (storage read), 2 = dst
+    /// (storage read-write), 3 = params (storage read). The kernel is dispatched
+    /// `(wg_m, wg_n, 1)` like the WGSL one.
+    ///
+    /// # Safety
+    /// `desc` must be a spirv-val-clean compute module whose binding interface
+    /// matches the layout above (our slangc-compiled `mul_mat_reg_tile_*.slang`).
+    /// Only call when `supports_spirv_passthrough()` is true.
+    unsafe fn reg_tile_passthrough(
+        &self,
+        desc: wgpu::ShaderModuleDescriptorPassthrough<'_>,
+        label: &str,
+    ) -> wgpu::ComputePipeline {
+        // Defense in depth for the public `mul_mat_reg_tile_*_passthrough` entry
+        // points: a SPIR-V passthrough module is only accepted on Vulkan, and
+        // `create_shader_module_passthrough` would otherwise fail with a fatal
+        // `NotCompiledForBackend` on Metal/DX12/GLES. Fail loudly and early if a
+        // caller forgot to gate on `supports_spirv_passthrough()`.
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("mul_mat_reg_tile_passthrough_bgl"),
+                entries: &[
+                    storage(0, true),
+                    storage(1, true),
+                    storage(2, false),
+                    storage(3, true),
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("mul_mat_reg_tile_passthrough_layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        let module = unsafe { self.device.create_shader_module_passthrough(desc) };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    // Match the naga reg-tile pipelines (see above): the kernel
+                    // fills its ~8 KB of `shmem` before reading, so zeroing
+                    // workgroup memory every dispatch is pure overhead. (For a
+                    // raw SPIR-V module wgpu injects no zeroing prologue anyway,
+                    // so this is really for parity with the naga path.)
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
+    /// Q4_0 reg-tile prefill GEMM via SPIR-V passthrough. See `reg_tile_passthrough`.
+    pub fn mul_mat_reg_tile_q4_0_passthrough(&self) -> wgpu::ComputePipeline {
+        // SAFETY: slangc-compiled from mul_mat_reg_tile_q4_0.slang, spirv-val clean.
+        unsafe {
+            self.reg_tile_passthrough(
+                wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/mul_mat_reg_tile_q4_0.spv")),
+                "mul_mat_reg_tile_q4_0_passthrough",
+            )
+        }
+    }
+
+    /// Q8_0 reg-tile prefill GEMM via SPIR-V passthrough. See `reg_tile_passthrough`.
+    pub fn mul_mat_reg_tile_q8_0_passthrough(&self) -> wgpu::ComputePipeline {
+        // SAFETY: slangc-compiled from mul_mat_reg_tile_q8_0.slang, spirv-val clean.
+        unsafe {
+            self.reg_tile_passthrough(
+                wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/mul_mat_reg_tile_q8_0.spv")),
+                "mul_mat_reg_tile_q8_0_passthrough",
+            )
+        }
     }
 
     /// Begin a compute pass, counting it and attaching a profiling span.
@@ -903,10 +1107,10 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             tx.send(r).ok();
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll_wait();
         rx.recv().unwrap().unwrap();
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("get_mapped_range failed");
         let timestamps: &[u64] = bytemuck::cast_slice(&data);
 
         let period_ns = profiler.timestamp_period as f64;
@@ -1474,7 +1678,7 @@ mod tests {
             pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
         }
         ctx.submit_encoder(enc);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
     }
 
     #[test]
@@ -1840,7 +2044,7 @@ mod tests {
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
 
         let result = ctx.download_f32(&y_buf, (n * m) as usize);
         for i in 0..(n * m) as usize {
@@ -1979,7 +2183,7 @@ mod tests {
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
 
         let result = ctx.download_f32(&y_buf, (n * m) as usize);
         for i in 0..(n * m) as usize {
@@ -2087,7 +2291,7 @@ mod tests {
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
 
         let result = ctx.download_f32(&y_buf, (n * y_stride) as usize);
         for t in 0..n as usize {
@@ -2218,7 +2422,7 @@ mod tests {
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
 
         let result = ctx.download_f32(&y_buf, (n * m) as usize);
         for i in 0..(n * m) as usize {
@@ -2320,7 +2524,7 @@ mod tests {
             pass.dispatch_workgroups(wg_m, wg_n, 1);
         }
         ctx.submit_encoder(enc);
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
 
         let result = ctx.download_f32(&y_buf, (n * m) as usize);
         for i in 0..(n * m) as usize {
@@ -2483,7 +2687,7 @@ mod tests {
             }
             ctx.submit_encoder(enc);
         }
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
 
         // Timed: 100 iterations of single GEMV dispatch
         let iters = 100;
@@ -2498,7 +2702,7 @@ mod tests {
             }
             ctx.submit_encoder(enc);
         }
-        ctx.device.poll(wgpu::Maintain::Wait);
+        ctx.device.poll_wait();
         let elapsed = start.elapsed();
 
         let us_per_gemv = elapsed.as_micros() as f64 / iters as f64;
@@ -4226,9 +4430,7 @@ mod tests {
             });
 
         let make_pipeline = |head_dim: u32| {
-            let mut consts: std::collections::HashMap<String, f64> =
-                std::collections::HashMap::new();
-            consts.insert("HEAD_DIM".to_string(), head_dim as f64);
+            let consts: [(&str, f64); 1] = [("HEAD_DIM", head_dim as f64)];
             ctx.device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(&format!("override_spike_hd{head_dim}")),
@@ -4284,9 +4486,9 @@ mod tests {
             slice.map_async(wgpu::MapMode::Read, move |r| {
                 tx.send(r).ok();
             });
-            ctx.device.poll(wgpu::Maintain::Wait);
+            ctx.device.poll_wait();
             rx.recv().unwrap().unwrap();
-            let data = slice.get_mapped_range();
+            let data = slice.get_mapped_range().expect("get_mapped_range failed");
             let v = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
             drop(data);
             staging.unmap();

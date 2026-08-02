@@ -18,6 +18,9 @@
 
 use anyhow::Result;
 
+#[cfg(feature = "gpu")]
+use crate::backend::wgpu::DevicePollExt;
+
 use super::vision_encoder::{
     VisionEncoderConfig, VisionEncoderWeights, extract_patch, interpolate_pos_embed_2d,
     pixel_shuffle,
@@ -1066,7 +1069,7 @@ impl VitGpuOps for WgpuVitOps {
     /// wgpu's `dispatch` only submits — block here so the profiler can attribute
     /// per-op GPU time. Off the profiled path this is never called.
     fn sync(&self) {
-        self.ctx.device.poll(wgpu::Maintain::Wait);
+        self.ctx.device.poll_wait();
     }
 }
 
