@@ -192,6 +192,22 @@ fn build_mul_mat_pipeline(
     )
 }
 
+/// Q4_0 reg-tile GEMM pipeline. With `CERA_WGPU_SPIRV_PASSTHROUGH=1` and a device
+/// that supports it (Vulkan), use the slangc-compiled SPIR-V fed straight to the
+/// driver, bypassing naga-30's codegen (which regresses ~28% on PowerVR prefill).
+/// Otherwise the naga-compiled WGSL kernel. This is the A/B toggle for the
+/// wgpu-30 regression test; both produce the same reg-tile GEMM interface.
+fn mul_mat_q4_0_pipeline(ctx: &GpuContext) -> wgpu::ComputePipeline {
+    if std::env::var("CERA_WGPU_SPIRV_PASSTHROUGH").as_deref() == Ok("1")
+        && ctx.supports_spirv_passthrough()
+    {
+        eprintln!("[cera] mul_mat_reg_tile_q4_0: SPIR-V passthrough (slang)");
+        ctx.mul_mat_reg_tile_q4_0_passthrough()
+    } else {
+        build_mul_mat_pipeline(ctx, "mul_mat_q4_0", "INIT_SRC0_SHMEM_Q4_0")
+    }
+}
+
 fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
         let r = a % b;
@@ -973,11 +989,7 @@ impl GpuLfm2Model {
             ),
             bias_add: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "bias_add"),
 
-            mul_mat_reg_tile_q4_0: build_mul_mat_pipeline(
-                &ctx,
-                "mul_mat_q4_0",
-                "INIT_SRC0_SHMEM_Q4_0",
-            ),
+            mul_mat_reg_tile_q4_0: mul_mat_q4_0_pipeline(&ctx),
             // Every quantized weight goes through the register-tiled kernel (weight
             // reuse across the token tile), NOT the batched-GEMV-shaped gemm_* kernels:
             // those re-dequantize the weight once per token, so they buy submit count

@@ -315,6 +315,15 @@ impl GpuContext {
         if adapter.features().contains(wgpu::Features::SHADER_F16) {
             features |= wgpu::Features::SHADER_F16;
         }
+        // SPIR-V passthrough lets us feed slangc-compiled SPIR-V straight to the
+        // Vulkan driver, bypassing naga-30's codegen (which regresses ~28% on
+        // PowerVR prefill). Vulkan-only; absent on Metal, where we fall back to WGSL.
+        if adapter
+            .features()
+            .contains(wgpu::Features::PASSTHROUGH_SHADERS)
+        {
+            features |= wgpu::Features::PASSTHROUGH_SHADERS;
+        }
 
         // Use the adapter's actual limits instead of hardcoding. This avoids
         // failures on GPUs with smaller max_buffer_size (integrated, mobile).
@@ -839,6 +848,70 @@ impl GpuContext {
                     zero_initialize_workgroup_memory: false,
                     ..Default::default()
                 },
+                cache: None,
+            })
+    }
+
+    /// True if the device was created with SPIR-V passthrough (Vulkan-only).
+    pub fn supports_spirv_passthrough(&self) -> bool {
+        self.device
+            .features()
+            .contains(wgpu::Features::PASSTHROUGH_SHADERS)
+    }
+
+    /// Build the Q4_0 register-tiled prefill GEMM from slangc-compiled SPIR-V,
+    /// fed straight to the driver (bypassing naga-30's codegen, which regresses
+    /// ~28% on PowerVR prefill). Passthrough modules carry no reflection, so the
+    /// bind-group layout is explicit and must match `mul_mat_reg_tile.wgsl`'s
+    /// interface: 0/1 = src0/src1 (storage read), 2 = dst (storage read-write),
+    /// 3 = params (storage read). The kernel is dispatched `(wg_m, wg_n, 1)` like
+    /// the WGSL one. Only call when `supports_spirv_passthrough()` is true.
+    pub fn mul_mat_reg_tile_q4_0_passthrough(&self) -> wgpu::ComputePipeline {
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("mul_mat_reg_tile_passthrough_bgl"),
+                entries: &[
+                    storage(0, true),
+                    storage(1, true),
+                    storage(2, false),
+                    storage(3, true),
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("mul_mat_reg_tile_passthrough_layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        // SAFETY: the SPIR-V is compiled offline by slangc from the sibling
+        // `shaders/spirv/mul_mat_reg_tile_q4_0.slang`, is spirv-val clean, and its
+        // binding interface matches `bgl` above. Only reached when the adapter
+        // advertises PASSTHROUGH_SHADERS (Vulkan), so the driver accepts raw SPIR-V.
+        let module = unsafe {
+            self.device
+                .create_shader_module_passthrough(wgpu::include_spirv_raw!(
+                    "shaders/spirv/mul_mat_reg_tile_q4_0.spv"
+                ))
+        };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("mul_mat_reg_tile_q4_0_passthrough"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             })
     }
