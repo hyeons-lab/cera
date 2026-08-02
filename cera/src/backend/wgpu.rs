@@ -1217,6 +1217,14 @@ pub mod shaders {
     /// when the adapter reports it.
     pub const COOPMAT_PROBE_SLANG: &str =
         include_str!(concat!(env!("OUT_DIR"), "/coopmat_probe.wgsl"));
+    /// WGSL twin of the Slang Q8_0 GEMM. The `case metal:` branch that carries
+    /// the `simdgroup_matrix` tiling is eliminated here, so what remains is the
+    /// source's portable `default:` branch: an untiled correctness reference,
+    /// one dot product per output element. It is *not* a replacement for
+    /// [`MUL_MAT_REG_TILE`] and nothing dispatches it outside
+    /// `tests/slang_multitarget_parity.rs`, which uses it to prove that one
+    /// source can carry a cooperative-matrix path and still emit legal WGSL.
+    pub const GEMM_Q8_0_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/gemm_q8_0.wgsl"));
     pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.wgsl");
     pub const ROPE: &str = include_str!("shaders/rope.wgsl");
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.wgsl");

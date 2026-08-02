@@ -291,6 +291,82 @@ MMA, which would have retired the GEMM-porting idea) did not occur. The path to
 porting the eight `simdgroup_matrix` GEMMs is open. The f16 constraint above is
 the one real caveat a port has to design around; it is not a blocker.
 
+## Round 3: the real simdgroup_matrix GEMM (new, needs a Mac run)
+
+The probe answered "can Slang reach the MMA". This answers the question that
+decides the branch: **can a generated simdgroup GEMM keep the speed of the
+hand-tuned one it would replace?** `shaders/slang/gemm_q8_0.slang` is a port of
+`shaders/gemm_q8_0.metal` with the same 64x32 tile, the same 8 KB threadgroup
+budget, and the same mixed `simdgroup_matrix<float>` x `simdgroup_matrix<half>`
+MMA, reached through `linalg::CoopMat`.
+
+Two commands. The first is correctness, the second is the one that matters:
+
+```sh
+cargo test -p cera --features metal --test slang_multitarget_parity -- --nocapture
+cargo run -p cera --features metal --release --example slang_gemm_bench
+```
+
+Expected from the test run: **8 metal-gated tests**, up from 5. The three new
+ones are `msl::gemm_q8_0_slang_matches_reference`,
+`generated_gemm_keeps_simdgroup_matrix`, and the softmax/probe tests as before.
+
+### What is already established, and what only your Mac can settle
+
+Verified here on Linux, so no need to re-check:
+
+- both targets compile, and the emitted MSL carries
+  `simdgroup_multiply_accumulate` with the mixed float/half operand pair;
+- the eight accumulators survive as
+  `thread array<simdgroup_matrix<float, int(8), int(8)>, int(8)>`;
+- the generated WGSL needs no `enable f16` and has no subgroup ops;
+- the WGSL branch is numerically correct on all three shapes, including a
+  ragged one, which pins the shared parts: bindings, the params layout, the
+  Q8_0 byte unpacking, and the dispatch grid.
+
+Not verified anywhere yet, because none of it can run off Metal:
+
+1. **The whole simdgroup tiling.** Every index in the `case metal:` branch is a
+   transcription of the handwritten kernel that no machine here can execute. The
+   parity test is the first thing that has ever run it.
+2. **The ragged epilogue.** This is the one place the port is a rewrite rather
+   than a transcription. Slang cannot type-pun groupshared memory, so instead of
+   reinterpreting the 8 KB scratch as one 64x32 float tile it bounces through
+   `sb` in two 16-column rounds. The `(70, 96, 45)` shape is the test that
+   exercises it.
+3. **Whether the accumulators actually stay in registers.** Eight live 8x8
+   accumulators plus six operand registers may spill after Slang's codegen. The
+   type surviving in the emitted text does not prove the register allocation
+   survives. A spill will not fail a test; it shows up only in the bench.
+
+### Reading the bench
+
+The interesting column is the last one. `ratio > 1.00` means the generated
+kernel is faster.
+
+Anything at or above ~0.97 is the answer this branch was hoping for. A ratio
+well below that is the same failure the softmax bench caught: that kernel passed
+its entire parity suite while carrying one extra threadgroup barrier and running
+~24% slower at the size where barrier latency dominates. The likely cause here
+is different, since the port has one *fewer* synchronization than the original:
+Slang exposes no simdgroup-scoped execution barrier, so the
+`simdgroup_barrier(mem_flags::mem_none)` scheduling hints between the operand
+loads and the MMAs are gone. That is correct on Apple silicon but is exactly the
+kind of hint whose absence costs throughput.
+
+The bench also prints an agreement check first. Both kernels stage weights as
+half and accumulate in float over the same tile order, so they should agree to
+the last bit and it prints `(bit-identical)` when they do. A `MISMATCH` there
+means the timings are not comparable and the tiling transcription is wrong
+somewhere; send that output rather than the timings.
+
+### What to send back
+
+The full output of both commands. If the bench shows a regression, the useful
+extra is the shape at which it is worst, since a gap that closes as the shape
+grows points at fixed per-dispatch overhead and a gap that does not points at
+the inner loop.
+
 ## Regenerating the committed outputs
 
 Only needed if you edit the `.slang`. Requires slangc 2026.13.1 (the CI drift

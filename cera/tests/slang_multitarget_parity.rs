@@ -73,6 +73,115 @@ fn assert_softmax(label: &str, input: &[f32], got: &[f32]) {
     eprintln!("{label}: max_abs_err={max_abs:.3e} sum={sum:.6} OK");
 }
 
+// ---------------------------------------------------------------------------
+// Q8_0 GEMM fixtures
+//
+// The second kernel in the tree, and the first production-shaped one: the Metal
+// branch is a `linalg::CoopMat` port of `shaders/gemm_q8_0.metal`, the WGSL
+// branch the source's untiled reference. Both are checked here against the same
+// CPU dot product.
+//
+// This suite can only establish correctness. `softmax.slang` passed a suite
+// exactly like it while carrying an extra threadgroup barrier that cost ~24% at
+// the size where barrier latency dominates, so `examples/slang_gemm_bench.rs`
+// is the other half of the check, not an optional extra.
+// ---------------------------------------------------------------------------
+
+/// Deterministic, sign-mixed, and not tile-aligned in period, so a kernel that
+/// transposed an axis or dropped a k block does not accidentally agree.
+fn gemm_data(n: usize, seed: u32) -> Vec<f32> {
+    let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((s >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+        })
+        .collect()
+}
+
+/// Pack a `[m, k]` row-major f32 matrix as Q8_0: 34 bytes per 32-element block,
+/// an f16 scale followed by 32 int8. Never a `#[repr(C)]` struct round-trip on
+/// the host side either; the point is to write the exact byte layout the shader
+/// indexes into.
+fn q8_0_pack(data: &[f32]) -> Vec<u8> {
+    assert_eq!(data.len() % 32, 0, "Q8_0 needs whole 32-element blocks");
+    let mut bytes = Vec::with_capacity(data.len() / 32 * 34);
+    for block in data.as_chunks::<32>().0 {
+        let amax = block.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        bytes.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+        for &x in block {
+            bytes.push((x * id).round().clamp(-127.0, 127.0) as i8 as u8);
+        }
+    }
+    bytes
+}
+
+/// `dst[row + col * m] = sum_k w[row, k] * x[col, k]`, computed from the
+/// *dequantized* weights rather than the pre-quantization ones. Referencing the
+/// originals would fold quantization error into the tolerance, which is exactly
+/// the band a real kernel bug would hide in.
+///
+/// Returns the products alongside a per-element bound `sum |w * x|`, so the
+/// assertion can scale with the cancellation the shape actually has instead of
+/// with an arbitrary absolute epsilon.
+fn gemm_ref(w: &[f32], x: &[f32], m: usize, k: usize, n: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut out = vec![0.0f32; m * n];
+    let mut mag = vec![0.0f32; m * n];
+    for col in 0..n {
+        for row in 0..m {
+            let mut acc = 0.0f64;
+            let mut abs = 0.0f64;
+            for i in 0..k {
+                let p = f64::from(w[row * k + i]) * f64::from(x[col * k + i]);
+                acc += p;
+                abs += p.abs();
+            }
+            out[row + col * m] = acc as f32;
+            mag[row + col * m] = abs as f32;
+        }
+    }
+    (out, mag)
+}
+
+/// `tol` is relative to `sum |w * x|` because the two targets carry different
+/// error: the Metal branch stages dequantized weights as `half` (as the
+/// handwritten kernel does), so it inherits fp16 rounding the WGSL reference
+/// branch never sees. Comparing both at the looser bound would let a genuine
+/// WGSL bug through.
+fn assert_gemm(label: &str, got: &[f32], want: &[f32], mag: &[f32], tol: f32) {
+    let mut worst = 0.0f32;
+    let mut worst_at = 0usize;
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert!(g.is_finite(), "{label}: non-finite output at {i}");
+        let bound = tol * mag[i].max(1e-6);
+        let err = (g - w).abs();
+        if err / bound > worst {
+            worst = err / bound;
+            worst_at = i;
+        }
+    }
+    assert!(
+        worst <= 1.0,
+        "{label}: worst err is {worst:.2}x tolerance at index {worst_at} \
+         (got {}, want {}, bound {:.3e})",
+        got[worst_at],
+        want[worst_at],
+        tol * mag[worst_at].max(1e-6)
+    );
+    eprintln!("{label}: worst={worst:.3} of tolerance OK");
+}
+
+/// `(m, k, n)`. Three shapes, each here for a different path.
+///
+/// * `(64, 64, 32)`: exactly one 64x32 tile, so the direct `simdgroup_store`
+///   fast path runs and the ragged epilogue never does.
+/// * `(70, 96, 45)`: overhangs on both axes, so the two-round bounce through
+///   `sb` runs and the clamped `thread_row`/`thread_col` reads are exercised.
+/// * `(10, 32, 3)`: smaller than a tile in every dimension, one k block.
+const GEMM_SHAPES: &[(usize, usize, usize)] = &[(64, 64, 32), (70, 96, 45), (10, 32, 3)];
+
 #[cfg(feature = "gpu")]
 mod wgsl {
     use super::*;
@@ -157,6 +266,85 @@ mod wgsl {
         let got = run_softmax(&ctx, &input);
         assert_softmax("wgsl softmax n=2048", &input, &got);
     }
+
+    fn run_gemm(
+        ctx: &GpuContext,
+        packed: &[u8],
+        x: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Vec<f32> {
+        let pipeline =
+            ctx.create_pipeline(shaders::GEMM_Q8_0_SLANG, "gemm_q8_0", "gemm_q8_0_slang");
+
+        let src0 = ctx.upload_storage(packed, "gemm_w");
+        let src1 = ctx.upload_f32(x, "gemm_x");
+        let dst = ctx.upload_f32(&vec![0.0f32; m * n], "gemm_dst");
+        // x_stride = k, y_stride = m: both operands are tightly packed here.
+        let params = ctx.upload_storage(
+            bytemuck::cast_slice(&[m as u32, k as u32, n as u32, k as u32, m as u32, 0u32]),
+            "gemm_params",
+        );
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: src0.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: src1.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: dst.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(n.div_ceil(32) as u32, m.div_ceil(64) as u32, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll_wait();
+        ctx.download_f32(&dst, m * n)
+    }
+
+    /// The WGSL branch computes in f32 throughout with no half staging, so it is
+    /// held to a much tighter bound than the Metal twin.
+    #[test]
+    fn gemm_q8_0_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        for &(m, k, n) in GEMM_SHAPES {
+            let w = gemm_data(m * k, 7);
+            let x = gemm_data(n * k, 13);
+            let packed = q8_0_pack(&w);
+            let mut deq = vec![0.0f32; m * k];
+            cera::quant::dequantize_q8_0_matrix(&packed, m, k, &mut deq);
+
+            let (want, mag) = gemm_ref(&deq, &x, m, k, n);
+            let got = run_gemm(&ctx, &packed, &x, m, k, n);
+            assert_gemm(
+                &format!("wgsl gemm_q8_0 {m}x{k}x{n}"),
+                &got,
+                &want,
+                &mag,
+                1e-5,
+            );
+        }
+    }
 }
 
 // Declared at the root, as every other suite does, so the gate is the shared
@@ -234,6 +422,105 @@ mod msl {
         let input = softmax_input(2048);
         let got = run_softmax(&ctx, &input);
         assert_softmax("msl softmax n=2048", &input, &got);
+    }
+
+    fn run_gemm(
+        ctx: &MetalContext,
+        packed: &[u8],
+        x: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Vec<f32> {
+        let pipeline = ctx
+            .create_pipeline(shaders::GEMM_Q8_0_SLANG, "gemm_q8_0")
+            .expect("compile generated MSL");
+
+        let src0 = ctx.upload_bytes(packed);
+        let src1 = ctx.upload_f32(x);
+        let dst = ctx.upload_f32(&vec![0.0f32; m * n]);
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&[
+            m as u32, k as u32, n as u32, k as u32, m as u32, 0u32,
+        ]));
+
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&src0), 0);
+        enc.set_buffer(1, Some(&src1), 0);
+        enc.set_buffer(2, Some(&dst), 0);
+        enc.set_buffer(3, Some(&params), 0);
+        // No `set_threadgroup_memory_length`: unlike the handwritten kernel,
+        // which takes its scratch as a `threadgroup char *` argument, the Slang
+        // source declares both staging arrays statically.
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: n.div_ceil(32) as u64,
+                height: m.div_ceil(64) as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        ctx.read_f32(&dst, m * n)
+    }
+
+    /// Looser than the WGSL bound by design: this branch stages dequantized
+    /// weights as `half` before the MMA, exactly as `gemm_q8_0.metal` does, so
+    /// it carries fp16 rounding on every term.
+    #[test]
+    fn gemm_q8_0_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        for &(m, k, n) in GEMM_SHAPES {
+            let w = gemm_data(m * k, 7);
+            let x = gemm_data(n * k, 13);
+            let packed = q8_0_pack(&w);
+            let mut deq = vec![0.0f32; m * k];
+            cera::quant::dequantize_q8_0_matrix(&packed, m, k, &mut deq);
+
+            let (want, mag) = gemm_ref(&deq, &x, m, k, n);
+            let got = run_gemm(&ctx, &packed, &x, m, k, n);
+            assert_gemm(
+                &format!("msl gemm_q8_0 {m}x{k}x{n}"),
+                &got,
+                &want,
+                &mag,
+                2e-3,
+            );
+        }
+    }
+
+    /// The generated MSL must reach the MMA hardware, not a scalar loop. Same
+    /// silent-failure shape as `generated_msl_keeps_simd_reduction`: a fallback
+    /// here is still numerically correct, so every test above keeps passing
+    /// while the kernel loses the only reason it exists.
+    #[test]
+    fn generated_gemm_keeps_simdgroup_matrix() {
+        let src = shaders::GEMM_Q8_0_SLANG;
+        assert!(
+            src.contains("simdgroup_multiply_accumulate"),
+            "generated MSL lost the MMA; __target_switch selected the portable branch"
+        );
+        assert!(
+            src.contains("simdgroup_matrix<half"),
+            "generated MSL lost the half weight operand, so the MMA is no longer \
+             the mixed float x half form gemm_q8_0.metal uses"
+        );
+        // 8 accumulators + 4 weight + 2 input operands must survive as arrays;
+        // a scalarized rewrite would drop the array types entirely.
+        assert!(
+            src.contains("array<simdgroup_matrix<float, int(8), int(8)>, int(8)>"),
+            "generated MSL no longer holds 8 live simdgroup accumulators"
+        );
     }
 
     /// The generated MSL must keep Metal's two-stage simd reduction, not fall
@@ -314,8 +601,32 @@ fn coopmat_probe_wgsl_falls_back_cleanly() {
 fn coopmat_probe_documents_the_f16_requirement() {
     assert!(
         cera::backend::wgpu::shaders::COOPMAT_PROBE_SLANG.contains("enable f16"),
-        "probe no longer requires f16; if the operands became f32 this test and the          warning it guards can go"
+        "probe no longer requires f16; if the operands became f32 this test and the warning it guards can go"
     );
+}
+
+/// The Q8_0 GEMM is the *counter*example to the probe, and that is the point of
+/// how it is bound. Its `half` staging lives entirely inside the metal branch,
+/// so the eliminated WGSL never sees an f16 type and the emission stays legal on
+/// adapters without `SHADER_F16`. This is the constraint
+/// `coopmat_probe_documents_the_f16_requirement` warns about, designed around
+/// rather than worked around, and it only holds while `src0`/`sa` keep their
+/// current types.
+#[cfg(feature = "gpu")]
+#[test]
+fn generated_gemm_wgsl_needs_no_f16() {
+    let src = cera::backend::wgpu::shaders::GEMM_Q8_0_SLANG;
+    assert!(
+        !src.contains("enable f16"),
+        "generated GEMM WGSL now requires f16; cera enables SHADER_F16 only when \
+         the adapter reports it, so this would fail pipeline creation elsewhere"
+    );
+    for leaked in ["CoopMat<", "simdgroup", "subgroupMatrix"] {
+        assert!(
+            !src.contains(leaked),
+            "generated WGSL leaked {leaked}; the metal branch was not eliminated"
+        );
+    }
 }
 
 /// The generated WGSL must **not** contain subgroup ops: cera never requests
@@ -325,9 +636,13 @@ fn coopmat_probe_documents_the_f16_requirement() {
 #[cfg(feature = "gpu")]
 #[test]
 fn generated_wgsl_has_no_subgroup_ops() {
-    let src = cera::backend::wgpu::shaders::SOFTMAX_SLANG;
-    assert!(
-        !src.contains("subgroup"),
-        "generated WGSL uses a subgroup op, but cera does not enable Features::SUBGROUP"
-    );
+    for (name, src) in [
+        ("softmax", cera::backend::wgpu::shaders::SOFTMAX_SLANG),
+        ("gemm_q8_0", cera::backend::wgpu::shaders::GEMM_Q8_0_SLANG),
+    ] {
+        assert!(
+            !src.contains("subgroup"),
+            "generated WGSL for {name} uses a subgroup op, but cera does not enable Features::SUBGROUP"
+        );
+    }
 }
