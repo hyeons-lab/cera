@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 48 "softmax.slang"
+#line 48 "cera/src/backend/shaders/slang/softmax.slang"
 struct KernelContext_0
 {
     packed_uint2 device* par_buf_0;
@@ -177,76 +177,72 @@ float block_sum_0(uint tid_1, float v_1, KernelContext_0 thread* kernelContext_1
 #line 112
     float _S5 = block_max_0(tid_2, local_max_0, &kernelContext_2);
 
-#line 120
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-#line 120
+#line 112
     i_0 = tid_2;
 
-#line 120
+#line 112
     float partial_0 = 0.0f;
 
-
-
+#line 146
     for(;;)
     {
 
-#line 124
+#line 146
         if(i_0 < _S3)
         {
         }
         else
         {
 
-#line 124
+#line 146
             break;
         }
 
-#line 125
+#line 147
         float e_0 = exp(*((&kernelContext_2)->x_buf_0+i_0) - _S5);
         *((&kernelContext_2)->x_buf_0+i_0) = e_0;
         float partial_1 = partial_0 + e_0;
 
-#line 124
+#line 146
         i_0 = i_0 + 256U;
 
-#line 124
+#line 146
         partial_0 = partial_1;
 
-#line 124
+#line 146
     }
 
-#line 124
+#line 146
     float _S6 = block_sum_0(tid_2, partial_0, &kernelContext_2);
 
-#line 129
+#line 151
     float _S7 = 1.0f / _S6;
 
-#line 129
+#line 151
     i_0 = tid_2;
 
 
     for(;;)
     {
 
-#line 132
+#line 154
         if(i_0 < _S3)
         {
         }
         else
         {
 
-#line 132
+#line 154
             break;
         }
 
-#line 133
+#line 155
         *((&kernelContext_2)->x_buf_0+i_0) = *((&kernelContext_2)->x_buf_0+i_0) * _S7;
 
-#line 132
+#line 154
         i_0 = i_0 + 256U;
 
-#line 132
+#line 154
     }
 
 

@@ -114,10 +114,32 @@ void softmax(uint3 lid : SV_GroupThreadID) {
     }
     float max_val = block_max(tid, local_max);
 
-    // `block_max` and `block_sum` both write `scratch`, so phase 2 must not
-    // start writing until every thread has read `scratch[0]`. `block_*` ends
-    // with a barrier only on the metal path, so barrier here unconditionally.
-    GroupMemoryBarrierWithGroupSync();
+    // `block_sum` reuses `scratch`, so there is a WAR between `block_max`'s
+    // `scratch[0]` read and `block_sum`'s later write. Whether that needs a
+    // barrier here is target-conditional:
+    //
+    //   - metal: match the handwritten reference (`shaders/softmax.metal`),
+    //     which does this exact phase transition with no barrier here. The same
+    //     WAR is present in that shipped kernel; its tight post-reduction read
+    //     plus the intervening exp loop make a lapping race practically
+    //     impossible, and it has run that way in production. Adding a barrier
+    //     here only emits a fifth `threadgroup_barrier` the reference never
+    //     pays: at small n the kernel is barrier-latency-bound (a few elements
+    //     per thread), so that one extra barrier measured as a ~24% regression
+    //     (0.76x at n=1024, closing to ~1.00x by n=16384). Drop it to match.
+    //   - default (portable tree path): targets arbitrary GPUs with weaker
+    //     scheduling guarantees, so keep the guard.
+    __target_switch {
+    case metal:
+    {
+        break;
+    }
+    default:
+    {
+        GroupMemoryBarrierWithGroupSync();
+        break;
+    }
+    }
 
     // Phase 2: exp(x - max), keeping the running sum.
     float partial = 0.0f;

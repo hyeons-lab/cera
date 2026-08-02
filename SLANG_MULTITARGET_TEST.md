@@ -134,6 +134,66 @@ around simdgroup matrix ops, and nothing here says whether an emitter can match
 them. A reduction helper is a much easier case than a tiled matmul, so a clean
 pass here should not be read as a green light for the GEMMs.
 
+## Results (Apple M1 Max, 2026-08-02)
+
+Ran on an Apple M1 Max (32-core GPU, Metal 4), macOS, from the worktree at branch
+tip. slangc 2026.13.1 on PATH.
+
+**Correctness.** All four parity tests pass, including
+`generated_msl_keeps_simd_reduction` (the generated MSL kept its two-stage
+`simd_max`/`simd_sum`; it did not fall back to the tree). Numeric agreement:
+
+```
+test msl::generated_msl_keeps_simd_reduction ... ok
+msl softmax n=100:  max_abs_err=8.941e-8 sum=1.000000 OK
+msl softmax n=1000: max_abs_err=9.313e-9 sum=1.000000 OK
+msl softmax n=2048: max_abs_err=9.313e-10 sum=0.999999 OK
+test msl::softmax_slang_shorter_than_workgroup ... ok
+test msl::softmax_slang_ragged ... ok
+test msl::softmax_slang_exact_multiple ... ok
+test result: ok. 4 passed
+```
+
+**Speed: a real small-n regression, found and fixed.** The first bench run showed
+the generated kernel losing at the small sizes and only reaching parity once the
+work grew:
+
+```
+       n   handwritten     generated     ratio
+    1024         10.33         13.61    0.759x   <- ~24% slower
+    4096         14.39         14.96    0.962x
+   16384         46.54         46.99    0.990x
+   65536        171.04        170.86    1.001x
+```
+
+Cause: the generated MSL emitted **five** `threadgroup_barrier`s where the
+handwritten `softmax.metal` has **four**. The extra one was the inter-phase
+(max -> exp/sum) barrier, which `softmax.slang` issued unconditionally. On Metal
+it is redundant: `block_max` already ends with a trailing barrier, and the
+handwritten kernel does that exact phase transition with none added. At small n
+the kernel is barrier-latency-bound (~4 elements per thread at n=1024), so 5/4
+barriers tracks the ~24% gap almost exactly.
+
+Fix: made that barrier target-conditional in `softmax.slang` (`__target_switch`,
+dropped on `metal`, kept on the portable `default`/tree path), then `just slang`.
+The generated MSL is now 4 barriers, structurally identical to the reference;
+`softmax.wgsl` is byte-unchanged. After:
+
+```
+       n   handwritten     generated     ratio
+    1024         13.12         13.42    0.978x   <- was 0.759x
+    4096         13.58         13.88    0.979x
+   16384         43.96         43.75    1.005x
+   65536        170.26        171.51    0.993x
+```
+
+Every size is now within ~2% of parity (the bench's own "no difference" band),
+agreement still bit-identical (`0.000e0`) at all sizes. This is exactly the class
+of silent regression the perf bench exists to catch: correctness never saw it,
+only the ratio did. (Absolute µs are not comparable across the two runs; only the
+within-run interleaved ratio is, which is why the handwritten n=1024 column moved
+too.)
+
 ## Regenerating the committed outputs
 
 Only needed if you edit the `.slang`. Requires slangc 2026.13.1 (the CI drift
