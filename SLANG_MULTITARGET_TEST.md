@@ -248,6 +248,49 @@ compares the two softmax kernels. Timing the probe would measure a single 8x8
 tile, which says nothing about a tiled GEMM, so it would be a number that invites
 over-reading rather than one worth having.
 
+## Round 2 result (Apple M1 Max, 2026-08-02): the probe passes
+
+Ran on branch tip `81308f7`, Apple M1 Max (32-core GPU, Metal 4), macOS.
+slangc 2026.13.1 on PATH.
+
+`coopmat_probe_reaches_metal_mma` **passes**: Slang lowers `linalg::CoopMat` to
+genuine Metal MMA. Five tests run under `--features metal` (the two `gpu`-gated
+probe tests do not build in this configuration, as expected), all green:
+
+```
+running 5 tests
+test coopmat_probe_reaches_metal_mma ... ok
+test msl::generated_msl_keeps_simd_reduction ... ok
+msl softmax n=100:  max_abs_err=8.941e-8 sum=1.000000 OK
+msl softmax n=1000: max_abs_err=9.313e-9 sum=1.000000 OK
+msl softmax n=2048: max_abs_err=9.313e-10 sum=0.999999 OK
+test msl::softmax_slang_shorter_than_workgroup ... ok
+test msl::softmax_slang_ragged ... ok
+test msl::softmax_slang_exact_multiple ... ok
+
+test result: ok. 5 passed; 0 failed
+```
+
+The generated `coopmat_probe.metal` carries the exact instructions and, more to
+the point, the exact type shape the eight hand-tuned GEMMs use, fp16 operands
+into an fp32 accumulator:
+
+```
+#include <metal_simdgroup_matrix>
+simdgroup_load(result, src, elements_per_row);
+simdgroup_store((this_0), (device float*)((buffer_0)) + (element_0), (ulong)(stride_0));
+simdgroup_matrix<float, int(8), int(8)> linalg_coopMatMulAdd_0(
+    simdgroup_matrix<half, int(8), int(8)> matA_0,
+    simdgroup_matrix<half, int(8), int(8)> matB_0,
+    simdgroup_matrix<float, int(8), int(8)> matC_0)
+simdgroup_multiply_accumulate(_S1, matA_0, matB_0, matC_0);
+```
+
+So the failure mode this probe existed to catch (Slang no longer reaching Metal
+MMA, which would have retired the GEMM-porting idea) did not occur. The path to
+porting the eight `simdgroup_matrix` GEMMs is open. The f16 constraint above is
+the one real caveat a port has to design around; it is not a blocker.
+
 ## Regenerating the committed outputs
 
 Only needed if you edit the `.slang`. Requires slangc 2026.13.1 (the CI drift
