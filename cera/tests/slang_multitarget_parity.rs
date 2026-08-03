@@ -438,6 +438,157 @@ fn rmsnorm_ref(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
+// Conv1d fixtures (LFM2 short-conv tier)
+//
+// Unlike the norm tier these are clean single-body ports with no
+// `__target_switch`, so the question is not whether a per-target fast path
+// survived but whether the shared body still writes *both* of its outputs: each
+// kernel produces an output vector and advances the rolling buffer in place. A
+// port that dropped the rolling-buffer update would still pass an output-only
+// check, so every conv assertion here covers the returned buffer too.
+//
+// Every conv test sweeps [`CONV_SHAPES`], which is what makes the predicated
+// `[ForceUnroll]` loops in `conv1d_fused_batch.slang` testable at all: at the
+// maximum shape (ks=4, d_conv=3) every predicate in those loops is
+// unconditionally true, so replacing them all with `true` would still pass. The
+// shape that actually ships is the smaller one.
+// ---------------------------------------------------------------------------
+
+/// `(kernel_size, d_conv)` pairs every conv test sweeps.
+///
+/// `(3, 2)` is the production shape: shipped LFM2 GGUFs set
+/// `lfm2.shortconv.l_cache = 3`, and the Metal and wgpu hosts both derive
+/// `kernel_size = l_cache`, `d_conv = kernel_size - 1`. `(4, 3)` is the maximum
+/// the `conv1d_fused_batch` register arrays are sized for, so it pins the
+/// boundary. `(2, 1)` degenerates the rolling buffer to a single slot, which is
+/// where an off-by-one in the shift loop shows up.
+const CONV_SHAPES: &[(usize, usize)] = &[(3, 2), (4, 3), (2, 1)];
+
+/// Deterministic conv input, rolling-buffer state and per-channel weights.
+/// `weight` is `hs x ks` with the current-input tap at column `d_conv`.
+fn conv_inputs(hs: usize, ks: usize, d_conv: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let input = (0..hs).map(|i| (i as f32 * 0.01).sin() * 2.0).collect();
+    let rbuffer = (0..d_conv * hs)
+        .map(|i| (i as f32 * 0.017).cos() * 0.5)
+        .collect();
+    let weight = (0..hs * ks)
+        .map(|i| 0.1 + 0.05 * (i as f32 * 0.03).sin())
+        .collect();
+    (input, rbuffer, weight)
+}
+
+/// Packed `[x | c | b]` conv projection for `n_tokens` tokens, the layout both
+/// fused kernels read (`proj_stride = 3 * hs`).
+fn conv_proj_inputs(hs: usize, n_tokens: usize) -> Vec<f32> {
+    (0..n_tokens * 3 * hs)
+        .map(|i| (i as f32 * 0.007).sin() * 1.5)
+        .collect()
+}
+
+/// Reference depthwise conv1d: one output element per channel, then the rolling
+/// buffer shifted left one slot with `input` appended. Returns
+/// `(output, rbuffer)`.
+fn conv1d_ref(
+    input: &[f32],
+    rbuffer: &[f32],
+    weight: &[f32],
+    hs: usize,
+    ks: usize,
+    d_conv: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut out = vec![0.0f32; hs];
+    let mut rb = rbuffer.to_vec();
+    for ch in 0..hs {
+        let mut sum = 0.0f32;
+        for k in 0..d_conv {
+            sum += rb[k * hs + ch] * weight[ch * ks + k];
+        }
+        sum += input[ch] * weight[ch * ks + d_conv];
+        out[ch] = sum;
+        // Shift after accumulating, ascending so the in-place move is a left
+        // shift, exactly as the kernel does it.
+        for k in 0..d_conv.saturating_sub(1) {
+            rb[k * hs + ch] = rb[(k + 1) * hs + ch];
+        }
+        if d_conv > 0 {
+            rb[(d_conv - 1) * hs + ch] = input[ch];
+        }
+    }
+    (out, rb)
+}
+
+/// Reference batched fused conv: per token `bx = x * b`, conv over the rolling
+/// state, then `c * sum`, walking tokens in order because the state is
+/// sequential. Returns `(output, rbuffer)`. The single-token `conv1d_fused` is
+/// this with `n_tokens = 1`, so both kernels are pinned to one reference.
+fn conv1d_fused_batch_ref(
+    proj: &[f32],
+    rbuffer: &[f32],
+    weight: &[f32],
+    hs: usize,
+    ks: usize,
+    d_conv: usize,
+    n_tokens: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let proj_stride = 3 * hs;
+    let mut out = vec![0.0f32; n_tokens * hs];
+    let mut rb = rbuffer.to_vec();
+    for ch in 0..hs {
+        // The kernel keeps this channel's state in registers across tokens and
+        // writes it back once at the end; mirror that so the two agree on the
+        // intermediate values, not just the final ones.
+        let mut state: Vec<f32> = (0..d_conv).map(|k| rb[k * hs + ch]).collect();
+        for t in 0..n_tokens {
+            let base = t * proj_stride;
+            let bx = proj[base + ch] * proj[base + 2 * hs + ch];
+            let mut sum = 0.0f32;
+            for k in 0..d_conv {
+                sum += state[k] * weight[ch * ks + k];
+            }
+            sum += bx * weight[ch * ks + d_conv];
+            for k in 0..d_conv.saturating_sub(1) {
+                state[k] = state[k + 1];
+            }
+            if d_conv > 0 {
+                state[d_conv - 1] = bx;
+            }
+            out[t * hs + ch] = proj[base + hs + ch] * sum;
+        }
+        for k in 0..d_conv {
+            rb[k * hs + ch] = state[k];
+        }
+    }
+    (out, rb)
+}
+
+/// Realistic LFM2 hidden sizes plus a ragged one (not a multiple of 256), which
+/// is what exercises the `ch >= hs` guard.
+const CONV_HIDDEN_SIZES: &[usize] = &[1024, 2048, 1537];
+
+/// Params for both single-token conv kernels: `(hs, kernel_size, d_conv, pad)`.
+fn conv_params(hs: usize, ks: usize, d_conv: usize) -> [u32; 4] {
+    [hs as u32, ks as u32, d_conv as u32, 0]
+}
+
+/// Params for the batched kernel, which adds the token count and the two
+/// strides.
+fn conv_batch_params(hs: usize, ks: usize, d_conv: usize, n_tokens: usize) -> [u32; 6] {
+    [
+        hs as u32,
+        ks as u32,
+        d_conv as u32,
+        n_tokens as u32,
+        (3 * hs) as u32,
+        hs as u32,
+    ]
+}
+
+/// `(hidden_size, n_tokens)` for the batched kernel: a realistic prefill batch,
+/// a short one, and a ragged pair. Token count is the axis that matters most
+/// there, since the rolling state has to stay correct across every token.
+const CONV_BATCH_SHAPES: &[(usize, usize)] = &[(1024, 64), (2048, 7), (1537, 33)];
+
+// ---------------------------------------------------------------------------
 // Q8_0 GEMM fixtures
 //
 // The second kernel in the tree, and the first production-shaped one: the Metal
@@ -1309,6 +1460,189 @@ mod wgsl {
         }
     }
 
+    /// Bind five storage buffers as bindings 0..4 for the conv kernels, which
+    /// all share one binding contract (in/proj, rbuffer, weight, output,
+    /// params).
+    fn conv_bind_group(
+        ctx: &GpuContext,
+        pipeline: &wgpu::ComputePipeline,
+        bufs: [&wgpu::Buffer; 5],
+    ) -> wgpu::BindGroup {
+        let entries: Vec<wgpu::BindGroupEntry> = bufs
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: b.as_entire_binding(),
+            })
+            .collect();
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &entries,
+        })
+    }
+
+    /// Dispatch one conv kernel over `hs` channels and read back both of its
+    /// outputs. All three conv kernels share a five-slot binding contract
+    /// (in/proj, rbuffer, weight, output, params), so one runner serves them
+    /// all; only the params word count differs.
+    #[allow(clippy::too_many_arguments)]
+    fn run_conv(
+        ctx: &GpuContext,
+        shader: &str,
+        entry: &str,
+        first: &[f32],
+        rbuffer: &[f32],
+        weight: &[f32],
+        hs: usize,
+        out_len: usize,
+        params: &[u32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let pipeline = ctx.create_pipeline(shader, entry, entry);
+        let first_buf = ctx.upload_f32(first, "cv_first");
+        let rb_buf = ctx.upload_f32(rbuffer, "cv_rb");
+        let w_buf = ctx.upload_f32(weight, "cv_w");
+        let out_buf = ctx.upload_f32(&vec![0.0f32; out_len], "cv_out");
+        let par_buf = ctx.upload_storage(bytemuck::cast_slice(params), "cv_params");
+        let bg = conv_bind_group(
+            ctx,
+            &pipeline,
+            [&first_buf, &rb_buf, &w_buf, &out_buf, &par_buf],
+        );
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(hs.div_ceil(256) as u32, 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll_wait();
+        (
+            ctx.download_f32(&out_buf, out_len),
+            ctx.download_f32(&rb_buf, rbuffer.len()),
+        )
+    }
+
+    /// Run one shader over every `CONV_SHAPES` x `CONV_HIDDEN_SIZES` pair and
+    /// check the output and the advanced rolling buffer against the reference.
+    /// `shader` is either the generated kernel or its handwritten twin, so the
+    /// same sweep pins both.
+    fn check_conv1d(ctx: &GpuContext, tag: &str, shader: &str) {
+        for &(ks, d_conv) in CONV_SHAPES {
+            for &hs in CONV_HIDDEN_SIZES {
+                let (input, rbuffer, weight) = conv_inputs(hs, ks, d_conv);
+                let (got_out, got_rb) = run_conv(
+                    ctx,
+                    shader,
+                    "conv1d_depthwise",
+                    &input,
+                    &rbuffer,
+                    &weight,
+                    hs,
+                    hs,
+                    &conv_params(hs, ks, d_conv),
+                );
+                let (want_out, want_rb) = conv1d_ref(&input, &rbuffer, &weight, hs, ks, d_conv);
+                let label = format!("wgsl {tag} conv1d hs={hs} ks={ks} d_conv={d_conv}");
+                assert_close(&label, &got_out, &want_out, 1e-5);
+                assert_close(&format!("{label} rbuffer"), &got_rb, &want_rb, 1e-5);
+            }
+        }
+    }
+
+    /// Single-token fused conv sweep, shared by the generated kernel and the
+    /// handwritten twin.
+    fn check_conv1d_fused(ctx: &GpuContext, tag: &str, shader: &str) {
+        for &(ks, d_conv) in CONV_SHAPES {
+            for &hs in CONV_HIDDEN_SIZES {
+                let (_, rbuffer, weight) = conv_inputs(hs, ks, d_conv);
+                let proj = conv_proj_inputs(hs, 1);
+                let (got_out, got_rb) = run_conv(
+                    ctx,
+                    shader,
+                    "conv1d_fused",
+                    &proj,
+                    &rbuffer,
+                    &weight,
+                    hs,
+                    hs,
+                    &conv_params(hs, ks, d_conv),
+                );
+                let (want_out, want_rb) =
+                    conv1d_fused_batch_ref(&proj, &rbuffer, &weight, hs, ks, d_conv, 1);
+                let label = format!("wgsl {tag} conv1d_fused hs={hs} ks={ks} d_conv={d_conv}");
+                assert_close(&label, &got_out, &want_out, 1e-5);
+                assert_close(&format!("{label} rbuffer"), &got_rb, &want_rb, 1e-5);
+            }
+        }
+    }
+
+    /// Batched fused conv sweep, shared by the generated kernel and the
+    /// handwritten twin.
+    fn check_conv1d_fused_batch(ctx: &GpuContext, tag: &str, shader: &str) {
+        for &(ks, d_conv) in CONV_SHAPES {
+            for &(hs, n_tokens) in CONV_BATCH_SHAPES {
+                let (_, rbuffer, weight) = conv_inputs(hs, ks, d_conv);
+                let proj = conv_proj_inputs(hs, n_tokens);
+                let (got_out, got_rb) = run_conv(
+                    ctx,
+                    shader,
+                    "conv1d_fused_batch",
+                    &proj,
+                    &rbuffer,
+                    &weight,
+                    hs,
+                    n_tokens * hs,
+                    &conv_batch_params(hs, ks, d_conv, n_tokens),
+                );
+                let (want_out, want_rb) =
+                    conv1d_fused_batch_ref(&proj, &rbuffer, &weight, hs, ks, d_conv, n_tokens);
+                let label = format!(
+                    "wgsl {tag} conv1d_fused_batch hs={hs} n={n_tokens} ks={ks} d_conv={d_conv}"
+                );
+                assert_close(&label, &got_out, &want_out, 1e-5);
+                assert_close(&format!("{label} rbuffer"), &got_rb, &want_rb, 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn conv1d_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        check_conv1d(&ctx, "generated", shaders::CONV1D_SLANG);
+    }
+
+    #[test]
+    fn conv1d_fused_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        check_conv1d_fused(&ctx, "generated", shaders::CONV1D_FUSED_SLANG);
+    }
+
+    #[test]
+    fn conv1d_fused_batch_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        check_conv1d_fused_batch(&ctx, "generated", shaders::CONV1D_FUSED_BATCH_SLANG);
+    }
+
+    /// The same sweeps against the three HANDWRITTEN kernels, mirroring the msl
+    /// module's pin.
+    ///
+    /// Without these, each generated kernel is pinned only to a CPU reference
+    /// written by reading the kernel body, so a transcription error made in the
+    /// `.slang` and repeated in the reference would pass. The msl module runs
+    /// the same check, but only a Metal host executes it; this keeps the
+    /// references pinned on a gpu-only host too.
+    #[test]
+    fn handwritten_conv_kernels_match_the_same_references() {
+        let Some(ctx) = setup() else { return };
+        check_conv1d(&ctx, "handwritten", shaders::CONV1D);
+        check_conv1d_fused(&ctx, "handwritten", shaders::CONV1D_FUSED);
+        check_conv1d_fused_batch(&ctx, "handwritten", shaders::CONV1D_FUSED_BATCH);
+    }
+
     fn run_gemm(
         ctx: &GpuContext,
         packed: &[u8],
@@ -2075,6 +2409,189 @@ mod msl {
         }
     }
 
+    /// Dispatch one conv kernel over `hs` channels and read back both of its
+    /// outputs. All three conv kernels share a five-slot binding contract
+    /// (in/proj, rbuffer, weight, output, params at buffers 0..4), so one runner
+    /// serves them all; only the params word count differs.
+    #[allow(clippy::too_many_arguments)]
+    fn run_conv(
+        ctx: &MetalContext,
+        shader: &'static str,
+        entry: &str,
+        first: &[f32],
+        rbuffer: &[f32],
+        weight: &[f32],
+        hs: usize,
+        out_len: usize,
+        params: &[u32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let pipeline = ctx
+            .create_pipeline(shader, entry)
+            .expect("compile generated MSL");
+
+        let first_buf = ctx.upload_f32(first);
+        let rb_buf = ctx.upload_f32(rbuffer);
+        let w_buf = ctx.upload_f32(weight);
+        let out_buf = ctx.upload_f32(&vec![0.0f32; out_len]);
+        let par_buf = ctx.upload_bytes(bytemuck::cast_slice(params));
+
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&first_buf), 0);
+        enc.set_buffer(1, Some(&rb_buf), 0);
+        enc.set_buffer(2, Some(&w_buf), 0);
+        enc.set_buffer(3, Some(&out_buf), 0);
+        enc.set_buffer(4, Some(&par_buf), 0);
+        // Flat grid over `hs` channels, 256 per threadgroup.
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: hs.div_ceil(256) as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        (
+            ctx.read_f32(&out_buf, out_len),
+            ctx.read_f32(&rb_buf, rbuffer.len()),
+        )
+    }
+
+    /// Run one shader over every `CONV_SHAPES` x `CONV_HIDDEN_SIZES` pair and
+    /// check the output and the advanced rolling buffer against the reference.
+    /// `shader` is either the generated kernel or its handwritten twin, so the
+    /// same sweep pins both.
+    fn check_conv1d(ctx: &MetalContext, tag: &str, shader: &'static str) {
+        for &(ks, d_conv) in CONV_SHAPES {
+            for &hs in CONV_HIDDEN_SIZES {
+                let (input, rbuffer, weight) = conv_inputs(hs, ks, d_conv);
+                let (got_out, got_rb) = run_conv(
+                    ctx,
+                    shader,
+                    "conv1d_depthwise",
+                    &input,
+                    &rbuffer,
+                    &weight,
+                    hs,
+                    hs,
+                    &conv_params(hs, ks, d_conv),
+                );
+                let (want_out, want_rb) = conv1d_ref(&input, &rbuffer, &weight, hs, ks, d_conv);
+                let label = format!("msl {tag} conv1d hs={hs} ks={ks} d_conv={d_conv}");
+                assert_close(&label, &got_out, &want_out, 1e-5);
+                assert_close(&format!("{label} rbuffer"), &got_rb, &want_rb, 1e-5);
+            }
+        }
+    }
+
+    /// Single-token fused conv sweep, shared by the generated kernel and the
+    /// handwritten twin.
+    fn check_conv1d_fused(ctx: &MetalContext, tag: &str, shader: &'static str) {
+        for &(ks, d_conv) in CONV_SHAPES {
+            for &hs in CONV_HIDDEN_SIZES {
+                let (_, rbuffer, weight) = conv_inputs(hs, ks, d_conv);
+                let proj = conv_proj_inputs(hs, 1);
+                let (got_out, got_rb) = run_conv(
+                    ctx,
+                    shader,
+                    "conv1d_fused",
+                    &proj,
+                    &rbuffer,
+                    &weight,
+                    hs,
+                    hs,
+                    &conv_params(hs, ks, d_conv),
+                );
+                let (want_out, want_rb) =
+                    conv1d_fused_batch_ref(&proj, &rbuffer, &weight, hs, ks, d_conv, 1);
+                let label = format!("msl {tag} conv1d_fused hs={hs} ks={ks} d_conv={d_conv}");
+                assert_close(&label, &got_out, &want_out, 1e-5);
+                assert_close(&format!("{label} rbuffer"), &got_rb, &want_rb, 1e-5);
+            }
+        }
+    }
+
+    /// Batched fused conv sweep, shared by the generated kernel and the
+    /// handwritten twin.
+    fn check_conv1d_fused_batch(ctx: &MetalContext, tag: &str, shader: &'static str) {
+        for &(ks, d_conv) in CONV_SHAPES {
+            for &(hs, n_tokens) in CONV_BATCH_SHAPES {
+                let (_, rbuffer, weight) = conv_inputs(hs, ks, d_conv);
+                let proj = conv_proj_inputs(hs, n_tokens);
+                let (got_out, got_rb) = run_conv(
+                    ctx,
+                    shader,
+                    "conv1d_fused_batch",
+                    &proj,
+                    &rbuffer,
+                    &weight,
+                    hs,
+                    n_tokens * hs,
+                    &conv_batch_params(hs, ks, d_conv, n_tokens),
+                );
+                let (want_out, want_rb) =
+                    conv1d_fused_batch_ref(&proj, &rbuffer, &weight, hs, ks, d_conv, n_tokens);
+                let label = format!(
+                    "msl {tag} conv1d_fused_batch hs={hs} n={n_tokens} ks={ks} d_conv={d_conv}"
+                );
+                assert_close(&label, &got_out, &want_out, 1e-5);
+                assert_close(&format!("{label} rbuffer"), &got_rb, &want_rb, 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn conv1d_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        check_conv1d(&ctx, "generated", shaders::CONV1D_SLANG);
+    }
+
+    #[test]
+    fn conv1d_fused_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        check_conv1d_fused(&ctx, "generated", shaders::CONV1D_FUSED_SLANG);
+    }
+
+    #[test]
+    fn conv1d_fused_batch_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        check_conv1d_fused_batch(&ctx, "generated", shaders::CONV1D_FUSED_BATCH_SLANG);
+    }
+
+    /// The same sweeps against the three HANDWRITTEN kernels.
+    ///
+    /// Without these, each generated kernel is pinned only to a CPU reference
+    /// that was written by reading the kernel body, so a transcription error
+    /// made in the `.slang` and repeated in the reference would pass. Running
+    /// both sides through one runner also pins the binding contract they share,
+    /// which for `conv1d_fused` is the consolidation this branch made: its Metal
+    /// twin used to take x, b and c as three separate buffers and now reads one
+    /// packed `proj`.
+    #[test]
+    fn handwritten_conv_kernels_match_the_same_references() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        check_conv1d(&ctx, "handwritten", shaders::CONV1D);
+        check_conv1d_fused(&ctx, "handwritten", shaders::CONV1D_FUSED);
+        check_conv1d_fused_batch(&ctx, "handwritten", shaders::CONV1D_FUSED_BATCH);
+    }
+
     fn run_gemm(
         ctx: &MetalContext,
         packed: &[u8],
@@ -2356,10 +2873,130 @@ fn generated_wgsl_has_no_subgroup_ops() {
         ),
         ("argmax_f32", cera::backend::wgpu::shaders::ARGMAX_F32_SLANG),
         ("rmsnorm", cera::backend::wgpu::shaders::RMSNORM_SLANG),
+        ("conv1d", cera::backend::wgpu::shaders::CONV1D_SLANG),
+        (
+            "conv1d_fused",
+            cera::backend::wgpu::shaders::CONV1D_FUSED_SLANG,
+        ),
+        (
+            "conv1d_fused_batch",
+            cera::backend::wgpu::shaders::CONV1D_FUSED_BATCH_SLANG,
+        ),
     ] {
         assert!(
             !src.contains("subgroup"),
             "generated WGSL for {name} uses a subgroup op, but cera does not enable Features::SUBGROUP"
         );
     }
+}
+
+/// The conv tier is the first clean single-body port since Phase 1a: one body,
+/// no `__target_switch`, and all three kernels on the same five-slot binding
+/// contract. That only holds because the Metal `conv1d_fused` twin was first
+/// consolidated onto the packed `proj` buffer; its old signature took x, b and c
+/// as three separate buffers and ran to `buffer(6)`. Pin the emitted binding
+/// count so reintroducing a per-target split cannot pass silently.
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+#[test]
+fn generated_conv_msl_binds_five_buffers() {
+    for (name, src) in [
+        ("conv1d", cera::backend::metal::shaders::CONV1D_SLANG),
+        (
+            "conv1d_fused",
+            cera::backend::metal::shaders::CONV1D_FUSED_SLANG,
+        ),
+        (
+            "conv1d_fused_batch",
+            cera::backend::metal::shaders::CONV1D_FUSED_BATCH_SLANG,
+        ),
+    ] {
+        for i in 0..5 {
+            assert!(
+                src.contains(&format!("[[buffer({i})]]")),
+                "generated MSL for {name} is missing buffer({i})"
+            );
+        }
+        assert!(
+            !src.contains("[[buffer(5)]]"),
+            "generated MSL for {name} binds more than the five conv slots"
+        );
+    }
+}
+
+/// WGSL half of [`generated_conv_msl_binds_five_buffers`].
+#[cfg(feature = "gpu")]
+#[test]
+fn generated_conv_wgsl_binds_five_slots() {
+    for (name, src) in [
+        ("conv1d", cera::backend::wgpu::shaders::CONV1D_SLANG),
+        (
+            "conv1d_fused",
+            cera::backend::wgpu::shaders::CONV1D_FUSED_SLANG,
+        ),
+        (
+            "conv1d_fused_batch",
+            cera::backend::wgpu::shaders::CONV1D_FUSED_BATCH_SLANG,
+        ),
+    ] {
+        for i in 0..5 {
+            assert!(
+                src.contains(&format!("@binding({i})")),
+                "generated WGSL for {name} is missing binding {i}"
+            );
+        }
+        assert!(
+            !src.contains("@binding(5)"),
+            "generated WGSL for {name} binds more than the five conv slots"
+        );
+    }
+}
+
+/// `conv1d_fused_batch` gets its speed from having all five loops over its
+/// `w_local[4]` / `rb[3]` state written with a literal trip count and
+/// `[ForceUnroll]`. Losing that unroll measured 0.72x against the handwritten
+/// kernel, which no numeric test can see: the kernel stays bit-identical, just
+/// slower.
+///
+/// This asserts the unroll, which is the part that regressed, not register
+/// residency as such: the emission still indexes `w_local[d_conv]` and
+/// `rb[d_conv - 1]` by a runtime value, and predicating those away to make every
+/// index constant measured slightly slower, so they stay.
+///
+/// Assert it structurally rather than by name: after unrolling, the only loop
+/// left in either emission is the per-token one. Written the compound way
+/// (`k < d_conv && k < 3`), Slang lowers `&&` to a branchy short-circuit that
+/// does not unroll, and all five reappear.
+#[test]
+fn generated_conv_batch_unrolls_its_register_loops() {
+    // Tracks that at least one arm compiled in. Both are cfg-gated, and with
+    // `--features metal` on a non-Apple target neither would, leaving the sole
+    // guard for the 0.72x regression passing while asserting nothing.
+    let mut checked = 0usize;
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    {
+        checked += 1;
+        let msl = cera::backend::metal::shaders::CONV1D_FUSED_BATCH_SLANG;
+        let loops = msl.matches("for(;;)").count();
+        assert_eq!(
+            loops, 1,
+            "generated MSL for conv1d_fused_batch has {loops} loops, expected only the \
+             per-token one; the register-array loops lost their unroll"
+        );
+    }
+    #[cfg(feature = "gpu")]
+    {
+        checked += 1;
+        let wgsl = cera::backend::wgpu::shaders::CONV1D_FUSED_BATCH_SLANG;
+        let loops = wgsl.matches("for(;;)").count() + wgsl.matches("loop {").count();
+        assert_eq!(
+            loops, 1,
+            "generated WGSL for conv1d_fused_batch has {loops} loops, expected only the \
+             per-token one; the register-array loops lost their unroll"
+        );
+    }
+    assert!(
+        checked > 0,
+        "neither emission was checked; this test cannot guard the unroll in this \
+         feature/target combination"
+    );
 }

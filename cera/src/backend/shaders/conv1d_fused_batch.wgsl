@@ -13,7 +13,9 @@
 //   rb shifts left, rb[d_conv - 1] = bx
 //   output[token, ch] = c * conv_out
 //
-// Constraints: kernel_size ≤ 4, d_conv ≤ 3 (LFM2 uses ks=4, d_conv=3).
+// Constraints: kernel_size ≤ 4, d_conv ≤ 3. Shipped LFM2 GGUFs set
+// `lfm2.shortconv.l_cache = 3`, giving ks=3 and d_conv=2; 4 and 3 are the
+// maxima the register arrays are sized for, not the usual values.
 // Validated at the top of the kernel — out-of-range params return early
 // rather than risk OOB on the size-4 `w_local` / size-3 `rb` register
 // arrays.

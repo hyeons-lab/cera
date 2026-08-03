@@ -253,6 +253,15 @@ pub mod shaders {
     pub const ROPE_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.metal"));
     pub const QK_NORM_ROPE: &str = include_str!("shaders/qk_norm_rope.metal");
     pub const CONV1D: &str = include_str!("shaders/conv1d.metal");
+    /// Same kernel as [`CONV1D`], generated from `shaders/slang/conv1d.slang` by
+    /// build.rs and shared with the wgpu backend's
+    /// [`super::super::wgpu::shaders::CONV1D_SLANG`]. Unlike the norm tier this
+    /// is a clean single-body port: the two handwritten twins already agreed on
+    /// element type, bindings and entry name, and there is no reduction or
+    /// subgroup op, so there is no `__target_switch`. Not yet on the production
+    /// path: `tests/slang_multitarget_parity.rs` pins it against the CPU
+    /// reference.
+    pub const CONV1D_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/conv1d.metal"));
     pub const ATTENTION: &str = include_str!("shaders/attention.metal");
     pub const FLASH_ATTENTION: &str = include_str!("shaders/flash_attention.metal");
     pub const ATTENTION_GQA: &str = include_str!("shaders/attention_gqa.metal");
@@ -279,6 +288,21 @@ pub mod shaders {
     pub const RMSNORM_BATCH_SLANG: &str =
         include_str!(concat!(env!("OUT_DIR"), "/rmsnorm_batch.metal"));
     pub const CONV1D_FUSED: &str = include_str!("shaders/conv1d_fused.metal");
+    /// Same kernel as [`CONV1D_FUSED`], generated from
+    /// `shaders/slang/conv1d_fused.slang` by build.rs and shared with the wgpu
+    /// backend's [`super::super::wgpu::shaders::CONV1D_FUSED_SLANG`]. A clean
+    /// single-body port with no `__target_switch`, made possible by first
+    /// consolidating this Metal twin onto the WGSL twin's single packed `proj`
+    /// binding (it used to take x, b and c as three separate buffers that every
+    /// caller filled from one buffer at three offsets). No kernel-size guard on
+    /// either twin or the port: nothing here indexes a fixed-size array, so a
+    /// bound could only convert a correct result into a skipped write.
+    /// ([`CONV1D_FUSED_BATCH`] does constrain its params, because it stages the
+    /// weights and rolling state in fixed-size registers.) Not yet on the
+    /// production path: `tests/slang_multitarget_parity.rs` pins it against the
+    /// CPU reference.
+    pub const CONV1D_FUSED_SLANG: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/conv1d_fused.metal"));
     pub const GEMM_Q4_0: &str = include_str!("shaders/gemm_q4_0.metal");
     pub const GEMM_Q4_1: &str = include_str!("shaders/gemm_q4_1.metal");
     pub const GEMV_Q4_1: &str = include_str!("shaders/gemv_q4_1.metal");
@@ -302,6 +326,19 @@ pub mod shaders {
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.metal");
     pub const QK_NORM_ROPE_BATCH: &str = include_str!("shaders/qk_norm_rope_batch.metal");
     pub const CONV1D_FUSED_BATCH: &str = include_str!("shaders/conv1d_fused_batch.metal");
+    /// Same kernel as [`CONV1D_FUSED_BATCH`], generated from
+    /// `shaders/slang/conv1d_fused_batch.slang` by build.rs and shared with the
+    /// wgpu backend's [`super::super::wgpu::shaders::CONV1D_FUSED_BATCH_SLANG`].
+    /// A clean single-body port with no `__target_switch`: the two handwritten
+    /// twins share an element type, a binding contract and an entry name, and
+    /// neither has a reduction. They do differ in loop spelling, in the weight
+    /// preload bound, and in whether they carry the `ks > 4 || d_conv > 3`
+    /// early-out (this Metal twin does not, and is unguarded on `w[d_conv]` as a
+    /// result); the `.slang` header explains how the shared body reconciles
+    /// those. Not yet on the production path:
+    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
+    pub const CONV1D_FUSED_BATCH_SLANG: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/conv1d_fused_batch.metal"));
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.metal");
     /// TurboQuant KV compression: `tq_encode_keys`, `tq_encode_values`,
     /// `tq_rotate_q` (three kernels in one source).

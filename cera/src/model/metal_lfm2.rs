@@ -2907,32 +2907,29 @@ impl MetalLfm2Model {
     /// Fused: bx = x * b → conv1d(bx, state) → output = c * conv_out.
     /// Combines 3 dispatches into 1; used by the decode-time
     /// gated-conv block.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// `proj` is the packed conv projection [x | c | b], each `hs` floats wide;
+    /// the shader reads the three components at in-shader offsets. This used to
+    /// bind x, b and c as three separate buffers, but every caller passed this
+    /// same buffer three times at offsets 0 / 2*hs / hs.
     fn encode_conv1d_fused(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
-        x: &Buffer,
-        x_off: u64,
-        b: &Buffer,
-        b_off: u64,
-        c: &Buffer,
-        c_off: u64,
+        proj: &Buffer,
         rbuf: &Buffer,
         weight: &Buffer,
         output: &Buffer,
-        output_off: u64,
         hs: u32,
     ) {
         let grid = sz1d(hs.div_ceil(256) as u64);
-        enc.set_compute_pipeline_state(&self.pipelines.conv1d_fused);
-        enc.set_buffer(0, Some(x), x_off);
-        enc.set_buffer(1, Some(b), b_off);
-        enc.set_buffer(2, Some(c), c_off);
-        enc.set_buffer(3, Some(rbuf), 0);
-        enc.set_buffer(4, Some(weight), 0);
-        enc.set_buffer(5, Some(output), output_off);
-        enc.set_buffer(6, Some(&self.params.conv1d), 0);
-        enc.dispatch_thread_groups(grid, sz1d(256));
+        self.dispatch(
+            enc,
+            &self.pipelines.conv1d_fused,
+            &[proj, rbuf, weight, output, &self.params.conv1d],
+            &[],
+            grid,
+            sz1d(256),
+        );
     }
 
     /// Dispatch one `attention_prefill` kernel call against (q_buf, k_cache,
@@ -5778,15 +5775,9 @@ impl MetalLfm2Model {
                 self.encode_conv1d_fused(
                     enc,
                     &self.conv_proj_buf,
-                    0,
-                    &self.conv_proj_buf,
-                    (2 * hs * 4) as u64,
-                    &self.conv_proj_buf,
-                    (hs * 4) as u64,
                     conv_buf,
                     lw.conv_weight.as_ref().unwrap(),
                     &self.conv_gate_buf,
-                    0,
                     hs32,
                 );
                 self.encode_gemv_weight_accumulate(
@@ -6212,15 +6203,9 @@ impl MetalLfm2Model {
                     self.encode_conv1d_fused(
                         enc,
                         &self.conv_proj_buf,
-                        0,
-                        &self.conv_proj_buf,
-                        (2 * hs * 4) as u64,
-                        &self.conv_proj_buf,
-                        (hs * 4) as u64,
                         conv_buf,
                         lw.conv_weight.as_ref().unwrap(),
                         &self.conv_gate_buf,
-                        0,
                         hs32,
                     );
                     self.encode_gemv_weight_accumulate(
@@ -6388,15 +6373,9 @@ impl MetalLfm2Model {
                     self.encode_conv1d_fused(
                         enc,
                         &self.conv_proj_buf,
-                        0,
-                        &self.conv_proj_buf,
-                        (2 * hs * 4) as u64,
-                        &self.conv_proj_buf,
-                        (hs * 4) as u64,
                         conv_buf,
                         lw.conv_weight.as_ref().unwrap(),
                         &self.conv_gate_buf,
-                        0,
                         hs32,
                     );
                     self.encode_gemv_weight_accumulate(
