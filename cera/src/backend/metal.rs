@@ -150,6 +150,13 @@ impl MetalContext {
         unsafe { std::slice::from_raw_parts(ptr, count).to_vec() }
     }
 
+    /// Read `count` u32 values back from a shared buffer (e.g. an argmax index
+    /// output), the integer analog of [`Self::read_f32`].
+    pub fn read_u32(&self, buf: &Buffer, count: usize) -> Vec<u32> {
+        let ptr = buf.contents() as *const u32;
+        unsafe { std::slice::from_raw_parts(ptr, count).to_vec() }
+    }
+
     /// Create a MTLCounterSampleBuffer backed by the device's hardware timestamp
     /// counter. Used for GPU-timestamped per-dispatch profiling. Returns None if
     /// the device doesn't expose timestamp counters.

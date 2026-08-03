@@ -395,8 +395,10 @@ fn argmax_inputs(n: usize, peak: usize) -> Vec<f32> {
     x
 }
 
-/// Reference argmax: strict `>` so the lower index wins on a tie, matching both
-/// kernels and the CPU `argmax`.
+/// Reference argmax: strict `>` so the lower index wins on a tie. This matches
+/// the WGSL branch and the CPU `argmax` exactly; the Metal branch keeps the
+/// lower lane on a tie (not necessarily the lowest index), but the fixtures
+/// inject a unique peak so no tie is exercised.
 fn argmax_f32_ref(x: &[f32]) -> u32 {
     let mut best = f32::NEG_INFINITY;
     let mut best_i = 0u32;
@@ -2003,9 +2005,7 @@ mod msl {
         cb.commit();
         cb.wait_until_completed();
 
-        // out holds a u32 index; MetalContext only exposes read_f32, so recover
-        // the index from the raw bits.
-        ctx.read_f32(&out_buf, 1)[0].to_bits()
+        ctx.read_u32(&out_buf, 1)[0]
     }
 
     #[test]

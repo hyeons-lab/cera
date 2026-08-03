@@ -45,7 +45,9 @@ __target_intrinsic(metal, "simd_shuffle_down($0, $1)")
 uint sg_shuffle_down_u(uint v, uint delta);
 
 /// Argmax of the per-thread (value, index) pairs across the whole workgroup.
-/// Result (the winning index) is valid on every thread. Tie-break: lower index.
+/// Result (the winning index) is valid on every thread. On an exact value tie
+/// the two branches can differ (wgsl keeps the lower index, metal the lower
+/// lane); see the header's tie-break note.
 uint block_argmax(uint tid, float val, uint idx) {
     uint result_idx;
     __target_switch {

@@ -129,10 +129,10 @@ fn main() {
     {
         let out_h = ctx.upload_bytes(bytemuck::cast_slice(&[0u32]));
         run_once(&ctx, &am_hand, &[&am_x_buf, &out_h, &am_params], 1);
-        let ih = ctx.read_f32(&out_h, 1)[0].to_bits();
+        let ih = ctx.read_u32(&out_h, 1)[0];
         let out_s = ctx.upload_bytes(bytemuck::cast_slice(&[0u32]));
         run_once(&ctx, &am_slang, &[&am_x_buf, &out_s, &am_params], 1);
-        let is = ctx.read_f32(&out_s, 1)[0].to_bits();
+        let is = ctx.read_u32(&out_s, 1)[0];
         let match_ = ih == is && ih == am_peak as u32;
         ok &= match_;
         println!(
