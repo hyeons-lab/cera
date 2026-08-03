@@ -188,6 +188,16 @@ pub mod shaders {
     pub const GEMV_Q4_K: &str = include_str!("shaders/gemv_q4_k.metal");
     pub const GEMV_Q5_K: &str = include_str!("shaders/gemv_q5_k.metal");
     pub const ELEMENTWISE: &str = include_str!("shaders/elementwise.metal");
+    /// The four elementwise entry points with identical WGSL+MSL twins
+    /// (`add_inplace`, `scaled_add_inplace`, `mul_inplace`, `silu_mul_inplace`),
+    /// generated from `shaders/slang/elementwise.slang` by build.rs and shared
+    /// with the wgpu backend's [`super::super::wgpu::shaders::ELEMENTWISE_SLANG`].
+    /// The Metal-only entry points ([`ELEMENTWISE`]'s `memcpy_f32`, `mul_out`,
+    /// `cast_f32_to_f16`, `scale_f32`) have no WGSL twin and stay handwritten.
+    /// Not yet on the production path: `tests/slang_multitarget_parity.rs` pins
+    /// it against the CPU reference.
+    pub const ELEMENTWISE_SLANG: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/elementwise.metal"));
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.metal");
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.metal");
     pub const SOFTMAX: &str = include_str!("shaders/softmax.metal");
@@ -207,6 +217,15 @@ pub mod shaders {
     pub const COOPMAT_PROBE_SLANG: &str =
         include_str!(concat!(env!("OUT_DIR"), "/coopmat_probe.metal"));
     pub const ROPE: &str = include_str!("shaders/rope.metal");
+    /// Same NEOX-only RoPE kernel as [`ROPE`], generated from
+    /// `shaders/slang/rope.slang` by build.rs. Unlike gelu/bias_add/elementwise
+    /// this is a `__target_switch` port: the metal branch mirrors this minimal
+    /// NEOX kernel, the wgsl branch (shared with
+    /// [`super::super::wgpu::shaders::ROPE_SLANG`]) mirrors the fuller
+    /// `rope.wgsl`, and Slang omits the freq_factors binding from the MSL since
+    /// only the wgsl branch uses it. Not yet on the production path:
+    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
+    pub const ROPE_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.metal"));
     pub const QK_NORM_ROPE: &str = include_str!("shaders/qk_norm_rope.metal");
     pub const CONV1D: &str = include_str!("shaders/conv1d.metal");
     pub const ATTENTION: &str = include_str!("shaders/attention.metal");
@@ -251,6 +270,13 @@ pub mod shaders {
     pub const VIT_LINEAR: &str = include_str!("shaders/vit_linear.metal");
     pub const LAYERNORM_BATCH: &str = include_str!("shaders/layernorm_batch.metal");
     pub const GELU: &str = include_str!("shaders/gelu.metal");
+    /// Same kernel as [`GELU`], generated from `shaders/slang/gelu.slang` by
+    /// build.rs, sharing that source with the wgpu backend's
+    /// [`super::super::wgpu::shaders::GELU_SLANG`]. Same contract (buffer 0 = x
+    /// in-place, buffer 1 = params). No per-target divergence, so the whole body
+    /// is shared with no `__target_switch`. Not yet on the production path:
+    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
+    pub const GELU_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/gelu.metal"));
     pub const BIAS_ADD: &str = include_str!("shaders/bias_add.metal");
     /// Same kernel as [`BIAS_ADD`], generated from `shaders/slang/bias_add.slang`
     /// by build.rs, sharing that source with the wgpu backend's

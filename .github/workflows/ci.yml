@@ -215,12 +215,19 @@ jobs:
           # The MSL half is never compiled on this runner, so a stale
           # `<name>.metal` would only surface on the Metal leg (or a user's
           # device) with no indication that the committed file, not the .slang,
-          # was at fault. Entry point is the basename here, not `main`.
+          # was at fault. Entry points are the kernel's own function names, not
+          # `main`: default to the basename, or read a `// slang-entries: a b c`
+          # header (same parse as build.rs and `just slang`) for kernels whose
+          # entry name differs (gelu) or that expose several (elementwise).
           dir=cera/src/backend/shaders/slang
           for f in "$dir"/*.slang; do
             name=$(basename "$f" .slang)
+            entries=$(sed -n 's|^[[:space:]]*//[[:space:]]*slang-entries:[[:space:]]*||p' "$f")
+            [ -z "$entries" ] && entries="$name"
+            entry_args=()
+            for e in $entries; do entry_args+=(-entry "$e"); done
             for target in wgsl metal; do
-              "$slangc" "$f" -target "$target" -O3 -entry "$name" -stage compute \
+              "$slangc" "$f" -target "$target" -O3 "${entry_args[@]}" -stage compute \
                 -o "$RUNNER_TEMP/$name.$target"
               if cmp -s "$RUNNER_TEMP/$name.$target" "$dir/$name.$target"; then
                 echo "ok: $name.$target matches slangc $SLANG_VER"

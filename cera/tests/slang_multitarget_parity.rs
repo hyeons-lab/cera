@@ -98,6 +98,148 @@ fn assert_softmax(label: &str, input: &[f32], got: &[f32]) {
     eprintln!("{label}: max_abs_err={max_abs:.3e} sum={sum:.6} OK");
 }
 
+/// Reference tanh-approximation GELU, matching `gelu.slang` (and `cpu::
+/// gelu_inplace`) including the tanh-argument clamp: without it a GPU tanh
+/// computed as (exp(2a)-1)/(exp(2a)+1) goes NaN on the saturated tail, so the
+/// reference has to clamp identically or the fixture's large inputs disagree for
+/// the wrong reason.
+fn gelu_ref(x: &[f32]) -> Vec<f32> {
+    // sqrt(2/pi), truncated to the shortest literal that is the same f32 the
+    // kernel's `0.7978845608f` compiles to (clippy::excessive_precision).
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    x.iter()
+        .map(|&xv| {
+            let inner = (SQRT_2_OVER_PI * (xv + 0.044715 * xv * xv * xv)).clamp(-15.0, 15.0);
+            0.5 * xv * (1.0 + inner.tanh())
+        })
+        .collect()
+}
+
+/// Deterministic, both signs, and deliberately including magnitudes past the
+/// clamp knee (|arg| > 15 around |x| ~ 17) so the saturated tail is exercised;
+/// a kernel that dropped the clamp returns NaN there and fails.
+fn gelu_inputs(n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let t = i as f32;
+            match i % 5 {
+                0 => (t * 0.013).sin() * 4.0,
+                1 => -(t * 0.009).cos() * 3.0,
+                2 => (t % 11.0) - 5.0,
+                3 => 20.0,
+                _ => -18.0,
+            }
+        })
+        .collect()
+}
+
+/// tanh is transcendental, so the generated kernel is held to a relative bound
+/// (scaled by the largest reference magnitude) rather than bit-equality: the
+/// GPU's tanh and the host's differ by a few ULP, amplified by the `0.5 * x`
+/// factor on the large-|x| fixture entries.
+fn assert_gelu(label: &str, input: &[f32], got: &[f32]) {
+    assert_close(label, got, &gelu_ref(input), 1e-4);
+}
+
+/// Deterministic a/b inputs for the elementwise ops, both signs, `b` kept away
+/// from zero so `mul` cannot pass by accident on an all-zero addend.
+fn elementwise_inputs(n: usize) -> (Vec<f32>, Vec<f32>) {
+    let a = (0..n)
+        .map(|i| (i as f32 * 0.017).sin() * 3.0 - 1.0)
+        .collect();
+    let b = (0..n)
+        .map(|i| (i as f32 * 0.011).cos() * 2.0 + 0.5)
+        .collect();
+    (a, b)
+}
+
+fn elementwise_add_ref(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter().zip(b).map(|(x, y)| x + y).collect()
+}
+fn elementwise_mul_ref(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter().zip(b).map(|(x, y)| x * y).collect()
+}
+fn elementwise_scaled_add_ref(a: &[f32], b: &[f32], s: f32) -> Vec<f32> {
+    a.iter().zip(b).map(|(x, y)| x + s * y).collect()
+}
+fn elementwise_silu_mul_ref(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter()
+        .zip(b)
+        .map(|(g, y)| (g / (1.0 + (-g).exp())) * y)
+        .collect()
+}
+
+/// Relative bound (scaled by the largest reference magnitude) for the
+/// elementwise ops that are not bit-exact: `scaled_add` because the GPU may
+/// contract `a + s*b` to an FMA the host mul-then-add does not, and `silu_mul`
+/// because of the `exp`.
+fn assert_close(label: &str, got: &[f32], want: &[f32], rel: f32) {
+    let mut max_abs = 0.0f32;
+    for (g, w) in got.iter().zip(want) {
+        assert!(g.is_finite(), "{label}: non-finite output");
+        max_abs = max_abs.max((g - w).abs());
+    }
+    let max_ref = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let tol = rel * max_ref.max(1e-6);
+    assert!(
+        max_abs <= tol,
+        "{label}: max_abs_err={max_abs:.3e} > tol={tol:.3e} (max_ref={max_ref:.3e})"
+    );
+    eprintln!("{label}: max_abs_err={max_abs:.3e} OK");
+}
+
+/// Deterministic Q and K vectors, both signs. `n_heads`/`n_kv_heads` model GQA,
+/// where K has fewer heads than Q.
+fn rope_inputs(n_heads: usize, n_kv_heads: usize, head_dim: usize) -> (Vec<f32>, Vec<f32>) {
+    let q = (0..n_heads * head_dim)
+        .map(|i| (i as f32 * 0.021).sin() * 2.0 - 0.5)
+        .collect();
+    let k = (0..n_kv_heads * head_dim)
+        .map(|i| (i as f32 * 0.017).cos() * 1.5 + 0.25)
+        .collect();
+    (q, k)
+}
+
+/// Non-trivial `freq_factors` (all != 1), so a kernel that ignored them diverges.
+/// Only the wgsl branch has a freq_factors path (the metal branch is NEOX-only),
+/// so this is used solely by the `gpu` module.
+#[cfg(feature = "gpu")]
+fn rope_freq_factors(half: usize) -> Vec<f32> {
+    (0..half).map(|d| 1.0 + 0.1 * d as f32).collect()
+}
+
+/// Apply RoPE in-place to `n_h` heads of `buf`, the reference for `rope.slang`.
+/// `rope_type` 0 = NEOX (split-halves), 1 = interleaved; `ff`, when present,
+/// divides each pair's angle (Llama-3). Angle uses `powf(-2d/head_dim)`, which is
+/// what both kernel branches compute (the metal branch as `1 / pow(.., 2d/..)`).
+fn rope_apply(
+    buf: &mut [f32],
+    n_h: usize,
+    pos: u32,
+    head_dim: usize,
+    freq_base: f32,
+    rope_type: u32,
+    ff: Option<&[f32]>,
+) {
+    let half = head_dim / 2;
+    for head in 0..n_h {
+        for d in 0..half {
+            let mut angle = pos as f32 * freq_base.powf(-2.0 * d as f32 / head_dim as f32);
+            if let Some(ff) = ff {
+                angle /= ff[d];
+            }
+            let (i0, i1) = if rope_type == 0 {
+                (head * head_dim + d, head * head_dim + d + half)
+            } else {
+                (head * head_dim + 2 * d, head * head_dim + 2 * d + 1)
+            };
+            let (x0, x1) = (buf[i0], buf[i1]);
+            buf[i0] = x0 * angle.cos() - x1 * angle.sin();
+            buf[i1] = x0 * angle.sin() + x1 * angle.cos();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Q8_0 GEMM fixtures
 //
@@ -343,6 +485,254 @@ mod wgsl {
         assert_eq!(got, want, "wgsl bias_add rows={rows} dim={dim}");
     }
 
+    fn run_gelu(ctx: &GpuContext, input: &[f32]) -> Vec<f32> {
+        let n = input.len() as u32;
+        let pipeline = ctx.create_pipeline(shaders::GELU_SLANG, "gelu_inplace", "gelu_slang");
+
+        let x = ctx.upload_f32(input, "gelu_x");
+        let params = ctx.upload_storage(bytemuck::cast_slice(&[n, 0u32]), "gelu_params");
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            // Flat grid over `n` elements, 256 per workgroup.
+            pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll_wait();
+        ctx.download_f32(&x, input.len())
+    }
+
+    #[test]
+    fn gelu_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        // Ragged length exercises the bounds check; the fixture spans the clamp.
+        let input = gelu_inputs(1000);
+        let got = run_gelu(&ctx, &input);
+        assert_gelu("wgsl gelu n=1000", &input, &got);
+    }
+
+    fn run_elementwise(
+        ctx: &GpuContext,
+        entry: &str,
+        a: &[f32],
+        b: &[f32],
+        scale_bits: u32,
+    ) -> Vec<f32> {
+        let n = a.len() as u32;
+        let pipeline = ctx.create_pipeline(shaders::ELEMENTWISE_SLANG, entry, entry);
+
+        let a_buf = ctx.upload_f32(a, "ew_a");
+        let b_buf = ctx.upload_f32(b, "ew_b");
+        let params = ctx.upload_storage(bytemuck::cast_slice(&[n, scale_bits]), "ew_params");
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: b_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll_wait();
+        ctx.download_f32(&a_buf, a.len())
+    }
+
+    /// All four shared entry points against their references. add/mul are
+    /// bit-exact; scaled_add and silu_mul use a relative bound (FMA / exp).
+    #[test]
+    fn elementwise_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        let (a, b) = elementwise_inputs(1000);
+        let s = 0.75f32;
+
+        let got = run_elementwise(&ctx, "add_inplace", &a, &b, 0);
+        assert_eq!(got, elementwise_add_ref(&a, &b), "wgsl elementwise add");
+
+        let got = run_elementwise(&ctx, "mul_inplace", &a, &b, 0);
+        assert_eq!(got, elementwise_mul_ref(&a, &b), "wgsl elementwise mul");
+
+        let got = run_elementwise(&ctx, "scaled_add_inplace", &a, &b, s.to_bits());
+        assert_close(
+            "wgsl elementwise scaled_add",
+            &got,
+            &elementwise_scaled_add_ref(&a, &b, s),
+            1e-6,
+        );
+
+        let got = run_elementwise(&ctx, "silu_mul_inplace", &a, &b, 0);
+        assert_close(
+            "wgsl elementwise silu_mul",
+            &got,
+            &elementwise_silu_mul_ref(&a, &b),
+            1e-5,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_rope(
+        ctx: &GpuContext,
+        q: &[f32],
+        k: &[f32],
+        pos: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        freq_base: f32,
+        rope_type: u32,
+        ff: &[f32],
+        has_ff: u32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let pipeline = ctx.create_pipeline(shaders::ROPE_SLANG, "rope", "rope_slang");
+
+        let q_buf = ctx.upload_f32(q, "rope_q");
+        let k_buf = ctx.upload_f32(k, "rope_k");
+        let params = ctx.upload_storage(
+            bytemuck::cast_slice(&[
+                pos,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                freq_base.to_bits(),
+                rope_type,
+                has_ff,
+            ]),
+            "rope_params",
+        );
+        let ff_buf = ctx.upload_f32(ff, "rope_ff");
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: q_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: k_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: ff_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            let total = n_heads.max(n_kv_heads) * (head_dim / 2);
+            pass.dispatch_workgroups(total.div_ceil(256), 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll_wait();
+        (
+            ctx.download_f32(&q_buf, q.len()),
+            ctx.download_f32(&k_buf, k.len()),
+        )
+    }
+
+    /// The wgsl branch carries NEOX + interleaved + freq_factors, so all three
+    /// are exercised. Bounds are relative (cos/sin/pow are transcendental); a
+    /// wrong pairing or a dropped freq_factors term diverges far past them.
+    #[test]
+    fn rope_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        let (n_heads, n_kv_heads, head_dim) = (8u32, 2u32, 32usize);
+        let half = head_dim / 2;
+        let pos = 7u32;
+        let freq_base = 10000.0f32;
+        let ff = rope_freq_factors(half);
+        let (q, k) = rope_inputs(n_heads as usize, n_kv_heads as usize, head_dim);
+
+        for (label, rope_type, has_ff) in [
+            ("wgsl rope neox", 0u32, 0u32),
+            ("wgsl rope interleaved", 1u32, 0u32),
+            ("wgsl rope neox+freq", 0u32, 1u32),
+        ] {
+            let (gq, gk) = run_rope(
+                &ctx,
+                &q,
+                &k,
+                pos,
+                n_heads,
+                n_kv_heads,
+                head_dim as u32,
+                freq_base,
+                rope_type,
+                &ff,
+                has_ff,
+            );
+            let ffopt = (has_ff == 1).then_some(ff.as_slice());
+            let mut wq = q.clone();
+            let mut wk = k.clone();
+            rope_apply(
+                &mut wq,
+                n_heads as usize,
+                pos,
+                head_dim,
+                freq_base,
+                rope_type,
+                ffopt,
+            );
+            rope_apply(
+                &mut wk,
+                n_kv_heads as usize,
+                pos,
+                head_dim,
+                freq_base,
+                rope_type,
+                ffopt,
+            );
+            assert_close(&format!("{label} q"), &gq, &wq, 1e-4);
+            assert_close(&format!("{label} k"), &gk, &wk, 1e-4);
+        }
+    }
+
     fn run_gemm(
         ctx: &GpuContext,
         packed: &[u8],
@@ -548,6 +938,218 @@ mod msl {
         let got = run_bias_add(&ctx, &x, &bias, dim as u32);
         let want = bias_add_ref(&x, &bias, dim);
         assert_eq!(got, want, "msl bias_add rows={rows} dim={dim}");
+    }
+
+    fn run_gelu(ctx: &MetalContext, input: &[f32]) -> Vec<f32> {
+        let n = input.len() as u32;
+        let pipeline = ctx
+            .create_pipeline(shaders::GELU_SLANG, "gelu_inplace")
+            .expect("compile generated MSL");
+
+        let x = ctx.upload_f32(input);
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&[n, 0u32]));
+
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&x), 0);
+        enc.set_buffer(1, Some(&params), 0);
+        // Flat grid over `n` elements, 256 per threadgroup.
+        let groups = n.div_ceil(256);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: groups as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        ctx.read_f32(&x, input.len())
+    }
+
+    #[test]
+    fn gelu_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        // Ragged length exercises the bounds check; the fixture spans the clamp.
+        let input = gelu_inputs(1000);
+        let got = run_gelu(&ctx, &input);
+        assert_gelu("msl gelu n=1000", &input, &got);
+    }
+
+    fn run_elementwise(
+        ctx: &MetalContext,
+        entry: &str,
+        a: &[f32],
+        b: &[f32],
+        scale_bits: u32,
+    ) -> Vec<f32> {
+        let n = a.len() as u32;
+        let pipeline = ctx
+            .create_pipeline(shaders::ELEMENTWISE_SLANG, entry)
+            .expect("compile generated MSL");
+
+        let a_buf = ctx.upload_f32(a);
+        let b_buf = ctx.upload_f32(b);
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&[n, scale_bits]));
+
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&a_buf), 0);
+        enc.set_buffer(1, Some(&b_buf), 0);
+        enc.set_buffer(2, Some(&params), 0);
+        let groups = n.div_ceil(256);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: groups as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        ctx.read_f32(&a_buf, a.len())
+    }
+
+    /// All four shared entry points against their references. add/mul are
+    /// bit-exact; scaled_add and silu_mul use a relative bound (FMA / exp).
+    #[test]
+    fn elementwise_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        let (a, b) = elementwise_inputs(1000);
+        let s = 0.75f32;
+
+        let got = run_elementwise(&ctx, "add_inplace", &a, &b, 0);
+        assert_eq!(got, elementwise_add_ref(&a, &b), "msl elementwise add");
+
+        let got = run_elementwise(&ctx, "mul_inplace", &a, &b, 0);
+        assert_eq!(got, elementwise_mul_ref(&a, &b), "msl elementwise mul");
+
+        let got = run_elementwise(&ctx, "scaled_add_inplace", &a, &b, s.to_bits());
+        assert_close(
+            "msl elementwise scaled_add",
+            &got,
+            &elementwise_scaled_add_ref(&a, &b, s),
+            1e-6,
+        );
+
+        let got = run_elementwise(&ctx, "silu_mul_inplace", &a, &b, 0);
+        assert_close(
+            "msl elementwise silu_mul",
+            &got,
+            &elementwise_silu_mul_ref(&a, &b),
+            1e-5,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_rope(
+        ctx: &MetalContext,
+        q: &[f32],
+        k: &[f32],
+        pos: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        freq_base: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let pipeline = ctx
+            .create_pipeline(shaders::ROPE_SLANG, "rope")
+            .expect("compile generated MSL");
+
+        let q_buf = ctx.upload_f32(q);
+        let k_buf = ctx.upload_f32(k);
+        // The metal branch reads only params[0..4]: no rope_type / freq_factors.
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&[
+            pos,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            freq_base.to_bits(),
+        ]));
+
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&q_buf), 0);
+        enc.set_buffer(1, Some(&k_buf), 0);
+        enc.set_buffer(2, Some(&params), 0);
+        let total = n_heads.max(n_kv_heads) * (head_dim / 2);
+        let groups = total.div_ceil(256);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: groups as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        (ctx.read_f32(&q_buf, q.len()), ctx.read_f32(&k_buf, k.len()))
+    }
+
+    /// The metal branch is NEOX-only (mirrors rope.metal); the interleaved and
+    /// freq_factors paths live only in the wgsl branch and are checked there.
+    #[test]
+    fn rope_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        let (n_heads, n_kv_heads, head_dim) = (8u32, 2u32, 32usize);
+        let pos = 7u32;
+        let freq_base = 10000.0f32;
+        let (q, k) = rope_inputs(n_heads as usize, n_kv_heads as usize, head_dim);
+
+        let (gq, gk) = run_rope(
+            &ctx,
+            &q,
+            &k,
+            pos,
+            n_heads,
+            n_kv_heads,
+            head_dim as u32,
+            freq_base,
+        );
+        let mut wq = q.clone();
+        let mut wk = k.clone();
+        rope_apply(&mut wq, n_heads as usize, pos, head_dim, freq_base, 0, None);
+        rope_apply(
+            &mut wk,
+            n_kv_heads as usize,
+            pos,
+            head_dim,
+            freq_base,
+            0,
+            None,
+        );
+        assert_close("msl rope neox q", &gq, &wq, 1e-4);
+        assert_close("msl rope neox k", &gk, &wk, 1e-4);
     }
 
     fn run_gemm(
