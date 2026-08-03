@@ -40,7 +40,13 @@ fn main() {
     // so it runs for either GPU feature and emits only the targets that feature
     // needs.
     let want_wgsl = std::env::var_os("CARGO_FEATURE_GPU").is_some();
-    let want_msl = std::env::var_os("CARGO_FEATURE_METAL").is_some();
+    // The Metal backend is itself cfg-gated to macOS/iOS, so gate MSL generation
+    // on the target OS too. Without this, `--all-features` on a non-Apple target
+    // would compile `.metal` and emit fallback `cargo:warning`s for shaders that
+    // nothing on that target can build or use.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let is_apple = target_os == "macos" || target_os == "ios";
+    let want_msl = std::env::var_os("CARGO_FEATURE_METAL").is_some() && is_apple;
     if want_wgsl || want_msl {
         compile_slang_multitarget(want_wgsl, want_msl);
     }
@@ -125,7 +131,7 @@ fn compile_slang_multitarget(want_wgsl: bool, want_msl: bool) {
 
     // (slangc target name, file extension). Extension doubles as the committed
     // fallback's suffix, so the two can never disagree.
-    let mut targets: Vec<(&str, &str)> = Vec::new();
+    let mut targets: Vec<(&str, &str)> = Vec::with_capacity(2);
     if want_wgsl {
         targets.push(("wgsl", "wgsl"));
     }
