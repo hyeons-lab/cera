@@ -385,6 +385,58 @@ fn add_rmsnorm_batch_ref(
     (new_src, dst)
 }
 
+/// Logits with a single, unambiguous maximum injected at `peak`, so the argmax
+/// is well defined and the metal (strict `>`) and wgsl (explicit tie-break)
+/// branches must agree. The base values span a small range and never reach the
+/// injected peak.
+fn argmax_inputs(n: usize, peak: usize) -> Vec<f32> {
+    let mut x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.001).sin() * 0.5).collect();
+    x[peak] = 10.0;
+    x
+}
+
+/// Reference argmax: strict `>` so the lower index wins on a tie. This matches
+/// the WGSL branch and the CPU `argmax` exactly; the Metal branch keeps the
+/// lower lane on a tie (not necessarily the lowest index), but the fixtures
+/// inject a unique peak so no tie is exercised.
+fn argmax_f32_ref(x: &[f32]) -> u32 {
+    let mut best = f32::NEG_INFINITY;
+    let mut best_i = 0u32;
+    for (i, &v) in x.iter().enumerate() {
+        if v > best {
+            best = v;
+            best_i = i as u32;
+        }
+    }
+    best_i
+}
+
+/// Deterministic single-vector input and per-element weight for RMSnorm.
+fn rmsnorm_inputs(n: usize) -> (Vec<f32>, Vec<f32>) {
+    let x = (0..n).map(|i| (i as f32 * 0.01).sin() * 2.0).collect();
+    let weight = (0..n)
+        .map(|j| 1.0 + 0.1 * (j as f32 * 0.04).cos())
+        .collect();
+    (x, weight)
+}
+
+/// Reference RMSnorm: `x * inv_rms(x) * weight`, sum of squares in f64 so the
+/// generated f32 kernel is held to a relative bound.
+fn rmsnorm_ref(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+    let n = x.len();
+    let sum_sq: f64 = x
+        .iter()
+        .map(|&v| {
+            let v = v as f64;
+            v * v
+        })
+        .sum();
+    let inv_rms = 1.0 / (sum_sq / n as f64 + eps as f64).sqrt();
+    (0..n)
+        .map(|i| (x[i] as f64 * inv_rms * weight[i] as f64) as f32)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Q8_0 GEMM fixtures
 //
@@ -1149,6 +1201,114 @@ mod wgsl {
         }
     }
 
+    fn run_argmax_f32(ctx: &GpuContext, x: &[f32]) -> u32 {
+        let n = x.len() as u32;
+        let pipeline =
+            ctx.create_pipeline(shaders::ARGMAX_F32_SLANG, "argmax_f32", "argmax_f32_slang");
+        let x_buf = ctx.upload_f32(x, "am_x");
+        let out_buf = ctx.upload_storage(bytemuck::cast_slice(&[0u32]), "am_out");
+        let params = ctx.upload_storage(bytemuck::cast_slice(&[n, 0u32]), "am_params");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            // Single workgroup by design: the kernel grid-strides over n.
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll_wait();
+        ctx.download_u32(&out_buf, 1)[0]
+    }
+
+    #[test]
+    fn argmax_f32_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        // Realistic vocab sizes; peak at the start, interior, and the grid-stride
+        // tail (last element) so the stride loop's end is exercised.
+        for (n, peak) in [(32768usize, 12345usize), (131072, 0), (131072, 131071)] {
+            let x = argmax_inputs(n, peak);
+            let got = run_argmax_f32(&ctx, &x);
+            assert_eq!(got, argmax_f32_ref(&x), "wgsl argmax n={n} peak={peak}");
+            assert_eq!(
+                got, peak as u32,
+                "wgsl argmax n={n}: got {got}, want peak {peak}"
+            );
+        }
+    }
+
+    // The wgsl rmsnorm branch is in-place: 3 bindings (x rw, weight, params).
+    fn run_rmsnorm(ctx: &GpuContext, x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+        let n = x.len() as u32;
+        let pipeline = ctx.create_pipeline(shaders::RMSNORM_SLANG, "rmsnorm", "rmsnorm_slang");
+        let x_buf = ctx.upload_f32(x, "rn_x");
+        let w_buf = ctx.upload_f32(weight, "rn_w");
+        let params = ctx.upload_storage(
+            bytemuck::cast_slice(&[n, eps.to_bits(), 0u32, 0u32]),
+            "rn_params",
+        );
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: w_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            // Single workgroup by design; the kernel grid-strides over n.
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll_wait();
+        ctx.download_f32(&x_buf, x.len())
+    }
+
+    #[test]
+    fn rmsnorm_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        let eps = 1e-5f32;
+        // Realistic hidden sizes plus a ragged n (not a multiple of 256).
+        for n in [4096usize, 8192, 2049] {
+            let (x, weight) = rmsnorm_inputs(n);
+            let got = run_rmsnorm(&ctx, &x, &weight, eps);
+            let want = rmsnorm_ref(&x, &weight, eps);
+            assert_close(&format!("wgsl rmsnorm n={n}"), &got, &want, 1e-4);
+        }
+    }
+
     fn run_gemm(
         ctx: &GpuContext,
         packed: &[u8],
@@ -1813,6 +1973,108 @@ mod msl {
         }
     }
 
+    fn run_argmax_f32(ctx: &MetalContext, x: &[f32]) -> u32 {
+        let n = x.len() as u32;
+        let pipeline = ctx
+            .create_pipeline(shaders::ARGMAX_F32_SLANG, "argmax_f32")
+            .expect("compile generated MSL");
+        let x_buf = ctx.upload_f32(x);
+        let out_buf = ctx.upload_bytes(bytemuck::cast_slice(&[0u32]));
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&[n, 0u32]));
+
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&x_buf), 0);
+        enc.set_buffer(1, Some(&out_buf), 0);
+        enc.set_buffer(2, Some(&params), 0);
+        // Single threadgroup of 256; the kernel grid-strides over n.
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        ctx.read_u32(&out_buf, 1)[0]
+    }
+
+    #[test]
+    fn argmax_f32_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        for (n, peak) in [(32768usize, 12345usize), (131072, 0), (131072, 131071)] {
+            let x = argmax_inputs(n, peak);
+            let got = run_argmax_f32(&ctx, &x);
+            assert_eq!(got, argmax_f32_ref(&x), "msl argmax n={n} peak={peak}");
+            assert_eq!(
+                got, peak as u32,
+                "msl argmax n={n}: got {got}, want peak {peak}"
+            );
+        }
+    }
+
+    // The metal rmsnorm branch is out-of-place: 4 buffers (src, dst, w, params).
+    fn run_rmsnorm(ctx: &MetalContext, x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+        let n = x.len() as u32;
+        let pipeline = ctx
+            .create_pipeline(shaders::RMSNORM_SLANG, "rmsnorm")
+            .expect("compile generated MSL");
+        let src_buf = ctx.upload_f32(x);
+        let dst_buf = ctx.upload_f32(&vec![0.0f32; x.len()]);
+        let w_buf = ctx.upload_f32(weight);
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&[n, eps.to_bits(), 0u32, 0u32]));
+
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&src_buf), 0);
+        enc.set_buffer(1, Some(&dst_buf), 0);
+        enc.set_buffer(2, Some(&w_buf), 0);
+        enc.set_buffer(3, Some(&params), 0);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        ctx.read_f32(&dst_buf, x.len())
+    }
+
+    #[test]
+    fn rmsnorm_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        let eps = 1e-5f32;
+        for n in [4096usize, 8192, 2049] {
+            let (x, weight) = rmsnorm_inputs(n);
+            let got = run_rmsnorm(&ctx, &x, &weight, eps);
+            let want = rmsnorm_ref(&x, &weight, eps);
+            assert_close(&format!("msl rmsnorm n={n}"), &got, &want, 1e-4);
+        }
+    }
+
     fn run_gemm(
         ctx: &MetalContext,
         packed: &[u8],
@@ -1961,6 +2223,27 @@ mod msl {
             "generated MSL lost simd_sum; __target_switch selected the portable tree"
         );
     }
+
+    /// argmax_f32's metal branch reduces the (value, index) pair with
+    /// `simd_shuffle_down`; a silent fall-through to the tree is correct but slow
+    /// and invisible to the numeric test.
+    #[test]
+    fn generated_argmax_keeps_simd_shuffle_down() {
+        assert!(
+            shaders::ARGMAX_F32_SLANG.contains("simd_shuffle_down"),
+            "generated MSL lost simd_shuffle_down; __target_switch selected the portable tree"
+        );
+    }
+
+    /// rmsnorm's metal branch keeps the simd reduction; a silent tree
+    /// fall-through is correct but slow and invisible to the numeric test.
+    #[test]
+    fn generated_rmsnorm_keeps_simd_sum() {
+        assert!(
+            shaders::RMSNORM_SLANG.contains("simd_sum"),
+            "generated MSL lost simd_sum; __target_switch selected the portable tree"
+        );
+    }
 }
 
 /// Slang reaches Metal's `simdgroup_matrix` hardware through `linalg::CoopMat`.
@@ -2071,6 +2354,8 @@ fn generated_wgsl_has_no_subgroup_ops() {
             "rmsnorm_batch",
             cera::backend::wgpu::shaders::RMSNORM_BATCH_SLANG,
         ),
+        ("argmax_f32", cera::backend::wgpu::shaders::ARGMAX_F32_SLANG),
+        ("rmsnorm", cera::backend::wgpu::shaders::RMSNORM_SLANG),
     ] {
         assert!(
             !src.contains("subgroup"),

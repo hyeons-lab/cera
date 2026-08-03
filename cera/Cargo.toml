@@ -140,6 +140,12 @@ required-features = ["metal"]
 name = "slang_norm_bench"
 required-features = ["metal"]
 
+# Phase 1b-ii: generated argmax_f32 and rmsnorm against their handwritten twins.
+# Metal-only for the same reason.
+[[example]]
+name = "slang_norm2_bench"
+required-features = ["metal"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true

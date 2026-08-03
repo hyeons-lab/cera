@@ -150,6 +150,13 @@ impl MetalContext {
         unsafe { std::slice::from_raw_parts(ptr, count).to_vec() }
     }
 
+    /// Read `count` u32 values back from a shared buffer (e.g. an argmax index
+    /// output), the integer analog of [`Self::read_f32`].
+    pub fn read_u32(&self, buf: &Buffer, count: usize) -> Vec<u32> {
+        let ptr = buf.contents() as *const u32;
+        unsafe { std::slice::from_raw_parts(ptr, count).to_vec() }
+    }
+
     /// Create a MTLCounterSampleBuffer backed by the device's hardware timestamp
     /// counter. Used for GPU-timestamped per-dispatch profiling. Returns None if
     /// the device doesn't expose timestamp counters.
@@ -199,6 +206,16 @@ pub mod shaders {
     pub const ELEMENTWISE_SLANG: &str =
         include_str!(concat!(env!("OUT_DIR"), "/elementwise.metal"));
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.metal");
+    /// Same kernel as [`RMSNORM`], generated from `shaders/slang/rmsnorm.slang`
+    /// by build.rs and shared with the wgpu backend's
+    /// [`super::super::wgpu::shaders::RMSNORM_SLANG`]. A `__target_switch` port
+    /// that diverges in both reduction and I/O model: the metal branch is
+    /// out-of-place (src -> dst, 4 buffers) with a two-stage `simd_sum`; the wgsl
+    /// branch is in-place (3 bindings) with a shared-memory tree. Each branch's
+    /// binding set is dropped for the other target. Not yet on the production
+    /// path: `tests/slang_multitarget_parity.rs` pins it against the CPU
+    /// reference.
+    pub const RMSNORM_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm.metal"));
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.metal");
     /// Same kernel as [`PER_HEAD_RMSNORM`], generated from
     /// `shaders/slang/per_head_rmsnorm.slang` by build.rs and shared with the
@@ -241,6 +258,14 @@ pub mod shaders {
     pub const ATTENTION_GQA: &str = include_str!("shaders/attention_gqa.metal");
     pub const ATTENTION_SPLITK: &str = include_str!("shaders/attention_splitk.metal");
     pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.metal");
+    /// Same kernel as [`ARGMAX_F32`], generated from
+    /// `shaders/slang/argmax_f32.slang` by build.rs and shared with the wgpu
+    /// backend's [`super::super::wgpu::shaders::ARGMAX_F32_SLANG`]. A
+    /// `__target_switch` port: the metal branch keeps the two-stage
+    /// `simd_shuffle_down` value+index reduction, the wgsl branch the
+    /// shared-memory tree. Not yet on the production path:
+    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
+    pub const ARGMAX_F32_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/argmax_f32.metal"));
     pub const GEMV_Q4_0_BATCH: &str = include_str!("shaders/gemv_q4_0_batch.metal");
     pub const RMSNORM_BATCH: &str = include_str!("shaders/rmsnorm_batch.metal");
     /// Same two kernels as [`RMSNORM_BATCH`] (`rmsnorm_batch` +
