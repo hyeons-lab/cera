@@ -15,9 +15,11 @@
 // Mirrors `conv1d_fused.metal` (Metal port shipped in PR #145) and
 // the per-token slice of `conv1d_fused_batch.wgsl` (PR #154).
 //
-// Constraints: kernel_size ≤ 4, d_conv ≤ 3 (LFM2 uses ks=4,
-// d_conv=3). Out-of-range params return early — same OOB guard the
-// batched twin uses.
+// No kernel-size constraint: this kernel indexes the rolling buffer
+// and weights dynamically, so it is correct for any d_conv. Shipped
+// LFM2 GGUFs set `lfm2.shortconv.l_cache = 3`, giving ks=3 and
+// d_conv=2. (`conv1d_fused_batch` does constrain ks ≤ 4 / d_conv ≤ 3,
+// because it stages the weights and state in fixed-size registers.)
 //
 // Bind group 0:
 //   @binding(0) proj: array<f32>     (read; 3*hs floats, [x, c, b] flat)
@@ -42,10 +44,17 @@ fn conv1d_fused(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d_conv = params.z;
 
     if ch >= hs { return; }
-    // Static guard: rbuffer/weight indexing assumes LFM2's
-    // ks=4 / d_conv=3. Bail on host-side dispatches with
-    // out-of-range params.
-    if ks > 4u || d_conv > 3u { return; }
+    // No kernel-size guard: every index below is dynamic
+    // (`rbuffer[k * hs + ch]`, `weight[ch * ks + k]`) with no
+    // fixed-size array to overrun, so this is correct for any
+    // d_conv. This used to carry a `ks > 4 || d_conv > 3`
+    // early-out, which could only convert a correct result into a
+    // skipped write leaving `output` stale from the previous
+    // layer. `conv1d_fused_batch` is the kernel that needs such a
+    // bound, for its register arrays. `2 <= kernel_size <= 4` is
+    // enforced at load by `validate_conv_kernel_size` in
+    // `model/lfm2.rs`, so the loop below cannot be driven by a
+    // malformed GGUF.
 
     let x_val = proj[ch];
     let c_val = proj[hs + ch];

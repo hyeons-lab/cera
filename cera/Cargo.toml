@@ -146,6 +146,12 @@ required-features = ["metal"]
 name = "slang_norm2_bench"
 required-features = ["metal"]
 
+# Phase 1c-i: the generated conv tier against its handwritten twins. Metal-only
+# for the same reason.
+[[example]]
+name = "slang_conv_bench"
+required-features = ["metal"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true

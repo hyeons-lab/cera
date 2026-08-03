@@ -15,8 +15,9 @@ committed outputs against what the pinned slangc produces, so a stale `.metal`
 or `.wgsl` fails the build rather than silently shipping to a device.
 
 Nothing here is on the production path yet. Each generated kernel sits beside its
-handwritten twin and only `tests/slang_multitarget_parity.rs` dispatches it, so a
-wrong generated kernel breaks nothing. This is an evaluation.
+handwritten twin and only `tests/slang_multitarget_parity.rs` and the
+`examples/slang_*_bench.rs` benches dispatch it, so a wrong generated kernel
+breaks nothing. This is an evaluation.
 
 ## The one primitive that makes it work: `__target_switch`
 
@@ -138,12 +139,28 @@ Performance (release matters; a debug build measures the harness):
 ```sh
 cargo run -p cera --features metal --release --example slang_softmax_bench
 cargo run -p cera --features metal --release --example slang_gemm_bench
+cargo run -p cera --features metal --release --example slang_elementwise_bench
+cargo run -p cera --features metal --release --example slang_norm_bench
+cargo run -p cera --features metal --release --example slang_norm2_bench
+cargo run -p cera --features metal --release --example slang_conv_bench
 ```
 
-Both benches print an agreement check first (a faster arm that disagrees is not a
-faster arm), then interleave the two kernels round by round and report the median
-ratio, because uninterleaved wall-clock timing of microsecond kernels drifts.
-`slang_gemm_bench` also prints `maxTotalThreadsPerThreadgroup` for both kernels:
-it is the register-pressure proxy (the driver sets it from registers per thread,
-so lower means a heavier kernel and lower occupancy) that located the dequant as
-the bottleneck.
+Every bench prints an agreement check first (a faster arm that disagrees is not a
+faster arm), then interleaves the two kernels round by round and reports the
+median ratio, because uninterleaved wall-clock timing of microsecond kernels
+drifts. `slang_gemm_bench` also prints `maxTotalThreadsPerThreadgroup` for both
+kernels: it is the register-pressure proxy (the driver sets it from registers per
+thread, so lower means a heavier kernel and lower occupancy) that located the
+dequant as the bottleneck.
+
+Treat the bench as a required step per tier, not an optional extra. It is what
+caught both of these in the first place: a `pow`/`powr` divergence in `rope` that
+was numerically invisible at small positions, and a 0.72x regression in
+`conv1d_fused_batch` whose output was bit-identical to the handwritten kernel.
+Neither is something a correctness test can see: the `rope` divergence because
+both kernels are compared to the CPU rather than to each other, and the 0.72x
+because the kernel stayed bit-identical and only got slower. Once a bench has
+located a
+codegen regression, pin it with a cheap structural assertion so the next one
+fails a test rather than waiting for someone to re-run the bench:
+`generated_conv_batch_unrolls_its_register_loops` does that for the 0.72x case.

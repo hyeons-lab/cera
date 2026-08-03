@@ -1223,6 +1223,20 @@ pub mod shaders {
         include_str!(concat!(env!("OUT_DIR"), "/rmsnorm_batch.wgsl"));
     pub const QK_NORM_ROPE_BATCH: &str = include_str!("shaders/qk_norm_rope_batch.wgsl");
     pub const CONV1D_FUSED_BATCH: &str = include_str!("shaders/conv1d_fused_batch.wgsl");
+    /// Same kernel as [`CONV1D_FUSED_BATCH`], generated from
+    /// `shaders/slang/conv1d_fused_batch.slang` by build.rs and shared with the
+    /// Metal backend's
+    /// [`super::super::metal::shaders::CONV1D_FUSED_BATCH_SLANG`]. A clean
+    /// single-body port with no `__target_switch`: the two handwritten twins
+    /// share an element type, a binding contract and an entry name, and neither
+    /// has a reduction. They do differ in loop spelling (this one has no C-style
+    /// `for`), in the weight preload bound, and in whether they carry the
+    /// `ks > 4 || d_conv > 3` early-out (this WGSL twin does, the Metal one does
+    /// not); the `.slang` header explains how the shared body reconciles those.
+    /// Not yet on the production path:
+    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
+    pub const CONV1D_FUSED_BATCH_SLANG: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/conv1d_fused_batch.wgsl"));
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.wgsl");
     /// Same kernel as [`PER_HEAD_RMSNORM`], generated from
     /// `shaders/slang/per_head_rmsnorm.slang` by build.rs and shared with the
@@ -1287,7 +1301,30 @@ pub mod shaders {
     /// (`n_queries = 1`) and chunked prefill from one entry point.
     pub const FLASH_ATTENTION_TQ: &str = include_str!("shaders/flash_attention_tq.wgsl");
     pub const CONV1D: &str = include_str!("shaders/conv1d.wgsl");
+    /// Same kernel as [`CONV1D`], generated from `shaders/slang/conv1d.slang` by
+    /// build.rs and shared with the Metal backend's
+    /// [`super::super::metal::shaders::CONV1D_SLANG`]. Unlike the norm tier this
+    /// is a clean single-body port: the two handwritten twins already agreed on
+    /// element type, bindings and entry name, and there is no reduction or
+    /// subgroup op, so there is no `__target_switch`. Not yet on the production
+    /// path: `tests/slang_multitarget_parity.rs` pins it against the CPU
+    /// reference.
+    pub const CONV1D_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/conv1d.wgsl"));
     pub const CONV1D_FUSED: &str = include_str!("shaders/conv1d_fused.wgsl");
+    /// Same kernel as [`CONV1D_FUSED`], generated from
+    /// `shaders/slang/conv1d_fused.slang` by build.rs and shared with the Metal
+    /// backend's [`super::super::metal::shaders::CONV1D_FUSED_SLANG`]. A clean
+    /// single-body port with no `__target_switch`, made possible by first
+    /// consolidating the Metal twin onto this WGSL twin's single packed `proj`
+    /// binding. Neither this twin nor the port carries a kernel-size guard:
+    /// nothing here indexes a fixed-size array, so a bound could only convert a
+    /// correct result into a skipped write that leaves the output stale.
+    /// (`CONV1D_FUSED_BATCH` does constrain its params, because it stages the
+    /// weights and rolling state in fixed-size registers.) Not yet on the
+    /// production path: `tests/slang_multitarget_parity.rs` pins it against the
+    /// CPU reference.
+    pub const CONV1D_FUSED_SLANG: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/conv1d_fused.wgsl"));
     // Vision-encoder (ViT) kernels.
     pub const LAYERNORM_BATCH: &str = include_str!("shaders/layernorm_batch.wgsl");
     /// Same kernel as [`LAYERNORM_BATCH`], generated from
