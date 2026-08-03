@@ -4,42 +4,139 @@ The reference every perf task (T1-T10) diffs against. Re-measure with the same
 commands before claiming a delta: a throughput number without a matching
 profile/counter movement is not evidence.
 
-**Model:** LFM2.5-350M-Q4_K_M (the most common real-world quant).
-**Settings:** prefill 512 / decode 128, `--no-cache`, medians (p50) over >=5 runs.
+**Primary model:** LFM2.5-350M-Q4_K_M (the most common real-world quant); the Mac
+section adds Llama-3.2-1B Q4_0 to cover the dense-transformer path.
+**Settings:** prefill 512, decode 128, `--no-cache`, medians (p50). Run counts and
+the decode-run prompt depth differ per section and are stated there; prefill and
+decode are always measured as separate runs (see the traps).
 
 **Sections carry their own provenance; they were not all measured at once:**
 
 | section | measured at | device |
 |---|---|---|
-| Android CPU/GPU table below | `c6f845d` (incl. #254) | Pixel 10 Pro Fold |
-| GPU I/O counters | mixed, see the † note | Mac / Adreno |
+| Android CPU/GPU table below | `b0ffd7e` (incl. #342) | Pixel 10 Pro Fold, TEC-cooled |
+| Mac cera vs llama.cpp | `b0ffd7e` (incl. #342) | M1 Max |
+| GPU I/O counters | mixed, see the † note in that section | Mac / Adreno |
 | GPU decode profile | `0f00dec` (incl. #316, #318, #319, #320) | M1 Max |
 
-**The Android GPU row has not been re-measured since `c6f845d`** and predates
-every wgpu decode change listed above. Do not read it as current: the same work
-is worth 1.78× on an M1 Max, and the Android number will have moved by some
-unknown amount. Re-running it needs the device.
+**Pin the llama.cpp build, and keep the binary.** The previous revision did name
+its build (`b9980`, vendored via pipette-llamacpp), which was right, but that
+binary is no longer on the device: what is there now is `f12cc6d0f` (9371). The
+two disagree by up to 2.45x on the same model, device and config (`-t 1` prefill:
+170.6 then, 69.7 now). Some of that spread is the cooling regime and the harness
+change rather than the build, exactly as for cera, so read it as "these numbers
+are not comparable" rather than as a measured build regression. Naming the build
+is necessary but not sufficient. A
+llama row is only reproducible if the binary it was measured with still exists.
+Note 9371 is *older* than b9980; it is simply what is staged on the device, and
+no attempt was made to pick a favourable one.
 
-## Android: Pixel 10 Pro Fold (Tensor G5), on a fan
+## Android: Pixel 10 Pro Fold (Tensor G5), TEC-cooled
 
 8 cores: 2 efficiency (cpu0-1) + 5 perf (cpu2-6) + 1 prime (cpu7).
 CPU has `asimddp` + `i8mm`.
 
-| Engine | Config | Prefill | Decode |
+cera `b0ffd7e`, llama.cpp `f12cc6d0f` (9371), `scripts/bench_android.sh` with
+separate prefill/decode runs and interleaved engines, 5 runs, `--settle 30`.
+Battery 27.6 -> 30.2 C across the matrix.
+
+| Engine | Config | Prefill | Decode ‡ |
 |---|---|---:|---:|
-| **cera** CPU | default RowPool | **102** | **70.3** |
-| cera CPU | pinned prime (`taskset 80`) | 113 | 66.1 |
-| cera CPU | pinned perf cluster (`taskset 7c`) | 49 | 46.5 |
-| **cera** GPU | wgpu / Vulkan (stale, see above) | 12 | 11.2 |
-| llama.cpp | `-t 1` pinned prime | 170.6 | 73.3 |
-| llama.cpp | `-t 5` pinned perf | 261.1 | **85.7** |
-| llama.cpp | `-t 6` pinned perf+prime | **393.5** | 70.8 |
+| cera CPU | default RowPool | **208 +/- 6** | 63.0 +/- 10.6 |
+| cera CPU | pinned perf cluster (`taskset 7c`) | 93 +/- 2 | 75.7 +/- 2.9 |
+| cera CPU | pinned prime (`taskset 80`) | 75 +/- <1 | 60.6 +/- 3.1 |
+| cera GPU | wgpu / Vulkan | 92 +/- 1 | 20.7 +/- 0.3 |
+| llama.cpp | `-t 6` pinned perf+prime | **209.2** | 53.6 |
+| llama.cpp | `-t 1` pinned prime | 77.7 | 54.5 |
+| llama.cpp | `-t 5` pinned perf | 161.3 | 48.6 |
 
-Best-vs-best: **decode** cera 70.3 vs llama 85.7 (llama 1.22x) ·
-**prefill** cera 102 vs llama 393.5 (llama 3.9x).
+**Prefill is a tie: 208 +/- 6 against 209.2.** This is best-config against
+best-config, and cera's best is its unpinned `default RowPool` (which sizes
+itself and is the shipping configuration) against llama pinned across perf+prime;
+mask-matched, llama leads on every pinned pair. That is the headline correction of
+this revision. The previous entry reported llama 1.50x ahead on prefill, which
+was entirely an artifact: the harness measured cera with one combined
+`--prompt-tokens 512 --max-tokens 128` invocation while `llama-bench` times its
+`pp512` separately, and simply splitting the cera run moved it 149 -> 208.
 
-llama.cpp b9980 (vendored via pipette-llamacpp). It has no Android GPU backend
-in this runtime, so the GPU row is cera-CPU-vs-cera-GPU only.
+**‡ Decode is not measurable on this device at n=5, for either engine.** Do not
+quote a decode ratio from this table. Across five matrices llama's own `-t 5`
+config, an unchanged binary at fixed settings, returned 62.7 / 60.8 / 91.2 / 43.4
+/ 48.6 tok/s, a 2.1x spread; cera's best config moved 66.7 / 83.7 / 95.3 / 61.3 /
+75.7 over the same matrices. Cooling flattens the trend but does not close this,
+so the residual is scheduler placement on big.LITTLE rather than temperature.
+Resolving it needs many more runs per config, not another matrix.
+
+For the same reason no code delta is claimed against the previous `c6f845d`
+entry: the decode column cannot support one, and the cooling regime changed too
+(that entry says "on a fan").
+
+llama.cpp's Vulkan build does run on this device's PowerVR GPU, and its prefill
+(638) is the highest prefill measured on the device, but it is excluded above: it
+logs `Compute pipeline creation failed for mul_mat_vec_q4_k_f32_f32`, decodes at
+3.06 tok/s, and a sustained decode run wedged the phone into a `watchdog,apc`
+reset. cera's wgpu row is the same GPU with neither failure, though at 20.7
+decode it is far below its own CPU path, so GPU is not the right choice on this
+device for either engine.
+
+## Mac: cera vs llama.cpp on M1 Max
+
+cera `b0ffd7e`, llama.cpp `75ad0b23e` (9770, Homebrew, BLAS + Metal), 15 runs
+each, p50 +/- stddev. Prefill and decode are separate runs on both sides, which
+is what `llama-bench` does internally and what the traps section explains.
+
+**LFM2.5-350M Q4_K_M**
+
+| Engine | Backend | Prefill | Decode |
+|---|---|---:|---:|
+| cera | Metal | 9274 +/- 181 | 281.9 +/- 49.4 |
+| llama.cpp | Metal | 9933 +/- 821 | 235.0 +/- 37.6 |
+| cera | CPU (`blas`) | 1403 +/- 27 | 156.9 +/- 11.5 |
+| llama.cpp | CPU | 1381 +/- 44 | **308.5 +/- 17.4** |
+
+**Llama-3.2-1B Q4_0** (dense transformer, so a different model path)
+
+| Engine | Backend | Prefill | Decode |
+|---|---|---:|---:|
+| cera | Metal | 3439 +/- 46 | 182.1 +/- 21.5 |
+| llama.cpp | Metal | 3813 +/- 47 | 170.4 +/- 31.6 |
+| cera | CPU (`blas`) | 537 +/- 7 | 68.8 +/- 11.9 |
+| llama.cpp | CPU | 652 +/- 26 | **120.7 +/- 10.2** |
+
+**Three gaps here are larger than their own noise; the rest are not.** Taking
+each in turn rather than as one headline:
+
+- **llama.cpp CPU decode, 1.75-1.97x.** Unambiguous on both models, distributions
+  nowhere near overlapping (308.5 +/- 17.4 vs 156.9 +/- 11.5; 120.7 +/- 10.2 vs
+  68.8 +/- 11.9). This is the one clear engine-level gap in the whole file.
+- **llama.cpp Metal prefill on Llama-1B, 1.11x** (3813 +/- 47 vs 3439 +/- 46).
+  A 374 gap against ~46 stddev on both sides, so real despite being small.
+- **llama.cpp CPU prefill on Llama-1B, 1.21x** (652 +/- 26 vs 537 +/- 7).
+
+Not resolvable at this sample size:
+
+- **Metal decode.** Medians favour cera (1.20x on 350M, 1.07x on 1B) but the
+  coefficients of variation are 17.5% and 11.8% for cera against 16.0% and 18.5%
+  for llama, so the distributions overlap. Across four sessions cera's 350M Metal
+  decode p50 came back 345.0 / 324.9 / 291.6 / 281.9, spanning the entire claimed
+  effect. Do not quote a Metal decode ratio from a single matrix.
+- **Metal prefill on 350M** (9933 +/- 821 vs 9274 +/- 181): llama's own stddev is
+  wider than the 659 gap.
+- **CPU prefill on 350M** (1403 +/- 27 vs 1381 +/- 44): inside both stddevs.
+
+Note the decode comparisons carry the same KV-depth asymmetry as the Android
+table: cera decodes from a 128-token prompt while `llama-bench`'s `tg` starts
+from an empty context, which disfavours cera. A cera decode win is therefore a
+lower bound, and a llama decode win is not inflated by it.
+
+cera's CPU rows use the opt-in `blas` feature, because llama.cpp always links
+BLAS and a no-BLAS comparison is not like-for-like. Measured both ways in one session on
+LFM2.5-350M Q4_K_M, `blas` is worth 2.62x on prefill (1403 vs 535) and is within
+noise on decode (156.9 vs 149.7), as expected for a GEMM-vs-GEMV split. Both
+halves come from the same session on purpose: the backend-comparison table in
+`README.md` reports 434 for that same no-BLAS cell at an older commit, and a 23%
+unexplained gap on one cell is exactly why a ratio should not be assembled from
+numbers taken at different times.
 
 ## GPU I/O counters (`cera bench --gpu-io`)
 
@@ -268,13 +365,24 @@ Read:
 ```bash
 # Android (build first: cargo ndk -t arm64-v8a build --release -p cera-cli --features gpu)
 scripts/bench_android.sh --model LFM2.5-350M-Q4_K_M.gguf --serial <adb-serial> \
-  --llama-bench /data/local/tmp/.../llama-bench
+  --llama-bench /data/local/tmp/.../llama-bench --settle 30 --decode-prompt 128
 
 # Android CPU profile (hotspot must move when a kernel task lands)
 scripts/profile_android_cpu.sh --model LFM2.5-350M-Q4_K_M.gguf --mask 80
 
 # Mac / desktop matrix
 scripts/bench_matrix.sh
+
+# Mac cera vs llama.cpp, matched to llama-bench's separate pp/tg runs
+cera bench -m <model.gguf> --device metal --no-cache --context-size 8192 \
+  --prompt-tokens 512 --max-tokens 0   --runs 15 --warmup 3   # prefill
+cera bench -m <model.gguf> --device metal --no-cache --context-size 8192 \
+  --prompt-tokens 128 --max-tokens 128 --runs 15 --warmup 3   # decode
+# CPU rows: same two commands with --device cpu
+llama-bench -m <model.gguf> -p 512 -n 128 -ngl 99 -r 15   # Metal rows
+llama-bench -m <model.gguf> -p 512 -n 128 -ngl 0  -r 15   # CPU rows
+# cera CPU rows need the opt-in BLAS feature to match llama's always-on BLAS:
+#   cargo build --release -p cera-cli --features gpu,metal,blas
 
 # Per-kernel GPU timestamps (prints a span table per forward pass, to stderr)
 CERA_GPU_PROFILE=1 cera bench -m <model.gguf> --device gpu \
@@ -284,11 +392,41 @@ CERA_GPU_PROFILE=1 cera bench -m <model.gguf> --device gpu \
 ## Known measurement traps
 
 - **Don't trust an unpinned multithreaded run.** Free-scheduled runs on
-  big.LITTLE were bimodal (llama `-t 4` came back `100 ± 99` pp512). Every
-  number above is from a pinned config; the pinned re-runs are stable
-  (llama `-t 1`: `73.3 ± 0.26`).
-- **Warm the device.** cera's first Android numbers were ~15% low because runs
-  1-2 were cold; `--warmup 2` fixed it. `bench` prints thermal headroom per run;
-  if it climbs toward 1.0, the number is thermally limited, not a ceiling.
+  big.LITTLE were bimodal (llama `-t 4` came back `100 ± 99` pp512), and pinning
+  is what made them repeatable. Not every row above is pinned: cera's headline
+  `default RowPool` row and the wgpu row are deliberately unpinned, because
+  RowPool sizes itself and that is the shipping configuration. Compare pinned to
+  pinned when attributing a difference to a kernel.
+- **Warm the run, cool the device.** These are different things and both matter.
+  cera's first Android numbers were ~15% low because runs 1-2 were cold, which
+  `--warmup 2` fixed; that is warming the *clocks and caches*. Letting the SoC
+  heat across a matrix is the opposite problem, and costs far more (see the
+  cooling note below). `bench` prints thermal headroom per run; if it climbs
+  toward 1.0 the number is thermally limited, not a ceiling.
 - **`--no-cache` matters.** Without it the KV prefix cache makes prefill look
   arbitrarily fast on repeat runs.
+- **Measure prefill with `--max-tokens 0`.** Timing prefill in a run that also
+  decodes reads ~10% low and inflates variance ~8x (LFM2.5-350M Q4_K_M on Metal,
+  one session: 9228 p50 / 128 stddev with `--max-tokens 0`, versus 8259 p50 /
+  1028 stddev with `--max-tokens 128`, same binary and model. The table above
+  reports 9274 for that cell from a later session; session-to-session drift of
+  that size is normal here and is why the tables carry stddev). `llama-bench` measures `pp` and `tg`
+  as separate runs, so comparing its prefill against a combined cera run
+  understates cera by that margin. Decode is the mirror image: it wants a
+  realistic prompt, so measure it separately with `--prompt-tokens 128
+  --max-tokens 128`.
+- **Cool the phone, and prove it stayed cool.** Thermal state dominates
+  everything else on Android. The same matrix on the same commit gave best decode
+  95.3 (battery 27.8 -> 28.8 C, TEC cooler) and 61.3 (27.6 -> 32.3 C, cooler
+  ineffective). Record battery temperature before and after and discard runs where
+  it climbs more than ~1-2 C.
+- **Engine ordering is a thermal bias.** `scripts/bench_android.sh` used to run
+  every cera config before llama, so without active cooling llama was measured on
+  a hotter device, biasing every ratio in cera's favour. It now interleaves the
+  two engines and defaults to `--settle 30`. The Android table above was
+  re-measured under the fixed script; any older Android number quoted elsewhere
+  in the repo predates it and carries the bias.
+- **Use the other engine as a control.** When a re-run moved cera decode 95.3 ->
+  61.3 it also moved llama 91.2 -> 50.9. Since no cera commit can affect
+  llama.cpp, that identified the run as thermally compromised rather than a
+  regression, which a cera-only measurement could not have done.

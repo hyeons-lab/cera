@@ -17,6 +17,7 @@
 #   scripts/bench_android.sh --model <name.gguf> [--serial <adb-serial>]
 #                            [--llama-bench <path-on-device>]
 #                            [--prompt 512] [--decode 128] [--runs 5]
+#                            [--decode-prompt 128] [--settle 30]
 #
 # The model must already be on the device at $DEVICE_DIR/<name.gguf>, and the
 # cera binary is pushed from target/aarch64-linux-android/release/cera (build
@@ -29,8 +30,18 @@ SERIAL="${CERA_ANDROID_SERIAL:-}"
 LLAMA_BENCH=""
 PROMPT=512
 DECODE=128
+# Prompt depth cera's decode run starts from. This is the one axis the two
+# harnesses do NOT match: llama-bench's `tg` always starts from an empty context
+# and this script does not pass its `-d/--n-depth`, so cera decodes at greater KV
+# depth. That disfavours cera, so a cera decode win here is a lower bound; keep
+# this small rather than inheriting $PROMPT, which made the gap much worse.
+DECODE_PROMPT=128
 RUNS=5
 WARMUP=2
+# Seconds to idle between measurements. Thermal state dominates on a phone and
+# back-to-back runs drift downward, so this defaults ON; pass `--settle 0` to opt
+# out when you only want a quick smoke run rather than comparable numbers.
+SETTLE=30
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,6 +52,8 @@ while [[ $# -gt 0 ]]; do
     --decode)      DECODE="$2"; shift 2 ;;
     --runs)        RUNS="$2"; shift 2 ;;
     --warmup)      WARMUP="$2"; shift 2 ;;
+    --decode-prompt) DECODE_PROMPT="$2"; shift 2 ;;
+    --settle)      SETTLE="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -78,58 +91,90 @@ echo "==> pushing cera to $DEVICE_DIR"
 #   80     = prime core only (cpu7)
 #   fc     = perf + prime (cpu2-7)
 #   7c     = perf cluster only (cpu2-6)
+# Prefill and decode are measured in SEPARATE invocations, and this is not
+# cosmetic. Timing prefill in a run that also decodes reads it ~10% low with ~8x
+# the variance, and llama-bench times its `pp` and `tg` runs separately, so a
+# combined cera run silently biases every cross-engine prefill ratio against
+# cera. Decode likewise wants its own run: llama-bench's `tg` starts from an
+# empty context, so decoding after a 512-token prefill compares different KV
+# depths. See "Known measurement traps" in benchmarks/BASELINE.md.
 run_cera() {
   local backend="$1" label="$2" mask="$3"
   local pin=""; [[ -n "$mask" ]] && pin="taskset $mask "
-  local cmd="cd $DEVICE_DIR && ${pin}./cera bench -m $MODEL --device $backend \
---prompt-tokens $PROMPT --max-tokens $DECODE --runs $RUNS --warmup $WARMUP --no-cache --gpu-io"
+  local base="cd $DEVICE_DIR && ${pin}./cera bench -m $MODEL --device $backend \
+--runs $RUNS --warmup $WARMUP --no-cache --gpu-io"
 
   echo "=== cera $backend [$label] ===" | tee -a "$LOG"
-  local out
-  if ! out=$("${ADB[@]}" shell "$cmd" 2>&1); then
-    echo "$out" >> "$LOG"
+  local pre_out dec_out
+  if ! pre_out=$("${ADB[@]}" shell "$base --prompt-tokens $PROMPT --max-tokens 0" 2>&1); then
+    echo "$pre_out" >> "$LOG"
     echo "cera,$backend,$label,FAIL,FAIL,FAIL,FAIL" >> "$OUT"
     return
   fi
-  echo "$out" >> "$LOG"
+  # Decode measures right after a full prefill run; settle so it is not timed on
+  # the heat that run just produced.
+  settle
+  if ! dec_out=$("${ADB[@]}" shell "$base --prompt-tokens $DECODE_PROMPT --max-tokens $DECODE" 2>&1); then
+    echo "${dec_out:-}" >> "$LOG"
+    echo "cera,$backend,$label,FAIL,FAIL,FAIL,FAIL" >> "$OUT"
+    return
+  fi
+  echo "$pre_out" >> "$LOG"; echo "$dec_out" >> "$LOG"
 
-  local pre dec
-  pre=$(grep -E "^prefill tok/s:" <<<"$out" | head -1)
-  dec=$(grep -E "^decode tok/s:"  <<<"$out" | head -1)
-  local p50 d50 psd dsd
+  local pre dec p50 d50 psd dsd
+  # `|| true` on every grep: under `set -euo pipefail` a non-matching grep in a
+  # command substitution aborts the whole script, which would silently kill the
+  # rest of the matrix instead of writing the FAIL row handled above.
+  pre=$(grep -E "^prefill tok/s:" <<<"$pre_out" | head -1 || true)
+  dec=$(grep -E "^decode tok/s:"  <<<"$dec_out" | head -1 || true)
   p50=$(sed -n 's/.*p50=\([0-9.]*\).*/\1/p' <<<"$pre")
   d50=$(sed -n 's/.*p50=\([0-9.]*\).*/\1/p' <<<"$dec")
   psd=$(sed -n 's/.*stddev=\([0-9.]*\).*/\1/p' <<<"$pre")
   dsd=$(sed -n 's/.*stddev=\([0-9.]*\).*/\1/p' <<<"$dec")
   echo "cera,$backend,$label,$p50,$d50,$psd,$dsd" >> "$OUT"
   echo "  -> prefill p50=$p50 decode p50=$d50" | tee -a "$LOG"
-  # The --gpu-io line is the one that says whether a GPU change actually removed
-  # round-trips; keep it in the raw log where it can't be lost to CSV flattening.
-  grep -E "^gpu I/O" <<<"$out" | tee -a "$LOG" || true
+  # The --gpu-io lines say whether a GPU change actually removed round-trips;
+  # keep them in the raw log where they can't be lost to CSV flattening. Grep
+  # BOTH runs: `cera bench` skips the report when it generates no tokens, so the
+  # prefill-at-$PROMPT counters only ever appear in the decode run's output, and
+  # the prefill run contributes its own submit counts when it does report.
+  printf '%s\n%s\n' "$pre_out" "$dec_out" | grep -E "^gpu I/O" | tee -a "$LOG" || true
 }
 
-run_cera cpu "default-rowpool" ""
-run_cera cpu "pin-prime-80"    "80"
-run_cera cpu "pin-perf-7c"     "7c"
-run_cera gpu "wgpu-vulkan"     ""
-
 # llama.cpp reference, if a llama-bench is present on the device. Uses the same
-# model file so the comparison is same-quant, same-weights.
-if [[ -n "$LLAMA_BENCH" ]]; then
-  rt=$(dirname "$LLAMA_BENCH")
-  for cfg in "1:80" "5:7c" "6:fc"; do
-    t="${cfg%%:*}"; mask="${cfg##*:}"
-    echo "=== llama-bench -t $t (taskset $mask) ===" | tee -a "$LOG"
-    out=$("${ADB[@]}" shell "cd $rt && LD_LIBRARY_PATH=. taskset $mask ./$(basename "$LLAMA_BENCH") \
+# model file so the comparison is same-quant, same-weights. llama-bench already
+# times `pp` and `tg` as separate runs internally, which is what run_cera above
+# was changed to match.
+run_llama() {
+  [[ -n "$LLAMA_BENCH" ]] || return 0
+  local t="$1" mask="$2"
+  local rt; rt=$(dirname "$LLAMA_BENCH")
+  echo "=== llama-bench -t $t (taskset $mask) ===" | tee -a "$LOG"
+  local out
+  out=$("${ADB[@]}" shell "cd $rt && LD_LIBRARY_PATH=. taskset $mask ./$(basename "$LLAMA_BENCH") \
 -m $DEVICE_DIR/$MODEL -t $t -p $PROMPT -n $DECODE -r $RUNS -o md" 2>&1) || true
-    echo "$out" >> "$LOG"
-    # llama-bench md rows: | model | size | params | backend | threads | test | t/s |
-    pp=$(grep -E "\|[[:space:]]*pp$PROMPT[[:space:]]*\|" <<<"$out" | sed -n "s/.*|[[:space:]]*\\([0-9.]*\\) ±.*/\\1/p" | head -1)
-    tg=$(grep -E "\|[[:space:]]*tg$DECODE[[:space:]]*\|" <<<"$out" | sed -n "s/.*|[[:space:]]*\\([0-9.]*\\) ±.*/\\1/p" | head -1)
-    echo "llama.cpp,cpu,t$t-$mask,${pp:-NA},${tg:-NA},NA,NA" >> "$OUT"
-    echo "  -> pp=$pp tg=$tg" | tee -a "$LOG"
-  done
-fi
+  echo "$out" >> "$LOG"
+  # llama-bench md rows: | model | size | params | backend | threads | test | t/s |
+  local pp tg
+  pp=$(grep -E "\|[[:space:]]*pp${PROMPT}[[:space:]]*\|" <<<"$out" | sed -n "s/.*|[[:space:]]*\\([0-9.]*\\) ±.*/\\1/p" | head -1)
+  tg=$(grep -E "\|[[:space:]]*tg${DECODE}[[:space:]]*\|" <<<"$out" | sed -n "s/.*|[[:space:]]*\\([0-9.]*\\) ±.*/\\1/p" | head -1)
+  echo "llama.cpp,cpu,t$t-$mask,${pp:-NA},${tg:-NA},NA,NA" >> "$OUT"
+  echo "  -> pp=$pp tg=$tg" | tee -a "$LOG"
+}
+
+settle() { [[ "$SETTLE" -gt 0 ]] && sleep "$SETTLE" || true; }
+
+# Engines are INTERLEAVED. Running every cera config and then every llama config
+# measures llama on a hotter device, which is a systematic bias in cera's favour
+# whenever cooling is imperfect. Alternating spreads any residual thermal drift
+# across both engines instead of concentrating it in the one that runs last.
+run_cera cpu "default-rowpool" "";  settle
+run_llama 5 "7c";                   settle
+run_cera cpu "pin-prime-80"    "80"; settle
+run_llama 1 "80";                   settle
+run_cera cpu "pin-perf-7c"     "7c"; settle
+run_llama 6 "fc";                   settle
+run_cera gpu "wgpu-vulkan"     ""
 
 echo
 echo "==> $OUT"
