@@ -38,7 +38,9 @@ CPU has `asimddp` + `i8mm`.
 
 cera `b0ffd7e`, llama.cpp `f12cc6d0f` (9371), `scripts/bench_android.sh` with
 separate prefill/decode runs and interleaved engines, 5 runs, `--settle 30`.
-Battery 27.6 -> 30.2 C across the matrix.
+Battery 27.6 -> 30.2 C across the matrix. The llama rows carry no stddev because
+this matrix predates the harness change that keeps `llama-bench`'s `±` value; the
+next run will have it, which is what a decode claim here would need.
 
 | Engine | Config | Prefill | Decode ‡ |
 |---|---|---:|---:|

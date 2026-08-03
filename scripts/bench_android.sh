@@ -111,6 +111,9 @@ run_cera() {
     echo "cera,$backend,$label,FAIL,FAIL,FAIL,FAIL" >> "$OUT"
     return
   fi
+  # Log the prefill run as soon as it succeeds: if the decode run below fails we
+  # return early, and its output would otherwise be lost from the raw log.
+  echo "$pre_out" >> "$LOG"
   # Decode measures right after a full prefill run; settle so it is not timed on
   # the heat that run just produced.
   settle
@@ -119,7 +122,7 @@ run_cera() {
     echo "cera,$backend,$label,FAIL,FAIL,FAIL,FAIL" >> "$OUT"
     return
   fi
-  echo "$pre_out" >> "$LOG"; echo "$dec_out" >> "$LOG"
+  echo "$dec_out" >> "$LOG"
 
   local pre dec p50 d50 psd dsd
   # `|| true` on every grep: under `set -euo pipefail` a non-matching grep in a
@@ -131,7 +134,7 @@ run_cera() {
   d50=$(sed -n 's/.*p50=\([0-9.]*\).*/\1/p' <<<"$dec")
   psd=$(sed -n 's/.*stddev=\([0-9.]*\).*/\1/p' <<<"$pre")
   dsd=$(sed -n 's/.*stddev=\([0-9.]*\).*/\1/p' <<<"$dec")
-  echo "cera,$backend,$label,$p50,$d50,$psd,$dsd" >> "$OUT"
+  echo "cera,$backend,$label,${p50:-NA},${d50:-NA},${psd:-NA},${dsd:-NA}" >> "$OUT"
   echo "  -> prefill p50=$p50 decode p50=$d50" | tee -a "$LOG"
   # The --gpu-io lines say whether a GPU change actually removed round-trips;
   # keep them in the raw log where they can't be lost to CSV flattening. Grep
@@ -155,10 +158,18 @@ run_llama() {
 -m $DEVICE_DIR/$MODEL -t $t -p $PROMPT -n $DECODE -r $RUNS -o md" 2>&1) || true
   echo "$out" >> "$LOG"
   # llama-bench md rows: | model | size | params | backend | threads | test | t/s |
-  local pp tg
-  pp=$(grep -E "\|[[:space:]]*pp${PROMPT}[[:space:]]*\|" <<<"$out" | sed -n "s/.*|[[:space:]]*\\([0-9.]*\\) ±.*/\\1/p" | head -1)
-  tg=$(grep -E "\|[[:space:]]*tg${DECODE}[[:space:]]*\|" <<<"$out" | sed -n "s/.*|[[:space:]]*\\([0-9.]*\\) ±.*/\\1/p" | head -1)
-  echo "llama.cpp,cpu,t$t-$mask,${pp:-NA},${tg:-NA},NA,NA" >> "$OUT"
+  # Keep llama-bench's own `± stddev`: every claim in benchmarks/BASELINE.md is
+  # argued against dispersion, and dropping it made the llama rows the only ones
+  # that could not be tested for significance. `|| true` for the same reason as
+  # in run_cera: a changed md format must not abort the rest of the matrix.
+  local pprow tgrow pp tg ppsd tgsd
+  pprow=$(grep -E "\|[[:space:]]*pp${PROMPT}[[:space:]]*\|" <<<"$out" | head -1 || true)
+  tgrow=$(grep -E "\|[[:space:]]*tg${DECODE}[[:space:]]*\|" <<<"$out" | head -1 || true)
+  pp=$(sed -n "s/.*|[[:space:]]*\\([0-9.]*\\) ±.*/\\1/p" <<<"$pprow")
+  tg=$(sed -n "s/.*|[[:space:]]*\\([0-9.]*\\) ±.*/\\1/p" <<<"$tgrow")
+  ppsd=$(sed -n "s/.*± *\\([0-9.]*\\).*/\\1/p" <<<"$pprow")
+  tgsd=$(sed -n "s/.*± *\\([0-9.]*\\).*/\\1/p" <<<"$tgrow")
+  echo "llama.cpp,cpu,t$t-$mask,${pp:-NA},${tg:-NA},${ppsd:-NA},${tgsd:-NA}" >> "$OUT"
   echo "  -> pp=$pp tg=$tg" | tee -a "$LOG"
 }
 
