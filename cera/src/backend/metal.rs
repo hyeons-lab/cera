@@ -191,6 +191,21 @@ pub mod shaders {
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.metal");
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.metal");
     pub const SOFTMAX: &str = include_str!("shaders/softmax.metal");
+    /// Same kernel as [`SOFTMAX`], generated from `shaders/slang/softmax.slang`
+    /// by build.rs rather than hand-written, sharing that source with the wgpu
+    /// backend's [`super::super::wgpu::shaders::SOFTMAX_SLANG`]. Contract is
+    /// unchanged (buffer 0 = x in-place, buffer 1 = params) and the two-stage
+    /// `simd_max`/`simd_sum` reduction is preserved via `__target_switch`, so
+    /// this is not the portable-tree fallback. Not yet on the production path:
+    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
+    pub const SOFTMAX_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax.metal"));
+    /// Capability probe, not a kernel: nothing dispatches this. Pins that Slang
+    /// reaches Metal's `simdgroup_matrix` hardware through `linalg::CoopMat`,
+    /// which is what decides whether the eight hand-tuned `simdgroup_matrix`
+    /// GEMMs are portable at all. See `shaders/slang/coopmat_probe.slang`;
+    /// asserted in `tests/slang_multitarget_parity.rs`.
+    pub const COOPMAT_PROBE_SLANG: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/coopmat_probe.metal"));
     pub const ROPE: &str = include_str!("shaders/rope.metal");
     pub const QK_NORM_ROPE: &str = include_str!("shaders/qk_norm_rope.metal");
     pub const CONV1D: &str = include_str!("shaders/conv1d.metal");
@@ -208,6 +223,16 @@ pub mod shaders {
     pub const GEMM_Q4_K: &str = include_str!("shaders/gemm_q4_k.metal");
     pub const GEMM_Q5_K: &str = include_str!("shaders/gemm_q5_k.metal");
     pub const GEMM_Q8_0: &str = include_str!("shaders/gemm_q8_0.metal");
+    /// Slang port of [`GEMM_Q8_0`], generated from `shaders/slang/gemm_q8_0.slang`.
+    /// Same binding contract, same 64x32 tile, same 8 KB threadgroup budget, and
+    /// the same mixed `simdgroup_matrix<float>` x `simdgroup_matrix<half>` MMA,
+    /// reached through `linalg::CoopMat`. Two deliberate divergences (no
+    /// simdgroup-scoped barrier, and a two-round ragged epilogue) are documented
+    /// at the top of the .slang. Not on the production path: dispatched only by
+    /// `tests/slang_multitarget_parity.rs` and `examples/slang_gemm_bench.rs`,
+    /// the latter being the one that can tell whether the divergences cost
+    /// anything.
+    pub const GEMM_Q8_0_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/gemm_q8_0.metal"));
     pub const GEMM_Q6_K: &str = include_str!("shaders/gemm_q6_k.metal");
     pub const GEMM_F32: &str = include_str!("shaders/gemm_f32.metal");
     pub const GEMV_Q8_0: &str = include_str!("shaders/gemv_q8_0.metal");

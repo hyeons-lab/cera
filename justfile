@@ -42,6 +42,17 @@ slang:
         echo "==> slangc $name"
         "$SLANGC" "$f" -target spirv -O3 -entry main -stage compute -o "$dir/$name.spv"
     done
+    # Multi-target kernels: one source, WGSL *and* MSL. Unlike the SPIR-V
+    # kernels above, the entry point is the basename rather than `main`, because
+    # both backends look the kernel up by its own name.
+    dir=cera/src/backend/shaders/slang
+    for f in "$dir"/*.slang; do
+        name=$(basename "$f" .slang)
+        for target in wgsl metal; do
+            echo "==> slangc $name -> $target"
+            "$SLANGC" "$f" -target "$target" -O3 -entry "$name" -stage compute -o "$dir/$name.$target"
+        done
+    done
 
 # Run the CLI with arguments
 run *ARGS:

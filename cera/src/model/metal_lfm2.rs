@@ -246,8 +246,6 @@ struct MetalPipelines {
     #[allow(dead_code)]
     per_head_rmsnorm: ComputePipelineState,
     #[allow(dead_code)]
-    softmax: ComputePipelineState,
-    #[allow(dead_code)]
     rope: ComputePipelineState,
     #[allow(dead_code)]
     qk_norm_rope: ComputePipelineState,
@@ -647,7 +645,6 @@ impl MetalLfm2Model {
             silu_mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "silu_mul_inplace")?,
             rmsnorm: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm")?,
             per_head_rmsnorm: ctx.create_pipeline(shaders::PER_HEAD_RMSNORM, "per_head_rmsnorm")?,
-            softmax: ctx.create_pipeline(shaders::SOFTMAX, "softmax")?,
             rope: ctx.create_pipeline(shaders::ROPE, "rope")?,
             qk_norm_rope: ctx.create_pipeline(shaders::QK_NORM_ROPE, "qk_norm_rope")?,
             attention: ctx.create_pipeline(shaders::ATTENTION, "attention")?,

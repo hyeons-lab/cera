@@ -211,6 +211,25 @@ jobs:
               rc=1
             fi
           done
+          # Multi-target kernels: same staleness risk, and worse consequences.
+          # The MSL half is never compiled on this runner, so a stale
+          # `<name>.metal` would only surface on the Metal leg (or a user's
+          # device) with no indication that the committed file, not the .slang,
+          # was at fault. Entry point is the basename here, not `main`.
+          dir=cera/src/backend/shaders/slang
+          for f in "$dir"/*.slang; do
+            name=$(basename "$f" .slang)
+            for target in wgsl metal; do
+              "$slangc" "$f" -target "$target" -O3 -entry "$name" -stage compute \
+                -o "$RUNNER_TEMP/$name.$target"
+              if cmp -s "$RUNNER_TEMP/$name.$target" "$dir/$name.$target"; then
+                echo "ok: $name.$target matches slangc $SLANG_VER"
+              else
+                echo "::error file=$dir/$name.$target::committed $name.$target differs from slangc ${SLANG_VER} output; regenerate with slangc ${SLANG_VER} ('just slang') and commit it."
+                rc=1
+              fi
+            done
+          done
           exit $rc
       - name: Install Mesa lavapipe (software Vulkan)
         run: |
@@ -347,7 +366,8 @@ jobs:
             --test metal_shaders_parity \
             --test metal_turboquant_oracle \
             --test metal_kv_shift_oracle \
-            --test metal_params_layout
+            --test metal_params_layout \
+            --test slang_multitarget_parity
 
   build-release:
     name: Release Build

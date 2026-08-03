@@ -114,6 +114,20 @@ required-features = ["gpu"]
 name = "wgpu_gemv_bench"
 required-features = ["gpu"]
 
+# Generated-vs-handwritten MSL comparison for the Slang multi-target pilot.
+# Metal-only: the WGSL half of that pilot is already verified and the only
+# Vulkan device CI can reach is a software rasterizer, so there is nothing to
+# learn from a wgpu twin.
+[[example]]
+name = "slang_softmax_bench"
+required-features = ["metal"]
+
+# The measurement the Slang branch turns on: a generated simdgroup GEMM against
+# the hand-tuned one it would replace. Metal-only for the same reason.
+[[example]]
+name = "slang_gemm_bench"
+required-features = ["metal"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true

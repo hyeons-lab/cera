@@ -409,7 +409,6 @@ struct GpuPipelines {
     silu_mul_inplace: wgpu::ComputePipeline,
     rmsnorm: wgpu::ComputePipeline,
     per_head_rmsnorm: wgpu::ComputePipeline,
-    softmax: wgpu::ComputePipeline,
     rope: wgpu::ComputePipeline,
     /// n_keep context shift: re-rotate retained K cells by `R(-shift)` into
     /// scratch (the memcpy halves use `copy_buffer_to_buffer`). See `shift_kv`.
@@ -965,7 +964,6 @@ impl GpuLfm2Model {
                 "per_head_rmsnorm",
                 "per_head_rmsnorm",
             ),
-            softmax: ctx.create_pipeline(shaders::SOFTMAX, "softmax", "softmax"),
             rope: ctx.create_pipeline(shaders::ROPE, "rope", "rope"),
             kv_shift: ctx.create_pipeline(shaders::KV_SHIFT, "kv_shift", "kv_shift"),
             flash_attention: ctx.create_pipeline(

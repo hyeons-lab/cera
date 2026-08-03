@@ -1198,6 +1198,33 @@ pub mod shaders {
     pub const CONV1D_FUSED_BATCH: &str = include_str!("shaders/conv1d_fused_batch.wgsl");
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.wgsl");
     pub const SOFTMAX: &str = include_str!("shaders/softmax.wgsl");
+    /// Same kernel as [`SOFTMAX`], generated from `shaders/slang/softmax.slang`
+    /// by build.rs rather than hand-written, and byte-identical in contract
+    /// (binding 0 = x in-place, binding 1 = params). Not yet on the production
+    /// path: `tests/slang_multitarget_parity.rs` pins it against the CPU
+    /// reference so the generated MSL twin can be validated on real Metal
+    /// hardware before either replaces its handwritten counterpart.
+    pub const SOFTMAX_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax.wgsl"));
+    /// Capability probe, not a kernel: nothing dispatches this. Pins that a
+    /// `__target_switch` metal branch using `linalg::CoopMat` is eliminated
+    /// before entry-point validation, so the same source still emits valid WGSL
+    /// even though WGSL has no cooperative-matrix type. See
+    /// `shaders/slang/coopmat_probe.slang`; asserted in
+    /// `tests/slang_multitarget_parity.rs`.
+    ///
+    /// Deliberately never turned into a pipeline: its `half` operands make the
+    /// emission open with `enable f16`, and cera requests `SHADER_F16` only
+    /// when the adapter reports it.
+    pub const COOPMAT_PROBE_SLANG: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/coopmat_probe.wgsl"));
+    /// WGSL twin of the Slang Q8_0 GEMM. The `case metal:` branch that carries
+    /// the `simdgroup_matrix` tiling is eliminated here, so what remains is the
+    /// source's portable `default:` branch: an untiled correctness reference,
+    /// one dot product per output element. It is *not* a replacement for
+    /// [`MUL_MAT_REG_TILE`] and nothing dispatches it outside
+    /// `tests/slang_multitarget_parity.rs`, which uses it to prove that one
+    /// source can carry a cooperative-matrix path and still emit legal WGSL.
+    pub const GEMM_Q8_0_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/gemm_q8_0.wgsl"));
     pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.wgsl");
     pub const ROPE: &str = include_str!("shaders/rope.wgsl");
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.wgsl");
