@@ -15,9 +15,12 @@
 //   binding/buffer 4: residual  f32, read, only used by add_rmsnorm_batch (stride = src_stride)
 //
 // Dispatch: (rows, 1, 1) workgroups of 256. `residual` (binding 4) is referenced
-// only by add_rmsnorm_batch, so the rmsnorm_batch pipeline never binds it (the
-// per-entry bind group layout drops it), the same way each handwritten entry
-// point does.
+// only by add_rmsnorm_batch. The two targets handle the plain entry's unused
+// binding differently: on wgpu, naga drops binding 4 from the rmsnorm_batch bind
+// group layout, so nothing binds it; on Metal, the generated MSL still lists
+// `buffer(4)` in the rmsnorm_batch signature (Slang emits the shared binding for
+// both entries) but never reads it, so a Metal caller must bind any valid buffer
+// there (the parity test and slang_norm_bench do).
 //
 // Reduction divergence via `__target_switch` in `block_sum`: metal reduces the
 // sum of squares with a two-stage `simd_sum` (via `WaveActiveSum`), the portable

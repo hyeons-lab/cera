@@ -256,12 +256,16 @@ fn main() {
         .create_pipeline(shaders::RMSNORM_BATCH_SLANG, "add_rmsnorm_batch")
         .expect("add_rmsnorm_batch slang");
     {
+        // The generated `rmsnorm_batch` MSL declares `res_buf [[buffer(4)]]` for
+        // both entry points (Slang emits the shared binding) even though the
+        // plain entry never reads it, so bind a valid buffer at index 4 for every
+        // dispatch below, plain or fused, to keep the Metal debug layer quiet.
         let sa = ctx.upload_f32(&rb_src);
         let da = ctx.upload_f32(&vec![0.0f32; rows as usize * n]);
         run_once(
             &ctx,
             &rb_hand,
-            &[&sa, &da, &rb_w_buf, &rb_params_075],
+            &[&sa, &da, &rb_w_buf, &rb_params_075, &rb_res_buf],
             rows as u64,
         );
         let a = ctx.read_f32(&da, rows as usize * n);
@@ -270,7 +274,7 @@ fn main() {
         run_once(
             &ctx,
             &rb_slang,
-            &[&sb, &db, &rb_w_buf, &rb_params_075],
+            &[&sb, &db, &rb_w_buf, &rb_params_075, &rb_res_buf],
             rows as u64,
         );
         let b = ctx.read_f32(&db, rows as usize * n);
@@ -357,8 +361,8 @@ fn main() {
             &ctx,
             &rb_hand,
             &rb_slang,
-            &[&sh, &dh, &rb_w_buf, &rb_params_075],
-            &[&ss, &ds, &rb_w_buf, &rb_params_075],
+            &[&sh, &dh, &rb_w_buf, &rb_params_075, &rb_res_buf],
+            &[&ss, &ds, &rb_w_buf, &rb_params_075, &rb_res_buf],
             rows as u64,
         );
         print_row(&format!("rmsnorm_batch {rows}x{n}"), h, s);
