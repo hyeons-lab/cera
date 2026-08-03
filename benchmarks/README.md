@@ -104,7 +104,9 @@ Two GPU backends with runtime selection via `--device`:
   Metal/Vulkan/DX12/WebGPU. Still behind native Metal, but the gap is smaller
   than it was: decode on LFM2-VL-450M Q4_0 / M1 Max went 63.4 → 112.8 tok/s
   (**1.78×**) across #316/#318/#319/#320. Per-kernel breakdown in
-  [`BASELINE.md`](BASELINE.md).
+  [`BASELINE.md`](BASELINE.md). A fresh three-way CPU vs wgpu vs Metal table on
+  this machine is in [Backend comparison on Apple Silicon](#backend-comparison-on-apple-silicon-m1-max-cpu-vs-wgpu-vs-metal)
+  below.
 
 ### Decode throughput vs llama.cpp (greedy, M1 Max, Q4_0)
 
@@ -161,6 +163,85 @@ cera bench -m model.gguf --device metal --no-cache --context-size 8192 --prompt-
 llama-bench -m model.gguf -p 128  -n 0 -ngl 99 -r 20
 llama-bench -m model.gguf -p 1024 -n 0 -ngl 99 -r 20
 llama-bench -m model.gguf -p 4096 -n 0 -ngl 99 -r 20
+```
+
+### Backend comparison on Apple Silicon (M1 Max): CPU vs wgpu vs Metal
+
+Same machine, same build (`--features gpu,metal`), the three backends side by
+side. Measured 2026-08-02 on an Apple M1 Max (10-core, 64 GB), commit `50d62da`.
+Greedy (temperature 0), KV caching disabled (`--no-cache`), 20 runs after 3
+warmups, p50 reported. Numbers are `cera`-internal (not a llama.cpp comparison);
+use the tables above for the Metal-vs-llama.cpp view.
+
+Note on wgpu: on macOS the wgpu backend runs through wgpu's Metal HAL via naga.
+The Slang SPIR-V passthrough added in #333/#334 is Vulkan-only, so it does not
+engage here; these wgpu numbers are the naga-on-Metal path. The passthrough win
+shows up on Vulkan hardware (Pixel/PowerVR 1.53–1.61× prefill, AMD RDNA ~1.04×),
+not on Apple Silicon.
+
+The two comparison columns use different baselines on purpose: decode compares
+Metal to **CPU** (wgpu decode trails CPU here, so CPU is the meaningful floor),
+while prefill compares Metal to **wgpu** (both are batched-GEMM GPU paths, so
+wgpu is the meaningful GPU peer).
+
+**Decode (tok/s, p50; 128-token prompt, 128 tokens generated):**
+
+| Model          | Quant  | CPU | wgpu | Metal | Metal vs CPU |
+|----------------|--------|----:|-----:|------:|-------------:|
+| LFM2.5-VL-450M | Q4_0   | 196 |  154 |   324 | 1.65×        |
+| LFM2.5-350M    | Q4_K_M | 147 |  143 |   307 | 2.09×        |
+| Llama-3.2-1B   | Q4_0   |  67 |   71 |   171 | 2.55×        |
+| LFM2.5-VL-1.6B | Q8_0   |  78 |   34 |   146 | 1.87×        |
+
+(The Metal 450M decode here, 324, is the p50; its p90 is 351.6, which is where
+the 351 in the vs-llama.cpp table above lands. That table was measured at a
+different commit, and GPU-clock-ramp variance on this row spans the gap, so the
+two numbers are consistent, not contradictory.)
+
+**Prefill (tok/s, p50; 512-token prompt, no decode):**
+
+| Model          | Quant  | CPU | wgpu   | Metal | Metal vs wgpu |
+|----------------|--------|----:|-------:|------:|--------------:|
+| LFM2.5-VL-450M | Q4_0   | 749 |   1787 | 10810 | 6.0×          |
+| LFM2.5-350M    | Q4_K_M | 434 |   1659 |  9404 | 5.7×          |
+| LFM2.5-VL-1.6B | Q8_0   | 183 |    577 |  2129 | 3.7×          |
+| Llama-3.2-1B   | Q4_0   | 227 |    68† | 2775  | 40.8×         |
+
+† **wgpu batched-prefill bail.** This Llama GGUF keeps `ffn_down` in F32, and wgpu
+has no batched F32 prefill GEMM, so one unsupported-dtype tensor drops the *entire*
+model onto the per-token prefill loop (`~340×` the GPU submits, prefill no faster
+than decode: 68 vs its own 71 decode). Metal self-guards per tensor and stays on
+the fast path (2775). This is the top open wgpu item: mirror Metal's per-tensor
+fallback so a single F32/Q4_1/Q2_K tensor stops poisoning the whole prefill.
+
+Reading the tables:
+
+- **Metal wins across the board**, which is why it is the `Auto`-preferred GPU
+  backend: 1.65–2.55× CPU on decode, 3.7–6.0× wgpu on prefill (excluding the
+  bailed Llama row).
+- **wgpu decode trails CPU** on M1 Max for these model sizes: NEON decode is
+  strong and the wgpu per-token round trips dominate at small batch. The gap is
+  worst on LFM2.5-VL-1.6B Q8_0 (34 vs 78), where the wgpu Q8_0 decode GEMV is the
+  weakest kernel. Only the dense Llama edges CPU (71 vs 67).
+- **wgpu prefill beats CPU** by 2.4–3.8× wherever batched GEMM engages, because
+  the batched path amortizes weight reads across all prompt tokens. The K-quant
+  model (LFM2.5-350M Q4_K_M) behaves like the Q4_0 one: the wgpu K-quant GEMM
+  works and does not bail, confirming the Q4_K/Q6_K loaders run on the
+  naga-on-Metal path too.
+- **Metal decode has higher run-to-run variance** (stddev up to ~70 on the 350M)
+  from GPU clock ramp on the M1 Max; p50 is the stable estimate, which is why
+  it, not the mean, is tabulated.
+
+Not shown: Qwen3.5-0.8B-Q4_K_M was dropped from the set because it is a
+`qwen3next` architecture cera does not yet support (load fails on every backend);
+Llama-3.2-1B-Q4_0 stands in as the dense-transformer data point.
+
+```
+# per cell, swap --device cpu|gpu|metal and the model
+# decode
+cera bench -m model.gguf --device metal --no-cache --prompt-tokens 128 --max-tokens 128 --runs 20 --warmup 3
+# prefill
+cera bench -m model.gguf --device metal --no-cache --context-size 8192 --prompt-tokens 512 --max-tokens 0 --runs 20 --warmup 3
 ```
 
 ## Key optimizations
