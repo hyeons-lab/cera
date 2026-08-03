@@ -54,6 +54,25 @@ fn softmax_input(n: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Broadcast bias add reference: `x[t*dim + j] += bias[j]`. A single f32 add, so
+/// the generated kernel must match it bit-for-bit (no tolerance).
+fn bias_add_ref(x: &[f32], bias: &[f32], dim: usize) -> Vec<f32> {
+    x.iter()
+        .enumerate()
+        .map(|(i, v)| v + bias[i % dim])
+        .collect()
+}
+
+/// `rows*dim` x values and `dim` bias values, deterministic and spanning both
+/// signs so a dropped or mis-indexed bias term shows up.
+fn bias_add_inputs(rows: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
+    let x = (0..rows * dim)
+        .map(|i| (i as f32 * 0.013).sin() * 3.0)
+        .collect();
+    let bias = (0..dim).map(|j| (j as f32) * 0.5 - 4.0).collect();
+    (x, bias)
+}
+
 /// Compare against `softmax_ref` on a relative tolerance, and independently
 /// assert the outputs sum to 1: a reduction bug that scaled every element
 /// equally would satisfy a loose elementwise check but not this one.
@@ -273,6 +292,57 @@ mod wgsl {
         assert_softmax("wgsl softmax n=2048", &input, &got);
     }
 
+    fn run_bias_add(ctx: &GpuContext, x: &[f32], bias: &[f32], dim: u32) -> Vec<f32> {
+        let total = x.len() as u32;
+        let pipeline = ctx.create_pipeline(shaders::BIAS_ADD_SLANG, "bias_add", "bias_add_slang");
+
+        let x_buf = ctx.upload_f32(x, "bias_x");
+        let bias_buf = ctx.upload_f32(bias, "bias_bias");
+        let params = ctx.upload_storage(bytemuck::cast_slice(&[total, dim]), "bias_params");
+
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bias_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            // Flat grid over `total` elements, 256 per workgroup.
+            pass.dispatch_workgroups(total.div_ceil(256), 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll_wait();
+        ctx.download_f32(&x_buf, x.len())
+    }
+
+    #[test]
+    fn bias_add_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        // Ragged total (not a multiple of 256) exercises the bounds check.
+        let (rows, dim) = (7usize, 40usize);
+        let (x, bias) = bias_add_inputs(rows, dim);
+        let got = run_bias_add(&ctx, &x, &bias, dim as u32);
+        let want = bias_add_ref(&x, &bias, dim);
+        assert_eq!(got, want, "wgsl bias_add rows={rows} dim={dim}");
+    }
+
     fn run_gemm(
         ctx: &GpuContext,
         packed: &[u8],
@@ -428,6 +498,56 @@ mod msl {
         let input = softmax_input(2048);
         let got = run_softmax(&ctx, &input);
         assert_softmax("msl softmax n=2048", &input, &got);
+    }
+
+    fn run_bias_add(ctx: &MetalContext, x: &[f32], bias: &[f32], dim: u32) -> Vec<f32> {
+        let total = x.len() as u32;
+        let pipeline = ctx
+            .create_pipeline(shaders::BIAS_ADD_SLANG, "bias_add")
+            .expect("compile generated MSL");
+
+        let x_buf = ctx.upload_f32(x);
+        let bias_buf = ctx.upload_f32(bias);
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&[total, dim]));
+
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&x_buf), 0);
+        enc.set_buffer(1, Some(&bias_buf), 0);
+        enc.set_buffer(2, Some(&params), 0);
+        // Flat grid over `total` elements, 256 per threadgroup.
+        let groups = total.div_ceil(256);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: groups as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        ctx.read_f32(&x_buf, x.len())
+    }
+
+    #[test]
+    fn bias_add_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        // Ragged total (not a multiple of 256) exercises the bounds check.
+        let (rows, dim) = (7usize, 40usize);
+        let (x, bias) = bias_add_inputs(rows, dim);
+        let got = run_bias_add(&ctx, &x, &bias, dim as u32);
+        let want = bias_add_ref(&x, &bias, dim);
+        assert_eq!(got, want, "msl bias_add rows={rows} dim={dim}");
     }
 
     fn run_gemm(

@@ -252,6 +252,14 @@ pub mod shaders {
     pub const LAYERNORM_BATCH: &str = include_str!("shaders/layernorm_batch.metal");
     pub const GELU: &str = include_str!("shaders/gelu.metal");
     pub const BIAS_ADD: &str = include_str!("shaders/bias_add.metal");
+    /// Same kernel as [`BIAS_ADD`], generated from `shaders/slang/bias_add.slang`
+    /// by build.rs, sharing that source with the wgpu backend's
+    /// [`super::super::wgpu::shaders::BIAS_ADD_SLANG`]. Same contract (buffer 0 =
+    /// x in-place, buffer 1 = bias, buffer 2 = params). No per-target divergence,
+    /// so the whole body is shared with no `__target_switch`. Not yet on the
+    /// production path: `tests/slang_multitarget_parity.rs` pins it against the
+    /// CPU reference.
+    pub const BIAS_ADD_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/bias_add.metal"));
     pub const VIT_ATTENTION: &str = include_str!("shaders/vit_attention.metal");
     pub const VIT_ATTENTION_MMA: &str = include_str!("shaders/vit_attention_mma.metal");
 }

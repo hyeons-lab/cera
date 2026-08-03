@@ -1242,6 +1242,12 @@ pub mod shaders {
     pub const LAYERNORM_BATCH: &str = include_str!("shaders/layernorm_batch.wgsl");
     pub const GELU: &str = include_str!("shaders/gelu.wgsl");
     pub const BIAS_ADD: &str = include_str!("shaders/bias_add.wgsl");
+    /// Same kernel as [`BIAS_ADD`], generated from `shaders/slang/bias_add.slang`
+    /// by build.rs, sharing that source with the Metal backend's
+    /// [`super::super::metal::shaders::BIAS_ADD_SLANG`]. Same binding contract.
+    /// Not yet on the production path: `tests/slang_multitarget_parity.rs` pins
+    /// it against the CPU reference.
+    pub const BIAS_ADD_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/bias_add.wgsl"));
     pub const VIT_ATTENTION: &str = include_str!("shaders/vit_attention.wgsl");
     pub const VIT_ATTENTION_TILED: &str = include_str!("shaders/vit_attention_tiled.wgsl");
 }
