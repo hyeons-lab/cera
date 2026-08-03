@@ -1201,9 +1201,27 @@ pub mod shaders {
     pub const SCALE_F32: &str = include_str!("shaders/scale_f32.wgsl");
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.wgsl");
     pub const RMSNORM_BATCH: &str = include_str!("shaders/rmsnorm_batch.wgsl");
+    /// Same two kernels as [`RMSNORM_BATCH`] (`rmsnorm_batch` +
+    /// `add_rmsnorm_batch`), generated from `shaders/slang/rmsnorm_batch.slang`
+    /// by build.rs and shared with the Metal backend's
+    /// [`super::super::metal::shaders::RMSNORM_BATCH_SLANG`]. A `__target_switch`
+    /// port: this wgsl branch keeps the shared-memory tree, the metal branch the
+    /// two-stage `simd_sum`. Not yet on the production path:
+    /// `tests/slang_multitarget_parity.rs` pins both entry points against the CPU
+    /// reference.
+    pub const RMSNORM_BATCH_SLANG: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/rmsnorm_batch.wgsl"));
     pub const QK_NORM_ROPE_BATCH: &str = include_str!("shaders/qk_norm_rope_batch.wgsl");
     pub const CONV1D_FUSED_BATCH: &str = include_str!("shaders/conv1d_fused_batch.wgsl");
     pub const PER_HEAD_RMSNORM: &str = include_str!("shaders/per_head_rmsnorm.wgsl");
+    /// Same kernel as [`PER_HEAD_RMSNORM`], generated from
+    /// `shaders/slang/per_head_rmsnorm.slang` by build.rs and shared with the
+    /// Metal backend's [`super::super::metal::shaders::PER_HEAD_RMSNORM_SLANG`].
+    /// A `__target_switch` port: this wgsl branch keeps the shared-memory tree,
+    /// the metal branch the two-stage `simd_sum`. Not yet on the production path:
+    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
+    pub const PER_HEAD_RMSNORM_SLANG: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/per_head_rmsnorm.wgsl"));
     pub const SOFTMAX: &str = include_str!("shaders/softmax.wgsl");
     /// Same kernel as [`SOFTMAX`], generated from `shaders/slang/softmax.slang`
     /// by build.rs rather than hand-written, and byte-identical in contract
@@ -1254,6 +1272,14 @@ pub mod shaders {
     pub const CONV1D_FUSED: &str = include_str!("shaders/conv1d_fused.wgsl");
     // Vision-encoder (ViT) kernels.
     pub const LAYERNORM_BATCH: &str = include_str!("shaders/layernorm_batch.wgsl");
+    /// Same kernel as [`LAYERNORM_BATCH`], generated from
+    /// `shaders/slang/layernorm_batch.slang` by build.rs and shared with the
+    /// Metal backend's [`super::super::metal::shaders::LAYERNORM_BATCH_SLANG`].
+    /// A `__target_switch` port: this wgsl branch keeps the shared-memory tree,
+    /// the metal branch the two-stage `simd_sum`. Not yet on the production path:
+    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
+    pub const LAYERNORM_BATCH_SLANG: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/layernorm_batch.wgsl"));
     pub const GELU: &str = include_str!("shaders/gelu.wgsl");
     /// Same kernel as [`GELU`], generated from `shaders/slang/gelu.slang` by
     /// build.rs, sharing that source with the Metal backend's
