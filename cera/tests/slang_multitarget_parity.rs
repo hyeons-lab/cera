@@ -19,6 +19,12 @@
 //! No GGUF and no network: synthetic inputs only, so these run wherever a GPU
 //! exists.
 
+// Every test here needs a GPU backend (wgpu or Metal); with neither feature the
+// reference helpers below are unused. Gate the whole file so CI's featureless
+// `cargo clippy --workspace --all-targets -- -D warnings` sees nothing rather
+// than dead code.
+#![cfg(any(feature = "gpu", feature = "metal"))]
+
 /// Reference softmax over `x`, matching what both kernels should produce.
 ///
 /// Max-shifted like the kernels are, so the comparison is not measuring a
