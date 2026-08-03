@@ -154,7 +154,9 @@ fn main() {
 
     let groups = (N as u64).div_ceil(256);
     // `a`/x span both signs; `b` is kept in [0.5, 1.0] so the in-place timing
-    // loop (mul/silu especially) neither overflows to inf nor collapses to zero.
+    // loop cannot overflow to inf (the failure mode that would change per-op
+    // cost). `mul` does shrink toward zero over the loop, which is harmless: a
+    // branchless f32 multiply costs the same on any finite or zero operand.
     let x: Vec<f32> = (0..N).map(|i| ((i as f32) * 0.001).sin() * 3.0).collect();
     let bvals: Vec<f32> = (0..N)
         .map(|i| ((i as f32) * 0.0017).cos() * 0.25 + 0.75)
@@ -236,12 +238,16 @@ fn main() {
         let qh = ctx.upload_f32(&qv);
         let kh = ctx.upload_f32(&kv);
         run_once(&ctx, &rope_hand, &[&qh, &kh, &rparams], rope_groups);
-        let a = ctx.read_f32(&qh, qv.len());
+        let aq = ctx.read_f32(&qh, qv.len());
+        let ak = ctx.read_f32(&kh, kv.len());
         let qs = ctx.upload_f32(&qv);
         let ks = ctx.upload_f32(&kv);
         run_once(&ctx, &rope_slang, &[&qs, &ks, &rparams], rope_groups);
-        let b = ctx.read_f32(&qs, qv.len());
-        ok &= report_agreement("rope (q)", &a, &b);
+        let bq = ctx.read_f32(&qs, qv.len());
+        let bk = ctx.read_f32(&ks, kv.len());
+        // Both rotated buffers: the kernel writes q and k, so check both.
+        ok &= report_agreement("rope (q)", &aq, &bq);
+        ok &= report_agreement("rope (k)", &ak, &bk);
     }
 
     if !ok {

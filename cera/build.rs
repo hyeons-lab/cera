@@ -207,7 +207,11 @@ fn compile_slang_multitarget(want_wgsl: bool, want_msl: bool) {
 /// matches), so all three stay identical and the committed output can never
 /// drift from what CI regenerates. Files in practice carry exactly one header.
 fn slang_entry_points(src_path: &str, basename: &str) -> Vec<String> {
-    let text = std::fs::read_to_string(src_path).unwrap_or_default();
+    // Fail fast rather than defaulting to the basename: an unreadable `.slang`
+    // is a repo-integrity problem, and silently falling through to the committed
+    // artifact would hide it.
+    let text = std::fs::read_to_string(src_path)
+        .unwrap_or_else(|e| panic!("failed to read Slang source {src_path}: {e}"));
     let mut names: Vec<String> = Vec::new();
     for line in text.lines() {
         let line = line.trim_start();

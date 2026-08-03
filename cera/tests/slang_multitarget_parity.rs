@@ -174,9 +174,17 @@ fn elementwise_silu_mul_ref(a: &[f32], b: &[f32]) -> Vec<f32> {
 /// contract `a + s*b` to an FMA the host mul-then-add does not, and `silu_mul`
 /// because of the `exp`.
 fn assert_close(label: &str, got: &[f32], want: &[f32], rel: f32) {
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{label}: length mismatch (got {}, want {})",
+        got.len(),
+        want.len()
+    );
     let mut max_abs = 0.0f32;
     for (g, w) in got.iter().zip(want) {
         assert!(g.is_finite(), "{label}: non-finite output");
+        assert!(w.is_finite(), "{label}: non-finite reference");
         max_abs = max_abs.max((g - w).abs());
     }
     let max_ref = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -211,7 +219,8 @@ fn rope_freq_factors(half: usize) -> Vec<f32> {
 /// Apply RoPE in-place to `n_h` heads of `buf`, the reference for `rope.slang`.
 /// `rope_type` 0 = NEOX (split-halves), 1 = interleaved; `ff`, when present,
 /// divides each pair's angle (Llama-3). Angle uses `powf(-2d/head_dim)`, which is
-/// what both kernel branches compute (the metal branch as `1 / pow(.., 2d/..)`).
+/// what both kernel branches compute (the metal branch as `1 / powr(.., 2d/..)`,
+/// the wgsl branch as `pow(.., -2d/..)`).
 fn rope_apply(
     buf: &mut [f32],
     n_h: usize,
