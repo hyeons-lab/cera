@@ -39,7 +39,9 @@ kernel void conv1d_fused(
     // neither this kernel nor the WGSL twin carries one. `conv1d_fused_batch` is
     // the kernel that genuinely needs such a bound, for its `w[4]` / `rb[3]`
     // arrays; note the handwritten one there does not carry it, and is unguarded
-    // on `w[d_conv]` as a result.
+    // on `w[d_conv]` as a result. `2 <= kernel_size <= 4` is enforced at load by
+    // `validate_conv_kernel_size` in `model/lfm2.rs`, so the loop below cannot be
+    // driven by a malformed GGUF.
 
     // Step 1: bx = x * b. All three components are read up front so the
     // loads issue together rather than stalling on `c` after the conv.

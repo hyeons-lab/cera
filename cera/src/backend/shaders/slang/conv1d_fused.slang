@@ -33,6 +33,11 @@
 // from all three. `conv1d_fused_batch` is the one kernel in this tier that
 // genuinely needs the bound, for its fixed-size `w_local` / `rb` arrays.
 //
+// The range that bound protects (`2 <= kernel_size <= 4`) is enforced at load by
+// `validate_conv_kernel_size` in `model/lfm2.rs`, so `d_conv` reaching any conv
+// kernel is already known sane and the loop below cannot be driven by a
+// malformed GGUF.
+//
 // Dispatch: (ceil(hs / 256), 1, 1) workgroups of 256 threads.
 
 [[vk::binding(0)]] StructuredBuffer<float>   proj_buf : register(t0);

@@ -38,11 +38,14 @@
 //   binding/buffer 4: params   (hs, kernel_size, d_conv, n_tokens, proj_stride,
 //                               out_stride)
 //
-// Constraints: kernel_size <= 4, d_conv <= 3, enforced at the top so
-// `w_local[d_conv]` and `rb[d_conv - 1]` cannot run off the fixed-size register
-// arrays. Shipped LFM2 GGUFs set `lfm2.shortconv.l_cache = 3`, giving ks=3 and
-// d_conv=2; 4 and 3 are the maxima the arrays are sized for, not the usual
-// values.
+// Constraints: kernel_size <= 4, d_conv <= 3, so `w_local[d_conv]` and
+// `rb[d_conv - 1]` cannot run off the fixed-size register arrays. That range is
+// enforced at load by `validate_conv_kernel_size` in `model/lfm2.rs`, which
+// rejects an out-of-range `lfm2.shortconv.l_cache` rather than letting this
+// kernel receive params it cannot honor; the early-out below is the second line
+// of defence, not the only one. Shipped LFM2 GGUFs set `l_cache = 3`, giving
+// ks=3 and d_conv=2; 4 and 3 are the maxima the arrays are sized for, not the
+// usual values.
 //
 // Every loop over `w_local` / `rb` is written as a literal-trip-count loop with
 // a predicated body (`for k in 0..3 { if (k < d_conv) ... }`) plus

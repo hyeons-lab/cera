@@ -51,7 +51,10 @@ fn conv1d_fused(@builtin(global_invocation_id) gid: vec3<u32>) {
     // early-out, which could only convert a correct result into a
     // skipped write leaving `output` stale from the previous
     // layer. `conv1d_fused_batch` is the kernel that needs such a
-    // bound, for its register arrays.
+    // bound, for its register arrays. `2 <= kernel_size <= 4` is
+    // enforced at load by `validate_conv_kernel_size` in
+    // `model/lfm2.rs`, so the loop below cannot be driven by a
+    // malformed GGUF.
 
     let x_val = proj[ch];
     let c_val = proj[hs + ch];

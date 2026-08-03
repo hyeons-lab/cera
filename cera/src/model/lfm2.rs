@@ -98,6 +98,29 @@ fn describe_cache_tag(tag: &str) -> String {
     }
 }
 
+/// Range-check `lfm2.shortconv.l_cache` at the point it enters from GGUF
+/// metadata, so every downstream consumer can trust it.
+///
+/// The GPU short-conv kernels stage a channel's weights and rolling state in
+/// fixed-size registers sized for `kernel_size <= 4`
+/// (`conv1d_fused_batch.{wgsl,metal,slang}`), and `d_conv = kernel_size - 1`
+/// underflows for 0. Both used to be handled per-kernel: the batched shader
+/// silently returned on out-of-range params, which turned a malformed model into
+/// wrong prefill logits rather than an error, and the CPU cache asserted the
+/// lower bound only. Checking the range once here means a bad value is a load
+/// failure with a clear message, and the kernels can index on the invariant.
+///
+/// Every shipped LFM2 GGUF sets `l_cache = 3`.
+fn validate_conv_kernel_size(v: Option<usize>) -> anyhow::Result<Option<usize>> {
+    if let Some(k) = v {
+        anyhow::ensure!(
+            (2..=4).contains(&k),
+            "lfm2.shortconv.l_cache must be in 2..=4, got {k}"
+        );
+    }
+    Ok(v)
+}
+
 impl Lfm2Model {
     /// Prefix-cache namespace: the `"cpu:"` backend prefix, the KV-mode tag, and
     /// the model id. The backend prefix keeps CPU entries away from wgpu's and
@@ -168,9 +191,10 @@ impl Lfm2Model {
         let rms_norm_eps = gguf
             .get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5);
-        let conv_kernel_size = gguf
-            .get_u32(&format!("{prefix}.shortconv.l_cache"))
-            .map(|v| v as usize);
+        let conv_kernel_size = validate_conv_kernel_size(
+            gguf.get_u32(&format!("{prefix}.shortconv.l_cache"))
+                .map(|v| v as usize),
+        )?;
 
         // Per-layer KV head counts
         let kv_heads_array = gguf
@@ -2973,5 +2997,38 @@ impl crate::model::gpu_weight_source::GpuWeightSource for Lfm2Model {
     }
     fn supports_batched_prefill(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod conv_kernel_size_tests {
+    use super::validate_conv_kernel_size;
+
+    #[test]
+    fn accepts_the_shipped_value_and_absence() {
+        assert_eq!(validate_conv_kernel_size(Some(3)).unwrap(), Some(3));
+        // Absent metadata falls back to 3 downstream, so it stays None here.
+        assert_eq!(validate_conv_kernel_size(None).unwrap(), None);
+    }
+
+    #[test]
+    fn accepts_the_register_array_bounds() {
+        for k in [2usize, 4] {
+            assert_eq!(validate_conv_kernel_size(Some(k)).unwrap(), Some(k));
+        }
+    }
+
+    #[test]
+    fn rejects_values_the_kernels_cannot_honor() {
+        // 0 and 1 underflow `d_conv = kernel_size - 1`; anything above 4 overruns
+        // the batched kernel's fixed-size `w_local` / `rb` registers, which used
+        // to make it silently skip the dispatch and emit wrong prefill logits.
+        for k in [0usize, 1, 5, 64, usize::MAX] {
+            let err = validate_conv_kernel_size(Some(k)).unwrap_err().to_string();
+            assert!(
+                err.contains("l_cache must be in 2..=4"),
+                "unexpected error for k={k}: {err}"
+            );
+        }
     }
 }
