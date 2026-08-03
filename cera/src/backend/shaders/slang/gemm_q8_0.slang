@@ -9,14 +9,14 @@
 //
 // ## What is shared and what is not
 //
-// The two branches share the binding contract, `GemmParams`, and the Q8_0
-// byte-unpacking helpers. They share nothing else, and that is not a failure of
-// the port: the Metal path is 8x8 simdgroup tiling, and the portable path on
-// wgpu is a register-tiled kernel (`shaders/mul_mat_reg_tile.wgsl`) with an
-// entirely different blocking strategy. `__target_switch` is what makes that
-// honest rather than a lie by `#ifdef`: the untaken branch is eliminated before
-// entry-point capability validation, so the `case metal:` body may use a
-// capability WGSL cannot express at all.
+// The two branches share the binding contract and `GemmParams`. They share
+// nothing else, and that is not a failure of the port: the Metal path is 8x8
+// simdgroup tiling, and the portable path on wgpu is a register-tiled kernel
+// (`shaders/mul_mat_reg_tile.wgsl`) with an entirely different blocking
+// strategy. `__target_switch` is what makes that honest rather than a lie by
+// `#ifdef`: the untaken branch is eliminated before entry-point capability
+// validation, so the `case metal:` body may use a capability WGSL cannot
+// express at all.
 //
 // The `default:` branch here is a plain correctness reference, one dot product
 // per output element with no tiling and no reuse. It exists so the WGSL half of
@@ -24,26 +24,42 @@
 // WGSL is a legal shader; it is *not* a replacement for `mul_mat_reg_tile.wgsl`
 // and nothing dispatches it. Do not benchmark it and conclude anything.
 //
-// ## Divergences from `shaders/gemm_q8_0.metal`
+// ## Performance: matching the hand-tuned kernel took metal-specific intrinsics
 //
-// Two, both forced by Slang, both worth measuring rather than assuming benign:
+// A naive port that expressed the hot path in portable Slang ran at ~0.64x the
+// handwritten kernel. Profiling (not guessing: three plausible causes were
+// measured and rejected) traced almost all of it to one thing. `src0` is bound
+// as `StructuredBuffer<uint>` because WGSL has no byte-addressable storage, so a
+// portable Q8_0 dequant reconstructs every quant with a word load, a shift, a
+// mask and a manual sign-extend. That per-byte arithmetic, not the MMAs, was the
+// gap, and it inflated register pressure enough to cut occupancy too.
 //
-// 1. No `simdgroup_barrier(mem_flags::mem_none)` between the operand loads and
-//    the MMAs. Slang exposes no simdgroup-scoped execution barrier. On Apple
-//    silicon the lanes of a simdgroup advance together, so dropping it is
-//    correct; it was a scheduling hint, and hints that stop being given can cost
-//    throughput.
-// 2. The ragged-tile epilogue bounces through `sb` in two 16-column rounds
-//    instead of reinterpreting the whole 8 KB scratch as one 64x32 float tile.
-//    Slang has no way to type-pun groupshared memory, and declaring a third
-//    array would have pushed the threadgroup budget from 8 KB to 16 KB and
-//    halved occupancy, which would confound exactly the A/B this kernel exists
-//    to run. Interior tiles take the direct-store fast path and never reach it.
+// The fix is to drop to Metal for the memory access only, via `__target_intrinsic`
+// (`load_i8x4_direct`, `load_f16_direct`, `stage_input_f2x4` below). Each reads
+// or stores exactly as the handwritten kernel does: a `packed_char4` for four
+// quants at once, a `half*` deref for the scale, a `float2x4` for the input
+// stage. All are called only inside `case metal:`, so the WGSL branch never sees
+// them and keeps its portable scalar path (verified: the emitted WGSL contains
+// no `packed_char4`/`float2x4`/`device char`). With those plus the unroll
+// strategy below, the generated kernel reaches ~0.93x, bit-identical, at higher
+// occupancy than the handwritten one. The residual ~7% is Slang wrapping every
+// `CoopMat` load and multiply-accumulate in a by-value helper; that is inherent
+// to the abstraction and would only go away by hand-writing the MMA in raw MSL.
 //
-// The first divergence is the one to watch. `softmax.slang` shipped with one
-// extra barrier the handwritten kernel did not have, the parity suite passed,
-// and it still cost ~24% at the size where barrier latency dominates. Structural
-// equivalence is not performance equivalence; only a device measurement is.
+// Two levers were measured and *rejected*, recorded so they are not retried: the
+// `simdgroup_barrier(mem_flags::mem_none)` operand-load hint (expressible via
+// `__target_intrinsic`, but neutral on Apple silicon in both the dequant-bound
+// and scheduling-bound regimes), and unrolling the `ik` loop (it gave every
+// iteration's operands distinct registers, dropping occupancy 896 -> 704 and
+// throughput with it; the inner loops are unrolled but `ik` stays rolled).
+//
+// ## Remaining divergence from `shaders/gemm_q8_0.metal`
+//
+// The ragged-tile epilogue bounces through `sb` in two 16-column rounds instead
+// of reinterpreting the whole 8 KB scratch as one 64x32 float tile. Slang has no
+// way to type-pun groupshared memory, and declaring a third array would have
+// pushed the threadgroup budget from 8 KB to 16 KB and halved occupancy.
+// Interior tiles take the direct-store fast path and never reach it.
 //
 // ## Layout (mirrors the handwritten kernel exactly)
 //
@@ -104,6 +120,41 @@ int load_i8(uint byte_off) {
     return int(load_byte(byte_off) ^ 0x80u) - 128;
 }
 
+/// Metal-only vectorized signed-byte read: four consecutive Q8_0 quants as one
+/// `packed_char4` load, sign-extended to `int4`. `src0` is bound as
+/// `StructuredBuffer<uint>` for WGSL's sake, but on Metal that lowers to a
+/// `device uint*`, and the quants are signed bytes inside it. The portable
+/// `load_i8` reconstructs each byte with a word load, a shift, a mask and a
+/// manual sign-extend; profiling showed that per-byte arithmetic, not the MMAs,
+/// was the whole ~0.64x gap (it also inflated register pressure enough to cut
+/// occupancy). `packed_char4` is 1-byte aligned, so it reads four quants per
+/// load with the hardware sign-extending, cutting the 16 scalar loads per k-tile
+/// to four, fewer even than the handwritten kernel's scalar `int8` reads. Only
+/// ever called inside `case metal:`, so the WGSL branch never references it and
+/// keeps the portable path. `$0`/`$1` are the buffer and the byte offset.
+__target_intrinsic(metal, "int4(*(const device packed_char4*)((const device char*)$0 + $1))")
+int4 load_i8x4_direct(StructuredBuffer<uint> buf, uint byte_off);
+
+/// Metal-only direct f16 scale read, the analog of `load_i8x4_direct` for the
+/// block's leading half. `byte_off` is 2-byte aligned (blocks start at multiples
+/// of 34), so this matches the handwritten `*(const device half*)blk`. The
+/// portable `load_f16` reconstructs it with a word load, a conditional shift and
+/// `f16tof32`; on Metal a `half*` deref is a single load the hardware widens.
+__target_intrinsic(metal, "(*(const device half*)((const device char*)$0 + $1))")
+half load_f16_direct(StructuredBuffer<uint> buf, uint byte_off);
+
+/// Metal-only vectorized input staging: copy 8 consecutive floats from `src1`
+/// into `sb` as one `float2x4` (32-byte) load and store, exactly the handwritten
+/// kernel's `*(threadgroup float2x4*)(...) = *(device float2x4*)y`. The portable
+/// path does eight scalar load/store pairs because Slang cannot cast a
+/// groupshared pointer to a vector type; those scalar transactions were part of
+/// the residual staging gap. `sb_off` (a multiple of 8) and `src_off` are both
+/// 32-byte aligned by construction, the same precondition the handwritten store
+/// relies on. `$0..$3` are sb, its offset, src1, its offset; the array parameter
+/// size is BLOCK_SIZE_N * BLOCK_SIZE_K.
+__target_intrinsic(metal, "(*(threadgroup float2x4*)(&$0[$1]) = *(const device float2x4*)(&$2[$3]))")
+void stage_input_f2x4(float sb[1024], uint sb_off, StructuredBuffer<float> src, uint src_off);
+
 /// `byte_off` must be 2-byte aligned, which every Q8_0 scale is.
 float load_f16(uint byte_off) {
     uint w = src0[byte_off >> 2u];
@@ -158,6 +209,7 @@ void gemm_q8_0(uint3 gid : SV_GroupID, uint tiitg : SV_GroupIndex) {
                     + (BLOCK_SIZE_K / THREAD_PER_COL) * (tiitg % THREAD_PER_COL);
 
         MatC mc[8];
+        [ForceUnroll]
         for (uint i = 0u; i < 8u; i++) {
             mc[i] = MatC(0.0f);
         }
@@ -165,10 +217,16 @@ void gemm_q8_0(uint3 gid : SV_GroupID, uint tiitg : SV_GroupIndex) {
         for (uint loop_k = 0u; loop_k < k; loop_k += BLOCK_SIZE_K) {
             // Dequantize this thread's 16 weights before the barrier: the read
             // is from device memory and does not depend on anyone else's stores.
-            const float d = load_f16(x_byte);
-            float temp_a[16];
-            for (uint e = 0u; e < 16u; e++) {
-                temp_a[e] = float(load_i8(x_byte + 2u + e + 16u * il)) * d;
+            const float d = float(load_f16_direct(src0, x_byte));
+            half temp_a[16];
+            const uint q_base = x_byte + 2u + 16u * il;
+            [ForceUnroll]
+            for (uint g = 0u; g < 4u; g++) {
+                const int4 q = load_i8x4_direct(src0, q_base + g * 4u);
+                temp_a[g * 4u + 0u] = half(float(q.x) * d);
+                temp_a[g * 4u + 1u] = half(float(q.y) * d);
+                temp_a[g * 4u + 2u] = half(float(q.z) * d);
+                temp_a[g * 4u + 3u] = half(float(q.w) * d);
             }
 
             GroupMemoryBarrierWithGroupSync();
@@ -176,22 +234,20 @@ void gemm_q8_0(uint3 gid : SV_GroupID, uint tiitg : SV_GroupIndex) {
             // Stage A in simdgroup-matrix-native order: each 8x8 tile occupies
             // SG_MAT_SIZE contiguous halves, so the MMA loads below read with a
             // stride of 8 and no gather.
+            [ForceUnroll]
             for (uint i = 0u; i < 16u; i++) {
                 const uint slot = SG_MAT_SIZE * ((tiitg / THREAD_PER_ROW / 8u)
                                                + (tiitg % THREAD_PER_ROW) * 16u
                                                + (i / 8u) * 8u)
                                 + (tiitg / THREAD_PER_ROW) % 8u + (i & 7u) * 8u;
-                sa[slot] = half(temp_a[i]);
+                sa[slot] = temp_a[i];
             }
 
-            // Eight contiguous floats per thread. The handwritten kernel writes
-            // these as one float2x4; Slang has no groupshared pointer cast, so
-            // this is eight scalar stores to consecutive addresses instead.
+            // Eight contiguous floats per thread, staged as one float2x4 to
+            // match the handwritten kernel (see `stage_input_f2x4`).
             const uint sb_base = 32u * 8u * (tiitg % THREAD_PER_COL)
                                + 8u * (tiitg / THREAD_PER_COL);
-            for (uint e = 0u; e < 8u; e++) {
-                sb[sb_base + e] = src1[y_off + e];
-            }
+            stage_input_f2x4(sb, sb_base, src1, y_off);
 
             x_byte += Q8_BLOCK_BYTES;
             y_off  += BLOCK_SIZE_K;
@@ -201,13 +257,20 @@ void gemm_q8_0(uint3 gid : SV_GroupID, uint tiitg : SV_GroupIndex) {
             uint lsma = 4u * SG_MAT_SIZE * (sgitg % 2u);
             uint lsmb = 2u * SG_MAT_SIZE * (sgitg / 2u);
 
+            // `ik` stays rolled on purpose: unrolling it gives each iteration's
+            // `ma`/`mb` distinct registers (all four iterations live at once),
+            // which drops occupancy 896 -> 704. Rolling reuses the operand
+            // registers across iterations; the inner loops below are still
+            // unrolled for constant indices and MMA scheduling. See header.
             for (uint ik = 0u; ik < BLOCK_SIZE_K / 8u; ik++) {
                 MatB ma[4];
                 MatA mb[2];
 
+                [ForceUnroll]
                 for (uint i = 0u; i < 4u; i++) {
                     ma[i] = MatB.Load<CoopMatMatrixLayout.RowMajor>(sa, lsma + SG_MAT_SIZE * i, 8);
                 }
+                [ForceUnroll]
                 for (uint i = 0u; i < 2u; i++) {
                     mb[i] = MatA.Load<CoopMatMatrixLayout.RowMajor>(sb, lsmb + SG_MAT_SIZE * i, 8);
                 }
@@ -216,6 +279,7 @@ void gemm_q8_0(uint3 gid : SV_GroupID, uint tiitg : SV_GroupIndex) {
                 // is the A operand and the *weight* tile is B, which is why the
                 // accumulator's row axis is a dst column and its column axis a
                 // dst row. The epilogue strides below depend on that.
+                [ForceUnroll]
                 for (uint i = 0u; i < 8u; i++) {
                     mc[i] = coopMatMulAdd<float, false>(mb[i / 4u], ma[i % 4u], mc[i]);
                 }
@@ -229,6 +293,7 @@ void gemm_q8_0(uint3 gid : SV_GroupID, uint tiitg : SV_GroupIndex) {
             // Full tile: no bounds check needed, store straight to dst.
             const uint c_off = (BLOCK_SIZE_M * r0 + 32u * (sgitg & 1u))
                              + (BLOCK_SIZE_N * r1 + 16u * (sgitg >> 1u)) * y_stride;
+            [ForceUnroll]
             for (uint i = 0u; i < 8u; i++) {
                 mc[i].Store<CoopMatMatrixLayout.RowMajor>(
                     dst, c_off + 8u * (i % 4u) + 8u * y_stride * (i / 4u), y_stride);
@@ -242,6 +307,7 @@ void gemm_q8_0(uint3 gid : SV_GroupID, uint tiitg : SV_GroupIndex) {
 
                 if ((sgitg >> 1u) == round) {
                     const uint base = 32u * (sgitg & 1u);
+                    [ForceUnroll]
                     for (uint i = 0u; i < 8u; i++) {
                         mc[i].Store<CoopMatMatrixLayout.RowMajor>(
                             sb, base + 8u * (i % 4u) + 8u * BLOCK_SIZE_M * (i / 4u), BLOCK_SIZE_M);

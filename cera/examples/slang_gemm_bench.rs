@@ -192,6 +192,23 @@ fn main() {
         .create_pipeline(shaders::GEMM_Q8_0_SLANG, "gemm_q8_0")
         .expect("compile generated gemm_q8_0.metal");
 
+    // maxTotalThreadsPerThreadgroup is a register-pressure proxy: the driver
+    // sets it from how many registers each thread needs, so a lower number means
+    // a heavier kernel and fewer resident threads (lower occupancy). This was the
+    // signal that located the dequant as the bottleneck: the naive per-byte
+    // extraction cut the generated kernel to 768 while the handwritten held 832.
+    println!("== occupancy (higher = lower register pressure) ==");
+    println!(
+        "  handwritten  maxThreadsPerTG={:<5} execWidth={}",
+        hand.max_total_threads_per_threadgroup(),
+        hand.thread_execution_width(),
+    );
+    println!(
+        "  generated    maxThreadsPerTG={:<5} execWidth={}\n",
+        slang.max_total_threads_per_threadgroup(),
+        slang.thread_execution_width(),
+    );
+
     // The generated kernel is supposed to reach the same instructions, not just
     // the same answers. If it did not, the timings still print but they are
     // measuring the portable branch and mean something else entirely.

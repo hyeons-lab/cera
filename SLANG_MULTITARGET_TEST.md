@@ -423,6 +423,63 @@ another parity run. Verdict: `linalg::CoopMat` reaches the hardware and is
 correct, but the emitter does not yet match the hand-tuned kernel's throughput,
 so this is not a drop-in replacement for the eight GEMMs on speed alone.
 
+### Round 3 optimization (Apple M1 Max, 2026-08-02): 0.64x -> ~0.93x
+
+Both candidate causes above turned out to be wrong, which is the useful part.
+The gap was found by measurement, not by trusting the guesses.
+
+**Both documented hypotheses were falsified.** `[ForceUnroll]` on the matrix
+loops (the "register spill" fix) *lowered* occupancy (maxThreadsPerTG 768 -> 640)
+and did nothing for throughput. The `simdgroup_barrier` hint (expressed via
+`__target_intrinsic`, so Slang *can* emit it after all) was neutral. A third
+guess, occupancy, was also too small to matter: 768 vs the handwritten 832.
+
+**Isolation found the real cause.** Replacing the Q8_0 dequant with a no-op
+jumped the ratio to ~0.93 and occupancy to 1024. So the per-byte dequant was
+almost the entire gap: `src0` is bound as `StructuredBuffer<uint>` for WGSL, so
+the portable path rebuilds each quant with a word load + shift + mask + manual
+sign-extend, which is heavy ALU and heavy register pressure.
+
+**The fix is metal-only direct memory access via `__target_intrinsic`,** leaving
+the portable WGSL branch (a correctness reference nothing dispatches) untouched:
+
+| step | large-shape ratio | occupancy |
+|------|-------------------|-----------|
+| baseline (naive port) | 0.64 | 768 |
+| direct `char` int8 read | 0.79 | 896 |
+| vectorized `float2x4` input staging | 0.83 | 896 |
+| roll `ik`, unroll inner loops | 0.90 | 896 |
+| `packed_char4` vectorized dequant (4 loads/tile) | **0.93** | 896 |
+
+Final numbers, bit-identical (`0.000e0`) at every shape:
+
+```
+== occupancy ==   handwritten maxThreadsPerTG=832   generated=896
+       m x k x n   handwritten     generated     ratio
+   1024x1024x128          89.0          94.1     0.946x
+   2048x2048x256         320.2         351.7     0.910x
+   4096x4096x256        1137.3        1229.0     0.925x
+   2048x2048x512         580.5         626.0     0.927x
+```
+
+The generated kernel now beats the handwritten one on occupancy (896 vs 832) and
+on dequant load count (4 `packed_char4` vs 16 scalar `int8`), and matches it on
+barrier count (verified 4, no softmax-style extra) and load stride (AIR-diff:
+Slang's explicit `elements_per_row=8` is byte-identical to the handwritten's
+default). The residual ~7% is Slang wrapping every `CoopMat` load and
+multiply-accumulate in a by-value helper: inherent to the abstraction, removable
+only by hand-writing the MMA in raw MSL, which is the thing the pilot tests
+whether we can avoid.
+
+**Verdict for the migration:** a generated simdgroup GEMM reaches ~0.93x
+bit-identical, but only because the hot-path *memory access* drops to
+`__target_intrinsic` raw-MSL strings (`load_i8x4_direct`, `load_f16_direct`,
+`stage_input_f2x4`). The compute (tiling, MMA) ports cleanly; the byte-unpacking
+and vectorized staging do not, because WGSL's buffer/groupshared abstractions
+cost too much. So "one portable source" holds for the math and leaks raw Metal
+at the memory layer. Two levers were measured and rejected (the barrier hint;
+unrolling `ik`), recorded in the `.slang` header so they are not retried.
+
 ## Regenerating the committed outputs
 
 Only needed if you edit the `.slang`. Requires slangc 2026.13.1 (the CI drift
