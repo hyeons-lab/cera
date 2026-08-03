@@ -43,14 +43,22 @@ slang:
         "$SLANGC" "$f" -target spirv -O3 -entry main -stage compute -o "$dir/$name.spv"
     done
     # Multi-target kernels: one source, WGSL *and* MSL. Unlike the SPIR-V
-    # kernels above, the entry point is the basename rather than `main`, because
-    # both backends look the kernel up by its own name.
+    # kernels above, the entry points are the kernel's own function names rather
+    # than `main`, because both backends look each kernel up by name. slangc has
+    # no auto-discovery, so pass one -entry per entry point: default to the
+    # basename, or read a `// slang-entries: a b c` header for kernels whose
+    # entry name differs (gelu) or that expose several (elementwise). build.rs
+    # and the CI drift check parse the same header.
     dir=cera/src/backend/shaders/slang
     for f in "$dir"/*.slang; do
         name=$(basename "$f" .slang)
+        entries=$(sed -n 's|^[[:space:]]*//[[:space:]]*slang-entries:[[:space:]]*||p' "$f")
+        [ -z "$entries" ] && entries="$name"
+        entry_args=()
+        for e in $entries; do entry_args+=(-entry "$e"); done
         for target in wgsl metal; do
-            echo "==> slangc $name -> $target"
-            "$SLANGC" "$f" -target "$target" -O3 -entry "$name" -stage compute -o "$dir/$name.$target"
+            echo "==> slangc $name -> $target ($entries)"
+            "$SLANGC" "$f" -target "$target" -O3 "${entry_args[@]}" -stage compute -o "$dir/$name.$target"
         done
     done
 

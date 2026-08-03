@@ -128,6 +128,12 @@ required-features = ["metal"]
 name = "slang_gemm_bench"
 required-features = ["metal"]
 
+# Phase 1a elementwise/math tier: generated gelu, elementwise, and rope against
+# their handwritten twins. Metal-only for the same reason.
+[[example]]
+name = "slang_elementwise_bench"
+required-features = ["metal"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true

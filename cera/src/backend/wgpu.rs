@@ -1191,6 +1191,13 @@ pub mod shaders {
     pub const GEMV_Q6_K: &str = include_str!("shaders/gemv_q6_k.wgsl");
     pub const GEMV_Q8_0: &str = include_str!("shaders/gemv_q8_0.wgsl");
     pub const ELEMENTWISE: &str = include_str!("shaders/elementwise.wgsl");
+    /// The four elementwise entry points (`add_inplace`, `scaled_add_inplace`,
+    /// `mul_inplace`, `silu_mul_inplace`), generated from
+    /// `shaders/slang/elementwise.slang` by build.rs and shared with the Metal
+    /// backend's [`super::super::metal::shaders::ELEMENTWISE_SLANG`]. Same binding
+    /// contract as [`ELEMENTWISE`]. Not yet on the production path:
+    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
+    pub const ELEMENTWISE_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/elementwise.wgsl"));
     pub const SCALE_F32: &str = include_str!("shaders/scale_f32.wgsl");
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.wgsl");
     pub const RMSNORM_BATCH: &str = include_str!("shaders/rmsnorm_batch.wgsl");
@@ -1227,6 +1234,13 @@ pub mod shaders {
     pub const GEMM_Q8_0_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/gemm_q8_0.wgsl"));
     pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.wgsl");
     pub const ROPE: &str = include_str!("shaders/rope.wgsl");
+    /// Same RoPE kernel as [`ROPE`] (NEOX + interleaved + freq_factors),
+    /// generated from `shaders/slang/rope.slang` by build.rs. A `__target_switch`
+    /// port: this wgsl branch mirrors `rope.wgsl`; the metal branch (shared with
+    /// [`super::super::metal::shaders::ROPE_SLANG`]) is the minimal NEOX-only
+    /// `rope.metal`. Not yet on the production path:
+    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
+    pub const ROPE_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.wgsl"));
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.wgsl");
     pub const FLASH_ATTENTION: &str = include_str!("shaders/flash_attention.wgsl");
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
@@ -1241,7 +1255,19 @@ pub mod shaders {
     // Vision-encoder (ViT) kernels.
     pub const LAYERNORM_BATCH: &str = include_str!("shaders/layernorm_batch.wgsl");
     pub const GELU: &str = include_str!("shaders/gelu.wgsl");
+    /// Same kernel as [`GELU`], generated from `shaders/slang/gelu.slang` by
+    /// build.rs, sharing that source with the Metal backend's
+    /// [`super::super::metal::shaders::GELU_SLANG`]. Same binding contract.
+    /// Not yet on the production path: `tests/slang_multitarget_parity.rs` pins
+    /// it against the CPU reference.
+    pub const GELU_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/gelu.wgsl"));
     pub const BIAS_ADD: &str = include_str!("shaders/bias_add.wgsl");
+    /// Same kernel as [`BIAS_ADD`], generated from `shaders/slang/bias_add.slang`
+    /// by build.rs, sharing that source with the Metal backend's
+    /// [`super::super::metal::shaders::BIAS_ADD_SLANG`]. Same binding contract.
+    /// Not yet on the production path: `tests/slang_multitarget_parity.rs` pins
+    /// it against the CPU reference.
+    pub const BIAS_ADD_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/bias_add.wgsl"));
     pub const VIT_ATTENTION: &str = include_str!("shaders/vit_attention.wgsl");
     pub const VIT_ATTENTION_TILED: &str = include_str!("shaders/vit_attention_tiled.wgsl");
 }
