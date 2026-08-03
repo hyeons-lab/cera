@@ -249,6 +249,142 @@ fn rope_apply(
     }
 }
 
+/// Deterministic per-head input and a shared per-element weight. Values span
+/// both signs so a dropped square or a mis-indexed weight shows up.
+fn per_head_rmsnorm_inputs(n_heads: usize, head_dim: usize) -> (Vec<f32>, Vec<f32>) {
+    let x = (0..n_heads * head_dim)
+        .map(|i| (i as f32 * 0.01).sin() * 2.0)
+        .collect();
+    let weight = (0..head_dim)
+        .map(|j| 1.0 + 0.1 * (j as f32 * 0.05).cos())
+        .collect();
+    (x, weight)
+}
+
+/// Reference per-head RMSnorm: for each head, `x /= sqrt(mean(x^2) + eps)` then
+/// scale by the shared weight. Sums sequentially, so the generated kernel (simd
+/// or tree reduction) is held to a relative bound, not bit-equality.
+fn per_head_rmsnorm_ref(
+    x: &[f32],
+    weight: &[f32],
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let mut out = x.to_vec();
+    for h in 0..n_heads {
+        let off = h * head_dim;
+        let sum_sq: f32 = x[off..off + head_dim].iter().map(|v| v * v).sum();
+        let inv_rms = 1.0 / (sum_sq / head_dim as f32 + eps).sqrt();
+        for i in 0..head_dim {
+            out[off + i] = x[off + i] * inv_rms * weight[i];
+        }
+    }
+    out
+}
+
+/// Deterministic src/weight/bias for batched LayerNorm. `src` has a non-zero mean
+/// and a healthy spread so the mean-subtraction and variance are both exercised.
+fn layernorm_batch_inputs(rows: usize, n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let src = (0..rows * n)
+        .map(|i| (i as f32 * 0.02).sin() * 3.0 + 0.5)
+        .collect();
+    let weight = (0..n)
+        .map(|j| 1.0 + 0.05 * (j as f32 * 0.03).cos())
+        .collect();
+    let bias = (0..n).map(|j| 0.1 * (j as f32 * 0.07).sin()).collect();
+    (src, weight, bias)
+}
+
+/// Reference batched affine LayerNorm, tightly packed (src_stride = dst_stride =
+/// n). Accumulates mean and variance in f64 (the "true" answer), so the generated
+/// f32 two-pass kernel is held to a relative bound.
+fn layernorm_batch_ref(
+    src: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    rows: usize,
+    n: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let mut dst = vec![0.0f32; rows * n];
+    for r in 0..rows {
+        let off = r * n;
+        let mean = (0..n).map(|i| src[off + i] as f64).sum::<f64>() / n as f64;
+        let var = (0..n)
+            .map(|i| {
+                let d = src[off + i] as f64 - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / n as f64;
+        let inv_std = 1.0 / (var + eps as f64).sqrt();
+        for i in 0..n {
+            dst[off + i] =
+                ((src[off + i] as f64 - mean) * inv_std * weight[i] as f64 + bias[i] as f64) as f32;
+        }
+    }
+    dst
+}
+
+/// Deterministic src / weight / residual for batched RMSnorm, both signs.
+fn rmsnorm_batch_inputs(rows: usize, n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let src = (0..rows * n)
+        .map(|i| (i as f32 * 0.02).sin() * 2.0)
+        .collect();
+    let w = (0..n)
+        .map(|j| 1.0 + 0.1 * (j as f32 * 0.04).cos())
+        .collect();
+    let residual = (0..rows * n)
+        .map(|i| (i as f32 * 0.015).cos() * 1.5)
+        .collect();
+    (src, w, residual)
+}
+
+/// Reference batched RMSnorm (tightly packed): `dst = src * inv_rms(src) * w` per
+/// row, sum of squares in f64 so the generated f32 kernel is held to a relative
+/// bound.
+fn rmsnorm_batch_ref(src: &[f32], w: &[f32], rows: usize, n: usize, eps: f32) -> Vec<f32> {
+    let mut dst = vec![0.0f32; rows * n];
+    for r in 0..rows {
+        let off = r * n;
+        let sum_sq: f64 = (0..n)
+            .map(|i| {
+                let v = src[off + i] as f64;
+                v * v
+            })
+            .sum();
+        let inv_rms = 1.0 / (sum_sq / n as f64 + eps as f64).sqrt();
+        for i in 0..n {
+            dst[off + i] = (src[off + i] as f64 * inv_rms * w[i] as f64) as f32;
+        }
+    }
+    dst
+}
+
+/// Reference for the fused `add_rmsnorm_batch`: `src' = src + res_scale*residual`
+/// (in-place), then rmsnorm(src') -> dst. Returns (post-add src, dst). The add is
+/// f32 to mirror the kernel.
+fn add_rmsnorm_batch_ref(
+    src: &[f32],
+    residual: &[f32],
+    w: &[f32],
+    rows: usize,
+    n: usize,
+    eps: f32,
+    res_scale: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut new_src = src.to_vec();
+    for r in 0..rows {
+        let off = r * n;
+        for i in 0..n {
+            new_src[off + i] = src[off + i] + res_scale * residual[off + i];
+        }
+    }
+    let dst = rmsnorm_batch_ref(&new_src, w, rows, n, eps);
+    (new_src, dst)
+}
+
 // ---------------------------------------------------------------------------
 // Q8_0 GEMM fixtures
 //
@@ -742,6 +878,277 @@ mod wgsl {
         }
     }
 
+    fn run_per_head_rmsnorm(
+        ctx: &GpuContext,
+        x: &[f32],
+        weight: &[f32],
+        n_heads: u32,
+        head_dim: u32,
+        eps: f32,
+    ) -> Vec<f32> {
+        let pipeline = ctx.create_pipeline(
+            shaders::PER_HEAD_RMSNORM_SLANG,
+            "per_head_rmsnorm",
+            "per_head_rmsnorm_slang",
+        );
+        let x_buf = ctx.upload_f32(x, "phr_x");
+        let w_buf = ctx.upload_f32(weight, "phr_w");
+        let params = ctx.upload_storage(
+            bytemuck::cast_slice(&[head_dim, eps.to_bits(), 0u32, 0u32]),
+            "phr_params",
+        );
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: w_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            // One workgroup per head.
+            pass.dispatch_workgroups(n_heads, 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll_wait();
+        ctx.download_f32(&x_buf, x.len())
+    }
+
+    #[test]
+    fn per_head_rmsnorm_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        let eps = 1e-5f32;
+        // Typical (head_dim < the 256-wide workgroup) and a grid-strided case.
+        for (n_heads, head_dim) in [(32usize, 128usize), (4, 1024)] {
+            let (x, weight) = per_head_rmsnorm_inputs(n_heads, head_dim);
+            let got = run_per_head_rmsnorm(&ctx, &x, &weight, n_heads as u32, head_dim as u32, eps);
+            let want = per_head_rmsnorm_ref(&x, &weight, n_heads, head_dim, eps);
+            assert_close(
+                &format!("wgsl per_head_rmsnorm {n_heads}x{head_dim}"),
+                &got,
+                &want,
+                1e-5,
+            );
+        }
+    }
+
+    fn run_layernorm_batch(
+        ctx: &GpuContext,
+        src: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        rows: u32,
+        n: u32,
+        eps: f32,
+    ) -> Vec<f32> {
+        let pipeline = ctx.create_pipeline(
+            shaders::LAYERNORM_BATCH_SLANG,
+            "layernorm_batch",
+            "layernorm_batch_slang",
+        );
+        let src_buf = ctx.upload_f32(src, "ln_src");
+        let dst_buf = ctx.upload_f32(&vec![0.0f32; (rows * n) as usize], "ln_dst");
+        let w_buf = ctx.upload_f32(weight, "ln_w");
+        let b_buf = ctx.upload_f32(bias, "ln_b");
+        // src_stride = dst_stride = n (tightly packed).
+        let params =
+            ctx.upload_storage(bytemuck::cast_slice(&[n, eps.to_bits(), n, n]), "ln_params");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: src_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dst_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: w_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: b_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            // One workgroup per row.
+            pass.dispatch_workgroups(rows, 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll_wait();
+        ctx.download_f32(&dst_buf, (rows * n) as usize)
+    }
+
+    #[test]
+    fn layernorm_batch_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        let eps = 1e-5f32;
+        // Realistic hidden size, and a ragged n (not a multiple of 256).
+        for (rows, n) in [(8usize, 4096usize), (4, 2049)] {
+            let (src, weight, bias) = layernorm_batch_inputs(rows, n);
+            let got = run_layernorm_batch(&ctx, &src, &weight, &bias, rows as u32, n as u32, eps);
+            let want = layernorm_batch_ref(&src, &weight, &bias, rows, n, eps);
+            assert_close(
+                &format!("wgsl layernorm_batch {rows}x{n}"),
+                &got,
+                &want,
+                1e-4,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_rmsnorm_batch(
+        ctx: &GpuContext,
+        entry: &str,
+        src: &[f32],
+        w: &[f32],
+        residual: Option<&[f32]>,
+        rows: u32,
+        n: u32,
+        eps: f32,
+        res_scale: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let pipeline = ctx.create_pipeline(shaders::RMSNORM_BATCH_SLANG, entry, entry);
+        let src_buf = ctx.upload_f32(src, "rb_src");
+        let dst_buf = ctx.upload_f32(&vec![0.0f32; (rows * n) as usize], "rb_dst");
+        let w_buf = ctx.upload_f32(w, "rb_w");
+        // params: n, eps, src_stride = n, dst_stride = n, res_scale.
+        let params = ctx.upload_storage(
+            bytemuck::cast_slice(&[n, eps.to_bits(), n, n, res_scale.to_bits()]),
+            "rb_params",
+        );
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: src_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: dst_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: w_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: params.as_entire_binding(),
+            },
+        ];
+        // add_rmsnorm_batch reads residual at binding 4; rmsnorm_batch's generated
+        // layout omits it, so bind it only when present.
+        let res_buf = residual.map(|r| ctx.upload_f32(r, "rb_res"));
+        if let Some(rb) = &res_buf {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 4,
+                resource: rb.as_entire_binding(),
+            });
+        }
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &entries,
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(rows, 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll_wait();
+        (
+            ctx.download_f32(&src_buf, (rows * n) as usize),
+            ctx.download_f32(&dst_buf, (rows * n) as usize),
+        )
+    }
+
+    #[test]
+    fn rmsnorm_batch_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        let eps = 1e-5f32;
+        for (rows, n) in [(8usize, 4096usize), (4, 2049)] {
+            let (src, w, residual) = rmsnorm_batch_inputs(rows, n);
+
+            // Plain: reads src, writes dst; src unchanged.
+            let (_, got_dst) = run_rmsnorm_batch(
+                &ctx,
+                "rmsnorm_batch",
+                &src,
+                &w,
+                None,
+                rows as u32,
+                n as u32,
+                eps,
+                1.0,
+            );
+            let want_dst = rmsnorm_batch_ref(&src, &w, rows, n, eps);
+            assert_close(
+                &format!("wgsl rmsnorm_batch {rows}x{n}"),
+                &got_dst,
+                &want_dst,
+                1e-4,
+            );
+
+            // Fused add + rmsnorm with a Granite-style residual scale.
+            let res_scale = 0.75f32;
+            let (got_src, got_dst) = run_rmsnorm_batch(
+                &ctx,
+                "add_rmsnorm_batch",
+                &src,
+                &w,
+                Some(&residual),
+                rows as u32,
+                n as u32,
+                eps,
+                res_scale,
+            );
+            let (want_src, want_dst) =
+                add_rmsnorm_batch_ref(&src, &residual, &w, rows, n, eps, res_scale);
+            assert_close(
+                &format!("wgsl add_rmsnorm_batch src {rows}x{n}"),
+                &got_src,
+                &want_src,
+                1e-5,
+            );
+            assert_close(
+                &format!("wgsl add_rmsnorm_batch dst {rows}x{n}"),
+                &got_dst,
+                &want_dst,
+                1e-4,
+            );
+        }
+    }
+
     fn run_gemm(
         ctx: &GpuContext,
         packed: &[u8],
@@ -1161,6 +1568,251 @@ mod msl {
         assert_close("msl rope neox k", &gk, &wk, 1e-4);
     }
 
+    fn run_per_head_rmsnorm(
+        ctx: &MetalContext,
+        x: &[f32],
+        weight: &[f32],
+        n_heads: u32,
+        head_dim: u32,
+        eps: f32,
+    ) -> Vec<f32> {
+        let pipeline = ctx
+            .create_pipeline(shaders::PER_HEAD_RMSNORM_SLANG, "per_head_rmsnorm")
+            .expect("compile generated MSL");
+        let x_buf = ctx.upload_f32(x);
+        let w_buf = ctx.upload_f32(weight);
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&[head_dim, eps.to_bits(), 0u32, 0u32]));
+
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&x_buf), 0);
+        enc.set_buffer(1, Some(&w_buf), 0);
+        enc.set_buffer(2, Some(&params), 0);
+        // One threadgroup per head.
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: n_heads as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        ctx.read_f32(&x_buf, x.len())
+    }
+
+    #[test]
+    fn per_head_rmsnorm_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        let eps = 1e-5f32;
+        for (n_heads, head_dim) in [(32usize, 128usize), (4, 1024)] {
+            let (x, weight) = per_head_rmsnorm_inputs(n_heads, head_dim);
+            let got = run_per_head_rmsnorm(&ctx, &x, &weight, n_heads as u32, head_dim as u32, eps);
+            let want = per_head_rmsnorm_ref(&x, &weight, n_heads, head_dim, eps);
+            assert_close(
+                &format!("msl per_head_rmsnorm {n_heads}x{head_dim}"),
+                &got,
+                &want,
+                1e-5,
+            );
+        }
+    }
+
+    fn run_layernorm_batch(
+        ctx: &MetalContext,
+        src: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        rows: u32,
+        n: u32,
+        eps: f32,
+    ) -> Vec<f32> {
+        let pipeline = ctx
+            .create_pipeline(shaders::LAYERNORM_BATCH_SLANG, "layernorm_batch")
+            .expect("compile generated MSL");
+        let src_buf = ctx.upload_f32(src);
+        let dst_buf = ctx.upload_f32(&vec![0.0f32; (rows * n) as usize]);
+        let w_buf = ctx.upload_f32(weight);
+        let b_buf = ctx.upload_f32(bias);
+        // src_stride = dst_stride = n (tightly packed).
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&[n, eps.to_bits(), n, n]));
+
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&src_buf), 0);
+        enc.set_buffer(1, Some(&dst_buf), 0);
+        enc.set_buffer(2, Some(&w_buf), 0);
+        enc.set_buffer(3, Some(&b_buf), 0);
+        enc.set_buffer(4, Some(&params), 0);
+        // One threadgroup per row.
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: rows as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        ctx.read_f32(&dst_buf, (rows * n) as usize)
+    }
+
+    #[test]
+    fn layernorm_batch_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        let eps = 1e-5f32;
+        for (rows, n) in [(8usize, 4096usize), (4, 2049)] {
+            let (src, weight, bias) = layernorm_batch_inputs(rows, n);
+            let got = run_layernorm_batch(&ctx, &src, &weight, &bias, rows as u32, n as u32, eps);
+            let want = layernorm_batch_ref(&src, &weight, &bias, rows, n, eps);
+            assert_close(
+                &format!("msl layernorm_batch {rows}x{n}"),
+                &got,
+                &want,
+                1e-4,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_rmsnorm_batch(
+        ctx: &MetalContext,
+        entry: &str,
+        src: &[f32],
+        w: &[f32],
+        residual: Option<&[f32]>,
+        rows: u32,
+        n: u32,
+        eps: f32,
+        res_scale: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let pipeline = ctx
+            .create_pipeline(shaders::RMSNORM_BATCH_SLANG, entry)
+            .expect("compile generated MSL");
+        let src_buf = ctx.upload_f32(src);
+        let dst_buf = ctx.upload_f32(&vec![0.0f32; (rows * n) as usize]);
+        let w_buf = ctx.upload_f32(w);
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&[
+            n,
+            eps.to_bits(),
+            n,
+            n,
+            res_scale.to_bits(),
+        ]));
+
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&src_buf), 0);
+        enc.set_buffer(1, Some(&dst_buf), 0);
+        enc.set_buffer(2, Some(&w_buf), 0);
+        enc.set_buffer(3, Some(&params), 0);
+        // add_rmsnorm_batch reads residual at buffer 4. The plain rmsnorm_batch
+        // entry still declares buffer 4 in its generated MSL signature (Slang
+        // emits the shared binding for both entries) but never reads it, so bind
+        // a valid buffer there regardless, so a debug-layer run does not flag an
+        // unset buffer.
+        let res_buf = residual.map(|r| ctx.upload_f32(r));
+        enc.set_buffer(4, Some(res_buf.as_ref().unwrap_or(&w_buf)), 0);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: rows as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        (
+            ctx.read_f32(&src_buf, (rows * n) as usize),
+            ctx.read_f32(&dst_buf, (rows * n) as usize),
+        )
+    }
+
+    #[test]
+    fn rmsnorm_batch_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        let eps = 1e-5f32;
+        for (rows, n) in [(8usize, 4096usize), (4, 2049)] {
+            let (src, w, residual) = rmsnorm_batch_inputs(rows, n);
+
+            let (_, got_dst) = run_rmsnorm_batch(
+                &ctx,
+                "rmsnorm_batch",
+                &src,
+                &w,
+                None,
+                rows as u32,
+                n as u32,
+                eps,
+                1.0,
+            );
+            let want_dst = rmsnorm_batch_ref(&src, &w, rows, n, eps);
+            assert_close(
+                &format!("msl rmsnorm_batch {rows}x{n}"),
+                &got_dst,
+                &want_dst,
+                1e-4,
+            );
+
+            let res_scale = 0.75f32;
+            let (got_src, got_dst) = run_rmsnorm_batch(
+                &ctx,
+                "add_rmsnorm_batch",
+                &src,
+                &w,
+                Some(&residual),
+                rows as u32,
+                n as u32,
+                eps,
+                res_scale,
+            );
+            let (want_src, want_dst) =
+                add_rmsnorm_batch_ref(&src, &residual, &w, rows, n, eps, res_scale);
+            assert_close(
+                &format!("msl add_rmsnorm_batch src {rows}x{n}"),
+                &got_src,
+                &want_src,
+                1e-5,
+            );
+            assert_close(
+                &format!("msl add_rmsnorm_batch dst {rows}x{n}"),
+                &got_dst,
+                &want_dst,
+                1e-4,
+            );
+        }
+    }
+
     fn run_gemm(
         ctx: &MetalContext,
         packed: &[u8],
@@ -1278,6 +1930,37 @@ mod msl {
             "generated MSL lost simd_sum; __target_switch selected the portable tree"
         );
     }
+
+    /// per_head_rmsnorm's whole reason to be a `__target_switch` port is the
+    /// Metal simd reduction; a silent fall-through to the tree is correct but
+    /// slow and no numeric test sees it.
+    #[test]
+    fn generated_per_head_rmsnorm_keeps_simd_sum() {
+        assert!(
+            shaders::PER_HEAD_RMSNORM_SLANG.contains("simd_sum"),
+            "generated MSL lost simd_sum; __target_switch selected the portable tree"
+        );
+    }
+
+    /// layernorm_batch's two reductions must stay simd on Metal; a silent tree
+    /// fall-through is correct but slow and invisible to the numeric tests.
+    #[test]
+    fn generated_layernorm_batch_keeps_simd_sum() {
+        assert!(
+            shaders::LAYERNORM_BATCH_SLANG.contains("simd_sum"),
+            "generated MSL lost simd_sum; __target_switch selected the portable tree"
+        );
+    }
+
+    /// Both rmsnorm_batch entry points must keep the metal simd reduction; a
+    /// silent tree fall-through is correct but slow and invisible to the tests.
+    #[test]
+    fn generated_rmsnorm_batch_keeps_simd_sum() {
+        assert!(
+            shaders::RMSNORM_BATCH_SLANG.contains("simd_sum"),
+            "generated MSL lost simd_sum; __target_switch selected the portable tree"
+        );
+    }
 }
 
 /// Slang reaches Metal's `simdgroup_matrix` hardware through `linalg::CoopMat`.
@@ -1376,6 +2059,18 @@ fn generated_wgsl_has_no_subgroup_ops() {
     for (name, src) in [
         ("softmax", cera::backend::wgpu::shaders::SOFTMAX_SLANG),
         ("gemm_q8_0", cera::backend::wgpu::shaders::GEMM_Q8_0_SLANG),
+        (
+            "per_head_rmsnorm",
+            cera::backend::wgpu::shaders::PER_HEAD_RMSNORM_SLANG,
+        ),
+        (
+            "layernorm_batch",
+            cera::backend::wgpu::shaders::LAYERNORM_BATCH_SLANG,
+        ),
+        (
+            "rmsnorm_batch",
+            cera::backend::wgpu::shaders::RMSNORM_BATCH_SLANG,
+        ),
     ] {
         assert!(
             !src.contains("subgroup"),

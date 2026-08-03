@@ -134,6 +134,12 @@ required-features = ["metal"]
 name = "slang_elementwise_bench"
 required-features = ["metal"]
 
+# Phase 1b-i norm tier: generated per_head_rmsnorm, layernorm_batch, and
+# rmsnorm_batch (both entry points) against their handwritten twins. Metal-only.
+[[example]]
+name = "slang_norm_bench"
+required-features = ["metal"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true
