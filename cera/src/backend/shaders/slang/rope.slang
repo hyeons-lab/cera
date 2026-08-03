@@ -26,6 +26,16 @@
 [[vk::binding(2)]] StructuredBuffer<uint>    params       : register(t2);
 [[vk::binding(3)]] StructuredBuffer<float>   freq_factors : register(t3);
 
+/// Metal-only `powr`: the handwritten rope.metal computes `freq` with `powr`
+/// (the positive-base variant), and Slang's portable `pow` differs by ~1 ULP.
+/// That ULP is scaled by `pos` in `angle = pos * freq`, so at realistic decode
+/// positions (pos in the thousands) the two diverge by ~1e-4 in cos/sin. Using
+/// `powr` here keeps the generated MSL bit-identical to the handwritten kernel.
+/// Referenced only in the metal branch, so Slang omits it from the WGSL (which
+/// mirrors rope.wgsl's `pow` and needs no `powr`).
+__target_intrinsic(metal, "powr($0, $1)")
+float metal_powr(float base, float exponent);
+
 /// Rotate one (x0, x1) pair by `angle`. Portable, used by both branches.
 float2 rotate_pair(float x0, float x1, float angle) {
     float cos_a = cos(angle);
@@ -49,14 +59,13 @@ void rope(uint3 gid : SV_DispatchThreadID) {
         float freq_base = asfloat(params[4]);
         uint half_dim   = head_dim / 2u;
 
-        // `1.0 / pow(fb, 2d/hd)` mirrors rope.metal's `1.0f / powr(...)`; Slang
-        // has no `powr` spelling, so this emits `pow`, a few-ULP difference the
-        // parity test's relative bound absorbs.
+        // `1.0 / metal_powr(...)` matches rope.metal's `1.0f / powr(...)` exactly
+        // (see metal_powr above for why pow would not).
         uint q_total = n_heads * half_dim;
         if (idx < q_total) {
             uint head = idx / half_dim;
             uint d    = idx % half_dim;
-            float freq  = 1.0f / pow(freq_base, float(2u * d) / float(head_dim));
+            float freq  = 1.0f / metal_powr(freq_base, float(2u * d) / float(head_dim));
             float angle = float(pos) * freq;
             uint i0 = head * head_dim + d;
             uint i1 = i0 + half_dim;
@@ -69,7 +78,7 @@ void rope(uint3 gid : SV_DispatchThreadID) {
         if (idx < k_total) {
             uint head = idx / half_dim;
             uint d    = idx % half_dim;
-            float freq  = 1.0f / pow(freq_base, float(2u * d) / float(head_dim));
+            float freq  = 1.0f / metal_powr(freq_base, float(2u * d) / float(head_dim));
             float angle = float(pos) * freq;
             uint i0 = head * head_dim + d;
             uint i1 = i0 + half_dim;
