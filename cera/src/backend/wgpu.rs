@@ -1200,6 +1200,16 @@ pub mod shaders {
     pub const ELEMENTWISE_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/elementwise.wgsl"));
     pub const SCALE_F32: &str = include_str!("shaders/scale_f32.wgsl");
     pub const RMSNORM: &str = include_str!("shaders/rmsnorm.wgsl");
+    /// Same kernel as [`RMSNORM`], generated from `shaders/slang/rmsnorm.slang`
+    /// by build.rs and shared with the Metal backend's
+    /// [`super::super::metal::shaders::RMSNORM_SLANG`]. A `__target_switch` port
+    /// that diverges in both reduction and I/O model: this wgsl branch is
+    /// in-place (3 bindings) with a shared-memory tree; the metal branch is
+    /// out-of-place (4 buffers) with a two-stage `simd_sum`. Each branch's
+    /// binding set is dropped for the other target. Not yet on the production
+    /// path: `tests/slang_multitarget_parity.rs` pins it against the CPU
+    /// reference.
+    pub const RMSNORM_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm.wgsl"));
     pub const RMSNORM_BATCH: &str = include_str!("shaders/rmsnorm_batch.wgsl");
     /// Same two kernels as [`RMSNORM_BATCH`] (`rmsnorm_batch` +
     /// `add_rmsnorm_batch`), generated from `shaders/slang/rmsnorm_batch.slang`
@@ -1251,6 +1261,14 @@ pub mod shaders {
     /// source can carry a cooperative-matrix path and still emit legal WGSL.
     pub const GEMM_Q8_0_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/gemm_q8_0.wgsl"));
     pub const ARGMAX_F32: &str = include_str!("shaders/argmax_f32.wgsl");
+    /// Same kernel as [`ARGMAX_F32`], generated from
+    /// `shaders/slang/argmax_f32.slang` by build.rs and shared with the Metal
+    /// backend's [`super::super::metal::shaders::ARGMAX_F32_SLANG`]. A
+    /// `__target_switch` port: this wgsl branch keeps the shared-memory tree, the
+    /// metal branch the two-stage `simd_shuffle_down`. Not yet on the production
+    /// path: `tests/slang_multitarget_parity.rs` pins it against the CPU
+    /// reference.
+    pub const ARGMAX_F32_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/argmax_f32.wgsl"));
     pub const ROPE: &str = include_str!("shaders/rope.wgsl");
     /// Same RoPE kernel as [`ROPE`] (NEOX + interleaved + freq_factors),
     /// generated from `shaders/slang/rope.slang` by build.rs. A `__target_switch`

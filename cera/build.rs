@@ -125,6 +125,8 @@ const SLANG_MULTI_KERNELS: &[&str] = &[
     "per_head_rmsnorm",
     "layernorm_batch",
     "rmsnorm_batch",
+    "argmax_f32",
+    "rmsnorm",
 ];
 
 /// Compile each multi-target kernel to the shader languages the enabled
