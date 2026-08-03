@@ -418,8 +418,9 @@ fn synth_f32(m: u32, k: u32) -> (Vec<u8>, Vec<f32>) {
 }
 
 /// Dense-f32 reg-tile loader: the batched-prefill fallback that `upload_weight`
-/// routes every non-quant dtype through (F16/BF16/F32 sources, Q4_1, Q2_K, all
-/// dequantized to f32 on the GPU). Binds src0 as `array<f32>`
+/// routes every dtype without a dedicated reg-tile loader through (F16/BF16/F32
+/// sources, plus quant types like Q4_1/Q2_K), dequantizing on the CPU and
+/// uploading the result as f32. Binds src0 as `array<f32>`
 /// (`SRC0_INNER_TYPE = f32`) and reads through `INIT_SRC0_SHMEM_FLOAT`, matching
 /// `gpu_lfm2`'s `mul_mat_reg_tile_f32` pipeline. Naga only: unlike the quantized
 /// loaders, f32 has no Slang SPIR-V passthrough kernel (the passthrough covers

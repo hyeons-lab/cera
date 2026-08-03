@@ -431,11 +431,11 @@ struct GpuPipelines {
     mul_mat_reg_tile_q4_k: wgpu::ComputePipeline,
     mul_mat_reg_tile_q5_k: wgpu::ComputePipeline,
     mul_mat_reg_tile_q6_k: wgpu::ComputePipeline,
-    /// Dense-f32 reg-tile GEMM. Serves every weight dequantized to f32 on the
-    /// GPU (F16/BF16/F32 sources, and quant types with no reg-tile loader like
-    /// Q4_1/Q2_K, which `upload_weight` also stores as f32). Having it means a
-    /// single unsupported-dtype tensor no longer drops the whole model onto the
-    /// per-token prefill loop.
+    /// Dense-f32 reg-tile GEMM. Serves every weight stored as f32 on the GPU:
+    /// F16/BF16/F32 sources, plus quant types with no reg-tile loader (like
+    /// Q4_1/Q2_K), which `upload_weight` dequantizes on the CPU and uploads as
+    /// f32. Having it means a single unsupported-dtype tensor no longer drops the
+    /// whole model onto the per-token prefill loop.
     mul_mat_reg_tile_f32: wgpu::ComputePipeline,
     attention_prefill: wgpu::ComputePipeline,
 }
