@@ -18,6 +18,7 @@
 #                            [--llama-bench <path-on-device>]
 #                            [--prompt 512] [--decode 128] [--runs 5]
 #                            [--decode-prompt 128] [--passes 5] [--equil-warm 2]
+#                            [--min-battery 30]
 #
 # The model must already be on the device at $DEVICE_DIR/<name.gguf>, and the
 # cera binary is pushed from target/aarch64-linux-android/release/cera (build
@@ -43,6 +44,11 @@ WARMUP=2
 # thermal transient, which is what made earlier numbers unrepeatable.
 EQUIL_WARM=2
 PASSES=5
+# Minimum battery level to measure at. Android reduces peak clocks at low
+# battery, and a run that drains across its own matrix compares its early cells
+# against its late ones at different power budgets. A whole session was measured
+# here from 93% down to 14% before this was noticed.
+MIN_BATTERY=30
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -56,6 +62,7 @@ while [[ $# -gt 0 ]]; do
     --decode-prompt) DECODE_PROMPT="$2"; shift 2 ;;
     --passes)      PASSES="$2"; shift 2 ;;
     --equil-warm)  EQUIL_WARM="$2"; shift 2 ;;
+    --min-battery) MIN_BATTERY="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -87,7 +94,7 @@ LOG="bench_android_raw.log"
 # soc_big_min/max bracket the BIG-cluster temperature seen around this cell, and
 # exist to prove equilibrium held; if they span more than a few degrees the run
 # was still in the thermal transient and the medians are not comparable.
-echo "engine,config,prefill_med,prefill_cov,decode_med,decode_cov,n,soc_big_min,soc_big_max" > "$OUT"
+echo "engine,config,prefill_med,prefill_cov,decode_med,decode_cov,n,soc_big_min,soc_big_max,batt_start,batt_end,power_state" > "$OUT"
 : > "$LOG"
 
 echo "==> pushing cera to $DEVICE_DIR"
@@ -140,6 +147,21 @@ soc_big() {
   "${ADB[@]}" shell "dumpsys thermalservice" 2>/dev/null \
     | awk '/Current temperatures from HAL/,/Current cooling devices/' \
     | sed -n 's/.*mValue=\([0-9.]*\), mType=0, mName=BIG, .*/\1/p' | head -1 | cut -d. -f1
+}
+
+batt_level() { "${ADB[@]}" shell "dumpsys battery | grep -i '^  level'" 2>/dev/null | grep -oE '[0-9]+' | head -1; }
+
+# Three-way, not a boolean: "plugged in but not charging" is its own power
+# envelope (the charger is current-limiting), and conflating it with charging
+# hides a real difference in what the SoC is allowed to draw.
+power_state() {
+  local out; out=$("${ADB[@]}" shell "dumpsys battery" 2>/dev/null)
+  local plugged=no
+  grep -qE '^  (AC|USB|Wireless|Dock) powered: true' <<<"$out" && plugged=yes
+  local status; status=$(grep -oE '^  status: [0-9]+' <<<"$out" | grep -oE '[0-9]+')
+  if [[ "$plugged" == yes && "$status" == 2 ]]; then echo charging
+  elif [[ "$plugged" == yes ]]; then echo plugged_not_charging
+  else echo on_battery; fi
 }
 
 # Samples accumulate in one file per cell+phase. Deliberately not `declare -A`:
@@ -202,6 +224,16 @@ one_pass() {
   sample_cera gpu "wgpu-vulkan" ""
 }
 
+BATT_START=$(batt_level); POWER_STATE=$(power_state)
+echo "==> battery ${BATT_START}% (${POWER_STATE}), min required ${MIN_BATTERY}%" | tee -a "$LOG"
+if [[ -n "$BATT_START" && "$BATT_START" -lt "$MIN_BATTERY" ]]; then
+  echo "error: battery ${BATT_START}% is below --min-battery ${MIN_BATTERY}%." >&2
+  echo "       Android throttles at low battery, so these numbers would not be" >&2
+  echo "       comparable to a run taken at a healthy level. Charge, or lower the" >&2
+  echo "       gate deliberately and record that you did." >&2
+  exit 3
+fi
+
 echo "==> driving to thermal equilibrium ($EQUIL_WARM warm-up passes, discarded)"
 for ((w = 0; w < EQUIL_WARM; w++)); do
   one_pass >/dev/null 2>&1 || true
@@ -228,6 +260,8 @@ stats() { # file -> "median cov n"
     }'
 }
 
+BATT_END=$(batt_level)
+
 soc_range() { # key -> "min max"
   local f; f="$SAMPLE_DIR/$(slug "$1").soc"
   [[ -s "$f" ]] || { echo "NA NA"; return; }
@@ -241,7 +275,7 @@ soc_range() { # key -> "min max"
     read -r pmed pcov _ <<<"$(stats "$SAMPLE_DIR/$(slug "$cell|prefill").vals")"
     read -r dmed dcov dn <<<"$(stats "$SAMPLE_DIR/$(slug "$cell|decode").vals")"
     read -r smin smax <<<"$(soc_range "$cell")"
-    echo "$eng,$cfg,$pmed,$pcov,$dmed,$dcov,$dn,$smin,$smax"
+    echo "$eng,$cfg,$pmed,$pcov,$dmed,$dcov,$dn,$smin,$smax,${BATT_START:-NA},${BATT_END:-NA},${POWER_STATE:-NA}"
   done
 } >> "$OUT"
 

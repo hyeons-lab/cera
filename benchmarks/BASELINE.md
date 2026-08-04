@@ -60,6 +60,11 @@ not repeatable.
 cera `b0ffd7e`, llama.cpp `f12cc6d0f` (9371), both pinned to the same five perf
 cores, 6 invocations each at equilibrium (BIG 64-70 C), 512-token decode.
 
+**Provisional: battery level was not recorded for this measurement** (it was
+somewhere around 55-60%, reconstructed from ad-hoc probes, and falling). Battery
+gating landed after it was taken. Treat the ratio as indicative and re-measure
+with `batt_start`/`batt_end` populated before quoting it.
+
 | Engine | Config | Decode median | CoV | spread |
 |---|---|---:|---:|---:|
 | **cera** | `taskset 7c` | **65.5** | 4.2% | 1.12x |
@@ -417,6 +422,17 @@ CERA_GPU_PROFILE=1 cera bench -m <model.gguf> --device gpu \
   understates cera by that margin. Decode is the mirror image: it wants a
   realistic prompt, so measure it separately with `--prompt-tokens 128
   --max-tokens 128`.
+- **Record battery level and power state, and gate on level.** Android reduces
+  peak clocks at low battery, so a session that drains while it measures compares
+  its early cells against its late ones at different power budgets. The runs
+  behind an earlier revision of this file drained 93% to 14% with the level
+  recorded nowhere, which makes every cross-matrix comparison in that revision
+  suspect independently of the thermal story. `bench_android.sh` now refuses to
+  start below `--min-battery` (default 30) and writes `batt_start`, `batt_end`
+  and a three-way `power_state` into every row. The state is three-way on
+  purpose: "plugged in but not charging" is its own power envelope, because the
+  charger is current-limiting, and folding it into a boolean hides a real
+  difference in what the SoC may draw.
 - **Battery temperature is not SoC temperature, and gating on it is useless.**
   Under load the BIG cluster reaches 74 C while the battery reads 23 C: a 0.5 C
   move on the sensor that is easy to read against a 48 C swing on the one that
