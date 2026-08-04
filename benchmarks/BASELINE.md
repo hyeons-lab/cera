@@ -55,24 +55,28 @@ the one that matters for comparing engines or commits. It is deliberately not
 the peak a cold phone reaches for two seconds, which is roughly 1.5x higher and
 not repeatable.
 
-### Decode at equilibrium, LFM2.5-350M Q4_K_M
+### Decode, frequency-matched, LFM2.5-350M Q4_K_M
 
 cera `b0ffd7e`, llama.cpp `f12cc6d0f` (9371), both pinned to the same five perf
-cores, 6 invocations each at equilibrium (BIG 64-70 C), 512-token decode.
+cores, 16 interleaved invocations each with the mid-run CPU frequency recorded,
+512-token decode.
 
-**Provisional: battery level was not recorded for this measurement** (it was
-somewhere around 55-60%, reconstructed from ad-hoc probes, and falling). Battery
-gating landed after it was taken. Treat the ratio as indicative and re-measure
-with `batt_start`/`batt_end` populated before quoting it.
+| Engine | All samples | Filtered to 3052 MHz |
+|---|---|---|
+| cera | n=16, median 51.8, CoV 12.4% | n=8, median **58.3**, CoV 7.1% |
+| llama.cpp | n=16, median 50.8, CoV 14.1% | n=3, median **56.9**, CoV 4.5% |
 
-| Engine | Config | Decode median | CoV | spread |
-|---|---|---:|---:|---:|
-| **cera** | `taskset 7c` | **65.5** | 4.2% | 1.12x |
-| llama.cpp | `-t 5`, `taskset 7c` | 59.3 | 4.5% | 1.13x |
+**No significant difference: 1.02x at 0.7 sigma.** At matched CPU frequency the
+two engines decode at the same speed on this device. Unfiltered, the same 32
+invocations would support almost any ratio you wanted to quote, which is what
+several earlier revisions of this file did.
 
-**cera 1.10x**, a 6.2 tok/s difference against a 1.6 combined standard error,
-so 3.9 sigma. It is a lower bound: cera decodes from a 128-token prompt while
-`llama-bench`'s `tg` starts from an empty context, which disfavours cera.
+Two caveats. llama reached the maximum clock in only 3 of 16 invocations against
+cera's 8, so its filtered median rests on a small sample; the asymmetry is
+probably cera's heavier in-process warmup driving the governor up before its
+timed run, and it is worth investigating separately. And cera decodes from a
+128-token prompt while `llama-bench`'s `tg` starts from an empty context, which
+disfavours cera slightly.
 
 The full matrix (all pinning configs, prefill, GPU) has not been re-measured
 under this protocol yet; a run needs roughly half an hour of device time because
