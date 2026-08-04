@@ -61,13 +61,13 @@ was entirely an artifact: the harness measured cera with one combined
 `--prompt-tokens 512 --max-tokens 128` invocation while `llama-bench` times its
 `pp512` separately, and simply splitting the cera run moved it 149 -> 208.
 
-**‡ Decode is not measurable on this device at n=5, for either engine.** Do not
-quote a decode ratio from this table. Across five matrices llama's own `-t 5`
-config, an unchanged binary at fixed settings, returned 62.7 / 60.8 / 91.2 / 43.4
-/ 48.6 tok/s, a 2.1x spread; cera's best config moved 66.7 / 83.7 / 95.3 / 61.3 /
-75.7 over the same matrices. Cooling flattens the trend but does not close this,
-so the residual is scheduler placement on big.LITTLE rather than temperature.
-Resolving it needs many more runs per config, not another matrix.
+**‡ Decode is not measurable on this device for either engine on CPU.** Do not
+quote a CPU decode ratio from this table. Three back-to-back matrices under
+active cooling, at 26-30 C with thermal headroom never above 0.60, still
+disagreed by 1.15-2.25x on every CPU config, while the wgpu row in those same
+matrices reproduced to 1.00x. It is CPU DVFS, it is not thermal, and it is not
+fixable without root on this device; see the traps section for the evidence.
+The GPU row is reproducible and can be quoted.
 
 For the same reason no code delta is claimed against the previous `c6f845d`
 entry: the decode column cannot support one, and the cooling regime changed too
@@ -417,6 +417,24 @@ CERA_GPU_PROFILE=1 cera bench -m <model.gguf> --device gpu \
   understates cera by that margin. Decode is the mirror image: it wants a
   realistic prompt, so measure it separately with `--prompt-tokens 128
   --max-tokens 128`.
+- **Android CPU decode is not reliably measurable on this device, and it is not
+  thermal.** Three back-to-back matrices, TEC cooler running, identical settings,
+  battery 26-30 C throughout and headroom never above 0.60 against a 0.95
+  throttling threshold, still disagreed by 1.15-2.25x on every CPU config. The
+  control is in the same table: `wgpu-vulkan` returned **21.0 / 20.9 / 20.9**
+  across those same three matrices, a 1.00x spread, while `pin-perf-7c` on the
+  CPU returned 75.7 / 96.7 / 66.0. The GPU rows even spanned a *wider*
+  temperature range (27.9-29.1 C) than the CPU rows (28.1-28.5 C). Same device,
+  same harness, same thermal state, one backend perfectly reproducible and the
+  other varying 1.5x.
+  The cause is CPU DVFS, and we cannot control it: the governor is `sched_pixel`
+  with 24 operating points from 177 MHz to 3.05 GHz, `adb shell` runs as
+  uid 2000, and writing `scaling_governor` is denied without root. `taskset`
+  fixes which cores run the work, not what frequency they run at. Note the most
+  stable CPU config is llama `-t 1` on a single core (1.15x), which is consistent
+  with multi-core frequency and placement being the driver.
+  Practical consequence: quote Android GPU numbers, and for CPU either report the
+  distribution over several whole matrices or do not state a ratio at all.
 - **The variance is between invocations, not within them.** On the same pinned
   config, `taskset 7c`, cera decode returned 60.5 / 94.0 / 75.7 across three
   matrices while its stddev *inside* each invocation stayed at 1.0-5.3. Two
