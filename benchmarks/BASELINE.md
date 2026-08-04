@@ -422,6 +422,30 @@ CERA_GPU_PROFILE=1 cera bench -m <model.gguf> --device gpu \
   understates cera by that margin. Decode is the mirror image: it wants a
   realistic prompt, so measure it separately with `--prompt-tokens 128
   --max-tokens 128`.
+- **Throughput tracks CPU frequency, and the governor's ramp is the dominant
+  noise source.** Measured against llama-bench decode over 16 instrumented
+  invocations: `corr(tok/s, CPU frequency) = +0.83`, and filtering to the samples
+  taken at the maximum 3052 MHz cut the coefficient of variation from **17.1% to
+  2.6%** (cera: 13.2% to 6.0%). `sched_pixel` has 24 operating points from 177
+  MHz to 3052 MHz and ramps on recent load, so a short measurement can finish
+  before the cores reach the top, and whether they do depends on load history.
+  That is why the failure is episodic rather than random.
+  **Temperature correlates with frequency at +0.95 in the same direction**, so a
+  hot device here is a fast one and thermal throttling is not the mechanism; an
+  earlier revision of this file had that causality backwards.
+  It cannot be fixed from outside the device, and all of these were measured and
+  rejected: pinning the governor (needs root), pre-warming the cores (decays
+  across the adb round trip), longer measurements (trade ramp noise for thermal
+  decline, and the median falls), more warmup iterations (16.3% vs 17.3% CoV),
+  mmap vs no-mmap, threadpool `--poll`/`--cpu-strict`, and memory pressure
+  (`SwapFree` was flat across every invocation). So `bench_android.sh` records
+  `cpu_mhz_min`/`cpu_mhz_max` per cell; a cell whose range does not sit at the
+  top of the ladder was not measured at speed.
+- **This affects both engines equally.** Under identical interleaved conditions
+  cera measured 16.3% CoV against llama.cpp's 17.1%. An earlier revision claimed
+  llama was ~2x noisier; that was a sampling window, not a property of either
+  engine, and it is why a cross-engine decode ratio needs frequency-matched
+  samples rather than more repetitions.
 - **Record battery level and power state, and gate on level.** Android reduces
   peak clocks at low battery, so a session that drains while it measures compares
   its early cells against its late ones at different power budgets. The runs

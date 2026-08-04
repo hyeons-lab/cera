@@ -94,7 +94,7 @@ LOG="bench_android_raw.log"
 # soc_big_min/max bracket the BIG-cluster temperature seen around this cell, and
 # exist to prove equilibrium held; if they span more than a few degrees the run
 # was still in the thermal transient and the medians are not comparable.
-echo "engine,config,prefill_med,prefill_cov,decode_med,decode_cov,n,soc_big_min,soc_big_max,batt_start,batt_end,power_state" > "$OUT"
+echo "engine,config,prefill_med,prefill_cov,decode_med,decode_cov,n,soc_big_min,soc_big_max,cpu_mhz_min,cpu_mhz_max,batt_start,batt_end,power_state" > "$OUT"
 : > "$LOG"
 
 echo "==> pushing cera to $DEVICE_DIR"
@@ -149,6 +149,26 @@ soc_big() {
     | sed -n 's/.*mValue=\([0-9.]*\), mType=0, mName=BIG, .*/\1/p' | head -1 | cut -d. -f1
 }
 
+# Mid-run CPU frequency on a perf core, MHz. This is the variable that actually
+# predicts throughput: measured against llama-bench decode over 16 invocations,
+# corr(tok/s, frequency) = +0.83, and filtering to samples taken at the maximum
+# clock cut the coefficient of variation from 17.1% to 2.6% (cera: 13.2% to
+# 6.0%). Temperature correlates with frequency at +0.95 in the SAME direction,
+# so a hot device here is a fast one; thermal throttling is not the mechanism.
+#
+# The governor (`sched_pixel`, 24 operating points from 177 MHz to 3052 MHz)
+# ramps on recent load, and a short measurement can finish before it reaches the
+# top. That cannot be fixed from outside: pinning the governor needs root,
+# pre-warming decays across the adb round trip, longer measurements trade ramp
+# noise for thermal decline, and warmup iterations make no difference (all
+# measured). So record it and let the reader see which samples were taken at
+# speed.
+cpu_mhz() {
+  local f
+  f=$("${ADB[@]}" shell "cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_cur_freq" 2>/dev/null | tr -d '\r')
+  [[ -n "$f" ]] && echo $((f / 1000)) || echo ""
+}
+
 batt_level() { "${ADB[@]}" shell "dumpsys battery | grep -i '^  level'" 2>/dev/null | grep -oE '[0-9]+' | head -1; }
 
 # Three-way, not a boolean: "plugged in but not charging" is its own power
@@ -178,8 +198,9 @@ record() { # key value
 }
 
 note_soc() { # key
-  local t; t=$(soc_big); [[ -n "$t" ]] || return 0
-  echo "$t" >> "$SAMPLE_DIR/$(slug "$1").soc"
+  local t; t=$(soc_big); [[ -n "$t" ]] && echo "$t" >> "$SAMPLE_DIR/$(slug "$1").soc"
+  local m; m=$(cpu_mhz); [[ -n "$m" ]] && echo "$m" >> "$SAMPLE_DIR/$(slug "$1").mhz"
+  return 0
 }
 
 sample_cera() { # backend label mask
@@ -262,8 +283,8 @@ stats() { # file -> "median cov n"
 
 BATT_END=$(batt_level)
 
-soc_range() { # key -> "min max"
-  local f; f="$SAMPLE_DIR/$(slug "$1").soc"
+range_of() { # key ext -> "min max"
+  local f; f="$SAMPLE_DIR/$(slug "$1").$2"
   [[ -s "$f" ]] || { echo "NA NA"; return; }
   sort -n "$f" | awk 'NR==1{min=$1} {max=$1} END{printf "%s %s", min, max}'
 }
@@ -274,8 +295,9 @@ soc_range() { # key -> "min max"
     eng="${cell%%|*}"; cfg="${cell##*|}"
     read -r pmed pcov _ <<<"$(stats "$SAMPLE_DIR/$(slug "$cell|prefill").vals")"
     read -r dmed dcov dn <<<"$(stats "$SAMPLE_DIR/$(slug "$cell|decode").vals")"
-    read -r smin smax <<<"$(soc_range "$cell")"
-    echo "$eng,$cfg,$pmed,$pcov,$dmed,$dcov,$dn,$smin,$smax,${BATT_START:-NA},${BATT_END:-NA},${POWER_STATE:-NA}"
+    read -r smin smax <<<"$(range_of "$cell" soc)"
+    read -r fmin fmax <<<"$(range_of "$cell" mhz)"
+    echo "$eng,$cfg,$pmed,$pcov,$dmed,$dcov,$dn,$smin,$smax,$fmin,$fmax,${BATT_START:-NA},${BATT_END:-NA},${POWER_STATE:-NA}"
   done
 } >> "$OUT"
 
