@@ -78,7 +78,17 @@ BIN_LOCAL="target/aarch64-linux-android/release/cera"
 
 OUT="bench_android.csv"
 LOG="bench_android_raw.log"
-echo "engine,backend,config,prefill_p50,decode_p50,prefill_stddev,decode_stddev" > "$OUT"
+# Thermal columns exist because the dominant source of variance on this device is
+# BETWEEN invocations, not within one: the same pinned config has returned 60.5
+# and 94.0 decode across matrices while its within-invocation stddev stayed at
+# 1-5. Affinity cannot explain that and more --runs cannot fix it, so every
+# measurement records the thermal state it was taken in.
+#   batt_c_pre/post : battery temperature C, sampled around each measurement.
+#                     Works for both engines, which is why it is here at all.
+#   hr0 / hrmax     : cera's own thermal headroom (0=cool, 1.0=throttling) at
+#                     launch and its max over runs. NA for llama.cpp, which has
+#                     no equivalent readout.
+echo "engine,backend,config,prefill_p50,decode_p50,prefill_stddev,decode_stddev,batt_c_pre,batt_c_post,hr0,hrmax" > "$OUT"
 : > "$LOG"
 
 echo "==> pushing cera to $DEVICE_DIR"
@@ -105,10 +115,11 @@ run_cera() {
 --runs $RUNS --warmup $WARMUP --no-cache --gpu-io"
 
   echo "=== cera $backend [$label] ===" | tee -a "$LOG"
-  local pre_out dec_out
+  local pre_out dec_out t_pre t_post
+  t_pre=$(batt_c)
   if ! pre_out=$("${ADB[@]}" shell "$base --prompt-tokens $PROMPT --max-tokens 0" 2>&1); then
     echo "$pre_out" >> "$LOG"
-    echo "cera,$backend,$label,FAIL,FAIL,FAIL,FAIL" >> "$OUT"
+    echo "cera,$backend,$label,FAIL,FAIL,FAIL,FAIL,$t_pre,$(batt_c),NA,NA" >> "$OUT"
     return
   fi
   # Log the prefill run as soon as it succeeds: if the decode run below fails we
@@ -119,10 +130,11 @@ run_cera() {
   settle
   if ! dec_out=$("${ADB[@]}" shell "$base --prompt-tokens $DECODE_PROMPT --max-tokens $DECODE" 2>&1); then
     echo "${dec_out:-}" >> "$LOG"
-    echo "cera,$backend,$label,FAIL,FAIL,FAIL,FAIL" >> "$OUT"
+    echo "cera,$backend,$label,FAIL,FAIL,FAIL,FAIL,$t_pre,$(batt_c),NA,NA" >> "$OUT"
     return
   fi
   echo "$dec_out" >> "$LOG"
+  t_post=$(batt_c)
 
   local pre dec p50 d50 psd dsd
   # `|| true` on every grep: under `set -euo pipefail` a non-matching grep in a
@@ -134,8 +146,13 @@ run_cera() {
   d50=$(sed -n 's/.*p50=\([0-9.]*\).*/\1/p' <<<"$dec")
   psd=$(sed -n 's/.*stddev=\([0-9.]*\).*/\1/p' <<<"$pre")
   dsd=$(sed -n 's/.*stddev=\([0-9.]*\).*/\1/p' <<<"$dec")
-  echo "cera,$backend,$label,${p50:-NA},${d50:-NA},${psd:-NA},${dsd:-NA}" >> "$OUT"
-  echo "  -> prefill p50=$p50 decode p50=$d50" | tee -a "$LOG"
+  # Headroom comes from the decode invocation: decode stability is the open
+  # question, and hr0 is the state the process launched into, which is the
+  # variable the between-invocation drift is suspected to track.
+  local hr0 hrmax
+  hr0=$(parse_hr0 "$dec_out"); hrmax=$(parse_hrmax "$dec_out")
+  echo "cera,$backend,$label,${p50:-NA},${d50:-NA},${psd:-NA},${dsd:-NA},${t_pre:-NA},${t_post:-NA},${hr0:-NA},${hrmax:-NA}" >> "$OUT"
+  echo "  -> prefill p50=$p50 decode p50=$d50 | batt ${t_pre}->${t_post} C | headroom ${hr0:-NA}->${hrmax:-NA}" | tee -a "$LOG"
   # The --gpu-io lines say whether a GPU change actually removed round-trips;
   # keep them in the raw log where they can't be lost to CSV flattening. Grep
   # BOTH runs: `cera bench` skips the report when it generates no tokens, so the
@@ -153,7 +170,8 @@ run_llama() {
   local t="$1" mask="$2"
   local rt; rt=$(dirname "$LLAMA_BENCH")
   echo "=== llama-bench -t $t (taskset $mask) ===" | tee -a "$LOG"
-  local out
+  local out t_pre t_post
+  t_pre=$(batt_c)
   out=$("${ADB[@]}" shell "cd $rt && LD_LIBRARY_PATH=. taskset $mask ./$(basename "$LLAMA_BENCH") \
 -m $DEVICE_DIR/$MODEL -t $t -p $PROMPT -n $DECODE -r $RUNS -o md" 2>&1) || true
   echo "$out" >> "$LOG"
@@ -169,11 +187,25 @@ run_llama() {
   tg=$(sed -n "s/.*|[[:space:]]*\\([0-9.]*\\) ±.*/\\1/p" <<<"$tgrow")
   ppsd=$(sed -n "s/.*± *\\([0-9.]*\\).*/\\1/p" <<<"$pprow")
   tgsd=$(sed -n "s/.*± *\\([0-9.]*\\).*/\\1/p" <<<"$tgrow")
-  echo "llama.cpp,cpu,t$t-$mask,${pp:-NA},${tg:-NA},${ppsd:-NA},${tgsd:-NA}" >> "$OUT"
-  echo "  -> pp=$pp tg=$tg" | tee -a "$LOG"
+  t_post=$(batt_c)
+  echo "llama.cpp,cpu,t$t-$mask,${pp:-NA},${tg:-NA},${ppsd:-NA},${tgsd:-NA},${t_pre:-NA},${t_post:-NA},NA,NA" >> "$OUT"
+  echo "  -> pp=$pp tg=$tg | batt ${t_pre}->${t_post} C" | tee -a "$LOG"
 }
 
 settle() { [[ "$SETTLE" -gt 0 ]] && sleep "$SETTLE" || true; }
+
+# Battery temperature in C (dumpsys reports deci-degrees). The only thermal
+# signal available for both engines, so it is what makes llama rows comparable.
+batt_c() {
+  local raw
+  raw=$("${ADB[@]}" shell "dumpsys battery | grep -i temperature" 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)
+  [[ -n "$raw" ]] && awk -v r="$raw" 'BEGIN{printf "%.1f", r/10}' || echo "NA"
+}
+
+# cera prints "thermal headroom before warmup: 0.42 (...)" and
+# "thermal headroom over runs: min=0.40 max=0.71" on stderr.
+parse_hr0()   { sed -n 's/.*thermal headroom before warmup: \([0-9.]*\).*/\1/p' <<<"$1" | head -1; }
+parse_hrmax() { sed -n 's/.*thermal headroom over runs:.*max=\([0-9.]*\).*/\1/p' <<<"$1" | head -1; }
 
 # Engines are INTERLEAVED. Running every cera config and then every llama config
 # measures llama on a hotter device, which is a systematic bias in cera's favour

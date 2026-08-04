@@ -38,9 +38,9 @@ CPU has `asimddp` + `i8mm`.
 
 cera `b0ffd7e`, llama.cpp `f12cc6d0f` (9371), `scripts/bench_android.sh` with
 separate prefill/decode runs and interleaved engines, 5 runs, `--settle 30`.
-Battery 27.6 -> 30.2 C across the matrix. The llama rows carry no stddev because
-this matrix predates the harness change that keeps `llama-bench`'s `±` value; the
-next run will have it, which is what a decode claim here would need.
+Battery 27.6 -> 30.2 C across the matrix. The llama rows carry no stddev, and no
+row carries per-measurement thermal state, because this matrix predates the
+harness changes that record both. A decode claim here would need them.
 
 | Engine | Config | Prefill | Decode ‡ |
 |---|---|---:|---:|
@@ -417,6 +417,17 @@ CERA_GPU_PROFILE=1 cera bench -m <model.gguf> --device gpu \
   understates cera by that margin. Decode is the mirror image: it wants a
   realistic prompt, so measure it separately with `--prompt-tokens 128
   --max-tokens 128`.
+- **The variance is between invocations, not within them.** On the same pinned
+  config, `taskset 7c`, cera decode returned 60.5 / 94.0 / 75.7 across three
+  matrices while its stddev *inside* each invocation stayed at 1.0-5.3. Two
+  consequences: raising `--runs` cannot fix it (it samples the tight
+  within-invocation distribution harder), and CPU affinity cannot either (the
+  unstable configs are the pinned ones). The sampling unit has to be the whole
+  invocation: repeat the matrix and report the spread across matrices. To make
+  that diagnosable, `bench_android.sh` records `batt_c_pre`/`batt_c_post` for
+  every measurement on both engines, and cera's own `hr0`/`hrmax` thermal
+  headroom (0=cool, 1.0=throttling) for its own. If `hr0` differs between two
+  invocations that disagree, the drift is thermal; if it does not, it is not.
 - **Cool the phone, and prove it stayed cool.** Thermal state dominates
   everything else on Android. The same matrix on the same commit gave best decode
   95.3 (battery 27.8 -> 28.8 C, TEC cooler) and 61.3 (27.6 -> 32.3 C, cooler
