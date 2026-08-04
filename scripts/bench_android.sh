@@ -17,7 +17,7 @@
 #   scripts/bench_android.sh --model <name.gguf> [--serial <adb-serial>]
 #                            [--llama-bench <path-on-device>]
 #                            [--prompt 512] [--decode 128] [--runs 5]
-#                            [--decode-prompt 128] [--settle 30]
+#                            [--decode-prompt 128] [--passes 5] [--equil-warm 2]
 #
 # The model must already be on the device at $DEVICE_DIR/<name.gguf>, and the
 # cera binary is pushed from target/aarch64-linux-android/release/cera (build
@@ -29,7 +29,7 @@ MODEL=""
 SERIAL="${CERA_ANDROID_SERIAL:-}"
 LLAMA_BENCH=""
 PROMPT=512
-DECODE=128
+DECODE=512
 # Prompt depth cera's decode run starts from. This is the one axis the two
 # harnesses do NOT match: llama-bench's `tg` always starts from an empty context
 # and this script does not pass its `-d/--n-depth`, so cera decodes at greater KV
@@ -38,10 +38,11 @@ DECODE=128
 DECODE_PROMPT=128
 RUNS=5
 WARMUP=2
-# Seconds to idle between measurements. Thermal state dominates on a phone and
-# back-to-back runs drift downward, so this defaults ON; pass `--settle 0` to opt
-# out when you only want a quick smoke run rather than comparable numbers.
-SETTLE=30
+# Passes to discard while the SoC reaches thermal equilibrium, then measured
+# passes. Do NOT add an idle between them: cooling drops the device back into the
+# thermal transient, which is what made earlier numbers unrepeatable.
+EQUIL_WARM=2
+PASSES=5
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,7 +54,8 @@ while [[ $# -gt 0 ]]; do
     --runs)        RUNS="$2"; shift 2 ;;
     --warmup)      WARMUP="$2"; shift 2 ;;
     --decode-prompt) DECODE_PROMPT="$2"; shift 2 ;;
-    --settle)      SETTLE="$2"; shift 2 ;;
+    --passes)      PASSES="$2"; shift 2 ;;
+    --equil-warm)  EQUIL_WARM="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -78,17 +80,14 @@ BIN_LOCAL="target/aarch64-linux-android/release/cera"
 
 OUT="bench_android.csv"
 LOG="bench_android_raw.log"
-# Thermal columns exist because the dominant source of variance on this device is
-# BETWEEN invocations, not within one: the same pinned config has returned 60.5
-# and 94.0 decode across matrices while its within-invocation stddev stayed at
-# 1-5. Affinity cannot explain that and more --runs cannot fix it, so every
-# measurement records the thermal state it was taken in.
-#   batt_c_pre/post : battery temperature C, sampled around each measurement.
-#                     Works for both engines, which is why it is here at all.
-#   hr0 / hrmax     : cera's own thermal headroom (0=cool, 1.0=throttling) at
-#                     launch and its max over runs. NA for llama.cpp, which has
-#                     no equivalent readout.
-echo "engine,backend,config,prefill_p50,decode_p50,prefill_stddev,decode_stddev,batt_c_pre,batt_c_post,hr0,hrmax" > "$OUT"
+# One row per cell, aggregated across PASSES measured passes rather than a single
+# invocation: the dominant variance on this device is between invocations, so the
+# invocation has to be the sampling unit. `*_cov` is the coefficient of variation
+# across passes (percent) and is the number that says whether a gap is real.
+# soc_big_min/max bracket the BIG-cluster temperature seen around this cell, and
+# exist to prove equilibrium held; if they span more than a few degrees the run
+# was still in the thermal transient and the medians are not comparable.
+echo "engine,config,prefill_med,prefill_cov,decode_med,decode_cov,n,soc_big_min,soc_big_max" > "$OUT"
 : > "$LOG"
 
 echo "==> pushing cera to $DEVICE_DIR"
@@ -101,123 +100,150 @@ echo "==> pushing cera to $DEVICE_DIR"
 #   80     = prime core only (cpu7)
 #   fc     = perf + prime (cpu2-7)
 #   7c     = perf cluster only (cpu2-6)
-# Prefill and decode are measured in SEPARATE invocations, and this is not
-# cosmetic. Timing prefill in a run that also decodes reads it ~10% low with ~8x
-# the variance, and llama-bench times its `pp` and `tg` runs separately, so a
-# combined cera run silently biases every cross-engine prefill ratio against
-# cera. Decode likewise wants its own run: llama-bench's `tg` starts from an
-# empty context, so decoding after a 512-token prefill compares different KV
-# depths. See "Known measurement traps" in benchmarks/BASELINE.md.
-run_cera() {
-  local backend="$1" label="$2" mask="$3"
+#
+# ---------------------------------------------------------------------------
+# Why this measures at thermal equilibrium
+#
+# A short decode measurement on this device happens inside a violent thermal
+# transient: the BIG cluster goes 26 C -> 74 C in about twelve seconds of load
+# and falls back to 30 C within twenty seconds of stopping. Where a 2-second
+# measurement lands inside that ramp decides its result, which is why repeating
+# one identical pinned config gave 7.1 / 63.3 / 64.9 / 40.0 / 22.7 / 22.1, a
+# 9.1x spread.
+#
+# Battery temperature does NOT show this. It moves ~0.5 C while the silicon
+# swings 48 C, so it is useless as a gate; this script reads the live BIG/MID
+# cluster temperatures out of `dumpsys thermalservice` instead.
+#
+# Two fixes were measured. Gating each invocation on a cold SoC still left 1.48x
+# (the transient is the problem, not the start point). Driving the device to
+# thermal equilibrium and measuring there gave 1.12x spread and ~4.3% CoV on
+# both engines, and a cera/llama decode ratio significant at 3.9 sigma. So:
+#
+#   1. run EQUIL_WARM invocations first, discarded, to reach steady state;
+#   2. then run PASSES measured passes BACK TO BACK with no cooldown, because
+#      idling between measurements drops the device back into the transient;
+#   3. interleave the engines, which both removes the ordering bias and keeps
+#      the load continuous so equilibrium holds;
+#   4. report median and CoV across passes, with the SoC temperature range as
+#      evidence that equilibrium actually held.
+#
+# This measures SUSTAINED throughput, which is the reproducible quantity and the
+# one that matters for comparing engines or commits. It is deliberately not the
+# peak a cold phone can hit for two seconds.
+# ---------------------------------------------------------------------------
+
+# Live BIG-cluster temperature, integer C. Must come from "Current temperatures
+# from HAL"; the "Cached temperatures" section earlier in the same dumpsys is
+# stale and reads high long after the device has cooled.
+soc_big() {
+  "${ADB[@]}" shell "dumpsys thermalservice" 2>/dev/null \
+    | awk '/Current temperatures from HAL/,/Current cooling devices/' \
+    | sed -n 's/.*mValue=\([0-9.]*\), mType=0, mName=BIG, .*/\1/p' | head -1 | cut -d. -f1
+}
+
+# Samples accumulate in one file per cell+phase. Deliberately not `declare -A`:
+# macOS ships bash 3.2, which has no associative arrays, and this script is run
+# from a Mac far more often than from the device.
+SAMPLE_DIR=$(mktemp -d)
+trap 'rm -rf "$SAMPLE_DIR"' EXIT
+
+slug() { tr -c 'A-Za-z0-9_' '_' <<<"$1"; }
+
+record() { # key value
+  [[ -n "$2" ]] || return 0
+  echo "$2" >> "$SAMPLE_DIR/$(slug "$1").vals"
+}
+
+note_soc() { # key
+  local t; t=$(soc_big); [[ -n "$t" ]] || return 0
+  echo "$t" >> "$SAMPLE_DIR/$(slug "$1").soc"
+}
+
+sample_cera() { # backend label mask
+  local backend="$1" mask="$3" key="cera|$2"
   local pin=""; [[ -n "$mask" ]] && pin="taskset $mask "
   local base="cd $DEVICE_DIR && ${pin}./cera bench -m $MODEL --device $backend \
 --runs $RUNS --warmup $WARMUP --no-cache --gpu-io"
-
-  echo "=== cera $backend [$label] ===" | tee -a "$LOG"
-  local pre_out dec_out t_pre t_post
-  t_pre=$(batt_c)
-  if ! pre_out=$("${ADB[@]}" shell "$base --prompt-tokens $PROMPT --max-tokens 0" 2>&1); then
-    echo "$pre_out" >> "$LOG"
-    echo "cera,$backend,$label,FAIL,FAIL,FAIL,FAIL,$t_pre,$(batt_c),NA,NA" >> "$OUT"
-    return
-  fi
-  # Log the prefill run as soon as it succeeds: if the decode run below fails we
-  # return early, and its output would otherwise be lost from the raw log.
-  echo "$pre_out" >> "$LOG"
-  # Decode measures right after a full prefill run; settle so it is not timed on
-  # the heat that run just produced.
-  settle
-  if ! dec_out=$("${ADB[@]}" shell "$base --prompt-tokens $DECODE_PROMPT --max-tokens $DECODE" 2>&1); then
-    echo "${dec_out:-}" >> "$LOG"
-    echo "cera,$backend,$label,FAIL,FAIL,FAIL,FAIL,$t_pre,$(batt_c),NA,NA" >> "$OUT"
-    return
-  fi
-  echo "$dec_out" >> "$LOG"
-  t_post=$(batt_c)
-
-  local pre dec p50 d50 psd dsd
-  # `|| true` on every grep: under `set -euo pipefail` a non-matching grep in a
-  # command substitution aborts the whole script, which would silently kill the
-  # rest of the matrix instead of writing the FAIL row handled above.
-  pre=$(grep -E "^prefill tok/s:" <<<"$pre_out" | head -1 || true)
-  dec=$(grep -E "^decode tok/s:"  <<<"$dec_out" | head -1 || true)
-  p50=$(sed -n 's/.*p50=\([0-9.]*\).*/\1/p' <<<"$pre")
-  d50=$(sed -n 's/.*p50=\([0-9.]*\).*/\1/p' <<<"$dec")
-  psd=$(sed -n 's/.*stddev=\([0-9.]*\).*/\1/p' <<<"$pre")
-  dsd=$(sed -n 's/.*stddev=\([0-9.]*\).*/\1/p' <<<"$dec")
-  # Headroom comes from the decode invocation: decode stability is the open
-  # question, and hr0 is the state the process launched into, which is the
-  # variable the between-invocation drift is suspected to track.
-  local hr0 hrmax
-  hr0=$(parse_hr0 "$dec_out"); hrmax=$(parse_hrmax "$dec_out")
-  echo "cera,$backend,$label,${p50:-NA},${d50:-NA},${psd:-NA},${dsd:-NA},${t_pre:-NA},${t_post:-NA},${hr0:-NA},${hrmax:-NA}" >> "$OUT"
-  echo "  -> prefill p50=$p50 decode p50=$d50 | batt ${t_pre}->${t_post} C | headroom ${hr0:-NA}->${hrmax:-NA}" | tee -a "$LOG"
-  # The --gpu-io lines say whether a GPU change actually removed round-trips;
-  # keep them in the raw log where they can't be lost to CSV flattening. Grep
-  # BOTH runs: `cera bench` skips the report when it generates no tokens, so the
-  # prefill-at-$PROMPT counters only ever appear in the decode run's output, and
-  # the prefill run contributes its own submit counts when it does report.
-  printf '%s\n%s\n' "$pre_out" "$dec_out" | grep -E "^gpu I/O" | tee -a "$LOG" || true
+  note_soc "$key"
+  local pre dec
+  pre=$("${ADB[@]}" shell "$base --prompt-tokens $PROMPT --max-tokens 0" 2>&1 || true)
+  echo "$pre" >> "$LOG"
+  record "$key|prefill" "$(sed -n 's/.*prefill tok\/s: p50=\([0-9.]*\).*/\1/p' <<<"$pre" | head -1)"
+  dec=$("${ADB[@]}" shell "$base --prompt-tokens $DECODE_PROMPT --max-tokens $DECODE" 2>&1 || true)
+  echo "$dec" >> "$LOG"
+  record "$key|decode" "$(sed -n 's/.*decode tok\/s: p50=\([0-9.]*\).*/\1/p' <<<"$dec" | head -1)"
+  note_soc "$key"
+  printf '%s\n%s\n' "$pre" "$dec" | grep -E "^gpu I/O" >> "$LOG" || true
 }
 
-# llama.cpp reference, if a llama-bench is present on the device. Uses the same
-# model file so the comparison is same-quant, same-weights. llama-bench already
-# times `pp` and `tg` as separate runs internally, which is what run_cera above
-# was changed to match.
-run_llama() {
+sample_llama() { # threads mask
   [[ -n "$LLAMA_BENCH" ]] || return 0
-  local t="$1" mask="$2"
-  local rt; rt=$(dirname "$LLAMA_BENCH")
-  echo "=== llama-bench -t $t (taskset $mask) ===" | tee -a "$LOG"
-  local out t_pre t_post
-  t_pre=$(batt_c)
+  local t="$1" mask="$2" key="llama.cpp|t$1-$2" rt
+  rt=$(dirname "$LLAMA_BENCH")
+  note_soc "$key"
+  local out
   out=$("${ADB[@]}" shell "cd $rt && LD_LIBRARY_PATH=. taskset $mask ./$(basename "$LLAMA_BENCH") \
 -m $DEVICE_DIR/$MODEL -t $t -p $PROMPT -n $DECODE -r $RUNS -o md" 2>&1) || true
   echo "$out" >> "$LOG"
-  # llama-bench md rows: | model | size | params | backend | threads | test | t/s |
-  # Keep llama-bench's own `± stddev`: every claim in benchmarks/BASELINE.md is
-  # argued against dispersion, and dropping it made the llama rows the only ones
-  # that could not be tested for significance. `|| true` for the same reason as
-  # in run_cera: a changed md format must not abort the rest of the matrix.
-  local pprow tgrow pp tg ppsd tgsd
-  pprow=$(grep -E "\|[[:space:]]*pp${PROMPT}[[:space:]]*\|" <<<"$out" | head -1 || true)
-  tgrow=$(grep -E "\|[[:space:]]*tg${DECODE}[[:space:]]*\|" <<<"$out" | head -1 || true)
-  pp=$(sed -n "s/.*|[[:space:]]*\\([0-9.]*\\) ±.*/\\1/p" <<<"$pprow")
-  tg=$(sed -n "s/.*|[[:space:]]*\\([0-9.]*\\) ±.*/\\1/p" <<<"$tgrow")
-  ppsd=$(sed -n "s/.*± *\\([0-9.]*\\).*/\\1/p" <<<"$pprow")
-  tgsd=$(sed -n "s/.*± *\\([0-9.]*\\).*/\\1/p" <<<"$tgrow")
-  t_post=$(batt_c)
-  echo "llama.cpp,cpu,t$t-$mask,${pp:-NA},${tg:-NA},${ppsd:-NA},${tgsd:-NA},${t_pre:-NA},${t_post:-NA},NA,NA" >> "$OUT"
-  echo "  -> pp=$pp tg=$tg | batt ${t_pre}->${t_post} C" | tee -a "$LOG"
+  record "$key|prefill" "$(grep -E "\|[[:space:]]*pp${PROMPT}[[:space:]]*\|" <<<"$out" | sed -n 's/.*|[[:space:]]*\([0-9.]*\) ±.*/\1/p' | head -1)"
+  record "$key|decode"  "$(grep -E "\|[[:space:]]*tg${DECODE}[[:space:]]*\|"  <<<"$out" | sed -n 's/.*|[[:space:]]*\([0-9.]*\) ±.*/\1/p' | head -1)"
+  note_soc "$key"
 }
 
-settle() { [[ "$SETTLE" -gt 0 ]] && sleep "$SETTLE" || true; }
-
-# Battery temperature in C (dumpsys reports deci-degrees). The only thermal
-# signal available for both engines, so it is what makes llama rows comparable.
-batt_c() {
-  local raw
-  raw=$("${ADB[@]}" shell "dumpsys battery | grep -i temperature" 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)
-  [[ -n "$raw" ]] && awk -v r="$raw" 'BEGIN{printf "%.1f", r/10}' || echo "NA"
+# One pass over every cell, engines interleaved.
+one_pass() {
+  sample_cera cpu "default-rowpool" ""
+  sample_llama 5 "7c"
+  sample_cera cpu "pin-prime-80" "80"
+  sample_llama 1 "80"
+  sample_cera cpu "pin-perf-7c" "7c"
+  sample_llama 6 "fc"
+  sample_cera gpu "wgpu-vulkan" ""
 }
 
-# cera prints "thermal headroom before warmup: 0.42 (...)" and
-# "thermal headroom over runs: min=0.40 max=0.71" on stderr.
-parse_hr0()   { sed -n 's/.*thermal headroom before warmup: \([0-9.]*\).*/\1/p' <<<"$1" | head -1; }
-parse_hrmax() { sed -n 's/.*thermal headroom over runs:.*max=\([0-9.]*\).*/\1/p' <<<"$1" | head -1; }
+echo "==> driving to thermal equilibrium ($EQUIL_WARM warm-up passes, discarded)"
+for ((w = 0; w < EQUIL_WARM; w++)); do
+  one_pass >/dev/null 2>&1 || true
+  echo "    warm-up pass $((w + 1))/$EQUIL_WARM done, BIG=$(soc_big) C" | tee -a "$LOG"
+done
+rm -f "$SAMPLE_DIR"/*.vals "$SAMPLE_DIR"/*.soc   # discard warm-up samples
 
-# Engines are INTERLEAVED. Running every cera config and then every llama config
-# measures llama on a hotter device, which is a systematic bias in cera's favour
-# whenever cooling is imperfect. Alternating spreads any residual thermal drift
-# across both engines instead of concentrating it in the one that runs last.
-run_cera cpu "default-rowpool" "";  settle
-run_llama 5 "7c";                   settle
-run_cera cpu "pin-prime-80"    "80"; settle
-run_llama 1 "80";                   settle
-run_cera cpu "pin-perf-7c"     "7c"; settle
-run_llama 6 "fc";                   settle
-run_cera gpu "wgpu-vulkan"     ""
+for ((pass = 1; pass <= PASSES; pass++)); do
+  echo "==> measured pass $pass/$PASSES (BIG=$(soc_big) C)" | tee -a "$LOG"
+  one_pass
+done
+
+# median and CoV across passes
+stats() { # file -> "median cov n"
+  grep -hE '^[0-9.]+$' "$1" 2>/dev/null | sort -n | awk '
+    {v[NR]=$1; s+=$1}
+    END{
+      if (NR==0) { print "NA NA 0"; exit }
+      m = (NR%2) ? v[(NR+1)/2] : (v[NR/2]+v[NR/2+1])/2
+      mean = s/NR; ss=0
+      for (i=1;i<=NR;i++) ss += (v[i]-mean)^2
+      cov = (mean>0) ? sqrt(ss/NR)/mean*100 : 0
+      printf "%.1f %.1f %d", m, cov, NR
+    }'
+}
+
+soc_range() { # key -> "min max"
+  local f; f="$SAMPLE_DIR/$(slug "$1").soc"
+  [[ -s "$f" ]] || { echo "NA NA"; return; }
+  sort -n "$f" | awk 'NR==1{min=$1} {max=$1} END{printf "%s %s", min, max}'
+}
+
+{
+  for cell in "cera|default-rowpool" "cera|pin-prime-80" "cera|pin-perf-7c" "cera|wgpu-vulkan" \
+              "llama.cpp|t5-7c" "llama.cpp|t1-80" "llama.cpp|t6-fc"; do
+    eng="${cell%%|*}"; cfg="${cell##*|}"
+    read -r pmed pcov _ <<<"$(stats "$SAMPLE_DIR/$(slug "$cell|prefill").vals")"
+    read -r dmed dcov dn <<<"$(stats "$SAMPLE_DIR/$(slug "$cell|decode").vals")"
+    read -r smin smax <<<"$(soc_range "$cell")"
+    echo "$eng,$cfg,$pmed,$pcov,$dmed,$dcov,$dn,$smin,$smax"
+  done
+} >> "$OUT"
 
 echo
 echo "==> $OUT"

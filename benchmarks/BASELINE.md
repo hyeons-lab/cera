@@ -14,7 +14,7 @@ decode are always measured as separate runs (see the traps).
 
 | section | measured at | device |
 |---|---|---|
-| Android CPU/GPU table below | `b0ffd7e` (incl. #342) | Pixel 10 Pro Fold, TEC-cooled |
+| Android decode at equilibrium | `b0ffd7e` (incl. #342) | Pixel 10 Pro Fold |
 | Mac cera vs llama.cpp | `b0ffd7e` (incl. #342) | M1 Max |
 | GPU I/O counters | mixed, see the † note in that section | Mac / Adreno |
 | GPU decode profile | `0f00dec` (incl. #316, #318, #319, #320) | M1 Max |
@@ -31,55 +31,55 @@ llama row is only reproducible if the binary it was measured with still exists.
 Note 9371 is *older* than b9980; it is simply what is staged on the device, and
 no attempt was made to pick a favourable one.
 
-## Android: Pixel 10 Pro Fold (Tensor G5), TEC-cooled
+## Android: Pixel 10 Pro Fold (Tensor G5)
 
 8 cores: 2 efficiency (cpu0-1) + 5 perf (cpu2-6) + 1 prime (cpu7).
 CPU has `asimddp` + `i8mm`.
 
-cera `b0ffd7e`, llama.cpp `f12cc6d0f` (9371), `scripts/bench_android.sh` with
-separate prefill/decode runs and interleaved engines, 5 runs, `--settle 30`.
-Battery 27.6 -> 30.2 C across the matrix. The llama rows carry no stddev, and no
-row carries per-measurement thermal state, because this matrix predates the
-harness changes that record both. A decode claim here would need them.
+**Measure at thermal equilibrium.** A short decode measurement on this device
+runs inside a violent thermal transient: the BIG cluster goes 26 C to 74 C in
+about twelve seconds of load and falls back to 30 C within twenty seconds of
+stopping. Where a 2-second measurement lands in that ramp decides its result,
+which is why repeating one identical pinned config gave 7.1 / 63.3 / 64.9 /
+40.0 / 22.7 / 22.1 tok/s, a 9.1x spread. Two fixes were measured: gating each
+invocation on a cold SoC still left 1.48x, because the transient is the problem
+rather than the start point; driving the device to equilibrium and measuring
+there gave 1.12x and ~4.3% CoV on both engines.
 
-| Engine | Config | Prefill | Decode ‡ |
-|---|---|---:|---:|
-| cera CPU | default RowPool | **208 +/- 6** | 63.0 +/- 10.6 |
-| cera CPU | pinned perf cluster (`taskset 7c`) | 93 +/- 2 | 75.7 +/- 2.9 |
-| cera CPU | pinned prime (`taskset 80`) | 75 +/- <1 | 60.6 +/- 3.1 |
-| cera GPU | wgpu / Vulkan | 92 +/- 1 | 20.7 +/- 0.3 |
-| llama.cpp | `-t 6` pinned perf+prime | **209.2** | 53.6 |
-| llama.cpp | `-t 1` pinned prime | 77.7 | 54.5 |
-| llama.cpp | `-t 5` pinned perf | 161.3 | 48.6 |
+`scripts/bench_android.sh` implements this: warm-up passes to reach steady
+state, then measured passes back to back with no idle between them (idling drops
+the device back into the transient), engines interleaved, reporting median and
+CoV per cell plus the BIG-cluster temperature range as evidence equilibrium held.
+This measures **sustained** throughput, which is the reproducible quantity and
+the one that matters for comparing engines or commits. It is deliberately not
+the peak a cold phone reaches for two seconds, which is roughly 1.5x higher and
+not repeatable.
 
-**Prefill is a tie: 208 +/- 6 against 209.2.** This is best-config against
-best-config, and cera's best is its unpinned `default RowPool` (which sizes
-itself and is the shipping configuration) against llama pinned across perf+prime;
-mask-matched, llama leads on every pinned pair. That is the headline correction of
-this revision. The previous entry reported llama 1.50x ahead on prefill, which
-was entirely an artifact: the harness measured cera with one combined
-`--prompt-tokens 512 --max-tokens 128` invocation while `llama-bench` times its
-`pp512` separately, and simply splitting the cera run moved it 149 -> 208.
+### Decode at equilibrium, LFM2.5-350M Q4_K_M
 
-**‡ Decode is not measurable on this device for either engine on CPU.** Do not
-quote a CPU decode ratio from this table. Three back-to-back matrices under
-active cooling, at 26-30 C with thermal headroom never above 0.60, still
-disagreed by 1.15-2.25x on every CPU config, while the wgpu row in those same
-matrices reproduced to 1.00x. It is CPU DVFS, it is not thermal, and it is not
-fixable without root on this device; see the traps section for the evidence.
-The GPU row is reproducible and can be quoted.
+cera `b0ffd7e`, llama.cpp `f12cc6d0f` (9371), both pinned to the same five perf
+cores, 6 invocations each at equilibrium (BIG 64-70 C), 512-token decode.
 
-For the same reason no code delta is claimed against the previous `c6f845d`
-entry: the decode column cannot support one, and the cooling regime changed too
-(that entry says "on a fan").
+| Engine | Config | Decode median | CoV | spread |
+|---|---|---:|---:|---:|
+| **cera** | `taskset 7c` | **65.5** | 4.2% | 1.12x |
+| llama.cpp | `-t 5`, `taskset 7c` | 59.3 | 4.5% | 1.13x |
+
+**cera 1.10x**, a 6.2 tok/s difference against a 1.6 combined standard error,
+so 3.9 sigma. It is a lower bound: cera decodes from a 128-token prompt while
+`llama-bench`'s `tg` starts from an empty context, which disfavours cera.
+
+The full matrix (all pinning configs, prefill, GPU) has not been re-measured
+under this protocol yet; a run needs roughly half an hour of device time because
+equilibrium has to be reached and held. The GPU row from the previous protocol
+is unaffected by any of this and reproduced exactly (21.0 / 20.9 / 20.9, 1.00x)
+because the GPU has its own clock domain.
 
 llama.cpp's Vulkan build does run on this device's PowerVR GPU, and its prefill
-(638) is the highest prefill measured on the device, but it is excluded above: it
-logs `Compute pipeline creation failed for mul_mat_vec_q4_k_f32_f32`, decodes at
-3.06 tok/s, and a sustained decode run wedged the phone into a `watchdog,apc`
-reset. cera's wgpu row is the same GPU with neither failure, though at 20.7
-decode it is far below its own CPU path, so GPU is not the right choice on this
-device for either engine.
+(638) is the highest prefill measured here, but it is excluded from comparison:
+it logs `Compute pipeline creation failed for mul_mat_vec_q4_k_f32_f32`, decodes
+at 3.06 tok/s, and a sustained decode run wedged the phone into a `watchdog,apc`
+reset.
 
 ## Mac: cera vs llama.cpp on M1 Max
 
@@ -417,24 +417,21 @@ CERA_GPU_PROFILE=1 cera bench -m <model.gguf> --device gpu \
   understates cera by that margin. Decode is the mirror image: it wants a
   realistic prompt, so measure it separately with `--prompt-tokens 128
   --max-tokens 128`.
-- **Android CPU decode is not reliably measurable on this device, and it is not
-  thermal.** Three back-to-back matrices, TEC cooler running, identical settings,
-  battery 26-30 C throughout and headroom never above 0.60 against a 0.95
-  throttling threshold, still disagreed by 1.15-2.25x on every CPU config. The
-  control is in the same table: `wgpu-vulkan` returned **21.0 / 20.9 / 20.9**
-  across those same three matrices, a 1.00x spread, while `pin-perf-7c` on the
-  CPU returned 75.7 / 96.7 / 66.0. The GPU rows even spanned a *wider*
-  temperature range (27.9-29.1 C) than the CPU rows (28.1-28.5 C). Same device,
-  same harness, same thermal state, one backend perfectly reproducible and the
-  other varying 1.5x.
-  The cause is CPU DVFS, and we cannot control it: the governor is `sched_pixel`
-  with 24 operating points from 177 MHz to 3.05 GHz, `adb shell` runs as
-  uid 2000, and writing `scaling_governor` is denied without root. `taskset`
-  fixes which cores run the work, not what frequency they run at. Note the most
-  stable CPU config is llama `-t 1` on a single core (1.15x), which is consistent
-  with multi-core frequency and placement being the driver.
-  Practical consequence: quote Android GPU numbers, and for CPU either report the
-  distribution over several whole matrices or do not state a ratio at all.
+- **Battery temperature is not SoC temperature, and gating on it is useless.**
+  Under load the BIG cluster reaches 74 C while the battery reads 23 C: a 0.5 C
+  move on the sensor that is easy to read against a 48 C swing on the one that
+  matters. Every thermal claim in an earlier revision of this file used battery
+  temperature and was wrong for that reason. Read the live cluster temperatures
+  from `dumpsys thermalservice`, and specifically from the "Current temperatures
+  from HAL" section: the "Cached temperatures" section printed above it is stale
+  and keeps reading hot long after the device has cooled.
+- **Do not idle between measurements on Android.** It is the opposite of the
+  right move. The device cools in about twenty seconds, so a settle drops it back
+  into the thermal transient and makes the next measurement unrepeatable. Keep
+  the load continuous and measure at equilibrium.
+- **A ratio needs both engines measured in the same thermal regime.** At
+  equilibrium both cera and llama.cpp sit at ~4.3% CoV and a 1.10x gap is 3.9
+  sigma; measured cold, the same pair swings 9x and supports nothing.
 - **The variance is between invocations, not within them.** On the same pinned
   config, `taskset 7c`, cera decode returned 60.5 / 94.0 / 75.7 across three
   matrices while its stddev *inside* each invocation stayed at 1.0-5.3. Two
