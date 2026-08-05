@@ -4,6 +4,163 @@
 
 // ── Thread pool configuration ──────────────────────────────────────────────
 
+/// Build rayon's global pool with a width and an affinity mask that do not
+/// depend on which thread happens to call first. Idempotent and cheap after the
+/// first call; safe to call from any entry point.
+///
+/// **Why this can't be left to rayon's lazy default.** Rayon builds its global
+/// pool on first use, and that pool inherits two things from whichever thread
+/// touches it first:
+///
+/// 1. its **width**, from `available_parallelism()`, which on Linux reports the
+///    caller's `sched_getaffinity` mask rather than the machine's core count;
+/// 2. its **affinity**, because a spawned thread inherits the creating thread's
+///    CPU mask.
+///
+/// [`super::threadpool::RowPool`] pins its calling thread to a single core
+/// (`pin_caller_once`). If any RowPool dispatch happens before rayon is first
+/// used (which is exactly what a library embedder does, since only `cera-cli`
+/// calls [`configure_thread_pool`]), rayon builds a **one-thread pool confined
+/// to one core**, and every residual rayon site serialises onto it:
+/// dequantization, VL preprocessing, the LFM2-Audio conv stem, and the four
+/// aarch64 i8mm prefill GEMM kernels in `super::simd`. (Every other GEMM
+/// driver reaches `RowPool` through [`par_rows_n`] and was never affected; the
+/// i8mm kernels are the ones that parallelise on rayon directly.)
+///
+/// Measured on a Pixel 10 Pro Fold, LFM2.5-350M-Q4_K_M at 512 prompt tokens,
+/// interleaved and thermal-gated: the embedder path went from a median 79
+/// tok/s prefill (a tight 78-81, because it was serialised) to 120-148 across
+/// three sessions, matching the CLI path in each. The width of that range is
+/// the machine, not the fix; absolute throughput on this device tracks
+/// background memory pressure, and both arms move together with it.
+///
+/// Decode came up too, but nothing in the decode path touches rayon (its GEMVs
+/// run on `RowPool::decode`), so treat that as unexplained rather than as this
+/// fix's doing.
+///
+/// So the width comes from [`super::cpu_features::performance_core_count`] and
+/// every worker asserts the perf-core mask on startup instead of keeping what
+/// it inherited. That makes the result independent of when this runs, which is
+/// what lets engine construction call it without having to prove it beats the
+/// first pin. (The one host class where the width is still derived from
+/// `available_parallelism` is [`super::cpu_features::core_topology`]'s last
+/// fallback, which is also the class that detects no `pin_cores` and therefore
+/// never pins a caller in the first place.)
+///
+/// The mask stays the perf-core set even when the width exceeds it, which is
+/// the opposite of [`super::threadpool::RowPool`]'s "surplus workers run
+/// unpinned" rule. The two are answering different questions: `RowPool` assigns
+/// each worker its **own** core and runs out of cores to hand out, whereas this
+/// is a set mask that any number of workers can share. A width override asking
+/// for more threads than there are P-cores is asking for oversubscription, not
+/// for the E-cores.
+///
+/// `RAYON_NUM_THREADS` still selects the width. It is read here rather than
+/// left to rayon, because deferring to rayon's own parsing means deferring to
+/// rayon's lazy build, which is the affinity bug above. Setting it used to be
+/// enough to trigger the pathology on its own.
+///
+/// Best-effort throughout: the affinity call is skipped when the platform has
+/// no usable core list or `CERA_PIN` is off, and a global pool someone else
+/// already built (a test harness, a dependency) is left alone with a warning.
+/// `CERA_RAYON_GLOBAL=0` opts out entirely, for a Rust host that wants to own
+/// the process-global pool itself; a host that does should either set that or
+/// call `build_global()` before loading a model.
+///
+/// Known gap on Android: the mask is asserted once per worker, at startup, and
+/// a cpuset cgroup migration (background ↔ foreground) overwrites per-thread
+/// masks wholesale. `RowPool` re-asserts on a dispatch cadence, but rayon gives
+/// no equivalent hook, so after a backgrounding the rayon pool keeps whatever
+/// mask the cgroup left it. That degrades to the cgroup's own mask, not back to
+/// the one-core pathology this function exists to prevent.
+///
+/// Public so an embedder can pay the pool's spawn cost at a moment of its
+/// choosing; calling it is optional, since engine construction already does.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub fn ensure_rayon_global_pool() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if super::cpu_features::env_disabled("CERA_RAYON_GLOBAL") {
+            return;
+        }
+
+        let n = rayon_pool_width(
+            super::cpu_features::env_usize("RAYON_NUM_THREADS"),
+            super::cpu_features::performance_core_count(),
+        );
+
+        // Perf cores only, matching the width policy: efficiency cores clock
+        // lower and share memory bandwidth, so a worker that lands on one is a
+        // straggler on every fork-join barrier. `&'static`, so the handler
+        // closure captures a slice rather than owning a copy. Empty when
+        // `CERA_PIN` is off and on every platform without a detected
+        // heterogeneous topology (macOS and homogeneous hosts included), where
+        // `set_current_thread_affinity` no-ops and this whole paragraph is
+        // moot.
+        let cores: &'static [usize] = super::threadpool::pinned_cores();
+
+        // No `panic_handler` on the builder, so a panic inside `start_handler`
+        // aborts the process rather than poisoning the pool. That is the right
+        // trade for a handler this small, and it is why the bounds check in
+        // `set_current_thread_affinity` matters: `libc::CPU_SET` past
+        // `CPU_SETSIZE` would panic there, on a thread nothing can catch.
+        //
+        // build_global() succeeds at most once per process; if rayon was
+        // already initialized (test harness, dependency), neither the width nor
+        // the mask applies to the residual rayon sites, so surface that.
+        if let Err(err) = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .start_handler(move |worker_index| {
+                // A refusal (cpuset excluding every P-core, all of them
+                // offline) leaves this worker on whatever it inherited, which
+                // is the state this function exists to prevent. Nothing can
+                // retry from here, so at least say so. Note this puts the
+                // host's `tracing` subscriber on the abort-on-panic thread
+                // described above; accepted rather than papered over with a
+                // `panic_handler`, which would change how panics propagate for
+                // every rayon job in the process, not just this one.
+                if !cores.is_empty() && !super::threadpool::set_current_thread_affinity(cores) {
+                    tracing::debug!(
+                        "cera: rayon worker {worker_index} kept its inherited CPU mask; \
+                         sched_setaffinity({cores:?}) was refused"
+                    );
+                }
+            })
+            .build_global()
+        {
+            tracing::warn!(
+                "cera: rayon global pool already initialized; P-core width ({n}) and affinity not applied to residual rayon sites: {err}"
+            );
+        }
+    });
+}
+
+/// Width for rayon's global pool: `RAYON_NUM_THREADS` when set to a usable
+/// value, else the detected performance-core count. Split out as a pure
+/// function so the precedence is testable without touching process env or
+/// building a global pool (which can only happen once per process).
+///
+/// The floor is defence in depth rather than a reachable case: `env_usize`
+/// already filters values below 1, and `performance_core_count` is `>= 1` on
+/// every branch. It is here because the failure mode is silent and severe:
+/// `ThreadPoolBuilder::num_threads(0)` does not mean "no threads", it means
+/// "decide for me", and what rayon decides is `available_parallelism()`, the
+/// very thing this function exists to keep out of the width.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn rayon_pool_width(env_override: Option<usize>, perf_cores: usize) -> usize {
+    env_override.unwrap_or(perf_cores).max(1)
+}
+
+/// No-op on `wasm32`: the pool is built by JS calling `initThreadPool`, and
+/// touching rayon here would force-instantiate the default registry and make
+/// that call fail. See [`configure_thread_pool`]'s `wasm32` arm.
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn ensure_rayon_global_pool() {}
+
+/// No-op without the `parallel` feature: there is no rayon to configure.
+#[cfg(not(feature = "parallel"))]
+pub fn ensure_rayon_global_pool() {}
+
 /// Warm the prefill pool and size rayon's global pool to performance cores.
 ///
 /// The decode pool is intentionally left cold — see the body for why.
@@ -12,7 +169,8 @@
 /// [`super::threadpool::RowPool`]s, sized from the detected topology —
 /// `CERA_THREADS` overrides the prefill width, `CERA_DECODE_THREADS` the
 /// decode width (see `super::calibrate`). `RAYON_NUM_THREADS` governs only
-/// the residual rayon sites (dequantization, VL preprocessing); it does
+/// the residual rayon sites (dequantization, VL preprocessing, the audio conv
+/// stem, and the aarch64 i8mm prefill GEMM kernels in `super::simd`); it does
 /// **not** constrain the RowPools.
 ///
 /// P-cores only, because efficiency cores have lower clock speed and share
@@ -20,10 +178,16 @@
 /// dispatches — measured as a 12% decode regression on M1 Max (58.6 vs 66.4
 /// tok/s) back on the rayon path.
 ///
-/// Must be called once before any rayon work (e.g., early in `main()`).
-/// Returns the number of threads configured.
+/// Optional: this only *warms* pools that would otherwise build lazily, and
+/// [`ensure_rayon_global_pool`] (which engine construction calls for every
+/// consumer) is what actually makes rayon's width and affinity correct. Call it
+/// early in `main()` if you want the spawn cost paid at startup and the thread
+/// count reported before a model loads. Returns the number of threads
+/// configured.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub fn configure_thread_pool() -> usize {
+    ensure_rayon_global_pool();
+
     // Warm the prefill pool — spawns and pins its workers now rather than
     // lazily on the first GEMM. Its width is the headline thread count.
     //
@@ -36,27 +200,7 @@ pub fn configure_thread_pool() -> usize {
     // into the first token rather than startup — unmeasured, but it is one
     // thread spawn per worker, once per process, against a decode that already
     // takes milliseconds per token.
-    let pool_threads = super::threadpool::RowPool::prefill().num_threads();
-
-    // Also size rayon's global pool for the remaining `par_chunks_mut` sites
-    // (prefill GEMM, VL preprocessing), unless the user pinned
-    // RAYON_NUM_THREADS.
-    if std::env::var("RAYON_NUM_THREADS").is_err() {
-        let n = super::cpu_features::performance_core_count();
-        // build_global() succeeds at most once per process; if rayon was
-        // already initialized (test harness, dependency), the P-core cap
-        // doesn't apply to those residual sites — surface that.
-        if let Err(err) = rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-        {
-            tracing::warn!(
-                "cera: rayon global pool already initialized; P-core cap ({n}) not applied to residual rayon sites: {err}"
-            );
-        }
-    }
-
-    pool_threads
+    super::threadpool::RowPool::prefill().num_threads()
 }
 
 /// On `wasm32` the row hot path runs on rayon (wasm-bindgen-rayon web
@@ -4615,6 +4759,21 @@ pub fn scale_inplace(a: &mut [f32], s: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `RAYON_NUM_THREADS` wins when usable, the detected perf-core count is
+    /// the default, and the result is never zero. Tested on the pure helper
+    /// because the pool it feeds can only be built once per process, so the
+    /// real call is not re-runnable under a test harness.
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[test]
+    fn rayon_pool_width_prefers_env_override() {
+        assert_eq!(rayon_pool_width(Some(3), 8), 3);
+        assert_eq!(rayon_pool_width(None, 8), 8);
+        // No caller can pass 0 today; the floor is pinned anyway because
+        // `num_threads(0)` reads as "decide for me" and hands the width back
+        // to `available_parallelism()`, silently.
+        assert_eq!(rayon_pool_width(None, 0), 1);
+    }
 
     /// Deterministic byte source for the kernel fixtures below. Nothing depends
     /// on the distribution beyond "not all the same"; a fixed stream keeps a

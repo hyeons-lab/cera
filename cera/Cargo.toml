@@ -152,6 +152,13 @@ required-features = ["metal"]
 name = "slang_conv_bench"
 required-features = ["metal"]
 
+# Checks that a library embedder and `cera-cli` get the same thread pools.
+# `mmap` for the `from_path` load; `parallel` because with rayon compiled out
+# there is no global pool for the two arms to differ over.
+[[example]]
+name = "embedder_path"
+required-features = ["mmap", "parallel"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true

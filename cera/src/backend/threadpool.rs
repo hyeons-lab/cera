@@ -375,7 +375,7 @@ impl RowPool {
             // Active-sized barrier: prefill GEMMs vary widely in size, and a
             // small one is better run on the few cores its work can fill than
             // dragged across the whole pool's barrier (see `Shared::active_barrier`).
-            RowPool::build(topo.perf_core_count, &topo.pin_cores, true)
+            RowPool::build(topo.perf_core_count, pinned_cores(), true)
         })
     }
 
@@ -398,7 +398,7 @@ impl RowPool {
             let n = super::calibrate::decode_thread_count(topo);
             // Full barrier: decode wants every worker hot across its tiny-GEMV /
             // huge-vocab-GEMV mix (see `Shared::active_barrier`).
-            RowPool::build(n, &topo.pin_cores, false)
+            RowPool::build(n, pinned_cores(), false)
         })
     }
 
@@ -407,6 +407,9 @@ impl RowPool {
     /// empty ⇒ no pinning (macOS/desktop). Spawn failures degrade the thread
     /// count rather than panicking. The pool pins *and claims the process-wide
     /// caller pin for* whatever thread first dispatches.
+    ///
+    /// `pin_cores` is taken as already policy-filtered: callers outside the
+    /// tests pass [`pinned_cores`], which is where `CERA_PIN` is honoured.
     fn build(num_threads: usize, pin_cores: &[usize], active_barrier: bool) -> RowPool {
         // `active` (≤ num_threads) is packed into the low `ACTIVE_BITS` of the
         // dispatch state; no real host has this many cores, but keep the pool
@@ -429,7 +432,6 @@ impl RowPool {
             job: UnsafeCell::new(None),
         });
 
-        let pin_cores: &[usize] = if pinning_enabled() { pin_cores } else { &[] };
         let mut workers = Vec::new();
         // Worker 0 is the caller; spawn the rest.
         for id in 1..num_threads {
@@ -991,17 +993,66 @@ fn worker_loop(shared: Arc<Shared>, worker_id: usize, pin_core: Option<usize>, s
 /// to little cores), in which case the thread stays schedulable as before.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn pin_current_thread_to_core(core: usize) -> bool {
-    // SAFETY: `set` is zero-initialized then populated via the libc CPU_SET
-    // macro; `sched_setaffinity(0, ...)` targets the current thread.
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(core, &mut set);
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
-    }
+    set_current_thread_affinity(&[core])
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub(crate) fn pin_current_thread_to_core(_core: usize) -> bool {
+    false
+}
+
+/// The cores this crate is willing to pin to: the detected performance cores,
+/// or nothing at all when `CERA_PIN` is off. The single place that decision is
+/// made. `RowPool::build` takes its core list already filtered through here,
+/// and [`super::cpu::ensure_rayon_global_pool`] uses the same list as a set
+/// mask rather than pinning one core per worker.
+pub(crate) fn pinned_cores() -> &'static [usize] {
+    if pinning_enabled() {
+        &super::cpu_features::core_topology().pin_cores
+    } else {
+        &[]
+    }
+}
+
+/// Set the calling thread's affinity to exactly `cores`, via
+/// `sched_setaffinity`. Same best-effort contract as
+/// [`pin_current_thread_to_core`], of which this is the general case.
+///
+/// Unlike that function this can *widen* a mask, which is the point: a thread
+/// inherits the mask of whoever spawned it, so a pool spawned from a thread
+/// [`RowPool::pin_caller_once`] already confined to one core would otherwise
+/// run every worker on that core. An empty `cores` is a no-op returning
+/// `false`: `sched_setaffinity` rejects an empty mask, and callers that got
+/// an empty core list have nothing to assert anyway.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn set_current_thread_affinity(cores: &[usize]) -> bool {
+    if cores.is_empty() {
+        return false;
+    }
+    // Indices at or beyond the set's capacity are out of bounds for
+    // `cpu_set_t` and make `CPU_SET` panic, so they are dropped instead. The
+    // bound is spelled from `size_of::<cpu_set_t>()` rather than `CPU_SETSIZE`
+    // because the latter is `c_int` on glibc and `size_t` on Android, so no
+    // one cast of it is redundant-free on both.
+    let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
+    // SAFETY: `set` is zero-initialized then populated via the libc CPU_SET
+    // macro, only at in-bounds indices; `sched_setaffinity(0, ...)` targets
+    // the current thread.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        let mut any = false;
+        for &core in cores {
+            if core < capacity {
+                libc::CPU_SET(core, &mut set);
+                any = true;
+            }
+        }
+        any && libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn set_current_thread_affinity(_cores: &[usize]) -> bool {
     false
 }
 
