@@ -93,8 +93,12 @@ their metadata).
 
 The CPU backend auto-detects thread count and core affinity per device. To pin
 them for benchmarking or tuning, set `CERA_DECODE_THREADS=<n>` (fixed decode
-width), `CERA_THREADS=<n>` (override the detected perf-core count), or
-`CERA_PIN=0` (disable affinity); see the
+width), `CERA_PREFILL_THREADS=<n>` (prefill width on its own, so the two can be
+swept independently), `CERA_THREADS=<n>` (override the detected perf-core
+count), or `CERA_PIN=0` (disable affinity, which also lifts the clamp the other
+two are subject to). `CERA_POOL_STATS=1` annotates each run with how many
+dispatches silently fell back to running serially, which is worth having on for
+any width sweep. See the
 [crate README](../cera/README.md#cpu-threading--tuning) for
 the full list. On Android, `bench` also prints the device's thermal headroom
 per run (a sustained CPU benchmark heats the SoC within seconds, so a raw tok/s

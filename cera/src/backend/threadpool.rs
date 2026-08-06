@@ -440,8 +440,10 @@ pub mod stats {
 /// case-insensitive, disables it — for host apps that manage thread placement
 /// and don't want cera's permanent caller pin). Resolved once.
 pub(crate) fn pinning_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !super::cpu_features::env_disabled("CERA_PIN"))
+    // Inverse of the shared reader. The sizing policy in `cpu_features` and
+    // `calibrate` needs the same answer, so the switch is resolved in one place
+    // rather than parsed once per consumer.
+    !super::cpu_features::pinning_disabled()
 }
 
 impl RowPool {
