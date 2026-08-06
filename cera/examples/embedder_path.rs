@@ -11,9 +11,15 @@
 //! lazy global pool takes both its width and its CPU mask from whichever thread
 //! first touches it. On the embedder path that thread had already been pinned
 //! to a single core by `RowPool::pin_caller_once`, so rayon came up as one
-//! worker on one core and the batched prefill GEMM serialised: measured on a
-//! Pixel 10 Pro Fold (LFM2.5-350M-Q4_K_M, 512 prompt tokens) at 78-81 tok/s
-//! prefill against 108-189 for the CLI path.
+//! worker on one core and everything left on it serialised. When this harness
+//! was written that included the aarch64 i8mm prefill GEMM, which is what made
+//! the gap so visible: measured on a Pixel 10 Pro Fold (LFM2.5-350M-Q4_K_M,
+//! 512 prompt tokens) at 78-81 tok/s prefill against 108-189 for the CLI path.
+//! Those kernels have since moved to the prefill `RowPool`, so what rides on
+//! rayon now is model-load dequantization, the ViT patch embed and the audio
+//! conv stem. Text prefill throughput will therefore no longer show the gap:
+//! the thread dump is the part that still proves it, and the two arms should
+//! agree on both.
 //!
 //! `CeraEngine::from_gguf` now calls `ensure_rayon_global_pool()`, which fixes
 //! the width and mask independently of call order. This example exists to keep

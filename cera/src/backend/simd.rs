@@ -1327,14 +1327,32 @@ pub(crate) mod neon {
         let m_even = m & !1;
         let n_even = n & !1;
 
-        // Main even×even tiles, parallel over 2-row strips.
+        // Main even×even tiles, parallel over 2-row strips, on the pinned
+        // prefill RowPool rather than rayon. `par_rows_n_work`'s doc carries the
+        // argument for why the batched GEMMs live on that pool and what the
+        // strip width costs in steal granularity; `k` caps the active worker
+        // count by this GEMM's total arithmetic. These four aarch64 i8mm kernels
+        // were the last GEMMs on rayon in production code (the reference drivers
+        // in the microbench module below stay there on purpose, so
+        // `microbench_gemm_rowtile` can A/B against the pre-tiling design).
+        //
+        // Each 2-row strip is one "row" of `2 * n`. The odd last *column* is
+        // handled inside the closure; only the odd last row is below. The block
+        // braces are vestigial, left rather than re-indent the whole kernel.
+        //
+        // One behavioural note: two sessions prefilling at once no longer
+        // overlap here. The second one's dispatch finds the pool lock held and
+        // runs its rows serially on its own thread, where the shared rayon pool
+        // used to interleave them. That is the trade every other GEMM in this
+        // file already makes.
         {
-            #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
-            use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
-            out[..m_even * n]
-                .par_chunks_mut(2 * n)
-                .enumerate()
-                .for_each(|(p, strip)| {
+            crate::backend::cpu::par_rows_n_work(
+                &mut out[..m_even * n],
+                2 * n,
+                1,
+                k,
+                |(p, strip)| {
+                    debug_assert_eq!(strip.len(), 2 * n, "i8mm GEMM: partial strip");
                     let i = p * 2;
                     // SAFETY: NEON+i8mm intrinsics; every load is bounded by the
                     // debug_asserts above and the 2×2 tile indices stay < m_even/n_even.
@@ -1472,7 +1490,8 @@ pub(crate) mod neon {
                             row_bytes,
                         );
                     }
-                });
+                },
+            );
         }
 
         // Odd last row (covers all columns).
@@ -1520,7 +1539,7 @@ pub(crate) mod neon {
     ///
     /// Reads each weight row once and dots against all n Q8_0 columns.
     /// Uses 4-column grouping to amortize Q4_0 nibble extraction.
-    /// Parallelized across output rows with rayon.
+    /// Parallelized across output rows on the prefill `RowPool`.
     ///
     /// Unused under the `blas` feature (SGEMM via Accelerate replaces it on
     /// the prefill hot path) but kept compiled so the GEMM microbench can
@@ -2268,14 +2287,17 @@ pub(crate) mod neon {
         let m_even = m & !1;
         let n_even = n & !1;
 
-        // Main even×even tiles, parallel over 2-row strips.
+        // Main even×even tiles, parallel over 2-row strips, on the prefill
+        // RowPool (see `par_rows_n_work`'s doc for why not rayon, and
+        // `gemm_q6_k_q8_0_neon_i8mm` for this kernel shape's specifics).
         {
-            #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
-            use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
-            out[..m_even * n]
-                .par_chunks_mut(2 * n)
-                .enumerate()
-                .for_each(|(p, strip)| {
+            crate::backend::cpu::par_rows_n_work(
+                &mut out[..m_even * n],
+                2 * n,
+                1,
+                k,
+                |(p, strip)| {
+                    debug_assert_eq!(strip.len(), 2 * n, "i8mm GEMM: partial strip");
                     let i = p * 2;
                     for j in (0..n_even).step_by(2) {
                         let (mut s00, mut s01, mut s10, mut s11) = (0.0f32, 0.0, 0.0, 0.0);
@@ -2349,7 +2371,8 @@ pub(crate) mod neon {
                             row_bytes,
                         );
                     }
-                });
+                },
+            );
         }
 
         // Odd last row (covers all columns).
@@ -2438,14 +2461,17 @@ pub(crate) mod neon {
         let mask_lo = unsafe { vdupq_n_u8(0x0F) };
         let offset_8 = unsafe { vdupq_n_s8(0x8) };
 
-        // Main even×even tiles, parallel over 2-row strips.
+        // Main even×even tiles, parallel over 2-row strips, on the prefill
+        // RowPool (see `par_rows_n_work`'s doc for why not rayon, and
+        // `gemm_q6_k_q8_0_neon_i8mm` for this kernel shape's specifics).
         {
-            #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
-            use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
-            out[..m_even * n]
-                .par_chunks_mut(2 * n)
-                .enumerate()
-                .for_each(|(p, strip)| {
+            crate::backend::cpu::par_rows_n_work(
+                &mut out[..m_even * n],
+                2 * n,
+                1,
+                k,
+                |(p, strip)| {
+                    debug_assert_eq!(strip.len(), 2 * n, "i8mm GEMM: partial strip");
                     let i = p * 2;
                     for j in (0..n_even).step_by(2) {
                         let (mut s00, mut s01, mut s10, mut s11) = (0.0f32, 0.0, 0.0, 0.0);
@@ -2538,7 +2564,8 @@ pub(crate) mod neon {
                             row_bytes,
                         );
                     }
-                });
+                },
+            );
         }
 
         // Odd last row (covers all columns).
@@ -2680,14 +2707,18 @@ pub(crate) mod neon {
         let m_even = m & !1;
         let n_even = n & !1;
 
+        // Main even×even tiles, parallel over 2-row strips, on the prefill
+        // RowPool (see `par_rows_n_work`'s doc for why not rayon, and
+        // `gemm_q6_k_q8_0_neon_i8mm` for this kernel shape's specifics).
         {
-            #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
-            use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
             let cs = col_sums.as_slice();
-            out[..m_even * n]
-                .par_chunks_mut(2 * n)
-                .enumerate()
-                .for_each(|(p, strip)| {
+            crate::backend::cpu::par_rows_n_work(
+                &mut out[..m_even * n],
+                2 * n,
+                1,
+                k,
+                |(p, strip)| {
+                    debug_assert_eq!(strip.len(), 2 * n, "i8mm GEMM: partial strip");
                     let i = p * 2;
                     let mask_0f = unsafe { vdupq_n_u8(0x0F) };
                     for j in (0..n_even).step_by(2) {
@@ -2833,7 +2864,8 @@ pub(crate) mod neon {
                             row_bytes,
                         );
                     }
-                });
+                },
+            );
         }
 
         // Odd last row (covers all columns).
