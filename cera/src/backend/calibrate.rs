@@ -316,6 +316,22 @@ pub fn decode_thread_count(topo: &CoreTopology) -> usize {
 /// only the 4 performance cores there, so the surplus workers ran *unpinned*
 /// and the kernel was free to place and migrate them. Pinning a worker to a
 /// specific A520 is a different configuration, and the one measured above.
+///
+/// **The tail is now partly mitigated, and the conclusion still holds.**
+/// `threadpool::worker_chunk_rows` sizes each worker's steal chunk to its
+/// core's `cpu_capacity`, so an A520 no longer claims a full-size chunk it
+/// needs ~5x as long to finish.
+///
+/// Compare it as a ratio, not against the table above: that table and the
+/// weighting measurement are different sessions on the same device, and the
+/// device's absolute level moved between them (its narrow-pool prefill reads
+/// 141 there and ~207 in the later run, so the two sets of tok/s are not
+/// interchangeable). Within the later session, widening cost **1.77x**
+/// unweighted (206.5 → 116.5) and **1.50x** weighted (212.5 → 142.0). So
+/// weighting recovers a good part of the widening loss without closing it, the
+/// wide pool still loses to the narrow one, and the efficiency cores stay out
+/// of the default. What the mitigation changes is the cost of overriding, not
+/// the choice of default.
 pub fn prefill_thread_count(topo: &CoreTopology) -> usize {
     let default = topo.perf_core_count.max(1);
     let Some(n) = env_usize("CERA_PREFILL_THREADS") else {
@@ -607,6 +623,7 @@ mod tests {
             perf_core_count: 192,
             pin_cores: Vec::new(),
             fast_cores: 0,
+            core_weights: Vec::new(),
         };
         for phys in [16usize, 32, 64, 96] {
             let narrow = width_for_host(&epyc, shape(21, 25), Overrides::default(), Some(phys))
@@ -631,6 +648,7 @@ mod tests {
             perf_core_count: 32,
             pin_cores: Vec::new(),
             fast_cores: 0,
+            core_weights: Vec::new(),
         };
         assert_eq!(
             width_for_host(&zen5, shape(1321, 129), Overrides::default(), Some(16)),
@@ -652,11 +670,13 @@ mod tests {
             perf_core_count: 6,
             pin_cores: vec![7, 6, 5, 4, 3, 2],
             fast_cores: 6,
+            core_weights: Vec::new(),
         };
         let unknown_phys = CoreTopology {
             perf_core_count: 32,
             pin_cores: Vec::new(),
             fast_cores: 0,
+            core_weights: Vec::new(),
         };
         let s = shape(219, 99);
         let threshold_only = Overrides {
@@ -696,6 +716,7 @@ mod tests {
             perf_core_count: 32,
             pin_cores: Vec::new(),
             fast_cores: 0,
+            core_weights: Vec::new(),
         };
         let ov = Overrides {
             narrow: Some(3),
@@ -728,6 +749,7 @@ mod tests {
             perf_core_count: 32,
             pin_cores: Vec::new(),
             fast_cores: 0,
+            core_weights: Vec::new(),
         };
         let low_wide = Overrides {
             wide: Some(4),
@@ -798,6 +820,7 @@ mod tests {
             perf_core_count: 6,
             pin_cores: vec![7, 6, 5, 4, 3, 2],
             fast_cores: 6,
+            core_weights: Vec::new(),
         };
         // LFM2-350M Q4_0 — the exact model measured scaling to all 6 big cores.
         assert_eq!(
@@ -814,6 +837,7 @@ mod tests {
             perf_core_count: 32,
             pin_cores: Vec::new(),
             fast_cores: 0,
+            core_weights: Vec::new(),
         };
         assert_eq!(
             width_for_host(&windows_box, shape(1321, 129), Overrides::default(), None),
@@ -833,6 +857,7 @@ mod tests {
             perf_core_count: 6,
             pin_cores: vec![7, 6, 5, 4, 3, 2, 1, 0],
             fast_cores: 6,
+            core_weights: Vec::new(),
         };
         assert_eq!(prefill_thread_count(&big_little), 6);
 
@@ -841,6 +866,7 @@ mod tests {
             perf_core_count: 10,
             pin_cores: Vec::new(),
             fast_cores: 0,
+            core_weights: Vec::new(),
         };
         assert_eq!(prefill_thread_count(&unpinned), 10);
     }

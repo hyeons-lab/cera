@@ -29,15 +29,20 @@
 //! an atomic whose high bits are the **epoch** (workers wake when it changes) —
 //! then joins the steal loop as worker 0. Background workers observe the new
 //! epoch (Acquire) and, alongside the caller, **claim contiguous row chunks**
-//! from a shared `next_chunk` atomic until the row space is exhausted — dynamic
+//! from a shared `next_row` cursor until the row space is exhausted: dynamic
 //! work-stealing, so faster cores grab more chunks and every worker reaches the
-//! barrier together (heterogeneous big.LITTLE load balancing). Each participating
-//! worker then `fetch_sub`s a `pending` counter; the caller spins on `pending ==
+//! barrier together (heterogeneous big.LITTLE load balancing). On a part whose
+//! cores differ in speed, a worker also sizes its chunk to the core it is pinned
+//! to, which shrinks (but does not remove) the time a chunk claimed late by a
+//! slow core holds everyone at the barrier (see `worker_chunk_rows`, which
+//! documents why the residual matters). Each participating worker then
+//! `fetch_sub`s a `pending` counter; the caller spins on `pending ==
 //! 0` (Acquire) before returning. That Release/Acquire pair both (a) publishes
 //! the `Job` to workers and (b) establishes happens-before for every worker's
 //! writes to the output, so the disjoint `&mut` handoff is sound and the caller
-//! may read the output once it returns. (Each chunk index is claimed by exactly
-//! one worker, so chunks are disjoint row ranges.)
+//! may read the output once it returns. (Each claim advances the cursor by
+//! exactly the rows it reserves, so chunks are disjoint row ranges even when
+//! workers claim different amounts.)
 //!
 //! **Active-sized barrier (prefill pool).** Only the `active` workers a dispatch
 //! needs (worker 0 = caller included) run and decrement `pending`; the rest read
@@ -145,11 +150,17 @@ struct Job {
     y_ptr: *mut f32,
     /// Elements per row (1 for `par_rows`, `n` for `par_rows_n`).
     n: usize,
-    /// Rows per steal unit. Workers claim chunks of this many contiguous rows
-    /// from the shared `next_chunk` counter — dynamic work-stealing, so fast
-    /// cores grab more chunks and all workers reach the barrier together
-    /// (heterogeneous big.LITTLE load balancing).
+    /// Rows per steal unit **for a worker on the fastest core**. Workers claim
+    /// contiguous ranges from the shared `next_row` cursor: dynamic
+    /// work-stealing, so fast cores grab more ranges and all workers reach the
+    /// barrier together (heterogeneous big.LITTLE load balancing). A worker on a
+    /// slower core scales this down by its weight; see
+    /// [`Shared::worker_weights`] and [`worker_chunk_rows`].
     chunk_rows: usize,
+    /// Floor for the per-worker scale-down, as resolved by the dispatcher from
+    /// the caller's `min_chunk_rows`. Carried on the job because the scaling
+    /// happens per worker, after `chunk_rows` has already been decided.
+    min_chunk_rows: usize,
     /// Total rows = `y.len() / n`.
     total_rows: usize,
     /// Workers participating this dispatch (`≤` pool size), worker 0 included.
@@ -202,9 +213,22 @@ struct Shared {
     /// Packed `(epoch, active)` — see [`pack_state`]. Bumped once per dispatch;
     /// workers wake when the epoch changes and read `active` from the same load.
     state: AtomicU64,
-    /// Next unclaimed chunk index. Active workers (and the caller) claim chunks
-    /// via `fetch_add`; reset to 0 before each dispatch's `state` bump.
-    next_chunk: AtomicUsize,
+    /// Next unclaimed **row**. Active workers (and the caller) claim a range by
+    /// `fetch_add`-ing the number of rows they want; reset to 0 before each
+    /// dispatch's `state` bump.
+    ///
+    /// A row cursor rather than a chunk index because chunk size is per-worker
+    /// (see `worker_weights`): `chunk_index * chunk_rows` only reconstructs a
+    /// range when every worker uses the same size. Advancing the cursor by
+    /// exactly the rows being reserved keeps claims disjoint whatever sizes the
+    /// workers pick.
+    next_row: AtomicUsize,
+    /// Per-worker chunk scale, indexed by worker id, in units of
+    /// [`super::cpu_features::WEIGHT_FULL`] (so a full-weight worker gets the
+    /// dispatcher's whole chunk). Empty when every worker should use the full
+    /// chunk, which is every homogeneous host and every host without affinity.
+    /// Immutable after `build`.
+    worker_weights: Vec<u32>,
     /// Background workers the dispatcher still waits on, reaching 0 when the
     /// dispatch has drained. Under the active-sized barrier this is `active - 1`
     /// (only participating workers decrement); under the full barrier it is
@@ -226,9 +250,18 @@ struct Shared {
 /// Target chunks per active worker — enough finer-than-worker granularity that
 /// a faster core can steal extra chunks to cover for a slower one (the X4 vs
 /// A725 ~1.24× speed gap needs a handful of chunks each to balance).
+///
+/// This sizes the chunk of a worker on the *fastest* core; a worker on a slower
+/// one scales down from it (see [`Shared::worker_weights`]). Raising it to cover
+/// a wider spread instead was measured and rejected: it works on the device with
+/// the spread (350M-Q4_K_M prefill p50 201 → 213 at the shipping width) but it
+/// moves every decode GEMV and every homogeneous host too, paying the finer
+/// granularity's atomic and setup cost where there is no straggler to fix.
 const STEAL_CHUNKS_PER_WORKER: usize = 4;
 /// Floor on chunk size: below this, per-chunk atomic + kernel-setup overhead
-/// starts to matter and contiguous streaming gets choppy.
+/// starts to matter and contiguous streaming gets choppy. Applies to the
+/// per-worker scaled size too, so weighting can shrink a slow core's chunk but
+/// not past the point where the claim costs more than the work.
 const MIN_CHUNK_ROWS: usize = 16;
 
 /// Default MAC count assigned to one prefill-GEMM worker before another is
@@ -307,23 +340,110 @@ fn state_active(state: u64) -> usize {
     (state & ACTIVE_MASK) as usize
 }
 
-/// Claim and run chunks from `shared.next_chunk` until the row space is
+/// How many rows worker `worker_id` claims per steal, scaling the job's chunk
+/// size by the relative speed of the core that worker is *meant* to be on.
+///
+/// "Meant to be": pinning is best-effort everywhere (a restricted cpuset can
+/// refuse it, and worker 0 only pins if it wins the process-wide caller-pin
+/// claim), so a weight is the intended placement rather than an observed one.
+/// Nothing here depends on it being exact, for the reason given below.
+///
+/// The point is the fork-join barrier: every worker's chunk should cost roughly
+/// the same *wall-clock time*, so a chunk claimed late by a slow core cannot
+/// hold everyone else at the barrier for a multiple of what it cost to claim.
+///
+/// **Two different spreads, two different sizes of effect.** The default pools
+/// are sized by `perf_core_count`, which counts only cores at or above the
+/// detector's performance threshold (`cpu_features::CAP_MID` on the
+/// `cpu_capacity` path; 85% of the top clock on the `cpuinfo_max_freq`
+/// fallback that x86 hybrid parts take). So on a Tensor G5 they hold the prime
+/// core (1024) and five A725s (824/825), and the widest ratio a default
+/// dispatch sees is ~1.24x. The 207-capacity A520s only become workers when `CERA_THREADS` /
+/// `CERA_PREFILL_THREADS` widens the pool past the performance cores, and that
+/// is where an unweighted chunk hurts most: an A520 holds a full-size chunk for
+/// ~5x what it costs the prime core. Measured on that part, 350M-Q4_K_M at 512
+/// prompt tokens, interleaved and thermally gated:
+///
+/// | width | prefill tok/s | decode tok/s |
+/// |-------|--------------:|-------------:|
+/// | default (6), unweighted | 206.5 | 93.7 |
+/// | default (6), weighted   | 212.5 | 94.7 |
+/// | `CERA_THREADS=8`, unweighted | 116.5 | 68.8 |
+/// | `CERA_THREADS=8`, weighted   | 142.0 | 82.2 |
+///
+/// So this is a small win at the shipping width and a large one on a widened
+/// pool. It does not make widening a good idea: 142 is still well below 212.
+///
+/// Weights only ever scale *down* from `job.chunk_rows`, so the fastest core's
+/// granularity is unchanged and the chunk count only ever rises: this is a
+/// refinement of the uniform schedule, not a different one. With no weights
+/// (homogeneous host, or no affinity to place a worker with) it returns
+/// `job.chunk_rows` unchanged and the whole mechanism is inert.
+///
+/// **The weights under-correct, and that is the honest reason this is safe.**
+/// Both sources over-rate a slow core's real throughput on these kernels:
+/// `calibrate::prefill_thread_count` records that `cpu_capacity` rates an A520
+/// 4x slower than an A725 while a quantized NEON dotprod kernel makes it worse
+/// than that, and `cpuinfo_max_freq` ratios ignore IPC entirely (an x86 E-core
+/// at 0.75 the clock is well under 0.75 the throughput on a wide FMA kernel).
+/// So the safety does not come from a margin in the weights. It comes from the
+/// direction of the change: any weight below full is strictly closer to
+/// equal-time chunks than the uniform chunk it replaces, so the straggler can
+/// only shrink. The residual under-correction is visible in the table above,
+/// as the gap between the weighted wide pool and the narrow one.
+///
+/// Two consequences worth keeping straight before tuning this. Weighting does
+/// not *bound* the tail, so it is not a licence to widen the default pool. And
+/// an undersized chunk is cheap (one extra `fetch_add` and the worker steals
+/// again), so if these weights are ever replaced by measured ones, biasing
+/// them low is the safe direction to be wrong in.
+#[inline]
+fn worker_chunk_rows(shared: &Shared, job: &Job, worker_id: usize) -> usize {
+    match shared.worker_weights.get(worker_id) {
+        Some(&w) if w < super::cpu_features::WEIGHT_FULL => {
+            // Widened for the multiply so the scale cannot overflow a 32-bit
+            // `usize` on a large row space; the quotient is ≤ `chunk_rows` and
+            // so always fits back.
+            let scaled = (job.chunk_rows as u64 * u64::from(w)
+                / u64::from(super::cpu_features::WEIGHT_FULL)) as usize;
+            // `max(1)` is the progress guarantee, not a tuning choice: a
+            // zero-row claim would never advance the cursor and would spin here
+            // forever. `min_chunk_rows` is already ≥ 1 at the dispatcher, but
+            // this does not depend on that holding.
+            scaled.max(job.min_chunk_rows).max(1)
+        }
+        // No weight for this worker (unpinned surplus worker, or a host with no
+        // spread) ⇒ full chunk, exactly as before weighting existed.
+        _ => job.chunk_rows,
+    }
+}
+
+/// Claim and run row ranges from `shared.next_row` until the row space is
 /// exhausted. Shared by the caller (worker 0) and every active background
 /// worker — each `fetch_add` hands out a unique, disjoint contiguous row range.
 #[inline]
-fn steal_and_run(shared: &Shared, job: &Job) {
+fn steal_and_run(shared: &Shared, job: &Job, worker_id: usize) {
+    // Resolved once per dispatch rather than per claim: it depends only on the
+    // worker and the job, and the steal loop is the hot path.
+    let chunk_rows = worker_chunk_rows(shared, job, worker_id);
+    debug_assert!(chunk_rows >= 1, "a zero-row claim would never terminate");
     loop {
         // Relaxed: uniqueness/atomicity of the claim is all we need here; the
         // visibility of each worker's output writes to the caller is provided
         // by the `pending` Release/Acquire barrier at the end of the dispatch.
-        let chunk = shared.next_chunk.fetch_add(1, Ordering::Relaxed);
-        let start = chunk * job.chunk_rows;
+        //
+        // Each claim advances the cursor by exactly the rows it reserves, so
+        // ranges stay disjoint even though workers use different sizes. The
+        // cursor is allowed to run past `total_rows`: a worker that lands there
+        // stops, so it overshoots by at most one claim per worker, far below
+        // any `usize` wrap.
+        let start = shared.next_row.fetch_add(chunk_rows, Ordering::Relaxed);
         if start >= job.total_rows {
             break;
         }
-        let end = (start + job.chunk_rows).min(job.total_rows);
-        // SAFETY: each chunk index is claimed by exactly one worker, so the row
-        // range `[start, end)` is disjoint from every other worker's — no two
+        let end = (start + chunk_rows).min(job.total_rows);
+        // SAFETY: each row range is claimed by exactly one worker, so
+        // `[start, end)` is disjoint from every other worker's, so no two
         // reconstructed `&mut` slices overlap (see `trampoline`).
         unsafe { (job.run)(job.closure, job.y_ptr, job.n, start, end) };
     }
@@ -461,7 +581,7 @@ impl RowPool {
             // Active-sized barrier: prefill GEMMs vary widely in size, and a
             // small one is better run on the few cores its work can fill than
             // dragged across the whole pool's barrier (see `Shared::active_barrier`).
-            RowPool::build(n, pinned_cores(), true)
+            RowPool::build(n, pinned_cores(), pinned_core_weights(), true)
         })
     }
 
@@ -484,7 +604,7 @@ impl RowPool {
             let n = super::calibrate::decode_thread_count(topo);
             // Full barrier: decode wants every worker hot across its tiny-GEMV /
             // huge-vocab-GEMV mix (see `Shared::active_barrier`).
-            RowPool::build(n, pinned_cores(), false)
+            RowPool::build(n, pinned_cores(), pinned_core_weights(), false)
         })
     }
 
@@ -494,9 +614,20 @@ impl RowPool {
     /// count rather than panicking. The pool pins *and claims the process-wide
     /// caller pin for* whatever thread first dispatches.
     ///
+    /// `core_weights` is the relative speed of each entry of `pin_cores`, in
+    /// units of [`super::cpu_features::WEIGHT_FULL`]; worker `i` sizes its steal
+    /// chunk by `core_weights[i]` (see [`Shared::worker_weights`]). Empty, or
+    /// shorter than the pool, leaves the uncovered workers on the full chunk.
+    ///
     /// `pin_cores` is taken as already policy-filtered: callers outside the
-    /// tests pass [`pinned_cores`], which is where `CERA_PIN` is honoured.
-    fn build(num_threads: usize, pin_cores: &[usize], active_barrier: bool) -> RowPool {
+    /// tests pass [`pinned_cores`], which is where `CERA_PIN` is honoured, and
+    /// the matching [`pinned_core_weights`] for the weights.
+    fn build(
+        num_threads: usize,
+        pin_cores: &[usize],
+        core_weights: &[u32],
+        active_barrier: bool,
+    ) -> RowPool {
         // `active` (≤ num_threads) is packed into the low `ACTIVE_BITS` of the
         // dispatch state; no real host has this many cores, but keep the pool
         // within the field rather than silently corrupt the epoch above it.
@@ -507,10 +638,31 @@ impl RowPool {
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(SPIN_BEFORE_PARK);
+        // Only carry weights when at least one worker would actually scale down.
+        // An all-`WEIGHT_FULL` vector (a host with no spread) would make
+        // `worker_chunk_rows` do lookup work per dispatch to conclude nothing,
+        // so drop it and let the empty-vector path answer for the whole pool.
+        //
+        // Truncated to the requested width: a weight beyond it belongs to a
+        // core no worker sits on. It is the *requested* width because the pool
+        // has not been spawned yet; if a spawn later fails the pool shrinks and
+        // this keeps a few weights no worker id can reach, which is harmless
+        // (nothing indexes them) but means the vector is an upper bound rather
+        // than an exact match.
+        let worker_weights: Vec<u32> = core_weights.iter().take(num_threads).copied().collect();
+        let worker_weights = if worker_weights
+            .iter()
+            .any(|&w| w < super::cpu_features::WEIGHT_FULL)
+        {
+            worker_weights
+        } else {
+            Vec::new()
+        };
         let shared = Arc::new(Shared {
             active_barrier,
             state: AtomicU64::new(0),
-            next_chunk: AtomicUsize::new(0),
+            next_row: AtomicUsize::new(0),
+            worker_weights,
             pending: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
@@ -815,10 +967,13 @@ impl RowPool {
 
         // Chunk finer than one-range-per-worker so a fast core can steal extra
         // chunks to balance out a slow one. ~`STEAL_CHUNKS_PER_WORKER` chunks per
-        // active worker, floored at the caller's `min_chunk_rows`.
+        // active worker, floored at the caller's `min_chunk_rows`. This is the
+        // size for a worker on the fastest core; slower cores scale down from it
+        // in `worker_chunk_rows`, subject to the same floor.
+        let min_chunk_rows = min_chunk_rows.max(1);
         let chunk_rows = total_rows
             .div_ceil(active * STEAL_CHUNKS_PER_WORKER)
-            .max(min_chunk_rows.max(1));
+            .max(min_chunk_rows);
 
         // Publish the job, then join the steal loop as worker 0.
         //
@@ -834,6 +989,7 @@ impl RowPool {
             y_ptr,
             n,
             chunk_rows,
+            min_chunk_rows,
             total_rows,
             active,
             closure: closure_ptr,
@@ -854,7 +1010,7 @@ impl RowPool {
         }
         // Reset the chunk cursor for this dispatch (ordered before workers can
         // claim by the `state` Release/Acquire below).
-        self.shared.next_chunk.store(0, Ordering::Relaxed);
+        self.shared.next_row.store(0, Ordering::Relaxed);
         // Publish the dispatch. Two barrier shapes (see `Shared::active_barrier`):
         //
         // - **Active-sized (prefill):** only the `active` workers (worker 0 =
@@ -906,7 +1062,7 @@ impl RowPool {
             // Caller (worker 0) steals chunks alongside the background workers,
             // reusing `y_ptr` (same tag). Being the fastest core (pinned to the
             // prime core), it naturally claims the most.
-            steal_and_run(&self.shared, &job);
+            steal_and_run(&self.shared, &job, 0);
         }
 
         // A worker's closure panicked (caught in `worker_loop` so the pool
@@ -995,7 +1151,7 @@ fn worker_loop(shared: Arc<Shared>, worker_id: usize, pin_core: Option<usize>, s
     // the dispatcher re-raises the panic on the calling thread after the drain.
     let run_job = |shared: &Shared, job: &Job| {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            steal_and_run(shared, job);
+            steal_and_run(shared, job, worker_id);
         }));
         if let Err(payload) = result {
             let mut slot = shared
@@ -1125,6 +1281,23 @@ pub(crate) fn pinned_cores() -> &'static [usize] {
     }
 }
 
+/// Relative speed of each core in [`pinned_cores`], same order and length, in
+/// units of [`super::cpu_features::WEIGHT_FULL`]. Empty when the host has no
+/// usable spread, and empty when `CERA_PIN` is off.
+///
+/// The `CERA_PIN` case is the load-bearing one: with pinning off a worker is
+/// wherever the OS put it, so `core_weights[i]` no longer describes worker `i`
+/// and sizing its chunk from that would be a guess dressed as a measurement.
+/// Returning nothing puts every worker back on the uniform chunk, which is the
+/// right behaviour when placement is unknown.
+pub(crate) fn pinned_core_weights() -> &'static [u32] {
+    if pinning_enabled() {
+        &super::cpu_features::core_topology().core_weights
+    } else {
+        &[]
+    }
+}
+
 /// The performance-core prefix of [`pinned_cores`], for callers that want a set
 /// mask rather than one core per worker: today
 /// [`super::cpu::ensure_rayon_global_pool`], which confines rayon's workers to
@@ -1195,7 +1368,7 @@ mod tests {
         // under both barrier modes (active-sized = prefill, full = decode).
         for &active_barrier in &[true, false] {
             for &num_threads in &[1usize, 2, 4, 7] {
-                let pool = RowPool::build(num_threads, &[], active_barrier);
+                let pool = RowPool::build(num_threads, &[], &[], active_barrier);
                 for &n in &[1usize, 3, 8] {
                     for &total_rows in &[0usize, 1, 5, 256, 1000] {
                         let len = total_rows * n;
@@ -1225,7 +1398,7 @@ mod tests {
         // A concurrency-stress check for the disjoint partition: each row adds 1
         // to a counter; after dispatch every counter must be exactly 1 (no lost
         // or double writes).
-        let pool = RowPool::build(4, &[], true);
+        let pool = RowPool::build(4, &[], &[], true);
         let total_rows = 10_000usize;
         let mut counts = vec![0.0f32; total_rows];
         pool.dispatch_rows(&mut counts, 1, 1, |_row, slice| {
@@ -1234,11 +1407,165 @@ mod tests {
         assert!(counts.iter().all(|&c| c == 1.0));
     }
 
+    /// The disjoint-partition guarantee has to survive workers claiming
+    /// *different* amounts. It used to hold trivially (a claim was a chunk
+    /// index times one shared size) and now rests on each claim advancing the
+    /// row cursor by exactly what it reserves. Run under Miri this is also the
+    /// data-race check for the mixed-size handoff.
+    #[test]
+    fn weighted_workers_still_partition_rows_exactly_once() {
+        // A Tensor-G5-shaped spread (prime, two mid, two little) plus a couple
+        // of exact-power-of-two ratios, so the scaling is exercised where it
+        // divides evenly and where it does not.
+        for weights in [
+            vec![256u32, 206, 206, 52, 52],
+            vec![256, 128, 64, 32],
+            vec![256, 1, 256, 1],
+        ] {
+            for &active_barrier in &[true, false] {
+                let pool = RowPool::build(weights.len(), &[], &weights, active_barrier);
+                // Sizes chosen so the weighted chunks actually differ: below
+                // roughly `MIN_CHUNK_ROWS * active * STEAL_CHUNKS_PER_WORKER`
+                // every weight collapses onto the floor and the test would
+                // silently re-run the uniform-partition case. The small sizes
+                // are kept deliberately, to cover that collapse too.
+                for &total_rows in &[1usize, 7, 256, 4_096, 10_000, 65_537] {
+                    let mut counts = vec![0.0f32; total_rows];
+                    pool.dispatch_rows(&mut counts, 1, 1, |_row, slice| {
+                        slice[0] += 1.0;
+                    });
+                    assert!(
+                        counts.iter().all(|&c| c == 1.0),
+                        "rows lost or written twice: weights={weights:?} \
+                         barrier={active_barrier} rows={total_rows}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The proportionality itself: a worker's chunk is its weight's share of
+    /// the dispatcher's chunk. This is the whole behavior of the change, and
+    /// nothing else pins it. The partition test cannot: disjointness holds for
+    /// *any* chunk size, so a scale that is silently half or double what it
+    /// should be still passes it while shipping a different schedule.
+    #[test]
+    fn chunk_scales_in_proportion_to_weight() {
+        let full = super::super::cpu_features::WEIGHT_FULL;
+        // A Tensor G5's three tiers: prime 1024, A725 824, A520 207, rescaled.
+        let shared = Shared {
+            active_barrier: true,
+            state: AtomicU64::new(0),
+            next_row: AtomicUsize::new(0),
+            worker_weights: vec![full, 206, 52],
+            pending: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+            panicked: AtomicBool::new(false),
+            panic_payload: Mutex::new(None),
+            job: UnsafeCell::new(None),
+        };
+        let job = Job {
+            y_ptr: std::ptr::null_mut(),
+            n: 1,
+            // Not a multiple of `WEIGHT_FULL`, so both scaled results truncate
+            // rather than dividing evenly.
+            chunk_rows: 500,
+            // Below every expected result, so the floor cannot mask the scale.
+            min_chunk_rows: 1,
+            total_rows: 1 << 20,
+            active: 3,
+            closure: std::ptr::null(),
+            run: trampoline::<fn(usize, &mut [f32])>,
+        };
+        assert_eq!(
+            worker_chunk_rows(&shared, &job, 0),
+            500,
+            "prime core scaled"
+        );
+        // 500 * 206 / 256 = 402.34, truncated.
+        assert_eq!(worker_chunk_rows(&shared, &job, 1), 402, "A725 scale wrong");
+        // 500 * 52 / 256 = 101.56, truncated: the ~1/5 that keeps an A520 from
+        // holding the barrier with a full-size chunk.
+        assert_eq!(worker_chunk_rows(&shared, &job, 2), 101, "A520 scale wrong");
+    }
+
+    /// Weighting may only ever scale a chunk *down* from the dispatcher's size,
+    /// never to zero: a zero-row claim leaves the cursor where it was and spins
+    /// the steal loop forever. The floor is checked directly here because the
+    /// dispatch test above would hang rather than fail if it broke.
+    #[test]
+    fn weight_scaling_floors_at_one_row() {
+        let shared = Shared {
+            active_barrier: true,
+            state: AtomicU64::new(0),
+            next_row: AtomicUsize::new(0),
+            worker_weights: vec![super::super::cpu_features::WEIGHT_FULL, 1],
+            pending: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+            panicked: AtomicBool::new(false),
+            panic_payload: Mutex::new(None),
+            job: UnsafeCell::new(None),
+        };
+        let job = Job {
+            y_ptr: std::ptr::null_mut(),
+            n: 1,
+            chunk_rows: 4,
+            // Deliberately 0, which the dispatcher never produces: with any
+            // floor of its own the `.max(job.min_chunk_rows)` would return a
+            // non-zero size on its own and the trailing `.max(1)` would be
+            // untestable. The guard exists precisely so `worker_chunk_rows`
+            // does not depend on the dispatcher having floored anything.
+            min_chunk_rows: 0,
+            total_rows: 1024,
+            active: 2,
+            closure: std::ptr::null(),
+            run: trampoline::<fn(usize, &mut [f32])>,
+        };
+        // Full weight ⇒ the dispatcher's size, untouched.
+        assert_eq!(worker_chunk_rows(&shared, &job, 0), 4);
+        // 4 * 1 / 256 truncates to 0; the floor has to lift it.
+        assert_eq!(worker_chunk_rows(&shared, &job, 1), 1);
+        // A worker with no weight at all (unpinned surplus) gets the full size.
+        assert_eq!(worker_chunk_rows(&shared, &job, 7), 4);
+
+        // The dispatcher's own floor is the other half of the guarantee
+        // `MIN_CHUNK_ROWS` documents: weighting may shrink a slow core's chunk,
+        // but not below the size where the claim costs more than the work.
+        // Scaling alone would give 256 * 1 / 256 = 1 row here.
+        let floored = Job {
+            chunk_rows: 256,
+            min_chunk_rows: 128,
+            ..job
+        };
+        assert_eq!(worker_chunk_rows(&shared, &floored, 0), 256);
+        assert_eq!(
+            worker_chunk_rows(&shared, &floored, 1),
+            128,
+            "weighting scaled past the dispatcher's floor"
+        );
+    }
+
+    /// An all-full weight list describes a host with no spread, so the pool
+    /// drops it and every worker takes the uniform path. This is what keeps the
+    /// homogeneous case free of per-dispatch lookup work rather than merely
+    /// arriving at the same answer.
+    #[test]
+    fn uniform_weights_are_dropped_at_build() {
+        let full = super::super::cpu_features::WEIGHT_FULL;
+        let uniform = RowPool::build(4, &[], &[full, full, full, full], true);
+        assert!(uniform.shared.worker_weights.is_empty());
+        let spread = RowPool::build(4, &[], &[full, full, full, 52], true);
+        assert_eq!(spread.shared.worker_weights.len(), 4);
+        // Weights past the pool width belong to cores no worker sits on.
+        let narrow = RowPool::build(2, &[], &[full, 52, 52, 52], true);
+        assert_eq!(narrow.shared.worker_weights, vec![full, 52]);
+    }
+
     #[test]
     fn repeated_dispatches_reuse_workers() {
         // Same pool, many dispatches — exercises the epoch/park/unpark cycle and
         // confirms the workers stay correct across rounds.
-        let pool = RowPool::build(4, &[], true);
+        let pool = RowPool::build(4, &[], &[], true);
         let mut y = vec![0.0f32; 2048];
         for iter in 0..50 {
             pool.dispatch_rows(&mut y, 1, 1, |row, slice| {
@@ -1266,7 +1593,7 @@ mod tests {
         // under the same swing too.
         for &active_barrier in &[true, false] {
             for &num_threads in &[2usize, 4, 8] {
-                let pool = RowPool::build(num_threads, &[], active_barrier);
+                let pool = RowPool::build(num_threads, &[], &[], active_barrier);
                 for iter in 0..60usize {
                     // Swing `active` between 1 (narrow) and the full width.
                     let total_rows = if iter % 2 == 0 { 1 } else { 2048 };
@@ -1290,7 +1617,7 @@ mod tests {
         // row, never the per-row result. Across depths (⇒ different `active`
         // caps) the output must still equal the serial reference, with no row
         // lost when the cap idles most of the pool.
-        let pool = RowPool::build(8, &[], true);
+        let pool = RowPool::build(8, &[], &[], true);
         for &depth in &[0usize, 1, 4096, 1_000_000] {
             for &total_rows in &[0usize, 1, 3, 64, 500] {
                 let n = 4;
@@ -1312,7 +1639,7 @@ mod tests {
 
     #[test]
     fn single_thread_pool_runs_serially() {
-        let pool = RowPool::build(1, &[], true);
+        let pool = RowPool::build(1, &[], &[], true);
         assert_eq!(pool.num_threads(), 1);
         let mut y = vec![0.0f32; 100];
         pool.dispatch_rows(&mut y, 1, 1, |row, slice| slice[0] = row as f32);
@@ -1323,7 +1650,7 @@ mod tests {
     fn trailing_partial_row_matches_serial_chunks() {
         // y.len() % n != 0: the tail must be visited with the short slice,
         // exactly like the serial `chunks_mut(n)` fallback.
-        let pool = RowPool::build(4, &[], true);
+        let pool = RowPool::build(4, &[], &[], true);
         let n = 8usize;
         let len = 8 * 300 + 5; // 300 full rows + a 5-element tail
         let mut got = vec![0.0f32; len];
@@ -1344,7 +1671,7 @@ mod tests {
     fn concurrent_dispatchers_are_safe() {
         // Two threads dispatching on the same pool simultaneously: the loser of
         // the dispatch lock runs serially — both outputs must still be exact.
-        let pool = RowPool::build(4, &[], true);
+        let pool = RowPool::build(4, &[], &[], true);
         for _ in 0..20 {
             let mut a = vec![0.0f32; 4096];
             let mut b = vec![0.0f32; 4096];
@@ -1360,7 +1687,7 @@ mod tests {
 
     #[test]
     fn worker_panic_propagates_and_pool_survives() {
-        let pool = RowPool::build(4, &[], true);
+        let pool = RowPool::build(4, &[], &[], true);
         let mut y = vec![0.0f32; 4096];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             pool.dispatch_rows(&mut y, 1, 1, |row, slice| {
