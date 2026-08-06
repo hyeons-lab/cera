@@ -510,8 +510,11 @@ pub mod stats {
         /// serialized prefill GEMM by roughly its contraction length. Treat this
         /// as a rough weighting *within* one dispatch kind, and treat
         /// `serial_fallbacks` / `fanout_dispatches` as the reliable signal:
-        /// those are exact, and detecting the silent fallback at all is what
-        /// these counters are for.
+        /// those are exact counts of exact events, and detecting the silent
+        /// fallback at all is what these counters are for. ("Exact" is about
+        /// the counting, not the read: [`snapshot`] takes four separate relaxed
+        /// loads, so a concurrent dispatch can leave one of them a single
+        /// increment behind. See its docs.)
         pub fanout_macs: u64,
         /// The same measure over just the `serial_fallbacks`, so one serialized
         /// large GEMM outweighs many serialized small ones. Same mixed-unit
@@ -527,7 +530,10 @@ pub mod stats {
             if self.fanout_macs == 0 {
                 return 0.0;
             }
-            self.serial_macs as f64 / self.fanout_macs as f64
+            // Clamped so the documented 0.0..=1.0 range holds for a `PoolStats`
+            // assembled by hand or differenced across a counter reset, not only
+            // for one that came from `snapshot`.
+            (self.serial_macs as f64 / self.fanout_macs as f64).clamp(0.0, 1.0)
         }
 
         /// Counters accumulated between two snapshots.
@@ -546,12 +552,34 @@ pub mod stats {
     }
 
     /// Read the counters.
+    ///
+    /// Four independent relaxed loads, so this is not an atomic snapshot: a
+    /// dispatch running concurrently can land between them. The **order** of
+    /// the loads is therefore load-bearing. A dispatch increments its `FANOUT_*`
+    /// counter before the matching `SERIAL_*` one, so reading the `SERIAL_*`
+    /// side *first* keeps the pair consistent in the common case: whatever
+    /// `FANOUT_*` is read afterwards is at least as advanced as the `SERIAL_*`
+    /// value already in hand. Reading them the other way round can report
+    /// `serial_fallbacks=1, fanout_dispatches=0`, i.e. a fallback rate above
+    /// 100%, which is exactly backwards for a diagnostic whose whole job is to
+    /// say how much work fell back.
+    ///
+    /// Ordering alone is not a proof under a weak memory model, so the
+    /// invariant is also enforced rather than merely argued: the `serial_*`
+    /// fields are clamped to their `fanout_*` counterparts. The clamp can only
+    /// ever *understate* a fallback by one in-flight dispatch, and the counters
+    /// are read once per bench run against a hot path that must stay relaxed,
+    /// which is the trade being made here.
     pub fn snapshot() -> PoolStats {
+        let serial_fallbacks = SERIAL_FALLBACKS.load(Ordering::Relaxed);
+        let serial_macs = SERIAL_MACS.load(Ordering::Relaxed);
+        let fanout_dispatches = FANOUT_DISPATCHES.load(Ordering::Relaxed);
+        let fanout_macs = FANOUT_MACS.load(Ordering::Relaxed);
         PoolStats {
-            fanout_dispatches: FANOUT_DISPATCHES.load(Ordering::Relaxed),
-            serial_fallbacks: SERIAL_FALLBACKS.load(Ordering::Relaxed),
-            fanout_macs: FANOUT_MACS.load(Ordering::Relaxed),
-            serial_macs: SERIAL_MACS.load(Ordering::Relaxed),
+            fanout_dispatches,
+            fanout_macs,
+            serial_fallbacks: serial_fallbacks.min(fanout_dispatches),
+            serial_macs: serial_macs.min(fanout_macs),
         }
     }
 }
@@ -1735,6 +1763,52 @@ mod tests {
             assert!(a.iter().enumerate().all(|(i, &v)| v == i as f32 + 1.0));
             assert!(b.iter().enumerate().all(|(i, &v)| v == i as f32 + 2.0));
         }
+    }
+
+    /// The fan-out counters exist to make a silent serial fallback visible, so a
+    /// counter that never increments, or a snapshot that reports an impossible
+    /// pair, fails open: the readout says the pool is healthy and the operator
+    /// believes it.
+    ///
+    /// Drives real contended dispatches rather than poking the atomics, so it
+    /// covers the increments in `dispatch_body` and the read in `snapshot`
+    /// together. The counters are process-global and other tests dispatch
+    /// concurrently, hence deltas via `since` and inequalities rather than
+    /// exact totals.
+    #[test]
+    fn fanout_counters_track_dispatches_and_stay_coherent() {
+        let before = stats::snapshot();
+        let pool = RowPool::build(4, &[], true);
+        // Two threads on one pool: whoever loses `try_lock` is a serial
+        // fallback, which is the event these counters exist to catch.
+        for _ in 0..20 {
+            let mut a = vec![0.0f32; 4096];
+            let mut b = vec![0.0f32; 4096];
+            thread::scope(|s| {
+                let pool = &pool;
+                s.spawn(|| pool.dispatch_rows(&mut a, 1, 1, |row, s| s[0] = row as f32 + 1.0));
+                pool.dispatch_rows(&mut b, 1, 1, |row, s| s[0] = row as f32 + 2.0);
+            });
+        }
+        let delta = stats::snapshot().since(&before);
+        assert!(
+            delta.fanout_dispatches >= 40,
+            "40 multi-worker dispatches counted as {}",
+            delta.fanout_dispatches
+        );
+        // The invariant `snapshot` enforces: a subset can never exceed its set.
+        // Read from a live snapshot, not a hand-built one, so a regression in
+        // the load order or the clamp shows up here.
+        let live = stats::snapshot();
+        assert!(
+            live.serial_fallbacks <= live.fanout_dispatches,
+            "serial {} > fanout {}",
+            live.serial_fallbacks,
+            live.fanout_dispatches
+        );
+        assert!(live.serial_macs <= live.fanout_macs);
+        let f = live.serial_mac_fraction();
+        assert!((0.0..=1.0).contains(&f), "fraction {f} outside 0.0..=1.0");
     }
 
     #[test]
