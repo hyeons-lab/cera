@@ -1778,7 +1778,7 @@ mod tests {
     #[test]
     fn fanout_counters_track_dispatches_and_stay_coherent() {
         let before = stats::snapshot();
-        let pool = RowPool::build(4, &[], true);
+        let pool = RowPool::build(4, &[], &[], true);
         // Two threads on one pool: whoever loses `try_lock` is a serial
         // fallback, which is the event these counters exist to catch.
         for _ in 0..20 {
