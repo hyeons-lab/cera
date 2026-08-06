@@ -87,8 +87,9 @@
 //! ## Affinity side effects
 //!
 //! On Linux/Android the spawned workers *and the calling thread* are pinned
-//! to the detected performance cores (the caller to the fastest one —
-//! unpinned, a big.LITTLE scheduler can strand it on an efficiency core where
+//! to distinct detected cores, fastest-first, so a default-width pool lands
+//! entirely on the performance ones (the caller to the fastest one, because
+//! unpinned a big.LITTLE scheduler can strand it on an efficiency core where
 //! it stalls every barrier). The caller pin is held by one thread at a time,
 //! process-wide, for as long as that thread lives: concurrent additional
 //! dispatchers (a second session) keep floating rather than piling onto the
@@ -354,6 +355,87 @@ pub struct RowPool {
     num_threads: usize,
 }
 
+/// Counters for the dispatch fan-out path.
+///
+/// Exists for one question: when a dispatch wants `active > 1` workers but
+/// `dispatch_lock.try_lock()` fails, it silently runs the whole operation
+/// serially on the caller. That is an all-or-nothing slowdown on that
+/// operation, and it does not show up anywhere except as a throughput number
+/// that is mysteriously half what it should be. Counting it is the only way to
+/// tell "this dispatch fanned out and the cores were slow" from "this dispatch
+/// never fanned out at all".
+pub mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(super) static FANOUT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SERIAL_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FANOUT_MACS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SERIAL_MACS: AtomicU64 = AtomicU64::new(0);
+
+    /// Dispatch-path counters since process start. Monotonic; use
+    /// [`PoolStats::since`] to get the delta over an interval.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct PoolStats {
+        /// Dispatches that wanted more than one worker.
+        pub fanout_dispatches: u64,
+        /// Of those, how many ran serially because the pool was already busy.
+        pub serial_fallbacks: u64,
+        /// Work over all `fanout_dispatches`, in output elements times the
+        /// caller-supplied `depth`.
+        ///
+        /// **Only the work-capped GEMM dispatches supply a depth**
+        /// ([`super::super::cpu::par_rows_n_work`]); every other caller passes
+        /// zero and so contributes plain output elements. The unit is therefore
+        /// mixed, and a serialized decode GEMV is understated against a
+        /// serialized prefill GEMM by roughly its contraction length. Treat this
+        /// as a rough weighting *within* one dispatch kind, and treat
+        /// `serial_fallbacks` / `fanout_dispatches` as the reliable signal:
+        /// those are exact, and detecting the silent fallback at all is what
+        /// these counters are for.
+        pub fanout_macs: u64,
+        /// The same measure over just the `serial_fallbacks`, so one serialized
+        /// large GEMM outweighs many serialized small ones. Same mixed-unit
+        /// caveat as `fanout_macs`.
+        pub serial_macs: u64,
+    }
+
+    impl PoolStats {
+        /// Fraction of fan-out work that ran serially, 0.0 to 1.0. Carries the
+        /// mixed-unit caveat documented on [`PoolStats::fanout_macs`]; the
+        /// dispatch counts are the trustworthy number.
+        pub fn serial_mac_fraction(&self) -> f64 {
+            if self.fanout_macs == 0 {
+                return 0.0;
+            }
+            self.serial_macs as f64 / self.fanout_macs as f64
+        }
+
+        /// Counters accumulated between two snapshots.
+        pub fn since(&self, earlier: &PoolStats) -> PoolStats {
+            PoolStats {
+                fanout_dispatches: self
+                    .fanout_dispatches
+                    .saturating_sub(earlier.fanout_dispatches),
+                serial_fallbacks: self
+                    .serial_fallbacks
+                    .saturating_sub(earlier.serial_fallbacks),
+                fanout_macs: self.fanout_macs.saturating_sub(earlier.fanout_macs),
+                serial_macs: self.serial_macs.saturating_sub(earlier.serial_macs),
+            }
+        }
+    }
+
+    /// Read the counters.
+    pub fn snapshot() -> PoolStats {
+        PoolStats {
+            fanout_dispatches: FANOUT_DISPATCHES.load(Ordering::Relaxed),
+            serial_fallbacks: SERIAL_FALLBACKS.load(Ordering::Relaxed),
+            fanout_macs: FANOUT_MACS.load(Ordering::Relaxed),
+            serial_macs: SERIAL_MACS.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Whether affinity pinning is enabled (`CERA_PIN=0`/`false`/`off`,
 /// case-insensitive, disables it — for host apps that manage thread placement
 /// and don't want cera's permanent caller pin). Resolved once.
@@ -364,18 +446,22 @@ pub(crate) fn pinning_enabled() -> bool {
 
 impl RowPool {
     /// Full-width pool for compute-bound batched work — prefill GEMM
-    /// ([`super::cpu::par_rows_n`]). Sized to all performance cores; batched
-    /// matmul is compute-bound and scales with threads. Lazily built so
+    /// ([`super::cpu::par_rows_n`]). Width comes from
+    /// `super::calibrate::prefill_thread_count`: the performance cores, since
+    /// batched matmul is compute-bound and scales with threads, but *not* the
+    /// efficiency cores, which measured as a large net loss. Overridable with
+    /// `CERA_PREFILL_THREADS=<n>` up to every pinnable core. Lazily built so
     /// `CeraEngine` consumers get it without calling
     /// [`super::cpu::configure_thread_pool`].
     pub fn prefill() -> &'static RowPool {
         static POOL: OnceLock<RowPool> = OnceLock::new();
         POOL.get_or_init(|| {
             let topo = super::cpu_features::core_topology();
+            let n = super::calibrate::prefill_thread_count(topo);
             // Active-sized barrier: prefill GEMMs vary widely in size, and a
             // small one is better run on the few cores its work can fill than
             // dragged across the whole pool's barrier (see `Shared::active_barrier`).
-            RowPool::build(topo.perf_core_count, pinned_cores(), true)
+            RowPool::build(n, pinned_cores(), true)
         })
     }
 
@@ -685,7 +771,8 @@ impl RowPool {
         // path below rather than blocking — always sound, never deadlocks. A
         // poisoned lock (a dispatcher panicked) is safe to take: the drain
         // guard below leaves the pool state consistent even on unwind.
-        let guard = if active > 1 {
+        let wanted_fanout = active > 1;
+        let guard = if wanted_fanout {
             match self.dispatch_lock.try_lock() {
                 Ok(g) => Some(g),
                 Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
@@ -694,6 +781,27 @@ impl RowPool {
         } else {
             None
         };
+
+        // Count how often that fallback fires, and how much work it swallows.
+        // A dispatch that wanted `active` workers and got one is a silent ~Nx on
+        // that operation, invisible in any throughput number, so it has to be
+        // counted rather than reasoned about. Relaxed adds on a path that is
+        // about to do at least `total_rows * n` MACs are free.
+        //
+        // `depth.max(1)` means a caller that supplied no depth contributes
+        // output elements rather than MACs; see `stats::PoolStats::fanout_macs`
+        // for why that is tolerated and what to read instead.
+        if wanted_fanout {
+            let macs = (total_rows as u64)
+                .saturating_mul(n as u64)
+                .saturating_mul(depth.max(1) as u64);
+            stats::FANOUT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            stats::FANOUT_MACS.fetch_add(macs, Ordering::Relaxed);
+            if guard.is_none() {
+                stats::SERIAL_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                stats::SERIAL_MACS.fetch_add(macs, Ordering::Relaxed);
+            }
+        }
 
         // Single active worker (small op, a 1-thread pool, or a contended
         // dispatch): run serially on the caller with safe slicing — no pointer
@@ -1001,17 +1109,37 @@ pub(crate) fn pin_current_thread_to_core(_core: usize) -> bool {
     false
 }
 
-/// The cores this crate is willing to pin to: the detected performance cores,
-/// or nothing at all when `CERA_PIN` is off. The single place that decision is
-/// made. `RowPool::build` takes its core list already filtered through here,
-/// and [`super::cpu::ensure_rayon_global_pool`] uses the same list as a set
-/// mask rather than pinning one core per worker.
+/// Every core this crate is willing to pin a worker to, fastest-first, or
+/// nothing at all when `CERA_PIN` is off. The single place that decision is
+/// made; `RowPool::build` takes its core list already filtered through here.
+///
+/// This is the *full* usable set, efficiency cores included, because a widened
+/// pool needs a distinct core for every worker (see `CoreTopology::pin_cores`
+/// for the 35x measurement behind that). A caller that wants only the fast
+/// cores wants [`perf_pinned_cores`] instead.
 pub(crate) fn pinned_cores() -> &'static [usize] {
     if pinning_enabled() {
         &super::cpu_features::core_topology().pin_cores
     } else {
         &[]
     }
+}
+
+/// The performance-core prefix of [`pinned_cores`], for callers that want a set
+/// mask rather than one core per worker: today
+/// [`super::cpu::ensure_rayon_global_pool`], which confines rayon's workers to
+/// the fast cores without handing each a private one.
+///
+/// `pin_cores` is fastest-first and `fast_cores` counts how many of its leading
+/// entries are performance cores, so the prefix is exactly that set. It reads
+/// `fast_cores` and **not** `perf_core_count`: the latter is a pool width that
+/// `CERA_THREADS` moves, so on a 6P+2E part `CERA_THREADS=8` would widen this
+/// mask onto both efficiency cores, which is the straggler-on-every-barrier
+/// problem the width policy exists to avoid.
+pub(crate) fn perf_pinned_cores() -> &'static [usize] {
+    let cores = pinned_cores();
+    let fast = super::cpu_features::core_topology().fast_cores;
+    &cores[..fast.min(cores.len())]
 }
 
 /// Set the calling thread's affinity to exactly `cores`, via

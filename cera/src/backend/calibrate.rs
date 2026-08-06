@@ -28,7 +28,7 @@ use std::sync::OnceLock;
 /// It is also the ceiling on the *narrow* arm inside the sizing path, so
 /// retuning it moves that arm on every sized host too, not just the fallback.
 ///
-/// On a heterogeneous topology `perf_core_count` is already the (capped)
+/// On a heterogeneous topology `perf_core_count` is already the
 /// big-core count, so this only binds on the homogeneous fallback where
 /// `perf_core_count` is *all logical CPUs*: a many-core host must not spin-wait
 /// a barrier across every core for memory-bound decode. 12 covers every
@@ -247,7 +247,8 @@ pub fn decode_thread_count(topo: &CoreTopology) -> usize {
                 tracing::warn!(
                     "cera: CERA_DECODE_THREADS={n} exceeds the {max_t} detected \
                      performance cores; clamping to {max_t} (set CERA_THREADS to \
-                     raise the detected count)"
+                     raise the detected count, though that is itself clamped to \
+                     the pinnable cores)"
                 );
             }
             return n.min(max_t);
@@ -269,6 +270,78 @@ pub fn decode_thread_count(topo: &CoreTopology) -> usize {
     }
 
     max_t.min(DECODE_MAX_AUTO)
+}
+
+/// Resolve the prefill worker count for this device: the performance cores,
+/// same as decode, overridable with `CERA_PREFILL_THREADS=<n>` up to every
+/// pinnable core.
+///
+/// **The efficiency cores are deliberately left out, and this was measured, not
+/// assumed.** The tempting argument for including them is that prefill is one
+/// large compute-bound GEMM handed out as work-stealing chunks
+/// (`STEAL_CHUNKS_PER_WORKER` per worker), so a slow core should just claim
+/// fewer chunks and still contribute, unlike decode's per-token full barrier.
+/// That argument is wrong. The likeliest reason is that work-stealing balances
+/// *throughput* but not the *tail*: the dispatch ends when the last chunk ends,
+/// and an efficiency core that claims a chunk late holds every other worker at
+/// the barrier for its whole duration. The competing explanation, that a pool
+/// spanning every core starves the system and pays for it in spin contention,
+/// is not supported: `CERA_SPIN=0` does not recover the loss, giving 70 and 78
+/// over two rounds at the wide width against 147 and 165 for the narrow one.
+/// The spin knob is noisy enough on this device that this rules the hypothesis
+/// out rather than confirming the tail one.
+///
+/// A third explanation, that the wide pool loses its `dispatch_lock` `try_lock`
+/// and silently runs whole GEMMs serially, is also ruled out: the counters in
+/// `threadpool::stats` report **zero** serial fallbacks out of 863 fan-out
+/// dispatches per run, on fast and slow runs alike.
+///
+/// Measured on a Pixel 10 Pro Fold (Tensor G5: 2x A520 at `cpu_capacity` 207,
+/// 5x A725 at 824, 1x X4 at 1024), LFM2.5-350M-Q4_K_M, 512-token prompt, five
+/// interleaved rounds, p50 prefill tok/s:
+///
+/// | prefill workers | cores spanned | prefill tok/s |
+/// |----------------:|---------------|--------------:|
+/// | 6               | perf only     | 141           |
+/// | 8               | perf + 2x A520| 84.5          |
+///
+/// A 1.67x loss to add two cores worth a nominal 8% of the machine's capacity.
+/// `cpu_capacity` rates the A520 4x slower than an A725, but on a quantized
+/// NEON dotprod kernel it is worse than that, and one tail chunk at 6-8x
+/// against ~32 chunks accounts for most of the gap before shared-cache
+/// contention is counted at all.
+///
+/// An earlier Tensor G4 measurement appeared to show the opposite (prefill 123
+/// → 138-146 going from 4 to 8 workers). It does not transfer: `pin_cores` held
+/// only the 4 performance cores there, so the surplus workers ran *unpinned*
+/// and the kernel was free to place and migrate them. Pinning a worker to a
+/// specific A520 is a different configuration, and the one measured above.
+pub fn prefill_thread_count(topo: &CoreTopology) -> usize {
+    let default = topo.perf_core_count.max(1);
+    let Some(n) = env_usize("CERA_PREFILL_THREADS") else {
+        return default;
+    };
+    // The knob may reach past the performance cores, up to whatever can still
+    // be pinned: widening is a loss on the parts measured here, not on every
+    // part, and this is how the next one gets swept without a rebuild.
+    //
+    // Hosts with no pinnable cores are *not* clamped, matching
+    // `cpu_features::apply_thread_override`. The cliff this guards against is
+    // pinned workers spin-waiting on the cores unpinned ones need; with nothing
+    // pinned there is no such split, and clamping to the P-core count would
+    // make the knob unusable on exactly the hosts (macOS, homogeneous desktop)
+    // where a sweep is most convenient to run.
+    if topo.pin_cores.is_empty() {
+        return n;
+    }
+    let ceiling = topo.pin_cores.len().max(default);
+    if n > ceiling {
+        tracing::warn!(
+            "cera: CERA_PREFILL_THREADS={n} exceeds the {ceiling} pinnable cores; \
+             clamping to {ceiling}"
+        );
+    }
+    n.min(ceiling)
 }
 
 /// Ceiling on either arm, for the same reason [`DECODE_MAX_AUTO`] has one:
@@ -533,6 +606,7 @@ mod tests {
         let epyc = CoreTopology {
             perf_core_count: 192,
             pin_cores: Vec::new(),
+            fast_cores: 0,
         };
         for phys in [16usize, 32, 64, 96] {
             let narrow = width_for_host(&epyc, shape(21, 25), Overrides::default(), Some(phys))
@@ -556,6 +630,7 @@ mod tests {
         let zen5 = CoreTopology {
             perf_core_count: 32,
             pin_cores: Vec::new(),
+            fast_cores: 0,
         };
         assert_eq!(
             width_for_host(&zen5, shape(1321, 129), Overrides::default(), Some(16)),
@@ -576,10 +651,12 @@ mod tests {
         let big_little = CoreTopology {
             perf_core_count: 6,
             pin_cores: vec![7, 6, 5, 4, 3, 2],
+            fast_cores: 6,
         };
         let unknown_phys = CoreTopology {
             perf_core_count: 32,
             pin_cores: Vec::new(),
+            fast_cores: 0,
         };
         let s = shape(219, 99);
         let threshold_only = Overrides {
@@ -618,6 +695,7 @@ mod tests {
         let host = CoreTopology {
             perf_core_count: 32,
             pin_cores: Vec::new(),
+            fast_cores: 0,
         };
         let ov = Overrides {
             narrow: Some(3),
@@ -649,6 +727,7 @@ mod tests {
         let host = CoreTopology {
             perf_core_count: 32,
             pin_cores: Vec::new(),
+            fast_cores: 0,
         };
         let low_wide = Overrides {
             wide: Some(4),
@@ -718,6 +797,7 @@ mod tests {
         let big_little = CoreTopology {
             perf_core_count: 6,
             pin_cores: vec![7, 6, 5, 4, 3, 2],
+            fast_cores: 6,
         };
         // LFM2-350M Q4_0 — the exact model measured scaling to all 6 big cores.
         assert_eq!(
@@ -733,10 +813,35 @@ mod tests {
         let windows_box = CoreTopology {
             perf_core_count: 32,
             pin_cores: Vec::new(),
+            fast_cores: 0,
         };
         assert_eq!(
             width_for_host(&windows_box, shape(1321, 129), Overrides::default(), None),
             None
         );
+    }
+
+    /// `CERA_PREFILL_THREADS` is read from the environment, so only the
+    /// no-override default and the pure clamp are testable here without racing
+    /// other tests over process env. The clamp's shape is the interesting part:
+    /// it must NOT bind on hosts with nothing to pin, matching
+    /// `cpu_features::apply_thread_override`, or the knob is unusable on macOS
+    /// and homogeneous desktops.
+    #[test]
+    fn prefill_width_defaults_to_perf_cores() {
+        let big_little = CoreTopology {
+            perf_core_count: 6,
+            pin_cores: vec![7, 6, 5, 4, 3, 2, 1, 0],
+            fast_cores: 6,
+        };
+        assert_eq!(prefill_thread_count(&big_little), 6);
+
+        // A host with no affinity still gets its perf-core count as the width.
+        let unpinned = CoreTopology {
+            perf_core_count: 10,
+            pin_cores: Vec::new(),
+            fast_cores: 0,
+        };
+        assert_eq!(prefill_thread_count(&unpinned), 10);
     }
 }

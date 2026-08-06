@@ -287,7 +287,7 @@ optimal on any one. The knobs below override them.
 | Variable | Effect |
 |----------|--------|
 | `CERA_DECODE_THREADS=<n>` or `CERA_DECODE_THREADS=auto` | Worker count for decode (per-token GEMV). A fixed `<n>` overrides the automatic sizing below (clamped to the detected count); `auto` selects it. |
-| `CERA_DECODE_SIZING=off` | Disable model-aware decode sizing (`0` / `false` / `off`, case-insensitive) and fall back to the flat cap (detected perf cores: ≤12 homogeneous, ≤6 on big.LITTLE). Use this to A/B the sizing on a new machine. |
+| `CERA_DECODE_SIZING=off` | Disable model-aware decode sizing (`0` / `false` / `off`, case-insensitive) and fall back to the flat cap (detected perf cores, capped at 12). Use this to A/B the sizing on a new machine. |
 | `CERA_DECODE_NARROW=<n>` / `CERA_DECODE_WIDE=<n>` | Override the two widths the sizing picks between. Defaults derive from the physical core count: `physical/2` capped at 12, and `physical + physical/4` capped at 24; the narrow arm never exceeds the wide one. Setting either also forces sizing on where it would otherwise be declined; on a host whose physical core count is undetectable, both must be pinned. |
 | `CERA_DECODE_BPD_KB=<n>` | Bytes-per-dispatch threshold (decimal KB) separating the narrow arm from the wide one. Default 2500. Unlike the two above, this does not force sizing on where it is declined; it moves the threshold, it does not pin a width. |
 | `CERA_THREADS=<n>` | Overrides the detected performance-core count, which the decode/prefill pools are sized from. |

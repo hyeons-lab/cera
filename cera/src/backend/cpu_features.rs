@@ -327,32 +327,45 @@ pub fn cpu_tier() -> CpuTier {
 ///
 /// `perf_core_count` is how many compute threads to run; `pin_cores` are the OS
 /// core indices to pin those workers to via `sched_setaffinity` (Linux/Android
-/// only — empty elsewhere, where the OS scheduler or Darwin QoS handles
+/// only; empty elsewhere, where the OS scheduler or Darwin QoS handles
 /// placement and affinity masks are inert).
+///
+/// Both pools default to `perf_core_count`. Widening prefill over the
+/// efficiency cores was tried and is a **loss**: see
+/// `calibrate::prefill_thread_count`, which owns that policy and the knob that
+/// overrides it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreTopology {
-    /// Number of compute worker threads to run (always ≥ 1).
+    /// Number of compute worker threads to run (always ≥ 1). Also the ceiling
+    /// `CERA_DECODE_THREADS` is clamped to.
     pub perf_core_count: usize,
-    /// OS core indices to pin workers to, fastest-first. Empty when the
-    /// platform has no usable affinity; when shorter than `perf_core_count`,
-    /// the surplus workers run unpinned.
+    /// OS core indices to pin workers to, fastest-first, covering **every**
+    /// usable core rather than only the performance ones. Empty when the
+    /// platform has no usable affinity; when shorter than the pool width, the
+    /// surplus workers run unpinned.
+    ///
+    /// Listing the efficiency cores here does not put them to work: no pool is
+    /// that wide by default. It is what makes a *deliberately* widened pool
+    /// (`CERA_THREADS`, `CERA_PREFILL_THREADS`) merely slower instead of
+    /// catastrophic, by giving every worker a distinct core. Measured on a
+    /// Tensor G4 (4x A520 + 3x A720 + 1x X4), a pool widened past the cores it
+    /// could pin cost decode 63.4 → 1.8 tok/s: the pinned workers spin
+    /// (`SPIN_BEFORE_PARK`) on exactly the cores the unpinned ones need in
+    /// order to reach the per-token barrier.
     pub pin_cores: Vec<usize>,
+    /// How many leading entries of `pin_cores` are *performance* cores, as
+    /// detected. Distinct from `perf_core_count`, which is a pool width and so
+    /// moves with `CERA_THREADS`; this is a fact about the silicon and does
+    /// not. `pin_cores` is fastest-first, so `pin_cores[..fast_cores]` is
+    /// exactly the fast set.
+    ///
+    /// Kept separate because the two diverge exactly where it matters:
+    /// `CERA_THREADS=8` on a 6P+2E part raises the width to 8, and a consumer
+    /// that derived "the perf cores" from the width would then hand out a mask
+    /// covering both efficiency cores. `super::threadpool::perf_pinned_cores`
+    /// is that consumer.
+    pub fast_cores: usize,
 }
-
-/// Upper bound on the auto-detected big-core count (and thus decode/prefill
-/// pool width). Decode scales across the performance cores but plateaus around
-/// the big-core count, beyond which more threads only add barrier/scheduling
-/// overhead and power draw; 6 covers current big.LITTLE mobile (Tensor G5,
-/// Snapdragon 8-series) with a sensible power/thermal margin. On a SoC with
-/// more than 6 performance cores (e.g. an 8-prime part) this leaves a couple
-/// idle — deliberately conservative; `CERA_THREADS` overrides in both
-/// directions for tuning. Decode has two further ceilings of its own, both in
-/// `calibrate`: `DECODE_WIDTH_MAX` bounds the wide arm of the model-sized path,
-/// and `DECODE_MAX_AUTO` is both the flat fallback for hosts that path declines
-/// *and* the ceiling on its narrow arm. Keep all three in mind when retuning
-/// any of them.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const MAX_AUTO_THREADS: usize = 6;
 
 /// Highest plausible CPU index to probe in sysfs. A hard bound so a malformed
 /// `/sys` can't loop unboundedly; real parts are far below this.
@@ -457,8 +470,8 @@ fn linux_physical_cores() -> Option<usize> {
 
 /// Uncached topology detection. Prefer [`core_topology`]; exposed for tests.
 ///
-/// Precedence: a valid `CERA_THREADS` override sets the thread count (workers
-/// still pin to the detected perf cores where available); otherwise the
+/// Precedence: a valid `CERA_THREADS` override sets the thread count (see
+/// `apply_thread_override` for the clamp it is subject to); otherwise the
 /// platform detector picks the perf-core count; otherwise all logical cores.
 pub fn detect_topology() -> CoreTopology {
     let forced = env_usize("CERA_THREADS");
@@ -470,10 +483,15 @@ pub fn detect_topology() -> CoreTopology {
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     if let Some(count) = macos_perf_core_count() {
+        // Apple Silicon is heterogeneous in hardware, but `perflevel0` reports
+        // only the P-cores and there is no usable affinity to pin an E-core
+        // worker with, so the pools stay on the P-core count.
         return apply_thread_override(
             CoreTopology {
                 perf_core_count: count,
                 pin_cores: Vec::new(),
+                // No pinnable cores, so there is no prefix to hand out.
+                fast_cores: 0,
             },
             forced,
         );
@@ -487,20 +505,51 @@ pub fn detect_topology() -> CoreTopology {
         CoreTopology {
             perf_core_count: n,
             pin_cores: Vec::new(),
+            fast_cores: 0,
         },
         forced,
     )
 }
 
 /// Apply a `CERA_THREADS` override to a detected topology: set the thread count
-/// and pin at most that many of the detected cores (fastest-first). Pure, so
-/// the override policy is testable without touching process env.
+/// and pin at most that many of the detected cores (fastest-first). Both pools
+/// derive from it, and it also lowers the ceiling `CERA_PREFILL_THREADS` is
+/// clamped to, so it stays the single global cap. Pure, so the override policy
+/// is testable without touching process env.
+///
+/// **Clamped to the number of pinnable cores**, where the host has any. That is
+/// not paternalism about power draw; asking for more workers than there are
+/// cores to pin does not oversubscribe gracefully, it falls off a cliff. The
+/// surplus workers run unpinned, and an unpinned worker must contend for a core
+/// that a pinned one is busy spin-waiting on (`SPIN_BEFORE_PARK`) rather than
+/// yielding it. Measured on a Tensor G4, `CERA_THREADS=8` against 4 pinnable
+/// cores took decode from 63.4 to 1.8 tok/s, a 35x loss, silently. Below the
+/// core count the override still works in both directions, which is what it is
+/// for; `CERA_SPIN=0` remains the lever for studying the oversubscribed case.
 fn apply_thread_override(mut topo: CoreTopology, forced: Option<usize>) -> CoreTopology {
-    if let Some(n) = forced {
-        topo.perf_core_count = n;
-        // Never pin more cores than were detected; surplus workers run unpinned.
-        topo.pin_cores.truncate(n);
-    }
+    let Some(n) = forced else { return topo };
+    let n = if topo.pin_cores.is_empty() {
+        // No affinity on this platform, so there is no pinned/unpinned split to
+        // fall off; leave the count to the caller.
+        n
+    } else {
+        let cap = topo.pin_cores.len();
+        if n > cap {
+            tracing::warn!(
+                "cera: CERA_THREADS={n} exceeds the {cap} pinnable cores on this host; \
+                 clamping to {cap} (the surplus workers would run unpinned and contend \
+                 with spinning ones)"
+            );
+        }
+        n.min(cap)
+    };
+    topo.perf_core_count = n;
+    topo.pin_cores.truncate(n);
+    // `fast_cores` is a property of the silicon, so the override does not move
+    // it; it is only re-clamped so it stays a valid prefix of the truncated
+    // list. Without this, `CERA_THREADS=8` on a 6P+2E part would leave anything
+    // deriving "the perf cores" from the width masking onto the E-cores.
+    topo.fast_cores = topo.fast_cores.min(topo.pin_cores.len());
     topo
 }
 
@@ -516,23 +565,32 @@ fn detect_topology_sysfs() -> Option<CoreTopology> {
     let caps = read_per_cpu_u32("cpu_capacity");
     let mut cores: Vec<(usize, u32)>;
 
+    // Weight at/above which a core counts as a performance core. Both branches
+    // below keep the *whole* core list and only derive this threshold: the
+    // efficiency cores are excluded from `perf_core_count` (the decode width),
+    // not from `pin_cores`, which the wider prefill pool needs in order to pin
+    // each of its workers to a distinct core.
+    let perf_threshold: u32;
+
     if !caps.is_empty() {
         // Homogeneous capacities (desktop/server arch_topology) → fallback.
         if caps.iter().all(|&(_, c)| c == caps[0].1) {
             return None;
         }
-        cores = caps.into_iter().filter(|&(_, c)| c >= CAP_MID).collect();
+        perf_threshold = CAP_MID;
+        cores = caps;
     } else {
-        // No cpu_capacity — rank the top frequency cluster instead.
+        // No cpu_capacity: rank by max frequency instead.
         let freqs = read_per_cpu_u32("cpufreq/cpuinfo_max_freq");
         let max = freqs.iter().map(|&(_, f)| f).max()?;
-        // Keep cores within 15% of the fastest — the top (big/prime) cluster.
+        // Cores within 15% of the fastest are the top (big/prime) cluster.
         // If *every* core clears the cutoff the machine is homogeneous → fallback.
         let cutoff = (max / 100) * 85;
         if freqs.iter().all(|&(_, f)| f >= cutoff) {
             return None;
         }
-        cores = freqs.into_iter().filter(|&(_, f)| f >= cutoff).collect();
+        perf_threshold = cutoff;
+        cores = freqs;
     }
 
     if cores.is_empty() {
@@ -559,13 +617,31 @@ fn detect_topology_sysfs() -> Option<CoreTopology> {
     });
 
     // Fastest-first (higher weight first; break ties by lower index for
-    // determinism), then cap.
+    // determinism).
     cores.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    cores.truncate(MAX_AUTO_THREADS);
+    // Counted *after* the sibling drop, so a hyperthreaded x86 hybrid part
+    // counts physical P-cores rather than logical ones. Counting before would
+    // size decode to both siblings of each P-core and so pin half its workers
+    // onto E-cores.
+    //
+    // Deliberately uncapped. This used to be clamped to a `MAX_AUTO_THREADS` of
+    // 6, which was never measured; it was a guess at where decode plateaus,
+    // and it binds on shipping parts: a Snapdragon 8 Elite (2 prime + 6
+    // performance) would leave two big cores idle. The real ceilings on decode
+    // live in `calibrate` (`DECODE_MAX_AUTO`, `DECODE_WIDTH_MAX`), which are
+    // calibrated; a heterogeneous SoC has few enough cores that a second,
+    // arbitrary cap here only ever subtracts.
+    let perf_core_count = cores
+        .iter()
+        .filter(|&&(_, w)| w >= perf_threshold)
+        .count()
+        .max(1);
     let pin_cores: Vec<usize> = cores.iter().map(|&(i, _)| i).collect();
+    let fast_cores = perf_core_count;
     Some(CoreTopology {
-        perf_core_count: pin_cores.len(),
+        perf_core_count,
         pin_cores,
+        fast_cores,
     })
 }
 
@@ -649,6 +725,10 @@ mod tests {
     fn topology_has_at_least_one_thread() {
         let topo = detect_topology();
         assert!(topo.perf_core_count >= 1);
+        // Every worker has a distinct core to pin to, or the host has no
+        // affinity at all. An in-between state is the oversubscribed
+        // configuration `apply_thread_override` exists to prevent.
+        assert!(topo.pin_cores.is_empty() || topo.pin_cores.len() >= topo.perf_core_count);
         // Cached accessor agrees with a fresh detect (modulo env, which both read).
         assert_eq!(core_topology().perf_core_count, performance_core_count());
     }
@@ -658,17 +738,62 @@ mod tests {
         let base = CoreTopology {
             perf_core_count: 3,
             pin_cores: vec![7, 6, 5],
+            fast_cores: 3,
         };
         // Fewer threads than detected cores → pin the fastest N.
         let two = apply_thread_override(base.clone(), Some(2));
         assert_eq!(two.perf_core_count, 2);
         assert_eq!(two.pin_cores, vec![7, 6]);
-        // More threads than detected cores → keep all pins, surplus unpinned.
-        let five = apply_thread_override(base.clone(), Some(5));
-        assert_eq!(five.perf_core_count, 5);
-        assert_eq!(five.pin_cores, vec![7, 6, 5]);
         // No override → unchanged.
         assert_eq!(apply_thread_override(base.clone(), None), base);
+    }
+
+    /// `CERA_THREADS` moves the pool *width*; it must not move `fast_cores`,
+    /// which is what `threadpool::perf_pinned_cores` slices the rayon mask from.
+    /// Letting the two move together put the mask on the efficiency cores.
+    #[test]
+    fn thread_override_leaves_fast_cores_alone() {
+        // 6 performance cores followed by 2 efficiency cores, fastest-first.
+        let big_little = CoreTopology {
+            perf_core_count: 6,
+            pin_cores: vec![7, 6, 5, 4, 3, 2, 1, 0],
+            fast_cores: 6,
+        };
+        // Widening past the perf cores must not widen the fast prefix.
+        let wide = apply_thread_override(big_little.clone(), Some(8));
+        assert_eq!(wide.perf_core_count, 8);
+        assert_eq!(wide.fast_cores, 6, "widening leaked onto the E-cores");
+        assert_eq!(&wide.pin_cores[..wide.fast_cores], &[7, 6, 5, 4, 3, 2]);
+        // Narrowing below the perf cores truncates `pin_cores`, so the prefix
+        // has to shrink with it or it would index out of bounds.
+        let narrow = apply_thread_override(big_little, Some(3));
+        assert_eq!(narrow.fast_cores, 3);
+        assert!(narrow.fast_cores <= narrow.pin_cores.len());
+    }
+
+    /// Asking for more workers than there are pinnable cores is the
+    /// configuration measured at 63.4 → 1.8 tok/s on a Tensor G4, so it is
+    /// clamped rather than honored. Without pins there is no cliff to avoid and
+    /// the count passes through.
+    #[test]
+    fn thread_override_clamps_to_pinnable_cores() {
+        let pinned = CoreTopology {
+            perf_core_count: 3,
+            pin_cores: vec![7, 6, 5],
+            fast_cores: 3,
+        };
+        let five = apply_thread_override(pinned, Some(5));
+        assert_eq!(five.perf_core_count, 3);
+        assert_eq!(five.pin_cores, vec![7, 6, 5]);
+
+        // No affinity (macOS/desktop fallback) → nothing to clamp against.
+        let unpinned = CoreTopology {
+            perf_core_count: 8,
+            pin_cores: Vec::new(),
+            fast_cores: 0,
+        };
+        let wide = apply_thread_override(unpinned, Some(16));
+        assert_eq!(wide.perf_core_count, 16);
     }
 
     #[test]
