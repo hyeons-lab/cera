@@ -341,8 +341,11 @@ pub struct CoreTopology {
     pub perf_core_count: usize,
     /// OS core indices to pin workers to, fastest-first, covering **every**
     /// usable core rather than only the performance ones. Empty when the
-    /// platform has no usable affinity; when shorter than the pool width, the
-    /// surplus workers run unpinned.
+    /// platform has no usable affinity. A pool wider than this list would leave
+    /// its surplus workers unpinned, which is the 35x cliff described on
+    /// `apply_thread_override`; both that function and
+    /// `calibrate::prefill_thread_count` clamp to this length precisely so that
+    /// state is unreachable while pinning is on.
     ///
     /// Listing the efficiency cores here does not put them to work: no pool is
     /// that wide by default. It is what makes a *deliberately* widened pool
@@ -424,10 +427,8 @@ pub(crate) fn env_usize(name: &str) -> Option<usize> {
 /// (`0` / `false` / `off`, case-insensitive). Unset ⇒ `false` (leave it on).
 /// Shared by the `CERA_*` kill switches so they all spell "off" the same way.
 ///
-/// Gated with its callers (`threadpool::pinning_enabled`,
-/// `calibrate::sizing_enabled`, `cpu::ensure_rayon_global_pool`), which exist
-/// only where the `RowPool` does.
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+/// Ungated, unlike most of the pool plumbing: [`pinning_disabled`] calls it and
+/// is itself reachable from `detect_topology`, which every target builds.
 pub(crate) fn env_disabled(name: &str) -> bool {
     std::env::var(name)
         .map(|v| {
@@ -437,6 +438,23 @@ pub(crate) fn env_disabled(name: &str) -> bool {
                 .any(|d| v.eq_ignore_ascii_case(d))
         })
         .unwrap_or(false)
+}
+
+/// Whether `CERA_PIN` switches worker pinning off, resolved once.
+///
+/// Lives here rather than next to `threadpool::pinning_enabled` (which is now
+/// its inverse) because the *sizing* policy needs the same answer, and both
+/// `threadpool` and `calibrate` are absent on targets that still size a pool.
+///
+/// It matters to sizing because the clamps in [`apply_thread_override`] and
+/// `calibrate::prefill_thread_count` exist to prevent one specific failure:
+/// surplus *unpinned* workers contending for cores that *pinned* workers are
+/// busy spin-waiting on. With `CERA_PIN=0` nothing is pinned, so that failure
+/// cannot occur and the clamp would only stop a deliberate oversubscription
+/// sweep from running.
+pub(crate) fn pinning_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| env_disabled("CERA_PIN"))
 }
 
 /// Number of performance cores to run compute threads on (convenience over
@@ -501,10 +519,11 @@ fn linux_physical_cores() -> Option<usize> {
 /// platform detector picks the perf-core count; otherwise all logical cores.
 pub fn detect_topology() -> CoreTopology {
     let forced = env_usize("CERA_THREADS");
+    let pinning_on = !pinning_disabled();
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some(topo) = detect_topology_sysfs() {
-        return apply_thread_override(topo, forced);
+        return apply_thread_override(topo, forced, pinning_on);
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -524,6 +543,7 @@ pub fn detect_topology() -> CoreTopology {
                 core_weights: Vec::new(),
             },
             forced,
+            pinning_on,
         );
     }
 
@@ -541,6 +561,7 @@ pub fn detect_topology() -> CoreTopology {
             core_weights: Vec::new(),
         },
         forced,
+        pinning_on,
     )
 }
 
@@ -550,20 +571,32 @@ pub fn detect_topology() -> CoreTopology {
 /// clamped to, so it stays the single global cap. Pure, so the override policy
 /// is testable without touching process env.
 ///
-/// **Clamped to the number of pinnable cores**, where the host has any. That is
-/// not paternalism about power draw; asking for more workers than there are
-/// cores to pin does not oversubscribe gracefully, it falls off a cliff. The
-/// surplus workers run unpinned, and an unpinned worker must contend for a core
-/// that a pinned one is busy spin-waiting on (`SPIN_BEFORE_PARK`) rather than
-/// yielding it. Measured on a Tensor G4, `CERA_THREADS=8` against 4 pinnable
-/// cores took decode from 63.4 to 1.8 tok/s, a 35x loss, silently. Below the
-/// core count the override still works in both directions, which is what it is
-/// for; `CERA_SPIN=0` remains the lever for studying the oversubscribed case.
-fn apply_thread_override(mut topo: CoreTopology, forced: Option<usize>) -> CoreTopology {
+/// **Clamped to the number of pinnable cores**, where the host has any *and*
+/// pinning is on. That is not paternalism about power draw; asking for more
+/// workers than there are cores to pin does not oversubscribe gracefully, it
+/// falls off a cliff. The surplus workers run unpinned, and an unpinned worker
+/// must contend for a core that a pinned one is busy spin-waiting on
+/// (`SPIN_BEFORE_PARK`) rather than yielding it. Measured on a Tensor G4,
+/// `CERA_THREADS=8` against 4 pinnable cores took decode from 63.4 to 1.8
+/// tok/s, a 35x loss, silently. Below the core count the override still works
+/// in both directions, which is what it is for.
+///
+/// `pinning_on` is [`pinning_disabled`]'s inverse, passed in rather than read
+/// so this stays pure and the policy is testable without touching process env.
+/// When it is false the clamp is skipped: the cliff above is *caused by* pinned
+/// workers spinning, so with `CERA_PIN=0` there is nothing to fall off, and
+/// clamping would only block the deliberate oversubscription sweep that
+/// `CERA_PIN=0` is the natural way to set up.
+fn apply_thread_override(
+    mut topo: CoreTopology,
+    forced: Option<usize>,
+    pinning_on: bool,
+) -> CoreTopology {
     let Some(n) = forced else { return topo };
-    let n = if topo.pin_cores.is_empty() {
-        // No affinity on this platform, so there is no pinned/unpinned split to
-        // fall off; leave the count to the caller.
+    let n = if topo.pin_cores.is_empty() || !pinning_on {
+        // Nothing will be pinned, either because the platform has no affinity or
+        // because `CERA_PIN` turned it off, so there is no pinned/unpinned split
+        // to fall off; leave the count to the caller.
         n
     } else {
         let cap = topo.pin_cores.len();
@@ -829,11 +862,11 @@ mod tests {
             core_weights: vec![WEIGHT_FULL, WEIGHT_FULL, WEIGHT_FULL],
         };
         // Fewer threads than detected cores → pin the fastest N.
-        let two = apply_thread_override(base.clone(), Some(2));
+        let two = apply_thread_override(base.clone(), Some(2), true);
         assert_eq!(two.perf_core_count, 2);
         assert_eq!(two.pin_cores, vec![7, 6]);
         // No override → unchanged.
-        assert_eq!(apply_thread_override(base.clone(), None), base);
+        assert_eq!(apply_thread_override(base.clone(), None, true), base);
     }
 
     /// `CERA_THREADS` moves the pool *width*; it must not move `fast_cores`,
@@ -849,13 +882,13 @@ mod tests {
             core_weights: vec![256, 206, 206, 206, 206, 206, 52, 52],
         };
         // Widening past the perf cores must not widen the fast prefix.
-        let wide = apply_thread_override(big_little.clone(), Some(8));
+        let wide = apply_thread_override(big_little.clone(), Some(8), true);
         assert_eq!(wide.perf_core_count, 8);
         assert_eq!(wide.fast_cores, 6, "widening leaked onto the E-cores");
         assert_eq!(&wide.pin_cores[..wide.fast_cores], &[7, 6, 5, 4, 3, 2]);
         // Narrowing below the perf cores truncates `pin_cores`, so the prefix
         // has to shrink with it or it would index out of bounds.
-        let narrow = apply_thread_override(big_little, Some(3));
+        let narrow = apply_thread_override(big_little, Some(3), true);
         assert_eq!(narrow.fast_cores, 3);
         assert!(narrow.fast_cores <= narrow.pin_cores.len());
     }
@@ -872,7 +905,7 @@ mod tests {
             fast_cores: 3,
             core_weights: vec![WEIGHT_FULL, WEIGHT_FULL, WEIGHT_FULL],
         };
-        let five = apply_thread_override(pinned, Some(5));
+        let five = apply_thread_override(pinned, Some(5), true);
         assert_eq!(five.perf_core_count, 3);
         assert_eq!(five.pin_cores, vec![7, 6, 5]);
 
@@ -883,7 +916,7 @@ mod tests {
             fast_cores: 0,
             core_weights: Vec::new(),
         };
-        let wide = apply_thread_override(unpinned, Some(16));
+        let wide = apply_thread_override(unpinned, Some(16), true);
         assert_eq!(wide.perf_core_count, 16);
     }
 
@@ -937,13 +970,41 @@ mod tests {
             fast_cores: 6,
             core_weights: vec![256, 206, 206, 206, 206, 206, 52, 52],
         };
-        let narrow = apply_thread_override(big_little.clone(), Some(3));
+        let narrow = apply_thread_override(big_little.clone(), Some(3), true);
         assert_eq!(narrow.pin_cores.len(), narrow.core_weights.len());
         assert_eq!(narrow.core_weights, vec![256, 206, 206]);
         // Widening past the detected cores clamps the width, so the lists still
         // match rather than one growing to a length the other cannot cover.
-        let wide = apply_thread_override(big_little, Some(16));
+        let wide = apply_thread_override(big_little, Some(16), true);
         assert_eq!(wide.pin_cores.len(), wide.core_weights.len());
+    }
+
+    /// With `CERA_PIN=0` nothing is pinned, so the clamp's justification (surplus
+    /// unpinned workers contending with pinned spinning ones) does not apply and
+    /// the override must pass through. Before this, `CERA_PIN=0 CERA_THREADS=16`
+    /// on an 8-core part was still silently reduced to 8, blocking the very
+    /// oversubscription sweep that turning pinning off is the way to set up.
+    #[test]
+    fn thread_override_is_not_clamped_when_pinning_is_off() {
+        let big_little = CoreTopology {
+            perf_core_count: 6,
+            pin_cores: vec![7, 6, 5, 4, 3, 2, 1, 0],
+            fast_cores: 6,
+            core_weights: vec![256, 206, 206, 206, 206, 206, 52, 52],
+        };
+        let pinned = apply_thread_override(big_little.clone(), Some(16), true);
+        assert_eq!(pinned.perf_core_count, 8, "clamped to the pinnable cores");
+
+        let unpinned = apply_thread_override(big_little, Some(16), false);
+        assert_eq!(
+            unpinned.perf_core_count, 16,
+            "CERA_PIN=0 still clamped, so an oversubscription sweep is impossible"
+        );
+        // Nothing is pinned, so neither the core list nor the weights parallel to
+        // it are truncated to the width: there is no per-worker core to hand out,
+        // and so no weight that describes one.
+        assert_eq!(unpinned.pin_cores.len(), 8);
+        assert_eq!(unpinned.core_weights.len(), 8);
     }
 
     #[test]

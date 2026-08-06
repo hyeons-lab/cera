@@ -341,16 +341,21 @@ pub fn prefill_thread_count(topo: &CoreTopology) -> usize {
     // be pinned: widening is a loss on the parts measured here, not on every
     // part, and this is how the next one gets swept without a rebuild.
     //
-    // Hosts with no pinnable cores are *not* clamped, matching
+    // Hosts where nothing will be pinned are *not* clamped, matching
     // `cpu_features::apply_thread_override`. The cliff this guards against is
     // pinned workers spin-waiting on the cores unpinned ones need; with nothing
     // pinned there is no such split, and clamping to the P-core count would
     // make the knob unusable on exactly the hosts (macOS, homogeneous desktop)
-    // where a sweep is most convenient to run.
-    if topo.pin_cores.is_empty() {
+    // where a sweep is most convenient to run. `CERA_PIN=0` is that same state
+    // asked for explicitly, so it is honoured here too rather than only the
+    // platform-has-no-affinity case.
+    if topo.pin_cores.is_empty() || !super::threadpool::pinning_enabled() {
         return n;
     }
-    let ceiling = topo.pin_cores.len().max(default);
+    // Just `pin_cores.len()`: `perf_core_count` counts a subset of `pin_cores`
+    // on the sysfs path, and `apply_thread_override` truncates the two into
+    // lockstep, so it can never exceed the pinnable count.
+    let ceiling = topo.pin_cores.len();
     if n > ceiling {
         tracing::warn!(
             "cera: CERA_PREFILL_THREADS={n} exceeds the {ceiling} pinnable cores; \

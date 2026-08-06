@@ -560,8 +560,10 @@ pub mod stats {
 /// case-insensitive, disables it — for host apps that manage thread placement
 /// and don't want cera's permanent caller pin). Resolved once.
 pub(crate) fn pinning_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !super::cpu_features::env_disabled("CERA_PIN"))
+    // Inverse of the shared reader. The sizing policy in `cpu_features` and
+    // `calibrate` needs the same answer, so the switch is resolved in one place
+    // rather than parsed once per consumer.
+    !super::cpu_features::pinning_disabled()
 }
 
 impl RowPool {
@@ -1559,6 +1561,56 @@ mod tests {
         // Weights past the pool width belong to cores no worker sits on.
         let narrow = RowPool::build(2, &[], &[full, 52, 52, 52], true);
         assert_eq!(narrow.shared.worker_weights, vec![full, 52]);
+    }
+
+    /// The junction between the two halves of this feature: `cpu_features`
+    /// detects weights and `worker_chunk_rows` consumes them, both tested, but
+    /// nothing asserted that the *shipping* pools actually carry them from one
+    /// to the other. Wiring `prefill()` to `&[]` would leave every other test
+    /// green while silently restoring unweighted chunks.
+    ///
+    /// Asserts the invariant rather than a specific weight vector, because what
+    /// is true depends on the host: with weights the pool must hold exactly one
+    /// per worker, and without them (homogeneous host, no affinity, or
+    /// `CERA_PIN=0`) it must hold none.
+    ///
+    /// **Host-dependent by nature, and only a real guard where there is a
+    /// spread.** On a homogeneous host or one without affinity there are no
+    /// weights to lose, so severing the wiring is not observable and this test
+    /// passes either way (verified: mutating `prefill()` to pass `&[]` does not
+    /// fail it on an Apple Silicon host). That is the correct instrument rather
+    /// than a weak one, since the mutation is only a defect where the weights
+    /// exist, but it does mean CI on a homogeneous runner does not cover this
+    /// and a big.LITTLE device is what actually exercises it.
+    #[test]
+    fn shipping_pools_carry_the_detected_weights() {
+        let expected = pinned_core_weights();
+        for pool in [RowPool::prefill(), RowPool::decode()] {
+            let got = &pool.shared.worker_weights;
+            if got.is_empty() {
+                // Dropped either because the host has no spread at all, or
+                // because every worker in this pool's width is full-weight.
+                assert!(
+                    expected.is_empty()
+                        || expected
+                            .iter()
+                            .take(pool.num_threads())
+                            .all(|&w| w == super::super::cpu_features::WEIGHT_FULL),
+                    "pool dropped weights that would have scaled a worker down: {expected:?}"
+                );
+            } else {
+                assert_eq!(
+                    got.len(),
+                    expected.len().min(pool.num_threads()),
+                    "pool weights are not one per worker"
+                );
+                assert_eq!(
+                    got[..],
+                    expected[..got.len()],
+                    "pool weights do not match the detected topology"
+                );
+            }
+        }
     }
 
     #[test]
