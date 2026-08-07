@@ -87,8 +87,9 @@
 //! ## Affinity side effects
 //!
 //! On Linux/Android the spawned workers *and the calling thread* are pinned
-//! to the detected performance cores (the caller to the fastest one —
-//! unpinned, a big.LITTLE scheduler can strand it on an efficiency core where
+//! to distinct detected cores, fastest-first, so a default-width pool lands
+//! entirely on the performance ones (the caller to the fastest one, because
+//! unpinned a big.LITTLE scheduler can strand it on an efficiency core where
 //! it stalls every barrier). The caller pin is held by one thread at a time,
 //! process-wide, for as long as that thread lives: concurrent additional
 //! dispatchers (a second session) keep floating rather than piling onto the
@@ -354,28 +355,143 @@ pub struct RowPool {
     num_threads: usize,
 }
 
+/// Counters for the dispatch fan-out path.
+///
+/// Exists for one question: when a dispatch wants `active > 1` workers but
+/// `dispatch_lock.try_lock()` fails, it silently runs the whole operation
+/// serially on the caller. That is an all-or-nothing slowdown on that
+/// operation, and it does not show up anywhere except as a throughput number
+/// that is mysteriously half what it should be. Counting it is the only way to
+/// tell "this dispatch fanned out and the cores were slow" from "this dispatch
+/// never fanned out at all".
+pub mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(super) static FANOUT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SERIAL_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FANOUT_MACS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SERIAL_MACS: AtomicU64 = AtomicU64::new(0);
+
+    /// Dispatch-path counters since process start. Monotonic; use
+    /// [`PoolStats::since`] to get the delta over an interval.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct PoolStats {
+        /// Dispatches that wanted more than one worker.
+        pub fanout_dispatches: u64,
+        /// Of those, how many ran serially because the pool was already busy.
+        pub serial_fallbacks: u64,
+        /// Work over all `fanout_dispatches`, in output elements times the
+        /// caller-supplied `depth`.
+        ///
+        /// **Only the work-capped GEMM dispatches supply a depth**
+        /// ([`super::super::cpu::par_rows_n_work`]); every other caller passes
+        /// zero and so contributes plain output elements. The unit is therefore
+        /// mixed, and a serialized decode GEMV is understated against a
+        /// serialized prefill GEMM by roughly its contraction length. Treat this
+        /// as a rough weighting *within* one dispatch kind, and treat
+        /// `serial_fallbacks` / `fanout_dispatches` as the reliable signal:
+        /// those are exact counts of exact events, and detecting the silent
+        /// fallback at all is what these counters are for. ("Exact" is about
+        /// the counting, not the read: [`snapshot`] takes four separate relaxed
+        /// loads, so a concurrent dispatch can leave one of them a single
+        /// increment behind. See its docs.)
+        pub fanout_macs: u64,
+        /// The same measure over just the `serial_fallbacks`, so one serialized
+        /// large GEMM outweighs many serialized small ones. Same mixed-unit
+        /// caveat as `fanout_macs`.
+        pub serial_macs: u64,
+    }
+
+    impl PoolStats {
+        /// Fraction of fan-out work that ran serially, 0.0 to 1.0. Carries the
+        /// mixed-unit caveat documented on [`PoolStats::fanout_macs`]; the
+        /// dispatch counts are the trustworthy number.
+        pub fn serial_mac_fraction(&self) -> f64 {
+            if self.fanout_macs == 0 {
+                return 0.0;
+            }
+            // Clamped so the documented 0.0..=1.0 range holds for a `PoolStats`
+            // assembled by hand or differenced across a counter reset, not only
+            // for one that came from `snapshot`.
+            (self.serial_macs as f64 / self.fanout_macs as f64).clamp(0.0, 1.0)
+        }
+
+        /// Counters accumulated between two snapshots.
+        pub fn since(&self, earlier: &PoolStats) -> PoolStats {
+            PoolStats {
+                fanout_dispatches: self
+                    .fanout_dispatches
+                    .saturating_sub(earlier.fanout_dispatches),
+                serial_fallbacks: self
+                    .serial_fallbacks
+                    .saturating_sub(earlier.serial_fallbacks),
+                fanout_macs: self.fanout_macs.saturating_sub(earlier.fanout_macs),
+                serial_macs: self.serial_macs.saturating_sub(earlier.serial_macs),
+            }
+        }
+    }
+
+    /// Read the counters.
+    ///
+    /// Four independent relaxed loads, so this is not an atomic snapshot: a
+    /// dispatch running concurrently can land between them. The **order** of
+    /// the loads is therefore load-bearing. A dispatch increments its `FANOUT_*`
+    /// counter before the matching `SERIAL_*` one, so reading the `SERIAL_*`
+    /// side *first* keeps the pair consistent in the common case: whatever
+    /// `FANOUT_*` is read afterwards is at least as advanced as the `SERIAL_*`
+    /// value already in hand. Reading them the other way round can report
+    /// `serial_fallbacks=1, fanout_dispatches=0`, i.e. a fallback rate above
+    /// 100%, which is exactly backwards for a diagnostic whose whole job is to
+    /// say how much work fell back.
+    ///
+    /// Ordering alone is not a proof under a weak memory model, so the
+    /// invariant is also enforced rather than merely argued: the `serial_*`
+    /// fields are clamped to their `fanout_*` counterparts. The clamp can only
+    /// ever *understate* a fallback by one in-flight dispatch, and the counters
+    /// are read once per bench run against a hot path that must stay relaxed,
+    /// which is the trade being made here.
+    pub fn snapshot() -> PoolStats {
+        let serial_fallbacks = SERIAL_FALLBACKS.load(Ordering::Relaxed);
+        let serial_macs = SERIAL_MACS.load(Ordering::Relaxed);
+        let fanout_dispatches = FANOUT_DISPATCHES.load(Ordering::Relaxed);
+        let fanout_macs = FANOUT_MACS.load(Ordering::Relaxed);
+        PoolStats {
+            fanout_dispatches,
+            fanout_macs,
+            serial_fallbacks: serial_fallbacks.min(fanout_dispatches),
+            serial_macs: serial_macs.min(fanout_macs),
+        }
+    }
+}
+
 /// Whether affinity pinning is enabled (`CERA_PIN=0`/`false`/`off`,
 /// case-insensitive, disables it — for host apps that manage thread placement
 /// and don't want cera's permanent caller pin). Resolved once.
 pub(crate) fn pinning_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !super::cpu_features::env_disabled("CERA_PIN"))
+    // Inverse of the shared reader. The sizing policy in `cpu_features` and
+    // `calibrate` needs the same answer, so the switch is resolved in one place
+    // rather than parsed once per consumer.
+    !super::cpu_features::pinning_disabled()
 }
 
 impl RowPool {
     /// Full-width pool for compute-bound batched work — prefill GEMM
-    /// ([`super::cpu::par_rows_n`]). Sized to all performance cores; batched
-    /// matmul is compute-bound and scales with threads. Lazily built so
+    /// ([`super::cpu::par_rows_n`]). Width comes from
+    /// `super::calibrate::prefill_thread_count`: the performance cores, since
+    /// batched matmul is compute-bound and scales with threads, but *not* the
+    /// efficiency cores, which measured as a large net loss. Overridable with
+    /// `CERA_PREFILL_THREADS=<n>` up to every pinnable core. Lazily built so
     /// `CeraEngine` consumers get it without calling
     /// [`super::cpu::configure_thread_pool`].
     pub fn prefill() -> &'static RowPool {
         static POOL: OnceLock<RowPool> = OnceLock::new();
         POOL.get_or_init(|| {
             let topo = super::cpu_features::core_topology();
+            let n = super::calibrate::prefill_thread_count(topo);
             // Active-sized barrier: prefill GEMMs vary widely in size, and a
             // small one is better run on the few cores its work can fill than
             // dragged across the whole pool's barrier (see `Shared::active_barrier`).
-            RowPool::build(topo.perf_core_count, pinned_cores(), true)
+            RowPool::build(n, pinned_cores(), true)
         })
     }
 
@@ -685,7 +801,8 @@ impl RowPool {
         // path below rather than blocking — always sound, never deadlocks. A
         // poisoned lock (a dispatcher panicked) is safe to take: the drain
         // guard below leaves the pool state consistent even on unwind.
-        let guard = if active > 1 {
+        let wanted_fanout = active > 1;
+        let guard = if wanted_fanout {
             match self.dispatch_lock.try_lock() {
                 Ok(g) => Some(g),
                 Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
@@ -694,6 +811,27 @@ impl RowPool {
         } else {
             None
         };
+
+        // Count how often that fallback fires, and how much work it swallows.
+        // A dispatch that wanted `active` workers and got one is a silent ~Nx on
+        // that operation, invisible in any throughput number, so it has to be
+        // counted rather than reasoned about. Relaxed adds on a path that is
+        // about to do at least `total_rows * n` MACs are free.
+        //
+        // `depth.max(1)` means a caller that supplied no depth contributes
+        // output elements rather than MACs; see `stats::PoolStats::fanout_macs`
+        // for why that is tolerated and what to read instead.
+        if wanted_fanout {
+            let macs = (total_rows as u64)
+                .saturating_mul(n as u64)
+                .saturating_mul(depth.max(1) as u64);
+            stats::FANOUT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            stats::FANOUT_MACS.fetch_add(macs, Ordering::Relaxed);
+            if guard.is_none() {
+                stats::SERIAL_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                stats::SERIAL_MACS.fetch_add(macs, Ordering::Relaxed);
+            }
+        }
 
         // Single active worker (small op, a 1-thread pool, or a contended
         // dispatch): run serially on the caller with safe slicing — no pointer
@@ -1001,17 +1139,37 @@ pub(crate) fn pin_current_thread_to_core(_core: usize) -> bool {
     false
 }
 
-/// The cores this crate is willing to pin to: the detected performance cores,
-/// or nothing at all when `CERA_PIN` is off. The single place that decision is
-/// made. `RowPool::build` takes its core list already filtered through here,
-/// and [`super::cpu::ensure_rayon_global_pool`] uses the same list as a set
-/// mask rather than pinning one core per worker.
+/// Every core this crate is willing to pin a worker to, fastest-first, or
+/// nothing at all when `CERA_PIN` is off. The single place that decision is
+/// made; `RowPool::build` takes its core list already filtered through here.
+///
+/// This is the *full* usable set, efficiency cores included, because a widened
+/// pool needs a distinct core for every worker (see `CoreTopology::pin_cores`
+/// for the 35x measurement behind that). A caller that wants only the fast
+/// cores wants [`perf_pinned_cores`] instead.
 pub(crate) fn pinned_cores() -> &'static [usize] {
     if pinning_enabled() {
         &super::cpu_features::core_topology().pin_cores
     } else {
         &[]
     }
+}
+
+/// The performance-core prefix of [`pinned_cores`], for callers that want a set
+/// mask rather than one core per worker: today
+/// [`super::cpu::ensure_rayon_global_pool`], which confines rayon's workers to
+/// the fast cores without handing each a private one.
+///
+/// `pin_cores` is fastest-first and `fast_cores` counts how many of its leading
+/// entries are performance cores, so the prefix is exactly that set. It reads
+/// `fast_cores` and **not** `perf_core_count`: the latter is a pool width that
+/// `CERA_THREADS` moves, so on a 6P+2E part `CERA_THREADS=8` would widen this
+/// mask onto both efficiency cores, which is the straggler-on-every-barrier
+/// problem the width policy exists to avoid.
+pub(crate) fn perf_pinned_cores() -> &'static [usize] {
+    let cores = pinned_cores();
+    let fast = super::cpu_features::core_topology().fast_cores;
+    &cores[..fast.min(cores.len())]
 }
 
 /// Set the calling thread's affinity to exactly `cores`, via
@@ -1228,6 +1386,52 @@ mod tests {
             assert!(a.iter().enumerate().all(|(i, &v)| v == i as f32 + 1.0));
             assert!(b.iter().enumerate().all(|(i, &v)| v == i as f32 + 2.0));
         }
+    }
+
+    /// The fan-out counters exist to make a silent serial fallback visible, so a
+    /// counter that never increments, or a snapshot that reports an impossible
+    /// pair, fails open: the readout says the pool is healthy and the operator
+    /// believes it.
+    ///
+    /// Drives real contended dispatches rather than poking the atomics, so it
+    /// covers the increments in `dispatch_body` and the read in `snapshot`
+    /// together. The counters are process-global and other tests dispatch
+    /// concurrently, hence deltas via `since` and inequalities rather than
+    /// exact totals.
+    #[test]
+    fn fanout_counters_track_dispatches_and_stay_coherent() {
+        let before = stats::snapshot();
+        let pool = RowPool::build(4, &[], true);
+        // Two threads on one pool: whoever loses `try_lock` is a serial
+        // fallback, which is the event these counters exist to catch.
+        for _ in 0..20 {
+            let mut a = vec![0.0f32; 4096];
+            let mut b = vec![0.0f32; 4096];
+            thread::scope(|s| {
+                let pool = &pool;
+                s.spawn(|| pool.dispatch_rows(&mut a, 1, 1, |row, s| s[0] = row as f32 + 1.0));
+                pool.dispatch_rows(&mut b, 1, 1, |row, s| s[0] = row as f32 + 2.0);
+            });
+        }
+        let delta = stats::snapshot().since(&before);
+        assert!(
+            delta.fanout_dispatches >= 40,
+            "40 multi-worker dispatches counted as {}",
+            delta.fanout_dispatches
+        );
+        // The invariant `snapshot` enforces: a subset can never exceed its set.
+        // Read from a live snapshot, not a hand-built one, so a regression in
+        // the load order or the clamp shows up here.
+        let live = stats::snapshot();
+        assert!(
+            live.serial_fallbacks <= live.fanout_dispatches,
+            "serial {} > fanout {}",
+            live.serial_fallbacks,
+            live.fanout_dispatches
+        );
+        assert!(live.serial_macs <= live.fanout_macs);
+        let f = live.serial_mac_fraction();
+        assert!((0.0..=1.0).contains(&f), "fraction {f} outside 0.0..=1.0");
     }
 
     #[test]

@@ -96,13 +96,15 @@ pub fn ensure_rayon_global_pool() {
 
         // Perf cores only, matching the width policy: efficiency cores clock
         // lower and share memory bandwidth, so a worker that lands on one is a
-        // straggler on every fork-join barrier. `&'static`, so the handler
-        // closure captures a slice rather than owning a copy. Empty when
-        // `CERA_PIN` is off and on every platform without a detected
+        // straggler on every fork-join barrier. Hence `perf_pinned_cores` and
+        // not `pinned_cores`, which deliberately also carries the E-cores so a
+        // widened RowPool can give every worker a private one. `&'static`, so
+        // the handler closure captures a slice rather than owning a copy. Empty
+        // when `CERA_PIN` is off and on every platform without a detected
         // heterogeneous topology (macOS and homogeneous hosts included), where
         // `set_current_thread_affinity` no-ops and this whole paragraph is
         // moot.
-        let cores: &'static [usize] = super::threadpool::pinned_cores();
+        let cores: &'static [usize] = super::threadpool::perf_pinned_cores();
 
         // No `panic_handler` on the builder, so a panic inside `start_handler`
         // aborts the process rather than poisoning the pool. That is the right
@@ -172,8 +174,9 @@ pub fn ensure_rayon_global_pool() {}
 ///
 /// The GEMV/GEMM row hot path runs on the persistent
 /// [`super::threadpool::RowPool`]s, sized from the detected topology —
-/// `CERA_THREADS` overrides the prefill width, `CERA_DECODE_THREADS` the
-/// decode width (see `super::calibrate`). `RAYON_NUM_THREADS` governs only
+/// `CERA_THREADS` moves the detected count both pools derive from,
+/// `CERA_PREFILL_THREADS` overrides the prefill width alone and
+/// `CERA_DECODE_THREADS` the decode width (see `super::calibrate`). `RAYON_NUM_THREADS` governs only
 /// the residual rayon sites (dequantization, the ViT patch embed, the audio
 /// conv stem); it does **not** constrain the RowPools, and no GEMM on the
 /// transformer prefill/decode path runs on it.
