@@ -108,7 +108,8 @@ pub(crate) mod neon {
         }};
     }
 
-    /// Widen one IEEE-754 half (raw bits) to f32 with a single `fcvtl`.
+    /// Widen one IEEE-754 half (raw bits) to f32 in a single instruction (LLVM
+    /// lowers this to a scalar `fcvt s, h`).
     ///
     /// `half`'s `f16::to_f32` is *not* usable in a hot loop: its aarch64 path runs
     /// `is_aarch64_feature_detected!("fp16")` per call, which the disassembly shows
@@ -1472,8 +1473,12 @@ pub(crate) mod neon {
                                             // `g < 4`, `h < 2`), but LLVM does not
                                             // prove it through the nest and emits a
                                             // bounds check per read; the mask states
-                                            // the invariant so it folds away.
-                                            let idx = (nh * 8 + 2 * g + h) & 15;
+                                            // the invariant so it folds away. The
+                                            // assert keeps a widened loop bound from
+                                            // silently aliasing to the wrong scale.
+                                            let idx = nh * 8 + 2 * g + h;
+                                            debug_assert!(idx < 16, "Q6_K GEMM: sub-block index");
+                                            let idx = idx & 15;
                                             let d_sc0 = dw0 * sc0[idx] as f32;
                                             let d_sc1 = dw1 * sc1[idx] as f32;
                                             let xsj = *b_scales.as_ptr().add(j * nb32 + xb);
@@ -2333,8 +2338,8 @@ pub(crate) mod neon {
                                         as *const BlockQ8_0),
                                 )
                             };
-                            let dw0 = f16::from_bits(wb0.delta).to_f32();
-                            let dw1 = f16::from_bits(wb1.delta).to_f32();
+                            let dw0 = unsafe { f16_bits_to_f32(wb0.delta) };
+                            let dw1 = unsafe { f16_bits_to_f32(wb1.delta) };
                             let db0 = b_scales[j * nb + bi];
                             let db1 = b_scales[(j + 1) * nb + bi];
                             let mut acc = unsafe { vdupq_n_s32(0) };
@@ -2503,8 +2508,8 @@ pub(crate) mod neon {
                                         as *const BlockQ4_0),
                                 )
                             };
-                            let dw0 = f16::from_bits(wb0.d).to_f32();
-                            let dw1 = f16::from_bits(wb1.d).to_f32();
+                            let dw0 = unsafe { f16_bits_to_f32(wb0.d) };
+                            let dw1 = unsafe { f16_bits_to_f32(wb1.d) };
                             let db0 = b_scales[j * nb + bi];
                             let db1 = b_scales[(j + 1) * nb + bi];
                             let acc = unsafe {
@@ -2759,14 +2764,14 @@ pub(crate) mod neon {
                             let dmin0 = unsafe { f16_bits_to_f32(wb0.dmin) };
                             let d1 = unsafe { f16_bits_to_f32(wb1.d) };
                             let dmin1 = unsafe { f16_bits_to_f32(wb1.dmin) };
+                            let (sc0, mn0) = crate::quant::decode_q4km_scales(&wb0.scales);
+                            let (sc1, mn1) = crate::quant::decode_q4km_scales(&wb1.scales);
                             // Pre-scale the 8 sub-block scales/mins once per
                             // superblock. Folding `d`/`dmin` in here keeps the
                             // per-sub-block epilogue to two loads instead of two
                             // loads plus two multiplies, and it is the same
                             // arithmetic in the same order, so the f32 result is
                             // unchanged.
-                            let (sc0, mn0) = crate::quant::decode_q4km_scales(&wb0.scales);
-                            let (sc1, mn1) = crate::quant::decode_q4km_scales(&wb1.scales);
                             let dsc0: [f32; 8] = core::array::from_fn(|s| d0 * sc0[s] as f32);
                             let dmn0: [f32; 8] = core::array::from_fn(|s| dmin0 * mn0[s] as f32);
                             let dsc1: [f32; 8] = core::array::from_fn(|s| d1 * sc1[s] as f32);
@@ -2860,12 +2865,21 @@ pub(crate) mod neon {
                                     // `2*g+1` for `g < 4`), but LLVM does not
                                     // prove it through the group loop and emits a
                                     // bounds check per read. Masking states the
-                                    // invariant so the check folds away.
+                                    // invariant so the check folds away. The
+                                    // assert keeps a widened loop bound from
+                                    // silently aliasing to the wrong scale.
+                                    debug_assert!(s < 8, "Q4_K GEMM: sub-block index");
                                     let (dsc0, dmn0) = (dsc0[s & 7], dmn0[s & 7]);
                                     let (dsc1, dmn1) = (dsc1[s & 7], dmn1[s & 7]);
-                                    // Raw reads: `j+1 < n` and `xb < nb32` hold
-                                    // from the tile bounds, and the slice lengths
-                                    // are asserted at entry.
+                                    // Raw reads. `cs` is `n * nb32` by
+                                    // construction in `q8_0_col_sums`, and
+                                    // `b_scales` is checked against the same
+                                    // length by a release `assert!` in
+                                    // `gemm_preq_dispatch`, the only production
+                                    // caller. The kernel's own entry checks are
+                                    // `debug_assert!` and do not carry this in
+                                    // release, which is the same footing the
+                                    // pre-existing raw `b_quants` reads stand on.
                                     let (xs_j, xs_j1, sx_j, sx_j1) = unsafe {
                                         (
                                             *b_scales.as_ptr().add(j * nb32 + xb),
@@ -3036,6 +3050,18 @@ pub(crate) mod neon {
             (s, q)
         }
 
+        fn assert_close(a: &[f32], b: &[f32]) {
+            assert_eq!(a.len(), b.len());
+            for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
+                assert!(
+                    (x - y).abs() <= 1e-2 * (1.0 + x.abs()),
+                    "row {i}: dotprod={x} fallback={y}"
+                );
+            }
+        }
+
+        use crate::backend::simd::require_simd_or_skip;
+
         /// `f16_bits_to_f32` must be a drop-in for `half`'s `to_f32`, for every
         /// one of the 65536 half patterns.
         ///
@@ -3060,18 +3086,6 @@ pub(crate) mod neon {
                 }
             }
         }
-
-        fn assert_close(a: &[f32], b: &[f32]) {
-            assert_eq!(a.len(), b.len());
-            for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
-                assert!(
-                    (x - y).abs() <= 1e-2 * (1.0 + x.abs()),
-                    "row {i}: dotprod={x} fallback={y}"
-                );
-            }
-        }
-
-        use crate::backend::simd::require_simd_or_skip;
 
         #[test]
         fn q4_0_gemv_fallback_matches_dotprod() {
