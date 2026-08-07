@@ -340,6 +340,22 @@ fn state_active(state: u64) -> usize {
     (state & ACTIVE_MASK) as usize
 }
 
+/// Whether the prefill pool should pin its workers 1:1 at width `n`.
+///
+/// False exactly when some worker would land on a core outside the fast set:
+/// `pin_cores` is fastest-first and worker `i` takes `pin_cores[i]`, so
+/// `n > fast_cores` means at least one worker is nailed to an efficiency core
+/// it can never be moved off. `fast_cores == 0` (macOS/iOS, homogeneous
+/// desktop) has no split to act on, and those hosts have an empty `pin_cores`
+/// anyway, so the policy is inert there.
+///
+/// A named function rather than an inline expression so the policy test guards
+/// *this* predicate instead of a copy of it.
+#[inline]
+fn prefill_should_pin(fast_cores: usize, n: usize) -> bool {
+    fast_cores == 0 || n <= fast_cores
+}
+
 /// How many rows worker `worker_id` claims per steal, scaling the job's chunk
 /// size by the relative speed of the core that worker is *meant* to be on.
 ///
@@ -373,6 +389,14 @@ fn state_active(state: u64) -> usize {
 ///
 /// So this is a small win at the shipping width and a large one on a widened
 /// pool. It does not make widening a good idea: 142 is still well below 212.
+///
+/// **The widened row is now historical.** `RowPool::prefill` stops pinning once
+/// its width exceeds `fast_cores`, and unpinned workers carry no weights (there
+/// is no known core to weight them by), so weighting no longer applies to that
+/// configuration at all. What ships today is the default-width row, plus decode,
+/// which still pins at every width. The widened numbers are kept because they
+/// are what motivated the mechanism, not because they describe current
+/// behaviour.
 ///
 /// Weights only ever scale *down* from `job.chunk_rows`, so the fastest core's
 /// granularity is unchanged and the chunk count only ever rises: this is a
@@ -473,6 +497,18 @@ pub struct RowPool {
     caller_pin: Option<usize>,
     /// Total workers including the caller (worker 0); always `≥ 1`.
     num_threads: usize,
+    /// Whether this pool pinned its workers 1:1 to distinct cores.
+    ///
+    /// Recorded rather than re-derived: the policy is decided from the
+    /// *requested* width, while [`RowPool::num_threads`] is the width actually
+    /// achieved after any spawn failures. Those can differ, so deriving the
+    /// placement from `num_threads` would report the wrong answer for a pool
+    /// that failed to spawn down below `fast_cores`.
+    ///
+    /// Test-only: nothing in the running engine needs to know, and carrying it
+    /// unconditionally would be a field the lib build never reads.
+    #[cfg(test)]
+    workers_pinned: bool,
 }
 
 /// Counters for the dispatch fan-out path.
@@ -611,7 +647,41 @@ impl RowPool {
             // Active-sized barrier: prefill GEMMs vary widely in size, and a
             // small one is better run on the few cores its work can fill than
             // dragged across the whole pool's barrier (see `Shared::active_barrier`).
-            RowPool::build(n, pinned_cores(), pinned_core_weights(), true)
+            //
+            // **Pinning is dropped once the pool outgrows the fast cores.**
+            // 1:1 pinning nails a worker to a specific efficiency core and
+            // leaves it there; the scheduler cannot move it even when it is the
+            // straggler every other worker is waiting on at the barrier. Below
+            // that width every worker lands on a fast core and pinning is a
+            // clear win, so the policy flips rather than being abandoned.
+            //
+            // Measured on a Pixel 10 Pro Fold (Tensor G5, 6 fast + 2 A520),
+            // 350M-Q4_K_M at 512 prompt tokens, 5 interleaved rounds each,
+            // thermally and load gated, prefill tok/s:
+            //
+            // | width | pinned | unpinned |
+            // |-------|-------:|---------:|
+            // | default (6, fits the fast cores) | **211** | 189 |
+            // | `CERA_THREADS=8` (reaches the A520s) | 148 | **203** |
+            //
+            // Non-overlapping in both directions. That is a 1.43x cost to
+            // widening, cut to 1.04x, against llama.cpp's own 1.06x.
+            //
+            // Decode keeps pinning at every width; see [`RowPool::decode`].
+            let widened = !prefill_should_pin(topo.fast_cores, n);
+            let (cores, weights, spread) = if widened {
+                // Weights go with the pins: `core_weights[i]` describes the core
+                // worker `i` was placed on, and once nothing is placed it
+                // describes nothing (the same reasoning as `pinned_core_weights`
+                // under `CERA_PIN=0`).
+                // Empty pins, but a non-empty *mask*: the workers must be
+                // confined to the usable core set explicitly rather than
+                // inheriting the caller's single-core mask. See `worker_loop`.
+                (&[][..], &[][..], pinned_cores())
+            } else {
+                (pinned_cores(), pinned_core_weights(), &[][..])
+            };
+            RowPool::build(n, cores, weights, spread, true)
         })
     }
 
@@ -634,15 +704,34 @@ impl RowPool {
             let n = super::calibrate::decode_thread_count(topo);
             // Full barrier: decode wants every worker hot across its tiny-GEMV /
             // huge-vocab-GEMV mix (see `Shared::active_barrier`).
-            RowPool::build(n, pinned_cores(), pinned_core_weights(), false)
+            //
+            // **Unlike prefill, decode pins at every width.** The two want
+            // opposite policies and it is worth being explicit about why: decode
+            // is a per-token full barrier over tiny dispatches, where keeping
+            // each worker resident on its own core matters more than letting the
+            // scheduler move it. Same device and model as the table on
+            // [`RowPool::prefill`], decode tok/s: 95.2 pinned against 83.1
+            // unpinned at the default width, and 81.0 against 67.8 at
+            // `CERA_THREADS=8`. Pinned wins at both, so there is no width at
+            // which relaxing it would pay.
+            RowPool::build(n, pinned_cores(), pinned_core_weights(), &[], false)
         })
     }
 
     /// Build a pool with `num_threads` total workers, pinning worker `i` to
     /// `pin_cores[i]` when present (surplus workers run unpinned). `pin_cores`
-    /// empty ⇒ no pinning (macOS/desktop). Spawn failures degrade the thread
-    /// count rather than panicking. The pool pins *and claims the process-wide
-    /// caller pin for* whatever thread first dispatches.
+    /// empty ⇒ no 1:1 pinning; the workers are then confined to `spread_mask`
+    /// instead, if that is non-empty, so they are *placed* rather than left to
+    /// inherit the caller's mask. Spawn failures degrade the thread count rather
+    /// than panicking.
+    ///
+    /// **The caller pin follows `pin_cores`, so it is not unconditional.**
+    /// `caller_pin` is `pin_cores.first()`, so with an empty `pin_cores` the
+    /// pool claims no process-wide caller pin and [`RowPool::pin_caller_once`]
+    /// is a no-op for it. Two callers reach that state deliberately: a host with
+    /// no usable affinity, and a prefill pool wider than the fast cores (see
+    /// [`RowPool::prefill`]). A pool that *does* pin still claims the caller pin
+    /// for whatever thread first dispatches through it.
     ///
     /// `core_weights` is the relative speed of each entry of `pin_cores`, in
     /// units of [`super::cpu_features::WEIGHT_FULL`]; worker `i` sizes its steal
@@ -656,6 +745,7 @@ impl RowPool {
         num_threads: usize,
         pin_cores: &[usize],
         core_weights: &[u32],
+        spread_mask: &'static [usize],
         active_barrier: bool,
     ) -> RowPool {
         // `active` (≤ num_threads) is packed into the low `ACTIVE_BITS` of the
@@ -707,7 +797,7 @@ impl RowPool {
             let pin = pin_cores.get(id).copied();
             match thread::Builder::new()
                 .name(format!("cera-rowpool-{id}"))
-                .spawn(move || worker_loop(shared, id, pin, spin_limit))
+                .spawn(move || worker_loop(shared, id, pin, spread_mask, spin_limit))
             {
                 Ok(handle) => workers.push(handle),
                 // Couldn't spawn — cap the pool at what we have.
@@ -728,6 +818,8 @@ impl RowPool {
             dispatch_lock: Mutex::new(()),
             caller_pin,
             num_threads,
+            #[cfg(test)]
+            workers_pinned: !pin_cores.is_empty(),
         }
     }
 
@@ -1172,9 +1264,25 @@ impl Drop for RowPool {
 
 /// Background worker: wait for each new epoch, run this worker's row range,
 /// signal completion. Exits on shutdown.
-fn worker_loop(shared: Arc<Shared>, worker_id: usize, pin_core: Option<usize>, spin_limit: u32) {
+fn worker_loop(
+    shared: Arc<Shared>,
+    worker_id: usize,
+    pin_core: Option<usize>,
+    spread_mask: &'static [usize],
+    spin_limit: u32,
+) {
     if let Some(core) = pin_core {
         let _ = pin_current_thread_to_core(core);
+    } else if !spread_mask.is_empty() {
+        // Not pinned 1:1, but affinity must still be *asserted*, not inherited.
+        // A spawned thread inherits its creator's mask, and `pin_caller_once`
+        // confines that creator to a single core process-wide, so leaving this
+        // out would put every worker of an unpinned pool on one core: the
+        // failure `set_current_thread_affinity` and `ensure_rayon_global_pool`
+        // both exist to prevent. Widening to the full set restores the
+        // scheduler's freedom to move a worker off a stalling core, which is
+        // the entire point of not pinning here.
+        let _ = set_current_thread_affinity(spread_mask);
     }
     // Run this worker's chunks of `job`, catching a closure panic so the worker
     // still reaches its `pending` decrement (a dead worker would wedge the pool);
@@ -1243,8 +1351,12 @@ fn worker_loop(shared: Arc<Shared>, worker_id: usize, pin_core: Option<usize>, s
         // masks, silently unpinning parked workers. One ~µs syscall per
         // worker per token at most — parks only happen in the ms-scale
         // inter-token gaps, never between the µs-apart GEMVs of one token.
-        if parked && let Some(core) = pin_core {
-            let _ = pin_current_thread_to_core(core);
+        if parked {
+            if let Some(core) = pin_core {
+                let _ = pin_current_thread_to_core(core);
+            } else if !spread_mask.is_empty() {
+                let _ = set_current_thread_affinity(spread_mask);
+            }
         }
         // SAFETY (both arms): the Acquire load of `state` above synchronizes with
         // the dispatcher's Release bump, so the fresh `Job` (written before that
@@ -1398,7 +1510,7 @@ mod tests {
         // under both barrier modes (active-sized = prefill, full = decode).
         for &active_barrier in &[true, false] {
             for &num_threads in &[1usize, 2, 4, 7] {
-                let pool = RowPool::build(num_threads, &[], &[], active_barrier);
+                let pool = RowPool::build(num_threads, &[], &[], &[], active_barrier);
                 for &n in &[1usize, 3, 8] {
                     for &total_rows in &[0usize, 1, 5, 256, 1000] {
                         let len = total_rows * n;
@@ -1428,7 +1540,7 @@ mod tests {
         // A concurrency-stress check for the disjoint partition: each row adds 1
         // to a counter; after dispatch every counter must be exactly 1 (no lost
         // or double writes).
-        let pool = RowPool::build(4, &[], &[], true);
+        let pool = RowPool::build(4, &[], &[], &[], true);
         let total_rows = 10_000usize;
         let mut counts = vec![0.0f32; total_rows];
         pool.dispatch_rows(&mut counts, 1, 1, |_row, slice| {
@@ -1453,7 +1565,7 @@ mod tests {
             vec![256, 1, 256, 1],
         ] {
             for &active_barrier in &[true, false] {
-                let pool = RowPool::build(weights.len(), &[], &weights, active_barrier);
+                let pool = RowPool::build(weights.len(), &[], &weights, &[], active_barrier);
                 // Sizes chosen so the weighted chunks actually differ: below
                 // roughly `MIN_CHUNK_ROWS * active * STEAL_CHUNKS_PER_WORKER`
                 // every weight collapses onto the floor and the test would
@@ -1582,12 +1694,12 @@ mod tests {
     #[test]
     fn uniform_weights_are_dropped_at_build() {
         let full = super::super::cpu_features::WEIGHT_FULL;
-        let uniform = RowPool::build(4, &[], &[full, full, full, full], true);
+        let uniform = RowPool::build(4, &[], &[full, full, full, full], &[], true);
         assert!(uniform.shared.worker_weights.is_empty());
-        let spread = RowPool::build(4, &[], &[full, full, full, 52], true);
+        let spread = RowPool::build(4, &[], &[full, full, full, 52], &[], true);
         assert_eq!(spread.shared.worker_weights.len(), 4);
         // Weights past the pool width belong to cores no worker sits on.
-        let narrow = RowPool::build(2, &[], &[full, 52, 52, 52], true);
+        let narrow = RowPool::build(2, &[], &[full, 52, 52, 52], &[], true);
         assert_eq!(narrow.shared.worker_weights, vec![full, 52]);
     }
 
@@ -1613,7 +1725,20 @@ mod tests {
     #[test]
     fn shipping_pools_carry_the_detected_weights() {
         let expected = pinned_core_weights();
-        for pool in [RowPool::prefill(), RowPool::decode()] {
+        // The prefill pool deliberately carries no weights when it is wider
+        // than the fast cores: it is unpinned there, so no weight describes any
+        // worker. Checking it in that state would assert the opposite of the
+        // intended behaviour, so it is skipped.
+        //
+        // Read from the pool's recorded placement, not re-derived from its
+        // width: the policy is decided on the *requested* width while
+        // `num_threads()` reports the width actually achieved, and a spawn
+        // failure can move one without the other.
+        let pools: Vec<&RowPool> = [RowPool::prefill(), RowPool::decode()]
+            .into_iter()
+            .filter(|p| p.workers_pinned || pinned_core_weights().is_empty())
+            .collect();
+        for pool in pools {
             let got = &pool.shared.worker_weights;
             if got.is_empty() {
                 // Dropped either because the host has no spread at all, or
@@ -1641,11 +1766,46 @@ mod tests {
         }
     }
 
+    /// The prefill pool drops pinning exactly when its width outgrows the fast
+    /// cores, and not before. Both directions matter: pinning is a 12% win at
+    /// the default width and a 27% loss once the pool reaches the E-cores, so a
+    /// policy that got the threshold wrong would regress one of the two.
+    ///
+    /// Asserts the predicate rather than the built pool, because `prefill()` is
+    /// a process-wide `OnceLock` whose width is fixed by whoever touches it
+    /// first and cannot be varied within a test run.
+    #[test]
+    fn prefill_drops_pinning_only_once_wider_than_the_fast_cores() {
+        // Drives the production predicate, so a change to it fails this test.
+        let widened = |fast: usize, n: usize| !prefill_should_pin(fast, n);
+
+        // Tensor G5: 6 fast + 2 A520.
+        assert!(!widened(6, 6), "default width must keep pinning");
+        assert!(
+            !widened(6, 4),
+            "narrower than the fast set must keep pinning"
+        );
+        assert!(
+            widened(6, 7),
+            "one worker past the fast set already reaches an E-core"
+        );
+        assert!(widened(6, 8), "CERA_THREADS=8 must drop pinning");
+
+        // A host with no detected fast set (macOS, homogeneous desktop) has no
+        // E-cores to fall onto, so the policy must not fire: there `pin_cores`
+        // is empty anyway and dropping it would be a no-op dressed as a
+        // decision.
+        assert!(
+            !widened(0, 32),
+            "policy fired on a host with no fast-core split"
+        );
+    }
+
     #[test]
     fn repeated_dispatches_reuse_workers() {
         // Same pool, many dispatches — exercises the epoch/park/unpark cycle and
         // confirms the workers stay correct across rounds.
-        let pool = RowPool::build(4, &[], &[], true);
+        let pool = RowPool::build(4, &[], &[], &[], true);
         let mut y = vec![0.0f32; 2048];
         for iter in 0..50 {
             pool.dispatch_rows(&mut y, 1, 1, |row, slice| {
@@ -1673,7 +1833,7 @@ mod tests {
         // under the same swing too.
         for &active_barrier in &[true, false] {
             for &num_threads in &[2usize, 4, 8] {
-                let pool = RowPool::build(num_threads, &[], &[], active_barrier);
+                let pool = RowPool::build(num_threads, &[], &[], &[], active_barrier);
                 for iter in 0..60usize {
                     // Swing `active` between 1 (narrow) and the full width.
                     let total_rows = if iter % 2 == 0 { 1 } else { 2048 };
@@ -1697,7 +1857,7 @@ mod tests {
         // row, never the per-row result. Across depths (⇒ different `active`
         // caps) the output must still equal the serial reference, with no row
         // lost when the cap idles most of the pool.
-        let pool = RowPool::build(8, &[], &[], true);
+        let pool = RowPool::build(8, &[], &[], &[], true);
         for &depth in &[0usize, 1, 4096, 1_000_000] {
             for &total_rows in &[0usize, 1, 3, 64, 500] {
                 let n = 4;
@@ -1719,7 +1879,7 @@ mod tests {
 
     #[test]
     fn single_thread_pool_runs_serially() {
-        let pool = RowPool::build(1, &[], &[], true);
+        let pool = RowPool::build(1, &[], &[], &[], true);
         assert_eq!(pool.num_threads(), 1);
         let mut y = vec![0.0f32; 100];
         pool.dispatch_rows(&mut y, 1, 1, |row, slice| slice[0] = row as f32);
@@ -1730,7 +1890,7 @@ mod tests {
     fn trailing_partial_row_matches_serial_chunks() {
         // y.len() % n != 0: the tail must be visited with the short slice,
         // exactly like the serial `chunks_mut(n)` fallback.
-        let pool = RowPool::build(4, &[], &[], true);
+        let pool = RowPool::build(4, &[], &[], &[], true);
         let n = 8usize;
         let len = 8 * 300 + 5; // 300 full rows + a 5-element tail
         let mut got = vec![0.0f32; len];
@@ -1751,7 +1911,7 @@ mod tests {
     fn concurrent_dispatchers_are_safe() {
         // Two threads dispatching on the same pool simultaneously: the loser of
         // the dispatch lock runs serially — both outputs must still be exact.
-        let pool = RowPool::build(4, &[], &[], true);
+        let pool = RowPool::build(4, &[], &[], &[], true);
         for _ in 0..20 {
             let mut a = vec![0.0f32; 4096];
             let mut b = vec![0.0f32; 4096];
@@ -1778,7 +1938,7 @@ mod tests {
     #[test]
     fn fanout_counters_track_dispatches_and_stay_coherent() {
         let before = stats::snapshot();
-        let pool = RowPool::build(4, &[], &[], true);
+        let pool = RowPool::build(4, &[], &[], &[], true);
         // Two threads on one pool: whoever loses `try_lock` is a serial
         // fallback, which is the event these counters exist to catch.
         for _ in 0..20 {
@@ -1813,7 +1973,7 @@ mod tests {
 
     #[test]
     fn worker_panic_propagates_and_pool_survives() {
-        let pool = RowPool::build(4, &[], &[], true);
+        let pool = RowPool::build(4, &[], &[], &[], true);
         let mut y = vec![0.0f32; 4096];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             pool.dispatch_rows(&mut y, 1, 1, |row, slice| {

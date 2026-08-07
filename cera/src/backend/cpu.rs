@@ -196,7 +196,7 @@ pub fn ensure_rayon_global_pool() {}
 pub fn configure_thread_pool() -> usize {
     ensure_rayon_global_pool();
 
-    // Warm the prefill pool — spawns and pins its workers now rather than
+    // Warm the prefill pool: spawns its workers now rather than
     // lazily on the first GEMM. Its width is the headline thread count.
     //
     // The **decode** pool is deliberately not warmed here. Its width depends on
