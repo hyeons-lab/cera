@@ -504,6 +504,10 @@ pub struct RowPool {
     /// achieved after any spawn failures. Those can differ, so deriving the
     /// placement from `num_threads` would report the wrong answer for a pool
     /// that failed to spawn down below `fast_cores`.
+    ///
+    /// Test-only: nothing in the running engine needs to know, and carrying it
+    /// unconditionally would be a field the lib build never reads.
+    #[cfg(test)]
     workers_pinned: bool,
 }
 
@@ -814,6 +818,7 @@ impl RowPool {
             dispatch_lock: Mutex::new(()),
             caller_pin,
             num_threads,
+            #[cfg(test)]
             workers_pinned: !pin_cores.is_empty(),
         }
     }
