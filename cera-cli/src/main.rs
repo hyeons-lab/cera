@@ -3842,6 +3842,20 @@ fn main() -> Result<()> {
             let mut headrooms = Vec::with_capacity(runs);
             let mut decode_io = PhaseIo::default();
             let mut prefill_io = PhaseIo::default();
+            // `CERA_POOL_STATS=1` annotates each run with how much of the
+            // thread-pool's fan-out work actually fanned out. A dispatch that
+            // loses the `try_lock` runs serially on the caller, which reads as a
+            // throughput drop with no other symptom; this makes it visible
+            // per-run so it can be correlated against the tok/s in the same line.
+            // Spelled the way every other `CERA_*` switch is, so
+            // `CERA_POOL_STATS=false` turns it off rather than on.
+            let pool_stats = std::env::var("CERA_POOL_STATS").is_ok_and(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "off"
+                )
+            });
+            let mut prev_pool = cera::backend::threadpool::stats::snapshot();
             for i in 0..runs {
                 let r = run_once()?;
                 let (pf, dc) = (r.prefill_tps, r.decode_tps);
@@ -3852,8 +3866,21 @@ fn main() -> Result<()> {
                     }
                     None => String::new(),
                 };
+                let pool_suffix = if pool_stats {
+                    let now = cera::backend::threadpool::stats::snapshot();
+                    let d = now.since(&prev_pool);
+                    prev_pool = now;
+                    format!(
+                        " | serial={}/{} ({:.1}% of weighted work)",
+                        d.serial_fallbacks,
+                        d.fanout_dispatches,
+                        d.serial_mac_fraction() * 100.0
+                    )
+                } else {
+                    String::new()
+                };
                 eprintln!(
-                    "run {}/{}: prefill={pf:.0} decode={dc:.1} tok/s{suffix}",
+                    "run {}/{}: prefill={pf:.0} decode={dc:.1} tok/s{suffix}{pool_suffix}",
                     i + 1,
                     runs
                 );

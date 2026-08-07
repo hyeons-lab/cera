@@ -336,11 +336,25 @@ disabling it caps that tier at AVX2.
 ## CPU threading & tuning
 
 On native targets the CPU backend dispatches GEMV/GEMM rows through a
-persistent, affinity-pinned worker pool (not a per-call fork-join), with dynamic
-chunk-stealing so faster cores absorb more work on heterogeneous big.LITTLE
-mobile. On heterogeneous big.LITTLE parts (Linux/Android) detection keeps at
-most 6 big cores for both pools, which fixes the multi-core decode collapse
-there. Elsewhere, desktop/server (where sysfs detection is skipped and every
+persistent, affinity-pinned worker pool (not a per-call fork-join). Rows are
+handed out by dynamic chunk-stealing, so a faster core simply claims more
+chunks. On a part whose cores differ in speed each worker's chunk is also
+*sized* to the `cpu_capacity` of the core it is pinned to, so that every
+worker's chunk costs roughly the same wall-clock time and one slow core cannot
+hold the rest at the dispatch barrier for a multiple of what its chunk cost.
+Both mechanisms are inert on homogeneous hosts, and `CERA_PIN=0` turns the
+sizing off along with the pinning it reads placement from.
+
+On heterogeneous big.LITTLE parts (Linux/Android) detection separates the
+performance cores from the efficiency ones and sizes both pools to the former,
+which fixes the multi-core decode collapse there. The efficiency cores are
+still recorded, so a deliberately widened pool can give every worker its own
+core rather than falling off a cliff, but nothing is that wide by default.
+Capacity-sized chunks make such a widened pool considerably less costly
+(measured on a Tensor G5, `CERA_THREADS=8` prefill 116.5 to 142.0 tok/s) but
+not free, so it remains an override rather than the default.
+
+Elsewhere, desktop/server (where sysfs detection is skipped and every
 logical CPU counts as a "perf core") and macOS (where the P-core count comes
 from `hw.perflevel0`), prefill
 uses all of them while **decode is sized from the loaded model** (see "How the
@@ -348,31 +362,45 @@ decode thread count is chosen" in the top-level README): small models that
 spread a token across many small pool dispatches run narrow, large ones that
 move more bytes per dispatch run wide. Where that sizing does not apply,
 heterogeneous parts, or a host whose physical core count cannot be detected
-(Windows, BSD, Intel macOS), the previous flat cap applies as before (≤12
-homogeneous, ≤6 on big.LITTLE). Both pools are process-wide singletons, so the
+(Windows, BSD, Intel macOS), the flat cap applies instead: the detected
+perf-core count, capped at 12. Both pools are process-wide singletons, so the
 decode width is sized from the **first** model loaded into a process and stays
 there for any loaded after it; it does not re-size per load. Everything else is
 auto-detected per device; the
 environment variables below only override for tuning (`CERA_THREADS` moves the
-detected count, which both pools size from):
+detected performance-core count, which both RowPools and rayon's global pool
+size from):
 
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `CERA_DECODE_THREADS` | `auto` | Decode worker count. A fixed `<n>` pins the width and overrides the automatic sizing (clamped to the detected performance cores); `auto` selects the model-based sizing below. |
-| `CERA_DECODE_SIZING` | on | `0` / `false` / `off` disables model-aware decode sizing, falling back to the flat cap (detected perf cores, ≤6 heterogeneous / ≤12 homogeneous). |
+| `CERA_DECODE_SIZING` | on | `0` / `false` / `off` disables model-aware decode sizing, falling back to the flat cap (detected perf cores, capped at 12). |
 | `CERA_DECODE_NARROW` | `physical / 2`, capped at 12 | Decode width for barrier-bound models (below the bytes-per-dispatch threshold); never exceeds the wide arm. Setting it also forces sizing on where it would otherwise be declined (on a host whose physical core count is undetectable, both arms must be pinned). |
 | `CERA_DECODE_WIDE` | `physical + physical / 4`, capped at 24 | Decode width for bandwidth-bound models, clamped to the detected cores. Setting it also forces sizing on where it would otherwise be declined (on a host whose physical core count is undetectable, both arms must be pinned). |
 | `CERA_DECODE_BPD_KB` | 2500 | Bytes-per-dispatch threshold (decimal KB) separating the two arms above. Unlike the two widths, this does **not** force sizing on where it is declined; it moves the threshold, it does not pin a width. |
-| `CERA_THREADS` | detected perf-core count | Override the detected performance-core count (moves the auto width for both pools). |
+| `CERA_THREADS` | detected perf-core count | Override the detected performance-core count (moves the auto width for both pools). Clamped to the number of pinnable cores on hosts that have any, with a warning: past that the surplus workers run unpinned and contend with pinned ones that are spin-waiting, measured at 35x slower on a Tensor G4. Not clamped where nothing gets pinned anyway: hosts with no affinity, or `CERA_PIN=0`. |
+| `CERA_PREFILL_THREADS` | detected perf-core count | Prefill pool width on its own, without moving decode. May reach past the performance cores up to every pinnable core, for sweeping a part where widening might pay (it does not on the parts measured so far: 6 workers 141 tok/s vs 8 workers 84.5 on a Tensor G5). Same no-clamp-without-pins rule as `CERA_THREADS`, including the `CERA_PIN=0` case. Note the two interact: `CERA_THREADS` truncates the pinnable-core list, so setting it as well lowers the ceiling this is clamped against. To sweep prefill past the perf cores, leave `CERA_THREADS` unset. |
 | `CERA_MIN_ROWS` | 128 | Minimum output rows a decode-GEMV worker takes before another joins. |
 | `CERA_PAR_THRESHOLD` | 256 | Minimum output dimension before a GEMV parallelizes; smaller GEMVs stay serial. |
 | `CERA_SPIN` | 100000 | Spin iterations before an idle worker parks. |
 | `CERA_PIN` | on | `0` / `false` / `off` disables affinity pinning (for hosts that manage thread placement themselves). |
+| `RAYON_NUM_THREADS` | detected perf-core count (moved by `CERA_THREADS`) | Width of rayon's global pool, which covers the parallel sites outside the RowPools: dequantization (so, model load), the ViT patch embed, and the LFM2-Audio conv stem. It does **not** move text prefill or decode width; every GEMM and GEMV on that path runs on a `RowPool`, sized by `CERA_PREFILL_THREADS` for prefill and `CERA_DECODE_THREADS` for decode (both defaulting from `CERA_THREADS`). It can still move a VL or audio prefill, whose encoders fan out on rayon. Read by `cera` itself rather than left to rayon, so the pool is built eagerly with a known CPU mask instead of lazily inheriting the mask of whichever thread reached it first. |
+| `CERA_RAYON_GLOBAL` | on | `0` / `false` / `off` stops `cera` claiming rayon's process-global pool, for a Rust host that wants to build it itself. Such a host can also just call `rayon::ThreadPoolBuilder::new().build_global()` before loading a model; `cera` then logs a warning and leaves it alone. |
 | `CERA_CPU_TIER` | auto | Force a lower CPU SIMD tier (downgrade only), for parity testing on capable hardware. |
+| `CERA_POOL_STATS` | off | `1` annotates each `cera bench` run with the pool's fan-out health: how many dispatches wanted more than one worker, and how many of those silently ran serially because the pool was already busy. The counts are exact; the accompanying work percentage mixes units across dispatch kinds, so read the counts. |
 | `CERA_LM_HEAD_NO_GEMM` | unset | `1` puts the LM-head projection in `forward_prefill_logits_all` back on the per-row loop the batched GEMM replaced, so both halves of a speculative-decoding A/B run from one binary. Measurement lever only; both paths compute the same projection, to within f32 accumulation order. |
 
 Affinity pinning applies on Linux/Android with a detected heterogeneous
 topology; homogeneous hosts and macOS run unpinned.
+
+None of this needs configuring from the host. Loading a model builds rayon's
+global pool; the RowPools build themselves on first use (prefill on the first
+GEMM, decode on the first decode GEMV, which is what lets decode size itself
+from the loaded model). Two functions let a host move that work earlier if it
+wants to: `cera::backend::cpu::ensure_rayon_global_pool()` builds just the
+rayon pool, and `configure_thread_pool()` also warms the prefill RowPool and
+returns its width, so a CLI can report a thread count before a model exists.
+Both are optional and idempotent.
 
 ## License
 

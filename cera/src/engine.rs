@@ -390,6 +390,16 @@ impl CeraEngine {
         cfg: EngineConfig,
         path: Option<&Path>,
     ) -> Result<Self, CeraError> {
+        // Give rayon's global pool a deterministic width and CPU mask before
+        // anything can build it lazily. Only `cera-cli` calls
+        // `configure_thread_pool`, so without this every library embedder (the
+        // UniFFI bindings, the iOS/Android SDKs, direct users) inherits
+        // whatever mask the first rayon touch happened to see. See
+        // `backend::cpu::ensure_rayon_global_pool` for the measured cost.
+        // Idempotent, so the constructors that funnel through here repeatedly
+        // pay only the first one.
+        crate::backend::cpu::ensure_rayon_global_pool();
+
         // Covers `from_bytes` / `from_reader`, which skip the pre-filter
         // in `from_manifest_with_primary`. Text LLMs AND LFM2-audio
         // models both load the primary GGUF through the same path;
