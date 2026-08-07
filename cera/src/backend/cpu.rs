@@ -22,21 +22,26 @@
 /// used (which is exactly what a library embedder does, since only `cera-cli`
 /// calls [`configure_thread_pool`]), rayon builds a **one-thread pool confined
 /// to one core**, and every residual rayon site serialises onto it:
-/// dequantization, VL preprocessing, the LFM2-Audio conv stem, and the four
-/// aarch64 i8mm prefill GEMM kernels in `super::simd`. (Every other GEMM
-/// driver reaches `RowPool` through [`par_rows_n`] and was never affected; the
-/// i8mm kernels are the ones that parallelise on rayon directly.)
+/// dequantization (so, model load), the ViT patch embed, and the LFM2-Audio
+/// conv stem. Every GEMM and GEMV on the transformer prefill/decode path
+/// reaches a `RowPool`, through [`par_rows`] for decode GEMVs and
+/// [`par_rows_n`], [`par_rows_n_chunked`] or [`par_rows_n_work`] for the
+/// batched paths; the four aarch64 i8mm kernels were the last exception and
+/// moved across when the two-pool oversubscription they caused was fixed. The vision and audio
+/// encoders still fan their own matmuls out on rayon, so `RAYON_NUM_THREADS`
+/// can still move a VL or audio prefill.
 ///
-/// Measured on a Pixel 10 Pro Fold, LFM2.5-350M-Q4_K_M at 512 prompt tokens,
-/// interleaved and thermal-gated: the embedder path went from a median 79
-/// tok/s prefill (a tight 78-81, because it was serialised) to 120-148 across
-/// three sessions, matching the CLI path in each. The width of that range is
-/// the machine, not the fix; absolute throughput on this device tracks
-/// background memory pressure, and both arms move together with it.
-///
-/// Decode came up too, but nothing in the decode path touches rayon (its GEMVs
-/// run on `RowPool::decode`), so treat that as unexplained rather than as this
-/// fix's doing.
+/// When this was written the aarch64 i8mm prefill GEMM was still on rayon, and
+/// measuring it was easy: on a Pixel 10 Pro Fold (LFM2.5-350M-Q4_K_M, 512
+/// prompt tokens, interleaved and thermal-gated) the embedder path ran a median
+/// 79 tok/s prefill, a tight 78-81 because it was serialised, against 120-148
+/// once fixed. Those kernels have since moved to `RowPool`, so that particular
+/// number is no longer reproducible and prefill throughput is no longer the way
+/// to observe this. What rides on rayon now is model-load dequantization, VL
+/// preprocessing and the audio conv stem, so the cost of getting it wrong is
+/// load latency and the VL/audio paths rather than tokens per second. The
+/// mechanism is unchanged, and the thread dump in `examples/embedder_path` is
+/// the direct way to check it.
 ///
 /// So the width comes from [`super::cpu_features::performance_core_count`] and
 /// every worker asserts the perf-core mask on startup instead of keeping what
@@ -169,9 +174,9 @@ pub fn ensure_rayon_global_pool() {}
 /// [`super::threadpool::RowPool`]s, sized from the detected topology —
 /// `CERA_THREADS` overrides the prefill width, `CERA_DECODE_THREADS` the
 /// decode width (see `super::calibrate`). `RAYON_NUM_THREADS` governs only
-/// the residual rayon sites (dequantization, VL preprocessing, the audio conv
-/// stem, and the aarch64 i8mm prefill GEMM kernels in `super::simd`); it does
-/// **not** constrain the RowPools.
+/// the residual rayon sites (dequantization, the ViT patch embed, the audio
+/// conv stem); it does **not** constrain the RowPools, and no GEMM on the
+/// transformer prefill/decode path runs on it.
 ///
 /// P-cores only, because efficiency cores have lower clock speed and share
 /// memory bandwidth: including them creates straggler threads on synchronized
@@ -591,9 +596,37 @@ pub fn decode_par_threads() -> usize {
 /// Like [`par_rows_n`] but caps the active worker count by the dispatch's total
 /// arithmetic, so a small prefill GEMM doesn't fork wider than its work can
 /// fill. `depth` is the contraction length `k`; total work is `y.len() * depth`
-/// MACs. Used by the x86 int8 batched GEMM, whose rows are cheap enough that a
-/// tiny model (or a short prompt) is better run on a few cores than the whole
-/// pool. See [`super::threadpool::RowPool::dispatch_rows_work`].
+/// MACs. Used by the x86 int8 and aarch64 i8mm batched GEMMs, whose rows are
+/// cheap enough that a tiny model (or a short prompt) is better run on a few
+/// cores than the whole pool. See
+/// [`super::threadpool::RowPool::dispatch_rows_work`].
+///
+/// # Why the batched GEMMs are here and not on rayon
+///
+/// Prefill alternates the GEMM with the per-projection activation pre-quant,
+/// which runs on this same pool. Driving the two from separate pools puts two
+/// full-width fork-join barriers on the same cores (on a six-core phone, twelve
+/// compute threads on six), each barrier waiting on stragglers the other pool
+/// descheduled. It costs throughput *and* stability, and it is worst on small
+/// models, whose GEMMs are too short to let the idle pool park itself.
+///
+/// Measured on a Pixel 10 Pro Fold (LFM2.5-350M-Q4_K_M, 512 prompt tokens,
+/// n=20 per arm, interleaved and thermal-gated) when the aarch64 i8mm kernels
+/// moved across: prefill median 134 to 202 tok/s, and run-to-run spread 2.65x
+/// to 1.07x. On LFM2.5-1.2B-Q4_K_M, where the GEMMs are long enough for the
+/// idle pool to park, the median moved 49 to 57 and the spread was already
+/// tight. The earlier diagnosis that pointed here came from correlating prefill
+/// throughput against summed thread wait time at r = -0.949, with six rayon
+/// workers burning ~12,700 CPU-ms per run against ~1,500 for all ten RowPool
+/// workers combined.
+///
+/// One sizing note for callers that pass a *strip* as the row (several rows of
+/// output at once): the pool's steal-chunk floor
+/// (`MIN_CHUNK_ROWS`, private to that module) counts the rows you declare, so a
+/// strip width multiplies the real granularity by the strip's row count. With
+/// 2-row strips the smallest steal unit is 32 output rows, so a worker is left
+/// with nothing once the dispatch has `32 * (active - 1)` rows or fewer. The
+/// work cap usually narrows `active` for exactly those dispatches anyway.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub fn par_rows_n_work(
     y: &mut [f32],

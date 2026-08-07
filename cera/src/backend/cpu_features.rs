@@ -267,12 +267,10 @@ pub fn detect() -> CpuFeatures {
         f.dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
         f.i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
         // NeonI8mm lights up the Q8_0, Q4_0, Q4_K and Q6_K GEMM kernels;
-        // everything else uses the dotprod path (i8mm implies dotprod). Those
-        // four are also the only *GEMM* kernels that parallelize on rayon
-        // rather than a `RowPool`, which is why `RAYON_NUM_THREADS` moves
-        // prefill width on an i8mm host and nowhere else. Gated behind real
-        // i8mm detection so non-i8mm hosts never reach it; the kernel is
-        // validated on CI by the `simd-i8mm` job (ubuntu-24.04-arm, Neoverse N2).
+        // everything else uses the dotprod path (i8mm implies dotprod). Gated
+        // behind real i8mm detection so non-i8mm hosts never reach it; the
+        // kernels are validated on CI by the `simd-i8mm` job (ubuntu-24.04-arm,
+        // Neoverse N2).
         f.tier = if f.neon && f.dotprod && f.i8mm {
             CpuTier::NeonI8mm
         } else if f.neon && f.dotprod {
