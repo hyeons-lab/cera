@@ -332,6 +332,16 @@ pub fn decode_thread_count(topo: &CoreTopology) -> usize {
 /// wide pool still loses to the narrow one, and the efficiency cores stay out
 /// of the default. What the mitigation changes is the cost of overriding, not
 /// the choice of default.
+///
+/// **Superseded, and the conclusion still holds.** `RowPool::prefill` now also
+/// stops *pinning* once its width exceeds `fast_cores`, which was worth far
+/// more than the chunk weighting: on the same device and model, widening cost
+/// 1.43x pinned and 1.06x unpinned (211 to ~200), against llama.cpp's own
+/// 1.13x. So the numbers in this doc describe the pinned configuration, which
+/// a widened prefill pool no longer uses. The efficiency cores still stay out
+/// of the default, now for a plainer reason: 211 at the default width beats
+/// ~200 widened, so widening buys nothing even after it stopped being
+/// catastrophic.
 pub fn prefill_thread_count(topo: &CoreTopology) -> usize {
     let default = topo.perf_core_count.max(1);
     let Some(n) = env_usize("CERA_PREFILL_THREADS") else {
