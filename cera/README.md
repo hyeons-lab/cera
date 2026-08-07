@@ -336,13 +336,25 @@ disabling it caps that tier at AVX2.
 ## CPU threading & tuning
 
 On native targets the CPU backend dispatches GEMV/GEMM rows through a
-persistent, affinity-pinned worker pool (not a per-call fork-join), with dynamic
-chunk-stealing so faster cores absorb more work on heterogeneous big.LITTLE
-mobile. On heterogeneous big.LITTLE parts (Linux/Android) detection separates
-the performance cores from the efficiency ones and sizes both pools to the
-former, which fixes the multi-core decode collapse there. The efficiency cores
-are still recorded, so a deliberately widened pool can give every worker its own
-core rather than falling off a cliff, but nothing is that wide by default. Elsewhere, desktop/server (where sysfs detection is skipped and every
+persistent, affinity-pinned worker pool (not a per-call fork-join). Rows are
+handed out by dynamic chunk-stealing, so a faster core simply claims more
+chunks. On a part whose cores differ in speed each worker's chunk is also
+*sized* to the `cpu_capacity` of the core it is pinned to, so that every
+worker's chunk costs roughly the same wall-clock time and one slow core cannot
+hold the rest at the dispatch barrier for a multiple of what its chunk cost.
+Both mechanisms are inert on homogeneous hosts, and `CERA_PIN=0` turns the
+sizing off along with the pinning it reads placement from.
+
+On heterogeneous big.LITTLE parts (Linux/Android) detection separates the
+performance cores from the efficiency ones and sizes both pools to the former,
+which fixes the multi-core decode collapse there. The efficiency cores are
+still recorded, so a deliberately widened pool can give every worker its own
+core rather than falling off a cliff, but nothing is that wide by default.
+Capacity-sized chunks make such a widened pool considerably less costly
+(measured on a Tensor G5, `CERA_THREADS=8` prefill 116.5 to 142.0 tok/s) but
+not free, so it remains an override rather than the default.
+
+Elsewhere, desktop/server (where sysfs detection is skipped and every
 logical CPU counts as a "perf core") and macOS (where the P-core count comes
 from `hw.perflevel0`), prefill
 uses all of them while **decode is sized from the loaded model** (see "How the

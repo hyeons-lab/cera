@@ -368,7 +368,33 @@ pub struct CoreTopology {
     /// covering both efficiency cores. `super::threadpool::perf_pinned_cores`
     /// is that consumer.
     pub fast_cores: usize,
+    /// Relative speed of each core in `pin_cores`, same order and same length,
+    /// normalized so the fastest core is [`WEIGHT_FULL`]. Empty when the host
+    /// gives no usable spread (homogeneous, no affinity, or undetectable).
+    ///
+    /// This is the *magnitude* of the signal `pin_cores` keeps only the
+    /// ordering of, and it comes from whichever source ranked the cores:
+    /// `cpu_capacity` (the kernel's own EAS throughput scale, and the good
+    /// case) or, on a host without it such as an x86 hybrid part,
+    /// `cpufreq/cpuinfo_max_freq` ratios, which are a weaker proxy because
+    /// clock alone says nothing about IPC. Consumers are expected to tolerate
+    /// an approximate weight; `threadpool::worker_chunk_rows` documents why
+    /// that is safe. Keeping the numbers costs nothing, and it is what lets
+    /// `RowPool` size a worker's chunk to the core it sits on (see
+    /// `super::threadpool::pinned_core_weights`). Derived from the same
+    /// sorted, sibling-dropped list as `pin_cores` so the two indices cannot
+    /// drift: `core_weights[i]` is the weight of the core at `pin_cores[i]`.
+    ///
+    /// Empty is a meaningful answer, not a missing one: a host with no spread
+    /// wants uniform chunks, which is exactly what a consumer that finds no
+    /// weight for a worker falls back to.
+    pub core_weights: Vec<u32>,
 }
+
+/// Normalized weight of the fastest core in [`CoreTopology::core_weights`].
+/// A power of two so scaling by it is a multiply and a shift, and large enough
+/// that a ~5x spread (Tensor G5's 1024 against 207) keeps usable resolution.
+pub const WEIGHT_FULL: u32 = 256;
 
 /// Highest plausible CPU index to probe in sysfs. A hard bound so a malformed
 /// `/sys` can't loop unboundedly; real parts are far below this.
@@ -511,6 +537,10 @@ pub fn detect_topology() -> CoreTopology {
                 pin_cores: Vec::new(),
                 // No pinnable cores, so there is no prefix to hand out.
                 fast_cores: 0,
+                // Apple Silicon is heterogeneous, but with no affinity a worker
+                // is not on a known core, so a per-core weight would describe
+                // nothing.
+                core_weights: Vec::new(),
             },
             forced,
             pinning_on,
@@ -526,6 +556,9 @@ pub fn detect_topology() -> CoreTopology {
             perf_core_count: n,
             pin_cores: Vec::new(),
             fast_cores: 0,
+            // Unpinned and, on everything that reaches this fallback,
+            // homogeneous: uniform chunks are correct here.
+            core_weights: Vec::new(),
         },
         forced,
         pinning_on,
@@ -578,12 +611,61 @@ fn apply_thread_override(
     };
     topo.perf_core_count = n;
     topo.pin_cores.truncate(n);
+    // Truncated in lockstep: `core_weights[i]` describes `pin_cores[i]`, and a
+    // weight list left longer than the core list would hand a worker the weight
+    // of a core no longer in the pool.
+    topo.core_weights.truncate(topo.pin_cores.len());
     // `fast_cores` is a property of the silicon, so the override does not move
     // it; it is only re-clamped so it stays a valid prefix of the truncated
     // list. Without this, `CERA_THREADS=8` on a 6P+2E part would leave anything
     // deriving "the perf cores" from the width masking onto the E-cores.
     topo.fast_cores = topo.fast_cores.min(topo.pin_cores.len());
     topo
+}
+
+/// Rescale a fastest-first `(cpu_index, weight)` list to
+/// [`CoreTopology::core_weights`]: relative to the fastest entry, in units of
+/// [`WEIGHT_FULL`].
+///
+/// Two separate guards keep the result usable, and they cover different cases:
+/// `div_ceil` stops a nonzero-but-tiny capacity from rounding down to zero on
+/// an extreme spread, and the `clamp` lower bound covers the one case rounding
+/// cannot, a core that reports a capacity of `0`. A zero weight would scale a
+/// consumer's chunk to nothing, forcing every consumer to invent its own floor
+/// just to make progress. Rounding up biases slow cores large by at most one
+/// part in `WEIGHT_FULL`, which is far below the accuracy the consumer needs.
+///
+/// Not gated to the platforms that call it: it is pure arithmetic, and keeping
+/// it buildable everywhere is what lets its rounding be tested on the host
+/// rather than only on a device with a heterogeneous `/sys`.
+// `allow`, not `expect`: on a non-Linux host this is dead in a normal build but
+// live in a test build, so an `expect` would fire as unfulfilled in one of them.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    allow(
+        dead_code,
+        reason = "only the sysfs detector calls it; tested on all hosts"
+    )
+)]
+fn normalize_core_weights(cores: &[(usize, u32)]) -> Vec<u32> {
+    // The actual max, not `cores[0]`: callers do pass a fastest-first list, but
+    // normalizing against the true maximum means an unsorted one gets wrong-free
+    // ratios rather than everything above entry 0 silently clamped to full. This
+    // runs once per process, so the extra pass is free. `max(1)` guards an
+    // all-zero list rather than dividing by zero.
+    let max_weight = u64::from(cores.iter().map(|&(_, w)| w).max().unwrap_or(0)).max(1);
+    cores
+        .iter()
+        .map(|&(_, w)| {
+            let scaled = u64::from(w) * u64::from(WEIGHT_FULL);
+            // The upper bound cannot bind (dividing by the true maximum keeps
+            // every ratio at or below `WEIGHT_FULL`); it is kept so the return
+            // type's contract is enforced at the one place that produces it
+            // rather than assumed by every consumer. The lower bound does real
+            // work, for a `w` of 0. Both applied in `u64`, before narrowing.
+            scaled.div_ceil(max_weight).clamp(1, u64::from(WEIGHT_FULL)) as u32
+        })
+        .collect()
 }
 
 /// Detect performance cores from Linux/Android sysfs. Prefers `cpu_capacity`
@@ -671,10 +753,15 @@ fn detect_topology_sysfs() -> Option<CoreTopology> {
         .max(1);
     let pin_cores: Vec<usize> = cores.iter().map(|&(i, _)| i).collect();
     let fast_cores = perf_core_count;
+    // Same list, same order, after the same sibling drop and the same sort, so
+    // `core_weights[i]` describes `pin_cores[i]` by construction rather than by
+    // a convention two call sites have to keep agreeing on.
+    let core_weights = normalize_core_weights(&cores);
     Some(CoreTopology {
         perf_core_count,
         pin_cores,
         fast_cores,
+        core_weights,
     })
 }
 
@@ -772,6 +859,7 @@ mod tests {
             perf_core_count: 3,
             pin_cores: vec![7, 6, 5],
             fast_cores: 3,
+            core_weights: vec![WEIGHT_FULL, WEIGHT_FULL, WEIGHT_FULL],
         };
         // Fewer threads than detected cores → pin the fastest N.
         let two = apply_thread_override(base.clone(), Some(2), true);
@@ -791,6 +879,7 @@ mod tests {
             perf_core_count: 6,
             pin_cores: vec![7, 6, 5, 4, 3, 2, 1, 0],
             fast_cores: 6,
+            core_weights: vec![256, 206, 206, 206, 206, 206, 52, 52],
         };
         // Widening past the perf cores must not widen the fast prefix.
         let wide = apply_thread_override(big_little.clone(), Some(8), true);
@@ -814,6 +903,7 @@ mod tests {
             perf_core_count: 3,
             pin_cores: vec![7, 6, 5],
             fast_cores: 3,
+            core_weights: vec![WEIGHT_FULL, WEIGHT_FULL, WEIGHT_FULL],
         };
         let five = apply_thread_override(pinned, Some(5), true);
         assert_eq!(five.perf_core_count, 3);
@@ -824,9 +914,69 @@ mod tests {
             perf_core_count: 8,
             pin_cores: Vec::new(),
             fast_cores: 0,
+            core_weights: Vec::new(),
         };
         let wide = apply_thread_override(unpinned, Some(16), true);
         assert_eq!(wide.perf_core_count, 16);
+    }
+
+    /// A Tensor G5's `cpu_capacity` values rescaled to `WEIGHT_FULL`. The
+    /// numbers matter to the thing that consumes them: a worker on the A520
+    /// takes ~1/5 the rows per steal, which is what stops it from holding the
+    /// fork-join barrier for ~5x a chunk.
+    #[test]
+    fn core_weights_rescale_relative_to_the_fastest_core() {
+        let g5 = [(7, 1024u32), (6, 824), (5, 824), (1, 207), (0, 207)];
+        assert_eq!(
+            normalize_core_weights(&g5),
+            vec![256, 206, 206, 52, 52],
+            "weights are not relative to the prime core"
+        );
+    }
+
+    /// No spread ⇒ every worker keeps the full chunk, which is the property that
+    /// makes this inert on homogeneous hosts.
+    #[test]
+    fn core_weights_are_full_when_cores_are_equal() {
+        let homogeneous = [(0, 1024u32), (1, 1024), (2, 1024), (3, 1024)];
+        assert!(
+            normalize_core_weights(&homogeneous)
+                .iter()
+                .all(|&w| w == WEIGHT_FULL)
+        );
+    }
+
+    /// A weight of zero would scale a consumer's chunk to nothing, so the
+    /// rounding has to keep even an absurdly slow core above zero.
+    #[test]
+    fn core_weights_never_normalize_to_zero() {
+        // A spread far wider than any real part, plus the degenerate all-zero
+        // list a malformed `/sys` could produce.
+        let extreme = [(0, u32::MAX), (1, 1)];
+        assert_eq!(normalize_core_weights(&extreme), vec![256, 1]);
+        assert_eq!(normalize_core_weights(&[(0, 0), (1, 0)]), vec![1, 1]);
+        assert!(normalize_core_weights(&[]).is_empty());
+    }
+
+    /// `core_weights[i]` describes `pin_cores[i]`, so a `CERA_THREADS` override
+    /// that truncates one must truncate the other. Leaving the weights long
+    /// would not fail loudly; it would silently hand a worker the weight of a
+    /// core that is no longer in the pool.
+    #[test]
+    fn thread_override_keeps_weights_aligned_with_pins() {
+        let big_little = CoreTopology {
+            perf_core_count: 6,
+            pin_cores: vec![7, 6, 5, 4, 3, 2, 1, 0],
+            fast_cores: 6,
+            core_weights: vec![256, 206, 206, 206, 206, 206, 52, 52],
+        };
+        let narrow = apply_thread_override(big_little.clone(), Some(3), true);
+        assert_eq!(narrow.pin_cores.len(), narrow.core_weights.len());
+        assert_eq!(narrow.core_weights, vec![256, 206, 206]);
+        // Widening past the detected cores clamps the width, so the lists still
+        // match rather than one growing to a length the other cannot cover.
+        let wide = apply_thread_override(big_little, Some(16), true);
+        assert_eq!(wide.pin_cores.len(), wide.core_weights.len());
     }
 
     /// With `CERA_PIN=0` nothing is pinned, so the clamp's justification (surplus
@@ -840,6 +990,7 @@ mod tests {
             perf_core_count: 6,
             pin_cores: vec![7, 6, 5, 4, 3, 2, 1, 0],
             fast_cores: 6,
+            core_weights: vec![256, 206, 206, 206, 206, 206, 52, 52],
         };
         let pinned = apply_thread_override(big_little.clone(), Some(16), true);
         assert_eq!(pinned.perf_core_count, 8, "clamped to the pinnable cores");
@@ -849,9 +1000,11 @@ mod tests {
             unpinned.perf_core_count, 16,
             "CERA_PIN=0 still clamped, so an oversubscription sweep is impossible"
         );
-        // Nothing is pinned, so the core list is not truncated to the width
-        // either: there is no per-worker core to hand out.
+        // Nothing is pinned, so neither the core list nor the weights parallel to
+        // it are truncated to the width: there is no per-worker core to hand out,
+        // and so no weight that describes one.
         assert_eq!(unpinned.pin_cores.len(), 8);
+        assert_eq!(unpinned.core_weights.len(), 8);
     }
 
     #[test]
