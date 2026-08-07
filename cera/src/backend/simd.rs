@@ -118,7 +118,7 @@ pub(crate) mod neon {
     /// registers and spills the kernel's live accumulators to the stack. Inside a
     /// `neon` function we already know the conversion is available, so go direct.
     #[inline]
-    #[target_feature(enable = "neon")]
+    #[target_feature(enable = "neon,fp16")]
     unsafe fn f16_bits_to_f32(bits: u16) -> f32 {
         unsafe { vgetq_lane_f32::<0>(vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(bits)))) }
     }
@@ -1320,7 +1320,7 @@ pub(crate) mod neon {
     // i8mm dispatch target of `gemm_q6_k_q8_0_neon`; dead under --all-features (blas
     // on), live under the default CI gate — same as the Q4_0/Q4_K i8mm kernels.
     #[allow(dead_code)]
-    #[target_feature(enable = "neon,i8mm")]
+    #[target_feature(enable = "neon,i8mm,fp16")]
     unsafe fn gemm_q6_k_q8_0_neon_i8mm(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -2296,7 +2296,7 @@ pub(crate) mod neon {
     // is `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
     // --all-features (blas on), live under the default CI gate.
     #[allow(dead_code)]
-    #[target_feature(enable = "neon,i8mm")]
+    #[target_feature(enable = "neon,i8mm,fp16")]
     unsafe fn gemm_q8_0_q8_0_neon_i8mm(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -2461,7 +2461,7 @@ pub(crate) mod neon {
     // is `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
     // --all-features (blas on), live under the default CI gate.
     #[allow(dead_code)]
-    #[target_feature(enable = "neon,i8mm")]
+    #[target_feature(enable = "neon,i8mm,fp16")]
     unsafe fn gemm_q4_0_q8_0_neon_i8mm(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -2708,7 +2708,7 @@ pub(crate) mod neon {
     /// matches [`gemm_q4_k_q8_0_neon_dotprod`] exactly, so the accumulated f32 is
     /// bit-identical (the `dp`/`sx` integers are the same regardless of instruction).
     /// Odd row/col remainders fall back to [`gemm_q4_k_scalar_dot`].
-    #[target_feature(enable = "neon,i8mm")]
+    #[target_feature(enable = "neon,i8mm,fp16")]
     unsafe fn gemm_q4_k_q8_0_neon_i8mm(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -3068,10 +3068,16 @@ pub(crate) mod neon {
         /// The GEMM parity tests cannot cover this: `assert_close` allows 1%
         /// relative error, while flipping the lowest mantissa bit of a half moves
         /// the value by about 0.1%. A conversion that was subtly wrong would pass
-        /// them. This runs on plain `neon`, so it executes on the dev host too,
-        /// where the i8mm kernels themselves never run.
+        /// them.
+        ///
+        /// Gated on `fp16` rather than `i8mm`, which is the point: the helper
+        /// declares `neon,fp16`, so this still executes on the dev host, where
+        /// the i8mm kernels that call it never run.
         #[test]
         fn f16_widen_matches_half_crate_exhaustively() {
+            if !require_simd_or_skip("fp16", std::arch::is_aarch64_feature_detected!("fp16")) {
+                return;
+            }
             for bits in 0..=u16::MAX {
                 let want = half::f16::from_bits(bits).to_f32();
                 let got = unsafe { f16_bits_to_f32(bits) };
