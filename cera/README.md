@@ -354,7 +354,8 @@ decode width is sized from the **first** model loaded into a process and stays
 there for any loaded after it; it does not re-size per load. Everything else is
 auto-detected per device; the
 environment variables below only override for tuning (`CERA_THREADS` moves the
-detected count, which both pools size from):
+detected performance-core count, which both RowPools and rayon's global pool
+size from):
 
 | Variable | Default | Effect |
 |----------|---------|--------|
@@ -368,11 +369,22 @@ detected count, which both pools size from):
 | `CERA_PAR_THRESHOLD` | 256 | Minimum output dimension before a GEMV parallelizes; smaller GEMVs stay serial. |
 | `CERA_SPIN` | 100000 | Spin iterations before an idle worker parks. |
 | `CERA_PIN` | on | `0` / `false` / `off` disables affinity pinning (for hosts that manage thread placement themselves). |
+| `RAYON_NUM_THREADS` | detected perf-core count (moved by `CERA_THREADS`) | Width of rayon's global pool, which covers the parallel sites outside the RowPools: dequantization, VL preprocessing, the LFM2-Audio conv stem, and the four aarch64 i8mm prefill GEMM kernels (Q8_0, Q4_0, Q4_K, Q6_K). Every other prefill GEMM, on every native architecture, goes through `RowPool::prefill` and follows `CERA_THREADS` instead, so this moves prefill width only for those four quantizations on an i8mm host. Read by `cera` itself rather than left to rayon, so the pool is built eagerly with a known CPU mask instead of lazily inheriting the mask of whichever thread reached it first. |
+| `CERA_RAYON_GLOBAL` | on | `0` / `false` / `off` stops `cera` claiming rayon's process-global pool, for a Rust host that wants to build it itself. Such a host can also just call `rayon::ThreadPoolBuilder::new().build_global()` before loading a model; `cera` then logs a warning and leaves it alone. |
 | `CERA_CPU_TIER` | auto | Force a lower CPU SIMD tier (downgrade only), for parity testing on capable hardware. |
 | `CERA_LM_HEAD_NO_GEMM` | unset | `1` puts the LM-head projection in `forward_prefill_logits_all` back on the per-row loop the batched GEMM replaced, so both halves of a speculative-decoding A/B run from one binary. Measurement lever only; both paths compute the same projection, to within f32 accumulation order. |
 
 Affinity pinning applies on Linux/Android with a detected heterogeneous
 topology; homogeneous hosts and macOS run unpinned.
+
+None of this needs configuring from the host. Loading a model builds rayon's
+global pool; the RowPools build themselves on first use (prefill on the first
+GEMM, decode on the first decode GEMV, which is what lets decode size itself
+from the loaded model). Two functions let a host move that work earlier if it
+wants to: `cera::backend::cpu::ensure_rayon_global_pool()` builds just the
+rayon pool, and `configure_thread_pool()` also warms the prefill RowPool and
+returns its width, so a CLI can report a thread count before a model exists.
+Both are optional and idempotent.
 
 ## License
 

@@ -21,7 +21,8 @@
 //! default-on `avx512` crate feature) down through [`CpuTier::Avx512`] to
 //! [`CpuTier::Avx2`], which runs the same int8 kernels with `dpbusd` emulated
 //! and is therefore the floor for the whole x86 int8 path; on aarch64 it is
-//! [`CpuTier::NeonI8mm`] (Q8_0/Q4_0 GEMM) down to [`CpuTier::NeonDotprod`].
+//! [`CpuTier::NeonI8mm`] (Q8_0/Q4_0/Q4_K/Q6_K GEMM) down to
+//! [`CpuTier::NeonDotprod`].
 //!
 //! The raw feature bools (e.g. [`CpuFeatures::avx512vnni`]) are detected and
 //! exposed regardless, for diagnostics and so future kernels can light up
@@ -265,8 +266,11 @@ pub fn detect() -> CpuFeatures {
         f.neon = std::arch::is_aarch64_feature_detected!("neon");
         f.dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
         f.i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
-        // NeonI8mm currently lights up only the Q8_0 GEMM kernel; everything
-        // else uses the dotprod path (i8mm implies dotprod). Gated behind real
+        // NeonI8mm lights up the Q8_0, Q4_0, Q4_K and Q6_K GEMM kernels;
+        // everything else uses the dotprod path (i8mm implies dotprod). Those
+        // four are also the only *GEMM* kernels that parallelize on rayon
+        // rather than a `RowPool`, which is why `RAYON_NUM_THREADS` moves
+        // prefill width on an i8mm host and nowhere else. Gated behind real
         // i8mm detection so non-i8mm hosts never reach it; the kernel is
         // validated on CI by the `simd-i8mm` job (ubuntu-24.04-arm, Neoverse N2).
         f.tier = if f.neon && f.dotprod && f.i8mm {
@@ -384,7 +388,8 @@ pub(crate) fn env_usize(name: &str) -> Option<usize> {
 /// Shared by the `CERA_*` kill switches so they all spell "off" the same way.
 ///
 /// Gated with its callers (`threadpool::pinning_enabled`,
-/// `calibrate::sizing_enabled`), which exist only where the `RowPool` does.
+/// `calibrate::sizing_enabled`, `cpu::ensure_rayon_global_pool`), which exist
+/// only where the `RowPool` does.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub(crate) fn env_disabled(name: &str) -> bool {
     std::env::var(name)
