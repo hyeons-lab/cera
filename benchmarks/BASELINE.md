@@ -18,6 +18,13 @@ decode are always measured as separate runs (see the traps).
 | Mac cera vs llama.cpp | `b0ffd7e` (incl. #342) | M1 Max |
 | GPU I/O counters | mixed, see the † note in that section | Mac / Adreno |
 | GPU decode profile | `0f00dec` (incl. #316, #318, #319, #320) | M1 Max |
+| CPU thread scaling | `433c3eb` (incl. #344-#348) | Pixel 10 Pro Fold |
+| Q4_K i8mm kernel counters | #351 (see the PR for the exact tree) | Pixel 10 Pro Fold |
+
+**The first four sections predate #344-#348 and #351 and have not been
+re-measured against them.** They are still the reference for what they cover;
+they are just not a "current tip" reading. The two sections added below carry
+the newer work and state their own protocol.
 
 **Pin the llama.cpp build, and keep the binary.** The previous revision did name
 its build (`b9980`, vendored via pipette-llamacpp), which was right, but that
@@ -492,6 +499,110 @@ Read:
   mobile tiler with a tighter register budget, so which kernel wins may differ
   too, not just by how much.
 
+## CPU thread scaling on big.LITTLE (Pixel 10 Pro Fold)
+
+cera `433c3eb`, prefill 512 / decode 128, `--runs 3 --warmup 1`, arms
+interleaved with a rotating order, each invocation gated on BIG-cluster
+temperature <= 40 C **and** 1-minute loadavg <= 5. **The two subsections below
+use different models**; each states its own, because they were measured
+separately.
+
+**These are width-dependent results, and they exist only on tiered silicon.**
+Both mechanisms key off cores differing in speed: capacity-aware chunk sizing
+scales a worker's steal by its core's weight, and the prefill pool drops pinning
+once it is wider than `fast_cores`. Neither is reachable unless
+`detect_topology_sysfs` returned a topology, and it returns `None` for
+homogeneous parts by design, leaving `pin_cores` empty and `fast_cores` at 0. So
+on any uniform host both are inert. That is why the CI benchmark workflow cannot
+track them and this file has to. `cera cpu` prints which case the host is in:
+`placement=tiered (4.92x fastest:slowest)` here, `placement=flat` on a hosted
+runner.
+
+### Prefill pinning, `CERA_THREADS=8` (#348)
+
+LFM2.5-1.2B-Q4_K_M.
+
+Three arms, 5 rounds. `main-nopin` is `CERA_PIN=0` on the old binary, included
+because it is *not* the same configuration as the fix: it also unpins the decode
+pool, the caller, and rayon's mask, so it says whether the narrow change
+captures the win rather than merely resembling it.
+
+| arm | prefill p50 | range | decode p50 |
+|---|---:|---|---:|
+| main (pin at every width) | 128.0 | 76-132 | 88.0 |
+| **pinfix** (drop pinning past `fast_cores`) | **197.0** | 129-205 | 88.8 |
+| main + `CERA_PIN=0` | 201.0 | 191-204 | 71.4 |
+
+**+54% prefill, and decode is unharmed** (88.8 against 88.0). The blunt
+`CERA_PIN=0` reaches the same prefill (201) but costs decode 19% (71.4 against
+88.0), which is the whole reason the fix is scoped to the prefill pool instead
+of being a global switch.
+
+At the default width this changes nothing, by construction: the default pool is
+6 wide against `fast_cores=6`, so `prefill_should_pin` is still true and the
+pinned path is unchanged. The default width is also what CI measures.
+
+### Steal-chunk sizing by core capacity (#347)
+
+LFM2.5-**350M**-Q4_K_M, not the 1.2B used above. These are the figures in
+`worker_chunk_rows`' doc table, reproduced here so the two live in one place;
+that table is the primary record.
+
++22% prefill and +19.5% decode at `CERA_THREADS=8`; **+2.9% prefill at the
+default width**, where the pool holds only performance cores and there is little
+spread left to correct for. The small default-width figure is the honest headline
+for shipping configurations; the 8-thread figure is what the mechanism does when
+a widened pool actually straddles the A520s.
+
+Two scheduling alternatives were measured against this and **both lost**:
+ggml-style fixed-size chunks (16 rows, 64 for GEMV) and guided self-scheduling
+(`chunk = ceil(remaining/P)`). At `CERA_THREADS=8`, medians over 4 rounds:
+count-based sizing 146.0, `size-16` 142.5, gss 137.0, `size-8` 136.5, `size-32`
+135.0. The shipped fixed-count sizing wins; the tail-exposure argument for
+fixed-size chunks dies on `MIN_CHUNK_ROWS`.
+
+## Q4_K i8mm kernel counters (#351)
+
+**This is a counter movement without a matching throughput number, and it is
+recorded as such.** The file's own rule cuts the other way too: a throughput
+number without a counter movement is not evidence, and a counter movement alone
+is not a speedup claim. The device was at loadavg 10-27 for the whole
+measurement window against a gate of 5, so no trustworthy wall-clock delta was
+obtained.
+
+Profiling (simpleperf `-e cpu-clock:u`, 350M-Q4_K_M, both engines at their best
+thread count) localized the entire remaining prefill gap to one kernel:
+
+| region | cera | llama.cpp | ratio |
+|---|---:|---:|---|
+| Q4_K kernel | 3.558 | 2.550 | 1.40x slower |
+| Q6_K kernel | 0.573 | 0.579 | parity |
+| everything else | 0.608 | 0.870 | 0.70x (cera faster) |
+
+cera's pool overhead is 5.1% of prefill against ggml's 7.7%, so the threading
+side is not the constraint. Note llama.cpp is **not** using a repacked GEMM
+here: its `q4_K_8x8` path is gated on 256-bit SVE and this SoC has 128-bit, so a
+plain per-row `vec_dot` was winning. The deficit was implementation, not
+algorithm.
+
+Instructions per `smmla` (both bodies contain 8 `smmla`; both kernels cover 8
+elements per `smmla`, so the ratio is comparable per unit of arithmetic):
+
+| kernel | before | after | stores | loads |
+|---|---:|---:|---|---|
+| Q4_K | 99.9 | **44.9** | 63 → 26 | 148 → 73 |
+| Q6_K | 68.1 | **54.2** | 39 → 36 | 108 → 103 |
+
+The cause was `half::f16::to_f32` running `is_aarch64_feature_detected!("fp16")`
+per call and lowering to two non-inlined `bl`s, spilling the kernel's live
+accumulators. Q4_K called it 4x per superblock and Q6_K 2x, which is exactly the
+2:1 ratio in their spill counts.
+
+**A refuted hypothesis worth not re-testing:** widening the Q4_K activation loads
+from `vld1_s8` to `vld1q_s8` to match Q6_K. Both binaries disassemble identically
+in the hot kernel (800 instructions, 10 `ldr q`, 8 `smmla`, 73 loads); LLVM
+already merges the adjacent 8-byte loads.
+
 ## Reproduce
 
 ```bash
@@ -567,6 +678,23 @@ CERA_GPU_PROFILE=1 cera bench -m <model.gguf> --device gpu \
   (`SwapFree` was flat across every invocation). So `bench_android.sh` records
   `cpu_mhz_min`/`cpu_mhz_max` per cell; a cell whose range does not sit at the
   top of the ladder was not measured at speed.
+- **Gate on background load, not only on temperature.** The rejected-causes list
+  above dismisses "memory pressure" on the evidence that `SwapFree` was flat, and
+  that remains true, but it is a narrower claim than it reads as: it says swap was
+  not the mechanism, not that a busy device measures the same as an idle one. It
+  does not. On a session where the phone sat at 1-minute loadavg 10-27, the same
+  binary and model read prefill anywhere from 25 to 208 tok/s, and both arms of an
+  A/B degraded together, so the ratio survived while every absolute number was
+  worthless. Read `/proc/loadavg` alongside the thermal gate and discard samples
+  taken above about 5; a cold SoC is a necessary condition for a valid
+  measurement, not a sufficient one. Gating on temperature alone will happily
+  admit a run competing with whatever else the phone decided to do.
+- **A/B direction survives a loaded device; magnitude does not.** Corollary of the
+  above, and it decides what you may write down. Non-overlapping paired ranges
+  across rotated rounds are still evidence of a sign. The medians are not evidence
+  of a size, because the compression is not uniform across the range. Report the
+  direction and say the magnitude is unmeasured, rather than quoting a ratio of
+  two numbers that were both wrong.
 - **Sample a sensor while the load is running, not around it.** This has now gone
   wrong twice in this harness, and both times the broken column was added
   specifically to explain variance. First, battery temperature was used as the

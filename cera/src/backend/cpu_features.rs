@@ -391,6 +391,58 @@ pub struct CoreTopology {
     pub core_weights: Vec<u32>,
 }
 
+impl CoreTopology {
+    /// One-line topology summary, for benchmark provenance and bug reports.
+    ///
+    /// The part that matters when reading a benchmark is `placement`. Two
+    /// scheduling behaviours only do anything where cores differ in speed:
+    /// capacity-aware chunk sizing scales a worker's chunk by its core's
+    /// weight, and the prefill pool drops pinning once it is wider than
+    /// `fast_cores`. Both are inert unless `detect_topology_sysfs` returned a
+    /// topology, which it does *only* for heterogeneous parts.
+    ///
+    /// Without this line a flat benchmark trend on a hosted runner reads like
+    /// "that work achieved nothing", when the honest reading is "this host
+    /// cannot express it". Printing the placement makes that distinction
+    /// visible rather than something a reader has to know to look for.
+    ///
+    /// Deliberately reports the observable *state* and not a guess at its
+    /// cause. An empty `pin_cores` has several: `detect_topology_sysfs`
+    /// declines homogeneous parts outright, macOS exposes no affinity API at
+    /// all, and sysfs can be unreadable. Naming any one of them would be a
+    /// false statement on the other hosts, and the distinction that matters
+    /// here is the same in every case.
+    pub fn report(&self) -> String {
+        let placement = if self.pin_cores.is_empty() {
+            // The all-cores fallback: no per-core placement, so weight-scaled
+            // chunks and pin-widening cannot do anything. `fast_cores` is 0
+            // here, which is what makes `prefill_should_pin` short-circuit.
+            "flat (no per-core placement, so capacity-aware sizing and \
+             pin-widening are both inert)"
+                .to_string()
+        } else {
+            match self.core_weights.iter().min() {
+                // Weights are normalized so the fastest core is `WEIGHT_FULL`;
+                // the slowest one therefore carries the whole ratio.
+                Some(&min) if min < WEIGHT_FULL => format!(
+                    "tiered ({:.2}x fastest:slowest)",
+                    f64::from(WEIGHT_FULL) / f64::from(min)
+                ),
+                // Reachable only if a future detector starts returning uniform
+                // weights; today `detect_topology_sysfs` rejects that case.
+                _ => "uniform (capacity-aware sizing is inert)".to_string(),
+            }
+        };
+        format!(
+            "cores: pinnable={} fast={} perf_pool={} placement={}",
+            self.pin_cores.len(),
+            self.fast_cores,
+            self.perf_core_count,
+            placement,
+        )
+    }
+}
+
 /// Normalized weight of the fastest core in [`CoreTopology::core_weights`].
 /// A power of two so scaling by it is a multiply and a shift, and large enough
 /// that a ~5x spread (Tensor G5's 1024 against 207) keeps usable resolution.
@@ -1122,6 +1174,46 @@ mod tests {
             assert_eq!(CpuTier::parse("neon"), None);
             assert_eq!(CpuTier::parse("i8mm"), None);
         }
+    }
+
+    /// The topology line is benchmark provenance, so the three cases must stay
+    /// distinguishable. In particular an empty `core_weights` must not be
+    /// reported as "homogeneous" when the real cause is that the platform
+    /// exposes no affinity: macOS hits that path on heterogeneous silicon, and
+    /// claiming the hardware is uniform there would be a false statement.
+    #[test]
+    fn topology_report_distinguishes_flat_from_tiered() {
+        let unknown = CoreTopology {
+            perf_core_count: 8,
+            pin_cores: Vec::new(),
+            fast_cores: 0,
+            core_weights: Vec::new(),
+        };
+        let r = unknown.report();
+        assert!(r.contains("placement=flat"), "{r}");
+
+        let homogeneous = CoreTopology {
+            perf_core_count: 4,
+            pin_cores: vec![0, 1, 2, 3],
+            fast_cores: 4,
+            core_weights: vec![WEIGHT_FULL; 4],
+        };
+        let r = homogeneous.report();
+        assert!(r.contains("placement=uniform"), "{r}");
+
+        // Tensor G5's real spread: 1024 against 207, which normalizes to 256
+        // against 52 and reports as ~4.9x.
+        let heterogeneous = CoreTopology {
+            perf_core_count: 6,
+            pin_cores: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            fast_cores: 6,
+            core_weights: vec![WEIGHT_FULL, WEIGHT_FULL, 206, 206, 206, 206, 52, 52],
+        };
+        let r = heterogeneous.report();
+        assert!(r.contains("placement=tiered"), "{r}");
+        assert!(r.contains("4.92x"), "{r}");
+        assert!(r.contains("pinnable=8"), "{r}");
+        assert!(r.contains("fast=6"), "{r}");
     }
 
     #[test]

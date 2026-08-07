@@ -2629,9 +2629,11 @@ fn main() -> Result<()> {
             // Host capability + the SIMD tier the runtime resolved for it.
             // Useful in bug reports to know which kernel path actually ran.
             println!("{}", cera::cpu_features().report());
+            println!("{}", cera::backend::cpu_features::core_topology().report());
         }
         Command::Cpu => {
             println!("{}", cera::cpu_features().report());
+            println!("{}", cera::backend::cpu_features::core_topology().report());
         }
         Command::Tokenize { model, text } => {
             let gguf = cera::gguf::GgufFile::open(Path::new(&model))?;

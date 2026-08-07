@@ -145,13 +145,28 @@ gap() {
 # label the device instead. The GPU's identity comes from the backend's
 # adapter line, which is logged at `info` — the caller must set RUST_LOG for it
 # to appear (the benchmarks workflow's GPU job does).
+#
+# `cera cpu` prints two lines: the tier, then the core topology. They are kept
+# in separate variables because `$TIER` is interpolated into a backticked
+# markdown caption below, which an embedded newline would break.
+#
+# The topology line is what says whether a *scheduling* change could register on
+# this runner at all. Capacity-aware chunk sizing and the prefill pool's
+# pin-widening only do anything where cores differ in speed, and the detector
+# returns no topology at all for a uniform host, so both are inert there. A
+# level trend on such a runner is not evidence they did nothing. The line reads
+# `placement=flat` on hosted runners and `placement=tiered` on the mobile parts.
 if [ "$DEVICE" = "cpu" ]; then
-  TIER="$("$BIN" cpu 2>/dev/null || echo 'cpu: tier=unknown')"
+  CPU_REPORT="$("$BIN" cpu 2>/dev/null || echo 'cpu: tier=unknown')"
+  TIER="$(printf '%s\n' "$CPU_REPORT" | sed -n '1p')"
+  TOPO="$(printf '%s\n' "$CPU_REPORT" | sed -n '2p')"
 else
   TIER="device=$DEVICE"
+  TOPO=""
 fi
 echo "runner arch: $ARCH_LABEL"
 echo "$TIER"
+[ -n "$TOPO" ] && echo "$TOPO"
 echo "params: bundle=$BUNDLE_ID prompt_tokens=$PROMPT_TOKENS max_tokens=$MAX_TOKENS runs=$RUNS warmup=$WARMUP"
 if [ "$LLAMA_ON" -eq 1 ]; then
   echo "llama.cpp comparison: ON ($LLAMA_BENCH) — gap = llama/cera (higher ⇒ cera further behind)"
@@ -296,6 +311,10 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     echo "### Bench — $BUNDLE_ID ($ARCH_LABEL)"
     echo
     echo "\`$TIER\` · prompt_tokens=$PROMPT_TOKENS · max_tokens=$MAX_TOKENS · runs=$RUNS"
+    if [ -n "$TOPO" ]; then
+      echo
+      echo "\`$TOPO\`"
+    fi
     if [ "$LLAMA_ON" -eq 1 ]; then
       echo
       echo "$LLAMA_CAPTION"
