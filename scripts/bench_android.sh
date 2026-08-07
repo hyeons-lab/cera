@@ -204,9 +204,13 @@ echo "==> pushing cera to $DEVICE_DIR"
 # from HAL"; the "Cached temperatures" section earlier in the same dumpsys is
 # stale and reads high long after the device has cooled.
 soc_big() {
+  # `|| true` on every sampler: these run inside the background sampling loop and
+  # their last command is a pipeline over adb output, so a transient adb failure
+  # or an absent sensor would return non-zero and, under `set -e`, take the
+  # caller down mid-matrix. An empty sample is the correct degradation.
   "${ADB[@]}" shell "dumpsys thermalservice" 2>/dev/null \
     | awk '/Current temperatures from HAL/,/Current cooling devices/' \
-    | sed -n 's/.*mValue=\([0-9.]*\), mType=0, mName=BIG, .*/\1/p' | head -1 | cut -d. -f1
+    | sed -n 's/.*mValue=\([0-9.]*\), mType=0, mName=BIG, .*/\1/p' | head -1 | cut -d. -f1 || true
 }
 
 # Mid-run CPU frequency on a perf core, MHz. This is the variable that actually
@@ -234,7 +238,7 @@ cpu_mhz() {
   [[ -n "$f" ]] && echo $((f / 1000)) || echo ""
 }
 
-batt_level() { "${ADB[@]}" shell "dumpsys battery | grep -i '^  level'" 2>/dev/null | grep -oE '[0-9]+' | head -1; }
+batt_level() { "${ADB[@]}" shell "dumpsys battery | grep -i '^  level'" 2>/dev/null | grep -oE '[0-9]+' | head -1 || true; }
 
 # Three-way, not a boolean: "plugged in but not charging" is its own power
 # envelope (the charger is current-limiting), and conflating it with charging
@@ -252,7 +256,10 @@ power_state() {
 # Samples accumulate in one file per cell+phase. Deliberately not `declare -A`:
 # macOS ships bash 3.2, which has no associative arrays, and this script is run
 # from a Mac far more often than from the device.
-SAMPLE_DIR=$(mktemp -d)
+# Bare `-d` works on current macOS and on GNU coreutils; the `-t` fallback
+# covers older macOS releases that wanted a template. Cheap insurance, since
+# this is an assignment under `set -e` and a failure here kills the harness.
+SAMPLE_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t cera-bench)
 # stop_samplers first: an interrupted run would otherwise leave a host-side adb
 # shell and an on-device polling loop running after the script exits.
 trap 'stop_samplers 2>/dev/null; rm -rf "$SAMPLE_DIR"' EXIT
@@ -322,7 +329,7 @@ stop_samplers() {
 sample_cera() { # backend label mask
   local backend="$1" mask="$3" key="cera|$2"
   local pin=""; [[ -n "$mask" ]] && pin="taskset $mask "
-  local base="cd \"$DEVICE_DIR\" && ${pin}./cera bench -m \"$MODEL\" --device $backend \
+  local base="cd \"$DEVICE_DIR\" && ${pin}./cera bench -m \"$MODEL\" --device \"$backend\" \
 --runs $RUNS --warmup $WARMUP --no-cache --gpu-io"
   local pre dec
   start_samplers "$key"
@@ -360,8 +367,14 @@ sample_llama() { # threads label mask
 -m \"$DEVICE_DIR/$MODEL\" -t $t -p $PROMPT -n $DECODE -r $RUNS -o md" 2>&1) || true
   stop_samplers
   printf '%s\n' "$out" >> "$LOG"
-  record "$key|prefill" "$(grep -E "\|[[:space:]]*pp${PROMPT}[[:space:]]*\|" <<<"$out" | sed -n 's/.*|[[:space:]]*\([0-9.]*\) ±.*/\1/p' | head -1)"
-  record "$key|decode"  "$(grep -E "\|[[:space:]]*tg${DECODE}[[:space:]]*\|"  <<<"$out" | sed -n 's/.*|[[:space:]]*\([0-9.]*\) ±.*/\1/p' | head -1)"
+  # One `sed -n` per field rather than `grep | sed`, matching `sample_cera`. The
+  # grep was not a correctness problem here (an argument-form substitution
+  # degrades to empty rather than aborting) but the two parsers reading
+  # differently was an invitation to fix the wrong one later.
+  record "$key|prefill" \
+    "$(sed -n "s/.*|[[:space:]]*pp${PROMPT}[[:space:]]*|[[:space:]]*\([0-9.]*\) ±.*/\1/p" <<<"$out" | head -1)"
+  record "$key|decode" \
+    "$(sed -n "s/.*|[[:space:]]*tg${DECODE}[[:space:]]*|[[:space:]]*\([0-9.]*\) ±.*/\1/p" <<<"$out" | head -1)"
 }
 
 # The cells, and the single pass over them. Labels carry the mask they actually
