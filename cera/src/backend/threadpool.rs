@@ -497,6 +497,14 @@ pub struct RowPool {
     caller_pin: Option<usize>,
     /// Total workers including the caller (worker 0); always `≥ 1`.
     num_threads: usize,
+    /// Whether this pool pinned its workers 1:1 to distinct cores.
+    ///
+    /// Recorded rather than re-derived: the policy is decided from the
+    /// *requested* width, while [`RowPool::num_threads`] is the width actually
+    /// achieved after any spawn failures. Those can differ, so deriving the
+    /// placement from `num_threads` would report the wrong answer for a pool
+    /// that failed to spawn down below `fast_cores`.
+    workers_pinned: bool,
 }
 
 /// Counters for the dispatch fan-out path.
@@ -708,9 +716,18 @@ impl RowPool {
 
     /// Build a pool with `num_threads` total workers, pinning worker `i` to
     /// `pin_cores[i]` when present (surplus workers run unpinned). `pin_cores`
-    /// empty ⇒ no pinning (macOS/desktop). Spawn failures degrade the thread
-    /// count rather than panicking. The pool pins *and claims the process-wide
-    /// caller pin for* whatever thread first dispatches.
+    /// empty ⇒ no 1:1 pinning; the workers are then confined to `spread_mask`
+    /// instead, if that is non-empty, so they are *placed* rather than left to
+    /// inherit the caller's mask. Spawn failures degrade the thread count rather
+    /// than panicking.
+    ///
+    /// **The caller pin follows `pin_cores`, so it is not unconditional.**
+    /// `caller_pin` is `pin_cores.first()`, so with an empty `pin_cores` the
+    /// pool claims no process-wide caller pin and [`RowPool::pin_caller_once`]
+    /// is a no-op for it. Two callers reach that state deliberately: a host with
+    /// no usable affinity, and a prefill pool wider than the fast cores (see
+    /// [`RowPool::prefill`]). A pool that *does* pin still claims the caller pin
+    /// for whatever thread first dispatches through it.
     ///
     /// `core_weights` is the relative speed of each entry of `pin_cores`, in
     /// units of [`super::cpu_features::WEIGHT_FULL`]; worker `i` sizes its steal
@@ -797,6 +814,7 @@ impl RowPool {
             dispatch_lock: Mutex::new(()),
             caller_pin,
             num_threads,
+            workers_pinned: !pin_cores.is_empty(),
         }
     }
 
@@ -1705,14 +1723,16 @@ mod tests {
         // The prefill pool deliberately carries no weights when it is wider
         // than the fast cores: it is unpinned there, so no weight describes any
         // worker. Checking it in that state would assert the opposite of the
-        // intended behaviour, so it is skipped rather than carved out.
-        let topo = super::super::cpu_features::core_topology();
-        let prefill_pinned = prefill_should_pin(topo.fast_cores, RowPool::prefill().num_threads());
-        let pools: Vec<&RowPool> = if prefill_pinned {
-            vec![RowPool::prefill(), RowPool::decode()]
-        } else {
-            vec![RowPool::decode()]
-        };
+        // intended behaviour, so it is skipped.
+        //
+        // Read from the pool's recorded placement, not re-derived from its
+        // width: the policy is decided on the *requested* width while
+        // `num_threads()` reports the width actually achieved, and a spawn
+        // failure can move one without the other.
+        let pools: Vec<&RowPool> = [RowPool::prefill(), RowPool::decode()]
+            .into_iter()
+            .filter(|p| p.workers_pinned || pinned_core_weights().is_empty())
+            .collect();
         for pool in pools {
             let got = &pool.shared.worker_weights;
             if got.is_empty() {
