@@ -7,10 +7,12 @@ Measured on Apple M-series (aarch64), single-socket, unless noted. All models
 loaded from GGUF with memory-mapped weights. Raw per-run data and long-context
 profiles live alongside this file:
 
-- [`BASELINE.md`](BASELINE.md): **the reference numbers**: Android CPU vs
-  llama.cpp, GPU I/O counters, and the per-kernel GPU decode profile. Every
-  section carries the commit and device it was measured on; check that before
-  quoting one.
+- [`BASELINE.md`](BASELINE.md): **the reference numbers**: Android and Mac cera
+  vs llama.cpp, GPU I/O counters, and the per-kernel GPU decode profile. Every
+  section carries the commit and device it was measured on, and every llama.cpp
+  number carries its build ID; check both before quoting one. It also lists the
+  measurement traps, which are worth reading before taking a number: the
+  prefill-with-decode one silently costs ~10% and 8x the variance.
 - [`GPU_FINDINGS_CORRECTION.md`](GPU_FINDINGS_CORRECTION.md): five rounds of
   wrong GPU conclusions and what each one cost. Worth reading before starting a
   GPU perf task; it is mostly a catalogue of ways to over-read a number, and
@@ -97,9 +99,12 @@ integer GEMM path on aarch64 and need no system libraries.
 Two GPU backends with runtime selection via `--device`:
 
 - **Native Metal** (`--device metal`, macOS): hand-written MSL shaders,
-  single-encoder dispatch, GPU argmax. Decodes ~2× faster than llama.cpp on all
-  tested Q4_0 models; prefill is competitive at short prompts and trails at long
-  prompts (tracked in [`profile_longctx.md`](profile_longctx.md)).
+  single-encoder dispatch, GPU argmax. Decode medians lead llama.cpp, but by less
+  than this file used to claim and by less than the run-to-run spread: see the
+  Mac table in [`BASELINE.md`](BASELINE.md), which measures 1.07-1.20x with
+  16-18% stddev on both engines and advises against quoting a single ratio.
+  Prefill is competitive at short prompts and trails at long prompts (tracked in
+  [`profile_longctx.md`](profile_longctx.md)).
 - **wgpu** (`--device gpu`, cross-platform): WGSL shaders targeting
   Metal/Vulkan/DX12/WebGPU. Still behind native Metal, but the gap is smaller
   than it was: decode on LFM2-VL-450M Q4_0 / M1 Max went 63.4 → 112.8 tok/s
