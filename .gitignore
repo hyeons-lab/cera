@@ -1,7 +1,10 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock IS tracked. This workspace ships binaries (cera-cli) and an
+# FFI library, and CI resolving dependencies fresh on every run made builds
+# non-reproducible: any transitive crate publishing a broken release turned
+# every branch red at once, unrelated to what changed.
 
 # Gradle / Kotlin (cera-parity Kotlin leg + any future Gradle subprojects)
 **/.gradle/
