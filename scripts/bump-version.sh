@@ -22,8 +22,12 @@
 # coordinate in lockstep, and `--check` (run in CI and on the publish path)
 # fails the build on any drift.
 #
-# This script edits files only — it does NOT touch Cargo.lock (which is
-# gitignored here; cargo refreshes the workspace entries on the next build).
+# This script edits files only, and it does NOT touch Cargo.lock. Since #349 the
+# lock is TRACKED, and it records the workspace crates' own versions, so a bump
+# leaves it stale until cargo rewrites it. Run any cargo command afterwards
+# (`cargo metadata` is enough) and commit the refreshed Cargo.lock with the
+# bump, or CI's `--locked` builds fail on the mismatch. Verified: bumping to
+# 0.4.1 without refreshing makes `cargo metadata --locked` exit non-zero.
 #
 # Usage:
 #   scripts/bump-version.sh <X.Y.Z>   Set a new version, then propagate it.
@@ -181,5 +185,7 @@ echo "  Cargo.toml        (workspace.package + ${#PIN_CRATES[@]} internal cera p
 echo "  pubspec.yaml      ${VERSION}${psuffix}"
 echo "  gradle.properties ${VERSION}${gsuffix}"
 echo
-echo "review the diff, then commit. (Cargo.lock is gitignored; cargo refreshes"
-echo "it on the next build.)"
+echo "Cargo.lock is tracked and records these crate versions, so refresh it before"
+echo "committing:  cargo metadata --offline >/dev/null  (then include it in the diff)."
+echo
+echo "review the diff, then commit."
