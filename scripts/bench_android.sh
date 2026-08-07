@@ -49,6 +49,7 @@ PASSES=5
 # against its late ones at different power budgets. A whole session was measured
 # here from 93% down to 14% before this was noticed.
 MIN_BATTERY=30
+FORCE=no
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -63,6 +64,7 @@ while [[ $# -gt 0 ]]; do
     --passes)      PASSES="$2"; shift 2 ;;
     --equil-warm)  EQUIL_WARM="$2"; shift 2 ;;
     --min-battery) MIN_BATTERY="$2"; shift 2 ;;
+    --force)       FORCE=yes; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -85,8 +87,66 @@ ADB=(adb)
 BIN_LOCAL="target/aarch64-linux-android/release/cera"
 [[ -f "$BIN_LOCAL" ]] || { echo "missing $BIN_LOCAL — build it first (see header)" >&2; exit 2; }
 
-OUT="bench_android.csv"
-LOG="bench_android_raw.log"
+# ---------------------------------------------------------------------------
+# CPU topology, detected rather than hardcoded.
+#
+# The taskset masks here used to be literals (80 / fc / 7c) picked for one SoC.
+# Run against a different big.LITTLE layout the same literal selects different
+# cores: on a Tensor G5 `7c` is the perf cluster, on a Tensor G4 it spans two
+# LITTLE cores plus the mid cluster. That produces a wrong number that looks
+# like a right one, so derive the masks from the device instead.
+#
+# Clusters are grouped by cpuinfo_max_freq: highest = prime, next = mid, the
+# rest little. LITTLE cores are never a benchmark target on their own; they only
+# appear inside the combined "big" mask if the SoC has no separate mid tier.
+# ---------------------------------------------------------------------------
+TOPO_RAW=""
+detect_topology() {
+  TOPO_RAW=$("${ADB[@]}" shell 'for c in /sys/devices/system/cpu/cpu[0-9]*; do
+      n=${c##*/cpu}; f=$(cat "$c/cpufreq/cpuinfo_max_freq" 2>/dev/null)
+      [ -n "$f" ] && echo "$n $f"
+    done' 2>/dev/null | tr -d '\r' | grep -E '^[0-9]+ [0-9]+$' || true)
+  [[ -n "$TOPO_RAW" ]] || { echo "error: could not read CPU topology from device" >&2; exit 2; }
+
+  local freqs; freqs=$(awk '{print $2}' <<<"$TOPO_RAW" | sort -rnu)
+  local prime_f mid_f
+  prime_f=$(sed -n 1p <<<"$freqs")
+  mid_f=$(sed -n 2p <<<"$freqs")
+
+  read -r PRIME_MASK N_PRIME <<<"$(cluster_mask "$prime_f")"
+  PRIME_CORE=$(awk -v w="$prime_f" '$2==w {print $1; exit}' <<<"$TOPO_RAW")
+
+  if [[ -n "$mid_f" ]]; then
+    read -r MID_MASK N_MID <<<"$(cluster_mask "$mid_f")"
+    read -r BIG_MASK N_BIG <<<"$(cluster_mask "$prime_f" "$mid_f")"
+  else
+    # Single-frequency SoC: no separate mid tier to pin against.
+    MID_MASK="$PRIME_MASK"; N_MID="$N_PRIME"
+    BIG_MASK="$PRIME_MASK"; N_BIG="$N_PRIME"
+  fi
+}
+
+# Hex taskset mask (and core count) for every core whose max freq is one of the
+# given values.
+cluster_mask() {
+  local want="$1" want2="${2:-}"
+  awk -v a="$want" -v b="$want2" '
+    ($2 == a) || (b != "" && $2 == b) { m += 2 ^ $1; n++ }
+    END { printf "%x %d", m, n }' <<<"$TOPO_RAW"
+}
+
+OUT="${CERA_BENCH_OUT:-bench_android.csv}"
+LOG="${OUT%.csv}_raw.log"
+
+# A full matrix costs hours of device time, and the previous version silently
+# truncated both files on every invocation, so a two-minute smoke test run from
+# the same directory destroyed a two-hour result set. Refuse to overwrite; set
+# CERA_BENCH_OUT to write elsewhere, or --force when you mean it.
+if [[ -e "$OUT" && "$FORCE" != "yes" ]]; then
+  echo "error: $OUT already exists; refusing to overwrite a previous run." >&2
+  echo "       Use --force to replace it, or set CERA_BENCH_OUT=<path.csv>." >&2
+  exit 2
+fi
 # One row per cell, aggregated across PASSES measured passes rather than a single
 # invocation: the dominant variance on this device is between invocations, so the
 # invocation has to be the sampling unit. `*_cov` is the coefficient of variation
@@ -102,11 +162,11 @@ echo "==> pushing cera to $DEVICE_DIR"
 "${ADB[@]}" push "$BIN_LOCAL" "$DEVICE_DIR/cera" >/dev/null
 "${ADB[@]}" shell "chmod +x $DEVICE_DIR/cera"
 
-# taskset masks for this SoC class (Tensor G5 / typical big.LITTLE):
-#   (none) = let the scheduler place threads (cera's RowPool sizes itself)
-#   80     = prime core only (cpu7)
-#   fc     = perf + prime (cpu2-7)
-#   7c     = perf cluster only (cpu2-6)
+# taskset masks, derived per device by detect_topology:
+#   (none)     = let the scheduler place threads (cera's RowPool sizes itself)
+#   PRIME_MASK = prime core(s) only
+#   MID_MASK   = mid cluster only
+#   BIG_MASK   = prime + mid
 #
 # ---------------------------------------------------------------------------
 # Why this measures at thermal equilibrium
@@ -165,7 +225,12 @@ soc_big() {
 # speed.
 cpu_mhz() {
   local f
-  f=$("${ADB[@]}" shell "cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_cur_freq" 2>/dev/null | tr -d '\r')
+  # `|| true` is load-bearing: this is an *assignment*-form substitution, so
+  # under `set -euo pipefail` a failing pipeline (offline core, missing cpufreq
+  # node, adb hiccup) aborts the whole run rather than skipping one sample. The
+  # argument-form parses elsewhere degrade to an empty value instead, which is
+  # why they do not need it.
+  f=$("${ADB[@]}" shell "cat /sys/devices/system/cpu/cpu${PRIME_CORE}/cpufreq/scaling_cur_freq" 2>/dev/null | tr -d '\r' || true)
   [[ -n "$f" ]] && echo $((f / 1000)) || echo ""
 }
 
@@ -188,7 +253,9 @@ power_state() {
 # macOS ships bash 3.2, which has no associative arrays, and this script is run
 # from a Mac far more often than from the device.
 SAMPLE_DIR=$(mktemp -d)
-trap 'rm -rf "$SAMPLE_DIR"' EXIT
+# stop_samplers first: an interrupted run would otherwise leave a host-side adb
+# shell and an on-device polling loop running after the script exits.
+trap 'stop_samplers 2>/dev/null; rm -rf "$SAMPLE_DIR"' EXIT
 
 slug() { tr -c 'A-Za-z0-9_' '_' <<<"$1"; }
 
@@ -197,53 +264,145 @@ record() { # key value
   echo "$2" >> "$SAMPLE_DIR/$(slug "$1").vals"
 }
 
-note_soc() { # key
-  local t; t=$(soc_big); [[ -n "$t" ]] && echo "$t" >> "$SAMPLE_DIR/$(slug "$1").soc"
-  local m; m=$(cpu_mhz); [[ -n "$m" ]] && echo "$m" >> "$SAMPLE_DIR/$(slug "$1").mhz"
+# Temperature and frequency must be sampled DURING an invocation, not around it.
+#
+# The previous version called a sampler before a cell's first run and after its
+# last. Both are moments when the CPU has been idle for an adb round trip, and
+# this silicon sheds heat and drops clocks in seconds, so those columns recorded
+# 700 MHz and 45 C while the workload was actually running at 3015 MHz and 85 C.
+# They could not see the effect they existed to detect, which is the same mistake
+# as the earlier battery-temperature instrumentation.
+#
+# Frequency comes off sysfs on-device at 1 Hz, which costs one `cat` per second.
+# Temperature has no unprivileged sysfs path (`thermal_zone*` is root-only), so
+# it is polled from the host via dumpsys at 0.2 Hz. That is a real perturbation,
+# but a small and uniform one, and measuring the right quantity approximately
+# beats measuring the wrong one precisely.
+MHZ_SAMPLER=""
+SOC_SAMPLER=""
+SAMPLE_BASE=""
+SAMPLER_TAG="cera_bench_sampler_$$"
+
+start_samplers() { # key
+  SAMPLE_BASE="$SAMPLE_DIR/$(slug "$1")"
+  # Deliberately NOT `adb ... | awk ... &`. For a backgrounded pipeline `$!` is
+  # the LAST command (awk), so killing it leaves the adb shell running and the
+  # subsequent `wait` blocks on the rest of the pipeline forever. Redirect the
+  # raw stream to a file so `$!` is adb itself, and parse it in stop_samplers.
+  # The tag exists so stop_samplers can pkill the DEVICE-side loop. Killing the
+  # host adb client does not kill it: adbd keeps the pty open, so the loop never
+  # takes SIGPIPE and survives until `timeout` reaps it. Left unfixed, a full
+  # matrix accumulates one polling loop per cell per pass, all of them running
+  # for fifteen minutes on the device whose performance is being measured.
+  "${ADB[@]}" shell "timeout 900 sh -c ': $SAMPLER_TAG; while :; do
+      cat /sys/devices/system/cpu/cpu${PRIME_CORE}/cpufreq/scaling_cur_freq 2>/dev/null; sleep 1
+    done'" > "$SAMPLE_BASE.mhz.raw" 2>/dev/null &
+  MHZ_SAMPLER=$!
+  ( while :; do
+      t=$(soc_big); [[ -n "$t" ]] && echo "$t" >> "$SAMPLE_BASE.soc"
+      sleep 5
+    done ) &
+  SOC_SAMPLER=$!
+}
+
+stop_samplers() {
+  [[ -n "$MHZ_SAMPLER" ]] && { kill "$MHZ_SAMPLER" 2>/dev/null || true; }
+  [[ -n "$SOC_SAMPLER" ]] && { kill "$SOC_SAMPLER" 2>/dev/null || true; }
+  [[ -n "$MHZ_SAMPLER" ]] && { "${ADB[@]}" shell "pkill -f $SAMPLER_TAG" >/dev/null 2>&1 || true; }
+  wait "$MHZ_SAMPLER" "$SOC_SAMPLER" 2>/dev/null || true
+  if [[ -n "$SAMPLE_BASE" && -f "$SAMPLE_BASE.mhz.raw" ]]; then
+    awk '{ sub(/\r$/, ""); if ($0 ~ /^[0-9]+$/) print int($0 / 1000) }' \
+      "$SAMPLE_BASE.mhz.raw" >> "$SAMPLE_BASE.mhz"
+    rm -f "$SAMPLE_BASE.mhz.raw"
+  fi
+  MHZ_SAMPLER=""; SOC_SAMPLER=""; SAMPLE_BASE=""
   return 0
 }
 
 sample_cera() { # backend label mask
   local backend="$1" mask="$3" key="cera|$2"
   local pin=""; [[ -n "$mask" ]] && pin="taskset $mask "
-  local base="cd $DEVICE_DIR && ${pin}./cera bench -m $MODEL --device $backend \
+  local base="cd \"$DEVICE_DIR\" && ${pin}./cera bench -m \"$MODEL\" --device $backend \
 --runs $RUNS --warmup $WARMUP --no-cache --gpu-io"
-  note_soc "$key"
   local pre dec
+  start_samplers "$key"
   pre=$("${ADB[@]}" shell "$base --prompt-tokens $PROMPT --max-tokens 0" 2>&1 || true)
-  echo "$pre" >> "$LOG"
-  record "$key|prefill" "$(sed -n 's/.*prefill tok\/s: p50=\([0-9.]*\).*/\1/p' <<<"$pre" | head -1)"
   dec=$("${ADB[@]}" shell "$base --prompt-tokens $DECODE_PROMPT --max-tokens $DECODE" 2>&1 || true)
-  echo "$dec" >> "$LOG"
+  stop_samplers
+  printf '%s\n' "$pre" >> "$LOG"
+  printf '%s\n' "$dec" >> "$LOG"
+  # cera prints its decode summary BEFORE its prefill summary, so each value must
+  # be taken from its own invocation rather than by position in the log.
+  record "$key|prefill" "$(sed -n 's/.*prefill tok\/s: p50=\([0-9.]*\).*/\1/p' <<<"$pre" | head -1)"
   record "$key|decode" "$(sed -n 's/.*decode tok\/s: p50=\([0-9.]*\).*/\1/p' <<<"$dec" | head -1)"
-  note_soc "$key"
   printf '%s\n%s\n' "$pre" "$dec" | grep -E "^gpu I/O" >> "$LOG" || true
 }
 
-sample_llama() { # threads mask
+# Config label for a llama cell: threads, cluster name, and the mask it actually
+# ran with, so a row stays interpretable on a device with a different layout.
+llama_cfg() { # threads label mask
+  if [[ -n "$3" ]]; then echo "t$1-$2-$3"; else echo "t$1-$2"; fi
+}
+
+sample_llama() { # threads label mask
   [[ -n "$LLAMA_BENCH" ]] || return 0
-  local t="$1" mask="$2" key="llama.cpp|t$1-$2" rt
+  # Declared separately from the substitution: `local x=$(...)` makes `local`
+  # the command whose status is seen, masking a failure inside (SC2155).
+  local t="$1" mask="$3" key rt
+  key="llama.cpp|$(llama_cfg "$1" "$2" "$3")"
   rt=$(dirname "$LLAMA_BENCH")
-  note_soc "$key"
-  local out
-  out=$("${ADB[@]}" shell "cd $rt && LD_LIBRARY_PATH=. taskset $mask ./$(basename "$LLAMA_BENCH") \
--m $DEVICE_DIR/$MODEL -t $t -p $PROMPT -n $DECODE -r $RUNS -o md" 2>&1) || true
-  echo "$out" >> "$LOG"
+  local out pin=""
+  # An empty mask means "unpinned", the symmetric counterpart to cera's default
+  # RowPool cell; taskset with no mask is a syntax error, so omit it entirely.
+  [[ -n "$mask" ]] && pin="taskset $mask "
+  start_samplers "$key"
+  out=$("${ADB[@]}" shell "cd \"$rt\" && LD_LIBRARY_PATH=. ${pin}./\"$(basename "$LLAMA_BENCH")\" \
+-m \"$DEVICE_DIR/$MODEL\" -t $t -p $PROMPT -n $DECODE -r $RUNS -o md" 2>&1) || true
+  stop_samplers
+  printf '%s\n' "$out" >> "$LOG"
   record "$key|prefill" "$(grep -E "\|[[:space:]]*pp${PROMPT}[[:space:]]*\|" <<<"$out" | sed -n 's/.*|[[:space:]]*\([0-9.]*\) ±.*/\1/p' | head -1)"
   record "$key|decode"  "$(grep -E "\|[[:space:]]*tg${DECODE}[[:space:]]*\|"  <<<"$out" | sed -n 's/.*|[[:space:]]*\([0-9.]*\) ±.*/\1/p' | head -1)"
-  note_soc "$key"
+}
+
+# The cells, and the single pass over them. Labels carry the mask they actually
+# ran with so a CSV row stays interpretable on a device with a different layout.
+CELLS=()
+build_cells() {
+  N_ALL=$(wc -l <<<"$TOPO_RAW" | tr -d ' ')
+  CERA_DEFAULT="default-rowpool"
+  CERA_PRIME="pin-prime-$PRIME_MASK"
+  CERA_MID="pin-mid-$MID_MASK"
+  CERA_GPU="wgpu-vulkan"
+  LLAMA_PRIME=$(llama_cfg 1 prime "$PRIME_MASK")
+  LLAMA_MID=$(llama_cfg "$N_MID" mid "$MID_MASK")
+  LLAMA_BIG=$(llama_cfg "$N_BIG" big "$BIG_MASK")
+  # Unpinned, every core. Without this cell the matrix has no counterpart to
+  # cera's default RowPool, which is also unpinned across every core, so a
+  # best-vs-best prefill comparison silently pits cera on N cores against llama
+  # on the largest cluster only. That asymmetry favours cera.
+  LLAMA_ALL=$(llama_cfg "$N_ALL" all "")
+  CELLS=(
+    "cera|$CERA_DEFAULT" "cera|$CERA_PRIME" "cera|$CERA_MID" "cera|$CERA_GPU"
+    "llama.cpp|$LLAMA_PRIME" "llama.cpp|$LLAMA_MID" "llama.cpp|$LLAMA_BIG"
+    "llama.cpp|$LLAMA_ALL"
+  )
 }
 
 # One pass over every cell, engines interleaved.
 one_pass() {
-  sample_cera cpu "default-rowpool" ""
-  sample_llama 5 "7c"
-  sample_cera cpu "pin-prime-80" "80"
-  sample_llama 1 "80"
-  sample_cera cpu "pin-perf-7c" "7c"
-  sample_llama 6 "fc"
-  sample_cera gpu "wgpu-vulkan" ""
+  sample_cera cpu "$CERA_DEFAULT" ""
+  sample_llama "$N_MID" mid "$MID_MASK"
+  sample_cera cpu "$CERA_PRIME" "$PRIME_MASK"
+  sample_llama 1 prime "$PRIME_MASK"
+  sample_cera cpu "$CERA_MID" "$MID_MASK"
+  sample_llama "$N_BIG" big "$BIG_MASK"
+  sample_cera gpu "$CERA_GPU" ""
+  sample_llama "$N_ALL" all ""
 }
+
+detect_topology
+build_cells
+echo "==> topology: prime=$PRIME_MASK (${N_PRIME}c, sampling cpu$PRIME_CORE), mid=$MID_MASK (${N_MID}c), big=$BIG_MASK (${N_BIG}c)" | tee -a "$LOG"
 
 BATT_START=$(batt_level); POWER_STATE=$(power_state)
 echo "==> battery ${BATT_START}% (${POWER_STATE}), min required ${MIN_BATTERY}%" | tee -a "$LOG"
@@ -260,7 +419,9 @@ for ((w = 0; w < EQUIL_WARM; w++)); do
   one_pass >/dev/null 2>&1 || true
   echo "    warm-up pass $((w + 1))/$EQUIL_WARM done, BIG=$(soc_big) C" | tee -a "$LOG"
 done
-rm -f "$SAMPLE_DIR"/*.vals "$SAMPLE_DIR"/*.soc   # discard warm-up samples
+# Discard warm-up samples. This must cover every extension the samplers write:
+# `.mhz` was missing here, so warm-up frequencies leaked into the measured range.
+rm -f "$SAMPLE_DIR"/*.vals "$SAMPLE_DIR"/*.soc "$SAMPLE_DIR"/*.mhz
 
 for ((pass = 1; pass <= PASSES; pass++)); do
   echo "==> measured pass $pass/$PASSES (BIG=$(soc_big) C)" | tee -a "$LOG"
@@ -283,6 +444,18 @@ stats() { # file -> "median cov n"
 
 BATT_END=$(batt_level)
 
+# A run that loses the device produces a header-only CSV and, before this
+# check, exited 0. An empty result that reports success is worse than a failure:
+# it reads downstream as "measured, nothing to see". Fail loudly instead.
+if ! ls "$SAMPLE_DIR"/*.vals >/dev/null 2>&1; then
+  echo "error: no samples collected across $PASSES passes; every cell failed." >&2
+  if ! "${ADB[@]}" get-state >/dev/null 2>&1; then
+    echo "       The device is no longer reachable over adb (it dropped mid-run)." >&2
+  fi
+  echo "       See $LOG for the raw output." >&2
+  exit 4
+fi
+
 range_of() { # key ext -> "min max"
   local f; f="$SAMPLE_DIR/$(slug "$1").$2"
   [[ -s "$f" ]] || { echo "NA NA"; return; }
@@ -290,8 +463,7 @@ range_of() { # key ext -> "min max"
 }
 
 {
-  for cell in "cera|default-rowpool" "cera|pin-prime-80" "cera|pin-perf-7c" "cera|wgpu-vulkan" \
-              "llama.cpp|t5-7c" "llama.cpp|t1-80" "llama.cpp|t6-fc"; do
+  for cell in "${CELLS[@]}"; do
     eng="${cell%%|*}"; cfg="${cell##*|}"
     read -r pmed pcov _ <<<"$(stats "$SAMPLE_DIR/$(slug "$cell|prefill").vals")"
     read -r dmed dcov dn <<<"$(stats "$SAMPLE_DIR/$(slug "$cell|decode").vals")"
