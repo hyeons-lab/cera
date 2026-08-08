@@ -3186,12 +3186,52 @@ unsafe fn attn_values_avx2(
 
 // ── f16 KV attention (widen-on-read) ────────────────────────────────────────
 
-/// Convert one IEEE-754 half (raw bits) to f32. On aarch64/x86 with hardware
-/// f16 this lowers to a single `fcvt`/`vcvtph2ps`; otherwise `half`'s software
-/// path. Accumulation downstream stays f32 for softmax stability.
+/// Convert one IEEE-754 half (raw bits) to f32. Accumulation downstream stays
+/// f32 for softmax stability.
+///
+/// Open-coded rather than `half::f16::to_f32`, which is a trap in a loop: its
+/// aarch64 path runs `is_aarch64_feature_detected!("fp16")` per call and lowers
+/// to two out-of-line `bl`s (`detect_and_initialize`, then `f16_to_f32_fp16`).
+/// Neither inlines, so every call clobbers the caller-saved registers and spills
+/// whatever the caller had live. The disassembly of `attn_scores_f16` showed
+/// exactly that, and this function is called from the *tail* loops of the NEON
+/// kernels, not only from the scalar fallback. An earlier revision of this doc
+/// claimed the wrapper "lowers to a single `fcvt`"; it does not, and that claim
+/// went unchecked.
+///
+/// Integer-only on purpose. The well-known branchless form multiplies by
+/// `2^112` to renormalize subnormals, which makes the result depend on
+/// `FPCR.FZ`: under flush-to-zero every subnormal half would widen to the wrong
+/// value. This version cannot be perturbed by the floating-point environment.
+/// The branches are cheap because normals dominate overwhelmingly, and
+/// `f16_widen_matches_half_crate_exhaustively` pins all 65536 patterns against
+/// the `half` crate.
 #[inline(always)]
 fn f16_to_f32(bits: u16) -> f32 {
-    half::f16::from_bits(bits).to_f32()
+    let sign = (u32::from(bits) & 0x8000) << 16;
+    let exp = (u32::from(bits) >> 10) & 0x1F;
+    let mant = u32::from(bits) & 0x03FF;
+    let rest = match exp {
+        // Zero, or a subnormal that has to be renormalized into a normal f32.
+        0 if mant == 0 => 0,
+        0 => {
+            // `mant` is 1..=0x3FF, so `leading_zeros` is 22..=31 and `shift`
+            // lands in 1..=10; neither the subtraction nor the shifts below can
+            // go out of range.
+            let shift = mant.leading_zeros() - 21;
+            ((113 - shift) << 23) | ((mant << (shift + 13)) & 0x007F_FFFF)
+        }
+        0x1F if mant == 0 => 0x7F80_0000,
+        // NaN. The payload is carried across, and the quiet bit is *set*, not
+        // copied: IEEE 754 says widening a signaling NaN quiets it, which is
+        // what both `half` and the hardware `fcvtl` in the NEON path do. An
+        // earlier draft of this shifted the payload verbatim and disagreed with
+        // both on every sNaN (0x7c01 widened to 0x7f802000, not 0x7fc02000).
+        0x1F => 0x7FC0_0000 | (mant << 13),
+        // Normal: rebias 15 -> 127 and left-align the 10-bit significand.
+        _ => ((exp + 112) << 23) | (mant << 13),
+    };
+    f32::from_bits(sign | rest)
 }
 
 /// f16 variant of [`attn_scores`]: `k_cache` holds IEEE-754 half bits (2
@@ -3214,8 +3254,14 @@ pub fn attn_scores_f16(
         debug_assert!(k_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
     }
     // head_dim > 128 overruns the NEON Q array — see `attn_scores`.
+    //
+    // `fp16` is checked for the same reason the x86 arm below checks `f16c`:
+    // the kernel's widen is `vcvt_f32_f16`, which `core::arch` declares
+    // `neon,fp16`. The `fcvtl` it lowers to is baseline ARMv8.0-A, so this is
+    // stating the contract rather than avoiding a trap, and a host that fails
+    // the gate still gets a correct answer from the scalar tail below.
     #[cfg(target_arch = "aarch64")]
-    if head_dim <= 128 {
+    if head_dim <= 128 && super::cpu_features::cpu_features().fp16 {
         unsafe {
             attn_scores_f16_neon(
                 q_head,
@@ -3284,8 +3330,14 @@ pub fn attn_values_f16(
         debug_assert!(v_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
     }
     // head_dim > 128 overruns the NEON accumulator array — see `attn_scores`.
+    //
+    // `fp16` is checked for the same reason the x86 arm below checks `f16c`:
+    // the kernel's widen is `vcvt_f32_f16`, which `core::arch` declares
+    // `neon,fp16`. The `fcvtl` it lowers to is baseline ARMv8.0-A, so this is
+    // stating the contract rather than avoiding a trap, and a host that fails
+    // the gate still gets a correct answer from the scalar tail below.
     #[cfg(target_arch = "aarch64")]
-    if head_dim <= 128 {
+    if head_dim <= 128 && super::cpu_features::cpu_features().fp16 {
         unsafe {
             attn_values_f16_neon(
                 scores,
@@ -3341,7 +3393,7 @@ pub fn attn_values_f16(
 /// tier gate is required.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-#[target_feature(enable = "neon")]
+#[target_feature(enable = "neon,fp16")]
 unsafe fn attn_scores_f16_neon(
     q_head: &[f32],
     k_cache: &[u16],
@@ -3401,7 +3453,7 @@ unsafe fn attn_scores_f16_neon(
 /// the FCVTL / MSRV rationale.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::needless_range_loop)]
-#[target_feature(enable = "neon")]
+#[target_feature(enable = "neon,fp16")]
 unsafe fn attn_values_f16_neon(
     scores: &[f32],
     v_cache: &[u16],
@@ -6432,6 +6484,42 @@ mod tests {
         let mut scores = vec![];
         attn_scores(&[0.0; 64], &[], &mut scores, 64, 0, 64, 0.125, 0);
         assert!(scores.is_empty());
+    }
+
+    /// `f16_to_f32` is open-coded, so it must equal `half`'s conversion for
+    /// every one of the 65536 half patterns, exactly.
+    ///
+    /// Exhaustive rather than sampled because the interesting inputs are the
+    /// rare ones: the subnormal renormalization is a different arm of the match
+    /// from normals, and random draws would essentially never hit it. This also
+    /// covers the two boundaries the arms meet at (`exp == 0` and `exp == 0x1F`)
+    /// without having to enumerate them by hand.
+    ///
+    /// The kernel tests below cannot stand in for this: they compare the f16
+    /// kernels against a scalar dot over values widened by *this same function*,
+    /// so a wrong conversion cancels out on both sides and they still pass.
+    #[test]
+    fn f16_widen_matches_half_crate_exhaustively() {
+        for bits in 0..=u16::MAX {
+            let want = half::f16::from_bits(bits).to_f32();
+            let got = f16_to_f32(bits);
+            if want.is_nan() {
+                assert!(got.is_nan(), "bits {bits:#06x}: want NaN, got {got}");
+                // The payload rides along, so a NaN must not silently become a
+                // different NaN (or an infinity with the sign flipped).
+                assert_eq!(
+                    got.to_bits() & 0x807F_FFFF,
+                    want.to_bits() & 0x807F_FFFF,
+                    "bits {bits:#06x}: NaN payload/sign differs"
+                );
+            } else {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "bits {bits:#06x}: want {want}, got {got}"
+                );
+            }
+        }
     }
 
     /// The f16 attention kernels must match a scalar dot over the *same*
