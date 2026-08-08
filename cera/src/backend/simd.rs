@@ -3069,7 +3069,11 @@ pub(crate) mod neon {
                 return;
             }
             for bits in 0..=u16::MAX {
-                let want = crate::quant::f16_to_f32(bits);
+                // The `half` crate on purpose: this test exists to check an
+                // open-coded conversion against an independent implementation,
+                // so referencing our own would make it compare two of our
+                // functions and prove nothing.
+                let want = half::f16::from_bits(bits).to_f32();
                 let got = unsafe { f16_bits_to_f32(bits) };
                 if want.is_nan() {
                     assert!(got.is_nan(), "bits {bits:#06x}: want NaN, got {got}");

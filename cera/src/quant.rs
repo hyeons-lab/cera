@@ -997,7 +997,11 @@ mod tests {
     #[test]
     fn f16_widen_matches_half_crate_exhaustively() {
         for bits in 0..=u16::MAX {
-            let want = f16_to_f32(bits);
+            // The `half` crate, deliberately: an open-coded conversion has to be
+            // checked against an *independent* implementation. A mechanical pass
+            // rewrote this reference to our own function once, which made the
+            // test compare `f16_to_f32` to itself and pass unconditionally.
+            let want = half::f16::from_bits(bits).to_f32();
             let got = f16_to_f32(bits);
             if want.is_nan() {
                 assert!(got.is_nan(), "bits {bits:#06x}: want NaN, got {got}");
