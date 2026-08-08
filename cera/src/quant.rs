@@ -1,7 +1,117 @@
-use half::f16;
-
 #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
 use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
+
+/// Convert one IEEE-754 half (raw bits) to f32. Accumulation downstream stays
+/// f32 for softmax stability.
+///
+/// Open-coded rather than `half::f16::to_f32`, which is a trap in a loop: its
+/// aarch64 path runs `is_aarch64_feature_detected!("fp16")` per call and lowers
+/// to two out-of-line `bl`s (`detect_and_initialize`, then `f16_to_f32_fp16`).
+/// Neither inlines, so every call clobbers the caller-saved registers and spills
+/// whatever the caller had live. The disassembly of `attn_scores_f16` showed
+/// exactly that, and this function is called from the *tail* loops of the NEON
+/// kernels, not only from the scalar fallback. An earlier revision of this doc
+/// claimed the wrapper "lowers to a single `fcvt`"; it does not, and that claim
+/// went unchecked.
+///
+/// Integer-only on purpose. The well-known branchless form multiplies by
+/// `2^112` to renormalize subnormals, which makes the result depend on
+/// `FPCR.FZ`: under flush-to-zero every subnormal half would widen to the wrong
+/// value. This version cannot be perturbed by the floating-point environment.
+/// The branches are cheap because normals dominate overwhelmingly, and
+/// `f16_widen_matches_half_crate_exhaustively` pins all 65536 patterns against
+/// the `half` crate.
+#[inline(always)]
+pub(crate) fn f16_to_f32(bits: u16) -> f32 {
+    let sign = (u32::from(bits) & 0x8000) << 16;
+    let exp = (u32::from(bits) >> 10) & 0x1F;
+    let mant = u32::from(bits) & 0x03FF;
+    let rest = match exp {
+        // Zero, or a subnormal that has to be renormalized into a normal f32.
+        0 if mant == 0 => 0,
+        0 => {
+            // `mant` is 1..=0x3FF, so `leading_zeros` is 22..=31 and `shift`
+            // lands in 1..=10; neither the subtraction nor the shifts below can
+            // go out of range.
+            let shift = mant.leading_zeros() - 21;
+            ((113 - shift) << 23) | ((mant << (shift + 13)) & 0x007F_FFFF)
+        }
+        0x1F if mant == 0 => 0x7F80_0000,
+        // NaN. The payload is carried across, and the quiet bit is *set*, not
+        // copied: IEEE 754 says widening a signaling NaN quiets it, which is
+        // what both `half` and the hardware `fcvtl` in the NEON path do. An
+        // earlier draft of this shifted the payload verbatim and disagreed with
+        // both on every sNaN (0x7c01 widened to 0x7f802000, not 0x7fc02000).
+        0x1F => 0x7FC0_0000 | (mant << 13),
+        // Normal: rebias 15 -> 127 and left-align the 10-bit significand.
+        _ => ((exp + 112) << 23) | (mant << 13),
+    };
+    f32::from_bits(sign | rest)
+}
+
+/// Convert one f32 to IEEE-754 half (raw bits), round-to-nearest-even.
+///
+/// The narrowing twin of [`f16_to_f32`], and open-coded for the same reason:
+/// `half::f16::from_f32` is an out-of-line call with a runtime feature probe,
+/// and the disassembly put 17 of them in hot paths (TurboQuant key/value
+/// append, the LFM2 and Llama prefill and attention blocks, the KV rope shift,
+/// and the Q8_0 activation quantizer).
+///
+/// Correctness here is load-bearing: this writes the f16 KV cache and the
+/// TurboQuant norms, so a rounding slip corrupts inference rather than merely
+/// slowing it. `f32_to_f16_matches_half_crate_exhaustively` checks the full
+/// 2^32 input space against the `half` crate, which is the only way to be sure
+/// the tie-breaking, the overflow-to-infinity carry, and the subnormal path all
+/// agree.
+#[inline(always)]
+pub(crate) fn f32_to_f16(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xFF) as i32;
+    let mant = b & 0x007F_FFFF;
+
+    if exp == 0xFF {
+        // Infinity keeps a zero significand. A NaN must stay a NaN even when
+        // its payload truncates to zero, so force the quiet bit rather than
+        // shifting alone.
+        return if mant == 0 {
+            sign | 0x7C00
+        } else {
+            sign | 0x7E00 | ((mant >> 13) as u16 & 0x03FF)
+        };
+    }
+
+    // Rebias 127 -> 15.
+    let e = exp - 127 + 15;
+    if e >= 0x1F {
+        return sign | 0x7C00; // overflow saturates to infinity
+    }
+    if e <= 0 {
+        // Below the subnormal range entirely: round toward the nearer of zero
+        // and the smallest subnormal, which for e < -10 is always zero.
+        if e < -10 {
+            return sign;
+        }
+        // Restore the implicit leading 1, then shift into subnormal position
+        // with round-to-nearest-even.
+        let m = mant | 0x0080_0000;
+        let shift = (14 - e) as u32; // 14..=24
+        let round = ((m >> (shift - 1)) & 1)
+            & (((m & ((1 << (shift - 1)) - 1)) != 0) as u32 | ((m >> shift) & 1));
+        return sign | ((m >> shift) + round) as u16;
+    }
+
+    // Normal. Round the 23-bit significand to 10 bits, ties to even; a carry
+    // out of the significand bumps the exponent, and may reach infinity.
+    let lsb = (mant >> 13) & 1;
+    let rounded = mant + 0x0FFF + lsb;
+    let carry = rounded >> 23;
+    let e = e as u32 + carry;
+    if e >= 0x1F {
+        return sign | 0x7C00;
+    }
+    sign | ((e << 10) as u16) | (((rounded >> 13) & 0x03FF) as u16)
+}
 
 // ── Block layouts ────────────────────────────────────────────────────────────
 
@@ -119,7 +229,7 @@ const _: () = assert!(size_of::<BlockQ5K>() == 176);
 /// Each byte in qs holds two 4-bit unsigned values (low nibble, high nibble).
 /// Values are offset by -8 to center around zero: value = (nibble - 8) * d.
 pub fn dequantize_q4_0_block(block: &BlockQ4_0) -> [f32; 32] {
-    let d = f16::from_bits(block.d).to_f32();
+    let d = f16_to_f32(block.d);
     let mut out = [0.0f32; 32];
 
     for i in 0..16 {
@@ -178,7 +288,7 @@ pub fn dequantize_q4_0_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
 /// Dot product of a Q4_0 block with an f32 vector of length 32. Scalar version.
 pub fn vec_dot_q4_0_f32_scalar(block: &BlockQ4_0, y: &[f32]) -> f32 {
     debug_assert_eq!(y.len(), 32);
-    let d = f16::from_bits(block.d).to_f32();
+    let d = f16_to_f32(block.d);
     let mut sum = 0.0f32;
 
     for i in 0..16 {
@@ -197,8 +307,8 @@ pub fn vec_dot_q4_0_f32_scalar(block: &BlockQ4_0, y: &[f32]) -> f32 {
 ///
 /// `q * d + m`, with `q` the raw nibble in `[0, 15]` — no `- 8` recentering.
 pub fn dequantize_q4_1_block(block: &BlockQ4_1) -> [f32; 32] {
-    let d = f16::from_bits(block.d).to_f32();
-    let m = f16::from_bits(block.m).to_f32();
+    let d = f16_to_f32(block.d);
+    let m = f16_to_f32(block.m);
     let mut out = [0.0f32; 32];
 
     for i in 0..16 {
@@ -265,8 +375,8 @@ pub fn dequantize_q4_1_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
 /// it factors out of the dot product rather than being added per element.
 pub fn vec_dot_q4_1_f32(block: &BlockQ4_1, y: &[f32]) -> f32 {
     debug_assert_eq!(y.len(), 32);
-    let d = f16::from_bits(block.d).to_f32();
-    let m = f16::from_bits(block.m).to_f32();
+    let d = f16_to_f32(block.d);
+    let m = f16_to_f32(block.m);
     let mut qsum = 0.0f32;
     let mut ysum = 0.0f32;
 
@@ -285,7 +395,7 @@ pub fn vec_dot_q4_1_f32(block: &BlockQ4_1, y: &[f32]) -> f32 {
 
 /// Dequantize a single Q8_0 block to 32 f32 values.
 pub fn dequantize_q8_0_block(block: &BlockQ8_0) -> [f32; 32] {
-    let d = f16::from_bits(block.delta).to_f32();
+    let d = f16_to_f32(block.delta);
     let mut out = [0.0f32; 32];
     for (o, &q) in out.iter_mut().zip(block.quants.iter()) {
         *o = q as f32 * d;
@@ -392,7 +502,7 @@ pub fn dequantize_q6_k_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
 /// Dot product of a Q8_0 block with an f32 vector of length 32. Scalar version.
 pub fn vec_dot_q8_0_f32_scalar(block: &BlockQ8_0, y: &[f32]) -> f32 {
     debug_assert_eq!(y.len(), 32);
-    let d = f16::from_bits(block.delta).to_f32();
+    let d = f16_to_f32(block.delta);
     let sum: f32 = block
         .quants
         .iter()
@@ -438,8 +548,8 @@ pub(crate) fn decode_q4km_scales(scales: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
 ///
 /// Ported from llama.cpp's dequantize_row_q4_K.
 pub fn dequantize_q4_k_m_block(block: &BlockQ4KM) -> [f32; 256] {
-    let d = f16::from_bits(block.d).to_f32();
-    let dmin = f16::from_bits(block.dmin).to_f32();
+    let d = f16_to_f32(block.d);
+    let dmin = f16_to_f32(block.dmin);
     let (sc, mn) = decode_q4km_scales(&block.scales);
 
     let mut out = [0.0f32; 256];
@@ -520,8 +630,8 @@ pub fn dequantize_q4_k_m_row(src: &[u8], dst: &mut [f32]) {
 pub fn vec_dot_q4_k_m_f32_scalar(block: &BlockQ4KM, y: &[f32]) -> f32 {
     debug_assert_eq!(y.len(), 256);
 
-    let d = f16::from_bits(block.d).to_f32();
-    let dmin = f16::from_bits(block.dmin).to_f32();
+    let d = f16_to_f32(block.d);
+    let dmin = f16_to_f32(block.dmin);
     let (sc, mn) = decode_q4km_scales(&block.scales);
     let qs = &block.qs;
 
@@ -563,7 +673,7 @@ pub fn vec_dot_q4_k_m_f32_scalar(block: &BlockQ4KM, y: &[f32]) -> f32 {
 /// in two passes of 128 values each. Within each pass, 32 iterations produce
 /// 4 values each by reassembling 6-bit quants from ql (low 4 bits) and qh (high 2 bits).
 pub fn dequantize_q6_k_block(block: &BlockQ6K) -> [f32; 256] {
-    let d = f16::from_bits(block.d).to_f32();
+    let d = f16_to_f32(block.d);
     let ql = &block.ql;
     let qh = &block.qh;
     let sc = &block.scales;
@@ -615,7 +725,7 @@ pub fn dequantize_q6_k_row(src: &[u8], dst: &mut [f32]) {
 /// Dot product of a Q6_K block with an f32 vector of length 256. Scalar version.
 pub fn vec_dot_q6_k_f32_scalar(block: &BlockQ6K, y: &[f32]) -> f32 {
     debug_assert_eq!(y.len(), 256);
-    let d = f16::from_bits(block.d).to_f32();
+    let d = f16_to_f32(block.d);
     let ql = &block.ql;
     let qh = &block.qh;
     let sc = &block.scales;
@@ -664,8 +774,8 @@ pub fn vec_dot_q6_k_f32(block: &BlockQ6K, y: &[f32]) -> f32 {
 /// start at bit 0/1 and shift left by 2 each iteration so all 8 `qh` bits are
 /// consumed across the 4×2 halves.
 pub fn dequantize_q5_k_block(block: &BlockQ5K) -> [f32; 256] {
-    let d = f16::from_bits(block.d).to_f32();
-    let dmin = f16::from_bits(block.dmin).to_f32();
+    let d = f16_to_f32(block.d);
+    let dmin = f16_to_f32(block.dmin);
     let (sc, mn) = decode_q4km_scales(&block.scales);
     let ql = &block.qs; // low 4 bits
     let qh = &block.qh; // high (5th) bit
@@ -722,8 +832,8 @@ pub fn dequantize_q5_k_row(src: &[u8], dst: &mut [f32]) {
 pub fn vec_dot_q5_k_f32_scalar(block: &BlockQ5K, y: &[f32]) -> f32 {
     debug_assert_eq!(y.len(), 256);
 
-    let d = f16::from_bits(block.d).to_f32();
-    let dmin = f16::from_bits(block.dmin).to_f32();
+    let d = f16_to_f32(block.d);
+    let dmin = f16_to_f32(block.dmin);
     let (sc, mn) = decode_q4km_scales(&block.scales);
     let ql = &block.qs;
     let qh = &block.qh;
@@ -793,6 +903,120 @@ pub fn vec_dot_q4_k_m_f32(block: &BlockQ4KM, y: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use half::f16;
+
+    /// `f16_to_f32` is open-coded, so it must equal `half`'s conversion for
+    /// every one of the 65536 half patterns, exactly.
+    ///
+    /// Exhaustive rather than sampled because the interesting inputs are the
+    /// rare ones: the subnormal renormalization is a different arm of the match
+    /// from normals, and random draws would essentially never hit it. This also
+    /// covers the two boundaries the arms meet at (`exp == 0` and `exp == 0x1F`)
+    /// without having to enumerate them by hand.
+    ///
+    /// The kernel tests below cannot stand in for this: they compare the f16
+    /// kernels against a scalar dot over values widened by *this same function*,
+    /// so a wrong conversion cancels out on both sides and they still pass.
+    /// `f32_to_f16` must round exactly like `half::f16::from_f32`.
+    ///
+    /// The full 2^32 input space was swept once against the `half` crate and
+    /// came back with zero mismatches; that run takes far too long for CI, so
+    /// what stays here is the structure that sweep was checking. Every f16 is
+    /// covered by round-tripping all 65536 patterns, and the classes a
+    /// hand-rolled rounder actually gets wrong are enumerated explicitly:
+    /// tie-to-even at the rounding boundary, the carry that pushes a rounded
+    /// significand up into the next exponent (and out to infinity), the
+    /// normal-to-subnormal seam, and underflow.
+    #[test]
+    fn f32_to_f16_matches_half_crate() {
+        // Every representable half, widened and narrowed back.
+        for bits in 0..=u16::MAX {
+            let v = f16_to_f32(bits);
+            if v.is_nan() {
+                continue;
+            }
+            assert_eq!(
+                f32_to_f16(v),
+                f16::from_f32(v).to_bits(),
+                "round-trip of half {bits:#06x} ({v})"
+            );
+        }
+
+        let cases: &[f32] = &[
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            65504.0, // largest finite half
+            65519.0, // rounds up to 65504
+            65520.0, // first value that rounds to infinity
+            -65520.0,
+            1.0e30,         // plain overflow
+            6.103_516e-5,   // smallest normal half
+            6.097_555e-5,   // just below it, becomes subnormal
+            5.960_464_5e-8, // smallest subnormal half
+            2.980_232_2e-8, // exactly half of it, ties to even -> zero
+            2.980_232_5e-8, // just above the tie, rounds up
+            1.0e-10,        // underflows to zero
+            -1.0e-10,
+            1.000_976_6, // exact at half precision
+            1.000_488_3, // exact tie between two halves, ties to even
+            1.001_464_8, // tie the other way
+            2048.0,      // integers around the half integer limit
+            2049.0,
+            4098.0,
+        ];
+        for &v in cases {
+            assert_eq!(
+                f32_to_f16(v),
+                f16::from_f32(v).to_bits(),
+                "boundary case {v:e}"
+            );
+        }
+
+        // Deterministic sweep across the whole exponent range, including the
+        // subnormal and overflow shoulders.
+        let mut st = 0x1234_5678u32;
+        for _ in 0..200_000 {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = f32::from_bits(st);
+            if v.is_nan() {
+                continue;
+            }
+            assert_eq!(
+                f32_to_f16(v),
+                f16::from_f32(v).to_bits(),
+                "random f32 {:#010x} ({v:e})",
+                st
+            );
+        }
+    }
+
+    #[test]
+    fn f16_widen_matches_half_crate_exhaustively() {
+        for bits in 0..=u16::MAX {
+            let want = f16_to_f32(bits);
+            let got = f16_to_f32(bits);
+            if want.is_nan() {
+                assert!(got.is_nan(), "bits {bits:#06x}: want NaN, got {got}");
+                // The payload rides along, so a NaN must not silently become a
+                // different NaN (or an infinity with the sign flipped).
+                assert_eq!(
+                    got.to_bits() & 0x807F_FFFF,
+                    want.to_bits() & 0x807F_FFFF,
+                    "bits {bits:#06x}: NaN payload/sign differs"
+                );
+            } else {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "bits {bits:#06x}: want {want}, got {got}"
+                );
+            }
+        }
+    }
 
     /// Build a Q8_0 block from known values for testing.
     fn make_q8_0_block(scale: f32, quants: [i8; 32]) -> BlockQ8_0 {

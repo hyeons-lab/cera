@@ -2112,7 +2112,7 @@ mod tests {
                 for b in 0..(k / 32) {
                     let block_off = (row * (k / 32) + b) * 18;
                     let d_bits = u16::from_le_bytes([q4_bytes[block_off], q4_bytes[block_off + 1]]);
-                    let delta = half::f16::from_bits(d_bits).to_f32();
+                    let delta = crate::quant::f16_to_f32(d_bits);
                     for qi in 0..16 {
                         let byte = q4_bytes[block_off + 2 + qi];
                         let lo = (byte & 0xF) as f32 - 8.0;
@@ -3250,7 +3250,7 @@ mod tests {
             for b in 0..nb as usize {
                 let block_off = (row * nb as usize + b) * 18;
                 let d_bits = u16::from_le_bytes([q4_bytes[block_off], q4_bytes[block_off + 1]]);
-                let delta = half::f16::from_bits(d_bits).to_f32();
+                let delta = crate::quant::f16_to_f32(d_bits);
                 for qi in 0..16 {
                     let byte = q4_bytes[block_off + 2 + qi];
                     let lo = (byte & 0xF) as f32 - 8.0;
@@ -3932,7 +3932,7 @@ mod tests {
                 for b in 0..nb as usize {
                     let block_off = (row * nb as usize + b) * 34;
                     let d_bits = u16::from_le_bytes([q8_bytes[block_off], q8_bytes[block_off + 1]]);
-                    let d = half::f16::from_bits(d_bits).to_f32();
+                    let d = crate::quant::f16_to_f32(d_bits);
                     for qi in 0..32 {
                         let quant = q8_bytes[block_off + 2 + qi] as i8;
                         acc += f32::from(quant) * d * x_slice[b * 32 + qi];

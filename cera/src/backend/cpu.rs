@@ -230,6 +230,7 @@ pub fn configure_thread_pool() -> usize {
     1
 }
 
+use crate::quant::f16_to_f32;
 use crate::quant::{
     BlockQ4_0, BlockQ4_1, BlockQ4KM, BlockQ5K, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q4_1_f32,
     vec_dot_q4_k_m_f32, vec_dot_q5_k_f32, vec_dot_q8_0_f32,
@@ -893,7 +894,7 @@ pub(crate) fn quantize_f32_to_q8_0_scalar(x: &[f32], scales: &mut [f32], quants:
             r if d != 0.0 && r.is_finite() => r,
             _ => 0.0,
         };
-        scales[bi] = half::f16::from_f32(d).to_f32();
+        scales[bi] = crate::quant::f16_to_f32(crate::quant::f32_to_f16(d));
         for (t, &v) in blk.iter().enumerate() {
             quants[bi * 32 + t] = (v * id).round_ties_even().clamp(-128.0, 127.0) as i8;
         }
@@ -3185,54 +3186,6 @@ unsafe fn attn_values_avx2(
 }
 
 // ── f16 KV attention (widen-on-read) ────────────────────────────────────────
-
-/// Convert one IEEE-754 half (raw bits) to f32. Accumulation downstream stays
-/// f32 for softmax stability.
-///
-/// Open-coded rather than `half::f16::to_f32`, which is a trap in a loop: its
-/// aarch64 path runs `is_aarch64_feature_detected!("fp16")` per call and lowers
-/// to two out-of-line `bl`s (`detect_and_initialize`, then `f16_to_f32_fp16`).
-/// Neither inlines, so every call clobbers the caller-saved registers and spills
-/// whatever the caller had live. The disassembly of `attn_scores_f16` showed
-/// exactly that, and this function is called from the *tail* loops of the NEON
-/// kernels, not only from the scalar fallback. An earlier revision of this doc
-/// claimed the wrapper "lowers to a single `fcvt`"; it does not, and that claim
-/// went unchecked.
-///
-/// Integer-only on purpose. The well-known branchless form multiplies by
-/// `2^112` to renormalize subnormals, which makes the result depend on
-/// `FPCR.FZ`: under flush-to-zero every subnormal half would widen to the wrong
-/// value. This version cannot be perturbed by the floating-point environment.
-/// The branches are cheap because normals dominate overwhelmingly, and
-/// `f16_widen_matches_half_crate_exhaustively` pins all 65536 patterns against
-/// the `half` crate.
-#[inline(always)]
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = (u32::from(bits) & 0x8000) << 16;
-    let exp = (u32::from(bits) >> 10) & 0x1F;
-    let mant = u32::from(bits) & 0x03FF;
-    let rest = match exp {
-        // Zero, or a subnormal that has to be renormalized into a normal f32.
-        0 if mant == 0 => 0,
-        0 => {
-            // `mant` is 1..=0x3FF, so `leading_zeros` is 22..=31 and `shift`
-            // lands in 1..=10; neither the subtraction nor the shifts below can
-            // go out of range.
-            let shift = mant.leading_zeros() - 21;
-            ((113 - shift) << 23) | ((mant << (shift + 13)) & 0x007F_FFFF)
-        }
-        0x1F if mant == 0 => 0x7F80_0000,
-        // NaN. The payload is carried across, and the quiet bit is *set*, not
-        // copied: IEEE 754 says widening a signaling NaN quiets it, which is
-        // what both `half` and the hardware `fcvtl` in the NEON path do. An
-        // earlier draft of this shifted the payload verbatim and disagreed with
-        // both on every sNaN (0x7c01 widened to 0x7f802000, not 0x7fc02000).
-        0x1F => 0x7FC0_0000 | (mant << 13),
-        // Normal: rebias 15 -> 127 and left-align the 10-bit significand.
-        _ => ((exp + 112) << 23) | (mant << 13),
-    };
-    f32::from_bits(sign | rest)
-}
 
 /// f16 variant of [`attn_scores`]: `k_cache` holds IEEE-754 half bits (2
 /// bytes/elem, half the memory traffic of the f32 path), widened to f32 on
@@ -6484,42 +6437,6 @@ mod tests {
         let mut scores = vec![];
         attn_scores(&[0.0; 64], &[], &mut scores, 64, 0, 64, 0.125, 0);
         assert!(scores.is_empty());
-    }
-
-    /// `f16_to_f32` is open-coded, so it must equal `half`'s conversion for
-    /// every one of the 65536 half patterns, exactly.
-    ///
-    /// Exhaustive rather than sampled because the interesting inputs are the
-    /// rare ones: the subnormal renormalization is a different arm of the match
-    /// from normals, and random draws would essentially never hit it. This also
-    /// covers the two boundaries the arms meet at (`exp == 0` and `exp == 0x1F`)
-    /// without having to enumerate them by hand.
-    ///
-    /// The kernel tests below cannot stand in for this: they compare the f16
-    /// kernels against a scalar dot over values widened by *this same function*,
-    /// so a wrong conversion cancels out on both sides and they still pass.
-    #[test]
-    fn f16_widen_matches_half_crate_exhaustively() {
-        for bits in 0..=u16::MAX {
-            let want = half::f16::from_bits(bits).to_f32();
-            let got = f16_to_f32(bits);
-            if want.is_nan() {
-                assert!(got.is_nan(), "bits {bits:#06x}: want NaN, got {got}");
-                // The payload rides along, so a NaN must not silently become a
-                // different NaN (or an infinity with the sign flipped).
-                assert_eq!(
-                    got.to_bits() & 0x807F_FFFF,
-                    want.to_bits() & 0x807F_FFFF,
-                    "bits {bits:#06x}: NaN payload/sign differs"
-                );
-            } else {
-                assert_eq!(
-                    got.to_bits(),
-                    want.to_bits(),
-                    "bits {bits:#06x}: want {want}, got {got}"
-                );
-            }
-        }
     }
 
     /// The f16 attention kernels must match a scalar dot over the *same*

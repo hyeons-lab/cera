@@ -6,7 +6,6 @@
 //!
 //! All operations are data-oblivious (no calibration needed).
 
-use half::f16;
 use std::f32::consts::PI;
 
 use crate::CeraError;
@@ -443,8 +442,8 @@ impl CompressedKeyCache {
         self.jl_data[kv_head].extend_from_slice(jl_packed);
         self.norms[kv_head].push(norm);
         self.residual_norms[kv_head].push(residual_norm);
-        self.norms_f32[kv_head].push(f16::from_bits(norm).to_f32());
-        self.residual_norms_f32[kv_head].push(f16::from_bits(residual_norm).to_f32());
+        self.norms_f32[kv_head].push(crate::quant::f16_to_f32(norm));
+        self.residual_norms_f32[kv_head].push(crate::quant::f16_to_f32(residual_norm));
     }
 
     /// Bytes of packed PolarQuant data per key vector.
@@ -511,7 +510,7 @@ impl CompressedValueCache {
     pub fn append(&mut self, kv_head: usize, polar_packed: &[u8], norm: u16) {
         self.polar_data[kv_head].extend_from_slice(polar_packed);
         self.norms[kv_head].push(norm);
-        self.norms_f32[kv_head].push(f16::from_bits(norm).to_f32());
+        self.norms_f32[kv_head].push(crate::quant::f16_to_f32(norm));
     }
 
     /// Bytes of packed PolarQuant data per value vector.
@@ -583,8 +582,8 @@ pub fn compress_and_append_keys(
                 h,
                 &scratch.polar_packed[..polar_bytes],
                 &scratch.jl_packed[..jl_bytes],
-                f16::from_f32(0.0).to_bits(),
-                f16::from_f32(0.0).to_bits(),
+                crate::quant::f32_to_f16(0.0),
+                crate::quant::f32_to_f16(0.0),
             );
             continue;
         }
@@ -641,8 +640,8 @@ pub fn compress_and_append_keys(
             h,
             &scratch.polar_packed[..polar_bytes],
             &scratch.jl_packed[..jl_bytes],
-            f16::from_f32(norm).to_bits(),
-            f16::from_f32(residual_norm).to_bits(),
+            crate::quant::f32_to_f16(norm),
+            crate::quant::f32_to_f16(residual_norm),
         );
     }
 }
@@ -676,7 +675,7 @@ pub fn compress_and_append_values(
             cache.append(
                 h,
                 &scratch.polar_packed[..polar_bytes],
-                f16::from_f32(0.0).to_bits(),
+                crate::quant::f32_to_f16(0.0),
             );
             continue;
         }
@@ -706,7 +705,7 @@ pub fn compress_and_append_values(
         cache.append(
             h,
             &scratch.polar_packed[..polar_bytes],
-            f16::from_f32(norm).to_bits(),
+            crate::quant::f32_to_f16(norm),
         );
     }
 }
@@ -732,8 +731,8 @@ pub fn dequantize_key(
     let head_dim = rotation.head_dim;
     debug_assert_eq!(out.len(), head_dim);
 
-    let norm = f16::from_bits(norm_bits).to_f32();
-    let residual_norm = f16::from_bits(residual_norm_bits).to_f32();
+    let norm = crate::quant::f16_to_f32(norm_bits);
+    let residual_norm = crate::quant::f16_to_f32(residual_norm_bits);
 
     // Reconstruct PolarQuant in rotated space
     let mut indices = vec![0u8; head_dim];
@@ -1230,11 +1229,11 @@ pub fn decode_compressed_keys(buf: &[u8]) -> Option<CompressedKeyCache> {
     }
     let norms_f32: Vec<Vec<f32>> = norms
         .iter()
-        .map(|h| h.iter().map(|&u| f16::from_bits(u).to_f32()).collect())
+        .map(|h| h.iter().map(|&u| crate::quant::f16_to_f32(u)).collect())
         .collect();
     let residual_norms_f32: Vec<Vec<f32>> = residual_norms
         .iter()
-        .map(|h| h.iter().map(|&u| f16::from_bits(u).to_f32()).collect())
+        .map(|h| h.iter().map(|&u| crate::quant::f16_to_f32(u)).collect())
         .collect();
     Some(CompressedKeyCache {
         polar_data,
@@ -1317,7 +1316,7 @@ pub fn decode_compressed_values(buf: &[u8]) -> Option<CompressedValueCache> {
     }
     let norms_f32: Vec<Vec<f32>> = norms
         .iter()
-        .map(|h| h.iter().map(|&u| f16::from_bits(u).to_f32()).collect())
+        .map(|h| h.iter().map(|&u| crate::quant::f16_to_f32(u)).collect())
         .collect();
     Some(CompressedValueCache {
         polar_data,
@@ -1532,7 +1531,7 @@ mod tests {
     /// reproduce the per-head packed bytes + the f16-bit norms.
     /// The f32 caches are derived on decode and must match within
     /// the f16→f32 conversion (exact, since the source values
-    /// already came from `f16::from_bits().to_f32()`).
+    /// already came from `crate::quant::f16_to_f32()`).
     #[test]
     fn encode_decode_compressed_keys_roundtrip() {
         let mut cache = CompressedKeyCache::new(3, 16, 8);
@@ -2083,7 +2082,7 @@ mod tests {
             &mut scratch,
         );
 
-        assert_eq!(f16::from_bits(cache.norms[0][0]).to_f32(), 0.0);
+        assert_eq!(crate::quant::f16_to_f32(cache.norms[0][0]), 0.0);
         assert!(cache.polar_data[0].iter().all(|&b| b == 0));
 
         let scores = vec![0.7f32; 1];

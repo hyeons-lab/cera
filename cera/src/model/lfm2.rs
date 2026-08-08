@@ -757,7 +757,7 @@ impl Lfm2Model {
                     key_cache_f16.extend(
                         state.scratch.k[..kv_dim]
                             .iter()
-                            .map(|&x| half::f16::from_f32(x).to_bits()),
+                            .map(|&x| crate::quant::f32_to_f16(x)),
                     );
                 }
                 _ => {
@@ -780,7 +780,7 @@ impl Lfm2Model {
                     value_cache_f16.extend(
                         state.scratch.v[..kv_dim]
                             .iter()
-                            .map(|&x| half::f16::from_f32(x).to_bits()),
+                            .map(|&x| crate::quant::f32_to_f16(x)),
                     );
                 }
                 _ => {
@@ -1676,7 +1676,7 @@ impl Lfm2Model {
                                         key_cache_f16.extend(
                                             state.scratch.k[..kv_dim]
                                                 .iter()
-                                                .map(|&x| half::f16::from_f32(x).to_bits()),
+                                                .map(|&x| crate::quant::f32_to_f16(x)),
                                         );
                                     }
                                     _ => {
@@ -1699,7 +1699,7 @@ impl Lfm2Model {
                                         value_cache_f16.extend(
                                             state.scratch.v[..kv_dim]
                                                 .iter()
-                                                .map(|&x| half::f16::from_f32(x).to_bits()),
+                                                .map(|&x| crate::quant::f32_to_f16(x)),
                                         );
                                     }
                                     _ => {
@@ -1746,16 +1746,11 @@ impl Lfm2Model {
                             } = &state.layers[layer]
                         {
                             kv_widen_k.clear();
-                            kv_widen_k.extend(
-                                key_cache_f16
-                                    .iter()
-                                    .map(|&b| half::f16::from_bits(b).to_f32()),
-                            );
+                            kv_widen_k
+                                .extend(key_cache_f16.iter().map(|&b| crate::quant::f16_to_f32(b)));
                             kv_widen_v.clear();
                             kv_widen_v.extend(
-                                value_cache_f16
-                                    .iter()
-                                    .map(|&b| half::f16::from_bits(b).to_f32()),
+                                value_cache_f16.iter().map(|&b| crate::quant::f16_to_f32(b)),
                             );
                         }
 

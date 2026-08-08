@@ -695,7 +695,7 @@ impl SafeTensors {
                     .as_chunks::<2>()
                     .0
                     .iter()
-                    .map(|c| half::f16::from_le_bytes(*c).to_f32())
+                    .map(|c| crate::quant::f16_to_f32(u16::from_le_bytes(*c)))
                     .collect())
             }
             "BF16" => {

@@ -9,16 +9,6 @@
 use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ8_0};
 #[cfg(target_arch = "aarch64")]
 use crate::quant::{BlockQ4_1, BlockQ6K};
-// `half::f16` is consumed by the NEON / AVX2 kernels below and by the
-// `#[cfg(test)] mod tests` further down (the tests aren't arch-gated and
-// use `f16::from_f32` to seed quantized blocks). Including `test` in the
-// gate keeps `cargo test` compilable on architectures that don't have a
-// SIMD kernel here (e.g. armv7, riscv64) — without it those archs build
-// the tests but lose the import. On non-test wasm32 builds the import
-// remains correctly elided.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", test))]
-use half::f16;
-
 /// Tier-test gate shared by every SIMD test module in this file.
 ///
 /// Returns true when the test should run. A host without `feature` skips
@@ -140,7 +130,7 @@ pub(crate) mod neon {
     pub unsafe fn vec_dot_q8_0_f32_neon(block: &BlockQ8_0, y: &[f32]) -> f32 {
         unsafe {
             debug_assert_eq!(y.len(), 32);
-            let d = f16::from_bits(block.delta).to_f32();
+            let d = crate::quant::f16_to_f32(block.delta);
 
             let mut sumv = vdupq_n_f32(0.0);
             let quants_ptr = block.quants.as_ptr();
@@ -176,7 +166,7 @@ pub(crate) mod neon {
     pub unsafe fn vec_dot_q4_0_f32_neon(block: &BlockQ4_0, y: &[f32]) -> f32 {
         unsafe {
             debug_assert_eq!(y.len(), 32);
-            let d = f16::from_bits(block.d).to_f32();
+            let d = crate::quant::f16_to_f32(block.d);
             let offset = vdupq_n_f32(8.0);
             let mask_lo = vdup_n_u8(0x0F);
 
@@ -221,8 +211,8 @@ pub(crate) mod neon {
     #[target_feature(enable = "neon")]
     pub unsafe fn vec_dot_q4_k_m_f32_neon(block: &BlockQ4KM, y: &[f32]) -> f32 {
         unsafe {
-            let d = f16::from_bits(block.d).to_f32();
-            let dmin = f16::from_bits(block.dmin).to_f32();
+            let d = crate::quant::f16_to_f32(block.d);
+            let dmin = crate::quant::f16_to_f32(block.dmin);
 
             let scales = &block.scales;
             let mut sc = [0u8; 8];
@@ -342,7 +332,7 @@ pub(crate) mod neon {
 
                 let d = amax / 127.0;
                 let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-                let d_stored = f16::from_f32(d).to_f32();
+                let d_stored = crate::quant::f16_to_f32(crate::quant::f32_to_f16(d));
                 scales[bi] = d_stored;
 
                 // Quantize 32 f32 → 32 i8 using NEON vector narrowing.
@@ -432,8 +422,8 @@ pub(crate) mod neon {
                     let p_0 = vdotq_s32(vdotq_s32(z, v0_lo, y0_lo), v0_hi, y0_hi);
                     let p_1 = vdotq_s32(vdotq_s32(z, v1_lo, y1_lo), v1_hi, y1_hi);
 
-                    let d0 = f16::from_bits(b0.d).to_f32() * *ptrs.xs().add(bi);
-                    let d1 = f16::from_bits(b1.d).to_f32() * *ptrs.xs().add(bi + 1);
+                    let d0 = crate::quant::f16_to_f32(b0.d) * *ptrs.xs().add(bi);
+                    let d1 = crate::quant::f16_to_f32(b1.d) * *ptrs.xs().add(bi + 1);
                     sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p_0), d0);
                     sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_1), d1);
                     bi += 2;
@@ -449,7 +439,7 @@ pub(crate) mod neon {
                     let y_hi = vld1q_s8(ptrs.xq().add(bi * 32 + 16));
                     let z = vdupq_n_s32(0);
                     let p = vdotq_s32(vdotq_s32(z, v_lo, y_lo), v_hi, y_hi);
-                    let d = f16::from_bits(b.d).to_f32() * *ptrs.xs().add(bi);
+                    let d = crate::quant::f16_to_f32(b.d) * *ptrs.xs().add(bi);
                     sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p), d);
                 }
 
@@ -542,8 +532,8 @@ pub(crate) mod neon {
                     let p_1 = vdotq_s32(vdotq_s32(z, w1_lo, x1_lo), w1_hi, x1_hi);
 
                     // Scale: d_weight × d_input
-                    let d0 = f16::from_bits(wb0.delta).to_f32() * *ptrs.xs().add(bi);
-                    let d1 = f16::from_bits(wb1.delta).to_f32() * *ptrs.xs().add(bi + 1);
+                    let d0 = crate::quant::f16_to_f32(wb0.delta) * *ptrs.xs().add(bi);
+                    let d1 = crate::quant::f16_to_f32(wb1.delta) * *ptrs.xs().add(bi + 1);
                     sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p_0), d0);
                     sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_1), d1);
                     bi += 2;
@@ -558,7 +548,7 @@ pub(crate) mod neon {
                     let x_hi = vld1q_s8(ptrs.xq().add(bi * 32 + 16));
                     let z = vdupq_n_s32(0);
                     let p = vdotq_s32(vdotq_s32(z, w_lo, x_lo), w_hi, x_hi);
-                    let d = f16::from_bits(wb.delta).to_f32() * *ptrs.xs().add(bi);
+                    let d = crate::quant::f16_to_f32(wb.delta) * *ptrs.xs().add(bi);
                     sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p), d);
                 }
 
@@ -625,7 +615,7 @@ pub(crate) mod neon {
                 for bi in 0..blocks_per_row {
                     let blk =
                         &*((a_base + row_start + bi * size_of::<BlockQ6K>()) as *const BlockQ6K);
-                    let d = f16::from_bits(blk.d).to_f32();
+                    let d = crate::quant::f16_to_f32(blk.d);
                     let ql = blk.ql.as_ptr();
                     let qh = blk.qh.as_ptr();
                     let sc = blk.scales.as_ptr();
@@ -790,8 +780,8 @@ pub(crate) mod neon {
                 for bi in 0..blocks_per_row {
                     let blk =
                         &*((a_base + row_start + bi * size_of::<BlockQ4KM>()) as *const BlockQ4KM);
-                    let d = f16::from_bits(blk.d).to_f32();
-                    let dmin = f16::from_bits(blk.dmin).to_f32();
+                    let d = crate::quant::f16_to_f32(blk.d);
+                    let dmin = crate::quant::f16_to_f32(blk.dmin);
 
                     // Decode the 8 sub-block 6-bit scales and mins (shared with
                     // the scalar/f32 paths, so the packing can't drift).
@@ -944,8 +934,8 @@ pub(crate) mod neon {
                     for bi in 0..sb {
                         let blk = &*((a as usize + row_start + bi * size_of::<BlockQ4KM>())
                             as *const BlockQ4KM);
-                        let d = half::f16::from_bits(blk.d).to_f32();
-                        let dmin = half::f16::from_bits(blk.dmin).to_f32();
+                        let d = crate::quant::f16_to_f32(blk.d);
+                        let dmin = crate::quant::f16_to_f32(blk.dmin);
                         let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
                         let qs = blk.qs.as_ptr();
 
@@ -1061,8 +1051,8 @@ pub(crate) mod neon {
                     for bi in 0..nb {
                         let blk = &*((a as usize + row_start + bi * size_of::<BlockQ4_1>())
                             as *const BlockQ4_1);
-                        let d = half::f16::from_bits(blk.d).to_f32();
-                        let mmin = half::f16::from_bits(blk.m).to_f32();
+                        let d = crate::quant::f16_to_f32(blk.d);
+                        let mmin = crate::quant::f16_to_f32(blk.m);
                         // Low nibbles → element indices 0..16, high nibbles → 16..32;
                         // the nibble *values* are all in `[0, 15]`, so they are
                         // non-negative as `i8`.
@@ -1155,7 +1145,7 @@ pub(crate) mod neon {
                     for bi in 0..sb {
                         let blk = &*((a as usize + row_start + bi * size_of::<BlockQ6K>())
                             as *const BlockQ6K);
-                        let d = half::f16::from_bits(blk.d).to_f32();
+                        let d = crate::quant::f16_to_f32(blk.d);
                         let sc = blk.scales;
                         let ql = blk.ql.as_ptr();
                         let qh = blk.qh.as_ptr();
@@ -1275,7 +1265,7 @@ pub(crate) mod neon {
                     .add(i * row_bytes + bi * size_of::<BlockQ6K>())
                     as *const BlockQ6K)
             };
-            let d = half::f16::from_bits(blk.d).to_f32();
+            let d = crate::quant::f16_to_f32(blk.d);
             let sc = blk.scales;
             for nh in 0..2 {
                 for h in 0..2 {
@@ -1603,8 +1593,8 @@ pub(crate) mod neon {
                         vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v0)), $offset_8),
                         vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v1, $mask_lo)), $offset_8),
                         vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v1)), $offset_8),
-                        f16::from_bits(b0.d).to_f32(),
-                        f16::from_bits(b1.d).to_f32(),
+                        crate::quant::f16_to_f32(b0.d),
+                        crate::quant::f16_to_f32(b1.d),
                     )
                 }};
             }
@@ -1615,7 +1605,7 @@ pub(crate) mod neon {
                     (
                         vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, $mask_lo)), $offset_8),
                         vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v)), $offset_8),
-                        f16::from_bits(b.d).to_f32(),
+                        crate::quant::f16_to_f32(b.d),
                     )
                 }};
             }
@@ -1842,8 +1832,8 @@ pub(crate) mod neon {
                         vld1q_s8(b0.quants.as_ptr().add(16)),
                         vld1q_s8(b1.quants.as_ptr()),
                         vld1q_s8(b1.quants.as_ptr().add(16)),
-                        f16::from_bits(b0.delta).to_f32(),
-                        f16::from_bits(b1.delta).to_f32(),
+                        crate::quant::f16_to_f32(b0.delta),
+                        crate::quant::f16_to_f32(b1.delta),
                     )
                 }};
             }
@@ -1853,7 +1843,7 @@ pub(crate) mod neon {
                     (
                         vld1q_s8(b.quants.as_ptr()),
                         vld1q_s8(b.quants.as_ptr().add(16)),
-                        f16::from_bits(b.delta).to_f32(),
+                        crate::quant::f16_to_f32(b.delta),
                     )
                 }};
             }
@@ -2026,7 +2016,7 @@ pub(crate) mod neon {
                 let y_hi = vld1q_s8(x_quants.as_ptr().add(bi * 32 + 16));
                 let z = vdupq_n_s32(0);
                 let p = vdotq_s32_emu(vdotq_s32_emu(z, v_lo, y_lo), v_hi, y_hi);
-                let d = f16::from_bits(b.d).to_f32() * x_scales[bi];
+                let d = crate::quant::f16_to_f32(b.d) * x_scales[bi];
                 sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d);
             }
             *yi = vaddvq_f32(sumv);
@@ -2064,7 +2054,7 @@ pub(crate) mod neon {
                 let x_hi = vld1q_s8(x_quants.as_ptr().add(bi * 32 + 16));
                 let z = vdupq_n_s32(0);
                 let p = vdotq_s32_emu(vdotq_s32_emu(z, w_lo, x_lo), w_hi, x_hi);
-                let d = f16::from_bits(wb.delta).to_f32() * x_scales[bi];
+                let d = crate::quant::f16_to_f32(wb.delta) * x_scales[bi];
                 sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d);
             }
             *yi = vaddvq_f32(sumv);
@@ -2111,7 +2101,7 @@ pub(crate) mod neon {
                     let y_hi = vld1q_s8(b_quants.as_ptr().add(j * k + bi * 32 + 16));
                     let z = vdupq_n_s32(0);
                     let p = vdotq_s32_emu(vdotq_s32_emu(z, v_lo, y_lo), v_hi, y_hi);
-                    let d = f16::from_bits(b.d).to_f32() * b_scales[j * nb + bi];
+                    let d = crate::quant::f16_to_f32(b.d) * b_scales[j * nb + bi];
                     sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d);
                 }
                 row[j] = vaddvq_f32(sumv);
@@ -2156,7 +2146,7 @@ pub(crate) mod neon {
                     let y_hi = vld1q_s8(b_quants.as_ptr().add(j * k + bi * 32 + 16));
                     let z = vdupq_n_s32(0);
                     let p = vdotq_s32_emu(vdotq_s32_emu(z, w_lo, y_lo), w_hi, y_hi);
-                    let d = f16::from_bits(wb.delta).to_f32() * b_scales[j * nb + bi];
+                    let d = crate::quant::f16_to_f32(wb.delta) * b_scales[j * nb + bi];
                     sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p), d);
                 }
                 row[j] = vaddvq_f32(sumv);
@@ -2279,7 +2269,7 @@ pub(crate) mod neon {
                     .add(i * row_bytes + bi * size_of::<BlockQ8_0>())
                     as *const BlockQ8_0)
             };
-            let dw = f16::from_bits(wb.delta).to_f32();
+            let dw = crate::quant::f16_to_f32(wb.delta);
             let db = b_scales[j * nb + bi];
             let mut s = 0i32;
             for l in 0..32 {
@@ -2436,7 +2426,7 @@ pub(crate) mod neon {
                     .add(i * row_bytes + bi * size_of::<BlockQ4_0>())
                     as *const BlockQ4_0)
             };
-            let dw = f16::from_bits(wb.d).to_f32();
+            let dw = crate::quant::f16_to_f32(wb.d);
             let db = b_scales[j * nb + bi];
             let mut s = 0i32;
             for l in 0..16 {
@@ -2668,8 +2658,8 @@ pub(crate) mod neon {
                     .add(i * row_bytes + bi * size_of::<BlockQ4KM>())
                     as *const BlockQ4KM)
             };
-            let d = half::f16::from_bits(blk.d).to_f32();
-            let dmin = half::f16::from_bits(blk.dmin).to_f32();
+            let d = crate::quant::f16_to_f32(blk.d);
+            let dmin = crate::quant::f16_to_f32(blk.dmin);
             let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
             for s in 0..8 {
                 let g = s / 2;
@@ -3079,7 +3069,7 @@ pub(crate) mod neon {
                 return;
             }
             for bits in 0..=u16::MAX {
-                let want = half::f16::from_bits(bits).to_f32();
+                let want = crate::quant::f16_to_f32(bits);
                 let got = unsafe { f16_bits_to_f32(bits) };
                 if want.is_nan() {
                     assert!(got.is_nan(), "bits {bits:#06x}: want NaN, got {got}");
@@ -3107,7 +3097,7 @@ pub(crate) mod neon {
                         *b = (lcg(&mut st) * 127.0) as i32 as u8;
                     }
                     BlockQ4_0 {
-                        d: f16::from_f32(0.03 + lcg(&mut st).abs() * 0.1).to_bits(),
+                        d: crate::quant::f32_to_f16(0.03 + lcg(&mut st).abs() * 0.1),
                         qs,
                     }
                 })
@@ -3137,7 +3127,7 @@ pub(crate) mod neon {
                         *q = (lcg(&mut st) * 127.0) as i32 as i8;
                     }
                     BlockQ8_0 {
-                        delta: f16::from_f32(0.03 + lcg(&mut st).abs() * 0.1).to_bits(),
+                        delta: crate::quant::f32_to_f16(0.03 + lcg(&mut st).abs() * 0.1),
                         quants,
                     }
                 })
@@ -3178,7 +3168,7 @@ pub(crate) mod neon {
                         ql,
                         qh,
                         scales,
-                        d: f16::from_f32(0.02 + lcg(&mut st).abs() * 0.05).to_bits(),
+                        d: crate::quant::f32_to_f16(0.02 + lcg(&mut st).abs() * 0.05),
                     }
                 })
                 .collect();
@@ -3204,8 +3194,8 @@ pub(crate) mod neon {
                 *b = (lcg(st).abs() * 255.0) as i32 as u8;
             }
             BlockQ4KM {
-                d: f16::from_f32(0.02 + lcg(st).abs() * 0.05).to_bits(),
-                dmin: f16::from_f32(0.01 + lcg(st).abs() * 0.03).to_bits(),
+                d: crate::quant::f32_to_f16(0.02 + lcg(st).abs() * 0.05),
+                dmin: crate::quant::f32_to_f16(0.01 + lcg(st).abs() * 0.03),
                 scales,
                 qs,
             }
@@ -3299,8 +3289,8 @@ pub(crate) mod neon {
                         *b = (lcg(&mut st).abs() * 255.0) as i32 as u8;
                     }
                     BlockQ4_1 {
-                        d: f16::from_f32(0.03 + lcg(&mut st).abs() * 0.1).to_bits(),
-                        m: f16::from_f32(lcg(&mut st) * 0.5).to_bits(),
+                        d: crate::quant::f32_to_f16(0.03 + lcg(&mut st).abs() * 0.1),
+                        m: crate::quant::f32_to_f16(lcg(&mut st) * 0.5),
                         qs,
                     }
                 })
@@ -3431,7 +3421,7 @@ pub(crate) mod neon {
                 ql,
                 qh,
                 scales,
-                d: half::f16::from_f32(0.02 + lcg(st).abs() * 0.05).to_bits(),
+                d: crate::quant::f32_to_f16(0.02 + lcg(st).abs() * 0.05),
             }
         }
 
@@ -3703,7 +3693,7 @@ pub(crate) mod neon {
                         *b = (lcg(&mut st) * 127.0) as i32 as u8;
                     }
                     BlockQ4_0 {
-                        d: f16::from_f32(0.03 + lcg(&mut st).abs() * 0.1).to_bits(),
+                        d: crate::quant::f32_to_f16(0.03 + lcg(&mut st).abs() * 0.1),
                         qs,
                     }
                 })
@@ -3740,7 +3730,7 @@ pub(crate) mod neon {
                         *q = (lcg(&mut st) * 127.0) as i32 as i8;
                     }
                     BlockQ8_0 {
-                        delta: f16::from_f32(0.03 + lcg(&mut st).abs() * 0.1).to_bits(),
+                        delta: crate::quant::f32_to_f16(0.03 + lcg(&mut st).abs() * 0.1),
                         quants,
                     }
                 })
@@ -3781,7 +3771,7 @@ pub(crate) mod neon {
                             *q = (lcg(&mut st) * 127.0) as i32 as i8;
                         }
                         BlockQ8_0 {
-                            delta: f16::from_f32(0.03 + lcg(&mut st).abs() * 0.1).to_bits(),
+                            delta: crate::quant::f32_to_f16(0.03 + lcg(&mut st).abs() * 0.1),
                             quants,
                         }
                     })
@@ -3827,7 +3817,7 @@ pub(crate) mod neon {
                             *b = (lcg(&mut st) * 127.0) as i32 as u8;
                         }
                         BlockQ4_0 {
-                            d: f16::from_f32(0.03 + lcg(&mut st).abs() * 0.1).to_bits(),
+                            d: crate::quant::f32_to_f16(0.03 + lcg(&mut st).abs() * 0.1),
                             qs,
                         }
                     })
@@ -3950,7 +3940,7 @@ mod avx2 {
     pub unsafe fn vec_dot_q8_0_f32_avx2(block: &BlockQ8_0, y: &[f32]) -> f32 {
         unsafe {
             debug_assert_eq!(y.len(), 32);
-            let d = f16::from_bits(block.delta).to_f32();
+            let d = crate::quant::f16_to_f32(block.delta);
 
             let mut sum256 = _mm256_setzero_ps();
             let quants_ptr = block.quants.as_ptr();
@@ -3985,7 +3975,7 @@ mod avx2 {
     pub unsafe fn vec_dot_q4_0_f32_avx2(block: &BlockQ4_0, y: &[f32]) -> f32 {
         unsafe {
             debug_assert_eq!(y.len(), 32);
-            let d = f16::from_bits(block.d).to_f32();
+            let d = crate::quant::f16_to_f32(block.d);
             let offset = _mm256_set1_ps(8.0);
             let mask_lo = _mm_set1_epi8(0x0F);
 
@@ -4029,8 +4019,8 @@ mod avx2 {
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn vec_dot_q4_k_m_f32_avx2(block: &BlockQ4KM, y: &[f32]) -> f32 {
         unsafe {
-            let d = f16::from_bits(block.d).to_f32();
-            let dmin = f16::from_bits(block.dmin).to_f32();
+            let d = crate::quant::f16_to_f32(block.d);
+            let dmin = crate::quant::f16_to_f32(block.dmin);
 
             let scales = &block.scales;
             let mut sc = [0u8; 8];
@@ -4138,7 +4128,7 @@ pub(crate) mod avx512 {
     pub unsafe fn vec_dot_q8_0_f32_avx512(block: &BlockQ8_0, y: &[f32]) -> f32 {
         unsafe {
             debug_assert_eq!(y.len(), 32);
-            let d = f16::from_bits(block.delta).to_f32();
+            let d = crate::quant::f16_to_f32(block.delta);
             let quants_ptr = block.quants.as_ptr();
             let y_ptr = y.as_ptr();
             let mut acc = _mm512_setzero_ps();
@@ -4159,7 +4149,7 @@ pub(crate) mod avx512 {
     pub unsafe fn vec_dot_q4_0_f32_avx512(block: &BlockQ4_0, y: &[f32]) -> f32 {
         unsafe {
             debug_assert_eq!(y.len(), 32);
-            let d = f16::from_bits(block.d).to_f32();
+            let d = crate::quant::f16_to_f32(block.d);
             let offset = _mm512_set1_ps(8.0);
             let mask_lo = _mm_set1_epi8(0x0F);
             let y_ptr = y.as_ptr();
@@ -4219,7 +4209,7 @@ pub(crate) mod avx512 {
             let mut acc = _mm512_setzero_ps();
             for b in 0..nb {
                 let block = &*(row.add(b * bsz) as *const BlockQ4_0);
-                let d = _mm512_set1_ps(f16::from_bits(block.d).to_f32());
+                let d = _mm512_set1_ps(crate::quant::f16_to_f32(block.d));
                 let qbytes = _mm_loadu_si128(block.qs.as_ptr() as *const __m128i);
                 let lo = _mm_and_si128(qbytes, mask_lo);
                 let hi = _mm_and_si128(_mm_srli_epi16(qbytes, 4), mask_lo);
@@ -4269,7 +4259,7 @@ pub(crate) mod avx512 {
             let mut acc = _mm512_setzero_ps();
             for b in 0..nb {
                 let block = &*(row.add(b * bsz) as *const BlockQ8_0);
-                let d = _mm512_set1_ps(f16::from_bits(block.delta).to_f32());
+                let d = _mm512_set1_ps(crate::quant::f16_to_f32(block.delta));
                 let quants_ptr = block.quants.as_ptr();
                 let y_ptr = y.as_ptr().add(b * 32);
 
@@ -4320,7 +4310,7 @@ pub(crate) mod avx512 {
                 *q = (lcg(&mut st) * 127.0) as i32 as i8;
             }
             let block = BlockQ8_0 {
-                delta: f16::from_f32(0.043).to_bits(),
+                delta: crate::quant::f32_to_f16(0.043),
                 quants,
             };
             let y: Vec<f32> = (0..32).map(|_| lcg(&mut st)).collect();
@@ -4343,7 +4333,7 @@ pub(crate) mod avx512 {
                 *b = (lcg(&mut st) * 127.0) as i32 as u8;
             }
             let block = BlockQ4_0 {
-                d: f16::from_f32(0.037).to_bits(),
+                d: crate::quant::f32_to_f16(0.037),
                 qs,
             };
             let y: Vec<f32> = (0..32).map(|_| lcg(&mut st)).collect();
@@ -4366,7 +4356,7 @@ pub(crate) mod avx512 {
             let nb = 5;
             let mut row = Vec::new();
             for _ in 0..nb {
-                row.extend_from_slice(&f16::from_f32(0.03).to_bits().to_le_bytes());
+                row.extend_from_slice(&crate::quant::f32_to_f16(0.03).to_le_bytes());
                 for _ in 0..16 {
                     row.push(((lcg(&mut st) + 1.0) * 127.0) as u8);
                 }
@@ -4397,7 +4387,7 @@ pub(crate) mod avx512 {
             let nb = 5;
             let mut row = Vec::new();
             for _ in 0..nb {
-                row.extend_from_slice(&f16::from_f32(0.02).to_bits().to_le_bytes());
+                row.extend_from_slice(&crate::quant::f32_to_f16(0.02).to_le_bytes());
                 for _ in 0..32 {
                     row.push((lcg(&mut st) * 127.0) as i32 as i8 as u8);
                 }
@@ -4537,7 +4527,7 @@ macro_rules! int8_gemm_kernels {
                     let w = unpack_q4_0(block.qs.as_ptr());
                     let a = _mm256_loadu_si256(x_quants.as_ptr().add(b * 32) as *const __m256i);
                     let scale = _mm256_set1_ps(
-                        f16::from_bits(block.d).to_f32() * *x_scales.get_unchecked(b),
+                        crate::quant::f16_to_f32(block.d) * *x_scales.get_unchecked(b),
                     );
                     acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
                 }
@@ -4561,7 +4551,7 @@ macro_rules! int8_gemm_kernels {
                     let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
                     let a = _mm256_loadu_si256(x_quants.as_ptr().add(b * 32) as *const __m256i);
                     let scale = _mm256_set1_ps(
-                        f16::from_bits(block.delta).to_f32() * *x_scales.get_unchecked(b),
+                        crate::quant::f16_to_f32(block.delta) * *x_scales.get_unchecked(b),
                     );
                     acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
                 }
@@ -4724,7 +4714,7 @@ macro_rules! int8_gemm_kernels {
                     let mut acc = [_mm256_setzero_ps(); TILE_N];
                     for b in 0..nb {
                         let block = &*(row.add(b * bsz) as *const BlockQ4_0);
-                        let dw = f16::from_bits(block.d).to_f32();
+                        let dw = crate::quant::f16_to_f32(block.d);
                         let w = unpack_q4_0(block.qs.as_ptr());
                         for (t, a_t) in acc.iter_mut().enumerate() {
                             let col = j + t;
@@ -4751,7 +4741,7 @@ macro_rules! int8_gemm_kernels {
                             b_quants.as_ptr().add(j * k + b * 32) as *const __m256i
                         );
                         let scale = _mm256_set1_ps(
-                            f16::from_bits(block.d).to_f32() * *b_scales.get_unchecked(j * nb + b),
+                            crate::quant::f16_to_f32(block.d) * *b_scales.get_unchecked(j * nb + b),
                         );
                         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
                     }
@@ -4780,7 +4770,7 @@ macro_rules! int8_gemm_kernels {
                     let mut acc = [_mm256_setzero_ps(); TILE_N];
                     for b in 0..nb {
                         let block = &*(row.add(b * bsz) as *const BlockQ8_0);
-                        let dw = f16::from_bits(block.delta).to_f32();
+                        let dw = crate::quant::f16_to_f32(block.delta);
                         let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
                         for (t, a_t) in acc.iter_mut().enumerate() {
                             let col = j + t;
@@ -4806,7 +4796,7 @@ macro_rules! int8_gemm_kernels {
                             b_quants.as_ptr().add(j * k + b * 32) as *const __m256i
                         );
                         let scale = _mm256_set1_ps(
-                            f16::from_bits(block.delta).to_f32()
+                            crate::quant::f16_to_f32(block.delta)
                                 * *b_scales.get_unchecked(j * nb + b),
                         );
                         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc);
@@ -4928,7 +4918,7 @@ macro_rules! int8_gemm_kernels {
                         for r in 0..TILE_M {
                             let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ8_0);
                             w[r] = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
-                            dw[r] = f16::from_bits(block.delta).to_f32();
+                            dw[r] = crate::quant::f16_to_f32(block.delta);
                         }
                         for t in 0..STRIP_N {
                             let col = j + t;
@@ -4968,7 +4958,7 @@ macro_rules! int8_gemm_kernels {
                         for r in 0..TILE_M {
                             let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ8_0);
                             let w = _mm256_loadu_si256(block.quants.as_ptr() as *const __m256i);
-                            let scale = _mm256_set1_ps(f16::from_bits(block.delta).to_f32() * da);
+                            let scale = _mm256_set1_ps(crate::quant::f16_to_f32(block.delta) * da);
                             acc[r] =
                                 _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc[r]);
                         }
@@ -5011,7 +5001,7 @@ macro_rules! int8_gemm_kernels {
                         for r in 0..TILE_M {
                             let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ4_0);
                             w[r] = unpack_q4_0(block.qs.as_ptr());
-                            dw[r] = f16::from_bits(block.d).to_f32();
+                            dw[r] = crate::quant::f16_to_f32(block.d);
                         }
                         for t in 0..STRIP_N {
                             let col = j + t;
@@ -5047,7 +5037,7 @@ macro_rules! int8_gemm_kernels {
                         for r in 0..TILE_M {
                             let block = &*(rows.add(r * row_bytes + b * bsz) as *const BlockQ4_0);
                             let w = unpack_q4_0(block.qs.as_ptr());
-                            let scale = _mm256_set1_ps(f16::from_bits(block.d).to_f32() * da);
+                            let scale = _mm256_set1_ps(crate::quant::f16_to_f32(block.d) * da);
                             acc[r] =
                                 _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot32(w, a)), scale, acc[r]);
                         }
@@ -5686,8 +5676,8 @@ macro_rules! int8_gemm_kernels {
                                     .as_ptr()
                                     .add(row_start + bi * size_of::<crate::quant::BlockQ4KM>())
                                     as *const crate::quant::BlockQ4KM);
-                                let d = half::f16::from_bits(blk.d).to_f32();
-                                let dmin = half::f16::from_bits(blk.dmin).to_f32();
+                                let d = crate::quant::f16_to_f32(blk.d);
+                                let dmin = crate::quant::f16_to_f32(blk.dmin);
                                 let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
                                 let qs = blk.qs.as_ptr();
                                 for g in 0..4 {
@@ -5743,8 +5733,8 @@ macro_rules! int8_gemm_kernels {
                                 .as_ptr()
                                 .add(row_start + bi * size_of::<crate::quant::BlockQ4KM>())
                                 as *const crate::quant::BlockQ4KM);
-                            let d = half::f16::from_bits(blk.d).to_f32();
-                            let dmin = half::f16::from_bits(blk.dmin).to_f32();
+                            let d = crate::quant::f16_to_f32(blk.d);
+                            let dmin = crate::quant::f16_to_f32(blk.dmin);
                             let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
                             let qs = blk.qs.as_ptr();
 
@@ -5861,8 +5851,8 @@ macro_rules! int8_gemm_kernels {
                                 .as_ptr()
                                 .add(row_start + bi * size_of::<crate::quant::BlockQ4_1>())
                                 as *const crate::quant::BlockQ4_1);
-                            let d = half::f16::from_bits(blk.d).to_f32();
-                            let mmin = half::f16::from_bits(blk.m).to_f32();
+                            let d = crate::quant::f16_to_f32(blk.d);
+                            let mmin = crate::quant::f16_to_f32(blk.m);
                             // 16 packed bytes → 32 weight values. Low nibbles fill the
                             // low 128-bit lane (element indices 0..16), high nibbles the
                             // high lane (16..32), matching the contiguous activation block.
@@ -5968,7 +5958,7 @@ macro_rules! int8_gemm_kernels {
                                     .as_ptr()
                                     .add(row_start + bi * size_of::<crate::quant::BlockQ6K>())
                                     as *const crate::quant::BlockQ6K);
-                                let d = half::f16::from_bits(blk.d).to_f32();
+                                let d = crate::quant::f16_to_f32(blk.d);
                                 let d32 = d * 32.0;
                                 let ql = blk.ql.as_ptr();
                                 let qh = blk.qh.as_ptr();
@@ -6041,7 +6031,7 @@ macro_rules! int8_gemm_kernels {
                                 .as_ptr()
                                 .add(row_start + bi * size_of::<crate::quant::BlockQ6K>())
                                 as *const crate::quant::BlockQ6K);
-                            let d = half::f16::from_bits(blk.d).to_f32();
+                            let d = crate::quant::f16_to_f32(blk.d);
                             let d32 = d * 32.0;
                             let ql = blk.ql.as_ptr();
                             let qh = blk.qh.as_ptr();
@@ -6549,14 +6539,14 @@ pub(crate) mod avx2_int8 {
                                 acc +=
                                     ((byte >> 4) as i32 - 8) * bq[j * k + b * 32 + t + 16] as i32;
                             }
-                            (half::f16::from_bits(blk.d).to_f32(), acc)
+                            (crate::quant::f16_to_f32(blk.d), acc)
                         } else {
                             let blk = unsafe { &*(weights.as_ptr().add(off) as *const BlockQ8_0) };
                             let mut acc = 0i32;
                             for t in 0..32 {
                                 acc += blk.quants[t] as i32 * bq[j * k + b * 32 + t] as i32;
                             }
-                            (half::f16::from_bits(blk.delta).to_f32(), acc)
+                            (crate::quant::f16_to_f32(blk.delta), acc)
                         };
                         sum += dw * bs[j * nb + b] * acc as f32;
                     }
@@ -6796,8 +6786,8 @@ pub(crate) mod avx2_int8 {
                             &*(a.as_ptr().add((i * sb + bi) * bsz)
                                 as *const crate::quant::BlockQ4KM)
                         };
-                        let d = half::f16::from_bits(blk.d).to_f32() as f64;
-                        let dmin = half::f16::from_bits(blk.dmin).to_f32() as f64;
+                        let d = crate::quant::f16_to_f32(blk.d) as f64;
+                        let dmin = crate::quant::f16_to_f32(blk.dmin) as f64;
                         let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
                         for s in 0..8 {
                             let block = bi * 8 + s;
@@ -7320,7 +7310,7 @@ pub(crate) mod avx512_vnni {
                     _ => 0.0,
                 };
                 // Round-trip through f16 so the scale matches a stored Q8_0 block.
-                *scale = f16::from_f32(d).to_f32();
+                *scale = crate::quant::f16_to_f32(crate::quant::f32_to_f16(d));
 
                 let idv = _mm512_set1_ps(id);
                 let p0 = _mm512_mul_ps(v0, idv);
@@ -7417,7 +7407,7 @@ pub(crate) mod avx512_vnni {
                     r if d != 0.0 && r.is_finite() => r,
                     _ => 0.0,
                 };
-                scales.push(f16::from_f32(d).to_f32());
+                scales.push(crate::quant::f16_to_f32(crate::quant::f32_to_f16(d)));
                 for &v in blk {
                     quants.push((v * id).round_ties_even().clamp(-128.0, 127.0) as i8);
                 }
@@ -7443,7 +7433,7 @@ pub(crate) mod avx512_vnni {
                         acc += ((byte & 0xF) as i32 - 8) * xq[b * 32 + t] as i32;
                         acc += ((byte >> 4) as i32 - 8) * xq[b * 32 + t + 16] as i32;
                     }
-                    *yi += f16::from_bits(blk.d).to_f32() * xs[b] * acc as f32;
+                    *yi += crate::quant::f16_to_f32(blk.d) * xs[b] * acc as f32;
                 }
             }
             y
@@ -7461,7 +7451,7 @@ pub(crate) mod avx512_vnni {
                     for t in 0..32 {
                         acc += blk.quants[t] as i32 * xq[b * 32 + t] as i32;
                     }
-                    *yi += f16::from_bits(blk.delta).to_f32() * xs[b] * acc as f32;
+                    *yi += crate::quant::f16_to_f32(blk.delta) * xs[b] * acc as f32;
                 }
             }
             y
@@ -8431,8 +8421,8 @@ pub(crate) mod avx512_vnni {
                             .as_ptr()
                             .add(row_start + bi * size_of::<crate::quant::BlockQ4KM>())
                             as *const crate::quant::BlockQ4KM);
-                        let d = half::f16::from_bits(blk.d).to_f32();
-                        let dmin = half::f16::from_bits(blk.dmin).to_f32();
+                        let d = crate::quant::f16_to_f32(blk.d);
+                        let dmin = crate::quant::f16_to_f32(blk.dmin);
                         let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
                         let qs = blk.qs.as_ptr();
                         for g in 0..4 {
@@ -8492,7 +8482,7 @@ pub(crate) mod avx512_vnni {
                             .as_ptr()
                             .add(row_start + bi * size_of::<crate::quant::BlockQ6K>())
                             as *const crate::quant::BlockQ6K);
-                        let d = half::f16::from_bits(blk.d).to_f32();
+                        let d = crate::quant::f16_to_f32(blk.d);
                         let ql = blk.ql.as_ptr();
                         let qh = blk.qh.as_ptr();
                         for nh in 0..2usize {
@@ -9129,6 +9119,7 @@ pub fn vec_dot_q4_k_m_f32(block: &BlockQ4KM, y: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use half::f16;
 
     #[test]
     fn test_simd_q4_0_matches_scalar() {

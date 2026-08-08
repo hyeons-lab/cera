@@ -143,7 +143,9 @@ impl Tensor {
             DType::F32 => self.as_f32_slice().to_vec(),
             DType::F16 => {
                 let f16s: &[half::f16] = bytemuck::cast_slice(&self.data);
-                f16s.iter().map(|x| x.to_f32()).collect()
+                f16s.iter()
+                    .map(|x| crate::quant::f16_to_f32(x.to_bits()))
+                    .collect()
             }
             DType::BF16 => {
                 let bf16s: &[half::bf16] = bytemuck::cast_slice(&self.data);
