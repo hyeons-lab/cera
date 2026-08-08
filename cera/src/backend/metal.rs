@@ -196,48 +196,43 @@ pub mod shaders {
     pub const GEMV_Q5_K: &str = include_str!("shaders/gemv_q5_k.metal");
     pub const ELEMENTWISE: &str = include_str!("shaders/elementwise.metal");
 
-    /// Generated from `shaders/slang/elementwise.slang`. **Not** the production
-    /// constant: the Slang port covers only 4 of the 8 entry points the
-    /// handwritten kernel exposes (it is missing `memcpy_f32`, `scale_f32`,
-    /// `mul_out` and `cast_f32_to_f16`), which `detok_metal_parity` catches as
-    /// a missing entry point at pipeline creation. Kept so the bench can still
-    /// compare the four it does cover.
-    pub const ELEMENTWISE_SLANG: &str =
-        include_str!(concat!(env!("OUT_DIR"), "/elementwise.metal"));
     /// The four elementwise entry points with identical WGSL+MSL twins
     /// (`add_inplace`, `scaled_add_inplace`, `mul_inplace`, `silu_mul_inplace`),
     /// generated from `shaders/slang/elementwise.slang` by build.rs and shared
     /// with the wgpu backend's [`super::super::wgpu::shaders::ELEMENTWISE_SLANG`].
-    /// The Metal-only entry points ([`ELEMENTWISE`]'s `memcpy_f32`, `mul_out`,
-    /// `cast_f32_to_f16`, `scale_f32`) have no WGSL twin and stay handwritten.
-    /// Not yet on the production path: `tests/slang_multitarget_parity.rs` pins
-    /// it against the CPU reference.
+    ///
+    /// **Not** the production constant, and the one Slang source that is not:
+    /// the port covers 4 of the 8 entry points [`ELEMENTWISE`] exposes, missing
+    /// the Metal-only `memcpy_f32`, `scale_f32`, `mul_out` and
+    /// `cast_f32_to_f16`, which have no WGSL twin to share a body with.
+    /// Swapping it in would fail at pipeline creation on the first missing entry
+    /// point. Kept so the bench can compare the four it does cover.
+    pub const ELEMENTWISE_SLANG: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/elementwise.metal"));
+    /// Generated from `shaders/slang/rmsnorm.slang` by build.rs and shared with
+    /// the wgpu backend's [`super::super::wgpu::shaders::RMSNORM`]. A
+    /// `__target_switch` port that diverges in both reduction and I/O model: the
+    /// metal branch is out-of-place (src -> dst, 4 buffers) with a two-stage
+    /// `simd_sum`; the wgsl branch is in-place (3 bindings) with a shared-memory
+    /// tree. Each branch's binding set is dropped for the other target.
+    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
     pub const RMSNORM: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm.metal"));
-    /// Same kernel as [`RMSNORM`], generated from `shaders/slang/rmsnorm.slang`
-    /// by build.rs and shared with the wgpu backend's
-    /// [`super::super::wgpu::shaders::RMSNORM`]. A `__target_switch` port
-    /// that diverges in both reduction and I/O model: the metal branch is
-    /// out-of-place (src -> dst, 4 buffers) with a two-stage `simd_sum`; the wgsl
-    /// branch is in-place (3 bindings) with a shared-memory tree. Each branch's
-    /// binding set is dropped for the other target. Not yet on the production
-    /// path: `tests/slang_multitarget_parity.rs` pins it against the CPU
-    /// reference.
+    /// Generated from `shaders/slang/per_head_rmsnorm.slang` by build.rs and
+    /// shared with the wgpu backend's
+    /// [`super::super::wgpu::shaders::PER_HEAD_RMSNORM`]. A `__target_switch`
+    /// port: the metal branch keeps the two-stage `simd_sum`, the wgsl branch the
+    /// shared-memory tree. `tests/slang_multitarget_parity.rs` pins it against
+    /// the CPU reference.
     pub const PER_HEAD_RMSNORM: &str =
         include_str!(concat!(env!("OUT_DIR"), "/per_head_rmsnorm.metal"));
-    /// Same kernel as [`PER_HEAD_RMSNORM`], generated from
-    /// `shaders/slang/per_head_rmsnorm.slang` by build.rs and shared with the
-    /// wgpu backend's [`super::super::wgpu::shaders::PER_HEAD_RMSNORM`]. A
-    /// `__target_switch` port: the metal branch keeps the two-stage `simd_sum`,
-    /// the wgsl branch the shared-memory tree. Not yet on the production path:
-    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
+    /// Generated from `shaders/slang/softmax.slang` by build.rs rather than
+    /// hand-written, sharing that source with the wgpu backend's
+    /// [`super::super::wgpu::shaders::SOFTMAX`]. Contract is unchanged (buffer
+    /// 0 = x in-place, buffer 1 = params) and the two-stage `simd_max`/`simd_sum`
+    /// reduction is preserved via `__target_switch`, so this is not the
+    /// portable-tree fallback. `tests/slang_multitarget_parity.rs` pins it
+    /// against the CPU reference.
     pub const SOFTMAX: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax.metal"));
-    /// Same kernel as [`SOFTMAX`], generated from `shaders/slang/softmax.slang`
-    /// by build.rs rather than hand-written, sharing that source with the wgpu
-    /// backend's [`super::super::wgpu::shaders::SOFTMAX`]. Contract is
-    /// unchanged (buffer 0 = x in-place, buffer 1 = params) and the two-stage
-    /// `simd_max`/`simd_sum` reduction is preserved via `__target_switch`, so
-    /// this is not the portable-tree fallback. Not yet on the production path:
-    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
     /// Capability probe, not a kernel: nothing dispatches this. Pins that Slang
     /// reaches Metal's `simdgroup_matrix` hardware through `linalg::CoopMat`,
     /// which is what decides whether the eight hand-tuned `simdgroup_matrix`
@@ -245,61 +240,54 @@ pub mod shaders {
     /// asserted in `tests/slang_multitarget_parity.rs`.
     pub const COOPMAT_PROBE_SLANG: &str =
         include_str!(concat!(env!("OUT_DIR"), "/coopmat_probe.metal"));
-    pub const ROPE: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.metal"));
-    /// Same NEOX-only RoPE kernel as [`ROPE`], generated from
-    /// `shaders/slang/rope.slang` by build.rs. Unlike gelu/bias_add/elementwise
-    /// this is a `__target_switch` port: the metal branch mirrors this minimal
-    /// NEOX kernel, the wgsl branch (shared with
-    /// [`super::super::wgpu::shaders::ROPE`]) mirrors the fuller
+    /// NEOX-only RoPE kernel, generated from `shaders/slang/rope.slang` by
+    /// build.rs. Unlike gelu/bias_add/elementwise this is a `__target_switch`
+    /// port: the metal branch mirrors this minimal NEOX kernel, the wgsl branch
+    /// (shared with [`super::super::wgpu::shaders::ROPE`]) mirrors the fuller
     /// `rope.wgsl`, and Slang omits the freq_factors binding from the MSL since
-    /// only the wgsl branch uses it. Not yet on the production path:
-    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
+    /// only the wgsl branch uses it. `tests/slang_multitarget_parity.rs` pins it
+    /// against the CPU reference.
+    pub const ROPE: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.metal"));
     pub const QK_NORM_ROPE: &str = include_str!("shaders/qk_norm_rope.metal");
+    /// Generated from `shaders/slang/conv1d.slang` by build.rs and shared with
+    /// the wgpu backend's [`super::super::wgpu::shaders::CONV1D`]. Unlike the
+    /// norm tier this is a clean single-body port: the two handwritten twins
+    /// already agreed on element type, bindings and entry name, and there is no
+    /// reduction or subgroup op, so there is no `__target_switch`.
+    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
     pub const CONV1D: &str = include_str!(concat!(env!("OUT_DIR"), "/conv1d.metal"));
-    /// Same kernel as [`CONV1D`], generated from `shaders/slang/conv1d.slang` by
-    /// build.rs and shared with the wgpu backend's
-    /// [`super::super::wgpu::shaders::CONV1D`]. Unlike the norm tier this
-    /// is a clean single-body port: the two handwritten twins already agreed on
-    /// element type, bindings and entry name, and there is no reduction or
-    /// subgroup op, so there is no `__target_switch`. Not yet on the production
-    /// path: `tests/slang_multitarget_parity.rs` pins it against the CPU
-    /// reference.
     pub const ATTENTION: &str = include_str!("shaders/attention.metal");
     pub const FLASH_ATTENTION: &str = include_str!("shaders/flash_attention.metal");
     pub const ATTENTION_GQA: &str = include_str!("shaders/attention_gqa.metal");
     pub const ATTENTION_SPLITK: &str = include_str!("shaders/attention_splitk.metal");
-    pub const ARGMAX_F32: &str = include_str!(concat!(env!("OUT_DIR"), "/argmax_f32.metal"));
-    /// Same kernel as [`ARGMAX_F32`], generated from
-    /// `shaders/slang/argmax_f32.slang` by build.rs and shared with the wgpu
-    /// backend's [`super::super::wgpu::shaders::ARGMAX_F32`]. A
+    /// Generated from `shaders/slang/argmax_f32.slang` by build.rs and shared
+    /// with the wgpu backend's [`super::super::wgpu::shaders::ARGMAX_F32`]. A
     /// `__target_switch` port: the metal branch keeps the two-stage
     /// `simd_shuffle_down` value+index reduction, the wgsl branch the
-    /// shared-memory tree. Not yet on the production path:
-    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
+    /// shared-memory tree. `tests/slang_multitarget_parity.rs` pins it against
+    /// the CPU reference.
+    pub const ARGMAX_F32: &str = include_str!(concat!(env!("OUT_DIR"), "/argmax_f32.metal"));
     pub const GEMV_Q4_0_BATCH: &str = include_str!("shaders/gemv_q4_0_batch.metal");
-    pub const RMSNORM_BATCH: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm_batch.metal"));
-    /// Same two kernels as [`RMSNORM_BATCH`] (`rmsnorm_batch` +
-    /// `add_rmsnorm_batch`), generated from `shaders/slang/rmsnorm_batch.slang`
-    /// by build.rs and shared with the wgpu backend's
-    /// [`super::super::wgpu::shaders::RMSNORM_BATCH`]. A `__target_switch`
-    /// port: the metal branch keeps the two-stage `simd_sum`, the wgsl branch the
-    /// shared-memory tree. Not yet on the production path:
+    /// Two kernels (`rmsnorm_batch` + `add_rmsnorm_batch`), generated from
+    /// `shaders/slang/rmsnorm_batch.slang` by build.rs and shared with the wgpu
+    /// backend's [`super::super::wgpu::shaders::RMSNORM_BATCH`]. A
+    /// `__target_switch` port: the metal branch keeps the two-stage `simd_sum`,
+    /// the wgsl branch the shared-memory tree.
     /// `tests/slang_multitarget_parity.rs` pins both entry points against the CPU
     /// reference.
-    pub const CONV1D_FUSED: &str = include_str!(concat!(env!("OUT_DIR"), "/conv1d_fused.metal"));
-    /// Same kernel as [`CONV1D_FUSED`], generated from
-    /// `shaders/slang/conv1d_fused.slang` by build.rs and shared with the wgpu
-    /// backend's [`super::super::wgpu::shaders::CONV1D_FUSED`]. A clean
-    /// single-body port with no `__target_switch`, made possible by first
-    /// consolidating this Metal twin onto the WGSL twin's single packed `proj`
+    pub const RMSNORM_BATCH: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm_batch.metal"));
+    /// Generated from `shaders/slang/conv1d_fused.slang` by build.rs and shared
+    /// with the wgpu backend's [`super::super::wgpu::shaders::CONV1D_FUSED`]. A
+    /// clean single-body port with no `__target_switch`, made possible by first
+    /// consolidating the Metal twin onto the WGSL twin's single packed `proj`
     /// binding (it used to take x, b and c as three separate buffers that every
     /// caller filled from one buffer at three offsets). No kernel-size guard on
-    /// either twin or the port: nothing here indexes a fixed-size array, so a
-    /// bound could only convert a correct result into a skipped write.
-    /// ([`CONV1D_FUSED_BATCH`] does constrain its params, because it stages the
-    /// weights and rolling state in fixed-size registers.) Not yet on the
-    /// production path: `tests/slang_multitarget_parity.rs` pins it against the
-    /// CPU reference.
+    /// the port: nothing here indexes a fixed-size array, so a bound could only
+    /// convert a correct result into a skipped write. ([`CONV1D_FUSED_BATCH`]
+    /// does constrain its params, because it stages the weights and rolling
+    /// state in fixed-size registers.) `tests/slang_multitarget_parity.rs` pins
+    /// it against the CPU reference.
+    pub const CONV1D_FUSED: &str = include_str!(concat!(env!("OUT_DIR"), "/conv1d_fused.metal"));
     pub const GEMM_Q4_0: &str = include_str!("shaders/gemm_q4_0.metal");
     pub const GEMM_Q4_1: &str = include_str!("shaders/gemm_q4_1.metal");
     pub const GEMV_Q4_1: &str = include_str!("shaders/gemv_q4_1.metal");
@@ -322,19 +310,18 @@ pub mod shaders {
     pub const GEMV_Q8_0_BATCH: &str = include_str!("shaders/gemv_q8_0_batch.metal");
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.metal");
     pub const QK_NORM_ROPE_BATCH: &str = include_str!("shaders/qk_norm_rope_batch.metal");
+    /// Generated from `shaders/slang/conv1d_fused_batch.slang` by build.rs and
+    /// shared with the wgpu backend's
+    /// [`super::super::wgpu::shaders::CONV1D_FUSED_BATCH`]. A clean single-body
+    /// port with no `__target_switch`: the two handwritten twins shared an
+    /// element type, a binding contract and an entry name, and neither had a
+    /// reduction. They did differ in loop spelling, in the weight preload bound,
+    /// and in whether they carried the `ks > 4 || d_conv > 3` early-out (the
+    /// Metal twin did not, and was unguarded on `w[d_conv]` as a result); the
+    /// `.slang` header explains how the shared body reconciles those.
+    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
     pub const CONV1D_FUSED_BATCH: &str =
         include_str!(concat!(env!("OUT_DIR"), "/conv1d_fused_batch.metal"));
-    /// Same kernel as [`CONV1D_FUSED_BATCH`], generated from
-    /// `shaders/slang/conv1d_fused_batch.slang` by build.rs and shared with the
-    /// wgpu backend's [`super::super::wgpu::shaders::CONV1D_FUSED_BATCH`].
-    /// A clean single-body port with no `__target_switch`: the two handwritten
-    /// twins share an element type, a binding contract and an entry name, and
-    /// neither has a reduction. They do differ in loop spelling, in the weight
-    /// preload bound, and in whether they carry the `ks > 4 || d_conv > 3`
-    /// early-out (this Metal twin does not, and is unguarded on `w[d_conv]` as a
-    /// result); the `.slang` header explains how the shared body reconciles
-    /// those. Not yet on the production path:
-    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.metal");
     /// TurboQuant KV compression: `tq_encode_keys`, `tq_encode_values`,
     /// `tq_rotate_q` (three kernels in one source).
@@ -344,29 +331,27 @@ pub mod shaders {
     pub const FLASH_ATTENTION_TQ: &str = include_str!("shaders/flash_attention_tq.metal");
     // Vision-encoder (ViT) kernels.
     pub const VIT_LINEAR: &str = include_str!("shaders/vit_linear.metal");
+    /// Generated from `shaders/slang/layernorm_batch.slang` by build.rs and
+    /// shared with the wgpu backend's
+    /// [`super::super::wgpu::shaders::LAYERNORM_BATCH`]. A `__target_switch`
+    /// port: the metal branch keeps the two-stage `simd_sum`, the wgsl branch the
+    /// shared-memory tree. `tests/slang_multitarget_parity.rs` pins it against
+    /// the CPU reference.
     pub const LAYERNORM_BATCH: &str =
         include_str!(concat!(env!("OUT_DIR"), "/layernorm_batch.metal"));
-    /// Same kernel as [`LAYERNORM_BATCH`], generated from
-    /// `shaders/slang/layernorm_batch.slang` by build.rs and shared with the wgpu
-    /// backend's [`super::super::wgpu::shaders::LAYERNORM_BATCH`]. A
-    /// `__target_switch` port: the metal branch keeps the two-stage `simd_sum`,
-    /// the wgsl branch the shared-memory tree. Not yet on the production path:
+    /// Generated from `shaders/slang/gelu.slang` by build.rs, sharing that
+    /// source with the wgpu backend's [`super::super::wgpu::shaders::GELU`].
+    /// Contract is buffer 0 = x in-place, buffer 1 = params. No per-target
+    /// divergence, so the whole body is shared with no `__target_switch`.
     /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
     pub const GELU: &str = include_str!(concat!(env!("OUT_DIR"), "/gelu.metal"));
-    /// Same kernel as [`GELU`], generated from `shaders/slang/gelu.slang` by
-    /// build.rs, sharing that source with the wgpu backend's
-    /// [`super::super::wgpu::shaders::GELU`]. Same contract (buffer 0 = x
-    /// in-place, buffer 1 = params). No per-target divergence, so the whole body
-    /// is shared with no `__target_switch`. Not yet on the production path:
-    /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
-    pub const BIAS_ADD: &str = include_str!(concat!(env!("OUT_DIR"), "/bias_add.metal"));
-    /// Same kernel as [`BIAS_ADD`], generated from `shaders/slang/bias_add.slang`
-    /// by build.rs, sharing that source with the wgpu backend's
-    /// [`super::super::wgpu::shaders::BIAS_ADD`]. Same contract (buffer 0 =
-    /// x in-place, buffer 1 = bias, buffer 2 = params). No per-target divergence,
-    /// so the whole body is shared with no `__target_switch`. Not yet on the
-    /// production path: `tests/slang_multitarget_parity.rs` pins it against the
+    /// Generated from `shaders/slang/bias_add.slang` by build.rs, sharing that
+    /// source with the wgpu backend's [`super::super::wgpu::shaders::BIAS_ADD`].
+    /// Contract is buffer 0 = x in-place, buffer 1 = bias, buffer 2 = params. No
+    /// per-target divergence, so the whole body is shared with no
+    /// `__target_switch`. `tests/slang_multitarget_parity.rs` pins it against the
     /// CPU reference.
+    pub const BIAS_ADD: &str = include_str!(concat!(env!("OUT_DIR"), "/bias_add.metal"));
     pub const VIT_ATTENTION: &str = include_str!("shaders/vit_attention.metal");
     pub const VIT_ATTENTION_MMA: &str = include_str!("shaders/vit_attention_mma.metal");
 }

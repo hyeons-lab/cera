@@ -252,11 +252,35 @@ fn cases() -> Vec<(usize, &'static str, &'static str, &'static str)> {
 /// layout against the Rust mirrors, so the guard that exists because a shader
 /// struct once outgrew its upload (NaN and silent audio in production) never
 /// covered them at all.
+///
+/// Two things this is deliberately weaker at than [`msl_struct_bytes`], both
+/// worth knowing before extending the table:
+///
+/// 1. It reads the `.slang` *input*, not the `.metal` the GPU is handed. The
+///    emitted MSL has no `struct Params` to parse, so there is nothing stricter
+///    to point at, but a change in how Slang lowers a params buffer would not be
+///    caught here.
+/// 2. It is a text scan, so it can only be trusted where its assumptions hold.
+///    Every assumption below therefore returns `None` when violated rather than
+///    guessing, and `None` is a test failure: under-reporting a width is exactly
+///    the silent pass this guard exists to prevent.
 fn slang_params_bytes(src: &str) -> Option<usize> {
     // Declaration: `StructuredBuffer<uintN> name : register(tN);`
-    let decl = src
-        .lines()
-        .find(|l| l.contains("StructuredBuffer<uint") && !l.trim_start().starts_with("//"))?;
+    //
+    // Require exactly one, and skip `RWStructuredBuffer` (whose name contains
+    // this needle): an unqualified "first match" picks the output buffer in
+    // `argmax_f32.slang`, and the wgsl-side params buffer in the two-binding
+    // sources, both of which report a plausible but wrong width.
+    let mut decls = src.lines().filter(|l| {
+        let t = l.trim_start();
+        !t.starts_with("//")
+            && t.contains("StructuredBuffer<uint")
+            && !t.contains("RWStructuredBuffer<uint")
+    });
+    let decl = decls.next()?;
+    if decls.next().is_some() {
+        return None;
+    }
     let after = decl.split("StructuredBuffer<uint").nth(1)?;
     let (comp_txt, rest) = after.split_once('>')?;
     let components: usize = if comp_txt.is_empty() {
@@ -279,18 +303,24 @@ fn slang_params_bytes(src: &str) -> Option<usize> {
     // Anchor on the statement, not the word: `rope.slang` names
     // `__target_switch` in a doc comment on line 3, and matching that put the
     // brace scan in the middle of prose and silently kept the wgsl arm.
-    let switch_at = src.match_indices("__target_switch").find(|(i, _)| {
+    let mut switches = src.match_indices("__target_switch").filter(|(i, _)| {
         src[i + "__target_switch".len()..]
             .trim_start()
             .starts_with('{')
     });
-    let scope: String = match switch_at.map(|(i, _)| i) {
+    let switch_at = switches.next().map(|(i, _)| i);
+    // More than one switch and the positional `default:`-drop below is
+    // ambiguous: a second switch's default arm would be counted in full.
+    if switches.next().is_some() {
+        return None;
+    }
+    let scope: String = match switch_at {
         None => src.to_string(),
         Some(sw) => {
             // Brace-match from the switch to find its extent.
             let bytes = src.as_bytes();
-            let open = sw + src[sw..].find('{').unwrap_or(0);
-            let (mut depth, mut end) = (0usize, src.len());
+            let open = sw + src[sw..].find('{')?;
+            let (mut depth, mut end) = (0usize, 0usize);
             for (i, &b) in bytes.iter().enumerate().skip(open) {
                 match b {
                     b'{' => depth += 1,
@@ -304,30 +334,49 @@ fn slang_params_bytes(src: &str) -> Option<usize> {
                     _ => {}
                 }
             }
-            match src[open..end].find("default:") {
+            // Unbalanced braces: the extent is a guess, so do not make one.
+            if end == 0 {
+                return None;
+            }
+            let body = &src[open..end];
+            match body.find("default:") {
                 // Everything but the default arm: before the switch, the metal
-                // arm, and everything after it.
-                Some(d) => format!("{}{}", &src[..open + d], &src[end..]),
+                // arm, and everything after it. Slang allows `default:` before
+                // `case metal:`, which would drop the metal arm instead; refuse
+                // rather than silently reporting the smaller width.
+                Some(d) => match body.find("case metal:") {
+                    Some(m) if m < d => format!("{}{}", &src[..open + d], &src[end..]),
+                    _ => return None,
+                },
                 None => src.to_string(),
             }
         }
     };
+    // Strip `//` comments, as `msl_struct_bytes` does. Prose about the binding
+    // is not a read of it: `rope.slang` documents its two arms as
+    // `params[0..4]` and `params[0..6]`, which are neither real indices nor
+    // parseable ones.
+    let scope: String = scope
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
     let scope = scope.as_str();
 
-    // Highest element index actually read, over `name[N]` (with or without a swizzle).
-    let mut max_idx = 0usize;
-    for (i, _) in scope.match_indices(name) {
-        let tail = &scope[i + name.len()..];
-        if let Some(inner) = tail
-            .strip_prefix('[')
-            .and_then(|t| t.split_once(']'))
-            .map(|(a, _)| a)
-            && let Ok(n) = inner.trim().parse::<usize>()
-        {
-            max_idx = max_idx.max(n);
-        }
-    }
-    Some(components * (max_idx + 1) * 4)
+    // Highest element index actually read, over `name[N]` (with or without a
+    // swizzle). A non-literal index (`par_buf[i]`, `par_buf[base + 1]`) cannot
+    // be resolved by a text scan and would silently leave the width at whatever
+    // the literals reached, so it is a hard failure instead.
+    scope
+        .match_indices(name)
+        .filter_map(|(i, _)| {
+            scope[i + name.len()..]
+                .strip_prefix('[')
+                .and_then(|t| t.split_once(']'))
+                .map(|(inner, _)| inner.trim().parse::<usize>())
+        })
+        .try_fold(0usize, |acc, parsed| parsed.ok().map(|n| acc.max(n)))
+        .map(|max_idx| components * (max_idx + 1) * 4)
 }
 
 /// Rust mirrors whose kernel is now a Slang port, paired with that source.
@@ -387,7 +436,7 @@ fn rust_param_mirrors_match_msl_structs() {
         match slang_params_bytes(slang_src) {
             None => failures.push(format!(
                 "{rust_name}: no `StructuredBuffer<uint*>` params binding found in the Slang \
-                 source — renamed, or the port changed how it takes parameters?"
+                 source: renamed, or the port changed how it takes parameters?"
             )),
             Some(slang_bytes) if slang_bytes != rust_bytes => failures.push(format!(
                 "{rust_name}: Rust mirror is {rust_bytes} B but the Slang kernel reads \

@@ -114,28 +114,21 @@ required-features = ["gpu"]
 name = "wgpu_gemv_bench"
 required-features = ["gpu"]
 
-# Generated-vs-handwritten MSL comparison for the Slang multi-target pilot.
-# Metal-only: the WGSL half of that pilot is already verified and the only
-# Vulkan device CI can reach is a software rasterizer, so there is nothing to
-# learn from a wgpu twin.
-# The measurement the Slang branch turns on: a generated simdgroup GEMM against
-# the hand-tuned one it would replace. Metal-only for the same reason.
+# A generated simdgroup GEMM against the hand-tuned one it would replace.
+# Metal-only: the WGSL half is already verified by parity and the only Vulkan
+# device CI can reach is a software rasterizer, so there is nothing to learn
+# from a wgpu twin.
 [[example]]
 name = "slang_gemm_bench"
 required-features = ["metal"]
 
-# Phase 1a elementwise/math tier: generated gelu, elementwise, and rope against
-# their handwritten twins. Metal-only for the same reason.
+# The four shared elementwise ops against their handwritten twins. The last
+# bench of its kind: everywhere else the generated kernel is now the production
+# kernel, so there is no twin left to compare against. Metal-only, same reason.
 [[example]]
 name = "slang_elementwise_bench"
 required-features = ["metal"]
 
-# Phase 1b-i norm tier: generated per_head_rmsnorm, layernorm_batch, and
-# rmsnorm_batch (both entry points) against their handwritten twins. Metal-only.
-# Phase 1b-ii: generated argmax_f32 and rmsnorm against their handwritten twins.
-# Metal-only for the same reason.
-# Phase 1c-i: the generated conv tier against its handwritten twins. Metal-only
-# for the same reason.
 # Checks that a library embedder and `cera-cli` get the same thread pools.
 # `mmap` for the `from_path` load; `parallel` because with rayon compiled out
 # there is no global pool for the two arms to differ over.

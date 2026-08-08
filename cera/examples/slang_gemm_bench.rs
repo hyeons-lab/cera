@@ -28,13 +28,14 @@
 //! accumulators plus six operand registers may or may not survive as registers
 //! after Slang's codegen. If they spill, it shows up here and nowhere else.
 //!
-//! This is the same failure mode `slang_softmax_bench` caught: that kernel
-//! passed its whole parity suite while carrying one extra threadgroup barrier
-//! and running ~24% slower at the size where barrier latency dominates.
+//! This is the same failure mode the softmax bench caught before that kernel
+//! went to production: it passed its whole parity suite while carrying one extra
+//! threadgroup barrier and running ~24% slower at the size where barrier latency
+//! dominates.
 //!
 //! ## Measurement discipline
 //!
-//! Same as `slang_softmax_bench`: a discarded warm-up per shape, arms alternated
+//! A discarded warm-up per shape, arms alternated
 //! each round so drift cannot be read as a kernel difference, several dispatches
 //! per timed encoder to amortize the submit, and the median round rather than
 //! the mean.

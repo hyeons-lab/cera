@@ -1626,22 +1626,6 @@ mod wgsl {
         check_conv1d_fused_batch(&ctx, "generated", shaders::CONV1D_FUSED_BATCH);
     }
 
-    /// The same sweeps against the three HANDWRITTEN kernels, mirroring the msl
-    /// module's pin.
-    ///
-    /// Without these, each generated kernel is pinned only to a CPU reference
-    /// written by reading the kernel body, so a transcription error made in the
-    /// `.slang` and repeated in the reference would pass. The msl module runs
-    /// the same check, but only a Metal host executes it; this keeps the
-    /// references pinned on a gpu-only host too.
-    #[test]
-    fn handwritten_conv_kernels_match_the_same_references() {
-        let Some(ctx) = setup() else { return };
-        check_conv1d(&ctx, "handwritten", shaders::CONV1D);
-        check_conv1d_fused(&ctx, "handwritten", shaders::CONV1D_FUSED);
-        check_conv1d_fused_batch(&ctx, "handwritten", shaders::CONV1D_FUSED_BATCH);
-    }
-
     fn run_gemm(
         ctx: &GpuContext,
         packed: &[u8],
@@ -2570,25 +2554,6 @@ mod msl {
             return;
         };
         check_conv1d_fused_batch(&ctx, "generated", shaders::CONV1D_FUSED_BATCH);
-    }
-
-    /// The same sweeps against the three HANDWRITTEN kernels.
-    ///
-    /// Without these, each generated kernel is pinned only to a CPU reference
-    /// that was written by reading the kernel body, so a transcription error
-    /// made in the `.slang` and repeated in the reference would pass. Running
-    /// both sides through one runner also pins the binding contract they share,
-    /// which for `conv1d_fused` is the consolidation this branch made: its Metal
-    /// twin used to take x, b and c as three separate buffers and now reads one
-    /// packed `proj`.
-    #[test]
-    fn handwritten_conv_kernels_match_the_same_references() {
-        let Some(ctx) = common::metal_context() else {
-            return;
-        };
-        check_conv1d(&ctx, "handwritten", shaders::CONV1D);
-        check_conv1d_fused(&ctx, "handwritten", shaders::CONV1D_FUSED);
-        check_conv1d_fused_batch(&ctx, "handwritten", shaders::CONV1D_FUSED_BATCH);
     }
 
     fn run_gemm(

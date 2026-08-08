@@ -172,7 +172,7 @@ impl KvShiftKParams {
 }
 impl MetalParams for KvShiftKParams {}
 
-/// Mirror of `Params` in `shaders/rope.metal`.
+/// Mirror of the params buffer in `shaders/slang/rope.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RopeParams {
@@ -413,7 +413,7 @@ pub struct ScaleParams {
 const _: () = assert!(size_of::<ScaleParams>() == 8);
 impl MetalParams for ScaleParams {}
 
-/// Mirror of `Params` in `shaders/bias_add.metal`.
+/// Mirror of the params buffer in `shaders/slang/bias_add.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BiasAddParams {
@@ -423,7 +423,7 @@ pub struct BiasAddParams {
 const _: () = assert!(size_of::<BiasAddParams>() == 8);
 impl MetalParams for BiasAddParams {}
 
-/// Mirror of `Params` in `shaders/rmsnorm_batch.metal` — shared by `rmsnorm_batch` and
+/// Mirror of the params buffer in `shaders/slang/rmsnorm_batch.slang`, shared by `rmsnorm_batch` and
 /// `add_rmsnorm_batch`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -437,7 +437,7 @@ pub struct RmsNormBatchParams {
 const _: () = assert!(size_of::<RmsNormBatchParams>() == 20);
 impl MetalParams for RmsNormBatchParams {}
 
-/// Mirror of `Params` in `shaders/conv1d_fused_batch.metal`.
+/// Mirror of the params buffer in `shaders/slang/conv1d_fused_batch.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Conv1dBatchParams {
@@ -492,7 +492,7 @@ pub struct VitAttnParams {
 const _: () = assert!(size_of::<VitAttnParams>() == 16);
 impl MetalParams for VitAttnParams {}
 
-/// Mirror of `Params` in `shaders/layernorm_batch.metal` (the ViT LayerNorm).
+/// Mirror of the params buffer in `shaders/slang/layernorm_batch.slang` (the ViT LayerNorm).
 ///
 /// Distinct from [`RmsNormBatchParams`]: LayerNorm has no residual-scale field, so it is
 /// four uints, not five. `src_stride`/`dst_stride` are both `dim` in the ViT caller.
