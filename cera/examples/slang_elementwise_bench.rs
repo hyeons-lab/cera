@@ -169,7 +169,7 @@ fn main() {
         .create_pipeline(shaders::GELU, "gelu_inplace")
         .expect("gelu.metal");
     let gelu_slang = ctx
-        .create_pipeline(shaders::GELU_SLANG, "gelu_inplace")
+        .create_pipeline(shaders::GELU, "gelu_inplace")
         .expect("gelu slang");
     let gparams = ctx.upload_bytes(bytemuck::cast_slice(&[N as u32, 0u32]));
     let mut ok = true;
@@ -219,7 +219,7 @@ fn main() {
         .create_pipeline(shaders::ROPE, "rope")
         .expect("rope.metal");
     let rope_slang = ctx
-        .create_pipeline(shaders::ROPE_SLANG, "rope")
+        .create_pipeline(shaders::ROPE, "rope")
         .expect("rope slang");
     let rparams = ctx.upload_bytes(bytemuck::cast_slice(&[
         1000u32,

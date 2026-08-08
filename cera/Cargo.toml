@@ -118,10 +118,6 @@ required-features = ["gpu"]
 # Metal-only: the WGSL half of that pilot is already verified and the only
 # Vulkan device CI can reach is a software rasterizer, so there is nothing to
 # learn from a wgpu twin.
-[[example]]
-name = "slang_softmax_bench"
-required-features = ["metal"]
-
 # The measurement the Slang branch turns on: a generated simdgroup GEMM against
 # the hand-tuned one it would replace. Metal-only for the same reason.
 [[example]]
@@ -136,22 +132,10 @@ required-features = ["metal"]
 
 # Phase 1b-i norm tier: generated per_head_rmsnorm, layernorm_batch, and
 # rmsnorm_batch (both entry points) against their handwritten twins. Metal-only.
-[[example]]
-name = "slang_norm_bench"
-required-features = ["metal"]
-
 # Phase 1b-ii: generated argmax_f32 and rmsnorm against their handwritten twins.
 # Metal-only for the same reason.
-[[example]]
-name = "slang_norm2_bench"
-required-features = ["metal"]
-
 # Phase 1c-i: the generated conv tier against its handwritten twins. Metal-only
 # for the same reason.
-[[example]]
-name = "slang_conv_bench"
-required-features = ["metal"]
-
 # Checks that a library embedder and `cera-cli` get the same thread pools.
 # `mmap` for the `from_path` load; `parallel` because with rayon compiled out
 # there is no global pool for the two arms to differ over.
