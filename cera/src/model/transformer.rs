@@ -304,7 +304,7 @@ mod gate_tests {
         // rather than checked at one aligned and one unaligned value. Note the
         // negative half is vacuous without `blas` (the arm is already false for
         // every k there), so the alignment requirement is only really asserted
-        // in the blas leg — which is the only configuration that can reach the
+        // in the blas leg, which is the only configuration that can reach the
         // dequantizer at all.
         for k in [256usize, 512, 2048] {
             assert_eq!(
@@ -332,24 +332,54 @@ mod gate_tests {
     ///
     /// Only meaningful under `blas` (that is the only configuration in which
     /// `try_blas_prefill_gemm` exists), and CI runs a `--features blas` leg.
+    /// Every `DType`, so the sweep below cannot quietly miss one.
+    ///
+    /// Hand-written, because `DType` has no iteration helper. What keeps it
+    /// honest is `all_dtypes_is_exhaustive`: adding a variant breaks that
+    /// match, and the fix is one line away from this array. Note what that does
+    /// *not* buy: it forces a visit, not a correct edit. Someone who adds a
+    /// variant to the match and forgets the array still gets a green sweep.
+    #[cfg(feature = "blas")]
+    const ALL_DTYPES: [DType; 11] = [
+        DType::F32,
+        DType::F16,
+        DType::BF16,
+        DType::I32,
+        DType::U8,
+        DType::Q4_0,
+        DType::Q4_1,
+        DType::Q4KM,
+        DType::Q5KM,
+        DType::Q8_0,
+        DType::Q6K,
+    ];
+
+    /// Wildcard-free, so a new `DType` variant stops compiling here.
+    #[cfg(feature = "blas")]
+    fn all_dtypes_is_exhaustive(d: DType) -> bool {
+        match d {
+            DType::F32
+            | DType::F16
+            | DType::BF16
+            | DType::I32
+            | DType::U8
+            | DType::Q4_0
+            | DType::Q4_1
+            | DType::Q4KM
+            | DType::Q5KM
+            | DType::Q8_0
+            | DType::Q6K => true,
+        }
+    }
+
     #[cfg(feature = "blas")]
     #[test]
     fn blas_gate_agrees_with_dequantizer_table() {
-        // `blas_dequantizer` matches without a wildcard, so a new `DType`
-        // variant is a compile error there before it can reach this list.
-        for dtype in [
-            DType::F32,
-            DType::F16,
-            DType::BF16,
-            DType::I32,
-            DType::U8,
-            DType::Q4_0,
-            DType::Q4_1,
-            DType::Q4KM,
-            DType::Q5KM,
-            DType::Q8_0,
-            DType::Q6K,
-        ] {
+        assert!(
+            ALL_DTYPES.iter().copied().all(all_dtypes_is_exhaustive),
+            "ALL_DTYPES holds a variant the exhaustive match does not"
+        );
+        for dtype in ALL_DTYPES {
             // k = 256 satisfies every alignment rule in the gate, so this asks
             // only about the dtype.
             if batched_gemm_supports(dtype, 256) {
@@ -567,6 +597,10 @@ pub(crate) fn warn_unbatchable(tensor: &str, dtype: DType) {
     }
 }
 
+/// Signature shared by every `quant::dequantize_*_matrix`.
+#[cfg(feature = "blas")]
+type MatrixDequantizer = fn(&[u8], usize, usize, &mut [f32]);
+
 /// The whole-matrix dequantizer the BLAS prefill route uses for `dtype`, or
 /// `None` if there is none.
 ///
@@ -577,9 +611,6 @@ pub(crate) fn warn_unbatchable(tensor: &str, dtype: DType) {
 /// a disagreement is silent corruption rather than a failure: the GEMM is
 /// skipped and the reused output buffer still holds the previous layer's
 /// activations. `blas_gate_agrees_with_dequantizer_table` pins the implication.
-#[cfg(feature = "blas")]
-type MatrixDequantizer = fn(&[u8], usize, usize, &mut [f32]);
-
 #[cfg(feature = "blas")]
 fn blas_dequantizer(dtype: DType) -> Option<MatrixDequantizer> {
     match dtype {
