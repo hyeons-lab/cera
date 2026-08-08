@@ -1930,46 +1930,108 @@ pub fn gemv_f32(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
 
 /// `y[m] = W[m,k] @ x[k]` for a half-precision weight matrix, widened on read.
 ///
-/// The reference-speed twin of [`gemv_f32`], and deliberately no faster: an
-/// unquantized GGUF is a conversion artifact rather than a deployment format,
-/// so the point here is that such a file *runs* instead of panicking. Quantize
-/// it (`llama-quantize model.gguf out.gguf Q4_K_M`) to reach the tuned kernels.
+/// Row-parallel on the decode `RowPool` and NEON-vectorized, for the same
+/// reason the quantized GEMVs are: a scalar single-threaded loop left this
+/// dtype ~50x behind llama.cpp on the same file, which is not a defensible
+/// place for a format `convert_hf_to_gguf.py` emits by default.
 ///
-/// Widening per element is free relative to the memory traffic, because
-/// `f16_to_f32` is open-coded and inlines; going through `half`'s converter
-/// here would put an out-of-line call with a CPU feature probe in the inner
-/// loop.
+/// `vcvt_f32_f16` widens four halves per instruction and feeds `vfmaq_f32`, so
+/// the widen rides along with the multiply-accumulate instead of costing a pass
+/// of its own. Quantizing still wins (the int8 kernels do 16 MACs per
+/// instruction against this path's 4), but the gap becomes a reason to
+/// quantize rather than a reason the file is unusable.
 pub fn gemv_f16(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
     let a16: &[u16] = bytemuck::cast_slice(a);
     debug_assert_eq!(a16.len(), m * k);
 
-    for (i, out) in y.iter_mut().enumerate() {
-        *out = a16[i * k..(i + 1) * k]
-            .iter()
-            .zip(x)
-            .map(|(&w, &xv)| crate::quant::f16_to_f32(w) * xv)
-            .sum();
+    let compute_row = |(i, yi): (usize, &mut f32)| {
+        let row = &a16[i * k..(i + 1) * k];
+        *yi = dot_f16_f32(row, x);
+    };
+
+    if m >= gemv_par_threshold() {
+        par_rows(y, gemv_min_rows(), compute_row);
+    } else {
+        y.iter_mut().enumerate().for_each(compute_row);
+    }
+}
+
+/// Dot product of a half-precision row with an f32 vector.
+#[inline]
+fn dot_f16_f32(row: &[u16], x: &[f32]) -> f32 {
+    debug_assert_eq!(row.len(), x.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        if crate::backend::cpu_features::cpu_features().fp16 {
+            // SAFETY: `neon` is mandatory on aarch64 and `fp16` is checked
+            // above; every load below is bounded by the equal-length assert.
+            return unsafe { dot_f16_f32_neon(row, x) };
+        }
+    }
+    row.iter()
+        .zip(x)
+        .map(|(&w, &xv)| crate::quant::f16_to_f32(w) * xv)
+        .sum()
+}
+
+/// NEON kernel behind [`dot_f16_f32`]: four halves widened and accumulated per
+/// `vfmaq_f32`, four such chains in flight to cover the FMA latency, with a
+/// scalar tail for `k % 16`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,fp16")]
+unsafe fn dot_f16_f32_neon(row: &[u16], x: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let (wp, xp) = (row.as_ptr(), x.as_ptr());
+        let n = row.len();
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        let mut i = 0;
+        while i + 16 <= n {
+            for (c, a) in acc.iter_mut().enumerate() {
+                let off = i + c * 4;
+                let w = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(wp.add(off))));
+                *a = vfmaq_f32(*a, w, vld1q_f32(xp.add(off)));
+            }
+            i += 16;
+        }
+        let mut sum = vaddvq_f32(vaddq_f32(
+            vaddq_f32(acc[0], acc[1]),
+            vaddq_f32(acc[2], acc[3]),
+        ));
+        while i < n {
+            sum += crate::quant::f16_to_f32(*wp.add(i)) * *xp.add(i);
+            i += 1;
+        }
+        sum
     }
 }
 
 /// `y[m] = W[m,k] @ x[k]` for a bfloat16 weight matrix. See [`gemv_f16`].
 ///
 /// bf16 shares f32's exponent field, so widening is a 16-bit left shift with no
-/// rounding and no special cases.
+/// rounding and no special cases; row-parallel for the same reason as the f16
+/// twin, but left scalar per element since there is no NEON bf16 widen without
+/// FEAT_BF16 and the shift is already cheap.
 pub fn gemv_bf16(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(y.len(), m);
     let a16: &[u16] = bytemuck::cast_slice(a);
     debug_assert_eq!(a16.len(), m * k);
 
-    for (i, out) in y.iter_mut().enumerate() {
-        *out = a16[i * k..(i + 1) * k]
+    let compute_row = |(i, yi): (usize, &mut f32)| {
+        *yi = a16[i * k..(i + 1) * k]
             .iter()
             .zip(x)
             .map(|(&w, &xv)| f32::from_bits(u32::from(w) << 16) * xv)
             .sum();
+    };
+
+    if m >= gemv_par_threshold() {
+        par_rows(y, gemv_min_rows(), compute_row);
+    } else {
+        y.iter_mut().enumerate().for_each(compute_row);
     }
 }
 
@@ -6986,36 +7048,46 @@ mod f16_gemv_tests {
 
     /// `gemv_f16` must equal widening the matrix to f32 and running `gemv_f32`.
     /// Isolates the kernel from the model so a wrong answer is attributable.
+    ///
+    /// The shapes are chosen to reach every path: `k = 64` is a clean multiple
+    /// of the 16-wide NEON body, `k = 70` leaves a 6-element scalar tail, and
+    /// `k = 12` is shorter than one vector block so it is tail-only. `m = 512`
+    /// clears `gemv_par_threshold` and exercises the row-parallel dispatch,
+    /// which the small `m` cases do not.
     #[test]
     fn gemv_f16_matches_widened_f32() {
-        let (m, k) = (7usize, 12usize);
-        let mut st = 0x9E37_79B9u32;
-        let mut next = || {
-            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            ((st >> 8) as f32 / 8_388_608.0) - 1.0
-        };
-        let halves: Vec<u16> = (0..m * k)
-            .map(|_| crate::quant::f32_to_f16(next()))
-            .collect();
-        let x: Vec<f32> = (0..k).map(|_| next()).collect();
+        for &(m, k) in &[(7usize, 12usize), (5, 64), (3, 70), (512, 64), (512, 70)] {
+            let mut st = 0x9E37_79B9u32;
+            let mut next = || {
+                st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((st >> 8) as f32 / 8_388_608.0) - 1.0
+            };
+            let halves: Vec<u16> = (0..m * k)
+                .map(|_| crate::quant::f32_to_f16(next()))
+                .collect();
+            let x: Vec<f32> = (0..k).map(|_| next()).collect();
 
-        let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
-        let mut got = vec![0.0f32; m];
-        gemv_f16(&bytes, &x, &mut got, m, k);
+            let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+            let mut got = vec![0.0f32; m];
+            gemv_f16(&bytes, &x, &mut got, m, k);
 
-        let widened: Vec<f32> = halves
-            .iter()
-            .map(|&h| crate::quant::f16_to_f32(h))
-            .collect();
-        let wbytes: Vec<u8> = widened.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let mut want = vec![0.0f32; m];
-        gemv_f32(&wbytes, &x, &mut want, m, k);
+            let widened: Vec<f32> = halves
+                .iter()
+                .map(|&h| crate::quant::f16_to_f32(h))
+                .collect();
+            let wbytes: Vec<u8> = widened.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let mut want = vec![0.0f32; m];
+            gemv_f32(&wbytes, &x, &mut want, m, k);
 
-        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-            assert!(
-                (g - w).abs() <= 1e-6 * (1.0 + w.abs()),
-                "row {i}: got {g} want {w}"
-            );
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                // Not bit-exact by construction: the NEON path keeps four
+                // partial sums and the reference keeps one, so the additions
+                // happen in a different order.
+                assert!(
+                    (g - w).abs() <= 1e-5 * (1.0 + w.abs()),
+                    "m={m} k={k} row {i}: got {g} want {w}"
+                );
+            }
         }
     }
 }
