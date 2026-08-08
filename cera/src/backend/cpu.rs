@@ -1928,6 +1928,51 @@ pub fn gemv_f32(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     }
 }
 
+/// `y[m] = W[m,k] @ x[k]` for a half-precision weight matrix, widened on read.
+///
+/// The reference-speed twin of [`gemv_f32`], and deliberately no faster: an
+/// unquantized GGUF is a conversion artifact rather than a deployment format,
+/// so the point here is that such a file *runs* instead of panicking. Quantize
+/// it (`llama-quantize model.gguf out.gguf Q4_K_M`) to reach the tuned kernels.
+///
+/// Widening per element is free relative to the memory traffic, because
+/// `f16_to_f32` is open-coded and inlines; going through `half`'s converter
+/// here would put an out-of-line call with a CPU feature probe in the inner
+/// loop.
+pub fn gemv_f16(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(y.len(), m);
+    let a16: &[u16] = bytemuck::cast_slice(a);
+    debug_assert_eq!(a16.len(), m * k);
+
+    for (i, out) in y.iter_mut().enumerate() {
+        *out = a16[i * k..(i + 1) * k]
+            .iter()
+            .zip(x)
+            .map(|(&w, &xv)| crate::quant::f16_to_f32(w) * xv)
+            .sum();
+    }
+}
+
+/// `y[m] = W[m,k] @ x[k]` for a bfloat16 weight matrix. See [`gemv_f16`].
+///
+/// bf16 shares f32's exponent field, so widening is a 16-bit left shift with no
+/// rounding and no special cases.
+pub fn gemv_bf16(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(y.len(), m);
+    let a16: &[u16] = bytemuck::cast_slice(a);
+    debug_assert_eq!(a16.len(), m * k);
+
+    for (i, out) in y.iter_mut().enumerate() {
+        *out = a16[i * k..(i + 1) * k]
+            .iter()
+            .zip(x)
+            .map(|(&w, &xv)| f32::from_bits(u32::from(w) << 16) * xv)
+            .sum();
+    }
+}
+
 /// Dispatch GEMV based on dtype: `y[m] = W[m,k] @ x[k]`.
 /// For Q4_0, pass scratch buffers to avoid per-call allocation.
 pub fn gemv_dispatch(
@@ -1995,6 +2040,8 @@ pub fn gemv_dispatch(
             }
         }
         DType::F32 => gemv_f32(data, x, y, m, k),
+        DType::F16 => gemv_f16(data, x, y, m, k),
+        DType::BF16 => gemv_bf16(data, x, y, m, k),
         DType::Q6K => {
             #[cfg(target_arch = "aarch64")]
             kq_gemv!(crate::backend::simd::neon::gemv_q6k_f32_neon);
@@ -6930,5 +6977,45 @@ mod tests {
         eprintln!("  per-call: {:.1} µs", per_call * 1e6);
         eprintln!("  weight:   {:.2} MB", weight_bytes_large as f64 / 1e6);
         eprintln!("  bandwidth: {:.1} GB/s", bw_large);
+    }
+}
+
+#[cfg(test)]
+mod f16_gemv_tests {
+    use super::*;
+
+    /// `gemv_f16` must equal widening the matrix to f32 and running `gemv_f32`.
+    /// Isolates the kernel from the model so a wrong answer is attributable.
+    #[test]
+    fn gemv_f16_matches_widened_f32() {
+        let (m, k) = (7usize, 12usize);
+        let mut st = 0x9E37_79B9u32;
+        let mut next = || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((st >> 8) as f32 / 8_388_608.0) - 1.0
+        };
+        let halves: Vec<u16> = (0..m * k)
+            .map(|_| crate::quant::f32_to_f16(next()))
+            .collect();
+        let x: Vec<f32> = (0..k).map(|_| next()).collect();
+
+        let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let mut got = vec![0.0f32; m];
+        gemv_f16(&bytes, &x, &mut got, m, k);
+
+        let widened: Vec<f32> = halves
+            .iter()
+            .map(|&h| crate::quant::f16_to_f32(h))
+            .collect();
+        let wbytes: Vec<u8> = widened.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let mut want = vec![0.0f32; m];
+        gemv_f32(&wbytes, &x, &mut want, m, k);
+
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-6 * (1.0 + w.abs()),
+                "row {i}: got {g} want {w}"
+            );
+        }
     }
 }
