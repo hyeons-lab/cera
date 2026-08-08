@@ -10,11 +10,11 @@ use anyhow::Result;
 use metal::{Buffer, ComputePipelineState, MTLResourceOptions, MTLSize, NSUInteger};
 
 use crate::backend::metal::{
-    ArgmaxParams, BiasAddParams, Conv1dBatchParams, ElementwiseParams, FlashAttnParams,
-    GemmF32Params, GemvBatchParams, GemvQkvParams, GemvRmsParams, GemvSplitKParams, KvCopyParams,
-    KvShiftKParams, MetalContext, MetalParams, PrefillAttnParams, QkNormRopeBatchParams,
-    QkNormRopeParams, QuantGemmParams, RmsNormBatchParams, RopeParams, ScaleParams,
-    SplitAttnParams, shaders,
+    ArgmaxParams, BiasAddParams, Conv1dBatchParams, Conv1dParams, ElementwiseParams,
+    FlashAttnParams, GemmF32Params, GemvBatchParams, GemvQkvParams, GemvRmsParams,
+    GemvSplitKParams, KvCopyParams, KvShiftKParams, MetalContext, MetalParams, NormParams,
+    PrefillAttnParams, QkNormRopeBatchParams, QkNormRopeParams, QuantGemmParams,
+    RmsNormBatchParams, RopeParams, ScaleParams, SplitAttnParams, shaders,
 };
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression, KvPrefixCache};
@@ -943,21 +943,22 @@ impl MetalLfm2Model {
         let head_dim_u32 = head_dim as u32;
         let eps_bits = config.rms_norm_eps.to_bits();
         let params = ParamsBufs {
-            rmsnorm_hs: ctx.upload_bytes(bytemuck::cast_slice(&[hs as u32, eps_bits, 0, 0u32])),
-            per_head_rmsnorm: ctx.upload_bytes(bytemuck::cast_slice(&[
+            rmsnorm_hs: ctx.upload_bytes(bytemuck::cast_slice(&NormParams::words(
+                hs as u32, eps_bits,
+            ))),
+            per_head_rmsnorm: ctx.upload_bytes(bytemuck::cast_slice(&NormParams::words(
                 head_dim_u32,
                 eps_bits,
-                0,
-                0u32,
-            ])),
-            elementwise_hs: ctx.upload_bytes(bytemuck::cast_slice(&[hs as u32, 0u32])),
-            elementwise_is: ctx.upload_bytes(bytemuck::cast_slice(&[is as u32, 0u32])),
-            conv1d: ctx.upload_bytes(bytemuck::cast_slice(&[
+            ))),
+            elementwise_hs: ctx
+                .upload_bytes(bytemuck::cast_slice(&ElementwiseParams::words(hs as u32))),
+            elementwise_is: ctx
+                .upload_bytes(bytemuck::cast_slice(&ElementwiseParams::words(is as u32))),
+            conv1d: ctx.upload_bytes(bytemuck::cast_slice(&Conv1dParams::words(
                 hs as u32,
                 config.conv_kernel_size.unwrap_or(3) as u32,
                 (config.conv_kernel_size.unwrap_or(3) - 1) as u32,
-                0u32,
-            ])),
+            ))),
             gemv_output: ctx
                 .upload_bytes(bytemuck::cast_slice(&[config.vocab_size as u32, hs as u32])),
         };

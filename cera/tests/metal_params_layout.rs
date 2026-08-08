@@ -448,6 +448,65 @@ fn slang_cases() -> Vec<(usize, &'static str, &'static str)> {
     ]
 }
 
+/// The host upload must cover everything the kernel reads.
+///
+/// This is the half `slang_cases` cannot express. That table asserts *equality*
+/// against a mirror, which only holds where the upload is exactly the params
+/// struct; several flipped kernels upload more than they read (`conv1d` sends 16
+/// bytes for 12) and would fail an equality check while being perfectly safe.
+/// The property that actually matters is the inequality, and it is the one that
+/// was violated: `argmax_f32` uploaded 4 bytes for a kernel that reads 8.
+///
+/// Pairs a Rust mirror with the `.slang` it is uploaded to. Every persistent
+/// params `Buffer` in `MetalLfm2Model` now goes through one of these rather than
+/// a literal `cast_slice(&[..])`, which is what makes the width a thing a test
+/// can see.
+#[test]
+fn metal_uploads_cover_what_the_slang_kernels_read() {
+    let cases: &[(usize, &str, &str)] = &[
+        (
+            size_of::<ArgmaxParams>(),
+            include_str!("../src/backend/shaders/slang/argmax_f32.slang"),
+            "ArgmaxParams -> argmax_f32.slang",
+        ),
+        (
+            size_of::<NormParams>(),
+            include_str!("../src/backend/shaders/slang/rmsnorm.slang"),
+            "NormParams -> rmsnorm.slang",
+        ),
+        (
+            size_of::<NormParams>(),
+            include_str!("../src/backend/shaders/slang/per_head_rmsnorm.slang"),
+            "NormParams -> per_head_rmsnorm.slang",
+        ),
+        (
+            size_of::<Conv1dParams>(),
+            include_str!("../src/backend/shaders/slang/conv1d.slang"),
+            "Conv1dParams -> conv1d.slang",
+        ),
+        (
+            size_of::<ElementwiseParams>(),
+            include_str!("../src/backend/shaders/slang/elementwise.slang"),
+            "ElementwiseParams -> elementwise.slang",
+        ),
+    ];
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|&(upload, src, label)| match slang_params_bytes(src) {
+            None => Some(format!("{label}: params binding not resolvable")),
+            Some(reads) if upload < reads => Some(format!(
+                "{label}: host uploads {upload} B but the kernel reads {reads} B,                  so it reads past the end of the buffer"
+            )),
+            Some(_) => None,
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "Metal params upload too small:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
 /// Every `.slang` params binding this test could ever be pointed at, so a
 /// rename or a lowering change fails here rather than going unnoticed.
 ///

@@ -417,6 +417,55 @@ pub struct ArgmaxParams {
 const _: () = assert!(size_of::<ArgmaxParams>() == 8);
 impl MetalParams for ArgmaxParams {}
 
+/// Mirror of the params buffer shared by `shaders/slang/rmsnorm.slang`'s metal
+/// arm and `shaders/slang/per_head_rmsnorm.slang`: `[n, eps_bits, 0, 0]`.
+///
+/// One struct for both because the layout is the same; only the meaning of `n`
+/// differs (hidden size for rmsnorm, head_dim for the per-head one).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormParams {
+    pub n: u32,
+    pub eps_bits: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+const _: () = assert!(size_of::<NormParams>() == 16);
+impl MetalParams for NormParams {}
+
+impl NormParams {
+    /// The upload form, for the persistent-`Buffer` path.
+    pub fn words(n: u32, eps_bits: u32) -> [u32; 4] {
+        [n, eps_bits, 0, 0]
+    }
+}
+const _: () = assert!(size_of::<[u32; 4]>() == size_of::<NormParams>());
+
+/// Mirror of the params buffer in `shaders/slang/conv1d.slang`:
+/// `[hs, kernel_size, d_conv, 0]`.
+///
+/// Sixteen bytes uploaded against twelve read. The kernel stops at
+/// `par_buf[2]`, so the trailing word is slack rather than a field, which is
+/// why the layout test checks upload >= kernel rather than equality.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Conv1dParams {
+    pub hs: u32,
+    pub kernel_size: u32,
+    pub d_conv: u32,
+    pub _pad: u32,
+}
+const _: () = assert!(size_of::<Conv1dParams>() == 16);
+impl MetalParams for Conv1dParams {}
+
+impl Conv1dParams {
+    /// The upload form, for the persistent-`Buffer` path.
+    pub fn words(hs: u32, kernel_size: u32, d_conv: u32) -> [u32; 4] {
+        [hs, kernel_size, d_conv, 0]
+    }
+}
+const _: () = assert!(size_of::<[u32; 4]>() == size_of::<Conv1dParams>());
+
 impl ArgmaxParams {
     /// The upload form, for the buffer path (this one is a persistent `Buffer`,
     /// not a `set_bytes` binding, so it goes through `bytemuck::cast_slice`).
@@ -433,7 +482,14 @@ impl ElementwiseParams {
     pub fn new(n: u32) -> Self {
         Self { n, _pad: 0 }
     }
+
+    /// The upload form, for the persistent-`Buffer` path (`set_bytes` callers
+    /// use `MetalParams::set` on the struct itself).
+    pub fn words(n: u32) -> [u32; 2] {
+        [n, 0]
+    }
 }
+const _: () = assert!(size_of::<[u32; 2]>() == size_of::<ElementwiseParams>());
 
 /// Mirror of `ScaleParams` in `shaders/elementwise.metal`.
 #[repr(C)]
