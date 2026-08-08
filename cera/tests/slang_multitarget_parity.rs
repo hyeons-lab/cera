@@ -2,19 +2,21 @@
 //! **both** WGSL and MSL by build.rs, each checked against the same CPU
 //! reference here.
 //!
-//! `softmax` is the pilot. It was picked because the two handwritten kernels it
-//! shadows already agree on their binding contract (x in-place at binding 0,
-//! params at binding 1) *and* deliberately disagree on their reduction:
-//! `softmax.metal` uses a two-stage `simd_max`/`simd_sum` while `softmax.wgsl`
-//! walks a shared-memory tree
-//! because cera does not request `wgpu::Features::SUBGROUP`. The Slang source
-//! keeps both via `__target_switch`, so this suite is really asking whether a
-//! generated kernel can preserve a per-target fast path rather than flattening
-//! to the portable one.
+//! `softmax` was the pilot. It was picked because the two handwritten kernels it
+//! replaced already agreed on their binding contract (x in-place at binding 0,
+//! params at binding 1) *and* deliberately disagreed on their reduction: the
+//! Metal one used a two-stage `simd_max`/`simd_sum` while the WGSL one walked a
+//! shared-memory tree, because cera does not request
+//! `wgpu::Features::SUBGROUP`. The Slang source keeps both via
+//! `__target_switch`, so this suite is really asking whether a generated kernel
+//! can preserve a per-target fast path rather than flattening to the portable
+//! one.
 //!
-//! Neither generated kernel is on the production path yet. Nothing regresses if
-//! they are wrong; the point is to find out on real hardware first, since the
-//! MSL half cannot be executed on a Linux or Windows dev box at all.
+//! **These kernels are on the production path.** They used to sit beside their
+//! handwritten twins, and a wrong one regressed nothing; the twins are now
+//! deleted and this suite is what stands between a wrong `.slang` and shipped
+//! inference. It matters most for the MSL half, which cannot be executed on a
+//! Linux or Windows dev box at all.
 //!
 //! No GGUF and no network: synthetic inputs only, so these run wherever a GPU
 //! exists.
@@ -2007,8 +2009,8 @@ mod msl {
         (ctx.read_f32(&q_buf, q.len()), ctx.read_f32(&k_buf, k.len()))
     }
 
-    /// The metal branch is NEOX-only (mirrors rope.metal); the interleaved and
-    /// freq_factors paths live only in the wgsl branch and are checked there.
+    /// The metal branch is NEOX-only; the interleaved and freq_factors paths
+    /// live only in the wgsl branch and are checked there.
     #[test]
     fn rope_slang_matches_reference() {
         let Some(ctx) = common::metal_context() else {

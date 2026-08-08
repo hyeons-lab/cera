@@ -79,7 +79,7 @@ inline void head_rope(
     for (uint d = tid; d < half_dim; d += 256u) {
         float theta = float(pos) * powr(theta_scale, float(d));
         // Llama-3 long-context RoPE scaling: divide the per-pair angle by the
-        // precomputed frequency factor (mirrors rope.metal / the wgpu path).
+        // precomputed frequency factor (mirrors slang/rope.slang / the wgpu path).
         if (has_freq_factors != 0u) {
             theta = theta / freq_factors[d];
         }

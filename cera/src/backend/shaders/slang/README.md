@@ -14,20 +14,25 @@ slangc is present, so the `.slang` is the source of truth. CI byte-compares the
 committed outputs against what the pinned slangc produces, so a stale `.metal`
 or `.wgsl` fails the build rather than silently shipping to a device.
 
-**These are the production kernels.** The evaluation is over: every kernel here
-except `elementwise.slang` and `gemm_q8_0.slang` is what the backends dispatch,
-and the handwritten WGSL/MSL twins they replaced have been deleted. A wrong
-generated kernel is now a wrong kernel, which is why
-`tests/slang_multitarget_parity.rs` pins each one against the CPU reference.
+**These are the production kernels.** The evaluation is over: with the three
+exceptions below, every kernel here is what the backends dispatch, and the
+handwritten WGSL/MSL twins they replaced have been deleted. A wrong generated
+kernel is now a wrong kernel, which is why `tests/slang_multitarget_parity.rs`
+pins each one against the CPU reference.
 
-The two exceptions, and why:
+The exceptions, and why:
 
-- `elementwise.slang` covers 4 of the 8 entry points the handwritten
-  `elementwise.wgsl`/`.metal` expose (it lacks `memcpy_f32`, `scale_f32`,
-  `mul_out` and `cast_f32_to_f16`, which have no cross-target twin to share a
-  body with). Both still ship; the port is reachable as `ELEMENTWISE_SLANG`.
+- `elementwise.slang` covers all four entry points `elementwise.wgsl` has, but
+  only four of the eight in `elementwise.metal`. The other four (`memcpy_f32`,
+  `scale_f32`, `mul_out`, `cast_f32_to_f16`) are Metal-only, with no WGSL
+  counterpart to share a body with, so the Metal side cannot switch. Flipping
+  only wgpu would give up the single shared source that is the point of this
+  directory, so both backends keep the handwritten kernel and the port stays
+  reachable as `ELEMENTWISE_SLANG`.
 - `gemm_q8_0.slang` is a cooperative-matrix experiment, not a replacement for
   the hand-tuned `simdgroup_matrix` GEMM. See `GEMM_Q8_0_SLANG`.
+- `coopmat_probe.slang` is a capability probe rather than a kernel. Nothing
+  dispatches it; `tests/slang_multitarget_parity.rs` asserts it compiles.
 
 ## The one primitive that makes it work: `__target_switch`
 

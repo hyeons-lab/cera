@@ -681,7 +681,8 @@ pub struct GpuLfm2Model {
     conv1d_params: wgpu::Buffer,        // [hs, kernel_size, d_conv, 0]
     per_head_norm_params: wgpu::Buffer, // [head_dim, eps_bits, 0, 0]
     // [pos, n_heads, n_kv_heads, head_dim, theta_bits, rope_type, has_freq_factors]
-    // — 7 u32, updated per token; must stay in sync with rope.wgsl's params array.
+    // 7 u32, updated per token; must stay in sync with the params array in
+    // `shaders/slang/rope.slang`'s wgsl branch.
     rope_params: wgpu::Buffer,
     attn_params: wgpu::Buffer, // [n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale, 0, 0] — updated per token
     gemv_tile_params: Vec<wgpu::Buffer>, // [rows, k, row_base, 0] per output-projection tile
