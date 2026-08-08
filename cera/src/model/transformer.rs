@@ -280,7 +280,7 @@ mod gate_tests {
     /// rather than never supported. See `q5_k_is_batched_exactly_under_blas`.
     #[test]
     fn unsupported_dtypes_are_never_batched() {
-        for dtype in [DType::F16, DType::F32] {
+        for dtype in [DType::F16, DType::F32, DType::BF16, DType::I32, DType::U8] {
             assert!(
                 !batched_gemm_supports(dtype, 256),
                 "{dtype:?} was admitted to the batched path with no kernel to run it"
@@ -300,16 +300,66 @@ mod gate_tests {
     /// host built without `blas`, which is every mobile build.
     #[test]
     fn q5_k_is_batched_exactly_under_blas() {
-        assert_eq!(
-            batched_gemm_supports(DType::Q5KM, 256),
-            cfg!(feature = "blas"),
-            "Q5_K batching must track the `blas` feature exactly"
-        );
-        // The 256-alignment requirement still applies, as for every K-quant.
-        assert!(
-            !batched_gemm_supports(DType::Q5KM, 96),
-            "Q5_K admitted at k=96, which is not a multiple of its 256-wide superblock"
-        );
+        // Swept over the same k list as `k_quant_batched_gemm_requires_whole_superblocks`
+        // rather than checked at one aligned and one unaligned value. Note the
+        // negative half is vacuous without `blas` (the arm is already false for
+        // every k there), so the alignment requirement is only really asserted
+        // in the blas leg — which is the only configuration that can reach the
+        // dequantizer at all.
+        for k in [256usize, 512, 2048] {
+            assert_eq!(
+                batched_gemm_supports(DType::Q5KM, k),
+                cfg!(feature = "blas"),
+                "Q5_K at k={k} must track the `blas` feature exactly"
+            );
+        }
+        for k in [32usize, 96, 128, 255, 257, 384] {
+            assert!(
+                !batched_gemm_supports(DType::Q5KM, k),
+                "Q5_K admitted at k={k}, which is not a multiple of its 256-wide superblock"
+            );
+        }
+    }
+
+    /// Every dtype the gate admits must be one the BLAS route can actually run.
+    ///
+    /// This is the implication whose failure the PR's own comments describe as
+    /// silent corruption: callers discard `try_blas_prefill_gemm`'s bool, so a
+    /// dtype admitted by [`batched_gemm_supports`] but missing from
+    /// [`blas_dequantizer`] skips the matmul and leaves the previous layer's
+    /// activations in the reused output buffer. Neither the gate test nor the
+    /// dequantizer's own unit test connects the two; this does.
+    ///
+    /// Only meaningful under `blas` (that is the only configuration in which
+    /// `try_blas_prefill_gemm` exists), and CI runs a `--features blas` leg.
+    #[cfg(feature = "blas")]
+    #[test]
+    fn blas_gate_agrees_with_dequantizer_table() {
+        // `blas_dequantizer` matches without a wildcard, so a new `DType`
+        // variant is a compile error there before it can reach this list.
+        for dtype in [
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::I32,
+            DType::U8,
+            DType::Q4_0,
+            DType::Q4_1,
+            DType::Q4KM,
+            DType::Q5KM,
+            DType::Q8_0,
+            DType::Q6K,
+        ] {
+            // k = 256 satisfies every alignment rule in the gate, so this asks
+            // only about the dtype.
+            if batched_gemm_supports(dtype, 256) {
+                assert!(
+                    blas_dequantizer(dtype).is_some(),
+                    "{dtype:?} is admitted to the batched path but has no BLAS \
+                     dequantizer, so the GEMM would be silently skipped"
+                );
+            }
+        }
     }
 
     /// Q4_1 is batched exactly when `k_quant_gemm_available()` holds — the shared
@@ -517,6 +567,32 @@ pub(crate) fn warn_unbatchable(tensor: &str, dtype: DType) {
     }
 }
 
+/// The whole-matrix dequantizer the BLAS prefill route uses for `dtype`, or
+/// `None` if there is none.
+///
+/// Split out of [`try_blas_prefill_gemm`] so that the set of dtypes the BLAS
+/// path can actually *run* is a value a test can inspect, rather than a `match`
+/// buried mid-function. [`batched_gemm_supports`] and this function are two
+/// lists that must agree, and callers discard `try_blas_prefill_gemm`'s bool, so
+/// a disagreement is silent corruption rather than a failure: the GEMM is
+/// skipped and the reused output buffer still holds the previous layer's
+/// activations. `blas_gate_agrees_with_dequantizer_table` pins the implication.
+#[cfg(feature = "blas")]
+type MatrixDequantizer = fn(&[u8], usize, usize, &mut [f32]);
+
+#[cfg(feature = "blas")]
+fn blas_dequantizer(dtype: DType) -> Option<MatrixDequantizer> {
+    match dtype {
+        DType::Q4_0 => Some(crate::quant::dequantize_q4_0_matrix),
+        DType::Q4_1 => Some(crate::quant::dequantize_q4_1_matrix),
+        DType::Q8_0 => Some(crate::quant::dequantize_q8_0_matrix),
+        DType::Q4KM => Some(crate::quant::dequantize_q4_k_m_matrix),
+        DType::Q5KM => Some(crate::quant::dequantize_q5_k_matrix),
+        DType::Q6K => Some(crate::quant::dequantize_q6_k_matrix),
+        DType::F32 | DType::F16 | DType::BF16 | DType::I32 | DType::U8 => None,
+    }
+}
+
 /// Prefill GEMM through BLAS: dequantize `wref` into `dequant_scratch[..m*k]`,
 /// then SGEMM `out[m, n] = weight[m, k] @ b[k, n]` in row-major (`b`/`out` are
 /// row-major `[k|m, n]`, stride `n`). Returns `true` for the supported dtypes;
@@ -540,15 +616,19 @@ pub(crate) fn try_blas_prefill_gemm(
         dequant_scratch.resize(m * k, 0.0);
     }
     let dequant = &mut dequant_scratch[..m * k];
-    match wref.dtype {
-        DType::Q4_0 => crate::quant::dequantize_q4_0_matrix(data, m, k, dequant),
-        DType::Q4_1 => crate::quant::dequantize_q4_1_matrix(data, m, k, dequant),
-        DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(data, m, k, dequant),
-        DType::Q4KM => crate::quant::dequantize_q4_k_m_matrix(data, m, k, dequant),
-        DType::Q5KM => crate::quant::dequantize_q5_k_matrix(data, m, k, dequant),
-        DType::Q6K => crate::quant::dequantize_q6_k_matrix(data, m, k, dequant),
-        _ => return false,
-    }
+    let Some(dequantize) = blas_dequantizer(wref.dtype) else {
+        // Reachable only if `batched_gemm_supports` admitted a dtype this
+        // function cannot run, which is the silent-corruption case: the caller
+        // ignores this `false` and goes on to read an output buffer that still
+        // holds the previous layer's activations. Loud in debug, free in release.
+        debug_assert!(
+            false,
+            "try_blas_prefill_gemm: no dequantizer for {:?}, but the gate admitted it",
+            wref.dtype
+        );
+        return false;
+    };
+    dequantize(data, m, k, dequant);
     crate::backend::blas::sgemm_rowmajor_nn(m, n, k, dequant, b, out);
     true
 }

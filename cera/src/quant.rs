@@ -500,9 +500,6 @@ pub fn dequantize_q4_k_m_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32])
         .for_each(|(dst_row, src_row)| dequantize_q4_k_m_row(src_row, dst_row));
 }
 
-/// Dequantize a Q6_K matrix of shape `[m, k]` (row-major) to `out`.
-///
-/// Superblocks are 256 wide, so `k` must be a multiple of 256 (not 32).
 /// Dequantize an `m x k` Q5_K matrix to f32, one row per task.
 ///
 /// Mirrors [`dequantize_q4_k_m_matrix`]; Q5_K is Q4_K plus a high-bit plane, so
@@ -534,6 +531,9 @@ pub fn dequantize_q5_k_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
         .for_each(|(dst_row, src_row)| dequantize_q5_k_row(src_row, dst_row));
 }
 
+/// Dequantize a Q6_K matrix of shape `[m, k]` (row-major) to `out`.
+///
+/// Superblocks are 256 wide, so `k` must be a multiple of 256 (not 32).
 pub fn dequantize_q6_k_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
     debug_assert_eq!(
         k % 256,
@@ -1370,29 +1370,28 @@ mod tests {
             (st >> 24) as u8
         };
         let mut src = vec![0u8; m * row_bytes];
-        for b in src.iter_mut() {
-            *b = byte();
-        }
-        // Keep the scale fields finite; random bits could land on inf/NaN and
-        // turn a real mismatch into a NaN-vs-NaN comparison that always passes.
-        for row in 0..m {
-            for b in 0..blocks_per_row {
+        src.iter_mut().for_each(|b| *b = byte());
+        // Keep the scale fields finite. Random bits can land on inf/NaN, and
+        // since NaN never compares equal to itself the `assert_eq!` below would
+        // then fail on rows that actually agree: a flaky red, not a false pass.
+        (0..m)
+            .flat_map(|row| (0..blocks_per_row).map(move |b| (row, b)))
+            .for_each(|(row, b)| {
                 let off = row * row_bytes + b * size_of::<BlockQ5K>();
                 let d = f16::from_f32(0.05 + (row % 7) as f32 * 0.01).to_bits();
                 let dmin = f16::from_f32(0.02 + (b % 3) as f32 * 0.01).to_bits();
                 src[off..off + 2].copy_from_slice(&d.to_le_bytes());
                 src[off + 2..off + 4].copy_from_slice(&dmin.to_le_bytes());
-            }
-        }
+            });
 
         let mut via_matrix = vec![0.0f32; m * k];
         dequantize_q5_k_matrix(&src, m, k, &mut via_matrix);
 
         let mut via_rows = vec![0.0f32; m * k];
-        for row in 0..m {
-            let s = &src[row * row_bytes..(row + 1) * row_bytes];
-            dequantize_q5_k_row(s, &mut via_rows[row * k..(row + 1) * k]);
-        }
+        via_rows
+            .chunks_mut(k)
+            .zip(src.chunks(row_bytes))
+            .for_each(|(dst, s)| dequantize_q5_k_row(s, dst));
 
         assert_eq!(
             via_matrix, via_rows,
