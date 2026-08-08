@@ -220,7 +220,9 @@ prompt-tokens=$prompt max-tokens=$maxtok"
   fi
 }
 
-echo "==> cera CPU tier: $("$BIN" cpu 2>/dev/null || echo unknown)"
+# `cera cpu` prints the tier then the core topology; label both rather than
+# letting the second line trail unlabelled after the "tier:" prefix.
+"$BIN" cpu 2>/dev/null | sed 's/^/==> cera /' || echo "==> cera cpu: unknown"
 echo "==> profiler: $TOOL"
 
 case "$MODE" in
