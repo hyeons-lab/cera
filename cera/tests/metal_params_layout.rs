@@ -271,16 +271,27 @@ fn slang_params_bytes(src: &str) -> Option<usize> {
     // this needle): an unqualified "first match" picks the output buffer in
     // `argmax_f32.slang`, and the wgsl-side params buffer in the two-binding
     // sources, both of which report a plausible but wrong width.
-    let mut decls = src.lines().filter(|l| {
-        let t = l.trim_start();
-        !t.starts_with("//")
-            && t.contains("StructuredBuffer<uint")
-            && !t.contains("RWStructuredBuffer<uint")
-    });
-    let decl = decls.next()?;
-    if decls.next().is_some() {
-        return None;
-    }
+    let candidates: Vec<&str> = src
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with("//")
+                && t.contains("StructuredBuffer<uint")
+                && !t.contains("RWStructuredBuffer<uint")
+        })
+        .collect();
+    // A `__target_switch` source can declare one params binding per target, as
+    // `rmsnorm.slang` does with `p_wgsl` and `p_metal`, because the two branches
+    // want different layouts. This is the Metal layout test, so take the
+    // `_metal` one; refusing outright (as an earlier revision did) left every
+    // such kernel uncovered, which is worse than the ambiguity it avoided.
+    // Anything else with more than one binding is still ambiguous.
+    let decl = match candidates.as_slice() {
+        [only] => only,
+        many => *many
+            .iter()
+            .find(|l| l.contains("_metal") || l.contains("metal_"))?,
+    };
     let after = decl.split("StructuredBuffer<uint").nth(1)?;
     let (comp_txt, rest) = after.split_once('>')?;
     let components: usize = if comp_txt.is_empty() {
@@ -313,55 +324,59 @@ fn slang_params_bytes(src: &str) -> Option<usize> {
     // switch is a reduction detail inside a helper, and every `par_buf` read is
     // after it), so keeping only the metal arm would see almost nothing and
     // silently under-report the width.
-    let mut switches = code.match_indices("__target_switch").filter(|(i, _)| {
-        code[i + "__target_switch".len()..]
-            .trim_start()
-            .starts_with('{')
-    });
-    let switch_at = switches.next().map(|(i, _)| i);
-    // More than one switch and the positional `default:`-drop below is
-    // ambiguous: a second switch's default arm would be counted in full.
-    if switches.next().is_some() {
-        return None;
-    }
-    let scope: String = match switch_at {
-        None => code.to_string(),
-        Some(sw) => {
-            // Brace-match from the switch to find its extent.
-            let bytes = code.as_bytes();
-            let open = sw + code[sw..].find('{')?;
-            let (mut depth, mut end) = (0usize, 0usize);
-            for (i, &b) in bytes.iter().enumerate().skip(open) {
-                match b {
-                    b'{' => depth += 1,
-                    b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = i + 1;
-                            break;
-                        }
+    // Every statement-level switch is handled, not just the first. `softmax.slang`
+    // has three and `rmsnorm.slang` two, so bailing on the second (as an earlier
+    // revision did) left exactly the multi-switch kernels uncovered.
+    let switch_starts: Vec<usize> = code
+        .match_indices("__target_switch")
+        .filter(|(i, _)| {
+            code[i + "__target_switch".len()..]
+                .trim_start()
+                .starts_with('{')
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    // The byte range of each switch's `default:` arm, i.e. what to delete.
+    let bytes = code.as_bytes();
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    for sw in switch_starts {
+        let open = sw + code[sw..].find('{')?;
+        let (mut depth, mut end) = (0usize, 0usize);
+        for (i, &b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
                     }
-                    _ => {}
                 }
-            }
-            // Unbalanced braces: the extent is a guess, so do not make one.
-            if end == 0 {
-                return None;
-            }
-            let body = &code[open..end];
-            match body.find("default:") {
-                // Everything but the default arm: before the switch, the metal
-                // arm, and everything after it. Slang allows `default:` before
-                // `case metal:`, which would drop the metal arm instead; refuse
-                // rather than silently reporting the smaller width.
-                Some(d) => match body.find("case metal:") {
-                    Some(m) if m < d => format!("{}{}", &code[..open + d], &code[end..]),
-                    _ => return None,
-                },
-                None => code.to_string(),
+                _ => {}
             }
         }
-    };
+        // Unbalanced braces: the extent is a guess, so do not make one.
+        if end == 0 {
+            return None;
+        }
+        let body = &code[open..end];
+        let Some(d) = body.find("default:") else {
+            continue; // no portable arm to drop
+        };
+        // Slang allows `default:` before `case metal:`, which would drop the
+        // metal arm instead. Refuse rather than report the smaller width.
+        match body.find("case metal:") {
+            Some(m) if m < d => cuts.push((open + d, end - 1)),
+            _ => return None,
+        }
+    }
+
+    // Delete back to front so earlier offsets stay valid.
+    let mut scope = code.to_string();
+    for (from, to) in cuts.into_iter().rev() {
+        scope.replace_range(from..to, "");
+    }
     let scope = scope.as_str();
 
     // Highest element index actually read, over `name[N]` (with or without a
@@ -419,7 +434,117 @@ fn slang_cases() -> Vec<(usize, &'static str, &'static str)> {
             include_str!("../src/backend/shaders/slang/conv1d_fused_batch.slang"),
             "Conv1dBatchParams",
         ),
+        (
+            size_of::<ArgmaxParams>(),
+            include_str!("../src/backend/shaders/slang/argmax_f32.slang"),
+            "ArgmaxParams",
+        ),
     ]
+}
+
+/// Every `.slang` params binding this test could ever be pointed at, so a
+/// rename or a lowering change fails here rather than going unnoticed.
+///
+/// `slang_cases` can only hold kernels whose host upload is *exactly* a Rust
+/// mirror. Several are not: `conv1d` reads 12 bytes from a 16-byte upload, and
+/// the ones dispatched from a literal `cast_slice(&[..])` have no mirror to name
+/// at all. Those still deserve a guard against the parser silently losing track
+/// of their binding, which is the failure that let the `argmax_f32` width
+/// mismatch through: it was not in the table, so nothing compared it to
+/// anything.
+///
+/// `None` here means the binding could not be found or resolved. It does not
+/// assert the width is *right*, only that it is still knowable.
+#[test]
+fn every_slang_params_binding_stays_parseable() {
+    // (source, name, expected bytes) for every flipped kernel with a params
+    // binding. The expected values are what the kernel reads, which is not
+    // always what the host uploads.
+    let sources: &[(&str, &str, usize)] = &[
+        (
+            include_str!("../src/backend/shaders/slang/argmax_f32.slang"),
+            "argmax_f32",
+            8,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/bias_add.slang"),
+            "bias_add",
+            8,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/conv1d.slang"),
+            "conv1d",
+            12,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/conv1d_fused.slang"),
+            "conv1d_fused",
+            12,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/conv1d_fused_batch.slang"),
+            "conv1d_fused_batch",
+            24,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/elementwise.slang"),
+            "elementwise",
+            8,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/gelu.slang"),
+            "gelu",
+            8,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/layernorm_batch.slang"),
+            "layernorm_batch",
+            16,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/per_head_rmsnorm.slang"),
+            "per_head_rmsnorm",
+            16,
+        ),
+        // Two params bindings, one per target; the metal arm is the 16-byte one.
+        (
+            include_str!("../src/backend/shaders/slang/rmsnorm.slang"),
+            "rmsnorm",
+            16,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/rmsnorm_batch.slang"),
+            "rmsnorm_batch",
+            20,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/rope.slang"),
+            "rope",
+            20,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/softmax.slang"),
+            "softmax",
+            8,
+        ),
+    ];
+    let failures: Vec<String> = sources
+        .iter()
+        .filter_map(|&(src, name, want)| match slang_params_bytes(src) {
+            None => Some(format!(
+                "{name}.slang: params binding not found or not resolvable"
+            )),
+            Some(got) if got != want => Some(format!(
+                "{name}.slang: kernel reads {got} B of params, expected {want} B"
+            )),
+            Some(_) => None,
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "Slang params drift:\n  {}",
+        failures.join("\n  ")
+    );
 }
 
 #[test]
@@ -533,13 +658,23 @@ fn slang_parser_refuses_to_guess() {
         Some(4 * 4)
     );
 
-    // Two read-only params bindings (the wgsl/metal split in `rmsnorm.slang`):
-    // ambiguous, so refuse rather than pick one.
+    // Two read-only params bindings, the wgsl/metal split `rmsnorm.slang` uses.
+    // Take the metal one: this is the Metal layout test, and refusing outright
+    // left every such kernel uncovered.
     assert_eq!(
         slang_params_bytes(
             "[[vk::binding(0)]] StructuredBuffer<uint> p_wgsl : register(t0);\n\
-             [[vk::binding(1)]] StructuredBuffer<uint> p_metal : register(t1);\n\
-             x = p_wgsl[1];"
+             [[vk::binding(1)]] StructuredBuffer<uint4> p_metal : register(t1);\n\
+             x = p_wgsl[7]; y = p_metal[0];"
+        ),
+        Some(4 * 4)
+    );
+    // Two bindings with no metal-specific name is still ambiguous.
+    assert_eq!(
+        slang_params_bytes(
+            "[[vk::binding(0)]] StructuredBuffer<uint> pa : register(t0);\n\
+             [[vk::binding(1)]] StructuredBuffer<uint> pb : register(t1);\n\
+             x = pa[1];"
         ),
         None
     );
@@ -556,11 +691,13 @@ fn slang_parser_refuses_to_guess() {
          \n  case metal:\n    x = params[1];\n    break;\n  }\n}";
     assert_eq!(slang_params_bytes(inverted), None);
 
-    // A second switch makes the positional `default:` drop ambiguous.
+    // Every switch gets its default arm dropped, not just the first. Here the
+    // second switch's portable arm reads a higher index than the metal one, and
+    // it must not count. `softmax.slang` really has three switches.
     let two = format!(
-        "{switched}\nvoid g() {{\n  __target_switch {{\n  case metal:\n    y = 1;\n    break;\n\n  default:\n    y = 2;\n    break;\n  }}\n}}"
+        "{switched}\nvoid g() {{\n  __target_switch {{\n  case metal:\n    y = params[2];\n    break;\n\n  default:\n    y = params[9];\n    break;\n  }}\n}}"
     );
-    assert_eq!(slang_params_bytes(&two), None);
+    assert_eq!(slang_params_bytes(&two), Some(3 * 4));
 
     // And it must agree with a source whose width we know independently:
     // `RopeParams` is 5 uints, asserted against `size_of` in `slang_cases`.

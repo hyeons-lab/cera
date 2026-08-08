@@ -10,10 +10,11 @@ use anyhow::Result;
 use metal::{Buffer, ComputePipelineState, MTLResourceOptions, MTLSize, NSUInteger};
 
 use crate::backend::metal::{
-    BiasAddParams, Conv1dBatchParams, ElementwiseParams, FlashAttnParams, GemmF32Params,
-    GemvBatchParams, GemvQkvParams, GemvRmsParams, GemvSplitKParams, KvCopyParams, KvShiftKParams,
-    MetalContext, MetalParams, PrefillAttnParams, QkNormRopeBatchParams, QkNormRopeParams,
-    QuantGemmParams, RmsNormBatchParams, RopeParams, ScaleParams, SplitAttnParams, shaders,
+    ArgmaxParams, BiasAddParams, Conv1dBatchParams, ElementwiseParams, FlashAttnParams,
+    GemmF32Params, GemvBatchParams, GemvQkvParams, GemvRmsParams, GemvSplitKParams, KvCopyParams,
+    KvShiftKParams, MetalContext, MetalParams, PrefillAttnParams, QkNormRopeBatchParams,
+    QkNormRopeParams, QuantGemmParams, RmsNormBatchParams, RopeParams, ScaleParams,
+    SplitAttnParams, shaders,
 };
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression, KvPrefixCache};
@@ -1039,7 +1040,9 @@ impl MetalLfm2Model {
             gemv_splitk_partials: make_buf(65536 * 8),
             logits_buf: make_buf(config.vocab_size),
             argmax_token_buf: ctx.create_buffer(4),
-            argmax_params_buf: ctx.upload_bytes(bytemuck::cast_slice(&[config.vocab_size as u32])),
+            argmax_params_buf: ctx.upload_bytes(bytemuck::cast_slice(&ArgmaxParams::words(
+                config.vocab_size as u32,
+            ))),
             conv_proj_buf: make_buf(3 * hs),
             conv_bx_buf: make_buf(hs),
             conv_out_buf: make_buf(hs),

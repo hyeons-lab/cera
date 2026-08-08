@@ -13,10 +13,11 @@ use metal::{
 
 pub mod params;
 pub use params::{
-    BiasAddParams, Conv1dBatchParams, ElementwiseParams, FlashAttnParams, GemmF32Params,
-    GemvBatchParams, GemvQkvParams, GemvRmsParams, GemvSplitKParams, KvCopyParams, KvShiftKParams,
-    MetalParams, PrefillAttnParams, QkNormRopeBatchParams, QkNormRopeParams, QuantGemmParams,
-    RmsNormBatchParams, RopeParams, ScaleParams, SplitAttnParams, TqAttnParams, TqParams,
+    ArgmaxParams, BiasAddParams, Conv1dBatchParams, ElementwiseParams, FlashAttnParams,
+    GemmF32Params, GemvBatchParams, GemvQkvParams, GemvRmsParams, GemvSplitKParams, KvCopyParams,
+    KvShiftKParams, MetalParams, PrefillAttnParams, QkNormRopeBatchParams, QkNormRopeParams,
+    QuantGemmParams, RmsNormBatchParams, RopeParams, ScaleParams, SplitAttnParams, TqAttnParams,
+    TqParams,
 };
 
 /// Metal compute context: device, command queue, compiled shader library cache.
