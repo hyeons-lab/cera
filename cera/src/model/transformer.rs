@@ -805,14 +805,21 @@ pub(crate) fn dequantize_row_into(
         // `MmapWeight::dequantize_row` does for the same dtypes; this path
         // simply never had the arms, which made an otherwise loadable model
         // panic on its first token.
+        // The `zip`s below stop at the shorter side, so a row that did not
+        // match `out` would leave part of the embedding as whatever the buffer
+        // held. The F32 arm gets this for free from `copy_from_slice`, which
+        // panics on a length mismatch; assert so these behave the same on a
+        // malformed file instead of returning a quietly half-filled row.
         DType::F16 => {
             let halves: &[u16] = bytemuck::cast_slice(row_data);
+            assert_eq!(halves.len(), out.len(), "F16 embedding row length");
             for (o, &h) in out.iter_mut().zip(halves) {
                 *o = crate::quant::f16_to_f32(h);
             }
         }
         DType::BF16 => {
             let halves: &[u16] = bytemuck::cast_slice(row_data);
+            assert_eq!(halves.len(), out.len(), "BF16 embedding row length");
             for (o, &h) in out.iter_mut().zip(halves) {
                 *o = f32::from_bits(u32::from(h) << 16);
             }
