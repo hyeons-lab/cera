@@ -280,6 +280,12 @@ fn slang_params_bytes(src: &str) -> Option<usize> {
                 && !t.contains("RWStructuredBuffer<uint")
         })
         .collect();
+    // Only `uint`-typed bindings are recognized, which every params buffer here
+    // is. That is not a silent assumption: a params binding of some other
+    // element type leaves `candidates` empty, which falls through to `None` and
+    // fails the test, rather than being skipped. Widen the needle when a kernel
+    // actually needs it.
+    //
     // A `__target_switch` source can declare one params binding per target, as
     // `rmsnorm.slang` does with `p_wgsl` and `p_metal`, because the two branches
     // want different layouts. This is the Metal layout test, so take the
@@ -669,6 +675,15 @@ fn slang_parser_refuses_to_guess() {
         ),
         Some(4 * 4)
     );
+    // A params binding of a non-`uint` element type is not silently skipped.
+    assert_eq!(
+        slang_params_bytes(
+            "[[vk::binding(0)]] StructuredBuffer<float> par_buf : register(t0);\n\
+             x = par_buf[1];"
+        ),
+        None
+    );
+
     // Two bindings with no metal-specific name is still ambiguous.
     assert_eq!(
         slang_params_bytes(
