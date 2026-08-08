@@ -3064,7 +3064,7 @@ pub(crate) mod neon {
         /// declares `neon,fp16`, so this still executes on the dev host, where
         /// the i8mm kernels that call it never run.
         #[test]
-        fn f16_widen_matches_half_crate_exhaustively() {
+        fn neon_f16_widen_matches_half_crate_exhaustively() {
             if !require_simd_or_skip("fp16", std::arch::is_aarch64_feature_detected!("fp16")) {
                 return;
             }
@@ -3762,7 +3762,14 @@ pub(crate) mod neon {
         /// `CERA_REQUIRE_SIMD=i8mm`. Covers odd m and n for the remainder paths.
         #[test]
         fn i8mm_gemm_matches_dotprod() {
-            if !require_simd_or_skip("i8mm", std::arch::is_aarch64_feature_detected!("i8mm")) {
+            // Two checks, not one condition: the kernels declare `neon,i8mm,fp16`,
+            // and `CERA_REQUIRE_SIMD` matches on the label, so a combined gate
+            // would blame `i8mm` for a missing `fp16`. FEAT_I8MM (v8.6) implies
+            // FEAT_FP16 (v8.2) on any real part, so the second check is stating
+            // the contract, not expecting to fire.
+            if !require_simd_or_skip("i8mm", std::arch::is_aarch64_feature_detected!("i8mm"))
+                || !require_simd_or_skip("fp16", std::arch::is_aarch64_feature_detected!("fp16"))
+            {
                 return;
             }
             for &(m, n, k) in &[(4usize, 4usize, 64usize), (5, 3, 96), (2, 7, 64)] {
@@ -3808,7 +3815,14 @@ pub(crate) mod neon {
         /// and n for the scalar-remainder paths.
         #[test]
         fn q4_0_gemm_i8mm_matches_dotprod() {
-            if !require_simd_or_skip("i8mm", std::arch::is_aarch64_feature_detected!("i8mm")) {
+            // Two checks, not one condition: the kernels declare `neon,i8mm,fp16`,
+            // and `CERA_REQUIRE_SIMD` matches on the label, so a combined gate
+            // would blame `i8mm` for a missing `fp16`. FEAT_I8MM (v8.6) implies
+            // FEAT_FP16 (v8.2) on any real part, so the second check is stating
+            // the contract, not expecting to fire.
+            if !require_simd_or_skip("i8mm", std::arch::is_aarch64_feature_detected!("i8mm"))
+                || !require_simd_or_skip("fp16", std::arch::is_aarch64_feature_detected!("fp16"))
+            {
                 return;
             }
             for &(m, n, k) in &[(4usize, 4usize, 64usize), (5, 3, 96), (2, 7, 64)] {

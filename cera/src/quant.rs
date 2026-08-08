@@ -59,10 +59,10 @@ pub(crate) fn f16_to_f32(bits: u16) -> f32 {
 ///
 /// Correctness here is load-bearing: this writes the f16 KV cache and the
 /// TurboQuant norms, so a rounding slip corrupts inference rather than merely
-/// slowing it. `f32_to_f16_matches_half_crate_exhaustively` checks the full
-/// 2^32 input space against the `half` crate, which is the only way to be sure
-/// the tie-breaking, the overflow-to-infinity carry, and the subnormal path all
-/// agree.
+/// slowing it. The full 2^32 input space was swept against the `half` crate
+/// once, off-CI, with zero mismatches; `f32_to_f16_matches_half_crate` is what
+/// remains of that in the suite, and it enumerates the classes a hand-rolled
+/// rounder actually gets wrong rather than re-running the sweep.
 #[inline(always)]
 pub(crate) fn f32_to_f16(v: f32) -> u16 {
     let b = v.to_bits();
@@ -905,18 +905,6 @@ mod tests {
     use super::*;
     use half::f16;
 
-    /// `f16_to_f32` is open-coded, so it must equal `half`'s conversion for
-    /// every one of the 65536 half patterns, exactly.
-    ///
-    /// Exhaustive rather than sampled because the interesting inputs are the
-    /// rare ones: the subnormal renormalization is a different arm of the match
-    /// from normals, and random draws would essentially never hit it. This also
-    /// covers the two boundaries the arms meet at (`exp == 0` and `exp == 0x1F`)
-    /// without having to enumerate them by hand.
-    ///
-    /// The kernel tests below cannot stand in for this: they compare the f16
-    /// kernels against a scalar dot over values widened by *this same function*,
-    /// so a wrong conversion cancels out on both sides and they still pass.
     /// `f32_to_f16` must round exactly like `half::f16::from_f32`.
     ///
     /// The full 2^32 input space was swept once against the `half` crate and
@@ -929,16 +917,34 @@ mod tests {
     /// normal-to-subnormal seam, and underflow.
     #[test]
     fn f32_to_f16_matches_half_crate() {
-        // Every representable half, widened and narrowed back.
+        // Every representable half, widened and narrowed back. NaN is compared
+        // by bits rather than skipped: `exp == 0xFF && mant != 0` is the one arm
+        // where narrowing is not a shift-and-round, so skipping it left the only
+        // interesting case untested.
         for bits in 0..=u16::MAX {
             let v = f16_to_f32(bits);
-            if v.is_nan() {
-                continue;
-            }
             assert_eq!(
                 f32_to_f16(v),
                 f16::from_f32(v).to_bits(),
                 "round-trip of half {bits:#06x} ({v})"
+            );
+        }
+
+        // Both NaN kinds narrowed directly from f32, including a payload that
+        // is entirely in the low bits the half cannot keep: `half` maps that to
+        // a quiet NaN rather than to infinity, and so must this.
+        for &nan_bits in &[
+            0x7FC0_0000u32, // qNaN
+            0xFFC0_0000,    // qNaN, negative
+            0x7F80_0001,    // sNaN, minimal payload
+            0x7F80_1000,    // sNaN, payload only in bits the half drops
+            0xFF80_0001,    // sNaN, negative
+        ] {
+            let v = f32::from_bits(nan_bits);
+            assert_eq!(
+                f32_to_f16(v),
+                f16::from_f32(v).to_bits(),
+                "narrowing f32 NaN {nan_bits:#010x}"
             );
         }
 
@@ -994,6 +1000,18 @@ mod tests {
         }
     }
 
+    /// `f16_to_f32` is open-coded, so it must equal `half`'s conversion for
+    /// every one of the 65536 half patterns, exactly.
+    ///
+    /// Exhaustive rather than sampled because the interesting inputs are the
+    /// rare ones: the subnormal renormalization is a different arm of the match
+    /// from normals, and random draws would essentially never hit it. This also
+    /// covers the two boundaries the arms meet at (`exp == 0` and `exp == 0x1F`)
+    /// without having to enumerate them by hand.
+    ///
+    /// The kernel tests cannot stand in for this: they compare the f16 kernels
+    /// against a scalar dot over values widened by *this same function*, so a
+    /// wrong conversion cancels out on both sides and they still pass.
     #[test]
     fn f16_widen_matches_half_crate_exhaustively() {
         for bits in 0..=u16::MAX {
