@@ -257,9 +257,14 @@ const _: () = assert!(size_of::<BlockQ5K>() == 176);
 /// block of `debug_assert`s per quant kept in agreement by hand, and those
 /// asserts are the whole guard: `par_chunks(row_bytes)` on a `k` that is not a
 /// whole number of blocks splits the rows at the wrong offsets and dequantizes
-/// garbage without failing. Deriving the width from `size_of::<$block>()` also
-/// makes it impossible to pair one quant's block struct with another's row
-/// helper, which the copies made a plain typo.
+/// garbage without failing.
+///
+/// What this does *not* do is make a wrong pairing impossible. `$elems`,
+/// `$block` and `$row` are three independent arguments, and nothing ties them
+/// to each other: a `$block` from one quant with a `$row` from another still
+/// compiles, and shows up as a tripped `debug_assert` rather than an error.
+/// What it removes is the hand-copied byte arithmetic and the six chances to
+/// mistype a name inside an assertion message.
 ///
 /// Invoked in place in each format's section rather than all together, so the
 /// file stays organized by quant format.

@@ -321,24 +321,15 @@ mod gate_tests {
         }
     }
 
-    /// Every dtype the gate admits must be one the BLAS route can actually run.
+    /// The `DType` variants the sweep below runs over.
     ///
-    /// This is the implication whose failure the PR's own comments describe as
-    /// silent corruption: callers discard `try_blas_prefill_gemm`'s bool, so a
-    /// dtype admitted by [`batched_gemm_supports`] but missing from
-    /// [`blas_dequantizer`] skips the matmul and leaves the previous layer's
-    /// activations in the reused output buffer. Neither the gate test nor the
-    /// dequantizer's own unit test connects the two; this does.
-    ///
-    /// Only meaningful under `blas` (that is the only configuration in which
-    /// `try_blas_prefill_gemm` exists), and CI runs a `--features blas` leg.
-    /// Every `DType`, so the sweep below cannot quietly miss one.
-    ///
-    /// Hand-written, because `DType` has no iteration helper. What keeps it
-    /// honest is `all_dtypes_is_exhaustive`: adding a variant breaks that
-    /// match, and the fix is one line away from this array. Note what that does
-    /// *not* buy: it forces a visit, not a correct edit. Someone who adds a
-    /// variant to the match and forgets the array still gets a green sweep.
+    /// Hand-written, because `DType` has no iteration helper, so it is only as
+    /// complete as the last person to edit it. `all_dtypes_is_exhaustive` is
+    /// what makes that survivable: adding a variant breaks that match, one line
+    /// from this array. Be clear on what that buys, though, because it is less
+    /// than it looks: it forces a visit, not a correct edit. Add a variant to
+    /// the match and forget the array and the sweep still passes, having
+    /// quietly skipped it.
     #[cfg(feature = "blas")]
     const ALL_DTYPES: [DType; 11] = [
         DType::F32,
@@ -372,6 +363,17 @@ mod gate_tests {
         }
     }
 
+    /// Every dtype the gate admits must be one the BLAS route can actually run.
+    ///
+    /// This is the implication whose failure the PR's own comments describe as
+    /// silent corruption: callers discard `try_blas_prefill_gemm`'s bool, so a
+    /// dtype admitted by [`batched_gemm_supports`] but missing from
+    /// [`blas_dequantizer`] skips the matmul and leaves the previous layer's
+    /// activations in the reused output buffer. Neither the gate test nor the
+    /// dequantizer's own unit test connects the two; this does.
+    ///
+    /// Only meaningful under `blas` (that is the only configuration in which
+    /// `try_blas_prefill_gemm` exists), and CI runs a `--features blas` leg.
     #[cfg(feature = "blas")]
     #[test]
     fn blas_gate_agrees_with_dequantizer_table() {
