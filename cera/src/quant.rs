@@ -253,11 +253,18 @@ const _: () = assert!(size_of::<BlockQ5K>() == 176);
 /// helper.
 ///
 /// Six of these existed verbatim, differing only in those three things and in
-/// the function name repeated inside their own assertion messages. That is a
-/// block of `debug_assert`s per quant kept in agreement by hand, and those
-/// asserts are the whole guard: `par_chunks(row_bytes)` on a `k` that is not a
-/// whole number of blocks splits the rows at the wrong offsets and dequantizes
-/// garbage without failing.
+/// the function name repeated inside their own assertion messages, a block of
+/// `debug_assert`s per quant kept in agreement by hand.
+///
+/// Those asserts are a debug-build check on the caller, not a release guard:
+/// they compile out, and `par_chunks(row_bytes)` on a `k` that is not a whole
+/// number of blocks then splits the rows at the wrong offsets and dequantizes
+/// garbage without failing. What actually upholds the invariant in release is
+/// the caller. Every one of these runs behind `batched_gemm_supports`, which
+/// requires `k.is_multiple_of(256)` for the K-quants, and the 32-wide formats
+/// get it from GGUF itself, which cannot store a quantized row that is not a
+/// whole number of blocks. A new caller outside that gate would need its own
+/// check.
 ///
 /// What this does *not* do is make a wrong pairing impossible. `$elems`,
 /// `$block` and `$row` are three independent arguments, and nothing ties them

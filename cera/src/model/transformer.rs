@@ -236,7 +236,12 @@ pub(crate) fn weight_data<'a>(gguf: &'a GgufFile, wref: &WeightRef) -> &'a [u8] 
     &gguf.mmap_data()[wref.start..wref.start + wref.size]
 }
 
+/// Gated exactly like `batched_gemm_supports` itself, which is
+/// `#[cfg(any(aarch64, x86_64, feature = "blas"))]`. Without this the module
+/// still compiles into a wasm32 test build and fails on a function that does
+/// not exist there. CI lints the host target only, so nothing caught it.
 #[cfg(test)]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
 mod gate_tests {
     use super::*;
 
@@ -653,12 +658,9 @@ pub(crate) fn try_blas_prefill_gemm(
         // Reachable only if `batched_gemm_supports` admitted a dtype this
         // function cannot run, which is the silent-corruption case: the caller
         // ignores this `false` and goes on to read an output buffer that still
-        // holds the previous layer's activations. Loud in debug, free in release.
-        debug_assert!(
-            false,
-            "try_blas_prefill_gemm: no dequantizer for {:?}, but the gate admitted it",
-            wref.dtype
-        );
+        // holds the previous layer's activations. Same failure as `gemm_preq`
+        // declining, so it gets the same debug panic and release log.
+        report_uncomputed_gemm("try_blas_prefill_gemm", wref.dtype, k);
         return false;
     };
     dequantize(data, m, k, dequant);
@@ -738,7 +740,7 @@ pub(crate) fn gemm_preq(
             ),
         };
         if !ran {
-            report_uncomputed_gemm(wref.dtype, k);
+            report_uncomputed_gemm("gemm_preq", wref.dtype, k);
         }
         return ran;
     }
@@ -752,7 +754,7 @@ pub(crate) fn gemm_preq(
         // across layers, so an uncomputed GEMM leaves the *previous* layer's
         // activations in `out`. (`LlamaModel::project_logits_batched` is the one
         // caller that does check it, and has a per-row path to fall back to.)
-        report_uncomputed_gemm(wref.dtype, k);
+        report_uncomputed_gemm("gemm_preq", wref.dtype, k);
     }
     ran
 }
@@ -761,23 +763,30 @@ pub(crate) fn gemm_preq(
 ///
 /// This must never happen — `batched_gemm_supports` gates it — so treat it as the
 /// invariant break it is. It is *not* a benign "fall back to the slow path": the
-/// callers of `gemm_preq` **ignore its return value** — `LlamaModel::project_logits_batched`
-/// is the one exception, declining to its per-row fallback — and they reuse a single
+/// callers **ignore the return value** (`LlamaModel::project_logits_batched`
+/// is the one exception, declining to its per-row fallback) and they reuse a single
 /// output buffer across layers, so for the rest an uncomputed GEMM leaves the previous
 /// layer's activations in `out` and inference produces confident garbage. Panic in debug;
 /// in release, at least say so loudly rather than silently corrupting the forward pass.
-#[cfg(all(
-    any(target_arch = "aarch64", target_arch = "x86_64"),
-    not(feature = "blas")
+///
+/// `route` names the dispatcher that declined, since the two are mutually
+/// exclusive by cfg: `gemm_preq` without `blas`, `try_blas_prefill_gemm` with.
+/// Both fail the same way and deserve the same noise.
+#[cfg(any(
+    all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(feature = "blas")
+    ),
+    feature = "blas"
 ))]
-fn report_uncomputed_gemm(dtype: DType, k: usize) {
+fn report_uncomputed_gemm(route: &str, dtype: DType, k: usize) {
     debug_assert!(
         false,
-        "gemm_preq: no batched kernel ran for {dtype:?} (k={k}), but `batched_gemm_supports` \
+        "{route}: no batched kernel ran for {dtype:?} (k={k}), but `batched_gemm_supports` \
          admitted it — the gate and the kernel table have drifted. `out` is now stale."
     );
     tracing::error!(
-        "gemm_preq: no batched kernel for {dtype:?} (k={k}); the matmul was NOT computed \
+        "{route}: no batched kernel for {dtype:?} (k={k}); the matmul was NOT computed \
          and the output buffer holds stale data"
     );
 }

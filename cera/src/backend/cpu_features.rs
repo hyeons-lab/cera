@@ -1168,11 +1168,25 @@ mod tests {
     #[test]
     fn tier_label_roundtrips_through_parse() {
         // `parse` is arch-gated, so only the current arch's tiers round-trip.
-        let mut tiers = vec![CpuTier::Scalar];
+        // Built per-arch rather than extended in place: on a target that is
+        // neither, both `extend` calls vanish and the `mut` becomes an
+        // `unused_mut` error under `-D warnings`.
         #[cfg(target_arch = "x86_64")]
-        tiers.extend([CpuTier::Avx2, CpuTier::Avx512, CpuTier::Avx512Vnni]);
+        let tiers = vec![
+            CpuTier::Scalar,
+            CpuTier::Avx2,
+            CpuTier::Avx512,
+            CpuTier::Avx512Vnni,
+        ];
         #[cfg(target_arch = "aarch64")]
-        tiers.extend([CpuTier::Neon, CpuTier::NeonDotprod, CpuTier::NeonI8mm]);
+        let tiers = vec![
+            CpuTier::Scalar,
+            CpuTier::Neon,
+            CpuTier::NeonDotprod,
+            CpuTier::NeonI8mm,
+        ];
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let tiers = vec![CpuTier::Scalar];
         for t in tiers {
             assert_eq!(CpuTier::parse(t.label()), Some(t), "label {:?}", t.label());
         }
