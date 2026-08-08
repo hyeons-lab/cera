@@ -249,6 +249,69 @@ pub struct BlockQ5K {
 
 const _: () = assert!(size_of::<BlockQ5K>() == 176);
 
+/// Define a `dequantize_*_matrix` from its block width, block struct and per-row
+/// helper.
+///
+/// Six of these existed verbatim, differing only in those three things and in
+/// the function name repeated inside their own assertion messages, a block of
+/// `debug_assert`s per quant kept in agreement by hand.
+///
+/// Those asserts are a debug-build check on the caller, not a release guard:
+/// they compile out, and `par_chunks(row_bytes)` on a `k` that is not a whole
+/// number of blocks then splits the rows at the wrong offsets and dequantizes
+/// garbage without failing. What actually upholds the invariant in release is
+/// the caller. Every one of these runs behind `batched_gemm_supports`, which
+/// requires `k.is_multiple_of(256)` for the K-quants, and the 32-wide formats
+/// get it from GGUF itself, which cannot store a quantized row that is not a
+/// whole number of blocks. A new caller outside that gate would need its own
+/// check.
+///
+/// What this does *not* do is make a wrong pairing impossible. `$elems`,
+/// `$block` and `$row` are three independent arguments, and nothing ties them
+/// to each other: a `$block` from one quant with a `$row` from another still
+/// compiles, and shows up as a tripped `debug_assert` rather than an error.
+/// What it removes is the hand-copied byte arithmetic and the six chances to
+/// mistype a name inside an assertion message.
+///
+/// Invoked in place in each format's section rather than all together, so the
+/// file stays organized by quant format.
+macro_rules! dequantize_matrix {
+    ($name:ident, $elems:expr, $block:ty, $row:path, $($summary:expr),+ $(,)?) => {
+        $(#[doc = $summary])+
+        ///
+        /// `src` is the raw packed block bytes; `out` must have space for
+        /// `m * k` f32s. Rows are dequantized in parallel with rayon, whose
+        /// split-on-demand runs tiny inputs on a single worker, so there is no
+        /// manual cutoff.
+        pub fn $name(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
+            debug_assert_eq!(
+                k % $elems,
+                0,
+                concat!(
+                    stringify!($name),
+                    ": k must be a multiple of ",
+                    stringify!($elems)
+                )
+            );
+            let row_bytes = (k / $elems) * size_of::<$block>();
+            debug_assert_eq!(
+                src.len(),
+                m * row_bytes,
+                concat!(stringify!($name), ": src length mismatch")
+            );
+            debug_assert_eq!(
+                out.len(),
+                m * k,
+                concat!(stringify!($name), ": out length mismatch")
+            );
+
+            out.par_chunks_mut(k)
+                .zip(src.par_chunks(row_bytes))
+                .for_each(|(dst_row, src_row)| $row(src_row, dst_row));
+        }
+    };
+}
+
 // ── Q4_0 dequantization ─────────────────────────────────────────────────────
 
 /// Dequantize a single Q4_0 block to 32 f32 values.
@@ -284,33 +347,13 @@ pub fn dequantize_q4_0_row(src: &[u8], dst: &mut [f32]) {
     }
 }
 
-/// Dequantize a Q4_0 matrix of shape `[m, k]` (row-major) to `out`.
-///
-/// `src` is the raw packed block bytes, `out` must have space for `m * k` f32s.
-/// Rows are dequantized in parallel with rayon (rayon's split-on-demand handles
-/// tiny inputs by running them on a single worker, so no manual cutoff needed).
-pub fn dequantize_q4_0_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
-    debug_assert_eq!(
-        k % 32,
-        0,
-        "dequantize_q4_0_matrix: k must be a multiple of 32"
-    );
-    let row_bytes = (k / 32) * size_of::<BlockQ4_0>();
-    debug_assert_eq!(
-        src.len(),
-        m * row_bytes,
-        "dequantize_q4_0_matrix: src length mismatch"
-    );
-    debug_assert_eq!(
-        out.len(),
-        m * k,
-        "dequantize_q4_0_matrix: out length mismatch"
-    );
-
-    out.par_chunks_mut(k)
-        .zip(src.par_chunks(row_bytes))
-        .for_each(|(dst_row, src_row)| dequantize_q4_0_row(src_row, dst_row));
-}
+dequantize_matrix!(
+    dequantize_q4_0_matrix,
+    32,
+    BlockQ4_0,
+    dequantize_q4_0_row,
+    "Dequantize a Q4_0 matrix of shape `[m, k]` (row-major) to `out`."
+);
 
 /// Dot product of a Q4_0 block with an f32 vector of length 32. Scalar version.
 pub fn vec_dot_q4_0_f32_scalar(block: &BlockQ4_0, y: &[f32]) -> f32 {
@@ -365,29 +408,13 @@ pub fn dequantize_q4_1_row(src: &[u8], dst: &mut [f32]) {
     }
 }
 
-/// Dequantize a Q4_1 matrix of shape `[m, k]` (row-major) to `out`.
-pub fn dequantize_q4_1_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
-    debug_assert_eq!(
-        k % 32,
-        0,
-        "dequantize_q4_1_matrix: k must be a multiple of 32"
-    );
-    let row_bytes = (k / 32) * size_of::<BlockQ4_1>();
-    debug_assert_eq!(
-        src.len(),
-        m * row_bytes,
-        "dequantize_q4_1_matrix: src length mismatch"
-    );
-    debug_assert_eq!(
-        out.len(),
-        m * k,
-        "dequantize_q4_1_matrix: out length mismatch"
-    );
-
-    out.par_chunks_mut(k)
-        .zip(src.par_chunks(row_bytes))
-        .for_each(|(dst_row, src_row)| dequantize_q4_1_row(src_row, dst_row));
-}
+dequantize_matrix!(
+    dequantize_q4_1_matrix,
+    32,
+    BlockQ4_1,
+    dequantize_q4_1_row,
+    "Dequantize a Q4_1 matrix of shape `[m, k]` (row-major) to `out`."
+);
 
 /// Dot product of a Q4_1 block with an f32 vector of length 32.
 ///
@@ -446,85 +473,48 @@ pub fn dequantize_q8_0_row(src: &[u8], dst: &mut [f32]) {
     }
 }
 
-/// Dequantize a Q8_0 matrix of shape `[m, k]` (row-major) to `out`.
-///
-/// `src` is the raw packed block bytes, `out` must have space for `m * k` f32s.
-/// Rows are dequantized in parallel with rayon (rayon's split-on-demand handles
-/// tiny inputs by running them on a single worker, so no manual cutoff needed).
-pub fn dequantize_q8_0_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
-    debug_assert_eq!(
-        k % 32,
-        0,
-        "dequantize_q8_0_matrix: k must be a multiple of 32"
-    );
-    let row_bytes = (k / 32) * size_of::<BlockQ8_0>();
-    debug_assert_eq!(
-        src.len(),
-        m * row_bytes,
-        "dequantize_q8_0_matrix: src length mismatch"
-    );
-    debug_assert_eq!(
-        out.len(),
-        m * k,
-        "dequantize_q8_0_matrix: out length mismatch"
-    );
+dequantize_matrix!(
+    dequantize_q8_0_matrix,
+    32,
+    BlockQ8_0,
+    dequantize_q8_0_row,
+    "Dequantize a Q8_0 matrix of shape `[m, k]` (row-major) to `out`."
+);
 
-    out.par_chunks_mut(k)
-        .zip(src.par_chunks(row_bytes))
-        .for_each(|(dst_row, src_row)| dequantize_q8_0_row(src_row, dst_row));
-}
+dequantize_matrix!(
+    dequantize_q4_k_m_matrix,
+    256,
+    BlockQ4KM,
+    dequantize_q4_k_m_row,
+    "Dequantize a Q4_K matrix of shape `[m, k]` (row-major) to `out`.",
+    "",
+    "Superblocks are 256 wide, so `k` must be a multiple of 256 (not 32).",
+);
 
-/// Dequantize a Q4_K matrix of shape `[m, k]` (row-major) to `out`.
-///
-/// Superblocks are 256 wide, so `k` must be a multiple of 256 (not 32).
-pub fn dequantize_q4_k_m_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
-    debug_assert_eq!(
-        k % 256,
-        0,
-        "dequantize_q4_k_m_matrix: k must be a multiple of 256"
-    );
-    let row_bytes = (k / 256) * size_of::<BlockQ4KM>();
-    debug_assert_eq!(
-        src.len(),
-        m * row_bytes,
-        "dequantize_q4_k_m_matrix: src length mismatch"
-    );
-    debug_assert_eq!(
-        out.len(),
-        m * k,
-        "dequantize_q4_k_m_matrix: out length mismatch"
-    );
+dequantize_matrix!(
+    dequantize_q5_k_matrix,
+    256,
+    BlockQ5K,
+    dequantize_q5_k_row,
+    "Dequantize a Q5_K matrix of shape `[m, k]` (row-major) to `out`.",
+    "",
+    "Superblocks are 256 wide, so `k` must be a multiple of 256 (not 32).",
+    "",
+    "Exists for the BLAS prefill route, which dequantizes the weight and SGEMMs",
+    "rather than running an int8 kernel: Q5_K is the one shipped K-quant with no",
+    "int8 GEMM, so before this it fell through to the per-token GEMV and prefill",
+    "collapsed (measured 4-5 tok/s against Q4_K_M's 228 on the same model and host).",
+);
 
-    out.par_chunks_mut(k)
-        .zip(src.par_chunks(row_bytes))
-        .for_each(|(dst_row, src_row)| dequantize_q4_k_m_row(src_row, dst_row));
-}
-
-/// Dequantize a Q6_K matrix of shape `[m, k]` (row-major) to `out`.
-///
-/// Superblocks are 256 wide, so `k` must be a multiple of 256 (not 32).
-pub fn dequantize_q6_k_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
-    debug_assert_eq!(
-        k % 256,
-        0,
-        "dequantize_q6_k_matrix: k must be a multiple of 256"
-    );
-    let row_bytes = (k / 256) * size_of::<BlockQ6K>();
-    debug_assert_eq!(
-        src.len(),
-        m * row_bytes,
-        "dequantize_q6_k_matrix: src length mismatch"
-    );
-    debug_assert_eq!(
-        out.len(),
-        m * k,
-        "dequantize_q6_k_matrix: out length mismatch"
-    );
-
-    out.par_chunks_mut(k)
-        .zip(src.par_chunks(row_bytes))
-        .for_each(|(dst_row, src_row)| dequantize_q6_k_row(src_row, dst_row));
-}
+dequantize_matrix!(
+    dequantize_q6_k_matrix,
+    256,
+    BlockQ6K,
+    dequantize_q6_k_row,
+    "Dequantize a Q6_K matrix of shape `[m, k]` (row-major) to `out`.",
+    "",
+    "Superblocks are 256 wide, so `k` must be a multiple of 256 (not 32).",
+);
 
 /// Dot product of a Q8_0 block with an f32 vector of length 32. Scalar version.
 pub fn vec_dot_q8_0_f32_scalar(block: &BlockQ8_0, y: &[f32]) -> f32 {
@@ -1315,6 +1305,57 @@ mod tests {
                 dst[32 + i]
             );
         }
+    }
+
+    /// `dequantize_q5_k_matrix` must equal a loop of `dequantize_q5_k_row`,
+    /// bit for bit.
+    ///
+    /// This is the only thing standing between a Q5_K model and silently wrong
+    /// prefill: the BLAS route dequantizes the whole weight matrix and SGEMMs,
+    /// so an off-by-one in the row striding would corrupt every batched token
+    /// while decode, which uses the per-row path, stayed correct and hid it.
+    /// `m` is above the parallel threshold on purpose, since the matrix helper
+    /// splits rows across workers and the row helper does not.
+    #[test]
+    fn test_dequantize_q5_k_matrix_matches_row() {
+        let m = 128;
+        let k = 512; // 2 superblocks per row
+        let blocks_per_row = k / 256;
+        let row_bytes = blocks_per_row * size_of::<BlockQ5K>();
+
+        let mut st = 0x5EED_1234u32;
+        let mut byte = || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (st >> 24) as u8
+        };
+        let mut src = vec![0u8; m * row_bytes];
+        src.iter_mut().for_each(|b| *b = byte());
+        // Keep the scale fields finite. Random bits can land on inf/NaN, and
+        // since NaN never compares equal to itself the `assert_eq!` below would
+        // then fail on rows that actually agree: a flaky red, not a false pass.
+        (0..m)
+            .flat_map(|row| (0..blocks_per_row).map(move |b| (row, b)))
+            .for_each(|(row, b)| {
+                let off = row * row_bytes + b * size_of::<BlockQ5K>();
+                let d = f16::from_f32(0.05 + (row % 7) as f32 * 0.01).to_bits();
+                let dmin = f16::from_f32(0.02 + (b % 3) as f32 * 0.01).to_bits();
+                src[off..off + 2].copy_from_slice(&d.to_le_bytes());
+                src[off + 2..off + 4].copy_from_slice(&dmin.to_le_bytes());
+            });
+
+        let mut via_matrix = vec![0.0f32; m * k];
+        dequantize_q5_k_matrix(&src, m, k, &mut via_matrix);
+
+        let mut via_rows = vec![0.0f32; m * k];
+        via_rows
+            .chunks_mut(k)
+            .zip(src.chunks(row_bytes))
+            .for_each(|(dst, s)| dequantize_q5_k_row(s, dst));
+
+        assert_eq!(
+            via_matrix, via_rows,
+            "matrix and row dequantization diverged"
+        );
     }
 
     #[test]

@@ -236,7 +236,12 @@ pub(crate) fn weight_data<'a>(gguf: &'a GgufFile, wref: &WeightRef) -> &'a [u8] 
     &gguf.mmap_data()[wref.start..wref.start + wref.size]
 }
 
+/// Gated exactly like `batched_gemm_supports` itself, which is
+/// `#[cfg(any(aarch64, x86_64, feature = "blas"))]`. Without this the module
+/// still compiles into a wasm32 test build and fails on a function that does
+/// not exist there. CI lints the host target only, so nothing caught it.
 #[cfg(test)]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
 mod gate_tests {
     use super::*;
 
@@ -273,14 +278,124 @@ mod gate_tests {
         }
     }
 
-    /// Dtypes with no int8 kernel must decline whatever the host.
+    /// Dtypes with no batched path at all must decline whatever the host.
+    ///
+    /// Q5_K used to belong here and no longer does: it has no int8 GEMM, but it
+    /// does have the BLAS dequant+SGEMM route, so it is conditionally supported
+    /// rather than never supported. See `q5_k_is_batched_exactly_under_blas`.
     #[test]
     fn unsupported_dtypes_are_never_batched() {
-        for dtype in [DType::Q5KM, DType::F16, DType::F32] {
+        for dtype in [DType::F16, DType::F32, DType::BF16, DType::I32, DType::U8] {
             assert!(
                 !batched_gemm_supports(dtype, 256),
                 "{dtype:?} was admitted to the batched path with no kernel to run it"
             );
+        }
+    }
+
+    /// Q5_K is batched **exactly** when `blas` is on, and this asserts the
+    /// biconditional rather than one direction of it.
+    ///
+    /// The failure it guards is not a slow path, it is silent corruption. Q5_K
+    /// has no int8 GEMM, so admitting it without BLAS makes `gemm_preq` decline
+    /// and the matmul get skipped entirely; the callers reuse one output buffer
+    /// across layers, so what the next layer reads is not zeros but the
+    /// *previous layer's* activations. Gating on `k_quant_gemm_available()`
+    /// like its K-quant siblings would do exactly that on any dotprod aarch64
+    /// host built without `blas`, which is every mobile build.
+    #[test]
+    fn q5_k_is_batched_exactly_under_blas() {
+        // Swept over the same k list as `k_quant_batched_gemm_requires_whole_superblocks`
+        // rather than checked at one aligned and one unaligned value. Note the
+        // negative half is vacuous without `blas` (the arm is already false for
+        // every k there), so the alignment requirement is only really asserted
+        // in the blas leg, which is the only configuration that can reach the
+        // dequantizer at all.
+        for k in [256usize, 512, 2048] {
+            assert_eq!(
+                batched_gemm_supports(DType::Q5KM, k),
+                cfg!(feature = "blas"),
+                "Q5_K at k={k} must track the `blas` feature exactly"
+            );
+        }
+        for k in [32usize, 96, 128, 255, 257, 384] {
+            assert!(
+                !batched_gemm_supports(DType::Q5KM, k),
+                "Q5_K admitted at k={k}, which is not a multiple of its 256-wide superblock"
+            );
+        }
+    }
+
+    /// The `DType` variants the sweep below runs over.
+    ///
+    /// Hand-written, because `DType` has no iteration helper, so it is only as
+    /// complete as the last person to edit it. `all_dtypes_is_exhaustive` is
+    /// what makes that survivable: adding a variant breaks that match, one line
+    /// from this array. Be clear on what that buys, though, because it is less
+    /// than it looks: it forces a visit, not a correct edit. Add a variant to
+    /// the match and forget the array and the sweep still passes, having
+    /// quietly skipped it.
+    #[cfg(feature = "blas")]
+    const ALL_DTYPES: [DType; 11] = [
+        DType::F32,
+        DType::F16,
+        DType::BF16,
+        DType::I32,
+        DType::U8,
+        DType::Q4_0,
+        DType::Q4_1,
+        DType::Q4KM,
+        DType::Q5KM,
+        DType::Q8_0,
+        DType::Q6K,
+    ];
+
+    /// Wildcard-free, so a new `DType` variant stops compiling here.
+    #[cfg(feature = "blas")]
+    fn all_dtypes_is_exhaustive(d: DType) -> bool {
+        match d {
+            DType::F32
+            | DType::F16
+            | DType::BF16
+            | DType::I32
+            | DType::U8
+            | DType::Q4_0
+            | DType::Q4_1
+            | DType::Q4KM
+            | DType::Q5KM
+            | DType::Q8_0
+            | DType::Q6K => true,
+        }
+    }
+
+    /// Every dtype the gate admits must be one the BLAS route can actually run.
+    ///
+    /// This is the implication whose failure the PR's own comments describe as
+    /// silent corruption: callers discard `try_blas_prefill_gemm`'s bool, so a
+    /// dtype admitted by [`batched_gemm_supports`] but missing from
+    /// [`blas_dequantizer`] skips the matmul and leaves the previous layer's
+    /// activations in the reused output buffer. Neither the gate test nor the
+    /// dequantizer's own unit test connects the two; this does.
+    ///
+    /// Only meaningful under `blas` (that is the only configuration in which
+    /// `try_blas_prefill_gemm` exists), and CI runs a `--features blas` leg.
+    #[cfg(feature = "blas")]
+    #[test]
+    fn blas_gate_agrees_with_dequantizer_table() {
+        assert!(
+            ALL_DTYPES.iter().copied().all(all_dtypes_is_exhaustive),
+            "ALL_DTYPES holds a variant the exhaustive match does not"
+        );
+        for dtype in ALL_DTYPES {
+            // k = 256 satisfies every alignment rule in the gate, so this asks
+            // only about the dtype.
+            if batched_gemm_supports(dtype, 256) {
+                assert!(
+                    blas_dequantizer(dtype).is_some(),
+                    "{dtype:?} is admitted to the batched path but has no BLAS \
+                     dequantizer, so the GEMM would be silently skipped"
+                );
+            }
         }
     }
 
@@ -408,6 +523,15 @@ pub fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
         // requirement: Q4_1 blocks are 32 wide.
         DType::Q4_1 => k_quant_gemm_available(),
         DType::Q4KM | DType::Q6K => k_quant_gemm_available() && k.is_multiple_of(256),
+        // Q5_K is the one shipped K-quant with no int8 GEMM, so unlike its
+        // siblings it must gate on `blas` itself rather than on
+        // `k_quant_gemm_available()`. That predicate is *true* on a non-BLAS
+        // dotprod aarch64 host, which would admit Q5_K here and then have
+        // `gemm_preq` decline for want of a kernel, silently skipping the
+        // matmul and leaving the previous layer's activations in the reused
+        // output buffer. Narrower than it looks, and deliberately so: the
+        // dequant+SGEMM route is the only Q5_K batched path that exists.
+        DType::Q5KM => cfg!(feature = "blas") && k.is_multiple_of(256),
         _ => false,
     }
 }
@@ -480,6 +604,33 @@ pub(crate) fn warn_unbatchable(tensor: &str, dtype: DType) {
     }
 }
 
+/// Signature shared by every `quant::dequantize_*_matrix`.
+#[cfg(feature = "blas")]
+type MatrixDequantizer = fn(&[u8], usize, usize, &mut [f32]);
+
+/// The whole-matrix dequantizer the BLAS prefill route uses for `dtype`, or
+/// `None` if there is none.
+///
+/// Split out of [`try_blas_prefill_gemm`] so that the set of dtypes the BLAS
+/// path can actually *run* is a value a test can inspect, rather than a `match`
+/// buried mid-function. [`batched_gemm_supports`] and this function are two
+/// lists that must agree, and callers discard `try_blas_prefill_gemm`'s bool, so
+/// a disagreement is silent corruption rather than a failure: the GEMM is
+/// skipped and the reused output buffer still holds the previous layer's
+/// activations. `blas_gate_agrees_with_dequantizer_table` pins the implication.
+#[cfg(feature = "blas")]
+fn blas_dequantizer(dtype: DType) -> Option<MatrixDequantizer> {
+    match dtype {
+        DType::Q4_0 => Some(crate::quant::dequantize_q4_0_matrix),
+        DType::Q4_1 => Some(crate::quant::dequantize_q4_1_matrix),
+        DType::Q8_0 => Some(crate::quant::dequantize_q8_0_matrix),
+        DType::Q4KM => Some(crate::quant::dequantize_q4_k_m_matrix),
+        DType::Q5KM => Some(crate::quant::dequantize_q5_k_matrix),
+        DType::Q6K => Some(crate::quant::dequantize_q6_k_matrix),
+        DType::F32 | DType::F16 | DType::BF16 | DType::I32 | DType::U8 => None,
+    }
+}
+
 /// Prefill GEMM through BLAS: dequantize `wref` into `dequant_scratch[..m*k]`,
 /// then SGEMM `out[m, n] = weight[m, k] @ b[k, n]` in row-major (`b`/`out` are
 /// row-major `[k|m, n]`, stride `n`). Returns `true` for the supported dtypes;
@@ -503,14 +654,16 @@ pub(crate) fn try_blas_prefill_gemm(
         dequant_scratch.resize(m * k, 0.0);
     }
     let dequant = &mut dequant_scratch[..m * k];
-    match wref.dtype {
-        DType::Q4_0 => crate::quant::dequantize_q4_0_matrix(data, m, k, dequant),
-        DType::Q4_1 => crate::quant::dequantize_q4_1_matrix(data, m, k, dequant),
-        DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(data, m, k, dequant),
-        DType::Q4KM => crate::quant::dequantize_q4_k_m_matrix(data, m, k, dequant),
-        DType::Q6K => crate::quant::dequantize_q6_k_matrix(data, m, k, dequant),
-        _ => return false,
-    }
+    let Some(dequantize) = blas_dequantizer(wref.dtype) else {
+        // Reachable only if `batched_gemm_supports` admitted a dtype this
+        // function cannot run, which is the silent-corruption case: the caller
+        // ignores this `false` and goes on to read an output buffer that still
+        // holds the previous layer's activations. Same failure as `gemm_preq`
+        // declining, so it gets the same debug panic and release log.
+        report_uncomputed_gemm("try_blas_prefill_gemm", wref.dtype, k);
+        return false;
+    };
+    dequantize(data, m, k, dequant);
     crate::backend::blas::sgemm_rowmajor_nn(m, n, k, dequant, b, out);
     true
 }
@@ -587,7 +740,7 @@ pub(crate) fn gemm_preq(
             ),
         };
         if !ran {
-            report_uncomputed_gemm(wref.dtype, k);
+            report_uncomputed_gemm("gemm_preq", wref.dtype, k);
         }
         return ran;
     }
@@ -601,7 +754,7 @@ pub(crate) fn gemm_preq(
         // across layers, so an uncomputed GEMM leaves the *previous* layer's
         // activations in `out`. (`LlamaModel::project_logits_batched` is the one
         // caller that does check it, and has a per-row path to fall back to.)
-        report_uncomputed_gemm(wref.dtype, k);
+        report_uncomputed_gemm("gemm_preq", wref.dtype, k);
     }
     ran
 }
@@ -610,23 +763,30 @@ pub(crate) fn gemm_preq(
 ///
 /// This must never happen — `batched_gemm_supports` gates it — so treat it as the
 /// invariant break it is. It is *not* a benign "fall back to the slow path": the
-/// callers of `gemm_preq` **ignore its return value** — `LlamaModel::project_logits_batched`
-/// is the one exception, declining to its per-row fallback — and they reuse a single
+/// callers **ignore the return value** (`LlamaModel::project_logits_batched`
+/// is the one exception, declining to its per-row fallback) and they reuse a single
 /// output buffer across layers, so for the rest an uncomputed GEMM leaves the previous
 /// layer's activations in `out` and inference produces confident garbage. Panic in debug;
 /// in release, at least say so loudly rather than silently corrupting the forward pass.
-#[cfg(all(
-    any(target_arch = "aarch64", target_arch = "x86_64"),
-    not(feature = "blas")
+///
+/// `route` names the dispatcher that declined, since the two are mutually
+/// exclusive by cfg: `gemm_preq` without `blas`, `try_blas_prefill_gemm` with.
+/// Both fail the same way and deserve the same noise.
+#[cfg(any(
+    all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(feature = "blas")
+    ),
+    feature = "blas"
 ))]
-fn report_uncomputed_gemm(dtype: DType, k: usize) {
+fn report_uncomputed_gemm(route: &str, dtype: DType, k: usize) {
     debug_assert!(
         false,
-        "gemm_preq: no batched kernel ran for {dtype:?} (k={k}), but `batched_gemm_supports` \
+        "{route}: no batched kernel ran for {dtype:?} (k={k}), but `batched_gemm_supports` \
          admitted it — the gate and the kernel table have drifted. `out` is now stale."
     );
     tracing::error!(
-        "gemm_preq: no batched kernel for {dtype:?} (k={k}); the matmul was NOT computed \
+        "{route}: no batched kernel for {dtype:?} (k={k}); the matmul was NOT computed \
          and the output buffer holds stale data"
     );
 }
