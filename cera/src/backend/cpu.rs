@@ -7116,14 +7116,21 @@ mod f16_gemv_tests {
             let halves: Vec<u16> = (0..m * k).map(|_| narrow(next())).collect();
             let x: Vec<f32> = (0..k).map(|_| next()).collect();
 
-            let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+            // Cast the typed vectors rather than building `Vec<u8>` from
+            // `to_le_bytes`. Two reasons: a `Vec<u8>` is only guaranteed
+            // 1-byte-aligned, and the kernels reach it through
+            // `bytemuck::cast_slice`, which panics on an under-aligned pointer
+            // (it happens to survive today because the allocator over-aligns).
+            // And `to_le_bytes` fixes an endianness the kernels do not: they
+            // read back native-endian, so on a big-endian host the old spelling
+            // fed them byte-swapped weights and the test would have been
+            // measuring the swap.
             let mut got = vec![0.0f32; m];
-            kernel(&bytes, &x, &mut got, m, k);
+            kernel(bytemuck::cast_slice(&halves), &x, &mut got, m, k);
 
             let widened: Vec<f32> = halves.iter().map(|&h| widen(h)).collect();
-            let wbytes: Vec<u8> = widened.iter().flat_map(|f| f.to_le_bytes()).collect();
             let mut want = vec![0.0f32; m];
-            gemv_f32(&wbytes, &x, &mut want, m, k);
+            gemv_f32(bytemuck::cast_slice(&widened), &x, &mut want, m, k);
 
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                 // Not bit-exact by construction: the NEON path keeps four
