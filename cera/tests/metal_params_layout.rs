@@ -92,12 +92,6 @@ fn cases() -> Vec<(usize, &'static str, &'static str, &'static str)> {
             "KvCopyParams",
         ),
         (
-            size_of::<RopeParams>(),
-            shaders::ROPE,
-            "Params",
-            "RopeParams",
-        ),
-        (
             size_of::<GemmF32Params>(),
             shaders::GEMM_F32,
             "GemmParams",
@@ -209,24 +203,6 @@ fn cases() -> Vec<(usize, &'static str, &'static str, &'static str)> {
             "ScaleParams",
             "ScaleParams",
         ),
-        (
-            size_of::<BiasAddParams>(),
-            shaders::BIAS_ADD,
-            "Params",
-            "BiasAddParams",
-        ),
-        (
-            size_of::<RmsNormBatchParams>(),
-            shaders::RMSNORM_BATCH,
-            "Params",
-            "RmsNormBatchParams",
-        ),
-        (
-            size_of::<Conv1dBatchParams>(),
-            shaders::CONV1D_FUSED_BATCH,
-            "Params",
-            "Conv1dBatchParams",
-        ),
         // ViT vision encoder (`MetalVitOps`).
         (
             size_of::<VitLinearParams>(),
@@ -248,12 +224,6 @@ fn cases() -> Vec<(usize, &'static str, &'static str, &'static str)> {
             "VitAttnParams (mma)",
         ),
         (
-            size_of::<LayerNormBatchParams>(),
-            shaders::LAYERNORM_BATCH,
-            "Params",
-            "LayerNormBatchParams",
-        ),
-        (
             size_of::<TqParams>(),
             shaders::TURBOQUANT,
             "TqParams",
@@ -265,12 +235,133 @@ fn cases() -> Vec<(usize, &'static str, &'static str, &'static str)> {
             "TqAttnParams",
             "TqAttnParams",
         ),
-        // `ElementwiseParams` is reused for `gelu.metal`, which has its own `Params`.
+    ]
+}
+
+/// Width, in bytes, of the params buffer a **Slang** kernel expects.
+///
+/// The Slang ports do not declare a `struct Params` for `msl_struct_bytes` to
+/// find. They take a typed buffer instead, and not uniformly: `rope.slang` uses
+/// `StructuredBuffer<uint>` indexed to `params[6]`, `bias_add.slang` a
+/// `StructuredBuffer<uint2>` swizzled `par_buf[0].x/.y`. One rule covers both:
+///
+///     u32 slots = components(element type) * (highest element index + 1)
+///
+/// This closes a gap that predates the migration. While the generated kernels
+/// were reachable only from tests and benches, *nothing* checked their params
+/// layout against the Rust mirrors, so the guard that exists because a shader
+/// struct once outgrew its upload (NaN and silent audio in production) never
+/// covered them at all.
+fn slang_params_bytes(src: &str) -> Option<usize> {
+    // Declaration: `StructuredBuffer<uintN> name : register(tN);`
+    let decl = src
+        .lines()
+        .find(|l| l.contains("StructuredBuffer<uint") && !l.trim_start().starts_with("//"))?;
+    let after = decl.split("StructuredBuffer<uint").nth(1)?;
+    let (comp_txt, rest) = after.split_once('>')?;
+    let components: usize = if comp_txt.is_empty() {
+        1
+    } else {
+        comp_txt.parse().ok()?
+    };
+    let name = rest.split_whitespace().next()?;
+
+    // A `__target_switch` port carries both backends' bodies in one source and
+    // they can read different numbers of params: `rope.slang`'s metal branch
+    // stops at `params[4]` while its wgsl branch reaches `params[6]`. This is
+    // the *Metal* layout test, so the wgsl body must not count.
+    //
+    // Drop the `default:` arm rather than keeping only the `case metal:` one.
+    // Most reads sit outside the switch entirely (in `rmsnorm_batch.slang` the
+    // switch is a reduction detail inside a helper, and every `par_buf` read is
+    // after it), so keeping only the metal arm would see almost nothing and
+    // silently under-report the width.
+    // Anchor on the statement, not the word: `rope.slang` names
+    // `__target_switch` in a doc comment on line 3, and matching that put the
+    // brace scan in the middle of prose and silently kept the wgsl arm.
+    let switch_at = src.match_indices("__target_switch").find(|(i, _)| {
+        src[i + "__target_switch".len()..]
+            .trim_start()
+            .starts_with('{')
+    });
+    let scope: String = match switch_at.map(|(i, _)| i) {
+        None => src.to_string(),
+        Some(sw) => {
+            // Brace-match from the switch to find its extent.
+            let bytes = src.as_bytes();
+            let open = sw + src[sw..].find('{').unwrap_or(0);
+            let (mut depth, mut end) = (0usize, src.len());
+            for (i, &b) in bytes.iter().enumerate().skip(open) {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match src[open..end].find("default:") {
+                // Everything but the default arm: before the switch, the metal
+                // arm, and everything after it.
+                Some(d) => format!("{}{}", &src[..open + d], &src[end..]),
+                None => src.to_string(),
+            }
+        }
+    };
+    let scope = scope.as_str();
+
+    // Highest element index actually read, over `name[N]` (with or without a swizzle).
+    let mut max_idx = 0usize;
+    for (i, _) in scope.match_indices(name) {
+        let tail = &scope[i + name.len()..];
+        if let Some(inner) = tail
+            .strip_prefix('[')
+            .and_then(|t| t.split_once(']'))
+            .map(|(a, _)| a)
+            && let Ok(n) = inner.trim().parse::<usize>()
+        {
+            max_idx = max_idx.max(n);
+        }
+    }
+    Some(components * (max_idx + 1) * 4)
+}
+
+/// Rust mirrors whose kernel is now a Slang port, paired with that source.
+fn slang_cases() -> Vec<(usize, &'static str, &'static str)> {
+    vec![
+        (
+            size_of::<RopeParams>(),
+            include_str!("../src/backend/shaders/slang/rope.slang"),
+            "RopeParams",
+        ),
+        (
+            size_of::<BiasAddParams>(),
+            include_str!("../src/backend/shaders/slang/bias_add.slang"),
+            "BiasAddParams",
+        ),
         (
             size_of::<ElementwiseParams>(),
-            shaders::GELU,
-            "Params",
+            include_str!("../src/backend/shaders/slang/gelu.slang"),
             "ElementwiseParams (gelu)",
+        ),
+        (
+            size_of::<LayerNormBatchParams>(),
+            include_str!("../src/backend/shaders/slang/layernorm_batch.slang"),
+            "LayerNormBatchParams",
+        ),
+        (
+            size_of::<RmsNormBatchParams>(),
+            include_str!("../src/backend/shaders/slang/rmsnorm_batch.slang"),
+            "RmsNormBatchParams",
+        ),
+        (
+            size_of::<Conv1dBatchParams>(),
+            include_str!("../src/backend/shaders/slang/conv1d_fused_batch.slang"),
+            "Conv1dBatchParams",
         ),
     ]
 }
@@ -288,6 +379,20 @@ fn rust_param_mirrors_match_msl_structs() {
                  {msl_bytes} B. A kernel reading a struct wider than the upload reads past \
                  the end of it — undefined behaviour, not a crash. Update the Rust mirror \
                  so its width matches, keeping the fields in the same order as the shader."
+            )),
+            Some(_) => {}
+        }
+    }
+    for (rust_bytes, slang_src, rust_name) in slang_cases() {
+        match slang_params_bytes(slang_src) {
+            None => failures.push(format!(
+                "{rust_name}: no `StructuredBuffer<uint*>` params binding found in the Slang \
+                 source — renamed, or the port changed how it takes parameters?"
+            )),
+            Some(slang_bytes) if slang_bytes != rust_bytes => failures.push(format!(
+                "{rust_name}: Rust mirror is {rust_bytes} B but the Slang kernel reads \
+                 {slang_bytes} B of params. Same hazard as the MSL case: the kernel reads \
+                 past the end of the upload."
             )),
             Some(_) => {}
         }
