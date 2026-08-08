@@ -251,7 +251,7 @@ impl MmapWeight {
             DType::BF16 => {
                 let src: &[half::bf16] = bytemuck::cast_slice(bytes);
                 for (d, &s) in dst.iter_mut().zip(src) {
-                    *d = s.to_f32();
+                    *d = crate::quant::bf16_to_f32(s.to_bits());
                 }
             }
             DType::Q4_0 => crate::quant::dequantize_q4_0_row(bytes, dst),

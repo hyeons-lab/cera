@@ -49,6 +49,33 @@ pub(crate) fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(sign | rest)
 }
 
+/// Convert one bfloat16 (raw bits) to f32.
+///
+/// bf16 is the top 16 bits of an f32: same 8-bit exponent, same bias, so every
+/// finite value, zero and infinity widens exactly by a 16-bit shift, with no
+/// rounding and no subnormal renormalization. Only NaN needs a case, and only
+/// for its quiet bit: IEEE 754 says widening a signaling NaN quiets it, which is
+/// what `half::bf16::to_f32` does and what [`f16_to_f32`] does on the
+/// same input. A bare shift would leave sNaN signaling and disagree with
+/// `MmapWeight::dequantize_row` on those patterns.
+///
+/// Exists so the widen has one spelling. It was open-coded in three places (the
+/// bf16 GEMV, the embedding lookup, and a test reference) while
+/// `model/weights.rs` used the `half` crate, which is exactly the drift that
+/// lets two copies disagree; that site now calls this too.
+/// `bf16_widen_matches_half_crate_exhaustively` pins all 65536 patterns.
+#[inline(always)]
+pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
+    // Exponent all ones with a non-zero significand is NaN; 0x7F80 itself is
+    // infinity and must not gain a mantissa bit.
+    let quiet = if (bits & 0x7FFF) > 0x7F80 {
+        0x0040_0000
+    } else {
+        0
+    };
+    f32::from_bits((u32::from(bits) << 16) | quiet)
+}
+
 /// Convert one f32 to IEEE-754 half (raw bits), round-to-nearest-even.
 ///
 /// The narrowing twin of [`f16_to_f32`], and open-coded for the same reason:
@@ -991,6 +1018,35 @@ mod tests {
                 "random f32 {:#010x} ({v:e})",
                 st
             );
+        }
+    }
+
+    /// Same contract as the f16 twin below, over bf16's 65536 patterns.
+    ///
+    /// Cheap enough to be exhaustive, and worth being exhaustive about: the
+    /// interesting inputs are exactly the ones a random sweep would miss, since
+    /// the sNaN quieting is the only case where `bf16_to_f32` is not a plain
+    /// shift and there are 127 such patterns per sign out of 65536.
+    #[test]
+    fn bf16_widen_matches_half_crate_exhaustively() {
+        for bits in 0..=u16::MAX {
+            // `half`, deliberately, and for the reason spelled out below.
+            let want = half::bf16::from_bits(bits).to_f32();
+            let got = bf16_to_f32(bits);
+            if want.is_nan() {
+                assert!(got.is_nan(), "bits {bits:#06x}: want NaN, got {got}");
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "bits {bits:#06x}: NaN payload/sign differs"
+                );
+            } else {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "bits {bits:#06x}: want {want}, got {got}"
+                );
+            }
         }
     }
 
