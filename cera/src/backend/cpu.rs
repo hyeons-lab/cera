@@ -230,10 +230,9 @@ pub fn configure_thread_pool() -> usize {
     1
 }
 
-use crate::quant::f16_to_f32;
 use crate::quant::{
-    BlockQ4_0, BlockQ4_1, BlockQ4KM, BlockQ5K, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q4_1_f32,
-    vec_dot_q4_k_m_f32, vec_dot_q5_k_f32, vec_dot_q8_0_f32,
+    BlockQ4_0, BlockQ4_1, BlockQ4KM, BlockQ5K, BlockQ8_0, f16_to_f32, vec_dot_q4_0_f32,
+    vec_dot_q4_1_f32, vec_dot_q4_k_m_f32, vec_dot_q5_k_f32, vec_dot_q8_0_f32,
 };
 #[cfg(not(target_arch = "aarch64"))]
 use crate::quant::{BlockQ6K, vec_dot_q6_k_f32};
@@ -1122,7 +1121,7 @@ pub(crate) fn repack_q4_0_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f
             for r in 0..8 {
                 let off = ((8 * sr + r) * nb + b) * bsz;
                 scales[(sr * nb + b) * 8 + r] =
-                    half::f16::from_le_bytes([src[off], src[off + 1]]).to_f32();
+                    f16_to_f32(u16::from_le_bytes([src[off], src[off + 1]]));
             }
             for g in 0..8usize {
                 for i in 0..16usize {
@@ -1271,9 +1270,11 @@ pub(crate) fn repack_q4_k_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f
         for bi in 0..sb {
             for r in 0..8 {
                 let off = ((8 * sr + r) * sb + bi) * bsz;
-                let d = half::f16::from_le_bytes([src[off + D_OFF], src[off + D_OFF + 1]]).to_f32();
-                let dmin = half::f16::from_le_bytes([src[off + DMIN_OFF], src[off + DMIN_OFF + 1]])
-                    .to_f32();
+                let d = f16_to_f32(u16::from_le_bytes([src[off + D_OFF], src[off + D_OFF + 1]]));
+                let dmin = f16_to_f32(u16::from_le_bytes([
+                    src[off + DMIN_OFF],
+                    src[off + DMIN_OFF + 1],
+                ]));
                 let scales_bytes: &[u8; 12] =
                     src[off + SC_OFF..off + SC_OFF + 12].try_into().unwrap();
                 let (sc, mn) = crate::quant::decode_q4km_scales(scales_bytes);
@@ -3345,11 +3346,10 @@ pub fn attn_scores_f16(
     }
     // head_dim > 128 overruns the NEON Q array — see `attn_scores`.
     //
-    // `fp16` is checked for the same reason the x86 arm below checks `f16c`:
-    // the kernel's widen is `vcvt_f32_f16`, which `core::arch` declares
-    // `neon,fp16`. The `fcvtl` it lowers to is baseline ARMv8.0-A, so this is
-    // stating the contract rather than avoiding a trap, and a host that fails
-    // the gate still gets a correct answer from the scalar tail below.
+    // `fp16` is checked for the same reason the x86 arm below checks `f16c`;
+    // `attn_scores_f16_neon`'s doc has the argument, and what it costs a
+    // pre-v8.2 host. Failing the gate still yields a correct answer from the
+    // scalar tail below.
     #[cfg(target_arch = "aarch64")]
     if head_dim <= 128 && super::cpu_features::cpu_features().fp16 {
         unsafe {
@@ -3421,11 +3421,10 @@ pub fn attn_values_f16(
     }
     // head_dim > 128 overruns the NEON accumulator array — see `attn_scores`.
     //
-    // `fp16` is checked for the same reason the x86 arm below checks `f16c`:
-    // the kernel's widen is `vcvt_f32_f16`, which `core::arch` declares
-    // `neon,fp16`. The `fcvtl` it lowers to is baseline ARMv8.0-A, so this is
-    // stating the contract rather than avoiding a trap, and a host that fails
-    // the gate still gets a correct answer from the scalar tail below.
+    // `fp16` is checked for the same reason the x86 arm below checks `f16c`;
+    // `attn_scores_f16_neon`'s doc has the argument, and what it costs a
+    // pre-v8.2 host. Failing the gate still yields a correct answer from the
+    // scalar tail below.
     #[cfg(target_arch = "aarch64")]
     if head_dim <= 128 && super::cpu_features::cpu_features().fp16 {
         unsafe {
@@ -3478,9 +3477,19 @@ pub fn attn_values_f16(
 /// (`vcvt_f32_f16`) — the conversion is what makes f16 KV a decode-at-depth
 /// win (a software widen is dominated by GQA re-reading each KV element
 /// `group_size×` per token and measured *slower* than f32). The intrinsic
-/// stabilized in Rust 1.94, which sets this crate's MSRV. FCVTL itself is
-/// baseline ARMv8.0 — only f16 *arithmetic* needs FEAT_FP16 — so no runtime
-/// tier gate is required.
+/// stabilized in Rust 1.94, which sets this crate's MSRV.
+///
+/// Declared `fp16` because that is how `core::arch` declares `vcvt_f32_f16`,
+/// its operand type being `float16x4_t`. FCVTL itself is baseline ARMv8.0-A and
+/// f16 *arithmetic* is what actually needs FEAT_FP16, so the declaration is
+/// wider than the instruction requires. Callers gate on it anyway: enabling the
+/// feature lets LLVM use it anywhere in the body, so the honest thing is to
+/// check it rather than to reason about what the compiler happens to emit
+/// today. The cost is that a pre-v8.2 host (Cortex-A53/A72, Raspberry Pi 4)
+/// takes the scalar path instead. That path widens through the inlined integer
+/// `f16_to_f32` rather than the old out-of-line `half` call, so it is not
+/// simply the pre-existing kernel minus vectorization, and which of the two is
+/// faster there has not been measured on such a host.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 #[target_feature(enable = "neon,fp16")]

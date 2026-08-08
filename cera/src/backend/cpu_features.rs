@@ -182,7 +182,10 @@ impl CpuFeatures {
     }
 
     /// Human-readable one-line summary for CLI `inspect` / bug reports, e.g.
-    /// `cpu: tier=avx2 [avx2 fma]` or `cpu: tier=neon+dotprod [neon dotprod]`.
+    /// `cpu: tier=avx2 [avx2 fma]` or `cpu: tier=neon+dotprod [neon dotprod fp16]`.
+    ///
+    /// Shares `active_flags` with [`Self::descriptor`], so it moves whenever that
+    /// list gains an entry.
     pub fn report(&self) -> String {
         format!(
             "cpu: tier={} [{}]",
@@ -191,12 +194,20 @@ impl CpuFeatures {
         )
     }
 
-    /// Compact, stable CPU-variant descriptor for telemetry — the active SIMD
-    /// features joined by commas, e.g. `"neon,dotprod,i8mm"` or `"avx2,fma"`,
+    /// Compact CPU-variant descriptor for telemetry: the active SIMD features
+    /// joined by commas, e.g. `"neon,dotprod,i8mm,fp16"` or `"avx2,fma"`,
     /// falling back to the tier label (e.g. `"scalar"`) when no accelerated
     /// features are present. Deterministic on a given host, so it can key a
     /// benchmark submission's CPU-variant field (the analog of llama.cpp's ggml
     /// CPU-backend descriptor).
+    ///
+    /// Stable for a given set of detected features, **not** across cera
+    /// versions: adding a flag to `active_flags` changes the string for every
+    /// host that reports it. That happened once already, when `fp16` was added,
+    /// which moved it on every aarch64 host from v8.2 on (so, in practice, all
+    /// of them except pre-FEAT_FP16 parts like Cortex-A53/A72). Treat the
+    /// descriptor as a grouping key within a release rather than a join key
+    /// across them.
     pub fn descriptor(&self) -> String {
         let flags = self.active_flags();
         if flags.is_empty() {
@@ -1092,6 +1103,14 @@ mod tests {
         assert_eq!(CpuFeatures::NONE.descriptor(), "scalar");
 
         // aarch64-shape flags join comma-separated in the stable order.
+        //
+        // This fixture is deliberately one detection cannot produce: `detect`
+        // will not report `NeonI8mm` without `fp16` (FEAT_I8MM is v8.6, FEAT_FP16
+        // v8.2), so it pins the ordering rather than a real host. The realistic
+        // shape is below, and it is the one that matters: `fp16` joined
+        // `active_flags` after this descriptor was already documented as stable,
+        // which moved the string on every aarch64 host from v8.2 on. Anything keying
+        // benchmark history on it sees a discontinuity there, not a regression.
         let neon = CpuFeatures {
             tier: CpuTier::NeonI8mm,
             neon: true,
@@ -1100,6 +1119,18 @@ mod tests {
             ..CpuFeatures::NONE
         };
         assert_eq!(neon.descriptor(), "neon,dotprod,i8mm");
+
+        // What an i8mm-class host actually reports, and what an M1 reports.
+        let real = CpuFeatures { fp16: true, ..neon };
+        assert_eq!(real.descriptor(), "neon,dotprod,i8mm,fp16");
+        let m1 = CpuFeatures {
+            tier: CpuTier::NeonDotprod,
+            neon: true,
+            dotprod: true,
+            fp16: true,
+            ..CpuFeatures::NONE
+        };
+        assert_eq!(m1.descriptor(), "neon,dotprod,fp16");
 
         // x86-shape flags likewise; report() shares the same active-flag set.
         let x86 = CpuFeatures {
