@@ -1,3 +1,24 @@
+//! Scalar CPU reference implementations: GEMV/GEMM, attention, norms, RoPE.
+//!
+//! These operate on raw `&[f32]` slices with no `Tensor` in the hot path, and
+//! are the correctness reference the SIMD and GPU kernels are pinned against.
+//! Where a NEON or AVX2 path exists it is dispatched from here at runtime.
+#![warn(missing_docs, clippy::missing_docs_in_private_items)]
+//
+// Both halves: `missing_docs` for the public items, the clippy one for the
+// private ones. Scoped here rather than crate-wide (646 and 887 items
+// elsewhere) because these files
+// have repeatedly lost a doc comment to an insertion or deletion above an item:
+// a doc binds to the next item below it, so both operations silently reassign
+// it, and the item left bare is otherwise silent. There is no `missing_docs`
+// for private items by default, and rustdoc stays green because the intra-doc
+// links still resolve.
+//
+// Known limit: clippy skips `#[cfg(test)]`, so this does not cover test
+// modules. A `#[test]` that loses its attribute is caught by `dead_code`
+// instead (it becomes an uncalled private fn), but a doc that merely moves
+// between two live test functions is caught by neither.
+
 // CPU compute backend — naive scalar implementations.
 //
 // All functions operate on raw f32 slices. No Tensor abstraction in the hot path.
@@ -3074,6 +3095,8 @@ pub fn attn_values(
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 #[target_feature(enable = "neon")]
+/// NEON f32 score kernel: `scores[t] = dot(q_head, k_cache[t]) * scale`.
+/// `head_dim <= 128`, which the caller checks; see `attn_scores`.
 unsafe fn attn_scores_neon(
     q_head: &[f32],
     k_cache: &[f32],
@@ -3133,6 +3156,8 @@ unsafe fn attn_scores_neon(
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::needless_range_loop)]
 #[target_feature(enable = "neon")]
+/// NEON f32 weighted-sum kernel: `attn_out += scores[t] * v_cache[t]`.
+/// `head_dim <= 128`, which the caller checks; see `attn_values`.
 unsafe fn attn_values_neon(
     scores: &[f32],
     v_cache: &[f32],
@@ -3703,6 +3728,8 @@ unsafe fn attn_values_f16_avx2(
 
 // ── Flash attention (tiled, online softmax) ────────────────────────────────
 
+/// KV positions per flash-attention tile. 32 keeps one tile's scores in
+/// registers on both the NEON and scalar paths.
 const FLASH_TILE_KV: usize = 32;
 
 /// Tiled flash attention for one KV head group (GQA).
@@ -3844,6 +3871,8 @@ pub fn flash_attention_gqa_cpu(
 }
 
 #[allow(dead_code, clippy::too_many_arguments, clippy::needless_range_loop)]
+/// Portable reference for [`flash_attention_gqa`], and the fallback wherever
+/// the NEON path does not apply.
 fn flash_attention_gqa_scalar(
     q_mat: &[f32],
     k_cache: &[f32],
@@ -4270,6 +4299,7 @@ unsafe fn flash_attention_gqa_avx512(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+/// NEON flash-attention over a GQA head group, tiled by `FLASH_TILE_KV`.
 unsafe fn flash_attention_gqa_neon(
     q_mat: &[f32],
     k_cache: &[f32],
@@ -4696,7 +4726,9 @@ unsafe fn bits_to_f32_mask_hi(byte: u32) -> std::arch::aarch64::float32x4_t {
 /// across both layouts; only the element pairing differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RopeType {
+    /// NEOX: the halves of each head are rotated against each other.
     Neox,
+    /// Interleaved: adjacent pairs within a head are rotated.
     Norm,
 }
 

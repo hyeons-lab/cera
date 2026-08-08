@@ -28,6 +28,22 @@
 //! exposed regardless, for diagnostics and so future kernels can light up
 //! without re-plumbing.
 
+#![warn(missing_docs, clippy::missing_docs_in_private_items)]
+//
+// Both halves: `missing_docs` for the public items, the clippy one for the
+// private ones. Scoped here rather than crate-wide (646 and 887 items
+// elsewhere) because these files
+// have repeatedly lost a doc comment to an insertion or deletion above an item:
+// a doc binds to the next item below it, so both operations silently reassign
+// it, and the item left bare is otherwise silent. There is no `missing_docs`
+// for private items by default, and rustdoc stays green because the intra-doc
+// links still resolve.
+//
+// Known limit: clippy skips `#[cfg(test)]`, so this does not cover test
+// modules. A `#[test]` that loses its attribute is caught by `dead_code`
+// instead (it becomes an uncalled private fn), but a doc that merely moves
+// between two live test functions is caught by neither.
+
 use std::sync::OnceLock;
 
 /// Ordered CPU capability tier. Higher is more capable.
@@ -122,15 +138,24 @@ pub struct CpuFeatures {
     /// Best tier cera has kernels for on this host (see module docs).
     pub tier: CpuTier,
     // ── x86_64 ──
+    /// AVX2 (256-bit integer and float SIMD).
     pub avx2: bool,
+    /// Fused multiply-add.
     pub fma: bool,
+    /// AVX-512 foundation.
     pub avx512f: bool,
+    /// AVX-512 byte and word instructions.
     pub avx512bw: bool,
+    /// AVX-512 vector-length extensions.
     pub avx512vl: bool,
+    /// AVX-512 VNNI (`dpbusd`, the int8 dot product).
     pub avx512vnni: bool,
     // ── aarch64 ──
+    /// NEON. Mandatory on aarch64; probed anyway for honest reporting.
     pub neon: bool,
+    /// FEAT_DotProd (`sdot`/`udot`), ARMv8.2.
     pub dotprod: bool,
+    /// FEAT_I8MM (`smmla`), ARMv8.6.
     pub i8mm: bool,
     /// FEAT_FP16. Needed only to *declare* what `simd::neon::f16_bits_to_f32`
     /// uses: `core::arch`'s `vcvt_f32_f16` is gated `neon,fp16` because its
@@ -143,6 +168,8 @@ pub struct CpuFeatures {
 }
 
 impl CpuFeatures {
+    /// Every feature off, tier `Scalar`. The base for test fixtures and the
+    /// value returned on targets with no SIMD detection.
     const NONE: CpuFeatures = CpuFeatures {
         tier: CpuTier::Scalar,
         avx2: false,

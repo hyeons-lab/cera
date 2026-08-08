@@ -1,3 +1,26 @@
+//! GGUF quantization formats: block layouts, dequantization, and the
+//! `vec_dot` kernels that consume a block without materializing it.
+//!
+//! Each format has a `#[repr(C)]` block struct mirroring its on-disk layout, a
+//! `dequantize_*_row`/`_matrix` pair, and a `vec_dot_*` that fuses the dequant
+//! into the dot product. The f16 converters live here too, open-coded rather
+//! than taken from the `half` crate, which is a trap in a hot loop.
+#![warn(missing_docs, clippy::missing_docs_in_private_items)]
+//
+// Both halves: `missing_docs` for the public items, the clippy one for the
+// private ones. Scoped here rather than crate-wide (646 and 887 items
+// elsewhere) because these files
+// have repeatedly lost a doc comment to an insertion or deletion above an item:
+// a doc binds to the next item below it, so both operations silently reassign
+// it, and the item left bare is otherwise silent. There is no `missing_docs`
+// for private items by default, and rustdoc stays green because the intra-doc
+// links still resolve.
+//
+// Known limit: clippy skips `#[cfg(test)]`, so this does not cover test
+// modules. A `#[test]` that loses its attribute is caught by `dead_code`
+// instead (it becomes an uncalled private fn), but a doc that merely moves
+// between two live test functions is caught by neither.
+
 #[cfg_attr(not(feature = "parallel"), allow(unused_imports))]
 use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
 
@@ -150,7 +173,9 @@ pub(crate) fn f32_to_f16(v: f32) -> u16 {
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ4_0 {
-    pub d: u16, // f16 stored as raw bits
+    /// Scale, f16 as raw bits.
+    pub d: u16,
+    /// 32 4-bit quants, two per byte, biased by 8.
     pub qs: [u8; 16],
 }
 
@@ -171,8 +196,11 @@ const _: () = assert!(size_of::<BlockQ4_0>() == 18);
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ4_1 {
-    pub d: u16, // f16 stored as raw bits
-    pub m: u16, // f16 stored as raw bits
+    /// Scale, f16 as raw bits.
+    pub d: u16,
+    /// Minimum, f16 as raw bits.
+    pub m: u16,
+    /// 32 4-bit quants, two per byte, unbiased.
     pub qs: [u8; 16],
 }
 
@@ -186,7 +214,9 @@ const _: () = assert!(size_of::<BlockQ4_1>() == 20);
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ8_0 {
-    pub delta: u16, // f16 stored as raw bits
+    /// Scale, f16 as raw bits.
+    pub delta: u16,
+    /// 32 signed 8-bit quants.
     pub quants: [i8; 32],
 }
 
@@ -202,9 +232,13 @@ const _: () = assert!(size_of::<BlockQ8_0>() == 34);
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ4KM {
-    pub d: u16,    // f16 stored as raw bits
-    pub dmin: u16, // f16 stored as raw bits
+    /// Super-scale applied to the 6-bit block scales, f16 as raw bits.
+    pub d: u16,
+    /// Super-scale applied to the 6-bit block minima, f16 as raw bits.
+    pub dmin: u16,
+    /// Eight 6-bit scale/min pairs, packed into 12 bytes.
     pub scales: [u8; 12],
+    /// 256 4-bit quants, two per byte.
     pub qs: [u8; 128],
 }
 
@@ -220,10 +254,14 @@ const _: () = assert!(size_of::<BlockQ4KM>() == 144);
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ6K {
+    /// Low 4 bits of each of the 256 quants.
     pub ql: [u8; 128],
+    /// High 2 bits of each of the 256 quants.
     pub qh: [u8; 64],
+    /// Sixteen signed 8-bit block scales.
     pub scales: [i8; 16],
-    pub d: u16, // f16 stored as raw bits
+    /// Super-scale, f16 as raw bits.
+    pub d: u16,
 }
 
 const _: () = assert!(size_of::<BlockQ6K>() == 210);
@@ -240,10 +278,15 @@ const _: () = assert!(size_of::<BlockQ6K>() == 210);
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ5K {
-    pub d: u16,    // f16 stored as raw bits
-    pub dmin: u16, // f16 stored as raw bits
+    /// Super-scale applied to the 6-bit block scales, f16 as raw bits.
+    pub d: u16,
+    /// Super-scale applied to the 6-bit block minima, f16 as raw bits.
+    pub dmin: u16,
+    /// Eight 6-bit scale/min pairs, packed into 12 bytes.
     pub scales: [u8; 12],
+    /// The fifth bit of each of the 256 quants.
     pub qh: [u8; 32],
+    /// Low 4 bits of each of the 256 quants.
     pub qs: [u8; 128],
 }
 
