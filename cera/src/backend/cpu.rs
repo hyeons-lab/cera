@@ -1963,15 +1963,18 @@ pub fn gemv_f16(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
 
 /// Dot product of a half-precision row with an f32 vector.
 ///
-/// The NEON kernel below takes its trip count from `row.len()` and reads *both*
-/// slices through raw pointers, so `row.len() == x.len()` is a soundness
-/// requirement, not a correctness nicety.
+/// The NEON kernel below reads *both* slices through raw pointers, so its trip
+/// count is `min(row.len(), x.len())`: that keeps the unsafe body in bounds for
+/// any pair of slices rather than only for the lengths today's one caller
+/// happens to pass. It is a `cmp`/`csel` per row with no branch and no panic
+/// landing pad, so it does not cost what checking the contract here would.
 ///
-/// Its callers enforce that in release with one check per GEMV rather than one
-/// per row: `gemv_f16` asserts `x.len() == k` on entry and then only ever hands
-/// over exact `k`-length row slices. Checking here instead measured ~10% off
-/// decode (20.5 to 18.3 tok/s on LFM2.5-2.6B), which is what a branch plus a
-/// panic landing pad costs when it runs per row of every matmul.
+/// The contract itself is still checked, once per GEMV instead of once per row:
+/// `gemv_f16` asserts `x.len() == k` on entry and then only ever hands over
+/// exact `k`-length row slices, so the `min` never actually truncates.
+/// Asserting per row measured ~10% off decode (20.5 to 18.3 tok/s on
+/// LFM2.5-2.6B), which is what a branch plus a panic landing pad costs when it
+/// runs on every row of every matmul.
 #[inline]
 fn dot_f16_f32(row: &[u16], x: &[f32]) -> f32 {
     debug_assert_eq!(row.len(), x.len());
@@ -1979,7 +1982,8 @@ fn dot_f16_f32(row: &[u16], x: &[f32]) -> f32 {
     {
         if crate::backend::cpu_features::cpu_features().fp16 {
             // SAFETY: `neon` is mandatory on aarch64 and `fp16` is checked
-            // above; every load below is bounded by the equal-length assert.
+            // above; every load below is bounded by the kernel's own
+            // `min(row.len(), x.len())` trip count.
             return unsafe { dot_f16_f32_neon(row, x) };
         }
     }
@@ -1998,7 +2002,8 @@ unsafe fn dot_f16_f32_neon(row: &[u16], x: &[f32]) -> f32 {
     use std::arch::aarch64::*;
     unsafe {
         let (wp, xp) = (row.as_ptr(), x.as_ptr());
-        let n = row.len();
+        // Both pointers are walked to `n`, so the shorter slice bounds it.
+        let n = row.len().min(x.len());
         let mut acc = [vdupq_n_f32(0.0); 4];
         let mut i = 0;
         while i + 16 <= n {
@@ -2023,10 +2028,15 @@ unsafe fn dot_f16_f32_neon(row: &[u16], x: &[f32]) -> f32 {
 
 /// `y[m] = W[m,k] @ x[k]` for a bfloat16 weight matrix. See [`gemv_f16`].
 ///
-/// bf16 shares f32's exponent field, so widening is a 16-bit left shift with no
-/// rounding and no special cases; row-parallel for the same reason as the f16
-/// twin, but left scalar per element since there is no NEON bf16 widen without
-/// FEAT_BF16 and the shift is already cheap.
+/// Row-parallel for the same reason as the f16 twin, but with a scalar body:
+/// `crate::quant::bf16_to_f32` is a shift, so the widen was never the cost here.
+///
+/// What the f16 kernel buys and this one does not is the *accumulator* shape:
+/// `.sum()` over f32 is a single dependency chain LLVM may not reassociate, so
+/// each element waits an FMA latency, against four independent chains next door.
+/// `vshll_n_u16` needs no FEAT_BF16 and would close most of that, but no bf16
+/// GGUF was on hand to measure it, and this path has yet to show up in a
+/// profile. Left as the obvious next step rather than an unmeasured rewrite.
 pub fn gemv_bf16(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     // As in `gemv_f16`: `zip` would silently stop at the shorter side, and
     // `gemv_f32` panics on a short `x`, so check once here rather than per row.
@@ -2040,7 +2050,7 @@ pub fn gemv_bf16(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
         *yi = row
             .iter()
             .zip(x)
-            .map(|(&w, &xv)| f32::from_bits(u32::from(w) << 16) * xv)
+            .map(|(&w, &xv)| crate::quant::bf16_to_f32(w) * xv)
             .sum();
     };
 
@@ -7062,6 +7072,79 @@ mod tests {
 mod f16_gemv_tests {
     use super::*;
 
+    /// Shapes that between them reach every path in both kernels.
+    ///
+    /// `k = 64` is a clean multiple of the 16-wide NEON body, `k = 70` leaves a
+    /// 6-element scalar tail, and `k = 12` is shorter than one vector block so
+    /// it is tail-only. `m = 512` clears `gemv_par_threshold` and exercises the
+    /// row-parallel dispatch, which the small `m` cases do not; it appears with
+    /// both a clean and a ragged `k` so parallel-plus-tail is covered.
+    /// `k = 2048` is the only one at a realistic hidden size: the others all
+    /// finish in a handful of accumulations, and drift between four partial
+    /// sums and one is a function of depth.
+    const SHAPES: &[(usize, usize)] =
+        &[(7, 12), (5, 64), (3, 70), (512, 64), (512, 70), (64, 2048)];
+
+    /// Pin a 16-bit GEMV against widening the whole matrix to f32 and running
+    /// `gemv_f32`, which isolates the kernel from the model so a wrong answer is
+    /// attributable.
+    ///
+    /// `narrow` and `widen` must come from the `half` crate, **not** from
+    /// `crate::quant`. The crate's own converters are what these kernels call,
+    /// so using them here would compare each kernel against itself: the fixture
+    /// and the reference would carry the same error and any widen bug would
+    /// cancel out. This is not hypothetical, an earlier bulk edit in this
+    /// crate rewrote exactly such a reference and left a test that passed
+    /// unconditionally for hours.
+    fn check_widened_gemv(
+        label: &str,
+        seed: u32,
+        narrow: fn(f32) -> u16,
+        widen: fn(u16) -> f32,
+        kernel: fn(&[u8], &[f32], &mut [f32], usize, usize),
+    ) {
+        for &(m, k) in SHAPES {
+            let mut st = seed;
+            let mut next = || {
+                st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((st >> 8) as f32 / 8_388_608.0) - 1.0
+            };
+            // Round-trip through the narrow type so the reference and the kernel
+            // start from the same values; a raw f32 would differ by the rounding.
+            let halves: Vec<u16> = (0..m * k).map(|_| narrow(next())).collect();
+            let x: Vec<f32> = (0..k).map(|_| next()).collect();
+
+            let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+            let mut got = vec![0.0f32; m];
+            kernel(&bytes, &x, &mut got, m, k);
+
+            let widened: Vec<f32> = halves.iter().map(|&h| widen(h)).collect();
+            let wbytes: Vec<u8> = widened.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let mut want = vec![0.0f32; m];
+            gemv_f32(&wbytes, &x, &mut want, m, k);
+
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                // Not bit-exact by construction: the NEON path keeps four
+                // partial sums and the reference keeps one, so the additions
+                // happen in a different order. The bound scales with the total
+                // magnitude that flowed through the accumulator rather than with
+                // the result, because cancellation makes a row's output an
+                // arbitrarily small fraction of what was summed to reach it, and
+                // at k = 2048 a result-relative bound would be flaky.
+                let sum_abs: f32 = widened[i * k..(i + 1) * k]
+                    .iter()
+                    .zip(&x)
+                    .map(|(a, b)| (a * b).abs())
+                    .sum();
+                let tol = 1e-5 * (1.0 + w.abs()) + 2e-6 * sum_abs;
+                assert!(
+                    (g - w).abs() <= tol,
+                    "{label} m={m} k={k} row {i}: got {g} want {w} (tol {tol})"
+                );
+            }
+        }
+    }
+
     /// `gemv_bf16` must equal widening the matrix to f32 and running
     /// `gemv_f32`, over the same shape sweep as its f16 twin.
     ///
@@ -7070,82 +7153,24 @@ mod f16_gemv_tests {
     /// this kernel through `gemv_dispatch`, and nothing else exercises it.
     #[test]
     fn gemv_bf16_matches_widened_f32() {
-        for &(m, k) in &[(7usize, 12usize), (5, 64), (3, 70), (512, 64)] {
-            let mut st = 0x1357_9BDFu32;
-            let mut next = || {
-                st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                ((st >> 8) as f32 / 8_388_608.0) - 1.0
-            };
-            // Round-trip through bf16 so the reference and the kernel start
-            // from the same values; a raw f32 would differ by the truncation.
-            let halves: Vec<u16> = (0..m * k)
-                .map(|_| (next().to_bits() >> 16) as u16)
-                .collect();
-            let x: Vec<f32> = (0..k).map(|_| next()).collect();
-
-            let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
-            let mut got = vec![0.0f32; m];
-            gemv_bf16(&bytes, &x, &mut got, m, k);
-
-            let widened: Vec<f32> = halves
-                .iter()
-                .map(|&h| f32::from_bits(u32::from(h) << 16))
-                .collect();
-            let wbytes: Vec<u8> = widened.iter().flat_map(|f| f.to_le_bytes()).collect();
-            let mut want = vec![0.0f32; m];
-            gemv_f32(&wbytes, &x, &mut want, m, k);
-
-            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                assert!(
-                    (g - w).abs() <= 1e-5 * (1.0 + w.abs()),
-                    "m={m} k={k} row {i}: got {g} want {w}"
-                );
-            }
-        }
+        check_widened_gemv(
+            "bf16",
+            0x1357_9BDF,
+            |v| half::bf16::from_f32(v).to_bits(),
+            |h| half::bf16::from_bits(h).to_f32(),
+            gemv_bf16,
+        );
     }
 
     /// `gemv_f16` must equal widening the matrix to f32 and running `gemv_f32`.
-    /// Isolates the kernel from the model so a wrong answer is attributable.
-    ///
-    /// The shapes are chosen to reach every path: `k = 64` is a clean multiple
-    /// of the 16-wide NEON body, `k = 70` leaves a 6-element scalar tail, and
-    /// `k = 12` is shorter than one vector block so it is tail-only. `m = 512`
-    /// clears `gemv_par_threshold` and exercises the row-parallel dispatch,
-    /// which the small `m` cases do not.
     #[test]
     fn gemv_f16_matches_widened_f32() {
-        for &(m, k) in &[(7usize, 12usize), (5, 64), (3, 70), (512, 64), (512, 70)] {
-            let mut st = 0x9E37_79B9u32;
-            let mut next = || {
-                st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                ((st >> 8) as f32 / 8_388_608.0) - 1.0
-            };
-            let halves: Vec<u16> = (0..m * k)
-                .map(|_| crate::quant::f32_to_f16(next()))
-                .collect();
-            let x: Vec<f32> = (0..k).map(|_| next()).collect();
-
-            let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
-            let mut got = vec![0.0f32; m];
-            gemv_f16(&bytes, &x, &mut got, m, k);
-
-            let widened: Vec<f32> = halves
-                .iter()
-                .map(|&h| crate::quant::f16_to_f32(h))
-                .collect();
-            let wbytes: Vec<u8> = widened.iter().flat_map(|f| f.to_le_bytes()).collect();
-            let mut want = vec![0.0f32; m];
-            gemv_f32(&wbytes, &x, &mut want, m, k);
-
-            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                // Not bit-exact by construction: the NEON path keeps four
-                // partial sums and the reference keeps one, so the additions
-                // happen in a different order.
-                assert!(
-                    (g - w).abs() <= 1e-5 * (1.0 + w.abs()),
-                    "m={m} k={k} row {i}: got {g} want {w}"
-                );
-            }
-        }
+        check_widened_gemv(
+            "f16",
+            0x9E37_79B9,
+            |v| half::f16::from_f32(v).to_bits(),
+            |h| half::f16::from_bits(h).to_f32(),
+            gemv_f16,
+        );
     }
 }

@@ -821,7 +821,7 @@ pub(crate) fn dequantize_row_into(
             let halves: &[u16] = bytemuck::cast_slice(row_data);
             assert_eq!(halves.len(), out.len(), "BF16 embedding row length");
             for (o, &h) in out.iter_mut().zip(halves) {
-                *o = f32::from_bits(u32::from(h) << 16);
+                *o = crate::quant::bf16_to_f32(h);
             }
         }
         _ => panic!("unsupported embedding dtype: {:?}", wref.dtype),
