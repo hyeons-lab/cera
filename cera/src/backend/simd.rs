@@ -7345,6 +7345,7 @@ pub(crate) mod avx512_vnni {
     #[cfg(test)]
     mod avx512_vnni_tests {
         use super::*;
+        use half::f16;
 
         /// Uniform `[0, 1)`. Deliberately not the `avx512_tests` `lcg`, which
         /// returns `[-1, 0)` — the byte-pattern builders below cast to `u8`, and
