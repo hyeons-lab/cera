@@ -28,6 +28,20 @@ name: Benchmarks
 # microbench exists because the kernel is where wgpu perf has actually moved by
 # orders of magnitude, and an end-to-end number dilutes that.
 #
+# **What this workflow can and cannot see.** Kernel work shows up here: the
+# `arm64-i8mm` runner is the one where the aarch64 SMMLA GEMM kernels actually
+# execute, and the push trigger covers `cera/src/backend/**`, so a change to
+# those kernels moves these numbers on the next merge. Core-topology *scheduling*
+# work does not show up here, and cannot: capacity-aware chunk sizing scales a
+# worker's chunk by its core's weight, and the prefill pool drops pinning once it
+# is wider than the fast-core count. Both are no-ops on a host whose cores are
+# all the same speed, and every hosted runner is that host. Each run prints its
+# resolved topology (`cores: ... placement=...`) next to the tier for exactly
+# this reason: where that reads `flat`, a level trend is not evidence scheduling
+# work achieved nothing, it is evidence this host cannot express it. Those
+# changes are measured on real big.LITTLE hardware and recorded in
+# `benchmarks/BASELINE.md` instead.
+#
 # Each CPU run also benchmarks upstream **llama.cpp** on the *same* GGUFs (pinned
 # commit, built once and cached, native ISA to match cera's runtime dispatch) and
 # adds `llama` + `gap (llama/cera)` columns to the summary table. This is
