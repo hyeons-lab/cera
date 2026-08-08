@@ -14,10 +14,25 @@ slangc is present, so the `.slang` is the source of truth. CI byte-compares the
 committed outputs against what the pinned slangc produces, so a stale `.metal`
 or `.wgsl` fails the build rather than silently shipping to a device.
 
-Nothing here is on the production path yet. Each generated kernel sits beside its
-handwritten twin and only `tests/slang_multitarget_parity.rs` and the
-`examples/slang_*_bench.rs` benches dispatch it, so a wrong generated kernel
-breaks nothing. This is an evaluation.
+**These are the production kernels.** The evaluation is over: with the three
+exceptions below, every kernel here is what the backends dispatch, and the
+handwritten WGSL/MSL twins they replaced have been deleted. A wrong generated
+kernel is now a wrong kernel, which is why `tests/slang_multitarget_parity.rs`
+pins each one against the CPU reference.
+
+The exceptions, and why:
+
+- `elementwise.slang` covers all four entry points `elementwise.wgsl` has, but
+  only four of the eight in `elementwise.metal`. The other four (`memcpy_f32`,
+  `scale_f32`, `mul_out`, `cast_f32_to_f16`) are Metal-only, with no WGSL
+  counterpart to share a body with, so the Metal side cannot switch. Flipping
+  only wgpu would give up the single shared source that is the point of this
+  directory, so both backends keep the handwritten kernel and the port stays
+  reachable as `ELEMENTWISE_SLANG`.
+- `gemm_q8_0.slang` is a cooperative-matrix experiment, not a replacement for
+  the hand-tuned `simdgroup_matrix` GEMM. See `GEMM_Q8_0_SLANG`.
+- `coopmat_probe.slang` is a capability probe rather than a kernel. Nothing
+  dispatches it; `tests/slang_multitarget_parity.rs` asserts it compiles.
 
 ## The one primitive that makes it work: `__target_switch`
 
@@ -137,13 +152,14 @@ than a skip.
 Performance (release matters; a debug build measures the harness):
 
 ```sh
-cargo run -p cera --features metal --release --example slang_softmax_bench
 cargo run -p cera --features metal --release --example slang_gemm_bench
 cargo run -p cera --features metal --release --example slang_elementwise_bench
-cargo run -p cera --features metal --release --example slang_norm_bench
-cargo run -p cera --features metal --release --example slang_norm2_bench
-cargo run -p cera --features metal --release --example slang_conv_bench
 ```
+
+Only two benches remain, and that is a consequence of the flip rather than an
+omission: a generated-vs-handwritten bench needs a handwritten twin, and outside
+`elementwise` and `gemm_q8_0` there is no longer one to compare against. The
+softmax, norm, norm2 and conv benches were deleted with the twins they timed.
 
 Every bench prints an agreement check first (a faster arm that disagrees is not a
 faster arm), then interleaves the two kernels round by round and reports the

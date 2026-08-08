@@ -2,19 +2,21 @@
 //! **both** WGSL and MSL by build.rs, each checked against the same CPU
 //! reference here.
 //!
-//! `softmax` is the pilot. It was picked because the two handwritten kernels it
-//! shadows already agree on their binding contract (x in-place at binding 0,
-//! params at binding 1) *and* deliberately disagree on their reduction:
-//! `softmax.metal` uses a two-stage `simd_max`/`simd_sum` while `softmax.wgsl`
-//! walks a shared-memory tree
-//! because cera does not request `wgpu::Features::SUBGROUP`. The Slang source
-//! keeps both via `__target_switch`, so this suite is really asking whether a
-//! generated kernel can preserve a per-target fast path rather than flattening
-//! to the portable one.
+//! `softmax` was the pilot. It was picked because the two handwritten kernels it
+//! replaced already agreed on their binding contract (x in-place at binding 0,
+//! params at binding 1) *and* deliberately disagreed on their reduction: the
+//! Metal one used a two-stage `simd_max`/`simd_sum` while the WGSL one walked a
+//! shared-memory tree, because cera does not request
+//! `wgpu::Features::SUBGROUP`. The Slang source keeps both via
+//! `__target_switch`, so this suite is really asking whether a generated kernel
+//! can preserve a per-target fast path rather than flattening to the portable
+//! one.
 //!
-//! Neither generated kernel is on the production path yet. Nothing regresses if
-//! they are wrong; the point is to find out on real hardware first, since the
-//! MSL half cannot be executed on a Linux or Windows dev box at all.
+//! **These kernels are on the production path.** They used to sit beside their
+//! handwritten twins, and a wrong one regressed nothing; the twins are now
+//! deleted and this suite is what stands between a wrong `.slang` and shipped
+//! inference. It matters most for the MSL half, which cannot be executed on a
+//! Linux or Windows dev box at all.
 //!
 //! No GGUF and no network: synthetic inputs only, so these run wherever a GPU
 //! exists.
@@ -720,7 +722,7 @@ mod wgsl {
 
     fn run_softmax(ctx: &GpuContext, input: &[f32]) -> Vec<f32> {
         let n = input.len() as u32;
-        let pipeline = ctx.create_pipeline(shaders::SOFTMAX_SLANG, "softmax", "softmax_slang");
+        let pipeline = ctx.create_pipeline(shaders::SOFTMAX, "softmax", "softmax_slang");
 
         let x = ctx.upload_f32(input, "softmax_x");
         let params = ctx.upload_storage(bytemuck::cast_slice(&[n, 0u32]), "params");
@@ -784,7 +786,7 @@ mod wgsl {
 
     fn run_bias_add(ctx: &GpuContext, x: &[f32], bias: &[f32], dim: u32) -> Vec<f32> {
         let total = x.len() as u32;
-        let pipeline = ctx.create_pipeline(shaders::BIAS_ADD_SLANG, "bias_add", "bias_add_slang");
+        let pipeline = ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "bias_add_slang");
 
         let x_buf = ctx.upload_f32(x, "bias_x");
         let bias_buf = ctx.upload_f32(bias, "bias_bias");
@@ -835,7 +837,7 @@ mod wgsl {
 
     fn run_gelu(ctx: &GpuContext, input: &[f32]) -> Vec<f32> {
         let n = input.len() as u32;
-        let pipeline = ctx.create_pipeline(shaders::GELU_SLANG, "gelu_inplace", "gelu_slang");
+        let pipeline = ctx.create_pipeline(shaders::GELU, "gelu_inplace", "gelu_slang");
 
         let x = ctx.upload_f32(input, "gelu_x");
         let params = ctx.upload_storage(bytemuck::cast_slice(&[n, 0u32]), "gelu_params");
@@ -967,7 +969,7 @@ mod wgsl {
         ff: &[f32],
         has_ff: u32,
     ) -> (Vec<f32>, Vec<f32>) {
-        let pipeline = ctx.create_pipeline(shaders::ROPE_SLANG, "rope", "rope_slang");
+        let pipeline = ctx.create_pipeline(shaders::ROPE, "rope", "rope_slang");
 
         let q_buf = ctx.upload_f32(q, "rope_q");
         let k_buf = ctx.upload_f32(k, "rope_k");
@@ -1090,7 +1092,7 @@ mod wgsl {
         eps: f32,
     ) -> Vec<f32> {
         let pipeline = ctx.create_pipeline(
-            shaders::PER_HEAD_RMSNORM_SLANG,
+            shaders::PER_HEAD_RMSNORM,
             "per_head_rmsnorm",
             "per_head_rmsnorm_slang",
         );
@@ -1159,7 +1161,7 @@ mod wgsl {
         eps: f32,
     ) -> Vec<f32> {
         let pipeline = ctx.create_pipeline(
-            shaders::LAYERNORM_BATCH_SLANG,
+            shaders::LAYERNORM_BATCH,
             "layernorm_batch",
             "layernorm_batch_slang",
         );
@@ -1239,7 +1241,7 @@ mod wgsl {
         eps: f32,
         res_scale: f32,
     ) -> (Vec<f32>, Vec<f32>) {
-        let pipeline = ctx.create_pipeline(shaders::RMSNORM_BATCH_SLANG, entry, entry);
+        let pipeline = ctx.create_pipeline(shaders::RMSNORM_BATCH, entry, entry);
         let src_buf = ctx.upload_f32(src, "rb_src");
         let dst_buf = ctx.upload_f32(&vec![0.0f32; (rows * n) as usize], "rb_dst");
         let w_buf = ctx.upload_f32(w, "rb_w");
@@ -1354,8 +1356,7 @@ mod wgsl {
 
     fn run_argmax_f32(ctx: &GpuContext, x: &[f32]) -> u32 {
         let n = x.len() as u32;
-        let pipeline =
-            ctx.create_pipeline(shaders::ARGMAX_F32_SLANG, "argmax_f32", "argmax_f32_slang");
+        let pipeline = ctx.create_pipeline(shaders::ARGMAX_F32, "argmax_f32", "argmax_f32_slang");
         let x_buf = ctx.upload_f32(x, "am_x");
         let out_buf = ctx.upload_storage(bytemuck::cast_slice(&[0u32]), "am_out");
         let params = ctx.upload_storage(bytemuck::cast_slice(&[n, 0u32]), "am_params");
@@ -1409,7 +1410,7 @@ mod wgsl {
     // The wgsl rmsnorm branch is in-place: 3 bindings (x rw, weight, params).
     fn run_rmsnorm(ctx: &GpuContext, x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
         let n = x.len() as u32;
-        let pipeline = ctx.create_pipeline(shaders::RMSNORM_SLANG, "rmsnorm", "rmsnorm_slang");
+        let pipeline = ctx.create_pipeline(shaders::RMSNORM, "rmsnorm", "rmsnorm_slang");
         let x_buf = ctx.upload_f32(x, "rn_x");
         let w_buf = ctx.upload_f32(weight, "rn_w");
         let params = ctx.upload_storage(
@@ -1612,35 +1613,19 @@ mod wgsl {
     #[test]
     fn conv1d_slang_matches_reference() {
         let Some(ctx) = setup() else { return };
-        check_conv1d(&ctx, "generated", shaders::CONV1D_SLANG);
+        check_conv1d(&ctx, "generated", shaders::CONV1D);
     }
 
     #[test]
     fn conv1d_fused_slang_matches_reference() {
         let Some(ctx) = setup() else { return };
-        check_conv1d_fused(&ctx, "generated", shaders::CONV1D_FUSED_SLANG);
+        check_conv1d_fused(&ctx, "generated", shaders::CONV1D_FUSED);
     }
 
     #[test]
     fn conv1d_fused_batch_slang_matches_reference() {
         let Some(ctx) = setup() else { return };
-        check_conv1d_fused_batch(&ctx, "generated", shaders::CONV1D_FUSED_BATCH_SLANG);
-    }
-
-    /// The same sweeps against the three HANDWRITTEN kernels, mirroring the msl
-    /// module's pin.
-    ///
-    /// Without these, each generated kernel is pinned only to a CPU reference
-    /// written by reading the kernel body, so a transcription error made in the
-    /// `.slang` and repeated in the reference would pass. The msl module runs
-    /// the same check, but only a Metal host executes it; this keeps the
-    /// references pinned on a gpu-only host too.
-    #[test]
-    fn handwritten_conv_kernels_match_the_same_references() {
-        let Some(ctx) = setup() else { return };
-        check_conv1d(&ctx, "handwritten", shaders::CONV1D);
-        check_conv1d_fused(&ctx, "handwritten", shaders::CONV1D_FUSED);
-        check_conv1d_fused_batch(&ctx, "handwritten", shaders::CONV1D_FUSED_BATCH);
+        check_conv1d_fused_batch(&ctx, "generated", shaders::CONV1D_FUSED_BATCH);
     }
 
     fn run_gemm(
@@ -1739,7 +1724,7 @@ mod msl {
     fn run_softmax(ctx: &MetalContext, input: &[f32]) -> Vec<f32> {
         let n = input.len() as u32;
         let pipeline = ctx
-            .create_pipeline(shaders::SOFTMAX_SLANG, "softmax")
+            .create_pipeline(shaders::SOFTMAX, "softmax")
             .expect("compile generated MSL");
 
         let x = ctx.upload_f32(input);
@@ -1803,7 +1788,7 @@ mod msl {
     fn run_bias_add(ctx: &MetalContext, x: &[f32], bias: &[f32], dim: u32) -> Vec<f32> {
         let total = x.len() as u32;
         let pipeline = ctx
-            .create_pipeline(shaders::BIAS_ADD_SLANG, "bias_add")
+            .create_pipeline(shaders::BIAS_ADD, "bias_add")
             .expect("compile generated MSL");
 
         let x_buf = ctx.upload_f32(x);
@@ -1853,7 +1838,7 @@ mod msl {
     fn run_gelu(ctx: &MetalContext, input: &[f32]) -> Vec<f32> {
         let n = input.len() as u32;
         let pipeline = ctx
-            .create_pipeline(shaders::GELU_SLANG, "gelu_inplace")
+            .create_pipeline(shaders::GELU, "gelu_inplace")
             .expect("compile generated MSL");
 
         let x = ctx.upload_f32(input);
@@ -1983,7 +1968,7 @@ mod msl {
         freq_base: f32,
     ) -> (Vec<f32>, Vec<f32>) {
         let pipeline = ctx
-            .create_pipeline(shaders::ROPE_SLANG, "rope")
+            .create_pipeline(shaders::ROPE, "rope")
             .expect("compile generated MSL");
 
         let q_buf = ctx.upload_f32(q);
@@ -2024,8 +2009,8 @@ mod msl {
         (ctx.read_f32(&q_buf, q.len()), ctx.read_f32(&k_buf, k.len()))
     }
 
-    /// The metal branch is NEOX-only (mirrors rope.metal); the interleaved and
-    /// freq_factors paths live only in the wgsl branch and are checked there.
+    /// The metal branch is NEOX-only; the interleaved and freq_factors paths
+    /// live only in the wgsl branch and are checked there.
     #[test]
     fn rope_slang_matches_reference() {
         let Some(ctx) = common::metal_context() else {
@@ -2071,7 +2056,7 @@ mod msl {
         eps: f32,
     ) -> Vec<f32> {
         let pipeline = ctx
-            .create_pipeline(shaders::PER_HEAD_RMSNORM_SLANG, "per_head_rmsnorm")
+            .create_pipeline(shaders::PER_HEAD_RMSNORM, "per_head_rmsnorm")
             .expect("compile generated MSL");
         let x_buf = ctx.upload_f32(x);
         let w_buf = ctx.upload_f32(weight);
@@ -2132,7 +2117,7 @@ mod msl {
         eps: f32,
     ) -> Vec<f32> {
         let pipeline = ctx
-            .create_pipeline(shaders::LAYERNORM_BATCH_SLANG, "layernorm_batch")
+            .create_pipeline(shaders::LAYERNORM_BATCH, "layernorm_batch")
             .expect("compile generated MSL");
         let src_buf = ctx.upload_f32(src);
         let dst_buf = ctx.upload_f32(&vec![0.0f32; (rows * n) as usize]);
@@ -2201,7 +2186,7 @@ mod msl {
         res_scale: f32,
     ) -> (Vec<f32>, Vec<f32>) {
         let pipeline = ctx
-            .create_pipeline(shaders::RMSNORM_BATCH_SLANG, entry)
+            .create_pipeline(shaders::RMSNORM_BATCH, entry)
             .expect("compile generated MSL");
         let src_buf = ctx.upload_f32(src);
         let dst_buf = ctx.upload_f32(&vec![0.0f32; (rows * n) as usize]);
@@ -2310,7 +2295,7 @@ mod msl {
     fn run_argmax_f32(ctx: &MetalContext, x: &[f32]) -> u32 {
         let n = x.len() as u32;
         let pipeline = ctx
-            .create_pipeline(shaders::ARGMAX_F32_SLANG, "argmax_f32")
+            .create_pipeline(shaders::ARGMAX_F32, "argmax_f32")
             .expect("compile generated MSL");
         let x_buf = ctx.upload_f32(x);
         let out_buf = ctx.upload_bytes(bytemuck::cast_slice(&[0u32]));
@@ -2362,7 +2347,7 @@ mod msl {
     fn run_rmsnorm(ctx: &MetalContext, x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
         let n = x.len() as u32;
         let pipeline = ctx
-            .create_pipeline(shaders::RMSNORM_SLANG, "rmsnorm")
+            .create_pipeline(shaders::RMSNORM, "rmsnorm")
             .expect("compile generated MSL");
         let src_buf = ctx.upload_f32(x);
         let dst_buf = ctx.upload_f32(&vec![0.0f32; x.len()]);
@@ -2554,7 +2539,7 @@ mod msl {
         let Some(ctx) = common::metal_context() else {
             return;
         };
-        check_conv1d(&ctx, "generated", shaders::CONV1D_SLANG);
+        check_conv1d(&ctx, "generated", shaders::CONV1D);
     }
 
     #[test]
@@ -2562,7 +2547,7 @@ mod msl {
         let Some(ctx) = common::metal_context() else {
             return;
         };
-        check_conv1d_fused(&ctx, "generated", shaders::CONV1D_FUSED_SLANG);
+        check_conv1d_fused(&ctx, "generated", shaders::CONV1D_FUSED);
     }
 
     #[test]
@@ -2570,26 +2555,7 @@ mod msl {
         let Some(ctx) = common::metal_context() else {
             return;
         };
-        check_conv1d_fused_batch(&ctx, "generated", shaders::CONV1D_FUSED_BATCH_SLANG);
-    }
-
-    /// The same sweeps against the three HANDWRITTEN kernels.
-    ///
-    /// Without these, each generated kernel is pinned only to a CPU reference
-    /// that was written by reading the kernel body, so a transcription error
-    /// made in the `.slang` and repeated in the reference would pass. Running
-    /// both sides through one runner also pins the binding contract they share,
-    /// which for `conv1d_fused` is the consolidation this branch made: its Metal
-    /// twin used to take x, b and c as three separate buffers and now reads one
-    /// packed `proj`.
-    #[test]
-    fn handwritten_conv_kernels_match_the_same_references() {
-        let Some(ctx) = common::metal_context() else {
-            return;
-        };
-        check_conv1d(&ctx, "handwritten", shaders::CONV1D);
-        check_conv1d_fused(&ctx, "handwritten", shaders::CONV1D_FUSED);
-        check_conv1d_fused_batch(&ctx, "handwritten", shaders::CONV1D_FUSED_BATCH);
+        check_conv1d_fused_batch(&ctx, "generated", shaders::CONV1D_FUSED_BATCH);
     }
 
     fn run_gemm(
@@ -2699,7 +2665,7 @@ mod msl {
     /// to observe which branch survived.
     #[test]
     fn generated_msl_keeps_simd_reduction() {
-        let src = shaders::SOFTMAX_SLANG;
+        let src = shaders::SOFTMAX;
         assert!(
             src.contains("simd_max"),
             "generated MSL lost simd_max; __target_switch selected the portable tree"
@@ -2716,7 +2682,7 @@ mod msl {
     #[test]
     fn generated_per_head_rmsnorm_keeps_simd_sum() {
         assert!(
-            shaders::PER_HEAD_RMSNORM_SLANG.contains("simd_sum"),
+            shaders::PER_HEAD_RMSNORM.contains("simd_sum"),
             "generated MSL lost simd_sum; __target_switch selected the portable tree"
         );
     }
@@ -2726,7 +2692,7 @@ mod msl {
     #[test]
     fn generated_layernorm_batch_keeps_simd_sum() {
         assert!(
-            shaders::LAYERNORM_BATCH_SLANG.contains("simd_sum"),
+            shaders::LAYERNORM_BATCH.contains("simd_sum"),
             "generated MSL lost simd_sum; __target_switch selected the portable tree"
         );
     }
@@ -2736,7 +2702,7 @@ mod msl {
     #[test]
     fn generated_rmsnorm_batch_keeps_simd_sum() {
         assert!(
-            shaders::RMSNORM_BATCH_SLANG.contains("simd_sum"),
+            shaders::RMSNORM_BATCH.contains("simd_sum"),
             "generated MSL lost simd_sum; __target_switch selected the portable tree"
         );
     }
@@ -2747,7 +2713,7 @@ mod msl {
     #[test]
     fn generated_argmax_keeps_simd_shuffle_down() {
         assert!(
-            shaders::ARGMAX_F32_SLANG.contains("simd_shuffle_down"),
+            shaders::ARGMAX_F32.contains("simd_shuffle_down"),
             "generated MSL lost simd_shuffle_down; __target_switch selected the portable tree"
         );
     }
@@ -2757,7 +2723,7 @@ mod msl {
     #[test]
     fn generated_rmsnorm_keeps_simd_sum() {
         assert!(
-            shaders::RMSNORM_SLANG.contains("simd_sum"),
+            shaders::RMSNORM.contains("simd_sum"),
             "generated MSL lost simd_sum; __target_switch selected the portable tree"
         );
     }
@@ -2857,30 +2823,24 @@ fn generated_gemm_wgsl_needs_no_f16() {
 #[test]
 fn generated_wgsl_has_no_subgroup_ops() {
     for (name, src) in [
-        ("softmax", cera::backend::wgpu::shaders::SOFTMAX_SLANG),
+        ("softmax", cera::backend::wgpu::shaders::SOFTMAX),
         ("gemm_q8_0", cera::backend::wgpu::shaders::GEMM_Q8_0_SLANG),
         (
             "per_head_rmsnorm",
-            cera::backend::wgpu::shaders::PER_HEAD_RMSNORM_SLANG,
+            cera::backend::wgpu::shaders::PER_HEAD_RMSNORM,
         ),
         (
             "layernorm_batch",
-            cera::backend::wgpu::shaders::LAYERNORM_BATCH_SLANG,
+            cera::backend::wgpu::shaders::LAYERNORM_BATCH,
         ),
-        (
-            "rmsnorm_batch",
-            cera::backend::wgpu::shaders::RMSNORM_BATCH_SLANG,
-        ),
-        ("argmax_f32", cera::backend::wgpu::shaders::ARGMAX_F32_SLANG),
-        ("rmsnorm", cera::backend::wgpu::shaders::RMSNORM_SLANG),
-        ("conv1d", cera::backend::wgpu::shaders::CONV1D_SLANG),
-        (
-            "conv1d_fused",
-            cera::backend::wgpu::shaders::CONV1D_FUSED_SLANG,
-        ),
+        ("rmsnorm_batch", cera::backend::wgpu::shaders::RMSNORM_BATCH),
+        ("argmax_f32", cera::backend::wgpu::shaders::ARGMAX_F32),
+        ("rmsnorm", cera::backend::wgpu::shaders::RMSNORM),
+        ("conv1d", cera::backend::wgpu::shaders::CONV1D),
+        ("conv1d_fused", cera::backend::wgpu::shaders::CONV1D_FUSED),
         (
             "conv1d_fused_batch",
-            cera::backend::wgpu::shaders::CONV1D_FUSED_BATCH_SLANG,
+            cera::backend::wgpu::shaders::CONV1D_FUSED_BATCH,
         ),
     ] {
         assert!(
@@ -2900,14 +2860,11 @@ fn generated_wgsl_has_no_subgroup_ops() {
 #[test]
 fn generated_conv_msl_binds_five_buffers() {
     for (name, src) in [
-        ("conv1d", cera::backend::metal::shaders::CONV1D_SLANG),
-        (
-            "conv1d_fused",
-            cera::backend::metal::shaders::CONV1D_FUSED_SLANG,
-        ),
+        ("conv1d", cera::backend::metal::shaders::CONV1D),
+        ("conv1d_fused", cera::backend::metal::shaders::CONV1D_FUSED),
         (
             "conv1d_fused_batch",
-            cera::backend::metal::shaders::CONV1D_FUSED_BATCH_SLANG,
+            cera::backend::metal::shaders::CONV1D_FUSED_BATCH,
         ),
     ] {
         for i in 0..5 {
@@ -2928,14 +2885,11 @@ fn generated_conv_msl_binds_five_buffers() {
 #[test]
 fn generated_conv_wgsl_binds_five_slots() {
     for (name, src) in [
-        ("conv1d", cera::backend::wgpu::shaders::CONV1D_SLANG),
-        (
-            "conv1d_fused",
-            cera::backend::wgpu::shaders::CONV1D_FUSED_SLANG,
-        ),
+        ("conv1d", cera::backend::wgpu::shaders::CONV1D),
+        ("conv1d_fused", cera::backend::wgpu::shaders::CONV1D_FUSED),
         (
             "conv1d_fused_batch",
-            cera::backend::wgpu::shaders::CONV1D_FUSED_BATCH_SLANG,
+            cera::backend::wgpu::shaders::CONV1D_FUSED_BATCH,
         ),
     ] {
         for i in 0..5 {
@@ -2975,7 +2929,7 @@ fn generated_conv_batch_unrolls_its_register_loops() {
     #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
     {
         checked += 1;
-        let msl = cera::backend::metal::shaders::CONV1D_FUSED_BATCH_SLANG;
+        let msl = cera::backend::metal::shaders::CONV1D_FUSED_BATCH;
         let loops = msl.matches("for(;;)").count();
         assert_eq!(
             loops, 1,
@@ -2986,7 +2940,7 @@ fn generated_conv_batch_unrolls_its_register_loops() {
     #[cfg(feature = "gpu")]
     {
         checked += 1;
-        let wgsl = cera::backend::wgpu::shaders::CONV1D_FUSED_BATCH_SLANG;
+        let wgsl = cera::backend::wgpu::shaders::CONV1D_FUSED_BATCH;
         let loops = wgsl.matches("for(;;)").count() + wgsl.matches("loop {").count();
         assert_eq!(
             loops, 1,

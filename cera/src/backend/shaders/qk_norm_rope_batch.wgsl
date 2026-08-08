@@ -27,7 +27,7 @@
 //                                         1-elem dummy when has_freq_factors == 0)
 //
 // `rope_type` (params[7]) selects the pair layout (0 = NEOX split-halves,
-// 1 = NORM interleaved), matching rope.wgsl. `has_qk_norm` (params[11]) gates
+// 1 = NORM interleaved), matching slang/rope.slang. `has_qk_norm` (params[11]) gates
 // Phase 1: dense transformers (llama/qwen2/mistral/granite) carry no per-head
 // norm weights, so they run rope-only and bind a dummy for q_norm_w/k_norm_w.
 
@@ -128,7 +128,7 @@ fn qk_norm_rope_batch(
     // ─── Phase 2: RoPE — pairs of (cos, sin) rotations ─────────────────────
     // theta_d = pos * freq_base^(-2d / head_dim). Compute once per d via pow.
     // `freq_factors` (Llama-3) optionally divides each pair's angle, mirroring
-    // rope.wgsl; gated by `has_freq_factors` (NEOX archs never set it).
+    // slang/rope.slang; gated by `has_freq_factors` (NEOX archs never set it).
     var d = tid;
     while d < half_dim {
         var angle = rope_angle(pos, d, head_dim, freq_base);

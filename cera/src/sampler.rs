@@ -10,7 +10,7 @@ use crate::backend::cpu;
 ///
 /// The strict `>` comparison means a NaN never displaces the running best and,
 /// on an exact tie, the **lowest** index wins — matching both GPU argmax
-/// kernels (`argmax_f32.wgsl` / `argmax_f32.metal`, which use the same `>`) and
+/// kernels (generated from `shaders/slang/argmax_f32.slang`, which uses the same `>`) and
 /// llama.cpp's `std::max_element` greedy pick. Public so external harnesses
 /// (e.g. benchmark runners driving [`crate::model::Model`] directly) pick
 /// tokens identically to cera's own greedy decode path across CPU and GPU.

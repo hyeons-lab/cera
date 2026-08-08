@@ -20,7 +20,7 @@
 // group layout, so nothing binds it; on Metal, the generated MSL still lists
 // `buffer(4)` in the rmsnorm_batch signature (Slang emits the shared binding for
 // both entries) but never reads it, so a Metal caller must bind any valid buffer
-// there (the parity test and slang_norm_bench do).
+// there (the parity test and the Metal backend's dispatch site do).
 //
 // Reduction divergence via `__target_switch` in `block_sum`: metal reduces the
 // sum of squares with a two-stage `simd_sum` (via `WaveActiveSum`), the portable
