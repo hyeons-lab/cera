@@ -132,6 +132,14 @@ pub struct CpuFeatures {
     pub neon: bool,
     pub dotprod: bool,
     pub i8mm: bool,
+    /// FEAT_FP16. Needed only to *declare* what `simd::neon::f16_bits_to_f32`
+    /// uses: `core::arch`'s `vcvt_f32_f16` is gated `neon,fp16` because its
+    /// operand type is `float16x4_t`, even though the `FCVTL` it lowers to is
+    /// baseline ARMv8.0-A and cannot trap on any AArch64 core. Detected so the
+    /// declaration is honest rather than relying on FEAT_I8MM (v8.6) implying
+    /// FEAT_FP16 (v8.2), the same reason the i8mm parity test gates on dotprod
+    /// instead of leaning on i8mm implying it.
+    pub fp16: bool,
 }
 
 impl CpuFeatures {
@@ -146,6 +154,7 @@ impl CpuFeatures {
         neon: false,
         dotprod: false,
         i8mm: false,
+        fp16: false,
     };
 
     /// The active SIMD feature flags in a stable, arch-independent order.
@@ -163,6 +172,7 @@ impl CpuFeatures {
             (self.neon, "neon"),
             (self.dotprod, "dotprod"),
             (self.i8mm, "i8mm"),
+            (self.fp16, "fp16"),
         ] {
             if on {
                 flags.push(name);
@@ -266,12 +276,20 @@ pub fn detect() -> CpuFeatures {
         f.neon = std::arch::is_aarch64_feature_detected!("neon");
         f.dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
         f.i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
+        f.fp16 = std::arch::is_aarch64_feature_detected!("fp16");
         // NeonI8mm lights up the Q8_0, Q4_0, Q4_K and Q6_K GEMM kernels;
         // everything else uses the dotprod path (i8mm implies dotprod). Gated
         // behind real i8mm detection so non-i8mm hosts never reach it; the
         // kernels are validated on CI by the `simd-i8mm` job (ubuntu-24.04-arm,
         // Neoverse N2).
-        f.tier = if f.neon && f.dotprod && f.i8mm {
+        //
+        // `fp16` joins the condition because those four kernels widen their
+        // block scales with `f16_bits_to_f32`, whose `vcvt_f32_f16` is declared
+        // `neon,fp16` by `core::arch`. FEAT_I8MM (v8.6) implies FEAT_FP16
+        // (v8.2) on any conformant core, so this never costs a real host the
+        // i8mm path; it is here so the tier states the features its kernels
+        // declare instead of resting on that implication.
+        f.tier = if f.neon && f.dotprod && f.i8mm && f.fp16 {
             CpuTier::NeonI8mm
         } else if f.neon && f.dotprod {
             CpuTier::NeonDotprod

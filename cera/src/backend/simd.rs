@@ -108,6 +108,21 @@ pub(crate) mod neon {
         }};
     }
 
+    /// Widen one IEEE-754 half (raw bits) to f32 in a single instruction (LLVM
+    /// lowers this to a scalar `fcvt s, h`).
+    ///
+    /// `half`'s `f16::to_f32` is *not* usable in a hot loop: its aarch64 path runs
+    /// `is_aarch64_feature_detected!("fp16")` per call, which the disassembly shows
+    /// as an out-of-line `bl` to `detect_and_initialize` plus a `bl` to
+    /// `f16_to_f32_fp16`. Neither inlines, so every call clobbers the caller-saved
+    /// registers and spills the kernel's live accumulators to the stack. Inside a
+    /// `neon` function we already know the conversion is available, so go direct.
+    #[inline]
+    #[target_feature(enable = "neon,fp16")]
+    unsafe fn f16_bits_to_f32(bits: u16) -> f32 {
+        unsafe { vgetq_lane_f32::<0>(vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(bits)))) }
+    }
+
     /// Accumulate dot product for a single decoded weight block against one Q8_0 column.
     macro_rules! gemm_dot_single {
         ($w_lo:expr, $w_hi:expr, $d_w:expr,
@@ -1305,7 +1320,7 @@ pub(crate) mod neon {
     // i8mm dispatch target of `gemm_q6_k_q8_0_neon`; dead under --all-features (blas
     // on), live under the default CI gate — same as the Q4_0/Q4_K i8mm kernels.
     #[allow(dead_code)]
-    #[target_feature(enable = "neon,i8mm")]
+    #[target_feature(enable = "neon,i8mm,fp16")]
     unsafe fn gemm_q6_k_q8_0_neon_i8mm(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -1415,8 +1430,8 @@ pub(crate) mod neon {
                                     .as_ptr()
                                     .add((i + 1) * row_bytes + bi * size_of::<BlockQ6K>())
                                     as *const BlockQ6K);
-                                let dw0 = half::f16::from_bits(blk0.d).to_f32();
-                                let dw1 = half::f16::from_bits(blk1.d).to_f32();
+                                let dw0 = f16_bits_to_f32(blk0.d);
+                                let dw1 = f16_bits_to_f32(blk1.d);
                                 let sc0 = blk0.scales;
                                 let sc1 = blk1.scales;
                                 for nh in 0..2 {
@@ -1454,7 +1469,16 @@ pub(crate) mod neon {
                                             let dp01 = vgetq_lane_s32::<1>(acc) as f32;
                                             let dp10 = vgetq_lane_s32::<2>(acc) as f32;
                                             let dp11 = vgetq_lane_s32::<3>(acc) as f32;
+                                            // `idx < 16` by construction (`nh < 2`,
+                                            // `g < 4`, `h < 2`), but LLVM does not
+                                            // prove it through the nest and emits a
+                                            // bounds check per read; the mask states
+                                            // the invariant so it folds away. The
+                                            // assert keeps a widened loop bound from
+                                            // silently aliasing to the wrong scale.
                                             let idx = nh * 8 + 2 * g + h;
+                                            debug_assert!(idx < 16, "Q6_K GEMM: sub-block index");
+                                            let idx = idx & 15;
                                             let d_sc0 = dw0 * sc0[idx] as f32;
                                             let d_sc1 = dw1 * sc1[idx] as f32;
                                             let xsj = *b_scales.as_ptr().add(j * nb32 + xb);
@@ -2272,7 +2296,7 @@ pub(crate) mod neon {
     // is `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
     // --all-features (blas on), live under the default CI gate.
     #[allow(dead_code)]
-    #[target_feature(enable = "neon,i8mm")]
+    #[target_feature(enable = "neon,i8mm,fp16")]
     unsafe fn gemm_q8_0_q8_0_neon_i8mm(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -2314,8 +2338,8 @@ pub(crate) mod neon {
                                         as *const BlockQ8_0),
                                 )
                             };
-                            let dw0 = f16::from_bits(wb0.delta).to_f32();
-                            let dw1 = f16::from_bits(wb1.delta).to_f32();
+                            let dw0 = unsafe { f16_bits_to_f32(wb0.delta) };
+                            let dw1 = unsafe { f16_bits_to_f32(wb1.delta) };
                             let db0 = b_scales[j * nb + bi];
                             let db1 = b_scales[(j + 1) * nb + bi];
                             let mut acc = unsafe { vdupq_n_s32(0) };
@@ -2437,7 +2461,7 @@ pub(crate) mod neon {
     // is `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
     // --all-features (blas on), live under the default CI gate.
     #[allow(dead_code)]
-    #[target_feature(enable = "neon,i8mm")]
+    #[target_feature(enable = "neon,i8mm,fp16")]
     unsafe fn gemm_q4_0_q8_0_neon_i8mm(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -2484,8 +2508,8 @@ pub(crate) mod neon {
                                         as *const BlockQ4_0),
                                 )
                             };
-                            let dw0 = f16::from_bits(wb0.d).to_f32();
-                            let dw1 = f16::from_bits(wb1.d).to_f32();
+                            let dw0 = unsafe { f16_bits_to_f32(wb0.d) };
+                            let dw1 = unsafe { f16_bits_to_f32(wb1.d) };
                             let db0 = b_scales[j * nb + bi];
                             let db1 = b_scales[(j + 1) * nb + bi];
                             let acc = unsafe {
@@ -2684,7 +2708,7 @@ pub(crate) mod neon {
     /// matches [`gemm_q4_k_q8_0_neon_dotprod`] exactly, so the accumulated f32 is
     /// bit-identical (the `dp`/`sx` integers are the same regardless of instruction).
     /// Odd row/col remainders fall back to [`gemm_q4_k_scalar_dot`].
-    #[target_feature(enable = "neon,i8mm")]
+    #[target_feature(enable = "neon,i8mm,fp16")]
     unsafe fn gemm_q4_k_q8_0_neon_i8mm(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -2736,12 +2760,22 @@ pub(crate) mod neon {
                                         as *const BlockQ4KM),
                                 )
                             };
-                            let d0 = half::f16::from_bits(wb0.d).to_f32();
-                            let dmin0 = half::f16::from_bits(wb0.dmin).to_f32();
-                            let d1 = half::f16::from_bits(wb1.d).to_f32();
-                            let dmin1 = half::f16::from_bits(wb1.dmin).to_f32();
+                            let d0 = unsafe { f16_bits_to_f32(wb0.d) };
+                            let dmin0 = unsafe { f16_bits_to_f32(wb0.dmin) };
+                            let d1 = unsafe { f16_bits_to_f32(wb1.d) };
+                            let dmin1 = unsafe { f16_bits_to_f32(wb1.dmin) };
                             let (sc0, mn0) = crate::quant::decode_q4km_scales(&wb0.scales);
                             let (sc1, mn1) = crate::quant::decode_q4km_scales(&wb1.scales);
+                            // Pre-scale the 8 sub-block scales/mins once per
+                            // superblock. Folding `d`/`dmin` in here keeps the
+                            // per-sub-block epilogue to two loads instead of two
+                            // loads plus two multiplies, and it is the same
+                            // arithmetic in the same order, so the f32 result is
+                            // unchanged.
+                            let dsc0: [f32; 8] = core::array::from_fn(|s| d0 * sc0[s] as f32);
+                            let dmn0: [f32; 8] = core::array::from_fn(|s| dmin0 * mn0[s] as f32);
+                            let dsc1: [f32; 8] = core::array::from_fn(|s| d1 * sc1[s] as f32);
+                            let dmn1: [f32; 8] = core::array::from_fn(|s| dmin1 * mn1[s] as f32);
                             let qs0 = wb0.qs.as_ptr();
                             let qs1 = wb1.qs.as_ptr();
 
@@ -2827,14 +2861,33 @@ pub(crate) mod neon {
                                             vgetq_lane_s32::<3>(acc) as f32,
                                         )
                                     };
-                                    let dsc0 = d0 * sc0[s] as f32;
-                                    let dmn0 = dmin0 * mn0[s] as f32;
-                                    let dsc1 = d1 * sc1[s] as f32;
-                                    let dmn1 = dmin1 * mn1[s] as f32;
-                                    let xs_j = b_scales[j * nb32 + xb];
-                                    let xs_j1 = b_scales[(j + 1) * nb32 + xb];
-                                    let sx_j = cs[j * nb32 + xb] as f32;
-                                    let sx_j1 = cs[(j + 1) * nb32 + xb] as f32;
+                                    // `s < 8` by construction (`s` is `2*g` or
+                                    // `2*g+1` for `g < 4`), but LLVM does not
+                                    // prove it through the group loop and emits a
+                                    // bounds check per read. Masking states the
+                                    // invariant so the check folds away. The
+                                    // assert keeps a widened loop bound from
+                                    // silently aliasing to the wrong scale.
+                                    debug_assert!(s < 8, "Q4_K GEMM: sub-block index");
+                                    let (dsc0, dmn0) = (dsc0[s & 7], dmn0[s & 7]);
+                                    let (dsc1, dmn1) = (dsc1[s & 7], dmn1[s & 7]);
+                                    // Raw reads. `cs` is `n * nb32` by
+                                    // construction in `q8_0_col_sums`, and
+                                    // `b_scales` is checked against the same
+                                    // length by a release `assert!` in
+                                    // `gemm_preq_dispatch`, the only production
+                                    // caller. The kernel's own entry checks are
+                                    // `debug_assert!` and do not carry this in
+                                    // release, which is the same footing the
+                                    // pre-existing raw `b_quants` reads stand on.
+                                    let (xs_j, xs_j1, sx_j, sx_j1) = unsafe {
+                                        (
+                                            *b_scales.as_ptr().add(j * nb32 + xb),
+                                            *b_scales.as_ptr().add((j + 1) * nb32 + xb),
+                                            *cs.as_ptr().add(j * nb32 + xb) as f32,
+                                            *cs.as_ptr().add((j + 1) * nb32 + xb) as f32,
+                                        )
+                                    };
                                     s00 += xs_j * (dsc0 * dp00 - dmn0 * sx_j);
                                     s01 += xs_j1 * (dsc0 * dp01 - dmn0 * sx_j1);
                                     s10 += xs_j * (dsc1 * dp10 - dmn1 * sx_j);
@@ -3008,6 +3061,37 @@ pub(crate) mod neon {
         }
 
         use crate::backend::simd::require_simd_or_skip;
+
+        /// `f16_bits_to_f32` must be a drop-in for `half`'s `to_f32`, for every
+        /// one of the 65536 half patterns.
+        ///
+        /// The GEMM parity tests cannot cover this: `assert_close` allows 1%
+        /// relative error, while flipping the lowest mantissa bit of a half moves
+        /// the value by about 0.1%. A conversion that was subtly wrong would pass
+        /// them.
+        ///
+        /// Gated on `fp16` rather than `i8mm`, which is the point: the helper
+        /// declares `neon,fp16`, so this still executes on the dev host, where
+        /// the i8mm kernels that call it never run.
+        #[test]
+        fn f16_widen_matches_half_crate_exhaustively() {
+            if !require_simd_or_skip("fp16", std::arch::is_aarch64_feature_detected!("fp16")) {
+                return;
+            }
+            for bits in 0..=u16::MAX {
+                let want = half::f16::from_bits(bits).to_f32();
+                let got = unsafe { f16_bits_to_f32(bits) };
+                if want.is_nan() {
+                    assert!(got.is_nan(), "bits {bits:#06x}: want NaN, got {got}");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "bits {bits:#06x}: want {want}, got {got}"
+                    );
+                }
+            }
+        }
 
         #[test]
         fn q4_0_gemv_fallback_matches_dotprod() {
