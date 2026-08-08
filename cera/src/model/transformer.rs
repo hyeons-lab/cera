@@ -273,15 +273,43 @@ mod gate_tests {
         }
     }
 
-    /// Dtypes with no int8 kernel must decline whatever the host.
+    /// Dtypes with no batched path at all must decline whatever the host.
+    ///
+    /// Q5_K used to belong here and no longer does: it has no int8 GEMM, but it
+    /// does have the BLAS dequant+SGEMM route, so it is conditionally supported
+    /// rather than never supported. See `q5_k_is_batched_exactly_under_blas`.
     #[test]
     fn unsupported_dtypes_are_never_batched() {
-        for dtype in [DType::Q5KM, DType::F16, DType::F32] {
+        for dtype in [DType::F16, DType::F32] {
             assert!(
                 !batched_gemm_supports(dtype, 256),
                 "{dtype:?} was admitted to the batched path with no kernel to run it"
             );
         }
+    }
+
+    /// Q5_K is batched **exactly** when `blas` is on, and this asserts the
+    /// biconditional rather than one direction of it.
+    ///
+    /// The failure it guards is not a slow path, it is silent corruption. Q5_K
+    /// has no int8 GEMM, so admitting it without BLAS makes `gemm_preq` decline
+    /// and the matmul get skipped entirely; the callers reuse one output buffer
+    /// across layers, so what the next layer reads is not zeros but the
+    /// *previous layer's* activations. Gating on `k_quant_gemm_available()`
+    /// like its K-quant siblings would do exactly that on any dotprod aarch64
+    /// host built without `blas`, which is every mobile build.
+    #[test]
+    fn q5_k_is_batched_exactly_under_blas() {
+        assert_eq!(
+            batched_gemm_supports(DType::Q5KM, 256),
+            cfg!(feature = "blas"),
+            "Q5_K batching must track the `blas` feature exactly"
+        );
+        // The 256-alignment requirement still applies, as for every K-quant.
+        assert!(
+            !batched_gemm_supports(DType::Q5KM, 96),
+            "Q5_K admitted at k=96, which is not a multiple of its 256-wide superblock"
+        );
     }
 
     /// Q4_1 is batched exactly when `k_quant_gemm_available()` holds — the shared
@@ -408,6 +436,15 @@ pub fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
         // requirement: Q4_1 blocks are 32 wide.
         DType::Q4_1 => k_quant_gemm_available(),
         DType::Q4KM | DType::Q6K => k_quant_gemm_available() && k.is_multiple_of(256),
+        // Q5_K is the one shipped K-quant with no int8 GEMM, so unlike its
+        // siblings it must gate on `blas` itself rather than on
+        // `k_quant_gemm_available()`. That predicate is *true* on a non-BLAS
+        // dotprod aarch64 host, which would admit Q5_K here and then have
+        // `gemm_preq` decline for want of a kernel, silently skipping the
+        // matmul and leaving the previous layer's activations in the reused
+        // output buffer. Narrower than it looks, and deliberately so: the
+        // dequant+SGEMM route is the only Q5_K batched path that exists.
+        DType::Q5KM => cfg!(feature = "blas") && k.is_multiple_of(256),
         _ => false,
     }
 }
@@ -508,6 +545,7 @@ pub(crate) fn try_blas_prefill_gemm(
         DType::Q4_1 => crate::quant::dequantize_q4_1_matrix(data, m, k, dequant),
         DType::Q8_0 => crate::quant::dequantize_q8_0_matrix(data, m, k, dequant),
         DType::Q4KM => crate::quant::dequantize_q4_k_m_matrix(data, m, k, dequant),
+        DType::Q5KM => crate::quant::dequantize_q5_k_matrix(data, m, k, dequant),
         DType::Q6K => crate::quant::dequantize_q6_k_matrix(data, m, k, dequant),
         _ => return false,
     }

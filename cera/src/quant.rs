@@ -503,6 +503,37 @@ pub fn dequantize_q4_k_m_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32])
 /// Dequantize a Q6_K matrix of shape `[m, k]` (row-major) to `out`.
 ///
 /// Superblocks are 256 wide, so `k` must be a multiple of 256 (not 32).
+/// Dequantize an `m x k` Q5_K matrix to f32, one row per task.
+///
+/// Mirrors [`dequantize_q4_k_m_matrix`]; Q5_K is Q4_K plus a high-bit plane, so
+/// the only difference is the per-row helper. Exists for the BLAS prefill
+/// route, which dequantizes the weight and SGEMMs rather than running an int8
+/// kernel: Q5_K is the one shipped K-quant with no int8 GEMM, so before this it
+/// fell through to the per-token GEMV and prefill collapsed (measured 4-5 tok/s
+/// against Q4_K_M's 228 on the same model and host).
+pub fn dequantize_q5_k_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        k % 256,
+        0,
+        "dequantize_q5_k_matrix: k must be a multiple of 256"
+    );
+    let row_bytes = (k / 256) * size_of::<BlockQ5K>();
+    debug_assert_eq!(
+        src.len(),
+        m * row_bytes,
+        "dequantize_q5_k_matrix: src length mismatch"
+    );
+    debug_assert_eq!(
+        out.len(),
+        m * k,
+        "dequantize_q5_k_matrix: out length mismatch"
+    );
+
+    out.par_chunks_mut(k)
+        .zip(src.par_chunks(row_bytes))
+        .for_each(|(dst_row, src_row)| dequantize_q5_k_row(src_row, dst_row));
+}
+
 pub fn dequantize_q6_k_matrix(src: &[u8], m: usize, k: usize, out: &mut [f32]) {
     debug_assert_eq!(
         k % 256,
@@ -1315,6 +1346,58 @@ mod tests {
                 dst[32 + i]
             );
         }
+    }
+
+    /// `dequantize_q5_k_matrix` must equal a loop of `dequantize_q5_k_row`,
+    /// bit for bit.
+    ///
+    /// This is the only thing standing between a Q5_K model and silently wrong
+    /// prefill: the BLAS route dequantizes the whole weight matrix and SGEMMs,
+    /// so an off-by-one in the row striding would corrupt every batched token
+    /// while decode, which uses the per-row path, stayed correct and hid it.
+    /// `m` is above the parallel threshold on purpose, since the matrix helper
+    /// splits rows across workers and the row helper does not.
+    #[test]
+    fn test_dequantize_q5_k_matrix_matches_row() {
+        let m = 128;
+        let k = 512; // 2 superblocks per row
+        let blocks_per_row = k / 256;
+        let row_bytes = blocks_per_row * size_of::<BlockQ5K>();
+
+        let mut st = 0x5EED_1234u32;
+        let mut byte = || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (st >> 24) as u8
+        };
+        let mut src = vec![0u8; m * row_bytes];
+        for b in src.iter_mut() {
+            *b = byte();
+        }
+        // Keep the scale fields finite; random bits could land on inf/NaN and
+        // turn a real mismatch into a NaN-vs-NaN comparison that always passes.
+        for row in 0..m {
+            for b in 0..blocks_per_row {
+                let off = row * row_bytes + b * size_of::<BlockQ5K>();
+                let d = f16::from_f32(0.05 + (row % 7) as f32 * 0.01).to_bits();
+                let dmin = f16::from_f32(0.02 + (b % 3) as f32 * 0.01).to_bits();
+                src[off..off + 2].copy_from_slice(&d.to_le_bytes());
+                src[off + 2..off + 4].copy_from_slice(&dmin.to_le_bytes());
+            }
+        }
+
+        let mut via_matrix = vec![0.0f32; m * k];
+        dequantize_q5_k_matrix(&src, m, k, &mut via_matrix);
+
+        let mut via_rows = vec![0.0f32; m * k];
+        for row in 0..m {
+            let s = &src[row * row_bytes..(row + 1) * row_bytes];
+            dequantize_q5_k_row(s, &mut via_rows[row * k..(row + 1) * k]);
+        }
+
+        assert_eq!(
+            via_matrix, via_rows,
+            "matrix and row dequantization diverged"
+        );
     }
 
     #[test]
