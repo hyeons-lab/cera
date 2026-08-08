@@ -1223,12 +1223,12 @@ pub(crate) fn forward_attn_block(
             key_cache_f16.extend(
                 state.scratch.k[..kv_dim]
                     .iter()
-                    .map(|&x| half::f16::from_f32(x).to_bits()),
+                    .map(|&x| crate::quant::f32_to_f16(x)),
             );
             value_cache_f16.extend(
                 state.scratch.v[..kv_dim]
                     .iter()
-                    .map(|&x| half::f16::from_f32(x).to_bits()),
+                    .map(|&x| crate::quant::f32_to_f16(x)),
             );
         } else {
             key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);

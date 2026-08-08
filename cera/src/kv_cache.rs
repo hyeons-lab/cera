@@ -612,8 +612,8 @@ impl InferenceState {
             ..
         } = &mut self.layers[layer]
         {
-            key_cache_f16.extend(k.iter().map(|&x| half::f16::from_f32(x).to_bits()));
-            value_cache_f16.extend(v.iter().map(|&x| half::f16::from_f32(x).to_bits()));
+            key_cache_f16.extend(k.iter().map(|&x| crate::quant::f32_to_f16(x)));
+            value_cache_f16.extend(v.iter().map(|&x| crate::quant::f32_to_f16(x)));
         }
     }
 
@@ -1173,7 +1173,7 @@ impl InferenceState {
                             let head = &mut key_cache_f16[head_start..head_start + head_dim];
                             let buf = &mut head_buf[..head_dim];
                             for (dst, &bits) in buf.iter_mut().zip(head.iter()) {
-                                *dst = half::f16::from_bits(bits).to_f32();
+                                *dst = crate::quant::f16_to_f32(bits);
                             }
                             match rope_type {
                                 crate::backend::cpu::RopeType::Neox => {
@@ -1192,7 +1192,7 @@ impl InferenceState {
                                 }
                             }
                             for (dst, &x) in head.iter_mut().zip(buf.iter()) {
-                                *dst = half::f16::from_f32(x).to_bits();
+                                *dst = crate::quant::f32_to_f16(x);
                             }
                         }
                     }
@@ -2268,7 +2268,7 @@ mod tests {
         assert_eq!(k16.len(), kv_dim);
         assert_eq!(v16.len(), kv_dim);
         for (i, &b) in k16.iter().enumerate() {
-            let got = half::f16::from_bits(b).to_f32();
+            let got = crate::quant::f16_to_f32(b);
             assert!(
                 (got - k[i]).abs() < 1e-2,
                 "f16 roundtrip drift at {i}: {got} vs {}",
@@ -2503,12 +2503,12 @@ mod tests {
                 );
                 for (d, &oracle_d) in oracle.iter().enumerate() {
                     let idx = t_new * kv_dim + h * head_dim + d;
-                    let got_k = half::f16::from_bits(k16[idx]).to_f32();
+                    let got_k = crate::quant::f16_to_f32(k16[idx]);
                     assert!(
                         (got_k - oracle_d).abs() < 1e-2,
                         "K reencode drift at t_new={t_new} h={h} d={d}: {got_k} vs {oracle_d}"
                     );
-                    let got_v = half::f16::from_bits(v16[idx]).to_f32();
+                    let got_v = crate::quant::f16_to_f32(v16[idx]);
                     assert!(
                         (got_v - raw(h, d)).abs() < 1e-2,
                         "V must stay unrotated at t_new={t_new} h={h} d={d}: {got_v} vs {}",

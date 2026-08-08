@@ -230,6 +230,7 @@ pub fn configure_thread_pool() -> usize {
     1
 }
 
+use crate::quant::f16_to_f32;
 use crate::quant::{
     BlockQ4_0, BlockQ4_1, BlockQ4KM, BlockQ5K, BlockQ8_0, vec_dot_q4_0_f32, vec_dot_q4_1_f32,
     vec_dot_q4_k_m_f32, vec_dot_q5_k_f32, vec_dot_q8_0_f32,
@@ -893,7 +894,7 @@ pub(crate) fn quantize_f32_to_q8_0_scalar(x: &[f32], scales: &mut [f32], quants:
             r if d != 0.0 && r.is_finite() => r,
             _ => 0.0,
         };
-        scales[bi] = half::f16::from_f32(d).to_f32();
+        scales[bi] = crate::quant::f16_to_f32(crate::quant::f32_to_f16(d));
         for (t, &v) in blk.iter().enumerate() {
             quants[bi * 32 + t] = (v * id).round_ties_even().clamp(-128.0, 127.0) as i8;
         }
@@ -3186,14 +3187,6 @@ unsafe fn attn_values_avx2(
 
 // ── f16 KV attention (widen-on-read) ────────────────────────────────────────
 
-/// Convert one IEEE-754 half (raw bits) to f32. On aarch64/x86 with hardware
-/// f16 this lowers to a single `fcvt`/`vcvtph2ps`; otherwise `half`'s software
-/// path. Accumulation downstream stays f32 for softmax stability.
-#[inline(always)]
-fn f16_to_f32(bits: u16) -> f32 {
-    half::f16::from_bits(bits).to_f32()
-}
-
 /// f16 variant of [`attn_scores`]: `k_cache` holds IEEE-754 half bits (2
 /// bytes/elem, half the memory traffic of the f32 path), widened to f32 on
 /// read. `q_head` stays f32; the dot accumulates in f32.
@@ -3214,8 +3207,14 @@ pub fn attn_scores_f16(
         debug_assert!(k_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
     }
     // head_dim > 128 overruns the NEON Q array — see `attn_scores`.
+    //
+    // `fp16` is checked for the same reason the x86 arm below checks `f16c`:
+    // the kernel's widen is `vcvt_f32_f16`, which `core::arch` declares
+    // `neon,fp16`. The `fcvtl` it lowers to is baseline ARMv8.0-A, so this is
+    // stating the contract rather than avoiding a trap, and a host that fails
+    // the gate still gets a correct answer from the scalar tail below.
     #[cfg(target_arch = "aarch64")]
-    if head_dim <= 128 {
+    if head_dim <= 128 && super::cpu_features::cpu_features().fp16 {
         unsafe {
             attn_scores_f16_neon(
                 q_head,
@@ -3284,8 +3283,14 @@ pub fn attn_values_f16(
         debug_assert!(v_cache.len() >= (seq_len - 1) * kv_dim + kv_h_offset + head_dim);
     }
     // head_dim > 128 overruns the NEON accumulator array — see `attn_scores`.
+    //
+    // `fp16` is checked for the same reason the x86 arm below checks `f16c`:
+    // the kernel's widen is `vcvt_f32_f16`, which `core::arch` declares
+    // `neon,fp16`. The `fcvtl` it lowers to is baseline ARMv8.0-A, so this is
+    // stating the contract rather than avoiding a trap, and a host that fails
+    // the gate still gets a correct answer from the scalar tail below.
     #[cfg(target_arch = "aarch64")]
-    if head_dim <= 128 {
+    if head_dim <= 128 && super::cpu_features::cpu_features().fp16 {
         unsafe {
             attn_values_f16_neon(
                 scores,
@@ -3341,7 +3346,7 @@ pub fn attn_values_f16(
 /// tier gate is required.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-#[target_feature(enable = "neon")]
+#[target_feature(enable = "neon,fp16")]
 unsafe fn attn_scores_f16_neon(
     q_head: &[f32],
     k_cache: &[u16],
@@ -3401,7 +3406,7 @@ unsafe fn attn_scores_f16_neon(
 /// the FCVTL / MSRV rationale.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::needless_range_loop)]
-#[target_feature(enable = "neon")]
+#[target_feature(enable = "neon,fp16")]
 unsafe fn attn_values_f16_neon(
     scores: &[f32],
     v_cache: &[u16],
