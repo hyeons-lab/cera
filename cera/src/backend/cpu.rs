@@ -2028,8 +2028,10 @@ unsafe fn dot_f16_f32_neon(row: &[u16], x: &[f32]) -> f32 {
 
 /// `y[m] = W[m,k] @ x[k]` for a bfloat16 weight matrix. See [`gemv_f16`].
 ///
-/// Row-parallel for the same reason as the f16 twin, but with a scalar body:
-/// `crate::quant::bf16_to_f32` is a shift, so the widen was never the cost here.
+/// Row-parallel for the same reason as the f16 twin, but with a scalar body.
+/// The widen was never the cost here: `crate::quant::bf16_to_f32` is a shift
+/// plus a compare/select that quiets sNaN, a handful of ALU ops with no memory
+/// traffic and no call.
 ///
 /// What the f16 kernel buys and this one does not is the *accumulator* shape:
 /// `.sum()` over f32 is a single dependency chain LLVM may not reassociate, so

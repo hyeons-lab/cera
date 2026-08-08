@@ -60,10 +60,10 @@ pub(crate) fn f16_to_f32(bits: u16) -> f32 {
 /// `MmapWeight::dequantize_row` on those patterns.
 ///
 /// Exists so the widen has one spelling. It was open-coded in three places (the
-/// bf16 GEMV, the embedding lookup, and a test reference) while `weights.rs` and
-/// `tensor.rs` used the `half` crate, which is exactly the drift that lets two
-/// copies disagree. `bf16_widen_matches_half_crate_exhaustively` pins all 65536
-/// patterns.
+/// bf16 GEMV, the embedding lookup, and a test reference) while
+/// `model/weights.rs` used the `half` crate, which is exactly the drift that
+/// lets two copies disagree; that site now calls this too.
+/// `bf16_widen_matches_half_crate_exhaustively` pins all 65536 patterns.
 #[inline(always)]
 pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
     // Exponent all ones with a non-zero significand is NaN; 0x7F80 itself is
