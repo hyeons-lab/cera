@@ -1,28 +1,31 @@
-//! Generated-vs-handwritten MSL microbenchmark for the Phase 1a Slang kernels:
-//! gelu, the four shared elementwise ops, and rope. Same question as
-//! `slang_softmax_bench` (is the generated kernel as fast as the one it would
-//! replace) and the same measurement discipline, extended to the
-//! elementwise/math tier.
+//! Generated-vs-handwritten MSL microbenchmark for the four shared elementwise
+//! ops (`add_inplace`, `scaled_add_inplace`, `mul_inplace`, `silu_mul_inplace`):
+//! is the generated kernel as fast as the one it would replace?
 //!
-//! Unlike softmax and the GEMM, these kernels have no reduction, no barrier and
-//! no tiling: each is a branchless per-element map (or, for rope, a per-pair
-//! rotation). A generated kernel that lowered them differently is not expected to
-//! change throughput, but "not expected" is a hypothesis, and the whole point of
-//! the pilot is to measure rather than assume.
+//! This is the last bench of its kind, and it survives only because
+//! `ELEMENTWISE` is the one shader the Slang port did not take over. Everywhere
+//! else the generated kernel *is* the production kernel, so there is no
+//! handwritten twin left to compare against and a "generated vs handwritten"
+//! bench would be a shader timed against itself. The gelu and rope arms went
+//! that way when their constants flipped, along with the four sibling benches.
 //!
-//! Metal only, for the same reason as the other two: the WGSL half is verified by
-//! parity and the only Vulkan device CI can reach is a software rasterizer.
+//! These kernels have no reduction, no barrier and no tiling: each is a
+//! branchless per-element map. A generated kernel that lowered them differently
+//! is not expected to change throughput, but "not expected" is a hypothesis.
+//!
+//! Metal only: the WGSL half is verified by parity and the only Vulkan device CI
+//! can reach is a software rasterizer.
 //!
 //! ```sh
 //! cargo run -p cera --features metal --release --example slang_elementwise_bench
 //! ```
 //!
-//! Discipline (identical to `slang_softmax_bench`): a discarded warm-up round per
-//! kernel, arms alternated each round so drift is not read as a kernel
-//! difference, `ITERS` dispatches per timed encoder so submit/wait is amortized,
-//! and the median round reported. In-place repeated application is
-//! data-independent in cost, so it stays off the upload path inside the timed
-//! region; correctness is checked separately from a fresh buffer.
+//! Discipline: a discarded warm-up round per kernel, arms alternated each round
+//! so drift is not read as a kernel difference, `ITERS` dispatches per timed
+//! encoder so submit/wait is amortized, and the median round reported. In-place
+//! repeated application is data-independent in cost, so it stays off the upload
+//! path inside the timed region; correctness is checked separately from a fresh
+//! buffer.
 
 use cera::backend::metal::{MetalContext, shaders};
 use metal::MTLSize;
@@ -34,7 +37,7 @@ const ITERS: u64 = 200;
 /// Timed rounds per arm after the discarded warm-up. Odd so the median is a real
 /// sample, not an average of two.
 const ROUNDS: usize = 7;
-/// Element count for the elementwise/gelu kernels: large enough to be
+/// Element count for the elementwise kernels: large enough to be
 /// bandwidth-bound and dwarf per-dispatch launch cost.
 const N: usize = 1 << 20;
 
@@ -164,24 +167,7 @@ fn main() {
 
     println!("== agreement (generated vs handwritten, single dispatch) ==");
 
-    // gelu
-    let gelu_hand = ctx
-        .create_pipeline(shaders::GELU, "gelu_inplace")
-        .expect("gelu.metal");
-    let gelu_slang = ctx
-        .create_pipeline(shaders::GELU_SLANG, "gelu_inplace")
-        .expect("gelu slang");
-    let gparams = ctx.upload_bytes(bytemuck::cast_slice(&[N as u32, 0u32]));
     let mut ok = true;
-    {
-        let xa = ctx.upload_f32(&x);
-        run_once(&ctx, &gelu_hand, &[&xa, &gparams], groups);
-        let a = ctx.read_f32(&xa, N);
-        let xb = ctx.upload_f32(&x);
-        run_once(&ctx, &gelu_slang, &[&xb, &gparams], groups);
-        let b = ctx.read_f32(&xb, N);
-        ok &= report_agreement("gelu", &a, &b);
-    }
 
     // elementwise: (entry, scale_bits)
     let ew_ops: [(&str, u32); 4] = [
@@ -211,45 +197,6 @@ fn main() {
         ok &= report_agreement(entry, &a, &b);
     }
 
-    // rope: realistic single-token GQA shape.
-    let (n_heads, n_kv_heads, head_dim) = (32u32, 8u32, 128usize);
-    let half = head_dim / 2;
-    let rope_groups = (n_heads.max(n_kv_heads) * half as u32).div_ceil(256) as u64;
-    let rope_hand = ctx
-        .create_pipeline(shaders::ROPE, "rope")
-        .expect("rope.metal");
-    let rope_slang = ctx
-        .create_pipeline(shaders::ROPE_SLANG, "rope")
-        .expect("rope slang");
-    let rparams = ctx.upload_bytes(bytemuck::cast_slice(&[
-        1000u32,
-        n_heads,
-        n_kv_heads,
-        head_dim as u32,
-        10000.0f32.to_bits(),
-    ]));
-    let qv: Vec<f32> = (0..n_heads as usize * head_dim)
-        .map(|i| ((i as f32) * 0.02).sin())
-        .collect();
-    let kv: Vec<f32> = (0..n_kv_heads as usize * head_dim)
-        .map(|i| ((i as f32) * 0.02).cos())
-        .collect();
-    {
-        let qh = ctx.upload_f32(&qv);
-        let kh = ctx.upload_f32(&kv);
-        run_once(&ctx, &rope_hand, &[&qh, &kh, &rparams], rope_groups);
-        let aq = ctx.read_f32(&qh, qv.len());
-        let ak = ctx.read_f32(&kh, kv.len());
-        let qs = ctx.upload_f32(&qv);
-        let ks = ctx.upload_f32(&kv);
-        run_once(&ctx, &rope_slang, &[&qs, &ks, &rparams], rope_groups);
-        let bq = ctx.read_f32(&qs, qv.len());
-        let bk = ctx.read_f32(&ks, kv.len());
-        // Both rotated buffers: the kernel writes q and k, so check both.
-        ok &= report_agreement("rope (q)", &aq, &bq);
-        ok &= report_agreement("rope (k)", &ak, &bk);
-    }
-
     if !ok {
         println!("\nkernels disagree; timings below are not comparable");
     }
@@ -261,21 +208,6 @@ fn main() {
         "{:<22}  {:>10}  {:>10}  {:>8}",
         "kernel", "handwritten", "generated", "ratio"
     );
-
-    // gelu timing
-    {
-        let xh = ctx.upload_f32(&x);
-        let xs = ctx.upload_f32(&x);
-        let (h, s) = compare(
-            &ctx,
-            &gelu_hand,
-            &gelu_slang,
-            &[&xh, &gparams],
-            &[&xs, &gparams],
-            groups,
-        );
-        print_row(&format!("gelu (n={N})"), h, s);
-    }
 
     // elementwise timing
     for (entry, scale) in ew_ops {
@@ -299,23 +231,6 @@ fn main() {
             groups,
         );
         print_row(entry, h, s);
-    }
-
-    // rope timing
-    {
-        let qh = ctx.upload_f32(&qv);
-        let kh = ctx.upload_f32(&kv);
-        let qs = ctx.upload_f32(&qv);
-        let ks = ctx.upload_f32(&kv);
-        let (h, s) = compare(
-            &ctx,
-            &rope_hand,
-            &rope_slang,
-            &[&qh, &kh, &rparams],
-            &[&qs, &ks, &rparams],
-            rope_groups,
-        );
-        print_row("rope (1 token, GQA)", h, s);
     }
 
     println!(

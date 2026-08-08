@@ -92,12 +92,6 @@ fn cases() -> Vec<(usize, &'static str, &'static str, &'static str)> {
             "KvCopyParams",
         ),
         (
-            size_of::<RopeParams>(),
-            shaders::ROPE,
-            "Params",
-            "RopeParams",
-        ),
-        (
             size_of::<GemmF32Params>(),
             shaders::GEMM_F32,
             "GemmParams",
@@ -209,24 +203,6 @@ fn cases() -> Vec<(usize, &'static str, &'static str, &'static str)> {
             "ScaleParams",
             "ScaleParams",
         ),
-        (
-            size_of::<BiasAddParams>(),
-            shaders::BIAS_ADD,
-            "Params",
-            "BiasAddParams",
-        ),
-        (
-            size_of::<RmsNormBatchParams>(),
-            shaders::RMSNORM_BATCH,
-            "Params",
-            "RmsNormBatchParams",
-        ),
-        (
-            size_of::<Conv1dBatchParams>(),
-            shaders::CONV1D_FUSED_BATCH,
-            "Params",
-            "Conv1dBatchParams",
-        ),
         // ViT vision encoder (`MetalVitOps`).
         (
             size_of::<VitLinearParams>(),
@@ -248,12 +224,6 @@ fn cases() -> Vec<(usize, &'static str, &'static str, &'static str)> {
             "VitAttnParams (mma)",
         ),
         (
-            size_of::<LayerNormBatchParams>(),
-            shaders::LAYERNORM_BATCH,
-            "Params",
-            "LayerNormBatchParams",
-        ),
-        (
             size_of::<TqParams>(),
             shaders::TURBOQUANT,
             "TqParams",
@@ -265,14 +235,322 @@ fn cases() -> Vec<(usize, &'static str, &'static str, &'static str)> {
             "TqAttnParams",
             "TqAttnParams",
         ),
-        // `ElementwiseParams` is reused for `gelu.metal`, which has its own `Params`.
+    ]
+}
+
+/// Width, in bytes, of the params buffer a **Slang** kernel expects.
+///
+/// The Slang ports do not declare a `struct Params` for `msl_struct_bytes` to
+/// find. They take a typed buffer instead, and not uniformly: `rope.slang` uses
+/// `StructuredBuffer<uint>` indexed to `params[6]`, `bias_add.slang` a
+/// `StructuredBuffer<uint2>` swizzled `par_buf[0].x/.y`. One rule covers both:
+///
+///     u32 slots = components(element type) * (highest element index + 1)
+///
+/// This closes a gap that predates the migration. While the generated kernels
+/// were reachable only from tests and benches, *nothing* checked their params
+/// layout against the Rust mirrors, so the guard that exists because a shader
+/// struct once outgrew its upload (NaN and silent audio in production) never
+/// covered them at all.
+///
+/// Two things this is deliberately weaker at than [`msl_struct_bytes`], both
+/// worth knowing before extending the table:
+///
+/// 1. It reads the `.slang` *input*, not the `.metal` the GPU is handed. The
+///    emitted MSL has no `struct Params` to parse, so there is nothing stricter
+///    to point at, but a change in how Slang lowers a params buffer would not be
+///    caught here.
+/// 2. It is a text scan, so it can only be trusted where its assumptions hold.
+///    Every assumption below therefore returns `None` when violated rather than
+///    guessing, and `None` is a test failure: under-reporting a width is exactly
+///    the silent pass this guard exists to prevent.
+fn slang_params_bytes(src: &str) -> Option<usize> {
+    // Declaration: `StructuredBuffer<uintN> name : register(tN);`
+    //
+    // Require exactly one, and skip `RWStructuredBuffer` (whose name contains
+    // this needle): an unqualified "first match" picks the output buffer in
+    // `argmax_f32.slang`, and the wgsl-side params buffer in the two-binding
+    // sources, both of which report a plausible but wrong width.
+    let candidates: Vec<&str> = src
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with("//")
+                && t.contains("StructuredBuffer<uint")
+                && !t.contains("RWStructuredBuffer<uint")
+        })
+        .collect();
+    // Only `uint`-typed bindings are recognized, which every params buffer here
+    // is. That is not a silent assumption: a params binding of some other
+    // element type leaves `candidates` empty, which falls through to `None` and
+    // fails the test, rather than being skipped. Widen the needle when a kernel
+    // actually needs it.
+    //
+    // A `__target_switch` source can declare one params binding per target, as
+    // `rmsnorm.slang` does with `p_wgsl` and `p_metal`, because the two branches
+    // want different layouts. This is the Metal layout test, so take the
+    // `_metal` one; refusing outright (as an earlier revision did) left every
+    // such kernel uncovered, which is worse than the ambiguity it avoided.
+    // Anything else with more than one binding is still ambiguous.
+    let decl = match candidates.as_slice() {
+        [only] => only,
+        many => *many
+            .iter()
+            .find(|l| l.contains("_metal") || l.contains("metal_"))?,
+    };
+    let after = decl.split("StructuredBuffer<uint").nth(1)?;
+    let (comp_txt, rest) = after.split_once('>')?;
+    let components: usize = if comp_txt.is_empty() {
+        1
+    } else {
+        comp_txt.parse().ok()?
+    };
+    let name = rest.split_whitespace().next()?;
+
+    // Strip `//` comments before anything else looks at the text, as
+    // `msl_struct_bytes` does. Prose is not code: `rope.slang` documents its two
+    // arms as `params[0..4]` and `params[0..6]`, which are neither real indices
+    // nor parseable ones, and a comment mentioning `case metal:` or `default:`
+    // would move the arm boundary found below. Safe here because no `.slang`
+    // source contains `//` inside a string literal or a URL.
+    let code: String = src
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let code = code.as_str();
+
+    // A `__target_switch` port carries both backends' bodies in one source and
+    // they can read different numbers of params: `rope.slang`'s metal branch
+    // stops at `params[4]` while its wgsl branch reaches `params[6]`. This is
+    // the *Metal* layout test, so the wgsl body must not count.
+    //
+    // Drop the `default:` arm rather than keeping only the `case metal:` one.
+    // Most reads sit outside the switch entirely (in `rmsnorm_batch.slang` the
+    // switch is a reduction detail inside a helper, and every `par_buf` read is
+    // after it), so keeping only the metal arm would see almost nothing and
+    // silently under-report the width.
+    // Every statement-level switch is handled, not just the first. `softmax.slang`
+    // has three and `rmsnorm.slang` two, so bailing on the second (as an earlier
+    // revision did) left exactly the multi-switch kernels uncovered.
+    let switch_starts: Vec<usize> = code
+        .match_indices("__target_switch")
+        .filter(|(i, _)| {
+            code[i + "__target_switch".len()..]
+                .trim_start()
+                .starts_with('{')
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    // The byte range of each switch's `default:` arm, i.e. what to delete.
+    let bytes = code.as_bytes();
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    for sw in switch_starts {
+        let open = sw + code[sw..].find('{')?;
+        let (mut depth, mut end) = (0usize, 0usize);
+        for (i, &b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Unbalanced braces: the extent is a guess, so do not make one.
+        if end == 0 {
+            return None;
+        }
+        let body = &code[open..end];
+        let Some(d) = body.find("default:") else {
+            continue; // no portable arm to drop
+        };
+        // Slang allows `default:` before `case metal:`, which would drop the
+        // metal arm instead. Refuse rather than report the smaller width.
+        match body.find("case metal:") {
+            Some(m) if m < d => cuts.push((open + d, end - 1)),
+            _ => return None,
+        }
+    }
+
+    // Delete back to front so earlier offsets stay valid.
+    let mut scope = code.to_string();
+    for (from, to) in cuts.into_iter().rev() {
+        scope.replace_range(from..to, "");
+    }
+    let scope = scope.as_str();
+
+    // Highest element index actually read, over `name[N]` (with or without a
+    // swizzle). Two ways this refuses to guess rather than under-report:
+    // a non-literal index (`par_buf[i]`, `par_buf[base + 1]`) cannot be resolved
+    // by a text scan, and *no* indexed read at all means the binding was renamed
+    // out from under this scan, since a params buffer nothing reads would not be
+    // declared.
+    let mut seen = false;
+    let max_idx = scope
+        .match_indices(name)
+        .filter_map(|(i, _)| {
+            scope[i + name.len()..]
+                .strip_prefix('[')
+                .and_then(|t| t.split_once(']'))
+                .map(|(inner, _)| inner.trim().parse::<usize>())
+        })
+        .try_fold(0usize, |acc, parsed| {
+            seen = true;
+            parsed.ok().map(|n| acc.max(n))
+        })?;
+    seen.then(|| components * (max_idx + 1) * 4)
+}
+
+/// Rust mirrors whose kernel is now a Slang port, paired with that source.
+fn slang_cases() -> Vec<(usize, &'static str, &'static str)> {
+    vec![
+        (
+            size_of::<RopeParams>(),
+            include_str!("../src/backend/shaders/slang/rope.slang"),
+            "RopeParams",
+        ),
+        (
+            size_of::<BiasAddParams>(),
+            include_str!("../src/backend/shaders/slang/bias_add.slang"),
+            "BiasAddParams",
+        ),
         (
             size_of::<ElementwiseParams>(),
-            shaders::GELU,
-            "Params",
+            include_str!("../src/backend/shaders/slang/gelu.slang"),
             "ElementwiseParams (gelu)",
         ),
+        (
+            size_of::<LayerNormBatchParams>(),
+            include_str!("../src/backend/shaders/slang/layernorm_batch.slang"),
+            "LayerNormBatchParams",
+        ),
+        (
+            size_of::<RmsNormBatchParams>(),
+            include_str!("../src/backend/shaders/slang/rmsnorm_batch.slang"),
+            "RmsNormBatchParams",
+        ),
+        (
+            size_of::<Conv1dBatchParams>(),
+            include_str!("../src/backend/shaders/slang/conv1d_fused_batch.slang"),
+            "Conv1dBatchParams",
+        ),
+        (
+            size_of::<ArgmaxParams>(),
+            include_str!("../src/backend/shaders/slang/argmax_f32.slang"),
+            "ArgmaxParams",
+        ),
     ]
+}
+
+/// Every `.slang` params binding this test could ever be pointed at, so a
+/// rename or a lowering change fails here rather than going unnoticed.
+///
+/// `slang_cases` can only hold kernels whose host upload is *exactly* a Rust
+/// mirror. Several are not: `conv1d` reads 12 bytes from a 16-byte upload, and
+/// the ones dispatched from a literal `cast_slice(&[..])` have no mirror to name
+/// at all. Those still deserve a guard against the parser silently losing track
+/// of their binding, which is the failure that let the `argmax_f32` width
+/// mismatch through: it was not in the table, so nothing compared it to
+/// anything.
+///
+/// `None` here means the binding could not be found or resolved. It does not
+/// assert the width is *right*, only that it is still knowable.
+#[test]
+fn every_slang_params_binding_stays_parseable() {
+    // (source, name, expected bytes) for every flipped kernel with a params
+    // binding. The expected values are what the kernel reads, which is not
+    // always what the host uploads.
+    let sources: &[(&str, &str, usize)] = &[
+        (
+            include_str!("../src/backend/shaders/slang/argmax_f32.slang"),
+            "argmax_f32",
+            8,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/bias_add.slang"),
+            "bias_add",
+            8,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/conv1d.slang"),
+            "conv1d",
+            12,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/conv1d_fused.slang"),
+            "conv1d_fused",
+            12,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/conv1d_fused_batch.slang"),
+            "conv1d_fused_batch",
+            24,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/elementwise.slang"),
+            "elementwise",
+            8,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/gelu.slang"),
+            "gelu",
+            8,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/layernorm_batch.slang"),
+            "layernorm_batch",
+            16,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/per_head_rmsnorm.slang"),
+            "per_head_rmsnorm",
+            16,
+        ),
+        // Two params bindings, one per target; the metal arm is the 16-byte one.
+        (
+            include_str!("../src/backend/shaders/slang/rmsnorm.slang"),
+            "rmsnorm",
+            16,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/rmsnorm_batch.slang"),
+            "rmsnorm_batch",
+            20,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/rope.slang"),
+            "rope",
+            20,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/softmax.slang"),
+            "softmax",
+            8,
+        ),
+    ];
+    let failures: Vec<String> = sources
+        .iter()
+        .filter_map(|&(src, name, want)| match slang_params_bytes(src) {
+            None => Some(format!(
+                "{name}.slang: params binding not found or not resolvable"
+            )),
+            Some(got) if got != want => Some(format!(
+                "{name}.slang: kernel reads {got} B of params, expected {want} B"
+            )),
+            Some(_) => None,
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "Slang params drift:\n  {}",
+        failures.join("\n  ")
+    );
 }
 
 #[test]
@@ -288,6 +566,20 @@ fn rust_param_mirrors_match_msl_structs() {
                  {msl_bytes} B. A kernel reading a struct wider than the upload reads past \
                  the end of it — undefined behaviour, not a crash. Update the Rust mirror \
                  so its width matches, keeping the fields in the same order as the shader."
+            )),
+            Some(_) => {}
+        }
+    }
+    for (rust_bytes, slang_src, rust_name) in slang_cases() {
+        match slang_params_bytes(slang_src) {
+            None => failures.push(format!(
+                "{rust_name}: no `StructuredBuffer<uint*>` params binding found in the Slang \
+                 source: renamed, or the port changed how it takes parameters?"
+            )),
+            Some(slang_bytes) if slang_bytes != rust_bytes => failures.push(format!(
+                "{rust_name}: Rust mirror is {rust_bytes} B but the Slang kernel reads \
+                 {slang_bytes} B of params. Same hazard as the MSL case: the kernel reads \
+                 past the end of the upload."
             )),
             Some(_) => {}
         }
@@ -322,5 +614,111 @@ struct OneLiner { uint n; uint _pad; };
         msl_struct_bytes(shaders::QK_NORM_ROPE, "Params"),
         Some(36),
         "qk_norm_rope Params is 9 uints"
+    );
+}
+
+/// The same obligation for `slang_params_bytes`, which needs it more.
+///
+/// It is a text scan standing in for a parse, so its failure mode is reporting a
+/// plausible-but-small width, which makes `rust_param_mirrors_match_msl_structs`
+/// pass while the kernel reads past the end of the upload. Each `None` below is
+/// a real way that could happen; without these, nothing but the six live sources
+/// exercises any of them, and those six are exactly the cases that work.
+#[test]
+fn slang_parser_refuses_to_guess() {
+    let one = |body: &str| {
+        format!("[[vk::binding(0)]] StructuredBuffer<uint> par_buf : register(t0);\n{body}")
+    };
+
+    // Baseline: highest literal index wins, and `uintN` scales the width.
+    assert_eq!(slang_params_bytes(&one("x = par_buf[2];")), Some(3 * 4));
+    assert_eq!(
+        slang_params_bytes(
+            "[[vk::binding(0)]] StructuredBuffer<uint2> par_buf : register(t0);\nx = par_buf[1].y;"
+        ),
+        Some(2 * 2 * 4)
+    );
+
+    // Comments are prose, not reads: neither the index nor the arm keywords in
+    // them may count. `rope.slang` really does document `params[0..6]`.
+    assert_eq!(
+        slang_params_bytes(&one("x = par_buf[1];  // par_buf[9] is not a read")),
+        Some(2 * 4)
+    );
+
+    // A non-literal index cannot be resolved, so the width is unknown.
+    assert_eq!(slang_params_bytes(&one("x = par_buf[i];")), None);
+    assert_eq!(slang_params_bytes(&one("x = par_buf[base + 1];")), None);
+
+    // Never indexed: the binding was renamed out from under the scan.
+    assert_eq!(slang_params_bytes(&one("x = 1;")), None);
+
+    // `RWStructuredBuffer<uint>` is an output buffer, not the params binding.
+    // Taking the first match anchors on `out_buf` in `argmax_f32.slang`.
+    assert_eq!(
+        slang_params_bytes(
+            "[[vk::binding(0)]] RWStructuredBuffer<uint> out_buf : register(u0);\n\
+             [[vk::binding(1)]] StructuredBuffer<uint> par_buf : register(t1);\n\
+             out_buf[0] = par_buf[3];"
+        ),
+        Some(4 * 4)
+    );
+
+    // Two read-only params bindings, the wgsl/metal split `rmsnorm.slang` uses.
+    // Take the metal one: this is the Metal layout test, and refusing outright
+    // left every such kernel uncovered.
+    assert_eq!(
+        slang_params_bytes(
+            "[[vk::binding(0)]] StructuredBuffer<uint> p_wgsl : register(t0);\n\
+             [[vk::binding(1)]] StructuredBuffer<uint4> p_metal : register(t1);\n\
+             x = p_wgsl[7]; y = p_metal[0];"
+        ),
+        Some(4 * 4)
+    );
+    // A params binding of a non-`uint` element type is not silently skipped.
+    assert_eq!(
+        slang_params_bytes(
+            "[[vk::binding(0)]] StructuredBuffer<float> par_buf : register(t0);\n\
+             x = par_buf[1];"
+        ),
+        None
+    );
+
+    // Two bindings with no metal-specific name is still ambiguous.
+    assert_eq!(
+        slang_params_bytes(
+            "[[vk::binding(0)]] StructuredBuffer<uint> pa : register(t0);\n\
+             [[vk::binding(1)]] StructuredBuffer<uint> pb : register(t1);\n\
+             x = pa[1];"
+        ),
+        None
+    );
+
+    // The wgsl arm must not count: only `params[1]` in the metal arm does.
+    let switched = "[[vk::binding(0)]] StructuredBuffer<uint> params : register(t0);\n\
+         void f() {\n  __target_switch {\n  case metal:\n    x = params[1];\n    break;\n\
+         \n  default:\n    x = params[7];\n    break;\n  }\n}";
+    assert_eq!(slang_params_bytes(switched), Some(2 * 4));
+
+    // `default:` before `case metal:` would drop the metal arm instead.
+    let inverted = "[[vk::binding(0)]] StructuredBuffer<uint> params : register(t0);\n\
+         void f() {\n  __target_switch {\n  default:\n    x = params[7];\n    break;\n\
+         \n  case metal:\n    x = params[1];\n    break;\n  }\n}";
+    assert_eq!(slang_params_bytes(inverted), None);
+
+    // Every switch gets its default arm dropped, not just the first. Here the
+    // second switch's portable arm reads a higher index than the metal one, and
+    // it must not count. `softmax.slang` really has three switches.
+    let two = format!(
+        "{switched}\nvoid g() {{\n  __target_switch {{\n  case metal:\n    y = params[2];\n    break;\n\n  default:\n    y = params[9];\n    break;\n  }}\n}}"
+    );
+    assert_eq!(slang_params_bytes(&two), Some(3 * 4));
+
+    // And it must agree with a source whose width we know independently:
+    // `RopeParams` is 5 uints, asserted against `size_of` in `slang_cases`.
+    assert_eq!(
+        slang_params_bytes(include_str!("../src/backend/shaders/slang/rope.slang")),
+        Some(20),
+        "rope.slang's metal arm reads params[0..4]"
     );
 }

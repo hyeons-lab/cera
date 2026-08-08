@@ -172,7 +172,7 @@ impl KvShiftKParams {
 }
 impl MetalParams for KvShiftKParams {}
 
-/// Mirror of `Params` in `shaders/rope.metal`.
+/// Mirror of the params buffer in `shaders/slang/rope.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RopeParams {
@@ -396,6 +396,38 @@ pub struct ElementwiseParams {
 const _: () = assert!(size_of::<ElementwiseParams>() == 8);
 impl MetalParams for ElementwiseParams {}
 
+/// Mirror of the params buffer in `shaders/slang/argmax_f32.slang`.
+///
+/// Eight bytes, not four. The `.slang` declares `StructuredBuffer<uint2>` so the
+/// wgsl branch keeps the `vec2<u32>` its handwritten twin used, and the emitted
+/// MSL therefore takes `packed_uint2 device*` even though only `.x` is read. The
+/// handwritten `argmax_f32.metal` this replaced took a 4-byte
+/// `struct Params { uint n; }`, and the Metal host still uploaded 4 bytes after
+/// the swap, which left the kernel loading a `uint2` out of a 4-byte buffer.
+///
+/// Exists so that width is a type with a `size_of` the layout test can check,
+/// rather than the length of a slice literal at the upload site, which is what
+/// let the mismatch through.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArgmaxParams {
+    pub n: u32,
+    pub _pad: u32,
+}
+const _: () = assert!(size_of::<ArgmaxParams>() == 8);
+impl MetalParams for ArgmaxParams {}
+
+impl ArgmaxParams {
+    /// The upload form, for the buffer path (this one is a persistent `Buffer`,
+    /// not a `set_bytes` binding, so it goes through `bytemuck::cast_slice`).
+    pub fn words(n: u32) -> [u32; 2] {
+        [n, 0]
+    }
+}
+/// Ties `words` to the mirror: the upload cannot drift from the declared width
+/// without failing to compile.
+const _: () = assert!(size_of::<[u32; 2]>() == size_of::<ArgmaxParams>());
+
 impl ElementwiseParams {
     /// The common case: `n` elements, zero padding.
     pub fn new(n: u32) -> Self {
@@ -413,7 +445,7 @@ pub struct ScaleParams {
 const _: () = assert!(size_of::<ScaleParams>() == 8);
 impl MetalParams for ScaleParams {}
 
-/// Mirror of `Params` in `shaders/bias_add.metal`.
+/// Mirror of the params buffer in `shaders/slang/bias_add.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BiasAddParams {
@@ -423,7 +455,7 @@ pub struct BiasAddParams {
 const _: () = assert!(size_of::<BiasAddParams>() == 8);
 impl MetalParams for BiasAddParams {}
 
-/// Mirror of `Params` in `shaders/rmsnorm_batch.metal` — shared by `rmsnorm_batch` and
+/// Mirror of the params buffer in `shaders/slang/rmsnorm_batch.slang`, shared by `rmsnorm_batch` and
 /// `add_rmsnorm_batch`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -437,7 +469,7 @@ pub struct RmsNormBatchParams {
 const _: () = assert!(size_of::<RmsNormBatchParams>() == 20);
 impl MetalParams for RmsNormBatchParams {}
 
-/// Mirror of `Params` in `shaders/conv1d_fused_batch.metal`.
+/// Mirror of the params buffer in `shaders/slang/conv1d_fused_batch.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Conv1dBatchParams {
@@ -492,7 +524,7 @@ pub struct VitAttnParams {
 const _: () = assert!(size_of::<VitAttnParams>() == 16);
 impl MetalParams for VitAttnParams {}
 
-/// Mirror of `Params` in `shaders/layernorm_batch.metal` (the ViT LayerNorm).
+/// Mirror of the params buffer in `shaders/slang/layernorm_batch.slang` (the ViT LayerNorm).
 ///
 /// Distinct from [`RmsNormBatchParams`]: LayerNorm has no residual-scale field, so it is
 /// four uints, not five. `src_stride`/`dst_stride` are both `dim` in the ViT caller.

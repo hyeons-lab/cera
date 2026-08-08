@@ -10,10 +10,11 @@ use anyhow::Result;
 use metal::{Buffer, ComputePipelineState, MTLResourceOptions, MTLSize, NSUInteger};
 
 use crate::backend::metal::{
-    BiasAddParams, Conv1dBatchParams, ElementwiseParams, FlashAttnParams, GemmF32Params,
-    GemvBatchParams, GemvQkvParams, GemvRmsParams, GemvSplitKParams, KvCopyParams, KvShiftKParams,
-    MetalContext, MetalParams, PrefillAttnParams, QkNormRopeBatchParams, QkNormRopeParams,
-    QuantGemmParams, RmsNormBatchParams, RopeParams, ScaleParams, SplitAttnParams, shaders,
+    ArgmaxParams, BiasAddParams, Conv1dBatchParams, ElementwiseParams, FlashAttnParams,
+    GemmF32Params, GemvBatchParams, GemvQkvParams, GemvRmsParams, GemvSplitKParams, KvCopyParams,
+    KvShiftKParams, MetalContext, MetalParams, PrefillAttnParams, QkNormRopeBatchParams,
+    QkNormRopeParams, QuantGemmParams, RmsNormBatchParams, RopeParams, ScaleParams,
+    SplitAttnParams, shaders,
 };
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression, KvPrefixCache};
@@ -416,7 +417,7 @@ pub struct MetalLfm2Model {
     ///   bytes `2*hs*4      .. 3*hs*4` → b  (pre-conv mul factor)
     /// The `conv1d_fused` shader and its `encode_conv1d_fused`
     /// caller both depend on this layout. Also matches the
-    /// prefill-side `conv1d_fused_batch.metal` shader's
+    /// prefill-side `shaders/slang/conv1d_fused_batch.slang` shader's
     /// `proj_stride = 3*hs`.
     conv_proj_buf: Buffer,
     /// Unused since the conv1d fusion went live: the fused shader
@@ -1039,7 +1040,9 @@ impl MetalLfm2Model {
             gemv_splitk_partials: make_buf(65536 * 8),
             logits_buf: make_buf(config.vocab_size),
             argmax_token_buf: ctx.create_buffer(4),
-            argmax_params_buf: ctx.upload_bytes(bytemuck::cast_slice(&[config.vocab_size as u32])),
+            argmax_params_buf: ctx.upload_bytes(bytemuck::cast_slice(&ArgmaxParams::words(
+                config.vocab_size as u32,
+            ))),
             conv_proj_buf: make_buf(3 * hs),
             conv_bx_buf: make_buf(hs),
             conv_out_buf: make_buf(hs),
@@ -3854,7 +3857,7 @@ impl MetalLfm2Model {
     /// == 0`, and attention K/V are cell-keyed by position so
     /// stale tail data is invisible (kernels honor seq_len). But
     /// conv layers always read the entire rolling buffer regardless
-    /// of seq_len — see `conv1d.metal`. Without this zero, an FFI /
+    /// of seq_len, see `shaders/slang/conv1d.slang`. Without this zero, an FFI /
     /// long-lived process that reuses the same `MetalLfm2Model`
     /// across multiple `Session`s would drift on conv state.
     fn zero_conv_buffers_locked(&self) {

@@ -14,7 +14,7 @@
 // `shift < retained` (the common case), and a compute grid can't synchronize a
 // per-thread read+write across that overlap without racing.
 //
-// RoPE convention matches `rope.wgsl`'s decode path so the delta composes with
+// RoPE convention matches `slang/rope.slang`'s wgsl branch (decode path) so the delta composes with
 // whatever the forward pass applied: each dim-pair is rotated by the shared
 // `rope_angle(shift, d, ...)` schedule, NEGATED (the delta is -shift) and
 // optionally divided by `freq_factors[d]` for Llama-3. Sharing `rope_angle`
