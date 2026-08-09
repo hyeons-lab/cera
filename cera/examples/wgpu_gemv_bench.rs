@@ -124,6 +124,7 @@ fn block_geom(dtype: DType) -> (usize, usize) {
         DType::Q4_0 => (32, 18),
         DType::Q8_0 => (32, 34),
         DType::Q4KM => (256, 144),
+        DType::Q5KM => (256, 176),
         DType::Q6K => (256, 210),
         // Dense f32: the control, and the reason to keep it in the table. It is
         // the best-behaved kernel here, by a wide margin at the LM-head shape, so
@@ -178,11 +179,11 @@ fn main() -> anyhow::Result<()> {
         // Checked here, before the run starts. `synth_weights` would otherwise
         // catch it partway through, but its message names only "the block size"
         // and not which one, so `K=1000` panics with an unexplained "left: 232".
-        // 256 is the strictest block size in the table — Q4_K and Q6_K — and a
-        // multiple of every other one.
+        // 256 is the strictest block size in the table (Q4_K, Q5_K and Q6_K)
+        // and a multiple of every other one.
         ensure!(
             k.is_multiple_of(256),
-            "K must be a multiple of 256 (the Q4_K/Q6_K super-block), got {k}"
+            "K must be a multiple of 256 (the Q4_K/Q5_K/Q6_K super-block), got {k}"
         );
         Some(vec![(m, k, "custom")])
     } else {
@@ -204,6 +205,13 @@ fn main() -> anyhow::Result<()> {
             dtype: DType::Q4KM,
             shader: shaders::GEMV_Q4_K,
             entry: "gemv_q4_k",
+            rows_per_wg: 2,
+        },
+        Kernel {
+            name: "q5_k",
+            dtype: DType::Q5KM,
+            shader: shaders::GEMV_Q5_K,
+            entry: "gemv_q5_k",
             rows_per_wg: 2,
         },
         Kernel {
