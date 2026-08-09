@@ -1,3 +1,25 @@
+//! Hand-written SIMD kernels: NEON on aarch64, AVX2 and AVX-512 on x86_64.
+//!
+//! Every entry point runtime-dispatches on `cpu_features()` and falls back to
+//! the scalar path in `super::cpu`, so a host missing a feature gets a correct
+//! answer rather than an illegal instruction. The tiers are `neon` <
+//! `dotprod` < `i8mm` on aarch64, and `avx2` < `avx512` < `avx512vnni` on x86.
+#![warn(missing_docs, clippy::missing_docs_in_private_items)]
+//
+// Both halves: `missing_docs` for the public items, the clippy one for the
+// private ones. Scoped here rather than crate-wide (646 and 887 items
+// elsewhere) because these files
+// have repeatedly lost a doc comment to an insertion or deletion above an item:
+// a doc binds to the next item below it, so both operations silently reassign
+// it, and the item left bare is otherwise silent. There is no `missing_docs`
+// for private items by default, and rustdoc stays green because the intra-doc
+// links still resolve.
+//
+// Known limit: clippy skips `#[cfg(test)]`, so this does not cover test
+// modules. A `#[test]` that loses its attribute is caught by `dead_code`
+// instead (it becomes an uncalled private fn), but a doc that merely moves
+// between two live test functions is caught by neither.
+
 // SIMD-optimized kernels for quantized operations.
 //
 // Platform-specific implementations behind cfg gates.
@@ -100,23 +122,31 @@ fn require_i8mm_kernel_or_skip() -> bool {
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
 struct GemvPtrs {
+    /// Packed weight bytes.
     a: usize,
+    /// Q8 activation quants.
     xq: usize,
+    /// Per-block activation scales.
     xs: usize,
 }
 #[cfg(target_arch = "aarch64")]
 impl GemvPtrs {
+    /// The weight bytes, back as a pointer.
     fn a(&self) -> *const u8 {
         self.a as *const u8
     }
+    /// The Q8 activation quants, back as a pointer.
     fn xq(&self) -> *const i8 {
         self.xq as *const i8
     }
+    /// The activation scales, back as a pointer.
     fn xs(&self) -> *const f32 {
         self.xs as *const f32
     }
 }
 
+/// aarch64 NEON kernels: `vec_dot`, GEMV and GEMM for the quantized dtypes,
+/// dispatched by tier (plain NEON, dotprod, i8mm).
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::needless_range_loop, unused_unsafe)]
 pub(crate) mod neon {
@@ -3973,6 +4003,7 @@ pub(crate) mod neon {
 // ── x86_64 AVX2 ─────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
+/// x86_64 AVX2 `vec_dot` kernels for the dense and quantized dtypes.
 mod avx2 {
     use super::*;
     use std::arch::x86_64::*;
@@ -4127,6 +4158,7 @@ mod avx2 {
     }
 
     #[target_feature(enable = "avx2")]
+    /// Horizontal sum of an 8-lane f32 vector.
     unsafe fn hsum_avx(v: __m256) -> f32 {
         let hi128 = _mm256_extractf128_ps(v, 1);
         let lo128 = _mm256_castps256_ps128(v);
@@ -4161,6 +4193,7 @@ mod avx2 {
 // Rust 1.89 (below the crate's current 1.94 MSRV), so the gate is about
 // hardware coverage, not toolchain support.
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+/// x86_64 AVX-512 `vec_dot` kernels, behind the `avx512` crate feature.
 pub(crate) mod avx512 {
     use super::*;
     use std::arch::x86_64::*;
@@ -4505,6 +4538,8 @@ pub(crate) mod avx512 {
 // definition` warning on every aarch64 and wasm32 build, which the CI lint
 // leg (x86 only) would never catch.
 #[cfg(target_arch = "x86_64")]
+/// Emit the int8 GEMM kernels for one x86 tier, since VNNI and the AVX2
+/// emulation differ only in how they reach a `dpbusd`.
 macro_rules! int8_gemm_kernels {
     ($feat:literal, $tile_n:expr, $tile_m:expr, $strip_n:expr, $kq_cols:expr) => {
         /// Horizontal sum of the 8 f32 lanes. Called once per output element, never
@@ -6269,6 +6304,7 @@ macro_rules! int8_gemm_kernels {
 // Note this module needs no `avx512` crate feature: `maddubs`/`madd` are
 // SSSE3/SSE2-era intrinsics, stable well before the crate MSRV.
 #[cfg(target_arch = "x86_64")]
+/// Int8 GEMM/GEMV at the AVX2 tier, emulating `dpbusd` with `maddubs`.
 pub(crate) mod avx2_int8 {
     use super::*;
     use std::arch::x86_64::*;
@@ -7250,6 +7286,7 @@ pub(crate) mod avx2_int8 {
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+/// Int8 GEMM/GEMV at the AVX-512 VNNI tier, using the hardware `dpbusd`.
 pub(crate) mod avx512_vnni {
     use super::*;
     use std::arch::x86_64::*;
