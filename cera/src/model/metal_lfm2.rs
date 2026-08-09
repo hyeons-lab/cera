@@ -2096,19 +2096,19 @@ impl MetalLfm2Model {
                 64u64,
             ),
             DType::Q5KM => (
-                // Q5_K super-block GEMV: NR=2 rows/TG, 32 threads (one simdgroup).
-                // Still the un-widened layout — unlike Q4_K, which was ported to the
-                // llama.cpp 4-rows/64-thread kernel; porting Q5_K the same way is the
-                // obvious follow-up. Used for decode, and for prefill tiles too small
-                // for the batched `gemm_q5_k` (n < GEMM_MIN_N or k % 256 != 0), which
-                // `encode_gemm` routes back here via its self-guard.
+                // Q5_K super-block GEMV: 4 rows/TG, 64 threads (NR=2 rows per
+                // simdgroup x NSG=2), the same geometry as `gemv_q4_k` and
+                // `gemv_q6_k` since the llama.cpp port. Used for decode, and for
+                // prefill tiles too small for the batched `gemm_q5_k`
+                // (n < GEMM_MIN_N or k % 256 != 0), which `encode_gemm` routes
+                // back here via its self-guard.
                 if accumulate {
                     &self.pipelines.gemv_q5_k_accum
                 } else {
                     &self.pipelines.gemv_q5_k
                 },
-                w.m.div_ceil(2),
-                32u64,
+                w.m.div_ceil(4),
+                64u64,
             ),
             DType::Q6K => (
                 // Q6_K layer weights (Q4_K_M stores ffn_down / some attn_v as Q6_K).
@@ -2198,16 +2198,19 @@ impl MetalLfm2Model {
                 enc.dispatch_thread_groups(grid, sz1d(64));
             }
             DType::Q5KM => {
-                // Q5_K: 2 rows/TG, 32 threads — matches the layer-weight `gemv_q5_k`
-                // path. (Q4_K above is now 4 rows/64 threads; Q5_K is not yet ported.)
-                let groups = m.div_ceil(2);
+                // Q5_K: 4 rows/TG, 64 threads, matching the layer-weight
+                // `gemv_q5_k` path. This is the second dispatch site, and the
+                // one the Q4_K port nearly shipped without updating: a geometry
+                // change has to land on both or the logit head silently reads
+                // the wrong rows.
+                let groups = m.div_ceil(4);
                 let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
                 enc.set_compute_pipeline_state(&self.pipelines.gemv_q5_k);
                 enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
                 enc.set_buffer(1, Some(input), 0);
                 enc.set_buffer(2, Some(output), 0);
                 enc.set_buffer(3, Some(&self.params.gemv_output), 0);
-                enc.dispatch_thread_groups(grid, sz1d(32));
+                enc.dispatch_thread_groups(grid, sz1d(64));
             }
             DType::F32 => {
                 let grid = sz2d(m.min(65535) as u64, m.div_ceil(65535) as u64);

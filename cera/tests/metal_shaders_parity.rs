@@ -701,7 +701,8 @@ fn test_gemv_q5_k() {
     let x_buf = ctx.upload_f32(&x);
     let p_buf = ctx.upload_bytes(bytemuck::cast_slice(&[m, k]));
 
-    // NR = 2 rows per threadgroup, 32 threads (one simdgroup).
+    // 4 rows per threadgroup, 64 threads (NR=2 per simdgroup x NSG=2), matching
+    // both `metal_lfm2.rs` dispatch sites since the llama.cpp port.
     let dispatch = |entry: &str, y_buf: &metal::Buffer| {
         let pl = ctx.create_pipeline(shaders::GEMV_Q5_K, entry).unwrap();
         let cb = ctx.queue.new_command_buffer();
@@ -711,9 +712,9 @@ fn test_gemv_q5_k() {
         enc.set_buffer(1, Some(&x_buf), 0);
         enc.set_buffer(2, Some(y_buf), 0);
         enc.set_buffer(3, Some(&p_buf), 0);
-        // NR = 2 rows per threadgroup -> ceil(m/2) groups so an odd m still
-        // covers the final row (truncating m/2 would silently drop it).
-        enc.dispatch_thread_groups(tg_size((m as u64).div_ceil(2)), tg_size(32));
+        // 4 rows per threadgroup -> ceil(m/4) groups so a ragged m still covers
+        // the final rows (truncating would silently drop them).
+        enc.dispatch_thread_groups(tg_size((m as u64).div_ceil(4)), tg_size(64));
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
