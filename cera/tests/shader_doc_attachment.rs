@@ -60,7 +60,7 @@ fn stem_included_by(decl: &str) -> Option<String> {
 fn shader_consts(src: &str) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
     let mut doc = String::new();
-    let mut lines = src.lines().peekable();
+    let mut lines = src.lines();
     while let Some(line) = lines.next() {
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix("///") {
@@ -80,8 +80,11 @@ fn shader_consts(src: &str) -> Vec<(String, String, String)> {
                     None => break,
                 }
             }
+            // `split_once`, not `split(..).next()`: the latter is always `Some`,
+            // so it reads as a check on the `NAME: Type = ..` shape while
+            // accepting anything.
             if decl.contains("include_str!")
-                && let Some(name) = decl.split(':').next()
+                && let Some((name, _)) = decl.split_once(':')
             {
                 out.push((name.trim().to_string(), doc.clone(), decl));
             }
