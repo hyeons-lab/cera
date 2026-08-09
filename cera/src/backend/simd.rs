@@ -40,6 +40,58 @@ fn require_simd_or_skip(feature: &str, detected: bool) -> bool {
     false
 }
 
+/// Gate for the four i8mm GEMM parity tests: every feature their bodies need.
+///
+/// `i8mm` for the kernel under test, `dotprod` because the reference kernel is
+/// the dotprod one (and the Q4_K/Q6_K i8mm kernels call `q8_0_col_sums` for
+/// their min term), and `fp16` because all four kernels declare
+/// `neon,i8mm,fp16`: they widen block scales with `f16_bits_to_f32`, whose
+/// `vcvt_f32_f16` `core::arch` declares `neon,fp16`.
+///
+/// One helper rather than a gate per test, because the four had drifted: two
+/// checked `i8mm && dotprod`, two checked `i8mm` alone, and none checked
+/// `fp16`.
+///
+/// The reporting is the fiddly part. `require_simd_or_skip` matches
+/// `CERA_REQUIRE_SIMD` on the label it is given, so a single combined condition
+/// would blame `i8mm` for a missing `dotprod` or `fp16`, while separate calls
+/// under their own labels would let `CERA_REQUIRE_SIMD=i8mm` *silently skip* on
+/// a host missing one of the implied features. A silent skip is the worse
+/// failure: the `simd-i8mm` CI leg exists so a green check proves the kernel
+/// ran. So each feature is named accurately, and requiring `i8mm` requires all
+/// three.
+///
+/// FEAT_I8MM (v8.6) implies FEAT_DotProd and FEAT_FP16 (both v8.2) on any
+/// conformant core, so the two extra checks state the contract rather than
+/// expecting to fire.
+#[cfg(all(test, target_arch = "aarch64"))]
+fn require_i8mm_kernel_or_skip() -> bool {
+    let required = std::env::var("CERA_REQUIRE_SIMD").unwrap_or_default();
+    let i8mm_required = required.split(',').any(|f| f.trim() == "i8mm");
+    let missing = [
+        ("i8mm", std::arch::is_aarch64_feature_detected!("i8mm")),
+        (
+            "dotprod",
+            std::arch::is_aarch64_feature_detected!("dotprod"),
+        ),
+        ("fp16", std::arch::is_aarch64_feature_detected!("fp16")),
+    ]
+    .into_iter()
+    .find(|&(_, detected)| !detected);
+    match missing {
+        None => true,
+        Some((name, _)) => {
+            assert!(
+                !i8mm_required,
+                "CERA_REQUIRE_SIMD requires `i8mm`, whose kernels declare \
+                 `neon,i8mm,fp16` and use the dotprod reference, but this host \
+                 does not report `{name}`"
+            );
+            false
+        }
+    }
+}
+
 // ── aarch64 NEON ────────────────────────────────────────────────────────────
 
 /// Send+Sync pointer wrapper for parallel GEMV closures.
@@ -3064,7 +3116,7 @@ pub(crate) mod neon {
         /// declares `neon,fp16`, so this still executes on the dev host, where
         /// the i8mm kernels that call it never run.
         #[test]
-        fn f16_widen_matches_half_crate_exhaustively() {
+        fn neon_f16_widen_matches_half_crate_exhaustively() {
             if !require_simd_or_skip("fp16", std::arch::is_aarch64_feature_detected!("fp16")) {
                 return;
             }
@@ -3444,17 +3496,13 @@ pub(crate) mod neon {
 
         /// The i8mm Q6_K GEMM must agree with the dotprod kernel on identical inputs.
         /// Runs on the `simd-i8mm` CI job (self-skips on non-i8mm hosts, e.g. M1).
-        /// The gate requires BOTH i8mm and dotprod: the body runs the dotprod
-        /// reference, and the i8mm kernel's scalar-remainder fallback is dotprod-free
-        /// but the reference is not. Shapes cover odd m (5) and odd n (3, 7) so the
+        /// Gated by [`require_i8mm_kernel_or_skip`], which requires `dotprod` (the
+        /// body runs the dotprod reference) and `fp16` (the kernel declares it)
+        /// alongside `i8mm`. Shapes cover odd m (5) and odd n (3, 7) so the
         /// 2×2-tile remainder paths are exercised; k = 512 straddles two superblocks.
         #[test]
         fn q6_k_gemm_i8mm_matches_dotprod() {
-            if !require_simd_or_skip(
-                "i8mm",
-                std::arch::is_aarch64_feature_detected!("i8mm")
-                    && std::arch::is_aarch64_feature_detected!("dotprod"),
-            ) {
+            if !require_i8mm_kernel_or_skip() {
                 return;
             }
             for &(m, n, k) in &[(4usize, 4usize, 256usize), (5, 3, 512), (2, 7, 256)] {
@@ -3756,13 +3804,13 @@ pub(crate) mod neon {
             assert_close(&out_dot, &out_fb);
         }
 
-        /// i8mm Q8_0 GEMM vs the dotprod kernel. Skips on the dev host (M1 has no
-        /// i8mm); runs where `is_aarch64_feature_detected!("i8mm")` (ARMv8.6) —
-        /// notably the `simd-i8mm` CI job, which enforces it via
+        /// i8mm Q8_0 GEMM vs the dotprod kernel. Gated by
+        /// [`require_i8mm_kernel_or_skip`], so it skips on the dev host (M1 has no
+        /// i8mm) and runs on the `simd-i8mm` CI job, which enforces it via
         /// `CERA_REQUIRE_SIMD=i8mm`. Covers odd m and n for the remainder paths.
         #[test]
         fn i8mm_gemm_matches_dotprod() {
-            if !require_simd_or_skip("i8mm", std::arch::is_aarch64_feature_detected!("i8mm")) {
+            if !require_i8mm_kernel_or_skip() {
                 return;
             }
             for &(m, n, k) in &[(4usize, 4usize, 64usize), (5, 3, 96), (2, 7, 64)] {
@@ -3808,7 +3856,7 @@ pub(crate) mod neon {
         /// and n for the scalar-remainder paths.
         #[test]
         fn q4_0_gemm_i8mm_matches_dotprod() {
-            if !require_simd_or_skip("i8mm", std::arch::is_aarch64_feature_detected!("i8mm")) {
+            if !require_i8mm_kernel_or_skip() {
                 return;
             }
             for &(m, n, k) in &[(4usize, 4usize, 64usize), (5, 3, 96), (2, 7, 64)] {
@@ -3848,24 +3896,14 @@ pub(crate) mod neon {
             }
         }
 
-        /// i8mm Q4_K GEMM vs the dotprod kernel. Same gating as
-        /// [`q4_0_gemm_i8mm_matches_dotprod`] — skips on the dev host (M1 has no
-        /// i8mm), enforced on the `simd-i8mm` CI job. Covers odd m and n for the
+        /// i8mm Q4_K GEMM vs the dotprod kernel. Gated by
+        /// [`require_i8mm_kernel_or_skip`] like its three siblings, so it skips on
+        /// the dev host (M1 has no i8mm) and is enforced on the `simd-i8mm` CI job. Covers odd m and n for the
         /// scalar-remainder paths; `k` is a multiple of 256 (superblock width),
         /// with 512 straddling two superblocks.
         #[test]
         fn q4_k_gemm_i8mm_matches_dotprod() {
-            // The body needs BOTH features: it runs the dotprod reference kernel, and
-            // the i8mm kernel itself calls the dotprod `q8_0_col_sums` for the min
-            // term. FEAT_I8MM (v8.6) implies FEAT_DotProd (v8.2) on any conformant
-            // core — and the dispatcher only reaches the i8mm kernel at tier
-            // `NeonI8mm`, which requires dotprod — but gate on both here so the test
-            // matches what it executes rather than relying on that implication.
-            if !require_simd_or_skip(
-                "i8mm",
-                std::arch::is_aarch64_feature_detected!("i8mm")
-                    && std::arch::is_aarch64_feature_detected!("dotprod"),
-            ) {
+            if !require_i8mm_kernel_or_skip() {
                 return;
             }
             for &(m, n, k) in &[(4usize, 4usize, 256usize), (5, 3, 512), (2, 7, 256)] {
