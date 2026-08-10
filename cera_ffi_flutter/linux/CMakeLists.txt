@@ -13,6 +13,8 @@ cmake_minimum_required(VERSION 3.13)
 set(PROJECT_NAME "cera_ffi_flutter")
 project(${PROJECT_NAME} LANGUAGES CXX)
 
+# Names a published release tag. Kept in lockstep with the Cargo workspace by
+# scripts/bump-version.sh (which verifies the write landed); do not hand-edit.
 set(CERA_VERSION "0.4.0")
 set(CERA_LIB_LABEL "linux-x86-64")
 set(CERA_LIB_FILE "libcera_ffi.so")

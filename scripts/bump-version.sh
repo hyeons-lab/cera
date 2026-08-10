@@ -14,6 +14,11 @@
 #   - cera-ffi-kotlin/gradle.properties  VERSION_NAME  (the Maven Central
 #     coordinate for the Kotlin/Android bindings; any "-QUALIFIER" suffix such
 #     as "-SNAPSHOT" is preserved)
+#   - the cera_ffi_flutter platform manifests, which name the *published*
+#     native artifact each platform resolves at build time: the AAR coordinate
+#     in android/build.gradle and the release tag the linux/windows
+#     CMakeLists download from, plus the two podspec versions (see
+#     PLUGIN_SITES below)
 #
 # The release pipeline (.github/workflows/publish.yml) reads the version from
 # `cargo metadata` (the `cera` crate) for the git tag + npm/CLI assets, and
@@ -46,6 +51,25 @@ GRADLE_PROPS="$ROOT/cera-ffi-kotlin/gradle.properties"
 # Dependent crates carrying an internal `cera` path-dep pin.
 PIN_CRATES=(cera-cli cera-ffi cera-wasm cera-parity)
 
+# Flutter plugin platform manifests, one entry per version *site*: a file with
+# two references appears twice. Format is "<label>|<path from ROOT>|<regex>",
+# where the regex names three captures — `pre`, `ver`, `post` — so the single
+# pattern serves as both reader and writer and the two cannot drift apart.
+#
+# These matter more than the other files here, because getting one wrong does
+# not fail a build. They name published release artifacts, so a site left
+# behind on a bump silently resolves the *previous* release's native library
+# (Android), or a git tag carrying no assets at all (Linux/Windows). Both
+# surface as a runtime failure in a consumer's app, long after the release.
+PLUGIN_SITES=(
+  "android build.gradle version|cera_ffi_flutter/android/build.gradle|(?<pre>^version = ')(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>')"
+  "android cera-ffi-android dependency|cera_ffi_flutter/android/build.gradle|(?<pre>^\s*api 'com\.hyeons-lab:cera-ffi-android:)(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>')"
+  "linux CMakeLists CERA_VERSION|cera_ffi_flutter/linux/CMakeLists.txt|(?<pre>^set\(CERA_VERSION \")(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>\"\))"
+  "windows CMakeLists CERA_VERSION|cera_ffi_flutter/windows/CMakeLists.txt|(?<pre>^set\(CERA_VERSION \")(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>\"\))"
+  "ios podspec s.version|cera_ffi_flutter/ios/cera_ffi_flutter.podspec|(?<pre>^\s*s\.version\s*=\s*')(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>')"
+  "macos podspec s.version|cera_ffi_flutter/macos/cera_ffi_flutter.podspec|(?<pre>^\s*s\.version\s*=\s*')(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>')"
+)
+
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -62,6 +86,10 @@ esac
 [ -f "$GRADLE_PROPS" ]  || die "gradle.properties not found at $GRADLE_PROPS"
 for c in "${PIN_CRATES[@]}"; do
   [ -f "$ROOT/$c/Cargo.toml" ] || die "$c/Cargo.toml not found at $ROOT/$c/Cargo.toml"
+done
+for site in "${PLUGIN_SITES[@]}"; do
+  IFS='|' read -r _label spath _re <<< "$site"
+  [ -f "$ROOT/$spath" ] || die "plugin manifest not found at $ROOT/$spath"
 done
 
 CHECK_ONLY=0
@@ -111,6 +139,9 @@ gradle_suffix() {
   # the "-QUALIFIER" suffix after the version (e.g. -SNAPSHOT), if any
   perl -ne 'print "$1" if /^VERSION_NAME\s*=\s*[0-9]+\.[0-9]+\.[0-9]+(-\S+)?/ && defined $1' "$GRADLE_PROPS"
 }
+plugin_site_versions() { # <path from ROOT> <regex> — one version per match
+  perl -ne 'BEGIN{$re = shift} print "$+{ver}\n" if /$re/' "$2" "$ROOT/$1"
+}
 
 # ─── --check: report drift, never write ──────────────────────────────────────
 if [ "$CHECK_ONLY" -eq 1 ]; then
@@ -135,6 +166,19 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   done
   check "pubspec.yaml build name" "$(pubspec_version)"
   check "gradle.properties VERSION_NAME" "$(gradle_version)"
+  for site in "${PLUGIN_SITES[@]}"; do
+    IFS='|' read -r slabel spath sre <<< "$site"
+    seen_site=0
+    while IFS= read -r sver; do
+      [ -n "$sver" ] || continue
+      seen_site=1
+      check "$slabel" "$sver"
+    done < <(plugin_site_versions "$spath" "$sre")
+    # A site whose regex now matches nothing is drift too: the file was
+    # reformatted or the line moved, and staying quiet about it is how a
+    # published artifact reference gets left a release behind.
+    [ "$seen_site" -eq 1 ] || { echo "drift: $slabel matched nothing in $spath" >&2; drift=1; }
+  done
 
   if [ "$drift" -eq 0 ]; then echo "OK: all files match VERSION $want"; fi
   exit "$drift"
@@ -179,11 +223,24 @@ perl -i -pe 'BEGIN{$v=shift; $s=shift} s/^(VERSION_NAME\s*=\s*)[0-9]+\.[0-9]+\.[
   "$VERSION" "$gsuffix" "$GRADLE_PROPS"
 verify "gradle.properties VERSION_NAME" "$(gradle_version)"
 
+# Flutter plugin platform manifests. The Apple SPM manifests are deliberately
+# absent: their `RELEASE_VERSION` / `RELEASE_CHECKSUM` literals are rewritten by
+# the release workflow, which is the only place the checksum is known.
+for site in "${PLUGIN_SITES[@]}"; do
+  IFS='|' read -r slabel spath sre <<< "$site"
+  perl -i -pe 'BEGIN{$re = shift; $v = shift} s/$re/$+{pre}$v$+{post}/' \
+    "$sre" "$VERSION" "$ROOT/$spath"
+  svers="$(plugin_site_versions "$spath" "$sre")"
+  [ -n "$svers" ] || die "$slabel: regex matched nothing in $spath"
+  while IFS= read -r sver; do verify "$slabel" "$sver"; done <<< "$svers"
+done
+
 echo "version set to $VERSION"
 echo "  VERSION"
 echo "  Cargo.toml        (workspace.package + ${#PIN_CRATES[@]} internal cera pins)"
 echo "  pubspec.yaml      ${VERSION}${psuffix}"
 echo "  gradle.properties ${VERSION}${gsuffix}"
+echo "  cera_ffi_flutter  ${#PLUGIN_SITES[@]} platform-manifest sites"
 echo
 echo "Cargo.lock is tracked and records these crate versions, so refresh it before"
 echo "committing:  cargo metadata --offline >/dev/null  (then include it in the diff)."
