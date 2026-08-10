@@ -391,16 +391,16 @@ class GenerateOutput {
   const GenerateOutput({
     /// Generated token IDs, in order, not including any prompt
     /// tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-    /// Rust side or (once exposed) through a tokenizer handle on the
-    /// FFI side.
+    /// Rust side, or with [`CeraEngine::decode_tokens`] from any
+    /// foreign binding.
     required this.tokens,
     required this.summary,
   });
 
   /// Generated token IDs, in order, not including any prompt
   /// tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-  /// Rust side or (once exposed) through a tokenizer handle on the
-  /// FFI side.
+  /// Rust side, or with [`CeraEngine::decode_tokens`] from any
+  /// foreign binding.
   final List<int> tokens;
   final GenerateSummary summary;
 
@@ -3583,6 +3583,16 @@ class CeraFfiFfi {
     if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async != 14088) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async`: expected 14088, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async');
     }
+    final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes');
+      _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes != 45873) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes`: expected 45873, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes');
+    }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_path;
     try {
       final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_constructor_ceraengine_from_path');
@@ -4791,6 +4801,121 @@ class CeraFfiFfi {
         callback.close();
         _ceraEngineCtorFromBundleIdAsyncFfiBufferRustFutureFree(futureHandle);
       }
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineCtorFromBytesFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_constructor_ceraengine_from_bytes');
+
+  CeraEngine ceraEngineCreateFromBytes(Uint8List bytes, EngineConfig config) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(6);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final bytesWriter = _UniFfiBinaryWriter();
+      bytesWriter.writeI32(bytes.length);
+      bytesWriter.writeBytes(bytes);
+      final Uint8List bytesBytes = bytesWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> bytesPtr = bytesBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(bytesBytes.length);
+      if (bytesBytes.isNotEmpty) { bytesPtr.asTypedList(bytesBytes.length).setAll(0, bytesBytes); }
+      foreignArgPtrs.add(bytesPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> bytesFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      bytesFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      bytesFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> bytesForeignPtr = calloc<_UniFfiForeignBytes>();
+      bytesForeignPtr.ref
+        ..len = bytesBytes.length
+        ..data = bytesPtr;
+      final _UniFfiRustBuffer bytesRustBuffer = _uniFfiRustBufferFromBytes(bytesForeignPtr.ref, bytesFromBytesStatusPtr);
+      calloc.free(bytesForeignPtr);
+      final int bytesFromBytesCode = bytesFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer bytesFromBytesErrBuf = bytesFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(bytesFromBytesStatusPtr);
+      if (bytesFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> bytesFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        bytesFromBytesErrBufPtr.ref
+          ..capacity = bytesFromBytesErrBuf.capacity
+          ..len = bytesFromBytesErrBuf.len
+          ..data = bytesFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(bytesFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $bytesFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = bytesRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = bytesRustBuffer.len;
+      (argBuf + 2).ref.ptr = bytesRustBuffer.data.cast<ffi.Void>();
+      final Uint8List configBytes = _uniffiEncodeEngineConfig(config);
+      final ffi.Pointer<ffi.Uint8> configPtr = configBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(configBytes.length);
+      if (configBytes.isNotEmpty) { configPtr.asTypedList(configBytes.length).setAll(0, configBytes); }
+      foreignArgPtrs.add(configPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> configFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      configFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      configFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> configForeignPtr = calloc<_UniFfiForeignBytes>();
+      configForeignPtr.ref
+        ..len = configBytes.length
+        ..data = configPtr;
+      final _UniFfiRustBuffer configRustBuffer = _uniFfiRustBufferFromBytes(configForeignPtr.ref, configFromBytesStatusPtr);
+      calloc.free(configForeignPtr);
+      final int configFromBytesCode = configFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer configFromBytesErrBuf = configFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(configFromBytesStatusPtr);
+      if (configFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> configFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        configFromBytesErrBufPtr.ref
+          ..capacity = configFromBytesErrBuf.capacity
+          ..len = configFromBytesErrBuf.len
+          ..data = configFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(configFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $configFromBytesCode');
+      }
+      (argBuf + 3).ref.u64 = configRustBuffer.capacity;
+      (argBuf + 4).ref.u64 = configRustBuffer.len;
+      (argBuf + 5).ref.ptr = configRustBuffer.data.cast<ffi.Void>();
+      _ceraEngineCtorFromBytesFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final int handle = (returnBuf + 0).ref.u64;
+      return CeraEngine._(this, handle);
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -7417,7 +7542,10 @@ class CeraFfiFfi {
         }
       }
       (argBuf + 0).ref.u64 = clonedHandle;
-      final Uint8List bytesBytes = bytes;
+      final bytesWriter = _UniFfiBinaryWriter();
+      bytesWriter.writeI32(bytes.length);
+      bytesWriter.writeBytes(bytes);
+      final Uint8List bytesBytes = bytesWriter.toBytes();
       final ffi.Pointer<ffi.Uint8> bytesPtr = bytesBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(bytesBytes.length);
       if (bytesBytes.isNotEmpty) { bytesPtr.asTypedList(bytesBytes.length).setAll(0, bytesBytes); }
       foreignArgPtrs.add(bytesPtr);
@@ -8746,7 +8874,11 @@ class CeraFfiFfi {
         ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
       rustRetBufferPtrs.add(retBufPtr);
       final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
-      final decodedValue = retBytes;
+      final _UniFfiBinaryReader retReader = _UniFfiBinaryReader(retBytes);
+      final decodedValue = (() { final int __len = retReader.readI32(); return retReader.readBytes(__len); })();
+      if (!retReader.isDone) {
+        throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');
+      }
       return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
@@ -8857,7 +8989,11 @@ class CeraFfiFfi {
         ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
       rustRetBufferPtrs.add(retBufPtr);
       final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
-      final decodedValue = retBytes;
+      final _UniFfiBinaryReader retReader = _UniFfiBinaryReader(retBytes);
+      final decodedValue = (() { final int __len = retReader.readI32(); return retReader.readBytes(__len); })();
+      if (!retReader.isDone) {
+        throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');
+      }
       return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
@@ -9516,6 +9652,37 @@ final class CeraEngine {
   /// [`Session::generate_async`].
   static Future<CeraEngine> fromBundleIdAsync(String bundleId, String quant, EngineConfig config) async {
     return _bindings().ceraEngineCreateFromBundleIdAsync(bundleId, quant, config);
+  }
+
+  /// Load a model from GGUF bytes already in memory.
+  ///
+  /// For callers with no filesystem to point [`CeraEngine::from_path`]
+  /// at: a browser, an encrypted blob decrypted in memory, an asset
+  /// read out of an archive. It is the one constructor a WebAssembly
+  /// build can also offer, so code written against it ports across.
+  ///
+  /// **Not a streaming API.** GGUF is random-access: tensor data is
+  /// addressed by offset and read throughout inference, so the whole
+  /// file has to be resident before the first token. You can download
+  /// over a stream, but you must accumulate it all before calling
+  /// this. There is no partial-model inference.
+  ///
+  /// **Prefer [`CeraEngine::from_path`] whenever a path exists.** That
+  /// route memory-maps the file, so tensor pages stay owned by the
+  /// kernel: shared between processes and evictable under pressure.
+  /// These bytes are committed resident memory for as long as the
+  /// engine lives, which on a phone is the difference between a model
+  /// the OS can page out and one that counts against your footprint.
+  /// To load from the network on a platform that has a filesystem,
+  /// stream to disk and use `from_path` (which is what [`BundleRepo`]
+  /// does), rather than buffering the model here.
+  ///
+  /// Text-only: the bytes are a bare GGUF with no accompanying
+  /// manifest, so there is nothing to point at a vision encoder or an
+  /// audio decoder. Multimodal models need `from_path` or
+  /// [`CeraEngine::from_bundle_id`]. `config.bundle_repo` is ignored.
+  static CeraEngine fromBytes(Uint8List bytes, EngineConfig config) {
+    return _bindings().ceraEngineCreateFromBytes(bytes, config);
   }
 
   /// Load a model from a local filesystem path. Accepts the same

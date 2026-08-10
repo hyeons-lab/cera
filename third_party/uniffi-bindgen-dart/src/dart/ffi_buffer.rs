@@ -282,6 +282,10 @@ pub(super) fn render_ffibuffer_rustbuffer_arg_serialization(
     } else {
         arg_name.clone()
     };
+    // `Bytes` needs the writer for the same reason it needs the reader on the
+    // way back: UniFFI's `FfiConverterData` is `i32` length followed by the
+    // bytes, not the bare bytes. Writing them raw makes Rust read the first
+    // four bytes of the payload as a length and panic (RustCallStatus 2).
     let needs_writer = matches!(
         runtime_unwrapped_type(&arg.type_),
         Type::Map { .. }
@@ -289,6 +293,7 @@ pub(super) fn render_ffibuffer_rustbuffer_arg_serialization(
             | Type::Optional { .. }
             | Type::Timestamp
             | Type::Duration
+            | Type::Bytes
     );
     let writer_name = format!("{arg_name}Writer");
     let encode_expr = match runtime_unwrapped_type(&arg.type_) {
@@ -298,12 +303,12 @@ pub(super) fn render_ffibuffer_rustbuffer_arg_serialization(
         Type::String => {
             format!("Uint8List.fromList(utf8.encode({lowered_arg}))")
         }
-        Type::Bytes => lowered_arg.clone(),
         Type::Map { .. }
         | Type::Sequence { .. }
         | Type::Optional { .. }
         | Type::Timestamp
-        | Type::Duration => {
+        | Type::Duration
+        | Type::Bytes => {
             format!("{writer_name}.toBytes()")
         }
         _ => {
@@ -507,21 +512,16 @@ pub(super) fn render_ffibuffer_async_complete_and_decode(
         out.push_str("            return;\n");
     } else if async_spec.suffix == "rust_buffer" {
         if let Some(ret_type) = return_type {
-            let decode_expr = match runtime_unwrapped_type(ret_type) {
-                Type::String => {
-                    lift_custom_if_needed("utf8.decode(resultBytes)", ret_type, custom_types)
-                }
-                Type::Bytes => lift_custom_if_needed("resultBytes", ret_type, custom_types),
-                Type::Record { name, .. } | Type::Enum { name, .. } => {
-                    format!("_uniffiDecode{}(resultBytes)", to_upper_camel(name))
-                }
-                _ => render_uniffi_binary_read_expression(
-                    ret_type,
-                    "resultReader",
-                    enums,
-                    custom_types,
-                ),
-            };
+            // Shares the sync path's helpers rather than restating them: this
+            // block used to be a copy, and copies of this logic are exactly how
+            // whole families of methods have silently diverged before.
+            let decode_expr = render_ffibuffer_return_decode_expr(
+                ret_type,
+                "resultBytes",
+                "resultReader",
+                enums,
+                custom_types,
+            );
             out.push_str(
                 "            final ffi.Pointer<_UniFfiRustBuffer> resultBufPtr = calloc<_UniFfiRustBuffer>();\n",
             );
@@ -532,10 +532,7 @@ pub(super) fn render_ffibuffer_async_complete_and_decode(
             out.push_str(
                 "            final Uint8List resultBytes = resultBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(resultBufPtr.ref.data.asTypedList(resultBufPtr.ref.len));\n",
             );
-            if matches!(
-                runtime_unwrapped_type(ret_type),
-                Type::String | Type::Bytes | Type::Record { .. } | Type::Enum { .. }
-            ) {
+            if decodes_from_whole_buffer(ret_type) {
                 out.push_str(&format!("            return {decode_expr};\n"));
             } else {
                 out.push_str(
@@ -746,14 +743,20 @@ pub(super) fn render_ffibuffer_outer_cleanup(out: &mut String) {
 /// buffer at once, as opposed to needing the incremental
 /// [`_UniFfiBinaryReader`].
 ///
-/// Strings and byte arrays *are* the payload, and records and enums get a
-/// generated whole-buffer `_uniffiDecode<Name>`. Everything else (sequences,
-/// optionals, maps) is length- or tag-prefixed, so it has to be read
-/// incrementally.
+/// A string *is* the payload (UniFFI writes raw UTF-8, with the RustBuffer's
+/// own length delimiting it), and records and enums get a generated
+/// whole-buffer `_uniffiDecode<Name>`. Everything else is length- or
+/// tag-prefixed and has to be read incrementally.
+///
+/// `Bytes` looks like it belongs here and does not: UniFFI's `FfiConverterData`
+/// writes an `i32` length *before* the bytes, so taking the whole buffer yields
+/// the payload with four junk bytes on the front. That is worse than a hard
+/// failure, because the call succeeds and returns corrupt data — it showed up
+/// as `hidden_states_for_tokens` reporting 1025 floats for a 1024-wide model.
 fn decodes_from_whole_buffer(ret_type: &Type) -> bool {
     matches!(
         runtime_unwrapped_type(ret_type),
-        Type::String | Type::Bytes | Type::Record { .. } | Type::Enum { .. }
+        Type::String | Type::Record { .. } | Type::Enum { .. }
     )
 }
 
@@ -765,18 +768,27 @@ fn decodes_from_whole_buffer(ret_type: &Type) -> bool {
 /// never taught to handle anything but records, enums, and maps, and every
 /// `String` / sequence / optional returning *method* silently generated a
 /// `throw UnsupportedError` for it.
+/// `bytes_var` / `reader_var` name the Dart locals the caller has in scope: the
+/// synchronous path uses `retBytes` / `retReader`, the rust-future path
+/// `resultBytes` / `resultReader`.
 pub(super) fn render_ffibuffer_return_decode_expr(
     ret_type: &Type,
+    bytes_var: &str,
+    reader_var: &str,
     enums: &[UdlEnum],
     custom_types: &HashMap<String, CustomTypeConfig>,
 ) -> String {
     match runtime_unwrapped_type(ret_type) {
-        Type::String => lift_custom_if_needed("utf8.decode(retBytes)", ret_type, custom_types),
-        Type::Bytes => lift_custom_if_needed("retBytes", ret_type, custom_types),
-        Type::Record { name, .. } | Type::Enum { name, .. } => {
-            format!("_uniffiDecode{}(retBytes)", to_upper_camel(name))
+        Type::String => {
+            lift_custom_if_needed(&format!("utf8.decode({bytes_var})"), ret_type, custom_types)
         }
-        _ => render_uniffi_binary_read_expression(ret_type, "retReader", enums, custom_types),
+        Type::Record { name, .. } | Type::Enum { name, .. } => {
+            format!("_uniffiDecode{}({bytes_var})", to_upper_camel(name))
+        }
+        // `Bytes` falls through here on purpose: the reader strips the `i32`
+        // length prefix that `FfiConverterData` writes. See
+        // `decodes_from_whole_buffer`.
+        _ => render_uniffi_binary_read_expression(ret_type, reader_var, enums, custom_types),
     }
 }
 
@@ -793,7 +805,8 @@ pub(super) fn render_ffibuffer_rustbuffer_return(
     enums: &[UdlEnum],
     custom_types: &HashMap<String, CustomTypeConfig>,
 ) {
-    let decode_expr = render_ffibuffer_return_decode_expr(ret_type, enums, custom_types);
+    let decode_expr =
+        render_ffibuffer_return_decode_expr(ret_type, "retBytes", "retReader", enums, custom_types);
     out.push_str(
         "      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();\n",
     );
@@ -908,16 +921,83 @@ mod tests {
 
     #[test]
     fn string_return_decodes_from_whole_buffer() {
-        let expr = render_ffibuffer_return_decode_expr(&Type::String, &[], &no_customs());
+        let expr = render_ffibuffer_return_decode_expr(
+            &Type::String,
+            "retBytes",
+            "retReader",
+            &[],
+            &no_customs(),
+        );
         assert_eq!(expr, "utf8.decode(retBytes)");
         assert!(decodes_from_whole_buffer(&Type::String));
     }
 
     #[test]
-    fn bytes_return_decodes_from_whole_buffer() {
-        let expr = render_ffibuffer_return_decode_expr(&Type::Bytes, &[], &no_customs());
-        assert_eq!(expr, "retBytes");
-        assert!(decodes_from_whole_buffer(&Type::Bytes));
+    fn bytes_return_strips_its_length_prefix() {
+        // NOT the whole buffer: UniFFI's `FfiConverterData` writes an `i32`
+        // length before the bytes, so taking everything hands back the payload
+        // with four junk bytes on the front. That shipped once and did not
+        // throw — `hidden_states_for_tokens` simply reported 1025 floats for a
+        // 1024-wide model.
+        let expr = render_ffibuffer_return_decode_expr(
+            &Type::Bytes,
+            "retBytes",
+            "retReader",
+            &[],
+            &no_customs(),
+        );
+        assert!(expr.contains("retReader.readI32()"), "got: {expr}");
+        assert!(expr.contains("retReader.readBytes("), "got: {expr}");
+        assert!(!decodes_from_whole_buffer(&Type::Bytes));
+    }
+
+    #[test]
+    fn bytes_arg_is_length_prefixed() {
+        // Mirror of the return side. Writing the bytes raw makes Rust read the
+        // first four bytes of the payload as a length and panic with
+        // RustCallStatus 2.
+        let mut out = String::new();
+        let arg = UdlArg {
+            name: "bytes".to_string(),
+            type_: Type::Bytes,
+            default: None,
+            docstring: None,
+        };
+        render_ffibuffer_rustbuffer_arg_serialization(
+            &mut out,
+            &arg,
+            0,
+            "unsupported",
+            "from_bytes",
+            &[],
+            &no_customs(),
+        );
+        assert!(out.contains("writeI32(bytes.length)"), "got: {out}");
+        assert!(out.contains("writeBytes(bytes)"), "got: {out}");
+    }
+
+    #[test]
+    fn string_arg_is_not_length_prefixed() {
+        // The counterpart that must NOT change: a UniFFI string *is* the raw
+        // UTF-8, delimited by the RustBuffer's own length.
+        let mut out = String::new();
+        let arg = UdlArg {
+            name: "text".to_string(),
+            type_: Type::String,
+            default: None,
+            docstring: None,
+        };
+        render_ffibuffer_rustbuffer_arg_serialization(
+            &mut out,
+            &arg,
+            0,
+            "unsupported",
+            "encode_text",
+            &[],
+            &no_customs(),
+        );
+        assert!(out.contains("utf8.encode(text)"), "got: {out}");
+        assert!(!out.contains("writeI32"), "got: {out}");
     }
 
     #[test]
@@ -925,7 +1005,8 @@ mod tests {
         let ty = Type::Sequence {
             inner_type: Box::new(Type::UInt32),
         };
-        let expr = render_ffibuffer_return_decode_expr(&ty, &[], &no_customs());
+        let expr =
+            render_ffibuffer_return_decode_expr(&ty, "retBytes", "retReader", &[], &no_customs());
         assert!(expr.contains("retReader.readI32()"), "{expr}");
         assert!(expr.contains("retReader.readU32()"), "{expr}");
         assert!(!decodes_from_whole_buffer(&ty));
@@ -936,7 +1017,8 @@ mod tests {
         let ty = Type::Optional {
             inner_type: Box::new(Type::String),
         };
-        let expr = render_ffibuffer_return_decode_expr(&ty, &[], &no_customs());
+        let expr =
+            render_ffibuffer_return_decode_expr(&ty, "retBytes", "retReader", &[], &no_customs());
         assert!(expr.contains("retReader.readI8()"), "{expr}");
         assert!(expr.contains("retReader.readString()"), "{expr}");
         // An Optional is tag-prefixed, so it must not take the
@@ -950,7 +1032,8 @@ mod tests {
             name: "GenerateOutput".into(),
             module_path: String::new(),
         };
-        let expr = render_ffibuffer_return_decode_expr(&ty, &[], &no_customs());
+        let expr =
+            render_ffibuffer_return_decode_expr(&ty, "retBytes", "retReader", &[], &no_customs());
         assert_eq!(expr, "_uniffiDecodeGenerateOutput(retBytes)");
         assert!(decodes_from_whole_buffer(&ty));
     }

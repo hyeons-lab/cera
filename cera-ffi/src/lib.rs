@@ -810,6 +810,39 @@ impl CeraEngine {
         Ok(Arc::new(Self { inner }))
     }
 
+    /// Load a model from GGUF bytes already in memory.
+    ///
+    /// For callers with no filesystem to point [`CeraEngine::from_path`]
+    /// at: a browser, an encrypted blob decrypted in memory, an asset
+    /// read out of an archive. It is the one constructor a WebAssembly
+    /// build can also offer, so code written against it ports across.
+    ///
+    /// **Not a streaming API.** GGUF is random-access: tensor data is
+    /// addressed by offset and read throughout inference, so the whole
+    /// file has to be resident before the first token. You can download
+    /// over a stream, but you must accumulate it all before calling
+    /// this. There is no partial-model inference.
+    ///
+    /// **Prefer [`CeraEngine::from_path`] whenever a path exists.** That
+    /// route memory-maps the file, so tensor pages stay owned by the
+    /// kernel: shared between processes and evictable under pressure.
+    /// These bytes are committed resident memory for as long as the
+    /// engine lives, which on a phone is the difference between a model
+    /// the OS can page out and one that counts against your footprint.
+    /// To load from the network on a platform that has a filesystem,
+    /// stream to disk and use `from_path` (which is what [`BundleRepo`]
+    /// does), rather than buffering the model here.
+    ///
+    /// Text-only: the bytes are a bare GGUF with no accompanying
+    /// manifest, so there is nothing to point at a vision encoder or an
+    /// audio decoder. Multimodal models need `from_path` or
+    /// [`CeraEngine::from_bundle_id`]. `config.bundle_repo` is ignored.
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: Vec<u8>, config: EngineConfig) -> Result<Arc<Self>, FfiError> {
+        let inner = cera::CeraEngine::from_bytes(bytes, config.try_into()?)?;
+        Ok(Arc::new(Self { inner }))
+    }
+
     /// Load a model by LeapBundles ID + quantization selector, e.g.
     /// `from_bundle_id("LFM2-1.2B-GGUF", "Q4_0", config)`. Resolves
     /// to the matching `<bundle_id>/<quant>.json` manifest under
