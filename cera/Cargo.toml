@@ -139,6 +139,13 @@ required-features = ["mmap", "parallel"]
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+
+# The `simd128` kernels in `backend/simd.rs` can only be executed on wasm, so
+# their oracle tests against the scalar reference need a wasm runner. Same
+# mechanism `cera-wasm` already uses for `tests/webgpu_smoke.rs`. Run them with
+# `just wasm-simd-test`; a plain `cargo test` cannot reach them.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }
 # Gated integration tests (`shift_real_model.rs`, `bundle_download.rs`)
 # that perform HTTP downloads are `#[cfg(feature = "remote")]`'d at the
 # test level — run them with `cargo test -p cera --features remote -- ...`.

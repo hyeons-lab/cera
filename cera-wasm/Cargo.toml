@@ -135,7 +135,15 @@ targets = ["wasm32-unknown-unknown"]
 #                                     on single-threaded builds (no
 #                                     atomic ops in the wasm body),
 #                                     so always-on is safe.
-# All six are universally supported in browsers + Node since
+#   - `--enable-simd`               — the `v128` ops emitted by the
+#                                     `wasm_simd` kernels in
+#                                     `cera/src/backend/simd.rs`.
+#                                     `.cargo/config.toml` turns
+#                                     `+simd128` on for this target, and
+#                                     without this flag wasm-opt rejects
+#                                     the result with the unhelpful
+#                                     "Fatal: error validating input".
+# All seven are universally supported in browsers + Node since
 # late-2020 builds; without them, wasm-opt refuses the wasm-bindgen
 # input as "non-MVP". Pin them here so local + CI builds stay in
 # sync.
@@ -148,4 +156,5 @@ wasm-opt = [
     '--enable-nontrapping-float-to-int',
     '--enable-reference-types',
     '--enable-threads',
+    '--enable-simd',
 ]

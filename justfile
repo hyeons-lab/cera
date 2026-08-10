@@ -624,6 +624,23 @@ wasm-node:
     @echo "--- cera-wasm/pkg-nodejs/ ---"
     @ls -lh cera-wasm/pkg-nodejs/
 
+# Run the `simd128` kernel oracle tests under Node.
+#
+# These cannot run under a plain `cargo test`: the host cannot execute a
+# wasm SIMD instruction, so a host-only suite would report green while
+# never touching `backend::simd::wasm_simd`. Each test pins a kernel
+# against the scalar reference in `crate::quant` — the same code wasm32
+# fell through to before these kernels existed, which is what makes
+# "matches scalar" the property worth asserting.
+#
+# `--lib` matters: without it the runner walks every integration test
+# binary in `cera/tests/`, none of which have wasm tests, and prints
+# "no tests to run!" 40 times.
+#
+# Requires: `wasm-pack`, node, and the `wasm32-unknown-unknown` target.
+wasm-simd-test:
+    wasm-pack test --node cera --lib -- wasm_simd
+
 # ── Multi-threaded wasm builds ──────────────────────────────────────────
 #
 # Threaded variants light up `cera`'s rayon paths (batched prefill
@@ -685,7 +702,12 @@ wasm-node:
 #                            (and, since the LLD in nightly-2026-07-10
 #                            stopped auto-exporting it, `failed to find
 #                            __heap_base for injecting thread id`).
-WASM_MT_RUSTFLAGS := "-C target-feature=+atomics,+bulk-memory,+mutable-globals" + \
+# `+simd128` is repeated here on purpose. `.cargo/config.toml` sets it for
+# wasm32-unknown-unknown, but `RUSTFLAGS` in the environment REPLACES the
+# config-file `rustflags` rather than appending to it — so omitting it here
+# would build the threaded variant against the scalar kernels and quietly lose
+# the SIMD speedup while everything still worked.
+WASM_MT_RUSTFLAGS := "-C target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128" + \
     " -C link-arg=--shared-memory" + \
     " -C link-arg=--import-memory" + \
     " -C link-arg=--max-memory=4294967296" + \
