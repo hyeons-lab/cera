@@ -29,7 +29,7 @@ Kotlin (`cera-ffi-kotlin`) and Swift bindings.
 | macOS    | 12.0 | `CeraFFI.xcframework` | Metal enabled; arm64 |
 | Linux    | — | `libcera_ffi.so` | downloaded + checksummed by CMake |
 | Windows  | — | `cera_ffi.dll` | downloaded + checksummed by CMake |
-| Web      | not supported | — | needs `dart:ffi`; see `cera-wasm` |
+| Web      | compiles, no inference | — | generated stub, every call throws; use `cera-wasm` |
 
 Apple targets are wired for both **Swift Package Manager** and CocoaPods;
 Flutter picks SPM when the project has it enabled and falls back to the podspec
@@ -217,24 +217,30 @@ The Apple manifests resolve `CeraFFI.xcframework` from a tagged release, so
 Apple targets need a published release (or a locally built xcframework) before
 they resolve.
 
-Web is not supported, and the failure is at **compile time**, not run time. The
-generated bindings import `dart:ffi` unconditionally, so an app that targets web
-and depends on this package fails to build:
+Web **compiles but does not run**, which is a deliberate distinction.
+
+An app that also targets the web can depend on this package and build. That is
+not automatic: `dart:ffi` does not exist on the web, and importing it anywhere on
+the graph fails the whole build rather than one branch of it. So `cera_ffi`
+exports its bindings conditionally, and the web branch is a *generated* stub with
+the same API and no FFI. It comes out of the same `just dart-bindings` run as the
+real bindings, from the same interface, and CI compiles a throwaway web app
+against it, so it cannot quietly fall behind.
+
+Data types are real there: `EngineConfig`, `GenerateOpts`, the error hierarchy
+and the enums all construct and compare normally, so shared code that builds a
+request stays platform-agnostic. Every engine entry point throws
+`UnsupportedError` naming itself:
 
 ```
-Error: Dart library 'dart:ffi' is not available on this platform.
-Info: The unavailable library 'dart:ffi' is imported through these packages:
-    main.dart => package:cera_ffi => dart:ffi
+CeraEngine.fromPath is not available on this platform: package `cera_ffi`
+needs dart:ffi, which the web does not provide.
 ```
 
-Only the *loader* is conditionally exported (`library_loader.dart`), so the
-`UnsupportedError` stub it provides is never reached: compilation stops first.
-Use `cera-wasm` in browsers.
-
-Making the package merely importable on web needs a stub mirroring the whole
-generated API surface, which is why it is not a one-line conditional export.
-Making it *work* on web needs a platform-interface package that both the FFI
-and wasm implementations satisfy; see "Web" in the repo root README.
+For inference in a browser, use `cera-wasm`. Making *this* package run there
+would need a platform-interface package that both the FFI and wasm
+implementations satisfy, plus an async-shaped API, since the wasm side cannot
+offer the synchronous calls this one does.
 
 ## License
 

@@ -28,5 +28,8 @@ without Flutter at all.
   `cera_ffi_flutter`; everyone else points `CERA_FFI_LIB` at a `cera-ffi` build.
   That build needs the `ffi-buffer` cargo feature, without which every call
   fails at `dlsym`.
-- The web is unsupported at compile time, not run time: the generated bindings
-  import `dart:ffi` unconditionally. Use `cera-wasm` in browsers.
+- The web compiles but runs nothing. The bindings are exported conditionally and
+  the web branch is a generated stub with the same API and no `dart:ffi`: data
+  types are real, engine entry points throw `UnsupportedError`. This exists so a
+  multi-platform app builds at all, since an unconditional `dart:ffi` import
+  fails the whole build rather than one branch. Use `cera-wasm` in browsers.

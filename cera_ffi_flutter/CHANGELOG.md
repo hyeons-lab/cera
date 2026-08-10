@@ -65,7 +65,7 @@ marked `publish_to: none` and was not a Flutter plugin.
 - Requires iOS 15.0+ / macOS 12.0+ / Android API 28+. An app left at Flutter's
   default deployment target fails with an SPM error that does not name the fix;
   see the README.
-- Flutter Web is not supported, and an app that targets web and depends on this
-  package fails to **compile**: the generated bindings import `dart:ffi`
-  unconditionally, so the `UnsupportedError` stub in the loader is never
-  reached. For browsers, use `cera-wasm`.
+- Flutter Web compiles but runs nothing. An app targeting web can depend on this
+  package: `cera_ffi` exports its bindings conditionally and the web branch is a
+  generated stub with the same API. Data types work there; every engine call
+  throws `UnsupportedError`. For inference in a browser, use `cera-wasm`.

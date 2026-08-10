@@ -12,6 +12,19 @@
 /// package alone means supplying that library yourself, via `CERA_FFI_LIB` or
 /// the loader path.
 ///
+/// ## Web
+///
+/// Importing this library in an app that also targets the web is safe: the
+/// bindings are exported conditionally, and a target without `dart:ffi` gets a
+/// generated stub with the same API whose every entry point throws
+/// [UnsupportedError]. Data types (records, enums, errors) are real there, so
+/// code that only builds a config or inspects a result still runs.
+///
+/// Inference itself does not work in a browser; use `cera-wasm` for that. The
+/// stub exists so a multi-platform app compiles at all, which it otherwise does
+/// not: `dart:ffi` is unavailable on web, and an unconditional import of it is
+/// a compile error for the whole build, not a runtime failure on one branch.
+///
 /// ## Regenerating the bindings
 ///
 /// The generated UniFFI bindings are committed under
@@ -37,4 +50,15 @@
 library;
 
 export 'src/library_loader.dart';
-export 'src/generated/cera_ffi.dart';
+
+// The stub is the DEFAULT and the real bindings are the conditional branch,
+// which is the way round a conditional export has to be written: the first URI
+// is used when no condition holds. `dart.library.ffi` rather than
+// `dart.library.io`, because FFI availability is exactly what differs.
+//
+// Both files are generated from the same interface by `just dart-bindings`, and
+// the generator has tests asserting their public surfaces match member for
+// member; a name in one and not the other is a compile error on whichever
+// platform is built second.
+export 'src/generated/cera_ffi_web.dart'
+    if (dart.library.ffi) 'src/generated/cera_ffi.dart';

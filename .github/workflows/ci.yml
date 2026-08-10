@@ -848,6 +848,62 @@ jobs:
       - name: Test
         run: cd cera_ffi && dart test
 
+      - name: Web build (the generated stub compiles for a browser)
+        # The one check that cannot be done from the VM. `cera_ffi` exports the
+        # bindings conditionally, and the web branch is a GENERATED stub with the
+        # same API and no dart:ffi. Its whole job is to let an app that also
+        # targets web compile at all, and the only proof of that is compiling one.
+        #
+        # A dart:ffi import anywhere on the graph fails the entire build, so this
+        # catches the stub falling behind the bindings — a member added to one and
+        # not the other — which no VM test can see. `dart test` covers the other
+        # half, that the stub's entry points throw.
+        #
+        # Built here rather than in its own job to reuse this one's Flutter
+        # install: a separate runner would cost more than the step does.
+        #
+        # It depends on `cera_ffi_flutter`, not `cera_ffi`, because that is what
+        # an app depends on, and the re-export is part of what has to compile.
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          flutter create --platforms web -t app "$WORK/probe" >/dev/null
+          cd "$WORK/probe"
+          # Overrides first: `pub add` resolves immediately, and the plugin's pin
+          # on `cera_ffi` is a version that need not exist on pub.dev yet.
+          cat > pubspec_overrides.yaml <<EOF
+          dependency_overrides:
+            cera_ffi:
+              path: ${GITHUB_WORKSPACE}/cera_ffi
+          EOF
+          flutter pub add cera_ffi_flutter --path "${GITHUB_WORKSPACE}/cera_ffi_flutter" >/dev/null
+          cat > lib/main.dart <<'EOF'
+          import 'package:flutter/material.dart';
+          import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+
+          // Touches a data type, a top-level function, an object constructor and
+          // the loader. Referencing them is the point: dart2js only reports a
+          // missing name if something names it.
+          void main() {
+            const config = EngineConfig(
+              contextSize: 2048,
+              backend: BackendPreference.cpu,
+              bundleRepo: null,
+            );
+            debugPrint('${config.contextSize} ${CeraLibrary.pathEnvVar}');
+            try {
+              debugPrint(ceraFfiVersion());
+              CeraEngine.fromPath('model.gguf', config);
+            } on UnsupportedError catch (e) {
+              debugPrint('expected on web: ${e.message}');
+            }
+            runApp(const MaterialApp(home: Scaffold(body: Text('ok'))));
+          }
+          EOF
+          flutter build web
+          test -f build/web/main.dart.js
+          echo "web build OK: the stub carries the full API surface"
+
       - name: Generator unit tests
         run: cargo test --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml
 

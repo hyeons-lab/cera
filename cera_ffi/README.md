@@ -62,16 +62,25 @@ text. For streaming and the async variants that keep the isolate responsive, see
 
 Everything `dart:ffi` supports: Android, iOS, macOS, Linux, Windows.
 
-Not the web. The generated bindings import `dart:ffi` unconditionally, so an app
-targeting web that depends on this package fails to *compile* rather than
-failing at run time. Use `cera-wasm` in browsers.
+The web compiles but runs nothing. `dart:ffi` does not exist there, and importing
+it anywhere on the graph fails the entire build rather than one branch, so the
+bindings are exported conditionally and the web branch is a **generated stub**
+with the same API. It is produced by the same `just dart-bindings` run, from the
+same interface, and CI compiles a web app against it, so it cannot drift.
+
+Data types are real on the web: `EngineConfig`, `GenerateOpts`, the error
+hierarchy and the enums construct and compare normally, so code that only builds
+a request stays platform-agnostic. Engine entry points throw `UnsupportedError`
+naming themselves. Use `cera-wasm` for inference in a browser.
 
 ## Bindings
 
 `lib/src/generated/cera_ffi.dart` is generated from the compiled `cera-ffi`
 cdylib by a vendored `uniffi-bindgen-dart`, then run through a deterministic
-patch tool. It is committed, so the package works out of the box. Regenerate
-from the repo root after any change to the Rust FFI surface:
+patch tool. The same run emits `lib/src/generated/cera_ffi_web.dart`, the
+no-FFI stub `lib/cera_ffi.dart` falls back to on the web. Both are committed, so
+the package works out of the box. Regenerate from the repo root after any change
+to the Rust FFI surface:
 
 ```sh
 just dart-bindings         # regenerate + patch
@@ -80,6 +89,8 @@ just dart-bindings-check   # verify nothing drifted, then analyze
 
 Drift is not cosmetic: UniFFI checksums every method at construction, so
 bindings that lag the Rust side make the engine throw before the first call.
+The stub can drift too, in its own way, so the generator has tests asserting the
+two files expose the same members and CI compiles a web app against the stub.
 
 ## License
 

@@ -23,6 +23,7 @@ mod render_objects;
 mod render_stubs;
 mod type_map;
 mod types;
+mod web_stub;
 use async_support::*;
 use callback::*;
 use codec::*;
@@ -36,6 +37,7 @@ use render_objects::*;
 use render_stubs::*;
 use type_map::*;
 use types::*;
+use web_stub::*;
 
 pub fn generate_bindings(args: &GenerateArgs) -> Result<()> {
     let cfg = config::load(args)?;
@@ -85,6 +87,20 @@ pub fn generate_bindings(args: &GenerateArgs) -> Result<()> {
         format!(
             "failed to write generated dart bindings: {}",
             output_file.display()
+        )
+    })?;
+
+    // The web stub, alongside the bindings rather than in place of them. A
+    // package exports one or the other with `if (dart.library.ffi)`, which is
+    // what lets it be imported by an app that also targets the web: without a
+    // branch supplying every name, such an app fails to compile outright, since
+    // the bindings import `dart:ffi` unconditionally.
+    let web_stub_file = args.out_dir.join(format!("{namespace}_web.dart"));
+    let web_stub = render_web_stub(&ctx);
+    fs::write(&web_stub_file, web_stub).with_context(|| {
+        format!(
+            "failed to write generated dart web stub: {}",
+            web_stub_file.display()
         )
     })?;
 
@@ -541,6 +557,7 @@ fn render_dart_scaffold(ctx: &RenderContext<'_>) -> String {
         callback_interfaces,
         has_runtime_unsupported,
         custom_types,
+        MethodDispatch::Bindings,
     ));
     if needs_binary_helpers {
         out.push_str(&render_uniffi_binary_helpers(records, enums, custom_types));
@@ -1898,7 +1915,14 @@ interface Outcome {
             trait_methods: UdlObjectTraitMethods::default(),
         }];
 
-        let content = render_data_models(&[], &enums, &[], false, &HashMap::new());
+        let content = render_data_models(
+            &[],
+            &enums,
+            &[],
+            false,
+            &HashMap::new(),
+            MethodDispatch::Bindings,
+        );
         assert!(
             content.contains("low(1),"),
             "expected low(1), got:\n{content}"
@@ -1948,7 +1972,14 @@ interface Outcome {
             trait_methods: UdlObjectTraitMethods::default(),
         }];
 
-        let content = render_data_models(&[], &enums, &[], false, &HashMap::new());
+        let content = render_data_models(
+            &[],
+            &enums,
+            &[],
+            false,
+            &HashMap::new(),
+            MethodDispatch::Bindings,
+        );
         assert!(
             content.contains("  red,\n"),
             "expected plain variant, got:\n{content}"
