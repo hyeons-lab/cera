@@ -22,4 +22,9 @@ build/
 # never committed: the zip is ~91 MB and it is a versioned release asset.
 /ios/CeraFFI.xcframework/
 /macos/CeraFFI.xcframework/
+# Same artifact, at the location the SPM manifests probe for a local override
+# (`just apple-xcframework` + copy). Ignored so a local build can never leak
+# into a commit or a published pub archive.
+/ios/cera_ffi_flutter/CeraFFI.xcframework/
+/macos/cera_ffi_flutter/CeraFFI.xcframework/
 .cera-xcframework-sha256

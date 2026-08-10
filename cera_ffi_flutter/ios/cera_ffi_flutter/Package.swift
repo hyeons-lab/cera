@@ -19,7 +19,37 @@
 // v<version> tag, exactly as it already does for the root Package.swift. `main`
 // keeps the placeholders; a published package carries real values. Do NOT
 // hand-edit these two literals.
+//
+// ── Local override ────────────────────────────────────────────────────────────
+// A locally-built XCFramework next to this manifest always wins, mirroring the
+// podspec's `prepare_command`. Without it there is no way to test an unreleased
+// engine build on iOS through SPM, because a `.binaryTarget(url:checksum:)`
+// pointing at placeholders cannot resolve. Populate it with:
+//
+//     just apple-xcframework
+//     cp -R target/xcframework-build/CeraFFI.xcframework \
+//           cera_ffi_flutter/ios/cera_ffi_flutter/
+//
+// It is gitignored and excluded from the published package, so it can only ever
+// be something the developer put there deliberately.
+import Foundation
 import PackageDescription
+
+let localXCFramework = "CeraFFI.xcframework"
+let hasLocalXCFramework = FileManager.default.fileExists(
+    atPath: URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .appendingPathComponent(localXCFramework)
+        .path
+)
+
+let ceraBinaryTarget: Target = hasLocalXCFramework
+    ? .binaryTarget(name: "CeraFFI", path: localXCFramework)
+    : .binaryTarget(
+        name: "CeraFFI",
+        url: "https://github.com/hyeons-lab/cera/releases/download/vRELEASE_VERSION/CeraFFI.xcframework.zip",
+        checksum: "RELEASE_CHECKSUM"
+    )
 
 let package = Package(
     name: "cera_ffi_flutter",
@@ -36,11 +66,7 @@ let package = Package(
         .package(name: "FlutterFramework", path: "../FlutterFramework"),
     ],
     targets: [
-        .binaryTarget(
-            name: "CeraFFI",
-            url: "https://github.com/hyeons-lab/cera/releases/download/vRELEASE_VERSION/CeraFFI.xcframework.zip",
-            checksum: "RELEASE_CHECKSUM"
-        ),
+        ceraBinaryTarget,
         // A Swift target that exists only to carry the binary dependency into
         // the app. Flutter requires a plugin's SPM package to expose a target
         // named after the plugin; SPM in turn requires that target to have at
