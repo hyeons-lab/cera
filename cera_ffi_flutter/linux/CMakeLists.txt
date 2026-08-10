@@ -17,22 +17,48 @@ set(CERA_VERSION "0.4.0")
 set(CERA_LIB_LABEL "linux-x86-64")
 set(CERA_LIB_FILE "libcera_ffi.so")
 
-# x86_64 only: that is the single Linux target the release pipeline builds.
-# Fail loudly rather than downloading an archive for the wrong architecture.
-if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-  message(FATAL_ERROR
-    "cera_ffi_flutter: no prebuilt cera-ffi library for ${CMAKE_SYSTEM_PROCESSOR}. "
-    "Only x86_64 Linux is published. Build cera-ffi from source and place "
-    "${CERA_LIB_FILE} in this directory, or set CERA_FFI_LIB at runtime.")
-endif()
-
 set(CERA_ARCHIVE "cera-ffi-${CERA_LIB_LABEL}-v${CERA_VERSION}.tar.gz")
 set(CERA_URL
   "https://github.com/hyeons-lab/cera/releases/download/v${CERA_VERSION}/${CERA_ARCHIVE}")
 set(CERA_DOWNLOAD_DIR "${CMAKE_CURRENT_BINARY_DIR}/cera-ffi")
 set(CERA_LIB_PATH "${CERA_DOWNLOAD_DIR}/${CERA_LIB_FILE}")
 
-if(NOT EXISTS "${CERA_LIB_PATH}")
+
+# ── Local override ────────────────────────────────────────────────────────────
+# A library sitting next to this CMakeLists always wins, mirroring the Apple
+# podspec and SPM manifest. Two reasons it has to exist:
+#
+#  1. The download below targets a *published* release asset, so before the
+#     first release that carries one there is nothing to fetch and the platform
+#     cannot be built or tested at all.
+#  2. It is the only way to try an unreleased engine build here.
+#
+# Populate it with:
+#     cargo build -p cera-ffi --release --features ffi-buffer
+#     cp target/release/libcera_ffi.so cera_ffi_flutter/linux/
+#
+# The `ffi-buffer` feature is not optional: without it the library loads and
+# every Dart call then fails at `dlsym`. Gitignored, so it can only ever be
+# something you put there deliberately.
+set(CERA_LOCAL_LIB "${CMAKE_CURRENT_SOURCE_DIR}/libcera_ffi.so")
+
+if(EXISTS "${CERA_LOCAL_LIB}")
+  message(STATUS "cera_ffi_flutter: using locally-supplied ${CERA_LOCAL_LIB} (not verified)")
+  set(CERA_LIB_PATH "${CERA_LOCAL_LIB}")
+elseif(NOT EXISTS "${CERA_LIB_PATH}")
+  # x86_64 only, and checked HERE rather than at the top of the file: it is a
+  # constraint on what the release pipeline publishes, not on what the plugin
+  # can use. Guarding earlier would reject a developer who supplied their own
+  # arm64 library via the override above, which is exactly the case where the
+  # message is least helpful.
+  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    message(FATAL_ERROR
+      "cera_ffi_flutter: no prebuilt cera-ffi library for ${CMAKE_SYSTEM_PROCESSOR}. "
+      "Only x86_64 Linux is published. Build cera-ffi from source and place "
+      "${CERA_LIB_FILE} in ${CMAKE_CURRENT_SOURCE_DIR}, or set CERA_FFI_LIB "
+      "at runtime.")
+  endif()
+
   file(MAKE_DIRECTORY "${CERA_DOWNLOAD_DIR}")
 
   # Fetch the checksum first so the archive can be verified as it downloads;

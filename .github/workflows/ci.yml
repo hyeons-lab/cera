@@ -855,6 +855,74 @@ jobs:
       - name: Generator unit tests
         run: cargo test --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml
 
+  flutter-desktop-build:
+    # Builds the Flutter example app for the desktop platforms, which is the
+    # only way their plugin wiring gets exercised at all: Linux and Windows go
+    # through CMakeLists that Flutter's own build drives, and nothing else in
+    # CI runs them.
+    #
+    # It uses the plugin's local-library override rather than the release
+    # download on purpose. Two reasons: a PR must not depend on a published
+    # release existing, and this way the job tests the CMake wiring against the
+    # library built from *this* commit instead of whatever last shipped.
+    #
+    # The library is built with `--features ffi-buffer` and then asserted,
+    # because omitting it produces a plugin that builds and bundles perfectly
+    # and fails at the first Dart call. That shipped to every platform once.
+    name: Flutter Desktop Build
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  platform: linux,   lib: libcera_ffi.so, dest: cera_ffi_flutter/linux }
+          - { os: windows-latest, platform: windows, lib: cera_ffi.dll,   dest: cera_ffi_flutter/windows }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+      - uses: Swatinem/rust-cache@v2
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Linux desktop build deps
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+
+      - name: Build cera-ffi and stage it as the plugin's local library
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p cera-ffi --release --features ffi-buffer
+          cp "target/release/${{ matrix.lib }}" "${{ matrix.dest }}/${{ matrix.lib }}"
+          scripts/assert-ffibuffer.sh "${{ matrix.dest }}/${{ matrix.lib }}"
+
+      - name: Build the example app
+        shell: bash
+        run: cd cera_ffi_flutter/example && flutter pub get && flutter build ${{ matrix.platform }} --debug
+
+      - name: Assert the library was bundled with the app
+        # Flutter copies whatever the plugin lists in
+        # `<plugin>_bundled_libraries` next to the executable; that placement is
+        # what makes the bare-name `DynamicLibrary.open` in library_loader_io
+        # resolve at runtime. If the CMake contract breaks, the app still builds
+        # and only fails when a user runs it.
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=$(find cera_ffi_flutter/example/build -name "${{ matrix.lib }}" | head -1)
+          if [ -z "$found" ]; then
+            echo "::error::${{ matrix.lib }} was not bundled with the built app"
+            exit 1
+          fi
+          echo "bundled at: $found"
+          scripts/assert-ffibuffer.sh "$found"
+
   android-abis:
     # Cross-compiles `cera-ffi` to every Android ABI supported by the
     # Android NDK (arm64-v8a, armeabi-v7a, x86_64, x86). Verifies each
