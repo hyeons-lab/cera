@@ -16,18 +16,33 @@ locally built cdylib.
 
 ## Supported platforms
 
-| Platform | Native library ships as | Notes |
-|----------|------------------------|-------|
-| Android  | `cera-ffi-android` AAR (Maven Central) | arm64-v8a, armeabi-v7a, x86_64 |
-| iOS      | `CeraFFI.xcframework` | Metal enabled; device + simulator |
-| macOS    | `CeraFFI.xcframework` | Metal enabled; arm64 |
-| Linux    | `libcera_ffi.so` | downloaded + checksummed by CMake |
-| Windows  | `cera_ffi.dll` | downloaded + checksummed by CMake |
-| Web      | not supported | needs `dart:ffi`; see `cera-wasm` |
+| Platform | Minimum | Native library ships as | Notes |
+|----------|---------|------------------------|-------|
+| Android  | API 24 | `cera-ffi-android` AAR (Maven Central) | arm64-v8a, armeabi-v7a, x86_64 |
+| iOS      | 15.0 | `CeraFFI.xcframework` | Metal enabled; device + simulator |
+| macOS    | 12.0 | `CeraFFI.xcframework` | Metal enabled; arm64 |
+| Linux    | — | `libcera_ffi.so` | downloaded + checksummed by CMake |
+| Windows  | — | `cera_ffi.dll` | downloaded + checksummed by CMake |
+| Web      | not supported | — | needs `dart:ffi`; see `cera-wasm` |
 
 Apple targets are wired for both **Swift Package Manager** and CocoaPods;
 Flutter picks SPM when the project has it enabled and falls back to the podspec
 otherwise.
+
+> **Set your app's deployment target to iOS 15.0 / macOS 12.0.** Flutter's own
+> default is lower (iOS 13.0, macOS 10.15), and an app left at the default fails
+> with an SPM error that does not say what to do:
+>
+> ```
+> error: The package product 'cera-ffi-flutter' requires minimum platform
+> version 15.0 for the iOS platform, but this target supports 13.0
+> ```
+>
+> Raise `IPHONEOS_DEPLOYMENT_TARGET` / `MACOSX_DEPLOYMENT_TARGET` in Xcode (or
+> the `platform :ios, '15.0'` line in your Podfile) and the error goes away.
+> Flutter propagates the app's deployment target into the plugin package it
+> generates, so this is the only knob you need. The floor is not arbitrary: the
+> prebuilt slices are compiled with `minos` 15.0 / 12.0.
 
 ## Quick start
 
