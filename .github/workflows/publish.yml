@@ -403,7 +403,11 @@ jobs:
       - name: Build desktop cdylib
         shell: bash
         run: |
-          cargo build -p cera-ffi --release --target ${{ matrix.target }}
+          # `--features ffi-buffer`: this cdylib is both the JVM bindings'
+          # JNA resource and the Flutter plugin's Linux/Windows/macOS
+          # download. Dart calls only the trampolines it enables.
+          cargo build -p cera-ffi --release --target ${{ matrix.target }} --features ffi-buffer
+          scripts/assert-ffibuffer.sh "target/${{ matrix.target }}/release/${{ matrix.lib }}"
           mkdir -p "${{ matrix.dest }}"
           cp "target/${{ matrix.target }}/release/${{ matrix.lib }}" "${{ matrix.dest }}/${{ matrix.lib }}"
           # Marker at the module root so upload-artifact's lowest-common-ancestor
@@ -427,9 +431,14 @@ jobs:
         run: |
           rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
           cargo install cargo-ndk --version '^4' --locked
+          # `--features ffi-buffer` is required even though Kotlin never calls
+          # the trampolines: the same AAR backs the Flutter plugin, and its
+          # Dart bindings call nothing else.
           cargo ndk -o cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs \
             --target arm64-v8a --target armeabi-v7a --target x86_64 --target x86 \
-            build -p cera-ffi --release
+            build -p cera-ffi --release --features ffi-buffer
+          scripts/assert-ffibuffer.sh \
+            cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs/*/libcera_ffi.so
 
       - name: Upload staged native libs
         uses: actions/upload-artifact@v7
@@ -575,39 +584,14 @@ jobs:
             echo "::error::expected arm64 host for arm64-only xcframework, got '$ARCH'" >&2
             exit 1
           fi
+      - uses: extractions/setup-just@v3
       - name: Build CeraFFI.xcframework
-        # Mirrors `just apple-xcframework` (Metal-enabled — `--features
-        # metal`). Inlined because the runner has no `just`.
-        #
-        # Deployment-target env pins the slices to Package.swift's
-        # `.macOS(.v12)` / `.iOS(.v15)` so a newer runner SDK doesn't
-        # stamp a higher `minos` (which warns at consumer link time).
-        env:
-          MACOSX_DEPLOYMENT_TARGET: "12.0"
-          IPHONEOS_DEPLOYMENT_TARGET: "15.0"
-        run: |
-          set -euo pipefail
-          # RUSTFLAGS="" clears .cargo/config.toml's `target-cpu=native` for the
-          # aarch64-apple-darwin slice — otherwise the runner's specific
-          # microarch (M2/M3/M4) leaks into the shipped staticlib and SIGILLs on
-          # older Apple Silicon (M1). Matches the `just apple-xcframework` guard.
-          #
-          # `--features metal` ships the Metal GPU backend in every slice
-          # (Auto probes Metal → CPU). Consumers link Metal.framework +
-          # Foundation via Package.swift `linkerSettings`.
-          RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release --features metal
-          RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios-sim --release --features metal
-          RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release --features metal
-          OUT=target/xcframework-build
-          rm -rf "$OUT"
-          mkdir -p "$OUT/headers"
-          cp cera-ffi/bindings/swift/cera_ffiFFI.h "$OUT/headers/"
-          cp cera-ffi/bindings/swift/cera_ffiFFI.modulemap "$OUT/headers/module.modulemap"
-          xcodebuild -create-xcframework \
-              -library target/aarch64-apple-ios/release/libcera_ffi.a -headers "$OUT/headers" \
-              -library target/aarch64-apple-ios-sim/release/libcera_ffi.a -headers "$OUT/headers" \
-              -library target/aarch64-apple-darwin/release/libcera_ffi.a -headers "$OUT/headers" \
-              -output "$OUT/CeraFFI.xcframework"
+        # Calls the recipe rather than restating it. This step used to inline a
+        # copy "mirroring" `just apple-xcframework`, and the copy silently went
+        # stale: the recipe moved to DYNAMIC frameworks and added the
+        # `ffi-buffer` feature, while CI kept building static `-library` slices
+        # without it. A release cut from here would have undone both.
+        run: just apple-xcframework
       - name: Zip + compute-checksum
         id: zip
         run: |

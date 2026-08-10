@@ -235,7 +235,7 @@ android-all:
 # and you don't need to rebuild all four every cycle. Picks arm64-v8a
 # as the default since it's what real Android phones ship with today.
 android-arm64:
-    cargo ndk --target arm64-v8a build -p cera-ffi --release
+    cargo ndk --target arm64-v8a build -p cera-ffi --release --features ffi-buffer
 
 # Stage the cera-ffi cdylib for the HOST desktop platform into the
 # `cera-ffi-jvm` module's JNA resource layout, for local
@@ -247,7 +247,9 @@ android-arm64:
 jvm-libs-host:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build -p cera-ffi --release
+    # `ffi-buffer` for the same reason as android-libs: one cdylib serves the
+    # JVM bindings and the Flutter plugin's desktop targets.
+    cargo build -p cera-ffi --release --features ffi-buffer
     case "$(uname -s)-$(uname -m)" in
       Darwin-arm64)  prefix=darwin-aarch64; lib=libcera_ffi.dylib ;;
       Darwin-x86_64) prefix=darwin-x86-64;  lib=libcera_ffi.dylib ;;
@@ -263,10 +265,16 @@ jvm-libs-host:
 # the `cera-ffi-android` module's jniLibs (cargo-ndk's `-o` writes the
 # `<abi>/libcera_ffi.so` layout). Requires the same cargo-ndk + NDK setup as
 # `android-all`.
+#
+# `ffi-buffer` is not optional here even though Kotlin never uses it: the same
+# AAR backs the Flutter plugin, whose Dart bindings call `uniffi_ffibuffer_*`.
+# See scripts/assert-ffibuffer.sh.
 android-libs:
     cargo ndk -o cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs \
         --target arm64-v8a --target armeabi-v7a --target x86_64 --target x86 \
-        build -p cera-ffi --release
+        build -p cera-ffi --release --features ffi-buffer
+    scripts/assert-ffibuffer.sh \
+        cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs/*/libcera_ffi.so
 
 # Cross-compile `cera-ffi` to all three arm64-only Apple-platform
 # targets and assemble a `CeraFFI.xcframework` ready for Swift

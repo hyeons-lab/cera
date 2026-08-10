@@ -18,7 +18,7 @@ locally built cdylib.
 
 | Platform | Minimum | Native library ships as | Notes |
 |----------|---------|------------------------|-------|
-| Android  | API 24 | `cera-ffi-android` AAR (Maven Central) | arm64-v8a, armeabi-v7a, x86_64 |
+| Android  | API 28 | `cera-ffi-android` AAR (Maven Central) | arm64-v8a, armeabi-v7a, x86_64 |
 | iOS      | 15.0 | `CeraFFI.xcframework` | Metal enabled; device + simulator |
 | macOS    | 12.0 | `CeraFFI.xcframework` | Metal enabled; arm64 |
 | Linux    | — | `libcera_ffi.so` | downloaded + checksummed by CMake |

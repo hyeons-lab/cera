@@ -39,13 +39,25 @@ apply plugin: 'com.android.library'
 
 android {
     namespace = 'com.hyeonslab.cera.ffi.flutter'
-    compileSdk = 35
+    // Must be >= the compileSdk of any app consuming the plugin, and current
+    // Flutter defaults apps to 36. A lower value here fails the consumer's
+    // build with "is currently compiled against android-35 ... update to at
+    // least 36". Raising compileSdk only widens the APIs available at compile
+    // time; minSdk and targetSdk are unaffected.
+    compileSdk = 36
 
     defaultConfig {
-        // Matches the floor the Rust cdylib is built against in
-        // `cera-ffi-kotlin`. Raising it here without raising it there would
-        // let an app install on a device the .so cannot load on.
-        minSdk = 24
+        // Must match `minSdk` in cera-ffi-kotlin/gradle/libs.versions.toml,
+        // which is what the `cera-ffi-android` AAR is published with. This
+        // said 24 while the AAR declared 28, and the manifest merger rejects
+        // that outright:
+        //
+        //   uses-sdk:minSdkVersion 24 cannot be smaller than version 28
+        //   declared in library [com.hyeons-lab:cera-ffi-android]
+        //
+        // so every consuming app failed to build. Lowering it here is not a
+        // fix; the .so genuinely targets 28.
+        minSdk = 28
     }
 
     compileOptions {

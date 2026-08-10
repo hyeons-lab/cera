@@ -19,7 +19,11 @@ android {
         applicationId = "com.hyeonslab.cera.cera_ffi_flutter_example"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // 28, not `flutter.minSdkVersion`: the cera-ffi-android AAR the plugin
+        // pulls in is published with minSdk 28, and the manifest merger fails
+        // the build if the app declares anything lower. Any app using this
+        // plugin needs the same floor.
+        minSdk = 28
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
