@@ -11,8 +11,17 @@
 class CeraLibrary {
   CeraLibrary._();
 
-  /// Base name of the cdylib, without platform prefix/suffix.
+  /// Base name of the native library, without platform prefix/suffix.
   static const String baseName = 'cera_ffi';
+
+  /// Environment variable holding an explicit path to the library.
+  ///
+  /// Meaningless on web (there is no filesystem and no FFI), but declared so
+  /// this stub keeps the same public surface as the `dart:io` implementation.
+  /// The conditional export in `library_loader.dart` means static analysis
+  /// resolves against THIS class by default, so anything missing here is a
+  /// compile error for callers even though the VM runs the other variant.
+  static const String pathEnvVar = 'CERA_FFI_LIB';
 
   /// Always throws on web — `cera-ffi` requires `dart:ffi`.
   static Never open({String? path}) => throw UnsupportedError(
