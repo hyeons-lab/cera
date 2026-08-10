@@ -63,6 +63,10 @@ on:
         description: 'Swift Package Manager (CeraFFI.xcframework — rewrites Package.swift + retags on real runs)'
         type: boolean
         default: true
+      web:
+        description: 'Web runtime for the Flutter plugin (cera-wasm --target web --features wgpu, attached to the release)'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -610,10 +614,89 @@ jobs:
           path: target/xcframework-build/CeraFFI.xcframework.zip
           if-no-files-found: error
 
+  # ── Web runtime (Flutter plugin's browser backend) ─────────────────────────
+  build-web-assets:
+    # The two files `dart run cera_ffi:install_web` fetches. They are the web's
+    # equivalent of the per-platform native libraries every other target
+    # downloads: a build output, so never committed and never in the pub
+    # archive, which leaves a release asset as the only place for them.
+    #
+    # Built with `--features wgpu` and NOT with the npm leg's `bundler` target.
+    # Both differences matter. `--target web` is the shape a plain
+    # `import('./cera_wasm.js')` can load, which is what the worker does; the
+    # bundler target expects a bundler to resolve its wasm import and fails in a
+    # bare browser. And the `wgpu` feature is what carries `WebGpuSession`,
+    # without which the browser falls back to the wasm CPU path at ~1/40th the
+    # throughput, silently, since the fallback is by design.
+    #
+    # One artifact serves both backends: cargo features are additive, so this
+    # build has the CPU `CeraEngine` too, and the worker picks at runtime.
+    name: Build web runtime
+    needs: version
+    if: ${{ github.event.inputs.web == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: 'v0.14.0'
+
+      - name: Install binaryen (provides wasm-opt)
+        run: |
+          # Same packages.microsoft.com workaround as the npm leg; see there.
+          while IFS= read -r f; do
+            sudo rm -f -- "$f"
+          done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
+          sudo apt-get update && sudo apt-get install -y binaryen
+
+      - name: Build cera-wasm (web target, wgpu)
+        run: just wasm-web-wgpu
+
+      - name: Stage release assets
+        # Renamed on the way out and renamed back by `install_web`. The local
+        # names are not free choices (wasm-bindgen's loader resolves its
+        # sibling as `new URL('cera_wasm_bg.wasm', import.meta.url)`), but a
+        # release's asset namespace is flat and shared with every other target,
+        # so `cera_wasm.js` is too generic to claim there.
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          src=cera-wasm/examples/webgpu/pkg
+          cp "$src/cera_wasm.js"     release-assets/cera-wasm-web.js
+          cp "$src/cera_wasm_bg.wasm" release-assets/cera-wasm-web_bg.wasm
+          ls -lh release-assets/
+
+      - name: Verify the wgpu feature is actually in the build
+        # A `--features wgpu` that silently did not apply produces a working
+        # artifact that is 40x slower, and nothing downstream would report it:
+        # the worker treats a missing `WebGpuSession` as "no GPU here" and falls
+        # back, which is exactly what it should do when the browser has no
+        # WebGPU. The export's presence is the only thing separating those two.
+        run: |
+          set -euo pipefail
+          grep -q 'WebGpuSession' cera-wasm/examples/webgpu/pkg/cera_wasm.js
+          grep -q 'generateTokens' cera-wasm/examples/webgpu/pkg/cera_wasm.js
+          echo "✓ WebGpuSession + generateTokens exported"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: web-assets
+          path: release-assets/
+          if-no-files-found: error
+
   # ── Tag + GitHub release (the canonical release event) ─────────────────────
   release:
     name: Tag & GitHub Release
-    needs: [version, publish-crates, build-cli, publish-npm, jvm-native-libs, publish-jvm, build-spm]
+    needs: [version, publish-crates, build-cli, publish-npm, jvm-native-libs, publish-jvm, build-spm, build-web-assets]
     # Real runs only, and only once every enabled leg succeeded. Disabled legs
     # are `skipped` (not `failure`), so they don't block the tag; any actual
     # failure does. `jvm-native-libs` is gated too: if it fails, `publish-jvm`
@@ -631,11 +714,13 @@ jobs:
           && needs.jvm-native-libs.result != 'failure'
           && needs.publish-jvm.result != 'failure'
           && needs.build-spm.result != 'failure'
+          && needs.build-web-assets.result != 'failure'
           && (github.event.inputs.crates == 'true'
               || github.event.inputs.cli == 'true'
               || github.event.inputs.npm == 'true'
               || github.event.inputs.jvm == 'true'
-              || github.event.inputs.spm == 'true') }}
+              || github.event.inputs.spm == 'true'
+              || github.event.inputs.web == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Least privilege: only this job creates the tag / release.
@@ -681,6 +766,17 @@ jobs:
         with:
           pattern: desktop-lib-*
           merge-multiple: true
+          path: release-assets
+
+      # Web runtime to attach, present only when the `web` leg ran. This is
+      # what `dart run cera_ffi:install_web` downloads; without it the Flutter
+      # plugin's web backend has no runtime to install and the tool tells the
+      # user to build it locally instead.
+      - name: Download web runtime
+        if: ${{ needs.build-web-assets.result == 'success' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: web-assets
           path: release-assets
 
       # SPM XCFramework zip to attach — present only when the `spm` leg ran.

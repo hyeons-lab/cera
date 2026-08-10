@@ -2268,6 +2268,18 @@ final class CeraEngine {
   /// [`CeraEngine::from_bundle_id`]. `config.bundle_repo` is ignored.
   static CeraEngine fromBytes(Uint8List bytes, EngineConfig config) => _unsupportedOnWeb('CeraEngine.fromBytes');
 
+  /// Async variant of [`CeraEngine::from_bytes`]: the in-memory twin of
+  /// [`CeraEngine::from_path_async`], for callers with no filesystem.
+  ///
+  /// This one benefits more than the path variant: `from_bytes` has no
+  /// mmap to lean on, so every tensor is already resident and the whole
+  /// parse plus tokenizer build happens inline. Same weak cancellation.
+  ///
+  /// The `bytes` are moved into the blocking task, so a dropped future
+  /// releases them when the task finishes rather than when it is
+  /// dropped.
+  static Future<CeraEngine> fromBytesAsync(Uint8List bytes, EngineConfig config) => _unsupportedOnWeb('CeraEngine.fromBytesAsync');
+
   /// Load a model from a local filesystem path. Accepts the same
   /// inputs as the native [`cera::CeraEngine::from_path`]: a bare
   /// `.gguf`, a LeapBundles `.json` manifest, or a directory
@@ -2278,6 +2290,23 @@ final class CeraEngine {
   /// to resolve. For a pure-local workflow (bundle already on
   /// disk) leave `bundle_repo = None`.
   static CeraEngine fromPath(String path, EngineConfig config) => _unsupportedOnWeb('CeraEngine.fromPath');
+
+  /// Async variant of [`CeraEngine::from_path`]: moves the GGUF open,
+  /// tokenizer build, and KV allocation onto a tokio blocking worker.
+  ///
+  /// The sync twin is not cheap enough to call from a UI thread. GGUF
+  /// tensor data is memory-mapped rather than read, so the cost is not
+  /// proportional to file size, but the tokenizer is built eagerly and
+  /// a large vocabulary's merge table is real work: enough to drop
+  /// frames, and on a cold page cache the metadata reads are disk-bound
+  /// on top. Foreign UI code should prefer this everywhere.
+  ///
+  /// Cancellation is the weak form documented on
+  /// [`CeraEngine::from_bundle_id_async`]: dropping the future aborts
+  /// the task only while it is still queued. Engine construction has no
+  /// cooperative cancel point, so once started it runs to completion and
+  /// the result is dropped.
+  static Future<CeraEngine> fromPathAsync(String path, EngineConfig config) => _unsupportedOnWeb('CeraEngine.fromPathAsync');
 
   /// Render the model's chat template against a sequence of
   /// `ChatMessage`s. `add_generation_prompt = true` appends the

@@ -1105,26 +1105,6 @@ pub(super) fn render_object_members(out: &mut String, ctx: &RenderMethodContext)
                             );
                             out.push_str(&format!("      return {lift};\n"));
                         }
-                        Some(ret_type) if is_runtime_optional_primitive_type(ret_type) => {
-                            // Optional primitives are JSON-encoded as Pointer<Utf8>.
-                            let decode = render_json_decode_expr("decoded", ret_type, custom_types);
-                            out.push_str("      final ffi.Pointer<Utf8> resultPtr = (returnBuf + 0).ref.pointer.cast<Utf8>();\n");
-                            out.push_str("      if (resultPtr == ffi.nullptr) {\n");
-                            out.push_str(&format!(
-                                "        throw StateError('Rust returned null pointer for {}');\n",
-                                method.name
-                            ));
-                            out.push_str("      }\n");
-                            out.push_str("      try {\n");
-                            out.push_str(
-                                "        final String payload = resultPtr.toDartString();\n",
-                            );
-                            out.push_str("        final Object? decoded = jsonDecode(payload);\n");
-                            out.push_str(&format!("        return {decode};\n"));
-                            out.push_str("      } finally {\n");
-                            out.push_str("        _rustStringFree(resultPtr);\n");
-                            out.push_str("      }\n");
-                        }
                         Some(ret_type) => match ffi_return_type.as_ref() {
                             Some(FfiType::RustBuffer(_)) => {
                                 render_ffibuffer_rustbuffer_return(

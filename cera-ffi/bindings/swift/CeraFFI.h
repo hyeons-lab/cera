@@ -351,9 +351,19 @@ uint64_t uniffi_cera_ffi_fn_constructor_ceraengine_from_bundle_id_async(RustBuff
 uint64_t uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes(RustBuffer bytes, RustBuffer config, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_CERAENGINE_FROM_BYTES_ASYNC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_CERAENGINE_FROM_BYTES_ASYNC
+uint64_t uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes_async(RustBuffer bytes, RustBuffer config
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_CERAENGINE_FROM_PATH
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_CERAENGINE_FROM_PATH
 uint64_t uniffi_cera_ffi_fn_constructor_ceraengine_from_path(RustBuffer path, RustBuffer config, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_CERAENGINE_FROM_PATH_ASYNC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_CERAENGINE_FROM_PATH_ASYNC
+uint64_t uniffi_cera_ffi_fn_constructor_ceraengine_from_path_async(RustBuffer path, RustBuffer config
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_APPLY_CHAT_TEMPLATE
@@ -1265,9 +1275,21 @@ uint16_t uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CERAENGINE_FROM_BYTES_ASYNC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CERAENGINE_FROM_BYTES_ASYNC
+uint16_t uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CERAENGINE_FROM_PATH
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CERAENGINE_FROM_PATH
 uint16_t uniffi_cera_ffi_checksum_constructor_ceraengine_from_path(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CERAENGINE_FROM_PATH_ASYNC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CERAENGINE_FROM_PATH_ASYNC
+uint16_t uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async(void
     
 );
 #endif

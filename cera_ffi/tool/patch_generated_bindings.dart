@@ -7,14 +7,23 @@
 // file is a no-op.
 //
 // What it fixes:
-//   1. `.ref.pointer` -> `.ref.ptr`  (3 sites)
+//   1. `.ref.pointer` -> `.ref.ptr`  (0 sites today; kept as a backstop)
 //      The `_UniFfiFfiBufferElement` union field is named `ptr`; the generator
-//      reads a non-existent `pointer` getter when unpacking returned pointers.
-//   2. async constructor wrapper (1 site)
-//      The public `CeraEngine.fromBundleIdAsync` wrapper is declared
-//      `Future<CeraEngine>` but is not marked `async`, so it returns the inner
-//      binding call's Future directly. Marking it `async` makes the declared
-//      and actual return types agree.
+//      read a non-existent `pointer` getter when unpacking returned pointers.
+//      Every site was an `Option<primitive>` return decoded as a JSON C string,
+//      and the generator no longer emits those, so this now matches nothing.
+//      Left in place because it is a pure no-op when there is nothing to fix
+//      and the upstream shape could come back.
+//   2. async constructor wrappers (3 sites)
+//      `CeraEngine.fromBundleIdAsync`, `fromPathAsync` and `fromBytesAsync` are
+//      declared `Future<CeraEngine>` but not marked `async`, so each returns the
+//      inner binding call's Future directly. The types already agree (the inner
+//      call returns `Future<CeraEngine>` too), so this is about behaviour rather
+//      than typing: an `async` body turns a synchronous throw from `_bindings()`
+//      (a missing or unloadable native library) into a failed future, which is
+//      what a `Future`-returning constructor should do. All three are patched
+//      because all three have the same shape; patching one made them differ on
+//      that failure.
 //
 //   (Callback-interface lowering is NO LONGER patched here. The vendored
 //    generator under `third_party/uniffi-bindgen-dart` now lowers
@@ -54,14 +63,19 @@ void main(List<String> args) {
   }
 
   // Fix 2: mark the public async-constructor wrapper `async`.
-  const asyncSig =
-      'fromBundleIdAsync(String bundleId, String quant, EngineConfig config) {';
-  const asyncFixed =
-      'fromBundleIdAsync(String bundleId, String quant, EngineConfig config) async {';
-  if (src.contains(asyncSig)) {
-    src = src.replaceAll(asyncSig, asyncFixed);
-    applied += 1;
-    stdout.writeln('  marked fromBundleIdAsync wrapper async (1 site)');
+  const asyncSigs = [
+    'fromBundleIdAsync(String bundleId, String quant, EngineConfig config) {',
+    'fromPathAsync(String path, EngineConfig config) {',
+    'fromBytesAsync(Uint8List bytes, EngineConfig config) {',
+  ];
+  for (final sig in asyncSigs) {
+    final fixed = '${sig.substring(0, sig.length - 1)}async {';
+    if (src.contains(sig)) {
+      src = src.replaceAll(sig, fixed);
+      applied += 1;
+      final name = sig.substring(0, sig.indexOf('('));
+      stdout.writeln('  marked $name wrapper async (1 site)');
+    }
   }
 
   // (No callback-stubbing fix: the vendored generator now lowers the sink

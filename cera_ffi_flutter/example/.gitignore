@@ -43,3 +43,8 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Web runtime installed by `dart run cera_ffi_flutter:install_web`. Build output
+# of the cera-wasm crate (~3 MB), fetched or copied per checkout like every other
+# platform's native library, never committed.
+/web/cera/

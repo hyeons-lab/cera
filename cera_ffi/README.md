@@ -36,21 +36,54 @@ with a `dlsym` error naming a symbol you never wrote.
 
 ## Use
 
+`Cera` is the portable API: one asynchronous surface that runs on every target,
+web included.
+
+```dart
+import 'dart:io';
+
+import 'package:cera_ffi/cera_ffi.dart';
+
+Future<void> main() async {
+  final cera = await Cera.openPath('/path/to/model.gguf');
+
+  final prompt = await cera.applyChatTemplate(
+    [const CeraMessage.user('Why is the sky blue?')],
+  );
+  await for (final piece in cera.generate(prompt, maxTokens: 128)) {
+    stdout.write(piece);   // fragments, not tokens: just append them
+  }
+
+  await cera.close();
+  exit(0);   // see "Platform support": a NativeCallable keeps the isolate alive
+}
+```
+
+The generated bindings underneath cover the whole engine (LoRA, vision, audio,
+embeddings, grammars, tool calling, KV compression). Reach for them when you
+need something `Cera` does not expose, and accept that they are native-only:
+`dart:ffi` is what they are, and the web does not have it. Most of their
+surface is synchronous, though `fromPathAsync`, `fromBytesAsync` and
+`generateStreamingAsync` are what `Cera` is built on.
+
 ```dart
 import 'package:cera_ffi/cera_ffi.dart';
 
 void main() {
-  final engine = CeraEngine(
-    modelPath: '/path/to/model.gguf',
-    config: const EngineConfig(),
+  final engine = CeraEngine.fromPath(
+    '/path/to/model.gguf',
+    const EngineConfig(
+      contextSize: 2048,
+      backend: BackendPreference.auto,
+      bundleRepo: null,
+    ),
   );
 
-  final out = engine.generate(
-    prompt: 'Why is the sky blue?',
-    opts: const GenerateOpts(maxTokens: 128),
-  );
+  final session = engine.newSession(const SessionConfig());
+  session.appendTokens(engine.encodeText('Why is the sky blue?'));
+  final out = session.generate(const GenerateOpts(maxTokens: 128));
 
-  print(engine.decodeTokens(tokens: out.tokens));
+  print(engine.decodeTokens(out.tokens));
 }
 ```
 
@@ -60,18 +93,43 @@ text. For streaming and the async variants that keep the isolate responsive, see
 
 ## Platform support
 
-Everything `dart:ffi` supports: Android, iOS, macOS, Linux, Windows.
+`Cera` runs everywhere: Android, iOS, macOS, Linux, Windows, and the web.
 
-The web compiles but runs nothing. `dart:ffi` does not exist there, and importing
-it anywhere on the graph fails the entire build rather than one branch, so the
-bindings are exported conditionally and the web branch is a **generated stub**
-with the same API. It is produced by the same `just dart-bindings` run, from the
-same interface, and CI compiles a web app against it, so it cannot drift.
+The generated bindings run everywhere `dart:ffi` does, which is everywhere
+except the web.
 
-Data types are real on the web: `EngineConfig`, `GenerateOpts`, the error
-hierarchy and the enums construct and compare normally, so code that only builds
-a request stays platform-agnostic. Engine entry points throw `UnsupportedError`
-naming themselves. Use `cera-wasm` for inference in a browser.
+That split is not a gap someone forgot to close. A browser runs the engine in a
+Web Worker; `postMessage` is asynchronous and a worker offers no synchronous
+escape hatch, so a synchronous `engine.generate(...)` is not implementable there
+at any price. `Cera` is the same engine behind an API whose shape a browser can
+satisfy: a Rust async runtime on native, a Web Worker on web.
+
+### On the web
+
+Inference runs on **WebGPU** when the browser has it and falls back to a wasm
+CPU build when it does not: ~58 tok/s against ~1.4 tok/s, measured on the same
+machine and model. Install the runtime into your app's `web/` directory once
+with `dart run cera_ffi:install_web`, then use `Cera.openBytes` (there is no
+filesystem for `openPath`). No COOP/COEP headers are needed; nothing here uses
+threads. See the [`cera_ffi_flutter`
+README](https://pub.dev/packages/cera_ffi_flutter) for the full setup and for
+what is narrower there.
+
+The **generated bindings** are still a stub on the web, and have to be: an
+unconditional `dart:ffi` import fails the entire build rather than one branch,
+so they are exported conditionally with a generated no-FFI branch. It is
+produced by the same `just dart-bindings` run, from the same interface, and CI
+compiles a web app against it, so it cannot drift. Data types are real there
+(`EngineConfig`, `GenerateOpts`, the error hierarchy and the enums construct
+and compare normally) while engine entry points throw `UnsupportedError` naming
+themselves.
+
+### Exiting a Dart script
+
+`Cera.generate` registers a callback interface, and the vtable behind it holds
+static `NativeCallable`s for the process's lifetime. A live `NativeCallable`
+keeps its isolate alive, so a plain Dart CLI has to call `exit()` even after
+`close()`. Flutter apps are running anyway and never notice.
 
 ## Bindings
 

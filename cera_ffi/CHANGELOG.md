@@ -8,6 +8,18 @@ without Flutter at all.
 
 ### Added
 
+- **`Cera`, a portable asynchronous API that runs on every target including the
+  web.** One surface over two transports: the Rust async runtime natively, a Web
+  Worker running `cera-wasm` in a browser. Loading, chat templating, tokenizing
+  and streaming generation, with generations serialized against one KV cache.
+  The generated bindings stay synchronous and native-only; `Cera` exists because
+  a browser cannot offer a synchronous `generate` at any price.
+- **Web inference**, on WebGPU where the browser has it and on a wasm CPU build
+  where it does not (58 tok/s against 1.4 tok/s on the same machine and model).
+  `dart run cera_ffi:install_web` puts the runtime in an app's `web/`; no
+  COOP/COEP headers are required.
+- `CeraEngine.fromPathAsync` and `fromBytesAsync`, so loading a model no longer
+  blocks the calling isolate.
 - `dart:ffi` bindings for the Cera inference engine, generated from the compiled
   `cera-ffi` cdylib by a vendored `uniffi-bindgen-dart` and committed under
   `lib/src/generated/`.
@@ -28,8 +40,8 @@ without Flutter at all.
   `cera_ffi_flutter`; everyone else points `CERA_FFI_LIB` at a `cera-ffi` build.
   That build needs the `ffi-buffer` cargo feature, without which every call
   fails at `dlsym`.
-- The web compiles but runs nothing. The bindings are exported conditionally and
-  the web branch is a generated stub with the same API and no `dart:ffi`: data
-  types are real, engine entry points throw `UnsupportedError`. This exists so a
-  multi-platform app builds at all, since an unconditional `dart:ffi` import
-  fails the whole build rather than one branch. Use `cera-wasm` in browsers.
+- The bindings are still exported conditionally, and the web branch is still a
+  generated stub with the same API and no `dart:ffi`: data types are real,
+  engine entry points throw `UnsupportedError`. That is what lets a
+  multi-platform app build at all, since an unconditional `dart:ffi` import
+  fails the whole build rather than one branch.

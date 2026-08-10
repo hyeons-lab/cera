@@ -1,0 +1,360 @@
+// Web Worker host for the Cera inference engine.
+//
+// `cera_ffi_flutter`'s web implementation drives this over `postMessage`. It is
+// plain JS with no Dart or Flutter dependency, so a hand-written page can drive
+// it too; the protocol below is the whole contract.
+//
+// It exists because the CPU path's `Session.generate` is a SYNCHRONOUS wasm
+// call that runs the whole decode loop before returning. On the main thread
+// that freezes the tab for the duration. Off it, the tab stays live and the
+// per-token `postMessage`es still arrive as they are produced, because the
+// receiving thread is not the blocked one.
+//
+// ## Why every import here is dynamic
+//
+// `import('./cera_wasm.js')` rather than a static `import ... from`. A static
+// import of a name the loaded artifact does not export is a hard module error:
+// the worker never evaluates, never registers `onmessage`, and the page hangs
+// with nothing in the console. Since the same script has to serve builds with
+// and without optional exports, and has to resolve its module from a URL the
+// host supplies, the import cannot be static.
+//
+// ## Protocol
+//
+// Request:  {id, op, ...args}
+// Reply:    {id, ok: true, result} | {id, ok: false, error}
+// Stream:   {id, event: 'token', text}   (zero or more, before the reply)
+//
+// Every request gets exactly one reply, and `id` correlates them. Streaming
+// events carry the same `id` and always precede that request's reply.
+
+'use strict';
+
+/**
+ * An error the host should surface as its platform's "not supported here"
+ * type rather than as a generic failure.
+ *
+ * `postMessage` cannot carry an Error subclass (structured clone drops the
+ * prototype), so the kind travels as a field on the reply and the host maps it
+ * back. Without this the documented `UnsupportedError` for `reset` on the GPU
+ * backend arrived as an ordinary worker exception, and a caller catching what
+ * the docs promised caught nothing.
+ */
+function unsupported(message) {
+  const err = new Error(message);
+  err.ceraKind = 'unsupported';
+  return err;
+}
+
+/** The wasm module namespace, once `open` has imported it. */
+let wasm = null;
+
+/** Active engine/session state. Exactly one of the two paths is populated. */
+let cpu = null; // {engine, session, tokenizer}
+let gpu = null; // {session, tokenizer}
+
+/** Human-readable description of the backend that actually loaded. */
+let backendLabel = 'none';
+
+/**
+ * Tokens currently in the live session's KV cache. Zero means BOS.
+ *
+ * Read from the session rather than counted here. A counter cannot be right:
+ * a prompt can be rejected before any forward runs (cache untouched) or fail
+ * partway through decode (cache advanced), and the two need opposite answers.
+ */
+function position() {
+  if (gpu) return gpu.session.position;
+  if (cpu) return cpu.session.position;
+  return 0;
+}
+
+/**
+ * The tokenizer of whichever path is live.
+ *
+ * Both paths expose one: the CPU engine has always had `engine.tokenizer`, and
+ * `WebGpuSession` gained the same getter so the GPU path is not restricted to
+ * raw prompt completion. Without it a chat model cannot be driven on the GPU at
+ * all: rendering a chat template needs the tokenizer, and feeding the rendered
+ * text back needs an encoder that lowers `<|im_start|>` to its id rather than
+ * to the characters spelling it.
+ */
+function tokenizer() {
+  if (gpu) return gpu.tokenizer;
+  if (cpu) return cpu.tokenizer;
+  throw new Error('no model is open');
+}
+
+/**
+ * Encode `text` into the ids to feed the model.
+ *
+ * Plain `encode` plus an explicit BOS rather than `encodeSpecial(text, true)`,
+ * which does two things where only one is wanted: it also appends EOS when the
+ * GGUF sets `add_eos_token`, ending the turn before the model has seen the
+ * generation header. `encode` still lowers the template's `<|im_start|>`-style
+ * markers to their own ids, which is the part that matters.
+ *
+ * `first` gates the BOS, which belongs at position 0 only. The KV cache
+ * persists across calls, so a later BOS would land mid-sequence at a nonzero
+ * position and desync RoPE from every other Cera path. The already-present
+ * check matters too: a chat template that emits its own BOS would otherwise
+ * get a second one, which is not a crash, just a quietly worse first token.
+ *
+ * Matches the native Dart implementation exactly, and matches
+ * `WebGpuSession::generate` on the BOS rule and `Session::append_text` on the
+ * encoding. (`append_text` itself has no BOS handling; the CLI frames its own
+ * prompts before calling it.)
+ */
+function encodePrompt(text, first) {
+  const tk = tokenizer();
+  const ids = Array.from(tk.encode(text));
+  const bos = tk.bosToken;
+  if (first && tk.addBosToken && bos != null && ids[0] !== bos) {
+    ids.unshift(bos);
+  }
+  return Uint32Array.from(ids);
+}
+
+/**
+ * Load the wasm module once, from a URL the host resolves.
+ *
+ * The URL is not derived from `import.meta.url` because the worker script and
+ * the wasm artifacts need not be co-located: the script ships inside the pub
+ * package and the artifacts are installed into the app's `web/` directory.
+ */
+async function ensureModule(moduleUrl) {
+  if (wasm) return;
+  // Absolutize first. A dynamic `import()` treats a specifier with no leading
+  // `./`, `../` or scheme as a BARE specifier (a package name), and rejects it
+  // outright with "Failed to resolve module specifier", even though the very
+  // same string works in `new Worker(...)`. Resolving against the worker's own
+  // location turns any of the three forms into something importable.
+  const module = await import(new URL(moduleUrl, self.location.href).href);
+  // wasm-bindgen's `--target web` default export fetches and instantiates the
+  // `.wasm` sibling. It resolves that path against the JS module's own URL, so
+  // the two files must stay next to each other.
+  //
+  // Assigned only after instantiation succeeds. Caching the namespace first
+  // makes a failed load stick: every later `open` short-circuits on the cached
+  // value and then fails inside wasm-bindgen with "wasm not initialized"
+  // instead of retrying the load that actually broke.
+  await module.default();
+  wasm = module;
+}
+
+/**
+ * Try the GPU path. Returns false (rather than throwing) for every reason the
+ * GPU cannot serve this model, so `auto` can fall through to the CPU.
+ *
+ * The failure modes are not all detectable up front: `navigator.gpu` can exist
+ * while `requestAdapter` yields nothing, and `WebGpuSession` is LFM2-only, so a
+ * dense-transformer GGUF throws from `create` after WebGPU itself came up fine.
+ * Both must degrade rather than fail the open.
+ */
+async function tryGpu(bytes, contextSize) {
+  if (!self.navigator || !self.navigator.gpu) return false;
+  if (typeof wasm.WebGpuSession !== 'function') return false;
+  let session;
+  try {
+    session = await wasm.WebGpuSession.create(bytes, contextSize);
+  } catch (_) {
+    return false;
+  }
+  gpu = { session, tokenizer: session.tokenizer };
+  backendLabel = `webgpu: ${session.adapter}`;
+  return true;
+}
+
+function openCpu(bytes, contextSize) {
+  const engine = wasm.CeraEngine.fromGgufBytes(bytes, contextSize);
+  const session = engine.newSession(new wasm.SessionConfig());
+  cpu = { engine, session, tokenizer: engine.tokenizer };
+  backendLabel = 'wasm cpu';
+}
+
+const OPS = {
+  /**
+   * Import the module, then open a model. `backend` is 'auto' | 'gpu' | 'cpu'.
+   *
+   * `bytes` arrives as a transferred ArrayBuffer, so the host's copy is gone by
+   * the time this runs. It is wrapped, not copied, but wasm-bindgen does copy
+   * it into linear memory (or into GPU buffers) during construction, so peak
+   * usage is briefly twice the model size on both paths.
+   */
+  async open({ moduleUrl, bytes, contextSize, backend }) {
+    await ensureModule(moduleUrl);
+    const view = new Uint8Array(bytes);
+    const ctx = contextSize ?? undefined;
+    if (backend === 'gpu') {
+      if (!(await tryGpu(view, ctx))) {
+        throw new Error(
+          'the WebGPU backend is unavailable: either this browser exposes no ' +
+            'navigator.gpu, no adapter could be acquired, or the model is not ' +
+            'an LFM2 GGUF (the only architecture with a browser GPU path). ' +
+            'Use backend: auto to fall back to the CPU instead.',
+        );
+      }
+    } else if (backend === 'cpu') {
+      openCpu(view, ctx);
+    } else if (!(await tryGpu(view, ctx))) {
+      openCpu(view, ctx);
+    }
+    return { backend: backendLabel };
+  },
+
+  /**
+   * Prefill `prompt` and decode up to `maxTokens`, streaming each decoded piece
+   * back as a `token` event before the reply.
+   *
+   * Both paths append to a live KV cache rather than resetting, so consecutive
+   * calls continue one conversation; `reset` starts over.
+   */
+  async generate(req, post) {
+    const { prompt, maxTokens } = req;
+    // Seeding is per SESSION in the wasm API, not per generate: `GenerateOpts`
+    // has no seed field and assigning one just creates a dead JS property.
+    // Honoring it therefore means rebuilding the session, which is only
+    // meaningful before anything has been fed, and is a no-op on the GPU path
+    // (its decode is greedy, so a seed changes nothing).
+    if (req.seed != null && position() === 0 && cpu) {
+      const config = new wasm.SessionConfig();
+      config.seed = BigInt(req.seed);
+      cpu.session.free();
+      cpu.session = cpu.engine.newSession(config);
+    }
+    const ids = encodePrompt(prompt, position() === 0);
+    const started = performance.now();
+    let text = '';
+    const onToken = (piece) => {
+      text += piece;
+      post({ event: 'token', text: piece });
+    };
+    if (gpu) {
+      // Caller-framed: `generateTokens` prepends nothing, which is what makes
+      // the BOS rule in `encodePrompt` the single place BOS is decided.
+      await gpu.session.generateTokens(ids, maxTokens, onToken);
+    } else {
+      const tk = cpu.tokenizer;
+      cpu.session.appendTokens(ids);
+      const opts = new wasm.GenerateOpts();
+      opts.maxTokens = maxTokens;
+      if (req.temperature != null) opts.temperature = req.temperature;
+      if (req.topP != null) opts.topP = req.topP;
+      if (req.topK != null) opts.topK = req.topK;
+      // Emit per token rather than per buffer-full; the point of a worker is
+      // that the host sees output as it is produced.
+      opts.flushEveryTokens = 1;
+      cpu.session.generate(opts, (toks) => onToken(tk.decode(toks)));
+    }
+    const ms = performance.now() - started;
+    return { text, elapsedMs: ms };
+  },
+
+  applyChatTemplate({ messagesJson, addGenerationPrompt }) {
+    // The messages cross as JSON so the host does not have to build a JS array
+    // of objects through interop, but `applyChatTemplate` wants the real array:
+    // it type-checks its argument and rejects a string with "messages must be
+    // an array".
+    return tokenizer().applyChatTemplate(JSON.parse(messagesJson), addGenerationPrompt);
+  },
+
+  encode({ text, addSpecial }) {
+    return Array.from(tokenizer().encodeSpecial(text, addSpecial));
+  },
+
+  decode({ tokens }) {
+    return tokenizer().decode(Uint32Array.from(tokens));
+  },
+
+  /**
+   * Drop the conversation, keeping the loaded weights.
+   *
+   * `WebGpuSession` has no reset, so the GPU path reports the limitation rather
+   * than silently continuing a conversation the caller believes it cleared.
+   */
+  reset() {
+    if (cpu) {
+      // `Session.reset`, not a fresh session. It clears KV, position and token
+      // history and lowers the cancel flag, which is all rebuilding did, while
+      // keeping the session's own config: a rebuild with a default
+      // `SessionConfig` silently discarded a seed the `generate` op installed.
+      cpu.session.reset();
+      return null;
+    }
+    throw unsupported(
+      'reset is not supported on the WebGPU backend: WebGpuSession owns its ' +
+        'KV cache on the GPU and exposes no way to clear it. Close the engine ' +
+        'and open it again to start a new conversation.',
+    );
+  },
+
+  /**
+   * Request an early stop. Reaches neither backend's in-flight decode, for two
+   * unrelated reasons, so treat it as best-effort.
+   *
+   * On the CPU path the decode loop is one synchronous wasm call. This message
+   * is not dequeued until that call returns, so the flag is only ever set
+   * between generations. Reaching an in-flight decode would need a
+   * SharedArrayBuffer flag, hence cross-origin isolation, which is the
+   * requirement this design otherwise avoids entirely.
+   *
+   * On the GPU path there is nothing to call: `WebGpuSession` exposes no
+   * cancel. Its decode does yield to the event loop between tokens, so a stop
+   * is implementable there, but it needs a Rust-side entry point that does not
+   * exist yet.
+   *
+   * Clearing the CPU flag right after setting it is deliberate. The engine's
+   * cancel flag is sticky, and `Session::generate` clears it only at entry,
+   * after `appendTokens` has already run; leaving it set poisons the next
+   * turn's chunked prefill with `Cancelled`.
+   */
+  cancel() {
+    if (cpu) {
+      cpu.session.cancel();
+      cpu.session.clearCancel();
+    }
+    return null;
+  },
+
+  close() {
+    // The tokenizer handles are separate wasm-bindgen objects holding their own
+    // `Arc<BpeTokenizer>` clone, so freeing the engine does not reclaim them.
+    // Terminating the worker would, but this protocol is documented as usable
+    // standalone, where open/close cycles would otherwise accumulate them.
+    if (cpu) {
+      cpu.tokenizer.free();
+      cpu.session.free();
+      cpu.engine.free();
+      cpu = null;
+    }
+    if (gpu) {
+      gpu.tokenizer.free();
+      gpu.session.free();
+      gpu = null;
+    }
+    backendLabel = 'none';
+    return null;
+  },
+};
+
+self.onmessage = async (e) => {
+  const req = e.data;
+  const { id, op } = req;
+  const post = (msg) => self.postMessage({ id, ...msg });
+  try {
+    const handler = OPS[op];
+    if (!handler) throw new Error(`unknown op ${op}`);
+    const result = await handler(req, post);
+    self.postMessage({ id, ok: true, result });
+  } catch (err) {
+    // Errors cross `postMessage` as strings: a wasm-bindgen `JsError` is not
+    // structured-cloneable, so posting it raw would fail the send and leave the
+    // host awaiting a reply that never comes.
+    self.postMessage({
+      id,
+      ok: false,
+      error: String((err && err.message) || err),
+      kind: (err && err.ceraKind) || 'error',
+    });
+  }
+};

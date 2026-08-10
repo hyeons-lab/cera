@@ -29,7 +29,7 @@ Kotlin (`cera-ffi-kotlin`) and Swift bindings.
 | macOS    | 12.0 | `CeraFFI.xcframework` | Metal enabled; arm64 |
 | Linux    | — | `libcera_ffi.so` | downloaded + checksummed by CMake |
 | Windows  | — | `cera_ffi.dll` | downloaded + checksummed by CMake |
-| Web      | compiles, no inference | — | generated stub, every call throws; use `cera-wasm` |
+| Web      | WebGPU, or wasm | `cera_wasm_bg.wasm` in your `web/` | one setup command; see [Web](#web) |
 
 Apple targets are wired for both **Swift Package Manager** and CocoaPods;
 Flutter picks SPM when the project has it enabled and falls back to the podspec
@@ -52,9 +52,55 @@ otherwise.
 
 ## Quick start
 
+`Cera` is the portable API. It works on every platform in the table above, web
+included, and it is what an app should reach for first:
+
 ```dart
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
 
+// `openPath` where there is a filesystem, `openBytes` where there is not.
+// `supportsPaths` is false only on the web.
+final cera = Cera.supportsPaths
+    ? await Cera.openPath(modelPath)
+    : await Cera.openBytes(modelBytes);
+
+debugPrint(cera.backend);   // "native (auto)", "webgpu: … (BrowserWebGpu)", …
+
+final prompt = await cera.applyChatTemplate(
+  [const CeraMessage.user('Why is the sky blue?')],
+);
+
+var answer = '';
+await for (final piece in cera.generate(prompt, maxTokens: 256)) {
+  answer += piece;   // fragments, not tokens: just append them
+}
+
+await cera.close();
+```
+
+Nothing there needs an isolate. Loading and decoding, the two long operations,
+already happen off the Dart thread on both transports: natively the engine runs
+on a Rust async runtime and completes the future from there, and on the web it
+runs in a Web Worker. One step is not off-thread natively, prefill, because
+`appendTokens` has no async twin yet; a long prompt blocks the calling isolate
+for its prefill, and decode is unaffected.
+
+`Cera.openBytes` is the constructor that also works in a browser, which has no
+filesystem to point `openPath` at. `Cera.supportsPaths` says which one to reach
+for, and it is worth branching on before the file picker rather than after: a
+picker has to be asked for the file's *bytes* up front on the web, and asking
+for them on native reads a multi-gigabyte model into the heap that the engine
+would otherwise have memory-mapped. `example/lib/main.dart` does exactly this.
+
+### The generated bindings
+
+`Cera` covers loading, chat templating, tokenizing and streaming generation.
+Everything else the engine can do (LoRA adapters, vision and audio input,
+embeddings, GBNF grammars, tool calling, TurboQuant KV compression) is on the
+generated bindings, which are `dart:ffi`-based and therefore **native-only**.
+Most of that surface is synchronous:
+
+```dart
 final engine = CeraEngine.fromPath(modelPath, const EngineConfig(
   contextSize: 2048,
   backend: BackendPreference.auto,
@@ -87,14 +133,69 @@ print(engine.decodeTokens(out.tokens));
 into text. For token-by-token output use `generateStreamingAsync` with a
 `ModalitySink` and decode incrementally.
 
-**Run inference off the UI isolate.** `generate` blocks its isolate for the
-whole decode. In a Flutter app, drive it from `Isolate.run` (as
-`example/lib/main.dart` does) or use `generateStreamingAsync`.
+**This `generate` blocks its isolate for the whole decode**, unlike
+`Cera.generate`. Drive it from `Isolate.run`, or use `generateStreamingAsync`,
+or use `Cera` and skip the question.
+
+## Web
+
+Inference in a browser runs through WebGPU when the browser has it, and falls
+back to a wasm CPU build when it does not. The difference is not marginal:
+**~58 tok/s against ~1.4 tok/s** measured on the same machine and model, so
+treat the fallback as a fallback.
+
+The wasm runtime is a build artifact and is not in the pub archive, for the same
+reason no other platform's native library is. Install it into your app's `web/`
+directory once:
+
+```sh
+dart run cera_ffi_flutter:install_web
+```
+
+That writes `cera_worker.js`, `cera_wasm.js` and `cera_wasm_bg.wasm` (~3 MB)
+into `web/cera/`, which is where the defaults look for them. Re-run it with
+`--force` after upgrading the package, since it skips files already present and
+the artifacts are versioned with the engine: a stale runtime beside new Dart is
+exactly what the flag exists to prevent. Use `--out` to install elsewhere and
+pass matching `CeraWebAssets` paths, and `--from DIR` to take the wasm from a
+local `just wasm-web-wgpu` build instead of the release.
+
+Then `Cera.openBytes` works as it does anywhere else. **No COOP/COEP headers are
+required**: the GPU path does not use threads, and neither does the CPU
+fallback, so nothing here needs `SharedArrayBuffer` or a cross-origin-isolated
+page.
+
+What is narrower on the web than on native:
+
+- **`openPath` throws.** There is no filesystem; use `openBytes`.
+- **The GPU path is LFM2-only.** `WebGpuSession` covers the `lfm2`/`lfm2.5`
+  family. A dense transformer (llama, qwen, granite) still runs, on the CPU
+  fallback, and `backend: CeraBackend.auto` arranges that silently; read
+  `cera.backend` if you need to know which one you got.
+- **`reset` throws on the GPU path.** Its KV cache lives on the GPU with no way
+  to clear it. Close the engine and open it again.
+- **`cancel` is best-effort.** It reaches neither backend's running decode:
+  the CPU decode is one synchronous wasm call occupying the worker, so the
+  message is not delivered until it has already finished, and `WebGpuSession`
+  exposes no cancel entry point at all. Cancelling the `generate` stream's
+  subscription stops delivery to your app immediately either way, which is what
+  a Stop button needs.
+- **Sampling is greedy on the GPU path.** `temperature`, `topP`, `topK` and
+  `seed` are honored on the CPU fallback and ignored on WebGPU, which decodes
+  greedily. Force `CeraBackend.cpu` if you need sampled output in a browser.
+- **The generated bindings are stubs**, as they have always been on the web:
+  `dart:ffi` does not exist there. Everything in "The generated bindings" above
+  is native-only.
 
 ## Examples
 
-- `example/` — a Flutter chat app (the pub.dev example), inference on a
-  background isolate.
+- `example/`: a Flutter chat app (the pub.dev example). One code path for every
+  platform, web included, because it is written against `Cera`. To run it in a
+  browser, build the runtime from this checkout first (the released assets only
+  exist from the version that added them onward):
+  `just wasm-web-wgpu`, then from `example/`
+  `dart run cera_ffi_flutter:install_web --from ../../cera-wasm/examples/webgpu/pkg`
+  and `flutter run -d chrome`.
 - `../cera_ffi/example/` — plain-Dart CLI scripts covering each surface:
   `cera_chat.dart` (template → generate → decode), `cera_generate.dart`,
   `cera_async.dart`, `cera_stream.dart`, `cera_progress.dart`. They live with
@@ -217,15 +318,16 @@ The Apple manifests resolve `CeraFFI.xcframework` from a tagged release, so
 Apple targets need a published release (or a locally built xcframework) before
 they resolve.
 
-Web **compiles but does not run**, which is a deliberate distinction.
+Web **runs**, through `Cera`; see the [Web](#web) section above for setup and
+for what is narrower there. What follows is about the *generated bindings*,
+which remain native-only.
 
-An app that also targets the web can depend on this package and build. That is
-not automatic: `dart:ffi` does not exist on the web, and importing it anywhere on
-the graph fails the whole build rather than one branch of it. So `cera_ffi`
-exports its bindings conditionally, and the web branch is a *generated* stub with
-the same API and no FFI. It comes out of the same `just dart-bindings` run as the
-real bindings, from the same interface, and CI compiles a throwaway web app
-against it, so it cannot quietly fall behind.
+`dart:ffi` does not exist on the web, and importing it anywhere on the graph
+fails the whole build rather than one branch of it. So `cera_ffi` exports its
+bindings conditionally, and the web branch is a *generated* stub with the same
+API and no FFI. It comes out of the same `just dart-bindings` run as the real
+bindings, from the same interface, and CI compiles a throwaway web app against
+it, so it cannot quietly fall behind.
 
 Data types are real there: `EngineConfig`, `GenerateOpts`, the error hierarchy
 and the enums all construct and compare normally, so shared code that builds a
@@ -237,10 +339,9 @@ CeraEngine.fromPath is not available on this platform: package `cera_ffi`
 needs dart:ffi, which the web does not provide.
 ```
 
-For inference in a browser, use `cera-wasm`. Making *this* package run there
-would need a platform-interface package that both the FFI and wasm
-implementations satisfy, plus an async-shaped API, since the wasm side cannot
-offer the synchronous calls this one does.
+That is the stub, not the package. Inference in a browser goes through `Cera`,
+which is async precisely because the synchronous calls above cannot exist there.
+`cera-wasm` remains the option for a non-Dart browser app.
 
 ## License
 

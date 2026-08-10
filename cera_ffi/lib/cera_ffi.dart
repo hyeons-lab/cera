@@ -1,12 +1,14 @@
 /// Dart bindings for the Cera inference engine.
 ///
 /// This is the package's public entry point. It re-exports:
-/// - [CeraLibrary] — the platform-aware native-library loader.
+/// - [Cera], the portable asynchronous API. Runs everywhere, web included.
+/// - [CeraLibrary], the platform-aware native-library loader.
 /// - the UniFFI engine bindings from `src/generated/cera_ffi.dart`
-///   (`CeraEngine`, `EngineConfig`, `Session`, `ModalitySink`, …).
+///   (`CeraEngine`, `EngineConfig`, `Session`, `ModalitySink`, …), which are
+///   `dart:ffi`-based and therefore native-only.
 ///
-/// Pure `dart:ffi`: nothing here imports `package:flutter`, so this works from
-/// a plain Dart CLI, server, or test. Flutter apps normally depend on
+/// Nothing here imports `package:flutter`, so this works from a plain Dart
+/// CLI, server, or test. Flutter apps normally depend on
 /// `package:cera_ffi_flutter` instead, which re-exports this library *and*
 /// wires each platform's build to ship the native library. Depending on this
 /// package alone means supplying that library yourself, via `CERA_FFI_LIB` or
@@ -14,16 +16,17 @@
 ///
 /// ## Web
 ///
-/// Importing this library in an app that also targets the web is safe: the
-/// bindings are exported conditionally, and a target without `dart:ffi` gets a
-/// generated stub with the same API whose every entry point throws
-/// [UnsupportedError]. Data types (records, enums, errors) are real there, so
-/// code that only builds a config or inspects a result still runs.
+/// Inference runs in a browser through [Cera], on WebGPU where the browser has
+/// it and on a wasm CPU build where it does not. It needs the runtime installed
+/// once with `dart run cera_ffi:install_web`; see the README.
 ///
-/// Inference itself does not work in a browser; use `cera-wasm` for that. The
-/// stub exists so a multi-platform app compiles at all, which it otherwise does
-/// not: `dart:ffi` is unavailable on web, and an unconditional import of it is
-/// a compile error for the whole build, not a runtime failure on one branch.
+/// The *generated bindings* remain native-only, and the web branch of them is a
+/// generated stub whose every entry point throws [UnsupportedError]. That stub
+/// is what lets a multi-platform app compile at all: `dart:ffi` is unavailable
+/// on web, and an unconditional import of it is a compile error for the whole
+/// build, not a runtime failure on one branch. Data types (records, enums,
+/// errors) are real there, so code that only builds a config or inspects a
+/// result still runs.
 ///
 /// ## Regenerating the bindings
 ///
@@ -40,15 +43,15 @@
 /// ```dart
 /// import 'package:cera_ffi/cera_ffi.dart';
 ///
-/// final engine = CeraEngine(
-///   modelPath: '/path/to/model.gguf',
-///   config: const EngineConfig(),
-/// );
-/// final out = engine.generate(prompt: 'Why is the sky blue?');
-/// print(engine.decodeTokens(tokens: out.tokens));
+/// final cera = await Cera.openPath('/path/to/model.gguf');
+/// await for (final piece in cera.generate('Why is the sky blue?')) {
+///   // fragments, not tokens: just append them
+/// }
+/// await cera.close();
 /// ```
 library;
 
+export 'src/async/cera.dart';
 export 'src/library_loader.dart';
 
 // The stub is the DEFAULT and the real bindings are the conditional branch,

@@ -23,11 +23,21 @@ marked `publish_to: none` and was not a Flutter plugin.
   Android NDK: the `cera-ffi-android` AAR via Gradle, `CeraFFI.xcframework` via
   a CocoaPods podspec *and* a Swift Package Manager manifest, and the desktop
   cdylibs via CMake with a SHA-256 check.
-- Flutter example app (`example/`) running inference on a background isolate,
-  plus plain-Dart CLI examples, which ship with `cera_ffi`.
+- **Web support**, through the `Cera` API re-exported from `cera_ffi`: WebGPU
+  where the browser has it, a wasm CPU build where it does not. Install the
+  runtime once with `dart run cera_ffi_flutter:install_web`.
+- Flutter example app (`example/`), one code path for every platform including
+  the web, plus plain-Dart CLI examples, which ship with `cera_ffi`.
 - Standalone Linux and Windows cdylib release assets.
 
 ### Fixed
+
+- **Four engine methods segfaulted the process.** `bosToken`, `eosToken`,
+  `specialTokenId` and `toolCallStartToken` return `Option<u32>`, which UniFFI
+  passes back as a RustBuffer; the generator special-cased optional primitives
+  as a JSON-encoded C string and dereferenced the buffer's capacity word as a
+  pointer. SIGSEGV, no exception, nothing an analyzer could see. No caller had
+  reached one until `Cera` needed BOS framing.
 
 - **Eleven engine methods threw `UnsupportedError` at runtime.** The Dart
   generator's object-method renderer decoded only records, enums, and maps, so
@@ -65,7 +75,9 @@ marked `publish_to: none` and was not a Flutter plugin.
 - Requires iOS 15.0+ / macOS 12.0+ / Android API 28+. An app left at Flutter's
   default deployment target fails with an SPM error that does not name the fix;
   see the README.
-- Flutter Web compiles but runs nothing. An app targeting web can depend on this
-  package: `cera_ffi` exports its bindings conditionally and the web branch is a
-  generated stub with the same API. Data types work there; every engine call
-  throws `UnsupportedError`. For inference in a browser, use `cera-wasm`.
+- Web inference goes through `Cera` and needs its runtime installed once with
+  `dart run cera_ffi_flutter:install_web`. The GPU path is LFM2-only; other
+  architectures fall back to the wasm CPU build. `openPath` is unavailable
+  there (no filesystem), `reset` is unavailable on the GPU backend, and
+  `cancel` is best-effort. The *generated bindings* remain native-only: their
+  web branch is a stub whose every engine call throws `UnsupportedError`.

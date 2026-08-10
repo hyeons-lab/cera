@@ -481,6 +481,18 @@ impl Tokenizer {
         self.inner.vocab_size() as u32
     }
 
+    /// Whether the GGUF asks for a BOS token to be prepended
+    /// (`tokenizer.ggml.add_bos_token`).
+    ///
+    /// Needed to frame a prompt correctly without `encodeSpecial`: that
+    /// helper prepends BOS *and* appends EOS together, and a chat-template
+    /// prompt wants the first and not the second. Callers doing their own
+    /// framing read this and prepend `bosToken` themselves.
+    #[wasm_bindgen(getter, js_name = addBosToken)]
+    pub fn add_bos_token(&self) -> bool {
+        self.inner.add_bos_token()
+    }
+
     /// BOS token ID, if the GGUF metadata declares one.
     #[wasm_bindgen(getter, js_name = bosToken)]
     pub fn bos_token(&self) -> Option<u32> {
@@ -1574,7 +1586,7 @@ impl<'a> cera::ModalitySink for JsTextSink<'a> {
 // See devlog 000169.
 #[cfg(feature = "wgpu")]
 mod webgpu {
-    use super::map_err;
+    use super::{Tokenizer, map_err};
     use cera::model::Model;
     use std::sync::Arc;
     use wasm_bindgen::prelude::*;
@@ -1728,6 +1740,18 @@ mod webgpu {
             })
         }
 
+        /// Number of tokens currently in the KV cache.
+        ///
+        /// The only reliable way for a caller to know whether this session is
+        /// at the start of a sequence, which is what decides BOS framing. A
+        /// counter kept outside cannot: a prompt can be rejected before any
+        /// forward runs (leaving the cache untouched) or fail partway through
+        /// decode (leaving it advanced), and the two need opposite answers.
+        #[wasm_bindgen(getter)]
+        pub fn position(&self) -> u32 {
+            self.state.seq_len as u32
+        }
+
         /// The KV-cache mode this session actually resolved to:
         /// `"turboquant(seed=N)"` or `"uncompressed"`.
         ///
@@ -1775,6 +1799,78 @@ mod webgpu {
                     }
                 }
             }
+            self.generate_ids(ids, max_tokens, on_token).await
+        }
+
+        /// The tokenizer this session's GGUF declares, for callers that need to
+        /// frame a prompt themselves.
+        ///
+        /// Needed because rendering a chat template requires a tokenizer, and
+        /// this session did not hand one out: a caller could feed it prompts
+        /// but had no way to build one for a chat model.
+        ///
+        /// Note what is *not* the reason. `generate` encodes with the
+        /// tokenizer's `encode`, which splits at special-token boundaries and
+        /// emits `<|im_start|>` as its own id, so a rendered template fed
+        /// straight to `generate` tokenizes correctly. Reach for
+        /// `generateTokens` when you want to own the framing instead, which is
+        /// what lets one caller frame identically across this session and the
+        /// CPU one:
+        ///
+        /// ```js
+        /// const tk = session.tokenizer;
+        /// // A real array, not JSON: `applyChatTemplate` type-checks its
+        /// // argument and rejects a string with "messages must be an array".
+        /// const prompt = tk.applyChatTemplate(messages, true);
+        /// // `encode`, not `encodeSpecial`: the latter also appends EOS when
+        /// // the GGUF asks for one, which ends the turn before the model has
+        /// // seen the generation header. It still lowers the template's
+        /// // markers to their own ids, which is the part that matters.
+        /// const ids = Array.from(tk.encode(prompt));
+        /// if (tk.addBosToken && tk.bosToken != null && ids[0] !== tk.bosToken) {
+        ///   ids.unshift(tk.bosToken);
+        /// }
+        /// await session.generateTokens(new Uint32Array(ids), 128, onToken);
+        /// ```
+        ///
+        /// The returned handle shares this session's tokenizer rather than
+        /// copying it, and is independent of the session's lifetime.
+        #[wasm_bindgen(getter)]
+        pub fn tokenizer(&self) -> Tokenizer {
+            Tokenizer {
+                inner: Arc::clone(&self.tokenizer),
+            }
+        }
+
+        /// Prefill `tokens`, then greedily decode up to `maxTokens`, exactly as
+        /// `generate` does, but taking token ids the caller has already framed.
+        ///
+        /// **No BOS is prepended.** That is the whole point of this entry point:
+        /// the caller owns framing, so a chat template's own leading special
+        /// token is not competing with an injected one. `generate` is this
+        /// method plus text encoding and the BOS rule.
+        ///
+        /// Like `generate`, this appends to the session's live KV cache rather
+        /// than resetting it, so consecutive calls continue one conversation.
+        #[wasm_bindgen(js_name = generateTokens)]
+        pub async fn generate_tokens(
+            &mut self,
+            tokens: Vec<u32>,
+            max_tokens: u32,
+            on_token: &js_sys::Function,
+        ) -> Result<String, JsError> {
+            self.generate_ids(tokens, max_tokens, on_token).await
+        }
+
+        /// Shared body of `generate` / `generateTokens`: prefill, greedy decode,
+        /// UTF-8-safe streaming. Not exported; the two public entry points
+        /// differ only in how `ids` is produced.
+        async fn generate_ids(
+            &mut self,
+            ids: Vec<u32>,
+            max_tokens: u32,
+            on_token: &js_sys::Function,
+        ) -> Result<String, JsError> {
             if ids.is_empty() {
                 return Ok(String::new());
             }

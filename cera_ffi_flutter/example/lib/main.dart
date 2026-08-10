@@ -1,14 +1,25 @@
 // Example Flutter app for `cera_ffi_flutter`: pick a GGUF, chat with it, watch
 // tokens stream in.
 //
-// The interesting part is that inference runs on a background isolate. Every
-// `generate*` call blocks its thread for as long as decoding takes, so calling
-// it on the UI isolate would freeze the frame pump. `Isolate.run` keeps the UI
-// responsive and lets tokens arrive over a port.
+// One code path serves every platform, web included, because it is written
+// against `Cera`, the portable async API, rather than against the generated
+// bindings. That is the whole point of the type: the bindings are synchronous
+// and `dart:ffi`-based, and neither of those can exist in a browser, so an app
+// that wants to run everywhere cannot be written against them.
+//
+// Note what is *absent* compared to a direct-bindings version: no
+// `dart:isolate`, no `dart:io`, no per-turn model reload. The blocking work
+// already happens off the Dart thread on both transports, so there is nothing
+// left for an isolate to fix.
+//
+// Running this on the web needs the wasm runtime installed once:
+//
+//   just wasm-web-wgpu
+//   cd cera_ffi_flutter/example
+//   dart run cera_ffi_flutter:install_web --from ../../cera-wasm/examples/webgpu/pkg
+//   flutter run -d chrome
 
 import 'dart:async';
-import 'dart:io' show Platform;
-import 'dart:isolate';
 
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
 import 'package:file_picker/file_picker.dart';
@@ -54,87 +65,157 @@ class _ChatPageState extends State<ChatPage> {
   final _scroll = ScrollController();
   final _turns = <Turn>[];
 
-  String? _modelPath;
-  String _status = 'No model loaded';
-  bool _busy = false;
+  /// The loaded model, kept alive across turns so the conversation shares one
+  /// KV cache and the weights are paid for once.
+  Cera? _cera;
+  StreamSubscription<String>? _generation;
 
-  @override
-  void initState() {
-    super.initState();
-    // Reading the backend report proves the native library resolved before the
-    // user does anything, which makes a packaging problem obvious immediately
-    // rather than at first generate.
-    unawaited(_probeNativeLibrary());
-  }
+  /// Releases the `_send` that is waiting on the current turn. See its use.
+  void Function()? _finishTurn;
+
+  String _status = 'No model loaded';
+  bool _loading = false;
+
+  bool get _busy => _loading || _generation != null;
 
   @override
   void dispose() {
+    unawaited(_generation?.cancel());
+    // Cancelling a subscription suppresses `onDone`, so without this the
+    // pending `_send` frame would hold this State, its transcript and the
+    // engine closure for the life of the app. Same reason `_stop` calls it.
+    _finishTurn?.call();
+    unawaited(_cera?.close());
     _input.dispose();
     _scroll.dispose();
     super.dispose();
   }
 
-  Future<void> _probeNativeLibrary() async {
-    try {
-      final report = cpuBackendReport();
-      final version = ceraFfiVersion();
-      setState(() => _status = 'cera $version · $report');
-    } catch (err, stack) {
-      // Log as well as display: the status line truncates, and the full
-      // message is the only thing that identifies *which* resolution step
-      // failed on a device.
-      debugPrint('cera: native library failed to load: $err\n$stack');
-      setState(() => _status = 'Native library failed to load: $err');
-    }
-  }
-
   Future<void> _pickModel() async {
+    // `withData` matters on the web, where there is no path to open: the picker
+    // has to hand over the bytes themselves. On native it would mean reading a
+    // multi-gigabyte file into the heap when the engine could have mapped it,
+    // so ask for it only where it is the only option.
     final result = await FilePicker.platform.pickFiles(
       dialogTitle: 'Choose a .gguf model',
       type: FileType.any,
+      withData: !Cera.supportsPaths,
     );
-    final path = result?.files.single.path;
-    if (path == null) return;
+    final file = result?.files.single;
+    if (file == null) return;
+
     setState(() {
-      _modelPath = path;
-      _status = 'Model: ${path.split(Platform.pathSeparator).last}';
+      _loading = true;
+      _status = 'Loading ${file.name}…';
       _turns.clear();
     });
+
+    try {
+      // Close any previous model first: two sets of weights will not fit
+      // alongside each other on a phone, and on the web they compete for one
+      // wasm heap. Inside the try, so a failure here cannot leave `_loading`
+      // stuck true and the whole UI disabled with nothing shown.
+      await _cera?.close();
+      _cera = null;
+      final path = file.path;
+      final cera = path != null
+          ? await Cera.openPath(path)
+          : await Cera.openBytes(file.bytes!);
+      // Every setState here follows an await, so it needs the guard: loading a
+      // multi-hundred-megabyte model takes long enough for the page to be
+      // disposed underneath it.
+      if (!mounted) {
+        await cera.close();
+        return;
+      }
+      setState(() {
+        _cera = cera;
+        _status = '${file.name} · ${cera.backend}';
+      });
+    } catch (err, stack) {
+      // Log as well as display: the status line truncates, and the full message
+      // is the only thing that says which step failed.
+      debugPrint('cera: model failed to load: $err\n$stack');
+      if (mounted) setState(() => _status = 'Failed to load: $err');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
   }
 
   Future<void> _send() async {
     final prompt = _input.text.trim();
-    final modelPath = _modelPath;
-    if (prompt.isEmpty || modelPath == null || _busy) return;
+    final cera = _cera;
+    if (prompt.isEmpty || cera == null || _busy) return;
 
     _input.clear();
     setState(() {
-      _busy = true;
       _turns.add(Turn(role: 'user', text: prompt));
       _turns.add(Turn(role: 'assistant', text: ''));
     });
     _scrollToBottom();
 
-    final receive = ReceivePort();
-    final sendPort = receive.sendPort;
-
-    // Tokens stream back over the port; each one appends to the last turn.
-    final sub = receive.listen((message) {
-      if (message is String) {
-        setState(() => _turns.last.text += message);
-        _scrollToBottom();
-      }
-    });
-
+    // Render the turn through the model's chat template so it answers rather
+    // than continuing the transcript. A GGUF without one throws, and a raw
+    // prompt is the honest fallback there. A closed engine throws here too, so
+    // report that rather than pressing on into a generate that cannot work.
+    String framed;
     try {
-      await Isolate.run(() => _generateOnIsolate(modelPath, prompt, sendPort));
-    } catch (err) {
-      setState(() => _turns.last.text = 'Error: $err');
-    } finally {
-      await sub.cancel();
-      receive.close();
-      setState(() => _busy = false);
+      framed = await cera.applyChatTemplate([CeraMessage.user(prompt)]);
+    } on StateError catch (err) {
+      if (mounted) setState(() => _turns.last.text = 'Error: $err');
+      return;
+    } catch (_) {
+      framed = prompt;
     }
+    if (!mounted) return;
+
+    // Completed from the stream's terminal callbacks AND from `_stop`.
+    // Cancelling a subscription suppresses `onDone`, so a Stop press would
+    // otherwise leave the `await` below pending for the life of the app.
+    final done = Completer<void>();
+    _finishTurn = () {
+      if (!done.isCompleted) done.complete();
+    };
+    final sub = cera.generate(framed, maxTokens: 256).listen(
+      (piece) {
+        setState(() => _turns.last.text += piece);
+        _scrollToBottom();
+      },
+      onError: (Object err) {
+        setState(() => _turns.last.text = 'Error: $err');
+        if (!done.isCompleted) done.complete();
+      },
+      onDone: () {
+        if (!done.isCompleted) done.complete();
+      },
+      cancelOnError: true,
+    );
+    if (!mounted) {
+      await sub.cancel();
+      return;
+    }
+    setState(() => _generation = sub);
+
+    await done.future;
+    _finishTurn = null;
+    await sub.cancel();
+    if (mounted) setState(() => _generation = null);
+  }
+
+  void _stop() {
+    // Cancel the SUBSCRIPTION, not the engine. `Cera.cancel` is best-effort and
+    // reaches neither web backend's running decode, whereas dropping the
+    // subscription stops delivery immediately on every platform, which is what
+    // a Stop button owes the user. The stream's own onCancel still asks the
+    // engine to stop where it can.
+    //
+    // Deliberately not awaited: on the web's CPU backend that future waits on a
+    // worker reply the worker cannot dequeue until its synchronous decode
+    // finishes, so awaiting it would leave the Stop button and the disabled
+    // input up for the rest of a decode the user just stopped.
+    unawaited(_generation?.cancel());
+    _finishTurn?.call();
+    setState(() => _generation = null);
   }
 
   void _scrollToBottom() {
@@ -191,7 +272,7 @@ class _ChatPageState extends State<ChatPage> {
                 Expanded(
                   child: TextField(
                     controller: _input,
-                    enabled: _modelPath != null && !_busy,
+                    enabled: _cera != null && !_busy,
                     onSubmitted: (_) => _send(),
                     decoration: const InputDecoration(
                       hintText: 'Ask something…',
@@ -200,16 +281,23 @@ class _ChatPageState extends State<ChatPage> {
                   ),
                 ),
                 const SizedBox(width: 8),
-                IconButton.filled(
-                  onPressed: _modelPath != null && !_busy ? _send : null,
-                  icon: _busy
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.send),
-                ),
+                if (_generation != null)
+                  IconButton.filled(
+                    onPressed: _stop,
+                    icon: const Icon(Icons.stop),
+                    tooltip: 'Stop generating',
+                  )
+                else
+                  IconButton.filled(
+                    onPressed: _cera != null && !_busy ? _send : null,
+                    icon: _loading
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.send),
+                  ),
               ],
             ),
           ),
@@ -241,56 +329,4 @@ class _Bubble extends StatelessWidget {
       ),
     );
   }
-}
-
-/// Runs on a background isolate: loads the model, renders the chat template,
-/// generates, and posts decoded text back as it goes.
-///
-/// The engine and session are created here and dropped when the isolate exits.
-/// A real app would keep them alive across turns; this reloads each time to
-/// keep the example self-contained.
-void _generateOnIsolate(String modelPath, String prompt, SendPort send) {
-  final engine = CeraEngine.fromPath(
-    modelPath,
-    const EngineConfig(
-      contextSize: 4096,
-      // Auto probes the GPU backend (Metal on Apple) and falls back to CPU.
-      backend: BackendPreference.auto,
-      bundleRepo: null,
-    ),
-  );
-
-  final rendered = engine.hasChatTemplate()
-      ? engine.applyChatTemplate(
-          [ChatMessage(role: 'user', content: prompt)],
-          true,
-        )
-      : prompt;
-
-  final session = engine.newSession(const SessionConfig(
-    maxSeqLen: null,
-    kvCompression: KvCompressionNone(),
-    nKeep: 0,
-    seed: null,
-    ubatchSize: 512,
-  ));
-
-  session.appendTokens(engine.encodeTextSpecial(rendered, true));
-
-  final out = session.generate(const GenerateOpts(
-    maxTokens: 256,
-    temperature: 0.7,
-    topP: 0.95,
-    topK: 40,
-    minP: 0.0,
-    repetitionPenalty: 1.1,
-    stopTokens: <int>[],
-    ignoreEos: false,
-    grammar: null,
-    grammarTriggerTokens: <int>[],
-    flushEveryTokens: 0,
-    flushEveryMs: 0,
-  ));
-
-  send.send(engine.decodeTokens(out.tokens));
 }

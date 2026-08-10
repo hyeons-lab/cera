@@ -877,11 +877,15 @@ jobs:
       - name: Test
         run: cd cera_ffi && dart test
 
-      - name: Web build (the generated stub compiles for a browser)
-        # The one check that cannot be done from the VM. `cera_ffi` exports the
-        # bindings conditionally, and the web branch is a GENERATED stub with the
-        # same API and no dart:ffi. Its whole job is to let an app that also
-        # targets web compile at all, and the only proof of that is compiling one.
+      - name: Web build (the web implementation compiles for a browser)
+        # The one check that cannot be done from the VM. Two separate things
+        # only a browser build can prove:
+        #
+        # 1. `Cera`'s web implementation compiles. It is real code (dart:js_interop
+        #    extension types, a Worker, transferable buffers) that no VM test
+        #    ever loads, so `dart analyze` passing is not the same as it
+        #    compiling. dart2js is what type-checks the interop.
+        # 2. The generated stub still carries the full binding surface (below).
         #
         # A dart:ffi import anywhere on the graph fails the entire build, so this
         # catches the stub falling behind the bindings — a member added to one and
@@ -907,12 +911,46 @@ jobs:
           EOF
           flutter pub add cera_ffi_flutter --path "${GITHUB_WORKSPACE}/cera_ffi_flutter" >/dev/null
           cat > lib/main.dart <<'EOF'
+          import 'dart:async';
+          import 'dart:typed_data';
+
           import 'package:flutter/material.dart';
           import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
 
           // Touches a data type, a top-level function, an object constructor and
           // the loader. Referencing them is the point: dart2js only reports a
-          // missing name if something names it.
+          // missing name if something names it. The same goes for every `Cera`
+          // member below: an uncalled method is a method dart2js never checks.
+          Future<void> exerciseCera() async {
+            debugPrint('supportsPaths=${Cera.supportsPaths}');
+            try {
+              await Cera.openPath('model.gguf');
+            } on UnsupportedError catch (e) {
+              debugPrint('expected on web: ${e.message}');
+            }
+            // Never reached (no worker is served here), but it has to compile.
+            if (DateTime.now().year < 2000) {
+              final cera = await Cera.openBytes(
+                Uint8List(0),
+                options: const CeraOptions(
+                  contextSize: 512,
+                  backend: CeraBackend.gpu,
+                  web: CeraWebAssets(workerUrl: 'w.js', moduleUrl: 'm.js'),
+                ),
+              );
+              debugPrint(cera.backend);
+              await for (final piece in cera.generate('hi', maxTokens: 1)) {
+                debugPrint(piece);
+              }
+              debugPrint(await cera.applyChatTemplate([const CeraMessage.user('hi')]));
+              debugPrint('${await cera.encode('hi')}');
+              debugPrint(await cera.decode(const [1]));
+              await cera.reset();
+              await cera.cancel();
+              await cera.close();
+            }
+          }
+
           void main() {
             const config = EngineConfig(
               contextSize: 2048,
@@ -926,12 +964,47 @@ jobs:
             } on UnsupportedError catch (e) {
               debugPrint('expected on web: ${e.message}');
             }
+            unawaited(exerciseCera());
             runApp(const MaterialApp(home: Scaffold(body: Text('ok'))));
           }
           EOF
           flutter build web
           test -f build/web/main.dart.js
-          echo "web build OK: the stub carries the full API surface"
+          echo "web build OK: Cera's web impl compiles and the stub carries the full API surface"
+
+      - name: install_web puts the runtime where the defaults look for it
+        # `Cera`'s web defaults point at `web/cera/`, and the tool is what puts
+        # anything there. A default that names a path nothing writes is a
+        # broken-out-of-the-box package, and the failure would surface as a
+        # worker that never loads.
+        #
+        # The wasm pair is faked rather than built: this asserts the tool's
+        # placement and naming contract, and building cera-wasm here to check a
+        # file copy would cost minutes. The real artifacts are exercised by the
+        # wasm jobs.
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          mkdir -p "$WORK/fake" "$WORK/app"
+          : > "$WORK/fake/cera_wasm.js"
+          : > "$WORK/fake/cera_wasm_bg.wasm"
+          cd "$WORK/app"
+          cat > pubspec.yaml <<EOF
+          name: install_web_probe
+          publish_to: none
+          environment: {sdk: ^3.3.0}
+          dependencies:
+            cera_ffi: {path: ${GITHUB_WORKSPACE}/cera_ffi}
+          EOF
+          dart pub get >/dev/null
+          dart run cera_ffi:install_web --from "$WORK/fake"
+          for f in cera_worker.js cera_wasm.js cera_wasm_bg.wasm; do
+            test -f "web/cera/$f" || { echo "install_web did not write web/cera/$f"; exit 1; }
+          done
+          # Non-empty, i.e. the worker really came from the package rather than
+          # from the same `: >` that made the fakes.
+          test -s web/cera/cera_worker.js
+          echo "install_web OK"
 
       - name: Generator unit tests
         run: cargo test --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml
