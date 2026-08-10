@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use uniffi_bindgen::interface::{ffi::FfiType, Type};
+use uniffi_bindgen::interface::{ffi::FfiType, ObjectImpl, Type};
 
 use super::config::CustomTypeConfig;
 use super::*;
@@ -153,6 +153,33 @@ pub(super) fn is_runtime_unsupported_async_ffibuffer_eligible_method(
     async_rust_future_spec_from_uniffi_return_type(method.return_type.as_ref()).is_some()
 }
 
+/// Async constructors reachable through the ffi-buffer trampoline.
+///
+/// Unlike a method, a constructor carries no `return_type`: it always yields a
+/// `u64` object handle, so there is no return spec to look up. The scaffolding
+/// still hands back a `RustFuture` handle that has to be polled and completed
+/// via `rust_future_complete_u64`, exactly like an object-returning async
+/// method.
+pub(super) fn is_runtime_unsupported_async_ffibuffer_eligible_constructor(
+    ctor: &UdlObjectConstructor,
+) -> bool {
+    ctor.runtime_unsupported.is_some() && ctor.is_async && ctor.ffi_symbol.is_some()
+}
+
+/// The `Type` an async constructor resolves to, for the shared completion
+/// renderer.
+///
+/// `module_path` is deliberately the local one: it keeps
+/// `is_external_object_type` false so the result lifts as `Foo._(this, handle)`
+/// rather than routing through an external `FooFfiCodec`.
+pub(super) fn constructor_return_object_type(object_name: &str, local_module_path: &str) -> Type {
+    Type::Object {
+        name: object_name.to_string(),
+        module_path: local_module_path.to_string(),
+        imp: ObjectImpl::Struct,
+    }
+}
+
 pub(super) fn has_runtime_unsupported_async_ffibuffer_support(
     functions: &[UdlFunction],
     objects: &[UdlObject],
@@ -166,6 +193,9 @@ pub(super) fn has_runtime_unsupported_async_ffibuffer_support(
             o.methods
                 .iter()
                 .any(is_runtime_unsupported_async_ffibuffer_eligible_method)
+                || o.constructors
+                    .iter()
+                    .any(is_runtime_unsupported_async_ffibuffer_eligible_constructor)
         })
         || records.iter().any(|r| {
             r.methods
@@ -1187,5 +1217,92 @@ mod tests {
     fn ineligible_async() {
         let f = test_function(Some("uniffi_test".into()), true);
         assert!(!is_ffibuffer_eligible_function(&f));
+    }
+
+    // ── async constructors ──────────────────────────────────────────────
+    //
+    // Regression cover for the constructor renderer, which handled only the
+    // synchronous ffi-buffer path. Every async constructor fell through to a
+    // `throw UnsupportedError` stub even though its `uniffi_ffibuffer_*`
+    // trampoline was exported, because the rust-future branch existed for
+    // methods only.
+
+    fn test_constructor(
+        ffi_symbol: Option<String>,
+        is_async: bool,
+        runtime_unsupported: Option<String>,
+    ) -> UdlObjectConstructor {
+        UdlObjectConstructor {
+            name: "from_bundle_id_async".to_string(),
+            ffi_symbol,
+            ffi_arg_types: vec![],
+            ffi_return_type: None,
+            ffi_has_rust_call_status: false,
+            runtime_unsupported,
+            docstring: None,
+            is_async,
+            args: vec![],
+            throws_type: None,
+        }
+    }
+
+    #[test]
+    fn async_constructor_with_symbol_is_ffibuffer_eligible() {
+        let ctor = test_constructor(
+            Some("uniffi_test_ctor".into()),
+            true,
+            Some("unsupported".into()),
+        );
+        assert!(is_runtime_unsupported_async_ffibuffer_eligible_constructor(
+            &ctor
+        ));
+    }
+
+    #[test]
+    fn sync_constructor_is_not_on_the_async_path() {
+        // Sync constructors are served by the direct ffi-buffer call; routing
+        // them through the rust-future lifecycle would look up poll/complete
+        // symbols that were never generated for them.
+        let ctor = test_constructor(
+            Some("uniffi_test_ctor".into()),
+            false,
+            Some("unsupported".into()),
+        );
+        assert!(!is_runtime_unsupported_async_ffibuffer_eligible_constructor(&ctor));
+    }
+
+    #[test]
+    fn async_constructor_without_symbol_is_not_eligible() {
+        let ctor = test_constructor(None, true, Some("unsupported".into()));
+        assert!(!is_runtime_unsupported_async_ffibuffer_eligible_constructor(&ctor));
+    }
+
+    #[test]
+    fn supported_async_constructor_is_not_rerouted() {
+        // `runtime_unsupported: None` means the direct-call renderer already
+        // handles it; the ffi-buffer fallback must not also claim it.
+        let ctor = test_constructor(Some("uniffi_test_ctor".into()), true, None);
+        assert!(!is_runtime_unsupported_async_ffibuffer_eligible_constructor(&ctor));
+    }
+
+    #[test]
+    fn constructor_return_type_completes_through_the_u64_future() {
+        // A constructor has no declared return type; it always completes to a
+        // u64 object handle, so it must select `rust_future_complete_u64`.
+        let ty = constructor_return_object_type("CeraEngine", "cera_ffi");
+        let spec = async_rust_future_spec_from_uniffi_return_type(Some(&ty))
+            .expect("object return has a future spec");
+        assert_eq!(spec.suffix, "u64");
+        assert_eq!(spec.complete_dart_type, "int");
+    }
+
+    #[test]
+    fn constructor_return_type_is_local_so_it_lifts_in_place() {
+        // Sharing the local module path keeps `is_external_object_type` false,
+        // so the result lifts as `CeraEngine._(this, handle)` rather than
+        // routing through an external `CeraEngineFfiCodec`.
+        let ty = constructor_return_object_type("CeraEngine", "cera_ffi");
+        assert!(!is_external_object_type(&ty, "cera_ffi"));
+        assert_eq!(object_name_from_type(&ty), Some("CeraEngine"));
     }
 }

@@ -51,6 +51,16 @@ void main() {
     // compiling and the test fails to load. Nothing to assert at runtime.
     expect(_surfaceGuard, isA<Function>());
   });
+
+  test('fromBundleIdAsync returns a Future, not a bare engine', () {
+    // The generator had no rust-future path for async *constructors* (only for
+    // methods), so this used to be a synchronous `throw UnsupportedError`. The
+    // static type is the regression signal: a stub body that threw would still
+    // satisfy `Future<CeraEngine>` if the wrapper were marked `async`, but the
+    // tear-off's type would not survive the generator dropping the ctor.
+    expect(CeraEngine.fromBundleIdAsync,
+        isA<Future<CeraEngine> Function(String, String, EngineConfig)>());
+  });
 }
 
 /// Compile-time reference to every method that used to be a runtime stub.

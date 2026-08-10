@@ -4614,8 +4614,206 @@ class CeraFfiFfi {
     }
   }
 
-  CeraEngine ceraEngineCreateFromBundleIdAsync(String bundleId, String quant, EngineConfig config) {
-    throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (from_bundle_id_async)');
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineCtorFromBundleIdAsyncFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_constructor_ceraengine_from_bundle_id_async');
+  late final void Function(int handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, int callbackData) _ceraEngineCtorFromBundleIdAsyncFfiBufferRustFuturePoll = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, ffi.Uint64 callbackData), void Function(int handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, int callbackData)>('ffi_cera_ffi_rust_future_poll_u64');
+  late final void Function(int handle) _ceraEngineCtorFromBundleIdAsyncFfiBufferRustFutureCancel = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle), void Function(int handle)>('ffi_cera_ffi_rust_future_cancel_u64');
+  late final int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _ceraEngineCtorFromBundleIdAsyncFfiBufferRustFutureComplete = _lib.lookupFunction<ffi.Uint64 Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('ffi_cera_ffi_rust_future_complete_u64');
+  late final void Function(int handle) _ceraEngineCtorFromBundleIdAsyncFfiBufferRustFutureFree = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle), void Function(int handle)>('ffi_cera_ffi_rust_future_free_u64');
+
+  Future<CeraEngine> ceraEngineCreateFromBundleIdAsync(String bundleId, String quant, EngineConfig config) async {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(9);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final Uint8List bundleIdBytes = Uint8List.fromList(utf8.encode(bundleId));
+      final ffi.Pointer<ffi.Uint8> bundleIdPtr = bundleIdBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(bundleIdBytes.length);
+      if (bundleIdBytes.isNotEmpty) { bundleIdPtr.asTypedList(bundleIdBytes.length).setAll(0, bundleIdBytes); }
+      foreignArgPtrs.add(bundleIdPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> bundleIdFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      bundleIdFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      bundleIdFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> bundleIdForeignPtr = calloc<_UniFfiForeignBytes>();
+      bundleIdForeignPtr.ref
+        ..len = bundleIdBytes.length
+        ..data = bundleIdPtr;
+      final _UniFfiRustBuffer bundleIdRustBuffer = _uniFfiRustBufferFromBytes(bundleIdForeignPtr.ref, bundleIdFromBytesStatusPtr);
+      calloc.free(bundleIdForeignPtr);
+      final int bundleIdFromBytesCode = bundleIdFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer bundleIdFromBytesErrBuf = bundleIdFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(bundleIdFromBytesStatusPtr);
+      if (bundleIdFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> bundleIdFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        bundleIdFromBytesErrBufPtr.ref
+          ..capacity = bundleIdFromBytesErrBuf.capacity
+          ..len = bundleIdFromBytesErrBuf.len
+          ..data = bundleIdFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(bundleIdFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $bundleIdFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = bundleIdRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = bundleIdRustBuffer.len;
+      (argBuf + 2).ref.ptr = bundleIdRustBuffer.data.cast<ffi.Void>();
+      final Uint8List quantBytes = Uint8List.fromList(utf8.encode(quant));
+      final ffi.Pointer<ffi.Uint8> quantPtr = quantBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(quantBytes.length);
+      if (quantBytes.isNotEmpty) { quantPtr.asTypedList(quantBytes.length).setAll(0, quantBytes); }
+      foreignArgPtrs.add(quantPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> quantFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      quantFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      quantFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> quantForeignPtr = calloc<_UniFfiForeignBytes>();
+      quantForeignPtr.ref
+        ..len = quantBytes.length
+        ..data = quantPtr;
+      final _UniFfiRustBuffer quantRustBuffer = _uniFfiRustBufferFromBytes(quantForeignPtr.ref, quantFromBytesStatusPtr);
+      calloc.free(quantForeignPtr);
+      final int quantFromBytesCode = quantFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer quantFromBytesErrBuf = quantFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(quantFromBytesStatusPtr);
+      if (quantFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> quantFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        quantFromBytesErrBufPtr.ref
+          ..capacity = quantFromBytesErrBuf.capacity
+          ..len = quantFromBytesErrBuf.len
+          ..data = quantFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(quantFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $quantFromBytesCode');
+      }
+      (argBuf + 3).ref.u64 = quantRustBuffer.capacity;
+      (argBuf + 4).ref.u64 = quantRustBuffer.len;
+      (argBuf + 5).ref.ptr = quantRustBuffer.data.cast<ffi.Void>();
+      final Uint8List configBytes = _uniffiEncodeEngineConfig(config);
+      final ffi.Pointer<ffi.Uint8> configPtr = configBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(configBytes.length);
+      if (configBytes.isNotEmpty) { configPtr.asTypedList(configBytes.length).setAll(0, configBytes); }
+      foreignArgPtrs.add(configPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> configFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      configFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      configFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> configForeignPtr = calloc<_UniFfiForeignBytes>();
+      configForeignPtr.ref
+        ..len = configBytes.length
+        ..data = configPtr;
+      final _UniFfiRustBuffer configRustBuffer = _uniFfiRustBufferFromBytes(configForeignPtr.ref, configFromBytesStatusPtr);
+      calloc.free(configForeignPtr);
+      final int configFromBytesCode = configFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer configFromBytesErrBuf = configFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(configFromBytesStatusPtr);
+      if (configFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> configFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        configFromBytesErrBufPtr.ref
+          ..capacity = configFromBytesErrBuf.capacity
+          ..len = configFromBytesErrBuf.len
+          ..data = configFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(configFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $configFromBytesCode');
+      }
+      (argBuf + 6).ref.u64 = configRustBuffer.capacity;
+      (argBuf + 7).ref.u64 = configRustBuffer.len;
+      (argBuf + 8).ref.ptr = configRustBuffer.data.cast<ffi.Void>();
+      _ceraEngineCtorFromBundleIdAsyncFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer async start failed with status $statusCode');
+      }
+      final int futureHandle = (returnBuf + 0).ref.u64;
+      final StreamController<int> pollEvents = StreamController<int>.broadcast();
+      final callback = ffi.NativeCallable<ffi.Void Function(ffi.Uint64, ffi.Int8)>.listener((int _, int pollResult) {
+        pollEvents.add(pollResult);
+      });
+      try {
+        _ceraEngineCtorFromBundleIdAsyncFfiBufferRustFuturePoll(futureHandle, callback.nativeFunction, 0);
+        while (true) {
+          final int pollResult = await pollEvents.stream.first;
+          if (pollResult == _rustFuturePollReady) {
+            break;
+          }
+          if (pollResult == _rustFuturePollWake) {
+            _ceraEngineCtorFromBundleIdAsyncFfiBufferRustFuturePoll(futureHandle, callback.nativeFunction, 0);
+            continue;
+          }
+          throw StateError('Rust future poll returned invalid status for from_bundle_id_async: $pollResult');
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> outStatusPtr = calloc<_UniFfiRustCallStatus>();
+        outStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        outStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        try {
+          final int resultValue = _ceraEngineCtorFromBundleIdAsyncFfiBufferRustFutureComplete(futureHandle, outStatusPtr);
+          final int completeStatusCode = outStatusPtr.ref.code;
+          if (completeStatusCode == _uniFfiRustCallStatusSuccess) {
+            return CeraEngine._(this, resultValue);
+          }
+          if (completeStatusCode == _uniFfiRustCallStatusCancelled) {
+            throw StateError('Rust future was cancelled for from_bundle_id_async');
+          }
+          final _UniFfiRustBuffer errorBuf = outStatusPtr.ref.errorBuf;
+          if (!(errorBuf.data == ffi.nullptr && errorBuf.len == 0 && errorBuf.capacity == 0)) {
+            final ffi.Pointer<_UniFfiRustBuffer> errorBufPtr = calloc<_UniFfiRustBuffer>();
+            errorBufPtr.ref
+              ..capacity = errorBuf.capacity
+              ..len = errorBuf.len
+              ..data = errorBuf.data;
+            rustRetBufferPtrs.add(errorBufPtr);
+            final Uint8List errorBytes = errorBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errorBufPtr.ref.data.asTypedList(errorBufPtr.ref.len));
+            if (completeStatusCode == _uniFfiRustCallStatusError && errorBytes.isNotEmpty) {
+              throw _uniffiLiftFfiErrorException(errorBytes);
+            }
+            if (errorBytes.isNotEmpty) {
+              throw StateError(utf8.decode(errorBytes, allowMalformed: true));
+            }
+          }
+          throw StateError('Rust future failed for from_bundle_id_async with status code: $completeStatusCode');
+        } finally {
+          calloc.free(outStatusPtr);
+        }
+      } catch (_) {
+        _ceraEngineCtorFromBundleIdAsyncFfiBufferRustFutureCancel(futureHandle);
+        rethrow;
+      } finally {
+        await pollEvents.close();
+        callback.close();
+        _ceraEngineCtorFromBundleIdAsyncFfiBufferRustFutureFree(futureHandle);
+      }
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
   }
 
   late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineCtorFromPathFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_constructor_ceraengine_from_path');

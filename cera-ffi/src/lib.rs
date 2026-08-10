@@ -1326,8 +1326,8 @@ impl From<cera::GenerateSummary> for GenerateSummary {
 pub struct GenerateOutput {
     /// Generated token IDs, in order, not including any prompt
     /// tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-    /// Rust side or (once exposed) through a tokenizer handle on the
-    /// FFI side.
+    /// Rust side, or with [`CeraEngine::decode_tokens`] from any
+    /// foreign binding.
     pub tokens: Vec<u32>,
     pub summary: GenerateSummary,
 }

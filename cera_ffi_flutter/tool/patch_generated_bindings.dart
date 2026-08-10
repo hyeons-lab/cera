@@ -10,19 +10,20 @@
 //   1. `.ref.pointer` -> `.ref.ptr`  (3 sites)
 //      The `_UniFfiFfiBufferElement` union field is named `ptr`; the generator
 //      reads a non-existent `pointer` getter when unpacking returned pointers.
-//   2. async constructor return type (1 site)
-//      `fromBundleIdAsync` is declared `Future<CeraEngine>` but its body returns
-//      the (generator-stubbed, synchronous) inner call. Marking the wrapper
-//      `async` auto-wraps the return into a Future and turns the stub's throw
-//      into a rejected Future — type-correct, behaviour unchanged.
+//   2. async constructor wrapper (1 site)
+//      The public `CeraEngine.fromBundleIdAsync` wrapper is declared
+//      `Future<CeraEngine>` but is not marked `async`, so it returns the inner
+//      binding call's Future directly. Marking it `async` makes the declared
+//      and actual return types agree.
 //
 //   (Callback-interface lowering is NO LONGER patched here. The vendored
 //    generator under `third_party/uniffi-bindgen-dart` now lowers
 //    `DownloadProgressSink` / `ModalitySink` arguments and emits working
 //    callback vtables, so the `*WithProgress` / `*Streaming*` entry points —
 //    including `generateStreamingAsync` via NativeCallable.listener — type-check
-//    and run without a patch. `fromBundleIdAsync` still throws; it needs the
-//    object/pointer rust-future variant. Tracked in V2.17.)
+//    and run without a patch. The async-constructor body is no longer patched
+//    either: the generator drives the real rust-future lifecycle for
+//    `fromBundleIdAsync` rather than emitting a throwing stub.)
 //
 // Plus native-lib resolution, RustBuffer/rust_future symbol names, and the
 // EngineConfig record encoder (Fixes 4–6 below).
@@ -52,7 +53,7 @@ void main(List<String> args) {
     stdout.writeln('  fixed .ref.pointer -> .ref.ptr ($getterHits sites)');
   }
 
-  // Fix 2: async constructor return type.
+  // Fix 2: mark the public async-constructor wrapper `async`.
   const asyncSig =
       'fromBundleIdAsync(String bundleId, String quant, EngineConfig config) {';
   const asyncFixed =
@@ -60,15 +61,14 @@ void main(List<String> args) {
   if (src.contains(asyncSig)) {
     src = src.replaceAll(asyncSig, asyncFixed);
     applied += 1;
-    stdout.writeln('  fixed fromBundleIdAsync return type (1 site)');
+    stdout.writeln('  marked fromBundleIdAsync wrapper async (1 site)');
   }
 
   // (No callback-stubbing fix: the vendored generator now lowers the sink
   // arguments and emits working callback vtables, so `*WithProgress` and
   // `*Streaming*` — including `generateStreamingAsync` via NativeCallable.listener
-  // — type-check and run without a patch. `fromBundleIdAsync` keeps the
-  // generator's own throwing stub; it needs the object/pointer rust-future
-  // variant. See V2.17.)
+  // — type-check and run without a patch. `fromBundleIdAsync` needs no body
+  // patch either; the generator emits its rust-future poll/complete lifecycle.)
 
   // Fix 4: native-library resolution. The generator emits a single
   // `libraryName = 'uniffi_cera_ffi'` and `DynamicLibrary.open(libraryName)`,

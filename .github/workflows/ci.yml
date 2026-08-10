@@ -835,12 +835,11 @@ jobs:
       - name: Assert no method is stubbed out
         # A regression in the generator's return-type handling shows up as a
         # `throw UnsupportedError` in place of a real body, which `dart analyze`
-        # is perfectly happy with. Only `from_bundle_id_async` is a known,
-        # accepted stub; anything else means a method silently stopped working.
+        # is perfectly happy with. Every method now has a real implementation,
+        # so any hit here means one silently stopped working.
         run: |
           cd cera_ffi_flutter
-          unexpected=$(grep -n "not implemented yet" lib/src/generated/cera_ffi.dart \
-            | grep -v "from_bundle_id_async" || true)
+          unexpected=$(grep -n "not implemented yet" lib/src/generated/cera_ffi.dart || true)
           if [ -n "${unexpected}" ]; then
             echo "::error::Generated bindings contain unexpected runtime stubs:"
             echo "${unexpected}"
