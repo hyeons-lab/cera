@@ -18,11 +18,17 @@
 //!
 //! ## What a regression here would most likely be
 //!
-//! The port carries two known divergences, both documented in the .slang: no
-//! `simdgroup_barrier` between the operand loads and the MMAs, and a two-round
-//! ragged epilogue instead of a single reinterpreted scratch buffer. Only the
-//! first can touch these numbers, since every shape below is a whole multiple of
-//! the 64x32 tile and takes the fast-path store.
+//! Check the build log first. `build_support/msl_postpass.rs` rewrites the
+//! generated MSL for folded addressing, and that rewrite is worth about 5% here
+//! (~0.93x without it, ~0.98x with it). It declines with a `cargo:warning`
+//! rather than failing when slangc moves its anchors, so a sudden drop to ~0.93x
+//! means the pass stopped applying, not that a kernel changed.
+//!
+//! Otherwise: the port carries two known divergences, both documented in the
+//! .slang: no `simdgroup_barrier` between the operand loads and the MMAs, and a
+//! two-round ragged epilogue instead of a single reinterpreted scratch buffer.
+//! Only the first can touch these numbers, since every shape below is a whole
+//! multiple of the 64x32 tile and takes the fast-path store.
 //!
 //! A third possibility is invisible in the source: eight live 8x8 float
 //! accumulators plus six operand registers may or may not survive as registers
@@ -51,9 +57,16 @@ const ITERS: u64 = 20;
 /// real sample.
 const ROUNDS: usize = 7;
 
-/// Threadgroup scratch the handwritten kernel takes as an argument: 4 KB of half
-/// weights + 4 KB of float input. The Slang port declares the same 8 KB
-/// statically, which is why only one arm sets this.
+/// Threadgroup scratch both kernels take as an argument: 4 KB of half weights +
+/// 4 KB of float input. Slang declares the same 8 KB statically, but `build.rs`
+/// rewrites it into a `[[threadgroup(0)]]` parameter, since static groupshared
+/// blocks the native AGX compiler from folding load displacements.
+///
+/// Both arms set it unconditionally. That is correctness-safe either way, but
+/// note it is not timing-neutral: if the post-pass ever declined, the Slang arm
+/// would carry its 8 KB of static groupshared *plus* this allocation, so the
+/// ratio printed below would understate the real unpatched kernel. The
+/// `generated_gemm_is_post_processed` parity test is what catches a decline.
 const SHMEM_BYTES: u64 = 8192;
 
 /// `(m, k, n)`: output rows, reduction depth, token count. All whole multiples
@@ -118,13 +131,7 @@ fn make_bufs(ctx: &MetalContext, m: usize, k: usize, n: usize) -> Bufs {
     }
 }
 
-fn encode(
-    ctx: &MetalContext,
-    pipeline: &metal::ComputePipelineState,
-    b: &Bufs,
-    needs_shmem: bool,
-    iters: u64,
-) {
+fn encode(ctx: &MetalContext, pipeline: &metal::ComputePipelineState, b: &Bufs, iters: u64) {
     let cb = ctx.queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(pipeline);
@@ -132,9 +139,7 @@ fn encode(
     enc.set_buffer(1, Some(&b.src1), 0);
     enc.set_buffer(2, Some(&b.dst), 0);
     enc.set_buffer(3, Some(&b.params), 0);
-    if needs_shmem {
-        enc.set_threadgroup_memory_length(0, SHMEM_BYTES);
-    }
+    enc.set_threadgroup_memory_length(0, SHMEM_BYTES);
     for _ in 0..iters {
         enc.dispatch_thread_groups(
             b.grid,
@@ -156,14 +161,9 @@ fn encode(
 /// Every dispatch writes the same output from the same inputs. That is fine for
 /// timing (the work is identical and data-independent) and it keeps re-uploads
 /// out of the timed region.
-fn time_dispatches(
-    ctx: &MetalContext,
-    pipeline: &metal::ComputePipelineState,
-    b: &Bufs,
-    needs_shmem: bool,
-) -> f64 {
+fn time_dispatches(ctx: &MetalContext, pipeline: &metal::ComputePipelineState, b: &Bufs) -> f64 {
     let start = std::time::Instant::now();
-    encode(ctx, pipeline, b, needs_shmem, ITERS);
+    encode(ctx, pipeline, b, ITERS);
     start.elapsed().as_secs_f64() * 1e6 / ITERS as f64
 }
 
@@ -229,8 +229,8 @@ fn main() {
     for &(m, k, n) in &[(128usize, 256usize, 64usize), (192, 128, 96)] {
         let a = make_bufs(&ctx, m, k, n);
         let b = make_bufs(&ctx, m, k, n);
-        encode(&ctx, &hand, &a, true, 1);
-        encode(&ctx, &slang, &b, false, 1);
+        encode(&ctx, &hand, &a, 1);
+        encode(&ctx, &slang, &b, 1);
         let ra = ctx.read_f32(&a.dst, m * n);
         let rb = ctx.read_f32(&b.dst, m * n);
 
@@ -270,8 +270,8 @@ fn main() {
 
         // Discarded: the first dispatch after pipeline creation pays compilation
         // and power-state ramp.
-        time_dispatches(&ctx, &hand, &bh, true);
-        time_dispatches(&ctx, &slang, &bs, false);
+        time_dispatches(&ctx, &hand, &bh);
+        time_dispatches(&ctx, &slang, &bs);
 
         let mut t_hand = Vec::with_capacity(ROUNDS);
         let mut t_slang = Vec::with_capacity(ROUNDS);
@@ -279,11 +279,11 @@ fn main() {
             // Alternate order so a monotonic drift across the run cannot be
             // attributed to whichever arm happens to run second.
             if r % 2 == 0 {
-                t_hand.push(time_dispatches(&ctx, &hand, &bh, true));
-                t_slang.push(time_dispatches(&ctx, &slang, &bs, false));
+                t_hand.push(time_dispatches(&ctx, &hand, &bh));
+                t_slang.push(time_dispatches(&ctx, &slang, &bs));
             } else {
-                t_slang.push(time_dispatches(&ctx, &slang, &bs, false));
-                t_hand.push(time_dispatches(&ctx, &hand, &bh, true));
+                t_slang.push(time_dispatches(&ctx, &slang, &bs));
+                t_hand.push(time_dispatches(&ctx, &hand, &bh));
             }
         }
 

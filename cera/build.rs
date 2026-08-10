@@ -1,5 +1,10 @@
 use std::process::Command;
 
+// Rewrites Slang's `gemm_q8_0` MSL into the shape the native AGX compiler folds
+// addressing for. Kept in its own file, and free of I/O, so `tests/msl_postpass.rs`
+// can `include!` the same source and exercise it directly.
+include!("build_support/msl_postpass.rs");
+
 // Embeds a best-effort short git SHA into the build for provenance
 // (`cera::build_info()` / `cera::GIT_SHA`). Consumers such as the Pipette
 // benchmark app report it alongside results, the way llama.cpp surfaces its
@@ -23,6 +28,10 @@ fn main() {
     });
     println!("cargo:rustc-env=CERA_GIT_SHA={sha}");
     println!("cargo:rerun-if-env-changed=CERA_GIT_SHA");
+    // Cargo picks this up through the build script's dep-info, but the
+    // dependency is declared explicitly so that editing the post-pass visibly
+    // regenerates the shader rather than relying on that inference.
+    println!("cargo:rerun-if-changed=build_support/msl_postpass.rs");
 
     // Compile the Slang SPIR-V passthrough kernels (gpu feature only). Each is
     // written to OUT_DIR and `include_spirv_raw!`d from there, so slangc is the
@@ -199,9 +208,49 @@ fn compile_slang_multitarget(want_wgsl: bool, want_msl: bool) {
                 std::fs::copy(&committed, &out)
                     .unwrap_or_else(|e| panic!("no compiled or committed {ext} for {name}: {e}"));
             }
+
+            // Deliberately after the compile-or-fallback write, so it covers
+            // both paths, and against OUT_DIR only, so the committed artifact
+            // stays byte-identical to slangc output for the CI drift check.
+            if *name == "gemm_q8_0" && *target == "metal" {
+                apply_msl_postpass(&out, name);
+            }
         }
     }
     println!("cargo:rerun-if-env-changed=SLANGC");
+}
+
+/// Rewrite a generated MSL file in place for folded addressing.
+///
+/// Declining is not an error: the unpatched shader is correct, just slower, so a
+/// slangc upgrade that moves the anchors costs performance and prints a warning
+/// rather than breaking the build. See `build_support/msl_postpass.rs` for the
+/// contract.
+fn apply_msl_postpass(path: &str, name: &str) {
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("cargo:warning=cannot read generated {name}.metal to post-process: {e}");
+            return;
+        }
+    };
+    match postpass_gemm_msl(&src) {
+        Ok(patched) => {
+            // Write beside the target and rename, so a failure part-way through
+            // leaves the readable unpatched file rather than a truncated one.
+            // `fs::write` truncates first, which would produce exactly the
+            // half-patched artifact the pass promises never to emit.
+            let tmp = format!("{path}.tmp");
+            let staged = std::fs::write(&tmp, patched).and_then(|()| std::fs::rename(&tmp, path));
+            if let Err(e) = staged {
+                let _ = std::fs::remove_file(&tmp);
+                println!("cargo:warning=cannot write post-processed {name}.metal: {e}");
+            }
+        }
+        Err(why) => println!(
+            "cargo:warning=MSL post-pass declined on {name}.metal ({why}); shipping unpatched Slang output, which is correct but ~5% slower than the patched shader on the simdgroup GEMM."
+        ),
+    }
 }
 
 /// Entry-point names to pass to slangc for a multi-target kernel.

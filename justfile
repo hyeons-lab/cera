@@ -17,13 +17,17 @@ test:
 clippy:
     cargo clippy --workspace -- -D warnings
 
-# Check formatting
+# Check formatting. The second command exists because rustfmt does not descend
+# into `include!`d files, so the build-script helpers under cera/build_support/
+# are invisible to `cargo fmt`. CI mirrors both.
 fmt:
     cargo fmt --check
+    rustfmt --edition 2024 --check cera/build_support/*.rs
 
 # Format code
 fmt-fix:
     cargo fmt
+    rustfmt --edition 2024 cera/build_support/*.rs
 
 # Recompile the committed Slang SPIR-V fallbacks from their .slang sources.
 # build.rs compiles with slangc directly; the checked-in .spv is only the

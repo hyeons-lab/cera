@@ -108,27 +108,57 @@ portable branch untouched:
 | `packed_char4` vectorized dequant | **0.93** | 896 |
 
 The generated kernel ends up bit-identical to the handwritten one, at *higher*
-occupancy (896 vs 832) and *fewer* dequant loads (4 `packed_char4` vs 16 scalar
-`int8`). The residual ~7% is Slang wrapping every `CoopMat` load and
-multiply-accumulate in a by-value helper, inherent to the abstraction and
-removable only by hand-writing the MMA in raw MSL.
+occupancy (896 vs 832). It does not issue fewer dequant loads, though an earlier
+revision of this file claimed 4 `packed_char4` against 16 scalar `int8`: AIR
+shows 16 scalar `load i8` per k-tile in both. What `packed_char4` removes is the
+shift/mask/sign-extend arithmetic around each load, not the loads.
+
+The residual ~7% turned out **not** to be the `CoopMat` abstraction, which an
+earlier revision of this file claimed. Native AGX disassembly shows the kernel
+body makes no `linalg_*` calls; the cost is address arithmetic. The native
+compiler folds load displacements into the load immediate for the handwritten
+kernel and not for the generated one:
+
+| kernel | `threadgroup_load`s | base regs | distinct immediates | MMAs |
+|--------|---------------------|-----------|---------------------|------|
+| handwritten | 26 | 4 | 21 | 32 |
+| generated | 13 | 11 | 2 | 16 |
+| generated, rewritten | 25 | 4 | 21 | 32 |
+
+The MMA column is there because the first two rows are not like for like: the
+generated loop is unrolled half as far, so it has half the loads to place, and a
+base-register count only means anything at a matched unroll factor. The third
+row is the comparable one.
+
+Three properties of the emitted MSL are each necessary and only jointly
+sufficient for that folding: scratch as a `[[threadgroup(0)]]` parameter,
+pointer-typed k-loop induction, and `#pragma unroll` on the k-loop. Slang can
+express none of them, so `cera/build_support/msl_postpass.rs` rewrites the
+generated MSL in `build.rs` (OUT_DIR only, so the committed artifact stays
+byte-identical for the drift check below). That takes the large shapes to
+**~0.98x**. See that file for the ablations and the upstream issues.
 
 Two levers were measured and **rejected** (recorded here and in the `.slang`
-header so they are not retried): the `simdgroup_barrier(mem_flags::mem_none)`
-operand-load hint (expressible via `__target_intrinsic`, but neutral on Apple
-silicon in both the dequant-bound and scheduling-bound regimes) and unrolling the
-`ik` loop (it gives every iteration's operands distinct registers, dropping
-occupancy 896 to 704; the inner loops are unrolled but `ik` stays rolled).
+header so they are not retried). The first is the
+`simdgroup_barrier(mem_flags::mem_none)` operand-load hint, expressible via
+`__target_intrinsic` but neutral on Apple silicon in both the dequant-bound and
+scheduling-bound regimes.
+
+The second is unrolling `ik` **in Slang**: it gives every iteration's
+operands distinct registers, dropping occupancy 896 to 704, and measures 0.89x.
+That is a different lever from the `#pragma unroll` the post-pass adds, which
+attaches AIR loop metadata rather than unrolling the source.
 
 ## The migration verdict
 
-A generated simdgroup GEMM reaches ~0.93x bit-identical, but only because the
-hot-path *memory access* drops to `__target_intrinsic` raw-MSL strings
-(`load_i8x4_direct`, `load_f16_direct`, `stage_input_f2x4`). The compute (tiling,
-MMA) ports cleanly through `CoopMat`; the byte-unpacking and vectorized staging
-do not, because WGSL's buffer and groupshared abstractions cost too much. So "one
-portable source" holds for the math and leaks raw Metal at the memory layer. Any
-port of the remaining hand-tuned `simdgroup_matrix` GEMMs inherits that shape.
+A generated simdgroup GEMM reaches ~0.93x bit-identical on its own, and ~0.98x
+with the MSL post-pass, but only because the hot-path *memory access* drops to
+`__target_intrinsic` raw-MSL strings (`load_i8x4_direct`, `load_f16_direct`,
+`stage_input_f2x4`). The compute (tiling, MMA) ports cleanly through `CoopMat`;
+the byte-unpacking and vectorized staging do not, because WGSL's buffer and
+groupshared abstractions cost too much. So "one portable source" holds for the
+math and leaks raw Metal at the memory layer. Any port of the remaining
+hand-tuned `simdgroup_matrix` GEMMs inherits that shape.
 
 ## Working with these shaders
 
@@ -138,6 +168,15 @@ Regenerate the committed outputs after editing any `.slang` (requires slangc
 ```sh
 just slang
 ```
+
+Note for `gemm_q8_0.metal`: the committed file is raw slangc output, and so is
+what slangc hands `build.rs` on your machine, but neither is what ends up in the
+binary. `build_support/msl_postpass.rs` rewrites whichever one it gets into
+OUT_DIR. Editing the `.slang` can move the anchors that the pass keys on. It
+declines with a `cargo:warning` rather than breaking the build, so the shader
+stays correct and quietly loses ~5%; the parity test
+`msl::generated_gemm_is_post_processed` fails in that case, which is the signal
+to watch rather than the build log.
 
 Correctness (runs on any Metal device; the two `gpu`-gated probe tests need the
 `gpu`/wgpu feature instead):
