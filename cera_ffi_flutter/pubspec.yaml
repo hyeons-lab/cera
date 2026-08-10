@@ -18,6 +18,12 @@ environment:
   # NativeCallable.isolateLocal (used by the generated bindings) lands in 3.1;
   # 3.3 is the floor we validate against.
   sdk: ^3.3.0
+  # Required by pub to declare `flutter.plugin.platforms` below; without it
+  # publishing is rejected. Note this is a *constraint*, not a dependency: it
+  # does not put `package:flutter` on the import path, and nothing under `lib/`
+  # imports it, so the bindings stay pure `dart:ffi`. `ffiPlugin: true` support
+  # is what sets the floor.
+  flutter: '>=3.10.0'
 
 # Deliberately NOT depending on the Flutter SDK. Nothing under `lib/` imports
 # `package:flutter/*` — the bindings are pure `dart:ffi` — so leaving the
