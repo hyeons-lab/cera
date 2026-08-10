@@ -1,20 +1,14 @@
 PODS:
-  - cera_ffi_flutter (0.4.0):
-    - FlutterMacOS
   - FlutterMacOS (1.0.0)
 
 DEPENDENCIES:
-  - cera_ffi_flutter (from `Flutter/ephemeral/.symlinks/plugins/cera_ffi_flutter/macos`)
   - FlutterMacOS (from `Flutter/ephemeral`)
 
 EXTERNAL SOURCES:
-  cera_ffi_flutter:
-    :path: Flutter/ephemeral/.symlinks/plugins/cera_ffi_flutter/macos
   FlutterMacOS:
     :path: Flutter/ephemeral
 
 SPEC CHECKSUMS:
-  cera_ffi_flutter: 093234caab98b3e76853d4a3880bf251ceed9b64
   FlutterMacOS: d0db08ddef1a9af05a5ec4b724367152bb0500b1
 
 PODFILE CHECKSUM: 1e95c36afbfd1cb6423ceca4de7a8e1b256fb6ac

@@ -165,7 +165,7 @@ dart-libs:
     @echo "Built {{CERA_FFI_DYLIB}} (with ffi-buffer trampolines)."
     @echo "Point Dart at it via CERA_FFI_LIB or place it on the loader path."
 
-# Generate + patch the Dart/Flutter bindings into the cera-ffi-flutter package.
+# Generate + patch the Dart/Flutter bindings into the cera_ffi_flutter package.
 # Builds + runs the VENDORED uniffi-bindgen-dart (third_party/) — patched for
 # Cera with callback-argument lowering + the foreign-trait vtable-init symbol fix
 # that makes streaming work; built from source rather than `cargo install`ing the
@@ -182,18 +182,18 @@ dart-libs:
 dart-bindings: dart-libs
     cargo run --release --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml -- \
         generate {{CERA_FFI_DYLIB}} \
-        --out-dir cera-ffi-flutter/lib/src/generated
-    cd cera-ffi-flutter && dart run tool/patch_generated_bindings.dart
+        --out-dir cera_ffi_flutter/lib/src/generated
+    cd cera_ffi_flutter && dart run tool/patch_generated_bindings.dart
 
 # Verify the committed Dart bindings are up to date with the current FFI
 # surface (regenerate + patch in place, fail on diff) and analyze the package.
 dart-bindings-check: dart-bindings
-    @if [ -n "$(git status --porcelain cera-ffi-flutter/lib/src/generated)" ]; then \
+    @if [ -n "$(git status --porcelain cera_ffi_flutter/lib/src/generated)" ]; then \
         echo "ERROR: Dart bindings are stale. Run \`just dart-bindings\` and commit the diff."; \
-        git --no-pager diff cera-ffi-flutter/lib/src/generated; \
+        git --no-pager diff cera_ffi_flutter/lib/src/generated; \
         exit 1; \
     fi
-    cd cera-ffi-flutter && dart pub get && dart analyze
+    cd cera_ffi_flutter && dart pub get && dart analyze
 
 # Verify the committed Kotlin + Swift bindings are up to date with the
 # current Rust FFI surface. Regenerates in-place and fails if `git diff`
@@ -296,16 +296,37 @@ apple-xcframework:
     # Metal-enabled slices. The Metal backend is iOS-portable (Shared
     # storage + system_default device); `--features metal` makes it the
     # Auto-preferred GPU backend on all three arm64 slices, with CPU
-    # fallback. The `Cera` SwiftPM target links Metal.framework +
-    # Foundation (see Package.swift `linkerSettings`) — a static lib
-    # doesn't auto-link the system frameworks its symbols reference.
+    # fallback.
+    #
+    # ── Dynamic, not static ────────────────────────────────────────────
+    # These slices ship as DYNAMIC frameworks. They used to be static
+    # archives (`-library libcera_ffi.a`), which forced two workarounds:
+    # consumers had to name Metal.framework + Foundation explicitly
+    # (a static lib does not auto-link the frameworks its symbols
+    # reference), and any consumer resolving symbols at RUNTIME rather
+    # than link time — Dart FFI via `DynamicLibrary.process()`, i.e. the
+    # whole Flutter plugin — got nothing at all, because the linker pulls
+    # in no archive members when nothing references them. That needed a
+    # brittle `-force_load` pointing at a hardcoded slice path.
+    #
+    # A dynamic framework is loaded whole by dyld, so every symbol is
+    # present at runtime and the system frameworks link themselves. Size
+    # is a wash: `-force_load` was already pulling in the entire archive.
+    #
+    # ── The framework must be named `CeraFFI` ──────────────────────
+    # The UniFFI-generated Swift wrapper does
+    # `#if canImport(CeraFFI) ; import CeraFFI`, and a framework's clang
+    # module takes the framework's name. Naming it anything else
+    # silently breaks every Swift consumer. The name comes from
+    # `ffi_module_name` in cera-ffi/uniffi.toml — change it there, not
+    # here, and regenerate (`just bindings`) so the two stay in step.
     #
     # Deployment targets pin the slices to Package.swift's
     # `.macOS(.v12)` / `.iOS(.v15)` so a newer host SDK doesn't stamp a
-    # higher `minos` into the staticlib (which otherwise warns
-    # "built for newer macOS version than being linked" at consumer
-    # link time). MACOSX_/IPHONEOS_ are each read only by the matching
-    # target, so exporting both is safe.
+    # higher `minos` into the binary (which otherwise warns "built for
+    # newer macOS version than being linked" at consumer link time).
+    # MACOSX_/IPHONEOS_ are each read only by the matching target, so
+    # exporting both is safe.
     export MACOSX_DEPLOYMENT_TARGET=12.0
     export IPHONEOS_DEPLOYMENT_TARGET=15.0
     RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release --features metal
@@ -313,19 +334,109 @@ apple-xcframework:
     RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release --features metal
     OUT=target/xcframework-build
     rm -rf "$OUT"
-    mkdir -p "$OUT/headers"
-    # Stage the headers + module map next to where xcodebuild will
-    # look. UniFFI-generated `cera_ffiFFI.modulemap` is renamed to
-    # `module.modulemap` on the way in — Xcode's framework conventions
-    # require that exact filename inside a `Headers/` directory.
-    cp cera-ffi/bindings/swift/cera_ffiFFI.h "$OUT/headers/"
-    cp cera-ffi/bindings/swift/cera_ffiFFI.modulemap "$OUT/headers/module.modulemap"
+    mkdir -p "$OUT"
+
+    # Framework name == the UniFFI Swift module name, which the generated
+    # wrapper imports (`import CeraFFI`). Set by `ffi_module_name` in
+    # cera-ffi/uniffi.toml; a framework's clang module takes the framework's
+    # name, so these two MUST agree or every Swift consumer breaks.
+    FW=CeraFFI
+    HDR=cera-ffi/bindings/swift/CeraFFI.h
+    # Version stamped into each slice's Info.plist. Single source of truth is
+    # the workspace VERSION file (kept in lockstep by scripts/bump-version.sh).
+    FW_VERSION="$(tr -d '[:space:]' < VERSION)"
+
+    # Assemble one .framework per slice from the Rust cdylib.
+    #
+    # $1 = rust target dir, $2 = staging subdir, $3 = platform
+    # ("macos" uses the versioned bundle layout Apple requires there;
+    # iOS uses the flat layout, and a versioned bundle is REJECTED on
+    # iOS).
+    make_framework() {
+      local rust_target="$1" stage="$2" platform="$3"
+      local src="target/${rust_target}/release/libcera_ffi.dylib"
+      local root="${OUT}/${stage}/${FW}.framework"
+
+      if [ ! -f "$src" ]; then
+        echo "missing cdylib: $src" >&2
+        exit 1
+      fi
+
+      local bin_dir hdr_dir mod_dir res_dir
+      if [ "$platform" = "macos" ]; then
+        bin_dir="$root/Versions/A"
+        hdr_dir="$root/Versions/A/Headers"
+        mod_dir="$root/Versions/A/Modules"
+        res_dir="$root/Versions/A/Resources"
+      else
+        bin_dir="$root"
+        hdr_dir="$root/Headers"
+        mod_dir="$root/Modules"
+        res_dir="$root"
+      fi
+      mkdir -p "$bin_dir" "$hdr_dir" "$mod_dir" "$res_dir"
+
+      cp "$src" "$bin_dir/${FW}"
+      chmod +w "$bin_dir/${FW}"
+      # dyld resolves the framework relative to whatever embeds it; the
+      # Rust cdylib's own install_name (an absolute build path) would
+      # fail to load anywhere else.
+      install_name_tool -id "@rpath/${FW}.framework/${FW}" "$bin_dir/${FW}"
+
+      cp "$HDR" "$hdr_dir/"
+      # Inside a framework the module must be declared `framework module`
+      # and live at Modules/module.modulemap. The plain `module` form the
+      # generator emits is only valid for a headers directory.
+      cat > "$mod_dir/module.modulemap" <<MODMAP_EOF
+    framework module ${FW} {
+        umbrella header "CeraFFI.h"
+        export *
+    }
+    MODMAP_EOF
+
+      local min_key min_ver plist_dir
+      if [ "$platform" = "macos" ]; then
+        min_key=LSMinimumSystemVersion; min_ver=12.0; plist_dir="$res_dir"
+      else
+        min_key=MinimumOSVersion; min_ver=15.0; plist_dir="$res_dir"
+      fi
+      cat > "$plist_dir/Info.plist" <<PLIST_EOF
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+      <key>CFBundleDevelopmentRegion</key><string>en</string>
+      <key>CFBundleExecutable</key><string>${FW}</string>
+      <key>CFBundleIdentifier</key><string>com.hyeons-lab.cera-ffi</string>
+      <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+      <key>CFBundleName</key><string>${FW}</string>
+      <key>CFBundlePackageType</key><string>FMWK</string>
+      <key>CFBundleShortVersionString</key><string>${FW_VERSION}</string>
+      <key>CFBundleVersion</key><string>${FW_VERSION}</string>
+      <key>${min_key}</key><string>${min_ver}</string>
+    </dict>
+    </plist>
+    PLIST_EOF
+
+      if [ "$platform" = "macos" ]; then
+        ln -s A "$root/Versions/Current"
+        ln -s Versions/Current/"${FW}" "$root/${FW}"
+        ln -s Versions/Current/Headers "$root/Headers"
+        ln -s Versions/Current/Modules "$root/Modules"
+        ln -s Versions/Current/Resources "$root/Resources"
+      fi
+    }
+
+    make_framework aarch64-apple-ios     ios-arm64           ios
+    make_framework aarch64-apple-ios-sim ios-arm64-simulator ios
+    make_framework aarch64-apple-darwin  macos-arm64         macos
+
     xcodebuild -create-xcframework \
-        -library target/aarch64-apple-ios/release/libcera_ffi.a -headers "$OUT/headers" \
-        -library target/aarch64-apple-ios-sim/release/libcera_ffi.a -headers "$OUT/headers" \
-        -library target/aarch64-apple-darwin/release/libcera_ffi.a -headers "$OUT/headers" \
+        -framework "$OUT/ios-arm64/${FW}.framework" \
+        -framework "$OUT/ios-arm64-simulator/${FW}.framework" \
+        -framework "$OUT/macos-arm64/${FW}.framework" \
         -output "$OUT/CeraFFI.xcframework"
-    echo "Built $OUT/CeraFFI.xcframework"
+    echo "Built $OUT/CeraFFI.xcframework (dynamic ${FW}.framework slices)"
 
 # Re-sync the root SwiftPM package's copy of the UniFFI Swift wrapper.
 #
@@ -407,7 +518,7 @@ swift-smoke:
     swiftc \
         cera-ffi/tests/swift/main.swift \
         cera-ffi/bindings/swift/cera_ffi.swift \
-        -import-objc-header cera-ffi/bindings/swift/cera_ffiFFI.h \
+        -import-objc-header cera-ffi/bindings/swift/CeraFFI.h \
         -L target/aarch64-apple-darwin/release \
         -lcera_ffi \
         -framework Metal \

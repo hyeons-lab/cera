@@ -11,7 +11,7 @@ locally built one:
 # from the repo root
 just dart-libs
 
-# from cera-ffi-flutter/
+# from cera_ffi_flutter/
 CERA_FFI_LIB=../target/debug/libcera_ffi.dylib \
   dart run example/dart/cera_chat.dart /path/to/model.gguf "Why is the sky blue?"
 ```

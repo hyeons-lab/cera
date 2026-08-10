@@ -742,6 +742,36 @@ jobs:
           grep -q "download/v${VERSION}/CeraFFI.xcframework.zip" Package.swift
           grep -q "checksum: \"${CHECKSUM}\"" Package.swift
 
+          # The Flutter plugin's Apple integrations carry the same two
+          # placeholders and consume the same XCFramework: two podspecs (for
+          # apps still on CocoaPods) and two SPM manifests (for apps that have
+          # migrated). `swift package compute-checksum` is a plain sha256 of the
+          # zip, so CHECKSUM is valid for all of them. Same idempotent-rewrite
+          # property as above: reruns re-substitute cleanly.
+          for f in \
+            cera_ffi_flutter/ios/cera_ffi_flutter.podspec \
+            cera_ffi_flutter/macos/cera_ffi_flutter.podspec \
+            cera_ffi_flutter/ios/cera_ffi_flutter/Package.swift \
+            cera_ffi_flutter/macos/cera_ffi_flutter/Package.swift
+          do
+            sed -i.bak \
+              -e "s|releases/download/vRELEASE_VERSION/|releases/download/v${VERSION}/|" \
+              -e "s|releases/download/v[0-9][0-9A-Za-z.+-]*/CeraFFI\.xcframework\.zip|releases/download/v${VERSION}/CeraFFI.xcframework.zip|" \
+              -e "s|VERSION=\"RELEASE_VERSION\"|VERSION=\"${VERSION}\"|" \
+              -e "s|EXPECTED_SHA=\"RELEASE_CHECKSUM\"|EXPECTED_SHA=\"${CHECKSUM}\"|" \
+              -e "s|checksum: \"RELEASE_CHECKSUM\"|checksum: \"${CHECKSUM}\"|" \
+              -e "s|checksum: \"[0-9a-f]\{64\}\"|checksum: \"${CHECKSUM}\"|" \
+              "$f"
+            rm -f "$f.bak"
+            # Match only placeholder USAGE, never the doc comments that name
+            # the tokens in prose — a bare RELEASE_VERSION match there would
+            # false-positive even after a correct rewrite.
+            if grep -qE 'download/vRELEASE_VERSION/|checksum: "RELEASE_CHECKSUM"|VERSION="RELEASE_VERSION"|EXPECTED_SHA="RELEASE_CHECKSUM"' "$f"; then
+              echo "::error::$f still has placeholders after rewrite" >&2
+              exit 1
+            fi
+          done
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # The default branch is protected by a ruleset (bypass_actors: [], so
@@ -754,12 +784,22 @@ jobs:
           # documented path). Tags are NOT covered by the branch ruleset, so the
           # (force-)tag push is allowed. The sed always turns placeholders into
           # real values, so there is always something to commit.
-          git add Package.swift
+          # Package.swift plus the Flutter plugin's four Apple integrations,
+          # which carry the same placeholders and are pinned by the same sed
+          # above. They must ride the SAME tagged commit: pub.dev publishes the
+          # plugin from this tag, so a podspec or SPM manifest left on
+          # placeholders would ship a package that cannot resolve its native
+          # library.
+          git add Package.swift \
+            cera_ffi_flutter/ios/cera_ffi_flutter.podspec \
+            cera_ffi_flutter/macos/cera_ffi_flutter.podspec \
+            cera_ffi_flutter/ios/cera_ffi_flutter/Package.swift \
+            cera_ffi_flutter/macos/cera_ffi_flutter/Package.swift
           # Normally main carries placeholders so there is always a diff; guard
           # the anomalous no-diff case (main already pinned) so `set -e` + an
           # empty `git commit` can't abort the release — just tag current HEAD.
           if git diff --cached --quiet; then
-            echo "Package.swift already pinned for v${VERSION} — tagging current HEAD"
+            echo "CeraFFI.xcframework already pinned for v${VERSION} — tagging current HEAD"
           else
             git commit -m "chore(spm): pin CeraFFI.xcframework for v${VERSION}"
           fi

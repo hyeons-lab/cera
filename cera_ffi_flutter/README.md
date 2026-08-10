@@ -19,7 +19,7 @@ deterministic patch tool that fixes the generator's known bugs.
 ## Layout
 
 ```
-cera-ffi-flutter/
+cera_ffi_flutter/
 ├── pubspec.yaml              # ffi dep, SDK ^3.3.0
 ├── analysis_options.yaml     # excludes generated/ from lints
 ├── tool/
@@ -68,7 +68,7 @@ trampolines that UniFFI only emits under `scaffolding-ffi-buffer-fns`.
 
 ```sh
 just dart-bindings
-cd cera-ffi-flutter
+cd cera_ffi_flutter
 CERA_FFI_LIB=../target/debug/libcera_ffi.dylib \
   dart run example/cera_generate.dart /path/to/model.gguf "Once upon a time"
 ```

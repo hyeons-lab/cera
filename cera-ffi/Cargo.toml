@@ -44,7 +44,7 @@ bindgen = ["uniffi/cli"]
 # must not enable it.
 metal = ["cera/metal"]
 
-# Opt-in feature for the Dart/Flutter bindings (cera-ffi-flutter). The Dart
+# Opt-in feature for the Dart/Flutter bindings (cera_ffi_flutter). The Dart
 # generator (uniffi-bindgen-dart) calls `uniffi_ffibuffer_*` trampolines —
 # extra scaffolding functions that pass args/returns through an FfiBuffer —
 # which UniFFI only emits under `scaffolding-ffi-buffer-fns`. Build the cdylib

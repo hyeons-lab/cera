@@ -36,12 +36,14 @@ class CeraLibrary {
   ///     statically into the host binary (see below).
   ///  4. The platform-conventional shared-library filename.
   ///
-  /// **Apple platforms link statically.** The published
-  /// `CeraFFI.xcframework` vends `libcera_ffi.a`, so on iOS and on macOS under
-  /// Flutter the symbols end up in the app binary and there is no dylib to
-  /// open. iOS is always that case. macOS can be either: statically linked
-  /// under Flutter, or a loose `libcera_ffi.dylib` for a plain Dart script, so
-  /// it probes the process image first and falls back to the dylib.
+  /// **Apple platforms load a framework, not a loose library.** The published
+  /// `CeraFFI.xcframework` vends dynamic `CeraFFI.framework` slices, which
+  /// Flutter embeds in the app bundle and dyld loads at launch. By the time
+  /// Dart runs, the symbols are already in the process, so there is nothing to
+  /// open by filename — note the binary is `CeraFFI.framework/CeraFFI`, not
+  /// `libcera_ffi.dylib`. iOS is always that case. macOS can be either: the
+  /// embedded framework under Flutter, or a loose `libcera_ffi.dylib` for a
+  /// plain Dart script, so it probes the process image first and falls back.
   static ffi.DynamicLibrary open({String? path}) {
     if (path != null && path.isNotEmpty) {
       return ffi.DynamicLibrary.open(path);

@@ -783,7 +783,7 @@ jobs:
 
   dart-bindings-drift:
     # Same idea as ffi-bindings-drift, for the committed Dart bindings under
-    # cera-ffi-flutter/lib/src/generated/.
+    # cera_ffi_flutter/lib/src/generated/.
     #
     # This job exists because its absence already cost us: the Dart bindings
     # silently fell ~3 weeks behind the Rust FFI surface (missing three
@@ -806,7 +806,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: dart-lang/setup-dart@v1
         with:
-          # Matches the `sdk: ^3.3.0` floor in cera-ffi-flutter/pubspec.yaml.
+          # Matches the `sdk: ^3.3.0` floor in cera_ffi_flutter/pubspec.yaml.
           sdk: stable
 
       - name: Build cera-ffi (ffi-buffer cdylib)
@@ -820,15 +820,15 @@ jobs:
         run: |
           cargo run --release --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml -- \
             generate target/debug/libcera_ffi.so \
-            --out-dir cera-ffi-flutter/lib/src/generated
-          cd cera-ffi-flutter && dart run tool/patch_generated_bindings.dart
+            --out-dir cera_ffi_flutter/lib/src/generated
+          cd cera_ffi_flutter && dart run tool/patch_generated_bindings.dart
 
       - name: Diff committed bindings
         run: |
-          if [ -n "$(git status --porcelain cera-ffi-flutter/lib/src/generated)" ]; then
+          if [ -n "$(git status --porcelain cera_ffi_flutter/lib/src/generated)" ]; then
             echo "::error::Committed Dart bindings are out of date."
             echo "Run 'just dart-bindings' locally and commit the resulting diff."
-            git --no-pager diff cera-ffi-flutter/lib/src/generated
+            git --no-pager diff cera_ffi_flutter/lib/src/generated
             exit 1
           fi
 
@@ -838,7 +838,7 @@ jobs:
         # is perfectly happy with. Only `from_bundle_id_async` is a known,
         # accepted stub; anything else means a method silently stopped working.
         run: |
-          cd cera-ffi-flutter
+          cd cera_ffi_flutter
           unexpected=$(grep -n "not implemented yet" lib/src/generated/cera_ffi.dart \
             | grep -v "from_bundle_id_async" || true)
           if [ -n "${unexpected}" ]; then
@@ -848,10 +848,10 @@ jobs:
           fi
 
       - name: Analyze
-        run: cd cera-ffi-flutter && dart pub get && dart analyze
+        run: cd cera_ffi_flutter && dart pub get && dart analyze
 
       - name: Test
-        run: cd cera-ffi-flutter && dart test
+        run: cd cera_ffi_flutter && dart test
 
       - name: Generator unit tests
         run: cargo test --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml

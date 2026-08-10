@@ -1,5 +1,5 @@
-module cera_ffiFFI {
-    header "cera_ffiFFI.h"
+module CeraFFI {
+    header "CeraFFI.h"
     export *
     use "Darwin"
     use "_Builtin_stdbool"

@@ -55,7 +55,7 @@ earlier "GPU is LFM2-only" limitation is gone (see #177/#192/#193/#194/#200).
 | V2.12 CUDA backend | ⬜ | |
 | V2.13 Python (PyO3) bindings | ⬜ | |
 | V2.14 Kotlin Multiplatform bindings | ✅ | `cera-ffi-kotlin` (android + jvm) |
-| V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter`: sync + async generate, sync + async streaming, `withProgress` all verified; only `fromBundleIdAsync` stubbed |
+| V2.17 Flutter / Dart bindings | 🟡 | `cera_ffi_flutter`: sync + async generate, sync + async streaming, `withProgress` all verified; only `fromBundleIdAsync` stubbed |
 | V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core + FFI + GPU (Metal/wgpu) encode shipped, no slicing |
 | V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
 
@@ -429,7 +429,7 @@ model starts a call. Exposed across CLI (`--tools` / `--constrain-tools`), FFI
 ### V2.17: Flutter / Dart Bindings, 2-3 weeks 🟡 (sync + async + streaming working; only `fromBundleIdAsync` stubbed)
 Expose the engine to Flutter/Dart, reusing the existing `cera-ffi` UniFFI
 surface (the same C ABI that already backs Kotlin + Swift). The
-`cera-ffi-flutter` Dart package ships the generated+patched bindings plus a
+`cera_ffi_flutter` Dart package ships the generated+patched bindings plus a
 platform-aware native-library loader.
 
 **Working (verified end-to-end):** the synchronous engine API round-trips real

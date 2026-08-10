@@ -102,7 +102,7 @@ One Rust core, consumed from many places:
 | **Kotlin / Swift / Python** | [`cera-ffi`](cera-ffi/) (UniFFI) | JVM, Apple platforms |
 | **Android** | [`cera-ffi-kotlin`](cera-ffi-kotlin/) | Android apps (AAR) |
 | **iOS / macOS** | [`Package.swift`](Package.swift) (SwiftPM XCFramework) | Apple apps (`.package(url:)`), Metal GPU (Auto: Metal → CPU) |
-| **Flutter / Dart** | [`cera-ffi-flutter`](cera-ffi-flutter/) | cross-platform mobile |
+| **Flutter / Dart** | [`cera_ffi_flutter`](cera_ffi_flutter/) | cross-platform mobile |
 | **Browser / Node** | [`cera-wasm`](cera-wasm/) (`@hyeons-lab/cera-wasm`) | WebAssembly + WebGPU |
 
 A complete SwiftUI example app (streaming chat + embeddings + LoRA) that consumes
@@ -395,7 +395,7 @@ adapter over it.
 - **[`cera`](cera/)**: core library
 - **[`cera-cli`](cera-cli/)**: CLI binary (clap)
 - **[`cera-ffi`](cera-ffi/)**: UniFFI bindings (Kotlin / Swift / Python)
-- **[`cera-ffi-kotlin`](cera-ffi-kotlin/)** · **[`cera-ffi-flutter`](cera-ffi-flutter/)**: Android / Flutter packaging
+- **[`cera-ffi-kotlin`](cera-ffi-kotlin/)** · **[`cera_ffi_flutter`](cera_ffi_flutter/)**: Android / Flutter packaging
 - **[`cera-wasm`](cera-wasm/)**: `wasm-bindgen` browser / Node bindings
 - **[`cera-parity`](cera-parity/)**: cross-binding parity harness (runs one prompt through every binding and reports drift)
 

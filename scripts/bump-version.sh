@@ -9,7 +9,7 @@
 #     version.workspace = true)
 #   - each dependent crate's internal `cera = { ..., version = "X.Y.Z", ... }`
 #     path-dep pin (cera-cli, cera-ffi, cera-wasm, cera-parity)
-#   - cera-ffi-flutter/pubspec.yaml  version:  (build name; any "+build" suffix
+#   - cera_ffi_flutter/pubspec.yaml  version:  (build name; any "+build" suffix
 #     after the version is preserved)
 #   - cera-ffi-kotlin/gradle.properties  VERSION_NAME  (the Maven Central
 #     coordinate for the Kotlin/Android bindings; any "-QUALIFIER" suffix such
@@ -41,7 +41,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION_FILE="$ROOT/VERSION"
 CARGO_TOML="$ROOT/Cargo.toml"
-PUBSPEC="$ROOT/cera-ffi-flutter/pubspec.yaml"
+PUBSPEC="$ROOT/cera_ffi_flutter/pubspec.yaml"
 GRADLE_PROPS="$ROOT/cera-ffi-kotlin/gradle.properties"
 # Dependent crates carrying an internal `cera` path-dep pin.
 PIN_CRATES=(cera-cli cera-ffi cera-wasm cera-parity)
