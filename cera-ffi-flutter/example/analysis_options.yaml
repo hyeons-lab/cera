@@ -1,0 +1,11 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  exclude:
+    # Plain-Dart CLI samples, not part of this Flutter app. They print to
+    # stdout by design, which `avoid_print` (correctly, for app code) rejects.
+    # See dart/README.md.
+    - dart/**
+
+linter:
+  rules:

@@ -72,41 +72,30 @@ void main(List<String> args) {
 
   // Fix 4: native-library resolution. The generator emits a single
   // `libraryName = 'uniffi_cera_ffi'` and `DynamicLibrary.open(libraryName)`,
-  // which is both the wrong base name (the cdylib is `cera_ffi`) and missing
-  // the platform prefix/suffix. Rewrite the default `open()` to honor a
-  // `CERA_FFI_LIB` path override and otherwise resolve the platform-correct
-  // filename. (An explicit `dynamicLibrary`/`libraryPath` still wins.)
+  // which is both the wrong base name (the library is `cera_ffi`) and missing
+  // the platform prefix/suffix. It also cannot express the Apple case, where
+  // the published XCFramework is a *static* `libcera_ffi.a` linked into the
+  // app binary — there is no file to open, the symbols are in the process.
+  //
+  // Rather than reimplement that here, delegate to `CeraLibrary.open()` so
+  // Flutter apps and plain `dart run` scripts resolve the library through one
+  // code path. (An explicit `dynamicLibrary` still wins; an explicit
+  // `libraryPath` is forwarded.)
   const importAnchor = "import 'dart:typed_data';";
-  const importWithIo = "import 'dart:typed_data';\nimport 'dart:io' as io;";
-  if (src.contains(importAnchor) && !src.contains("import 'dart:io' as io;")) {
-    src = src.replaceFirst(importAnchor, importWithIo);
+  const importWithLoader =
+      "import 'dart:typed_data';\nimport '../library_loader.dart';";
+  if (src.contains(importAnchor) &&
+      !src.contains("import '../library_loader.dart';")) {
+    src = src.replaceFirst(importAnchor, importWithLoader);
   }
 
   const openBad =
       'return ffi.DynamicLibrary.open(_libraryPath ?? libraryName);';
-  const openGood = '''
-final envPath = io.Platform.environment['CERA_FFI_LIB'];
-    if (provided == null && _libraryPath == null && envPath != null && envPath.isNotEmpty) {
-      return ffi.DynamicLibrary.open(envPath);
-    }
-    return ffi.DynamicLibrary.open(_libraryPath ?? _ceraDefaultLibraryFile());''';
+  const openGood = 'return CeraLibrary.open(path: _libraryPath);';
   if (src.contains(openBad)) {
     src = src.replaceAll(openBad, openGood);
-    if (!src.contains('String _ceraDefaultLibraryFile()')) {
-      src += '''
-
-// Added by tool/patch_generated_bindings.dart — platform-correct default name
-// for the cera-ffi cdylib (`cera_ffi`). iOS links statically; manual users can
-// pass a DynamicLibrary or set CERA_FFI_LIB.
-String _ceraDefaultLibraryFile() {
-  if (io.Platform.isMacOS) return 'libcera_ffi.dylib';
-  if (io.Platform.isWindows) return 'cera_ffi.dll';
-  return 'libcera_ffi.so';
-}
-''';
-    }
     applied += 1;
-    stdout.writeln('  fixed native-library resolution (CERA_FFI_LIB + platform name)');
+    stdout.writeln('  fixed native-library resolution (delegates to CeraLibrary.open)');
   }
 
   // Fix 5: RustBuffer / rust_future symbol names. The generator emits the

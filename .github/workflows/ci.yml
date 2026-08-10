@@ -781,6 +781,81 @@ jobs:
             exit 1
           fi
 
+  dart-bindings-drift:
+    # Same idea as ffi-bindings-drift, for the committed Dart bindings under
+    # cera-ffi-flutter/lib/src/generated/.
+    #
+    # This job exists because its absence already cost us: the Dart bindings
+    # silently fell ~3 weeks behind the Rust FFI surface (missing three
+    # `GenerateOpts` fields and `encode_text_special`), and since UniFFI
+    # checksums every method at construction, the package could not even open
+    # the library. `just dart-bindings-check` existed the whole time; nothing
+    # ran it.
+    #
+    # Unlike the Kotlin/Swift job this also analyzes and tests the package,
+    # because the generated Dart is the shipped artifact rather than an input
+    # to another compiler.
+    name: Dart Bindings Drift
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+      - uses: Swatinem/rust-cache@v2
+      - uses: dart-lang/setup-dart@v1
+        with:
+          # Matches the `sdk: ^3.3.0` floor in cera-ffi-flutter/pubspec.yaml.
+          sdk: stable
+
+      - name: Build cera-ffi (ffi-buffer cdylib)
+        # The Dart generator emits calls to the `uniffi_ffibuffer_*`
+        # trampolines, which UniFFI only exports under this feature. Kotlin and
+        # Swift use the standard symbols and do not need it.
+        run: cargo build -p cera-ffi --features ffi-buffer
+
+      - name: Regenerate + patch Dart bindings
+        # Mirrors `just dart-bindings`, inlined to avoid installing just.
+        run: |
+          cargo run --release --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml -- \
+            generate target/debug/libcera_ffi.so \
+            --out-dir cera-ffi-flutter/lib/src/generated
+          cd cera-ffi-flutter && dart run tool/patch_generated_bindings.dart
+
+      - name: Diff committed bindings
+        run: |
+          if [ -n "$(git status --porcelain cera-ffi-flutter/lib/src/generated)" ]; then
+            echo "::error::Committed Dart bindings are out of date."
+            echo "Run 'just dart-bindings' locally and commit the resulting diff."
+            git --no-pager diff cera-ffi-flutter/lib/src/generated
+            exit 1
+          fi
+
+      - name: Assert no method is stubbed out
+        # A regression in the generator's return-type handling shows up as a
+        # `throw UnsupportedError` in place of a real body, which `dart analyze`
+        # is perfectly happy with. Only `from_bundle_id_async` is a known,
+        # accepted stub; anything else means a method silently stopped working.
+        run: |
+          cd cera-ffi-flutter
+          unexpected=$(grep -n "not implemented yet" lib/src/generated/cera_ffi.dart \
+            | grep -v "from_bundle_id_async" || true)
+          if [ -n "${unexpected}" ]; then
+            echo "::error::Generated bindings contain unexpected runtime stubs:"
+            echo "${unexpected}"
+            exit 1
+          fi
+
+      - name: Analyze
+        run: cd cera-ffi-flutter && dart pub get && dart analyze
+
+      - name: Test
+        run: cd cera-ffi-flutter && dart test
+
+      - name: Generator unit tests
+        run: cargo test --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml
+
   android-abis:
     # Cross-compiles `cera-ffi` to every Android ABI supported by the
     # Android NDK (arm64-v8a, armeabi-v7a, x86_64, x86). Verifies each

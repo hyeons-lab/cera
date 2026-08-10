@@ -1,0 +1,64 @@
+// Android side of the `cera_ffi_flutter` FFI plugin.
+//
+// This builds no native code. `com.hyeons-lab:cera-ffi-android` is already
+// published to Maven Central by the release pipeline
+// (`cera-ffi-kotlin/cera-ffi-android`) as an AAR carrying
+// `jni/<abi>/libcera_ffi.so` for arm64-v8a, armeabi-v7a, x86_64, and x86. The
+// Android Gradle Plugin merges those into the consuming app's APK, which is
+// what makes the plain `DynamicLibrary.open('libcera_ffi.so')` in
+// `lib/src/library_loader_io.dart` resolve at runtime.
+//
+// Consequence: an app developer needs no Rust toolchain and no NDK.
+//
+// The AAR also carries the Kotlin UniFFI bindings. They are unused here (Dart
+// talks to the C ABI directly) but harmless, and depending on the whole
+// artifact keeps the native library on exactly the version the rest of the
+// release ships.
+
+group = 'com.hyeonslab.cera.ffi.flutter'
+version = '0.4.0'
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.7.3'
+    }
+}
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: 'com.android.library'
+
+android {
+    namespace = 'com.hyeonslab.cera.ffi.flutter'
+    compileSdk = 35
+
+    defaultConfig {
+        // Matches the floor the Rust cdylib is built against in
+        // `cera-ffi-kotlin`. Raising it here without raising it there would
+        // let an app install on a device the .so cannot load on.
+        minSdk = 24
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // Version is kept in lockstep with the Cargo workspace by
+    // scripts/bump-version.sh. Pinned exactly (not a range): the Dart bindings
+    // are checksum-verified against a specific FFI surface at construction, so
+    // a drifting native library would fail loudly at startup rather than
+    // silently misbehave.
+    api 'com.hyeons-lab:cera-ffi-android:0.4.0'
+}

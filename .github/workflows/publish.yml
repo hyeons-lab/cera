@@ -381,7 +381,13 @@ jobs:
       matrix:
         include:
           # Desktop JVM targets → JNA resource-prefix dirs under the jvm module.
+          # The prefix names are JNA's, derived from os.name/os.arch at runtime:
+          # a consumer on a platform with no dir here finds no bundled library
+          # and fails the load.
           - { os: macos-latest,   label: darwin-aarch64, target: aarch64-apple-darwin,    lib: libcera_ffi.dylib, dest: cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/darwin-aarch64, android: false }
+          # Intel Macs. Cross-compiled from the arm64 runner; the Apple SDK is
+          # universal so this needs only `rustup target add`.
+          - { os: macos-latest,   label: darwin-x86-64,  target: x86_64-apple-darwin,     lib: libcera_ffi.dylib, dest: cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/darwin-x86-64,  android: false }
           - { os: ubuntu-latest,  label: linux-x86-64,   target: x86_64-unknown-linux-gnu, lib: libcera_ffi.so,    dest: cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/linux-x86-64,  android: true  }
           - { os: windows-latest, label: win32-x86-64,   target: x86_64-pc-windows-msvc,  lib: cera_ffi.dll,      dest: cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/win32-x86-64,  android: false }
     steps:
@@ -435,6 +441,36 @@ jobs:
             cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs/
           if-no-files-found: error
           include-hidden-files: false
+
+      # The same cdylib, packaged as a standalone release asset. Until this
+      # existed the desktop libraries shipped ONLY inside the Maven jar, which
+      # left non-JVM desktop consumers — the Flutter plugin's Linux and Windows
+      # CMake steps in particular — with nothing to download. Reuses the
+      # artifact already built above rather than adding a build matrix.
+      #
+      # `.sha256` accompanies each archive so a consumer can verify the
+      # download; the CMake and podspec fetch steps do exactly that.
+      - name: Package standalone cdylib
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p desktop-libs
+          archive="cera-ffi-${{ matrix.label }}-v${VERSION}.tar.gz"
+          tar -czf "desktop-libs/${archive}" \
+            -C "target/${{ matrix.target }}/release" "${{ matrix.lib }}"
+          # shasum is present on all three runner images (macOS, Linux,
+          # Windows/Git-Bash); sha256sum is not on macOS.
+          ( cd desktop-libs && shasum -a 256 "${archive}" > "${archive}.sha256" )
+          cat "desktop-libs/${archive}.sha256"
+
+      - name: Upload standalone cdylib
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-lib-${{ matrix.label }}
+          path: desktop-libs/
+          if-no-files-found: error
 
   publish-jvm:
     name: Assemble & publish to Maven Central
@@ -648,6 +684,18 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           pattern: cli-*
+          merge-multiple: true
+          path: release-assets
+
+      # Standalone desktop cdylibs to attach — present only when the
+      # `jvm-native-libs` leg ran. These are what the Flutter plugin's Linux and
+      # Windows CMake steps download; without them those platforms have no
+      # native library to fetch.
+      - name: Download desktop cdylib artifacts
+        if: ${{ needs.jvm-native-libs.result == 'success' }}
+        uses: actions/download-artifact@v8
+        with:
+          pattern: desktop-lib-*
           merge-multiple: true
           path: release-assets
 

@@ -7,7 +7,7 @@ import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'package:ffi/ffi.dart';
 import 'dart:typed_data';
-import 'dart:io' as io;
+import '../library_loader.dart';
 
 final class _RustBuffer extends ffi.Struct {
   external ffi.Pointer<ffi.Uint8> data;
@@ -3008,11 +3008,7 @@ class CeraFfiFfi {
     if (provided != null) {
       return provided;
     }
-    final envPath = io.Platform.environment['CERA_FFI_LIB'];
-    if (provided == null && _libraryPath == null && envPath != null && envPath.isNotEmpty) {
-      return ffi.DynamicLibrary.open(envPath);
-    }
-    return ffi.DynamicLibrary.open(_libraryPath ?? _ceraDefaultLibraryFile());
+    return CeraLibrary.open(path: _libraryPath);
   }
 
   void _ensureApiIntegrity(ffi.DynamicLibrary lib) {
@@ -10522,12 +10518,3 @@ String toolGrammar(List<ToolDef> tools, ToolFormat format) {
   return _bindings().toolGrammar(tools, format);
 }
 
-
-// Added by tool/patch_generated_bindings.dart — platform-correct default name
-// for the cera-ffi cdylib (`cera_ffi`). iOS links statically; manual users can
-// pass a DynamicLibrary or set CERA_FFI_LIB.
-String _ceraDefaultLibraryFile() {
-  if (io.Platform.isMacOS) return 'libcera_ffi.dylib';
-  if (io.Platform.isWindows) return 'cera_ffi.dll';
-  return 'libcera_ffi.so';
-}

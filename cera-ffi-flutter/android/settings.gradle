@@ -1,0 +1,5 @@
+// Standalone settings file so the module resolves plugins when Flutter builds
+// it as an included build. Repositories are declared in build.gradle's
+// buildscript/allprojects blocks to stay compatible with the older
+// apply-plugin style Flutter still generates for plugin modules.
+rootProject.name = 'cera_ffi_flutter'

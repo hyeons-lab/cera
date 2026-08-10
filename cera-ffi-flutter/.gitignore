@@ -17,3 +17,9 @@ build/
 *.dylib
 *.dll
 *.a
+
+# Fetched at `pod install` / SPM-resolve time by the ios/ and macos/ podspecs,
+# never committed: the zip is ~91 MB and it is a versioned release asset.
+/ios/CeraFFI.xcframework/
+/macos/CeraFFI.xcframework/
+.cera-xcframework-sha256
