@@ -914,42 +914,12 @@ pub(super) fn render_object_members(out: &mut String, ctx: &RenderMethodContext)
                         }
                         Some(ret_type) => match ffi_return_type.as_ref() {
                             Some(FfiType::RustBuffer(_)) => {
-                                let is_map_type =
-                                    matches!(runtime_unwrapped_type(ret_type), Type::Map { .. });
-                                let decode_expr = match runtime_unwrapped_type(ret_type) {
-                                    Type::Record { name, .. } | Type::Enum { name, .. } => {
-                                        format!("_uniffiDecode{}(retBytes)", to_upper_camel(name))
-                                    }
-                                    Type::Map { .. } => render_uniffi_binary_read_expression(
-                                        ret_type,
-                                        "retReader",
-                                        enums,
-                                        custom_types,
-                                    ),
-                                    _ => {
-                                        out.push_str(&format!(
-                                            "      throw UnsupportedError('{escaped_reason} ({})');\n",
-                                            method.name
-                                        ));
-                                        String::new()
-                                    }
-                                };
-                                if !decode_expr.is_empty() {
-                                    out.push_str(
-                                        "      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();\n",
-                                    );
-                                    out.push_str(
-                                        "      retBufPtr.ref\n        ..capacity = (returnBuf + 0).ref.u64\n        ..len = (returnBuf + 1).ref.u64\n        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();\n",
-                                    );
-                                    out.push_str("      rustRetBufferPtrs.add(retBufPtr);\n");
-                                    out.push_str(
-                                        "      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));\n",
-                                    );
-                                    if is_map_type {
-                                        out.push_str("      final _UniFfiBinaryReader retReader = _UniFfiBinaryReader(retBytes);\n");
-                                    }
-                                    out.push_str(&format!("      return {decode_expr};\n"));
-                                }
+                                render_ffibuffer_rustbuffer_return(
+                                    out,
+                                    ret_type,
+                                    enums,
+                                    custom_types,
+                                );
                             }
                             _ => {
                                 let Some(union_field) = ffi_return_type

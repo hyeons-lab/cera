@@ -712,6 +712,84 @@ pub(super) fn render_ffibuffer_outer_cleanup(out: &mut String) {
     out.push_str("    }\n");
 }
 
+/// `true` when a RustBuffer return payload can be decoded from the whole
+/// buffer at once, as opposed to needing the incremental
+/// [`_UniFfiBinaryReader`].
+///
+/// Strings and byte arrays *are* the payload, and records and enums get a
+/// generated whole-buffer `_uniffiDecode<Name>`. Everything else (sequences,
+/// optionals, maps) is length- or tag-prefixed, so it has to be read
+/// incrementally.
+fn decodes_from_whole_buffer(ret_type: &Type) -> bool {
+    matches!(
+        runtime_unwrapped_type(ret_type),
+        Type::String | Type::Bytes | Type::Record { .. } | Type::Enum { .. }
+    )
+}
+
+/// Renders the Dart expression that turns a RustBuffer return payload into a
+/// value, for the ffibuffer ABI.
+///
+/// Shared by the top-level-function and object-method renderers. Keep it that
+/// way: these two call sites were once copy-pasted, the object-method copy was
+/// never taught to handle anything but records, enums, and maps, and every
+/// `String` / sequence / optional returning *method* silently generated a
+/// `throw UnsupportedError` for it.
+pub(super) fn render_ffibuffer_return_decode_expr(
+    ret_type: &Type,
+    enums: &[UdlEnum],
+    custom_types: &HashMap<String, CustomTypeConfig>,
+) -> String {
+    match runtime_unwrapped_type(ret_type) {
+        Type::String => lift_custom_if_needed("utf8.decode(retBytes)", ret_type, custom_types),
+        Type::Bytes => lift_custom_if_needed("retBytes", ret_type, custom_types),
+        Type::Record { name, .. } | Type::Enum { name, .. } => {
+            format!("_uniffiDecode{}(retBytes)", to_upper_camel(name))
+        }
+        _ => render_uniffi_binary_read_expression(ret_type, "retReader", enums, custom_types),
+    }
+}
+
+/// Emits the full RustBuffer return-decoding block for the ffibuffer ABI:
+/// lifts the buffer out of the return slots, decodes it, and returns the
+/// value.
+///
+/// Types that need the incremental reader also get an `isDone` assertion, so a
+/// payload the decoder under-reads fails loudly instead of silently dropping
+/// trailing bytes.
+pub(super) fn render_ffibuffer_rustbuffer_return(
+    out: &mut String,
+    ret_type: &Type,
+    enums: &[UdlEnum],
+    custom_types: &HashMap<String, CustomTypeConfig>,
+) {
+    let decode_expr = render_ffibuffer_return_decode_expr(ret_type, enums, custom_types);
+    out.push_str(
+        "      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();\n",
+    );
+    out.push_str(
+        "      retBufPtr.ref\n        ..capacity = (returnBuf + 0).ref.u64\n        ..len = (returnBuf + 1).ref.u64\n        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();\n",
+    );
+    out.push_str("      rustRetBufferPtrs.add(retBufPtr);\n");
+    out.push_str(
+        "      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));\n",
+    );
+    if decodes_from_whole_buffer(ret_type) {
+        out.push_str(&format!("      final decodedValue = {decode_expr};\n"));
+    } else {
+        out.push_str(
+            "      final _UniFfiBinaryReader retReader = _UniFfiBinaryReader(retBytes);\n",
+        );
+        out.push_str(&format!("      final decodedValue = {decode_expr};\n"));
+        out.push_str("      if (!retReader.isDone) {\n");
+        out.push_str(
+            "        throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');\n",
+        );
+        out.push_str("      }\n");
+    }
+    out.push_str("      return decodedValue;\n");
+}
+
 pub(super) fn async_rust_future_spec_from_uniffi_return_type(
     return_type: Option<&Type>,
 ) -> Option<AsyncRustFutureSpec> {
@@ -785,6 +863,121 @@ pub(super) fn async_rust_future_spec_from_uniffi_return_type(
 mod tests {
     use super::*;
     use uniffi_bindgen::interface::{ffi::FfiType, ObjectImpl, Type};
+
+    // ── RustBuffer return decoding ─────────────────────────────────────
+    //
+    // Regression cover for the object-method renderer, which used to handle
+    // only records, enums, and maps and emitted `throw UnsupportedError` for
+    // every other RustBuffer return. That killed `decode_tokens`,
+    // `encode_text`, `apply_chat_template`, `transcribe`, `tool_format`, and
+    // the `hidden_states_*` family at runtime.
+
+    fn no_customs() -> HashMap<String, CustomTypeConfig> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn string_return_decodes_from_whole_buffer() {
+        let expr = render_ffibuffer_return_decode_expr(&Type::String, &[], &no_customs());
+        assert_eq!(expr, "utf8.decode(retBytes)");
+        assert!(decodes_from_whole_buffer(&Type::String));
+    }
+
+    #[test]
+    fn bytes_return_decodes_from_whole_buffer() {
+        let expr = render_ffibuffer_return_decode_expr(&Type::Bytes, &[], &no_customs());
+        assert_eq!(expr, "retBytes");
+        assert!(decodes_from_whole_buffer(&Type::Bytes));
+    }
+
+    #[test]
+    fn sequence_return_uses_incremental_reader() {
+        let ty = Type::Sequence {
+            inner_type: Box::new(Type::UInt32),
+        };
+        let expr = render_ffibuffer_return_decode_expr(&ty, &[], &no_customs());
+        assert!(expr.contains("retReader.readI32()"), "{expr}");
+        assert!(expr.contains("retReader.readU32()"), "{expr}");
+        assert!(!decodes_from_whole_buffer(&ty));
+    }
+
+    #[test]
+    fn optional_return_uses_incremental_reader() {
+        let ty = Type::Optional {
+            inner_type: Box::new(Type::String),
+        };
+        let expr = render_ffibuffer_return_decode_expr(&ty, &[], &no_customs());
+        assert!(expr.contains("retReader.readI8()"), "{expr}");
+        assert!(expr.contains("retReader.readString()"), "{expr}");
+        // An Optional is tag-prefixed, so it must not take the
+        // whole-buffer path even though its inner type would.
+        assert!(!decodes_from_whole_buffer(&ty));
+    }
+
+    #[test]
+    fn record_return_uses_generated_whole_buffer_decoder() {
+        let ty = Type::Record {
+            name: "GenerateOutput".into(),
+            module_path: String::new(),
+        };
+        let expr = render_ffibuffer_return_decode_expr(&ty, &[], &no_customs());
+        assert_eq!(expr, "_uniffiDecodeGenerateOutput(retBytes)");
+        assert!(decodes_from_whole_buffer(&ty));
+    }
+
+    #[test]
+    fn sequence_return_emits_isdone_assertion() {
+        let ty = Type::Sequence {
+            inner_type: Box::new(Type::Float32),
+        };
+        let mut out = String::new();
+        render_ffibuffer_rustbuffer_return(&mut out, &ty, &[], &no_customs());
+        assert!(out.contains("_UniFfiBinaryReader retReader"), "{out}");
+        assert!(out.contains("if (!retReader.isDone)"), "{out}");
+        assert!(out.contains("return decodedValue;"), "{out}");
+    }
+
+    #[test]
+    fn string_return_omits_reader_and_isdone_assertion() {
+        let mut out = String::new();
+        render_ffibuffer_rustbuffer_return(&mut out, &Type::String, &[], &no_customs());
+        assert!(!out.contains("_UniFfiBinaryReader"), "{out}");
+        assert!(!out.contains("isDone"), "{out}");
+        assert!(
+            out.contains("final decodedValue = utf8.decode(retBytes);"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn rustbuffer_return_never_emits_unsupported_error() {
+        // Every return shape cera's FFI surface actually uses.
+        let shapes = vec![
+            Type::String,
+            Type::Bytes,
+            Type::Sequence {
+                inner_type: Box::new(Type::UInt32),
+            },
+            Type::Sequence {
+                inner_type: Box::new(Type::Float32),
+            },
+            Type::Optional {
+                inner_type: Box::new(Type::String),
+            },
+            Type::Record {
+                name: "GenerateOutput".into(),
+                module_path: String::new(),
+            },
+        ];
+        for ty in shapes {
+            let mut out = String::new();
+            render_ffibuffer_rustbuffer_return(&mut out, &ty, &[], &no_customs());
+            assert!(
+                !out.contains("UnsupportedError"),
+                "{ty:?} still renders an UnsupportedError: {out}"
+            );
+        }
+    }
 
     // ── ffibuffer_symbol_name ──────────────────────────────────────────
 

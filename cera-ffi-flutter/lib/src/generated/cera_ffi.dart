@@ -252,9 +252,9 @@ class GenerateOpts {
     this.repetitionPenalty = 1.0,
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     this.stopTokens = const [],
-    /// Ignore end-of-generation: EOS and `stopTokens` are not honored, so
-    /// decode always runs to `maxTokens`. For benchmark loops that must cover
-    /// an exact token count.
+    /// Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
+    /// decode always runs to `max_tokens`. For benchmark loops that must
+    /// cover an exact token count.
     this.ignoreEos = false,
     /// Optional GBNF grammar **source text** constraining the output (e.g. a
     /// JSON grammar). When absent (the default), decoding is unconstrained. The
@@ -285,9 +285,9 @@ class GenerateOpts {
   final double repetitionPenalty;
   /// Early-stop IDs (EOS / instruction markers / end-of-turn).
   final List<int> stopTokens;
-  /// Ignore end-of-generation: EOS and `stopTokens` are not honored, so decode
-  /// always runs to `maxTokens`. For benchmark loops that must cover an exact
-  /// token count.
+  /// Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
+  /// decode always runs to `max_tokens`. For benchmark loops that must
+  /// cover an exact token count.
   final bool ignoreEos;
   /// Optional GBNF grammar **source text** constraining the output (e.g. a
   /// JSON grammar). When absent (the default), decoding is unconstrained. The
@@ -584,9 +584,11 @@ class ModelMetadata {
     required this.hasChatTemplate,
     required this.quantization,
     /// Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
-    /// want to insert a BOS at the head of a raw prompt should honor it.
+    /// want to insert a BOS at the head of a raw prompt should honor it —
+    /// or, better, tokenize via `encode_text_special`, which applies both
+    /// this and `add_eos_token`.
     required this.addBosToken,
-    /// Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `addBosToken`.
+    /// Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `add_bos_token`.
     required this.addEosToken,
     /// SIMD backend tier the runtime resolved for this host (e.g.
     /// `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
@@ -602,9 +604,11 @@ class ModelMetadata {
   final bool hasChatTemplate;
   final String quantization;
   /// Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
-  /// want to insert a BOS at the head of a raw prompt should honor it.
+  /// want to insert a BOS at the head of a raw prompt should honor it —
+  /// or, better, tokenize via `encode_text_special`, which applies both
+  /// this and `add_eos_token`.
   final bool addBosToken;
-  /// Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `addBosToken`.
+  /// Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `add_bos_token`.
   final bool addEosToken;
   /// SIMD backend tier the runtime resolved for this host (e.g.
   /// `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
@@ -1214,6 +1218,34 @@ final class FfiErrorOutOfMemory extends FfiError {
   int get hashCode => requestedBytes.hashCode;
 }
 
+/// A backend's KV-cache compression mode is fixed by the first session that
+/// configures it — the compressed and uncompressed caches have different
+/// buffer layouts (and the uncompressed one is f32 on CPU/wgpu but f16 on
+/// Metal), so only the configured one is ever allocated. Two sessions wanting
+/// different modes need two `CeraModel` instances. Mirrors
+/// `cera::CeraError::KvCompressionConflict`.
+final class FfiErrorKvCompressionConflict extends FfiError {
+  const FfiErrorKvCompressionConflict({
+    required this.configured,
+    required this.requested,
+  });
+  final String configured;
+  final String requested;
+
+  @override
+  String toString() {
+    return 'FfiErrorKvCompressionConflict(configured: $configured, requested: $requested)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiErrorKvCompressionConflict && configured == other.configured && requested == other.requested;
+
+  @override
+  int get hashCode => Object.hash(configured, requested);
+}
+
 /// Why a decode loop exited. Mirrors [`cera::FinishReason`].
 sealed class FinishReason {
   const FinishReason();
@@ -1332,7 +1364,7 @@ final class FinishReasonError extends FinishReason {
 /// and native Metal). The GPU paths implement the both-sides mode only: a
 /// single-sided (debug) request, or a `head_dim` their kernels can't handle,
 /// warns and falls back to that backend's uncompressed KV (f32 on wgpu, f16 on
-/// Metal).
+/// Metal). `F16` is honored by the CPU backend only.
 sealed class KvCompression {
   const KvCompression();
 }
@@ -1351,6 +1383,26 @@ final class KvCompressionNone extends KvCompression {
   bool operator ==(Object other) =>
       identical(this, other) ||
       other is KvCompressionNone;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+/// f16 KV cache — half-precision keys + values (2 bytes/elem), ~2× less KV
+/// bandwidth at decode-at-depth. Near-lossless. CPU LFM2 and
+/// dense-transformer paths.
+final class KvCompressionF16 extends KvCompression {
+  const KvCompressionF16();
+
+  @override
+  String toString() {
+    return 'KvCompressionF16()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvCompressionF16;
 
   @override
   int get hashCode => runtimeType.hashCode;
@@ -1631,6 +1683,26 @@ final class FfiErrorExceptionOutOfMemory extends FfiErrorException {
   }
 }
 
+/// A backend's KV-cache compression mode is fixed by the first session that
+/// configures it — the compressed and uncompressed caches have different
+/// buffer layouts (and the uncompressed one is f32 on CPU/wgpu but f16 on
+/// Metal), so only the configured one is ever allocated. Two sessions wanting
+/// different modes need two `CeraModel` instances. Mirrors
+/// `cera::CeraError::KvCompressionConflict`.
+final class FfiErrorExceptionKvCompressionConflict extends FfiErrorException {
+  const FfiErrorExceptionKvCompressionConflict({
+    required this.configured,
+    required this.requested,
+  });
+  final String configured;
+  final String requested;
+
+  @override
+  String toString() {
+    return 'FfiErrorExceptionKvCompressionConflict(configured: $configured, requested: $requested)';
+  }
+}
+
 FfiErrorException _uniffiLiftFfiErrorException(Uint8List bytes) {
   final FfiError value = _uniffiDecodeFfiError(bytes);
   if (value is FfiErrorUnsupportedModality) return const FfiErrorExceptionUnsupportedModality();
@@ -1677,6 +1749,12 @@ FfiErrorException _uniffiLiftFfiErrorException(Uint8List bytes) {
   if (value is FfiErrorOutOfMemory) {
     return FfiErrorExceptionOutOfMemory(
       requestedBytes: value.requestedBytes,
+    );
+  }
+  if (value is FfiErrorKvCompressionConflict) {
+    return FfiErrorExceptionKvCompressionConflict(
+      configured: value.configured,
+      requested: value.requested,
     );
   }
   throw StateError('Unknown FfiError error variant while lifting exception: $value');
@@ -1772,6 +1850,13 @@ String _encodeFfiError(FfiError value) {
       'requestedBytes': value.requestedBytes,
     });
   }
+  if (value is FfiErrorKvCompressionConflict) {
+    return jsonEncode({
+      'tag': 'kvCompressionConflict',
+      'configured': value.configured,
+      'requested': value.requested,
+    });
+  }
   throw StateError('Unknown FfiError variant instance: $value');
 }
 
@@ -1824,6 +1909,11 @@ FfiError _decodeFfiError(String raw) {
     case 'outOfMemory':
       return FfiErrorOutOfMemory(
         requestedBytes: (map['requestedBytes'] as num).toInt(),
+      );
+    case 'kvCompressionConflict':
+      return FfiErrorKvCompressionConflict(
+        configured: map['configured'] as String,
+        requested: map['requested'] as String,
       );
     default:
       throw StateError('Unknown FfiError variant tag: $tag');
@@ -1899,6 +1989,11 @@ String _encodeKvCompression(KvCompression value) {
       'tag': 'none',
     });
   }
+  if (value is KvCompressionF16) {
+    return jsonEncode({
+      'tag': 'f16',
+    });
+  }
   if (value is KvCompressionTurboQuant) {
     return jsonEncode({
       'tag': 'turboQuant',
@@ -1916,6 +2011,9 @@ KvCompression _decodeKvCompression(String raw) {
   switch (tag) {
     case 'none':
       return KvCompressionNone(
+      );
+    case 'f16':
+      return KvCompressionF16(
       );
     case 'turboQuant':
       return KvCompressionTurboQuant(
@@ -2014,6 +2112,13 @@ String _encodeFfiErrorException(FfiErrorException value) {
       'requestedBytes': value.requestedBytes,
     });
   }
+  if (value is FfiErrorExceptionKvCompressionConflict) {
+    return jsonEncode({
+      'tag': 'kvCompressionConflict',
+      'configured': value.configured,
+      'requested': value.requested,
+    });
+  }
   throw StateError('Unknown FfiErrorException exception instance: $value');
 }
 
@@ -2062,6 +2167,11 @@ FfiErrorException _decodeFfiErrorException(Object? raw) {
     case 'outOfMemory':
       return FfiErrorExceptionOutOfMemory(
         requestedBytes: (map['requestedBytes'] as num).toInt(),
+      );
+    case 'kvCompressionConflict':
+      return FfiErrorExceptionKvCompressionConflict(
+        configured: map['configured'] as String,
+        requested: map['requested'] as String,
       );
     default:
       throw StateError('Unknown FfiErrorException exception tag: $tag');
@@ -2655,6 +2765,11 @@ void _uniffiWriteFfiError(FfiError value, _UniFfiBinaryWriter writer) {
     writer.writeI32(12);
     writer.writeU64(value.requestedBytes);
   }
+  else if (value is FfiErrorKvCompressionConflict) {
+    writer.writeI32(13);
+    writer.writeString(value.configured);
+    writer.writeString(value.requested);
+  }
   else {
     throw StateError('Unknown FfiError variant instance: $value');
   }
@@ -2710,6 +2825,11 @@ FfiError _uniffiReadFfiError(_UniFfiBinaryReader reader) {
     case 12:
       return FfiErrorOutOfMemory(
         requestedBytes: reader.readU64(),
+      );
+    case 13:
+      return FfiErrorKvCompressionConflict(
+        configured: reader.readString(),
+        requested: reader.readString(),
       );
     default:
       throw StateError('Unknown FfiError variant tag: $tag');
@@ -2791,8 +2911,11 @@ void _uniffiWriteKvCompression(KvCompression value, _UniFfiBinaryWriter writer) 
   if (value is KvCompressionNone) {
     writer.writeI32(1);
   }
-  else if (value is KvCompressionTurboQuant) {
+  else if (value is KvCompressionF16) {
     writer.writeI32(2);
+  }
+  else if (value is KvCompressionTurboQuant) {
+    writer.writeI32(3);
     writer.writeU64(value.seed);
     writer.writeBool(value.keys);
     writer.writeBool(value.values);
@@ -2814,6 +2937,8 @@ KvCompression _uniffiReadKvCompression(_UniFfiBinaryReader reader) {
     case 1:
       return const KvCompressionNone();
     case 2:
+      return const KvCompressionF16();
+    case 3:
       return KvCompressionTurboQuant(
         seed: reader.readU64(),
         keys: reader.readBool(),
@@ -3051,6 +3176,16 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text != 52220) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_encode_text`: expected 52220, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special');
+      _checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special != 59360) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special`: expected 59360, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_eos_token;
     try {
@@ -4292,7 +4427,15 @@ class CeraFfiFfi {
         rustRetBufferPtrs.add(errBufPtr);
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
-      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (store_dir)');
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = utf8.decode(retBytes);
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -4669,7 +4812,15 @@ class CeraFfiFfi {
         }
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
-      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (apply_chat_template)');
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = utf8.decode(retBytes);
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -4809,7 +4960,15 @@ class CeraFfiFfi {
         }
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
-      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (apply_chat_template_with_tools)');
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = utf8.decode(retBytes);
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -4952,7 +5111,8 @@ class CeraFfiFfi {
         ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
       rustRetBufferPtrs.add(retBufPtr);
       final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
-      return _uniffiDecodeModalityCapabilities(retBytes);
+      final decodedValue = _uniffiDecodeModalityCapabilities(retBytes);
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -5114,7 +5274,15 @@ class CeraFfiFfi {
         rustRetBufferPtrs.add(errBufPtr);
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
-      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (decode_tokens)');
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = utf8.decode(retBytes);
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -5208,7 +5376,126 @@ class CeraFfiFfi {
         rustRetBufferPtrs.add(errBufPtr);
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
-      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (encode_text)');
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final _UniFfiBinaryReader retReader = _UniFfiBinaryReader(retBytes);
+      final decodedValue = (() { final int __len = retReader.readI32(); final out = <int>[]; for (var i = 0; i < __len; i++) { out.add(retReader.readU32()); } return out; })();
+      if (!retReader.isDone) {
+        throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');
+      }
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineEncodeTextSpecialFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_ceraengine_encode_text_special');
+
+  List<int> ceraEngineInvokeEncodeTextSpecial(int handle, String text, bool addSpecial) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _ceraEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      final Uint8List textBytes = Uint8List.fromList(utf8.encode(text));
+      final ffi.Pointer<ffi.Uint8> textPtr = textBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(textBytes.length);
+      if (textBytes.isNotEmpty) { textPtr.asTypedList(textBytes.length).setAll(0, textBytes); }
+      foreignArgPtrs.add(textPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> textFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      textFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      textFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> textForeignPtr = calloc<_UniFfiForeignBytes>();
+      textForeignPtr.ref
+        ..len = textBytes.length
+        ..data = textPtr;
+      final _UniFfiRustBuffer textRustBuffer = _uniFfiRustBufferFromBytes(textForeignPtr.ref, textFromBytesStatusPtr);
+      calloc.free(textForeignPtr);
+      final int textFromBytesCode = textFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer textFromBytesErrBuf = textFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(textFromBytesStatusPtr);
+      if (textFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> textFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        textFromBytesErrBufPtr.ref
+          ..capacity = textFromBytesErrBuf.capacity
+          ..len = textFromBytesErrBuf.len
+          ..data = textFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(textFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $textFromBytesCode');
+      }
+      (argBuf + 1).ref.u64 = textRustBuffer.capacity;
+      (argBuf + 2).ref.u64 = textRustBuffer.len;
+      (argBuf + 3).ref.ptr = textRustBuffer.data.cast<ffi.Void>();
+      (argBuf + 4).ref.i8 = addSpecial ? 1 : 0;
+      _ceraEngineEncodeTextSpecialFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final _UniFfiBinaryReader retReader = _UniFfiBinaryReader(retBytes);
+      final decodedValue = (() { final int __len = retReader.readI32(); final out = <int>[]; for (var i = 0; i < __len; i++) { out.add(retReader.readU32()); } return out; })();
+      if (!retReader.isDone) {
+        throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');
+      }
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -5478,7 +5765,8 @@ class CeraFfiFfi {
         ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
       rustRetBufferPtrs.add(retBufPtr);
       final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
-      return _uniffiDecodeModelMetadata(retBytes);
+      final decodedValue = _uniffiDecodeModelMetadata(retBytes);
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -5847,7 +6135,19 @@ class CeraFfiFfi {
         rustRetBufferPtrs.add(errBufPtr);
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
-      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (tool_format)');
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final _UniFfiBinaryReader retReader = _UniFfiBinaryReader(retBytes);
+      final decodedValue = (() { final int __tag = retReader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return _uniffiReadToolFormat(retReader); })();
+      if (!retReader.isDone) {
+        throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');
+      }
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -5951,7 +6251,15 @@ class CeraFfiFfi {
         }
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
-      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (transcribe)');
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = utf8.decode(retBytes);
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -7401,7 +7709,8 @@ class CeraFfiFfi {
         ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
       rustRetBufferPtrs.add(retBufPtr);
       final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
-      return _uniffiDecodeModalityCapabilities(retBytes);
+      final decodedValue = _uniffiDecodeModalityCapabilities(retBytes);
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -7569,7 +7878,8 @@ class CeraFfiFfi {
         ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
       rustRetBufferPtrs.add(retBufPtr);
       final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
-      return _uniffiDecodeGenerateOutput(retBytes);
+      final decodedValue = _uniffiDecodeGenerateOutput(retBytes);
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -7840,7 +8150,8 @@ class CeraFfiFfi {
         ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
       rustRetBufferPtrs.add(retBufPtr);
       final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
-      return _uniffiDecodeGenerateSummary(retBytes);
+      final decodedValue = _uniffiDecodeGenerateSummary(retBytes);
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -8234,7 +8545,15 @@ class CeraFfiFfi {
         }
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
-      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (hidden_states_for_text)');
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = retBytes;
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -8337,7 +8656,15 @@ class CeraFfiFfi {
         }
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
-      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (hidden_states_for_tokens)');
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = retBytes;
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -8440,7 +8767,19 @@ class CeraFfiFfi {
         }
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
-      throw UnsupportedError('runtime invocation for this UniFFI ABI (RustCallStatus out-arg) is not implemented yet (hidden_states_mean_pooled)');
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final _UniFfiBinaryReader retReader = _UniFfiBinaryReader(retBytes);
+      final decodedValue = (() { final int __len = retReader.readI32(); final out = <double>[]; for (var i = 0; i < __len; i++) { out.add(retReader.readF32()); } return out; })();
+      if (!retReader.isDone) {
+        throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');
+      }
+      return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -9071,6 +9410,18 @@ final class CeraEngine {
   List<int> encodeText(String text) {
     _ensureOpen();
     return _ffi.ceraEngineInvokeEncodeText(_handle, text);
+  }
+
+  /// Encode `text` with optional special markers — the analog of llama.cpp's
+  /// `llama_tokenize(..., add_special)`. When `add_special` is true, BOS is
+  /// prepended iff the GGUF declares `tokenizer.ggml.add_bos_token` and EOS
+  /// appended iff it declares `tokenizer.ggml.add_eos_token`, so token counts
+  /// match llama.cpp for the same text (benchmark parity). With
+  /// `add_special = false` this is exactly [`Self::encode_text`]. Prefer this
+  /// over hand-prepending BOS via [`ModelMetadata::add_bos_token`].
+  List<int> encodeTextSpecial(String text, bool addSpecial) {
+    _ensureOpen();
+    return _ffi.ceraEngineInvokeEncodeTextSpecial(_handle, text, addSpecial);
   }
 
   /// End-of-sequence / end-of-text token ID, if the model has one.
