@@ -460,6 +460,35 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc -p cera-wasm --features wgpu --no-deps --lib --target wasm32-unknown-unknown
 
+  wasm-simd-kernels:
+    # The `simd128` kernels in `cera/src/backend/simd.rs` are the only reason
+    # browsers are not on the scalar path, and NOTHING else in CI executes
+    # them: every other job either builds wasm32 without running it, or runs
+    # tests on the host, where a wasm SIMD instruction cannot execute. A
+    # host-only suite is green whether or not these kernels are correct.
+    #
+    # Each test is an oracle against the scalar reference in `crate::quant` —
+    # the code wasm32 fell through to before the kernels existed — so "matches
+    # scalar" is exactly the property that makes enabling them safe.
+    name: Wasm SIMD Kernels
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+      - uses: extractions/setup-just@v3
+      - name: Run the simd128 kernel oracle tests under Node
+        # `+simd128` comes from `.cargo/config.toml`; do not set RUSTFLAGS here,
+        # which would REPLACE that rather than append and silently test the
+        # scalar path instead.
+        run: just wasm-simd-test
+
   cera-wasm-pack:
     # Multi-target wasm-pack build. Each matrix entry produces one
     # consumer shape:
