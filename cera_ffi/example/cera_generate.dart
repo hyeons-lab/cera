@@ -11,7 +11,7 @@
 //
 // The FFI surface returns token IDs (no detokenizer is exposed yet — see
 // V2.17), so this prints the token count and decode timing rather than text.
-import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+import 'package:cera_ffi/cera_ffi.dart';
 
 void main(List<String> args) {
   if (args.isEmpty) {

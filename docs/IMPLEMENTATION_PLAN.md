@@ -55,7 +55,7 @@ earlier "GPU is LFM2-only" limitation is gone (see #177/#192/#193/#194/#200).
 | V2.12 CUDA backend | ⬜ | |
 | V2.13 Python (PyO3) bindings | ⬜ | |
 | V2.14 Kotlin Multiplatform bindings | ✅ | `cera-ffi-kotlin` (android + jvm) |
-| V2.17 Flutter / Dart bindings | 🟡 | `cera_ffi_flutter`: full API verified (no stubs left) + real Flutter FFI plugin; Android/iOS/Linux/Windows builds unverified |
+| V2.17 Flutter / Dart bindings | 🟡 | `cera_ffi` (pure Dart) + `cera_ffi_flutter` (FFI plugin): full API verified, no stubs; iOS/Android/macOS/Linux builds run, Windows covered by CI only |
 | V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core + FFI + GPU (Metal/wgpu) encode shipped, no slicing |
 | V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
 
@@ -428,9 +428,14 @@ model starts a call. Exposed across CLI (`--tools` / `--constrain-tools`), FFI
 
 ### V2.17: Flutter / Dart Bindings, 2-3 weeks 🟡 (full API working, no stubs; platform builds unverified off macOS)
 Expose the engine to Flutter/Dart, reusing the existing `cera-ffi` UniFFI
-surface (the same C ABI that already backs Kotlin + Swift). The
-`cera_ffi_flutter` Dart package ships the generated+patched bindings plus a
-platform-aware native-library loader.
+surface (the same C ABI that already backs Kotlin + Swift). Two packages: the
+`cera_ffi` Dart package ships the generated+patched bindings plus a
+platform-aware native-library loader, and `cera_ffi_flutter` is the Flutter FFI
+plugin that depends on it and adds the per-platform native build wiring. They
+are split because pub will not publish a package declaring
+`flutter.plugin.platforms` without a Flutter SDK constraint, and declaring that
+constraint makes `dart pub get` refuse the package: one package cannot be both a
+plugin and plain-Dart-resolvable.
 
 **Working (verified end-to-end):** the synchronous engine API round-trips real
 inference: loaded a Qwen2-0.5B GGUF through `CeraEngine.fromPath` →

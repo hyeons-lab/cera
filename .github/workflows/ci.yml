@@ -783,7 +783,7 @@ jobs:
 
   dart-bindings-drift:
     # Same idea as ffi-bindings-drift, for the committed Dart bindings under
-    # cera_ffi_flutter/lib/src/generated/.
+    # cera_ffi/lib/src/generated/.
     #
     # This job exists because its absence already cost us: the Dart bindings
     # silently fell ~3 weeks behind the Rust FFI surface (missing three
@@ -804,11 +804,12 @@ jobs:
         with:
           toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
-      # Flutter, not `dart-lang/setup-dart`: the package declares a Flutter SDK
-      # constraint (pub requires one to publish `flutter.plugin.platforms`), and
-      # that makes plain `dart pub get` refuse to resolve it. Flutter ships a
-      # Dart SDK, so this covers both. The `sdk: ^3.3.0` floor is satisfied by
-      # any current stable Flutter.
+      # Flutter, not `dart-lang/setup-dart`, because the recipe checks BOTH
+      # packages: `cera_ffi` with plain `dart` (proving it still resolves
+      # without Flutter, which is the reason it exists) and `cera_ffi_flutter`
+      # with `flutter`, which it cannot avoid needing. Flutter ships a Dart SDK,
+      # so one install covers both; the `sdk: ^3.3.0` floor is satisfied by any
+      # current stable Flutter.
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
@@ -825,7 +826,7 @@ jobs:
         # generator emits calls to `uniffi_ffibuffer_*` trampolines, which
         # UniFFI exports only under that feature; Kotlin and Swift use the
         # standard symbols), regenerates + patches the bindings in place, fails
-        # on any diff against what is committed, and analyzes the package.
+        # on any diff against what is committed, and analyzes both packages.
         run: just dart-bindings-check
 
       - name: Assert no method is stubbed out
@@ -834,7 +835,7 @@ jobs:
         # is perfectly happy with. Every method now has a real implementation,
         # so any hit here means one silently stopped working.
         run: |
-          cd cera_ffi_flutter
+          cd cera_ffi
           unexpected=$(grep -n "not implemented yet" lib/src/generated/cera_ffi.dart || true)
           if [ -n "${unexpected}" ]; then
             echo "::error::Generated bindings contain unexpected runtime stubs:"
@@ -843,9 +844,9 @@ jobs:
           fi
 
       # Analysis happens inside `just dart-bindings-check` above, which has also
-      # already resolved the package, so the plain Dart test runner works here.
+      # already resolved the package.
       - name: Test
-        run: cd cera_ffi_flutter && dart test
+        run: cd cera_ffi && dart test
 
       - name: Generator unit tests
         run: cargo test --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml

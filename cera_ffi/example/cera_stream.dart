@@ -8,7 +8,7 @@
 //     dart run example/cera_stream.dart /path/to/model.gguf "Once upon a time"
 import 'dart:io' show exit;
 
-import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+import 'package:cera_ffi/cera_ffi.dart';
 
 /// Collects streamed tokens as Rust pushes them across the FFI boundary.
 class _CollectingSink implements ModalitySink {

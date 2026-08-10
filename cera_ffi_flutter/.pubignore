@@ -1,0 +1,29 @@
+# Excluded from the published pub.dev archive (this file replaces .gitignore for
+# that purpose, so anything listed in .gitignore that should also stay out of the
+# archive has to be repeated here).
+
+# In-repo path override for the sibling `cera_ffi` package. Publishing it would
+# ship a dependency override pointing at a directory that does not exist on a
+# consumer's machine.
+pubspec_overrides.yaml
+
+# Dart tooling and local build output.
+.dart_tool/
+pubspec.lock
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Locally built native libraries. Consumers get these from the release assets
+# each platform's build wiring downloads, never from the archive.
+*.so
+*.dylib
+*.dll
+*.a
+/ios/CeraFFI.xcframework/
+/macos/CeraFFI.xcframework/
+/ios/cera_ffi_flutter/CeraFFI.xcframework/
+/macos/cera_ffi_flutter/CeraFFI.xcframework/
+/ios/cera_ffi_flutter/.build/
+/macos/cera_ffi_flutter/.build/
+.cera-xcframework-sha256

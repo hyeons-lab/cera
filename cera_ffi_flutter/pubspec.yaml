@@ -1,8 +1,8 @@
 name: cera_ffi_flutter
 # pub.dev requires 60-180 characters; anything longer is a scoring penalty.
 description: >-
-  Flutter and Dart bindings for the Cera on-device inference engine. Runs GGUF
-  LLMs locally, with prebuilt native libraries for every platform.
+  Flutter FFI plugin for the Cera on-device inference engine. Ships prebuilt
+  native libraries for Android, iOS, macOS, Linux and Windows.
 version: 0.4.0
 repository: https://github.com/hyeons-lab/cera
 issue_tracker: https://github.com/hyeons-lab/cera/issues
@@ -15,48 +15,40 @@ topics:
   - ai
 
 environment:
-  # NativeCallable.isolateLocal (used by the generated bindings) lands in 3.1;
-  # 3.3 is the floor we validate against.
   sdk: ^3.3.0
-  # Mandatory, and it has a cost worth stating plainly. pub rejects publishing a
-  # package that declares `flutter.plugin.platforms` without a Flutter SDK
-  # constraint ("allows Flutter SDK version 1.9.x, which does not support the
-  # flutter.plugin.platforms key"), so a plugin cannot opt out. 3.10 is the
-  # floor because that is where `ffiPlugin: true` landed.
+  # Mandatory: pub rejects a package declaring `flutter.plugin.platforms`
+  # without a Flutter SDK constraint ("allows Flutter SDK version 1.9.x, which
+  # does not support the flutter.plugin.platforms key"). 3.10 is the floor
+  # because that is where `ffiPlugin: true` landed.
   #
-  # The cost: declaring it makes pub treat the package as *requiring* the
-  # Flutter SDK, so `dart pub get` refuses it outright ("Because
-  # cera_ffi_flutter requires the Flutter SDK, version solving failed") even
-  # though nothing under `lib/` imports `package:flutter` and the bindings are
-  # pure `dart:ffi`. Use `flutter pub get` (which works for plain-Dart packages
-  # too). Verified by removing this line: publishing fails.
-  #
-  # Lifting that restriction means splitting the package in two — a pure-Dart
-  # `cera_ffi` with no `flutter:` block, plus a thin plugin depending on it,
-  # the standard federated layout. Not done here.
+  # Declaring it is also what makes `dart pub get` refuse a package, which is
+  # why the Dart API is not here: it lives in `cera_ffi`, which has no such
+  # constraint and resolves from plain Dart. This package adds the native build
+  # wiring on top and re-exports it, so a Flutter app needs only this one
+  # dependency.
   flutter: '>=3.10.0'
 
-# Deliberately NOT depending on the Flutter SDK. Nothing under `lib/` imports
-# `package:flutter/*` — the bindings are pure `dart:ffi` — so leaving the
-# dependency out keeps the package usable from a plain Dart CLI (`dart run`,
-# server, or test) on a machine with no Flutter install. The `flutter:` block
-# below is metadata the Flutter tool reads to wire up the native builds; it
-# does not require the SDK to be a dependency.
 dependencies:
-  # dart:ffi helpers (Utf8, toNativeUtf8, calloc, …) the generated code uses.
-  ffi: ^2.1.0
+  # The Dart API. Pinned to the exact workspace version rather than a caret
+  # range: the bindings are checksum-verified against a specific Rust FFI
+  # surface at construction, and the native library this plugin fetches is built
+  # from that same surface. A mismatched pair fails loudly at startup, so there
+  # is no version of `cera_ffi` other than this one that can work with the
+  # native library shipped alongside it. Kept in step by scripts/bump-version.sh.
+  cera_ffi: 0.4.0
 
 dev_dependencies:
+  # Only for analyzing this package's one re-export file; `analysis_options.yaml`
+  # includes it. The Dart API and its test suite live in `cera_ffi`.
   lints: ^4.0.0
-  test: ^1.25.0
 
 flutter:
   plugin:
     platforms:
       # `ffiPlugin: true` on every platform: this is an FFI-only plugin. There
       # is no platform channel and no per-platform Dart class, so Flutter's
-      # tooling only needs to build/bundle the native library. Dart calls it
-      # directly via `CeraLibrary.open()`.
+      # tooling only needs to build/bundle the native library. The Dart side
+      # calls it directly, from `package:cera_ffi`.
       #
       # None of these build Rust. Each pulls the prebuilt library that the
       # release pipeline already publishes, so app developers never need a Rust

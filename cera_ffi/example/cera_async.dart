@@ -6,7 +6,7 @@
 //     dart run example/cera_async.dart /path/to/model.gguf "Once upon a time"
 import 'dart:io' show exit;
 
-import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+import 'package:cera_ffi/cera_ffi.dart';
 
 Future<void> main(List<String> args) async {
   if (args.isEmpty) {

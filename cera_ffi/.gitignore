@@ -1,0 +1,19 @@
+# Dart tooling
+.dart_tool/
+.packages
+pubspec.lock
+build/
+
+# The generated+patched UniFFI bindings (lib/src/generated/cera_ffi.dart) ARE
+# committed — like the Kotlin/Swift bindings — so the package works out of the
+# box. Regenerate with `just dart-bindings`; `just dart-bindings-check` guards
+# against drift.
+
+# A locally built cera-ffi cdylib, dropped here so the examples and tests can
+# find it without setting CERA_FFI_LIB. This package ships no native library of
+# its own (that is what `cera_ffi_flutter` adds), so anything matching these is
+# always a local build.
+*.so
+*.dylib
+*.dll
+*.a

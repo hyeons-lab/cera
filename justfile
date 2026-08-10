@@ -165,7 +165,8 @@ dart-libs:
     @echo "Built {{CERA_FFI_DYLIB}} (with ffi-buffer trampolines)."
     @echo "Point Dart at it via CERA_FFI_LIB or place it on the loader path."
 
-# Generate + patch the Dart/Flutter bindings into the cera_ffi_flutter package.
+# Generate + patch the Dart bindings into the cera_ffi package (NOT
+# cera_ffi_flutter, which is the thin Flutter plugin wrapping it).
 # Builds + runs the VENDORED uniffi-bindgen-dart (third_party/) — patched for
 # Cera with callback-argument lowering + the foreign-trait vtable-init symbol fix
 # that makes streaming work; built from source rather than `cargo install`ing the
@@ -182,23 +183,25 @@ dart-libs:
 dart-bindings: dart-libs
     cargo run --release --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml -- \
         generate {{CERA_FFI_DYLIB}} \
-        --out-dir cera_ffi_flutter/lib/src/generated
-    cd cera_ffi_flutter && dart run tool/patch_generated_bindings.dart
+        --out-dir cera_ffi/lib/src/generated
+    cd cera_ffi && dart run tool/patch_generated_bindings.dart
 
 # Verify the committed Dart bindings are up to date with the current FFI
-# surface (regenerate + patch in place, fail on diff) and analyze the package.
+# surface (regenerate + patch in place, fail on diff) and analyze both packages.
 dart-bindings-check: dart-bindings
-    @if [ -n "$(git status --porcelain cera_ffi_flutter/lib/src/generated)" ]; then \
+    @if [ -n "$(git status --porcelain cera_ffi/lib/src/generated)" ]; then \
         echo "ERROR: Dart bindings are stale. Run \`just dart-bindings\` and commit the diff."; \
-        git --no-pager diff cera_ffi_flutter/lib/src/generated; \
+        git --no-pager diff cera_ffi/lib/src/generated; \
         exit 1; \
     fi
-    # `flutter pub get`, not `dart pub get`. pub will not publish a package
-    # declaring `flutter.plugin.platforms` without a Flutter SDK constraint, and
-    # declaring one makes `dart pub get` refuse the package outright ("requires
-    # the Flutter SDK, version solving failed") even though nothing under lib/
-    # imports package:flutter. See the note in cera_ffi_flutter/pubspec.yaml.
-    # `dart test` afterwards is fine: pub has already resolved by then.
+    # `dart`, not `flutter`, and that is the point of the split: `cera_ffi`
+    # declares no Flutter SDK constraint, so plain Dart can resolve it. If this
+    # line ever has to become `flutter pub get`, something has reintroduced a
+    # Flutter dependency and plain-Dart consumers are broken.
+    cd cera_ffi && dart pub get && dart analyze
+    # The plugin does need Flutter: pub refuses to publish a package declaring
+    # `flutter.plugin.platforms` without an SDK constraint, and that constraint
+    # is exactly what `dart pub get` rejects. See cera_ffi_flutter/pubspec.yaml.
     cd cera_ffi_flutter && flutter pub get && flutter analyze
 
 # Verify the committed Kotlin + Swift bindings are up to date with the

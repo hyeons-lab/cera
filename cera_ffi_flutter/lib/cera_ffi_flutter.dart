@@ -1,30 +1,27 @@
-/// Flutter/Dart bindings for the Cera inference engine.
+/// Flutter bindings for the Cera inference engine.
 ///
-/// This is the package's public entry point. It re-exports:
-/// - [CeraLibrary] — the platform-aware native-library loader.
-/// - the UniFFI engine bindings from `src/generated/cera_ffi.dart`
-///   (`CeraEngine`, `EngineConfig`, `Session`, `ModalitySink`, …).
+/// This library is a re-export of `package:cera_ffi`, and deliberately holds no
+/// code of its own. The Dart API lives in that package because it has no
+/// Flutter SDK constraint and so resolves under plain `dart pub get`; a plugin
+/// cannot avoid declaring one, and declaring one is what makes `dart pub get`
+/// refuse a package. Everything this package adds is under `android/`, `ios/`,
+/// `macos/`, `linux/` and `windows/`: the per-platform build wiring that ships
+/// the native library with your app.
 ///
-/// ## Regenerating the bindings
-///
-/// The generated UniFFI bindings are committed under
-/// `src/generated/cera_ffi.dart`. Regenerate them from the repo root if the
-/// Rust FFI surface changes (see V2.17 in `docs/IMPLEMENTATION_PLAN.md`):
-///
-/// ```sh
-/// just dart-bindings
-/// ```
-///
-/// ## Usage sketch
+/// So a Flutter app depends on this package and imports this one library:
 ///
 /// ```dart
 /// import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
 ///
-/// final lib = CeraLibrary.open();
-/// final ffi = CeraFfiFfi(dynamicLibrary: lib); // from generated bindings
-/// // … construct an engine, run generate(), etc.
+/// final engine = CeraEngine(
+///   modelPath: path,
+///   config: const EngineConfig(),
+/// );
 /// ```
-library cera_ffi_flutter;
+///
+/// Importing `package:cera_ffi/cera_ffi.dart` directly works too and is
+/// identical; the two names exist so that non-Flutter Dart programs have
+/// something to depend on.
+library;
 
-export 'src/library_loader.dart';
-export 'src/generated/cera_ffi.dart';
+export 'package:cera_ffi/cera_ffi.dart';

@@ -1,7 +1,7 @@
 @TestOn('vm')
 library;
 
-import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+import 'package:cera_ffi/cera_ffi.dart';
 import 'package:test/test.dart';
 
 /// Compile-time guard on the generated binding surface.

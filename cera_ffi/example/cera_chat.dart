@@ -14,7 +14,7 @@
 //     dart run example/cera_chat.dart /path/to/model.gguf "Why is the sky blue?"
 import 'dart:io';
 
-import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+import 'package:cera_ffi/cera_ffi.dart';
 
 void main(List<String> args) {
   if (args.isEmpty) {

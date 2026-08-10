@@ -9,11 +9,14 @@
 #     version.workspace = true)
 #   - each dependent crate's internal `cera = { ..., version = "X.Y.Z", ... }`
 #     path-dep pin (cera-cli, cera-ffi, cera-wasm, cera-parity)
-#   - cera_ffi_flutter/pubspec.yaml  version:  (build name; any "+build" suffix
-#     after the version is preserved)
+#   - cera_ffi/pubspec.yaml  version:  (build name; any "+build" suffix after
+#     the version is preserved)
 #   - cera-ffi-kotlin/gradle.properties  VERSION_NAME  (the Maven Central
 #     coordinate for the Kotlin/Android bindings; any "-QUALIFIER" suffix such
 #     as "-SNAPSHOT" is preserved)
+#   - cera_ffi_flutter/pubspec.yaml, both its own `version:` and its pin on
+#     `cera_ffi:` — the two packages are published as a pair and the plugin
+#     pins the exact version, not a range
 #   - the cera_ffi_flutter platform manifests, which name the *published*
 #     native artifact each platform resolves at build time: the AAR coordinate
 #     in android/build.gradle and the release tag the linux/windows
@@ -46,7 +49,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION_FILE="$ROOT/VERSION"
 CARGO_TOML="$ROOT/Cargo.toml"
-PUBSPEC="$ROOT/cera_ffi_flutter/pubspec.yaml"
+PUBSPEC="$ROOT/cera_ffi/pubspec.yaml"
 GRADLE_PROPS="$ROOT/cera-ffi-kotlin/gradle.properties"
 # Dependent crates carrying an internal `cera` path-dep pin.
 PIN_CRATES=(cera-cli cera-ffi cera-wasm cera-parity)
@@ -62,6 +65,8 @@ PIN_CRATES=(cera-cli cera-ffi cera-wasm cera-parity)
 # (Android), or a git tag carrying no assets at all (Linux/Windows). Both
 # surface as a runtime failure in a consumer's app, long after the release.
 PLUGIN_SITES=(
+  "plugin pubspec version|cera_ffi_flutter/pubspec.yaml|(?<pre>^version:\s*)(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>)"
+  "plugin pin on cera_ffi|cera_ffi_flutter/pubspec.yaml|(?<pre>^\s*cera_ffi:\s*)(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>)"
   "android build.gradle version|cera_ffi_flutter/android/build.gradle|(?<pre>^version = ')(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>')"
   "android cera-ffi-android dependency|cera_ffi_flutter/android/build.gradle|(?<pre>^\s*api 'com\.hyeons-lab:cera-ffi-android:)(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>')"
   "linux CMakeLists CERA_VERSION|cera_ffi_flutter/linux/CMakeLists.txt|(?<pre>^set\(CERA_VERSION \")(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>\"\))"
@@ -240,7 +245,7 @@ echo "  VERSION"
 echo "  Cargo.toml        (workspace.package + ${#PIN_CRATES[@]} internal cera pins)"
 echo "  pubspec.yaml      ${VERSION}${psuffix}"
 echo "  gradle.properties ${VERSION}${gsuffix}"
-echo "  cera_ffi_flutter  ${#PLUGIN_SITES[@]} platform-manifest sites"
+echo "  cera_ffi_flutter  ${#PLUGIN_SITES[@]} pubspec + platform-manifest sites"
 echo
 echo "Cargo.lock is tracked and records these crate versions, so refresh it before"
 echo "committing:  cargo metadata --offline >/dev/null  (then include it in the diff)."

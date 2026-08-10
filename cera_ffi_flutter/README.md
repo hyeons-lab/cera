@@ -3,19 +3,22 @@
 Flutter and Dart bindings for the [Cera](https://github.com/hyeons-lab/cera)
 inference engine: on-device LLM inference with no network round trip.
 
-This package wraps the **`cera-ffi` UniFFI surface**, the same C ABI that backs
-the Kotlin (`cera-ffi-kotlin`) and Swift bindings, and adds a platform-aware
-native-library loader. The Dart bindings are generated from the compiled
-`cera-ffi` cdylib by a vendored `uniffi-bindgen-dart`, then run through a small
-deterministic patch tool.
+This is the package Flutter apps depend on. It is an **FFI plugin**: the native
+library is fetched and linked by each platform's own build system, with no
+method channels and no Dart-side setup.
 
-It is a Flutter **FFI plugin**: the native library is fetched and linked by each
-platform's own build system, with no method channels and no Dart-side setup. It
-also runs as a plain Dart package (server, CLI) by pointing `CERA_FFI_LIB` at a
-locally built cdylib; resolve with `flutter pub get` rather than `dart pub get`,
-since pub requires a plugin to declare a Flutter SDK constraint and that
-constraint is what `dart pub get` refuses. Nothing under `lib/` imports
-`package:flutter`.
+The Dart API is not here. It lives in
+[`cera_ffi`](https://pub.dev/packages/cera_ffi), which this package depends on
+and re-exports, so `import 'package:cera_ffi_flutter/cera_ffi_flutter.dart'`
+gives you the whole API and you need only this one dependency. The two are split
+because pub will not publish a package declaring `flutter.plugin.platforms`
+without a Flutter SDK constraint, and declaring that constraint is exactly what
+makes `dart pub get` refuse a package. One package cannot be both a plugin and
+plain-Dart-resolvable, so the bindings live in the half that has no Flutter
+constraint.
+
+Both wrap the **`cera-ffi` UniFFI surface**, the same C ABI that backs the
+Kotlin (`cera-ffi-kotlin`) and Swift bindings.
 
 ## Supported platforms
 
@@ -92,15 +95,16 @@ whole decode. In a Flutter app, drive it from `Isolate.run` (as
 
 - `example/` — a Flutter chat app (the pub.dev example), inference on a
   background isolate.
-- `example/dart/` — plain-Dart CLI scripts covering each surface:
+- `../cera_ffi/example/` — plain-Dart CLI scripts covering each surface:
   `cera_chat.dart` (template → generate → decode), `cera_generate.dart`,
-  `cera_async.dart`, `cera_stream.dart`, `cera_progress.dart`.
+  `cera_async.dart`, `cera_stream.dart`, `cera_progress.dart`. They live with
+  the API package because they need no Flutter.
 
 ```sh
-just dart-bindings
-cd cera_ffi_flutter
+just dart-libs
+cd cera_ffi
 CERA_FFI_LIB=../target/debug/libcera_ffi.dylib \
-  dart run example/dart/cera_chat.dart /path/to/model.gguf "Why is the sky blue?"
+  dart run example/cera_chat.dart /path/to/model.gguf "Why is the sky blue?"
 ```
 
 Supported architectures match the engine: `lfm2`/`lfm2.5` (incl. vision and
@@ -124,17 +128,29 @@ runtime. `CeraLibrary.open()` resolves, in order:
 
 ## Layout
 
+Two packages, side by side in the repo. This one holds only the native build
+wiring and a one-line re-export; everything a caller writes against lives in
+`cera_ffi/`.
+
 ```
-cera_ffi_flutter/
-├── pubspec.yaml              # ffi dep, SDK ^3.3.0, plugin platform block
+cera_ffi_flutter/             # the plugin: native build wiring
+├── pubspec.yaml              # cera_ffi dep, flutter constraint, plugin platform block
+├── pubspec_overrides.yaml    # resolve cera_ffi from ../ during development
 ├── android/                  # Gradle module -> cera-ffi-android AAR
 ├── ios/, macos/              # podspec + SPM manifest -> CeraFFI.xcframework
 ├── linux/, windows/          # CMake: download + checksum the cdylib
+├── example/                  # Flutter app
+└── lib/
+    └── cera_ffi_flutter.dart # re-export of package:cera_ffi
+
+cera_ffi/                     # the Dart API: no Flutter constraint
+├── pubspec.yaml
 ├── tool/
 │   └── patch_generated_bindings.dart  # post-gen fixups (idempotent)
-├── example/                  # Flutter app + plain-Dart scripts
+├── example/                  # plain-Dart scripts
+├── test/
 └── lib/
-    ├── cera_ffi_flutter.dart # public barrel (loader + generated bindings)
+    ├── cera_ffi.dart         # public barrel (loader + generated bindings)
     └── src/
         ├── library_loader.dart       # conditional export (io / web stub)
         ├── library_loader_io.dart    # CeraLibrary.open(): dylib resolution
@@ -201,9 +217,24 @@ The Apple manifests resolve `CeraFFI.xcframework` from a tagged release, so
 Apple targets need a published release (or a locally built xcframework) before
 they resolve.
 
-Web is out of scope: this package needs `dart:ffi`. Importing it in a
-multi-platform app is safe (the web stub throws a clear `UnsupportedError`);
-for browsers use `cera-wasm`.
+Web is not supported, and the failure is at **compile time**, not run time. The
+generated bindings import `dart:ffi` unconditionally, so an app that targets web
+and depends on this package fails to build:
+
+```
+Error: Dart library 'dart:ffi' is not available on this platform.
+Info: The unavailable library 'dart:ffi' is imported through these packages:
+    main.dart => package:cera_ffi => dart:ffi
+```
+
+Only the *loader* is conditionally exported (`library_loader.dart`), so the
+`UnsupportedError` stub it provides is never reached: compilation stops first.
+Use `cera-wasm` in browsers.
+
+Making the package merely importable on web needs a stub mirroring the whole
+generated API surface, which is why it is not a one-line conditional export.
+Making it *work* on web needs a platform-interface package that both the FFI
+and wasm implementations satisfy; see "Web" in the repo root README.
 
 ## License
 

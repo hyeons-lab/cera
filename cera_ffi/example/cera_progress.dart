@@ -10,7 +10,7 @@
 // e.g. bundleId=LFM2-350M-GGUF quant=Q4_0
 import 'dart:io' show Directory, exit;
 
-import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+import 'package:cera_ffi/cera_ffi.dart';
 
 class _AbortAfterFirst implements DownloadProgressSink {
   @override

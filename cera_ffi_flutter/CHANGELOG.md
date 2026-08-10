@@ -5,6 +5,16 @@
 First release to pub.dev. The package existed in-tree before this, but was
 marked `publish_to: none` and was not a Flutter plugin.
 
+### Changed
+
+- **The Dart API moved to the new `cera_ffi` package**, which this one now
+  depends on and re-exports. `import 'package:cera_ffi_flutter/cera_ffi_flutter.dart'`
+  is unchanged and still gives you everything. The split exists because pub
+  refuses to publish a package declaring `flutter.plugin.platforms` without a
+  Flutter SDK constraint, and declaring that constraint makes `dart pub get`
+  refuse the package: one package could not be both a plugin and usable from
+  plain Dart.
+
 ### Added
 
 - **Flutter FFI plugin support for Android, iOS, macOS, Linux, and Windows.**
@@ -14,7 +24,7 @@ marked `publish_to: none` and was not a Flutter plugin.
   a CocoaPods podspec *and* a Swift Package Manager manifest, and the desktop
   cdylibs via CMake with a SHA-256 check.
 - Flutter example app (`example/`) running inference on a background isolate,
-  plus plain-Dart CLI examples under `example/dart/`.
+  plus plain-Dart CLI examples, which ship with `cera_ffi`.
 - Standalone Linux and Windows cdylib release assets.
 
 ### Fixed
@@ -55,6 +65,7 @@ marked `publish_to: none` and was not a Flutter plugin.
 - Requires iOS 15.0+ / macOS 12.0+ / Android API 28+. An app left at Flutter's
   default deployment target fails with an SPM error that does not name the fix;
   see the README.
-- Flutter Web is not supported: the bindings are `dart:ffi`-based. Importing the
-  package in a multi-platform app is safe (the web stub throws a clear
-  `UnsupportedError`). For browsers, use `cera-wasm`.
+- Flutter Web is not supported, and an app that targets web and depends on this
+  package fails to **compile**: the generated bindings import `dart:ffi`
+  unconditionally, so the `UnsupportedError` stub in the loader is never
+  reached. For browsers, use `cera-wasm`.

@@ -1,0 +1,18 @@
+include: package:lints/recommended.yaml
+
+analyzer:
+  exclude:
+    # Generated UniFFI bindings — produced by `just dart-bindings`, not
+    # hand-edited. Excluded from lints (and from the known async/streaming
+    # codegen errors tracked in V2.17) so the hand-written package code can be
+    # analyzed cleanly on its own.
+    - lib/src/generated/**
+
+linter:
+  rules:
+    # The examples are CLI scripts: printing to stdout is their entire output
+    # channel. `avoid_print` is aimed at app code, where print bypasses the
+    # logging setup, and `lints/recommended` does not enable it anyway — this
+    # is here to say so, since the rule was previously dodged by excluding the
+    # example directory from a Flutter app's analyzer.
+    avoid_print: false

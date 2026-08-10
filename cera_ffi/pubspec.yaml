@@ -1,0 +1,37 @@
+name: cera_ffi
+# pub.dev requires 60-180 characters; anything longer is a scoring penalty.
+description: >-
+  Dart bindings for the Cera on-device inference engine. Runs GGUF LLMs locally
+  through dart:ffi, with no Flutter dependency.
+version: 0.4.0
+repository: https://github.com/hyeons-lab/cera
+issue_tracker: https://github.com/hyeons-lab/cera/issues
+documentation: https://github.com/hyeons-lab/cera/blob/main/cera_ffi/README.md
+topics:
+  - llm
+  - inference
+  - ffi
+  - gguf
+  - ai
+
+environment:
+  # NativeCallable.isolateLocal (used by the generated bindings) lands in 3.1;
+  # 3.3 is the floor we validate against.
+  sdk: ^3.3.0
+  # No `flutter:` constraint, and that absence is the entire point of this
+  # package existing separately from `cera_ffi_flutter`. Declaring one is what
+  # makes pub treat a package as requiring the Flutter SDK, after which
+  # `dart pub get` refuses it outright. A plugin cannot avoid declaring it (pub
+  # rejects `flutter.plugin.platforms` without one), so the bindings live here
+  # instead and the plugin depends on them.
+  #
+  # Nothing in `lib/` imports `package:flutter`, and nothing here should: adding
+  # such an import, or a `flutter:` block, silently ends plain-Dart support.
+
+dependencies:
+  # dart:ffi helpers (Utf8, toNativeUtf8, calloc, …) the generated code uses.
+  ffi: ^2.1.0
+
+dev_dependencies:
+  lints: ^4.0.0
+  test: ^1.25.0
