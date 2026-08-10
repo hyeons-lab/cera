@@ -1128,6 +1128,44 @@ public static func fromBundleIdAsync(bundleId: String, quant: String, config: En
 }
     
     /**
+     * Load a model from GGUF bytes already in memory.
+     *
+     * For callers with no filesystem to point [`CeraEngine::from_path`]
+     * at: a browser, an encrypted blob decrypted in memory, an asset
+     * read out of an archive. It is the one constructor a WebAssembly
+     * build can also offer, so code written against it ports across.
+     *
+     * **Not a streaming API.** GGUF is random-access: tensor data is
+     * addressed by offset and read throughout inference, so the whole
+     * file has to be resident before the first token. You can download
+     * over a stream, but you must accumulate it all before calling
+     * this. There is no partial-model inference.
+     *
+     * **Prefer [`CeraEngine::from_path`] whenever a path exists.** That
+     * route memory-maps the file, so tensor pages stay owned by the
+     * kernel: shared between processes and evictable under pressure.
+     * These bytes are committed resident memory for as long as the
+     * engine lives, which on a phone is the difference between a model
+     * the OS can page out and one that counts against your footprint.
+     * To load from the network on a platform that has a filesystem,
+     * stream to disk and use `from_path` (which is what [`BundleRepo`]
+     * does), rather than buffering the model here.
+     *
+     * Text-only: the bytes are a bare GGUF with no accompanying
+     * manifest, so there is nothing to point at a vision encoder or an
+     * audio decoder. Multimodal models need `from_path` or
+     * [`CeraEngine::from_bundle_id`]. `config.bundle_repo` is ignored.
+     */
+public static func fromBytes(bytes: Data, config: EngineConfig)throws  -> CeraEngine  {
+    return try  FfiConverterTypeCeraEngine_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes(
+        FfiConverterData.lower(bytes),
+        FfiConverterTypeEngineConfig_lower(config),$0
+    )
+})
+}
+    
+    /**
      * Load a model from a local filesystem path. Accepts the same
      * inputs as the native [`cera::CeraEngine::from_path`]: a bare
      * `.gguf`, a LeapBundles `.json` manifest, or a directory
@@ -3537,8 +3575,8 @@ public struct GenerateOutput: Equatable, Hashable {
     /**
      * Generated token IDs, in order, not including any prompt
      * tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-     * Rust side or (once exposed) through a tokenizer handle on the
-     * FFI side.
+     * Rust side, or with [`CeraEngine::decode_tokens`] from any
+     * foreign binding.
      */
     public var tokens: [UInt32]
     public var summary: GenerateSummary
@@ -3549,8 +3587,8 @@ public struct GenerateOutput: Equatable, Hashable {
         /**
          * Generated token IDs, in order, not including any prompt
          * tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-         * Rust side or (once exposed) through a tokenizer handle on the
-         * FFI side.
+         * Rust side, or with [`CeraEngine::decode_tokens`] from any
+         * foreign binding.
          */tokens: [UInt32], summary: GenerateSummary) {
         self.tokens = tokens
         self.summary = summary
@@ -5374,6 +5412,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 14088) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes() != 45873) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 64420) {

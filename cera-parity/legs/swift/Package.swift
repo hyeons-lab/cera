@@ -17,11 +17,11 @@
 // XCFramework for iOS/Mac apps).
 //
 // Two-target layout:
-//   - `cera_ffiFFI` — `.systemLibrary` wrapping the generated C FFI
-//     header (`cera_ffiFFI.h`) via `module.modulemap`. Module name
-//     MUST be `cera_ffiFFI` exactly because the generated
-//     `cera_ffi.swift` uses `#if canImport(cera_ffiFFI) ; import
-//     cera_ffiFFI` to discover the C symbols. A different module name
+//   - `CeraFFI` — `.systemLibrary` wrapping the generated C FFI
+//     header (`CeraFFI.h`) via `module.modulemap`. The module name MUST
+//     match `ffi_module_name` in cera-ffi/uniffi.toml, because the
+//     generated `cera_ffi.swift` uses `#if canImport(CeraFFI) ; import
+//     CeraFFI` to discover the C symbols. A different module name
 //     leaves every `uniffi_cera_ffi_fn_*` symbol unresolved at compile
 //     time. Symlinks the header from `cera-ffi/bindings/swift/`.
 //   - `CeraParitySwift` — `.executableTarget` consuming the bindings
@@ -52,12 +52,12 @@ let package = Package(
     ],
     targets: [
         .systemLibrary(
-            name: "cera_ffiFFI",
-            path: "Sources/cera_ffiFFI"
+            name: "CeraFFI",
+            path: "Sources/CeraFFI"
         ),
         .executableTarget(
             name: "CeraParitySwift",
-            dependencies: ["cera_ffiFFI"],
+            dependencies: ["CeraFFI"],
             path: "Sources/CeraParitySwift",
             linkerSettings: [
                 // Resolved at link time against `swift build -Xlinker

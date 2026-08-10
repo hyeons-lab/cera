@@ -946,6 +946,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async(): Int
 
+    external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes(): Int
+
     external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_path(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf(): Int
@@ -1024,6 +1026,12 @@ internal object UniffiLib {
         `bundleId`: RustBuffer.ByValue,
         `quant`: RustBuffer.ByValue,
         `config`: RustBuffer.ByValue,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes(
+        `bytes`: RustBuffer.ByValue,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
     ): Long
 
     external fun uniffi_cera_ffi_fn_constructor_ceraengine_from_path(
@@ -1747,6 +1755,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 14088) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes() != 45873) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 64420) {
@@ -3412,6 +3423,50 @@ open class CeraEngine :
                 { FfiConverterTypeCeraEngine.lift(it) },
                 // Error FFI converter
                 FfiException.ErrorHandler,
+            )
+
+        /**
+         * Load a model from GGUF bytes already in memory.
+         *
+         * For callers with no filesystem to point [`CeraEngine::from_path`]
+         * at: a browser, an encrypted blob decrypted in memory, an asset
+         * read out of an archive. It is the one constructor a WebAssembly
+         * build can also offer, so code written against it ports across.
+         *
+         * **Not a streaming API.** GGUF is random-access: tensor data is
+         * addressed by offset and read throughout inference, so the whole
+         * file has to be resident before the first token. You can download
+         * over a stream, but you must accumulate it all before calling
+         * this. There is no partial-model inference.
+         *
+         * **Prefer [`CeraEngine::from_path`] whenever a path exists.** That
+         * route memory-maps the file, so tensor pages stay owned by the
+         * kernel: shared between processes and evictable under pressure.
+         * These bytes are committed resident memory for as long as the
+         * engine lives, which on a phone is the difference between a model
+         * the OS can page out and one that counts against your footprint.
+         * To load from the network on a platform that has a filesystem,
+         * stream to disk and use `from_path` (which is what [`BundleRepo`]
+         * does), rather than buffering the model here.
+         *
+         * Text-only: the bytes are a bare GGUF with no accompanying
+         * manifest, so there is nothing to point at a vision encoder or an
+         * audio decoder. Multimodal models need `from_path` or
+         * [`CeraEngine::from_bundle_id`]. `config.bundle_repo` is ignored.
+         */
+        @Throws(FfiException::class)
+        fun `fromBytes`(
+            `bytes`: kotlin.ByteArray,
+            `config`: EngineConfig,
+        ): CeraEngine =
+            FfiConverterTypeCeraEngine.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes(
+                        FfiConverterByteArray.lower(`bytes`),
+                        FfiConverterTypeEngineConfig.lower(`config`),
+                        _status,
+                    )
+                },
             )
 
         /**
@@ -5967,8 +6022,8 @@ data class GenerateOutput(
     /**
      * Generated token IDs, in order, not including any prompt
      * tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-     * Rust side or (once exposed) through a tokenizer handle on the
-     * FFI side.
+     * Rust side, or with [`CeraEngine::decode_tokens`] from any
+     * foreign binding.
      */
     var `tokens`: List<kotlin.UInt>,
     var `summary`: GenerateSummary,

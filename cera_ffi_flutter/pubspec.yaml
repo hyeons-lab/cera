@@ -18,11 +18,22 @@ environment:
   # NativeCallable.isolateLocal (used by the generated bindings) lands in 3.1;
   # 3.3 is the floor we validate against.
   sdk: ^3.3.0
-  # Required by pub to declare `flutter.plugin.platforms` below; without it
-  # publishing is rejected. Note this is a *constraint*, not a dependency: it
-  # does not put `package:flutter` on the import path, and nothing under `lib/`
-  # imports it, so the bindings stay pure `dart:ffi`. `ffiPlugin: true` support
-  # is what sets the floor.
+  # Mandatory, and it has a cost worth stating plainly. pub rejects publishing a
+  # package that declares `flutter.plugin.platforms` without a Flutter SDK
+  # constraint ("allows Flutter SDK version 1.9.x, which does not support the
+  # flutter.plugin.platforms key"), so a plugin cannot opt out. 3.10 is the
+  # floor because that is where `ffiPlugin: true` landed.
+  #
+  # The cost: declaring it makes pub treat the package as *requiring* the
+  # Flutter SDK, so `dart pub get` refuses it outright ("Because
+  # cera_ffi_flutter requires the Flutter SDK, version solving failed") even
+  # though nothing under `lib/` imports `package:flutter` and the bindings are
+  # pure `dart:ffi`. Use `flutter pub get` (which works for plain-Dart packages
+  # too). Verified by removing this line: publishing fails.
+  #
+  # Lifting that restriction means splitting the package in two — a pure-Dart
+  # `cera_ffi` with no `flutter:` block, plus a thin plugin depending on it,
+  # the standard federated layout. Not done here.
   flutter: '>=3.10.0'
 
 # Deliberately NOT depending on the Flutter SDK. Nothing under `lib/` imports

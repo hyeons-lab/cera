@@ -11,8 +11,11 @@ deterministic patch tool.
 
 It is a Flutter **FFI plugin**: the native library is fetched and linked by each
 platform's own build system, with no method channels and no Dart-side setup. It
-also works as a plain Dart package (server, CLI) by pointing `CERA_FFI_LIB` at a
-locally built cdylib.
+also runs as a plain Dart package (server, CLI) by pointing `CERA_FFI_LIB` at a
+locally built cdylib; resolve with `flutter pub get` rather than `dart pub get`,
+since pub requires a plugin to declare a Flutter SDK constraint and that
+constraint is what `dart pub get` refuses. Nothing under `lib/` imports
+`package:flutter`.
 
 ## Supported platforms
 

@@ -346,6 +346,11 @@ uint64_t uniffi_cera_ffi_fn_constructor_ceraengine_from_bundle_id(RustBuffer bun
 uint64_t uniffi_cera_ffi_fn_constructor_ceraengine_from_bundle_id_async(RustBuffer bundle_id, RustBuffer quant, RustBuffer config
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_CERAENGINE_FROM_BYTES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_CERAENGINE_FROM_BYTES
+uint64_t uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes(RustBuffer bytes, RustBuffer config, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_CERAENGINE_FROM_PATH
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_CERAENGINE_FROM_PATH
 uint64_t uniffi_cera_ffi_fn_constructor_ceraengine_from_path(RustBuffer path, RustBuffer config, RustCallStatus *_Nonnull out_status
@@ -1251,6 +1256,12 @@ uint16_t uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CERAENGINE_FROM_BUNDLE_ID_ASYNC
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CERAENGINE_FROM_BUNDLE_ID_ASYNC
 uint16_t uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CERAENGINE_FROM_BYTES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CERAENGINE_FROM_BYTES
+uint16_t uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes(void
     
 );
 #endif

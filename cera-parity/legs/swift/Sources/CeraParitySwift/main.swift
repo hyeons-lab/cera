@@ -13,7 +13,7 @@
 // them in sync byte-for-byte.
 
 import Foundation
-import cera_ffiFFI
+import CeraFFI
 
 struct RunArgsOwned: Codable {
     let bundle: String

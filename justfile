@@ -193,7 +193,13 @@ dart-bindings-check: dart-bindings
         git --no-pager diff cera_ffi_flutter/lib/src/generated; \
         exit 1; \
     fi
-    cd cera_ffi_flutter && dart pub get && dart analyze
+    # `flutter pub get`, not `dart pub get`. pub will not publish a package
+    # declaring `flutter.plugin.platforms` without a Flutter SDK constraint, and
+    # declaring one makes `dart pub get` refuse the package outright ("requires
+    # the Flutter SDK, version solving failed") even though nothing under lib/
+    # imports package:flutter. See the note in cera_ffi_flutter/pubspec.yaml.
+    # `dart test` afterwards is fine: pub has already resolved by then.
+    cd cera_ffi_flutter && flutter pub get && flutter analyze
 
 # Verify the committed Kotlin + Swift bindings are up to date with the
 # current Rust FFI surface. Regenerates in-place and fails if `git diff`

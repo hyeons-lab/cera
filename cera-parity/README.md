@@ -195,7 +195,7 @@ Two worked examples ship today:
   vendored binding via `sourceSets.main.kotlin.srcDirs` so the file
   isn't duplicated; `Main.kt` reads stdin / writes stdout in the
   contract shape; `cera_parity::run_kotlin_jna` spawns it.
-- `legs/swift/`: SPM Package with two targets: `cera_ffiFFI`
+- `legs/swift/`: SPM Package with two targets: `CeraFFI`
   (`.systemLibrary` exposing the generated C FFI header via
   `module.modulemap`; name MUST match what the generated
   `cera_ffi.swift` `canImport`s) and `CeraParitySwift`
