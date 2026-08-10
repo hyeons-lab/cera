@@ -296,7 +296,7 @@ pub mod shaders {
     pub const GEMM_Q5_K: &str = include_str!("shaders/gemm_q5_k.metal");
     pub const GEMM_Q8_0: &str = include_str!("shaders/gemm_q8_0.metal");
     /// Slang port of [`GEMM_Q8_0`], generated from `shaders/slang/gemm_q8_0.slang`.
-    /// Same binding contract, same 64x32 tile, same 8 KB threadgroup budget, and
+    /// Same buffer bindings, same 64x32 tile, same 8 KB threadgroup budget, and
     /// the same mixed `simdgroup_matrix<float>` x `simdgroup_matrix<half>` MMA,
     /// reached through `linalg::CoopMat`. Two deliberate divergences (no
     /// simdgroup-scoped barrier, and a two-round ragged epilogue) are documented
@@ -304,6 +304,15 @@ pub mod shaders {
     /// `tests/slang_multitarget_parity.rs` and `examples/slang_gemm_bench.rs`,
     /// the latter being the one that can tell whether the divergences cost
     /// anything.
+    ///
+    /// **Callers must bind 8 KB of threadgroup memory at index 0**, exactly like
+    /// [`GEMM_Q8_0`]. Slang declares the staging arrays statically, but
+    /// `build_support/msl_postpass.rs` rewrites them into slices of a
+    /// `[[threadgroup(0)]]` parameter, because static groupshared is one of
+    /// three things that stop the native AGX compiler folding load
+    /// displacements. That rewrite is worth ~5% and declines with a
+    /// `cargo:warning` if slangc moves its anchors, so binding the memory is
+    /// correct either way.
     pub const GEMM_Q8_0_SLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/gemm_q8_0.metal"));
     pub const GEMM_Q6_K: &str = include_str!("shaders/gemm_q6_k.metal");
     pub const GEMM_F32: &str = include_str!("shaders/gemm_f32.metal");

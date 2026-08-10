@@ -27,6 +27,11 @@ jobs:
         run: ./scripts/bump-version.sh --check
       - name: Check formatting
         run: cargo fmt --check
+      - name: Check build-script helper formatting
+        # rustfmt does not descend into `include!`d files, so `cargo fmt` never
+        # sees the build-script helpers under `cera/build_support/`. Mirrors the
+        # `rustfmt` line of `just fmt`.
+        run: rustfmt --edition 2024 --check cera/build_support/*.rs
       - name: Clippy
         # `--all-targets` lints tests, benches, and examples too — without it
         # clippy skips those compile targets, so lints living in test modules

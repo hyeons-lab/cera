@@ -42,16 +42,23 @@
 // them and keeps its portable scalar path (verified: the emitted WGSL contains
 // no `packed_char4`/`float2x4`/`device char`). With those plus the unroll
 // strategy below, the generated kernel reaches ~0.93x, bit-identical, at higher
-// occupancy than the handwritten one. The residual ~7% is Slang wrapping every
-// `CoopMat` load and multiply-accumulate in a by-value helper; that is inherent
-// to the abstraction and would only go away by hand-writing the MMA in raw MSL.
+// occupancy than the handwritten one.
 //
-// Two levers were measured and *rejected*, recorded so they are not retried: the
-// `simdgroup_barrier(mem_flags::mem_none)` operand-load hint (expressible via
-// `__target_intrinsic`, but neutral on Apple silicon in both the dequant-bound
-// and scheduling-bound regimes), and unrolling the `ik` loop (it gave every
-// iteration's operands distinct registers, dropping occupancy 896 -> 704 and
-// throughput with it; the inner loops are unrolled but `ik` stays rolled).
+// The residual ~7% is *not* the `CoopMat` abstraction, though an earlier version
+// of this comment said so. Disassembling to native AGX shows the kernel body
+// makes no `linalg_*` calls at all; the cost is address arithmetic. The native
+// compiler folds load displacements into the instruction immediate for the
+// handwritten kernel (4 base registers, 21 immediates) and not for this one (11
+// bases, 2 immediates, at half the unroll factor, so compare those counts only
+// via the rewritten kernel). `build_support/msl_postpass.rs` rewrites the
+// emitted MSL to recover the folding, reaching ~0.98x. Read that file before
+// changing anything below.
+//
+// Two levers were measured and *rejected*, recorded so they are not retried.
+// The first is the `simdgroup_barrier(mem_flags::mem_none)` operand-load hint,
+// expressible via `__target_intrinsic` but neutral on Apple silicon in both the
+// dequant-bound and scheduling-bound regimes. The second is unrolling the `ik`
+// loop in Slang, recorded at that loop below.
 //
 // ## Remaining divergence from `shaders/gemm_q8_0.metal`
 //
@@ -127,11 +134,13 @@ int load_i8(uint byte_off) {
 /// `load_i8` reconstructs each byte with a word load, a shift, a mask and a
 /// manual sign-extend; profiling showed that per-byte arithmetic, not the MMAs,
 /// was the whole ~0.64x gap (it also inflated register pressure enough to cut
-/// occupancy). `packed_char4` is 1-byte aligned, so it reads four quants per
-/// load with the hardware sign-extending, cutting the 16 scalar loads per k-tile
-/// to four, fewer even than the handwritten kernel's scalar `int8` reads. Only
-/// ever called inside `case metal:`, so the WGSL branch never references it and
-/// keeps the portable path. `$0`/`$1` are the buffer and the byte offset.
+/// occupancy). `packed_char4` is 1-byte aligned and lets the hardware
+/// sign-extend, which removes that arithmetic. It does *not* reduce the load
+/// count, though an earlier version of this comment claimed it cut 16 scalar
+/// loads per k-tile to four: AIR shows 16 scalar `load i8` per k-tile here and
+/// in the handwritten kernel alike. Only ever called inside `case metal:`, so
+/// the WGSL branch never references it and keeps the portable path. `$0`/`$1`
+/// are the buffer and the byte offset.
 __target_intrinsic(metal, "int4(*(const device packed_char4*)((const device char*)$0 + $1))")
 int4 load_i8x4_direct(StructuredBuffer<uint> buf, uint byte_off);
 
@@ -257,11 +266,17 @@ void gemm_q8_0(uint3 gid : SV_GroupID, uint tiitg : SV_GroupIndex) {
             uint lsma = 4u * SG_MAT_SIZE * (sgitg % 2u);
             uint lsmb = 2u * SG_MAT_SIZE * (sgitg / 2u);
 
-            // `ik` stays rolled on purpose: unrolling it gives each iteration's
-            // `ma`/`mb` distinct registers (all four iterations live at once),
-            // which drops occupancy 896 -> 704. Rolling reuses the operand
-            // registers across iterations; the inner loops below are still
-            // unrolled for constant indices and MMA scheduling. See header.
+            // `ik` stays rolled *here* on purpose: unrolling it in Slang gives
+            // each iteration's `ma`/`mb` distinct registers (all four live at
+            // once), which drops occupancy 896 -> 704, and it measures 0.89x.
+            // The inner loops below are still unrolled for constant indices and
+            // MMA scheduling.
+            //
+            // This is not the same lever as the `#pragma unroll(4)` that
+            // `build_support/msl_postpass.rs` adds to the emitted MSL. That
+            // pragma does not unroll in AIR; it attaches loop metadata the
+            // native AGX translator honors, which `[ForceUnroll]` here cannot
+            // produce. Do not "fix" the inconsistency by unrolling in Slang.
             for (uint ik = 0u; ik < BLOCK_SIZE_K / 8u; ik++) {
                 MatB ma[4];
                 MatA mb[2];

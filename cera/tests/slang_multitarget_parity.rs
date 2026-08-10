@@ -2584,9 +2584,16 @@ mod msl {
         enc.set_buffer(1, Some(&src1), 0);
         enc.set_buffer(2, Some(&dst), 0);
         enc.set_buffer(3, Some(&params), 0);
-        // No `set_threadgroup_memory_length`: unlike the handwritten kernel,
-        // which takes its scratch as a `threadgroup char *` argument, the Slang
-        // source declares both staging arrays statically.
+        // 4 KB of weights staged as half plus 4 KB of input staged as float.
+        // Slang declares both arrays statically, but `build.rs` rewrites them
+        // into slices of a `[[threadgroup(0)]]` parameter, because static
+        // groupshared is one of three things that stop the native AGX compiler
+        // folding load displacements. Setting this is harmless if that rewrite
+        // declined and the arrays are still static, so it is unconditional
+        // rather than gated on the shader text. The size is pinned by
+        // `POSTPASS_SCRATCH_BYTES` in `build_support/msl_postpass.rs`, which
+        // declines rather than rewrite a shader that outgrows it.
+        enc.set_threadgroup_memory_length(0, 8192);
         enc.dispatch_thread_groups(
             metal::MTLSize {
                 width: n.div_ceil(32) as u64,
@@ -2655,6 +2662,58 @@ mod msl {
             src.contains("array<simdgroup_matrix<float, int(8), int(8)>, int(8)>"),
             "generated MSL no longer holds 8 live simdgroup accumulators"
         );
+    }
+
+    /// The MSL post-pass must actually have run on the shader that ships.
+    ///
+    /// It is worth ~5% on the large shapes and it is designed to fail *softly*:
+    /// when slangc moves an anchor it declines with a `cargo:warning` and emits
+    /// correct-but-slower MSL, which every other test here still passes. Without
+    /// this assertion the regression is invisible until someone re-runs
+    /// `slang_gemm_bench` by hand. `tests/msl_postpass.rs` covers the transform
+    /// itself; this covers the wiring, so it deliberately reads the OUT_DIR
+    /// artifact rather than the committed one.
+    #[test]
+    fn generated_gemm_is_post_processed() {
+        // Kept in sync with POSTPASS_MARKER in `cera/build_support/msl_postpass.rs`.
+        // If that constant was deliberately bumped, update this literal to match.
+        assert!(
+            shaders::GEMM_Q8_0_SLANG.starts_with("// cera:msl-postpass=v"),
+            "the MSL post-pass declined; check the build log for its cargo:warning. \
+             The shader is still correct, but the simdgroup GEMM lost ~5%."
+        );
+        // Equality on the first line, not `starts_with`: the latter would also
+        // accept a future `v10`, which is the trap `POSTPASS_MARKER` is matched
+        // exactly to avoid.
+        assert_eq!(
+            shaders::GEMM_Q8_0_SLANG.lines().next(),
+            Some("// cera:msl-postpass=v1"),
+            "the post-pass ran but at an unexpected marker version; update this test"
+        );
+        // The three conditions the pass exists to impose.
+        for needed in [
+            "threadgroup char* shmem_p_0 [[threadgroup(0)]]",
+            "threadgroup const half* pa_1 = pa_0 + ",
+            "#pragma unroll(",
+        ] {
+            assert!(
+                shaders::GEMM_Q8_0_SLANG.contains(needed),
+                "post-processed MSL is missing {needed:?}"
+            );
+        }
+        // Condition 2 asserted at the loads themselves, not just at the
+        // declaration of the pointer walk. Declaring `pa_1` while every load
+        // still reads `(_sa)[...]` is the half-patched shape the pass is
+        // required never to emit, and it is invisible to the check above.
+        for load in [
+            "_slang_simdgroup_load<simdgroup_matrix<half, int(8), int(8)>>(pa_0",
+            "_slang_simdgroup_load<simdgroup_matrix<float, int(8), int(8)>>(pb_0",
+        ] {
+            assert!(
+                shaders::GEMM_Q8_0_SLANG.contains(load),
+                "post-processed MSL has the pointer walk but no load consuming it: {load:?}"
+            );
+        }
     }
 
     /// The generated MSL must keep Metal's two-stage simd reduction, not fall
