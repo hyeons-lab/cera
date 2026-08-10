@@ -1,8 +1,8 @@
 name: cera_ffi_flutter
+# pub.dev requires 60-180 characters; anything longer is a scoring penalty.
 description: >-
   Flutter and Dart bindings for the Cera on-device inference engine. Runs GGUF
-  LLMs locally through the cera-ffi UniFFI surface, with prebuilt native
-  libraries for Android, iOS, macOS, Linux, and Windows.
+  LLMs locally, with prebuilt native libraries for every platform.
 version: 0.4.0
 repository: https://github.com/hyeons-lab/cera
 issue_tracker: https://github.com/hyeons-lab/cera/issues

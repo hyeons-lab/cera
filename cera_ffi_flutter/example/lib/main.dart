@@ -79,7 +79,11 @@ class _ChatPageState extends State<ChatPage> {
       final report = cpuBackendReport();
       final version = ceraFfiVersion();
       setState(() => _status = 'cera $version · $report');
-    } catch (err) {
+    } catch (err, stack) {
+      // Log as well as display: the status line truncates, and the full
+      // message is the only thing that identifies *which* resolution step
+      // failed on a device.
+      debugPrint('cera: native library failed to load: $err\n$stack');
       setState(() => _status = 'Native library failed to load: $err');
     }
   }

@@ -329,9 +329,23 @@ apple-xcframework:
     # exporting both is safe.
     export MACOSX_DEPLOYMENT_TARGET=12.0
     export IPHONEOS_DEPLOYMENT_TARGET=15.0
-    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release --features metal
-    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios-sim --release --features metal
-    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release --features metal
+    # ── Why `ffi-buffer` is in here ────────────────────────────────────
+    # One XCFramework serves two consumers: the Swift package and the
+    # Flutter/Dart plugin. Swift calls the standard `uniffi_cera_ffi_*`
+    # scaffolding, but the Dart bindings call `uniffi_ffibuffer_*`
+    # trampolines, which UniFFI only emits under the `ffi-buffer`
+    # feature (`uniffi/scaffolding-ffi-buffer-fns`).
+    #
+    # Without it the framework links, embeds, signs, and loads
+    # perfectly, and then every Dart call dies at `dlsym` with "symbol
+    # not found" — nothing catches it before runtime, because the
+    # symbols the Swift side needs are all present. The trampolines are
+    # thin wrappers over the same scaffolding, so carrying them costs
+    # almost nothing and Swift consumers never look at them.
+    FEATURES=metal,ffi-buffer
+    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release --features "$FEATURES"
+    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios-sim --release --features "$FEATURES"
+    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release --features "$FEATURES"
     OUT=target/xcframework-build
     rm -rf "$OUT"
     mkdir -p "$OUT"
@@ -436,6 +450,21 @@ apple-xcframework:
         -framework "$OUT/ios-arm64-simulator/${FW}.framework" \
         -framework "$OUT/macos-arm64/${FW}.framework" \
         -output "$OUT/CeraFFI.xcframework"
+    # Guard the `ffi-buffer` feature. Dropping it produces an XCFramework
+    # that links, embeds, signs, and loads perfectly and then fails every
+    # Dart call at `dlsym`, because only the Dart bindings use the
+    # `uniffi_ffibuffer_*` trampolines. Nothing else catches it before
+    # runtime on a device, so assert here.
+    for slice in ios-arm64 ios-arm64-simulator macos-arm64; do
+        count=$(nm -gU "$OUT/$slice/${FW}.framework/${FW}" | grep -c uniffi_ffibuffer || true)
+        if [ "$count" -eq 0 ]; then
+            echo "ERROR: $slice exports no uniffi_ffibuffer_* trampolines." >&2
+            echo "  The Dart/Flutter plugin cannot call into this build." >&2
+            echo "  Build cera-ffi with --features ffi-buffer." >&2
+            exit 1
+        fi
+        echo "  $slice: $count ffibuffer trampolines"
+    done
     echo "Built $OUT/CeraFFI.xcframework (dynamic ${FW}.framework slices)"
 
 # Re-sync the root SwiftPM package's copy of the UniFFI Swift wrapper.
