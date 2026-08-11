@@ -63,6 +63,38 @@ tracing = { workspace = true }
 # wasm-bindgen's async-fn codegen references `wasm_bindgen_futures`
 # directly, so it must be a declared dependency.
 wasm-bindgen-futures = { workspace = true }
+# SHA-256 for the browser bundle store's integrity checks. Pure Rust and
+# incremental, so a download is hashed as it streams and a cached file is
+# re-verified in chunks. `crypto.subtle.digest` was the alternative and
+# can't do either: it's one-shot over a whole buffer, which would mean
+# holding a second copy of a multi-GB model to check it.
+sha2 = { workspace = true }
+# Browser APIs for the bundle store: OPFS (the `FileSystem*` handles),
+# `fetch` responses and their streaming bodies. Feature-gated per
+# interface, so this list is exactly what `src/bundle.rs` touches — any
+# addition there needs a matching entry here or the build fails with a
+# missing type rather than silently widening the surface.
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "File",
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "FileSystemGetDirectoryOptions",
+    "FileSystemGetFileOptions",
+    "FileSystemHandle",
+    "FileSystemHandleKind",
+    "FileSystemReadWriteOptions",
+    "FileSystemRemoveOptions",
+    "FileSystemSyncAccessHandle",
+    "FileSystemWritableFileStream",
+    "Headers",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "RequestInit",
+    "Response",
+    "StorageManager",
+    "WritableStream",
+] }
 
 # `wasm-bindgen-rayon` is wasm-only — it pulls in `web_sys::Worker`
 # / Node `worker_threads` glue that doesn't exist on native targets.

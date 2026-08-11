@@ -533,6 +533,17 @@ jobs:
         # workflow-level `RUSTFLAGS: ""` had been overriding the config here
         # since it was added.
         run: just wasm-simd-test
+      - name: Run cera-wasm's own unit tests under Node
+        # Same trap as the kernels above, one crate over: `cera-wasm` is
+        # `cfg(target_arch = "wasm32")`, so `cargo test` on the host builds an
+        # empty lib and reports green without executing a line of it. These are
+        # `#[wasm_bindgen_test]`, so they need a real wasm runtime.
+        #
+        # Covers the bundle store's URL addressing. The OPFS half needs a
+        # browser (`just wasm-test-opfs`) and is not run here: chromedriver in
+        # CI would have to major-version-match the runner's Chrome, the same
+        # coupling that keeps `wasm-test-wgpu` out of CI.
+        run: just wasm-test
 
   cera-wasm-pack:
     # Multi-target wasm-pack build. Each matrix entry produces one

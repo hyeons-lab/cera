@@ -661,6 +661,31 @@ wasm-simd-test:
         exit 1
     fi
 
+# Run `cera-wasm`'s own unit tests under Node.
+#
+# Same reason as `wasm-simd-test`: the crate is
+# `cfg(target_arch = "wasm32")`, so `cargo test` builds an empty lib and
+# reports green without executing anything in it. These are
+# `#[wasm_bindgen_test]`, which needs a real wasm runtime.
+#
+# `--node`, not `--headless --chrome`: the tests here are the bundle
+# store's pure URL/addressing logic, which has no browser dependency.
+# The OPFS paths themselves need a browser and live in `tests/`.
+wasm-test:
+    wasm-pack test --node cera-wasm --lib
+
+# Run the OPFS bundle-store test in headless Chrome.
+#
+# Separate from `wasm-test` because it cannot run under Node: there is no
+# `navigator.storage.getDirectory` there, which is exactly the layer
+# under test. The URL it downloads is the harness page itself, served by
+# wasm-bindgen-test-runner, so this needs no network and no fixture.
+#
+# Requires a Chrome and a chromedriver whose MAJOR version matches it on
+# PATH (same constraint as `wasm-test-wgpu`).
+wasm-test-opfs:
+    cd cera-wasm && wasm-pack test --headless --chrome --test opfs_bundle
+
 # ── Multi-threaded wasm builds ──────────────────────────────────────────
 #
 # Threaded variants light up `cera`'s rayon paths (batched prefill

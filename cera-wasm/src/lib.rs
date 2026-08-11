@@ -16,6 +16,10 @@
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
+/// Remote bundle downloading + caching, over the Origin Private File
+/// System. The web counterpart to `cera::bundle::BundleRepo`.
+pub mod bundle;
+
 // Pull `wasm-bindgen-rayon` into the link graph so its
 // `#[wasm_bindgen]`-emitted `initThreadPool` export survives
 // dead-code elimination and reaches the generated `cera_wasm.d.ts`.
@@ -407,6 +411,70 @@ impl CeraEngine {
                 .as_deref()
                 .map(cera::manifest::InferenceType::parse_str),
             chat_template: None,
+        };
+        cera::CeraEngine::from_parts(parts, cfg)
+            .map(|inner| CeraEngine { inner })
+            .map_err(map_cera_err)
+    }
+
+    /// Load a published LeapBundle by id and quantization, downloading
+    /// through `repo` and reusing whatever it already cached.
+    ///
+    /// This is the browser equivalent of the native
+    /// `CeraEngine::from_bundle_id`. The manifest picks up every file
+    /// the bundle names, so a VL or audio bundle arrives complete: no
+    /// separate mmproj argument and no guessing at the modality, unlike
+    /// `fromGgufParts` which has only its arguments to go on.
+    ///
+    /// `onProgress(url, bytesDownloaded, totalBytes)` fires during
+    /// downloads only; a fully cached bundle loads without calling it.
+    /// `totalBytes` is `null` when the server doesn't say.
+    ///
+    /// **Memory:** every file lands in wasm linear memory and stays for
+    /// the engine's lifetime. The bytes are never handed to JS on the
+    /// way, so this costs one copy of the model rather than two.
+    #[wasm_bindgen(js_name = fromBundleId)]
+    pub async fn from_bundle_id(
+        repo: &bundle::BundleRepo,
+        bundle_id: String,
+        quant: String,
+        context_size: Option<u32>,
+        on_progress: Option<js_sys::Function>,
+    ) -> Result<CeraEngine, JsError> {
+        let parts = bundle::load_bundle(repo, &bundle_id, &quant, on_progress.as_ref()).await?;
+        Self::from_bundle_parts(parts, context_size)
+    }
+
+    /// Load a bundle from the URL of its manifest JSON, for bundles
+    /// hosted somewhere other than `LiquidAI/LeapBundles`.
+    ///
+    /// Files the manifest names are fetched relative to it. Entries
+    /// with a nested path are refused rather than guessed at: see
+    /// `bundle::join_url`.
+    #[wasm_bindgen(js_name = fromManifestUrl)]
+    pub async fn from_manifest_url(
+        repo: &bundle::BundleRepo,
+        manifest_url: String,
+        context_size: Option<u32>,
+        on_progress: Option<js_sys::Function>,
+    ) -> Result<CeraEngine, JsError> {
+        let parts = bundle::load_manifest(repo, &manifest_url, on_progress.as_ref()).await?;
+        Self::from_bundle_parts(parts, context_size)
+    }
+
+    /// Shared tail of the two bundle constructors. Not exported: it
+    /// takes a Rust type, and the point of `ModelBytes` here is that the
+    /// weights never cross the JS boundary.
+    fn from_bundle_parts(
+        parts: cera::ModelBytes,
+        context_size: Option<u32>,
+    ) -> Result<CeraEngine, JsError> {
+        // See `from_gguf_bytes` for why the spread is deliberate.
+        #[allow(clippy::needless_update)]
+        let cfg = cera::EngineConfig {
+            context_size: context_size.unwrap_or(4096) as usize,
+            backend: cera::BackendPreference::Cpu,
+            ..cera::EngineConfig::default()
         };
         cera::CeraEngine::from_parts(parts, cfg)
             .map(|inner| CeraEngine { inner })
