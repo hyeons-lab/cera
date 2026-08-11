@@ -128,11 +128,21 @@ Future<BenchResult> runBenchmark({
     // Frame the prompt the way the chat page does, so the measurement covers
     // the path an app actually takes. A GGUF without a template is not an
     // error worth failing the run over; the raw prompt still generates.
+    //
+    // Keep the reason, though. An instruct model handed a bare prompt predicts
+    // EOS as its first token and decodes nothing, so this fallback is the most
+    // likely cause of the "produced no output" failure below. Swallowing the
+    // error reports a dead benchmark with no hint of why it died, and the
+    // causes are worth telling apart: a base model with no template at all is
+    // expected, whereas a template that exists and fails to render is a bug in
+    // the engine (one such: a template calling Python methods minijinja lacks).
     String framed;
+    String? templateError;
     try {
       framed = await cera.applyChatTemplate([CeraMessage.user(_prompt)]);
-    } catch (_) {
+    } catch (e) {
       framed = _prompt;
+      templateError = '$e';
     }
     final promptTokens = (await cera.encode(framed)).length;
 
@@ -160,7 +170,10 @@ Future<BenchResult> runBenchmark({
     if (ttft == null || output.isEmpty) {
       return BenchResult.failed(
         label: label,
-        error: 'the model produced no output',
+        error: templateError == null
+            ? 'the model produced no output'
+            : 'the model produced no output; its chat template failed to '
+                  'render, so the prompt went in unframed: $templateError',
       );
     }
 
