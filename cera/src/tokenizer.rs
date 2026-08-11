@@ -570,6 +570,15 @@ pub fn apply_chat_template_with_tools<M: serde::Serialize>(
     // `{% endgeneration %}` block markers at `BpeTokenizer::from_gguf`
     // load time, so feed it directly to minijinja.
     let mut env = minijinja::Environment::new();
+    // Chat templates are written for Jinja2, where `messages` is a list of
+    // Python dicts and `content` a Python str, so they call Python *methods*:
+    // `message.get("content")`, `text.split(...)`, `args.items()`,
+    // `s.strip()`. minijinja implements these as filters and has no methods at
+    // all, so any template reaching one fails outright with
+    // "unknown method: map has no method named get" and the model becomes
+    // unusable for chat. `pycompat` routes unknown methods to Python
+    // equivalents, which is exactly the gap.
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_template("chat", template_str)
         .context("invalid chat template")?;
 
@@ -1177,6 +1186,76 @@ mod tests {
 
         let result = apply_chat_template(&tok, &messages, true).unwrap();
         assert_eq!(result, "user: Hello!\nassistant: ");
+    }
+
+    /// Chat templates are authored against Jinja2, where `messages` holds
+    /// Python dicts and `content` is a Python `str`, so they freely call
+    /// Python *methods*. minijinja ships these as filters and implements no
+    /// methods at all, so without the `pycompat` callback every one of these
+    /// aborts the whole render with "unknown method: …".
+    ///
+    /// This is not hypothetical breadth for its own sake. Across the 16 GGUF
+    /// chat templates on hand, `.split()` appears in 12, `.items()` in 3, and
+    /// `.get()`, `.strip()`, `.rstrip()`, `.lstrip()` and `.endswith()` in one
+    /// each. Only `.get()` was ever observed failing in the wild, because the
+    /// other calls sat on branches (tool calls, multi-part content) that a
+    /// plain user turn never reaches. Covering the family rather than the one
+    /// reported symptom is the point: the next model to break would otherwise
+    /// be the next template that reaches `.split()` on its main path.
+    ///
+    /// The cases below are therefore not a transcript of that survey.
+    /// `.startswith()` appears in none of the 16 and is still asserted here,
+    /// as the sibling of `.endswith()`: the two are one implementation, and a
+    /// template using either is equally plausible. Read the counts above as
+    /// evidence for how wide the gap is, not as the list of what is covered.
+    #[test]
+    fn chat_template_may_call_python_methods() {
+        let cases: [(&str, &str); 8] = [
+            // dict.get, the one seen failing on LFM2.5-230M-Q4_K_M.
+            (r#"{{ messages[0].get("content") }}"#, "Hello!"),
+            // A key that is absent renders Jinja2's `None`, not an error.
+            (r#"{{ messages[0].get("nope") }}"#, "None"),
+            (r#"{{ messages[0].content.split("l") | length }}"#, "3"),
+            (r#"{{ messages[0].content.strip() }}"#, "Hello!"),
+            (r#"{{ messages[0].content.rstrip("!") }}"#, "Hello"),
+            (r#"{{ messages[0].content.lstrip("H") }}"#, "ello!"),
+            // Capitalized: these return Python bools, the way a template
+            // author testing `{% if s.endswith(...) %}` expects, not
+            // minijinja's lowercase `true`.
+            (r#"{{ messages[0].content.endswith("!") }}"#, "True"),
+            (r#"{{ messages[0].content.startswith("H") }}"#, "True"),
+        ];
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Hello!".to_string(),
+        }];
+        for (template, want) in cases {
+            let mut tok = make_test_tokenizer();
+            tok.chat_template = Some(template.to_string());
+            let got = apply_chat_template(&tok, &messages, false)
+                .unwrap_or_else(|e| panic!("{template} failed to render: {e:#}"));
+            assert_eq!(got, want, "template: {template}");
+        }
+    }
+
+    /// A dict method reached through `.items()` inside a `for` unpack, which
+    /// is how tool-call templates render an argument map. Separate from the
+    /// scalar cases above because the failure mode differs: this one breaks
+    /// iteration rather than a single substitution.
+    #[test]
+    fn chat_template_may_iterate_dict_items() {
+        let mut tok = make_test_tokenizer();
+        tok.chat_template =
+            Some("{% for k, v in messages[0].items() %}{{ k }}={{ v }};{% endfor %}".to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Hello!".to_string(),
+        }];
+        let got = apply_chat_template(&tok, &messages, false).expect("items() must render");
+        assert!(
+            got.contains("role=user") && got.contains("content=Hello!"),
+            "expected both pairs, got {got:?}"
+        );
     }
 
     /// `strip_generation_markers` removes `{% generation %}` /
