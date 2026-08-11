@@ -21,7 +21,7 @@
 # `RUSTFLAGS: ""`, and the published npm package shipped scalar for it.
 #
 # Little else catches it. The build succeeds. The package gets SMALLER (78 KB
-# of kernels stripped), so a size budget reads the regression as an
+# of vector code stripped), so a size budget reads the regression as an
 # improvement. And the oracle suite still passes, because those tests call the
 # kernels directly and so never touch the dispatch that broke.
 #
@@ -33,7 +33,7 @@
 # already installs for `wasm-opt`. It counts lines carrying a `v128.` mnemonic
 # in the finished artifact rather than checking the flag, because the flag is
 # the input and what matters is whether vector code survived into the thing
-# people download. That is a proxy, not a census: the `f32x4.*` and `i32x4.*`
+# people download. That is a proxy, not a census: the `f32x4.*` and `i8x16.*`
 # families are vector ops too and are not counted. It does not need to be a
 # census. A real build gives 14100 of them against 0.
 set -euo pipefail
@@ -66,13 +66,15 @@ for wasm in "$@"; do
     # than reaching the counter as "no vector instructions" and being
     # misdiagnosed as a build-configuration problem.
     #
-    # The feature flags are not optional, for the same reason `wasm-opt` needs
-    # them in cera-wasm/Cargo.toml: binaryen refuses a non-MVP module as
-    # invalid input unless told which proposals to accept. `--enable-simd`
-    # covers the `v128` ops this script exists to count, and `--enable-threads`
-    # the atomics in the threaded build. Recent binaryen accepts these modules
-    # without either, which is exactly why they are easy to leave off and then
-    # discover on whatever version the runner's apt happens to pin.
+    # The feature flags are insurance rather than a requirement today.
+    # `wasm-dis` does not validate, so binaryen 130 disassembles both the SIMD
+    # and the threaded module without them; `wasm-opt` does validate, which is
+    # why `cera-wasm/Cargo.toml` has to pass the same pair (drop
+    # `--enable-simd` there and it refuses the module as invalid input). Since
+    # the only thing standing between the two behaviours is which binaryen
+    # tool runs, pass the flags here too and stop the guard from depending on
+    # it: `--enable-simd` for the `v128` ops this script counts,
+    # `--enable-threads` for the atomics in the threaded build.
     if ! disassembly=$(wasm-dis --enable-simd --enable-threads "$wasm"); then
         echo "assert-wasm-simd: wasm-dis could not read $wasm" >&2
         status=1

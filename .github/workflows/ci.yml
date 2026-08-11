@@ -421,13 +421,6 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Puts back `.cargo/config.toml`'s wasm32 entry, which the workflow-level
-    # `RUSTFLAGS: ""` replaces. The kernels compile either way (they carry
-    # their own `#[target_feature]`), but the `simd128`-gated dispatch arms in
-    # `vec_dot_*` are cfg'd out without this, so the job would check a
-    # configuration nothing ships.
-    env:
-      RUSTFLAGS: "-C target-feature=+simd128"
     strategy:
       fail-fast: false
       matrix:
@@ -443,8 +436,12 @@ jobs:
     # workflow-level `RUSTFLAGS: ""` is there to neutralize `target-cpu=native`
     # on the host, but an env `RUSTFLAGS` REPLACES the config's target entry
     # rather than appending to it, so this job has been compiling the scalar
-    # fallback instead of the kernels that actually ship. Repeating the flag is
-    # what `WASM_MT_RUSTFLAGS` in the justfile has to do, for the same reason.
+    # fallback instead of the kernels that actually ship. The kernels compile
+    # either way (they carry their own `#[target_feature]`), but the
+    # `simd128`-gated dispatch arms in `vec_dot_*` are cfg'd out without this,
+    # so the job would lint a configuration nothing ships. Repeating the flag
+    # is what `WASM_MT_RUSTFLAGS` in the justfile has to do, for the same
+    # reason.
     #
     # Safe for the whole job: every step below passes `--target`, and cargo does
     # not apply rustflags to host build scripts or proc macros when
@@ -563,10 +560,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Built on every PR, so this is where a lost `+simd128` gets caught before
-    # it reaches the release. publish.yml ships the bundler shape of this same
-    # body today; web and nodejs are a follow-up there. The v128 check below is
-    # the backstop that makes this line's correctness verifiable rather than
-    # assumed.
+    # it reaches the release. Of the three npm shapes this job builds,
+    # publish.yml publishes the bundler one today; web and nodejs are a
+    # follow-up there (it does build a `--target web` wasm for the release
+    # assets, by a different job). The v128 check below is the backstop that
+    # makes this line's correctness verifiable rather than assumed.
     env:
       RUSTFLAGS: "-C target-feature=+simd128"
     strategy:
@@ -653,9 +651,9 @@ jobs:
           SIZE_BYTES=$(wc -c < "$WASM")
           BUDGET_KB=2816  # 2.75 MB
           BUDGET_BYTES=$((BUDGET_KB * 1024))
-          # Display rounds UP to KB so a 2,560,001-byte file reads as
-          # "2561 KB" not "2560 KB" — keeps the human-readable line
-          # honest with the byte-precision comparison below.
+          # Display rounds UP to KB, so a 2,621,441-byte file reads as
+          # "2561 KB" rather than "2560 KB". That keeps the human-readable
+          # line honest with the byte-precision comparison below.
           SIZE_KB=$(( (SIZE_BYTES + 1023) / 1024 ))
           # Default $GITHUB_STEP_SUMMARY to /dev/null so a contributor
           # can copy this script and run it locally — the variable is
@@ -701,12 +699,20 @@ jobs:
     # between the two, whatever this comment used to claim: it
     # hardcodes its own copy of the flag list rather than calling the
     # recipe, and that copy is exactly what went stale when `+simd128`
-    # was added to the justfile and not here. The assert step below is
-    # what catches it now.
+    # was added to the justfile and not here. The assert step below
+    # catches that one flag going missing again; the rest of the list
+    # is on the reader, apart from what the shared-memory /
+    # initThreadPool step covers.
     name: Cera-Wasm Pack MT (${{ matrix.target }})
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # The build step below assigns its own `RUSTFLAGS` inline, which shadows
+    # this for that command. It is here so that a step added to this job later
+    # inherits the feature instead of the workflow-level `RUSTFLAGS: ""`, and
+    # so silently compiling scalar is not the default for new work.
+    env:
+      RUSTFLAGS: "-C target-feature=+simd128"
     strategy:
       fail-fast: false
       matrix:
@@ -801,11 +807,9 @@ jobs:
         # Threaded wasm is bigger than the single-threaded body
         # because the std rebuild includes atomics-aware sync
         # primitives + TLS init. 2666 KB measured for both
-        # targets once `+simd128` is in the flag list below (it
-        # was ~2.3 MB when that list was missing the feature and
-        # the kernels were being stripped); the 3072 KB budget
-        # gives ~15% headroom for std / wasm-bindgen-rayon churn
-        # before this needs a bump.
+        # targets with `+simd128` in the build step's flag list
+        # above; the 3072 KB budget gives ~15% headroom for std /
+        # wasm-bindgen-rayon churn before this needs a bump.
         # Crossing the budget is intentional sometimes (a real
         # new capability, not a regression) — when it happens,
         # justify in the PR description and bump `BUDGET_KB`
