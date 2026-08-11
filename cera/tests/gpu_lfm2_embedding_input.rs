@@ -11,7 +11,7 @@
 //! oracles) but the seam: writing the wrong buffer, the wrong length, or at
 //! the wrong position would still produce plausible-looking logits.
 //!
-//! ## These models are stateful — reuse contaminates
+//! ## These models are stateful, and reuse contaminates
 //!
 //! Same hazard as `gpu_lfm2_prefill_equivalence.rs`: the KV cache, conv
 //! rolling buffers and prefix cache live in `GpuState`, on the **model**. A
@@ -25,7 +25,7 @@ use cera::gguf::GgufFile;
 use cera::kv_cache::InferenceState;
 use cera::model::{Model, load_model, load_model_gpu};
 
-/// The `core` fixture set's LFM2 model — fetched on pull requests, so this
+/// The `core` fixture set's LFM2 model, fetched on pull requests, so this
 /// file gets real PR coverage rather than an `arch`-tier skip-as-pass.
 const FIXTURE: &str = "LFM2.5-230M-Q4_K_M.gguf";
 
@@ -52,7 +52,7 @@ fn fixture_or_skip() -> Option<PathBuf> {
     None
 }
 
-/// A model instance per call — see the module docs on statefulness.
+/// A model instance per call; see the module docs on statefulness.
 fn load_gpu(path: &std::path::Path) -> Option<Box<dyn Model>> {
     match load_model_gpu(GgufFile::open(path).expect("open gguf"), Some(path), 4096) {
         Ok(m) => Some(m),
@@ -155,8 +155,18 @@ fn successive_embeddings_advance_the_kv_cache() {
     let mut state = InferenceState::from_config(gpu.config()).expect("state");
 
     let first = gpu.forward_from_embedding(&embedding, 0, &mut state);
-    state.seq_len += 1;
+    // `forward_from_embedding` advances `seq_len` itself, on both backends.
+    // Adding a manual step here would land the next embedding at position 2
+    // and leave an unwritten hole at 1 for attention to read.
+    assert_eq!(
+        state.seq_len, 1,
+        "forward_from_embedding must advance seq_len itself"
+    );
     let second = gpu.forward_from_embedding(&embedding, 1, &mut state);
+    assert_eq!(
+        state.seq_len, 2,
+        "second embedding must advance seq_len too"
+    );
 
     let cos = cosine(&first, &second);
     assert!(
@@ -186,8 +196,13 @@ fn cpu_and_gpu_agree_on_position_after_a_prefix() {
     let mut gpu_state = InferenceState::from_config(gpu.config()).expect("state");
     cpu.forward(&[1], 0, &mut cpu_state);
     gpu.forward(&[1], 0, &mut gpu_state);
-    cpu_state.seq_len += 1;
-    gpu_state.seq_len += 1;
+    // `forward` advances `seq_len` itself too (CPU inside `run_layers`, GPU
+    // inside the shared compute tail), so the prefix leaves both at 1 and the
+    // embedding below appends at 1. Stepping them by hand would put it at 2 on
+    // both backends: still *agreeing*, and so still passing the cosine check,
+    // while quietly testing a position that is not the one after the prefix.
+    assert_eq!(cpu_state.seq_len, 1, "CPU forward must advance seq_len");
+    assert_eq!(gpu_state.seq_len, 1, "GPU forward must advance seq_len");
 
     let cpu_logits = cpu.forward_from_embedding(&embedding, 1, &mut cpu_state);
     let gpu_logits = gpu.forward_from_embedding(&embedding, 1, &mut gpu_state);

@@ -13,21 +13,21 @@
 //! not what wasm-bindgen builds.) So persistence has to come from a JS
 //! API, and there are four:
 //!
-//! - **OPFS** (`navigator.storage.getDirectory()`) — an origin-private
+//! - **OPFS** (`navigator.storage.getDirectory()`), an origin-private
 //!   directory tree with `getFileHandle` / `getDirectoryHandle` /
 //!   `removeEntry`. Disk-backed, and the only one with directories, so
 //!   the native store's `<host>/<url-path>` layout carries over exactly.
 //!   In a worker, `createSyncAccessHandle()` also allows reading
 //!   straight into wasm linear memory with no intermediate JS buffer.
 //!   Chrome 86+, Safari 15.2+, Firefox 111+.
-//! - **Cache Storage** — streams a `Response` to disk without buffering
+//! - **Cache Storage**: streams a `Response` to disk without buffering
 //!   in the JS heap, which is genuinely nice for a multi-GB download,
 //!   but `cache.put()` reports no progress, entries are flat and keyed
 //!   by `Request`, and reads hand back a whole `Blob`.
-//! - **IndexedDB** — universal and disk-backed, but flat key/value over
+//! - **IndexedDB**: universal and disk-backed, but flat key/value over
 //!   `Blob`s: the directory layout, the size walk and the sidecar all
 //!   become bookkeeping we'd have to invent.
-//! - **`localStorage`** — strings only, ~5 MB. Not a candidate.
+//! - **`localStorage`**: strings only, ~5 MB. Not a candidate.
 //!
 //! OPFS wins on fit. We do not fall back to IndexedDB: every browser
 //! that can run this engine at a useful speed has OPFS, and a silent
@@ -190,7 +190,7 @@ impl BundleRepo {
         opts.set_recursive(true);
         match JsFuture::from(root.remove_entry_with_options(&self.store_dir, &opts)).await {
             Ok(_) => Ok(()),
-            // Already absent — the lazy-creation invariant means this
+            // Already absent; the lazy-creation invariant means this
             // is the normal state before any download.
             Err(e) if is_not_found(&e) => Ok(()),
             Err(e) => Err(js_err("clearCache", e)),

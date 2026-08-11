@@ -385,14 +385,29 @@ impl CeraEngine {
             .map_err(|e| CeraError::Backend(format!("parsing GGUF bytes: {e}")))?;
 
         // Parse the mmproj *before* resolving the modality, because the
-        // upgrade in step 3 is only sound if the sidecar is real. Deciding
+        // upgrade below is only sound if the sidecar is real. Deciding
         // "VL" from the mere presence of a buffer and then discovering it is
         // garbage leaves `capabilities.image_in == true` on an engine with no
         // vision encoder: a claim that `append_image` immediately refuses.
         // An unusable mmproj must therefore not be evidence of anything.
+        //
+        // Skipped entirely when nothing downstream can consult it: an
+        // explicit *text* type short-circuits the upgrade and routes no
+        // aux weights, so parsing there would burn the work and warn about
+        // a sidecar the caller deliberately opted out of. That opt-out is
+        // a documented use ("text plus an ignored sidecar"), so it should
+        // not be the noisy path.
+        let mmproj_can_matter = match &parts.inference_type {
+            // Inferred: the upgrade needs to know whether it is usable.
+            None => true,
+            // Explicit and multimodal: `aux` below needs it parsed.
+            Some(InferenceType::LlamaCppImageToText | InferenceType::LlamaCppLfm2AudioV1) => true,
+            Some(_) => false,
+        };
         let mmproj = parts
             .multimodal_projector
             .as_ref()
+            .filter(|_| mmproj_can_matter)
             .and_then(|bytes| parse_aux_gguf(bytes, "multimodal projector"));
 
         let inference_type = resolve_parts_inference_type(
@@ -1965,13 +1980,16 @@ mod tests {
         );
     }
 
-    /// An unknown arch stays unknown rather than being upgraded, so
-    /// `check_inference_type_supported` can still reject it by name.
+    /// An unknown arch *is* upgraded by a usable mmproj, same as a known
+    /// text one. The arch is not what makes a bundle multimodal; a real
+    /// vision encoder sitting next to it is.
     #[test]
-    fn unknown_arch_is_not_upgraded_by_an_mmproj() {
-        // `inference_type_for_arch` maps unrecognised arches to text, so this
-        // pins the documented policy rather than an accident: an mmproj plus
-        // an unknown arch lands on VL, and loading proceeds.
+    fn unknown_arch_is_upgraded_by_a_usable_mmproj() {
+        // `inference_type_for_arch` maps unrecognised arches to text, so
+        // without this upgrade a VL bundle on an arch cera does not know
+        // by name would load text-only and drop its vision tower in
+        // silence. Pinned because it is the whole reason the upgrade keys
+        // off the sidecar rather than off the arch string.
         assert_eq!(
             resolve_parts_inference_type(None, "totally-made-up", true),
             InferenceType::LlamaCppImageToText

@@ -1,10 +1,11 @@
 //! Cache-key and catalog logic shared by every bundle store.
 //!
 //! Everything here is pure: no filesystem, no HTTP, no `remote` feature.
-//! That is the point. There are two bundle stores in the workspace now —
-//! the native [`super::BundleRepo`] (an on-disk tree under `store_dir`)
-//! and the browser one in `cera-wasm` (the Origin Private File System) —
-//! and they must agree on:
+//! That is the point. There are two bundle stores in the workspace now:
+//! the native `BundleRepo` (an on-disk tree under `store_dir`) and the
+//! browser one in `cera-wasm` (the Origin Private File System). Neither
+//! is linked here because both are cfg-gated away from some build this
+//! module still compiles in. They must agree on:
 //!
 //! - which cache entry a URL maps to ([`cache_relative_segments`]),
 //! - which characters are safe in a path segment
@@ -39,9 +40,14 @@ pub const LEAP_BUNDLES_API_URL: &str = "https://huggingface.co/api/models/Liquid
 /// `LiquidAI/LeapBundles/<name>/` plus the per-quant manifests
 /// (`<quant>.json`) Liquid publishes inside it.
 ///
-/// Returned by [`super::list_leap_bundles`]; both `name` and `quants`
-/// are sorted ascending so output is stable across runs even if the
-/// HF API reorders its `siblings` array.
+/// Returned by `list_leap_bundles`, named here rather than linked: that
+/// function is behind the `remote` feature, and an intra-doc link to it
+/// is an unresolved-link error in any build without it. This module is
+/// deliberately always-compiled, so it is documented on wasm too, where
+/// `remote` is off.
+///
+/// Both `name` and `quants` are sorted ascending so output is stable
+/// across runs even if the HF API reorders its `siblings` array.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeapBundleEntry {
     pub name: String,
@@ -405,7 +411,7 @@ mod tests {
     fn cache_segments_reject_windows_reserved_chars() {
         // Chars that appear as segment content and are Windows-reserved:
         // `*`, `"`, `<`, `>`, `|`. (`?` and `#` are separately stripped
-        // as URL syntax — see `cache_segments_strip_query_and_fragment`.)
+        // as URL syntax, see `cache_segments_strip_query_and_fragment`.)
         // Catching these up front means a Windows consumer never sees a
         // cryptic filesystem error at join time.
         for bad in ["a*b", "a\"b", "a<b", "a>b", "a|b"] {

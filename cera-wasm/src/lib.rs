@@ -405,7 +405,7 @@ impl CeraEngine {
             model: bytes.into(),
             multimodal_projector: mmproj.map(Into::into),
             // `parse_str` maps anything unrecognized to `Unknown(s)`, which
-            // `from_parts` rejects by name — better than silently falling
+            // `from_parts` rejects by name, better than silently falling
             // back to text when a caller fat-fingers the string.
             inference_type: inference_type
                 .as_deref()
@@ -1660,10 +1660,10 @@ impl Session {
     /// `maxLongSize` caps the longest side of the **encoded** image in
     /// pixels, trading detail for speed and token count:
     ///
-    /// - `null`/omitted — use the session default
+    /// - `null`/omitted: use the session default
     ///   (`setImageMaxLongSize`, itself unset by default).
-    /// - `0` — force *no* cap for this call, overriding a session default.
-    /// - `n` — cap at `n` pixels.
+    /// - `0`: force *no* cap for this call, overriding a session default.
+    /// - `n`: cap at `n` pixels.
     ///
     /// Requires a VL bundle (`capabilities.imageIn === true`), which means
     /// loading via `CeraEngine.fromGgufParts` with the vision mmproj.
@@ -2182,7 +2182,7 @@ mod webgpu {
             if hidden == 0 || !img_tokens.len().is_multiple_of(hidden) {
                 return Err(JsError::new(&format!(
                     "vision encoder returned {} f32s, not a multiple of hidden_size \
-                     ({hidden}) — malformed image-token tensor",
+                     ({hidden}), malformed image-token tensor",
                     img_tokens.len()
                 )));
             }

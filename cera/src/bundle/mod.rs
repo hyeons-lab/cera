@@ -6,12 +6,12 @@
 //!   addressing, the path-segment allowlist, LeapBundles manifest URLs
 //!   and catalog parsing. The browser store in `cera-wasm` builds on
 //!   this, which is why it isn't behind the `remote` feature.
-//! - [`BundleRepo`] (behind `remote`) is the native store: a
+//! - `BundleRepo` (behind `remote`, so named and not linked) is the native store: a
 //!   `reqwest::blocking` downloader over an on-disk tree, with
 //!   SHA-256 integrity and sidecar caching.
 //!
-//! A `wasm32` build gets the first and not the second — there is no
-//! filesystem and no reqwest — and supplies its own OPFS-backed store
+//! A `wasm32` build gets the first and not the second (there is no
+//! filesystem and no reqwest) and supplies its own OPFS-backed store
 //! that shares the addressing above. See `cera-wasm`'s bundle module.
 
 pub mod cache_key;

@@ -890,7 +890,7 @@ impl CeraEngine {
             model: bytes.into(),
             multimodal_projector: multimodal_projector.map(Into::into),
             // `parse_str` maps anything unrecognized to `Unknown(s)`,
-            // which `from_parts` rejects by name — better than silently
+            // which `from_parts` rejects by name, better than silently
             // falling back to text when a caller fat-fingers the string.
             inference_type: inference_type
                 .as_deref()

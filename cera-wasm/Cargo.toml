@@ -71,7 +71,7 @@ wasm-bindgen-futures = { workspace = true }
 sha2 = { workspace = true }
 # Browser APIs for the bundle store: OPFS (the `FileSystem*` handles),
 # `fetch` responses and their streaming bodies. Feature-gated per
-# interface, so this list is exactly what `src/bundle.rs` touches — any
+# interface, so this list is exactly what `src/bundle.rs` touches: any
 # addition there needs a matching entry here or the build fails with a
 # missing type rather than silently widening the surface.
 web-sys = { version = "0.3", features = [
@@ -116,7 +116,7 @@ wasm-bindgen-test = { workspace = true }
 # which reads as a broken model rather than a missing build flag.
 default = ["vl"]
 
-# `vl` — image input. Turns on `cera/vl-preprocess` (PNG/JPEG decode +
+# `vl`: image input. Turns on `cera/vl-preprocess` (PNG/JPEG decode +
 # resize + normalize via the pure-Rust `image` crate, no system libpng or
 # libjpeg). Without it `Session.appendImage` compiles but always returns
 # `UnsupportedModality`. Text-only or raw-PCM-audio-only deployments can
