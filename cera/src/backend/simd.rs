@@ -9282,6 +9282,9 @@ pub(crate) mod wasm_simd {
         /// workflow-level `RUSTFLAGS: ""` replaces `.cargo/config.toml`
         /// instead of appending to it.
         #[wasm_bindgen_test]
+        // The asserted expression is a constant by construction: the whole
+        // point is to fail the build configuration, not a runtime value.
+        #[allow(clippy::assertions_on_constants)]
         fn simd128_is_actually_enabled() {
             assert!(
                 cfg!(target_feature = "simd128"),

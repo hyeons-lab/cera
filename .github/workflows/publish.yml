@@ -687,7 +687,10 @@ jobs:
 
       - name: Assert the build has SIMD in it
         # Alongside the wgpu check below: that one guards the GPU path, this
-        # one guards the CPU fallback the same artifact serves.
+        # one guards the CPU fallback the same artifact serves. `just
+        # wasm-web-wgpu` runs the same assert on the same file, so this step
+        # is redundant while the recipe keeps it; kept anyway so the release
+        # leg's coverage does not depend on a recipe it does not own.
         run: scripts/assert-wasm-simd.sh "cera-wasm/examples/webgpu/pkg/cera_wasm_bg.wasm"
 
       - name: Stage release assets

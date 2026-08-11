@@ -649,11 +649,13 @@ wasm-simd-test:
         exit 1
     }
     printf '%s\n' "$out"
-    # Both spellings on purpose: the runner says "no tests to run!" when the
-    # filter matches nothing, and "running 0 tests" when the binary itself has
-    # none. Checked against a deliberately wrong filter rather than assumed,
-    # because the first version of this guard matched only the second spelling
-    # and let the empty run through.
+    # "no tests to run!" is the one that fires today: wasm-bindgen-cli applies
+    # the filter before its own is-empty check, so a filter that matches
+    # nothing lands in the same branch as a binary with no wasm tests at all.
+    # Checked against a deliberately wrong filter rather than assumed, because
+    # the first version of this guard grepped only for "running 0 tests" and
+    # let the empty run through. "running 0 tests" is kept as the second
+    # spelling in case a future runner reports it that way instead.
     if printf '%s\n' "$out" | grep -qE 'no tests to run|running 0 tests'; then
         echo "wasm-simd-test: the wasm_simd filter matched no tests" >&2
         exit 1
@@ -694,11 +696,12 @@ wasm-simd-test:
 # doesn't have canonical bundler-side worker glue, so we ship `web` +
 # `nodejs` only.
 #
-# Every recipe above and below ends by running
-# `scripts/assert-wasm-simd.sh` on what it just built. The threaded recipes
-# need it most: they set RUSTFLAGS themselves, so they carry `+simd128` in the
-# list below rather than inheriting it from `.cargo/config.toml`, and a build
-# that loses it is silent (it succeeds, and the artifact gets smaller).
+# Every recipe that produces a package ends by running
+# `scripts/assert-wasm-simd.sh` on it. (`wasm-demo-wgpu` only serves what
+# `wasm-web-wgpu` already asserted, and the two test recipes build nothing
+# that ships.) The threaded recipes need it most: a build that loses
+# `+simd128` from the list below is silent, since it succeeds and the
+# artifact gets smaller.
 #
 # Link-arg breakdown (all required, none optional):
 #   --shared-memory          memory definition gets the SHARED flag.
