@@ -19,6 +19,7 @@ byteorder.workspace = true
 half.workspace = true
 memmap2 = { workspace = true, optional = true }
 minijinja.workspace = true
+minijinja-contrib.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rand.workspace = true
