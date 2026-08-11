@@ -11,6 +11,12 @@ env:
   CARGO_TERM_COLOR: always
   # Override .cargo/config.toml target-cpu=native — CI runners vary
   RUSTFLAGS: ""
+  # NOTE: that empty value REPLACES `.cargo/config.toml` for every target
+  # rather than appending to it, which also deletes the wasm32 entry's
+  # `+simd128`. Every wasm job below puts it back: at job level where it can,
+  # so a step added later inherits it rather than silently building scalar,
+  # and inside its own flag list in `cera-wasm-pack-mt`, which sets RUSTFLAGS
+  # in the step and so cannot inherit anything.
 
 jobs:
   check:
@@ -415,6 +421,13 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Puts back `.cargo/config.toml`'s wasm32 entry, which the workflow-level
+    # `RUSTFLAGS: ""` replaces. The kernels compile either way (they carry
+    # their own `#[target_feature]`), but the `simd128`-gated dispatch arms in
+    # `vec_dot_*` are cfg'd out without this, so the job would check a
+    # configuration nothing ships.
+    env:
+      RUSTFLAGS: "-C target-feature=+simd128"
     strategy:
       fail-fast: false
       matrix:
@@ -493,6 +506,16 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # The oracle tests here were not the thing that broke: they call the
+    # kernels directly, and the kernels carry their own `#[target_feature]`,
+    # so they were exercising real simd128 the whole time. What they could not
+    # see is the dispatch, which the global flag gates and which decides
+    # whether anything calls the kernels at all. Hence both halves: the flag
+    # below, so this job runs the configuration that ships, and
+    # `simd128_is_actually_enabled` in the suite, so a green run means the
+    # dispatch is on rather than merely that the kernels are correct.
+    env:
+      RUSTFLAGS: "-C target-feature=+simd128"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
@@ -505,9 +528,13 @@ jobs:
           tool: wasm-pack@0.14.0
       - uses: extractions/setup-just@v4
       - name: Run the simd128 kernel oracle tests under Node
-        # `+simd128` comes from `.cargo/config.toml`; do not set RUSTFLAGS here,
-        # which would REPLACE that rather than append and silently test the
-        # scalar path instead.
+        # Do not set RUSTFLAGS in this step. The job-level value above is
+        # already `.cargo/config.toml`'s wasm32 entry, and a step-level one
+        # would REPLACE it rather than append, testing the scalar dispatch.
+        # This comment used to say `+simd128` came from the config and stop
+        # there, which was true of a local run and not of this job: the
+        # workflow-level `RUSTFLAGS: ""` had been overriding the config here
+        # since it was added.
         run: just wasm-simd-test
 
   cera-wasm-pack:
@@ -535,6 +562,13 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Built on every PR, so this is where a lost `+simd128` gets caught before
+    # it reaches the release. publish.yml ships the bundler shape of this same
+    # body today; web and nodejs are a follow-up there. The v128 check below is
+    # the backstop that makes this line's correctness verifiable rather than
+    # assumed.
+    env:
+      RUSTFLAGS: "-C target-feature=+simd128"
     strategy:
       fail-fast: false
       matrix:
@@ -573,6 +607,12 @@ jobs:
             --release \
             --scope hyeons-lab \
             --out-dir pkg-${{ matrix.target }}
+      - name: Assert the build has SIMD in it
+        # The job-level RUSTFLAGS above is a claim; this checks the artifact.
+        # Losing `+simd128` is invisible everywhere else: the build succeeds,
+        # and the package gets SMALLER, because the kernels nothing dispatches
+        # to any more are stripped.
+        run: scripts/assert-wasm-simd.sh "cera-wasm/pkg-${{ matrix.target }}/cera_wasm_bg.wasm"
       - name: Check .wasm size budget
         # Hard cap on the post-wasm-opt cdylib size. Catches the
         # next time something bloats the bundle silently. Crossing
@@ -591,7 +631,17 @@ jobs:
         #   PR #69 (engine + tokenizer):         1.2 MB  (+1.0 MB minijinja + LFM2)
         #   PR #70 (Session + generate):         1.2 MB  (~unchanged)
         #   PR #72 (applyChatTemplate):          2.0 MB  (+800 KB minijinja render)
-        # Budget:                                2.5 MB  (~25% headroom)
+        #   (drifted to, scalar):                2507 KB
+        #   simd128 restored:                    2585 KB (+78 KB of vector code)
+        # Budget:                                2816 KB (~9% headroom)
+        #
+        # That last entry is a bump, not a regression. The 2507 KB line is not
+        # a release; it is what the artifact had quietly become while a
+        # workflow-level `RUSTFLAGS: ""` was overriding `.cargo/config.toml`,
+        # leaving no vector code in the build at all. The 78 KB back is the
+        # `wasm_simd` kernels plus everything else LLVM vectorizes once it is
+        # allowed to emit `v128`. Worth remembering the next time a wasm
+        # artifact gets unexpectedly SMALLER.
         #
         # Plain bash arithmetic (no `numfmt` etc.) so this script
         # runs identically on the macOS / Linux developer machines
@@ -601,7 +651,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=2560  # 2.5 MB
+          BUDGET_KB=2816  # 2.75 MB
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           # Display rounds UP to KB so a 2,560,001-byte file reads as
           # "2561 KB" not "2560 KB" — keeps the human-readable line
@@ -647,8 +697,12 @@ jobs:
     # bundler-target threaded build is unsupported upstream.
     #
     # Build flags break down identically to the `wasm-web-mt` /
-    # `wasm-node-mt` justfile recipes; if those go stale this
-    # job catches it.
+    # `wasm-node-mt` justfile recipes. This job does NOT catch drift
+    # between the two, whatever this comment used to claim: it
+    # hardcodes its own copy of the flag list rather than calling the
+    # recipe, and that copy is exactly what went stale when `+simd128`
+    # was added to the justfile and not here. The assert step below is
+    # what catches it now.
     name: Cera-Wasm Pack MT (${{ matrix.target }})
     needs: check
     runs-on: ubuntu-latest
@@ -689,9 +743,13 @@ jobs:
       - name: Build cera-wasm npm package (threaded)
         # Flag breakdown lives in the justfile next to
         # `WASM_MT_RUSTFLAGS`. Keep this command in lockstep —
-        # if a flag changes there it must change here too.
+        # if a flag changes there it must change here too. It had already
+        # drifted: `+simd128` was added there and not here, which is the whole
+        # reason the threaded packages this job builds were scalar.
+        # The feature list below is byte-identical to the justfile's so the
+        # next drift is visible by eye.
         run: |
-          RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals \
+          RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128 \
             -C link-arg=--shared-memory \
             -C link-arg=--import-memory \
             -C link-arg=--max-memory=4294967296 \
@@ -707,6 +765,11 @@ jobs:
             --out-dir pkg-${{ matrix.target }}-mt \
             -- --features parallel \
             -Z build-std=panic_abort,std
+      - name: Assert the build has SIMD in it
+        # This job sets RUSTFLAGS itself, so it cannot inherit the feature and
+        # has to carry `+simd128` in its own flag list. It did not, so the
+        # threaded packages it builds were scalar.
+        run: scripts/assert-wasm-simd.sh "cera-wasm/pkg-${{ matrix.target }}-mt/cera_wasm_bg.wasm"
       - name: Verify threaded artifact has shared memory + initThreadPool
         # Two-pronged sanity check that catches the most common
         # silent regression: the build succeeds but produces a
@@ -737,9 +800,12 @@ jobs:
       - name: Check threaded .wasm size budget
         # Threaded wasm is bigger than the single-threaded body
         # because the std rebuild includes atomics-aware sync
-        # primitives + TLS init. ~2.3 MB measured locally for
-        # both targets; 3 MB budget gives ~30% headroom for std
-        # / wasm-bindgen-rayon churn before this needs a bump.
+        # primitives + TLS init. 2666 KB measured for both
+        # targets once `+simd128` is in the flag list below (it
+        # was ~2.3 MB when that list was missing the feature and
+        # the kernels were being stripped); the 3072 KB budget
+        # gives ~15% headroom for std / wasm-bindgen-rayon churn
+        # before this needs a bump.
         # Crossing the budget is intentional sometimes (a real
         # new capability, not a regression) — when it happens,
         # justify in the PR description and bump `BUDGET_KB`
@@ -749,7 +815,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}-mt
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=3072  # 3 MB — threaded body is ~30% larger than st
+          BUDGET_KB=3072  # 3 MB; see the note above for the measurement
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           SIZE_KB=$(( (SIZE_BYTES + 1023) / 1024 ))
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}

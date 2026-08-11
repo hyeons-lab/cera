@@ -600,6 +600,7 @@ wasm:
     wasm-pack build cera-wasm --target bundler --release --scope hyeons-lab --out-dir pkg-bundler
     @echo "--- cera-wasm/pkg-bundler/ ---"
     @ls -lh cera-wasm/pkg-bundler/
+    scripts/assert-wasm-simd.sh cera-wasm/pkg-bundler/cera_wasm_bg.wasm
 
 # Build the `--target web` variant — direct browser ESM, no bundler
 # required. Consumers `import init, { ... } from './cera_wasm.js'`
@@ -609,6 +610,7 @@ wasm-web:
     wasm-pack build cera-wasm --target web --release --scope hyeons-lab --out-dir pkg-web
     @echo "--- cera-wasm/pkg-web/ ---"
     @ls -lh cera-wasm/pkg-web/
+    scripts/assert-wasm-simd.sh cera-wasm/pkg-web/cera_wasm_bg.wasm
 
 # Build the `--target nodejs` variant — CommonJS module that Node
 # consumers `require('@hyeons-lab/cera-wasm')` directly without the
@@ -618,6 +620,7 @@ wasm-node:
     wasm-pack build cera-wasm --target nodejs --release --scope hyeons-lab --out-dir pkg-nodejs
     @echo "--- cera-wasm/pkg-nodejs/ ---"
     @ls -lh cera-wasm/pkg-nodejs/
+    scripts/assert-wasm-simd.sh cera-wasm/pkg-nodejs/cera_wasm_bg.wasm
 
 # Run the `simd128` kernel oracle tests under Node.
 #
@@ -634,7 +637,27 @@ wasm-node:
 #
 # Requires: `wasm-pack`, node, and the `wasm32-unknown-unknown` target.
 wasm-simd-test:
-    wasm-pack test --node cera --lib -- wasm_simd
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Captured rather than run straight through, because `wasm-pack test`
+    # exits 0 when its filter matches nothing. The suite carries the only
+    # check that the `simd128` dispatch is enabled at all
+    # (`simd128_is_actually_enabled`), so a rename that stopped `wasm_simd`
+    # from matching would retire that check silently, with a green run.
+    out=$(wasm-pack test --node cera --lib -- wasm_simd 2>&1) || {
+        printf '%s\n' "$out"
+        exit 1
+    }
+    printf '%s\n' "$out"
+    # Both spellings on purpose: the runner says "no tests to run!" when the
+    # filter matches nothing, and "running 0 tests" when the binary itself has
+    # none. Checked against a deliberately wrong filter rather than assumed,
+    # because the first version of this guard matched only the second spelling
+    # and let the empty run through.
+    if printf '%s\n' "$out" | grep -qE 'no tests to run|running 0 tests'; then
+        echo "wasm-simd-test: the wasm_simd filter matched no tests" >&2
+        exit 1
+    fi
 
 # ── Multi-threaded wasm builds ──────────────────────────────────────────
 #
@@ -670,6 +693,12 @@ wasm-simd-test:
 # `--target bundler` is intentionally not provided — `wasm-bindgen-rayon`
 # doesn't have canonical bundler-side worker glue, so we ship `web` +
 # `nodejs` only.
+#
+# Every recipe above and below ends by running
+# `scripts/assert-wasm-simd.sh` on what it just built. The threaded recipes
+# need it most: they set RUSTFLAGS themselves, so they carry `+simd128` in the
+# list below rather than inheriting it from `.cargo/config.toml`, and a build
+# that loses it is silent (it succeeds, and the artifact gets smaller).
 #
 # Link-arg breakdown (all required, none optional):
 #   --shared-memory          memory definition gets the SHARED flag.
@@ -725,6 +754,7 @@ wasm-web-mt:
         -Z build-std=panic_abort,std
     @echo "--- cera-wasm/pkg-web-mt/ ---"
     @ls -lh cera-wasm/pkg-web-mt/
+    scripts/assert-wasm-simd.sh cera-wasm/pkg-web-mt/cera_wasm_bg.wasm
 
 # Build the `--target nodejs` threaded variant — `pkg-nodejs-mt/`.
 # Node consumers `await initThreadPool(os.cpus().length)` once before
@@ -738,6 +768,7 @@ wasm-node-mt:
         -Z build-std=panic_abort,std
     @echo "--- cera-wasm/pkg-nodejs-mt/ ---"
     @ls -lh cera-wasm/pkg-nodejs-mt/
+    scripts/assert-wasm-simd.sh cera-wasm/pkg-nodejs-mt/cera_wasm_bg.wasm
 
 # ── WebGPU (single-threaded GPU) wasm build + demo ──────────────────────
 #
@@ -755,6 +786,7 @@ wasm-web-wgpu:
         --out-dir examples/webgpu/pkg -- --features wgpu
     @echo "--- cera-wasm/examples/webgpu/pkg/ ---"
     @ls -lh cera-wasm/examples/webgpu/pkg/
+    scripts/assert-wasm-simd.sh cera-wasm/examples/webgpu/pkg/cera_wasm_bg.wasm
 
 # Build + serve the in-browser WebGPU LFM2 demo on http://localhost:8000
 # (WebGPU is allowed on localhost without HTTPS). Open the page, pick a

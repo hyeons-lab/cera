@@ -9265,6 +9265,34 @@ pub(crate) mod wasm_simd {
         use super::*;
         use wasm_bindgen_test::wasm_bindgen_test;
 
+        /// The one thing the tests below cannot check about themselves: that
+        /// anything outside this module would ever call the code they cover.
+        ///
+        /// Every case below passes whether or not `simd128` is enabled. The
+        /// kernels carry their own `#[target_feature(enable = "simd128")]`, so
+        /// they compile and run as real vector code either way, and these
+        /// tests call them directly. What the global feature gates is the
+        /// `#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]`
+        /// dispatch in `vec_dot_*`: with it off, every caller goes to
+        /// `crate::quant::vec_dot_*_scalar` and these kernels are unreachable
+        /// in the shipped artifact. A green run here would then mean "the
+        /// kernels are correct" while production used none of them.
+        ///
+        /// Not hypothetical. CI ran this suite that way, because a
+        /// workflow-level `RUSTFLAGS: ""` replaces `.cargo/config.toml`
+        /// instead of appending to it.
+        #[wasm_bindgen_test]
+        fn simd128_is_actually_enabled() {
+            assert!(
+                cfg!(target_feature = "simd128"),
+                "built without `-C target-feature=+simd128`, so `vec_dot_*` \
+                 dispatches to the scalar reference and nothing in a shipped \
+                 build reaches the kernels these tests cover. Check whether a \
+                 RUSTFLAGS in the environment is replacing \
+                 .cargo/config.toml's wasm32 entry."
+            );
+        }
+
         /// Deterministic pseudo-random bytes; no `rand` dependency on wasm.
         fn lcg_bytes(seed: u32, n: usize) -> Vec<u8> {
             let mut s = seed;
