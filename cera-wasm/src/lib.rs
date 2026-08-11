@@ -1874,7 +1874,7 @@ impl<'a> cera::ModalitySink for JsTextSink<'a> {
 // See devlog 000169.
 #[cfg(feature = "wgpu")]
 mod webgpu {
-    use super::{Tokenizer, map_err};
+    use super::{Capabilities, Tokenizer, capabilities_to_js, map_err};
     use cera::model::Model;
     use std::sync::Arc;
     use wasm_bindgen::prelude::*;
@@ -2107,6 +2107,25 @@ mod webgpu {
         #[wasm_bindgen(getter, js_name = imageIn)]
         pub fn image_in(&self) -> bool {
             self.vision_encoder.is_some()
+        }
+
+        /// Modality capability flags for this session, same shape as
+        /// `Session.capabilities` on the CPU path.
+        ///
+        /// Reports what *this session* can do, which is deliberately not the
+        /// engine's answer. The WebGPU path takes an image only when it was
+        /// built with a usable mmproj, and has no audio path at all, so
+        /// forwarding a VL-or-audio engine's capabilities here would promise
+        /// a modality the live session refuses.
+        #[wasm_bindgen(getter)]
+        pub fn capabilities(&self) -> Capabilities {
+            capabilities_to_js(cera::ModalityCapabilities {
+                image_in: self.image_in(),
+                // `text_only()` supplies text in/out and leaves audio off, so
+                // a new field added upstream lands here as `false` rather than
+                // as a silent `true`.
+                ..cera::ModalityCapabilities::text_only()
+            })
         }
 
         /// Set the session-default cap on an appended image's longest side in
