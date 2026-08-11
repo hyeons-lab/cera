@@ -1,0 +1,28 @@
+name: Install binaryen
+description: >
+  Installs binaryen (which provides `wasm-opt`) on an Ubuntu runner, working
+  around the intermittent apt failure the Microsoft package source causes.
+
+# Every wasm-pack job needs `wasm-opt` on PATH, and every one of them needs the
+# same apt workaround to get it. Four copies of this block existed before this
+# action did (two in ci.yml, two in publish.yml) and the web-demo deploy would
+# have made five. The bodies were identical and only the comments had drifted:
+# three of the four had given up on explaining the workaround and pointed at
+# another job instead. That is the argument for collapsing it: an apt
+# workaround is exactly the kind of thing that gets fixed in one place and left
+# stale in the others.
+runs:
+  using: composite
+  steps:
+    - name: Install binaryen (provides wasm-opt)
+      shell: bash
+      run: |
+        # packages.microsoft.com apt sources ship preinstalled on the GitHub
+        # ubuntu image and intermittently serve an invalid InRelease
+        # ("NOSPLIT"), which fails `apt-get update`. A broken release is worse
+        # than a broken CI check, so remove every apt source referencing that
+        # host, matched by content (covers both .list and deb822 .sources).
+        while IFS= read -r f; do
+          sudo rm -f -- "$f"
+        done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
+        sudo apt-get update && sudo apt-get install -y binaryen
