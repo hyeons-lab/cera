@@ -38,7 +38,15 @@ fn page_url() -> String {
     // give a bare-directory URL something to name.
     let href = href.split(['?', '#']).next().unwrap_or(&href).to_string();
     if href.ends_with('/') {
-        format!("{href}index.html")
+        // Named after a file the harness itself serves, not `index.html`.
+        // `cache_relative_segments` rejects a URL with no path component, so a
+        // bare directory URL needs *something* appended, and `index.html` is
+        // the obvious guess. It is also wrong: `wasm-pack test` serves the
+        // harness page at `/` without an `index.html` behind it, so every
+        // download test here 404'd the moment this ran anywhere other than a
+        // static-file server. This path is one the runner is known to serve,
+        // because it is where the browser loaded the harness JS from.
+        format!("{href}wasm-bindgen-test")
     } else {
         href
     }

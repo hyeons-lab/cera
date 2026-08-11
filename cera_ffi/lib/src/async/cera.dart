@@ -235,11 +235,21 @@ abstract interface class Cera {
   /// noticeable only after a cancelled one, whose decode may still be
   /// finishing (see [cancel]).
   ///
-  /// **The sampling parameters are ignored on the web's GPU backend**, which
-  /// decodes greedily, i.e. as though `temperature` were 0. They are honored
-  /// natively and on the web's CPU backend. `seed` additionally applies only
-  /// to the first generation of a session, since the sampler is seeded once
-  /// when the session is created.
+  /// The sampling parameters are honored on every backend, including the
+  /// web's GPU one. Greedy decoding is `temperature: 0` or `topK: 1`, the
+  /// same rule everywhere.
+  ///
+  /// Sampling does cost more on the web's GPU backend than greedy decoding
+  /// does: greedy takes the argmax on the GPU and reads back a token id, while
+  /// sampling has to read the whole logits row back for the sampler to see it,
+  /// once per token. Worth knowing if a run is slower than the greedy numbers
+  /// suggested; it is not a reason to avoid it.
+  ///
+  /// `seed` behaves differently per backend, because the sampler's lifetime
+  /// does. Natively and on the web's CPU backend it is a session-level knob
+  /// applied when the session is created, so it takes effect only on the first
+  /// generation of a session. The web's GPU backend builds its sampler per
+  /// call, so a seed applies to whichever call passes it.
   Stream<String> generate(
     String prompt, {
     int maxTokens = 256,

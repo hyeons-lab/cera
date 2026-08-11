@@ -702,8 +702,8 @@ jobs:
         #   PR #72 (applyChatTemplate):          2.0 MB  (+800 KB minijinja render)
         #   (drifted to, scalar):                2507 KB
         #   simd128 restored:                    2585 KB (+78 KB of vector code)
-        #   PR #364 (ffi parity):                3144 KB
-        # Budget:                                3.5 MB  (~14% headroom)
+        #   PR #364 (ffi parity):                3162 KB
+        # Budget:                                3.5 MB  (~13% headroom)
         #
         # The 2585 KB entry is a bump, not a regression. The 2507 KB line is
         # not a release; it is what the artifact had quietly become while a
@@ -713,7 +713,7 @@ jobs:
         # allowed to emit `v128`. Worth remembering the next time a wasm
         # artifact gets unexpectedly SMALLER.
         #
-        # PR #364's ~559 KB over that baseline splits roughly +262 KB for the
+        # PR #364's 577 KB over that baseline splits roughly +262 KB for the
         # multimodal/bundle API surface and the OPFS store, +383 KB for the
         # image decoders `vl` pulls in. Roughly, because attribution needs a
         # build of `main` and a `--no-default-features` build and CI produces
@@ -895,9 +895,9 @@ jobs:
         # Threaded wasm is bigger than the single-threaded body
         # because the std rebuild includes atomics-aware sync
         # primitives + TLS init, and that gap has closed to
-        # almost nothing as the body grew: 2666 KB threaded
-        # against 2585 KB single-threaded on the same commit
-        # once `+simd128` is in the flag list below, i.e. +3%,
+        # almost nothing as the body grew: 3247 KB threaded
+        # against 3162 KB single-threaded on PR #364, i.e. +3%
+        # (it was 2666 / 2585 on main before that),
         # not the "~30% larger" this line used to claim (it was
         # +15% when set, at 2.0 / 2.3 MB). PR #364 carries both
         # up together. Sized off headroom rather than a ratio.

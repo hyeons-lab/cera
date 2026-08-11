@@ -2259,15 +2259,25 @@ mod webgpu {
             format!("{name} ({backend})")
         }
 
-        /// Tokenize `prompt`, run prefill, then greedily decode up to
-        /// `maxTokens` tokens. `onToken(text)` is invoked for each decoded
-        /// piece as it is produced; the full generated string is also
-        /// returned. Stops early on the model's EOS token.
+        /// Tokenize `prompt`, run prefill, then decode up to `maxTokens`
+        /// tokens. `onToken(text)` is invoked for each decoded piece as it is
+        /// produced; the full generated string is also returned. Stops early on
+        /// the model's EOS token.
+        ///
+        /// Sampling follows the same rule as every other backend: greedy when
+        /// `temperature <= 0` or `topK == 1`, stochastic otherwise. Omitted
+        /// knobs fall back to `SamplerConfig`'s defaults, and `seed` makes a
+        /// stochastic run reproducible. See `generateTokens` for what the
+        /// stochastic path costs.
         #[wasm_bindgen]
         pub async fn generate(
             &mut self,
             prompt: &str,
             max_tokens: u32,
+            temperature: Option<f32>,
+            top_p: Option<f32>,
+            top_k: Option<u32>,
+            seed: Option<u64>,
             on_token: &js_sys::Function,
         ) -> Result<String, JsError> {
             let mut ids = self.tokenizer.encode(prompt);
@@ -2286,7 +2296,8 @@ mod webgpu {
             {
                 ids.insert(0, bos);
             }
-            self.generate_ids(ids, max_tokens, on_token).await
+            self.generate_ids(ids, max_tokens, temperature, top_p, top_k, seed, on_token)
+                .await
         }
 
         /// The tokenizer this session's GGUF declares, for callers that need to
@@ -2329,7 +2340,7 @@ mod webgpu {
             }
         }
 
-        /// Prefill `tokens`, then greedily decode up to `maxTokens`, exactly as
+        /// Prefill `tokens`, then decode up to `maxTokens`, exactly as
         /// `generate` does, but taking token ids the caller has already framed.
         ///
         /// **No BOS is prepended.** That is the whole point of this entry point:
@@ -2339,23 +2350,47 @@ mod webgpu {
         ///
         /// Like `generate`, this appends to the session's live KV cache rather
         /// than resetting it, so consecutive calls continue one conversation.
+        ///
+        /// **Sampling is not free here, unlike on the CPU.** Greedy decoding
+        /// takes the argmax on the GPU and reads back four bytes; sampling has
+        /// to read the whole logits row back so the sampler can see it, which
+        /// is a vocab-sized transfer per token. The greedy path is kept for
+        /// exactly that reason, so a caller that does not ask for sampling
+        /// pays nothing for its availability.
         #[wasm_bindgen(js_name = generateTokens)]
         pub async fn generate_tokens(
             &mut self,
             tokens: Vec<u32>,
             max_tokens: u32,
+            temperature: Option<f32>,
+            top_p: Option<f32>,
+            top_k: Option<u32>,
+            seed: Option<u64>,
             on_token: &js_sys::Function,
         ) -> Result<String, JsError> {
-            self.generate_ids(tokens, max_tokens, on_token).await
+            self.generate_ids(
+                tokens,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                seed,
+                on_token,
+            )
+            .await
         }
 
-        /// Shared body of `generate` / `generateTokens`: prefill, greedy decode,
+        /// Shared body of `generate` / `generateTokens`: prefill, decode,
         /// UTF-8-safe streaming. Not exported; the two public entry points
         /// differ only in how `ids` is produced.
         async fn generate_ids(
             &mut self,
             ids: Vec<u32>,
             max_tokens: u32,
+            temperature: Option<f32>,
+            top_p: Option<f32>,
+            top_k: Option<u32>,
+            seed: Option<u64>,
             on_token: &js_sys::Function,
         ) -> Result<String, JsError> {
             if ids.is_empty() {
@@ -2390,11 +2425,41 @@ mod webgpu {
                 self.model.forward_prefill_step(tok, pos, &mut self.state);
                 pos += 1;
             }
-            let mut next = self
-                .model
-                .forward_greedy_async(*last, pos, &mut self.state)
-                .await
-                .map_err(map_err)?;
+
+            // Greedy stays on the GPU-argmax path, which reads back four bytes
+            // per token; sampling needs the whole logits row on the host, which
+            // is a vocab-sized readback per token. Deciding once, here, keeps a
+            // caller that did not ask for sampling on the cheap path.
+            //
+            // The rule matches `SamplerConfig`'s own definition of greedy, so
+            // this backend agrees with the CPU on what `temperature: 0` means
+            // rather than inventing a second threshold.
+            let defaults = cera::sampler::SamplerConfig::default();
+            let cfg = cera::sampler::SamplerConfig {
+                temperature: temperature.unwrap_or(defaults.temperature),
+                top_p: top_p.unwrap_or(defaults.top_p),
+                top_k: top_k.map(|k| k as usize).unwrap_or(defaults.top_k),
+                seed,
+                ..defaults
+            };
+            let mut sampler =
+                (cfg.temperature > 0.0 && cfg.top_k != 1).then(|| cera::sampler::Sampler::new(cfg));
+
+            let mut next = match sampler.as_mut() {
+                Some(s) => {
+                    let mut logits = self
+                        .model
+                        .forward_logits_async(*last, pos, &mut self.state)
+                        .await
+                        .map_err(map_err)?;
+                    s.sample(&mut logits)
+                }
+                None => self
+                    .model
+                    .forward_greedy_async(*last, pos, &mut self.state)
+                    .await
+                    .map_err(map_err)?,
+            };
             pos += 1;
 
             // Greedy decode loop. Stream raw bytes through a buffer and emit
@@ -2425,11 +2490,21 @@ mod webgpu {
                 if pos >= max_seq_len {
                     break;
                 }
-                next = self
-                    .model
-                    .forward_greedy_async(next, pos, &mut self.state)
-                    .await
-                    .map_err(map_err)?;
+                next = match sampler.as_mut() {
+                    Some(s) => {
+                        let mut logits = self
+                            .model
+                            .forward_logits_async(next, pos, &mut self.state)
+                            .await
+                            .map_err(map_err)?;
+                        s.sample(&mut logits)
+                    }
+                    None => self
+                        .model
+                        .forward_greedy_async(next, pos, &mut self.state)
+                        .await
+                        .map_err(map_err)?,
+                };
                 pos += 1;
             }
             // Flush any trailing bytes (an incomplete multi-byte char at the

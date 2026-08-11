@@ -3753,6 +3753,51 @@ impl GpuLfm2Model {
         Ok(out[0])
     }
 
+    /// Async (wasm/WebGPU) decode step returning the full logits row, for
+    /// callers that sample rather than take the argmax.
+    ///
+    /// [`Self::forward_greedy_async`]'s sibling, and the reason sampling can
+    /// work on this backend at all: that one reduces the step to a token id on
+    /// the GPU, so temperature, top-k and top-p have nothing left to act on by
+    /// the time anything reaches the host. This reads the row back instead and
+    /// lets the caller's [`crate::sampler::Sampler`] do the work, which keeps
+    /// one sampler implementation across every backend rather than growing a
+    /// second one in WGSL.
+    ///
+    /// Costs a vocab-sized readback per token where the greedy path costs four
+    /// bytes, so callers should keep using that one when the request is greedy
+    /// (`temperature <= 0` or `top_k == 1`). Same locking discipline as the
+    /// greedy path: compute under `infer_lock`, release before the `.await`.
+    pub async fn forward_logits_async(
+        &self,
+        token: u32,
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>> {
+        let vocab = self.config.vocab_size;
+        let pending = {
+            let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+            let _lora_guard = self.resolve_lora(state);
+            // Keep the KV-write slot in lockstep with the RoPE position.
+            self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
+            // `None`: the argmax would be computed and then ignored, and its
+            // staging copy is a second readback nothing reads.
+            self.forward_inner_compute_tail(&[token], pos, state, TailArgmax::None);
+
+            self.ctx.begin_download(
+                &self.logits_buf,
+                (vocab * std::mem::size_of::<f32>()) as u64,
+            )
+        };
+
+        let bytes = pending.recv().await?;
+        // Copy into an aligned Vec rather than casting the byte slice: the
+        // readback's buffer carries no f32 alignment guarantee.
+        let mut out = vec![0f32; vocab];
+        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
+        Ok(out)
+    }
+
     /// Adapter name and backend of the underlying [`GpuContext`], for
     /// surfacing which GPU/backend the model is actually running on (e.g. in
     /// the wasm `WebGpuSession.adapter` getter).

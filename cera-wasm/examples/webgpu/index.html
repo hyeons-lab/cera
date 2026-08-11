@@ -164,8 +164,11 @@
         const t0 = performance.now();
         let n = 0;
         try {
-          // onToken streams each decoded piece as the GPU produces it.
-          await session.generate(prompt, maxTokens, (piece) => {
+          // onToken streams each decoded piece as the GPU produces it. The
+          // four nulls are the sampling knobs; this page decodes greedily,
+          // which keeps it on the argmax-on-GPU path and so keeps the tok/s it
+          // reports comparable to what it reported before sampling existed.
+          await session.generate(prompt, maxTokens, 0, null, null, null, (piece) => {
             outEl.textContent += piece;
             n += 1;
           });

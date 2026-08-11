@@ -280,11 +280,11 @@ const OPS = {
    */
   async generate(req, post) {
     const { prompt, maxTokens } = req;
-    // Seeding is per SESSION in the wasm API, not per generate: `GenerateOpts`
-    // has no seed field and assigning one just creates a dead JS property.
-    // Honoring it therefore means rebuilding the session, which is only
-    // meaningful before anything has been fed, and is a no-op on the GPU path
-    // (its decode is greedy, so a seed changes nothing).
+    // Seeding is per SESSION in the CPU wasm API, not per generate:
+    // `GenerateOpts` has no seed field and assigning one just creates a dead JS
+    // property. Honoring it therefore means rebuilding the session, which is
+    // only meaningful before anything has been fed. The GPU path takes its seed
+    // as a `generateTokens` argument instead, so it needs none of this.
     if (req.seed != null && position() === 0 && cpu) {
       const config = new wasm.SessionConfig();
       config.seed = BigInt(req.seed);
@@ -301,7 +301,20 @@ const OPS = {
     if (gpu) {
       // Caller-framed: `generateTokens` prepends nothing, which is what makes
       // the BOS rule in `encodePrompt` the single place BOS is decided.
-      await gpu.session.generateTokens(ids, maxTokens, onToken);
+      //
+      // Sampling knobs pass straight through. `null` for any of them means the
+      // wasm side falls back to `SamplerConfig`'s default, which is the same
+      // thing omitting them from `GenerateOpts` does on the CPU path, so the
+      // two backends answer a bare `generate()` the same way.
+      await gpu.session.generateTokens(
+        ids,
+        maxTokens,
+        req.temperature ?? null,
+        req.topP ?? null,
+        req.topK ?? null,
+        req.seed != null ? BigInt(req.seed) : null,
+        onToken,
+      );
     } else {
       const tk = cpu.tokenizer;
       cpu.session.appendTokens(ids);
