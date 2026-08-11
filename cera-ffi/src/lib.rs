@@ -13,7 +13,9 @@
 //!   accessor. Constructors: [`CeraEngine::from_path`] for a local
 //!   GGUF, manifest, or directory; [`CeraEngine::from_bundle_id`]
 //!   for LeapBundles-style remote loading;
-//!   [`CeraEngine::from_bundle_id_async`] for the tokio-async variant.
+//!   [`CeraEngine::from_path_async`], [`CeraEngine::from_bytes_async`]
+//!   and [`CeraEngine::from_bundle_id_async`] for the tokio-async
+//!   variants, which move the load off the calling thread.
 //!   Tokenizer methods ([`CeraEngine::encode_text`],
 //!   [`CeraEngine::decode_tokens`],
 //!   [`CeraEngine::apply_chat_template`]) let foreign callers
@@ -810,6 +812,39 @@ impl CeraEngine {
         Ok(Arc::new(Self { inner }))
     }
 
+    /// Load a model from GGUF bytes already in memory.
+    ///
+    /// For callers with no filesystem to point [`CeraEngine::from_path`]
+    /// at: a browser, an encrypted blob decrypted in memory, an asset
+    /// read out of an archive. It is the one constructor a WebAssembly
+    /// build can also offer, so code written against it ports across.
+    ///
+    /// **Not a streaming API.** GGUF is random-access: tensor data is
+    /// addressed by offset and read throughout inference, so the whole
+    /// file has to be resident before the first token. You can download
+    /// over a stream, but you must accumulate it all before calling
+    /// this. There is no partial-model inference.
+    ///
+    /// **Prefer [`CeraEngine::from_path`] whenever a path exists.** That
+    /// route memory-maps the file, so tensor pages stay owned by the
+    /// kernel: shared between processes and evictable under pressure.
+    /// These bytes are committed resident memory for as long as the
+    /// engine lives, which on a phone is the difference between a model
+    /// the OS can page out and one that counts against your footprint.
+    /// To load from the network on a platform that has a filesystem,
+    /// stream to disk and use `from_path` (which is what [`BundleRepo`]
+    /// does), rather than buffering the model here.
+    ///
+    /// Text-only: the bytes are a bare GGUF with no accompanying
+    /// manifest, so there is nothing to point at a vision encoder or an
+    /// audio decoder. Multimodal models need `from_path` or
+    /// [`CeraEngine::from_bundle_id`]. `config.bundle_repo` is ignored.
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: Vec<u8>, config: EngineConfig) -> Result<Arc<Self>, FfiError> {
+        let inner = cera::CeraEngine::from_bytes(bytes, config.try_into()?)?;
+        Ok(Arc::new(Self { inner }))
+    }
+
     /// Load a model by LeapBundles ID + quantization selector, e.g.
     /// `from_bundle_id("LFM2-1.2B-GGUF", "Q4_0", config)`. Resolves
     /// to the matching `<bundle_id>/<quant>.json` manifest under
@@ -1326,8 +1361,8 @@ impl From<cera::GenerateSummary> for GenerateSummary {
 pub struct GenerateOutput {
     /// Generated token IDs, in order, not including any prompt
     /// tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-    /// Rust side or (once exposed) through a tokenizer handle on the
-    /// FFI side.
+    /// Rust side, or with [`CeraEngine::decode_tokens`] from any
+    /// foreign binding.
     pub tokens: Vec<u32>,
     pub summary: GenerateSummary,
 }
@@ -1992,11 +2027,12 @@ impl Drop for AsyncCancelGuard {
 
 /// Lighter-weight sibling of [`AsyncCancelGuard`] for `spawn_blocking`
 /// tasks that don't share mutable state with anything the caller can
-/// signal. Used by [`CeraEngine::from_bundle_id_async`]: the underlying
-/// `cera::CeraEngine::from_bundle_id` holds no cross-thread cancel flag
-/// and the `reqwest::blocking` download can't be cooperatively
-/// cancelled, so there's nothing like `Session::cancel` to call on
-/// drop. All we can do is abort the queued task before its closure
+/// signal. Used by all three async [`CeraEngine`] constructors, via
+/// `spawn_engine_build`: engine construction holds no cross-thread
+/// cancel flag, and neither the tokenizer build nor (for
+/// `from_bundle_id`) the `reqwest::blocking` download can be
+/// cooperatively cancelled, so there's nothing like `Session::cancel`
+/// to call on drop. All we can do is abort the queued task before its closure
 /// runs — `AbortHandle::abort` (taken from the task's `JoinHandle`
 /// via `JoinHandle::abort_handle()` so the guard doesn't fight the
 /// outer `.await` for ownership of the handle) on a queued
@@ -2112,6 +2148,35 @@ impl Session {
     }
 }
 
+/// Runs a blocking engine construction on tokio and wraps the result.
+///
+/// The three async constructors differ only in the call they make and the name
+/// in their join-error message; everything else (the `spawn_blocking`, the
+/// `AbortOnDrop` guard, the join-error mapping, the `Arc` wrap) is identical.
+/// Three copies of it is how families of near-identical methods start to
+/// diverge, so there is one.
+///
+/// Cancellation is the weak form the constructors document: dropping the
+/// returned future aborts the task only while it is still queued, because
+/// engine construction has no cooperative cancel point.
+async fn spawn_engine_build<F>(what: &str, build: F) -> Result<Arc<CeraEngine>, FfiError>
+where
+    F: FnOnce() -> Result<cera::CeraEngine, cera::CeraError> + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(move || build().map_err(FfiError::from));
+    let mut guard = AbortOnDrop {
+        abort: handle.abort_handle(),
+        armed: true,
+    };
+    let join_result = handle.await;
+    guard.armed = false;
+    join_result
+        .map_err(|e| FfiError::Backend {
+            detail: format!("{what} join error: {e}"),
+        })?
+        .map(|inner| Arc::new(CeraEngine { inner }))
+}
+
 // Async CeraEngine constructors (PR 11).
 #[uniffi::export(async_runtime = "tokio")]
 impl CeraEngine {
@@ -2152,21 +2217,61 @@ impl CeraEngine {
         // (e.g. 32-bit `u64 → usize` overflow on the context size)
         // fails fast without spawning a blocking task.
         let cera_config: cera::EngineConfig = config.try_into()?;
-        let handle = tokio::task::spawn_blocking(move || {
+        spawn_engine_build("from_bundle_id_async", move || {
             cera::CeraEngine::from_bundle_id(&bundle_id, &quant, cera_config)
-                .map_err(FfiError::from)
-        });
-        let mut guard = AbortOnDrop {
-            abort: handle.abort_handle(),
-            armed: true,
-        };
-        let join_result = handle.await;
-        guard.armed = false;
-        join_result
-            .map_err(|e| FfiError::Backend {
-                detail: format!("from_bundle_id_async join error: {e}"),
-            })?
-            .map(|inner| Arc::new(Self { inner }))
+        })
+        .await
+    }
+
+    /// Async variant of [`CeraEngine::from_path`]: moves the GGUF open,
+    /// tokenizer build, and KV allocation onto a tokio blocking worker.
+    ///
+    /// The sync twin is not cheap enough to call from a UI thread. GGUF
+    /// tensor data is memory-mapped rather than read, so the cost is not
+    /// proportional to file size, but the tokenizer is built eagerly and
+    /// a large vocabulary's merge table is real work: enough to drop
+    /// frames, and on a cold page cache the metadata reads are disk-bound
+    /// on top. Foreign UI code should prefer this everywhere.
+    ///
+    /// Cancellation is the weak form documented on
+    /// [`CeraEngine::from_bundle_id_async`]: dropping the future aborts
+    /// the task only while it is still queued. Engine construction has no
+    /// cooperative cancel point, so once started it runs to completion and
+    /// the result is dropped.
+    #[uniffi::constructor]
+    pub async fn from_path_async(
+        path: String,
+        config: EngineConfig,
+    ) -> Result<Arc<Self>, FfiError> {
+        // Convert the config synchronously so a bad one fails fast without
+        // spawning, exactly as `from_bundle_id_async` does.
+        let cera_config: cera::EngineConfig = config.try_into()?;
+        spawn_engine_build("from_path_async", move || {
+            cera::CeraEngine::from_path(&path, cera_config)
+        })
+        .await
+    }
+
+    /// Async variant of [`CeraEngine::from_bytes`]: the in-memory twin of
+    /// [`CeraEngine::from_path_async`], for callers with no filesystem.
+    ///
+    /// This one benefits more than the path variant: `from_bytes` has no
+    /// mmap to lean on, so every tensor is already resident and the whole
+    /// parse plus tokenizer build happens inline. Same weak cancellation.
+    ///
+    /// The `bytes` are moved into the blocking task, so a dropped future
+    /// releases them when the task finishes rather than when it is
+    /// dropped.
+    #[uniffi::constructor]
+    pub async fn from_bytes_async(
+        bytes: Vec<u8>,
+        config: EngineConfig,
+    ) -> Result<Arc<Self>, FfiError> {
+        let cera_config: cera::EngineConfig = config.try_into()?;
+        spawn_engine_build("from_bytes_async", move || {
+            cera::CeraEngine::from_bytes(bytes, cera_config)
+        })
+        .await
     }
 }
 

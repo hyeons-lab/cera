@@ -460,6 +460,37 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc -p cera-wasm --features wgpu --no-deps --lib --target wasm32-unknown-unknown
 
+  wasm-simd-kernels:
+    # The `simd128` kernels in `cera/src/backend/simd.rs` are the only reason
+    # browsers are not on the scalar path, and NOTHING else in CI executes
+    # them: every other job either builds wasm32 without running it, or runs
+    # tests on the host, where a wasm SIMD instruction cannot execute. A
+    # host-only suite is green whether or not these kernels are correct.
+    #
+    # Each test is an oracle against the scalar reference in `crate::quant` —
+    # the code wasm32 fell through to before the kernels existed — so "matches
+    # scalar" is exactly the property that makes enabling them safe.
+    name: Wasm SIMD Kernels
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.14.0
+      - uses: extractions/setup-just@v4
+      - name: Run the simd128 kernel oracle tests under Node
+        # `+simd128` comes from `.cargo/config.toml`; do not set RUSTFLAGS here,
+        # which would REPLACE that rather than append and silently test the
+        # scalar path instead.
+        run: just wasm-simd-test
+
   cera-wasm-pack:
     # Multi-target wasm-pack build. Each matrix entry produces one
     # consumer shape:
@@ -726,9 +757,10 @@ jobs:
 
   ffi-bindings-drift:
     # Verifies the committed Kotlin + Swift bindings under
-    # cera-ffi/bindings/ stay in sync with the Rust `#[uniffi::*]`
-    # surface. Regenerates via `uniffi-bindgen` (the in-repo binary
-    # target) against the freshly-built debug dylib and fails if
+    # cera-ffi/bindings/, and the SwiftPM wrapper copy under
+    # cera-ffi/apple/Sources/Cera/, stay in sync with the Rust
+    # `#[uniffi::*]` surface. Regenerates via `uniffi-bindgen` (the in-repo
+    # binary target) against the freshly-built debug dylib and fails if
     # `git diff` shows changes — signalling someone touched the FFI
     # exports without running `just bindings` and committing the result.
     #
@@ -767,29 +799,281 @@ jobs:
           chmod +x /tmp/ktlint
           sudo mv /tmp/ktlint /usr/local/bin/ktlint
           ktlint --version
-      - name: Build cera-ffi (cdylib for bindgen)
-        run: cargo build -p cera-ffi
-      - name: Regenerate bindings
-        # `--features bindgen` opts into the crate's `bindgen` feature,
-        # which lights up `uniffi/cli`. Library consumers never pay for
-        # this feature; only the binary target needs it.
+      - uses: extractions/setup-just@v4
+      - name: Regenerate bindings and diff
+        # `just bindings-check` rather than a copy of its commands. This job
+        # used to inline them, and the copy was already incomplete: it never
+        # wrote the committed SwiftPM wrapper at cera-ffi/apple/, which drifted
+        # ~800 lines behind the Rust surface unnoticed. Calling the recipe means
+        # the local and CI definitions cannot disagree again.
+        run: just bindings-check
+
+  dart-bindings-drift:
+    # Same idea as ffi-bindings-drift, for the committed Dart bindings under
+    # cera_ffi/lib/src/generated/.
+    #
+    # This job exists because its absence already cost us: the Dart bindings
+    # silently fell ~3 weeks behind the Rust FFI surface (missing three
+    # `GenerateOpts` fields and `encode_text_special`), and since UniFFI
+    # checksums every method at construction, the package could not even open
+    # the library. `just dart-bindings-check` existed the whole time; nothing
+    # ran it.
+    #
+    # Unlike the Kotlin/Swift job this also analyzes and tests the package,
+    # because the generated Dart is the shipped artifact rather than an input
+    # to another compiler.
+    name: Dart Bindings Drift
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+      - uses: Swatinem/rust-cache@v2
+      # Flutter, not `dart-lang/setup-dart`, because the recipe checks BOTH
+      # packages: `cera_ffi` with plain `dart` (proving it still resolves
+      # without Flutter, which is the reason it exists) and `cera_ffi_flutter`
+      # with `flutter`, which it cannot avoid needing. Flutter ships a Dart SDK,
+      # so one install covers both; the `sdk: ^3.3.0` floor is satisfied by any
+      # current stable Flutter.
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - uses: extractions/setup-just@v4
+
+      - name: Regenerate, diff, and analyze
+        # Runs the recipe instead of a copy of it. The steps here used to be
+        # inlined "to avoid installing just", and promptly drifted: the recipe
+        # moved to `flutter pub get`/`flutter analyze` while this job kept
+        # calling `dart`, and the job failed on a package it had itself
+        # declared healthy the previous week.
+        #
+        # The recipe builds cera-ffi with `--features ffi-buffer` (the Dart
+        # generator emits calls to `uniffi_ffibuffer_*` trampolines, which
+        # UniFFI exports only under that feature; Kotlin and Swift use the
+        # standard symbols), regenerates + patches the bindings in place, fails
+        # on any diff against what is committed, and analyzes both packages.
+        run: just dart-bindings-check
+
+      - name: Assert no method is stubbed out
+        # A regression in the generator's return-type handling shows up as a
+        # `throw UnsupportedError` in place of a real body, which `dart analyze`
+        # is perfectly happy with. Every method now has a real implementation,
+        # so any hit here means one silently stopped working.
         run: |
-          cargo run -q -p cera-ffi --bin uniffi-bindgen --features bindgen -- generate \
-            --library target/debug/libcera_ffi.so \
-            --language kotlin \
-            --out-dir cera-ffi/bindings/kotlin
-          cargo run -q -p cera-ffi --bin uniffi-bindgen --features bindgen -- generate \
-            --library target/debug/libcera_ffi.so \
-            --language swift \
-            --out-dir cera-ffi/bindings/swift
-      - name: Diff committed bindings
-        run: |
-          if [ -n "$(git status --porcelain cera-ffi/bindings)" ]; then
-            echo "::error::Vendored bindings under cera-ffi/bindings/ are out of date."
-            echo "Run 'just bindings' locally and commit the resulting diff."
-            git --no-pager diff cera-ffi/bindings
+          cd cera_ffi
+          unexpected=$(grep -n "not implemented yet" lib/src/generated/cera_ffi.dart || true)
+          if [ -n "${unexpected}" ]; then
+            echo "::error::Generated bindings contain unexpected runtime stubs:"
+            echo "${unexpected}"
             exit 1
           fi
+
+      # Analysis happens inside `just dart-bindings-check` above, which has also
+      # already resolved the package.
+      - name: Test
+        run: cd cera_ffi && dart test
+
+      - name: Web build (the web implementation compiles for a browser)
+        # The one check that cannot be done from the VM. Two separate things
+        # only a browser build can prove:
+        #
+        # 1. `Cera`'s web implementation compiles. It is real code (dart:js_interop
+        #    extension types, a Worker, transferable buffers) that no VM test
+        #    ever loads, so `dart analyze` passing is not the same as it
+        #    compiling. dart2js is what type-checks the interop.
+        # 2. The generated stub still carries the full binding surface (below).
+        #
+        # A dart:ffi import anywhere on the graph fails the entire build, so this
+        # catches the stub falling behind the bindings — a member added to one and
+        # not the other — which no VM test can see. `dart test` covers the other
+        # half, that the stub's entry points throw.
+        #
+        # Built here rather than in its own job to reuse this one's Flutter
+        # install: a separate runner would cost more than the step does.
+        #
+        # It depends on `cera_ffi_flutter`, not `cera_ffi`, because that is what
+        # an app depends on, and the re-export is part of what has to compile.
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          flutter create --platforms web -t app "$WORK/probe" >/dev/null
+          cd "$WORK/probe"
+          # Overrides first: `pub add` resolves immediately, and the plugin's pin
+          # on `cera_ffi` is a version that need not exist on pub.dev yet.
+          cat > pubspec_overrides.yaml <<EOF
+          dependency_overrides:
+            cera_ffi:
+              path: ${GITHUB_WORKSPACE}/cera_ffi
+          EOF
+          flutter pub add cera_ffi_flutter --path "${GITHUB_WORKSPACE}/cera_ffi_flutter" >/dev/null
+          cat > lib/main.dart <<'EOF'
+          import 'dart:async';
+          import 'dart:typed_data';
+
+          import 'package:flutter/material.dart';
+          import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+
+          // Touches a data type, a top-level function, an object constructor and
+          // the loader. Referencing them is the point: dart2js only reports a
+          // missing name if something names it. The same goes for every `Cera`
+          // member below: an uncalled method is a method dart2js never checks.
+          Future<void> exerciseCera() async {
+            debugPrint('supportsPaths=${Cera.supportsPaths}');
+            try {
+              await Cera.openPath('model.gguf');
+            } on UnsupportedError catch (e) {
+              debugPrint('expected on web: ${e.message}');
+            }
+            // Never reached (no worker is served here), but it has to compile.
+            if (DateTime.now().year < 2000) {
+              final cera = await Cera.openBytes(
+                Uint8List(0),
+                options: const CeraOptions(
+                  contextSize: 512,
+                  backend: CeraBackend.gpu,
+                  web: CeraWebAssets(workerUrl: 'w.js', moduleUrl: 'm.js'),
+                ),
+              );
+              debugPrint(cera.backend);
+              await for (final piece in cera.generate('hi', maxTokens: 1)) {
+                debugPrint(piece);
+              }
+              debugPrint(await cera.applyChatTemplate([const CeraMessage.user('hi')]));
+              debugPrint('${await cera.encode('hi')}');
+              debugPrint(await cera.decode(const [1]));
+              await cera.reset();
+              await cera.cancel();
+              await cera.close();
+            }
+          }
+
+          void main() {
+            const config = EngineConfig(
+              contextSize: 2048,
+              backend: BackendPreference.cpu,
+              bundleRepo: null,
+            );
+            debugPrint('${config.contextSize} ${CeraLibrary.pathEnvVar}');
+            try {
+              debugPrint(ceraFfiVersion());
+              CeraEngine.fromPath('model.gguf', config);
+            } on UnsupportedError catch (e) {
+              debugPrint('expected on web: ${e.message}');
+            }
+            unawaited(exerciseCera());
+            runApp(const MaterialApp(home: Scaffold(body: Text('ok'))));
+          }
+          EOF
+          flutter build web
+          test -f build/web/main.dart.js
+          echo "web build OK: Cera's web impl compiles and the stub carries the full API surface"
+
+      - name: install_web puts the runtime where the defaults look for it
+        # `Cera`'s web defaults point at `web/cera/`, and the tool is what puts
+        # anything there. A default that names a path nothing writes is a
+        # broken-out-of-the-box package, and the failure would surface as a
+        # worker that never loads.
+        #
+        # The wasm pair is faked rather than built: this asserts the tool's
+        # placement and naming contract, and building cera-wasm here to check a
+        # file copy would cost minutes. The real artifacts are exercised by the
+        # wasm jobs.
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          mkdir -p "$WORK/fake" "$WORK/app"
+          : > "$WORK/fake/cera_wasm.js"
+          : > "$WORK/fake/cera_wasm_bg.wasm"
+          cd "$WORK/app"
+          cat > pubspec.yaml <<EOF
+          name: install_web_probe
+          publish_to: none
+          environment: {sdk: ^3.3.0}
+          dependencies:
+            cera_ffi: {path: ${GITHUB_WORKSPACE}/cera_ffi}
+          EOF
+          dart pub get >/dev/null
+          dart run cera_ffi:install_web --from "$WORK/fake"
+          for f in cera_worker.js cera_wasm.js cera_wasm_bg.wasm; do
+            test -f "web/cera/$f" || { echo "install_web did not write web/cera/$f"; exit 1; }
+          done
+          # Non-empty, i.e. the worker really came from the package rather than
+          # from the same `: >` that made the fakes.
+          test -s web/cera/cera_worker.js
+          echo "install_web OK"
+
+      - name: Generator unit tests
+        run: cargo test --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml
+
+  flutter-desktop-build:
+    # Builds the Flutter example app for the desktop platforms, which is the
+    # only way their plugin wiring gets exercised at all: Linux and Windows go
+    # through CMakeLists that Flutter's own build drives, and nothing else in
+    # CI runs them.
+    #
+    # It uses the plugin's local-library override rather than the release
+    # download on purpose. Two reasons: a PR must not depend on a published
+    # release existing, and this way the job tests the CMake wiring against the
+    # library built from *this* commit instead of whatever last shipped.
+    #
+    # The library is built with `--features ffi-buffer` and then asserted,
+    # because omitting it produces a plugin that builds and bundles perfectly
+    # and fails at the first Dart call. That shipped to every platform once.
+    name: Flutter Desktop Build
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  platform: linux,   lib: libcera_ffi.so, dest: cera_ffi_flutter/linux }
+          - { os: windows-latest, platform: windows, lib: cera_ffi.dll,   dest: cera_ffi_flutter/windows }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+      - uses: Swatinem/rust-cache@v2
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Linux desktop build deps
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+
+      - name: Build cera-ffi and stage it as the plugin's local library
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p cera-ffi --release --features ffi-buffer
+          cp "target/release/${{ matrix.lib }}" "${{ matrix.dest }}/${{ matrix.lib }}"
+          scripts/assert-ffibuffer.sh "${{ matrix.dest }}/${{ matrix.lib }}"
+
+      - name: Build the example app
+        shell: bash
+        run: cd cera_ffi_flutter/example && flutter pub get && flutter build ${{ matrix.platform }} --debug
+
+      - name: Assert the library was bundled with the app
+        # Flutter copies whatever the plugin lists in
+        # `<plugin>_bundled_libraries` next to the executable; that placement is
+        # what makes the bare-name `DynamicLibrary.open` in library_loader_io
+        # resolve at runtime. If the CMake contract breaks, the app still builds
+        # and only fails when a user runs it.
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=$(find cera_ffi_flutter/example/build -name "${{ matrix.lib }}" | head -1)
+          if [ -z "$found" ]; then
+            echo "::error::${{ matrix.lib }} was not bundled with the built app"
+            exit 1
+          fi
+          echo "bundled at: $found"
+          scripts/assert-ffibuffer.sh "$found"
 
   android-abis:
     # Cross-compiles `cera-ffi` to every Android ABI supported by the
@@ -984,38 +1268,18 @@ jobs:
             echo "::error::expected arm64 host for arm64-only cross-compile, got '$ARCH' — pin runs-on to an Apple Silicon label" >&2
             exit 1
           fi
+      - uses: extractions/setup-just@v4
       - name: Build XCFramework
-        # Mirrors `just apple-xcframework` exactly. Inlined because the
-        # CI runner doesn't have `just` installed by default and
-        # adding a setup-just step for a single-recipe job would be
-        # more weight than the recipe itself.
-        # Metal-enabled slices (`--features metal`): the Metal backend is
-        # iOS-portable (Shared storage + system_default device) and
-        # becomes the Auto-preferred GPU backend on every slice, with CPU
-        # fallback. The `Cera` SwiftPM target links Metal.framework +
-        # Foundation (Package.swift `linkerSettings`).
+        # Runs the recipe rather than a copy of it. This step used to be
+        # inlined, with a comment claiming it mirrored the recipe exactly;
+        # it did not. It had drifted to static `-library` slices, the old
+        # pre-`ffi_module_name` header names, and no `ffi-buffer` feature,
+        # so it verified an XCFramework that no longer resembled the one
+        # `just apple-xcframework` (and the release) produces. Installing
+        # `just` is cheaper than that class of silent divergence.
         #
-        # Deployment-target env pins the slices to Package.swift's
-        # `.macOS(.v12)` / `.iOS(.v15)` so a newer runner SDK doesn't
-        # stamp a higher `minos` (which warns at consumer link time).
-        env:
-          MACOSX_DEPLOYMENT_TARGET: "12.0"
-          IPHONEOS_DEPLOYMENT_TARGET: "15.0"
-        run: |
-          set -euo pipefail
-          cargo build -p cera-ffi --target aarch64-apple-ios --release --features metal
-          cargo build -p cera-ffi --target aarch64-apple-ios-sim --release --features metal
-          cargo build -p cera-ffi --target aarch64-apple-darwin --release --features metal
-          OUT=target/xcframework-build
-          rm -rf "$OUT"
-          mkdir -p "$OUT/headers"
-          cp cera-ffi/bindings/swift/cera_ffiFFI.h "$OUT/headers/"
-          cp cera-ffi/bindings/swift/cera_ffiFFI.modulemap "$OUT/headers/module.modulemap"
-          xcodebuild -create-xcframework \
-              -library target/aarch64-apple-ios/release/libcera_ffi.a -headers "$OUT/headers" \
-              -library target/aarch64-apple-ios-sim/release/libcera_ffi.a -headers "$OUT/headers" \
-              -library target/aarch64-apple-darwin/release/libcera_ffi.a -headers "$OUT/headers" \
-              -output "$OUT/CeraFFI.xcframework"
+        # Deployment targets, Metal, and ffi-buffer all live in the recipe.
+        run: just apple-xcframework
       - name: Log XCFramework size
         # Logs the per-slice + total size so a future regression where
         # debuginfo slips back in (or a heavyweight dep accidentally
@@ -1036,7 +1300,7 @@ jobs:
           set -euo pipefail
           XCF=target/xcframework-build/CeraFFI.xcframework
           du -sh "$XCF"
-          du -sh "$XCF"/*/libcera_ffi*.a
+          du -sh "$XCF"/*/CeraFFI.framework
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
           {
             echo "## Apple XCFramework artifact"
@@ -1045,7 +1309,7 @@ jobs:
             echo
             echo '```'
             du -sh "$XCF"
-            du -sh "$XCF"/*/libcera_ffi*.a
+            du -sh "$XCF"/*/CeraFFI.framework
             echo '```'
             echo
             echo "Slices: \`ios-arm64\` + \`ios-arm64-simulator\` + \`macos-arm64\` (no x86_64 — Apple Silicon-only)."
@@ -1070,15 +1334,16 @@ jobs:
         # mode for UniFFI 0.31.
         #
         # `-import-objc-header` exposes the C declarations from
-        # `cera_ffiFFI.h` without needing a separate module map +
-        # SPM ceremony for a single-binary test. Foundation auto-
-        # links on Apple platforms.
+        # `CeraFFI.h` without needing a separate module map + SPM
+        # ceremony for a single-binary test. Foundation auto-links on
+        # Apple platforms. The header is named after `ffi_module_name`
+        # in cera-ffi/uniffi.toml; change it there and this follows.
         run: |
           set -euo pipefail
           swiftc \
               cera-ffi/tests/swift/main.swift \
               cera-ffi/bindings/swift/cera_ffi.swift \
-              -import-objc-header cera-ffi/bindings/swift/cera_ffiFFI.h \
+              -import-objc-header cera-ffi/bindings/swift/CeraFFI.h \
               -L target/aarch64-apple-darwin/release \
               -lcera_ffi \
               -framework Metal \
@@ -1442,7 +1707,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: cera-parity/legs/swift/.build
-          key: cera-parity-swift-spm-${{ hashFiles('cera-parity/legs/swift/Package.swift', 'cera-ffi/bindings/swift/cera_ffi.swift', 'cera-ffi/bindings/swift/cera_ffiFFI.h') }}
+          key: cera-parity-swift-spm-${{ hashFiles('cera-parity/legs/swift/Package.swift', 'cera-ffi/bindings/swift/cera_ffi.swift', 'cera-ffi/bindings/swift/CeraFFI.h') }}
       # The Swift leg links against `libcera_ffi.dylib` at build time.
       # The binary records an absolute install_name pointing at the
       # cdylib's build-time location under `target/release/` in this

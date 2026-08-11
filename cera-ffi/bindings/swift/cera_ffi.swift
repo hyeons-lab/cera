@@ -7,8 +7,8 @@ import Foundation
 // Depending on the consumer's build setup, the low-level FFI code
 // might be in a separate module, or it might be compiled inline into
 // this module. This is a bit of light hackery to work with both.
-#if canImport(cera_ffiFFI)
-import cera_ffiFFI
+#if canImport(CeraFFI)
+import CeraFFI
 #endif
 
 fileprivate extension RustBuffer {
@@ -1128,6 +1128,71 @@ public static func fromBundleIdAsync(bundleId: String, quant: String, config: En
 }
     
     /**
+     * Load a model from GGUF bytes already in memory.
+     *
+     * For callers with no filesystem to point [`CeraEngine::from_path`]
+     * at: a browser, an encrypted blob decrypted in memory, an asset
+     * read out of an archive. It is the one constructor a WebAssembly
+     * build can also offer, so code written against it ports across.
+     *
+     * **Not a streaming API.** GGUF is random-access: tensor data is
+     * addressed by offset and read throughout inference, so the whole
+     * file has to be resident before the first token. You can download
+     * over a stream, but you must accumulate it all before calling
+     * this. There is no partial-model inference.
+     *
+     * **Prefer [`CeraEngine::from_path`] whenever a path exists.** That
+     * route memory-maps the file, so tensor pages stay owned by the
+     * kernel: shared between processes and evictable under pressure.
+     * These bytes are committed resident memory for as long as the
+     * engine lives, which on a phone is the difference between a model
+     * the OS can page out and one that counts against your footprint.
+     * To load from the network on a platform that has a filesystem,
+     * stream to disk and use `from_path` (which is what [`BundleRepo`]
+     * does), rather than buffering the model here.
+     *
+     * Text-only: the bytes are a bare GGUF with no accompanying
+     * manifest, so there is nothing to point at a vision encoder or an
+     * audio decoder. Multimodal models need `from_path` or
+     * [`CeraEngine::from_bundle_id`]. `config.bundle_repo` is ignored.
+     */
+public static func fromBytes(bytes: Data, config: EngineConfig)throws  -> CeraEngine  {
+    return try  FfiConverterTypeCeraEngine_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes(
+        FfiConverterData.lower(bytes),
+        FfiConverterTypeEngineConfig_lower(config),$0
+    )
+})
+}
+    
+    /**
+     * Async variant of [`CeraEngine::from_bytes`]: the in-memory twin of
+     * [`CeraEngine::from_path_async`], for callers with no filesystem.
+     *
+     * This one benefits more than the path variant: `from_bytes` has no
+     * mmap to lean on, so every tensor is already resident and the whole
+     * parse plus tokenizer build happens inline. Same weak cancellation.
+     *
+     * The `bytes` are moved into the blocking task, so a dropped future
+     * releases them when the task finishes rather than when it is
+     * dropped.
+     */
+public static func fromBytesAsync(bytes: Data, config: EngineConfig)async throws  -> CeraEngine  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes_async(FfiConverterData.lower(bytes),FfiConverterTypeEngineConfig_lower(config)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_u64,
+            completeFunc: ffi_cera_ffi_rust_future_complete_u64,
+            freeFunc: ffi_cera_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterTypeCeraEngine_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
      * Load a model from a local filesystem path. Accepts the same
      * inputs as the native [`cera::CeraEngine::from_path`]: a bare
      * `.gguf`, a LeapBundles `.json` manifest, or a directory
@@ -1145,6 +1210,38 @@ public static func fromPath(path: String, config: EngineConfig)throws  -> CeraEn
         FfiConverterTypeEngineConfig_lower(config),$0
     )
 })
+}
+    
+    /**
+     * Async variant of [`CeraEngine::from_path`]: moves the GGUF open,
+     * tokenizer build, and KV allocation onto a tokio blocking worker.
+     *
+     * The sync twin is not cheap enough to call from a UI thread. GGUF
+     * tensor data is memory-mapped rather than read, so the cost is not
+     * proportional to file size, but the tokenizer is built eagerly and
+     * a large vocabulary's merge table is real work: enough to drop
+     * frames, and on a cold page cache the metadata reads are disk-bound
+     * on top. Foreign UI code should prefer this everywhere.
+     *
+     * Cancellation is the weak form documented on
+     * [`CeraEngine::from_bundle_id_async`]: dropping the future aborts
+     * the task only while it is still queued. Engine construction has no
+     * cooperative cancel point, so once started it runs to completion and
+     * the result is dropped.
+     */
+public static func fromPathAsync(path: String, config: EngineConfig)async throws  -> CeraEngine  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_constructor_ceraengine_from_path_async(FfiConverterString.lower(path),FfiConverterTypeEngineConfig_lower(config)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_u64,
+            completeFunc: ffi_cera_ffi_rust_future_complete_u64,
+            freeFunc: ffi_cera_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterTypeCeraEngine_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
 }
     
 
@@ -3537,8 +3634,8 @@ public struct GenerateOutput: Equatable, Hashable {
     /**
      * Generated token IDs, in order, not including any prompt
      * tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-     * Rust side or (once exposed) through a tokenizer handle on the
-     * FFI side.
+     * Rust side, or with [`CeraEngine::decode_tokens`] from any
+     * foreign binding.
      */
     public var tokens: [UInt32]
     public var summary: GenerateSummary
@@ -3549,8 +3646,8 @@ public struct GenerateOutput: Equatable, Hashable {
         /**
          * Generated token IDs, in order, not including any prompt
          * tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-         * Rust side or (once exposed) through a tokenizer handle on the
-         * FFI side.
+         * Rust side, or with [`CeraEngine::decode_tokens`] from any
+         * foreign binding.
          */tokens: [UInt32], summary: GenerateSummary) {
         self.tokens = tokens
         self.summary = summary
@@ -5376,7 +5473,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 14088) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes() != 45873) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async() != 8065) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 64420) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async() != 48795) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() != 57598) {

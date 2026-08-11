@@ -9114,6 +9114,262 @@ pub(crate) mod avx512_vnni {
     }
 }
 
+// ── wasm32 SIMD (simd128) ───────────────────────────────────────────────────
+
+/// wasm32 `simd128` `vec_dot` kernels for the quantized dtypes.
+///
+/// Browsers run the same engine as everything else, and until these existed
+/// wasm32 fell through the dispatch below to `crate::quant::vec_dot_*_scalar`.
+/// Measured in Chrome on an M1 Max, that scalar path decodes an
+/// LFM2.5-350M-Q4_0 at 0.68 tok/s against 160 tok/s for the native NEON build.
+///
+/// `-C target-feature=+simd128` alone does not close that: LLVM will not
+/// autovectorize the nibble unpacking these formats need, and enabling it
+/// without these kernels measured +5%.
+///
+/// Two differences from the NEON and AVX2 modules are worth knowing before
+/// editing:
+///
+/// * **There is no FMA.** wasm SIMD has no fused multiply-add, so every
+///   accumulation is a separate `f32x4_mul` + `f32x4_add`. Do not "simplify"
+///   one into an FMA that the target cannot encode.
+/// * **There is one tier.** `simd128` is the only wasm SIMD feature, so unlike
+///   `neon < dotprod < i8mm` there is nothing to runtime-dispatch between.
+///   Every browser and Node release since 2021 has it, and the caller gates on
+///   the `simd128` target feature at compile time rather than on
+///   `cpu_features()`.
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod wasm_simd {
+    use super::*;
+    use core::arch::wasm32::*;
+
+    /// Horizontal sum of an `f32x4` accumulator.
+    #[inline]
+    #[target_feature(enable = "simd128")]
+    fn hsum_f32x4(v: v128) -> f32 {
+        f32x4_extract_lane::<0>(v)
+            + f32x4_extract_lane::<1>(v)
+            + f32x4_extract_lane::<2>(v)
+            + f32x4_extract_lane::<3>(v)
+    }
+
+    /// Widen the low four `u8` lanes of `v` to `f32x4`, minus `bias`.
+    ///
+    /// The two-step `u8 -> u16 -> u32` widening is required: wasm SIMD has no
+    /// direct `u8x16 -> u32x4` extend.
+    #[inline]
+    #[target_feature(enable = "simd128")]
+    fn u8_lanes_to_f32(u16s: v128, high: bool, bias: v128) -> v128 {
+        let u32s = if high {
+            u32x4_extend_high_u16x8(u16s)
+        } else {
+            u32x4_extend_low_u16x8(u16s)
+        };
+        f32x4_sub(f32x4_convert_u32x4(u32s), bias)
+    }
+
+    /// simd128 Q4_0 dot product with an f32 vector.
+    ///
+    /// Q4_0 packs 32 quants into 16 bytes, low nibble of byte `i` pairing with
+    /// `y[i]` and high nibble with `y[i + 16]`. Both halves are therefore
+    /// contiguous in `y`, which is what makes this a straight eight-way
+    /// multiply-accumulate with no shuffling.
+    #[target_feature(enable = "simd128")]
+    pub fn vec_dot_q4_0_f32_simd128(block: &BlockQ4_0, y: &[f32]) -> f32 {
+        debug_assert_eq!(y.len(), 32);
+        let d = crate::quant::f16_to_f32(block.d);
+        let bias = f32x4_splat(8.0);
+
+        // SAFETY: `qs` is 16 bytes and `v128_load` reads exactly 16; `y` is
+        // asserted to be 32 f32 and the largest offset read below is 28..32.
+        let (qs, y_ptr) = unsafe {
+            (
+                v128_load(block.qs.as_ptr().cast::<v128>()),
+                y.as_ptr().cast::<v128>(),
+            )
+        };
+
+        let lo = v128_and(qs, u8x16_splat(0x0F));
+        let hi = u8x16_shr(qs, 4);
+
+        let mut acc = f32x4_splat(0.0);
+        for (half, base) in [(lo, 0usize), (hi, 4usize)] {
+            let w_lo = u16x8_extend_low_u8x16(half);
+            let w_hi = u16x8_extend_high_u8x16(half);
+            for (chunk, (src, high)) in [(w_lo, false), (w_lo, true), (w_hi, false), (w_hi, true)]
+                .into_iter()
+                .enumerate()
+            {
+                let q = u8_lanes_to_f32(src, high, bias);
+                // SAFETY: `base + chunk` is at most 7, and reading v128 lane
+                // `7` of `y` covers f32 indices 28..32, the last of 32.
+                let yv = unsafe { v128_load(y_ptr.add(base + chunk)) };
+                acc = f32x4_add(acc, f32x4_mul(q, yv));
+            }
+        }
+
+        d * hsum_f32x4(acc)
+    }
+
+    /// simd128 Q8_0 dot product with an f32 vector.
+    ///
+    /// Q8_0 is 32 signed bytes, one per `y` element in order, so this is a
+    /// plain sign-extending widen with no nibble work.
+    #[target_feature(enable = "simd128")]
+    pub fn vec_dot_q8_0_f32_simd128(block: &BlockQ8_0, y: &[f32]) -> f32 {
+        debug_assert_eq!(y.len(), 32);
+        let d = crate::quant::f16_to_f32(block.delta);
+
+        let mut acc = f32x4_splat(0.0);
+        for half in 0..2usize {
+            // SAFETY: `quants` is 32 i8; `half` is 0 or 1 so this reads bytes
+            // 0..16 then 16..32. `y` is 32 f32 and lane `half * 4 + 3` covers
+            // f32 indices 28..32 at most.
+            let (qs, y_ptr) = unsafe {
+                (
+                    v128_load(block.quants.as_ptr().add(half * 16).cast::<v128>()),
+                    y.as_ptr().cast::<v128>(),
+                )
+            };
+            let w = [i16x8_extend_low_i8x16(qs), i16x8_extend_high_i8x16(qs)];
+            for (chunk, (src, high)) in [(w[0], false), (w[0], true), (w[1], false), (w[1], true)]
+                .into_iter()
+                .enumerate()
+            {
+                let i32s = if high {
+                    i32x4_extend_high_i16x8(src)
+                } else {
+                    i32x4_extend_low_i16x8(src)
+                };
+                let q = f32x4_convert_i32x4(i32s);
+                // SAFETY: see the load above.
+                let yv = unsafe { v128_load(y_ptr.add(half * 4 + chunk)) };
+                acc = f32x4_add(acc, f32x4_mul(q, yv));
+            }
+        }
+
+        d * hsum_f32x4(acc)
+    }
+
+    // ── Tests ───────────────────────────────────────────────────────────────
+    //
+    // These execute only under a wasm runner (`just wasm-simd-test`), which is
+    // the whole point: a `cargo test` on the host cannot run a simd128
+    // instruction, so a host-only suite would report green while never
+    // touching this module. Every case is an oracle against the scalar
+    // reference in `crate::quant`, which is the same code wasm32 used to fall
+    // through to, so "matches scalar" is exactly the property that makes
+    // turning these kernels on safe.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use wasm_bindgen_test::wasm_bindgen_test;
+
+        /// Deterministic pseudo-random bytes; no `rand` dependency on wasm.
+        fn lcg_bytes(seed: u32, n: usize) -> Vec<u8> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (s >> 24) as u8
+                })
+                .collect()
+        }
+
+        /// Deterministic pseudo-random f32 activations in roughly [-2, 2].
+        fn lcg_f32(seed: u32, n: usize) -> Vec<f32> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((s >> 8) as f32 / (1 << 23) as f32) - 1.0
+                })
+                .collect()
+        }
+
+        /// The two kernels reassociate the sum differently from the scalar
+        /// loop, so exact equality is the wrong bar. This is a relative
+        /// tolerance against the magnitude of the inputs rather than of the
+        /// result, because cancellation can make a correct result tiny and a
+        /// result-relative check vacuous there.
+        fn assert_close(got: f32, want: f32, scale: f32, what: &str) {
+            let tol = 1e-4 * scale.max(1.0);
+            assert!(
+                (got - want).abs() <= tol,
+                "{what}: simd128 {got} vs scalar {want} (tol {tol})"
+            );
+        }
+
+        #[wasm_bindgen_test]
+        fn q4_0_matches_scalar() {
+            for seed in 0..64u32 {
+                let qs_bytes = lcg_bytes(seed, 16);
+                let mut qs = [0u8; 16];
+                qs.copy_from_slice(&qs_bytes);
+                // Exercise a real spread of f16 scales, including negative.
+                let d = if seed % 2 == 0 { 0x3C00 } else { 0xB800 };
+                let block = BlockQ4_0 { d, qs };
+                let y = lcg_f32(seed.wrapping_add(9_001), 32);
+
+                let got = vec_dot_q4_0_f32_simd128(&block, &y);
+                let want = crate::quant::vec_dot_q4_0_f32_scalar(&block, &y);
+                assert_close(got, want, 32.0 * 8.0, "q4_0");
+            }
+        }
+
+        #[wasm_bindgen_test]
+        fn q8_0_matches_scalar() {
+            for seed in 0..64u32 {
+                let raw = lcg_bytes(seed, 32);
+                let mut quants = [0i8; 32];
+                for (dst, src) in quants.iter_mut().zip(raw) {
+                    *dst = src as i8;
+                }
+                let delta = if seed % 2 == 0 { 0x3C00 } else { 0xB800 };
+                let block = BlockQ8_0 { delta, quants };
+                let y = lcg_f32(seed.wrapping_add(4_242), 32);
+
+                let got = vec_dot_q8_0_f32_simd128(&block, &y);
+                let want = crate::quant::vec_dot_q8_0_f32_scalar(&block, &y);
+                assert_close(got, want, 32.0 * 128.0, "q8_0");
+            }
+        }
+
+        /// Nibble extraction is the part most likely to be wrong, and random
+        /// bytes rarely produce the extremes, so pin them directly: every
+        /// byte all-zero nibbles, then all-fifteen.
+        #[wasm_bindgen_test]
+        fn q4_0_handles_nibble_extremes() {
+            let y = lcg_f32(7, 32);
+            for fill in [0x00u8, 0xFF, 0x0F, 0xF0] {
+                let block = BlockQ4_0 {
+                    d: 0x3C00,
+                    qs: [fill; 16],
+                };
+                let got = vec_dot_q4_0_f32_simd128(&block, &y);
+                let want = crate::quant::vec_dot_q4_0_f32_scalar(&block, &y);
+                assert_close(got, want, 32.0 * 8.0, &format!("q4_0 fill {fill:#04x}"));
+            }
+        }
+
+        /// i8 sign extension is the Q8_0 equivalent of the above: a widen that
+        /// zero-extends instead of sign-extending passes on positive-only data.
+        #[wasm_bindgen_test]
+        fn q8_0_handles_sign_extremes() {
+            let y = lcg_f32(11, 32);
+            for fill in [0i8, -128, 127, -1] {
+                let block = BlockQ8_0 {
+                    delta: 0x3C00,
+                    quants: [fill; 32],
+                };
+                let got = vec_dot_q8_0_f32_simd128(&block, &y);
+                let want = crate::quant::vec_dot_q8_0_f32_scalar(&block, &y);
+                assert_close(got, want, 32.0 * 128.0, &format!("q8_0 fill {fill}"));
+            }
+        }
+    }
+}
+
 // ── Dispatch ────────────────────────────────────────────────────────────────
 
 /// Best available Q4_0 dot product.
@@ -9139,7 +9395,16 @@ pub fn vec_dot_q4_0_f32(block: &BlockQ4_0, y: &[f32]) -> f32 {
         }
     }
 
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        wasm_simd::vec_dot_q4_0_f32_simd128(block, y)
+    }
+
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
     {
         crate::quant::vec_dot_q4_0_f32_scalar(block, y)
     }
@@ -9165,7 +9430,16 @@ pub fn vec_dot_q8_0_f32(block: &BlockQ8_0, y: &[f32]) -> f32 {
         }
     }
 
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        wasm_simd::vec_dot_q8_0_f32_simd128(block, y)
+    }
+
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
     {
         crate::quant::vec_dot_q8_0_f32_scalar(block, y)
     }

@@ -1,0 +1,65 @@
+name: cera_ffi_flutter
+# pub.dev requires 60-180 characters; anything longer is a scoring penalty.
+description: >-
+  Flutter FFI plugin for the Cera on-device inference engine. Ships prebuilt
+  native libraries for Android, iOS, macOS, Linux and Windows.
+version: 0.4.0
+repository: https://github.com/hyeons-lab/cera
+issue_tracker: https://github.com/hyeons-lab/cera/issues
+documentation: https://github.com/hyeons-lab/cera/blob/main/cera_ffi_flutter/README.md
+topics:
+  - llm
+  - inference
+  - ffi
+  - gguf
+  - ai
+
+environment:
+  sdk: ^3.3.0
+  # Mandatory: pub rejects a package declaring `flutter.plugin.platforms`
+  # without a Flutter SDK constraint ("allows Flutter SDK version 1.9.x, which
+  # does not support the flutter.plugin.platforms key"). 3.10 is the floor
+  # because that is where `ffiPlugin: true` landed.
+  #
+  # Declaring it is also what makes `dart pub get` refuse a package, which is
+  # why the Dart API is not here: it lives in `cera_ffi`, which has no such
+  # constraint and resolves from plain Dart. This package adds the native build
+  # wiring on top and re-exports it, so a Flutter app needs only this one
+  # dependency.
+  flutter: '>=3.10.0'
+
+dependencies:
+  # The Dart API. Pinned to the exact workspace version rather than a caret
+  # range: the bindings are checksum-verified against a specific Rust FFI
+  # surface at construction, and the native library this plugin fetches is built
+  # from that same surface. A mismatched pair fails loudly at startup, so there
+  # is no version of `cera_ffi` other than this one that can work with the
+  # native library shipped alongside it. Kept in step by scripts/bump-version.sh.
+  cera_ffi: 0.4.0
+
+dev_dependencies:
+  # Only for analyzing this package's one re-export file; `analysis_options.yaml`
+  # includes it. The Dart API and its test suite live in `cera_ffi`.
+  lints: ^4.0.0
+
+flutter:
+  plugin:
+    platforms:
+      # `ffiPlugin: true` on every platform: this is an FFI-only plugin. There
+      # is no platform channel and no per-platform Dart class, so Flutter's
+      # tooling only needs to build/bundle the native library. The Dart side
+      # calls it directly, from `package:cera_ffi`.
+      #
+      # None of these build Rust. Each pulls the prebuilt library that the
+      # release pipeline already publishes, so app developers never need a Rust
+      # toolchain or the Android NDK.
+      android:
+        ffiPlugin: true
+      ios:
+        ffiPlugin: true
+      macos:
+        ffiPlugin: true
+      linux:
+        ffiPlugin: true
+      windows:
+        ffiPlugin: true

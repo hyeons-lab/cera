@@ -27,9 +27,9 @@
 import Foundation
 
 // Compile-time link to the UniFFI binding via `-import-objc-header
-// cera_ffiFFI.h`. The Swift binding's `#if canImport(cera_ffiFFI)`
-// branch is false in this single-binary swiftc invocation; the C
-// symbols are resolved through the bridging header instead.
+// CeraFFI.h`. The Swift binding's `#if canImport(CeraFFI)` branch is
+// false in this single-binary swiftc invocation; the C symbols are
+// resolved through the bridging header instead.
 
 func fail(_ msg: String) -> Never {
     FileHandle.standardError.write(Data("FAIL: \(msg)\n".utf8))

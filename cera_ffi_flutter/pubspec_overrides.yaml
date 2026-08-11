@@ -1,0 +1,16 @@
+# Resolve `cera_ffi` from the sibling directory instead of pub.dev.
+#
+# The dependency in pubspec.yaml is a hosted pin (`cera_ffi: 0.4.0`), which is
+# what a published plugin must carry. In this repo that version may not exist on
+# pub.dev yet, and even when it does, the two packages are developed together
+# and a plugin must be tested against the working tree rather than the last
+# release.
+#
+# `pubspec_overrides.yaml` is read by pub in addition to pubspec.yaml and, being
+# a separate file, needs no edit-before-publish dance. It is excluded from the
+# published archive by `.pubignore`, and it only ever affects builds rooted at
+# this directory: a consumer resolving `cera_ffi_flutter` from pub.dev never
+# sees it.
+dependency_overrides:
+  cera_ffi:
+    path: ../cera_ffi

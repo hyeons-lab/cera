@@ -1,0 +1,30 @@
+# Dart / Flutter tooling
+.dart_tool/
+.packages
+pubspec.lock
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# The generated+patched UniFFI bindings (lib/src/generated/cera_ffi.dart) ARE
+# committed — like the Kotlin/Swift bindings — so the package works out of the
+# box. Regenerate with `just dart-bindings`; `just dart-bindings-check` guards
+# against drift.
+
+# Bundled native libraries (built from the cera-ffi crate per target).
+/native/
+*.so
+*.dylib
+*.dll
+*.a
+
+# Fetched at `pod install` / SPM-resolve time by the ios/ and macos/ podspecs,
+# never committed: the zip is ~91 MB and it is a versioned release asset.
+/ios/CeraFFI.xcframework/
+/macos/CeraFFI.xcframework/
+# Same artifact, at the location the SPM manifests probe for a local override
+# (`just apple-xcframework` + copy). Ignored so a local build can never leak
+# into a commit or a published pub archive.
+/ios/cera_ffi_flutter/CeraFFI.xcframework/
+/macos/cera_ffi_flutter/CeraFFI.xcframework/
+.cera-xcframework-sha256

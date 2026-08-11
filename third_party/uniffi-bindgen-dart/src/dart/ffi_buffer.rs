@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use uniffi_bindgen::interface::{ffi::FfiType, Type};
+use uniffi_bindgen::interface::{ffi::FfiType, ObjectImpl, Type};
 
 use super::config::CustomTypeConfig;
 use super::*;
@@ -153,6 +153,33 @@ pub(super) fn is_runtime_unsupported_async_ffibuffer_eligible_method(
     async_rust_future_spec_from_uniffi_return_type(method.return_type.as_ref()).is_some()
 }
 
+/// Async constructors reachable through the ffi-buffer trampoline.
+///
+/// Unlike a method, a constructor carries no `return_type`: it always yields a
+/// `u64` object handle, so there is no return spec to look up. The scaffolding
+/// still hands back a `RustFuture` handle that has to be polled and completed
+/// via `rust_future_complete_u64`, exactly like an object-returning async
+/// method.
+pub(super) fn is_runtime_unsupported_async_ffibuffer_eligible_constructor(
+    ctor: &UdlObjectConstructor,
+) -> bool {
+    ctor.runtime_unsupported.is_some() && ctor.is_async && ctor.ffi_symbol.is_some()
+}
+
+/// The `Type` an async constructor resolves to, for the shared completion
+/// renderer.
+///
+/// `module_path` is deliberately the local one: it keeps
+/// `is_external_object_type` false so the result lifts as `Foo._(this, handle)`
+/// rather than routing through an external `FooFfiCodec`.
+pub(super) fn constructor_return_object_type(object_name: &str, local_module_path: &str) -> Type {
+    Type::Object {
+        name: object_name.to_string(),
+        module_path: local_module_path.to_string(),
+        imp: ObjectImpl::Struct,
+    }
+}
+
 pub(super) fn has_runtime_unsupported_async_ffibuffer_support(
     functions: &[UdlFunction],
     objects: &[UdlObject],
@@ -166,6 +193,9 @@ pub(super) fn has_runtime_unsupported_async_ffibuffer_support(
             o.methods
                 .iter()
                 .any(is_runtime_unsupported_async_ffibuffer_eligible_method)
+                || o.constructors
+                    .iter()
+                    .any(is_runtime_unsupported_async_ffibuffer_eligible_constructor)
         })
         || records.iter().any(|r| {
             r.methods
@@ -252,6 +282,10 @@ pub(super) fn render_ffibuffer_rustbuffer_arg_serialization(
     } else {
         arg_name.clone()
     };
+    // `Bytes` needs the writer for the same reason it needs the reader on the
+    // way back: UniFFI's `FfiConverterData` is `i32` length followed by the
+    // bytes, not the bare bytes. Writing them raw makes Rust read the first
+    // four bytes of the payload as a length and panic (RustCallStatus 2).
     let needs_writer = matches!(
         runtime_unwrapped_type(&arg.type_),
         Type::Map { .. }
@@ -259,6 +293,7 @@ pub(super) fn render_ffibuffer_rustbuffer_arg_serialization(
             | Type::Optional { .. }
             | Type::Timestamp
             | Type::Duration
+            | Type::Bytes
     );
     let writer_name = format!("{arg_name}Writer");
     let encode_expr = match runtime_unwrapped_type(&arg.type_) {
@@ -268,12 +303,12 @@ pub(super) fn render_ffibuffer_rustbuffer_arg_serialization(
         Type::String => {
             format!("Uint8List.fromList(utf8.encode({lowered_arg}))")
         }
-        Type::Bytes => lowered_arg.clone(),
         Type::Map { .. }
         | Type::Sequence { .. }
         | Type::Optional { .. }
         | Type::Timestamp
-        | Type::Duration => {
+        | Type::Duration
+        | Type::Bytes => {
             format!("{writer_name}.toBytes()")
         }
         _ => {
@@ -477,21 +512,16 @@ pub(super) fn render_ffibuffer_async_complete_and_decode(
         out.push_str("            return;\n");
     } else if async_spec.suffix == "rust_buffer" {
         if let Some(ret_type) = return_type {
-            let decode_expr = match runtime_unwrapped_type(ret_type) {
-                Type::String => {
-                    lift_custom_if_needed("utf8.decode(resultBytes)", ret_type, custom_types)
-                }
-                Type::Bytes => lift_custom_if_needed("resultBytes", ret_type, custom_types),
-                Type::Record { name, .. } | Type::Enum { name, .. } => {
-                    format!("_uniffiDecode{}(resultBytes)", to_upper_camel(name))
-                }
-                _ => render_uniffi_binary_read_expression(
-                    ret_type,
-                    "resultReader",
-                    enums,
-                    custom_types,
-                ),
-            };
+            // Shares the sync path's helpers rather than restating them: this
+            // block used to be a copy, and copies of this logic are exactly how
+            // whole families of methods have silently diverged before.
+            let decode_expr = render_ffibuffer_return_decode_expr(
+                ret_type,
+                "resultBytes",
+                "resultReader",
+                enums,
+                custom_types,
+            );
             out.push_str(
                 "            final ffi.Pointer<_UniFfiRustBuffer> resultBufPtr = calloc<_UniFfiRustBuffer>();\n",
             );
@@ -502,10 +532,7 @@ pub(super) fn render_ffibuffer_async_complete_and_decode(
             out.push_str(
                 "            final Uint8List resultBytes = resultBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(resultBufPtr.ref.data.asTypedList(resultBufPtr.ref.len));\n",
             );
-            if matches!(
-                runtime_unwrapped_type(ret_type),
-                Type::String | Type::Bytes | Type::Record { .. } | Type::Enum { .. }
-            ) {
+            if decodes_from_whole_buffer(ret_type) {
                 out.push_str(&format!("            return {decode_expr};\n"));
             } else {
                 out.push_str(
@@ -712,6 +739,100 @@ pub(super) fn render_ffibuffer_outer_cleanup(out: &mut String) {
     out.push_str("    }\n");
 }
 
+/// `true` when a RustBuffer return payload can be decoded from the whole
+/// buffer at once, as opposed to needing the incremental
+/// [`_UniFfiBinaryReader`].
+///
+/// A string *is* the payload (UniFFI writes raw UTF-8, with the RustBuffer's
+/// own length delimiting it), and records and enums get a generated
+/// whole-buffer `_uniffiDecode<Name>`. Everything else is length- or
+/// tag-prefixed and has to be read incrementally.
+///
+/// `Bytes` looks like it belongs here and does not: UniFFI's `FfiConverterData`
+/// writes an `i32` length *before* the bytes, so taking the whole buffer yields
+/// the payload with four junk bytes on the front. That is worse than a hard
+/// failure, because the call succeeds and returns corrupt data — it showed up
+/// as `hidden_states_for_tokens` reporting 1025 floats for a 1024-wide model.
+fn decodes_from_whole_buffer(ret_type: &Type) -> bool {
+    matches!(
+        runtime_unwrapped_type(ret_type),
+        Type::String | Type::Record { .. } | Type::Enum { .. }
+    )
+}
+
+/// Renders the Dart expression that turns a RustBuffer return payload into a
+/// value, for the ffibuffer ABI.
+///
+/// Shared by the top-level-function and object-method renderers. Keep it that
+/// way: these two call sites were once copy-pasted, the object-method copy was
+/// never taught to handle anything but records, enums, and maps, and every
+/// `String` / sequence / optional returning *method* silently generated a
+/// `throw UnsupportedError` for it.
+/// `bytes_var` / `reader_var` name the Dart locals the caller has in scope: the
+/// synchronous path uses `retBytes` / `retReader`, the rust-future path
+/// `resultBytes` / `resultReader`.
+pub(super) fn render_ffibuffer_return_decode_expr(
+    ret_type: &Type,
+    bytes_var: &str,
+    reader_var: &str,
+    enums: &[UdlEnum],
+    custom_types: &HashMap<String, CustomTypeConfig>,
+) -> String {
+    match runtime_unwrapped_type(ret_type) {
+        Type::String => {
+            lift_custom_if_needed(&format!("utf8.decode({bytes_var})"), ret_type, custom_types)
+        }
+        Type::Record { name, .. } | Type::Enum { name, .. } => {
+            format!("_uniffiDecode{}({bytes_var})", to_upper_camel(name))
+        }
+        // `Bytes` falls through here on purpose: the reader strips the `i32`
+        // length prefix that `FfiConverterData` writes. See
+        // `decodes_from_whole_buffer`.
+        _ => render_uniffi_binary_read_expression(ret_type, reader_var, enums, custom_types),
+    }
+}
+
+/// Emits the full RustBuffer return-decoding block for the ffibuffer ABI:
+/// lifts the buffer out of the return slots, decodes it, and returns the
+/// value.
+///
+/// Types that need the incremental reader also get an `isDone` assertion, so a
+/// payload the decoder under-reads fails loudly instead of silently dropping
+/// trailing bytes.
+pub(super) fn render_ffibuffer_rustbuffer_return(
+    out: &mut String,
+    ret_type: &Type,
+    enums: &[UdlEnum],
+    custom_types: &HashMap<String, CustomTypeConfig>,
+) {
+    let decode_expr =
+        render_ffibuffer_return_decode_expr(ret_type, "retBytes", "retReader", enums, custom_types);
+    out.push_str(
+        "      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();\n",
+    );
+    out.push_str(
+        "      retBufPtr.ref\n        ..capacity = (returnBuf + 0).ref.u64\n        ..len = (returnBuf + 1).ref.u64\n        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();\n",
+    );
+    out.push_str("      rustRetBufferPtrs.add(retBufPtr);\n");
+    out.push_str(
+        "      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));\n",
+    );
+    if decodes_from_whole_buffer(ret_type) {
+        out.push_str(&format!("      final decodedValue = {decode_expr};\n"));
+    } else {
+        out.push_str(
+            "      final _UniFfiBinaryReader retReader = _UniFfiBinaryReader(retBytes);\n",
+        );
+        out.push_str(&format!("      final decodedValue = {decode_expr};\n"));
+        out.push_str("      if (!retReader.isDone) {\n");
+        out.push_str(
+            "        throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');\n",
+        );
+        out.push_str("      }\n");
+    }
+    out.push_str("      return decodedValue;\n");
+}
+
 pub(super) fn async_rust_future_spec_from_uniffi_return_type(
     return_type: Option<&Type>,
 ) -> Option<AsyncRustFutureSpec> {
@@ -785,6 +906,191 @@ pub(super) fn async_rust_future_spec_from_uniffi_return_type(
 mod tests {
     use super::*;
     use uniffi_bindgen::interface::{ffi::FfiType, ObjectImpl, Type};
+
+    // ── RustBuffer return decoding ─────────────────────────────────────
+    //
+    // Regression cover for the object-method renderer, which used to handle
+    // only records, enums, and maps and emitted `throw UnsupportedError` for
+    // every other RustBuffer return. That killed `decode_tokens`,
+    // `encode_text`, `apply_chat_template`, `transcribe`, `tool_format`, and
+    // the `hidden_states_*` family at runtime.
+
+    fn no_customs() -> HashMap<String, CustomTypeConfig> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn string_return_decodes_from_whole_buffer() {
+        let expr = render_ffibuffer_return_decode_expr(
+            &Type::String,
+            "retBytes",
+            "retReader",
+            &[],
+            &no_customs(),
+        );
+        assert_eq!(expr, "utf8.decode(retBytes)");
+        assert!(decodes_from_whole_buffer(&Type::String));
+    }
+
+    #[test]
+    fn bytes_return_strips_its_length_prefix() {
+        // NOT the whole buffer: UniFFI's `FfiConverterData` writes an `i32`
+        // length before the bytes, so taking everything hands back the payload
+        // with four junk bytes on the front. That shipped once and did not
+        // throw — `hidden_states_for_tokens` simply reported 1025 floats for a
+        // 1024-wide model.
+        let expr = render_ffibuffer_return_decode_expr(
+            &Type::Bytes,
+            "retBytes",
+            "retReader",
+            &[],
+            &no_customs(),
+        );
+        assert!(expr.contains("retReader.readI32()"), "got: {expr}");
+        assert!(expr.contains("retReader.readBytes("), "got: {expr}");
+        assert!(!decodes_from_whole_buffer(&Type::Bytes));
+    }
+
+    #[test]
+    fn bytes_arg_is_length_prefixed() {
+        // Mirror of the return side. Writing the bytes raw makes Rust read the
+        // first four bytes of the payload as a length and panic with
+        // RustCallStatus 2.
+        let mut out = String::new();
+        let arg = UdlArg {
+            name: "bytes".to_string(),
+            type_: Type::Bytes,
+            default: None,
+            docstring: None,
+        };
+        render_ffibuffer_rustbuffer_arg_serialization(
+            &mut out,
+            &arg,
+            0,
+            "unsupported",
+            "from_bytes",
+            &[],
+            &no_customs(),
+        );
+        assert!(out.contains("writeI32(bytes.length)"), "got: {out}");
+        assert!(out.contains("writeBytes(bytes)"), "got: {out}");
+    }
+
+    #[test]
+    fn string_arg_is_not_length_prefixed() {
+        // The counterpart that must NOT change: a UniFFI string *is* the raw
+        // UTF-8, delimited by the RustBuffer's own length.
+        let mut out = String::new();
+        let arg = UdlArg {
+            name: "text".to_string(),
+            type_: Type::String,
+            default: None,
+            docstring: None,
+        };
+        render_ffibuffer_rustbuffer_arg_serialization(
+            &mut out,
+            &arg,
+            0,
+            "unsupported",
+            "encode_text",
+            &[],
+            &no_customs(),
+        );
+        assert!(out.contains("utf8.encode(text)"), "got: {out}");
+        assert!(!out.contains("writeI32"), "got: {out}");
+    }
+
+    #[test]
+    fn sequence_return_uses_incremental_reader() {
+        let ty = Type::Sequence {
+            inner_type: Box::new(Type::UInt32),
+        };
+        let expr =
+            render_ffibuffer_return_decode_expr(&ty, "retBytes", "retReader", &[], &no_customs());
+        assert!(expr.contains("retReader.readI32()"), "{expr}");
+        assert!(expr.contains("retReader.readU32()"), "{expr}");
+        assert!(!decodes_from_whole_buffer(&ty));
+    }
+
+    #[test]
+    fn optional_return_uses_incremental_reader() {
+        let ty = Type::Optional {
+            inner_type: Box::new(Type::String),
+        };
+        let expr =
+            render_ffibuffer_return_decode_expr(&ty, "retBytes", "retReader", &[], &no_customs());
+        assert!(expr.contains("retReader.readI8()"), "{expr}");
+        assert!(expr.contains("retReader.readString()"), "{expr}");
+        // An Optional is tag-prefixed, so it must not take the
+        // whole-buffer path even though its inner type would.
+        assert!(!decodes_from_whole_buffer(&ty));
+    }
+
+    #[test]
+    fn record_return_uses_generated_whole_buffer_decoder() {
+        let ty = Type::Record {
+            name: "GenerateOutput".into(),
+            module_path: String::new(),
+        };
+        let expr =
+            render_ffibuffer_return_decode_expr(&ty, "retBytes", "retReader", &[], &no_customs());
+        assert_eq!(expr, "_uniffiDecodeGenerateOutput(retBytes)");
+        assert!(decodes_from_whole_buffer(&ty));
+    }
+
+    #[test]
+    fn sequence_return_emits_isdone_assertion() {
+        let ty = Type::Sequence {
+            inner_type: Box::new(Type::Float32),
+        };
+        let mut out = String::new();
+        render_ffibuffer_rustbuffer_return(&mut out, &ty, &[], &no_customs());
+        assert!(out.contains("_UniFfiBinaryReader retReader"), "{out}");
+        assert!(out.contains("if (!retReader.isDone)"), "{out}");
+        assert!(out.contains("return decodedValue;"), "{out}");
+    }
+
+    #[test]
+    fn string_return_omits_reader_and_isdone_assertion() {
+        let mut out = String::new();
+        render_ffibuffer_rustbuffer_return(&mut out, &Type::String, &[], &no_customs());
+        assert!(!out.contains("_UniFfiBinaryReader"), "{out}");
+        assert!(!out.contains("isDone"), "{out}");
+        assert!(
+            out.contains("final decodedValue = utf8.decode(retBytes);"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn rustbuffer_return_never_emits_unsupported_error() {
+        // Every return shape cera's FFI surface actually uses.
+        let shapes = vec![
+            Type::String,
+            Type::Bytes,
+            Type::Sequence {
+                inner_type: Box::new(Type::UInt32),
+            },
+            Type::Sequence {
+                inner_type: Box::new(Type::Float32),
+            },
+            Type::Optional {
+                inner_type: Box::new(Type::String),
+            },
+            Type::Record {
+                name: "GenerateOutput".into(),
+                module_path: String::new(),
+            },
+        ];
+        for ty in shapes {
+            let mut out = String::new();
+            render_ffibuffer_rustbuffer_return(&mut out, &ty, &[], &no_customs());
+            assert!(
+                !out.contains("UnsupportedError"),
+                "{ty:?} still renders an UnsupportedError: {out}"
+            );
+        }
+    }
 
     // ── ffibuffer_symbol_name ──────────────────────────────────────────
 
@@ -994,5 +1300,92 @@ mod tests {
     fn ineligible_async() {
         let f = test_function(Some("uniffi_test".into()), true);
         assert!(!is_ffibuffer_eligible_function(&f));
+    }
+
+    // ── async constructors ──────────────────────────────────────────────
+    //
+    // Regression cover for the constructor renderer, which handled only the
+    // synchronous ffi-buffer path. Every async constructor fell through to a
+    // `throw UnsupportedError` stub even though its `uniffi_ffibuffer_*`
+    // trampoline was exported, because the rust-future branch existed for
+    // methods only.
+
+    fn test_constructor(
+        ffi_symbol: Option<String>,
+        is_async: bool,
+        runtime_unsupported: Option<String>,
+    ) -> UdlObjectConstructor {
+        UdlObjectConstructor {
+            name: "from_bundle_id_async".to_string(),
+            ffi_symbol,
+            ffi_arg_types: vec![],
+            ffi_return_type: None,
+            ffi_has_rust_call_status: false,
+            runtime_unsupported,
+            docstring: None,
+            is_async,
+            args: vec![],
+            throws_type: None,
+        }
+    }
+
+    #[test]
+    fn async_constructor_with_symbol_is_ffibuffer_eligible() {
+        let ctor = test_constructor(
+            Some("uniffi_test_ctor".into()),
+            true,
+            Some("unsupported".into()),
+        );
+        assert!(is_runtime_unsupported_async_ffibuffer_eligible_constructor(
+            &ctor
+        ));
+    }
+
+    #[test]
+    fn sync_constructor_is_not_on_the_async_path() {
+        // Sync constructors are served by the direct ffi-buffer call; routing
+        // them through the rust-future lifecycle would look up poll/complete
+        // symbols that were never generated for them.
+        let ctor = test_constructor(
+            Some("uniffi_test_ctor".into()),
+            false,
+            Some("unsupported".into()),
+        );
+        assert!(!is_runtime_unsupported_async_ffibuffer_eligible_constructor(&ctor));
+    }
+
+    #[test]
+    fn async_constructor_without_symbol_is_not_eligible() {
+        let ctor = test_constructor(None, true, Some("unsupported".into()));
+        assert!(!is_runtime_unsupported_async_ffibuffer_eligible_constructor(&ctor));
+    }
+
+    #[test]
+    fn supported_async_constructor_is_not_rerouted() {
+        // `runtime_unsupported: None` means the direct-call renderer already
+        // handles it; the ffi-buffer fallback must not also claim it.
+        let ctor = test_constructor(Some("uniffi_test_ctor".into()), true, None);
+        assert!(!is_runtime_unsupported_async_ffibuffer_eligible_constructor(&ctor));
+    }
+
+    #[test]
+    fn constructor_return_type_completes_through_the_u64_future() {
+        // A constructor has no declared return type; it always completes to a
+        // u64 object handle, so it must select `rust_future_complete_u64`.
+        let ty = constructor_return_object_type("CeraEngine", "cera_ffi");
+        let spec = async_rust_future_spec_from_uniffi_return_type(Some(&ty))
+            .expect("object return has a future spec");
+        assert_eq!(spec.suffix, "u64");
+        assert_eq!(spec.complete_dart_type, "int");
+    }
+
+    #[test]
+    fn constructor_return_type_is_local_so_it_lifts_in_place() {
+        // Sharing the local module path keeps `is_external_object_type` false,
+        // so the result lifts as `CeraEngine._(this, handle)` rather than
+        // routing through an external `CeraEngineFfiCodec`.
+        let ty = constructor_return_object_type("CeraEngine", "cera_ffi");
+        assert!(!is_external_object_type(&ty, "cera_ffi"));
+        assert_eq!(object_name_from_type(&ty), Some("CeraEngine"));
     }
 }

@@ -87,12 +87,15 @@ pub(super) fn has_runtime_ffibuffer_fallback(
             && (is_ffibuffer_eligible_function(f)
                 || is_runtime_unsupported_async_ffibuffer_eligible_function(f))
     }) || objects.iter().any(|o| {
-        o.constructors
-            .iter()
-            .any(|c| c.runtime_unsupported.is_some() && is_ffibuffer_eligible_object_constructor(c))
-            || o.methods
-                .iter()
-                .any(|m| m.runtime_unsupported.is_some() && is_ffibuffer_eligible_object_member(m))
+        o.constructors.iter().any(|c| {
+            c.runtime_unsupported.is_some()
+                && (is_ffibuffer_eligible_object_constructor(c)
+                    || is_runtime_unsupported_async_ffibuffer_eligible_constructor(c))
+        }) || o.methods.iter().any(|m| {
+            m.runtime_unsupported.is_some()
+                && (is_ffibuffer_eligible_object_member(m)
+                    || is_runtime_unsupported_async_ffibuffer_eligible_method(m))
+        })
     })
 }
 

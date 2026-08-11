@@ -55,7 +55,7 @@ earlier "GPU is LFM2-only" limitation is gone (see #177/#192/#193/#194/#200).
 | V2.12 CUDA backend | ⬜ | |
 | V2.13 Python (PyO3) bindings | ⬜ | |
 | V2.14 Kotlin Multiplatform bindings | ✅ | `cera-ffi-kotlin` (android + jvm) |
-| V2.17 Flutter / Dart bindings | 🟡 | `cera-ffi-flutter`: sync + async generate, sync + async streaming, `withProgress` all verified; only `fromBundleIdAsync` stubbed |
+| V2.17 Flutter / Dart bindings | 🟡 | `cera_ffi` (pure Dart) + `cera_ffi_flutter` (FFI plugin): full API verified, no stubs; iOS/Android/macOS/Linux builds run, Windows covered by CI only |
 | V2.15 Vision (LFM2-VL) | ✅ | off-roadmap; core + FFI + GPU (Metal/wgpu) encode shipped, no slicing |
 | V2.16 Audio + TTS (LFM2-Audio) | ✅ | off-roadmap; core shipped, Metal-only decode accel |
 
@@ -426,11 +426,16 @@ trigger** (`GenerateOpts.grammar_trigger_tokens`) keeps generation free until th
 model starts a call. Exposed across CLI (`--tools` / `--constrain-tools`), FFI
 (Kotlin/Swift), WASM, and Dart. PR #239.
 
-### V2.17: Flutter / Dart Bindings, 2-3 weeks 🟡 (sync + async + streaming working; only `fromBundleIdAsync` stubbed)
+### V2.17: Flutter / Dart Bindings, 2-3 weeks 🟡 (full API working, no stubs; platform builds unverified off macOS)
 Expose the engine to Flutter/Dart, reusing the existing `cera-ffi` UniFFI
-surface (the same C ABI that already backs Kotlin + Swift). The
-`cera-ffi-flutter` Dart package ships the generated+patched bindings plus a
-platform-aware native-library loader.
+surface (the same C ABI that already backs Kotlin + Swift). Two packages: the
+`cera_ffi` Dart package ships the generated+patched bindings plus a
+platform-aware native-library loader, and `cera_ffi_flutter` is the Flutter FFI
+plugin that depends on it and adds the per-platform native build wiring. They
+are split because pub will not publish a package declaring
+`flutter.plugin.platforms` without a Flutter SDK constraint, and declaring that
+constraint makes `dart pub get` refuse the package: one package cannot be both a
+plugin and plain-Dart-resolvable.
 
 **Working (verified end-to-end):** the synchronous engine API round-trips real
 inference: loaded a Qwen2-0.5B GGUF through `CeraEngine.fromPath` →
@@ -442,8 +447,8 @@ and structured `FfiError` propagation also confirmed. Delivered:
 - `tool/patch_generated_bindings.dart`: deterministic, idempotent post-gen
   fixups: corrects `rustbuffer`/`rust_future` symbol names + the `.ref.ptr`
   union field, rewrites native-lib resolution (`CERA_FFI_LIB` + platform name),
-  synthesizes the `EngineConfig` record encoder, fixes the async-ctor return
-  type, and stubs the unsupported callback-sink methods.
+  synthesizes the `EngineConfig` record encoder, and marks the public
+  `fromBundleIdAsync` wrapper `async`.
 - `just dart-libs` / `dart-bindings` / `dart-bindings-check` recipes; committed
   generated bindings (analyze clean); `example/cera_generate.dart`.
 
@@ -488,19 +493,38 @@ synchronous). So `ModalitySink` (used by `generate_streaming_async`) → listene
 Consequence: `listener` callbacks are async, so **sync `generate_streaming`'s
 `ModalitySink` callbacks are now queued** and arrive only when you yield to the
 event loop (drain after the call: `example/cera_stream.dart`; or just use
-`generateStreamingAsync`). `fromBundleIdAsync` stays generator-stubbed; async
-constructor returning an object handle needs the object/pointer rust-future
-variant.
+`generateStreamingAsync`).
+
+**`fromBundleIdAsync`: WORKING.** The generator's rust-future poll/complete path
+existed for object *methods* only, so every async *constructor* fell through to
+an `UnsupportedError` stub even though its `uniffi_ffibuffer_*` trampoline was
+exported all along. A constructor carries no declared return type (it always
+completes to a u64 object handle), so the fix synthesizes the object type and
+reuses the shared completion renderer, which already handled both the
+`CeraEngine._(this, handle)` lift and the `FfiError` throw path. Verified both
+ways against a cached `LFM2.5-350M-GGUF` bundle: a cache hit returns a live
+engine, and a bogus bundle id rejects with a lifted `FfiErrorExceptionBackend`.
 
 **`BundleRepo.withProgress`: VERIFIED.** `DownloadProgressSink.onProgress`
 fires synchronously (it stays `isolateLocal`; `fromBundleId` is synchronous) with
 all args RustBuffer-decoded correctly: `url: String`, `bytesDownloaded: u64`,
 `totalBytes: Option<u64>` (`example/cera_progress.dart`, `LFM2-350M-GGUF`).
 
-**Remaining:** object/pointer rust-future variant (unblocks `fromBundleIdAsync`);
-package prebuilt native libs per target (Android jniLibs / iOS xcframework /
-desktop); expose a detokenizer over FFI; example Flutter app + wire the Dart
-drift check into CI; then the upstream PR.
+**Now a real Flutter FFI plugin.** `pubspec.yaml` declares platform entries for
+android/ios/macos/linux/windows, each resolving the prebuilt native library
+from an already-published release artifact: the `cera-ffi-android` AAR via
+Gradle, `CeraFFI.xcframework` via a podspec *and* an SPM manifest, and the
+desktop cdylibs via CMake with a checksum check. Apple ships **dynamic**
+frameworks now; a static xcframework contributed zero symbols to a Dart-FFI
+consumer (measured: 0 exports without `-force_load`, 185 with the dynamic
+framework embedded). Detokenization needed no FFI work: `decode_tokens` was
+always exported, it was the Dart generator that dropped it.
+
+**Remaining:** verify the Android, iOS, Linux, and Windows builds on real
+targets (only macOS is exercised so far); publish to pub.dev; then the upstream
+generator PR. The Apple manifests carry `RELEASE_VERSION`/`RELEASE_CHECKSUM`
+placeholders that the release job rewrites on the tagged commit, so Apple
+targets only resolve from a published tag (or a locally built xcframework).
 
 **Spike result (2026-06-13, `uniffi-bindgen-dart` 0.1.3):** Viable but not
 turnkey. The generator builds against `uniffi_bindgen 0.31.1` (our exact

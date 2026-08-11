@@ -1,0 +1,5 @@
+include: package:lints/recommended.yaml
+
+# No `analyzer.exclude` here any more: the generated UniFFI bindings moved to the
+# `cera_ffi` package along with the rest of the Dart API, and this package's
+# `lib/` is a single re-export file.

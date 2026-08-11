@@ -155,6 +155,14 @@ bindings:
         --library {{CERA_FFI_DYLIB}} \
         --language swift \
         --out-dir cera-ffi/bindings/swift
+    # The root SwiftPM package's `Cera` target needs the wrapper *inside* the
+    # target directory (a `.package(url:)` consumer never has the Rust tree), so
+    # it holds a committed copy. Syncing it here rather than in a recipe someone
+    # has to remember is the whole point: the copy drifted 800 lines behind the
+    # Rust surface precisely because it was manual, and `canImport` fails
+    # silently, so the symptom is undeclared symbols pointing nowhere near the
+    # cause. `bindings-check` diffs it too.
+    cp cera-ffi/bindings/swift/cera_ffi.swift cera-ffi/apple/Sources/Cera/cera_ffi.swift
 
 # Build the `cera-ffi` cdylib with the `ffi-buffer` feature — required by the
 # Dart bindings. `uniffi-bindgen-dart` calls `uniffi_ffibuffer_*` trampolines
@@ -165,7 +173,8 @@ dart-libs:
     @echo "Built {{CERA_FFI_DYLIB}} (with ffi-buffer trampolines)."
     @echo "Point Dart at it via CERA_FFI_LIB or place it on the loader path."
 
-# Generate + patch the Dart/Flutter bindings into the cera-ffi-flutter package.
+# Generate + patch the Dart bindings into the cera_ffi package (NOT
+# cera_ffi_flutter, which is the thin Flutter plugin wrapping it).
 # Builds + runs the VENDORED uniffi-bindgen-dart (third_party/) — patched for
 # Cera with callback-argument lowering + the foreign-trait vtable-init symbol fix
 # that makes streaming work; built from source rather than `cargo install`ing the
@@ -182,27 +191,36 @@ dart-libs:
 dart-bindings: dart-libs
     cargo run --release --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml -- \
         generate {{CERA_FFI_DYLIB}} \
-        --out-dir cera-ffi-flutter/lib/src/generated
-    cd cera-ffi-flutter && dart run tool/patch_generated_bindings.dart
+        --out-dir cera_ffi/lib/src/generated
+    cd cera_ffi && dart run tool/patch_generated_bindings.dart
 
 # Verify the committed Dart bindings are up to date with the current FFI
-# surface (regenerate + patch in place, fail on diff) and analyze the package.
+# surface (regenerate + patch in place, fail on diff) and analyze both packages.
 dart-bindings-check: dart-bindings
-    @if [ -n "$(git status --porcelain cera-ffi-flutter/lib/src/generated)" ]; then \
+    @if [ -n "$(git status --porcelain cera_ffi/lib/src/generated)" ]; then \
         echo "ERROR: Dart bindings are stale. Run \`just dart-bindings\` and commit the diff."; \
-        git --no-pager diff cera-ffi-flutter/lib/src/generated; \
+        git --no-pager diff cera_ffi/lib/src/generated; \
         exit 1; \
     fi
-    cd cera-ffi-flutter && dart pub get && dart analyze
+    # `dart`, not `flutter`, and that is the point of the split: `cera_ffi`
+    # declares no Flutter SDK constraint, so plain Dart can resolve it. If this
+    # line ever has to become `flutter pub get`, something has reintroduced a
+    # Flutter dependency and plain-Dart consumers are broken.
+    cd cera_ffi && dart pub get && dart analyze
+    # The plugin does need Flutter: pub refuses to publish a package declaring
+    # `flutter.plugin.platforms` without an SDK constraint, and that constraint
+    # is exactly what `dart pub get` rejects. See cera_ffi_flutter/pubspec.yaml.
+    cd cera_ffi_flutter && flutter pub get && flutter analyze
 
 # Verify the committed Kotlin + Swift bindings are up to date with the
 # current Rust FFI surface. Regenerates in-place and fails if `git diff`
 # shows changes — signals that someone touched a `#[uniffi::*]` export
 # without running `just bindings`. CI runs this too; see ci.yml.
 bindings-check: bindings
-    @if [ -n "$(git status --porcelain cera-ffi/bindings)" ]; then \
-        echo "ERROR: vendored bindings are stale. Run \`just bindings\` and commit the diff."; \
-        git --no-pager diff cera-ffi/bindings; \
+    @if [ -n "$(git status --porcelain cera-ffi/bindings cera-ffi/apple/Sources/Cera)" ]; then \
+        echo "::error::Vendored bindings (cera-ffi/bindings/, cera-ffi/apple/) are out of date."; \
+        echo "Run \`just bindings\` locally and commit the resulting diff."; \
+        git --no-pager diff cera-ffi/bindings cera-ffi/apple/Sources/Cera; \
         exit 1; \
     fi
 
@@ -235,7 +253,7 @@ android-all:
 # and you don't need to rebuild all four every cycle. Picks arm64-v8a
 # as the default since it's what real Android phones ship with today.
 android-arm64:
-    cargo ndk --target arm64-v8a build -p cera-ffi --release
+    cargo ndk --target arm64-v8a build -p cera-ffi --release --features ffi-buffer
 
 # Stage the cera-ffi cdylib for the HOST desktop platform into the
 # `cera-ffi-jvm` module's JNA resource layout, for local
@@ -247,7 +265,9 @@ android-arm64:
 jvm-libs-host:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build -p cera-ffi --release
+    # `ffi-buffer` for the same reason as android-libs: one cdylib serves the
+    # JVM bindings and the Flutter plugin's desktop targets.
+    cargo build -p cera-ffi --release --features ffi-buffer
     case "$(uname -s)-$(uname -m)" in
       Darwin-arm64)  prefix=darwin-aarch64; lib=libcera_ffi.dylib ;;
       Darwin-x86_64) prefix=darwin-x86-64;  lib=libcera_ffi.dylib ;;
@@ -263,10 +283,16 @@ jvm-libs-host:
 # the `cera-ffi-android` module's jniLibs (cargo-ndk's `-o` writes the
 # `<abi>/libcera_ffi.so` layout). Requires the same cargo-ndk + NDK setup as
 # `android-all`.
+#
+# `ffi-buffer` is not optional here even though Kotlin never uses it: the same
+# AAR backs the Flutter plugin, whose Dart bindings call `uniffi_ffibuffer_*`.
+# See scripts/assert-ffibuffer.sh.
 android-libs:
     cargo ndk -o cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs \
         --target arm64-v8a --target armeabi-v7a --target x86_64 --target x86 \
-        build -p cera-ffi --release
+        build -p cera-ffi --release --features ffi-buffer
+    scripts/assert-ffibuffer.sh \
+        cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs/*/libcera_ffi.so
 
 # Cross-compile `cera-ffi` to all three arm64-only Apple-platform
 # targets and assemble a `CeraFFI.xcframework` ready for Swift
@@ -296,50 +322,176 @@ apple-xcframework:
     # Metal-enabled slices. The Metal backend is iOS-portable (Shared
     # storage + system_default device); `--features metal` makes it the
     # Auto-preferred GPU backend on all three arm64 slices, with CPU
-    # fallback. The `Cera` SwiftPM target links Metal.framework +
-    # Foundation (see Package.swift `linkerSettings`) — a static lib
-    # doesn't auto-link the system frameworks its symbols reference.
+    # fallback.
+    #
+    # ── Dynamic, not static ────────────────────────────────────────────
+    # These slices ship as DYNAMIC frameworks. They used to be static
+    # archives (`-library libcera_ffi.a`), which forced two workarounds:
+    # consumers had to name Metal.framework + Foundation explicitly
+    # (a static lib does not auto-link the frameworks its symbols
+    # reference), and any consumer resolving symbols at RUNTIME rather
+    # than link time — Dart FFI via `DynamicLibrary.process()`, i.e. the
+    # whole Flutter plugin — got nothing at all, because the linker pulls
+    # in no archive members when nothing references them. That needed a
+    # brittle `-force_load` pointing at a hardcoded slice path.
+    #
+    # A dynamic framework is loaded whole by dyld, so every symbol is
+    # present at runtime and the system frameworks link themselves. Size
+    # is a wash: `-force_load` was already pulling in the entire archive.
+    #
+    # ── The framework must be named `CeraFFI` ──────────────────────
+    # The UniFFI-generated Swift wrapper does
+    # `#if canImport(CeraFFI) ; import CeraFFI`, and a framework's clang
+    # module takes the framework's name. Naming it anything else
+    # silently breaks every Swift consumer. The name comes from
+    # `ffi_module_name` in cera-ffi/uniffi.toml — change it there, not
+    # here, and regenerate (`just bindings`) so the two stay in step.
     #
     # Deployment targets pin the slices to Package.swift's
     # `.macOS(.v12)` / `.iOS(.v15)` so a newer host SDK doesn't stamp a
-    # higher `minos` into the staticlib (which otherwise warns
-    # "built for newer macOS version than being linked" at consumer
-    # link time). MACOSX_/IPHONEOS_ are each read only by the matching
-    # target, so exporting both is safe.
+    # higher `minos` into the binary (which otherwise warns "built for
+    # newer macOS version than being linked" at consumer link time).
+    # MACOSX_/IPHONEOS_ are each read only by the matching target, so
+    # exporting both is safe.
     export MACOSX_DEPLOYMENT_TARGET=12.0
     export IPHONEOS_DEPLOYMENT_TARGET=15.0
-    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release --features metal
-    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios-sim --release --features metal
-    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release --features metal
+    # ── Why `ffi-buffer` is in here ────────────────────────────────────
+    # One XCFramework serves two consumers: the Swift package and the
+    # Flutter/Dart plugin. Swift calls the standard `uniffi_cera_ffi_*`
+    # scaffolding, but the Dart bindings call `uniffi_ffibuffer_*`
+    # trampolines, which UniFFI only emits under the `ffi-buffer`
+    # feature (`uniffi/scaffolding-ffi-buffer-fns`).
+    #
+    # Without it the framework links, embeds, signs, and loads
+    # perfectly, and then every Dart call dies at `dlsym` with "symbol
+    # not found" — nothing catches it before runtime, because the
+    # symbols the Swift side needs are all present. The trampolines are
+    # thin wrappers over the same scaffolding, so carrying them costs
+    # almost nothing and Swift consumers never look at them.
+    FEATURES=metal,ffi-buffer
+    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release --features "$FEATURES"
+    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios-sim --release --features "$FEATURES"
+    RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release --features "$FEATURES"
     OUT=target/xcframework-build
     rm -rf "$OUT"
-    mkdir -p "$OUT/headers"
-    # Stage the headers + module map next to where xcodebuild will
-    # look. UniFFI-generated `cera_ffiFFI.modulemap` is renamed to
-    # `module.modulemap` on the way in — Xcode's framework conventions
-    # require that exact filename inside a `Headers/` directory.
-    cp cera-ffi/bindings/swift/cera_ffiFFI.h "$OUT/headers/"
-    cp cera-ffi/bindings/swift/cera_ffiFFI.modulemap "$OUT/headers/module.modulemap"
-    xcodebuild -create-xcframework \
-        -library target/aarch64-apple-ios/release/libcera_ffi.a -headers "$OUT/headers" \
-        -library target/aarch64-apple-ios-sim/release/libcera_ffi.a -headers "$OUT/headers" \
-        -library target/aarch64-apple-darwin/release/libcera_ffi.a -headers "$OUT/headers" \
-        -output "$OUT/CeraFFI.xcframework"
-    echo "Built $OUT/CeraFFI.xcframework"
+    mkdir -p "$OUT"
 
-# Re-sync the root SwiftPM package's copy of the UniFFI Swift wrapper.
-#
-# The consumable `Cera` SwiftPM target (`cera-ffi/apple/Sources/Cera/`)
-# holds a COMMITTED COPY of the generated `cera_ffi.swift` so the
-# package resolves standalone (a `.package(url:)` consumer never has
-# the Rust tree). The canonical source is the vendored binding under
-# `cera-ffi/bindings/swift/`, regenerated by the `ffi-bindings-drift`
-# CI job. Run this after that binding changes so the two stay
-# byte-identical — otherwise the package's Swift surface drifts from
-# the Rust FFI. CI could enforce this with a `diff` check (follow-up).
-spm-sync-binding:
-    cp cera-ffi/bindings/swift/cera_ffi.swift cera-ffi/apple/Sources/Cera/cera_ffi.swift
-    echo "Synced cera-ffi/apple/Sources/Cera/cera_ffi.swift"
+    # Framework name == the UniFFI Swift module name, which the generated
+    # wrapper imports (`import CeraFFI`). Set by `ffi_module_name` in
+    # cera-ffi/uniffi.toml; a framework's clang module takes the framework's
+    # name, so these two MUST agree or every Swift consumer breaks.
+    FW=CeraFFI
+    HDR=cera-ffi/bindings/swift/CeraFFI.h
+    # Version stamped into each slice's Info.plist. Single source of truth is
+    # the workspace VERSION file (kept in lockstep by scripts/bump-version.sh).
+    FW_VERSION="$(tr -d '[:space:]' < VERSION)"
+
+    # Assemble one .framework per slice from the Rust cdylib.
+    #
+    # $1 = rust target dir, $2 = staging subdir, $3 = platform
+    # ("macos" uses the versioned bundle layout Apple requires there;
+    # iOS uses the flat layout, and a versioned bundle is REJECTED on
+    # iOS).
+    make_framework() {
+      local rust_target="$1" stage="$2" platform="$3"
+      local src="target/${rust_target}/release/libcera_ffi.dylib"
+      local root="${OUT}/${stage}/${FW}.framework"
+
+      if [ ! -f "$src" ]; then
+        echo "missing cdylib: $src" >&2
+        exit 1
+      fi
+
+      local bin_dir hdr_dir mod_dir res_dir
+      if [ "$platform" = "macos" ]; then
+        bin_dir="$root/Versions/A"
+        hdr_dir="$root/Versions/A/Headers"
+        mod_dir="$root/Versions/A/Modules"
+        res_dir="$root/Versions/A/Resources"
+      else
+        bin_dir="$root"
+        hdr_dir="$root/Headers"
+        mod_dir="$root/Modules"
+        res_dir="$root"
+      fi
+      mkdir -p "$bin_dir" "$hdr_dir" "$mod_dir" "$res_dir"
+
+      cp "$src" "$bin_dir/${FW}"
+      chmod +w "$bin_dir/${FW}"
+      # dyld resolves the framework relative to whatever embeds it; the
+      # Rust cdylib's own install_name (an absolute build path) would
+      # fail to load anywhere else.
+      install_name_tool -id "@rpath/${FW}.framework/${FW}" "$bin_dir/${FW}"
+
+      cp "$HDR" "$hdr_dir/"
+      # Inside a framework the module must be declared `framework module`
+      # and live at Modules/module.modulemap. The plain `module` form the
+      # generator emits is only valid for a headers directory.
+      cat > "$mod_dir/module.modulemap" <<MODMAP_EOF
+    framework module ${FW} {
+        umbrella header "CeraFFI.h"
+        export *
+    }
+    MODMAP_EOF
+
+      local min_key min_ver plist_dir
+      if [ "$platform" = "macos" ]; then
+        min_key=LSMinimumSystemVersion; min_ver=12.0; plist_dir="$res_dir"
+      else
+        min_key=MinimumOSVersion; min_ver=15.0; plist_dir="$res_dir"
+      fi
+      cat > "$plist_dir/Info.plist" <<PLIST_EOF
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+      <key>CFBundleDevelopmentRegion</key><string>en</string>
+      <key>CFBundleExecutable</key><string>${FW}</string>
+      <key>CFBundleIdentifier</key><string>com.hyeons-lab.cera-ffi</string>
+      <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+      <key>CFBundleName</key><string>${FW}</string>
+      <key>CFBundlePackageType</key><string>FMWK</string>
+      <key>CFBundleShortVersionString</key><string>${FW_VERSION}</string>
+      <key>CFBundleVersion</key><string>${FW_VERSION}</string>
+      <key>${min_key}</key><string>${min_ver}</string>
+    </dict>
+    </plist>
+    PLIST_EOF
+
+      if [ "$platform" = "macos" ]; then
+        ln -s A "$root/Versions/Current"
+        ln -s Versions/Current/"${FW}" "$root/${FW}"
+        ln -s Versions/Current/Headers "$root/Headers"
+        ln -s Versions/Current/Modules "$root/Modules"
+        ln -s Versions/Current/Resources "$root/Resources"
+      fi
+    }
+
+    make_framework aarch64-apple-ios     ios-arm64           ios
+    make_framework aarch64-apple-ios-sim ios-arm64-simulator ios
+    make_framework aarch64-apple-darwin  macos-arm64         macos
+
+    xcodebuild -create-xcframework \
+        -framework "$OUT/ios-arm64/${FW}.framework" \
+        -framework "$OUT/ios-arm64-simulator/${FW}.framework" \
+        -framework "$OUT/macos-arm64/${FW}.framework" \
+        -output "$OUT/CeraFFI.xcframework"
+    # Guard the `ffi-buffer` feature. Dropping it produces an XCFramework
+    # that links, embeds, signs, and loads perfectly and then fails every
+    # Dart call at `dlsym`, because only the Dart bindings use the
+    # `uniffi_ffibuffer_*` trampolines. Nothing else catches it before
+    # runtime on a device, so assert here.
+    for slice in ios-arm64 ios-arm64-simulator macos-arm64; do
+        count=$(nm -gU "$OUT/$slice/${FW}.framework/${FW}" | grep -c uniffi_ffibuffer || true)
+        if [ "$count" -eq 0 ]; then
+            echo "ERROR: $slice exports no uniffi_ffibuffer_* trampolines." >&2
+            echo "  The Dart/Flutter plugin cannot call into this build." >&2
+            echo "  Build cera-ffi with --features ffi-buffer." >&2
+            exit 1
+        fi
+        echo "  $slice: $count ffibuffer trampolines"
+    done
+    echo "Built $OUT/CeraFFI.xcframework (dynamic ${FW}.framework slices)"
 
 # Build + zip + checksum the CeraFFI XCFramework for a SwiftPM binary
 # target release. Produces `target/xcframework-build/CeraFFI.xcframework.zip`
@@ -407,7 +559,7 @@ swift-smoke:
     swiftc \
         cera-ffi/tests/swift/main.swift \
         cera-ffi/bindings/swift/cera_ffi.swift \
-        -import-objc-header cera-ffi/bindings/swift/cera_ffiFFI.h \
+        -import-objc-header cera-ffi/bindings/swift/CeraFFI.h \
         -L target/aarch64-apple-darwin/release \
         -lcera_ffi \
         -framework Metal \
@@ -466,6 +618,23 @@ wasm-node:
     wasm-pack build cera-wasm --target nodejs --release --scope hyeons-lab --out-dir pkg-nodejs
     @echo "--- cera-wasm/pkg-nodejs/ ---"
     @ls -lh cera-wasm/pkg-nodejs/
+
+# Run the `simd128` kernel oracle tests under Node.
+#
+# These cannot run under a plain `cargo test`: the host cannot execute a
+# wasm SIMD instruction, so a host-only suite would report green while
+# never touching `backend::simd::wasm_simd`. Each test pins a kernel
+# against the scalar reference in `crate::quant` — the same code wasm32
+# fell through to before these kernels existed, which is what makes
+# "matches scalar" the property worth asserting.
+#
+# `--lib` matters: without it the runner walks every integration test
+# binary in `cera/tests/`, none of which have wasm tests, and prints
+# "no tests to run!" 40 times.
+#
+# Requires: `wasm-pack`, node, and the `wasm32-unknown-unknown` target.
+wasm-simd-test:
+    wasm-pack test --node cera --lib -- wasm_simd
 
 # ── Multi-threaded wasm builds ──────────────────────────────────────────
 #
@@ -528,7 +697,12 @@ wasm-node:
 #                            (and, since the LLD in nightly-2026-07-10
 #                            stopped auto-exporting it, `failed to find
 #                            __heap_base for injecting thread id`).
-WASM_MT_RUSTFLAGS := "-C target-feature=+atomics,+bulk-memory,+mutable-globals" + \
+# `+simd128` is repeated here on purpose. `.cargo/config.toml` sets it for
+# wasm32-unknown-unknown, but `RUSTFLAGS` in the environment REPLACES the
+# config-file `rustflags` rather than appending to it — so omitting it here
+# would build the threaded variant against the scalar kernels and quietly lose
+# the SIMD speedup while everything still worked.
+WASM_MT_RUSTFLAGS := "-C target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128" + \
     " -C link-arg=--shared-memory" + \
     " -C link-arg=--import-memory" + \
     " -C link-arg=--max-memory=4294967296" + \

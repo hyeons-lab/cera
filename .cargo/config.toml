@@ -22,3 +22,19 @@ rustflags = ["-C", "target-cpu=x86-64-v3"]
 [target.aarch64-unknown-linux-gnu]
 # No extra flags — generic aarch64 baseline. The NEON / dotprod hot-path kernels
 # are opted in per-function via `#[target_feature(enable = "neon,dotprod")]`.
+
+[target.wasm32-unknown-unknown]
+# `simd128` is wasm's only SIMD feature and every browser and Node release since
+# 2021 has it, so there is no tier to runtime-dispatch between and no reason to
+# ship without it. The `wasm_simd` kernels in `backend/simd.rs` are gated on
+# this feature at compile time; without it wasm32 falls through to the scalar
+# reference, which measured 0.68 tok/s against 160 native on an LFM2.5-350M-Q4_0.
+#
+# Note this flag alone buys ~5%: LLVM does not autovectorize the nibble
+# unpacking these formats need. It matters because it switches on the
+# hand-written kernels.
+#
+# `RUSTFLAGS` in the environment REPLACES this rather than appending, so any
+# recipe that sets it (see `WASM_MT_RUSTFLAGS` in the justfile) has to repeat
+# `+simd128` or it silently builds the scalar path.
+rustflags = ["-C", "target-feature=+simd128"]

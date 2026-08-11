@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- No permissions, components, or resources. This module exists only to
+         pull the cera-ffi-android AAR (and its jniLibs) into the consuming
+         app; all behavior lives in Dart over FFI. -->
+</manifest>

@@ -408,6 +408,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "tracing-subscriber",
+ "wasm-bindgen-test",
  "web-time",
  "wgpu",
 ]

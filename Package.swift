@@ -15,10 +15,16 @@
 // The shipped XCFramework is built WITH the `metal` feature (see
 // `just apple-xcframework`). Inference prefers the native Metal backend
 // (Auto probes Metal → CPU) on device, Simulator, and native macOS, falling
-// back to the CPU (Accelerate/NEON) when Metal is unavailable. Because the
-// slices are Metal-enabled *static* libs, the `Cera` target links
-// `Metal.framework` + `Foundation` explicitly below — a `.binaryTarget`
-// static lib does not auto-link the system frameworks its symbols reference.
+// back to the CPU (Accelerate/NEON) when Metal is unavailable. The slices are
+// Metal-enabled *dynamic* frameworks, so they carry their own load commands for
+// `Metal.framework` and `Foundation` and dyld resolves them — no
+// `linkerSettings` needed here.
+//
+// They used to be static archives, which cost two workarounds: the consumer had
+// to name those system frameworks explicitly, and anything resolving symbols at
+// RUNTIME rather than link time (Dart FFI via `DynamicLibrary.process()`, i.e.
+// the whole Flutter plugin) got nothing at all, because the linker pulls in no
+// archive members when nothing references them.
 //
 // ── Slices ──────────────────────────────────────────────────────────────────
 // The XCFramework carries three arm64-only slices — ios-arm64 (device),
@@ -27,17 +33,17 @@
 //
 // ── Targets ─────────────────────────────────────────────────────────────────
 //   - `CeraFFI` (binaryTarget) — the remote XCFramework. Its `Headers/` carry
-//     `module.modulemap` declaring the clang module `cera_ffiFFI`. That module
+//     `module.modulemap` declaring the clang module `CeraFFI`. That module
 //     name is load-bearing: the generated wrapper does
-//     `#if canImport(cera_ffiFFI) ; import cera_ffiFFI`, so the module the
-//     binaryTarget vends MUST be named `cera_ffiFFI` exactly.
+//     `#if canImport(CeraFFI) ; import CeraFFI`, so the module the
+//     binaryTarget vends MUST be named `CeraFFI` exactly.
 //   - `Cera` (Swift target) — holds the UniFFI-generated Swift wrapper
 //     (`cera_ffi.swift`). It is a COMMITTED COPY of
-//     `cera-ffi/bindings/swift/cera_ffi.swift`; re-sync it after regenerating
-//     the bindings with `just spm-sync-binding` (the two files must stay
-//     byte-identical or the Swift surface drifts from the Rust FFI). Depends on
-//     `CeraFFI` so `import cera_ffiFFI` resolves against the binaryTarget's
-//     clang module.
+//     `cera-ffi/bindings/swift/cera_ffi.swift`, because a `.package(url:)`
+//     consumer never has the Rust tree to generate from. `just bindings` writes
+//     both, and `just bindings-check` diffs both in CI, so the two cannot
+//     drift; do not hand-edit this copy. Depends on `CeraFFI` so
+//     `import CeraFFI` resolves against the binaryTarget's clang module.
 //
 // ── Release wiring ──────────────────────────────────────────────────────────
 // The `url` + `checksum` below carry the literal placeholders `RELEASE_VERSION`
@@ -81,22 +87,15 @@ let package = Package(
         .target(
             name: "Cera",
             dependencies: ["CeraFFI"],
-            path: "cera-ffi/apple/Sources/Cera",
-            // The XCFramework is a Metal-enabled *static* library. A
-            // `.binaryTarget` static lib does NOT auto-link the system
-            // frameworks its symbols reference, so consumers must link
-            // them explicitly or they hit undefined-symbol errors at
-            // link time. The Metal backend references Metal.framework
-            // (device / command queue / MSL pipeline objects) and
-            // Foundation (Metal's Objective-C runtime dependency).
-            // Accelerate is NOT listed: the Rust `accelerate-src` dep is
-            // wired for the native-macOS BLAS path only and the linker
-            // resolves it from the staticlib without a framework flag on
-            // the slices we ship — adding it here would be dead weight.
-            linkerSettings: [
-                .linkedFramework("Metal"),
-                .linkedFramework("Foundation"),
-            ]
+            path: "cera-ffi/apple/Sources/Cera"
+            // No `linkerSettings`. The XCFramework vends dynamic
+            // frameworks, which record their own dependencies
+            // (Metal.framework for the device / command queue / MSL
+            // pipeline objects, Foundation for Metal's Objective-C
+            // runtime) in their load commands, so dyld resolves them
+            // without the consumer restating anything. The static-lib
+            // era needed `.linkedFramework` here; re-adding it now would
+            // just be dead weight.
         ),
     ]
 )

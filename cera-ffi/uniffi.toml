@@ -1,0 +1,17 @@
+# UniFFI bindings configuration.
+#
+# Read by `uniffi-bindgen` (see `just bindings`) from next to this crate's
+# Cargo.toml. Without it every naming default applies.
+
+[bindings.swift]
+# Name of the low-level C module: the header, the module map, the clang module,
+# and the `import` line inside the generated `cera_ffi.swift`.
+#
+# The default is `{module_name}FFI`, and since the crate is already named
+# `cera-ffi` (namespace `cera_ffi`), that produced `cera_ffiFFI` — a stutter of
+# "ffi" plus "FFI", in mixed snake_case and caps. It also leaked into the
+# XCFramework, because a framework's clang module takes the framework's name.
+#
+# This is internal plumbing: consumers import the friendly `Cera` wrapper target
+# (see the root Package.swift), never this module. Renaming it is safe.
+ffi_module_name = "CeraFFI"

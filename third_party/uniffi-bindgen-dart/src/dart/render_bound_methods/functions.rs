@@ -419,59 +419,12 @@ pub(super) fn render_toplevel_functions(
                     None => out.push_str("      return;\n"),
                     Some(ret_type) => match ffi_return_type.as_ref() {
                         Some(FfiType::RustBuffer(_)) => {
-                            let decode_expr = match runtime_unwrapped_type(ret_type) {
-                                Type::String => lift_custom_if_needed(
-                                    "utf8.decode(retBytes)",
-                                    ret_type,
-                                    ctx.custom_types,
-                                ),
-                                Type::Bytes => {
-                                    lift_custom_if_needed("retBytes", ret_type, ctx.custom_types)
-                                }
-                                Type::Record { name, .. } | Type::Enum { name, .. } => {
-                                    format!("_uniffiDecode{}(retBytes)", to_upper_camel(name))
-                                }
-                                _ => render_uniffi_binary_read_expression(
-                                    ret_type,
-                                    "retReader",
-                                    ctx.enums,
-                                    ctx.custom_types,
-                                ),
-                            };
-                            out.push_str(
-                                "      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();\n",
+                            render_ffibuffer_rustbuffer_return(
+                                out,
+                                ret_type,
+                                ctx.enums,
+                                ctx.custom_types,
                             );
-                            out.push_str(
-                                "      retBufPtr.ref\n        ..capacity = (returnBuf + 0).ref.u64\n        ..len = (returnBuf + 1).ref.u64\n        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();\n",
-                            );
-                            out.push_str("      rustRetBufferPtrs.add(retBufPtr);\n");
-                            out.push_str(
-                                "      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));\n",
-                            );
-                            if matches!(
-                                runtime_unwrapped_type(ret_type),
-                                Type::String
-                                    | Type::Bytes
-                                    | Type::Record { .. }
-                                    | Type::Enum { .. }
-                            ) {
-                                out.push_str(&format!(
-                                    "      final decodedValue = {decode_expr};\n"
-                                ));
-                            } else {
-                                out.push_str(
-                                    "      final _UniFfiBinaryReader retReader = _UniFfiBinaryReader(retBytes);\n",
-                                );
-                                out.push_str(&format!(
-                                    "      final decodedValue = {decode_expr};\n"
-                                ));
-                                out.push_str("      if (!retReader.isDone) {\n");
-                                out.push_str(
-                                    "        throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');\n",
-                                );
-                                out.push_str("      }\n");
-                            }
-                            out.push_str("      return decodedValue;\n");
                         }
                         _ => {
                             let Some(union_field) = ffi_return_type

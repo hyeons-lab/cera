@@ -11,12 +11,29 @@ fn has_nullable_field(fields: &[UdlArg]) -> bool {
         .any(|f| matches!(f.type_, Type::Optional { .. }))
 }
 
+/// Where a record's or enum's methods should dispatch to.
+///
+/// Records and enums are otherwise pure Dart, which is why the web stub can
+/// share this renderer instead of duplicating it. Their *methods* are the one
+/// exception: those cross the FFI boundary through `_bindings()`, which does not
+/// exist in a stub with no `dart:ffi`. Rendering them as unsupported keeps the
+/// two files' public surfaces identical, which is the property that lets a
+/// conditional export compile on both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MethodDispatch {
+    /// Call through `_bindings()`, for the native bindings.
+    Bindings,
+    /// Throw `UnsupportedError`, for the web stub.
+    Unsupported,
+}
+
 pub(super) fn render_data_models(
     records: &[UdlRecord],
     enums: &[UdlEnum],
     callback_interfaces: &[UdlCallbackInterface],
     emit_uniffi_error_lift_helpers: bool,
     custom_types: &HashMap<String, CustomTypeConfig>,
+    dispatch: MethodDispatch,
 ) -> String {
     let mut out = String::new();
 
@@ -153,7 +170,9 @@ pub(super) fn render_data_models(
             out.push('\n');
             out.push_str(&render_doc_comment(method.docstring.as_deref(), "  "));
             out.push_str(&format!("  {signature_return} {method_name}({args}) {{\n"));
-            if method.is_async
+            if dispatch == MethodDispatch::Unsupported {
+                out.push_str(&render_unsupported_method_body(&class_name, &method_name));
+            } else if method.is_async
                 && !is_runtime_async_rust_future_compatible_method(
                     method,
                     callback_interfaces,
@@ -306,7 +325,9 @@ pub(super) fn render_data_models(
             out.push('\n');
             out.push_str(&render_doc_comment(method.docstring.as_deref(), "  "));
             out.push_str(&format!("  {signature_return} {method_name}({args}) {{\n"));
-            if method.is_async
+            if dispatch == MethodDispatch::Unsupported {
+                out.push_str(&render_unsupported_method_body(&enum_name, &method_name));
+            } else if method.is_async
                 && !is_runtime_async_rust_future_compatible_method(
                     method,
                     callback_interfaces,
