@@ -214,3 +214,41 @@ fn cpu_and_gpu_agree_on_position_after_a_prefix() {
          cosine {cos:.6}"
     );
 }
+
+/// The batched override must agree with the CPU model frame for frame.
+///
+/// The readback count is pinned separately in
+/// `gpu_lfm2_embedding_readbacks.rs`; counting alone would pass just as happily
+/// if the override seeded the frames wrongly, or skipped them.
+#[test]
+fn multi_frame_prefill_from_embeddings_matches_the_cpu_model() {
+    let Some(path) = fixture_or_skip() else {
+        return;
+    };
+    let Some(gpu) = load_gpu(&path) else { return };
+    let cpu = load_cpu(&path);
+
+    let hidden_size = cpu.config().hidden_size;
+    const FRAMES: usize = 6;
+    let embeddings: Vec<f32> = (0..FRAMES)
+        .flat_map(|i| synthetic_embedding(hidden_size, 0xF00D + i as u32))
+        .collect();
+
+    let mut cpu_state = InferenceState::from_config(cpu.config()).expect("state");
+    let mut gpu_state = InferenceState::from_config(gpu.config()).expect("state");
+
+    let cpu_logits = cpu.forward_prefill_from_embeddings(&embeddings, FRAMES, 0, &mut cpu_state);
+    let gpu_logits = gpu.forward_prefill_from_embeddings(&embeddings, FRAMES, 0, &mut gpu_state);
+
+    assert_eq!(
+        cpu_state.seq_len, gpu_state.seq_len,
+        "backends disagree on how far a {FRAMES}-frame image advanced the cache"
+    );
+    let cos = cosine(&cpu_logits, &gpu_logits);
+    assert!(
+        cos > 0.999,
+        "GPU multi-frame prefill_from_embeddings diverged from CPU: cosine \
+         {cos:.6}. The logits are the last frame's, so a low cosine means the \
+         frames were seeded at the wrong positions or in the wrong order."
+    );
+}

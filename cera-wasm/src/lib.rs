@@ -2226,13 +2226,15 @@ mod webgpu {
                 }));
             }
 
-            cera::model::Model::forward_prefill_from_embeddings(
-                &self.model,
-                &img_tokens,
-                n_tokens,
-                start,
-                &mut self.state,
-            );
+            // `seed_embeddings`, not `Model::forward_prefill_from_embeddings`:
+            // the trait method ends in a blocking `download_f32`, and blocking
+            // is exactly what this thread must not do. The readback completes
+            // from the JS event loop, which cannot run until this call returns,
+            // so waiting on it here hangs the worker outright. The logits it
+            // would fetch are discarded on this path anyway; appending an image
+            // wants the KV cache, nothing more.
+            self.model
+                .seed_embeddings(&img_tokens, n_tokens, start, &mut self.state);
             self.state.seq_len = end;
             Ok(())
         }

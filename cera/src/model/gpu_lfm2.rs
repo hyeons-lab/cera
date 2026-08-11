@@ -2693,6 +2693,72 @@ impl GpuLfm2Model {
         );
     }
 
+    /// Append `n_tokens` embedding frames to the KV cache, reading nothing
+    /// back.
+    ///
+    /// This is the entry point the browser needs. `Model::forward_from_embedding`
+    /// and [`Model::forward_prefill_from_embeddings`] both end in a blocking
+    /// `download_f32`, which on wasm waits forever: the buffer-map callback it
+    /// waits for is delivered by the JS event loop, and the thread calling it is
+    /// the one that would have to return for that loop to run. Appending an
+    /// image wants the KV cache updated and nothing else, so the readback is not
+    /// merely unaffordable there, it is unnecessary.
+    ///
+    /// Logits for the last frame are left in `logits_buf` for a caller that does
+    /// want them to fetch on its own terms (blocking natively, or via
+    /// `begin_download` on wasm).
+    pub fn seed_embeddings(
+        &self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _lora_guard = self.resolve_lora(state);
+        self.seed_embeddings_locked(embeddings, n_tokens, start_pos, state);
+    }
+
+    /// [`Self::seed_embeddings`] with `infer_lock` and the LoRA guard already
+    /// held by the caller, so the two entry points cannot disagree about how a
+    /// frame run is seeded.
+    fn seed_embeddings_locked(
+        &self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) {
+        let hidden_size = self.config.hidden_size;
+        assert!(n_tokens > 0, "seed_embeddings requires at least one frame");
+        assert_eq!(
+            embeddings.len(),
+            n_tokens * hidden_size,
+            "embeddings.len() ({}) != n_tokens ({}) * hidden_size ({})",
+            embeddings.len(),
+            n_tokens,
+            hidden_size
+        );
+
+        // Same fresh-prefill reset as the token path and the Metal twin: at
+        // position zero the GPU-resident counter and the conv rolling buffers
+        // still hold whatever a previous generate() left, and the embeddings
+        // path has no prefix-cache restore to overwrite them.
+        if start_pos == 0 {
+            self.gpu_state.seq_len.store(0, Ordering::Relaxed);
+            self.zero_conv_buffers_locked();
+        }
+
+        for i in 0..n_tokens {
+            let frame = &embeddings[i * hidden_size..(i + 1) * hidden_size];
+            // `state.seq_len`, not `start_pos + i`: the compute tail advances it
+            // per frame, and matching `forward_from_embedding` here is what
+            // keeps a spliced image landing where the caller's state says.
+            let pos = state.seq_len;
+            self.forward_inner_compute_from_embedding(frame, pos, state);
+        }
+    }
+
     /// As [`Self::forward_inner_compute`], but also encodes the greedy argmax —
     /// and optionally its readback copy — into the *same* encoder as the output
     /// projection. See [`TailArgmax`] for why the two are separable.
@@ -5307,6 +5373,42 @@ impl Model for GpuLfm2Model {
         // splicing an image into a prompt track position through the state.
         let pos = state.seq_len;
         self.forward_inner_compute_from_embedding(embedding, pos, state);
+        self.ctx
+            .download_f32(&self.logits_buf, self.config.vocab_size)
+    }
+
+    /// Overridden so an image costs **one** logits readback instead of one per
+    /// patch token.
+    ///
+    /// The default in `model/mod.rs` loops [`Model::forward_from_embedding`],
+    /// and every one of those ends in a blocking `download_f32`. Two problems,
+    /// and the second is fatal rather than merely slow:
+    ///
+    /// - Natively it pulls a full vocab-sized vector per frame and discards all
+    ///   but the last, which for a many-token image is most of the work.
+    /// - On wasm it deadlocks. `download_f32` blocks in `mpsc::recv` waiting on
+    ///   the buffer-map callback, and `poll_wait()` is a no-op there because
+    ///   WebGPU is driven by the JS event loop, which cannot run while this
+    ///   thread is the one blocking it. See `GpuContext::begin_download`, whose
+    ///   docs spell out that the blocking helpers have no wasm analog.
+    ///
+    /// Seeding is therefore split from the readback: frames go through
+    /// `seed_embeddings_locked` (private, hence not linked), which leaves
+    /// logits on the GPU, and
+    /// only the final frame's are brought back. Callers that want no readback
+    /// at all (appending an image is one: it needs the KV cache, not logits)
+    /// should call [`Self::seed_embeddings`] instead, which is the only form
+    /// that is safe to call on wasm.
+    fn forward_prefill_from_embeddings(
+        &self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _lora_guard = self.resolve_lora(state);
+        self.seed_embeddings_locked(embeddings, n_tokens, start_pos, state);
         self.ctx
             .download_f32(&self.logits_buf, self.config.vocab_size)
     }
