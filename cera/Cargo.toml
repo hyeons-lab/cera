@@ -140,6 +140,13 @@ required-features = ["mmap", "parallel"]
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+# `tests/from_parts_vl.rs` encodes a tiny PNG to exercise the image path.
+# Already in the tree as an optional dep behind `vl-preprocess`, so this
+# adds no new crate — it just makes the encoder reachable from tests.
+# Default features off: only the PNG codec is needed, not the whole
+# format zoo, and a hand-written byte array is how the first attempt at
+# this test shipped an invalid CRC.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # The `simd128` kernels in `backend/simd.rs` can only be executed on wasm, so
 # their oracle tests against the scalar reference need a wasm runner. Same

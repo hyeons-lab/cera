@@ -72,6 +72,19 @@ wasm-bindgen-rayon = { workspace = true, optional = true }
 wasm-bindgen-test = { workspace = true }
 
 [features]
+# Image input is on by default because a VL bundle that loads but cannot
+# accept an image is a worse failure than a slightly larger download: the
+# engine reports `capabilities.imageIn = false` and `appendImage` throws,
+# which reads as a broken model rather than a missing build flag.
+default = ["vl"]
+
+# `vl` — image input. Turns on `cera/vl-preprocess` (PNG/JPEG decode +
+# resize + normalize via the pure-Rust `image` crate, no system libpng or
+# libjpeg). Without it `Session.appendImage` compiles but always returns
+# `UnsupportedModality`. Text-only or raw-PCM-audio-only deployments can
+# `--no-default-features` to drop the decoders from the `.wasm`.
+vl = ["cera/vl-preprocess"]
+
 # `parallel` — opt-in multi-threaded wasm build. Lights up
 # `cera/parallel` (rayon) and links `wasm-bindgen-rayon`, which
 # emits a `#[wasm_bindgen]` `initThreadPool(numThreads)` export

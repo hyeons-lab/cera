@@ -91,12 +91,11 @@ const TS_CAPABILITIES: &'static str = r#"
  * bindings (cera-ffi) so cross-platform consumers can probe the
  * same fields regardless of which binding they're driving.
  *
- * Note: under cera-wasm's current loader (`fromGgufBytes`), the
- * model's `inference_type` is synthesized as text-only — these
- * flags will report `textIn: true, textOut: true` and `false`
- * for everything else even for genuinely audio- or
- * image-capable models. A model-aware loader (planned) will
- * make these flags reflect the real capability surface.
+ * These describe the bundle that was actually loaded. A model
+ * opened with `fromGgufBytes` is text-only by construction, since
+ * one GGUF cannot carry a vision tower or an audio encoder: load
+ * the multimodal projector alongside it via `fromGgufParts` for
+ * `imageIn` / `audioIn` to be true.
  */
 export interface Capabilities {
     readonly textIn: boolean;
@@ -104,6 +103,32 @@ export interface Capabilities {
     readonly imageIn: boolean;
     readonly audioIn: boolean;
     readonly audioOut: boolean;
+}
+"#;
+
+/// TS declaration for the `ModelMetadata` record. See `TS_CAPABILITIES`
+/// for why these interfaces are hand-declared rather than derived.
+#[wasm_bindgen(typescript_custom_section)]
+const TS_MODEL_METADATA: &'static str = r#"
+/**
+ * Summary of a loaded model, returned by `CeraEngine.metadata`.
+ * Mirrors the `ModelMetadata` record the JVM/Apple bindings
+ * (cera-ffi) expose, so cross-platform consumers read the same
+ * field names from either binding.
+ *
+ * Every field is also available as an individual getter on
+ * `CeraEngine`. This is the one-call form: each getter is a
+ * separate wasm boundary crossing, so prefer this when you want
+ * several of them at once (rendering a model-info panel, say).
+ */
+export interface ModelMetadata {
+    readonly architecture: string;
+    readonly maxSeqLen: number;
+    readonly vocabSize: number;
+    readonly hasChatTemplate: boolean;
+    readonly quantization: string;
+    readonly addBosToken: boolean;
+    readonly addEosToken: boolean;
 }
 "#;
 
@@ -116,6 +141,41 @@ extern "C" {
     /// destructuring (`const { audioIn } = engine.capabilities`).
     #[wasm_bindgen(typescript_type = "Capabilities")]
     pub type Capabilities;
+
+    /// Opaque type-label wrapper for the `ModelMetadata` interface above,
+    /// same arrangement as `Capabilities`.
+    #[wasm_bindgen(typescript_type = "ModelMetadata")]
+    pub type ModelMetadata;
+}
+
+/// Build a JS-side `ModelMetadata` object from cera core's own struct.
+fn metadata_to_js(md: &cera::ModelMetadata) -> ModelMetadata {
+    let obj = js_sys::Object::new();
+    // As in `capabilities_to_js`: `Reflect::set` cannot fail against a
+    // freshly-made object, so the `Result` is discarded per field.
+    let set = |key: &str, value: JsValue| {
+        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), &value);
+    };
+    set("architecture", JsValue::from_str(&md.architecture));
+    set("maxSeqLen", JsValue::from_f64(md.max_seq_len as f64));
+    set("vocabSize", JsValue::from_f64(md.vocab_size as f64));
+    set("hasChatTemplate", JsValue::from_bool(md.has_chat_template));
+    set("quantization", JsValue::from_str(&md.quantization));
+    set("addBosToken", JsValue::from_bool(md.add_bos_token));
+    set("addEosToken", JsValue::from_bool(md.add_eos_token));
+    JsValue::from(obj).unchecked_into()
+}
+
+/// Describe the CPU backend tier this build resolved at runtime, e.g.
+/// `"tier=wasm_simd128 [simd128]"`.
+///
+/// Diagnostic: it tells you whether the SIMD kernels are actually live,
+/// which is the difference between roughly 1.4 and 0.64 tokens/second on the
+/// wasm CPU path. A browser without the simd128 proposal, or a `.wasm` built
+/// without `+simd128`, reports the scalar tier.
+#[wasm_bindgen(js_name = cpuBackendReport)]
+pub fn cpu_backend_report() -> String {
+    cera::cpu_features().report()
 }
 
 /// Build a JS-side `Capabilities` object from a cera core
@@ -297,6 +357,62 @@ impl CeraEngine {
             .map_err(map_cera_err)
     }
 
+    /// Load a multi-file bundle: the model GGUF plus its multimodal
+    /// projector ("mmproj"). This is the constructor a VL or audio model
+    /// needs, and `fromGgufBytes` structurally cannot be: the vision tower
+    /// and the audio encoder live in a *second* GGUF, and that one takes a
+    /// single buffer.
+    ///
+    /// `mmproj` may be `null`, in which case this is exactly
+    /// `fromGgufBytes` with an explicit context size.
+    ///
+    /// **Modality is inferred from the arguments, not just the header.**
+    /// Every published LFM2-VL model reports `architecture = "lfm2"`, the
+    /// same string a text model reports, because the vision half is entirely
+    /// in the mmproj. So passing an `mmproj` alongside a text-arch model is
+    /// taken as the statement of intent it is and loads as image-to-text;
+    /// audio models already identify themselves and are unaffected. Pass
+    /// `inferenceType` explicitly to override (`"llama.cpp/text-to-text"`,
+    /// `"llama.cpp/image-to-text"`, `"llama.cpp/lfm2-audio-v1"`).
+    ///
+    /// A malformed or mismatched mmproj is **not** fatal: it warns and the
+    /// bundle still serves text, with `capabilities.imageIn` staying false
+    /// and `appendImage` throwing "no vision encoder attached". That mirrors
+    /// the native loaders rather than failing a whole page load over a
+    /// sidecar.
+    ///
+    /// **Memory:** both buffers stay resident in wasm linear memory for the
+    /// engine's lifetime. A VL bundle is the model *plus* the tower.
+    #[wasm_bindgen(js_name = fromGgufParts)]
+    pub fn from_gguf_parts(
+        bytes: Vec<u8>,
+        mmproj: Option<Vec<u8>>,
+        context_size: Option<u32>,
+        inference_type: Option<String>,
+    ) -> Result<CeraEngine, JsError> {
+        // See `from_gguf_bytes` for why the spread is deliberate.
+        #[allow(clippy::needless_update)]
+        let cfg = cera::EngineConfig {
+            context_size: context_size.unwrap_or(4096) as usize,
+            backend: cera::BackendPreference::Cpu,
+            ..cera::EngineConfig::default()
+        };
+        let parts = cera::ModelBytes {
+            model: bytes.into(),
+            multimodal_projector: mmproj.map(Into::into),
+            // `parse_str` maps anything unrecognized to `Unknown(s)`, which
+            // `from_parts` rejects by name — better than silently falling
+            // back to text when a caller fat-fingers the string.
+            inference_type: inference_type
+                .as_deref()
+                .map(cera::manifest::InferenceType::parse_str),
+            chat_template: None,
+        };
+        cera::CeraEngine::from_parts(parts, cfg)
+            .map(|inner| CeraEngine { inner })
+            .map_err(map_cera_err)
+    }
+
     /// Model architecture string from the GGUF metadata
     /// (e.g. `"lfm2"`, `"llama"`).
     #[wasm_bindgen(getter)]
@@ -355,16 +471,15 @@ impl CeraEngine {
     /// See the `Capabilities` interface in the generated `.d.ts`
     /// for the field shape.
     ///
-    /// **Caveat:** today cera-wasm only loads models via
-    /// `CeraEngine.fromGgufBytes`, which routes through cera's
-    /// synthetic-text manifest path. As a result this getter
-    /// always returns `{ textIn: true, textOut: true, imageIn:
-    /// false, audioIn: false, audioOut: false }` — even for
-    /// genuinely audio- or image-capable models. The shape is
-    /// exposed now so JS code stabilizes against the same surface
-    /// the JVM/Apple bindings (cera-ffi) report; a model-aware
-    /// loader (planned) will make these flags reflect the real
-    /// capability surface without a binding break.
+    /// These reflect the bundle you actually loaded. A model opened with
+    /// `fromGgufBytes` is text-only by construction and reports
+    /// `{ textIn: true, textOut: true }` with everything else false, because
+    /// a single GGUF cannot carry a vision tower or an audio encoder. To get
+    /// `imageIn` or `audioIn`, load the mmproj too via `fromGgufParts`.
+    ///
+    /// A bundle whose mmproj failed to parse reports the flag as false and
+    /// logs a warning, so this stays an accurate answer about what the
+    /// engine can do rather than what the caller intended.
     #[wasm_bindgen(getter)]
     pub fn capabilities(&self) -> Capabilities {
         capabilities_to_js(self.inner.capabilities())
@@ -389,6 +504,56 @@ impl CeraEngine {
     #[wasm_bindgen(getter, js_name = contextSize)]
     pub fn context_size(&self) -> u32 {
         self.inner.config().context_size as u32
+    }
+
+    /// Everything `CeraEngine`'s individual metadata getters report, in one
+    /// object. See the `ModelMetadata` interface in the generated `.d.ts`.
+    #[wasm_bindgen(getter)]
+    pub fn metadata(&self) -> ModelMetadata {
+        metadata_to_js(self.inner.metadata())
+    }
+
+    /// Transcribe mono `f32` PCM audio (roughly normalized to `[-1.0, 1.0]`)
+    /// to text, using the model's own audio encoder and chat template.
+    ///
+    /// `sampleRate` is the rate of the samples you pass; cera resamples to
+    /// whatever the encoder wants. A typical browser source is
+    /// `AudioBuffer.getChannelData(0)` after decoding through
+    /// `AudioContext.decodeAudioData`, whose `sampleRate` you read off the
+    /// same `AudioBuffer`.
+    ///
+    /// Requires an audio bundle loaded through `fromGgufParts` with its
+    /// mmproj; otherwise this throws `"modality not supported by this
+    /// model"`. This runs a full prefill + decode, so it is *slow* on the
+    /// wasm CPU backend for anything but short clips.
+    #[wasm_bindgen]
+    pub fn transcribe(&self, pcm: &[f32], sample_rate: u32) -> Result<String, JsError> {
+        self.inner
+            .transcribe(pcm, sample_rate)
+            .map_err(map_cera_err)
+    }
+
+    /// The tool-call format auto-detected from this model's architecture, or
+    /// `undefined` when the architecture has no known tool convention.
+    ///
+    /// Engine-level counterpart to the free `detectToolFormat(architecture)`
+    /// function: this one already knows the loaded model's architecture, so
+    /// it cannot disagree with it.
+    #[wasm_bindgen(js_name = toolFormat)]
+    pub fn tool_format(&self) -> Option<ToolFormat> {
+        cera::tools::ToolFormat::detect(&self.inner.model().config().architecture).map(Into::into)
+    }
+
+    /// The token id of `format`'s tool-call start marker (e.g.
+    /// `<|tool_call_start|>`) in this model's vocab, for use as a lazy
+    /// grammar trigger in `GenerateOpts.grammarTriggerTokens`.
+    /// `undefined` when this tokenizer lacks that special token.
+    #[wasm_bindgen(js_name = toolCallStartToken)]
+    pub fn tool_call_start_token(&self, format: ToolFormat) -> Option<u32> {
+        let fmt: cera::tools::ToolFormat = format.into();
+        self.inner
+            .tokenizer()
+            .special_token_id(fmt.call_start_marker())
     }
 
     /// Returns a `Tokenizer` handle bound to this engine's vocab.
@@ -639,15 +804,24 @@ impl From<ToolFormat> for cera::tools::ToolFormat {
     }
 }
 
+impl From<cera::tools::ToolFormat> for ToolFormat {
+    fn from(f: cera::tools::ToolFormat) -> Self {
+        match f {
+            cera::tools::ToolFormat::Lfm2Pythonic => ToolFormat::Lfm2Pythonic,
+            cera::tools::ToolFormat::Hermes => ToolFormat::Hermes,
+        }
+    }
+}
+
 /// Detect the tool-call format for a model architecture string (`"lfm2"`,
 /// `"qwen3"`, …). Returns `undefined` for architectures with no known
 /// convention.
+///
+/// Prefer `CeraEngine.toolFormat` when you have an engine: it reads the
+/// loaded model's own architecture, so it cannot be given the wrong string.
 #[wasm_bindgen(js_name = detectToolFormat)]
 pub fn detect_tool_format(architecture: &str) -> Option<ToolFormat> {
-    cera::tools::ToolFormat::detect(architecture).map(|f| match f {
-        cera::tools::ToolFormat::Lfm2Pythonic => ToolFormat::Lfm2Pythonic,
-        cera::tools::ToolFormat::Hermes => ToolFormat::Hermes,
-    })
+    cera::tools::ToolFormat::detect(architecture).map(Into::into)
 }
 
 /// Parse tool calls out of generated model text. Returns a JSON string
@@ -1393,13 +1567,12 @@ impl Session {
     /// - `"empty input"` if `samples.length === 0` — fast-fail at
     ///   the wasm boundary, parity with `appendText` /
     ///   `appendTokens` empty-input rejection.
-    /// - `"modality not supported by this model"` for text-only
-    ///   models (`session.capabilities.audioIn === false` —
-    ///   currently always `false` under the synthetic-text
-    ///   loader; see `CeraEngine.capabilities` doc).
-    /// - `"backend: Session::append_audio is not yet implemented for audio-capable models — ..."`
-    ///   for audio-capable models — placeholder string until the
-    ///   real implementation lands.
+    /// - `"modality not supported by this model"` when
+    ///   `session.capabilities.audioIn === false`. Load the bundle's
+    ///   mmproj through `CeraEngine.fromGgufParts` to get an
+    ///   audio-capable session; `fromGgufBytes` cannot produce one.
+    /// - `"backend: Session::append_audio: no audio encoder attached..."`
+    ///   when the bundle claimed audio but its mmproj failed to parse.
     #[wasm_bindgen(js_name = appendAudio)]
     pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), JsError> {
         if samples.is_empty() {
@@ -1408,6 +1581,53 @@ impl Session {
         self.inner
             .append_audio(samples, sample_rate)
             .map_err(map_cera_err)
+    }
+
+    /// Encode an image and append its embeddings to the KV cache.
+    ///
+    /// `bytes` is an encoded image file (PNG or JPEG), not raw pixels: pass
+    /// a `Uint8Array` over a `fetch` response, a `File`/`Blob`
+    /// `arrayBuffer()`, or a canvas `toBlob` result.
+    ///
+    /// `maxLongSize` caps the longest side of the **encoded** image in
+    /// pixels, trading detail for speed and token count:
+    ///
+    /// - `null`/omitted — use the session default
+    ///   (`setImageMaxLongSize`, itself unset by default).
+    /// - `0` — force *no* cap for this call, overriding a session default.
+    /// - `n` — cap at `n` pixels.
+    ///
+    /// Requires a VL bundle (`capabilities.imageIn === true`), which means
+    /// loading via `CeraEngine.fromGgufParts` with the vision mmproj.
+    /// Otherwise this throws `"modality not supported by this model"`.
+    /// Building `cera-wasm` with `--no-default-features` (dropping the `vl`
+    /// feature) produces the same error, since the image decoders are gone.
+    #[wasm_bindgen(js_name = appendImage)]
+    pub fn append_image(
+        &mut self,
+        bytes: &[u8],
+        max_long_size: Option<u32>,
+    ) -> Result<(), JsError> {
+        // Mirrors cera-ffi's mapping so the two bindings agree on what a
+        // `0` means. Delegating to `append_image` for `None` (rather than
+        // always calling the `_with_opts` form) is what keeps the session
+        // default reachable.
+        match max_long_size {
+            None => self.inner.append_image(bytes),
+            Some(0) => self.inner.append_image_with_opts(bytes, None),
+            Some(n) => self.inner.append_image_with_opts(bytes, Some(n)),
+        }
+        .map_err(map_cera_err)
+    }
+
+    /// Set the session-default cap on the longest side of an appended
+    /// image, in pixels. `null` clears it (no cap).
+    ///
+    /// Applies to later `appendImage` calls that pass no explicit
+    /// `maxLongSize`. A per-call value always wins.
+    #[wasm_bindgen(js_name = setImageMaxLongSize)]
+    pub fn set_image_max_long_size(&mut self, max_long_size: Option<u32>) {
+        self.inner.set_image_max_long_size(max_long_size);
     }
 
     /// Current KV cache position (number of tokens currently held).

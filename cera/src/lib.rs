@@ -59,7 +59,9 @@ pub mod turboquant;
 // `use cera::{Session, ModalitySink, ...}` rather than reaching into
 // `cera::session::*`.
 pub use backend::cpu_features::{CpuFeatures, CpuTier, cpu_features, cpu_tier};
-pub use engine::{BackendPreference, CeraEngine, EngineConfig, ModelFiles, ModelMetadata};
+pub use engine::{
+    BackendPreference, CeraEngine, EngineConfig, ModelBytes, ModelFiles, ModelMetadata,
+};
 pub use session::{
     CeraError, FinishReason, GenerateOpts, GenerateSummary, ModalityCapabilities, ModalitySink,
     Session, SessionConfig, SpecDecode,
