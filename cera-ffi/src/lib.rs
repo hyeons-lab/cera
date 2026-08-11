@@ -837,11 +837,67 @@ impl CeraEngine {
     ///
     /// Text-only: the bytes are a bare GGUF with no accompanying
     /// manifest, so there is nothing to point at a vision encoder or an
-    /// audio decoder. Multimodal models need `from_path` or
+    /// audio decoder. Multimodal models need
+    /// [`CeraEngine::from_parts`], `from_path`, or
     /// [`CeraEngine::from_bundle_id`]. `config.bundle_repo` is ignored.
     #[uniffi::constructor]
     pub fn from_bytes(bytes: Vec<u8>, config: EngineConfig) -> Result<Arc<Self>, FfiError> {
         let inner = cera::CeraEngine::from_bytes(bytes, config.try_into()?)?;
+        Ok(Arc::new(Self { inner }))
+    }
+
+    /// Load a multi-file bundle from memory: the model GGUF plus its
+    /// multimodal projector ("mmproj").
+    ///
+    /// This is the constructor a VL or audio model needs when there is
+    /// no filesystem, and [`CeraEngine::from_bytes`] structurally cannot
+    /// be: the vision tower and the audio encoder live in a *second*
+    /// GGUF, and that one takes a single buffer. Same inputs and same
+    /// rules as the wasm build's `fromGgufParts`, so a portable layer
+    /// over both has one shape to target.
+    ///
+    /// `multimodal_projector` may be `None`, which makes this exactly
+    /// `from_bytes` with an explicit config.
+    ///
+    /// **Modality is inferred from the arguments, not just the header.**
+    /// Every published LFM2-VL model reports `architecture = "lfm2"`,
+    /// the same string a text model reports, because the vision half is
+    /// entirely in the mmproj. So supplying one alongside a text-arch
+    /// model is taken as the statement of intent it is and loads as
+    /// image-to-text; audio models already identify themselves and are
+    /// unaffected. Pass `inference_type` explicitly to override
+    /// (`"llama.cpp/text-to-text"`, `"llama.cpp/image-to-text"`,
+    /// `"llama.cpp/lfm2-audio-v1"`).
+    ///
+    /// A malformed or mismatched mmproj is **not** fatal: it warns, and
+    /// the bundle still serves text with `capabilities().image_in`
+    /// staying false. That mirrors the path-based loaders rather than
+    /// failing a whole load over a sidecar.
+    ///
+    /// **Prefer `from_path` whenever a path exists**, for the same
+    /// memory reason as [`CeraEngine::from_bytes`]: these buffers are
+    /// committed resident memory for the engine's lifetime, and a VL
+    /// bundle is the model *plus* the tower. `config.bundle_repo` is
+    /// ignored.
+    #[uniffi::constructor]
+    pub fn from_parts(
+        bytes: Vec<u8>,
+        multimodal_projector: Option<Vec<u8>>,
+        inference_type: Option<String>,
+        config: EngineConfig,
+    ) -> Result<Arc<Self>, FfiError> {
+        let parts = cera::ModelBytes {
+            model: bytes.into(),
+            multimodal_projector: multimodal_projector.map(Into::into),
+            // `parse_str` maps anything unrecognized to `Unknown(s)`,
+            // which `from_parts` rejects by name — better than silently
+            // falling back to text when a caller fat-fingers the string.
+            inference_type: inference_type
+                .as_deref()
+                .map(cera::manifest::InferenceType::parse_str),
+            chat_template: None,
+        };
+        let inner = cera::CeraEngine::from_parts(parts, config.try_into()?)?;
         Ok(Arc::new(Self { inner }))
     }
 
@@ -2270,6 +2326,35 @@ impl CeraEngine {
         let cera_config: cera::EngineConfig = config.try_into()?;
         spawn_engine_build("from_bytes_async", move || {
             cera::CeraEngine::from_bytes(bytes, cera_config)
+        })
+        .await
+    }
+
+    /// Async variant of [`CeraEngine::from_parts`].
+    ///
+    /// Wanted more than the text-only twin, not less: a VL bundle is the
+    /// model *plus* its tower, so there is strictly more parsing to keep
+    /// off the caller's thread, and the vision encoder's weights are
+    /// built during the load. Same weak cancellation, and both buffers
+    /// are moved into the blocking task.
+    #[uniffi::constructor]
+    pub async fn from_parts_async(
+        bytes: Vec<u8>,
+        multimodal_projector: Option<Vec<u8>>,
+        inference_type: Option<String>,
+        config: EngineConfig,
+    ) -> Result<Arc<Self>, FfiError> {
+        let cera_config: cera::EngineConfig = config.try_into()?;
+        spawn_engine_build("from_parts_async", move || {
+            let parts = cera::ModelBytes {
+                model: bytes.into(),
+                multimodal_projector: multimodal_projector.map(Into::into),
+                inference_type: inference_type
+                    .as_deref()
+                    .map(cera::manifest::InferenceType::parse_str),
+                chat_template: None,
+            };
+            cera::CeraEngine::from_parts(parts, cera_config)
         })
         .await
     }
