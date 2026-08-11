@@ -1830,6 +1830,17 @@ mod webgpu {
         tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
         state: cera::kv_cache::InferenceState,
         eos: Option<u32>,
+        /// CPU vision-encoder weights, parsed from the mmproj passed to
+        /// `createWithParts`. `None` for a text-only session. Kept even when
+        /// `gpu_vision_encoder` is present: it is the documented fallback for
+        /// an oversized patch grid or a GPU encode failure.
+        vision_encoder: Option<Arc<cera::model::vision_encoder::VisionEncoderWeights>>,
+        /// The same tower uploaded to the GPU, built once at construction so
+        /// it stays off the per-image path. `None` when the upload failed, in
+        /// which case encoding falls back to `vision_encoder`.
+        gpu_vision_encoder: Option<Arc<dyn cera::model::vision_encoder_gpu::VisionGpuEncode>>,
+        /// Session-default cap on an appended image's longest side.
+        image_max_long_size: Option<u32>,
     }
 
     #[wasm_bindgen]
@@ -1957,7 +1968,58 @@ mod webgpu {
                 tokenizer,
                 state,
                 eos,
+                vision_encoder: None,
+                gpu_vision_encoder: None,
+                image_max_long_size: None,
             })
+        }
+
+        /// As `create`, but also attaches a vision tower from `mmproj`, giving
+        /// the GPU session `appendImage`.
+        ///
+        /// Separate from `create` rather than an extra argument on it so an
+        /// existing call keeps its meaning and its parameter order.
+        ///
+        /// The tower is uploaded to the GPU once here, not per image. If that
+        /// upload fails the session still works and encodes on the CPU, which
+        /// is slower but numerically equivalent; a malformed mmproj leaves
+        /// `imageIn` false and `appendImage` throwing, exactly as on the CPU
+        /// engine.
+        #[wasm_bindgen(js_name = createWithParts)]
+        pub async fn create_with_parts(
+            bytes: Vec<u8>,
+            mmproj: Vec<u8>,
+            context_size: Option<u32>,
+            kv_compression: Option<crate::TurboQuantConfig>,
+        ) -> Result<WebGpuSession, JsError> {
+            let mut session = Self::create(bytes, context_size, kv_compression).await?;
+
+            let proj_gguf = cera::gguf::GgufFile::from_bytes(Arc::from(mmproj)).map_err(map_err)?;
+            let weights =
+                cera::model::vision_encoder::VisionEncoderWeights::from_gguf(&Arc::new(proj_gguf))
+                    .map_err(map_err)?;
+
+            // Reject a tower trained against a different LLM here rather than
+            // at the first `appendImage`: the projection has to land in this
+            // model's hidden space, and a dimension mismatch is a mispaired
+            // bundle, not a runtime condition.
+            let llm_hidden = cera::model::Model::config(&session.model).hidden_size;
+            let proj_dim = weights.config.projection_dim;
+            if proj_dim != llm_hidden {
+                return Err(JsError::new(&format!(
+                    "vision encoder's projection_dim ({proj_dim}) does not match the \
+                     model's hidden_size ({llm_hidden}); the mmproj must pair with \
+                     the LLM it was trained against"
+                )));
+            }
+
+            let weights = Arc::new(weights);
+            session.gpu_vision_encoder = cera::model::vision_encoder_gpu::build_gpu_vision_encoder(
+                &weights,
+                cera::BackendPreference::Gpu,
+            );
+            session.vision_encoder = Some(weights);
+            Ok(session)
         }
 
         /// Number of tokens currently in the KV cache.
@@ -1970,6 +2032,122 @@ mod webgpu {
         #[wasm_bindgen(getter)]
         pub fn position(&self) -> u32 {
             self.state.seq_len as u32
+        }
+
+        /// Whether this session can accept images, i.e. whether it was built
+        /// by `createWithParts` with a usable mmproj.
+        #[wasm_bindgen(getter, js_name = imageIn)]
+        pub fn image_in(&self) -> bool {
+            self.vision_encoder.is_some()
+        }
+
+        /// Set the session-default cap on an appended image's longest side in
+        /// pixels; `null` clears it. A per-call `maxLongSize` still wins.
+        #[wasm_bindgen(js_name = setImageMaxLongSize)]
+        pub fn set_image_max_long_size(&mut self, max_long_size: Option<u32>) {
+            self.image_max_long_size = max_long_size;
+        }
+
+        /// Encode an image (PNG or JPEG bytes) and append its embeddings to
+        /// the KV cache, so a following `generate` / `generateTokens` sees it.
+        ///
+        /// `maxLongSize` follows the CPU session: `null` uses the session
+        /// default, `0` forces no cap for this call, `n` caps at `n` pixels.
+        ///
+        /// Ordering is the caller's to manage, as with `generateTokens`:
+        /// append the image where the chat template puts its `<image>` marker,
+        /// which usually means framing the prompt in two halves around it.
+        ///
+        /// Throws when the session has no vision tower (`imageIn === false`),
+        /// or when the image would overflow the context. Unlike the CPU
+        /// session this cannot shift the KV cache to make room; that
+        /// limitation is pre-existing and applies to prompts too.
+        #[wasm_bindgen(js_name = appendImage)]
+        pub fn append_image(
+            &mut self,
+            bytes: &[u8],
+            max_long_size: Option<u32>,
+        ) -> Result<(), JsError> {
+            let Some(encoder) = self.vision_encoder.clone() else {
+                return Err(crate::map_cera_err(cera::CeraError::UnsupportedModality));
+            };
+            let cap = match max_long_size {
+                None => self.image_max_long_size,
+                Some(0) => None,
+                Some(n) => Some(n),
+            };
+
+            let pre = cera::model::vision_preprocessor::preprocess_image_with_opts(
+                bytes,
+                &encoder.config,
+                cap,
+            )
+            .map_err(crate::map_cera_err)?;
+
+            // Prefer the GPU tower, but only within the attention kernel's
+            // token capacity, and fall back rather than fail on a runtime GPU
+            // error: the CPU encoder is always attached and numerically
+            // equivalent. Same policy as `Session::append_image_with_opts`.
+            let grid_tokens = pre.grid_w.saturating_mul(pre.grid_h);
+            let gpu = self
+                .gpu_vision_encoder
+                .as_ref()
+                .filter(|_| grid_tokens <= cera::model::vision_encoder_gpu::MAX_VIT_TOKENS);
+            let img_tokens = match gpu {
+                Some(g) => match g.encode_image(&pre.pixels, pre.grid_w, pre.grid_h) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(
+                            "gpu vision encode failed ({e:#}); falling back to CPU encoder"
+                        );
+                        encoder
+                            .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
+                            .map_err(map_err)?
+                    }
+                },
+                None => encoder
+                    .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
+                    .map_err(map_err)?,
+            };
+
+            let hidden = cera::model::Model::config(&self.model).hidden_size;
+            if hidden == 0 || !img_tokens.len().is_multiple_of(hidden) {
+                return Err(JsError::new(&format!(
+                    "vision encoder returned {} f32s, not a multiple of hidden_size \
+                     ({hidden}) — malformed image-token tensor",
+                    img_tokens.len()
+                )));
+            }
+            let n_tokens = img_tokens.len() / hidden;
+            if n_tokens == 0 {
+                return Err(crate::map_cera_err(cera::CeraError::EmptyInput));
+            }
+
+            // Check capacity before dispatching: this session has no
+            // context-shift path, so an overflow has to be refused up front
+            // rather than discovered halfway through the frames, which would
+            // leave the cache holding half an image.
+            let start = self.state.seq_len;
+            let max = cera::model::Model::config(&self.model).max_seq_len;
+            let end = start
+                .checked_add(n_tokens)
+                .ok_or_else(|| JsError::new("position overflow appending image embeddings"))?;
+            if end > max {
+                return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
+                    max_seq_len: max as u32,
+                    by: (end - max) as u32,
+                }));
+            }
+
+            cera::model::Model::forward_prefill_from_embeddings(
+                &self.model,
+                &img_tokens,
+                n_tokens,
+                start,
+                &mut self.state,
+            );
+            self.state.seq_len = end;
+            Ok(())
         }
 
         /// The KV-cache mode this session actually resolved to:
