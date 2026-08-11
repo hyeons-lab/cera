@@ -51,8 +51,8 @@ const _prompt = 'In one sentence, why is the sky blue?';
 const _maxTokens = 32;
 
 /// What one arm of the benchmark measured.
-class BenchResult {
-  BenchResult.ok({
+class _BenchResult {
+  _BenchResult.ok({
     required this.label,
     required this.backend,
     required this.promptTokens,
@@ -62,7 +62,7 @@ class BenchResult {
     required this.output,
   }) : error = null;
 
-  BenchResult.failed({required this.label, required this.error})
+  _BenchResult.failed({required this.label, required this.error})
     : backend = null,
       promptTokens = 0,
       ttft = Duration.zero,
@@ -114,16 +114,21 @@ class BenchResult {
 
 /// Runs one arm: open on `backend`, generate, measure, close.
 ///
-/// Takes bytes rather than a `Cera` because each arm needs its own engine, and
-/// its own buffer with it (the web transfers what it is given).
-Future<BenchResult> runBenchmark({
-  required Uint8List bytes,
+/// Takes an opener rather than a `Cera` because each arm needs its own engine,
+/// and rather than bytes because how the model is opened is platform-specific.
+/// On the web there is no path, so the caller hands over a private copy of the
+/// bytes (the worker transfers what it is given, leaving the original
+/// unreadable). On native the caller opens the path instead and the engine maps
+/// the file: passing bytes there would pull a multi-gigabyte GGUF through the
+/// Dart heap once per arm, for nothing.
+Future<_BenchResult> _runBenchmark({
+  required Future<Cera> Function(CeraOptions) open,
   required CeraBackend backend,
   required String label,
 }) async {
   Cera? cera;
   try {
-    cera = await Cera.openBytes(bytes, options: CeraOptions(backend: backend));
+    cera = await open(CeraOptions(backend: backend));
 
     // Frame the prompt the way the chat page does, so the measurement covers
     // the path an app actually takes. A GGUF without a template is not an
@@ -144,7 +149,11 @@ Future<BenchResult> runBenchmark({
       framed = _prompt;
       templateError = '$e';
     }
-    final promptTokens = (await cera.encode(framed)).length;
+    // `addSpecial: false`: `framed` came out of the chat template, which has
+    // already emitted the model's BOS. Encoding with the default would prepend
+    // a second one (and append EOS when the GGUF asks for it), so the reported
+    // prompt size would not be the prompt that was actually fed.
+    final promptTokens = (await cera.encode(framed, addSpecial: false)).length;
 
     final started = Stopwatch()..start();
     Duration? ttft;
@@ -168,7 +177,7 @@ Future<BenchResult> runBenchmark({
     // A run that produced nothing has no rate to report, and dividing by its
     // zero-length decode span would invent one.
     if (ttft == null || output.isEmpty) {
-      return BenchResult.failed(
+      return _BenchResult.failed(
         label: label,
         error: templateError == null
             ? 'the model produced no output'
@@ -181,7 +190,7 @@ Future<BenchResult> runBenchmark({
     // prompt, so prepending BOS would inflate the count by one.
     final decodeTokens = (await cera.encode(output, addSpecial: false)).length;
 
-    return BenchResult.ok(
+    return _BenchResult.ok(
       label: label,
       backend: cera.backend,
       promptTokens: promptTokens,
@@ -194,7 +203,7 @@ Future<BenchResult> runBenchmark({
     // Expected, not exceptional: `CeraBackend.gpu` is documented to fail rather
     // than fall back on the web, so a machine without WebGPU lands here. That is
     // a result to display, not a crash.
-    return BenchResult.failed(label: label, error: '$err');
+    return _BenchResult.failed(label: label, error: '$err');
   } finally {
     await cera?.close();
   }
@@ -208,12 +217,17 @@ class BenchmarkPage extends StatefulWidget {
 }
 
 class _BenchmarkPageState extends State<BenchmarkPage> {
-  /// Kept pristine and never handed to an engine directly: every run gets a
-  /// copy, because the web transfers (and so neuters) whatever it is given.
+  /// Web only. Kept pristine and never handed to an engine directly: every run
+  /// gets a copy, because the web transfers (and so neuters) whatever it is
+  /// given. Null on native, where [_path] is used instead.
   Uint8List? _master;
+
+  /// Native only. Both arms open this path independently and the engine maps
+  /// the file, so no copy of the weights passes through the Dart heap.
+  String? _path;
   String _modelName = '';
 
-  final _results = <BenchResult>[];
+  final _results = <_BenchResult>[];
   String? _running;
   bool _picking = false;
 
@@ -225,15 +239,22 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
       final result = await FilePicker.platform.pickFiles(
         dialogTitle: 'Choose a .gguf model to benchmark',
         type: FileType.any,
-        // Bytes on every platform here, unlike the chat page: both arms need
-        // their own buffer, so there is nothing for a path to save.
-        withData: true,
+        // Same rule as the chat page: ask for bytes only where there is no
+        // path to open. Requesting them on native reads the whole GGUF into
+        // the Dart heap, which for a multi-gigabyte model is slow at best and
+        // an OOM at worst, and it throws away the memory mapping the engine
+        // would otherwise use. Two arms do not change that: each opens the
+        // path itself.
+        withData: !Cera.supportsPaths,
       );
       final file = result?.files.single;
-      if (file?.bytes == null) return;
+      if (file == null) return;
+      final path = file.path;
+      if (path == null && file.bytes == null) return;
       if (!mounted) return;
       setState(() {
-        _master = file!.bytes;
+        _path = path;
+        _master = path == null ? file.bytes : null;
         _modelName = file.name;
         _results.clear();
       });
@@ -244,7 +265,8 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
 
   Future<void> _run() async {
     final master = _master;
-    if (master == null || _busy) return;
+    final path = _path;
+    if ((master == null && path == null) || _busy) return;
 
     setState(() => _results.clear());
 
@@ -256,10 +278,14 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
       ('GPU', CeraBackend.gpu),
     ]) {
       setState(() => _running = label);
-      // A fresh copy per arm: the previous one was transferred into a worker
-      // and is no longer readable.
-      final result = await runBenchmark(
-        bytes: Uint8List.fromList(master),
+      final result = await _runBenchmark(
+        // Native opens the path twice and lets the engine map it. The web has
+        // no path, so each arm gets a fresh copy: the previous one was
+        // transferred into the worker and is no longer readable. `sublist(0)`
+        // rather than `Uint8List.fromList`, which copies element by element.
+        open: path != null
+            ? (options) => Cera.openPath(path, options: options)
+            : (options) => Cera.openBytes(master!.sublist(0), options: options),
         backend: backend,
         label: label,
       );
@@ -301,7 +327,11 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
               ),
               const SizedBox(width: 12),
               FilledButton.icon(
-                onPressed: _master == null || _busy ? null : _run,
+                // Either source arms the button: native holds a path and no
+                // bytes, the web the reverse.
+                onPressed: (_master == null && _path == null) || _busy
+                    ? null
+                    : _run,
                 icon: const Icon(Icons.speed),
                 label: const Text('Run'),
               ),
@@ -340,7 +370,7 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
 class _ResultCard extends StatelessWidget {
   const _ResultCard({required this.result});
 
-  final BenchResult result;
+  final _BenchResult result;
 
   @override
   Widget build(BuildContext context) {
@@ -408,22 +438,33 @@ class _ResultCard extends StatelessWidget {
 class _Speedup extends StatelessWidget {
   const _Speedup({required this.results});
 
-  final List<BenchResult> results;
+  final List<_BenchResult> results;
 
   @override
   Widget build(BuildContext context) {
     final cpu = results[0].decodeTokensPerSecond;
     final gpu = results[1].decodeTokensPerSecond;
-    if (cpu == null || gpu == null || cpu <= 0) return const SizedBox.shrink();
+    if (cpu == null || gpu == null || cpu <= 0 || gpu <= 0) {
+      return const SizedBox.shrink();
+    }
+    // Do not assume the GPU won. Natively the second row is whatever `auto`
+    // picked, which can be the CPU again, and even a real GPU can lose to
+    // per-token overhead on a small model. Reporting "0.8x faster" would be a
+    // plainly false sentence on a page whose whole purpose is an honest
+    // number, so state the slower case as a slowdown and the tie as a tie.
     final ratio = gpu / cpu;
+    final headline = switch (ratio) {
+      _ when ratio >= 1.05 =>
+        'GPU decoded ${ratio.toStringAsFixed(1)}x faster than CPU.',
+      _ when ratio <= 0.95 =>
+        'GPU decoded ${(1 / ratio).toStringAsFixed(1)}x slower than CPU.',
+      _ => 'GPU and CPU decoded at about the same rate.',
+    };
     return Card(
       color: Theme.of(context).colorScheme.primaryContainer,
       child: Padding(
         padding: const EdgeInsets.all(14),
-        child: Text(
-          'GPU decoded ${ratio.toStringAsFixed(1)}x faster than CPU.',
-          style: Theme.of(context).textTheme.titleMedium,
-        ),
+        child: Text(headline, style: Theme.of(context).textTheme.titleMedium),
       ),
     );
   }

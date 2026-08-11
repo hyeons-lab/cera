@@ -255,10 +255,10 @@ class _ChatPageState extends State<ChatPage> {
             onPressed: _busy
                 ? null
                 : () => Navigator.of(context).push(
-                      MaterialPageRoute<void>(
-                        builder: (_) => const BenchmarkPage(),
-                      ),
+                    MaterialPageRoute<void>(
+                      builder: (_) => const BenchmarkPage(),
                     ),
+                  ),
             icon: const Icon(Icons.speed),
             tooltip: 'Benchmark CPU vs GPU',
           ),
