@@ -36,7 +36,12 @@ of these architectures loads:
 | `lfm2` | Liquid **LFM2 / LFM2.5** (the canonical LeapBundles family) | text, vision, audio |
 | `llama` | **LLaMA 2 / 3**, and classic **Mistral 7B** (ships as GGUF arch `llama`) | text |
 | `qwen2`, `qwen3` | **Qwen2 / Qwen2.5 / Qwen3** | text |
-| `granite` | **IBM Granite 3.x** | text |
+| `granite` | **IBM Granite 3.x**, and the dense **Granite 4.1** line (3b / 8b / 30b) | text |
+
+No Granite 4.0 model loads today. The 4.0-H hybrids convert to a separate arch
+`granitehybrid`; the non-hybrid ones (`granite-4.0-micro`, `-1b`, `-350m`) do
+convert to `granite`, but write `attention.head_count_kv` as a per-layer array
+that the loader does not yet accept. The 4.1 line above is unaffected.
 
 Every architecture above runs on **all three compute backends** (CPU, Metal, and
 wgpu), with single-token decode and prompt prefill on each. Prefill uses

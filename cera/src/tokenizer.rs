@@ -37,11 +37,17 @@ pub struct BpeTokenizer {
     chat_template: Option<String>,
     /// Pre-compiled pretokenizer regex.
     pretokenize_re: Regex,
-    /// True when the pretokenizer splits digits as a bare `\p{N}` with no leading
-    /// space (REFACT family — Granite/Refact/CodeShell/SmolLM). The whitespace
-    /// `\s+(?!\S)` emulation in `pretokenize` must then NOT donate a trailing
-    /// space to a following digit, since llama.cpp keeps such digits bare. False
-    /// for GPT-2/LLAMA3-style pretokenizers, whose ` ?\p{N}+` absorbs the space.
+    /// True for the `refact` pre type (Granite 3.x/Refact/CodeShell/SmolLM;
+    /// Granite 4.x is `dbrx` on the LLAMA3 arm and does not set this), where
+    /// llama.cpp keeps a digit following a whitespace run bare. The `\s+(?!\S)`
+    /// emulation in `pretokenize` must then NOT donate a trailing space to that
+    /// digit.
+    ///
+    /// Keyed on the pre type, not on the bare-`\p{N}` digit shape: `qwen2`
+    /// (`\p{N}`) and LLAMA3 (`\p{N}{1,3}`) also lack the leading ` ?` that only
+    /// `gpt2`'s ` ?\p{N}+` carries, yet both leave this false. Confirmed right
+    /// for LLAMA3, whose token IDs match the reference tokenizer on
+    /// whitespace-run-before-digit inputs; `qwen2` is unverified either way.
     digits_split_bare: bool,
     /// GPT-2 byte→unicode mapping (computed once, used in encode).
     byte_to_unicode: [char; 256],
@@ -226,8 +232,10 @@ impl BpeTokenizer {
     ///
     /// REFACT-family pretokenizers (`digits_split_bare`) split digits as a bare
     /// `\p{N}` with no leading space, so a whitespace run before a digit keeps
-    /// its trailing space (llama.cpp leaves the digit bare); every other
-    /// pretokenizer uses ` ?\p{N}+`, where the digit does absorb the space.
+    /// its trailing space (llama.cpp leaves the digit bare). Only `gpt2` uses
+    /// ` ?\p{N}+`, where the digit does absorb the space; see
+    /// [`BpeTokenizer::digits_split_bare`] for why the other arms that also lack
+    /// a leading ` ?` still do not set the flag.
     fn pretokenize<'a>(&self, s: &'a str) -> Vec<&'a str> {
         let mut ranges: Vec<(usize, usize)> = self
             .pretokenize_re
@@ -247,7 +255,9 @@ impl BpeTokenizer {
             let next_char = s[b..].chars().next();
             let next_non_ws = next_char.is_some_and(|c| !c.is_whitespace());
             // REFACT keeps digits bare, so don't donate a space to a following
-            // digit; other pretokenizers' ` ?\p{N}+` does take it.
+            // digit. Every other pre type does take it, which is a fact about
+            // the flag rather than about the regexes (only `gpt2` has a
+            // space-absorbing ` ?\p{N}+`); see `digits_split_bare`.
             let next_takes_space =
                 !(self.digits_split_bare && next_char.is_some_and(char::is_numeric));
             if is_ws_run
@@ -684,9 +694,11 @@ fn build_unicode_to_byte() -> HashMap<char, u8> {
 /// Build the pretokenizer regex based on the `tokenizer.ggml.pre` type.
 ///
 /// Different model families use different pretokenizer patterns:
-/// - "lfm2", "llama3", "llama-v3", "llama-bpe" → LLAMA3 pattern (case-insensitive
-///   contractions, 1-3 digit groups, newline handling)
+/// - "lfm2", "llama3", "llama-v3", "llama-bpe", "dbrx" → LLAMA3 pattern
+///   (case-insensitive contractions, 1-3 digit groups, newline handling)
+/// - "qwen2" → LLAMA3 but splitting numbers one digit at a time
 /// - "gpt2" → GPT-2 pattern (simpler, case-sensitive contractions)
+/// - "refact" → GPT-2 but splitting numbers one digit at a time
 /// - Others → defaults to LLAMA3 with a warning
 fn build_pretokenize_regex(pre_type: &str) -> Regex {
     let pattern = match pre_type {
@@ -698,7 +710,13 @@ fn build_pretokenize_regex(pre_type: &str) -> Regex {
         // groups "llama3" | "llama-v3" | "llama-bpe" onto LLAMA_VOCAB_PRE_TYPE_LLAMA3.
         // cera had the first two, so every Llama-3 GGUF warned "unknown ... type
         // 'llama-bpe'" and then picked LLAMA3 anyway: right pattern, false alarm.
-        "lfm2" | "llama3" | "llama-v3" | "llama-bpe" => concat!(
+        // `dbrx` is Databricks DBRX's pre type, which every IBM Granite 4.x GGUF
+        // also converts with. llama.cpp's DBRX case arm, shared with
+        // LLAMA_VOCAB_PRE_TYPE_SMAUG, carries the same regex as its own LLAMA3
+        // arm, so cera's unknown-type fallback was already correct and naming it
+        // only drops the warning. `smaug-bpe` shares that arm but stays out
+        // until the test corpus covers it.
+        "lfm2" | "llama3" | "llama-v3" | "llama-bpe" | "dbrx" => concat!(
             r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
             r"|[^\r\n\p{L}\p{N}]?\p{L}+",
             r"|\p{N}{1,3}",
@@ -728,7 +746,8 @@ fn build_pretokenize_regex(pre_type: &str) -> Regex {
             r"| ?[^\s\p{L}\p{N}]+",
             r"|\s+",
         ),
-        // Refact pattern — used by Granite (and Refact/CodeShell/SmolLM). Matches
+        // Refact pattern: used by Granite 3.x (and Refact/CodeShell/SmolLM);
+        // Granite 4.x is `dbrx` on the LLAMA3 arm above, not this one. Matches
         // llama.cpp's `LLAMA_VOCAB_PRE_TYPE_REFACT`: the GPT-2 pattern, but numbers
         // are split one digit at a time (a leading `\p{N}` expr) — so `\p{N}`
         // replaces GPT-2's ` ?\p{N}+`. Whitespace is GPT-2-style (`\s+`, with the
@@ -934,8 +953,22 @@ mod tests {
     }
 
     #[test]
+    fn test_pretokenize_dbrx_matches_llama3() {
+        // Pins `dbrx` to the LLAMA3 pattern. It cannot fail today, and it does
+        // not guard the arm's existence either: deleting `| "dbrx"` falls back
+        // to a byte-identical pattern and leaves this green (only the warning
+        // comes back). What it does catch is a later edit moving `dbrx` onto
+        // `gpt2` or `refact`, which would change digit grouping and silently
+        // retokenize every Granite 4.x GGUF.
+        assert_eq!(
+            build_pretokenize_regex("dbrx").as_str(),
+            build_pretokenize_regex("llama3").as_str(),
+        );
+    }
+
+    #[test]
     fn test_pretokenize_refact_splits_each_digit() {
-        // REFACT (Granite) splits numbers one digit at a time via a bare `\p{N}`,
+        // REFACT (Granite 3.x) splits numbers one digit at a time via a bare `\p{N}`,
         // unlike LLAMA3's ` ?\p{N}+` which groups 1-3 digits.
         let re = build_pretokenize_regex("refact");
         let chunks: Vec<&str> = re.find_iter("12345").map(|m| m.as_str()).collect();
