@@ -539,11 +539,71 @@ jobs:
         # empty lib and reports green without executing a line of it. These are
         # `#[wasm_bindgen_test]`, so they need a real wasm runtime.
         #
-        # Covers the bundle store's URL addressing. The OPFS half needs a
-        # browser (`just wasm-test-opfs`) and is not run here: chromedriver in
-        # CI would have to major-version-match the runner's Chrome, the same
-        # coupling that keeps `wasm-test-wgpu` out of CI.
+        # Covers the bundle store's URL addressing. The OPFS half needs a real
+        # browser and runs in the `wasm-browser` job below.
         run: just wasm-test
+
+  wasm-browser:
+    # The browser-only half of cera-wasm's tests.
+    #
+    # These used to be justfile-only, on the reasoning that chromedriver has to
+    # major-version-match Chrome and CI could not be relied on for that. On a
+    # developer machine that is a real problem (a brew Chrome outruns a brew
+    # chromedriver and `wasm-pack test` dies on a version mismatch), but the
+    # runner image ships Chrome and ChromeDriver together, so they match by
+    # construction. The version print below is kept so a future mismatch names
+    # itself instead of surfacing as an unexplained WebDriver error.
+    #
+    # Worth having: `opfs_bundle.rs` covers code that cannot execute anywhere
+    # else. OPFS has no Node equivalent, so before this job the only thing
+    # exercising the browser bundle store was someone remembering to run
+    # `just wasm-test-opfs` by hand.
+    name: Wasm browser tests
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Same `+simd128` restoration as the Wasm Build job: the workflow-level
+    # `RUSTFLAGS: ""` would otherwise replace the wasm32 entry in
+    # `.cargo/config.toml` and test the scalar path.
+    env:
+      RUSTFLAGS: "-C target-feature=+simd128"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.14.0
+      - name: Browser and driver versions
+        # Printed rather than asserted: the pair is whatever the image ships,
+        # and the log is what makes a future mismatch diagnosable in one look.
+        run: |
+          google-chrome --version
+          chromedriver --version
+      - name: OPFS bundle store
+        # Needs no GPU, so this is the part of the job that must always pass.
+        run: cd cera-wasm && wasm-pack test --headless --chrome --test opfs_bundle
+      - name: Install Mesa lavapipe (software Vulkan)
+        # Chrome needs a Vulkan driver to hand WebGPU an adapter, and the runner
+        # has no GPU. Same package set the lavapipe job above uses, including
+        # its apt-source workaround.
+        run: |
+          while IFS= read -r f; do
+            sudo rm -f -- "$f"
+          done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+          vulkaninfo --summary || true
+      - name: WebGPU async init and readback
+        # `webgpu_smoke.rs` has existed since PR #169 and has never run in CI:
+        # it needs a browser AND an adapter. Whether headless Chrome finds one
+        # on lavapipe is the open question this step answers; if it cannot, the
+        # honest outcome is to delete this step and say so next to the recipe,
+        # not to let it pass without an adapter.
+        run: cd cera-wasm && wasm-pack test --headless --chrome --features wgpu --test webgpu_smoke
 
   cera-wasm-pack:
     # Multi-target wasm-pack build. Each matrix entry produces one
