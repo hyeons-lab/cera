@@ -1202,6 +1202,12 @@ mod tests {
     /// plain user turn never reaches. Covering the family rather than the one
     /// reported symptom is the point: the next model to break would otherwise
     /// be the next template that reaches `.split()` on its main path.
+    ///
+    /// The cases below are therefore not a transcript of that survey.
+    /// `.startswith()` appears in none of the 16 and is still asserted here,
+    /// as the sibling of `.endswith()`: the two are one implementation, and a
+    /// template using either is equally plausible. Read the counts above as
+    /// evidence for how wide the gap is, not as the list of what is covered.
     #[test]
     fn chat_template_may_call_python_methods() {
         let cases: [(&str, &str); 8] = [
