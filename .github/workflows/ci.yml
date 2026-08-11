@@ -642,15 +642,32 @@ jobs:
         #   PR #72 (applyChatTemplate):          2.0 MB  (+800 KB minijinja render)
         #   (drifted to, scalar):                2507 KB
         #   simd128 restored:                    2585 KB (+78 KB of vector code)
-        # Budget:                                2816 KB (~9% headroom)
+        #   PR #364 (ffi parity):                3144 KB
+        # Budget:                                3.5 MB  (~14% headroom)
         #
-        # That last entry is a bump, not a regression. The 2507 KB line is not
-        # a release; it is what the artifact had quietly become while a
+        # The 2585 KB entry is a bump, not a regression. The 2507 KB line is
+        # not a release; it is what the artifact had quietly become while a
         # workflow-level `RUSTFLAGS: ""` was overriding `.cargo/config.toml`,
         # leaving no vector code in the build at all. The 78 KB back is the
         # `wasm_simd` kernels plus everything else LLVM vectorizes once it is
         # allowed to emit `v128`. Worth remembering the next time a wasm
         # artifact gets unexpectedly SMALLER.
+        #
+        # PR #364's ~559 KB over that baseline splits roughly +262 KB for the
+        # multimodal/bundle API surface and the OPFS store, +383 KB for the
+        # image decoders `vl` pulls in. Roughly, because attribution needs a
+        # build of `main` and a `--no-default-features` build and CI produces
+        # neither, so the split was measured locally on a different wasm-pack
+        # and before `+simd128` came back. The total above is this job's own
+        # figure; the split is the shape of the growth, not arithmetic that
+        # closes against it.
+        #
+        # On `vl` being default-on, since it is the larger half of that
+        # jump: CI publishes one prebuilt npm artifact, so whichever way
+        # the default goes is what every consumer gets, and a VL bundle
+        # whose `appendImage` throws reads as a broken model rather than
+        # a missing build flag. Text-only deployments that want the
+        # 383 KB back build with `--no-default-features`.
         #
         # Plain bash arithmetic (no `numfmt` etc.) so this script
         # runs identically on the macOS / Linux developer machines
@@ -660,7 +677,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=2816  # 2.75 MB
+          BUDGET_KB=3584  # 3.5 MB
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           # Display rounds UP to KB, so a 2,621,441-byte file reads as
           # "2561 KB" rather than "2560 KB". That keeps the human-readable
@@ -817,10 +834,13 @@ jobs:
       - name: Check threaded .wasm size budget
         # Threaded wasm is bigger than the single-threaded body
         # because the std rebuild includes atomics-aware sync
-        # primitives + TLS init. 2666 KB measured for both
-        # targets with `+simd128` in the build step's flag list
-        # above; the 3072 KB budget gives ~15% headroom for std /
-        # wasm-bindgen-rayon churn before this needs a bump.
+        # primitives + TLS init, and that gap has closed to
+        # almost nothing as the body grew: 2666 KB threaded
+        # against 2585 KB single-threaded on the same commit
+        # once `+simd128` is in the flag list below, i.e. +3%,
+        # not the "~30% larger" this line used to claim (it was
+        # +15% when set, at 2.0 / 2.3 MB). PR #364 carries both
+        # up together. Sized off headroom rather than a ratio.
         # Crossing the budget is intentional sometimes (a real
         # new capability, not a regression) — when it happens,
         # justify in the PR description and bump `BUDGET_KB`
@@ -830,7 +850,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}-mt
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=3072  # 3 MB; see the note above for the measurement
+          BUDGET_KB=3712  # 3.625 MB; see the note above for the measurement
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           SIZE_KB=$(( (SIZE_BYTES + 1023) / 1024 ))
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
