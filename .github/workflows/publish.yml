@@ -327,17 +327,7 @@ jobs:
         with:
           tool: wasm-pack@0.14.0
 
-      - name: Install binaryen (provides wasm-opt)
-        run: |
-          # packages.microsoft.com apt sources ship preinstalled on the GitHub
-          # ubuntu image and intermittently serve an invalid InRelease
-          # ("NOSPLIT"), which fails `apt-get update`. A broken release is worse
-          # than a broken CI check, so remove every apt source referencing that
-          # host, matched by content (covers both .list and deb822 .sources).
-          while IFS= read -r f; do
-            sudo rm -f -- "$f"
-          done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
-          sudo apt-get update && sudo apt-get install -y binaryen
+      - uses: ./.github/actions/install-binaryen
 
       - uses: actions/setup-node@v6
         with:
@@ -674,13 +664,12 @@ jobs:
         with:
           tool: wasm-pack@0.14.0
 
-      - name: Install binaryen (provides wasm-opt)
-        run: |
-          # Same packages.microsoft.com workaround as the npm leg; see there.
-          while IFS= read -r f; do
-            sudo rm -f -- "$f"
-          done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
-          sudo apt-get update && sudo apt-get install -y binaryen
+      - uses: ./.github/actions/install-binaryen
+
+      # ubuntu-latest ships no `just`, and the next step is the only thing in
+      # this job that runs a recipe. Without this the web leg of a release fails
+      # at "Build cera-wasm", which takes the `release` job down with it.
+      - uses: extractions/setup-just@v4
 
       - name: Build cera-wasm (web target, wgpu)
         run: just wasm-web-wgpu

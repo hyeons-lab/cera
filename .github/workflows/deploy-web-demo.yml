@@ -1,0 +1,289 @@
+name: Deploy Web Demo
+
+# Builds `cera_ffi_flutter/example` for the browser and uploads it to Cloudflare
+# Pages, so there is a live URL running LFM2 on WebGPU in the visitor's own
+# browser.
+#
+# The point of the demo is WebGPU, not "a Flutter app that happens to build".
+# The measured gap is ~58 tok/s on WebGPU against ~1.4 tok/s on the wasm CPU
+# path, and the CPU path is what you get by accident, silently: the worker
+# probes `typeof wasm.WebGpuSession !== 'function'` and falls through to the CPU
+# whenever the wasm was built without `--features wgpu`
+# (cera_ffi/lib/src/web/cera_worker.js). No error, no console warning, just a
+# demo that is 40x slower than the thing it exists to show. That is why this
+# workflow builds via `just wasm-web-wgpu` rather than `just wasm-web`, which is
+# the same build without the feature, and then asserts the symbol is actually
+# present before deploying.
+#
+# Deployment is Direct Upload from here rather than Cloudflare's own Git
+# integration: the artifact needs a Rust nightly toolchain, wasm-pack, binaryen
+# and Flutter to exist at all, which Cloudflare's build image does not provide.
+# The Pages side therefore only ever receives a finished directory, and none of
+# the free plan's build limits (500 builds/month, 20-minute timeout, 1
+# concurrent build) apply to it.
+#
+# ── One-time setup ────────────────────────────────────────────────────────
+#
+#   1. Create the Pages project once, from a machine with wrangler:
+#
+#        npx wrangler pages project create cera-demo --production-branch=main
+#
+#      Not from the dashboard, and pass `--production-branch` explicitly. A
+#      Direct Upload project exposes no production-branch control in the
+#      dashboard at all, and the value is fixed when the project is created:
+#      run the command interactively without the flag and it offers whatever
+#      branch you happen to have checked out, which pins the demo's production
+#      URL to a feature branch, correctable only through the Update Project
+#      API. The project must also exist before the first deploy, since
+#      `wrangler pages deploy` can only create one interactively, which in CI
+#      surfaces as a failed deploy.
+#   2. Create an API token: My Profile > API Tokens > Create Custom Token,
+#      with the single permission Account > Cloudflare Pages > Edit.
+#   3. Add two repository secrets: CLOUDFLARE_API_TOKEN and
+#      CLOUDFLARE_ACCOUNT_ID.
+#
+#      The account ID is NOT in the dashboard sidebar unless a domain has been
+#      added: that panel belongs to a zone's Overview page, and a Pages-only
+#      account has no zone, so there is nothing there to read. Two places that
+#      work regardless:
+#
+#        - the dashboard URL, which carries it once you are inside an account:
+#          https://dash.cloudflare.com/<32-hex-account-id>/pages
+#        - `npx wrangler whoami`, which tables the ID for every account the
+#          current login can reach. Handy since step 1 already needs wrangler.
+#
+# A custom domain needs nothing here. Pages project > Custom domains > Set up a
+# domain, and Cloudflare serves it alongside the *.pages.dev URL. A subdomain
+# does not require the zone to be on Cloudflare; if DNS lives elsewhere, add the
+# domain in the dashboard FIRST and only then point a CNAME at
+# <project>.pages.dev, because a CNAME that resolves before the domain is
+# associated returns 522.
+
+# The two path lists are identical and have to stay that way. They are written
+# out twice because GitHub Actions rejects YAML anchors in workflow files, so
+# `&name` / `*name` is not available to say it once.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cera/**"
+      - "cera-wasm/**"
+      - "cera_ffi/**"
+      - "cera_ffi_flutter/**"
+      # The recipe that passes `--features wgpu` and the config that carries
+      # `+simd128`. Both decide what the deployed engine can do, and an edit to
+      # either matches none of the paths above.
+      - "justfile"
+      - ".cargo/config.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/deploy-web-demo.yml"
+      - ".github/actions/install-binaryen/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "cera/**"
+      - "cera-wasm/**"
+      - "cera_ffi/**"
+      - "cera_ffi_flutter/**"
+      - "justfile"
+      - ".cargo/config.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/deploy-web-demo.yml"
+      - ".github/actions/install-binaryen/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Lets wrangler-action record a GitHub Deployment, which is what surfaces the
+  # preview URL on the PR itself instead of only in the job log.
+  deployments: write
+
+# One deploy per branch at a time, newest wins. A superseded commit's upload is
+# worthless the moment a newer one starts, and Pages keeps every deployment
+# forever otherwise.
+concurrency:
+  group: web-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT_NAME: cera-demo
+  # `just wasm-web-wgpu` writes here; `install_web --from` reads it.
+  WGPU_PKG: cera-wasm/examples/webgpu/pkg
+  APP_DIR: cera_ffi_flutter/example
+
+jobs:
+  deploy:
+    name: Build and deploy the WebGPU demo
+    # Forks cannot see the secrets, so without this guard every fork PR fails on
+    # an unauthenticated deploy that was never going to work.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.14.0
+      - uses: ./.github/actions/install-binaryen
+      - uses: extractions/setup-just@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Build the WebGPU wasm runtime
+        # Deliberately does NOT set RUSTFLAGS, unlike ci.yml and publish.yml.
+        # An env RUSTFLAGS *replaces* `.cargo/config.toml` rather than appending
+        # to it, and the wasm32 entry there is what carries `+simd128`, the only
+        # thing keeping the CPU fallback off the scalar path. The
+        # `target-cpu=native` problem those workflows set it for cannot arise
+        # here anyway: this builds with `--target`, and cargo does not apply
+        # `target.<triple>.rustflags` to host artifacts in that case, so the
+        # build scripts and proc macros it does compile for the host are
+        # unaffected either way.
+        run: just wasm-web-wgpu
+
+      - name: Install the runtime into the app's web/ directory
+        working-directory: ${{ env.APP_DIR }}
+        # `--from` rather than the default download. The default is not broken
+        # (publish.yml's `build-web-assets` attaches a wgpu build to every
+        # release, which is exactly what `_downloadModule` fetches); it is just
+        # the wrong source here. A demo deployed from a commit has to run that
+        # commit's engine, not the last tagged one, or the URL stops being
+        # evidence about the change that triggered it.
+        run: |
+          flutter pub get
+          dart run cera_ffi_flutter:install_web \
+            --from "${GITHUB_WORKSPACE}/${WGPU_PKG}" --force
+
+      - name: Assert the installed runtime is the WebGPU build
+        # The one check that separates this demo from a 40x slower one. Without
+        # `--features wgpu` the `webgpu` module in cera-wasm/src/lib.rs is not
+        # compiled, so wasm-bindgen emits no `WebGpuSession` class into the glue
+        # and the worker's probe quietly selects the CPU path.
+        run: |
+          set -euo pipefail
+          GLUE="${APP_DIR}/web/cera/cera_wasm.js"
+          if ! grep -q 'export class WebGpuSession' "$GLUE"; then
+            echo "::error file=$GLUE::no WebGpuSession in the installed runtime. This is a non-wgpu build and would silently deploy the wasm CPU path (~1.4 tok/s vs ~58). Check that 'just wasm-web-wgpu' still passes --features wgpu."
+            exit 1
+          fi
+          echo "WebGpuSession present: the deployed runtime can reach the GPU"
+
+      - name: Build the Flutter web app
+        working-directory: ${{ env.APP_DIR }}
+        # `--pwa-strategy=none`: the generated service worker caches the app
+        # shell, so a redeployed demo keeps serving the previous build to anyone
+        # who has already visited. For a demo that redeploys on every push to
+        # main that is a bug, not a feature.
+        #
+        # `--no-web-resources-cdn`: bundles CanvasKit instead of fetching it
+        # from gstatic, which makes the deployment self-contained. This site
+        # needs no COOP/COEP headers today (neither the GPU path nor the CPU
+        # fallback uses threads, so nothing here wants SharedArrayBuffer), and
+        # if the threaded `-mt` build ever becomes the fallback and does, this
+        # flag is what makes setting them possible: a cross-origin CanvasKit
+        # fetch is exactly what `require-corp` blocks.
+        run: flutter build web --release --pwa-strategy=none --no-web-resources-cdn
+
+      - name: Report what is being deployed
+        working-directory: ${{ env.APP_DIR }}/build/web
+        # Pages rejects any single file over 25 MiB on every plan. Nothing here
+        # is close today (bundled CanvasKit is the largest at a few MB, the
+        # engine wasm next), but a model accidentally committed into web/ would
+        # be, and this names the reason where the upload's own failure would
+        # not.
+        #
+        # `wc -c` rather than `find -printf`, which is GNU-only: the rest of
+        # this repo's CI scripts stay runnable on the macOS machines
+        # contributors sanity-check them on, and there is no reason for this one
+        # to be the exception. `-n1` runs one `wc` per file so there is never a
+        # `total` summary line to filter out; filtering it by name would put the
+        # size gate at the mercy of the runner's locale.
+        run: |
+          set -euo pipefail
+          LIMIT=$((25 * 1024 * 1024))
+          # `-r` is load-bearing, and its absence is invisible on a Mac: GNU
+          # xargs with no input still runs `wc -c` once with no operands, which
+          # reads the empty stdin and prints `0`, so the emptiness check below
+          # would see "0" rather than "" and wave an empty build through. BSD
+          # xargs skips the run on its own and accepts `-r` as a no-op, so this
+          # spelling behaves the same in CI and on a contributor's machine.
+          SIZES=$(find . -type f -print0 | xargs -0 -r -n1 wc -c | sort -rn)
+          # An empty build directory would otherwise sail through the size gate
+          # by having nothing to measure, which is the one result it must never
+          # report as a pass.
+          if [ -z "$SIZES" ]; then
+            echo "::error::${APP_DIR}/build/web is empty; flutter build produced nothing"
+            exit 1
+          fi
+          # Walked with a here-string rather than `| head`, so nothing runs in a
+          # subshell (the loop assigns SIZE/BIGGEST for the gate below) and no
+          # early-closing pipe can fail the step with SIGPIPE under `pipefail`.
+          # `read` splits the count off the front, and because `path` is the
+          # last variable it keeps the rest of the line whole, so a filename
+          # containing spaces survives into the error message intact.
+          rank=0
+          {
+            echo "## Web demo deployment"
+            echo
+            echo "| file | size |"
+            echo "|---|---|"
+            while read -r bytes path; do
+              rank=$((rank + 1))
+              if [ "$rank" -eq 1 ]; then
+                SIZE=$bytes
+                BIGGEST=$path
+              fi
+              if [ "$rank" -le 5 ]; then
+                echo "| \`${path#./}\` | $((bytes / 1024)) KB |"
+              fi
+            done <<< "$SIZES"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            # Bytes, not a rounded unit: any rounding makes a file barely over
+            # the limit read as exactly the limit, which reads as a false
+            # positive to whoever has to act on it.
+            echo "::error::${BIGGEST#./} is $SIZE bytes, over Cloudflare Pages' 25 MiB ($LIMIT bytes) per-file limit"
+            exit 1
+          fi
+
+      - name: Deploy to Cloudflare Pages
+        id: deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+          # `--branch` is what decides production vs preview. The project's
+          # production branch is `main`, so pushes there land on the custom
+          # domain and every other branch gets its own preview URL.
+          #
+          # No `--commit-dirty`. Everything this job writes is gitignored
+          # (`web/cera/`, `build/`, `pubspec.lock`, the wasm-pack output), so
+          # the tree is clean and wrangler records that accurately on its own.
+          # Passing the flag would not guard against anything (a dirty tree
+          # warns, it does not block) and would stamp every deployment as dirty
+          # whether it is or not.
+          command: >-
+            pages deploy ${{ env.APP_DIR }}/build/web
+            --project-name=${{ env.PROJECT_NAME }}
+            --branch=${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+
+      - name: Link the deployment
+        run: |
+          {
+            echo
+            echo "Deployed: ${{ steps.deploy.outputs.deployment-url }}"
+            echo
+            echo "Pick an **LFM2** GGUF: \`WebGpuSession\` is LFM2-only, so any"
+            echo "other architecture falls back to the wasm CPU path."
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
