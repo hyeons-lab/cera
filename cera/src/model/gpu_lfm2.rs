@@ -793,6 +793,21 @@ pub struct GpuLfm2Model {
     lora_params_pool: Mutex<(Vec<wgpu::Buffer>, usize)>,
 }
 
+/// Where a decode step's initial hidden state comes from.
+///
+/// The two arms are the difference between a text token and an image patch.
+/// Text has an id that indexes the embedding table; an image arrives from the
+/// mmproj's projector as a hidden-size vector with no id behind it. Only the
+/// first step of the forward pass differs, so this is a seed selector rather
+/// than a second code path.
+#[derive(Clone, Copy)]
+enum HiddenSeed<'a> {
+    /// Look the row up in the embedding table.
+    Token(u32),
+    /// Upload this hidden-size vector as-is.
+    Embedding(&'a [f32]),
+}
+
 /// What the decode tail appends after the output projection.
 ///
 /// Both greedy paths want the argmax dispatch in that encoder rather than one of
@@ -2656,6 +2671,28 @@ impl GpuLfm2Model {
         self.forward_inner_compute_tail(tokens, pos, state, TailArgmax::None);
     }
 
+    /// Run one decode step from a caller-supplied hidden vector rather than a
+    /// token id, leaving logits in `logits_buf`.
+    ///
+    /// This is the vision path. An image becomes a run of hidden-size
+    /// embeddings from the mmproj's projector, with no token id that could
+    /// produce them, so the embedding-lookup step has nothing to look up.
+    /// Everything after that step is identical, which is why this only
+    /// re-seeds `hidden_buf` instead of duplicating the layer dispatch.
+    fn forward_inner_compute_from_embedding(
+        &self,
+        embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) {
+        self.forward_inner_compute_tail_seeded(
+            HiddenSeed::Embedding(embedding),
+            pos,
+            state,
+            TailArgmax::None,
+        );
+    }
+
     /// As [`Self::forward_inner_compute`], but also encodes the greedy argmax —
     /// and optionally its readback copy — into the *same* encoder as the output
     /// projection. See [`TailArgmax`] for why the two are separable.
@@ -2674,7 +2711,20 @@ impl GpuLfm2Model {
         argmax: TailArgmax,
     ) {
         assert_eq!(tokens.len(), 1, "GPU forward expects single token");
-        let token_id = tokens[0] as usize;
+        self.forward_inner_compute_tail_seeded(HiddenSeed::Token(tokens[0]), pos, state, argmax);
+    }
+
+    /// As [`Self::forward_inner_compute_tail`], but the initial hidden state
+    /// comes from a [`HiddenSeed`] rather than always from an embedding-table
+    /// lookup. Splitting on the seed keeps one copy of the layer dispatch:
+    /// the token and image paths differ only in how `hidden_buf` is filled.
+    fn forward_inner_compute_tail_seeded(
+        &self,
+        seed: HiddenSeed<'_>,
+        pos: usize,
+        state: &mut InferenceState,
+        argmax: TailArgmax,
+    ) {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let hs32 = hs as u32;
@@ -2689,13 +2739,31 @@ impl GpuLfm2Model {
             self.gpu_state.max_seq_len,
         );
 
-        // 1. Embedding lookup from CPU cache (4KB upload per token)
-        let emb_offset = token_id * hs;
-        self.ctx.queue.write_buffer(
-            &self.hidden_buf,
-            0,
-            bytemuck::cast_slice(&self.gpu_state.embedding_f32[emb_offset..emb_offset + hs]),
-        );
+        // 1. Seed the hidden state (4KB upload per step). A token reads its
+        //    row out of the CPU-side embedding cache; an image embedding is
+        //    already a hidden-size vector and uploads directly.
+        match seed {
+            HiddenSeed::Token(token) => {
+                let emb_offset = token as usize * hs;
+                self.ctx.queue.write_buffer(
+                    &self.hidden_buf,
+                    0,
+                    bytemuck::cast_slice(
+                        &self.gpu_state.embedding_f32[emb_offset..emb_offset + hs],
+                    ),
+                );
+            }
+            HiddenSeed::Embedding(embedding) => {
+                assert_eq!(
+                    embedding.len(),
+                    hs,
+                    "GPU forward_from_embedding expects one hidden-size vector"
+                );
+                self.ctx
+                    .queue
+                    .write_buffer(&self.hidden_buf, 0, bytemuck::cast_slice(embedding));
+            }
+        }
 
         // Active LoRA adapter (cheap Arc clone; `None` on the base-model path).
         // Read once so every hook in this forward shares one lock acquisition.
@@ -5222,10 +5290,26 @@ impl Model for GpuLfm2Model {
         self.forward_greedy_inner(tokens, pos, state)
     }
 
-    // forward_embedding and forward_from_embedding use default impls
-    // (unimplemented). Audio generation requires Metal backend for now.
-    // wgpu support would need refactoring forward() to split the layer
-    // dispatch from the logit projection, plus a hidden_buf download path.
+    fn supports_embedding_input(&self) -> bool {
+        true
+    }
+
+    fn forward_from_embedding(
+        &self,
+        embedding: &[f32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _lora_guard = self.resolve_lora(state);
+        // `state.seq_len`, not the `pos` argument, matching the CPU model:
+        // embeddings are appended at the cache's current end, and callers
+        // splicing an image into a prompt track position through the state.
+        let pos = state.seq_len;
+        self.forward_inner_compute_from_embedding(embedding, pos, state);
+        self.ctx
+            .download_f32(&self.logits_buf, self.config.vocab_size)
+    }
 
     fn forward_prefill(
         &self,
