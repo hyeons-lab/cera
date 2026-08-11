@@ -40,7 +40,17 @@ name: Deploy Web Demo
 #   2. Create an API token: My Profile > API Tokens > Create Custom Token,
 #      with the single permission Account > Cloudflare Pages > Edit.
 #   3. Add two repository secrets: CLOUDFLARE_API_TOKEN and
-#      CLOUDFLARE_ACCOUNT_ID (the account ID is in the dashboard sidebar).
+#      CLOUDFLARE_ACCOUNT_ID.
+#
+#      The account ID is NOT in the dashboard sidebar unless a domain has been
+#      added: that panel belongs to a zone's Overview page, and a Pages-only
+#      account has no zone, so there is nothing there to read. Two places that
+#      work regardless:
+#
+#        - the dashboard URL, which carries it once you are inside an account:
+#          https://dash.cloudflare.com/<32-hex-account-id>/pages
+#        - `npx wrangler whoami`, which tables the ID for every account the
+#          current login can reach. Handy since step 1 already needs wrangler.
 #
 # A custom domain needs nothing here. Pages project > Custom domains > Set up a
 # domain, and Cloudflare serves it alongside the *.pages.dev URL. A subdomain
