@@ -25,6 +25,8 @@ import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
+import 'benchmark.dart';
+
 void main() => runApp(const CeraExampleApp());
 
 class CeraExampleApp extends StatelessWidget {
@@ -245,6 +247,21 @@ class _ChatPageState extends State<ChatPage> {
           ),
         ),
         actions: [
+          IconButton(
+            // Disabled while this page is busy. Not because the benchmark
+            // shares state with it (it opens its own engines from its own
+            // pick), but because a second set of weights alongside a
+            // generation in flight is how a browser tab runs out of memory.
+            onPressed: _busy
+                ? null
+                : () => Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => const BenchmarkPage(),
+                      ),
+                    ),
+            icon: const Icon(Icons.speed),
+            tooltip: 'Benchmark CPU vs GPU',
+          ),
           IconButton(
             onPressed: _busy ? null : _pickModel,
             icon: const Icon(Icons.folder_open),
