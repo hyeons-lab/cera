@@ -78,9 +78,13 @@ env:
   # runners "native" degrades to a feature-stripped baseline that trips
   # `ring`'s aarch64-apple-darwin const assertion, and a release binary must run
   # on any CPU of its arch anyway. Empty RUSTFLAGS forces the generic baseline.
-  # Mirrors ci.yml; a step needing specific flags (e.g. threaded wasm) sets them
-  # itself, overriding this default.
+  # Mirrors ci.yml; the two wasm jobs override it at job level (see below).
   RUSTFLAGS: ""
+  # NOTE: that empty value REPLACES `.cargo/config.toml` for every target
+  # rather than appending to it, which also deletes the wasm32 entry's
+  # `+simd128`. Both wasm jobs below set RUSTFLAGS back at job level. This one
+  # shipped: the published `@hyeons-lab/cera-wasm` was built on the scalar
+  # path.
 
 jobs:
   version:
@@ -302,6 +306,11 @@ jobs:
     if: ${{ github.event.inputs.npm == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Puts back `.cargo/config.toml`'s wasm32 entry, which the workflow-level
+    # `RUSTFLAGS: ""` replaces. This is the job whose output people install
+    # from npm.
+    env:
+      RUSTFLAGS: "-C target-feature=+simd128"
     steps:
       - uses: actions/checkout@v6
 
@@ -346,6 +355,11 @@ jobs:
             --release \
             --scope hyeons-lab \
             --out-dir pkg-bundler
+
+      - name: Assert the build has SIMD in it
+        # Before publishing, not after: this is the artifact people install,
+        # and it went out on the scalar path once already.
+        run: scripts/assert-wasm-simd.sh "cera-wasm/pkg-bundler/cera_wasm_bg.wasm"
 
       - name: Publish to npm
         env:
@@ -638,6 +652,12 @@ jobs:
     if: ${{ github.event.inputs.web == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Puts back `.cargo/config.toml`'s wasm32 entry, which the workflow-level
+    # `RUSTFLAGS: ""` replaces. `just wasm-web-wgpu` sets no RUSTFLAGS of its
+    # own, so without this the released web runtime, and every Flutter web app
+    # that installs it, runs scalar kernels on the CPU fallback path.
+    env:
+      RUSTFLAGS: "-C target-feature=+simd128"
     steps:
       - uses: actions/checkout@v6
 
@@ -664,6 +684,11 @@ jobs:
 
       - name: Build cera-wasm (web target, wgpu)
         run: just wasm-web-wgpu
+
+      - name: Assert the build has SIMD in it
+        # Alongside the wgpu check below: that one guards the GPU path, this
+        # one guards the CPU fallback the same artifact serves.
+        run: scripts/assert-wasm-simd.sh "cera-wasm/examples/webgpu/pkg/cera_wasm_bg.wasm"
 
       - name: Stage release assets
         # Renamed on the way out and renamed back by `install_web`. The local

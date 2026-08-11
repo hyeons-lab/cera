@@ -26,9 +26,13 @@ rustflags = ["-C", "target-cpu=x86-64-v3"]
 [target.wasm32-unknown-unknown]
 # `simd128` is wasm's only SIMD feature and every browser and Node release since
 # 2021 has it, so there is no tier to runtime-dispatch between and no reason to
-# ship without it. The `wasm_simd` kernels in `backend/simd.rs` are gated on
-# this feature at compile time; without it wasm32 falls through to the scalar
-# reference, which measured 0.68 tok/s against 160 native on an LFM2.5-350M-Q4_0.
+# ship without it. What the flag gates is the DISPATCH: the `wasm_simd` kernels
+# in `backend/simd.rs` carry their own `#[target_feature(enable = "simd128")]`
+# and compile either way, but the `vec_dot_*` arms that call them are
+# `#[cfg(target_feature = "simd128")]`. Without this flag every caller falls
+# through to the scalar reference, the kernels are stripped as unreachable, and
+# the artifact has no vector code in it. That scalar path measured 0.68 tok/s
+# against 160 native on an LFM2.5-350M-Q4_0.
 #
 # Note this flag alone buys ~5%: LLVM does not autovectorize the nibble
 # unpacking these formats need. It matters because it switches on the
