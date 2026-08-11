@@ -426,6 +426,18 @@ jobs:
           # browser LFM2 session must keep compiling on wasm32. Native runtime
           # (WGSL kernels) is covered by the `gpu-tests` job above via lavapipe.
           - "--no-default-features --features gpu"
+    # Restores the `+simd128` that `.cargo/config.toml` carries for wasm32. The
+    # workflow-level `RUSTFLAGS: ""` is there to neutralize `target-cpu=native`
+    # on the host, but an env `RUSTFLAGS` REPLACES the config's target entry
+    # rather than appending to it, so this job has been compiling the scalar
+    # fallback instead of the kernels that actually ship. Repeating the flag is
+    # what `WASM_MT_RUSTFLAGS` in the justfile has to do, for the same reason.
+    #
+    # Safe for the whole job: every step below passes `--target`, and cargo does
+    # not apply rustflags to host build scripts or proc macros when
+    # cross-compiling, so `+simd128` never reaches a host artifact.
+    env:
+      RUSTFLAGS: "-C target-feature=+simd128"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
