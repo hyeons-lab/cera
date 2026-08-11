@@ -2269,6 +2269,14 @@ mod webgpu {
         /// knobs fall back to `SamplerConfig`'s defaults, and `seed` makes a
         /// stochastic run reproducible. See `generateTokens` for what the
         /// stochastic path costs.
+        // The four sampling knobs are passed flat rather than bundled, which
+        // puts this one over clippy's limit. The CPU `Session::generate` takes
+        // a `GenerateOpts`, but that type carries stop sequences, repetition
+        // penalties and a context policy this path does not implement, so
+        // accepting it here would advertise options the GPU decode loop
+        // silently ignores. A knob that is visibly absent beats one that is
+        // present and does nothing.
+        #[allow(clippy::too_many_arguments)]
         #[wasm_bindgen]
         pub async fn generate(
             &mut self,
@@ -2357,6 +2365,8 @@ mod webgpu {
         /// is a vocab-sized transfer per token. The greedy path is kept for
         /// exactly that reason, so a caller that does not ask for sampling
         /// pays nothing for its availability.
+        // Flat sampling knobs; see the note on `generate`.
+        #[allow(clippy::too_many_arguments)]
         #[wasm_bindgen(js_name = generateTokens)]
         pub async fn generate_tokens(
             &mut self,
@@ -2383,6 +2393,8 @@ mod webgpu {
         /// Shared body of `generate` / `generateTokens`: prefill, decode,
         /// UTF-8-safe streaming. Not exported; the two public entry points
         /// differ only in how `ids` is produced.
+        // Flat sampling knobs; see the note on `generate`.
+        #[allow(clippy::too_many_arguments)]
         async fn generate_ids(
             &mut self,
             ids: Vec<u32>,

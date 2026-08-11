@@ -599,10 +599,17 @@ jobs:
           vulkaninfo --summary || true
       - name: WebGPU async init and readback
         # `webgpu_smoke.rs` has existed since PR #169 and has never run in CI:
-        # it needs a browser AND an adapter. Whether headless Chrome finds one
-        # on lavapipe is the open question this step answers; if it cannot, the
-        # honest outcome is to delete this step and say so next to the recipe,
-        # not to let it pass without an adapter.
+        # it needs a browser AND an adapter. The first CI run of it reported
+        # "webgpu found no adapters", because `wasm-bindgen-test-runner` picks
+        # up `cera-wasm/webdriver.json` from the working directory and that file
+        # was written on a Mac: it passes `--use-angle=metal`, which no Linux
+        # runner can honor. Point the runner at the Linux flag set instead.
+        #
+        # `--enable-unsafe-swiftshader` is what lets Dawn accept a software
+        # adapter at all; without it Chrome refuses lavapipe and reports no
+        # adapter even though Vulkan is present.
+        env:
+          WASM_BINDGEN_TEST_WEBDRIVER_JSON: ${{ github.workspace }}/cera-wasm/webdriver-linux.json
         run: cd cera-wasm && wasm-pack test --headless --chrome --features wgpu --test webgpu_smoke
 
   cera-wasm-pack:

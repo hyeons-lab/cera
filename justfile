@@ -827,7 +827,11 @@ wasm-demo-wgpu: wasm-web-wgpu
 # round-trip on real browser WebGPU). Requires a WebGPU-capable Chrome and
 # a chromedriver whose MAJOR version matches it on PATH — wasm-pack cannot
 # auto-fetch chromedriver on Apple Silicon. Chrome flags that enable
-# headless WebGPU live in `cera-wasm/webdriver.json`.
+# headless WebGPU live in `cera-wasm/webdriver.json`, which the test runner
+# picks up from the working directory. Those flags are macOS-specific
+# (`--use-angle=metal`); CI runs the same test on Linux and overrides the
+# file via `WASM_BINDGEN_TEST_WEBDRIVER_JSON=cera-wasm/webdriver-linux.json`.
+# Keep the two in step when changing either.
 wasm-test-wgpu:
     cd cera-wasm && wasm-pack test --headless --chrome --features wgpu
 
