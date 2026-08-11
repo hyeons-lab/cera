@@ -1792,12 +1792,12 @@ mod webgpu {
             // so prepending on a continuation would inject a BOS at a nonzero
             // position mid-sequence. Also skip if the encoder already emitted it
             // (chat template / special token).
-            if self.state.seq_len == 0 && self.tokenizer.add_bos_token() {
-                if let Some(bos) = self.tokenizer.bos_token() {
-                    if ids.first() != Some(&bos) {
-                        ids.insert(0, bos);
-                    }
-                }
+            if self.state.seq_len == 0
+                && self.tokenizer.add_bos_token()
+                && let Some(bos) = self.tokenizer.bos_token()
+                && ids.first() != Some(&bos)
+            {
+                ids.insert(0, bos);
             }
             self.generate_ids(ids, max_tokens, on_token).await
         }

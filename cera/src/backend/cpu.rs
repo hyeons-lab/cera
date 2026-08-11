@@ -414,6 +414,12 @@ pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + 
         });
 }
 
+/// Serial fallback for builds without `parallel`: applies `f` to every element
+/// of `y` in order, on the calling thread.
+///
+/// `min_rows` is ignored because there are no workers to gate. Note the bound
+/// on `f` also drops to a plain `Fn`, which is what lets a caller pass a
+/// non-`Send` closure in a single-threaded build.
 #[cfg(not(feature = "parallel"))]
 pub fn par_rows(y: &mut [f32], _min_rows: usize, f: impl Fn((usize, &mut f32))) {
     for (i, yi) in y.iter_mut().enumerate() {
@@ -465,6 +471,11 @@ pub fn par_rows_n(
         });
 }
 
+/// Serial fallback for builds without `parallel`: walks `y` in `n`-element
+/// rows, in order, on the calling thread.
+///
+/// Keeps the parallel twin's `n == 0` and empty-`y` guards rather than assuming
+/// callers check, so the two paths reject the same inputs.
 #[cfg(not(feature = "parallel"))]
 pub fn par_rows_n(y: &mut [f32], n: usize, _min_rows: usize, f: impl Fn((usize, &mut [f32]))) {
     debug_assert_ne!(n, 0, "par_rows_n: n must be > 0");
@@ -537,6 +548,11 @@ pub fn par_rows_n_chunked(
     par_rows_n(y, n, min_rows, f);
 }
 
+/// Serial fallback for builds without `parallel`, delegating to
+/// [`par_rows_n`].
+///
+/// `min_chunk_rows` exists to stop a work-stealing chunk from collapsing to
+/// too few rows; with no stealing there is nothing to floor, so it is ignored.
 #[cfg(not(feature = "parallel"))]
 pub fn par_rows_n_chunked(
     y: &mut [f32],
@@ -584,6 +600,12 @@ pub fn par_rows_n_chunked_decode(
     par_rows_n_chunked(y, n, min_rows, min_chunk_rows, f);
 }
 
+/// Serial fallback for builds without `parallel`, delegating to
+/// [`par_rows_n_chunked`].
+///
+/// The decode/prefill pool split this name refers to does not exist without
+/// `parallel`, so there is no separate pool to keep hot and the two entry
+/// points collapse into the same serial walk.
 #[cfg(not(feature = "parallel"))]
 pub fn par_rows_n_chunked_decode(
     y: &mut [f32],
@@ -612,6 +634,10 @@ pub fn decode_par_threads() -> usize {
     crate::par::current_num_threads()
 }
 
+/// Always `1` without `parallel`: the dispatch runs on the calling thread.
+///
+/// Callers use this to skip building a per-worker scratch layout when the
+/// answer is one, so a serial build takes that cheap path unconditionally.
 #[cfg(not(feature = "parallel"))]
 pub fn decode_par_threads() -> usize {
     1
@@ -690,6 +716,11 @@ pub fn par_rows_n_work(
     par_rows_n(y, n, min_rows, f);
 }
 
+/// Serial fallback for builds without `parallel`, delegating to
+/// [`par_rows_n`].
+///
+/// `depth` caps how many workers a small dispatch may wake, so with no workers
+/// to wake it is ignored.
 #[cfg(not(feature = "parallel"))]
 pub fn par_rows_n_work(
     y: &mut [f32],
@@ -893,6 +924,11 @@ pub fn gemv_min_rows() -> usize {
     })
 }
 
+/// [`GEMV_MIN_ROWS_DEFAULT`] verbatim without `parallel`.
+///
+/// Deliberately does not read `CERA_MIN_ROWS`: the value only decides how rows
+/// are split across workers, so honoring the override here would let it look
+/// effective in a build where nothing consumes it.
 #[cfg(not(feature = "parallel"))]
 pub fn gemv_min_rows() -> usize {
     GEMV_MIN_ROWS_DEFAULT
