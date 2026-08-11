@@ -37,28 +37,32 @@ void main(List<String> args) {
     ),
   );
 
-  final session = engine.newSession(const SessionConfig(
-    maxSeqLen: null,
-    kvCompression: KvCompressionNone(),
-    nKeep: 0,
-    seed: null,
-    ubatchSize: 512,
-  ));
+  final session = engine.newSession(
+    const SessionConfig(
+      maxSeqLen: null,
+      kvCompression: KvCompressionNone(),
+      nKeep: 0,
+      seed: null,
+      ubatchSize: 512,
+    ),
+  );
 
   session.appendText(prompt);
-  final out = session.generate(const GenerateOpts(
-    maxTokens: 32,
-    temperature: 0.0,
-    topP: 1.0,
-    topK: 0,
-    minP: 0.0,
-    repetitionPenalty: 1.0,
-    stopTokens: <int>[],
-    grammar: null,
-    grammarTriggerTokens: <int>[],
-    flushEveryTokens: 0,
-    flushEveryMs: 0,
-  ));
+  final out = session.generate(
+    const GenerateOpts(
+      maxTokens: 32,
+      temperature: 0.0,
+      topP: 1.0,
+      topK: 0,
+      minP: 0.0,
+      repetitionPenalty: 1.0,
+      stopTokens: <int>[],
+      grammar: null,
+      grammarTriggerTokens: <int>[],
+      flushEveryTokens: 0,
+      flushEveryMs: 0,
+    ),
+  );
 
   final s = out.summary;
   print('generated ${out.tokens.length} tokens in ${s.decodeMs} ms');

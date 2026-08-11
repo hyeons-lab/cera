@@ -15,7 +15,10 @@ topics:
   - ai
 
 environment:
-  sdk: ^3.3.0
+  # 3.7, not 3.3, for the same reason as `cera_ffi`: `dart format` selects its
+  # style from this constraint, and the pre-3.7 style would rewrite this
+  # package's modern formatting backwards. See that pubspec for the full note.
+  sdk: ^3.7.0
   # Mandatory: pub rejects a package declaring `flutter.plugin.platforms`
   # without a Flutter SDK constraint ("allows Flutter SDK version 1.9.x, which
   # does not support the flutter.plugin.platforms key"). 3.10 is the floor

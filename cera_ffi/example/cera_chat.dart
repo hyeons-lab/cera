@@ -38,10 +38,13 @@ void main(List<String> args) {
 
   // ── String return ────────────────────────────────────────────────────────
   final messages = [ChatMessage(role: 'user', content: prompt)];
-  final String rendered = engine.hasChatTemplate()
-      ? engine.applyChatTemplate(messages, true)
-      : prompt;
-  print('chat template: ${engine.hasChatTemplate() ? "yes" : "none, raw prompt"}');
+  final String rendered =
+      engine.hasChatTemplate()
+          ? engine.applyChatTemplate(messages, true)
+          : prompt;
+  print(
+    'chat template: ${engine.hasChatTemplate() ? "yes" : "none, raw prompt"}',
+  );
 
   // ── Sequence return ──────────────────────────────────────────────────────
   final List<int> promptTokens = engine.encodeTextSpecial(rendered, true);
@@ -50,29 +53,33 @@ void main(List<String> args) {
   // ── Optional-enum return ─────────────────────────────────────────────────
   print('tool format:   ${engine.toolFormat() ?? "none"}');
 
-  final session = engine.newSession(const SessionConfig(
-    maxSeqLen: null,
-    kvCompression: KvCompressionNone(),
-    nKeep: 0,
-    seed: null,
-    ubatchSize: 512,
-  ));
+  final session = engine.newSession(
+    const SessionConfig(
+      maxSeqLen: null,
+      kvCompression: KvCompressionNone(),
+      nKeep: 0,
+      seed: null,
+      ubatchSize: 512,
+    ),
+  );
 
   session.appendTokens(promptTokens);
-  final out = session.generate(const GenerateOpts(
-    maxTokens: 64,
-    temperature: 0.0,
-    topP: 1.0,
-    topK: 0,
-    minP: 0.0,
-    repetitionPenalty: 1.0,
-    stopTokens: <int>[],
-    ignoreEos: false,
-    grammar: null,
-    grammarTriggerTokens: <int>[],
-    flushEveryTokens: 0,
-    flushEveryMs: 0,
-  ));
+  final out = session.generate(
+    const GenerateOpts(
+      maxTokens: 64,
+      temperature: 0.0,
+      topP: 1.0,
+      topK: 0,
+      minP: 0.0,
+      repetitionPenalty: 1.0,
+      stopTokens: <int>[],
+      ignoreEos: false,
+      grammar: null,
+      grammarTriggerTokens: <int>[],
+      flushEveryTokens: 0,
+      flushEveryMs: 0,
+    ),
+  );
 
   // ── String return, the one that made text output impossible ──────────────
   final String text = engine.decodeTokens(out.tokens);

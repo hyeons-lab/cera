@@ -212,6 +212,41 @@ dart-bindings-check: dart-bindings
     # is exactly what `dart pub get` rejects. See cera_ffi_flutter/pubspec.yaml.
     cd cera_ffi_flutter && flutter pub get && flutter analyze
 
+# Format every hand-written Dart file, the way CI checks it.
+#
+# Not a bare `dart format .`, for two reasons CI's "Format" step documents at
+# length:
+#
+#   - `lib/src/generated/` is excluded. UniFFI writes it and `dart-bindings`
+#     patches it, so formatting it would fight the generator on every regen.
+#   - each package is formatted from its own root, because `dart format` takes
+#     its style from the package's language version and the nested example
+#     declares a different one. Sweeping it up from the parent applies the
+#     wrong style to it.
+#
+# Run `just dart-pub-get` first (or any recipe that resolves the packages) if
+# this is a fresh checkout: with no `.dart_tool/` the formatter ignores the
+# declared language version entirely and silently uses the newest style.
+dart-fmt:
+    cd cera_ffi && git ls-files '*.dart' | grep -v '^lib/src/generated/' | xargs dart format
+    cd cera_ffi_flutter && git ls-files '*.dart' | grep -v '^example/' | xargs dart format
+    cd cera_ffi_flutter/example && git ls-files '*.dart' | xargs dart format
+
+# Resolve all three Dart packages so `dart format` reads their declared language
+# version instead of defaulting to the newest style on a fresh checkout. `dart`
+# for `cera_ffi` and `flutter` for the two Flutter packages, for the same reason
+# the split matters in `dart-bindings-check`.
+dart-pub-get:
+    cd cera_ffi && dart pub get
+    cd cera_ffi_flutter && flutter pub get
+    cd cera_ffi_flutter/example && flutter pub get
+
+# Check Dart formatting without rewriting anything. Mirrors CI's gate.
+dart-fmt-check:
+    cd cera_ffi && git ls-files '*.dart' | grep -v '^lib/src/generated/' | xargs dart format --output=none --set-exit-if-changed
+    cd cera_ffi_flutter && git ls-files '*.dart' | grep -v '^example/' | xargs dart format --output=none --set-exit-if-changed
+    cd cera_ffi_flutter/example && git ls-files '*.dart' | xargs dart format --output=none --set-exit-if-changed
+
 # Verify the committed Kotlin + Swift bindings are up to date with the
 # current Rust FFI surface. Regenerates in-place and fails if `git diff`
 # shows changes — signals that someone touched a `#[uniffi::*]` export

@@ -61,7 +61,9 @@ Future<void> installWeb(List<String> args) async {
     ..writeln('Installed into ${out.path}/')
     ..writeln()
     ..writeln('Point the engine at it if you changed --out:')
-    ..writeln('  Cera.openBytes(bytes, options: CeraOptions(web: CeraWebAssets(')
+    ..writeln(
+      '  Cera.openBytes(bytes, options: CeraOptions(web: CeraWebAssets(',
+    )
     ..writeln("    workerUrl: '${_urlOf(out)}/cera_worker.js',")
     ..writeln("    moduleUrl: '${_urlOf(out)}/cera_wasm.js',")
     ..writeln('  )));');
@@ -120,14 +122,21 @@ String _normalizePath(String path) {
 /// top level of a file this package controls do not justify one, and a tool
 /// that pulls in dependencies is a tool that can fail to resolve.
 Future<({String version, String repository})> _readPubspec() async {
-  final lib = await Isolate.resolvePackageUri(Uri.parse('package:cera_ffi/cera_ffi.dart'));
+  final lib = await Isolate.resolvePackageUri(
+    Uri.parse('package:cera_ffi/cera_ffi.dart'),
+  );
   if (lib == null) {
-    throw StateError('could not resolve package:cera_ffi; run this via `dart run`');
+    throw StateError(
+      'could not resolve package:cera_ffi; run this via `dart run`',
+    );
   }
   final file = File.fromUri(lib.resolve('../pubspec.yaml'));
   final text = await file.readAsString();
   String field(String name) {
-    final match = RegExp('^$name:\\s*(\\S+)\\s*\$', multiLine: true).firstMatch(text);
+    final match = RegExp(
+      '^$name:\\s*(\\S+)\\s*\$',
+      multiLine: true,
+    ).firstMatch(text);
     if (match == null) {
       throw StateError('no `$name:` in ${file.path}');
     }
@@ -144,10 +153,19 @@ Future<void> _installWorker(Directory out, {required bool force}) async {
   if (uri == null) {
     throw StateError('could not resolve the bundled cera_worker.js');
   }
-  await _write(out, 'cera_worker.js', await File.fromUri(uri).readAsBytes(), force: force);
+  await _write(
+    out,
+    'cera_worker.js',
+    await File.fromUri(uri).readAsBytes(),
+    force: force,
+  );
 }
 
-Future<void> _copyModule(Directory from, Directory out, {required bool force}) async {
+Future<void> _copyModule(
+  Directory from,
+  Directory out, {
+  required bool force,
+}) async {
   for (final name in const ['cera_wasm.js', 'cera_wasm_bg.wasm']) {
     final source = File('${from.path}/$name');
     if (!source.existsSync()) {
@@ -176,7 +194,9 @@ Future<void> _downloadModule(
       // Checked before the request, not after the download: re-running the
       // tool should not pull ~3 MB of wasm just to discard it.
       if (File('${out.path}/${entry.key}').existsSync() && !force) {
-        stdout.writeln('  skip  ${entry.key} (already present; --force to overwrite)');
+        stdout.writeln(
+          '  skip  ${entry.key} (already present; --force to overwrite)',
+        );
         continue;
       }
       final url = '$base/${entry.value}';
@@ -218,6 +238,7 @@ Future<void> _write(
   stdout.writeln('  write $name (${_size(bytes.length)})');
 }
 
-String _size(int bytes) => bytes < 1024 * 1024
-    ? '${(bytes / 1024).toStringAsFixed(0)} KB'
-    : '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+String _size(int bytes) =>
+    bytes < 1024 * 1024
+        ? '${(bytes / 1024).toStringAsFixed(0)} KB'
+        : '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';

@@ -26,11 +26,16 @@ void main() {
       expect(config.backend, BackendPreference.cpu);
       // copyWith and equality come from the shared renderer, so they work too.
       expect(config.copyWith(contextSize: 4096).contextSize, 4096);
-      expect(config, equals(const EngineConfig(
-        contextSize: 2048,
-        backend: BackendPreference.cpu,
-        bundleRepo: null,
-      )));
+      expect(
+        config,
+        equals(
+          const EngineConfig(
+            contextSize: 2048,
+            backend: BackendPreference.cpu,
+            bundleRepo: null,
+          ),
+        ),
+      );
     });
 
     test('enums keep their variants', () {
@@ -61,11 +66,14 @@ void main() {
 
     test('object constructors throw', () {
       expect(
-        () => CeraEngine.fromPath('model.gguf', const EngineConfig(
-          contextSize: 0,
-          backend: BackendPreference.auto,
-          bundleRepo: null,
-        )),
+        () => CeraEngine.fromPath(
+          'model.gguf',
+          const EngineConfig(
+            contextSize: 0,
+            backend: BackendPreference.auto,
+            bundleRepo: null,
+          ),
+        ),
         throwsUnsupportedError,
       );
       expect(() => BundleRepo.create('/tmp/cache'), throwsUnsupportedError);

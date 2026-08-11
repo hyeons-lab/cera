@@ -54,13 +54,15 @@ Future<void> main(List<String> args) async {
       bundleRepo: null,
     ),
   );
-  final session = engine.newSession(const SessionConfig(
-    maxSeqLen: null,
-    kvCompression: KvCompressionNone(),
-    nKeep: 0,
-    seed: null,
-    ubatchSize: 512,
-  ));
+  final session = engine.newSession(
+    const SessionConfig(
+      maxSeqLen: null,
+      kvCompression: KvCompressionNone(),
+      nKeep: 0,
+      seed: null,
+      ubatchSize: 512,
+    ),
+  );
   session.appendText(prompt);
 
   final sink = _CollectingSink();
@@ -92,8 +94,10 @@ Future<void> main(List<String> args) async {
     await Future<void>.delayed(const Duration(milliseconds: 5));
   }
 
-  print('done: ${sink.tokens.length} tokens over ${sink.batches} callback batches, '
-      'finish=${sink.finish}, decode=${summary.decodeMs}ms');
+  print(
+    'done: ${sink.tokens.length} tokens over ${sink.batches} callback batches, '
+    'finish=${sink.finish}, decode=${summary.decodeMs}ms',
+  );
 
   // The callback vtable's static NativeCallables keep the isolate alive, so a
   // CLI script won't exit on its own. A Flutter app stays running regardless.
