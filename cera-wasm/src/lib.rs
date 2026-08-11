@@ -2235,7 +2235,15 @@ mod webgpu {
             // wants the KV cache, nothing more.
             self.model
                 .seed_embeddings(&img_tokens, n_tokens, start, &mut self.state);
-            self.state.seq_len = end;
+            // `seed_embeddings` advances `seq_len` itself, once per frame, so
+            // assigning `end` here would be a no-op on a good day and would
+            // paper over a miscount on a bad one. Assert the contract instead:
+            // a mismatch means the KV cache holds a different number of frames
+            // than the session thinks, and every later position is wrong.
+            debug_assert_eq!(
+                self.state.seq_len, end,
+                "seed_embeddings must advance seq_len by n_tokens"
+            );
             Ok(())
         }
 

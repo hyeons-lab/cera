@@ -171,6 +171,7 @@ abstract interface class Cera {
   /// empty afterwards. Whether that happens depends on the list's shape and the
   /// web compiler, so do not rely on either outcome. Opening a second engine,
   /// or retrying after a failure, needs a freshly fetched or copied list.
+  ///
   /// **Multimodal models need `mmproj`.** A VL or audio model is two GGUFs:
   /// the vision tower and the audio encoder live in a separate "mmproj" file,
   /// and passing only the model loads it as text-only. [openPath] reads the
