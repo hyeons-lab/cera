@@ -312,9 +312,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: jetli/wasm-pack-action@v0.4.0
+      # Composite action, so no Node runtime to deprecate; see the note in
+      # ci.yml. Same pinned wasm-pack version.
+      - uses: taiki-e/install-action@v2
         with:
-          version: 'v0.14.0'
+          tool: wasm-pack@0.14.0
 
       - name: Install binaryen (provides wasm-opt)
         run: |
@@ -588,7 +590,7 @@ jobs:
             echo "::error::expected arm64 host for arm64-only xcframework, got '$ARCH'" >&2
             exit 1
           fi
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
       - name: Build CeraFFI.xcframework
         # Calls the recipe rather than restating it. This step used to inline a
         # copy "mirroring" `just apple-xcframework`, and the copy silently went
@@ -646,9 +648,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: jetli/wasm-pack-action@v0.4.0
+      # Composite action, so no Node runtime to deprecate; see the note in
+      # ci.yml. Same pinned wasm-pack version.
+      - uses: taiki-e/install-action@v2
         with:
-          version: 'v0.14.0'
+          tool: wasm-pack@0.14.0
 
       - name: Install binaryen (provides wasm-opt)
         run: |

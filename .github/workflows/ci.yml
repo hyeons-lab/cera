@@ -268,7 +268,7 @@ jobs:
       # Only the `core` set (~270 MB) — it holds LFM2.5-230M-Q4_K_M, which is
       # what these tests want. `arch`-tier is 6.3 GB and buys nothing here.
       - name: Cache GGUF fixtures
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target/oracle/models
           key: cera-parity-fixtures-core-${{ hashFiles('scripts/fetch_test_models.sh') }}
@@ -481,8 +481,10 @@ jobs:
           toolchain: nightly-2026-07-10
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: jetli/wasm-pack-action@v0.4.0
-      - uses: extractions/setup-just@v3
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.14.0
+      - uses: extractions/setup-just@v4
       - name: Run the simd128 kernel oracle tests under Node
         # `+simd128` comes from `.cargo/config.toml`; do not set RUSTFLAGS here,
         # which would REPLACE that rather than append and silently test the
@@ -525,9 +527,14 @@ jobs:
           toolchain: nightly-2026-07-10
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: jetli/wasm-pack-action@v0.4.0
+      # `taiki-e/install-action`, not `jetli/wasm-pack-action`: the latter is a
+      # `node16` action with no newer release, so GitHub force-runs it on
+      # node24 and warns. This one is a composite action, so it has no Node
+      # runtime to deprecate at all. Same pinned wasm-pack version; note the
+      # `tool:` form takes no leading `v`.
+      - uses: taiki-e/install-action@v2
         with:
-          version: 'v0.14.0'
+          tool: wasm-pack@0.14.0
       - name: Install binaryen (provides wasm-opt)
         run: |
           # Remove every apt source referencing packages.microsoft.com — see the
@@ -644,9 +651,14 @@ jobs:
           # the linker.
           components: rust-src
       - uses: Swatinem/rust-cache@v2
-      - uses: jetli/wasm-pack-action@v0.4.0
+      # `taiki-e/install-action`, not `jetli/wasm-pack-action`: the latter is a
+      # `node16` action with no newer release, so GitHub force-runs it on
+      # node24 and warns. This one is a composite action, so it has no Node
+      # runtime to deprecate at all. Same pinned wasm-pack version; note the
+      # `tool:` form takes no leading `v`.
+      - uses: taiki-e/install-action@v2
         with:
-          version: 'v0.14.0'
+          tool: wasm-pack@0.14.0
       - name: Install binaryen (provides wasm-opt)
         run: |
           # Remove every apt source referencing packages.microsoft.com — see the
@@ -842,7 +854,7 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
 
       - name: Regenerate, diff, and analyze
         # Runs the recipe instead of a copy of it. The steps here used to be
@@ -1270,7 +1282,7 @@ jobs:
             echo "::error::expected arm64 host for arm64-only cross-compile, got '$ARCH' — pin runs-on to an Apple Silicon label" >&2
             exit 1
           fi
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
       - name: Build XCFramework
         # Runs the recipe rather than a copy of it. This step used to be
         # inlined, with a comment claiming it mirrored the recipe exactly;
