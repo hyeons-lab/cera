@@ -533,6 +533,84 @@ jobs:
         # workflow-level `RUSTFLAGS: ""` had been overriding the config here
         # since it was added.
         run: just wasm-simd-test
+      - name: Run cera-wasm's own unit tests under Node
+        # Same trap as the kernels above, one crate over: `cera-wasm` is
+        # `cfg(target_arch = "wasm32")`, so `cargo test` on the host builds an
+        # empty lib and reports green without executing a line of it. These are
+        # `#[wasm_bindgen_test]`, so they need a real wasm runtime.
+        #
+        # Covers the bundle store's URL addressing. The OPFS half needs a real
+        # browser and runs in the `wasm-browser` job below.
+        run: just wasm-test
+
+  wasm-browser:
+    # The browser-only half of cera-wasm's tests.
+    #
+    # These used to be justfile-only, on the reasoning that chromedriver has to
+    # major-version-match Chrome and CI could not be relied on for that. On a
+    # developer machine that is a real problem (a brew Chrome outruns a brew
+    # chromedriver and `wasm-pack test` dies on a version mismatch), but the
+    # runner image ships Chrome and ChromeDriver together, so they match by
+    # construction. The version print below is kept so a future mismatch names
+    # itself instead of surfacing as an unexplained WebDriver error.
+    #
+    # Worth having: `opfs_bundle.rs` covers code that cannot execute anywhere
+    # else. OPFS has no Node equivalent, so before this job the only thing
+    # exercising the browser bundle store was someone remembering to run
+    # `just wasm-test-opfs` by hand.
+    name: Wasm browser tests
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Same `+simd128` restoration as the Wasm Build job: the workflow-level
+    # `RUSTFLAGS: ""` would otherwise replace the wasm32 entry in
+    # `.cargo/config.toml` and test the scalar path.
+    env:
+      RUSTFLAGS: "-C target-feature=+simd128"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.14.0
+      - name: Browser and driver versions
+        # Printed rather than asserted: the pair is whatever the image ships,
+        # and the log is what makes a future mismatch diagnosable in one look.
+        run: |
+          google-chrome --version
+          chromedriver --version
+      - name: OPFS bundle store
+        # Needs no GPU, so this is the part of the job that must always pass.
+        run: cd cera-wasm && wasm-pack test --headless --chrome --test opfs_bundle
+      - name: Install Mesa lavapipe (software Vulkan)
+        # Chrome needs a Vulkan driver to hand WebGPU an adapter, and the runner
+        # has no GPU. Same package set the lavapipe job above uses, including
+        # its apt-source workaround.
+        run: |
+          while IFS= read -r f; do
+            sudo rm -f -- "$f"
+          done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+          vulkaninfo --summary || true
+      - name: WebGPU async init and readback
+        # `webgpu_smoke.rs` has existed since PR #169 and has never run in CI:
+        # it needs a browser AND an adapter. The first CI run of it reported
+        # "webgpu found no adapters", because `wasm-bindgen-test-runner` picks
+        # up `cera-wasm/webdriver.json` from the working directory and that file
+        # was written on a Mac: it passes `--use-angle=metal`, which no Linux
+        # runner can honor. Point the runner at the Linux flag set instead.
+        #
+        # `--enable-unsafe-swiftshader` is what lets Dawn accept a software
+        # adapter at all; without it Chrome refuses lavapipe and reports no
+        # adapter even though Vulkan is present.
+        env:
+          WASM_BINDGEN_TEST_WEBDRIVER_JSON: ${{ github.workspace }}/cera-wasm/webdriver-linux.json
+        run: cd cera-wasm && wasm-pack test --headless --chrome --features wgpu --test webgpu_smoke
 
   cera-wasm-pack:
     # Multi-target wasm-pack build. Each matrix entry produces one
@@ -631,15 +709,32 @@ jobs:
         #   PR #72 (applyChatTemplate):          2.0 MB  (+800 KB minijinja render)
         #   (drifted to, scalar):                2507 KB
         #   simd128 restored:                    2585 KB (+78 KB of vector code)
-        # Budget:                                2816 KB (~9% headroom)
+        #   PR #364 (ffi parity):                3162 KB
+        # Budget:                                3.5 MB  (~13% headroom)
         #
-        # That last entry is a bump, not a regression. The 2507 KB line is not
-        # a release; it is what the artifact had quietly become while a
+        # The 2585 KB entry is a bump, not a regression. The 2507 KB line is
+        # not a release; it is what the artifact had quietly become while a
         # workflow-level `RUSTFLAGS: ""` was overriding `.cargo/config.toml`,
         # leaving no vector code in the build at all. The 78 KB back is the
         # `wasm_simd` kernels plus everything else LLVM vectorizes once it is
         # allowed to emit `v128`. Worth remembering the next time a wasm
         # artifact gets unexpectedly SMALLER.
+        #
+        # PR #364's 577 KB over that baseline splits roughly +262 KB for the
+        # multimodal/bundle API surface and the OPFS store, +383 KB for the
+        # image decoders `vl` pulls in. Roughly, because attribution needs a
+        # build of `main` and a `--no-default-features` build and CI produces
+        # neither, so the split was measured locally on a different wasm-pack
+        # and before `+simd128` came back. The total above is this job's own
+        # figure; the split is the shape of the growth, not arithmetic that
+        # closes against it.
+        #
+        # On `vl` being default-on, since it is the larger half of that
+        # jump: CI publishes one prebuilt npm artifact, so whichever way
+        # the default goes is what every consumer gets, and a VL bundle
+        # whose `appendImage` throws reads as a broken model rather than
+        # a missing build flag. Text-only deployments that want the
+        # 383 KB back build with `--no-default-features`.
         #
         # Plain bash arithmetic (no `numfmt` etc.) so this script
         # runs identically on the macOS / Linux developer machines
@@ -649,7 +744,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=2816  # 2.75 MB
+          BUDGET_KB=3584  # 3.5 MB
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           # Display rounds UP to KB, so a 2,621,441-byte file reads as
           # "2561 KB" rather than "2560 KB". That keeps the human-readable
@@ -806,10 +901,13 @@ jobs:
       - name: Check threaded .wasm size budget
         # Threaded wasm is bigger than the single-threaded body
         # because the std rebuild includes atomics-aware sync
-        # primitives + TLS init. 2666 KB measured for both
-        # targets with `+simd128` in the build step's flag list
-        # above; the 3072 KB budget gives ~15% headroom for std /
-        # wasm-bindgen-rayon churn before this needs a bump.
+        # primitives + TLS init, and that gap has closed to
+        # almost nothing as the body grew: 3247 KB threaded
+        # against 3162 KB single-threaded on PR #364, i.e. +3%
+        # (it was 2666 / 2585 on main before that),
+        # not the "~30% larger" this line used to claim (it was
+        # +15% when set, at 2.0 / 2.3 MB). PR #364 carries both
+        # up together. Sized off headroom rather than a ratio.
         # Crossing the budget is intentional sometimes (a real
         # new capability, not a regression) — when it happens,
         # justify in the PR description and bump `BUDGET_KB`
@@ -819,7 +917,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}-mt
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=3072  # 3 MB; see the note above for the measurement
+          BUDGET_KB=3712  # 3.625 MB; see the note above for the measurement
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           SIZE_KB=$(( (SIZE_BYTES + 1023) / 1024 ))
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}

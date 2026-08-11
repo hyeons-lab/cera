@@ -52,11 +52,49 @@ anyhow.workspace = true
 # for the `on_text_tokens` trampoline). Already a transitive dep of
 # wasm-bindgen; declared here because we use the public types.
 js-sys = "0.3"
+# The GPU vision encoder degrades to the CPU one on a runtime GPU failure.
+# `cera` logs that same fallback through `tracing` on its own image path, so
+# matching it keeps one story rather than inventing a second logging channel
+# here. Inert without a subscriber; browser callers who want the messages
+# install `tracing-wasm` (or equivalent) themselves.
+tracing = { workspace = true }
 # Bridges Rust `Future`s to JS Promises — required for the `async`
 # `#[wasm_bindgen]` exports on the WebGPU session (`WebGpuSession`).
 # wasm-bindgen's async-fn codegen references `wasm_bindgen_futures`
 # directly, so it must be a declared dependency.
 wasm-bindgen-futures = { workspace = true }
+# SHA-256 for the browser bundle store's integrity checks. Pure Rust and
+# incremental, so a download is hashed as it streams and a cached file is
+# re-verified in chunks. `crypto.subtle.digest` was the alternative and
+# can't do either: it's one-shot over a whole buffer, which would mean
+# holding a second copy of a multi-GB model to check it.
+sha2 = { workspace = true }
+# Browser APIs for the bundle store: OPFS (the `FileSystem*` handles),
+# `fetch` responses and their streaming bodies. Feature-gated per
+# interface, so this list is exactly what `src/bundle.rs` touches: any
+# addition there needs a matching entry here or the build fails with a
+# missing type rather than silently widening the surface.
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "File",
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "FileSystemGetDirectoryOptions",
+    "FileSystemGetFileOptions",
+    "FileSystemHandle",
+    "FileSystemHandleKind",
+    "FileSystemReadWriteOptions",
+    "FileSystemRemoveOptions",
+    "FileSystemSyncAccessHandle",
+    "FileSystemWritableFileStream",
+    "Headers",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "RequestInit",
+    "Response",
+    "StorageManager",
+    "WritableStream",
+] }
 
 # `wasm-bindgen-rayon` is wasm-only — it pulls in `web_sys::Worker`
 # / Node `worker_threads` glue that doesn't exist on native targets.
@@ -72,6 +110,19 @@ wasm-bindgen-rayon = { workspace = true, optional = true }
 wasm-bindgen-test = { workspace = true }
 
 [features]
+# Image input is on by default because a VL bundle that loads but cannot
+# accept an image is a worse failure than a slightly larger download: the
+# engine reports `capabilities.imageIn = false` and `appendImage` throws,
+# which reads as a broken model rather than a missing build flag.
+default = ["vl"]
+
+# `vl`: image input. Turns on `cera/vl-preprocess` (PNG/JPEG decode +
+# resize + normalize via the pure-Rust `image` crate, no system libpng or
+# libjpeg). Without it `Session.appendImage` compiles but always returns
+# `UnsupportedModality`. Text-only or raw-PCM-audio-only deployments can
+# `--no-default-features` to drop the decoders from the `.wasm`.
+vl = ["cera/vl-preprocess"]
+
 # `parallel` — opt-in multi-threaded wasm build. Lights up
 # `cera/parallel` (rayon) and links `wasm-bindgen-rayon`, which
 # emits a `#[wasm_bindgen]` `initThreadPool(numThreads)` export

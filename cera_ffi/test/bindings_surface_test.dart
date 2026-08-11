@@ -62,6 +62,20 @@ void main() {
     expect(_bundleRepoSurfaceGuard, isA<Function>());
   });
 
+  test('fromPartsAsync returns a Future, not a bare engine', () {
+    // Same async-constructor hazard as `fromBundleIdAsync` below, and the same
+    // signal. The multimodal constructor matters on its own: it is the only way
+    // to load a model plus its mmproj without a filesystem, so if the generator
+    // drops it, `Cera.openBytes(mmproj: ...)` silently loses its native half
+    // and VL-from-memory becomes web-only again.
+    expect(
+      CeraEngine.fromPartsAsync,
+      isA<
+          Future<CeraEngine> Function(
+              Uint8List, Uint8List?, String?, EngineConfig)>(),
+    );
+  });
+
   test('fromBundleIdAsync returns a Future, not a bare engine', () {
     // The generator had no rust-future path for async *constructors* (only for
     // methods), so this used to be a synchronous `throw UnsupportedError`. The

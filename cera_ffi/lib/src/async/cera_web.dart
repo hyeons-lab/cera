@@ -40,8 +40,13 @@ extension type _Request._(JSObject _) implements JSObject {
     String op,
     String? moduleUrl,
     JSArrayBuffer? bytes,
+    JSArrayBuffer? mmproj,
     int? contextSize,
     String? backend,
+    String? inferenceType,
+    int? maxLongSize,
+    JSArray<JSNumber>? pcm,
+    int? sampleRate,
     String? prompt,
     int? maxTokens,
     double? temperature,
@@ -76,6 +81,15 @@ extension type _Reply._(JSObject _) implements JSObject {
 
 extension type _OpenResult._(JSObject _) implements JSObject {
   external String get backend;
+  external _Capabilities get capabilities;
+}
+
+extension type _Capabilities._(JSObject _) implements JSObject {
+  external bool get textIn;
+  external bool get textOut;
+  external bool get imageIn;
+  external bool get audioIn;
+  external bool get audioOut;
 }
 
 /// The web has no filesystem, so [Cera.openPath] always throws. See
@@ -100,10 +114,15 @@ Future<Cera> openPath(String path, CeraOptions options) async =>
     );
 
 /// Opens a model from memory. See [Cera.openBytes].
-Future<Cera> openBytes(Uint8List bytes, CeraOptions options) async {
+Future<Cera> openBytes(
+  Uint8List bytes,
+  CeraOptions options,
+  Uint8List? mmproj,
+  String? inferenceType,
+) async {
   final worker = _WorkerCera(options);
   try {
-    await worker._start(bytes);
+    await worker._start(bytes, mmproj, inferenceType);
   } on Object {
     // The worker is already constructed by the time `open` can fail, and a
     // failed open hands the caller nothing to `close()`. Without this, every
@@ -114,6 +133,14 @@ Future<Cera> openBytes(Uint8List bytes, CeraOptions options) async {
   }
   return worker;
 }
+
+CeraCapabilities _capabilitiesOf(_Capabilities caps) => CeraCapabilities(
+  textIn: caps.textIn,
+  textOut: caps.textOut,
+  imageIn: caps.imageIn,
+  audioIn: caps.audioIn,
+  audioOut: caps.audioOut,
+);
 
 class _WorkerCera implements Cera {
   _WorkerCera(this._options);
@@ -150,7 +177,15 @@ class _WorkerCera implements Cera {
   @override
   String get backend => _backend;
 
-  Future<void> _start(Uint8List bytes) async {
+  /// Reported by the worker as part of the open reply rather than fetched
+  /// afterwards, so it costs no extra round trip and cannot be observed before
+  /// it is known.
+  late final CeraCapabilities _capabilities;
+
+  @override
+  CeraCapabilities get capabilities => _capabilities;
+
+  Future<void> _start(Uint8List bytes, Uint8List? mmproj, String? inferenceType) async {
     // Both URLs are resolved against the page before they leave Dart.
     //
     // `new Worker(url)` would resolve a relative URL against the document
@@ -190,6 +225,7 @@ class _WorkerCera implements Cera {
     }).toJS;
 
     final buffer = _detach(bytes);
+    final projBuffer = mmproj == null ? null : _detach(mmproj);
     final result = await _send(
       _newId(),
       (id) => _Request(
@@ -197,15 +233,20 @@ class _WorkerCera implements Cera {
         op: 'open',
         moduleUrl: moduleUrl,
         bytes: buffer,
+        mmproj: projBuffer,
         contextSize: _options.contextSize,
         backend: _options.backend.name,
+        inferenceType: inferenceType,
       ),
       // Hand the model's memory to the worker rather than copying it. A
       // multi-hundred-megabyte structured clone is both a pause and a moment
-      // where the tab holds two copies.
-      transfer: <JSAny>[buffer],
+      // where the tab holds two copies. The projector rides along: it is the
+      // smaller of the two but the same argument applies.
+      transfer: <JSAny>[buffer, if (projBuffer != null) projBuffer],
     );
-    _backend = (result as _OpenResult).backend;
+    final opened = result as _OpenResult;
+    _backend = opened.backend;
+    _capabilities = _capabilitiesOf(opened.capabilities);
   }
 
   /// Produces an `ArrayBuffer` that is safe to transfer.
@@ -419,6 +460,43 @@ class _WorkerCera implements Cera {
         id: id,
         op: 'decode',
         tokens: tokens.map((t) => t.toJS).toList().toJS,
+      ),
+    );
+    return (result as JSString).toDart;
+  }
+
+  @override
+  Future<void> appendImage(Uint8List bytes, {int? maxLongSize}) async {
+    // Queued behind any running generation, as on native: this appends patch
+    // embeddings to the very KV cache a decode is writing to.
+    await _queue;
+    final buffer = _detach(bytes);
+    await _send(
+      _newId(),
+      (id) => _Request(
+        id: id,
+        op: 'appendImage',
+        bytes: buffer,
+        maxLongSize: maxLongSize,
+      ),
+      transfer: <JSAny>[buffer],
+    );
+  }
+
+  @override
+  Future<String> transcribe(List<double> pcm, {required int sampleRate}) async {
+    await _queue;
+    final result = await _send(
+      _newId(),
+      (id) => _Request(
+        id: id,
+        op: 'transcribe',
+        // Crosses as a plain number array and is narrowed to Float32Array in
+        // the worker. A `Float64List` would transfer, but the samples are f32
+        // on the Rust side, so the wider buffer would be twice the traffic to
+        // then be halved.
+        pcm: pcm.map((s) => s.toJS).toList().toJS,
+        sampleRate: sampleRate,
       ),
     );
     return (result as JSString).toDart;

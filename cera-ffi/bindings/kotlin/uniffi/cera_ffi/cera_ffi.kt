@@ -950,6 +950,10 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async(): Int
 
+    external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async(): Int
+
     external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_path(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async(): Int
@@ -1040,6 +1044,21 @@ internal object UniffiLib {
 
     external fun uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes_async(
         `bytes`: RustBuffer.ByValue,
+        `config`: RustBuffer.ByValue,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_constructor_ceraengine_from_parts(
+        `bytes`: RustBuffer.ByValue,
+        `multimodalProjector`: RustBuffer.ByValue,
+        `inferenceType`: RustBuffer.ByValue,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_constructor_ceraengine_from_parts_async(
+        `bytes`: RustBuffer.ByValue,
+        `multimodalProjector`: RustBuffer.ByValue,
+        `inferenceType`: RustBuffer.ByValue,
         `config`: RustBuffer.ByValue,
     ): Long
 
@@ -1771,10 +1790,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 14088) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes() != 45873) {
+    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes() != 53168) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async() != 8065) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts() != 18448) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async() != 8804) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 64420) {
@@ -3471,7 +3496,8 @@ open class CeraEngine :
          *
          * Text-only: the bytes are a bare GGUF with no accompanying
          * manifest, so there is nothing to point at a vision encoder or an
-         * audio decoder. Multimodal models need `from_path` or
+         * audio decoder. Multimodal models need
+         * [`CeraEngine::from_parts`], `from_path`, or
          * [`CeraEngine::from_bundle_id`]. `config.bundle_repo` is ignored.
          */
         @Throws(FfiException::class)
@@ -3510,6 +3536,93 @@ open class CeraEngine :
             uniffiRustCallAsync(
                 UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes_async(
                     FfiConverterByteArray.lower(`bytes`),
+                    FfiConverterTypeEngineConfig.lower(`config`),
+                ),
+                { future, callback, continuation -> UniffiLib.ffi_cera_ffi_rust_future_poll_u64(future, callback, continuation) },
+                { future, continuation -> UniffiLib.ffi_cera_ffi_rust_future_complete_u64(future, continuation) },
+                { future -> UniffiLib.ffi_cera_ffi_rust_future_free_u64(future) },
+                // lift function
+                { FfiConverterTypeCeraEngine.lift(it) },
+                // Error FFI converter
+                FfiException.ErrorHandler,
+            )
+
+        /**
+         * Load a multi-file bundle from memory: the model GGUF plus its
+         * multimodal projector ("mmproj").
+         *
+         * This is the constructor a VL or audio model needs when there is
+         * no filesystem, and [`CeraEngine::from_bytes`] structurally cannot
+         * be: the vision tower and the audio encoder live in a *second*
+         * GGUF, and that one takes a single buffer. Same inputs and same
+         * rules as the wasm build's `fromGgufParts`, so a portable layer
+         * over both has one shape to target.
+         *
+         * `multimodal_projector` may be `None`, which makes this exactly
+         * `from_bytes` with an explicit config.
+         *
+         * **Modality is inferred from the arguments, not just the header.**
+         * Every published LFM2-VL model reports `architecture = "lfm2"`,
+         * the same string a text model reports, because the vision half is
+         * entirely in the mmproj. So supplying one alongside a text-arch
+         * model is taken as the statement of intent it is and loads as
+         * image-to-text; audio models already identify themselves and are
+         * unaffected. Pass `inference_type` explicitly to override
+         * (`"llama.cpp/text-to-text"`, `"llama.cpp/image-to-text"`,
+         * `"llama.cpp/lfm2-audio-v1"`).
+         *
+         * A malformed or mismatched mmproj is **not** fatal: it warns, and
+         * the bundle still serves text with `capabilities().image_in`
+         * staying false. That mirrors the path-based loaders rather than
+         * failing a whole load over a sidecar.
+         *
+         * **Prefer `from_path` whenever a path exists**, for the same
+         * memory reason as [`CeraEngine::from_bytes`]: these buffers are
+         * committed resident memory for the engine's lifetime, and a VL
+         * bundle is the model *plus* the tower. `config.bundle_repo` is
+         * ignored.
+         */
+        @Throws(FfiException::class)
+        fun `fromParts`(
+            `bytes`: kotlin.ByteArray,
+            `multimodalProjector`: kotlin.ByteArray?,
+            `inferenceType`: kotlin.String?,
+            `config`: EngineConfig,
+        ): CeraEngine =
+            FfiConverterTypeCeraEngine.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_parts(
+                        FfiConverterByteArray.lower(`bytes`),
+                        FfiConverterOptionalByteArray.lower(`multimodalProjector`),
+                        FfiConverterOptionalString.lower(`inferenceType`),
+                        FfiConverterTypeEngineConfig.lower(`config`),
+                        _status,
+                    )
+                },
+            )
+
+        /**
+         * Async variant of [`CeraEngine::from_parts`].
+         *
+         * Wanted more than the text-only twin, not less: a VL bundle is the
+         * model *plus* its tower, so there is strictly more parsing to keep
+         * off the caller's thread, and the vision encoder's weights are
+         * built during the load. Same weak cancellation, and both buffers
+         * are moved into the blocking task.
+         */
+        @Throws(FfiException::class)
+        @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+        suspend fun `fromPartsAsync`(
+            `bytes`: kotlin.ByteArray,
+            `multimodalProjector`: kotlin.ByteArray?,
+            `inferenceType`: kotlin.String?,
+            `config`: EngineConfig,
+        ): CeraEngine =
+            uniffiRustCallAsync(
+                UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_parts_async(
+                    FfiConverterByteArray.lower(`bytes`),
+                    FfiConverterOptionalByteArray.lower(`multimodalProjector`),
+                    FfiConverterOptionalString.lower(`inferenceType`),
                     FfiConverterTypeEngineConfig.lower(`config`),
                 ),
                 { future, callback, continuation -> UniffiLib.ffi_cera_ffi_rust_future_poll_u64(future, callback, continuation) },
@@ -7423,6 +7536,38 @@ public object FfiConverterOptionalString : FfiConverterRustBuffer<kotlin.String?
         } else {
             buf.put(1)
             FfiConverterString.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalByteArray : FfiConverterRustBuffer<kotlin.ByteArray?> {
+    override fun read(buf: ByteBuffer): kotlin.ByteArray? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterByteArray.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.ByteArray?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterByteArray.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: kotlin.ByteArray?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterByteArray.write(value, buf)
         }
     }
 }

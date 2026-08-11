@@ -181,11 +181,27 @@ impl Manifest {
     /// through this — keeps downstream loader dispatch uniform regardless
     /// of how the session was initiated.
     pub fn synthetic_text(model_path: &Path) -> Self {
+        Self::synthetic(model_path, InferenceType::LlamaCppTextToText, None)
+    }
+
+    /// Synthesize a minimal manifest for a bare GGUF of any modality.
+    ///
+    /// `multimodal_projector` names the mmproj sidecar for VL and audio
+    /// bundles. It is recorded so consumers that inspect the manifest see the
+    /// same shape a real one would have, but the in-memory constructors do
+    /// *not* open it by name: `CeraEngine::from_gguf` only opens aux files
+    /// when it was given a filesystem path, and hands in already-parsed
+    /// weights otherwise. Pass `<bytes>`-style placeholders freely.
+    pub fn synthetic(
+        model_path: &Path,
+        inference_type: InferenceType,
+        multimodal_projector: Option<String>,
+    ) -> Self {
         let model_path_str = model_path.to_string_lossy().into_owned();
         let mut raw_map = serde_json::Map::new();
         raw_map.insert(
             "inference_type".into(),
-            serde_json::Value::String("llama.cpp/text-to-text".into()),
+            serde_json::Value::String(inference_type.as_str().to_string()),
         );
         raw_map.insert(
             "schema_version".into(),
@@ -196,6 +212,12 @@ impl Manifest {
             "model".into(),
             serde_json::Value::String(model_path_str.clone()),
         );
+        if let Some(mmproj) = &multimodal_projector {
+            load_params.insert(
+                "multimodal_projector".into(),
+                serde_json::Value::String(mmproj.clone()),
+            );
+        }
         raw_map.insert(
             "load_time_parameters".into(),
             serde_json::Value::Object(load_params),
@@ -203,11 +225,11 @@ impl Manifest {
         let raw = serde_json::Value::Object(raw_map);
 
         Self {
-            inference_type: InferenceType::LlamaCppTextToText,
+            inference_type,
             schema_version: "1.0.0".into(),
             files: ManifestFiles {
                 model: model_path_str,
-                multimodal_projector: None,
+                multimodal_projector,
                 audio_decoder: None,
                 audio_tokenizer: None,
                 extras: HashMap::new(),

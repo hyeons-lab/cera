@@ -1153,7 +1153,8 @@ public static func fromBundleIdAsync(bundleId: String, quant: String, config: En
      *
      * Text-only: the bytes are a bare GGUF with no accompanying
      * manifest, so there is nothing to point at a vision encoder or an
-     * audio decoder. Multimodal models need `from_path` or
+     * audio decoder. Multimodal models need
+     * [`CeraEngine::from_parts`], `from_path`, or
      * [`CeraEngine::from_bundle_id`]. `config.bundle_repo` is ignored.
      */
 public static func fromBytes(bytes: Data, config: EngineConfig)throws  -> CeraEngine  {
@@ -1182,6 +1183,76 @@ public static func fromBytesAsync(bytes: Data, config: EngineConfig)async throws
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes_async(FfiConverterData.lower(bytes),FfiConverterTypeEngineConfig_lower(config)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_u64,
+            completeFunc: ffi_cera_ffi_rust_future_complete_u64,
+            freeFunc: ffi_cera_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterTypeCeraEngine_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
+     * Load a multi-file bundle from memory: the model GGUF plus its
+     * multimodal projector ("mmproj").
+     *
+     * This is the constructor a VL or audio model needs when there is
+     * no filesystem, and [`CeraEngine::from_bytes`] structurally cannot
+     * be: the vision tower and the audio encoder live in a *second*
+     * GGUF, and that one takes a single buffer. Same inputs and same
+     * rules as the wasm build's `fromGgufParts`, so a portable layer
+     * over both has one shape to target.
+     *
+     * `multimodal_projector` may be `None`, which makes this exactly
+     * `from_bytes` with an explicit config.
+     *
+     * **Modality is inferred from the arguments, not just the header.**
+     * Every published LFM2-VL model reports `architecture = "lfm2"`,
+     * the same string a text model reports, because the vision half is
+     * entirely in the mmproj. So supplying one alongside a text-arch
+     * model is taken as the statement of intent it is and loads as
+     * image-to-text; audio models already identify themselves and are
+     * unaffected. Pass `inference_type` explicitly to override
+     * (`"llama.cpp/text-to-text"`, `"llama.cpp/image-to-text"`,
+     * `"llama.cpp/lfm2-audio-v1"`).
+     *
+     * A malformed or mismatched mmproj is **not** fatal: it warns, and
+     * the bundle still serves text with `capabilities().image_in`
+     * staying false. That mirrors the path-based loaders rather than
+     * failing a whole load over a sidecar.
+     *
+     * **Prefer `from_path` whenever a path exists**, for the same
+     * memory reason as [`CeraEngine::from_bytes`]: these buffers are
+     * committed resident memory for the engine's lifetime, and a VL
+     * bundle is the model *plus* the tower. `config.bundle_repo` is
+     * ignored.
+     */
+public static func fromParts(bytes: Data, multimodalProjector: Data?, inferenceType: String?, config: EngineConfig)throws  -> CeraEngine  {
+    return try  FfiConverterTypeCeraEngine_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ceraengine_from_parts(
+        FfiConverterData.lower(bytes),
+        FfiConverterOptionData.lower(multimodalProjector),
+        FfiConverterOptionString.lower(inferenceType),
+        FfiConverterTypeEngineConfig_lower(config),$0
+    )
+})
+}
+    
+    /**
+     * Async variant of [`CeraEngine::from_parts`].
+     *
+     * Wanted more than the text-only twin, not less: a VL bundle is the
+     * model *plus* its tower, so there is strictly more parsing to keep
+     * off the caller's thread, and the vision encoder's weights are
+     * built during the load. Same weak cancellation, and both buffers
+     * are moved into the blocking task.
+     */
+public static func fromPartsAsync(bytes: Data, multimodalProjector: Data?, inferenceType: String?, config: EngineConfig)async throws  -> CeraEngine  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_constructor_ceraengine_from_parts_async(FfiConverterData.lower(bytes),FfiConverterOptionData.lower(multimodalProjector),FfiConverterOptionString.lower(inferenceType),FfiConverterTypeEngineConfig_lower(config)
                 )
             },
             pollFunc: ffi_cera_ffi_rust_future_poll_u64,
@@ -4985,6 +5056,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
+    typealias SwiftType = Data?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterData.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterData.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeBundleRepo: FfiConverterRustBuffer {
     typealias SwiftType = BundleRepo?
 
@@ -5473,10 +5568,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 14088) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes() != 45873) {
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes() != 53168) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async() != 8065) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts() != 18448) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async() != 8804) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 64420) {

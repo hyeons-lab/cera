@@ -10,7 +10,10 @@
 //!
 //! Run: `wasm-pack test --headless --chrome --features wgpu` (the
 //! `cera-wasm/webdriver.json` capabilities enable WebGPU in headless Chrome).
-//! Requires a WebGPU-capable Chrome + matching chromedriver.
+//! Requires a WebGPU-capable Chrome + matching chromedriver. That file's
+//! flags are macOS-specific; CI points the runner at `webdriver-linux.json`
+//! through `WASM_BINDGEN_TEST_WEBDRIVER_JSON`, since a software adapter needs
+//! different flags than a Metal one.
 
 #![cfg(all(target_arch = "wasm32", feature = "wgpu"))]
 

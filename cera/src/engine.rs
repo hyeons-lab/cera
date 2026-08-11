@@ -139,6 +139,44 @@ pub struct ModelFiles {
     pub chat_template: Option<String>,
 }
 
+/// In-memory counterpart to [`ModelFiles`] for [`CeraEngine::from_parts`].
+///
+/// [`CeraEngine::from_bytes`] takes a single buffer and is therefore text-only:
+/// a VL or audio bundle needs a *second* GGUF, the multimodal projector, and
+/// there is nowhere to put it. That is the whole reason this type exists.
+/// Targets with no filesystem (wasm above all) can only ever hand the engine
+/// bytes, so without it they are locked out of every non-text modality.
+///
+/// Buffers are `Arc<[u8]>` because `GgufFile` keeps a zero-copy view into
+/// them; cloning a `ModelBytes` shares the same allocation rather than
+/// duplicating a multi-hundred-megabyte model.
+#[derive(Clone)]
+pub struct ModelBytes {
+    /// Required: the primary model GGUF.
+    pub model: Arc<[u8]>,
+    /// The multimodal projector GGUF (the "mmproj"): the vision tower for a
+    /// VL bundle, the audio encoder for an audio one. `None` is text-only.
+    pub multimodal_projector: Option<Arc<[u8]>>,
+    /// Explicit inference type. `None` auto-detects from the primary GGUF's
+    /// `general.architecture`, then upgrades text → VL when an mmproj is
+    /// present (see [`CeraEngine::from_parts`] for why).
+    pub inference_type: Option<InferenceType>,
+    /// Chat-template override. When set, replaces the GGUF's own template.
+    pub chat_template: Option<String>,
+}
+
+impl ModelBytes {
+    /// Convenience: a text-only `ModelBytes` from a single buffer.
+    pub fn text(model: impl Into<Arc<[u8]>>) -> Self {
+        Self {
+            model: model.into(),
+            multimodal_projector: None,
+            inference_type: Some(InferenceType::LlamaCppTextToText),
+            chat_template: None,
+        }
+    }
+}
+
 impl ModelFiles {
     /// Convenience: construct a text-only `ModelFiles` from a single path.
     pub fn text(path: impl Into<PathBuf>) -> Self {
@@ -152,6 +190,19 @@ impl ModelFiles {
             chat_template: None,
         }
     }
+}
+
+/// Encoder weights a caller has already parsed, handed to
+/// [`CeraEngine::from_gguf`] instead of being read from the manifest's paths.
+///
+/// Internal: the public route is [`CeraEngine::from_parts`]. Every path-based
+/// constructor passes `default()` and keeps loading aux files eagerly.
+#[derive(Default)]
+struct AuxWeights {
+    /// Parsed vision mmproj, for `LlamaCppImageToText` bundles.
+    vision_mmproj: Option<Arc<GgufFile>>,
+    /// Parsed audio encoder, for `LlamaCppLfm2AudioV1` bundles.
+    audio_encoder: Option<Arc<AudioEncoderWeights>>,
 }
 
 /// Short summary of the loaded model. Matches the shape planned for the
@@ -291,7 +342,113 @@ impl CeraEngine {
         let gguf = GgufFile::from_bytes(arc_bytes)
             .map_err(|e| CeraError::Backend(format!("parsing GGUF bytes: {e}")))?;
         let manifest = Manifest::synthetic_text(Path::new("<bytes>"));
-        Self::from_gguf(gguf, manifest, cfg, None)
+        Self::from_gguf(gguf, manifest, cfg, None, AuxWeights::default())
+    }
+
+    /// Load a multi-file bundle entirely from memory: the multi-file
+    /// counterpart to [`Self::from_bytes`], as [`Self::from_files`] is to
+    /// [`Self::from_path`].
+    ///
+    /// This is what makes VL and audio reachable without a filesystem. Both
+    /// modalities need a second GGUF (the multimodal projector), every other
+    /// multi-file constructor takes `PathBuf`s, and [`Self::from_bytes`] has
+    /// nowhere to put a second buffer, so a target like wasm could previously
+    /// load text and nothing else.
+    ///
+    /// Inference type resolves in three steps, most specific first:
+    ///
+    /// 1. an explicit `parts.inference_type`, honored as given;
+    /// 2. otherwise the primary GGUF's `general.architecture`;
+    /// 3. otherwise, if (2) said text-to-text *and* an mmproj was supplied
+    ///    **and parsed**, image-to-text.
+    ///
+    /// Step 3 is not a guess dressed up as a default. Every published LFM2-VL
+    /// bundle reports `architecture = "lfm2"`, identical to a text model: the
+    /// vision tower lives entirely in the mmproj. Auto-detect therefore says
+    /// "text" for every real VL model, and taking it at its word would make
+    /// the mmproj argument silently inert, which is the failure mode
+    /// `from_path` refuses a bare-GGUF VL load to avoid. Supplying an mmproj
+    /// is an unambiguous statement of intent, so it wins. Audio is never
+    /// inferred this way (its `lfm2-audio` arch is already distinctive) and
+    /// callers who genuinely want text plus an ignored sidecar can say so
+    /// with an explicit `inference_type`.
+    ///
+    /// Unconditional: no `mmap`, no `std-fs`. Aux parsing failures are
+    /// non-fatal and warn, matching the path-based loaders, so a bundle with
+    /// a broken mmproj still serves text. Note the interaction with step 3:
+    /// an *inferred* modality downgrades when its mmproj will not parse, so
+    /// `capabilities()` keeps describing what the engine can actually do,
+    /// while an *explicit* one is left standing and surfaces the specific
+    /// "no encoder attached" error at first use.
+    pub fn from_parts(parts: ModelBytes, cfg: EngineConfig) -> Result<Self, CeraError> {
+        let gguf = GgufFile::from_bytes(Arc::clone(&parts.model))
+            .map_err(|e| CeraError::Backend(format!("parsing GGUF bytes: {e}")))?;
+
+        // Parse the mmproj *before* resolving the modality, because the
+        // upgrade below is only sound if the sidecar is real. Deciding
+        // "VL" from the mere presence of a buffer and then discovering it is
+        // garbage leaves `capabilities.image_in == true` on an engine with no
+        // vision encoder: a claim that `append_image` immediately refuses.
+        // An unusable mmproj must therefore not be evidence of anything.
+        //
+        // Skipped entirely when nothing downstream can consult it: an
+        // explicit *text* type short-circuits the upgrade and routes no
+        // aux weights, so parsing there would burn the work and warn about
+        // a sidecar the caller deliberately opted out of. That opt-out is
+        // a documented use ("text plus an ignored sidecar"), so it should
+        // not be the noisy path.
+        let mmproj_can_matter = match &parts.inference_type {
+            // Inferred: the upgrade needs to know whether it is usable.
+            None => true,
+            // Explicit and multimodal: `aux` below needs it parsed.
+            Some(InferenceType::LlamaCppImageToText | InferenceType::LlamaCppLfm2AudioV1) => true,
+            Some(_) => false,
+        };
+        let mmproj = parts
+            .multimodal_projector
+            .as_ref()
+            .filter(|_| mmproj_can_matter)
+            .and_then(|bytes| parse_aux_gguf(bytes, "multimodal projector"));
+
+        let inference_type = resolve_parts_inference_type(
+            parts.inference_type.clone(),
+            gguf.get_str("general.architecture").unwrap_or(""),
+            mmproj.is_some(),
+        );
+        check_inference_type_supported(&inference_type)?;
+
+        // Route the parsed mmproj to whichever encoder this modality wants.
+        //
+        // An *explicit* type is still honored even when the mmproj is
+        // unusable: the caller declared the bundle's shape, so the modality
+        // stays on and `append_image` / `append_audio` report the specific
+        // "no encoder attached" error. That matches how a manifest-driven
+        // load behaves. Only the inferred case downgrades, above.
+        //
+        // A text type ignores the mmproj entirely, which is what makes the
+        // documented opt-out ("text plus an ignored sidecar") mean something.
+        let aux = match (&inference_type, mmproj) {
+            (InferenceType::LlamaCppImageToText, Some(g)) => AuxWeights {
+                vision_mmproj: Some(g),
+                audio_encoder: None,
+            },
+            (InferenceType::LlamaCppLfm2AudioV1, Some(g)) => AuxWeights {
+                vision_mmproj: None,
+                audio_encoder: try_parse_audio_encoder(&g, None),
+            },
+            _ => AuxWeights::default(),
+        };
+
+        let mut manifest = Manifest::synthetic(
+            Path::new("<bytes>"),
+            inference_type,
+            parts
+                .multimodal_projector
+                .as_ref()
+                .map(|_| "<mmproj-bytes>".to_string()),
+        );
+        manifest.chat_template = parts.chat_template;
+        Self::from_gguf(gguf, manifest, cfg, None, aux)
     }
 
     /// Load from any `std::io::Read`. Streams the full GGUF into an
@@ -306,7 +463,7 @@ impl CeraEngine {
         let gguf = GgufFile::from_reader(reader)
             .map_err(|e| CeraError::Backend(format!("reading GGUF stream: {e}")))?;
         let manifest = Manifest::synthetic_text(Path::new("<reader>"));
-        Self::from_gguf(gguf, manifest, cfg, None)
+        Self::from_gguf(gguf, manifest, cfg, None, AuxWeights::default())
     }
 
     /// Load from explicit file paths — skips manifest JSON parsing.
@@ -384,11 +541,20 @@ impl CeraEngine {
     ///   reopen the file by path for their own mmap, so they need the
     ///   original filesystem path even though we also hand them the
     ///   already-parsed `GgufFile`.
+    ///
+    /// `aux` carries encoder weights the caller has already parsed. It is how
+    /// the hermetic constructors reach a modality at all: the eager mmproj
+    /// load below is gated on `path.is_some()` so a `from_bytes` call cannot
+    /// surreptitiously open a filesystem path the manifest happens to name,
+    /// and that gate would otherwise make a no-filesystem VL load impossible
+    /// rather than merely unsupported. Path-based callers pass
+    /// `AuxWeights::default()` and keep the existing eager-load behavior.
     fn from_gguf(
         gguf: GgufFile,
         manifest: Manifest,
         cfg: EngineConfig,
         path: Option<&Path>,
+        aux: AuxWeights,
     ) -> Result<Self, CeraError> {
         // Give rayon's global pool a deterministic width and CPU mask before
         // anything can build it lazily. Only `cera-cli` calls
@@ -428,16 +594,25 @@ impl CeraEngine {
         // that would violate the no-filesystem contract. Failure
         // here is non-fatal: warn and leave the encoder unset so
         // text generation still works on a partly-broken bundle.
-        let audio_encoder = if path.is_some() {
-            try_load_audio_encoder(&manifest)
-        } else {
-            None
-        };
-        let vision_encoder_gguf = if path.is_some() {
-            try_load_vision_encoder_gguf(&manifest)
-        } else {
-            None
-        };
+        //
+        // A caller-supplied `aux` wins outright rather than merging: it is
+        // the only route a hermetic caller has, and when both could apply
+        // (`from_files` with pre-parsed weights) the explicit argument is the
+        // more specific instruction.
+        let audio_encoder = aux.audio_encoder.or_else(|| {
+            if path.is_some() {
+                try_load_audio_encoder(&manifest)
+            } else {
+                None
+            }
+        });
+        let vision_encoder_gguf = aux.vision_mmproj.or_else(|| {
+            if path.is_some() {
+                try_load_vision_encoder_gguf(&manifest)
+            } else {
+                None
+            }
+        });
         // Typed weights only when the raw mmproj loaded — we don't
         // re-attempt the open here. Failure to parse leaves the
         // typed slot unset (warned in `try_parse_vision_encoder`)
@@ -494,7 +669,7 @@ impl CeraEngine {
         check_inference_type_supported(&manifest.inference_type)?;
         let gguf = GgufFile::open(primary)
             .map_err(|e| CeraError::Backend(format!("opening `{}`: {e}", primary.display())))?;
-        Self::from_gguf(gguf, manifest, cfg, Some(primary))
+        Self::from_gguf(gguf, manifest, cfg, Some(primary), AuxWeights::default())
     }
 
     /// Convergence point for `from_path(.gguf)`. Re-resolves the primary
@@ -1086,15 +1261,47 @@ fn try_load_audio_encoder(manifest: &Manifest) -> Option<Arc<AudioEncoderWeights
             return None;
         }
     };
-    match AudioEncoderWeights::from_gguf(&gguf) {
+    try_parse_audio_encoder(&gguf, Some(&path.display().to_string()))
+}
+
+/// Parse an already-opened mmproj GGUF into typed `AudioEncoderWeights`.
+/// Split out of [`try_load_audio_encoder`] so the in-memory constructors,
+/// which have the GGUF but no path, share the same warn-and-continue policy.
+fn try_parse_audio_encoder(
+    gguf: &Arc<GgufFile>,
+    path: Option<&str>,
+) -> Option<Arc<AudioEncoderWeights>> {
+    match AudioEncoderWeights::from_gguf(gguf) {
         Ok(w) => Some(Arc::new(w)),
         Err(e) => {
             tracing::warn!(
                 target: "cera::engine",
-                path = %path.display(),
+                path = %path.unwrap_or("<in-memory>"),
                 error = %format!("{e:#}"),
                 "audio mmproj GGUF parsed but encoder weights failed to load; \
                  audio input will surface as 'no audio encoder attached'"
+            );
+            None
+        }
+    }
+}
+
+/// Parse aux GGUF bytes, warning rather than failing the whole load.
+///
+/// Matches the path-based loaders' policy: a bundle whose mmproj is corrupt
+/// still serves text, and the modality surfaces its own "no encoder attached"
+/// error when someone actually reaches for it.
+fn parse_aux_gguf(bytes: &Arc<[u8]>, kind: &str) -> Option<Arc<GgufFile>> {
+    match GgufFile::from_bytes(Arc::clone(bytes)) {
+        Ok(g) => Some(Arc::new(g)),
+        Err(e) => {
+            tracing::warn!(
+                target: "cera::engine",
+                kind = %kind,
+                error = %format!("{e:#}"),
+                "in-memory mmproj GGUF failed to parse; that modality will \
+                 surface as 'no encoder attached'. Text-only chat against \
+                 this bundle still works."
             );
             None
         }
@@ -1204,15 +1411,47 @@ fn auto_detect_inference_type(model_path: &Path) -> Result<InferenceType, CeraEr
             model_path.display()
         ))
     })?;
-    let arch = gguf.get_str("general.architecture").unwrap_or("");
-    Ok(match arch {
+    Ok(inference_type_for_arch(
+        gguf.get_str("general.architecture").unwrap_or(""),
+    ))
+}
+
+/// Decide a [`ModelBytes`] bundle's inference type. See
+/// [`CeraEngine::from_parts`] for the reasoning, in particular why an mmproj
+/// upgrades a text detection to VL. Pure, so the policy is testable without a
+/// GGUF on hand.
+///
+/// `mmproj_parsed` means the sidecar was supplied *and* parsed. Passing "was
+/// supplied" instead would let a corrupt buffer talk the engine into
+/// advertising a modality it cannot serve.
+fn resolve_parts_inference_type(
+    explicit: Option<InferenceType>,
+    arch: &str,
+    mmproj_parsed: bool,
+) -> InferenceType {
+    if let Some(it) = explicit {
+        return it;
+    }
+    let detected = inference_type_for_arch(arch);
+    match (&detected, mmproj_parsed) {
+        (InferenceType::LlamaCppTextToText, true) => InferenceType::LlamaCppImageToText,
+        _ => detected,
+    }
+}
+
+/// The arch → `InferenceType` mapping, split out of
+/// [`auto_detect_inference_type`] so the in-memory constructors can reuse it.
+/// They already hold a parsed [`GgufFile`] and must not touch the filesystem,
+/// which is the only thing the mmap-gated wrapper adds.
+fn inference_type_for_arch(arch: &str) -> InferenceType {
+    match arch {
         "lfm2" | "llama" | "qwen2" | "qwen3" => InferenceType::LlamaCppTextToText,
         "lfm2vl" => InferenceType::LlamaCppImageToText,
         "lfm2-audio" => InferenceType::LlamaCppLfm2AudioV1,
         // Unknown arch → assume text. Callers who need a different
         // mapping can set `ModelFiles::inference_type` explicitly.
         _ => InferenceType::LlamaCppTextToText,
-    })
+    }
 }
 
 /// Dispatch the text-model loader on [`BackendPreference`]. Single source
@@ -1687,5 +1926,109 @@ mod tests {
         assert_eq!(f.model, PathBuf::from("/x/y.gguf"));
         assert!(f.multimodal_projector.is_none());
         assert_eq!(f.inference_type, Some(InferenceType::LlamaCppTextToText));
+    }
+
+    #[test]
+    fn model_bytes_text_helper_is_text_only() {
+        let b = ModelBytes::text(vec![0u8; 4]);
+        assert!(b.multimodal_projector.is_none());
+        assert_eq!(b.inference_type, Some(InferenceType::LlamaCppTextToText));
+    }
+
+    /// The load-bearing case. Every published LFM2-VL bundle reports
+    /// `architecture = "lfm2"`, indistinguishable from a text model, so
+    /// trusting auto-detect alone would make the mmproj argument silently
+    /// inert and `append_image` fail with "no vision encoder attached" on a
+    /// correctly-supplied bundle.
+    #[test]
+    fn mmproj_upgrades_a_text_arch_to_vl() {
+        assert_eq!(
+            resolve_parts_inference_type(None, "lfm2", true),
+            InferenceType::LlamaCppImageToText
+        );
+    }
+
+    /// `false` here means "no usable mmproj", covering both the absent case
+    /// and the supplied-but-unparseable one. The latter is the important
+    /// one: upgrading on a corrupt sidecar would leave `capabilities()`
+    /// advertising an `image_in` that `append_image` immediately refuses.
+    #[test]
+    fn no_usable_mmproj_leaves_a_text_arch_as_text() {
+        assert_eq!(
+            resolve_parts_inference_type(None, "lfm2", false),
+            InferenceType::LlamaCppTextToText
+        );
+    }
+
+    /// The upgrade is text-only. An audio arch already identifies itself, so
+    /// an mmproj must not push it onto the vision path.
+    #[test]
+    fn mmproj_does_not_retype_an_audio_arch() {
+        assert_eq!(
+            resolve_parts_inference_type(None, "lfm2-audio", true),
+            InferenceType::LlamaCppLfm2AudioV1
+        );
+    }
+
+    /// An explicit type is honored as given, which is how a caller opts out
+    /// of the upgrade and asks for text plus an ignored sidecar.
+    #[test]
+    fn explicit_inference_type_overrides_the_mmproj_upgrade() {
+        assert_eq!(
+            resolve_parts_inference_type(Some(InferenceType::LlamaCppTextToText), "lfm2", true),
+            InferenceType::LlamaCppTextToText
+        );
+    }
+
+    /// An unknown arch *is* upgraded by a usable mmproj, same as a known
+    /// text one. The arch is not what makes a bundle multimodal; a real
+    /// vision encoder sitting next to it is.
+    #[test]
+    fn unknown_arch_is_upgraded_by_a_usable_mmproj() {
+        // `inference_type_for_arch` maps unrecognised arches to text, so
+        // without this upgrade a VL bundle on an arch cera does not know
+        // by name would load text-only and drop its vision tower in
+        // silence. Pinned because it is the whole reason the upgrade keys
+        // off the sidecar rather than off the arch string.
+        assert_eq!(
+            resolve_parts_inference_type(None, "totally-made-up", true),
+            InferenceType::LlamaCppImageToText
+        );
+    }
+
+    #[test]
+    fn synthetic_manifest_records_the_mmproj_and_type() {
+        let m = Manifest::synthetic(
+            Path::new("<bytes>"),
+            InferenceType::LlamaCppImageToText,
+            Some("<mmproj-bytes>".to_string()),
+        );
+        assert_eq!(m.inference_type, InferenceType::LlamaCppImageToText);
+        assert_eq!(
+            m.files.multimodal_projector.as_deref(),
+            Some("<mmproj-bytes>")
+        );
+        assert_eq!(
+            m.raw["inference_type"].as_str(),
+            Some("llama.cpp/image-to-text")
+        );
+    }
+
+    /// `synthetic_text` must keep producing exactly what it did before it was
+    /// re-expressed on top of `synthetic`.
+    #[test]
+    fn synthetic_text_is_unchanged_by_the_generalization() {
+        let m = Manifest::synthetic_text(Path::new("/m/model.gguf"));
+        assert_eq!(m.inference_type, InferenceType::LlamaCppTextToText);
+        assert!(m.files.multimodal_projector.is_none());
+        assert_eq!(m.files.model, "/m/model.gguf");
+        assert_eq!(
+            m.raw["inference_type"].as_str(),
+            Some("llama.cpp/text-to-text")
+        );
+        assert_eq!(
+            m.raw["load_time_parameters"]["model"].as_str(),
+            Some("/m/model.gguf")
+        );
     }
 }

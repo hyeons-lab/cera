@@ -16,6 +16,10 @@
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
+/// Remote bundle downloading + caching, over the Origin Private File
+/// System. The web counterpart to `cera::bundle::BundleRepo`.
+pub mod bundle;
+
 // Pull `wasm-bindgen-rayon` into the link graph so its
 // `#[wasm_bindgen]`-emitted `initThreadPool` export survives
 // dead-code elimination and reaches the generated `cera_wasm.d.ts`.
@@ -91,12 +95,11 @@ const TS_CAPABILITIES: &'static str = r#"
  * bindings (cera-ffi) so cross-platform consumers can probe the
  * same fields regardless of which binding they're driving.
  *
- * Note: under cera-wasm's current loader (`fromGgufBytes`), the
- * model's `inference_type` is synthesized as text-only — these
- * flags will report `textIn: true, textOut: true` and `false`
- * for everything else even for genuinely audio- or
- * image-capable models. A model-aware loader (planned) will
- * make these flags reflect the real capability surface.
+ * These describe the bundle that was actually loaded. A model
+ * opened with `fromGgufBytes` is text-only by construction, since
+ * one GGUF cannot carry a vision tower or an audio encoder: load
+ * the multimodal projector alongside it via `fromGgufParts` for
+ * `imageIn` / `audioIn` to be true.
  */
 export interface Capabilities {
     readonly textIn: boolean;
@@ -104,6 +107,32 @@ export interface Capabilities {
     readonly imageIn: boolean;
     readonly audioIn: boolean;
     readonly audioOut: boolean;
+}
+"#;
+
+/// TS declaration for the `ModelMetadata` record. See `TS_CAPABILITIES`
+/// for why these interfaces are hand-declared rather than derived.
+#[wasm_bindgen(typescript_custom_section)]
+const TS_MODEL_METADATA: &'static str = r#"
+/**
+ * Summary of a loaded model, returned by `CeraEngine.metadata`.
+ * Mirrors the `ModelMetadata` record the JVM/Apple bindings
+ * (cera-ffi) expose, so cross-platform consumers read the same
+ * field names from either binding.
+ *
+ * Every field is also available as an individual getter on
+ * `CeraEngine`. This is the one-call form: each getter is a
+ * separate wasm boundary crossing, so prefer this when you want
+ * several of them at once (rendering a model-info panel, say).
+ */
+export interface ModelMetadata {
+    readonly architecture: string;
+    readonly maxSeqLen: number;
+    readonly vocabSize: number;
+    readonly hasChatTemplate: boolean;
+    readonly quantization: string;
+    readonly addBosToken: boolean;
+    readonly addEosToken: boolean;
 }
 "#;
 
@@ -116,6 +145,41 @@ extern "C" {
     /// destructuring (`const { audioIn } = engine.capabilities`).
     #[wasm_bindgen(typescript_type = "Capabilities")]
     pub type Capabilities;
+
+    /// Opaque type-label wrapper for the `ModelMetadata` interface above,
+    /// same arrangement as `Capabilities`.
+    #[wasm_bindgen(typescript_type = "ModelMetadata")]
+    pub type ModelMetadata;
+}
+
+/// Build a JS-side `ModelMetadata` object from cera core's own struct.
+fn metadata_to_js(md: &cera::ModelMetadata) -> ModelMetadata {
+    let obj = js_sys::Object::new();
+    // As in `capabilities_to_js`: `Reflect::set` cannot fail against a
+    // freshly-made object, so the `Result` is discarded per field.
+    let set = |key: &str, value: JsValue| {
+        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), &value);
+    };
+    set("architecture", JsValue::from_str(&md.architecture));
+    set("maxSeqLen", JsValue::from_f64(md.max_seq_len as f64));
+    set("vocabSize", JsValue::from_f64(md.vocab_size as f64));
+    set("hasChatTemplate", JsValue::from_bool(md.has_chat_template));
+    set("quantization", JsValue::from_str(&md.quantization));
+    set("addBosToken", JsValue::from_bool(md.add_bos_token));
+    set("addEosToken", JsValue::from_bool(md.add_eos_token));
+    JsValue::from(obj).unchecked_into()
+}
+
+/// Describe the CPU backend tier this build resolved at runtime, e.g.
+/// `"tier=wasm_simd128 [simd128]"`.
+///
+/// Diagnostic: it tells you whether the SIMD kernels are actually live,
+/// which is the difference between roughly 1.4 and 0.64 tokens/second on the
+/// wasm CPU path. A browser without the simd128 proposal, or a `.wasm` built
+/// without `+simd128`, reports the scalar tier.
+#[wasm_bindgen(js_name = cpuBackendReport)]
+pub fn cpu_backend_report() -> String {
+    cera::cpu_features().report()
 }
 
 /// Build a JS-side `Capabilities` object from a cera core
@@ -297,6 +361,126 @@ impl CeraEngine {
             .map_err(map_cera_err)
     }
 
+    /// Load a multi-file bundle: the model GGUF plus its multimodal
+    /// projector ("mmproj"). This is the constructor a VL or audio model
+    /// needs, and `fromGgufBytes` structurally cannot be: the vision tower
+    /// and the audio encoder live in a *second* GGUF, and that one takes a
+    /// single buffer.
+    ///
+    /// `mmproj` may be `null`, in which case this is exactly
+    /// `fromGgufBytes` with an explicit context size.
+    ///
+    /// **Modality is inferred from the arguments, not just the header.**
+    /// Every published LFM2-VL model reports `architecture = "lfm2"`, the
+    /// same string a text model reports, because the vision half is entirely
+    /// in the mmproj. So passing an `mmproj` alongside a text-arch model is
+    /// taken as the statement of intent it is and loads as image-to-text;
+    /// audio models already identify themselves and are unaffected. Pass
+    /// `inferenceType` explicitly to override (`"llama.cpp/text-to-text"`,
+    /// `"llama.cpp/image-to-text"`, `"llama.cpp/lfm2-audio-v1"`).
+    ///
+    /// A malformed or mismatched mmproj is **not** fatal: it warns and the
+    /// bundle still serves text, with `capabilities.imageIn` staying false
+    /// and `appendImage` throwing "no vision encoder attached". That mirrors
+    /// the native loaders rather than failing a whole page load over a
+    /// sidecar.
+    ///
+    /// **Memory:** both buffers stay resident in wasm linear memory for the
+    /// engine's lifetime. A VL bundle is the model *plus* the tower.
+    #[wasm_bindgen(js_name = fromGgufParts)]
+    pub fn from_gguf_parts(
+        bytes: Vec<u8>,
+        mmproj: Option<Vec<u8>>,
+        context_size: Option<u32>,
+        inference_type: Option<String>,
+    ) -> Result<CeraEngine, JsError> {
+        // See `from_gguf_bytes` for why the spread is deliberate.
+        #[allow(clippy::needless_update)]
+        let cfg = cera::EngineConfig {
+            context_size: context_size.unwrap_or(4096) as usize,
+            backend: cera::BackendPreference::Cpu,
+            ..cera::EngineConfig::default()
+        };
+        let parts = cera::ModelBytes {
+            model: bytes.into(),
+            multimodal_projector: mmproj.map(Into::into),
+            // `parse_str` maps anything unrecognized to `Unknown(s)`, which
+            // `from_parts` rejects by name, better than silently falling
+            // back to text when a caller fat-fingers the string.
+            inference_type: inference_type
+                .as_deref()
+                .map(cera::manifest::InferenceType::parse_str),
+            chat_template: None,
+        };
+        cera::CeraEngine::from_parts(parts, cfg)
+            .map(|inner| CeraEngine { inner })
+            .map_err(map_cera_err)
+    }
+
+    /// Load a published LeapBundle by id and quantization, downloading
+    /// through `repo` and reusing whatever it already cached.
+    ///
+    /// This is the browser equivalent of the native
+    /// `CeraEngine::from_bundle_id`. The manifest picks up every file
+    /// the bundle names, so a VL or audio bundle arrives complete: no
+    /// separate mmproj argument and no guessing at the modality, unlike
+    /// `fromGgufParts` which has only its arguments to go on.
+    ///
+    /// `onProgress(url, bytesDownloaded, totalBytes)` fires during
+    /// downloads only; a fully cached bundle loads without calling it.
+    /// `totalBytes` is `null` when the server doesn't say.
+    ///
+    /// **Memory:** every file lands in wasm linear memory and stays for
+    /// the engine's lifetime. The bytes are never handed to JS on the
+    /// way, so this costs one copy of the model rather than two.
+    #[wasm_bindgen(js_name = fromBundleId)]
+    pub async fn from_bundle_id(
+        repo: &bundle::BundleRepo,
+        bundle_id: String,
+        quant: String,
+        context_size: Option<u32>,
+        on_progress: Option<js_sys::Function>,
+    ) -> Result<CeraEngine, JsError> {
+        let parts = bundle::load_bundle(repo, &bundle_id, &quant, on_progress.as_ref()).await?;
+        Self::from_bundle_parts(parts, context_size)
+    }
+
+    /// Load a bundle from the URL of its manifest JSON, for bundles
+    /// hosted somewhere other than `LiquidAI/LeapBundles`.
+    ///
+    /// Files the manifest names are fetched relative to it. Entries
+    /// with a nested path are refused rather than guessed at: see
+    /// `bundle::join_url`.
+    #[wasm_bindgen(js_name = fromManifestUrl)]
+    pub async fn from_manifest_url(
+        repo: &bundle::BundleRepo,
+        manifest_url: String,
+        context_size: Option<u32>,
+        on_progress: Option<js_sys::Function>,
+    ) -> Result<CeraEngine, JsError> {
+        let parts = bundle::load_manifest(repo, &manifest_url, on_progress.as_ref()).await?;
+        Self::from_bundle_parts(parts, context_size)
+    }
+
+    /// Shared tail of the two bundle constructors. Not exported: it
+    /// takes a Rust type, and the point of `ModelBytes` here is that the
+    /// weights never cross the JS boundary.
+    fn from_bundle_parts(
+        parts: cera::ModelBytes,
+        context_size: Option<u32>,
+    ) -> Result<CeraEngine, JsError> {
+        // See `from_gguf_bytes` for why the spread is deliberate.
+        #[allow(clippy::needless_update)]
+        let cfg = cera::EngineConfig {
+            context_size: context_size.unwrap_or(4096) as usize,
+            backend: cera::BackendPreference::Cpu,
+            ..cera::EngineConfig::default()
+        };
+        cera::CeraEngine::from_parts(parts, cfg)
+            .map(|inner| CeraEngine { inner })
+            .map_err(map_cera_err)
+    }
+
     /// Model architecture string from the GGUF metadata
     /// (e.g. `"lfm2"`, `"llama"`).
     #[wasm_bindgen(getter)]
@@ -355,16 +539,15 @@ impl CeraEngine {
     /// See the `Capabilities` interface in the generated `.d.ts`
     /// for the field shape.
     ///
-    /// **Caveat:** today cera-wasm only loads models via
-    /// `CeraEngine.fromGgufBytes`, which routes through cera's
-    /// synthetic-text manifest path. As a result this getter
-    /// always returns `{ textIn: true, textOut: true, imageIn:
-    /// false, audioIn: false, audioOut: false }` — even for
-    /// genuinely audio- or image-capable models. The shape is
-    /// exposed now so JS code stabilizes against the same surface
-    /// the JVM/Apple bindings (cera-ffi) report; a model-aware
-    /// loader (planned) will make these flags reflect the real
-    /// capability surface without a binding break.
+    /// These reflect the bundle you actually loaded. A model opened with
+    /// `fromGgufBytes` is text-only by construction and reports
+    /// `{ textIn: true, textOut: true }` with everything else false, because
+    /// a single GGUF cannot carry a vision tower or an audio encoder. To get
+    /// `imageIn` or `audioIn`, load the mmproj too via `fromGgufParts`.
+    ///
+    /// A bundle whose mmproj failed to parse reports the flag as false and
+    /// logs a warning, so this stays an accurate answer about what the
+    /// engine can do rather than what the caller intended.
     #[wasm_bindgen(getter)]
     pub fn capabilities(&self) -> Capabilities {
         capabilities_to_js(self.inner.capabilities())
@@ -389,6 +572,56 @@ impl CeraEngine {
     #[wasm_bindgen(getter, js_name = contextSize)]
     pub fn context_size(&self) -> u32 {
         self.inner.config().context_size as u32
+    }
+
+    /// Everything `CeraEngine`'s individual metadata getters report, in one
+    /// object. See the `ModelMetadata` interface in the generated `.d.ts`.
+    #[wasm_bindgen(getter)]
+    pub fn metadata(&self) -> ModelMetadata {
+        metadata_to_js(self.inner.metadata())
+    }
+
+    /// Transcribe mono `f32` PCM audio (roughly normalized to `[-1.0, 1.0]`)
+    /// to text, using the model's own audio encoder and chat template.
+    ///
+    /// `sampleRate` is the rate of the samples you pass; cera resamples to
+    /// whatever the encoder wants. A typical browser source is
+    /// `AudioBuffer.getChannelData(0)` after decoding through
+    /// `AudioContext.decodeAudioData`, whose `sampleRate` you read off the
+    /// same `AudioBuffer`.
+    ///
+    /// Requires an audio bundle loaded through `fromGgufParts` with its
+    /// mmproj; otherwise this throws `"modality not supported by this
+    /// model"`. This runs a full prefill + decode, so it is *slow* on the
+    /// wasm CPU backend for anything but short clips.
+    #[wasm_bindgen]
+    pub fn transcribe(&self, pcm: &[f32], sample_rate: u32) -> Result<String, JsError> {
+        self.inner
+            .transcribe(pcm, sample_rate)
+            .map_err(map_cera_err)
+    }
+
+    /// The tool-call format auto-detected from this model's architecture, or
+    /// `undefined` when the architecture has no known tool convention.
+    ///
+    /// Engine-level counterpart to the free `detectToolFormat(architecture)`
+    /// function: this one already knows the loaded model's architecture, so
+    /// it cannot disagree with it.
+    #[wasm_bindgen(js_name = toolFormat)]
+    pub fn tool_format(&self) -> Option<ToolFormat> {
+        cera::tools::ToolFormat::detect(&self.inner.model().config().architecture).map(Into::into)
+    }
+
+    /// The token id of `format`'s tool-call start marker (e.g.
+    /// `<|tool_call_start|>`) in this model's vocab, for use as a lazy
+    /// grammar trigger in `GenerateOpts.grammarTriggerTokens`.
+    /// `undefined` when this tokenizer lacks that special token.
+    #[wasm_bindgen(js_name = toolCallStartToken)]
+    pub fn tool_call_start_token(&self, format: ToolFormat) -> Option<u32> {
+        let fmt: cera::tools::ToolFormat = format.into();
+        self.inner
+            .tokenizer()
+            .special_token_id(fmt.call_start_marker())
     }
 
     /// Returns a `Tokenizer` handle bound to this engine's vocab.
@@ -639,15 +872,24 @@ impl From<ToolFormat> for cera::tools::ToolFormat {
     }
 }
 
+impl From<cera::tools::ToolFormat> for ToolFormat {
+    fn from(f: cera::tools::ToolFormat) -> Self {
+        match f {
+            cera::tools::ToolFormat::Lfm2Pythonic => ToolFormat::Lfm2Pythonic,
+            cera::tools::ToolFormat::Hermes => ToolFormat::Hermes,
+        }
+    }
+}
+
 /// Detect the tool-call format for a model architecture string (`"lfm2"`,
 /// `"qwen3"`, …). Returns `undefined` for architectures with no known
 /// convention.
+///
+/// Prefer `CeraEngine.toolFormat` when you have an engine: it reads the
+/// loaded model's own architecture, so it cannot be given the wrong string.
 #[wasm_bindgen(js_name = detectToolFormat)]
 pub fn detect_tool_format(architecture: &str) -> Option<ToolFormat> {
-    cera::tools::ToolFormat::detect(architecture).map(|f| match f {
-        cera::tools::ToolFormat::Lfm2Pythonic => ToolFormat::Lfm2Pythonic,
-        cera::tools::ToolFormat::Hermes => ToolFormat::Hermes,
-    })
+    cera::tools::ToolFormat::detect(architecture).map(Into::into)
 }
 
 /// Parse tool calls out of generated model text. Returns a JSON string
@@ -1393,13 +1635,12 @@ impl Session {
     /// - `"empty input"` if `samples.length === 0` — fast-fail at
     ///   the wasm boundary, parity with `appendText` /
     ///   `appendTokens` empty-input rejection.
-    /// - `"modality not supported by this model"` for text-only
-    ///   models (`session.capabilities.audioIn === false` —
-    ///   currently always `false` under the synthetic-text
-    ///   loader; see `CeraEngine.capabilities` doc).
-    /// - `"backend: Session::append_audio is not yet implemented for audio-capable models — ..."`
-    ///   for audio-capable models — placeholder string until the
-    ///   real implementation lands.
+    /// - `"modality not supported by this model"` when
+    ///   `session.capabilities.audioIn === false`. Load the bundle's
+    ///   mmproj through `CeraEngine.fromGgufParts` to get an
+    ///   audio-capable session; `fromGgufBytes` cannot produce one.
+    /// - `"backend: Session::append_audio: no audio encoder attached..."`
+    ///   when the bundle claimed audio but its mmproj failed to parse.
     #[wasm_bindgen(js_name = appendAudio)]
     pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), JsError> {
         if samples.is_empty() {
@@ -1408,6 +1649,53 @@ impl Session {
         self.inner
             .append_audio(samples, sample_rate)
             .map_err(map_cera_err)
+    }
+
+    /// Encode an image and append its embeddings to the KV cache.
+    ///
+    /// `bytes` is an encoded image file (PNG or JPEG), not raw pixels: pass
+    /// a `Uint8Array` over a `fetch` response, a `File`/`Blob`
+    /// `arrayBuffer()`, or a canvas `toBlob` result.
+    ///
+    /// `maxLongSize` caps the longest side of the **encoded** image in
+    /// pixels, trading detail for speed and token count:
+    ///
+    /// - `null`/omitted: use the session default
+    ///   (`setImageMaxLongSize`, itself unset by default).
+    /// - `0`: force *no* cap for this call, overriding a session default.
+    /// - `n`: cap at `n` pixels.
+    ///
+    /// Requires a VL bundle (`capabilities.imageIn === true`), which means
+    /// loading via `CeraEngine.fromGgufParts` with the vision mmproj.
+    /// Otherwise this throws `"modality not supported by this model"`.
+    /// Building `cera-wasm` with `--no-default-features` (dropping the `vl`
+    /// feature) produces the same error, since the image decoders are gone.
+    #[wasm_bindgen(js_name = appendImage)]
+    pub fn append_image(
+        &mut self,
+        bytes: &[u8],
+        max_long_size: Option<u32>,
+    ) -> Result<(), JsError> {
+        // Mirrors cera-ffi's mapping so the two bindings agree on what a
+        // `0` means. Delegating to `append_image` for `None` (rather than
+        // always calling the `_with_opts` form) is what keeps the session
+        // default reachable.
+        match max_long_size {
+            None => self.inner.append_image(bytes),
+            Some(0) => self.inner.append_image_with_opts(bytes, None),
+            Some(n) => self.inner.append_image_with_opts(bytes, Some(n)),
+        }
+        .map_err(map_cera_err)
+    }
+
+    /// Set the session-default cap on the longest side of an appended
+    /// image, in pixels. `null` clears it (no cap).
+    ///
+    /// Applies to later `appendImage` calls that pass no explicit
+    /// `maxLongSize`. A per-call value always wins.
+    #[wasm_bindgen(js_name = setImageMaxLongSize)]
+    pub fn set_image_max_long_size(&mut self, max_long_size: Option<u32>) {
+        self.inner.set_image_max_long_size(max_long_size);
     }
 
     /// Current KV cache position (number of tokens currently held).
@@ -1586,7 +1874,7 @@ impl<'a> cera::ModalitySink for JsTextSink<'a> {
 // See devlog 000169.
 #[cfg(feature = "wgpu")]
 mod webgpu {
-    use super::{Tokenizer, map_err};
+    use super::{Capabilities, Tokenizer, capabilities_to_js, map_err};
     use cera::model::Model;
     use std::sync::Arc;
     use wasm_bindgen::prelude::*;
@@ -1610,6 +1898,17 @@ mod webgpu {
         tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
         state: cera::kv_cache::InferenceState,
         eos: Option<u32>,
+        /// CPU vision-encoder weights, parsed from the mmproj passed to
+        /// `createWithParts`. `None` for a text-only session. Kept even when
+        /// `gpu_vision_encoder` is present: it is the documented fallback for
+        /// an oversized patch grid or a GPU encode failure.
+        vision_encoder: Option<Arc<cera::model::vision_encoder::VisionEncoderWeights>>,
+        /// The same tower uploaded to the GPU, built once at construction so
+        /// it stays off the per-image path. `None` when the upload failed, in
+        /// which case encoding falls back to `vision_encoder`.
+        gpu_vision_encoder: Option<Arc<dyn cera::model::vision_encoder_gpu::VisionGpuEncode>>,
+        /// Session-default cap on an appended image's longest side.
+        image_max_long_size: Option<u32>,
     }
 
     #[wasm_bindgen]
@@ -1737,7 +2036,58 @@ mod webgpu {
                 tokenizer,
                 state,
                 eos,
+                vision_encoder: None,
+                gpu_vision_encoder: None,
+                image_max_long_size: None,
             })
+        }
+
+        /// As `create`, but also attaches a vision tower from `mmproj`, giving
+        /// the GPU session `appendImage`.
+        ///
+        /// Separate from `create` rather than an extra argument on it so an
+        /// existing call keeps its meaning and its parameter order.
+        ///
+        /// The tower is uploaded to the GPU once here, not per image. If that
+        /// upload fails the session still works and encodes on the CPU, which
+        /// is slower but numerically equivalent; a malformed mmproj leaves
+        /// `imageIn` false and `appendImage` throwing, exactly as on the CPU
+        /// engine.
+        #[wasm_bindgen(js_name = createWithParts)]
+        pub async fn create_with_parts(
+            bytes: Vec<u8>,
+            mmproj: Vec<u8>,
+            context_size: Option<u32>,
+            kv_compression: Option<crate::TurboQuantConfig>,
+        ) -> Result<WebGpuSession, JsError> {
+            let mut session = Self::create(bytes, context_size, kv_compression).await?;
+
+            let proj_gguf = cera::gguf::GgufFile::from_bytes(Arc::from(mmproj)).map_err(map_err)?;
+            let weights =
+                cera::model::vision_encoder::VisionEncoderWeights::from_gguf(&Arc::new(proj_gguf))
+                    .map_err(map_err)?;
+
+            // Reject a tower trained against a different LLM here rather than
+            // at the first `appendImage`: the projection has to land in this
+            // model's hidden space, and a dimension mismatch is a mispaired
+            // bundle, not a runtime condition.
+            let llm_hidden = cera::model::Model::config(&session.model).hidden_size;
+            let proj_dim = weights.config.projection_dim;
+            if proj_dim != llm_hidden {
+                return Err(JsError::new(&format!(
+                    "vision encoder's projection_dim ({proj_dim}) does not match the \
+                     model's hidden_size ({llm_hidden}); the mmproj must pair with \
+                     the LLM it was trained against"
+                )));
+            }
+
+            let weights = Arc::new(weights);
+            session.gpu_vision_encoder = cera::model::vision_encoder_gpu::build_gpu_vision_encoder(
+                &weights,
+                cera::BackendPreference::Gpu,
+            );
+            session.vision_encoder = Some(weights);
+            Ok(session)
         }
 
         /// Number of tokens currently in the KV cache.
@@ -1750,6 +2100,151 @@ mod webgpu {
         #[wasm_bindgen(getter)]
         pub fn position(&self) -> u32 {
             self.state.seq_len as u32
+        }
+
+        /// Whether this session can accept images, i.e. whether it was built
+        /// by `createWithParts` with a usable mmproj.
+        #[wasm_bindgen(getter, js_name = imageIn)]
+        pub fn image_in(&self) -> bool {
+            self.vision_encoder.is_some()
+        }
+
+        /// Modality capability flags for this session, same shape as
+        /// `Session.capabilities` on the CPU path.
+        ///
+        /// Reports what *this session* can do, which is deliberately not the
+        /// engine's answer. The WebGPU path takes an image only when it was
+        /// built with a usable mmproj, and has no audio path at all, so
+        /// forwarding a VL-or-audio engine's capabilities here would promise
+        /// a modality the live session refuses.
+        #[wasm_bindgen(getter)]
+        pub fn capabilities(&self) -> Capabilities {
+            capabilities_to_js(cera::ModalityCapabilities {
+                image_in: self.image_in(),
+                // `text_only()` supplies text in/out and leaves audio off, so
+                // a new field added upstream lands here as `false` rather than
+                // as a silent `true`.
+                ..cera::ModalityCapabilities::text_only()
+            })
+        }
+
+        /// Set the session-default cap on an appended image's longest side in
+        /// pixels; `null` clears it. A per-call `maxLongSize` still wins.
+        #[wasm_bindgen(js_name = setImageMaxLongSize)]
+        pub fn set_image_max_long_size(&mut self, max_long_size: Option<u32>) {
+            self.image_max_long_size = max_long_size;
+        }
+
+        /// Encode an image (PNG or JPEG bytes) and append its embeddings to
+        /// the KV cache, so a following `generate` / `generateTokens` sees it.
+        ///
+        /// `maxLongSize` follows the CPU session: `null` uses the session
+        /// default, `0` forces no cap for this call, `n` caps at `n` pixels.
+        ///
+        /// Ordering is the caller's to manage, as with `generateTokens`:
+        /// append the image where the chat template puts its `<image>` marker,
+        /// which usually means framing the prompt in two halves around it.
+        ///
+        /// Throws when the session has no vision tower (`imageIn === false`),
+        /// or when the image would overflow the context. Unlike the CPU
+        /// session this cannot shift the KV cache to make room; that
+        /// limitation is pre-existing and applies to prompts too.
+        #[wasm_bindgen(js_name = appendImage)]
+        pub fn append_image(
+            &mut self,
+            bytes: &[u8],
+            max_long_size: Option<u32>,
+        ) -> Result<(), JsError> {
+            let Some(encoder) = self.vision_encoder.clone() else {
+                return Err(crate::map_cera_err(cera::CeraError::UnsupportedModality));
+            };
+            let cap = match max_long_size {
+                None => self.image_max_long_size,
+                Some(0) => None,
+                Some(n) => Some(n),
+            };
+
+            let pre = cera::model::vision_preprocessor::preprocess_image_with_opts(
+                bytes,
+                &encoder.config,
+                cap,
+            )
+            .map_err(crate::map_cera_err)?;
+
+            // Prefer the GPU tower, but only within the attention kernel's
+            // token capacity, and fall back rather than fail on a runtime GPU
+            // error: the CPU encoder is always attached and numerically
+            // equivalent. Same policy as `Session::append_image_with_opts`.
+            let grid_tokens = pre.grid_w.saturating_mul(pre.grid_h);
+            let gpu = self
+                .gpu_vision_encoder
+                .as_ref()
+                .filter(|_| grid_tokens <= cera::model::vision_encoder_gpu::MAX_VIT_TOKENS);
+            let img_tokens = match gpu {
+                Some(g) => match g.encode_image(&pre.pixels, pre.grid_w, pre.grid_h) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(
+                            "gpu vision encode failed ({e:#}); falling back to CPU encoder"
+                        );
+                        encoder
+                            .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
+                            .map_err(map_err)?
+                    }
+                },
+                None => encoder
+                    .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
+                    .map_err(map_err)?,
+            };
+
+            let hidden = cera::model::Model::config(&self.model).hidden_size;
+            if hidden == 0 || !img_tokens.len().is_multiple_of(hidden) {
+                return Err(JsError::new(&format!(
+                    "vision encoder returned {} f32s, not a multiple of hidden_size \
+                     ({hidden}), malformed image-token tensor",
+                    img_tokens.len()
+                )));
+            }
+            let n_tokens = img_tokens.len() / hidden;
+            if n_tokens == 0 {
+                return Err(crate::map_cera_err(cera::CeraError::EmptyInput));
+            }
+
+            // Check capacity before dispatching: this session has no
+            // context-shift path, so an overflow has to be refused up front
+            // rather than discovered halfway through the frames, which would
+            // leave the cache holding half an image.
+            let start = self.state.seq_len;
+            let max = cera::model::Model::config(&self.model).max_seq_len;
+            let end = start
+                .checked_add(n_tokens)
+                .ok_or_else(|| JsError::new("position overflow appending image embeddings"))?;
+            if end > max {
+                return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
+                    max_seq_len: max as u32,
+                    by: (end - max) as u32,
+                }));
+            }
+
+            // `seed_embeddings`, not `Model::forward_prefill_from_embeddings`:
+            // the trait method ends in a blocking `download_f32`, and blocking
+            // is exactly what this thread must not do. The readback completes
+            // from the JS event loop, which cannot run until this call returns,
+            // so waiting on it here hangs the worker outright. The logits it
+            // would fetch are discarded on this path anyway; appending an image
+            // wants the KV cache, nothing more.
+            self.model
+                .seed_embeddings(&img_tokens, n_tokens, start, &mut self.state);
+            // `seed_embeddings` advances `seq_len` itself, once per frame, so
+            // assigning `end` here would be a no-op on a good day and would
+            // paper over a miscount on a bad one. Assert the contract instead:
+            // a mismatch means the KV cache holds a different number of frames
+            // than the session thinks, and every later position is wrong.
+            debug_assert_eq!(
+                self.state.seq_len, end,
+                "seed_embeddings must advance seq_len by n_tokens"
+            );
+            Ok(())
         }
 
         /// The KV-cache mode this session actually resolved to:
@@ -1772,15 +2267,33 @@ mod webgpu {
             format!("{name} ({backend})")
         }
 
-        /// Tokenize `prompt`, run prefill, then greedily decode up to
-        /// `maxTokens` tokens. `onToken(text)` is invoked for each decoded
-        /// piece as it is produced; the full generated string is also
-        /// returned. Stops early on the model's EOS token.
+        /// Tokenize `prompt`, run prefill, then decode up to `maxTokens`
+        /// tokens. `onToken(text)` is invoked for each decoded piece as it is
+        /// produced; the full generated string is also returned. Stops early on
+        /// the model's EOS token.
+        ///
+        /// Sampling follows the same rule as every other backend: greedy when
+        /// `temperature <= 0` or `topK == 1`, stochastic otherwise. Omitted
+        /// knobs fall back to `SamplerConfig`'s defaults, and `seed` makes a
+        /// stochastic run reproducible. See `generateTokens` for what the
+        /// stochastic path costs.
+        // The four sampling knobs are passed flat rather than bundled, which
+        // puts this one over clippy's limit. The CPU `Session::generate` takes
+        // a `GenerateOpts`, but that type carries stop sequences, repetition
+        // penalties and a context policy this path does not implement, so
+        // accepting it here would advertise options the GPU decode loop
+        // silently ignores. A knob that is visibly absent beats one that is
+        // present and does nothing.
+        #[allow(clippy::too_many_arguments)]
         #[wasm_bindgen]
         pub async fn generate(
             &mut self,
             prompt: &str,
             max_tokens: u32,
+            temperature: Option<f32>,
+            top_p: Option<f32>,
+            top_k: Option<u32>,
+            seed: Option<u64>,
             on_token: &js_sys::Function,
         ) -> Result<String, JsError> {
             let mut ids = self.tokenizer.encode(prompt);
@@ -1799,7 +2312,8 @@ mod webgpu {
             {
                 ids.insert(0, bos);
             }
-            self.generate_ids(ids, max_tokens, on_token).await
+            self.generate_ids(ids, max_tokens, temperature, top_p, top_k, seed, on_token)
+                .await
         }
 
         /// The tokenizer this session's GGUF declares, for callers that need to
@@ -1842,7 +2356,7 @@ mod webgpu {
             }
         }
 
-        /// Prefill `tokens`, then greedily decode up to `maxTokens`, exactly as
+        /// Prefill `tokens`, then decode up to `maxTokens`, exactly as
         /// `generate` does, but taking token ids the caller has already framed.
         ///
         /// **No BOS is prepended.** That is the whole point of this entry point:
@@ -1852,23 +2366,51 @@ mod webgpu {
         ///
         /// Like `generate`, this appends to the session's live KV cache rather
         /// than resetting it, so consecutive calls continue one conversation.
+        ///
+        /// **Sampling is not free here, unlike on the CPU.** Greedy decoding
+        /// takes the argmax on the GPU and reads back four bytes; sampling has
+        /// to read the whole logits row back so the sampler can see it, which
+        /// is a vocab-sized transfer per token. The greedy path is kept for
+        /// exactly that reason, so a caller that does not ask for sampling
+        /// pays nothing for its availability.
+        // Flat sampling knobs; see the note on `generate`.
+        #[allow(clippy::too_many_arguments)]
         #[wasm_bindgen(js_name = generateTokens)]
         pub async fn generate_tokens(
             &mut self,
             tokens: Vec<u32>,
             max_tokens: u32,
+            temperature: Option<f32>,
+            top_p: Option<f32>,
+            top_k: Option<u32>,
+            seed: Option<u64>,
             on_token: &js_sys::Function,
         ) -> Result<String, JsError> {
-            self.generate_ids(tokens, max_tokens, on_token).await
+            self.generate_ids(
+                tokens,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                seed,
+                on_token,
+            )
+            .await
         }
 
-        /// Shared body of `generate` / `generateTokens`: prefill, greedy decode,
+        /// Shared body of `generate` / `generateTokens`: prefill, decode,
         /// UTF-8-safe streaming. Not exported; the two public entry points
         /// differ only in how `ids` is produced.
+        // Flat sampling knobs; see the note on `generate`.
+        #[allow(clippy::too_many_arguments)]
         async fn generate_ids(
             &mut self,
             ids: Vec<u32>,
             max_tokens: u32,
+            temperature: Option<f32>,
+            top_p: Option<f32>,
+            top_k: Option<u32>,
+            seed: Option<u64>,
             on_token: &js_sys::Function,
         ) -> Result<String, JsError> {
             if ids.is_empty() {
@@ -1903,11 +2445,41 @@ mod webgpu {
                 self.model.forward_prefill_step(tok, pos, &mut self.state);
                 pos += 1;
             }
-            let mut next = self
-                .model
-                .forward_greedy_async(*last, pos, &mut self.state)
-                .await
-                .map_err(map_err)?;
+
+            // Greedy stays on the GPU-argmax path, which reads back four bytes
+            // per token; sampling needs the whole logits row on the host, which
+            // is a vocab-sized readback per token. Deciding once, here, keeps a
+            // caller that did not ask for sampling on the cheap path.
+            //
+            // The rule matches `SamplerConfig`'s own definition of greedy, so
+            // this backend agrees with the CPU on what `temperature: 0` means
+            // rather than inventing a second threshold.
+            let defaults = cera::sampler::SamplerConfig::default();
+            let cfg = cera::sampler::SamplerConfig {
+                temperature: temperature.unwrap_or(defaults.temperature),
+                top_p: top_p.unwrap_or(defaults.top_p),
+                top_k: top_k.map(|k| k as usize).unwrap_or(defaults.top_k),
+                seed,
+                ..defaults
+            };
+            let mut sampler =
+                (cfg.temperature > 0.0 && cfg.top_k != 1).then(|| cera::sampler::Sampler::new(cfg));
+
+            let mut next = match sampler.as_mut() {
+                Some(s) => {
+                    let mut logits = self
+                        .model
+                        .forward_logits_async(*last, pos, &mut self.state)
+                        .await
+                        .map_err(map_err)?;
+                    s.sample(&mut logits)
+                }
+                None => self
+                    .model
+                    .forward_greedy_async(*last, pos, &mut self.state)
+                    .await
+                    .map_err(map_err)?,
+            };
             pos += 1;
 
             // Greedy decode loop. Stream raw bytes through a buffer and emit
@@ -1938,11 +2510,21 @@ mod webgpu {
                 if pos >= max_seq_len {
                     break;
                 }
-                next = self
-                    .model
-                    .forward_greedy_async(next, pos, &mut self.state)
-                    .await
-                    .map_err(map_err)?;
+                next = match sampler.as_mut() {
+                    Some(s) => {
+                        let mut logits = self
+                            .model
+                            .forward_logits_async(next, pos, &mut self.state)
+                            .await
+                            .map_err(map_err)?;
+                        s.sample(&mut logits)
+                    }
+                    None => self
+                        .model
+                        .forward_greedy_async(next, pos, &mut self.state)
+                        .await
+                        .map_err(map_err)?,
+                };
                 pos += 1;
             }
             // Flush any trailing bytes (an incomplete multi-byte char at the

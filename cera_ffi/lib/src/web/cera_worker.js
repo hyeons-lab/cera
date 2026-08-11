@@ -151,12 +151,18 @@ async function ensureModule(moduleUrl) {
  * dense-transformer GGUF throws from `create` after WebGPU itself came up fine.
  * Both must degrade rather than fail the open.
  */
-async function tryGpu(bytes, contextSize) {
+async function tryGpu(bytes, contextSize, mmproj) {
   if (!self.navigator || !self.navigator.gpu) return false;
   if (typeof wasm.WebGpuSession !== 'function') return false;
+  // `createWithParts` is the newer of the two and is absent from a wasm build
+  // predating it, so fall back rather than throwing a TypeError that `auto`
+  // would then read as "no GPU" for entirely the wrong reason.
+  if (mmproj && typeof wasm.WebGpuSession.createWithParts !== 'function') return false;
   let session;
   try {
-    session = await wasm.WebGpuSession.create(bytes, contextSize);
+    session = mmproj
+      ? await wasm.WebGpuSession.createWithParts(bytes, mmproj, contextSize)
+      : await wasm.WebGpuSession.create(bytes, contextSize);
   } catch (_) {
     return false;
   }
@@ -165,11 +171,33 @@ async function tryGpu(bytes, contextSize) {
   return true;
 }
 
-function openCpu(bytes, contextSize) {
-  const engine = wasm.CeraEngine.fromGgufBytes(bytes, contextSize);
+function openCpu(bytes, contextSize, mmproj, inferenceType) {
+  // `fromGgufParts` covers the text-only case too (a null projector is exactly
+  // `fromGgufBytes`), so both paths resolve the inference type through one
+  // constructor instead of two that have to agree.
+  const engine = wasm.CeraEngine.fromGgufParts(bytes, mmproj, contextSize, inferenceType);
   const session = engine.newSession(new wasm.SessionConfig());
   cpu = { engine, session, tokenizer: engine.tokenizer };
   backendLabel = 'wasm cpu';
+}
+
+/**
+ * What the live model accepts and emits.
+ *
+ * The GPU session reports its own, which is not the engine's: `WebGpuSession`
+ * accepts an image only when it was built with a projector, and never accepts
+ * audio. Reporting the CPU engine's answer for a GPU session would promise a
+ * modality the live path refuses.
+ */
+function capabilitiesOf() {
+  const caps = gpu ? gpu.session.capabilities : cpu.engine.capabilities;
+  return {
+    textIn: caps.textIn,
+    textOut: caps.textOut,
+    imageIn: caps.imageIn,
+    audioIn: caps.audioIn,
+    audioOut: caps.audioOut,
+  };
 }
 
 const OPS = {
@@ -181,12 +209,15 @@ const OPS = {
    * it into linear memory (or into GPU buffers) during construction, so peak
    * usage is briefly twice the model size on both paths.
    */
-  async open({ moduleUrl, bytes, contextSize, backend }) {
+  async open({ moduleUrl, bytes, mmproj, contextSize, backend, inferenceType }) {
     await ensureModule(moduleUrl);
     const view = new Uint8Array(bytes);
+    // Transferred separately from `bytes`, and absent for a text-only model.
+    const proj = mmproj ? new Uint8Array(mmproj) : undefined;
     const ctx = contextSize ?? undefined;
+    const type = inferenceType ?? undefined;
     if (backend === 'gpu') {
-      if (!(await tryGpu(view, ctx))) {
+      if (!(await tryGpu(view, ctx, proj))) {
         throw new Error(
           'the WebGPU backend is unavailable: either this browser exposes no ' +
             'navigator.gpu, no adapter could be acquired, or the model is not ' +
@@ -195,11 +226,49 @@ const OPS = {
         );
       }
     } else if (backend === 'cpu') {
-      openCpu(view, ctx);
-    } else if (!(await tryGpu(view, ctx))) {
-      openCpu(view, ctx);
+      openCpu(view, ctx, proj, type);
+    } else if (!(await tryGpu(view, ctx, proj))) {
+      openCpu(view, ctx, proj, type);
     }
-    return { backend: backendLabel };
+    return { backend: backendLabel, capabilities: capabilitiesOf() };
+  },
+
+  /**
+   * Feed an image into the live conversation.
+   *
+   * Both paths append patch embeddings to the same KV cache `generate` writes
+   * to, so ordering is the caller's: image first, then the question.
+   */
+  appendImage({ bytes, maxLongSize }) {
+    const view = new Uint8Array(bytes);
+    const cap = maxLongSize ?? undefined;
+    if (gpu) {
+      gpu.session.appendImage(view, cap);
+    } else {
+      cpu.session.appendImage(view, cap);
+    }
+    return null;
+  },
+
+  /**
+   * Transcribe mono PCM.
+   *
+   * Engine-level and CPU-only: `transcribe` runs its own prefill and decode on
+   * the engine, and the GPU path has no engine behind it (`WebGpuSession` owns
+   * a model directly and exposes no audio entry point).
+   */
+  transcribe({ pcm, sampleRate }) {
+    if (!cpu) {
+      throw unsupported(
+        'transcribe is not supported on the WebGPU backend: WebGpuSession has ' +
+          'no audio path. Open the model with backend: cpu to transcribe.',
+      );
+    }
+    return cpu.engine.transcribe(Float32Array.from(pcm), sampleRate);
+  },
+
+  capabilities() {
+    return capabilitiesOf();
   },
 
   /**
@@ -211,11 +280,11 @@ const OPS = {
    */
   async generate(req, post) {
     const { prompt, maxTokens } = req;
-    // Seeding is per SESSION in the wasm API, not per generate: `GenerateOpts`
-    // has no seed field and assigning one just creates a dead JS property.
-    // Honoring it therefore means rebuilding the session, which is only
-    // meaningful before anything has been fed, and is a no-op on the GPU path
-    // (its decode is greedy, so a seed changes nothing).
+    // Seeding is per SESSION in the CPU wasm API, not per generate:
+    // `GenerateOpts` has no seed field and assigning one just creates a dead JS
+    // property. Honoring it therefore means rebuilding the session, which is
+    // only meaningful before anything has been fed. The GPU path takes its seed
+    // as a `generateTokens` argument instead, so it needs none of this.
     if (req.seed != null && position() === 0 && cpu) {
       const config = new wasm.SessionConfig();
       config.seed = BigInt(req.seed);
@@ -232,7 +301,20 @@ const OPS = {
     if (gpu) {
       // Caller-framed: `generateTokens` prepends nothing, which is what makes
       // the BOS rule in `encodePrompt` the single place BOS is decided.
-      await gpu.session.generateTokens(ids, maxTokens, onToken);
+      //
+      // Sampling knobs pass straight through. `null` for any of them means the
+      // wasm side falls back to `SamplerConfig`'s default, which is the same
+      // thing omitting them from `GenerateOpts` does on the CPU path, so the
+      // two backends answer a bare `generate()` the same way.
+      await gpu.session.generateTokens(
+        ids,
+        maxTokens,
+        req.temperature ?? null,
+        req.topP ?? null,
+        req.topK ?? null,
+        req.seed != null ? BigInt(req.seed) : null,
+        onToken,
+      );
     } else {
       const tk = cpu.tokenizer;
       cpu.session.appendTokens(ids);

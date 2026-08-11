@@ -40,6 +40,19 @@ EngineConfig _configOf(CeraOptions options) => EngineConfig(
   bundleRepo: null,
 );
 
+/// Maps the generated capability record onto the portable one.
+///
+/// Restated rather than re-exported because the generated type is part of the
+/// binding surface, and this API has to carry the same meaning on the web,
+/// where those bindings are stubs.
+CeraCapabilities _capabilitiesOf(ModalityCapabilities caps) => CeraCapabilities(
+  textIn: caps.textIn,
+  textOut: caps.textOut,
+  imageIn: caps.imageIn,
+  audioIn: caps.audioIn,
+  audioOut: caps.audioOut,
+);
+
 /// This platform has a filesystem, so [Cera.openPath] works. See
 /// [Cera.supportsPaths].
 const bool supportsPaths = true;
@@ -49,8 +62,20 @@ Future<Cera> openPath(String path, CeraOptions options) async =>
     _NativeCera(await CeraEngine.fromPathAsync(path, _configOf(options)), options);
 
 /// Opens a model from memory. See [Cera.openBytes].
-Future<Cera> openBytes(Uint8List bytes, CeraOptions options) async =>
-    _NativeCera(await CeraEngine.fromBytesAsync(bytes, _configOf(options)), options);
+///
+/// Always `fromPartsAsync`, even with no mmproj: it is a superset of
+/// `fromBytesAsync` (a null projector is exactly the text-only load), and
+/// routing both through one constructor means the text and multimodal paths
+/// cannot drift in how they resolve the inference type.
+Future<Cera> openBytes(
+  Uint8List bytes,
+  CeraOptions options,
+  Uint8List? mmproj,
+  String? inferenceType,
+) async => _NativeCera(
+  await CeraEngine.fromPartsAsync(bytes, mmproj, inferenceType, _configOf(options)),
+  options,
+);
 
 class _NativeCera implements Cera {
   _NativeCera(this._engine, this._options)
@@ -58,13 +83,21 @@ class _NativeCera implements Cera {
       // Read once. Both are fixed by the GGUF, and `metadata()` builds a whole
       // record across the FFI boundary, which is not something to do on every
       // prompt for two fields.
-      _bosToken = _engine.metadata().addBosToken ? _engine.bosToken() : null;
+      _bosToken = _engine.metadata().addBosToken ? _engine.bosToken() : null,
+      // Fixed by the bundle at load time, so reading it per query would cross
+      // the FFI boundary for a record that cannot change.
+      _capabilities = _capabilitiesOf(_engine.capabilities());
 
   final CeraEngine _engine;
   final CeraOptions _options;
 
   /// The BOS id to prepend, or null when this model does not want one.
   final int? _bosToken;
+
+  final CeraCapabilities _capabilities;
+
+  @override
+  CeraCapabilities get capabilities => _capabilities;
 
   Session _session;
   bool _closed = false;
@@ -272,6 +305,29 @@ class _NativeCera implements Cera {
   Future<String> decode(List<int> tokens) async {
     _ensureOpen();
     return _engine.decodeTokens(tokens);
+  }
+
+  @override
+  Future<void> appendImage(Uint8List bytes, {int? maxLongSize}) async {
+    _ensureOpen();
+    // Queued behind any running generation for the same reason generations are
+    // queued behind each other: this appends patch embeddings to the very KV
+    // cache a decode is writing to, and interleaving the two would splice the
+    // image into the middle of the answer.
+    await _queue;
+    _ensureOpen();
+    _session.appendImage(bytes, maxLongSize);
+  }
+
+  @override
+  Future<String> transcribe(List<double> pcm, {required int sampleRate}) async {
+    _ensureOpen();
+    // Queued despite not touching the session: it is a full prefill plus decode
+    // on the shared engine, so running it under a generation would contend on
+    // the same model for the length of the clip.
+    await _queue;
+    _ensureOpen();
+    return _engine.transcribe(pcm, sampleRate);
   }
 
   @override

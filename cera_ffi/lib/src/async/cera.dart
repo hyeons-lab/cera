@@ -94,6 +94,45 @@ class CeraOptions {
   final CeraWebAssets web;
 }
 
+/// What a loaded model accepts as input and emits as output.
+///
+/// Derived at load time from the bundle's declared inference type, not from
+/// what a caller asked for: it describes what the engine *can* do. A VL bundle
+/// whose mmproj failed to parse reports `imageIn: false` and the engine still
+/// serves text, so this is the honest thing to gate a UI on.
+class CeraCapabilities {
+  /// Creates a capability set.
+  const CeraCapabilities({
+    required this.textIn,
+    required this.textOut,
+    required this.imageIn,
+    required this.audioIn,
+    required this.audioOut,
+  });
+
+  /// Whether the model accepts text prompts. True for every model that
+  /// currently loads.
+  final bool textIn;
+
+  /// Whether the model emits text.
+  final bool textOut;
+
+  /// Whether [Cera.appendImage] will work.
+  final bool imageIn;
+
+  /// Whether [Cera.transcribe] will work.
+  final bool audioIn;
+
+  /// Whether the model emits audio. No path here surfaces audio output yet;
+  /// reported so a caller can tell a speech model from a transcription one.
+  final bool audioOut;
+
+  @override
+  String toString() =>
+      'CeraCapabilities(textIn: $textIn, textOut: $textOut, '
+      'imageIn: $imageIn, audioIn: $audioIn, audioOut: $audioOut)';
+}
+
 /// A loaded model, ready to generate.
 ///
 /// Obtain one from [openPath] or [openBytes], and [close] it when done: it owns
@@ -132,10 +171,29 @@ abstract interface class Cera {
   /// empty afterwards. Whether that happens depends on the list's shape and the
   /// web compiler, so do not rely on either outcome. Opening a second engine,
   /// or retrying after a failure, needs a freshly fetched or copied list.
+  ///
+  /// **Multimodal models need `mmproj`.** A VL or audio model is two GGUFs:
+  /// the vision tower and the audio encoder live in a separate "mmproj" file,
+  /// and passing only the model loads it as text-only. [openPath] reads the
+  /// second file from the bundle's manifest; from memory there is no manifest,
+  /// so it has to be handed over.
+  ///
+  /// Modality is inferred from the arguments, because it cannot be read from
+  /// the header: every published LFM2-VL model reports the same architecture
+  /// string a text model does, since the vision half is entirely in the mmproj.
+  /// So supplying one is taken as the statement of intent it is. Pass
+  /// `inferenceType` to override (`llama.cpp/text-to-text`,
+  /// `llama.cpp/image-to-text`, `llama.cpp/lfm2-audio-v1`).
+  ///
+  /// A malformed mmproj is not fatal: the model still serves text, and
+  /// [capabilities] reports `imageIn: false` rather than promising something
+  /// [appendImage] would then refuse.
   static Future<Cera> openBytes(
     Uint8List bytes, {
+    Uint8List? mmproj,
+    String? inferenceType,
     CeraOptions options = const CeraOptions(),
-  }) => impl.openBytes(bytes, options);
+  }) => impl.openBytes(bytes, options, mmproj, inferenceType);
 
   /// Describes the backend in use, and on the web the GPU adapter with it.
   ///
@@ -150,6 +208,12 @@ abstract interface class Cera {
   /// CPU internally at load time and the FFI surface exposes no accessor for
   /// what it picked.
   String get backend;
+
+  /// What this model accepts and emits. Fixed for the engine's lifetime.
+  ///
+  /// Gate on this rather than catching from [appendImage] / [transcribe]: those
+  /// throw, and by then a user has already picked a file.
+  CeraCapabilities get capabilities;
 
   /// Generates a continuation of `prompt`, streaming decoded text as it is
   /// produced.
@@ -172,11 +236,21 @@ abstract interface class Cera {
   /// noticeable only after a cancelled one, whose decode may still be
   /// finishing (see [cancel]).
   ///
-  /// **The sampling parameters are ignored on the web's GPU backend**, which
-  /// decodes greedily, i.e. as though `temperature` were 0. They are honored
-  /// natively and on the web's CPU backend. `seed` additionally applies only
-  /// to the first generation of a session, since the sampler is seeded once
-  /// when the session is created.
+  /// The sampling parameters are honored on every backend, including the
+  /// web's GPU one. Greedy decoding is `temperature: 0` or `topK: 1`, the
+  /// same rule everywhere.
+  ///
+  /// Sampling does cost more on the web's GPU backend than greedy decoding
+  /// does: greedy takes the argmax on the GPU and reads back a token id, while
+  /// sampling has to read the whole logits row back for the sampler to see it,
+  /// once per token. Worth knowing if a run is slower than the greedy numbers
+  /// suggested; it is not a reason to avoid it.
+  ///
+  /// `seed` behaves differently per backend, because the sampler's lifetime
+  /// does. Natively and on the web's CPU backend it is a session-level knob
+  /// applied when the session is created, so it takes effect only on the first
+  /// generation of a session. The web's GPU backend builds its sampler per
+  /// call, so a seed applies to whichever call passes it.
   Stream<String> generate(
     String prompt, {
     int maxTokens = 256,
@@ -210,6 +284,35 @@ abstract interface class Cera {
 
   /// Detokenizes `tokens` back to text.
   Future<String> decode(List<int> tokens);
+
+  /// Feeds an image into the conversation, to be described or asked about by
+  /// the next [generate].
+  ///
+  /// `bytes` is an encoded PNG or JPEG, not raw pixels; it is decoded, resized
+  /// and run through the vision tower, and the resulting patch embeddings are
+  /// appended to the same KV cache [generate] writes to. So the order matters:
+  /// append the image, then generate with the question.
+  ///
+  /// `maxLongSize` caps the longer edge in pixels before encoding, trading
+  /// detail for tokens and time. Omit it for the model's own default; pass 0 to
+  /// disable the cap entirely.
+  ///
+  /// Throws if this model has no vision encoder, i.e. whenever
+  /// [capabilities] reports `imageIn: false`. Serialized against [generate] the
+  /// same way generations are serialized against each other, since both append
+  /// to one cache.
+  Future<void> appendImage(Uint8List bytes, {int? maxLongSize});
+
+  /// Transcribes mono PCM audio to text.
+  ///
+  /// `pcm` is normalized to roughly [-1.0, 1.0] and `sampleRate` must already
+  /// match what the model's audio encoder expects; nothing here resamples.
+  ///
+  /// Independent of the conversation: this runs the model's own "Perform ASR."
+  /// mode start to finish and returns the whole transcript, rather than
+  /// streaming or appending to the session. Throws when [capabilities] reports
+  /// `audioIn: false`.
+  Future<String> transcribe(List<double> pcm, {required int sampleRate});
 
   /// Clears the conversation, keeping the model loaded.
   ///

@@ -465,10 +465,13 @@ dependencies = [
  "cera",
  "js-sys",
  "serde_json",
+ "sha2",
+ "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-rayon",
  "wasm-bindgen-test",
+ "web-sys",
 ]
 
 [[package]]
