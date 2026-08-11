@@ -1838,15 +1838,17 @@ impl GpuLfm2Model {
     ) -> (&wgpu::ComputePipeline, u32, &'static str) {
         // rows-per-workgroup MUST match each shader's `NR`/`ROWS_PER_WG`
         // constant: gemv_q4_0_fast=4, gemv_q8_0=8, gemv_q4_k=2, gemv_q5_k=2,
-        // gemv_q6_k=2, gemv_f32=8. A mismatch over-dispatches and the shaders
-        // bounds-check only writes, not weight reads, so a too-small value reads
-        // past the weight buffer.
+        // gemv_q6_k=2, gemv_f32=8. Too large and rows are silently dropped, in
+        // every kernel here. Too small over-dispatches, and what that costs is
+        // per kernel: `gemv_q4_0_fast` is the one that reads past the weight
+        // buffer, since it alone guards writes but not weight reads. The rest
+        // guard the read path too (`gemv_q5_k` returns early for a whole
+        // workgroup, the others skip per row), so they only burn dispatches.
         match w.tensor.dtype {
             DType::Q4_0 => (&self.pipelines.gemv_q4_0_fast, 4, "gemv_q4"),
             DType::Q8_0 => (&self.pipelines.gemv_q8_0, 8, "gemv_q8"),
             DType::Q4KM => (&self.pipelines.gemv_q4_k, 2, "gemv_q4k"),
             DType::Q6K => (&self.pipelines.gemv_q6_k, 2, "gemv_q6"),
-            // gemv_q5_k uses NR=2 rows per workgroup (must match the shader).
             DType::Q5KM => (&self.pipelines.gemv_q5_k, 2, "gemv_q5k"),
             _ => (&self.pipelines.gemv_f32, 8, "gemv_f32"),
         }

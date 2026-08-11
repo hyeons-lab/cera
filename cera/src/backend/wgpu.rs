@@ -3692,7 +3692,14 @@ mod tests {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(m.div_ceil(2), 1, 1); // NR=2
+            // NR=2, plus 2 surplus workgroups on purpose. Above 131070 rows
+            // `gemv_row_workgroups` rounds the grid up to a multiple of MAX_WG,
+            // so groups with `first_row >= m` are normal in production, and the
+            // kernel's early return is the only thing keeping their unclamped
+            // `row0` and unguarded `y[first_row]` write in bounds. Dispatching
+            // exactly `m.div_ceil(2)` never enters that path, which left the
+            // guard deletable with the suite still green.
+            pass.dispatch_workgroups(m.div_ceil(2) + 2, 1, 1);
         }
         ctx.submit_encoder(enc);
 
