@@ -111,7 +111,7 @@ jobs:
       # corrupt ~/.cache/cera under the key and poison every future run. Keyed per
       # arch to avoid the two matrix jobs racing on one key.
       - name: Restore model bundles
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ~/.cache/cera
           key: bench-models-LFM2.5-350M-${{ matrix.arch }}-v1
@@ -123,7 +123,7 @@ jobs:
       # `LLAMA_COMMIT`, so bumping the pin re-keys them automatically.
       - name: Restore llama.cpp build
         id: llama-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ~/llamacpp/build
           key: llamacpp-${{ env.LLAMA_COMMIT }}-${{ matrix.runner }}-v1
@@ -160,7 +160,7 @@ jobs:
       - name: Save llama.cpp build
         if: steps.llama.outcome == 'success' && steps.llama-cache.outputs.cache-hit != 'true'
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ~/llamacpp/build
           key: llamacpp-${{ env.LLAMA_COMMIT }}-${{ matrix.runner }}-v1
@@ -188,7 +188,7 @@ jobs:
       # the cache untouched rather than persisting a partial ~/.cache/cera.
       - name: Save model bundles
         if: success()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ~/.cache/cera
           key: bench-models-LFM2.5-350M-${{ matrix.arch }}-v1
@@ -241,7 +241,7 @@ jobs:
       # job keys per-arch because those are different runners with different
       # binaries; here only the `--device` flag differs.)
       - name: Restore model bundles
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ~/.cache/cera
           key: bench-models-LFM2.5-350M-macos-v1
@@ -267,7 +267,7 @@ jobs:
         run: bash scripts/ci-bench.sh
       - name: Save model bundles
         if: success()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ~/.cache/cera
           key: bench-models-LFM2.5-350M-macos-v1
