@@ -432,15 +432,22 @@ jobs:
         with:
           toolchain: nightly-2026-07-10
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Check wasm32 compile
-        run: cargo check -p cera ${{ matrix.features }} --target wasm32-unknown-unknown
-      - name: Check cera-wasm WebGPU surface compiles
+      - name: Lint wasm32 compile
+        # `clippy`, not `check`: it subsumes the compile check and is the only
+        # lint coverage these feature combos get. The `check` job lints with no
+        # `--features` at all, so every `#[cfg(not(feature = "parallel"))]`
+        # fallback and every `gpu`-gated module is invisible to it. Seven
+        # undocumented serial fallbacks in `backend/cpu.rs` accumulated in that
+        # gap before anyone ran this locally.
+        run: cargo clippy -p cera ${{ matrix.features }} --target wasm32-unknown-unknown -- -D warnings
+      - name: Lint cera-wasm WebGPU surface
         # Runs once (on the gpu matrix entry): the browser `WebGpuSession`
         # glue in cera-wasm only builds with the `wgpu` feature, which the
         # cera-wasm-pack job doesn't enable.
         if: matrix.features == '--no-default-features --features gpu'
-        run: cargo check -p cera-wasm --features wgpu --target wasm32-unknown-unknown
+        run: cargo clippy -p cera-wasm --features wgpu --target wasm32-unknown-unknown -- -D warnings
       - name: Lint cera-wasm rustdoc
         # The `doc` job runs rustdoc on the HOST target, and `cera-wasm` is
         # wasm32-only — so nothing there documents this crate, and a broken
