@@ -1,6 +1,8 @@
 @TestOn('vm')
 library;
 
+import 'dart:typed_data';
+
 import 'package:cera_ffi/cera_ffi.dart';
 import 'package:test/test.dart';
 
@@ -52,6 +54,14 @@ void main() {
     expect(_surfaceGuard, isA<Function>());
   });
 
+  test('the RustBuffer-returning methods are declared on Session', () {
+    expect(_sessionSurfaceGuard, isA<Function>());
+  });
+
+  test('the RustBuffer-returning methods are declared on BundleRepo', () {
+    expect(_bundleRepoSurfaceGuard, isA<Function>());
+  });
+
   test('fromBundleIdAsync returns a Future, not a bare engine', () {
     // The generator had no rust-future path for async *constructors* (only for
     // methods), so this used to be a synchronous `throw UnsupportedError`. The
@@ -80,4 +90,29 @@ void Function(CeraEngine) get _surfaceGuard => (CeraEngine engine) {
       engine.encodeTextSpecial('', false);
       // Optional-enum return.
       engine.toolFormat();
+    };
+
+/// The same guard for `Session`, which the RustBuffer regression hit just as
+/// hard as `CeraEngine`. The `hiddenStates*` trio is the reason this matters
+/// beyond "it throws": those three went from throwing to returning *corrupt*
+/// data when `Vec<u8>`'s wire format was wrong in both directions, which a
+/// stub-only check would have called fixed.
+void Function(Session) get _sessionSurfaceGuard => (Session session) {
+      // Record returns.
+      session.capabilities();
+      session.generate(const GenerateOpts());
+      // `Vec<u8>` / `Vec<f32>` returns.
+      session.hiddenStatesForText('');
+      session.hiddenStatesForTokens(const <int>[]);
+      session.hiddenStatesMeanPooled(const <int>[]);
+      // `Vec<u8>` argument alongside an optional-primitive argument.
+      session.appendImage(Uint8List(0), null);
+      session.setImageMaxLongSize(null);
+    };
+
+/// And for `BundleRepo`, whose `storeDir` is a plain string return and so was
+/// stubbed by the same renderer gap.
+void Function(BundleRepo) get _bundleRepoSurfaceGuard => (BundleRepo repo) {
+      repo.storeDir();
+      repo.cacheSize();
     };

@@ -32,8 +32,8 @@ class CeraLibrary {
   /// Resolution order:
   ///  1. [path], when given.
   ///  2. `$CERA_FFI_LIB`, when set and non-empty.
-  ///  3. The process image, on platforms where the library is linked
-  ///     statically into the host binary (see below).
+  ///  3. The process image, on platforms where the symbols are already
+  ///     loaded into the host binary (see below).
   ///  4. The platform-conventional shared-library filename.
   ///
   /// **Apple platforms load a framework, not a loose library.** The published
@@ -55,7 +55,7 @@ class CeraLibrary {
     }
 
     if (Platform.isIOS) {
-      // Always a static archive linked into the app binary.
+      // Always the embedded framework, already loaded by dyld at launch.
       return ffi.DynamicLibrary.process();
     }
 

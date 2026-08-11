@@ -39,11 +39,11 @@
 //     binaryTarget vends MUST be named `CeraFFI` exactly.
 //   - `Cera` (Swift target) — holds the UniFFI-generated Swift wrapper
 //     (`cera_ffi.swift`). It is a COMMITTED COPY of
-//     `cera-ffi/bindings/swift/cera_ffi.swift`; re-sync it after regenerating
-//     the bindings with `just spm-sync-binding` (the two files must stay
-//     byte-identical or the Swift surface drifts from the Rust FFI). Depends on
-//     `CeraFFI` so `import CeraFFI` resolves against the binaryTarget's
-//     clang module.
+//     `cera-ffi/bindings/swift/cera_ffi.swift`, because a `.package(url:)`
+//     consumer never has the Rust tree to generate from. `just bindings` writes
+//     both, and `just bindings-check` diffs both in CI, so the two cannot
+//     drift; do not hand-edit this copy. Depends on `CeraFFI` so
+//     `import CeraFFI` resolves against the binaryTarget's clang module.
 //
 // ── Release wiring ──────────────────────────────────────────────────────────
 // The `url` + `checksum` below carry the literal placeholders `RELEASE_VERSION`

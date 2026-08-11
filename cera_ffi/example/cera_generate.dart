@@ -9,8 +9,9 @@
 //   CERA_FFI_LIB=../target/debug/libcera_ffi.dylib \
 //     dart run example/cera_generate.dart /path/to/model.gguf "Once upon a time"
 //
-// The FFI surface returns token IDs (no detokenizer is exposed yet — see
-// V2.17), so this prints the token count and decode timing rather than text.
+// The FFI surface returns token IDs; this example reports the token count and
+// decode timing rather than text. To render the text instead, pass the ids
+// through `engine.decodeTokens` (see `cera_chat.dart`).
 import 'package:cera_ffi/cera_ffi.dart';
 
 void main(List<String> args) {

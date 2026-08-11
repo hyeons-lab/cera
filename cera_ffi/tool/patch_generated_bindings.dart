@@ -88,8 +88,9 @@ void main(List<String> args) {
   // `libraryName = 'uniffi_cera_ffi'` and `DynamicLibrary.open(libraryName)`,
   // which is both the wrong base name (the library is `cera_ffi`) and missing
   // the platform prefix/suffix. It also cannot express the Apple case, where
-  // the published XCFramework is a *static* `libcera_ffi.a` linked into the
-  // app binary — there is no file to open, the symbols are in the process.
+  // the published XCFramework vends *dynamic* `CeraFFI.framework` slices that
+  // Flutter embeds and dyld loads at launch: there is no file to open by
+  // filename, the symbols are already in the process.
   //
   // Rather than reimplement that here, delegate to `CeraLibrary.open()` so
   // Flutter apps and plain `dart run` scripts resolve the library through one

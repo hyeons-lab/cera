@@ -338,9 +338,10 @@ just apple-xcframework
 swift build   # compiles cera_ffi.swift against the local macOS slice
 ```
 
-Revert to the url/placeholder form before committing. After
-regenerating the Swift bindings, run `just spm-sync-binding` to keep
-the package's `cera_ffi.swift` copy byte-identical to the vendored one.
+Revert to the url/placeholder form before committing. The package's
+`cera_ffi.swift` copy is written by `just bindings` alongside the
+vendored one and diffed by `just bindings-check`, so it stays
+byte-identical without a separate step.
 
 For a **local, vendored** XCFramework instead of the remote release
 (e.g. an app that bundles its own build), drop `CeraFFI.xcframework`

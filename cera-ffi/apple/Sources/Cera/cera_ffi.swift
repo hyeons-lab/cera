@@ -7,8 +7,8 @@ import Foundation
 // Depending on the consumer's build setup, the low-level FFI code
 // might be in a separate module, or it might be compiled inline into
 // this module. This is a bit of light hackery to work with both.
-#if canImport(cera_ffiFFI)
-import cera_ffiFFI
+#if canImport(CeraFFI)
+import CeraFFI
 #endif
 
 fileprivate extension RustBuffer {
@@ -850,6 +850,13 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
     func applyChatTemplate(messages: [ChatMessage], addGenerationPrompt: Bool) throws  -> String
     
     /**
+     * Like [`CeraEngine::apply_chat_template`], but also passes a `tools`
+     * array so a tool-trained model renders its tool-definition block. Pass an
+     * empty `tools` for identical behavior to the plain call.
+     */
+    func applyChatTemplateWithTools(messages: [ChatMessage], tools: [ToolDef], addGenerationPrompt: Bool) throws  -> String
+    
+    /**
      * Beginning-of-sequence token ID, if the model has one.
      * LLaMA-family models typically do; some don't. Honor
      * [`ModelMetadata::add_bos_token`] when deciding whether to
@@ -896,6 +903,17 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
      * Empty input returns an empty vec.
      */
     func encodeText(text: String)  -> [UInt32]
+    
+    /**
+     * Encode `text` with optional special markers — the analog of llama.cpp's
+     * `llama_tokenize(..., add_special)`. When `add_special` is true, BOS is
+     * prepended iff the GGUF declares `tokenizer.ggml.add_bos_token` and EOS
+     * appended iff it declares `tokenizer.ggml.add_eos_token`, so token counts
+     * match llama.cpp for the same text (benchmark parity). With
+     * `add_special = false` this is exactly [`Self::encode_text`]. Prefer this
+     * over hand-prepending BOS via [`ModelMetadata::add_bos_token`].
+     */
+    func encodeTextSpecial(text: String, addSpecial: Bool)  -> [UInt32]
     
     /**
      * End-of-sequence / end-of-text token ID, if the model has one.
@@ -945,6 +963,20 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
      * isn't defined in the tokenizer's vocab.
      */
     func specialTokenId(name: String)  -> UInt32?
+    
+    /**
+     * The token id of `format`'s tool-call start marker (e.g.
+     * `<|tool_call_start|>`) in this model's vocab, for use as a lazy grammar
+     * trigger in `GenerateOpts.grammar_trigger_tokens`. `None` if the model's
+     * tokenizer lacks that special token.
+     */
+    func toolCallStartToken(format: ToolFormat)  -> UInt32?
+    
+    /**
+     * The tool-call format auto-detected from this model's architecture, or
+     * `None` if the architecture has no known tool convention.
+     */
+    func toolFormat()  -> ToolFormat?
     
     /**
      * Transcribe mono `f32` PCM audio (normalized to roughly `[-1.0, 1.0]`) to text using the
@@ -1096,6 +1128,71 @@ public static func fromBundleIdAsync(bundleId: String, quant: String, config: En
 }
     
     /**
+     * Load a model from GGUF bytes already in memory.
+     *
+     * For callers with no filesystem to point [`CeraEngine::from_path`]
+     * at: a browser, an encrypted blob decrypted in memory, an asset
+     * read out of an archive. It is the one constructor a WebAssembly
+     * build can also offer, so code written against it ports across.
+     *
+     * **Not a streaming API.** GGUF is random-access: tensor data is
+     * addressed by offset and read throughout inference, so the whole
+     * file has to be resident before the first token. You can download
+     * over a stream, but you must accumulate it all before calling
+     * this. There is no partial-model inference.
+     *
+     * **Prefer [`CeraEngine::from_path`] whenever a path exists.** That
+     * route memory-maps the file, so tensor pages stay owned by the
+     * kernel: shared between processes and evictable under pressure.
+     * These bytes are committed resident memory for as long as the
+     * engine lives, which on a phone is the difference between a model
+     * the OS can page out and one that counts against your footprint.
+     * To load from the network on a platform that has a filesystem,
+     * stream to disk and use `from_path` (which is what [`BundleRepo`]
+     * does), rather than buffering the model here.
+     *
+     * Text-only: the bytes are a bare GGUF with no accompanying
+     * manifest, so there is nothing to point at a vision encoder or an
+     * audio decoder. Multimodal models need `from_path` or
+     * [`CeraEngine::from_bundle_id`]. `config.bundle_repo` is ignored.
+     */
+public static func fromBytes(bytes: Data, config: EngineConfig)throws  -> CeraEngine  {
+    return try  FfiConverterTypeCeraEngine_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes(
+        FfiConverterData.lower(bytes),
+        FfiConverterTypeEngineConfig_lower(config),$0
+    )
+})
+}
+    
+    /**
+     * Async variant of [`CeraEngine::from_bytes`]: the in-memory twin of
+     * [`CeraEngine::from_path_async`], for callers with no filesystem.
+     *
+     * This one benefits more than the path variant: `from_bytes` has no
+     * mmap to lean on, so every tensor is already resident and the whole
+     * parse plus tokenizer build happens inline. Same weak cancellation.
+     *
+     * The `bytes` are moved into the blocking task, so a dropped future
+     * releases them when the task finishes rather than when it is
+     * dropped.
+     */
+public static func fromBytesAsync(bytes: Data, config: EngineConfig)async throws  -> CeraEngine  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes_async(FfiConverterData.lower(bytes),FfiConverterTypeEngineConfig_lower(config)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_u64,
+            completeFunc: ffi_cera_ffi_rust_future_complete_u64,
+            freeFunc: ffi_cera_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterTypeCeraEngine_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
      * Load a model from a local filesystem path. Accepts the same
      * inputs as the native [`cera::CeraEngine::from_path`]: a bare
      * `.gguf`, a LeapBundles `.json` manifest, or a directory
@@ -1113,6 +1210,38 @@ public static func fromPath(path: String, config: EngineConfig)throws  -> CeraEn
         FfiConverterTypeEngineConfig_lower(config),$0
     )
 })
+}
+    
+    /**
+     * Async variant of [`CeraEngine::from_path`]: moves the GGUF open,
+     * tokenizer build, and KV allocation onto a tokio blocking worker.
+     *
+     * The sync twin is not cheap enough to call from a UI thread. GGUF
+     * tensor data is memory-mapped rather than read, so the cost is not
+     * proportional to file size, but the tokenizer is built eagerly and
+     * a large vocabulary's merge table is real work: enough to drop
+     * frames, and on a cold page cache the metadata reads are disk-bound
+     * on top. Foreign UI code should prefer this everywhere.
+     *
+     * Cancellation is the weak form documented on
+     * [`CeraEngine::from_bundle_id_async`]: dropping the future aborts
+     * the task only while it is still queued. Engine construction has no
+     * cooperative cancel point, so once started it runs to completion and
+     * the result is dropped.
+     */
+public static func fromPathAsync(path: String, config: EngineConfig)async throws  -> CeraEngine  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_constructor_ceraengine_from_path_async(FfiConverterString.lower(path),FfiConverterTypeEngineConfig_lower(config)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_u64,
+            completeFunc: ffi_cera_ffi_rust_future_complete_u64,
+            freeFunc: ffi_cera_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterTypeCeraEngine_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
 }
     
 
@@ -1133,6 +1262,22 @@ open func applyChatTemplate(messages: [ChatMessage], addGenerationPrompt: Bool)t
     uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template(
             self.uniffiCloneHandle(),
         FfiConverterSequenceTypeChatMessage.lower(messages),
+        FfiConverterBool.lower(addGenerationPrompt),$0
+    )
+})
+}
+    
+    /**
+     * Like [`CeraEngine::apply_chat_template`], but also passes a `tools`
+     * array so a tool-trained model renders its tool-definition block. Pass an
+     * empty `tools` for identical behavior to the plain call.
+     */
+open func applyChatTemplateWithTools(messages: [ChatMessage], tools: [ToolDef], addGenerationPrompt: Bool)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template_with_tools(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypeChatMessage.lower(messages),
+        FfiConverterSequenceTypeToolDef.lower(tools),
         FfiConverterBool.lower(addGenerationPrompt),$0
     )
 })
@@ -1214,6 +1359,25 @@ open func encodeText(text: String) -> [UInt32]  {
     uniffi_cera_ffi_fn_method_ceraengine_encode_text(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(text),$0
+    )
+})
+}
+    
+    /**
+     * Encode `text` with optional special markers — the analog of llama.cpp's
+     * `llama_tokenize(..., add_special)`. When `add_special` is true, BOS is
+     * prepended iff the GGUF declares `tokenizer.ggml.add_bos_token` and EOS
+     * appended iff it declares `tokenizer.ggml.add_eos_token`, so token counts
+     * match llama.cpp for the same text (benchmark parity). With
+     * `add_special = false` this is exactly [`Self::encode_text`]. Prefer this
+     * over hand-prepending BOS via [`ModelMetadata::add_bos_token`].
+     */
+open func encodeTextSpecial(text: String, addSpecial: Bool) -> [UInt32]  {
+    return try!  FfiConverterSequenceUInt32.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_ceraengine_encode_text_special(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(text),
+        FfiConverterBool.lower(addSpecial),$0
     )
 })
 }
@@ -1302,6 +1466,33 @@ open func specialTokenId(name: String) -> UInt32?  {
     uniffi_cera_ffi_fn_method_ceraengine_special_token_id(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(name),$0
+    )
+})
+}
+    
+    /**
+     * The token id of `format`'s tool-call start marker (e.g.
+     * `<|tool_call_start|>`) in this model's vocab, for use as a lazy grammar
+     * trigger in `GenerateOpts.grammar_trigger_tokens`. `None` if the model's
+     * tokenizer lacks that special token.
+     */
+open func toolCallStartToken(format: ToolFormat) -> UInt32?  {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_ceraengine_tool_call_start_token(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeToolFormat_lower(format),$0
+    )
+})
+}
+    
+    /**
+     * The tool-call format auto-detected from this model's architecture, or
+     * `None` if the architecture has no known tool convention.
+     */
+open func toolFormat() -> ToolFormat?  {
+    return try!  FfiConverterOptionTypeToolFormat.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_ceraengine_tool_format(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -3289,12 +3480,26 @@ public struct GenerateOpts: Equatable, Hashable {
      */
     public var stopTokens: [UInt32]
     /**
+     * Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
+     * decode always runs to `max_tokens`. For benchmark loops that must
+     * cover an exact token count.
+     */
+    public var ignoreEos: Bool
+    /**
      * Optional GBNF grammar **source text** constraining the output (e.g. a
      * JSON grammar). When absent (the default), decoding is unconstrained. The
      * grammar is compiled on the Rust side when generation starts; a malformed
      * grammar is reported as a `GrammarParse` error.
      */
     public var grammar: String?
+    /**
+     * Lazy-grammar trigger token ids (tool calling). When non-empty and
+     * `grammar` is set, the grammar stays inactive until the model emits one
+     * of these tokens (e.g. the tool-call start marker from
+     * [`CeraEngine::tool_call_start_token`]), then constrains the call and
+     * deactivates on completion. Empty → `grammar` is active from the start.
+     */
+    public var grammarTriggerTokens: [UInt32]
     /**
      * Ignored under synchronous generate; reserved for streaming.
      */
@@ -3306,30 +3511,42 @@ public struct GenerateOpts: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(maxTokens: UInt32, temperature: Float, topP: Float, topK: UInt32, 
+    public init(maxTokens: UInt32 = UInt32(256), temperature: Float = Float(0.7), topP: Float = Float(0.9), topK: UInt32 = UInt32(40), 
         /**
          * Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
          * disables it. Honored in the stochastic path.
-         */minP: Float, 
+         */minP: Float = Float(0.0), 
         /**
          * Repetition penalty over tokens generated this call. `1.0` disables it.
          * Honored in the stochastic path (greedy/argmax decoding is unaffected).
-         */repetitionPenalty: Float, 
+         */repetitionPenalty: Float = Float(1.0), 
         /**
          * Early-stop IDs (EOS / instruction markers / end-of-turn).
-         */stopTokens: [UInt32], 
+         */stopTokens: [UInt32] = [], 
+        /**
+         * Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
+         * decode always runs to `max_tokens`. For benchmark loops that must
+         * cover an exact token count.
+         */ignoreEos: Bool = false, 
         /**
          * Optional GBNF grammar **source text** constraining the output (e.g. a
          * JSON grammar). When absent (the default), decoding is unconstrained. The
          * grammar is compiled on the Rust side when generation starts; a malformed
          * grammar is reported as a `GrammarParse` error.
-         */grammar: String?, 
+         */grammar: String? = nil, 
+        /**
+         * Lazy-grammar trigger token ids (tool calling). When non-empty and
+         * `grammar` is set, the grammar stays inactive until the model emits one
+         * of these tokens (e.g. the tool-call start marker from
+         * [`CeraEngine::tool_call_start_token`]), then constrains the call and
+         * deactivates on completion. Empty → `grammar` is active from the start.
+         */grammarTriggerTokens: [UInt32] = [], 
         /**
          * Ignored under synchronous generate; reserved for streaming.
-         */flushEveryTokens: UInt32, 
+         */flushEveryTokens: UInt32 = UInt32(16), 
         /**
          * Ignored under synchronous generate; reserved for streaming.
-         */flushEveryMs: UInt32) {
+         */flushEveryMs: UInt32 = UInt32(50)) {
         self.maxTokens = maxTokens
         self.temperature = temperature
         self.topP = topP
@@ -3337,7 +3554,9 @@ public struct GenerateOpts: Equatable, Hashable {
         self.minP = minP
         self.repetitionPenalty = repetitionPenalty
         self.stopTokens = stopTokens
+        self.ignoreEos = ignoreEos
         self.grammar = grammar
+        self.grammarTriggerTokens = grammarTriggerTokens
         self.flushEveryTokens = flushEveryTokens
         self.flushEveryMs = flushEveryMs
     }
@@ -3365,7 +3584,9 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
                 minP: FfiConverterFloat.read(from: &buf), 
                 repetitionPenalty: FfiConverterFloat.read(from: &buf), 
                 stopTokens: FfiConverterSequenceUInt32.read(from: &buf), 
+                ignoreEos: FfiConverterBool.read(from: &buf), 
                 grammar: FfiConverterOptionString.read(from: &buf), 
+                grammarTriggerTokens: FfiConverterSequenceUInt32.read(from: &buf), 
                 flushEveryTokens: FfiConverterUInt32.read(from: &buf), 
                 flushEveryMs: FfiConverterUInt32.read(from: &buf)
         )
@@ -3379,7 +3600,9 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
         FfiConverterFloat.write(value.minP, into: &buf)
         FfiConverterFloat.write(value.repetitionPenalty, into: &buf)
         FfiConverterSequenceUInt32.write(value.stopTokens, into: &buf)
+        FfiConverterBool.write(value.ignoreEos, into: &buf)
         FfiConverterOptionString.write(value.grammar, into: &buf)
+        FfiConverterSequenceUInt32.write(value.grammarTriggerTokens, into: &buf)
         FfiConverterUInt32.write(value.flushEveryTokens, into: &buf)
         FfiConverterUInt32.write(value.flushEveryMs, into: &buf)
     }
@@ -3411,8 +3634,8 @@ public struct GenerateOutput: Equatable, Hashable {
     /**
      * Generated token IDs, in order, not including any prompt
      * tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-     * Rust side or (once exposed) through a tokenizer handle on the
-     * FFI side.
+     * Rust side, or with [`CeraEngine::decode_tokens`] from any
+     * foreign binding.
      */
     public var tokens: [UInt32]
     public var summary: GenerateSummary
@@ -3423,8 +3646,8 @@ public struct GenerateOutput: Equatable, Hashable {
         /**
          * Generated token IDs, in order, not including any prompt
          * tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-         * Rust side or (once exposed) through a tokenizer handle on the
-         * FFI side.
+         * Rust side, or with [`CeraEngine::decode_tokens`] from any
+         * foreign binding.
          */tokens: [UInt32], summary: GenerateSummary) {
         self.tokens = tokens
         self.summary = summary
@@ -3623,9 +3846,15 @@ public struct ModelMetadata: Equatable, Hashable {
     public var quantization: String
     /**
      * Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
-     * want to insert a BOS at the head of a raw prompt should honor it.
+     * want to insert a BOS at the head of a raw prompt should honor it —
+     * or, better, tokenize via `encode_text_special`, which applies both
+     * this and `add_eos_token`.
      */
     public var addBosToken: Bool
+    /**
+     * Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `add_bos_token`.
+     */
+    public var addEosToken: Bool
     /**
      * SIMD backend tier the runtime resolved for this host (e.g.
      * `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
@@ -3640,8 +3869,13 @@ public struct ModelMetadata: Equatable, Hashable {
     public init(architecture: String, maxSeqLen: UInt32, vocabSize: UInt32, hasChatTemplate: Bool, quantization: String, 
         /**
          * Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
-         * want to insert a BOS at the head of a raw prompt should honor it.
+         * want to insert a BOS at the head of a raw prompt should honor it —
+         * or, better, tokenize via `encode_text_special`, which applies both
+         * this and `add_eos_token`.
          */addBosToken: Bool, 
+        /**
+         * Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `add_bos_token`.
+         */addEosToken: Bool, 
         /**
          * SIMD backend tier the runtime resolved for this host (e.g.
          * `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
@@ -3655,6 +3889,7 @@ public struct ModelMetadata: Equatable, Hashable {
         self.hasChatTemplate = hasChatTemplate
         self.quantization = quantization
         self.addBosToken = addBosToken
+        self.addEosToken = addEosToken
         self.cpuBackend = cpuBackend
     }
 
@@ -3680,6 +3915,7 @@ public struct FfiConverterTypeModelMetadata: FfiConverterRustBuffer {
                 hasChatTemplate: FfiConverterBool.read(from: &buf), 
                 quantization: FfiConverterString.read(from: &buf), 
                 addBosToken: FfiConverterBool.read(from: &buf), 
+                addEosToken: FfiConverterBool.read(from: &buf), 
                 cpuBackend: FfiConverterString.read(from: &buf)
         )
     }
@@ -3691,6 +3927,7 @@ public struct FfiConverterTypeModelMetadata: FfiConverterRustBuffer {
         FfiConverterBool.write(value.hasChatTemplate, into: &buf)
         FfiConverterString.write(value.quantization, into: &buf)
         FfiConverterBool.write(value.addBosToken, into: &buf)
+        FfiConverterBool.write(value.addEosToken, into: &buf)
         FfiConverterString.write(value.cpuBackend, into: &buf)
     }
 }
@@ -3721,9 +3958,9 @@ public struct SessionConfig: Equatable, Hashable {
      */
     public var maxSeqLen: UInt32?
     /**
-     * KV cache compression mode.
+     * KV cache compression mode. `None` → no compression (the default).
      */
-    public var kvCompression: KvCompression
+    public var kvCompression: KvCompression?
     /**
      * Pinned-prefix length for Phase-1.5 context shift on overflow.
      * `0` disables shift; overflow returns `ContextOverflow` error.
@@ -3744,20 +3981,20 @@ public struct SessionConfig: Equatable, Hashable {
         /**
          * Cap on total tokens held in KV. `None` → model's default
          * `max_seq_len`.
-         */maxSeqLen: UInt32?, 
+         */maxSeqLen: UInt32? = nil, 
         /**
-         * KV cache compression mode.
-         */kvCompression: KvCompression, 
+         * KV cache compression mode. `None` → no compression (the default).
+         */kvCompression: KvCompression? = nil, 
         /**
          * Pinned-prefix length for Phase-1.5 context shift on overflow.
          * `0` disables shift; overflow returns `ContextOverflow` error.
-         */nKeep: UInt32, 
+         */nKeep: UInt32 = UInt32(0), 
         /**
          * Deterministic sampling seed. `None` = fresh entropy per call.
-         */seed: UInt64?, 
+         */seed: UInt64? = nil, 
         /**
          * Chunked-prefill ubatch size. `0` = monolithic prefill.
-         */ubatchSize: UInt32) {
+         */ubatchSize: UInt32 = UInt32(512)) {
         self.maxSeqLen = maxSeqLen
         self.kvCompression = kvCompression
         self.nKeep = nKeep
@@ -3782,7 +4019,7 @@ public struct FfiConverterTypeSessionConfig: FfiConverterRustBuffer {
         return
             try SessionConfig(
                 maxSeqLen: FfiConverterOptionUInt32.read(from: &buf), 
-                kvCompression: FfiConverterTypeKvCompression.read(from: &buf), 
+                kvCompression: FfiConverterOptionTypeKvCompression.read(from: &buf), 
                 nKeep: FfiConverterUInt32.read(from: &buf), 
                 seed: FfiConverterOptionUInt64.read(from: &buf), 
                 ubatchSize: FfiConverterUInt32.read(from: &buf)
@@ -3791,7 +4028,7 @@ public struct FfiConverterTypeSessionConfig: FfiConverterRustBuffer {
 
     public static func write(_ value: SessionConfig, into buf: inout [UInt8]) {
         FfiConverterOptionUInt32.write(value.maxSeqLen, into: &buf)
-        FfiConverterTypeKvCompression.write(value.kvCompression, into: &buf)
+        FfiConverterOptionTypeKvCompression.write(value.kvCompression, into: &buf)
         FfiConverterUInt32.write(value.nKeep, into: &buf)
         FfiConverterOptionUInt64.write(value.seed, into: &buf)
         FfiConverterUInt32.write(value.ubatchSize, into: &buf)
@@ -3811,6 +4048,146 @@ public func FfiConverterTypeSessionConfig_lift(_ buf: RustBuffer) throws -> Sess
 #endif
 public func FfiConverterTypeSessionConfig_lower(_ value: SessionConfig) -> RustBuffer {
     return FfiConverterTypeSessionConfig.lower(value)
+}
+
+
+/**
+ * A tool call parsed from model output. Mirrors [`cera::tools::ToolCall`];
+ * `arguments_json` is the call's arguments encoded as a JSON string.
+ */
+public struct ToolCall: Equatable, Hashable {
+    public var name: String
+    /**
+     * The call's arguments as a JSON string — normally an object
+     * (e.g. `{"city":"Paris"}`), but a malformed Hermes/Qwen reply may pass
+     * through a non-object value, so decode defensively.
+     */
+    public var argumentsJson: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, 
+        /**
+         * The call's arguments as a JSON string — normally an object
+         * (e.g. `{"city":"Paris"}`), but a malformed Hermes/Qwen reply may pass
+         * through a non-object value, so decode defensively.
+         */argumentsJson: String) {
+        self.name = name
+        self.argumentsJson = argumentsJson
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ToolCall: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeToolCall: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ToolCall {
+        return
+            try ToolCall(
+                name: FfiConverterString.read(from: &buf), 
+                argumentsJson: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ToolCall, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.argumentsJson, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeToolCall_lift(_ buf: RustBuffer) throws -> ToolCall {
+    return try FfiConverterTypeToolCall.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeToolCall_lower(_ value: ToolCall) -> RustBuffer {
+    return FfiConverterTypeToolCall.lower(value)
+}
+
+
+/**
+ * A tool the model may call. Mirrors [`cera::tools::ToolDef`], but the
+ * JSON Schema for the arguments crosses the boundary as a JSON **string**
+ * (`parameters_json`) since UniFFI has no arbitrary-JSON type. An empty
+ * `parameters_json` means "no parameters".
+ */
+public struct ToolDef: Equatable, Hashable {
+    public var name: String
+    public var description: String?
+    /**
+     * JSON Schema object for the arguments, as a JSON string (e.g.
+     * `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
+     */
+    public var parametersJson: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, description: String?, 
+        /**
+         * JSON Schema object for the arguments, as a JSON string (e.g.
+         * `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
+         */parametersJson: String) {
+        self.name = name
+        self.description = description
+        self.parametersJson = parametersJson
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ToolDef: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeToolDef: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ToolDef {
+        return
+            try ToolDef(
+                name: FfiConverterString.read(from: &buf), 
+                description: FfiConverterOptionString.read(from: &buf), 
+                parametersJson: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ToolDef, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.description, into: &buf)
+        FfiConverterString.write(value.parametersJson, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeToolDef_lift(_ buf: RustBuffer) throws -> ToolDef {
+    return try FfiConverterTypeToolDef.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeToolDef_lower(_ value: ToolDef) -> RustBuffer {
+    return FfiConverterTypeToolDef.lower(value)
 }
 
 // Note that we don't yet support `indirect` for enums.
@@ -4053,6 +4430,16 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
      */
     case OutOfMemory(requestedBytes: UInt64
     )
+    /**
+     * A backend's KV-cache compression mode is fixed by the first session that
+     * configures it — the compressed and uncompressed caches have different
+     * buffer layouts (and the uncompressed one is f32 on CPU/wgpu but f16 on
+     * Metal), so only the configured one is ever allocated. Two sessions wanting
+     * different modes need two `CeraModel` instances. Mirrors
+     * `cera::CeraError::KvCompressionConflict`.
+     */
+    case KvCompressionConflict(configured: String, requested: String
+    )
 
     
 
@@ -4111,6 +4498,10 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             )
         case 12: return .OutOfMemory(
             requestedBytes: try FfiConverterUInt64.read(from: &buf)
+            )
+        case 13: return .KvCompressionConflict(
+            configured: try FfiConverterString.read(from: &buf), 
+            requested: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -4180,6 +4571,12 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
         case let .OutOfMemory(requestedBytes):
             writeInt(&buf, Int32(12))
             FfiConverterUInt64.write(requestedBytes, into: &buf)
+            
+        
+        case let .KvCompressionConflict(configured,requested):
+            writeInt(&buf, Int32(13))
+            FfiConverterString.write(configured, into: &buf)
+            FfiConverterString.write(requested, into: &buf)
             
         }
     }
@@ -4314,7 +4711,7 @@ public func FfiConverterTypeFinishReason_lower(_ value: FinishReason) -> RustBuf
  * and native Metal). The GPU paths implement the both-sides mode only: a
  * single-sided (debug) request, or a `head_dim` their kernels can't handle,
  * warns and falls back to that backend's uncompressed KV (f32 on wgpu, f16 on
- * Metal).
+ * Metal). `F16` is honored by the CPU backend only.
  */
 
 public enum KvCompression: Equatable, Hashable {
@@ -4324,6 +4721,12 @@ public enum KvCompression: Equatable, Hashable {
      * f16 on native Metal, whose cache has always been half precision.
      */
     case none
+    /**
+     * f16 KV cache — half-precision keys + values (2 bytes/elem), ~2× less KV
+     * bandwidth at decode-at-depth. Near-lossless. CPU LFM2 and
+     * dense-transformer paths.
+     */
+    case f16
     /**
      * TurboQuant compression. Both `keys` + `values` true is the
      * production configuration; toggling them individually is
@@ -4355,7 +4758,9 @@ public struct FfiConverterTypeKvCompression: FfiConverterRustBuffer {
         
         case 1: return .none
         
-        case 2: return .turboQuant(seed: try FfiConverterUInt64.read(from: &buf), keys: try FfiConverterBool.read(from: &buf), values: try FfiConverterBool.read(from: &buf)
+        case 2: return .f16
+        
+        case 3: return .turboQuant(seed: try FfiConverterUInt64.read(from: &buf), keys: try FfiConverterBool.read(from: &buf), values: try FfiConverterBool.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -4370,8 +4775,12 @@ public struct FfiConverterTypeKvCompression: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
         
         
-        case let .turboQuant(seed,keys,values):
+        case .f16:
             writeInt(&buf, Int32(2))
+        
+        
+        case let .turboQuant(seed,keys,values):
+            writeInt(&buf, Int32(3))
             FfiConverterUInt64.write(seed, into: &buf)
             FfiConverterBool.write(keys, into: &buf)
             FfiConverterBool.write(values, into: &buf)
@@ -4393,6 +4802,87 @@ public func FfiConverterTypeKvCompression_lift(_ buf: RustBuffer) throws -> KvCo
 #endif
 public func FfiConverterTypeKvCompression_lower(_ value: KvCompression) -> RustBuffer {
     return FfiConverterTypeKvCompression.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The tool-call wire format a model family uses. Mirrors
+ * [`cera::tools::ToolFormat`]. Get one from
+ * [`CeraEngine::tool_format`] (auto-detected from the model) or set it
+ * explicitly.
+ */
+
+public enum ToolFormat: Equatable, Hashable {
+    
+    /**
+     * LFM2 / LFM2.5: Pythonic `[get_weather(city="Paris")]` in
+     * `<|tool_call_start|>…<|tool_call_end|>`.
+     */
+    case lfm2Pythonic
+    /**
+     * Hermes / Qwen: JSON `{"name":…,"arguments":{…}}` in
+     * `<tool_call>…</tool_call>`.
+     */
+    case hermes
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ToolFormat: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeToolFormat: FfiConverterRustBuffer {
+    typealias SwiftType = ToolFormat
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ToolFormat {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .lfm2Pythonic
+        
+        case 2: return .hermes
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ToolFormat, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .lfm2Pythonic:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .hermes:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeToolFormat_lift(_ buf: RustBuffer) throws -> ToolFormat {
+    return try FfiConverterTypeToolFormat.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeToolFormat_lower(_ value: ToolFormat) -> RustBuffer {
+    return FfiConverterTypeToolFormat.lower(value)
 }
 
 
@@ -4519,6 +5009,54 @@ fileprivate struct FfiConverterOptionTypeBundleRepo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeKvCompression: FfiConverterRustBuffer {
+    typealias SwiftType = KvCompression?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeKvCompression.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeKvCompression.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeToolFormat: FfiConverterRustBuffer {
+    typealias SwiftType = ToolFormat?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeToolFormat.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeToolFormat.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
     typealias SwiftType = [UInt32]
 
@@ -4586,6 +5124,56 @@ fileprivate struct FfiConverterSequenceTypeChatMessage: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeChatMessage.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeToolCall: FfiConverterRustBuffer {
+    typealias SwiftType = [ToolCall]
+
+    public static func write(_ value: [ToolCall], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeToolCall.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ToolCall] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ToolCall]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeToolCall.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeToolDef: FfiConverterRustBuffer {
+    typealias SwiftType = [ToolDef]
+
+    public static func write(_ value: [ToolDef], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeToolDef.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ToolDef] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ToolDef]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeToolDef.read(from: &buf))
         }
         return seq
     }
@@ -4661,6 +5249,46 @@ public func cpuBackendReport() -> String  {
     )
 })
 }
+/**
+ * Detect the tool-call format for a model architecture string (e.g.
+ * `"lfm2"`, `"qwen3"`). Returns `None` for architectures with no known
+ * convention — the caller may still choose a format explicitly.
+ */
+public func detectToolFormat(architecture: String) -> ToolFormat?  {
+    return try!  FfiConverterOptionTypeToolFormat.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_detect_tool_format(
+        FfiConverterString.lower(architecture),$0
+    )
+})
+}
+/**
+ * Parse tool calls out of generated model text for the given `format`.
+ * Returns an empty list when the reply contains no tool call (the model
+ * answered in prose). Errors only when a call section is present but
+ * unrecoverably malformed.
+ */
+public func parseToolCalls(text: String, format: ToolFormat)throws  -> [ToolCall]  {
+    return try  FfiConverterSequenceTypeToolCall.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_func_parse_tool_calls(
+        FfiConverterString.lower(text),
+        FfiConverterTypeToolFormat_lower(format),$0
+    )
+})
+}
+/**
+ * Build a GBNF grammar string constraining output to a valid call for one
+ * of `tools`, in `format`. Put the result in `GenerateOpts.grammar` and set
+ * `GenerateOpts.grammar_trigger_tokens` (see
+ * [`CeraEngine::tool_call_start_token`]) for a lazy tool-call trigger.
+ */
+public func toolGrammar(tools: [ToolDef], format: ToolFormat)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_func_tool_grammar(
+        FfiConverterSequenceTypeToolDef.lower(tools),
+        FfiConverterTypeToolFormat_lower(format),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -4683,6 +5311,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_func_cpu_backend_report() != 61086) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_parse_tool_calls() != 47579) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_tool_grammar() != 41383) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4693,6 +5330,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template() != 38712) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools() != 46076) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_bos_token() != 30744) {
@@ -4708,6 +5348,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_encode_text() != 52220) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special() != 59360) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_eos_token() != 21294) {
@@ -4726,6 +5369,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token() != 23833) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_tool_format() != 33648) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_transcribe() != 9680) {
@@ -4824,7 +5473,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 14088) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes() != 45873) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async() != 8065) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 64420) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async() != 48795) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() != 57598) {
