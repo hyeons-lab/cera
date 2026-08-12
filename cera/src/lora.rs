@@ -778,6 +778,9 @@ fn parse_peft_lora_name(name: &str) -> Option<(usize, LoraTarget, bool)> {
 
 /// Decode-path apply: `y += scale · B·(A·x)`, in place. `x` is length `k`, `y`
 /// length `d`; `tmp` is scratch resized to `rank`. Alloc-free given a reused `tmp`.
+///
+/// This is the reference order that [`apply_prefill`] must reproduce exactly;
+/// see that function for why "exactly" and not "closely".
 pub fn apply_decode(t: &LoraTargetWeights, x: &[f32], y: &mut [f32], tmp: &mut Vec<f32>) {
     debug_assert_eq!(x.len(), t.k);
     debug_assert_eq!(y.len(), t.d);
@@ -794,7 +797,8 @@ pub fn apply_decode(t: &LoraTargetWeights, x: &[f32], y: &mut [f32], tmp: &mut V
         let acc: f32 = row.iter().zip(x).map(|(w, &xi)| w * xi).sum();
         *tmp_r = acc * t.scale;
     }
-    // y += B · tmp   (B is [d × rank] row-major)
+    // y += B · tmp   (B is [d × rank] row-major). The dot product is summed on
+    // its own, from zero, and added to `y` once.
     for (row, yi) in t.b.chunks_exact(t.rank).zip(y.iter_mut()) {
         let acc: f32 = row.iter().zip(tmp.iter()).map(|(w, &ti)| w * ti).sum();
         *yi += acc;
@@ -806,7 +810,27 @@ pub fn apply_decode(t: &LoraTargetWeights, x: &[f32], y: &mut [f32], tmp: &mut V
 /// of token `j`), `y` the projection output `[d × n]` in the same layout,
 /// accumulated in place — matching the batched-prefill buffer layout so this
 /// drops in right after a base projection GEMM. `tmp` is scratch resized to
-/// `rank × n`. Equivalent to calling [`apply_decode`] on each of the `n` columns.
+/// `rank · n + n`.
+///
+/// **Must be bit-identical to [`apply_decode`] on each column**, which
+/// `apply_prefill_matches_per_column_decode` asserts on the raw bits rather than
+/// to a tolerance. Closeness is not enough: the projections around an adapter
+/// are quantized, so a one-ulp difference in the delta can flip an int8 bucket
+/// in the next layer, and from there the paths diverge by a quantization step
+/// rather than an ulp. On LFM2-350M-Q4_0 that turned a 1e-8 seed into logits
+/// 0.49 apart, ten layers on.
+///
+/// The trap is in the second stage, and it is invisible if you only compare the
+/// formulas. Accumulating `y[o][j] += B[o][r]·tmp[r][j]` inside the `r` loop,
+/// which is the natural way to write it against this layout, computes
+/// `((y + b₀t₀) + b₁t₁) + …`, while the decode path sums the dot product from
+/// zero and adds it to `y` once. Those differ in the rounding of every partial
+/// sum. So the `r` loop accumulates into a zeroed scratch row, and only the
+/// finished dot product reaches `y`.
+///
+/// The first stage needs no such care: it already accumulates from zero over the
+/// input dimension in ascending order, exactly as the decode path's dot product
+/// does.
 pub fn apply_prefill(
     t: &LoraTargetWeights,
     x: &[f32],
@@ -821,10 +845,14 @@ pub fn apply_prefill(
     if n == 0 || t.scale == 0.0 {
         return;
     }
-    // Tmp[rank × n] = scale · (A · X).  A is [rank × k] row-major.
+    // `rank × n` for the low-rank vectors, plus one `n`-wide row to accumulate
+    // each output's dot product before it touches `y`.
     tmp.clear();
-    tmp.resize(t.rank * n, 0.0);
-    for (r, tmp_row) in tmp.chunks_exact_mut(n).enumerate() {
+    tmp.resize(t.rank * n + n, 0.0);
+    let (tmp_rank, acc_row) = tmp.split_at_mut(t.rank * n);
+
+    // Tmp[rank × n] = scale · (A · X).  A is [rank × k] row-major.
+    for (r, tmp_row) in tmp_rank.chunks_exact_mut(n).enumerate() {
         let a_row = &t.a[r * t.k..(r + 1) * t.k];
         for (kk, &a_val) in a_row.iter().enumerate() {
             let x_row = &x[kk * n..(kk + 1) * n];
@@ -839,11 +867,15 @@ pub fn apply_prefill(
     // Y[d × n] += B · Tmp.  B is [d × rank] row-major.
     for (o, y_row) in y.chunks_exact_mut(n).enumerate() {
         let b_row = &t.b[o * t.rank..(o + 1) * t.rank];
+        acc_row.fill(0.0);
         for (r, &b_val) in b_row.iter().enumerate() {
-            let tmp_row = &tmp[r * n..(r + 1) * n];
-            for (y_j, &t_j) in y_row.iter_mut().zip(tmp_row) {
-                *y_j += b_val * t_j;
+            let tmp_row = &tmp_rank[r * n..(r + 1) * n];
+            for (a_j, &t_j) in acc_row.iter_mut().zip(tmp_row) {
+                *a_j += b_val * t_j;
             }
+        }
+        for (y_j, &a_j) in y_row.iter_mut().zip(acc_row.iter()) {
+            *y_j += a_j;
         }
     }
 }
@@ -1175,10 +1207,17 @@ mod tests {
         }
     }
 
+    /// The batched `apply_prefill` must equal `apply_decode` on each column
+    /// **bit for bit**, not to a tolerance.
+    ///
+    /// A tolerance is not good enough here and this test used to allow one. The
+    /// projections around the adapter are quantized, so a one-ulp difference in
+    /// the delta can flip an int8 bucket in the next layer, and from there the
+    /// two paths diverge by a quantization step rather than an ulp. On
+    /// LFM2-350M-Q4_0 a shortconv adapter seeded exactly that way ended up
+    /// 0.49 apart in the logits.
     #[test]
     fn apply_prefill_matches_per_column_decode() {
-        // The batched `apply_prefill` (Y[d×n] += scale·B·(A·X[k×n])) must equal
-        // running `apply_decode` on each of the n columns independently.
         let (rank, k, d, n) = (3, 4, 5, 3);
         let buf = synth_safetensors(rank, k, d, 0.5, 0.25);
         let adapter = LoraAdapterWeights::from_safetensors_bytes(&buf, Some(6.0)).unwrap();
@@ -1206,8 +1245,12 @@ mod tests {
                 y_ref[o * n + j] = v;
             }
         }
-        for (a, b) in y_batched.iter().zip(&y_ref) {
-            assert!((a - b).abs() < 1e-5, "{a} != {b}");
+        for (i, (a, b)) in y_batched.iter().zip(&y_ref).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "element {i}: batched {a} != per-column {b}"
+            );
         }
     }
 
