@@ -1,0 +1,9 @@
+# LFS tracking for the Space repo this build is pushed to. Nothing to do with
+# this repository, which stores no build output.
+#
+# `*.wasm` because those are the only files a Flutter web build produces with
+# any prospect of reaching Hugging Face's 10 MB LFS threshold: the engine, and
+# the renderer bundled by `--no-web-resources-cdn`.
+#
+# Keep the `*.ext filter=lfs` shape, which deploy-web-demo.yml parses.
+*.wasm filter=lfs diff=lfs merge=lfs -text

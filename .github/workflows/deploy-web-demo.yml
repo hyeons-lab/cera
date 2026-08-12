@@ -2,7 +2,8 @@ name: Deploy Web Demo
 
 # Builds `cera_ffi_flutter/example` for the browser and uploads it to Cloudflare
 # Pages, so there is a live URL running LFM2 on WebGPU in the visitor's own
-# browser.
+# browser. The same build can also go to a Hugging Face static Space instead,
+# on request: see "Publishing to the Hugging Face Space" below.
 #
 # The point of the demo is WebGPU, not "a Flutter app that happens to build".
 # The measured gap is ~58 tok/s on WebGPU against ~1.4 tok/s on the wasm CPU
@@ -58,6 +59,57 @@ name: Deploy Web Demo
 # domain in the dashboard FIRST and only then point a CNAME at
 # <project>.pages.dev, because a CNAME that resolves before the domain is
 # associated returns 522.
+#
+# ── Publishing to the Hugging Face Space ──────────────────────────────────
+#
+# A Hugging Face Space with `sdk: static` is a git repo whose files are served
+# as-is, with no container and no compute behind them, which is why they are
+# free for every account and never idle out. That makes it the same artifact
+# Cloudflare gets: `flutter build web` output, no build step on their side. So
+# it is a second destination on this workflow rather than a second workflow,
+# which would otherwise duplicate the toolchain, the WebGpuSession assertion
+# and the size walk to produce a byte-identical directory.
+#
+# It never runs on a push. Cloudflare deploys itself on every push to main;
+# the Space is published only by dispatching this workflow by hand with
+# `publish_space` checked. A Space is one repo serving one site, so there is no
+# per-branch preview to make an automatic deploy safe the way it is for Pages,
+# and the publish force-pushes, replacing whatever is live rather than adding
+# to it.
+#
+# Force-pushing a one-commit history keeps the Space's ref shallow but not its
+# object store: each publish whose wasm changed leaves the previous LFS objects
+# behind, and HF does not collect them. Bounded by how often anyone publishes,
+# and clearable with the Hub's super-squash if it ever matters.
+#
+# A publish dispatch skips the Cloudflare deploy rather than doing both. Not
+# tidiness: the Space publish needs a concurrency group that never cancels
+# (see below), which puts it outside the branch's group, and two runs in
+# different groups can reach `wrangler pages deploy --branch=main` at the same
+# time. A publish of an older commit finishing after a push of a newer one
+# would then leave the older build live on production. A dispatch that wants a
+# Cloudflare redeploy is the same dispatch with the box unchecked.
+#
+# Any ref may be dispatched, main or not, so the ref is stamped into the Space's
+# commit message and the job summary. Without that there is nothing on the Hub
+# saying the live site is a branch.
+#
+# One-time setup, none of which has to exist for this workflow to merge or for
+# a Cloudflare deploy to keep working:
+#
+#   1. Create the Space at huggingface.co/new-space, SDK "Static". Owner and
+#      name have to match the `SPACE_ID` env value below. The Space must exist
+#      first: pushing to a Space that was never created is a 404, not an
+#      implicit create.
+#   2. Create a token at huggingface.co/settings/tokens with write access to
+#      that Space. A fine-grained token needs "Write access to contents/settings
+#      of selected repos" with the Space picked; a classic token needs `write`.
+#   3. Add it as the repository secret HF_TOKEN.
+#
+# The Space's README.md is not authored on the Hub. `.github/hf-space/README.md`
+# in this repo is the Space card, YAML frontmatter and all, and it is copied
+# into the upload on every publish. Editing the card through the Hub UI works
+# right up until the next publish discards it.
 
 # The two path lists are identical and have to stay that way. They are written
 # out twice because GitHub Actions rejects YAML anchors in workflow files, so
@@ -79,6 +131,18 @@ on:
       - "Cargo.lock"
       - ".github/workflows/deploy-web-demo.yml"
       - ".github/actions/install-binaryen/**"
+      # The LFS patterns, which are not inert metadata: the size gate parses
+      # them and fails on a file it cannot place, so a PR editing only this
+      # file (the fix that gate's own error message asks for) has to be able to
+      # run that gate. Leave this entry out and such a PR matches no path, runs
+      # zero jobs, and merges green.
+      #
+      # The Space card beside it is deliberately not listed. Nothing on the
+      # push path reads it, so a wording change there would otherwise buy a
+      # 40-minute rebuild and a production redeploy of a byte-identical
+      # artifact. It reaches the Space on the next manual publish, which builds
+      # anyway.
+      - ".github/hf-space/.gitattributes"
   pull_request:
     branches: [main]
     paths:
@@ -92,7 +156,13 @@ on:
       - "Cargo.lock"
       - ".github/workflows/deploy-web-demo.yml"
       - ".github/actions/install-binaryen/**"
+      - ".github/hf-space/.gitattributes"
   workflow_dispatch:
+    inputs:
+      publish_space:
+        description: "Also publish this build to the Hugging Face Space"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -103,12 +173,34 @@ permissions:
 # One deploy per branch at a time, newest wins. A superseded commit's upload is
 # worthless the moment a newer one starts, and Pages keeps every deployment
 # forever otherwise.
+#
+# A Space publish is the exception, and gets a group of its own. Two publishes
+# force-push the same single Space repo, so concurrent ones mean whichever
+# finishes last wins rather than whichever commit is newer, and a cancellation
+# landing inside `git push --force` can leave the Space holding uploaded LFS
+# objects that no ref points at. It waits rather than cancels for that reason.
+#
+# Keyed on `publish_space` and not on the event, because that is what decides
+# which destination a run touches. A dispatch that does not publish is an
+# ordinary Cloudflare redeploy and belongs in its branch's group with
+# everything else.
+#
+# Waiting has a depth of one: GitHub holds a single pending run per group, so a
+# third publish cancels the queued second. Safe, since a pending run has pushed
+# nothing.
 concurrency:
-  group: web-demo-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ inputs.publish_space && 'web-demo-space-publish' || format('web-demo-{0}', github.ref) }}
+  cancel-in-progress: ${{ !inputs.publish_space }}
 
 env:
   PROJECT_NAME: cera-demo
+  # The Hugging Face Space this publishes to, `<owner>/<name>`. Its served
+  # hostname is derived from this rather than written out a second time; see
+  # the publish step.
+  SPACE_ID: hyeons-lab/cera-demo
+  # Copied into the upload verbatim: the Space card, and the LFS patterns that
+  # the size gate reads back out to decide what may exceed 10 MB.
+  SPACE_META: .github/hf-space
   # `just wasm-web-wgpu` writes here; `install_web --from` reads it.
   WGPU_PKG: cera-wasm/examples/webgpu/pkg
   APP_DIR: cera_ffi_flutter/example
@@ -202,6 +294,19 @@ jobs:
         # be, and this names the reason where the upload's own failure would
         # not.
         #
+        # The second gate is Hugging Face's: it expects anything over 10 MB to
+        # arrive through LFS, and the Space upload tracks `*.wasm` for exactly
+        # that reason. Checked here, on one walk we are already doing, rather
+        # than at publish time, where the same problem surfaces as a rejected
+        # push at the end of a 40-minute job.
+        #
+        # It fails the build even though publishing the Space is manual, which
+        # is deliberate on both counts: a file over 10 MB appearing in a
+        # Flutter web build is worth stopping for whoever it inconveniences (it
+        # is the same "did a model get committed into web/" canary as the gate
+        # above, one threshold down), and if it turns out to be legitimate the
+        # fix is one pattern in `.github/hf-space/.gitattributes`.
+        #
         # `wc -c` rather than `find -printf`, which is GNU-only: the rest of
         # this repo's CI scripts stay runnable on the macOS machines
         # contributors sanity-check them on, and there is no reason for this one
@@ -211,6 +316,31 @@ jobs:
         run: |
           set -euo pipefail
           LIMIT=$((25 * 1024 * 1024))
+          # Decimal MB, not MiB. HF states the threshold as "10 MB" without
+          # saying which, and the two differ by 485 KB. Taking the smaller
+          # reading costs nothing (it can only ask for LFS slightly early)
+          # while the larger one would leave a band of files that clear this
+          # gate and are still refused by the push, which is the exact outcome
+          # the gate exists to convert into an early failure.
+          LFS_LIMIT=$((10 * 1000 * 1000))
+          # The extensions LFS will handle, read out of the file that will do
+          # the handling instead of restated here. A gate that carries its own
+          # copy of the patterns is not checking the tracking, it is agreeing
+          # with itself.
+          ATTR="${GITHUB_WORKSPACE}/${SPACE_META}/.gitattributes"
+          LFS_EXTS=$(sed -n 's/^\*\.\([A-Za-z0-9_-]\{1,\}\)[[:space:]].*filter=lfs.*/\1/p' "$ATTR")
+          # An empty parse would make the loop below wave everything through
+          # while still reporting a pass, so it is the one outcome that cannot
+          # be treated as "nothing to check". Reachable without anyone touching
+          # this step: reformat a line in `.gitattributes` into a shape the sed
+          # no longer matches and the gate retires itself silently.
+          if [ -z "$(printf '%s' "$LFS_EXTS" | tr -d '[:space:]')" ]; then
+            echo "::error file=${SPACE_META}/.gitattributes::no 'filter=lfs' patterns parsed out of this file, so the 10 MB check below would pass whatever it was given. Keep the '*.ext filter=lfs' shape."
+            exit 1
+          fi
+          # Padded on both sides so the membership test matches whole entries:
+          # unpadded, an extension would match any substring of another.
+          LFS_LIST=" $(printf '%s' "$LFS_EXTS" | tr '\n' ' ') "
           # `-r` is load-bearing, and its absence is invisible on a Mac: GNU
           # xargs with no input still runs `wc -c` once with no operands, which
           # reads the empty stdin and prints `0`, so the emptiness check below
@@ -226,12 +356,14 @@ jobs:
             exit 1
           fi
           # Walked with a here-string rather than `| head`, so nothing runs in a
-          # subshell (the loop assigns SIZE/BIGGEST for the gate below) and no
-          # early-closing pipe can fail the step with SIGPIPE under `pipefail`.
+          # subshell (the loop assigns SIZE/BIGGEST and accumulates UNTRACKED
+          # for the two gates below) and no early-closing pipe can fail the
+          # step with SIGPIPE under `pipefail`.
           # `read` splits the count off the front, and because `path` is the
           # last variable it keeps the rest of the line whole, so a filename
           # containing spaces survives into the error message intact.
           rank=0
+          UNTRACKED=""
           {
             echo "## Web demo deployment"
             echo
@@ -246,8 +378,31 @@ jobs:
               if [ "$rank" -le 5 ]; then
                 echo "| \`${path#./}\` | $((bytes / 1024)) KB |"
               fi
+              if [ "$bytes" -gt "$LFS_LIMIT" ]; then
+                # Matched on the bare filename, because every other spelling
+                # finds a dot that is not an extension separator: `find .`
+                # prefixes each path with `./`, and a directory component may
+                # contain a dot of its own. Either would send a dotless
+                # `NOTICES` down the has-an-extension arm.
+                rel="${path#./}"
+                case "${rel##*/}" in
+                  *.*) ext="${rel##*.}" ;;
+                  *) ext="" ;;
+                esac
+                case "$LFS_LIST" in
+                  *" $ext "*) ;;
+                  # Collected rather than reported: this loop's output is the
+                  # job summary table, and an error line belongs in the log.
+                  *) UNTRACKED="${UNTRACKED}  ${rel} ($bytes bytes)"$'\n' ;;
+                esac
+              fi
             done <<< "$SIZES"
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          # Cloudflare's limit is checked first because it is the one that
+          # blocks the always-on deploy. A stray model in `web/` trips both, and
+          # in the other order the only message printed would be the LFS one,
+          # whose advice is to add a pattern: following it satisfies that gate
+          # and surfaces the Cloudflare failure a run later.
           if [ "$SIZE" -gt "$LIMIT" ]; then
             # Bytes, not a rounded unit: any rounding makes a file barely over
             # the limit read as exactly the limit, which reads as a false
@@ -255,9 +410,26 @@ jobs:
             echo "::error::${BIGGEST#./} is $SIZE bytes, over Cloudflare Pages' 25 MiB ($LIMIT bytes) per-file limit"
             exit 1
           fi
+          if [ -n "$UNTRACKED" ]; then
+            # `%0A` is how an annotation carries a newline, so the filenames
+            # ride inside the error rather than as loose log lines below it.
+            # Annotations are surfaced at the top of the run, which is the only
+            # place a reader is guaranteed to look.
+            # Two expansions because bash does not nest them: drop the trailing
+            # newline every entry was appended with, then turn the separators
+            # into `%0A`.
+            LIST="${UNTRACKED%$'\n'}"
+            echo "::error::these files are over $LFS_LIMIT bytes and would be pushed to the Hugging Face Space outside LFS:%0A${LIST//$'\n'/%0A}"
+            echo "::error::add a pattern for them to ${SPACE_META}/.gitattributes, or find out why the build grew one. It has to be a top-level '*.ext filter=lfs' line: that is the only shape this check can read, so a path-scoped pattern would leave it failing unchanged."
+            exit 1
+          fi
 
       - name: Deploy to Cloudflare Pages
         id: deploy
+        # Skipped when this run is publishing the Space, so the two
+        # destinations are never uploaded to by the same run. The header
+        # explains why that separation is load-bearing rather than cosmetic.
+        if: ${{ !inputs.publish_space }}
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -278,11 +450,129 @@ jobs:
             --project-name=${{ env.PROJECT_NAME }}
             --branch=${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
 
-      - name: Link the deployment
+      - name: Publish to the Hugging Face Space
+        id: space
+        # Only ever from a hand-dispatched run that asked for it. See
+        # "Publishing to the Hugging Face Space" in the header for why this is
+        # not on the push path with Cloudflare, and for the one-time setup that
+        # has to exist before it can succeed.
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          set -euo pipefail
+          # An explicit publish request that finds no credentials is a failure,
+          # not something to skip past: the caller ticked a box asking for this,
+          # and would otherwise read a green run as a deploy that happened.
+          if [ -z "${HF_TOKEN:-}" ]; then
+            echo "::error::publish_space was requested but the HF_TOKEN secret is empty. Create the Space and the token first; the header of this file has the steps."
+            exit 1
+          fi
+
+          # Staged in RUNNER_TEMP rather than turning `build/web` itself into a
+          # git repo. The push below authenticates with a remote URL carrying
+          # the token, which git writes into `.git/config`, and `build/web` is
+          # the directory this job hands to an uploader. Keeping the repo out
+          # of it means no later change to what gets uploaded, or in what
+          # order, can ship a credential.
+          SPACE_DIR="${RUNNER_TEMP}/hf-space"
+          rm -rf "$SPACE_DIR"
+          mkdir -p "$SPACE_DIR"
+          # `/.` for the source, because `dir/*` leaves dotfiles behind.
+          cp -R "${APP_DIR}/build/web/." "$SPACE_DIR/"
+          # The card and the LFS patterns live in this repo and are versioned
+          # with the app they describe, so they are copied in rather than left
+          # to whatever the Space happens to hold.
+          cp "${SPACE_META}/README.md" "$SPACE_DIR/"
+          cp "${SPACE_META}/.gitattributes" "$SPACE_DIR/"
+          cd "$SPACE_DIR"
+
+          # A fresh repo force-pushed over the Space, rather than cloning it and
+          # syncing files in. Cloning means reconciling deletions by hand (a
+          # file that leaves the Flutter output would otherwise be served
+          # forever) and pulling down every wasm the Space has ever held. This
+          # keeps the published history one commit deep and makes the upload
+          # exactly the directory that was built.
+          #
+          # `-b main`: Spaces serve their default branch, and a repo initialized
+          # under git's older default would push a `master` nobody looks at.
+          git init -q -b main
+          # After `git init`, since `--local` writes the lfs filters into this
+          # repo's config, and before `git add`, since those filters are what
+          # turn the `.gitattributes` copied above into pointer files.
+          git lfs install --local
+          git add -A
+          git \
+            -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -q -m "Deploy ${GITHUB_REF_NAME} (${GITHUB_SHA}) from ${GITHUB_REPOSITORY}"
+
+          # A named remote, not a URL passed straight to `git push`. The URL
+          # form looks tidier and silently breaks LFS: git-lfs resolves its
+          # batch endpoint from a remote, and with an ad-hoc URL it has none to
+          # resolve, so the push fails with `batch request: missing protocol`
+          # after the pointer files are already committed.
+          #
+          # The token is in the URL because that is the shape HF's git endpoint
+          # takes; the username half is ignored when the password is a token.
+          # Actions masks the secret's value wherever it appears in the log, and
+          # nothing here echoes the remote, so it does not reach the transcript.
+          git remote add space "https://user:${HF_TOKEN}@huggingface.co/spaces/${SPACE_ID}"
+          git push --force --quiet space main
+
+          # A static Space is served from `<owner>-<name>.static.hf.space`,
+          # lowercased. Derived instead of written out again so that changing
+          # SPACE_ID cannot leave this pointing at the previous Space, which
+          # would still resolve and still look fine. Besides alphanumerics an
+          # owner or name may hold `-`, `_` or `.`, and a host may hold only
+          # `-`, so the latter two fold to it along with the separating slash.
+          HOST=$(printf '%s' "$SPACE_ID" | tr '[:upper:]' '[:lower:]' | tr '/_.' '---')
+          echo "url=https://${HOST}.static.hf.space" >> "$GITHUB_OUTPUT"
+
+      - name: Link the deployment
+        # `always()`, with each destination reported only if it ran and a
+        # failed publish reported as failed. A condition naming either deploy
+        # step would go silent on the run that needs a summary most: the
+        # publish dispatch, which skips Cloudflare, so gating on that step
+        # would suppress the Space result along with it.
+        if: always()
+        env:
+          PAGES_URL: ${{ steps.deploy.outputs.deployment-url }}
+          SPACE_URL: ${{ steps.space.outputs.url }}
+          SPACE_OUTCOME: ${{ steps.space.outcome }}
+        run: |
+          set -euo pipefail
+          # No URL and no publish attempt means nothing was deployed, usually
+          # because the job failed on its way here. Nothing to add that the
+          # failing step has not already said.
+          if [ -z "${PAGES_URL:-}" ] && [ "${SPACE_OUTCOME:-skipped}" = "skipped" ]; then
+            exit 0
+          fi
           {
             echo
-            echo "Deployed: ${{ steps.deploy.outputs.deployment-url }}"
+            if [ -n "${PAGES_URL:-}" ]; then
+              echo "Deployed: ${PAGES_URL}"
+            fi
+            case "${SPACE_OUTCOME:-skipped}" in
+              skipped) ;;
+              success)
+                echo
+                echo "Hugging Face Space: ${SPACE_URL}"
+                echo "Space page: https://huggingface.co/spaces/${SPACE_ID}"
+                # Worth stating plainly, because the Space has no per-branch
+                # previews: whatever ref was dispatched is now the live site.
+                echo
+                echo "The Space now serves \`${GITHUB_REF_NAME}\`."
+                ;;
+              *)
+                echo
+                # Neither "was not updated" nor "still serves what it did":
+                # a cancellation can land inside the force push, so what the
+                # Space holds afterwards is not something this job knows.
+                echo "The publish step \`${SPACE_OUTCOME}\`, so the Space may not"
+                echo "hold this build. Check https://huggingface.co/spaces/${SPACE_ID}."
+                ;;
+            esac
             echo
             echo "Pick an **LFM2** GGUF: \`WebGpuSession\` is LFM2-only, so any"
             echo "other architecture falls back to the wasm CPU path."
