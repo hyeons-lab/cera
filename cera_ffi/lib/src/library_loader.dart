@@ -7,5 +7,4 @@
 /// target web — see the README "Platform support" section.
 library;
 
-export 'library_loader_web.dart'
-    if (dart.library.io) 'library_loader_io.dart';
+export 'library_loader_web.dart' if (dart.library.io) 'library_loader_io.dart';

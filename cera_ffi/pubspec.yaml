@@ -15,9 +15,13 @@ topics:
   - ai
 
 environment:
-  # NativeCallable.isolateLocal (used by the generated bindings) lands in 3.1;
-  # 3.3 is the floor we validate against.
-  sdk: ^3.3.0
+  # NativeCallable.isolateLocal (used by the generated bindings) lands in 3.1,
+  # so the runtime floor is lower than this. 3.7 is the *formatting* floor: the
+  # `dart format` gate in CI picks its style from this constraint, and below
+  # 3.7 it applies the pre-tall-style rules, which would rewrite this package's
+  # modern formatting backwards. Raising it keeps the code as written and the
+  # gate honest.
+  sdk: ^3.7.0
   # No `flutter:` constraint, and that absence is the entire point of this
   # package existing separately from `cera_ffi_flutter`. Declaring one is what
   # makes pub treat a package as requiring the Flutter SDK, after which

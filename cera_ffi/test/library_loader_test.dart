@@ -1,7 +1,6 @@
 @TestOn('vm')
 library;
 
-
 import 'package:cera_ffi/cera_ffi.dart';
 import 'package:test/test.dart';
 

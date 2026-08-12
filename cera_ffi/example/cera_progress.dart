@@ -20,8 +20,10 @@ class _AbortAfterFirst implements DownloadProgressSink {
     // Then throw to abort before pulling the full model; the throw unwinds the
     // synchronous download (nothing after fromBundleId reliably runs).
     // ignore: avoid_print
-    print('✓ onProgress fired — url=$url bytesDownloaded=$bytesDownloaded '
-        'totalBytes=$totalBytes');
+    print(
+      '✓ onProgress fired — url=$url bytesDownloaded=$bytesDownloaded '
+      'totalBytes=$totalBytes',
+    );
     throw _StopDownload();
   }
 }
@@ -31,9 +33,10 @@ class _StopDownload implements Exception {}
 void main(List<String> args) {
   final bundleId = args.isNotEmpty ? args[0] : 'LFM2-350M-GGUF';
   final quant = args.length > 1 ? args[1] : 'Q4_0';
-  final storeDir = args.length > 2
-      ? args[2]
-      : Directory.systemTemp.createTempSync('cera_prog_').path;
+  final storeDir =
+      args.length > 2
+          ? args[2]
+          : Directory.systemTemp.createTempSync('cera_prog_').path;
 
   print('cera ${ceraFfiVersion()} — verifying BundleRepo.withProgress');
   print('bundle=$bundleId quant=$quant store=$storeDir');

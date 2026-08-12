@@ -185,7 +185,11 @@ class _WorkerCera implements Cera {
   @override
   CeraCapabilities get capabilities => _capabilities;
 
-  Future<void> _start(Uint8List bytes, Uint8List? mmproj, String? inferenceType) async {
+  Future<void> _start(
+    Uint8List bytes,
+    Uint8List? mmproj,
+    String? inferenceType,
+  ) async {
     // Both URLs are resolved against the page before they leave Dart.
     //
     // `new Worker(url)` would resolve a relative URL against the document
@@ -201,28 +205,29 @@ class _WorkerCera implements Cera {
     worker.onmessage = ((_MessageEvent event) => _receive(event.data)).toJS;
     // Without this, a worker that fails to load never replies and every request
     // hangs forever with nothing logged. The usual cause is a bad `workerUrl`.
-    worker.onerror = ((_ErrorEvent error) {
-      // Shut down rather than only failing the in-flight batch. A worker that
-      // errored answers nothing further, so leaving it "open" means every
-      // later request parks a completer that cannot resolve, which is the hang
-      // this handler exists to prevent.
-      //
-      // The event's own message leads, because `onerror` fires for two
-      // different things: a worker that never loaded, and an uncaught error
-      // inside one that did (a wasm out-of-memory mid-generate being the
-      // likely one). Only the first is a path problem, so the path advice is
-      // an afterthought rather than the headline.
-      final detail = error.message ?? 'no detail from the worker';
-      _shutDown(
-        StateError(
-          'the Cera web worker at "$workerUrl" failed: $detail. '
-          'If it never loaded, check that cera_worker.js, cera_wasm.js and '
-          'cera_wasm_bg.wasm are served from the configured paths (see '
-          'CeraWebAssets), which `dart run cera_ffi:install_web` sets up '
-          '(`dart run cera_ffi_flutter:install_web` from a Flutter app).',
-        ),
-      );
-    }).toJS;
+    worker.onerror =
+        ((_ErrorEvent error) {
+          // Shut down rather than only failing the in-flight batch. A worker that
+          // errored answers nothing further, so leaving it "open" means every
+          // later request parks a completer that cannot resolve, which is the hang
+          // this handler exists to prevent.
+          //
+          // The event's own message leads, because `onerror` fires for two
+          // different things: a worker that never loaded, and an uncaught error
+          // inside one that did (a wasm out-of-memory mid-generate being the
+          // likely one). Only the first is a path problem, so the path advice is
+          // an afterthought rather than the headline.
+          final detail = error.message ?? 'no detail from the worker';
+          _shutDown(
+            StateError(
+              'the Cera web worker at "$workerUrl" failed: $detail. '
+              'If it never loaded, check that cera_worker.js, cera_wasm.js and '
+              'cera_wasm_bg.wasm are served from the configured paths (see '
+              'CeraWebAssets), which `dart run cera_ffi:install_web` sets up '
+              '(`dart run cera_ffi_flutter:install_web` from a Flutter app).',
+            ),
+          );
+        }).toJS;
 
     final buffer = _detach(bytes);
     final projBuffer = mmproj == null ? null : _detach(mmproj);
@@ -256,7 +261,8 @@ class _WorkerCera implements Cera {
   /// views onto it. Copy in that case; the common case is a whole-buffer list
   /// and costs nothing.
   JSArrayBuffer _detach(Uint8List bytes) {
-    if (bytes.offsetInBytes == 0 && bytes.lengthInBytes == bytes.buffer.lengthInBytes) {
+    if (bytes.offsetInBytes == 0 &&
+        bytes.lengthInBytes == bytes.buffer.lengthInBytes) {
       return bytes.buffer.toJS;
     }
     return Uint8List.fromList(bytes).buffer.toJS;
@@ -447,9 +453,12 @@ class _WorkerCera implements Cera {
   Future<List<int>> encode(String text, {bool addSpecial = true}) async {
     final result = await _send(
       _newId(),
-      (id) => _Request(id: id, op: 'encode', text: text, addSpecial: addSpecial),
+      (id) =>
+          _Request(id: id, op: 'encode', text: text, addSpecial: addSpecial),
     );
-    return (result as JSArray<JSNumber>).toDart.map((n) => n.toDartInt).toList();
+    return (result as JSArray<JSNumber>).toDart
+        .map((n) => n.toDartInt)
+        .toList();
   }
 
   @override

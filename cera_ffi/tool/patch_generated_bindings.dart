@@ -40,12 +40,12 @@
 import 'dart:io';
 
 void main(List<String> args) {
-  final path = args.isNotEmpty
-      ? args.first
-      : 'lib/src/generated/cera_ffi.dart';
+  final path = args.isNotEmpty ? args.first : 'lib/src/generated/cera_ffi.dart';
   final file = File(path);
   if (!file.existsSync()) {
-    stderr.writeln('patch_generated_bindings: $path not found — run `just dart-bindings` first.');
+    stderr.writeln(
+      'patch_generated_bindings: $path not found — run `just dart-bindings` first.',
+    );
     exit(1);
   }
 
@@ -110,7 +110,9 @@ void main(List<String> args) {
   if (src.contains(openBad)) {
     src = src.replaceAll(openBad, openGood);
     applied += 1;
-    stdout.writeln('  fixed native-library resolution (delegates to CeraLibrary.open)');
+    stdout.writeln(
+      '  fixed native-library resolution (delegates to CeraLibrary.open)',
+    );
   }
 
   // Fix 5: RustBuffer / rust_future symbol names. The generator emits the
@@ -125,7 +127,9 @@ void main(List<String> args) {
   if (symHits > 0) {
     src = src.replaceAll(symBad, symGood);
     applied += symHits;
-    stdout.writeln('  fixed rustbuffer/rust_future symbol names ($symHits sites)');
+    stdout.writeln(
+      '  fixed rustbuffer/rust_future symbol names ($symHits sites)',
+    );
   }
 
   // Fix 6: EngineConfig record encoding. The generator stubs the writer for
@@ -153,7 +157,9 @@ void main(List<String> args) {
   if (src.contains(writeStub)) {
     src = src.replaceAll(writeStub, writeImpl);
     applied += 1;
-    stdout.writeln('  implemented _uniffiWriteEngineConfig (record with handle field)');
+    stdout.writeln(
+      '  implemented _uniffiWriteEngineConfig (record with handle field)',
+    );
   }
   const encodeStub =
       "Uint8List _uniffiEncodeEngineConfig(EngineConfig value) {\n"

@@ -25,38 +25,46 @@ Future<void> main(List<String> args) async {
       bundleRepo: null,
     ),
   );
-  final session = engine.newSession(const SessionConfig(
-    maxSeqLen: null,
-    kvCompression: KvCompressionNone(),
-    nKeep: 0,
-    seed: null,
-    ubatchSize: 512,
-  ));
+  final session = engine.newSession(
+    const SessionConfig(
+      maxSeqLen: null,
+      kvCompression: KvCompressionNone(),
+      nKeep: 0,
+      seed: null,
+      ubatchSize: 512,
+    ),
+  );
   session.appendText(prompt);
 
   // Prove the event loop stays live while Rust decodes: tick a timer.
   var ticks = 0;
-  final ticker = Stream.periodic(const Duration(milliseconds: 200), (i) => i)
-      .listen((_) => ticks++);
+  final ticker = Stream.periodic(
+    const Duration(milliseconds: 200),
+    (i) => i,
+  ).listen((_) => ticks++);
 
   print('awaiting generateAsync …');
-  final out = await session.generateAsync(const GenerateOpts(
-    maxTokens: 24,
-    temperature: 0.0,
-    topP: 1.0,
-    topK: 0,
-    minP: 0.0,
-    repetitionPenalty: 1.0,
-    stopTokens: <int>[],
-    grammar: null,
-    grammarTriggerTokens: <int>[],
-    flushEveryTokens: 0,
-    flushEveryMs: 0,
-  ));
+  final out = await session.generateAsync(
+    const GenerateOpts(
+      maxTokens: 24,
+      temperature: 0.0,
+      topP: 1.0,
+      topK: 0,
+      minP: 0.0,
+      repetitionPenalty: 1.0,
+      stopTokens: <int>[],
+      grammar: null,
+      grammarTriggerTokens: <int>[],
+      flushEveryTokens: 0,
+      flushEveryMs: 0,
+    ),
+  );
   await ticker.cancel();
 
-  print('generateAsync done: ${out.tokens.length} tokens, '
-      '${out.summary.decodeMs}ms, event-loop ticks during decode=$ticks');
+  print(
+    'generateAsync done: ${out.tokens.length} tokens, '
+    '${out.summary.decodeMs}ms, event-loop ticks during decode=$ticks',
+  );
 
   // generateStreamingAsync mixes async + a callback sink. cera runs the sink on
   // a tokio worker thread; the ModalitySink vtable uses NativeCallable.listener,
@@ -80,7 +88,9 @@ Future<void> main(List<String> args) async {
     ),
     sink,
   );
-  print('generateStreamingAsync done: ${sink.count} tokens, finish=${sink.finish}');
+  print(
+    'generateStreamingAsync done: ${sink.count} tokens, finish=${sink.finish}',
+  );
   exit(0);
 }
 

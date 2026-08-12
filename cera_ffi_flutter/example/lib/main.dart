@@ -36,10 +36,7 @@ class CeraExampleApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Cera Example',
-      theme: ThemeData(
-        colorSchemeSeed: Colors.indigo,
-        useMaterial3: true,
-      ),
+      theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
       home: const ChatPage(),
     );
   }
@@ -191,20 +188,22 @@ class _ChatPageState extends State<ChatPage> {
     _finishTurn = () {
       if (!done.isCompleted) done.complete();
     };
-    final sub = cera.generate(framed, maxTokens: 256).listen(
-      (piece) {
-        setState(() => _turns.last.text += piece);
-        _scrollToBottom();
-      },
-      onError: (Object err) {
-        setState(() => _turns.last.text = 'Error: $err');
-        if (!done.isCompleted) done.complete();
-      },
-      onDone: () {
-        if (!done.isCompleted) done.complete();
-      },
-      cancelOnError: true,
-    );
+    final sub = cera
+        .generate(framed, maxTokens: 256)
+        .listen(
+          (piece) {
+            setState(() => _turns.last.text += piece);
+            _scrollToBottom();
+          },
+          onError: (Object err) {
+            setState(() => _turns.last.text = 'Error: $err');
+            if (!done.isCompleted) done.complete();
+          },
+          onDone: () {
+            if (!done.isCompleted) done.complete();
+          },
+          cancelOnError: true,
+        );
     if (!mounted) {
       await sub.cancel();
       return;
@@ -354,7 +353,9 @@ class _Bubble extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         constraints: const BoxConstraints(maxWidth: 520),
         decoration: BoxDecoration(
-          color: turn.isUser ? scheme.primaryContainer : scheme.surfaceContainerHighest,
+          color: turn.isUser
+              ? scheme.primaryContainer
+              : scheme.surfaceContainerHighest,
           borderRadius: BorderRadius.circular(14),
         ),
         child: Text(turn.text.isEmpty ? '…' : turn.text),

@@ -58,8 +58,10 @@ CeraCapabilities _capabilitiesOf(ModalityCapabilities caps) => CeraCapabilities(
 const bool supportsPaths = true;
 
 /// Opens a model from the filesystem. See [Cera.openPath].
-Future<Cera> openPath(String path, CeraOptions options) async =>
-    _NativeCera(await CeraEngine.fromPathAsync(path, _configOf(options)), options);
+Future<Cera> openPath(String path, CeraOptions options) async => _NativeCera(
+  await CeraEngine.fromPathAsync(path, _configOf(options)),
+  options,
+);
 
 /// Opens a model from memory. See [Cera.openBytes].
 ///
@@ -73,7 +75,12 @@ Future<Cera> openBytes(
   Uint8List? mmproj,
   String? inferenceType,
 ) async => _NativeCera(
-  await CeraEngine.fromPartsAsync(bytes, mmproj, inferenceType, _configOf(options)),
+  await CeraEngine.fromPartsAsync(
+    bytes,
+    mmproj,
+    inferenceType,
+    _configOf(options),
+  ),
   options,
 );
 
@@ -151,7 +158,9 @@ class _NativeCera implements Cera {
     // is exactly "is the KV cache empty", and only the session knows: a prompt
     // can be rejected before any of it lands (cache untouched) or fail partway
     // through prefill (cache advanced), and the two need opposite answers.
-    if (_session.position() == 0 && bos != null && (ids.isEmpty || ids.first != bos)) {
+    if (_session.position() == 0 &&
+        bos != null &&
+        (ids.isEmpty || ids.first != bos)) {
       return [bos, ...ids];
     }
     return ids;
@@ -290,7 +299,9 @@ class _NativeCera implements Cera {
   }) async {
     _ensureOpen();
     return _engine.applyChatTemplate(
-      messages.map((m) => ChatMessage(role: m.role, content: m.content)).toList(),
+      messages
+          .map((m) => ChatMessage(role: m.role, content: m.content))
+          .toList(),
       addGenerationPrompt,
     );
   }
@@ -442,9 +453,10 @@ class _StreamingSink implements ModalitySink {
     // Hold back a trailing replacement char: it means the last token is half a
     // character, and the next one completes it. A genuine U+FFFD in the model's
     // output is merely delayed by one token.
-    final stable = full.endsWith(_replacement)
-        ? full.substring(0, full.length - _replacement.length)
-        : full;
+    final stable =
+        full.endsWith(_replacement)
+            ? full.substring(0, full.length - _replacement.length)
+            : full;
     if (stable.length > _emitted) {
       emit(stable.substring(_emitted));
       _emitted = stable.length;

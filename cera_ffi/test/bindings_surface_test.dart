@@ -71,8 +71,13 @@ void main() {
     expect(
       CeraEngine.fromPartsAsync,
       isA<
-          Future<CeraEngine> Function(
-              Uint8List, Uint8List?, String?, EngineConfig)>(),
+        Future<CeraEngine> Function(
+          Uint8List,
+          Uint8List?,
+          String?,
+          EngineConfig,
+        )
+      >(),
     );
   });
 
@@ -82,8 +87,10 @@ void main() {
     // static type is the regression signal: a stub body that threw would still
     // satisfy `Future<CeraEngine>` if the wrapper were marked `async`, but the
     // tear-off's type would not survive the generator dropping the ctor.
-    expect(CeraEngine.fromBundleIdAsync,
-        isA<Future<CeraEngine> Function(String, String, EngineConfig)>());
+    expect(
+      CeraEngine.fromBundleIdAsync,
+      isA<Future<CeraEngine> Function(String, String, EngineConfig)>(),
+    );
   });
 }
 
@@ -93,18 +100,21 @@ void main() {
 /// disk. Only static resolution matters, and that happens whether or not the
 /// body runs.
 void Function(CeraEngine) get _surfaceGuard => (CeraEngine engine) {
-      // String returns.
-      engine.decodeTokens(const <int>[]);
-      engine.applyChatTemplate(const <ChatMessage>[], true);
-      engine.applyChatTemplateWithTools(
-          const <ChatMessage>[], const <ToolDef>[], true);
-      engine.transcribe(const <double>[], 16000);
-      // Sequence returns.
-      engine.encodeText('');
-      engine.encodeTextSpecial('', false);
-      // Optional-enum return.
-      engine.toolFormat();
-    };
+  // String returns.
+  engine.decodeTokens(const <int>[]);
+  engine.applyChatTemplate(const <ChatMessage>[], true);
+  engine.applyChatTemplateWithTools(
+    const <ChatMessage>[],
+    const <ToolDef>[],
+    true,
+  );
+  engine.transcribe(const <double>[], 16000);
+  // Sequence returns.
+  engine.encodeText('');
+  engine.encodeTextSpecial('', false);
+  // Optional-enum return.
+  engine.toolFormat();
+};
 
 /// The same guard for `Session`, which the RustBuffer regression hit just as
 /// hard as `CeraEngine`. The `hiddenStates*` trio is the reason this matters
@@ -112,21 +122,21 @@ void Function(CeraEngine) get _surfaceGuard => (CeraEngine engine) {
 /// data when `Vec<u8>`'s wire format was wrong in both directions, which a
 /// stub-only check would have called fixed.
 void Function(Session) get _sessionSurfaceGuard => (Session session) {
-      // Record returns.
-      session.capabilities();
-      session.generate(const GenerateOpts());
-      // `Vec<u8>` / `Vec<f32>` returns.
-      session.hiddenStatesForText('');
-      session.hiddenStatesForTokens(const <int>[]);
-      session.hiddenStatesMeanPooled(const <int>[]);
-      // `Vec<u8>` argument alongside an optional-primitive argument.
-      session.appendImage(Uint8List(0), null);
-      session.setImageMaxLongSize(null);
-    };
+  // Record returns.
+  session.capabilities();
+  session.generate(const GenerateOpts());
+  // `Vec<u8>` / `Vec<f32>` returns.
+  session.hiddenStatesForText('');
+  session.hiddenStatesForTokens(const <int>[]);
+  session.hiddenStatesMeanPooled(const <int>[]);
+  // `Vec<u8>` argument alongside an optional-primitive argument.
+  session.appendImage(Uint8List(0), null);
+  session.setImageMaxLongSize(null);
+};
 
 /// And for `BundleRepo`, whose `storeDir` is a plain string return and so was
 /// stubbed by the same renderer gap.
 void Function(BundleRepo) get _bundleRepoSurfaceGuard => (BundleRepo repo) {
-      repo.storeDir();
-      repo.cacheSize();
-    };
+  repo.storeDir();
+  repo.cacheSize();
+};

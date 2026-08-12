@@ -1008,7 +1008,7 @@ jobs:
       # packages: `cera_ffi` with plain `dart` (proving it still resolves
       # without Flutter, which is the reason it exists) and `cera_ffi_flutter`
       # with `flutter`, which it cannot avoid needing. Flutter ships a Dart SDK,
-      # so one install covers both; the `sdk: ^3.3.0` floor is satisfied by any
+      # so one install covers both; the `sdk: ^3.7.0` floor is satisfied by any
       # current stable Flutter.
       - uses: subosito/flutter-action@v2
         with:
@@ -1040,6 +1040,60 @@ jobs:
           if [ -n "${unexpected}" ]; then
             echo "::error::Generated bindings contain unexpected runtime stubs:"
             echo "${unexpected}"
+            exit 1
+          fi
+
+      - name: Format
+        # `dart format` was ungated until now, and the Dart tree had drifted:
+        # 19 of 27 files did not match their own package's style.
+        #
+        # Two traps make this less obvious than `cargo fmt --check`.
+        #
+        # 1. **The style depends on the package's language version**, which
+        #    `dart format` reads from the RESOLVED package config, not from
+        #    `pubspec.yaml`. Below 3.7 it applies the pre-tall-style rules. So
+        #    the same file formats two different ways depending on whether
+        #    `pub get` has run: with no `.dart_tool/` the formatter falls back
+        #    to the newest style and ignores the constraint entirely. Both
+        #    packages were on `^3.3.0` while their code was written tall, so a
+        #    developer running this locally after `pub get` got the opposite
+        #    answer from CI running it on a fresh checkout. They are on `^3.7.0`
+        #    now, which makes the two agree; do not lower it without moving
+        #    this gate too.
+        #
+        #    This step runs after the recipe above precisely so the resolution
+        #    exists and the check means the same thing here as on a laptop.
+        #
+        # 2. **The nested example is its own package** with its own constraint,
+        #    so it is formatted from its own root rather than swept up by the
+        #    parent's run, which would apply the wrong language version to it.
+        #
+        # `lib/src/generated/` is excluded: UniFFI emits it and
+        # `just dart-bindings` patches it, so gating its formatting would fail
+        # CI on every regeneration for a file no human edits. The drift check
+        # above already pins its content exactly, which is the stronger
+        # guarantee. Same exclusion `dart analyze` already makes.
+        run: |
+          set -euo pipefail
+          fail=0
+          check() { # $1 = package dir, $2 = extra grep -v pattern (optional)
+            local dir="$1" skip="${2:-}"
+            local files
+            files=$(cd "$dir" && git ls-files '*.dart' \
+              | grep -v '^lib/src/generated/' \
+              | { [ -n "$skip" ] && grep -v "$skip" || cat; })
+            [ -z "$files" ] && return 0
+            echo "--- $dir"
+            # shellcheck disable=SC2086
+            (cd "$dir" && echo "$files" | xargs dart format --output=none \
+              --set-exit-if-changed) || fail=1
+          }
+          check cera_ffi
+          check cera_ffi_flutter '^example/'
+          (cd cera_ffi_flutter/example && flutter pub get >/dev/null)
+          check cera_ffi_flutter/example
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Dart formatting drift. Run \`just dart-fmt\` and commit."
             exit 1
           fi
 

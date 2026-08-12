@@ -9,8 +9,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  testWidgets('renders the empty state before a model is picked',
-      (WidgetTester tester) async {
+  testWidgets('renders the empty state before a model is picked', (
+    WidgetTester tester,
+  ) async {
     await tester.pumpWidget(const CeraExampleApp());
 
     expect(find.text('Cera'), findsOneWidget);
