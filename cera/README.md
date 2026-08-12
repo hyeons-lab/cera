@@ -111,10 +111,14 @@ at one. Dispatch is on the GGUF `general.architecture` string:
 | `lfm2` | Liquid LFM2 / LFM2.5 (the canonical LeapBundles family) |
 | `qwen2`, `qwen3` | Qwen2 / Qwen2.5 / Qwen3 |
 | `llama` | LLaMA 2/3, and classic Mistral 7B (ships as GGUF arch `llama`) |
-| `granite` | IBM Granite 3.x |
+| `granite` | IBM Granite 3.x, and the dense Granite 4.1 line (3b / 8b / 30b) |
 
 Any other architecture errors out with `unsupported architecture: <name>` (this
-includes the newer `mistral3`/`mistral4` layouts).
+includes the newer `mistral3`/`mistral4` layouts). No Granite 4.0 model loads
+today: the 4.0-H hybrids convert to the separate arch `granitehybrid`; the
+non-hybrid ones (`granite-4.0-micro`, `-1b`, `-350m`) do convert to `granite`,
+but write `attention.head_count_kv` as a per-layer array the loader does not yet
+accept. Granite 4.1 is unaffected.
 
 **Modalities:** text-to-text is fully supported for every architecture above.
 **LFM2-Audio** (`lfm2-audio-v1`, text+audio in/out) also loads. **Vision (VL,
