@@ -1173,6 +1173,7 @@ jobs:
               await cera.reset();
               await cera.cancel();
               await cera.close();
+              await cera.terminate();
             }
           }
 

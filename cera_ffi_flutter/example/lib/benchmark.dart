@@ -291,32 +291,20 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
 
   @override
   void dispose() {
-    // Native only, and the asymmetry is the whole content of this method.
+    // `terminate`, not `close`. The page is gone, so the run has nowhere to
+    // report to, and the orderly shutdown is the one that cannot be relied on
+    // here: on the web `close` waits for a worker that is busy decoding, which
+    // on the CPU backend means waiting out the whole run (~20 seconds at the
+    // rate this page exists to show) with the model still resident.
+    // `terminate` kills the worker outright and takes its heap with it.
     //
-    // Natively `close` cancels the session and the decode stops at its next
-    // between-token check. That is real cancellation and it is safe by
-    // construction: `close` sets its closed flag first, so the sink stops
-    // touching the handles it is about to lose.
+    // The in-flight `await for` then ends with an error, which `_runBenchmark`
+    // already turns into a failed result, and the `mounted` check in [_run]
+    // discards it and stops the loop before a second arm opens anything.
     //
-    // On the web it would be unsafe on one backend and useless on the other.
-    // The worker's `onmessage` is `async`, so a close posted during a GPU
-    // `generateTokens` is dequeued while that call is still awaiting, and the
-    // worker's close frees the session out from under it, which wasm-bindgen
-    // reports as "recursive use of an object detected" (the same re-entry
-    // `_WorkerCera._queue` exists to prevent for generations). The CPU arm has
-    // the opposite shape: its decode is one synchronous wasm call occupying the
-    // worker, so the message cannot be dequeued until the run has finished
-    // regardless, which `Cera.cancel` documents as the reason cancelling is
-    // best-effort there.
-    //
-    // So on the web the arm is left to finish and `_runBenchmark`'s `finally`
-    // closes it, which is the first moment closing is safe there. Either way
-    // the result is discarded by the `mounted` check in [_run] and no second
-    // arm starts.
-    //
-    // Unawaited because dispose cannot be async. Close is idempotent on both
-    // transports, so the `finally` closing it again is a no-op, not a race.
-    if (!kIsWeb) unawaited(_live?.close());
+    // Unawaited because dispose cannot be async, and safe against the
+    // `finally` that will also close this engine: both calls are idempotent.
+    unawaited(_live?.terminate());
     super.dispose();
   }
 
@@ -396,9 +384,9 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
             // continuation, and by then the framework has unmounted the element
             // that `dispose` belonged to.
             //
-            // Safe on the web too, unlike the close in [dispose]: nothing is
-            // generating yet, so there is no in-flight call for the worker's
-            // close to free the session out from under.
+            // `close` rather than the `terminate` in [dispose], because nothing
+            // is generating yet: this is the orderly case, where the engine can
+            // release the model on its own terms.
             if (!mounted && engine != null) unawaited(engine.close());
           },
         );

@@ -553,6 +553,19 @@ class _WorkerCera implements Cera {
     _shutDown(StateError('this Cera engine is closed'));
   }
 
+  @override
+  Future<void> terminate() async {
+    // Straight to the terminate, with no `close` op posted first. That request
+    // is what frees the model politely, and it is also what cannot be served
+    // while a decode is running: the CPU backend will not dequeue it until the
+    // run is over, and the GPU backend would dequeue it mid-call and free a
+    // session the running `generateTokens` still holds. Terminating needs
+    // nothing from the worker, and takes its heap with it.
+    //
+    // Async only to match the interface: there is nothing here to await.
+    _shutDown(StateError('this Cera engine was terminated'));
+  }
+
   /// Terminates the worker and fails everything still waiting on it.
   ///
   /// Idempotent, and the single path to a dead worker: both an explicit

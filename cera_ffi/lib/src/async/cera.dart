@@ -341,6 +341,10 @@ abstract interface class Cera {
   /// returned future waits on a worker reply that cannot be dequeued until the
   /// synchronous decode finishes. Drop the subscription rather than awaiting it
   /// if a Stop button must return promptly.
+  ///
+  /// [terminate] does stop the work itself on every platform, but by destroying
+  /// the engine, so it answers "I am done with this" rather than "stop this
+  /// one generation".
   Future<void> cancel();
 
   /// Releases the model and everything derived from it. Safe to call twice.
@@ -351,6 +355,34 @@ abstract interface class Cera {
   /// keeps its isolate alive. A CLI has to `exit()`; a Flutter app is running
   /// anyway and never notices.
   Future<void> close();
+
+  /// Tears the engine down now, abandoning whatever it was doing.
+  ///
+  /// [close] is the orderly form and the one to reach for: it releases the
+  /// model and, natively, stops the decode at its next between-token check. Use
+  /// this instead when the result no longer has anywhere to go, which in a UI
+  /// means a page that has been disposed.
+  ///
+  /// The difference is the web, where [close] first asks the worker to free the
+  /// model and waits for it to answer. A running decode makes that request
+  /// either slow or unsafe, depending on the backend: the CPU decode is one
+  /// synchronous wasm call occupying the worker, so the message is not
+  /// delivered until the run has finished anyway, while a GPU decode yields
+  /// between tokens and so *can* dequeue it, whereupon freeing the session
+  /// re-enters an object the running call still holds. This skips that request
+  /// and terminates the worker, which the browser does from the outside: it
+  /// needs no cooperation from the code running inside, so it stops a decode of
+  /// either kind, and the worker's whole heap goes with it rather than being
+  /// released call by call.
+  ///
+  /// Natively there is nothing to terminate that [close] does not already do,
+  /// so this is [close].
+  ///
+  /// In-flight work does not simply vanish: a [generate] stream still running
+  /// ends with an error rather than silently, because a caller awaiting one
+  /// deserves to be told the engine went away. Safe to call twice, and safe to
+  /// call after [close].
+  Future<void> terminate();
 }
 
 /// An error raised inside the web worker.

@@ -398,6 +398,14 @@ class _NativeCera implements Cera {
     _session.close();
     _engine.close();
   }
+
+  @override
+  // There is no faster stop here. `close` already cancels the session and drops
+  // every handle, and the decode belongs to a background thread that stops at
+  // its next between-token check either way. The distinction this method draws
+  // exists for the web, where `close` waits on a worker that may be busy; see
+  // `Cera.terminate`.
+  Future<void> terminate() => close();
 }
 
 /// Turns the binding's token-id callbacks into a stream of text.
