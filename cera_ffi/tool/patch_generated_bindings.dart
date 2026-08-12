@@ -143,6 +143,16 @@ void main(List<String> args) {
       "void _uniffiWriteEngineConfig(EngineConfig value, _UniFfiBinaryWriter writer) {\n"
       "  throw UnsupportedError('UniFFI binary encode not fully supported for EngineConfig');\n"
       "}";
+  // The handle is CLONED before being written, exactly as the generator does
+  // for an object passed as a method argument (see `_bundleRepoClone` at the
+  // `bundleRepoInvoke*` call sites). Rust lifts the field with `into_arc`,
+  // which takes ownership: `EngineConfig::try_from` clones the inner repo and
+  // then drops that `Arc`, so writing the raw handle hands over the caller's
+  // only strong reference and leaves the Dart `BundleRepo` dangling the moment
+  // the call returns. `close()` (or the finalizer) then frees a slot Rust has
+  // already freed and something else may have taken. `BundleRepoFfiCodec.lower`
+  // deliberately does NOT clone, which is right for its other uses, so the
+  // clone belongs here at the ownership transfer.
   const writeImpl =
       "void _uniffiWriteEngineConfig(EngineConfig value, _UniFfiBinaryWriter writer) {\n"
       "  writer.writeU64(value.contextSize);\n"
@@ -151,7 +161,22 @@ void main(List<String> args) {
       "    writer.writeI8(0);\n"
       "  } else {\n"
       "    writer.writeI8(1);\n"
-      "    writer.writeU64(BundleRepoFfiCodec.lower(value.bundleRepo!));\n"
+      "    final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();\n"
+      "    try {\n"
+      "      cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;\n"
+      "      cloneStatusPtr.ref.errorBuf\n"
+      "        ..capacity = 0\n"
+      "        ..len = 0\n"
+      "        ..data = ffi.nullptr;\n"
+      "      final clonedHandle = _bindings()._bundleRepoClone(\n"
+      "          BundleRepoFfiCodec.lower(value.bundleRepo!), cloneStatusPtr);\n"
+      "      if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {\n"
+      "        throw StateError('UniFFI clone failed with status \${cloneStatusPtr.ref.code}');\n"
+      "      }\n"
+      "      writer.writeU64(clonedHandle);\n"
+      "    } finally {\n"
+      "      calloc.free(cloneStatusPtr);\n"
+      "    }\n"
       "  }\n"
       "}";
   if (src.contains(writeStub)) {

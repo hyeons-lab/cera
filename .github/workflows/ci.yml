@@ -1231,8 +1231,16 @@ jobs:
           test -s web/cera/cera_worker.js
           echo "install_web OK"
 
+      # The generator is upstream + `third_party/uniffi-bindgen-dart/patches/`,
+      # materialized on demand, so the manifest only exists under `build/`
+      # once it has been built. `dart-bindings-check` above already
+      # materialized it (and would have failed had a patch stopped applying);
+      # `vendor-generator` is repeated here only so this step does not depend
+      # on that ordering, and is a stamp hit when it holds.
       - name: Generator unit tests
-        run: cargo test --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml
+        run: |
+          just vendor-generator
+          cargo test --manifest-path third_party/uniffi-bindgen-dart/build/Cargo.toml
 
   flutter-desktop-build:
     # Builds the Flutter example app for the desktop platforms, which is the

@@ -2357,7 +2357,22 @@ void _uniffiWriteEngineConfig(EngineConfig value, _UniFfiBinaryWriter writer) {
     writer.writeI8(0);
   } else {
     writer.writeI8(1);
-    writer.writeU64(BundleRepoFfiCodec.lower(value.bundleRepo!));
+    final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+    try {
+      cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      cloneStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final clonedHandle = _bindings()._bundleRepoClone(
+          BundleRepoFfiCodec.lower(value.bundleRepo!), cloneStatusPtr);
+      if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+        throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+      }
+      writer.writeU64(clonedHandle);
+    } finally {
+      calloc.free(cloneStatusPtr);
+    }
   }
 }
 
@@ -10938,7 +10953,7 @@ final class _DownloadProgressSinkTraitCallbackBridge {
 
   DownloadProgressSink? lookup(int handle) => _callbacks[handle];
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)> _freeNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)>.isolateLocal((int handle) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)> _freeNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)>.listener((int handle) {
     instance.release(handle);
   });
 
@@ -10960,31 +10975,17 @@ final class _DownloadProgressSinkTraitCallbackBridge {
     _bindings()._uniFfiRustBufferFree(buf, _freeArgStatus);
   }
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)> _onProgressNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>.isolateLocal((int handle, _UniFfiRustBuffer url, int bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)> _onProgressNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer url, int bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus) {
     final DownloadProgressSink? callback = instance.lookup(handle);
     if (callback == null) {
       _uniffiFreeArgBuffer(url);
       _uniffiFreeArgBuffer(totalBytes);
-      outStatus.ref.code = _uniFfiRustCallStatusUnexpectedError;
-      outStatus.ref.errorBuf
-        ..capacity = 0
-        ..len = 0
-        ..data = ffi.nullptr;
       return;
     }
     try {
       callback.onProgress(utf8.decode(url.data.asTypedList(url.len)), bytesDownloaded, (() { final r = _UniFfiBinaryReader(totalBytes.data.asTypedList(totalBytes.len)); return r.readI8() == 0 ? null : r.readU64(); })());
-      outStatus.ref.code = _uniFfiRustCallStatusSuccess;
-      outStatus.ref.errorBuf
-        ..capacity = 0
-        ..len = 0
-        ..data = ffi.nullptr;
     } catch (_) {
-      outStatus.ref.code = _uniFfiRustCallStatusUnexpectedError;
-      outStatus.ref.errorBuf
-        ..capacity = 0
-        ..len = 0
-        ..data = ffi.nullptr;
+      // async listener: no channel to report a Dart error to Rust
     } finally {
       _uniffiFreeArgBuffer(url);
       _uniffiFreeArgBuffer(totalBytes);

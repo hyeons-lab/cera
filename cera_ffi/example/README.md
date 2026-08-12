@@ -22,7 +22,7 @@ CERA_FFI_LIB=../target/debug/libcera_ffi.dylib \
 | `cera_generate.dart` | Minimal synchronous generate, token IDs only |
 | `cera_async.dart` | `generateAsync` + `generateStreamingAsync` (recommended streaming path) |
 | `cera_stream.dart` | Synchronous `generateStreaming`, and why you must drain the event loop |
-| `cera_progress.dart` | `BundleRepo.withProgress` download progress callbacks |
+| `cera_progress.dart` | `BundleRepo.withProgress` download progress callbacks, via `fromBundleIdAsync` (downloads a full bundle; it cannot be aborted) |
 
 They print to stdout by design; `analysis_options.yaml` disables `avoid_print`
 for that reason rather than excluding the directory from analysis, so these

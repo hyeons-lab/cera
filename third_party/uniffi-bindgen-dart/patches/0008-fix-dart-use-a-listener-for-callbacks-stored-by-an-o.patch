@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cera <cera@local>
+Date: Tue, 11 Aug 2026 14:25:32 -0700
+Subject: fix(dart): use a listener for callbacks stored by an object
+ constructor
+
+A callback trait was treated as cross-thread only when it appeared as an
+argument to an async function or method. A callback handed to an object's
+CONSTRUCTOR is stored for that object's lifetime, so whether the constructor
+itself is async says nothing about which thread later invokes it.
+
+Concretely: a download-progress sink reaches Rust through the synchronous
+BundleRepo::with_progress and therefore never appears in an async argument
+list, yet is invoked from a tokio blocking worker as soon as the repo is handed
+to an async loader. It was left on NativeCallable.isolateLocal, which is
+undefined behaviour off the isolate's own thread.
+
+Scanning constructor arguments unconditionally is the narrow fix: a stored
+callback outlives the call that installed it, so `is_async` on that call is not
+the right question.
+---
+ Cargo.toml                 |  7 +++++--
+ src/dart/render_objects.rs | 36 +++++++++++++++++++++++++++++-------
+ 2 files changed, 34 insertions(+), 9 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index bb9b59d..7195f8d 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,8 +1,11 @@
+ # Vendored from https://github.com/nchapman/uniffi-bindgen-dart @ v0.1.3
+ # (crate `ubdg_bindgen`, the `uniffi-bindgen-dart` binary), flattened to a
+ # standalone crate. Local modifications: callback-interface argument lowering
+-# + Option<primitive> support for streaming (see src/dart/callback.rs). These
+-# fixes are to be upstreamed; this vendored copy is the interim source.
++# + Option<primitive> support for streaming (see src/dart/callback.rs), and
++# the `listener` vs `isolateLocal` choice for callback vtables (see
++# `callback_traits_used_async` in src/dart/render_objects.rs, which also
++# covers callbacks stored by an object constructor). These fixes are to be
++# upstreamed; this vendored copy is the interim source.
+ #
+ # Its own `[workspace]` table keeps it OUT of the parent cera workspace so
+ # `cargo run --manifest-path …` builds it independently.
+diff --git a/src/dart/render_objects.rs b/src/dart/render_objects.rs
+index f6a8b4e..061a03c 100644
+--- a/src/dart/render_objects.rs
++++ b/src/dart/render_objects.rs
+@@ -2,11 +2,27 @@ use super::config::CustomTypeConfig;
+ use super::*;
+ use std::collections::{HashMap, HashSet};
+ 
+-/// Names of foreign-implementable (callback-trait) objects that are passed as an
+-/// argument to at least one ASYNC function or method. Such callbacks are invoked
+-/// by Rust from a non-isolate thread, so their Dart vtable must use
+-/// `NativeCallable.listener`. Interfaces used only by synchronous APIs are left
+-/// on `isolateLocal` (synchronous, same-thread delivery).
++/// Names of foreign-implementable (callback-trait) objects that Rust may invoke
++/// from a thread that is not the Dart isolate's. Their vtables must use
++/// `NativeCallable.listener` (cross-thread, queued delivery); invoking an
++/// `isolateLocal` callable from a foreign thread is undefined behaviour.
++/// Interfaces that can only ever be called on the isolate's own thread stay on
++/// `isolateLocal`, which delivers synchronously and in-line.
++///
++/// Two shapes qualify:
++///
++/// 1. **An argument to an async function or method.** Rust runs the body on a
++///    runtime worker and calls back from there.
++///
++/// 2. **An argument to an object's constructor.** A constructor *stores* the
++///    callback for the object's lifetime rather than consuming it within the
++///    call, so every later use is a potential foreign-thread call and the
++///    constructor's own sync/async-ness says nothing about them. `BundleRepo`
++///    is the case in point: `with_progress` is synchronous, but the sink it
++///    keeps is invoked from a tokio blocking worker as soon as the repo is
++///    handed to `CeraEngine::from_bundle_id_async`. Scanning only argument
++///    lists of async signatures misses that entirely, because the sink never
++///    appears in one.
+ fn callback_traits_used_async(objects: &[UdlObject], functions: &[UdlFunction]) -> HashSet<String> {
+     let trait_names: HashSet<&str> = objects
+         .iter()
+@@ -14,8 +30,8 @@ fn callback_traits_used_async(objects: &[UdlObject], functions: &[UdlFunction])
+         .map(|o| o.name.as_str())
+         .collect();
+     let mut used = HashSet::new();
+-    let mut scan = |is_async: bool, args: &[UdlArg]| {
+-        if !is_async {
++    let mut scan = |foreign_thread: bool, args: &[UdlArg]| {
++        if !foreign_thread {
+             return;
+         }
+         for a in args {
+@@ -33,6 +49,12 @@ fn callback_traits_used_async(objects: &[UdlObject], functions: &[UdlFunction])
+         for m in &o.methods {
+             scan(m.is_async, &m.args);
+         }
++        // Unconditionally, per (2) above: a stored callback outlives the call
++        // that installed it, so `is_async` on the constructor is not the
++        // question.
++        for c in &o.constructors {
++            scan(true, &c.args);
++        }
+     }
+     used
+ }

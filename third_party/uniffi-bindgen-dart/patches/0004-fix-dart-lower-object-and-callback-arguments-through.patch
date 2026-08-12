@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cera <cera@local>
+Date: Tue, 11 Aug 2026 14:25:31 -0700
+Subject: fix(dart): lower object and callback arguments through their FfiCodec
+
+An object argument was written straight into the u64 union field, which neither
+type-checks nor links for a Dart-implemented trait.
+
+Lowering through the generated FfiCodec returns the handle for a Rust-backed
+instance and, for a Dart-backed one, registers the callback in the handle map
+and installs its vtable before returning the handle. That is what allows a sink
+to be passed INTO a Rust method at all.
+---
+ src/dart/ffi_buffer.rs | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/dart/ffi_buffer.rs b/src/dart/ffi_buffer.rs
+index 8e84591..b41892f 100644
+--- a/src/dart/ffi_buffer.rs
++++ b/src/dart/ffi_buffer.rs
+@@ -381,6 +381,22 @@ pub(super) fn render_ffibuffer_primitive_arg_write(
+     custom_types: &HashMap<String, CustomTypeConfig>,
+ ) {
+     let arg_name = safe_dart_identifier(&to_lower_camel(&arg.name));
++
++    // Object arguments (including foreign-implementable trait callbacks such as
++    // a streaming/progress sink passed INTO a Rust method): lower through the
++    // object's generated FfiCodec. For a Rust-backed instance the codec returns
++    // its handle; for a Dart-implemented trait it registers the callback in the
++    // handle map and installs the vtable (touching the init-done field), then
++    // returns the handle. Writing the raw Dart object to the u64 union field
++    // (the previous behaviour) neither type-checks nor links.
++    if let Some(obj_name) = object_name_from_type(&arg.type_) {
++        let codec = format!("{}FfiCodec", to_upper_camel(obj_name));
++        out.push_str(&format!(
++            "      (argBuf + {offset}).ref.u64 = {codec}.lower({arg_name});\n"
++        ));
++        return;
++    }
++
+     // Apply lower transform for custom types backed by primitives.
+     let lowered_arg = if let Type::Custom { name, .. } = &arg.type_ {
+         if let Some(cfg) = custom_types.get(name.as_str()) {
