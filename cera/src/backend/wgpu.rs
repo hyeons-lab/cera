@@ -1247,8 +1247,9 @@ pub mod shaders {
     /// stage: windowed overlap-add of the iDFT frames into PCM, one thread per
     /// output sample. A portable position-indexed reduction, no `__target_switch`.
     pub const OVERLAP_ADD: &str = include_str!(concat!(env!("OUT_DIR"), "/overlap_add.wgsl"));
-    // LFM2A audio-encoder (Conformer) kernels. Generated from
-    // `shaders/slang/*.slang` by build.rs and shared with the Metal backend's
+    // LFM2A audio kernels: the Conformer encoder body and the log-mel
+    // front-end below it. Generated from `shaders/slang/*.slang` by build.rs
+    // and shared with the Metal backend's
     // `metal::shaders::*` twins.
     //
     // The encoder forward pass itself is Metal-only for now; these are the WGSL
@@ -1284,6 +1285,16 @@ pub mod shaders {
     /// handwritten; only its softmax reduction has a `__target_switch`.
     pub const AUDIO_XL_ATTENTION: &str =
         include_str!(concat!(env!("OUT_DIR"), "/audio_xl_attention.wgsl"));
+    /// Framing pass of the log-mel front-end: center padding, pre-emphasis and
+    /// the Hann window folded into one gather.
+    pub const STFT_FRAME: &str = include_str!(concat!(env!("OUT_DIR"), "/stft_frame.wgsl"));
+    /// Per-frame power spectrum as a direct DFT against a host-built twiddle
+    /// table, standing in for the CPU path's rustfft.
+    pub const POWER_SPEC: &str = include_str!(concat!(env!("OUT_DIR"), "/power_spec.wgsl"));
+    /// Mel filterbank projection plus the natural-log floor, emitting mel-major.
+    pub const MEL_PROJECT: &str = include_str!(concat!(env!("OUT_DIR"), "/mel_project.wgsl"));
+    /// Per-feature (per-mel-bin) normalization, transposing back to time-major.
+    pub const MEL_NORM: &str = include_str!(concat!(env!("OUT_DIR"), "/mel_norm.wgsl"));
     /// Generated from `shaders/slang/per_head_rmsnorm.slang` by build.rs and
     /// shared with the Metal backend's
     /// `metal::shaders::PER_HEAD_RMSNORM`. A `__target_switch`

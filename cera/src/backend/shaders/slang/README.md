@@ -22,14 +22,15 @@ pins each one against the CPU reference.
 
 The exceptions, and why:
 
-- **The LFM2A audio-encoder tier is Metal-live and WGSL-inert.**
-  `conv2d_direct`, `transpose_blocked`, `glu_split`, `chan_affine_silu`,
-  `activations` and `audio_xl_attention` are dispatched by the Metal audio
-  encoder (`model/audio_encoder_gpu.rs`) and pinned numerically against the CPU
-  encoder by `tests/audio_encoder_metal_parity.rs`. Their WGSL halves are
+- **The LFM2A audio tier is Metal-live and WGSL-inert.** Ten kernels: the
+  Conformer body (`conv2d_direct`, `transpose_blocked`, `glu_split`,
+  `chan_affine_silu`, `activations`, `audio_xl_attention`) and the log-mel
+  front-end (`stft_frame`, `power_spec`, `mel_project`, `mel_norm`). All are
+  dispatched by the Metal audio encoder (`model/audio_encoder_gpu.rs`) and pinned
+  numerically by `tests/audio_encoder_metal_parity.rs`. Their WGSL halves are
   generated, committed and drift-checked like everything else here, but nothing
   dispatches them yet: the wgpu audio encoder is a later change. So for these
-  six, `slang_multitarget_parity.rs` carries only generation checks (entry points
+  ten, `slang_multitarget_parity.rs` carries only generation checks (entry points
   present, no subgroup ops, no `enable f16`), and wiring wgpu means adding
   numeric cases, not just an ops impl. They are written as one source rather than
   handwritten pairs precisely so that is the only work left.
