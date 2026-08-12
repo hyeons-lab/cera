@@ -7,8 +7,11 @@
 //!
 //! Iterates every fixture set under `tests/fixtures/oracle/<model>/`; each
 //! `index.json` names its `model_file`, looked up under `target/oracle/models/`
-//! (override the dir with `CERA_ORACLE_MODELS_DIR`). A model whose GGUF is absent
-//! is skipped, so CI (which has neither the models nor llama.cpp) passes.
+//! (override the dir with `CERA_ORACLE_MODELS_DIR`). The whole suite is inert
+//! unless `CERA_ORACLE=1` is set, which no CI workflow does, so CI never reaches
+//! it regardless of which fixtures happen to be on the runner. Once that opt-in
+//! IS set, an absent GGUF is a hard failure rather than a skip: see the
+//! assertion in `text_models_match_llama_cpp_oracle`.
 //!
 //! Two gates per prompt, plus one informational signal:
 //!   1. tokenizer parity   — cera's `encode` matches llama.cpp's input tokens
@@ -28,7 +31,7 @@
 //! Gated behind `CERA_ORACLE=1` and `#[ignore]`. Run:
 //!   CERA_ORACLE=1 cargo test -p cera --release --test oracle_text -- --ignored --nocapture
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use cera::gguf::GgufFile;
@@ -104,11 +107,20 @@ fn encode_with_bos(tok: &BpeTokenizer, want_tokens: &[u32], prompt: &str) -> Vec
     }
 }
 
-/// Validate one model's fixture set. Returns failure strings (empty = pass);
-/// `None` if the model GGUF is absent (skipped).
-fn check_model(fixture_dir: &std::path::Path) -> Option<Vec<String>> {
-    // Committed fixtures must parse — corruption is a hard failure, not a skip.
-    // The *only* intended skip is the model GGUF being absent (CI / no download).
+/// Outcome of validating one model's fixture set.
+enum ModelOutcome {
+    /// The GGUF was present and every prompt ran. Carries the gate failures,
+    /// empty meaning pass.
+    Checked(Vec<String>),
+    /// The GGUF was absent, so nothing in this fixture set was verified. Fatal
+    /// at the call site rather than here, so one message can name all of them.
+    /// The path already ends in the file name, so it carries both.
+    Absent { path: PathBuf },
+}
+
+/// Validate one model's fixture set.
+fn check_model(fixture_dir: &std::path::Path) -> ModelOutcome {
+    // Committed fixtures must parse; corruption is a hard failure.
     let index_path = fixture_dir.join("index.json");
     let index: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&index_path)
@@ -118,8 +130,7 @@ fn check_model(fixture_dir: &std::path::Path) -> Option<Vec<String>> {
     let model_file = index["model_file"].as_str().unwrap();
     let mp = models_dir().join(model_file);
     if !mp.exists() {
-        eprintln!("skipping {model_file}: not found at {}", mp.display());
-        return None;
+        return ModelOutcome::Absent { path: mp };
     }
     eprintln!("=== oracle model: {} ===", mp.display());
 
@@ -322,7 +333,20 @@ fn check_model(fixture_dir: &std::path::Path) -> Option<Vec<String>> {
             );
         }
     }
-    Some(failures)
+    // Prefix each failure with the fixture set it came from. The sets share most
+    // of their prompt file names (`1-2-3.json`, `the-capital-of-france-is.json`,
+    // …), so an unprefixed line cannot be attributed to a model once the caller
+    // is looking at failures from more than one.
+    let set_name = fixture_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| fixture_dir.display().to_string());
+    ModelOutcome::Checked(
+        failures
+            .into_iter()
+            .map(|f| format!("{set_name} {f}"))
+            .collect(),
+    )
 }
 
 #[test]
@@ -342,24 +366,61 @@ fn text_models_match_llama_cpp_oracle() {
     assert!(!dirs.is_empty(), "no oracle fixture sets found");
 
     let mut all_failures = Vec::new();
-    let mut ran = 0usize;
+    // A BTreeSet, not a Vec: `llama-3_2-1b` and `llama-3_2-1b-long` are two
+    // fixture sets over one GGUF, so a Vec would name that file twice and
+    // inflate the count. Ordering by path keeps the report deterministic.
+    let mut missing: BTreeSet<PathBuf> = BTreeSet::new();
     for dir in &dirs {
-        if let Some(failures) = check_model(dir) {
-            ran += 1;
-            all_failures.extend(failures);
+        match check_model(dir) {
+            ModelOutcome::Checked(failures) => all_failures.extend(failures),
+            ModelOutcome::Absent { path } => {
+                missing.insert(path);
+            }
         }
     }
 
-    if ran == 0 {
-        eprintln!(
-            "skipping: no oracle models under {}",
-            models_dir().display()
-        );
-        return;
+    // An absent GGUF is fatal here, unlike the `CERA_REQUIRE_MODEL` opt-in the
+    // sibling suites use. CI sets that variable in the `gpu-tests` job, whose
+    // wgpu LFM2 step needs only `core`-tier fixtures, and pointedly leaves it
+    // unset in `batched-prefill-parity`, which fetches only `core` on a pull
+    // request while granite/llama3/qwen2/qwen3 are `arch` tier, so absence is a
+    // legitimate skip there. (Cited by job name, not line: ci.yml's line numbers
+    // shift often enough that a line citation goes stale between branches.)
+    // This suite is different: no workflow sets `CERA_ORACLE`, so it runs only
+    // when a human asks, and absence then means the caller wanted coverage and
+    // silently did not get it. Skipping reports the identical green as a real
+    // run, which is how the whole fixture set went unnoticed after macOS purged
+    // `target/` (cargo marks it `CACHEDIR.TAG`, and the fetch script's default
+    // dest lives inside it).
+    //
+    // Both conditions are reported together: gate failures are only collected,
+    // never printed as they happen, so failing on `missing` alone would discard
+    // a real regression found on the models that WERE present and send the
+    // caller off to download several GB before they ever saw it.
+    let mut report = Vec::new();
+    if !missing.is_empty() {
+        report.push(format!(
+            "{} required oracle model(s) absent:\n  {}\n\
+             Fetch them with `scripts/fetch_test_models.sh --set all --dest {}`, \
+             or point CERA_ORACLE_MODELS_DIR at a directory that already has them.",
+            missing.len(),
+            missing
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n  "),
+            models_dir().display(),
+        ));
+    }
+    if !all_failures.is_empty() {
+        report.push(format!(
+            "gate failures on the model(s) that were present:\n{}",
+            all_failures.join("\n"),
+        ));
     }
     assert!(
-        all_failures.is_empty(),
-        "oracle gate failures:\n{}",
-        all_failures.join("\n")
+        report.is_empty(),
+        "CERA_ORACLE=1 oracle run did not pass:\n\n{}",
+        report.join("\n\n"),
     );
 }
