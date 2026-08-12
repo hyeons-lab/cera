@@ -1285,6 +1285,19 @@ jobs:
         shell: bash
         run: cd cera_ffi_flutter/example && flutter pub get && flutter build ${{ matrix.platform }} --debug
 
+      - name: Run the example's widget tests
+        # The example's widget tests existed before this step and nothing ran
+        # them, which made them decoration: a broken route or a renamed action
+        # would have left the benchmark page unreachable with CI still green.
+        #
+        # Linux only. They are pure widget tests over Dart code with no native
+        # dependency, so running them on the Windows leg as well would assert
+        # the same things twice. This leg has already resolved the example, so
+        # the step costs seconds.
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: cd cera_ffi_flutter/example && flutter test
+
       - name: Assert the library was bundled with the app
         # Flutter copies whatever the plugin lists in
         # `<plugin>_bundled_libraries` next to the executable; that placement is

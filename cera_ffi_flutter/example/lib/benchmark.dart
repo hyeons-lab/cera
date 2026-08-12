@@ -10,16 +10,12 @@
 // It runs the same prompt twice, once on each backend, from the same weights,
 // and reports what each cost.
 //
-// ## Why this page opens its own model
+// ## Why this page picks its own model
 //
-// On the web `openBytes` may **transfer** the model's `ArrayBuffer` into the
-// worker, which neuters the caller's view of it. Whether it transfers or copies
-// depends on the list's shape and the compiler, and `Cera.openBytes` explicitly
-// declines to promise either (see `_detach` in
-// `cera_ffi/lib/src/async/cera_web.dart`). Since the caller's bytes may or may
-// not survive a load, two engines need two buffers regardless. Picking here
-// keeps a pristine master and hands each run its own copy, rather than reaching
-// into the chat page's state for bytes that may already be gone.
+// Two engines need two opens, and on the web a load may consume the buffer it
+// is handed, so the chat page's bytes are not something to borrow: see
+// `ModelSource.open`, which owns that rule for both pages. This page keeps its
+// own `ModelSource` and opens it once per arm.
 //
 // ## Native
 //
@@ -30,12 +26,12 @@
 // it did not run.
 
 import 'dart:async' show unawaited;
-import 'dart:typed_data';
 
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+
+import 'model_source.dart';
 
 /// The prompt every run shares.
 ///
@@ -132,16 +128,14 @@ class _BenchResult {
 
 /// Runs one arm: open on `backend`, generate, measure, close.
 ///
-/// Takes an opener rather than a `Cera` because each arm needs its own engine,
-/// and rather than bytes because how the model is opened is platform-specific.
-/// On the web there is no path, so the caller hands over a private copy of the
-/// bytes, for the reason in this file's header. On native the caller opens the
-/// path instead and the engine maps the file: passing bytes there would pull a
-/// multi-gigabyte GGUF through the Dart heap once per arm, for nothing.
+/// Takes an opener rather than a `Cera`, because each arm needs its own engine
+/// and this function is the thing that owns an engine's lifetime. What opening
+/// means per platform is `ModelSource.open`'s business, not this one's.
 ///
 /// `onEngine` receives the engine once it is open and null once it is closed,
-/// so the caller can reach it while it is live. [_BenchmarkPageState.dispose]
-/// is the only reason that hook exists.
+/// so the caller can reach it while it is live. Teardown is the only reason
+/// that hook exists: closing a run the page walked away from, whether it was
+/// mid-generation or still loading.
 Future<_BenchResult> _runBenchmark({
   required Future<Cera> Function(CeraOptions) open,
   required CeraBackend backend,
@@ -207,8 +201,14 @@ Future<_BenchResult> _runBenchmark({
       maxTokens: _maxTokens,
       temperature: 0,
     )) {
-      ttft ??= started.elapsed;
-      lastPiece = started.elapsed;
+      // One read, not two. Reading the stopwatch separately for each would put
+      // a microsecond between them on the first fragment, and a run that
+      // emitted only that fragment would then have a positive span to divide
+      // by: one token over one microsecond, reported as a million tok/s,
+      // instead of the page declining to state a rate it does not have.
+      final at = started.elapsed;
+      ttft ??= at;
+      lastPiece = at;
       buffer.write(piece);
     }
     final total = lastPiece ?? started.elapsed;
@@ -271,15 +271,11 @@ class BenchmarkPage extends StatefulWidget {
 }
 
 class _BenchmarkPageState extends State<BenchmarkPage> {
-  /// Web only. Kept pristine and never handed to an engine directly: every run
-  /// gets a copy, for the reason in this file's header. Null on native, where
-  /// [_path] is used instead.
-  Uint8List? _master;
-
-  /// Native only. Both arms open this path independently and the engine maps
-  /// the file, so no copy of the weights passes through the Dart heap.
-  String? _path;
-  String _modelName = '';
+  /// The picked model, opened once per arm.
+  ///
+  /// Kept whole across both runs rather than consumed by the first, which is
+  /// what `reusable` in [ModelSource.open] is for.
+  ModelSource? _source;
 
   final _results = <_BenchResult>[];
   String? _running;
@@ -327,57 +323,33 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
   Future<void> _pickModel() async {
     setState(() => _picking = true);
     try {
-      final result = await FilePicker.platform.pickFiles(
+      final source = await pickModelSource(
         dialogTitle: 'Choose a .gguf model to benchmark',
-        type: FileType.any,
-        // Bytes only where there is no path to open, for the reason spelled
-        // out on the chat page's picker. Two arms do not change it: each opens
-        // the path itself rather than sharing one read.
-        withData: !Cera.supportsPaths,
       );
       // A cancelled dialog is not a failure and says nothing.
-      final file = result?.files.single;
-      if (file == null || !mounted) return;
-      // `Cera.supportsPaths`, not `file.path != null`. On the web the picker
-      // manufactures a `blob:` URL for the bytes it just read and puts it in
-      // `path` (`file_picker`'s `addPickedFile`: `path: path ?? blobUrl`), so
-      // that field is non-null in a browser and testing it would send every web
-      // run into `Cera.openPath`, which is exactly the call the web does not
-      // have. Ask the API which mode it supports instead, the same question
-      // `withData` above is already asking.
-      final path = Cera.supportsPaths ? file.path : null;
-      if (path == null && file.bytes == null) {
-        // Neither a path nor bytes, which a content URI the picker cannot
-        // resolve will do. Clear the previous pick as well as saying so: a
-        // snackbar fades, and leaving the old model named on screen with Run
-        // still armed would let the next run measure the old file and look
-        // like it had honored the new one.
+      if (source == null || !mounted) return;
+      setState(() {
+        _source = source;
+        _results.clear();
+      });
+    } catch (err) {
+      // Both the picker failing and a file that cannot be read land here, and
+      // neither can be left silent: nothing awaits this method, so the error
+      // would otherwise escape into the zone and the user would see only a
+      // spinner that stopped.
+      //
+      // Drop the previous pick as well as reporting. A snackbar fades, and
+      // leaving the old model named on screen with Run still armed would let
+      // the next run measure the old file and look like it had honored the new
+      // one.
+      if (mounted) {
         setState(() {
-          _path = null;
-          _master = null;
-          _modelName = '';
+          _source = null;
           _results.clear();
         });
         ScaffoldMessenger.of(
           context,
-        ).showSnackBar(SnackBar(content: Text('Could not read ${file.name}.')));
-        return;
-      }
-      setState(() {
-        _path = path;
-        _master = path == null ? file.bytes : null;
-        _modelName = file.name;
-        _results.clear();
-      });
-    } catch (err) {
-      // The picker itself failing (a denied permission, a platform channel
-      // that threw) would otherwise escape into the zone as an unhandled
-      // error, since nothing awaits this method: the spinner would clear and
-      // the user would be told nothing at all.
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Could not open a file: $err')));
+        ).showSnackBar(SnackBar(content: Text('Could not open a model: $err')));
       }
     } finally {
       if (mounted) setState(() => _picking = false);
@@ -385,9 +357,8 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
   }
 
   Future<void> _run() async {
-    final master = _master;
-    final path = _path;
-    if ((master == null && path == null) || _busy) return;
+    final source = _source;
+    if (source == null || _busy) return;
 
     setState(() => _results.clear());
 
@@ -406,12 +377,11 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
       ]) {
         setState(() => _running = label);
         final result = await _runBenchmark(
-          // Native opens the path twice and lets the engine map it. The web has
-          // no path, so each arm gets its own copy of the bytes.
-          open: path != null
-              ? (options) => Cera.openPath(path, options: options)
-              : (options) =>
-                    Cera.openBytes(master!.sublist(0), options: options),
+          // `reusable`, because the second arm opens this same source: natively
+          // that is the same path mapped twice, and on the web it is a fresh
+          // copy of the bytes per arm rather than one buffer the first load may
+          // have taken.
+          open: (options) => source.open(options: options, reusable: true),
           backend: backend,
           label: label,
           onEngine: (engine) {
@@ -476,17 +446,15 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
               ),
               const SizedBox(width: 12),
               FilledButton.icon(
-                onPressed: (_master == null && _path == null) || _busy
-                    ? null
-                    : _run,
+                onPressed: _source == null || _busy ? null : _run,
                 icon: const Icon(Icons.speed),
                 label: const Text('Run'),
               ),
             ],
           ),
-          if (_modelName.isNotEmpty) ...[
+          if (_source case final source?) ...[
             const SizedBox(height: 12),
-            Text('Model: $_modelName', style: theme.textTheme.bodySmall),
+            Text('Model: ${source.name}', style: theme.textTheme.bodySmall),
           ],
           if (_running != null) ...[
             const SizedBox(height: 20),
@@ -567,12 +535,19 @@ class _ResultCard extends StatelessWidget {
               // Says which tokens the span covers, because the rate above is
               // over one fewer of them: the first arrived at TTFT and is
               // counted there. Without that the two lines look like they
-              // should divide into each other, and they do not. A single-token
-              // run has no span to report at all, and saying "the last 0 of
-              // them in 0 ms" would be a worse answer than saying so.
+              // should divide into each other, and they do not.
+              //
+              // Keyed off the rate rather than off the token count, so the two
+              // lines cannot disagree. A run can decode several tokens and
+              // still have no rate, since a fragment is only emitted once it
+              // completes a character: hold one back and the last piece lands
+              // at the same instant as the first, leaving a zero-length span
+              // that "the last N of them in 0 ms" would report as real.
               Text(
-                result.decodeTokens < 2
-                    ? 'Decoded ${result.decodeTokens} token, too short to time'
+                rate == null
+                    ? 'Decoded ${result.decodeTokens} '
+                          '${result.decodeTokens == 1 ? 'token' : 'tokens'}, '
+                          'all at once, so there is no decode rate to report'
                     : 'Decoded ${result.decodeTokens} tokens, the last '
                           '${result.decodeTokens - 1} of them in '
                           '${result.decodeSpan.inMilliseconds} ms',
@@ -625,9 +600,8 @@ class _Speedup extends StatelessWidget {
     // number, so state the slower case as a slowdown and the tie as a tie.
     final ratio = gpuRate / cpuRate;
     final headline = switch (ratio) {
-      _ when ratio >= 1.05 =>
-        'GPU decoded ${ratio.toStringAsFixed(1)}x faster than CPU.',
-      _ when ratio <= 0.95 =>
+      >= 1.05 => 'GPU decoded ${ratio.toStringAsFixed(1)}x faster than CPU.',
+      <= 0.95 =>
         'GPU decoded ${(1 / ratio).toStringAsFixed(1)}x slower than CPU.',
       _ => 'GPU and CPU decoded at about the same rate.',
     };
