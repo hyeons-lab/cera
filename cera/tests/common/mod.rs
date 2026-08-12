@@ -15,11 +15,33 @@
 //! [`dense_model_or_skip`] resolves the dense GGUF the speculative-decoding
 //! suite and LM-head benchmark share, and [`dense_gemm_head_fixture`] loads it
 //! while asserting it actually reaches the batched LM-head projection.
+//!
+//! [`hidden_states_with_lora`] runs a prompt with an optional adapter attached,
+//! shared by the two LoRA suites (`lora_parity`, `moe_lora_parity`).
 
 #![allow(dead_code)]
 
 #[cfg(feature = "remote")]
 pub mod download;
+
+/// Per-token hidden states for `tokens`, with an optional LoRA adapter attached
+/// to the inference state.
+///
+/// Defined here rather than per test binary for the reason `metal_context`
+/// gives: a copy per module is how the copies drift. Both LoRA suites
+/// (`lora_parity`, `moe_lora_parity`) compare a base run against an adapted
+/// one, and the comparison is only meaningful if both arms are built the same
+/// way.
+pub fn hidden_states_with_lora(
+    model: &dyn cera::model::Model,
+    tokens: &[u32],
+    lora: Option<std::sync::Arc<cera::lora::LoraAdapterWeights>>,
+) -> Vec<f32> {
+    let mut state =
+        cera::kv_cache::InferenceState::for_prefill(model.config(), tokens.len()).unwrap();
+    state.lora = lora;
+    model.hidden_states(tokens, &mut state)
+}
 
 /// Acquire a Metal device, or skip the calling test.
 ///

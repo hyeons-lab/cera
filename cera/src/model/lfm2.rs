@@ -43,14 +43,24 @@ pub(crate) struct DenseFfnRefs {
 /// `n_expert` long and index-aligned.
 #[derive(Debug, Clone)]
 pub(crate) struct MoeFfnRefs {
-    /// Routing parameters for this layer.
+    /// Routing parameters for this layer, copied out of
+    /// [`crate::model::MoeConfig`] at load.
     ///
     /// Carried here rather than read from `ModelConfig::moe` at the call site so
-    /// that having expert weights and having the config to drive them is one
+    /// that having expert weights and having the numbers to drive them is one
     /// fact instead of two. The alternative left the hot path with an
     /// `if let Some(cfg)` whose `else` would silently skip the whole FFN and add
     /// the *previous* block's stale scratch into the residual.
-    pub cfg: crate::model::MoeConfig,
+    ///
+    /// All three are flattened rather than held as a `MoeConfig`: that struct
+    /// also carries the per-model `is_moe_layer` map, which is both meaningless
+    /// inside a per-layer struct (this layer is routed by virtue of being an
+    /// `FfnRefs::Moe`) and a heap allocation per routed layer to clone.
+    pub n_expert: usize,
+    /// Experts activated per token. See [`Self::n_expert`].
+    pub n_expert_used: usize,
+    /// Per-expert feed-forward width. See [`Self::n_expert`].
+    pub expert_ff_len: usize,
     /// Router projection (`ffn_gate_inp.weight`, F32, `[hidden, n_expert]`)
     /// producing one logit per expert.
     pub router: WeightRef,
@@ -413,6 +423,7 @@ impl Lfm2Model {
                 n_expert,
                 n_expert_used,
                 expert_ff_len,
+                is_moe_layer: moe_layers.clone(),
             })
         } else {
             None
@@ -517,7 +528,9 @@ impl Lfm2Model {
                 );
 
                 FfnRefs::Moe(Box::new(MoeFfnRefs {
-                    cfg: moe_cfg.clone(),
+                    n_expert,
+                    n_expert_used: moe_cfg.n_expert_used,
+                    expert_ff_len: moe_cfg.expert_ff_len,
                     router: Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_gate_inp.weight"))?,
                     exp_probs_b,
                     gate: expert_refs("ffn_gate_exps.weight")?,
@@ -639,9 +652,16 @@ impl Lfm2Model {
     /// the biased score as the combining weight changes every output subtly and
     /// still reads as fluent text, so the `moe_routing_tests` module pins this
     /// against llama.cpp's own values rather than trusting inspection.
-    fn route_experts(&self, moe: &MoeFfnRefs, ffn_input: &[f32], state: &mut InferenceState) {
-        let n_expert = moe.cfg.n_expert;
-        let n_used = moe.cfg.n_expert_used;
+    fn route_experts(
+        &self,
+        layer: usize,
+        moe: &MoeFfnRefs,
+        lora: Option<&crate::lora::LoraAdapterWeights>,
+        ffn_input: &[f32],
+        state: &mut InferenceState,
+    ) {
+        let n_expert = moe.n_expert;
+        let n_used = moe.n_expert_used;
 
         state.scratch.moe_probs.resize(n_expert, 0.0);
         transformer::gemv(
@@ -650,6 +670,20 @@ impl Lfm2Model {
             ffn_input,
             &mut state.scratch.moe_probs[..n_expert],
         );
+        // The router is a LoRA target in its own right (llama.cpp builds it with
+        // `build_lora_mm`), and it is adapted on the *logits*, before the
+        // sigmoid. An adapter that moved a token across a selection boundary
+        // would otherwise be silently ignored while its expert deltas applied.
+        if let Some(lora) = lora
+            && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGateInp)
+        {
+            crate::lora::apply_decode(
+                t,
+                ffn_input,
+                &mut state.scratch.moe_probs[..n_expert],
+                &mut state.scratch.lora_tmp,
+            );
+        }
         state.scratch.moe_probs[..n_expert]
             .iter_mut()
             .for_each(|p| *p = 1.0 / (1.0 + (-*p).exp()));
@@ -669,15 +703,31 @@ impl Lfm2Model {
     /// `state.scratch.q8_*` already, matching the dense
     /// [`transformer::forward_ffn_block`] contract; each expert's
     /// down-projection re-quantizes its own SwiGLU product.
+    ///
+    /// The body deliberately duplicates the ~60 lines of
+    /// [`transformer::forward_ffn_block`] (the same gate/up GEMV, SwiGLU,
+    /// requantize, down GEMV, LoRA sequence) rather than calling it. Sharing
+    /// would mean parameterizing the dense helper over per-expert weights, a
+    /// per-expert LoRA lookup and an output buffer that is accumulated rather
+    /// than written, which puts three new branches in the FFN hot path of every
+    /// dense model cera runs so that one architecture can reuse it. Nothing
+    /// pins the two copies to each other, so a change to the dense block's
+    /// arithmetic has to be mirrored here by hand; if a third routed
+    /// architecture lands, that trade stops paying and this should be extracted.
     fn forward_moe_ffn(
         &self,
+        layer: usize,
         moe: &MoeFfnRefs,
         hidden_size: usize,
         ffn_input: &[f32],
         state: &mut InferenceState,
     ) {
-        let ff = moe.cfg.expert_ff_len;
-        self.route_experts(moe, ffn_input, state);
+        let ff = moe.expert_ff_len;
+        // Cloned out of `state` up front: the `Arc` bumps a refcount, and the
+        // alternative is holding a borrow of `state` across the GEMVs that need
+        // it mutably. Same shape as `transformer::forward_ffn_block`.
+        let lora = state.lora.clone();
+        self.route_experts(layer, moe, lora.as_deref(), ffn_input, state);
 
         state.scratch.moe_expert_out.resize(hidden_size, 0.0);
         state.scratch.out[..hidden_size].fill(0.0);
@@ -737,6 +787,32 @@ impl Lfm2Model {
                 );
             }
 
+            // Per-expert LoRA on gate/up, before the SwiGLU mul reads both. The
+            // adapter's factors are indexed by the *same* expert id as the base
+            // weight, matching llama.cpp's `build_lora_mm_id`, which feeds one
+            // `ids` tensor to the base and both factors alike.
+            if let Some(lora) = &lora {
+                if let Some(t) =
+                    lora.get_expert(layer, crate::lora::LoraTarget::FfnGateExps, expert)
+                {
+                    crate::lora::apply_decode(
+                        t,
+                        ffn_input,
+                        &mut state.scratch.gate[..ff],
+                        &mut state.scratch.lora_tmp,
+                    );
+                }
+                if let Some(t) = lora.get_expert(layer, crate::lora::LoraTarget::FfnUpExps, expert)
+                {
+                    crate::lora::apply_decode(
+                        t,
+                        ffn_input,
+                        &mut state.scratch.up[..ff],
+                        &mut state.scratch.lora_tmp,
+                    );
+                }
+            }
+
             cpu::silu_mul_inplace(&mut state.scratch.gate[..ff], &state.scratch.up[..ff]);
 
             #[cfg(target_arch = "aarch64")]
@@ -772,6 +848,21 @@ impl Lfm2Model {
                 &mut state.scratch.moe_expert_out[..hidden_size],
             );
 
+            // LoRA on this expert's down projection. Its input is the SwiGLU
+            // product in `gate`, not the layer input, so it must read `gate`
+            // *before* the accumulate below consumes `moe_expert_out`.
+            if let Some(lora) = &lora
+                && let Some(t) =
+                    lora.get_expert(layer, crate::lora::LoraTarget::FfnDownExps, expert)
+            {
+                crate::lora::apply_decode(
+                    t,
+                    &state.scratch.gate[..ff],
+                    &mut state.scratch.moe_expert_out[..hidden_size],
+                    &mut state.scratch.lora_tmp,
+                );
+            }
+
             let (out, expert_out) = (
                 &mut state.scratch.out[..hidden_size],
                 &state.scratch.moe_expert_out[..hidden_size],
@@ -797,6 +888,7 @@ impl Lfm2Model {
     #[allow(clippy::too_many_arguments)]
     fn prefill_moe_ffn(
         &self,
+        layer: usize,
         moe: &MoeFfnRefs,
         hs: usize,
         n: usize,
@@ -813,7 +905,7 @@ impl Lfm2Model {
             #[cfg(target_arch = "aarch64")]
             Self::quantize_to_scratch(col, state);
 
-            self.forward_moe_ffn(moe, hs, col, state);
+            self.forward_moe_ffn(layer, moe, hs, col, state);
 
             (0..hs).for_each(|i| ffn_out[i * n + j] = state.scratch.out[i]);
         }
@@ -1450,7 +1542,7 @@ impl Lfm2Model {
                         state,
                     );
                 }
-                FfnRefs::Moe(moe) => self.forward_moe_ffn(moe, hs, &ffn_input, state),
+                FfnRefs::Moe(moe) => self.forward_moe_ffn(i, moe, hs, &ffn_input, state),
             }
 
             cpu::add_inplace(hidden, &state.scratch.out[..cfg.hidden_size]);
@@ -2630,7 +2722,16 @@ impl Lfm2Model {
                 let dense = match &refs.ffn {
                     FfnRefs::Dense(d) => d,
                     FfnRefs::Moe(moe) => {
-                        self.prefill_moe_ffn(moe, hs, n, &ffn_input, &mut ffn_out, &mut col, state);
+                        self.prefill_moe_ffn(
+                            layer,
+                            moe,
+                            hs,
+                            n,
+                            &ffn_input,
+                            &mut ffn_out,
+                            &mut col,
+                            state,
+                        );
                         break 'dense_ffn;
                     }
                 };

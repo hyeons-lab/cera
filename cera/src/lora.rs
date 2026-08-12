@@ -18,9 +18,19 @@
 //! passes lives in the backends (a later PR).
 //!
 //! Factors are stored **row-major, pre-dequantized to f32** (`a[i·k + j]` is
-//! `A[i][j]`, `b[i·rank + j]` is `B[i][j]`). Adapters are tiny (rank ≤ ~64), so
-//! f32 keeps the correction exact and gives one shared apply path across every
-//! backend with no dtype dispatch.
+//! `A[i][j]`, `b[i·rank + j]` is `B[i][j]`). An ordinary projection's factors are
+//! tiny (rank ≤ ~64), so f32 keeps the correction exact and gives one shared
+//! apply path across every backend with no dtype dispatch.
+//!
+//! **Mixture-of-experts adapters are not tiny.** A routed projection carries one
+//! factor pair *per expert*, so its footprint scales with the expert count: on
+//! LFM2.5-8B-A1B (32 experts, 22 routed layers, three projections each) a rank-32
+//! adapter is roughly a gigabyte of f32 once loaded. The caps here bound the two
+//! factors separately ([`MAX_LORA_RANK`] the rank, `MAX_LORA_EXPERTS` the expert
+//! count) and both sit far above any real adapter, so neither constrains the
+//! product in practice: an embedder on a memory budget has to size the adapter
+//! itself. Storing the factors quantized would change the apply path on every
+//! backend, so it is deliberately not done here.
 
 #[cfg(any(feature = "mmap", not(target_arch = "wasm32")))]
 use std::path::Path;
@@ -30,12 +40,26 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::gguf::GgufFile;
 
+/// Number of distinct [`LoraTarget`]s, i.e. the length of `LoraTarget::ALL` and
+/// the width of every per-target array indexed by [`LoraTarget::index`].
+///
+/// Public because [`LoraTarget::index`] and [`LoraTarget::ALL`] are: anything
+/// that indexes by `index()` needs the width, and spelling it as a literal is a
+/// runtime out-of-bounds rather than a compile error once a target is added.
+/// The GPU backends (`model/gpu_lfm2.rs`, `model/metal_lfm2.rs`) size their own
+/// per-target arrays from it for exactly that reason, though being in this crate
+/// they would not need it to be public.
+pub const LORA_TARGET_COUNT: usize = 13;
+
 /// The linear-projection targets an adapter can modify: the four attention
-/// projections, the three FFN projections, and LFM2's two gated-conv
-/// (`shortconv`) projections. llama.cpp's `convert_lora_to_gguf` emits deltas for
-/// all of these, so cera adapts them all — otherwise an adapter trained against
+/// projections, the three FFN projections, LFM2's two gated-conv (`shortconv`)
+/// projections, and the mixture-of-experts router plus its three per-expert
+/// projections. llama.cpp's `convert_lora_to_gguf` emits deltas for all of
+/// these, so cera adapts them all; otherwise an adapter trained against
 /// llama.cpp is only partially applied and the resulting hidden states diverge.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// Declaration order is `index()` order, which `Ord` and `ALL` both rely on.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum LoraTarget {
     AttnQ,
     AttnK,
@@ -48,11 +72,22 @@ pub enum LoraTarget {
     ShortconvInProj,
     /// LFM2 gated-conv output projection (`shortconv.out_proj`), `hidden → hidden`.
     ShortconvOutProj,
+    /// MoE router projection (`ffn_gate_inp`), `hidden → n_expert`. Adapted
+    /// because llama.cpp routes through `build_lora_mm(gate_inp, cur)`: skipping
+    /// it would leave expert *selection* unadapted while the experts themselves
+    /// were adapted, which diverges without ever looking wrong.
+    FfnGateInp,
+    /// MoE per-expert gate projection (`ffn_gate_exps`), `hidden → expert_ff_len`.
+    FfnGateExps,
+    /// MoE per-expert up projection (`ffn_up_exps`), `hidden → expert_ff_len`.
+    FfnUpExps,
+    /// MoE per-expert down projection (`ffn_down_exps`), `expert_ff_len → hidden`.
+    FfnDownExps,
 }
 
 impl LoraTarget {
-    /// All nine targets, in `index()` order.
-    pub const ALL: [LoraTarget; 9] = [
+    /// Every target, in `index()` order.
+    pub const ALL: [LoraTarget; LORA_TARGET_COUNT] = [
         LoraTarget::AttnQ,
         LoraTarget::AttnK,
         LoraTarget::AttnV,
@@ -62,9 +97,13 @@ impl LoraTarget {
         LoraTarget::FfnDown,
         LoraTarget::ShortconvInProj,
         LoraTarget::ShortconvOutProj,
+        LoraTarget::FfnGateInp,
+        LoraTarget::FfnGateExps,
+        LoraTarget::FfnUpExps,
+        LoraTarget::FfnDownExps,
     ];
 
-    /// Dense array index (0..9) for `LoraLayer::targets`.
+    /// Dense array index (`0..LORA_TARGET_COUNT`) for `LoraLayer::targets`.
     pub fn index(self) -> usize {
         match self {
             LoraTarget::AttnQ => 0,
@@ -76,7 +115,23 @@ impl LoraTarget {
             LoraTarget::FfnDown => 6,
             LoraTarget::ShortconvInProj => 7,
             LoraTarget::ShortconvOutProj => 8,
+            LoraTarget::FfnGateInp => 9,
+            LoraTarget::FfnGateExps => 10,
+            LoraTarget::FfnUpExps => 11,
+            LoraTarget::FfnDownExps => 12,
         }
+    }
+
+    /// Whether this target's base weight is a *stacked* per-expert tensor, and
+    /// so carries one set of low-rank factors per expert rather than one set
+    /// overall. Drives both the load-time split and which accessor
+    /// ([`LoraAdapterWeights::get`] vs [`LoraAdapterWeights::get_expert`])
+    /// returns the delta.
+    pub fn is_expert(self) -> bool {
+        matches!(
+            self,
+            LoraTarget::FfnGateExps | LoraTarget::FfnUpExps | LoraTarget::FfnDownExps
+        )
     }
 
     /// The GGUF base-weight stem, e.g. `attn_q` in `blk.N.attn_q.weight`.
@@ -91,6 +146,10 @@ impl LoraTarget {
             LoraTarget::FfnDown => "ffn_down",
             LoraTarget::ShortconvInProj => "shortconv.in_proj",
             LoraTarget::ShortconvOutProj => "shortconv.out_proj",
+            LoraTarget::FfnGateInp => "ffn_gate_inp",
+            LoraTarget::FfnGateExps => "ffn_gate_exps",
+            LoraTarget::FfnUpExps => "ffn_up_exps",
+            LoraTarget::FfnDownExps => "ffn_down_exps",
         }
     }
 
@@ -172,10 +231,24 @@ impl LoraTargetWeights {
     }
 }
 
-/// The (up to nine) target deltas for one transformer layer.
+/// One target's delta: a single low-rank pair, or one pair per expert.
+///
+/// A mixture-of-experts projection is `n_expert` independent matrices stacked
+/// into one tensor, and llama.cpp's `build_lora_mm_id` indexes the adapter's
+/// factors with the *same* expert ids as the base weight, so the delta is
+/// per-expert too. Modelled as a sum type rather than a `Vec` that dense
+/// targets would fill with one element, so that "an expert target is never read
+/// as if it were dense" is a `match`, not a convention.
+enum TargetDelta {
+    Dense(LoraTargetWeights),
+    /// One entry per expert, index-aligned with the base weight's expert slices.
+    Experts(Vec<LoraTargetWeights>),
+}
+
+/// The (up to [`LORA_TARGET_COUNT`]) target deltas for one transformer layer.
 #[derive(Default)]
 pub struct LoraLayer {
-    targets: [Option<LoraTargetWeights>; 9],
+    targets: [Option<TargetDelta>; LORA_TARGET_COUNT],
 }
 
 /// A loaded LoRA adapter: per-layer low-rank deltas plus scaling.
@@ -186,8 +259,47 @@ pub struct LoraAdapterWeights {
 
 impl LoraAdapterWeights {
     /// The delta for `(layer, target)`, or `None` if the adapter doesn't touch it.
+    ///
+    /// Always `None` for an expert target ([`LoraTarget::is_expert`]), whose
+    /// delta is per-expert; use [`Self::get_expert`]. That is why this returns
+    /// the weights directly rather than the internal `TargetDelta`: an expert delta
+    /// cannot reach a caller that is not asking for a specific expert.
     pub fn get(&self, layer: usize, target: LoraTarget) -> Option<&LoraTargetWeights> {
-        self.layers.get(layer)?.targets[target.index()].as_ref()
+        match self.layers.get(layer)?.targets[target.index()].as_ref()? {
+            TargetDelta::Dense(t) => Some(t),
+            TargetDelta::Experts(_) => None,
+        }
+    }
+
+    /// The delta for `(layer, target, expert)` of a stacked per-expert
+    /// projection, or `None` if the adapter doesn't touch it.
+    ///
+    /// Always `None` for a non-expert target; use [`Self::get`].
+    pub fn get_expert(
+        &self,
+        layer: usize,
+        target: LoraTarget,
+        expert: usize,
+    ) -> Option<&LoraTargetWeights> {
+        match self.layers.get(layer)?.targets[target.index()].as_ref()? {
+            TargetDelta::Experts(per_expert) => per_expert.get(expert),
+            TargetDelta::Dense(_) => None,
+        }
+    }
+
+    /// Whether any layer carries a per-expert delta.
+    ///
+    /// For backends with no expert kernels: [`Self::get`] returns `None` for an
+    /// expert target by design, so a per-target upload loop skips those deltas
+    /// without a word. This lets such a loop assert it is not silently dropping
+    /// half an adapter.
+    pub fn has_expert_deltas(&self) -> bool {
+        self.layers.iter().any(|l| {
+            LoraTarget::ALL
+                .into_iter()
+                .filter(|t| t.is_expert())
+                .any(|t| l.targets[t.index()].is_some())
+        })
     }
 
     /// Number of layers the adapter spans (one past the highest layer index seen).
@@ -200,7 +312,8 @@ impl LoraAdapterWeights {
         self.default_scale
     }
 
-    /// Total number of `(layer, target)` deltas present.
+    /// Total number of `(layer, target)` deltas present. A per-expert delta
+    /// counts once, not once per expert: it adapts one projection.
     pub fn target_count(&self) -> usize {
         self.layers
             .iter()
@@ -220,13 +333,37 @@ impl LoraAdapterWeights {
         let q_dim = config.n_heads * config.head_dim;
         for (layer, l) in self.layers.iter().enumerate() {
             for target in LoraTarget::ALL {
-                let Some(t) = l.targets[target.index()].as_ref() else {
+                let Some(delta) = l.targets[target.index()].as_ref() else {
                     continue;
                 };
                 ensure!(
                     layer < n_layers,
                     "LoRA references layer {layer} but the model has {n_layers} layers"
                 );
+                // Whether *this layer's* FFN is routed. Per-layer, not
+                // per-model: `lfm2moe` runs dense leading blocks and MoE ones in
+                // the same file, so a whole-model flag would mislabel both ends.
+                let moe = config
+                    .moe
+                    .as_ref()
+                    .filter(|m| m.is_moe_layer.get(layer).copied().unwrap_or(false));
+                // Reject a delta the forward pass would silently drop. A dense
+                // `ffn_gate` adapter on a routed layer has plausible dims (the
+                // model's leading blocks really are that wide), so without this
+                // it validates, loads, and then adapts nothing: a partially
+                // applied adapter that still generates fluent text.
+                match (target, moe.is_some()) {
+                    (LoraTarget::FfnGate | LoraTarget::FfnUp | LoraTarget::FfnDown, true) => bail!(
+                        "LoRA target {target:?} on layer {layer} adapts a dense feed-forward \
+                         block, but that layer is mixture-of-experts; it needs the stacked \
+                         per-expert tensors (`ffn_*_exps.weight.lora_{{a,b}}`)"
+                    ),
+                    (t, false) if t.is_expert() || t == LoraTarget::FfnGateInp => bail!(
+                        "LoRA target {target:?} on layer {layer} adapts a mixture-of-experts \
+                         feed-forward block, but that layer is dense"
+                    ),
+                    _ => {}
+                }
                 // Per-layer KV width (0 / absent ⇒ fall back to the global count).
                 let kv_heads = config
                     .kv_heads_per_layer
@@ -247,15 +384,51 @@ impl LoraAdapterWeights {
                     // gates); `out_proj` maps hidden → hidden.
                     LoraTarget::ShortconvInProj => (config.hidden_size, 3 * config.hidden_size),
                     LoraTarget::ShortconvOutProj => (config.hidden_size, config.hidden_size),
+                    // MoE. The `moe` binding is `Some` for all four of these:
+                    // the match above bailed on the dense-layer case, so the
+                    // fallbacks here are unreachable rather than a silent
+                    // default. Experts are `expert_ff_len` wide, *not*
+                    // `intermediate_size` (1792 vs 7168 on LFM2.5-8B-A1B), so
+                    // reusing the dense arm would accept an adapter four times
+                    // too wide.
+                    LoraTarget::FfnGateInp => (config.hidden_size, moe.map_or(0, |m| m.n_expert)),
+                    LoraTarget::FfnGateExps | LoraTarget::FfnUpExps => {
+                        (config.hidden_size, moe.map_or(0, |m| m.expert_ff_len))
+                    }
+                    LoraTarget::FfnDownExps => {
+                        (moe.map_or(0, |m| m.expert_ff_len), config.hidden_size)
+                    }
                 };
-                ensure!(
-                    t.k == want_k && t.d == want_d,
-                    "LoRA target {target:?} on layer {layer} has dims (in={}, out={}), \
-                     but the model expects (in={want_k}, out={want_d}) — adapter built for a \
-                     different model?",
-                    t.k,
-                    t.d
-                );
+
+                // One `(k, d)` rule, checked against every low-rank pair the
+                // target carries: one for a dense projection, `n_expert` for a
+                // stacked one. Written as a slice so the two cases cannot drift.
+                // The count check belongs to the stacked arm alone; a dense
+                // delta is one pair by construction, so checking it there would
+                // compare 1 to 1 and read as a guard that cannot fire.
+                let pairs = match delta {
+                    TargetDelta::Dense(t) => std::slice::from_ref(t),
+                    TargetDelta::Experts(per_expert) => {
+                        let want_experts = moe.map_or(0, |m| m.n_expert);
+                        ensure!(
+                            per_expert.len() == want_experts,
+                            "LoRA target {target:?} on layer {layer} carries {} expert deltas, \
+                             but the model has {want_experts} experts",
+                            per_expert.len()
+                        );
+                        per_expert.as_slice()
+                    }
+                };
+                for t in pairs {
+                    ensure!(
+                        t.k == want_k && t.d == want_d,
+                        "LoRA target {target:?} on layer {layer} has dims (in={}, out={}), \
+                         but the model expects (in={want_k}, out={want_d}). Adapter built for a \
+                         different model?",
+                        t.k,
+                        t.d
+                    );
+                }
             }
         }
         Ok(())
@@ -285,13 +458,31 @@ impl LoraAdapterWeights {
         let alpha_meta = gguf.get_f32("adapter.lora.alpha");
 
         let mut builder = AdapterBuilder::new();
-        for name in gguf.tensors.keys() {
+        for (name, info) in &gguf.tensors {
             let Some((layer, target, is_a)) = parse_gguf_lora_name(name) else {
                 continue;
             };
-            let (_, rows, cols, _) = gguf.tensor_meta(name)?;
+            // GGUF `ne` is fastest-varying first, so a `[k, rank]` factor is
+            // `rank` rows of `k`. A stacked per-expert factor adds a third
+            // dimension holding the expert count, its slices contiguous, which
+            // is why `n_slices` can simply chunk the flat data below.
+            //
+            // Read straight from the shape rather than through
+            // `GgufFile::tensor_meta`, which is deliberately rank-2-only: it
+            // backs the 2D `WeightRef` kernels, where quietly flattening a
+            // rank-3 tensor would hand a GEMV every expert at once.
+            let (rows, cols, n_slices) = match info.shape[..] {
+                [cols, rows] => (rows, cols, 1),
+                [cols, rows, n_slices] => (rows, cols, n_slices),
+                _ => bail!(
+                    "LoRA tensor {name} has rank {}, expected 2 (dense) or 3 (per-expert)",
+                    info.shape.len()
+                ),
+            };
             let data = gguf.get_tensor(name)?.to_f32_vec();
-            builder.add_factor(layer, target, is_a, data, rows, cols);
+            let factor = Factor::new(data, rows, cols, n_slices)
+                .with_context(|| format!("LoRA tensor {name}"))?;
+            builder.add_factor(layer, target, is_a, factor);
         }
         builder.finish(alpha_meta)
     }
@@ -314,6 +505,21 @@ impl LoraAdapterWeights {
         let st = SafeTensors::parse(bytes)?;
         let mut builder = AdapterBuilder::new();
         for (name, entry) in st.tensors() {
+            // Mixture-of-experts deltas are only read from GGUF, where the
+            // per-expert factors arrive stacked into one tensor with a known
+            // layout. PEFT stores them as one module per expert under a naming
+            // scheme that varies by architecture, so rather than guess at it and
+            // drop what doesn't match, say so. Detected on the path containing
+            // `experts` (which is what makes this an assertion about the file
+            // rather than a guess about the scheme) and only for tensors that
+            // are LoRA factors at all.
+            if name.contains("experts") && (name.contains("lora_A") || name.contains("lora_B")) {
+                bail!(
+                    "PEFT adapter tensor {name} targets a mixture-of-experts projection, which \
+                     cera only loads from GGUF. Convert the adapter with llama.cpp's \
+                     `convert_lora_to_gguf.py` and load the result."
+                );
+            }
             let Some((layer, target, is_a)) = parse_peft_lora_name(name) else {
                 continue;
             };
@@ -323,7 +529,11 @@ impl LoraAdapterWeights {
                 .shape2()
                 .with_context(|| format!("tensor {name} not 2-D"))?;
             let data = st.dequantize(entry, bytes)?;
-            builder.add_factor(layer, target, is_a, data, rows, cols);
+            // `shape2` already rejected anything but rank 2, so every PEFT
+            // factor is a single unstacked matrix.
+            let factor =
+                Factor::new(data, rows, cols, 1).with_context(|| format!("LoRA tensor {name}"))?;
+            builder.add_factor(layer, target, is_a, factor);
         }
         // PEFT keeps alpha out-of-band; default to alpha == rank (scale 1).
         builder.finish(alpha)
@@ -335,6 +545,19 @@ impl LoraAdapterWeights {
 /// reject rather than let it size a huge allocation.
 const MAX_LORA_LAYERS: usize = 8192;
 
+/// Sanity cap on the expert count of a stacked adapter factor.
+///
+/// Not a defence against a crafted header: `GgufFile::tensor_range` already
+/// requires a tensor's full byte range to be present, so a `[1, 1, 10^9]` factor
+/// needs ~4 GB of real file behind it or the read fails first. What this bounds
+/// is the *amplification* on a file that does have the bytes: the split turns
+/// one flat tensor into `n_slices` `LoraTargetWeights`, each two separately
+/// allocated `Vec`s. It runs before anything knows the model's real expert
+/// count, since `validate_dims` is the only thing that does and it runs at
+/// attach time. Real MoE models are far below this; llama.cpp's own
+/// `LLAMA_MAX_EXPERTS` is 512.
+const MAX_LORA_EXPERTS: usize = 4096;
+
 /// Maximum supported LoRA rank. Adapters above this are rejected at load
 /// (`LoraTargetWeights::new`), which lets GPU backends size a fixed rank-width
 /// scratch buffer (the Metal `lora_tmp`) with no out-of-bounds risk. Real
@@ -345,15 +568,64 @@ pub const MAX_LORA_RANK: usize = 512;
 /// them into a `LoraAdapterWeights`.
 #[derive(Default)]
 struct AdapterBuilder {
-    /// (layer, target_index) → (A?, B?) as `(data, rows, cols)`.
-    factors: std::collections::HashMap<(usize, usize), FactorPair>,
+    /// (layer, target) → (A?, B?).
+    factors: std::collections::HashMap<(usize, LoraTarget), FactorPair>,
     max_layer: usize,
+}
+
+/// One loaded LoRA factor: `n_slices` contiguous `[rows × cols]` row-major
+/// matrices. `n_slices` is 1 for an ordinary projection and the expert count for
+/// a stacked mixture-of-experts one, so both shapes flow through one type.
+struct Factor {
+    data: Vec<f32>,
+    rows: usize,
+    cols: usize,
+    n_slices: usize,
+}
+
+impl Factor {
+    /// Validate that `data` is exactly `n_slices` whole `[rows × cols]` matrices,
+    /// which is what makes [`Self::slice`] in-bounds by construction.
+    fn new(data: Vec<f32>, rows: usize, cols: usize, n_slices: usize) -> Result<Self> {
+        // checked_mul so a malformed header's absurd dims error instead of
+        // wrapping to a small product that happens to match `data.len()`.
+        let want = rows
+            .checked_mul(cols)
+            .and_then(|m| m.checked_mul(n_slices))
+            .context("LoRA factor dims overflow")?;
+        // Checked separately from the size: a zero-slice factor satisfies
+        // `data.len() == want` at 0 == 0, so folding the two together would
+        // report a failure by printing an equality that holds.
+        ensure!(n_slices > 0, "LoRA factor has no slices");
+        ensure!(
+            n_slices <= MAX_LORA_EXPERTS,
+            "LoRA factor is stacked {n_slices} deep, over the sane maximum of {MAX_LORA_EXPERTS} experts"
+        );
+        ensure!(
+            data.len() == want,
+            "LoRA factor has {} elements, expected {n_slices}×{rows}×{cols} = {want}",
+            data.len()
+        );
+        Ok(Self {
+            data,
+            rows,
+            cols,
+            n_slices,
+        })
+    }
+
+    /// The `i`-th `[rows × cols]` matrix, copied out. Called once per expert at
+    /// load time, so the copy is not on any hot path.
+    fn slice(&self, i: usize) -> Vec<f32> {
+        let n = self.rows * self.cols;
+        self.data[i * n..(i + 1) * n].to_vec()
+    }
 }
 
 #[derive(Default)]
 struct FactorPair {
-    a: Option<(Vec<f32>, usize, usize)>,
-    b: Option<(Vec<f32>, usize, usize)>,
+    a: Option<Factor>,
+    b: Option<Factor>,
 }
 
 impl AdapterBuilder {
@@ -361,21 +633,13 @@ impl AdapterBuilder {
         Self::default()
     }
 
-    fn add_factor(
-        &mut self,
-        layer: usize,
-        target: LoraTarget,
-        is_a: bool,
-        data: Vec<f32>,
-        rows: usize,
-        cols: usize,
-    ) {
+    fn add_factor(&mut self, layer: usize, target: LoraTarget, is_a: bool, factor: Factor) {
         self.max_layer = self.max_layer.max(layer);
-        let slot = self.factors.entry((layer, target.index())).or_default();
+        let slot = self.factors.entry((layer, target)).or_default();
         if is_a {
-            slot.a = Some((data, rows, cols));
+            slot.a = Some(factor);
         } else {
-            slot.b = Some((data, rows, cols));
+            slot.b = Some(factor);
         }
     }
 
@@ -401,21 +665,69 @@ impl AdapterBuilder {
         let mut default_scale = 1.0f32;
         let mut scale_set = false;
 
-        for ((layer, target_idx), pair) in factors {
-            let (a, rank_a, k) = pair
+        for ((layer, target), pair) in factors {
+            let a = pair
                 .a
-                .with_context(|| format!("layer {layer} target {target_idx}: missing lora_a"))?;
-            let (b, d, rank_b) = pair
+                .with_context(|| format!("layer {layer} target {target:?}: missing lora_a"))?;
+            let b = pair
                 .b
-                .with_context(|| format!("layer {layer} target {target_idx}: missing lora_b"))?;
-            let alpha = alpha.unwrap_or(rank_a as f32);
-            let tw = LoraTargetWeights::new(a, rank_a, k, b, d, rank_b, alpha)
-                .with_context(|| format!("layer {layer} target {target_idx}"))?;
+                .with_context(|| format!("layer {layer} target {target:?}: missing lora_b"))?;
+            // A and B are separate tensors, so nothing in the file forces them to
+            // agree on the expert count; a mismatch would otherwise pair expert
+            // `i`'s A with a B that isn't its own.
+            ensure!(
+                a.n_slices == b.n_slices,
+                "layer {layer} target {target:?}: lora_a has {} slices but lora_b has {}",
+                a.n_slices,
+                b.n_slices
+            );
+            // Rank is `alpha`'s denominator. Read from A's rows here;
+            // llama.cpp reads the same number off B (`lw->b->ne[0]`), and the
+            // two agree because `LoraTargetWeights::new` rejects the pair below
+            // unless A's rank equals B's.
+            let alpha = alpha.unwrap_or(a.rows as f32);
+            // Whether the delta is per-expert follows from the *target*, not from
+            // the slice count: a one-expert model would otherwise load its
+            // stacked tensors as dense ones and never reach `get_expert`.
+            let delta = if target.is_expert() {
+                let per_expert = (0..a.n_slices)
+                    .map(|e| {
+                        LoraTargetWeights::new(
+                            a.slice(e),
+                            a.rows,
+                            a.cols,
+                            b.slice(e),
+                            b.rows,
+                            b.cols,
+                            alpha,
+                        )
+                        .with_context(|| format!("layer {layer} target {target:?} expert {e}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                TargetDelta::Experts(per_expert)
+            } else {
+                ensure!(
+                    a.n_slices == 1,
+                    "layer {layer} target {target:?} is a single projection carrying one \
+                     low-rank pair, but its factors are stacked {} deep",
+                    a.n_slices
+                );
+                TargetDelta::Dense(
+                    LoraTargetWeights::new(a.data, a.rows, a.cols, b.data, b.rows, b.cols, alpha)
+                        .with_context(|| format!("layer {layer} target {target:?}"))?,
+                )
+            };
             if !scale_set {
-                default_scale = tw.scale;
+                // `Experts` is never empty: `Factor::new` rejects `n_slices == 0`
+                // and the vec is built with exactly `a.n_slices` entries, so the
+                // `map_or` default is a total-function formality, not a fallback.
+                default_scale = match &delta {
+                    TargetDelta::Dense(t) => t.scale,
+                    TargetDelta::Experts(per_expert) => per_expert.first().map_or(1.0, |t| t.scale),
+                };
                 scale_set = true;
             }
-            layers[layer].targets[target_idx] = Some(tw);
+            layers[layer].targets[target.index()] = Some(delta);
         }
 
         Ok(Arc::new(LoraAdapterWeights {
@@ -735,6 +1047,29 @@ mod tests {
             parse_gguf_lora_name("blk.15.shortconv.out_proj.weight.lora_b"),
             Some((15, LoraTarget::ShortconvOutProj, false))
         );
+        // MoE. `ffn_gate`, `ffn_gate_inp` and `ffn_gate_exps` are three
+        // different projections sharing a prefix, so a `starts_with` match
+        // would collapse them; each must land on its own target.
+        assert_eq!(
+            parse_gguf_lora_name("blk.2.ffn_gate_exps.weight.lora_a"),
+            Some((2, LoraTarget::FfnGateExps, true))
+        );
+        assert_eq!(
+            parse_gguf_lora_name("blk.2.ffn_up_exps.weight.lora_b"),
+            Some((2, LoraTarget::FfnUpExps, false))
+        );
+        assert_eq!(
+            parse_gguf_lora_name("blk.23.ffn_down_exps.weight.lora_a"),
+            Some((23, LoraTarget::FfnDownExps, true))
+        );
+        assert_eq!(
+            parse_gguf_lora_name("blk.2.ffn_gate_inp.weight.lora_a"),
+            Some((2, LoraTarget::FfnGateInp, true))
+        );
+        assert_eq!(
+            parse_gguf_lora_name("blk.2.ffn_gate.weight.lora_a"),
+            Some((2, LoraTarget::FfnGate, true))
+        );
         // Non-lora / unknown target / malformed → None.
         assert_eq!(parse_gguf_lora_name("blk.3.attn_q.weight"), None);
         assert_eq!(parse_gguf_lora_name("blk.3.attn_norm.weight.lora_a"), None);
@@ -914,6 +1249,468 @@ mod tests {
             8,
         );
         assert!(LoraAdapterWeights::from_safetensors_bytes(&buf, None).is_err());
+    }
+
+    // ── mixture-of-experts adapters ─────────────────────────────────────────
+
+    /// `ALL` and `index()` are two hand-written spellings of the same order, and
+    /// `index()` is what sizes the per-target arrays in `model/gpu_lfm2.rs` and
+    /// `model/metal_lfm2.rs`. A target added to one and not the other indexes
+    /// out of bounds at runtime, so pin them to each other.
+    ///
+    /// `ALL.len() == LORA_TARGET_COUNT` is deliberately *not* asserted: `ALL` is
+    /// declared as `[LoraTarget; LORA_TARGET_COUNT]`, so that equality is the
+    /// type and an assertion on it can never fail.
+    #[test]
+    fn all_targets_are_in_index_order() {
+        for (i, target) in LoraTarget::ALL.into_iter().enumerate() {
+            assert_eq!(target.index(), i, "{target:?}");
+        }
+        // Stems must be distinct, or `from_gguf_stem` silently resolves a
+        // tensor to whichever target `ALL` happens to list first.
+        let mut stems: Vec<&str> = LoraTarget::ALL.iter().map(|t| t.gguf_stem()).collect();
+        stems.sort_unstable();
+        stems.dedup();
+        assert_eq!(
+            stems.len(),
+            LORA_TARGET_COUNT,
+            "duplicate gguf stems: {stems:?}"
+        );
+    }
+
+    /// The error text of a load that must fail, *including the cause chain*.
+    ///
+    /// `LoraAdapterWeights` has no `Debug`, so `unwrap_err` is unavailable on
+    /// the loader's `Result`. Formatted with `{:?}` rather than `to_string()`
+    /// because the loader wraps failures in `with_context` (the tensor name), so
+    /// `to_string()` returns only that outermost line and an assertion on the
+    /// real reason would never match.
+    fn load_err(r: Result<Arc<LoraAdapterWeights>>) -> String {
+        match r {
+            Ok(_) => panic!("expected the adapter to be rejected"),
+            Err(e) => format!("{e:?}"),
+        }
+    }
+
+    /// Append a GGUF-format length-prefixed string.
+    fn push_gguf_string(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    /// Serialize a minimal GGUF v3 file of F32 tensors, `(name, ne, data)` with
+    /// `ne` fastest-varying first (GGUF's own order), plus an optional
+    /// `adapter.lora.alpha`.
+    fn synth_gguf(tensors: &[(&str, Vec<usize>, Vec<f32>)], alpha: Option<f32>) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(alpha.is_some() as u64).to_le_bytes());
+        if let Some(a) = alpha {
+            push_gguf_string(&mut out, "adapter.lora.alpha");
+            out.extend_from_slice(&6u32.to_le_bytes()); // GGUF_TYPE_FLOAT32
+            out.extend_from_slice(&a.to_le_bytes());
+        }
+        let mut offset = 0u64;
+        for (name, ne, data) in tensors {
+            push_gguf_string(&mut out, name);
+            out.extend_from_slice(&(ne.len() as u32).to_le_bytes());
+            ne.iter()
+                .for_each(|&d| out.extend_from_slice(&(d as u64).to_le_bytes()));
+            out.extend_from_slice(&0u32.to_le_bytes()); // GGML_TYPE_F32
+            out.extend_from_slice(&offset.to_le_bytes());
+            offset += (data.len() * 4) as u64;
+        }
+        // The data section starts at the next multiple of the default alignment.
+        while !out.len().is_multiple_of(32) {
+            out.push(0);
+        }
+        for (_, _, data) in tensors {
+            out.extend(data.iter().flat_map(|x| x.to_le_bytes()));
+        }
+        out
+    }
+
+    /// A stacked expert adapter for one layer: `n_expert` slices where expert
+    /// `e`'s `A` is filled with `e + 1` and its `B` with `1 / (e + 1)`, so a
+    /// wrong slice is a wrong *value*, not just a wrong shape.
+    ///
+    /// Both factors vary with `e` deliberately. Holding `B` constant would leave
+    /// a bad offset or stride in `b.slice(e)` invisible, since every slice would
+    /// then hold the same bytes.
+    fn synth_expert_gguf(n_expert: usize, rank: usize, k: usize, d: usize) -> Vec<u8> {
+        let a: Vec<f32> = (0..n_expert)
+            .flat_map(|e| std::iter::repeat_n(e as f32 + 1.0, rank * k))
+            .collect();
+        let b: Vec<f32> = (0..n_expert)
+            .flat_map(|e| std::iter::repeat_n(1.0 / (e as f32 + 1.0), d * rank))
+            .collect();
+        synth_gguf(
+            &[
+                // ne is [k, rank, n_expert] for A and [rank, d, n_expert] for B,
+                // matching llama.cpp's `A.shape[-2] == B.shape[-1]` assertion.
+                (
+                    "blk.0.ffn_gate_exps.weight.lora_a",
+                    vec![k, rank, n_expert],
+                    a,
+                ),
+                (
+                    "blk.0.ffn_gate_exps.weight.lora_b",
+                    vec![rank, d, n_expert],
+                    b,
+                ),
+            ],
+            Some(rank as f32),
+        )
+    }
+
+    /// A stacked adapter must split into one independent low-rank pair per
+    /// expert, in expert order, reachable only through `get_expert`.
+    #[test]
+    fn gguf_expert_adapter_splits_per_expert() {
+        let (n_expert, rank, k, d) = (4, 2, 3, 5);
+        let buf = synth_expert_gguf(n_expert, rank, k, d);
+        let adapter = LoraAdapterWeights::from_gguf_bytes(Arc::from(buf.into_boxed_slice()))
+            .expect("expert adapter loads");
+
+        // One projection adapted, not one per expert.
+        assert_eq!(adapter.target_count(), 1);
+        // A per-expert delta is invisible to the dense accessor, so a caller
+        // that forgot to route by expert reads `None` instead of expert 0.
+        assert!(adapter.get(0, LoraTarget::FfnGateExps).is_none());
+
+        for e in 0..n_expert {
+            let t = adapter
+                .get_expert(0, LoraTarget::FfnGateExps, e)
+                .unwrap_or_else(|| panic!("expert {e} present"));
+            assert_eq!((t.rank, t.k, t.d), (rank, k, d));
+            // Expert e's A was filled with e+1 and its B with 1/(e+1): proves
+            // the split took slice e of *each* factor, not slice 0 repeated or
+            // a stride off by one. Checked on both because a bad offset in one
+            // of the two is invisible if only the other varies.
+            assert!(
+                t.a.iter().all(|&x| x == e as f32 + 1.0),
+                "expert {e} got A = {:?}",
+                &t.a[..t.a.len().min(4)]
+            );
+            assert!(
+                t.b.iter().all(|&x| x == 1.0 / (e as f32 + 1.0)),
+                "expert {e} got B = {:?}",
+                &t.b[..t.b.len().min(4)]
+            );
+        }
+        // One past the last expert is `None`, not a wrapped index.
+        assert!(
+            adapter
+                .get_expert(0, LoraTarget::FfnGateExps, n_expert)
+                .is_none()
+        );
+    }
+
+    /// Expert `e`'s `A` must be paired with expert `e`'s `B`, not with another
+    /// expert's.
+    ///
+    /// `A` is filled with `e + 1` and `B` with `1 / (e + 1)`, so a correctly
+    /// paired expert yields the *same* value for every `e` and the expectation
+    /// is a constant. That is the sharp shape here: cross-pairing A from one
+    /// slice with B from another breaks the cancellation and the constant fails.
+    ///
+    /// This does not test that the *forward pass* looks up the routed expert:
+    /// the expert index is passed in explicitly. That is pinned by
+    /// `expert_factors_are_indexed_by_the_routed_expert` in
+    /// `tests/moe_lora_parity.rs`, which drives a real model.
+    #[test]
+    fn expert_deltas_apply_independently() {
+        let (n_expert, rank, k, d) = (3, 2, 4, 3);
+        let buf = synth_expert_gguf(n_expert, rank, k, d);
+        let adapter =
+            LoraAdapterWeights::from_gguf_bytes(Arc::from(buf.into_boxed_slice())).unwrap();
+
+        let x = vec![1.0f32, 2.0, 3.0, 4.0];
+        let sum_x: f32 = x.iter().sum();
+        let mut tmp = Vec::new();
+        for e in 0..n_expert {
+            let t = adapter.get_expert(0, LoraTarget::FfnGateExps, e).unwrap();
+            let mut y = vec![0.0f32; d];
+            apply_decode(t, &x, &mut y, &mut tmp);
+            // A is all (e+1), B all 1/(e+1), alpha == rank so scale == 1:
+            // tmp[r] = (e+1)·sum(x); y[o] = rank · (e+1) · sum(x) / (e+1).
+            // The (e+1) factors cancel, which is the point: an implementation
+            // that paired expert e's A with a different expert's B would NOT
+            // cancel, so the constant expectation is the sharp check here.
+            let expected = rank as f32 * sum_x;
+            assert!(
+                y.iter().all(|&v| (v - expected).abs() < 1e-4),
+                "expert {e}: {y:?} != {expected}"
+            );
+        }
+    }
+
+    /// A dense (rank-2) factor under an expert target is a malformed adapter:
+    /// it describes one expert where the model has many. The loader cannot know
+    /// the expert count on its own, so it accepts it as a one-expert stack; what
+    /// must not happen is that it silently *adapts* expert 0 and leaves the rest
+    /// bare. `validate_dims` is the one that has the model, so it is the one
+    /// that has to reject it.
+    #[test]
+    fn an_unstacked_expert_factor_is_rejected_against_the_model() {
+        let (rank, k, d) = (2, 8, 16);
+        let buf = synth_gguf(
+            &[
+                (
+                    "blk.2.ffn_gate_exps.weight.lora_a",
+                    vec![k, rank],
+                    vec![1.0; rank * k],
+                ),
+                (
+                    "blk.2.ffn_gate_exps.weight.lora_b",
+                    vec![rank, d],
+                    vec![1.0; d * rank],
+                ),
+            ],
+            Some(rank as f32),
+        );
+        let adapter = LoraAdapterWeights::from_gguf_bytes(Arc::from(buf.into_boxed_slice()))
+            .expect("a rank-2 expert factor loads as a one-expert stack");
+        // `moe_config()`'s layer 2 is routed with 3 experts, so a one-expert
+        // stack must not pass. Dims are otherwise correct (8 -> 16), which is
+        // what makes the expert-count check the only thing that can catch it.
+        let err = adapter
+            .validate_dims(&moe_config())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1 expert deltas"), "{err}");
+    }
+
+    /// A stacked factor under a *dense* target must be refused rather than
+    /// flattened: nothing downstream would ever index its experts.
+    #[test]
+    fn rejects_stacked_factors_on_a_dense_target() {
+        let (n_expert, rank, k, d) = (2, 2, 3, 5);
+        let buf = synth_gguf(
+            &[
+                (
+                    "blk.0.ffn_gate.weight.lora_a",
+                    vec![k, rank, n_expert],
+                    vec![1.0; n_expert * rank * k],
+                ),
+                (
+                    "blk.0.ffn_gate.weight.lora_b",
+                    vec![rank, d, n_expert],
+                    vec![1.0; n_expert * d * rank],
+                ),
+            ],
+            Some(rank as f32),
+        );
+        let err = load_err(LoraAdapterWeights::from_gguf_bytes(Arc::from(
+            buf.into_boxed_slice(),
+        )));
+        assert!(err.contains("stacked"), "{err}");
+    }
+
+    /// An expert count past anything real must be refused at load, before the
+    /// split turns one flat tensor into two `Vec`s per slice.
+    #[test]
+    fn rejects_absurd_expert_count() {
+        let n = MAX_LORA_EXPERTS + 1;
+        let buf = synth_gguf(
+            &[
+                (
+                    "blk.0.ffn_gate_exps.weight.lora_a",
+                    vec![1, 1, n],
+                    vec![1.0; n],
+                ),
+                (
+                    "blk.0.ffn_gate_exps.weight.lora_b",
+                    vec![1, 1, n],
+                    vec![1.0; n],
+                ),
+            ],
+            Some(1.0),
+        );
+        let err = load_err(LoraAdapterWeights::from_gguf_bytes(Arc::from(
+            buf.into_boxed_slice(),
+        )));
+        assert!(err.contains("over the sane maximum"), "{err}");
+    }
+
+    /// A and B are separate tensors; disagreeing expert counts would pair
+    /// expert `i`'s A with someone else's B.
+    #[test]
+    fn rejects_mismatched_expert_counts() {
+        let (rank, k, d) = (2, 3, 5);
+        let buf = synth_gguf(
+            &[
+                (
+                    "blk.0.ffn_gate_exps.weight.lora_a",
+                    vec![k, rank, 4],
+                    vec![1.0; 4 * rank * k],
+                ),
+                (
+                    "blk.0.ffn_gate_exps.weight.lora_b",
+                    vec![rank, d, 2],
+                    vec![1.0; 2 * d * rank],
+                ),
+            ],
+            Some(rank as f32),
+        );
+        let err = load_err(LoraAdapterWeights::from_gguf_bytes(Arc::from(
+            buf.into_boxed_slice(),
+        )));
+        assert!(err.contains("slices"), "{err}");
+    }
+
+    /// PEFT stores expert modules one per expert under an architecture-specific
+    /// name. Rather than guess and drop what doesn't match, loading must fail
+    /// with a pointer at the supported route.
+    #[test]
+    fn peft_expert_adapter_is_refused_not_dropped() {
+        let name = "base_model.model.model.layers.0.mlp.experts.3.gate_proj.lora_A.weight";
+        let buf = st_buf(
+            serde_json::json!({
+                name: { "dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16] },
+            }),
+            16,
+        );
+        let err = load_err(LoraAdapterWeights::from_safetensors_bytes(&buf, None));
+        assert!(err.contains("convert_lora_to_gguf"), "{err}");
+    }
+
+    /// A four-layer config: layers 0-1 dense, 2-3 routed, shaped like
+    /// LFM2.5-8B-A1B's split but small.
+    fn moe_config() -> crate::model::ModelConfig {
+        crate::model::ModelConfig {
+            architecture: "lfm2moe".to_string(),
+            n_layers: 4,
+            hidden_size: 8,
+            intermediate_size: 32,
+            n_heads: 2,
+            n_kv_heads: 2,
+            head_dim: 4,
+            vocab_size: 16,
+            max_seq_len: 32,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
+            block_types: vec![crate::model::BlockType::Attention; 4],
+            conv_kernel_size: None,
+            kv_heads_per_layer: vec![2; 4],
+            scalars: crate::model::ScalarMultipliers::default(),
+            moe: Some(crate::model::MoeConfig {
+                n_expert: 3,
+                n_expert_used: 2,
+                expert_ff_len: 16,
+                is_moe_layer: vec![false, false, true, true],
+            }),
+        }
+    }
+
+    /// Build a one-layer adapter carrying `target` with the given dims, for
+    /// `n_slices` experts (1 = dense).
+    fn adapter_for(
+        layer: usize,
+        target: LoraTarget,
+        k: usize,
+        d: usize,
+        n_slices: usize,
+    ) -> Arc<LoraAdapterWeights> {
+        let rank = 2;
+        let stem = target.gguf_stem();
+        let (ne_a, ne_b) = if n_slices > 1 {
+            (vec![k, rank, n_slices], vec![rank, d, n_slices])
+        } else {
+            (vec![k, rank], vec![rank, d])
+        };
+        let buf = synth_gguf(
+            &[
+                (
+                    &format!("blk.{layer}.{stem}.weight.lora_a"),
+                    ne_a,
+                    vec![0.5; n_slices * rank * k],
+                ),
+                (
+                    &format!("blk.{layer}.{stem}.weight.lora_b"),
+                    ne_b,
+                    vec![0.5; n_slices * d * rank],
+                ),
+            ],
+            Some(rank as f32),
+        );
+        LoraAdapterWeights::from_gguf_bytes(Arc::from(buf.into_boxed_slice()))
+            .expect("synthetic adapter loads")
+    }
+
+    /// The silent-drop case the expert path exists to close: a dense `ffn_gate`
+    /// adapter aimed at a routed layer has entirely plausible dims (the model's
+    /// own leading blocks are that wide), so only the layer kind catches it.
+    #[test]
+    fn validate_dims_rejects_a_dense_ffn_adapter_on_a_routed_layer() {
+        let cfg = moe_config();
+        // Layer 1 is dense: the same adapter is accepted there.
+        adapter_for(1, LoraTarget::FfnGate, 8, 32, 1)
+            .validate_dims(&cfg)
+            .expect("dense adapter on a dense layer");
+
+        let err = adapter_for(2, LoraTarget::FfnGate, 8, 32, 1)
+            .validate_dims(&cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mixture-of-experts"), "{err}");
+    }
+
+    /// ...and the mirror image: expert deltas aimed at a dense layer.
+    #[test]
+    fn validate_dims_rejects_an_expert_adapter_on_a_dense_layer() {
+        let cfg = moe_config();
+        adapter_for(3, LoraTarget::FfnGateExps, 8, 16, 3)
+            .validate_dims(&cfg)
+            .expect("expert adapter on a routed layer");
+
+        let err = adapter_for(0, LoraTarget::FfnGateExps, 8, 16, 3)
+            .validate_dims(&cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is dense"), "{err}");
+    }
+
+    /// Experts are `expert_ff_len` wide (16), not `intermediate_size` (32).
+    /// Validating against the dense width would accept an adapter twice too big
+    /// and then read past every expert's factors.
+    #[test]
+    fn validate_dims_uses_the_expert_width_not_the_dense_one() {
+        let cfg = moe_config();
+        let err = adapter_for(2, LoraTarget::FfnGateExps, 8, 32, 3)
+            .validate_dims(&cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("out=16"), "{err}");
+    }
+
+    /// The router is `hidden → n_expert`, and it is a real target: an adapter
+    /// that moves a token across a selection boundary must not be dropped.
+    #[test]
+    fn validate_dims_accepts_the_router_and_checks_its_width() {
+        let cfg = moe_config();
+        adapter_for(2, LoraTarget::FfnGateInp, 8, 3, 1)
+            .validate_dims(&cfg)
+            .expect("router adapter validates");
+        let err = adapter_for(2, LoraTarget::FfnGateInp, 8, 4, 1)
+            .validate_dims(&cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("out=3"), "{err}");
+    }
+
+    /// An adapter trained on a differently-sized expert set must be rejected
+    /// before the forward pass indexes an expert it doesn't have.
+    #[test]
+    fn validate_dims_rejects_wrong_expert_count() {
+        let cfg = moe_config();
+        let err = adapter_for(2, LoraTarget::FfnGateExps, 8, 16, 2)
+            .validate_dims(&cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 expert deltas"), "{err}");
     }
 
     #[test]

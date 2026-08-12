@@ -161,6 +161,16 @@ pub struct MoeConfig {
     /// Distinct from `ModelConfig::intermediate_size`, which stays the *dense*
     /// width used by the leading dense blocks (7168).
     pub expert_ff_len: usize,
+    /// Which layers route through experts, indexed by layer. Length `n_layers`.
+    ///
+    /// A MoE file is not uniformly MoE: `lfm2moe` runs dense leading blocks and
+    /// routed ones in the same model, so "is this layer MoE" is per-layer even
+    /// though every other field here is per-model. Carried in the config (rather
+    /// than left implicit in the per-layer weight refs) because
+    /// [`crate::lora::LoraAdapterWeights::validate_dims`] sees only a
+    /// [`ModelConfig`], and it needs the distinction to tell a dense-FFN adapter
+    /// that would silently do nothing from one that fits.
+    pub is_moe_layer: Vec<bool>,
 }
 
 /// Trait for loaded models that can run forward passes.

@@ -474,7 +474,7 @@ struct WgpuLoraTarget {
 /// order) low-rank factors. Built from a CPU [`LoraAdapterWeights`] via
 /// [`WgpuLoraAdapter::upload`] and cached on the model (Arc-pointer-keyed LRU).
 struct WgpuLoraAdapter {
-    layers: Vec<[Option<WgpuLoraTarget>; 9]>,
+    layers: Vec<[Option<WgpuLoraTarget>; crate::lora::LORA_TARGET_COUNT]>,
 }
 
 impl WgpuLoraAdapter {
@@ -492,8 +492,19 @@ impl WgpuLoraAdapter {
     /// alone.
     fn upload(ctx: &GpuContext, w: &LoraAdapterWeights, residual_mult: f32) -> Self {
         let mut layers = Vec::with_capacity(w.n_layers());
+        // `w.get` returns `None` for an expert target by design, so a
+        // per-expert adapter would upload as nothing at all rather than
+        // fail. Unreachable today (the GPU LFM2 loader rejects a
+        // mixture-of-experts model before a session can attach anything),
+        // but a silent partial upload is exactly what the loader-side
+        // errors exist to prevent, so state the invariant here too.
+        debug_assert!(
+            !w.has_expert_deltas(),
+            "adapter carries per-expert deltas, which this backend has no kernels for"
+        );
         for layer in 0..w.n_layers() {
-            let mut targets: [Option<WgpuLoraTarget>; 9] = Default::default();
+            let mut targets: [Option<WgpuLoraTarget>; crate::lora::LORA_TARGET_COUNT] =
+                Default::default();
             for target in LoraTarget::ALL {
                 let Some(t) = w.get(layer, target) else {
                     continue;
