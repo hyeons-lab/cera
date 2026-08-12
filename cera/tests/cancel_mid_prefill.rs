@@ -75,6 +75,7 @@ fn mock_config(vocab_size: usize, max_seq_len: usize) -> ModelConfig {
         conv_kernel_size: None,
         kv_heads_per_layer: Vec::new(),
         scalars: ScalarMultipliers::default(),
+        moe: None,
     }
 }
 

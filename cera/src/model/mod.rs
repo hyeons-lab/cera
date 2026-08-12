@@ -139,6 +139,28 @@ pub struct ModelConfig {
     /// Architecture scalar multipliers (Granite 3.x). Identity for every other
     /// arch — see [`ScalarMultipliers`].
     pub scalars: ScalarMultipliers,
+    /// Mixture-of-experts parameters (`lfm2moe`). `None` for dense
+    /// architectures, which is every other arch cera loads.
+    pub moe: Option<MoeConfig>,
+}
+
+/// Mixture-of-experts routing parameters, for architectures whose feed-forward
+/// block is a set of independently-weighted experts rather than one SwiGLU.
+///
+/// Only sigmoid gating with a selection bias is modelled, because that is what
+/// `lfm2moe` uses (`lfm2moe.expert_gating_func = 2`); the loader rejects any
+/// other gating function rather than silently substituting softmax, which would
+/// still produce fluent text while being numerically wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoeConfig {
+    /// Total experts per MoE layer (`expert_count`, 32 for LFM2.5-8B-A1B).
+    pub n_expert: usize,
+    /// Experts activated per token (`expert_used_count`, 4).
+    pub n_expert_used: usize,
+    /// Per-expert feed-forward width (`expert_feed_forward_length`, 1792).
+    /// Distinct from `ModelConfig::intermediate_size`, which stays the *dense*
+    /// width used by the leading dense blocks (7168).
+    pub expert_ff_len: usize,
 }
 
 /// Trait for loaded models that can run forward passes.
@@ -583,7 +605,8 @@ pub fn load_model(
 
     let model: Box<dyn Model> =
         match arch.as_str() {
-            "lfm2" => Box::new(lfm2::Lfm2Model::from_gguf_with_id(
+            // `lfm2moe` shares this loader: same graph, experts in the FFN slot.
+            "lfm2" | "lfm2moe" => Box::new(lfm2::Lfm2Model::from_gguf_with_id(
                 gguf,
                 context_size,
                 model_id,
@@ -631,6 +654,13 @@ pub fn load_model_gpu(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     match arch.as_str() {
+        // `lfm2moe` is intentionally absent: the wgpu backend has no expert
+        // kernels yet, and falling through to the dense LFM2 loader would fail
+        // later on a missing `ffn_gate.weight` with nothing pointing at the
+        // real cause. Run it on the CPU backend until phase 3 lands.
+        "lfm2moe" => bail!(
+            "lfm2moe (mixture-of-experts) is not supported on the wgpu backend yet; use the CPU backend"
+        ),
         "lfm2" => Ok(Box::new(gpu_lfm2::GpuLfm2Model::from_gguf_with_id(
             gguf,
             context_size,
@@ -658,6 +688,11 @@ pub fn load_model_metal(
         .unwrap_or("unknown")
         .to_string();
     match arch.as_str() {
+        // See the wgpu loader above: no expert kernels on Metal yet, and the
+        // dense LFM2 path would fail on a missing tensor instead of saying why.
+        "lfm2moe" => bail!(
+            "lfm2moe (mixture-of-experts) is not supported on the Metal backend yet; use the CPU backend"
+        ),
         "lfm2" => Ok(Box::new(metal_lfm2::MetalLfm2Model::from_gguf(
             gguf,
             path,

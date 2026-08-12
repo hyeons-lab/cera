@@ -17,6 +17,8 @@
 //! RoPE layout + Llama-3 frequency factors, and (via `config().scalars`) the
 //! Granite scalar multipliers.
 
+use anyhow::Result;
+
 use crate::backend::cpu::RopeType;
 use crate::gguf::GgufFile;
 use crate::model::ModelConfig;
@@ -64,9 +66,17 @@ pub(crate) trait GpuWeightSource {
     /// Separate output projection (`output.weight`) when present; `None` ⇒ the
     /// embedding table is reused for the logit projection (tied embeddings).
     fn output_ref(&self) -> Option<&WeightRef>;
-    fn ffn_gate_ref(&self, layer: usize) -> &WeightRef;
-    fn ffn_up_ref(&self, layer: usize) -> &WeightRef;
-    fn ffn_down_ref(&self, layer: usize) -> &WeightRef;
+    /// The layer's dense SwiGLU projections.
+    ///
+    /// Fallible because a mixture-of-experts layer has no single FFN weight to
+    /// return: its projections are per-expert and only selected after routing.
+    /// No GPU backend implements experts yet, so both GPU loaders reject such a
+    /// model up front; these return an error rather than an arbitrary expert so
+    /// that a future backend which forgets to handle MoE fails loudly at upload
+    /// instead of quietly running every token through expert 0.
+    fn ffn_gate_ref(&self, layer: usize) -> Result<&WeightRef>;
+    fn ffn_up_ref(&self, layer: usize) -> Result<&WeightRef>;
+    fn ffn_down_ref(&self, layer: usize) -> Result<&WeightRef>;
     fn conv_in_proj_ref(&self, layer: usize) -> Option<&WeightRef>;
     fn conv_out_proj_ref(&self, layer: usize) -> Option<&WeightRef>;
     fn attn_q_ref(&self, layer: usize) -> Option<&WeightRef>;

@@ -1219,9 +1219,9 @@ impl GpuLfm2Model {
             let attn_norm = ctx.upload_f32(src.attn_norm_weight(i), &format!("l{i}.anorm"));
             let ffn_norm = ctx.upload_f32(src.ffn_norm_weight(i), &format!("l{i}.fnorm"));
 
-            let ffn_gate = upload_weight(src.ffn_gate_ref(i), &format!("l{i}.ffn_gate"));
-            let ffn_up = upload_weight(src.ffn_up_ref(i), &format!("l{i}.ffn_up"));
-            let ffn_down = upload_weight(src.ffn_down_ref(i), &format!("l{i}.ffn_down"));
+            let ffn_gate = upload_weight(src.ffn_gate_ref(i)?, &format!("l{i}.ffn_gate"));
+            let ffn_up = upload_weight(src.ffn_up_ref(i)?, &format!("l{i}.ffn_up"));
+            let ffn_down = upload_weight(src.ffn_down_ref(i)?, &format!("l{i}.ffn_down"));
 
             let is_conv = config.block_types[i] == BlockType::GatedConv;
 

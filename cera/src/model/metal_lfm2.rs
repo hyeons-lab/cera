@@ -852,9 +852,9 @@ impl MetalLfm2Model {
         for i in 0..config.n_layers {
             let attn_norm = ctx.upload_f32(src.attn_norm_weight(i));
             let ffn_norm = ctx.upload_f32(src.ffn_norm_weight(i));
-            let ffn_gate = upload_weight(src.ffn_gate_ref(i))?;
-            let ffn_up = upload_weight(src.ffn_up_ref(i))?;
-            let ffn_down = upload_weight(src.ffn_down_ref(i))?;
+            let ffn_gate = upload_weight(src.ffn_gate_ref(i)?)?;
+            let ffn_up = upload_weight(src.ffn_up_ref(i)?)?;
+            let ffn_down = upload_weight(src.ffn_down_ref(i)?)?;
             let is_conv = config.block_types[i] == BlockType::GatedConv;
             let (conv_in_proj, conv_out_proj, conv_weight) = if is_conv {
                 let ip = src.conv_in_proj_ref(i).expect("conv layer missing in_proj");
