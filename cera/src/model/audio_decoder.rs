@@ -36,6 +36,13 @@ pub trait AudioGpu {
     /// to the CPU sampler when it is false. Deliberately has no default, so a
     /// new backend has to answer rather than inherit an answer.
     fn supports_depthformer(&self) -> bool;
+
+    /// Convert the accumulated spectrum `[n_frames × n_fft_bins × 2]` (log-mag,
+    /// angle) to PCM via ISTFT. Defaults to the CPU `istft_to_pcm`; GPU backends
+    /// override to run the iDFT-matmul + windowed overlap-add on-device.
+    fn istft_to_pcm(&self, spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f32> {
+        istft_to_pcm(spectrum, n_fft, hop_length)
+    }
 }
 
 /// Configuration for the depthformer (small transformer inside the decoder).
@@ -1202,9 +1209,7 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
     let ifft = planner.plan_fft_inverse(n_fft);
 
     // Periodic Hann window: w[n] = 0.5 * (1 - cos(2π*n/N)).
-    let hann: Vec<f32> = (0..n_fft)
-        .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n_fft as f32).cos()))
-        .collect();
+    let hann = build_hann(n_fft);
 
     // Streaming overlap buffers (size = n_fft).
     let mut overlap_buf = vec![0.0f32; n_fft];
@@ -1265,6 +1270,62 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
         output.drain(..padding);
     }
     output
+}
+
+/// Periodic Hann window of length `n_fft`: `w[n] = 0.5·(1 - cos(2π·n/n_fft))`.
+///
+/// Shared by the CPU `istft_to_pcm` and the GPU ISTFT overlap-add, which uploads
+/// this vector once and reads `hann[local]` / `hann[local]²` per output sample.
+pub fn build_hann(n_fft: usize) -> Vec<f32> {
+    (0..n_fft)
+        .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n_fft as f32).cos()))
+        .collect()
+}
+
+/// Build the real inverse-DFT basis for the GPU ISTFT.
+///
+/// Returns a row-major `[n_fft × (2·n_fft_bins)]` matrix `B` such that a frame's
+/// time-domain signal is `time[t] = Σ_j halfspec[j] · B[t][j]`, where
+/// `halfspec = [re_0..re_{bins-1}, im_0..im_{bins-1}]` is the interleaved
+/// real/imag half-spectrum produced by `exp_polar`. The Hermitian mirror of the
+/// negative frequencies and the `1/n_fft` inverse-transform scale are folded into
+/// the coefficients, so the GPU matmul consumes the half-spectrum directly (no
+/// explicit negative-frequency mirror pass, no radix FFT). This reproduces the
+/// CPU `ifft_frame` real output bin-for-bin up to float rounding:
+///
+/// - DC (`k = 0`): `re` coefficient `1/n_fft`, `im` coefficient `0`.
+/// - interior (`1 ≤ k ≤ n_fft/2 - 1`): doubled, `re = (2/n_fft)·cos(2πkt/n_fft)`,
+///   `im = -(2/n_fft)·sin(2πkt/n_fft)`.
+/// - Nyquist (`k = n_fft/2`): `re = (1/n_fft)·cos(πt)`, `im` coefficient `0`.
+///
+/// The `im` coefficients at DC and Nyquist are zero because those bins are their
+/// own conjugate mirror, exactly as the CPU discards the imaginary part there.
+///
+/// Assumes an even `n_fft` (the STFT convention: the last of `n_fft/2 + 1` bins
+/// is Nyquist), matching the CPU `istft_to_pcm` mirror loop. Every shipping
+/// vocoder uses an even `n_fft` (1280 here).
+pub fn build_idft_basis(n_fft: usize) -> Vec<f32> {
+    let bins = n_fft / 2 + 1;
+    let n = n_fft as f32;
+    let two_pi = 2.0 * std::f32::consts::PI;
+    let mut basis = vec![0.0f32; n_fft * 2 * bins];
+    for t in 0..n_fft {
+        let row = t * 2 * bins;
+        for k in 0..bins {
+            let ang = two_pi * k as f32 * t as f32 / n;
+            let (re_c, im_c) = if k == 0 {
+                (1.0 / n, 0.0)
+            } else if k == bins - 1 {
+                // Nyquist: cos(πt), no imaginary contribution.
+                (ang.cos() / n, 0.0)
+            } else {
+                (2.0 * ang.cos() / n, -2.0 * ang.sin() / n)
+            };
+            basis[row + k] = re_c;
+            basis[row + bins + k] = im_c;
+        }
+    }
+    basis
 }
 
 /// Inverse FFT of one frame using a pre-planned FFT.

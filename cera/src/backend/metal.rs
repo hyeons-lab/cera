@@ -364,6 +364,17 @@ pub mod shaders {
     pub const BIAS_ADD: &str = include_str!(concat!(env!("OUT_DIR"), "/bias_add.metal"));
     pub const VIT_ATTENTION: &str = include_str!("shaders/vit_attention.metal");
     pub const VIT_ATTENTION_MMA: &str = include_str!("shaders/vit_attention_mma.metal");
+    /// Generated from `shaders/slang/exp_polar.slang` by build.rs and shared with
+    /// the wgpu backend's `wgpu::shaders::EXP_POLAR`. First GPU ISTFT stage:
+    /// maps the detokenizer's polar half-spectrum (log-magnitude, angle) to the
+    /// interleaved real/imag half-spectrum the iDFT matmul consumes. A portable
+    /// element-wise map, no `__target_switch`.
+    pub const EXP_POLAR: &str = include_str!(concat!(env!("OUT_DIR"), "/exp_polar.metal"));
+    /// Generated from `shaders/slang/overlap_add.slang` by build.rs and shared
+    /// with the wgpu backend's `wgpu::shaders::OVERLAP_ADD`. Final GPU ISTFT
+    /// stage: windowed overlap-add of the iDFT frames into PCM, one thread per
+    /// output sample. A portable position-indexed reduction, no `__target_switch`.
+    pub const OVERLAP_ADD: &str = include_str!(concat!(env!("OUT_DIR"), "/overlap_add.metal"));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────

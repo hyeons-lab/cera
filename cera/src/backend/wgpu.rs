@@ -1236,6 +1236,17 @@ pub mod shaders {
     /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
     pub const CONV1D_FUSED_BATCH: &str =
         include_str!(concat!(env!("OUT_DIR"), "/conv1d_fused_batch.wgsl"));
+    /// Generated from `shaders/slang/exp_polar.slang` by build.rs and shared with
+    /// the Metal backend's `metal::shaders::EXP_POLAR`. First GPU ISTFT stage:
+    /// maps the detokenizer's polar half-spectrum (log-magnitude, angle) to the
+    /// interleaved real/imag half-spectrum the iDFT matmul consumes. A portable
+    /// element-wise map, no `__target_switch`.
+    pub const EXP_POLAR: &str = include_str!(concat!(env!("OUT_DIR"), "/exp_polar.wgsl"));
+    /// Generated from `shaders/slang/overlap_add.slang` by build.rs and shared
+    /// with the Metal backend's `metal::shaders::OVERLAP_ADD`. Final GPU ISTFT
+    /// stage: windowed overlap-add of the iDFT frames into PCM, one thread per
+    /// output sample. A portable position-indexed reduction, no `__target_switch`.
+    pub const OVERLAP_ADD: &str = include_str!(concat!(env!("OUT_DIR"), "/overlap_add.wgsl"));
     /// Generated from `shaders/slang/per_head_rmsnorm.slang` by build.rs and
     /// shared with the Metal backend's
     /// `metal::shaders::PER_HEAD_RMSNORM`. A `__target_switch`

@@ -214,6 +214,62 @@ fn pcm_parity() {
     eprintln!("pcm_parity: PASSED");
 }
 
+/// The GPU ISTFT (`exp_polar` → iDFT-matmul → `overlap_add`) must reproduce the
+/// CPU `istft_to_pcm` on the *same* spectrum, isolating the ISTFT from any
+/// spectrum divergence. The iDFT-as-matmul differs from rustfft's radix only by
+/// float rounding, so the bar is tight.
+#[test]
+fn gpu_istft_matches_cpu() {
+    if !gpu_available() {
+        return;
+    }
+    let Some((gguf, path)) = load_vocoder() else {
+        return;
+    };
+
+    let detok_w = cera::model::audio_decoder::DetokenizerWeights::from_gguf(&gguf).unwrap();
+    let dec_w = cera::model::audio_decoder::AudioDecoderWeights::from_gguf(&gguf).unwrap();
+    let gpu = cera::model::wgpu_audio_decoder::WgpuAudioDecoder::from_gguf(&gguf, &path).unwrap();
+
+    // Accumulate several frames (like the engine's `all_spectrum`) so overlap-add
+    // runs well past the n_fft/hop overlap depth and through the tail.
+    let mut cpu_state = cera::model::audio_decoder::DetokenizerState::new(&detok_w.config);
+    let mut spectrum = Vec::new();
+    for f in 0..4 {
+        let base = f * 111 + 20;
+        let codes: Vec<i32> = (0..8).map(|c| base + c * 90).collect();
+        let s = cera::model::audio_decoder::detokenize_to_spectrum(
+            &detok_w,
+            &dec_w,
+            &mut cpu_state,
+            &codes,
+        );
+        spectrum.extend_from_slice(&s);
+    }
+
+    let n_fft = detok_w.config.n_fft;
+    let hop = detok_w.config.hop_length;
+    let cpu_pcm = cera::model::audio_decoder::istft_to_pcm(&spectrum, n_fft, hop);
+    let gpu_pcm = gpu.istft_to_pcm(&spectrum, n_fft, hop);
+
+    assert_eq!(cpu_pcm.len(), gpu_pcm.len(), "PCM length mismatch");
+    assert!(gpu_pcm.iter().all(|v| v.is_finite()), "GPU PCM NaN/Inf");
+
+    let cos = cosine_sim(&cpu_pcm, &gpu_pcm);
+    let cpu_rms = rms(&cpu_pcm);
+    let worst = max_abs_diff(&cpu_pcm, &gpu_pcm);
+    eprintln!(
+        "  gpu_istft: cos={cos:.6} cpu_rms={cpu_rms:.4} worst_abs_diff={worst:.4} rel={:.4e}",
+        worst as f64 / cpu_rms.max(1e-9)
+    );
+    assert!(cos > 0.999, "GPU ISTFT cosine {cos:.6} < 0.999");
+    assert!(
+        (worst as f64) < 0.05 * cpu_rms.max(1e-6),
+        "GPU ISTFT worst abs diff {worst:.4} > 5% of CPU RMS {cpu_rms:.4}"
+    );
+    eprintln!("gpu_istft_matches_cpu: PASSED");
+}
+
 #[test]
 fn multi_frame_stability() {
     if !gpu_available() {

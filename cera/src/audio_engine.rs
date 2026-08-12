@@ -186,11 +186,12 @@ impl<'a> AudioOutputDecoder<'a> {
         if self.all_spectrum.is_empty() {
             return 0;
         }
-        let pcm = istft_to_pcm(
-            &self.all_spectrum,
-            self.detok_weights.config.n_fft,
-            self.detok_weights.config.hop_length,
-        );
+        let n_fft = self.detok_weights.config.n_fft;
+        let hop = self.detok_weights.config.hop_length;
+        let pcm = match self.gpu {
+            Some(g) => g.istft_to_pcm(&self.all_spectrum, n_fft, hop),
+            None => istft_to_pcm(&self.all_spectrum, n_fft, hop),
+        };
         if pcm.is_empty() {
             return 0;
         }

@@ -19,8 +19,11 @@
 //! depthformer (code sampling) stays on CPU; `supports_depthformer` reports
 //! that, so `CERA_GPU_DF=1` keeps sampling on the CPU rather than reaching the
 //! `sample_audio_frame` panic here. A WGPU depthformer is a follow-up.
-//! PCM is still produced by the CPU `istft_to_pcm` until the ISTFT PR moves it
-//! to the GPU.
+//!
+//! The final ISTFT (`istft_to_pcm`) runs on the GPU too: `exp_polar` maps the
+//! polar half-spectrum to complex, a reg-tile GEMM against a precomputed real
+//! inverse-DFT basis does the iDFT, and `overlap_add` windows and folds the
+//! frames into PCM. Only the startup-pad strip stays on the CPU after readback.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -78,6 +81,8 @@ struct Pipelines {
     silu_mul: wgpu::ComputePipeline,
     add_inplace: wgpu::ComputePipeline,
     bias_add: wgpu::ComputePipeline,
+    exp_polar: wgpu::ComputePipeline,
+    overlap_add: wgpu::ComputePipeline,
 }
 
 pub struct WgpuAudioDecoder {
@@ -89,6 +94,11 @@ pub struct WgpuAudioDecoder {
     output_norm: Buffer,
     lin_w: GpuWeight,
     lin_b: Buffer,
+
+    // GPU ISTFT: real inverse-DFT basis `[n_fft x 2·n_fft_bins]` and the Hann
+    // window `[n_fft]`, both derived from the config and uploaded once.
+    idft_basis: GpuWeight,
+    hann: Buffer,
 
     // Scratch (all sized for N_FRAMES tokens).
     hidden_buf: Buffer,       // residual stream [N x hs]
@@ -241,6 +251,16 @@ impl WgpuAudioDecoder {
                 "audio_detok_add_inplace",
             ),
             bias_add: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "audio_detok_bias_add"),
+            exp_polar: ctx.create_pipeline(
+                shaders::EXP_POLAR,
+                "exp_polar",
+                "audio_istft_exp_polar",
+            ),
+            overlap_add: ctx.create_pipeline(
+                shaders::OVERLAP_ADD,
+                "overlap_add",
+                "audio_istft_overlap_add",
+            ),
         };
 
         // Dequantize each weight to f32 (CPU-matching precision) and upload.
@@ -321,6 +341,20 @@ impl WgpuAudioDecoder {
             n_embd_bins(&cfg)
         );
 
+        // GPU ISTFT tables, built once from the config. `idft_basis` is an
+        // `[n_fft x 2·n_fft_bins]` weight consumed by the reg-tile GEMM exactly
+        // like `lin_w`; `hann` is the length-`n_fft` window read by `overlap_add`.
+        let basis = crate::model::audio_decoder::build_idft_basis(cfg.n_fft);
+        let idft_basis = GpuWeight {
+            buf: ctx.upload_f32(&basis, "audio_istft_idft_basis"),
+            m: cfg.n_fft as u32,
+            k: n_embd_bins(&cfg) as u32,
+        };
+        let hann = ctx.upload_f32(
+            &crate::model::audio_decoder::build_hann(cfg.n_fft),
+            "audio_istft_hann",
+        );
+
         let alloc = |n: usize, label: &str| ctx.create_storage_rw((n * 4) as u64, label);
         let big = n_embd.max(kv_dim).max(ffn_dim);
         let hidden_buf = alloc(N_FRAMES * n_embd, "audio_detok_hidden");
@@ -353,6 +387,8 @@ impl WgpuAudioDecoder {
             output_norm,
             lin_w,
             lin_b,
+            idft_basis,
+            hann,
             hidden_buf,
             normed_buf,
             proj_buf,
@@ -851,6 +887,103 @@ impl WgpuAudioDecoder {
         self.ctx
             .download_f32(&self.spectrum_buf, N_FRAMES * spec_per_frame)
     }
+
+    /// Convert the accumulated spectrum to PCM on the GPU: `exp_polar` →
+    /// iDFT-matmul → windowed `overlap_add`. Numerically mirrors the CPU
+    /// `istft_to_pcm` (the iDFT basis folds the Hermitian mirror and the
+    /// `1/n_fft` scale), down to the startup-pad strip, which stays on the CPU
+    /// after readback. Runs once at end-of-generation, so the frame-sized
+    /// scratch is allocated per call rather than persisted.
+    pub fn istft_to_pcm(&self, spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f32> {
+        debug_assert_eq!(n_fft, self.cfg.n_fft, "istft n_fft differs from config");
+        debug_assert_eq!(
+            hop_length, self.cfg.hop_length,
+            "istft hop differs from config"
+        );
+        let bins = n_fft / 2 + 1;
+        let frame_size = bins * 2;
+        let n_frames = spectrum.len() / frame_size;
+        if n_frames == 0 {
+            return vec![];
+        }
+
+        // A single 1D dispatch caps the frame count at the device's
+        // `max_compute_workgroups_per_dimension` (65535 by default); the CPU
+        // `istft_to_pcm` has no such limit, so fall back to it for very long
+        // utterances (many minutes) rather than tripping a wgpu validation panic.
+        let max_wg = self
+            .ctx
+            .device
+            .limits()
+            .max_compute_workgroups_per_dimension as usize;
+        let exp_wg = (n_frames * bins).div_ceil(256);
+        let oa_wg = (n_frames * hop_length).div_ceil(256);
+        let gemm_wg_n = n_frames.div_ceil((MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N) as usize);
+        if exp_wg > max_wg || oa_wg > max_wg || gemm_wg_n > max_wg {
+            return crate::model::audio_decoder::istft_to_pcm(spectrum, n_fft, hop_length);
+        }
+
+        let spec_buf = self.ctx.upload_f32(spectrum, "audio_istft_spectrum_in");
+        let halfspec = self
+            .ctx
+            .create_storage_rw((n_frames * frame_size * 4) as u64, "audio_istft_halfspec");
+        let time_domain = self
+            .ctx
+            .create_storage_rw((n_frames * n_fft * 4) as u64, "audio_istft_time");
+        let pcm_buf = self
+            .ctx
+            .create_storage_rw((n_frames * hop_length * 4) as u64, "audio_istft_pcm");
+
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+
+        // 1. Polar half-spectrum (log-mag, angle) → interleaved [re | im].
+        let ep = self.params(
+            &[n_frames as u32, bins as u32],
+            "audio_istft_exp_polar_params",
+        );
+        self.encode(
+            &mut enc,
+            &self.pipes.exp_polar,
+            &[&spec_buf, &halfspec, &ep],
+            (((n_frames * bins) as u32).div_ceil(256), 1, 1),
+            "audio_istft_exp_polar",
+        );
+
+        // 2. iDFT as a matmul: time_domain[frame, t] = Σ_j halfspec[frame, j]·B[t, j].
+        self.gemm(
+            &mut enc,
+            &self.idft_basis,
+            &halfspec,
+            &time_domain,
+            n_frames as u32,
+            frame_size as u32,
+            n_fft as u32,
+        );
+
+        // 3. Windowed overlap-add → PCM.
+        let oa = self.params(
+            &[n_frames as u32, n_fft as u32, hop_length as u32, 0],
+            "audio_istft_overlap_params",
+        );
+        self.encode(
+            &mut enc,
+            &self.pipes.overlap_add,
+            &[&time_domain, &self.hann, &pcm_buf, &oa],
+            (((n_frames * hop_length) as u32).div_ceil(256), 1, 1),
+            "audio_istft_overlap_add",
+        );
+
+        self.ctx.submit_encoder(enc);
+
+        let mut pcm = self.ctx.download_f32(&pcm_buf, n_frames * hop_length);
+        // Strip the startup-padding artifacts, matching the CPU `istft_to_pcm`
+        // tail (leave the buffer untouched when it is shorter than the pad).
+        let padding = (n_fft - hop_length) / 2;
+        if pcm.len() > padding {
+            pcm.drain(..padding);
+        }
+        pcm
+    }
 }
 
 /// Spectrum floats per frame: `(n_fft/2 + 1) * 2` (log-magnitude, angle).
@@ -874,6 +1007,10 @@ impl crate::model::audio_decoder::AudioGpu for WgpuAudioDecoder {
 
     fn detokenize_to_spectrum(&self, cpu_weights: &DetokenizerWeights, codes: &[i32]) -> Vec<f32> {
         self.detokenize_to_spectrum(cpu_weights, codes)
+    }
+
+    fn istft_to_pcm(&self, spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f32> {
+        self.istft_to_pcm(spectrum, n_fft, hop_length)
     }
 
     fn reset_depthformer(&self) {}

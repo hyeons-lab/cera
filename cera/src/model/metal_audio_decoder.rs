@@ -2,7 +2,8 @@
 //
 // The detokenizer (8-layer LFM2 backbone, 6 tokens per frame) is the main
 // audio bottleneck at ~165ms/frame on CPU. This module moves it to Metal,
-// targeting ~10-15ms/frame. ISTFT stays on CPU (rustfft).
+// targeting ~10-15ms/frame. The final ISTFT also runs on Metal (`exp_polar` →
+// per-frame iDFT gemv → `overlap_add`); only the startup-pad strip is CPU.
 //
 // Weight tensors are Q4_0 in the vocoder GGUF — accessed via zero-copy mmap
 // exactly like the LLM weights in metal_lfm2.rs.
@@ -70,6 +71,8 @@ struct Pipelines {
     qk_norm_rope: ComputePipelineState,
     flash_attention: ComputePipelineState,
     conv1d: ComputePipelineState,
+    exp_polar: ComputePipelineState,
+    overlap_add: ComputePipelineState,
 }
 
 // ── Params buffers ──────────────────────────────────────────────────────────
@@ -94,6 +97,11 @@ pub struct MetalAudioDecoder {
     output_norm: Buffer,
     lin_w: MetalWeight,
     lin_b: Buffer,
+
+    // GPU ISTFT: real inverse-DFT basis `[n_fft x 2·n_fft_bins]` (consumed by the
+    // per-frame gemv) and the Hann window `[n_fft]`, both built from the config.
+    idft_basis: MetalWeight,
+    hann: Buffer,
 
     // Scratch
     hidden_buf: Buffer,
@@ -173,6 +181,8 @@ impl MetalAudioDecoder {
             qk_norm_rope: ctx.create_pipeline(shaders::QK_NORM_ROPE, "qk_norm_rope")?,
             flash_attention: ctx.create_pipeline(shaders::FLASH_ATTENTION, "flash_attention")?,
             conv1d: ctx.create_pipeline(shaders::CONV1D, "conv1d_depthwise")?,
+            exp_polar: ctx.create_pipeline(shaders::EXP_POLAR, "exp_polar")?,
+            overlap_add: ctx.create_pipeline(shaders::OVERLAP_ADD, "overlap_add")?,
         };
 
         // Weights are dequantized from Q4_0 to F32 and uploaded.
@@ -290,6 +300,25 @@ impl MetalAudioDecoder {
         let lin_w = make_weight("lin.weight")?;
         let lin_b = ctx.upload_f32(&gguf.get_tensor("lin.bias")?.to_f32_vec());
 
+        // GPU ISTFT tables, built once from the config. `idft_basis` is an
+        // `[n_fft x 2·n_fft_bins]` weight the per-frame gemv consumes exactly like
+        // `lin_w`; `hann` is the length-`n_fft` window read by `overlap_add`.
+        let n_fft_bins = cfg.n_fft / 2 + 1;
+        let idft_basis = {
+            let basis = crate::model::audio_decoder::build_idft_basis(cfg.n_fft);
+            let buf = ctx.upload_f32(&basis);
+            let params_buf = ctx.upload_bytes(bytemuck::cast_slice(&[
+                cfg.n_fft as u32,
+                (n_fft_bins * 2) as u32,
+            ]));
+            MetalWeight {
+                buf,
+                m: cfg.n_fft as u32,
+                params_buf,
+            }
+        };
+        let hann = ctx.upload_f32(&crate::model::audio_decoder::build_hann(cfg.n_fft));
+
         // Scratch buffers
         let spectrum_size = 6 * (cfg.n_fft / 2 + 1) * 2;
         let ab = |n: usize| ctx.create_buffer((n * 4) as u64);
@@ -358,6 +387,8 @@ impl MetalAudioDecoder {
             output_norm,
             lin_w,
             lin_b,
+            idft_basis,
+            hann,
             hidden_buf,
             normed_buf,
             accum_scratch,
@@ -900,6 +931,94 @@ impl MetalAudioDecoder {
         }
         spectrum
     }
+
+    /// Convert the accumulated spectrum to PCM on the GPU: `exp_polar` →
+    /// per-frame iDFT gemv → windowed `overlap_add`. Numerically mirrors the CPU
+    /// `istft_to_pcm` (the iDFT basis folds the Hermitian mirror and the
+    /// `1/n_fft` scale), down to the startup-pad strip, which stays on the CPU
+    /// after readback. Runs once at end-of-generation, so the frame-sized scratch
+    /// is allocated per call rather than persisted.
+    pub fn istft_to_pcm(&self, spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f32> {
+        debug_assert_eq!(n_fft, self.cfg.n_fft, "istft n_fft differs from config");
+        debug_assert_eq!(
+            hop_length, self.cfg.hop_length,
+            "istft hop differs from config"
+        );
+        let bins = n_fft / 2 + 1;
+        let frame_size = bins * 2;
+        let n_frames = spectrum.len() / frame_size;
+        if n_frames == 0 {
+            return vec![];
+        }
+
+        let spec_buf = self.ctx.upload_f32(spectrum);
+        let halfspec = self.ctx.create_buffer((n_frames * frame_size * 4) as u64);
+        let time_domain = self.ctx.create_buffer((n_frames * n_fft * 4) as u64);
+        let pcm_buf = self.ctx.create_buffer((n_frames * hop_length * 4) as u64);
+        let ep_params = self
+            .ctx
+            .upload_bytes(bytemuck::cast_slice(&[n_frames as u32, bins as u32]));
+        let oa_params = self.ctx.upload_bytes(bytemuck::cast_slice(&[
+            n_frames as u32,
+            n_fft as u32,
+            hop_length as u32,
+            0u32,
+        ]));
+
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+
+        // 1. Polar half-spectrum (log-mag, angle) → interleaved [re | im].
+        enc.set_compute_pipeline_state(&self.pipes.exp_polar);
+        enc.set_buffer(0, Some(&spec_buf), 0);
+        enc.set_buffer(1, Some(&halfspec), 0);
+        enc.set_buffer(2, Some(&ep_params), 0);
+        enc.dispatch_thread_groups(sz1d(((n_frames * bins) as u64).div_ceil(256)), sz1d(256));
+        self.barrier(enc);
+
+        // 2. iDFT as a matmul, one gemv per frame over the shared basis (frame
+        // offsets into halfspec/time_domain, mirroring the lin-head loop above).
+        for f in 0..n_frames {
+            let x_off = (f * frame_size * 4) as u64;
+            let y_off = (f * n_fft * 4) as u64;
+            enc.set_compute_pipeline_state(&self.pipes.gemv_f32);
+            enc.set_buffer(0, Some(&self.idft_basis.buf), 0);
+            enc.set_buffer(1, Some(&halfspec), x_off);
+            enc.set_buffer(2, Some(&time_domain), y_off);
+            enc.set_buffer(3, Some(&self.idft_basis.params_buf), 0);
+            enc.dispatch_thread_groups(sz1d(self.idft_basis.m as u64), sz1d(32));
+        }
+        self.barrier(enc);
+
+        // 3. Windowed overlap-add → PCM.
+        enc.set_compute_pipeline_state(&self.pipes.overlap_add);
+        enc.set_buffer(0, Some(&time_domain), 0);
+        enc.set_buffer(1, Some(&self.hann), 0);
+        enc.set_buffer(2, Some(&pcm_buf), 0);
+        enc.set_buffer(3, Some(&oa_params), 0);
+        enc.dispatch_thread_groups(
+            sz1d(((n_frames * hop_length) as u64).div_ceil(256)),
+            sz1d(256),
+        );
+
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let total = n_frames * hop_length;
+        let mut pcm = vec![0.0f32; total];
+        unsafe {
+            let src = pcm_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, pcm.as_mut_ptr(), total);
+        }
+        // Strip the startup-padding artifacts, matching the CPU `istft_to_pcm`
+        // tail (leave the buffer untouched when it is shorter than the pad).
+        let padding = (n_fft - hop_length) / 2;
+        if pcm.len() > padding {
+            pcm.drain(..padding);
+        }
+        pcm
+    }
 }
 
 // ── MetalDepthformer ────────────────────────────────────────────────────────
@@ -1415,6 +1534,10 @@ impl crate::model::audio_decoder::AudioGpu for MetalAudioDecoder {
         codes: &[i32],
     ) -> Vec<f32> {
         self.detokenize_to_spectrum(cpu_weights, codes)
+    }
+
+    fn istft_to_pcm(&self, spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f32> {
+        self.istft_to_pcm(spectrum, n_fft, hop_length)
     }
 
     fn reset_depthformer(&self) {
