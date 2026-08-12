@@ -73,10 +73,11 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    File, FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetDirectoryOptions,
-    FileSystemGetFileOptions, FileSystemHandle, FileSystemHandleKind, FileSystemReadWriteOptions,
-    FileSystemRemoveOptions, FileSystemSyncAccessHandle, FileSystemWritableFileStream,
-    ReadableStreamDefaultReader, RequestInit, Response, StorageManager,
+    AbortSignal, File, FileSystemDirectoryHandle, FileSystemFileHandle,
+    FileSystemGetDirectoryOptions, FileSystemGetFileOptions, FileSystemHandle,
+    FileSystemHandleKind, FileSystemReadWriteOptions, FileSystemRemoveOptions,
+    FileSystemSyncAccessHandle, FileSystemWritableFileStream, ReadableStreamDefaultReader,
+    RequestInit, Response, StorageManager,
 };
 
 /// `fetch` off the global scope. Bound directly rather than through
@@ -90,12 +91,49 @@ extern "C" {
 
     #[wasm_bindgen(js_name = fetch)]
     fn global_fetch_with_init(input: &str, init: &RequestInit) -> js_sys::Promise;
+
+    /// `AbortSignal.timeout(ms)`. Bound by hand because the pinned
+    /// `web-sys` exposes the `AbortSignal` type without this static
+    /// constructor.
+    ///
+    /// Bound infallibly, so a browser without it throws a `TypeError`
+    /// out of every fetch here rather than degrading. That is a
+    /// deliberate floor, not an oversight: it arrived in Chrome 103 /
+    /// Safari 16, later than OPFS itself (Chrome 86 / Safari 15.2), so
+    /// the two are not equivalent. It is however comfortably older than
+    /// the WebGPU this crate's fast path needs (Chrome 113 / Safari
+    /// 18), and a store that silently reverts to unbounded fetches is
+    /// the hang this exists to prevent.
+    #[wasm_bindgen(js_namespace = AbortSignal, js_name = timeout)]
+    fn abort_after(ms: u32) -> AbortSignal;
 }
 
 /// Directory name used when the caller doesn't pick one. Everything
 /// lives under this single top-level OPFS entry so `clearCache` can
 /// remove the tree without touching anything else the origin stored.
 const DEFAULT_STORE_DIR: &str = "cera-models";
+
+/// Deadline for the small requests: the `HEAD` probe and the catalog
+/// GET in `list_leap_bundles`. Matches the native store's.
+///
+/// `fetch` has no default timeout, and a stalled connection (captive
+/// portal, a proxy that blackholes rather than refuses) leaves its
+/// promise *pending* rather than rejecting it. Without a signal the
+/// await never returns, so a load hangs with no error and no progress
+/// instead of falling back. That is not hypothetical: it is what a
+/// stalled HEAD against huggingface.co did here, and it defeats
+/// `head_info`'s "never fails" contract, which only holds for a
+/// rejected fetch.
+const HEAD_TIMEOUT_MS: u32 = 30_000;
+
+/// Deadline for a model download, covering the whole body rather than
+/// just the response head. Generous because a multi-GB GGUF on a slow
+/// link legitimately takes minutes; it is still a real ceiling, and a
+/// transfer slower than roughly 2.5 MB/s sustained will not finish a
+/// 1.5 GB bundle inside it. The store has no resume, so such a download
+/// restarts. Matches the native store, deliberately: a shared number
+/// that is occasionally too small beats two that drift.
+const GET_TIMEOUT_MS: u32 = 600_000;
 
 /// Suffix for the persisted per-file hash, matching the native store's
 /// `<dest>.sha256` sidecar so the two layouts stay readable as one.
@@ -426,6 +464,48 @@ impl BundleRepo {
         Ok(true)
     }
 
+    /// Drain the response body into `writer`, hashing and reporting progress
+    /// as it goes. Returns the number of bytes written.
+    ///
+    /// Split out of `download_to_cache` so that every way this can fail (a
+    /// rejected read, an abort, a malformed chunk, a failed write) leaves
+    /// through one `Err` its caller can clean up after, rather than each error
+    /// having to remember to undo the partial file itself.
+    async fn stream_body(
+        reader: &ReadableStreamDefaultReader,
+        writer: &mut Writer,
+        hasher: &mut Sha256,
+        url: &str,
+        total: Option<f64>,
+        on_progress: Option<&Function>,
+    ) -> Result<u64, JsError> {
+        let mut written: u64 = 0;
+        let mut reported: u64 = 0;
+        loop {
+            let next = JsFuture::from(reader.read())
+                .await
+                .map_err(|e| js_err(&format!("reading `{url}`"), e))?;
+            if Reflect::get(&next, &JsValue::from_str("done"))
+                .map(|v| v.is_truthy())
+                .unwrap_or(true)
+            {
+                break;
+            }
+            let chunk: Uint8Array = Reflect::get(&next, &JsValue::from_str("value"))
+                .map_err(|e| js_err(&format!("reading `{url}`"), e))?
+                .unchecked_into();
+            let chunk = chunk.to_vec();
+            hasher.update(&chunk);
+            writer.write(&chunk).await?;
+            written = written.saturating_add(chunk.len() as u64);
+            if written - reported >= PROGRESS_INTERVAL_BYTES {
+                reported = written;
+                report_progress(on_progress, url, written, total);
+            }
+        }
+        Ok(written)
+    }
+
     /// Stream `url` into the cache, hashing as it goes.
     async fn download_to_cache(
         &self,
@@ -434,7 +514,13 @@ impl BundleRepo {
         content_length: Option<f64>,
         on_progress: Option<&Function>,
     ) -> Result<(), JsError> {
-        let response = fetch_ok(url, None).await?;
+        // The deadline covers the response head *and* the body stream:
+        // an `AbortSignal` fires against the whole request, so a
+        // transfer that stalls mid-body aborts too rather than leaving
+        // the reader waiting on a chunk that never arrives.
+        let init = RequestInit::new();
+        init.set_signal(Some(&abort_after(GET_TIMEOUT_MS)));
+        let response = fetch_ok(url, Some(&init)).await?;
         // Prefer the HEAD-probed length: the CDN response usually
         // echoes `Content-Length` too, but a chunked one won't, and a
         // progress bar that loses its total mid-download is worse than
@@ -456,37 +542,35 @@ impl BundleRepo {
         let mut writer = Writer::open(&handle).await?;
 
         let mut hasher = Sha256::new();
-        let mut written: u64 = 0;
-        let mut reported: u64 = 0;
-        loop {
-            let next = JsFuture::from(reader.read())
-                .await
-                .map_err(|e| js_err(&format!("reading `{url}`"), e))?;
-            if Reflect::get(&next, &JsValue::from_str("done"))
-                .map(|v| v.is_truthy())
-                .unwrap_or(true)
-            {
-                break;
-            }
-            let chunk: Uint8Array = Reflect::get(&next, &JsValue::from_str("value"))
-                .map_err(|e| js_err(&format!("reading `{url}`"), e))?
-                .unchecked_into();
-            let chunk = chunk.to_vec();
-            hasher.update(&chunk);
-            if let Err(e) = writer.write(&chunk).await {
-                // Leave nothing half-written for a later run to mistake
-                // for a complete download.
+        // Every failure inside the stream gets the same cleanup, so the loop
+        // runs in a helper and the recovery lives at one call site. It used to
+        // be attached only to the write branch, which left the read branch
+        // returning through `?` with a truncated file still in the cache and,
+        // on the sync writer, its exclusive lock still held. Both matter more
+        // now that `GET_TIMEOUT_MS` makes a mid-body abort a routine outcome
+        // rather than a network freak: the truncated entry has no `.sha256`
+        // sidecar, so a later resolve whose HEAD probe also fails accepts it as
+        // a cache hit, and the held lock fails the immediate retry, which on
+        // the worker's `auto` path is the CPU load right behind a GPU attempt.
+        let streamed =
+            Self::stream_body(&reader, &mut writer, &mut hasher, url, total, on_progress).await;
+        let written = match streamed {
+            Ok(written) => written,
+            Err(e) => {
                 writer.abandon();
                 let _ = self.remove(url.to_string()).await;
                 return Err(e);
             }
-            written = written.saturating_add(chunk.len() as u64);
-            if written - reported >= PROGRESS_INTERVAL_BYTES {
-                reported = written;
-                report_progress(on_progress, url, written, total);
-            }
+        };
+        // `close` is part of the write, not a release: the `Writer::Stream`
+        // variant only commits there, so this is where a multi-GB model meets
+        // `QuotaExceededError`. A failure has to drop the entry for the same
+        // reason a mid-stream one does, or it stays as a truncated file with no
+        // sidecar for a later resolve to accept as a cache hit.
+        if let Err(e) = writer.close().await {
+            let _ = self.remove(url.to_string()).await;
+            return Err(e);
         }
-        writer.close().await?;
         report_progress(on_progress, url, written, total);
 
         let actual = hex(&hasher.finalize());
@@ -524,7 +608,17 @@ impl BundleRepo {
             .await?
             .ok_or_else(|| JsError::new("could not create the .sha256 sidecar"))?;
         let mut writer = Writer::open(&handle).await?;
-        writer.write(hash.as_bytes()).await?;
+        // `abandon` on failure, for the same reason the payload write does it:
+        // a `Writer::Sync` dropped without releasing its access handle holds
+        // OPFS's exclusive lock for the life of the worker, so the immediate
+        // retry (the CPU load right behind a GPU attempt) would fail with
+        // `NoModificationAllowedError` on a sidecar that not even `remove` can
+        // delete. Reachable here on the same quota-exhaustion path as the
+        // payload, since this write is what follows a multi-GB flush.
+        if let Err(e) = writer.write(hash.as_bytes()).await {
+            writer.abandon();
+            return Err(e);
+        }
         writer.close().await
     }
 }
@@ -558,6 +652,7 @@ struct HeadInfo {
 async fn head_info(url: &str) -> HeadInfo {
     let init = RequestInit::new();
     init.set_method("HEAD");
+    init.set_signal(Some(&abort_after(HEAD_TIMEOUT_MS)));
     let Ok(response) = fetch_ok(url, Some(&init)).await else {
         return HeadInfo::default();
     };
@@ -693,11 +788,18 @@ impl Writer {
     async fn close(self) -> Result<(), JsError> {
         match self {
             Writer::Sync { handle, .. } => {
-                handle
+                // The handle is closed whether or not the flush succeeded.
+                // Returning through `?` here would drop it still holding
+                // OPFS's exclusive lock on the file, so the retry right behind
+                // this one (the worker's CPU fallback after a GPU attempt)
+                // would fail with `NoModificationAllowedError` for the
+                // lifetime of the worker, which is the invariant `abandon`
+                // exists to keep.
+                let flushed = handle
                     .flush()
-                    .map_err(|e| js_err("flushing the cache entry", e))?;
+                    .map_err(|e| js_err("flushing the cache entry", e));
                 handle.close();
-                Ok(())
+                flushed
             }
             // A writable stream only commits its contents on `close`,
             // so this is the write, not just a release.
@@ -1067,7 +1169,12 @@ pub async fn persist_storage() -> Result<bool, JsError> {
 /// `CeraEngine.fromBundleId` are filtered out rather than offered.
 #[wasm_bindgen(js_name = listLeapBundles)]
 pub async fn list_leap_bundles() -> Result<JsValue, JsError> {
-    let response = fetch_ok(LEAP_BUNDLES_API_URL, None).await?;
+    // Same deadline as the HEAD probe: this is a small JSON response,
+    // and a picker that never opens is worse than one that reports it
+    // couldn't reach the catalog.
+    let init = RequestInit::new();
+    init.set_signal(Some(&abort_after(HEAD_TIMEOUT_MS)));
+    let response = fetch_ok(LEAP_BUNDLES_API_URL, Some(&init)).await?;
     let body = JsFuture::from(
         response
             .text()

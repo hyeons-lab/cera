@@ -58,6 +58,9 @@ extension type _Request._(JSObject _) implements JSObject {
     String? text,
     bool? addSpecial,
     JSArray<JSNumber>? tokens,
+    String? bundleId,
+    String? quant,
+    String? storeDir,
   });
 }
 
@@ -77,11 +80,24 @@ extension type _Reply._(JSObject _) implements JSObject {
   external String? get error;
   external String? get kind;
   external JSAny? get result;
+  // Download-progress fields, present only on `event: 'progress'`. The two
+  // counts are `JSAny?` rather than `int?`: they cross as JS numbers and
+  // `total` is genuinely null when the server sent no length, which a nullable
+  // Dart primitive cannot represent across interop.
+  external String? get url;
+  external JSAny? get done;
+  external JSAny? get total;
 }
 
 extension type _OpenResult._(JSObject _) implements JSObject {
   external String get backend;
   external _Capabilities get capabilities;
+}
+
+/// One entry of the `listBundles` reply.
+extension type _BundleEntry._(JSObject _) implements JSObject {
+  external String get name;
+  external JSArray<JSString> get quants;
 }
 
 extension type _Capabilities._(JSObject _) implements JSObject {
@@ -134,6 +150,57 @@ Future<Cera> openBytes(
   return worker;
 }
 
+/// Lists the published bundles. See [Cera.listBundles].
+///
+/// Spins up a worker, asks, and terminates it. That is heavier than a plain
+/// HTTP request, and deliberate: the catalog is fetched and parsed by the same
+/// Rust code the CLI uses, so a browser picker and `cera list-bundles` cannot
+/// disagree about what exists. Doing it in Dart would mean a second parser and
+/// a second set of rules about which entries are offerable.
+Future<List<CeraBundle>> listBundles(CeraOptions options) async {
+  final worker = _WorkerCera(options);
+  try {
+    worker._spawn();
+    final result = await worker._send(
+      worker._newId(),
+      (id) => _Request(id: id, op: 'listBundles', moduleUrl: worker._moduleUrl),
+    );
+    return [
+      for (final entry in (result as JSArray<_BundleEntry>).toDart)
+        CeraBundle(
+          name: entry.name,
+          quants: [for (final q in entry.quants.toDart) q.toDart],
+        ),
+    ];
+  } finally {
+    // Always, including on failure: a worker left running holds the wasm module
+    // it imported, and a picker that is opened and closed repeatedly would
+    // otherwise accumulate one per attempt.
+    worker._shutDown(StateError('this Cera bundle listing is finished'));
+  }
+}
+
+/// Downloads and opens a published bundle. See [Cera.openBundle].
+Future<Cera> openBundle(
+  String name,
+  String quant,
+  CeraOptions options,
+  void Function(CeraDownload progress)? onProgress,
+  String? storeDir,
+) async {
+  final worker = _WorkerCera(options);
+  try {
+    await worker._startBundle(name, quant, storeDir, onProgress);
+  } on Object {
+    // As in `openBytes`: the worker exists before the open can fail, and a
+    // failed open hands the caller nothing to `close()`. A mistyped bundle name
+    // is the common case here, so leaking one worker per attempt is easy to hit.
+    worker._shutDown(StateError('this Cera engine failed to open'));
+    rethrow;
+  }
+  return worker;
+}
+
 CeraCapabilities _capabilitiesOf(_Capabilities caps) => CeraCapabilities(
   textIn: caps.textIn,
   textOut: caps.textOut,
@@ -161,6 +228,9 @@ class _WorkerCera implements Cera {
   /// Sinks for streaming ops, by id. Present only while a generate is running.
   final _streams = <int, StreamController<String>>{};
 
+  /// Progress callbacks for in-flight bundle downloads, by id.
+  final _progress = <int, void Function(CeraDownload progress)>{};
+
   int _nextId = 0;
   String _backend = 'unknown';
   bool _closed = false;
@@ -185,11 +255,17 @@ class _WorkerCera implements Cera {
   @override
   CeraCapabilities get capabilities => _capabilities;
 
-  Future<void> _start(
-    Uint8List bytes,
-    Uint8List? mmproj,
-    String? inferenceType,
-  ) async {
+  /// The resolved wasm module URL, set by [_spawn]. Every op that may run
+  /// before a model is open has to pass it, since the worker imports the module
+  /// lazily and `listBundles` is typically the first call an app makes.
+  String _moduleUrl = '';
+
+  /// Starts the worker and installs its handlers, without opening anything.
+  ///
+  /// Split from [_start] so [listBundles] can reach the worker without a model:
+  /// a picker runs before there is anything to load, and constructing a worker
+  /// is the only way to reach the wasm catalog parser.
+  void _spawn() {
     // Both URLs are resolved against the page before they leave Dart.
     //
     // `new Worker(url)` would resolve a relative URL against the document
@@ -199,7 +275,7 @@ class _WorkerCera implements Cera {
     // which an ES module rejects outright ("Failed to resolve module specifier").
     // Resolving here makes both absolute and removes the difference.
     final workerUrl = Uri.base.resolve(_options.web.workerUrl).toString();
-    final moduleUrl = Uri.base.resolve(_options.web.moduleUrl).toString();
+    _moduleUrl = Uri.base.resolve(_options.web.moduleUrl).toString();
     final worker = _Worker(workerUrl, _WorkerOptions(type: 'module'));
     _worker = worker;
     worker.onmessage = ((_MessageEvent event) => _receive(event.data)).toJS;
@@ -228,7 +304,14 @@ class _WorkerCera implements Cera {
             ),
           );
         }).toJS;
+  }
 
+  Future<void> _start(
+    Uint8List bytes,
+    Uint8List? mmproj,
+    String? inferenceType,
+  ) async {
+    _spawn();
     final buffer = _detach(bytes);
     final projBuffer = mmproj == null ? null : _detach(mmproj);
     final result = await _send(
@@ -236,7 +319,7 @@ class _WorkerCera implements Cera {
       (id) => _Request(
         id: id,
         op: 'open',
-        moduleUrl: moduleUrl,
+        moduleUrl: _moduleUrl,
         bytes: buffer,
         mmproj: projBuffer,
         contextSize: _options.contextSize,
@@ -249,6 +332,46 @@ class _WorkerCera implements Cera {
       // smaller of the two but the same argument applies.
       transfer: <JSAny>[buffer, if (projBuffer != null) projBuffer],
     );
+    _adoptOpenResult(result);
+  }
+
+  /// Downloads and opens a published bundle in this worker.
+  ///
+  /// Unlike [_start] nothing is transferred: the weights are fetched inside the
+  /// worker and go straight into wasm memory, which is the whole reason this is
+  /// a separate op rather than a download in Dart followed by `openBytes`.
+  Future<void> _startBundle(
+    String name,
+    String quant,
+    String? storeDir,
+    void Function(CeraDownload progress)? onProgress,
+  ) async {
+    _spawn();
+    final id = _newId();
+    // Registered before the request goes out: the first progress event can
+    // arrive before `_send` returns, exactly as a token event can.
+    if (onProgress != null) _progress[id] = onProgress;
+    try {
+      final result = await _send(
+        id,
+        (id) => _Request(
+          id: id,
+          op: 'openBundle',
+          moduleUrl: _moduleUrl,
+          bundleId: name,
+          quant: quant,
+          storeDir: storeDir,
+          contextSize: _options.contextSize,
+          backend: _options.backend.name,
+        ),
+      );
+      _adoptOpenResult(result);
+    } finally {
+      _progress.remove(id);
+    }
+  }
+
+  void _adoptOpenResult(JSAny? result) {
     final opened = result as _OpenResult;
     _backend = opened.backend;
     _capabilities = _capabilitiesOf(opened.capabilities);
@@ -273,6 +396,24 @@ class _WorkerCera implements Cera {
     final reply = data as _Reply;
     if (reply.event == 'token') {
       _streams[reply.id]?.add(reply.text ?? '');
+      return;
+    }
+    if (reply.event == 'progress') {
+      final sink = _progress[reply.id];
+      if (sink != null) {
+        final total = reply.total;
+        sink(
+          CeraDownload(
+            url: reply.url ?? '',
+            bytesDownloaded:
+                ((reply.done as JSNumber?)?.toDartDouble ?? 0).toInt(),
+            // Distinguishes "the server sent no length" from "zero so far";
+            // the worker forwards null rather than omitting the field.
+            totalBytes:
+                total == null ? null : (total as JSNumber).toDartDouble.toInt(),
+          ),
+        );
+      }
       return;
     }
     final completer = _pending.remove(reply.id);

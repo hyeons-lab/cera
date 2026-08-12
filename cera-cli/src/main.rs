@@ -9,6 +9,7 @@ use cera::tokenizer::BpeTokenizer;
 use cera::{BackendPreference, CeraEngine, CeraError, EngineConfig, FinishReason, ModalitySink};
 use clap::{Parser, Subcommand};
 
+mod bundle_picker;
 mod chat_tui;
 mod image_source;
 mod signal;
@@ -1126,13 +1127,19 @@ pub(crate) fn simulate_truncate_oldest_turn_pairs(
 }
 
 /// Default cache root, used by the bundle-id flow when `--cache-dir` is
-/// unset: `$HOME/.cache/cera` when `$HOME` is set, otherwise
-/// `<TMPDIR>/.cache/cera`. Shared between the `BundleRepo` (downloads land
-/// under `<root>/huggingface.co/...`) and the KV prefix cache (under
-/// `<root>/kv`), so a single `--cache-dir` flag covers both — unify the
-/// user's cache footprint instead of fragmenting it.
+/// unset: `$HOME/.cache/cera`, falling back to `%USERPROFILE%\.cache\cera` on
+/// Windows and to `<TMPDIR>/.cache/cera` when neither is set. Shared between
+/// the `BundleRepo` (downloads land under `<root>/huggingface.co/...`) and the
+/// KV prefix cache (under `<root>/kv`), so a single `--cache-dir` flag covers
+/// both, unifying the user's cache footprint instead of fragmenting it.
 fn default_cache_dir() -> PathBuf {
+    // `USERPROFILE` before falling back to a temp dir: Windows sets no `HOME`,
+    // so without it every Windows run cached into a directory the OS is free to
+    // clean, and re-downloaded multi-gigabyte models. It also makes this agree
+    // with `Cera.openBundle`'s default in `cera_ffi`, which is what lets a
+    // desktop app and this CLI share one set of downloads.
     let base = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     base.join(".cache/cera")
@@ -1190,6 +1197,54 @@ fn resolve_engine(
              `--bundle-id <id> --quant <quant>`"
         ),
     }
+}
+
+/// Whether a full-screen ratatui UI can be driven from here.
+///
+/// Both streams must be a tty: a pipe can neither answer a picker nor drive a
+/// TUI, and a script that forgot its flags wants an error rather than a process
+/// blocked forever on a keystroke nobody is there to press. `--no-tui` opts out
+/// explicitly.
+///
+/// Shared by the bundle picker and the chat REPL so the two cannot drift into
+/// disagreeing about whether this terminal is interactive.
+fn tui_available(no_tui: bool) -> bool {
+    !no_tui && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// Offer the published catalog when `cera chat` was given no model source,
+/// returning the chosen `(bundle id, quant)`.
+///
+/// Deliberately NOT inside [`resolve_engine`]. Two reasons, both learned the
+/// hard way. It would fire for every model-taking command, and a picker is
+/// right for `chat` but surprising for a one-shot `run --prompt`. And probing
+/// the tty inside `resolve_engine` silently changed what its unit tests do:
+/// `cargo test` inherits the developer's terminal on fds 0 and 1 (libtest
+/// captures `print!`, not `is_terminal`), so `resolve_engine_rejects_no_source`
+/// stopped asserting on an error message and instead made a live HTTP request
+/// and took over the terminal. CI stayed green because CI has no tty, which is
+/// the worst version of that bug.
+///
+/// Returns `Ok(None)` when a picker is not appropriate here, leaving the caller
+/// to fail with its usual "no model source" error.
+fn pick_bundle_interactively(no_tui: bool) -> Result<Option<(String, String)>> {
+    // A ratatui picker before the line-based REPL would ignore exactly what
+    // `--no-tui` asked for, so the picker is gated on the same predicate the
+    // chat TUI itself uses.
+    if !tui_available(no_tui) {
+        return Ok(None);
+    }
+    eprintln!("Fetching the LeapBundles catalog…");
+    let entries =
+        cera::bundle::list_leap_bundles().context("could not reach the LeapBundles catalog")?;
+    let Some((id, quant)) = bundle_picker::pick(&entries)? else {
+        // Cancelling is not a failure, but the caller still needs a model, so
+        // it has to stop. Says what happened rather than dumping the usage text
+        // at someone who just pressed Esc.
+        anyhow::bail!("no model selected");
+    };
+    eprintln!("Selected {} ({quant})", display_bundle_id(&id));
+    Ok(Some((id, quant)))
 }
 
 fn load_engine_from_spec(
@@ -3012,10 +3067,23 @@ fn main() -> Result<()> {
         } => {
             use std::io::BufRead;
 
+            // With no model source at all, offer the catalog rather than
+            // refusing outright: the alternative is an error telling the user
+            // to go run `cera list-bundles`, read it, and come back with two
+            // strings, for something that is one request away.
+            let picked = if model.is_none() && bundle_id.is_none() && quant.is_none() {
+                pick_bundle_interactively(no_tui)?
+            } else {
+                None
+            };
+            let (bundle_id, quant) = match &picked {
+                Some((id, q)) => (Some(id.as_str()), Some(q.as_str())),
+                None => (bundle_id.as_deref(), quant.as_deref()),
+            };
             let engine = resolve_engine(
                 model.as_deref(),
-                bundle_id.as_deref(),
-                quant.as_deref(),
+                bundle_id,
+                quant,
                 cache_dir.as_deref(),
                 &device,
                 context_size,
@@ -3091,8 +3159,7 @@ fn main() -> Result<()> {
             // sensibly) and the user didn't opt out via `--no-tui`.
             // Otherwise fall back to the line-based REPL — works for
             // pipes, log capture, dumb terminals, scripted tests.
-            let use_tui =
-                !no_tui && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+            let use_tui = tui_available(no_tui);
             if use_tui {
                 // `tokenizer_arc()` shares the engine's existing
                 // `Arc<BpeTokenizer>` with the worker thread instead

@@ -840,6 +840,10 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_func_detect_tool_format(): Int
 
+    external fun uniffi_cera_ffi_checksum_func_list_leap_bundles(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_list_leap_bundles_async(): Int
+
     external fun uniffi_cera_ffi_checksum_func_parse_tool_calls(): Int
 
     external fun uniffi_cera_ffi_checksum_func_tool_grammar(): Int
@@ -1396,6 +1400,10 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_func_list_leap_bundles(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_list_leap_bundles_async(): Long
+
     external fun uniffi_cera_ffi_fn_func_parse_tool_calls(
         `text`: RustBuffer.ByValue,
         `format`: RustBuffer.ByValue,
@@ -1629,6 +1637,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_list_leap_bundles() != 14501) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_list_leap_bundles_async() != 60360) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_func_parse_tool_calls() != 47579) {
@@ -6306,6 +6320,47 @@ public object FfiConverterTypeGenerateSummary : FfiConverterRustBuffer<GenerateS
 }
 
 /**
+ * One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
+ * model directory plus every per-quant manifest inside it. Feed
+ * `name` and one element of `quants` straight to
+ * [`CeraEngine::from_bundle_id`].
+ *
+ * Both fields are sorted ascending, so a menu built from this list is
+ * stable across runs even if the upstream API reorders its response.
+ */
+data class LeapBundleEntry(
+    var `name`: kotlin.String,
+    var `quants`: List<kotlin.String>,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeLeapBundleEntry : FfiConverterRustBuffer<LeapBundleEntry> {
+    override fun read(buf: ByteBuffer): LeapBundleEntry =
+        LeapBundleEntry(
+            FfiConverterString.read(buf),
+            FfiConverterSequenceString.read(buf),
+        )
+
+    override fun allocationSize(value: LeapBundleEntry) =
+        (
+            FfiConverterString.allocationSize(value.`name`) +
+                FfiConverterSequenceString.allocationSize(value.`quants`)
+        )
+
+    override fun write(
+        value: LeapBundleEntry,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`name`, buf)
+        FfiConverterSequenceString.write(value.`quants`, buf)
+    }
+}
+
+/**
  * Modality support flags for a loaded model. Mirrors
  * [`cera::ModalityCapabilities`].
  */
@@ -7727,6 +7782,34 @@ public object FfiConverterSequenceFloat : FfiConverterRustBuffer<List<kotlin.Flo
 /**
  * @suppress
  */
+public object FfiConverterSequenceString : FfiConverterRustBuffer<List<kotlin.String>> {
+    override fun read(buf: ByteBuffer): List<kotlin.String> {
+        val len = buf.getInt()
+        return List<kotlin.String>(len) {
+            FfiConverterString.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<kotlin.String>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterString.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<kotlin.String>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterString.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeChatMessage : FfiConverterRustBuffer<List<ChatMessage>> {
     override fun read(buf: ByteBuffer): List<ChatMessage> {
         val len = buf.getInt()
@@ -7748,6 +7831,34 @@ public object FfiConverterSequenceTypeChatMessage : FfiConverterRustBuffer<List<
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeChatMessage.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeLeapBundleEntry : FfiConverterRustBuffer<List<LeapBundleEntry>> {
+    override fun read(buf: ByteBuffer): List<LeapBundleEntry> {
+        val len = buf.getInt()
+        return List<LeapBundleEntry>(len) {
+            FfiConverterTypeLeapBundleEntry.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<LeapBundleEntry>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeLeapBundleEntry.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<LeapBundleEntry>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeLeapBundleEntry.write(it, buf)
         }
     }
 }
@@ -7843,6 +7954,61 @@ fun `detectToolFormat`(`architecture`: kotlin.String): ToolFormat? =
         uniffiRustCall { _status ->
             UniffiLib.uniffi_cera_ffi_fn_func_detect_tool_format(FfiConverterString.lower(`architecture`), _status)
         },
+    )
+
+/**
+ * List every bundle published on `LiquidAI/LeapBundles`, so a picker
+ * can offer `<name>, <quant>` pairs instead of making the user type a
+ * bundle id. Pair with [`CeraEngine::from_bundle_id`], which takes
+ * exactly these two strings.
+ *
+ * One blocking HTTP GET with a 30 s timeout and no retry. Prefer
+ * [`list_leap_bundles_async`] anywhere a UI thread is involved: this
+ * twin stalls the calling thread for the whole round-trip.
+ *
+ * Needs no [`BundleRepo`]: the catalog is a single small JSON
+ * response and is deliberately not cached, so a picker opened twice
+ * in one session reflects newly published bundles.
+ */
+@Throws(FfiException::class)
+fun `listLeapBundles`(): List<LeapBundleEntry> =
+    FfiConverterSequenceTypeLeapBundleEntry.lift(
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_list_leap_bundles(_status)
+        },
+    )
+
+/**
+ * Async variant of [`list_leap_bundles`]: moves the blocking HTTP
+ * round-trip onto a tokio blocking worker so a coroutine, a Swift
+ * `async` context or a Dart `Future` can await the catalog without
+ * stalling the thread that asked for it.
+ *
+ * `async_runtime = "tokio"` is load-bearing, not decoration: it is
+ * what makes uniffi poll this future inside a tokio context. Without
+ * it the foreign executor drives the future with no runtime
+ * installed and the `spawn_blocking` below panics with "must be
+ * called from the context of a Tokio 1.x runtime" on the very first
+ * call.
+ *
+ * Cancellation: dropping the returned future aborts the task if it
+ * has not started, so a dismissed picker does not leave a 30 s
+ * blocking GET queued on the pool. A request already in flight runs
+ * to completion; `reqwest::blocking` offers nothing to interrupt, and
+ * the response is small.
+ */
+@Throws(FfiException::class)
+@Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+suspend fun `listLeapBundlesAsync`(): List<LeapBundleEntry> =
+    uniffiRustCallAsync(
+        UniffiLib.uniffi_cera_ffi_fn_func_list_leap_bundles_async(),
+        { future, callback, continuation -> UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterSequenceTypeLeapBundleEntry.lift(it) },
+        // Error FFI converter
+        FfiException.ErrorHandler,
     )
 
 /**

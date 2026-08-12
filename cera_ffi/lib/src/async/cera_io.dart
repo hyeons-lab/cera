@@ -17,6 +17,7 @@
 library;
 
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 
 import '../generated/cera_ffi.dart';
@@ -34,10 +35,10 @@ BackendPreference _backendOf(CeraBackend backend) => switch (backend) {
   CeraBackend.auto || CeraBackend.gpu => BackendPreference.auto,
 };
 
-EngineConfig _configOf(CeraOptions options) => EngineConfig(
+EngineConfig _configOf(CeraOptions options, [BundleRepo? repo]) => EngineConfig(
   contextSize: options.contextSize,
   backend: _backendOf(options.backend),
-  bundleRepo: null,
+  bundleRepo: repo,
 );
 
 /// Maps the generated capability record onto the portable one.
@@ -83,6 +84,108 @@ Future<Cera> openBytes(
   ),
   options,
 );
+
+/// Lists the published bundles. See [Cera.listBundles].
+///
+/// `options` is unused here and present only so the two implementations keep
+/// identical signatures; it carries the web asset locations, which native has
+/// no equivalent of.
+Future<List<CeraBundle>> listBundles(CeraOptions options) async {
+  // The async twin, so the HTTP round-trip lands on a tokio blocking worker
+  // rather than stalling the isolate. A picker is usually opened from a button
+  // press, which is exactly the thread not to block.
+  final entries = await listLeapBundlesAsync();
+  return [
+    for (final entry in entries)
+      CeraBundle(name: entry.name, quants: entry.quants),
+  ];
+}
+
+/// Downloads and opens a published bundle. See [Cera.openBundle].
+Future<Cera> openBundle(
+  String name,
+  String quant,
+  CeraOptions options,
+  void Function(CeraDownload progress)? onProgress,
+  String? storeDir,
+) async {
+  final dir = storeDir ?? _defaultStoreDir();
+  // Two constructors rather than always attaching a sink: `withProgress`
+  // installs a callback vtable that Rust invokes from its download thread, and
+  // a caller who did not ask for progress should not pay for that plumbing.
+  final repo =
+      onProgress == null
+          ? BundleRepo.create(dir)
+          : BundleRepo.withProgress(dir, _ProgressSink(onProgress));
+  try {
+    final engine = await CeraEngine.fromBundleIdAsync(
+      name,
+      quant,
+      _configOf(options, repo),
+    );
+    return _NativeCera(engine, options);
+  } finally {
+    // The engine holds its own reference (the config lowers an `Arc` clone), so
+    // releasing this handle does not disturb a loaded model. Without it the
+    // repo would sit until its finalizer ran, holding the progress callback
+    // registration alive with it.
+    repo.close();
+  }
+}
+
+/// Where downloads are cached when the caller names no directory.
+///
+/// `$HOME/.cache/cera`, which is exactly what the `cera` CLI uses, so a desktop
+/// app and the CLI share one set of downloads rather than each pulling its own
+/// copy of a multi-gigabyte model.
+///
+/// Deliberately unavailable on mobile. An app there writes inside its own
+/// container and `HOME` either is unset or points somewhere unwritable, so a
+/// default would surface as a permission failure partway into a download. The
+/// throw names the parameter and the package that answers the question instead.
+String _defaultStoreDir() {
+  if (Platform.isAndroid || Platform.isIOS) {
+    throw ArgumentError(
+      'Cera.openBundle needs an explicit storeDir on Android and iOS: an app '
+      'may only write inside its own container, which the environment does not '
+      'name. Pass a directory from package:path_provider, e.g. '
+      '(await getApplicationSupportDirectory()).path.',
+    );
+  }
+  // `USERPROFILE` because Windows sets no `HOME`.
+  final home =
+      Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'];
+  if (home == null || home.isEmpty) {
+    throw ArgumentError(
+      'Cera.openBundle could not choose a storeDir: neither HOME nor '
+      'USERPROFILE is set. Pass storeDir explicitly.',
+    );
+  }
+  return [home, '.cache', 'cera'].join(Platform.pathSeparator);
+}
+
+/// Forwards Rust's download callbacks to the caller's closure.
+///
+/// A class rather than a closure because the binding takes the trait. Its
+/// vtable is installed as a cross-thread listener, so calls arrive on the
+/// isolate's event loop rather than inline on the download thread; that makes
+/// it safe to touch UI state from `onProgress` directly.
+class _ProgressSink implements DownloadProgressSink {
+  _ProgressSink(this.emit);
+
+  final void Function(CeraDownload progress) emit;
+
+  @override
+  void onProgress(String url, int bytesDownloaded, int? totalBytes) {
+    emit(
+      CeraDownload(
+        url: url,
+        bytesDownloaded: bytesDownloaded,
+        totalBytes: totalBytes,
+      ),
+    );
+  }
+}
 
 class _NativeCera implements Cera {
   _NativeCera(this._engine, this._options)

@@ -133,11 +133,89 @@ class CeraCapabilities {
       'imageIn: $imageIn, audioIn: $audioIn, audioOut: $audioOut)';
 }
 
+/// One model published on `LiquidAI/LeapBundles`, with the quantizations it
+/// offers.
+///
+/// The pair a picker needs: [name] and one of [quants] are exactly the two
+/// arguments [Cera.openBundle] takes.
+class CeraBundle {
+  /// Creates a catalog entry.
+  const CeraBundle({required this.name, required this.quants});
+
+  /// The bundle id, e.g. `LFM2-1.2B-GGUF`.
+  final String name;
+
+  /// Quantization labels this bundle publishes, e.g. `Q4_0`, `Q8_0`.
+  ///
+  /// Sorted ascending, as is [name] across the returned list, so a menu built
+  /// from this is stable across runs even when the upstream API reorders its
+  /// response.
+  final List<String> quants;
+
+  /// [name] without its `-GGUF` suffix, for showing in a menu.
+  ///
+  /// Every entry in the live catalog carries that suffix and it is noise in a
+  /// list. `cera list-bundles` and the CLI picker trim it the same way, so a
+  /// menu built on this names a model exactly as the CLI does. Pass [name],
+  /// not this, to [Cera.openBundle].
+  String get displayName =>
+      name.endsWith('-GGUF')
+          ? name.substring(0, name.length - '-GGUF'.length)
+          : name;
+
+  @override
+  String toString() => 'CeraBundle($name, quants: ${quants.join(", ")})';
+}
+
+/// Progress of one file within a bundle download.
+///
+/// A bundle is several files (the manifest, the model, and for a multimodal
+/// bundle its projector), so this arrives for each in turn and [url] is what
+/// distinguishes them. [bytesDownloaded] is monotonic within one file and
+/// starts over at the next.
+///
+/// Reported roughly every 256 KB plus once at end of stream, on both
+/// transports, so the last event for a file always carries its final count.
+/// A fully cached bundle opens without emitting any of these.
+class CeraDownload {
+  /// Creates a progress event.
+  const CeraDownload({
+    required this.url,
+    required this.bytesDownloaded,
+    required this.totalBytes,
+  });
+
+  /// The file being fetched.
+  final String url;
+
+  /// Bytes of this file received so far.
+  final int bytesDownloaded;
+
+  /// This file's total size, or null when the server sent no length.
+  ///
+  /// Null is not rare enough to ignore: a chunked-transfer response has no
+  /// `Content-Length`, so a progress bar needs an indeterminate state rather
+  /// than a division.
+  final int? totalBytes;
+
+  /// Completion of this file in `0.0..1.0`, or null when [totalBytes] is
+  /// unknown or zero.
+  double? get fraction {
+    final total = totalBytes;
+    if (total == null || total <= 0) return null;
+    return (bytesDownloaded / total).clamp(0.0, 1.0);
+  }
+
+  @override
+  String toString() =>
+      'CeraDownload($url, $bytesDownloaded/${totalBytes ?? "?"})';
+}
+
 /// A loaded model, ready to generate.
 ///
-/// Obtain one from [openPath] or [openBytes], and [close] it when done: it owns
-/// the model weights, which are the largest allocation in most apps, and
-/// nothing collects them for you on the web.
+/// Obtain one from [openPath], [openBytes] or [openBundle], and [close] it when
+/// done: it owns the model weights, which are the largest allocation in most
+/// apps, and nothing collects them for you on the web.
 abstract interface class Cera {
   /// Whether [openPath] works on this platform. False only on the web.
   ///
@@ -194,6 +272,75 @@ abstract interface class Cera {
     String? inferenceType,
     CeraOptions options = const CeraOptions(),
   }) => impl.openBytes(bytes, options, mmproj, inferenceType);
+
+  /// The bundles published on `LiquidAI/LeapBundles`, for a picker to offer.
+  ///
+  /// Each entry pairs a name with its quantizations, which is exactly what
+  /// [openBundle] takes. One small HTTP request, deliberately uncached, so a
+  /// picker opened twice in a session reflects newly published bundles.
+  ///
+  /// Every platform reads the same catalog through the same parser, so a menu
+  /// built on this shows the same list as `cera list-bundles`.
+  ///
+  /// Throws if the catalog cannot be reached. There is a 30 second deadline
+  /// and no retry: a picker that reports it could not reach the network beats
+  /// one that never opens.
+  static Future<List<CeraBundle>> listBundles({
+    CeraOptions options = const CeraOptions(),
+  }) => impl.listBundles(options);
+
+  /// Downloads a published bundle by `name` and `quant` and loads it, reusing
+  /// anything already cached.
+  ///
+  /// The pair comes from [listBundles]. Prefer this over fetching a GGUF
+  /// yourself and calling [openBytes]: a bundle's manifest names every file it
+  /// needs and states its modality outright, so a vision or audio bundle
+  /// arrives complete, whereas [openBytes] has only its arguments to go on.
+  ///
+  /// It is also the cheaper path in memory on every platform, and dramatically
+  /// so on the web: the weights go from the cache into the engine without
+  /// passing through the caller, which costs one copy of the model rather than
+  /// two and, in a browser, sidesteps the roughly 2 GiB limit on a single
+  /// contiguous JavaScript allocation that [openBytes] runs into.
+  ///
+  /// `onProgress` fires per file while downloading and not at all on a fully
+  /// cached bundle, so do not wait for a first event before showing the UI.
+  ///
+  /// **The download cannot be cancelled.** There is no way to abandon it once
+  /// started, and dropping the returned future does not stop it, so `onProgress`
+  /// keeps firing until the bundle is fetched. A caller that can be disposed
+  /// mid-download (a page or a route) has to guard its own callback rather than
+  /// expect the download to stop with it. Worth knowing before offering this on
+  /// a multi-gigabyte model, where the wait is minutes.
+  ///
+  /// `storeDir` is where downloads are cached, and it means different things
+  /// per platform. Natively it is a filesystem path, defaulting on desktop to
+  /// `$HOME/.cache/cera`, which is also where the `cera` CLI caches, so the two
+  /// share downloads rather than each pulling its own copy. **On the web it is
+  /// a single directory NAME inside the origin's private filesystem, not a
+  /// path**: one containing `/` or `..` is rejected. So the same value cannot
+  /// simply be passed everywhere; leave it null on the web, where the default
+  /// is right anyway.
+  ///
+  /// **Required on Android and iOS**, where it throws [ArgumentError] if
+  /// omitted: an app there may write only inside its own container, which no
+  /// environment variable names, so there is nothing sound to default to. Pass
+  /// a path from `path_provider`, e.g.
+  /// `(await getApplicationSupportDirectory()).path`. Failing at the call is
+  /// deliberate, rather than defaulting to something that would surface as a
+  /// permission error partway into a multi-gigabyte download.
+  ///
+  /// The backend follows [CeraOptions.backend] as it does for [openBytes],
+  /// including the web's GPU-then-CPU fallback. Note that the browser GPU path
+  /// serves LFM2 bundles only, so a non-LFM2 choice there means the wasm CPU
+  /// backend and a large slowdown; [backend] reports which one took effect.
+  static Future<Cera> openBundle(
+    String name,
+    String quant, {
+    void Function(CeraDownload progress)? onProgress,
+    String? storeDir,
+    CeraOptions options = const CeraOptions(),
+  }) => impl.openBundle(name, quant, options, onProgress, storeDir);
 
   /// Describes the backend in use, and on the web the GPU adapter with it.
   ///

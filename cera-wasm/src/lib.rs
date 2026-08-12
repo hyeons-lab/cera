@@ -1977,11 +1977,25 @@ mod webgpu {
             context_size: Option<u32>,
             kv_compression: Option<crate::TurboQuantConfig>,
         ) -> Result<WebGpuSession, JsError> {
+            Self::from_model_bytes(Arc::from(bytes), context_size, kv_compression).await
+        }
+
+        /// The body of `create`, over an `Arc<[u8]>` the caller already holds.
+        ///
+        /// Split out for `fromBundleId`, whose bytes come from the store as an
+        /// `Arc<[u8]>` and must never be turned back into a `Vec` for the sake
+        /// of a signature: that is a second full copy of the model.
+        ///
+        /// Not `#[wasm_bindgen]`: it takes a Rust type, which is the point.
+        async fn from_model_bytes(
+            gguf_bytes: Arc<[u8]>,
+            context_size: Option<u32>,
+            kv_compression: Option<crate::TurboQuantConfig>,
+        ) -> Result<WebGpuSession, JsError> {
             let ctx = cera::backend::wgpu::GpuContext::new_async()
                 .await
                 .map_err(map_err)?;
             let ctx_size = context_size.unwrap_or(4096) as usize;
-            let gguf_bytes: Arc<[u8]> = Arc::from(bytes);
             let gguf = cera::gguf::GgufFile::from_bytes(gguf_bytes).map_err(map_err)?;
             // Build the tokenizer before the GGUF is moved into the model.
             let tokenizer =
@@ -2061,8 +2075,61 @@ mod webgpu {
             kv_compression: Option<crate::TurboQuantConfig>,
         ) -> Result<WebGpuSession, JsError> {
             let mut session = Self::create(bytes, context_size, kv_compression).await?;
+            session.attach_vision(Arc::from(mmproj))?;
+            Ok(session)
+        }
 
-            let proj_gguf = cera::gguf::GgufFile::from_bytes(Arc::from(mmproj)).map_err(map_err)?;
+        /// Load a published LeapBundle by id and quantization onto the GPU,
+        /// downloading through `repo` and reusing whatever it already cached.
+        ///
+        /// The GPU twin of `CeraEngine.fromBundleId`, and the one to prefer in
+        /// a browser: the WebGPU backend measured ~58 tok/s against ~1.4 for
+        /// the wasm CPU build on the same model, so reaching a bundle only
+        /// through the CPU constructor is a ~40x cost.
+        ///
+        /// `onProgress(url, bytesDownloaded, totalBytes)` fires during
+        /// downloads only; a fully cached bundle loads without calling it.
+        /// `totalBytes` is `null` when the server doesn't say.
+        ///
+        /// **Memory:** the weights go from the store straight into wasm linear
+        /// memory and stay for the session's lifetime. They are never handed to
+        /// JS on the way, which is what keeps this clear of the ~2 GiB ceiling
+        /// on a single JS `ArrayBuffer` that loading through `create` runs into,
+        /// and costs one copy of the model rather than two.
+        ///
+        /// Throws for every reason `create` does, plus a bundle the GPU path
+        /// cannot serve: it is LFM2-only, and an audio bundle's encoder is
+        /// rejected as a vision tower. A caller wanting a fallback should catch
+        /// and retry through `CeraEngine.fromBundleId`, which is what
+        /// `cera_worker.js` does for `backend: 'auto'`.
+        #[wasm_bindgen(js_name = fromBundleId)]
+        pub async fn from_bundle_id(
+            repo: &crate::bundle::BundleRepo,
+            bundle_id: String,
+            quant: String,
+            context_size: Option<u32>,
+            kv_compression: Option<crate::TurboQuantConfig>,
+            on_progress: Option<js_sys::Function>,
+        ) -> Result<WebGpuSession, JsError> {
+            let parts =
+                crate::bundle::load_bundle(repo, &bundle_id, &quant, on_progress.as_ref()).await?;
+            let mut session =
+                Self::from_model_bytes(parts.model, context_size, kv_compression).await?;
+            // A VL bundle names its tower in the manifest, so unlike
+            // `createWithParts` this path never has to be told about it.
+            if let Some(mmproj) = parts.multimodal_projector {
+                session.attach_vision(mmproj)?;
+            }
+            Ok(session)
+        }
+
+        /// Parse `mmproj` as a vision tower and attach it, giving this session
+        /// `appendImage`.
+        ///
+        /// Shared by `createWithParts` and `fromBundleId` so the two cannot
+        /// drift on the pairing check below.
+        fn attach_vision(&mut self, mmproj: Arc<[u8]>) -> Result<(), JsError> {
+            let proj_gguf = cera::gguf::GgufFile::from_bytes(mmproj).map_err(map_err)?;
             let weights =
                 cera::model::vision_encoder::VisionEncoderWeights::from_gguf(&Arc::new(proj_gguf))
                     .map_err(map_err)?;
@@ -2071,7 +2138,7 @@ mod webgpu {
             // at the first `appendImage`: the projection has to land in this
             // model's hidden space, and a dimension mismatch is a mispaired
             // bundle, not a runtime condition.
-            let llm_hidden = cera::model::Model::config(&session.model).hidden_size;
+            let llm_hidden = cera::model::Model::config(&self.model).hidden_size;
             let proj_dim = weights.config.projection_dim;
             if proj_dim != llm_hidden {
                 return Err(JsError::new(&format!(
@@ -2082,12 +2149,12 @@ mod webgpu {
             }
 
             let weights = Arc::new(weights);
-            session.gpu_vision_encoder = cera::model::vision_encoder_gpu::build_gpu_vision_encoder(
+            self.gpu_vision_encoder = cera::model::vision_encoder_gpu::build_gpu_vision_encoder(
                 &weights,
                 cera::BackendPreference::Gpu,
             );
-            session.vision_encoder = Some(weights);
-            Ok(session)
+            self.vision_encoder = Some(weights);
+            Ok(())
         }
 
         /// Number of tokens currently in the KV cache.
