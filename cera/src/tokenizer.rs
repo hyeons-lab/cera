@@ -969,7 +969,7 @@ mod tests {
     #[test]
     fn test_pretokenize_refact_splits_each_digit() {
         // REFACT (Granite 3.x) splits numbers one digit at a time via a bare `\p{N}`,
-        // unlike LLAMA3's ` ?\p{N}+` which groups 1-3 digits.
+        // unlike LLAMA3's `\p{N}{1,3}` which groups 1-3 digits.
         let re = build_pretokenize_regex("refact");
         let chunks: Vec<&str> = re.find_iter("12345").map(|m| m.as_str()).collect();
         assert_eq!(chunks, vec!["1", "2", "3", "4", "5"]);
