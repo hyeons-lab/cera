@@ -31,6 +31,9 @@ pub mod metal_turboquant;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_audio_decoder;
 
+#[cfg(feature = "gpu")]
+pub mod wgpu_audio_decoder;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, bail, ensure};
