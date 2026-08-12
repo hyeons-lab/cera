@@ -119,10 +119,23 @@ class _ChatPageState extends State<ChatPage> {
       // stuck true and the whole UI disabled with nothing shown.
       await _cera?.close();
       _cera = null;
-      final path = file.path;
+      // Ask the API which mode it has, rather than testing `file.path`. On the
+      // web the picker manufactures a `blob:` URL for the bytes it just read
+      // and puts it in `path`, so that field is non-null in a browser and
+      // testing it would send every web load into `openPath`, which is the one
+      // call the web does not have.
+      final path = Cera.supportsPaths ? file.path : null;
+      final bytes = file.bytes;
+      // Neither one is reachable when a native pick yields a content URI the
+      // picker could not resolve. Say so, rather than letting a bang throw a
+      // null-check error the status line would show as-is.
+      if (path == null && bytes == null) {
+        if (mounted) setState(() => _status = 'Could not read ${file.name}');
+        return;
+      }
       final cera = path != null
           ? await Cera.openPath(path)
-          : await Cera.openBytes(file.bytes!);
+          : await Cera.openBytes(bytes!);
       // Every setState here follows an await, so it needs the guard: loading a
       // multi-hundred-megabyte model takes long enough for the page to be
       // disposed underneath it.
@@ -250,8 +263,10 @@ class _ChatPageState extends State<ChatPage> {
           IconButton(
             // Disabled while this page is busy. Not because the benchmark
             // shares state with it (it opens its own engines from its own
-            // pick), but because a second set of weights alongside a
+            // pick), but because a second set of weights loading alongside a
             // generation in flight is how a browser tab runs out of memory.
+            // An idle chat model stays resident either way; this rules out the
+            // concurrent case, not coexistence.
             onPressed: _busy
                 ? null
                 : () => Navigator.of(context).push(

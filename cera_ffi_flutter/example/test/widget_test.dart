@@ -31,8 +31,7 @@ void main() {
 
     expect(find.text('CPU vs GPU'), findsOneWidget);
     expect(find.widgetWithText(FilledButton, 'Run'), findsOneWidget);
-    // Nothing is loaded, so Run must be inert. This is the assertion that would
-    // have caught gating it on the wrong field when the native path was added.
+    // Nothing is loaded, so Run must be inert.
     final run = tester.widget<FilledButton>(
       find.widgetWithText(FilledButton, 'Run'),
     );
