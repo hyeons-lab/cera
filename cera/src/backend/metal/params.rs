@@ -594,3 +594,98 @@ pub struct LayerNormBatchParams {
 }
 const _: () = assert!(size_of::<LayerNormBatchParams>() == 16);
 impl MetalParams for LayerNormBatchParams {}
+
+// ── LFM2A audio encoder (Conformer) ───────────────────────────────────────────────
+
+/// Mirror of the params buffer in `shaders/slang/conv2d_direct.slang`: four
+/// `uint4`s, read up to `par_buf[3].x`.
+///
+/// `pad_h`/`pad_w` are the **low-side** pad only, and `h_out`/`w_out` are computed
+/// by the host rather than derived in the kernel. That is what lets the caller
+/// express the asymmetric split `cpu::conformer_conv_module_forward` uses for even
+/// kernel sizes (`pad_left = (k-1)/2`, remainder on the right); a kernel that
+/// re-derived the output dims from a single symmetric pad could not.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Conv2dDirectParams {
+    pub in_ch: u32,
+    pub out_ch: u32,
+    pub h_in: u32,
+    pub w_in: u32,
+    pub kh: u32,
+    pub kw: u32,
+    pub stride_h: u32,
+    pub stride_w: u32,
+    pub pad_h: u32,
+    pub pad_w: u32,
+    pub h_out: u32,
+    pub w_out: u32,
+    pub groups: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+const _: () = assert!(size_of::<Conv2dDirectParams>() == 64);
+impl MetalParams for Conv2dDirectParams {}
+
+/// Mirror of the params buffer in `shaders/slang/transpose_blocked.slang`:
+/// `[a, b, k, _]`, the `[A][B][K]` → `[B][A][K]` shape.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransposeBlockedParams {
+    pub a: u32,
+    pub b: u32,
+    pub k: u32,
+    pub _pad: u32,
+}
+const _: () = assert!(size_of::<TransposeBlockedParams>() == 16);
+impl MetalParams for TransposeBlockedParams {}
+
+/// Mirror of the params buffer shared by `shaders/slang/glu_split.slang` and
+/// `shaders/slang/chan_affine_silu.slang`: `[outer, inner, 0, 0]`.
+///
+/// One struct for both because the layout *and* the meaning are the same: each
+/// kernel indexes a flat `outer × inner` buffer and recovers the outer index as
+/// `idx / inner`. Only the names differ at the call site (`rows`/`n` for the GLU
+/// split, `channels`/`t` for the per-channel affine). Same rationale as
+/// [`NormParams`] covering both rmsnorm kernels.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Batch2dParams {
+    pub outer: u32,
+    pub inner: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+const _: () = assert!(size_of::<Batch2dParams>() == 16);
+impl MetalParams for Batch2dParams {}
+
+impl Batch2dParams {
+    /// `outer × inner`, zero padding.
+    pub fn new(outer: u32, inner: u32) -> Self {
+        Self {
+            outer,
+            inner,
+            _pad0: 0,
+            _pad1: 0,
+        }
+    }
+}
+
+/// Mirror of the params buffer in `shaders/slang/audio_xl_attention.slang`.
+/// `scale_bits` is `(1/sqrt(head_dim)).to_bits()`.
+///
+/// Deliberately **not** shared with [`VitAttnParams`], which currently declares
+/// the identical four fields. The two kernels live in different subsystems and
+/// will drift (the ViT one already has an MMA variant); a shared mirror would
+/// mean a field added for audio silently widens every ViT upload.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioXlAttnParams {
+    pub tokens: u32,
+    pub n_head: u32,
+    pub head_dim: u32,
+    pub scale_bits: u32,
+}
+const _: () = assert!(size_of::<AudioXlAttnParams>() == 16);
+impl MetalParams for AudioXlAttnParams {}

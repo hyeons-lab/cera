@@ -1247,6 +1247,43 @@ pub mod shaders {
     /// stage: windowed overlap-add of the iDFT frames into PCM, one thread per
     /// output sample. A portable position-indexed reduction, no `__target_switch`.
     pub const OVERLAP_ADD: &str = include_str!(concat!(env!("OUT_DIR"), "/overlap_add.wgsl"));
+    // LFM2A audio-encoder (Conformer) kernels. Generated from
+    // `shaders/slang/*.slang` by build.rs and shared with the Metal backend's
+    // `metal::shaders::*` twins.
+    //
+    // The encoder forward pass itself is Metal-only for now; these are the WGSL
+    // halves of the shared sources, kept compiled so the wgpu encoder is a
+    // host-side wiring change rather than a kernel port. **Nothing dispatches
+    // them yet**, so their only coverage is the generation checks in
+    // `tests/slang_multitarget_parity.rs` (entry points present, no subgroup
+    // ops, no `enable f16`). The numeric pinning is Metal-only, via
+    // `tests/audio_encoder_metal_parity.rs`; wiring wgpu means adding numeric
+    // cases for these, not just an ops impl.
+    /// `relu_inplace` / `silu_inplace` / `gelu_erf_inplace`, sharing `GELU`'s
+    /// contract (binding 0 = x in-place, binding 1 = params). The GELU here is
+    /// the **erf** form the audio adapter was trained against, not `GELU`'s tanh
+    /// approximation.
+    pub const ACTIVATIONS: &str = include_str!(concat!(env!("OUT_DIR"), "/activations.wgsl"));
+    /// Direct (im2col-free) conv2d covering the conv subsampling stem's regular,
+    /// depthwise and pointwise layers *and* each Conformer block's depthwise
+    /// conv1d (`kh = 1`).
+    pub const CONV2D_DIRECT: &str = include_str!(concat!(env!("OUT_DIR"), "/conv2d_direct.wgsl"));
+    /// Outer-axis swap with a contiguous inner block: the conv stem's
+    /// channel/time permute (`K = f_out`) and the conv module's time-major ↔
+    /// channel-major transposes (`K = 1`).
+    pub const TRANSPOSE_BLOCKED: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/transpose_blocked.wgsl"));
+    /// Batched GLU split for the Conformer convolution module.
+    pub const GLU_SPLIT: &str = include_str!(concat!(env!("OUT_DIR"), "/glu_split.wgsl"));
+    /// Per-channel affine + SiLU over a channel-major buffer (the conv module's
+    /// `conv_norm`, which is a scale/shift and not a LayerNorm).
+    pub const CHAN_AFFINE_SILU: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/chan_affine_silu.wgsl"));
+    /// Conformer self-attention with Transformer-XL relative-position bias.
+    /// Portable (non-MMA), so unlike `VIT_ATTENTION` it is generated rather than
+    /// handwritten; only its softmax reduction has a `__target_switch`.
+    pub const AUDIO_XL_ATTENTION: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/audio_xl_attention.wgsl"));
     /// Generated from `shaders/slang/per_head_rmsnorm.slang` by build.rs and
     /// shared with the Metal backend's
     /// `metal::shaders::PER_HEAD_RMSNORM`. A `__target_switch`

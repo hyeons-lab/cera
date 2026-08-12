@@ -141,6 +141,12 @@ const SLANG_MULTI_KERNELS: &[&str] = &[
     "conv1d_fused_batch",
     "exp_polar",
     "overlap_add",
+    "activations",
+    "conv2d_direct",
+    "transpose_blocked",
+    "glu_split",
+    "chan_affine_silu",
+    "audio_xl_attention",
 ];
 
 /// Compile each multi-target kernel to the shader languages the enabled
