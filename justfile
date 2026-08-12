@@ -173,23 +173,33 @@ dart-libs:
     @echo "Built {{CERA_FFI_DYLIB}} (with ffi-buffer trampolines)."
     @echo "Point Dart at it via CERA_FFI_LIB or place it on the loader path."
 
+# Materialize the patched Dart bindings generator from its upstream pin plus
+# `third_party/uniffi-bindgen-dart/patches/`. The fork is not committed; see
+# that directory's README for how to add a patch. The upstream clone is cached,
+# so this only touches the network on the first run or after a pin change.
+vendor-generator:
+    ./scripts/vendor-uniffi-bindgen-dart.sh
+
 # Generate + patch the Dart bindings into the cera_ffi package (NOT
 # cera_ffi_flutter, which is the thin Flutter plugin wrapping it).
-# Builds + runs the VENDORED uniffi-bindgen-dart (third_party/) — patched for
-# Cera with callback-argument lowering + the foreign-trait vtable-init symbol fix
-# that makes streaming work; built from source rather than `cargo install`ing the
-# upstream 0.1.3 so those fixes are in effect (to be upstreamed). It runs against
-# the ffi-buffer cdylib, then `tool/patch_generated_bindings.dart` (deterministic
-# + idempotent) fixes symbol names, native-lib resolution, and the EngineConfig
-# record encoder. The patched result analyzes clean and round-trips real
-# inference, including async + streaming. See V2.17.
+# Builds + runs the vendored uniffi-bindgen-dart, which is upstream 0.1.3 plus
+# the patch series in `third_party/uniffi-bindgen-dart/patches/`: eight fixes
+# upstream does not have, covering the callback ABI (argument lowering, the
+# vtable-init symbol, slot order, RustBuffer by value, cross-thread delivery)
+# and web-stub generation, which is what makes this recipe also emit
+# `cera_ffi/lib/src/generated/cera_ffi_web.dart`. See that directory's README.
+# It runs against the ffi-buffer cdylib, then
+# `tool/patch_generated_bindings.dart` (deterministic + idempotent) fixes symbol
+# names, native-lib resolution, and the EngineConfig record encoder. The patched
+# result analyzes clean and round-trips real inference, including async +
+# streaming. See V2.17.
 #
 # `cargo run --manifest-path` is used over a hardcoded target/ binary path so it
 # stays portable (handles the Windows `.exe` suffix automatically).
 #
 # Requires a Dart SDK >= 3.3.
-dart-bindings: dart-libs
-    cargo run --release --manifest-path third_party/uniffi-bindgen-dart/Cargo.toml -- \
+dart-bindings: vendor-generator dart-libs
+    cargo run --release --manifest-path third_party/uniffi-bindgen-dart/build/Cargo.toml -- \
         generate {{CERA_FFI_DYLIB}} \
         --out-dir cera_ffi/lib/src/generated
     cd cera_ffi && dart run tool/patch_generated_bindings.dart

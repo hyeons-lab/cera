@@ -1,0 +1,19 @@
+# Upstream pin for the vendored Dart bindings generator.
+#
+# Read by scripts/vendor-uniffi-bindgen-dart.sh. Change the rev here and
+# re-run `just vendor-generator` to move to a new upstream; any patch that no
+# longer applies will fail loudly rather than being silently dropped.
+#
+# The subdirectory is the crate within upstream's workspace that we build; the
+# rest of that repo (runtime, test harness, fixtures) is not used.
+repo=https://github.com/nchapman/uniffi-bindgen-dart
+tag=v0.1.3
+rev=c2a2ee53cc2dc1ef2d6e8e8f41168d71e3098c6f
+subdir=crates/ubdg_bindgen
+
+# Upstream's terms, for tooling. The full permission notice is kept beside
+# this file as LICENSE, because patches/ carries substantial upstream code
+# verbatim and MIT requires the notice to travel with it: a clone that never
+# runs the vendor script must still have it.
+license=MIT
+copyright=Copyright (c) 2025 Nick Chapman
