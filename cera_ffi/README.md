@@ -59,6 +59,40 @@ Future<void> main() async {
 }
 ```
 
+### Downloading a published model
+
+`Cera.listBundles()` returns the models published on `LiquidAI/LeapBundles` as
+`<name, quants>` pairs, which is what a picker needs, and `Cera.openBundle`
+downloads one and opens it. Both work on every target, and the same catalog and
+parser back `cera list-bundles`, so a menu shows what the CLI shows.
+
+```dart
+final bundles = await Cera.listBundles();
+for (final b in bundles) {
+  print('${b.displayName}: ${b.quants.join(" ")}');
+}
+
+final cera = await Cera.openBundle(
+  bundles.first.name,     // the full id, not displayName
+  bundles.first.quants.first,
+  onProgress: (p) => print('${p.url} ${p.fraction ?? "?"}'),
+);
+```
+
+Prefer this over fetching a `.gguf` yourself and calling `openBytes`. A bundle's
+manifest names every file it needs and states its modality, so a vision or audio
+model arrives complete rather than being guessed at from the arguments. It is
+also the cheaper path in memory, and on the web dramatically so: the weights go
+from the cache straight into the engine, one copy of the model instead of two,
+which is also what keeps it clear of the roughly 2 GiB ceiling on a single
+contiguous JavaScript allocation that `openBytes` runs into.
+
+Downloads are cached, so re-opening the same pair is offline and instant.
+`storeDir` chooses where, and is **required on Android and iOS**, where an app
+may write only inside its own container: pass a path from `path_provider`. On
+desktop it defaults to `$HOME/.cache/cera`, which the `cera` CLI also uses, so
+the two share downloads.
+
 The generated bindings underneath cover the whole engine (LoRA, vision, audio,
 embeddings, grammars, tool calling, KV compression). Reach for them when you
 need something `Cera` does not expose, and accept that they are native-only:
@@ -109,9 +143,11 @@ satisfy: a Rust async runtime on native, a Web Worker on web.
 Inference runs on **WebGPU** when the browser has it and falls back to a wasm
 CPU build when it does not: ~58 tok/s against ~1.4 tok/s, measured on the same
 machine and model. Install the runtime into your app's `web/` directory once
-with `dart run cera_ffi:install_web`, then use `Cera.openBytes` (there is no
-filesystem for `openPath`). No COOP/COEP headers are needed; nothing here uses
-threads. See the [`cera_ffi_flutter`
+with `dart run cera_ffi:install_web`, then use `Cera.openBundle` (preferred, see
+above) or `Cera.openBytes` for a model the user supplies; there is no filesystem
+for `openPath`. Downloads are cached in the origin's private filesystem (OPFS),
+so a second visit reopens the same model without the network. No COOP/COEP
+headers are needed; nothing here uses threads. See the [`cera_ffi_flutter`
 README](https://pub.dev/packages/cera_ffi_flutter) for the full setup and for
 what is narrower there.
 

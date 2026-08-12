@@ -440,6 +440,60 @@ class GenerateSummary {
   int get hashCode => Object.hash(tokensGenerated, promptEvalTokens, promptEvalMs, decodeMs, finishReason);
 }
 
+/// One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
+/// model directory plus every per-quant manifest inside it. Feed
+/// `name` and one element of `quants` straight to
+/// [`CeraEngine::from_bundle_id`].
+///
+/// Both fields are sorted ascending, so a menu built from this list is
+/// stable across runs even if the upstream API reorders its response.
+class LeapBundleEntry {
+  const LeapBundleEntry({
+    required this.name,
+    required this.quants,
+  });
+
+  final String name;
+  final List<String> quants;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'name': this.name,
+      'quants': this.quants,
+    };
+  }
+
+  factory LeapBundleEntry.fromJson(Map<String, dynamic> json) {
+    return LeapBundleEntry(
+      name: json['name'] as String,
+      quants: (json['quants'] as List).map((item) => item as String).toList(),
+    );
+  }
+
+  LeapBundleEntry copyWith({
+    String? name,
+    List<String>? quants,
+  }) {
+    return LeapBundleEntry(
+      name: name ?? this.name,
+      quants: quants ?? this.quants,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'LeapBundleEntry(name: $name, quants: $quants)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LeapBundleEntry && name == other.name && quants == other.quants;
+
+  @override
+  int get hashCode => Object.hash(name, quants);
+}
+
 /// Modality support flags for a loaded model. Mirrors
 /// [`cera::ModalityCapabilities`].
 class ModalityCapabilities {
@@ -2931,6 +2985,39 @@ String cpuBackendReport() => _unsupportedOnWeb('cpuBackendReport');
 /// `"lfm2"`, `"qwen3"`). Returns `None` for architectures with no known
 /// convention — the caller may still choose a format explicitly.
 ToolFormat? detectToolFormat(String architecture) => _unsupportedOnWeb('detectToolFormat');
+
+/// List every bundle published on `LiquidAI/LeapBundles`, so a picker
+/// can offer `<name>, <quant>` pairs instead of making the user type a
+/// bundle id. Pair with [`CeraEngine::from_bundle_id`], which takes
+/// exactly these two strings.
+///
+/// One blocking HTTP GET with a 30 s timeout and no retry. Prefer
+/// [`list_leap_bundles_async`] anywhere a UI thread is involved: this
+/// twin stalls the calling thread for the whole round-trip.
+///
+/// Needs no [`BundleRepo`]: the catalog is a single small JSON
+/// response and is deliberately not cached, so a picker opened twice
+/// in one session reflects newly published bundles.
+List<LeapBundleEntry> listLeapBundles() => _unsupportedOnWeb('listLeapBundles');
+
+/// Async variant of [`list_leap_bundles`]: moves the blocking HTTP
+/// round-trip onto a tokio blocking worker so a coroutine, a Swift
+/// `async` context or a Dart `Future` can await the catalog without
+/// stalling the thread that asked for it.
+///
+/// `async_runtime = "tokio"` is load-bearing, not decoration: it is
+/// what makes uniffi poll this future inside a tokio context. Without
+/// it the foreign executor drives the future with no runtime
+/// installed and the `spawn_blocking` below panics with "must be
+/// called from the context of a Tokio 1.x runtime" on the very first
+/// call.
+///
+/// Cancellation: dropping the returned future aborts the task if it
+/// has not started, so a dismissed picker does not leave a 30 s
+/// blocking GET queued on the pool. A request already in flight runs
+/// to completion; `reqwest::blocking` offers nothing to interrupt, and
+/// the response is small.
+Future<List<LeapBundleEntry>> listLeapBundlesAsync() => _unsupportedOnWeb('listLeapBundlesAsync');
 
 /// Parse tool calls out of generated model text for the given `format`.
 /// Returns an empty list when the reply contains no tool call (the model

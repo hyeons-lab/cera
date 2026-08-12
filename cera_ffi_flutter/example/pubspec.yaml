@@ -39,6 +39,12 @@ dependencies:
   # Lets the user pick a .gguf off the device instead of hardcoding a path.
   file_picker: ^10.0.0
 
+  # Supplies the bundle download directory on Android and iOS, where an app may
+  # only write inside its own container and `Cera.openBundle` therefore refuses
+  # to guess. Desktop needs none of this: the default there is the CLI's own
+  # cache, so the two share downloads.
+  path_provider: ^2.1.0
+
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8

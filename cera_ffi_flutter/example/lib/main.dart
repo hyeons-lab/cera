@@ -23,7 +23,10 @@ import 'dart:async';
 
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, kIsWeb, TargetPlatform;
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'benchmark.dart';
 
@@ -75,6 +78,12 @@ class _ChatPageState extends State<ChatPage> {
   String _status = 'No model loaded';
   bool _loading = false;
 
+  /// Download completion in `0.0..1.0` while a bundle is being fetched, or null
+  /// for "not downloading, or downloading something of unknown size". Both
+  /// nulls render the same way (no determinate bar), so they need not be
+  /// distinguished here.
+  double? _downloadFraction;
+
   bool get _busy => _loading || _generation != null;
 
   @override
@@ -90,6 +99,71 @@ class _ChatPageState extends State<ChatPage> {
     super.dispose();
   }
 
+  /// Runs `open` as the app's one model-loading path, with the bookkeeping that
+  /// every loader needs: closing the previous model, the busy flag, the
+  /// dispose-during-load guard, and error reporting.
+  ///
+  /// Shared by the file picker and the bundle menu. They differ only in how
+  /// they produce a [Cera], and having each carry its own copy of this is how
+  /// the two quietly drift apart on which of these steps they remember.
+  Future<void> _load(String label, Future<Cera> Function() open) async {
+    // Guarded here, not only on the buttons that call it. Both entry points
+    // await a dialog first, and the file picker's is a browser-native dialog
+    // that does not disable the Flutter buttons behind it, so a second load can
+    // legitimately arrive while the first is still running. Two in flight would
+    // each open an engine and the last to finish would overwrite the other's
+    // without closing it, leaking a full set of model weights. That is the
+    // hazard `_pickBundle` reasons about below; keeping the invariant in the
+    // function that depends on it means a future caller cannot forget it.
+    //
+    // Says so rather than dropping the request silently: the user picked a file
+    // or a bundle and would otherwise see the status line still naming the
+    // first load, with no sign the second went nowhere.
+    if (_loading) {
+      setState(() => _status = 'Still loading; ignored $label');
+      return;
+    }
+    setState(() {
+      _loading = true;
+      _downloadFraction = null;
+      _status = 'Loading $label…';
+      _turns.clear();
+    });
+
+    try {
+      // Close any previous model first: two sets of weights will not fit
+      // alongside each other on a phone, and on the web they compete for one
+      // wasm heap. Inside the try, so a failure here cannot leave `_loading`
+      // stuck true and the whole UI disabled with nothing shown.
+      await _cera?.close();
+      _cera = null;
+      final cera = await open();
+      // Every setState here follows an await, so it needs the guard: loading a
+      // multi-hundred-megabyte model takes long enough for the page to be
+      // disposed underneath it.
+      if (!mounted) {
+        await cera.close();
+        return;
+      }
+      setState(() {
+        _cera = cera;
+        _status = '$label · ${cera.backend}';
+      });
+    } catch (err, stack) {
+      // Log as well as display: the status line truncates, and the full message
+      // is the only thing that says which step failed.
+      debugPrint('cera: model failed to load: $err\n$stack');
+      if (mounted) setState(() => _status = 'Failed to load: $err');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _downloadFraction = null;
+        });
+      }
+    }
+  }
+
   Future<void> _pickModel() async {
     // `withData` matters on the web, where there is no path to open: the picker
     // has to hand over the bytes themselves. On native it would mean reading a
@@ -103,55 +177,80 @@ class _ChatPageState extends State<ChatPage> {
     final file = result?.files.single;
     if (file == null) return;
 
-    setState(() {
-      _loading = true;
-      _status = 'Loading ${file.name}…';
-      _turns.clear();
-    });
-
-    try {
-      // Close any previous model first: two sets of weights will not fit
-      // alongside each other on a phone, and on the web they compete for one
-      // wasm heap. Inside the try, so a failure here cannot leave `_loading`
-      // stuck true and the whole UI disabled with nothing shown.
-      await _cera?.close();
-      _cera = null;
-      // Ask the API which mode it has, rather than testing `file.path`. On the
-      // web the picker manufactures a `blob:` URL for the bytes it just read
-      // and puts it in `path`, so that field is non-null in a browser and
-      // testing it would send every web load into `openPath`, which is the one
-      // call the web does not have.
-      final path = Cera.supportsPaths ? file.path : null;
-      final bytes = file.bytes;
-      // Neither one is reachable when a native pick yields a content URI the
-      // picker could not resolve. Say so, rather than letting a bang throw a
-      // null-check error the status line would show as-is.
-      if (path == null && bytes == null) {
-        if (mounted) setState(() => _status = 'Could not read ${file.name}');
-        return;
-      }
-      final cera = path != null
-          ? await Cera.openPath(path)
-          : await Cera.openBytes(bytes!);
-      // Every setState here follows an await, so it needs the guard: loading a
-      // multi-hundred-megabyte model takes long enough for the page to be
-      // disposed underneath it.
-      if (!mounted) {
-        await cera.close();
-        return;
-      }
-      setState(() {
-        _cera = cera;
-        _status = '${file.name} · ${cera.backend}';
-      });
-    } catch (err, stack) {
-      // Log as well as display: the status line truncates, and the full message
-      // is the only thing that says which step failed.
-      debugPrint('cera: model failed to load: $err\n$stack');
-      if (mounted) setState(() => _status = 'Failed to load: $err');
-    } finally {
-      if (mounted) setState(() => _loading = false);
+    // Ask the API which mode it has, rather than testing `file.path`. On the
+    // web the picker manufactures a `blob:` URL for the bytes it just read
+    // and puts it in `path`, so that field is non-null in a browser and
+    // testing it would send every web load into `openPath`, which is the one
+    // call the web does not have.
+    final path = Cera.supportsPaths ? file.path : null;
+    final bytes = file.bytes;
+    // Neither one is reachable when a native pick yields a content URI the
+    // picker could not resolve. Say so, rather than letting a bang throw a
+    // null-check error the status line would show as-is.
+    if (path == null && bytes == null) {
+      if (mounted) setState(() => _status = 'Could not read ${file.name}');
+      return;
     }
+    await _load(
+      file.name,
+      () => path != null ? Cera.openPath(path) : Cera.openBytes(bytes!),
+    );
+  }
+
+  /// Where bundle downloads are cached.
+  ///
+  /// Only Android and iOS need an answer: an app there may write solely inside
+  /// its own container, which no environment variable names, so `openBundle`
+  /// refuses to guess rather than failing partway into a download. Desktop
+  /// falls through to the default, `$HOME/.cache/cera`, which is the CLI's own
+  /// cache, so a model pulled by `cera chat` is already here, and vice versa.
+  /// The web takes a single directory NAME inside the origin's private
+  /// filesystem rather than a path, so a native path would be rejected there;
+  /// null takes its default, which is what you want.
+  Future<String?> _storeDir() async {
+    if (kIsWeb) return null;
+    final mobile =
+        defaultTargetPlatform == TargetPlatform.android ||
+        defaultTargetPlatform == TargetPlatform.iOS;
+    if (!mobile) return null;
+    return (await getApplicationSupportDirectory()).path;
+  }
+
+  /// Offers the published catalog, then downloads and opens what was chosen.
+  Future<void> _pickBundle() async {
+    final choice = await showDialog<_BundleChoice>(
+      context: context,
+      builder: (_) => const _BundlePickerDialog(),
+    );
+    if (choice == null || !mounted) return;
+
+    final label = '${choice.bundle.displayName} · ${choice.quant}';
+    await _load(
+      label,
+      // `_storeDir()` is awaited INSIDE the callback, not before `_load`. On
+      // mobile it is a real platform-channel round trip, and awaiting it out
+      // here would leave the buttons enabled (nothing sets `_loading` until
+      // `_load` runs) long enough to start a second load: both would see
+      // `_cera` still null, and whichever finished last would overwrite the
+      // other's engine without closing it, leaking the model weights.
+      () async => Cera.openBundle(
+        choice.bundle.name,
+        choice.quant,
+        storeDir: await _storeDir(),
+        onProgress: (progress) {
+          // Guarded before setState: progress keeps arriving for a moment after
+          // the page is disposed, since disposal does not cancel the download.
+          if (!mounted) return;
+          setState(() {
+            _downloadFraction = progress.fraction;
+            final pct = progress.fraction == null
+                ? '${(progress.bytesDownloaded / 1024 / 1024).toStringAsFixed(0)} MB'
+                : '${(progress.fraction! * 100).toStringAsFixed(0)}%';
+            _status = 'Downloading $label · $pct';
+          });
+        },
+      ),
+    );
   }
 
   Future<void> _send() async {
@@ -277,6 +376,11 @@ class _ChatPageState extends State<ChatPage> {
             tooltip: 'Benchmark CPU vs GPU',
           ),
           IconButton(
+            onPressed: _busy ? null : _pickBundle,
+            icon: const Icon(Icons.cloud_download_outlined),
+            tooltip: 'Download a published model',
+          ),
+          IconButton(
             onPressed: _busy ? null : _pickModel,
             icon: const Icon(Icons.folder_open),
             tooltip: 'Open a .gguf model',
@@ -285,9 +389,18 @@ class _ChatPageState extends State<ChatPage> {
       ),
       body: Column(
         children: [
+          // Up for any load, not only a download: `_downloadFraction` is null
+          // for a local file open and for a server that sent no length, and
+          // `value: null` is an indeterminate bar, which is the honest
+          // rendering of both.
+          if (_loading) LinearProgressIndicator(value: _downloadFraction),
           Expanded(
             child: _turns.isEmpty
-                ? const Center(child: Text('Open a .gguf model to start.'))
+                ? const Center(
+                    child: Text(
+                      'Download a published model, or open a .gguf, to start.',
+                    ),
+                  )
                 : ListView.builder(
                     controller: _scroll,
                     padding: const EdgeInsets.all(12),
@@ -334,6 +447,97 @@ class _ChatPageState extends State<ChatPage> {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// A bundle and one of its quantizations, chosen from the catalog.
+class _BundleChoice {
+  const _BundleChoice(this.bundle, this.quant);
+
+  /// The catalog entry. Carried whole rather than as a bare id so the display
+  /// name comes from `CeraBundle.displayName` instead of being trimmed again
+  /// here.
+  final CeraBundle bundle;
+
+  final String quant;
+}
+
+/// Lists the published bundles and pops with the chosen `<name>, <quant>`.
+class _BundlePickerDialog extends StatefulWidget {
+  const _BundlePickerDialog();
+
+  @override
+  State<_BundlePickerDialog> createState() => _BundlePickerDialogState();
+}
+
+class _BundlePickerDialogState extends State<_BundlePickerDialog> {
+  // Held as a Future and given to a FutureBuilder rather than resolved into
+  // state, so the request is issued exactly once: initState runs once, whereas
+  // build runs on every expansion tile toggle.
+  late final Future<List<CeraBundle>> _bundles = Cera.listBundles();
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Published models'),
+      content: SizedBox(
+        width: 420,
+        height: 460,
+        child: FutureBuilder<List<CeraBundle>>(
+          future: _bundles,
+          builder: (context, snapshot) {
+            if (snapshot.hasError) {
+              // The catalog is one request with a 30 second deadline and no
+              // retry, so the useful thing to show is the reason plus a way to
+              // give up; a spinner that never ends would be worse.
+              return Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(
+                    'Could not reach the catalog:\n${snapshot.error}',
+                  ),
+                ),
+              );
+            }
+            final bundles = snapshot.data;
+            if (bundles == null) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            return ListView.builder(
+              itemCount: bundles.length,
+              itemBuilder: (context, i) {
+                final bundle = bundles[i];
+                final n = bundle.quants.length;
+                return ExpansionTile(
+                  // Without a key the expanded state is not preserved across
+                  // ListView recycling, so expanding a tile and scrolling away
+                  // collapses it: only about six of the ~29 entries fit.
+                  key: PageStorageKey(bundle.name),
+                  title: Text(bundle.displayName),
+                  subtitle: Text('$n quantization${n == 1 ? "" : "s"}'),
+                  children: [
+                    for (final quant in bundle.quants)
+                      ListTile(
+                        dense: true,
+                        title: Text(quant),
+                        onTap: () => Navigator.of(
+                          context,
+                        ).pop(_BundleChoice(bundle, quant)),
+                      ),
+                  ],
+                );
+              },
+            );
+          },
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+      ],
     );
   }
 }

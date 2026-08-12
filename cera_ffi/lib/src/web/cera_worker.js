@@ -23,7 +23,8 @@
 //
 // Request:  {id, op, ...args}
 // Reply:    {id, ok: true, result} | {id, ok: false, error}
-// Stream:   {id, event: 'token', text}   (zero or more, before the reply)
+// Stream:   {id, event: 'token', text}                      (generate)
+//           {id, event: 'progress', url, done, total}       (openBundle)
 //
 // Every request gets exactly one reply, and `id` correlates them. Streaming
 // events carry the same `id` and always precede that request's reply.
@@ -171,11 +172,85 @@ async function tryGpu(bytes, contextSize, mmproj) {
   return true;
 }
 
+/**
+ * Try the GPU path for a bundle. Returns `null` on success, or a string saying
+ * why the GPU could not serve it, so `auto` can fall through to the CPU and
+ * still report the reason if that fails too.
+ *
+ * A reason rather than `tryGpu`'s bare boolean because this path can fail for
+ * something the caller must hear about. `tryGpu` is handed bytes and can only
+ * fail on the model itself; this one downloads, so a network failure arrives
+ * here as well, and a silent fall-through would then report whatever the CPU
+ * retry says about a cache that was never populated.
+ *
+ * Separate from `tryGpu` for the same reason the two constructors are separate:
+ * this one keeps the weights inside wasm. Handing them to JS to reuse `tryGpu`
+ * would cost a second full copy of the model and reintroduce the ~2 GiB ceiling
+ * on a single `ArrayBuffer`, which is what the bundle constructors exist to
+ * avoid.
+ *
+ * A failure *after* the download (a non-LFM2 architecture, the common one) has
+ * already populated the cache, so the CPU retry behind it loads from the store
+ * rather than downloading again.
+ */
+async function tryGpuBundle(repo, bundleId, quant, contextSize, onProgress) {
+  if (!self.navigator || !self.navigator.gpu) return 'this browser exposes no navigator.gpu';
+  // Absent from a wasm build without the `wgpu` feature, and from one predating
+  // this constructor. Both fall back rather than throwing a TypeError that
+  // `auto` would read as "no GPU" for the wrong reason.
+  if (typeof wasm.WebGpuSession !== 'function') {
+    return 'this wasm build has no WebGpuSession (built without the `wgpu` feature)';
+  }
+  if (typeof wasm.WebGpuSession.fromBundleId !== 'function') {
+    return 'this wasm build predates WebGpuSession.fromBundleId';
+  }
+  let session;
+  try {
+    session = await wasm.WebGpuSession.fromBundleId(
+      repo,
+      bundleId,
+      quant,
+      contextSize,
+      // No KV compression: `SessionConfig.kvCompression` is not exposed through
+      // this protocol either, so requesting it on one path only would make the
+      // two backends disagree about memory for reasons a caller cannot see.
+      undefined,
+      onProgress,
+    );
+  } catch (err) {
+    return String((err && err.message) || err);
+  }
+  gpu = { session, tokenizer: session.tokenizer };
+  backendLabel = `webgpu: ${session.adapter}`;
+  return null;
+}
+
 function openCpu(bytes, contextSize, mmproj, inferenceType) {
   // `fromGgufParts` covers the text-only case too (a null projector is exactly
   // `fromGgufBytes`), so both paths resolve the inference type through one
   // constructor instead of two that have to agree.
   const engine = wasm.CeraEngine.fromGgufParts(bytes, mmproj, contextSize, inferenceType);
+  const session = engine.newSession(new wasm.SessionConfig());
+  cpu = { engine, session, tokenizer: engine.tokenizer };
+  backendLabel = 'wasm cpu';
+}
+
+/**
+ * Open a bundle on the CPU engine.
+ *
+ * `fromBundleId` rather than pulling the bytes out of the repo and calling
+ * `fromGgufParts`: the manifest states the modality outright and names every
+ * file the bundle needs, so a VL or audio bundle arrives complete with no
+ * guessing, and the weights never cross into JS.
+ */
+async function openCpuBundle(repo, bundleId, quant, contextSize, onProgress) {
+  const engine = await wasm.CeraEngine.fromBundleId(
+    repo,
+    bundleId,
+    quant,
+    contextSize,
+    onProgress,
+  );
   const session = engine.newSession(new wasm.SessionConfig());
   cpu = { engine, session, tokenizer: engine.tokenizer };
   backendLabel = 'wasm cpu';
@@ -231,6 +306,81 @@ const OPS = {
       openCpu(view, ctx, proj, type);
     }
     return { backend: backendLabel, capabilities: capabilitiesOf() };
+  },
+
+  /**
+   * The bundles published on `LiquidAI/LeapBundles`, as
+   * `[{ name, quants: [...] }]`.
+   *
+   * Takes `moduleUrl` like `open` does, and for the same reason: a picker is
+   * the first thing an app shows, so this usually runs before any model has
+   * been opened and cannot assume the module is already imported.
+   */
+  async listBundles({ moduleUrl }) {
+    await ensureModule(moduleUrl);
+    return wasm.listLeapBundles();
+  },
+
+  /**
+   * Download a published bundle by `<bundleId, quant>` and open it, streaming
+   * `progress` events while files are fetched.
+   *
+   * The counterpart to `open` for callers who have a bundle id rather than
+   * bytes, and the better path in a browser wherever both would work: the
+   * weights go from the store straight into wasm linear memory, never through
+   * a JS `ArrayBuffer`, so this costs one copy of the model instead of two and
+   * is not bounded by the ~2 GiB limit on a single contiguous JS allocation.
+   *
+   * `storeDir` names the OPFS directory to cache under; omitting it takes
+   * `BundleRepo`'s own default. A cached bundle re-opens without any network
+   * access and fires no progress events.
+   */
+  async openBundle(req, post) {
+    const { moduleUrl, bundleId, quant, contextSize, backend, storeDir } = req;
+    await ensureModule(moduleUrl);
+    const repo = new wasm.BundleRepo(storeDir ?? undefined);
+    const ctx = contextSize ?? undefined;
+    // `total` is null when the server sends no Content-Length, and crosses as
+    // null rather than being dropped so the host can tell "unknown size" from
+    // "no progress yet".
+    const onProgress = (url, done, total) => {
+      post({ event: 'progress', url, done, total: total ?? null });
+    };
+    try {
+      if (backend === 'cpu') {
+        await openCpuBundle(repo, bundleId, quant, ctx, onProgress);
+        return { backend: backendLabel, capabilities: capabilitiesOf() };
+      }
+      const why = await tryGpuBundle(repo, bundleId, quant, ctx, onProgress);
+      if (why === null) {
+        return { backend: backendLabel, capabilities: capabilitiesOf() };
+      }
+      if (backend === 'gpu') {
+        throw new Error(
+          `the WebGPU backend could not load bundle ${bundleId}/${quant}: ${why}. ` +
+            'Only LFM2 bundles have a browser GPU path. Use backend: auto to fall ' +
+            'back to the CPU instead.',
+        );
+      }
+      // `auto`. The CPU load is the fallback, but the GPU reason is the more
+      // useful half of a double failure: it is the one that says whether the
+      // download itself failed, so it rides along rather than being discarded.
+      try {
+        await openCpuBundle(repo, bundleId, quant, ctx, onProgress);
+      } catch (err) {
+        throw new Error(
+          `${String((err && err.message) || err)} (the WebGPU path was tried first ` +
+            `and reported: ${why})`,
+        );
+      }
+      return { backend: backendLabel, capabilities: capabilitiesOf() };
+    } finally {
+      // The repo is a wasm-bindgen handle and nothing else holds it once the
+      // load has read what it needs, so it has to be freed explicitly like the
+      // session/engine/tokenizer handles in `close`. In `finally` because the
+      // `auto` path can leave by three different routes.
+      repo.free();
+    }
   },
 
   /**

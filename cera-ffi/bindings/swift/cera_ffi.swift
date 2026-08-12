@@ -3837,6 +3837,69 @@ public func FfiConverterTypeGenerateSummary_lower(_ value: GenerateSummary) -> R
 
 
 /**
+ * One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
+ * model directory plus every per-quant manifest inside it. Feed
+ * `name` and one element of `quants` straight to
+ * [`CeraEngine::from_bundle_id`].
+ *
+ * Both fields are sorted ascending, so a menu built from this list is
+ * stable across runs even if the upstream API reorders its response.
+ */
+public struct LeapBundleEntry: Equatable, Hashable {
+    public var name: String
+    public var quants: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, quants: [String]) {
+        self.name = name
+        self.quants = quants
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension LeapBundleEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLeapBundleEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LeapBundleEntry {
+        return
+            try LeapBundleEntry(
+                name: FfiConverterString.read(from: &buf), 
+                quants: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LeapBundleEntry, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterSequenceString.write(value.quants, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLeapBundleEntry_lift(_ buf: RustBuffer) throws -> LeapBundleEntry {
+    return try FfiConverterTypeLeapBundleEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLeapBundleEntry_lower(_ value: LeapBundleEntry) -> RustBuffer {
+    return FfiConverterTypeLeapBundleEntry.lower(value)
+}
+
+
+/**
  * Modality support flags for a loaded model. Mirrors
  * [`cera::ModalityCapabilities`].
  */
@@ -5202,6 +5265,31 @@ fileprivate struct FfiConverterSequenceFloat: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]
+
+    public static func write(_ value: [String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterString.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [String]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeChatMessage: FfiConverterRustBuffer {
     typealias SwiftType = [ChatMessage]
 
@@ -5219,6 +5307,31 @@ fileprivate struct FfiConverterSequenceTypeChatMessage: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeChatMessage.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeLeapBundleEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [LeapBundleEntry]
+
+    public static func write(_ value: [LeapBundleEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLeapBundleEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LeapBundleEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LeapBundleEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLeapBundleEntry.read(from: &buf))
         }
         return seq
     }
@@ -5357,6 +5470,59 @@ public func detectToolFormat(architecture: String) -> ToolFormat?  {
 })
 }
 /**
+ * List every bundle published on `LiquidAI/LeapBundles`, so a picker
+ * can offer `<name>, <quant>` pairs instead of making the user type a
+ * bundle id. Pair with [`CeraEngine::from_bundle_id`], which takes
+ * exactly these two strings.
+ *
+ * One blocking HTTP GET with a 30 s timeout and no retry. Prefer
+ * [`list_leap_bundles_async`] anywhere a UI thread is involved: this
+ * twin stalls the calling thread for the whole round-trip.
+ *
+ * Needs no [`BundleRepo`]: the catalog is a single small JSON
+ * response and is deliberately not cached, so a picker opened twice
+ * in one session reflects newly published bundles.
+ */
+public func listLeapBundles()throws  -> [LeapBundleEntry]  {
+    return try  FfiConverterSequenceTypeLeapBundleEntry.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_func_list_leap_bundles($0
+    )
+})
+}
+/**
+ * Async variant of [`list_leap_bundles`]: moves the blocking HTTP
+ * round-trip onto a tokio blocking worker so a coroutine, a Swift
+ * `async` context or a Dart `Future` can await the catalog without
+ * stalling the thread that asked for it.
+ *
+ * `async_runtime = "tokio"` is load-bearing, not decoration: it is
+ * what makes uniffi poll this future inside a tokio context. Without
+ * it the foreign executor drives the future with no runtime
+ * installed and the `spawn_blocking` below panics with "must be
+ * called from the context of a Tokio 1.x runtime" on the very first
+ * call.
+ *
+ * Cancellation: dropping the returned future aborts the task if it
+ * has not started, so a dismissed picker does not leave a 30 s
+ * blocking GET queued on the pool. A request already in flight runs
+ * to completion; `reqwest::blocking` offers nothing to interrupt, and
+ * the response is small.
+ */
+public func listLeapBundlesAsync()async throws  -> [LeapBundleEntry]  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_func_list_leap_bundles_async(
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_cera_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_cera_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeLeapBundleEntry.lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+/**
  * Parse tool calls out of generated model text for the given `format`.
  * Returns an empty list when the reply contains no tool call (the model
  * answered in prose). Errors only when a call section is present but
@@ -5407,6 +5573,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_list_leap_bundles() != 14501) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_list_leap_bundles_async() != 60360) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_parse_tool_calls() != 47579) {

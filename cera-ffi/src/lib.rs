@@ -624,6 +624,74 @@ pub fn tool_grammar(tools: Vec<ToolDef>, format: ToolFormat) -> Result<String, F
 }
 
 // ---------------------------------------------------------------------------
+// LeapBundles catalog
+// ---------------------------------------------------------------------------
+
+/// One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
+/// model directory plus every per-quant manifest inside it. Feed
+/// `name` and one element of `quants` straight to
+/// [`CeraEngine::from_bundle_id`].
+///
+/// Both fields are sorted ascending, so a menu built from this list is
+/// stable across runs even if the upstream API reorders its response.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LeapBundleEntry {
+    pub name: String,
+    pub quants: Vec<String>,
+}
+
+/// List every bundle published on `LiquidAI/LeapBundles`, so a picker
+/// can offer `<name>, <quant>` pairs instead of making the user type a
+/// bundle id. Pair with [`CeraEngine::from_bundle_id`], which takes
+/// exactly these two strings.
+///
+/// One blocking HTTP GET with a 30 s timeout and no retry. Prefer
+/// [`list_leap_bundles_async`] anywhere a UI thread is involved: this
+/// twin stalls the calling thread for the whole round-trip.
+///
+/// Needs no [`BundleRepo`]: the catalog is a single small JSON
+/// response and is deliberately not cached, so a picker opened twice
+/// in one session reflects newly published bundles.
+#[uniffi::export]
+pub fn list_leap_bundles() -> Result<Vec<LeapBundleEntry>, FfiError> {
+    cera::bundle::list_leap_bundles()
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|e| LeapBundleEntry {
+                    name: e.name,
+                    quants: e.quants,
+                })
+                .collect()
+        })
+        .map_err(|e| FfiError::Backend {
+            detail: format!("list_leap_bundles: {e}"),
+        })
+}
+
+/// Async variant of [`list_leap_bundles`]: moves the blocking HTTP
+/// round-trip onto a tokio blocking worker so a coroutine, a Swift
+/// `async` context or a Dart `Future` can await the catalog without
+/// stalling the thread that asked for it.
+///
+/// `async_runtime = "tokio"` is load-bearing, not decoration: it is
+/// what makes uniffi poll this future inside a tokio context. Without
+/// it the foreign executor drives the future with no runtime
+/// installed and the `spawn_blocking` below panics with "must be
+/// called from the context of a Tokio 1.x runtime" on the very first
+/// call.
+///
+/// Cancellation: dropping the returned future aborts the task if it
+/// has not started, so a dismissed picker does not leave a 30 s
+/// blocking GET queued on the pool. A request already in flight runs
+/// to completion; `reqwest::blocking` offers nothing to interrupt, and
+/// the response is small.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn list_leap_bundles_async() -> Result<Vec<LeapBundleEntry>, FfiError> {
+    spawn_blocking_guarded("list_leap_bundles_async", list_leap_bundles).await
+}
+
+// ---------------------------------------------------------------------------
 // BundleRepo
 // ---------------------------------------------------------------------------
 
@@ -2083,8 +2151,9 @@ impl Drop for AsyncCancelGuard {
 
 /// Lighter-weight sibling of [`AsyncCancelGuard`] for `spawn_blocking`
 /// tasks that don't share mutable state with anything the caller can
-/// signal. Used by all three async [`CeraEngine`] constructors, via
-/// `spawn_engine_build`: engine construction holds no cross-thread
+/// signal. Reached through `spawn_blocking_guarded`, so it covers the
+/// three async [`CeraEngine`] constructors (via `spawn_engine_build`)
+/// and `list_leap_bundles_async`: engine construction holds no cross-thread
 /// cancel flag, and neither the tokenizer build nor (for
 /// `from_bundle_id`) the `reqwest::blocking` download can be
 /// cooperatively cancelled, so there's nothing like `Session::cancel`
@@ -2204,13 +2273,45 @@ impl Session {
     }
 }
 
+/// Runs `work` on a tokio blocking worker under an [`AbortOnDrop`] guard.
+///
+/// The one place the `spawn_blocking` + guard + join-error-mapping sequence
+/// lives, for the exports whose blocking work has no cooperative cancel point:
+/// the async engine constructors (via [`spawn_engine_build`]) and
+/// [`list_leap_bundles_async`]. They differ only in `what`, the name in the
+/// join-error message, and in what they do with the value.
+///
+/// Not for [`Session::generate_async`] or `generate_streaming_async`. Those
+/// hold a cancel flag the caller can signal, so they use [`AsyncCancelGuard`]
+/// to call `Session::cancel` on drop; routing them through here would silently
+/// drop that.
+///
+/// Cancellation is therefore the weak form those exports document: dropping the
+/// returned future aborts the task only while it is still queued, since neither
+/// a blocking HTTP GET nor an engine build can be interrupted once running.
+async fn spawn_blocking_guarded<T, F>(what: &str, work: F) -> Result<T, FfiError>
+where
+    F: FnOnce() -> Result<T, FfiError> + Send + 'static,
+    T: Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(work);
+    let mut guard = AbortOnDrop {
+        abort: handle.abort_handle(),
+        armed: true,
+    };
+    let join_result = handle.await;
+    guard.armed = false;
+    join_result.map_err(|e| FfiError::Backend {
+        detail: format!("{what} join error: {e}"),
+    })?
+}
+
 /// Runs a blocking engine construction on tokio and wraps the result.
 ///
 /// The three async constructors differ only in the call they make and the name
-/// in their join-error message; everything else (the `spawn_blocking`, the
-/// `AbortOnDrop` guard, the join-error mapping, the `Arc` wrap) is identical.
-/// Three copies of it is how families of near-identical methods start to
-/// diverge, so there is one.
+/// in their join-error message, so this adds the one thing they share on top of
+/// [`spawn_blocking_guarded`]: the `Arc` wrap. Three copies of it is how
+/// families of near-identical methods start to diverge, so there is one.
 ///
 /// Cancellation is the weak form the constructors document: dropping the
 /// returned future aborts the task only while it is still queued, because
@@ -2219,17 +2320,8 @@ async fn spawn_engine_build<F>(what: &str, build: F) -> Result<Arc<CeraEngine>, 
 where
     F: FnOnce() -> Result<cera::CeraEngine, cera::CeraError> + Send + 'static,
 {
-    let handle = tokio::task::spawn_blocking(move || build().map_err(FfiError::from));
-    let mut guard = AbortOnDrop {
-        abort: handle.abort_handle(),
-        armed: true,
-    };
-    let join_result = handle.await;
-    guard.armed = false;
-    join_result
-        .map_err(|e| FfiError::Backend {
-            detail: format!("{what} join error: {e}"),
-        })?
+    spawn_blocking_guarded(what, move || build().map_err(FfiError::from))
+        .await
         .map(|inner| Arc::new(CeraEngine { inner }))
 }
 
