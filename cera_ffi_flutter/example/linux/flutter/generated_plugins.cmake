@@ -7,6 +7,7 @@ list(APPEND FLUTTER_PLUGIN_LIST
 
 list(APPEND FLUTTER_FFI_PLUGIN_LIST
   cera_ffi_flutter
+  jni
 )
 
 set(PLUGIN_BUNDLED_LIBRARIES)

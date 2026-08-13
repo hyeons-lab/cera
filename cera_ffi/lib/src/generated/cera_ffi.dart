@@ -508,6 +508,60 @@ class GenerateSummary {
   int get hashCode => Object.hash(tokensGenerated, promptEvalTokens, promptEvalMs, decodeMs, finishReason);
 }
 
+/// One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
+/// model directory plus every per-quant manifest inside it. Feed
+/// `name` and one element of `quants` straight to
+/// [`CeraEngine::from_bundle_id`].
+///
+/// Both fields are sorted ascending, so a menu built from this list is
+/// stable across runs even if the upstream API reorders its response.
+class LeapBundleEntry {
+  const LeapBundleEntry({
+    required this.name,
+    required this.quants,
+  });
+
+  final String name;
+  final List<String> quants;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'name': this.name,
+      'quants': this.quants,
+    };
+  }
+
+  factory LeapBundleEntry.fromJson(Map<String, dynamic> json) {
+    return LeapBundleEntry(
+      name: json['name'] as String,
+      quants: (json['quants'] as List).map((item) => item as String).toList(),
+    );
+  }
+
+  LeapBundleEntry copyWith({
+    String? name,
+    List<String>? quants,
+  }) {
+    return LeapBundleEntry(
+      name: name ?? this.name,
+      quants: quants ?? this.quants,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'LeapBundleEntry(name: $name, quants: $quants)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LeapBundleEntry && name == other.name && quants == other.quants;
+
+  @override
+  int get hashCode => Object.hash(name, quants);
+}
+
 /// Modality support flags for a loaded model. Mirrors
 /// [`cera::ModalityCapabilities`].
 class ModalityCapabilities {
@@ -2357,7 +2411,22 @@ void _uniffiWriteEngineConfig(EngineConfig value, _UniFfiBinaryWriter writer) {
     writer.writeI8(0);
   } else {
     writer.writeI8(1);
-    writer.writeU64(BundleRepoFfiCodec.lower(value.bundleRepo!));
+    final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+    try {
+      cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      cloneStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final clonedHandle = _bindings()._bundleRepoClone(
+          BundleRepoFfiCodec.lower(value.bundleRepo!), cloneStatusPtr);
+      if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+        throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+      }
+      writer.writeU64(clonedHandle);
+    } finally {
+      calloc.free(cloneStatusPtr);
+    }
   }
 }
 
@@ -2492,6 +2561,36 @@ GenerateSummary _uniffiDecodeGenerateSummary(Uint8List bytes) {
   final value = _uniffiReadGenerateSummary(reader);
   if (!reader.isDone) {
     throw StateError('extra bytes remaining while decoding GenerateSummary');
+  }
+  return value;
+}
+
+void _uniffiWriteLeapBundleEntry(LeapBundleEntry value, _UniFfiBinaryWriter writer) {
+  writer.writeString(value.name);
+  writer.writeI32(value.quants.length);
+  for (final item in value.quants) {
+    writer.writeString(item);
+  }
+}
+
+Uint8List _uniffiEncodeLeapBundleEntry(LeapBundleEntry value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteLeapBundleEntry(value, writer);
+  return writer.toBytes();
+}
+
+LeapBundleEntry _uniffiReadLeapBundleEntry(_UniFfiBinaryReader reader) {
+  return LeapBundleEntry(
+    name: reader.readString(),
+    quants: (() { final int __len = reader.readI32(); final out = <String>[]; for (var i = 0; i < __len; i++) { out.add(reader.readString()); } return out; })(),
+  );
+}
+
+LeapBundleEntry _uniffiDecodeLeapBundleEntry(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadLeapBundleEntry(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding LeapBundleEntry');
   }
   return value;
 }
@@ -3052,6 +3151,26 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_func_detect_tool_format != 18753) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_detect_tool_format`: expected 18753, got $_checksum_uniffi_cera_ffi_checksum_func_detect_tool_format');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_func_list_leap_bundles');
+      _checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_list_leap_bundles`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles != 14501) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_list_leap_bundles`: expected 14501, got $_checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles_async;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_func_list_leap_bundles_async');
+      _checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles_async = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_list_leap_bundles_async`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles_async != 60360) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_list_leap_bundles_async`: expected 60360, got $_checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_parse_tool_calls;
     try {
@@ -3861,6 +3980,188 @@ class CeraFfiFfi {
         throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');
       }
       return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _listLeapBundlesFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_func_list_leap_bundles');
+
+  List<LeapBundleEntry> listLeapBundles() {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(0);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      _listLeapBundlesFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final _UniFfiBinaryReader retReader = _UniFfiBinaryReader(retBytes);
+      final decodedValue = (() { final int __len = retReader.readI32(); final out = <LeapBundleEntry>[]; for (var i = 0; i < __len; i++) { out.add(_uniffiReadLeapBundleEntry(retReader)); } return out; })();
+      if (!retReader.isDone) {
+        throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');
+      }
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _listLeapBundlesAsyncFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_func_list_leap_bundles_async');
+  late final void Function(int handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, int callbackData) _listLeapBundlesAsyncFfiBufferRustFuturePoll = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, ffi.Uint64 callbackData), void Function(int handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, int callbackData)>('ffi_cera_ffi_rust_future_poll_rust_buffer');
+  late final void Function(int handle) _listLeapBundlesAsyncFfiBufferRustFutureCancel = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle), void Function(int handle)>('ffi_cera_ffi_rust_future_cancel_rust_buffer');
+  late final _UniFfiRustBuffer Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _listLeapBundlesAsyncFfiBufferRustFutureComplete = _lib.lookupFunction<_UniFfiRustBuffer Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), _UniFfiRustBuffer Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('ffi_cera_ffi_rust_future_complete_rust_buffer');
+  late final void Function(int handle) _listLeapBundlesAsyncFfiBufferRustFutureFree = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle), void Function(int handle)>('ffi_cera_ffi_rust_future_free_rust_buffer');
+
+  Future<List<LeapBundleEntry>> listLeapBundlesAsync() async {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(0);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      _listLeapBundlesAsyncFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer async start failed with status $statusCode');
+      }
+      final int futureHandle = (returnBuf + 0).ref.u64;
+      final StreamController<int> pollEvents = StreamController<int>.broadcast();
+      final callback = ffi.NativeCallable<ffi.Void Function(ffi.Uint64, ffi.Int8)>.listener((int _, int pollResult) {
+        pollEvents.add(pollResult);
+      });
+      try {
+        _listLeapBundlesAsyncFfiBufferRustFuturePoll(futureHandle, callback.nativeFunction, 0);
+        while (true) {
+          final int pollResult = await pollEvents.stream.first;
+          if (pollResult == _rustFuturePollReady) {
+            break;
+          }
+          if (pollResult == _rustFuturePollWake) {
+            _listLeapBundlesAsyncFfiBufferRustFuturePoll(futureHandle, callback.nativeFunction, 0);
+            continue;
+          }
+          throw StateError('Rust future poll returned invalid status for list_leap_bundles_async: $pollResult');
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> outStatusPtr = calloc<_UniFfiRustCallStatus>();
+        outStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        outStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        try {
+          final _UniFfiRustBuffer resultValue = _listLeapBundlesAsyncFfiBufferRustFutureComplete(futureHandle, outStatusPtr);
+          final int completeStatusCode = outStatusPtr.ref.code;
+          if (completeStatusCode == _uniFfiRustCallStatusSuccess) {
+            final ffi.Pointer<_UniFfiRustBuffer> resultBufPtr = calloc<_UniFfiRustBuffer>();
+            resultBufPtr.ref
+              ..capacity = resultValue.capacity
+              ..len = resultValue.len
+              ..data = resultValue.data;
+            rustRetBufferPtrs.add(resultBufPtr);
+            final Uint8List resultBytes = resultBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(resultBufPtr.ref.data.asTypedList(resultBufPtr.ref.len));
+            final _UniFfiBinaryReader resultReader = _UniFfiBinaryReader(resultBytes);
+            final decodedValue = (() { final int __len = resultReader.readI32(); final out = <LeapBundleEntry>[]; for (var i = 0; i < __len; i++) { out.add(_uniffiReadLeapBundleEntry(resultReader)); } return out; })();
+            if (!resultReader.isDone) {
+              throw StateError('extra bytes remaining while decoding UniFFI rust future payload');
+            }
+            return decodedValue;
+          }
+          if (completeStatusCode == _uniFfiRustCallStatusCancelled) {
+            throw StateError('Rust future was cancelled for list_leap_bundles_async');
+          }
+          final _UniFfiRustBuffer errorBuf = outStatusPtr.ref.errorBuf;
+          if (!(errorBuf.data == ffi.nullptr && errorBuf.len == 0 && errorBuf.capacity == 0)) {
+            final ffi.Pointer<_UniFfiRustBuffer> errorBufPtr = calloc<_UniFfiRustBuffer>();
+            errorBufPtr.ref
+              ..capacity = errorBuf.capacity
+              ..len = errorBuf.len
+              ..data = errorBuf.data;
+            rustRetBufferPtrs.add(errorBufPtr);
+            final Uint8List errorBytes = errorBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errorBufPtr.ref.data.asTypedList(errorBufPtr.ref.len));
+            if (completeStatusCode == _uniFfiRustCallStatusError && errorBytes.isNotEmpty) {
+              throw _uniffiLiftFfiErrorException(errorBytes);
+            }
+            if (errorBytes.isNotEmpty) {
+              throw StateError(utf8.decode(errorBytes, allowMalformed: true));
+            }
+          }
+          throw StateError('Rust future failed for list_leap_bundles_async with status code: $completeStatusCode');
+        } finally {
+          calloc.free(outStatusPtr);
+        }
+      } catch (_) {
+        _listLeapBundlesAsyncFfiBufferRustFutureCancel(futureHandle);
+        rethrow;
+      } finally {
+        await pollEvents.close();
+        callback.close();
+        _listLeapBundlesAsyncFfiBufferRustFutureFree(futureHandle);
+      }
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -10938,7 +11239,7 @@ final class _DownloadProgressSinkTraitCallbackBridge {
 
   DownloadProgressSink? lookup(int handle) => _callbacks[handle];
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)> _freeNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)>.isolateLocal((int handle) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)> _freeNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)>.listener((int handle) {
     instance.release(handle);
   });
 
@@ -10960,31 +11261,17 @@ final class _DownloadProgressSinkTraitCallbackBridge {
     _bindings()._uniFfiRustBufferFree(buf, _freeArgStatus);
   }
 
-  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)> _onProgressNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>.isolateLocal((int handle, _UniFfiRustBuffer url, int bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus) {
+  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)> _onProgressNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle, _UniFfiRustBuffer url, ffi.Uint64 bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>.listener((int handle, _UniFfiRustBuffer url, int bytesDownloaded, _UniFfiRustBuffer totalBytes, ffi.Pointer<ffi.Void> outReturn, ffi.Pointer<_UniFfiRustCallStatus> outStatus) {
     final DownloadProgressSink? callback = instance.lookup(handle);
     if (callback == null) {
       _uniffiFreeArgBuffer(url);
       _uniffiFreeArgBuffer(totalBytes);
-      outStatus.ref.code = _uniFfiRustCallStatusUnexpectedError;
-      outStatus.ref.errorBuf
-        ..capacity = 0
-        ..len = 0
-        ..data = ffi.nullptr;
       return;
     }
     try {
       callback.onProgress(utf8.decode(url.data.asTypedList(url.len)), bytesDownloaded, (() { final r = _UniFfiBinaryReader(totalBytes.data.asTypedList(totalBytes.len)); return r.readI8() == 0 ? null : r.readU64(); })());
-      outStatus.ref.code = _uniFfiRustCallStatusSuccess;
-      outStatus.ref.errorBuf
-        ..capacity = 0
-        ..len = 0
-        ..data = ffi.nullptr;
     } catch (_) {
-      outStatus.ref.code = _uniFfiRustCallStatusUnexpectedError;
-      outStatus.ref.errorBuf
-        ..capacity = 0
-        ..len = 0
-        ..data = ffi.nullptr;
+      // async listener: no channel to report a Dart error to Rust
     } finally {
       _uniffiFreeArgBuffer(url);
       _uniffiFreeArgBuffer(totalBytes);
@@ -11783,6 +12070,43 @@ String cpuBackendReport() {
 /// convention — the caller may still choose a format explicitly.
 ToolFormat? detectToolFormat(String architecture) {
   return _bindings().detectToolFormat(architecture);
+}
+
+/// List every bundle published on `LiquidAI/LeapBundles`, so a picker
+/// can offer `<name>, <quant>` pairs instead of making the user type a
+/// bundle id. Pair with [`CeraEngine::from_bundle_id`], which takes
+/// exactly these two strings.
+///
+/// One blocking HTTP GET with a 30 s timeout and no retry. Prefer
+/// [`list_leap_bundles_async`] anywhere a UI thread is involved: this
+/// twin stalls the calling thread for the whole round-trip.
+///
+/// Needs no [`BundleRepo`]: the catalog is a single small JSON
+/// response and is deliberately not cached, so a picker opened twice
+/// in one session reflects newly published bundles.
+List<LeapBundleEntry> listLeapBundles() {
+  return _bindings().listLeapBundles();
+}
+
+/// Async variant of [`list_leap_bundles`]: moves the blocking HTTP
+/// round-trip onto a tokio blocking worker so a coroutine, a Swift
+/// `async` context or a Dart `Future` can await the catalog without
+/// stalling the thread that asked for it.
+///
+/// `async_runtime = "tokio"` is load-bearing, not decoration: it is
+/// what makes uniffi poll this future inside a tokio context. Without
+/// it the foreign executor drives the future with no runtime
+/// installed and the `spawn_blocking` below panics with "must be
+/// called from the context of a Tokio 1.x runtime" on the very first
+/// call.
+///
+/// Cancellation: dropping the returned future aborts the task if it
+/// has not started, so a dismissed picker does not leave a 30 s
+/// blocking GET queued on the pool. A request already in flight runs
+/// to completion; `reqwest::blocking` offers nothing to interrupt, and
+/// the response is small.
+Future<List<LeapBundleEntry>> listLeapBundlesAsync() {
+  return _bindings().listLeapBundlesAsync();
 }
 
 /// Parse tool calls out of generated model text for the given `format`.

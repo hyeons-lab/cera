@@ -455,9 +455,12 @@ and structured `FfiError` propagation also confirmed. Delivered:
 **Streaming: WORKING (verified end-to-end).** `generate_streaming(opts, sink)`
 delivers tokens to a Dart-implemented `ModalitySink`: a Qwen2-0.5B run produced
 24 `onTextTokens` callbacks + one `onDone(FinishReasonMaxTokens)`. Getting there
-required vendoring the generator (`third_party/uniffi-bindgen-dart/`, own
-workspace) and five codegen fixes, to be upstreamed to
-`nchapman/uniffi-bindgen-dart`:
+required vendoring the generator and five codegen fixes, to be upstreamed to
+`nchapman/uniffi-bindgen-dart`. (The vendored copy is no longer committed
+source: it is an upstream pin plus a patch series under
+`third_party/uniffi-bindgen-dart/patches/`, now eight patches, of which these
+five are 0002 to 0005 plus 0008. See that directory's README for the full
+list.)
 1. **Callback-arg lowering**: sink args lower via `<Name>FfiCodec.lower`
    (registers the Dart impl + installs the vtable), not a raw object write, so
    a sink can be passed *into* Rust.
@@ -476,7 +479,16 @@ workspace) and five codegen fixes, to be upstreamed to
 5. **Per-interface `listener` vs `isolateLocal`**: void vtable methods of a
    callback interface used by any *async* method use `NativeCallable.listener`
    (cross-thread); sync-only interfaces keep `isolateLocal`. Unblocks
-   `generate_streaming_async` (see Async below).
+   `generate_streaming_async` (see Async below). Extended to cover callbacks
+   passed to an **object constructor**, which store them for the object's
+   lifetime: `DownloadProgressSink` reaches Rust through the *synchronous*
+   `BundleRepo::with_progress` and so never appears in an async argument list,
+   yet is invoked from a tokio blocking worker once the repo is handed to
+   `from_bundle_id_async`. Scanning async argument lists alone left it on
+   `isolateLocal`, i.e. undefined behaviour on every progress callback.
+   (Still unfixed and inherent to the vtable shape: the non-void `clone`
+   slot cannot be a `listener`, so it stays `isolateLocal` for every callback
+   trait, `ModalitySink` included, which is long-standing shipped behaviour.)
 
 **Async: `generateAsync` AND `generateStreamingAsync` WORK.** `generateAsync`
 returns a real `Future` via UniFFI's rust-future poll/complete loop; verified
@@ -487,8 +499,14 @@ The enabler is a **per-interface vtable-callable heuristic**: a callback
 interface passed to any *async* method gets `NativeCallable.listener` (callable
 cross-thread, delivered on the owning isolate's event loop); interfaces used
 only by synchronous APIs keep `NativeCallable.isolateLocal` (same-thread,
-synchronous). So `ModalitySink` (used by `generate_streaming_async`) → listener;
-`DownloadProgressSink` (only `with_progress`) → isolateLocal.
+synchronous). So `ModalitySink` (used by `generate_streaming_async`) → listener.
+`DownloadProgressSink` reaches Rust through the synchronous
+`BundleRepo::with_progress` and so matches neither rule, yet is invoked from a
+tokio worker once the repo is used by `from_bundle_id_async`; a callback stored
+by a CONSTRUCTOR therefore also gets `listener`, which is what it now has. (The
+generator is no longer committed source: it is upstream v0.1.3 plus the patch
+series in `third_party/uniffi-bindgen-dart/patches/`, materialized by
+`just vendor-generator`. That directory's README lists all eight.)
 
 Consequence: `listener` callbacks are async, so **sync `generate_streaming`'s
 `ModalitySink` callbacks are now queued** and arrive only when you yield to the
@@ -506,9 +524,20 @@ ways against a cached `LFM2.5-350M-GGUF` bundle: a cache hit returns a live
 engine, and a bogus bundle id rejects with a lifted `FfiErrorExceptionBackend`.
 
 **`BundleRepo.withProgress`: VERIFIED.** `DownloadProgressSink.onProgress`
-fires synchronously (it stays `isolateLocal`; `fromBundleId` is synchronous) with
-all args RustBuffer-decoded correctly: `url: String`, `bytesDownloaded: u64`,
-`totalBytes: Option<u64>` (`example/cera_progress.dart`, `LFM2-350M-GGUF`).
+delivers all args RustBuffer-decoded correctly: `url: String`,
+`bytesDownloaded: u64`, `totalBytes: Option<u64>`
+(`example/cera_progress.dart`, `LFM2-350M-GGUF`). It is a `listener`, so calls
+arrive on the isolate's event loop rather than inline on the download thread,
+which is what makes it safe to touch UI state from `onProgress` directly. It
+was `isolateLocal` originally, which was undefined behaviour the moment the
+repo was handed to `from_bundle_id_async`.
+
+Two consequences the example had to absorb. Observing the callbacks needs
+`from_bundle_id_async`: the synchronous loader blocks the isolate's event loop
+for the whole download, so every queued call would wait until it returned. And
+the sink can no longer abort by throwing, because a listener has no channel back
+to Rust and the generated bridge swallows the exception, so the example pulls
+the whole bundle rather than stopping after the first event.
 
 **Now a real Flutter FFI plugin.** `pubspec.yaml` declares platform entries for
 android/ios/macos/linux/windows, each resolving the prebuilt native library

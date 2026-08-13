@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>cera-wasm CPU vs WebGPU bench</title>
+    <style>
+      body { font-family: ui-monospace, Menlo, monospace; margin: 2rem; line-height: 1.5; }
+      #out { white-space: pre-wrap; border: 1px solid #888; padding: 1rem; margin-top: 1rem; }
+    </style>
+  </head>
+  <body>
+    <h1>cera-wasm CPU vs WebGPU</h1>
+    <div id="out">starting…</div>
+
+    <script type="module">
+      import init, {
+        CeraEngine, SessionConfig, GenerateOpts, WebGpuSession, ceraVersion,
+      } from "./pkg/cera_wasm.js";
+
+      const outEl = document.getElementById("out");
+      const log = (m) => {
+        outEl.textContent += `\n${m}`;
+        console.log(`[bench] ${m}`);
+      };
+      // Machine-readable sink so the driver can read results without
+      // scraping the rendered text.
+      window.__bench = { done: false, results: {}, error: null };
+
+      const QUESTION = "In one sentence, why is the sky blue?";
+      const MAX_TOKENS = 32;
+      // Filled in once the engine is up: an instruct model handed a bare
+      // question predicts EOS as its very first token, so a benchmark that
+      // skips the chat template measures nothing and reports 0 tok/s.
+      let PROMPT = QUESTION;
+
+      try {
+        await init();
+        outEl.textContent = `cera ${ceraVersion()}`;
+
+        log("fetching model…");
+        // Cache-busted: swapping the symlink behind `model.gguf` does not
+        // change the URL, so the browser will happily re-serve the previous
+        // model and the run silently measures the wrong one.
+        const buf = await (await fetch(`./model.gguf?cb=${Date.now()}`)).arrayBuffer();
+        log(`model: ${(buf.byteLength / 1e6).toFixed(1)} MB`);
+
+        // ---- CPU ----
+        // Fresh copy per backend: each constructor takes ownership of the
+        // bytes it is handed, so sharing one view across both would hand the
+        // second backend a buffer the first already consumed.
+        log("\n--- CPU ---");
+        let t0 = performance.now();
+        const engine = CeraEngine.fromGgufBytes(new Uint8Array(buf.slice(0)), 2048);
+        log(`load: ${((performance.now() - t0) / 1000).toFixed(2)}s`);
+        log(`arch: ${engine.architecture}, quant: ${engine.quantization}, vocab: ${engine.vocabSize}`);
+
+        const tk = engine.tokenizer;
+        if (engine.hasChatTemplate) {
+          PROMPT = tk.applyChatTemplate([{ role: "user", content: QUESTION }], true);
+          log(`chat template applied: ${JSON.stringify(PROMPT)}`);
+        } else {
+          log("no chat template; using the bare question");
+        }
+        const ids = Array.from(tk.encode(PROMPT));
+        // Same BOS rule the d.ts documents: the GGUF decides, and a template
+        // that already emitted one must not get a second.
+        if (tk.addBosToken && tk.bosToken != null && ids[0] !== tk.bosToken) {
+          ids.unshift(tk.bosToken);
+        }
+        const session = engine.newSession(new SessionConfig());
+        session.appendTokens(new Uint32Array(ids));
+
+        const opts = new GenerateOpts();
+        opts.maxTokens = MAX_TOKENS;
+        opts.temperature = 0;
+        let cpuText = "";
+        const summary = session.generate(opts, (toks) => {
+          cpuText += tk.decode(toks);
+        });
+        const cpuDecodeTps = summary.tokensGenerated / (summary.decodeMs / 1000);
+        const cpuPrefillTps = summary.promptEvalTokens / (summary.promptEvalMs / 1000);
+        log(`prefill: ${summary.promptEvalTokens} tok in ${summary.promptEvalMs.toFixed(0)}ms (${cpuPrefillTps.toFixed(1)} tok/s)`);
+        log(`decode:  ${summary.tokensGenerated} tok in ${summary.decodeMs.toFixed(0)}ms (${cpuDecodeTps.toFixed(1)} tok/s)`);
+        log(`finish:  ${summary.finishReason}`);
+        log(`text:    ${JSON.stringify(cpuText)}`);
+        window.__bench.results.cpu = {
+          decodeTps: cpuDecodeTps, prefillTps: cpuPrefillTps,
+          tokens: summary.tokensGenerated, text: cpuText,
+          finishReason: summary.finishReason,
+        };
+
+        // ---- WebGPU ----
+        log("\n--- WebGPU ---");
+        if (!("gpu" in navigator)) throw new Error("navigator.gpu missing");
+        t0 = performance.now();
+        const gpu = await WebGpuSession.create(new Uint8Array(buf.slice(0)), 2048, null);
+        log(`load+upload: ${((performance.now() - t0) / 1000).toFixed(2)}s`);
+        log(`adapter: ${gpu.adapter}`);
+        log(`kv: ${gpu.kvCompression}`);
+
+        // Greedy, matching the CPU run above: temperature 0 keeps this on the
+        // argmax-on-GPU path, so the tok/s is the one the demo page reports.
+        let gpuText = "", n = 0, firstMs = null;
+        t0 = performance.now();
+        await gpu.generate(PROMPT, MAX_TOKENS, 0, null, null, null, (piece) => {
+          if (firstMs === null) firstMs = performance.now() - t0;
+          gpuText += piece;
+          n += 1;
+        });
+        const totalMs = performance.now() - t0;
+        if (n === 0) {
+          // Zero tokens is a result, not a crash: record it before failing, so
+          // the run reports what happened rather than dying on
+          // `firstMs.toFixed` with nothing captured. It still stops the page
+          // here, since a GPU decode that produced nothing makes the sampling
+          // comparison below meaningless.
+          log(`decode produced NO tokens in ${totalMs.toFixed(0)}ms (EOS first?)`);
+          window.__bench.results.gpu = { decodeTps: 0, tokens: 0, text: "" };
+          throw new Error("gpu produced no tokens");
+        }
+        // Exclude the first token: it carries prefill, so folding it into the
+        // decode rate would report a number no steady-state decode achieves.
+        const gpuDecodeTps = n > 1 ? (n - 1) / ((totalMs - firstMs) / 1000) : 0;
+        log(`ttft:   ${firstMs.toFixed(0)}ms`);
+        log(`decode: ${n} tok, ${gpuDecodeTps.toFixed(1)} tok/s (excl. first)`);
+        log(`text:   ${JSON.stringify(gpuText)}`);
+        window.__bench.results.gpu = {
+          decodeTps: gpuDecodeTps, ttftMs: firstMs, tokens: n, text: gpuText,
+          adapter: gpu.adapter,
+        };
+
+        // ---- sampling ----
+        // A nonzero temperature takes the logits-readback path rather than the
+        // argmax-on-GPU one above, so this checks that path still produces
+        // text.
+        //
+        // On a FRESH session, not the one above. `WebGpuSession` is stateful:
+        // its on-GPU KV cache persists across `generate` calls, so reusing it
+        // would prefill PROMPT on top of the tokens just generated and sample a
+        // continuation of a doubled conversation rather than an answer to
+        // PROMPT.
+        log("\n--- WebGPU, temperature 0.8 ---");
+        // Free the greedy session first. Every `create` requests its own
+        // GpuContext and uploads its own copy of the weights, so keeping both
+        // alive would hold two full GPU-resident copies for no reason: the
+        // numbers above are already recorded, and nothing below reads `gpu`.
+        gpu.free();
+        const gpuSampling = await WebGpuSession.create(new Uint8Array(buf.slice(0)), 2048, null);
+        let sampled = "";
+        t0 = performance.now();
+        await gpuSampling.generate(PROMPT, 16, 0.8, 0.95, 40, 7n, (piece) => { sampled += piece; });
+        log(`${((performance.now() - t0) / 1000).toFixed(2)}s`);
+        log(`text: ${JSON.stringify(sampled)}`);
+        window.__bench.results.sampled = { text: sampled };
+
+        log("\nDONE");
+        window.__bench.done = true;
+      } catch (err) {
+        window.__bench.error = String(err);
+        window.__bench.done = true;
+        log(`\nERROR: ${err}`);
+        console.error(err);
+      }
+    </script>
+  </body>
+</html>

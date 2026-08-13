@@ -1,1 +1,11 @@
-/target
+# Materialized from UPSTREAM + patches/ by scripts/vendor-uniffi-bindgen-dart.sh.
+# Never edit these by hand: they are deleted and rebuilt on every pin or patch
+# change. To change the generator, add or edit a file in patches/.
+build/
+.cache/
+# Cargo output, parked here while build/ is rebuilt so patch iteration does not
+# pay for a full recompile each time.
+.target/
+# Left behind by anyone who built the fork back when its source was committed
+# at this level.
+target/

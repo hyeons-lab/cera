@@ -50,6 +50,11 @@ cera run -m model.gguf -p "Weather in Paris?" --tools @tools.json --constrain-to
 # Interactive multi-turn chat REPL (keeps the prefix cache warm across turns)
 cera chat --bundle-id LFM2.5-1.2B-Instruct --quant Q4_0
 
+# No model source at all, on a terminal, without --no-tui: pick one from the
+# published catalog. Type to filter, Enter to choose a bundle then its
+# quantization, Esc to back out.
+cera chat
+
 # Attach a LoRA adapter (llama.cpp .gguf or PEFT .safetensors) for the session
 cera run -m model.gguf -p "..." --lora adapter.safetensors
 cera chat -m model.gguf --lora adapter.gguf
@@ -65,7 +70,7 @@ cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead 
 | Command | Purpose |
 |---------|---------|
 | `run` | Run inference on a prompt: text, optional grammar/JSON or tool calling (`--tools` / `--constrain-tools`), plus audio input for LFM2-Audio bundles. Optional `--lora` adapter. |
-| `chat` | Interactive multi-turn REPL with `/help`, `/clear`, `/exit` slash commands. Optional `--lora` adapter. |
+| `chat` | Interactive multi-turn REPL with `/help`, `/clear`, `/exit` slash commands. Optional `--lora` adapter. Run with no model source at all on a terminal (and without `--no-tui`) to pick one from the published catalog. |
 | `embed` | Extract last-layer hidden-state embeddings for a prompt: mean-pooled by default, `--per-token` for the full matrix, `--json` for array output. |
 | `logits` | Dump the next-token logits over the full vocabulary for a prompt (single prefill): `--top-k` for the K highest `(token_id, logit)` pairs, `--json` for array output. Handy for cross-backend parity checks. |
 | `inspect` | Inspect a GGUF file's metadata and resolved CPU backend tier. |

@@ -251,6 +251,10 @@ cera run --bundle-id LFM2.5-1.2B-Instruct --quant Q4_0 --prompt "Hello"
 # Interactive multi-turn chat (keeps the prefix cache warm across turns)
 cera chat --bundle-id LFM2.5-1.2B-Instruct --quant Q4_0
 
+# Or with no model source at all: pick one from the published catalog
+# interactively (needs a terminal, and not --no-tui)
+cera chat
+
 # Pick a GPU
 cera run -m model.gguf -p "Hi" --device metal   # or: gpu, cpu, auto
 ```
@@ -275,7 +279,7 @@ See the [`cera` crate README](cera/README.md) for the full library API.
 | Command | Purpose |
 |---------|---------|
 | `run` | One-shot inference: text, optional grammar/JSON or tool calling (`--tools`), plus image/audio input for VL/Audio bundles |
-| `chat` | Interactive multi-turn REPL with a persistent KV prefix cache |
+| `chat` | Interactive multi-turn REPL with a persistent KV prefix cache. Given no model source at all on a terminal (and without `--no-tui`), opens a picker over the published catalog |
 | `embed` | Extract last-layer hidden-state embeddings: mean-pooled, or `--per-token` for the full matrix |
 | `logits` | Dump next-token logits over the vocabulary (single prefill), handy for cross-backend parity checks |
 | `inspect` | Dump a GGUF's metadata, tensor shapes, and resolved backend tier |

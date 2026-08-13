@@ -382,6 +382,54 @@ reused on subsequent calls; apps don't have to bundle the GGUF
 in-app, which matters because a 1B-parameter model is ~500 MB–1 GB
 and consumer app stores cap at ~200 MB.
 
+### Discovering what to load
+
+`listLeapBundles()` returns the published catalog as
+`LeapBundleEntry` records (`name` plus its `quants`), so a picker can
+offer `<name>, <quant>` pairs instead of making the user type a bundle
+id. The two strings feed straight into `fromBundleId`.
+
+It needs no `BundleRepo`: the catalog is one small JSON response,
+deliberately uncached, so a picker opened twice in a session reflects
+newly published bundles. Both fields are sorted ascending, so a menu
+built from it is stable across runs even if upstream reorders its
+response.
+
+One blocking HTTP GET with a 30 s timeout and no retry. Use
+`listLeapBundlesAsync()` anywhere a UI thread is involved; the
+blocking twin stalls the calling thread for the whole round trip.
+
+The `config` in both snippets below is the repo-bearing `EngineConfig`
+built in the Kotlin and Swift sections that follow: listing needs no
+`BundleRepo`, but loading the chosen bundle does.
+
+```kotlin
+// Off the main thread, or use listLeapBundlesAsync() from a coroutine.
+val bundles = listLeapBundles()
+bundles.forEach { entry ->
+    println("${entry.name}: ${entry.quants.joinToString(" ")}")
+}
+
+// Feed a chosen pair straight to from_bundle_id.
+val choice = bundles.first()
+val engine = CeraEngine.fromBundleId(choice.name, choice.quants.first(), config)
+```
+
+```swift
+// `listLeapBundles()` blocks; prefer the async twin off a UI thread.
+let bundles = try await listLeapBundlesAsync()
+for entry in bundles {
+    print("\(entry.name): \(entry.quants.joined(separator: " "))")
+}
+
+// The async twin here too, and it matters more: listing is a few KB,
+// but this downloads the model.
+if let choice = bundles.first, let quant = choice.quants.first {
+    let engine = try await CeraEngine.fromBundleIdAsync(
+        bundleId: choice.name, quant: quant, config: config)
+}
+```
+
 ### Kotlin
 
 ```kotlin

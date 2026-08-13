@@ -1,0 +1,707 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cera <cera@local>
+Date: Tue, 11 Aug 2026 14:25:31 -0700
+Subject: fix(dart): correct the callback vtable ABI and support async delivery
+
+Two changes to the same renderer, kept in one patch because they interleave
+within the bridge body and neither compiles without the other.
+
+RustBuffer argument ABI: UniFFI passes String / Sequence / Enum / Record /
+Option to a foreign callback as a RustBuffer BY VALUE, not as a Pointer<Utf8>
+holding JSON. Confirmed against the Kotlin and Swift reference bindings, where
+these arguments are RustBuffer.ByValue. Adds callback-specific FFI mappers,
+deliberately scoped to callback bridges so the non-ffibuffer runtime path keeps
+its existing String mapping, and decodes through the existing binary reader.
+Rust transfers ownership of each lowered buffer to the callback, so the bridge
+frees them; without that every invocation leaked one.
+
+Cross-thread delivery: a void vtable method of an interface used by an async API
+is invoked from a non-isolate thread, where NativeCallable.isolateLocal is
+undefined behaviour. Those now use NativeCallable.listener. Methods with a
+return value must answer synchronously by writing outReturn, which only
+isolateLocal can do, so they stay isolate-local and therefore same-thread only.
+---
+ src/dart/callback.rs       | 132 ++++++++++++++-------
+ src/dart/mod.rs            |   1 +
+ src/dart/render_objects.rs | 233 ++++++++++++++++++++++++++++++-------
+ src/dart/type_map.rs       | 109 +++++++++++++++++
+ 4 files changed, 390 insertions(+), 85 deletions(-)
+
+diff --git a/src/dart/callback.rs b/src/dart/callback.rs
+index aceb792..e9fc965 100644
+--- a/src/dart/callback.rs
++++ b/src/dart/callback.rs
+@@ -122,7 +122,7 @@ pub(super) fn render_callback_bridges(
+             let mut ffi_args = vec!["ffi.Uint64 handle".to_string()];
+             for arg in &method.args {
+                 let arg_name = safe_dart_identifier(&to_lower_camel(&arg.name));
+-                let arg_native = map_runtime_native_ffi_type(&arg.type_, records, enums)
++                let arg_native = map_callback_native_ffi_type(&arg.type_, records, enums)
+                     .expect("validated runtime callback arg type");
+                 ffi_args.push(format!("{arg_native} {arg_name}"));
+             }
+@@ -139,7 +139,7 @@ pub(super) fn render_callback_bridges(
+                 );
+             } else {
+                 if let Some(return_type) = method.return_type.as_ref() {
+-                    let out_type = map_runtime_native_ffi_type(return_type, records, enums)
++                    let out_type = map_callback_native_ffi_type(return_type, records, enums)
+                         .expect("validated runtime callback return type");
+                     ffi_args.push(format!("ffi.Pointer<{out_type}> outReturn"));
+                 } else {
+@@ -240,9 +240,9 @@ pub(super) fn render_callback_bridges(
+             let mut callback_args = Vec::new();
+             for arg in &method.args {
+                 let arg_name = safe_dart_identifier(&to_lower_camel(&arg.name));
+-                let arg_native = map_runtime_native_ffi_type(&arg.type_, records, enums)
++                let arg_native = map_callback_native_ffi_type(&arg.type_, records, enums)
+                     .expect("validated runtime callback arg type");
+-                let arg_dart = map_runtime_dart_ffi_type(&arg.type_, records, enums)
++                let arg_dart = map_callback_dart_ffi_type(&arg.type_, records, enums)
+                     .expect("validated runtime callback arg type");
+                 ffi_args.push(format!("{arg_native} {arg_name}"));
+                 dart_args.push(format!("{arg_dart} {arg_name}"));
+@@ -416,7 +416,7 @@ pub(super) fn render_callback_bridges(
+                 out.push_str("    }();\n");
+             } else {
+                 if let Some(return_type) = method.return_type.as_ref() {
+-                    let out_type = map_runtime_native_ffi_type(return_type, records, enums)
++                    let out_type = map_callback_native_ffi_type(return_type, records, enums)
+                         .expect("validated runtime callback return type");
+                     ffi_args.push(format!("ffi.Pointer<{out_type}> outReturn"));
+                     dart_args.push(format!("ffi.Pointer<{out_type}> outReturn"));
+@@ -853,63 +853,109 @@ pub(super) fn render_callback_arg_decode_expr(
+     custom_types: &HashMap<String, CustomTypeConfig>,
+ ) -> String {
+     let type_ = runtime_unwrapped_type(original_type);
++    // Complex callback args arrive as a `_UniFfiRustBuffer` by value (UniFFI's
++    // ABI; see map_runtime_*_ffi_type). Build a binary reader over its bytes and
++    // deserialize with the same big-endian format UniFFI uses for records.
++    let reader = format!("_UniFfiBinaryReader({arg_name}.data.asTypedList({arg_name}.len))");
+     let builtin_expr = match type_ {
+-        Type::String => format!(
+-            "{arg_name} == ffi.nullptr ? (throw StateError('Rust passed null string callback arg')) : {arg_name}.toDartString()"
+-        ),
+-        Type::Optional { inner_type } if is_runtime_string_type(inner_type) => {
+-            format!("{arg_name} == ffi.nullptr ? null : {arg_name}.toDartString()")
+-        }
+-        Type::Record { .. } if records
+-            .iter()
+-            .any(|r| record_name_from_type(type_) == Some(r.name.as_str())) =>
+-        {
+-            let record_name = record_name_from_type(type_).unwrap_or("Record");
++        // Scalars / handles passed directly (not via RustBuffer).
++        Type::Object { name, .. } => format!("{}FfiCodec.lift({arg_name})", to_upper_camel(name)),
++        Type::Optional { inner_type } if is_runtime_object_type(inner_type) => {
++            let name = object_name_from_type(inner_type)
++                .expect("is_runtime_object_type guarantees Object inner");
+             format!(
+-                "{arg_name} == ffi.nullptr ? (throw StateError('Rust passed null record callback arg')) : {}.fromJson(jsonDecode({arg_name}.toDartString()) as Map<String, dynamic>)",
+-                to_upper_camel(record_name)
++                "{arg_name} == 0 ? null : {}FfiCodec.lift({arg_name})",
++                to_upper_camel(name)
+             )
+         }
++        Type::Timestamp => {
++            format!("DateTime.fromMicrosecondsSinceEpoch({arg_name}, isUtc: true)")
++        }
++        Type::Duration => format!("Duration(microseconds: {arg_name})"),
++
++        // RustBuffer-backed types. A top-level String is the raw UTF-8 of the
++        // buffer (no length prefix); everything else is UniFFI-serialized.
++        Type::String => {
++            format!("utf8.decode({arg_name}.data.asTypedList({arg_name}.len))")
++        }
+         Type::Enum { .. } if is_runtime_enum_type(type_, enums) => {
+             let enum_name = enum_name_from_type(type_).unwrap_or("Enum");
+-            format!(
+-                "{arg_name} == ffi.nullptr ? (throw StateError('Rust passed null enum callback arg')) : {}FfiCodec.decode({arg_name}.toDartString())",
+-                to_upper_camel(enum_name)
+-            )
++            format!("_uniffiRead{}({reader})", to_upper_camel(enum_name))
+         }
+-        Type::Sequence { inner_type } if is_runtime_sequence_json_type(type_) => {
+-            let inner_decode = render_json_decode_expr("item", inner_type, custom_types);
+-            format!(
+-                "{arg_name} == ffi.nullptr ? (throw StateError('Rust passed null sequence callback arg')) : (jsonDecode({arg_name}.toDartString()) as List).map((item) => {inner_decode}).toList()"
+-            )
++        Type::Record { .. }
++            if records
++                .iter()
++                .any(|r| record_name_from_type(type_) == Some(r.name.as_str())) =>
++        {
++            let record_name = record_name_from_type(type_).unwrap_or("Record");
++            format!("_uniffiRead{}({reader})", to_upper_camel(record_name))
+         }
+-        Type::Object { name, .. } => {
++        Type::Sequence { inner_type } => {
++            let elem =
++                render_runtime_reader_read_expr("r", inner_type, records, enums, custom_types);
+             format!(
+-                "{}FfiCodec.lift({arg_name})",
+-                to_upper_camel(name)
++                "(() {{ final r = {reader}; final n = r.readI32(); return List.generate(n, (_) => {elem}); }})()"
+             )
+         }
+-        Type::Optional { inner_type } if is_runtime_object_type(inner_type) => {
+-            let name = object_name_from_type(inner_type)
+-                .expect("is_runtime_object_type guarantees Object inner");
++        Type::Optional { inner_type } => {
++            let inner =
++                render_runtime_reader_read_expr("r", inner_type, records, enums, custom_types);
++            format!("(() {{ final r = {reader}; return r.readI8() == 0 ? null : {inner}; }})()")
++        }
++        _ => arg_name.to_string(),
++    };
++    // Apply lift template if the original type is Custom (stripped by runtime_unwrapped_type above).
++    lift_custom_if_needed(&builtin_expr, original_type, custom_types)
++}
++
++/// Render an expression that reads ONE value of `type_` from a
++/// `_UniFfiBinaryReader` named `reader` (used for sequence elements and the
++/// payload of an optional in the callback-arg RustBuffer ABI).
++pub(super) fn render_runtime_reader_read_expr(
++    reader: &str,
++    type_: &Type,
++    records: &[UdlRecord],
++    enums: &[UdlEnum],
++    custom_types: &HashMap<String, CustomTypeConfig>,
++) -> String {
++    let t = runtime_unwrapped_type(type_);
++    let expr = match t {
++        Type::UInt8 => format!("{reader}.readU8()"),
++        Type::Int8 => format!("{reader}.readI8()"),
++        Type::UInt16 => format!("{reader}.readU16()"),
++        Type::Int16 => format!("{reader}.readI16()"),
++        Type::UInt32 => format!("{reader}.readU32()"),
++        Type::Int32 => format!("{reader}.readI32()"),
++        Type::UInt64 => format!("{reader}.readU64()"),
++        Type::Int64 => format!("{reader}.readI64()"),
++        Type::Float32 => format!("{reader}.readF32()"),
++        Type::Float64 => format!("{reader}.readF64()"),
++        Type::Boolean => format!("{reader}.readBool()"),
++        Type::String => format!("{reader}.readString()"),
++        Type::Enum { .. } if is_runtime_enum_type(t, enums) => {
+             format!(
+-                "{arg_name} == 0 ? null : {}FfiCodec.lift({arg_name})",
+-                to_upper_camel(name)
++                "_uniffiRead{}({reader})",
++                to_upper_camel(enum_name_from_type(t).unwrap_or("Enum"))
+             )
+         }
+-        Type::Bytes => {
++        Type::Record { .. }
++            if records
++                .iter()
++                .any(|r| record_name_from_type(t) == Some(r.name.as_str())) =>
++        {
+             format!(
+-                "{arg_name} == ffi.nullptr ? (throw StateError('Rust passed null bytes callback arg')) : base64Decode({arg_name}.toDartString())"
++                "_uniffiRead{}({reader})",
++                to_upper_camel(record_name_from_type(t).unwrap_or("Record"))
+             )
+         }
+-        Type::Timestamp => {
+-            format!("DateTime.fromMicrosecondsSinceEpoch({arg_name}, isUtc: true)")
++        Type::Object { name, .. } => {
++            format!("{}FfiCodec.lift({reader}.readU64())", to_upper_camel(name))
+         }
+-        Type::Duration => format!("Duration(microseconds: {arg_name})"),
+-        _ => arg_name.to_string(),
++        // Fallback: read a u64 (keeps generation total; not hit for the runtime
++        // callback types Cera uses — primitives/sequences/enums).
++        _ => format!("{reader}.readU64()"),
+     };
+-    // Apply lift template if the original type is Custom (stripped by runtime_unwrapped_type above).
+-    lift_custom_if_needed(&builtin_expr, original_type, custom_types)
++    lift_custom_if_needed(&expr, type_, custom_types)
+ }
+ 
+ pub(super) fn render_callback_return_encode_expr(
+diff --git a/src/dart/mod.rs b/src/dart/mod.rs
+index af40db9..74feda3 100644
+--- a/src/dart/mod.rs
++++ b/src/dart/mod.rs
+@@ -647,6 +647,7 @@ fn render_dart_scaffold(ctx: &RenderContext<'_>) -> String {
+     out.push_str(&render_object_classes(
+         objects,
+         callback_interfaces,
++        functions,
+         ffi_class_name,
+         api_overrides,
+         records,
+diff --git a/src/dart/render_objects.rs b/src/dart/render_objects.rs
+index d42393d..2ed819e 100644
+--- a/src/dart/render_objects.rs
++++ b/src/dart/render_objects.rs
+@@ -1,16 +1,58 @@
+ use super::config::CustomTypeConfig;
+ use super::*;
+-use std::collections::HashMap;
++use std::collections::{HashMap, HashSet};
++
++/// Names of foreign-implementable (callback-trait) objects that are passed as an
++/// argument to at least one ASYNC function or method. Such callbacks are invoked
++/// by Rust from a non-isolate thread, so their Dart vtable must use
++/// `NativeCallable.listener`. Interfaces used only by synchronous APIs are left
++/// on `isolateLocal` (synchronous, same-thread delivery).
++fn callback_traits_used_async(objects: &[UdlObject], functions: &[UdlFunction]) -> HashSet<String> {
++    let trait_names: HashSet<&str> = objects
++        .iter()
++        .filter(|o| o.has_callback_interface)
++        .map(|o| o.name.as_str())
++        .collect();
++    let mut used = HashSet::new();
++    let mut scan = |is_async: bool, args: &[UdlArg]| {
++        if !is_async {
++            return;
++        }
++        for a in args {
++            if let Some(n) = object_name_from_type(&a.type_) {
++                if trait_names.contains(n) {
++                    used.insert(n.to_string());
++                }
++            }
++        }
++    };
++    for f in functions {
++        scan(f.is_async, &f.args);
++    }
++    for o in objects {
++        for m in &o.methods {
++            scan(m.is_async, &m.args);
++        }
++    }
++    used
++}
+ 
+ pub(super) fn render_object_classes(
+     objects: &[UdlObject],
+     callback_interfaces: &[UdlCallbackInterface],
++    functions: &[UdlFunction],
+     ffi_class_name: &str,
+     api_overrides: &ApiOverrides,
+     records: &[UdlRecord],
+     enums: &[UdlEnum],
+     custom_types: &HashMap<String, CustomTypeConfig>,
+ ) -> String {
++    // Callback-trait interfaces passed to an ASYNC function/method are invoked
++    // from a non-isolate thread (e.g. a tokio worker), so their void methods
++    // must use `NativeCallable.listener` (cross-thread, async delivery).
++    // Interfaces only used by synchronous APIs keep `isolateLocal` (same-thread,
++    // synchronous — which preserves synchronous progress + in-callback abort).
++    let async_callback_traits = callback_traits_used_async(objects, functions);
+     let mut out = String::new();
+     for object in objects {
+         if api_overrides.excluded(&ApiOverrides::object_key(&object.name)) {
+@@ -25,6 +67,7 @@ pub(super) fn render_object_classes(
+                 records,
+                 enums,
+                 custom_types,
++                async_callback_traits.contains(&object.name),
+             ));
+         } else {
+             out.push_str(&render_plain_object(
+@@ -57,6 +100,7 @@ fn render_trait_interface(
+     records: &[UdlRecord],
+     enums: &[UdlEnum],
+     custom_types: &HashMap<String, CustomTypeConfig>,
++    use_listener: bool,
+ ) -> String {
+     let object_name = api_overrides
+         .renamed_or_default(&ApiOverrides::object_key(&object.name), || {
+@@ -366,6 +410,7 @@ fn render_trait_interface(
+         records,
+         enums,
+         custom_types,
++        use_listener,
+     ));
+ 
+     // 5. FfiCodec that handles both Rust-backed and Dart-backed instances
+@@ -693,12 +738,12 @@ fn render_trait_vtable_struct(
+         for arg in &method.args {
+             let arg_name = safe_dart_identifier(&to_lower_camel(&arg.name));
+             let arg_native =
+-                map_runtime_native_ffi_type(&arg.type_, records, enums).unwrap_or("ffi.Uint64");
++                map_callback_native_ffi_type(&arg.type_, records, enums).unwrap_or("ffi.Uint64");
+             ffi_args.push(format!("{arg_native} {arg_name}"));
+         }
+         if let Some(return_type) = method.return_type.as_ref() {
+             let out_type =
+-                map_runtime_native_ffi_type(return_type, records, enums).unwrap_or("ffi.Uint64");
++                map_callback_native_ffi_type(return_type, records, enums).unwrap_or("ffi.Uint64");
+             ffi_args.push(format!("ffi.Pointer<{out_type}> outReturn"));
+         } else {
+             ffi_args.push("ffi.Pointer<ffi.Void> outReturn".to_string());
+@@ -722,6 +767,7 @@ fn render_trait_callback_bridge(
+     records: &[UdlRecord],
+     enums: &[UdlEnum],
+     custom_types: &HashMap<String, CustomTypeConfig>,
++    use_listener: bool,
+ ) -> String {
+     let mut out = String::new();
+     out.push_str(&format!("final class {bridge_name} {{\n"));
+@@ -773,10 +819,16 @@ fn render_trait_callback_bridge(
+         "  {object_name}? lookup(int handle) => _callbacks[handle];\n\n"
+     ));
+ 
+-    // free native callable
+-    out.push_str(
+-        "  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)> _freeNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)>.isolateLocal((int handle) {\n",
+-    );
++    // free native callable. Void → can be a cross-thread `listener` when this
++    // interface is used asynchronously; otherwise same-thread `isolateLocal`.
++    let free_ctor = if use_listener {
++        "listener"
++    } else {
++        "isolateLocal"
++    };
++    out.push_str(&format!(
++        "  static final ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)> _freeNative = ffi.NativeCallable<ffi.Void Function(ffi.Uint64 handle)>.{free_ctor}((int handle) {{\n",
++    ));
+     out.push_str("    instance.release(handle);\n");
+     out.push_str("  });\n\n");
+ 
+@@ -787,6 +839,37 @@ fn render_trait_callback_bridge(
+     out.push_str("    return instance.cloneHandle(handle);\n");
+     out.push_str("  }, exceptionalReturn: 0);\n\n");
+ 
++    // RustBuffer callback args are passed by value, and Rust transfers ownership
++    // of the lowered buffer to the foreign callback (standard UniFFI
++    // foreign-callback contract). The bridge must free each one after decoding
++    // its value — otherwise every callback invocation leaks a RustBuffer. Emit a
++    // shared helper once (only when some method actually takes a buffer arg).
++    let object_has_buffer_arg = object
++        .methods
++        .iter()
++        .filter(|m| !is_uniffi_trait_method_name(&m.name))
++        .any(|m| m.args.iter().any(|a| is_callback_rustbuffer_type(&a.type_)));
++    if object_has_buffer_arg {
++        // Reusable out-status for the buffer frees. Callbacks on an isolate run
++        // serially, so a single process-lifetime status (like the static
++        // NativeCallables themselves) is safe and avoids a calloc/free pair on
++        // every — potentially per-token — callback invocation.
++        out.push_str(
++            "  static final ffi.Pointer<_UniFfiRustCallStatus> _freeArgStatus = calloc<_UniFfiRustCallStatus>();\n\n",
++        );
++        out.push_str("  static void _uniffiFreeArgBuffer(_UniFfiRustBuffer buf) {\n");
++        out.push_str("    if (buf.data == ffi.nullptr && buf.len == 0 && buf.capacity == 0) {\n");
++        out.push_str("      return;\n");
++        out.push_str("    }\n");
++        out.push_str("    _freeArgStatus.ref.code = _uniFfiRustCallStatusSuccess;\n");
++        out.push_str("    _freeArgStatus.ref.errorBuf\n");
++        out.push_str("      ..capacity = 0\n");
++        out.push_str("      ..len = 0\n");
++        out.push_str("      ..data = ffi.nullptr;\n");
++        out.push_str("    _bindings()._uniFfiRustBufferFree(buf, _freeArgStatus);\n");
++        out.push_str("  }\n\n");
++    }
++
+     // Per-method native callables
+     for method in &object.methods {
+         if is_uniffi_trait_method_name(&method.name) {
+@@ -798,12 +881,13 @@ fn render_trait_callback_bridge(
+         let mut ffi_args = vec!["ffi.Uint64 handle".to_string()];
+         let mut dart_args = vec!["int handle".to_string()];
+         let mut callback_args = Vec::new();
++        let mut buffer_arg_names = Vec::new();
+ 
+         for arg in &method.args {
+             let arg_name = safe_dart_identifier(&to_lower_camel(&arg.name));
+             let arg_native =
+-                map_runtime_native_ffi_type(&arg.type_, records, enums).unwrap_or("ffi.Uint64");
+-            let arg_dart = map_runtime_dart_ffi_type(&arg.type_, records, enums).unwrap_or("int");
++                map_callback_native_ffi_type(&arg.type_, records, enums).unwrap_or("ffi.Uint64");
++            let arg_dart = map_callback_dart_ffi_type(&arg.type_, records, enums).unwrap_or("int");
+             ffi_args.push(format!("{arg_native} {arg_name}"));
+             dart_args.push(format!("{arg_dart} {arg_name}"));
+             callback_args.push(render_callback_arg_decode_expr(
+@@ -813,11 +897,22 @@ fn render_trait_callback_bridge(
+                 enums,
+                 custom_types,
+             ));
++            if is_callback_rustbuffer_type(&arg.type_) {
++                buffer_arg_names.push(arg_name);
++            }
+         }
+ 
++        // Free statements for the RustBuffer args (6-space indent, for inside a
++        // try/finally or if-block). Empty when the method takes no buffer args.
++        let free_buffers: String = buffer_arg_names
++            .iter()
++            .map(|n| format!("      _uniffiFreeArgBuffer({n});\n"))
++            .collect();
++        let has_buffers = !buffer_arg_names.is_empty();
++
+         if let Some(return_type) = method.return_type.as_ref() {
+             let out_type =
+-                map_runtime_native_ffi_type(return_type, records, enums).unwrap_or("ffi.Uint64");
++                map_callback_native_ffi_type(return_type, records, enums).unwrap_or("ffi.Uint64");
+             ffi_args.push(format!("ffi.Pointer<{out_type}> outReturn"));
+             dart_args.push(format!("ffi.Pointer<{out_type}> outReturn"));
+         } else {
+@@ -827,51 +922,105 @@ fn render_trait_callback_bridge(
+         ffi_args.push("ffi.Pointer<_RustCallStatus> outStatus".to_string());
+         dart_args.push("ffi.Pointer<_RustCallStatus> outStatus".to_string());
+ 
++        // Void methods use `NativeCallable.listener` so Rust can invoke them
++        // from a non-isolate thread (e.g. a tokio worker driving
++        // generate_streaming_async). Methods with a return value must answer
++        // synchronously (write `outReturn`), which only `isolateLocal` can do —
++        // those stay isolate-local (and thus same-thread-only).
++        let is_listener = use_listener && method.return_type.is_none();
++        let ctor = if is_listener {
++            "listener"
++        } else {
++            "isolateLocal"
++        };
+         out.push_str(&format!(
+-            "  static final ffi.NativeCallable<ffi.Void Function({})> {native_callable_name} = ffi.NativeCallable<ffi.Void Function({})>.isolateLocal(({}) {{\n",
++            "  static final ffi.NativeCallable<ffi.Void Function({})> {native_callable_name} = ffi.NativeCallable<ffi.Void Function({})>.{ctor}(({}) {{\n",
+             ffi_args.join(", "),
+             ffi_args.join(", "),
+             dart_args.join(", ")
+         ));
+-        out.push_str(&format!(
+-            "    final {object_name}? callback = instance.lookup(handle);\n"
+-        ));
+-        out.push_str("    if (callback == null) {\n");
+-        out.push_str("      outStatus.ref\n");
+-        out.push_str("        ..code = _rustCallStatusUnexpectedError\n");
+-        out.push_str("        ..errorBuf = 'Invalid callback handle'.toNativeUtf8();\n");
+-        out.push_str("      return;\n");
+-        out.push_str("    }\n");
+-        out.push_str("    try {\n");
+ 
+-        if let Some(return_type) = method.return_type.as_ref() {
++        if is_listener {
++            // A listener callback runs asynchronously on the owning isolate,
++            // AFTER the native call has returned — so `outStatus`/`outReturn` are
++            // already consumed by Rust (which pre-initialises the status to
++            // success). We therefore only deliver the decoded args and must NOT
++            // touch the (now-stale) out pointers. Foreign-side errors can't be
++            // reported back on this path, so they're swallowed. RustBuffer args
++            // are still owned by us and freed in `finally` (and on early return).
+             out.push_str(&format!(
+-                "      final result = callback.{method_name}({});\n",
+-                callback_args.join(", ")
++                "    final {object_name}? callback = instance.lookup(handle);\n"
+             ));
+-            let encoded = render_callback_return_encode_expr(
+-                return_type,
+-                "result",
+-                records,
+-                enums,
+-                custom_types,
+-            );
+-            out.push_str(&format!("      outReturn.value = {encoded};\n"));
+-        } else {
++            out.push_str("    if (callback == null) {\n");
++            out.push_str(&free_buffers);
++            out.push_str("      return;\n");
++            out.push_str("    }\n");
++            out.push_str("    try {\n");
+             out.push_str(&format!(
+                 "      callback.{method_name}({});\n",
+                 callback_args.join(", ")
+             ));
++            out.push_str("    } catch (_) {\n");
++            out.push_str("      // async listener: no channel to report a Dart error to Rust\n");
++            if has_buffers {
++                out.push_str("    } finally {\n");
++                out.push_str(&free_buffers);
++                out.push_str("    }\n");
++            } else {
++                out.push_str("    }\n");
++            }
++            out.push_str("  });\n\n");
++        } else {
++            // Synchronous (isolateLocal) bridge. Owns its RustBuffer args too;
++            // free them in `finally`. `errorBuf` is set to nullptr (the error
++            // code still propagates) — handing Rust a `toNativeUtf8()` C string
++            // both leaks it and is ambiguous to free across the FFI boundary.
++            out.push_str(&format!(
++                "    final {object_name}? callback = instance.lookup(handle);\n"
++            ));
++            out.push_str("    if (callback == null) {\n");
++            out.push_str(&free_buffers);
++            out.push_str("      outStatus.ref\n");
++            out.push_str("        ..code = _rustCallStatusUnexpectedError\n");
++            out.push_str("        ..errorBuf = ffi.nullptr;\n");
++            out.push_str("      return;\n");
++            out.push_str("    }\n");
++            out.push_str("    try {\n");
++            if let Some(return_type) = method.return_type.as_ref() {
++                out.push_str(&format!(
++                    "      final result = callback.{method_name}({});\n",
++                    callback_args.join(", ")
++                ));
++                let encoded = render_callback_return_encode_expr(
++                    return_type,
++                    "result",
++                    records,
++                    enums,
++                    custom_types,
++                );
++                out.push_str(&format!("      outReturn.value = {encoded};\n"));
++            } else {
++                out.push_str(&format!(
++                    "      callback.{method_name}({});\n",
++                    callback_args.join(", ")
++                ));
++            }
++            out.push_str("      outStatus.ref\n");
++            out.push_str("        ..code = _rustCallStatusSuccess\n");
++            out.push_str("        ..errorBuf = ffi.nullptr;\n");
++            out.push_str("    } catch (_) {\n");
++            out.push_str("      outStatus.ref\n");
++            out.push_str("        ..code = _rustCallStatusUnexpectedError\n");
++            out.push_str("        ..errorBuf = ffi.nullptr;\n");
++            if has_buffers {
++                out.push_str("    } finally {\n");
++                out.push_str(&free_buffers);
++                out.push_str("    }\n");
++            } else {
++                out.push_str("    }\n");
++            }
++            out.push_str("  });\n\n");
+         }
+-        out.push_str("      outStatus.ref\n");
+-        out.push_str("        ..code = _rustCallStatusSuccess\n");
+-        out.push_str("        ..errorBuf = ffi.nullptr;\n");
+-        out.push_str("    } catch (err) {\n");
+-        out.push_str("      outStatus.ref\n");
+-        out.push_str("        ..code = _rustCallStatusUnexpectedError\n");
+-        out.push_str("        ..errorBuf = err.toString().toNativeUtf8();\n");
+-        out.push_str("    }\n");
+-        out.push_str("  });\n\n");
+     }
+ 
+     // createVTable
+diff --git a/src/dart/type_map.rs b/src/dart/type_map.rs
+index eb1e0ae..0500a6b 100644
+--- a/src/dart/type_map.rs
++++ b/src/dart/type_map.rs
+@@ -560,6 +560,62 @@ pub(super) fn map_runtime_dart_ffi_type(
+     }
+ }
+ 
++/// FFI type for a value crossing a **callback** boundary (foreign-trait /
++/// callback-interface vtable arg or return). UniFFI passes String / Sequence /
++/// Enum / Record / Option<non-object> as a `RustBuffer` BY VALUE (binary-
++/// serialized) — confirmed against the Kotlin/Swift reference bindings, where
++/// these args are `RustBuffer.ByValue`. Primitives and object handles stay
++/// scalar. This is intentionally separate from `map_runtime_*_ffi_type` (used by
++/// the non-ffibuffer runtime path, where String marshals as `Pointer<Utf8>`),
++/// so the change is scoped to callback bridges only. For a by-value struct the
++/// native and Dart sides use the same type, so one function serves both.
++/// True for the callback arg/return types that cross the boundary as a
++/// `RustBuffer` by value (must match `render_callback_arg_decode_expr`). Bytes /
++/// Map keep their existing runtime mapping; Object / Optional<Object> stay
++/// scalar handles.
++pub(super) fn is_callback_rustbuffer_type(type_: &Type) -> bool {
++    let t = if let Type::Custom { builtin, .. } = type_ {
++        builtin.as_ref()
++    } else {
++        type_
++    };
++    match t {
++        Type::String | Type::Sequence { .. } | Type::Record { .. } | Type::Enum { .. } => true,
++        Type::Optional { .. } => {
++            !is_runtime_optional_object_type(t) && !is_runtime_optional_bytes_type(t)
++        }
++        _ => false,
++    }
++}
++
++/// Native-side FFI type for a callback vtable arg/return. RustBuffer-by-value for
++/// the complex families; otherwise the standard native marker. Scoped to callback
++/// bridges (the non-ffibuffer runtime path keeps `map_runtime_native_ffi_type`).
++pub(super) fn map_callback_native_ffi_type(
++    type_: &Type,
++    records: &[UdlRecord],
++    enums: &[UdlEnum],
++) -> Option<&'static str> {
++    if is_callback_rustbuffer_type(type_) {
++        return Some("_UniFfiRustBuffer");
++    }
++    map_runtime_native_ffi_type(type_, records, enums)
++}
++
++/// Dart-side type for a callback vtable arg/return (the `NativeCallable` closure
++/// parameter). Same RustBuffer struct as the native side for by-value families;
++/// otherwise the Dart scalar (`int`/`double`/`bool`).
++pub(super) fn map_callback_dart_ffi_type(
++    type_: &Type,
++    records: &[UdlRecord],
++    enums: &[UdlEnum],
++) -> Option<&'static str> {
++    if is_callback_rustbuffer_type(type_) {
++        return Some("_UniFfiRustBuffer");
++    }
++    map_runtime_dart_ffi_type(type_, records, enums)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -824,6 +880,59 @@ mod tests {
+         );
+     }
+ 
++    // ── callback FFI mappers (RustBuffer-by-value ABI) ──────────────────
++
++    #[test]
++    fn callback_ffi_string_is_rustbuffer() {
++        // Both native and Dart sides see the struct by value.
++        assert_eq!(
++            map_callback_native_ffi_type(&Type::String, &[], &[]),
++            Some("_UniFfiRustBuffer")
++        );
++        assert_eq!(
++            map_callback_dart_ffi_type(&Type::String, &[], &[]),
++            Some("_UniFfiRustBuffer")
++        );
++    }
++
++    #[test]
++    fn callback_ffi_sequence_is_rustbuffer() {
++        let t = Type::Sequence {
++            inner_type: Box::new(Type::UInt32),
++        };
++        assert_eq!(
++            map_callback_native_ffi_type(&t, &[], &[]),
++            Some("_UniFfiRustBuffer")
++        );
++    }
++
++    #[test]
++    fn callback_ffi_primitive_stays_scalar() {
++        // Primitives are NOT RustBuffer: native marker on one side, Dart scalar
++        // on the other (this split is why the closure params type-check).
++        assert_eq!(
++            map_callback_native_ffi_type(&Type::UInt32, &[], &[]),
++            Some("ffi.Uint32")
++        );
++        assert_eq!(
++            map_callback_dart_ffi_type(&Type::UInt32, &[], &[]),
++            Some("int")
++        );
++    }
++
++    #[test]
++    fn callback_ffi_object_stays_handle() {
++        let t = Type::Object {
++            name: "Sink".into(),
++            module_path: "".into(),
++            imp: ObjectImpl::Struct,
++        };
++        assert_eq!(
++            map_callback_native_ffi_type(&t, &[], &[]),
++            Some("ffi.Uint64")
++        );
++    }
++
+     // ── lift_custom_if_needed / lower_custom_if_needed ──────────────────
+ 
+     fn url_customs() -> HashMap<String, CustomTypeConfig> {

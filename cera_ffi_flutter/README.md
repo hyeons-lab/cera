@@ -85,8 +85,17 @@ runs in a Web Worker. One step is not off-thread natively, prefill, because
 `appendTokens` has no async twin yet; a long prompt blocks the calling isolate
 for its prefill, and decode is unaffected.
 
-`Cera.openBytes` is the constructor that also works in a browser, which has no
-filesystem to point `openPath` at. `Cera.supportsPaths` says which one to reach
+`Cera.openBundle` downloads a model published on `LiquidAI/LeapBundles` by
+`<name, quant>` and opens it, caching it for next time; `Cera.listBundles`
+returns the catalog for a picker to offer. It is the constructor to reach for
+first on every platform, and especially in a browser, where it keeps the weights
+out of JavaScript entirely: one copy of the model instead of two, and clear of
+the roughly 2 GiB ceiling on a single contiguous JS allocation. Pass `storeDir`
+from `path_provider` on Android and iOS, where it is required.
+
+For a model the user supplies instead, `Cera.openBytes` is the constructor that
+also works in a browser, which has no filesystem to point `openPath` at.
+`Cera.supportsPaths` says which one to reach
 for, and it is worth branching on before the file picker rather than after: a
 picker has to be asked for the file's *bytes* up front on the web, and asking
 for them on native reads a multi-gigabyte model into the heap that the engine
@@ -167,7 +176,7 @@ page.
 
 What is narrower on the web than on native:
 
-- **`openPath` throws.** There is no filesystem; use `openBytes`.
+- **`openPath` throws.** There is no filesystem; use `openBundle` or `openBytes`.
 - **The GPU path is LFM2-only.** `WebGpuSession` covers the `lfm2`/`lfm2.5`
   family. A dense transformer (llama, qwen, granite) still runs, on the CPU
   fallback, and `backend: CeraBackend.auto` arranges that silently; read

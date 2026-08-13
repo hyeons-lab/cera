@@ -75,6 +75,10 @@ sha2 = { workspace = true }
 # addition there needs a matching entry here or the build fails with a
 # missing type rather than silently widening the surface.
 web-sys = { version = "0.3", features = [
+    # `AbortSignal` also unlocks `RequestInit::set_signal`, which is what
+    # puts a deadline on the bundle store's fetches. Without one a stalled
+    # connection leaves the promise pending forever instead of rejecting.
+    "AbortSignal",
     "Blob",
     "File",
     "FileSystemDirectoryHandle",

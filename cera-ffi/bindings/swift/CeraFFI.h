@@ -673,6 +673,18 @@ RustBuffer uniffi_cera_ffi_fn_func_cpu_backend_report(RustCallStatus *_Nonnull o
 RustBuffer uniffi_cera_ffi_fn_func_detect_tool_format(RustBuffer architecture, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_LIST_LEAP_BUNDLES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_LIST_LEAP_BUNDLES
+RustBuffer uniffi_cera_ffi_fn_func_list_leap_bundles(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_LIST_LEAP_BUNDLES_ASYNC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_LIST_LEAP_BUNDLES_ASYNC
+uint64_t uniffi_cera_ffi_fn_func_list_leap_bundles_async(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_PARSE_TOOL_CALLS
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_PARSE_TOOL_CALLS
 RustBuffer uniffi_cera_ffi_fn_func_parse_tool_calls(RustBuffer text, RustBuffer format, RustCallStatus *_Nonnull out_status
@@ -958,6 +970,18 @@ uint16_t uniffi_cera_ffi_checksum_func_cpu_backend_report(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_DETECT_TOOL_FORMAT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_DETECT_TOOL_FORMAT
 uint16_t uniffi_cera_ffi_checksum_func_detect_tool_format(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_LIST_LEAP_BUNDLES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_LIST_LEAP_BUNDLES
+uint16_t uniffi_cera_ffi_checksum_func_list_leap_bundles(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_LIST_LEAP_BUNDLES_ASYNC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_LIST_LEAP_BUNDLES_ASYNC
+uint16_t uniffi_cera_ffi_checksum_func_list_leap_bundles_async(void
     
 );
 #endif
