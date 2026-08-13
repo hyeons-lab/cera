@@ -215,6 +215,94 @@ fn cpu_and_gpu_agree_on_position_after_a_prefix() {
     );
 }
 
+/// `forward_embedding` returns the hidden state, and the audio path is its only
+/// caller: `generate_audio` hands it to the depthformer to sample codes from.
+/// Before this it was the trait's default `unimplemented!`, so a `--features
+/// gpu` build with no Metal panicked on the first audio frame.
+///
+/// The contract this pins is *where the tail stops*, which is easy to get wrong
+/// by one step in either direction. The CPU model's `run_layers` ends with the
+/// output norm, so what comes back is the **post-norm** vector; a backend that
+/// returned the pre-norm one would still look like a hidden state and still have
+/// the right length. RMSNorm's per-element weight multiply rotates as well as
+/// rescales, so the cosine below does catch it (measured 0.963 when this was
+/// wrong), and the magnitude check makes the reason legible rather than leaving
+/// a bare cosine to interpret.
+#[test]
+fn forward_embedding_matches_the_cpu_model() {
+    let Some(path) = fixture_or_skip() else {
+        return;
+    };
+    let Some(gpu) = load_gpu(&path) else { return };
+    let cpu = load_cpu(&path);
+
+    let mut cpu_state = InferenceState::from_config(cpu.config()).expect("state");
+    let mut gpu_state = InferenceState::from_config(gpu.config()).expect("state");
+
+    let cpu_hidden = cpu.forward_embedding(&[1], 0, &mut cpu_state);
+    let gpu_hidden = gpu.forward_embedding(&[1], 0, &mut gpu_state);
+
+    assert_eq!(
+        gpu_hidden.len(),
+        cpu.config().hidden_size,
+        "forward_embedding must return one hidden-size vector, not logits"
+    );
+    assert_eq!(
+        cpu_state.seq_len, gpu_state.seq_len,
+        "backends disagree on how far forward_embedding advanced the cache"
+    );
+
+    let cos = cosine(&cpu_hidden, &gpu_hidden);
+    let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+    let (cpu_rms, gpu_rms) = (rms(&cpu_hidden), rms(&gpu_hidden));
+    assert!(
+        cos > 0.999,
+        "GPU forward_embedding diverged from CPU: cosine {cos:.6}, \
+         RMS cpu={cpu_rms:.4} gpu={gpu_rms:.4}. A gpu RMS far below the cpu \
+         one means the tail stopped before the output norm; the contract is \
+         the post-norm state."
+    );
+    assert!(
+        (gpu_rms / cpu_rms - 1.0).abs() < 0.05,
+        "forward_embedding magnitudes disagree: cpu RMS {cpu_rms:.4} vs gpu \
+         {gpu_rms:.4}. A large ratio here is a missing or extra normalization \
+         step, not kernel noise."
+    );
+}
+
+/// The audio loop's other half: a frame's codes come back as an embedding and
+/// have to re-enter the LLM as hidden state, not as logits. Same seam as
+/// `forward_from_embedding`, different tail.
+#[test]
+fn forward_hidden_from_embedding_matches_the_cpu_model() {
+    let Some(path) = fixture_or_skip() else {
+        return;
+    };
+    let Some(gpu) = load_gpu(&path) else { return };
+    let cpu = load_cpu(&path);
+
+    let hidden_size = cpu.config().hidden_size;
+    let embedding = synthetic_embedding(hidden_size, 0xA0D10);
+
+    let mut cpu_state = InferenceState::from_config(cpu.config()).expect("state");
+    let mut gpu_state = InferenceState::from_config(gpu.config()).expect("state");
+
+    let cpu_hidden = cpu.forward_hidden_from_embedding(&embedding, 0, &mut cpu_state);
+    let gpu_hidden = gpu.forward_hidden_from_embedding(&embedding, 0, &mut gpu_state);
+
+    assert_eq!(gpu_hidden.len(), hidden_size);
+    assert_eq!(
+        cpu_state.seq_len, gpu_state.seq_len,
+        "backends disagree on how far forward_hidden_from_embedding advanced \
+         the cache"
+    );
+    let cos = cosine(&cpu_hidden, &gpu_hidden);
+    assert!(
+        cos > 0.999,
+        "GPU forward_hidden_from_embedding diverged from CPU: cosine {cos:.6}"
+    );
+}
+
 /// The batched override must agree with the CPU model frame for frame.
 ///
 /// The readback count is pinned separately in
