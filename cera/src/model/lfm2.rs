@@ -177,9 +177,9 @@ pub struct Lfm2Model {
 fn select_experts(probs: &[f32], biases: &[f32], n_used: usize, selected: &mut Vec<(usize, f32)>) {
     selected.clear();
     let n_expert = probs.len().min(biases.len());
-    let mut stack_biased = [0.0f32; 64];
+    let mut stack_biased = [0.0f32; 256];
     let heap_biased;
-    let biased: &[f32] = if n_expert <= 64 {
+    let biased: &[f32] = if n_expert <= 256 {
         for i in 0..n_expert {
             stack_biased[i] = probs[i] + biases[i];
         }

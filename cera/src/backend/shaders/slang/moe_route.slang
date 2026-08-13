@@ -54,6 +54,7 @@ static const uint MAX_EXPERTS = 256u;
 static const uint MAX_USED = 16u;
 
 groupshared float sh_prob[MAX_EXPERTS];
+groupshared float sh_score[MAX_EXPERTS];
 
 [shader("compute")]
 [numthreads(32, 1, 1)]
@@ -68,7 +69,9 @@ void moe_route(uint3 lid : SV_GroupThreadID, uint3 grp : SV_GroupID) {
     }
 
     for (uint e = lid.x; e < n_expert; e += WG) {
-        sh_prob[e] = 1.0f / (1.0f + exp(-logits[tok * n_expert + e]));
+        float p = 1.0f / (1.0f + exp(-logits[tok * n_expert + e]));
+        sh_prob[e] = p;
+        sh_score[e] = p + bias[e];
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -110,7 +113,7 @@ void moe_route(uint3 lid : SV_GroupThreadID, uint3 grp : SV_GroupID) {
             if (used) {
                 continue;
             }
-            float score = sh_prob[e] + bias[e];
+            float score = sh_score[e];
             if (!have || score > best_score) {
                 best = e;
                 best_score = score;

@@ -9,6 +9,7 @@
 @binding(3) @group(0) var<storage, read_write> sel_weight_0 : array<f32>;
 
 var<workgroup> sh_prob_0 : array<f32, i32(256)>;
+var<workgroup> sh_score_0 : array<f32, i32(256)>;
 
 @compute
 @workgroup_size(32, 1, 1)
@@ -32,7 +33,9 @@ fn moe_route(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup
         {
             break;
         }
-        sh_prob_0[e_0] = 1.0f / (1.0f + exp(- logits_0[tok_0 * n_expert_0 + e_0]));
+        var p_0 : f32 = 1.0f / (1.0f + exp(- logits_0[tok_0 * n_expert_0 + e_0]));
+        sh_prob_0[e_0] = p_0;
+        sh_score_0[e_0] = p_0 + bias_0[e_0];
         e_0 = e_0 + u32(32);
     }
     workgroupBarrier();
@@ -100,7 +103,7 @@ fn moe_route(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup
                 e_0 = e_0 + u32(1);
                 continue;
             }
-            var score_0 : f32 = sh_prob_0[e_0] + bias_0[e_0];
+            var score_0 : f32 = sh_score_0[e_0];
             var _S3 : bool;
             if(!have_0)
             {

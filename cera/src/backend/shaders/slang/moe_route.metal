@@ -12,6 +12,7 @@ struct KernelContext_0
     uint device* sel_expert_0;
     float device* sel_weight_0;
     array<float, int(256)> threadgroup* sh_prob_0;
+    array<float, int(256)> threadgroup* sh_score_0;
 };
 
 
@@ -39,9 +40,11 @@ struct KernelContext_0
 
 #line 60
     threadgroup array<float, int(256)> sh_prob_1;
+    threadgroup array<float, int(256)> sh_score_1;
 
 #line 60
     (&kernelContext_0)->sh_prob_0 = &sh_prob_1;
+    (&kernelContext_0)->sh_score_0 = &sh_score_1;
     uint n_expert_0 = (uint4(*(params_1+int(0))) ).x;
     uint _S1 = min(min((uint4(*(params_1+int(0))) ).y, n_expert_0), 16U);
 
@@ -75,7 +78,9 @@ struct KernelContext_0
         }
 
 #line 71
-        (*(&kernelContext_0)->sh_prob_0)[e_0] = 1.0f / (1.0f + exp(- (&kernelContext_0)->logits_0[tok_0 * n_expert_0 + e_0]));
+        float p_0 = 1.0f / (1.0f + exp(- (&kernelContext_0)->logits_0[tok_0 * n_expert_0 + e_0]));
+        (*(&kernelContext_0)->sh_prob_0)[e_0] = p_0;
+        (*(&kernelContext_0)->sh_score_0)[e_0] = p_0 + (&kernelContext_0)->bias_0[e_0];
 
 #line 70
         e_0 = e_0 + 32U;
@@ -218,7 +223,7 @@ struct KernelContext_0
             }
 
 #line 113
-            float score_0 = (*(&kernelContext_0)->sh_prob_0)[e_0] + (&kernelContext_0)->bias_0[e_0];
+            float score_0 = (*(&kernelContext_0)->sh_score_0)[e_0];
 
 #line 113
             bool _S3;
