@@ -6,7 +6,7 @@ backend) from a single source. It exists to test whether cera can stop
 maintaining every GPU kernel twice (WGSL and MSL kept in agreement by hand) and
 generate both from one file instead.
 
-Each `<name>.slang` is compiled by `just slang` (slangc 2026.13.1, pinned) into
+Each `<name>.slang` is compiled by `just slang` (slangc 2026.14.1, pinned) into
 the committed `<name>.wgsl` and `<name>.metal` next to it. Those committed
 outputs are the build's fallback when slangc is absent (CI runners without a
 Slang toolchain); `build.rs` regenerates from the `.slang` into `OUT_DIR` when
@@ -201,7 +201,7 @@ hand-tuned `simdgroup_matrix` GEMMs inherits that shape.
 ## Working with these shaders
 
 Regenerate the committed outputs after editing any `.slang` (requires slangc
-2026.13.1, the version CI byte-compares against):
+2026.14.1, the version CI byte-compares against):
 
 ```sh
 just slang

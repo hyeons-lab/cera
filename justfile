@@ -33,7 +33,7 @@ fmt-fix:
 # build.rs compiles with slangc directly; the checked-in .spv is only the
 # fallback for build hosts without slangc (e.g. CI). Run this after editing a
 # .slang so the fallback stays in sync. Needs slangc on PATH or ~/.local/slang/bin.
-# Use slangc 2026.13.1: the CI drift check byte-compares against that version's
+# Use slangc 2026.14.1: the CI drift check byte-compares against that version's
 # output, and SPIR-V is only byte-reproducible within one slangc version.
 slang:
     #!/usr/bin/env bash

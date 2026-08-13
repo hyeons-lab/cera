@@ -201,7 +201,7 @@ jobs:
       # PATH or in $SLANGC, so it does not change what build.rs compiles.
       - name: Verify committed SPIR-V matches the Slang sources
         run: |
-          SLANG_VER=2026.13.1
+          SLANG_VER=2026.14.1
           asset="slang-${SLANG_VER}-linux-x86_64.tar.gz"
           url="https://github.com/shader-slang/slang/releases/download/v${SLANG_VER}/${asset}"
           curl -fsSL -o "$RUNNER_TEMP/slang.tar.gz" "$url"
