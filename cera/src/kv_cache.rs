@@ -583,9 +583,23 @@ impl InferenceState {
                 // call. Stays empty if the `blas` feature is off.
                 dequant_weight_scratch: Vec::new(),
                 lora_tmp: Vec::new(),
-                moe_probs: Vec::new(),
-                moe_expert_out: Vec::new(),
-                moe_selected: Vec::new(),
+                moe_probs: config
+                    .moe
+                    .as_ref()
+                    .map(|m| zeroed_f32(m.n_expert))
+                    .transpose()?
+                    .unwrap_or_default(),
+                moe_expert_out: config
+                    .moe
+                    .as_ref()
+                    .map(|_| zeroed_f32(config.hidden_size))
+                    .transpose()?
+                    .unwrap_or_default(),
+                moe_selected: config
+                    .moe
+                    .as_ref()
+                    .map(|m| Vec::with_capacity(m.n_expert_used))
+                    .unwrap_or_default(),
             },
             // Scratch is needed whenever either side is compressed. The
             // EncodeScratch `rot` buffer is shared between key and value
