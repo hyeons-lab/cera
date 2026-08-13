@@ -139,6 +139,8 @@ const SLANG_MULTI_KERNELS: &[&str] = &[
     "conv1d",
     "conv1d_fused",
     "conv1d_fused_batch",
+    "exp_polar",
+    "overlap_add",
 ];
 
 /// Compile each multi-target kernel to the shader languages the enabled

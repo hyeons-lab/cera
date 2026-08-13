@@ -699,6 +699,80 @@ fn assert_gemm(label: &str, got: &[f32], want: &[f32], mag: &[f32], tol: f32) {
 /// * `(10, 32, 3)`: smaller than a tile in every dimension, one k block.
 const GEMM_SHAPES: &[(usize, usize, usize)] = &[(64, 64, 32), (70, 96, 45), (10, 32, 3)];
 
+// ── GPU ISTFT kernels (exp_polar, overlap_add) ──────────────────────────────
+
+/// `exp_polar` reference: per frame, `[log_abs | angle]` (each `bins` wide) maps
+/// to `[re | im]` with `re_j = exp(log_abs_j)·cos(angle_j)`, `im_j =
+/// exp(log_abs_j)·sin(angle_j)`. Input and output share the `2·bins` stride.
+fn exp_polar_ref(spectrum: &[f32], n_frames: usize, bins: usize) -> Vec<f32> {
+    let fs = 2 * bins;
+    let mut out = vec![0.0f32; n_frames * fs];
+    for f in 0..n_frames {
+        let base = f * fs;
+        for j in 0..bins {
+            let mag = spectrum[base + j].exp();
+            out[base + j] = mag * spectrum[base + bins + j].cos();
+            out[base + bins + j] = mag * spectrum[base + bins + j].sin();
+        }
+    }
+    out
+}
+
+/// `overlap_add` reference: window each length-`n_fft` frame with `hann`, lay it
+/// at offset `frame·hop`, sum overlaps, and normalize by the accumulated window
+/// energy. Output length is `n_frames·hop` (no startup-pad strip here; that is
+/// the decoder's CPU-side tail). Matches the kernel's per-position formula.
+fn overlap_add_ref(
+    time_domain: &[f32],
+    hann: &[f32],
+    n_frames: usize,
+    n_fft: usize,
+    hop: usize,
+) -> Vec<f32> {
+    let total = n_frames * hop;
+    (0..total)
+        .map(|g| {
+            let i_hi = (g / hop).min(n_frames - 1);
+            let i_lo = if g >= n_fft { (g - n_fft) / hop + 1 } else { 0 };
+            let mut numer = 0.0f32;
+            let mut denom = 0.0f32;
+            for i in i_lo..=i_hi {
+                let local = g - i * hop;
+                let w = hann[local];
+                numer += time_domain[i * n_fft + local] * w;
+                denom += w * w;
+            }
+            if denom > 1e-8 { numer / denom } else { numer }
+        })
+        .collect()
+}
+
+/// Deterministic polar spectrum: log-magnitudes spanning a wide dynamic range
+/// (so `exp` is meaningfully exercised) and angles across `[-π, π]`.
+fn exp_polar_input(n_frames: usize, bins: usize) -> Vec<f32> {
+    let fs = 2 * bins;
+    (0..n_frames * fs)
+        .map(|i| {
+            let frame = i / fs;
+            let j = i % fs;
+            if j < bins {
+                // log-magnitude
+                -6.0 + 5.0 * (0.03 * (frame * bins + j) as f32).sin()
+            } else {
+                // angle in [-π, π]
+                std::f32::consts::PI * (0.05 * (frame + j) as f32).cos()
+            }
+        })
+        .collect()
+}
+
+/// Deterministic time-domain frames for the overlap-add fixture.
+fn overlap_add_input(n_frames: usize, n_fft: usize) -> Vec<f32> {
+    (0..n_frames * n_fft)
+        .map(|i| (0.017 * i as f32).sin() * 2.0 - (0.003 * i as f32).cos())
+        .collect()
+}
+
 #[cfg(feature = "gpu")]
 mod wgsl {
     use super::*;
@@ -1705,6 +1779,132 @@ mod wgsl {
                 1e-5,
             );
         }
+    }
+
+    fn run_exp_polar(ctx: &GpuContext, spectrum: &[f32], n_frames: u32, bins: u32) -> Vec<f32> {
+        let pipeline = ctx.create_pipeline(shaders::EXP_POLAR, "exp_polar", "exp_polar_slang");
+        let spec = ctx.upload_f32(spectrum, "exp_polar_spec");
+        let out = ctx.create_storage_rw((spectrum.len() * 4) as u64, "exp_polar_out");
+        let params =
+            ctx.upload_storage(bytemuck::cast_slice(&[n_frames, bins]), "exp_polar_params");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: spec.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((n_frames * bins).div_ceil(256), 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll_wait();
+        ctx.download_f32(&out, spectrum.len())
+    }
+
+    #[test]
+    fn exp_polar_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        let (n_frames, bins) = (5usize, 641usize);
+        let spec = exp_polar_input(n_frames, bins);
+        let got = run_exp_polar(&ctx, &spec, n_frames as u32, bins as u32);
+        let want = exp_polar_ref(&spec, n_frames, bins);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst <= 1e-4,
+            "wgsl exp_polar worst abs err {worst:.3e} > 1e-4"
+        );
+    }
+
+    fn run_overlap_add(
+        ctx: &GpuContext,
+        time_domain: &[f32],
+        hann: &[f32],
+        n_frames: u32,
+        n_fft: u32,
+        hop: u32,
+    ) -> Vec<f32> {
+        let pipeline =
+            ctx.create_pipeline(shaders::OVERLAP_ADD, "overlap_add", "overlap_add_slang");
+        let td = ctx.upload_f32(time_domain, "oa_td");
+        let hann_buf = ctx.upload_f32(hann, "oa_hann");
+        let total = (n_frames * hop) as usize;
+        let out = ctx.create_storage_rw((total * 4) as u64, "oa_out");
+        let params = ctx.upload_storage(
+            bytemuck::cast_slice(&[n_frames, n_fft, hop, 0u32]),
+            "oa_params",
+        );
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: td.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: hann_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((n_frames * hop).div_ceil(256), 1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll_wait();
+        ctx.download_f32(&out, total)
+    }
+
+    #[test]
+    fn overlap_add_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        // 8 frames wraps well past the n_fft/hop overlap depth (1280/320 = 4).
+        let (n_frames, n_fft, hop) = (8usize, 1280usize, 320usize);
+        let td = overlap_add_input(n_frames, n_fft);
+        let hann = cera::model::audio_decoder::build_hann(n_fft);
+        let got = run_overlap_add(&ctx, &td, &hann, n_frames as u32, n_fft as u32, hop as u32);
+        let want = overlap_add_ref(&td, &hann, n_frames, n_fft, hop);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst <= 1e-3,
+            "wgsl overlap_add worst abs err {worst:.3e} > 1e-3"
+        );
     }
 }
 
@@ -2784,6 +2984,123 @@ mod msl {
         assert!(
             shaders::RMSNORM.contains("simd_sum"),
             "generated MSL lost simd_sum; __target_switch selected the portable tree"
+        );
+    }
+
+    fn run_exp_polar(ctx: &MetalContext, spectrum: &[f32], n_frames: u32, bins: u32) -> Vec<f32> {
+        let pipeline = ctx
+            .create_pipeline(shaders::EXP_POLAR, "exp_polar")
+            .expect("compile generated MSL");
+        let spec = ctx.upload_f32(spectrum);
+        let out = ctx.create_buffer((spectrum.len() * 4) as u64);
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&[n_frames, bins]));
+
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&spec), 0);
+        enc.set_buffer(1, Some(&out), 0);
+        enc.set_buffer(2, Some(&params), 0);
+        let groups = (n_frames * bins).div_ceil(256);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: groups as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        ctx.read_f32(&out, spectrum.len())
+    }
+
+    #[test]
+    fn exp_polar_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        let (n_frames, bins) = (5usize, 641usize);
+        let spec = exp_polar_input(n_frames, bins);
+        let got = run_exp_polar(&ctx, &spec, n_frames as u32, bins as u32);
+        let want = exp_polar_ref(&spec, n_frames, bins);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst <= 1e-4,
+            "msl exp_polar worst abs err {worst:.3e} > 1e-4"
+        );
+    }
+
+    fn run_overlap_add(
+        ctx: &MetalContext,
+        time_domain: &[f32],
+        hann: &[f32],
+        n_frames: u32,
+        n_fft: u32,
+        hop: u32,
+    ) -> Vec<f32> {
+        let pipeline = ctx
+            .create_pipeline(shaders::OVERLAP_ADD, "overlap_add")
+            .expect("compile generated MSL");
+        let td = ctx.upload_f32(time_domain);
+        let hann_buf = ctx.upload_f32(hann);
+        let total = (n_frames * hop) as usize;
+        let out = ctx.create_buffer((total * 4) as u64);
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&[n_frames, n_fft, hop, 0u32]));
+
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&td), 0);
+        enc.set_buffer(1, Some(&hann_buf), 0);
+        enc.set_buffer(2, Some(&out), 0);
+        enc.set_buffer(3, Some(&params), 0);
+        let groups = (n_frames * hop).div_ceil(256);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: groups as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        ctx.read_f32(&out, total)
+    }
+
+    #[test]
+    fn overlap_add_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        let (n_frames, n_fft, hop) = (8usize, 1280usize, 320usize);
+        let td = overlap_add_input(n_frames, n_fft);
+        let hann = cera::model::audio_decoder::build_hann(n_fft);
+        let got = run_overlap_add(&ctx, &td, &hann, n_frames as u32, n_fft as u32, hop as u32);
+        let want = overlap_add_ref(&td, &hann, n_frames, n_fft, hop);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst <= 1e-3,
+            "msl overlap_add worst abs err {worst:.3e} > 1e-3"
         );
     }
 }
