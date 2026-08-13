@@ -185,7 +185,11 @@ fn select_experts(probs: &[f32], biases: &[f32], n_used: usize, selected: &mut V
         }
         &stack_biased[..n_expert]
     } else {
-        heap_biased = probs.iter().zip(biases).map(|(&p, &b)| p + b).collect::<Vec<_>>();
+        heap_biased = probs
+            .iter()
+            .zip(biases)
+            .map(|(&p, &b)| p + b)
+            .collect::<Vec<_>>();
         &heap_biased[..]
     };
     (0..n_used.min(n_expert)).for_each(|_| {
