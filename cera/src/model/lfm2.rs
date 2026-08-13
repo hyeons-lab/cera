@@ -177,14 +177,15 @@ pub struct Lfm2Model {
 fn select_experts(probs: &[f32], biases: &[f32], n_used: usize, selected: &mut Vec<(usize, f32)>) {
     selected.clear();
     let n_expert = probs.len().min(biases.len());
+    let biased: Vec<f32> = probs.iter().zip(biases).map(|(&p, &b)| p + b).collect();
     (0..n_used.min(n_expert)).for_each(|_| {
         let best = (0..n_expert)
             .filter(|e| !selected.iter().any(|(taken, _)| taken == e))
             .max_by(|&a, &b| {
                 // `total_cmp`, not `partial_cmp`: a NaN logit would otherwise
                 // make `max_by` silently return an arbitrary expert.
-                (probs[a] + biases[a])
-                    .total_cmp(&(probs[b] + biases[b]))
+                biased[a]
+                    .total_cmp(&biased[b])
                     // Ties go to the lower index, matching the stable order of
                     // `ggml_argsort_top_k`. `max_by` keeps the *last* maximum,
                     // so the reversed index comparison is what makes it the
@@ -740,7 +741,7 @@ impl Lfm2Model {
         // `n_expert_used` pairs (4 here), not per-expert data.
         let selected = std::mem::take(&mut state.scratch.moe_selected);
 
-        for &(expert, weight) in &selected {
+        for (i, &(expert, weight)) in selected.iter().enumerate() {
             // Restore the Q8_0 quantization of `ffn_input`. The previous
             // iteration's down projection re-quantized this scratch to hold its
             // SwiGLU product, so the gate/up GEMVs below would otherwise read
@@ -751,7 +752,7 @@ impl Lfm2Model {
             // valid; that is one quantization per layer, against one per expert
             // for the bottom-of-loop form.
             #[cfg(target_arch = "aarch64")]
-            if expert != selected[0].0 {
+            if i > 0 {
                 Self::quantize_to_scratch(ffn_input, state);
             }
 
