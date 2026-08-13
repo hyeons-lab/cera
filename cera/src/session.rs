@@ -478,6 +478,12 @@ pub struct Session {
     /// encoder can back multiple sessions (one per concurrent
     /// generation) without re-loading the ~hundreds-of-MB weights.
     audio_encoder: Option<Arc<AudioEncoderWeights>>,
+    /// Optional cached GPU audio encoder. When present, [`Self::append_audio`]
+    /// runs the Conformer encoder on the GPU instead of the CPU
+    /// `audio_encoder`; the CPU encoder above is always kept as the fallback
+    /// (and still backs the capability/dimension checks). Attached via
+    /// [`Self::attach_gpu_audio_encoder`].
+    gpu_audio_encoder: Option<Arc<dyn crate::model::audio_encoder_gpu::AudioGpuEncode>>,
     /// Vision encoder weights, if attached. None for non-VL
     /// sessions; populated via [`Self::attach_vision_encoder`]
     /// before [`Self::append_image`] is called. Held by `Arc`
@@ -629,6 +635,7 @@ impl Session {
             capabilities,
             config,
             audio_encoder: None,
+            gpu_audio_encoder: None,
             vision_encoder: None,
             gpu_vision_encoder: None,
             image_max_long_size: None,
@@ -655,6 +662,20 @@ impl Session {
     /// the LLM it was trained against.
     pub fn attach_audio_encoder(&mut self, encoder: Arc<AudioEncoderWeights>) {
         self.audio_encoder = Some(encoder);
+    }
+
+    /// Attach a cached GPU audio encoder. When present, [`Self::append_audio`]
+    /// runs the Conformer stack on the GPU, falling back to the CPU
+    /// `audio_encoder` for chunks the GPU kernels cannot take (see
+    /// [`crate::model::audio_encoder_gpu::MAX_AUDIO_TOKENS`]) and for any other
+    /// encode error. The CPU encoder must still be attached via
+    /// [`Self::attach_audio_encoder`]: it backs that fallback and the
+    /// capability/dimension checks. Preserved across `reset()`.
+    pub fn attach_gpu_audio_encoder(
+        &mut self,
+        encoder: Arc<dyn crate::model::audio_encoder_gpu::AudioGpuEncode>,
+    ) {
+        self.gpu_audio_encoder = Some(encoder);
     }
 
     /// Attach a vision encoder so [`Self::append_image`] can encode
@@ -1017,8 +1038,23 @@ impl Session {
         if samples.is_empty() {
             return Err(CeraError::EmptyInput);
         }
-        let (embeddings, n_frames) =
-            crate::model::audio_encoder::encode_audio_pcm(samples, encoder.as_ref());
+        // Prefer the GPU encoder when one is attached. A GPU refusal (chunk
+        // longer than the attention kernel's capacity, unsupported geometry) is
+        // a fallback, not a failure: the CPU encoder is always present and
+        // produces the same output, just slower.
+        let (embeddings, n_frames) = match self.gpu_audio_encoder.as_ref() {
+            Some(gpu) => match gpu.encode_pcm(samples) {
+                Ok(out) => out,
+                Err(e) => {
+                    // warn, not debug, and for the same reason
+                    // `try_metal_audio_encoder` warns at build time: the only
+                    // other symptom of this is "audio encode got slower".
+                    tracing::warn!("audio encoder: GPU path declined, using CPU: {e:#}");
+                    crate::model::audio_encoder::encode_audio_pcm(samples, encoder.as_ref())
+                }
+            },
+            None => crate::model::audio_encoder::encode_audio_pcm(samples, encoder.as_ref()),
+        };
         if n_frames == 0 {
             // Sub-window-length input: log_mel_spectrogram produced
             // zero frames. Caller's audio was too short to encode

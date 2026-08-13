@@ -156,25 +156,6 @@ pub trait VitGpuOps {
     fn sync(&self) {}
 }
 
-/// Dequantize a linear weight to a contiguous `[rows*cols]` f32 vector for
-/// upload. F32 weights are copied directly; quantized dtypes go row-by-row.
-/// Only the GPU/Metal backends use this (the wgpu/Metal `upload_weight` impls);
-/// gated to match so the default (no-backend) build doesn't flag it as dead.
-#[cfg(any(
-    feature = "gpu",
-    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
-))]
-fn dequant_weight(w: &MmapWeight) -> Vec<f32> {
-    if let Some(f) = w.try_as_f32() {
-        return f.to_vec();
-    }
-    let mut out = vec![0f32; w.rows * w.cols];
-    for r in 0..w.rows {
-        w.dequantize_row(r, &mut out[r * w.cols..(r + 1) * w.cols]);
-    }
-    out
-}
-
 /// One ViT block's weights, uploaded to GPU buffers. Linear weights are
 /// `O::Weight` (possibly quantized); norm/bias vectors are plain f32 `O::Buf`.
 pub struct GpuVitBlock<O: VitGpuOps> {
@@ -907,7 +888,7 @@ impl VitGpuOps for WgpuVitOps {
                 dtype: w.dtype,
             },
             // Dense or a quant dtype without a ViT GEMM kernel: dequantize.
-            _ => WgpuVitWeight::Dense(self.ctx.upload_f32(&dequant_weight(w), "vit_w")),
+            _ => WgpuVitWeight::Dense(self.ctx.upload_f32(&w.to_dense_f32(), "vit_w")),
         }
     }
 
@@ -1079,21 +1060,18 @@ impl VitGpuOps for WgpuVitOps {
 /// their packed bytes and run the simdgroup `gemm_q8_0`/`gemm_q4_0` kernels;
 /// f32 weights (or quant dtypes without a GEMM kernel) fall back to the scalar
 /// `vit_linear` gemv on a dequantized f32 buffer.
+///
+/// Shared with the audio encoder, which makes the identical packed-versus-dense
+/// decision. Alias rather than a rename so the ViT-facing name still reads at
+/// the `VitGpuOps::Weight` binding below.
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub enum MetalVitWeight {
-    /// Dequantized f32 buffer, `[out_dim, in_dim]` row-major.
-    Dense(metal::Buffer),
-    /// Packed quantized bytes (`MmapWeight::data()` layout) + dtype.
-    Quant {
-        buf: metal::Buffer,
-        dtype: crate::tensor::DType,
-    },
-}
+pub type MetalVitWeight = crate::backend::metal::MetalLinearWeight;
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+use crate::backend::metal::MetalLinear;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 use crate::backend::metal::params::{
-    BiasAddParams, ElementwiseParams, LayerNormBatchParams, MetalParams, QuantGemmParams,
-    VitAttnParams, VitLinearParams,
+    BiasAddParams, ElementwiseParams, LayerNormBatchParams, VitAttnParams,
 };
 
 /// Native-Metal implementation of [`VitGpuOps`]. Mirrors `WgpuVitOps` using
@@ -1103,9 +1081,7 @@ use crate::backend::metal::params::{
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub struct MetalVitOps {
     ctx: crate::backend::metal::MetalContext,
-    p_linear: metal::ComputePipelineState,
-    p_gemm_q8_0: metal::ComputePipelineState,
-    p_gemm_q4_0: metal::ComputePipelineState,
+    linear: MetalLinear,
     p_bias: metal::ComputePipelineState,
     p_layernorm: metal::ComputePipelineState,
     p_gelu: metal::ComputePipelineState,
@@ -1120,9 +1096,7 @@ impl MetalVitOps {
     pub fn new(ctx: crate::backend::metal::MetalContext) -> Result<Self> {
         use crate::backend::metal::shaders;
         Ok(Self {
-            p_linear: ctx.create_pipeline(shaders::VIT_LINEAR, "vit_linear")?,
-            p_gemm_q8_0: ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0")?,
-            p_gemm_q4_0: ctx.create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0")?,
+            linear: MetalLinear::new(&ctx)?,
             p_bias: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add")?,
             p_layernorm: ctx.create_pipeline(shaders::LAYERNORM_BATCH, "layernorm_batch")?,
             p_gelu: ctx.create_pipeline(shaders::GELU, "gelu_inplace")?,
@@ -1133,76 +1107,6 @@ impl MetalVitOps {
             p_add: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace")?,
             ctx,
         })
-    }
-
-    /// Run one kernel in its own command buffer: bind `bufs` at slots 0.. then the typed
-    /// `params` at the next slot (length from `size_of_val`, never a literal), dispatch,
-    /// and block until done.
-    fn run<P: MetalParams>(
-        &self,
-        pipe: &metal::ComputePipelineState,
-        bufs: &[&metal::Buffer],
-        params: &P,
-        grid: metal::MTLSize,
-        threads: metal::MTLSize,
-    ) {
-        let cb = self.ctx.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(pipe);
-        for (i, b) in bufs.iter().enumerate() {
-            enc.set_buffer(i as u64, Some(b), 0);
-        }
-        params.set(enc, bufs.len() as u64);
-        enc.dispatch_thread_groups(grid, threads);
-        enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
-    }
-
-    /// Quantized `y[tokens, out_dim] = x[tokens, in_dim] · wᵀ` via the simdgroup
-    /// `gemm_q8_0`/`gemm_q4_0` kernels. `wq` is the packed weight `[out_dim,
-    /// in_dim]`; `x` is f32 `[tokens, in_dim]`; `y` is f32 `[tokens, out_dim]`.
-    /// Param/grid/threadgroup layout mirrors `metal_lfm2`'s `encode_gemm`.
-    #[allow(clippy::too_many_arguments)]
-    fn run_gemm_quant(
-        &self,
-        pipe: &metal::ComputePipelineState,
-        wq: &metal::Buffer,
-        x: &metal::Buffer,
-        y: &metal::Buffer,
-        tokens: usize,
-        out_dim: usize,
-        in_dim: usize,
-    ) {
-        // These GEMM kernels never read `_pad`, so they always plain-store (no accumulate).
-        let params = QuantGemmParams {
-            m: out_dim as u32,
-            k: in_dim as u32,
-            n: tokens as u32,
-            x_stride: in_dim as u32,
-            y_stride: out_dim as u32,
-            _pad: 0,
-        };
-        let cb = self.ctx.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(pipe);
-        enc.set_buffer(0, Some(wq), 0);
-        enc.set_buffer(1, Some(x), 0);
-        enc.set_buffer(2, Some(y), 0);
-        params.set(enc, 3);
-        enc.set_threadgroup_memory_length(0, 8192); // 4 KB weights + 4 KB input
-        enc.dispatch_thread_groups(
-            // (ceil(tokens/32), ceil(out_dim/64)) tiles × 128 threads (4 simdgroups).
-            metal::MTLSize::new(
-                (tokens as u64).div_ceil(32),
-                (out_dim as u64).div_ceil(64),
-                1,
-            ),
-            metal::MTLSize::new(128, 1, 1),
-        );
-        enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
     }
 
     /// Bidirectional attention via the flash-attention MMA kernel
@@ -1238,22 +1142,14 @@ impl MetalVitOps {
         } else {
             &self.p_attn_mma
         };
-        let cb = self.ctx.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(pipe);
-        enc.set_buffer(0, Some(q), 0);
-        enc.set_buffer(1, Some(k), 0);
-        enc.set_buffer(2, Some(v), 0);
-        enc.set_buffer(3, Some(out), 0);
-        params.set(enc, 4);
-        enc.set_threadgroup_memory_length(0, shmem);
-        enc.dispatch_thread_groups(
+        self.ctx.run_kernel_shmem(
+            pipe,
+            &[q, k, v, out],
+            &params,
             metal::MTLSize::new(n_head as u64 * (tokens as u64).div_ceil(Q_PER_TG), 1, 1),
             metal::MTLSize::new(256, 1, 1),
+            Some(shmem),
         );
-        enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
     }
 }
 
@@ -1271,16 +1167,7 @@ impl VitGpuOps for MetalVitOps {
     }
 
     fn upload_weight(&self, w: &MmapWeight) -> Self::Weight {
-        use crate::tensor::DType;
-        match w.dtype {
-            // Keep packed → simdgroup GEMM straight from the quantized bytes.
-            DType::Q8_0 | DType::Q4_0 => MetalVitWeight::Quant {
-                buf: self.ctx.upload_bytes(w.data()),
-                dtype: w.dtype,
-            },
-            // Dense or a quant dtype without a ViT GEMM kernel: dequantize.
-            _ => MetalVitWeight::Dense(self.ctx.upload_f32(&dequant_weight(w))),
-        }
+        self.ctx.upload_linear_weight(w)
     }
 
     fn upload_weight_f32(&self, data: &[f32], _out_dim: usize, _in_dim: usize) -> Self::Weight {
@@ -1295,32 +1182,8 @@ impl VitGpuOps for MetalVitOps {
         out_dim: usize,
         in_dim: usize,
     ) -> Self::Buf {
-        let y = self.ctx.create_buffer((tokens * out_dim * 4) as u64);
-        match w {
-            MetalVitWeight::Quant { buf, dtype } => {
-                let pipe = match dtype {
-                    crate::tensor::DType::Q8_0 => &self.p_gemm_q8_0,
-                    _ => &self.p_gemm_q4_0,
-                };
-                self.run_gemm_quant(pipe, buf, x, &y, tokens, out_dim, in_dim);
-            }
-            MetalVitWeight::Dense(wbuf) => {
-                let params = VitLinearParams {
-                    m: out_dim as u32,
-                    k: in_dim as u32,
-                    n: tokens as u32,
-                    _pad: 0,
-                };
-                self.run(
-                    &self.p_linear,
-                    &[wbuf, x, &y],
-                    &params,
-                    metal::MTLSize::new(out_dim as u64, tokens as u64, 1),
-                    metal::MTLSize::new(32, 1, 1),
-                );
-            }
-        }
-        y
+        self.linear
+            .forward(&self.ctx, x, w, tokens, out_dim, in_dim)
     }
 
     fn bias_add(&self, x: &Self::Buf, bias: &Self::Buf, rows: usize, dim: usize) {
@@ -1329,7 +1192,7 @@ impl VitGpuOps for MetalVitOps {
             total,
             dim: dim as u32,
         };
-        self.run(
+        self.ctx.run_kernel(
             &self.p_bias,
             &[x, bias],
             &params,
@@ -1354,7 +1217,7 @@ impl VitGpuOps for MetalVitOps {
             src_stride: dim as u32,
             dst_stride: dim as u32,
         };
-        self.run(
+        self.ctx.run_kernel(
             &self.p_layernorm,
             &[src, &dst, weight, bias],
             &params,
@@ -1365,7 +1228,7 @@ impl VitGpuOps for MetalVitOps {
     }
 
     fn gelu(&self, x: &Self::Buf, len: usize) {
-        self.run(
+        self.ctx.run_kernel(
             &self.p_gelu,
             &[x],
             &ElementwiseParams::new(len as u32),
@@ -1400,7 +1263,7 @@ impl VitGpuOps for MetalVitOps {
                 head_dim: head_dim as u32,
                 scale_bits: scale.to_bits(),
             };
-            self.run(
+            self.ctx.run_kernel(
                 &self.p_attn,
                 &[q, k, v, &out],
                 &params,
@@ -1412,7 +1275,7 @@ impl VitGpuOps for MetalVitOps {
     }
 
     fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize) {
-        self.run(
+        self.ctx.run_kernel(
             &self.p_add,
             &[dst, src],
             &ElementwiseParams::new(len as u32),

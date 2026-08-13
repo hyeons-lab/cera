@@ -135,6 +135,103 @@ impl MetalContext {
     }
 }
 
+/// A linear-layer weight on the Metal backend: packed for the dtypes with a
+/// simdgroup GEMM kernel, dequantized to f32 otherwise.
+///
+/// Shared by the vision and audio encoders. They previously carried identical
+/// private copies of this enum and of the `Q8_0 | Q4_0 => packed, _ => dense`
+/// rule, which meant adding a packed-GEMM dtype had two places to land and one
+/// of them would silently keep dequantizing.
+pub enum MetalLinearWeight {
+    Dense(Buffer),
+    Quant {
+        buf: Buffer,
+        dtype: crate::tensor::DType,
+    },
+}
+
+/// The batched linear layer both GPU encoders run: `y[rows, out_dim] =
+/// x[rows, in_dim] · wᵀ`, dispatching to a simdgroup GEMM for packed weights and
+/// to the dense `vit_linear` kernel otherwise.
+///
+/// Holds the three pipelines because which one runs is a property of the
+/// uploaded weight, not of the caller.
+pub struct MetalLinear {
+    p_dense: ComputePipelineState,
+    p_q8_0: ComputePipelineState,
+    p_q4_0: ComputePipelineState,
+}
+
+impl MetalLinear {
+    pub fn new(ctx: &MetalContext) -> Result<Self> {
+        Ok(Self {
+            p_dense: ctx.create_pipeline(shaders::VIT_LINEAR, "vit_linear")?,
+            p_q8_0: ctx.create_pipeline(shaders::GEMM_Q8_0, "gemm_q8_0")?,
+            p_q4_0: ctx.create_pipeline(shaders::GEMM_Q4_0, "gemm_q4_0")?,
+        })
+    }
+
+    /// `y[rows, out_dim] = x[rows, in_dim] · wᵀ`, into a fresh buffer.
+    pub fn forward(
+        &self,
+        ctx: &MetalContext,
+        x: &Buffer,
+        w: &MetalLinearWeight,
+        rows: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Buffer {
+        let y = ctx.create_buffer((rows * out_dim * 4) as u64);
+        match w {
+            MetalLinearWeight::Quant { buf, dtype } => {
+                let pipe = match dtype {
+                    crate::tensor::DType::Q8_0 => &self.p_q8_0,
+                    crate::tensor::DType::Q4_0 => &self.p_q4_0,
+                    other => panic!("unsupported MetalLinear weight dtype: {other:?}"),
+                };
+                // These GEMM kernels never read `_pad`, so they always plain-store.
+                let p = params::QuantGemmParams {
+                    m: out_dim as u32,
+                    k: in_dim as u32,
+                    n: rows as u32,
+                    x_stride: in_dim as u32,
+                    y_stride: out_dim as u32,
+                    _pad: 0,
+                };
+                ctx.run_kernel_shmem(
+                    pipe,
+                    &[buf, x, &y],
+                    &p,
+                    // (ceil(rows/32), ceil(out_dim/64)) tiles x 128 threads.
+                    metal::MTLSize::new(
+                        (rows as u64).div_ceil(32),
+                        (out_dim as u64).div_ceil(64),
+                        1,
+                    ),
+                    metal::MTLSize::new(128, 1, 1),
+                    Some(8192), // 4 KB weights + 4 KB input
+                );
+            }
+            MetalLinearWeight::Dense(wbuf) => {
+                let p = params::VitLinearParams {
+                    m: out_dim as u32,
+                    k: in_dim as u32,
+                    n: rows as u32,
+                    _pad: 0,
+                };
+                ctx.run_kernel(
+                    &self.p_dense,
+                    &[wbuf, x, &y],
+                    &p,
+                    metal::MTLSize::new(out_dim as u64, rows as u64, 1),
+                    metal::MTLSize::new(32, 1, 1),
+                );
+            }
+        }
+        y
+    }
+}
+
 fn build_pipeline(device: &Device, library: &Library, entry: &str) -> Result<ComputePipelineState> {
     let function = library
         .get_function(entry, None)
@@ -149,6 +246,83 @@ impl MetalContext {
     pub fn read_f32(&self, buf: &Buffer, count: usize) -> Vec<f32> {
         let ptr = buf.contents() as *const f32;
         unsafe { std::slice::from_raw_parts(ptr, count).to_vec() }
+    }
+
+    /// Run one kernel in its own command buffer and block until it completes.
+    ///
+    /// Binds `bufs` at slots `0..`, then `params` at the next slot with a
+    /// `size_of_val`-derived length (never a literal, per [`params`]), dispatches
+    /// `grid` threadgroups of `threads`, and waits.
+    ///
+    /// The ViT encoder had a private copy of this, the quantized GEMM and the
+    /// ViT's flash-attention dispatch each had another, and the audio encoder
+    /// would have added a fourth. It is command-buffer plumbing rather than
+    /// anything an encoder owns, and a divergence between copies (a missed
+    /// `wait_until_completed`, a params slot off by one) would show up as
+    /// nondeterministic wrong output, so the library now has exactly one copy and
+    /// it lives with the queue it submits to. Kernels needing threadgroup memory
+    /// go through [`Self::run_kernel_shmem`], which shares this body.
+    ///
+    /// `cera/tests/` still hand-rolls the same sequence in a dozen places. Those
+    /// predate this helper and are a follow-up, not a contradiction: it is `pub`
+    /// precisely so they can adopt it.
+    pub fn run_kernel<P: params::MetalParams>(
+        &self,
+        pipe: &ComputePipelineState,
+        bufs: &[&Buffer],
+        params: &P,
+        grid: metal::MTLSize,
+        threads: metal::MTLSize,
+    ) {
+        self.run_kernel_shmem(pipe, bufs, params, grid, threads, None);
+    }
+
+    /// [`Self::run_kernel`] for a kernel that also needs `shmem` bytes of
+    /// threadgroup memory at index 0 (the simdgroup GEMMs and the ViT's
+    /// flash-attention kernel).
+    ///
+    /// `None` and `Some(0)` are not the same thing: a kernel that declares no
+    /// threadgroup memory should not have a length set at all, which is why this
+    /// takes an `Option` rather than defaulting to zero.
+    pub fn run_kernel_shmem<P: params::MetalParams>(
+        &self,
+        pipe: &ComputePipelineState,
+        bufs: &[&Buffer],
+        params: &P,
+        grid: metal::MTLSize,
+        threads: metal::MTLSize,
+        shmem: Option<u64>,
+    ) {
+        let cb = self.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipe);
+        for (i, b) in bufs.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(b), 0);
+        }
+        params.set(enc, bufs.len() as u64);
+        if let Some(bytes) = shmem {
+            enc.set_threadgroup_memory_length(0, bytes);
+        }
+        enc.dispatch_thread_groups(grid, threads);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    /// Upload a `[out_dim, in_dim]` row-major linear weight, keeping it packed
+    /// when a simdgroup GEMM kernel can read the quantized bytes directly.
+    ///
+    /// On the context rather than on [`MetalLinear`] because uploading a weight
+    /// needs the device, not the pipelines.
+    pub fn upload_linear_weight(&self, w: &crate::model::weights::MmapWeight) -> MetalLinearWeight {
+        use crate::tensor::DType;
+        match w.dtype {
+            DType::Q8_0 | DType::Q4_0 => MetalLinearWeight::Quant {
+                buf: self.upload_bytes(w.data()),
+                dtype: w.dtype,
+            },
+            _ => MetalLinearWeight::Dense(self.upload_f32(&w.to_dense_f32())),
+        }
     }
 
     /// Read `count` u32 values back from a shared buffer (e.g. an argmax index
@@ -375,6 +549,38 @@ pub mod shaders {
     /// stage: windowed overlap-add of the iDFT frames into PCM, one thread per
     /// output sample. A portable position-indexed reduction, no `__target_switch`.
     pub const OVERLAP_ADD: &str = include_str!(concat!(env!("OUT_DIR"), "/overlap_add.metal"));
+    // LFM2A audio-encoder (Conformer) kernels. All generated from
+    // `shaders/slang/*.slang` by build.rs and shared with the wgpu backend's
+    // `wgpu::shaders::*` twins. These MSL halves are pinned numerically against
+    // the CPU encoder by `tests/audio_encoder_metal_parity.rs`;
+    // `tests/slang_multitarget_parity.rs` adds only an entry-point-presence check
+    // for them (its no-subgroup and no-f16 guards are WGSL-only, being
+    // constraints on the wgpu emission).
+    /// `relu_inplace` / `silu_inplace` / `gelu_erf_inplace`, sharing `GELU`'s
+    /// contract (buffer 0 = x in-place, buffer 1 = params). The GELU here is the
+    /// **erf** form the audio adapter was trained against, not `GELU`'s tanh
+    /// approximation.
+    pub const ACTIVATIONS: &str = include_str!(concat!(env!("OUT_DIR"), "/activations.metal"));
+    /// Direct (im2col-free) conv2d covering the conv subsampling stem's regular,
+    /// depthwise and pointwise layers *and* each Conformer block's depthwise
+    /// conv1d (`kh = 1`).
+    pub const CONV2D_DIRECT: &str = include_str!(concat!(env!("OUT_DIR"), "/conv2d_direct.metal"));
+    /// Outer-axis swap with a contiguous inner block: the conv stem's
+    /// channel/time permute (`K = f_out`) and the conv module's time-major ↔
+    /// channel-major transposes (`K = 1`).
+    pub const TRANSPOSE_BLOCKED: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/transpose_blocked.metal"));
+    /// Batched GLU split for the Conformer convolution module.
+    pub const GLU_SPLIT: &str = include_str!(concat!(env!("OUT_DIR"), "/glu_split.metal"));
+    /// Per-channel affine + SiLU over a channel-major buffer (the conv module's
+    /// `conv_norm`, which is a scale/shift and not a LayerNorm).
+    pub const CHAN_AFFINE_SILU: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/chan_affine_silu.metal"));
+    /// Conformer self-attention with Transformer-XL relative-position bias.
+    /// Portable (non-MMA), so unlike `VIT_ATTENTION` it is generated rather than
+    /// handwritten; only its softmax reduction has a `__target_switch`.
+    pub const AUDIO_XL_ATTENTION: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/audio_xl_attention.metal"));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────

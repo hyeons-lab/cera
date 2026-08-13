@@ -3224,6 +3224,155 @@ fn generated_wgsl_has_no_subgroup_ops() {
             "generated WGSL for {name} uses a subgroup op, but cera does not enable Features::SUBGROUP"
         );
     }
+    // The audio tier goes through the shared lookup rather than a fourth copy of
+    // its name list. `audio_xl_attention` is the one that can actually regress
+    // here: its softmax reduction is a `__target_switch` whose metal arm uses
+    // `WaveActiveMax`/`WaveActiveSum`, so a failed branch elimination would put a
+    // wave intrinsic in the WGSL.
+    for name in AUDIO_KERNELS {
+        let Some(src) = audio_kernel_sources(name).0 else {
+            continue;
+        };
+        assert!(
+            !src.contains("subgroup"),
+            "generated WGSL for {name} uses a subgroup op, but cera does not enable Features::SUBGROUP"
+        );
+    }
+}
+
+/// The audio kernels' WGSL must not require `enable f16` either: cera requests
+/// `SHADER_F16` only when the adapter reports it, so an f16 type reaching this
+/// emission fails pipeline creation on the devices that lack it. Same constraint
+/// `generated_gemm_wgsl_needs_no_f16` pins for the GEMM, checked here because
+/// these are the sources the wgpu audio encoder will build pipelines from.
+#[cfg(feature = "gpu")]
+#[test]
+fn generated_audio_wgsl_needs_no_f16() {
+    for name in AUDIO_KERNELS {
+        let Some(src) = audio_kernel_sources(name).0 else {
+            continue;
+        };
+        assert!(
+            !src.contains("enable f16"),
+            "generated WGSL for {name} requires f16; cera enables SHADER_F16 only when \
+             the adapter reports it, so this would fail pipeline creation elsewhere"
+        );
+    }
+}
+
+/// Every LFM2A audio-encoder kernel, by `.slang` basename.
+///
+/// One list, consumed by all three checks below. It used to be written out per
+/// check, which meant a seventh kernel had to be added in three places and the
+/// checks failed open if it was added to fewer.
+const AUDIO_KERNELS: &[&str] = &[
+    "activations",
+    "conv2d_direct",
+    "transpose_blocked",
+    "glu_split",
+    "chan_affine_silu",
+    "audio_xl_attention",
+];
+
+/// The `(wgsl, msl)` sources for one audio kernel, `None` where the feature is
+/// off.
+///
+/// A single lookup rather than a `match` per call site: the earlier form ended
+/// in a `_ =>` catch-all, so a seventh kernel added to the caller's table would
+/// have silently re-tested `audio_xl_attention` and passed. Panicking on an
+/// unknown name makes that a failure instead.
+fn audio_kernel_sources(name: &str) -> (Option<&'static str>, Option<&'static str>) {
+    #[cfg(feature = "gpu")]
+    let wgsl = Some(match name {
+        "activations" => cera::backend::wgpu::shaders::ACTIVATIONS,
+        "conv2d_direct" => cera::backend::wgpu::shaders::CONV2D_DIRECT,
+        "transpose_blocked" => cera::backend::wgpu::shaders::TRANSPOSE_BLOCKED,
+        "glu_split" => cera::backend::wgpu::shaders::GLU_SPLIT,
+        "chan_affine_silu" => cera::backend::wgpu::shaders::CHAN_AFFINE_SILU,
+        "audio_xl_attention" => cera::backend::wgpu::shaders::AUDIO_XL_ATTENTION,
+        other => panic!("no WGSL source registered for audio kernel {other}"),
+    });
+    #[cfg(not(feature = "gpu"))]
+    let wgsl = None::<&'static str>;
+
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    let msl = Some(match name {
+        "activations" => cera::backend::metal::shaders::ACTIVATIONS,
+        "conv2d_direct" => cera::backend::metal::shaders::CONV2D_DIRECT,
+        "transpose_blocked" => cera::backend::metal::shaders::TRANSPOSE_BLOCKED,
+        "glu_split" => cera::backend::metal::shaders::GLU_SPLIT,
+        "chan_affine_silu" => cera::backend::metal::shaders::CHAN_AFFINE_SILU,
+        "audio_xl_attention" => cera::backend::metal::shaders::AUDIO_XL_ATTENTION,
+        other => panic!("no MSL source registered for audio kernel {other}"),
+    });
+    #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
+    let msl = None::<&'static str>;
+
+    (wgsl, msl)
+}
+
+/// Every audio kernel's entry points must survive into each target this build
+/// actually emits.
+///
+/// These kernels ship in this change but only the Metal backend drives them; the
+/// WGSL halves sit inert until the wgpu audio encoder lands. An entry point
+/// silently missing from one target would therefore surface as a pipeline
+/// failure in a later change rather than here, which is exactly the drift this
+/// suite exists to prevent.
+///
+/// "Each target this build emits" and not "both": the sources are cfg'd, so a
+/// `--features metal` build has no WGSL to look at and a featureless one has
+/// neither. The gate below is what the wording change is really about. Without
+/// it this test ran in every configuration, and the featureless one CI runs
+/// twice (`cargo test --workspace` and `-p cera --no-default-features`) walked
+/// all six kernels, looked at nothing and reported a pass. Skipped in a build
+/// that emits no sources is honest; green there is not.
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+#[test]
+fn audio_kernel_entry_points_reach_every_enabled_target() {
+    // Only `activations` exposes entry points that differ from its basename; the
+    // rest are looked up by name, so the list stays derived from AUDIO_KERNELS.
+    let cases: Vec<(&str, Vec<&str>)> = AUDIO_KERNELS
+        .iter()
+        .map(|&name| match name {
+            "activations" => (
+                name,
+                vec!["relu_inplace", "silu_inplace", "gelu_erf_inplace"],
+            ),
+            _ => (name, vec![name]),
+        })
+        .collect();
+    let checked = cases
+        .iter()
+        .map(|(name, entries)| {
+            let (wgsl, msl) = audio_kernel_sources(name);
+            entries
+                .iter()
+                .map(|e| {
+                    if let Some(src) = wgsl {
+                        assert!(src.contains(e), "{name}.wgsl is missing entry point {e}");
+                    }
+                    if let Some(src) = msl {
+                        assert!(src.contains(e), "{name}.metal is missing entry point {e}");
+                    }
+                    usize::from(wgsl.is_some()) + usize::from(msl.is_some())
+                })
+                .sum::<usize>()
+        })
+        .sum::<usize>();
+
+    // Belt and braces behind the cfg gate, and not the same check restated: the
+    // gate says a source table should exist, this says entry points were actually
+    // compared. It is what still catches an emptied `AUDIO_KERNELS` or an entry
+    // list that lost its names, neither of which the cfg can see.
+    assert!(
+        checked > 0,
+        "checked no entry points at all, so this test proves nothing: \
+         AUDIO_KERNELS or the per-kernel entry lists are empty"
+    );
 }
 
 /// The conv tier is the first clean single-body port since Phase 1a: one body,

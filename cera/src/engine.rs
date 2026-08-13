@@ -268,6 +268,11 @@ pub struct CeraEngine {
     /// available). Shared into every session via `new_session`; sessions fall
     /// back to the CPU `vision_encoder` when this is `None`.
     gpu_vision_encoder: Option<Arc<dyn crate::model::vision_encoder_gpu::VisionGpuEncode>>,
+    /// Cached GPU audio encoder, built at construction when `audio_encoder` is
+    /// present and `cfg.backend` selects a GPU backend (and the device is
+    /// available). Shared into every session via `new_session`; sessions fall
+    /// back to the CPU `audio_encoder` when this is `None`.
+    gpu_audio_encoder: Option<Arc<dyn crate::model::audio_encoder_gpu::AudioGpuEncode>>,
 }
 
 impl CeraEngine {
@@ -629,6 +634,13 @@ impl CeraEngine {
         let gpu_vision_encoder = vision_encoder.as_ref().and_then(|w| {
             crate::model::vision_encoder_gpu::build_gpu_vision_encoder(w, cfg.backend)
         });
+        // Same deal for audio: uploading the Conformer weights once here keeps
+        // them off the per-utterance path. `None` (CPU encode) for `Cpu`,
+        // disabled features, device-init failure, or a model geometry the
+        // kernels cannot take.
+        let gpu_audio_encoder = audio_encoder
+            .as_ref()
+            .and_then(|w| crate::model::audio_encoder_gpu::build_gpu_audio_encoder(w, cfg.backend));
         Ok(Self {
             manifest,
             model,
@@ -639,6 +651,7 @@ impl CeraEngine {
             vision_encoder_gguf,
             vision_encoder,
             gpu_vision_encoder,
+            gpu_audio_encoder,
         })
     }
 
@@ -713,6 +726,11 @@ impl CeraEngine {
         // the CPU encoder for image input within the GPU kernel's capacity.
         if let Some(gpu) = &self.gpu_vision_encoder {
             session.attach_gpu_vision_encoder(Arc::clone(gpu));
+        }
+        // GPU audio encoder (if one was built); the session prefers it over the
+        // CPU encoder for PCM input the GPU kernels can take.
+        if let Some(gpu) = &self.gpu_audio_encoder {
+            session.attach_gpu_audio_encoder(Arc::clone(gpu));
         }
         Ok(session)
     }
@@ -860,6 +878,15 @@ impl CeraEngine {
     /// Primarily for tests/diagnostics — sessions auto-select the GPU path.
     pub fn has_gpu_vision_encoder(&self) -> bool {
         self.gpu_vision_encoder.is_some()
+    }
+
+    /// Whether a GPU audio encoder was built at construction (true when an audio
+    /// mmproj loaded, `cfg.backend` selected a supported GPU backend, and the
+    /// device was available). When false, PCM input falls back to the CPU
+    /// encoder. Primarily for tests/diagnostics; sessions auto-select the GPU
+    /// path.
+    pub fn has_gpu_audio_encoder(&self) -> bool {
+        self.gpu_audio_encoder.is_some()
     }
 
     /// Borrow the raw mmapped vision-encoder mmproj GGUF, if any.

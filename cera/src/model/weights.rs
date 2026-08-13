@@ -192,6 +192,30 @@ impl MmapWeight {
         }
     }
 
+    /// Dequantize the whole weight to a contiguous `[rows * cols]` f32 vector.
+    ///
+    /// F32 weights are copied directly; quantized dtypes go row by row through
+    /// [`Self::dequantize_row`]. This is what the GPU backends upload when they
+    /// have no packed GEMM kernel for the weight's dtype, so it lives here
+    /// rather than in one of them: both the vision and audio encoders make the
+    /// same packed-versus-dense decision and must not drift on the dense half.
+    pub fn to_dense_f32(&self) -> Vec<f32> {
+        if let Some(f) = self.try_as_f32() {
+            return f.to_vec();
+        }
+        // `chunks_exact_mut(0)` panics, so a degenerate zero-column weight has to
+        // short-circuit. Not reachable from a real GGUF, but this is a shared
+        // helper and the version it replaced returned empty rather than panicking.
+        if self.cols == 0 {
+            return Vec::new();
+        }
+        let mut out = vec![0f32; self.rows * self.cols];
+        for (r, chunk) in out.chunks_exact_mut(self.cols).enumerate() {
+            self.dequantize_row(r, chunk);
+        }
+        out
+    }
+
     /// `y = self · x` where `self` is `[rows × cols]` and `x` is
     /// `[cols]`. Routes through
     /// [`crate::backend::cpu::gemv_dispatch`], which has a per-

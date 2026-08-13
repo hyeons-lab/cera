@@ -14,13 +14,25 @@ slangc is present, so the `.slang` is the source of truth. CI byte-compares the
 committed outputs against what the pinned slangc produces, so a stale `.metal`
 or `.wgsl` fails the build rather than silently shipping to a device.
 
-**These are the production kernels.** The evaluation is over: with the three
+**These are the production kernels.** The evaluation is over: with the four
 exceptions below, every kernel here is what the backends dispatch, and the
 handwritten WGSL/MSL twins they replaced have been deleted. A wrong generated
 kernel is now a wrong kernel, which is why `tests/slang_multitarget_parity.rs`
 pins each one against the CPU reference.
 
 The exceptions, and why:
+
+- **The LFM2A audio-encoder tier is Metal-live and WGSL-inert.**
+  `conv2d_direct`, `transpose_blocked`, `glu_split`, `chan_affine_silu`,
+  `activations` and `audio_xl_attention` are dispatched by the Metal audio
+  encoder (`model/audio_encoder_gpu.rs`) and pinned numerically against the CPU
+  encoder by `tests/audio_encoder_metal_parity.rs`. Their WGSL halves are
+  generated, committed and drift-checked like everything else here, but nothing
+  dispatches them yet: the wgpu audio encoder is a later change. So for these
+  six, `slang_multitarget_parity.rs` carries only generation checks (entry points
+  present, no subgroup ops, no `enable f16`), and wiring wgpu means adding
+  numeric cases, not just an ops impl. They are written as one source rather than
+  handwritten pairs precisely so that is the only work left.
 
 - `elementwise.slang` covers all four entry points `elementwise.wgsl` has, but
   only four of the eight in `elementwise.metal`. The other four (`memcpy_f32`,

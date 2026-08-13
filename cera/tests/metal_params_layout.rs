@@ -445,6 +445,36 @@ fn slang_cases() -> Vec<(usize, &'static str, &'static str)> {
             include_str!("../src/backend/shaders/slang/argmax_f32.slang"),
             "ArgmaxParams",
         ),
+        (
+            size_of::<ElementwiseParams>(),
+            include_str!("../src/backend/shaders/slang/activations.slang"),
+            "ElementwiseParams (activations)",
+        ),
+        (
+            size_of::<Conv2dDirectParams>(),
+            include_str!("../src/backend/shaders/slang/conv2d_direct.slang"),
+            "Conv2dDirectParams",
+        ),
+        (
+            size_of::<TransposeBlockedParams>(),
+            include_str!("../src/backend/shaders/slang/transpose_blocked.slang"),
+            "TransposeBlockedParams",
+        ),
+        (
+            size_of::<Batch2dParams>(),
+            include_str!("../src/backend/shaders/slang/glu_split.slang"),
+            "Batch2dParams (glu_split)",
+        ),
+        (
+            size_of::<Batch2dParams>(),
+            include_str!("../src/backend/shaders/slang/chan_affine_silu.slang"),
+            "Batch2dParams (chan_affine_silu)",
+        ),
+        (
+            size_of::<AudioXlAttnParams>(),
+            include_str!("../src/backend/shaders/slang/audio_xl_attention.slang"),
+            "AudioXlAttnParams",
+        ),
     ]
 }
 

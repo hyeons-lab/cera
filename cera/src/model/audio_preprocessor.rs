@@ -135,6 +135,29 @@ pub fn build_hann_window(length: usize) -> Vec<f32> {
     w
 }
 
+/// Number of STFT frames [`log_mel_spectrogram`] will produce for `n_samples`
+/// input samples, without computing the spectrogram.
+///
+/// Derived from the **padded** sample length, matching the C++ reference's
+/// `out.n_len = (n_samples_padded - frame_size) / hop + 1`. Exposed so a caller
+/// that has to decide something about the frame count before paying for the STFT
+/// (the GPU encoder checks its attention kernel's capacity this way) does not
+/// have to restate the formula and risk drifting from it.
+pub fn n_frames_for(n_samples: usize) -> usize {
+    if n_samples == 0 {
+        return 0;
+    }
+    let n_samples_padded = match n_samples.checked_add(2 * (N_FFT / 2)) {
+        Some(v) => v,
+        None => return 0,
+    };
+    if n_samples_padded < N_FFT {
+        0
+    } else {
+        (n_samples_padded - N_FFT) / HOP_LEN + 1
+    }
+}
+
 /// Compute the LFM2A log-mel spectrogram of a mono PCM chunk
 /// sampled at `SAMPLE_RATE` (16 kHz). Output is row-major
 /// `[n_frames × n_mel_bins]` ready to feed into
@@ -205,11 +228,12 @@ pub fn log_mel_spectrogram(pcm: &[f32], n_mel_bins: usize) -> (Vec<f32>, usize) 
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(N_FFT);
 
-    let n_frames = if n_samples_padded < N_FFT {
-        0
-    } else {
-        (n_samples_padded - N_FFT) / HOP_LEN + 1
-    };
+    // Single source for the frame count: `n_frames_for` is what the GPU encoder
+    // consults to size its capacity check before paying for this function, so a
+    // second copy of the formula here is exactly the drift that would break it.
+    // (No post-condition assert: restating the same expression against the same
+    // inputs cannot fail, it can only look like a guard.)
+    let n_frames = n_frames_for(n_samples_in);
     if n_frames == 0 {
         return (Vec::new(), 0);
     }
@@ -401,6 +425,28 @@ mod tests {
             max - min > 0.01,
             "mel output has no variation (min={min}, max={max})"
         );
+    }
+
+    /// `n_frames_for` must agree with what `log_mel_spectrogram` actually
+    /// returns, at every boundary.
+    ///
+    /// The GPU encoder decides whether a chunk fits its attention kernel from
+    /// `n_frames_for` alone, *before* paying for the STFT, so a disagreement here
+    /// is either a needless CPU fallback or a capacity guard consulted with the
+    /// wrong number. Sweeps zero, sub-hop, exact-hop and multi-hop lengths
+    /// because the closed form only stays equal to the padded-length arithmetic
+    /// while `N_FFT / 2 * 2 == N_FFT`.
+    #[test]
+    fn n_frames_for_matches_log_mel_spectrogram() {
+        for n in [0usize, 1, 159, 160, 161, 320, 1599, 1600, 16000] {
+            let pcm = vec![0.1f32; n];
+            let (_, actual) = log_mel_spectrogram(&pcm, 8);
+            assert_eq!(
+                n_frames_for(n),
+                actual,
+                "n_frames_for({n}) disagrees with log_mel_spectrogram"
+            );
+        }
     }
 
     /// Empty input returns an empty vec without panicking.
