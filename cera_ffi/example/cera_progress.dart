@@ -66,8 +66,12 @@ Future<void> main(List<String> args) async {
   final repo = BundleRepo.withProgress(storeDir, sink);
   print('BundleRepo.withProgress constructed OK; downloading…');
 
+  // Declared out here so the `finally` can reach it: a handle assigned inside
+  // the `try` is out of scope by then, which is how a load that throws midway
+  // leaves an engine open.
+  CeraEngine? engine;
   try {
-    final engine = await CeraEngine.fromBundleIdAsync(
+    engine = await CeraEngine.fromBundleIdAsync(
       bundleId,
       quant,
       EngineConfig(
@@ -77,11 +81,21 @@ Future<void> main(List<String> args) async {
       ),
     );
     print('fromBundleIdAsync loaded the model; ${sink.calls} progress events');
-    engine.close();
   } catch (e) {
     // A network or HTTP failure, or a bundle id / quant that does not exist.
     // The sink can no longer abort, so this is never the expected path.
     print('fromBundleIdAsync failed: ${e.runtimeType}: $e');
+  } finally {
+    // Closed explicitly rather than left to the finalizer, and that matters
+    // here twice over. `exit` below runs no finalizers at all, so nothing else
+    // would ever release these. And closing `repo` AFTER passing it into
+    // `EngineConfig` is the thing this example exists to check: the generated
+    // writer clones the handle at the record boundary, so the Dart object still
+    // owns a reference and this is a plain free. Without that clone it was a
+    // second free of a slot Rust had already released, which is a use-after-free
+    // whose crash lands wherever the runtime next hands that slot out.
+    engine?.close();
+    repo.close();
   }
   exit(0);
 }

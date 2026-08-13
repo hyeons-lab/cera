@@ -55,12 +55,28 @@ if [ -z "$repo" ] || [ -z "$rev" ] || [ -z "$subdir" ]; then
   exit 1
 fi
 
+# Expand the series once, here, instead of writing the glob at each of the four
+# places that need it. An unmatched bare glob is left as a literal by bash, and
+# every one of those places then fails its own way: `cat` writes to stderr and
+# hands `shasum` an empty stream, so the stamp silently hashes nothing; the
+# apply loop below runs once on a literal `*.patch` and blames the patch. An
+# empty series is a legitimate state (it is what upstreaming all of them looks
+# like), so give it one explicit answer rather than four accidental ones.
+shopt -s nullglob
+patches=("$vendor"/patches/*.patch)
+shopt -u nullglob
+
 # The stamp covers the WHOLE pin and the patches, so editing either rebuilds
 # without anyone having to remember --force. `repo` and `subdir` are in there
 # alongside `rev`: keying on the rev alone meant repointing the pin at a
 # different repo or a different crate left the stamp valid, and the script
 # happily reported "up to date" over a build/ materialized from the old one.
-want="$repo $rev $subdir $(cat "$vendor"/patches/*.patch | shasum -a 256 | cut -d' ' -f1)"
+if [ "${#patches[@]}" -eq 0 ]; then
+  patch_hash="none"
+else
+  patch_hash="$(cat "${patches[@]}" | shasum -a 256 | cut -d' ' -f1)"
+fi
+want="$repo $rev $subdir $patch_hash"
 
 # Recover a parked cargo target directory before doing anything else. The
 # rebuild below moves `build/target` aside and back, so an interrupted run (a
@@ -74,7 +90,7 @@ if [ -d "$cargo_target" ] && [ ! -d "$build/target" ] && [ -d "$build" ]; then
 fi
 
 if [ "$force" -eq 0 ] && [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$want" ]; then
-  echo "generator up to date ($tag, $(ls "$vendor"/patches/*.patch | wc -l | tr -d ' ') patches)"
+  echo "generator up to date ($tag, ${#patches[@]} patches)"
   exit 0
 fi
 
@@ -127,7 +143,7 @@ if [ -n "$tag" ]; then
   fi
 fi
 
-echo "materializing $tag ($rev) + $(ls "$vendor"/patches/*.patch | wc -l | tr -d ' ') patches…"
+echo "materializing $tag ($rev) + ${#patches[@]} patches…"
 # Keep cargo's output across the rebuild. Editing a patch is the documented
 # inner loop, and wiping `build/target` with the sources turns each iteration
 # into a full recompile of the generator's dependency tree.
@@ -157,7 +173,13 @@ git -C "$cache" archive "$rev" "$subdir" | tar -x -C "$build" --strip-components
 # applied at that point; no stamp is written on the failure path, so the next
 # run wipes build/ and starts over rather than layering onto the remains.
 build_rel="${build#"$root"/}"
-for patch in "$vendor"/patches/*.patch; do
+if [ "${#patches[@]}" -eq 0 ]; then
+  echo "  no patches; building upstream as pinned"
+fi
+# `${patches[@]+...}` rather than a bare `"${patches[@]}"`: this is bash 3.2 on
+# macOS, where expanding an empty array under `set -u` is an unbound-variable
+# error rather than zero iterations.
+for patch in ${patches[@]+"${patches[@]}"}; do
   if ! git -C "$root" apply --directory="$build_rel" -p1 --check "$patch" 2>/dev/null; then
     echo "error: $(basename "$patch") does not apply to $tag." >&2
     echo "       Upstream moved under it, or an earlier patch changed shape." >&2
@@ -174,7 +196,8 @@ done
 # the flatten patch did not land, the crate still inherits from a workspace
 # that is not there and the build fails much later with an unrelated message.
 if ! grep -q '^\[workspace\]' "$build/Cargo.toml" 2>/dev/null; then
-  echo "error: build/Cargo.toml has no [workspace] table; patches did not apply." >&2
+  echo "error: build/Cargo.toml has no [workspace] table." >&2
+  echo "       The flatten patch did not land, or the series no longer carries one." >&2
   exit 1
 fi
 
