@@ -895,11 +895,16 @@ impl WgpuAudioDecoder {
     /// after readback. Runs once at end-of-generation, so the frame-sized
     /// scratch is allocated per call rather than persisted.
     pub fn istft_to_pcm(&self, spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f32> {
-        debug_assert_eq!(n_fft, self.cfg.n_fft, "istft n_fft differs from config");
-        debug_assert_eq!(
-            hop_length, self.cfg.hop_length,
-            "istft hop differs from config"
-        );
+        // `idft_basis` and `hann` are built once from `self.cfg`, but every
+        // buffer below is sized from these arguments, so a mismatch does not
+        // compute a different transform: it indexes a basis that is the wrong
+        // shape for the buffers around it. This was a `debug_assert`, which is
+        // compiled out of exactly the builds that run this. The CPU
+        // implementation takes both as parameters and is tied to neither, so
+        // hand the call over rather than refuse it.
+        if n_fft != self.cfg.n_fft || hop_length != self.cfg.hop_length {
+            return crate::model::audio_decoder::istft_to_pcm(spectrum, n_fft, hop_length);
+        }
         let bins = n_fft / 2 + 1;
         let frame_size = bins * 2;
         let n_frames = spectrum.len() / frame_size;

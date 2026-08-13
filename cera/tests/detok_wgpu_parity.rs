@@ -270,6 +270,47 @@ fn gpu_istft_matches_cpu() {
     eprintln!("gpu_istft_matches_cpu: PASSED");
 }
 
+/// `istft_to_pcm` takes `n_fft` and `hop_length` as arguments but resolves the
+/// iDFT basis and the Hann window from the config it was built with, so the two
+/// have to agree or the kernels index a basis the surrounding buffers are not
+/// shaped for. The guard hands a mismatch to the CPU implementation, which is
+/// parameterized on both and tied to neither.
+///
+/// Worth a test rather than trusting the branch: the same condition was a
+/// `debug_assert` first, which is to say it held in every build except the ones
+/// that run this code.
+#[test]
+fn istft_with_a_foreign_config_falls_back_to_cpu() {
+    if !gpu_available() {
+        return;
+    }
+    let Some((gguf, path)) = load_vocoder() else {
+        return;
+    };
+    let gpu = cera::model::wgpu_audio_decoder::WgpuAudioDecoder::from_gguf(&gguf, &path).unwrap();
+
+    // Half the configured n_fft, so the frames are a different size and the
+    // basis is emphatically the wrong shape for them. Synthetic rather than
+    // detokenized: no real spectrum has this geometry, which is the point.
+    let n_fft = 64;
+    let hop = 16;
+    let frame_size = (n_fft / 2 + 1) * 2;
+    let spectrum: Vec<f32> = (0..frame_size * 5)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+        .collect();
+
+    let want = cera::model::audio_decoder::istft_to_pcm(&spectrum, n_fft, hop);
+    let got = gpu.istft_to_pcm(&spectrum, n_fft, hop);
+
+    // Bit-exact, not approximate: falling back means running the very function
+    // `want` came from. Anything else here is the GPU path having accepted a
+    // geometry it cannot serve.
+    assert_eq!(
+        got, want,
+        "a foreign n_fft/hop must fall back to the CPU ISTFT verbatim"
+    );
+}
+
 #[test]
 fn multi_frame_stability() {
     if !gpu_available() {

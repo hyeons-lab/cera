@@ -939,11 +939,14 @@ impl MetalAudioDecoder {
     /// after readback. Runs once at end-of-generation, so the frame-sized scratch
     /// is allocated per call rather than persisted.
     pub fn istft_to_pcm(&self, spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f32> {
-        debug_assert_eq!(n_fft, self.cfg.n_fft, "istft n_fft differs from config");
-        debug_assert_eq!(
-            hop_length, self.cfg.hop_length,
-            "istft hop differs from config"
-        );
+        // Same config tie as the WGPU twin: `idft_basis` and `hann` come from
+        // `self.cfg` while every buffer below is sized from these arguments, so
+        // a mismatch reads a basis of the wrong shape rather than computing a
+        // different transform. `debug_assert` covered only the builds least
+        // likely to run this. The CPU implementation is tied to neither.
+        if n_fft != self.cfg.n_fft || hop_length != self.cfg.hop_length {
+            return crate::model::audio_decoder::istft_to_pcm(spectrum, n_fft, hop_length);
+        }
         let bins = n_fft / 2 + 1;
         let frame_size = bins * 2;
         let n_frames = spectrum.len() / frame_size;
@@ -976,16 +979,21 @@ impl MetalAudioDecoder {
         enc.dispatch_thread_groups(sz1d(((n_frames * bins) as u64).div_ceil(256)), sz1d(256));
         self.barrier(enc);
 
-        // 2. iDFT as a matmul, one gemv per frame over the shared basis (frame
-        // offsets into halfspec/time_domain, mirroring the lin-head loop above).
+        // 2. iDFT as a matmul, one gemv per frame over the shared basis, frame
+        // offsets indexing into halfspec/time_domain.
+        //
+        // The pipeline and the two basis bindings are set once, outside the
+        // loop: encoder state persists across dispatches, and only the frame
+        // offsets change. The lin-head loop above does rebind every pass, but
+        // that is not a convention to copy — it interleaves memcpy, rmsnorm and
+        // add_inplace between its gemvs, so its bindings really are clobbered.
+        // This is an unbroken run of one kernel.
+        enc.set_compute_pipeline_state(&self.pipes.gemv_f32);
+        enc.set_buffer(0, Some(&self.idft_basis.buf), 0);
+        enc.set_buffer(3, Some(&self.idft_basis.params_buf), 0);
         for f in 0..n_frames {
-            let x_off = (f * frame_size * 4) as u64;
-            let y_off = (f * n_fft * 4) as u64;
-            enc.set_compute_pipeline_state(&self.pipes.gemv_f32);
-            enc.set_buffer(0, Some(&self.idft_basis.buf), 0);
-            enc.set_buffer(1, Some(&halfspec), x_off);
-            enc.set_buffer(2, Some(&time_domain), y_off);
-            enc.set_buffer(3, Some(&self.idft_basis.params_buf), 0);
+            enc.set_buffer(1, Some(&halfspec), (f * frame_size * 4) as u64);
+            enc.set_buffer(2, Some(&time_domain), (f * n_fft * 4) as u64);
             enc.dispatch_thread_groups(sz1d(self.idft_basis.m as u64), sz1d(32));
         }
         self.barrier(enc);

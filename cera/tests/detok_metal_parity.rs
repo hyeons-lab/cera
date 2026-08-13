@@ -197,6 +197,36 @@ fn gpu_istft_matches_cpu() {
     eprintln!("gpu_istft_matches_cpu: PASSED");
 }
 
+/// The WGPU twin of this is in `detok_wgpu_parity.rs`; same reasoning.
+///
+/// `istft_to_pcm` takes `n_fft` and `hop_length` as arguments but resolves the
+/// iDFT basis and the Hann window from the config it was built with, so a
+/// mismatch indexes a basis the surrounding buffers are not shaped for. The
+/// guard hands those calls to the CPU implementation, which is parameterized on
+/// both. It was a `debug_assert` first, i.e. it held everywhere except the
+/// builds that run this code.
+#[test]
+fn istft_with_a_foreign_config_falls_back_to_cpu() {
+    let Some((gguf, path)) = load_vocoder() else {
+        return;
+    };
+    let gpu = cera::model::metal_audio_decoder::MetalAudioDecoder::from_gguf(&gguf, &path).unwrap();
+
+    let n_fft = 64;
+    let hop = 16;
+    let frame_size = (n_fft / 2 + 1) * 2;
+    let spectrum: Vec<f32> = (0..frame_size * 5)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+        .collect();
+
+    let want = cera::model::audio_decoder::istft_to_pcm(&spectrum, n_fft, hop);
+    let got = gpu.istft_to_pcm(&spectrum, n_fft, hop);
+    assert_eq!(
+        got, want,
+        "a foreign n_fft/hop must fall back to the CPU ISTFT verbatim"
+    );
+}
+
 // ── Test 2: PCM parity ──────────────────────────────────────────────────────
 
 #[test]
