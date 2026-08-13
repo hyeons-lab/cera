@@ -764,10 +764,13 @@ impl GgufFile {
     /// weights stacked into one rank-3 `[ne0, ne1, n_expert]` tensor, e.g.
     /// `blk.2.ffn_gate_exps.weight` with shape `[2048, 1792, 32]`. Expert `e`'s
     /// slice is the contiguous `[ne0, ne1]` sub-tensor at element offset
-    /// `e * ne0 * ne1`, so it can be addressed as an ordinary 2D weight and fed
-    /// to the existing GEMV kernels unchanged: no expert-aware kernel variants,
-    /// and quantized dtypes keep working because every supported block type
-    /// divides `ne0` evenly.
+    /// `e * ne0 * ne1`, so it can be addressed as an ordinary 2D weight, and
+    /// quantized dtypes keep working because every supported block type divides
+    /// `ne0` evenly. On CPU that is the whole story: the existing GEMV kernels
+    /// take an expert's slice unchanged. The GPU backends do have expert-aware
+    /// kernels, because routing happens on the device and the slice has to be
+    /// chosen inside the shader, but they choose it with the same stride this
+    /// offset defines.
     ///
     /// Rank-3 is rejected by `tensor_meta` rather than handled there: a stacked
     /// expert tensor has no single meaningful `(rows, cols)`, and silently

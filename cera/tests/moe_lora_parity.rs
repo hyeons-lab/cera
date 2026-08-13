@@ -29,6 +29,7 @@ use std::sync::Arc;
 mod common;
 
 use common::hidden_states_with_lora as run;
+use common::write_lora_gguf as write_gguf;
 
 use cera::gguf::GgufFile;
 use cera::kv_cache::InferenceState;
@@ -40,43 +41,6 @@ fn model_path() -> Option<PathBuf> {
         .ok()
         .map(PathBuf::from)?;
     (p.exists() && GgufFile::open(&p).is_ok()).then_some(p)
-}
-
-/// Append a GGUF length-prefixed string.
-fn push_str(out: &mut Vec<u8>, s: &str) {
-    out.extend_from_slice(&(s.len() as u64).to_le_bytes());
-    out.extend_from_slice(s.as_bytes());
-}
-
-/// Serialize a minimal GGUF v3 adapter of F32 tensors. Each entry is
-/// `(name, ne, data)` with `ne` fastest-varying first, GGUF's own order.
-fn write_gguf(tensors: &[(String, Vec<usize>, Vec<f32>)], alpha: f32) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"GGUF");
-    out.extend_from_slice(&3u32.to_le_bytes());
-    out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-    out.extend_from_slice(&1u64.to_le_bytes());
-    push_str(&mut out, "adapter.lora.alpha");
-    out.extend_from_slice(&6u32.to_le_bytes()); // GGUF_TYPE_FLOAT32
-    out.extend_from_slice(&alpha.to_le_bytes());
-
-    let mut offset = 0u64;
-    for (name, ne, data) in tensors {
-        push_str(&mut out, name);
-        out.extend_from_slice(&(ne.len() as u32).to_le_bytes());
-        ne.iter()
-            .for_each(|&d| out.extend_from_slice(&(d as u64).to_le_bytes()));
-        out.extend_from_slice(&0u32.to_le_bytes()); // GGML_TYPE_F32
-        out.extend_from_slice(&offset.to_le_bytes());
-        offset += (data.len() * 4) as u64;
-    }
-    while !out.len().is_multiple_of(32) {
-        out.push(0);
-    }
-    for (_, _, data) in tensors {
-        out.extend(data.iter().flat_map(|x| x.to_le_bytes()));
-    }
-    out
 }
 
 const RANK: usize = 4;

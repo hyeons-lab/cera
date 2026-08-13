@@ -218,7 +218,8 @@ CERA_FFI_LIB=../target/debug/libcera_ffi.dylib \
 ```
 
 Supported architectures match the engine: `lfm2`/`lfm2.5` (incl. vision and
-audio), `llama` (incl. classic Mistral), `qwen2`/`qwen3`, `granite`.
+audio), `lfm2moe` (routed mixture-of-experts), `llama` (incl. classic Mistral),
+`qwen2`/`qwen3`, `granite`.
 
 > The callback vtable's static `NativeCallable`s keep the isolate alive, so a
 > CLI script must `exit()` explicitly (the examples do); a Flutter app stays

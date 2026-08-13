@@ -34,6 +34,7 @@ of these architectures loads:
 | Architecture | Models | Modalities |
 |--------------|--------|------------|
 | `lfm2` | Liquid **LFM2 / LFM2.5** (the canonical LeapBundles family) | text, vision, audio |
+| `lfm2moe` | Liquid **LFM2.5-8B-A1B** (routed mixture-of-experts) | text |
 | `llama` | **LLaMA 2 / 3**, and classic **Mistral 7B** (ships as GGUF arch `llama`) | text |
 | `qwen2`, `qwen3` | **Qwen2 / Qwen2.5 / Qwen3** | text |
 | `granite` | **IBM Granite 3.x**, and the dense **Granite 4.1** line (3b / 8b / 30b) | text |
@@ -48,6 +49,17 @@ wgpu), with single-token decode and prompt prefill on each. Prefill uses
 batched-GEMM (each weight read once for the whole prompt) on every backend and
 architecture, including CPU for both LFM2 and the dense transformers, with a
 tiled flash-attention path that kicks in for long prompts.
+
+`lfm2moe`'s routed feed-forward block is the one exception to that
+batched-GEMM sentence, and it is deliberate: each token picks its own 4-of-32
+experts, so an expert's weights are re-read once per routed token rather than
+once per prompt. (The GPU backends still issue one dispatch per projection for
+the whole chunk, not one per token; what they do not do is share a weight row
+between two tokens that chose the same expert.) Grouping tokens by expert is a
+follow-up, kept separate from getting the routing arithmetic right. On the two GPU backends its expert kernels
+are also Q4_0-only, and its routed-FFN LoRA targets (the router and the
+per-expert projections) apply on CPU only: an adapter carrying them is refused
+rather than half-applied.
 
 ### Modalities
 
@@ -176,7 +188,10 @@ README for the API surface.
 delta is applied at inference time (`y += scale·B·(A·x)`), **never merged into the
 weights**, so the base model stays quantized and adapters hot-swap / unload per
 request at ~no cost. Runs on **CPU, Metal, and wgpu** (batched-GEMM prefill +
-decode) and is dimension-checked against the model at attach.
+decode) and is dimension-checked against the model at attach. The one gap is
+`lfm2moe`'s routed-FFN targets, which apply on CPU only; on a GPU backend such an
+adapter is refused with `CeraError::LoraUnsupportedByBackend` rather than
+partially applied.
 
 **Hidden-states extraction.** Pull the per-token last-layer hidden state
 (post-final-RMSNorm, the llama.cpp `--pooling none` vector) straight out of the

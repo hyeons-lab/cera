@@ -290,6 +290,16 @@ pub enum CeraError {
     InvalidToken { id: u32, vocab_size: u32 },
     #[error("LoRA adapter incompatible with this model: {0}")]
     LoraDimMismatch(String),
+    /// The adapter is well-formed and its dimensions fit the model, but the
+    /// active backend has no hook for one of the targets it adapts.
+    ///
+    /// Distinct from [`CeraError::LoraDimMismatch`] because the remedy is
+    /// different and a caller can act on it: nothing about the adapter or the
+    /// model needs changing, only the backend it runs on. Today the one case is
+    /// a routed feed-forward delta (the router or the per-expert factors) on a
+    /// GPU backend, which the CPU backend applies.
+    #[error("LoRA adapter not supported by this backend: {0}")]
+    LoraUnsupportedByBackend(String),
     #[error("backend: {0}")]
     Backend(String),
     #[error("out of memory: could not allocate {requested_bytes} bytes")]
@@ -717,6 +727,10 @@ impl Session {
     /// The adapter's dimensions are validated against the model up front, so an
     /// adapter built for a different model is rejected with
     /// [`CeraError::LoraDimMismatch`] rather than silently corrupting output.
+    /// An adapter that fits the model but targets something this backend cannot
+    /// apply is rejected separately, with
+    /// [`CeraError::LoraUnsupportedByBackend`], since that one is fixed by
+    /// changing backend rather than by changing the adapter.
     ///
     /// Note: this only affects tokens processed **after** the call — it does not
     /// retroactively re-adapt KV already in the cache. Attach before prefilling
@@ -728,6 +742,17 @@ impl Session {
         adapters
             .validate_dims(self.model.config())
             .map_err(|e| CeraError::LoraDimMismatch(e.to_string()))?;
+        // Routed-FFN deltas have no hook on the GPU backends. Both the router
+        // and the per-expert factors would upload without complaint and then
+        // never be applied, which is an adapter that quietly does part of its
+        // job, so refuse the whole thing here.
+        if adapters.has_moe_deltas() && !self.model.supports_moe_lora() {
+            return Err(CeraError::LoraUnsupportedByBackend(
+                "the adapter carries mixture-of-experts deltas (router and/or per-expert \
+                 factors) and this backend has no routed-FFN hooks; the CPU backend applies them"
+                    .to_string(),
+            ));
+        }
         self.lora = Some(adapters);
         self.state.lora = self.lora.clone();
         Ok(())

@@ -1215,6 +1215,21 @@ pub mod shaders {
     /// Each branch's binding set is dropped for the other target.
     /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
     pub const RMSNORM: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm.wgsl"));
+    /// Mixture-of-experts routing (`lfm2moe`), generated from
+    /// `shaders/slang/moe_route.slang` and shared with the Metal backend.
+    ///
+    /// Dispatched by `GpuLfm2Model::moe_ffn_steps` for every routed layer.
+    /// `tests/slang_multitarget_parity.rs` pins the generated WGSL against the
+    /// CPU reference, including exact expert-id agreement on a fixture whose
+    /// biases land ties on the top-k boundary.
+    pub const MOE_ROUTE: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_route.wgsl"));
+    /// Expert-indexed Q4_0 GEMV, generated from
+    /// `shaders/slang/moe_gemv_q4_0.slang`. See [`MOE_ROUTE`] on where these are
+    /// dispatched and what pins them.
+    pub const MOE_GEMV_Q4_0: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_gemv_q4_0.wgsl"));
+    /// Weighted sum of a token's expert outputs, generated from
+    /// `shaders/slang/moe_combine.slang`. See [`MOE_ROUTE`].
+    pub const MOE_COMBINE: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_combine.wgsl"));
     /// Two kernels (`rmsnorm_batch` + `add_rmsnorm_batch`), generated from
     /// `shaders/slang/rmsnorm_batch.slang` by build.rs and shared with the Metal
     /// backend's `metal::shaders::RMSNORM_BATCH`. A

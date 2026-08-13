@@ -139,6 +139,7 @@ const SLANG_MULTI_KERNELS: &[&str] = &[
     "conv1d",
     "conv1d_fused",
     "conv1d_fused_batch",
+<<<<<<< HEAD
     "exp_polar",
     "overlap_add",
     "activations",
@@ -151,6 +152,9 @@ const SLANG_MULTI_KERNELS: &[&str] = &[
     "power_spec",
     "mel_project",
     "mel_norm",
+    "moe_route",
+    "moe_gemv_q4_0",
+    "moe_combine",
 ];
 
 /// Compile each multi-target kernel to the shader languages the enabled

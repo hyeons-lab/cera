@@ -134,6 +134,17 @@ impl LoraTarget {
         )
     }
 
+    /// Whether this target only exists on a routed (mixture-of-experts) layer.
+    ///
+    /// Wider than [`Self::is_expert`] by exactly the router, `ffn_gate_inp`,
+    /// which is not a stacked tensor but is just as meaningless on a dense
+    /// layer. Shared by `validate_dims` and
+    /// [`LoraAdapterWeights::has_moe_deltas`] so the set cannot drift between
+    /// them.
+    fn is_routed_ffn(self) -> bool {
+        self.is_expert() || self == LoraTarget::FfnGateInp
+    }
+
     /// The GGUF base-weight stem, e.g. `attn_q` in `blk.N.attn_q.weight`.
     fn gguf_stem(self) -> &'static str {
         match self {
@@ -287,17 +298,21 @@ impl LoraAdapterWeights {
         }
     }
 
-    /// Whether any layer carries a per-expert delta.
+    /// Whether any layer carries a delta only the routed-FFN path can apply:
+    /// the router projection or a per-expert factor.
     ///
-    /// For backends with no expert kernels: [`Self::get`] returns `None` for an
-    /// expert target by design, so a per-target upload loop skips those deltas
-    /// without a word. This lets such a loop assert it is not silently dropping
-    /// half an adapter.
-    pub fn has_expert_deltas(&self) -> bool {
+    /// Both halves go missing in different ways on a backend without those
+    /// hooks, which is why one predicate covers them. [`Self::get`] returns
+    /// `None` for an expert target by design, so a per-target upload loop skips
+    /// per-expert factors without a word. The router is worse: structurally it
+    /// is an ordinary dense target, so the same loop uploads it happily and
+    /// then never reaches a hook that would apply it. Such a backend rejects
+    /// the whole adapter on this rather than running a silently partial one.
+    pub fn has_moe_deltas(&self) -> bool {
         self.layers.iter().any(|l| {
             LoraTarget::ALL
                 .into_iter()
-                .filter(|t| t.is_expert())
+                .filter(|t| t.is_routed_ffn())
                 .any(|t| l.targets[t.index()].is_some())
         })
     }
@@ -358,7 +373,7 @@ impl LoraAdapterWeights {
                          block, but that layer is mixture-of-experts; it needs the stacked \
                          per-expert tensors (`ffn_*_exps.weight.lora_{{a,b}}`)"
                     ),
-                    (t, false) if t.is_expert() || t == LoraTarget::FfnGateInp => bail!(
+                    (t, false) if t.is_routed_ffn() => bail!(
                         "LoRA target {target:?} on layer {layer} adapts a mixture-of-experts \
                          feed-forward block, but that layer is dense"
                     ),
@@ -1646,6 +1661,37 @@ mod tests {
                 is_moe_layer: vec![false, false, true, true],
             }),
         }
+    }
+
+    /// `has_moe_deltas` covers both halves of "only the routed FFN can apply
+    /// this", and the router is the half worth a test.
+    ///
+    /// A per-expert factor is at least *structurally* distinct, so a backend
+    /// without expert kernels skips it (`get` returns `None` for an expert
+    /// target). The router is an ordinary dense target with ordinary dims, so
+    /// nothing about its shape stops a per-target upload loop from taking it
+    /// and then never applying it. If this predicate ever stopped covering
+    /// `FfnGateInp`, `Session::attach_lora_adapters` would start admitting
+    /// router adapters onto backends that silently drop them, and no output
+    /// would look wrong.
+    #[test]
+    fn has_moe_deltas_covers_the_router_and_the_experts() {
+        assert!(
+            adapter_for(0, LoraTarget::FfnGateInp, 8, 4, 1).has_moe_deltas(),
+            "a router delta is a routed-FFN delta"
+        );
+        assert!(
+            adapter_for(0, LoraTarget::FfnGateExps, 8, 16, 3).has_moe_deltas(),
+            "a per-expert delta is a routed-FFN delta"
+        );
+        assert!(
+            !adapter_for(0, LoraTarget::FfnGate, 8, 16, 1).has_moe_deltas(),
+            "a dense FFN delta must not trip the gate; every GPU backend applies it"
+        );
+        assert!(
+            !adapter_for(0, LoraTarget::AttnQ, 8, 8, 1).has_moe_deltas(),
+            "an attention delta must not trip the gate"
+        );
     }
 
     /// Build a one-layer adapter carrying `target` with the given dims, for

@@ -97,9 +97,12 @@ pub(crate) enum FfnRefs {
 impl FfnRefs {
     /// The dense projections, or an error naming the layer when it is MoE.
     ///
-    /// For paths that have no expert implementation yet (the GPU weight-source
-    /// accessors): better a named failure than a silent fallback onto the wrong
-    /// weights.
+    /// Every backend now implements experts, so this is no longer a
+    /// not-yet-supported path: it is the accessor a caller reaches for once it
+    /// has established the layer is dense, and the error is what keeps a caller
+    /// that has *not* from silently falling back onto the wrong weights. Both
+    /// GPU loaders ask `GpuWeightSource::moe_refs` first for exactly that
+    /// reason.
     pub fn dense(&self) -> Result<&DenseFfnRefs> {
         match self {
             Self::Dense(d) => Ok(d),
@@ -364,7 +367,7 @@ impl Lfm2Model {
         let n_kv_heads = kv_heads_per_layer.iter().copied().max().unwrap_or(0);
 
         // Which layers route through experts. Read from tensor presence, the
-        // same way block types are, rather than from `leading_dense_block_count`
+        // same way block types are, rather than from `leading_dense_block_count`.
         // A metadata/tensor disagreement then fails at weight resolution with
         // a missing-tensor name instead of silently running the wrong FFN.
         let moe_layers: Vec<bool> = (0..n_layers)
@@ -3080,6 +3083,13 @@ impl Model for Lfm2Model {
         true
     }
 
+    /// The CPU path is the one backend with routed-FFN LoRA hooks: the router
+    /// delta feeds `select_experts` and the per-expert factors are applied to
+    /// the selected expert's projections, both pinned by `moe_lora_parity`.
+    fn supports_moe_lora(&self) -> bool {
+        true
+    }
+
     fn f16_kv_supported(&self) -> bool {
         true
     }
@@ -3516,6 +3526,12 @@ impl crate::model::gpu_weight_source::GpuWeightSource for Lfm2Model {
     }
     fn ffn_down_ref(&self, layer: usize) -> Result<&WeightRef> {
         Ok(&self.layer_refs[layer].ffn.dense()?.down)
+    }
+    fn moe_refs(&self, layer: usize) -> Option<&MoeFfnRefs> {
+        match &self.layer_refs[layer].ffn {
+            FfnRefs::Dense(_) => None,
+            FfnRefs::Moe(m) => Some(m),
+        }
     }
     fn conv_in_proj_ref(&self, layer: usize) -> Option<&WeightRef> {
         self.layer_refs[layer].shortconv_in_proj.as_ref()

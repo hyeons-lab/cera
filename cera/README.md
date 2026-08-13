@@ -42,6 +42,23 @@ error.
   Exhaustive `match`es over `CeraError` need a new arm. This is the one item
   here that changes runtime behavior: that call used to succeed silently and
   corrupt the prefix cache.
+- **`CeraError` also gained `LoraUnsupportedByBackend`**: an adapter that is
+  well-formed and dimensionally valid, but adapts a target the active backend has
+  no hook for. Today that is exactly the routed mixture-of-experts targets (the
+  router and the per-expert projections) on the two GPU backends, which the CPU
+  backend applies. Another new arm for exhaustive `match`es. Note the FFI mirror
+  `FfiError` appends its counterpart at the *end* of the enum: UniFFI serializes
+  by declaration ordinal, so a mid-enum insertion would renumber every later
+  variant for a prebuilt binding.
+- **`ModelConfig` gained `moe: Option<MoeConfig>`**, `None` for every dense
+  architecture, alongside the new public `MoeConfig` type. Struct literals of
+  `ModelConfig` need the field; `..Default::default()` is not available here, so
+  this is a compile error rather than a silent behavior change.
+- **`LoraTarget` gained four routed-FFN variants** (`FfnGateInp` for the router,
+  and `FfnGateExps` / `FfnUpExps` / `FfnDownExps` for the per-expert
+  projections). Exhaustive `match`es need the arms, and `LoraTarget::ALL` is now
+  `[LoraTarget; 13]` rather than `[LoraTarget; 9]`: prefer the public
+  `LORA_TARGET_COUNT` over a hard-coded length in any array typed by it.
 - **The f16 KV cache** (added for decode-at-depth) widened four public items in
   the `cera::kv_cache` module: `KvCompression` gained `F16`, `LayerSnapshot`
   gained `AttentionF16`, `LayerState::Attention` gained `key_cache_f16` and
@@ -109,6 +126,7 @@ at one. Dispatch is on the GGUF `general.architecture` string:
 | Architecture | Examples |
 |--------------|----------|
 | `lfm2` | Liquid LFM2 / LFM2.5 (the canonical LeapBundles family) |
+| `lfm2moe` | Liquid LFM2.5-8B-A1B (routed mixture-of-experts) |
 | `qwen2`, `qwen3` | Qwen2 / Qwen2.5 / Qwen3 |
 | `llama` | LLaMA 2/3, and classic Mistral 7B (ships as GGUF arch `llama`) |
 | `granite` | IBM Granite 3.x, and the dense Granite 4.1 line (3b / 8b / 30b) |
@@ -290,7 +308,10 @@ Load a LoRA adapter, a llama.cpp GGUF (from `convert_lora_to_gguf`) or a PEFT
 `.safetensors`, and attach it to a `Session`. The delta is applied at inference
 time (`y += scale·B·(A·x)`), **never merged into the weights**, so the base model
 stays quantized and adapters hot-swap / unload per request. Runs on CPU, Metal,
-and wgpu (batched-GEMM prefill + decode) and is dimension-checked at attach.
+and wgpu (batched-GEMM prefill + decode) and is dimension-checked at attach. The
+one gap is `lfm2moe`'s routed-FFN targets (the router and the per-expert
+projections), which apply on CPU only; on a GPU backend such an adapter is
+refused with `CeraError::LoraUnsupportedByBackend` rather than half-applied.
 
 ```rust
 use cera::lora::LoraAdapterWeights;

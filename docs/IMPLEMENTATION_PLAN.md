@@ -19,8 +19,9 @@ that leg stays disabled until the registry secrets are set up.
 KV cache, generation engine, HF bundle download, interactive chat TUI, and bench
 command are all shipped; the end-to-end inference pipeline is done. **Phase 4
 model coverage** has since expanded: architecture dispatch now handles `lfm2`,
-`qwen2`, `qwen3`, `llama`, and `granite` on the shared LLaMA/transformer code
-path (classic Mistral ships as arch `llama`, so it is covered too). Only the
+`lfm2moe`, `qwen2`, `qwen3`, `llama`, and `granite` on the shared
+LLaMA/transformer code path (classic Mistral ships as arch `llama`, so it is
+covered too; `lfm2moe` shares the LFM2 path with experts in the FFN slot). Only the
 `gemma` and `phi3` arch strings named in Phase 4 remain unwired. The dense
 transformers run on **every backend** (CPU, wgpu, and Metal) with decode +
 batched-GEMM prefill and a tiled flash-attention path for long prompts; the
@@ -50,7 +51,7 @@ earlier "GPU is LFM2-only" limitation is gone (see #177/#192/#193/#194/#200).
 | V2.8 Speculative decoding | 🟡 | Prompt-lookup (n-gram) drafting shipped, CPU dense only; draft-model variant remains |
 | V2.9 LoRA adapters | ✅ | `cera/src/lora.rs`; runtime apply on CPU + Metal + wgpu; FFI/WASM |
 | - Hidden-states extraction | ✅ | `Model::hidden_states` (CPU/Metal/wgpu) + FFI/WASM; classifier/embedding path |
-| V2.10 MoE support | ⬜ | |
+| V2.10 MoE support | ✅ | `lfm2moe` (LFM2.5-8B-A1B) on CPU, Metal and wgpu; Mixtral not covered |
 | V2.11 Multi-GPU | ⬜ | |
 | V2.12 CUDA backend | ⬜ | |
 | V2.13 Python (PyO3) bindings | ⬜ | |
@@ -271,10 +272,11 @@ Build LFM2 FIRST. This is the hard case. LLaMA comes after, trivially.
 
 > Status: wgpu backend shipped (matmul, quantized GEMM/GEMV, rmsnorm, silu, rope,
 > softmax, attention, conv1d, element-wise) plus a separate **Metal** backend and
-> shader preprocessor. GPU forward pass now supports **LFM2 and the dense
-> transformers** (llama/qwen2/qwen3/granite) on both wgpu and Metal: decode +
-> batched-GEMM prefill, GPU-side KV-shift, and the ViT vision encoder; runs on
-> wasm as well. Subgroup variants implemented with small-subgroup adapter support.
+> shader preprocessor. GPU forward pass now supports **LFM2, the routed
+> `lfm2moe` arch, and the dense transformers** (llama/qwen2/qwen3/granite) on
+> both wgpu and Metal: decode + batched-GEMM prefill (the routed FFN excepted,
+> see V2.10), GPU-side KV-shift, and the ViT vision encoder; runs on wasm as
+> well. Subgroup variants implemented with small-subgroup adapter support.
 
 ```
 5.1  backend/wgpu.rs: Device init, buffer pool, weight upload.
@@ -399,8 +401,19 @@ Shipped alongside **hidden-states extraction** (`Model::hidden_states`, post-fin
 per-token vectors reflecting the active adapter); the classifier/embedding path that
 unblocks section-router / extractor heads. PRs #205–#215.
 
-### V2.10: MoE Support, 2-3 weeks ⬜
-Top-K expert routing for Mixtral, LFM2-8B-A1B, LFM2-24B-A2B.
+### V2.10: MoE Support, 2-3 weeks ✅
+Top-K expert routing, shipped for the `lfm2moe` arch (LFM2.5-8B-A1B) on all
+three backends. Sigmoid gating with a selection bias (`expert_gating_func = 2`)
+is the one rule modelled; the loader rejects any other rather than substituting
+softmax. The two GPU backends share three Slang kernels (`moe_route`,
+`moe_gemv_q4_0`, `moe_combine`) and are Q4_0-only. Prefill through the routed
+FFN reuses no weights on any backend: an expert row is read once per routed token
+rather than shared across the tokens that chose it, which is the named follow-up
+(group tokens by expert, then one tiled GEMM per group). Mixtral is genuinely out, though not by the
+gating check: it ships as GGUF arch `llama`, so it never reaches that gate and
+instead fails the dense loader on a missing `blk.N.ffn_gate.weight`. LFM2-24B-A2B is untested rather
+than excluded: it is the same arch and would load within the Q4_0 / 256-expert /
+16-active bounds.
 
 ### V2.11: Multi-GPU, 3-4 weeks ⬜
 Pipeline parallelism, tensor parallelism, CPU offloading.

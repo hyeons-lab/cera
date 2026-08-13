@@ -26,7 +26,8 @@ Point at a local model (a `.gguf` file, a `.json` LeapBundles manifest, or a
 directory containing one) or let it auto-download a bundle by id/quant from
 [`huggingface.co/LiquidAI/LeapBundles`](https://huggingface.co/LiquidAI/LeapBundles)
 (cached under `$HOME/.cache/cera`). Supported architectures: `lfm2`,
-`qwen2`/`qwen3`, `llama` (incl. classic Mistral), and `granite`; see the
+`lfm2moe` (routed mixture-of-experts), `qwen2`/`qwen3`, `llama` (incl. classic
+Mistral), and `granite`; see the
 [`cera` README](https://github.com/hyeons-lab/cera/tree/main/cera#supported-models)
 for the full list and modality support.
 

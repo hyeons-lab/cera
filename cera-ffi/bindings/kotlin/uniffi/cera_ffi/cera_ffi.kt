@@ -1741,7 +1741,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_append_tokens() != 1227) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_attach_lora() != 28982) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_attach_lora() != 3335) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_cancel() != 7555) {
@@ -5052,9 +5052,15 @@ public interface SessionInterface {
      * Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
      * call). It's applied to every subsequent forward pass — generation **and**
      * hidden-states extraction — until removed or replaced (hot-swap), and is
-     * preserved across [`Self::reset`]. Returns [`FfiError::LoraParse`] if the
-     * adapter's dimensions don't match the loaded model. Only affects tokens
-     * processed after the call (doesn't retroactively re-adapt cached KV).
+     * preserved across [`Self::reset`]. Only affects tokens processed after the
+     * call (doesn't retroactively re-adapt cached KV).
+     *
+     * Two distinct failures, worth catching separately: [`FfiError::LoraParse`]
+     * means the adapter's dimensions don't match the loaded model, so the
+     * adapter or the pairing is wrong; [`FfiError::LoraUnsupportedByBackend`]
+     * means it fits but this backend has no hook for something it adapts, so
+     * the same adapter works on another backend (today: a mixture-of-experts
+     * adapter needs the CPU backend).
      */
     fun `attachLora`(`adapters`: LoraAdapters)
 
@@ -5555,9 +5561,15 @@ open class Session :
      * Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
      * call). It's applied to every subsequent forward pass — generation **and**
      * hidden-states extraction — until removed or replaced (hot-swap), and is
-     * preserved across [`Self::reset`]. Returns [`FfiError::LoraParse`] if the
-     * adapter's dimensions don't match the loaded model. Only affects tokens
-     * processed after the call (doesn't retroactively re-adapt cached KV).
+     * preserved across [`Self::reset`]. Only affects tokens processed after the
+     * call (doesn't retroactively re-adapt cached KV).
+     *
+     * Two distinct failures, worth catching separately: [`FfiError::LoraParse`]
+     * means the adapter's dimensions don't match the loaded model, so the
+     * adapter or the pairing is wrong; [`FfiError::LoraUnsupportedByBackend`]
+     * means it fits but this backend has no hook for something it adapts, so
+     * the same adapter works on another backend (today: a mixture-of-experts
+     * adapter needs the CPU backend).
      */
     @Throws(FfiException::class)
     override fun `attachLora`(`adapters`: LoraAdapters) =
@@ -6898,6 +6910,30 @@ sealed class FfiException : kotlin.Exception() {
             get() = "configured=${ `configured` }, requested=${ `requested` }"
     }
 
+    /**
+     * The adapter fits the model, but the active backend has no hook for
+     * something it adapts. Mirrors [`cera::CeraError::LoraUnsupportedByBackend`].
+     *
+     * Separate from [`FfiError::LoraParse`] because the two need different
+     * handling on the foreign side: `LoraParse` means the adapter or the model
+     * pairing is wrong, while this one means only the backend is, so a caller
+     * can retry on CPU instead of surfacing "bad adapter" to a user. Today the
+     * case is a routed feed-forward (mixture-of-experts) delta on a GPU
+     * backend.
+     *
+     * **Appended, not grouped next to `LoraParse`.** UniFFI serializes this
+     * enum by ordinal, and the committed Kotlin/Swift/Dart bindings decode it
+     * the same way, so inserting mid-enum renumbers every later variant and a
+     * prebuilt consumer would decode this one as whatever now holds its old
+     * ordinal. New variants go at the end.
+     */
+    class LoraUnsupportedByBackend(
+        val `detail`: kotlin.String,
+    ) : FfiException() {
+        override val message
+            get() = "detail=${ `detail` }"
+    }
+
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<FfiException> {
         override fun lift(error_buf: RustBuffer.ByValue): FfiException = FfiConverterTypeFfiError.lift(error_buf)
     }
@@ -6978,6 +7014,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
             13 -> {
                 FfiException.KvCompressionConflict(
                     FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            14 -> {
+                FfiException.LoraUnsupportedByBackend(
                     FfiConverterString.read(buf),
                 )
             }
@@ -7065,6 +7107,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
                     FfiConverterString.allocationSize(value.`configured`) +
                     FfiConverterString.allocationSize(value.`requested`)
             )
+
+            is FfiException.LoraUnsupportedByBackend -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`detail`)
+            )
         }
 
     override fun write(
@@ -7146,6 +7194,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
                 buf.putInt(13)
                 FfiConverterString.write(value.`configured`, buf)
                 FfiConverterString.write(value.`requested`, buf)
+                Unit
+            }
+
+            is FfiException.LoraUnsupportedByBackend -> {
+                buf.putInt(14)
+                FfiConverterString.write(value.`detail`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

@@ -228,6 +228,24 @@ pub enum FfiError {
         configured: String,
         requested: String,
     },
+
+    /// The adapter fits the model, but the active backend has no hook for
+    /// something it adapts. Mirrors [`cera::CeraError::LoraUnsupportedByBackend`].
+    ///
+    /// Separate from [`FfiError::LoraParse`] because the two need different
+    /// handling on the foreign side: `LoraParse` means the adapter or the model
+    /// pairing is wrong, while this one means only the backend is, so a caller
+    /// can retry on CPU instead of surfacing "bad adapter" to a user. Today the
+    /// case is a routed feed-forward (mixture-of-experts) delta on a GPU
+    /// backend.
+    ///
+    /// **Appended, not grouped next to `LoraParse`.** UniFFI serializes this
+    /// enum by ordinal, and the committed Kotlin/Swift/Dart bindings decode it
+    /// the same way, so inserting mid-enum renumbers every later variant and a
+    /// prebuilt consumer would decode this one as whatever now holds its old
+    /// ordinal. New variants go at the end.
+    #[error("LoRA adapter not supported by this backend: {detail}")]
+    LoraUnsupportedByBackend { detail: String },
 }
 
 impl From<cera::CeraError> for FfiError {
@@ -261,6 +279,9 @@ impl From<cera::CeraError> for FfiError {
                 requested,
             },
             cera::CeraError::LoraDimMismatch(s) => FfiError::LoraParse { detail: s },
+            cera::CeraError::LoraUnsupportedByBackend(s) => {
+                FfiError::LoraUnsupportedByBackend { detail: s }
+            }
             cera::CeraError::Io(io_err) => FfiError::Io {
                 detail: io_err.to_string(),
             },
@@ -1799,9 +1820,15 @@ impl Session {
     /// Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
     /// call). It's applied to every subsequent forward pass — generation **and**
     /// hidden-states extraction — until removed or replaced (hot-swap), and is
-    /// preserved across [`Self::reset`]. Returns [`FfiError::LoraParse`] if the
-    /// adapter's dimensions don't match the loaded model. Only affects tokens
-    /// processed after the call (doesn't retroactively re-adapt cached KV).
+    /// preserved across [`Self::reset`]. Only affects tokens processed after the
+    /// call (doesn't retroactively re-adapt cached KV).
+    ///
+    /// Two distinct failures, worth catching separately: [`FfiError::LoraParse`]
+    /// means the adapter's dimensions don't match the loaded model, so the
+    /// adapter or the pairing is wrong; [`FfiError::LoraUnsupportedByBackend`]
+    /// means it fits but this backend has no hook for something it adapts, so
+    /// the same adapter works on another backend (today: a mixture-of-experts
+    /// adapter needs the CPU backend).
     pub fn attach_lora(&self, adapters: Arc<LoraAdapters>) -> Result<(), FfiError> {
         self.lock_inner()?
             .attach_lora_adapters(adapters.inner.clone())?;
@@ -2805,6 +2832,12 @@ mod tests {
     /// side had dropped the `"backend: "` and `"io: "` label prefixes.
     #[test]
     fn ffi_error_display_matches_cera_error_for_every_shared_variant() {
+        // One deliberate exclusion: `CeraError::LoraDimMismatch` maps to
+        // `FfiError::LoraParse`, whose Display is the wider "lora: {detail}"
+        // because it also covers adapter *load* failures that have no
+        // `CeraError` counterpart. Every other shared variant is paired below,
+        // and a new one belongs here rather than being quietly left out.
+
         // Prep the Io pair outside the vec since io::Error isn't
         // `Clone`: we need to consume one into `CeraError::Io` and
         // stash its pre-wrap display string for the FFI side.
@@ -2840,6 +2873,40 @@ mod tests {
                     detail: "metal driver crashed".into(),
                 },
                 cera::CeraError::Backend("metal driver crashed".into()),
+            ),
+            (
+                FfiError::InvalidToken {
+                    id: 99,
+                    vocab_size: 32,
+                },
+                cera::CeraError::InvalidToken {
+                    id: 99,
+                    vocab_size: 32,
+                },
+            ),
+            (
+                FfiError::LoraUnsupportedByBackend {
+                    detail: "no routed-FFN hooks".into(),
+                },
+                cera::CeraError::LoraUnsupportedByBackend("no routed-FFN hooks".into()),
+            ),
+            (
+                FfiError::OutOfMemory {
+                    requested_bytes: 1 << 40,
+                },
+                cera::CeraError::OutOfMemory {
+                    requested_bytes: 1 << 40,
+                },
+            ),
+            (
+                FfiError::KvCompressionConflict {
+                    configured: "tq3".into(),
+                    requested: "none".into(),
+                },
+                cera::CeraError::KvCompressionConflict {
+                    configured: "tq3".into(),
+                    requested: "none".into(),
+                },
             ),
             (FfiError::Io { detail: io_msg }, cera::CeraError::Io(io_err)),
         ];

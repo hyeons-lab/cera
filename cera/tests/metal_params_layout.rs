@@ -292,9 +292,35 @@ fn slang_params_bytes(src: &str) -> Option<usize> {
     // `_metal` one; refusing outright (as an earlier revision did) left every
     // such kernel uncovered, which is worse than the ambiguity it avoided.
     // Anything else with more than one binding is still ambiguous.
-    let decl = match candidates.as_slice() {
-        [only] => only,
-        many => *many
+    //
+    // Before falling back to that, prefer a `uintN` binding when exactly one
+    // candidate is vector-typed. A kernel that reads *data* as `uint` (any
+    // quantized-weight kernel, since WGSL has no byte-addressable storage)
+    // declares those as plain `StructuredBuffer<uint>`, so without this
+    // `moe_gemv_q4_0` reports three candidates (its weights, its expert-id
+    // table, and its params) and falls through to `None`, i.e. a test failure
+    // on a kernel whose params binding is perfectly unambiguous.
+    //
+    // This is a disambiguator, not a rule about params bindings: five kernels
+    // here (`conv1d`, `conv1d_fused`, `conv1d_fused_batch`, `rmsnorm_batch`,
+    // `rope`) declare their params as a scalar `StructuredBuffer<uint>`, which
+    // is why the single-candidate arm below still has to exist. The ordering
+    // does mean a scalar params binding loses to a vector *data* binding in the
+    // same kernel. No kernel here has that shape, and one that did would usually
+    // fail this test rather than pass wrongly, since the resolved width would
+    // not match its expected byte count. Usually, not always: if the two
+    // bindings happened to agree on width, this would silently check the wrong
+    // one. Adding a kernel with a vector data binding alongside scalar params
+    // means revisiting this precedence, not trusting the mismatch to catch it.
+    let vector_typed: Vec<&str> = candidates
+        .iter()
+        .copied()
+        .filter(|l| !l.contains("StructuredBuffer<uint>"))
+        .collect();
+    let decl = match (candidates.as_slice(), vector_typed.as_slice()) {
+        (_, [only]) => only,
+        ([only], _) => only,
+        (many, _) => *many
             .iter()
             .find(|l| l.contains("_metal") || l.contains("metal_"))?,
     };
@@ -495,6 +521,21 @@ fn slang_cases() -> Vec<(usize, &'static str, &'static str)> {
             include_str!("../src/backend/shaders/slang/mel_norm.slang"),
             "MelNormParams",
         ),
+        (
+            size_of::<MoeRouteParams>(),
+            include_str!("../src/backend/shaders/slang/moe_route.slang"),
+            "MoeRouteParams",
+        ),
+        (
+            size_of::<MoeGemvParams>(),
+            include_str!("../src/backend/shaders/slang/moe_gemv_q4_0.slang"),
+            "MoeGemvParams",
+        ),
+        (
+            size_of::<MoeCombineParams>(),
+            include_str!("../src/backend/shaders/slang/moe_combine.slang"),
+            "MoeCombineParams",
+        ),
     ]
 }
 
@@ -619,6 +660,23 @@ fn every_slang_params_binding_stays_parseable() {
         (
             include_str!("../src/backend/shaders/slang/per_head_rmsnorm.slang"),
             "per_head_rmsnorm",
+            16,
+        ),
+        // The three `lfm2moe` kernels. `moe_gemv_q4_0` reads two `uint4`s, so
+        // its params upload is 32 bytes.
+        (
+            include_str!("../src/backend/shaders/slang/moe_combine.slang"),
+            "moe_combine",
+            16,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/moe_gemv_q4_0.slang"),
+            "moe_gemv_q4_0",
+            32,
+        ),
+        (
+            include_str!("../src/backend/shaders/slang/moe_route.slang"),
+            "moe_route",
             16,
         ),
         // Two params bindings, one per target; the metal arm is the 16-byte one.
@@ -776,13 +834,33 @@ fn slang_parser_refuses_to_guess() {
     // Two read-only params bindings, the wgsl/metal split `rmsnorm.slang` uses.
     // Take the metal one: this is the Metal layout test, and refusing outright
     // left every such kernel uncovered.
+    //
+    // Both are `uint4`, as `rmsnorm.slang` really declares them. Making the
+    // wgsl side a scalar `uint` here would be resolved by the vector-typed
+    // filter instead, and this case would stop covering the `_metal` fallback
+    // it is named for.
     assert_eq!(
         slang_params_bytes(
-            "[[vk::binding(0)]] StructuredBuffer<uint> p_wgsl : register(t0);\n\
+            "[[vk::binding(0)]] StructuredBuffer<uint4> p_wgsl : register(t0);\n\
              [[vk::binding(1)]] StructuredBuffer<uint4> p_metal : register(t1);\n\
              x = p_wgsl[7]; y = p_metal[0];"
         ),
         Some(4 * 4)
+    );
+
+    // A scalar `uint` *data* binding alongside a `uintN` params one is not
+    // ambiguous, and must not need a `_metal` name to resolve. This is
+    // `moe_gemv_q4_0`'s shape: WGSL has no byte-addressable storage, so its
+    // packed weights and its expert-id table are both `StructuredBuffer<uint>`,
+    // and only `params` is a vector.
+    assert_eq!(
+        slang_params_bytes(
+            "[[vk::binding(0)]] StructuredBuffer<uint> w : register(t0);\n\
+             [[vk::binding(1)]] StructuredBuffer<uint> sel_expert : register(t1);\n\
+             [[vk::binding(2)]] StructuredBuffer<uint4> params : register(t2);\n\
+             x = w[0] + sel_expert[0]; y = params[1].x;"
+        ),
+        Some(4 * 2 * 4)
     );
     // A params binding of a non-`uint` element type is not silently skipped.
     assert_eq!(
