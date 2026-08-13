@@ -3284,11 +3284,15 @@ impl Model for MetalLfm2Model {
 
         let pos = self.state.seq_len.load(Ordering::Relaxed);
 
-        // 2. Run layers only (no output norm, no logit projection).
-        // The reference's llama_get_embeddings returns the raw hidden state
-        // without the output norm weight multiplication (RMS ~0.14), not the
-        // normed+weighted state (RMS ~1.5). This was confirmed by feeding the
-        // reference's embedding to cera's depthformer → 8/8 matching codes.
+        // 2. Run the layers. No logit projection: what this returns is the
+        // hidden state, which the caller hands to the depthformer.
+        //
+        // The output norm below IS part of that, despite reading like a step
+        // past it. `Lfm2Model::run_layers` ends with
+        // `rmsnorm(hidden, output_norm_weight)`, so the CPU's `forward_embedding`
+        // returns the normed vector and this has to as well. Pinned by
+        // `gpu_lfm2_embedding_input::forward_embedding_matches_the_cpu_model`
+        // on the WGPU twin, which caught exactly this off-by-one-step.
         let cb = self.ctx.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         self.encode_layers(enc, pos);

@@ -828,6 +828,24 @@ enum TailArgmax {
     DispatchAndStage,
 }
 
+/// Where the decode tail stops.
+///
+/// The audio path wants the hidden state rather than logits, so it stops after
+/// the output norm and before the projection. **After** the norm, not before:
+/// the CPU model's `run_layers` ends with `rmsnorm(hidden, output_norm_weight)`
+/// and `forward_embedding` returns that, so the vector the depthformer is
+/// calibrated against is the normed one. Stopping a step earlier gets a vector
+/// that is off by the norm's per-element weight, which is a rotation and not
+/// just a rescale, so nothing downstream reads as merely quieter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecodeTail {
+    /// Output norm, LM head, and whatever the [`TailArgmax`] asks for on top.
+    /// Logits end up in `logits_buf`.
+    Logits(TailArgmax),
+    /// Output norm only, leaving the normed hidden state in `hidden_buf`.
+    Hidden,
+}
+
 impl GpuLfm2Model {
     /// Construct without a model identifier. Equivalent to
     /// `from_gguf_with_id(gguf, context_size, "")`. Warm prefix cache
@@ -2668,7 +2686,7 @@ impl GpuLfm2Model {
     /// decoding (`forward_greedy_inner`). This split lets the wasm-async
     /// path avoid the vocab-sized blocking download every step.
     fn forward_inner_compute(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) {
-        self.forward_inner_compute_tail(tokens, pos, state, TailArgmax::None);
+        self.forward_inner_compute_tail(tokens, pos, state, DecodeTail::Logits(TailArgmax::None));
     }
 
     /// Run one decode step from a caller-supplied hidden vector rather than a
@@ -2689,7 +2707,7 @@ impl GpuLfm2Model {
             HiddenSeed::Embedding(embedding),
             pos,
             state,
-            TailArgmax::None,
+            DecodeTail::Logits(TailArgmax::None),
         );
     }
 
@@ -2759,9 +2777,10 @@ impl GpuLfm2Model {
         }
     }
 
-    /// As [`Self::forward_inner_compute`], but also encodes the greedy argmax —
-    /// and optionally its readback copy — into the *same* encoder as the output
-    /// projection. See [`TailArgmax`] for why the two are separable.
+    /// As [`Self::forward_inner_compute`], but the caller chooses where the tail
+    /// stops (see [`DecodeTail`]) and, when it stops at logits, whether the
+    /// greedy argmax — and its readback copy — ride in the *same* encoder as the
+    /// output projection. See [`TailArgmax`] for why those two are separable.
     ///
     /// Worth the extra parameter. The argmax used to get its own encoder and its
     /// own `submit_and_wait`, which cost ~1.3 ms per token against the kernel's
@@ -2774,10 +2793,10 @@ impl GpuLfm2Model {
         tokens: &[u32],
         pos: usize,
         state: &mut InferenceState,
-        argmax: TailArgmax,
+        tail: DecodeTail,
     ) {
         assert_eq!(tokens.len(), 1, "GPU forward expects single token");
-        self.forward_inner_compute_tail_seeded(HiddenSeed::Token(tokens[0]), pos, state, argmax);
+        self.forward_inner_compute_tail_seeded(HiddenSeed::Token(tokens[0]), pos, state, tail);
     }
 
     /// As [`Self::forward_inner_compute_tail`], but the initial hidden state
@@ -2789,7 +2808,7 @@ impl GpuLfm2Model {
         seed: HiddenSeed<'_>,
         pos: usize,
         state: &mut InferenceState,
-        argmax: TailArgmax,
+        tail: DecodeTail,
     ) {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
@@ -3619,6 +3638,11 @@ impl GpuLfm2Model {
 
         // 3. Output norm + projection. Untied models project through
         // `output.weight`; tied models reuse the embedding table.
+        //
+        // The norm runs for both tails: it is the last step of the CPU model's
+        // `run_layers`, so it is inside what `forward_embedding` returns, not
+        // part of the projection that `DecodeTail::Hidden` is declining. Only
+        // the projection and the argmax below are conditional.
         let mut enc = self.new_encoder();
         self.encode_rmsnorm(
             &mut enc,
@@ -3627,6 +3651,13 @@ impl GpuLfm2Model {
             hs32,
             cfg.rms_norm_eps,
         );
+        let DecodeTail::Logits(argmax) = tail else {
+            self.submit_and_wait(enc);
+            self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
+            state.seq_len += 1;
+            self.ctx.finish_profiler();
+            return;
+        };
         self.encode_lm_head(&mut enc, &self.hidden_buf, &self.logits_buf);
         // Granite divides the logits by `logits_scaling` (identity elsewhere).
         if let Some(params) = self.logit_scale_params.as_ref() {
@@ -3696,7 +3727,12 @@ impl GpuLfm2Model {
     fn forward_greedy_inner(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
         // The argmax rides along in the output projection's encoder, so a decode
         // step is one submit-and-stall, not two.
-        self.forward_inner_compute_tail(tokens, pos, state, TailArgmax::DispatchAndStage);
+        self.forward_inner_compute_tail(
+            tokens,
+            pos,
+            state,
+            DecodeTail::Logits(TailArgmax::DispatchAndStage),
+        );
         self.ctx.read_mapped_u32(&self.argmax_readback_buf, 1)[0]
     }
 
@@ -3741,7 +3777,12 @@ impl GpuLfm2Model {
             // `Dispatch`, not `DispatchAndStage`: this path reads through
             // `begin_download`'s per-call buffer, so staging into the shared one
             // would be a copy nothing reads.
-            self.forward_inner_compute_tail(&[token], pos, state, TailArgmax::Dispatch);
+            self.forward_inner_compute_tail(
+                &[token],
+                pos,
+                state,
+                DecodeTail::Logits(TailArgmax::Dispatch),
+            );
 
             self.ctx
                 .begin_download(&self.argmax_out_buf, std::mem::size_of::<u32>() as u64)
@@ -3782,7 +3823,12 @@ impl GpuLfm2Model {
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
             // `None`: the argmax would be computed and then ignored, and its
             // staging copy is a second readback nothing reads.
-            self.forward_inner_compute_tail(&[token], pos, state, TailArgmax::None);
+            self.forward_inner_compute_tail(
+                &[token],
+                pos,
+                state,
+                DecodeTail::Logits(TailArgmax::None),
+            );
 
             self.ctx.begin_download(
                 &self.logits_buf,
@@ -5420,6 +5466,55 @@ impl Model for GpuLfm2Model {
         self.forward_inner_compute_from_embedding(embedding, pos, state);
         self.ctx
             .download_f32(&self.logits_buf, self.config.vocab_size)
+    }
+
+    /// The audio path's counterpart to [`Model::forward`]: same layer stack and
+    /// same output norm, but it stops before the projection, because what
+    /// consumes the result is the depthformer rather than a sampler.
+    ///
+    /// Without this the whole audio pipeline was unreachable on this backend. A
+    /// `cera-cli --features gpu` build with no Metal auto-selects WGPU for the
+    /// LLM, and `generate_audio` calls straight into here, so the default in
+    /// `model/mod.rs` panicked before a single frame was produced — including
+    /// for anyone who had picked `CERA_AUDIO_GPU=wgpu` to get the WGPU
+    /// detokenizer.
+    fn forward_embedding(
+        &self,
+        tokens: &[u32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _lora_guard = self.resolve_lora(state);
+        // `state.seq_len` over the `pos` argument for the same reason as
+        // `forward_from_embedding` above, and matching the CPU model, which
+        // ignores its own `pos` here too.
+        let pos = state.seq_len;
+        self.forward_inner_compute_tail(tokens, pos, state, DecodeTail::Hidden);
+        self.ctx
+            .download_f32(&self.hidden_buf, self.config.hidden_size)
+    }
+
+    /// [`Model::forward_embedding`] seeded by a hidden vector rather than a
+    /// token id. This is how an audio frame's codes are fed back into the LLM:
+    /// the frame has no token id that could produce its embedding.
+    fn forward_hidden_from_embedding(
+        &self,
+        embedding: &[f32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _lora_guard = self.resolve_lora(state);
+        let pos = state.seq_len;
+        self.forward_inner_compute_tail_seeded(
+            HiddenSeed::Embedding(embedding),
+            pos,
+            state,
+            DecodeTail::Hidden,
+        );
+        self.ctx
+            .download_f32(&self.hidden_buf, self.config.hidden_size)
     }
 
     /// Overridden so an image costs **one** logits readback instead of one per
