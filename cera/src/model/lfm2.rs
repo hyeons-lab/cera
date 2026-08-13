@@ -755,7 +755,7 @@ impl Lfm2Model {
         // `n_expert_used` pairs (4 here), not per-expert data.
         let selected = std::mem::take(&mut state.scratch.moe_selected);
 
-        for (i, &(expert, weight)) in selected.iter().enumerate() {
+        for (_i, &(expert, weight)) in selected.iter().enumerate() {
             // Restore the Q8_0 quantization of `ffn_input`. The previous
             // iteration's down projection re-quantized this scratch to hold its
             // SwiGLU product, so the gate/up GEMVs below would otherwise read
@@ -766,7 +766,7 @@ impl Lfm2Model {
             // valid; that is one quantization per layer, against one per expert
             // for the bottom-of-loop form.
             #[cfg(target_arch = "aarch64")]
-            if i > 0 {
+            if _i > 0 {
                 Self::quantize_to_scratch(ffn_input, state);
             }
 
