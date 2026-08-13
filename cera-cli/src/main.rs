@@ -2373,15 +2373,6 @@ fn main() -> Result<()> {
                     );
                 }
                 let gpu_df_requested = std::env::var("CERA_GPU_DF").as_deref() == Ok("1");
-                #[cfg(all(feature = "metal", target_os = "macos"))]
-                if gpu_df_requested {
-                    eprintln!(
-                        "warning: CERA_GPU_DF=1 enables an experimental Metal depthformer that \
-                         currently produces incorrect codes (frame-1 immediate-end with \
-                         --audio-temperature 0; NaN-logit panic with default sampling). \
-                         The CPU depthformer is the supported path."
-                    );
-                }
 
                 // Select the audio GPU backend for the detokenizer (and, under
                 // CERA_GPU_DF, the depthformer): CERA_AUDIO_GPU in
@@ -2455,6 +2446,30 @@ fn main() -> Result<()> {
                         }
                     };
 
+                // `CERA_GPU_DF=1` asks for the depthformer on the GPU, but only
+                // some backends have one: WGPU ships the detokenizer alone and
+                // its `sample_audio_frame` panics, and even Metal leaves the
+                // depthformer `None` if those weights failed to load. Honouring
+                // the flag on either would crash generation instead of falling
+                // back, so it is resolved against the backend that was actually
+                // built, not against the environment variable alone.
+                let gpu_depthformer = gpu_df_requested
+                    && gpu_detok.as_ref().is_some_and(|d| d.supports_depthformer());
+                if gpu_df_requested && !gpu_depthformer && gpu_detok.is_some() {
+                    eprintln!(
+                        "CERA_GPU_DF=1 ignored: the selected audio GPU backend has no \
+                         depthformer; sampling codes on the CPU"
+                    );
+                }
+                if gpu_depthformer {
+                    eprintln!(
+                        "warning: CERA_GPU_DF=1 enables an experimental Metal depthformer that \
+                         currently produces incorrect codes (frame-1 immediate-end with \
+                         --audio-temperature 0; NaN-logit panic with default sampling). \
+                         The CPU depthformer is the supported path."
+                    );
+                }
+
                 let mut all_pcm = Vec::new();
                 let sys = system.as_deref().unwrap();
                 let mode = if sys == "Respond with interleaved text and audio." {
@@ -2471,7 +2486,7 @@ fn main() -> Result<()> {
                     audio_temperature,
                     audio_top_k,
                     mode,
-                    gpu_depthformer: gpu_df_requested,
+                    gpu_depthformer,
                 };
 
                 let gpu_ref: Option<&dyn cera::model::audio_decoder::AudioGpu> =

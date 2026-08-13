@@ -19,10 +19,16 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f64 {
     let dot: f64 = a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum();
     let na: f64 = a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
     let nb: f64 = b.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-    if na == 0.0 || nb == 0.0 {
-        return 0.0;
+    // Two zero vectors agree exactly, so the gates below should read that as a
+    // match rather than as the worst possible score. Only a one-sided zero is
+    // real disagreement. Callers pair this with a non-silence assertion on the
+    // CPU reference, since "both sides emitted nothing" is a detokenizer bug
+    // that agreement alone cannot see.
+    match (na == 0.0, nb == 0.0) {
+        (true, true) => 1.0,
+        (true, false) | (false, true) => 0.0,
+        (false, false) => dot / (na * nb),
     }
-    dot / (na * nb)
 }
 
 fn rms(x: &[f32]) -> f64 {
@@ -118,6 +124,13 @@ fn spectrum_parity() {
             assert!(
                 gpu_frame.iter().all(|v| v.is_finite()),
                 "cs {ci} f {f}: GPU NaN/Inf"
+            );
+            // The reference has to carry signal for the two gates below to mean
+            // anything: a pair of all-zero frames scores a perfect cosine and a
+            // zero max_diff, which is the same green as a real match.
+            assert!(
+                cpu_frame.iter().any(|&v| v != 0.0),
+                "cs {ci} f {f}: CPU reference frame is all zeros"
             );
 
             let cos = cosine_sim(cpu_frame, gpu_frame);
@@ -260,6 +273,9 @@ fn multi_frame_stability() {
         let cos = cosine_sim(cpu_f0, gpu_f0);
         let cpu_r = rms(cpu_f0);
         let gpu_r = rms(gpu_f0);
+        // Same reason as `spectrum_parity`: a silent reference makes the cosine
+        // gate vacuous rather than failing it.
+        assert!(cpu_r > 0.0, "frame {fi}: CPU reference frame is all zeros");
         if fi == 0 {
             first_rms_cpu = cpu_r;
             first_rms_gpu = gpu_r;

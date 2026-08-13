@@ -1395,6 +1395,13 @@ impl MetalDepthformer {
 // ── AudioGpu trait implementation ───────────────────────────────────────────
 
 impl crate::model::audio_decoder::AudioGpu for MetalAudioDecoder {
+    // Not a constant `true`: `from_gguf` leaves this `None` on any depthformer
+    // load failure (it prints "using CPU" and keeps the detokenizer), and
+    // `sample_audio_frame` panics in exactly that case.
+    fn supports_depthformer(&self) -> bool {
+        self.depthformer.is_some()
+    }
+
     fn sample_audio_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8] {
         match &self.depthformer {
             Some(df) => df.sample_frame(embedding, temperature, top_k),

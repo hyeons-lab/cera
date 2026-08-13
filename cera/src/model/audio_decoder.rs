@@ -27,6 +27,15 @@ pub trait AudioGpu {
 
     /// Reset detokenizer state (conv buffers + KV caches, called per generation).
     fn reset_detokenizer(&self);
+
+    /// Whether [`AudioGpu::sample_audio_frame`] is actually implemented here.
+    ///
+    /// A backend may ship the detokenizer alone: the WGPU one does, and its
+    /// `sample_audio_frame` panics. Callers that route the depthformer to the
+    /// GPU (the CLI, under `CERA_GPU_DF=1`) must ask this first and fall back
+    /// to the CPU sampler when it is false. Deliberately has no default, so a
+    /// new backend has to answer rather than inherit an answer.
+    fn supports_depthformer(&self) -> bool;
 }
 
 /// Configuration for the depthformer (small transformer inside the decoder).

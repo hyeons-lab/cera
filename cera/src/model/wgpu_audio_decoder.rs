@@ -16,8 +16,9 @@
 //! more accurate than Metal's f16 cache.
 //!
 //! Scope (PR1): the detokenizer only, which is the validated win. The
-//! depthformer (code sampling) stays on CPU by default; `sample_audio_frame`
-//! is only reached when `CERA_GPU_DF=1`, and a WGPU depthformer is a follow-up.
+//! depthformer (code sampling) stays on CPU; `supports_depthformer` reports
+//! that, so `CERA_GPU_DF=1` keeps sampling on the CPU rather than reaching the
+//! `sample_audio_frame` panic here. A WGPU depthformer is a follow-up.
 //! PCM is still produced by the CPU `istft_to_pcm` until the ISTFT PR moves it
 //! to the GPU.
 
@@ -117,7 +118,14 @@ impl WgpuAudioDecoder {
         let n_embd = conv_in.cols;
         let q_norm_t = gguf.get_tensor("lfm.layers.2.self_attn.q_layernorm.weight")?;
         let head_dim = q_norm_t.shape()[0];
-        anyhow::ensure!(head_dim > 0, "detokenizer n_embd_head must be > 0");
+        // `n_head` and `n_kv` below both divide by this, so a corrupt vocoder
+        // GGUF reporting an empty q_layernorm shape would be a div-by-zero
+        // panic. Same wording as the CPU loader's check in `audio_decoder.rs`,
+        // since the two read the same tensor and fail for the same reason.
+        anyhow::ensure!(
+            head_dim > 0,
+            "detokenizer n_embd_head must be > 0 (q_layernorm shape was empty)"
+        );
         let q_w = crate::model::weights::MmapWeight::from_gguf(
             gguf,
             "lfm.layers.2.self_attn.q_proj.weight",
@@ -851,10 +859,16 @@ fn n_embd_bins(cfg: &DetokenizerConfig) -> usize {
 }
 
 impl crate::model::audio_decoder::AudioGpu for WgpuAudioDecoder {
+    // PR1 ships the detokenizer only; the depthformer stays on CPU and is a
+    // follow-up.
+    fn supports_depthformer(&self) -> bool {
+        false
+    }
+
     fn sample_audio_frame(&self, _embedding: &[f32], _temperature: f32, _top_k: usize) -> [i32; 8] {
-        // PR1 ships the detokenizer only; the depthformer stays on CPU. This is
-        // reached only under CERA_GPU_DF=1, which the CLI documents as
-        // experimental. A WGPU depthformer is a follow-up.
+        // Unreachable through the CLI, which routes the depthformer by
+        // `supports_depthformer` above rather than by `CERA_GPU_DF` alone. Kept
+        // as a backstop for a caller that wires the trait up itself.
         panic!("WGPU depthformer not implemented; unset CERA_GPU_DF to use the CPU sampler");
     }
 
