@@ -9,6 +9,7 @@
 @binding(3) @group(0) var<storage, read_write> sel_weight_0 : array<f32>;
 
 var<workgroup> sh_prob_0 : array<f32, i32(256)>;
+
 var<workgroup> sh_score_0 : array<f32, i32(256)>;
 
 @compute
@@ -136,15 +137,13 @@ fn moe_route(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup
             e_0 = e_0 + u32(1);
         }
         chosen_0[s_0] = best_0;
-        var w_0 : f32 = sh_prob_0[best_0];
-        unnorm_w_0[s_0] = w_0;
-        var _S4 : u32 = tok_0 * _S1 + s_0;
-        sel_expert_0[_S4] = best_0;
-        var sum_1 : f32 = sum_0 + w_0;
+        unnorm_w_0[s_0] = sh_prob_0[best_0];
+        sel_expert_0[tok_0 * _S1 + s_0] = best_0;
+        var sum_1 : f32 = sum_0 + sh_prob_0[best_0];
         s_0 = s_0 + u32(1);
         sum_0 = sum_1;
     }
-    var inv_denom_0 : f32 = 1.0f / max(sum_0, 0.00006103515625f);
+    var _S4 : f32 = 1.0f / max(sum_0, 0.00006103515625f);
     s_0 = u32(0);
     for(;;)
     {
@@ -155,8 +154,7 @@ fn moe_route(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup
         {
             break;
         }
-        var _S6 : u32 = tok_0 * _S1 + s_0;
-        sel_weight_0[_S6] = unnorm_w_0[s_0] * inv_denom_0;
+        sel_weight_0[tok_0 * _S1 + s_0] = unnorm_w_0[s_0] * _S4;
         s_0 = s_0 + u32(1);
     }
     return;
