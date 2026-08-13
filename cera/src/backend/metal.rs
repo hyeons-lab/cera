@@ -186,7 +186,8 @@ impl MetalLinear {
             MetalLinearWeight::Quant { buf, dtype } => {
                 let pipe = match dtype {
                     crate::tensor::DType::Q8_0 => &self.p_q8_0,
-                    _ => &self.p_q4_0,
+                    crate::tensor::DType::Q4_0 => &self.p_q4_0,
+                    other => panic!("unsupported MetalLinear weight dtype: {other:?}"),
                 };
                 // These GEMM kernels never read `_pad`, so they always plain-store.
                 let p = params::QuantGemmParams {

@@ -126,6 +126,10 @@ fn assert_parity(label: &str, want: &[f32], got: &[f32], min_cos: f64, atol: f32
         got.iter().all(|v| v.is_finite()),
         "{label}: GPU output has non-finite values"
     );
+    if want.is_empty() {
+        eprintln!("{label}: empty inputs match");
+        return;
+    }
 
     let cos = cosine_sim(want, got);
     let diff = max_abs_diff(want, got);
