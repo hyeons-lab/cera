@@ -93,8 +93,10 @@ void moe_route(uint3 lid : SV_GroupThreadID, uint3 grp : SV_GroupID) {
     // reasoning above were ever wrong the duplicate check would fail open
     // rather than silently match expert 0.
     uint chosen[MAX_USED];
+    float unnorm_w[MAX_USED];
     for (uint i = 0u; i < MAX_USED; ++i) {
         chosen[i] = ~0u;
+        unnorm_w[i] = 0.0f;
     }
     float sum = 0.0f;
 
@@ -123,15 +125,15 @@ void moe_route(uint3 lid : SV_GroupThreadID, uint3 grp : SV_GroupID) {
 
         chosen[s] = best;
         float w = sh_prob[best];
+        unnorm_w[s] = w;
         sel_expert[tok * n_used + s] = best;
-        sel_weight[tok * n_used + s] = w;
         sum += w;
     }
 
     // Clamp the divisor to f16's smallest positive normal (2^-14) exactly as
     // llama.cpp does, so an all-but-zero gate cannot divide by zero.
-    float denom = max(sum, 1.0f / 16384.0f);
+    float inv_denom = 1.0f / max(sum, 1.0f / 16384.0f);
     for (uint s = 0u; s < n_used; ++s) {
-        sel_weight[tok * n_used + s] = sel_weight[tok * n_used + s] / denom;
+        sel_weight[tok * n_used + s] = unnorm_w[s] * inv_denom;
     }
 }

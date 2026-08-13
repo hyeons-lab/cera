@@ -101,6 +101,7 @@ struct KernelContext_0
 
 #line 92
     thread array<uint, int(16)> chosen_0;
+    thread array<float, int(16)> unnorm_w_0;
 
 #line 92
     uint i_0 = 0U;
@@ -120,6 +121,7 @@ struct KernelContext_0
 
 #line 94
         chosen_0[i_0] = 4294967295U;
+        unnorm_w_0[i_0] = 0.0f;
 
 #line 93
         i_0 = i_0 + 1U;
@@ -301,11 +303,11 @@ struct KernelContext_0
 #line 121
         chosen_0[s_0] = best_0;
         float w_0 = (*(&kernelContext_0)->sh_prob_0)[best_0];
+        unnorm_w_0[s_0] = w_0;
         uint _S4 = tok_0 * _S1 + s_0;
 
 #line 123
         *((&kernelContext_0)->sel_expert_0+_S4) = best_0;
-        *((&kernelContext_0)->sel_weight_0+_S4) = w_0;
         float sum_1 = sum_0 + w_0;
 
 #line 98
@@ -318,7 +320,7 @@ struct KernelContext_0
     }
 
 #line 130
-    float _S5 = max(sum_0, 0.00006103515625f);
+    float inv_denom_0 = 1.0f / max(sum_0, 0.00006103515625f);
 
 #line 130
     s_0 = 0U;
@@ -340,7 +342,7 @@ struct KernelContext_0
         uint _S6 = tok_0 * _S1 + s_0;
 
 #line 132
-        *((&kernelContext_0)->sel_weight_0+_S6) = *((&kernelContext_0)->sel_weight_0+_S6) / _S5;
+        *((&kernelContext_0)->sel_weight_0+_S6) = unnorm_w_0[s_0] * inv_denom_0;
 
 #line 131
         s_0 = s_0 + 1U;
