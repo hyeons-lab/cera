@@ -689,3 +689,77 @@ pub struct AudioXlAttnParams {
 }
 const _: () = assert!(size_of::<AudioXlAttnParams>() == 16);
 impl MetalParams for AudioXlAttnParams {}
+
+// ── LFM2A log-mel front-end ───────────────────────────────────────────────────
+
+/// Mirror of the params buffer in `shaders/slang/stft_frame.slang`: two `uint4`s.
+///
+/// `center_pad` is the padding applied to *each* side of the signal, and
+/// `n_samples` is the un-padded length, so the kernel recovers the padded signal
+/// from the raw PCM with a bounds test instead of a materialized copy. Named in
+/// full to keep it apart from the `_pad*` tail, which is struct padding and
+/// nothing to do with the signal.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StftFrameParams {
+    pub n_frames: u32,
+    pub n_fft: u32,
+    pub hop: u32,
+    pub center_pad: u32,
+    pub n_samples: u32,
+    pub preemph_bits: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+const _: () = assert!(size_of::<StftFrameParams>() == 32);
+impl MetalParams for StftFrameParams {}
+
+/// Mirror of the params buffer in `shaders/slang/power_spec.slang`:
+/// `[n_frames, n_fft, n_bins, _]`.
+///
+/// `n_bins` is carried rather than derived as `n_fft / 2 + 1` so the kernel's
+/// output stride is whatever the host allocated, not whatever the kernel would
+/// have computed.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PowerSpecParams {
+    pub n_frames: u32,
+    pub n_fft: u32,
+    pub n_bins: u32,
+    pub _pad: u32,
+}
+const _: () = assert!(size_of::<PowerSpecParams>() == 16);
+impl MetalParams for PowerSpecParams {}
+
+/// Mirror of the params buffer in `shaders/slang/mel_project.slang`:
+/// `[n_mel, n_frames, n_bins, eps_bits]`, where `eps_bits` is the log floor
+/// (`LOG_MEL_EPS`) added inside the logarithm.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MelProjectParams {
+    pub n_mel: u32,
+    pub n_frames: u32,
+    pub n_bins: u32,
+    pub eps_bits: u32,
+}
+const _: () = assert!(size_of::<MelProjectParams>() == 16);
+impl MetalParams for MelProjectParams {}
+
+/// Mirror of the params buffer in `shaders/slang/mel_norm.slang`:
+/// `[n_mel, n_frames, effective_n_len, eps_bits]`.
+///
+/// Not shared with [`MelProjectParams`] despite the identical width: the third
+/// field means "frames the statistics are taken over" here and "FFT bins" there,
+/// and `eps_bits` is the variance floor rather than the log floor. One mirror for
+/// both would make a field added for one kernel silently reinterpret the other's
+/// upload.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MelNormParams {
+    pub n_mel: u32,
+    pub n_frames: u32,
+    pub effective_n_len: u32,
+    pub eps_bits: u32,
+}
+const _: () = assert!(size_of::<MelNormParams>() == 16);
+impl MetalParams for MelNormParams {}

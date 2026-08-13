@@ -3272,6 +3272,10 @@ const AUDIO_KERNELS: &[&str] = &[
     "glu_split",
     "chan_affine_silu",
     "audio_xl_attention",
+    "stft_frame",
+    "power_spec",
+    "mel_project",
+    "mel_norm",
 ];
 
 /// The `(wgsl, msl)` sources for one audio kernel, `None` where the feature is
@@ -3290,6 +3294,10 @@ fn audio_kernel_sources(name: &str) -> (Option<&'static str>, Option<&'static st
         "glu_split" => cera::backend::wgpu::shaders::GLU_SPLIT,
         "chan_affine_silu" => cera::backend::wgpu::shaders::CHAN_AFFINE_SILU,
         "audio_xl_attention" => cera::backend::wgpu::shaders::AUDIO_XL_ATTENTION,
+        "stft_frame" => cera::backend::wgpu::shaders::STFT_FRAME,
+        "power_spec" => cera::backend::wgpu::shaders::POWER_SPEC,
+        "mel_project" => cera::backend::wgpu::shaders::MEL_PROJECT,
+        "mel_norm" => cera::backend::wgpu::shaders::MEL_NORM,
         other => panic!("no WGSL source registered for audio kernel {other}"),
     });
     #[cfg(not(feature = "gpu"))]
@@ -3303,6 +3311,10 @@ fn audio_kernel_sources(name: &str) -> (Option<&'static str>, Option<&'static st
         "glu_split" => cera::backend::metal::shaders::GLU_SPLIT,
         "chan_affine_silu" => cera::backend::metal::shaders::CHAN_AFFINE_SILU,
         "audio_xl_attention" => cera::backend::metal::shaders::AUDIO_XL_ATTENTION,
+        "stft_frame" => cera::backend::metal::shaders::STFT_FRAME,
+        "power_spec" => cera::backend::metal::shaders::POWER_SPEC,
+        "mel_project" => cera::backend::metal::shaders::MEL_PROJECT,
+        "mel_norm" => cera::backend::metal::shaders::MEL_NORM,
         other => panic!("no MSL source registered for audio kernel {other}"),
     });
     #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]

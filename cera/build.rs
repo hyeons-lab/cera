@@ -147,6 +147,10 @@ const SLANG_MULTI_KERNELS: &[&str] = &[
     "glu_split",
     "chan_affine_silu",
     "audio_xl_attention",
+    "stft_frame",
+    "power_spec",
+    "mel_project",
+    "mel_norm",
 ];
 
 /// Compile each multi-target kernel to the shader languages the enabled

@@ -475,6 +475,26 @@ fn slang_cases() -> Vec<(usize, &'static str, &'static str)> {
             include_str!("../src/backend/shaders/slang/audio_xl_attention.slang"),
             "AudioXlAttnParams",
         ),
+        (
+            size_of::<StftFrameParams>(),
+            include_str!("../src/backend/shaders/slang/stft_frame.slang"),
+            "StftFrameParams",
+        ),
+        (
+            size_of::<PowerSpecParams>(),
+            include_str!("../src/backend/shaders/slang/power_spec.slang"),
+            "PowerSpecParams",
+        ),
+        (
+            size_of::<MelProjectParams>(),
+            include_str!("../src/backend/shaders/slang/mel_project.slang"),
+            "MelProjectParams",
+        ),
+        (
+            size_of::<MelNormParams>(),
+            include_str!("../src/backend/shaders/slang/mel_norm.slang"),
+            "MelNormParams",
+        ),
     ]
 }
 

@@ -62,6 +62,16 @@ pub const HOP_LEN: usize = 160;
 pub const PREEMPH: f32 = 0.97;
 /// Floor added inside the natural-log of mel energies, ~`2^-24`.
 pub const LOG_MEL_EPS: f32 = 5.960_464_5e-8;
+/// Floor added to the per-feature variance *before* the square root, in the
+/// mel-spectrogram normalization. Distinct from [`LOG_MEL_EPS`] and from
+/// [`AudioEncoderConfig::eps`]: this one guards a `1/sqrt(var)` on a nearly
+/// constant mel bin, and it is what the C++ reference uses there.
+///
+/// `f64` because the CPU normalization accumulates in f64 and this is the
+/// literal it has always used there; the GPU front-end narrows it once, at the
+/// point it packs the value into a kernel's params. Typing it `f32` instead
+/// would round the CPU's floor through f32 and change the shipping path.
+pub const NORM_VAR_EPS: f64 = 1e-5;
 
 /// Configuration for the LFM2A Conformer audio encoder. Read from
 /// the `clip.audio.*` metadata block of the multimodal_projector

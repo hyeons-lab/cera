@@ -3,12 +3,16 @@
 //! The CPU encoder ([`super::audio_encoder::audio_encoder_forward`]) runs every
 //! linear layer through a per-timestep `gemv` and every attention score through a
 //! scalar triple loop, over 17 blocks, which is the slowest stage of the audio-in
-//! pipeline. This module batches the whole post-mel forward pass on the GPU.
+//! pipeline. This module batches the whole forward pass on the GPU, log-mel
+//! front-end included.
 //!
 //! Same shape as the vision encoder's GPU path: the math is written once against
-//! the [`AudioEncoderGpuOps`] trait and [`encode_audio_mel_gpu`] is
+//! the [`AudioEncoderGpuOps`] trait and the drivers above it are
 //! backend-agnostic, so a second backend is a host-side wiring change rather than
-//! a kernel port. Only the Metal implementation ships here; the wgpu one follows.
+//! a kernel port. [`encode_audio_pcm_gpu`] is the live entry point;
+//! [`encode_audio_mel_gpu`] takes a host spectrogram and exists so the parity
+//! suite can feed the GPU body the CPU front-end's output. Only the Metal
+//! implementation ships here; the wgpu one follows.
 //! Every kernel it will need is already generated for WGSL and exported as
 //! `backend::wgpu::shaders::*`, but nothing dispatches those yet: they are
 //! checked only for generation faults (no subgroup ops, no `enable f16`, entry
@@ -17,13 +21,22 @@
 //!
 //! Numerical reference is the CPU encoder: see `tests/audio_encoder_metal_parity.rs`.
 //!
+//! The log-mel front-end runs here too, as four kernels below
+//! [`log_mel_spectrogram_gpu`]: framing (with center padding, pre-emphasis and
+//! the Hann window folded into one gather), a direct-DFT power spectrum, the mel
+//! filterbank projection, and the per-feature normalization. The spectrogram
+//! never reaches the host: [`encode_audio_pcm_gpu`] hands the front-end's output
+//! buffer straight to the conv stem.
+//!
+//! Unlike the Conformer body, that front-end is **not** an exact port. The CPU
+//! path FFTs with `rustfft` and accumulates the power spectrum, the filterbank
+//! dot product and the normalization statistics in f64; neither an FFT nor a
+//! double is available in WGSL or in MSL on Apple GPUs.
+//! `tests/audio_encoder_metal_parity.rs` gates it per stage and, more
+//! importantly, gates what survives 17 Conformer blocks.
+//!
 //! What stays on the CPU:
 //!
-//! - **The log-mel front-end.** [`AudioGpuEncode::encode_pcm`] takes raw PCM and
-//!   calls [`crate::model::audio_preprocessor::log_mel_spectrogram`] before
-//!   handing the spectrogram to the GPU. Moving the STFT and mel filterbank onto
-//!   the GPU is a separate change, and this entry point is the seam for it:
-//!   callers pass PCM either way, so nothing above this module moves.
 //! - **The sinusoidal relative-position table** ([`super::audio_encoder::relative_pos_emb`]),
 //!   built once per chunk and uploaded. It is `O(t)` transcendentals against the
 //!   encoder's `O(t²·n_embd)` of real work, and it is CPU in the shipping Metal
@@ -45,9 +58,10 @@ use crate::model::weights::MmapWeight;
 /// rustdoc build.)
 ///
 /// The stem downsamples time by 8×, so this admits ~8192 mel frames ≈ 82 s of
-/// audio in one chunk. [`encode_audio_mel_gpu`] checks it *before* uploading
-/// anything and returns an error above it, so the caller falls back to the CPU
-/// encoder instead of the kernel writing past its scratch.
+/// audio in one chunk. Every public entry point checks it through
+/// `ensure_capacity` before its expensive step (uploading a spectrogram, or
+/// computing one) and returns an error above it, so the caller falls back to the
+/// CPU encoder instead of the kernel writing past its scratch.
 ///
 /// This value MUST match the `MAX_TOKENS` literal in
 /// `backend/shaders/slang/audio_xl_attention.slang`. The generated WGSL and MSL
@@ -98,15 +112,26 @@ mod const_sync_tests {
 
 /// The message both capacity refusals carry.
 ///
-/// `encode_pcm` refuses early (before the STFT) and `conv_stem_gpu` refuses
-/// again on the path that actually reaches the kernel. Two call sites, one
-/// spelling: the parity suite asserts on this text, and a wording edit that
+/// `ensure_capacity` refuses early, from the geometry alone, and `conv_stem_gpu`
+/// refuses again on the path that actually reaches the kernel. Two call sites,
+/// one spelling: the parity suite asserts on this text, and a wording edit that
 /// landed in only one of them would keep passing.
 fn over_capacity_msg(t_out: usize) -> String {
     format!(
         "post-stem length {t_out} exceeds MAX_AUDIO_TOKENS ({MAX_AUDIO_TOKENS}); \
          caller should fall back to the CPU encoder"
     )
+}
+
+/// The message both unrunnable-stem refusals carry.
+///
+/// `ensure_capacity` refuses early, from the geometry alone, and `conv_stem_gpu`
+/// refuses again on the path that dispatches. Same condition, so same spelling.
+/// Unlike [`over_capacity_msg`] no test asserts on this text; the reason here is
+/// only the general one, that two hand-written messages for one condition
+/// drift.
+fn unrunnable_stem_msg(n_frames: usize) -> String {
+    format!("audio encoder: conv stem cannot run on {n_frames} mel frames")
 }
 
 /// Per-stem-layer `(depthwise, stride, pad)`, hardcoded to the LFM2A C++
@@ -339,6 +364,168 @@ pub trait AudioEncoderGpuOps {
         n_head: usize,
         head_dim: usize,
     ) -> Self::Buf;
+
+    // ── Log-mel front-end ────────────────────────────────────────────────────
+    //
+    // These four take the STFT geometry from the crate constants
+    // (`audio_encoder::{N_FFT, HOP_LEN, PREEMPH}`, `audio_preprocessor::N_FFT_BINS`)
+    // rather than through the signature: they describe the LFM2A preprocessor,
+    // not the backend, so every implementation would read the same values.
+
+    /// Frame `pcm` into `[n_frames, N_FFT]`, applying center padding,
+    /// pre-emphasis and `hann` (an `N_FFT`-wide, zero-flanked window) in the
+    /// gather. `n_samples` is the un-padded PCM length.
+    fn stft_frames(
+        &self,
+        pcm: &Self::Buf,
+        hann: &Self::Buf,
+        n_samples: usize,
+        n_frames: usize,
+    ) -> Self::Buf;
+
+    /// Power spectrum `|X[k]|²` of each frame, `[n_frames, N_FFT_BINS]`.
+    /// `twiddle` is the `[N_FFT, 2]` cos/sin table of `-2π·m/N_FFT`.
+    fn power_spec(&self, frames: &Self::Buf, twiddle: &Self::Buf, n_frames: usize) -> Self::Buf;
+
+    /// Project the power spectrum through `filters` (`[n_mel, N_FFT_BINS]`) and
+    /// take the natural log with the `LOG_MEL_EPS` floor. Returns **mel-major**
+    /// `[n_mel, n_frames]`, the layout [`Self::mel_norm`] reduces over.
+    fn mel_project(
+        &self,
+        power: &Self::Buf,
+        filters: &Self::Buf,
+        n_mel: usize,
+        n_frames: usize,
+    ) -> Self::Buf;
+
+    /// Per-mel-bin normalization of a mel-major `[n_mel, n_frames]` spectrogram,
+    /// returning **time-major** `[n_frames, n_mel]`. Statistics come from the
+    /// first `effective_n_len` frames; the rest are zeroed.
+    fn mel_norm(
+        &self,
+        mel: &Self::Buf,
+        n_mel: usize,
+        n_frames: usize,
+        effective_n_len: usize,
+    ) -> Self::Buf;
+}
+
+/// The constant inputs of the log-mel front-end, uploaded once per model.
+///
+/// None of the three depends on the audio: the window and the twiddles are fixed
+/// by the STFT geometry and the filterbank by `n_mel_bins`. Rebuilding them per
+/// utterance would cost more host work than the front-end saves.
+pub struct GpuMelFrontend<O: AudioEncoderGpuOps> {
+    /// Periodic Hann window centered in an `N_FFT`-wide buffer.
+    hann: O::Buf,
+    /// `[N_FFT, 2]` cos/sin of `-2π·m/N_FFT`, indexed by `(k·n) mod N_FFT`.
+    twiddle: O::Buf,
+    /// Slaney mel filterbank, `[n_mel, N_FFT_BINS]`.
+    filters: O::Buf,
+    n_mel: usize,
+}
+
+impl<O: AudioEncoderGpuOps> GpuMelFrontend<O> {
+    /// Upload the window, twiddles and `n_mel`-band filterbank.
+    ///
+    /// Public, and separately constructible from [`GpuAudioWeights`], so the
+    /// front-end can be parity-checked without a model file: it depends on
+    /// nothing in the GGUF but the band count.
+    pub fn build(ops: &O, n_mel: usize) -> Result<Self> {
+        use crate::model::audio_encoder::{N_FFT, SAMPLE_RATE};
+        use crate::model::audio_preprocessor::{build_mel_filterbank, build_padded_hann_window};
+
+        // `build_mel_filterbank` panics on a zero bin count; refuse here instead,
+        // so a model with a broken config falls back to the CPU encoder.
+        anyhow::ensure!(n_mel > 0, "audio encoder config has n_mel_bins = 0");
+        Ok(Self {
+            hann: ops.upload(&build_padded_hann_window()),
+            twiddle: ops.upload(&dft_twiddles(N_FFT)),
+            filters: ops.upload(&build_mel_filterbank(n_mel, N_FFT, SAMPLE_RATE as usize)),
+            n_mel,
+        })
+    }
+
+    /// The uploaded twiddle table, for driving [`AudioEncoderGpuOps::power_spec`]
+    /// directly.
+    ///
+    /// Exists for the parity suite's per-stage checks, in the same spirit as
+    /// [`encoder_input_gpu`]. Handing the test the shipped table rather than
+    /// letting it build its own keeps the stage check on the production input.
+    pub fn twiddle(&self) -> &O::Buf {
+        &self.twiddle
+    }
+}
+
+/// The `[n_fft, 2]` cos/sin table the DFT reads, interleaved.
+///
+/// Entry `m` is `exp(-2πi·m/n_fft)`. The DFT's angle depends only on
+/// `(k·n) mod n_fft`, so `n_fft` entries cover every `(bin, tap)` pair rather
+/// than the `n_fft²` a naive table would hold: 4 KB for LFM2A.
+///
+/// Computed in f64 and rounded once. That is the whole reason this is a table
+/// and not a `cos()` in the shader: a GPU `cos` of `-2π·k·n/N` at `k·n` in the
+/// tens of thousands is argument-reduced with far less care than this is.
+fn dft_twiddles(n_fft: usize) -> Vec<f32> {
+    (0..n_fft)
+        .flat_map(|m| {
+            let ang = -2.0 * std::f64::consts::PI * m as f64 / n_fft as f64;
+            [ang.cos() as f32, ang.sin() as f32]
+        })
+        .collect()
+}
+
+/// Compute the log-mel spectrogram of `pcm` entirely on the GPU, leaving the
+/// result in device memory.
+///
+/// Matches [`crate::model::audio_preprocessor::log_mel_spectrogram`]:
+/// `[n_frames, n_mel]` row-major, time-major outer.
+///
+/// `Ok(None)` has exactly one meaning: the chunk is too short to produce a
+/// frame, which is also the only case where the buffer would be zero-length. A
+/// chunk this path cannot run is an `Err`, never an empty result, so a caller
+/// cannot mistake a refusal for silence.
+///
+/// Approximates that function rather than reproducing it (see the module doc):
+/// the FFT becomes a direct DFT and three f64 reductions become f32 ones.
+pub fn log_mel_spectrogram_gpu<O: AudioEncoderGpuOps>(
+    ops: &O,
+    fe: &GpuMelFrontend<O>,
+    pcm: &[f32],
+) -> Result<Option<(O::Buf, usize)>> {
+    use crate::model::audio_encoder::N_FFT;
+    use crate::model::audio_preprocessor::{N_FFT_BINS, effective_n_len, n_frames_for};
+
+    let n_frames = n_frames_for(pcm.len());
+    if n_frames == 0 {
+        return Ok(None);
+    }
+    // The kernels index their buffers with `uint`, so the binding limit is the
+    // largest element count they compute (`n_frames * n_fft` and friends), not
+    // the frame count: bounding only `n_frames` would leave `total` free to wrap
+    // and return most threads early, which is the silent truncation this exists
+    // to prevent. `encode_audio_pcm_gpu` bounds `n_frames` far below all of this
+    // through `ensure_capacity`, but this entry point is public and has no such
+    // caller guarantee.
+    let fits = |n: usize| n <= u32::MAX as usize;
+    anyhow::ensure!(
+        fits(pcm.len())
+            && [N_FFT, N_FFT_BINS, fe.n_mel]
+                .into_iter()
+                .all(|width| n_frames.checked_mul(width).is_some_and(fits)),
+        "audio front-end: {} samples ({n_frames} frames) exceed the kernels' u32 buffer indices",
+        pcm.len(),
+    );
+
+    let pcm_buf = ops.upload(pcm);
+    let frames = ops.stft_frames(&pcm_buf, &fe.hann, pcm.len(), n_frames);
+    let power = ops.power_spec(&frames, &fe.twiddle, n_frames);
+    let mel = ops.mel_project(&power, &fe.filters, fe.n_mel, n_frames);
+    let eff = effective_n_len(pcm.len(), n_frames);
+    Ok(Some((
+        ops.mel_norm(&mel, fe.n_mel, n_frames, eff),
+        n_frames,
+    )))
 }
 
 /// One conv-stem layer uploaded to GPU buffers, plus the geometry the loader
@@ -508,6 +695,10 @@ fn validate_block(il: usize, b: &ConformerLayerWeights, cfg: &AudioEncoderConfig
 /// expensive part and must not happen per utterance.
 pub struct GpuAudioWeights<O: AudioEncoderGpuOps> {
     cfg: AudioEncoderConfig,
+    /// Window, twiddles and mel filterbank for the GPU log-mel front-end. Not a
+    /// weight (nothing here comes out of the GGUF), but it has the same lifetime
+    /// and the same reason to exist: uploaded once, reused per utterance.
+    mel_frontend: GpuMelFrontend<O>,
     stem: Vec<GpuStemLayer<O>>,
     pre_encode_out_w: O::Weight,
     pre_encode_out_b: O::Buf,
@@ -668,6 +859,7 @@ impl<O: AudioEncoderGpuOps> GpuAudioWeights<O> {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
+            mel_frontend: GpuMelFrontend::build(ops, cfg.n_mel_bins)?,
             cfg,
             stem,
             pre_encode_out_w: ops.upload_weight(&w.conv_stem.pre_encode_out_w),
@@ -730,9 +922,9 @@ impl<O: AudioEncoderGpuOps> GpuAudioWeights<O> {
     /// Walk the stem's geometry to get the post-stem sequence length for
     /// `n_frames` mel frames, without touching the GPU.
     ///
-    /// Lets [`AudioGpuEncode::encode_pcm`] check the attention kernel's capacity
-    /// *before* computing the spectrogram, so an over-long chunk costs nothing on
-    /// its way to the CPU fallback.
+    /// Lets `ensure_capacity` check the attention kernel's capacity *before* a
+    /// spectrogram is uploaded or computed, so an over-long chunk costs nothing
+    /// on its way to the CPU fallback.
     ///
     /// It cannot disagree with the stem that actually runs because both go
     /// through the one `stem_specs` walk (plain code span: it is private, and an
@@ -792,51 +984,64 @@ impl<O: AudioEncoderGpuOps> GpuAudioWeights<O> {
 /// Run the conv subsampling stem and the `pre_encode_out` projection, producing
 /// the `[t_out × n_embd]` sequence the Conformer stack consumes.
 ///
-/// `Ok(None)` means there is nothing to encode (`n_frames == 0`). Split out from
-/// [`encode_audio_mel_gpu`] so the stem has its own parity boundary against
-/// `cpu::conv_stem_forward`, reachable through [`encoder_input_gpu`]. A
+/// `mel` is a device buffer, `[n_frames, n_mel_bins]` row-major: it comes either
+/// from [`log_mel_spectrogram_gpu`] (never touching the host) or from a host
+/// spectrogram uploaded by [`upload_mel`].
+///
+/// Split out from `encode_audio_gpu` so the stem has its own parity boundary
+/// against `cpu::conv_stem_forward`, reachable through [`encoder_input_gpu`]. A
 /// divergence here and one 17 blocks later are very different bugs, and an
 /// end-to-end check alone cannot tell them apart.
+///
+/// Callers guarantee `n_frames > 0`; a zero reaches the stem-geometry walk and
+/// comes back as "cannot run on 0 mel frames" rather than a silent empty result.
 fn conv_stem_gpu<O: AudioEncoderGpuOps>(
     ops: &O,
     gpu_w: &GpuAudioWeights<O>,
-    mel: &[f32],
+    mel: &O::Buf,
     n_frames: usize,
-) -> Result<Option<(O::Buf, usize)>> {
+) -> Result<(O::Buf, usize)> {
     let cfg = &gpu_w.cfg;
-    anyhow::ensure!(
-        mel.len() == n_frames * cfg.n_mel_bins,
-        "conv_stem_gpu: mel.len() {} != n_frames * n_mel_bins ({n_frames} * {})",
-        mel.len(),
-        cfg.n_mel_bins,
-    );
-    if n_frames == 0 {
-        return Ok(None);
-    }
 
-    // Capacity check before any upload: the geometry walk is pure arithmetic, so
-    // an over-long chunk costs nothing on its way to the CPU fallback. These are
-    // the same specs the dispatch loop below uses, so the guard cannot drift
-    // from the work it guards.
-    let specs = gpu_w.stem_specs(n_frames).ok_or_else(|| {
-        anyhow::anyhow!("conv_stem_gpu: stem cannot run on {n_frames} mel frames")
-    })?;
-    let last = specs
-        .last()
-        .ok_or_else(|| anyhow::anyhow!("conv_stem_gpu: conv stem has no layers"))?;
+    // Re-checked here even though every caller has already been through
+    // `ensure_capacity`, which is where the "costs nothing on the way to the CPU
+    // fallback" property lives: by this point a spectrogram has been uploaded or
+    // computed. This copy is deliberate belt-and-braces, and cheap (a five-entry
+    // geometry walk). What it guards is a fixed-size workgroup array in the
+    // attention kernel, so the failure mode of losing it is an out-of-bounds
+    // write rather than a wrong number, and these are the same specs the
+    // dispatch loop below uses, so it cannot drift from the work it guards.
+    let specs = gpu_w
+        .stem_specs(n_frames)
+        .ok_or_else(|| anyhow::anyhow!("{}", unrunnable_stem_msg(n_frames)))?;
+    // One spelling for both refusals, as with `over_capacity_msg`: the geometry
+    // walk and the dispatch fold are separately empty-able as far as the type
+    // system knows, and two hand-written messages for the same condition drift.
+    let no_layers = || anyhow::anyhow!("conv_stem_gpu: conv stem has no layers");
+    let last = specs.last().ok_or_else(no_layers)?;
     let (t, f_out) = (last.h_out, last.w_out);
     anyhow::ensure!(t > 0 && t <= MAX_AUDIO_TOKENS, "{}", over_capacity_msg(t));
 
-    let cur = gpu_w.stem.iter().zip(&specs).zip(STEM_RELU_AFTER).fold(
-        ops.upload(mel),
-        |input, ((layer, spec), relu)| {
-            let out = ops.conv2d(&input, &layer.weight, &layer.bias, spec);
+    // The accumulator starts empty rather than at `mel` because the first layer
+    // reads a borrowed buffer and every later one an owned intermediate.
+    let cur = gpu_w
+        .stem
+        .iter()
+        .zip(&specs)
+        .zip(STEM_RELU_AFTER)
+        .fold(None, |input, ((layer, spec), relu)| {
+            let out = ops.conv2d(
+                input.as_ref().unwrap_or(mel),
+                &layer.weight,
+                &layer.bias,
+                spec,
+            );
             if relu {
                 ops.relu(&out, spec.out_len());
             }
-            out
-        },
-    );
+            Some(out)
+        })
+        .ok_or_else(no_layers)?;
 
     let cur_ch = last.out_ch;
     let plane = cur_ch * f_out;
@@ -851,23 +1056,80 @@ fn conv_stem_gpu<O: AudioEncoderGpuOps>(
     let flat = ops.transpose_blocked(&cur, cur_ch, t, f_out);
     let x = ops.linear(&flat, &gpu_w.pre_encode_out_w, t, cfg.n_embd, plane);
     ops.bias_add(&x, &gpu_w.pre_encode_out_b, t, cfg.n_embd);
-    Ok(Some((x, t)))
+    Ok((x, t))
+}
+
+/// Refuse a chunk the attention kernel cannot hold, from the frame count alone.
+///
+/// Pure arithmetic over the stem geometry, so an over-long chunk costs nothing
+/// on its way to the CPU fallback. It runs before the expensive step on every
+/// path that reaches the encoder: [`upload_mel`] calls it before copying a
+/// spectrogram to the device (covering [`encode_audio_mel_gpu`] and
+/// [`encoder_input_gpu`]), and [`encode_audio_pcm_gpu`] calls it before computing
+/// one. `conv_stem_gpu` re-checks with the specs it actually dispatches, so the
+/// guard still holds for a caller that skips this.
+fn ensure_capacity<O: AudioEncoderGpuOps>(
+    gpu_w: &GpuAudioWeights<O>,
+    n_frames: usize,
+) -> Result<()> {
+    let t_out = gpu_w
+        .predict_t_out(n_frames)
+        .ok_or_else(|| anyhow::anyhow!("{}", unrunnable_stem_msg(n_frames)))?;
+    anyhow::ensure!(
+        t_out > 0 && t_out <= MAX_AUDIO_TOKENS,
+        "{}",
+        over_capacity_msg(t_out)
+    );
+    Ok(())
+}
+
+/// Check a host spectrogram against the model's geometry, refuse it if it is
+/// over capacity, and only then upload it.
+///
+/// The order is the point. The length check is a caller error, the capacity
+/// refusal is free, and the upload is the only expensive step; refusing after it
+/// would mean copying exactly the largest spectrograms, the ones that get
+/// refused, for nothing.
+///
+/// `Ok(None)` means there is nothing to encode. That case is separated from the
+/// upload rather than handled inside it because a zero-length allocation is not
+/// something every backend will accept, and because the callers all want to
+/// return an empty result rather than an error.
+fn upload_mel<O: AudioEncoderGpuOps>(
+    ops: &O,
+    gpu_w: &GpuAudioWeights<O>,
+    mel: &[f32],
+    n_frames: usize,
+) -> Result<Option<O::Buf>> {
+    anyhow::ensure!(
+        mel.len() == n_frames * gpu_w.cfg.n_mel_bins,
+        "audio encoder: mel.len() {} != n_frames * n_mel_bins ({n_frames} * {})",
+        mel.len(),
+        gpu_w.cfg.n_mel_bins,
+    );
+    if n_frames == 0 {
+        return Ok(None);
+    }
+    ensure_capacity(gpu_w, n_frames)?;
+    Ok(Some(ops.upload(mel)))
 }
 
 /// The conv stem's output, read back to the host: `(encoder_in [t_out × n_embd],
 /// t_out)`, directly comparable to [`super::audio_encoder::conv_stem_forward`].
 ///
-/// Exists for the parity suite. The forward pass keeps the buffer on the GPU.
+/// Exists for the parity suite, and takes a host spectrogram so it can be fed
+/// the CPU front-end's output. The forward pass keeps everything on the GPU.
 pub fn encoder_input_gpu<O: AudioEncoderGpuOps>(
     ops: &O,
     gpu_w: &GpuAudioWeights<O>,
     mel: &[f32],
     n_frames: usize,
 ) -> Result<(Vec<f32>, usize)> {
-    match conv_stem_gpu(ops, gpu_w, mel, n_frames)? {
-        Some((x, t)) => Ok((ops.download(&x, t * gpu_w.cfg.n_embd), t)),
-        None => Ok((Vec::new(), 0)),
-    }
+    let Some(mel_buf) = upload_mel(ops, gpu_w, mel, n_frames)? else {
+        return Ok((Vec::new(), 0));
+    };
+    let (x, t) = conv_stem_gpu(ops, gpu_w, &mel_buf, n_frames)?;
+    Ok((ops.download(&x, t * gpu_w.cfg.n_embd), t))
 }
 
 /// Run the Conformer encoder + MLP adapter on the GPU. Backend-agnostic: `ops`
@@ -880,19 +1142,69 @@ pub fn encoder_input_gpu<O: AudioEncoderGpuOps>(
 ///
 /// Returns an error (rather than falling back silently) when the chunk exceeds
 /// the attention kernel's capacity, so the caller decides how to degrade.
+///
+/// Takes a **host** spectrogram, so it is the entry point for feeding the GPU
+/// encoder the CPU front-end's output: the parity suite pins the two halves
+/// against each other that way. The live path is [`encode_audio_pcm_gpu`], which
+/// computes the spectrogram on the GPU and never copies it back.
 pub fn encode_audio_mel_gpu<O: AudioEncoderGpuOps>(
     ops: &O,
     gpu_w: &GpuAudioWeights<O>,
     mel: &[f32],
     n_frames: usize,
 ) -> Result<(Vec<f32>, usize)> {
+    let Some(mel_buf) = upload_mel(ops, gpu_w, mel, n_frames)? else {
+        return Ok((Vec::new(), 0));
+    };
+    encode_audio_gpu(ops, gpu_w, &mel_buf, n_frames)
+}
+
+/// Encode raw PCM end to end on the GPU: log-mel front-end, conv stem, Conformer
+/// stack, MLP adapter. Output matches
+/// [`super::audio_encoder::encode_audio_pcm`]: `(embeddings [t_out ×
+/// llm_hidden_size], t_out)`.
+///
+/// The capacity refusal happens here, from the frame count alone, *before* the
+/// front-end runs. A refusal sends the caller to the CPU encoder, which computes
+/// its own spectrogram; computing one here first would mean paying for the STFT
+/// twice, and the refusal case is by definition the longest utterances, where
+/// that is most expensive.
+pub fn encode_audio_pcm_gpu<O: AudioEncoderGpuOps>(
+    ops: &O,
+    gpu_w: &GpuAudioWeights<O>,
+    pcm: &[f32],
+) -> Result<(Vec<f32>, usize)> {
+    let n_frames = crate::model::audio_preprocessor::n_frames_for(pcm.len());
+    if n_frames == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    ensure_capacity(gpu_w, n_frames)?;
+
+    // The front-end decides emptiness from the same `n_frames_for` the early
+    // return above used, so this arm cannot be reached; it is here because the
+    // return type is an `Option`, not as a second guard on the same condition.
+    // (Its other failure mode, a chunk too large for the kernels' `u32` sizes,
+    // is an `Err` and propagates rather than arriving here as an empty result.)
+    let Some((mel, n_frames)) = log_mel_spectrogram_gpu(ops, &gpu_w.mel_frontend, pcm)? else {
+        return Ok((Vec::new(), 0));
+    };
+    encode_audio_gpu(ops, gpu_w, &mel, n_frames)
+}
+
+/// The encoder proper, from an already-resident `[n_frames, n_mel_bins]`
+/// spectrogram. Both entry points funnel here so the front-end's origin (host
+/// upload or GPU kernels) changes nothing below the stem.
+fn encode_audio_gpu<O: AudioEncoderGpuOps>(
+    ops: &O,
+    gpu_w: &GpuAudioWeights<O>,
+    mel: &O::Buf,
+    n_frames: usize,
+) -> Result<(Vec<f32>, usize)> {
     let cfg = &gpu_w.cfg;
     let (n_embd, n_ff, n_head, eps) = (cfg.n_embd, cfg.n_ff, cfg.n_head, cfg.eps);
     let head_dim = n_embd / n_head;
 
-    let Some((mut x, t)) = conv_stem_gpu(ops, gpu_w, mel, n_frames)? else {
-        return Ok((Vec::new(), 0));
-    };
+    let (mut x, t) = conv_stem_gpu(ops, gpu_w, mel, n_frames)?;
 
     // ── Stage 2: relative-position embedding, built on the CPU once per chunk ──
     let seq_len = 2 * t - 1;
@@ -1041,7 +1353,8 @@ fn macaron_ffn<O: AudioEncoderGpuOps>(
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 use crate::backend::metal::params::{
     AudioXlAttnParams, Batch2dParams, BiasAddParams, Conv2dDirectParams, ElementwiseParams,
-    LayerNormBatchParams, MetalParams, ScaleParams, TransposeBlockedParams,
+    LayerNormBatchParams, MelNormParams, MelProjectParams, MetalParams, PowerSpecParams,
+    ScaleParams, StftFrameParams, TransposeBlockedParams,
 };
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 use crate::backend::metal::{MetalLinear, MetalLinearWeight};
@@ -1071,6 +1384,10 @@ pub struct MetalAudioOps {
     p_glu: metal::ComputePipelineState,
     p_chan_affine: metal::ComputePipelineState,
     p_attn: metal::ComputePipelineState,
+    p_stft: metal::ComputePipelineState,
+    p_power: metal::ComputePipelineState,
+    p_mel_project: metal::ComputePipelineState,
+    p_mel_norm: metal::ComputePipelineState,
 }
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -1091,6 +1408,10 @@ impl MetalAudioOps {
             p_glu: ctx.create_pipeline(shaders::GLU_SPLIT, "glu_split")?,
             p_chan_affine: ctx.create_pipeline(shaders::CHAN_AFFINE_SILU, "chan_affine_silu")?,
             p_attn: ctx.create_pipeline(shaders::AUDIO_XL_ATTENTION, "audio_xl_attention")?,
+            p_stft: ctx.create_pipeline(shaders::STFT_FRAME, "stft_frame")?,
+            p_power: ctx.create_pipeline(shaders::POWER_SPEC, "power_spec")?,
+            p_mel_project: ctx.create_pipeline(shaders::MEL_PROJECT, "mel_project")?,
+            p_mel_norm: ctx.create_pipeline(shaders::MEL_NORM, "mel_norm")?,
             ctx,
         })
     }
@@ -1314,16 +1635,107 @@ impl AudioEncoderGpuOps for MetalAudioOps {
         );
         out
     }
+
+    fn stft_frames(
+        &self,
+        pcm: &Self::Buf,
+        hann: &Self::Buf,
+        n_samples: usize,
+        n_frames: usize,
+    ) -> Self::Buf {
+        use crate::model::audio_encoder::{HOP_LEN, N_FFT, PREEMPH};
+
+        let total = n_frames * N_FFT;
+        let frames = self.alloc(total);
+        let params = StftFrameParams {
+            n_frames: n_frames as u32,
+            n_fft: N_FFT as u32,
+            hop: HOP_LEN as u32,
+            // `N_FFT / 2` per side, matching the CPU path's librosa
+            // `center=True` behaviour.
+            center_pad: (N_FFT / 2) as u32,
+            n_samples: n_samples as u32,
+            preemph_bits: PREEMPH.to_bits(),
+            _pad0: 0,
+            _pad1: 0,
+        };
+        self.run_flat(&self.p_stft, &[pcm, hann, &frames], &params, total);
+        frames
+    }
+
+    fn power_spec(&self, frames: &Self::Buf, twiddle: &Self::Buf, n_frames: usize) -> Self::Buf {
+        use crate::model::audio_encoder::N_FFT;
+        use crate::model::audio_preprocessor::N_FFT_BINS;
+
+        let total = n_frames * N_FFT_BINS;
+        let power = self.alloc(total);
+        let params = PowerSpecParams {
+            n_frames: n_frames as u32,
+            n_fft: N_FFT as u32,
+            n_bins: N_FFT_BINS as u32,
+            _pad: 0,
+        };
+        self.run_flat(&self.p_power, &[frames, twiddle, &power], &params, total);
+        power
+    }
+
+    fn mel_project(
+        &self,
+        power: &Self::Buf,
+        filters: &Self::Buf,
+        n_mel: usize,
+        n_frames: usize,
+    ) -> Self::Buf {
+        use crate::model::audio_encoder::LOG_MEL_EPS;
+        use crate::model::audio_preprocessor::N_FFT_BINS;
+
+        let total = n_mel * n_frames;
+        let mel = self.alloc(total);
+        let params = MelProjectParams {
+            n_mel: n_mel as u32,
+            n_frames: n_frames as u32,
+            n_bins: N_FFT_BINS as u32,
+            eps_bits: LOG_MEL_EPS.to_bits(),
+        };
+        self.run_flat(&self.p_mel_project, &[power, filters, &mel], &params, total);
+        mel
+    }
+
+    fn mel_norm(
+        &self,
+        mel: &Self::Buf,
+        n_mel: usize,
+        n_frames: usize,
+        effective_n_len: usize,
+    ) -> Self::Buf {
+        let dst = self.alloc(n_mel * n_frames);
+        let params = MelNormParams {
+            n_mel: n_mel as u32,
+            n_frames: n_frames as u32,
+            effective_n_len: effective_n_len as u32,
+            eps_bits: (crate::model::audio_encoder::NORM_VAR_EPS as f32).to_bits(),
+        };
+        // One workgroup per mel bin: the reduction is over the time axis, which
+        // is the contiguous one in this (mel-major) input.
+        self.ctx.run_kernel(
+            &self.p_mel_norm,
+            &[mel, &dst],
+            &params,
+            metal::MTLSize::new(n_mel as u64, 1, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+        dst
+    }
 }
 
 // ── Cached, object-safe encoder for the live session path ────────────────────
 
 /// Object-safe GPU audio encoder cached in a [`crate::session::Session`].
 ///
-/// Takes **raw PCM**, not a mel spectrogram, so that moving the log-mel
-/// front-end onto the GPU later is entirely below this boundary and no caller
-/// changes. Implementors are `Send + Sync` so the engine can share one across
-/// sessions.
+/// Takes **raw PCM**, not a mel spectrogram, so the log-mel front-end sits
+/// entirely below this boundary: it runs on the GPU (see
+/// [`log_mel_spectrogram_gpu`]) without any caller knowing. Implementors are
+/// `Send + Sync` so the engine can share one across sessions.
 pub trait AudioGpuEncode: Send + Sync {
     /// Encode mono PCM at [`super::audio_encoder::SAMPLE_RATE`] into per-frame
     /// LLM-hidden-size embeddings. Output matches
@@ -1340,32 +1752,7 @@ struct MetalAudioEncoder {
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 impl AudioGpuEncode for MetalAudioEncoder {
     fn encode_pcm(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize)> {
-        // Decide capacity from the frame count alone, before computing the
-        // spectrogram. A refusal sends the caller to the CPU encoder, which runs
-        // its own `log_mel_spectrogram`; computing it here first would mean
-        // paying for the STFT twice, and the refusal case is by definition the
-        // longest utterances, where it is most expensive.
-        let n_frames = crate::model::audio_preprocessor::n_frames_for(pcm.len());
-        if n_frames == 0 {
-            return Ok((Vec::new(), 0));
-        }
-        let t_out = self.weights.predict_t_out(n_frames).ok_or_else(|| {
-            anyhow::anyhow!("audio encoder: conv stem cannot run on {n_frames} mel frames")
-        })?;
-        anyhow::ensure!(
-            t_out > 0 && t_out <= MAX_AUDIO_TOKENS,
-            "{}",
-            over_capacity_msg(t_out)
-        );
-
-        let (mel, mel_frames) =
-            crate::model::audio_preprocessor::log_mel_spectrogram(pcm, self.weights.cfg.n_mel_bins);
-        anyhow::ensure!(
-            mel_frames == n_frames,
-            "audio encoder: n_frames_for predicted {n_frames} frames but the \
-             spectrogram has {mel_frames}",
-        );
-        encode_audio_mel_gpu(&self.ops, &self.weights, &mel, n_frames)
+        encode_audio_pcm_gpu(&self.ops, &self.weights, pcm)
     }
 }
 

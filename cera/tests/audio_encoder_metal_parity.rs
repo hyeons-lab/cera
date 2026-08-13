@@ -11,7 +11,7 @@
 //! layout assumption that happens to hold for a square, uniform fixture and not
 //! for the shipped shapes).
 //!
-//! Checks two stage boundaries, not just the end:
+//! Checks stage boundaries, not just the end:
 //!
 //! 1. **Conv stem**: `encoder_input_gpu` vs `conv_stem_forward`. Covers
 //!    `conv2d_direct` in all three stem modes (regular, depthwise, pointwise),
@@ -20,6 +20,9 @@
 //! 2. **Full encoder**: `encode_audio_mel_gpu` vs `audio_encoder_forward`.
 //!    Everything above plus 17 blocks of macaron FFN, XL attention, and the conv
 //!    module, then the erf-GELU adapter.
+//! 3. **Log-mel front-end**: framing, the direct DFT, and the whole spectrogram,
+//!    then `encode_audio_pcm_gpu` end to end. See the second tolerance section
+//!    below; this half is an approximation, not a port.
 //!
 //! ## Tolerances, and why the CPU is the approximate side
 //!
@@ -48,9 +51,34 @@
 //! the GPU is *closer* to the reference than the CPU is. A real kernel bug
 //! fails that ordering, activation quantization cannot.
 //!
+//! ## Tolerances for the front-end, where the GPU *is* the approximate side
+//!
+//! The reverse holds for the log-mel front-end, and it needs its own gates. The
+//! CPU FFTs with `rustfft` and accumulates the power spectrum, the mel
+//! filterbank dot product and the normalization statistics in f64. The GPU runs
+//! a direct DFT and three f32 reductions, because neither WGSL nor MSL on Apple
+//! GPUs has an FFT or a double. Measured on an M1 Max:
+//!
+//! | comparison                                 | rel-L2         |
+//! |--------------------------------------------|----------------|
+//! | power spectrum vs an f64 DFT               | 5.3e-7         |
+//! | whole front-end vs the CPU front-end       | 8.4e-6..2.9e-5 |
+//! | its effect on the encoder, after 17 blocks | 4.5e-6         |
+//!
+//! The last row is what decides whether the front-end is good enough, and it is
+//! smaller than the front-end's own error: the encoder's LayerNorms and
+//! residuals contract the difference rather than amplifying it. It is measured
+//! by running the *same* GPU body over both spectrograms, so nothing else can
+//! mask it.
+//!
+//! The middle row is a range because it is not monotone in duration, which is
+//! the opposite of what the f32 reductions suggest: it is worst at 211 frames
+//! and best at the 8101-frame ceiling. See `mel_frontend_parity`.
+//!
 //! Skips cleanly when the mmproj is absent or no Metal device exists;
 //! `CERA_REQUIRE_METAL=1` turns the missing device into a failure, per the
-//! project-wide convention.
+//! project-wide convention. The front-end stage tests need no model at all: the
+//! front-end depends on nothing in the GGUF but the band count.
 
 mod common;
 
@@ -812,4 +840,326 @@ fn xl_attention_strided_path_parity() {
         1e-4,
         1e-4,
     );
+}
+
+// ── Tests 7-11: the log-mel front-end ───────────────────────────────────────
+//
+// Unlike everything above, this half is not an exact port: the CPU FFTs with
+// rustfft and accumulates the power spectrum, the filterbank dot product and the
+// normalization statistics in f64, none of which the GPU has. So the stages are
+// checked against *higher-precision* references rather than against the CPU
+// path, and the end-to-end check measures what actually matters, which is how
+// much of the difference survives 17 Conformer blocks.
+
+/// The frame buffer `stft_frame` is supposed to produce, built the way the CPU
+/// preprocessor builds it: materialize the center-padded signal, pre-emphasize
+/// it, then slice and window each frame.
+///
+/// Deliberately not the kernel's shape. The kernel never builds a padded buffer;
+/// it recovers each tap with a bounds test on the un-padded index. Two
+/// structurally different routes to the same numbers is the only thing that makes
+/// this a check rather than a restatement.
+fn reference_frames(pcm: &[f32], hann: &[f32], n_frames: usize) -> Vec<f32> {
+    use cera::model::audio_encoder::{HOP_LEN, N_FFT, PREEMPH};
+
+    let pad = N_FFT / 2;
+    let padded: Vec<f32> = std::iter::repeat_n(0.0f32, pad)
+        .chain(pcm.iter().copied())
+        .chain(std::iter::repeat_n(0.0f32, pad))
+        .collect();
+    // Pre-emphasis over the inner region only, and reading the *original*
+    // neighbour, matching the C++ reference's write-back over
+    // `samples[pad+1 .. pad+n_samples]`.
+    let inner_end = padded.len() - pad;
+    let emph: Vec<f32> = padded
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| {
+            if i > pad && i < inner_end {
+                x - PREEMPH * padded[i - 1]
+            } else {
+                x
+            }
+        })
+        .collect();
+
+    (0..n_frames)
+        .flat_map(|ti| {
+            let off = ti * HOP_LEN;
+            emph[off..off + N_FFT]
+                .iter()
+                .zip(hann)
+                .map(|(&s, &h)| s * h)
+                .collect::<Vec<f32>>()
+        })
+        .collect()
+}
+
+/// Exact (f64) power spectrum of `frames`, one row of `N_FFT_BINS` per frame.
+///
+/// An f64 DFT rather than an FFT: this is the reference the *GPU* is measured
+/// against, so it has to be more accurate than either implementation, and a
+/// direct transform in f64 is both.
+fn reference_power(frames: &[f32], n_frames: usize) -> Vec<f32> {
+    use cera::model::audio_encoder::N_FFT;
+    use cera::model::audio_preprocessor::N_FFT_BINS;
+
+    (0..n_frames)
+        .flat_map(|ti| {
+            let frame = &frames[ti * N_FFT..(ti + 1) * N_FFT];
+            (0..N_FFT_BINS)
+                .map(|k| {
+                    let (re, im) =
+                        frame
+                            .iter()
+                            .enumerate()
+                            .fold((0.0f64, 0.0f64), |(re, im), (n, &x)| {
+                                let ang = -2.0 * std::f64::consts::PI * ((k * n) % N_FFT) as f64
+                                    / N_FFT as f64;
+                                (re + x as f64 * ang.cos(), im + x as f64 * ang.sin())
+                            });
+                    (re * re + im * im) as f32
+                })
+                .collect::<Vec<f32>>()
+        })
+        .collect()
+}
+
+/// Framing: center padding, pre-emphasis and the Hann window, all folded into
+/// one gather.
+///
+/// No reduction is involved, so this stage has no excuse to be approximate and
+/// the gate is at f32 rounding. It is also the stage where a silent off-by-one
+/// is most likely and least visible downstream: a window placed at tap 0 instead
+/// of tap 56, or pre-emphasis applied one sample early, still yields a plausible
+/// spectrogram.
+#[test]
+fn stft_frames_parity() {
+    use cera::model::audio_encoder::N_FFT;
+    use cera::model::audio_encoder_gpu::AudioEncoderGpuOps;
+    use cera::model::audio_preprocessor::{build_padded_hann_window, n_frames_for};
+
+    let Some(ctx) = common::metal_context() else {
+        return;
+    };
+    let ops = MetalAudioOps::new(ctx).expect("build Metal audio ops");
+
+    let pcm = test_pcm(0.4);
+    let n_frames = n_frames_for(pcm.len());
+    assert!(n_frames > 0, "test signal produced no frames");
+    let hann = build_padded_hann_window();
+
+    let want = reference_frames(&pcm, &hann, n_frames);
+    let got = ops.download(
+        &ops.stft_frames(&ops.upload(&pcm), &ops.upload(&hann), pcm.len(), n_frames),
+        n_frames * N_FFT,
+    );
+
+    assert_parity("stft frames", &want, &got, 0.9999999, 1e-7, 1e-6);
+}
+
+/// The direct DFT, against an exact f64 transform of the same frames.
+///
+/// Both sides consume the GPU's own frame buffer, so this isolates the transform
+/// from the framing above it. What it measures is the cost of accumulating 512
+/// oscillating terms in f32, which is the single largest approximation this
+/// front-end makes.
+#[test]
+fn power_spec_parity() {
+    use cera::model::audio_encoder::N_FFT;
+    use cera::model::audio_encoder_gpu::{AudioEncoderGpuOps, GpuMelFrontend};
+    use cera::model::audio_preprocessor::{N_FFT_BINS, build_padded_hann_window, n_frames_for};
+
+    let Some(ctx) = common::metal_context() else {
+        return;
+    };
+    let ops = MetalAudioOps::new(ctx).expect("build Metal audio ops");
+    // Only the twiddle table is needed here, but it is not separately
+    // constructible and building the rest is cheap.
+    let fe = GpuMelFrontend::build(&ops, 128).expect("build mel front-end");
+
+    let pcm = test_pcm(0.4);
+    let n_frames = n_frames_for(pcm.len());
+    assert!(n_frames > 0, "test signal produced no frames");
+    let hann = build_padded_hann_window();
+    let frames_buf = ops.stft_frames(&ops.upload(&pcm), &ops.upload(&hann), pcm.len(), n_frames);
+    let frames = ops.download(&frames_buf, n_frames * N_FFT);
+
+    let want = reference_power(&frames, n_frames);
+    let got = ops.download(
+        &ops.power_spec(&frames_buf, fe.twiddle(), n_frames),
+        n_frames * N_FFT_BINS,
+    );
+
+    let l2 = rel_l2(&want, &got);
+    // A zero side would make the cosine undefined rather than 0.0 or 1.0, and
+    // here that is a fixture failure, not a kernel one: `test_pcm` is broadband,
+    // so an all-zero power spectrum means the DFT reference or the kernel
+    // produced nothing to compare.
+    let cos = cosine_sim(&want, &got)
+        .expect("power spectrum or its f64 reference is all zeros, so there is no signal to check");
+    eprintln!("power spectrum vs f64 DFT: rel-L2 {l2:.3e}, cosine {cos:.9}");
+    assert!(
+        got.iter().all(|v| v.is_finite() && *v >= 0.0),
+        "power spectrum has non-finite or negative entries"
+    );
+    assert!(
+        l2 <= 2e-6,
+        "power spectrum rel-L2 {l2:.3e} vs the f64 DFT, over 2e-6"
+    );
+    assert!(cos >= 0.999999999, "power spectrum cosine {cos:.9}");
+}
+
+/// The whole front-end against `log_mel_spectrogram`, at several lengths.
+///
+/// This is the aggregate of every approximation: DFT for FFT, and f32 for f64 in
+/// the power spectrum, the filterbank projection and the normalization
+/// statistics. Runs without the mmproj, since the front-end depends on nothing in
+/// it but the band count.
+///
+/// The lengths matter for one reason beyond generality: `effective_n_len` is
+/// `n_samples / HOP_LEN`, so the size of the zeroed tail (and whether there is
+/// one at all) changes with the duration, and the normalization takes its
+/// statistics over a different window each time.
+///
+/// 81 s is the ceiling the live path admits: 8101 frames, `t_out` 1013, just
+/// under `MAX_AUDIO_TOKENS`. It is here because the obvious guess about this
+/// kernel is wrong. The normalization reduces over the time axis in f32 where
+/// the CPU uses f64, so error "should" grow with duration; measured, it peaks at
+/// 211 frames (2.9e-5) and *falls* to 8.4e-6 at the ceiling, because rel-L2 is
+/// normalized by a tensor norm that the zeroed tail dilutes most at short
+/// lengths. The longest chunk is the best-behaved one, not the worst.
+#[test]
+fn mel_frontend_parity() {
+    use cera::model::audio_encoder_gpu::{
+        AudioEncoderGpuOps, GpuMelFrontend, log_mel_spectrogram_gpu,
+    };
+
+    let Some(ctx) = common::metal_context() else {
+        return;
+    };
+    let ops = MetalAudioOps::new(ctx).expect("build Metal audio ops");
+    let n_mel = 128;
+    let fe = GpuMelFrontend::build(&ops, n_mel).expect("build mel front-end");
+
+    for secs in [0.35f32, 0.8, 2.1, 81.0] {
+        let pcm = test_pcm(secs);
+        let (want, n_frames) = log_mel_spectrogram(&pcm, n_mel);
+        assert!(n_frames > 0, "{secs}s produced no mel frames");
+
+        let (mel_buf, gpu_frames) = log_mel_spectrogram_gpu(&ops, &fe, &pcm)
+            .expect("front-end should run")
+            .expect("front-end should produce frames");
+        assert_eq!(gpu_frames, n_frames, "{secs}s: frame count disagrees");
+        let got = ops.download(&mel_buf, n_frames * n_mel);
+
+        let label = format!("log-mel @ {secs}s ({n_frames} frames)");
+        let l2 = rel_l2(&want, &got);
+        eprintln!("{label}: rel-L2 vs CPU front-end {l2:.3e}");
+        assert!(
+            l2 <= 1e-4,
+            "{label}: rel-L2 {l2:.3e} vs the CPU front-end, over 1e-4"
+        );
+        assert_parity(&label, &want, &got, 0.9999999, 1e-3, 1e-3);
+    }
+}
+
+/// A chunk with only one live frame normalizes to all zeros, on both paths.
+///
+/// `mel_norm`'s `eff <= 1` branch is the one place the GPU takes a structurally
+/// different route from the CPU rather than a numerically approximate one: it
+/// zeroes the whole row instead of normalizing, because a single live frame
+/// centers to exactly 0 and its unbiased variance is undefined. Every other
+/// front-end test runs tenths of a second, where `eff` is in the tens, so
+/// nothing else reaches it.
+///
+/// Checked as an exact equality rather than through `assert_parity`: the
+/// reference is all zeros, so cosine similarity is undefined and would report 0.
+#[test]
+fn mel_norm_zeroes_a_single_live_frame() {
+    use cera::model::audio_encoder_gpu::{
+        AudioEncoderGpuOps, GpuMelFrontend, log_mel_spectrogram_gpu,
+    };
+    use cera::model::audio_preprocessor::n_frames_for;
+
+    let Some(ctx) = common::metal_context() else {
+        return;
+    };
+    let ops = MetalAudioOps::new(ctx).expect("build Metal audio ops");
+    let n_mel = 128;
+    let fe = GpuMelFrontend::build(&ops, n_mel).expect("build mel front-end");
+
+    // 200 samples at HOP_LEN 160 is 2 frames with only 1 of them live
+    // (`eff = min(200 / 160, 2) = 1`), which is the `eff <= 1` case. Loud rather
+    // than silent input, so an unnormalized spectrogram would be conspicuously
+    // non-zero.
+    let pcm: Vec<f32> = (0..200).map(|i| (i as f32 * 0.21).sin()).collect();
+    let n_frames = n_frames_for(pcm.len());
+    assert_eq!(
+        n_frames, 2,
+        "fixture no longer lands on the eff <= 1 branch"
+    );
+    assert_eq!(pcm.len() / 160, 1, "fixture has more than one live frame");
+
+    let (want, cpu_frames) = log_mel_spectrogram(&pcm, n_mel);
+    assert_eq!(cpu_frames, n_frames);
+    assert!(
+        want.iter().all(|&v| v == 0.0),
+        "the CPU reference for this branch is not all zeros"
+    );
+
+    let (mel_buf, gpu_frames) = log_mel_spectrogram_gpu(&ops, &fe, &pcm)
+        .expect("front-end should run")
+        .expect("front-end should produce frames");
+    assert_eq!(gpu_frames, n_frames);
+    let got = ops.download(&mel_buf, n_frames * n_mel);
+    assert_eq!(got.len(), want.len());
+    assert!(
+        got.iter().all(|&v| v == 0.0),
+        "GPU did not zero a sub-hop chunk; max |v| = {:.3e}",
+        got.iter().fold(0.0f32, |m, &v| m.max(v.abs()))
+    );
+}
+
+/// PCM in, embeddings out, entirely on the GPU, against the CPU pipeline.
+///
+/// Two comparisons, because they answer different questions:
+///
+/// 1. **GPU front-end vs CPU front-end, same GPU body.** Isolates how much of
+///    the front-end's approximation survives 17 Conformer blocks. This is the
+///    number that decides whether the front-end is good enough, and nothing
+///    upstream of the encoder can mask it.
+/// 2. **Whole GPU pipeline vs the whole shipping CPU pipeline.** The loose,
+///    end-to-end sanity check. It stays loose for the reason the rest of this
+///    suite documents: on Q4_0 weights the CPU reference quantizes its
+///    activations, so it is the approximate side of the body.
+#[test]
+fn encode_pcm_parity() {
+    use cera::model::audio_encoder::encode_audio_pcm;
+    use cera::model::audio_encoder_gpu::encode_audio_pcm_gpu;
+
+    let Some((weights, ops, gpu_w)) = fixture() else {
+        return;
+    };
+
+    let pcm = test_pcm(1.5);
+    let (gpu_out, gpu_t) =
+        encode_audio_pcm_gpu(&ops, &gpu_w, &pcm).expect("GPU PCM encoder should run");
+
+    // 1. Same body, CPU spectrogram.
+    let (cpu_mel, n_frames) = log_mel_spectrogram(&pcm, weights.config.n_mel_bins);
+    let (gpu_cpu_mel_out, t) =
+        encode_audio_mel_gpu(&ops, &gpu_w, &cpu_mel, n_frames).expect("GPU encoder should run");
+    assert_eq!(gpu_t, t, "GPU front-end changed the output length");
+    let front_end_l2 = rel_l2(&gpu_cpu_mel_out, &gpu_out);
+    eprintln!("front-end effect after 17 blocks: rel-L2 {front_end_l2:.3e}");
+    assert!(
+        front_end_l2 <= 5e-5,
+        "the GPU front-end moves the encoder output by rel-L2 {front_end_l2:.3e}, over 5e-5"
+    );
+
+    // 2. Whole pipeline against the whole CPU pipeline.
+    let (cpu_out, cpu_t) = encode_audio_pcm(&pcm, &weights);
+    assert_eq!(gpu_t, cpu_t, "encoder output length disagrees");
+    assert_parity("encode_pcm", &cpu_out, &gpu_out, 0.999, 5e-2, 5e-2);
 }

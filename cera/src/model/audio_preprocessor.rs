@@ -31,7 +31,9 @@
 //! ever needs sub-ms-per-frame, this is the obvious place to
 //! introduce a thread-local cache.
 
-use crate::model::audio_encoder::{HOP_LEN, LOG_MEL_EPS, N_FFT, PREEMPH, SAMPLE_RATE, WINDOW_LEN};
+use crate::model::audio_encoder::{
+    HOP_LEN, LOG_MEL_EPS, N_FFT, NORM_VAR_EPS, PREEMPH, SAMPLE_RATE, WINDOW_LEN,
+};
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex32;
 
@@ -135,6 +137,40 @@ pub fn build_hann_window(length: usize) -> Vec<f32> {
     w
 }
 
+/// The Hann window as the STFT actually applies it: `WINDOW_LEN` periodic Hann
+/// samples centered inside an `N_FFT`-wide buffer, zero on both flanks.
+///
+/// Split out of [`log_mel_spectrogram`] so the GPU front-end
+/// (`model::audio_encoder_gpu`) uploads the same taps at the same offset rather
+/// than rebuilding the centering. The offset is the part worth sharing: a window
+/// placed at 0 instead of `(N_FFT - WINDOW_LEN) / 2` still produces a plausible
+/// spectrogram, shifted in phase.
+pub fn build_padded_hann_window() -> Vec<f32> {
+    let raw = build_hann_window(WINDOW_LEN);
+    let lo = (N_FFT - WINDOW_LEN) / 2;
+    let mut padded = vec![0.0f32; N_FFT];
+    padded[lo..lo + WINDOW_LEN].copy_from_slice(&raw);
+    padded
+}
+
+/// How many leading frames the per-feature normalization takes its statistics
+/// over, given `n_samples` input samples and the `n_frames` the STFT produced.
+///
+/// The frames past this point are the trailing center-padding: they are part of
+/// the output (the C++ reference keeps the frame count and zeroes them rather
+/// than trimming), but they never contribute to a mean or a variance. Exposed
+/// for the same reason as [`n_frames_for`]: the GPU front-end has to pass this
+/// count into a kernel, and a second copy of `n_samples / HOP_LEN` is exactly the
+/// drift that would leave the two paths normalizing over different windows while
+/// both still look like a spectrogram.
+///
+/// `pub(crate)` rather than `pub`: unlike [`n_frames_for`] and
+/// [`build_padded_hann_window`], which the parity suite imports as an external
+/// crate, this one's only consumer is `model::audio_encoder_gpu`.
+pub(crate) fn effective_n_len(n_samples: usize, n_frames: usize) -> usize {
+    (n_samples / HOP_LEN).min(n_frames)
+}
+
 /// Number of STFT frames [`log_mel_spectrogram`] will produce for `n_samples`
 /// input samples, without computing the spectrogram.
 ///
@@ -212,13 +248,9 @@ pub fn log_mel_spectrogram(pcm: &[f32], n_mel_bins: usize) -> (Vec<f32>, usize) 
         prev = cur;
     }
 
-    // Hann window centered inside an N_FFT-sized buffer (left-pad
-    // = (N_FFT - WINDOW_LEN) / 2 zeros, then WINDOW_LEN of Hann,
-    // then right-pad zeros).
-    let hann_raw = build_hann_window(WINDOW_LEN);
-    let hann_pad = (N_FFT - WINDOW_LEN) / 2;
-    let mut hann = vec![0.0f32; N_FFT];
-    hann[hann_pad..hann_pad + WINDOW_LEN].copy_from_slice(&hann_raw);
+    // Hann window centered inside an N_FFT-sized buffer. Shared with the GPU
+    // front-end, which uploads exactly these taps.
+    let hann = build_padded_hann_window();
 
     // Mel filterbank.
     let filters = build_mel_filterbank(n_mel_bins, N_FFT, SAMPLE_RATE as usize);
@@ -285,7 +317,7 @@ pub fn log_mel_spectrogram(pcm: &[f32], n_mel_bins: usize) -> (Vec<f32>, usize) 
     // gives 0; variance is undefined in the unbiased estimator) —
     // this keeps the output uniformly zero-tailed for short inputs
     // instead of leaving frame 0 as an unnormalized raw log-mel.
-    let effective_n_len = (n_samples_in / HOP_LEN).min(n_frames);
+    let effective_n_len = effective_n_len(n_samples_in, n_frames);
     for mi in 0..n_mel_bins {
         let row = &mut mel[mi * n_frames..(mi + 1) * n_frames];
         if effective_n_len > 1 {
@@ -300,7 +332,7 @@ pub fn log_mel_spectrogram(pcm: &[f32], n_mel_bins: usize) -> (Vec<f32>, usize) 
                 var_sum += d * d;
             }
             let var = var_sum / (effective_n_len - 1) as f64; // unbiased
-            let inv_std = 1.0 / (var + 1e-5).sqrt();
+            let inv_std = 1.0 / (var + NORM_VAR_EPS).sqrt();
             for v in row[..effective_n_len].iter_mut() {
                 *v = ((*v as f64 - mean) * inv_std) as f32;
             }
@@ -447,6 +479,69 @@ mod tests {
                 "n_frames_for({n}) disagrees with log_mel_spectrogram"
             );
         }
+    }
+
+    /// The padded window must sit centered in the FFT buffer, not at index 0.
+    ///
+    /// Checked as a property of the result (peak at `N_FFT / 2`, both flanks
+    /// zero) rather than by re-slicing it against `build_hann_window`, which
+    /// would only restate the construction. The GPU front-end uploads this
+    /// verbatim, and a window at the wrong offset shifts every frame's phase
+    /// while still producing a plausible spectrogram.
+    #[test]
+    fn padded_hann_window_is_centered() {
+        let w = build_padded_hann_window();
+        assert_eq!(w.len(), N_FFT);
+        let lo = (N_FFT - WINDOW_LEN) / 2;
+        assert!(
+            (w[N_FFT / 2] - 1.0).abs() < 1e-6,
+            "peak should land at N_FFT/2, got {}",
+            w[N_FFT / 2]
+        );
+        assert!(w[..lo].iter().all(|&v| v == 0.0), "low flank is not zero");
+        assert!(
+            w[lo + WINDOW_LEN..].iter().all(|&v| v == 0.0),
+            "high flank is not zero"
+        );
+        // The window itself must be strictly inside those flanks, or "centered"
+        // would also be satisfied by an all-zero buffer.
+        assert!(w[lo + 1..lo + WINDOW_LEN].iter().all(|&v| v > 0.0));
+    }
+
+    /// `effective_n_len` must name exactly the frames the normalization keeps.
+    ///
+    /// The GPU front-end passes this count into a kernel that both reduces over
+    /// `[0, eff)` and zeroes `[eff, n_frames)`, so the boundary is checked
+    /// against what the CPU output actually looks like: everything past it is
+    /// zero, and the frame just before it is not.
+    ///
+    /// The expected boundary is a literal, not a call to `effective_n_len`.
+    /// Deriving it from the function under test would move both sides together
+    /// and the assertion could never fail. 5000 samples at `HOP_LEN` 160 is 31
+    /// live frames out of 32.
+    #[test]
+    fn effective_n_len_bounds_the_nonzero_frames() {
+        let n_mel = 16;
+        let n = 5000;
+        let pcm: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.03).sin() + (i as f32 * 0.11).cos())
+            .collect();
+        let (mel, n_frames) = log_mel_spectrogram(&pcm, n_mel);
+        let eff = 31;
+        assert_eq!(effective_n_len(n, n_frames), eff);
+        assert!(eff > 1 && eff < n_frames, "eff {eff} of {n_frames} frames");
+
+        assert!(
+            mel[eff * n_mel..].iter().all(|&v| v == 0.0),
+            "frames at or past effective_n_len {eff} are not all zero"
+        );
+        assert!(
+            mel[(eff - 1) * n_mel..eff * n_mel]
+                .iter()
+                .any(|&v| v != 0.0),
+            "the last live frame ({}) is entirely zero",
+            eff - 1
+        );
     }
 
     /// Empty input returns an empty vec without panicking.
