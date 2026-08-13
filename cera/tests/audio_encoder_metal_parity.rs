@@ -64,15 +64,26 @@ use cera::model::audio_preprocessor::log_mel_spectrogram;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn cosine_sim(a: &[f32], b: &[f32]) -> f64 {
+/// Cosine similarity, or `None` when a side has no direction to compare.
+///
+/// A zero vector points nowhere, so no return value honestly describes its
+/// agreement with anything: 0.0 claims the two are orthogonal, 1.0 claims they
+/// match, and both are inventions. Handing the caller the ambiguity keeps that
+/// decision at the gate, where the two zero cases are not alike. One side zero
+/// is the shape of a kernel that never ran and left its output buffer as
+/// allocated, which is the single most likely real failure here. Both sides zero
+/// means the reference itself carries no signal, so the comparison proves
+/// nothing rather than proving agreement, and answering 1.0 would turn a
+/// measurement of nothing into a pass.
+fn cosine_sim(a: &[f32], b: &[f32]) -> Option<f64> {
     assert_eq!(a.len(), b.len(), "cosine_sim on mismatched lengths");
     let dot: f64 = a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum();
     let na: f64 = a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
     let nb: f64 = b.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
     if na == 0.0 || nb == 0.0 {
-        return 0.0;
+        return None;
     }
-    dot / (na * nb)
+    Some(dot / (na * nb))
 }
 
 fn rms(x: &[f32]) -> f64 {
@@ -129,12 +140,30 @@ fn assert_parity(label: &str, want: &[f32], got: &[f32], min_cos: f64, atol: f32
             if x.1 > acc.1 { x } else { acc }
         });
     eprintln!(
-        "{label}: cosine {cos:.6}, max_abs_diff {diff:.3e}, ref rms {:.3e}, \
+        "{label}: cosine {}, max_abs_diff {diff:.3e}, ref rms {:.3e}, \
          worst element [{worst_i}] cpu={:.4} gpu={:.4} (budget overrun {worst_over:.3e})",
+        match cos {
+            Some(c) => format!("{c:.6}"),
+            None => "undefined (a side is all zeros)".to_string(),
+        },
         rms(want),
         want[worst_i],
         got[worst_i],
     );
+    // Split from the gate below so the undefined case reports what is actually
+    // wrong. Folded into a number it reads as "cosine 0.000000 < 0.999", which
+    // describes two vectors that disagree about direction and sends the reader
+    // looking for a math error in a kernel that may never have run at all.
+    let Some(cos) = cos else {
+        panic!(
+            "{label}: cosine is undefined because a side is all zeros \
+             (reference rms {:.3e}, gpu rms {:.3e}). An all-zero GPU output is an \
+             output buffer that was allocated and never written; an all-zero \
+             reference means this comparison has no signal to check against.",
+            rms(want),
+            rms(got),
+        );
+    };
     assert!(
         cos >= min_cos,
         "{label}: cosine {cos:.6} < {min_cos} (max_abs_diff {diff:.3e})"

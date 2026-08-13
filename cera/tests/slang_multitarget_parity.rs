@@ -3311,15 +3311,28 @@ fn audio_kernel_sources(name: &str) -> (Option<&'static str>, Option<&'static st
     (wgsl, msl)
 }
 
-/// Every audio kernel's entry points must survive into both targets.
+/// Every audio kernel's entry points must survive into each target this build
+/// actually emits.
 ///
 /// These kernels ship in this change but only the Metal backend drives them; the
 /// WGSL halves sit inert until the wgpu audio encoder lands. An entry point
 /// silently missing from one target would therefore surface as a pipeline
 /// failure in a later change rather than here, which is exactly the drift this
 /// suite exists to prevent.
+///
+/// "Each target this build emits" and not "both": the sources are cfg'd, so a
+/// `--features metal` build has no WGSL to look at and a featureless one has
+/// neither. The gate below is what the wording change is really about. Without
+/// it this test ran in every configuration, and the featureless one CI runs
+/// twice (`cargo test --workspace` and `-p cera --no-default-features`) walked
+/// all six kernels, looked at nothing and reported a pass. Skipped in a build
+/// that emits no sources is honest; green there is not.
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
 #[test]
-fn audio_kernel_entry_points_reach_both_targets() {
+fn audio_kernel_entry_points_reach_every_enabled_target() {
     // Only `activations` exposes entry points that differ from its basename; the
     // rest are looked up by name, so the list stays derived from AUDIO_KERNELS.
     let cases: Vec<(&str, Vec<&str>)> = AUDIO_KERNELS
@@ -3332,17 +3345,34 @@ fn audio_kernel_entry_points_reach_both_targets() {
             _ => (name, vec![name]),
         })
         .collect();
-    for (name, entries) in &cases {
-        let (wgsl, msl) = audio_kernel_sources(name);
-        for e in entries {
-            if let Some(src) = wgsl {
-                assert!(src.contains(e), "{name}.wgsl is missing entry point {e}");
-            }
-            if let Some(src) = msl {
-                assert!(src.contains(e), "{name}.metal is missing entry point {e}");
-            }
-        }
-    }
+    let checked = cases
+        .iter()
+        .map(|(name, entries)| {
+            let (wgsl, msl) = audio_kernel_sources(name);
+            entries
+                .iter()
+                .map(|e| {
+                    if let Some(src) = wgsl {
+                        assert!(src.contains(e), "{name}.wgsl is missing entry point {e}");
+                    }
+                    if let Some(src) = msl {
+                        assert!(src.contains(e), "{name}.metal is missing entry point {e}");
+                    }
+                    usize::from(wgsl.is_some()) + usize::from(msl.is_some())
+                })
+                .sum::<usize>()
+        })
+        .sum::<usize>();
+
+    // Belt and braces behind the cfg gate, and not the same check restated: the
+    // gate says a source table should exist, this says entry points were actually
+    // compared. It is what still catches an emptied `AUDIO_KERNELS` or an entry
+    // list that lost its names, neither of which the cfg can see.
+    assert!(
+        checked > 0,
+        "checked no entry points at all, so this test proves nothing: \
+         AUDIO_KERNELS or the per-kernel entry lists are empty"
+    );
 }
 
 /// The conv tier is the first clean single-body port since Phase 1a: one body,
