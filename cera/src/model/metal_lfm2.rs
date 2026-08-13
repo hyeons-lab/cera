@@ -6,20 +6,23 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use metal::{Buffer, ComputePipelineState, MTLResourceOptions, MTLSize, NSUInteger};
 
 use crate::backend::metal::{
     ArgmaxParams, BiasAddParams, Conv1dBatchParams, Conv1dParams, ElementwiseParams,
     FlashAttnParams, GemmF32Params, GemvBatchParams, GemvQkvParams, GemvRmsParams,
-    GemvSplitKParams, KvCopyParams, KvShiftKParams, MetalContext, MetalParams, NormParams,
-    PrefillAttnParams, QkNormRopeBatchParams, QkNormRopeParams, QuantGemmParams,
-    RmsNormBatchParams, RopeParams, ScaleParams, SplitAttnParams, shaders,
+    GemvSplitKParams, KvCopyParams, KvShiftKParams, MetalContext, MetalParams, MoeCombineParams,
+    MoeGemvParams, MoeRouteParams, NormParams, PrefillAttnParams, QkNormRopeBatchParams,
+    QkNormRopeParams, QuantGemmParams, RmsNormBatchParams, RopeParams, ScaleParams,
+    SplitAttnParams, shaders,
 };
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression, KvPrefixCache};
 use crate::lora::{LoraAdapterWeights, LoraTarget};
-use crate::model::gpu_weight_source::GpuWeightSource;
+use crate::model::gpu_weight_source::{
+    GpuWeightSource, MOE_MAX_EXPERT_USED, MOE_MAX_EXPERTS, stacked_expert_layout,
+};
 // Through the mirror, not `crate::turboquant`, so `metal_turboquant`'s re-exports
 // serve the purpose they document — and so this reads like `gpu_lfm2`, which routes
 // its equivalents through `gpu_turboquant`.
@@ -50,12 +53,62 @@ struct MetalWeight {
     params_buf: Buffer,
 }
 
+/// A layer's feed-forward weights on GPU: one dense SwiGLU, or a routed expert
+/// set.
+///
+/// Mirrors `lfm2::FfnRefs`, and for the same reason it exists there: `lfm2moe`
+/// runs dense leading blocks and routes the rest, so "which kind is this" is a
+/// per-layer question in one model. A sum type makes exactly-one-of-two a fact
+/// the encoders match on, rather than two sets of `Option` fields they would
+/// have to keep consistent by hand.
+enum MetalFfn {
+    Dense(MetalDenseFfn),
+    /// Boxed so the enum's size is set by the dense variant: otherwise every
+    /// layer of every dense model cera runs carries the MoE variant's width as
+    /// padding.
+    Moe(Box<MetalMoeFfn>),
+}
+
+struct MetalDenseFfn {
+    gate: MetalWeight,
+    up: MetalWeight,
+    down: MetalWeight,
+}
+
+/// One routed feed-forward block's weights.
+///
+/// The three expert projections stay *stacked*: one `MetalWeight` per
+/// projection describing expert 0's slice, plus the byte stride to the next
+/// expert. The CPU path splits the rank-3 GGUF tensor into `n_expert` separate
+/// 2-D refs and picks one after routing, which it can do because routing has
+/// already happened on the same core. On GPU the selection lives in a device
+/// buffer, so the slice has to be chosen inside the kernel, and a stride is the
+/// only form that survives the trip.
+struct MetalMoeFfn {
+    /// Router projection (`ffn_gate_inp.weight`, F32, `m = n_expert`).
+    router: MetalWeight,
+    /// Per-expert selection bias (`exp_probs_b.bias`), `n_expert` f32.
+    bias: Buffer,
+    /// Expert 0's slice of the stacked `ffn_gate_exps` / `ffn_up_exps` /
+    /// `ffn_down_exps` tensors. `m`/`k` describe a *single* expert.
+    gate: MetalWeight,
+    up: MetalWeight,
+    down: MetalWeight,
+    /// Byte distance between consecutive experts' slices, derived and checked by
+    /// `gpu_weight_source::stacked_expert_layout`. That check catches a
+    /// transcription error in the formula, not a file that is unevenly stacked:
+    /// see the function for why those are not the same thing.
+    gate_stride: u32,
+    up_stride: u32,
+    down_stride: u32,
+    /// The model's single routed-FFN scratch, shared by every routed layer.
+    scratch: Arc<MoeScratch>,
+}
+
 struct MetalLayerWeights {
     attn_norm: Buffer,
     ffn_norm: Buffer,
-    ffn_gate: MetalWeight,
-    ffn_up: MetalWeight,
-    ffn_down: MetalWeight,
+    ffn: MetalFfn,
     conv_in_proj: Option<MetalWeight>,
     conv_out_proj: Option<MetalWeight>,
     conv_weight: Option<Buffer>,
@@ -108,7 +161,7 @@ struct MetalLoraTarget {
 /// order) low-rank factors. Built from a CPU [`LoraAdapterWeights`] via
 /// [`MetalLoraAdapter::upload`] and cached on the model (Arc-pointer-keyed LRU).
 struct MetalLoraAdapter {
-    layers: Vec<[Option<MetalLoraTarget>; 9]>,
+    layers: Vec<[Option<MetalLoraTarget>; crate::lora::LORA_TARGET_COUNT]>,
 }
 
 impl MetalLoraAdapter {
@@ -126,8 +179,17 @@ impl MetalLoraAdapter {
     /// residual add) don't feed the scaled residual, so they use `scale` alone.
     fn upload(ctx: &MetalContext, w: &LoraAdapterWeights, residual_mult: f32) -> Self {
         let mut layers = Vec::with_capacity(w.n_layers());
+        // Per-expert factors upload as nothing and a router delta uploads fine
+        // and is then never applied; see `LoraAdapterWeights::has_moe_deltas`.
+        // The guard is `Session::attach_lora_adapters`, not this.
+        debug_assert!(
+            !w.has_moe_deltas(),
+            "adapter carries routed-FFN deltas, which this backend has no hooks for; \
+             Session::attach_lora_adapters is meant to have rejected it"
+        );
         for layer in 0..w.n_layers() {
-            let mut targets: [Option<MetalLoraTarget>; 9] = Default::default();
+            let mut targets: [Option<MetalLoraTarget>; crate::lora::LORA_TARGET_COUNT] =
+                Default::default();
             for target in LoraTarget::ALL {
                 let Some(t) = w.get(layer, target) else {
                     continue;
@@ -284,8 +346,10 @@ struct MetalPipelines {
     gemm_q5_k: ComputePipelineState,
     gemm_q8_0: ComputePipelineState,
     gemm_q6_k: ComputePipelineState,
-    /// Batched f32 NT GEMM `C = Lhs · Rhsᵀ` for the prefill LoRA down-projection
-    /// (`Tmp = X · Aᵀ`).
+    /// Batched f32 NT GEMM `C = Lhs · Rhsᵀ`. Two callers: the prefill LoRA
+    /// down-projection (`Tmp = X · Aᵀ`) and the MoE router projection in
+    /// `encode_moe_ffn` (`Logits = X · Wᵀ`), whose weight is F32 by load-time
+    /// check so it needs no quantized variant.
     gemm_f32_nt: ComputePipelineState,
     /// Accumulate variant `C += Lhs · Rhsᵀ` for the prefill LoRA up-projection
     /// (`Y += Tmp · Bᵀ`).
@@ -316,6 +380,13 @@ struct MetalPipelines {
     scaled_add_inplace: ComputePipelineState,
     /// Granite logit-scale divide applied to the final logits (`a[i] *= scale`).
     scale_f32: ComputePipelineState,
+    /// `lfm2moe` routing: sigmoid + biased top-k over the router logits.
+    moe_route: ComputePipelineState,
+    /// `lfm2moe` expert-indexed Q4_0 GEMV; the expert id comes from a device
+    /// buffer, not the host.
+    moe_gemv_q4_0: ComputePipelineState,
+    /// `lfm2moe` weighted sum of a token's expert outputs.
+    moe_combine: ComputePipelineState,
 }
 
 #[allow(dead_code)]
@@ -455,6 +526,9 @@ pub struct MetalLfm2Model {
     /// `infer_lock`, so the flag needs no stronger ordering than `Relaxed`.
     hs_scratch: std::sync::OnceLock<HsScratch>,
     use_hs_scratch: AtomicBool,
+    /// Latches once the "ignoring a routed-FFN adapter" error has been logged,
+    /// so a long generation does not repeat it per token. See `resolve_lora`.
+    moe_lora_dropped_warned: AtomicBool,
     /// The compressed KV cache and its kernels, built on demand by
     /// [`Model::configure_kv_compression`] when a session asks for it. `None` ⇒
     /// the f16 path in [`Self::f16_kv`].
@@ -589,6 +663,19 @@ impl MetalLfm2Model {
         let q_dim = config.n_heads * head_dim;
         let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * head_dim;
         let scalars = config.scalars;
+        // The routed FFN's combine step adds its output into the residual
+        // stream unscaled, matching the fused accumulate-GEMV the dense path
+        // uses when `residual == 1.0`. No routed architecture also carries
+        // Granite's sublayer multiplier today, so rather than thread the scale
+        // through `moe_combine` for a combination that does not exist, refuse
+        // it: a silent drop here scales every routed layer's contribution
+        // wrongly and still produces fluent text.
+        anyhow::ensure!(
+            config.moe.is_none() || scalars.residual == 1.0,
+            "mixture-of-experts with a residual multiplier ({}) is not supported on the Metal \
+             backend; the routed FFN combine adds into the residual unscaled",
+            scalars.residual,
+        );
         let rope_type = src.rope_type() as u32;
 
         tracing::info!(
@@ -695,6 +782,9 @@ impl MetalLfm2Model {
             bias_add: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add")?,
             scaled_add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "scaled_add_inplace")?,
             scale_f32: ctx.create_pipeline(shaders::ELEMENTWISE, "scale_f32")?,
+            moe_route: ctx.create_pipeline(shaders::MOE_ROUTE, "moe_route")?,
+            moe_gemv_q4_0: ctx.create_pipeline(shaders::MOE_GEMV_Q4_0, "moe_gemv_q4_0")?,
+            moe_combine: ctx.create_pipeline(shaders::MOE_COMBINE, "moe_combine")?,
         };
 
         // Open a second mmap of the same file for the no-copy Metal buffer.
@@ -848,13 +938,90 @@ impl MetalLfm2Model {
         let upload_opt_f32 =
             |data: Option<&[f32]>| -> Option<Buffer> { data.map(|d| ctx.upload_f32(d)) };
 
+        // The largest batch the prefill path hands the kernels in one dispatch,
+        // and the token count every buffer sized per-token below multiplies by:
+        // the routed-FFN scratch, `lora_tmp_batched`, and the five
+        // `prefill_*_buf`. Any of them smaller than a chunk is an
+        // out-of-bounds device write, not a load error, so bind it once.
+        // `forward_prefill` recomputes the same expression against
+        // `self.state.max_seq_len`, which is initialized from this same local.
+        let max_pref = max_seq_len.min(MAX_PREFILL_TOKENS);
+
+        // Routed-FFN scratch: one allocation for the whole model, shared by
+        // every routed layer, so decode reuses it as the n = 1 case rather than
+        // allocating per call.
+        let moe_scratch = config
+            .moe
+            .as_ref()
+            .map(|m| -> Result<Arc<MoeScratch>> {
+                let buf = |n: usize| ctx.create_buffer(n as u64 * 4);
+                // The only enforcement of the kernels' expert-count limits in
+                // this backend (wgpu has its own copy of this check, on the same
+                // constants), and it has to run before the sizing below: a GGUF
+                // declaring a wild `n_expert_used` would otherwise drive
+                // `entries * expert_ff_len` into `create_buffer` and fail as an
+                // allocation rather than with the named error written for it.
+                // `upload_moe` validates each layer's *shapes* against the
+                // scratch, but it does not re-check these bounds, so do not move
+                // or weaken this without reading that function.
+                anyhow::ensure!(
+                    (1..=MOE_MAX_EXPERTS as usize).contains(&m.n_expert)
+                        && (1..=MOE_MAX_EXPERT_USED as usize).contains(&m.n_expert_used)
+                        && m.n_expert_used <= m.n_expert,
+                    "Metal MoE routing supports 1..={MOE_MAX_EXPERTS} experts and \
+                     1..={MOE_MAX_EXPERT_USED} active (and no more active than available), \
+                     model declares {} and {}",
+                    m.n_expert,
+                    m.n_expert_used,
+                );
+                let entries = max_pref * m.n_expert_used;
+                let dim = |v: usize, what: &str| -> Result<u32> {
+                    u32::try_from(v).with_context(|| {
+                        format!("mixture-of-experts {what} {v} does not fit the kernels' u32")
+                    })
+                };
+                // `expert_ff_len` is a file-declared number with no bound above
+                // (unlike the two expert counts, which the kernels cap), so the
+                // row products are checked: an overflow here wraps in release
+                // and under-allocates a buffer the kernels then write past.
+                let cells = |rows: usize, cols: usize, what: &str| -> Result<usize> {
+                    rows.checked_mul(cols).with_context(|| {
+                        format!("mixture-of-experts {what} scratch size overflows")
+                    })
+                };
+                Ok(Arc::new(MoeScratch {
+                    n_expert: dim(m.n_expert, "expert count")?,
+                    n_expert_used: dim(m.n_expert_used, "active expert count")?,
+                    expert_ff_len: dim(m.expert_ff_len, "expert width")?,
+                    logits: buf(cells(max_pref, m.n_expert, "logits")?),
+                    sel_expert: buf(entries),
+                    sel_weight: buf(entries),
+                    gate: buf(cells(entries, m.expert_ff_len, "gate")?),
+                    up: buf(cells(entries, m.expert_ff_len, "up")?),
+                    z: buf(cells(entries, hs, "output")?),
+                }))
+            })
+            .transpose()?;
+
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
             let attn_norm = ctx.upload_f32(src.attn_norm_weight(i));
             let ffn_norm = ctx.upload_f32(src.ffn_norm_weight(i));
-            let ffn_gate = upload_weight(src.ffn_gate_ref(i))?;
-            let ffn_up = upload_weight(src.ffn_up_ref(i))?;
-            let ffn_down = upload_weight(src.ffn_down_ref(i))?;
+            let ffn = match src.moe_refs(i) {
+                None => MetalFfn::Dense(MetalDenseFfn {
+                    gate: upload_weight(src.ffn_gate_ref(i)?)?,
+                    up: upload_weight(src.ffn_up_ref(i)?)?,
+                    down: upload_weight(src.ffn_down_ref(i)?)?,
+                }),
+                Some(m) => MetalFfn::Moe(Box::new(upload_moe(
+                    &ctx,
+                    &upload_weight,
+                    moe_scratch.as_ref(),
+                    hs,
+                    i,
+                    m,
+                )?)),
+            };
             let is_conv = config.block_types[i] == BlockType::GatedConv;
             let (conv_in_proj, conv_out_proj, conv_weight) = if is_conv {
                 let ip = src.conv_in_proj_ref(i).expect("conv layer missing in_proj");
@@ -901,9 +1068,7 @@ impl MetalLfm2Model {
             layers.push(MetalLayerWeights {
                 attn_norm,
                 ffn_norm,
-                ffn_gate,
-                ffn_up,
-                ffn_down,
+                ffn,
                 conv_in_proj,
                 conv_out_proj,
                 conv_weight,
@@ -1001,7 +1166,6 @@ impl MetalLfm2Model {
         // when head_dim is decoupled (Qwen3), so each scratch buffer is sized for
         // the max of every role it plays across the layer. For LFM2 these all
         // collapse to the original sizes (q_dim == hs, max_kv_dim ≤ hs, is ≥ hs).
-        let max_pref = max_seq_len.min(MAX_PREFILL_TOKENS);
         let prefill_normed_cols = hs.max(q_dim);
         let prefill_proj_cols = (3 * hs).max(q_dim);
         let prefill_gate_cols = is.max(max_kv_dim).max(hs);
@@ -1087,6 +1251,7 @@ impl MetalLfm2Model {
             },
             hs_scratch: std::sync::OnceLock::new(),
             use_hs_scratch: AtomicBool::new(false),
+            moe_lora_dropped_warned: AtomicBool::new(false),
             tq: std::sync::OnceLock::new(),
             kv_mode: std::sync::OnceLock::new(),
             kv_cache_tag: std::sync::OnceLock::new(),
@@ -1114,6 +1279,174 @@ impl MetalLfm2Model {
             lora_tmp_batched,
         })
     }
+}
+
+/// Per-forward scratch for the routed FFN.
+///
+/// Sized once for the largest batch the prefill path can hand it, so decode
+/// (`n = 1`) and prefill share one allocation instead of reallocating per call.
+/// An "entry" is one (token, slot) pair, so every buffer below that is indexed
+/// by entry is `n_tokens * n_expert_used` rows, not `n_tokens`.
+///
+/// Held by `Arc` from every routed layer rather than as an `Option` on the
+/// model. The two spellings allocate the same buffers once; this one makes "a
+/// routed layer always has its scratch" a fact the type carries, so the encoder
+/// has no absent case to either panic on or silently skip the FFN for.
+struct MoeScratch {
+    // The three routing dimensions the buffers below were sized from, and the
+    // single source for them everywhere else: `upload_moe` validates each routed
+    // layer's weights against these rather than against the copies its own
+    // `MoeFfnRefs` carries, and `encode_moe_ffn` reads them from here to fill the
+    // kernel params. Both used to keep their own copy, which meant validating
+    // one clone of `config.moe` against another. The bounds these must satisfy
+    // (`MOE_MAX_EXPERTS`, `MOE_MAX_EXPERT_USED`) are enforced once, where the
+    // scratch is built, before anything is sized from them.
+    //
+    // Not every dimension: `z` is also sized by the hidden size, which is not
+    // recorded here because `upload_moe` ties the weights to it directly
+    // (`down.m == hs`). A buffer sized from anything outside this list is
+    // covered by neither, so add the dimension here when adding such a buffer.
+    /// Experts per routed layer, sizing `logits`.
+    n_expert: u32,
+    /// Experts per token, the multiplier turning tokens into entries.
+    n_expert_used: u32,
+    /// Per-expert feed-forward width, the row stride of `gate` and `up`.
+    expert_ff_len: u32,
+    /// `[n_tokens][n_expert]` router logits, pre-sigmoid.
+    logits: Buffer,
+    /// `[n_entries]` chosen expert ids (u32).
+    sel_expert: Buffer,
+    /// `[n_entries]` renormalized unbiased probabilities (f32).
+    sel_weight: Buffer,
+    /// `[n_entries][expert_ff_len]` gate projection, overwritten in place with
+    /// the SwiGLU product that the down projection then consumes.
+    gate: Buffer,
+    /// `[n_entries][expert_ff_len]` up projection.
+    up: Buffer,
+    /// `[n_entries][hidden]` per-entry expert outputs, before the weighted
+    /// combine folds each token's entries together.
+    z: Buffer,
+}
+
+/// Upload one routed feed-forward block, keeping the expert projections stacked
+/// and deriving the per-expert byte stride.
+///
+/// Every shape here is checked against [`MoeScratch`]'s dimensions rather than
+/// the counts this layer's own [`MoeFfnRefs`] carries; see `MoeScratch`'s fields
+/// for why those are the authoritative copy.
+///
+/// The per-expert stride, and the validation behind it, come from
+/// `gpu_weight_source::stacked_expert_layout`, shared with the wgpu loader: a
+/// wrong stride does not fault, it reads a neighbouring expert's weights and
+/// still produces fluent text, so two backends deriving it separately is a
+/// defect neither one's tests would name.
+fn upload_moe(
+    ctx: &MetalContext,
+    upload_weight: &impl Fn(&WeightRef) -> Result<MetalWeight>,
+    scratch: Option<&Arc<MoeScratch>>,
+    hidden_size: usize,
+    layer: usize,
+    moe: &crate::model::lfm2::MoeFfnRefs,
+) -> Result<MetalMoeFfn> {
+    let scratch = scratch
+        .with_context(|| {
+            format!(
+                "layer {layer} has routed expert weights but the model config carries no \
+                 mixture-of-experts parameters to size their scratch with"
+            )
+        })?
+        .clone();
+    let n_expert = scratch.n_expert;
+    let expert_ff_len = scratch.expert_ff_len;
+
+    anyhow::ensure!(
+        moe.exp_probs_b.len() == n_expert as usize,
+        "layer {layer}: selection bias has {} entries for {n_expert} experts",
+        moe.exp_probs_b.len(),
+    );
+    // `moe_route` emits ids in `0..n_expert`, and `moe_gemv_q4_0` turns each one
+    // into `id * expert_stride` against a tensor stacked `refs.len()` deep, so a
+    // layer with fewer expert tensors than the router has experts would address
+    // past the stacked tensor into whatever follows it, reading plausible
+    // weights rather than faulting.
+    //
+    // Both this and the bias-length check above are vacuous against today's only
+    // `GpuWeightSource::moe_refs` implementation, which builds the ref lists as
+    // `(0..n_expert)` and checks the bias itself. They are kept because this
+    // function consumes a *trait*: it is the boundary where a second
+    // implementation would arrive, and the cost is two integer comparisons at
+    // load.
+    anyhow::ensure!(
+        moe.gate.len() == n_expert as usize
+            && moe.up.len() == n_expert as usize
+            && moe.down.len() == n_expert as usize,
+        "layer {layer}: routed FFN has {n_expert} experts but {} gate / {} up / {} down expert \
+         tensors; the routing kernel emits ids the GEMV would index past the stacked weights",
+        moe.gate.len(),
+        moe.up.len(),
+        moe.down.len(),
+    );
+    anyhow::ensure!(
+        moe.router.dtype == DType::F32,
+        "layer {layer}: Metal MoE routing needs an F32 router projection, found {:?}",
+        moe.router.dtype,
+    );
+
+    // One stacked projection: upload expert 0's slice as the base and return
+    // the byte stride to the next expert.
+    let stack = |refs: &[WeightRef], what: &str| -> Result<(MetalWeight, u32)> {
+        let layout = stacked_expert_layout(refs, layer, what, "Metal")?;
+        let first = refs
+            .first()
+            .with_context(|| format!("layer {layer}: {what} has no experts"))?;
+        Ok((upload_weight(first)?, layout.expert_stride))
+    };
+
+    let router_w = upload_weight(&moe.router)?;
+    let (gate, gate_stride) = stack(&moe.gate, "ffn_gate_exps")?;
+    let (up, up_stride) = stack(&moe.up, "ffn_up_exps")?;
+    let (down, down_stride) = stack(&moe.down, "ffn_down_exps")?;
+    let hs = u32::try_from(hidden_size)
+        .with_context(|| format!("layer {layer}: hidden size {hidden_size} too large"))?;
+    anyhow::ensure!(
+        gate.m == expert_ff_len && up.m == expert_ff_len && down.k == expert_ff_len,
+        "layer {layer}: expert width {expert_ff_len} disagrees with the projection shapes \
+         (gate.m={}, up.m={}, down.k={})",
+        gate.m,
+        up.m,
+        down.k,
+    );
+    // Every shape the kernels index with, against the two numbers just tied to
+    // the scratch's own. `down.m` is the sharp one: `MoeScratch::z` holds
+    // `n_entries * hidden_size` floats and the down GEMV writes
+    // `z[entry * down.m + row]`, so `down.m > hs` is an out-of-bounds device
+    // write, and `down.m < hs` silently desyncs that row stride from the one
+    // `moe_combine` reads it back with. `gate.k`/`up.k`/`router.k` index the
+    // activation rows and `router.m` bounds the logits buffer, so a file
+    // disagreeing on any of them is a load error rather than a wrong answer.
+    anyhow::ensure!(
+        down.m == hs && gate.k == hs && up.k == hs && router_w.k == hs && router_w.m == n_expert,
+        "layer {layer}: routed FFN shapes disagree with hidden size {hs} / expert count \
+         {n_expert} (down.m={}, gate.k={}, up.k={}, router {}x{}); the Metal expert kernels \
+         index every one of these against those two numbers",
+        down.m,
+        gate.k,
+        up.k,
+        router_w.m,
+        router_w.k,
+    );
+
+    Ok(MetalMoeFfn {
+        router: router_w,
+        bias: ctx.upload_f32(&moe.exp_probs_b),
+        gate,
+        up,
+        down,
+        gate_stride,
+        up_stride,
+        down_stride,
+        scratch,
+    })
 }
 
 /// Copy a snapshot's bytes into a GPU buffer, bounds-checked.
@@ -1228,7 +1561,30 @@ impl MetalLfm2Model {
     /// forward. Must be called while holding `infer_lock` (it mutates the
     /// per-model `active_lora`/`lora_lru`).
     fn resolve_lora(&self, state: &InferenceState) -> LoraGuard<'_> {
-        let resolved = state.lora.as_ref().map(|adapter| {
+        // `Session::attach_lora_adapters` refuses an adapter carrying routed-FFN
+        // deltas, because this backend applies none of them (see
+        // `supports_moe_lora`). That gate is not the only way in:
+        // `InferenceState::lora` is a public field and `Model::forward` takes
+        // the state directly, so a caller driving the trait (the parity harness,
+        // an FFI embedder, a test) reaches here without passing it.
+        //
+        // Dropping the whole adapter is the conservative arm. Applying its
+        // attention half while silently dropping the router and per-expert
+        // deltas is exactly the fluent-but-wrong outcome the gate exists to
+        // prevent, and it is the harder of the two to notice. Logged once per
+        // model, since a generation loop would otherwise repeat it per token.
+        let usable = state.lora.as_ref().filter(|adapter| {
+            let ok = !adapter.has_moe_deltas();
+            if !ok && !self.moe_lora_dropped_warned.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    "ignoring a LoRA adapter that carries mixture-of-experts deltas: this \
+                     backend has no routed-FFN hooks. Attach through `Session`, which refuses \
+                     it with `CeraError::LoraUnsupportedByBackend` instead of ignoring it."
+                );
+            }
+            ok
+        });
+        let resolved = usable.map(|adapter| {
             let mut lru = self.lora_lru.lock().expect("lora_lru poisoned");
             if let Some(pos) = lru.iter().position(|(cpu, _)| Arc::ptr_eq(cpu, adapter)) {
                 // Hit: mark most-recently-used by moving the entry to the end
@@ -2312,6 +2668,186 @@ impl MetalLfm2Model {
             ElementwiseParams::new(n).set(enc, 2);
         }
         enc.dispatch_thread_groups(sz1d(n.div_ceil(256) as u64), sz1d(256));
+    }
+
+    /// One expert-indexed Q4_0 GEMV: `y[entry] = W[sel_expert[entry]] · x[row]`
+    /// for every entry, in one dispatch.
+    ///
+    /// `x_by_entry` picks the activation row per entry: `false` for the gate and
+    /// up projections, whose input is the token's hidden state and so is shared
+    /// by all of that token's slots, and `true` for the down projection, whose
+    /// input is the per-slot SwiGLU product.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_moe_gemv(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w: &MetalWeight,
+        expert_stride: u32,
+        sel_expert: &Buffer,
+        x: &Buffer,
+        y: &Buffer,
+        n_used: u32,
+        n_entries: u32,
+        x_by_entry: bool,
+    ) {
+        let params = MoeGemvParams {
+            m: w.m,
+            k: w.k,
+            n_used,
+            n_entries,
+            expert_stride,
+            x_by_entry: u32::from(x_by_entry),
+            _pad0: 0,
+            _pad1: 0,
+        };
+        enc.set_compute_pipeline_state(&self.pipelines.moe_gemv_q4_0);
+        enc.set_buffer(0, Some(&self.mmap_buf), w.mmap_offset);
+        enc.set_buffer(1, Some(x), 0);
+        enc.set_buffer(2, Some(y), 0);
+        enc.set_buffer(3, Some(sel_expert), 0);
+        params.set(enc, 4);
+        enc.dispatch_thread_groups(sz2d(w.m as u64, n_entries as u64), sz1d(32));
+    }
+
+    /// The routed feed-forward block for one MoE layer, over `n` tokens.
+    ///
+    /// `x` is the `ffn_norm` output, `[n][hidden]` token-major; `out` receives
+    /// the block's output at the same layout. `accumulate` picks the convention
+    /// of the calling site, which is not decided by the phase: `true` adds into
+    /// whatever `out` holds, `false` overwrites it. Decode always accumulates,
+    /// straight into the residual stream, as the dense path's fused
+    /// accumulate-GEMV does. Prefill splits: the main batched path overwrites a
+    /// scratch buffer and lets the *next* layer's `add_rmsnorm_batch` fold in
+    /// the residual, while the profiled path accumulates into its own batch
+    /// buffer, matching its dense twin's `encode_gemm_add`.
+    ///
+    /// Mirrors `lfm2::forward_moe_ffn` step for step, and like that function it
+    /// deliberately does not share code with the dense FFN path: the sequence is
+    /// the same but every buffer is indexed by (token, slot) rather than token,
+    /// and the projections are slices of a stacked tensor chosen on the device.
+    /// Nothing pins the two to each other, so an arithmetic change in the dense
+    /// block has to be mirrored here by hand; the oracle suite pins *this* to
+    /// the CPU implementation, which is the direction that matters.
+    ///
+    /// LoRA is absent on purpose. The router and the experts are all LoRA
+    /// targets on CPU, and no GPU backend uploads per-expert factors yet, so an
+    /// adapter carrying them is refused by `Session::attach_lora_adapters` (via
+    /// [`Model::supports_moe_lora`]) rather than silently dropped here. A caller
+    /// that bypasses `Session` and sets `InferenceState::lora` directly is
+    /// caught by `resolve_lora`, which filters unconditionally in every profile
+    /// and drops such an adapter whole rather than applying its attention half.
+    ///
+    /// `x` and `out` may be the same buffer: the batched-prefill caller passes
+    /// `prefill_normed_buf` for both. That is safe only because the dispatches
+    /// below run in encoder order, so the last read of `x` precedes the write to
+    /// `out`. The wgpu twin never aliases them.
+    fn encode_moe_ffn(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        moe: &MetalMoeFfn,
+        x: &Buffer,
+        out: &Buffer,
+        n: u32,
+        accumulate: bool,
+    ) {
+        let scratch = &moe.scratch;
+        let hs = self.config.hidden_size as u32;
+        let ff = scratch.expert_ff_len;
+        let n_used = scratch.n_expert_used;
+        let entries = n * n_used;
+
+        // Router logits, `[n][n_expert] = X · Wᵀ`. The router is F32, so this is
+        // the same NT GEMM the batched LoRA down-projection uses rather than one
+        // of the quantized GEMV paths, and it covers decode (n = 1) and prefill
+        // with one dispatch shape instead of a per-token loop.
+        let router_params = GemmF32Params {
+            m: n,
+            n: scratch.n_expert,
+            k: moe.router.k,
+        };
+        let router_total = (n as u64) * (scratch.n_expert as u64);
+        enc.set_compute_pipeline_state(&self.pipelines.gemm_f32_nt);
+        enc.set_buffer(0, Some(x), 0);
+        enc.set_buffer(1, Some(&self.mmap_buf), moe.router.mmap_offset);
+        enc.set_buffer(2, Some(&scratch.logits), 0);
+        router_params.set(enc, 3);
+        enc.dispatch_thread_groups(
+            sz2d(router_total.min(65535), router_total.div_ceil(65535)),
+            sz1d(32),
+        );
+
+        // Sigmoid + biased top-k → (expert id, unbiased weight) per entry.
+        enc.set_compute_pipeline_state(&self.pipelines.moe_route);
+        enc.set_buffer(0, Some(&scratch.logits), 0);
+        enc.set_buffer(1, Some(&moe.bias), 0);
+        enc.set_buffer(2, Some(&scratch.sel_expert), 0);
+        enc.set_buffer(3, Some(&scratch.sel_weight), 0);
+        MoeRouteParams {
+            n_expert: scratch.n_expert,
+            n_used,
+            n_tokens: n,
+            _pad: 0,
+        }
+        .set(enc, 4);
+        enc.dispatch_thread_groups(sz1d(n as u64), sz1d(32));
+
+        self.encode_moe_gemv(
+            enc,
+            &moe.gate,
+            moe.gate_stride,
+            &scratch.sel_expert,
+            x,
+            &scratch.gate,
+            n_used,
+            entries,
+            false,
+        );
+        self.encode_moe_gemv(
+            enc,
+            &moe.up,
+            moe.up_stride,
+            &scratch.sel_expert,
+            x,
+            &scratch.up,
+            n_used,
+            entries,
+            false,
+        );
+
+        // SwiGLU over every entry at once: `gate = silu(gate) * up`.
+        let total = entries * ff;
+        enc.set_compute_pipeline_state(&self.pipelines.silu_mul_inplace);
+        enc.set_buffer(0, Some(&scratch.gate), 0);
+        enc.set_buffer(1, Some(&scratch.up), 0);
+        ElementwiseParams::new(total).set(enc, 2);
+        enc.dispatch_thread_groups(sz1d(total.div_ceil(256) as u64), sz1d(256));
+
+        // Down projection reads the per-entry SwiGLU product, so its activation
+        // row is the entry itself, not the token.
+        self.encode_moe_gemv(
+            enc,
+            &moe.down,
+            moe.down_stride,
+            &scratch.sel_expert,
+            &scratch.gate,
+            &scratch.z,
+            n_used,
+            entries,
+            true,
+        );
+
+        enc.set_compute_pipeline_state(&self.pipelines.moe_combine);
+        enc.set_buffer(0, Some(&scratch.z), 0);
+        enc.set_buffer(1, Some(&scratch.sel_weight), 0);
+        enc.set_buffer(2, Some(out), 0);
+        MoeCombineParams {
+            hidden: hs,
+            n_used,
+            n_tokens: n,
+            accumulate: u32::from(accumulate),
+        }
+        .set(enc, 3);
+        enc.dispatch_thread_groups(sz2d(hs.div_ceil(256) as u64, n as u64), sz1d(256));
     }
 
     /// Attention output / FFN-down residual GEMV with the Granite residual
@@ -3402,6 +3938,13 @@ impl Model for MetalLfm2Model {
             .expect("prefix_cache mutex poisoned") = KvPrefixCache::new(config, &self.config, &id);
     }
 
+    fn supports_moe_lora(&self) -> bool {
+        // No routed-FFN LoRA hooks on this backend: `encode_moe_ffn` applies
+        // the base experts only, and there is no per-expert factor upload.
+        // `Session::attach_lora_adapters` turns this into a rejection.
+        false
+    }
+
     fn turboquant_supported(&self) -> bool {
         // Gated on `head_dim`: the compressed kernels need a power-of-two
         // `head_dim` that is <= 128 and a multiple of 32. Reporting the real
@@ -3535,8 +4078,16 @@ impl Model for MetalLfm2Model {
         // its batched-GEMM base path instead of falling back to per-token.
         let _lora_guard = self.resolve_lora(state);
         // Cached KV is base-model-only, so bypass the prefix cache when an adapter
-        // is active (both lookup and insert).
-        let lora_active = state.lora.is_some();
+        // is active (both lookup and insert). Ask the *resolved* adapter, not
+        // `state.lora`: `resolve_lora` drops an adapter carrying routed-FFN
+        // deltas entirely, and that run is a pure base-model prefill whose KV is
+        // cacheable. Reading `state.lora` would leave such a session running
+        // every prefill cold and never populating the cache.
+        let lora_active = self
+            .active_lora
+            .lock()
+            .expect("active_lora poisoned")
+            .is_some();
         // Fresh prefill (start_pos == 0) → reset GPU-resident state so the model
         // doesn't carry KV history from a previous generation. The CPU-side
         // InferenceState is already fresh when callers invoke generate() again,
@@ -4598,13 +5149,32 @@ impl MetalLfm2Model {
                 hs as u32,
                 self.scalars.residual,
             );
+            let dense = match &lw.ffn {
+                // Routed layer: one call covers the router, the experts, the
+                // SwiGLU and the weighted combine. `accumulate = false` because
+                // the batched path leaves the FFN output in `normed_buf` for the
+                // next layer's fused residual add, exactly as the dense down
+                // GEMM below does.
+                MetalFfn::Moe(moe) => {
+                    self.encode_moe_ffn(
+                        enc,
+                        moe,
+                        &self.prefill_normed_buf,
+                        &self.prefill_normed_buf,
+                        n as u32,
+                        false,
+                    );
+                    continue;
+                }
+                MetalFfn::Dense(d) => d,
+            };
             // gate+up GEMM (1 dispatch each for all N tokens)
-            if Self::is_batched_gemm_dtype(lw.ffn_gate.dtype)
-                && Self::is_batched_gemm_dtype(lw.ffn_up.dtype)
+            if Self::is_batched_gemm_dtype(dense.gate.dtype)
+                && Self::is_batched_gemm_dtype(dense.up.dtype)
             {
                 self.encode_gemm(
                     enc,
-                    &lw.ffn_gate,
+                    &dense.gate,
                     &self.prefill_normed_buf,
                     0,
                     &self.prefill_gate_buf,
@@ -4616,7 +5186,7 @@ impl MetalLfm2Model {
                 );
                 self.encode_gemm(
                     enc,
-                    &lw.ffn_up,
+                    &dense.up,
                     &self.prefill_normed_buf,
                     0,
                     &self.prefill_up_buf,
@@ -4630,7 +5200,7 @@ impl MetalLfm2Model {
                 for i in 0..n {
                     self.encode_gemv_weight_offset(
                         enc,
-                        &lw.ffn_gate,
+                        &dense.gate,
                         &self.prefill_normed_buf,
                         b4(i * hs),
                         &self.prefill_gate_buf,
@@ -4638,7 +5208,7 @@ impl MetalLfm2Model {
                     );
                     self.encode_gemv_weight_offset(
                         enc,
-                        &lw.ffn_up,
+                        &dense.up,
                         &self.prefill_normed_buf,
                         b4(i * hs),
                         &self.prefill_up_buf,
@@ -4678,10 +5248,10 @@ impl MetalLfm2Model {
                 enc.dispatch_thread_groups(grid, sz1d(256));
             }
             // FFN down GEMM → normed_buf scratch (add fused into next layer's norm).
-            if Self::is_batched_gemm_dtype(lw.ffn_down.dtype) {
+            if Self::is_batched_gemm_dtype(dense.down.dtype) {
                 self.encode_gemm(
                     enc,
-                    &lw.ffn_down,
+                    &dense.down,
                     &self.prefill_gate_buf,
                     0,
                     &self.prefill_normed_buf,
@@ -4696,7 +5266,7 @@ impl MetalLfm2Model {
                 for i in 0..n {
                     self.encode_gemv_weight_offset(
                         enc,
-                        &lw.ffn_down,
+                        &dense.down,
                         &self.prefill_gate_buf,
                         b4(i * is),
                         &self.prefill_normed_buf,
@@ -5162,82 +5732,103 @@ impl MetalLfm2Model {
                 );
             });
 
-            run_phase(format!("L{layer}_{lt}_ffn_gemm"), &|enc| {
-                self.encode_gemm(
-                    enc,
-                    &lw.ffn_gate,
-                    &self.prefill_normed_buf,
-                    0,
-                    &self.prefill_gate_buf,
-                    0,
-                    n as u32,
-                    hs as u32,
-                    is as u32,
-                    false,
-                );
-                self.encode_gemm(
-                    enc,
-                    &lw.ffn_up,
-                    &self.prefill_normed_buf,
-                    0,
-                    &self.prefill_up_buf,
-                    0,
-                    n as u32,
-                    hs as u32,
-                    is as u32,
-                    false,
-                );
-            });
-
-            run_phase(format!("L{layer}_{lt}_ffn_silu"), &|enc| {
-                let total = (n * is) as u32;
-                let grid = sz1d(total.div_ceil(256) as u64);
-                enc.set_compute_pipeline_state(&self.pipelines.silu_mul_inplace);
-                enc.set_buffer(0, Some(&self.prefill_gate_buf), 0);
-                enc.set_buffer(1, Some(&self.prefill_up_buf), 0);
-                let params = ElementwiseParams::new(total);
-                params.set(enc, 2);
-                enc.dispatch_thread_groups(grid, sz1d(256));
-            });
-
-            run_phase(format!("L{layer}_{lt}_ffn_down"), &|enc| {
-                // Granite scales the FFN sublayer output (residual != 1.0); other
-                // archs plain-add.
-                if self.scalars.residual == 1.0 {
-                    self.encode_gemm_add(
-                        enc,
-                        &lw.ffn_down,
-                        &self.prefill_gate_buf,
-                        0,
-                        batch_buf,
-                        0,
-                        &self.prefill_normed_buf,
-                        n as u32,
-                        is as u32,
-                        hs as u32,
-                    );
-                } else {
-                    self.encode_gemm(
-                        enc,
-                        &lw.ffn_down,
-                        &self.prefill_gate_buf,
-                        0,
-                        &self.prefill_normed_buf,
-                        0,
-                        n as u32,
-                        is as u32,
-                        hs as u32,
-                        false,
-                    );
-                    self.encode_scaled_add_inplace(
-                        enc,
-                        batch_buf,
-                        &self.prefill_normed_buf,
-                        (n * hs) as u32,
-                        self.scalars.residual,
-                    );
+            // The routed FFN is one encoder call, so it is one phase rather
+            // than the dense path's gemm/silu/down triple. Splitting it would
+            // mean re-entering `encode_moe_ffn` three times with the middle of
+            // its buffer sequence exposed, which is a worse trade than the lost
+            // granularity.
+            match &lw.ffn {
+                MetalFfn::Moe(moe) => {
+                    run_phase(format!("L{layer}_{lt}_ffn_moe"), &|enc| {
+                        self.encode_moe_ffn(
+                            enc,
+                            moe,
+                            &self.prefill_normed_buf,
+                            batch_buf,
+                            n as u32,
+                            true,
+                        );
+                    });
                 }
-            });
+                MetalFfn::Dense(dense) => {
+                    run_phase(format!("L{layer}_{lt}_ffn_gemm"), &|enc| {
+                        self.encode_gemm(
+                            enc,
+                            &dense.gate,
+                            &self.prefill_normed_buf,
+                            0,
+                            &self.prefill_gate_buf,
+                            0,
+                            n as u32,
+                            hs as u32,
+                            is as u32,
+                            false,
+                        );
+                        self.encode_gemm(
+                            enc,
+                            &dense.up,
+                            &self.prefill_normed_buf,
+                            0,
+                            &self.prefill_up_buf,
+                            0,
+                            n as u32,
+                            hs as u32,
+                            is as u32,
+                            false,
+                        );
+                    });
+
+                    run_phase(format!("L{layer}_{lt}_ffn_silu"), &|enc| {
+                        let total = (n * is) as u32;
+                        let grid = sz1d(total.div_ceil(256) as u64);
+                        enc.set_compute_pipeline_state(&self.pipelines.silu_mul_inplace);
+                        enc.set_buffer(0, Some(&self.prefill_gate_buf), 0);
+                        enc.set_buffer(1, Some(&self.prefill_up_buf), 0);
+                        let params = ElementwiseParams::new(total);
+                        params.set(enc, 2);
+                        enc.dispatch_thread_groups(grid, sz1d(256));
+                    });
+
+                    run_phase(format!("L{layer}_{lt}_ffn_down"), &|enc| {
+                        // Granite scales the FFN sublayer output (residual != 1.0); other
+                        // archs plain-add.
+                        if self.scalars.residual == 1.0 {
+                            self.encode_gemm_add(
+                                enc,
+                                &dense.down,
+                                &self.prefill_gate_buf,
+                                0,
+                                batch_buf,
+                                0,
+                                &self.prefill_normed_buf,
+                                n as u32,
+                                is as u32,
+                                hs as u32,
+                            );
+                        } else {
+                            self.encode_gemm(
+                                enc,
+                                &dense.down,
+                                &self.prefill_gate_buf,
+                                0,
+                                &self.prefill_normed_buf,
+                                0,
+                                n as u32,
+                                is as u32,
+                                hs as u32,
+                                false,
+                            );
+                            self.encode_scaled_add_inplace(
+                                enc,
+                                batch_buf,
+                                &self.prefill_normed_buf,
+                                (n * hs) as u32,
+                                self.scalars.residual,
+                            );
+                        }
+                    });
+                }
+            }
         }
 
         // Final logits epilogue.
@@ -5956,63 +6547,78 @@ impl MetalLfm2Model {
 
             // FFN
             self.encode_rmsnorm(enc, &self.hidden_buf, &self.ffn_input_buf, &lw.ffn_norm);
-            if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
-                self.encode_gemv_gate_up(
-                    enc,
-                    &lw.ffn_gate,
-                    &lw.ffn_up,
-                    &self.ffn_input_buf,
-                    &self.gate_buf,
-                    &self.up_buf,
-                );
-            } else {
-                self.encode_gemv_weight(enc, &lw.ffn_gate, &self.ffn_input_buf, &self.gate_buf);
-                self.encode_gemv_weight(enc, &lw.ffn_up, &self.ffn_input_buf, &self.up_buf);
+            match &lw.ffn {
+                // Routed layer: the whole block (router, experts, SwiGLU,
+                // weighted combine) is one call, accumulating into the residual
+                // stream the way the dense path's fused accumulate-GEMV does.
+                MetalFfn::Moe(moe) => {
+                    self.encode_moe_ffn(enc, moe, &self.ffn_input_buf, &self.hidden_buf, 1, true)
+                }
+                MetalFfn::Dense(dense) => {
+                    if dense.gate.dtype == DType::Q4_0 && dense.up.dtype == DType::Q4_0 {
+                        self.encode_gemv_gate_up(
+                            enc,
+                            &dense.gate,
+                            &dense.up,
+                            &self.ffn_input_buf,
+                            &self.gate_buf,
+                            &self.up_buf,
+                        );
+                    } else {
+                        self.encode_gemv_weight(
+                            enc,
+                            &dense.gate,
+                            &self.ffn_input_buf,
+                            &self.gate_buf,
+                        );
+                        self.encode_gemv_weight(enc, &dense.up, &self.ffn_input_buf, &self.up_buf);
+                    }
+                    // LoRA gate/up deltas on the raw projections, before silu_mul.
+                    self.encode_lora_hook(
+                        enc,
+                        lora.as_ref(),
+                        i,
+                        LoraTarget::FfnGate,
+                        &self.ffn_input_buf,
+                        &self.gate_buf,
+                    );
+                    self.encode_lora_hook(
+                        enc,
+                        lora.as_ref(),
+                        i,
+                        LoraTarget::FfnUp,
+                        &self.ffn_input_buf,
+                        &self.up_buf,
+                    );
+                    self.encode_elementwise(
+                        enc,
+                        &self.pipelines.silu_mul_inplace,
+                        &self.gate_buf,
+                        &self.up_buf,
+                        &self.params.elementwise_is,
+                        dense.gate.m,
+                    );
+                    // FFN-down + residual. `ffn_input_buf` is free here (consumed by the
+                    // gate/up projection), so it doubles as the Granite scaled-add temp.
+                    self.encode_residual_proj(
+                        enc,
+                        &dense.down,
+                        &self.gate_buf,
+                        &self.hidden_buf,
+                        &self.ffn_input_buf,
+                    );
+                    // LoRA ffn-down delta: input is the silu_mul(gate,up) result in
+                    // `gate_buf`, added into the post-residual hidden state.
+                    self.encode_lora_hook(
+                        enc,
+                        lora.as_ref(),
+                        i,
+                        LoraTarget::FfnDown,
+                        &self.gate_buf,
+                        &self.hidden_buf,
+                    );
+                }
             }
-            // LoRA gate/up deltas on the raw projections, before silu_mul.
-            self.encode_lora_hook(
-                enc,
-                lora.as_ref(),
-                i,
-                LoraTarget::FfnGate,
-                &self.ffn_input_buf,
-                &self.gate_buf,
-            );
-            self.encode_lora_hook(
-                enc,
-                lora.as_ref(),
-                i,
-                LoraTarget::FfnUp,
-                &self.ffn_input_buf,
-                &self.up_buf,
-            );
-            self.encode_elementwise(
-                enc,
-                &self.pipelines.silu_mul_inplace,
-                &self.gate_buf,
-                &self.up_buf,
-                &self.params.elementwise_is,
-                lw.ffn_gate.m,
-            );
-            // FFN-down + residual. `ffn_input_buf` is free here (consumed by the
-            // gate/up projection), so it doubles as the Granite scaled-add temp.
-            self.encode_residual_proj(
-                enc,
-                &lw.ffn_down,
-                &self.gate_buf,
-                &self.hidden_buf,
-                &self.ffn_input_buf,
-            );
-            // LoRA ffn-down delta: input is the silu_mul(gate,up) result in
-            // `gate_buf`, added into the post-residual hidden state.
-            self.encode_lora_hook(
-                enc,
-                lora.as_ref(),
-                i,
-                LoraTarget::FfnDown,
-                &self.gate_buf,
-                &self.hidden_buf,
-            );
         }
     }
 
@@ -6151,18 +6757,25 @@ impl MetalLfm2Model {
             // batched mode because ~2048 TGs redundantly reducing across the
             // hidden vector costs more than one dispatch saved.
             self.encode_rmsnorm(enc, &self.hidden_buf, &self.ffn_input_buf, &lw.ffn_norm);
-            if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
+            let dense = match &lw.ffn {
+                MetalFfn::Moe(moe) => {
+                    self.encode_moe_ffn(enc, moe, &self.ffn_input_buf, &self.hidden_buf, 1, true);
+                    continue;
+                }
+                MetalFfn::Dense(d) => d,
+            };
+            if dense.gate.dtype == DType::Q4_0 && dense.up.dtype == DType::Q4_0 {
                 self.encode_gemv_gate_up(
                     enc,
-                    &lw.ffn_gate,
-                    &lw.ffn_up,
+                    &dense.gate,
+                    &dense.up,
                     &self.ffn_input_buf,
                     &self.gate_buf,
                     &self.up_buf,
                 );
             } else {
-                self.encode_gemv_weight(enc, &lw.ffn_gate, &self.ffn_input_buf, &self.gate_buf);
-                self.encode_gemv_weight(enc, &lw.ffn_up, &self.ffn_input_buf, &self.up_buf);
+                self.encode_gemv_weight(enc, &dense.gate, &self.ffn_input_buf, &self.gate_buf);
+                self.encode_gemv_weight(enc, &dense.up, &self.ffn_input_buf, &self.up_buf);
             }
             self.encode_elementwise(
                 enc,
@@ -6170,10 +6783,10 @@ impl MetalLfm2Model {
                 &self.gate_buf,
                 &self.up_buf,
                 &self.params.elementwise_is,
-                lw.ffn_gate.m,
+                dense.gate.m,
             );
             // ffn_down fused with residual add.
-            self.encode_gemv_weight_accumulate(enc, &lw.ffn_down, &self.gate_buf, &self.hidden_buf);
+            self.encode_gemv_weight_accumulate(enc, &dense.down, &self.gate_buf, &self.hidden_buf);
         }
     }
 
@@ -6303,41 +6916,82 @@ impl MetalLfm2Model {
                 });
             }
 
-            self.gpu_sampled_pass(timer, cb, "ffn_norm_gemv", |enc| {
-                self.encode_rmsnorm(enc, &self.hidden_buf, &self.ffn_input_buf, &lw.ffn_norm);
-                if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
-                    self.encode_gemv_gate_up(
-                        enc,
-                        &lw.ffn_gate,
-                        &lw.ffn_up,
-                        &self.ffn_input_buf,
-                        &self.gate_buf,
-                        &self.up_buf,
-                    );
-                } else {
-                    self.encode_gemv_weight(enc, &lw.ffn_gate, &self.ffn_input_buf, &self.gate_buf);
-                    self.encode_gemv_weight(enc, &lw.ffn_up, &self.ffn_input_buf, &self.up_buf);
+            // One sampled pass for the whole routed block: it is a single
+            // encoder call, so the dense path's norm/gemv and silu/down split
+            // has nothing to divide here.
+            match &lw.ffn {
+                MetalFfn::Moe(moe) => {
+                    self.gpu_sampled_pass(timer, cb, "ffn_moe", |enc| {
+                        self.encode_rmsnorm(
+                            enc,
+                            &self.hidden_buf,
+                            &self.ffn_input_buf,
+                            &lw.ffn_norm,
+                        );
+                        self.encode_moe_ffn(
+                            enc,
+                            moe,
+                            &self.ffn_input_buf,
+                            &self.hidden_buf,
+                            1,
+                            true,
+                        );
+                    });
                 }
-            });
-            self.gpu_sampled_pass(timer, cb, "ffn_silu_down", |enc| {
-                self.encode_elementwise(
-                    enc,
-                    &self.pipelines.silu_mul_inplace,
-                    &self.gate_buf,
-                    &self.up_buf,
-                    &self.params.elementwise_is,
-                    lw.ffn_gate.m,
-                );
-                // Granite-scaled FFN residual; `ffn_input_buf` is free (consumed
-                // by the gate/up projection) so it doubles as the scaled-add temp.
-                self.encode_residual_proj(
-                    enc,
-                    &lw.ffn_down,
-                    &self.gate_buf,
-                    &self.hidden_buf,
-                    &self.ffn_input_buf,
-                );
-            });
+                MetalFfn::Dense(dense) => {
+                    self.gpu_sampled_pass(timer, cb, "ffn_norm_gemv", |enc| {
+                        self.encode_rmsnorm(
+                            enc,
+                            &self.hidden_buf,
+                            &self.ffn_input_buf,
+                            &lw.ffn_norm,
+                        );
+                        if dense.gate.dtype == DType::Q4_0 && dense.up.dtype == DType::Q4_0 {
+                            self.encode_gemv_gate_up(
+                                enc,
+                                &dense.gate,
+                                &dense.up,
+                                &self.ffn_input_buf,
+                                &self.gate_buf,
+                                &self.up_buf,
+                            );
+                        } else {
+                            self.encode_gemv_weight(
+                                enc,
+                                &dense.gate,
+                                &self.ffn_input_buf,
+                                &self.gate_buf,
+                            );
+                            self.encode_gemv_weight(
+                                enc,
+                                &dense.up,
+                                &self.ffn_input_buf,
+                                &self.up_buf,
+                            );
+                        }
+                    });
+                    self.gpu_sampled_pass(timer, cb, "ffn_silu_down", |enc| {
+                        self.encode_elementwise(
+                            enc,
+                            &self.pipelines.silu_mul_inplace,
+                            &self.gate_buf,
+                            &self.up_buf,
+                            &self.params.elementwise_is,
+                            dense.gate.m,
+                        );
+                        // Granite-scaled FFN residual; `ffn_input_buf` is free
+                        // (consumed by the gate/up projection) so it doubles as
+                        // the scaled-add temp.
+                        self.encode_residual_proj(
+                            enc,
+                            &dense.down,
+                            &self.gate_buf,
+                            &self.hidden_buf,
+                            &self.ffn_input_buf,
+                        );
+                    });
+                }
+            }
         }
     }
 
@@ -6476,42 +7130,81 @@ impl MetalLfm2Model {
                 });
             }
 
-            // FFN: rmsnorm + gate/up GEMVs.
-            self.profile_segment(timer, "ffn_norm_gemv", |enc| {
-                self.encode_rmsnorm(enc, &self.hidden_buf, &self.ffn_input_buf, &lw.ffn_norm);
-                if lw.ffn_gate.dtype == DType::Q4_0 && lw.ffn_up.dtype == DType::Q4_0 {
-                    self.encode_gemv_gate_up(
-                        enc,
-                        &lw.ffn_gate,
-                        &lw.ffn_up,
-                        &self.ffn_input_buf,
-                        &self.gate_buf,
-                        &self.up_buf,
-                    );
-                } else {
-                    self.encode_gemv_weight(enc, &lw.ffn_gate, &self.ffn_input_buf, &self.gate_buf);
-                    self.encode_gemv_weight(enc, &lw.ffn_up, &self.ffn_input_buf, &self.up_buf);
+            // FFN. One segment for a routed block (it is a single encoder
+            // call); the dense path keeps its norm/gemv and silu/down split.
+            match &lw.ffn {
+                MetalFfn::Moe(moe) => {
+                    self.profile_segment(timer, "ffn_moe", |enc| {
+                        self.encode_rmsnorm(
+                            enc,
+                            &self.hidden_buf,
+                            &self.ffn_input_buf,
+                            &lw.ffn_norm,
+                        );
+                        self.encode_moe_ffn(
+                            enc,
+                            moe,
+                            &self.ffn_input_buf,
+                            &self.hidden_buf,
+                            1,
+                            true,
+                        );
+                    });
                 }
-            });
-            // silu_mul + ffn_down residual (Granite-scaled; `ffn_input_buf` is
-            // free here and doubles as the scaled-add temp).
-            self.profile_segment(timer, "ffn_silu_down", |enc| {
-                self.encode_elementwise(
-                    enc,
-                    &self.pipelines.silu_mul_inplace,
-                    &self.gate_buf,
-                    &self.up_buf,
-                    &self.params.elementwise_is,
-                    lw.ffn_gate.m,
-                );
-                self.encode_residual_proj(
-                    enc,
-                    &lw.ffn_down,
-                    &self.gate_buf,
-                    &self.hidden_buf,
-                    &self.ffn_input_buf,
-                );
-            });
+                MetalFfn::Dense(dense) => {
+                    self.profile_segment(timer, "ffn_norm_gemv", |enc| {
+                        self.encode_rmsnorm(
+                            enc,
+                            &self.hidden_buf,
+                            &self.ffn_input_buf,
+                            &lw.ffn_norm,
+                        );
+                        if dense.gate.dtype == DType::Q4_0 && dense.up.dtype == DType::Q4_0 {
+                            self.encode_gemv_gate_up(
+                                enc,
+                                &dense.gate,
+                                &dense.up,
+                                &self.ffn_input_buf,
+                                &self.gate_buf,
+                                &self.up_buf,
+                            );
+                        } else {
+                            self.encode_gemv_weight(
+                                enc,
+                                &dense.gate,
+                                &self.ffn_input_buf,
+                                &self.gate_buf,
+                            );
+                            self.encode_gemv_weight(
+                                enc,
+                                &dense.up,
+                                &self.ffn_input_buf,
+                                &self.up_buf,
+                            );
+                        }
+                    });
+                    // silu_mul + ffn_down residual (Granite-scaled;
+                    // `ffn_input_buf` is free here and doubles as the
+                    // scaled-add temp).
+                    self.profile_segment(timer, "ffn_silu_down", |enc| {
+                        self.encode_elementwise(
+                            enc,
+                            &self.pipelines.silu_mul_inplace,
+                            &self.gate_buf,
+                            &self.up_buf,
+                            &self.params.elementwise_is,
+                            dense.gate.m,
+                        );
+                        self.encode_residual_proj(
+                            enc,
+                            &dense.down,
+                            &self.gate_buf,
+                            &self.hidden_buf,
+                            &self.ffn_input_buf,
+                        );
+                    });
+                }
+            }
         }
     }
 }

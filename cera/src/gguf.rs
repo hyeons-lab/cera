@@ -753,6 +753,65 @@ impl GgufFile {
         Ok((range.start, rows, cols, info.dtype))
     }
 
+    /// Get metadata for one expert's slice of a stacked MoE expert tensor:
+    /// `(byte_offset_in_backing, slice_len_bytes, rows, cols, dtype)`.
+    ///
+    /// Same shape as [`Self::tensor_meta`] plus the slice length, which callers
+    /// need because, unlike a whole-tensor lookup, the length cannot be
+    /// recovered from the tensor info alone.
+    ///
+    /// MoE architectures (`lfm2moe`) store a layer's per-expert feed-forward
+    /// weights stacked into one rank-3 `[ne0, ne1, n_expert]` tensor, e.g.
+    /// `blk.2.ffn_gate_exps.weight` with shape `[2048, 1792, 32]`. Expert `e`'s
+    /// slice is the contiguous `[ne0, ne1]` sub-tensor at element offset
+    /// `e * ne0 * ne1`, so it can be addressed as an ordinary 2D weight, and
+    /// quantized dtypes keep working because every supported block type divides
+    /// `ne0` evenly. On CPU that is the whole story: the existing GEMV kernels
+    /// take an expert's slice unchanged. The GPU backends do have expert-aware
+    /// kernels, because routing happens on the device and the slice has to be
+    /// chosen inside the shader, but they choose it with the same stride this
+    /// offset defines.
+    ///
+    /// Rank-3 is rejected by `tensor_meta` rather than handled there: a stacked
+    /// expert tensor has no single meaningful `(rows, cols)`, and silently
+    /// returning the first expert's would make a routing bug look like a
+    /// quality regression.
+    pub fn tensor_meta_expert(
+        &self,
+        name: &str,
+        expert: usize,
+    ) -> Result<(usize, usize, usize, usize, DType)> {
+        let (info, range) = self.tensor_range(name)?;
+        let [ne0, ne1, n_expert] = match info.shape[..] {
+            [ne0, ne1, n_expert] => [ne0, ne1, n_expert],
+            _ => bail!(
+                "tensor_meta_expert: {name} must be rank 3, got rank {}",
+                info.shape.len()
+            ),
+        };
+        ensure!(
+            expert < n_expert,
+            "tensor_meta_expert: expert {expert} out of range for {name} ({n_expert} experts)"
+        );
+
+        let slice_bytes = tensor_data_size(&[ne0, ne1], info.dtype)?;
+        let start = expert
+            .checked_mul(slice_bytes)
+            .and_then(|off| range.start.checked_add(off))
+            .with_context(|| format!("tensor {name} expert {expert} offset overflow"))?;
+        let end = start
+            .checked_add(slice_bytes)
+            .with_context(|| format!("tensor {name} expert {expert} end offset overflow"))?;
+        // The stacked tensor's own bound, not the buffer's: a short final slice
+        // would otherwise read into whatever tensor follows it.
+        ensure!(
+            end <= range.end,
+            "tensor {name} expert {expert} slice extends past the tensor"
+        );
+
+        Ok((start, slice_bytes, ne1, ne0, info.dtype))
+    }
+
     /// Print a summary of the GGUF file for inspection.
     pub fn print_inspect(&self) {
         println!("=== GGUF File ===");
@@ -1058,5 +1117,89 @@ mod tests {
                 "unexpected error: {e}"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod expert_slice_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::ptr::NonNull;
+    use std::sync::Arc;
+
+    /// Build a GGUF holding one rank-3 F32 expert tensor `[ne0, ne1, n_expert]`
+    /// at `offset`, backed by a buffer big enough to hold it.
+    fn gguf_with_expert_tensor(ne0: usize, ne1: usize, n_expert: usize, offset: usize) -> GgufFile {
+        let size_bytes = ne0 * ne1 * n_expert * 4;
+        let bytes: Arc<[u8]> = Arc::from(vec![0u8; offset + size_bytes].into_boxed_slice());
+        let ptr = NonNull::new(bytes.as_ptr() as *mut u8).unwrap();
+        let len = bytes.len();
+
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "exps".to_string(),
+            TensorInfo {
+                name: "exps".to_string(),
+                shape: vec![ne0, ne1, n_expert],
+                dtype: DType::F32,
+                offset: offset as u64,
+                size_bytes,
+                ggml_type_id: GGML_TYPE_F32,
+            },
+        );
+
+        GgufFile {
+            metadata: HashMap::new(),
+            tensors,
+            data: SafeDataPtr { ptr, len },
+            _backing: Backing::Owned(bytes),
+            data_offset: 0,
+        }
+    }
+
+    /// Expert slices are contiguous and evenly spaced, and each is presented
+    /// with the *2D* shape (rows = ne1, cols = ne0) so it can be handed to
+    /// the ordinary GEMV kernels. Offsets are checked against an independently
+    /// computed stride rather than hand-typed constants.
+    #[test]
+    fn expert_slices_are_contiguous_and_2d() {
+        let (ne0, ne1, n_expert, base) = (2048, 1792, 32, 4096);
+        let gguf = gguf_with_expert_tensor(ne0, ne1, n_expert, base);
+        let stride = ne0 * ne1 * 4;
+
+        for e in 0..n_expert {
+            let (start, size, rows, cols, dtype) = gguf.tensor_meta_expert("exps", e).unwrap();
+            assert_eq!(start, base + e * stride, "expert {e} offset");
+            assert_eq!(size, stride, "expert {e} size");
+            // GGUF [ne0, ne1] → rows = ne1 (outputs), cols = ne0 (inputs).
+            assert_eq!((rows, cols), (ne1, ne0));
+            assert_eq!(dtype, DType::F32);
+        }
+    }
+
+    /// The slices must exactly tile the stacked tensor: the last one has to end
+    /// on its final byte, or a short tail would read into the next tensor.
+    #[test]
+    fn last_expert_ends_exactly_at_the_tensor_end() {
+        let (ne0, ne1, n_expert, base) = (64, 32, 8, 0);
+        let gguf = gguf_with_expert_tensor(ne0, ne1, n_expert, base);
+        let (start, size, ..) = gguf.tensor_meta_expert("exps", n_expert - 1).unwrap();
+        assert_eq!(start + size, base + ne0 * ne1 * n_expert * 4);
+    }
+
+    #[test]
+    fn rejects_out_of_range_expert() {
+        let gguf = gguf_with_expert_tensor(64, 32, 8, 0);
+        let err = gguf.tensor_meta_expert("exps", 8).unwrap_err().to_string();
+        assert!(err.contains("out of range"), "{err}");
+    }
+
+    /// `tensor_meta` must keep refusing rank 3 rather than quietly describing
+    /// the whole expert stack as one matrix.
+    #[test]
+    fn tensor_meta_still_rejects_rank_3() {
+        let gguf = gguf_with_expert_tensor(64, 32, 8, 0);
+        let err = gguf.tensor_meta("exps").unwrap_err().to_string();
+        assert!(err.contains("unexpected rank"), "{err}");
     }
 }

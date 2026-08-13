@@ -34,7 +34,7 @@ filesystem tree manually" workaround.
 | 15 | Parity harness (`cera-parity` Kotlin/Swift legs + perf gate) |
 | 16+ | Session-API expansion: `Session::append_audio` placeholder, `Session::clear_cancel`, `CeraEngine::is_special_token`, `CeraEngine::context_size` resolved getter |
 | 17+ | Hidden-states extraction: `Session::hidden_states_for_tokens` / `_for_text` (LE-f32 `Data`/`ByteArray`), `hidden_states_mean_pooled` (`[Float]`), `hidden_size` |
-| 18+ | LoRA adapters: `LoraAdapters` object (`from_gguf` / `from_safetensors`), `Session::attach_lora` / `remove_lora` / `has_lora`, `FfiError::LoraParse` |
+| 18+ | LoRA adapters: `LoraAdapters` object (`from_gguf` / `from_safetensors`), `Session::attach_lora` / `remove_lora` / `has_lora`, `FfiError::LoraParse`, `FfiError::LoraUnsupportedByBackend` |
 | 19+ | Maven Central (`com.hyeons-lab:cera-ffi-{jvm,android}`) + SwiftPM remote publishing (`.package(url:)` against a prebuilt `CeraFFI.xcframework`); both shipped |
 
 Don't add FFI exposure to `cera` directly. The `cera` crate keeps its

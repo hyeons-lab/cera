@@ -1300,6 +1300,41 @@ final class FfiErrorKvCompressionConflict extends FfiError {
   int get hashCode => Object.hash(configured, requested);
 }
 
+/// The adapter fits the model, but the active backend has no hook for
+/// something it adapts. Mirrors [`cera::CeraError::LoraUnsupportedByBackend`].
+///
+/// Separate from [`FfiError::LoraParse`] because the two need different
+/// handling on the foreign side: `LoraParse` means the adapter or the model
+/// pairing is wrong, while this one means only the backend is, so a caller
+/// can retry on CPU instead of surfacing "bad adapter" to a user. Today the
+/// case is a routed feed-forward (mixture-of-experts) delta on a GPU
+/// backend.
+///
+/// **Appended, not grouped next to `LoraParse`.** UniFFI serializes this
+/// enum by ordinal, and the committed Kotlin/Swift/Dart bindings decode it
+/// the same way, so inserting mid-enum renumbers every later variant and a
+/// prebuilt consumer would decode this one as whatever now holds its old
+/// ordinal. New variants go at the end.
+final class FfiErrorLoraUnsupportedByBackend extends FfiError {
+  const FfiErrorLoraUnsupportedByBackend({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'FfiErrorLoraUnsupportedByBackend(detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiErrorLoraUnsupportedByBackend && detail == other.detail;
+
+  @override
+  int get hashCode => detail.hashCode;
+}
+
 /// Why a decode loop exited. Mirrors [`cera::FinishReason`].
 sealed class FinishReason {
   const FinishReason();
@@ -1757,6 +1792,33 @@ final class FfiErrorExceptionKvCompressionConflict extends FfiErrorException {
   }
 }
 
+/// The adapter fits the model, but the active backend has no hook for
+/// something it adapts. Mirrors [`cera::CeraError::LoraUnsupportedByBackend`].
+///
+/// Separate from [`FfiError::LoraParse`] because the two need different
+/// handling on the foreign side: `LoraParse` means the adapter or the model
+/// pairing is wrong, while this one means only the backend is, so a caller
+/// can retry on CPU instead of surfacing "bad adapter" to a user. Today the
+/// case is a routed feed-forward (mixture-of-experts) delta on a GPU
+/// backend.
+///
+/// **Appended, not grouped next to `LoraParse`.** UniFFI serializes this
+/// enum by ordinal, and the committed Kotlin/Swift/Dart bindings decode it
+/// the same way, so inserting mid-enum renumbers every later variant and a
+/// prebuilt consumer would decode this one as whatever now holds its old
+/// ordinal. New variants go at the end.
+final class FfiErrorExceptionLoraUnsupportedByBackend extends FfiErrorException {
+  const FfiErrorExceptionLoraUnsupportedByBackend({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'FfiErrorExceptionLoraUnsupportedByBackend(detail: $detail)';
+  }
+}
+
 FfiErrorException _uniffiLiftFfiErrorException(Uint8List bytes) {
   final FfiError value = _uniffiDecodeFfiError(bytes);
   if (value is FfiErrorUnsupportedModality) return const FfiErrorExceptionUnsupportedModality();
@@ -1809,6 +1871,11 @@ FfiErrorException _uniffiLiftFfiErrorException(Uint8List bytes) {
     return FfiErrorExceptionKvCompressionConflict(
       configured: value.configured,
       requested: value.requested,
+    );
+  }
+  if (value is FfiErrorLoraUnsupportedByBackend) {
+    return FfiErrorExceptionLoraUnsupportedByBackend(
+      detail: value.detail,
     );
   }
   throw StateError('Unknown FfiError error variant while lifting exception: $value');
@@ -1911,6 +1978,12 @@ String _encodeFfiError(FfiError value) {
       'requested': value.requested,
     });
   }
+  if (value is FfiErrorLoraUnsupportedByBackend) {
+    return jsonEncode({
+      'tag': 'loraUnsupportedByBackend',
+      'detail': value.detail,
+    });
+  }
   throw StateError('Unknown FfiError variant instance: $value');
 }
 
@@ -1968,6 +2041,10 @@ FfiError _decodeFfiError(String raw) {
       return FfiErrorKvCompressionConflict(
         configured: map['configured'] as String,
         requested: map['requested'] as String,
+      );
+    case 'loraUnsupportedByBackend':
+      return FfiErrorLoraUnsupportedByBackend(
+        detail: map['detail'] as String,
       );
     default:
       throw StateError('Unknown FfiError variant tag: $tag');
@@ -2173,6 +2250,12 @@ String _encodeFfiErrorException(FfiErrorException value) {
       'requested': value.requested,
     });
   }
+  if (value is FfiErrorExceptionLoraUnsupportedByBackend) {
+    return jsonEncode({
+      'tag': 'loraUnsupportedByBackend',
+      'detail': value.detail,
+    });
+  }
   throw StateError('Unknown FfiErrorException exception instance: $value');
 }
 
@@ -2226,6 +2309,10 @@ FfiErrorException _decodeFfiErrorException(Object? raw) {
       return FfiErrorExceptionKvCompressionConflict(
         configured: map['configured'] as String,
         requested: map['requested'] as String,
+      );
+    case 'loraUnsupportedByBackend':
+      return FfiErrorExceptionLoraUnsupportedByBackend(
+        detail: map['detail'] as String,
       );
     default:
       throw StateError('Unknown FfiErrorException exception tag: $tag');
@@ -2869,6 +2956,10 @@ void _uniffiWriteFfiError(FfiError value, _UniFfiBinaryWriter writer) {
     writer.writeString(value.configured);
     writer.writeString(value.requested);
   }
+  else if (value is FfiErrorLoraUnsupportedByBackend) {
+    writer.writeI32(14);
+    writer.writeString(value.detail);
+  }
   else {
     throw StateError('Unknown FfiError variant instance: $value');
   }
@@ -2929,6 +3020,10 @@ FfiError _uniffiReadFfiError(_UniFfiBinaryReader reader) {
       return FfiErrorKvCompressionConflict(
         configured: reader.readString(),
         requested: reader.readString(),
+      );
+    case 14:
+      return FfiErrorLoraUnsupportedByBackend(
+        detail: reader.readString(),
       );
     default:
       throw StateError('Unknown FfiError variant tag: $tag');
@@ -3499,8 +3594,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_attach_lora`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_attach_lora != 28982) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_attach_lora`: expected 28982, got $_checksum_uniffi_cera_ffi_checksum_method_session_attach_lora');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_attach_lora != 3335) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_attach_lora`: expected 3335, got $_checksum_uniffi_cera_ffi_checksum_method_session_attach_lora');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_cancel;
     try {
@@ -11787,9 +11882,15 @@ final class Session {
   /// Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
   /// call). It's applied to every subsequent forward pass — generation **and**
   /// hidden-states extraction — until removed or replaced (hot-swap), and is
-  /// preserved across [`Self::reset`]. Returns [`FfiError::LoraParse`] if the
-  /// adapter's dimensions don't match the loaded model. Only affects tokens
-  /// processed after the call (doesn't retroactively re-adapt cached KV).
+  /// preserved across [`Self::reset`]. Only affects tokens processed after the
+  /// call (doesn't retroactively re-adapt cached KV).
+  ///
+  /// Two distinct failures, worth catching separately: [`FfiError::LoraParse`]
+  /// means the adapter's dimensions don't match the loaded model, so the
+  /// adapter or the pairing is wrong; [`FfiError::LoraUnsupportedByBackend`]
+  /// means it fits but this backend has no hook for something it adapts, so
+  /// the same adapter works on another backend (today: a mixture-of-experts
+  /// adapter needs the CPU backend).
   void attachLora(LoraAdapters adapters) {
     _ensureOpen();
     _ffi.sessionInvokeAttachLora(_handle, adapters);

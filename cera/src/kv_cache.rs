@@ -261,6 +261,18 @@ pub struct ScratchBuffers {
     /// Scratch for the LoRA down-projection intermediate (`A·x`). Reused across
     /// apply calls so the LoRA hot path allocates nothing.
     pub lora_tmp: Vec<f32>,
+    /// Router logits, then gate probabilities, for one MoE layer (`n_expert`).
+    /// Stays empty on dense models, which never touch it.
+    pub moe_probs: Vec<f32>,
+    /// One expert's feed-forward output (`hidden_size`), before it is scaled by
+    /// its routing weight and accumulated. Needed because the down-projection
+    /// GEMV overwrites its destination rather than accumulating, so the running
+    /// sum cannot live in `out`. Empty on dense models.
+    pub moe_expert_out: Vec<f32>,
+    /// The `n_expert_used` selected expert indices and their normalized
+    /// combining weights, for one MoE layer. Held in scratch so routing
+    /// allocates nothing per layer per token. Empty on dense models.
+    pub moe_selected: Vec<(usize, f32)>,
 }
 
 /// Inference state across all layers.
@@ -323,6 +335,9 @@ impl InferenceState {
                 q8_quants: Vec::new(),
                 dequant_weight_scratch: Vec::new(),
                 lora_tmp: Vec::new(),
+                moe_probs: Vec::new(),
+                moe_expert_out: Vec::new(),
+                moe_selected: Vec::new(),
             },
             tq_encode_scratch: None,
             tq_query_scratch: None,
@@ -568,6 +583,23 @@ impl InferenceState {
                 // call. Stays empty if the `blas` feature is off.
                 dequant_weight_scratch: Vec::new(),
                 lora_tmp: Vec::new(),
+                moe_probs: config
+                    .moe
+                    .as_ref()
+                    .map(|m| zeroed_f32(m.n_expert))
+                    .transpose()?
+                    .unwrap_or_default(),
+                moe_expert_out: config
+                    .moe
+                    .as_ref()
+                    .map(|_| zeroed_f32(config.hidden_size))
+                    .transpose()?
+                    .unwrap_or_default(),
+                moe_selected: config
+                    .moe
+                    .as_ref()
+                    .map(|m| Vec::with_capacity(m.n_expert_used))
+                    .unwrap_or_default(),
             },
             // Scratch is needed whenever either side is compressed. The
             // EncodeScratch `rot` buffer is shared between key and value
@@ -1958,6 +1990,7 @@ mod tests {
                 .map(|i| if i % 2 == 0 { 2 } else { 0 })
                 .collect(),
             scalars: crate::model::ScalarMultipliers::default(),
+            moe: None,
         }
     }
 

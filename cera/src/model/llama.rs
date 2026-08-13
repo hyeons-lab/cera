@@ -272,6 +272,8 @@ impl LlamaModel {
             conv_kernel_size: None,
             kv_heads_per_layer,
             scalars,
+            // Dense transformers only; the `llama`-family loader has no expert path.
+            moe: None,
         };
 
         // Final norm tensor (NOT the LFM2 `token_embd_norm.weight`).
@@ -1795,14 +1797,15 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
     fn output_ref(&self) -> Option<&WeightRef> {
         self.output_ref.as_ref()
     }
-    fn ffn_gate_ref(&self, layer: usize) -> &WeightRef {
-        &self.layer_refs[layer].ffn_gate
+    // Always dense: the `llama`-family loader has no expert path.
+    fn ffn_gate_ref(&self, layer: usize) -> Result<&WeightRef> {
+        Ok(&self.layer_refs[layer].ffn_gate)
     }
-    fn ffn_up_ref(&self, layer: usize) -> &WeightRef {
-        &self.layer_refs[layer].ffn_up
+    fn ffn_up_ref(&self, layer: usize) -> Result<&WeightRef> {
+        Ok(&self.layer_refs[layer].ffn_up)
     }
-    fn ffn_down_ref(&self, layer: usize) -> &WeightRef {
-        &self.layer_refs[layer].ffn_down
+    fn ffn_down_ref(&self, layer: usize) -> Result<&WeightRef> {
+        Ok(&self.layer_refs[layer].ffn_down)
     }
     fn conv_in_proj_ref(&self, _layer: usize) -> Option<&WeightRef> {
         None

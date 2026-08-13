@@ -108,13 +108,22 @@ fn llm_layer0_conv_standalone() {
     let is = cfg.intermediate_size;
     let mut gate = vec![0.0f32; is];
     let mut up = vec![0.0f32; is];
-    model.ffn_gate_gemv(0, &hidden, &mut gate);
-    model.ffn_up_gemv(0, &hidden, &mut up);
+    // These are fallible now: they reject a mixture-of-experts layer, whose FFN
+    // weights are per-expert. Layer 0 of this model is dense, so the error is
+    // unreachable here, but it must not be discarded.
+    model
+        .ffn_gate_gemv(0, &hidden, &mut gate)
+        .expect("layer 0 is dense");
+    model
+        .ffn_up_gemv(0, &hidden, &mut up)
+        .expect("layer 0 is dense");
     cpu::silu_mul_inplace(&mut gate, &up);
     stat("ffn_silu_mul", &gate);
 
     let mut down = vec![0.0f32; hs];
-    model.ffn_down_gemv(0, &gate, &mut down);
+    model
+        .ffn_down_gemv(0, &gate, &mut down)
+        .expect("layer 0 is dense");
 
     let output: Vec<f32> = ffn_residual.iter().zip(&down).map(|(r, d)| r + d).collect();
     stat("FINAL", &output);

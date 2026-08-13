@@ -763,3 +763,80 @@ pub struct MelNormParams {
 }
 const _: () = assert!(size_of::<MelNormParams>() == 16);
 impl MetalParams for MelNormParams {}
+
+// ── Mixture-of-experts (lfm2moe) ────────────────────────────────────────────
+
+/// Mirror of the params binding in `shaders/slang/moe_route.slang`.
+///
+/// Both counts are the loader's to get right, not the kernel's to survive.
+///
+/// The routing kernel does clamp `n_used` to its own `MAX_USED`, but that clamp
+/// is not a safety net: it only bounds *this* kernel's writes, and
+/// `moe_gemv_q4_0` and `moe_combine` then index with the host's unclamped
+/// `n_used`, reading `sel_expert` slots the clamp left unwritten and
+/// multiplying that garbage by `expert_stride` into a device read. `n_expert`
+/// is not clamped at all; it indexes a fixed-size groupshared array. What makes
+/// both safe is the Metal loader rejecting a model above `MOE_MAX_EXPERTS` /
+/// `MOE_MAX_EXPERT_USED` when it builds the shared `MoeScratch`, before any
+/// buffer is sized from those counts, and
+/// `moe_bound_tests::loader_bounds_match_the_routing_kernel` pins those two
+/// constants to the shader's own array sizes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeRouteParams {
+    pub n_expert: u32,
+    pub n_used: u32,
+    pub n_tokens: u32,
+    pub _pad: u32,
+}
+const _: () = assert!(size_of::<MoeRouteParams>() == 16);
+impl MetalParams for MoeRouteParams {}
+
+/// Mirror of the params binding in `shaders/slang/moe_gemv_q4_0.slang`: two
+/// `uint4`s, so 32 bytes.
+///
+/// `expert_stride` is the byte distance between consecutive experts' slices of
+/// the stacked weight, i.e. `m * (k / 32) * 18` for Q4_0. It is a byte count
+/// rather than a row or block count because the kernel's block addressing is
+/// already byte-based, and deriving it in-shader would mean re-deriving
+/// `row_bytes` from `k` in two places.
+///
+/// `x_by_entry` selects the activation row: 0 for the gate/up projections,
+/// which share the token's hidden state across all of its slots, and 1 for the
+/// down projection, whose input is the per-slot SwiGLU product.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeGemvParams {
+    pub m: u32,
+    pub k: u32,
+    pub n_used: u32,
+    pub n_entries: u32,
+    pub expert_stride: u32,
+    pub x_by_entry: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+const _: () = assert!(size_of::<MoeGemvParams>() == 32);
+impl MetalParams for MoeGemvParams {}
+
+/// Mirror of the params binding in `shaders/slang/moe_combine.slang`.
+///
+/// `accumulate` selects the output convention of the *caller*, not of the
+/// phase: 1 adds the combined result into whatever `out` already holds, 0
+/// overwrites it. Decode always accumulates, straight into the residual stream,
+/// as the dense path's fused accumulate-GEMV does. Prefill goes both ways: the
+/// main batched path writes into a scratch buffer whose residual add is fused
+/// into the *next* layer's `add_rmsnorm_batch`, so it must overwrite, while the
+/// profiled path accumulates into its own batch buffer exactly as its dense
+/// twin's `encode_gemm_add` does. Read the flag at the call site rather than
+/// inferring it from decode-versus-prefill.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeCombineParams {
+    pub hidden: u32,
+    pub n_used: u32,
+    pub n_tokens: u32,
+    pub accumulate: u32,
+}
+const _: () = assert!(size_of::<MoeCombineParams>() == 16);
+impl MetalParams for MoeCombineParams {}

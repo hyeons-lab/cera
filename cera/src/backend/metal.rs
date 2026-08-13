@@ -15,9 +15,10 @@ pub mod params;
 pub use params::{
     ArgmaxParams, BiasAddParams, Conv1dBatchParams, Conv1dParams, ElementwiseParams,
     FlashAttnParams, GemmF32Params, GemvBatchParams, GemvQkvParams, GemvRmsParams,
-    GemvSplitKParams, KvCopyParams, KvShiftKParams, MetalParams, NormParams, PrefillAttnParams,
-    QkNormRopeBatchParams, QkNormRopeParams, QuantGemmParams, RmsNormBatchParams, RopeParams,
-    ScaleParams, SplitAttnParams, TqAttnParams, TqParams,
+    GemvSplitKParams, KvCopyParams, KvShiftKParams, MetalParams, MoeCombineParams, MoeGemvParams,
+    MoeRouteParams, NormParams, PrefillAttnParams, QkNormRopeBatchParams, QkNormRopeParams,
+    QuantGemmParams, RmsNormBatchParams, RopeParams, ScaleParams, SplitAttnParams, TqAttnParams,
+    TqParams,
 };
 
 /// Metal compute context: device, command queue, compiled shader library cache.
@@ -392,6 +393,19 @@ pub mod shaders {
     /// tree. Each branch's binding set is dropped for the other target.
     /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
     pub const RMSNORM: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm.metal"));
+    /// Mixture-of-experts routing (`lfm2moe`), generated from
+    /// `shaders/slang/moe_route.slang` and shared with the wgpu backend.
+    /// Sigmoid + top-k over the router logits; see the source for why the
+    /// ranking and weighting score sets differ.
+    pub const MOE_ROUTE: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_route.metal"));
+    /// Expert-indexed Q4_0 GEMV, generated from
+    /// `shaders/slang/moe_gemv_q4_0.slang`. Reads the routed expert id from a
+    /// device buffer and does the weight-slice arithmetic in-shader, which is
+    /// what keeps routing off the host and out of a per-layer readback stall.
+    pub const MOE_GEMV_Q4_0: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_gemv_q4_0.metal"));
+    /// Weighted sum of a token's expert outputs, generated from
+    /// `shaders/slang/moe_combine.slang`.
+    pub const MOE_COMBINE: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_combine.metal"));
     /// Generated from `shaders/slang/per_head_rmsnorm.slang` by build.rs and
     /// shared with the wgpu backend's
     /// `wgpu::shaders::PER_HEAD_RMSNORM`. A `__target_switch`

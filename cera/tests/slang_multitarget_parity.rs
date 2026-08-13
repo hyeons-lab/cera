@@ -747,6 +747,198 @@ fn overlap_add_ref(
         .collect()
 }
 
+// ── Mixture-of-experts (lfm2moe) ────────────────────────────────────────────
+
+// Shape of the MoE fixtures. Small enough to keep the reference cheap, but with
+// every dimension distinct, so a kernel that read the slot dimension as the
+// token dimension (or the reverse) lands on different data instead of aliasing
+// onto the right answer.
+
+/// Experts per routed layer.
+const MOE_N_EXPERT: usize = 6;
+/// Experts activated per token. Deliberately unequal to `MOE_N_TOKENS`.
+const MOE_N_USED: usize = 3;
+/// Tokens per fixture batch.
+const MOE_N_TOKENS: usize = 4;
+/// Rows per expert projection.
+const MOE_M: usize = 10;
+/// Inner dimension, chosen so `nb = k / 32 = 35` is both *greater* than the
+/// GEMV's 32-thread workgroup and not a multiple of it.
+///
+/// Both halves matter and an earlier `k = 96` had neither. `nb > WG` is what
+/// makes threads take a second iteration of the grid-stride block loop, so the
+/// cross-block accumulation (`sum += acc * scale`) is actually executed twice
+/// by a thread; at `nb = 3` no thread ever loops, and a kernel that overwrote
+/// `sum` instead of accumulating passed. `nb % WG != 0` then leaves that loop
+/// ragged, so the threads that stop early are exercised too. The real down
+/// projection has both of those properties as well (`1792 / 32 = 56`); what the
+/// fixture reproduces is the properties, not the size.
+const MOE_K: usize = 1120;
+
+/// Pack a `[.., k]` row-major f32 buffer as Q4_0: 18 bytes per 32-element block,
+/// an f16 scale followed by 16 bytes of nibble pairs, where byte `i` holds
+/// element `i` in its low nibble and element `i + 16` in its high one.
+///
+/// Written out by hand rather than reusing `cera::quant`'s quantizer so the
+/// fixture states the byte layout the shader indexes, independently of the
+/// production packer it is meant to agree with. The *dequantizer* is not
+/// duplicated: [`q4_0_dequant`] calls into `cera::quant`, so the reference the
+/// kernels are scored against is the crate's own.
+fn q4_0_pack(data: &[f32]) -> Vec<u8> {
+    assert_eq!(data.len() % 32, 0, "Q4_0 needs whole 32-element blocks");
+    let mut bytes = Vec::with_capacity(data.len() / 32 * 18);
+    for block in data.as_chunks::<32>().0 {
+        // Q4_0 is symmetric around 8, so the scale comes from the most negative
+        // value, matching `quant::BlockQ4_0`'s layout and `cera-wasm`'s packer.
+        let amax = block
+            .iter()
+            .fold(0f32, |m, &x| if x.abs() > m.abs() { x } else { m });
+        let d = amax / -8.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        bytes.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+        let nib = |x: f32| ((x * id + 8.5) as i32).clamp(0, 15) as u8;
+        bytes.extend((0..16).map(|i| nib(block[i]) | (nib(block[i + 16]) << 4)));
+    }
+    bytes
+}
+
+/// The f32 values a Q4_0 buffer packed by [`q4_0_pack`] decodes back to.
+///
+/// The references below contract against *these*, not the pre-quantization
+/// floats: comparing against the originals would fold quantization error into
+/// the tolerance, which is the band a real kernel bug would hide in.
+///
+/// Delegates to `cera::quant`, as the Q8_0 cases in this file already do, so
+/// what the kernels are scored against is the crate's own dequantizer rather
+/// than a second copy of the nibble unpacking that could drift away from it.
+fn q4_0_dequant(bytes: &[u8]) -> Vec<f32> {
+    let mut out = vec![0.0f32; bytes.len() / 18 * 32];
+    cera::quant::dequantize_q4_0_row(bytes, &mut out);
+    out
+}
+
+/// Router logits and per-expert selection bias.
+///
+/// The bias is what makes this fixture worth having: `lfm2moe` trains it to
+/// balance expert load, which pushes the ranking scores toward each other, so
+/// the bias here is scaled to land ties and near-ties on the top-k boundary.
+/// A kernel that ranked by the unbiased probability, or that broke ties toward
+/// the higher index, disagrees here and nowhere else.
+fn moe_route_inputs() -> (Vec<f32>, Vec<f32>) {
+    let mut logits = gemm_data(MOE_N_TOKENS * MOE_N_EXPERT, 7);
+    let mut bias: Vec<f32> = (0..MOE_N_EXPERT).map(|e| (e as f32 - 2.5) * 0.05).collect();
+
+    // Plant an exact tie, so the documented "ties go to the lower expert index"
+    // is a property the fixture can actually falsify. Pseudo-random logits never
+    // produce one: the smallest pairwise score gap here is ~2e-3, so flipping
+    // the kernel's `>` to `>=` left every parity test green.
+    //
+    // Constructed rather than searched for, because the tie has to survive in
+    // f32 on two backends: experts 2 and 3 are given equal biases and, for token
+    // 1, equal logits, so `sigmoid(l) + b` is not merely close but bit-identical.
+    // Both logits are large enough to put the pair inside the top `MOE_N_USED`,
+    // where the tie-break decides which *slot* each takes; since `sel_expert` is
+    // compared elementwise, swapping them fails the test.
+    bias[3] = bias[2];
+    logits[MOE_N_EXPERT + 2] = 3.0;
+    logits[MOE_N_EXPERT + 3] = 3.0;
+
+    (logits, bias)
+}
+
+/// Sigmoid, rank by `prob + bias`, weight by the renormalized *unbiased* prob.
+///
+/// Mirrors `lfm2::select_experts`, including its two details that are invisible
+/// in aggregate output: ties go to the lower expert index, and the divisor is
+/// clamped to f16's smallest positive normal.
+fn moe_route_ref(logits: &[f32], bias: &[f32]) -> (Vec<u32>, Vec<f32>) {
+    let mut ids = Vec::with_capacity(MOE_N_TOKENS * MOE_N_USED);
+    let mut weights = Vec::with_capacity(MOE_N_TOKENS * MOE_N_USED);
+    for tok in 0..MOE_N_TOKENS {
+        let probs: Vec<f32> = (0..MOE_N_EXPERT)
+            .map(|e| 1.0 / (1.0 + (-logits[tok * MOE_N_EXPERT + e]).exp()))
+            .collect();
+        let mut chosen: Vec<usize> = Vec::with_capacity(MOE_N_USED);
+        for _ in 0..MOE_N_USED {
+            let best = (0..MOE_N_EXPERT)
+                .filter(|e| !chosen.contains(e))
+                .max_by(|&a, &b| {
+                    (probs[a] + bias[a])
+                        .total_cmp(&(probs[b] + bias[b]))
+                        .then(b.cmp(&a))
+                })
+                .expect("n_used <= n_expert");
+            chosen.push(best);
+        }
+        let denom = chosen
+            .iter()
+            .map(|&e| probs[e])
+            .sum::<f32>()
+            .max(1.0 / 16384.0);
+        ids.extend(chosen.iter().map(|&e| e as u32));
+        weights.extend(chosen.iter().map(|&e| probs[e] / denom));
+    }
+    (ids, weights)
+}
+
+/// `y[entry, row] = W[sel[entry]][row, :] . x[x_row(entry), :]`, over the
+/// dequantized weights. `x_by_entry` mirrors the kernel's parameter: `false`
+/// reads the token's row (shared by its slots), `true` reads the entry's own.
+fn moe_gemv_ref(
+    w: &[f32],
+    x: &[f32],
+    sel: &[u32],
+    n_entries: usize,
+    x_by_entry: bool,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut out = vec![0.0f32; n_entries * MOE_M];
+    let mut mag = vec![0.0f32; n_entries * MOE_M];
+    for entry in 0..n_entries {
+        let x_row = if x_by_entry {
+            entry
+        } else {
+            entry / MOE_N_USED
+        };
+        let w_base = sel[entry] as usize * MOE_M * MOE_K;
+        for row in 0..MOE_M {
+            let (acc, abs) = (0..MOE_K).fold((0.0f64, 0.0f64), |(a, b), i| {
+                let p = f64::from(w[w_base + row * MOE_K + i]) * f64::from(x[x_row * MOE_K + i]);
+                (a + p, b + p.abs())
+            });
+            out[entry * MOE_M + row] = acc as f32;
+            mag[entry * MOE_M + row] = abs as f32;
+        }
+    }
+    (out, mag)
+}
+
+/// `out[tok, row] (+)= sum over the token's slots of weight[entry] * z[entry, row]`.
+fn moe_combine_ref(
+    z: &[f32],
+    weights: &[f32],
+    out: &[f32],
+    accumulate: bool,
+    hidden: usize,
+) -> Vec<f32> {
+    (0..MOE_N_TOKENS)
+        .flat_map(|tok| {
+            (0..hidden).map(move |row| {
+                let acc: f32 = (0..MOE_N_USED)
+                    .map(|s| {
+                        let entry = tok * MOE_N_USED + s;
+                        weights[entry] * z[entry * hidden + row]
+                    })
+                    .sum();
+                if accumulate {
+                    out[tok * hidden + row] + acc
+                } else {
+                    acc
+                }
+            })
+        })
+        .collect()
+}
+
 /// Deterministic polar spectrum: log-magnitudes spanning a wide dynamic range
 /// (so `exp` is meaningfully exercised) and angles across `[-π, π]`.
 fn exp_polar_input(n_frames: usize, bins: usize) -> Vec<f32> {
@@ -771,6 +963,46 @@ fn overlap_add_input(n_frames: usize, n_fft: usize) -> Vec<f32> {
     (0..n_frames * n_fft)
         .map(|i| (0.017 * i as f32).sin() * 2.0 - (0.003 * i as f32).cos())
         .collect()
+}
+
+/// Hidden widths `moe_combine` is scored at.
+///
+/// `MOE_M` fits in one 256-thread workgroup, so it only ever runs with
+/// `grp.x == 0` and cannot see a wrong group stride in
+/// `row = grp.x * WG + lid.x`; production always dispatches several groups
+/// (`2048 / 256 = 8`). The second width crosses that boundary and is not a
+/// multiple of 256, so the ragged last group and its `row >= hidden` early-out
+/// are exercised in the same case.
+const MOE_COMBINE_WIDTHS: &[usize] = &[MOE_M, 300];
+
+/// Expert ids for `entries` (token, slot) pairs.
+///
+/// The stride `5` is coprime with `MOE_N_EXPERT`, so the ids cycle through every
+/// stacked slice. That is the whole point of the constant: a stride sharing a
+/// factor with the expert count (this was `3`, and `gcd(3, 6) = 3`) walks only a
+/// subset, leaving most of the stacked tensor never addressed and a wrong expert
+/// stride free to pass. Shared by every GEMV case, MSL and WGSL, so it cannot
+/// be "simplified" back in one of them.
+fn moe_sel(entries: usize) -> Vec<u32> {
+    (0..entries)
+        .map(|e| ((e * 5 + 1) % MOE_N_EXPERT) as u32)
+        .collect()
+}
+
+/// `[m, k, n_used, n_entries, expert_stride_bytes, x_by_entry, 0, 0]`, the two
+/// `uint4`s `moe_gemv_q4_0` reads.
+fn moe_gemv_params(n_entries: usize, x_by_entry: bool) -> [u32; 8] {
+    let expert_stride = (MOE_M * MOE_K / 32 * 18) as u32;
+    [
+        MOE_M as u32,
+        MOE_K as u32,
+        MOE_N_USED as u32,
+        n_entries as u32,
+        expert_stride,
+        u32::from(x_by_entry),
+        0,
+        0,
+    ]
 }
 
 #[cfg(feature = "gpu")]
@@ -1906,6 +2138,171 @@ mod wgsl {
             "wgsl overlap_add worst abs err {worst:.3e} > 1e-3"
         );
     }
+
+    /// Bind `buffers` at consecutive slots 0.., dispatch `groups`, and return
+    /// the pipeline's work as done. The MoE kernels all take a flat,
+    /// consecutively-numbered binding set, so a single helper covers the three
+    /// of them rather than three near-identical `create_bind_group` blocks.
+    fn run_moe_kernel(
+        ctx: &GpuContext,
+        src: &str,
+        entry: &str,
+        buffers: &[&wgpu::Buffer],
+        groups: (u32, u32),
+    ) {
+        let pipeline = ctx.create_pipeline(src, entry, entry);
+        let entries: Vec<wgpu::BindGroupEntry> = buffers
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: b.as_entire_binding(),
+            })
+            .collect();
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &entries,
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(groups.0, groups.1, 1);
+        }
+        ctx.queue.submit(Some(enc.finish()));
+        ctx.device.poll_wait();
+    }
+
+    /// WGSL half of `msl::moe_route_matches_cpu_selection`. Scored on synthetic
+    /// data with a planted boundary tie, which is what
+    /// `tests/wgpu_moe_oracle.rs` cannot do: that one drives a real model, where
+    /// the selection is whatever the weights produce.
+    #[test]
+    fn moe_route_matches_cpu_selection() {
+        let Some(ctx) = setup() else { return };
+        let entries = MOE_N_TOKENS * MOE_N_USED;
+        let (logits, bias) = moe_route_inputs();
+        let (want_ids, want_w) = moe_route_ref(&logits, &bias);
+
+        let logits_buf = ctx.upload_f32(&logits, "moe_logits");
+        let bias_buf = ctx.upload_f32(&bias, "moe_bias");
+        let sel_expert = ctx.upload_storage(bytemuck::cast_slice(&vec![0u32; entries]), "moe_sel");
+        let sel_weight = ctx.upload_f32(&vec![0.0f32; entries], "moe_selw");
+        let params = ctx.upload_storage(
+            bytemuck::cast_slice(&[
+                MOE_N_EXPERT as u32,
+                MOE_N_USED as u32,
+                MOE_N_TOKENS as u32,
+                0,
+            ]),
+            "moe_route_params",
+        );
+        run_moe_kernel(
+            &ctx,
+            shaders::MOE_ROUTE,
+            "moe_route",
+            &[&logits_buf, &bias_buf, &sel_expert, &sel_weight, &params],
+            (MOE_N_TOKENS as u32, 1),
+        );
+
+        assert_eq!(
+            ctx.download_u32(&sel_expert, entries),
+            want_ids,
+            "wgsl moe_route picked different experts"
+        );
+        assert_close(
+            "wgsl moe_route weights",
+            &ctx.download_f32(&sel_weight, entries),
+            &want_w,
+            1e-5,
+        );
+    }
+
+    /// WGSL half of the two `msl::moe_gemv_*` tests, covering both activation
+    /// indexings in one body since only the flag and the fixtures differ.
+    #[test]
+    fn moe_gemv_matches_cpu() {
+        let Some(ctx) = setup() else { return };
+        let entries = MOE_N_TOKENS * MOE_N_USED;
+        for (x_by_entry, seed) in [(false, 11u32), (true, 13)] {
+            let packed = q4_0_pack(&gemm_data(MOE_N_EXPERT * MOE_M * MOE_K, seed));
+            let w = q4_0_dequant(&packed);
+            let x_rows = if x_by_entry { entries } else { MOE_N_TOKENS };
+            let x = gemm_data(x_rows * MOE_K, seed + 1);
+            let sel = moe_sel(entries);
+            let (want, mag) = moe_gemv_ref(&w, &x, &sel, entries, x_by_entry);
+
+            // Same trailing pad as the MSL path: a block start that is not
+            // word-aligned makes the kernel read one `u32` past the last byte.
+            let mut w_bytes = packed.clone();
+            w_bytes.extend_from_slice(&[0u8; 8]);
+            let w_buf = ctx.upload_storage(&w_bytes, "moe_w");
+            let x_buf = ctx.upload_f32(&x, "moe_x");
+            let y_buf = ctx.upload_f32(&vec![0.0f32; entries * MOE_M], "moe_y");
+            let sel_buf = ctx.upload_storage(bytemuck::cast_slice(&sel), "moe_sel");
+            let params = ctx.upload_storage(
+                bytemuck::cast_slice(&moe_gemv_params(entries, x_by_entry)),
+                "moe_gemv_params",
+            );
+            run_moe_kernel(
+                &ctx,
+                shaders::MOE_GEMV_Q4_0,
+                "moe_gemv_q4_0",
+                &[&w_buf, &x_buf, &y_buf, &sel_buf, &params],
+                (MOE_M as u32, entries as u32),
+            );
+
+            assert_gemm(
+                &format!("wgsl moe_gemv_q4_0 x_by_entry={x_by_entry}"),
+                &ctx.download_f32(&y_buf, entries * MOE_M),
+                &want,
+                &mag,
+                1e-5,
+            );
+        }
+    }
+
+    /// WGSL half of `msl::moe_combine_matches_cpu`, both output conventions.
+    #[test]
+    fn moe_combine_matches_cpu() {
+        let Some(ctx) = setup() else { return };
+        let entries = MOE_N_TOKENS * MOE_N_USED;
+        let weights: Vec<f32> = gemm_data(entries, 16).iter().map(|v| v.abs()).collect();
+        for &hidden in MOE_COMBINE_WIDTHS {
+            let z = gemm_data(entries * hidden, 15);
+            let seed_out = gemm_data(MOE_N_TOKENS * hidden, 17);
+            for accumulate in [false, true] {
+                let want = moe_combine_ref(&z, &weights, &seed_out, accumulate, hidden);
+                let z_buf = ctx.upload_f32(&z, "moe_z");
+                let w_buf = ctx.upload_f32(&weights, "moe_selw");
+                let out_buf = ctx.upload_f32(&seed_out, "moe_out");
+                let params = ctx.upload_storage(
+                    bytemuck::cast_slice(&[
+                        hidden as u32,
+                        MOE_N_USED as u32,
+                        MOE_N_TOKENS as u32,
+                        u32::from(accumulate),
+                    ]),
+                    "moe_combine_params",
+                );
+                run_moe_kernel(
+                    &ctx,
+                    shaders::MOE_COMBINE,
+                    "moe_combine",
+                    &[&z_buf, &w_buf, &out_buf, &params],
+                    (hidden.div_ceil(256) as u32, MOE_N_TOKENS as u32),
+                );
+                assert_close(
+                    &format!("wgsl moe_combine hidden={hidden} accumulate={accumulate}"),
+                    &ctx.download_f32(&out_buf, MOE_N_TOKENS * hidden),
+                    &want,
+                    1e-5,
+                );
+            }
+        }
+    }
 }
 
 // Declared at the root, as every other suite does, so the gate is the shared
@@ -2994,7 +3391,6 @@ mod msl {
         let spec = ctx.upload_f32(spectrum);
         let out = ctx.create_buffer((spectrum.len() * 4) as u64);
         let params = ctx.upload_bytes(bytemuck::cast_slice(&[n_frames, bins]));
-
         let cb = ctx.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
@@ -3056,7 +3452,6 @@ mod msl {
         let total = (n_frames * hop) as usize;
         let out = ctx.create_buffer((total * 4) as u64);
         let params = ctx.upload_bytes(bytemuck::cast_slice(&[n_frames, n_fft, hop, 0u32]));
-
         let cb = ctx.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
@@ -3102,6 +3497,233 @@ mod msl {
             worst <= 1e-3,
             "msl overlap_add worst abs err {worst:.3e} > 1e-3"
         );
+    }
+
+    fn run_moe_route(ctx: &MetalContext, logits: &[f32], bias: &[f32]) -> (Vec<u32>, Vec<f32>) {
+        let pipeline = ctx
+            .create_pipeline(shaders::MOE_ROUTE, "moe_route")
+            .expect("compile generated MSL");
+        let entries = MOE_N_TOKENS * MOE_N_USED;
+        let logits_buf = ctx.upload_f32(logits);
+        let bias_buf = ctx.upload_f32(bias);
+        let sel_expert = ctx.create_buffer((entries * 4) as u64);
+        let sel_weight = ctx.create_buffer((entries * 4) as u64);
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&[
+            MOE_N_EXPERT as u32,
+            MOE_N_USED as u32,
+            MOE_N_TOKENS as u32,
+            0,
+        ]));
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&logits_buf), 0);
+        enc.set_buffer(1, Some(&bias_buf), 0);
+        enc.set_buffer(2, Some(&sel_expert), 0);
+        enc.set_buffer(3, Some(&sel_weight), 0);
+        enc.set_buffer(4, Some(&params), 0);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: MOE_N_TOKENS as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        (
+            ctx.read_u32(&sel_expert, entries),
+            ctx.read_f32(&sel_weight, entries),
+        )
+    }
+
+    /// The routing rule, ties and all.
+    ///
+    /// Expert *ids* are compared exactly, not within a tolerance: a flipped
+    /// selection is a different expert's weights, which no epsilon covers. The
+    /// weights then get the ordinary float tolerance.
+    #[test]
+    fn moe_route_matches_cpu_selection() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        let (logits, bias) = moe_route_inputs();
+        let (want_ids, want_w) = moe_route_ref(&logits, &bias);
+        let (got_ids, got_w) = run_moe_route(&ctx, &logits, &bias);
+        assert_eq!(got_ids, want_ids, "msl moe_route picked different experts");
+        assert_close("msl moe_route weights", &got_w, &want_w, 1e-5);
+    }
+
+    fn run_moe_gemv(
+        ctx: &MetalContext,
+        packed: &[u8],
+        x: &[f32],
+        sel: &[u32],
+        n_entries: usize,
+        x_by_entry: bool,
+    ) -> Vec<f32> {
+        let pipeline = ctx
+            .create_pipeline(shaders::MOE_GEMV_Q4_0, "moe_gemv_q4_0")
+            .expect("compile generated MSL");
+        // The kernel reads up to a whole `uint` past the last block byte when a
+        // block start is not word-aligned, exactly as `gemv_q4_0` does; pad so
+        // that read stays inside the allocation.
+        let mut w_bytes = packed.to_vec();
+        w_bytes.extend_from_slice(&[0u8; 8]);
+        let w_buf = ctx.upload_bytes(&w_bytes);
+        let x_buf = ctx.upload_f32(x);
+        let sel_buf = ctx.upload_bytes(bytemuck::cast_slice(sel));
+        let y_buf = ctx.create_buffer((n_entries * MOE_M * 4) as u64);
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&moe_gemv_params(
+            n_entries, x_by_entry,
+        )));
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&w_buf), 0);
+        enc.set_buffer(1, Some(&x_buf), 0);
+        enc.set_buffer(2, Some(&y_buf), 0);
+        enc.set_buffer(3, Some(&sel_buf), 0);
+        enc.set_buffer(4, Some(&params), 0);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: MOE_M as u64,
+                height: n_entries as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        ctx.read_f32(&y_buf, n_entries * MOE_M)
+    }
+
+    /// The gate/up shape: every slot of a token contracts against the *same*
+    /// activation row, so only the expert slice differs between them.
+    ///
+    /// The selection deliberately repeats an expert across tokens and gives one
+    /// token two different experts, so a kernel that ignored `sel_expert` and
+    /// used `entry % n_expert` (or expert 0 throughout) disagrees.
+    #[test]
+    fn moe_gemv_by_token_matches_cpu() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        let entries = MOE_N_TOKENS * MOE_N_USED;
+        let packed = q4_0_pack(&gemm_data(MOE_N_EXPERT * MOE_M * MOE_K, 11));
+        let w = q4_0_dequant(&packed);
+        let x = gemm_data(MOE_N_TOKENS * MOE_K, 12);
+        let sel = moe_sel(entries);
+        let (want, mag) = moe_gemv_ref(&w, &x, &sel, entries, false);
+        let got = run_moe_gemv(&ctx, &packed, &x, &sel, entries, false);
+        assert_gemm("msl moe_gemv_q4_0 by-token", &got, &want, &mag, 1e-5);
+    }
+
+    /// The down-projection shape: each entry contracts against its own row, so
+    /// swapping `x_by_entry` collapses a token's slots onto one input.
+    #[test]
+    fn moe_gemv_by_entry_matches_cpu() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        let entries = MOE_N_TOKENS * MOE_N_USED;
+        let packed = q4_0_pack(&gemm_data(MOE_N_EXPERT * MOE_M * MOE_K, 13));
+        let w = q4_0_dequant(&packed);
+        let x = gemm_data(entries * MOE_K, 14);
+        let sel = moe_sel(entries);
+        let (want, mag) = moe_gemv_ref(&w, &x, &sel, entries, true);
+        let got = run_moe_gemv(&ctx, &packed, &x, &sel, entries, true);
+        assert_gemm("msl moe_gemv_q4_0 by-entry", &got, &want, &mag, 1e-5);
+    }
+
+    fn run_moe_combine(
+        ctx: &MetalContext,
+        z: &[f32],
+        weights: &[f32],
+        out: &[f32],
+        accumulate: bool,
+        hidden: usize,
+    ) -> Vec<f32> {
+        let pipeline = ctx
+            .create_pipeline(shaders::MOE_COMBINE, "moe_combine")
+            .expect("compile generated MSL");
+        let z_buf = ctx.upload_f32(z);
+        let w_buf = ctx.upload_f32(weights);
+        let out_buf = ctx.upload_f32(out);
+        let params = ctx.upload_bytes(bytemuck::cast_slice(&[
+            hidden as u32,
+            MOE_N_USED as u32,
+            MOE_N_TOKENS as u32,
+            u32::from(accumulate),
+        ]));
+
+        let cb = ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&z_buf), 0);
+        enc.set_buffer(1, Some(&w_buf), 0);
+        enc.set_buffer(2, Some(&out_buf), 0);
+        enc.set_buffer(3, Some(&params), 0);
+        enc.dispatch_thread_groups(
+            metal::MTLSize {
+                width: hidden.div_ceil(256) as u64,
+                height: MOE_N_TOKENS as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        ctx.read_f32(&out_buf, MOE_N_TOKENS * hidden)
+    }
+
+    /// Both output conventions, because the two callers disagree: decode adds
+    /// into the residual stream, batched prefill overwrites a scratch buffer the
+    /// next layer's fused residual add consumes. The pre-seeded `out` is
+    /// non-zero so an `accumulate = false` that silently added would fail.
+    #[test]
+    fn moe_combine_matches_cpu() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        let entries = MOE_N_TOKENS * MOE_N_USED;
+        let weights = gemm_data(entries, 16)
+            .iter()
+            .map(|v| v.abs())
+            .collect::<Vec<_>>();
+        for &hidden in MOE_COMBINE_WIDTHS {
+            let z = gemm_data(entries * hidden, 15);
+            let seed_out = gemm_data(MOE_N_TOKENS * hidden, 17);
+            for accumulate in [false, true] {
+                let want = moe_combine_ref(&z, &weights, &seed_out, accumulate, hidden);
+                let got = run_moe_combine(&ctx, &z, &weights, &seed_out, accumulate, hidden);
+                assert_close(
+                    &format!("msl moe_combine hidden={hidden} accumulate={accumulate}"),
+                    &got,
+                    &want,
+                    1e-5,
+                );
+            }
+        }
     }
 }
 

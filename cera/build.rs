@@ -151,6 +151,9 @@ const SLANG_MULTI_KERNELS: &[&str] = &[
     "power_spec",
     "mel_project",
     "mel_norm",
+    "moe_route",
+    "moe_gemv_q4_0",
+    "moe_combine",
 ];
 
 /// Compile each multi-target kernel to the shader languages the enabled

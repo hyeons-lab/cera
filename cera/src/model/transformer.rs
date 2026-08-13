@@ -230,6 +230,34 @@ pub(crate) fn resolve_weight(gguf: &GgufFile, name: &str) -> Result<WeightRef> {
     })
 }
 
+/// Resolve one expert's slice of a stacked MoE expert tensor to a byte range,
+/// as an ordinary 2D [`WeightRef`].
+///
+/// MoE layers keep all experts in a single rank-3 tensor, so `resolve_weight`
+/// would describe the whole stack as one `m × k` matrix. This splits out expert
+/// `e` instead; the result is indistinguishable from a dense weight of the same
+/// shape and dtype, which is what lets the CPU backend's existing GEMV kernels
+/// run against it with no expert-aware variants. The GPU backends do have
+/// expert-aware kernels, because routing happens on the device and the slice has
+/// to be chosen inside the shader; they consume these same refs to derive the
+/// stride it picks with.
+pub(crate) fn resolve_expert_weight(
+    gguf: &GgufFile,
+    name: &str,
+    expert: usize,
+) -> Result<WeightRef> {
+    let (start, size, m, k, dtype) = gguf.tensor_meta_expert(name, expert)?;
+    Ok(WeightRef {
+        start,
+        size,
+        dtype,
+        m,
+        k,
+        #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+        repacked: None,
+    })
+}
+
 /// Get the raw bytes for a pre-resolved weight.
 #[inline]
 pub(crate) fn weight_data<'a>(gguf: &'a GgufFile, wref: &WeightRef) -> &'a [u8] {

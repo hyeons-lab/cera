@@ -6,7 +6,7 @@ backend) from a single source. It exists to test whether cera can stop
 maintaining every GPU kernel twice (WGSL and MSL kept in agreement by hand) and
 generate both from one file instead.
 
-Each `<name>.slang` is compiled by `just slang` (slangc 2026.13.1, pinned) into
+Each `<name>.slang` is compiled by `just slang` (slangc 2026.14.1, pinned) into
 the committed `<name>.wgsl` and `<name>.metal` next to it. Those committed
 outputs are the build's fallback when slangc is absent (CI runners without a
 Slang toolchain); `build.rs` regenerates from the `.slang` into `OUT_DIR` when
@@ -162,6 +162,31 @@ operands distinct registers, dropping occupancy 896 to 704, and measures 0.89x.
 That is a different lever from the `#pragma unroll` the post-pass adds, which
 attaches AIR loop metadata rather than unrolling the source.
 
+### The three `moe_*` kernels (what writing Slang *first* bought)
+
+`moe_route`, `moe_gemv_q4_0` and `moe_combine` are the only *production* kernels
+here with no handwritten ancestor (`coopmat_probe` has none either, but nothing
+dispatches it). They were written for the Metal `lfm2moe` port, and their WGSL
+was pinned against the CPU reference by the parity suite before any wgpu host
+code existed to dispatch it.
+
+That ordering is the whole argument for this directory, so it is worth recording
+what it bought. The wgpu routed-FFN path that came later was host wiring only:
+the three oracle tests it started with passed on the first run against the real
+LFM2.5-8B-A1B, with no kernel debugging in between. (That suite is five tests
+today, plus a separate dispatch-count guard. Every addition is a host-side
+check, two LoRA-handling ones and the guard; none came from a kernel defect.)
+The two backends land on the same numbers because they are running the same
+selection rule compiled twice rather than two ports of it: first-token cosine
+0.999923 against CPU on both, 0.9958 for the full prefill on both, and a
+40-token greedy generation that is token-identical between them.
+
+Two of the three need no `__target_switch` at all: `moe_route` and
+`moe_combine` are the same code on both targets, which is worth noting because
+it is the cheap case this directory was supposed to produce and mostly has not.
+The third, `moe_gemv_q4_0`, branches only its `block_sum`, the same
+`WaveActiveSum`-versus-shared-memory-tree split `softmax` settled above.
+
 ## The migration verdict
 
 A generated simdgroup GEMM reaches ~0.93x bit-identical on its own, and ~0.98x
@@ -176,7 +201,7 @@ hand-tuned `simdgroup_matrix` GEMMs inherits that shape.
 ## Working with these shaders
 
 Regenerate the committed outputs after editing any `.slang` (requires slangc
-2026.13.1, the version CI byte-compares against):
+2026.14.1, the version CI byte-compares against):
 
 ```sh
 just slang

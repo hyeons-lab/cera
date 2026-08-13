@@ -13,10 +13,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod common;
+
+use common::hidden_states_with_lora as run;
+
 use cera::gguf::GgufFile;
 use cera::kv_cache::InferenceState;
 use cera::lora::LoraAdapterWeights;
-use cera::model::{BlockType, Model, load_model};
+use cera::model::{BlockType, load_model};
 
 fn lfm2_model_path() -> Option<PathBuf> {
     let p = std::env::var("CERA_LFM2_MODEL").ok().map(PathBuf::from)?;
@@ -138,13 +142,6 @@ fn synth_adapter_io(
     buf.extend_from_slice(&header_bytes);
     buf.extend_from_slice(&data);
     LoraAdapterWeights::from_safetensors_bytes(&buf, Some(alpha)).expect("load synthetic adapter")
-}
-
-/// Per-token hidden states with an optional adapter set on the state.
-fn run(model: &dyn Model, tokens: &[u32], lora: Option<Arc<LoraAdapterWeights>>) -> Vec<f32> {
-    let mut state = InferenceState::for_prefill(model.config(), tokens.len()).unwrap();
-    state.lora = lora;
-    model.hidden_states(tokens, &mut state)
 }
 
 #[test]

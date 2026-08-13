@@ -52,7 +52,9 @@ use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression, KvPrefixCache, LayerSnapshot, StateSnapshot};
 use crate::lora::{LoraAdapterWeights, LoraTarget};
 use crate::model::gpu_turboquant::{TqGpuCache, TqMode, describe_kv_mode};
-use crate::model::gpu_weight_source::GpuWeightSource;
+use crate::model::gpu_weight_source::{
+    GpuWeightSource, MOE_MAX_EXPERT_USED, MOE_MAX_EXPERTS, stacked_expert_layout,
+};
 use crate::model::transformer::WeightRef;
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 use crate::tensor::DType;
@@ -349,14 +351,86 @@ enum LmHead {
     },
 }
 
+/// A layer's feed-forward weights on GPU: one dense SwiGLU, or a routed expert
+/// set.
+///
+/// Mirrors `lfm2::FfnRefs` and the Metal backend's `MetalFfn`, and exists for
+/// the reason given there: `lfm2moe` runs dense leading blocks and routes the
+/// rest, so "which kind is this" is a per-layer question inside a single model.
+/// A sum type makes exactly-one-of-two a fact the encoders match on, rather than
+/// two sets of `Option` fields they would have to keep consistent by hand.
+///
+/// Both variants are boxed, where the Metal backend boxes only the routed one.
+/// The difference is that a wgpu handle is wide: `GpuWeight` carries a shape
+/// `Vec` and a cached bind group on top of its scalars, so `GpuDenseFfn`
+/// measures 312 bytes and `GpuMoeFfn` 216, against tens each on Metal. Box only
+/// one and the *other* stays inline, which is the comparison clippy's
+/// `large_enum_variant` makes: 312 against a boxed 8 is 304, and 216 against 8
+/// is 208, so either single-box choice still trips its 200-byte default. Boxing
+/// both leaves 8 against 8. Note 208 clears 200 by only eight bytes, so shrinking
+/// `GpuMoeFfn` could make boxing `Dense` alone legal again.
+enum GpuFfn {
+    Dense(Box<GpuDenseFfn>),
+    Moe(Box<GpuMoeFfn>),
+}
+
+struct GpuDenseFfn {
+    gate: GpuWeight,
+    up: GpuWeight,
+    down: GpuWeight,
+}
+
+/// One projection of a routed FFN, with every expert's slice in one buffer.
+///
+/// Not a [`GpuWeight`]: that type carries a params buffer and a cached bind
+/// group for the dense GEMV dispatch, and neither survives the trip here. The
+/// expert kernel takes its shape through its own params layout and picks the
+/// slice on the device, so what it needs from the host is the base buffer and
+/// the stride.
+struct GpuMoeWeight {
+    /// The stacked tensor, `[n_expert][m][k]` Q4_0, bound whole. The expert
+    /// slice offset is applied in-shader from `sel_expert`.
+    buffer: wgpu::Buffer,
+    /// Rows and inner dimension of a *single* expert's slice.
+    m: u32,
+    k: u32,
+    /// Byte distance between consecutive experts' slices, derived and checked by
+    /// `gpu_weight_source::stacked_expert_layout`. That check catches a
+    /// transcription error in the formula, not a file that is unevenly stacked:
+    /// see the function for why those are not the same thing.
+    expert_stride: u32,
+}
+
+/// One routed feed-forward block's weights.
+///
+/// The three expert projections stay *stacked*, exactly as on Metal: the CPU
+/// path splits the rank-3 GGUF tensor into `n_expert` separate 2-D refs and
+/// picks one after routing, which it can do because routing has already happened
+/// on the same core. On GPU the selection lives in a device buffer, so the slice
+/// has to be chosen inside the kernel, and a stride is the only form that
+/// survives the trip.
+struct GpuMoeFfn {
+    /// Router projection (`ffn_gate_inp.weight`), f32, `[n_expert][hidden]`
+    /// row-major. Bound as the right-hand side of the shared `gemm_f32_nt`
+    /// rather than through a GEMV, so it is a plain buffer: its shape is
+    /// `(n_expert, hidden)`, both of which are validated against the scratch and
+    /// the config at load.
+    router: wgpu::Buffer,
+    /// Per-expert selection bias (`exp_probs_b.bias`), `n_expert` f32.
+    bias: wgpu::Buffer,
+    gate: GpuMoeWeight,
+    up: GpuMoeWeight,
+    down: GpuMoeWeight,
+    /// The model's single routed-FFN scratch, shared by every routed layer.
+    scratch: Arc<MoeScratch>,
+}
+
 /// GPU buffer handles for one layer's weights.
 /// Q4_0/Q8_0 weights are uploaded quantized; f32 norms uploaded as-is.
 struct GpuLayerWeights {
     attn_norm: wgpu::Buffer,
     ffn_norm: wgpu::Buffer,
-    ffn_gate: GpuWeight,
-    ffn_up: GpuWeight,
-    ffn_down: GpuWeight,
+    ffn: GpuFfn,
     // Conv-specific
     conv_in_proj: Option<GpuWeight>,
     conv_out_proj: Option<GpuWeight>,
@@ -373,6 +447,269 @@ struct GpuLayerWeights {
     attn_q_bias: Option<wgpu::Buffer>,
     attn_k_bias: Option<wgpu::Buffer>,
     attn_v_bias: Option<wgpu::Buffer>,
+}
+
+/// Device-side working set for the routed FFN, allocated once for the model and
+/// shared by every routed layer.
+///
+/// Sized for the largest batch the prefill path hands the kernels, which decode
+/// then reuses as the `n = 1` case. Everything indexed *by entry* is
+/// `n_tokens * n_expert_used` rows, not `n_tokens`.
+///
+/// Held by `Arc` from every routed layer rather than as an `Option` on the
+/// model, for the reason the Metal backend gives: it makes "a routed layer
+/// always has its scratch" a fact the type carries, so the encoder has no absent
+/// case to either panic on or silently skip the FFN for.
+struct MoeScratch {
+    // The four dimensions the buffers below were sized from, and the single
+    // source for them everywhere else: `upload_moe` validates each routed
+    // layer's weights against these, and `moe_ffn_steps` reads them from here to
+    // fill the kernel params and size its dispatch grids. The bounds they must
+    // satisfy (`MOE_MAX_EXPERTS`, `MOE_MAX_EXPERT_USED`, and `MAX_WG` for the
+    // grids) are enforced once, where the scratch is built, before anything is
+    // sized from them.
+    //
+    // Not quite every dimension: `z` is also sized by the hidden size, which is
+    // not recorded here because `upload_moe` ties the weights to it directly
+    // (`down.m == hs`). A buffer sized from anything outside this list is
+    // covered by neither, so add the dimension here when adding such a buffer.
+    /// Experts per routed layer, sizing `logits`.
+    n_expert: u32,
+    /// Experts per token, the multiplier turning tokens into entries.
+    n_expert_used: u32,
+    /// Per-expert feed-forward width, the row stride of `gate` and `up`.
+    expert_ff_len: u32,
+    /// Entries the buffers below were sized for, i.e. the largest
+    /// `n_tokens * n_expert_used` any dispatch may ask for. Kept because it also
+    /// bounds a *dispatch* dimension: `moe_gemv_q4_0`'s grid is
+    /// `(rows, n_entries)` and neither axis can be folded, so entries beyond
+    /// [`crate::backend::wgpu::MAX_WG`] would be silently dropped rather than
+    /// clamped. Checked at load, where it is a named error.
+    max_entries: u32,
+    /// `[n_tokens][n_expert]` router logits, pre-sigmoid.
+    logits: wgpu::Buffer,
+    /// `[n_entries]` chosen expert ids (u32).
+    sel_expert: wgpu::Buffer,
+    /// `[n_entries]` renormalized unbiased probabilities (f32).
+    sel_weight: wgpu::Buffer,
+    /// `[n_entries][expert_ff_len]` gate projection, overwritten in place with
+    /// the SwiGLU product that the down projection then consumes.
+    gate: wgpu::Buffer,
+    /// `[n_entries][expert_ff_len]` up projection.
+    up: wgpu::Buffer,
+    /// `[n_entries][hidden]` per-entry expert outputs, before the weighted
+    /// combine folds each token's entries together.
+    z: wgpu::Buffer,
+}
+
+/// One dispatch of the routed FFN: which kernel, bound to what, over which grid.
+///
+/// The block is built as a list of these rather than encoded straight into a
+/// command encoder, because a wgpu bind group cannot be created while a compute
+/// pass is open. Building them all first is what lets the whole routed block
+/// share one pass with the layer's rmsnorm instead of forcing a boundary per
+/// kernel; see the module header on what a pass boundary costs.
+///
+/// The params buffers each step binds are not kept here, and do not have to
+/// outlive the encode: wgpu refcounts the resources a `BindGroup` binds, and a
+/// recorded dispatch holds the bind group, so the buffers survive to the submit
+/// even where the caller drops the whole step list first (which the prefill arm
+/// does, one layer at a time, into an encoder submitted after the loop). The
+/// same pattern is already load-bearing in the dense batched path, whose params
+/// buffers are scoped to the block that encodes them.
+struct MoeStep<'a> {
+    pipeline: &'a wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    workgroups: (u32, u32, u32),
+}
+
+/// Upload one routed feed-forward block, stacking the expert projections into
+/// one buffer each and deriving the per-expert byte stride.
+///
+/// Every shape here is checked against [`MoeScratch`]'s dimensions rather than
+/// the counts this layer's own `MoeFfnRefs` carries; see `MoeScratch`'s fields
+/// for why those are the authoritative copy.
+///
+/// The per-expert stride, and the validation behind it, come from
+/// `gpu_weight_source::stacked_expert_layout`, shared with the Metal loader: a
+/// wrong stride does not fault, it reads a neighbouring expert's weights and
+/// still produces fluent text, so two backends deriving it separately is a
+/// defect neither one's tests would name. What stays here is the part that is
+/// this backend's: the storage-binding cap, and the upload itself.
+fn upload_moe(
+    ctx: &GpuContext,
+    src: &dyn GpuWeightSource,
+    scratch: Option<&Arc<MoeScratch>>,
+    hidden_size: usize,
+    layer: usize,
+    moe: &crate::model::lfm2::MoeFfnRefs,
+) -> Result<GpuMoeFfn> {
+    use anyhow::Context;
+
+    let scratch = scratch
+        .with_context(|| {
+            format!(
+                "layer {layer} has routed expert weights but the model config carries no \
+                 mixture-of-experts parameters to size their scratch with"
+            )
+        })?
+        .clone();
+    let n_expert = scratch.n_expert;
+    let expert_ff_len = scratch.expert_ff_len;
+
+    anyhow::ensure!(
+        moe.exp_probs_b.len() == n_expert as usize,
+        "layer {layer}: selection bias has {} entries for {n_expert} experts",
+        moe.exp_probs_b.len(),
+    );
+    // `moe_route` emits ids in `0..n_expert`, and `moe_gemv_q4_0` turns each one
+    // into `id * expert_stride` against a tensor stacked `refs.len()` deep, so a
+    // layer with fewer expert tensors than the router has experts would address
+    // past the stacked buffer.
+    //
+    // Both this and the bias-length check above are vacuous against today's only
+    // `GpuWeightSource::moe_refs` implementation, which builds the ref lists as
+    // `(0..n_expert)` and checks the bias itself. They are kept because this
+    // function consumes a *trait*: it is the boundary where a second
+    // implementation would arrive, and the cost is two integer comparisons at
+    // load.
+    anyhow::ensure!(
+        moe.gate.len() == n_expert as usize
+            && moe.up.len() == n_expert as usize
+            && moe.down.len() == n_expert as usize,
+        "layer {layer}: routed FFN has {n_expert} experts but {} gate / {} up / {} down expert \
+         tensors; the routing kernel emits ids the GEMV would index past the stacked weights",
+        moe.gate.len(),
+        moe.up.len(),
+        moe.down.len(),
+    );
+    anyhow::ensure!(
+        moe.router.dtype == DType::F32,
+        "layer {layer}: wgpu MoE routing needs an F32 router projection, found {:?}",
+        moe.router.dtype,
+    );
+
+    // Stack one projection: every expert's bytes concatenated into a single
+    // buffer, plus the byte stride from one expert to the next.
+    //
+    // Concatenated rather than sliced whole out of the mmap, even though
+    // `stacked_expert_layout` proves the experts are contiguous there.
+    // `weight_bytes` is a trait method whose contract is "the bytes of *this*
+    // ref", and reading past one ref's extent would be reaching through it to
+    // the mmap the only current implementation happens to be backed by. The cost
+    // is one transient host copy per projection at load.
+    let stack = |refs: &[WeightRef], what: &str| -> Result<GpuMoeWeight> {
+        let layout = stacked_expert_layout(refs, layer, what, "wgpu")?;
+        let stride = layout.expert_stride;
+        let total = layout.total_bytes;
+        // The kernel binds the whole stack as one `array<u32>`, so the adapter's
+        // per-binding cap is a hard limit on the model rather than something the
+        // dispatch can tile around. There is no equivalent of the f16 LM head's
+        // `gemv_tile_rows` here: that one re-binds a row range per dispatch
+        // because its kernel takes a `row_base`, and the expert GEMV has no such
+        // parameter, it resolves its own slice from `sel_expert`. Reported as a
+        // load error naming the adapter's limit; the alternative is a wgpu
+        // validation failure mid-dispatch. Metal has no such cap, so this check
+        // has no counterpart there and stays out of the shared helper.
+        anyhow::ensure!(
+            u64::from(total) <= ctx.max_storage_buffer_binding_size,
+            "layer {layer}: {what} stacks {} experts into {total} bytes, over this adapter's \
+             {} byte storage-binding limit; the expert GEMV binds the whole stack at once",
+            refs.len(),
+            ctx.max_storage_buffer_binding_size,
+        );
+        let bytes = refs
+            .iter()
+            .fold(Vec::with_capacity(total as usize), |mut acc: Vec<u8>, r| {
+                acc.extend_from_slice(src.weight_bytes(r));
+                acc
+            });
+        Ok(GpuMoeWeight {
+            buffer: ctx.upload_storage(&bytes, &format!("l{layer}.{what}")),
+            m: u32::try_from(layout.rows)
+                .with_context(|| format!("layer {layer}: {what} has too many rows"))?,
+            k: u32::try_from(layout.inner)
+                .with_context(|| format!("layer {layer}: {what} inner dim too large"))?,
+            expert_stride: stride,
+        })
+    };
+
+    let gate = stack(&moe.gate, "ffn_gate_exps")?;
+    let up = stack(&moe.up, "ffn_up_exps")?;
+    let down = stack(&moe.down, "ffn_down_exps")?;
+    let hs = u32::try_from(hidden_size)
+        .with_context(|| format!("layer {layer}: hidden size {hidden_size} too large"))?;
+    anyhow::ensure!(
+        gate.m == expert_ff_len && up.m == expert_ff_len && down.k == expert_ff_len,
+        "layer {layer}: expert width {expert_ff_len} disagrees with the projection shapes \
+         (gate.m={}, up.m={}, down.k={})",
+        gate.m,
+        up.m,
+        down.k,
+    );
+    // Every shape the kernels index with, against the two numbers just tied to
+    // the scratch's own. `down.m` is the sharp one: `MoeScratch::z` holds
+    // `n_entries * hidden_size` floats and the down GEMV writes
+    // `z[entry * down.m + row]`, so `down.m > hs` is an out-of-bounds device
+    // write, and `down.m < hs` silently desyncs that row stride from the one
+    // `moe_combine` reads it back with. `gate.k`/`up.k` index the activation
+    // rows, and the router's shape bounds both the logits buffer and the GEMM
+    // that fills it, so a file disagreeing on any of them is a load error rather
+    // than a wrong answer.
+    anyhow::ensure!(
+        down.m == hs
+            && gate.k == hs
+            && up.k == hs
+            && moe.router.k == hidden_size
+            && moe.router.m == n_expert as usize,
+        "layer {layer}: routed FFN shapes disagree with hidden size {hs} / expert count \
+         {n_expert} (down.m={}, gate.k={}, up.k={}, router {}x{}); the wgpu expert kernels \
+         index every one of these against those two numbers",
+        down.m,
+        gate.k,
+        up.k,
+        moe.router.m,
+        moe.router.k,
+    );
+    // `moe_gemv_q4_0` takes its row index straight from `grp.x`, with no
+    // `get_wid`-style folding available (the Y axis already carries the entry),
+    // so a projection taller than the per-dimension workgroup cap would drop
+    // every row above it and still return plausible output.
+    anyhow::ensure!(
+        gate.m.max(down.m) <= crate::backend::wgpu::MAX_WG,
+        "layer {layer}: expert projections are {} rows, over the {} workgroups-per-dimension \
+         cap the expert GEMV dispatches one row per workgroup against",
+        gate.m.max(down.m),
+        crate::backend::wgpu::MAX_WG,
+    );
+
+    // The router is the last routed binding without a named size error. It is
+    // small on every real model (`n_expert x hidden` f32, ~256 KiB here), but it
+    // is the one that scales with hidden size, and the alternative to checking
+    // is a bare wgpu validation failure on the first forward. The bias needs no
+    // check: `n_expert` is already bounded to `MOE_MAX_EXPERTS` floats.
+    let router_bytes = (moe.router.m as u64)
+        .checked_mul(moe.router.k as u64)
+        .and_then(|n| n.checked_mul(4))
+        .with_context(|| format!("layer {layer}: router projection size overflows u64"))?;
+    anyhow::ensure!(
+        router_bytes <= ctx.max_storage_buffer_binding_size,
+        "layer {layer}: router projection needs {router_bytes} bytes, over this adapter's {} \
+         byte storage-binding limit",
+        ctx.max_storage_buffer_binding_size,
+    );
+
+    Ok(GpuMoeFfn {
+        router: ctx.upload_f32(
+            &src.dequantize_weight(&moe.router),
+            &format!("l{layer}.ffn_gate_inp"),
+        ),
+        bias: ctx.upload_f32(&moe.exp_probs_b, &format!("l{layer}.exp_probs_b")),
+        gate,
+        up,
+        down,
+        scratch,
+    })
 }
 
 /// Compute pipelines for all shader entry points.
@@ -437,6 +774,17 @@ struct GpuPipelines {
     /// whole model onto the per-token prefill loop.
     mul_mat_reg_tile_f32: wgpu::ComputePipeline,
     attention_prefill: wgpu::ComputePipeline,
+    // ── Routed mixture-of-experts (`lfm2moe`) ─────────────────────────────
+    // Built for every model, dense or routed: pipeline creation is a shader
+    // compile, so making it conditional would trade a fixed load-time cost for a
+    // branch on every construction path. Dense models never dispatch them.
+    /// `lfm2moe` routing: sigmoid + biased top-k over the router logits.
+    moe_route: wgpu::ComputePipeline,
+    /// `lfm2moe` expert-indexed Q4_0 GEMV; the expert id comes from a device
+    /// buffer, not the host.
+    moe_gemv_q4_0: wgpu::ComputePipeline,
+    /// `lfm2moe` weighted sum of a token's expert outputs.
+    moe_combine: wgpu::ComputePipeline,
 }
 
 /// One LoRA target's low-rank factors uploaded to GPU. The apply is two GEMV
@@ -474,7 +822,7 @@ struct WgpuLoraTarget {
 /// order) low-rank factors. Built from a CPU [`LoraAdapterWeights`] via
 /// [`WgpuLoraAdapter::upload`] and cached on the model (Arc-pointer-keyed LRU).
 struct WgpuLoraAdapter {
-    layers: Vec<[Option<WgpuLoraTarget>; 9]>,
+    layers: Vec<[Option<WgpuLoraTarget>; crate::lora::LORA_TARGET_COUNT]>,
 }
 
 impl WgpuLoraAdapter {
@@ -492,8 +840,20 @@ impl WgpuLoraAdapter {
     /// alone.
     fn upload(ctx: &GpuContext, w: &LoraAdapterWeights, residual_mult: f32) -> Self {
         let mut layers = Vec::with_capacity(w.n_layers());
+        // Unreachable through `Session`, which refuses an adapter carrying
+        // routed-FFN deltas (`supports_moe_lora` is false here). Asserted anyway
+        // as a belt-and-braces check for a caller that bypasses `Session`: this
+        // backend now *has* routed layers, so a delta reaching the upload would
+        // be uploaded and then never applied rather than being impossible.
+        // Compiles out in release; the gate itself is in `session.rs`.
+        debug_assert!(
+            !w.has_moe_deltas(),
+            "adapter carries routed-FFN deltas, which this backend has no hooks for; \
+             Session::attach_lora_adapters is meant to have rejected it"
+        );
         for layer in 0..w.n_layers() {
-            let mut targets: [Option<WgpuLoraTarget>; 9] = Default::default();
+            let mut targets: [Option<WgpuLoraTarget>; crate::lora::LORA_TARGET_COUNT] =
+                Default::default();
             for target in LoraTarget::ALL {
                 let Some(t) = w.get(layer, target) else {
                     continue;
@@ -624,6 +984,9 @@ pub struct GpuLfm2Model {
     /// Latches once the "no batched GEMM for this dtype" warning has been emitted,
     /// so a long generation doesn't repeat it on every `forward_prefill`.
     batched_fallback_warned: AtomicBool,
+    /// Latches once the "ignoring a routed-FFN adapter" error has been logged,
+    /// so a long generation does not repeat it per token. See `resolve_lora`.
+    moe_lora_dropped_warned: AtomicBool,
     /// Llama-3 RoPE frequency factors (`rope_freqs.weight`), or a 1-element
     /// dummy when the model uses plain RoPE. Always bound (binding 3) on the
     /// decode rope dispatch; `has_freq_factors` in `rope_params` gates its use.
@@ -942,6 +1305,19 @@ impl GpuLfm2Model {
         let rope_type = src.rope_type();
         let scalars = config.scalars;
         let batched_prefill = src.supports_batched_prefill();
+        // The routed FFN's combine step adds its output into the residual stream
+        // unscaled, matching what the dense path's `scaled_add_inplace` does when
+        // `residual == 1.0`. No routed architecture also carries Granite's
+        // sublayer multiplier today, so rather than thread the scale through
+        // `moe_combine` for a combination that does not exist, refuse it: a
+        // silent drop here scales every routed layer's contribution wrongly and
+        // still produces fluent text.
+        anyhow::ensure!(
+            config.moe.is_none() || scalars.residual == 1.0,
+            "mixture-of-experts with a residual multiplier ({}) is not supported on the wgpu \
+             backend; the routed FFN combine adds into the residual unscaled",
+            scalars.residual,
+        );
 
         tracing::info!(
             "GPU model: {} layers, hs={hs}, is={is}, vocab={}",
@@ -1082,6 +1458,13 @@ impl GpuLfm2Model {
                 "attention_prefill",
                 "attention_prefill",
             ),
+            moe_route: ctx.create_pipeline(shaders::MOE_ROUTE, "moe_route", "moe_route"),
+            moe_gemv_q4_0: ctx.create_pipeline(
+                shaders::MOE_GEMV_Q4_0,
+                "moe_gemv_q4_0",
+                "moe_gemv_q4_0",
+            ),
+            moe_combine: ctx.create_pipeline(shaders::MOE_COMBINE, "moe_combine", "moe_combine"),
         };
 
         // Upload weights: Q4_0/Q8_0/Q6K stay quantized, others dequantized to f32.
@@ -1214,14 +1597,133 @@ impl GpuLfm2Model {
             data.map(|d| ctx.upload_f32(d, name))
         };
 
+        // The largest batch the prefill path hands the kernels in one dispatch,
+        // and the token count every buffer sized per-token below multiplies by:
+        // the routed-FFN scratch here, and further down `lora_tmp_batched` and
+        // the five `prefill_*_buf`. Any of them smaller than a chunk is an
+        // out-of-bounds device write, not a load error, so it is bound once.
+        let max_pref = max_seq_len.min(MAX_PREFILL_TOKENS);
+
+        // Routed-FFN scratch: one allocation for the whole model, shared by every
+        // routed layer, so decode reuses it as the n = 1 case rather than
+        // allocating per call.
+        let moe_scratch = config
+            .moe
+            .as_ref()
+            .map(|m| -> Result<Arc<MoeScratch>> {
+                use anyhow::Context;
+
+                // Every scratch buffer is bound whole by the kernel that reads
+                // it, so each one is capped by the adapter's per-binding limit,
+                // not just by `create_storage_rw`'s `max_buffer_size` assert.
+                // `z` is the one that actually reaches for it: it is
+                // `entries x hidden_size` floats, and nothing else here bounds
+                // the hidden size. Named error at load rather than a wgpu
+                // validation failure on the first forward.
+                let buf = |n: usize, name: &str| -> Result<wgpu::Buffer> {
+                    let bytes = n as u64 * 4;
+                    anyhow::ensure!(
+                        bytes <= ctx.max_storage_buffer_binding_size,
+                        "mixture-of-experts scratch `{name}` needs {bytes} bytes, over this \
+                         adapter's {} byte storage-binding limit",
+                        ctx.max_storage_buffer_binding_size,
+                    );
+                    Ok(ctx.create_storage_rw(bytes, name))
+                };
+                // The only enforcement of the kernels' expert-count limits in
+                // this backend (Metal has its own copy of this check, on the
+                // same constants), and it has to run before the sizing below: a
+                // GGUF declaring a wild `n_expert_used` would otherwise drive
+                // `entries * expert_ff_len` into the allocator and fail as an
+                // allocation rather than with the named error written for it.
+                // `upload_moe` validates each layer's *shapes* against the
+                // scratch, but it does not re-check these bounds, so do not move
+                // or weaken this without reading that function.
+                anyhow::ensure!(
+                    (1..=MOE_MAX_EXPERTS as usize).contains(&m.n_expert)
+                        && (1..=MOE_MAX_EXPERT_USED as usize).contains(&m.n_expert_used)
+                        && m.n_expert_used <= m.n_expert,
+                    "wgpu MoE routing supports 1..={MOE_MAX_EXPERTS} experts and \
+                     1..={MOE_MAX_EXPERT_USED} active (and no more active than available), \
+                     model declares {} and {}",
+                    m.n_expert,
+                    m.n_expert_used,
+                );
+                let entries = max_pref * m.n_expert_used;
+                let dim = |v: usize, what: &str| -> Result<u32> {
+                    u32::try_from(v).with_context(|| {
+                        format!("mixture-of-experts {what} {v} does not fit the kernels' u32")
+                    })
+                };
+                // `expert_ff_len` is a file-declared number with no bound above
+                // (unlike the two expert counts, which the kernels cap), so the
+                // row products are checked: an overflow here wraps in release and
+                // under-allocates a buffer the kernels then write past.
+                let cells = |rows: usize, cols: usize, what: &str| -> Result<usize> {
+                    rows.checked_mul(cols).with_context(|| {
+                        format!("mixture-of-experts {what} scratch size overflows")
+                    })
+                };
+                let max_entries = dim(entries, "entry count")?;
+                anyhow::ensure!(
+                    max_entries <= crate::backend::wgpu::MAX_WG,
+                    "a {max_pref}-token chunk over {} experts per token is {max_entries} \
+                     entries, over the {} workgroups-per-dimension cap the expert GEMV \
+                     dispatches one entry per workgroup against",
+                    m.n_expert_used,
+                    crate::backend::wgpu::MAX_WG,
+                );
+                // The routed SwiGLU is the third and last grid this scratch
+                // sizes, and the only one that is not one workgroup per row or
+                // per entry: `silu_mul_inplace` takes 256 elements each and
+                // indexes by a bare `gid.x`, so its extent is the whole
+                // `entries x expert_ff_len` slab divided by 256. Checked in the
+                // same place as the other two, so all three of the scratch's
+                // dispatch bounds are one screenful apart rather than one of
+                // them surfacing as a wgpu validation failure mid-prefill.
+                let silu_groups = cells(entries, m.expert_ff_len, "SwiGLU")?.div_ceil(256);
+                anyhow::ensure!(
+                    silu_groups <= crate::backend::wgpu::MAX_WG as usize,
+                    "the routed SwiGLU over {max_entries} entries of width {} needs \
+                     {silu_groups} workgroups, over this backend's {} per-dimension cap",
+                    m.expert_ff_len,
+                    crate::backend::wgpu::MAX_WG,
+                );
+                Ok(Arc::new(MoeScratch {
+                    n_expert: dim(m.n_expert, "expert count")?,
+                    n_expert_used: dim(m.n_expert_used, "active expert count")?,
+                    expert_ff_len: dim(m.expert_ff_len, "expert width")?,
+                    max_entries,
+                    logits: buf(cells(max_pref, m.n_expert, "logits")?, "moe.logits")?,
+                    sel_expert: buf(entries, "moe.sel_expert")?,
+                    sel_weight: buf(entries, "moe.sel_weight")?,
+                    gate: buf(cells(entries, m.expert_ff_len, "gate")?, "moe.gate")?,
+                    up: buf(cells(entries, m.expert_ff_len, "up")?, "moe.up")?,
+                    z: buf(cells(entries, hs, "output")?, "moe.z")?,
+                }))
+            })
+            .transpose()?;
+
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
             let attn_norm = ctx.upload_f32(src.attn_norm_weight(i), &format!("l{i}.anorm"));
             let ffn_norm = ctx.upload_f32(src.ffn_norm_weight(i), &format!("l{i}.fnorm"));
 
-            let ffn_gate = upload_weight(src.ffn_gate_ref(i), &format!("l{i}.ffn_gate"));
-            let ffn_up = upload_weight(src.ffn_up_ref(i), &format!("l{i}.ffn_up"));
-            let ffn_down = upload_weight(src.ffn_down_ref(i), &format!("l{i}.ffn_down"));
+            let ffn = match src.moe_refs(i) {
+                None => GpuFfn::Dense(Box::new(GpuDenseFfn {
+                    gate: upload_weight(src.ffn_gate_ref(i)?, &format!("l{i}.ffn_gate")),
+                    up: upload_weight(src.ffn_up_ref(i)?, &format!("l{i}.ffn_up")),
+                    down: upload_weight(src.ffn_down_ref(i)?, &format!("l{i}.ffn_down")),
+                })),
+                Some(m) => GpuFfn::Moe(Box::new(upload_moe(
+                    &ctx,
+                    src,
+                    moe_scratch.as_ref(),
+                    hs,
+                    i,
+                    m,
+                )?)),
+            };
 
             let is_conv = config.block_types[i] == BlockType::GatedConv;
 
@@ -1277,9 +1779,7 @@ impl GpuLfm2Model {
             layers.push(GpuLayerWeights {
                 attn_norm,
                 ffn_norm,
-                ffn_gate,
-                ffn_up,
-                ffn_down,
+                ffn,
                 conv_in_proj,
                 conv_out_proj,
                 conv_weight,
@@ -1322,9 +1822,10 @@ impl GpuLfm2Model {
         let conv_gate_buf = f(hs, "conv_gate");
 
         // Batched-prefill scratch. Sized for the worst case of
-        // `MAX_PREFILL_TOKENS` rows; chunking on the host side keeps
-        // larger prompts within this footprint.
-        let max_pref = max_seq_len.min(MAX_PREFILL_TOKENS);
+        // `MAX_PREFILL_TOKENS` rows (`max_pref`, bound above the weight upload
+        // because the routed-FFN scratch is sized from it too); chunking on the
+        // host side keeps larger prompts within this footprint.
+        //
         // Per-token column counts. `q_dim`/`max_kv_dim` can exceed `hs` when
         // head_dim is decoupled (Qwen3), so the scratch buffers that hold Q
         // (proj), the attention output (normed), and K/V (gate/up) must be
@@ -1492,6 +1993,7 @@ impl GpuLfm2Model {
             scalars,
             batched_prefill,
             batched_fallback_warned: AtomicBool::new(false),
+            moe_lora_dropped_warned: AtomicBool::new(false),
             rope_freqs_buf,
             has_freq_factors,
             hidden_buf,
@@ -1555,7 +2057,30 @@ impl GpuLfm2Model {
     /// forward. Must be called while holding `infer_lock` (it mutates the
     /// per-model `active_lora`/`lora_lru`).
     fn resolve_lora(&self, state: &InferenceState) -> LoraGuard<'_> {
-        let resolved = state.lora.as_ref().map(|adapter| {
+        // `Session::attach_lora_adapters` refuses an adapter carrying routed-FFN
+        // deltas, because this backend applies none of them (see
+        // `supports_moe_lora`). That gate is not the only way in:
+        // `InferenceState::lora` is a public field and `Model::forward` takes
+        // the state directly, so a caller driving the trait (the parity harness,
+        // an FFI embedder, a test) reaches here without passing it.
+        //
+        // Dropping the whole adapter is the conservative arm. Applying its
+        // attention half while silently dropping the router and per-expert
+        // deltas is exactly the fluent-but-wrong outcome the gate exists to
+        // prevent, and it is the harder of the two to notice. Logged once per
+        // model, since a generation loop would otherwise repeat it per token.
+        let usable = state.lora.as_ref().filter(|adapter| {
+            let ok = !adapter.has_moe_deltas();
+            if !ok && !self.moe_lora_dropped_warned.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    "ignoring a LoRA adapter that carries mixture-of-experts deltas: this \
+                     backend has no routed-FFN hooks. Attach through `Session`, which refuses \
+                     it with `CeraError::LoraUnsupportedByBackend` instead of ignoring it."
+                );
+            }
+            ok
+        });
+        let resolved = usable.map(|adapter| {
             let mut lru = self.lora_lru.lock().expect("lora_lru poisoned");
             if let Some(pos) = lru.iter().position(|(cpu, _)| Arc::ptr_eq(cpu, adapter)) {
                 // Hit: mark most-recently-used by moving the entry to the end
@@ -1924,19 +2449,32 @@ impl GpuLfm2Model {
     fn cache_bind_groups(&mut self) {
         let cfg = &self.config;
         for i in 0..cfg.n_layers {
-            // FFN
-            let gate_bg = self.make_gemv_bg(
-                &self.layers[i].ffn_gate,
-                &self.ffn_input_buf,
-                &self.gate_buf,
-            );
-            self.layers[i].ffn_gate.cached_bg = Some(gate_bg);
-            let up_bg =
-                self.make_gemv_bg(&self.layers[i].ffn_up, &self.ffn_input_buf, &self.up_buf);
-            self.layers[i].ffn_up.cached_bg = Some(up_bg);
-            let down_bg =
-                self.make_gemv_bg(&self.layers[i].ffn_down, &self.gate_buf, &self.out_buf);
-            self.layers[i].ffn_down.cached_bg = Some(down_bg);
+            // FFN. Only the dense arm caches: the routed one builds its bind
+            // groups per call in `moe_ffn_steps`, so there is nothing here for it
+            // to look up. Its inputs at n = 1 are layer-constant and so are
+            // cacheable in principle, which is worth revisiting with a
+            // measurement (a bind group cost ~16 us when this caching was added,
+            // against a measured 32.7 ms per token on 8B-A1B) rather than on the
+            // strength of that arithmetic.
+            //
+            // The same follow-up covers the seven params buffers `moe_ffn_steps`
+            // uploads per routed layer per call, which are also constant at
+            // n = 1 (~154 fresh buffers per token on 8B-A1B). The dense path
+            // preallocates its equivalents in `GpuWeight::params_buf`, and Metal
+            // passes them with `set_bytes` and allocates nothing; this backend
+            // is the outlier. Measure before moving either.
+            if let GpuFfn::Dense(d) = &self.layers[i].ffn {
+                let gate_bg = self.make_gemv_bg(&d.gate, &self.ffn_input_buf, &self.gate_buf);
+                let up_bg = self.make_gemv_bg(&d.up, &self.ffn_input_buf, &self.up_buf);
+                let down_bg = self.make_gemv_bg(&d.down, &self.gate_buf, &self.out_buf);
+                // Built before the mutable borrow: `make_gemv_bg` takes `&self`,
+                // so it cannot run while `self.layers[i]` is borrowed mutably.
+                if let GpuFfn::Dense(d) = &mut self.layers[i].ffn {
+                    d.gate.cached_bg = Some(gate_bg);
+                    d.up.cached_bg = Some(up_bg);
+                    d.down.cached_bg = Some(down_bg);
+                }
+            }
 
             if cfg.block_types[i] == BlockType::GatedConv {
                 if let Some(ref w) = self.layers[i].conv_in_proj {
@@ -2046,6 +2584,232 @@ impl GpuLfm2Model {
             &fresh_bg
         };
         self.encode(enc, pipeline, bg, self.gemv_workgroups(w), label);
+    }
+
+    /// Bind `buffers` at consecutive bindings from 0.
+    ///
+    /// All three MoE kernels number their bindings that way, with the params
+    /// block last, so passing the buffers in the order the shader declares them
+    /// is the whole contract.
+    fn moe_bind_group(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        label: &str,
+        buffers: &[&wgpu::Buffer],
+    ) -> wgpu::BindGroup {
+        let entries: Vec<wgpu::BindGroupEntry<'_>> = buffers
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: b.as_entire_binding(),
+            })
+            .collect();
+        self.ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &entries,
+            })
+    }
+
+    /// One expert-indexed GEMV: `y[entry] = W[sel_expert[entry]] · x[row(entry)]`
+    /// for every entry, in one dispatch.
+    ///
+    /// `x_by_entry` picks the activation row per entry: `false` for the gate and
+    /// up projections, whose input is the token's hidden state and so is shared
+    /// by all of that token's slots, and `true` for the down projection, whose
+    /// input is the per-slot SwiGLU product.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_gemv_step(
+        &self,
+        w: &GpuMoeWeight,
+        sel_expert: &wgpu::Buffer,
+        x: &wgpu::Buffer,
+        y: &wgpu::Buffer,
+        n_used: u32,
+        n_entries: u32,
+        x_by_entry: bool,
+        label: &'static str,
+    ) -> MoeStep<'_> {
+        let params = self.ctx.upload_storage(
+            bytemuck::cast_slice(&[
+                w.m,
+                w.k,
+                n_used,
+                n_entries,
+                w.expert_stride,
+                u32::from(x_by_entry),
+                0,
+                0,
+            ]),
+            label,
+        );
+        MoeStep {
+            pipeline: &self.pipelines.moe_gemv_q4_0,
+            bind_group: self.moe_bind_group(
+                &self.pipelines.moe_gemv_q4_0,
+                label,
+                &[&w.buffer, x, y, sel_expert, &params],
+            ),
+            // Genuinely two-dimensional: one workgroup per (row, entry), with
+            // neither axis foldable into the other. Both are bounded below
+            // `MAX_WG` at load (`upload_moe` for the rows, the scratch for the
+            // entries), which is what makes this safe to dispatch unfolded.
+            workgroups: (w.m, n_entries, 1),
+        }
+    }
+
+    /// The routed feed-forward block for one MoE layer, over `n` tokens, as the
+    /// sequence of dispatches it decomposes into.
+    ///
+    /// `x` is the `ffn_norm` output, `[n][hidden]` token-major; `out` receives the
+    /// block's output at the same layout. `accumulate` picks the convention of the
+    /// calling site, which is not decided by the phase: `true` adds into whatever
+    /// `out` holds, `false` overwrites it. Decode accumulates straight into the
+    /// residual stream, as the dense path's residual add does. Prefill overwrites
+    /// its FFN-output scratch and lets the *next* layer's `add_rmsnorm_batch` fold
+    /// the residual in, which is exactly what the dense prefill path does with the
+    /// same buffer.
+    ///
+    /// Mirrors `lfm2::forward_moe_ffn` step for step, and like that function it
+    /// deliberately does not share code with the dense FFN path: the sequence is
+    /// the same but every buffer is indexed by (token, slot) rather than token,
+    /// and the projections are slices of a stacked tensor chosen on the device.
+    /// Nothing pins the two to each other, so an arithmetic change in the dense
+    /// block has to be mirrored here by hand; the oracle suite pins *this* to the
+    /// CPU implementation, which is the direction that matters.
+    ///
+    /// LoRA is absent on purpose. The router and the experts are all LoRA targets
+    /// on CPU, and no GPU backend uploads per-expert factors yet, so an adapter
+    /// carrying them is refused by `Session::attach_lora_adapters` (via
+    /// [`Model::supports_moe_lora`]) rather than silently dropped here.
+    fn moe_ffn_steps(
+        &self,
+        moe: &GpuMoeFfn,
+        x: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        n: u32,
+        accumulate: bool,
+    ) -> Vec<MoeStep<'_>> {
+        let scratch = &moe.scratch;
+        let hs = self.config.hidden_size as u32;
+        let ff = scratch.expert_ff_len;
+        let n_used = scratch.n_expert_used;
+        let entries = n * n_used;
+        // Both callers are internal and already bounded (decode passes 1;
+        // prefill asserts its chunk against the same cap the scratch was sized
+        // from), so this states the invariant rather than defending a reachable
+        // input, which is why it compiles out in release.
+        debug_assert!(
+            entries <= scratch.max_entries,
+            "routed FFN asked for {n} tokens ({entries} entries) against scratch sized for {}; \
+             every per-entry buffer below would be indexed past its end",
+            scratch.max_entries,
+        );
+
+        // Router logits, `[n][n_expert] = X · Wᵀ`. The router is f32, so this is
+        // the same NT GEMM the batched LoRA down-projection uses rather than one
+        // of the quantized GEMV paths, and it covers decode (n = 1) and prefill
+        // with one dispatch shape instead of a per-token loop.
+        let router_params = self.ctx.upload_storage(
+            bytemuck::cast_slice(&[n, scratch.n_expert, hs, 0u32]),
+            "moe_router_params",
+        );
+        let route_params = self.ctx.upload_storage(
+            bytemuck::cast_slice(&[scratch.n_expert, n_used, n, 0u32]),
+            "moe_route_params",
+        );
+        let silu_total = entries * ff;
+        let silu_params = self
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&[silu_total, 0u32]), "moe_silu_params");
+        let combine_params = self.ctx.upload_storage(
+            bytemuck::cast_slice(&[hs, n_used, n, u32::from(accumulate)]),
+            "moe_combine_params",
+        );
+
+        vec![
+            MoeStep {
+                pipeline: &self.pipelines.gemm_f32_nt,
+                bind_group: self.moe_bind_group(
+                    &self.pipelines.gemm_f32_nt,
+                    "moe_router",
+                    &[x, &moe.router, &scratch.logits, &router_params],
+                ),
+                workgroups: crate::backend::wgpu::gemv_row_workgroups(n * scratch.n_expert),
+            },
+            // Sigmoid + biased top-k → (expert id, unbiased weight) per entry.
+            MoeStep {
+                pipeline: &self.pipelines.moe_route,
+                bind_group: self.moe_bind_group(
+                    &self.pipelines.moe_route,
+                    "moe_route",
+                    &[
+                        &scratch.logits,
+                        &moe.bias,
+                        &scratch.sel_expert,
+                        &scratch.sel_weight,
+                        &route_params,
+                    ],
+                ),
+                // One threadgroup per token, and `n` is capped by the prefill
+                // chunk size well below `MAX_WG`.
+                workgroups: (n, 1, 1),
+            },
+            self.moe_gemv_step(
+                &moe.gate,
+                &scratch.sel_expert,
+                x,
+                &scratch.gate,
+                n_used,
+                entries,
+                false,
+                "moe_gate",
+            ),
+            self.moe_gemv_step(
+                &moe.up,
+                &scratch.sel_expert,
+                x,
+                &scratch.up,
+                n_used,
+                entries,
+                false,
+                "moe_up",
+            ),
+            // SwiGLU over every entry at once: `gate = silu(gate) * up`.
+            MoeStep {
+                pipeline: &self.pipelines.silu_mul_inplace,
+                bind_group: self.moe_bind_group(
+                    &self.pipelines.silu_mul_inplace,
+                    "moe_silu",
+                    &[&scratch.gate, &scratch.up, &silu_params],
+                ),
+                workgroups: (silu_total.div_ceil(256), 1, 1),
+            },
+            // The down projection reads the per-entry SwiGLU product, so its
+            // activation row is the entry itself, not the token.
+            self.moe_gemv_step(
+                &moe.down,
+                &scratch.sel_expert,
+                &scratch.gate,
+                &scratch.z,
+                n_used,
+                entries,
+                true,
+                "moe_down",
+            ),
+            MoeStep {
+                pipeline: &self.pipelines.moe_combine,
+                bind_group: self.moe_bind_group(
+                    &self.pipelines.moe_combine,
+                    "moe_combine",
+                    &[&scratch.z, &scratch.sel_weight, out, &combine_params],
+                ),
+                workgroups: (hs.div_ceil(256), n, 1),
+            },
+        ]
     }
 
     /// Encode the logit projection.
@@ -3504,20 +4268,46 @@ impl GpuLfm2Model {
                         },
                     ],
                 });
+            // A routed layer replaces the entire gate/up/silu/down/residual
+            // sequence with the expert kernels, so it takes the pass on its own
+            // rather than threading the difference through the dense path below.
+            // The rmsnorm is the one shared dispatch: it is the same
+            // normalization either way, and sharing the pass with it keeps the
+            // routed block at one pass per layer like the dense one.
+            //
+            // No LoRA hooks, and none are reachable: `validate_dims` rejects a
+            // dense-FFN delta on a routed layer, and `supports_moe_lora` refuses
+            // an adapter carrying routed-FFN deltas at attach.
+            let dense = match &lw.ffn {
+                GpuFfn::Moe(moe) => {
+                    let steps =
+                        self.moe_ffn_steps(moe, &self.ffn_input_buf, &self.hidden_buf, 1, true);
+                    {
+                        let mut pass = self.ctx.begin_pass(&mut enc, "ffn_moe");
+                        self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
+                        steps.iter().for_each(|s| {
+                            self.dispatch_into(&mut pass, s.pipeline, &s.bind_group, s.workgroups);
+                        });
+                    }
+                    self.ctx.submit_encoder(enc);
+                    continue;
+                }
+                GpuFfn::Dense(d) => d,
+            };
             let gate_bg_tmp;
-            let gate_bg = match lw.ffn_gate.cached_bg.as_ref() {
+            let gate_bg = match dense.gate.cached_bg.as_ref() {
                 Some(bg) => bg,
                 None => {
                     gate_bg_tmp =
-                        self.make_gemv_bg(&lw.ffn_gate, &self.ffn_input_buf, &self.gate_buf);
+                        self.make_gemv_bg(&dense.gate, &self.ffn_input_buf, &self.gate_buf);
                     &gate_bg_tmp
                 }
             };
             let up_bg_tmp;
-            let up_bg = match lw.ffn_up.cached_bg.as_ref() {
+            let up_bg = match dense.up.cached_bg.as_ref() {
                 Some(bg) => bg,
                 None => {
-                    up_bg_tmp = self.make_gemv_bg(&lw.ffn_up, &self.ffn_input_buf, &self.up_buf);
+                    up_bg_tmp = self.make_gemv_bg(&dense.up, &self.ffn_input_buf, &self.up_buf);
                     &up_bg_tmp
                 }
             };
@@ -3544,10 +4334,10 @@ impl GpuLfm2Model {
                     ],
                 });
             let down_bg_tmp;
-            let down_bg = match lw.ffn_down.cached_bg.as_ref() {
+            let down_bg = match dense.down.cached_bg.as_ref() {
                 Some(bg) => bg,
                 None => {
-                    down_bg_tmp = self.make_gemv_bg(&lw.ffn_down, &self.gate_buf, &self.out_buf);
+                    down_bg_tmp = self.make_gemv_bg(&dense.down, &self.gate_buf, &self.out_buf);
                     &down_bg_tmp
                 }
             };
@@ -3603,8 +4393,8 @@ impl GpuLfm2Model {
                 // rmsnorm
                 self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
                 // gate + up GEMVs
-                self.dispatch_gemv_into(&mut pass, &lw.ffn_gate, gate_bg);
-                self.dispatch_gemv_into(&mut pass, &lw.ffn_up, up_bg);
+                self.dispatch_gemv_into(&mut pass, &dense.gate, gate_bg);
+                self.dispatch_gemv_into(&mut pass, &dense.up, up_bg);
                 // LoRA gate/up deltas on the raw projections, before silu_mul.
                 if let Some((t, (bg_a, bg_b))) = gate_lora_bgs.as_ref() {
                     self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
@@ -3617,10 +4407,10 @@ impl GpuLfm2Model {
                     &mut pass,
                     &self.pipelines.silu_mul_inplace,
                     &silu_bg,
-                    ((lw.ffn_gate.tensor.shape[0] as u32).div_ceil(256), 1, 1),
+                    ((dense.gate.tensor.shape[0] as u32).div_ceil(256), 1, 1),
                 );
                 // down GEMV
-                self.dispatch_gemv_into(&mut pass, &lw.ffn_down, down_bg);
+                self.dispatch_gemv_into(&mut pass, &dense.down, down_bg);
                 // residual add
                 self.dispatch_into(
                     &mut pass,
@@ -3930,10 +4720,20 @@ impl GpuLfm2Model {
     /// `O(n_layers)` walk; called once per `forward_prefill`.
     fn unbatchable_matmul_weight(&self) -> Option<(usize, &'static str, DType)> {
         for (li, lw) in self.layers.iter().enumerate() {
+            // Only the FFN differs by layer kind. A routed layer's experts never
+            // reach the reg-tile GEMM (`upload_moe` admits Q4_0 only, and the
+            // routed prefill path runs the same expert GEMV decode does), so
+            // they contribute nothing here; the rest of the layer still does,
+            // which is why this narrows the three FFN entries rather than
+            // skipping the layer.
+            let (gate, up, down) = match &lw.ffn {
+                GpuFfn::Dense(d) => (Some(&d.gate), Some(&d.up), Some(&d.down)),
+                GpuFfn::Moe(_) => (None, None, None),
+            };
             let weights: [(&'static str, Option<&GpuWeight>); 9] = [
-                ("ffn_gate", Some(&lw.ffn_gate)),
-                ("ffn_up", Some(&lw.ffn_up)),
-                ("ffn_down", Some(&lw.ffn_down)),
+                ("ffn_gate", gate),
+                ("ffn_up", up),
+                ("ffn_down", down),
                 ("attn_q", lw.attn_q.as_ref()),
                 ("attn_k", lw.attn_k.as_ref()),
                 ("attn_v", lw.attn_v.as_ref()),
@@ -4931,10 +5731,36 @@ impl GpuLfm2Model {
                 n_u,
                 hs_u,
             );
+            // A routed layer replaces every dispatch from here to the end of the
+            // block. Its output goes to `prefill_up_buf` and does *not*
+            // accumulate, which is the same convention the dense arm's final
+            // `mul_mat_reg_tile` below uses: the next layer's
+            // `add_rmsnorm_batch` (or, after the last layer, the final
+            // `scaled_add_inplace`) folds it into the residual stream.
+            //
+            // No LoRA hooks, for the reason the decode path gives: an adapter
+            // that could want one here is rejected before it reaches the model.
+            let dense = match &lw.ffn {
+                GpuFfn::Moe(moe) => {
+                    let steps = self.moe_ffn_steps(
+                        moe,
+                        &self.prefill_normed_buf,
+                        &self.prefill_up_buf,
+                        n_u,
+                        false,
+                    );
+                    let mut pass = self.ctx.begin_pass(&mut enc, "ffn_moe_batch");
+                    steps.iter().for_each(|s| {
+                        self.dispatch_into(&mut pass, s.pipeline, &s.bind_group, s.workgroups);
+                    });
+                    continue;
+                }
+                GpuFfn::Dense(d) => d,
+            };
             // gate + up GEMMs.
             self.encode_mul_mat_reg_tile(
                 &mut enc,
-                &lw.ffn_gate,
+                &dense.gate,
                 &self.prefill_normed_buf,
                 &self.prefill_gate_buf,
                 n_u,
@@ -4944,7 +5770,7 @@ impl GpuLfm2Model {
             );
             self.encode_mul_mat_reg_tile(
                 &mut enc,
-                &lw.ffn_up,
+                &dense.up,
                 &self.prefill_normed_buf,
                 &self.prefill_up_buf,
                 n_u,
@@ -5018,7 +5844,7 @@ impl GpuLfm2Model {
             // is is×N, plenty of room for hs×N writes.
             self.encode_mul_mat_reg_tile(
                 &mut enc,
-                &lw.ffn_down,
+                &dense.down,
                 &self.prefill_gate_buf,
                 &self.prefill_up_buf,
                 n_u,
@@ -5565,7 +6391,17 @@ impl Model for GpuLfm2Model {
         // target), and the sequential fallback loop runs the decode hooks. The
         // guard clears `active_lora` on the way out.
         let _lora_guard = self.resolve_lora(state);
-        let lora_active = state.lora.is_some();
+        // Ask the *resolved* adapter, not `state.lora`. `resolve_lora` drops an
+        // adapter carrying routed-FFN deltas entirely, and such a run is a pure
+        // base-model prefill whose KV is cacheable. Reading `state.lora` here
+        // would disable the prefix cache for both the lookup and the insert, so
+        // every prefill in that session would run cold and none would ever
+        // populate the cache.
+        let lora_active = self
+            .active_lora
+            .lock()
+            .expect("active_lora poisoned")
+            .is_some();
         // Reset internal seq_len so repeated generate() calls (bench) work.
         self.gpu_state.seq_len.store(start_pos, Ordering::Relaxed);
 
@@ -5775,6 +6611,16 @@ impl Model for GpuLfm2Model {
     fn restore_state(&self, snapshot: &StateSnapshot) {
         let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
         self.restore_state_locked(snapshot);
+    }
+
+    fn supports_moe_lora(&self) -> bool {
+        // The routed FFN runs here, but without LoRA hooks: `moe_ffn_steps`
+        // applies no delta to the router or to any expert projection. Uploading
+        // per-expert factors means a fourth stacked tensor per projection and a
+        // rank-indexed variant of the expert GEMV, which is a port of its own.
+        // Until then this stays false so `Session` refuses the adapter outright
+        // instead of applying the attention half and silently dropping the rest.
+        false
     }
 
     fn turboquant_supported(&self) -> bool {

@@ -363,6 +363,7 @@ mod tests {
                 conv_kernel_size: None,
                 kv_heads_per_layer: vec![2; n_layers],
                 scalars: crate::model::ScalarMultipliers::default(),
+                moe: None,
             }
         }
 

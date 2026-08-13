@@ -139,6 +139,38 @@ pub struct ModelConfig {
     /// Architecture scalar multipliers (Granite 3.x). Identity for every other
     /// arch — see [`ScalarMultipliers`].
     pub scalars: ScalarMultipliers,
+    /// Mixture-of-experts parameters (`lfm2moe`). `None` for dense
+    /// architectures, which is every other arch cera loads.
+    pub moe: Option<MoeConfig>,
+}
+
+/// Mixture-of-experts routing parameters, for architectures whose feed-forward
+/// block is a set of independently-weighted experts rather than one SwiGLU.
+///
+/// Only sigmoid gating with a selection bias is modelled, because that is what
+/// `lfm2moe` uses (`lfm2moe.expert_gating_func = 2`); the loader rejects any
+/// other gating function rather than silently substituting softmax, which would
+/// still produce fluent text while being numerically wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoeConfig {
+    /// Total experts per MoE layer (`expert_count`, 32 for LFM2.5-8B-A1B).
+    pub n_expert: usize,
+    /// Experts activated per token (`expert_used_count`, 4).
+    pub n_expert_used: usize,
+    /// Per-expert feed-forward width (`expert_feed_forward_length`, 1792).
+    /// Distinct from `ModelConfig::intermediate_size`, which stays the *dense*
+    /// width used by the leading dense blocks (7168).
+    pub expert_ff_len: usize,
+    /// Which layers route through experts, indexed by layer. Length `n_layers`.
+    ///
+    /// A MoE file is not uniformly MoE: `lfm2moe` runs dense leading blocks and
+    /// routed ones in the same model, so "is this layer MoE" is per-layer even
+    /// though every other field here is per-model. Carried in the config (rather
+    /// than left implicit in the per-layer weight refs) because
+    /// [`crate::lora::LoraAdapterWeights::validate_dims`] sees only a
+    /// [`ModelConfig`], and it needs the distinction to tell a dense-FFN adapter
+    /// that would silently do nothing from one that fits.
+    pub is_moe_layer: Vec<bool>,
 }
 
 /// Trait for loaded models that can run forward passes.
@@ -500,6 +532,24 @@ pub trait Model: Send + Sync {
         unimplemented!("restore_state not supported by this backend")
     }
 
+    /// Whether this backend can apply LoRA to a routed feed-forward block: the
+    /// router projection and the per-expert factors.
+    ///
+    /// Defaults to `false`, which is the direction that fails loudly:
+    /// `Session::attach_lora_adapters` refuses a routed-FFN adapter outright
+    /// rather than admitting one the backend has no hooks for and applying half
+    /// of it. A backend that forgets to override this rejects an adapter it
+    /// could have run, which a user sees immediately; the opposite default
+    /// would silently produce subtly wrong logits.
+    ///
+    /// `Lfm2Model` is the one backend with the hooks, and returns `true`. Both
+    /// GPU backends run the routed FFN but have no LoRA path through it, and
+    /// restate `false` at their own definitions rather than inheriting this one,
+    /// so whoever adds the hooks reads the reason where the work is.
+    fn supports_moe_lora(&self) -> bool {
+        false
+    }
+
     /// Whether this model/backend supports TurboQuant KV cache compression.
     /// Used by the CLI to decide whether to request compression or fall back to
     /// the backend's uncompressed KV (f32 on CPU and wgpu, f16 on native
@@ -583,7 +633,8 @@ pub fn load_model(
 
     let model: Box<dyn Model> =
         match arch.as_str() {
-            "lfm2" => Box::new(lfm2::Lfm2Model::from_gguf_with_id(
+            // `lfm2moe` shares this loader: same graph, experts in the FFN slot.
+            "lfm2" | "lfm2moe" => Box::new(lfm2::Lfm2Model::from_gguf_with_id(
                 gguf,
                 context_size,
                 model_id,
@@ -631,7 +682,12 @@ pub fn load_model_gpu(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     match arch.as_str() {
-        "lfm2" => Ok(Box::new(gpu_lfm2::GpuLfm2Model::from_gguf_with_id(
+        // `lfm2moe` shares this loader: same graph, experts in the FFN slot.
+        // `GpuLfm2Model` picks the routed path per layer from
+        // `GpuWeightSource::moe_refs`, so the only difference here is that the
+        // arch string is admitted. The expert kernels are Q4_0-only and reject
+        // anything else at load with a named error.
+        "lfm2" | "lfm2moe" => Ok(Box::new(gpu_lfm2::GpuLfm2Model::from_gguf_with_id(
             gguf,
             context_size,
             model_id,
@@ -658,7 +714,11 @@ pub fn load_model_metal(
         .unwrap_or("unknown")
         .to_string();
     match arch.as_str() {
-        "lfm2" => Ok(Box::new(metal_lfm2::MetalLfm2Model::from_gguf(
+        // `lfm2moe` shares the LFM2 loader: same graph, experts in the FFN slot.
+        // Both GPU backends dispatch the same three routing / expert kernels,
+        // each generated from its own Slang source; see `load_model_gpu` above
+        // for the wgpu half.
+        "lfm2" | "lfm2moe" => Ok(Box::new(metal_lfm2::MetalLfm2Model::from_gguf(
             gguf,
             path,
             context_size,

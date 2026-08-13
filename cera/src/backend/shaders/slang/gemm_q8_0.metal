@@ -34,7 +34,7 @@ Matrix _slang_simdgroup_load_transpose(const threadgroup T* src, ulong elements_
 }
 
 
-#line 28665 "hlsl.meta.slang"
+#line 28769 "hlsl.meta.slang"
 void linalg_CoopMat_Store_0(simdgroup_matrix<float, int(8), int(8)> this_0, float device* buffer_0, uint element_0, uint stride_0)
 {
 
@@ -45,15 +45,15 @@ void linalg_CoopMat_Store_0(simdgroup_matrix<float, int(8), int(8)> this_0, floa
 }
 
 
-#line 30042
+#line 30146
 simdgroup_matrix<float, int(8), int(8)> linalg_coopMatMulAdd_0(simdgroup_matrix<float, int(8), int(8)> matA_0, simdgroup_matrix<half, int(8), int(8)> matB_0, simdgroup_matrix<float, int(8), int(8)> matC_0)
 {
 
-#line 30057
+#line 30161
     simdgroup_matrix<float, int(8), int(8)> _S1;
     simdgroup_multiply_accumulate(_S1, matA_0, matB_0, matC_0);
 
-#line 30057
+#line 30161
     return _S1;
 }
 

@@ -2,7 +2,7 @@
 
 use std::sync::Mutex;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::backend::cpu;
 use crate::gguf::GgufFile;
@@ -26,26 +26,101 @@ use crate::turboquant;
 // referring to `lfm2::WeightRef` via this re-export.
 pub(crate) use transformer::WeightRef;
 
+/// The three SwiGLU projections of a dense feed-forward block.
+#[derive(Debug, Clone)]
+pub(crate) struct DenseFfnRefs {
+    pub gate: WeightRef,
+    pub up: WeightRef,
+    pub down: WeightRef,
+}
+
+/// Weight references for one mixture-of-experts feed-forward block.
+///
+/// The GGUF stores each layer's experts stacked into rank-3 tensors; these are
+/// pre-split into one ordinary 2D [`WeightRef`] per expert at load time (see
+/// [`crate::gguf::GgufFile::tensor_meta_expert`]) so the existing GEMV kernels
+/// run against an expert unchanged. `gate`, `up` and `down` are each
+/// `n_expert` long and index-aligned.
+#[derive(Debug, Clone)]
+pub(crate) struct MoeFfnRefs {
+    /// Routing parameters for this layer, copied out of
+    /// [`crate::model::MoeConfig`] at load.
+    ///
+    /// Carried here rather than read from `ModelConfig::moe` at the call site so
+    /// that having expert weights and having the numbers to drive them is one
+    /// fact instead of two. The alternative left the hot path with an
+    /// `if let Some(cfg)` whose `else` would silently skip the whole FFN and add
+    /// the *previous* block's stale scratch into the residual.
+    ///
+    /// All three are flattened rather than held as a `MoeConfig`: that struct
+    /// also carries the per-model `is_moe_layer` map, which is both meaningless
+    /// inside a per-layer struct (this layer is routed by virtue of being an
+    /// `FfnRefs::Moe`) and a heap allocation per routed layer to clone.
+    pub n_expert: usize,
+    /// Experts activated per token. See [`Self::n_expert`].
+    pub n_expert_used: usize,
+    /// Per-expert feed-forward width. See [`Self::n_expert`].
+    pub expert_ff_len: usize,
+    /// Router projection (`ffn_gate_inp.weight`, F32, `[hidden, n_expert]`)
+    /// producing one logit per expert.
+    pub router: WeightRef,
+    /// Per-expert selection bias (`exp_probs_b.bias`, F32, `n_expert` long).
+    ///
+    /// Added to the gate probabilities **only** to pick the top-k experts; the
+    /// weights those experts are then combined with are the *unbiased*
+    /// probabilities. This is the DeepSeek-V3 convention llama.cpp implements
+    /// ("leave probs unbiased as it's later used to get expert weights"), and
+    /// conflating the two still yields fluent output, so it is pinned by the
+    /// routing unit tests rather than left to inspection.
+    pub exp_probs_b: Vec<f32>,
+    pub gate: Vec<WeightRef>,
+    pub up: Vec<WeightRef>,
+    pub down: Vec<WeightRef>,
+}
+
+/// A layer's feed-forward block: one dense SwiGLU, or a routed expert set.
+///
+/// `lfm2moe` mixes both (its leading blocks are dense, the rest MoE),
+/// so this is per-layer rather than per-model. Modelled as a sum type instead
+/// of optional dense fields plus optional expert fields so that "exactly one of
+/// the two is populated" is a type-level fact rather than a load-time
+/// invariant the hot paths would have to re-check.
+#[derive(Debug, Clone)]
+pub(crate) enum FfnRefs {
+    Dense(DenseFfnRefs),
+    /// Boxed so the enum's size is set by the dense variant rather than by the
+    /// larger MoE one, which every dense layer of every model would otherwise
+    /// carry as padding.
+    Moe(Box<MoeFfnRefs>),
+}
+
+impl FfnRefs {
+    /// The dense projections, or an error naming the layer when it is MoE.
+    ///
+    /// Every backend now implements experts, so this is no longer a
+    /// not-yet-supported path: it is the accessor a caller reaches for once it
+    /// has established the layer is dense, and the error is what keeps a caller
+    /// that has *not* from silently falling back onto the wrong weights. Both
+    /// GPU loaders ask `GpuWeightSource::moe_refs` first for exactly that
+    /// reason.
+    pub fn dense(&self) -> Result<&DenseFfnRefs> {
+        match self {
+            Self::Dense(d) => Ok(d),
+            Self::Moe(_) => bail!("expected a dense FFN block, found a mixture-of-experts block"),
+        }
+    }
+}
+
 /// Per-layer weight references for quantized tensors.
 #[derive(Debug, Clone)]
 pub(crate) struct LayerWeightRefs {
-    pub ffn_gate: WeightRef,
-    pub ffn_up: WeightRef,
-    pub ffn_down: WeightRef,
+    pub ffn: FfnRefs,
     pub shortconv_in_proj: Option<WeightRef>,
     pub shortconv_out_proj: Option<WeightRef>,
     pub attn_q: Option<WeightRef>,
     pub attn_k: Option<WeightRef>,
     pub attn_v: Option<WeightRef>,
     pub attn_output: Option<WeightRef>,
-}
-
-/// Dimensions for a layer's weight matrices (for GPU model construction).
-pub struct LayerWeightDims {
-    pub ffn_gate_m: usize,
-    pub ffn_gate_k: usize,
-    pub ffn_down_m: usize,
-    pub ffn_down_k: usize,
 }
 
 // ── LFM2 Model ─────────────────────────────────────────────────────────────
@@ -86,6 +161,68 @@ pub struct Lfm2Model {
     /// stay consistent because configuration is first-call-wins. See
     /// `configure_kv_compression`.
     kv_cache_tag: Mutex<Option<String>>,
+}
+
+/// Choose the top-`n_used` experts and their combining weights.
+///
+/// `probs` are the sigmoid gate probabilities and `biases` the per-expert
+/// selection bias (`exp_probs_b`). Experts are *ranked* by `probs + biases` but
+/// *weighted* by `probs` alone, then renormalized to sum to 1. This is the DeepSeek-V3
+/// convention llama.cpp implements in `build_moe_ffn`.
+///
+/// Split out of [`Lfm2Model::route_experts`] as a pure function purely so this
+/// rule is directly testable: the bias affects rank only, which means the
+/// returned weights are *not* necessarily descending, and a version that
+/// weights by the biased score produces plausible text while being wrong.
+fn select_experts(probs: &[f32], biases: &[f32], n_used: usize, selected: &mut Vec<(usize, f32)>) {
+    selected.clear();
+    let n_expert = probs.len().min(biases.len());
+    let mut stack_biased = [0.0f32; 256];
+    let heap_biased;
+    let biased: &[f32] = if n_expert <= 256 {
+        for i in 0..n_expert {
+            stack_biased[i] = probs[i] + biases[i];
+        }
+        &stack_biased[..n_expert]
+    } else {
+        heap_biased = probs
+            .iter()
+            .zip(biases)
+            .map(|(&p, &b)| p + b)
+            .collect::<Vec<_>>();
+        &heap_biased[..]
+    };
+    (0..n_used.min(n_expert)).for_each(|_| {
+        let best = (0..n_expert)
+            .filter(|e| !selected.iter().any(|(taken, _)| taken == e))
+            .max_by(|&a, &b| {
+                // `total_cmp`, not `partial_cmp`: a NaN logit would otherwise
+                // make `max_by` silently return an arbitrary expert.
+                biased[a]
+                    .total_cmp(&biased[b])
+                    // Ties go to the lower index, matching the stable order of
+                    // `ggml_argsort_top_k`. `max_by` keeps the *last* maximum,
+                    // so the reversed index comparison is what makes it the
+                    // first.
+                    .then(b.cmp(&a))
+            });
+        if let Some(e) = best {
+            selected.push((e, probs[e]));
+        }
+    });
+
+    // Renormalize the unbiased probabilities over the chosen experts, clamping
+    // the divisor to f16's smallest positive normal (2^-14) exactly as
+    // llama.cpp does so an all-but-zero gate cannot divide by zero. Spelled as
+    // an exponent rather than the decimal expansion because 6.103515625e-5
+    // carries more digits than an f32 literal keeps, which clippy rejects.
+    const MIN_POSITIVE_F16: f32 = 1.0 / 16384.0;
+    let denom = selected
+        .iter()
+        .map(|&(_, w)| w)
+        .sum::<f32>()
+        .max(MIN_POSITIVE_F16);
+    selected.iter_mut().for_each(|(_, w)| *w /= denom);
 }
 
 /// Render a cache tag for the `KvCompressionConflict` message — the empty tag is
@@ -160,23 +297,38 @@ impl Lfm2Model {
         model_id: String,
     ) -> Result<Self> {
         ensure!(context_size > 0, "context_size must be > 0");
-        let prefix = "lfm2";
+        // `lfm2moe` is the same graph as `lfm2` with experts in the FFN slot, so
+        // it shares this loader, but its metadata keys are namespaced under its
+        // own arch name (`lfm2moe.block_count`, not `lfm2.block_count`), so the
+        // prefix has to follow the file rather than be hardcoded.
+        let arch = gguf
+            .get_str("general.architecture")
+            .unwrap_or("lfm2")
+            .to_string();
+        ensure!(
+            arch == "lfm2" || arch == "lfm2moe",
+            "Lfm2Model: unsupported architecture {arch}"
+        );
+        let prefix = arch.as_str();
 
-        let n_layers = gguf
-            .get_u32(&format!("{prefix}.block_count"))
-            .context("missing lfm2.block_count")? as usize;
+        let n_layers =
+            gguf.get_u32(&format!("{prefix}.block_count"))
+                .with_context(|| format!("missing {prefix}.block_count"))? as usize;
         let hidden_size = gguf
             .get_u32(&format!("{prefix}.embedding_length"))
-            .context("missing lfm2.embedding_length")? as usize;
+            .with_context(|| format!("missing {prefix}.embedding_length"))?
+            as usize;
         let intermediate_size = gguf
             .get_u32(&format!("{prefix}.feed_forward_length"))
-            .context("missing lfm2.feed_forward_length")? as usize;
+            .with_context(|| format!("missing {prefix}.feed_forward_length"))?
+            as usize;
         let n_heads = gguf
             .get_u32(&format!("{prefix}.attention.head_count"))
-            .context("missing lfm2.attention.head_count")? as usize;
-        let vocab_size = gguf
-            .get_u32(&format!("{prefix}.vocab_size"))
-            .context("missing lfm2.vocab_size")? as usize;
+            .with_context(|| format!("missing {prefix}.attention.head_count"))?
+            as usize;
+        let vocab_size =
+            gguf.get_u32(&format!("{prefix}.vocab_size"))
+                .with_context(|| format!("missing {prefix}.vocab_size"))? as usize;
         // Cap the model's max_seq_len by the user's requested context_size so
         // KV cache pre-allocation in `InferenceState::from_config_with_compression`
         // matches the actual budget. Mirrors the pattern used by metal_lfm2 and
@@ -199,7 +351,7 @@ impl Lfm2Model {
         // Per-layer KV head counts
         let kv_heads_array = gguf
             .get_i32_array(&format!("{prefix}.attention.head_count_kv"))
-            .context("missing lfm2.attention.head_count_kv")?;
+            .with_context(|| format!("missing {prefix}.attention.head_count_kv"))?;
 
         // Validate kv_heads_array length matches n_layers
         anyhow::ensure!(
@@ -229,8 +381,77 @@ impl Lfm2Model {
 
         let n_kv_heads = kv_heads_per_layer.iter().copied().max().unwrap_or(0);
 
+        // Which layers route through experts. Read from tensor presence, the
+        // same way block types are, rather than from `leading_dense_block_count`.
+        // A metadata/tensor disagreement then fails at weight resolution with
+        // a missing-tensor name instead of silently running the wrong FFN.
+        let moe_layers: Vec<bool> = (0..n_layers)
+            .map(|i| {
+                gguf.tensors
+                    .contains_key(&format!("blk.{i}.ffn_gate_exps.weight"))
+            })
+            .collect();
+
+        let moe = if moe_layers.iter().any(|&is_moe| is_moe) {
+            // Sigmoid (2) is the only gating function implemented. Softmax (1)
+            // would load and generate fluent-looking text off wrong weights, so
+            // reject it rather than default to it.
+            let gating_func = gguf
+                .get_u32(&format!("{prefix}.expert_gating_func"))
+                .with_context(|| format!("missing {prefix}.expert_gating_func"))?;
+            ensure!(
+                gating_func == 2,
+                "{prefix}: expert_gating_func {gating_func} is not supported (only 2 = sigmoid)"
+            );
+            let n_expert = gguf
+                .get_u32(&format!("{prefix}.expert_count"))
+                .with_context(|| format!("missing {prefix}.expert_count"))?
+                as usize;
+            let n_expert_used = gguf
+                .get_u32(&format!("{prefix}.expert_used_count"))
+                .with_context(|| format!("missing {prefix}.expert_used_count"))?
+                as usize;
+            let expert_ff_len = gguf
+                .get_u32(&format!("{prefix}.expert_feed_forward_length"))
+                .with_context(|| format!("missing {prefix}.expert_feed_forward_length"))?
+                as usize;
+            ensure!(
+                n_expert_used > 0 && n_expert_used <= n_expert,
+                "{prefix}: expert_used_count ({n_expert_used}) must be in 1..={n_expert}"
+            );
+            // The expert GEMVs borrow the dense FFN's `gate`/`up` scratch, which
+            // `InferenceState` allocates at `intermediate_size` and never grows.
+            // A file whose expert width exceeded the dense width would index
+            // past it mid-forward, so reject it at load with a name instead.
+            ensure!(
+                expert_ff_len <= intermediate_size,
+                "{prefix}: expert_feed_forward_length ({expert_ff_len}) exceeds \
+                 feed_forward_length ({intermediate_size}), which sizes the FFN scratch"
+            );
+            // The Q8_0 requantize of the SwiGLU product computes its block count
+            // as `expert_ff_len / 32`; a non-multiple would truncate and leave
+            // the tail block holding stale scratch rather than this expert's
+            // activations.
+            ensure!(
+                expert_ff_len > 0 && expert_ff_len.is_multiple_of(32),
+                "{prefix}: expert_feed_forward_length ({expert_ff_len}) must be a positive \
+                 multiple of 32"
+            );
+            Some(crate::model::MoeConfig {
+                n_expert,
+                n_expert_used,
+                expert_ff_len,
+                is_moe_layer: moe_layers.clone(),
+            })
+        } else {
+            None
+        };
+
         let config = ModelConfig {
-            architecture: "lfm2".to_string(),
+            // The file's own arch, not a flattened "lfm2": `model_fingerprint`
+            // hashes this into the prefix-cache namespace, and an lfm2moe cache
+            // entry must not be reachable by an lfm2 model of the same shape.
+            architecture: arch.clone(),
             n_layers,
             hidden_size,
             intermediate_size,
@@ -245,6 +466,7 @@ impl Lfm2Model {
             conv_kernel_size,
             kv_heads_per_layer: kv_heads_per_layer.clone(),
             scalars: ScalarMultipliers::default(),
+            moe: moe.clone(),
         };
 
         // Pre-extract small F32 weights
@@ -293,12 +515,56 @@ impl Lfm2Model {
         for (i, bt) in block_types.iter().enumerate() {
             // `.with_repack` on every projection weight (all hit the batched
             // prefill GEMM at `n > 1`); token_embd is excluded above.
-            let ffn_gate = Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_gate.weight"))?
-                .with_repack(&gguf);
-            let ffn_up =
-                Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_up.weight"))?.with_repack(&gguf);
-            let ffn_down = Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_down.weight"))?
-                .with_repack(&gguf);
+            let ffn = if moe_layers[i] {
+                let moe_cfg = moe
+                    .as_ref()
+                    .context("layer has expert tensors but no MoE metadata")?;
+                let n_expert = moe_cfg.n_expert;
+
+                // Experts are deliberately *not* `.with_repack`ed. The repack
+                // exists to feed the batched prefill GEMM, and it allocates a
+                // full second copy of the weight (x86_64 only). Experts are the
+                // bulk of the parameters here, and repacking all 32 per tensor
+                // would roughly double resident memory for the whole model,
+                // while each expert sees only the tokens routed to it, so its
+                // GEMM is a fraction of the width the repack was tuned for.
+                // Whether it pays back is a measurement, not a default.
+                let expert_refs = |suffix: &str| -> Result<Vec<WeightRef>> {
+                    let name = format!("blk.{i}.{suffix}");
+                    (0..n_expert)
+                        .map(|e| Self::resolve_expert_weight(&gguf, &name, e))
+                        .collect()
+                };
+
+                let exp_probs_b = gguf
+                    .get_tensor(&format!("blk.{i}.exp_probs_b.bias"))?
+                    .to_f32_vec();
+                ensure!(
+                    exp_probs_b.len() == n_expert,
+                    "layer {i}: exp_probs_b has {} entries, expected {n_expert}",
+                    exp_probs_b.len()
+                );
+
+                FfnRefs::Moe(Box::new(MoeFfnRefs {
+                    n_expert,
+                    n_expert_used: moe_cfg.n_expert_used,
+                    expert_ff_len: moe_cfg.expert_ff_len,
+                    router: Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_gate_inp.weight"))?,
+                    exp_probs_b,
+                    gate: expert_refs("ffn_gate_exps.weight")?,
+                    up: expert_refs("ffn_up_exps.weight")?,
+                    down: expert_refs("ffn_down_exps.weight")?,
+                }))
+            } else {
+                FfnRefs::Dense(DenseFfnRefs {
+                    gate: Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_gate.weight"))?
+                        .with_repack(&gguf),
+                    up: Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_up.weight"))?
+                        .with_repack(&gguf),
+                    down: Self::resolve_weight(&gguf, &format!("blk.{i}.ffn_down.weight"))?
+                        .with_repack(&gguf),
+                })
+            };
 
             let (shortconv_in_proj, shortconv_out_proj, attn_q, attn_k, attn_v, attn_output) =
                 if *bt == BlockType::GatedConv {
@@ -346,9 +612,7 @@ impl Lfm2Model {
                 };
 
             layer_refs.push(LayerWeightRefs {
-                ffn_gate,
-                ffn_up,
-                ffn_down,
+                ffn,
                 shortconv_in_proj,
                 shortconv_out_proj,
                 attn_q,
@@ -385,6 +649,291 @@ impl Lfm2Model {
     /// Thin wrapper over the shared `transformer::resolve_weight`.
     fn resolve_weight(gguf: &GgufFile, name: &str) -> Result<WeightRef> {
         transformer::resolve_weight(gguf, name)
+    }
+
+    /// Resolve expert `expert` of a stacked MoE tensor to a 2D weight ref.
+    fn resolve_expert_weight(gguf: &GgufFile, name: &str, expert: usize) -> Result<WeightRef> {
+        transformer::resolve_expert_weight(gguf, name, expert)
+    }
+
+    /// Pick the experts for one token and their combining weights, leaving both
+    /// in `state.scratch.moe_selected`.
+    ///
+    /// Mirrors llama.cpp's `build_moe_ffn` for `expert_gating_func = 2`:
+    ///
+    /// 1. `probs = sigmoid(router · x)`
+    /// 2. select the top `n_expert_used` by `probs + exp_probs_b`
+    /// 3. weight them by the **unbiased** `probs`, renormalized to sum to 1
+    ///
+    /// Step 3 is the part that is easy to get wrong: `exp_probs_b` is a
+    /// DeepSeek-V3 style load-balancing bias that steers *selection* only. Using
+    /// the biased score as the combining weight changes every output subtly and
+    /// still reads as fluent text, so the `moe_routing_tests` module pins this
+    /// against llama.cpp's own values rather than trusting inspection.
+    fn route_experts(
+        &self,
+        layer: usize,
+        moe: &MoeFfnRefs,
+        lora: Option<&crate::lora::LoraAdapterWeights>,
+        ffn_input: &[f32],
+        state: &mut InferenceState,
+    ) {
+        let n_expert = moe.n_expert;
+        let n_used = moe.n_expert_used;
+
+        state.scratch.moe_probs.resize(n_expert, 0.0);
+        transformer::gemv(
+            &self.gguf,
+            &moe.router,
+            ffn_input,
+            &mut state.scratch.moe_probs[..n_expert],
+        );
+        // The router is a LoRA target in its own right (llama.cpp builds it with
+        // `build_lora_mm`), and it is adapted on the *logits*, before the
+        // sigmoid. An adapter that moved a token across a selection boundary
+        // would otherwise be silently ignored while its expert deltas applied.
+        if let Some(lora) = lora
+            && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGateInp)
+        {
+            crate::lora::apply_decode(
+                t,
+                ffn_input,
+                &mut state.scratch.moe_probs[..n_expert],
+                &mut state.scratch.lora_tmp,
+            );
+        }
+        state.scratch.moe_probs[..n_expert]
+            .iter_mut()
+            .for_each(|p| *p = 1.0 / (1.0 + (-*p).exp()));
+
+        select_experts(
+            &state.scratch.moe_probs[..n_expert],
+            &moe.exp_probs_b,
+            n_used,
+            &mut state.scratch.moe_selected,
+        );
+    }
+
+    /// Routed feed-forward for one MoE layer, writing the combined expert
+    /// output into `state.scratch.out[..hidden_size]`.
+    ///
+    /// On aarch64 the caller must have quantized `ffn_input` into
+    /// `state.scratch.q8_*` already, matching the dense
+    /// [`transformer::forward_ffn_block`] contract; each expert's
+    /// down-projection re-quantizes its own SwiGLU product.
+    ///
+    /// The body deliberately duplicates the ~60 lines of
+    /// [`transformer::forward_ffn_block`] (the same gate/up GEMV, SwiGLU,
+    /// requantize, down GEMV, LoRA sequence) rather than calling it. Sharing
+    /// would mean parameterizing the dense helper over per-expert weights, a
+    /// per-expert LoRA lookup and an output buffer that is accumulated rather
+    /// than written, which puts three new branches in the FFN hot path of every
+    /// dense model cera runs so that one architecture can reuse it. Nothing
+    /// pins the two copies to each other, so a change to the dense block's
+    /// arithmetic has to be mirrored here by hand; if a third routed
+    /// architecture lands, that trade stops paying and this should be extracted.
+    fn forward_moe_ffn(
+        &self,
+        layer: usize,
+        moe: &MoeFfnRefs,
+        hidden_size: usize,
+        ffn_input: &[f32],
+        state: &mut InferenceState,
+    ) {
+        let ff = moe.expert_ff_len;
+        // Cloned out of `state` up front: the `Arc` bumps a refcount, and the
+        // alternative is holding a borrow of `state` across the GEMVs that need
+        // it mutably. Same shape as `transformer::forward_ffn_block`.
+        let lora = state.lora.clone();
+        self.route_experts(layer, moe, lora.as_deref(), ffn_input, state);
+
+        state.scratch.moe_expert_out.resize(hidden_size, 0.0);
+        state.scratch.out[..hidden_size].fill(0.0);
+
+        // `moe_selected` is scratch that the expert GEMVs below also borrow
+        // from `state`, so take the routing decision out first. It is
+        // `n_expert_used` pairs (4 here), not per-expert data.
+        let selected = std::mem::take(&mut state.scratch.moe_selected);
+
+        #[cfg(target_arch = "aarch64")]
+        let mut first = true;
+
+        for &(expert, weight) in &selected {
+            // Restore the Q8_0 quantization of `ffn_input`. The previous
+            // iteration's down projection re-quantized this scratch to hold its
+            // SwiGLU product, so the gate/up GEMVs below would otherwise read
+            // that instead of the layer input. Done at the top of the body, not
+            // the bottom, so it does not also run after the final expert where
+            // nothing consumes it. The caller guarantees it is already correct
+            // on entry, so the first iteration re-does work that is already
+            // valid; that is one quantization per layer, against one per expert
+            // for the bottom-of-loop form.
+            #[cfg(target_arch = "aarch64")]
+            if !first {
+                Self::quantize_to_scratch(ffn_input, state);
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                first = false;
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                transformer::gemv_preq(
+                    &self.gguf,
+                    &moe.gate[expert],
+                    ffn_input,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    &mut state.scratch.gate[..ff],
+                );
+                transformer::gemv_preq(
+                    &self.gguf,
+                    &moe.up[expert],
+                    ffn_input,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    &mut state.scratch.up[..ff],
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                transformer::gemv(
+                    &self.gguf,
+                    &moe.gate[expert],
+                    ffn_input,
+                    &mut state.scratch.gate[..ff],
+                );
+                transformer::gemv(
+                    &self.gguf,
+                    &moe.up[expert],
+                    ffn_input,
+                    &mut state.scratch.up[..ff],
+                );
+            }
+
+            // Per-expert LoRA on gate/up, before the SwiGLU mul reads both. The
+            // adapter's factors are indexed by the *same* expert id as the base
+            // weight, matching llama.cpp's `build_lora_mm_id`, which feeds one
+            // `ids` tensor to the base and both factors alike.
+            if let Some(lora) = &lora {
+                if let Some(t) =
+                    lora.get_expert(layer, crate::lora::LoraTarget::FfnGateExps, expert)
+                {
+                    crate::lora::apply_decode(
+                        t,
+                        ffn_input,
+                        &mut state.scratch.gate[..ff],
+                        &mut state.scratch.lora_tmp,
+                    );
+                }
+                if let Some(t) = lora.get_expert(layer, crate::lora::LoraTarget::FfnUpExps, expert)
+                {
+                    crate::lora::apply_decode(
+                        t,
+                        ffn_input,
+                        &mut state.scratch.up[..ff],
+                        &mut state.scratch.lora_tmp,
+                    );
+                }
+            }
+
+            cpu::silu_mul_inplace(&mut state.scratch.gate[..ff], &state.scratch.up[..ff]);
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                // The down projection consumes the SwiGLU product, not the
+                // layer input, so it needs its own Q8_0 quantization, and it
+                // overwrites the q8 scratch the gate/up GEMVs above read, which
+                // is why this runs after both of them for every expert.
+                let nb = ff / 32;
+                state.scratch.q8_scales.resize(nb, 0.0);
+                state.scratch.q8_quants.resize(ff, 0);
+                unsafe {
+                    crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                        &state.scratch.gate[..ff],
+                        &mut state.scratch.q8_scales,
+                        &mut state.scratch.q8_quants,
+                    );
+                }
+                transformer::gemv_preq(
+                    &self.gguf,
+                    &moe.down[expert],
+                    &state.scratch.gate[..ff],
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    &mut state.scratch.moe_expert_out[..hidden_size],
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            transformer::gemv(
+                &self.gguf,
+                &moe.down[expert],
+                &state.scratch.gate[..ff],
+                &mut state.scratch.moe_expert_out[..hidden_size],
+            );
+
+            // LoRA on this expert's down projection. Its input is the SwiGLU
+            // product in `gate`, not the layer input, so it must read `gate`
+            // *before* the accumulate below consumes `moe_expert_out`.
+            if let Some(lora) = &lora
+                && let Some(t) =
+                    lora.get_expert(layer, crate::lora::LoraTarget::FfnDownExps, expert)
+            {
+                crate::lora::apply_decode(
+                    t,
+                    &state.scratch.gate[..ff],
+                    &mut state.scratch.moe_expert_out[..hidden_size],
+                    &mut state.scratch.lora_tmp,
+                );
+            }
+
+            let (out, expert_out) = (
+                &mut state.scratch.out[..hidden_size],
+                &state.scratch.moe_expert_out[..hidden_size],
+            );
+            out.iter_mut()
+                .zip(expert_out)
+                .for_each(|(acc, &v)| *acc += weight * v);
+        }
+
+        state.scratch.moe_selected = selected;
+    }
+
+    /// Prefill feed-forward for a MoE layer: route and run every token
+    /// individually, reading `ffn_input` and writing `ffn_out` in the caller's
+    /// column-major (`hs × n`) layout.
+    ///
+    /// Deliberately unbatched. The dense path batches because all `n` tokens
+    /// share one weight matrix; here each token picks its own 4-of-32 experts,
+    /// so a batched GEMM would first have to group tokens by expert and scatter
+    /// the results back. That grouping is the next optimization (plan
+    /// 000312-01, phase 1 step 6) and is kept separate from making the
+    /// arithmetic right, so the batched version has a reference to match.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_moe_ffn(
+        &self,
+        layer: usize,
+        moe: &MoeFfnRefs,
+        hs: usize,
+        n: usize,
+        ffn_input: &[f32],
+        ffn_out: &mut [f32],
+        col: &mut [f32],
+        state: &mut InferenceState,
+    ) {
+        for j in 0..n {
+            (0..hs).for_each(|i| col[i] = ffn_input[i * n + j]);
+
+            // `forward_moe_ffn` reads the pre-quantized column on aarch64,
+            // exactly as the dense per-token fallback does.
+            #[cfg(target_arch = "aarch64")]
+            Self::quantize_to_scratch(col, state);
+
+            self.forward_moe_ffn(layer, moe, hs, col, state);
+
+            (0..hs).for_each(|i| ffn_out[i * n + j] = state.scratch.out[i]);
+        }
     }
 
     // ── Public accessors for GPU model construction ───────────────────────
@@ -434,30 +983,25 @@ impl Lfm2Model {
         self.gemv(wref, x, y);
     }
 
-    /// FFN gate GEMV for a layer.
-    pub fn ffn_gate_gemv(&self, layer: usize, x: &[f32], y: &mut [f32]) {
-        self.gemv(&self.layer_refs[layer].ffn_gate, x, y);
+    /// FFN gate GEMV for a layer. Errors on a MoE layer, whose gate weight is
+    /// per-expert and only meaningful after routing.
+    pub fn ffn_gate_gemv(&self, layer: usize, x: &[f32], y: &mut [f32]) -> Result<()> {
+        self.gemv(&self.layer_refs[layer].ffn.dense()?.gate, x, y);
+        Ok(())
     }
 
-    /// FFN up GEMV for a layer.
-    pub fn ffn_up_gemv(&self, layer: usize, x: &[f32], y: &mut [f32]) {
-        self.gemv(&self.layer_refs[layer].ffn_up, x, y);
+    /// FFN up GEMV for a layer. Errors on a MoE layer (see
+    /// [`Self::ffn_gate_gemv`]).
+    pub fn ffn_up_gemv(&self, layer: usize, x: &[f32], y: &mut [f32]) -> Result<()> {
+        self.gemv(&self.layer_refs[layer].ffn.dense()?.up, x, y);
+        Ok(())
     }
 
-    /// FFN down GEMV for a layer.
-    pub fn ffn_down_gemv(&self, layer: usize, x: &[f32], y: &mut [f32]) {
-        self.gemv(&self.layer_refs[layer].ffn_down, x, y);
-    }
-
-    /// Returns (ffn_gate_m, ffn_gate_k, ffn_down_m, ffn_down_k) for a layer.
-    pub fn layer_weight_info(&self, layer: usize) -> LayerWeightDims {
-        let refs = &self.layer_refs[layer];
-        LayerWeightDims {
-            ffn_gate_m: refs.ffn_gate.m,
-            ffn_gate_k: refs.ffn_gate.k,
-            ffn_down_m: refs.ffn_down.m,
-            ffn_down_k: refs.ffn_down.k,
-        }
+    /// FFN down GEMV for a layer. Errors on a MoE layer (see
+    /// [`Self::ffn_gate_gemv`]).
+    pub fn ffn_down_gemv(&self, layer: usize, x: &[f32], y: &mut [f32]) -> Result<()> {
+        self.gemv(&self.layer_refs[layer].ffn.dense()?.down, x, y);
+        Ok(())
     }
 
     /// Get raw weight bytes for a WeightRef (for GPU quantized upload).
@@ -1006,21 +1550,25 @@ impl Lfm2Model {
             #[cfg(target_arch = "aarch64")]
             Self::quantize_to_scratch(&ffn_input, state);
 
-            let refs = &self.layer_refs[i];
-            let ffn_weights = FfnWeights {
-                ffn_gate: &refs.ffn_gate,
-                ffn_up: &refs.ffn_up,
-                ffn_down: &refs.ffn_down,
-            };
-            transformer::forward_ffn_block(
-                &self.gguf,
-                i,
-                &ffn_weights,
-                hs,
-                cfg.intermediate_size,
-                &ffn_input,
-                state,
-            );
+            match &self.layer_refs[i].ffn {
+                FfnRefs::Dense(dense) => {
+                    let ffn_weights = FfnWeights {
+                        ffn_gate: &dense.gate,
+                        ffn_up: &dense.up,
+                        ffn_down: &dense.down,
+                    };
+                    transformer::forward_ffn_block(
+                        &self.gguf,
+                        i,
+                        &ffn_weights,
+                        hs,
+                        cfg.intermediate_size,
+                        &ffn_input,
+                        state,
+                    );
+                }
+                FfnRefs::Moe(moe) => self.forward_moe_ffn(i, moe, hs, &ffn_input, state),
+            }
 
             cpu::add_inplace(hidden, &state.scratch.out[..cfg.hidden_size]);
         }
@@ -2191,251 +2739,277 @@ impl Lfm2Model {
             // leave later matrices silently uncomputed in the batched path and
             // produce wrong outputs.
             let refs = &self.layer_refs[layer];
-            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
-            let used_gemm = if [
-                ("ffn_gate", &refs.ffn_gate),
-                ("ffn_up", &refs.ffn_up),
-                ("ffn_down", &refs.ffn_down),
-            ]
-            .into_iter()
-            .fold(true, |ok, (name, w)| {
-                if transformer::batched_gemm_supports(w.dtype, w.k) {
-                    ok
-                } else {
-                    transformer::warn_unbatchable(name, w.dtype);
-                    false
-                }
-            }) {
-                // Pre-quantize all n columns to Q8_0 — only needed for the NEON fallback.
-                #[cfg(not(feature = "blas"))]
-                transformer::quantize_columns(
-                    &ffn_input,
-                    hs,
-                    n,
-                    &mut col,
-                    &mut bq_scales,
-                    &mut bq_quants,
-                );
-
-                // Gate + Up via batched GEMM
-                #[cfg(feature = "blas")]
-                {
-                    transformer::try_blas_prefill_gemm(
-                        &self.gguf,
-                        &refs.ffn_gate,
-                        &ffn_input,
-                        &mut gate_mat,
-                        is,
-                        n,
-                        hs,
-                        &mut state.scratch.dequant_weight_scratch,
-                    );
-                    transformer::try_blas_prefill_gemm(
-                        &self.gguf,
-                        &refs.ffn_up,
-                        &ffn_input,
-                        &mut up_mat,
-                        is,
-                        n,
-                        hs,
-                        &mut state.scratch.dequant_weight_scratch,
-                    );
-                }
-                #[cfg(not(feature = "blas"))]
-                {
-                    transformer::gemm_preq(
-                        &self.gguf,
-                        &refs.ffn_gate,
-                        &bq_scales,
-                        &bq_quants,
-                        &mut gate_mat,
-                        is,
-                        n,
-                        hs,
-                    );
-                    transformer::gemm_preq(
-                        &self.gguf,
-                        &refs.ffn_up,
-                        &bq_scales,
-                        &bq_quants,
-                        &mut up_mat,
-                        is,
-                        n,
-                        hs,
-                    );
-                }
-
-                // LoRA on gate/up — BEFORE the SiLU+mul, input is the normed FFN
-                // input `[hs×n]`.
-                if let Some(lora) = &lora {
-                    if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
-                        crate::lora::apply_prefill(
-                            t,
-                            &ffn_input,
-                            &mut gate_mat[..is * n],
+            // A MoE layer has no single FFN weight to batch: each token picks
+            // its own experts, so the dense path below does not apply. Routed
+            // per token: correct, but not yet grouped by expert (plan
+            // 000312-01, phase 1 step 6).
+            'dense_ffn: {
+                let dense = match &refs.ffn {
+                    FfnRefs::Dense(d) => d,
+                    FfnRefs::Moe(moe) => {
+                        self.prefill_moe_ffn(
+                            layer,
+                            moe,
+                            hs,
                             n,
-                            &mut state.scratch.lora_tmp,
-                        );
-                    }
-                    if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
-                        crate::lora::apply_prefill(
-                            t,
                             &ffn_input,
-                            &mut up_mat[..is * n],
-                            n,
-                            &mut state.scratch.lora_tmp,
+                            &mut ffn_out,
+                            &mut col,
+                            state,
                         );
+                        break 'dense_ffn;
                     }
-                }
-
-                // Fused SiLU+mul (row-major is×n)
-                cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
-
-                // Re-quantize gate_mat columns for down projection — only needed for NEON fallback.
-                #[cfg(not(feature = "blas"))]
-                transformer::quantize_columns(
-                    &gate_mat,
-                    is,
-                    n,
-                    &mut inter_col,
-                    &mut dq_scales,
-                    &mut dq_quants,
-                );
-
-                // Down via batched GEMM
-                #[cfg(feature = "blas")]
-                {
-                    transformer::try_blas_prefill_gemm(
-                        &self.gguf,
-                        &refs.ffn_down,
-                        &gate_mat,
-                        &mut ffn_out,
+                };
+                #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+                let used_gemm = if [
+                    ("ffn_gate", &dense.gate),
+                    ("ffn_up", &dense.up),
+                    ("ffn_down", &dense.down),
+                ]
+                .into_iter()
+                .fold(true, |ok, (name, w)| {
+                    if transformer::batched_gemm_supports(w.dtype, w.k) {
+                        ok
+                    } else {
+                        transformer::warn_unbatchable(name, w.dtype);
+                        false
+                    }
+                }) {
+                    // Pre-quantize all n columns to Q8_0 — only needed for the NEON fallback.
+                    #[cfg(not(feature = "blas"))]
+                    transformer::quantize_columns(
+                        &ffn_input,
                         hs,
                         n,
-                        is,
-                        &mut state.scratch.dequant_weight_scratch,
+                        &mut col,
+                        &mut bq_scales,
+                        &mut bq_quants,
                     );
-                }
-                #[cfg(not(feature = "blas"))]
-                transformer::gemm_preq(
-                    &self.gguf,
-                    &refs.ffn_down,
-                    &dq_scales,
-                    &dq_quants,
-                    &mut ffn_out,
-                    hs,
-                    n,
-                    is,
-                );
 
-                // LoRA on the down projection — applied to `ffn_out` BEFORE the
-                // residual add; input is the SiLU⊙up product in `gate_mat` `[is×n]`.
-                if let Some(lora) = &lora
-                    && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnDown)
-                {
-                    crate::lora::apply_prefill(
-                        t,
-                        &gate_mat[..is * n],
-                        &mut ffn_out,
-                        n,
-                        &mut state.scratch.lora_tmp,
-                    );
-                }
-                true
-            } else {
-                false
-            };
-
-            // Fallback: per-token GEMV. Used on x86_64-no-blas (no batched
-            // path compiled), and on any target where the FFN weights
-            // weren't all batchable (`used_gemm = false`).
-            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
-            let need_fallback = !used_gemm;
-            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas")))]
-            let need_fallback = true;
-            if need_fallback {
-                ffn_out.fill(0.0);
-                for j in 0..n {
-                    for i in 0..hs {
-                        col[i] = ffn_input[i * n + j];
-                    }
-
-                    #[cfg(target_arch = "aarch64")]
+                    // Gate + Up via batched GEMM
+                    #[cfg(feature = "blas")]
                     {
-                        Self::quantize_to_scratch(&col, state);
-                        self.gemv_preq(
-                            &refs.ffn_gate,
-                            &col,
-                            &state.scratch.q8_scales,
-                            &state.scratch.q8_quants,
-                            &mut gate_col,
+                        transformer::try_blas_prefill_gemm(
+                            &self.gguf,
+                            &dense.gate,
+                            &ffn_input,
+                            &mut gate_mat,
+                            is,
+                            n,
+                            hs,
+                            &mut state.scratch.dequant_weight_scratch,
                         );
-                        self.gemv_preq(
-                            &refs.ffn_up,
-                            &col,
-                            &state.scratch.q8_scales,
-                            &state.scratch.q8_quants,
-                            &mut up_col,
+                        transformer::try_blas_prefill_gemm(
+                            &self.gguf,
+                            &dense.up,
+                            &ffn_input,
+                            &mut up_mat,
+                            is,
+                            n,
+                            hs,
+                            &mut state.scratch.dequant_weight_scratch,
                         );
                     }
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(not(feature = "blas"))]
                     {
-                        self.gemv(&refs.ffn_gate, &col, &mut gate_col);
-                        self.gemv(&refs.ffn_up, &col, &mut up_col);
+                        transformer::gemm_preq(
+                            &self.gguf,
+                            &dense.gate,
+                            &bq_scales,
+                            &bq_quants,
+                            &mut gate_mat,
+                            is,
+                            n,
+                            hs,
+                        );
+                        transformer::gemm_preq(
+                            &self.gguf,
+                            &dense.up,
+                            &bq_scales,
+                            &bq_quants,
+                            &mut up_mat,
+                            is,
+                            n,
+                            hs,
+                        );
                     }
 
-                    // LoRA on gate/up (per-token decode hook) — this fallback loop
-                    // doesn't route through `forward_ffn_block`, so apply it here.
+                    // LoRA on gate/up — BEFORE the SiLU+mul, input is the normed FFN
+                    // input `[hs×n]`.
                     if let Some(lora) = &lora {
                         if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
-                            crate::lora::apply_decode(
+                            crate::lora::apply_prefill(
                                 t,
-                                &col,
-                                &mut gate_col,
+                                &ffn_input,
+                                &mut gate_mat[..is * n],
+                                n,
                                 &mut state.scratch.lora_tmp,
                             );
                         }
                         if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
-                            crate::lora::apply_decode(
+                            crate::lora::apply_prefill(
                                 t,
-                                &col,
-                                &mut up_col,
+                                &ffn_input,
+                                &mut up_mat[..is * n],
+                                n,
                                 &mut state.scratch.lora_tmp,
                             );
                         }
                     }
 
-                    cpu::silu_mul_inplace(&mut gate_col, &up_col);
+                    // Fused SiLU+mul (row-major is×n)
+                    cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
 
-                    #[cfg(target_arch = "aarch64")]
+                    // Re-quantize gate_mat columns for down projection — only needed for NEON fallback.
+                    #[cfg(not(feature = "blas"))]
+                    transformer::quantize_columns(
+                        &gate_mat,
+                        is,
+                        n,
+                        &mut inter_col,
+                        &mut dq_scales,
+                        &mut dq_quants,
+                    );
+
+                    // Down via batched GEMM
+                    #[cfg(feature = "blas")]
                     {
-                        Self::quantize_to_scratch(&gate_col, state);
-                        self.gemv_preq(
-                            &refs.ffn_down,
-                            &gate_col,
-                            &state.scratch.q8_scales,
-                            &state.scratch.q8_quants,
-                            &mut out_col,
+                        transformer::try_blas_prefill_gemm(
+                            &self.gguf,
+                            &dense.down,
+                            &gate_mat,
+                            &mut ffn_out,
+                            hs,
+                            n,
+                            is,
+                            &mut state.scratch.dequant_weight_scratch,
                         );
                     }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    self.gemv(&refs.ffn_down, &gate_col, &mut out_col);
+                    #[cfg(not(feature = "blas"))]
+                    transformer::gemm_preq(
+                        &self.gguf,
+                        &dense.down,
+                        &dq_scales,
+                        &dq_quants,
+                        &mut ffn_out,
+                        hs,
+                        n,
+                        is,
+                    );
 
-                    // LoRA on the down projection (per-token decode hook) — input is
-                    // the SiLU⊙up product in `gate_col`.
+                    // LoRA on the down projection — applied to `ffn_out` BEFORE the
+                    // residual add; input is the SiLU⊙up product in `gate_mat` `[is×n]`.
                     if let Some(lora) = &lora
                         && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnDown)
                     {
-                        crate::lora::apply_decode(
+                        crate::lora::apply_prefill(
                             t,
-                            &gate_col,
-                            &mut out_col,
+                            &gate_mat[..is * n],
+                            &mut ffn_out,
+                            n,
                             &mut state.scratch.lora_tmp,
                         );
                     }
+                    true
+                } else {
+                    false
+                };
 
-                    for i in 0..hs {
-                        ffn_out[i * n + j] = out_col[i];
+                // Fallback: per-token GEMV. Used on x86_64-no-blas (no batched
+                // path compiled), and on any target where the FFN weights
+                // weren't all batchable (`used_gemm = false`).
+                #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+                let need_fallback = !used_gemm;
+                #[cfg(not(any(
+                    target_arch = "aarch64",
+                    target_arch = "x86_64",
+                    feature = "blas"
+                )))]
+                let need_fallback = true;
+                if need_fallback {
+                    ffn_out.fill(0.0);
+                    for j in 0..n {
+                        for i in 0..hs {
+                            col[i] = ffn_input[i * n + j];
+                        }
+
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            Self::quantize_to_scratch(&col, state);
+                            self.gemv_preq(
+                                &dense.gate,
+                                &col,
+                                &state.scratch.q8_scales,
+                                &state.scratch.q8_quants,
+                                &mut gate_col,
+                            );
+                            self.gemv_preq(
+                                &dense.up,
+                                &col,
+                                &state.scratch.q8_scales,
+                                &state.scratch.q8_quants,
+                                &mut up_col,
+                            );
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        {
+                            self.gemv(&dense.gate, &col, &mut gate_col);
+                            self.gemv(&dense.up, &col, &mut up_col);
+                        }
+
+                        // LoRA on gate/up (per-token decode hook) — this fallback loop
+                        // doesn't route through `forward_ffn_block`, so apply it here.
+                        if let Some(lora) = &lora {
+                            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
+                                crate::lora::apply_decode(
+                                    t,
+                                    &col,
+                                    &mut gate_col,
+                                    &mut state.scratch.lora_tmp,
+                                );
+                            }
+                            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
+                                crate::lora::apply_decode(
+                                    t,
+                                    &col,
+                                    &mut up_col,
+                                    &mut state.scratch.lora_tmp,
+                                );
+                            }
+                        }
+
+                        cpu::silu_mul_inplace(&mut gate_col, &up_col);
+
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            Self::quantize_to_scratch(&gate_col, state);
+                            self.gemv_preq(
+                                &dense.down,
+                                &gate_col,
+                                &state.scratch.q8_scales,
+                                &state.scratch.q8_quants,
+                                &mut out_col,
+                            );
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        self.gemv(&dense.down, &gate_col, &mut out_col);
+
+                        // LoRA on the down projection (per-token decode hook) — input is
+                        // the SiLU⊙up product in `gate_col`.
+                        if let Some(lora) = &lora
+                            && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnDown)
+                        {
+                            crate::lora::apply_decode(
+                                t,
+                                &gate_col,
+                                &mut out_col,
+                                &mut state.scratch.lora_tmp,
+                            );
+                        }
+
+                        for i in 0..hs {
+                            ffn_out[i * n + j] = out_col[i];
+                        }
                     }
                 }
             }
@@ -2528,6 +3102,13 @@ impl Lfm2Model {
 
 impl Model for Lfm2Model {
     fn supports_hidden_states(&self) -> bool {
+        true
+    }
+
+    /// The CPU path is the one backend with routed-FFN LoRA hooks: the router
+    /// delta feeds `select_experts` and the per-expert factors are applied to
+    /// the selected expert's projections, both pinned by `moe_lora_parity`.
+    fn supports_moe_lora(&self) -> bool {
         true
     }
 
@@ -2959,14 +3540,20 @@ impl crate::model::gpu_weight_source::GpuWeightSource for Lfm2Model {
     fn output_ref(&self) -> Option<&WeightRef> {
         None
     }
-    fn ffn_gate_ref(&self, layer: usize) -> &WeightRef {
-        &self.layer_refs[layer].ffn_gate
+    fn ffn_gate_ref(&self, layer: usize) -> Result<&WeightRef> {
+        Ok(&self.layer_refs[layer].ffn.dense()?.gate)
     }
-    fn ffn_up_ref(&self, layer: usize) -> &WeightRef {
-        &self.layer_refs[layer].ffn_up
+    fn ffn_up_ref(&self, layer: usize) -> Result<&WeightRef> {
+        Ok(&self.layer_refs[layer].ffn.dense()?.up)
     }
-    fn ffn_down_ref(&self, layer: usize) -> &WeightRef {
-        &self.layer_refs[layer].ffn_down
+    fn ffn_down_ref(&self, layer: usize) -> Result<&WeightRef> {
+        Ok(&self.layer_refs[layer].ffn.dense()?.down)
+    }
+    fn moe_refs(&self, layer: usize) -> Option<&MoeFfnRefs> {
+        match &self.layer_refs[layer].ffn {
+            FfnRefs::Dense(_) => None,
+            FfnRefs::Moe(m) => Some(m),
+        }
     }
     fn conv_in_proj_ref(&self, layer: usize) -> Option<&WeightRef> {
         self.layer_refs[layer].shortconv_in_proj.as_ref()
@@ -3025,5 +3612,109 @@ mod conv_kernel_size_tests {
                 "unexpected error for k={k}: {err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod moe_routing_tests {
+    use super::select_experts;
+
+    /// The bias steers *selection*; the weights come from the unbiased
+    /// probabilities. Both halves are asserted, because getting only the first
+    /// half right is the failure mode that still produces fluent text.
+    #[test]
+    fn bias_ranks_experts_but_does_not_weight_them() {
+        // Expert 1 has the lower probability but a large enough bias to be
+        // ranked first; expert 0 wins on raw probability.
+        let probs = [0.40, 0.30, 0.05, 0.01];
+        let biases = [0.00, 0.50, 0.00, 0.00];
+        let mut selected = Vec::new();
+        select_experts(&probs, &biases, 2, &mut selected);
+
+        let picked: Vec<usize> = selected.iter().map(|&(e, _)| e).collect();
+        assert_eq!(picked, vec![1, 0], "bias must decide the ranking");
+
+        // Weights are the unbiased probs renormalized: 0.30/0.70, 0.40/0.70.
+        // Note they *ascend*; a biased-weight implementation would emit
+        // descending values and pass a "weights are sorted" check.
+        let weights: Vec<f32> = selected.iter().map(|&(_, w)| w).collect();
+        assert!((weights[0] - 0.30 / 0.70).abs() < 1e-6, "got {weights:?}");
+        assert!((weights[1] - 0.40 / 0.70).abs() < 1e-6, "got {weights:?}");
+        assert!(
+            weights[0] < weights[1],
+            "unbiased weights must not be forced into descending order: {weights:?}"
+        );
+    }
+
+    /// Regression against real llama.cpp output: `ffn_moe_topk-2` /
+    /// `ffn_moe_weights_norm-2` for token 3 of "The capital of France is"
+    /// (BOS-prefixed) on LFM2.5-8B-A1B-Q4_0. This token is the useful one
+    /// precisely because its normalized weights are non-monotonic
+    /// (0.3474 < 0.3556), which only happens when ranking and weighting use
+    /// different scores.
+    #[test]
+    fn matches_llama_cpp_non_monotonic_token() {
+        // Reconstructed from the reference dump: expert 21 ranks first on
+        // biased score despite expert 17 having the higher raw probability.
+        let mut probs = [0.0f32; 32];
+        let mut biases = [0.0f32; 32];
+        probs[21] = 0.3474;
+        probs[17] = 0.3556;
+        probs[6] = 0.1866;
+        probs[12] = 0.1103;
+        biases[21] = 0.10;
+
+        let mut selected = Vec::new();
+        select_experts(&probs, &biases, 4, &mut selected);
+
+        assert_eq!(
+            selected.iter().map(|&(e, _)| e).collect::<Vec<_>>(),
+            vec![21, 17, 6, 12]
+        );
+        let weights: Vec<f32> = selected.iter().map(|&(_, w)| w).collect();
+        // The reference weights already sum to 1, so renormalizing is a no-op
+        // and they should come back unchanged.
+        for (got, want) in weights.iter().zip([0.3474, 0.3556, 0.1866, 0.1103]) {
+            assert!((got - want).abs() < 1e-3, "got {weights:?}");
+        }
+    }
+
+    /// Ties resolve to the lower expert index, matching `ggml_argsort_top_k`.
+    /// Without the reversed index tiebreak `max_by` keeps the last maximum and
+    /// silently picks the higher index.
+    #[test]
+    fn ties_break_toward_the_lower_index() {
+        let probs = [0.25, 0.25, 0.25, 0.25];
+        let biases = [0.0; 4];
+        let mut selected = Vec::new();
+        select_experts(&probs, &biases, 2, &mut selected);
+        assert_eq!(
+            selected.iter().map(|&(e, _)| e).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    /// An all-zero gate must not divide by zero. llama.cpp clamps the divisor
+    /// to f16's smallest positive normal; the weights stay finite.
+    #[test]
+    fn zero_gate_does_not_divide_by_zero() {
+        let probs = [0.0f32; 4];
+        let biases = [0.0f32; 4];
+        let mut selected = Vec::new();
+        select_experts(&probs, &biases, 2, &mut selected);
+        assert!(selected.iter().all(|&(_, w)| w.is_finite()), "{selected:?}");
+    }
+
+    /// Asking for more experts than exist must stop at the expert count rather
+    /// than spin or emit duplicates.
+    #[test]
+    fn n_used_saturates_at_the_expert_count() {
+        let probs = [0.5, 0.3];
+        let biases = [0.0, 0.0];
+        let mut selected = Vec::new();
+        select_experts(&probs, &biases, 8, &mut selected);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].0, 0);
+        assert_eq!(selected[1].0, 1);
     }
 }

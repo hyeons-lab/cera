@@ -15,11 +15,36 @@
 //! [`dense_model_or_skip`] resolves the dense GGUF the speculative-decoding
 //! suite and LM-head benchmark share, and [`dense_gemm_head_fixture`] loads it
 //! while asserting it actually reaches the batched LM-head projection.
+//!
+//! [`hidden_states_with_lora`] runs a prompt with an optional adapter attached,
+//! shared by the two LoRA suites (`lora_parity`, `moe_lora_parity`).
+//!
+//! [`write_lora_gguf`] serializes an adapter fixture, shared by
+//! `moe_lora_parity`, `metal_moe_oracle` and `wgpu_moe_oracle`.
 
 #![allow(dead_code)]
 
 #[cfg(feature = "remote")]
 pub mod download;
+
+/// Per-token hidden states for `tokens`, with an optional LoRA adapter attached
+/// to the inference state.
+///
+/// Defined here rather than per test binary for the reason `metal_context`
+/// gives: a copy per module is how the copies drift. Both LoRA suites
+/// (`lora_parity`, `moe_lora_parity`) compare a base run against an adapted
+/// one, and the comparison is only meaningful if both arms are built the same
+/// way.
+pub fn hidden_states_with_lora(
+    model: &dyn cera::model::Model,
+    tokens: &[u32],
+    lora: Option<std::sync::Arc<cera::lora::LoraAdapterWeights>>,
+) -> Vec<f32> {
+    let mut state =
+        cera::kv_cache::InferenceState::for_prefill(model.config(), tokens.len()).unwrap();
+    state.lora = lora;
+    model.hidden_states(tokens, &mut state)
+}
 
 /// Acquire a Metal device, or skip the calling test.
 ///
@@ -266,4 +291,47 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
             Err(p) => p.into_inner().push(msg),
         }
     }
+}
+
+/// Append a GGUF length-prefixed string.
+fn push_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Serialize a minimal GGUF v3 adapter of F32 tensors. Each entry is
+/// `(name, ne, data)` with `ne` fastest-varying first, GGUF's own order.
+///
+/// Shared rather than per-suite: `moe_lora_parity` builds stacked expert
+/// adapters with it, and both GPU oracles build two apiece, a router-only
+/// adapter and a router-plus-`attn_output` one. Two copies of a byte-layout
+/// writer is how those suites end up disagreeing about the format they are all
+/// asserting against.
+pub fn write_lora_gguf(tensors: &[(String, Vec<usize>, Vec<f32>)], alpha: f32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"GGUF");
+    out.extend_from_slice(&3u32.to_le_bytes());
+    out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    out.extend_from_slice(&1u64.to_le_bytes());
+    push_str(&mut out, "adapter.lora.alpha");
+    out.extend_from_slice(&6u32.to_le_bytes()); // GGUF_TYPE_FLOAT32
+    out.extend_from_slice(&alpha.to_le_bytes());
+
+    let mut offset = 0u64;
+    for (name, ne, data) in tensors {
+        push_str(&mut out, name);
+        out.extend_from_slice(&(ne.len() as u32).to_le_bytes());
+        ne.iter()
+            .for_each(|&d| out.extend_from_slice(&(d as u64).to_le_bytes()));
+        out.extend_from_slice(&0u32.to_le_bytes()); // GGML_TYPE_F32
+        out.extend_from_slice(&offset.to_le_bytes());
+        offset += (data.len() * 4) as u64;
+    }
+    while !out.len().is_multiple_of(32) {
+        out.push(0);
+    }
+    for (_, _, data) in tensors {
+        out.extend(data.iter().flat_map(|x| x.to_le_bytes()));
+    }
+    out
 }

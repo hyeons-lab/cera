@@ -582,6 +582,7 @@ fn host_config(head_dim: usize) -> ModelConfig {
         conv_kernel_size: Some(3),
         kv_heads_per_layer: vec![N_KV_HEADS; n_layers],
         scalars: ScalarMultipliers::default(),
+        moe: None,
     }
 }
 
