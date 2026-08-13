@@ -1003,7 +1003,6 @@ fn moe_gemv_params(n_entries: usize, x_by_entry: bool) -> [u32; 8] {
         0,
         0,
     ]
->>>>>>> 13e2a0f (feat(lfm2moe): run the routed FFN on the Metal and wgpu backends)
 }
 
 #[cfg(feature = "gpu")]
@@ -2304,7 +2303,6 @@ mod wgsl {
             }
         }
     }
->>>>>>> 13e2a0f (feat(lfm2moe): run the routed FFN on the Metal and wgpu backends)
 }
 
 // Declared at the root, as every other suite does, so the gate is the shared
@@ -3380,7 +3378,13 @@ mod msl {
     /// fall-through is correct but slow and invisible to the numeric test.
     #[test]
     fn generated_rmsnorm_keeps_simd_sum() {
-           fn run_exp_polar(ctx: &MetalContext, spectrum: &[f32], n_frames: u32, bins: u32) -> Vec<f32> {
+        assert!(
+            shaders::RMSNORM.contains("simd_sum"),
+            "generated MSL lost simd_sum; __target_switch selected the portable tree"
+        );
+    }
+
+    fn run_exp_polar(ctx: &MetalContext, spectrum: &[f32], n_frames: u32, bins: u32) -> Vec<f32> {
         let pipeline = ctx
             .create_pipeline(shaders::EXP_POLAR, "exp_polar")
             .expect("compile generated MSL");
@@ -3720,12 +3724,6 @@ mod msl {
                 );
             }
         }
-    }       &want,
-                    1e-5,
-                );
-            }
-        }
->>>>>>> 13e2a0f (feat(lfm2moe): run the routed FFN on the Metal and wgpu backends)
     }
 }
 

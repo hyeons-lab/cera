@@ -595,7 +595,6 @@ pub struct LayerNormBatchParams {
 const _: () = assert!(size_of::<LayerNormBatchParams>() == 16);
 impl MetalParams for LayerNormBatchParams {}
 
-<<<<<<< HEAD
 // ── LFM2A audio encoder (Conformer) ───────────────────────────────────────────────
 
 /// Mirror of the params buffer in `shaders/slang/conv2d_direct.slang`: four

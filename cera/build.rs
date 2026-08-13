@@ -139,7 +139,6 @@ const SLANG_MULTI_KERNELS: &[&str] = &[
     "conv1d",
     "conv1d_fused",
     "conv1d_fused_batch",
-<<<<<<< HEAD
     "exp_polar",
     "overlap_add",
     "activations",
