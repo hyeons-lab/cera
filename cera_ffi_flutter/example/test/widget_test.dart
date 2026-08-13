@@ -15,7 +15,10 @@ void main() {
     await tester.pumpWidget(const CeraExampleApp());
 
     expect(find.text('Cera'), findsOneWidget);
-    expect(find.text('Open a .gguf model to start.'), findsOneWidget);
+    expect(
+      find.text('Download a published model, or open a .gguf, to start.'),
+      findsOneWidget,
+    );
   });
 
   // The benchmark page is reachable only through the app-bar icon, so a broken
