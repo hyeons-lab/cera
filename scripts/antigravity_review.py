@@ -94,7 +94,7 @@ def get_repo_guidelines() -> str:
 
 def call_gemini_api(api_key: str, prompt: str) -> str:
     model = "gemini-3.7-flash"
-    thinking_budget = int(os.getenv("ANTIGRAVITY_THINKING_BUDGET", "4096"))
+    thinking_budget = int(os.getenv("ANTIGRAVITY_THINKING_BUDGET", "8192"))
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     payload = {
         "contents": [
@@ -103,8 +103,8 @@ def call_gemini_api(api_key: str, prompt: str) -> str:
             }
         ],
         "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 8192,
+            "temperature": 0.1,
+            "maxOutputTokens": 16384,
             "thinkingConfig": {
                 "thinkingBudget": thinking_budget,
             },
@@ -119,7 +119,7 @@ def call_gemini_api(api_key: str, prompt: str) -> str:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=180) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             candidates = data.get("candidates", [])
             if candidates:
@@ -168,7 +168,7 @@ def post_or_update_comment(
 
     meta_header = (
         f"> *Reviewed commit {commit_link} • {timestamp_utc} • "
-        f"Powered by Gemini 3.7 Flash with Deep Thinking*"
+        f"Deep Reasoning Audit (Gemini 3.7 Flash)*"
     )
     full_body = f"{COMMENT_TAG}\n## 🪐 Antigravity Code Review\n{meta_header}\n\n{body_clean}"
     headers = {
@@ -247,37 +247,76 @@ def main():
 
     guidelines = get_repo_guidelines()
 
-    prompt = f"""You are Antigravity, an expert AI code reviewer evaluating a pull request for the Cera repository.
-Cera is a lightweight inference engine and library for LLM / SLM (written in Rust with FFI bindings for Swift, Kotlin, Dart/Flutter, and WebAssembly).
+    prompt = f"""You are Antigravity, a Senior Principal Systems & Multiplatform Architect conducting a thorough, rigorous, production-grade code review for the Cera repository.
 
-Repository Guidelines & Conventions:
+About Cera:
+Cera is a high-performance, lightweight LLM / SLM inference engine written in Rust with bindings for Swift, Kotlin, Dart/Flutter, and WebAssembly / WebGPU.
+
+Repository Guidelines & Rules:
 {guidelines}
 
 Pull Request Context:
-Title: {pr_title}
-Description: {pr_body}
+- Title: {pr_title}
+- Description: {pr_body}
 
 Diff to review:
 ```diff
 {diff}
 ```
 
-Review Instructions:
-1. Provide a concise, high-level summary of what this PR does.
-2. Review the code changes for:
-   - Correctness, concurrency/lifetime safety, resource leaks (e.g. KV cache, model weights, subscriptions).
-   - Invariants and edge case handling (e.g. error propagation, bounds, null checks).
-   - Performance and unnecessary allocations in hot paths.
-   - Adherence to project conventions (clean API surfaces, backward/forward compatibility, proper derives and error types).
-3. Clearly organize findings by severity:
-   - 🚨 **Critical / Blocking**: Serious bugs, memory/concurrency violations, breaking API regressions.
-   - ⚠️ **Warnings / Suggestions**: Edge case risks, performance improvements, cleaner idioms.
-   - ✅ **Highlights**: Well-designed aspects of the change.
-4. If everything looks clean, state that explicitly.
-5. Be actionable, concise, and constructive.
+Review Objective & Standard:
+Provide a rigorous, deep-dive code review that matches or exceeds the depth, precision, and actionable quality of top-tier reviewers (such as Copilot / Junie / human staff engineers). Do NOT write superficial or generic summaries. Every finding must be specific, backed by exact file paths, line references or code snippets, and include a concrete fix proposal.
+
+Audit Checklist:
+1. **Architectural & Cross-Platform Integrity**:
+   - Clean abstractions, minimal coupling, proper module boundaries.
+   - Cross-platform differences (macOS vs iOS vs Android vs Web / WASM, desktop vs mobile).
+   - Compatibility across Flutter versions, Swift / Kotlin FFI patterns, and memory models.
+2. **Concurrency, Cancellation & Asynchronous Correctness**:
+   - Atomic variables, ordering semantics, race conditions on shared state.
+   - Cancellation flag handling: pre-armed cancels, in-flight preemption, reset semantics across calls.
+   - Stream subscriptions, Completers, async/await suspension leaks or race conditions.
+3. **Memory, KV Cache & Resource Management**:
+   - Model weights lifecycle, KV cache allocations, unclosed sessions or engines.
+   - Buffer clones vs borrows, zero-copy safety, web worker neutering vs double-buffering.
+   - Dispose patterns in UI frameworks and RAII cleanup in Rust.
+4. **Correctness, Edge Cases & Error Domains**:
+   - Out-of-bounds access, division by zero, empty collections, nil/null propagation.
+   - Graceful error propagation instead of silent failure or unhandled exceptions/panics.
+   - Fallback behaviors (e.g. offline cache miss, missing preferences).
+5. **Performance & Hot Paths**:
+   - Unnecessary heap allocations, redundant sorting in tight loops, string formatting in generation hot paths.
+   - Bilinear interpolation, token decoding throughput, and memory layout.
+6. **Test Coverage & Regression Prevention**:
+   - Missing unit tests for new code paths, unverified edge cases, untested failure branches.
+
+Output Structure:
+### 1. Executive Summary & Impact Analysis
+- Concise technical synthesis of what the PR changes, architectural implications, and readiness for merge.
+
+### 2. 🚨 Critical / Blocking Issues
+*(If none, explicitly state "None identified.")*
+- Severe bugs, memory/concurrency violations, unhandled panics/exceptions, or breaking regressions.
+- Include exact `file_path:line_number`, explanation of the hazard, and a concrete before/after code diff fix.
+
+### 3. ⚠️ Warnings & Correctness Risks
+- Edge cases, error handling gaps, resource leaks, cross-platform caveats, or subtle logical flaws.
+- Include exact `file_path:line_number`, explanation, and actionable code diff recommendations.
+
+### 4. 💡 Suggestions & Optimization Opportunities
+- Non-blocking improvements: cleaner idioms, performance optimizations in hot paths, documentation comments, or refactoring opportunities.
+- Include exact `file_path:line_number` and concise code proposals.
+
+### 5. 🧪 Test Coverage & Edge Cases to Consider
+- Specific scenarios or test cases that should be verified (e.g. cancellation during prefill, network failure during stream, zero-sized inputs).
+
+### 6. 🌟 Architecture Highlights
+- Acknowledge well-crafted patterns, elegant abstractions, and robust implementations in the PR.
+
+Be direct, highly technical, actionable, and precise.
 """
 
-    print("Generating code review with Gemini / Antigravity...")
+    print("Generating thorough deep-reasoning code review with Gemini 3.7 Flash...")
     review = call_gemini_api(api_key, prompt)
     if not review:
         print("Failed to get review from API.", file=sys.stderr)
@@ -288,5 +327,4 @@ Review Instructions:
 
 
 if __name__ == "__main__":
-    main()
     main()
