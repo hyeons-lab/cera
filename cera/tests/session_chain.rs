@@ -1681,7 +1681,11 @@ fn generate_honors_pre_armed_cancel() {
     assert_eq!(summary.tokens_generated, 0);
     assert!(sink.0.is_empty());
     // Cancel flag was consumed by the cancelled generate
-    assert!(!session.cancel_handle().load(std::sync::atomic::Ordering::Relaxed));
+    assert!(
+        !session
+            .cancel_handle()
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     // Next generate after appending should work without being cancelled
     session.append_tokens(&prompt_toks).unwrap();
