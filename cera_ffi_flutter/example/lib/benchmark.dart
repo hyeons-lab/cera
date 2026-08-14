@@ -520,7 +520,7 @@ class _ResultCard extends StatelessWidget {
                   borderRadius: BorderRadius.circular(6),
                   border: Border.all(
                     color: isGpu
-                        ? const Color(0xFF3B82F6).withValues(alpha: 0.5)
+                        ? const Color(0x803B82F6)
                         : const Color(0xFF475569),
                   ),
                 ),
@@ -639,9 +639,7 @@ class _Speedup extends StatelessWidget {
         color: isFaster ? const Color(0xFF06281E) : const Color(0xFF14161B),
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
-          color: isFaster
-              ? const Color(0xFF10B981).withValues(alpha: 0.4)
-              : const Color(0xFF232732),
+          color: isFaster ? const Color(0x6610B981) : const Color(0xFF232732),
           width: 1,
         ),
       ),

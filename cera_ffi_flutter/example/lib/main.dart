@@ -1076,9 +1076,12 @@ class _TypingIndicatorState extends State<_TypingIndicator>
                     width: 6.5,
                     height: 6.5,
                     decoration: BoxDecoration(
-                      color: const Color(
-                        0xFF38BDF8,
-                      ).withValues(alpha: opacity.clamp(0.2, 1.0)),
+                      color: Color.fromRGBO(
+                        56,
+                        189,
+                        248,
+                        opacity.clamp(0.2, 1.0),
+                      ),
                       shape: BoxShape.circle,
                     ),
                     transform: Matrix4.diagonal3Values(scale, scale, 1.0),
