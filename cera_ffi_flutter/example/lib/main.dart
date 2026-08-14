@@ -29,6 +29,7 @@ import 'package:flutter/foundation.dart'
     show defaultTargetPlatform, kIsWeb, TargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'benchmark.dart';
 import 'model_source.dart';
@@ -240,6 +241,53 @@ class _ChatPageState extends State<ChatPage> {
   bool get _busy => _loading || _generation != null;
 
   @override
+  void initState() {
+    super.initState();
+    _restoreLastModel();
+  }
+
+  /// Restores the previously loaded bundle model when the page reloads.
+  Future<void> _restoreLastModel() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final bundleName = prefs.getString('cera_last_bundle_name');
+      final quant = prefs.getString('cera_last_bundle_quant');
+      if (bundleName != null && quant != null && mounted) {
+        final displayName = bundleName.endsWith('-GGUF')
+            ? bundleName.substring(0, bundleName.length - '-GGUF'.length)
+            : bundleName;
+        final label = '$displayName · $quant';
+        final bundleSource = BundleModelSource(
+          name: label,
+          bundleName: bundleName,
+          quant: quant,
+          getStoreDir: _storeDir,
+        );
+        await _load(
+          bundleSource,
+          () async => Cera.openBundle(
+            bundleName,
+            quant,
+            storeDir: await _storeDir(),
+            onProgress: (progress) {
+              if (!mounted) return;
+              setState(() {
+                _downloadFraction = progress.fraction;
+                final pct = progress.fraction == null
+                    ? '${(progress.bytesDownloaded / 1024 / 1024).toStringAsFixed(0)} MB'
+                    : '${(progress.fraction! * 100).toStringAsFixed(0)}%';
+                _status = 'Downloading $label · $pct';
+              });
+            },
+          ),
+        );
+      }
+    } catch (err) {
+      debugPrint('cera: could not restore last model: $err');
+    }
+  }
+
+  @override
   void dispose() {
     unawaited(_generation?.cancel());
     // Cancelling a subscription suppresses `onDone`, so without this the
@@ -307,6 +355,14 @@ class _ChatPageState extends State<ChatPage> {
         _loadedModel = model;
         _status = '${model.name} · ${cera.backend}$visionTag';
       });
+
+      if (model is BundleModelSource) {
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString('cera_last_bundle_name', model.bundleName);
+          await prefs.setString('cera_last_bundle_quant', model.quant);
+        } catch (_) {}
+      }
     } catch (err, stack) {
       // Log as well as display: the status line truncates, and the full message
       // is the only thing that says which step failed.
@@ -363,9 +419,20 @@ class _ChatPageState extends State<ChatPage> {
 
   /// Offers the published catalog, then downloads and opens what was chosen.
   Future<void> _pickBundle() async {
+    String? currentBundleName;
+    String? currentQuant;
+    final loaded = _loadedModel;
+    if (loaded is BundleModelSource) {
+      currentBundleName = loaded.bundleName;
+      currentQuant = loaded.quant;
+    }
+
     final choice = await showDialog<_BundleChoice>(
       context: context,
-      builder: (_) => const _BundlePickerDialog(),
+      builder: (_) => _BundlePickerDialog(
+        currentBundleName: currentBundleName,
+        currentQuant: currentQuant,
+      ),
     );
     if (choice == null || !mounted) return;
 
@@ -903,7 +970,10 @@ class _BundleChoice {
 
 /// Lists the published bundles and pops with the chosen `<name>, <quant>`.
 class _BundlePickerDialog extends StatefulWidget {
-  const _BundlePickerDialog();
+  const _BundlePickerDialog({this.currentBundleName, this.currentQuant});
+
+  final String? currentBundleName;
+  final String? currentQuant;
 
   @override
   State<_BundlePickerDialog> createState() => _BundlePickerDialogState();
@@ -966,6 +1036,7 @@ class _BundlePickerDialogState extends State<_BundlePickerDialog> {
                   const Divider(color: Color(0xFF1E222D), height: 1),
               itemBuilder: (context, i) {
                 final bundle = bundles[i];
+                final isCurrentBundle = bundle.name == widget.currentBundleName;
                 final quants = bundle.quants.toList()
                   ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
                 final n = quants.length;
@@ -974,9 +1045,47 @@ class _BundlePickerDialogState extends State<_BundlePickerDialog> {
                   // ListView recycling, so expanding a tile and scrolling away
                   // collapses it: only about six of the ~29 entries fit.
                   key: PageStorageKey(bundle.name),
-                  title: Text(
-                    bundle.displayName,
-                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  initiallyExpanded: isCurrentBundle,
+                  title: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          bundle.displayName,
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                      if (isCurrentBundle)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 7,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF0E3E2F),
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(color: const Color(0x6610B981)),
+                          ),
+                          child: const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.check_circle_rounded,
+                                size: 12,
+                                color: Color(0xFF34D399),
+                              ),
+                              SizedBox(width: 4),
+                              Text(
+                                'Active',
+                                style: TextStyle(
+                                  color: Color(0xFF34D399),
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
                   ),
                   subtitle: Text(
                     '$n quantization${n == 1 ? "" : "s"}',
@@ -987,20 +1096,68 @@ class _BundlePickerDialogState extends State<_BundlePickerDialog> {
                   ),
                   children: [
                     for (final quant in quants)
-                      ListTile(
-                        dense: true,
-                        title: Text(
-                          quant,
-                          style: const TextStyle(fontFamily: 'monospace'),
-                        ),
-                        trailing: const Icon(
-                          Icons.download_rounded,
-                          size: 18,
-                          color: Color(0xFF94A3B8),
-                        ),
-                        onTap: () => Navigator.of(
-                          context,
-                        ).pop(_BundleChoice(bundle, quant)),
+                      Builder(
+                        builder: (context) {
+                          final isLoadedQuant =
+                              isCurrentBundle && quant == widget.currentQuant;
+                          return Container(
+                            color: isLoadedQuant
+                                ? const Color(0xFF162338)
+                                : null,
+                            child: ListTile(
+                              dense: true,
+                              title: Row(
+                                children: [
+                                  Text(
+                                    quant,
+                                    style: TextStyle(
+                                      fontFamily: 'monospace',
+                                      fontWeight: isLoadedQuant
+                                          ? FontWeight.w700
+                                          : FontWeight.normal,
+                                      color: isLoadedQuant
+                                          ? const Color(0xFF93C5FD)
+                                          : null,
+                                    ),
+                                  ),
+                                  if (isLoadedQuant) ...[
+                                    const SizedBox(width: 8),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 6,
+                                        vertical: 1,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFF1E3A5F),
+                                        borderRadius: BorderRadius.circular(4),
+                                      ),
+                                      child: const Text(
+                                        'Loaded',
+                                        style: TextStyle(
+                                          color: Color(0xFF60A5FA),
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                              trailing: Icon(
+                                isLoadedQuant
+                                    ? Icons.check_rounded
+                                    : Icons.download_rounded,
+                                size: 18,
+                                color: isLoadedQuant
+                                    ? const Color(0xFF60A5FA)
+                                    : const Color(0xFF94A3B8),
+                              ),
+                              onTap: () => Navigator.of(
+                                context,
+                              ).pop(_BundleChoice(bundle, quant)),
+                            ),
+                          );
+                        },
                       ),
                   ],
                 );

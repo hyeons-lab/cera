@@ -9,8 +9,13 @@ import 'package:cera_ffi_flutter_example/main.dart';
 import 'package:cera_ffi_flutter_example/model_source.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+  });
+
   testWidgets('renders the empty state before a model is picked', (
     WidgetTester tester,
   ) async {
