@@ -358,7 +358,7 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
         title: const Text('CPU vs GPU'),
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(1),
-          child: Container(color: const Color(0xFF1E222D), height: 1),
+          child: Container(color: theme.dividerColor, height: 1),
         ),
       ),
       body: ListView(

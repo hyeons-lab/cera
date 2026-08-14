@@ -1753,10 +1753,19 @@ impl Session {
 
         let decode_start = Instant::now();
 
+        // RAII guard ensuring the cancel flag is cleared when this generation exits
+        // (whether on completion, cancellation, or error).
+        struct CancelGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CancelGuard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _cancel_guard = CancelGuard(Arc::clone(&self.cancel));
+
         // If a cancel was already armed before generate() started (e.g. preemption or timeout),
-        // honor it immediately without wiping the flag or performing unnecessary work.
+        // honor it immediately without performing unnecessary work.
         if self.cancel.load(Ordering::Relaxed) {
-            self.cancel.store(false, Ordering::Relaxed);
             sink.on_done(FinishReason::Cancelled);
             let decode_ms = duration_ms_u32(decode_start.elapsed());
             return Ok(GenerateSummary {
@@ -2111,9 +2120,6 @@ impl Session {
 
         sink.on_done(finish.clone());
 
-        // Cancel has been consumed by this generation; clear so subsequent operations start clean.
-        self.cancel.store(false, Ordering::Relaxed);
-
         let decode_ms = duration_ms_u32(decode_start.elapsed());
         Ok(GenerateSummary {
             tokens_generated: generated,
@@ -2329,9 +2335,6 @@ impl Session {
         }
 
         sink.on_done(finish.clone());
-
-        // Cancel has been consumed by this generation; clear so subsequent operations start clean.
-        self.cancel.store(false, Ordering::Relaxed);
 
         let decode_ms = duration_ms_u32(decode_start.elapsed());
         Ok(GenerateSummary {
