@@ -110,13 +110,6 @@ class _ChatPageState extends State<ChatPage> {
   /// Shared by the file picker and the bundle menu. They differ only in how
   /// they produce a [Cera], and having each carry its own copy of this is how
   /// the two quietly drift apart on which of these steps they remember.
-  /// Runs `open` as the app's one model-loading path, with the bookkeeping that
-  /// every loader needs: closing the previous model, the busy flag, the
-  /// dispose-during-load guard, and error reporting.
-  ///
-  /// Shared by the file picker and the bundle menu. They differ only in how
-  /// they produce a [Cera], and having each carry its own copy of this is how
-  /// the two quietly drift apart on which of these steps they remember.
   Future<void> _load(LoadedModel model, Future<Cera> Function() open) async {
     // Guarded here, not only on the buttons that call it. Both entry points
     // await a dialog first, and the file picker's is a browser-native dialog
