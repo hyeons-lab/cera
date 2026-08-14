@@ -160,11 +160,17 @@ def post_or_update_comment(
         "%Y-%m-%d %H:%M:%S UTC"
     )
 
+    body_clean = comment_body.strip()
+    if body_clean.startswith("## 🪐 Antigravity Code Review"):
+        body_clean = body_clean[len("## 🪐 Antigravity Code Review"):].strip()
+    elif body_clean.startswith("# Antigravity Code Review"):
+        body_clean = body_clean[len("# Antigravity Code Review"):].strip()
+
     meta_header = (
         f"> *Reviewed commit {commit_link} • {timestamp_utc} • "
         f"Powered by Gemini 3.7 Flash with Deep Thinking*"
     )
-    full_body = f"{COMMENT_TAG}\n## 🪐 Antigravity Code Review\n{meta_header}\n\n{comment_body}"
+    full_body = f"{COMMENT_TAG}\n## 🪐 Antigravity Code Review\n{meta_header}\n\n{body_clean}"
     headers = {
         "Authorization": f"token {github_token}",
         "Accept": "application/vnd.github.v3+json",
