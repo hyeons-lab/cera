@@ -42,19 +42,13 @@ const _sentinel = Object();
 /// unrecognized roles, but it's template-dependent rather than
 /// enforced by [`CeraEngine::apply_chat_template`].
 class ChatMessage {
-  const ChatMessage({
-    required this.role,
-    required this.content,
-  });
+  const ChatMessage({required this.role, required this.content});
 
   final String role;
   final String content;
 
   Map<String, dynamic> toJson() {
-    return {
-      'role': this.role,
-      'content': this.content,
-    };
+    return {'role': this.role, 'content': this.content};
   }
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
@@ -64,10 +58,7 @@ class ChatMessage {
     );
   }
 
-  ChatMessage copyWith({
-    String? role,
-    String? content,
-  }) {
+  ChatMessage copyWith({String? role, String? content}) {
     return ChatMessage(
       role: role ?? this.role,
       content: content ?? this.content,
@@ -98,6 +89,7 @@ class EngineConfig {
     /// capped by the loader).
     required this.contextSize,
     required this.backend,
+
     /// Bundle repository for resolving `http(s)://` URLs in manifests
     /// (or for [`CeraEngine::from_bundle_id`]). `None` means "remote
     /// URLs will fail with an error"; set this to a [`BundleRepo`]
@@ -113,6 +105,7 @@ class EngineConfig {
   /// capped by the loader).
   final int contextSize;
   final BackendPreference backend;
+
   /// Bundle repository for resolving `http(s)://` URLs in manifests
   /// (or for [`CeraEngine::from_bundle_id`]). `None` means "remote
   /// URLs will fail with an error"; set this to a [`BundleRepo`]
@@ -125,7 +118,13 @@ class EngineConfig {
     return {
       'contextSize': this.contextSize,
       'backend': BackendPreferenceFfiCodec.encode(this.backend),
-      'bundleRepo': this.bundleRepo == null ? null : (() { final __tmp = this.bundleRepo!; return BundleRepoFfiCodec.lower(__tmp); })(),
+      'bundleRepo':
+          this.bundleRepo == null
+              ? null
+              : (() {
+                final __tmp = this.bundleRepo!;
+                return BundleRepoFfiCodec.lower(__tmp);
+              })(),
     };
   }
 
@@ -133,7 +132,13 @@ class EngineConfig {
     return EngineConfig(
       contextSize: (json['contextSize'] as num).toInt(),
       backend: BackendPreferenceFfiCodec.decode(json['backend'] as String),
-      bundleRepo: json['bundleRepo'] == null ? null : (() { final __tmp = json['bundleRepo']; return BundleRepoFfiCodec.lift((__tmp as num).toInt()); })(),
+      bundleRepo:
+          json['bundleRepo'] == null
+              ? null
+              : (() {
+                final __tmp = json['bundleRepo'];
+                return BundleRepoFfiCodec.lift((__tmp as num).toInt());
+              })(),
     );
   }
 
@@ -145,7 +150,8 @@ class EngineConfig {
     return EngineConfig(
       contextSize: contextSize ?? this.contextSize,
       backend: backend ?? this.backend,
-      bundleRepo: bundleRepo == _sentinel ? this.bundleRepo : bundleRepo as BundleRepo?,
+      bundleRepo:
+          bundleRepo == _sentinel ? this.bundleRepo : bundleRepo as BundleRepo?,
     );
   }
 
@@ -157,7 +163,10 @@ class EngineConfig {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is EngineConfig && contextSize == other.contextSize && backend == other.backend && bundleRepo == other.bundleRepo;
+      other is EngineConfig &&
+          contextSize == other.contextSize &&
+          backend == other.backend &&
+          bundleRepo == other.bundleRepo;
 
   @override
   int get hashCode => Object.hash(contextSize, backend, bundleRepo);
@@ -176,31 +185,39 @@ class GenerateOpts {
     this.temperature = 0.7,
     this.topP = 0.9,
     this.topK = 40,
+
     /// Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
     /// disables it. Honored in the stochastic path.
     this.minP = 0.0,
+
     /// Repetition penalty over tokens generated this call. `1.0` disables it.
     /// Honored in the stochastic path (greedy/argmax decoding is unaffected).
     this.repetitionPenalty = 1.0,
+
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     this.stopTokens = const [],
+
     /// Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
     /// decode always runs to `max_tokens`. For benchmark loops that must
     /// cover an exact token count.
     this.ignoreEos = false,
+
     /// Optional GBNF grammar **source text** constraining the output (e.g. a
     /// JSON grammar). When absent (the default), decoding is unconstrained. The
     /// grammar is compiled on the Rust side when generation starts; a malformed
     /// grammar is reported as a `GrammarParse` error.
     this.grammar = null,
+
     /// Lazy-grammar trigger token ids (tool calling). When non-empty and
     /// `grammar` is set, the grammar stays inactive until the model emits one
     /// of these tokens (e.g. the tool-call start marker from
     /// [`CeraEngine::tool_call_start_token`]), then constrains the call and
     /// deactivates on completion. Empty → `grammar` is active from the start.
     this.grammarTriggerTokens = const [],
+
     /// Ignored under synchronous generate; reserved for streaming.
     this.flushEveryTokens = 16,
+
     /// Ignored under synchronous generate; reserved for streaming.
     this.flushEveryMs = 50,
   });
@@ -209,31 +226,39 @@ class GenerateOpts {
   final double temperature;
   final double topP;
   final int topK;
+
   /// Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
   /// disables it. Honored in the stochastic path.
   final double minP;
+
   /// Repetition penalty over tokens generated this call. `1.0` disables it.
   /// Honored in the stochastic path (greedy/argmax decoding is unaffected).
   final double repetitionPenalty;
+
   /// Early-stop IDs (EOS / instruction markers / end-of-turn).
   final List<int> stopTokens;
+
   /// Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
   /// decode always runs to `max_tokens`. For benchmark loops that must
   /// cover an exact token count.
   final bool ignoreEos;
+
   /// Optional GBNF grammar **source text** constraining the output (e.g. a
   /// JSON grammar). When absent (the default), decoding is unconstrained. The
   /// grammar is compiled on the Rust side when generation starts; a malformed
   /// grammar is reported as a `GrammarParse` error.
   final String? grammar;
+
   /// Lazy-grammar trigger token ids (tool calling). When non-empty and
   /// `grammar` is set, the grammar stays inactive until the model emits one
   /// of these tokens (e.g. the tool-call start marker from
   /// [`CeraEngine::tool_call_start_token`]), then constrains the call and
   /// deactivates on completion. Empty → `grammar` is active from the start.
   final List<int> grammarTriggerTokens;
+
   /// Ignored under synchronous generate; reserved for streaming.
   final int flushEveryTokens;
+
   /// Ignored under synchronous generate; reserved for streaming.
   final int flushEveryMs;
 
@@ -256,18 +281,49 @@ class GenerateOpts {
 
   factory GenerateOpts.fromJson(Map<String, dynamic> json) {
     return GenerateOpts(
-      maxTokens: json.containsKey('maxTokens') ? (json['maxTokens'] as num).toInt() : 256,
-      temperature: json.containsKey('temperature') ? (json['temperature'] as num).toDouble() : 0.7,
+      maxTokens:
+          json.containsKey('maxTokens')
+              ? (json['maxTokens'] as num).toInt()
+              : 256,
+      temperature:
+          json.containsKey('temperature')
+              ? (json['temperature'] as num).toDouble()
+              : 0.7,
       topP: json.containsKey('topP') ? (json['topP'] as num).toDouble() : 0.9,
       topK: json.containsKey('topK') ? (json['topK'] as num).toInt() : 40,
       minP: json.containsKey('minP') ? (json['minP'] as num).toDouble() : 0.0,
-      repetitionPenalty: json.containsKey('repetitionPenalty') ? (json['repetitionPenalty'] as num).toDouble() : 1.0,
-      stopTokens: json.containsKey('stopTokens') ? (json['stopTokens'] as List).map((item) => (item as num).toInt()).toList() : const [],
-      ignoreEos: json.containsKey('ignoreEos') ? json['ignoreEos'] as bool : false,
-      grammar: json.containsKey('grammar') ? json['grammar'] == null ? null : json['grammar'] as String : null,
-      grammarTriggerTokens: json.containsKey('grammarTriggerTokens') ? (json['grammarTriggerTokens'] as List).map((item) => (item as num).toInt()).toList() : const [],
-      flushEveryTokens: json.containsKey('flushEveryTokens') ? (json['flushEveryTokens'] as num).toInt() : 16,
-      flushEveryMs: json.containsKey('flushEveryMs') ? (json['flushEveryMs'] as num).toInt() : 50,
+      repetitionPenalty:
+          json.containsKey('repetitionPenalty')
+              ? (json['repetitionPenalty'] as num).toDouble()
+              : 1.0,
+      stopTokens:
+          json.containsKey('stopTokens')
+              ? (json['stopTokens'] as List)
+                  .map((item) => (item as num).toInt())
+                  .toList()
+              : const [],
+      ignoreEos:
+          json.containsKey('ignoreEos') ? json['ignoreEos'] as bool : false,
+      grammar:
+          json.containsKey('grammar')
+              ? json['grammar'] == null
+                  ? null
+                  : json['grammar'] as String
+              : null,
+      grammarTriggerTokens:
+          json.containsKey('grammarTriggerTokens')
+              ? (json['grammarTriggerTokens'] as List)
+                  .map((item) => (item as num).toInt())
+                  .toList()
+              : const [],
+      flushEveryTokens:
+          json.containsKey('flushEveryTokens')
+              ? (json['flushEveryTokens'] as num).toInt()
+              : 16,
+      flushEveryMs:
+          json.containsKey('flushEveryMs')
+              ? (json['flushEveryMs'] as num).toInt()
+              : 50,
     );
   }
 
@@ -309,10 +365,35 @@ class GenerateOpts {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is GenerateOpts && maxTokens == other.maxTokens && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && ignoreEos == other.ignoreEos && grammar == other.grammar && grammarTriggerTokens == other.grammarTriggerTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs;
+      other is GenerateOpts &&
+          maxTokens == other.maxTokens &&
+          temperature == other.temperature &&
+          topP == other.topP &&
+          topK == other.topK &&
+          minP == other.minP &&
+          repetitionPenalty == other.repetitionPenalty &&
+          stopTokens == other.stopTokens &&
+          ignoreEos == other.ignoreEos &&
+          grammar == other.grammar &&
+          grammarTriggerTokens == other.grammarTriggerTokens &&
+          flushEveryTokens == other.flushEveryTokens &&
+          flushEveryMs == other.flushEveryMs;
 
   @override
-  int get hashCode => Object.hash(maxTokens, temperature, topP, topK, minP, repetitionPenalty, stopTokens, ignoreEos, grammar, grammarTriggerTokens, flushEveryTokens, flushEveryMs);
+  int get hashCode => Object.hash(
+    maxTokens,
+    temperature,
+    topP,
+    topK,
+    minP,
+    repetitionPenalty,
+    stopTokens,
+    ignoreEos,
+    grammar,
+    grammarTriggerTokens,
+    flushEveryTokens,
+    flushEveryMs,
+  );
 }
 
 /// Bundle of everything a synchronous `generate` call produces:
@@ -337,23 +418,22 @@ class GenerateOutput {
   final GenerateSummary summary;
 
   Map<String, dynamic> toJson() {
-    return {
-      'tokens': this.tokens,
-      'summary': this.summary.toJson(),
-    };
+    return {'tokens': this.tokens, 'summary': this.summary.toJson()};
   }
 
   factory GenerateOutput.fromJson(Map<String, dynamic> json) {
     return GenerateOutput(
-      tokens: (json['tokens'] as List).map((item) => (item as num).toInt()).toList(),
-      summary: GenerateSummary.fromJson(json['summary'] as Map<String, dynamic>),
+      tokens:
+          (json['tokens'] as List)
+              .map((item) => (item as num).toInt())
+              .toList(),
+      summary: GenerateSummary.fromJson(
+        json['summary'] as Map<String, dynamic>,
+      ),
     );
   }
 
-  GenerateOutput copyWith({
-    List<int>? tokens,
-    GenerateSummary? summary,
-  }) {
+  GenerateOutput copyWith({List<int>? tokens, GenerateSummary? summary}) {
     return GenerateOutput(
       tokens: tokens ?? this.tokens,
       summary: summary ?? this.summary,
@@ -368,7 +448,9 @@ class GenerateOutput {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is GenerateOutput && tokens == other.tokens && summary == other.summary;
+      other is GenerateOutput &&
+          tokens == other.tokens &&
+          summary == other.summary;
 
   @override
   int get hashCode => Object.hash(tokens, summary);
@@ -434,10 +516,21 @@ class GenerateSummary {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is GenerateSummary && tokensGenerated == other.tokensGenerated && promptEvalTokens == other.promptEvalTokens && promptEvalMs == other.promptEvalMs && decodeMs == other.decodeMs && finishReason == other.finishReason;
+      other is GenerateSummary &&
+          tokensGenerated == other.tokensGenerated &&
+          promptEvalTokens == other.promptEvalTokens &&
+          promptEvalMs == other.promptEvalMs &&
+          decodeMs == other.decodeMs &&
+          finishReason == other.finishReason;
 
   @override
-  int get hashCode => Object.hash(tokensGenerated, promptEvalTokens, promptEvalMs, decodeMs, finishReason);
+  int get hashCode => Object.hash(
+    tokensGenerated,
+    promptEvalTokens,
+    promptEvalMs,
+    decodeMs,
+    finishReason,
+  );
 }
 
 /// One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
@@ -448,19 +541,13 @@ class GenerateSummary {
 /// Both fields are sorted ascending, so a menu built from this list is
 /// stable across runs even if the upstream API reorders its response.
 class LeapBundleEntry {
-  const LeapBundleEntry({
-    required this.name,
-    required this.quants,
-  });
+  const LeapBundleEntry({required this.name, required this.quants});
 
   final String name;
   final List<String> quants;
 
   Map<String, dynamic> toJson() {
-    return {
-      'name': this.name,
-      'quants': this.quants,
-    };
+    return {'name': this.name, 'quants': this.quants};
   }
 
   factory LeapBundleEntry.fromJson(Map<String, dynamic> json) {
@@ -470,10 +557,7 @@ class LeapBundleEntry {
     );
   }
 
-  LeapBundleEntry copyWith({
-    String? name,
-    List<String>? quants,
-  }) {
+  LeapBundleEntry copyWith({String? name, List<String>? quants}) {
     return LeapBundleEntry(
       name: name ?? this.name,
       quants: quants ?? this.quants,
@@ -555,7 +639,12 @@ class ModalityCapabilities {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is ModalityCapabilities && textIn == other.textIn && textOut == other.textOut && imageIn == other.imageIn && audioIn == other.audioIn && audioOut == other.audioOut;
+      other is ModalityCapabilities &&
+          textIn == other.textIn &&
+          textOut == other.textOut &&
+          imageIn == other.imageIn &&
+          audioIn == other.audioIn &&
+          audioOut == other.audioOut;
 
   @override
   int get hashCode => Object.hash(textIn, textOut, imageIn, audioIn, audioOut);
@@ -569,13 +658,16 @@ class ModelMetadata {
     required this.vocabSize,
     required this.hasChatTemplate,
     required this.quantization,
+
     /// Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
     /// want to insert a BOS at the head of a raw prompt should honor it —
     /// or, better, tokenize via `encode_text_special`, which applies both
     /// this and `add_eos_token`.
     required this.addBosToken,
+
     /// Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `add_bos_token`.
     required this.addEosToken,
+
     /// SIMD backend tier the runtime resolved for this host (e.g.
     /// `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
     /// model-specific — surfaced here so consumers fetching metadata also
@@ -589,13 +681,16 @@ class ModelMetadata {
   final int vocabSize;
   final bool hasChatTemplate;
   final String quantization;
+
   /// Mirror of GGUF `tokenizer.ggml.add_bos_token`. Consumers that
   /// want to insert a BOS at the head of a raw prompt should honor it —
   /// or, better, tokenize via `encode_text_special`, which applies both
   /// this and `add_eos_token`.
   final bool addBosToken;
+
   /// Mirror of GGUF `tokenizer.ggml.add_eos_token`. See `add_bos_token`.
   final bool addEosToken;
+
   /// SIMD backend tier the runtime resolved for this host (e.g.
   /// `"neon+dotprod"`, `"avx2"`, `"scalar"`). A host property, not
   /// model-specific — surfaced here so consumers fetching metadata also
@@ -659,10 +754,27 @@ class ModelMetadata {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is ModelMetadata && architecture == other.architecture && maxSeqLen == other.maxSeqLen && vocabSize == other.vocabSize && hasChatTemplate == other.hasChatTemplate && quantization == other.quantization && addBosToken == other.addBosToken && addEosToken == other.addEosToken && cpuBackend == other.cpuBackend;
+      other is ModelMetadata &&
+          architecture == other.architecture &&
+          maxSeqLen == other.maxSeqLen &&
+          vocabSize == other.vocabSize &&
+          hasChatTemplate == other.hasChatTemplate &&
+          quantization == other.quantization &&
+          addBosToken == other.addBosToken &&
+          addEosToken == other.addEosToken &&
+          cpuBackend == other.cpuBackend;
 
   @override
-  int get hashCode => Object.hash(architecture, maxSeqLen, vocabSize, hasChatTemplate, quantization, addBosToken, addEosToken, cpuBackend);
+  int get hashCode => Object.hash(
+    architecture,
+    maxSeqLen,
+    vocabSize,
+    hasChatTemplate,
+    quantization,
+    addBosToken,
+    addEosToken,
+    cpuBackend,
+  );
 }
 
 /// Per-session configuration. Mirrors [`cera::SessionConfig`].
@@ -671,13 +783,17 @@ class SessionConfig {
     /// Cap on total tokens held in KV. `None` → model's default
     /// `max_seq_len`.
     this.maxSeqLen = null,
+
     /// KV cache compression mode. `None` → no compression (the default).
     this.kvCompression = null,
+
     /// Pinned-prefix length for Phase-1.5 context shift on overflow.
     /// `0` disables shift; overflow returns `ContextOverflow` error.
     this.nKeep = 0,
+
     /// Deterministic sampling seed. `None` = fresh entropy per call.
     this.seed = null,
+
     /// Chunked-prefill ubatch size. `0` = monolithic prefill.
     this.ubatchSize = 512,
   });
@@ -685,20 +801,30 @@ class SessionConfig {
   /// Cap on total tokens held in KV. `None` → model's default
   /// `max_seq_len`.
   final int? maxSeqLen;
+
   /// KV cache compression mode. `None` → no compression (the default).
   final KvCompression? kvCompression;
+
   /// Pinned-prefix length for Phase-1.5 context shift on overflow.
   /// `0` disables shift; overflow returns `ContextOverflow` error.
   final int nKeep;
+
   /// Deterministic sampling seed. `None` = fresh entropy per call.
   final int? seed;
+
   /// Chunked-prefill ubatch size. `0` = monolithic prefill.
   final int ubatchSize;
 
   Map<String, dynamic> toJson() {
     return {
       'maxSeqLen': this.maxSeqLen,
-      'kvCompression': this.kvCompression == null ? null : (() { final __tmp = this.kvCompression!; return KvCompressionFfiCodec.encode(__tmp); })(),
+      'kvCompression':
+          this.kvCompression == null
+              ? null
+              : (() {
+                final __tmp = this.kvCompression!;
+                return KvCompressionFfiCodec.encode(__tmp);
+              })(),
       'nKeep': this.nKeep,
       'seed': this.seed,
       'ubatchSize': this.ubatchSize,
@@ -707,11 +833,32 @@ class SessionConfig {
 
   factory SessionConfig.fromJson(Map<String, dynamic> json) {
     return SessionConfig(
-      maxSeqLen: json.containsKey('maxSeqLen') ? json['maxSeqLen'] == null ? null : (json['maxSeqLen'] as num).toInt() : null,
-      kvCompression: json.containsKey('kvCompression') ? json['kvCompression'] == null ? null : (() { final __tmp = json['kvCompression']; return KvCompressionFfiCodec.decode(__tmp as String); })() : null,
+      maxSeqLen:
+          json.containsKey('maxSeqLen')
+              ? json['maxSeqLen'] == null
+                  ? null
+                  : (json['maxSeqLen'] as num).toInt()
+              : null,
+      kvCompression:
+          json.containsKey('kvCompression')
+              ? json['kvCompression'] == null
+                  ? null
+                  : (() {
+                    final __tmp = json['kvCompression'];
+                    return KvCompressionFfiCodec.decode(__tmp as String);
+                  })()
+              : null,
       nKeep: json.containsKey('nKeep') ? (json['nKeep'] as num).toInt() : 0,
-      seed: json.containsKey('seed') ? json['seed'] == null ? null : (json['seed'] as num).toInt() : null,
-      ubatchSize: json.containsKey('ubatchSize') ? (json['ubatchSize'] as num).toInt() : 512,
+      seed:
+          json.containsKey('seed')
+              ? json['seed'] == null
+                  ? null
+                  : (json['seed'] as num).toInt()
+              : null,
+      ubatchSize:
+          json.containsKey('ubatchSize')
+              ? (json['ubatchSize'] as num).toInt()
+              : 512,
     );
   }
 
@@ -724,7 +871,10 @@ class SessionConfig {
   }) {
     return SessionConfig(
       maxSeqLen: maxSeqLen == _sentinel ? this.maxSeqLen : maxSeqLen as int?,
-      kvCompression: kvCompression == _sentinel ? this.kvCompression : kvCompression as KvCompression?,
+      kvCompression:
+          kvCompression == _sentinel
+              ? this.kvCompression
+              : kvCompression as KvCompression?,
       nKeep: nKeep ?? this.nKeep,
       seed: seed == _sentinel ? this.seed : seed as int?,
       ubatchSize: ubatchSize ?? this.ubatchSize,
@@ -739,10 +889,16 @@ class SessionConfig {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is SessionConfig && maxSeqLen == other.maxSeqLen && kvCompression == other.kvCompression && nKeep == other.nKeep && seed == other.seed && ubatchSize == other.ubatchSize;
+      other is SessionConfig &&
+          maxSeqLen == other.maxSeqLen &&
+          kvCompression == other.kvCompression &&
+          nKeep == other.nKeep &&
+          seed == other.seed &&
+          ubatchSize == other.ubatchSize;
 
   @override
-  int get hashCode => Object.hash(maxSeqLen, kvCompression, nKeep, seed, ubatchSize);
+  int get hashCode =>
+      Object.hash(maxSeqLen, kvCompression, nKeep, seed, ubatchSize);
 }
 
 /// A tool call parsed from model output. Mirrors [`cera::tools::ToolCall`];
@@ -750,6 +906,7 @@ class SessionConfig {
 class ToolCall {
   const ToolCall({
     required this.name,
+
     /// The call's arguments as a JSON string — normally an object
     /// (e.g. `{"city":"Paris"}`), but a malformed Hermes/Qwen reply may pass
     /// through a non-object value, so decode defensively.
@@ -757,16 +914,14 @@ class ToolCall {
   });
 
   final String name;
+
   /// The call's arguments as a JSON string — normally an object
   /// (e.g. `{"city":"Paris"}`), but a malformed Hermes/Qwen reply may pass
   /// through a non-object value, so decode defensively.
   final String argumentsJson;
 
   Map<String, dynamic> toJson() {
-    return {
-      'name': this.name,
-      'argumentsJson': this.argumentsJson,
-    };
+    return {'name': this.name, 'argumentsJson': this.argumentsJson};
   }
 
   factory ToolCall.fromJson(Map<String, dynamic> json) {
@@ -776,10 +931,7 @@ class ToolCall {
     );
   }
 
-  ToolCall copyWith({
-    String? name,
-    String? argumentsJson,
-  }) {
+  ToolCall copyWith({String? name, String? argumentsJson}) {
     return ToolCall(
       name: name ?? this.name,
       argumentsJson: argumentsJson ?? this.argumentsJson,
@@ -794,7 +946,9 @@ class ToolCall {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is ToolCall && name == other.name && argumentsJson == other.argumentsJson;
+      other is ToolCall &&
+          name == other.name &&
+          argumentsJson == other.argumentsJson;
 
   @override
   int get hashCode => Object.hash(name, argumentsJson);
@@ -808,6 +962,7 @@ class ToolDef {
   const ToolDef({
     required this.name,
     required this.description,
+
     /// JSON Schema object for the arguments, as a JSON string (e.g.
     /// `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
     required this.parametersJson,
@@ -815,6 +970,7 @@ class ToolDef {
 
   final String name;
   final String? description;
+
   /// JSON Schema object for the arguments, as a JSON string (e.g.
   /// `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
   final String parametersJson;
@@ -830,7 +986,8 @@ class ToolDef {
   factory ToolDef.fromJson(Map<String, dynamic> json) {
     return ToolDef(
       name: json['name'] as String,
-      description: json['description'] == null ? null : json['description'] as String,
+      description:
+          json['description'] == null ? null : json['description'] as String,
       parametersJson: json['parametersJson'] as String,
     );
   }
@@ -842,7 +999,8 @@ class ToolDef {
   }) {
     return ToolDef(
       name: name ?? this.name,
-      description: description == _sentinel ? this.description : description as String?,
+      description:
+          description == _sentinel ? this.description : description as String?,
       parametersJson: parametersJson ?? this.parametersJson,
     );
   }
@@ -855,7 +1013,10 @@ class ToolDef {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is ToolDef && name == other.name && description == other.description && parametersJson == other.parametersJson;
+      other is ToolDef &&
+          name == other.name &&
+          description == other.description &&
+          parametersJson == other.parametersJson;
 
   @override
   int get hashCode => Object.hash(name, description, parametersJson);
@@ -868,8 +1029,10 @@ enum BackendPreference {
   /// Probe Metal → GPU → CPU at load time.
   auto,
   cpu,
+
   /// `wgpu` (Vulkan / Metal / DX12). Requires the `gpu` feature.
   gpu,
+
   /// Native Metal. Requires the `metal` feature + macOS.
   metal,
 }
@@ -913,8 +1076,7 @@ final class FfiErrorUnsupportedModality extends FfiError {
 
   @override
   bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is FfiErrorUnsupportedModality;
+      identical(this, other) || other is FfiErrorUnsupportedModality;
 
   @override
   int get hashCode => runtimeType.hashCode;
@@ -923,9 +1085,7 @@ final class FfiErrorUnsupportedModality extends FfiError {
 /// The manifest's `inference_type` is one cera doesn't recognize
 /// at this version. Field carries the offending string.
 final class FfiErrorUnsupportedInferenceType extends FfiError {
-  const FfiErrorUnsupportedInferenceType({
-    required this.inferenceType,
-  });
+  const FfiErrorUnsupportedInferenceType({required this.inferenceType});
   final String inferenceType;
 
   @override
@@ -936,7 +1096,8 @@ final class FfiErrorUnsupportedInferenceType extends FfiError {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is FfiErrorUnsupportedInferenceType && inferenceType == other.inferenceType;
+      other is FfiErrorUnsupportedInferenceType &&
+          inferenceType == other.inferenceType;
 
   @override
   int get hashCode => inferenceType.hashCode;
@@ -955,8 +1116,7 @@ final class FfiErrorBusy extends FfiError {
 
   @override
   bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is FfiErrorBusy;
+      identical(this, other) || other is FfiErrorBusy;
 
   @override
   int get hashCode => runtimeType.hashCode;
@@ -986,8 +1146,7 @@ final class FfiErrorCancelled extends FfiError {
 
   @override
   bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is FfiErrorCancelled;
+      identical(this, other) || other is FfiErrorCancelled;
 
   @override
   int get hashCode => runtimeType.hashCode;
@@ -998,10 +1157,7 @@ final class FfiErrorCancelled extends FfiError {
 /// model doesn't support rope-shift). `max_seq_len` is the cap
 /// that was hit; `by` is the overshoot in tokens.
 final class FfiErrorContextOverflow extends FfiError {
-  const FfiErrorContextOverflow({
-    required this.maxSeqLen,
-    required this.by,
-  });
+  const FfiErrorContextOverflow({required this.maxSeqLen, required this.by});
   final int maxSeqLen;
   final int by;
 
@@ -1013,7 +1169,9 @@ final class FfiErrorContextOverflow extends FfiError {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is FfiErrorContextOverflow && maxSeqLen == other.maxSeqLen && by == other.by;
+      other is FfiErrorContextOverflow &&
+          maxSeqLen == other.maxSeqLen &&
+          by == other.by;
 
   @override
   int get hashCode => Object.hash(maxSeqLen, by);
@@ -1031,8 +1189,7 @@ final class FfiErrorEmptyInput extends FfiError {
 
   @override
   bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is FfiErrorEmptyInput;
+      identical(this, other) || other is FfiErrorEmptyInput;
 
   @override
   int get hashCode => runtimeType.hashCode;
@@ -1056,9 +1213,7 @@ final class FfiErrorEmptyInput extends FfiError {
 /// foreign `.toString()` / `String(describing:)` gives the same
 /// output Rust consumers see.
 final class FfiErrorIo extends FfiError {
-  const FfiErrorIo({
-    required this.detail,
-  });
+  const FfiErrorIo({required this.detail});
   final String detail;
 
   @override
@@ -1068,8 +1223,7 @@ final class FfiErrorIo extends FfiError {
 
   @override
   bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is FfiErrorIo && detail == other.detail;
+      identical(this, other) || other is FfiErrorIo && detail == other.detail;
 
   @override
   int get hashCode => detail.hashCode;
@@ -1087,9 +1241,7 @@ final class FfiErrorIo extends FfiError {
 /// Field is named `detail` rather than `message` for the same
 /// `Throwable.message` collision reason as [`FfiError::Io`].
 final class FfiErrorBackend extends FfiError {
-  const FfiErrorBackend({
-    required this.detail,
-  });
+  const FfiErrorBackend({required this.detail});
   final String detail;
 
   @override
@@ -1111,9 +1263,7 @@ final class FfiErrorBackend extends FfiError {
 /// grammar object can't cross the boundary, so callers pass the source text
 /// and it's parsed here). `detail` carries the parser's diagnostic.
 final class FfiErrorGrammarParse extends FfiError {
-  const FfiErrorGrammarParse({
-    required this.detail,
-  });
+  const FfiErrorGrammarParse({required this.detail});
   final String detail;
 
   @override
@@ -1136,10 +1286,7 @@ final class FfiErrorGrammarParse extends FfiError {
 /// unwind through the held session lock and poison it). Mirrors
 /// `cera::CeraError::InvalidToken`.
 final class FfiErrorInvalidToken extends FfiError {
-  const FfiErrorInvalidToken({
-    required this.id,
-    required this.vocabSize,
-  });
+  const FfiErrorInvalidToken({required this.id, required this.vocabSize});
   final int id;
   final int vocabSize;
 
@@ -1151,7 +1298,9 @@ final class FfiErrorInvalidToken extends FfiError {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is FfiErrorInvalidToken && id == other.id && vocabSize == other.vocabSize;
+      other is FfiErrorInvalidToken &&
+          id == other.id &&
+          vocabSize == other.vocabSize;
 
   @override
   int get hashCode => Object.hash(id, vocabSize);
@@ -1161,9 +1310,7 @@ final class FfiErrorInvalidToken extends FfiError {
 /// [`LoraAdapters::from_safetensors`]) or was incompatible with the model at
 /// attach time (wrong dimensions). `detail` carries the diagnostic.
 final class FfiErrorLoraParse extends FfiError {
-  const FfiErrorLoraParse({
-    required this.detail,
-  });
+  const FfiErrorLoraParse({required this.detail});
   final String detail;
 
   @override
@@ -1185,9 +1332,7 @@ final class FfiErrorLoraParse extends FfiError {
 /// the process, so a caller can fall back (smaller model or context) or
 /// surface a clean error. Mirrors `cera::CeraError::OutOfMemory`.
 final class FfiErrorOutOfMemory extends FfiError {
-  const FfiErrorOutOfMemory({
-    required this.requestedBytes,
-  });
+  const FfiErrorOutOfMemory({required this.requestedBytes});
   final int requestedBytes;
 
   @override
@@ -1226,7 +1371,9 @@ final class FfiErrorKvCompressionConflict extends FfiError {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is FfiErrorKvCompressionConflict && configured == other.configured && requested == other.requested;
+      other is FfiErrorKvCompressionConflict &&
+          configured == other.configured &&
+          requested == other.requested;
 
   @override
   int get hashCode => Object.hash(configured, requested);
@@ -1248,9 +1395,7 @@ final class FfiErrorKvCompressionConflict extends FfiError {
 /// prebuilt consumer would decode this one as whatever now holds its old
 /// ordinal. New variants go at the end.
 final class FfiErrorLoraUnsupportedByBackend extends FfiError {
-  const FfiErrorLoraUnsupportedByBackend({
-    required this.detail,
-  });
+  const FfiErrorLoraUnsupportedByBackend({required this.detail});
   final String detail;
 
   @override
@@ -1282,8 +1427,7 @@ final class FinishReasonMaxTokens extends FinishReason {
 
   @override
   bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is FinishReasonMaxTokens;
+      identical(this, other) || other is FinishReasonMaxTokens;
 
   @override
   int get hashCode => runtimeType.hashCode;
@@ -1299,8 +1443,7 @@ final class FinishReasonStop extends FinishReason {
 
   @override
   bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is FinishReasonStop;
+      identical(this, other) || other is FinishReasonStop;
 
   @override
   int get hashCode => runtimeType.hashCode;
@@ -1316,8 +1459,7 @@ final class FinishReasonCancelled extends FinishReason {
 
   @override
   bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is FinishReasonCancelled;
+      identical(this, other) || other is FinishReasonCancelled;
 
   @override
   int get hashCode => runtimeType.hashCode;
@@ -1333,8 +1475,7 @@ final class FinishReasonContextFull extends FinishReason {
 
   @override
   bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is FinishReasonContextFull;
+      identical(this, other) || other is FinishReasonContextFull;
 
   @override
   int get hashCode => runtimeType.hashCode;
@@ -1353,17 +1494,14 @@ final class FinishReasonGrammarDeadEnd extends FinishReason {
 
   @override
   bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is FinishReasonGrammarDeadEnd;
+      identical(this, other) || other is FinishReasonGrammarDeadEnd;
 
   @override
   int get hashCode => runtimeType.hashCode;
 }
 
 final class FinishReasonError extends FinishReason {
-  const FinishReasonError({
-    required this.message,
-  });
+  const FinishReasonError({required this.message});
   final String message;
 
   @override
@@ -1402,8 +1540,7 @@ final class KvCompressionNone extends KvCompression {
 
   @override
   bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is KvCompressionNone;
+      identical(this, other) || other is KvCompressionNone;
 
   @override
   int get hashCode => runtimeType.hashCode;
@@ -1422,8 +1559,7 @@ final class KvCompressionF16 extends KvCompression {
 
   @override
   bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is KvCompressionF16;
+      identical(this, other) || other is KvCompressionF16;
 
   @override
   int get hashCode => runtimeType.hashCode;
@@ -1451,7 +1587,10 @@ final class KvCompressionTurboQuant extends KvCompression {
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is KvCompressionTurboQuant && seed == other.seed && keys == other.keys && values == other.values;
+      other is KvCompressionTurboQuant &&
+          seed == other.seed &&
+          keys == other.keys &&
+          values == other.values;
 
   @override
   int get hashCode => Object.hash(seed, keys, values);
@@ -1465,6 +1604,7 @@ enum ToolFormat {
   /// LFM2 / LFM2.5: Pythonic `[get_weather(city="Paris")]` in
   /// `<|tool_call_start|>…<|tool_call_end|>`.
   lfm2Pythonic,
+
   /// Hermes / Qwen: JSON `{"name":…,"arguments":{…}}` in
   /// `<tool_call>…</tool_call>`.
   hermes,
@@ -1510,7 +1650,8 @@ final class FfiErrorExceptionUnsupportedModality extends FfiErrorException {
 
 /// The manifest's `inference_type` is one cera doesn't recognize
 /// at this version. Field carries the offending string.
-final class FfiErrorExceptionUnsupportedInferenceType extends FfiErrorException {
+final class FfiErrorExceptionUnsupportedInferenceType
+    extends FfiErrorException {
   const FfiErrorExceptionUnsupportedInferenceType({
     required this.inferenceType,
   });
@@ -1604,9 +1745,7 @@ final class FfiErrorExceptionEmptyInput extends FfiErrorException {
 /// foreign `.toString()` / `String(describing:)` gives the same
 /// output Rust consumers see.
 final class FfiErrorExceptionIo extends FfiErrorException {
-  const FfiErrorExceptionIo({
-    required this.detail,
-  });
+  const FfiErrorExceptionIo({required this.detail});
   final String detail;
 
   @override
@@ -1627,9 +1766,7 @@ final class FfiErrorExceptionIo extends FfiErrorException {
 /// Field is named `detail` rather than `message` for the same
 /// `Throwable.message` collision reason as [`FfiError::Io`].
 final class FfiErrorExceptionBackend extends FfiErrorException {
-  const FfiErrorExceptionBackend({
-    required this.detail,
-  });
+  const FfiErrorExceptionBackend({required this.detail});
   final String detail;
 
   @override
@@ -1643,9 +1780,7 @@ final class FfiErrorExceptionBackend extends FfiErrorException {
 /// grammar object can't cross the boundary, so callers pass the source text
 /// and it's parsed here). `detail` carries the parser's diagnostic.
 final class FfiErrorExceptionGrammarParse extends FfiErrorException {
-  const FfiErrorExceptionGrammarParse({
-    required this.detail,
-  });
+  const FfiErrorExceptionGrammarParse({required this.detail});
   final String detail;
 
   @override
@@ -1677,9 +1812,7 @@ final class FfiErrorExceptionInvalidToken extends FfiErrorException {
 /// [`LoraAdapters::from_safetensors`]) or was incompatible with the model at
 /// attach time (wrong dimensions). `detail` carries the diagnostic.
 final class FfiErrorExceptionLoraParse extends FfiErrorException {
-  const FfiErrorExceptionLoraParse({
-    required this.detail,
-  });
+  const FfiErrorExceptionLoraParse({required this.detail});
   final String detail;
 
   @override
@@ -1693,9 +1826,7 @@ final class FfiErrorExceptionLoraParse extends FfiErrorException {
 /// the process, so a caller can fall back (smaller model or context) or
 /// surface a clean error. Mirrors `cera::CeraError::OutOfMemory`.
 final class FfiErrorExceptionOutOfMemory extends FfiErrorException {
-  const FfiErrorExceptionOutOfMemory({
-    required this.requestedBytes,
-  });
+  const FfiErrorExceptionOutOfMemory({required this.requestedBytes});
   final int requestedBytes;
 
   @override
@@ -1739,10 +1870,9 @@ final class FfiErrorExceptionKvCompressionConflict extends FfiErrorException {
 /// the same way, so inserting mid-enum renumbers every later variant and a
 /// prebuilt consumer would decode this one as whatever now holds its old
 /// ordinal. New variants go at the end.
-final class FfiErrorExceptionLoraUnsupportedByBackend extends FfiErrorException {
-  const FfiErrorExceptionLoraUnsupportedByBackend({
-    required this.detail,
-  });
+final class FfiErrorExceptionLoraUnsupportedByBackend
+    extends FfiErrorException {
+  const FfiErrorExceptionLoraUnsupportedByBackend({required this.detail});
   final String detail;
 
   @override
@@ -1772,9 +1902,7 @@ BackendPreference _decodeBackendPreference(String raw) {
 
 String _encodeFfiError(FfiError value) {
   if (value is FfiErrorUnsupportedModality) {
-    return jsonEncode({
-      'tag': 'unsupportedModality',
-    });
+    return jsonEncode({'tag': 'unsupportedModality'});
   }
   if (value is FfiErrorUnsupportedInferenceType) {
     return jsonEncode({
@@ -1783,14 +1911,10 @@ String _encodeFfiError(FfiError value) {
     });
   }
   if (value is FfiErrorBusy) {
-    return jsonEncode({
-      'tag': 'busy',
-    });
+    return jsonEncode({'tag': 'busy'});
   }
   if (value is FfiErrorCancelled) {
-    return jsonEncode({
-      'tag': 'cancelled',
-    });
+    return jsonEncode({'tag': 'cancelled'});
   }
   if (value is FfiErrorContextOverflow) {
     return jsonEncode({
@@ -1800,27 +1924,16 @@ String _encodeFfiError(FfiError value) {
     });
   }
   if (value is FfiErrorEmptyInput) {
-    return jsonEncode({
-      'tag': 'emptyInput',
-    });
+    return jsonEncode({'tag': 'emptyInput'});
   }
   if (value is FfiErrorIo) {
-    return jsonEncode({
-      'tag': 'io',
-      'detail': value.detail,
-    });
+    return jsonEncode({'tag': 'io', 'detail': value.detail});
   }
   if (value is FfiErrorBackend) {
-    return jsonEncode({
-      'tag': 'backend',
-      'detail': value.detail,
-    });
+    return jsonEncode({'tag': 'backend', 'detail': value.detail});
   }
   if (value is FfiErrorGrammarParse) {
-    return jsonEncode({
-      'tag': 'grammarParse',
-      'detail': value.detail,
-    });
+    return jsonEncode({'tag': 'grammarParse', 'detail': value.detail});
   }
   if (value is FfiErrorInvalidToken) {
     return jsonEncode({
@@ -1830,10 +1943,7 @@ String _encodeFfiError(FfiError value) {
     });
   }
   if (value is FfiErrorLoraParse) {
-    return jsonEncode({
-      'tag': 'loraParse',
-      'detail': value.detail,
-    });
+    return jsonEncode({'tag': 'loraParse', 'detail': value.detail});
   }
   if (value is FfiErrorOutOfMemory) {
     return jsonEncode({
@@ -1862,47 +1972,35 @@ FfiError _decodeFfiError(String raw) {
   final String? tag = map['tag'] as String?;
   switch (tag) {
     case 'unsupportedModality':
-      return FfiErrorUnsupportedModality(
-      );
+      return FfiErrorUnsupportedModality();
     case 'unsupportedInferenceType':
       return FfiErrorUnsupportedInferenceType(
         inferenceType: map['inferenceType'] as String,
       );
     case 'busy':
-      return FfiErrorBusy(
-      );
+      return FfiErrorBusy();
     case 'cancelled':
-      return FfiErrorCancelled(
-      );
+      return FfiErrorCancelled();
     case 'contextOverflow':
       return FfiErrorContextOverflow(
         maxSeqLen: (map['maxSeqLen'] as num).toInt(),
         by: (map['by'] as num).toInt(),
       );
     case 'emptyInput':
-      return FfiErrorEmptyInput(
-      );
+      return FfiErrorEmptyInput();
     case 'io':
-      return FfiErrorIo(
-        detail: map['detail'] as String,
-      );
+      return FfiErrorIo(detail: map['detail'] as String);
     case 'backend':
-      return FfiErrorBackend(
-        detail: map['detail'] as String,
-      );
+      return FfiErrorBackend(detail: map['detail'] as String);
     case 'grammarParse':
-      return FfiErrorGrammarParse(
-        detail: map['detail'] as String,
-      );
+      return FfiErrorGrammarParse(detail: map['detail'] as String);
     case 'invalidToken':
       return FfiErrorInvalidToken(
         id: (map['id'] as num).toInt(),
         vocabSize: (map['vocabSize'] as num).toInt(),
       );
     case 'loraParse':
-      return FfiErrorLoraParse(
-        detail: map['detail'] as String,
-      );
+      return FfiErrorLoraParse(detail: map['detail'] as String);
     case 'outOfMemory':
       return FfiErrorOutOfMemory(
         requestedBytes: (map['requestedBytes'] as num).toInt(),
@@ -1913,9 +2011,7 @@ FfiError _decodeFfiError(String raw) {
         requested: map['requested'] as String,
       );
     case 'loraUnsupportedByBackend':
-      return FfiErrorLoraUnsupportedByBackend(
-        detail: map['detail'] as String,
-      );
+      return FfiErrorLoraUnsupportedByBackend(detail: map['detail'] as String);
     default:
       throw StateError('Unknown FfiError variant tag: $tag');
   }
@@ -1923,35 +2019,22 @@ FfiError _decodeFfiError(String raw) {
 
 String _encodeFinishReason(FinishReason value) {
   if (value is FinishReasonMaxTokens) {
-    return jsonEncode({
-      'tag': 'maxTokens',
-    });
+    return jsonEncode({'tag': 'maxTokens'});
   }
   if (value is FinishReasonStop) {
-    return jsonEncode({
-      'tag': 'stop',
-    });
+    return jsonEncode({'tag': 'stop'});
   }
   if (value is FinishReasonCancelled) {
-    return jsonEncode({
-      'tag': 'cancelled',
-    });
+    return jsonEncode({'tag': 'cancelled'});
   }
   if (value is FinishReasonContextFull) {
-    return jsonEncode({
-      'tag': 'contextFull',
-    });
+    return jsonEncode({'tag': 'contextFull'});
   }
   if (value is FinishReasonGrammarDeadEnd) {
-    return jsonEncode({
-      'tag': 'grammarDeadEnd',
-    });
+    return jsonEncode({'tag': 'grammarDeadEnd'});
   }
   if (value is FinishReasonError) {
-    return jsonEncode({
-      'tag': 'error',
-      'message': value.message,
-    });
+    return jsonEncode({'tag': 'error', 'message': value.message});
   }
   throw StateError('Unknown FinishReason variant instance: $value');
 }
@@ -1961,24 +2044,17 @@ FinishReason _decodeFinishReason(String raw) {
   final String? tag = map['tag'] as String?;
   switch (tag) {
     case 'maxTokens':
-      return FinishReasonMaxTokens(
-      );
+      return FinishReasonMaxTokens();
     case 'stop':
-      return FinishReasonStop(
-      );
+      return FinishReasonStop();
     case 'cancelled':
-      return FinishReasonCancelled(
-      );
+      return FinishReasonCancelled();
     case 'contextFull':
-      return FinishReasonContextFull(
-      );
+      return FinishReasonContextFull();
     case 'grammarDeadEnd':
-      return FinishReasonGrammarDeadEnd(
-      );
+      return FinishReasonGrammarDeadEnd();
     case 'error':
-      return FinishReasonError(
-        message: map['message'] as String,
-      );
+      return FinishReasonError(message: map['message'] as String);
     default:
       throw StateError('Unknown FinishReason variant tag: $tag');
   }
@@ -1986,14 +2062,10 @@ FinishReason _decodeFinishReason(String raw) {
 
 String _encodeKvCompression(KvCompression value) {
   if (value is KvCompressionNone) {
-    return jsonEncode({
-      'tag': 'none',
-    });
+    return jsonEncode({'tag': 'none'});
   }
   if (value is KvCompressionF16) {
-    return jsonEncode({
-      'tag': 'f16',
-    });
+    return jsonEncode({'tag': 'f16'});
   }
   if (value is KvCompressionTurboQuant) {
     return jsonEncode({
@@ -2011,11 +2083,9 @@ KvCompression _decodeKvCompression(String raw) {
   final String? tag = map['tag'] as String?;
   switch (tag) {
     case 'none':
-      return KvCompressionNone(
-      );
+      return KvCompressionNone();
     case 'f16':
-      return KvCompressionF16(
-      );
+      return KvCompressionF16();
     case 'turboQuant':
       return KvCompressionTurboQuant(
         seed: (map['seed'] as num).toInt(),
@@ -2044,9 +2114,7 @@ ToolFormat _decodeToolFormat(String raw) {
 
 String _encodeFfiErrorException(FfiErrorException value) {
   if (value is FfiErrorExceptionUnsupportedModality) {
-    return jsonEncode({
-      'tag': 'unsupportedModality',
-    });
+    return jsonEncode({'tag': 'unsupportedModality'});
   }
   if (value is FfiErrorExceptionUnsupportedInferenceType) {
     return jsonEncode({
@@ -2055,14 +2123,10 @@ String _encodeFfiErrorException(FfiErrorException value) {
     });
   }
   if (value is FfiErrorExceptionBusy) {
-    return jsonEncode({
-      'tag': 'busy',
-    });
+    return jsonEncode({'tag': 'busy'});
   }
   if (value is FfiErrorExceptionCancelled) {
-    return jsonEncode({
-      'tag': 'cancelled',
-    });
+    return jsonEncode({'tag': 'cancelled'});
   }
   if (value is FfiErrorExceptionContextOverflow) {
     return jsonEncode({
@@ -2072,27 +2136,16 @@ String _encodeFfiErrorException(FfiErrorException value) {
     });
   }
   if (value is FfiErrorExceptionEmptyInput) {
-    return jsonEncode({
-      'tag': 'emptyInput',
-    });
+    return jsonEncode({'tag': 'emptyInput'});
   }
   if (value is FfiErrorExceptionIo) {
-    return jsonEncode({
-      'tag': 'io',
-      'detail': value.detail,
-    });
+    return jsonEncode({'tag': 'io', 'detail': value.detail});
   }
   if (value is FfiErrorExceptionBackend) {
-    return jsonEncode({
-      'tag': 'backend',
-      'detail': value.detail,
-    });
+    return jsonEncode({'tag': 'backend', 'detail': value.detail});
   }
   if (value is FfiErrorExceptionGrammarParse) {
-    return jsonEncode({
-      'tag': 'grammarParse',
-      'detail': value.detail,
-    });
+    return jsonEncode({'tag': 'grammarParse', 'detail': value.detail});
   }
   if (value is FfiErrorExceptionInvalidToken) {
     return jsonEncode({
@@ -2102,10 +2155,7 @@ String _encodeFfiErrorException(FfiErrorException value) {
     });
   }
   if (value is FfiErrorExceptionLoraParse) {
-    return jsonEncode({
-      'tag': 'loraParse',
-      'detail': value.detail,
-    });
+    return jsonEncode({'tag': 'loraParse', 'detail': value.detail});
   }
   if (value is FfiErrorExceptionOutOfMemory) {
     return jsonEncode({
@@ -2130,7 +2180,10 @@ String _encodeFfiErrorException(FfiErrorException value) {
 }
 
 FfiErrorException _decodeFfiErrorException(Object? raw) {
-  final Map<String, dynamic> map = raw is String ? (jsonDecode(raw) as Map<String, dynamic>) : (raw as Map<String, dynamic>);
+  final Map<String, dynamic> map =
+      raw is String
+          ? (jsonDecode(raw) as Map<String, dynamic>)
+          : (raw as Map<String, dynamic>);
   final String? tag = map['tag'] as String?;
   switch (tag) {
     case 'unsupportedModality':
@@ -2151,26 +2204,18 @@ FfiErrorException _decodeFfiErrorException(Object? raw) {
     case 'emptyInput':
       return const FfiErrorExceptionEmptyInput();
     case 'io':
-      return FfiErrorExceptionIo(
-        detail: map['detail'] as String,
-      );
+      return FfiErrorExceptionIo(detail: map['detail'] as String);
     case 'backend':
-      return FfiErrorExceptionBackend(
-        detail: map['detail'] as String,
-      );
+      return FfiErrorExceptionBackend(detail: map['detail'] as String);
     case 'grammarParse':
-      return FfiErrorExceptionGrammarParse(
-        detail: map['detail'] as String,
-      );
+      return FfiErrorExceptionGrammarParse(detail: map['detail'] as String);
     case 'invalidToken':
       return FfiErrorExceptionInvalidToken(
         id: (map['id'] as num).toInt(),
         vocabSize: (map['vocabSize'] as num).toInt(),
       );
     case 'loraParse':
-      return FfiErrorExceptionLoraParse(
-        detail: map['detail'] as String,
-      );
+      return FfiErrorExceptionLoraParse(detail: map['detail'] as String);
     case 'outOfMemory':
       return FfiErrorExceptionOutOfMemory(
         requestedBytes: (map['requestedBytes'] as num).toInt(),
@@ -2192,7 +2237,8 @@ FfiErrorException _decodeFfiErrorException(Object? raw) {
 final class BackendPreferenceFfiCodec {
   const BackendPreferenceFfiCodec._();
 
-  static String encode(BackendPreference value) => _encodeBackendPreference(value);
+  static String encode(BackendPreference value) =>
+      _encodeBackendPreference(value);
 
   static BackendPreference decode(String raw) => _decodeBackendPreference(raw);
 }
@@ -2232,11 +2278,11 @@ final class ToolFormatFfiCodec {
 final class FfiErrorExceptionFfiCodec {
   const FfiErrorExceptionFfiCodec._();
 
-  static String encode(FfiErrorException value) => _encodeFfiErrorException(value);
+  static String encode(FfiErrorException value) =>
+      _encodeFfiErrorException(value);
 
   static FfiErrorException decode(Object? raw) => _decodeFfiErrorException(raw);
 }
-
 
 /// Remote model-bundle downloader + on-disk cache. Wraps
 /// [`cera::bundle::BundleRepo`]; construct once per application with
@@ -2264,7 +2310,8 @@ final class BundleRepo {
   /// Create a new repo rooted at `store_dir`. The directory doesn't
   /// need to exist yet — it's created on the first download. Pass
   /// the same path to subsequent runs to reuse the cached bundles.
-  static BundleRepo create(String storeDir) => _unsupportedOnWeb('BundleRepo.create');
+  static BundleRepo create(String storeDir) =>
+      _unsupportedOnWeb('BundleRepo.create');
 
   /// Create a new repo rooted at `store_dir` with a foreign
   /// [`DownloadProgressSink`] attached. The sink fires periodically
@@ -2281,7 +2328,10 @@ final class BundleRepo {
   /// down the sink mid-app-lifecycle, drop the repo + construct a
   /// new one — Arc-based, so all in-flight calls finish on the
   /// old sink and new calls go to the new one.
-  static BundleRepo withProgress(String storeDir, DownloadProgressSink progress) => _unsupportedOnWeb('BundleRepo.withProgress');
+  static BundleRepo withProgress(
+    String storeDir,
+    DownloadProgressSink progress,
+  ) => _unsupportedOnWeb('BundleRepo.withProgress');
 
   /// Total bytes currently held in the cache. Returns `0` if the
   /// `store_dir` doesn't exist yet (no downloads have run).
@@ -2314,8 +2364,10 @@ final class BundleRepo {
 }
 
 final class BundleRepoFfiCodec {
-  static int lower(BundleRepo value) => _unsupportedOnWeb('BundleRepoFfiCodec.lower');
-  static BundleRepo lift(int handle) => _unsupportedOnWeb('BundleRepoFfiCodec.lift');
+  static int lower(BundleRepo value) =>
+      _unsupportedOnWeb('BundleRepoFfiCodec.lower');
+  static BundleRepo lift(int handle) =>
+      _unsupportedOnWeb('BundleRepoFfiCodec.lift');
 }
 
 /// Owning handle to a loaded model. Mirrors [`cera::CeraEngine`];
@@ -2344,7 +2396,11 @@ final class CeraEngine {
   /// the call in `spawn_blocking` / its equivalent. (An async
   /// counterpart matching `generate_async` could be added later;
   /// not in this PR.)
-  static CeraEngine fromBundleId(String bundleId, String quant, EngineConfig config) => _unsupportedOnWeb('CeraEngine.fromBundleId');
+  static CeraEngine fromBundleId(
+    String bundleId,
+    String quant,
+    EngineConfig config,
+  ) => _unsupportedOnWeb('CeraEngine.fromBundleId');
 
   /// Async variant of [`CeraEngine::from_bundle_id`] — offloads the
   /// manifest + GGUF download and the engine construction onto a
@@ -2373,7 +2429,11 @@ final class CeraEngine {
   /// `JoinError` from a panicking blocking closure surfaces as
   /// [`FfiError::Backend`] with a diagnostic prefix, same as
   /// [`Session::generate_async`].
-  static Future<CeraEngine> fromBundleIdAsync(String bundleId, String quant, EngineConfig config) => _unsupportedOnWeb('CeraEngine.fromBundleIdAsync');
+  static Future<CeraEngine> fromBundleIdAsync(
+    String bundleId,
+    String quant,
+    EngineConfig config,
+  ) => _unsupportedOnWeb('CeraEngine.fromBundleIdAsync');
 
   /// Load a model from GGUF bytes already in memory.
   ///
@@ -2403,7 +2463,8 @@ final class CeraEngine {
   /// audio decoder. Multimodal models need
   /// [`CeraEngine::from_parts`], `from_path`, or
   /// [`CeraEngine::from_bundle_id`]. `config.bundle_repo` is ignored.
-  static CeraEngine fromBytes(Uint8List bytes, EngineConfig config) => _unsupportedOnWeb('CeraEngine.fromBytes');
+  static CeraEngine fromBytes(Uint8List bytes, EngineConfig config) =>
+      _unsupportedOnWeb('CeraEngine.fromBytes');
 
   /// Async variant of [`CeraEngine::from_bytes`]: the in-memory twin of
   /// [`CeraEngine::from_path_async`], for callers with no filesystem.
@@ -2415,7 +2476,10 @@ final class CeraEngine {
   /// The `bytes` are moved into the blocking task, so a dropped future
   /// releases them when the task finishes rather than when it is
   /// dropped.
-  static Future<CeraEngine> fromBytesAsync(Uint8List bytes, EngineConfig config) => _unsupportedOnWeb('CeraEngine.fromBytesAsync');
+  static Future<CeraEngine> fromBytesAsync(
+    Uint8List bytes,
+    EngineConfig config,
+  ) => _unsupportedOnWeb('CeraEngine.fromBytesAsync');
 
   /// Load a multi-file bundle from memory: the model GGUF plus its
   /// multimodal projector ("mmproj").
@@ -2450,7 +2514,12 @@ final class CeraEngine {
   /// committed resident memory for the engine's lifetime, and a VL
   /// bundle is the model *plus* the tower. `config.bundle_repo` is
   /// ignored.
-  static CeraEngine fromParts(Uint8List bytes, Uint8List? multimodalProjector, String? inferenceType, EngineConfig config) => _unsupportedOnWeb('CeraEngine.fromParts');
+  static CeraEngine fromParts(
+    Uint8List bytes,
+    Uint8List? multimodalProjector,
+    String? inferenceType,
+    EngineConfig config,
+  ) => _unsupportedOnWeb('CeraEngine.fromParts');
 
   /// Async variant of [`CeraEngine::from_parts`].
   ///
@@ -2459,7 +2528,12 @@ final class CeraEngine {
   /// off the caller's thread, and the vision encoder's weights are
   /// built during the load. Same weak cancellation, and both buffers
   /// are moved into the blocking task.
-  static Future<CeraEngine> fromPartsAsync(Uint8List bytes, Uint8List? multimodalProjector, String? inferenceType, EngineConfig config) => _unsupportedOnWeb('CeraEngine.fromPartsAsync');
+  static Future<CeraEngine> fromPartsAsync(
+    Uint8List bytes,
+    Uint8List? multimodalProjector,
+    String? inferenceType,
+    EngineConfig config,
+  ) => _unsupportedOnWeb('CeraEngine.fromPartsAsync');
 
   /// Load a model from a local filesystem path. Accepts the same
   /// inputs as the native [`cera::CeraEngine::from_path`]: a bare
@@ -2470,7 +2544,8 @@ final class CeraEngine {
   /// `config.bundle_repo` must be set — otherwise those URLs fail
   /// to resolve. For a pure-local workflow (bundle already on
   /// disk) leave `bundle_repo = None`.
-  static CeraEngine fromPath(String path, EngineConfig config) => _unsupportedOnWeb('CeraEngine.fromPath');
+  static CeraEngine fromPath(String path, EngineConfig config) =>
+      _unsupportedOnWeb('CeraEngine.fromPath');
 
   /// Async variant of [`CeraEngine::from_path`]: moves the GGUF open,
   /// tokenizer build, and KV allocation onto a tokio blocking worker.
@@ -2487,7 +2562,8 @@ final class CeraEngine {
   /// the task only while it is still queued. Engine construction has no
   /// cooperative cancel point, so once started it runs to completion and
   /// the result is dropped.
-  static Future<CeraEngine> fromPathAsync(String path, EngineConfig config) => _unsupportedOnWeb('CeraEngine.fromPathAsync');
+  static Future<CeraEngine> fromPathAsync(String path, EngineConfig config) =>
+      _unsupportedOnWeb('CeraEngine.fromPathAsync');
 
   /// Render the model's chat template against a sequence of
   /// `ChatMessage`s. `add_generation_prompt = true` appends the
@@ -2498,12 +2574,19 @@ final class CeraEngine {
   /// Returns [`FfiError::Backend`] if the model has no chat
   /// template (check [`CeraEngine::has_chat_template`] first) or
   /// if the template fails to render against the supplied messages.
-  String applyChatTemplate(List<ChatMessage> messages, bool addGenerationPrompt) => _unsupportedOnWeb('CeraEngine.applyChatTemplate');
+  String applyChatTemplate(
+    List<ChatMessage> messages,
+    bool addGenerationPrompt,
+  ) => _unsupportedOnWeb('CeraEngine.applyChatTemplate');
 
   /// Like [`CeraEngine::apply_chat_template`], but also passes a `tools`
   /// array so a tool-trained model renders its tool-definition block. Pass an
   /// empty `tools` for identical behavior to the plain call.
-  String applyChatTemplateWithTools(List<ChatMessage> messages, List<ToolDef> tools, bool addGenerationPrompt) => _unsupportedOnWeb('CeraEngine.applyChatTemplateWithTools');
+  String applyChatTemplateWithTools(
+    List<ChatMessage> messages,
+    List<ToolDef> tools,
+    bool addGenerationPrompt,
+  ) => _unsupportedOnWeb('CeraEngine.applyChatTemplateWithTools');
 
   /// Beginning-of-sequence token ID, if the model has one.
   /// LLaMA-family models typically do; some don't. Honor
@@ -2513,7 +2596,8 @@ final class CeraEngine {
 
   /// What this model accepts as input / emits as output. Derived at
   /// load time from the manifest's `inference_type`.
-  ModalityCapabilities capabilities() => _unsupportedOnWeb('CeraEngine.capabilities');
+  ModalityCapabilities capabilities() =>
+      _unsupportedOnWeb('CeraEngine.capabilities');
 
   /// Resolved context-window size (KV cache cap) the engine was
   /// configured with. Mirrors the `context_size` field of the
@@ -2537,11 +2621,18 @@ final class CeraEngine {
   /// only appends bytes for IDs it has in `vocab.get(id)`. No
   /// substitution glyph, no error. Callers that want to detect
   /// invalid IDs should validate against `vocab_size()` first.
-  String decodeTokens(List<int> tokens) => _unsupportedOnWeb('CeraEngine.decodeTokens');
+  String decodeTokens(List<int> tokens) =>
+      _unsupportedOnWeb('CeraEngine.decodeTokens');
+
+  /// Returns default `GenerateOpts` for this engine, pre-populated with
+  /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+  GenerateOpts defaultGenerateOpts() =>
+      _unsupportedOnWeb('CeraEngine.defaultGenerateOpts');
 
   /// Encode `text` into token IDs using the model's BPE tokenizer.
   /// Empty input returns an empty vec.
-  List<int> encodeText(String text) => _unsupportedOnWeb('CeraEngine.encodeText');
+  List<int> encodeText(String text) =>
+      _unsupportedOnWeb('CeraEngine.encodeText');
 
   /// Encode `text` with optional special markers — the analog of llama.cpp's
   /// `llama_tokenize(..., add_special)`. When `add_special` is true, BOS is
@@ -2550,7 +2641,8 @@ final class CeraEngine {
   /// match llama.cpp for the same text (benchmark parity). With
   /// `add_special = false` this is exactly [`Self::encode_text`]. Prefer this
   /// over hand-prepending BOS via [`ModelMetadata::add_bos_token`].
-  List<int> encodeTextSpecial(String text, bool addSpecial) => _unsupportedOnWeb('CeraEngine.encodeTextSpecial');
+  List<int> encodeTextSpecial(String text, bool addSpecial) =>
+      _unsupportedOnWeb('CeraEngine.encodeTextSpecial');
 
   /// End-of-sequence / end-of-text token ID, if the model has one.
   /// Used as a default stop-token by the sampler; callers can also
@@ -2582,18 +2674,21 @@ final class CeraEngine {
   /// by `Arc` clone. The returned session outlives `&self`; the
   /// engine keeps the shared state live for every session it hands
   /// out. Cheap — no model load, just config + state allocation.
-  Session newSession(SessionConfig config) => _unsupportedOnWeb('CeraEngine.newSession');
+  Session newSession(SessionConfig config) =>
+      _unsupportedOnWeb('CeraEngine.newSession');
 
   /// Look up a special token by name (e.g. `<|im_start|>`,
   /// `<|im_end|>`, `<|tool_call|>`). Returns `None` if the token
   /// isn't defined in the tokenizer's vocab.
-  int? specialTokenId(String name) => _unsupportedOnWeb('CeraEngine.specialTokenId');
+  int? specialTokenId(String name) =>
+      _unsupportedOnWeb('CeraEngine.specialTokenId');
 
   /// The token id of `format`'s tool-call start marker (e.g.
   /// `<|tool_call_start|>`) in this model's vocab, for use as a lazy grammar
   /// trigger in `GenerateOpts.grammar_trigger_tokens`. `None` if the model's
   /// tokenizer lacks that special token.
-  int? toolCallStartToken(ToolFormat format) => _unsupportedOnWeb('CeraEngine.toolCallStartToken');
+  int? toolCallStartToken(ToolFormat format) =>
+      _unsupportedOnWeb('CeraEngine.toolCallStartToken');
 
   /// The tool-call format auto-detected from this model's architecture, or
   /// `None` if the architecture has no known tool convention.
@@ -2606,7 +2701,8 @@ final class CeraEngine {
   ///
   /// Blocking: runs a full prefill + greedy decode. Foreign async runtimes should wrap the call in
   /// `spawn_blocking` / its equivalent.
-  String transcribe(List<double> pcm, int sampleRate) => _unsupportedOnWeb('CeraEngine.transcribe');
+  String transcribe(List<double> pcm, int sampleRate) =>
+      _unsupportedOnWeb('CeraEngine.transcribe');
 
   /// Total vocabulary size — the number of distinct token IDs the
   /// model can emit. Sourced from the model's config (matches
@@ -2617,8 +2713,10 @@ final class CeraEngine {
 }
 
 final class CeraEngineFfiCodec {
-  static int lower(CeraEngine value) => _unsupportedOnWeb('CeraEngineFfiCodec.lower');
-  static CeraEngine lift(int handle) => _unsupportedOnWeb('CeraEngineFfiCodec.lift');
+  static int lower(CeraEngine value) =>
+      _unsupportedOnWeb('CeraEngineFfiCodec.lower');
+  static CeraEngine lift(int handle) =>
+      _unsupportedOnWeb('CeraEngineFfiCodec.lift');
 }
 
 /// Foreign-trait callback for download progress events from
@@ -2650,8 +2748,10 @@ abstract interface class DownloadProgressSink {
 }
 
 final class DownloadProgressSinkFfiCodec {
-  static int lower(DownloadProgressSink value) => _unsupportedOnWeb('DownloadProgressSinkFfiCodec.lower');
-  static DownloadProgressSink lift(int handle) => _unsupportedOnWeb('DownloadProgressSinkFfiCodec.lift');
+  static int lower(DownloadProgressSink value) =>
+      _unsupportedOnWeb('DownloadProgressSinkFfiCodec.lower');
+  static DownloadProgressSink lift(int handle) =>
+      _unsupportedOnWeb('DownloadProgressSinkFfiCodec.lift');
 }
 
 /// A loaded LoRA adapter, ready to attach to a [`Session`] via
@@ -2668,12 +2768,14 @@ final class LoraAdapters {
   /// Load a llama.cpp-format GGUF adapter (`convert_lora_to_gguf` output) from
   /// a local path. `alpha` is read from the adapter's `adapter.lora.alpha`
   /// metadata (missing ⇒ scale = 1).
-  static LoraAdapters fromGguf(String path) => _unsupportedOnWeb('LoraAdapters.fromGguf');
+  static LoraAdapters fromGguf(String path) =>
+      _unsupportedOnWeb('LoraAdapters.fromGguf');
 
   /// Load a PEFT `.safetensors` adapter from a local path. PEFT stores `alpha`
   /// in a sibling `adapter_config.json`, so pass it explicitly here (`None` ⇒
   /// scale = 1, i.e. `alpha == rank`).
-  static LoraAdapters fromSafetensors(String path, double? alpha) => _unsupportedOnWeb('LoraAdapters.fromSafetensors');
+  static LoraAdapters fromSafetensors(String path, double? alpha) =>
+      _unsupportedOnWeb('LoraAdapters.fromSafetensors');
 
   /// Number of `(layer, target)` low-rank deltas the adapter carries — for
   /// diagnostics / logging.
@@ -2681,8 +2783,10 @@ final class LoraAdapters {
 }
 
 final class LoraAdaptersFfiCodec {
-  static int lower(LoraAdapters value) => _unsupportedOnWeb('LoraAdaptersFfiCodec.lower');
-  static LoraAdapters lift(int handle) => _unsupportedOnWeb('LoraAdaptersFfiCodec.lift');
+  static int lower(LoraAdapters value) =>
+      _unsupportedOnWeb('LoraAdaptersFfiCodec.lower');
+  static LoraAdapters lift(int handle) =>
+      _unsupportedOnWeb('LoraAdaptersFfiCodec.lift');
 }
 
 /// Streaming sink for decode output. Foreign callers implement this
@@ -2703,12 +2807,14 @@ abstract interface class ModalitySink {
   /// `Vec<u32>` is transferred to the callback, so implementations
   /// may retain or store it directly if needed — no clone required.
   void onTextTokens(List<int> tokens);
+
   /// Called with each chunk of generated PCM audio samples. Not
   /// called for text-only models; LFM2-Audio-class models emit here.
   /// The `sample_rate` is the model's native output rate (typically
   /// 24000 for LFM2-Audio) and is stable across the whole generate
   /// call.
   void onAudioFrames(List<double> pcm, int sampleRate);
+
   /// Called exactly once per [`Session::generate_streaming`] call,
   /// as the last thing before the wrapper returns. Fires for both
   /// success (`MaxTokens`, `Stop`, `Cancelled`, `ContextFull`) and
@@ -2719,8 +2825,10 @@ abstract interface class ModalitySink {
 }
 
 final class ModalitySinkFfiCodec {
-  static int lower(ModalitySink value) => _unsupportedOnWeb('ModalitySinkFfiCodec.lower');
-  static ModalitySink lift(int handle) => _unsupportedOnWeb('ModalitySinkFfiCodec.lift');
+  static int lower(ModalitySink value) =>
+      _unsupportedOnWeb('ModalitySinkFfiCodec.lower');
+  static ModalitySink lift(int handle) =>
+      _unsupportedOnWeb('ModalitySinkFfiCodec.lift');
 }
 
 /// Stateful inference handle. Wraps [`cera::Session`] behind a
@@ -2779,7 +2887,8 @@ final class Session {
   /// (warn logged at `CeraEngine::from_path`).
   /// - `ContextOverflow` / `Cancelled` propagate from the
   /// underlying prefill.
-  void appendAudio(List<double> samples, int sampleRate) => _unsupportedOnWeb('Session.appendAudio');
+  void appendAudio(List<double> samples, int sampleRate) =>
+      _unsupportedOnWeb('Session.appendAudio');
 
   /// Append an encoded image (PNG / JPEG bytes, auto-detected) to the
   /// context. The image is decoded, resized, normalized, and run
@@ -2831,7 +2940,8 @@ final class Session {
   /// mismatch.
   /// - `ContextOverflow` / `Cancelled` propagate from the
   /// underlying prefill.
-  void appendImage(Uint8List bytes, int? maxLongSize) => _unsupportedOnWeb('Session.appendImage');
+  void appendImage(Uint8List bytes, int? maxLongSize) =>
+      _unsupportedOnWeb('Session.appendImage');
 
   /// Append raw text to the context, running a prefill over just
   /// the new tokens. `EmptyInput` error if `text` is empty.
@@ -2839,7 +2949,8 @@ final class Session {
 
   /// Append pre-tokenized IDs. Useful when the caller has its own
   /// tokenizer + chat-template pipeline.
-  void appendTokens(List<int> tokens) => _unsupportedOnWeb('Session.appendTokens');
+  void appendTokens(List<int> tokens) =>
+      _unsupportedOnWeb('Session.appendTokens');
 
   /// Attach a [`LoraAdapters`] to this session (generated as `attachLora` in
   /// Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
@@ -2854,7 +2965,8 @@ final class Session {
   /// means it fits but this backend has no hook for something it adapts, so
   /// the same adapter works on another backend (today: a mixture-of-experts
   /// adapter needs the CPU backend).
-  void attachLora(LoraAdapters adapters) => _unsupportedOnWeb('Session.attachLora');
+  void attachLora(LoraAdapters adapters) =>
+      _unsupportedOnWeb('Session.attachLora');
 
   /// Signal in-flight `generate()` to exit with
   /// `FinishReason::Cancelled` at the next between-token check.
@@ -2863,7 +2975,8 @@ final class Session {
 
   /// Capabilities reported by the loaded model. Cheap — reads a
   /// cached copy, no lock.
-  ModalityCapabilities capabilities() => _unsupportedOnWeb('Session.capabilities');
+  ModalityCapabilities capabilities() =>
+      _unsupportedOnWeb('Session.capabilities');
 
   /// Clear the cancel flag without dropping any session state.
   /// Use this after observing a cancellation signal — either
@@ -2887,13 +3000,19 @@ final class Session {
   /// any thread (mirrors the shape of [`Self::cancel`]).
   void clearCancel() => _unsupportedOnWeb('Session.clearCancel');
 
+  /// Returns default `GenerateOpts` for this session, pre-populated with
+  /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+  GenerateOpts defaultGenerateOpts() =>
+      _unsupportedOnWeb('Session.defaultGenerateOpts');
+
   /// Run autoregressive decode and return all emitted tokens +
   /// a summary. Synchronous — the call blocks until the decode
   /// loop exits (`max_tokens`, EOS, `cancel()`, or error).
   ///
   /// For streaming (per-chunk delivery) and async, see the PR 4 /
   /// PR 5 follow-ups in `cera-ffi/README.md`.
-  GenerateOutput generate(GenerateOpts opts) => _unsupportedOnWeb('Session.generate');
+  GenerateOutput generate(GenerateOpts opts) =>
+      _unsupportedOnWeb('Session.generate');
 
   /// Async variant of [`Session::generate`] — runs buffered decode
   /// (returning every emitted token + a summary) on a tokio blocking
@@ -2916,7 +3035,8 @@ final class Session {
   /// as sync [`Session::generate`]. `JoinError` from a panic in the
   /// blocking closure surfaces as [`FfiError::Backend`] with a
   /// diagnostic prefix.
-  Future<GenerateOutput> generateAsync(GenerateOpts opts) => _unsupportedOnWeb('Session.generateAsync');
+  Future<GenerateOutput> generateAsync(GenerateOpts opts) =>
+      _unsupportedOnWeb('Session.generateAsync');
 
   /// Run autoregressive decode, streaming every token (and audio
   /// frame, for audio-capable models) to a foreign [`ModalitySink`]
@@ -2949,7 +3069,8 @@ final class Session {
   /// a terminal `on_done(FinishReason::Error { message })` so
   /// foreign consumers have a reliable end-of-stream signal
   /// regardless of how the call exits.
-  GenerateSummary generateStreaming(GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('Session.generateStreaming');
+  GenerateSummary generateStreaming(GenerateOpts opts, ModalitySink sink) =>
+      _unsupportedOnWeb('Session.generateStreaming');
 
   /// Async variant of [`Session::generate_streaming`] — delivers
   /// tokens and audio frames to the foreign [`ModalitySink`] as the
@@ -2975,7 +3096,10 @@ final class Session {
   /// already stopped awaiting. For a queued-but-not-started decode,
   /// abort cancels the task without ever running the closure; no
   /// sink callbacks fire for that case (the decode never began).
-  Future<GenerateSummary> generateStreamingAsync(GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('Session.generateStreamingAsync');
+  Future<GenerateSummary> generateStreamingAsync(
+    GenerateOpts opts,
+    ModalitySink sink,
+  ) => _unsupportedOnWeb('Session.generateStreamingAsync');
 
   /// Whether a LoRA adapter is currently attached to this session.
   bool hasLora() => _unsupportedOnWeb('Session.hasLora');
@@ -2988,7 +3112,8 @@ final class Session {
 
   /// Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
   /// (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
-  Uint8List hiddenStatesForText(String text) => _unsupportedOnWeb('Session.hiddenStatesForText');
+  Uint8List hiddenStatesForText(String text) =>
+      _unsupportedOnWeb('Session.hiddenStatesForText');
 
   /// Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
   /// `--pooling none` / `llama_get_embeddings_ith` vector) for `tokens`,
@@ -3008,12 +3133,14 @@ final class Session {
   /// Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
   /// doesn't implement hidden-state extraction; `InvalidToken` if any id is
   /// `>= vocab_size`.
-  Uint8List hiddenStatesForTokens(List<int> tokens) => _unsupportedOnWeb('Session.hiddenStatesForTokens');
+  Uint8List hiddenStatesForTokens(List<int> tokens) =>
+      _unsupportedOnWeb('Session.hiddenStatesForTokens');
 
   /// Mean-pooled hidden state — a single `[hidden_size]` vector (the common
   /// classifier path: pool in Rust, ship `D` floats not `T*D`). Returned as
   /// `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
-  List<double> hiddenStatesMeanPooled(List<int> tokens) => _unsupportedOnWeb('Session.hiddenStatesMeanPooled');
+  List<double> hiddenStatesMeanPooled(List<int> tokens) =>
+      _unsupportedOnWeb('Session.hiddenStatesMeanPooled');
 
   /// Current KV position — how many tokens live in the cache.
   /// Atomic-backed; safe to call from a different thread while
@@ -3039,7 +3166,8 @@ final class Session {
   /// image-encode budget once. See [`Self::append_image`] for the cap
   /// semantics (shrinks the encoded target, never upscales, takes
   /// precedence over the model's minimum-resolution floor).
-  void setImageMaxLongSize(int? maxLongSize) => _unsupportedOnWeb('Session.setImageMaxLongSize');
+  void setImageMaxLongSize(int? maxLongSize) =>
+      _unsupportedOnWeb('Session.setImageMaxLongSize');
 }
 
 final class SessionFfiCodec {
@@ -3072,7 +3200,8 @@ String cpuBackendReport() => _unsupportedOnWeb('cpuBackendReport');
 /// Detect the tool-call format for a model architecture string (e.g.
 /// `"lfm2"`, `"qwen3"`). Returns `None` for architectures with no known
 /// convention — the caller may still choose a format explicitly.
-ToolFormat? detectToolFormat(String architecture) => _unsupportedOnWeb('detectToolFormat');
+ToolFormat? detectToolFormat(String architecture) =>
+    _unsupportedOnWeb('detectToolFormat');
 
 /// List every bundle published on `LiquidAI/LeapBundles`, so a picker
 /// can offer `<name>, <quant>` pairs instead of making the user type a
@@ -3105,16 +3234,19 @@ List<LeapBundleEntry> listLeapBundles() => _unsupportedOnWeb('listLeapBundles');
 /// blocking GET queued on the pool. A request already in flight runs
 /// to completion; `reqwest::blocking` offers nothing to interrupt, and
 /// the response is small.
-Future<List<LeapBundleEntry>> listLeapBundlesAsync() => _unsupportedOnWeb('listLeapBundlesAsync');
+Future<List<LeapBundleEntry>> listLeapBundlesAsync() =>
+    _unsupportedOnWeb('listLeapBundlesAsync');
 
 /// Parse tool calls out of generated model text for the given `format`.
 /// Returns an empty list when the reply contains no tool call (the model
 /// answered in prose). Errors only when a call section is present but
 /// unrecoverably malformed.
-List<ToolCall> parseToolCalls(String text, ToolFormat format) => _unsupportedOnWeb('parseToolCalls');
+List<ToolCall> parseToolCalls(String text, ToolFormat format) =>
+    _unsupportedOnWeb('parseToolCalls');
 
 /// Build a GBNF grammar string constraining output to a valid call for one
 /// of `tools`, in `format`. Put the result in `GenerateOpts.grammar` and set
 /// `GenerateOpts.grammar_trigger_tokens` (see
 /// [`CeraEngine::tool_call_start_token`]) for a lazy tool-call trigger.
-String toolGrammar(List<ToolDef> tools, ToolFormat format) => _unsupportedOnWeb('toolGrammar');
+String toolGrammar(List<ToolDef> tools, ToolFormat format) =>
+    _unsupportedOnWeb('toolGrammar');

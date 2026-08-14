@@ -866,6 +866,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts(): Int
+
     external fun uniffi_cera_ffi_checksum_method_ceraengine_encode_text(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special(): Int
@@ -915,6 +917,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_session_capabilities(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_clear_cancel(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_default_generate_opts(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_generate(): Int
 
@@ -1110,6 +1114,11 @@ internal object UniffiLib {
     external fun uniffi_cera_ffi_fn_method_ceraengine_decode_tokens(
         `ptr`: Long,
         `tokens`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ceraengine_default_generate_opts(
+        `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
@@ -1317,6 +1326,11 @@ internal object UniffiLib {
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_session_default_generate_opts(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_method_session_generate(
         `ptr`: Long,
@@ -1678,6 +1692,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens() != 27407) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts() != 26137) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text() != 52220) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1751,6 +1768,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_clear_cancel() != 11168) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_generate() != 57005) {
@@ -2811,6 +2831,12 @@ public interface CeraEngineInterface {
     fun `decodeTokens`(`tokens`: List<kotlin.UInt>): kotlin.String
 
     /**
+     * Returns default `GenerateOpts` for this engine, pre-populated with
+     * advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+     */
+    fun `defaultGenerateOpts`(): GenerateOpts
+
+    /**
      * Encode `text` into token IDs using the model's BPE tokenizer.
      * Empty input returns an empty vec.
      */
@@ -3154,6 +3180,22 @@ open class CeraEngine :
                     UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_decode_tokens(
                         it,
                         FfiConverterSequenceUInt.lower(`tokens`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Returns default `GenerateOpts` for this engine, pre-populated with
+     * advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+     */
+    override fun `defaultGenerateOpts`(): GenerateOpts =
+        FfiConverterTypeGenerateOpts.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_default_generate_opts(
+                        it,
                         _status,
                     )
                 }
@@ -5102,6 +5144,12 @@ public interface SessionInterface {
     fun `clearCancel`()
 
     /**
+     * Returns default `GenerateOpts` for this session, pre-populated with
+     * advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+     */
+    fun `defaultGenerateOpts`(): GenerateOpts
+
+    /**
      * Run autoregressive decode and return all emitted tokens +
      * a summary. Synchronous — the call blocks until the decode
      * loop exits (`max_tokens`, EOS, `cancel()`, or error).
@@ -5645,6 +5693,23 @@ open class Session :
                 )
             }
         }
+
+    /**
+     * Returns default `GenerateOpts` for this session, pre-populated with
+     * advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+     */
+    @Throws(FfiException::class)
+    override fun `defaultGenerateOpts`(): GenerateOpts =
+        FfiConverterTypeGenerateOpts.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_default_generate_opts(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
 
     /**
      * Run autoregressive decode and return all emitted tokens +

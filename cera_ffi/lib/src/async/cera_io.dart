@@ -95,10 +95,20 @@ Future<List<CeraBundle>> listBundles(CeraOptions options) async {
   // rather than stalling the isolate. A picker is usually opened from a button
   // press, which is exactly the thread not to block.
   final entries = await listLeapBundlesAsync();
-  return [
+  final list = [
     for (final entry in entries)
-      CeraBundle(name: entry.name, quants: entry.quants),
+      CeraBundle(
+        name: entry.name,
+        quants:
+            entry.quants.toList()
+              ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase())),
+      ),
   ];
+  list.sort(
+    (a, b) =>
+        a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()),
+  );
+  return list;
 }
 
 /// Downloads and opens a published bundle. See [Cera.openBundle].

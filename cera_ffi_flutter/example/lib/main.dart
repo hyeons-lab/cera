@@ -20,6 +20,7 @@
 //   flutter run -d chrome
 
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
@@ -161,6 +162,21 @@ class CeraExampleApp extends StatelessWidget {
   }
 }
 
+/// Generation statistics for an assistant turn.
+class TurnStats {
+  const TurnStats({
+    required this.tokens,
+    required this.totalMs,
+    this.ttftMs,
+    required this.tokensPerSecond,
+  });
+
+  final int tokens;
+  final int totalMs;
+  final int? ttftMs;
+  final double tokensPerSecond;
+}
+
 /// One message in the transcript.
 class Turn {
   Turn({
@@ -168,12 +184,18 @@ class Turn {
     required this.text,
     this.imageBytes,
     this.imageName,
+    this.isGenerating = false,
+    this.statusText,
+    this.stats,
   });
 
   final String role;
   String text;
   final Uint8List? imageBytes;
   final String? imageName;
+  bool isGenerating;
+  String? statusText;
+  TurnStats? stats;
 
   bool get isUser => role == 'user';
 }
@@ -425,7 +447,12 @@ class _ChatPageState extends State<ChatPage> {
     final imageName = _pendingImageName;
     if ((prompt.isEmpty && imageBytes == null) || cera == null || _busy) return;
 
-    _input.clear();
+    final assistantTurn = Turn(
+      role: 'assistant',
+      text: '',
+      isGenerating: true,
+      statusText: imageBytes != null ? 'Analyzing image...' : 'Thinking...',
+    );
     setState(() {
       _pendingImageBytes = null;
       _pendingImageName = null;
@@ -437,7 +464,7 @@ class _ChatPageState extends State<ChatPage> {
           imageName: imageName,
         ),
       );
-      _turns.add(Turn(role: 'assistant', text: ''));
+      _turns.add(assistantTurn);
     });
     _scrollToBottom();
 
@@ -447,10 +474,17 @@ class _ChatPageState extends State<ChatPage> {
         await cera.appendImage(imageBytes);
       } catch (err) {
         if (mounted) {
-          setState(() => _turns.last.text = 'Error appending image: $err');
+          setState(() {
+            assistantTurn.isGenerating = false;
+            assistantTurn.text = 'Error appending image: $err';
+          });
         }
         return;
       }
+    }
+
+    if (mounted) {
+      setState(() => assistantTurn.statusText = 'Generating...');
     }
 
     final messagePrompt = prompt.isEmpty ? 'Describe this image.' : prompt;
@@ -458,7 +492,12 @@ class _ChatPageState extends State<ChatPage> {
     try {
       framed = await cera.applyChatTemplate([CeraMessage.user(messagePrompt)]);
     } on StateError catch (err) {
-      if (mounted) setState(() => _turns.last.text = 'Error: $err');
+      if (mounted) {
+        setState(() {
+          assistantTurn.isGenerating = false;
+          assistantTurn.text = 'Error: $err';
+        });
+      }
       return;
     } catch (_) {
       framed = messagePrompt;
@@ -472,15 +511,25 @@ class _ChatPageState extends State<ChatPage> {
     _finishTurn = () {
       if (!done.isCompleted) done.complete();
     };
+
+    final stopwatch = Stopwatch()..start();
+    int tokenCount = 0;
+    int? firstTokenMs;
+
     final sub = cera
         .generate(framed, maxTokens: 256)
         .listen(
           (piece) {
-            setState(() => _turns.last.text += piece);
+            firstTokenMs ??= stopwatch.elapsedMilliseconds;
+            tokenCount++;
+            setState(() => assistantTurn.text += piece);
             _scrollToBottom();
           },
           onError: (Object err) {
-            setState(() => _turns.last.text = 'Error: $err');
+            setState(() {
+              assistantTurn.isGenerating = false;
+              assistantTurn.text = 'Error: $err';
+            });
             if (!done.isCompleted) done.complete();
           },
           onDone: () {
@@ -495,6 +544,30 @@ class _ChatPageState extends State<ChatPage> {
     setState(() => _generation = sub);
 
     await done.future;
+    stopwatch.stop();
+    final totalMs = stopwatch.elapsedMilliseconds;
+    final ttft = firstTokenMs;
+    final decodeMs = ttft != null ? (totalMs - ttft) : totalMs;
+    final tps = tokenCount > 0 && decodeMs > 0
+        ? (tokenCount / (decodeMs / 1000.0))
+        : (tokenCount > 0 && totalMs > 0
+              ? (tokenCount / (totalMs / 1000.0))
+              : 0.0);
+
+    if (mounted) {
+      setState(() {
+        assistantTurn.isGenerating = false;
+        if (tokenCount > 0) {
+          assistantTurn.stats = TurnStats(
+            tokens: tokenCount,
+            totalMs: totalMs,
+            ttftMs: ttft,
+            tokensPerSecond: tps,
+          );
+        }
+      });
+    }
+
     _finishTurn = null;
     await sub.cancel();
     if (mounted) setState(() => _generation = null);
@@ -873,21 +946,29 @@ class _BundlePickerDialogState extends State<_BundlePickerDialog> {
                 ),
               );
             }
-            final bundles = snapshot.data;
-            if (bundles == null) {
+            final rawBundles = snapshot.data;
+            if (rawBundles == null) {
               return const Center(
                 child: CircularProgressIndicator(
                   valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF3B82F6)),
                 ),
               );
             }
+            final bundles = rawBundles.toList()
+              ..sort(
+                (a, b) => a.displayName.toLowerCase().compareTo(
+                  b.displayName.toLowerCase(),
+                ),
+              );
             return ListView.separated(
               itemCount: bundles.length,
               separatorBuilder: (_, _) =>
                   const Divider(color: Color(0xFF1E222D), height: 1),
               itemBuilder: (context, i) {
                 final bundle = bundles[i];
-                final n = bundle.quants.length;
+                final quants = bundle.quants.toList()
+                  ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+                final n = quants.length;
                 return ExpansionTile(
                   // Without a key the expanded state is not preserved across
                   // ListView recycling, so expanding a tile and scrolling away
@@ -905,7 +986,7 @@ class _BundlePickerDialogState extends State<_BundlePickerDialog> {
                     ),
                   ),
                   children: [
-                    for (final quant in bundle.quants)
+                    for (final quant in quants)
                       ListTile(
                         dense: true,
                         title: Text(
@@ -938,6 +1019,80 @@ class _BundlePickerDialogState extends State<_BundlePickerDialog> {
   }
 }
 
+class _TypingIndicator extends StatefulWidget {
+  const _TypingIndicator({this.label});
+
+  final String? label;
+
+  @override
+  State<_TypingIndicator> createState() => _TypingIndicatorState();
+}
+
+class _TypingIndicatorState extends State<_TypingIndicator>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1200),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          if (widget.label != null && widget.label!.isNotEmpty) ...[
+            Text(
+              widget.label!,
+              style: const TextStyle(
+                color: Color(0xFF94A3B8),
+                fontSize: 13,
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+            const SizedBox(width: 8),
+          ],
+          AnimatedBuilder(
+            animation: _controller,
+            builder: (context, _) {
+              return Row(
+                mainAxisSize: MainAxisSize.min,
+                children: List.generate(3, (index) {
+                  final offset = index * 0.2;
+                  final raw = (_controller.value - offset) % 1.0;
+                  final wave = math.sin(raw * math.pi);
+                  final scale = 0.6 + 0.4 * (wave < 0 ? 0 : wave);
+                  final opacity = 0.25 + 0.75 * (wave < 0 ? 0 : wave);
+                  return Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 2.5),
+                    width: 6.5,
+                    height: 6.5,
+                    decoration: BoxDecoration(
+                      color: const Color(
+                        0xFF38BDF8,
+                      ).withValues(alpha: opacity.clamp(0.2, 1.0)),
+                      shape: BoxShape.circle,
+                    ),
+                    transform: Matrix4.diagonal3Values(scale, scale, 1.0),
+                  );
+                }),
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _Bubble extends StatelessWidget {
   const _Bubble({required this.turn});
 
@@ -946,6 +1101,8 @@ class _Bubble extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isUser = turn.isUser;
+    final showTyping = !isUser && turn.text.isEmpty;
+
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -978,17 +1135,50 @@ class _Bubble extends StatelessWidget {
                   child: Image.memory(turn.imageBytes!, fit: BoxFit.contain),
                 ),
               ),
-              if (turn.text.isNotEmpty) const SizedBox(height: 8),
+              if (turn.text.isNotEmpty || showTyping) const SizedBox(height: 8),
             ],
-            if (turn.text.isNotEmpty || turn.imageBytes == null)
+            if (showTyping)
+              _TypingIndicator(label: turn.statusText ?? 'Generating...')
+            else if (turn.text.isNotEmpty || turn.imageBytes == null)
               Text(
-                turn.text.isEmpty ? '…' : turn.text,
+                turn.text,
                 style: TextStyle(
                   color: isUser ? Colors.white : const Color(0xFFF1F5F9),
                   fontSize: 14,
                   height: 1.45,
                 ),
               ),
+            if (turn.stats != null) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0B0C0E),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: const Color(0xFF1E222D)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.bolt_rounded,
+                      size: 13,
+                      color: Color(0xFF38BDF8),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      '${turn.stats!.tokens} tokens · ${turn.stats!.tokensPerSecond.toStringAsFixed(1)} tok/s · ${(turn.stats!.totalMs / 1000.0).toStringAsFixed(2)}s${turn.stats!.ttftMs != null ? " (TTFT ${turn.stats!.ttftMs}ms)" : ""}',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Color(0xFF8E95A5),
+                        fontFamily: 'monospace',
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ],
         ),
       ),

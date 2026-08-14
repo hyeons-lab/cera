@@ -165,13 +165,19 @@ Future<List<CeraBundle>> listBundles(CeraOptions options) async {
       worker._newId(),
       (id) => _Request(id: id, op: 'listBundles', moduleUrl: worker._moduleUrl),
     );
-    return [
+    final list = [
       for (final entry in (result as JSArray<_BundleEntry>).toDart)
         CeraBundle(
           name: entry.name,
-          quants: [for (final q in entry.quants.toDart) q.toDart],
+          quants: [for (final q in entry.quants.toDart) q.toDart]
+            ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase())),
         ),
     ];
+    list.sort(
+      (a, b) =>
+          a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()),
+    );
+    return list;
   } finally {
     // Always, including on failure: a worker left running holds the wasm module
     // it imported, and a picker that is opened and closed repeatedly would
