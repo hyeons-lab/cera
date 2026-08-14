@@ -94,6 +94,7 @@ def get_repo_guidelines() -> str:
 
 def call_gemini_api(api_key: str, prompt: str) -> str:
     model = "gemini-3.7-flash"
+    thinking_budget = int(os.getenv("ANTIGRAVITY_THINKING_BUDGET", "4096"))
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     payload = {
         "contents": [
@@ -103,7 +104,10 @@ def call_gemini_api(api_key: str, prompt: str) -> str:
         ],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 3000,
+            "maxOutputTokens": 8192,
+            "thinkingConfig": {
+                "thinkingBudget": thinking_budget,
+            },
         },
     }
 
@@ -115,13 +119,18 @@ def call_gemini_api(api_key: str, prompt: str) -> str:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             candidates = data.get("candidates", [])
             if candidates:
                 parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    return parts[0].get("text", "")
+                text_parts = [
+                    p.get("text", "")
+                    for p in parts
+                    if "text" in p and not p.get("thought", False)
+                ]
+                if text_parts:
+                    return "".join(text_parts).strip()
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         print(f"Gemini API model '{model}' HTTPError {e.code}: {body}", file=sys.stderr)
