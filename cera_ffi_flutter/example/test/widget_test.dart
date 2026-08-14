@@ -23,16 +23,18 @@ void main() {
     );
   });
 
-  testWidgets('the speed icon is disabled before a model is loaded', (
-    WidgetTester tester,
-  ) async {
-    await tester.pumpWidget(const CeraExampleApp());
+  testWidgets(
+    'the speed icon is disabled and vision attach is hidden before a model is loaded',
+    (WidgetTester tester) async {
+      await tester.pumpWidget(const CeraExampleApp());
 
-    final button = tester.widget<IconButton>(
-      find.widgetWithIcon(IconButton, Icons.speed),
-    );
-    expect(button.onPressed, isNull);
-  });
+      final button = tester.widget<IconButton>(
+        find.widgetWithIcon(IconButton, Icons.speed),
+      );
+      expect(button.onPressed, isNull);
+      expect(find.byIcon(Icons.add_photo_alternate_outlined), findsNothing);
+    },
+  );
 
   testWidgets('benchmark page displays the loaded model and enables run', (
     WidgetTester tester,

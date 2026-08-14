@@ -1654,3 +1654,37 @@ fn ignore_eos_does_not_override_active_grammar() {
         );
     }
 }
+
+#[test]
+fn generate_honors_pre_armed_cancel() {
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available — skipping");
+        return;
+    };
+
+    let gguf = cera::gguf::GgufFile::open(&model_path).unwrap();
+    let tokenizer = cera::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
+    let model = cera::model::load_model(gguf, None, 4096).unwrap();
+    let prompt_toks = tokenizer.encode("Hello");
+
+    let mut session = make_session(model, tokenizer, SessionConfig::default());
+    session.append_tokens(&prompt_toks).unwrap();
+
+    // Pre-arm cancel before calling generate
+    session.cancel();
+
+    let opts = GenerateOpts::default();
+    let mut sink = CollectSink(Vec::new());
+    let summary = session.generate(&opts, &mut sink).unwrap();
+
+    assert_eq!(summary.finish_reason, FinishReason::Cancelled);
+    assert_eq!(summary.tokens_generated, 0);
+    assert!(sink.0.is_empty());
+    // Cancel flag was consumed by the cancelled generate
+    assert!(!session.cancel_handle().load(std::sync::atomic::Ordering::Relaxed));
+
+    // Next generate after appending should work without being cancelled
+    session.append_tokens(&prompt_toks).unwrap();
+    let summary2 = session.generate(&opts, &mut sink).unwrap();
+    assert_ne!(summary2.finish_reason, FinishReason::Cancelled);
+}

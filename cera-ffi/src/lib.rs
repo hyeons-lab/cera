@@ -1067,6 +1067,26 @@ impl CeraEngine {
         }
     }
 
+    /// Returns default `GenerateOpts` for this engine, pre-populated with
+    /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+    pub fn default_generate_opts(&self) -> GenerateOpts {
+        let core = self.inner.default_generate_opts();
+        GenerateOpts {
+            max_tokens: core.max_tokens,
+            temperature: core.temperature,
+            top_p: core.top_p,
+            top_k: core.top_k,
+            min_p: core.min_p,
+            repetition_penalty: core.repetition_penalty,
+            stop_tokens: core.stop_tokens,
+            ignore_eos: core.ignore_eos,
+            grammar: None,
+            grammar_trigger_tokens: core.grammar_trigger_tokens,
+            flush_every_tokens: core.flush_every_tokens,
+            flush_every_ms: core.flush_every_ms,
+        }
+    }
+
     // ----- Tokenizer surface (PR 13) ---------------------------------
     //
     // Wraps `cera::tokenizer::BpeTokenizer` so foreign callers can
@@ -1925,6 +1945,27 @@ impl Session {
     pub fn set_image_max_long_size(&self, max_long_size: Option<u32>) -> Result<(), FfiError> {
         self.lock_inner()?.set_image_max_long_size(max_long_size);
         Ok(())
+    }
+
+    /// Returns default `GenerateOpts` for this session, pre-populated with
+    /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+    pub fn default_generate_opts(&self) -> Result<GenerateOpts, FfiError> {
+        let guard = self.lock_inner()?;
+        let core = guard.default_generate_opts();
+        Ok(GenerateOpts {
+            max_tokens: core.max_tokens,
+            temperature: core.temperature,
+            top_p: core.top_p,
+            top_k: core.top_k,
+            min_p: core.min_p,
+            repetition_penalty: core.repetition_penalty,
+            stop_tokens: core.stop_tokens.clone(),
+            ignore_eos: core.ignore_eos,
+            grammar: None,
+            grammar_trigger_tokens: core.grammar_trigger_tokens.clone(),
+            flush_every_tokens: core.flush_every_tokens,
+            flush_every_ms: core.flush_every_ms,
+        })
     }
 
     /// Run autoregressive decode and return all emitted tokens +
@@ -3307,5 +3348,16 @@ mod tests {
         );
         assert_eq!(detect_tool_format("qwen3".into()), Some(ToolFormat::Hermes));
         assert_eq!(detect_tool_format("gpt2".into()), None);
+    }
+
+    #[test]
+    fn generate_opts_defaults_match_core() {
+        let opts = GenerateOpts::default();
+        let core = cera::GenerateOpts::default();
+        assert_eq!(opts.temperature, core.temperature);
+        assert_eq!(opts.top_p, core.top_p);
+        assert_eq!(opts.top_k, core.top_k);
+        assert_eq!(opts.min_p, core.min_p);
+        assert_eq!(opts.repetition_penalty, core.repetition_penalty);
     }
 }

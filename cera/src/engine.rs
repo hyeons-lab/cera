@@ -732,6 +732,7 @@ impl CeraEngine {
         if let Some(gpu) = &self.gpu_audio_encoder {
             session.attach_gpu_audio_encoder(Arc::clone(gpu));
         }
+        session.set_default_generate_opts(self.default_generate_opts());
         Ok(session)
     }
 
@@ -956,6 +957,13 @@ impl CeraEngine {
     /// Borrow the engine config.
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    /// Returns default generation options for this engine, populated from the
+    /// manifest's advisory sampling defaults (if loaded from a bundle manifest)
+    /// or standard defaults.
+    pub fn default_generate_opts(&self) -> crate::session::GenerateOpts {
+        crate::session::GenerateOpts::from_manifest(&self.manifest)
     }
 
     /// Configure the model's KV prefix cache. Passthrough to

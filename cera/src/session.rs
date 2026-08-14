@@ -156,6 +156,39 @@ impl Default for GenerateOpts {
     }
 }
 
+impl GenerateOpts {
+    /// Constructs a `GenerateOpts` seeded with the advisory defaults from the
+    /// given manifest (if any), falling back to standard defaults for unmentioned fields.
+    pub fn from_manifest(manifest: &crate::manifest::Manifest) -> Self {
+        let mut opts = Self::default();
+        if let crate::manifest::GenerationDefaults::Text {
+            temperature,
+            min_p,
+            top_p,
+            top_k,
+            repetition_penalty,
+        } = &manifest.generation_defaults
+        {
+            if let Some(t) = temperature {
+                opts.temperature = *t;
+            }
+            if let Some(mp) = min_p {
+                opts.min_p = *mp;
+            }
+            if let Some(tp) = top_p {
+                opts.top_p = *tp;
+            }
+            if let Some(tk) = top_k {
+                opts.top_k = *tk;
+            }
+            if let Some(rp) = repetition_penalty {
+                opts.repetition_penalty = *rp;
+            }
+        }
+        opts
+    }
+}
+
 /// Summary returned from a completed `generate` call.
 #[derive(Debug, Clone)]
 pub struct GenerateSummary {
@@ -176,7 +209,7 @@ pub struct GenerateSummary {
 }
 
 /// Why a decode loop ended.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinishReason {
     /// Hit `max_tokens`.
     MaxTokens,
@@ -479,6 +512,8 @@ pub struct Session {
     /// inference_type at construction. Immutable for the session's
     /// lifetime.
     capabilities: ModalityCapabilities,
+    /// Default generation options for this session.
+    default_opts: GenerateOpts,
     /// Retained for `reset()` (rebuild state + sampler) and
     /// `sync_sampler_from_opts` (read back the seed).
     config: SessionConfig,
@@ -643,6 +678,7 @@ impl Session {
             prefill_elapsed: Duration::ZERO,
             max_seq_len,
             capabilities,
+            default_opts: GenerateOpts::default(),
             config,
             audio_encoder: None,
             gpu_audio_encoder: None,
@@ -654,6 +690,16 @@ impl Session {
             hs_scratch_cap: 0,
             lora: None,
         })
+    }
+
+    /// Borrow the default generation options configured for this session.
+    pub fn default_generate_opts(&self) -> &GenerateOpts {
+        &self.default_opts
+    }
+
+    /// Override the default generation options for this session.
+    pub fn set_default_generate_opts(&mut self, opts: GenerateOpts) {
+        self.default_opts = opts;
     }
 
     /// Attach an audio encoder so [`Self::append_audio`] can encode
@@ -1691,10 +1737,6 @@ impl Session {
         opts: &GenerateOpts,
         sink: &mut S,
     ) -> Result<GenerateSummary, CeraError> {
-        // Reset cancel at the start of each generate — stale flips from a
-        // prior call shouldn't pre-cancel the next one.
-        self.cancel.store(false, Ordering::Relaxed);
-
         // Prefill happened in `append_*`, which accumulated its token count and
         // wall time on the session. Consume them here — unconditionally, so
         // EVERY `generate()` call (including the no-op early exits below)
@@ -1710,6 +1752,22 @@ impl Session {
         self.prefill_elapsed = Duration::ZERO;
 
         let decode_start = Instant::now();
+
+        // If a cancel was already armed before generate() started (e.g. preemption or timeout),
+        // honor it immediately without wiping the flag or performing unnecessary work.
+        if self.cancel.load(Ordering::Relaxed) {
+            self.cancel.store(false, Ordering::Relaxed);
+            sink.on_done(FinishReason::Cancelled);
+            let decode_ms = duration_ms_u32(decode_start.elapsed());
+            return Ok(GenerateSummary {
+                tokens_generated: 0,
+                prompt_eval_tokens,
+                prompt_eval_ms,
+                decode_ms,
+                finish_reason: FinishReason::Cancelled,
+            });
+        }
+
         let mut finish = FinishReason::MaxTokens;
         let mut generated: u32 = 0;
         let mut pos = self.current_pos;
@@ -2053,6 +2111,9 @@ impl Session {
 
         sink.on_done(finish.clone());
 
+        // Cancel has been consumed by this generation; clear so subsequent operations start clean.
+        self.cancel.store(false, Ordering::Relaxed);
+
         let decode_ms = duration_ms_u32(decode_start.elapsed());
         Ok(GenerateSummary {
             tokens_generated: generated,
@@ -2268,6 +2329,9 @@ impl Session {
         }
 
         sink.on_done(finish.clone());
+
+        // Cancel has been consumed by this generation; clear so subsequent operations start clean.
+        self.cancel.store(false, Ordering::Relaxed);
 
         let decode_ms = duration_ms_u32(decode_start.elapsed());
         Ok(GenerateSummary {
@@ -2558,5 +2622,65 @@ mod tests {
     fn splice_image_markers_empty() {
         let segs = splice_image_markers(&[], 99);
         assert!(segs.is_empty());
+    }
+
+    #[test]
+    fn generate_opts_from_manifest_applies_defaults_and_preserves_fallbacks() {
+        let manifest = crate::manifest::Manifest {
+            inference_type: InferenceType::LlamaCppTextToText,
+            schema_version: "1.0.0".into(),
+            files: crate::manifest::ManifestFiles {
+                model: "model.gguf".into(),
+                multimodal_projector: None,
+                audio_decoder: None,
+                audio_tokenizer: None,
+                extras: std::collections::HashMap::new(),
+            },
+            chat_template: None,
+            generation_defaults: crate::manifest::GenerationDefaults::Text {
+                temperature: Some(0.35),
+                min_p: Some(0.05),
+                top_p: Some(0.85),
+                top_k: Some(25),
+                repetition_penalty: Some(1.15),
+            },
+            raw: serde_json::json!({}),
+        };
+
+        let opts = GenerateOpts::from_manifest(&manifest);
+        assert_eq!(opts.temperature, 0.35);
+        assert_eq!(opts.min_p, 0.05);
+        assert_eq!(opts.top_p, 0.85);
+        assert_eq!(opts.top_k, 25);
+        assert_eq!(opts.repetition_penalty, 1.15);
+        assert_eq!(opts.max_tokens, 256); // untouched fallback
+
+        let empty_manifest = crate::manifest::Manifest {
+            inference_type: InferenceType::LlamaCppTextToText,
+            schema_version: "1.0.0".into(),
+            files: crate::manifest::ManifestFiles {
+                model: "model.gguf".into(),
+                multimodal_projector: None,
+                audio_decoder: None,
+                audio_tokenizer: None,
+                extras: std::collections::HashMap::new(),
+            },
+            chat_template: None,
+            generation_defaults: crate::manifest::GenerationDefaults::Text {
+                temperature: None,
+                min_p: None,
+                top_p: None,
+                top_k: None,
+                repetition_penalty: None,
+            },
+            raw: serde_json::json!({}),
+        };
+
+        let default_opts = GenerateOpts::from_manifest(&empty_manifest);
+        assert_eq!(default_opts.temperature, 0.7);
+        assert_eq!(default_opts.top_p, 0.9);
+        assert_eq!(default_opts.top_k, 40);
+        assert_eq!(default_opts.min_p, 0.0);
+        assert_eq!(default_opts.repetition_penalty, 1.0);
     }
 }

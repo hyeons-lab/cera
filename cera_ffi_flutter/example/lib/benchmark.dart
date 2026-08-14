@@ -354,56 +354,128 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
-      appBar: AppBar(title: const Text('CPU vs GPU')),
+      appBar: AppBar(
+        title: const Text('CPU vs GPU'),
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(1),
+          child: Container(color: const Color(0xFF1E222D), height: 1),
+        ),
+      ),
       body: ListView(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(20),
         children: [
-          Text(
-            'Runs the same prompt on both backends and reports what each cost.',
-            style: theme.textTheme.bodyMedium,
-          ),
-          const SizedBox(height: 4),
-          Text(
-            kIsWeb
-                ? 'In the browser this is WebGPU against the wasm CPU build. '
-                      'The CPU run is the slow one; give it a moment.'
-                : 'Natively, asking for the GPU behaves as "auto", so the '
-                      'second run is whichever backend auto picked. The browser '
-                      'is where this comparison is a real one.',
-            style: theme.textTheme.bodySmall,
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: const Color(0xFF14161B),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: const Color(0xFF232732)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Runs the same prompt on both backends and reports what each cost.',
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFFF1F5F9),
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  kIsWeb
+                      ? 'In the browser this is WebGPU against the wasm CPU build. '
+                            'The CPU run is the slow one; give it a moment.'
+                      : 'Natively, asking for the GPU behaves as "auto", so the '
+                            'second run is whichever backend auto picked. The browser '
+                            'is where this comparison is a real one.',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: const Color(0xFF94A3B8),
+                    height: 1.4,
+                  ),
+                ),
+              ],
+            ),
           ),
           const SizedBox(height: 16),
-          Text(
-            'Model: ${widget.model.name}',
-            style: theme.textTheme.titleSmall,
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFF14161B),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: const Color(0xFF232732)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(
+                    Icons.memory_rounded,
+                    size: 16,
+                    color: Color(0xFF60A5FA),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Model: ${widget.model.name}',
+                    style: const TextStyle(
+                      color: Color(0xFFF1F5F9),
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 16),
           Align(
             alignment: Alignment.centerLeft,
             child: FilledButton.icon(
               onPressed: _busy ? null : _run,
-              icon: const Icon(Icons.speed),
+              icon: const Icon(Icons.speed, size: 18),
               label: const Text('Run benchmark'),
             ),
           ),
           if (_running != null) ...[
-            const SizedBox(height: 20),
-            Row(
-              children: [
-                const SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-                const SizedBox(width: 12),
-                Text('Running $_running… ($_maxTokens tokens)'),
-              ],
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF14161B),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: const Color(0xFF232732)),
+              ),
+              child: Row(
+                children: [
+                  const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      valueColor: AlwaysStoppedAnimation<Color>(
+                        Color(0xFF3B82F6),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Text(
+                    'Running $_running… ($_maxTokens tokens)',
+                    style: const TextStyle(
+                      color: Color(0xFFE2E8F0),
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ],
           const SizedBox(height: 20),
           for (final r in _results) ...[
             _ResultCard(result: r),
-            const SizedBox(height: 12),
+            const SizedBox(height: 14),
           ],
           if (_results.length == 2)
             _Speedup(cpu: _results[0], gpu: _results[1]),
@@ -422,94 +494,124 @@ class _ResultCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final rate = result.decodeTokensPerSecond;
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Text(result.label, style: theme.textTheme.titleMedium),
-                const Spacer(),
-                if (rate != null)
-                  Text(
-                    '${rate.toStringAsFixed(1)} tok/s',
-                    style: theme.textTheme.titleMedium,
-                  ),
-              ],
-            ),
-            const SizedBox(height: 6),
-            if (!result.ok)
-              Text(
-                result.error!,
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: theme.colorScheme.error,
+    final isGpu = result.label.contains('GPU');
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF14161B),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFF232732), width: 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 4,
                 ),
-              )
-            else ...[
-              // What the engine says it opened. On the web that is the
-              // resolved backend, adapter included. Natively it echoes the
-              // preference instead ("native (auto)" for a GPU request), which
-              // is the honest rendering of a platform where asking for the GPU
-              // means asking auto to find one.
-              Text(
-                'Backend: ${result.backend}',
-                style: theme.textTheme.bodySmall,
+                decoration: BoxDecoration(
+                  color: isGpu
+                      ? const Color(0xFF1E3A5F)
+                      : const Color(0xFF262938),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(
+                    color: isGpu
+                        ? const Color(0xFF3B82F6).withValues(alpha: 0.5)
+                        : const Color(0xFF475569),
+                  ),
+                ),
+                child: Text(
+                  result.label,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    color: isGpu
+                        ? const Color(0xFF93C5FD)
+                        : const Color(0xFFE2E8F0),
+                  ),
+                ),
               ),
-              Text(
-                'Time to first token: ${result.ttft.inMilliseconds} ms '
-                '(prefill of ${result.promptTokens} tokens, plus one decode step)',
-                style: theme.textTheme.bodySmall,
-              ),
-              // Says which tokens the span covers, because the rate above is
-              // over one fewer of them: the first arrived at TTFT and is
-              // counted there. Without that the two lines look like they
-              // should divide into each other, and they do not.
-              //
-              // Keyed off the rate rather than off the token count, so the two
-              // lines cannot disagree. A run can decode several tokens and
-              // still have no rate, since a fragment is only emitted once it
-              // completes a character: hold one back and the last piece lands
-              // at the same instant as the first, leaving a zero-length span
-              // that "the last N of them in 0 ms" would report as real.
-              Text(
-                rate == null
-                    ? 'Decoded ${result.decodeTokens} '
-                          '${result.decodeTokens == 1 ? 'token' : 'tokens'}, '
-                          'all at once, so there is no decode rate to report'
-                    : 'Decoded ${result.decodeTokens} tokens, the last '
-                          '${result.decodeTokens - 1} of them in '
-                          '${result.decodeSpan.inMilliseconds} ms',
-                style: theme.textTheme.bodySmall,
-              ),
-              if (result.note != null)
+              const Spacer(),
+              if (rate != null)
                 Text(
-                  result.note!,
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.error,
+                  '${rate.toStringAsFixed(1)} tok/s',
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                    fontFamily: 'monospace',
+                    color: Color(0xFF34D399),
                   ),
                 ),
-              const SizedBox(height: 8),
+            ],
+          ),
+          const SizedBox(height: 12),
+          if (!result.ok)
+            Text(
+              result.error!,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: const Color(0xFFEF4444),
+              ),
+            )
+          else ...[
+            Text(
+              'Backend: ${result.backend}',
+              style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Time to first token: ${result.ttft.inMilliseconds} ms '
+              '(prefill of ${result.promptTokens} tokens, plus one decode step)',
+              style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              rate == null
+                  ? 'Decoded ${result.decodeTokens} '
+                        '${result.decodeTokens == 1 ? 'token' : 'tokens'}, '
+                        'all at once, so there is no decode rate to report'
+                  : 'Decoded ${result.decodeTokens} tokens, the last '
+                        '${result.decodeTokens - 1} of them in '
+                        '${result.decodeSpan.inMilliseconds} ms',
+              style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+            ),
+            if (result.note != null) ...[
+              const SizedBox(height: 4),
               Text(
-                result.output.trim(),
-                style: theme.textTheme.bodySmall?.copyWith(
-                  fontStyle: FontStyle.italic,
-                ),
+                result.note!,
+                style: const TextStyle(color: Color(0xFFEF4444), fontSize: 12),
               ),
             ],
+            const SizedBox(height: 10),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF0B0C0E),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFF1E222D)),
+              ),
+              child: Text(
+                result.output.trim(),
+                style: const TextStyle(
+                  color: Color(0xFFCBD5E1),
+                  fontStyle: FontStyle.italic,
+                  fontSize: 12,
+                  height: 1.4,
+                ),
+              ),
+            ),
           ],
-        ),
+        ],
       ),
     );
   }
 }
 
 /// The headline number, shown only when both arms produced one.
-///
-/// Named arms rather than a list, so the mapping from result to role is stated
-/// where it is made. The call site still supplies it by position, because the
-/// order is fixed by the loop that produced the results.
 class _Speedup extends StatelessWidget {
   const _Speedup({required this.cpu, required this.gpu});
 
@@ -523,11 +625,6 @@ class _Speedup extends StatelessWidget {
     if (cpuRate == null || gpuRate == null || cpuRate <= 0 || gpuRate <= 0) {
       return const SizedBox.shrink();
     }
-    // Do not assume the GPU won. Natively the second row is whatever `auto`
-    // picked, which can be the CPU again, and even a real GPU can lose to
-    // per-token overhead on a small model. Reporting "0.8x faster" would be a
-    // plainly false sentence on a page whose whole purpose is an honest
-    // number, so state the slower case as a slowdown and the tie as a tie.
     final ratio = gpuRate / cpuRate;
     final headline = switch (ratio) {
       >= 1.05 => 'GPU decoded ${ratio.toStringAsFixed(1)}x faster than CPU.',
@@ -535,11 +632,40 @@ class _Speedup extends StatelessWidget {
         'GPU decoded ${(1 / ratio).toStringAsFixed(1)}x slower than CPU.',
       _ => 'GPU and CPU decoded at about the same rate.',
     };
-    return Card(
-      color: Theme.of(context).colorScheme.primaryContainer,
-      child: Padding(
-        padding: const EdgeInsets.all(14),
-        child: Text(headline, style: Theme.of(context).textTheme.titleMedium),
+    final isFaster = ratio >= 1.05;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: isFaster ? const Color(0xFF06281E) : const Color(0xFF14161B),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: isFaster
+              ? const Color(0xFF10B981).withValues(alpha: 0.4)
+              : const Color(0xFF232732),
+          width: 1,
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            isFaster ? Icons.bolt_rounded : Icons.info_outline_rounded,
+            color: isFaster ? const Color(0xFF34D399) : const Color(0xFF94A3B8),
+            size: 24,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              headline,
+              style: TextStyle(
+                color: isFaster
+                    ? const Color(0xFFE6FFFA)
+                    : const Color(0xFFF1F5F9),
+                fontSize: 15,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
