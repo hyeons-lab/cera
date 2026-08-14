@@ -7,15 +7,8 @@
 // CPU on the same machine and model, which is a 40x difference a user can feel
 // but not name. This page names it.
 //
-// It runs the same prompt twice, once on each backend, from the same weights,
-// and reports what each cost.
-//
-// ## Model source
-//
-// Two engines need two opens, and on the web a load may consume the buffer it
-// is handed: see `ModelSource.open`, which owns that rule for both pages.
-// This page can reuse a `ModelSource` chosen by the chat page or pick its own,
-// and opens it once per arm with `reusable: true`.
+// It runs the same prompt twice, once on each backend, using the model loaded
+// in the chat page, and reports what each cost.
 //
 // ## Native
 //

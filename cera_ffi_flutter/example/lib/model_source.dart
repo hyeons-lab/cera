@@ -1,16 +1,15 @@
 // Picking a model, and the platform rules that go with it.
 //
-// Both pages of this example open a GGUF the user chose, and doing that right
-// takes three rules that differ per platform: which form to ask the picker for,
-// how to tell which form came back, and whether a load consumes the bytes it is
-// given.
+// Opening a GGUF the user chose takes three rules that differ per platform:
+// which form to ask the picker for, how to tell which form came back, and
+// whether a load consumes the bytes it is given.
 //
 // The middle rule is the one worth centralizing. Testing `file.path` for null
 // reads as the obvious way to ask whether a path is available, and it is wrong
 // on the web, where the picker manufactures a `blob:` URL and puts it in that
 // field: every browser load then goes to `Cera.openPath`, which the web does
-// not implement. The chat page shipped that bug. A rule written once can still
-// be wrong, but it cannot be wrong in one page and right in the other.
+// not implement. A rule written once can still be wrong, but it cannot be
+// wrong in one place and right in another.
 
 import 'dart:typed_data';
 
@@ -42,13 +41,8 @@ class ModelSource implements LoadedModel {
       );
 
   @visibleForTesting
-  ModelSource.forTesting({required this.name, String? path, Uint8List? bytes})
-    : _path = path,
-      _bytes = bytes,
-      assert(
-        (path == null) != (bytes == null),
-        'a source is a path or bytes, never both and never neither',
-      );
+  ModelSource.forTesting({required String name, String? path, Uint8List? bytes})
+    : this._(name: name, path: path, bytes: bytes);
 
   @override
   final String name;
@@ -61,25 +55,18 @@ class ModelSource implements LoadedModel {
 
   /// Opens this model.
   ///
-  /// Set `reusable` when this source has to survive the call. On the web a load
-  /// may **transfer** the buffer it is handed into the worker, which neuters
-  /// the caller's view of it, so a second open of the same source would be
-  /// handed an empty list. Defaults to `true` so the source can be reused across
-  /// chat turns and benchmark runs.
+  /// On the web a load may **transfer** the buffer it is handed into the worker,
+  /// which neuters the caller's view of it, so `openBytes` receives a fresh
+  /// sublist copy to ensure this source can be reused across chat turns and
+  /// benchmark runs.
   @override
-  Future<Cera> open({
-    CeraOptions options = const CeraOptions(),
-    bool reusable = true,
-  }) {
+  Future<Cera> open({CeraOptions options = const CeraOptions()}) {
     final path = _path;
     if (path != null) return Cera.openPath(path, options: options);
     final bytes = _bytes!;
     // `sublist(0)` rather than `Uint8List.fromList`: both copy, and this one
     // states the intent, which is a fresh whole buffer.
-    return Cera.openBytes(
-      reusable ? bytes.sublist(0) : bytes,
-      options: options,
-    );
+    return Cera.openBytes(bytes.sublist(0), options: options);
   }
 }
 
@@ -89,7 +76,8 @@ class BundleModelSource implements LoadedModel {
     required this.name,
     required this.bundleName,
     required this.quant,
-    required this.storeDir,
+    this.storeDir,
+    this.getStoreDir,
   });
 
   @override
@@ -101,17 +89,16 @@ class BundleModelSource implements LoadedModel {
   /// The quantization variant (e.g. "Q4_0").
   final String quant;
 
-  /// Where bundle downloads are cached.
+  /// Where bundle downloads are cached, if known synchronously.
   final String? storeDir;
 
+  /// Async resolver for cache directory on platforms requiring it (Android/iOS).
+  final Future<String?> Function()? getStoreDir;
+
   @override
-  Future<Cera> open({CeraOptions options = const CeraOptions()}) {
-    return Cera.openBundle(
-      bundleName,
-      quant,
-      options: options,
-      storeDir: storeDir,
-    );
+  Future<Cera> open({CeraOptions options = const CeraOptions()}) async {
+    final dir = storeDir ?? await getStoreDir?.call();
+    return Cera.openBundle(bundleName, quant, options: options, storeDir: dir);
   }
 }
 

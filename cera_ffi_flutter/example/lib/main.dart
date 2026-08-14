@@ -110,11 +110,14 @@ class _ChatPageState extends State<ChatPage> {
   /// Shared by the file picker and the bundle menu. They differ only in how
   /// they produce a [Cera], and having each carry its own copy of this is how
   /// the two quietly drift apart on which of these steps they remember.
-  Future<void> _load(
-    String label,
-    Future<Cera> Function() open, {
-    LoadedModel? model,
-  }) async {
+  /// Runs `open` as the app's one model-loading path, with the bookkeeping that
+  /// every loader needs: closing the previous model, the busy flag, the
+  /// dispose-during-load guard, and error reporting.
+  ///
+  /// Shared by the file picker and the bundle menu. They differ only in how
+  /// they produce a [Cera], and having each carry its own copy of this is how
+  /// the two quietly drift apart on which of these steps they remember.
+  Future<void> _load(LoadedModel model, Future<Cera> Function() open) async {
     // Guarded here, not only on the buttons that call it. Both entry points
     // await a dialog first, and the file picker's is a browser-native dialog
     // that does not disable the Flutter buttons behind it, so a second load can
@@ -128,13 +131,13 @@ class _ChatPageState extends State<ChatPage> {
     // or a bundle and would otherwise see the status line still naming the
     // first load, with no sign the second went nowhere.
     if (_loading) {
-      setState(() => _status = 'Still loading; ignored $label');
+      setState(() => _status = 'Still loading; ignored ${model.name}');
       return;
     }
     setState(() {
       _loading = true;
       _downloadFraction = null;
-      _status = 'Loading $label…';
+      _status = 'Loading ${model.name}…';
       _turns.clear();
       _loadedModel = null;
     });
@@ -157,7 +160,7 @@ class _ChatPageState extends State<ChatPage> {
       setState(() {
         _cera = cera;
         _loadedModel = model;
-        _status = '$label · ${cera.backend}';
+        _status = '${model.name} · ${cera.backend}';
       });
     } catch (err, stack) {
       // Log as well as display: the status line truncates, and the full message
@@ -191,7 +194,7 @@ class _ChatPageState extends State<ChatPage> {
     // without an initializer does not promote inside one.
     final model = source;
 
-    await _load(model.name, () => model.open(reusable: true), model: model);
+    await _load(model, () => model.open());
   }
 
   /// Where bundle downloads are cached.
@@ -222,22 +225,25 @@ class _ChatPageState extends State<ChatPage> {
     if (choice == null || !mounted) return;
 
     final label = '${choice.bundle.displayName} · ${choice.quant}';
-    final storeDir = await _storeDir();
-    if (!mounted) return;
-
     final bundleSource = BundleModelSource(
       name: label,
       bundleName: choice.bundle.name,
       quant: choice.quant,
-      storeDir: storeDir,
+      getStoreDir: _storeDir,
     );
 
     await _load(
-      label,
+      bundleSource,
+      // `_storeDir()` is awaited INSIDE the callback, not before `_load`. On
+      // mobile it is a real platform-channel round trip, and awaiting it out
+      // here would leave the buttons enabled (nothing sets `_loading` until
+      // `_load` runs) long enough to start a second load: both would see
+      // `_cera` still null, and whichever finished last would overwrite the
+      // other's engine without closing it, leaking the model weights.
       () async => Cera.openBundle(
         choice.bundle.name,
         choice.quant,
-        storeDir: storeDir,
+        storeDir: await _storeDir(),
         onProgress: (progress) {
           // Guarded before setState: progress keeps arriving for a moment after
           // the page is disposed, since disposal does not cancel the download.
@@ -251,7 +257,6 @@ class _ChatPageState extends State<ChatPage> {
           });
         },
       ),
-      model: bundleSource,
     );
   }
 
