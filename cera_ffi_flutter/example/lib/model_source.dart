@@ -18,12 +18,21 @@ import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart' show visibleForTesting;
 
+/// A model that can be opened on different backends.
+abstract class LoadedModel {
+  /// The model's display name.
+  String get name;
+
+  /// Opens an engine instance for this model with the given [options].
+  Future<Cera> open({CeraOptions options = const CeraOptions()});
+}
+
 /// A model the user picked, in whichever form this platform can open.
 ///
 /// Which form that is follows [Cera.supportsPaths]: a path off the web, the
 /// bytes themselves in a browser. Callers do not need to know which, and get
 /// [open] rather than the two fields, so the choice stays in one place.
-class ModelSource {
+class ModelSource implements LoadedModel {
   ModelSource._({required this.name, String? path, Uint8List? bytes})
     : _path = path,
       _bytes = bytes,
@@ -41,7 +50,7 @@ class ModelSource {
         'a source is a path or bytes, never both and never neither',
       );
 
-  /// The file's display name, for status lines.
+  @override
   final String name;
 
   /// Non-null only where the engine can open a path, i.e. off the web.
@@ -55,15 +64,12 @@ class ModelSource {
   /// Set `reusable` when this source has to survive the call. On the web a load
   /// may **transfer** the buffer it is handed into the worker, which neuters
   /// the caller's view of it, so a second open of the same source would be
-  /// handed an empty list. (Whether it transfers or copies depends on the
-  /// list's shape and the compiler, and [Cera.openBytes] declines to promise
-  /// either, which is reason enough not to rely on the buffer surviving.)
-  /// Copying costs a second full-size allocation, so it is off by default: a
-  /// page that opens a model once without needing to reuse it should not pay
-  /// for a copy it will never read.
+  /// handed an empty list. Defaults to `true` so the source can be reused across
+  /// chat turns and benchmark runs.
+  @override
   Future<Cera> open({
     CeraOptions options = const CeraOptions(),
-    bool reusable = false,
+    bool reusable = true,
   }) {
     final path = _path;
     if (path != null) return Cera.openPath(path, options: options);
@@ -73,6 +79,38 @@ class ModelSource {
     return Cera.openBytes(
       reusable ? bytes.sublist(0) : bytes,
       options: options,
+    );
+  }
+}
+
+/// A published model bundle downloaded from the remote catalog.
+class BundleModelSource implements LoadedModel {
+  const BundleModelSource({
+    required this.name,
+    required this.bundleName,
+    required this.quant,
+    required this.storeDir,
+  });
+
+  @override
+  final String name;
+
+  /// The catalog bundle name (e.g. "LFM2-700M").
+  final String bundleName;
+
+  /// The quantization variant (e.g. "Q4_0").
+  final String quant;
+
+  /// Where bundle downloads are cached.
+  final String? storeDir;
+
+  @override
+  Future<Cera> open({CeraOptions options = const CeraOptions()}) {
+    return Cera.openBundle(
+      bundleName,
+      quant,
+      options: options,
+      storeDir: storeDir,
     );
   }
 }

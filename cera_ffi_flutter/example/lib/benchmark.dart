@@ -264,26 +264,18 @@ Future<_BenchResult> _runBenchmark({
 }
 
 class BenchmarkPage extends StatefulWidget {
-  const BenchmarkPage({super.key, this.initialSource});
+  const BenchmarkPage({super.key, required this.model});
 
-  /// A model chosen elsewhere (e.g. the chat page) to benchmark without
-  /// re-picking, or null to start without one.
-  final ModelSource? initialSource;
+  /// The model to benchmark on both backends.
+  final LoadedModel model;
 
   @override
   State<BenchmarkPage> createState() => _BenchmarkPageState();
 }
 
 class _BenchmarkPageState extends State<BenchmarkPage> {
-  /// The picked model, opened once per arm.
-  ///
-  /// Kept whole across both runs rather than consumed by the first, which is
-  /// what `reusable` in [ModelSource.open] is for.
-  ModelSource? _source;
-
   final _results = <_BenchResult>[];
   String? _running;
-  bool _picking = false;
 
   /// The engine of the arm in flight, or null between arms.
   ///
@@ -291,13 +283,7 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
   /// it, and it deliberately does not drive any of the UI.
   Cera? _live;
 
-  bool get _busy => _running != null || _picking;
-
-  @override
-  void initState() {
-    super.initState();
-    _source = widget.initialSource;
-  }
+  bool get _busy => _running != null;
 
   @override
   void dispose() {
@@ -318,49 +304,12 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
     super.dispose();
   }
 
-  Future<void> _pickModel() async {
-    setState(() => _picking = true);
-    try {
-      final source = await pickModelSource(
-        dialogTitle: 'Choose a .gguf model to benchmark',
-      );
-      // A cancelled dialog is not a failure and says nothing.
-      if (source == null || !mounted) return;
-      setState(() {
-        _source = source;
-        _results.clear();
-      });
-    } catch (err) {
-      // Both the picker failing and a file that cannot be read land here, and
-      // neither can be left silent: nothing awaits this method, so the error
-      // would otherwise escape into the zone and the user would see only a
-      // spinner that stopped.
-      //
-      // Drop the previous pick as well as reporting. A snackbar fades, and
-      // leaving the old model named on screen with Run still armed would let
-      // the next run measure the old file and look like it had honored the new
-      // one.
-      if (mounted) {
-        setState(() {
-          _source = null;
-          _results.clear();
-        });
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Could not open a model: $err')));
-      }
-    } finally {
-      if (mounted) setState(() => _picking = false);
-    }
-  }
-
   Future<void> _run() async {
-    final source = _source;
-    if (source == null || _busy) return;
+    if (_busy) return;
 
     setState(() => _results.clear());
 
-    // `finally`, because `_running` is what disables both buttons and spins the
+    // `finally`, because `_running` is what disables the button and spins the
     // indicator. `_runBenchmark` reports its own failures as results rather
     // than throwing, but "rather than" is not "never": anything escaping it
     // would otherwise leave the page permanently busy, with a spinner that
@@ -375,11 +324,7 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
       ]) {
         setState(() => _running = label);
         final result = await _runBenchmark(
-          // `reusable`, because the second arm opens this same source: natively
-          // that is the same path mapped twice, and on the web it is a fresh
-          // copy of the bytes per arm rather than one buffer the first load may
-          // have taken.
-          open: (options) => source.open(options: options, reusable: true),
+          open: (options) => widget.model.open(options: options),
           backend: backend,
           label: label,
           onEngine: (engine) {
@@ -435,25 +380,19 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
             style: theme.textTheme.bodySmall,
           ),
           const SizedBox(height: 16),
-          Row(
-            children: [
-              FilledButton.icon(
-                onPressed: _busy ? null : _pickModel,
-                icon: const Icon(Icons.folder_open),
-                label: const Text('Choose model'),
-              ),
-              const SizedBox(width: 12),
-              FilledButton.icon(
-                onPressed: _source == null || _busy ? null : _run,
-                icon: const Icon(Icons.speed),
-                label: const Text('Run'),
-              ),
-            ],
+          Text(
+            'Model: ${widget.model.name}',
+            style: theme.textTheme.titleSmall,
           ),
-          if (_source case final source?) ...[
-            const SizedBox(height: 12),
-            Text('Model: ${source.name}', style: theme.textTheme.bodySmall),
-          ],
+          const SizedBox(height: 12),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: FilledButton.icon(
+              onPressed: _busy ? null : _run,
+              icon: const Icon(Icons.speed),
+              label: const Text('Run benchmark'),
+            ),
+          ),
           if (_running != null) ...[
             const SizedBox(height: 20),
             Row(

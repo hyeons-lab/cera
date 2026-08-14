@@ -72,10 +72,9 @@ class _ChatPageState extends State<ChatPage> {
   Cera? _cera;
   StreamSubscription<String>? _generation;
 
-  /// The model source chosen via the file picker, retained so the benchmark
-  /// page can reuse the same weights without forcing the user to pick the file
-  /// again.
-  ModelSource? _source;
+  /// The loaded model descriptor (file or bundle), retained so the benchmark
+  /// page can run side-by-side CPU vs GPU measurements on the same model.
+  LoadedModel? _loadedModel;
 
   /// Releases the `_send` that is waiting on the current turn. See its use.
   void Function()? _finishTurn;
@@ -114,7 +113,7 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> _load(
     String label,
     Future<Cera> Function() open, {
-    ModelSource? source,
+    LoadedModel? model,
   }) async {
     // Guarded here, not only on the buttons that call it. Both entry points
     // await a dialog first, and the file picker's is a browser-native dialog
@@ -137,7 +136,7 @@ class _ChatPageState extends State<ChatPage> {
       _downloadFraction = null;
       _status = 'Loading $label…';
       _turns.clear();
-      _source = null;
+      _loadedModel = null;
     });
 
     try {
@@ -157,7 +156,7 @@ class _ChatPageState extends State<ChatPage> {
       }
       setState(() {
         _cera = cera;
-        _source = source;
+        _loadedModel = model;
         _status = '$label · ${cera.backend}';
       });
     } catch (err, stack) {
@@ -192,9 +191,7 @@ class _ChatPageState extends State<ChatPage> {
     // without an initializer does not promote inside one.
     final model = source;
 
-    // `reusable: true` so the bytes on the web survive being loaded here and can
-    // be reused if the benchmark page is opened.
-    await _load(model.name, () => model.open(reusable: true), source: model);
+    await _load(model.name, () => model.open(reusable: true), model: model);
   }
 
   /// Where bundle downloads are cached.
@@ -225,18 +222,22 @@ class _ChatPageState extends State<ChatPage> {
     if (choice == null || !mounted) return;
 
     final label = '${choice.bundle.displayName} · ${choice.quant}';
+    final storeDir = await _storeDir();
+    if (!mounted) return;
+
+    final bundleSource = BundleModelSource(
+      name: label,
+      bundleName: choice.bundle.name,
+      quant: choice.quant,
+      storeDir: storeDir,
+    );
+
     await _load(
       label,
-      // `_storeDir()` is awaited INSIDE the callback, not before `_load`. On
-      // mobile it is a real platform-channel round trip, and awaiting it out
-      // here would leave the buttons enabled (nothing sets `_loading` until
-      // `_load` runs) long enough to start a second load: both would see
-      // `_cera` still null, and whichever finished last would overwrite the
-      // other's engine without closing it, leaking the model weights.
       () async => Cera.openBundle(
         choice.bundle.name,
         choice.quant,
-        storeDir: await _storeDir(),
+        storeDir: storeDir,
         onProgress: (progress) {
           // Guarded before setState: progress keeps arriving for a moment after
           // the page is disposed, since disposal does not cancel the download.
@@ -250,6 +251,7 @@ class _ChatPageState extends State<ChatPage> {
           });
         },
       ),
+      model: bundleSource,
     );
   }
 
@@ -359,17 +361,13 @@ class _ChatPageState extends State<ChatPage> {
         ),
         actions: [
           IconButton(
-            // Disabled while this page is busy. Not because the benchmark
-            // shares state with it (it opens its own engines from its own
-            // pick or this page's source), but because a second set of weights
-            // loading alongside a generation in flight is how a browser tab
-            // runs out of memory. An idle chat model stays resident either
-            // way; this rules out the concurrent case, not coexistence.
-            onPressed: _busy
+            // Disabled until a model is loaded, or while this page is busy
+            // (loading or generating).
+            onPressed: (_busy || _loadedModel == null)
                 ? null
                 : () => Navigator.of(context).push(
                     MaterialPageRoute<void>(
-                      builder: (_) => BenchmarkPage(initialSource: _source),
+                      builder: (_) => BenchmarkPage(model: _loadedModel!),
                     ),
                   ),
             icon: const Icon(Icons.speed),

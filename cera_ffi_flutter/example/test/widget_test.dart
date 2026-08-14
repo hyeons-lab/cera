@@ -23,42 +23,51 @@ void main() {
     );
   });
 
-  // The benchmark page is reachable only through the app-bar icon, so a broken
-  // route or a rename of that icon would strand it with nothing failing. Like
-  // the test above this loads no model: it asserts the page builds and reaches
-  // its own empty state, which is where a widget-tree regression would show.
-  testWidgets('the speed icon opens the benchmark page', (
+  testWidgets('the speed icon is disabled before a model is loaded', (
     WidgetTester tester,
   ) async {
     await tester.pumpWidget(const CeraExampleApp());
 
-    await tester.tap(find.byIcon(Icons.speed));
-    await tester.pumpAndSettle();
-
-    expect(find.text('CPU vs GPU'), findsOneWidget);
-    expect(find.widgetWithText(FilledButton, 'Run'), findsOneWidget);
-    // Nothing is loaded, so Run must be inert.
-    final run = tester.widget<FilledButton>(
-      find.widgetWithText(FilledButton, 'Run'),
+    final button = tester.widget<IconButton>(
+      find.widgetWithIcon(IconButton, Icons.speed),
     );
-    expect(run.onPressed, isNull);
+    expect(button.onPressed, isNull);
   });
 
-  testWidgets('benchmark page reuses the initialSource and enables run', (
+  testWidgets('benchmark page displays the loaded model and enables run', (
     WidgetTester tester,
   ) async {
     final source = ModelSource.forTesting(
       name: 'test-model.gguf',
       path: '/tmp/test-model.gguf',
     );
-    await tester.pumpWidget(
-      MaterialApp(home: BenchmarkPage(initialSource: source)),
-    );
+    await tester.pumpWidget(MaterialApp(home: BenchmarkPage(model: source)));
 
     expect(find.text('CPU vs GPU'), findsOneWidget);
     expect(find.text('Model: test-model.gguf'), findsOneWidget);
     final run = tester.widget<FilledButton>(
-      find.widgetWithText(FilledButton, 'Run'),
+      find.widgetWithText(FilledButton, 'Run benchmark'),
+    );
+    expect(run.onPressed, isNotNull);
+  });
+
+  testWidgets('benchmark page works with a bundle model source', (
+    WidgetTester tester,
+  ) async {
+    const bundle = BundleModelSource(
+      name: 'LFM2-700M · Q4_0',
+      bundleName: 'LFM2-700M',
+      quant: 'Q4_0',
+      storeDir: '/tmp/cache',
+    );
+    await tester.pumpWidget(
+      const MaterialApp(home: BenchmarkPage(model: bundle)),
+    );
+
+    expect(find.text('CPU vs GPU'), findsOneWidget);
+    expect(find.text('Model: LFM2-700M · Q4_0'), findsOneWidget);
+    final run = tester.widget<FilledButton>(
+      find.widgetWithText(FilledButton, 'Run benchmark'),
     );
     expect(run.onPressed, isNotNull);
   });
