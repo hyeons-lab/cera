@@ -93,7 +93,7 @@ def get_repo_guidelines() -> str:
 
 
 def call_gemini_api(api_key: str, prompt: str) -> str:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    candidate_models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
     payload = {
         "contents": [
             {
@@ -105,27 +105,32 @@ def call_gemini_api(api_key: str, prompt: str) -> str:
             "maxOutputTokens": 3000,
         },
     }
+    data_bytes = json.dumps(payload).encode("utf-8")
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    for model in candidate_models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        req = urllib.request.Request(
+            url,
+            data=data_bytes,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
 
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            candidates = data.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    return parts[0].get("text", "")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        print(f"Gemini API HTTPError {e.code}: {body}", file=sys.stderr)
-    except Exception as e:
-        print(f"Gemini API request failed: {e}", file=sys.stderr)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        return parts[0].get("text", "")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            print(f"Gemini API model '{model}' HTTPError {e.code}: {body}", file=sys.stderr)
+            if e.code == 404:
+                continue
+        except Exception as e:
+            print(f"Gemini API model '{model}' request failed: {e}", file=sys.stderr)
 
     return ""
 
