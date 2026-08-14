@@ -140,8 +140,31 @@ def call_gemini_api(api_key: str, prompt: str) -> str:
     return ""
 
 
-def post_or_update_comment(github_token: str, repo: str, pr_number: str, comment_body: str) -> None:
-    full_body = f"{COMMENT_TAG}\n## 🪐 Antigravity Code Review\n\n{comment_body}"
+import datetime
+
+
+def post_or_update_comment(
+    github_token: str,
+    repo: str,
+    pr_number: str,
+    comment_body: str,
+    head_sha: str = "",
+) -> None:
+    short_sha = head_sha[:7] if head_sha else run_cmd(["git", "rev-parse", "--short", "HEAD"])
+    commit_link = (
+        f"[`{short_sha}`](https://github.com/{repo}/commit/{head_sha})"
+        if head_sha
+        else f"`{short_sha}`"
+    )
+    timestamp_utc = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+
+    meta_header = (
+        f"> *Reviewed commit {commit_link} • {timestamp_utc} • "
+        f"Powered by Gemini 3.7 Flash with Deep Thinking*"
+    )
+    full_body = f"{COMMENT_TAG}\n## 🪐 Antigravity Code Review\n{meta_header}\n\n{comment_body}"
     headers = {
         "Authorization": f"token {github_token}",
         "Accept": "application/vnd.github.v3+json",
@@ -203,6 +226,7 @@ def main():
     repo = os.getenv("GITHUB_REPOSITORY")
     pr_number = os.getenv("PR_NUMBER")
     base_ref = os.getenv("BASE_REF", "main")
+    head_sha = os.getenv("HEAD_SHA", "")
     pr_title = os.getenv("PR_TITLE", "")
     pr_body = os.getenv("PR_BODY", "")
 
@@ -254,8 +278,9 @@ Review Instructions:
         sys.exit(1)
 
     print("Posting review comment to GitHub...")
-    post_or_update_comment(github_token, repo, pr_number, review)
+    post_or_update_comment(github_token, repo, pr_number, review, head_sha=head_sha)
 
 
 if __name__ == "__main__":
+    main()
     main()
