@@ -10,12 +10,12 @@
 // It runs the same prompt twice, once on each backend, from the same weights,
 // and reports what each cost.
 //
-// ## Why this page picks its own model
+// ## Model source
 //
 // Two engines need two opens, and on the web a load may consume the buffer it
-// is handed, so the chat page's bytes are not something to borrow: see
-// `ModelSource.open`, which owns that rule for both pages. This page keeps its
-// own `ModelSource` and opens it once per arm.
+// is handed: see `ModelSource.open`, which owns that rule for both pages.
+// This page can reuse a `ModelSource` chosen by the chat page or pick its own,
+// and opens it once per arm with `reusable: true`.
 //
 // ## Native
 //
@@ -264,7 +264,11 @@ Future<_BenchResult> _runBenchmark({
 }
 
 class BenchmarkPage extends StatefulWidget {
-  const BenchmarkPage({super.key});
+  const BenchmarkPage({super.key, this.initialSource});
+
+  /// A model chosen elsewhere (e.g. the chat page) to benchmark without
+  /// re-picking, or null to start without one.
+  final ModelSource? initialSource;
 
   @override
   State<BenchmarkPage> createState() => _BenchmarkPageState();
@@ -288,6 +292,12 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
   Cera? _live;
 
   bool get _busy => _running != null || _picking;
+
+  @override
+  void initState() {
+    super.initState();
+    _source = widget.initialSource;
+  }
 
   @override
   void dispose() {

@@ -72,6 +72,11 @@ class _ChatPageState extends State<ChatPage> {
   Cera? _cera;
   StreamSubscription<String>? _generation;
 
+  /// The model source chosen via the file picker, retained so the benchmark
+  /// page can reuse the same weights without forcing the user to pick the file
+  /// again.
+  ModelSource? _source;
+
   /// Releases the `_send` that is waiting on the current turn. See its use.
   void Function()? _finishTurn;
 
@@ -106,7 +111,11 @@ class _ChatPageState extends State<ChatPage> {
   /// Shared by the file picker and the bundle menu. They differ only in how
   /// they produce a [Cera], and having each carry its own copy of this is how
   /// the two quietly drift apart on which of these steps they remember.
-  Future<void> _load(String label, Future<Cera> Function() open) async {
+  Future<void> _load(
+    String label,
+    Future<Cera> Function() open, {
+    ModelSource? source,
+  }) async {
     // Guarded here, not only on the buttons that call it. Both entry points
     // await a dialog first, and the file picker's is a browser-native dialog
     // that does not disable the Flutter buttons behind it, so a second load can
@@ -128,6 +137,7 @@ class _ChatPageState extends State<ChatPage> {
       _downloadFraction = null;
       _status = 'Loading $label…';
       _turns.clear();
+      _source = null;
     });
 
     try {
@@ -147,6 +157,7 @@ class _ChatPageState extends State<ChatPage> {
       }
       setState(() {
         _cera = cera;
+        _source = source;
         _status = '$label · ${cera.backend}';
       });
     } catch (err, stack) {
@@ -181,9 +192,9 @@ class _ChatPageState extends State<ChatPage> {
     // without an initializer does not promote inside one.
     final model = source;
 
-    // Not `reusable`: this page opens the model once and keeps it, so paying
-    // for a second copy of the weights on the web would buy nothing.
-    await _load(model.name, () => model.open());
+    // `reusable: true` so the bytes on the web survive being loaded here and can
+    // be reused if the benchmark page is opened.
+    await _load(model.name, () => model.open(reusable: true), source: model);
   }
 
   /// Where bundle downloads are cached.
@@ -350,15 +361,15 @@ class _ChatPageState extends State<ChatPage> {
           IconButton(
             // Disabled while this page is busy. Not because the benchmark
             // shares state with it (it opens its own engines from its own
-            // pick), but because a second set of weights loading alongside a
-            // generation in flight is how a browser tab runs out of memory.
-            // An idle chat model stays resident either way; this rules out the
-            // concurrent case, not coexistence.
+            // pick or this page's source), but because a second set of weights
+            // loading alongside a generation in flight is how a browser tab
+            // runs out of memory. An idle chat model stays resident either
+            // way; this rules out the concurrent case, not coexistence.
             onPressed: _busy
                 ? null
                 : () => Navigator.of(context).push(
                     MaterialPageRoute<void>(
-                      builder: (_) => const BenchmarkPage(),
+                      builder: (_) => BenchmarkPage(initialSource: _source),
                     ),
                   ),
             icon: const Icon(Icons.speed),

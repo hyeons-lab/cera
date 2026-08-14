@@ -16,6 +16,7 @@ import 'dart:typed_data';
 
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 /// A model the user picked, in whichever form this platform can open.
 ///
@@ -24,6 +25,15 @@ import 'package:file_picker/file_picker.dart';
 /// [open] rather than the two fields, so the choice stays in one place.
 class ModelSource {
   ModelSource._({required this.name, String? path, Uint8List? bytes})
+    : _path = path,
+      _bytes = bytes,
+      assert(
+        (path == null) != (bytes == null),
+        'a source is a path or bytes, never both and never neither',
+      );
+
+  @visibleForTesting
+  ModelSource.forTesting({required this.name, String? path, Uint8List? bytes})
     : _path = path,
       _bytes = bytes,
       assert(
@@ -49,8 +59,8 @@ class ModelSource {
   /// list's shape and the compiler, and [Cera.openBytes] declines to promise
   /// either, which is reason enough not to rely on the buffer surviving.)
   /// Copying costs a second full-size allocation, so it is off by default: a
-  /// page that opens a model once and keeps it, like the chat page, should not
-  /// pay for a copy it will never read.
+  /// page that opens a model once without needing to reuse it should not pay
+  /// for a copy it will never read.
   Future<Cera> open({
     CeraOptions options = const CeraOptions(),
     bool reusable = false,

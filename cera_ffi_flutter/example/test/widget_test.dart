@@ -4,7 +4,9 @@
 // seconds. This only asserts the app builds and reaches its empty state, which
 // is enough to catch a broken widget tree in CI.
 
+import 'package:cera_ffi_flutter_example/benchmark.dart';
 import 'package:cera_ffi_flutter_example/main.dart';
+import 'package:cera_ffi_flutter_example/model_source.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -40,5 +42,24 @@ void main() {
       find.widgetWithText(FilledButton, 'Run'),
     );
     expect(run.onPressed, isNull);
+  });
+
+  testWidgets('benchmark page reuses the initialSource and enables run', (
+    WidgetTester tester,
+  ) async {
+    final source = ModelSource.forTesting(
+      name: 'test-model.gguf',
+      path: '/tmp/test-model.gguf',
+    );
+    await tester.pumpWidget(
+      MaterialApp(home: BenchmarkPage(initialSource: source)),
+    );
+
+    expect(find.text('CPU vs GPU'), findsOneWidget);
+    expect(find.text('Model: test-model.gguf'), findsOneWidget);
+    final run = tester.widget<FilledButton>(
+      find.widgetWithText(FilledButton, 'Run'),
+    );
+    expect(run.onPressed, isNotNull);
   });
 }
