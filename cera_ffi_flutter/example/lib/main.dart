@@ -284,6 +284,11 @@ class _ChatPageState extends State<ChatPage> {
       }
     } catch (err) {
       debugPrint('cera: could not restore last model: $err');
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.remove('cera_last_bundle_name');
+        await prefs.remove('cera_last_bundle_quant');
+      } catch (_) {}
     }
   }
 
@@ -356,13 +361,16 @@ class _ChatPageState extends State<ChatPage> {
         _status = '${model.name} · ${cera.backend}$visionTag';
       });
 
-      if (model is BundleModelSource) {
-        try {
-          final prefs = await SharedPreferences.getInstance();
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        if (model is BundleModelSource) {
           await prefs.setString('cera_last_bundle_name', model.bundleName);
           await prefs.setString('cera_last_bundle_quant', model.quant);
-        } catch (_) {}
-      }
+        } else {
+          await prefs.remove('cera_last_bundle_name');
+          await prefs.remove('cera_last_bundle_quant');
+        }
+      } catch (_) {}
     } catch (err, stack) {
       // Log as well as display: the status line truncates, and the full message
       // is the only thing that says which step failed.
@@ -514,6 +522,7 @@ class _ChatPageState extends State<ChatPage> {
     final imageName = _pendingImageName;
     if ((prompt.isEmpty && imageBytes == null) || cera == null || _busy) return;
 
+    _input.clear();
     final assistantTurn = Turn(
       role: 'assistant',
       text: '',
@@ -615,9 +624,9 @@ class _ChatPageState extends State<ChatPage> {
     final totalMs = stopwatch.elapsedMilliseconds;
     final ttft = firstTokenMs;
     final decodeMs = ttft != null ? (totalMs - ttft) : totalMs;
-    final tps = tokenCount > 0 && decodeMs > 0
-        ? (tokenCount / (decodeMs / 1000.0))
-        : (tokenCount > 0 && totalMs > 0
+    final tps = tokenCount > 1 && decodeMs > 0
+        ? ((tokenCount - 1) / (decodeMs / 1000.0))
+        : (tokenCount == 1 && totalMs > 0
               ? (tokenCount / (totalMs / 1000.0))
               : 0.0);
 
