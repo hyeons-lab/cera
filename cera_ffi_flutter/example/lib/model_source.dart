@@ -57,8 +57,7 @@ class ModelSource implements LoadedModel {
   ///
   /// On the web a load may **transfer** the buffer it is handed into the worker,
   /// which neuters the caller's view of it, so `openBytes` receives a fresh
-  /// sublist copy to ensure this source can be reused across chat turns and
-  /// benchmark runs.
+  /// sublist copy to ensure this source can be reused across multiple sessions.
   @override
   Future<Cera> open({CeraOptions options = const CeraOptions()}) {
     final path = _path;

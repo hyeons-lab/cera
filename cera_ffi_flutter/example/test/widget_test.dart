@@ -4,10 +4,8 @@
 // seconds. This only asserts the app builds and reaches its empty state, which
 // is enough to catch a broken widget tree in CI.
 
-import 'package:cera_ffi_flutter_example/benchmark.dart';
 import 'package:cera_ffi_flutter_example/chat_state.dart';
 import 'package:cera_ffi_flutter_example/main.dart';
-import 'package:cera_ffi_flutter_example/model_source.dart';
 import 'package:cera_ffi_flutter_example/widgets/message_list.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -30,56 +28,13 @@ void main() {
     );
   });
 
-  testWidgets(
-    'the speed icon is disabled, and vision/audio buttons are hidden before a model is loaded',
-    (WidgetTester tester) async {
-      await tester.pumpWidget(const CeraExampleApp());
-
-      final button = tester.widget<IconButton>(
-        find.widgetWithIcon(IconButton, Icons.speed),
-      );
-      expect(button.onPressed, isNull);
-      expect(find.byIcon(Icons.add_photo_alternate_outlined), findsNothing);
-      expect(find.byIcon(Icons.mic_none_rounded), findsNothing);
-    },
-  );
-
-  testWidgets('benchmark page displays the loaded model and enables run', (
+  testWidgets('vision and audio buttons are hidden before a model is loaded', (
     WidgetTester tester,
   ) async {
-    final source = ModelSource.forTesting(
-      name: 'test-model.gguf',
-      path: '/tmp/test-model.gguf',
-    );
-    await tester.pumpWidget(MaterialApp(home: BenchmarkPage(model: source)));
+    await tester.pumpWidget(const CeraExampleApp());
 
-    expect(find.text('CPU vs GPU'), findsOneWidget);
-    expect(find.text('Model: test-model.gguf'), findsOneWidget);
-    final run = tester.widget<FilledButton>(
-      find.widgetWithText(FilledButton, 'Run benchmark'),
-    );
-    expect(run.onPressed, isNotNull);
-  });
-
-  testWidgets('benchmark page works with a bundle model source', (
-    WidgetTester tester,
-  ) async {
-    const bundle = BundleModelSource(
-      name: 'LFM2-700M · Q4_0',
-      bundleName: 'LFM2-700M',
-      quant: 'Q4_0',
-      storeDir: '/tmp/cache',
-    );
-    await tester.pumpWidget(
-      const MaterialApp(home: BenchmarkPage(model: bundle)),
-    );
-
-    expect(find.text('CPU vs GPU'), findsOneWidget);
-    expect(find.text('Model: LFM2-700M · Q4_0'), findsOneWidget);
-    final run = tester.widget<FilledButton>(
-      find.widgetWithText(FilledButton, 'Run benchmark'),
-    );
-    expect(run.onPressed, isNotNull);
+    expect(find.byIcon(Icons.add_photo_alternate_outlined), findsNothing);
+    expect(find.byIcon(Icons.mic_none_rounded), findsNothing);
   });
 
   testWidgets(

@@ -15,7 +15,6 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
-import 'benchmark.dart';
 import 'chat_controller.dart';
 import 'chat_intent.dart';
 import 'chat_state.dart';
@@ -514,22 +513,6 @@ class _ChatPageState extends State<ChatPage> {
                 onPressed: state.turns.isEmpty
                     ? null
                     : () => _controller.dispatch(const ClearTranscriptIntent()),
-              ),
-              IconButton(
-                icon: const Icon(Icons.speed),
-                tooltip: state.hasModel
-                    ? 'CPU vs GPU Benchmark'
-                    : 'Load a model first to benchmark',
-                onPressed: state.hasModel
-                    ? () {
-                        Navigator.of(context).push(
-                          MaterialPageRoute(
-                            builder: (_) =>
-                                BenchmarkPage(model: state.loadedModel!),
-                          ),
-                        );
-                      }
-                    : null,
               ),
               IconButton(
                 icon: const Icon(Icons.settings_outlined),
