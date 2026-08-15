@@ -397,9 +397,9 @@ const OPS = {
   appendImage({ bytes, maxLongSize }) {
     const t0 = performance.now();
     const view = new Uint8Array(bytes);
-    const cap = maxLongSize ?? 384;
+    const cap = maxLongSize ?? undefined;
     console.info(
-      `[cera:worker] appendImage: received ${view.byteLength} bytes of image data (maxLongSize: ${cap ?? 'none'})`,
+      `[cera:worker] appendImage: received ${view.byteLength} bytes of image data (maxLongSize: ${cap ?? 'model-default'})`,
     );
     if (gpu) {
       console.info(
@@ -538,26 +538,29 @@ const OPS = {
       // Emit per token rather than per buffer-full; the point of a worker is
       // that the host sees output as it is produced.
       opts.flushEveryTokens = 1;
-      let emittedLength = 0;
-      const allTokens = [];
+      let uncommittedTokens = [];
       try {
         cpu.session.generate(opts, (toks) => {
           for (let i = 0; i < toks.length; i++) {
-            allTokens.push(toks[i]);
+            uncommittedTokens.push(toks[i]);
           }
-          let full = tk.decode(Uint32Array.from(allTokens));
-          if (full.endsWith('\uFFFD')) {
-            full = full.slice(0, -1);
+          const decoded = tk.decode(Uint32Array.from(uncommittedTokens));
+          if (decoded.endsWith('\uFFFD')) {
+            // Incomplete multibyte UTF-8 character spanning across token chunks;
+            // hold back until the completing token arrives.
+            return;
           }
-          if (full.length > emittedLength) {
-            const delta = full.slice(emittedLength);
-            emittedLength = full.length;
-            onToken(delta);
+          if (decoded.length > 0) {
+            onToken(decoded);
+            uncommittedTokens = [];
           }
         });
-        const finalFull = tk.decode(Uint32Array.from(allTokens));
-        if (finalFull.length > emittedLength) {
-          onToken(finalFull.slice(emittedLength));
+        if (uncommittedTokens.length > 0) {
+          const remaining = tk.decode(Uint32Array.from(uncommittedTokens));
+          if (remaining.length > 0) {
+            onToken(remaining);
+          }
+          uncommittedTokens = [];
         }
       } finally {
         opts.free();
