@@ -2256,14 +2256,13 @@ fn main() -> Result<()> {
                 // `--temperature`, `--kv-cache-keys`, and appends `--prompt` before the marker.
                 // (256 / "f32" mirror the `Run` clap defaults; `transcribe` uses the same budget.)
                 let prompt_is_empty = prompt.as_deref().unwrap_or("").trim().is_empty();
-                let effective_temp =
-                    temperature.unwrap_or(engine.default_generate_opts().temperature);
+                let effective_opts = build_opts(&engine, None, Vec::new());
                 let has_sampling_overrides = top_p.is_some()
                     || top_k.is_some()
                     || min_p.is_some()
                     || repetition_penalty.is_some();
                 let transcribe_compatible = prompt_is_empty
-                    && effective_temp <= 0.0
+                    && effective_opts.temperature <= 0.0
                     && !has_sampling_overrides
                     && max_tokens == 256
                     && kv_cache_keys == "f32"

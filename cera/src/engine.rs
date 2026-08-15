@@ -684,8 +684,23 @@ impl CeraEngine {
         let gpu_audio_encoder = audio_encoder
             .as_ref()
             .and_then(|w| crate::model::audio_encoder_gpu::build_gpu_audio_encoder(w, cfg.backend));
-        let audio_decoder = aux.audio_decoder;
-        let detok_weights = aux.detok_weights;
+        let audio_decoder = aux.audio_decoder.filter(|dec| {
+            let model_dim = model.config().hidden_size;
+            let vocoder_dim = dec.depthformer_config.n_embd;
+            if vocoder_dim != model_dim {
+                tracing::warn!(
+                    "audio decoder embedding dimension ({vocoder_dim}) does not match model hidden size ({model_dim}); ignoring mismatched vocoder"
+                );
+                false
+            } else {
+                true
+            }
+        });
+        let detok_weights = if audio_decoder.is_some() {
+            aux.detok_weights
+        } else {
+            None
+        };
         Ok(Self {
             manifest,
             model,

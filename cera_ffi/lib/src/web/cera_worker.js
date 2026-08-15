@@ -633,14 +633,17 @@ const OPS = {
     if (req.seed != null && currentPos === 0 && cpu) {
       const config = new wasm.SessionConfig();
       config.seed = BigInt(req.seed);
+      let tq = null;
       if (cpu.turboQuant && typeof wasm.TurboQuantConfig === 'function') {
-        config.kvCompression = new wasm.TurboQuantConfig(BigInt(0));
+        tq = new wasm.TurboQuantConfig(BigInt(0));
+        config.kvCompression = tq;
       }
       try {
         cpu.session.free();
         cpu.session = cpu.engine.newSession(config);
       } finally {
         config.free();
+        tq?.free();
       }
     }
     let ids;

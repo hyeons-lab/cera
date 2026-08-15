@@ -55,11 +55,12 @@ def should_ignore_file(filepath: str) -> bool:
     return False
 
 
-def get_pr_diff(base_ref: str) -> str:
+def get_pr_diff(base_ref: str, base_sha: str | None = None) -> str:
     # Ensure origin/base_ref is fetched
     run_cmd(["git", "fetch", "origin", base_ref])
 
-    changed_files = run_cmd(["git", "diff", "--name-only", f"origin/{base_ref}...HEAD"]).splitlines()
+    target = base_sha if base_sha else f"origin/{base_ref}"
+    changed_files = run_cmd(["git", "diff", "--name-only", f"{target}...HEAD"]).splitlines()
     reviewable_files = [f for f in changed_files if not should_ignore_file(f)]
 
     if not reviewable_files:
@@ -67,7 +68,7 @@ def get_pr_diff(base_ref: str) -> str:
 
     diff_chunks = []
     for f in reviewable_files:
-        diff = run_cmd(["git", "diff", f"origin/{base_ref}...HEAD", "--", f])
+        diff = run_cmd(["git", "diff", f"{target}...HEAD", "--", f])
         if diff:
             # Cap individual large file diffs if needed
             if len(diff) > 20000:
@@ -201,6 +202,7 @@ def main():
     repo = os.getenv("GITHUB_REPOSITORY")
     pr_number = os.getenv("PR_NUMBER")
     base_ref = os.getenv("BASE_REF", "main")
+    base_sha = os.getenv("BASE_SHA", "")
     head_sha = os.getenv("HEAD_SHA", "")
     pr_title = os.getenv("PR_TITLE", "")
     pr_body = os.getenv("PR_BODY", "")
@@ -209,7 +211,7 @@ def main():
         print("Missing GitHub environment context (GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER).", file=sys.stderr)
         sys.exit(0)
 
-    diff = get_pr_diff(base_ref)
+    diff = get_pr_diff(base_ref, base_sha)
     if not diff:
         print("No reviewable diff found.")
         sys.exit(0)
