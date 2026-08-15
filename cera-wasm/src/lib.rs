@@ -2081,7 +2081,7 @@ mod webgpu {
             kv_compression: Option<crate::TurboQuantConfig>,
         ) -> Result<WebGpuSession, JsError> {
             let mut session = Self::create(bytes, context_size, kv_compression).await?;
-            session.attach_vision(Arc::from(mmproj))?;
+            session.attach_projector(Arc::from(mmproj))?;
             Ok(session)
         }
 
@@ -2177,10 +2177,6 @@ mod webgpu {
                 self.vision_encoder = Some(weights);
                 Ok(())
             }
-        }
-
-        fn attach_vision(&mut self, mmproj: Arc<[u8]>) -> Result<(), JsError> {
-            self.attach_projector(mmproj)
         }
 
         /// Number of tokens currently in the KV cache.

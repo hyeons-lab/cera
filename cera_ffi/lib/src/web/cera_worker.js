@@ -479,7 +479,9 @@ const OPS = {
       );
     } else {
       const tk = cpu.tokenizer;
-      cpu.session.appendTokens(ids);
+      if (ids.length > 0) {
+        cpu.session.appendTokens(ids);
+      }
       const opts = new wasm.GenerateOpts();
       opts.maxTokens = maxTokens;
       if (req.temperature != null) opts.temperature = req.temperature;
@@ -488,7 +490,11 @@ const OPS = {
       // Emit per token rather than per buffer-full; the point of a worker is
       // that the host sees output as it is produced.
       opts.flushEveryTokens = 1;
-      cpu.session.generate(opts, (toks) => onToken(tk.decode(toks)));
+      try {
+        cpu.session.generate(opts, (toks) => onToken(tk.decode(toks)));
+      } finally {
+        opts.free();
+      }
     }
     const ms = performance.now() - started;
     return { text, elapsedMs: ms };

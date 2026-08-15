@@ -388,7 +388,10 @@ class _NativeCera implements Cera {
           _session.close();
           _session = reseeded;
         }
-        _session.appendTokens(_frame(prompt));
+        final tokens = _frame(prompt);
+        if (tokens.isNotEmpty) {
+          _session.appendTokens(tokens);
+        }
         unawaited(
           _session
               .generateStreamingAsync(opts, sink)
