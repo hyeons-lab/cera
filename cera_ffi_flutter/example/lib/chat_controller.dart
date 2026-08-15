@@ -381,36 +381,44 @@ class ChatController extends ValueNotifier<ChatState> {
     final done = Completer<void>();
     _generationCompleter = done;
 
-    final stream = cera.generate(formattedPrompt);
+    try {
+      final stream = cera.generate(formattedPrompt);
 
-    final sub = stream.listen(
-      (piece) {
-        tokenCount++;
-        firstTokenMs ??= stopwatch.elapsedMilliseconds;
-        assistantTurn.isGenerating = true;
-        assistantTurn.statusText = null;
-        assistantTurn.text += piece;
-        notifyListeners();
-      },
-      onError: (Object err) {
-        assistantTurn.isGenerating = false;
-        assistantTurn.statusText = null;
-        assistantTurn.text = 'Error: $err';
-        notifyListeners();
-        if (!done.isCompleted) done.complete();
-      },
-      onDone: () {
-        if (!done.isCompleted) done.complete();
-      },
-      cancelOnError: true,
-    );
+      final sub = stream.listen(
+        (piece) {
+          tokenCount++;
+          firstTokenMs ??= stopwatch.elapsedMilliseconds;
+          assistantTurn.isGenerating = true;
+          assistantTurn.statusText = null;
+          assistantTurn.text += piece;
+          notifyListeners();
+        },
+        onError: (Object err) {
+          assistantTurn.isGenerating = false;
+          assistantTurn.statusText = null;
+          assistantTurn.text = 'Error: $err';
+          notifyListeners();
+          if (!done.isCompleted) done.complete();
+        },
+        onDone: () {
+          if (!done.isCompleted) done.complete();
+        },
+        cancelOnError: true,
+      );
 
-    _generationSub = sub;
+      _generationSub = sub;
 
-    await done.future;
-    stopwatch.stop();
-    _generationSub = null;
-    _generationCompleter = null;
+      await done.future;
+    } catch (err) {
+      assistantTurn.isGenerating = false;
+      assistantTurn.statusText = null;
+      assistantTurn.text = 'Error: $err';
+      notifyListeners();
+    } finally {
+      stopwatch.stop();
+      _generationSub = null;
+      _generationCompleter = null;
+    }
 
     final totalMs = stopwatch.elapsedMilliseconds;
     final ttft = firstTokenMs;
