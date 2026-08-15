@@ -1973,7 +1973,8 @@ pub fn gemv_q4_1_f32(
 #[inline]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "dot_f32 input lengths must match");
-    let len = a.len();
+    let mut a_chunks = a.chunks_exact(8);
+    let mut b_chunks = b.chunks_exact(8);
     let mut sum0 = 0.0f32;
     let mut sum1 = 0.0f32;
     let mut sum2 = 0.0f32;
@@ -1983,21 +1984,19 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     let mut sum6 = 0.0f32;
     let mut sum7 = 0.0f32;
 
-    let chunks = len / 8;
-    for i in 0..chunks {
-        let base = i * 8;
-        sum0 += a[base] * b[base];
-        sum1 += a[base + 1] * b[base + 1];
-        sum2 += a[base + 2] * b[base + 2];
-        sum3 += a[base + 3] * b[base + 3];
-        sum4 += a[base + 4] * b[base + 4];
-        sum5 += a[base + 5] * b[base + 5];
-        sum6 += a[base + 6] * b[base + 6];
-        sum7 += a[base + 7] * b[base + 7];
+    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        sum0 += ca[0] * cb[0];
+        sum1 += ca[1] * cb[1];
+        sum2 += ca[2] * cb[2];
+        sum3 += ca[3] * cb[3];
+        sum4 += ca[4] * cb[4];
+        sum5 += ca[5] * cb[5];
+        sum6 += ca[6] * cb[6];
+        sum7 += ca[7] * cb[7];
     }
     let mut sum = ((sum0 + sum1) + (sum2 + sum3)) + ((sum4 + sum5) + (sum6 + sum7));
-    for i in (chunks * 8)..len {
-        sum += a[i] * b[i];
+    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
+        sum += x * y;
     }
     sum
 }

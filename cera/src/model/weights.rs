@@ -264,11 +264,12 @@ impl MmapWeight {
         // Fast path if already contiguous F32
         if self.dtype == DType::F32 {
             let w_f32 = self.as_f32();
-            for r in 0..self.rows {
-                let w_row = &w_f32[r * self.cols..(r + 1) * self.cols];
-                for t in 0..n_tokens {
-                    let x_row = &x[t * self.cols..(t + 1) * self.cols];
-                    y[t * self.rows + r] = crate::backend::cpu::dot_f32(x_row, w_row);
+            for t in 0..n_tokens {
+                let x_row = &x[t * self.cols..(t + 1) * self.cols];
+                let y_row = &mut y[t * self.rows..(t + 1) * self.rows];
+                for r in 0..self.rows {
+                    let w_row = &w_f32[r * self.cols..(r + 1) * self.cols];
+                    y_row[r] = crate::backend::cpu::dot_f32(x_row, w_row);
                 }
             }
             return;

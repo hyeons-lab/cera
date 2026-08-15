@@ -397,6 +397,14 @@ class _WorkerCera implements Cera {
     return Uint8List.fromList(bytes).buffer.toJS;
   }
 
+  JSArrayBuffer _detachF32(Float32List floats) {
+    if (floats.offsetInBytes == 0 &&
+        floats.lengthInBytes == floats.buffer.lengthInBytes) {
+      return floats.buffer.toJS;
+    }
+    return Float32List.fromList(floats).buffer.toJS;
+  }
+
   void _receive(JSObject? data) {
     if (data == null) return;
     final reply = data as _Reply;
@@ -660,14 +668,16 @@ class _WorkerCera implements Cera {
         await ahead;
       } catch (_) {}
       final floatList = pcm is Float32List ? pcm : Float32List.fromList(pcm);
+      final buffer = _detachF32(floatList);
       await _send(
         _newId(),
         (id) => _Request(
           id: id,
           op: 'appendAudio',
-          pcm: floatList.toJS,
+          pcm: Float32List.view(buffer.toDart).toJS,
           sampleRate: sampleRate,
         ),
+        transfer: <JSAny>[buffer],
       );
     } finally {
       mine.complete();
@@ -684,14 +694,16 @@ class _WorkerCera implements Cera {
         await ahead;
       } catch (_) {}
       final floatList = pcm is Float32List ? pcm : Float32List.fromList(pcm);
+      final buffer = _detachF32(floatList);
       final result = await _send(
         _newId(),
         (id) => _Request(
           id: id,
           op: 'transcribe',
-          pcm: floatList.toJS,
+          pcm: Float32List.view(buffer.toDart).toJS,
           sampleRate: sampleRate,
         ),
+        transfer: <JSAny>[buffer],
       );
       return (result as JSString).toDart;
     } finally {
