@@ -261,9 +261,10 @@ impl MmapWeight {
             return;
         }
 
-        // Fast path if already contiguous F32
-        if self.dtype == DType::F32 {
-            let w_f32 = self.as_f32();
+        // Fast path if already contiguous and properly aligned F32
+        if self.dtype == DType::F32
+            && let Some(w_f32) = self.try_as_f32()
+        {
             for t in 0..n_tokens {
                 let x_row = &x[t * self.cols..(t + 1) * self.cols];
                 let y_row = &mut y[t * self.rows..(t + 1) * self.rows];
