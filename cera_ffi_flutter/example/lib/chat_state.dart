@@ -100,12 +100,25 @@ class DownloadedModelRecord {
       );
 }
 
+/// Audio generation mode when an audio-capable model (with neural vocoder) is loaded.
+enum AudioChatMode {
+  /// Voice Chat (Interleaved): Model generates conversational text and spoken audio.
+  interleaved,
+
+  /// Text to Speech (TTS): Model speaks and synthesizes the user text prompt directly using its neural vocoder.
+  textToSpeech,
+
+  /// Text Only: Generates standard text responses without vocoder speech synthesis.
+  textOnly,
+}
+
 /// Settings state for engine inference and vision/audio preprocessing.
 class ChatSettings {
   const ChatSettings({
     this.backend = CeraBackend.auto,
     this.turboQuant = false,
     this.maxImageLongSize = 256,
+    this.audioChatMode = AudioChatMode.interleaved,
   });
 
   /// Which compute backend to run on.
@@ -118,6 +131,9 @@ class ChatSettings {
   /// Maximum long side resolution for image inputs to the vision encoder.
   /// null means use model's native resolution limit. Defaults to 256 for fast inference.
   final int? maxImageLongSize;
+
+  /// Mode for audio generation when an audio-capable model is loaded.
+  final AudioChatMode audioChatMode;
 
   /// Converts settings to engine open options.
   CeraOptions get ceraOptions => CeraOptions(
@@ -135,6 +151,7 @@ class ChatSettings {
     CeraBackend? backend,
     bool? turboQuant,
     int? Function()? maxImageLongSize,
+    AudioChatMode? audioChatMode,
   }) {
     return ChatSettings(
       backend: backend ?? this.backend,
@@ -142,8 +159,18 @@ class ChatSettings {
       maxImageLongSize: maxImageLongSize != null
           ? maxImageLongSize()
           : this.maxImageLongSize,
+      audioChatMode: audioChatMode ?? this.audioChatMode,
     );
   }
+}
+
+/// Main UI mode for the Cera demo application.
+enum AppUIMode {
+  /// Conversational multimodal chat.
+  chat,
+
+  /// Dedicated on-device neural Text-to-Speech (TTS) Studio.
+  ttsStudio,
 }
 
 /// Immutable MVI State representing the entire Chat UI and engine state.
@@ -161,6 +188,7 @@ class ChatState {
     this.backend,
     this.downloadedModels = const [],
     this.settings = const ChatSettings(),
+    this.uiMode = AppUIMode.chat,
   });
 
   final LoadedModel? loadedModel;
@@ -175,6 +203,7 @@ class ChatState {
   final String? backend;
   final List<DownloadedModelRecord> downloadedModels;
   final ChatSettings settings;
+  final AppUIMode uiMode;
 
   bool get hasModel => loadedModel != null;
   bool get isBusy => isLoading || isGenerating;
@@ -196,6 +225,7 @@ class ChatState {
     String? Function()? backend,
     List<DownloadedModelRecord>? downloadedModels,
     ChatSettings? settings,
+    AppUIMode? uiMode,
   }) {
     return ChatState(
       loadedModel: loadedModel != null ? loadedModel() : this.loadedModel,
@@ -216,6 +246,7 @@ class ChatState {
       backend: backend != null ? backend() : this.backend,
       downloadedModels: downloadedModels ?? this.downloadedModels,
       settings: settings ?? this.settings,
+      uiMode: uiMode ?? this.uiMode,
     );
   }
 }

@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+import 'chat_state.dart';
 import 'model_source.dart';
 
 /// Sealed hierarchy of all user and system intents processed by [ChatController].
@@ -80,17 +81,25 @@ class ClearTranscriptIntent extends ChatIntent {
   const ClearTranscriptIntent();
 }
 
-/// Intent to update runtime and engine settings (e.g. backend, TurboQuant, max image dimension).
+/// Intent to update runtime and engine settings (e.g. backend, TurboQuant, max image dimension, audio mode).
 class UpdateSettingsIntent extends ChatIntent {
   const UpdateSettingsIntent({
     this.backend,
     this.turboQuant,
     this.maxImageLongSize,
     this.clearMaxImageLongSize = false,
+    this.audioChatMode,
   });
 
   final CeraBackend? backend;
   final bool? turboQuant;
   final int? maxImageLongSize;
   final bool clearMaxImageLongSize;
+  final AudioChatMode? audioChatMode;
+}
+
+/// Intent to switch the main app UI mode (Chat vs TTS Studio).
+class SetUIModeIntent extends ChatIntent {
+  const SetUIModeIntent(this.mode);
+  final AppUIMode mode;
 }

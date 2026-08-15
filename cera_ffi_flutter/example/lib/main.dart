@@ -23,6 +23,7 @@ import 'model_source.dart';
 import 'widgets/bundle_picker_dialog.dart';
 import 'widgets/message_composer.dart';
 import 'widgets/message_list.dart';
+import 'widgets/tts_studio_view.dart';
 
 void main() => runApp(const CeraExampleApp());
 
@@ -437,6 +438,44 @@ class _ChatPageState extends State<ChatPage> {
                           },
                         ),
                       ),
+                      const SizedBox(height: 8),
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Audio Output Mode'),
+                        subtitle: Text(
+                          'Select how audio-capable models generate speech (using the model\'s neural vocoder, not OS/browser TTS).',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        trailing: DropdownButton<AudioChatMode>(
+                          value: currentSettings.audioChatMode,
+                          dropdownColor: theme.colorScheme.surface,
+                          underline: const SizedBox.shrink(),
+                          items: const [
+                            DropdownMenuItem(
+                              value: AudioChatMode.interleaved,
+                              child: Text('Voice Chat (Interleaved)'),
+                            ),
+                            DropdownMenuItem(
+                              value: AudioChatMode.textToSpeech,
+                              child: Text('Text to Speech (TTS)'),
+                            ),
+                            DropdownMenuItem(
+                              value: AudioChatMode.textOnly,
+                              child: Text('Text Only (No Audio)'),
+                            ),
+                          ],
+                          onChanged: (val) {
+                            if (val == null) return;
+                            setModalState(() {});
+                            _controller.dispatch(
+                              UpdateSettingsIntent(audioChatMode: val),
+                            );
+                          },
+                        ),
+                      ),
                       if (state.hasModel) ...[
                         Divider(color: theme.dividerColor, height: 24),
                         Text(
@@ -453,10 +492,12 @@ class _ChatPageState extends State<ChatPage> {
                           padding: const EdgeInsets.all(12),
                           decoration: BoxDecoration(
                             color: theme.colorScheme.outlineVariant.withValues(
-                              alpha: 0.4,
+                              alpha: 0.25,
                             ),
                             borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: theme.dividerColor),
+                            border: Border.all(
+                              color: theme.colorScheme.outlineVariant,
+                            ),
                           ),
                           child: Row(
                             children: [
@@ -546,6 +587,39 @@ class _ChatPageState extends State<ChatPage> {
                     ),
             ),
             actions: [
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: SegmentedButton<AppUIMode>(
+                  style: SegmentedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
+                    side: BorderSide(color: theme.colorScheme.outlineVariant),
+                    selectedBackgroundColor: theme.colorScheme.primary
+                        .withValues(alpha: 0.16),
+                    selectedForegroundColor: theme.colorScheme.primary,
+                  ),
+                  showSelectedIcon: false,
+                  segments: const [
+                    ButtonSegment<AppUIMode>(
+                      value: AppUIMode.chat,
+                      label: Text('Chat', style: TextStyle(fontSize: 11.5)),
+                      icon: Icon(Icons.chat_outlined, size: 14),
+                    ),
+                    ButtonSegment<AppUIMode>(
+                      value: AppUIMode.ttsStudio,
+                      label: Text(
+                        'TTS Studio',
+                        style: TextStyle(fontSize: 11.5),
+                      ),
+                      icon: Icon(Icons.record_voice_over_outlined, size: 14),
+                    ),
+                  ],
+                  selected: {state.uiMode},
+                  onSelectionChanged: (selection) {
+                    _controller.dispatch(SetUIModeIntent(selection.first));
+                  },
+                ),
+              ),
               IconButton(
                 icon: const Icon(Icons.delete_outline_rounded),
                 tooltip: 'Clear transcript',
@@ -560,45 +634,200 @@ class _ChatPageState extends State<ChatPage> {
               ),
             ],
           ),
-          body: Column(
-            children: [
-              Expanded(
-                child: MessageList(
-                  turns: state.turns,
-                  scrollController: _scrollController,
-                  audioPlayer: _controller.audioPlayer,
-                ),
-              ),
-              MessageComposer(
-                controller: _inputController,
-                isBusy: state.isBusy,
-                isGenerating: state.isGenerating,
-                canAttachImage: state.canAttachImage,
-                canAttachAudio: state.canAttachAudio,
-                pendingImageBytes: state.pendingImageBytes,
-                pendingImageName: state.pendingImageName,
-                onSend: _sendMessage,
-                onStop: () =>
-                    _controller.dispatch(const StopGenerationIntent()),
-                onPickImage: _pickImage,
-                onClearImage: () =>
-                    _controller.dispatch(const ClearAttachedImageIntent()),
-                onSendAudio: (pcm, sampleRate) {
-                  final text = _inputController.text.trim();
-                  _inputController.clear();
-                  _controller.dispatch(
-                    SendAudioPromptIntent(
-                      pcmSamples: pcm,
-                      sampleRate: sampleRate,
-                      prompt: text,
+          body: state.uiMode == AppUIMode.ttsStudio
+              ? TtsStudioView(
+                  state: state,
+                  controller: _controller,
+                  onOpenCatalog: () => _pickBundle(state),
+                )
+              : Column(
+                  children: [
+                    Expanded(
+                      child: MessageList(
+                        turns: state.turns,
+                        scrollController: _scrollController,
+                        audioPlayer: _controller.audioPlayer,
+                      ),
                     ),
-                  );
-                },
-              ),
-            ],
-          ),
+                    if (state.hasModel &&
+                        (state.capabilities?.audioOut ?? false))
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.surface,
+                          border: Border(
+                            top: BorderSide(
+                              color: theme.colorScheme.outlineVariant,
+                            ),
+                            bottom: BorderSide(
+                              color: theme.colorScheme.outlineVariant,
+                            ),
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.graphic_eq_rounded,
+                              size: 15,
+                              color: theme.colorScheme.primary,
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              'Voice Mode:',
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600,
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: SingleChildScrollView(
+                                scrollDirection: Axis.horizontal,
+                                child: Row(
+                                  children: [
+                                    _AudioModeChip(
+                                      label: 'Voice Chat',
+                                      icon: Icons.record_voice_over_outlined,
+                                      isSelected:
+                                          state.settings.audioChatMode ==
+                                          AudioChatMode.interleaved,
+                                      onTap: () => _controller.dispatch(
+                                        const UpdateSettingsIntent(
+                                          audioChatMode:
+                                              AudioChatMode.interleaved,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    _AudioModeChip(
+                                      label: 'Text to Speech (TTS)',
+                                      icon: Icons.volume_up_outlined,
+                                      isSelected:
+                                          state.settings.audioChatMode ==
+                                          AudioChatMode.textToSpeech,
+                                      onTap: () => _controller.dispatch(
+                                        const UpdateSettingsIntent(
+                                          audioChatMode:
+                                              AudioChatMode.textToSpeech,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    _AudioModeChip(
+                                      label: 'Text Only',
+                                      icon: Icons.chat_bubble_outline_rounded,
+                                      isSelected:
+                                          state.settings.audioChatMode ==
+                                          AudioChatMode.textOnly,
+                                      onTap: () => _controller.dispatch(
+                                        const UpdateSettingsIntent(
+                                          audioChatMode: AudioChatMode.textOnly,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    MessageComposer(
+                      controller: _inputController,
+                      isBusy: state.isBusy,
+                      isGenerating: state.isGenerating,
+                      canAttachImage: state.canAttachImage,
+                      canAttachAudio: state.canAttachAudio,
+                      pendingImageBytes: state.pendingImageBytes,
+                      pendingImageName: state.pendingImageName,
+                      onSend: _sendMessage,
+                      onStop: () =>
+                          _controller.dispatch(const StopGenerationIntent()),
+                      onPickImage: _pickImage,
+                      onClearImage: () => _controller.dispatch(
+                        const ClearAttachedImageIntent(),
+                      ),
+                      onSendAudio: (pcm, sampleRate) {
+                        final text = _inputController.text.trim();
+                        _inputController.clear();
+                        _controller.dispatch(
+                          SendAudioPromptIntent(
+                            pcmSamples: pcm,
+                            sampleRate: sampleRate,
+                            prompt: text,
+                          ),
+                        );
+                      },
+                    ),
+                  ],
+                ),
         );
       },
+    );
+  }
+}
+
+class _AudioModeChip extends StatelessWidget {
+  const _AudioModeChip({
+    required this.label,
+    required this.icon,
+    required this.isSelected,
+    required this.onTap,
+  });
+
+  final String label;
+  final IconData icon;
+  final bool isSelected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(6),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: isSelected
+              ? theme.colorScheme.primary.withValues(alpha: 0.16)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+            color: isSelected
+                ? theme.colorScheme.primary.withValues(alpha: 0.4)
+                : theme.colorScheme.outlineVariant,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              icon,
+              size: 13,
+              color: isSelected
+                  ? theme.colorScheme.primary
+                  : theme.colorScheme.onSurfaceVariant,
+            ),
+            const SizedBox(width: 5),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                color: isSelected
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

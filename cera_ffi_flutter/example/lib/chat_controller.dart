@@ -73,6 +73,8 @@ class ChatController extends ValueNotifier<ChatState> {
         await _onClearTranscript();
       case UpdateSettingsIntent():
         await _onUpdateSettings(intent);
+      case SetUIModeIntent():
+        value = value.copyWith(uiMode: intent.mode);
     }
   }
 
@@ -128,10 +130,17 @@ class ChatController extends ValueNotifier<ChatState> {
       };
       final turboQuant = prefs.getBool('cera_turboquant') ?? false;
       final maxImageDim = prefs.getInt('cera_max_image_dim');
+      final audioModeStr = prefs.getString('cera_audio_chat_mode');
+      final audioMode = switch (audioModeStr) {
+        'tts' => AudioChatMode.textToSpeech,
+        'textOnly' => AudioChatMode.textOnly,
+        _ => AudioChatMode.interleaved,
+      };
       final restoredSettings = ChatSettings(
         backend: backend,
         turboQuant: turboQuant,
         maxImageLongSize: maxImageDim == 0 ? null : (maxImageDim ?? 256),
+        audioChatMode: audioMode,
       );
       value = value.copyWith(settings: restoredSettings);
 
@@ -180,11 +189,13 @@ class ChatController extends ValueNotifier<ChatState> {
     final newMaxImage = intent.clearMaxImageLongSize
         ? null
         : (intent.maxImageLongSize ?? current.maxImageLongSize);
+    final newAudioMode = intent.audioChatMode ?? current.audioChatMode;
 
     final updated = current.copyWith(
       backend: newBackend,
       turboQuant: newTurbo,
       maxImageLongSize: () => newMaxImage,
+      audioChatMode: newAudioMode,
     );
 
     value = value.copyWith(settings: updated);
@@ -198,6 +209,11 @@ class ChatController extends ValueNotifier<ChatState> {
       } else {
         await prefs.setInt('cera_max_image_dim', 0);
       }
+      await prefs.setString('cera_audio_chat_mode', switch (newAudioMode) {
+        AudioChatMode.textToSpeech => 'tts',
+        AudioChatMode.textOnly => 'textOnly',
+        AudioChatMode.interleaved => 'interleaved',
+      });
     } catch (err) {
       debugPrint('cera: error persisting settings: $err');
     }
@@ -285,15 +301,61 @@ class ChatController extends ValueNotifier<ChatState> {
       pendingImageName: () => null,
     );
 
+    final Map<String, ({int downloaded, int? total})> fileDownloads = {};
+
     try {
       final cera = await openFn((progress) {
         if (_disposed) return;
-        final pct = progress.fraction == null
-            ? '${(progress.bytesDownloaded / 1024 / 1024).toStringAsFixed(0)} MB'
-            : '${(progress.fraction! * 100).toStringAsFixed(0)}%';
+        fileDownloads[progress.url] = (
+          downloaded: progress.bytesDownloaded,
+          total: progress.totalBytes,
+        );
+
+        final totalDownloaded = fileDownloads.values.fold<int>(
+          0,
+          (sum, f) => sum + f.downloaded,
+        );
+
+        int? sumTotal;
+        bool allTotalsKnown = true;
+        int runningTotal = 0;
+        for (final f in fileDownloads.values) {
+          if (f.total != null) {
+            runningTotal += f.total!;
+          } else {
+            allTotalsKnown = false;
+          }
+        }
+        if (allTotalsKnown && runningTotal > 0) {
+          sumTotal = runningTotal;
+        }
+
+        final fraction = (sumTotal != null && sumTotal > 0)
+            ? (totalDownloaded / sumTotal).clamp(0.0, 1.0)
+            : null;
+
+        final fileName = progress.url.contains('/')
+            ? progress.url.split('/').last
+            : progress.url;
+
+        final downloadedMb = (totalDownloaded / 1024 / 1024).toStringAsFixed(1);
+        final pctStr = fraction != null
+            ? '${(fraction * 100).toStringAsFixed(0)}%'
+            : '$downloadedMb MB';
+
+        final totalStr = sumTotal != null
+            ? '${(sumTotal / 1024 / 1024).toStringAsFixed(1)} MB'
+            : null;
+
+        final bytesInfo = totalStr != null
+            ? '$downloadedMb / $totalStr'
+            : '$downloadedMb MB';
+
+        final fileSuffix = fileName.isNotEmpty ? ' · $fileName' : '';
+
         value = value.copyWith(
-          downloadFraction: () => progress.fraction,
-          status: 'Downloading $label · $pct',
+          downloadFraction: () => fraction,
+          status: 'Downloading $label · $pctStr ($bytesInfo)$fileSuffix',
         );
       });
 
@@ -390,12 +452,30 @@ class ChatController extends ValueNotifier<ChatState> {
       imageName: imageName,
     );
 
+    final audioOut = value.capabilities?.audioOut ?? false;
+    final audioMode = audioOut
+        ? value.settings.audioChatMode
+        : AudioChatMode.textOnly;
+    final isTts = audioMode == AudioChatMode.textToSpeech;
+    final isInterleaved = audioMode == AudioChatMode.interleaved;
+
+    final String initialStatus;
+    if (imageBytes != null) {
+      initialStatus = 'Analyzing image...';
+    } else if (isTts) {
+      initialStatus = 'Synthesizing neural speech...';
+    } else if (isInterleaved) {
+      initialStatus = 'Thinking & speaking...';
+    } else {
+      initialStatus = 'Thinking...';
+    }
+
     final assistantTurn = Turn(
       role: 'assistant',
       text: '',
       modelName: value.loadedModel?.name,
       isGenerating: true,
-      statusText: imageBytes != null ? 'Analyzing image...' : 'Thinking...',
+      statusText: initialStatus,
     );
 
     final newTurns = List<Turn>.from(value.turns)
@@ -415,14 +495,21 @@ class ChatController extends ValueNotifier<ChatState> {
 
     debugPrint(
       '[cera:chat] Submitting user message: "$framedPrompt" '
-      '(image: ${imageBytes != null ? "${imageBytes.length} bytes" : "none"})',
+      '(image: ${imageBytes != null ? "${imageBytes.length} bytes" : "none"}, audioMode: ${audioMode.name})',
     );
+
+    final String? systemPrompt = isTts
+        ? 'Perform TTS.'
+        : (isInterleaved ? 'Respond with interleaved text and audio.' : null);
+
+    final messages = <CeraMessage>[
+      if (systemPrompt != null) CeraMessage.system(systemPrompt),
+      CeraMessage.user(framedPrompt),
+    ];
 
     String formattedPrompt;
     try {
-      formattedPrompt = await cera.applyChatTemplate([
-        CeraMessage.user(framedPrompt),
-      ]);
+      formattedPrompt = await cera.applyChatTemplate(messages);
     } catch (_) {
       formattedPrompt = framedPrompt;
     }
