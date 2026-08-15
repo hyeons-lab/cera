@@ -722,7 +722,7 @@ impl VisionEncoderWeights {
         let in_dim = p.mm1_w.cols;
         let mid_dim = p.mm1_w.rows; // intermediate (e.g., 2048)
         let out_dim = cfg.projection_dim;
-        if in_dim == 0 || pooled.is_empty() {
+        if in_dim == 0 || pooled.is_empty() || !pooled.len().is_multiple_of(in_dim) {
             return Vec::new();
         }
         let n_tokens = pooled.len() / in_dim;

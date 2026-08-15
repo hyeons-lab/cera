@@ -616,12 +616,18 @@ const OPS = {
       }
     }
     let ids;
-    if (pendingAudioSuffixTokens != null && (!prompt || prompt.trim() === '')) {
-      ids = pendingAudioSuffixTokens;
-      pendingAudioSuffixTokens = null;
+    const pendingSuffix = pendingAudioSuffixTokens;
+    pendingAudioSuffixTokens = null;
+    if (pendingSuffix != null && (!prompt || prompt.trim() === '')) {
+      ids = pendingSuffix;
       console.info(`[cera:worker] generate: using ${ids.length} pending audio suffix tokens for generation`);
+    } else if (pendingSuffix != null) {
+      const promptIds = encodePrompt(prompt, currentPos === 0);
+      ids = new Uint32Array(pendingSuffix.length + promptIds.length);
+      ids.set(pendingSuffix, 0);
+      ids.set(promptIds, pendingSuffix.length);
+      console.info(`[cera:worker] generate: combined ${pendingSuffix.length} audio suffix tokens and ${promptIds.length} prompt tokens`);
     } else {
-      pendingAudioSuffixTokens = null;
       ids = encodePrompt(prompt, currentPos === 0);
       console.info(`[cera:worker] generate: prompt encoded into ${ids.length} tokens`);
     }

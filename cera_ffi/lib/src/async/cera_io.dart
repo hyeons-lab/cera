@@ -416,11 +416,12 @@ class _NativeCera implements Cera {
         }
         List<int> tokens;
         final pendingSuffix = _pendingAudioSuffixTokens;
+        _pendingAudioSuffixTokens = null;
         if (pendingSuffix != null && prompt.trim().isEmpty) {
-          _pendingAudioSuffixTokens = null;
           tokens = pendingSuffix;
+        } else if (pendingSuffix != null) {
+          tokens = [...pendingSuffix, ..._frame(prompt)];
         } else {
-          _pendingAudioSuffixTokens = null;
           tokens = _frame(prompt);
         }
         if (tokens.isNotEmpty) {
