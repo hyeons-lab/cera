@@ -1609,18 +1609,7 @@ impl Session {
     /// Append PCM audio samples (mono `f32`, normalized to roughly
     /// `[-1.0, 1.0]`) at `sample_rate` Hz.
     ///
-    /// **Status: placeholder.** The wasm shape is wired through to
-    /// `cera::Session::append_audio`, but the cera core method is
-    /// currently a scaffold — for any model it errors, either with
-    /// the `UnsupportedModality` variant (text-only LLMs) or with
-    /// a `Backend(...)` variant (audio-capable models, awaiting
-    /// Session-side audio-tokenizer wiring). This export exists so
-    /// JS / TS consumers can lock in the symbol + signature now and
-    /// the wasm-pack `.d.ts` artifact catches any future shape
-    /// changes; it does **not** yet decode and append audio tokens.
-    /// Mirrors the same placeholder framing that cera-ffi shipped
-    /// in PR #78.
-    ///
+    /// Non-16kHz inputs are automatically linearly resampled to 16 kHz.
     /// `samples` arrives as `Float32Array` on the JS side. The
     /// wasm-bindgen boundary copies the typed-array contents into
     /// wasm linear memory once — there's no per-element boxing
@@ -2104,8 +2093,7 @@ mod webgpu {
         /// and costs one copy of the model rather than two.
         ///
         /// Throws for every reason `create` does, plus a bundle the GPU path
-        /// cannot serve: it is LFM2-only, and an audio bundle's encoder is
-        /// rejected as a vision tower. A caller wanting a fallback should catch
+        /// cannot serve: it is LFM2-only. A caller wanting a fallback should catch
         /// and retry through `CeraEngine.fromBundleId`, which is what
         /// `cera_worker.js` does for `backend: 'auto'`.
         #[wasm_bindgen(js_name = fromBundleId)]

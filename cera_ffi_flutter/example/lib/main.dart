@@ -373,13 +373,17 @@ class _ChatPageState extends State<ChatPage> {
                 onPickImage: _pickImage,
                 onClearImage: () =>
                     _controller.dispatch(const ClearAttachedImageIntent()),
-                onSendAudio: (pcm, sampleRate) => _controller.dispatch(
-                  SendAudioPromptIntent(
-                    pcmSamples: pcm,
-                    sampleRate: sampleRate,
-                    prompt: _inputController.text.trim(),
-                  ),
-                ),
+                onSendAudio: (pcm, sampleRate) {
+                  final text = _inputController.text.trim();
+                  _inputController.clear();
+                  _controller.dispatch(
+                    SendAudioPromptIntent(
+                      pcmSamples: pcm,
+                      sampleRate: sampleRate,
+                      prompt: text,
+                    ),
+                  );
+                },
               ),
             ],
           ),

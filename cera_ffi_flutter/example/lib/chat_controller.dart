@@ -574,8 +574,13 @@ class ChatController extends ValueNotifier<ChatState> {
         _ceraEngine = null;
         try {
           final reloaded = await current.open();
+          if (_disposed) {
+            await reloaded.close();
+            return;
+          }
           _ceraEngine = reloaded;
         } catch (err) {
+          if (_disposed) return;
           value = value.copyWith(
             loadedModel: () => null,
             status: 'Failed to reload model: $err',
@@ -583,7 +588,9 @@ class ChatController extends ValueNotifier<ChatState> {
         }
       }
     } catch (_) {}
-    value = value.copyWith(turns: []);
+    if (!_disposed) {
+      value = value.copyWith(turns: []);
+    }
   }
 
   @override

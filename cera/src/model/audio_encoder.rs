@@ -17,10 +17,8 @@
 //!   → embeddings [llm_hidden_size × T_subsampled]
 //! ```
 //!
-//! This module is the **loader only** — config + weight structs +
-//! `from_gguf`. The Conformer forward pass and mel-spec preprocessor
-//! land in follow-up PRs (the "audio input pipeline" plan in
-//! `devlog/`).
+//! This module implements the audio weights loader, Conformer forward pass,
+//! mel-spec preprocessing, and automatic linear resampling.
 //!
 //! Tensor name conventions are taken from llama.cpp's
 //! `tools/mtmd/clip-impl.h` (`TN_*` macros), substituted with

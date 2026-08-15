@@ -5,11 +5,10 @@
 //! one-shot `engine::generate()` so every downstream consumer — CLI,
 //! FFI bindings, browser workers, the AIDL service — shares one core.
 //!
-//! The API is multimodal from day one even though only text is wired
-//! in v1: `append_image` and `append_audio` return
-//! `CeraError::UnsupportedModality` until the VL / audio loaders land
-//! in follow-ups. Callbacks use a `ModalitySink` trait with default-empty
-//! methods so text-only consumers override just `on_text_tokens` + `on_done`.
+//! The API is multimodal: `append_image` and `append_audio` feed visual and
+//! acoustic features into the LLM via their respective attached encoders.
+//! Callbacks use a `ModalitySink` trait with default-empty methods so text-only
+//! consumers override just `on_text_tokens` + `on_done`.
 
 use std::io;
 use std::sync::Arc;

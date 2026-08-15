@@ -504,20 +504,27 @@ const OPS = {
       // Emit per token rather than per buffer-full; the point of a worker is
       // that the host sees output as it is produced.
       opts.flushEveryTokens = 1;
-      let prevText = '';
+      let emittedLength = 0;
       const allTokens = [];
       try {
         cpu.session.generate(opts, (toks) => {
           for (let i = 0; i < toks.length; i++) {
             allTokens.push(toks[i]);
           }
-          const full = tk.decode(Uint32Array.from(allTokens));
-          const delta = full.slice(prevText.length);
-          if (delta.length > 0) {
-            prevText = full;
+          let full = tk.decode(Uint32Array.from(allTokens));
+          if (full.endsWith('\uFFFD')) {
+            full = full.slice(0, -1);
+          }
+          if (full.length > emittedLength) {
+            const delta = full.slice(emittedLength);
+            emittedLength = full.length;
             onToken(delta);
           }
         });
+        const finalFull = tk.decode(Uint32Array.from(allTokens));
+        if (finalFull.length > emittedLength) {
+          onToken(finalFull.slice(emittedLength));
+        }
       } finally {
         opts.free();
       }
