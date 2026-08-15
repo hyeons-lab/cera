@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:record/record.dart';
 
@@ -46,7 +47,10 @@ class AudioRecorderService {
   }
 
   /// Stops recording and returns all accumulated normalized Float32 PCM samples.
-  Future<List<double>> stopRecording() async {
+  Future<List<double>> stopRecording({
+    bool normalize = true,
+    bool trim = true,
+  }) async {
     if (!_isRecording) return [];
     _isRecording = false;
     await _streamSub?.cancel();
@@ -54,7 +58,17 @@ class AudioRecorderService {
     try {
       await _recorder.stop();
     } catch (_) {}
-    return List<double>.from(_accumulatedPcm);
+
+    var pcm = List<double>.from(_accumulatedPcm);
+    if (pcm.isEmpty) return [];
+
+    if (trim) {
+      pcm = trimSilence(pcm);
+    }
+    if (normalize) {
+      pcm = normalizeAudio(pcm);
+    }
+    return pcm;
   }
 
   /// Cancels recording and discards audio.
@@ -83,5 +97,89 @@ class AudioRecorderService {
       floats[i] = (sample / 32768.0).clamp(-1.0, 1.0);
     }
     return floats;
+  }
+
+  /// Trims leading and trailing silence from PCM samples using frame RMS energy.
+  static List<double> trimSilence(
+    List<double> samples, {
+    int sampleRate = 16000,
+    double thresholdFactor = 0.08,
+    double minThreshold = 0.015,
+    int paddingMs = 120,
+  }) {
+    if (samples.length < sampleRate ~/ 10) return samples; // < 100ms: skip
+
+    final frameSize = (sampleRate * 0.02).round(); // 20ms frame
+    if (frameSize <= 0) return samples;
+
+    final numFrames = samples.length ~/ frameSize;
+    if (numFrames == 0) return samples;
+
+    final frameRms = Float64List(numFrames);
+    double maxRms = 0.0;
+
+    for (var f = 0; f < numFrames; f++) {
+      double sumSquares = 0.0;
+      final start = f * frameSize;
+      for (var i = 0; i < frameSize; i++) {
+        final val = samples[start + i];
+        sumSquares += val * val;
+      }
+      final rms = math.sqrt(sumSquares / frameSize);
+      frameRms[f] = rms;
+      if (rms > maxRms) {
+        maxRms = rms;
+      }
+    }
+
+    if (maxRms < minThreshold) {
+      // Entire signal is very quiet: keep original to avoid false empty
+      return samples;
+    }
+
+    final dynamicThreshold = math.max(minThreshold, maxRms * thresholdFactor);
+
+    var startFrame = 0;
+    while (startFrame < numFrames && frameRms[startFrame] < dynamicThreshold) {
+      startFrame++;
+    }
+
+    var endFrame = numFrames - 1;
+    while (endFrame > startFrame && frameRms[endFrame] < dynamicThreshold) {
+      endFrame--;
+    }
+
+    final padSamples = (sampleRate * (paddingMs / 1000.0)).round();
+    final startSample = math.max(0, (startFrame * frameSize) - padSamples);
+    final endSample = math.min(
+      samples.length,
+      ((endFrame + 1) * frameSize) + padSamples,
+    );
+
+    if (startSample >= endSample) return samples;
+    return samples.sublist(startSample, endSample);
+  }
+
+  /// Normalizes PCM samples so peak absolute amplitude is scaled to [targetPeak].
+  static List<double> normalizeAudio(
+    List<double> samples, {
+    double targetPeak = 0.9,
+  }) {
+    if (samples.isEmpty) return samples;
+
+    double maxAmp = 0.0;
+    for (final s in samples) {
+      final absVal = s.abs();
+      if (absVal > maxAmp) maxAmp = absVal;
+    }
+
+    if (maxAmp < 1e-4) return samples; // Silent or nearly silent
+
+    final scale = targetPeak / maxAmp;
+    final normalized = Float32List(samples.length);
+    for (var i = 0; i < samples.length; i++) {
+      normalized[i] = (samples[i] * scale).clamp(-1.0, 1.0);
+    }
+    return normalized;
   }
 }
