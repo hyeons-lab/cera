@@ -17,6 +17,7 @@ class ChatController extends ValueNotifier<ChatState> {
 
   Cera? _ceraEngine;
   StreamSubscription<String>? _generationSub;
+  Completer<void>? _generationCompleter;
   bool _disposed = false;
 
   /// Exposes the active Cera engine if loaded (e.g. for external benchmark).
@@ -62,7 +63,7 @@ class ChatController extends ValueNotifier<ChatState> {
       case ClearAttachedImageIntent():
         _onClearAttachedImage();
       case ClearTranscriptIntent():
-        _onClearTranscript();
+        await _onClearTranscript();
       case RemoveDownloadedModelIntent():
         await _onRemoveDownloadedModel(intent.record);
     }
@@ -74,6 +75,10 @@ class ChatController extends ValueNotifier<ChatState> {
     if (_generationSub != null) {
       await _generationSub?.cancel();
       _generationSub = null;
+    }
+    if (_generationCompleter != null && !_generationCompleter!.isCompleted) {
+      _generationCompleter!.complete();
+      _generationCompleter = null;
     }
     if (_ceraEngine != null) {
       final old = _ceraEngine;
@@ -360,6 +365,7 @@ class ChatController extends ValueNotifier<ChatState> {
     int? firstTokenMs;
     int tokenCount = 0;
     final done = Completer<void>();
+    _generationCompleter = done;
 
     final stream = cera.generate(formattedPrompt);
 
@@ -390,6 +396,7 @@ class ChatController extends ValueNotifier<ChatState> {
     await done.future;
     stopwatch.stop();
     _generationSub = null;
+    _generationCompleter = null;
 
     final totalMs = stopwatch.elapsedMilliseconds;
     final ttft = firstTokenMs;
@@ -421,6 +428,10 @@ class ChatController extends ValueNotifier<ChatState> {
       await _generationSub?.cancel();
       _generationSub = null;
     }
+    if (_generationCompleter != null && !_generationCompleter!.isCompleted) {
+      _generationCompleter!.complete();
+      _generationCompleter = null;
+    }
     for (final turn in value.turns) {
       if (turn.isGenerating) {
         turn.isGenerating = false;
@@ -444,8 +455,8 @@ class ChatController extends ValueNotifier<ChatState> {
     );
   }
 
-  void _onClearTranscript() {
-    _onStopGeneration();
+  Future<void> _onClearTranscript() async {
+    await _onStopGeneration();
     try {
       _ceraEngine?.reset();
     } catch (_) {}

@@ -2266,6 +2266,7 @@ fn main() -> Result<()> {
                             temperature: Some(t),
                             ..
                         } => *t,
+                        cera::manifest::GenerationDefaults::Audio { .. } => 0.0,
                         _ => 0.7,
                     }
                 });
