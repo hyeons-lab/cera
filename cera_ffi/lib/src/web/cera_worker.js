@@ -490,7 +490,7 @@ const OPS = {
     const messages = [];
     if (currentPos === 0) {
       const systemPrompt = capabilitiesOf().audioOut
-        ? "Perform TTS. Lily's voice is clear, bright and natural."
+        ? 'Respond with interleaved text and audio.'
         : 'Respond to the user.';
       messages.push({ role: 'system', content: systemPrompt });
     }

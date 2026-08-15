@@ -2786,6 +2786,17 @@ mod webgpu {
             };
             pos += 1;
 
+            let mut decoder =
+                if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
+                    Some(cera::audio_engine::AudioOutputDecoder::new(
+                        dec, detok, None, 0.0, 1, false,
+                    ))
+                } else {
+                    None
+                };
+            let mut modality_budget = 6usize;
+            let mut text_done = false;
+
             // Greedy decode loop. Stream raw bytes through a buffer and emit
             // only complete UTF-8: a multi-byte character can span several
             // byte-fallback tokens, so converting one token at a time would
@@ -2800,10 +2811,10 @@ mod webgpu {
                 generated += 1;
 
                 if next == cera::audio_engine::TOKEN_AUDIO_START
-                    && let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights)
+                    && let Some(ref mut dec) = decoder
                 {
                     console_info(
-                        "[cera-wasm] WebGpuSession hit TOKEN_AUDIO_START (128). Beginning vocoder audio decoding...",
+                        "[cera-wasm] WebGpuSession hit TOKEN_AUDIO_START (128). Beginning sequential vocoder audio decoding...",
                     );
                     if !pending.is_empty() {
                         let valid = match std::str::from_utf8(&pending) {
@@ -2818,13 +2829,86 @@ mod webgpu {
                         pending.clear();
                     }
 
-                    if pos >= max_seq_len {
-                        break;
-                    }
+                    if pos < max_seq_len {
+                        let mut emb = self
+                            .model
+                            .forward_embedding_async(next, pos, &mut self.state)
+                            .await
+                            .map_err(map_err)?;
+                        pos += 1;
 
-                    let mut decoder = cera::audio_engine::AudioOutputDecoder::new(
-                        dec, detok, None, 0.0, 1, false,
-                    );
+                        let mut frame_count = 0;
+                        loop {
+                            if generated >= max_tokens as usize || pos >= max_seq_len {
+                                break;
+                            }
+                            let outcome = dec.decode_frame(&emb);
+                            let audio_emb = match outcome {
+                                cera::audio_engine::FrameOutcome::End => {
+                                    console_info(&format!(
+                                        "[cera-wasm] WebGpuSession vocoder emitted End code after {frame_count} frames"
+                                    ));
+                                    break;
+                                }
+                                cera::audio_engine::FrameOutcome::Codes { audio_embedding } => {
+                                    frame_count += 1;
+                                    audio_embedding
+                                }
+                            };
+                            emb = self
+                                .model
+                                .forward_hidden_from_embedding_async(
+                                    &audio_emb,
+                                    pos,
+                                    &mut self.state,
+                                )
+                                .await
+                                .map_err(map_err)?;
+                            pos += 1;
+                            generated += 1;
+                        }
+                    }
+                    break;
+                }
+
+                if next == cera::audio_engine::TOKEN_TEXT_END {
+                    text_done = true;
+                }
+
+                if next != cera::audio_engine::TOKEN_TEXT_END {
+                    pending.extend_from_slice(&self.tokenizer.decode_bytes(&[next]));
+                    let valid = match std::str::from_utf8(&pending) {
+                        Ok(s) => s.len(),
+                        Err(e) => e.valid_up_to(),
+                    };
+                    if valid > 0 {
+                        let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                        out.push_str(&piece);
+                        emit(on_token, &piece);
+                        pending.drain(..valid);
+                    }
+                }
+
+                modality_budget = modality_budget.saturating_sub(1);
+
+                // Interleaved audio generation: when modality budget hits 0 or text is done,
+                // extract audio embedding from this token and decode up to 12 audio frames.
+                if let Some(ref mut dec) = decoder
+                    && (modality_budget == 0 || text_done)
+                    && pos < max_seq_len
+                {
+                    if !pending.is_empty() {
+                        let valid = match std::str::from_utf8(&pending) {
+                            Ok(s) => s.len(),
+                            Err(e) => e.valid_up_to(),
+                        };
+                        if valid > 0 {
+                            let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                            out.push_str(&piece);
+                            emit(on_token, &piece);
+                            pending.drain(..valid);
+                        }
+                    }
 
                     let mut emb = self
                         .model
@@ -2833,24 +2917,50 @@ mod webgpu {
                         .map_err(map_err)?;
                     pos += 1;
 
-                    let mut frame_count = 0;
-                    loop {
-                        if generated >= max_tokens as usize || pos >= max_seq_len {
-                            break;
-                        }
-                        let outcome = decoder.decode_frame(&emb);
+                    let mut frames = 0;
+                    let mut reached_end = false;
+                    while frames < 12 && pos < max_seq_len && generated < max_tokens as usize {
+                        let outcome = dec.decode_frame(&emb);
                         let audio_emb = match outcome {
                             cera::audio_engine::FrameOutcome::End => {
-                                console_info(&format!(
-                                    "[cera-wasm] WebGpuSession vocoder emitted End code after {frame_count} frames"
-                                ));
+                                text_done = true;
+                                reached_end = true;
                                 break;
                             }
                             cera::audio_engine::FrameOutcome::Codes { audio_embedding } => {
-                                frame_count += 1;
                                 audio_embedding
                             }
                         };
+                        frames += 1;
+                        if frames == 12 && !text_done {
+                            // Transition back to text from the audio embedding
+                            next = match sampler.as_mut() {
+                                Some(s) => {
+                                    let mut l = self
+                                        .model
+                                        .forward_logits_from_embedding_async(
+                                            &audio_emb,
+                                            pos,
+                                            &mut self.state,
+                                        )
+                                        .await
+                                        .map_err(map_err)?;
+                                    s.sample(&mut l)
+                                }
+                                None => self
+                                    .model
+                                    .forward_greedy_from_embedding_async(
+                                        &audio_emb,
+                                        pos,
+                                        &mut self.state,
+                                    )
+                                    .await
+                                    .map_err(map_err)?,
+                            };
+                            pos += 1;
+                            modality_budget = 6;
+                            break;
+                        }
                         emb = self
                             .model
                             .forward_hidden_from_embedding_async(&audio_emb, pos, &mut self.state)
@@ -2860,44 +2970,18 @@ mod webgpu {
                         generated += 1;
                     }
 
-                    if let Some(cb) = on_audio {
-                        let mut total_samples = 0;
-                        decoder.finish(|pcm, rate| {
-                            total_samples += pcm.len();
-                            console_info(&format!(
-                                "[cera-wasm] WebGpuSession vocoder finish produced {} PCM samples at {} Hz",
-                                pcm.len(),
-                                rate
-                            ));
-                            let array = js_sys::Float32Array::from(pcm);
-                            let rate_val = JsValue::from_f64(rate as f64);
-                            if let Err(err) = cb.call2(&JsValue::null(), &array, &rate_val) {
-                                wasm_bindgen::throw_val(err);
-                            }
-                        });
-                        console_info(&format!(
-                            "[cera-wasm] WebGpuSession audio generation finished with {frame_count} frames and {total_samples} samples"
-                        ));
+                    if reached_end {
+                        break;
                     }
-                    break;
-                }
-
-                pending.extend_from_slice(&self.tokenizer.decode_bytes(&[next]));
-                let valid = match std::str::from_utf8(&pending) {
-                    Ok(s) => s.len(),
-                    Err(e) => e.valid_up_to(),
-                };
-                if valid > 0 {
-                    let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
-                    out.push_str(&piece);
-                    emit(on_token, &piece);
-                    pending.drain(..valid);
+                    if frames == 12 {
+                        continue;
+                    }
                 }
 
                 // Stop before the next forward would overflow the context
                 // window (the GPU forward asserts `seq_len < max_seq_len`). The
                 // token just emitted is the last one this call can produce.
-                if pos >= max_seq_len {
+                if pos >= max_seq_len || generated >= max_tokens as usize {
                     break;
                 }
                 next = match sampler.as_mut() {
@@ -2916,6 +3000,31 @@ mod webgpu {
                         .map_err(map_err)?,
                 };
                 pos += 1;
+            }
+
+            if let Some(mut dec) = decoder
+                && dec.audio_frames() > 0
+                && let Some(cb) = on_audio
+            {
+                let mut total_samples = 0;
+                dec.finish(|pcm, rate| {
+                    total_samples += pcm.len();
+                    console_info(&format!(
+                        "[cera-wasm] WebGpuSession vocoder finish produced {} PCM samples at {} Hz",
+                        pcm.len(),
+                        rate
+                    ));
+                    let array = js_sys::Float32Array::from(pcm);
+                    let rate_val = JsValue::from_f64(rate as f64);
+                    if let Err(err) = cb.call2(&JsValue::null(), &array, &rate_val) {
+                        wasm_bindgen::throw_val(err);
+                    }
+                });
+                console_info(&format!(
+                    "[cera-wasm] WebGpuSession audio generation finished with {} frames and {} total samples",
+                    dec.audio_frames(),
+                    total_samples
+                ));
             }
             // Flush any trailing bytes (an incomplete multi-byte char at the
             // stop boundary — lossy as a last resort).
