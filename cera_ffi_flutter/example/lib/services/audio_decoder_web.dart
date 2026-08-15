@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:js_interop';
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 
-@JS('window.ceraDecodeAudioBlob')
+@JS('ceraDecodeAudioBlob')
 external JSPromise<JSFloat32Array>? _ceraDecodeAudioBlob(
   JSString blobUrl,
   JSNumber targetSampleRate,
@@ -16,6 +16,7 @@ Future<Float32List?> decodeAudioBlob(String blobUrl, int sampleRate) async {
     final jsFloats = await promise.toDart;
     return jsFloats.toDart;
   } catch (err) {
+    debugPrint('[cera:audio_decoder_web] decodeAudioBlob failed: $err');
     return null;
   }
 }

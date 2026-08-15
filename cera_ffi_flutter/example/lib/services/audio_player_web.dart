@@ -1,23 +1,23 @@
 import 'dart:async';
 import 'dart:js_interop';
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 
-@JS('window.ceraPlayAudio')
+@JS('ceraPlayAudio')
 external JSPromise<JSAny?>? _ceraPlayAudio(
   JSFloat32Array float32Array,
   JSNumber sampleRate,
 );
 
-@JS('window.ceraStopAudio')
+@JS('ceraStopAudio')
 external void _ceraStopAudio();
 
-@JS('window.ceraStartAudioStream')
+@JS('ceraStartAudioStream')
 external void _ceraStartAudioStream(JSNumber sampleRate);
 
-@JS('window.ceraAppendAudioStreamChunk')
+@JS('ceraAppendAudioStreamChunk')
 external void _ceraAppendAudioStreamChunk(JSFloat32Array chunk);
 
-@JS('window.ceraStopAudioStream')
+@JS('ceraStopAudioStream')
 external void _ceraStopAudioStream();
 
 /// Plays a single audio PCM buffer using the browser Web Audio API.
@@ -27,33 +27,43 @@ Future<void> playAudioPcm(Float32List samples, int sampleRate) async {
     if (promise != null) {
       await promise.toDart;
     }
-  } catch (_) {}
+  } catch (err) {
+    debugPrint('[cera:audio_player_web] playAudioPcm failed: $err');
+  }
 }
 
 /// Stops any active audio playback.
 void stopAudioPlayback() {
   try {
     _ceraStopAudio();
-  } catch (_) {}
+  } catch (err) {
+    debugPrint('[cera:audio_player_web] stopAudioPlayback failed: $err');
+  }
 }
 
 /// Starts an audio streaming playback session.
 void startAudioStream(int sampleRate) {
   try {
     _ceraStartAudioStream(sampleRate.toJS);
-  } catch (_) {}
+  } catch (err) {
+    debugPrint('[cera:audio_player_web] startAudioStream failed: $err');
+  }
 }
 
 /// Appends a PCM chunk to the active audio stream.
 void appendAudioStreamChunk(Float32List chunk) {
   try {
     _ceraAppendAudioStreamChunk(chunk.toJS);
-  } catch (_) {}
+  } catch (err) {
+    debugPrint('[cera:audio_player_web] appendAudioStreamChunk failed: $err');
+  }
 }
 
 /// Stops and closes the audio streaming session.
 void stopAudioStream() {
   try {
     _ceraStopAudioStream();
-  } catch (_) {}
+  } catch (err) {
+    debugPrint('[cera:audio_player_web] stopAudioStream failed: $err');
+  }
 }

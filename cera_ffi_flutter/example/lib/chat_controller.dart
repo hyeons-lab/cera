@@ -552,6 +552,9 @@ class ChatController extends ValueNotifier<ChatState> {
       final stream = cera.generate(
         formattedPrompt,
         onAudio: (pcm, rate) {
+          debugPrint(
+            '[cera:chat] Received ${pcm.length} audio samples at $rate Hz',
+          );
           generatedAudioSamples.addAll(pcm);
           _audioPlayer.appendChunk(pcm);
           _updateLastTurn(
