@@ -57,23 +57,3 @@ void stopAudioStream() {
     _ceraStopAudioStream();
   } catch (_) {}
 }
-
-@JS('window.ceraSpeakText')
-external void _ceraSpeakText(JSString text);
-
-@JS('window.ceraStopSpeech')
-external void _ceraStopSpeech();
-
-/// Synthesizes and speaks text using browser speech synthesis.
-void speakText(String text) {
-  try {
-    _ceraSpeakText(text.toJS);
-  } catch (_) {}
-}
-
-/// Stops any ongoing speech synthesis.
-void stopSpeech() {
-  try {
-    _ceraStopSpeech();
-  } catch (_) {}
-}
