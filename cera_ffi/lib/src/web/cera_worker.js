@@ -140,6 +140,15 @@ async function ensureModule(moduleUrl) {
   // value and then fails inside wasm-bindgen with "wasm not initialized"
   // instead of retrying the load that actually broke.
   await module.default();
+  if (typeof module.initThreadPool === 'function' && self.crossOriginIsolated) {
+    try {
+      const concurrency = self.navigator?.hardwareConcurrency || 4;
+      await module.initThreadPool(concurrency);
+      console.info(`[cera:worker] multi-threaded wasm initialized with ${concurrency} threads`);
+    } catch (e) {
+      console.warn(`[cera:worker] initThreadPool failed: ${e}`);
+    }
+  }
   wasm = module;
 }
 
