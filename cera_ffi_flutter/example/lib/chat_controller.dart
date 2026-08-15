@@ -335,6 +335,11 @@ class ChatController extends ValueNotifier<ChatState> {
         ? promptText
         : (imageBytes != null ? 'Describe this image.' : '');
 
+    debugPrint(
+      '[cera:chat] Submitting user message: "$framedPrompt" '
+      '(image: ${imageBytes != null ? "${imageBytes.length} bytes" : "none"})',
+    );
+
     String formattedPrompt;
     try {
       formattedPrompt = await cera.applyChatTemplate([
@@ -346,7 +351,17 @@ class ChatController extends ValueNotifier<ChatState> {
 
     if (imageBytes != null) {
       try {
-        await cera.appendImage(imageBytes);
+        assistantTurn.statusText = 'Encoding image patches...';
+        notifyListeners();
+        debugPrint(
+          '[cera:chat] Encoding image patches with maxLongSize 384...',
+        );
+        await cera.appendImage(imageBytes, maxLongSize: 384);
+        debugPrint(
+          '[cera:chat] Image successfully encoded and seeded into KV cache',
+        );
+        assistantTurn.statusText = 'Generating response...';
+        notifyListeners();
       } catch (err) {
         assistantTurn.isGenerating = false;
         assistantTurn.statusText = null;
@@ -371,6 +386,11 @@ class ChatController extends ValueNotifier<ChatState> {
 
     final durationSec = intent.pcmSamples.length / intent.sampleRate;
     final promptText = intent.prompt.trim();
+    debugPrint(
+      '[cera:chat] Submitting audio prompt: "${promptText.isNotEmpty ? promptText : "(voice note)"}" '
+      '(${intent.pcmSamples.length} samples, ${durationSec.toStringAsFixed(1)}s)',
+    );
+
     final userTurn = Turn(
       role: 'user',
       text: promptText.isNotEmpty
@@ -384,7 +404,7 @@ class ChatController extends ValueNotifier<ChatState> {
       text: '',
       modelName: value.loadedModel?.name,
       isGenerating: true,
-      statusText: 'Listening to audio...',
+      statusText: 'Processing audio...',
     );
 
     final newTurns = List<Turn>.from(value.turns)
@@ -407,7 +427,17 @@ class ChatController extends ValueNotifier<ChatState> {
     }
 
     try {
+      assistantTurn.statusText = 'Encoding audio frames...';
+      notifyListeners();
+      debugPrint(
+        '[cera:chat] Encoding audio frames at ${intent.sampleRate}Hz...',
+      );
       await cera.appendAudio(intent.pcmSamples, sampleRate: intent.sampleRate);
+      debugPrint(
+        '[cera:chat] Audio successfully encoded and seeded into KV cache',
+      );
+      assistantTurn.statusText = 'Generating response...';
+      notifyListeners();
     } catch (err) {
       assistantTurn.isGenerating = false;
       assistantTurn.statusText = null;
@@ -433,13 +463,20 @@ class ChatController extends ValueNotifier<ChatState> {
     final done = Completer<void>();
     _generationCompleter = done;
 
+    debugPrint(
+      '[cera:chat] Prefilling prompt (${formattedPrompt.length} chars) and starting generation...',
+    );
+
     try {
       final stream = cera.generate(formattedPrompt);
 
       final sub = stream.listen(
         (piece) {
           tokenCount++;
-          firstTokenMs ??= stopwatch.elapsedMilliseconds;
+          if (firstTokenMs == null) {
+            firstTokenMs = stopwatch.elapsedMilliseconds;
+            debugPrint('[cera:chat] First token received in ${firstTokenMs}ms');
+          }
           assistantTurn.isGenerating = true;
           assistantTurn.statusText = null;
           assistantTurn.text += piece;
@@ -506,6 +543,10 @@ class ChatController extends ValueNotifier<ChatState> {
         tps: tps,
       );
     }
+    debugPrint(
+      '[cera:chat] Generation completed: $totalTokens tokens in ${totalMs}ms '
+      '(${tps.toStringAsFixed(1)} tok/s, TTFT: ${ttft ?? totalMs}ms)',
+    );
 
     if (!_disposed) {
       value = value.copyWith(

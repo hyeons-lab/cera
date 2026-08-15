@@ -395,13 +395,25 @@ const OPS = {
    * to, so ordering is the caller's: image first, then the question.
    */
   appendImage({ bytes, maxLongSize }) {
+    const t0 = performance.now();
     const view = new Uint8Array(bytes);
-    const cap = maxLongSize ?? undefined;
+    const cap = maxLongSize ?? 384;
+    console.info(
+      `[cera:worker] appendImage: received ${bytes.length} bytes of image data (maxLongSize: ${cap ?? 'none'})`,
+    );
     if (gpu) {
+      console.info(
+        '[cera:worker] appendImage: preprocessing and encoding image patches for WebGPU KV cache...',
+      );
       gpu.session.appendImage(view, cap);
     } else {
+      console.info(
+        '[cera:worker] appendImage: preprocessing and encoding image patches on CPU session (this may take several seconds)...',
+      );
       cpu.session.appendImage(view, cap);
     }
+    const elapsed = (performance.now() - t0).toFixed(1);
+    console.info(`[cera:worker] appendImage: image embeddings seeded into KV cache in ${elapsed}ms`);
     return null;
   },
 
@@ -409,13 +421,21 @@ const OPS = {
    * Feed mono PCM audio into the live conversation.
    */
   appendAudio({ pcm, sampleRate }) {
+    const t0 = performance.now();
     const samples = Float32Array.from(pcm);
     const sr = sampleRate ?? 16000;
+    console.info(
+      `[cera:worker] appendAudio: processing ${samples.length} audio samples at ${sr}Hz (${(samples.length / sr).toFixed(1)}s)...`,
+    );
     if (gpu) {
+      console.info('[cera:worker] appendAudio: encoding audio frames for WebGPU KV cache...');
       gpu.session.appendAudio(samples, sr);
     } else {
+      console.info('[cera:worker] appendAudio: encoding audio frames on CPU session...');
       cpu.session.appendAudio(samples, sr);
     }
+    const elapsed = (performance.now() - t0).toFixed(1);
+    console.info(`[cera:worker] appendAudio: audio embeddings seeded into KV cache in ${elapsed}ms`);
     return null;
   },
 
@@ -433,7 +453,11 @@ const OPS = {
           'no audio path. Open the model with backend: cpu to transcribe.',
       );
     }
-    return cpu.engine.transcribe(Float32Array.from(pcm), sampleRate);
+    console.info(`[cera:worker] transcribe: running ASR on ${pcm.length} samples at ${sampleRate}Hz...`);
+    const t0 = performance.now();
+    const result = cpu.engine.transcribe(Float32Array.from(pcm), sampleRate);
+    console.info(`[cera:worker] transcribe: completed in ${(performance.now() - t0).toFixed(1)}ms`);
+    return result;
   },
 
   capabilities() {
@@ -449,12 +473,16 @@ const OPS = {
    */
   async generate(req, post) {
     const { prompt, maxTokens } = req;
+    const currentPos = position();
+    console.info(
+      `[cera:worker] generate: starting generation on "${backendLabel}" (context position: ${currentPos}, maxTokens: ${maxTokens})`,
+    );
     // Seeding is per SESSION in the CPU wasm API, not per generate:
     // `GenerateOpts` has no seed field and assigning one just creates a dead JS
     // property. Honoring it therefore means rebuilding the session, which is
     // only meaningful before anything has been fed. The GPU path takes its seed
     // as a `generateTokens` argument instead, so it needs none of this.
-    if (req.seed != null && position() === 0 && cpu) {
+    if (req.seed != null && currentPos === 0 && cpu) {
       const config = new wasm.SessionConfig();
       config.seed = BigInt(req.seed);
       try {
@@ -464,10 +492,19 @@ const OPS = {
         config.free();
       }
     }
-    const ids = encodePrompt(prompt, position() === 0);
+    const ids = encodePrompt(prompt, currentPos === 0);
+    console.info(`[cera:worker] generate: prompt encoded into ${ids.length} tokens`);
     const started = performance.now();
+    let firstTokenTime = null;
+    let tokenCount = 0;
     let text = '';
     const onToken = (piece) => {
+      tokenCount++;
+      if (!firstTokenTime) {
+        firstTokenTime = performance.now();
+        const ttft = (firstTokenTime - started).toFixed(1);
+        console.info(`[cera:worker] generate: first token emitted in ${ttft}ms (TTFT)`);
+      }
       text += piece;
       post({ event: 'token', text: piece });
     };
@@ -527,6 +564,14 @@ const OPS = {
       }
     }
     const ms = performance.now() - started;
+    const decodeMs = firstTokenTime ? (performance.now() - firstTokenTime) : ms;
+    const tps =
+      tokenCount > 1 && decodeMs > 0
+        ? ((tokenCount - 1) / (decodeMs / 1000)).toFixed(1)
+        : (tokenCount / (ms / 1000)).toFixed(1);
+    console.info(
+      `[cera:worker] generate: completed ${tokenCount} tokens in ${ms.toFixed(1)}ms (${tps} tok/s)`,
+    );
     return { text, elapsedMs: ms };
   },
 
