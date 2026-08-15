@@ -121,7 +121,7 @@ class ChatController extends ValueNotifier<ChatState> {
             : bundleName;
 
         // Ensure active model is recorded in downloaded models
-        _saveDownloadedRecord(bundleName, quant, displayName);
+        await _saveDownloadedRecord(bundleName, quant, displayName);
 
         await _load(
           bundleSource: BundleModelSource(
@@ -337,7 +337,9 @@ class ChatController extends ValueNotifier<ChatState> {
     );
 
     final messages = newTurns
-        .where((t) => !t.isGenerating && t.text.isNotEmpty)
+        .where(
+          (t) => !t.isGenerating && (t.text.isNotEmpty || t.imageBytes != null),
+        )
         .map((t) => CeraMessage(t.role, t.text))
         .toList();
 
@@ -458,7 +460,7 @@ class ChatController extends ValueNotifier<ChatState> {
   Future<void> _onClearTranscript() async {
     await _onStopGeneration();
     try {
-      _ceraEngine?.reset();
+      await _ceraEngine?.reset();
     } catch (_) {}
     value = value.copyWith(turns: []);
   }
