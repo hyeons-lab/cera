@@ -1,7 +1,11 @@
 import 'dart:async';
 import 'dart:math' as math;
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:record/record.dart';
+
+import 'audio_decoder_stub.dart'
+    if (dart.library.js_interop) 'audio_decoder_web.dart'
+    as web_audio;
 
 /// Service managing microphone capture for Cera multimodal audio models.
 class AudioRecorderService {
@@ -9,6 +13,7 @@ class AudioRecorderService {
   final List<double> _accumulatedPcm = [];
   StreamSubscription<Uint8List>? _streamSub;
   bool _isRecording = false;
+  int _currentSampleRate = 16000;
 
   bool get isRecording => _isRecording;
 
@@ -21,29 +26,38 @@ class AudioRecorderService {
     }
   }
 
-  /// Begins streaming 16-bit PCM audio from the microphone.
+  /// Begins streaming 16-bit PCM audio from the microphone (or recording on web).
   Future<void> startRecording({int sampleRate = 16000}) async {
     if (_isRecording) return;
     _accumulatedPcm.clear();
+    _currentSampleRate = sampleRate;
 
     final hasPerm = await hasPermission();
     if (!hasPerm) {
       throw StateError('Microphone permission not granted');
     }
 
-    final stream = await _recorder.startStream(
-      RecordConfig(
-        encoder: AudioEncoder.pcm16bits,
-        sampleRate: sampleRate,
-        numChannels: 1,
-      ),
-    );
+    if (kIsWeb) {
+      await _recorder.start(
+        RecordConfig(sampleRate: sampleRate, numChannels: 1),
+        path: '',
+      );
+      _isRecording = true;
+    } else {
+      final stream = await _recorder.startStream(
+        RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: sampleRate,
+          numChannels: 1,
+        ),
+      );
 
-    _isRecording = true;
-    _streamSub = stream.listen((chunk) {
-      final samples = pcm16ToFloat32(chunk);
-      _accumulatedPcm.addAll(samples);
-    });
+      _isRecording = true;
+      _streamSub = stream.listen((chunk) {
+        final samples = pcm16ToFloat32(chunk);
+        _accumulatedPcm.addAll(samples);
+      });
+    }
   }
 
   /// Stops recording and returns all accumulated normalized Float32 PCM samples.
@@ -55,15 +69,30 @@ class AudioRecorderService {
     _isRecording = false;
     await _streamSub?.cancel();
     _streamSub = null;
-    try {
-      await _recorder.stop();
-    } catch (_) {}
 
-    var pcm = List<double>.from(_accumulatedPcm);
+    List<double> pcm;
+    if (kIsWeb) {
+      final blobUrl = await _recorder.stop();
+      if (blobUrl != null && blobUrl.isNotEmpty) {
+        final decoded = await web_audio.decodeAudioBlob(
+          blobUrl,
+          _currentSampleRate,
+        );
+        pcm = decoded != null ? decoded.toList() : [];
+      } else {
+        pcm = [];
+      }
+    } else {
+      try {
+        await _recorder.stop();
+      } catch (_) {}
+      pcm = List<double>.from(_accumulatedPcm);
+    }
+
     if (pcm.isEmpty) return [];
 
     if (trim) {
-      pcm = trimSilence(pcm);
+      pcm = trimSilence(pcm, sampleRate: _currentSampleRate);
     }
     if (normalize) {
       pcm = normalizeAudio(pcm);

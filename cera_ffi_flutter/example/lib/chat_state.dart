@@ -116,8 +116,16 @@ class ChatSettings {
   final int? maxImageLongSize;
 
   /// Converts settings to engine open options.
-  CeraOptions get ceraOptions =>
-      CeraOptions(backend: backend, turboQuant: turboQuant);
+  CeraOptions get ceraOptions => CeraOptions(
+    backend: backend,
+    turboQuant: turboQuant,
+    web: CeraWebAssets(
+      workerUrl: 'cera/cera_worker.js',
+      moduleUrl: backend == CeraBackend.cpu
+          ? 'cera_mt/cera_wasm.js'
+          : 'cera/cera_wasm.js',
+    ),
+  );
 
   ChatSettings copyWith({
     CeraBackend? backend,

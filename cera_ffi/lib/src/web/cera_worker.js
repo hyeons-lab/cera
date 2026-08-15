@@ -131,16 +131,20 @@ async function ensureModule(moduleUrl) {
   // outright with "Failed to resolve module specifier", even though the very
   // same string works in `new Worker(...)`. Resolving against the worker's own
   // location turns any of the three forms into something importable.
-  const module = await import(new URL(moduleUrl, self.location.href).href);
-  // wasm-bindgen's `--target web` default export fetches and instantiates the
-  // `.wasm` sibling. It resolves that path against the JS module's own URL, so
-  // the two files must stay next to each other.
-  //
-  // Assigned only after instantiation succeeds. Caching the namespace first
-  // makes a failed load stick: every later `open` short-circuits on the cached
-  // value and then fails inside wasm-bindgen with "wasm not initialized"
-  // instead of retrying the load that actually broke.
-  await module.default();
+  let module;
+  try {
+    module = await import(new URL(moduleUrl, self.location.href).href);
+    await module.default();
+  } catch (err) {
+    const defaultUrl = 'cera/cera_wasm.js';
+    if (moduleUrl !== defaultUrl) {
+      console.warn(`[cera:worker] failed to load ${moduleUrl} (${err}), falling back to ${defaultUrl}`);
+      module = await import(new URL(defaultUrl, self.location.href).href);
+      await module.default();
+    } else {
+      throw err;
+    }
+  }
   if (typeof module.initThreadPool === 'function') {
     if (self.crossOriginIsolated) {
       try {
@@ -469,11 +473,16 @@ const OPS = {
       }
     }
 
+    const currentPos = position();
     const userContent =
       prompt && prompt.trim().length > 0
         ? `${prompt.trim()}\n${markerName}`
         : markerName;
-    const messages = [{ role: 'user', content: userContent }];
+    const messages = [];
+    if (currentPos === 0) {
+      messages.push({ role: 'system', content: 'Respond to the user.' });
+    }
+    messages.push({ role: 'user', content: userContent });
     let formatted;
     try {
       formatted = tk.applyChatTemplate(messages, true);
@@ -656,6 +665,18 @@ const OPS = {
         firstTokenTime = performance.now();
         const ttft = (firstTokenTime - started).toFixed(1);
         console.info(`[cera:worker] generate: first token emitted in ${ttft}ms (TTFT)`);
+      }
+      if (
+        piece.includes('<|text_end|>') ||
+        piece.includes('<|im_end|>') ||
+        piece.includes('<|endoftext|>')
+      ) {
+        const clean = piece.replace(/<\|(text_end|im_end|endoftext)\|>/g, '');
+        if (clean.length > 0) {
+          text += clean;
+          post({ event: 'token', text: clean });
+        }
+        return;
       }
       text += piece;
       post({ event: 'token', text: piece });

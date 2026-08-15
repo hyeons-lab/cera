@@ -40,15 +40,26 @@
     }
   </style>
 </head>
-<body style="background-color: #0b0c0e;">
-  <!--
-    You can customize the "flutter_bootstrap.js" script.
-    This is useful to provide a custom configuration to the Flutter loader
-    or to give the user feedback during the initialization process.
-
-    For more details:
-    * https://docs.flutter.dev/platform-integration/web/initialization
-  -->
+  <script>
+    window.ceraDecodeAudioBlob = async function(blobUrl, targetSr) {
+      try {
+        const res = await fetch(blobUrl);
+        const buf = await res.arrayBuffer();
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        const ctx = new AudioCtx({ sampleRate: targetSr || 16000 });
+        try {
+          const decoded = await ctx.decodeAudioData(buf);
+          const chan = decoded.getChannelData(0);
+          return new Float32Array(chan);
+        } finally {
+          if (ctx.state !== 'closed') ctx.close();
+        }
+      } catch (err) {
+        console.error('[cera:audio] decodeAudioData failed:', err);
+        throw err;
+      }
+    };
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>
