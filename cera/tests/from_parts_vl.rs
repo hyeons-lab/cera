@@ -96,6 +96,7 @@ fn from_parts_loads_a_vl_bundle_from_bytes_alone() {
         ModelBytes {
             model: model.into(),
             multimodal_projector: Some(mmproj.into()),
+            audio_decoder: None,
             inference_type: None,
             chat_template: None,
         },
@@ -147,6 +148,7 @@ fn explicit_text_type_suppresses_the_upgrade() {
         ModelBytes {
             model: model.into(),
             multimodal_projector: Some(mmproj.into()),
+            audio_decoder: None,
             inference_type: Some(InferenceType::LlamaCppTextToText),
             chat_template: None,
         },
@@ -173,6 +175,7 @@ fn a_corrupt_mmproj_degrades_to_text_instead_of_failing() {
         ModelBytes {
             model: model.into(),
             multimodal_projector: Some(vec![0xDE, 0xAD, 0xBE, 0xEF].into()),
+            audio_decoder: None,
             inference_type: None,
             chat_template: None,
         },
@@ -204,6 +207,7 @@ fn append_image_advances_the_kv_cache() {
         ModelBytes {
             model: model.into(),
             multimodal_projector: Some(mmproj.into()),
+            audio_decoder: None,
             inference_type: None,
             chat_template: None,
         },

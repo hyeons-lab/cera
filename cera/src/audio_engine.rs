@@ -48,9 +48,9 @@ pub struct AudioGenerateResult {
 }
 
 /// Special token IDs for modality control.
-const TOKEN_AUDIO_START: u32 = 128;
-const TOKEN_TEXT_END: u32 = 130;
-const AUDIO_END_CODE: i32 = 2048;
+pub(crate) const TOKEN_AUDIO_START: u32 = 128;
+pub(crate) const TOKEN_TEXT_END: u32 = 130;
+pub(crate) const AUDIO_END_CODE: i32 = 2048;
 
 #[derive(PartialEq)]
 enum Modality {
@@ -63,7 +63,7 @@ enum Modality {
 // ---------------------------------------------------------------------------
 
 /// Per-frame outcome from [`AudioOutputDecoder::decode_frame`].
-enum FrameOutcome {
+pub(crate) enum FrameOutcome {
     /// Codes sampled + detokenized; `audio_embedding` is the feedback
     /// embedding the caller should pass back through the main LLM.
     Codes { audio_embedding: Vec<f32> },
@@ -80,7 +80,7 @@ enum FrameOutcome {
 ///
 /// External `generate_audio` signature is unchanged; this is a purely
 /// internal refactor.
-struct AudioOutputDecoder<'a> {
+pub(crate) struct AudioOutputDecoder<'a> {
     weights: &'a AudioDecoderWeights,
     detok_weights: &'a DetokenizerWeights,
     gpu: Option<&'a dyn AudioGpu>,
@@ -100,7 +100,7 @@ struct AudioOutputDecoder<'a> {
 }
 
 impl<'a> AudioOutputDecoder<'a> {
-    fn new(
+    pub(crate) fn new(
         weights: &'a AudioDecoderWeights,
         detok_weights: &'a DetokenizerWeights,
         gpu: Option<&'a dyn AudioGpu>,
@@ -139,7 +139,7 @@ impl<'a> AudioOutputDecoder<'a> {
     /// `embed` is the main LLM's hidden state / embedding to condition
     /// this frame on (the audio_start token embedding on the first
     /// frame, or the prior frame's feedback embedding afterward).
-    fn decode_frame(&mut self, embed: &[f32]) -> FrameOutcome {
+    pub(crate) fn decode_frame(&mut self, embed: &[f32]) -> FrameOutcome {
         let t0 = Instant::now();
         let codes = match (self.use_gpu_df, self.gpu) {
             (true, Some(g)) => {
@@ -182,7 +182,7 @@ impl<'a> AudioOutputDecoder<'a> {
     /// emit the resulting PCM via `sink`. Returns the PCM sample count.
     /// A single end-of-generation ISTFT (rather than per-frame) avoids
     /// discontinuities from fresh overlap buffers.
-    fn finish(&mut self, mut sink: impl FnMut(&[f32], u32)) -> usize {
+    pub(crate) fn finish(&mut self, mut sink: impl FnMut(&[f32], u32)) -> usize {
         if self.all_spectrum.is_empty() {
             return 0;
         }

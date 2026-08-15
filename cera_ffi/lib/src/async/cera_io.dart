@@ -299,6 +299,7 @@ class _NativeCera implements Cera {
     double? topP,
     int? topK,
     int? seed,
+    void Function(List<double> pcm, int sampleRate)? onAudio,
   }) {
     _ensureOpen();
     // A controller rather than an `async*` body: the tokens arrive on a
@@ -376,6 +377,7 @@ class _NativeCera implements Cera {
         emit: (piece) {
           if (!controller.isClosed) controller.add(piece);
         },
+        onAudio: onAudio,
         isOpen: () => !_closed,
         done: (error) {
           finished = true;
@@ -669,6 +671,7 @@ class _StreamingSink implements ModalitySink {
   _StreamingSink({
     required this.engine,
     required this.emit,
+    this.onAudio,
     required this.isOpen,
     required this.done,
   });
@@ -678,6 +681,9 @@ class _StreamingSink implements ModalitySink {
 
   /// Receives each new fragment of text.
   final void Function(String) emit;
+
+  /// Receives raw Float32 PCM audio chunks when model is in audio mode.
+  final void Function(List<double> pcm, int sampleRate)? onAudio;
 
   /// Whether the engine is still open.
   ///
@@ -697,7 +703,7 @@ class _StreamingSink implements ModalitySink {
   bool _finished = false;
 
   /// The replacement character, the signal that a decode ended mid-sequence.
-  static const _replacement = '�';
+  static const _replacement = '\uFFFD';
 
   @override
   void onTextTokens(List<int> tokens) {
@@ -719,8 +725,8 @@ class _StreamingSink implements ModalitySink {
 
   @override
   void onAudioFrames(List<double> pcm, int sampleRate) {
-    // Text-only stream. Audio-capable models are reachable through the
-    // generated bindings directly.
+    if (_finished || !isOpen()) return;
+    onAudio?.call(pcm, sampleRate);
   }
 
   @override

@@ -1814,9 +1814,11 @@ impl Session {
         &mut self,
         opts: &GenerateOpts,
         on_text_tokens: &js_sys::Function,
+        on_audio_frames: Option<js_sys::Function>,
     ) -> Result<GenerateSummary, JsError> {
         let mut sink = JsTextSink {
             on_text: on_text_tokens,
+            on_audio: on_audio_frames.as_ref(),
         };
         self.inner
             .generate(&opts.inner, &mut sink)
@@ -1826,39 +1828,34 @@ impl Session {
 }
 
 /// Internal `ModalitySink` implementation that trampolines text
-/// tokens to a JS callback. Audio frames are dropped (text-only
-/// flow); a separate `JsAudioSink` will land alongside the audio
-/// engine wrapper in a future PR.
+/// tokens and audio frames to JS callbacks.
 struct JsTextSink<'a> {
     on_text: &'a js_sys::Function,
+    on_audio: Option<&'a js_sys::Function>,
 }
 
 impl<'a> cera::ModalitySink for JsTextSink<'a> {
     fn on_text_tokens(&mut self, tokens: &[u32]) {
         // `Uint32Array::from(&[u32])` allocates JS-owned memory and
-        // copies the slice in. We *could* use `Uint32Array::view`
-        // for zero-copy, but the resulting view becomes invalid the
-        // moment Rust grows linear memory mid-call (a footgun JS
-        // callers would hit randomly). Per-flush copy cost is
-        // trivial relative to a forward pass.
+        // copies the slice in.
         let array = js_sys::Uint32Array::from(tokens);
-        // Treat any exception thrown by the JS callback as fatal:
-        // re-throw it across the wasm boundary so it lands in the
-        // JS caller's `try { ... } catch` around `session.generate`.
-        // `wasm_bindgen::throw_val` aborts the current Rust call
-        // immediately — cera's generate loop has no defined
-        // recovery path for sink errors anyway, so unwinding mid-
-        // decode is no worse than a `cancel()` (the KV cache is
-        // left in whatever state the partial decode produced).
         if let Err(err) = self.on_text.call1(&JsValue::null(), &array) {
             wasm_bindgen::throw_val(err);
         }
     }
 
+    fn on_audio_frames(&mut self, pcm: &[f32], sample_rate: u32) {
+        if let Some(cb) = self.on_audio {
+            let array = js_sys::Float32Array::from(pcm);
+            let rate = JsValue::from_f64(sample_rate as f64);
+            if let Err(err) = cb.call2(&JsValue::null(), &array, &rate) {
+                wasm_bindgen::throw_val(err);
+            }
+        }
+    }
+
     fn on_done(&mut self, _reason: cera::FinishReason) {
-        // The `GenerateSummary` already carries the finish reason;
-        // no need to re-emit it through the sink. JS callers see it
-        // via `summary.finishReason` after `generate` returns.
+        // The `GenerateSummary` already carries the finish reason.
     }
 }
 

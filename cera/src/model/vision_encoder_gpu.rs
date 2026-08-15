@@ -658,6 +658,10 @@ pub async fn encode_image_gpu_wgpu_async(
     ops.bias_add(&tokens, &gpu_w.patch_conv_b, n_patches, n_embd);
 
     // 2. Add (interpolated) position embeddings.
+    anyhow::ensure!(
+        cfg.n_trained_patches > 0,
+        "n_trained_patches must be greater than 0"
+    );
     let trained_side = (cfg.n_trained_patches as f64).sqrt().round() as usize;
     anyhow::ensure!(
         trained_side * trained_side == cfg.n_trained_patches,
@@ -676,6 +680,10 @@ pub async fn encode_image_gpu_wgpu_async(
             n_embd,
         ))
     };
+    anyhow::ensure!(
+        !pos.is_empty(),
+        "failed to interpolate 2D position embeddings (dimension mismatch)"
+    );
     let pos_buf = ops.upload(&pos);
     ops.add(&tokens, &pos_buf, n_patches * n_embd);
 

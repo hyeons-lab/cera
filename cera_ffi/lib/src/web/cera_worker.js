@@ -193,6 +193,9 @@ async function tryGpu(bytes, contextSize, mmproj, turboQuant) {
       ? await wasm.WebGpuSession.createWithParts(bytes, mmproj, contextSize, kvCompression)
       : await wasm.WebGpuSession.create(bytes, contextSize, kvCompression);
   } catch (_) {
+    try {
+      kvCompression?.free();
+    } catch (_) {}
     return false;
   }
   gpu = { session, tokenizer: session.tokenizer };
@@ -247,6 +250,9 @@ async function tryGpuBundle(repo, bundleId, quant, contextSize, onProgress, turb
       onProgress,
     );
   } catch (err) {
+    try {
+      kvCompression?.free();
+    } catch (_) {}
     return String((err && err.message) || err);
   }
   gpu = { session, tokenizer: session.tokenizer };
@@ -710,24 +716,31 @@ const OPS = {
       if (req.topK != null) opts.topK = req.topK;
       // Emit per token rather than per buffer-full; the point of a worker is
       // that the host sees output as it is produced.
-      opts.flushEveryTokens = 1;
       let uncommittedTokens = [];
+      const onAudio = (pcm, sampleRate) => {
+        console.info(`[cera:worker] generate: emitting ${pcm.length} audio PCM samples at ${sampleRate}Hz`);
+        post({ event: 'audio', pcm: Array.from(pcm), sampleRate });
+      };
       try {
-        cpu.session.generate(opts, (toks) => {
-          for (let i = 0; i < toks.length; i++) {
-            uncommittedTokens.push(toks[i]);
-          }
-          const decoded = tk.decode(Uint32Array.from(uncommittedTokens));
-          if (decoded.endsWith('\uFFFD') && uncommittedTokens.length < 4) {
-            // Incomplete multibyte UTF-8 character spanning across token chunks;
-            // hold back until the completing token arrives (max 4 bytes).
-            return;
-          }
-          if (decoded.length > 0) {
-            onToken(decoded);
-            uncommittedTokens = [];
-          }
-        });
+        cpu.session.generate(
+          opts,
+          (toks) => {
+            for (let i = 0; i < toks.length; i++) {
+              uncommittedTokens.push(toks[i]);
+            }
+            const decoded = tk.decode(Uint32Array.from(uncommittedTokens));
+            if (decoded.endsWith('\uFFFD') && uncommittedTokens.length < 4) {
+              // Incomplete multibyte UTF-8 character spanning across token chunks;
+              // hold back until the completing token arrives (max 4 bytes).
+              return;
+            }
+            if (decoded.length > 0) {
+              onToken(decoded);
+              uncommittedTokens = [];
+            }
+          },
+          onAudio,
+        );
         if (uncommittedTokens.length > 0) {
           const remaining = tk.decode(Uint32Array.from(uncommittedTokens));
           if (remaining.length > 0) {

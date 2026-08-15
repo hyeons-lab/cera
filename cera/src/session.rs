@@ -528,6 +528,10 @@ pub struct Session {
     /// encoder can back multiple sessions (one per concurrent
     /// generation) without re-loading the ~hundreds-of-MB weights.
     audio_encoder: Option<Arc<AudioEncoderWeights>>,
+    /// Audio decoder (vocoder depthformer) weights, if attached.
+    audio_decoder: Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
+    /// Detokenizer weights, if attached.
+    detok_weights: Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
     /// Optional cached GPU audio encoder. When present, [`Self::append_audio`]
     /// runs the Conformer encoder on the GPU instead of the CPU
     /// `audio_encoder`; the CPU encoder above is always kept as the fallback
@@ -686,6 +690,8 @@ impl Session {
             default_opts: GenerateOpts::default(),
             config,
             audio_encoder: None,
+            audio_decoder: None,
+            detok_weights: None,
             gpu_audio_encoder: None,
             vision_encoder: None,
             gpu_vision_encoder: None,
@@ -705,6 +711,17 @@ impl Session {
     /// Override the default generation options for this session.
     pub fn set_default_generate_opts(&mut self, opts: GenerateOpts) {
         self.default_opts = opts;
+    }
+
+    /// Attach vocoder weights so [`Self::generate`] can synthesize PCM audio
+    /// frames from model hidden states when the model enters audio mode.
+    pub fn attach_vocoder(
+        &mut self,
+        decoder: Arc<crate::model::audio_decoder::AudioDecoderWeights>,
+        detok: Arc<crate::model::audio_decoder::DetokenizerWeights>,
+    ) {
+        self.audio_decoder = Some(decoder);
+        self.detok_weights = Some(detok);
     }
 
     /// Attach an audio encoder so [`Self::append_audio`] can encode
@@ -2067,6 +2084,57 @@ impl Session {
             // every token), which is exactly why the gap would go unnoticed.
             self.token_history.push(token);
             generated += 1;
+
+            if token == crate::audio_engine::TOKEN_AUDIO_START
+                && let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights)
+            {
+                pending.pop();
+                if !pending.is_empty() {
+                    sink.on_text_tokens(&pending);
+                    pending.clear();
+                }
+
+                let mut decoder =
+                    crate::audio_engine::AudioOutputDecoder::new(dec, detok, None, 0.0, 1, false);
+
+                let mut emb = self.model.forward_embedding(&[token], pos, &mut self.state);
+                pos += 1;
+
+                let mut cancelled = false;
+                loop {
+                    if self.cancel.load(Ordering::Relaxed) {
+                        cancelled = true;
+                        break;
+                    }
+                    if generated >= opts.max_tokens || pos >= self.max_seq_len {
+                        break;
+                    }
+                    let outcome = decoder.decode_frame(&emb);
+                    let audio_emb = match outcome {
+                        crate::audio_engine::FrameOutcome::End => break,
+                        crate::audio_engine::FrameOutcome::Codes { audio_embedding } => {
+                            audio_embedding
+                        }
+                    };
+                    emb =
+                        self.model
+                            .forward_hidden_from_embedding(&audio_emb, pos, &mut self.state);
+                    pos += 1;
+                    generated += 1;
+                }
+
+                decoder.finish(|pcm, rate| {
+                    sink.on_audio_frames(pcm, rate);
+                });
+                finish = if cancelled {
+                    FinishReason::Cancelled
+                } else if pos >= self.max_seq_len {
+                    FinishReason::ContextFull
+                } else {
+                    FinishReason::Stop
+                };
+                break;
+            }
 
             let should_flush_n = pending.len() >= flush_n;
             let should_flush_t =

@@ -978,6 +978,7 @@ impl CeraEngine {
         let parts = cera::ModelBytes {
             model: bytes.into(),
             multimodal_projector: multimodal_projector.map(Into::into),
+            audio_decoder: None,
             // `parse_str` maps anything unrecognized to `Unknown(s)`,
             // which `from_parts` rejects by name, better than silently
             // falling back to text when a caller fat-fingers the string.
@@ -2492,6 +2493,7 @@ impl CeraEngine {
             let parts = cera::ModelBytes {
                 model: bytes.into(),
                 multimodal_projector: multimodal_projector.map(Into::into),
+                audio_decoder: None,
                 inference_type: inference_type
                     .as_deref()
                     .map(cera::manifest::InferenceType::parse_str),

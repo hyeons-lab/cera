@@ -409,6 +409,7 @@ abstract interface class Cera {
     double? topP,
     int? topK,
     int? seed,
+    void Function(List<double> pcm, int sampleRate)? onAudio,
   });
 
   /// Renders `messages` through the model's chat template.

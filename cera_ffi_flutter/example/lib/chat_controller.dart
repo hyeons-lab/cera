@@ -545,8 +545,23 @@ class ChatController extends ValueNotifier<ChatState> {
       '[cera:chat] Prefilling prompt (${formattedPrompt.length} chars) and starting generation...',
     );
 
+    final generatedAudioSamples = <double>[];
+    _audioPlayer.startStream();
+
     try {
-      final stream = cera.generate(formattedPrompt);
+      final stream = cera.generate(
+        formattedPrompt,
+        onAudio: (pcm, rate) {
+          generatedAudioSamples.addAll(pcm);
+          _audioPlayer.appendChunk(pcm);
+          _updateLastTurn(
+            (t) => t.copyWith(
+              audioSamples: generatedAudioSamples,
+              audioDurationSeconds: generatedAudioSamples.length / rate,
+            ),
+          );
+        },
+      );
 
       final sub = stream.listen(
         (piece) {

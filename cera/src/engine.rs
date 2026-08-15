@@ -157,6 +157,8 @@ pub struct ModelBytes {
     /// The multimodal projector GGUF (the "mmproj"): the vision tower for a
     /// VL bundle, the audio encoder for an audio one. `None` is text-only.
     pub multimodal_projector: Option<Arc<[u8]>>,
+    /// Optional vocoder GGUF for audio output decoding.
+    pub audio_decoder: Option<Arc<[u8]>>,
     /// Explicit inference type. `None` auto-detects from the primary GGUF's
     /// `general.architecture`, then upgrades text → VL when an mmproj is
     /// present (see [`CeraEngine::from_parts`] for why).
@@ -171,6 +173,7 @@ impl ModelBytes {
         Self {
             model: model.into(),
             multimodal_projector: None,
+            audio_decoder: None,
             inference_type: Some(InferenceType::LlamaCppTextToText),
             chat_template: None,
         }
@@ -203,6 +206,10 @@ struct AuxWeights {
     vision_mmproj: Option<Arc<GgufFile>>,
     /// Parsed audio encoder, for `LlamaCppLfm2AudioV1` bundles.
     audio_encoder: Option<Arc<AudioEncoderWeights>>,
+    /// Parsed audio decoder (vocoder depthformer), for audio-out bundles.
+    audio_decoder: Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
+    /// Parsed detokenizer, for audio-out bundles.
+    detok_weights: Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
 }
 
 /// Short summary of the loaded model. Matches the shape planned for the
@@ -273,6 +280,10 @@ pub struct CeraEngine {
     /// available). Shared into every session via `new_session`; sessions fall
     /// back to the CPU `audio_encoder` when this is `None`.
     gpu_audio_encoder: Option<Arc<dyn crate::model::audio_encoder_gpu::AudioGpuEncode>>,
+    /// Audio decoder (depthformer) weights for audio output generation.
+    audio_decoder: Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
+    /// Detokenizer weights for audio output generation.
+    detok_weights: Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
 }
 
 impl CeraEngine {
@@ -432,17 +443,41 @@ impl CeraEngine {
         //
         // A text type ignores the mmproj entirely, which is what makes the
         // documented opt-out ("text plus an ignored sidecar") mean something.
-        let aux = match (&inference_type, mmproj) {
+        let (audio_decoder, detok_weights) = if let Some(voc_bytes) = parts.audio_decoder {
+            if let Ok(voc_gguf) = GgufFile::from_bytes(voc_bytes) {
+                let voc_arc = Arc::new(voc_gguf);
+                (
+                    crate::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_arc)
+                        .ok()
+                        .map(Arc::new),
+                    crate::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_arc)
+                        .ok()
+                        .map(Arc::new),
+                )
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        let mut aux = match (&inference_type, mmproj) {
             (InferenceType::LlamaCppImageToText, Some(g)) => AuxWeights {
                 vision_mmproj: Some(g),
                 audio_encoder: None,
+                audio_decoder: None,
+                detok_weights: None,
             },
             (InferenceType::LlamaCppLfm2AudioV1, Some(g)) => AuxWeights {
                 vision_mmproj: None,
                 audio_encoder: try_parse_audio_encoder(&g, None),
+                audio_decoder: None,
+                detok_weights: None,
             },
             _ => AuxWeights::default(),
         };
+        aux.audio_decoder = audio_decoder;
+        aux.detok_weights = detok_weights;
 
         let mut manifest = Manifest::synthetic(
             Path::new("<bytes>"),
@@ -634,13 +669,11 @@ impl CeraEngine {
         let gpu_vision_encoder = vision_encoder.as_ref().and_then(|w| {
             crate::model::vision_encoder_gpu::build_gpu_vision_encoder(w, cfg.backend)
         });
-        // Same deal for audio: uploading the Conformer weights once here keeps
-        // them off the per-utterance path. `None` (CPU encode) for `Cpu`,
-        // disabled features, device-init failure, or a model geometry the
-        // kernels cannot take.
         let gpu_audio_encoder = audio_encoder
             .as_ref()
             .and_then(|w| crate::model::audio_encoder_gpu::build_gpu_audio_encoder(w, cfg.backend));
+        let audio_decoder = aux.audio_decoder;
+        let detok_weights = aux.detok_weights;
         Ok(Self {
             manifest,
             model,
@@ -648,6 +681,8 @@ impl CeraEngine {
             metadata,
             config: cfg,
             audio_encoder,
+            audio_decoder,
+            detok_weights,
             vision_encoder_gguf,
             vision_encoder,
             gpu_vision_encoder,
@@ -731,6 +766,10 @@ impl CeraEngine {
         // CPU encoder for PCM input the GPU kernels can take.
         if let Some(gpu) = &self.gpu_audio_encoder {
             session.attach_gpu_audio_encoder(Arc::clone(gpu));
+        }
+        // Auto-attach vocoder for audio output generation when present.
+        if let (Some(decoder), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
+            session.attach_vocoder(Arc::clone(decoder), Arc::clone(detok));
         }
         session.set_default_generate_opts(self.default_generate_opts());
         Ok(session)

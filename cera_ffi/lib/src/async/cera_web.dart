@@ -88,6 +88,9 @@ extension type _Reply._(JSObject _) implements JSObject {
   external String? get url;
   external JSAny? get done;
   external JSAny? get total;
+  // Audio streaming fields, present on `event: 'audio'`.
+  external JSAny? get pcm;
+  external JSAny? get sampleRate;
 }
 
 extension type _OpenResult._(JSObject _) implements JSObject {
@@ -237,6 +240,10 @@ class _WorkerCera implements Cera {
 
   /// Progress callbacks for in-flight bundle downloads, by id.
   final _progress = <int, void Function(CeraDownload progress)>{};
+
+  /// Callbacks for streaming audio frames, by id.
+  final _audioCallbacks =
+      <int, void Function(List<double> pcm, int sampleRate)>{};
 
   int _nextId = 0;
   String _backend = 'unknown';
@@ -407,6 +414,22 @@ class _WorkerCera implements Cera {
       _streams[reply.id]?.add(reply.text ?? '');
       return;
     }
+    if (reply.event == 'audio') {
+      final callback = _audioCallbacks[reply.id];
+      if (callback != null) {
+        final pcmJs = reply.pcm;
+        final sampleRate =
+            ((reply.sampleRate as JSNumber?)?.toDartDouble ?? 24000).toInt();
+        if (pcmJs != null) {
+          final pcm =
+              (pcmJs as JSArray<JSNumber>).toDart
+                  .map((n) => n.toDartDouble)
+                  .toList();
+          callback(pcm, sampleRate);
+        }
+      }
+      return;
+    }
     if (reply.event == 'progress') {
       final sink = _progress[reply.id];
       if (sink != null) {
@@ -458,6 +481,7 @@ class _WorkerCera implements Cera {
     }
     final pending = _pending.values.toList();
     _pending.clear();
+    _audioCallbacks.clear();
     for (final completer in pending) {
       if (!completer.isCompleted) completer.completeError(error);
     }
@@ -496,6 +520,7 @@ class _WorkerCera implements Cera {
     double? topP,
     int? topK,
     int? seed,
+    void Function(List<double> pcm, int sampleRate)? onAudio,
   }) {
     if (_closed) {
       throw StateError('this Cera engine is closed');
@@ -538,9 +563,13 @@ class _WorkerCera implements Cera {
       started = true;
       final id = _newId();
       _streams[id] = controller;
+      if (onAudio != null) {
+        _audioCallbacks[id] = onAudio;
+      }
       void terminate(Object? error, StackTrace? stack) {
         finished = true;
         _streams.remove(id);
+        _audioCallbacks.remove(id);
         if (!mine.isCompleted) mine.complete();
         if (controller.isClosed) return;
         if (error != null) controller.addError(error, stack);
