@@ -2246,7 +2246,7 @@ mod webgpu {
         pub fn append_tokens(&mut self, ids: Vec<u32>) -> Result<(), JsError> {
             let max_seq_len = self.model.config().max_seq_len;
             let mut pos = self.state.seq_len;
-            if pos + ids.len() > max_seq_len {
+            if pos.saturating_add(ids.len()) > max_seq_len {
                 return Err(JsError::new(&format!(
                     "tokens of len {} plus {pos} already in context exceeds max sequence length {max_seq_len}",
                     ids.len()
