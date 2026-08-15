@@ -2296,14 +2296,12 @@ mod webgpu {
             // leave the cache holding half an image.
             let start = self.state.seq_len;
             let max = cera::model::Model::config(&self.model).max_seq_len;
-            let end = start
-                .checked_add(n_tokens)
-                .ok_or_else(|| {
-                    crate::map_cera_err(cera::CeraError::ContextOverflow {
-                        max_seq_len: max as u32,
-                        by: u32::MAX,
-                    })
-                })?;
+            let end = start.checked_add(n_tokens).ok_or_else(|| {
+                crate::map_cera_err(cera::CeraError::ContextOverflow {
+                    max_seq_len: max as u32,
+                    by: u32::MAX,
+                })
+            })?;
             if end > max {
                 return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
                     max_seq_len: max as u32,
@@ -2380,14 +2378,12 @@ mod webgpu {
 
             let start = self.state.seq_len;
             let max = cera::model::Model::config(&self.model).max_seq_len;
-            let end = start
-                .checked_add(n_tokens)
-                .ok_or_else(|| {
-                    crate::map_cera_err(cera::CeraError::ContextOverflow {
-                        max_seq_len: max as u32,
-                        by: u32::MAX,
-                    })
-                })?;
+            let end = start.checked_add(n_tokens).ok_or_else(|| {
+                crate::map_cera_err(cera::CeraError::ContextOverflow {
+                    max_seq_len: max as u32,
+                    by: u32::MAX,
+                })
+            })?;
             if end > max {
                 return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
                     max_seq_len: max as u32,
