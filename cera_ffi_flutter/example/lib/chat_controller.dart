@@ -11,10 +11,13 @@ import 'model_source.dart';
 /// MVI Controller / Store managing state transitions, Cera engine lifecycle,
 /// download progress, and token generation.
 class ChatController extends ValueNotifier<ChatState> {
-  ChatController() : super(const ChatState()) {
+  ChatController({Future<String?> Function()? defaultStoreDir})
+    : _defaultStoreDir = defaultStoreDir ?? (() async => null),
+      super(const ChatState()) {
     _loadDownloadedRecords();
   }
 
+  final Future<String?> Function() _defaultStoreDir;
   Cera? _ceraEngine;
   StreamSubscription<String>? _generationSub;
   Completer<void>? _generationCompleter;
@@ -128,11 +131,19 @@ class ChatController extends ValueNotifier<ChatState> {
             name: '$displayName · $quant',
             bundleName: bundleName,
             quant: quant,
-            getStoreDir: () async => null, // Default
+            getStoreDir: _defaultStoreDir,
           ),
-          openFn: (onProgress) =>
-              Cera.openBundle(bundleName, quant, onProgress: onProgress),
+          openFn: (onProgress) async => Cera.openBundle(
+            bundleName,
+            quant,
+            storeDir: await _defaultStoreDir(),
+            onProgress: onProgress,
+          ),
           label: '$displayName · $quant',
+          isBundle: true,
+          bundleName: bundleName,
+          quant: quant,
+          displayName: displayName,
         );
       }
     } catch (err) {
@@ -421,7 +432,10 @@ class ChatController extends ValueNotifier<ChatState> {
     }
 
     if (!_disposed) {
-      value = value.copyWith(isGenerating: false);
+      value = value.copyWith(
+        isGenerating: false,
+        turns: List<Turn>.from(value.turns),
+      );
     }
   }
 

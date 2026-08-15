@@ -80,7 +80,9 @@ class ChatPage extends StatefulWidget {
 }
 
 class _ChatPageState extends State<ChatPage> {
-  final ChatController _controller = ChatController();
+  late final ChatController _controller = ChatController(
+    defaultStoreDir: _storeDir,
+  );
   final TextEditingController _inputController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
 
