@@ -2124,6 +2124,13 @@ mod webgpu {
         ) -> Result<WebGpuSession, JsError> {
             let parts =
                 crate::bundle::load_bundle(repo, &bundle_id, &quant, on_progress.as_ref()).await?;
+            if parts.audio_decoder.is_some()
+                || parts.inference_type == Some(cera::manifest::InferenceType::Audio)
+            {
+                return Err(JsError::new(
+                    "audio output models require the CPU backend (WebGPU currently supports text and vision models)",
+                ));
+            }
             let mut session =
                 Self::from_model_bytes(parts.model, context_size, kv_compression).await?;
             // A VL or audio bundle names its tower in the manifest, so unlike

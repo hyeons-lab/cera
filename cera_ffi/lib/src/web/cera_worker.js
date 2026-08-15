@@ -176,7 +176,8 @@ async function ensureModule(moduleUrl) {
  * dense-transformer GGUF throws from `create` after WebGPU itself came up fine.
  * Both must degrade rather than fail the open.
  */
-async function tryGpu(bytes, contextSize, mmproj, turboQuant) {
+async function tryGpu(bytes, contextSize, mmproj, turboQuant, inferenceType) {
+  if (inferenceType === 'audio') return false;
   if (!self.navigator || !self.navigator.gpu) return false;
   if (typeof wasm.WebGpuSession !== 'function') return false;
   // `createWithParts` is the newer of the two and is absent from a wasm build
@@ -339,7 +340,7 @@ const OPS = {
     const ctx = contextSize ?? undefined;
     const type = inferenceType ?? undefined;
     if (backend === 'gpu') {
-      if (!(await tryGpu(view, ctx, proj, turboQuant))) {
+      if (!(await tryGpu(view, ctx, proj, turboQuant, type))) {
         throw new Error(
           'the WebGPU backend is unavailable: either this browser exposes no ' +
             'navigator.gpu, no adapter could be acquired, or the model is not ' +
@@ -349,7 +350,7 @@ const OPS = {
       }
     } else if (backend === 'cpu') {
       openCpu(view, ctx, proj, type, turboQuant);
-    } else if (!(await tryGpu(view, ctx, proj, turboQuant))) {
+    } else if (!(await tryGpu(view, ctx, proj, turboQuant, type))) {
       openCpu(view, ctx, proj, type, turboQuant);
     }
     return { backend: backendLabel, capabilities: capabilitiesOf() };
@@ -489,7 +490,10 @@ const OPS = {
         : markerName;
     const messages = [];
     if (currentPos === 0) {
-      messages.push({ role: 'system', content: 'Respond to the user.' });
+      const systemPrompt = capabilitiesOf().audioOut
+        ? 'Respond with interleaved text and audio.'
+        : 'Respond to the user.';
+      messages.push({ role: 'system', content: systemPrompt });
     }
     messages.push({ role: 'user', content: userContent });
     let formatted;
