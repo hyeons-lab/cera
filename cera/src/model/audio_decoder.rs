@@ -337,19 +337,10 @@ pub fn depthformer_forward(
 
         // 2. Fused QKV projection → split.
         // Pre-quantize cur to Q8_0 once, reuse for QKV and later wo.
-        #[cfg(target_arch = "aarch64")]
-        {
-            let nb = n_embd / 32;
-            q8_scales.resize(nb, 0.0);
-            q8_quants.resize(n_embd, 0);
-            unsafe {
-                crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                    &cur,
-                    &mut q8_scales,
-                    &mut q8_quants,
-                );
-            }
-        }
+        let nb = n_embd / 32;
+        q8_scales.resize(nb, 0.0);
+        q8_quants.resize(n_embd, 0);
+        crate::backend::cpu::quantize_f32_to_q8_0_into(&cur, &mut q8_scales, &mut q8_quants);
         qkv.iter_mut().for_each(|v| *v = 0.0);
         crate::backend::cpu::gemv_dispatch(
             lw.wqkv.dtype,
@@ -426,19 +417,10 @@ pub fn depthformer_forward(
         cpu::rmsnorm(&mut cur, &lw.ffn_norm, cfg.rms_norm_eps);
 
         // Pre-quantize cur for FFN gate + up (same input).
-        #[cfg(target_arch = "aarch64")]
-        {
-            let nb = n_embd / 32;
-            q8_scales.resize(nb, 0.0);
-            q8_quants.resize(n_embd, 0);
-            unsafe {
-                crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                    &cur,
-                    &mut q8_scales,
-                    &mut q8_quants,
-                );
-            }
-        }
+        let nb = n_embd / 32;
+        q8_scales.resize(nb, 0.0);
+        q8_quants.resize(n_embd, 0);
+        crate::backend::cpu::quantize_f32_to_q8_0_into(&cur, &mut q8_scales, &mut q8_quants);
         gate.iter_mut().for_each(|v| *v = 0.0);
         up.iter_mut().for_each(|v| *v = 0.0);
         crate::backend::cpu::gemv_dispatch(

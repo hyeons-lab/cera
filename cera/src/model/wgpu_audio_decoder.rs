@@ -121,7 +121,10 @@ pub struct WgpuAudioDecoder {
 impl WgpuAudioDecoder {
     pub fn from_gguf(gguf: &Arc<GgufFile>, _vocoder_path: &Path) -> Result<Self> {
         let ctx = GpuContext::new()?;
+        Self::from_gguf_with_context(ctx, gguf)
+    }
 
+    pub fn from_gguf_with_context(ctx: GpuContext, gguf: &Arc<GgufFile>) -> Result<Self> {
         // Config from tensor shapes (same derivation as DetokenizerWeights).
         let conv_in =
             crate::model::weights::MmapWeight::from_gguf(gguf, "lfm.layers.0.conv.in_proj.weight")?;

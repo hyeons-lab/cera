@@ -1921,6 +1921,8 @@ mod webgpu {
         audio_decoder: Option<Arc<cera::model::audio_decoder::AudioDecoderWeights>>,
         /// CPU detokenizer weights for vocoder output generation.
         detok_weights: Option<Arc<cera::model::audio_decoder::DetokenizerWeights>>,
+        /// GPU detokenizer and ISTFT instance if available.
+        gpu_audio_decoder: Option<Arc<cera::model::wgpu_audio_decoder::WgpuAudioDecoder>>,
         /// Session-default cap on an appended image's longest side.
         image_max_long_size: Option<u32>,
     }
@@ -2070,6 +2072,7 @@ mod webgpu {
                 gpu_audio_encoder: None,
                 audio_decoder: None,
                 detok_weights: None,
+                gpu_audio_decoder: None,
                 image_max_long_size: None,
             })
         }
@@ -2163,6 +2166,13 @@ mod webgpu {
                 .map_err(|e| {
                     JsError::new(&format!("failed to parse detokenizer weights: {e:#}"))
                 })?;
+            let ctx = self.model.ctx().clone();
+            self.gpu_audio_decoder =
+                cera::model::wgpu_audio_decoder::WgpuAudioDecoder::from_gguf_with_context(
+                    ctx, &voc_arc,
+                )
+                .map(Arc::new)
+                .ok();
             self.audio_decoder = Some(Arc::new(decoder_weights));
             self.detok_weights = Some(Arc::new(detok_weights));
             Ok(())
@@ -2786,10 +2796,14 @@ mod webgpu {
             };
             pos += 1;
 
+            let gpu_ref: Option<&dyn cera::model::audio_decoder::AudioGpu> = self
+                .gpu_audio_decoder
+                .as_deref()
+                .map(|d| d as &dyn cera::model::audio_decoder::AudioGpu);
             let mut decoder =
                 if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
                     Some(cera::audio_engine::AudioOutputDecoder::new(
-                        dec, detok, None, 0.0, 1, false,
+                        dec, detok, gpu_ref, 0.0, 1, false,
                     ))
                 } else {
                     None
