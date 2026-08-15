@@ -25,9 +25,9 @@
 //! inverse-DFT basis does the iDFT, and `overlap_add` windows and folds the
 //! frames into PCM. Only the startup-pad strip stays on the CPU after readback.
 
-use std::cell::Cell;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use wgpu::Buffer;
@@ -115,7 +115,7 @@ pub struct WgpuAudioDecoder {
     conv_bufs: Vec<Option<Buffer>>, // [d_conv x hs] per conv layer
     kv_k: Vec<Option<Buffer>>,      // [swa x kv_dim] f32 per attn layer
     kv_v: Vec<Option<Buffer>>,
-    n_past: Cell<usize>,
+    n_past: AtomicUsize,
 }
 
 impl WgpuAudioDecoder {
@@ -404,7 +404,7 @@ impl WgpuAudioDecoder {
             conv_bufs,
             kv_k,
             kv_v,
-            n_past: Cell::new(0),
+            n_past: AtomicUsize::new(0),
         })
     }
 
@@ -413,7 +413,7 @@ impl WgpuAudioDecoder {
     }
 
     pub fn reset(&self) {
-        self.n_past.set(0);
+        self.n_past.store(0, Ordering::Relaxed);
         // Zero the conv rolling buffers. The KV caches need no clearing: n_past=0
         // bounds `flash_attention` to the entries this generation writes.
         let zeros_len = self.cfg.d_conv * self.cfg.n_embd;
@@ -598,7 +598,7 @@ impl WgpuAudioDecoder {
             .queue
             .write_buffer(&self.hidden_buf, 0, bytemuck::cast_slice(&tokens));
 
-        let n_past = self.n_past.get();
+        let n_past = self.n_past.load(Ordering::Relaxed);
         let scale = 1.0f32 / (hd as f32).sqrt();
         let seq_len = (n_past + N_FRAMES).min(self.cfg.swa_window_size) as u32;
 
@@ -885,10 +885,315 @@ impl WgpuAudioDecoder {
         );
 
         self.ctx.submit_encoder(enc);
-        self.n_past.set(n_past + N_FRAMES);
+        self.n_past.store(n_past + N_FRAMES, Ordering::Relaxed);
 
         self.ctx
             .download_f32(&self.spectrum_buf, N_FRAMES * spec_per_frame)
+    }
+
+    pub async fn detokenize_to_spectrum_async(
+        &self,
+        cpu_weights: &DetokenizerWeights,
+        codes: &[i32],
+    ) -> Result<Vec<f32>> {
+        let hs = self.cfg.n_embd;
+        let hd = self.cfg.n_embd_head;
+        let n_kv = self.cfg.n_head_kv as u32;
+        let q_dim = (self.cfg.n_head * hd) as u32;
+        let kv_dim = n_kv * hd as u32;
+        let n = N_FRAMES as u32;
+        let hs_u = hs as u32;
+        let spec_per_frame = n_embd_bins(&self.cfg);
+
+        // 1. Embed + upsample on CPU, upload as the residual stream.
+        let tokens = {
+            use crate::model::audio_decoder::{detok_embed_codes, upsample};
+            let emb = detok_embed_codes(cpu_weights, codes);
+            upsample(&emb, hs, N_FRAMES)
+        };
+        self.ctx
+            .queue
+            .write_buffer(&self.hidden_buf, 0, bytemuck::cast_slice(&tokens));
+
+        let n_past = self.n_past.load(Ordering::Relaxed);
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let seq_len = (n_past + N_FRAMES).min(self.cfg.swa_window_size) as u32;
+
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+
+        for (il, lw) in self.layers.iter().enumerate() {
+            if il == 0 {
+                self.rmsnorm_batch(
+                    &mut enc,
+                    &self.hidden_buf,
+                    &self.normed_buf,
+                    &lw.operator_norm,
+                    n,
+                );
+            } else {
+                self.add_rmsnorm_batch(
+                    &mut enc,
+                    &self.hidden_buf,
+                    &self.normed_buf,
+                    &lw.operator_norm,
+                    &self.up_buf,
+                    n,
+                );
+            }
+
+            if self.cfg.layer_is_conv[il] {
+                let cin = lw.conv_in_proj.as_ref().unwrap();
+                let cop = lw.conv_out_proj.as_ref().unwrap();
+                let cw = lw.conv_weight.as_ref().unwrap();
+                let rbuf = self.conv_bufs[il].as_ref().unwrap();
+
+                self.gemm(
+                    &mut enc,
+                    cin,
+                    &self.normed_buf,
+                    &self.proj_buf,
+                    n,
+                    hs_u,
+                    3 * hs_u,
+                );
+                let cp = self.params(
+                    &[
+                        hs_u,
+                        (self.cfg.d_conv + 1) as u32,
+                        self.cfg.d_conv as u32,
+                        n,
+                    ],
+                    "audio_detok_conv_params",
+                );
+                self.encode(
+                    &mut enc,
+                    &self.pipes.conv1d_fused_batch,
+                    &[&self.proj_buf, rbuf, cw, &self.normed_buf, &cp],
+                    (hs_u.div_ceil(256), 1, 1),
+                    "audio_detok_conv",
+                );
+                self.gemm(
+                    &mut enc,
+                    cop,
+                    &self.normed_buf,
+                    &self.proj_buf,
+                    n,
+                    hs_u,
+                    hs_u,
+                );
+                self.add_inplace(&mut enc, &self.hidden_buf, &self.proj_buf, n * hs_u);
+            } else {
+                let wq = lw.wq.as_ref().unwrap();
+                let wk = lw.wk.as_ref().unwrap();
+                let wv = lw.wv.as_ref().unwrap();
+                let wo = lw.wo.as_ref().unwrap();
+                let q_norm = lw.q_norm.as_ref().unwrap();
+                let k_norm = lw.k_norm.as_ref().unwrap();
+
+                self.gemm(
+                    &mut enc,
+                    wq,
+                    &self.normed_buf,
+                    &self.proj_buf,
+                    n,
+                    hs_u,
+                    q_dim,
+                );
+                self.gemm(
+                    &mut enc,
+                    wk,
+                    &self.normed_buf,
+                    &self.gate_buf,
+                    n,
+                    hs_u,
+                    kv_dim,
+                );
+                self.gemm(
+                    &mut enc,
+                    wv,
+                    &self.normed_buf,
+                    &self.up_buf,
+                    n,
+                    hs_u,
+                    kv_dim,
+                );
+
+                let slot = (n_past % self.cfg.swa_window_size) as u32;
+                let qk_p = self.params(
+                    &[
+                        self.cfg.n_head as u32,
+                        self.cfg.n_head_kv as u32,
+                        hd as u32,
+                        self.cfg.rms_norm_eps.to_bits(),
+                        self.cfg.rope_freq_base.to_bits(),
+                        0,
+                        0,
+                        1,
+                        slot,
+                        n,
+                    ],
+                    "audio_detok_qk_rope_params",
+                );
+                self.encode(
+                    &mut enc,
+                    &self.pipes.qk_norm_rope_batch,
+                    &[
+                        &self.proj_buf,
+                        &self.gate_buf,
+                        q_norm,
+                        k_norm,
+                        &self.rope_freqs_dummy,
+                        &qk_p,
+                    ],
+                    (
+                        ((self.cfg.n_head + self.cfg.n_head_kv) * N_FRAMES) as u32,
+                        1,
+                        1,
+                    ),
+                    "audio_detok_qk_rope",
+                );
+
+                let k_cache = self.kv_k[il].as_ref().unwrap();
+                let v_cache = self.kv_v[il].as_ref().unwrap();
+                let cache_byte_off = (slot * kv_dim * 4) as u64;
+                let chunk_bytes = (N_FRAMES as u64) * (kv_dim as u64) * 4;
+                enc.copy_buffer_to_buffer(&self.gate_buf, 0, k_cache, cache_byte_off, chunk_bytes);
+                enc.copy_buffer_to_buffer(&self.up_buf, 0, v_cache, cache_byte_off, chunk_bytes);
+
+                let att_p = self.params(
+                    &[
+                        self.cfg.n_head as u32,
+                        self.cfg.n_head_kv as u32,
+                        hd as u32,
+                        kv_dim,
+                        seq_len,
+                        scale.to_bits(),
+                        slot,
+                        self.cfg.swa_window_size as u32,
+                    ],
+                    "audio_detok_attn_params",
+                );
+                for t in 0..N_FRAMES as u32 {
+                    let q_tok_off = (t * q_dim * 4) as u64;
+                    let out_tok_off = (t * q_dim * 4) as u64;
+                    enc.copy_buffer_to_buffer(
+                        &self.proj_buf,
+                        q_tok_off,
+                        &self.q_single,
+                        0,
+                        (q_dim * 4) as u64,
+                    );
+                    self.encode(
+                        &mut enc,
+                        &self.pipes.flash_attention,
+                        &[&self.q_single, k_cache, v_cache, &self.attn_single, &att_p],
+                        (self.cfg.n_head as u32, 1, 1),
+                        "audio_detok_flash_attn",
+                    );
+                    enc.copy_buffer_to_buffer(
+                        &self.attn_single,
+                        0,
+                        &self.normed_buf,
+                        out_tok_off,
+                        (q_dim * 4) as u64,
+                    );
+                }
+
+                self.gemm(
+                    &mut enc,
+                    wo,
+                    &self.normed_buf,
+                    &self.proj_buf,
+                    n,
+                    q_dim,
+                    hs_u,
+                );
+                self.add_inplace(&mut enc, &self.hidden_buf, &self.proj_buf, n * hs_u);
+            }
+
+            let ffn_dim = self.cfg.ffn_dim as u32;
+            self.rmsnorm_batch(
+                &mut enc,
+                &self.hidden_buf,
+                &self.normed_buf,
+                &lw.ffn_norm,
+                n,
+            );
+            self.gemm(
+                &mut enc,
+                &lw.ffn_w1,
+                &self.normed_buf,
+                &self.gate_buf,
+                n,
+                hs_u,
+                ffn_dim,
+            );
+            self.gemm(
+                &mut enc,
+                &lw.ffn_w3,
+                &self.normed_buf,
+                &self.up_buf,
+                n,
+                hs_u,
+                ffn_dim,
+            );
+            let sp = self.params(&[n * ffn_dim], "audio_detok_silu_params");
+            self.encode(
+                &mut enc,
+                &self.pipes.silu_mul,
+                &[&self.gate_buf, &self.up_buf, &sp],
+                (((n * ffn_dim) as u32).div_ceil(256), 1, 1),
+                "audio_detok_silu_mul",
+            );
+            self.gemm(
+                &mut enc,
+                &lw.ffn_w2,
+                &self.gate_buf,
+                &self.up_buf,
+                n,
+                ffn_dim,
+                hs_u,
+            );
+        }
+
+        self.add_rmsnorm_batch(
+            &mut enc,
+            &self.hidden_buf,
+            &self.normed_buf,
+            &self.output_norm,
+            &self.up_buf,
+            n,
+        );
+        self.gemm(
+            &mut enc,
+            &self.lin_w,
+            &self.normed_buf,
+            &self.spectrum_buf,
+            n,
+            hs_u,
+            spec_per_frame as u32,
+        );
+        let bias_params = self.params(
+            &[(N_FRAMES * spec_per_frame) as u32, spec_per_frame as u32],
+            "audio_detok_bias_params",
+        );
+        self.encode(
+            &mut enc,
+            &self.pipes.bias_add,
+            &[&self.spectrum_buf, &self.lin_b, &bias_params],
+            (((N_FRAMES * spec_per_frame) as u32).div_ceil(256), 1, 1),
+            "audio_detok_bias",
+        );
+
+        let pending = {
+            self.ctx.submit_encoder(enc);
+            self.n_past.store(n_past + N_FRAMES, Ordering::Relaxed);
+            self.ctx
+                .begin_download(&self.spectrum_buf, (N_FRAMES * spec_per_frame * 4) as u64)
+        };
+        let bytes = pending.recv().await?;
+        let result: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+        Ok(result)
     }
 
     /// Convert the accumulated spectrum to PCM on the GPU: `exp_polar` →
@@ -918,79 +1223,163 @@ impl WgpuAudioDecoder {
         // A single 1D dispatch caps the frame count at the device's
         // `max_compute_workgroups_per_dimension` (65535 by default); the CPU
         // `istft_to_pcm` has no such limit, so fall back to it for very long
-        // utterances (many minutes) rather than tripping a wgpu validation panic.
-        let max_wg = self
-            .ctx
-            .device
-            .limits()
-            .max_compute_workgroups_per_dimension as usize;
-        let exp_wg = (n_frames * bins).div_ceil(256);
-        let oa_wg = (n_frames * hop_length).div_ceil(256);
-        let gemm_wg_n = n_frames.div_ceil((MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N) as usize);
-        if exp_wg > max_wg || oa_wg > max_wg || gemm_wg_n > max_wg {
+        // audio rather than truncating.
+        if n_frames > (u16::MAX as usize) {
             return crate::model::audio_decoder::istft_to_pcm(spectrum, n_fft, hop_length);
         }
 
-        let spec_buf = self.ctx.upload_f32(spectrum, "audio_istft_spectrum_in");
-        let halfspec = self
-            .ctx
-            .create_storage_rw((n_frames * frame_size * 4) as u64, "audio_istft_halfspec");
-        let time_domain = self
-            .ctx
-            .create_storage_rw((n_frames * n_fft * 4) as u64, "audio_istft_time");
-        let pcm_buf = self
-            .ctx
-            .create_storage_rw((n_frames * hop_length * 4) as u64, "audio_istft_pcm");
-
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
 
-        // 1. Polar half-spectrum (log-mag, angle) → interleaved [re | im].
-        let ep = self.params(
-            &[n_frames as u32, bins as u32],
-            "audio_istft_exp_polar_params",
+        let spec_buf = self.ctx.upload_f32(spectrum, "audio_istft_spectrum_in");
+        let n_spec_floats = n_frames * frame_size;
+        let complex_buf = self.ctx.create_storage_rw(
+            (n_spec_floats * std::mem::size_of::<f32>()) as u64,
+            "audio_istft_complex_half_spectrum",
         );
+        let ep_params = self.params(&[n_spec_floats as u32], "audio_istft_exp_polar_params");
         self.encode(
             &mut enc,
             &self.pipes.exp_polar,
-            &[&spec_buf, &halfspec, &ep],
-            (((n_frames * bins) as u32).div_ceil(256), 1, 1),
+            &[&spec_buf, &complex_buf, &ep_params],
+            (((n_spec_floats as u32) / 2).div_ceil(256), 1, 1),
             "audio_istft_exp_polar",
         );
 
-        // 2. iDFT as a matmul: time_domain[frame, t] = Σ_j halfspec[frame, j]·B[t, j].
+        let windowed_buf = self.ctx.create_storage_rw(
+            (n_frames * n_fft * std::mem::size_of::<f32>()) as u64,
+            "audio_istft_windowed_frames",
+        );
         self.gemm(
             &mut enc,
             &self.idft_basis,
-            &halfspec,
-            &time_domain,
+            &complex_buf,
+            &windowed_buf,
             n_frames as u32,
             frame_size as u32,
             n_fft as u32,
         );
 
-        // 3. Windowed overlap-add → PCM.
-        let oa = self.params(
-            &[n_frames as u32, n_fft as u32, hop_length as u32, 0],
-            "audio_istft_overlap_params",
+        let pcm_len = (n_frames - 1) * hop_length + n_fft;
+        let pcm_buf = self.ctx.create_storage_rw(
+            (pcm_len * std::mem::size_of::<f32>()) as u64,
+            "audio_istft_pcm_out",
+        );
+        let oa_params = self.params(
+            &[
+                n_frames as u32,
+                hop_length as u32,
+                n_fft as u32,
+                pcm_len as u32,
+            ],
+            "audio_istft_overlap_add_params",
         );
         self.encode(
             &mut enc,
             &self.pipes.overlap_add,
-            &[&time_domain, &self.hann, &pcm_buf, &oa],
-            (((n_frames * hop_length) as u32).div_ceil(256), 1, 1),
+            &[&windowed_buf, &self.hann, &pcm_buf, &oa_params],
+            ((pcm_len as u32).div_ceil(256), 1, 1),
             "audio_istft_overlap_add",
         );
 
         self.ctx.submit_encoder(enc);
 
         let mut pcm = self.ctx.download_f32(&pcm_buf, n_frames * hop_length);
-        // Strip the startup-padding artifacts, matching the CPU `istft_to_pcm`
-        // tail (leave the buffer untouched when it is shorter than the pad).
         let padding = (n_fft - hop_length) / 2;
         if pcm.len() > padding {
             pcm.drain(..padding);
         }
         pcm
+    }
+
+    pub async fn istft_to_pcm_async(
+        &self,
+        spectrum: &[f32],
+        n_fft: usize,
+        hop_length: usize,
+    ) -> Result<Vec<f32>> {
+        if n_fft != self.cfg.n_fft || hop_length != self.cfg.hop_length {
+            return Ok(crate::model::audio_decoder::istft_to_pcm(
+                spectrum, n_fft, hop_length,
+            ));
+        }
+        let bins = n_fft / 2 + 1;
+        let frame_size = bins * 2;
+        let n_frames = spectrum.len() / frame_size;
+        if n_frames == 0 {
+            return Ok(vec![]);
+        }
+
+        if n_frames > (u16::MAX as usize) {
+            return Ok(crate::model::audio_decoder::istft_to_pcm(
+                spectrum, n_fft, hop_length,
+            ));
+        }
+
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+
+        let spec_buf = self.ctx.upload_f32(spectrum, "audio_istft_spectrum_in");
+        let n_spec_floats = n_frames * frame_size;
+        let complex_buf = self.ctx.create_storage_rw(
+            (n_spec_floats * std::mem::size_of::<f32>()) as u64,
+            "audio_istft_complex_half_spectrum",
+        );
+        let ep_params = self.params(&[n_spec_floats as u32], "audio_istft_exp_polar_params");
+        self.encode(
+            &mut enc,
+            &self.pipes.exp_polar,
+            &[&spec_buf, &complex_buf, &ep_params],
+            (((n_spec_floats as u32) / 2).div_ceil(256), 1, 1),
+            "audio_istft_exp_polar",
+        );
+
+        let windowed_buf = self.ctx.create_storage_rw(
+            (n_frames * n_fft * std::mem::size_of::<f32>()) as u64,
+            "audio_istft_windowed_frames",
+        );
+        self.gemm(
+            &mut enc,
+            &self.idft_basis,
+            &complex_buf,
+            &windowed_buf,
+            n_frames as u32,
+            frame_size as u32,
+            n_fft as u32,
+        );
+
+        let pcm_len = (n_frames - 1) * hop_length + n_fft;
+        let pcm_buf = self.ctx.create_storage_rw(
+            (pcm_len * std::mem::size_of::<f32>()) as u64,
+            "audio_istft_pcm_out",
+        );
+        let oa_params = self.params(
+            &[
+                n_frames as u32,
+                hop_length as u32,
+                n_fft as u32,
+                pcm_len as u32,
+            ],
+            "audio_istft_overlap_add_params",
+        );
+        self.encode(
+            &mut enc,
+            &self.pipes.overlap_add,
+            &[&windowed_buf, &self.hann, &pcm_buf, &oa_params],
+            ((pcm_len as u32).div_ceil(256), 1, 1),
+            "audio_istft_overlap_add",
+        );
+
+        let pending = {
+            self.ctx.submit_encoder(enc);
+            self.ctx
+                .begin_download(&pcm_buf, (pcm_len * std::mem::size_of::<f32>()) as u64)
+        };
+        let bytes = pending.recv().await?;
+        let mut pcm: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+        let padding = (n_fft - hop_length) / 2;
+        if pcm.len() > padding {
+            pcm.drain(..padding);
+        }
+        Ok(pcm)
     }
 }
 
@@ -1017,8 +1406,25 @@ impl crate::model::audio_decoder::AudioGpu for WgpuAudioDecoder {
         self.detokenize_to_spectrum(cpu_weights, codes)
     }
 
+    fn detokenize_to_spectrum_async<'a>(
+        &'a self,
+        cpu_weights: &'a DetokenizerWeights,
+        codes: &'a [i32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
+        Box::pin(self.detokenize_to_spectrum_async(cpu_weights, codes))
+    }
+
     fn istft_to_pcm(&self, spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f32> {
         self.istft_to_pcm(spectrum, n_fft, hop_length)
+    }
+
+    fn istft_to_pcm_async<'a>(
+        &'a self,
+        spectrum: &'a [f32],
+        n_fft: usize,
+        hop_length: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
+        Box::pin(self.istft_to_pcm_async(spectrum, n_fft, hop_length))
     }
 
     fn reset_depthformer(&self) {}

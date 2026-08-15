@@ -2798,8 +2798,12 @@ mod webgpu {
 
             let mut decoder =
                 if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
+                    let gpu_ref: Option<&dyn cera::model::audio_decoder::AudioGpu> = self
+                        .gpu_audio_decoder
+                        .as_deref()
+                        .map(|g| g as &dyn cera::model::audio_decoder::AudioGpu);
                     Some(cera::audio_engine::AudioOutputDecoder::new(
-                        dec, detok, None, 0.0, 1, false,
+                        dec, detok, gpu_ref, 0.0, 1, false,
                     ))
                 } else {
                     None
@@ -2852,7 +2856,7 @@ mod webgpu {
                             if generated >= max_tokens as usize || pos >= max_seq_len {
                                 break;
                             }
-                            let outcome = dec.decode_frame(&emb);
+                            let outcome = dec.decode_frame_async(&emb).await.map_err(map_err)?;
                             let audio_emb = match outcome {
                                 cera::audio_engine::FrameOutcome::End => {
                                     console_info(&format!(
@@ -2930,7 +2934,7 @@ mod webgpu {
                     let mut frames = 0;
                     let mut reached_end = false;
                     while frames < 12 && pos < max_seq_len && generated < max_tokens as usize {
-                        let outcome = dec.decode_frame(&emb);
+                        let outcome = dec.decode_frame_async(&emb).await.map_err(map_err)?;
                         let audio_emb = match outcome {
                             cera::audio_engine::FrameOutcome::End => {
                                 text_done = true;
@@ -3017,7 +3021,7 @@ mod webgpu {
                 && let Some(cb) = on_audio
             {
                 let mut total_samples = 0;
-                dec.finish(|pcm, rate| {
+                dec.finish_async(|pcm, rate| {
                     total_samples += pcm.len();
                     console_info(&format!(
                         "[cera-wasm] WebGpuSession vocoder finish produced {} PCM samples at {} Hz",
@@ -3029,7 +3033,9 @@ mod webgpu {
                     if let Err(err) = cb.call2(&JsValue::null(), &array, &rate_val) {
                         wasm_bindgen::throw_val(err);
                     }
-                });
+                })
+                .await
+                .map_err(map_err)?;
                 console_info(&format!(
                     "[cera-wasm] WebGpuSession audio generation finished with {} frames and {} total samples",
                     dec.audio_frames(),

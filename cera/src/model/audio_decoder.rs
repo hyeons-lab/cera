@@ -15,12 +15,31 @@ use crate::model::weights::MmapWeight;
 
 /// GPU-accelerated audio backend. Implementations provide Metal or WGPU
 /// dispatch for the depthformer (code sampling) and detokenizer (spectrum).
-pub trait AudioGpu {
+pub trait AudioGpu: Send + Sync {
     /// Sample 8 audio codes from an LLM embedding using the depthformer.
     fn sample_audio_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8];
 
+    /// Async version of [`Self::sample_audio_frame`] for WebGPU / browser wasm.
+    fn sample_audio_frame_async<'a>(
+        &'a self,
+        embedding: &'a [f32],
+        temperature: f32,
+        top_k: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<[i32; 8]>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.sample_audio_frame(embedding, temperature, top_k)) })
+    }
+
     /// Convert 8 audio codes to spectrum [n_frames × n_fft_bins × 2].
     fn detokenize_to_spectrum(&self, cpu_weights: &DetokenizerWeights, codes: &[i32]) -> Vec<f32>;
+
+    /// Async version of [`Self::detokenize_to_spectrum`].
+    fn detokenize_to_spectrum_async<'a>(
+        &'a self,
+        cpu_weights: &'a DetokenizerWeights,
+        codes: &'a [i32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.detokenize_to_spectrum(cpu_weights, codes)) })
+    }
 
     /// Reset depthformer KV caches (called per audio frame).
     fn reset_depthformer(&self);
@@ -29,12 +48,6 @@ pub trait AudioGpu {
     fn reset_detokenizer(&self);
 
     /// Whether [`AudioGpu::sample_audio_frame`] is actually implemented here.
-    ///
-    /// A backend may ship the detokenizer alone: the WGPU one does, and its
-    /// `sample_audio_frame` panics. Callers that route the depthformer to the
-    /// GPU (the CLI, under `CERA_GPU_DF=1`) must ask this first and fall back
-    /// to the CPU sampler when it is false. Deliberately has no default, so a
-    /// new backend has to answer rather than inherit an answer.
     fn supports_depthformer(&self) -> bool;
 
     /// Convert the accumulated spectrum `[n_frames × n_fft_bins × 2]` (log-mag,
@@ -42,6 +55,16 @@ pub trait AudioGpu {
     /// override to run the iDFT-matmul + windowed overlap-add on-device.
     fn istft_to_pcm(&self, spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f32> {
         istft_to_pcm(spectrum, n_fft, hop_length)
+    }
+
+    /// Async version of [`Self::istft_to_pcm`].
+    fn istft_to_pcm_async<'a>(
+        &'a self,
+        spectrum: &'a [f32],
+        n_fft: usize,
+        hop_length: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.istft_to_pcm(spectrum, n_fft, hop_length)) })
     }
 }
 

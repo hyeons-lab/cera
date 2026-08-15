@@ -190,6 +190,48 @@ impl<'a> AudioOutputDecoder<'a> {
         FrameOutcome::Codes { audio_embedding }
     }
 
+    /// Async version of [`Self::decode_frame`] for WebGPU / browser wasm.
+    pub async fn decode_frame_async(&mut self, embed: &[f32]) -> anyhow::Result<FrameOutcome> {
+        let t0 = Instant::now();
+        let codes = match (self.use_gpu_df, self.gpu) {
+            (true, Some(g)) => {
+                g.sample_audio_frame_async(embed, self.audio_temperature, self.audio_top_k)
+                    .await?
+            }
+            _ => sample_audio_frame(
+                self.weights,
+                &mut self.df_state,
+                embed,
+                self.audio_temperature,
+                self.audio_top_k,
+            ),
+        };
+        self.time_depthformer += t0.elapsed();
+
+        if codes[0] == AUDIO_END_CODE {
+            return Ok(FrameOutcome::End);
+        }
+
+        let t1 = Instant::now();
+        let spectrum = if let Some(g) = self.gpu {
+            g.detokenize_to_spectrum_async(self.detok_weights, &codes)
+                .await?
+        } else {
+            detokenize_to_spectrum(
+                self.detok_weights,
+                self.weights,
+                &mut self.detok_state,
+                &codes,
+            )
+        };
+        self.time_detokenizer += t1.elapsed();
+        self.all_spectrum.extend_from_slice(&spectrum);
+        self.audio_frames += 1;
+
+        let audio_embedding = embed_audio_token(self.weights, &codes);
+        Ok(FrameOutcome::Codes { audio_embedding })
+    }
+
     /// Drain the accumulated spectrum through a single ISTFT pass and
     /// emit the resulting PCM via `sink`. Returns the PCM sample count.
     /// A single end-of-generation ISTFT (rather than per-frame) avoids
@@ -210,6 +252,28 @@ impl<'a> AudioOutputDecoder<'a> {
         let n = pcm.len();
         sink(&pcm, self.detok_weights.config.sample_rate as u32);
         n
+    }
+
+    /// Async version of [`Self::finish`] for WebGPU / browser wasm.
+    pub async fn finish_async(
+        &mut self,
+        mut sink: impl FnMut(&[f32], u32),
+    ) -> anyhow::Result<usize> {
+        if self.all_spectrum.is_empty() {
+            return Ok(0);
+        }
+        let n_fft = self.detok_weights.config.n_fft;
+        let hop = self.detok_weights.config.hop_length;
+        let pcm = match self.gpu {
+            Some(g) => g.istft_to_pcm_async(&self.all_spectrum, n_fft, hop).await?,
+            None => istft_to_pcm(&self.all_spectrum, n_fft, hop),
+        };
+        if pcm.is_empty() {
+            return Ok(0);
+        }
+        let n = pcm.len();
+        sink(&pcm, self.detok_weights.config.sample_rate as u32);
+        Ok(n)
     }
 }
 
