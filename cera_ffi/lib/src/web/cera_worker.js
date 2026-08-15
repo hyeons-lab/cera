@@ -230,8 +230,13 @@ function openCpu(bytes, contextSize, mmproj, inferenceType) {
   // `fromGgufBytes`), so both paths resolve the inference type through one
   // constructor instead of two that have to agree.
   const engine = wasm.CeraEngine.fromGgufParts(bytes, mmproj, contextSize, inferenceType);
-  const session = engine.newSession(new wasm.SessionConfig());
-  cpu = { engine, session, tokenizer: engine.tokenizer };
+  const config = new wasm.SessionConfig();
+  try {
+    const session = engine.newSession(config);
+    cpu = { engine, session, tokenizer: engine.tokenizer };
+  } finally {
+    config.free();
+  }
   backendLabel = 'wasm cpu';
 }
 
@@ -251,8 +256,13 @@ async function openCpuBundle(repo, bundleId, quant, contextSize, onProgress) {
     contextSize,
     onProgress,
   );
-  const session = engine.newSession(new wasm.SessionConfig());
-  cpu = { engine, session, tokenizer: engine.tokenizer };
+  const config = new wasm.SessionConfig();
+  try {
+    const session = engine.newSession(config);
+    cpu = { engine, session, tokenizer: engine.tokenizer };
+  } finally {
+    config.free();
+  }
   backendLabel = 'wasm cpu';
 }
 
@@ -450,8 +460,12 @@ const OPS = {
     if (req.seed != null && position() === 0 && cpu) {
       const config = new wasm.SessionConfig();
       config.seed = BigInt(req.seed);
-      cpu.session.free();
-      cpu.session = cpu.engine.newSession(config);
+      try {
+        cpu.session.free();
+        cpu.session = cpu.engine.newSession(config);
+      } finally {
+        config.free();
+      }
     }
     const ids = encodePrompt(prompt, position() === 0);
     const started = performance.now();
@@ -490,8 +504,20 @@ const OPS = {
       // Emit per token rather than per buffer-full; the point of a worker is
       // that the host sees output as it is produced.
       opts.flushEveryTokens = 1;
+      let prevText = '';
+      const allTokens = [];
       try {
-        cpu.session.generate(opts, (toks) => onToken(tk.decode(toks)));
+        cpu.session.generate(opts, (toks) => {
+          for (let i = 0; i < toks.length; i++) {
+            allTokens.push(toks[i]);
+          }
+          const full = tk.decode(Uint32Array.from(allTokens));
+          const delta = full.slice(prevText.length);
+          if (delta.length > 0) {
+            prevText = full;
+            onToken(delta);
+          }
+        });
       } finally {
         opts.free();
       }

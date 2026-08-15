@@ -2243,7 +2243,7 @@ mod webgpu {
             bytes: &[u8],
             max_long_size: Option<u32>,
         ) -> Result<(), JsError> {
-            let Some(encoder) = self.vision_encoder.clone() else {
+            let Some(encoder) = self.vision_encoder.as_ref() else {
                 return Err(crate::map_cera_err(cera::CeraError::UnsupportedModality));
             };
             let cap = match max_long_size {
@@ -2339,7 +2339,7 @@ mod webgpu {
         /// next `generateTokens`.
         #[wasm_bindgen(js_name = appendAudio)]
         pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), JsError> {
-            let Some(encoder) = self.audio_encoder.clone() else {
+            let Some(encoder) = self.audio_encoder.as_ref() else {
                 return Err(crate::map_cera_err(cera::CeraError::UnsupportedModality));
             };
             if samples.is_empty() {
