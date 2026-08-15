@@ -20,8 +20,7 @@ class RecordingWaveformIndicator extends StatefulWidget {
       _RecordingWaveformIndicatorState();
 }
 
-class _RecordingWaveformIndicatorState
-    extends State<RecordingWaveformIndicator>
+class _RecordingWaveformIndicatorState extends State<RecordingWaveformIndicator>
     with SingleTickerProviderStateMixin {
   late final AnimationController _animController;
 

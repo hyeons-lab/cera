@@ -10,3 +10,7 @@ void startAudioStream(int sampleRate) {}
 void appendAudioStreamChunk(Float32List chunk) {}
 
 void stopAudioStream() {}
+
+void speakText(String text) {}
+
+void stopSpeech() {}

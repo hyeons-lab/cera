@@ -42,12 +42,20 @@ class AudioPlayerService {
     }
   }
 
-  /// Stops streaming and ends audio playback.
+  /// Speaks text aloud using speech synthesis.
+  void speakText(String text) {
+    if (kIsWeb) {
+      web_player.speakText(text);
+    }
+  }
+
+  /// Stops streaming and ends audio playback and speech.
   void stop() {
     _isPlaying = false;
     if (kIsWeb) {
       web_player.stopAudioStream();
       web_player.stopAudioPlayback();
+      web_player.stopSpeech();
     }
   }
 

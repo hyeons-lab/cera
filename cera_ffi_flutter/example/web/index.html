@@ -151,6 +151,20 @@
         activeStreamer = null;
       }
     };
+
+    window.ceraSpeakText = function(text) {
+      if (!('speechSynthesis' in window)) return;
+      window.speechSynthesis.cancel();
+      if (!text || text.trim() === '') return;
+      const utterance = new SpeechSynthesisUtterance(text);
+      window.speechSynthesis.speak(utterance);
+    };
+
+    window.ceraStopSpeech = function() {
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
+    };
   </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>

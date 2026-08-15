@@ -252,6 +252,35 @@ class _TurnBubble extends StatelessWidget {
                             ],
                           ],
                         ),
+                      if (audioPlayer != null && turn.text.isNotEmpty)
+                        InkWell(
+                          onTap: () => audioPlayer!.speakText(turn.text),
+                          borderRadius: BorderRadius.circular(4),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 4,
+                              vertical: 2,
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.volume_up_rounded,
+                                  size: 13,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                                const SizedBox(width: 3),
+                                Text(
+                                  'Speak',
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
                     ],
                   ),
                 ],
