@@ -1917,6 +1917,10 @@ mod webgpu {
         audio_encoder: Option<Arc<cera::model::audio_encoder::AudioEncoderWeights>>,
         /// GPU audio encoder instance if available.
         gpu_audio_encoder: Option<Arc<dyn cera::model::audio_encoder_gpu::AudioGpuEncode>>,
+        /// CPU audio decoder weights for vocoder output generation.
+        audio_decoder: Option<Arc<cera::model::audio_decoder::AudioDecoderWeights>>,
+        /// CPU detokenizer weights for vocoder output generation.
+        detok_weights: Option<Arc<cera::model::audio_decoder::DetokenizerWeights>>,
         /// Session-default cap on an appended image's longest side.
         image_max_long_size: Option<u32>,
     }
@@ -2064,6 +2068,8 @@ mod webgpu {
                 gpu_vision_encoder: None,
                 audio_encoder: None,
                 gpu_audio_encoder: None,
+                audio_decoder: None,
+                detok_weights: None,
                 image_max_long_size: None,
             })
         }
@@ -2124,13 +2130,6 @@ mod webgpu {
         ) -> Result<WebGpuSession, JsError> {
             let parts =
                 crate::bundle::load_bundle(repo, &bundle_id, &quant, on_progress.as_ref()).await?;
-            if parts.audio_decoder.is_some()
-                || parts.inference_type == Some(cera::manifest::InferenceType::Audio)
-            {
-                return Err(JsError::new(
-                    "audio output models require the CPU backend (WebGPU currently supports text and vision models)",
-                ));
-            }
             let mut session =
                 Self::from_model_bytes(parts.model, context_size, kv_compression).await?;
             // A VL or audio bundle names its tower in the manifest, so unlike
@@ -2138,7 +2137,28 @@ mod webgpu {
             if let Some(mmproj) = parts.multimodal_projector {
                 session.attach_projector(mmproj)?;
             }
+            if let Some(voc_bytes) = parts.audio_decoder {
+                session.attach_vocoder(voc_bytes)?;
+            }
             Ok(session)
+        }
+
+        /// Parse `vocoder_bytes` as an audio decoder & detokenizer and attach it,
+        /// giving this GPU session audio output synthesis via `AudioOutputDecoder`.
+        fn attach_vocoder(&mut self, vocoder_bytes: Arc<[u8]>) -> Result<(), JsError> {
+            let voc_gguf = cera::gguf::GgufFile::from_bytes(vocoder_bytes).map_err(map_err)?;
+            let voc_arc = Arc::new(voc_gguf);
+            let decoder_weights = cera::model::audio_decoder::AudioDecoderWeights::from_gguf(
+                &voc_arc,
+            )
+            .map_err(|e| JsError::new(&format!("failed to parse audio decoder weights: {e:#}")))?;
+            let detok_weights = cera::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_arc)
+                .map_err(|e| {
+                    JsError::new(&format!("failed to parse detokenizer weights: {e:#}"))
+                })?;
+            self.audio_decoder = Some(Arc::new(decoder_weights));
+            self.detok_weights = Some(Arc::new(detok_weights));
+            Ok(())
         }
 
         /// Parse `mmproj` as a vision tower or audio encoder and attach it, giving
@@ -2228,6 +2248,13 @@ mod webgpu {
             self.audio_encoder.is_some()
         }
 
+        /// Whether this session can produce audio output, i.e. whether it was built
+        /// from an audio bundle with an audio vocoder sidecar attached.
+        #[wasm_bindgen(getter, js_name = audioOut)]
+        pub fn audio_out(&self) -> bool {
+            self.audio_decoder.is_some() && self.detok_weights.is_some()
+        }
+
         /// Modality capability flags for this session, same shape as
         /// `Session.capabilities` on the CPU path.
         #[wasm_bindgen(getter)]
@@ -2235,6 +2262,7 @@ mod webgpu {
             capabilities_to_js(cera::ModalityCapabilities {
                 image_in: self.image_in(),
                 audio_in: self.audio_in(),
+                audio_out: self.audio_out(),
                 ..cera::ModalityCapabilities::text_only()
             })
         }
@@ -2623,6 +2651,7 @@ mod webgpu {
             top_k: Option<u32>,
             seed: Option<u64>,
             on_token: &js_sys::Function,
+            on_audio: Option<js_sys::Function>,
         ) -> Result<String, JsError> {
             self.generate_ids(
                 tokens,
@@ -2632,6 +2661,7 @@ mod webgpu {
                 top_k,
                 seed,
                 on_token,
+                on_audio.as_ref(),
             )
             .await
         }
@@ -2650,6 +2680,7 @@ mod webgpu {
             top_k: Option<u32>,
             seed: Option<u64>,
             on_token: &js_sys::Function,
+            on_audio: Option<&js_sys::Function>,
         ) -> Result<String, JsError> {
             if ids.is_empty() {
                 return Ok(String::new());
@@ -2726,10 +2757,92 @@ mod webgpu {
             // corrupt non-ASCII output into U+FFFD replacement chars.
             let mut out = String::new();
             let mut pending = Vec::<u8>::new();
+            let mut generated = 0;
             for _ in 0..max_tokens {
                 if Some(next) == self.eos {
                     break;
                 }
+                generated += 1;
+
+                if next == cera::audio_engine::TOKEN_AUDIO_START
+                    && let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights)
+                {
+                    console_info(
+                        "[cera-wasm] WebGpuSession hit TOKEN_AUDIO_START (128). Beginning vocoder audio decoding on GPU...",
+                    );
+                    if !pending.is_empty() {
+                        let valid = match std::str::from_utf8(&pending) {
+                            Ok(s) => s.len(),
+                            Err(e) => e.valid_up_to(),
+                        };
+                        if valid > 0 {
+                            let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                            out.push_str(&piece);
+                            emit(on_token, &piece);
+                        }
+                        pending.clear();
+                    }
+
+                    let mut decoder = cera::audio_engine::AudioOutputDecoder::new(
+                        dec, detok, None, 0.0, 1, false,
+                    );
+
+                    let mut emb = self
+                        .model
+                        .forward_embedding_async(next, pos, &mut self.state)
+                        .await
+                        .map_err(map_err)?;
+                    pos += 1;
+
+                    let mut frame_count = 0;
+                    loop {
+                        if generated >= max_tokens as usize || pos >= max_seq_len {
+                            break;
+                        }
+                        let outcome = decoder.decode_frame(&emb);
+                        let audio_emb = match outcome {
+                            cera::audio_engine::FrameOutcome::End => {
+                                console_info(&format!(
+                                    "[cera-wasm] WebGpuSession vocoder emitted End code after {frame_count} frames"
+                                ));
+                                break;
+                            }
+                            cera::audio_engine::FrameOutcome::Codes { audio_embedding } => {
+                                frame_count += 1;
+                                audio_embedding
+                            }
+                        };
+                        emb = self
+                            .model
+                            .forward_hidden_from_embedding_async(&audio_emb, pos, &mut self.state)
+                            .await
+                            .map_err(map_err)?;
+                        pos += 1;
+                        generated += 1;
+                    }
+
+                    if let Some(cb) = on_audio {
+                        let mut total_samples = 0;
+                        decoder.finish(|pcm, rate| {
+                            total_samples += pcm.len();
+                            console_info(&format!(
+                                "[cera-wasm] WebGpuSession vocoder finish produced {} PCM samples at {} Hz",
+                                pcm.len(),
+                                rate
+                            ));
+                            let array = js_sys::Float32Array::from(pcm);
+                            let rate_val = JsValue::from_f64(rate as f64);
+                            if let Err(err) = cb.call2(&JsValue::null(), &array, &rate_val) {
+                                wasm_bindgen::throw_val(err);
+                            }
+                        });
+                        console_info(&format!(
+                            "[cera-wasm] WebGpuSession audio generation finished with {frame_count} frames and {total_samples} samples"
+                        ));
+                    }
+                    break;
+                }
+
                 pending.extend_from_slice(&self.tokenizer.decode_bytes(&[next]));
                 let valid = match std::str::from_utf8(&pending) {
                     Ok(s) => s.len(),

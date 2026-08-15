@@ -4639,6 +4639,59 @@ impl GpuLfm2Model {
         Ok(out)
     }
 
+    /// Async decode step returning the hidden state embedding on GPU, for vocoder conditioning.
+    pub async fn forward_embedding_async(
+        &self,
+        token: u32,
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>> {
+        let hidden_size = self.config.hidden_size;
+        let pending = {
+            let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+            let _lora_guard = self.resolve_lora(state);
+            self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
+            self.forward_inner_compute_tail(&[token], pos, state, DecodeTail::Hidden);
+            self.ctx.begin_download(
+                &self.hidden_buf,
+                (hidden_size * std::mem::size_of::<f32>()) as u64,
+            )
+        };
+        let bytes = pending.recv().await?;
+        let mut out = vec![0f32; hidden_size];
+        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
+        Ok(out)
+    }
+
+    /// Async decode step returning the hidden state embedding when seeded by an audio embedding.
+    pub async fn forward_hidden_from_embedding_async(
+        &self,
+        embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>> {
+        let hidden_size = self.config.hidden_size;
+        let pending = {
+            let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+            let _lora_guard = self.resolve_lora(state);
+            self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
+            self.forward_inner_compute_tail_seeded(
+                HiddenSeed::Embedding(embedding),
+                pos,
+                state,
+                DecodeTail::Hidden,
+            );
+            self.ctx.begin_download(
+                &self.hidden_buf,
+                (hidden_size * std::mem::size_of::<f32>()) as u64,
+            )
+        };
+        let bytes = pending.recv().await?;
+        let mut out = vec![0f32; hidden_size];
+        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
+        Ok(out)
+    }
+
     /// Adapter name and backend of the underlying [`GpuContext`], for
     /// surfacing which GPU/backend the model is actually running on (e.g. in
     /// the wasm `WebGpuSession.adapter` getter).

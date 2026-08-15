@@ -176,8 +176,7 @@ async function ensureModule(moduleUrl) {
  * dense-transformer GGUF throws from `create` after WebGPU itself came up fine.
  * Both must degrade rather than fail the open.
  */
-async function tryGpu(bytes, contextSize, mmproj, turboQuant, inferenceType) {
-  if (inferenceType === 'audio') return false;
+async function tryGpu(bytes, contextSize, mmproj, turboQuant) {
   if (!self.navigator || !self.navigator.gpu) return false;
   if (typeof wasm.WebGpuSession !== 'function') return false;
   // `createWithParts` is the newer of the two and is absent from a wasm build
@@ -340,7 +339,7 @@ const OPS = {
     const ctx = contextSize ?? undefined;
     const type = inferenceType ?? undefined;
     if (backend === 'gpu') {
-      if (!(await tryGpu(view, ctx, proj, turboQuant, type))) {
+      if (!(await tryGpu(view, ctx, proj, turboQuant))) {
         throw new Error(
           'the WebGPU backend is unavailable: either this browser exposes no ' +
             'navigator.gpu, no adapter could be acquired, or the model is not ' +
@@ -350,7 +349,7 @@ const OPS = {
       }
     } else if (backend === 'cpu') {
       openCpu(view, ctx, proj, type, turboQuant);
-    } else if (!(await tryGpu(view, ctx, proj, turboQuant, type))) {
+    } else if (!(await tryGpu(view, ctx, proj, turboQuant))) {
       openCpu(view, ctx, proj, type, turboQuant);
     }
     return { backend: backendLabel, capabilities: capabilitiesOf() };
@@ -697,6 +696,12 @@ const OPS = {
     console.info(
       `[cera:worker] generate op started: backend=${gpu ? 'gpu' : 'cpu'}, maxTokens=${maxTokens}, ids=${ids.length}`,
     );
+    const onAudio = (pcm, sampleRate) => {
+      console.info(
+        `[cera:worker] generate: emitting ${pcm?.length} audio PCM samples at ${sampleRate}Hz, posting to host with id=${req.id}`,
+      );
+      post({ event: 'audio', pcm: Array.from(pcm), sampleRate });
+    };
     if (gpu) {
       // Caller-framed: `generateTokens` prepends nothing, which is what makes
       // the BOS rule in `encodePrompt` the single place BOS is decided.
@@ -713,6 +718,7 @@ const OPS = {
         req.topK ?? null,
         req.seed != null ? BigInt(req.seed) : null,
         onToken,
+        onAudio,
       );
     } else {
       const tk = cpu.tokenizer;
@@ -727,12 +733,6 @@ const OPS = {
       // Emit per token rather than per buffer-full; the point of a worker is
       // that the host sees output as it is produced.
       let uncommittedTokens = [];
-      const onAudio = (pcm, sampleRate) => {
-        console.info(
-          `[cera:worker] generate: emitting ${pcm?.length} audio PCM samples at ${sampleRate}Hz, posting to host with id=${req.id}`,
-        );
-        post({ event: 'audio', pcm: Array.from(pcm), sampleRate });
-      };
       try {
         console.info('[cera:worker] calling cpu.session.generate...');
         cpu.session.generate(
