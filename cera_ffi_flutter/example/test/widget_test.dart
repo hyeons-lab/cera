@@ -31,7 +31,7 @@ void main() {
   });
 
   testWidgets(
-    'the speed icon is disabled and vision attach is hidden before a model is loaded',
+    'the speed icon is disabled, and vision/audio buttons are hidden before a model is loaded',
     (WidgetTester tester) async {
       await tester.pumpWidget(const CeraExampleApp());
 
@@ -40,6 +40,7 @@ void main() {
       );
       expect(button.onPressed, isNull);
       expect(find.byIcon(Icons.add_photo_alternate_outlined), findsNothing);
+      expect(find.byIcon(Icons.mic_none_rounded), findsNothing);
     },
   );
 
@@ -129,4 +130,35 @@ void main() {
       expect(find.text('Gemma-2-2B · Q4_K_M'), findsOneWidget);
     },
   );
+
+  testWidgets('message list displays voice note badge for audio prompt turns', (
+    WidgetTester tester,
+  ) async {
+    final turns = [
+      Turn(
+        role: 'user',
+        text: 'What is the weather?',
+        audioDurationSeconds: 3.5,
+      ),
+      Turn(
+        role: 'assistant',
+        text: 'It is sunny today.',
+        modelName: 'LFM2.5-Audio-1.5B · Q4_0',
+        stats: const TurnStats(tokens: 10, totalMs: 200, ttftMs: 30, tps: 50.0),
+      ),
+    ];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MessageList(turns: turns, scrollController: ScrollController()),
+        ),
+      ),
+    );
+
+    expect(find.text('3.5s voice input'), findsOneWidget);
+    expect(find.text('What is the weather?'), findsOneWidget);
+    expect(find.text('It is sunny today.'), findsOneWidget);
+    expect(find.text('LFM2.5-Audio-1.5B · Q4_0'), findsOneWidget);
+  });
 }

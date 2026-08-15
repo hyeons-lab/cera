@@ -450,6 +450,17 @@ abstract interface class Cera {
   /// to one cache.
   Future<void> appendImage(Uint8List bytes, {int? maxLongSize});
 
+  /// Feeds mono PCM audio into the conversation, to be processed by the next
+  /// [generate].
+  ///
+  /// `pcm` is normalized to roughly [-1.0, 1.0]. Non-16 kHz inputs are
+  /// automatically resampled by the engine to the model's required rate.
+  ///
+  /// Throws if this model has no audio encoder, i.e. whenever [capabilities]
+  /// reports `audioIn: false`. Serialized against [generate] the same way
+  /// generations are serialized against each other.
+  Future<void> appendAudio(List<double> pcm, {int sampleRate = 16000});
+
   /// Transcribes mono PCM audio to text.
   ///
   /// `pcm` is normalized to roughly [-1.0, 1.0] and `sampleRate` must already

@@ -1,40 +1,108 @@
+import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import '../services/audio_recorder_service.dart';
 
 /// Bottom message composer with text input, image attachment preview,
-/// vision picker trigger, and send/stop button.
-class MessageComposer extends StatelessWidget {
+/// vision picker trigger, audio push-to-talk microphone trigger, and send/stop button.
+class MessageComposer extends StatefulWidget {
   const MessageComposer({
     super.key,
     required this.controller,
     required this.isBusy,
     required this.isGenerating,
     required this.canAttachImage,
+    required this.canAttachAudio,
     required this.pendingImageBytes,
     required this.pendingImageName,
     required this.onSend,
     required this.onStop,
     required this.onPickImage,
     required this.onClearImage,
+    required this.onSendAudio,
   });
 
   final TextEditingController controller;
   final bool isBusy;
   final bool isGenerating;
   final bool canAttachImage;
+  final bool canAttachAudio;
   final Uint8List? pendingImageBytes;
   final String? pendingImageName;
   final VoidCallback onSend;
   final VoidCallback onStop;
   final VoidCallback onPickImage;
   final VoidCallback onClearImage;
+  final void Function(List<double> pcm, int sampleRate) onSendAudio;
+
+  @override
+  State<MessageComposer> createState() => _MessageComposerState();
+}
+
+class _MessageComposerState extends State<MessageComposer> {
+  final AudioRecorderService _audioRecorder = AudioRecorderService();
+  bool _isRecordingAudio = false;
+  bool _draggedToCancel = false;
+  int _recordingSeconds = 0;
+  Timer? _recordTimer;
+
+  @override
+  void dispose() {
+    _recordTimer?.cancel();
+    _audioRecorder.dispose();
+    super.dispose();
+  }
+
+  Future<void> _startRecording() async {
+    if (widget.isBusy) return;
+    try {
+      await _audioRecorder.startRecording(sampleRate: 16000);
+      setState(() {
+        _isRecordingAudio = true;
+        _draggedToCancel = false;
+        _recordingSeconds = 0;
+      });
+      _recordTimer?.cancel();
+      _recordTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted && _isRecordingAudio) {
+          setState(() => _recordingSeconds++);
+        }
+      });
+    } catch (err) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Microphone error: $err')));
+      }
+    }
+  }
+
+  Future<void> _stopRecording() async {
+    if (!_isRecordingAudio) return;
+    _recordTimer?.cancel();
+    final cancelled = _draggedToCancel;
+    setState(() {
+      _isRecordingAudio = false;
+      _draggedToCancel = false;
+    });
+
+    if (cancelled) {
+      await _audioRecorder.cancelRecording();
+      return;
+    }
+
+    final pcm = await _audioRecorder.stopRecording();
+    if (pcm.isNotEmpty) {
+      widget.onSendAudio(pcm, 16000);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        if (pendingImageBytes != null)
+        if (widget.pendingImageBytes != null)
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             color: const Color(0xFF14161B),
@@ -43,7 +111,7 @@ class MessageComposer extends StatelessWidget {
                 ClipRRect(
                   borderRadius: BorderRadius.circular(6),
                   child: Image.memory(
-                    pendingImageBytes!,
+                    widget.pendingImageBytes!,
                     width: 44,
                     height: 44,
                     fit: BoxFit.cover,
@@ -55,7 +123,7 @@ class MessageComposer extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        pendingImageName ?? 'Attached image',
+                        widget.pendingImageName ?? 'Attached image',
                         style: const TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.w600,
@@ -81,7 +149,7 @@ class MessageComposer extends StatelessWidget {
                     color: Color(0xFF94A3B8),
                   ),
                   tooltip: 'Remove attached image',
-                  onPressed: isBusy ? null : onClearImage,
+                  onPressed: widget.isBusy ? null : widget.onClearImage,
                 ),
               ],
             ),
@@ -92,74 +160,194 @@ class MessageComposer extends StatelessWidget {
             color: Color(0xFF14161B),
             border: Border(top: BorderSide(color: Color(0xFF1E222D), width: 1)),
           ),
-          child: Row(
-            children: [
-              if (canAttachImage) ...[
-                IconButton(
-                  icon: const Icon(
-                    Icons.add_photo_alternate_outlined,
-                    color: Color(0xFF94A3B8),
-                  ),
-                  tooltip: 'Attach image for vision prompt',
-                  onPressed: isBusy ? null : onPickImage,
-                ),
-                const SizedBox(width: 4),
-              ],
-              Expanded(
-                child: TextField(
-                  controller: controller,
-                  decoration: InputDecoration(
-                    hintText: isGenerating
-                        ? 'Model is generating response...'
-                        : 'Send a message...',
-                    hintStyle: const TextStyle(color: Color(0xFF64748B)),
-                    filled: true,
-                    fillColor: const Color(0xFF0B0C0E),
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 12,
-                    ),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(24),
-                      borderSide: const BorderSide(color: Color(0xFF232732)),
-                    ),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(24),
-                      borderSide: const BorderSide(color: Color(0xFF232732)),
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(24),
-                      borderSide: const BorderSide(color: Color(0xFF3B82F6)),
-                    ),
-                  ),
-                  enabled: !isGenerating,
-                  onSubmitted: (_) => onSend(),
-                ),
+          child: _isRecordingAudio ? _buildRecordingBar() : _buildInputBar(),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildRecordingBar() {
+    final minutes = (_recordingSeconds ~/ 60).toString().padLeft(2, '0');
+    final seconds = (_recordingSeconds % 60).toString().padLeft(2, '0');
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      decoration: BoxDecoration(
+        color: _draggedToCancel
+            ? const Color(0xFF3B1219)
+            : const Color(0xFF182234),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(
+          color: _draggedToCancel
+              ? const Color(0xFFEF4444)
+              : const Color(0xFF3B82F6),
+        ),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 10,
+            height: 10,
+            decoration: BoxDecoration(
+              color: _draggedToCancel
+                  ? const Color(0xFFEF4444)
+                  : const Color(0xFF60A5FA),
+              shape: BoxShape.circle,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Text(
+            '$minutes:$seconds',
+            style: const TextStyle(
+              fontWeight: FontWeight.w600,
+              fontSize: 13,
+              color: Color(0xFFF1F5F9),
+            ),
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Text(
+              _draggedToCancel
+                  ? 'Release to cancel'
+                  : 'Recording... (slide away to cancel)',
+              style: TextStyle(
+                fontSize: 12,
+                color: _draggedToCancel
+                    ? const Color(0xFFFCA5A5)
+                    : const Color(0xFF93C5FD),
               ),
-              const SizedBox(width: 10),
-              if (isGenerating)
-                IconButton.filled(
-                  style: IconButton.styleFrom(
-                    backgroundColor: const Color(0xFFEF4444),
-                    foregroundColor: Colors.white,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          GestureDetector(
+            onLongPressMoveUpdate: (details) {
+              if (details.localOffsetFromOrigin.dx < -50 ||
+                  details.localOffsetFromOrigin.dy < -50) {
+                if (!_draggedToCancel) setState(() => _draggedToCancel = true);
+              } else {
+                if (_draggedToCancel) setState(() => _draggedToCancel = false);
+              }
+            },
+            onLongPressEnd: (_) => _stopRecording(),
+            onLongPressCancel: () => _stopRecording(),
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: _draggedToCancel
+                    ? const Color(0xFFEF4444)
+                    : const Color(0xFF3B82F6),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(
+                Icons.mic_rounded,
+                size: 20,
+                color: Colors.white,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInputBar() {
+    return Row(
+      children: [
+        if (widget.canAttachImage) ...[
+          IconButton(
+            icon: const Icon(
+              Icons.add_photo_alternate_outlined,
+              color: Color(0xFF94A3B8),
+            ),
+            tooltip: 'Attach image for vision prompt',
+            onPressed: widget.isBusy ? null : widget.onPickImage,
+          ),
+          const SizedBox(width: 4),
+        ],
+        if (widget.canAttachAudio) ...[
+          GestureDetector(
+            onLongPressStart: (_) => _startRecording(),
+            onLongPressMoveUpdate: (details) {
+              if (details.localOffsetFromOrigin.dx < -50 ||
+                  details.localOffsetFromOrigin.dy < -50) {
+                if (!_draggedToCancel) setState(() => _draggedToCancel = true);
+              } else {
+                if (_draggedToCancel) setState(() => _draggedToCancel = false);
+              }
+            },
+            onLongPressEnd: (_) => _stopRecording(),
+            onLongPressCancel: () => _stopRecording(),
+            child: IconButton(
+              icon: const Icon(
+                Icons.mic_none_rounded,
+                color: Color(0xFF60A5FA),
+              ),
+              tooltip: 'Hold to speak (audio model)',
+              onPressed: () {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Press and hold to speak, release to send.'),
+                    duration: Duration(seconds: 2),
                   ),
-                  icon: const Icon(Icons.stop_rounded),
-                  tooltip: 'Stop generation',
-                  onPressed: onStop,
-                )
-              else
-                IconButton.filled(
-                  style: IconButton.styleFrom(
-                    backgroundColor: const Color(0xFF3B82F6),
-                    foregroundColor: Colors.white,
-                  ),
-                  icon: const Icon(Icons.arrow_upward_rounded),
-                  tooltip: 'Send message',
-                  onPressed: isBusy ? null : onSend,
-                ),
-            ],
+                );
+              },
+            ),
+          ),
+          const SizedBox(width: 4),
+        ],
+        Expanded(
+          child: TextField(
+            controller: widget.controller,
+            decoration: InputDecoration(
+              hintText: widget.isGenerating
+                  ? 'Model is generating response...'
+                  : 'Send a message...',
+              hintStyle: const TextStyle(color: Color(0xFF64748B)),
+              filled: true,
+              fillColor: const Color(0xFF0B0C0E),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 12,
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(24),
+                borderSide: const BorderSide(color: Color(0xFF232732)),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(24),
+                borderSide: const BorderSide(color: Color(0xFF232732)),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(24),
+                borderSide: const BorderSide(color: Color(0xFF3B82F6)),
+              ),
+            ),
+            enabled: !widget.isGenerating,
+            onSubmitted: (_) => widget.onSend(),
           ),
         ),
+        const SizedBox(width: 10),
+        if (widget.isGenerating)
+          IconButton.filled(
+            style: IconButton.styleFrom(
+              backgroundColor: const Color(0xFFEF4444),
+              foregroundColor: Colors.white,
+            ),
+            icon: const Icon(Icons.stop_rounded),
+            tooltip: 'Stop generation',
+            onPressed: widget.onStop,
+          )
+        else
+          IconButton.filled(
+            style: IconButton.styleFrom(
+              backgroundColor: const Color(0xFF3B82F6),
+              foregroundColor: Colors.white,
+            ),
+            icon: const Icon(Icons.arrow_upward_rounded),
+            tooltip: 'Send message',
+            onPressed: widget.isBusy ? null : widget.onSend,
+          ),
       ],
     );
   }

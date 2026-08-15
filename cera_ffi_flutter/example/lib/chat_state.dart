@@ -26,6 +26,7 @@ class Turn {
     this.modelName,
     this.imageBytes,
     this.imageName,
+    this.audioDurationSeconds,
     this.stats,
     this.isGenerating = false,
     this.statusText,
@@ -36,6 +37,7 @@ class Turn {
   final String? modelName;
   final Uint8List? imageBytes;
   final String? imageName;
+  final double? audioDurationSeconds;
   TurnStats? stats;
   bool isGenerating;
   String? statusText;
@@ -102,6 +104,8 @@ class ChatState {
   bool get isBusy => isLoading || isGenerating;
   bool get canAttachImage =>
       hasModel && (capabilities?.imageIn ?? false) && !isBusy;
+  bool get canAttachAudio =>
+      hasModel && (capabilities?.audioIn ?? false) && !isBusy;
   bool get canSend =>
       hasModel && !isBusy && (!turns.any((t) => t.isGenerating));
 

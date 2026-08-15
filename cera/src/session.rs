@@ -1097,34 +1097,44 @@ impl Session {
                  currently-loaded LLM."
             )));
         }
-        if sample_rate != crate::model::audio_encoder::SAMPLE_RATE {
-            return Err(CeraError::Backend(format!(
-                "Session::append_audio: sample_rate {} != {} required by \
-                 encoder (resampling is out of scope; resample externally \
-                 before passing samples in)",
-                sample_rate,
-                crate::model::audio_encoder::SAMPLE_RATE,
-            )));
-        }
         if samples.is_empty() {
             return Err(CeraError::EmptyInput);
         }
+        let target_sr = crate::model::audio_encoder::SAMPLE_RATE;
+        let resampled: std::borrow::Cow<[f32]> = if sample_rate == target_sr {
+            std::borrow::Cow::Borrowed(samples)
+        } else {
+            std::borrow::Cow::Owned(crate::model::audio_encoder::resample_linear(
+                samples,
+                sample_rate,
+                target_sr,
+            ))
+        };
+        if resampled.is_empty() {
+            return Err(CeraError::EmptyInput);
+        }
+        let effective_samples = resampled.as_ref();
         // Prefer the GPU encoder when one is attached. A GPU refusal (chunk
         // longer than the attention kernel's capacity, unsupported geometry) is
         // a fallback, not a failure: the CPU encoder is always present and
         // produces the same output, just slower.
         let (embeddings, n_frames) = match self.gpu_audio_encoder.as_ref() {
-            Some(gpu) => match gpu.encode_pcm(samples) {
+            Some(gpu) => match gpu.encode_pcm(effective_samples) {
                 Ok(out) => out,
                 Err(e) => {
                     // warn, not debug, and for the same reason
                     // `try_metal_audio_encoder` warns at build time: the only
                     // other symptom of this is "audio encode got slower".
                     tracing::warn!("audio encoder: GPU path declined, using CPU: {e:#}");
-                    crate::model::audio_encoder::encode_audio_pcm(samples, encoder.as_ref())
+                    crate::model::audio_encoder::encode_audio_pcm(
+                        effective_samples,
+                        encoder.as_ref(),
+                    )
                 }
             },
-            None => crate::model::audio_encoder::encode_audio_pcm(samples, encoder.as_ref()),
+            None => {
+                crate::model::audio_encoder::encode_audio_pcm(effective_samples, encoder.as_ref())
+            }
         };
         if n_frames == 0 {
             // Sub-window-length input: log_mel_spectrogram produced

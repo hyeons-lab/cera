@@ -640,6 +640,20 @@ class _WorkerCera implements Cera {
   }
 
   @override
+  Future<void> appendAudio(List<double> pcm, {int sampleRate = 16000}) async {
+    await _queue;
+    await _send(
+      _newId(),
+      (id) => _Request(
+        id: id,
+        op: 'appendAudio',
+        pcm: pcm.map((s) => s.toJS).toList().toJS,
+        sampleRate: sampleRate,
+      ),
+    );
+  }
+
+  @override
   Future<String> transcribe(List<double> pcm, {required int sampleRate}) async {
     await _queue;
     final result = await _send(

@@ -364,6 +364,7 @@ class _ChatPageState extends State<ChatPage> {
                 isBusy: state.isBusy,
                 isGenerating: state.isGenerating,
                 canAttachImage: state.canAttachImage,
+                canAttachAudio: state.canAttachAudio,
                 pendingImageBytes: state.pendingImageBytes,
                 pendingImageName: state.pendingImageName,
                 onSend: _sendMessage,
@@ -372,6 +373,13 @@ class _ChatPageState extends State<ChatPage> {
                 onPickImage: _pickImage,
                 onClearImage: () =>
                     _controller.dispatch(const ClearAttachedImageIntent()),
+                onSendAudio: (pcm, sampleRate) => _controller.dispatch(
+                  SendAudioPromptIntent(
+                    pcmSamples: pcm,
+                    sampleRate: sampleRate,
+                    prompt: _inputController.text.trim(),
+                  ),
+                ),
               ),
             ],
           ),

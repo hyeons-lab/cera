@@ -45,6 +45,19 @@ class SendMessageIntent extends ChatIntent {
   final String prompt;
 }
 
+/// Intent to send an audio prompt to an audio-in model.
+class SendAudioPromptIntent extends ChatIntent {
+  const SendAudioPromptIntent({
+    required this.pcmSamples,
+    this.sampleRate = 16000,
+    this.prompt = '',
+  });
+
+  final List<double> pcmSamples;
+  final int sampleRate;
+  final String prompt;
+}
+
 /// Intent to cancel/stop an ongoing text generation.
 class StopGenerationIntent extends ChatIntent {
   const StopGenerationIntent();

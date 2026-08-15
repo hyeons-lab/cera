@@ -444,6 +444,14 @@ class _NativeCera implements Cera {
   }
 
   @override
+  Future<void> appendAudio(List<double> pcm, {int sampleRate = 16000}) async {
+    _ensureOpen();
+    await _queue;
+    _ensureOpen();
+    _session.appendAudio(pcm, sampleRate);
+  }
+
+  @override
   Future<String> transcribe(List<double> pcm, {required int sampleRate}) async {
     _ensureOpen();
     // Queued despite not touching the session: it is a full prefill plus decode

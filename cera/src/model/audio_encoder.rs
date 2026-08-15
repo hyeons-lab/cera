@@ -73,6 +73,40 @@ pub const LOG_MEL_EPS: f32 = 5.960_464_5e-8;
 /// would round the CPU's floor through f32 and change the shipping path.
 pub const NORM_VAR_EPS: f64 = 1e-5;
 
+/// Linearly resample `samples` from `sr_in` to `sr_out` Hz.
+/// Returns `samples` unchanged when `sr_in == sr_out`.
+///
+/// Linear interpolation is the simplest viable resampler:
+/// - Upsample (e.g. 8 kHz → 16 kHz): introduces a smoothed
+///   high-frequency rolloff but no aliasing — adequate for ASR.
+/// - Downsample (e.g. 44.1 kHz → 16 kHz): does NOT apply an
+///   anti-aliasing low-pass filter, so frequencies above the
+///   output Nyquist (8 kHz here) fold back as aliasing artifacts.
+///   Speech energy is mostly under 8 kHz so this is tolerable for
+///   ASR but not studio-quality.
+pub fn resample_linear(samples: &[f32], sr_in: u32, sr_out: u32) -> Vec<f32> {
+    if samples.is_empty() || sr_in == 0 || sr_out == 0 {
+        return Vec::new();
+    }
+    if sr_in == sr_out {
+        return samples.to_vec();
+    }
+    let n_in = samples.len();
+    let ratio = sr_out as f64 / sr_in as f64;
+    let n_out = ((n_in as f64) * ratio).round().max(1.0) as usize;
+    let mut out = Vec::with_capacity(n_out);
+    let step = sr_in as f64 / sr_out as f64;
+    for i in 0..n_out {
+        let pos = i as f64 * step;
+        let idx = pos.floor() as usize;
+        let frac = (pos - idx as f64) as f32;
+        let a = samples[idx.min(n_in - 1)];
+        let b = samples[(idx + 1).min(n_in - 1)];
+        out.push(a + (b - a) * frac);
+    }
+    out
+}
+
 /// Configuration for the LFM2A Conformer audio encoder. Read from
 /// the `clip.audio.*` metadata block of the multimodal_projector
 /// GGUF.

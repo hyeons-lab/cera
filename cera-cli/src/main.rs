@@ -1739,41 +1739,7 @@ fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
 /// degenerate but cheap to handle here so the caller doesn't
 /// have to special-case them.
 fn resample_linear(samples: &[f32], sr_in: u32, sr_out: u32) -> Vec<f32> {
-    if samples.is_empty() || sr_in == 0 || sr_out == 0 {
-        return Vec::new();
-    }
-    if sr_in == sr_out {
-        return samples.to_vec();
-    }
-    let n_in = samples.len();
-    // Output length scales by the rate ratio. Use f64 to avoid
-    // precision loss on long inputs (a 60s @ 44.1kHz clip is
-    // 2.6M samples — f32 mantissa starts losing integer fidelity
-    // around 16M, so f32 would be fine here, but f64 is free).
-    let ratio = sr_out as f64 / sr_in as f64;
-    // Clamp to ≥ 1 for non-empty input. Without this a tiny input
-    // (e.g. `n_in=1` with `sr_in=48_000, sr_out=16_000`) would
-    // round `n_in * ratio = 0.333 → 0` and the resampler would
-    // hand back an empty buffer, which `Session::append_audio`
-    // surfaces as `EmptyInput`. The empty-input early return
-    // above handles `n_in == 0`; this handles the round-to-zero
-    // edge case for non-empty input.
-    let n_out = ((n_in as f64) * ratio).round().max(1.0) as usize;
-    let mut out = Vec::with_capacity(n_out);
-    let step = sr_in as f64 / sr_out as f64;
-    for i in 0..n_out {
-        let pos = i as f64 * step;
-        let idx = pos.floor() as usize;
-        let frac = (pos - idx as f64) as f32;
-        // Clamp to [0, n_in - 1]. The last interval (idx == n_in - 1,
-        // frac > 0) interpolates against itself — equivalent to
-        // hold-the-last-sample, which is the standard end-of-buffer
-        // handling for linear resampling.
-        let a = samples[idx.min(n_in - 1)];
-        let b = samples[(idx + 1).min(n_in - 1)];
-        out.push(a + (b - a) * frac);
-    }
-    out
+    cera::model::audio_encoder::resample_linear(samples, sr_in, sr_out)
 }
 
 /// Pick a vocab-resident special token to use as the audio

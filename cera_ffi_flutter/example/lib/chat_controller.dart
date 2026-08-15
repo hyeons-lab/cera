@@ -59,6 +59,8 @@ class ChatController extends ValueNotifier<ChatState> {
         await _onUnloadModel();
       case SendMessageIntent():
         await _onSendMessage(intent.prompt);
+      case SendAudioPromptIntent():
+        await _onSendAudioPrompt(intent);
       case StopGenerationIntent():
         await _onStopGeneration();
       case AttachImageIntent():
@@ -350,7 +352,11 @@ class ChatController extends ValueNotifier<ChatState> {
 
     final messages = newTurns
         .where(
-          (t) => !t.isGenerating && (t.text.isNotEmpty || t.imageBytes != null),
+          (t) =>
+              !t.isGenerating &&
+              (t.text.isNotEmpty ||
+                  t.imageBytes != null ||
+                  t.audioDurationSeconds != null),
         )
         .map((t) => CeraMessage(t.role, t.text))
         .toList();
@@ -374,6 +380,85 @@ class ChatController extends ValueNotifier<ChatState> {
         return;
       }
     }
+
+    await _runGeneration(assistantTurn, formattedPrompt);
+  }
+
+  Future<void> _onSendAudioPrompt(SendAudioPromptIntent intent) async {
+    final cera = _ceraEngine;
+    if (intent.pcmSamples.isEmpty ||
+        cera == null ||
+        value.isBusy ||
+        _disposed) {
+      return;
+    }
+
+    final durationSec = intent.pcmSamples.length / intent.sampleRate;
+    final promptText = intent.prompt.trim();
+    final userTurn = Turn(
+      role: 'user',
+      text: promptText.isNotEmpty
+          ? promptText
+          : '🎙️ Audio (${durationSec.toStringAsFixed(1)}s)',
+      audioDurationSeconds: durationSec,
+    );
+
+    final assistantTurn = Turn(
+      role: 'assistant',
+      text: '',
+      modelName: value.loadedModel?.name,
+      isGenerating: true,
+      statusText: 'Listening to audio...',
+    );
+
+    final newTurns = List<Turn>.from(value.turns)
+      ..addAll([userTurn, assistantTurn]);
+
+    value = value.copyWith(
+      turns: newTurns,
+      isGenerating: true,
+      pendingImageBytes: () => null,
+      pendingImageName: () => null,
+    );
+
+    final messages = newTurns
+        .where(
+          (t) =>
+              !t.isGenerating &&
+              (t.text.isNotEmpty ||
+                  t.imageBytes != null ||
+                  t.audioDurationSeconds != null),
+        )
+        .map((t) => CeraMessage(t.role, t.text))
+        .toList();
+
+    String formattedPrompt;
+    try {
+      formattedPrompt = await cera.applyChatTemplate(messages);
+    } catch (_) {
+      formattedPrompt = promptText;
+    }
+
+    try {
+      await cera.appendAudio(intent.pcmSamples, sampleRate: intent.sampleRate);
+    } catch (err) {
+      assistantTurn.isGenerating = false;
+      assistantTurn.statusText = null;
+      assistantTurn.text = 'Failed to process audio: $err';
+      notifyListeners();
+      value = value.copyWith(isGenerating: false);
+      return;
+    }
+
+    await _runGeneration(assistantTurn, formattedPrompt);
+  }
+
+  Future<void> _runGeneration(
+    Turn assistantTurn,
+    String formattedPrompt,
+  ) async {
+    final cera = _ceraEngine;
+    if (cera == null || _disposed) return;
 
     final stopwatch = Stopwatch()..start();
     int? firstTokenMs;
