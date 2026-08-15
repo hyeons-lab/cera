@@ -572,11 +572,12 @@ impl WgpuAudioDecoder {
 
     // ── public forward ──────────────────────────────────────────────────────
 
-    pub fn detokenize_to_spectrum(
+    fn encode_detokenize_to_spectrum(
         &self,
+        enc: &mut wgpu::CommandEncoder,
         cpu_weights: &DetokenizerWeights,
         codes: &[i32],
-    ) -> Vec<f32> {
+    ) -> (usize, usize) {
         let hs = self.cfg.n_embd;
         let hd = self.cfg.n_embd_head;
         let n_head = self.cfg.n_head as u32;
@@ -602,13 +603,11 @@ impl WgpuAudioDecoder {
         let scale = 1.0f32 / (hd as f32).sqrt();
         let seq_len = (n_past + N_FRAMES).min(self.cfg.swa_window_size) as u32;
 
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-
         for (il, lw) in self.layers.iter().enumerate() {
             // Phase 1: (add prev-layer residual then) rmsnorm with operator_norm.
             if il == 0 {
                 self.rmsnorm_batch(
-                    &mut enc,
+                    enc,
                     &self.hidden_buf,
                     &self.normed_buf,
                     &lw.operator_norm,
@@ -616,7 +615,7 @@ impl WgpuAudioDecoder {
                 );
             } else {
                 self.add_rmsnorm_batch(
-                    &mut enc,
+                    enc,
                     &self.hidden_buf,
                     &self.normed_buf,
                     &lw.operator_norm,
@@ -633,7 +632,7 @@ impl WgpuAudioDecoder {
 
                 // in_proj: normed → proj [n x 3hs].
                 self.gemm(
-                    &mut enc,
+                    enc,
                     cin,
                     &self.normed_buf,
                     &self.proj_buf,
@@ -654,22 +653,14 @@ impl WgpuAudioDecoder {
                     "audio_detok_conv_params",
                 );
                 self.encode(
-                    &mut enc,
+                    enc,
                     &self.pipes.conv1d_fused_batch,
                     &[&self.proj_buf, rbuf, cw, &self.normed_buf, &cp],
                     (hs_u.div_ceil(256), 1, 1),
                     "audio_detok_conv1d",
                 );
                 // out_proj: normed → gate (op residual scratch) [n x hs].
-                self.gemm(
-                    &mut enc,
-                    cop,
-                    &self.normed_buf,
-                    &self.gate_buf,
-                    n,
-                    hs_u,
-                    hs_u,
-                );
+                self.gemm(enc, cop, &self.normed_buf, &self.gate_buf, n, hs_u, hs_u);
             } else {
                 let wq = lw.wq.as_ref().unwrap();
                 let wk = lw.wk.as_ref().unwrap();
@@ -681,33 +672,9 @@ impl WgpuAudioDecoder {
                 let v_cache = self.kv_v[il].as_ref().unwrap();
 
                 // Q → proj, K → gate, V → up.
-                self.gemm(
-                    &mut enc,
-                    wq,
-                    &self.normed_buf,
-                    &self.proj_buf,
-                    n,
-                    hs_u,
-                    q_dim,
-                );
-                self.gemm(
-                    &mut enc,
-                    wk,
-                    &self.normed_buf,
-                    &self.gate_buf,
-                    n,
-                    hs_u,
-                    kv_dim,
-                );
-                self.gemm(
-                    &mut enc,
-                    wv,
-                    &self.normed_buf,
-                    &self.up_buf,
-                    n,
-                    hs_u,
-                    kv_dim,
-                );
+                self.gemm(enc, wq, &self.normed_buf, &self.proj_buf, n, hs_u, q_dim);
+                self.gemm(enc, wk, &self.normed_buf, &self.gate_buf, n, hs_u, kv_dim);
+                self.gemm(enc, wv, &self.normed_buf, &self.up_buf, n, hs_u, kv_dim);
 
                 // Per-head QK-norm + NeoX RoPE on Q (proj) and K (gate).
                 let p = self.params(
@@ -729,7 +696,7 @@ impl WgpuAudioDecoder {
                 );
                 let tg = n * (n_head + n_kv);
                 self.encode(
-                    &mut enc,
+                    enc,
                     &self.pipes.qk_norm_rope_batch,
                     &[
                         &self.proj_buf,
@@ -779,7 +746,7 @@ impl WgpuAudioDecoder {
                         q_dim as u64 * 4,
                     );
                     self.encode(
-                        &mut enc,
+                        enc,
                         &self.pipes.flash_attention,
                         &[
                             &self.q_single,
@@ -801,20 +768,12 @@ impl WgpuAudioDecoder {
                 }
 
                 // out_proj: attn out (normed, stride q_dim) → gate (op residual).
-                self.gemm(
-                    &mut enc,
-                    wo,
-                    &self.normed_buf,
-                    &self.gate_buf,
-                    n,
-                    q_dim,
-                    hs_u,
-                );
+                self.gemm(enc, wo, &self.normed_buf, &self.gate_buf, n, q_dim, hs_u);
             }
 
             // FFN: fused (hidden += op residual) + ffn_norm → normed.
             self.add_rmsnorm_batch(
-                &mut enc,
+                enc,
                 &self.hidden_buf,
                 &self.normed_buf,
                 &lw.ffn_norm,
@@ -822,7 +781,7 @@ impl WgpuAudioDecoder {
                 n,
             );
             self.gemm(
-                &mut enc,
+                enc,
                 &lw.ffn_w1,
                 &self.normed_buf,
                 &self.gate_buf,
@@ -831,7 +790,7 @@ impl WgpuAudioDecoder {
                 ffn,
             );
             self.gemm(
-                &mut enc,
+                enc,
                 &lw.ffn_w3,
                 &self.normed_buf,
                 &self.up_buf,
@@ -839,32 +798,24 @@ impl WgpuAudioDecoder {
                 hs_u,
                 ffn,
             );
-            self.silu_mul(&mut enc, &self.gate_buf, &self.up_buf, n * ffn);
+            self.silu_mul(enc, &self.gate_buf, &self.up_buf, n * ffn);
             // down → up (next layer's residual scratch).
-            self.gemm(
-                &mut enc,
-                &lw.ffn_w2,
-                &self.gate_buf,
-                &self.up_buf,
-                n,
-                ffn,
-                hs_u,
-            );
+            self.gemm(enc, &lw.ffn_w2, &self.gate_buf, &self.up_buf, n, ffn, hs_u);
         }
 
         // Final residual add (last layer's FFN down lives in up_buf).
-        self.add_inplace(&mut enc, &self.hidden_buf, &self.up_buf, n * hs_u);
+        self.add_inplace(enc, &self.hidden_buf, &self.up_buf, n * hs_u);
 
         // Output norm + linear head + bias per frame.
         self.rmsnorm_batch(
-            &mut enc,
+            enc,
             &self.hidden_buf,
             &self.normed_buf,
             &self.output_norm,
             n,
         );
         self.gemm(
-            &mut enc,
+            enc,
             &self.lin_w,
             &self.normed_buf,
             &self.spectrum_buf,
@@ -877,18 +828,28 @@ impl WgpuAudioDecoder {
             "audio_detok_bias_params",
         );
         self.encode(
-            &mut enc,
+            enc,
             &self.pipes.bias_add,
             &[&self.spectrum_buf, &self.lin_b, &bias_params],
             (((N_FRAMES * spec_per_frame) as u32).div_ceil(256), 1, 1),
             "audio_detok_bias",
         );
 
-        self.ctx.submit_encoder(enc);
         self.n_past.store(n_past + N_FRAMES, Ordering::Relaxed);
+        (N_FRAMES, spec_per_frame)
+    }
 
+    pub fn detokenize_to_spectrum(
+        &self,
+        cpu_weights: &DetokenizerWeights,
+        codes: &[i32],
+    ) -> Vec<f32> {
+        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
+        let (n_frames, spec_per_frame) =
+            self.encode_detokenize_to_spectrum(&mut enc, cpu_weights, codes);
+        self.ctx.submit_encoder(enc);
         self.ctx
-            .download_f32(&self.spectrum_buf, N_FRAMES * spec_per_frame)
+            .download_f32(&self.spectrum_buf, n_frames * spec_per_frame)
     }
 
     pub async fn detokenize_to_spectrum_async(
@@ -896,293 +857,15 @@ impl WgpuAudioDecoder {
         cpu_weights: &DetokenizerWeights,
         codes: &[i32],
     ) -> Result<Vec<f32>> {
-        let hs = self.cfg.n_embd;
-        let hd = self.cfg.n_embd_head;
-        let n_kv = self.cfg.n_head_kv as u32;
-        let q_dim = (self.cfg.n_head * hd) as u32;
-        let kv_dim = n_kv * hd as u32;
-        let n = N_FRAMES as u32;
-        let hs_u = hs as u32;
-        let spec_per_frame = n_embd_bins(&self.cfg);
-
-        // 1. Embed + upsample on CPU, upload as the residual stream.
-        let tokens = {
-            use crate::model::audio_decoder::{detok_embed_codes, upsample};
-            let emb = detok_embed_codes(cpu_weights, codes);
-            upsample(&emb, hs, N_FRAMES)
-        };
-        self.ctx
-            .queue
-            .write_buffer(&self.hidden_buf, 0, bytemuck::cast_slice(&tokens));
-
-        let n_past = self.n_past.load(Ordering::Relaxed);
-        let scale = 1.0f32 / (hd as f32).sqrt();
-        let seq_len = (n_past + N_FRAMES).min(self.cfg.swa_window_size) as u32;
-
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-
-        for (il, lw) in self.layers.iter().enumerate() {
-            if il == 0 {
-                self.rmsnorm_batch(
-                    &mut enc,
-                    &self.hidden_buf,
-                    &self.normed_buf,
-                    &lw.operator_norm,
-                    n,
-                );
-            } else {
-                self.add_rmsnorm_batch(
-                    &mut enc,
-                    &self.hidden_buf,
-                    &self.normed_buf,
-                    &lw.operator_norm,
-                    &self.up_buf,
-                    n,
-                );
-            }
-
-            if self.cfg.layer_is_conv[il] {
-                let cin = lw.conv_in_proj.as_ref().unwrap();
-                let cop = lw.conv_out_proj.as_ref().unwrap();
-                let cw = lw.conv_weight.as_ref().unwrap();
-                let rbuf = self.conv_bufs[il].as_ref().unwrap();
-
-                self.gemm(
-                    &mut enc,
-                    cin,
-                    &self.normed_buf,
-                    &self.proj_buf,
-                    n,
-                    hs_u,
-                    3 * hs_u,
-                );
-                let cp = self.params(
-                    &[
-                        hs_u,
-                        (self.cfg.d_conv + 1) as u32,
-                        self.cfg.d_conv as u32,
-                        n,
-                    ],
-                    "audio_detok_conv_params",
-                );
-                self.encode(
-                    &mut enc,
-                    &self.pipes.conv1d_fused_batch,
-                    &[&self.proj_buf, rbuf, cw, &self.normed_buf, &cp],
-                    (hs_u.div_ceil(256), 1, 1),
-                    "audio_detok_conv",
-                );
-                self.gemm(
-                    &mut enc,
-                    cop,
-                    &self.normed_buf,
-                    &self.proj_buf,
-                    n,
-                    hs_u,
-                    hs_u,
-                );
-                self.add_inplace(&mut enc, &self.hidden_buf, &self.proj_buf, n * hs_u);
-            } else {
-                let wq = lw.wq.as_ref().unwrap();
-                let wk = lw.wk.as_ref().unwrap();
-                let wv = lw.wv.as_ref().unwrap();
-                let wo = lw.wo.as_ref().unwrap();
-                let q_norm = lw.q_norm.as_ref().unwrap();
-                let k_norm = lw.k_norm.as_ref().unwrap();
-
-                self.gemm(
-                    &mut enc,
-                    wq,
-                    &self.normed_buf,
-                    &self.proj_buf,
-                    n,
-                    hs_u,
-                    q_dim,
-                );
-                self.gemm(
-                    &mut enc,
-                    wk,
-                    &self.normed_buf,
-                    &self.gate_buf,
-                    n,
-                    hs_u,
-                    kv_dim,
-                );
-                self.gemm(
-                    &mut enc,
-                    wv,
-                    &self.normed_buf,
-                    &self.up_buf,
-                    n,
-                    hs_u,
-                    kv_dim,
-                );
-
-                let slot = (n_past % self.cfg.swa_window_size) as u32;
-                let qk_p = self.params(
-                    &[
-                        self.cfg.n_head as u32,
-                        self.cfg.n_head_kv as u32,
-                        hd as u32,
-                        self.cfg.rms_norm_eps.to_bits(),
-                        self.cfg.rope_freq_base.to_bits(),
-                        0,
-                        0,
-                        1,
-                        slot,
-                        n,
-                    ],
-                    "audio_detok_qk_rope_params",
-                );
-                self.encode(
-                    &mut enc,
-                    &self.pipes.qk_norm_rope_batch,
-                    &[
-                        &self.proj_buf,
-                        &self.gate_buf,
-                        q_norm,
-                        k_norm,
-                        &self.rope_freqs_dummy,
-                        &qk_p,
-                    ],
-                    (
-                        ((self.cfg.n_head + self.cfg.n_head_kv) * N_FRAMES) as u32,
-                        1,
-                        1,
-                    ),
-                    "audio_detok_qk_rope",
-                );
-
-                let k_cache = self.kv_k[il].as_ref().unwrap();
-                let v_cache = self.kv_v[il].as_ref().unwrap();
-                let cache_byte_off = (slot * kv_dim * 4) as u64;
-                let chunk_bytes = (N_FRAMES as u64) * (kv_dim as u64) * 4;
-                enc.copy_buffer_to_buffer(&self.gate_buf, 0, k_cache, cache_byte_off, chunk_bytes);
-                enc.copy_buffer_to_buffer(&self.up_buf, 0, v_cache, cache_byte_off, chunk_bytes);
-
-                let att_p = self.params(
-                    &[
-                        self.cfg.n_head as u32,
-                        self.cfg.n_head_kv as u32,
-                        hd as u32,
-                        kv_dim,
-                        seq_len,
-                        scale.to_bits(),
-                        slot,
-                        self.cfg.swa_window_size as u32,
-                    ],
-                    "audio_detok_attn_params",
-                );
-                for t in 0..N_FRAMES as u32 {
-                    let q_tok_off = (t * q_dim * 4) as u64;
-                    let out_tok_off = (t * q_dim * 4) as u64;
-                    enc.copy_buffer_to_buffer(
-                        &self.proj_buf,
-                        q_tok_off,
-                        &self.q_single,
-                        0,
-                        (q_dim * 4) as u64,
-                    );
-                    self.encode(
-                        &mut enc,
-                        &self.pipes.flash_attention,
-                        &[&self.q_single, k_cache, v_cache, &self.attn_single, &att_p],
-                        (self.cfg.n_head as u32, 1, 1),
-                        "audio_detok_flash_attn",
-                    );
-                    enc.copy_buffer_to_buffer(
-                        &self.attn_single,
-                        0,
-                        &self.normed_buf,
-                        out_tok_off,
-                        (q_dim * 4) as u64,
-                    );
-                }
-
-                self.gemm(
-                    &mut enc,
-                    wo,
-                    &self.normed_buf,
-                    &self.proj_buf,
-                    n,
-                    q_dim,
-                    hs_u,
-                );
-                self.add_inplace(&mut enc, &self.hidden_buf, &self.proj_buf, n * hs_u);
-            }
-
-            let ffn_dim = self.cfg.ffn_dim as u32;
-            self.rmsnorm_batch(
-                &mut enc,
-                &self.hidden_buf,
-                &self.normed_buf,
-                &lw.ffn_norm,
-                n,
-            );
-            self.gemm(
-                &mut enc,
-                &lw.ffn_w1,
-                &self.normed_buf,
-                &self.gate_buf,
-                n,
-                hs_u,
-                ffn_dim,
-            );
-            self.gemm(
-                &mut enc,
-                &lw.ffn_w3,
-                &self.normed_buf,
-                &self.up_buf,
-                n,
-                hs_u,
-                ffn_dim,
-            );
-            self.silu_mul(&mut enc, &self.gate_buf, &self.up_buf, n * ffn_dim);
-            self.gemm(
-                &mut enc,
-                &lw.ffn_w2,
-                &self.gate_buf,
-                &self.up_buf,
-                n,
-                ffn_dim,
-                hs_u,
-            );
-        }
-
-        self.add_rmsnorm_batch(
-            &mut enc,
-            &self.hidden_buf,
-            &self.normed_buf,
-            &self.output_norm,
-            &self.up_buf,
-            n,
-        );
-        self.gemm(
-            &mut enc,
-            &self.lin_w,
-            &self.normed_buf,
-            &self.spectrum_buf,
-            n,
-            hs_u,
-            spec_per_frame as u32,
-        );
-        let bias_params = self.params(
-            &[(N_FRAMES * spec_per_frame) as u32, spec_per_frame as u32],
-            "audio_detok_bias_params",
-        );
-        self.encode(
-            &mut enc,
-            &self.pipes.bias_add,
-            &[&self.spectrum_buf, &self.lin_b, &bias_params],
-            (((N_FRAMES * spec_per_frame) as u32).div_ceil(256), 1, 1),
-            "audio_detok_bias",
-        );
-
+        let (n_frames, spec_per_frame) =
+            self.encode_detokenize_to_spectrum(&mut enc, cpu_weights, codes);
         let pending = {
             self.ctx.submit_encoder(enc);
-            self.n_past.store(n_past + N_FRAMES, Ordering::Relaxed);
-            self.ctx
-                .begin_download(&self.spectrum_buf, (N_FRAMES * spec_per_frame * 4) as u64)
+            self.ctx.begin_download(
+                &self.spectrum_buf,
+                (n_frames * spec_per_frame * std::mem::size_of::<f32>()) as u64,
+            )
         };
         let bytes = pending.recv().await?;
         let result: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
@@ -1363,8 +1046,10 @@ impl WgpuAudioDecoder {
 
         let pending = {
             self.ctx.submit_encoder(enc);
-            self.ctx
-                .begin_download(&pcm_buf, (pcm_len * std::mem::size_of::<f32>()) as u64)
+            self.ctx.begin_download(
+                &pcm_buf,
+                ((n_frames * hop_length) * std::mem::size_of::<f32>()) as u64,
+            )
         };
         let bytes = pending.recv().await?;
         let mut pcm: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
