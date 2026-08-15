@@ -2127,8 +2127,14 @@ impl Session {
                             );
                             break;
                         }
-                        crate::audio_engine::FrameOutcome::Codes { audio_embedding } => {
+                        crate::audio_engine::FrameOutcome::Codes {
+                            audio_embedding,
+                            pcm,
+                        } => {
                             frame_count += 1;
+                            if !pcm.is_empty() {
+                                sink.on_audio_frames(&pcm, decoder.sample_rate());
+                            }
                             audio_embedding
                         }
                     };

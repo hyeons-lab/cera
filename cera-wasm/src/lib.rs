@@ -2856,8 +2856,19 @@ mod webgpu {
                                     ));
                                     break;
                                 }
-                                cera::audio_engine::FrameOutcome::Codes { audio_embedding } => {
+                                cera::audio_engine::FrameOutcome::Codes {
+                                    audio_embedding,
+                                    pcm,
+                                } => {
                                     frame_count += 1;
+                                    if !pcm.is_empty() {
+                                        if let Some(cb) = on_audio {
+                                            let array = js_sys::Float32Array::from(pcm.as_slice());
+                                            let rate_val =
+                                                JsValue::from_f64(dec.sample_rate() as f64);
+                                            let _ = cb.call2(&JsValue::null(), &array, &rate_val);
+                                        }
+                                    }
                                     audio_embedding
                                 }
                             };
@@ -2933,7 +2944,17 @@ mod webgpu {
                                 reached_end = true;
                                 break;
                             }
-                            cera::audio_engine::FrameOutcome::Codes { audio_embedding } => {
+                            cera::audio_engine::FrameOutcome::Codes {
+                                audio_embedding,
+                                pcm,
+                            } => {
+                                if !pcm.is_empty() {
+                                    if let Some(cb) = on_audio {
+                                        let array = js_sys::Float32Array::from(pcm.as_slice());
+                                        let rate_val = JsValue::from_f64(dec.sample_rate() as f64);
+                                        let _ = cb.call2(&JsValue::null(), &array, &rate_val);
+                                    }
+                                }
                                 audio_embedding
                             }
                         };

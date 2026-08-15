@@ -67,7 +67,11 @@ enum Modality {
 pub enum FrameOutcome {
     /// Codes sampled + detokenized; `audio_embedding` is the feedback
     /// embedding the caller should pass back through the main LLM.
-    Codes { audio_embedding: Vec<f32> },
+    /// `pcm` contains the progressive real-time audio chunk for this frame.
+    Codes {
+        audio_embedding: Vec<f32>,
+        pcm: Vec<f32>,
+    },
     /// Audio stream terminated (`codes[0] == AUDIO_END_CODE`). No
     /// spectrum produced for this frame; caller should return control
     /// to the text modality per its mode's exit convention.
@@ -83,11 +87,11 @@ pub struct AudioOutputDecoder<'a> {
     gpu: Option<&'a dyn AudioGpu>,
     df_state: DepthformerState,
     detok_state: DetokenizerState,
+    streamer: crate::model::audio_decoder::IstftStreamer,
     /// Accumulated spectrum across the entire generate_audio call.
-    /// Flushed by `finish()` via a single ISTFT pass — per-frame ISTFT
-    /// would produce discontinuities from fresh overlap buffers.
     all_spectrum: Vec<f32>,
     audio_frames: usize,
+    streamed_samples: usize,
     time_depthformer: Duration,
     time_detokenizer: Duration,
     audio_temperature: f32,
@@ -100,6 +104,11 @@ impl<'a> AudioOutputDecoder<'a> {
     /// Total audio frames decoded so far in this session.
     pub fn audio_frames(&self) -> usize {
         self.audio_frames
+    }
+
+    /// Sample rate of the vocoder in Hz (typically 24000).
+    pub fn sample_rate(&self) -> u32 {
+        self.detok_weights.config.sample_rate as u32
     }
 
     /// Total duration spent in depthformer frame sampling.
@@ -128,14 +137,20 @@ impl<'a> AudioOutputDecoder<'a> {
         }
         let df_state = DepthformerState::new(&weights.depthformer_config);
         let detok_state = DetokenizerState::new(&detok_weights.config);
+        let streamer = crate::model::audio_decoder::IstftStreamer::new(
+            detok_weights.config.n_fft,
+            detok_weights.config.hop_length,
+        );
         Self {
             weights,
             detok_weights,
             gpu,
             df_state,
             detok_state,
+            streamer,
             all_spectrum: Vec::new(),
             audio_frames: 0,
+            streamed_samples: 0,
             time_depthformer: Duration::ZERO,
             time_detokenizer: Duration::ZERO,
             audio_temperature,
@@ -186,8 +201,14 @@ impl<'a> AudioOutputDecoder<'a> {
         self.all_spectrum.extend_from_slice(&spectrum);
         self.audio_frames += 1;
 
+        let pcm = self.streamer.feed_frames(&spectrum);
+        self.streamed_samples += pcm.len();
+
         let audio_embedding = embed_audio_token(self.weights, &codes);
-        FrameOutcome::Codes { audio_embedding }
+        FrameOutcome::Codes {
+            audio_embedding,
+            pcm,
+        }
     }
 
     /// Async version of [`Self::decode_frame`] for WebGPU / browser wasm.
@@ -228,15 +249,23 @@ impl<'a> AudioOutputDecoder<'a> {
         self.all_spectrum.extend_from_slice(&spectrum);
         self.audio_frames += 1;
 
+        let pcm = self.streamer.feed_frames(&spectrum);
+        self.streamed_samples += pcm.len();
+
         let audio_embedding = embed_audio_token(self.weights, &codes);
-        Ok(FrameOutcome::Codes { audio_embedding })
+        Ok(FrameOutcome::Codes {
+            audio_embedding,
+            pcm,
+        })
     }
 
-    /// Drain the accumulated spectrum through a single ISTFT pass and
-    /// emit the resulting PCM via `sink`. Returns the PCM sample count.
-    /// A single end-of-generation ISTFT (rather than per-frame) avoids
-    /// discontinuities from fresh overlap buffers.
+    /// Drain any remaining audio through the ISTFT pass.
+    /// If streaming was already performed during decoding, returns the
+    /// accumulated streamed sample count.
     pub fn finish(&mut self, mut sink: impl FnMut(&[f32], u32)) -> usize {
+        if self.streamed_samples > 0 {
+            return self.streamed_samples;
+        }
         if self.all_spectrum.is_empty() {
             return 0;
         }
@@ -259,6 +288,9 @@ impl<'a> AudioOutputDecoder<'a> {
         &mut self,
         mut sink: impl FnMut(&[f32], u32),
     ) -> anyhow::Result<usize> {
+        if self.streamed_samples > 0 {
+            return Ok(self.streamed_samples);
+        }
         if self.all_spectrum.is_empty() {
             return Ok(0);
         }
@@ -401,7 +433,15 @@ pub fn generate_audio(
                             text_done = true;
                             break;
                         }
-                        FrameOutcome::Codes { audio_embedding } => audio_embedding,
+                        FrameOutcome::Codes {
+                            audio_embedding,
+                            pcm,
+                        } => {
+                            if !pcm.is_empty() {
+                                audio_callback(&pcm, decoder.sample_rate());
+                            }
+                            audio_embedding
+                        }
                     };
                     modality_budget = modality_budget.saturating_sub(1);
 
@@ -471,7 +511,15 @@ pub fn generate_audio(
                             break;
                         }
                     },
-                    FrameOutcome::Codes { audio_embedding } => audio_embedding,
+                    FrameOutcome::Codes {
+                        audio_embedding,
+                        pcm,
+                    } => {
+                        if !pcm.is_empty() {
+                            audio_callback(&pcm, decoder.sample_rate());
+                        }
+                        audio_embedding
+                    }
                 };
                 modality_budget = modality_budget.saturating_sub(1);
 

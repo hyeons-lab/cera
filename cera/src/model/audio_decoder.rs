@@ -1390,3 +1390,138 @@ fn ifft_frame(
         *o = c.re * inv_n;
     }
 }
+
+/// Stateful streaming inverse STFT (overlap-add) processor.
+///
+/// Maintains overlap-add state across streaming frame decodes so PCM audio can
+/// be streamed progressively with zero boundary discontinuities or fade artifacts.
+pub struct IstftStreamer {
+    n_fft: usize,
+    hop_length: usize,
+    n_fft_bins: usize,
+    frame_size: usize,
+    hann: Vec<f32>,
+    overlap_buf: Vec<f32>,
+    window_sum: Vec<f32>,
+    padding_remaining: usize,
+    fft_buf: Vec<rustfft::num_complex::Complex32>,
+    time_domain: Vec<f32>,
+    ifft: std::sync::Arc<dyn rustfft::Fft<f32>>,
+}
+
+impl IstftStreamer {
+    pub fn new(n_fft: usize, hop_length: usize) -> Self {
+        let mut planner = rustfft::FftPlanner::new();
+        let ifft = planner.plan_fft_inverse(n_fft);
+        let n_fft_bins = n_fft / 2 + 1;
+        let frame_size = n_fft_bins * 2;
+        let hann = build_hann(n_fft);
+        let padding = (n_fft - hop_length) / 2;
+        Self {
+            n_fft,
+            hop_length,
+            n_fft_bins,
+            frame_size,
+            hann,
+            overlap_buf: vec![0.0f32; n_fft],
+            window_sum: vec![0.0f32; n_fft],
+            padding_remaining: padding,
+            fft_buf: vec![rustfft::num_complex::Complex32::new(0.0, 0.0); n_fft],
+            time_domain: vec![0.0f32; n_fft],
+            ifft,
+        }
+    }
+
+    /// Feed spectrum floats for 1 or more frames and return newly decoded PCM samples.
+    pub fn feed_frames(&mut self, spectrum: &[f32]) -> Vec<f32> {
+        let n_frames = spectrum.len() / self.frame_size;
+        if n_frames == 0 {
+            return vec![];
+        }
+        let mut output = Vec::with_capacity(n_frames * self.hop_length);
+        for i in 0..n_frames {
+            for c in self.fft_buf.iter_mut() {
+                *c = rustfft::num_complex::Complex32::new(0.0, 0.0);
+            }
+            for j in 0..self.n_fft_bins {
+                let log_abs = spectrum[i * self.frame_size + j];
+                let angle = spectrum[i * self.frame_size + self.n_fft_bins + j];
+                let mag = log_abs.exp();
+                self.fft_buf[j] =
+                    rustfft::num_complex::Complex32::new(mag * angle.cos(), mag * angle.sin());
+            }
+            for j in 1..self.n_fft_bins - 1 {
+                self.fft_buf[self.n_fft - j] =
+                    rustfft::num_complex::Complex32::new(self.fft_buf[j].re, -self.fft_buf[j].im);
+            }
+
+            ifft_frame(
+                &mut self.fft_buf,
+                &mut self.time_domain,
+                self.n_fft,
+                self.ifft.as_ref(),
+            );
+
+            for j in 0..self.n_fft {
+                self.overlap_buf[j] += self.time_domain[j] * self.hann[j];
+                self.window_sum[j] += self.hann[j] * self.hann[j];
+            }
+
+            for k in 0..self.hop_length {
+                let sample = if self.window_sum[k] > 1e-8 {
+                    self.overlap_buf[k] / self.window_sum[k]
+                } else {
+                    self.overlap_buf[k]
+                };
+                if self.padding_remaining > 0 {
+                    self.padding_remaining -= 1;
+                } else {
+                    output.push(sample);
+                }
+            }
+
+            self.overlap_buf.copy_within(self.hop_length..self.n_fft, 0);
+            self.overlap_buf[self.n_fft - self.hop_length..].fill(0.0);
+            self.window_sum.copy_within(self.hop_length..self.n_fft, 0);
+            self.window_sum[self.n_fft - self.hop_length..].fill(0.0);
+        }
+        output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_istft_streamer_exact_parity_with_batch() {
+        let n_fft = 1280;
+        let hop_length = 320;
+        let n_fft_bins = n_fft / 2 + 1;
+        let frame_size = n_fft_bins * 2;
+        let n_frames = 18; // 3 tokens * 6 frames
+
+        let mut spectrum = vec![0.0f32; n_frames * frame_size];
+        for i in 0..spectrum.len() {
+            spectrum[i] = ((i as f32) * 0.01).sin();
+        }
+
+        let batch_pcm = istft_to_pcm(&spectrum, n_fft, hop_length);
+
+        let mut streamer = IstftStreamer::new(n_fft, hop_length);
+        let mut streamed_pcm = Vec::new();
+        // Feed in 6-frame chunks (matching 1 token at a time)
+        for chunk in spectrum.chunks(6 * frame_size) {
+            let pcm_chunk = streamer.feed_frames(chunk);
+            streamed_pcm.extend_from_slice(&pcm_chunk);
+        }
+
+        assert_eq!(batch_pcm.len(), streamed_pcm.len());
+        for (idx, (&b, &s)) in batch_pcm.iter().zip(streamed_pcm.iter()).enumerate() {
+            assert!(
+                (b - s).abs() < 1e-6,
+                "Sample mismatch at {idx}: batch={b}, stream={s}"
+            );
+        }
+    }
+}
