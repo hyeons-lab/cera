@@ -1977,16 +1977,25 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     let mut sum1 = 0.0f32;
     let mut sum2 = 0.0f32;
     let mut sum3 = 0.0f32;
-    let chunks = a.len() / 4;
+    let mut sum4 = 0.0f32;
+    let mut sum5 = 0.0f32;
+    let mut sum6 = 0.0f32;
+    let mut sum7 = 0.0f32;
+
+    let chunks = a.len() / 8;
     for i in 0..chunks {
-        let base = i * 4;
+        let base = i * 8;
         sum0 += a[base] * b[base];
         sum1 += a[base + 1] * b[base + 1];
         sum2 += a[base + 2] * b[base + 2];
         sum3 += a[base + 3] * b[base + 3];
+        sum4 += a[base + 4] * b[base + 4];
+        sum5 += a[base + 5] * b[base + 5];
+        sum6 += a[base + 6] * b[base + 6];
+        sum7 += a[base + 7] * b[base + 7];
     }
-    let mut sum = (sum0 + sum1) + (sum2 + sum3);
-    for i in (chunks * 4)..a.len() {
+    let mut sum = ((sum0 + sum1) + (sum2 + sum3)) + ((sum4 + sum5) + (sum6 + sum7));
+    for i in (chunks * 8)..a.len() {
         sum += a[i] * b[i];
     }
     sum

@@ -235,13 +235,26 @@ impl MmapWeight {
         );
     }
 
+    pub fn batched_matmul(&self, x: &[f32], y: &mut [f32], n_tokens: usize) {
+        self.batched_matmul_with_scratch(x, y, n_tokens, None);
+    }
+
     /// Batched linear projection: `y[tokens, rows] = x[tokens, cols] · selfᵀ`
     /// where `self` is `[rows × cols]`.
     ///
     /// By inverting the loop order (iterating over weight rows in the outer loop
     /// and token rows in the inner loop), each quantized weight row is dequantized
     /// and loaded into CPU cache **once** rather than `n_tokens` times.
-    pub fn batched_matmul(&self, x: &[f32], y: &mut [f32], n_tokens: usize) {
+    ///
+    /// If `scratch` is provided and has `scratch.len() >= self.cols`, it is used
+    /// directly to avoid allocating on the heap.
+    pub fn batched_matmul_with_scratch(
+        &self,
+        x: &[f32],
+        y: &mut [f32],
+        n_tokens: usize,
+        mut scratch: Option<&mut [f32]>,
+    ) {
         assert_eq!(x.len(), n_tokens * self.cols);
         assert_eq!(y.len(), n_tokens * self.rows);
         if n_tokens == 0 || self.rows == 0 || self.cols == 0 {
@@ -262,12 +275,20 @@ impl MmapWeight {
         }
 
         // Quantized path: dequantize each row into scratch ONCE
-        let mut row_buf = vec![0.0f32; self.cols];
+        let mut local_buf;
+        let row_buf: &mut [f32] = match scratch.as_mut() {
+            Some(buf) if buf.len() >= self.cols => &mut buf[..self.cols],
+            _ => {
+                local_buf = vec![0.0f32; self.cols];
+                &mut local_buf[..]
+            }
+        };
+
         for r in 0..self.rows {
-            self.dequantize_row(r, &mut row_buf);
+            self.dequantize_row(r, row_buf);
             for t in 0..n_tokens {
                 let x_row = &x[t * self.cols..(t + 1) * self.cols];
-                y[t * self.rows + r] = crate::backend::cpu::dot_f32(x_row, &row_buf);
+                y[t * self.rows + r] = crate::backend::cpu::dot_f32(x_row, row_buf);
             }
         }
     }

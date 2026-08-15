@@ -554,9 +554,9 @@ const OPS = {
             uncommittedTokens.push(toks[i]);
           }
           const decoded = tk.decode(Uint32Array.from(uncommittedTokens));
-          if (decoded.endsWith('\uFFFD')) {
+          if (decoded.endsWith('\uFFFD') && uncommittedTokens.length < 4) {
             // Incomplete multibyte UTF-8 character spanning across token chunks;
-            // hold back until the completing token arrives.
+            // hold back until the completing token arrives (max 4 bytes).
             return;
           }
           if (decoded.length > 0) {

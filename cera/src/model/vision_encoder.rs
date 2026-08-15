@@ -601,16 +601,25 @@ impl VisionEncoderWeights {
             crate::backend::cpu::layer_norm_inplace(row, &block.ln1_w, &block.ln1_b, cfg.eps);
         }
 
-        // Q/K/V projections batched across all tokens: weight rows dequantized once
-        block
-            .q_w
-            .batched_matmul(&scratch.pre_norm, &mut scratch.q, n_tokens);
-        block
-            .k_w
-            .batched_matmul(&scratch.pre_norm, &mut scratch.k, n_tokens);
-        block
-            .v_w
-            .batched_matmul(&scratch.pre_norm, &mut scratch.v, n_tokens);
+        // Q/K/V projections batched across all tokens: weight rows dequantized once into reusable scratch
+        block.q_w.batched_matmul_with_scratch(
+            &scratch.pre_norm,
+            &mut scratch.q,
+            n_tokens,
+            Some(&mut scratch.dequant_scratch),
+        );
+        block.k_w.batched_matmul_with_scratch(
+            &scratch.pre_norm,
+            &mut scratch.k,
+            n_tokens,
+            Some(&mut scratch.dequant_scratch),
+        );
+        block.v_w.batched_matmul_with_scratch(
+            &scratch.pre_norm,
+            &mut scratch.v,
+            n_tokens,
+            Some(&mut scratch.dequant_scratch),
+        );
 
         for t in 0..n_tokens {
             let q_row = &mut scratch.q[t * n_embd..(t + 1) * n_embd];
@@ -663,9 +672,12 @@ impl VisionEncoderWeights {
         }
 
         // Output projection + bias + residual add.
-        block
-            .o_w
-            .batched_matmul(&scratch.attn_out, &mut scratch.attn_proj, n_tokens);
+        block.o_w.batched_matmul_with_scratch(
+            &scratch.attn_out,
+            &mut scratch.attn_proj,
+            n_tokens,
+            Some(&mut scratch.dequant_scratch),
+        );
         for t in 0..n_tokens {
             let proj_row = &mut scratch.attn_proj[t * n_embd..(t + 1) * n_embd];
             for (o, b) in proj_row.iter_mut().zip(block.o_b.iter()) {
@@ -685,9 +697,12 @@ impl VisionEncoderWeights {
             crate::backend::cpu::layer_norm_inplace(row, &block.ln2_w, &block.ln2_b, cfg.eps);
         }
         let n_ff = cfg.n_ff;
-        block
-            .ffn_up_w
-            .batched_matmul(&scratch.pre_norm, &mut scratch.ffn_mid, n_tokens);
+        block.ffn_up_w.batched_matmul_with_scratch(
+            &scratch.pre_norm,
+            &mut scratch.ffn_mid,
+            n_tokens,
+            Some(&mut scratch.dequant_scratch),
+        );
         for t in 0..n_tokens {
             let ff_row = &mut scratch.ffn_mid[t * n_ff..(t + 1) * n_ff];
             for (f, b) in ff_row.iter_mut().zip(block.ffn_up_b.iter()) {
@@ -696,9 +711,12 @@ impl VisionEncoderWeights {
             crate::backend::cpu::gelu_inplace(ff_row);
         }
 
-        block
-            .ffn_down_w
-            .batched_matmul(&scratch.ffn_mid, &mut scratch.ffn_out, n_tokens);
+        block.ffn_down_w.batched_matmul_with_scratch(
+            &scratch.ffn_mid,
+            &mut scratch.ffn_out,
+            n_tokens,
+            Some(&mut scratch.dequant_scratch),
+        );
         for t in 0..n_tokens {
             let down_row = &mut scratch.ffn_out[t * n_embd..(t + 1) * n_embd];
             for (d, b) in down_row.iter_mut().zip(block.ffn_down_b.iter()) {
@@ -763,12 +781,16 @@ struct VitScratch {
     attn_proj: Vec<f32>,
     ffn_mid: Vec<f32>,
     ffn_out: Vec<f32>,
+    /// Reusable row dequantization buffer sized to `max(n_embd, n_ff)`
+    /// to avoid per-matmul heap allocations across all blocks.
+    dequant_scratch: Vec<f32>,
 }
 
 impl VitScratch {
     fn new(cfg: &VisionEncoderConfig, n_tokens: usize) -> Self {
         let n_pe = n_tokens * cfg.n_embd;
         let n_pf = n_tokens * cfg.n_ff;
+        let max_dim = cfg.n_embd.max(cfg.n_ff);
         Self {
             pre_norm: vec![0.0; n_pe],
             q: vec![0.0; n_pe],
@@ -779,6 +801,7 @@ impl VitScratch {
             attn_proj: vec![0.0; n_pe],
             ffn_mid: vec![0.0; n_pf],
             ffn_out: vec![0.0; n_pe],
+            dequant_scratch: vec![0.0; max_dim],
         }
     }
 }
