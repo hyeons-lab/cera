@@ -2796,14 +2796,10 @@ mod webgpu {
             };
             pos += 1;
 
-            let gpu_ref: Option<&dyn cera::model::audio_decoder::AudioGpu> = self
-                .gpu_audio_decoder
-                .as_deref()
-                .map(|d| d as &dyn cera::model::audio_decoder::AudioGpu);
             let mut decoder =
                 if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
                     Some(cera::audio_engine::AudioOutputDecoder::new(
-                        dec, detok, gpu_ref, 0.0, 1, false,
+                        dec, detok, None, 0.0, 1, false,
                     ))
                 } else {
                     None
