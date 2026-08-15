@@ -3169,15 +3169,6 @@ fn main() -> Result<()> {
             opts.max_tokens = max_tokens as u32;
             if let Some(t) = temperature {
                 opts.temperature = t;
-            } else if matches!(
-                engine.manifest().generation_defaults,
-                cera::manifest::GenerationDefaults::Text {
-                    temperature: None,
-                    ..
-                } | cera::manifest::GenerationDefaults::Other { .. }
-                    | cera::manifest::GenerationDefaults::Audio { .. }
-            ) {
-                opts.temperature = 0.0;
             }
             if let Some(p) = top_p {
                 opts.top_p = p;

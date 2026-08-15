@@ -1823,7 +1823,7 @@ impl Session {
     }
 
     /// Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
-    /// (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+    /// (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
     pub fn hidden_states_for_text(&self, text: String) -> Result<Vec<u8>, FfiError> {
         let hs = self.lock_inner()?.hidden_states_for_text(&text)?;
         Ok(f32_vec_to_le_bytes(&hs))

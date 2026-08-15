@@ -2726,7 +2726,7 @@ public protocol SessionProtocol: AnyObject, Sendable {
     
     /**
      * Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
-     * (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+     * (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
      */
     func hiddenStatesForText(text: String) throws  -> Data
     
@@ -3252,7 +3252,7 @@ open func hiddenSize() -> UInt32  {
     
     /**
      * Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
-     * (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+     * (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
      */
 open func hiddenStatesForText(text: String)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -5788,7 +5788,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_hidden_size() != 46607) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 54184) {
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 17860) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100) {

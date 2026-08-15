@@ -1016,9 +1016,7 @@ impl Session {
         debug_assert_eq!(t * d, flat.len(), "hidden states not a multiple of D");
         let mut pooled = vec![0.0f32; d];
         for row in flat.chunks_exact(d) {
-            for (p, &x) in pooled.iter_mut().zip(row) {
-                *p += x;
-            }
+            crate::backend::cpu::add_inplace(&mut pooled, row);
         }
         if t > 0 {
             let inv = 1.0 / t as f32;

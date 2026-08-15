@@ -160,7 +160,7 @@ class ChatController extends ValueNotifier<ChatState> {
     );
 
     await _load(
-      bundleSource: bundleSource,
+      modelSource: bundleSource,
       openFn: (onProgress) async => Cera.openBundle(
         intent.bundleName,
         intent.quant,
@@ -177,7 +177,7 @@ class ChatController extends ValueNotifier<ChatState> {
 
   Future<void> _onLoadLocalModel(LoadLocalModelIntent intent) async {
     await _load(
-      bundleSource: intent.source,
+      modelSource: intent.source,
       openFn: (_) => intent.source.open(),
       label: intent.source.name,
       isBundle: false,
@@ -185,7 +185,7 @@ class ChatController extends ValueNotifier<ChatState> {
   }
 
   Future<void> _load({
-    required LoadedModel bundleSource,
+    required LoadedModel modelSource,
     required Future<Cera> Function(void Function(CeraDownload) onProgress)
     openFn,
     required String label,
@@ -228,10 +228,10 @@ class ChatController extends ValueNotifier<ChatState> {
       final visionTag = cera.capabilities.imageIn ? ' · Vision' : '';
 
       value = value.copyWith(
-        loadedModel: () => bundleSource,
+        loadedModel: () => modelSource,
         capabilities: () => cera.capabilities,
         backend: () => cera.backend,
-        status: '${bundleSource.name} · ${cera.backend}$visionTag',
+        status: '${modelSource.name} · ${cera.backend}$visionTag',
         isLoading: false,
         downloadFraction: () => null,
       );
@@ -614,11 +614,15 @@ class ChatController extends ValueNotifier<ChatState> {
           if (_disposed) return;
           value = value.copyWith(
             loadedModel: () => null,
+            backend: () => null,
+            capabilities: () => null,
             status: 'Failed to reload model: $err',
           );
         }
       }
-    } catch (_) {}
+    } catch (err) {
+      debugPrint('[cera:chat] Engine reset failed: $err');
+    }
     if (!_disposed) {
       value = value.copyWith(turns: []);
     }

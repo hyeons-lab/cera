@@ -7,6 +7,7 @@ applies repository guidelines from AGENTS.md / GEMINI.md, and posts or updates
 a structured review comment on the PR.
 """
 
+import datetime
 import json
 import os
 import subprocess
@@ -138,9 +139,6 @@ def call_gemini_api(api_key: str, prompt: str) -> str:
         print(f"Gemini API model '{model}' request failed: {e}", file=sys.stderr)
 
     return ""
-
-
-import datetime
 
 
 def post_comment(

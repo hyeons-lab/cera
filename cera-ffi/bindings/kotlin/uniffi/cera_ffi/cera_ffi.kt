@@ -1791,7 +1791,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_size() != 46607) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 54184) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 17860) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100) {
@@ -5268,7 +5268,7 @@ public interface SessionInterface {
 
     /**
      * Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
-     * (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+     * (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
      */
     fun `hiddenStatesForText`(`text`: kotlin.String): kotlin.ByteArray
 
@@ -5911,7 +5911,7 @@ open class Session :
 
     /**
      * Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
-     * (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+     * (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
      */
     @Throws(FfiException::class)
     override fun `hiddenStatesForText`(`text`: kotlin.String): kotlin.ByteArray =

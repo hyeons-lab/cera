@@ -2995,7 +2995,7 @@ final class Session {
   int hiddenSize() => _unsupportedOnWeb('Session.hiddenSize');
 
   /// Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
-  /// (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+  /// (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
   Uint8List hiddenStatesForText(String text) => _unsupportedOnWeb('Session.hiddenStatesForText');
 
   /// Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp

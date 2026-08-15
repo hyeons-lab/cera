@@ -625,15 +625,9 @@ impl VisionEncoderWeights {
             let q_row = &mut scratch.q[t * n_embd..(t + 1) * n_embd];
             let k_row = &mut scratch.k[t * n_embd..(t + 1) * n_embd];
             let v_row = &mut scratch.v[t * n_embd..(t + 1) * n_embd];
-            for (q, b) in q_row.iter_mut().zip(block.q_b.iter()) {
-                *q += *b;
-            }
-            for (k, b) in k_row.iter_mut().zip(block.k_b.iter()) {
-                *k += *b;
-            }
-            for (v, b) in v_row.iter_mut().zip(block.v_b.iter()) {
-                *v += *b;
-            }
+            crate::backend::cpu::add_inplace(q_row, &block.q_b);
+            crate::backend::cpu::add_inplace(k_row, &block.k_b);
+            crate::backend::cpu::add_inplace(v_row, &block.v_b);
         }
 
         // Multi-head scaled dot-product attention.
@@ -680,14 +674,10 @@ impl VisionEncoderWeights {
         );
         for t in 0..n_tokens {
             let proj_row = &mut scratch.attn_proj[t * n_embd..(t + 1) * n_embd];
-            for (o, b) in proj_row.iter_mut().zip(block.o_b.iter()) {
-                *o += *b;
-            }
+            crate::backend::cpu::add_inplace(proj_row, &block.o_b);
             // Residual: tokens += proj.
             let tok_row = &mut tokens[t * n_embd..(t + 1) * n_embd];
-            for (tk, p) in tok_row.iter_mut().zip(proj_row.iter()) {
-                *tk += *p;
-            }
+            crate::backend::cpu::add_inplace(tok_row, proj_row);
         }
 
         // ── MLP ──
@@ -705,9 +695,7 @@ impl VisionEncoderWeights {
         );
         for t in 0..n_tokens {
             let ff_row = &mut scratch.ffn_mid[t * n_ff..(t + 1) * n_ff];
-            for (f, b) in ff_row.iter_mut().zip(block.ffn_up_b.iter()) {
-                *f += *b;
-            }
+            crate::backend::cpu::add_inplace(ff_row, &block.ffn_up_b);
             crate::backend::cpu::gelu_inplace(ff_row);
         }
 
@@ -719,14 +707,10 @@ impl VisionEncoderWeights {
         );
         for t in 0..n_tokens {
             let down_row = &mut scratch.ffn_out[t * n_embd..(t + 1) * n_embd];
-            for (d, b) in down_row.iter_mut().zip(block.ffn_down_b.iter()) {
-                *d += *b;
-            }
+            crate::backend::cpu::add_inplace(down_row, &block.ffn_down_b);
             // Residual.
             let tok_row = &mut tokens[t * n_embd..(t + 1) * n_embd];
-            for (tk, d) in tok_row.iter_mut().zip(down_row.iter()) {
-                *tk += *d;
-            }
+            crate::backend::cpu::add_inplace(tok_row, down_row);
         }
     }
 
@@ -738,6 +722,9 @@ impl VisionEncoderWeights {
         let in_dim = p.mm1_w.cols;
         let mid_dim = p.mm1_w.rows; // intermediate (e.g., 2048)
         let out_dim = cfg.projection_dim;
+        if in_dim == 0 || pooled.is_empty() {
+            return Vec::new();
+        }
         let n_tokens = pooled.len() / in_dim;
 
         let mut mid = vec![0f32; n_tokens * mid_dim];
@@ -746,18 +733,14 @@ impl VisionEncoderWeights {
         p.mm1_w.batched_matmul(pooled, &mut mid, n_tokens);
         for t in 0..n_tokens {
             let mid_row = &mut mid[t * mid_dim..(t + 1) * mid_dim];
-            for (m, b) in mid_row.iter_mut().zip(p.mm1_b.iter()) {
-                *m += *b;
-            }
+            crate::backend::cpu::add_inplace(mid_row, &p.mm1_b);
             crate::backend::cpu::gelu_inplace(mid_row);
         }
 
         p.mm2_w.batched_matmul(&mid, &mut out, n_tokens);
         for t in 0..n_tokens {
             let out_row = &mut out[t * out_dim..(t + 1) * out_dim];
-            for (o, b) in out_row.iter_mut().zip(p.mm2_b.iter()) {
-                *o += *b;
-            }
+            crate::backend::cpu::add_inplace(out_row, &p.mm2_b);
         }
         out
     }

@@ -186,7 +186,7 @@ impl MmapWeight {
     /// fall-through to `dequantize_row` is preferable to a panic.
     pub fn try_as_f32(&self) -> Option<&[f32]> {
         if self.dtype == DType::F32 {
-            Some(bytemuck::cast_slice(self.data()))
+            bytemuck::try_cast_slice(self.data()).ok()
         } else {
             None
         }
@@ -253,7 +253,7 @@ impl MmapWeight {
         x: &[f32],
         y: &mut [f32],
         n_tokens: usize,
-        mut scratch: Option<&mut [f32]>,
+        scratch: Option<&mut [f32]>,
     ) {
         assert_eq!(x.len(), n_tokens * self.cols);
         assert_eq!(y.len(), n_tokens * self.rows);
@@ -277,7 +277,7 @@ impl MmapWeight {
 
         // Quantized path: dequantize each row into scratch ONCE
         let mut local_buf;
-        let row_buf: &mut [f32] = match scratch.as_mut() {
+        let row_buf: &mut [f32] = match scratch {
             Some(buf) if buf.len() >= self.cols => &mut buf[..self.cols],
             _ => {
                 local_buf = vec![0.0f32; self.cols];

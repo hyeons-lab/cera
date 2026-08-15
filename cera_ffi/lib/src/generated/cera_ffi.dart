@@ -3714,8 +3714,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_hidden_states_for_text`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text != 54184) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_text`: expected 54184, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text != 17860) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_text`: expected 17860, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens;
     try {
@@ -12234,7 +12234,7 @@ final class Session {
   }
 
   /// Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
-  /// (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+  /// (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
   Uint8List hiddenStatesForText(String text) {
     _ensureOpen();
     return _ffi.sessionInvokeHiddenStatesForText(_handle, text);
