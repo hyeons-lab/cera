@@ -66,8 +66,6 @@ class ChatController extends ValueNotifier<ChatState> {
         _onClearAttachedImage();
       case ClearTranscriptIntent():
         await _onClearTranscript();
-      case RemoveDownloadedModelIntent():
-        await _onRemoveDownloadedModel(intent.record);
     }
   }
 
@@ -292,18 +290,6 @@ class ChatController extends ValueNotifier<ChatState> {
         await prefs.setStringList('cera_downloaded_models', list);
         await _loadDownloadedRecords();
       }
-    } catch (_) {}
-  }
-
-  Future<void> _onRemoveDownloadedModel(DownloadedModelRecord record) async {
-    final updated = value.downloadedModels
-        .where((r) => r.id != record.id)
-        .toList();
-    value = value.copyWith(downloadedModels: updated);
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final list = updated.map((r) => jsonEncode(r.toJson())).toList();
-      await prefs.setStringList('cera_downloaded_models', list);
     } catch (_) {}
   }
 

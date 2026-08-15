@@ -1,6 +1,5 @@
 import 'dart:typed_data';
 
-import 'chat_state.dart';
 import 'model_source.dart';
 
 /// Sealed hierarchy of all user and system intents processed by [ChatController].
@@ -78,10 +77,4 @@ class ClearAttachedImageIntent extends ChatIntent {
 /// Intent to clear the conversation transcript.
 class ClearTranscriptIntent extends ChatIntent {
   const ClearTranscriptIntent();
-}
-
-/// Intent to remove a model from the downloaded records list.
-class RemoveDownloadedModelIntent extends ChatIntent {
-  const RemoveDownloadedModelIntent(this.record);
-  final DownloadedModelRecord record;
 }

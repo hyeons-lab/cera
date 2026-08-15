@@ -230,6 +230,10 @@ function openCpu(bytes, contextSize, mmproj, inferenceType) {
   // `fromGgufBytes`), so both paths resolve the inference type through one
   // constructor instead of two that have to agree.
   const engine = wasm.CeraEngine.fromGgufParts(bytes, mmproj, contextSize, inferenceType);
+  initCpuSession(engine);
+}
+
+function initCpuSession(engine) {
   const config = new wasm.SessionConfig();
   try {
     const session = engine.newSession(config);
@@ -256,14 +260,7 @@ async function openCpuBundle(repo, bundleId, quant, contextSize, onProgress) {
     contextSize,
     onProgress,
   );
-  const config = new wasm.SessionConfig();
-  try {
-    const session = engine.newSession(config);
-    cpu = { engine, session, tokenizer: engine.tokenizer };
-  } finally {
-    config.free();
-  }
-  backendLabel = 'wasm cpu';
+  initCpuSession(engine);
 }
 
 /**
