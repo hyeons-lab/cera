@@ -1137,14 +1137,7 @@ impl WgpuAudioDecoder {
                 hs_u,
                 ffn_dim,
             );
-            let sp = self.params(&[n * ffn_dim], "audio_detok_silu_params");
-            self.encode(
-                &mut enc,
-                &self.pipes.silu_mul,
-                &[&self.gate_buf, &self.up_buf, &sp],
-                (((n * ffn_dim) as u32).div_ceil(256), 1, 1),
-                "audio_detok_silu_mul",
-            );
+            self.silu_mul(&mut enc, &self.gate_buf, &self.up_buf, n * ffn_dim);
             self.gemm(
                 &mut enc,
                 &lw.ffn_w2,
