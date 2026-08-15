@@ -72,6 +72,28 @@ class DownloadedModelRecord {
       );
 }
 
+/// Settings state for engine inference and vision/audio preprocessing.
+class ChatSettings {
+  const ChatSettings({this.turboQuant = false, this.maxImageLongSize = 256});
+
+  /// Whether TurboQuant KV-cache compression is enabled.
+  /// Defaults to false (cera default).
+  final bool turboQuant;
+
+  /// Maximum long side resolution for image inputs to the vision encoder.
+  /// null means use model's native resolution limit. Defaults to 256 for fast inference.
+  final int? maxImageLongSize;
+
+  ChatSettings copyWith({bool? turboQuant, int? Function()? maxImageLongSize}) {
+    return ChatSettings(
+      turboQuant: turboQuant ?? this.turboQuant,
+      maxImageLongSize: maxImageLongSize != null
+          ? maxImageLongSize()
+          : this.maxImageLongSize,
+    );
+  }
+}
+
 /// Immutable MVI State representing the entire Chat UI and engine state.
 class ChatState {
   const ChatState({
@@ -86,6 +108,7 @@ class ChatState {
     this.capabilities,
     this.backend,
     this.downloadedModels = const [],
+    this.settings = const ChatSettings(),
   });
 
   final LoadedModel? loadedModel;
@@ -99,6 +122,7 @@ class ChatState {
   final CeraCapabilities? capabilities;
   final String? backend;
   final List<DownloadedModelRecord> downloadedModels;
+  final ChatSettings settings;
 
   bool get hasModel => loadedModel != null;
   bool get isBusy => isLoading || isGenerating;
@@ -119,6 +143,7 @@ class ChatState {
     CeraCapabilities? Function()? capabilities,
     String? Function()? backend,
     List<DownloadedModelRecord>? downloadedModels,
+    ChatSettings? settings,
   }) {
     return ChatState(
       loadedModel: loadedModel != null ? loadedModel() : this.loadedModel,
@@ -138,6 +163,7 @@ class ChatState {
       capabilities: capabilities != null ? capabilities() : this.capabilities,
       backend: backend != null ? backend() : this.backend,
       downloadedModels: downloadedModels ?? this.downloadedModels,
+      settings: settings ?? this.settings,
     );
   }
 }

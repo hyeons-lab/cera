@@ -66,6 +66,8 @@ class ChatController extends ValueNotifier<ChatState> {
         _onClearAttachedImage();
       case ClearTranscriptIntent():
         await _onClearTranscript();
+      case UpdateSettingsIntent():
+        await _onUpdateSettings(intent);
     }
   }
 
@@ -113,6 +115,14 @@ class ChatController extends ValueNotifier<ChatState> {
       final prefs = await SharedPreferences.getInstance();
       if (_disposed || value.isLoading || _ceraEngine != null) return;
 
+      final turboQuant = prefs.getBool('cera_turboquant') ?? false;
+      final maxImageDim = prefs.getInt('cera_max_image_dim') ?? 256;
+      final restoredSettings = ChatSettings(
+        turboQuant: turboQuant,
+        maxImageLongSize: maxImageDim == 0 ? null : maxImageDim,
+      );
+      value = value.copyWith(settings: restoredSettings);
+
       final bundleName = prefs.getString('cera_last_bundle_name');
       final quant = prefs.getString('cera_last_bundle_quant');
       if (bundleName != null && quant != null) {
@@ -131,6 +141,7 @@ class ChatController extends ValueNotifier<ChatState> {
             bundleName,
             quant,
             storeDir: await _defaultStoreDir(),
+            options: CeraOptions(turboQuant: restoredSettings.turboQuant),
             onProgress: onProgress,
           ),
           label: '$displayName · $quant',
@@ -150,6 +161,51 @@ class ChatController extends ValueNotifier<ChatState> {
     }
   }
 
+  Future<void> _onUpdateSettings(UpdateSettingsIntent intent) async {
+    final current = value.settings;
+    final newTurbo = intent.turboQuant ?? current.turboQuant;
+    final newMaxImage = intent.clearMaxImageLongSize
+        ? null
+        : (intent.maxImageLongSize ?? current.maxImageLongSize);
+
+    final updated = current.copyWith(
+      turboQuant: newTurbo,
+      maxImageLongSize: () => newMaxImage,
+    );
+
+    value = value.copyWith(settings: updated);
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('cera_turboquant', newTurbo);
+      if (newMaxImage != null) {
+        await prefs.setInt('cera_max_image_dim', newMaxImage);
+      } else {
+        await prefs.setInt('cera_max_image_dim', 0);
+      }
+    } catch (err) {
+      debugPrint('cera: error persisting settings: $err');
+    }
+
+    // If TurboQuant changed and a bundle model is currently loaded and idle, reload it.
+    if (intent.turboQuant != null &&
+        intent.turboQuant != current.turboQuant &&
+        value.loadedModel != null &&
+        !value.isBusy) {
+      final model = value.loadedModel;
+      if (model is BundleModelSource) {
+        dispatch(
+          LoadBundleIntent(
+            bundleName: model.bundleName,
+            quant: model.quant,
+            displayName: model.name,
+            storeDir: _defaultStoreDir,
+          ),
+        );
+      }
+    }
+  }
+
   Future<void> _onLoadBundle(LoadBundleIntent intent) async {
     final label = '${intent.displayName} · ${intent.quant}';
     final bundleSource = BundleModelSource(
@@ -165,6 +221,7 @@ class ChatController extends ValueNotifier<ChatState> {
         intent.bundleName,
         intent.quant,
         storeDir: await intent.storeDir(),
+        options: CeraOptions(turboQuant: value.settings.turboQuant),
         onProgress: onProgress,
       ),
       label: label,
@@ -353,10 +410,11 @@ class ChatController extends ValueNotifier<ChatState> {
       try {
         assistantTurn.statusText = 'Encoding image patches...';
         notifyListeners();
+        final maxLong = value.settings.maxImageLongSize;
         debugPrint(
-          '[cera:chat] Encoding image patches with maxLongSize 256...',
+          '[cera:chat] Encoding image patches with maxLongSize ${maxLong ?? "native"}...',
         );
-        await cera.appendImage(imageBytes, maxLongSize: 256);
+        await cera.appendImage(imageBytes, maxLongSize: maxLong);
         debugPrint(
           '[cera:chat] Image successfully encoded and seeded into KV cache',
         );
@@ -395,7 +453,7 @@ class ChatController extends ValueNotifier<ChatState> {
       role: 'user',
       text: promptText.isNotEmpty
           ? promptText
-          : '🎙️ Audio (${durationSec.toStringAsFixed(1)}s)',
+          : 'Voice note (${durationSec.toStringAsFixed(1)}s)',
       audioDurationSeconds: durationSec,
     );
 
@@ -417,36 +475,60 @@ class ChatController extends ValueNotifier<ChatState> {
       pendingImageName: () => null,
     );
 
+    String finalPrompt = promptText;
+    if (finalPrompt.isEmpty) {
+      try {
+        assistantTurn.statusText = 'Transcribing audio...';
+        notifyListeners();
+        final transcribed = await cera.transcribe(
+          intent.pcmSamples,
+          sampleRate: intent.sampleRate,
+        );
+        if (transcribed.trim().isNotEmpty) {
+          finalPrompt = transcribed.trim();
+          userTurn.text = finalPrompt;
+          notifyListeners();
+        }
+      } catch (err) {
+        debugPrint('[cera:chat] ASR transcription skipped / failed: $err');
+      }
+    }
+
     String formattedPrompt;
     try {
       formattedPrompt = await cera.applyChatTemplate([
-        CeraMessage.user(promptText),
+        CeraMessage.user(finalPrompt.isNotEmpty ? finalPrompt : 'Hello'),
       ]);
     } catch (_) {
-      formattedPrompt = promptText;
+      formattedPrompt = finalPrompt.isNotEmpty ? finalPrompt : 'Hello';
     }
 
-    try {
-      assistantTurn.statusText = 'Encoding audio frames...';
-      notifyListeners();
-      debugPrint(
-        '[cera:chat] Encoding audio frames at ${intent.sampleRate}Hz...',
-      );
-      await cera.appendAudio(intent.pcmSamples, sampleRate: intent.sampleRate);
-      debugPrint(
-        '[cera:chat] Audio successfully encoded and seeded into KV cache',
-      );
-      assistantTurn.statusText = 'Generating response...';
-      notifyListeners();
-    } catch (err) {
-      assistantTurn.isGenerating = false;
-      assistantTurn.statusText = null;
-      assistantTurn.text = 'Failed to process audio: $err';
-      notifyListeners();
-      value = value.copyWith(isGenerating: false);
-      return;
+    if (finalPrompt == promptText && promptText.isEmpty) {
+      try {
+        assistantTurn.statusText = 'Encoding audio frames...';
+        notifyListeners();
+        debugPrint(
+          '[cera:chat] Encoding audio frames at ${intent.sampleRate}Hz...',
+        );
+        await cera.appendAudio(
+          intent.pcmSamples,
+          sampleRate: intent.sampleRate,
+        );
+        debugPrint(
+          '[cera:chat] Audio successfully encoded and seeded into KV cache',
+        );
+      } catch (err) {
+        assistantTurn.isGenerating = false;
+        assistantTurn.statusText = null;
+        assistantTurn.text = 'Failed to process audio: $err';
+        notifyListeners();
+        value = value.copyWith(isGenerating: false);
+        return;
+      }
     }
 
+    assistantTurn.statusText = 'Generating response...';
+    notifyListeners();
     await _runGeneration(assistantTurn, formattedPrompt);
   }
 

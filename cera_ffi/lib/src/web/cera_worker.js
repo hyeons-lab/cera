@@ -161,18 +161,22 @@ async function ensureModule(moduleUrl) {
  * dense-transformer GGUF throws from `create` after WebGPU itself came up fine.
  * Both must degrade rather than fail the open.
  */
-async function tryGpu(bytes, contextSize, mmproj) {
+async function tryGpu(bytes, contextSize, mmproj, turboQuant) {
   if (!self.navigator || !self.navigator.gpu) return false;
   if (typeof wasm.WebGpuSession !== 'function') return false;
   // `createWithParts` is the newer of the two and is absent from a wasm build
   // predating it, so fall back rather than throwing a TypeError that `auto`
   // would then read as "no GPU" for entirely the wrong reason.
   if (mmproj && typeof wasm.WebGpuSession.createWithParts !== 'function') return false;
+  const kvCompression =
+    turboQuant && typeof wasm.TurboQuantConfig === 'function'
+      ? new wasm.TurboQuantConfig(BigInt(0))
+      : undefined;
   let session;
   try {
     session = mmproj
-      ? await wasm.WebGpuSession.createWithParts(bytes, mmproj, contextSize)
-      : await wasm.WebGpuSession.create(bytes, contextSize);
+      ? await wasm.WebGpuSession.createWithParts(bytes, mmproj, contextSize, kvCompression)
+      : await wasm.WebGpuSession.create(bytes, contextSize, kvCompression);
   } catch (_) {
     return false;
   }
@@ -202,7 +206,7 @@ async function tryGpu(bytes, contextSize, mmproj) {
  * already populated the cache, so the CPU retry behind it loads from the store
  * rather than downloading again.
  */
-async function tryGpuBundle(repo, bundleId, quant, contextSize, onProgress) {
+async function tryGpuBundle(repo, bundleId, quant, contextSize, onProgress, turboQuant) {
   if (!self.navigator || !self.navigator.gpu) return 'this browser exposes no navigator.gpu';
   // Absent from a wasm build without the `wgpu` feature, and from one predating
   // this constructor. Both fall back rather than throwing a TypeError that
@@ -213,6 +217,10 @@ async function tryGpuBundle(repo, bundleId, quant, contextSize, onProgress) {
   if (typeof wasm.WebGpuSession.fromBundleId !== 'function') {
     return 'this wasm build predates WebGpuSession.fromBundleId';
   }
+  const kvCompression =
+    turboQuant && typeof wasm.TurboQuantConfig === 'function'
+      ? new wasm.TurboQuantConfig(BigInt(0))
+      : undefined;
   let session;
   try {
     session = await wasm.WebGpuSession.fromBundleId(
@@ -220,10 +228,7 @@ async function tryGpuBundle(repo, bundleId, quant, contextSize, onProgress) {
       bundleId,
       quant,
       contextSize,
-      // No KV compression: `SessionConfig.kvCompression` is not exposed through
-      // this protocol either, so requesting it on one path only would make the
-      // two backends disagree about memory for reasons a caller cannot see.
-      undefined,
+      kvCompression,
       onProgress,
     );
   } catch (err) {
@@ -234,19 +239,22 @@ async function tryGpuBundle(repo, bundleId, quant, contextSize, onProgress) {
   return null;
 }
 
-function openCpu(bytes, contextSize, mmproj, inferenceType) {
+function openCpu(bytes, contextSize, mmproj, inferenceType, turboQuant) {
   // `fromGgufParts` covers the text-only case too (a null projector is exactly
   // `fromGgufBytes`), so both paths resolve the inference type through one
   // constructor instead of two that have to agree.
   const engine = wasm.CeraEngine.fromGgufParts(bytes, mmproj, contextSize, inferenceType);
-  initCpuSession(engine);
+  initCpuSession(engine, turboQuant);
 }
 
-function initCpuSession(engine) {
+function initCpuSession(engine, turboQuant) {
   const config = new wasm.SessionConfig();
+  if (turboQuant && typeof wasm.TurboQuantConfig === 'function') {
+    config.kvCompression = new wasm.TurboQuantConfig(BigInt(0));
+  }
   try {
     const session = engine.newSession(config);
-    cpu = { engine, session, tokenizer: engine.tokenizer };
+    cpu = { engine, session, tokenizer: engine.tokenizer, turboQuant: Boolean(turboQuant) };
   } finally {
     config.free();
   }
@@ -261,7 +269,7 @@ function initCpuSession(engine) {
  * file the bundle needs, so a VL or audio bundle arrives complete with no
  * guessing, and the weights never cross into JS.
  */
-async function openCpuBundle(repo, bundleId, quant, contextSize, onProgress) {
+async function openCpuBundle(repo, bundleId, quant, contextSize, onProgress, turboQuant) {
   const engine = await wasm.CeraEngine.fromBundleId(
     repo,
     bundleId,
@@ -269,7 +277,7 @@ async function openCpuBundle(repo, bundleId, quant, contextSize, onProgress) {
     contextSize,
     onProgress,
   );
-  initCpuSession(engine);
+  initCpuSession(engine, turboQuant);
 }
 
 /**
@@ -298,7 +306,7 @@ const OPS = {
    * it into linear memory (or into GPU buffers) during construction, so peak
    * usage is briefly twice the model size on both paths.
    */
-  async open({ moduleUrl, bytes, mmproj, contextSize, backend, inferenceType }) {
+  async open({ moduleUrl, bytes, mmproj, contextSize, backend, inferenceType, turboQuant }) {
     await ensureModule(moduleUrl);
     const view = new Uint8Array(bytes);
     // Transferred separately from `bytes`, and absent for a text-only model.
@@ -306,7 +314,7 @@ const OPS = {
     const ctx = contextSize ?? undefined;
     const type = inferenceType ?? undefined;
     if (backend === 'gpu') {
-      if (!(await tryGpu(view, ctx, proj))) {
+      if (!(await tryGpu(view, ctx, proj, turboQuant))) {
         throw new Error(
           'the WebGPU backend is unavailable: either this browser exposes no ' +
             'navigator.gpu, no adapter could be acquired, or the model is not ' +
@@ -315,9 +323,9 @@ const OPS = {
         );
       }
     } else if (backend === 'cpu') {
-      openCpu(view, ctx, proj, type);
-    } else if (!(await tryGpu(view, ctx, proj))) {
-      openCpu(view, ctx, proj, type);
+      openCpu(view, ctx, proj, type, turboQuant);
+    } else if (!(await tryGpu(view, ctx, proj, turboQuant))) {
+      openCpu(view, ctx, proj, type, turboQuant);
     }
     return { backend: backendLabel, capabilities: capabilitiesOf() };
   },
@@ -350,7 +358,7 @@ const OPS = {
    * access and fires no progress events.
    */
   async openBundle(req, post) {
-    const { moduleUrl, bundleId, quant, contextSize, backend, storeDir } = req;
+    const { moduleUrl, bundleId, quant, contextSize, backend, storeDir, turboQuant } = req;
     await ensureModule(moduleUrl);
     const repo = new wasm.BundleRepo(storeDir ?? undefined);
     const ctx = contextSize ?? undefined;
@@ -362,10 +370,10 @@ const OPS = {
     };
     try {
       if (backend === 'cpu') {
-        await openCpuBundle(repo, bundleId, quant, ctx, onProgress);
+        await openCpuBundle(repo, bundleId, quant, ctx, onProgress, turboQuant);
         return { backend: backendLabel, capabilities: capabilitiesOf() };
       }
-      const why = await tryGpuBundle(repo, bundleId, quant, ctx, onProgress);
+      const why = await tryGpuBundle(repo, bundleId, quant, ctx, onProgress, turboQuant);
       if (why === null) {
         return { backend: backendLabel, capabilities: capabilitiesOf() };
       }
@@ -380,7 +388,7 @@ const OPS = {
       // useful half of a double failure: it is the one that says whether the
       // download itself failed, so it rides along rather than being discarded.
       try {
-        await openCpuBundle(repo, bundleId, quant, ctx, onProgress);
+        await openCpuBundle(repo, bundleId, quant, ctx, onProgress, turboQuant);
       } catch (err) {
         throw new Error(
           `${String((err && err.message) || err)} (the WebGPU path was tried first ` +
@@ -450,24 +458,80 @@ const OPS = {
 
   /**
    * Transcribe mono PCM.
-   *
-   * Engine-level and CPU-only: `transcribe` runs its own prefill and decode on
-   * the engine, and the GPU path has no engine behind it (`WebGpuSession` owns
-   * a model directly and exposes no audio entry point).
    */
-  transcribe({ pcm, sampleRate }) {
-    if (!cpu) {
-      throw unsupported(
-        'transcribe is not supported on the WebGPU backend: WebGpuSession has ' +
-          'no audio path. Open the model with backend: cpu to transcribe.',
-      );
-    }
+  async transcribe({ pcm, sampleRate }) {
     const samples = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm);
-    console.info(`[cera:worker] transcribe: running ASR on ${samples.length} samples at ${sampleRate}Hz...`);
-    const t0 = performance.now();
-    const result = cpu.engine.transcribe(samples, sampleRate);
-    console.info(`[cera:worker] transcribe: completed in ${(performance.now() - t0).toFixed(1)}ms`);
-    return result;
+    const sr = sampleRate ?? 16000;
+    if (gpu) {
+      console.info(
+        `[cera:worker] transcribe: running ASR on WebGPU (${samples.length} samples at ${sr}Hz)...`,
+      );
+      const t0 = performance.now();
+      const tk = gpu.session.tokenizer;
+      let markerName = '<|reserved_4|>';
+      let markerId = tk.specialTokenId(markerName);
+      if (markerId == null) {
+        for (const candidate of ['<|reserved_5|>', '<|reserved_6|>', '<|reserved_7|>', '<|audio_start|>']) {
+          const id = tk.specialTokenId(candidate);
+          if (id != null) {
+            markerName = candidate;
+            markerId = id;
+            break;
+          }
+        }
+      }
+      const messages = [
+        { role: 'system', content: 'Perform ASR.' },
+        { role: 'user', content: markerName },
+      ];
+      let formatted;
+      try {
+        formatted = tk.applyChatTemplate(messages, true);
+      } catch (err) {
+        throw new Error(`failed to render ASR chat template: ${err}`);
+      }
+      const allTokens = Array.from(tk.encode(formatted, false));
+      const splitIdx = markerId != null ? allTokens.indexOf(markerId) : -1;
+
+      gpu.session.reset();
+      if (splitIdx > 0) {
+        const prefix = allTokens.slice(0, splitIdx);
+        await gpu.session.generateTokens(
+          new Uint32Array(prefix),
+          0,
+          null,
+          null,
+          null,
+          null,
+          () => {},
+        );
+      }
+      gpu.session.appendAudio(samples, sr);
+      const suffix = splitIdx >= 0 ? allTokens.slice(splitIdx + 1) : allTokens;
+      let text = '';
+      await gpu.session.generateTokens(
+        new Uint32Array(suffix),
+        256,
+        null,
+        null,
+        null,
+        null,
+        (piece) => {
+          text += piece;
+        },
+      );
+      console.info(
+        `[cera:worker] transcribe: WebGPU ASR completed in ${(performance.now() - t0).toFixed(1)}ms: "${text.trim()}"`,
+      );
+      return text.trim();
+    }
+    if (cpu) {
+      const t0 = performance.now();
+      const result = cpu.engine.transcribe(samples, sr);
+      console.info(`[cera:worker] transcribe: CPU ASR completed in ${(performance.now() - t0).toFixed(1)}ms`);
+      return result;
+    }
+    throw unsupported('no model loaded to transcribe');
   },
 
   capabilities() {

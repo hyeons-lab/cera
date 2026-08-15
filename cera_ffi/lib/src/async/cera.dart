@@ -81,6 +81,7 @@ class CeraOptions {
   const CeraOptions({
     this.contextSize = 4096,
     this.backend = CeraBackend.auto,
+    this.turboQuant = false,
     this.web = const CeraWebAssets(),
   });
 
@@ -89,6 +90,9 @@ class CeraOptions {
 
   /// Which compute backend to run on.
   final CeraBackend backend;
+
+  /// Whether to enable TurboQuant KV-cache compression. Defaults to false (cera default).
+  final bool turboQuant;
 
   /// Web asset locations. Ignored on native targets.
   final CeraWebAssets web;

@@ -1340,10 +1340,10 @@ pub fn build_gpu_vision_encoder(
 }
 
 #[cfg(feature = "gpu")]
-fn try_wgpu_vision_encoder(
+pub fn build_wgpu_vision_encoder_with_context(
+    ctx: crate::backend::wgpu::GpuContext,
     weights: &VisionEncoderWeights,
 ) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
-    let ctx = crate::backend::wgpu::GpuContext::new().ok()?;
     let ops = WgpuVitOps::new(ctx).ok()?;
     let gpu_w = GpuVitWeights::build(&ops, weights);
     tracing::info!("vision encoder: using wgpu GPU backend");
@@ -1351,6 +1351,14 @@ fn try_wgpu_vision_encoder(
         ops,
         weights: gpu_w,
     }))
+}
+
+#[cfg(feature = "gpu")]
+fn try_wgpu_vision_encoder(
+    weights: &VisionEncoderWeights,
+) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
+    let ctx = crate::backend::wgpu::GpuContext::new().ok()?;
+    build_wgpu_vision_encoder_with_context(ctx, weights)
 }
 
 #[cfg(not(feature = "gpu"))]

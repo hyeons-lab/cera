@@ -2162,10 +2162,11 @@ mod webgpu {
                     )));
                 }
                 let weights = Arc::new(weights);
-                self.gpu_vision_encoder = cera::model::vision_encoder_gpu::build_gpu_vision_encoder(
-                    &weights,
-                    cera::BackendPreference::Gpu,
-                );
+                self.gpu_vision_encoder =
+                    cera::model::vision_encoder_gpu::build_wgpu_vision_encoder_with_context(
+                        self.model.ctx().clone(),
+                        &weights,
+                    );
                 self.vision_encoder = Some(weights);
                 Ok(())
             }

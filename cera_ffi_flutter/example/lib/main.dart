@@ -216,70 +216,256 @@ class _ChatPageState extends State<ChatPage> {
     _controller.dispatch(SendMessageIntent(prompt));
   }
 
-  void _showModelOptionsSheet(ChatState state) {
+  void _showSettingsSheet(ChatState state) {
     final theme = Theme.of(context);
     showModalBottomSheet(
       context: context,
       backgroundColor: theme.colorScheme.surface,
+      isScrollControlled: true,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       builder: (context) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 8),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                ListTile(
-                  leading: Icon(
-                    Icons.cloud_download_outlined,
-                    color: theme.colorScheme.primary,
-                  ),
-                  title: const Text('Downloaded & Catalog Models'),
-                  subtitle: const Text(
-                    'Switch between cached models or download new ones',
-                  ),
-                  onTap: () {
-                    Navigator.of(context).pop();
-                    _pickBundle(state);
-                  },
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            final currentSettings = _controller.value.settings;
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  vertical: 12,
+                  horizontal: 16,
                 ),
-                ListTile(
-                  leading: Icon(
-                    Icons.folder_open_outlined,
-                    color: theme.colorScheme.primary,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Center(
+                        child: Container(
+                          width: 36,
+                          height: 4,
+                          margin: const EdgeInsets.only(bottom: 16),
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.outlineVariant,
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                        ),
+                      ),
+                      Row(
+                        children: [
+                          Icon(
+                            Icons.settings_outlined,
+                            size: 20,
+                            color: theme.colorScheme.primary,
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            'Settings & Models',
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w600,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        'MODELS',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 0.8,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(
+                          Icons.cloud_download_outlined,
+                          color: theme.colorScheme.primary,
+                        ),
+                        title: const Text('Downloaded & Catalog Models'),
+                        subtitle: const Text(
+                          'Switch between cached models or download new ones',
+                        ),
+                        onTap: () {
+                          Navigator.of(context).pop();
+                          _pickBundle(state);
+                        },
+                      ),
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(
+                          Icons.folder_open_outlined,
+                          color: theme.colorScheme.primary,
+                        ),
+                        title: const Text('Open Local .gguf File...'),
+                        subtitle: const Text(
+                          'Pick a model file from disk storage',
+                        ),
+                        onTap: () {
+                          Navigator.of(context).pop();
+                          _pickLocalModel();
+                        },
+                      ),
+                      if (state.hasModel) ...[
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: Icon(
+                            Icons.eject_outlined,
+                            color: theme.colorScheme.error,
+                          ),
+                          title: Text(
+                            'Unload Active Model',
+                            style: TextStyle(color: theme.colorScheme.error),
+                          ),
+                          subtitle: const Text(
+                            'Release memory and close model engine',
+                          ),
+                          onTap: () {
+                            Navigator.of(context).pop();
+                            _controller.dispatch(const UnloadModelIntent());
+                          },
+                        ),
+                      ],
+                      Divider(color: theme.dividerColor, height: 24),
+                      Text(
+                        'INFERENCE & OPTIMIZATION',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 0.8,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('TurboQuant KV Compression'),
+                        subtitle: Text(
+                          'Compresses KV cache to 3-bit keys / 2-bit values for lower memory footprint and faster multi-turn attention. (Default: Off)',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        value: currentSettings.turboQuant,
+                        onChanged: (val) {
+                          setModalState(() {});
+                          _controller.dispatch(
+                            UpdateSettingsIntent(turboQuant: val),
+                          );
+                        },
+                      ),
+                      const SizedBox(height: 8),
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Vision Max Image Dimension'),
+                        subtitle: Text(
+                          'Caps the long side of input images before ViT patch encoding to minimize prompt latency.',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        trailing: DropdownButton<int?>(
+                          value: currentSettings.maxImageLongSize,
+                          dropdownColor: theme.colorScheme.surface,
+                          underline: const SizedBox.shrink(),
+                          items: const [
+                            DropdownMenuItem(
+                              value: 256,
+                              child: Text('256 px (Fast)'),
+                            ),
+                            DropdownMenuItem(
+                              value: 384,
+                              child: Text('384 px (Med)'),
+                            ),
+                            DropdownMenuItem(
+                              value: 512,
+                              child: Text('512 px (HD)'),
+                            ),
+                            DropdownMenuItem(
+                              value: null,
+                              child: Text('Native / Off'),
+                            ),
+                          ],
+                          onChanged: (val) {
+                            setModalState(() {});
+                            _controller.dispatch(
+                              UpdateSettingsIntent(
+                                maxImageLongSize: val,
+                                clearMaxImageLongSize: val == null,
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                      if (state.hasModel) ...[
+                        Divider(color: theme.dividerColor, height: 24),
+                        Text(
+                          'BACKEND & DEVICE',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: 0.8,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.outlineVariant.withValues(
+                              alpha: 0.4,
+                            ),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: theme.dividerColor),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(
+                                Icons.memory_rounded,
+                                size: 20,
+                                color: theme.colorScheme.primary,
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      state.backend ?? 'Unknown Backend',
+                                      style: const TextStyle(
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      'Active model: ${state.loadedModel?.name ?? ""}',
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        color:
+                                            theme.colorScheme.onSurfaceVariant,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 12),
+                    ],
                   ),
-                  title: const Text('Open Local .gguf File...'),
-                  subtitle: const Text('Pick a model file from disk storage'),
-                  onTap: () {
-                    Navigator.of(context).pop();
-                    _pickLocalModel();
-                  },
                 ),
-                if (state.hasModel) ...[
-                  Divider(color: theme.dividerColor),
-                  ListTile(
-                    leading: Icon(
-                      Icons.eject_outlined,
-                      color: theme.colorScheme.error,
-                    ),
-                    title: Text(
-                      'Unload Active Model',
-                      style: TextStyle(color: theme.colorScheme.error),
-                    ),
-                    subtitle: const Text(
-                      'Release memory and close model engine',
-                    ),
-                    onTap: () {
-                      Navigator.of(context).pop();
-                      _controller.dispatch(const UnloadModelIntent());
-                    },
-                  ),
-                ],
-              ],
-            ),
-          ),
+              ),
+            );
+          },
         );
       },
     );
@@ -350,9 +536,9 @@ class _ChatPageState extends State<ChatPage> {
                     : null,
               ),
               IconButton(
-                icon: const Icon(Icons.tune_rounded),
-                tooltip: 'Model Options',
-                onPressed: () => _showModelOptionsSheet(state),
+                icon: const Icon(Icons.settings_outlined),
+                tooltip: 'Settings & Models',
+                onPressed: () => _showSettingsSheet(state),
               ),
             ],
           ),

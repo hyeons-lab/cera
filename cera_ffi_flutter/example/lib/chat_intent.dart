@@ -78,3 +78,16 @@ class ClearAttachedImageIntent extends ChatIntent {
 class ClearTranscriptIntent extends ChatIntent {
   const ClearTranscriptIntent();
 }
+
+/// Intent to update runtime and engine settings (e.g. TurboQuant, max image dimension).
+class UpdateSettingsIntent extends ChatIntent {
+  const UpdateSettingsIntent({
+    this.turboQuant,
+    this.maxImageLongSize,
+    this.clearMaxImageLongSize = false,
+  });
+
+  final bool? turboQuant;
+  final int? maxImageLongSize;
+  final bool clearMaxImageLongSize;
+}

@@ -1247,6 +1247,11 @@ impl GpuLfm2Model {
         Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
     }
 
+    /// Access the underlying GPU context (device, queue, adapter).
+    pub fn ctx(&self) -> &GpuContext {
+        &self.ctx
+    }
+
     /// Construct a GPU model for a dense transformer (Qwen2/Qwen3/LLaMA/
     /// Mistral/Granite) — the `LlamaModel` family. Mirrors `from_gguf_with_id`
     /// but feeds the shared loader a `LlamaModel` weight source instead of

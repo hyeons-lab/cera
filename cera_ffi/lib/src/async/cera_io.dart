@@ -199,7 +199,18 @@ class _ProgressSink implements DownloadProgressSink {
 
 class _NativeCera implements Cera {
   _NativeCera(this._engine, this._options)
-    : _session = _engine.newSession(const SessionConfig()),
+    : _session = _engine.newSession(
+        SessionConfig(
+          kvCompression:
+              _options.turboQuant
+                  ? const KvCompressionTurboQuant(
+                    seed: 0,
+                    keys: true,
+                    values: true,
+                  )
+                  : null,
+        ),
+      ),
       // Read once. Both are fixed by the GGUF, and `metadata()` builds a whole
       // record across the FFI boundary, which is not something to do on every
       // prompt for two fields.
@@ -386,7 +397,19 @@ class _NativeCera implements Cera {
           // `close()` calls `cancel()` on it first, which throws in turn and
           // skips `_engine.close()`: the model weights, the largest allocation
           // in the app, would leak until the finalizer ran.
-          final reseeded = _engine.newSession(SessionConfig(seed: seed));
+          final reseeded = _engine.newSession(
+            SessionConfig(
+              seed: seed,
+              kvCompression:
+                  _options.turboQuant
+                      ? const KvCompressionTurboQuant(
+                        seed: 0,
+                        keys: true,
+                        values: true,
+                      )
+                      : null,
+            ),
+          );
           _session.close();
           _session = reseeded;
         }

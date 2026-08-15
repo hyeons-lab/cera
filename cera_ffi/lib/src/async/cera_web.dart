@@ -61,6 +61,7 @@ extension type _Request._(JSObject _) implements JSObject {
     String? bundleId,
     String? quant,
     String? storeDir,
+    bool? turboQuant,
   });
 }
 
@@ -331,6 +332,7 @@ class _WorkerCera implements Cera {
         contextSize: _options.contextSize,
         backend: _options.backend.name,
         inferenceType: inferenceType,
+        turboQuant: _options.turboQuant,
       ),
       // Hand the model's memory to the worker rather than copying it. A
       // multi-hundred-megabyte structured clone is both a pause and a moment
@@ -369,6 +371,7 @@ class _WorkerCera implements Cera {
           storeDir: storeDir,
           contextSize: _options.contextSize,
           backend: _options.backend.name,
+          turboQuant: _options.turboQuant,
         ),
       );
       _adoptOpenResult(result);
