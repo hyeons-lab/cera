@@ -74,7 +74,14 @@ class DownloadedModelRecord {
 
 /// Settings state for engine inference and vision/audio preprocessing.
 class ChatSettings {
-  const ChatSettings({this.turboQuant = false, this.maxImageLongSize = 256});
+  const ChatSettings({
+    this.backend = CeraBackend.auto,
+    this.turboQuant = false,
+    this.maxImageLongSize = 256,
+  });
+
+  /// Which compute backend to run on.
+  final CeraBackend backend;
 
   /// Whether TurboQuant KV-cache compression is enabled.
   /// Defaults to false (cera default).
@@ -85,10 +92,16 @@ class ChatSettings {
   final int? maxImageLongSize;
 
   /// Converts settings to engine open options.
-  CeraOptions get ceraOptions => CeraOptions(turboQuant: turboQuant);
+  CeraOptions get ceraOptions =>
+      CeraOptions(backend: backend, turboQuant: turboQuant);
 
-  ChatSettings copyWith({bool? turboQuant, int? Function()? maxImageLongSize}) {
+  ChatSettings copyWith({
+    CeraBackend? backend,
+    bool? turboQuant,
+    int? Function()? maxImageLongSize,
+  }) {
     return ChatSettings(
+      backend: backend ?? this.backend,
       turboQuant: turboQuant ?? this.turboQuant,
       maxImageLongSize: maxImageLongSize != null
           ? maxImageLongSize()

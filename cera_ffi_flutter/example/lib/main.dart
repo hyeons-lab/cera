@@ -15,6 +15,7 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
 import 'chat_controller.dart';
 import 'chat_intent.dart';
 import 'chat_state.dart';
@@ -337,6 +338,44 @@ class _ChatPageState extends State<ChatPage> {
                           fontWeight: FontWeight.w600,
                           letterSpacing: 0.8,
                           color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Compute Backend'),
+                        subtitle: Text(
+                          'Choose between Auto (WebGPU / Metal), GPU only, or CPU backend (WASM / Single-core).',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        trailing: DropdownButton<CeraBackend>(
+                          value: currentSettings.backend,
+                          dropdownColor: theme.colorScheme.surface,
+                          underline: const SizedBox.shrink(),
+                          items: const [
+                            DropdownMenuItem(
+                              value: CeraBackend.auto,
+                              child: Text('Auto (GPU / Fallback)'),
+                            ),
+                            DropdownMenuItem(
+                              value: CeraBackend.gpu,
+                              child: Text('GPU (WebGPU / Metal)'),
+                            ),
+                            DropdownMenuItem(
+                              value: CeraBackend.cpu,
+                              child: Text('CPU (WASM / CPU)'),
+                            ),
+                          ],
+                          onChanged: (val) {
+                            if (val == null) return;
+                            setModalState(() {});
+                            _controller.dispatch(
+                              UpdateSettingsIntent(backend: val),
+                            );
+                          },
                         ),
                       ),
                       const SizedBox(height: 8),

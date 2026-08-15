@@ -115,11 +115,18 @@ class ChatController extends ValueNotifier<ChatState> {
       final prefs = await SharedPreferences.getInstance();
       if (_disposed || value.isLoading || _ceraEngine != null) return;
 
+      final backendStr = prefs.getString('cera_backend');
+      final backend = switch (backendStr) {
+        'cpu' => CeraBackend.cpu,
+        'gpu' => CeraBackend.gpu,
+        _ => CeraBackend.auto,
+      };
       final turboQuant = prefs.getBool('cera_turboquant') ?? false;
-      final maxImageDim = prefs.getInt('cera_max_image_dim') ?? 256;
+      final maxImageDim = prefs.getInt('cera_max_image_dim');
       final restoredSettings = ChatSettings(
+        backend: backend,
         turboQuant: turboQuant,
-        maxImageLongSize: maxImageDim == 0 ? null : maxImageDim,
+        maxImageLongSize: maxImageDim == 0 ? null : (maxImageDim ?? 256),
       );
       value = value.copyWith(settings: restoredSettings);
 
@@ -141,7 +148,7 @@ class ChatController extends ValueNotifier<ChatState> {
             bundleName,
             quant,
             storeDir: await _defaultStoreDir(),
-            options: CeraOptions(turboQuant: restoredSettings.turboQuant),
+            options: restoredSettings.ceraOptions,
             onProgress: onProgress,
           ),
           label: '$displayName · $quant',
@@ -163,12 +170,14 @@ class ChatController extends ValueNotifier<ChatState> {
 
   Future<void> _onUpdateSettings(UpdateSettingsIntent intent) async {
     final current = value.settings;
+    final newBackend = intent.backend ?? current.backend;
     final newTurbo = intent.turboQuant ?? current.turboQuant;
     final newMaxImage = intent.clearMaxImageLongSize
         ? null
         : (intent.maxImageLongSize ?? current.maxImageLongSize);
 
     final updated = current.copyWith(
+      backend: newBackend,
       turboQuant: newTurbo,
       maxImageLongSize: () => newMaxImage,
     );
@@ -177,6 +186,7 @@ class ChatController extends ValueNotifier<ChatState> {
 
     try {
       final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('cera_backend', newBackend.name);
       await prefs.setBool('cera_turboquant', newTurbo);
       if (newMaxImage != null) {
         await prefs.setInt('cera_max_image_dim', newMaxImage);
@@ -187,9 +197,12 @@ class ChatController extends ValueNotifier<ChatState> {
       debugPrint('cera: error persisting settings: $err');
     }
 
-    // If TurboQuant changed and a bundle model is currently loaded and idle, reload it.
-    if (intent.turboQuant != null &&
-        intent.turboQuant != current.turboQuant &&
+    // If backend or TurboQuant changed and a model is currently loaded and idle, reload it.
+    final backendChanged =
+        intent.backend != null && intent.backend != current.backend;
+    final turboChanged =
+        intent.turboQuant != null && intent.turboQuant != current.turboQuant;
+    if ((backendChanged || turboChanged) &&
         value.loadedModel != null &&
         !value.isBusy) {
       final model = value.loadedModel;
@@ -202,6 +215,8 @@ class ChatController extends ValueNotifier<ChatState> {
             storeDir: _defaultStoreDir,
           ),
         );
+      } else if (model is ModelSource) {
+        dispatch(LoadLocalModelIntent(model));
       }
     }
   }

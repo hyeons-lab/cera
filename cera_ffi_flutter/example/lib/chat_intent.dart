@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 
+import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
 import 'model_source.dart';
 
 /// Sealed hierarchy of all user and system intents processed by [ChatController].
@@ -79,14 +80,16 @@ class ClearTranscriptIntent extends ChatIntent {
   const ClearTranscriptIntent();
 }
 
-/// Intent to update runtime and engine settings (e.g. TurboQuant, max image dimension).
+/// Intent to update runtime and engine settings (e.g. backend, TurboQuant, max image dimension).
 class UpdateSettingsIntent extends ChatIntent {
   const UpdateSettingsIntent({
+    this.backend,
     this.turboQuant,
     this.maxImageLongSize,
     this.clearMaxImageLongSize = false,
   });
 
+  final CeraBackend? backend;
   final bool? turboQuant;
   final int? maxImageLongSize;
   final bool clearMaxImageLongSize;
