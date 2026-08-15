@@ -121,7 +121,7 @@ class ChatController extends ValueNotifier<ChatState> {
             : bundleName;
 
         await _load(
-          bundleSource: BundleModelSource(
+          modelSource: BundleModelSource(
             name: '$displayName · $quant',
             bundleName: bundleName,
             quant: quant,
