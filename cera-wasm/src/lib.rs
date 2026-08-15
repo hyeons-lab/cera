@@ -1907,6 +1907,10 @@ mod webgpu {
         /// it stays off the per-image path. `None` when the upload failed, in
         /// which case encoding falls back to `vision_encoder`.
         gpu_vision_encoder: Option<Arc<dyn cera::model::vision_encoder_gpu::VisionGpuEncode>>,
+        /// CPU audio-encoder weights, parsed from the mmproj passed from an audio bundle.
+        audio_encoder: Option<Arc<cera::model::audio_encoder::AudioEncoderWeights>>,
+        /// GPU audio encoder instance if available.
+        gpu_audio_encoder: Option<Arc<dyn cera::model::audio_encoder_gpu::AudioGpuEncode>>,
         /// Session-default cap on an appended image's longest side.
         image_max_long_size: Option<u32>,
     }
@@ -2052,6 +2056,8 @@ mod webgpu {
                 eos,
                 vision_encoder: None,
                 gpu_vision_encoder: None,
+                audio_encoder: None,
+                gpu_audio_encoder: None,
                 image_max_long_size: None,
             })
         }
@@ -2115,46 +2121,66 @@ mod webgpu {
                 crate::bundle::load_bundle(repo, &bundle_id, &quant, on_progress.as_ref()).await?;
             let mut session =
                 Self::from_model_bytes(parts.model, context_size, kv_compression).await?;
-            // A VL bundle names its tower in the manifest, so unlike
+            // A VL or audio bundle names its tower in the manifest, so unlike
             // `createWithParts` this path never has to be told about it.
             if let Some(mmproj) = parts.multimodal_projector {
-                session.attach_vision(mmproj)?;
+                session.attach_projector(mmproj)?;
             }
             Ok(session)
         }
 
-        /// Parse `mmproj` as a vision tower and attach it, giving this session
-        /// `appendImage`.
+        /// Parse `mmproj` as a vision tower or audio encoder and attach it, giving
+        /// this session `appendImage` or `appendAudio`.
         ///
         /// Shared by `createWithParts` and `fromBundleId` so the two cannot
         /// drift on the pairing check below.
-        fn attach_vision(&mut self, mmproj: Arc<[u8]>) -> Result<(), JsError> {
+        fn attach_projector(&mut self, mmproj: Arc<[u8]>) -> Result<(), JsError> {
             let proj_gguf = cera::gguf::GgufFile::from_bytes(mmproj).map_err(map_err)?;
-            let weights =
-                cera::model::vision_encoder::VisionEncoderWeights::from_gguf(&Arc::new(proj_gguf))
-                    .map_err(map_err)?;
-
-            // Reject a tower trained against a different LLM here rather than
-            // at the first `appendImage`: the projection has to land in this
-            // model's hidden space, and a dimension mismatch is a mispaired
-            // bundle, not a runtime condition.
+            let proj_arc = Arc::new(proj_gguf);
             let llm_hidden = cera::model::Model::config(&self.model).hidden_size;
-            let proj_dim = weights.config.projection_dim;
-            if proj_dim != llm_hidden {
-                return Err(JsError::new(&format!(
-                    "vision encoder's projection_dim ({proj_dim}) does not match the \
-                     model's hidden_size ({llm_hidden}); the mmproj must pair with \
-                     the LLM it was trained against"
-                )));
-            }
 
-            let weights = Arc::new(weights);
-            self.gpu_vision_encoder = cera::model::vision_encoder_gpu::build_gpu_vision_encoder(
-                &weights,
-                cera::BackendPreference::Gpu,
-            );
-            self.vision_encoder = Some(weights);
-            Ok(())
+            if proj_arc.metadata().contains_key("clip.audio.block_count") {
+                let weights = cera::model::audio_encoder::AudioEncoderWeights::from_gguf(&proj_arc)
+                    .map_err(map_err)?;
+                let enc_hidden = weights.config.llm_hidden_size;
+                if enc_hidden != llm_hidden {
+                    return Err(JsError::new(&format!(
+                        "audio encoder's llm_hidden_size ({enc_hidden}) does not match the \
+                         model's hidden_size ({llm_hidden}); the mmproj must pair with \
+                         the LLM it was trained against"
+                    )));
+                }
+                let weights = Arc::new(weights);
+                self.gpu_audio_encoder = cera::model::audio_encoder_gpu::build_gpu_audio_encoder(
+                    &weights,
+                    cera::BackendPreference::Gpu,
+                );
+                self.audio_encoder = Some(weights);
+                Ok(())
+            } else {
+                let weights =
+                    cera::model::vision_encoder::VisionEncoderWeights::from_gguf(&proj_arc)
+                        .map_err(map_err)?;
+                let proj_dim = weights.config.projection_dim;
+                if proj_dim != llm_hidden {
+                    return Err(JsError::new(&format!(
+                        "vision encoder's projection_dim ({proj_dim}) does not match the \
+                         model's hidden_size ({llm_hidden}); the mmproj must pair with \
+                         the LLM it was trained against"
+                    )));
+                }
+                let weights = Arc::new(weights);
+                self.gpu_vision_encoder = cera::model::vision_encoder_gpu::build_gpu_vision_encoder(
+                    &weights,
+                    cera::BackendPreference::Gpu,
+                );
+                self.vision_encoder = Some(weights);
+                Ok(())
+            }
+        }
+
+        fn attach_vision(&mut self, mmproj: Arc<[u8]>) -> Result<(), JsError> {
+            self.attach_projector(mmproj)
         }
 
         /// Number of tokens currently in the KV cache.
@@ -2170,27 +2196,26 @@ mod webgpu {
         }
 
         /// Whether this session can accept images, i.e. whether it was built
-        /// by `createWithParts` with a usable mmproj.
+        /// by `createWithParts` or `fromBundleId` with a usable vision mmproj.
         #[wasm_bindgen(getter, js_name = imageIn)]
         pub fn image_in(&self) -> bool {
             self.vision_encoder.is_some()
         }
 
+        /// Whether this session can accept audio, i.e. whether it was built
+        /// from an audio bundle with a usable audio mmproj.
+        #[wasm_bindgen(getter, js_name = audioIn)]
+        pub fn audio_in(&self) -> bool {
+            self.audio_encoder.is_some()
+        }
+
         /// Modality capability flags for this session, same shape as
         /// `Session.capabilities` on the CPU path.
-        ///
-        /// Reports what *this session* can do, which is deliberately not the
-        /// engine's answer. The WebGPU path takes an image only when it was
-        /// built with a usable mmproj, and has no audio path at all, so
-        /// forwarding a VL-or-audio engine's capabilities here would promise
-        /// a modality the live session refuses.
         #[wasm_bindgen(getter)]
         pub fn capabilities(&self) -> Capabilities {
             capabilities_to_js(cera::ModalityCapabilities {
                 image_in: self.image_in(),
-                // `text_only()` supplies text in/out and leaves audio off, so
-                // a new field added upstream lands here as `false` rather than
-                // as a silent `true`.
+                audio_in: self.audio_in(),
                 ..cera::ModalityCapabilities::text_only()
             })
         }
@@ -2307,6 +2332,76 @@ mod webgpu {
             // paper over a miscount on a bad one. Assert the contract instead:
             // a mismatch means the KV cache holds a different number of frames
             // than the session thinks, and every later position is wrong.
+            debug_assert_eq!(
+                self.state.seq_len, end,
+                "seed_embeddings must advance seq_len by n_tokens"
+            );
+            Ok(())
+        }
+
+        /// Feed mono PCM audio into the conversation, to be processed by the
+        /// next `generateTokens`.
+        #[wasm_bindgen(js_name = appendAudio)]
+        pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), JsError> {
+            let Some(encoder) = self.audio_encoder.clone() else {
+                return Err(crate::map_cera_err(cera::CeraError::UnsupportedModality));
+            };
+            if samples.is_empty() {
+                return Err(crate::map_cera_err(cera::CeraError::EmptyInput));
+            }
+            let target_sr = cera::model::audio_encoder::SAMPLE_RATE;
+            let resampled: std::borrow::Cow<[f32]> = if sample_rate == target_sr {
+                std::borrow::Cow::Borrowed(samples)
+            } else {
+                std::borrow::Cow::Owned(cera::model::audio_encoder::resample_linear(
+                    samples,
+                    sample_rate,
+                    target_sr,
+                ))
+            };
+            if resampled.is_empty() {
+                return Err(crate::map_cera_err(cera::CeraError::EmptyInput));
+            }
+            let effective_samples = resampled.as_ref();
+            let (embeddings, n_tokens) = match self.gpu_audio_encoder.as_ref() {
+                Some(gpu) => match gpu.encode_pcm(effective_samples) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        tracing::warn!(
+                            "gpu audio encode failed ({e:#}); falling back to CPU encoder"
+                        );
+                        cera::model::audio_encoder::encode_audio_pcm(
+                            effective_samples,
+                            encoder.as_ref(),
+                        )
+                    }
+                },
+                None => cera::model::audio_encoder::encode_audio_pcm(
+                    effective_samples,
+                    encoder.as_ref(),
+                ),
+            };
+            if n_tokens == 0 {
+                return Err(crate::map_cera_err(cera::CeraError::AudioClipTooShort {
+                    samples: effective_samples.len(),
+                    min_samples: cera::model::audio_encoder::WINDOW_LEN,
+                }));
+            }
+
+            let start = self.state.seq_len;
+            let max = cera::model::Model::config(&self.model).max_seq_len;
+            let end = start
+                .checked_add(n_tokens)
+                .ok_or_else(|| JsError::new("position overflow appending audio embeddings"))?;
+            if end > max {
+                return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
+                    max_seq_len: max as u32,
+                    by: (end - max) as u32,
+                }));
+            }
+
+            self.model
+                .seed_embeddings(&embeddings, n_tokens, start, &mut self.state);
             debug_assert_eq!(
                 self.state.seq_len, end,
                 "seed_embeddings must advance seq_len by n_tokens"

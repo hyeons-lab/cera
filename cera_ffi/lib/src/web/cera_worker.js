@@ -401,6 +401,20 @@ const OPS = {
   },
 
   /**
+   * Feed mono PCM audio into the live conversation.
+   */
+  appendAudio({ pcm, sampleRate }) {
+    const samples = Float32Array.from(pcm);
+    const sr = sampleRate ?? 16000;
+    if (gpu) {
+      gpu.session.appendAudio(samples, sr);
+    } else {
+      cpu.session.appendAudio(samples, sr);
+    }
+    return null;
+  },
+
+  /**
    * Transcribe mono PCM.
    *
    * Engine-level and CPU-only: `transcribe` runs its own prefill and decode on
