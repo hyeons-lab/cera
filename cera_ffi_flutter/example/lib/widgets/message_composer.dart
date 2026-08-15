@@ -43,6 +43,7 @@ class _MessageComposerState extends State<MessageComposer> {
   final AudioRecorderService _audioRecorder = AudioRecorderService();
   bool _isRecordingAudio = false;
   bool _draggedToCancel = false;
+  Offset? _pointerOrigin;
   int _recordingSeconds = 0;
   Timer? _recordTimer;
 
@@ -53,10 +54,12 @@ class _MessageComposerState extends State<MessageComposer> {
     super.dispose();
   }
 
-  Future<void> _startRecording() async {
-    if (widget.isBusy) return;
+  Future<void> _startRecording(Offset globalPosition) async {
+    if (widget.isBusy || _isRecordingAudio) return;
     try {
+      _pointerOrigin = globalPosition;
       await _audioRecorder.startRecording(sampleRate: 16000);
+      if (!mounted) return;
       setState(() {
         _isRecordingAudio = true;
         _draggedToCancel = false;
@@ -77,10 +80,22 @@ class _MessageComposerState extends State<MessageComposer> {
     }
   }
 
+  void _onPointerMove(Offset currentPosition) {
+    if (!_isRecordingAudio || _pointerOrigin == null) return;
+    final diff = currentPosition - _pointerOrigin!;
+    // Dragging left or upwards by more than 40 pixels triggers cancel
+    final isCancel = diff.dx < -40 || diff.dy < -40;
+    if (isCancel != _draggedToCancel) {
+      setState(() => _draggedToCancel = isCancel);
+    }
+  }
+
   Future<void> _stopRecording() async {
     if (!_isRecordingAudio) return;
     _recordTimer?.cancel();
     final cancelled = _draggedToCancel;
+    _pointerOrigin = null;
+
     setState(() {
       _isRecordingAudio = false;
       _draggedToCancel = false;
@@ -92,7 +107,7 @@ class _MessageComposerState extends State<MessageComposer> {
     }
 
     final pcm = await _audioRecorder.stopRecording();
-    if (pcm.isNotEmpty) {
+    if (pcm.isNotEmpty && mounted) {
       widget.onSendAudio(pcm, 16000);
     }
   }
@@ -160,18 +175,121 @@ class _MessageComposerState extends State<MessageComposer> {
             color: Color(0xFF14161B),
             border: Border(top: BorderSide(color: Color(0xFF1E222D), width: 1)),
           ),
-          child: _isRecordingAudio ? _buildRecordingBar() : _buildInputBar(),
+          child: Row(
+            children: [
+              if (widget.canAttachImage && !_isRecordingAudio) ...[
+                IconButton(
+                  icon: const Icon(
+                    Icons.add_photo_alternate_outlined,
+                    color: Color(0xFF94A3B8),
+                  ),
+                  tooltip: 'Attach image for vision prompt',
+                  onPressed: widget.isBusy ? null : widget.onPickImage,
+                ),
+                const SizedBox(width: 4),
+              ],
+              if (widget.canAttachAudio) ...[
+                Listener(
+                  onPointerDown: (event) => _startRecording(event.position),
+                  onPointerMove: (event) => _onPointerMove(event.position),
+                  onPointerUp: (_) => _stopRecording(),
+                  onPointerCancel: (_) => _stopRecording(),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: _isRecordingAudio
+                          ? (_draggedToCancel
+                                ? const Color(0xFFEF4444)
+                                : const Color(0xFF3B82F6))
+                          : Colors.transparent,
+                      shape: BoxShape.circle,
+                    ),
+                    padding: const EdgeInsets.all(8),
+                    child: Icon(
+                      _isRecordingAudio
+                          ? Icons.mic_rounded
+                          : Icons.mic_none_rounded,
+                      color: _isRecordingAudio
+                          ? Colors.white
+                          : const Color(0xFF60A5FA),
+                      size: 22,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+              ],
+              Expanded(
+                child: _isRecordingAudio
+                    ? _buildRecordingIndicator()
+                    : TextField(
+                        controller: widget.controller,
+                        decoration: InputDecoration(
+                          hintText: widget.isGenerating
+                              ? 'Model is generating response...'
+                              : 'Send a message...',
+                          hintStyle: const TextStyle(color: Color(0xFF64748B)),
+                          filled: true,
+                          fillColor: const Color(0xFF0B0C0E),
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 12,
+                          ),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(24),
+                            borderSide: const BorderSide(
+                              color: Color(0xFF232732),
+                            ),
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(24),
+                            borderSide: const BorderSide(
+                              color: Color(0xFF232732),
+                            ),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(24),
+                            borderSide: const BorderSide(
+                              color: Color(0xFF3B82F6),
+                            ),
+                          ),
+                        ),
+                        enabled: !widget.isGenerating,
+                        onSubmitted: (_) => widget.onSend(),
+                      ),
+              ),
+              const SizedBox(width: 10),
+              if (widget.isGenerating)
+                IconButton.filled(
+                  style: IconButton.styleFrom(
+                    backgroundColor: const Color(0xFFEF4444),
+                    foregroundColor: Colors.white,
+                  ),
+                  icon: const Icon(Icons.stop_rounded),
+                  tooltip: 'Stop generation',
+                  onPressed: widget.onStop,
+                )
+              else if (!_isRecordingAudio)
+                IconButton.filled(
+                  style: IconButton.styleFrom(
+                    backgroundColor: const Color(0xFF3B82F6),
+                    foregroundColor: Colors.white,
+                  ),
+                  icon: const Icon(Icons.arrow_upward_rounded),
+                  tooltip: 'Send message',
+                  onPressed: widget.isBusy ? null : widget.onSend,
+                ),
+            ],
+          ),
         ),
       ],
     );
   }
 
-  Widget _buildRecordingBar() {
+  Widget _buildRecordingIndicator() {
     final minutes = (_recordingSeconds ~/ 60).toString().padLeft(2, '0');
     final seconds = (_recordingSeconds % 60).toString().padLeft(2, '0');
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       decoration: BoxDecoration(
         color: _draggedToCancel
             ? const Color(0xFF3B1219)
@@ -186,8 +304,8 @@ class _MessageComposerState extends State<MessageComposer> {
       child: Row(
         children: [
           Container(
-            width: 10,
-            height: 10,
+            width: 8,
+            height: 8,
             decoration: BoxDecoration(
               color: _draggedToCancel
                   ? const Color(0xFFEF4444)
@@ -195,23 +313,23 @@ class _MessageComposerState extends State<MessageComposer> {
               shape: BoxShape.circle,
             ),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 8),
           Text(
             '$minutes:$seconds',
             style: const TextStyle(
               fontWeight: FontWeight.w600,
-              fontSize: 13,
+              fontSize: 12,
               color: Color(0xFFF1F5F9),
             ),
           ),
-          const SizedBox(width: 16),
+          const SizedBox(width: 12),
           Expanded(
             child: Text(
               _draggedToCancel
                   ? 'Release to cancel'
                   : 'Recording... (slide away to cancel)',
               style: TextStyle(
-                fontSize: 12,
+                fontSize: 11,
                 color: _draggedToCancel
                     ? const Color(0xFFFCA5A5)
                     : const Color(0xFF93C5FD),
@@ -220,135 +338,8 @@ class _MessageComposerState extends State<MessageComposer> {
               overflow: TextOverflow.ellipsis,
             ),
           ),
-          GestureDetector(
-            onLongPressMoveUpdate: (details) {
-              if (details.localOffsetFromOrigin.dx < -50 ||
-                  details.localOffsetFromOrigin.dy < -50) {
-                if (!_draggedToCancel) setState(() => _draggedToCancel = true);
-              } else {
-                if (_draggedToCancel) setState(() => _draggedToCancel = false);
-              }
-            },
-            onLongPressEnd: (_) => _stopRecording(),
-            onLongPressCancel: () => _stopRecording(),
-            child: Container(
-              padding: const EdgeInsets.all(8),
-              decoration: BoxDecoration(
-                color: _draggedToCancel
-                    ? const Color(0xFFEF4444)
-                    : const Color(0xFF3B82F6),
-                shape: BoxShape.circle,
-              ),
-              child: const Icon(
-                Icons.mic_rounded,
-                size: 20,
-                color: Colors.white,
-              ),
-            ),
-          ),
         ],
       ),
-    );
-  }
-
-  Widget _buildInputBar() {
-    return Row(
-      children: [
-        if (widget.canAttachImage) ...[
-          IconButton(
-            icon: const Icon(
-              Icons.add_photo_alternate_outlined,
-              color: Color(0xFF94A3B8),
-            ),
-            tooltip: 'Attach image for vision prompt',
-            onPressed: widget.isBusy ? null : widget.onPickImage,
-          ),
-          const SizedBox(width: 4),
-        ],
-        if (widget.canAttachAudio) ...[
-          GestureDetector(
-            onLongPressStart: (_) => _startRecording(),
-            onLongPressMoveUpdate: (details) {
-              if (details.localOffsetFromOrigin.dx < -50 ||
-                  details.localOffsetFromOrigin.dy < -50) {
-                if (!_draggedToCancel) setState(() => _draggedToCancel = true);
-              } else {
-                if (_draggedToCancel) setState(() => _draggedToCancel = false);
-              }
-            },
-            onLongPressEnd: (_) => _stopRecording(),
-            onLongPressCancel: () => _stopRecording(),
-            child: IconButton(
-              icon: const Icon(
-                Icons.mic_none_rounded,
-                color: Color(0xFF60A5FA),
-              ),
-              tooltip: 'Hold to speak (audio model)',
-              onPressed: () {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Press and hold to speak, release to send.'),
-                    duration: Duration(seconds: 2),
-                  ),
-                );
-              },
-            ),
-          ),
-          const SizedBox(width: 4),
-        ],
-        Expanded(
-          child: TextField(
-            controller: widget.controller,
-            decoration: InputDecoration(
-              hintText: widget.isGenerating
-                  ? 'Model is generating response...'
-                  : 'Send a message...',
-              hintStyle: const TextStyle(color: Color(0xFF64748B)),
-              filled: true,
-              fillColor: const Color(0xFF0B0C0E),
-              contentPadding: const EdgeInsets.symmetric(
-                horizontal: 16,
-                vertical: 12,
-              ),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(24),
-                borderSide: const BorderSide(color: Color(0xFF232732)),
-              ),
-              enabledBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(24),
-                borderSide: const BorderSide(color: Color(0xFF232732)),
-              ),
-              focusedBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(24),
-                borderSide: const BorderSide(color: Color(0xFF3B82F6)),
-              ),
-            ),
-            enabled: !widget.isGenerating,
-            onSubmitted: (_) => widget.onSend(),
-          ),
-        ),
-        const SizedBox(width: 10),
-        if (widget.isGenerating)
-          IconButton.filled(
-            style: IconButton.styleFrom(
-              backgroundColor: const Color(0xFFEF4444),
-              foregroundColor: Colors.white,
-            ),
-            icon: const Icon(Icons.stop_rounded),
-            tooltip: 'Stop generation',
-            onPressed: widget.onStop,
-          )
-        else
-          IconButton.filled(
-            style: IconButton.styleFrom(
-              backgroundColor: const Color(0xFF3B82F6),
-              foregroundColor: Colors.white,
-            ),
-            icon: const Icon(Icons.arrow_upward_rounded),
-            tooltip: 'Send message',
-            onPressed: widget.isBusy ? null : widget.onSend,
-          ),
-      ],
     );
   }
 }
