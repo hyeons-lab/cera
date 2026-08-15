@@ -502,7 +502,7 @@ const OPS = {
       formatted = userContent;
     }
 
-    const allTokens = Array.from(tk.encode(formatted, false));
+    const allTokens = Array.from(tk.encodeSpecial(formatted, false));
     const splitIdx = markerId != null ? allTokens.indexOf(markerId) : -1;
     let prefix = splitIdx > 0 ? allTokens.slice(0, splitIdx) : [];
     if (splitIdx === -1 && prompt && prompt.trim() !== '') {
@@ -514,15 +514,7 @@ const OPS = {
     if (gpu) {
       console.info('[cera:worker] appendAudio: encoding audio frames for WebGPU KV cache...');
       if (prefix.length > 0) {
-        await gpu.session.generateTokens(
-          new Uint32Array(prefix),
-          0,
-          null,
-          null,
-          null,
-          null,
-          () => {},
-        );
+        gpu.session.appendTokens(new Uint32Array(prefix));
       }
       gpu.session.appendAudio(samples, sr);
     } else {

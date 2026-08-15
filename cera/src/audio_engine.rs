@@ -63,6 +63,7 @@ enum Modality {
 // ---------------------------------------------------------------------------
 
 /// Per-frame outcome from [`AudioOutputDecoder::decode_frame`].
+#[derive(Debug, Clone, PartialEq)]
 pub enum FrameOutcome {
     /// Codes sampled + detokenized; `audio_embedding` is the feedback
     /// embedding the caller should pass back through the main LLM.
@@ -75,11 +76,7 @@ pub enum FrameOutcome {
 
 /// Owns the audio output-decoder state and exposes per-frame operations.
 /// Extracted from `generate_audio` so the same per-frame logic is shared
-/// between the Sequential and Interleaved paths and so future decoder
-/// variants can slot in behind a common interface.
-///
-/// External `generate_audio` signature is unchanged; this is a purely
-/// internal refactor.
+/// between the Sequential and Interleaved paths and across CPU/WebGPU sessions.
 pub struct AudioOutputDecoder<'a> {
     weights: &'a AudioDecoderWeights,
     detok_weights: &'a DetokenizerWeights,
@@ -100,6 +97,21 @@ pub struct AudioOutputDecoder<'a> {
 }
 
 impl<'a> AudioOutputDecoder<'a> {
+    /// Total audio frames decoded so far in this session.
+    pub fn audio_frames(&self) -> usize {
+        self.audio_frames
+    }
+
+    /// Total duration spent in depthformer frame sampling.
+    pub fn time_depthformer(&self) -> Duration {
+        self.time_depthformer
+    }
+
+    /// Total duration spent in detokenizer spectral processing.
+    pub fn time_detokenizer(&self) -> Duration {
+        self.time_detokenizer
+    }
+
     pub fn new(
         weights: &'a AudioDecoderWeights,
         detok_weights: &'a DetokenizerWeights,

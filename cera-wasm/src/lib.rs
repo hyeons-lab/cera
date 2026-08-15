@@ -2152,6 +2152,13 @@ mod webgpu {
                 &voc_arc,
             )
             .map_err(|e| JsError::new(&format!("failed to parse audio decoder weights: {e:#}")))?;
+            let llm_hidden = cera::model::Model::config(&self.model).hidden_size;
+            if decoder_weights.decoder_config.n_embd != llm_hidden {
+                return Err(JsError::new(&format!(
+                    "audio vocoder expects an LLM with hidden size {}, but the loaded model has {}",
+                    decoder_weights.decoder_config.n_embd, llm_hidden
+                )));
+            }
             let detok_weights = cera::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_arc)
                 .map_err(|e| {
                     JsError::new(&format!("failed to parse detokenizer weights: {e:#}"))
@@ -2232,6 +2239,25 @@ mod webgpu {
         #[wasm_bindgen(getter)]
         pub fn position(&self) -> u32 {
             self.state.seq_len as u32
+        }
+
+        /// Feed `ids` into the KV cache without running any token generation.
+        #[wasm_bindgen(js_name = appendTokens)]
+        pub fn append_tokens(&mut self, ids: Vec<u32>) -> Result<(), JsError> {
+            let max_seq_len = self.model.config().max_seq_len;
+            let mut pos = self.state.seq_len;
+            if pos + ids.len() > max_seq_len {
+                return Err(JsError::new(&format!(
+                    "tokens of len {} plus {pos} already in context exceeds max sequence length {max_seq_len}",
+                    ids.len()
+                )));
+            }
+            for tok in ids {
+                self.model.forward_prefill_step(tok, pos, &mut self.state);
+                pos += 1;
+            }
+            self.state.seq_len = pos;
+            Ok(())
         }
 
         /// Whether this session can accept images, i.e. whether it was built
@@ -2777,7 +2803,7 @@ mod webgpu {
                     && let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights)
                 {
                     console_info(
-                        "[cera-wasm] WebGpuSession hit TOKEN_AUDIO_START (128). Beginning vocoder audio decoding on GPU...",
+                        "[cera-wasm] WebGpuSession hit TOKEN_AUDIO_START (128). Beginning vocoder audio decoding...",
                     );
                     if !pending.is_empty() {
                         let valid = match std::str::from_utf8(&pending) {
@@ -2790,6 +2816,10 @@ mod webgpu {
                             emit(on_token, &piece);
                         }
                         pending.clear();
+                    }
+
+                    if pos >= max_seq_len {
+                        break;
                     }
 
                     let mut decoder = cera::audio_engine::AudioOutputDecoder::new(
