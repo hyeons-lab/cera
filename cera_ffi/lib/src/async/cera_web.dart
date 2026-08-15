@@ -625,51 +625,72 @@ class _WorkerCera implements Cera {
   Future<void> appendImage(Uint8List bytes, {int? maxLongSize}) async {
     // Queued behind any running generation, as on native: this appends patch
     // embeddings to the very KV cache a decode is writing to.
-    await _queue;
-    final buffer = _detach(bytes);
-    await _send(
-      _newId(),
-      (id) => _Request(
-        id: id,
-        op: 'appendImage',
-        bytes: buffer,
-        maxLongSize: maxLongSize,
-      ),
-      transfer: <JSAny>[buffer],
-    );
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      await ahead;
+      final buffer = _detach(bytes);
+      await _send(
+        _newId(),
+        (id) => _Request(
+          id: id,
+          op: 'appendImage',
+          bytes: buffer,
+          maxLongSize: maxLongSize,
+        ),
+        transfer: <JSAny>[buffer],
+      );
+    } finally {
+      mine.complete();
+    }
   }
 
   @override
   Future<void> appendAudio(List<double> pcm, {int sampleRate = 16000}) async {
-    await _queue;
-    await _send(
-      _newId(),
-      (id) => _Request(
-        id: id,
-        op: 'appendAudio',
-        pcm: pcm.map((s) => s.toJS).toList().toJS,
-        sampleRate: sampleRate,
-      ),
-    );
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      await ahead;
+      await _send(
+        _newId(),
+        (id) => _Request(
+          id: id,
+          op: 'appendAudio',
+          pcm: pcm.map((s) => s.toJS).toList().toJS,
+          sampleRate: sampleRate,
+        ),
+      );
+    } finally {
+      mine.complete();
+    }
   }
 
   @override
   Future<String> transcribe(List<double> pcm, {required int sampleRate}) async {
-    await _queue;
-    final result = await _send(
-      _newId(),
-      (id) => _Request(
-        id: id,
-        op: 'transcribe',
-        // Crosses as a plain number array and is narrowed to Float32Array in
-        // the worker. A `Float64List` would transfer, but the samples are f32
-        // on the Rust side, so the wider buffer would be twice the traffic to
-        // then be halved.
-        pcm: pcm.map((s) => s.toJS).toList().toJS,
-        sampleRate: sampleRate,
-      ),
-    );
-    return (result as JSString).toDart;
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      await ahead;
+      final result = await _send(
+        _newId(),
+        (id) => _Request(
+          id: id,
+          op: 'transcribe',
+          // Crosses as a plain number array and is narrowed to Float32Array in
+          // the worker. A `Float64List` would transfer, but the samples are f32
+          // on the Rust side, so the wider buffer would be twice the traffic to
+          // then be halved.
+          pcm: pcm.map((s) => s.toJS).toList().toJS,
+          sampleRate: sampleRate,
+        ),
+      );
+      return (result as JSString).toDart;
+    } finally {
+      mine.complete();
+    }
   }
 
   @override

@@ -1062,11 +1062,11 @@ impl Session {
     /// 3. [`CeraError::Backend`] when the attached encoder's
     ///    `llm_hidden_size` doesn't match the LLM's `hidden_size`
     ///    (wrong-bundle encoder).
-    /// 4. [`CeraError::Backend`] on sample-rate mismatch.
-    /// 5. [`CeraError::EmptyInput`] when `samples` is empty *or* the
+    /// 4. [`CeraError::EmptyInput`] when `samples` is empty *or* the
     ///    audio is too short to produce any encoder frames (less than
-    ///    one window after center-padded STFT).
-    /// 6. [`CeraError::ContextOverflow`] / [`CeraError::Cancelled`]
+    ///    one window after center-padded STFT). Non-16kHz inputs are
+    ///    automatically resampled to 16kHz.
+    /// 5. [`CeraError::ContextOverflow`] / [`CeraError::Cancelled`]
     ///    propagated from the underlying [`Self::append_embeddings`]
     ///    call.
     pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), CeraError> {

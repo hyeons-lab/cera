@@ -106,8 +106,6 @@ class ChatState {
       hasModel && (capabilities?.imageIn ?? false) && !isBusy;
   bool get canAttachAudio =>
       hasModel && (capabilities?.audioIn ?? false) && !isBusy;
-  bool get canSend =>
-      hasModel && !isBusy && (!turns.any((t) => t.isGenerating));
 
   ChatState copyWith({
     LoadedModel? Function()? loadedModel,

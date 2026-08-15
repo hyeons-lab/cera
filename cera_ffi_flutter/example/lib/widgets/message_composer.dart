@@ -41,6 +41,7 @@ class MessageComposer extends StatefulWidget {
 
 class _MessageComposerState extends State<MessageComposer> {
   final AudioRecorderService _audioRecorder = AudioRecorderService();
+  bool _isStartingRecording = false;
   bool _isRecordingAudio = false;
   bool _draggedToCancel = false;
   Offset? _pointerOrigin;
@@ -55,11 +56,21 @@ class _MessageComposerState extends State<MessageComposer> {
   }
 
   Future<void> _startRecording(Offset globalPosition) async {
-    if (widget.isBusy || _isRecordingAudio) return;
+    if (widget.isBusy || _isRecordingAudio || _isStartingRecording) return;
+    _isStartingRecording = true;
+    _pointerOrigin = globalPosition;
     try {
-      _pointerOrigin = globalPosition;
       await _audioRecorder.startRecording(sampleRate: 16000);
-      if (!mounted) return;
+      if (!mounted) {
+        await _audioRecorder.cancelRecording();
+        return;
+      }
+      if (!_isStartingRecording) {
+        // User already released finger before recording finished starting
+        await _audioRecorder.cancelRecording();
+        return;
+      }
+      _isStartingRecording = false;
       setState(() {
         _isRecordingAudio = true;
         _draggedToCancel = false;
@@ -72,6 +83,7 @@ class _MessageComposerState extends State<MessageComposer> {
         }
       });
     } catch (err) {
+      _isStartingRecording = false;
       if (mounted) {
         ScaffoldMessenger.of(
           context,
@@ -91,6 +103,12 @@ class _MessageComposerState extends State<MessageComposer> {
   }
 
   Future<void> _stopRecording() async {
+    if (_isStartingRecording) {
+      _isStartingRecording = false;
+      _pointerOrigin = null;
+      await _audioRecorder.cancelRecording();
+      return;
+    }
     if (!_isRecordingAudio) return;
     _recordTimer?.cancel();
     final cancelled = _draggedToCancel;

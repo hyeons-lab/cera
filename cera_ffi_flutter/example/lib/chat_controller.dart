@@ -23,9 +23,6 @@ class ChatController extends ValueNotifier<ChatState> {
   Completer<void>? _generationCompleter;
   bool _disposed = false;
 
-  /// Exposes the active Cera engine if loaded (e.g. for external benchmark).
-  Cera? get engine => _ceraEngine;
-
   /// Loads locally tracked downloaded model records from persistent storage.
   Future<void> _loadDownloadedRecords() async {
     try {
@@ -350,22 +347,18 @@ class ChatController extends ValueNotifier<ChatState> {
       pendingImageName: () => null,
     );
 
-    final messages = newTurns
-        .where(
-          (t) =>
-              !t.isGenerating &&
-              (t.text.isNotEmpty ||
-                  t.imageBytes != null ||
-                  t.audioDurationSeconds != null),
-        )
-        .map((t) => CeraMessage(t.role, t.text))
-        .toList();
+    final promptText = prompt.trim();
+    final framedPrompt = promptText.isNotEmpty
+        ? promptText
+        : (imageBytes != null ? 'Describe this image.' : '');
 
     String formattedPrompt;
     try {
-      formattedPrompt = await cera.applyChatTemplate(messages);
+      formattedPrompt = await cera.applyChatTemplate([
+        CeraMessage.user(framedPrompt),
+      ]);
     } catch (_) {
-      formattedPrompt = prompt.trim();
+      formattedPrompt = framedPrompt;
     }
 
     if (imageBytes != null) {
@@ -421,22 +414,17 @@ class ChatController extends ValueNotifier<ChatState> {
       pendingImageName: () => null,
     );
 
-    final messages = newTurns
-        .where(
-          (t) =>
-              !t.isGenerating &&
-              (t.text.isNotEmpty ||
-                  t.imageBytes != null ||
-                  t.audioDurationSeconds != null),
-        )
-        .map((t) => CeraMessage(t.role, t.text))
-        .toList();
-
     String formattedPrompt;
-    try {
-      formattedPrompt = await cera.applyChatTemplate(messages);
-    } catch (_) {
-      formattedPrompt = promptText;
+    if (promptText.isNotEmpty) {
+      try {
+        formattedPrompt = await cera.applyChatTemplate([
+          CeraMessage.user(promptText),
+        ]);
+      } catch (_) {
+        formattedPrompt = promptText;
+      }
+    } else {
+      formattedPrompt = '';
     }
 
     try {
@@ -505,20 +493,35 @@ class ChatController extends ValueNotifier<ChatState> {
       _generationCompleter = null;
     }
 
+    int totalTokens = 0;
+    if (assistantTurn.text.isNotEmpty) {
+      try {
+        final encoded = await cera.encode(
+          assistantTurn.text,
+          addSpecial: false,
+        );
+        totalTokens = encoded.length;
+      } catch (_) {
+        totalTokens = tokenCount;
+      }
+    } else {
+      totalTokens = tokenCount;
+    }
+
     final totalMs = stopwatch.elapsedMilliseconds;
     final ttft = firstTokenMs;
     final decodeMs = ttft != null ? (totalMs - ttft) : totalMs;
-    final tps = tokenCount > 1 && decodeMs > 0
-        ? ((tokenCount - 1) / (decodeMs / 1000.0))
-        : (tokenCount == 1 && totalMs > 0
-              ? (tokenCount / (totalMs / 1000.0))
+    final tps = totalTokens > 1 && decodeMs > 0
+        ? ((totalTokens - 1) / (decodeMs / 1000.0))
+        : (totalTokens == 1 && totalMs > 0
+              ? (totalTokens / (totalMs / 1000.0))
               : 0.0);
 
     assistantTurn.isGenerating = false;
     assistantTurn.statusText = null;
-    if (tokenCount > 0) {
+    if (totalTokens > 0) {
       assistantTurn.stats = TurnStats(
-        tokens: tokenCount,
+        tokens: totalTokens,
         totalMs: totalMs,
         ttftMs: ttft,
         tps: tps,
@@ -569,6 +572,18 @@ class ChatController extends ValueNotifier<ChatState> {
     await _onStopGeneration();
     try {
       await _ceraEngine?.reset();
+    } on UnsupportedError {
+      // The WebGPU backend owns its KV cache on the GPU with no in-place reset;
+      // reopen the engine with the current model to clear it cleanly.
+      final current = value.loadedModel;
+      if (current != null) {
+        await _ceraEngine?.close();
+        _ceraEngine = null;
+        try {
+          final reloaded = await current.open();
+          _ceraEngine = reloaded;
+        } catch (_) {}
+      }
     } catch (_) {}
     value = value.copyWith(turns: []);
   }

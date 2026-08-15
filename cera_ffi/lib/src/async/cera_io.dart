@@ -438,17 +438,31 @@ class _NativeCera implements Cera {
     // queued behind each other: this appends patch embeddings to the very KV
     // cache a decode is writing to, and interleaving the two would splice the
     // image into the middle of the answer.
-    await _queue;
-    _ensureOpen();
-    _session.appendImage(bytes, maxLongSize);
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      await ahead;
+      _ensureOpen();
+      _session.appendImage(bytes, maxLongSize);
+    } finally {
+      mine.complete();
+    }
   }
 
   @override
   Future<void> appendAudio(List<double> pcm, {int sampleRate = 16000}) async {
     _ensureOpen();
-    await _queue;
-    _ensureOpen();
-    _session.appendAudio(pcm, sampleRate);
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      await ahead;
+      _ensureOpen();
+      _session.appendAudio(pcm, sampleRate);
+    } finally {
+      mine.complete();
+    }
   }
 
   @override
@@ -457,9 +471,16 @@ class _NativeCera implements Cera {
     // Queued despite not touching the session: it is a full prefill plus decode
     // on the shared engine, so running it under a generation would contend on
     // the same model for the length of the clip.
-    await _queue;
-    _ensureOpen();
-    return _engine.transcribe(pcm, sampleRate);
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      await ahead;
+      _ensureOpen();
+      return _engine.transcribe(pcm, sampleRate);
+    } finally {
+      mine.complete();
+    }
   }
 
   @override

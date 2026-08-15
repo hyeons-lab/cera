@@ -259,10 +259,8 @@ async function openCpuBundle(repo, bundleId, quant, contextSize, onProgress) {
 /**
  * What the live model accepts and emits.
  *
- * The GPU session reports its own, which is not the engine's: `WebGpuSession`
- * accepts an image only when it was built with a projector, and never accepts
- * audio. Reporting the CPU engine's answer for a GPU session would promise a
- * modality the live path refuses.
+ * Both the GPU and CPU sessions report their own loaded capabilities (text,
+ * vision, audio) based on the attached multimodal projectors.
  */
 function capabilitiesOf() {
   const caps = gpu ? gpu.session.capabilities : cpu.engine.capabilities;

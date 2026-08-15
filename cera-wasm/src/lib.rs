@@ -2139,7 +2139,7 @@ mod webgpu {
             let proj_arc = Arc::new(proj_gguf);
             let llm_hidden = cera::model::Model::config(&self.model).hidden_size;
 
-            if proj_arc.metadata().contains_key("clip.audio.block_count") {
+            if proj_arc.metadata.contains_key("clip.audio.block_count") {
                 let weights = cera::model::audio_encoder::AudioEncoderWeights::from_gguf(&proj_arc)
                     .map_err(map_err)?;
                 let enc_hidden = weights.config.llm_hidden_size;
@@ -2382,10 +2382,7 @@ mod webgpu {
                 ),
             };
             if n_tokens == 0 {
-                return Err(crate::map_cera_err(cera::CeraError::AudioClipTooShort {
-                    samples: effective_samples.len(),
-                    min_samples: cera::model::audio_encoder::WINDOW_LEN,
-                }));
+                return Err(crate::map_cera_err(cera::CeraError::EmptyInput));
             }
 
             let start = self.state.seq_len;
