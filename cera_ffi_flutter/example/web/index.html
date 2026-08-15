@@ -59,6 +59,98 @@
         throw err;
       }
     };
+
+    let activeAudioSource = null;
+    let activeAudioCtx = null;
+    let activeStreamer = null;
+
+    class CeraAudioStreamer {
+      constructor(sampleRate = 24000) {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        this.ctx = new AudioCtx({ sampleRate });
+        this.sampleRate = sampleRate;
+        this.nextStartTime = this.ctx.currentTime;
+        this.isPlaying = true;
+      }
+
+      appendChunk(float32Array) {
+        if (!this.isPlaying || !float32Array || float32Array.length === 0) return;
+        const buffer = this.ctx.createBuffer(1, float32Array.length, this.sampleRate);
+        buffer.copyToChannel(float32Array, 0);
+        const source = this.ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(this.ctx.destination);
+        const startTime = Math.max(this.ctx.currentTime, this.nextStartTime);
+        source.start(startTime);
+        this.nextStartTime = startTime + buffer.duration;
+      }
+
+      stop() {
+        this.isPlaying = false;
+        if (this.ctx.state !== 'closed') {
+          this.ctx.close();
+        }
+      }
+    }
+
+    window.ceraPlayAudio = async function(float32Array, sampleRate) {
+      window.ceraStopAudio();
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const sr = sampleRate || 24000;
+      const ctx = new AudioCtx({ sampleRate: sr });
+      activeAudioCtx = ctx;
+      const buffer = ctx.createBuffer(1, float32Array.length, sr);
+      buffer.copyToChannel(float32Array, 0);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      activeAudioSource = source;
+      return new Promise((resolve) => {
+        source.onended = () => {
+          if (activeAudioSource === source) {
+            activeAudioSource = null;
+          }
+          if (ctx.state !== 'closed') {
+            ctx.close();
+          }
+          resolve();
+        };
+        source.start(0);
+      });
+    };
+
+    window.ceraStopAudio = function() {
+      if (activeAudioSource) {
+        try { activeAudioSource.stop(); } catch (_) {}
+        activeAudioSource = null;
+      }
+      if (activeAudioCtx) {
+        try { if (activeAudioCtx.state !== 'closed') activeAudioCtx.close(); } catch (_) {}
+        activeAudioCtx = null;
+      }
+      if (activeStreamer) {
+        activeStreamer.stop();
+        activeStreamer = null;
+      }
+    };
+
+    window.ceraStartAudioStream = function(sampleRate) {
+      if (activeStreamer) activeStreamer.stop();
+      activeStreamer = new CeraAudioStreamer(sampleRate || 24000);
+    };
+
+    window.ceraAppendAudioStreamChunk = function(float32Array) {
+      if (activeStreamer) {
+        activeStreamer.appendChunk(float32Array);
+      }
+    };
+
+    window.ceraStopAudioStream = function() {
+      if (activeStreamer) {
+        activeStreamer.stop();
+        activeStreamer = null;
+      }
+    };
   </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>

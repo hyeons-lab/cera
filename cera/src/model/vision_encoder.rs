@@ -922,10 +922,15 @@ pub(crate) fn interpolate_pos_embed_2d(
     out_w: usize,
     n_embd: usize,
 ) -> Vec<f32> {
-    if in_h == 0 || in_w == 0 || out_h == 0 || out_w == 0 || n_embd == 0 {
+    if in_h == 0
+        || in_w == 0
+        || out_h == 0
+        || out_w == 0
+        || n_embd == 0
+        || pos.len() != in_h * in_w * n_embd
+    {
         return Vec::new();
     }
-    debug_assert_eq!(pos.len(), in_h * in_w * n_embd);
     let mut out = vec![0f32; out_h * out_w * n_embd];
     let scale_y = in_h as f32 / out_h as f32;
     let scale_x = in_w as f32 / out_w as f32;

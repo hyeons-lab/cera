@@ -2586,9 +2586,11 @@ fn main() -> Result<()> {
                     max_tokens,
                     sampler: cera::sampler::SamplerConfig {
                         temperature: temperature.unwrap_or(default_opts.temperature),
-                        top_p: default_opts.top_p,
-                        top_k: default_opts.top_k as usize,
-                        min_p: default_opts.min_p,
+                        top_p: top_p.unwrap_or(default_opts.top_p),
+                        top_k: top_k
+                            .map(|k| k as usize)
+                            .unwrap_or(default_opts.top_k as usize),
+                        min_p: min_p.unwrap_or(default_opts.min_p),
                         ..Default::default()
                     },
                     audio_temperature,

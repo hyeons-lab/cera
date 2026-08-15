@@ -2154,10 +2154,8 @@ mod webgpu {
                     )));
                 }
                 let weights = Arc::new(weights);
-                self.gpu_audio_encoder = cera::model::audio_encoder_gpu::build_gpu_audio_encoder(
-                    &weights,
-                    cera::BackendPreference::Gpu,
-                );
+                // Audio encoding on WebGPU falls back to the CPU encoder path.
+                self.gpu_audio_encoder = None;
                 self.audio_encoder = Some(weights);
                 Ok(())
             } else {

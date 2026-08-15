@@ -566,6 +566,7 @@ class _ChatPageState extends State<ChatPage> {
                 child: MessageList(
                   turns: state.turns,
                   scrollController: _scrollController,
+                  audioPlayer: _controller.audioPlayer,
                 ),
               ),
               MessageComposer(

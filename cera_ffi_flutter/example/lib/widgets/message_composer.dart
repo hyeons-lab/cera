@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import '../services/audio_recorder_service.dart';
+import 'audio_waveform.dart';
 
 /// Bottom message composer with text input, image attachment preview,
 /// vision picker trigger, audio push-to-talk microphone trigger, and send/stop button.
@@ -311,49 +312,14 @@ class _MessageComposerState extends State<MessageComposer> {
   }
 
   Widget _buildRecordingIndicator(ThemeData theme) {
-    final minutes = (_recordingSeconds ~/ 60).toString().padLeft(2, '0');
-    final seconds = (_recordingSeconds % 60).toString().padLeft(2, '0');
-
     final color = _draggedToCancel
         ? theme.colorScheme.error
         : theme.colorScheme.primary;
 
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(24),
-        border: Border.all(color: color),
-      ),
-      child: Row(
-        children: [
-          Container(
-            width: 8,
-            height: 8,
-            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            '$minutes:$seconds',
-            style: TextStyle(
-              fontWeight: FontWeight.w600,
-              fontSize: 12,
-              color: theme.colorScheme.onSurface,
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              _draggedToCancel
-                  ? 'Release to cancel'
-                  : 'Recording... (slide away to cancel)',
-              style: TextStyle(fontSize: 11, color: color),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-        ],
-      ),
+    return RecordingWaveformIndicator(
+      recordingSeconds: _recordingSeconds,
+      isCancelled: _draggedToCancel,
+      color: color,
     );
   }
 }

@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import '../chat_state.dart';
+import '../services/audio_player_service.dart';
+import 'audio_waveform.dart';
 
 /// Conversation transcript list with message bubbles, stats, and empty state.
 class MessageList extends StatelessWidget {
@@ -7,10 +9,12 @@ class MessageList extends StatelessWidget {
     super.key,
     required this.turns,
     required this.scrollController,
+    this.audioPlayer,
   });
 
   final List<Turn> turns;
   final ScrollController scrollController;
+  final AudioPlayerService? audioPlayer;
 
   @override
   Widget build(BuildContext context) {
@@ -67,16 +71,17 @@ class MessageList extends StatelessWidget {
       itemCount: turns.length,
       itemBuilder: (context, index) {
         final turn = turns[index];
-        return _TurnBubble(turn: turn);
+        return _TurnBubble(turn: turn, audioPlayer: audioPlayer);
       },
     );
   }
 }
 
 class _TurnBubble extends StatelessWidget {
-  const _TurnBubble({required this.turn});
+  const _TurnBubble({required this.turn, this.audioPlayer});
 
   final Turn turn;
+  final AudioPlayerService? audioPlayer;
 
   @override
   Widget build(BuildContext context) {
@@ -126,71 +131,50 @@ class _TurnBubble extends StatelessWidget {
                   const SizedBox(height: 8),
                 ],
                 if (isUser && turn.audioDurationSeconds != null) ...[
-                  Container(
-                    margin: const EdgeInsets.only(bottom: 6),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 4,
-                    ),
-                    decoration: BoxDecoration(
-                      color: theme.colorScheme.primary,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          Icons.graphic_eq_rounded,
-                          size: 14,
-                          color: theme.colorScheme.onPrimary,
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          '${turn.audioDurationSeconds!.toStringAsFixed(1)}s voice input',
-                          style: TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                            color: theme.colorScheme.onPrimary,
-                          ),
-                        ),
-                      ],
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: AudioWaveformBubble(
+                      durationSeconds: turn.audioDurationSeconds!,
+                      samples: turn.audioSamples,
+                      audioPlayer: audioPlayer,
                     ),
                   ),
                 ],
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 12,
-                  ),
-                  decoration: BoxDecoration(
-                    color: isUser
-                        ? theme.colorScheme.primary
-                        : theme.colorScheme.surface,
-                    borderRadius: BorderRadius.circular(16).copyWith(
-                      bottomRight: isUser
-                          ? const Radius.circular(4)
-                          : const Radius.circular(16),
-                      bottomLeft: !isUser
-                          ? const Radius.circular(4)
-                          : const Radius.circular(16),
+                if (turn.text.isNotEmpty || turn.isGenerating)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 12,
                     ),
-                    border: isUser
-                        ? null
-                        : Border.all(color: theme.colorScheme.outline),
-                  ),
-                  child: turn.isGenerating && turn.text.isEmpty
-                      ? _TypingIndicator(label: turn.statusText)
-                      : SelectableText(
-                          turn.text,
-                          style: TextStyle(
-                            fontSize: 14,
-                            height: 1.5,
-                            color: isUser
-                                ? theme.colorScheme.onPrimary
-                                : theme.colorScheme.onSurface,
+                    decoration: BoxDecoration(
+                      color: isUser
+                          ? theme.colorScheme.primary
+                          : theme.colorScheme.surface,
+                      borderRadius: BorderRadius.circular(16).copyWith(
+                        bottomRight: isUser
+                            ? const Radius.circular(4)
+                            : const Radius.circular(16),
+                        bottomLeft: !isUser
+                            ? const Radius.circular(4)
+                            : const Radius.circular(16),
+                      ),
+                      border: isUser
+                          ? null
+                          : Border.all(color: theme.colorScheme.outline),
+                    ),
+                    child: turn.isGenerating && turn.text.isEmpty
+                        ? _TypingIndicator(label: turn.statusText)
+                        : SelectableText(
+                            turn.text,
+                            style: TextStyle(
+                              fontSize: 14,
+                              height: 1.5,
+                              color: isUser
+                                  ? theme.colorScheme.onPrimary
+                                  : theme.colorScheme.onSurface,
+                            ),
                           ),
-                        ),
-                ),
+                  ),
                 if (!isUser &&
                     (turn.modelName != null || turn.stats != null)) ...[
                   const SizedBox(height: 6),

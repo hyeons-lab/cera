@@ -6,6 +6,7 @@
 
 import 'package:cera_ffi_flutter_example/chat_state.dart';
 import 'package:cera_ffi_flutter_example/main.dart';
+import 'package:cera_ffi_flutter_example/widgets/audio_waveform.dart';
 import 'package:cera_ffi_flutter_example/widgets/message_list.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -111,7 +112,8 @@ void main() {
       ),
     );
 
-    expect(find.text('3.5s voice input'), findsOneWidget);
+    expect(find.byType(AudioWaveformBubble), findsOneWidget);
+    expect(find.text('3.5s'), findsOneWidget);
     expect(find.text('What is the weather?'), findsOneWidget);
     expect(find.text('It is sunny today.'), findsOneWidget);
     expect(find.text('LFM2.5-Audio-1.5B · Q4_0'), findsOneWidget);

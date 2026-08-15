@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'chat_intent.dart';
 import 'chat_state.dart';
 import 'model_source.dart';
+import 'services/audio_player_service.dart';
 
 /// MVI Controller / Store managing state transitions, Cera engine lifecycle,
 /// download progress, and token generation.
@@ -18,10 +19,14 @@ class ChatController extends ValueNotifier<ChatState> {
   }
 
   final Future<String?> Function() _defaultStoreDir;
+  final AudioPlayerService _audioPlayer = AudioPlayerService();
   Cera? _ceraEngine;
   StreamSubscription<String>? _generationSub;
   Completer<void>? _generationCompleter;
   bool _disposed = false;
+
+  /// Audio player service instance.
+  AudioPlayerService get audioPlayer => _audioPlayer;
 
   /// Loads locally tracked downloaded model records from persistent storage.
   Future<void> _loadDownloadedRecords() async {
@@ -471,6 +476,7 @@ class ChatController extends ValueNotifier<ChatState> {
       role: 'user',
       text: promptText,
       audioDurationSeconds: durationSec,
+      audioSamples: intent.pcmSamples,
     );
 
     final assistantTurn = Turn(
@@ -639,6 +645,7 @@ class ChatController extends ValueNotifier<ChatState> {
   }
 
   Future<void> _onStopGeneration() async {
+    _audioPlayer.stop();
     if (_generationSub != null) {
       await _generationSub?.cancel();
       _generationSub = null;
@@ -711,6 +718,7 @@ class ChatController extends ValueNotifier<ChatState> {
   @override
   void dispose() {
     _disposed = true;
+    _audioPlayer.dispose();
     _generationSub?.cancel();
     if (_generationCompleter != null && !_generationCompleter!.isCompleted) {
       _generationCompleter!.complete();

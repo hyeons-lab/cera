@@ -27,6 +27,7 @@ class Turn {
     this.imageBytes,
     this.imageName,
     this.audioDurationSeconds,
+    this.audioSamples,
     this.stats,
     this.isGenerating = false,
     this.statusText,
@@ -38,6 +39,7 @@ class Turn {
   final Uint8List? imageBytes;
   final String? imageName;
   final double? audioDurationSeconds;
+  final List<double>? audioSamples;
   final TurnStats? stats;
   final bool isGenerating;
   final String? statusText;
@@ -49,6 +51,7 @@ class Turn {
     Uint8List? imageBytes,
     String? imageName,
     double? audioDurationSeconds,
+    List<double>? audioSamples,
     TurnStats? stats,
     bool? isGenerating,
     String? Function()? statusText,
@@ -60,6 +63,7 @@ class Turn {
       imageBytes: imageBytes ?? this.imageBytes,
       imageName: imageName ?? this.imageName,
       audioDurationSeconds: audioDurationSeconds ?? this.audioDurationSeconds,
+      audioSamples: audioSamples ?? this.audioSamples,
       stats: stats ?? this.stats,
       isGenerating: isGenerating ?? this.isGenerating,
       statusText: statusText != null ? statusText() : this.statusText,
