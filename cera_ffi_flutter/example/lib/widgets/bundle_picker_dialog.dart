@@ -108,11 +108,11 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return AlertDialog(
-      backgroundColor: const Color(0xFF14161B),
+      backgroundColor: theme.colorScheme.surface,
       surfaceTintColor: Colors.transparent,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(16),
-        side: const BorderSide(color: Color(0xFF232732)),
+        side: BorderSide(color: theme.colorScheme.outline),
       ),
       title: const Text(
         'Select Model',
@@ -126,9 +126,9 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
             // Segmented Tab Switcher
             Container(
               decoration: BoxDecoration(
-                color: const Color(0xFF0B0C0E),
+                color: theme.scaffoldBackgroundColor,
                 borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: const Color(0xFF232732)),
+                border: Border.all(color: theme.colorScheme.outline),
               ),
               padding: const EdgeInsets.all(3),
               child: Row(
@@ -172,9 +172,9 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
 
   Widget _buildDownloadedView(ThemeData theme) {
     if (_loadingDownloaded) {
-      return const Center(
+      return Center(
         child: CircularProgressIndicator(
-          valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF3B82F6)),
+          valueColor: AlwaysStoppedAnimation<Color>(theme.colorScheme.primary),
         ),
       );
     }
@@ -186,26 +186,26 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(
+              Icon(
                 Icons.folder_open_rounded,
                 size: 48,
-                color: Color(0xFF64748B),
+                color: theme.colorScheme.onSurfaceVariant,
               ),
               const SizedBox(height: 12),
-              const Text(
+              Text(
                 'No models downloaded yet',
                 style: TextStyle(
                   fontWeight: FontWeight.w600,
                   fontSize: 15,
-                  color: Color(0xFFF1F5F9),
+                  color: theme.colorScheme.onSurface,
                 ),
               ),
               const SizedBox(height: 6),
-              const Text(
+              Text(
                 'Download models from the catalog to run fast, offline on-device inference.',
                 textAlign: TextAlign.center,
                 style: TextStyle(
-                  color: Color(0xFF8E95A5),
+                  color: theme.colorScheme.onSurfaceVariant,
                   fontSize: 12,
                   height: 1.4,
                 ),
@@ -213,8 +213,8 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
               const SizedBox(height: 18),
               FilledButton.icon(
                 style: FilledButton.styleFrom(
-                  backgroundColor: const Color(0xFF3B82F6),
-                  foregroundColor: Colors.white,
+                  backgroundColor: theme.colorScheme.primary,
+                  foregroundColor: theme.colorScheme.onPrimary,
                   padding: const EdgeInsets.symmetric(
                     horizontal: 16,
                     vertical: 10,
@@ -236,7 +236,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
     return ListView.separated(
       itemCount: _downloaded.length,
       separatorBuilder: (_, _) =>
-          const Divider(color: Color(0xFF1E222D), height: 1),
+          Divider(color: theme.colorScheme.outlineVariant, height: 1),
       itemBuilder: (context, i) {
         final model = _downloaded[i];
         final isActive =
@@ -245,10 +245,15 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
 
         return Container(
           decoration: BoxDecoration(
-            color: isActive ? const Color(0xFF162338) : null,
+            color: isActive
+                ? theme.colorScheme.primary.withValues(alpha: 0.16)
+                : null,
             borderRadius: BorderRadius.circular(8),
             border: isActive
-                ? Border.all(color: const Color(0x663B82F6), width: 1)
+                ? Border.all(
+                    color: theme.colorScheme.primary.withValues(alpha: 0.4),
+                    width: 1,
+                  )
                 : null,
           ),
           child: ListTile(
@@ -260,7 +265,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                     model.displayName,
                     style: TextStyle(
                       fontWeight: isActive ? FontWeight.w700 : FontWeight.w600,
-                      color: isActive ? const Color(0xFF93C5FD) : null,
+                      color: isActive ? theme.colorScheme.primary : null,
                     ),
                   ),
                 ),
@@ -271,9 +276,11 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                       vertical: 2,
                     ),
                     decoration: BoxDecoration(
-                      color: const Color(0xFF0E3E2F),
+                      color: Colors.green.withValues(alpha: 0.2),
                       borderRadius: BorderRadius.circular(6),
-                      border: Border.all(color: const Color(0x6610B981)),
+                      border: Border.all(
+                        color: Colors.green.withValues(alpha: 0.4),
+                      ),
                     ),
                     child: const Row(
                       mainAxisSize: MainAxisSize.min,
@@ -281,13 +288,13 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                         Icon(
                           Icons.check_circle_rounded,
                           size: 11,
-                          color: Color(0xFF34D399),
+                          color: Colors.greenAccent,
                         ),
                         SizedBox(width: 4),
                         Text(
                           'Active',
                           style: TextStyle(
-                            color: Color(0xFF34D399),
+                            color: Colors.greenAccent,
                             fontSize: 11,
                             fontWeight: FontWeight.w600,
                           ),
@@ -299,10 +306,10 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
             ),
             subtitle: Text(
               model.quant,
-              style: const TextStyle(
+              style: TextStyle(
                 fontFamily: 'monospace',
                 fontSize: 12,
-                color: Color(0xFF8E95A5),
+                color: theme.colorScheme.onSurfaceVariant,
               ),
             ),
             trailing: Row(
@@ -328,17 +335,17 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                     ),
                   )
                 else
-                  const Icon(
+                  Icon(
                     Icons.check_rounded,
                     size: 18,
-                    color: Color(0xFF60A5FA),
+                    color: theme.colorScheme.primary,
                   ),
                 const SizedBox(width: 4),
                 IconButton(
-                  icon: const Icon(
+                  icon: Icon(
                     Icons.delete_outline_rounded,
                     size: 18,
-                    color: Color(0xFF64748B),
+                    color: theme.colorScheme.onSurfaceVariant,
                   ),
                   tooltip: 'Remove from list',
                   onPressed: () => _removeDownloadedModel(model),
@@ -375,9 +382,9 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
         }
         final rawBundles = snapshot.data;
         if (rawBundles == null) {
-          return const Center(
+          return Center(
             child: CircularProgressIndicator(
-              valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF3B82F6)),
+              valueColor: AlwaysStoppedAnimation<Color>(theme.colorScheme.primary),
             ),
           );
         }
@@ -390,7 +397,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
         return ListView.separated(
           itemCount: bundles.length,
           separatorBuilder: (_, _) =>
-              const Divider(color: Color(0xFF1E222D), height: 1),
+              Divider(color: theme.colorScheme.outlineVariant, height: 1),
           itemBuilder: (context, i) {
             final bundle = bundles[i];
             final isCurrentBundle = bundle.name == widget.currentBundleName;
@@ -414,9 +421,11 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                         vertical: 2,
                       ),
                       decoration: BoxDecoration(
-                        color: const Color(0xFF0E3E2F),
+                        color: Colors.green.withValues(alpha: 0.2),
                         borderRadius: BorderRadius.circular(6),
-                        border: Border.all(color: const Color(0x6610B981)),
+                        border: Border.all(
+                          color: Colors.green.withValues(alpha: 0.4),
+                        ),
                       ),
                       child: const Row(
                         mainAxisSize: MainAxisSize.min,
@@ -424,13 +433,13 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                           Icon(
                             Icons.check_circle_rounded,
                             size: 12,
-                            color: Color(0xFF34D399),
+                            color: Colors.greenAccent,
                           ),
                           SizedBox(width: 4),
                           Text(
                             'Active',
                             style: TextStyle(
-                              color: Color(0xFF34D399),
+                              color: Colors.greenAccent,
                               fontSize: 11,
                               fontWeight: FontWeight.w600,
                             ),
@@ -442,7 +451,10 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
               ),
               subtitle: Text(
                 '$n quantization${n == 1 ? "" : "s"}',
-                style: const TextStyle(color: Color(0xFF8E95A5), fontSize: 12),
+                style: TextStyle(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontSize: 12,
+                ),
               ),
               children: [
                 for (final quant in quants)
@@ -454,7 +466,9 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                         (r) => r.bundleName == bundle.name && r.quant == quant,
                       );
                       return Container(
-                        color: isLoadedQuant ? const Color(0xFF162338) : null,
+                        color: isLoadedQuant
+                            ? theme.colorScheme.primary.withValues(alpha: 0.16)
+                            : null,
                         child: ListTile(
                           dense: true,
                           title: Row(
@@ -467,7 +481,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                                       ? FontWeight.w700
                                       : FontWeight.normal,
                                   color: isLoadedQuant
-                                      ? const Color(0xFF93C5FD)
+                                      ? theme.colorScheme.primary
                                       : null,
                                 ),
                               ),
@@ -479,13 +493,13 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                                     vertical: 1,
                                   ),
                                   decoration: BoxDecoration(
-                                    color: const Color(0xFF1E3A5F),
+                                    color: theme.colorScheme.primary.withValues(alpha: 0.2),
                                     borderRadius: BorderRadius.circular(4),
                                   ),
-                                  child: const Text(
+                                  child: Text(
                                     'Active',
                                     style: TextStyle(
-                                      color: Color(0xFF60A5FA),
+                                      color: theme.colorScheme.primary,
                                       fontSize: 10,
                                       fontWeight: FontWeight.w700,
                                     ),
@@ -499,13 +513,13 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                                     vertical: 1,
                                   ),
                                   decoration: BoxDecoration(
-                                    color: const Color(0xFF1F2937),
+                                    color: theme.colorScheme.outlineVariant,
                                     borderRadius: BorderRadius.circular(4),
                                   ),
-                                  child: const Text(
+                                  child: Text(
                                     'Downloaded',
                                     style: TextStyle(
-                                      color: Color(0xFF9CA3AF),
+                                      color: theme.colorScheme.onSurfaceVariant,
                                       fontSize: 10,
                                       fontWeight: FontWeight.w600,
                                     ),
@@ -522,8 +536,8 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                                       : Icons.download_rounded),
                             size: 18,
                             color: isLoadedQuant
-                                ? const Color(0xFF60A5FA)
-                                : const Color(0xFF94A3B8),
+                                ? theme.colorScheme.primary
+                                : theme.colorScheme.onSurfaceVariant,
                           ),
                           onTap: () => Navigator.of(context).pop(
                             BundleChoice(
@@ -562,8 +576,9 @@ class _TabButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Material(
-      color: isSelected ? const Color(0xFF1E222D) : Colors.transparent,
+      color: isSelected ? theme.colorScheme.outlineVariant : Colors.transparent,
       borderRadius: BorderRadius.circular(7),
       child: InkWell(
         onTap: onTap,
@@ -578,8 +593,8 @@ class _TabButton extends StatelessWidget {
                   icon,
                   size: 15,
                   color: isSelected
-                      ? const Color(0xFFF1F5F9)
-                      : const Color(0xFF8E95A5),
+                      ? theme.colorScheme.onSurface
+                      : theme.colorScheme.onSurfaceVariant,
                 ),
                 const SizedBox(width: 6),
               ],
@@ -589,8 +604,8 @@ class _TabButton extends StatelessWidget {
                   fontSize: 13,
                   fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
                   color: isSelected
-                      ? const Color(0xFFF1F5F9)
-                      : const Color(0xFF8E95A5),
+                      ? theme.colorScheme.onSurface
+                      : theme.colorScheme.onSurfaceVariant,
                 ),
               ),
               if (count != null && count! > 0) ...[
@@ -602,8 +617,8 @@ class _TabButton extends StatelessWidget {
                   ),
                   decoration: BoxDecoration(
                     color: isSelected
-                        ? const Color(0xFF3B82F6)
-                        : const Color(0xFF262938),
+                        ? theme.colorScheme.primary
+                        : theme.colorScheme.outlineVariant,
                     borderRadius: BorderRadius.circular(10),
                   ),
                   child: Text(
@@ -612,8 +627,8 @@ class _TabButton extends StatelessWidget {
                       fontSize: 11,
                       fontWeight: FontWeight.w700,
                       color: isSelected
-                          ? Colors.white
-                          : const Color(0xFF94A3B8),
+                          ? theme.colorScheme.onPrimary
+                          : theme.colorScheme.onSurfaceVariant,
                     ),
                   ),
                 ),

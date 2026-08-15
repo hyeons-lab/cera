@@ -132,13 +132,14 @@ class _MessageComposerState extends State<MessageComposer> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         if (widget.pendingImageBytes != null)
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            color: const Color(0xFF14161B),
+            color: theme.colorScheme.surface,
             child: Row(
               children: [
                 ClipRRect(
@@ -157,29 +158,29 @@ class _MessageComposerState extends State<MessageComposer> {
                     children: [
                       Text(
                         widget.pendingImageName ?? 'Attached image',
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.w600,
-                          color: Color(0xFFF1F5F9),
+                          color: theme.colorScheme.onSurface,
                         ),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
-                      const Text(
+                      Text(
                         'Will be sent with next prompt',
                         style: TextStyle(
                           fontSize: 11,
-                          color: Color(0xFF8E95A5),
+                          color: theme.colorScheme.onSurfaceVariant,
                         ),
                       ),
                     ],
                   ),
                 ),
                 IconButton(
-                  icon: const Icon(
+                  icon: Icon(
                     Icons.close_rounded,
                     size: 18,
-                    color: Color(0xFF94A3B8),
+                    color: theme.colorScheme.onSurfaceVariant,
                   ),
                   tooltip: 'Remove attached image',
                   onPressed: widget.isBusy ? null : widget.onClearImage,
@@ -189,17 +190,19 @@ class _MessageComposerState extends State<MessageComposer> {
           ),
         Container(
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-          decoration: const BoxDecoration(
-            color: Color(0xFF14161B),
-            border: Border(top: BorderSide(color: Color(0xFF1E222D), width: 1)),
+          decoration: BoxDecoration(
+            color: theme.colorScheme.surface,
+            border: Border(
+              top: BorderSide(color: theme.colorScheme.outlineVariant, width: 1),
+            ),
           ),
           child: Row(
             children: [
               if (widget.canAttachImage && !_isRecordingAudio) ...[
                 IconButton(
-                  icon: const Icon(
+                  icon: Icon(
                     Icons.add_photo_alternate_outlined,
-                    color: Color(0xFF94A3B8),
+                    color: theme.colorScheme.onSurfaceVariant,
                   ),
                   tooltip: 'Attach image for vision prompt',
                   onPressed: widget.isBusy ? null : widget.onPickImage,
@@ -216,8 +219,8 @@ class _MessageComposerState extends State<MessageComposer> {
                     decoration: BoxDecoration(
                       color: _isRecordingAudio
                           ? (_draggedToCancel
-                                ? const Color(0xFFEF4444)
-                                : const Color(0xFF3B82F6))
+                              ? theme.colorScheme.error
+                              : theme.colorScheme.primary)
                           : Colors.transparent,
                       shape: BoxShape.circle,
                     ),
@@ -227,8 +230,8 @@ class _MessageComposerState extends State<MessageComposer> {
                           ? Icons.mic_rounded
                           : Icons.mic_none_rounded,
                       color: _isRecordingAudio
-                          ? Colors.white
-                          : const Color(0xFF60A5FA),
+                          ? theme.colorScheme.onPrimary
+                          : theme.colorScheme.primary,
                       size: 22,
                     ),
                   ),
@@ -237,36 +240,38 @@ class _MessageComposerState extends State<MessageComposer> {
               ],
               Expanded(
                 child: _isRecordingAudio
-                    ? _buildRecordingIndicator()
+                    ? _buildRecordingIndicator(theme)
                     : TextField(
                         controller: widget.controller,
                         decoration: InputDecoration(
                           hintText: widget.isGenerating
                               ? 'Model is generating response...'
                               : 'Send a message...',
-                          hintStyle: const TextStyle(color: Color(0xFF64748B)),
+                          hintStyle: TextStyle(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
                           filled: true,
-                          fillColor: const Color(0xFF0B0C0E),
+                          fillColor: theme.scaffoldBackgroundColor,
                           contentPadding: const EdgeInsets.symmetric(
                             horizontal: 16,
                             vertical: 12,
                           ),
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(24),
-                            borderSide: const BorderSide(
-                              color: Color(0xFF232732),
+                            borderSide: BorderSide(
+                              color: theme.colorScheme.outline,
                             ),
                           ),
                           enabledBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(24),
-                            borderSide: const BorderSide(
-                              color: Color(0xFF232732),
+                            borderSide: BorderSide(
+                              color: theme.colorScheme.outline,
                             ),
                           ),
                           focusedBorder: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(24),
-                            borderSide: const BorderSide(
-                              color: Color(0xFF3B82F6),
+                            borderSide: BorderSide(
+                              color: theme.colorScheme.primary,
                             ),
                           ),
                         ),
@@ -278,8 +283,8 @@ class _MessageComposerState extends State<MessageComposer> {
               if (widget.isGenerating)
                 IconButton.filled(
                   style: IconButton.styleFrom(
-                    backgroundColor: const Color(0xFFEF4444),
-                    foregroundColor: Colors.white,
+                    backgroundColor: theme.colorScheme.error,
+                    foregroundColor: theme.colorScheme.onError,
                   ),
                   icon: const Icon(Icons.stop_rounded),
                   tooltip: 'Stop generation',
@@ -288,8 +293,8 @@ class _MessageComposerState extends State<MessageComposer> {
               else if (!_isRecordingAudio)
                 IconButton.filled(
                   style: IconButton.styleFrom(
-                    backgroundColor: const Color(0xFF3B82F6),
-                    foregroundColor: Colors.white,
+                    backgroundColor: theme.colorScheme.primary,
+                    foregroundColor: theme.colorScheme.onPrimary,
                   ),
                   icon: const Icon(Icons.arrow_upward_rounded),
                   tooltip: 'Send message',
@@ -302,22 +307,20 @@ class _MessageComposerState extends State<MessageComposer> {
     );
   }
 
-  Widget _buildRecordingIndicator() {
+  Widget _buildRecordingIndicator(ThemeData theme) {
     final minutes = (_recordingSeconds ~/ 60).toString().padLeft(2, '0');
     final seconds = (_recordingSeconds % 60).toString().padLeft(2, '0');
+
+    final color = _draggedToCancel
+        ? theme.colorScheme.error
+        : theme.colorScheme.primary;
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       decoration: BoxDecoration(
-        color: _draggedToCancel
-            ? const Color(0xFF3B1219)
-            : const Color(0xFF182234),
+        color: color.withValues(alpha: 0.12),
         borderRadius: BorderRadius.circular(24),
-        border: Border.all(
-          color: _draggedToCancel
-              ? const Color(0xFFEF4444)
-              : const Color(0xFF3B82F6),
-        ),
+        border: Border.all(color: color),
       ),
       child: Row(
         children: [
@@ -325,19 +328,17 @@ class _MessageComposerState extends State<MessageComposer> {
             width: 8,
             height: 8,
             decoration: BoxDecoration(
-              color: _draggedToCancel
-                  ? const Color(0xFFEF4444)
-                  : const Color(0xFF60A5FA),
+              color: color,
               shape: BoxShape.circle,
             ),
           ),
           const SizedBox(width: 8),
           Text(
             '$minutes:$seconds',
-            style: const TextStyle(
+            style: TextStyle(
               fontWeight: FontWeight.w600,
               fontSize: 12,
-              color: Color(0xFFF1F5F9),
+              color: theme.colorScheme.onSurface,
             ),
           ),
           const SizedBox(width: 12),
@@ -348,9 +349,7 @@ class _MessageComposerState extends State<MessageComposer> {
                   : 'Recording... (slide away to cancel)',
               style: TextStyle(
                 fontSize: 11,
-                color: _draggedToCancel
-                    ? const Color(0xFFFCA5A5)
-                    : const Color(0xFF93C5FD),
+                color: color,
               ),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,

@@ -18,5 +18,5 @@ jobs:
       - uses: JetBrains/junie-github-action@v1.3.7
         with:
           junie_api_key: ${{ secrets.JUNIE_API_KEY }}
-          use_single_comment: true
+          use_single_comment: false
           prompt: "code-review"

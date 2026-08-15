@@ -367,9 +367,9 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: const Color(0xFF14161B),
+              color: theme.colorScheme.surface,
               borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: const Color(0xFF232732)),
+              border: Border.all(color: theme.colorScheme.outline),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -377,7 +377,7 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
                 Text(
                   'Runs the same prompt on both backends and reports what each cost.',
                   style: theme.textTheme.bodyMedium?.copyWith(
-                    color: const Color(0xFFF1F5F9),
+                    color: theme.colorScheme.onSurface,
                     fontWeight: FontWeight.w500,
                   ),
                 ),
@@ -390,7 +390,7 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
                             'second run is whichever backend auto picked. The browser '
                             'is where this comparison is a real one.',
                   style: theme.textTheme.bodySmall?.copyWith(
-                    color: const Color(0xFF94A3B8),
+                    color: theme.colorScheme.onSurfaceVariant,
                     height: 1.4,
                   ),
                 ),
@@ -403,23 +403,23 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               decoration: BoxDecoration(
-                color: const Color(0xFF14161B),
+                color: theme.colorScheme.surface,
                 borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: const Color(0xFF232732)),
+                border: Border.all(color: theme.colorScheme.outline),
               ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Icon(
+                  Icon(
                     Icons.memory_rounded,
                     size: 16,
-                    color: Color(0xFF60A5FA),
+                    color: theme.colorScheme.primary,
                   ),
                   const SizedBox(width: 8),
                   Text(
                     'Model: ${widget.model.name}',
-                    style: const TextStyle(
-                      color: Color(0xFFF1F5F9),
+                    style: TextStyle(
+                      color: theme.colorScheme.onSurface,
                       fontSize: 13,
                       fontWeight: FontWeight.w500,
                       fontFamily: 'monospace',
@@ -443,27 +443,27 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
               decoration: BoxDecoration(
-                color: const Color(0xFF14161B),
+                color: theme.colorScheme.surface,
                 borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: const Color(0xFF232732)),
+                border: Border.all(color: theme.colorScheme.outline),
               ),
               child: Row(
                 children: [
-                  const SizedBox(
+                  SizedBox(
                     width: 16,
                     height: 16,
                     child: CircularProgressIndicator(
                       strokeWidth: 2,
                       valueColor: AlwaysStoppedAnimation<Color>(
-                        Color(0xFF3B82F6),
+                        theme.colorScheme.primary,
                       ),
                     ),
                   ),
                   const SizedBox(width: 12),
                   Text(
                     'Running $_running… ($_maxTokens tokens)',
-                    style: const TextStyle(
-                      color: Color(0xFFE2E8F0),
+                    style: TextStyle(
+                      color: theme.colorScheme.onSurface,
                       fontSize: 13,
                       fontWeight: FontWeight.w500,
                     ),
@@ -499,9 +499,9 @@ class _ResultCard extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: const Color(0xFF14161B),
+        color: theme.colorScheme.surface,
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: const Color(0xFF232732), width: 1),
+        border: Border.all(color: theme.colorScheme.outline, width: 1),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -515,13 +515,13 @@ class _ResultCard extends StatelessWidget {
                 ),
                 decoration: BoxDecoration(
                   color: isGpu
-                      ? const Color(0xFF1E3A5F)
-                      : const Color(0xFF262938),
+                      ? theme.colorScheme.primary.withValues(alpha: 0.16)
+                      : theme.colorScheme.outlineVariant,
                   borderRadius: BorderRadius.circular(6),
                   border: Border.all(
                     color: isGpu
-                        ? const Color(0x803B82F6)
-                        : const Color(0xFF475569),
+                        ? theme.colorScheme.primary.withValues(alpha: 0.4)
+                        : theme.colorScheme.outline,
                   ),
                 ),
                 child: Text(
@@ -530,8 +530,8 @@ class _ResultCard extends StatelessWidget {
                     fontSize: 13,
                     fontWeight: FontWeight.w700,
                     color: isGpu
-                        ? const Color(0xFF93C5FD)
-                        : const Color(0xFFE2E8F0),
+                        ? theme.colorScheme.primary
+                        : theme.colorScheme.onSurface,
                   ),
                 ),
               ),
@@ -543,7 +543,7 @@ class _ResultCard extends StatelessWidget {
                     fontSize: 18,
                     fontWeight: FontWeight.w700,
                     fontFamily: 'monospace',
-                    color: Color(0xFF34D399),
+                    color: Colors.greenAccent,
                   ),
                 ),
             ],
@@ -553,19 +553,25 @@ class _ResultCard extends StatelessWidget {
             Text(
               result.error!,
               style: theme.textTheme.bodySmall?.copyWith(
-                color: const Color(0xFFEF4444),
+                color: theme.colorScheme.error,
               ),
             )
           else ...[
             Text(
               'Backend: ${result.backend}',
-              style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+              style: TextStyle(
+                color: theme.colorScheme.onSurfaceVariant,
+                fontSize: 12,
+              ),
             ),
             const SizedBox(height: 4),
             Text(
               'Time to first token: ${result.ttft.inMilliseconds} ms '
               '(prefill of ${result.promptTokens} tokens, plus one decode step)',
-              style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+              style: TextStyle(
+                color: theme.colorScheme.onSurfaceVariant,
+                fontSize: 12,
+              ),
             ),
             const SizedBox(height: 4),
             Text(
@@ -576,13 +582,19 @@ class _ResultCard extends StatelessWidget {
                   : 'Decoded ${result.decodeTokens} tokens, the last '
                         '${result.decodeTokens - 1} of them in '
                         '${result.decodeSpan.inMilliseconds} ms',
-              style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
+              style: TextStyle(
+                color: theme.colorScheme.onSurfaceVariant,
+                fontSize: 12,
+              ),
             ),
             if (result.note != null) ...[
               const SizedBox(height: 4),
               Text(
                 result.note!,
-                style: const TextStyle(color: Color(0xFFEF4444), fontSize: 12),
+                style: TextStyle(
+                  color: theme.colorScheme.error,
+                  fontSize: 12,
+                ),
               ),
             ],
             const SizedBox(height: 10),
@@ -590,14 +602,14 @@ class _ResultCard extends StatelessWidget {
               width: double.infinity,
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
-                color: const Color(0xFF0B0C0E),
+                color: theme.scaffoldBackgroundColor,
                 borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: const Color(0xFF1E222D)),
+                border: Border.all(color: theme.colorScheme.outlineVariant),
               ),
               child: Text(
                 result.output.trim(),
-                style: const TextStyle(
-                  color: Color(0xFFCBD5E1),
+                style: TextStyle(
+                  color: theme.colorScheme.onSurface,
                   fontStyle: FontStyle.italic,
                   fontSize: 12,
                   height: 1.4,
@@ -620,6 +632,7 @@ class _Speedup extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     final cpuRate = cpu.decodeTokensPerSecond;
     final gpuRate = gpu.decodeTokensPerSecond;
     if (cpuRate == null || gpuRate == null || cpuRate <= 0 || gpuRate <= 0) {
@@ -636,10 +649,14 @@ class _Speedup extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: isFaster ? const Color(0xFF06281E) : const Color(0xFF14161B),
+        color: isFaster
+            ? Colors.green.withValues(alpha: 0.16)
+            : theme.colorScheme.surface,
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
-          color: isFaster ? const Color(0x6610B981) : const Color(0xFF232732),
+          color: isFaster
+              ? Colors.green.withValues(alpha: 0.4)
+              : theme.colorScheme.outline,
           width: 1,
         ),
       ),
@@ -647,7 +664,9 @@ class _Speedup extends StatelessWidget {
         children: [
           Icon(
             isFaster ? Icons.bolt_rounded : Icons.info_outline_rounded,
-            color: isFaster ? const Color(0xFF34D399) : const Color(0xFF94A3B8),
+            color: isFaster
+                ? Colors.greenAccent
+                : theme.colorScheme.onSurfaceVariant,
             size: 24,
           ),
           const SizedBox(width: 12),
@@ -656,8 +675,8 @@ class _Speedup extends StatelessWidget {
               headline,
               style: TextStyle(
                 color: isFaster
-                    ? const Color(0xFFE6FFFA)
-                    : const Color(0xFFF1F5F9),
+                    ? Colors.greenAccent
+                    : theme.colorScheme.onSurface,
                 fontSize: 15,
                 fontWeight: FontWeight.w600,
               ),

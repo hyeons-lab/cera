@@ -431,7 +431,7 @@ const OPS = {
    */
   appendAudio({ pcm, sampleRate }) {
     const t0 = performance.now();
-    const samples = Float32Array.from(pcm);
+    const samples = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm);
     const sr = sampleRate ?? 16000;
     console.info(
       `[cera:worker] appendAudio: processing ${samples.length} audio samples at ${sr}Hz (${(samples.length / sr).toFixed(1)}s)...`,
@@ -462,9 +462,10 @@ const OPS = {
           'no audio path. Open the model with backend: cpu to transcribe.',
       );
     }
-    console.info(`[cera:worker] transcribe: running ASR on ${pcm.length} samples at ${sampleRate}Hz...`);
+    const samples = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm);
+    console.info(`[cera:worker] transcribe: running ASR on ${samples.length} samples at ${sampleRate}Hz...`);
     const t0 = performance.now();
-    const result = cpu.engine.transcribe(Float32Array.from(pcm), sampleRate);
+    const result = cpu.engine.transcribe(samples, sampleRate);
     console.info(`[cera:worker] transcribe: completed in ${(performance.now() - t0).toFixed(1)}ms`);
     return result;
   },

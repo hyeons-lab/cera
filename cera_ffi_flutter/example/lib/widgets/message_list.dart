@@ -14,6 +14,7 @@ class MessageList extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     if (turns.isEmpty) {
       return Center(
         child: Padding(
@@ -25,32 +26,32 @@ class MessageList extends StatelessWidget {
                 width: 64,
                 height: 64,
                 decoration: BoxDecoration(
-                  color: const Color(0xFF14161B),
+                  color: theme.colorScheme.surface,
                   shape: BoxShape.circle,
-                  border: Border.all(color: const Color(0xFF232732)),
+                  border: Border.all(color: theme.colorScheme.outline),
                 ),
-                child: const Icon(
+                child: Icon(
                   Icons.auto_awesome_rounded,
                   size: 28,
-                  color: Color(0xFF60A5FA),
+                  color: theme.colorScheme.primary,
                 ),
               ),
               const SizedBox(height: 16),
-              const Text(
+              Text(
                 'Cera On-Device AI',
                 style: TextStyle(
                   fontSize: 18,
                   fontWeight: FontWeight.w700,
-                  color: Color(0xFFF1F5F9),
+                  color: theme.colorScheme.onSurface,
                 ),
               ),
               const SizedBox(height: 8),
-              const Text(
+              Text(
                 'High-performance, local LLM & Vision inference on CPU and GPU.',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 13,
-                  color: Color(0xFF8E95A5),
+                  color: theme.colorScheme.onSurfaceVariant,
                   height: 1.4,
                 ),
               ),
@@ -79,6 +80,7 @@ class _TurnBubble extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     final isUser = turn.role == 'user';
     return Padding(
       padding: const EdgeInsets.only(bottom: 16),
@@ -92,15 +94,15 @@ class _TurnBubble extends StatelessWidget {
             Container(
               width: 32,
               height: 32,
-              decoration: const BoxDecoration(
-                color: Color(0xFF1E3A5F),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.primary.withValues(alpha: 0.16),
                 shape: BoxShape.circle,
               ),
-              child: const Center(
+              child: Center(
                 child: Icon(
                   Icons.smart_toy_rounded,
                   size: 16,
-                  color: Color(0xFF60A5FA),
+                  color: theme.colorScheme.primary,
                 ),
               ),
             ),
@@ -131,24 +133,24 @@ class _TurnBubble extends StatelessWidget {
                       vertical: 4,
                     ),
                     decoration: BoxDecoration(
-                      color: const Color(0xFF1D4ED8),
+                      color: theme.colorScheme.primary,
                       borderRadius: BorderRadius.circular(8),
                     ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        const Icon(
+                        Icon(
                           Icons.graphic_eq_rounded,
                           size: 14,
-                          color: Colors.white,
+                          color: theme.colorScheme.onPrimary,
                         ),
                         const SizedBox(width: 6),
                         Text(
                           '${turn.audioDurationSeconds!.toStringAsFixed(1)}s voice input',
-                          style: const TextStyle(
+                          style: TextStyle(
                             fontSize: 11,
                             fontWeight: FontWeight.w600,
-                            color: Colors.white,
+                            color: theme.colorScheme.onPrimary,
                           ),
                         ),
                       ],
@@ -162,8 +164,8 @@ class _TurnBubble extends StatelessWidget {
                   ),
                   decoration: BoxDecoration(
                     color: isUser
-                        ? const Color(0xFF2563EB)
-                        : const Color(0xFF14161B),
+                        ? theme.colorScheme.primary
+                        : theme.colorScheme.surface,
                     borderRadius: BorderRadius.circular(16).copyWith(
                       bottomRight: isUser
                           ? const Radius.circular(4)
@@ -174,7 +176,7 @@ class _TurnBubble extends StatelessWidget {
                     ),
                     border: isUser
                         ? null
-                        : Border.all(color: const Color(0xFF232732)),
+                        : Border.all(color: theme.colorScheme.outline),
                   ),
                   child: turn.isGenerating && turn.text.isEmpty
                       ? _TypingIndicator(label: turn.statusText)
@@ -184,8 +186,8 @@ class _TurnBubble extends StatelessWidget {
                             fontSize: 14,
                             height: 1.5,
                             color: isUser
-                                ? Colors.white
-                                : const Color(0xFFF1F5F9),
+                                ? theme.colorScheme.onPrimary
+                                : theme.colorScheme.onSurface,
                           ),
                         ),
                 ),
@@ -204,25 +206,27 @@ class _TurnBubble extends StatelessWidget {
                             vertical: 2,
                           ),
                           decoration: BoxDecoration(
-                            color: const Color(0xFF182234),
+                            color: theme.colorScheme.primary.withValues(alpha: 0.12),
                             borderRadius: BorderRadius.circular(4),
-                            border: Border.all(color: const Color(0xFF24334C)),
+                            border: Border.all(
+                              color: theme.colorScheme.primary.withValues(alpha: 0.24),
+                            ),
                           ),
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              const Icon(
+                              Icon(
                                 Icons.memory_rounded,
                                 size: 11,
-                                color: Color(0xFF60A5FA),
+                                color: theme.colorScheme.primary,
                               ),
                               const SizedBox(width: 4),
                               Text(
                                 turn.modelName!,
-                                style: const TextStyle(
+                                style: TextStyle(
                                   fontSize: 10.5,
                                   fontWeight: FontWeight.w600,
-                                  color: Color(0xFF93C5FD),
+                                  color: theme.colorScheme.primary,
                                 ),
                               ),
                             ],
@@ -234,26 +238,26 @@ class _TurnBubble extends StatelessWidget {
                           children: [
                             Text(
                               '${turn.stats!.tokens} tokens · ${turn.stats!.tps.toStringAsFixed(1)} tok/s',
-                              style: const TextStyle(
+                              style: TextStyle(
                                 fontSize: 11,
                                 fontWeight: FontWeight.w600,
-                                color: Color(0xFF8E95A5),
+                                color: theme.colorScheme.onSurfaceVariant,
                               ),
                             ),
                             if (turn.stats!.ttftMs != null) ...[
-                              const Text(
+                              Text(
                                 ' · TTFT ',
                                 style: TextStyle(
                                   fontSize: 11,
-                                  color: Color(0xFF64748B),
+                                  color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.7),
                                 ),
                               ),
                               Text(
                                 '${turn.stats!.ttftMs}ms',
-                                style: const TextStyle(
+                                style: TextStyle(
                                   fontSize: 11,
                                   fontWeight: FontWeight.w600,
-                                  color: Color(0xFF8E95A5),
+                                  color: theme.colorScheme.onSurfaceVariant,
                                 ),
                               ),
                             ],
@@ -296,13 +300,17 @@ class _TypingIndicatorState extends State<_TypingIndicator>
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         if (widget.label != null) ...[
           Text(
             widget.label!,
-            style: const TextStyle(fontSize: 13, color: Color(0xFF94A3B8)),
+            style: TextStyle(
+              fontSize: 13,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
           ),
           const SizedBox(width: 8),
         ],
@@ -320,7 +328,7 @@ class _TypingIndicatorState extends State<_TypingIndicator>
                   width: 6,
                   height: 6,
                   decoration: BoxDecoration(
-                    color: Color.fromRGBO(96, 165, 250, opacity),
+                    color: theme.colorScheme.primary.withValues(alpha: opacity),
                     shape: BoxShape.circle,
                   ),
                 );

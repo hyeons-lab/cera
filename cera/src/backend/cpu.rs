@@ -1972,7 +1972,8 @@ pub fn gemv_q4_1_f32(
 /// Vector dot product of two `f32` slices of equal length.
 #[inline]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "dot_f32 input lengths must match");
+    let len = a.len();
     let mut sum0 = 0.0f32;
     let mut sum1 = 0.0f32;
     let mut sum2 = 0.0f32;
@@ -1982,7 +1983,7 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     let mut sum6 = 0.0f32;
     let mut sum7 = 0.0f32;
 
-    let chunks = a.len() / 8;
+    let chunks = len / 8;
     for i in 0..chunks {
         let base = i * 8;
         sum0 += a[base] * b[base];
@@ -1995,7 +1996,7 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         sum7 += a[base + 7] * b[base + 7];
     }
     let mut sum = ((sum0 + sum1) + (sum2 + sum3)) + ((sum4 + sum5) + (sum6 + sum7));
-    for i in (chunks * 8)..a.len() {
+    for i in (chunks * 8)..len {
         sum += a[i] * b[i];
     }
     sum

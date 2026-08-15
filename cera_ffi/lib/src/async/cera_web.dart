@@ -45,7 +45,7 @@ extension type _Request._(JSObject _) implements JSObject {
     String? backend,
     String? inferenceType,
     int? maxLongSize,
-    JSArray<JSNumber>? pcm,
+    JSAny? pcm,
     int? sampleRate,
     String? prompt,
     int? maxTokens,
@@ -653,12 +653,13 @@ class _WorkerCera implements Cera {
     _queue = mine.future;
     try {
       await ahead;
+      final floatList = pcm is Float32List ? pcm : Float32List.fromList(pcm);
       await _send(
         _newId(),
         (id) => _Request(
           id: id,
           op: 'appendAudio',
-          pcm: pcm.map((s) => s.toJS).toList().toJS,
+          pcm: floatList.toJS,
           sampleRate: sampleRate,
         ),
       );
@@ -674,16 +675,13 @@ class _WorkerCera implements Cera {
     _queue = mine.future;
     try {
       await ahead;
+      final floatList = pcm is Float32List ? pcm : Float32List.fromList(pcm);
       final result = await _send(
         _newId(),
         (id) => _Request(
           id: id,
           op: 'transcribe',
-          // Crosses as a plain number array and is narrowed to Float32Array in
-          // the worker. A `Float64List` would transfer, but the samples are f32
-          // on the Rust side, so the wider buffer would be twice the traffic to
-          // then be halved.
-          pcm: pcm.map((s) => s.toJS).toList().toJS,
+          pcm: floatList.toJS,
           sampleRate: sampleRate,
         ),
       );

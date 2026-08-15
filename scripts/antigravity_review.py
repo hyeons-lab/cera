@@ -143,7 +143,7 @@ def call_gemini_api(api_key: str, prompt: str) -> str:
 import datetime
 
 
-def post_or_update_comment(
+def post_comment(
     github_token: str,
     repo: str,
     pr_number: str,
@@ -177,49 +177,20 @@ def post_or_update_comment(
         "User-Agent": "Antigravity-Code-Review",
     }
 
-    # Check for existing comment with COMMENT_TAG
-    list_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
-    req = urllib.request.Request(list_url, headers=headers)
-    existing_comment_id = None
-
+    # Always create a new comment so updates trigger notifications and preserve review history
+    create_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
+    req = urllib.request.Request(
+        create_url,
+        data=json.dumps({"body": full_body}).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
     try:
-        with urllib.request.urlopen(req) as resp:
-            comments = json.loads(resp.read().decode("utf-8"))
-            for c in comments:
-                if COMMENT_TAG in c.get("body", ""):
-                    existing_comment_id = c.get("id")
-                    break
+        with urllib.request.urlopen(req):
+            print("Created new review comment on PR")
     except Exception as e:
-        print(f"Error fetching existing comments: {e}", file=sys.stderr)
-
-    if existing_comment_id:
-        # Update existing comment
-        update_url = f"https://api.github.com/repos/{repo}/issues/comments/{existing_comment_id}"
-        req = urllib.request.Request(
-            update_url,
-            data=json.dumps({"body": full_body}).encode("utf-8"),
-            headers=headers,
-            method="PATCH",
-        )
-        try:
-            with urllib.request.urlopen(req):
-                print(f"Updated existing review comment #{existing_comment_id}")
-        except Exception as e:
-            print(f"Error updating comment: {e}", file=sys.stderr)
-    else:
-        # Create new comment
-        create_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
-        req = urllib.request.Request(
-            create_url,
-            data=json.dumps({"body": full_body}).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req):
-                print("Created new review comment on PR")
-        except Exception as e:
-            print(f"Error posting comment: {e}", file=sys.stderr)
+        print(f"Error posting comment: {e}", file=sys.stderr)
+        raise
 
 
 def main():
@@ -323,7 +294,7 @@ Be direct, highly technical, actionable, and precise.
         sys.exit(1)
 
     print("Posting review comment to GitHub...")
-    post_or_update_comment(github_token, repo, pr_number, review, head_sha=head_sha)
+    post_comment(github_token, repo, pr_number, review, head_sha=head_sha)
 
 
 if __name__ == "__main__":

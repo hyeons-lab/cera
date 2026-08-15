@@ -217,9 +217,10 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   void _showModelOptionsSheet(ChatState state) {
+    final theme = Theme.of(context);
     showModalBottomSheet(
       context: context,
-      backgroundColor: const Color(0xFF14161B),
+      backgroundColor: theme.colorScheme.surface,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
@@ -231,9 +232,9 @@ class _ChatPageState extends State<ChatPage> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 ListTile(
-                  leading: const Icon(
+                  leading: Icon(
                     Icons.cloud_download_outlined,
-                    color: Color(0xFF60A5FA),
+                    color: theme.colorScheme.primary,
                   ),
                   title: const Text('Downloaded & Catalog Models'),
                   subtitle: const Text(
@@ -245,9 +246,9 @@ class _ChatPageState extends State<ChatPage> {
                   },
                 ),
                 ListTile(
-                  leading: const Icon(
+                  leading: Icon(
                     Icons.folder_open_outlined,
-                    color: Color(0xFF34D399),
+                    color: theme.colorScheme.primary,
                   ),
                   title: const Text('Open Local .gguf File...'),
                   subtitle: const Text('Pick a model file from disk storage'),
@@ -257,15 +258,15 @@ class _ChatPageState extends State<ChatPage> {
                   },
                 ),
                 if (state.hasModel) ...[
-                  const Divider(color: Color(0xFF232732)),
+                  Divider(color: theme.dividerColor),
                   ListTile(
-                    leading: const Icon(
+                    leading: Icon(
                       Icons.eject_outlined,
-                      color: Color(0xFFF87171),
+                      color: theme.colorScheme.error,
                     ),
-                    title: const Text(
+                    title: Text(
                       'Unload Active Model',
-                      style: TextStyle(color: Color(0xFFF87171)),
+                      style: TextStyle(color: theme.colorScheme.error),
                     ),
                     subtitle: const Text(
                       'Release memory and close model engine',
@@ -286,6 +287,7 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return ValueListenableBuilder<ChatState>(
       valueListenable: _controller,
       builder: (context, state, _) {
@@ -298,10 +300,10 @@ class _ChatPageState extends State<ChatPage> {
                 const SizedBox(height: 2),
                 Text(
                   state.status,
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 11,
                     fontWeight: FontWeight.normal,
-                    color: Color(0xFF8E95A5),
+                    color: theme.colorScheme.onSurfaceVariant,
                   ),
                   overflow: TextOverflow.ellipsis,
                 ),
@@ -313,12 +315,12 @@ class _ChatPageState extends State<ChatPage> {
                   ? LinearProgressIndicator(
                       value: state.downloadFraction,
                       minHeight: 3,
-                      backgroundColor: const Color(0xFF1E222D),
-                      valueColor: const AlwaysStoppedAnimation<Color>(
-                        Color(0xFF3B82F6),
+                      backgroundColor: theme.colorScheme.outlineVariant,
+                      valueColor: AlwaysStoppedAnimation<Color>(
+                        theme.colorScheme.primary,
                       ),
                     )
-                  : Container(color: const Color(0xFF1E222D), height: 1),
+                  : Container(color: theme.colorScheme.outlineVariant, height: 1),
             ),
             actions: [
               IconButton(

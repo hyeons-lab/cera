@@ -2127,7 +2127,11 @@ mod webgpu {
             let proj_arc = Arc::new(proj_gguf);
             let llm_hidden = cera::model::Model::config(&self.model).hidden_size;
 
-            if proj_arc.metadata.contains_key("clip.audio.block_count") {
+            let is_audio = proj_arc.metadata.contains_key("clip.audio.block_count")
+                || proj_arc.metadata.contains_key("clip.has_audio_encoder")
+                || proj_arc.metadata.contains_key("audio.block_count");
+
+            if is_audio {
                 let weights = cera::model::audio_encoder::AudioEncoderWeights::from_gguf(&proj_arc)
                     .map_err(map_err)?;
                 let enc_hidden = weights.config.llm_hidden_size;
