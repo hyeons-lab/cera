@@ -3881,7 +3881,7 @@ fn main() -> Result<()> {
                 if add_bos && let Some(bos) = tokenizer.bos_token() {
                     tokens.push(bos);
                 }
-                tokens.extend_from_slice(&tokenizer.encode(&prompt));
+                tokens.extend(tokenizer.encode(&prompt));
             }
 
             eprintln!(

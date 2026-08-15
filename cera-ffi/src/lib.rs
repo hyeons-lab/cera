@@ -1070,21 +1070,7 @@ impl CeraEngine {
     /// Returns default `GenerateOpts` for this engine, pre-populated with
     /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
     pub fn default_generate_opts(&self) -> GenerateOpts {
-        let core = self.inner.default_generate_opts();
-        GenerateOpts {
-            max_tokens: core.max_tokens,
-            temperature: core.temperature,
-            top_p: core.top_p,
-            top_k: core.top_k,
-            min_p: core.min_p,
-            repetition_penalty: core.repetition_penalty,
-            stop_tokens: core.stop_tokens,
-            ignore_eos: core.ignore_eos,
-            grammar: None,
-            grammar_trigger_tokens: core.grammar_trigger_tokens,
-            flush_every_tokens: core.flush_every_tokens,
-            flush_every_ms: core.flush_every_ms,
-        }
+        GenerateOpts::from(&self.inner.default_generate_opts())
     }
 
     // ----- Tokenizer surface (PR 13) ---------------------------------
@@ -1405,9 +1391,8 @@ pub struct GenerateOpts {
     pub flush_every_ms: u32,
 }
 
-impl Default for GenerateOpts {
-    fn default() -> Self {
-        let core = cera::GenerateOpts::default();
+impl From<&cera::GenerateOpts> for GenerateOpts {
+    fn from(core: &cera::GenerateOpts) -> Self {
         Self {
             max_tokens: core.max_tokens,
             temperature: core.temperature,
@@ -1415,15 +1400,27 @@ impl Default for GenerateOpts {
             top_k: core.top_k,
             min_p: core.min_p,
             repetition_penalty: core.repetition_penalty,
-            stop_tokens: core.stop_tokens,
+            stop_tokens: core.stop_tokens.clone(),
             ignore_eos: core.ignore_eos,
             // Core default is no grammar; the compiled `Arc` has no FFI form, so
             // the mirrored field is the (absent) source string.
             grammar: None,
-            grammar_trigger_tokens: core.grammar_trigger_tokens,
+            grammar_trigger_tokens: core.grammar_trigger_tokens.clone(),
             flush_every_tokens: core.flush_every_tokens,
             flush_every_ms: core.flush_every_ms,
         }
+    }
+}
+
+impl From<cera::GenerateOpts> for GenerateOpts {
+    fn from(core: cera::GenerateOpts) -> Self {
+        GenerateOpts::from(&core)
+    }
+}
+
+impl Default for GenerateOpts {
+    fn default() -> Self {
+        GenerateOpts::from(&cera::GenerateOpts::default())
     }
 }
 
@@ -1951,21 +1948,7 @@ impl Session {
     /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
     pub fn default_generate_opts(&self) -> Result<GenerateOpts, FfiError> {
         let guard = self.lock_inner()?;
-        let core = guard.default_generate_opts();
-        Ok(GenerateOpts {
-            max_tokens: core.max_tokens,
-            temperature: core.temperature,
-            top_p: core.top_p,
-            top_k: core.top_k,
-            min_p: core.min_p,
-            repetition_penalty: core.repetition_penalty,
-            stop_tokens: core.stop_tokens.clone(),
-            ignore_eos: core.ignore_eos,
-            grammar: None,
-            grammar_trigger_tokens: core.grammar_trigger_tokens.clone(),
-            flush_every_tokens: core.flush_every_tokens,
-            flush_every_ms: core.flush_every_ms,
-        })
+        Ok(GenerateOpts::from(guard.default_generate_opts()))
     }
 
     /// Run autoregressive decode and return all emitted tokens +
