@@ -235,6 +235,43 @@ impl MmapWeight {
         );
     }
 
+    /// Batched linear projection: `y[tokens, rows] = x[tokens, cols] · selfᵀ`
+    /// where `self` is `[rows × cols]`.
+    ///
+    /// By inverting the loop order (iterating over weight rows in the outer loop
+    /// and token rows in the inner loop), each quantized weight row is dequantized
+    /// and loaded into CPU cache **once** rather than `n_tokens` times.
+    pub fn batched_matmul(&self, x: &[f32], y: &mut [f32], n_tokens: usize) {
+        assert_eq!(x.len(), n_tokens * self.cols);
+        assert_eq!(y.len(), n_tokens * self.rows);
+        if n_tokens == 0 || self.rows == 0 || self.cols == 0 {
+            return;
+        }
+
+        // Fast path if already contiguous F32
+        if self.dtype == DType::F32 {
+            let w_f32 = self.as_f32();
+            for r in 0..self.rows {
+                let w_row = &w_f32[r * self.cols..(r + 1) * self.cols];
+                for t in 0..n_tokens {
+                    let x_row = &x[t * self.cols..(t + 1) * self.cols];
+                    y[t * self.rows + r] = crate::backend::cpu::dot_f32(x_row, w_row);
+                }
+            }
+            return;
+        }
+
+        // Quantized path: dequantize each row into scratch ONCE
+        let mut row_buf = vec![0.0f32; self.cols];
+        for r in 0..self.rows {
+            self.dequantize_row(r, &mut row_buf);
+            for t in 0..n_tokens {
+                let x_row = &x[t * self.cols..(t + 1) * self.cols];
+                y[t * self.rows + r] = crate::backend::cpu::dot_f32(x_row, &row_buf);
+            }
+        }
+    }
+
     /// Dequantise a single row at `row_idx` into `dst`. `dst.len()`
     /// must equal `self.cols`. Works for any dtype the rest of the
     /// crate supports (F32 path is a memcpy, quantised dtypes route

@@ -601,17 +601,21 @@ impl VisionEncoderWeights {
             crate::backend::cpu::layer_norm_inplace(row, &block.ln1_w, &block.ln1_b, cfg.eps);
         }
 
-        // Q/K/V projections per token. Each is [n_embd × n_embd]
-        // (12 heads × 64 head_dim = 768).
+        // Q/K/V projections batched across all tokens: weight rows dequantized once
+        block
+            .q_w
+            .batched_matmul(&scratch.pre_norm, &mut scratch.q, n_tokens);
+        block
+            .k_w
+            .batched_matmul(&scratch.pre_norm, &mut scratch.k, n_tokens);
+        block
+            .v_w
+            .batched_matmul(&scratch.pre_norm, &mut scratch.v, n_tokens);
+
         for t in 0..n_tokens {
-            let pre_row = &scratch.pre_norm[t * n_embd..(t + 1) * n_embd];
             let q_row = &mut scratch.q[t * n_embd..(t + 1) * n_embd];
             let k_row = &mut scratch.k[t * n_embd..(t + 1) * n_embd];
             let v_row = &mut scratch.v[t * n_embd..(t + 1) * n_embd];
-            block.q_w.gemv(pre_row, q_row);
-            block.k_w.gemv(pre_row, k_row);
-            block.v_w.gemv(pre_row, v_row);
-            // Add per-head biases.
             for (q, b) in q_row.iter_mut().zip(block.q_b.iter()) {
                 *q += *b;
             }
@@ -638,7 +642,7 @@ impl VisionEncoderWeights {
                 for (k_idx, score) in scratch.scores.iter_mut().enumerate() {
                     let k_off = k_idx * n_embd + h * head_dim;
                     let k = &scratch.k[k_off..k_off + head_dim];
-                    let dot: f32 = q.iter().zip(k).map(|(a, b)| a * b).sum();
+                    let dot = crate::backend::cpu::dot_f32(q, k);
                     *score = dot * scale;
                 }
                 // Softmax over the n_tokens scores.
@@ -659,10 +663,11 @@ impl VisionEncoderWeights {
         }
 
         // Output projection + bias + residual add.
+        block
+            .o_w
+            .batched_matmul(&scratch.attn_out, &mut scratch.attn_proj, n_tokens);
         for t in 0..n_tokens {
-            let attn_row = &scratch.attn_out[t * n_embd..(t + 1) * n_embd];
             let proj_row = &mut scratch.attn_proj[t * n_embd..(t + 1) * n_embd];
-            block.o_w.gemv(attn_row, proj_row);
             for (o, b) in proj_row.iter_mut().zip(block.o_b.iter()) {
                 *o += *b;
             }
@@ -680,17 +685,22 @@ impl VisionEncoderWeights {
             crate::backend::cpu::layer_norm_inplace(row, &block.ln2_w, &block.ln2_b, cfg.eps);
         }
         let n_ff = cfg.n_ff;
+        block
+            .ffn_up_w
+            .batched_matmul(&scratch.pre_norm, &mut scratch.ffn_mid, n_tokens);
         for t in 0..n_tokens {
-            let pre_row = &scratch.pre_norm[t * n_embd..(t + 1) * n_embd];
             let ff_row = &mut scratch.ffn_mid[t * n_ff..(t + 1) * n_ff];
-            block.ffn_up_w.gemv(pre_row, ff_row);
             for (f, b) in ff_row.iter_mut().zip(block.ffn_up_b.iter()) {
                 *f += *b;
             }
             crate::backend::cpu::gelu_inplace(ff_row);
-            // ffn_down: [n_embd × n_ff]
+        }
+
+        block
+            .ffn_down_w
+            .batched_matmul(&scratch.ffn_mid, &mut scratch.ffn_out, n_tokens);
+        for t in 0..n_tokens {
             let down_row = &mut scratch.ffn_out[t * n_embd..(t + 1) * n_embd];
-            block.ffn_down_w.gemv(ff_row, down_row);
             for (d, b) in down_row.iter_mut().zip(block.ffn_down_b.iter()) {
                 *d += *b;
             }
@@ -714,16 +724,19 @@ impl VisionEncoderWeights {
 
         let mut mid = vec![0f32; n_tokens * mid_dim];
         let mut out = vec![0f32; n_tokens * out_dim];
+
+        p.mm1_w.batched_matmul(pooled, &mut mid, n_tokens);
         for t in 0..n_tokens {
-            let in_row = &pooled[t * in_dim..(t + 1) * in_dim];
             let mid_row = &mut mid[t * mid_dim..(t + 1) * mid_dim];
-            p.mm1_w.gemv(in_row, mid_row);
             for (m, b) in mid_row.iter_mut().zip(p.mm1_b.iter()) {
                 *m += *b;
             }
             crate::backend::cpu::gelu_inplace(mid_row);
+        }
+
+        p.mm2_w.batched_matmul(&mid, &mut out, n_tokens);
+        for t in 0..n_tokens {
             let out_row = &mut out[t * out_dim..(t + 1) * out_dim];
-            p.mm2_w.gemv(mid_row, out_row);
             for (o, b) in out_row.iter_mut().zip(p.mm2_b.iter()) {
                 *o += *b;
             }
