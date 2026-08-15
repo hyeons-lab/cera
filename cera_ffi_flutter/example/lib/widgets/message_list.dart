@@ -95,7 +95,7 @@ class _TurnBubble extends StatelessWidget {
               width: 32,
               height: 32,
               decoration: BoxDecoration(
-                color: theme.colorScheme.primary.withValues(alpha: 0.16),
+                color: theme.colorScheme.primary.withOpacity(0.16),
                 shape: BoxShape.circle,
               ),
               child: Center(
@@ -206,13 +206,11 @@ class _TurnBubble extends StatelessWidget {
                             vertical: 2,
                           ),
                           decoration: BoxDecoration(
-                            color: theme.colorScheme.primary.withValues(
-                              alpha: 0.12,
-                            ),
+                            color: theme.colorScheme.primary.withOpacity(0.12),
                             borderRadius: BorderRadius.circular(4),
                             border: Border.all(
-                              color: theme.colorScheme.primary.withValues(
-                                alpha: 0.24,
+                              color: theme.colorScheme.primary.withOpacity(
+                                0.24,
                               ),
                             ),
                           ),
@@ -254,7 +252,7 @@ class _TurnBubble extends StatelessWidget {
                                 style: TextStyle(
                                   fontSize: 11,
                                   color: theme.colorScheme.onSurfaceVariant
-                                      .withValues(alpha: 0.7),
+                                      .withOpacity(0.7),
                                 ),
                               ),
                               Text(
@@ -333,7 +331,7 @@ class _TypingIndicatorState extends State<_TypingIndicator>
                   width: 6,
                   height: 6,
                   decoration: BoxDecoration(
-                    color: theme.colorScheme.primary.withValues(alpha: opacity),
+                    color: theme.colorScheme.primary.withOpacity(opacity),
                     shape: BoxShape.circle,
                   ),
                 );

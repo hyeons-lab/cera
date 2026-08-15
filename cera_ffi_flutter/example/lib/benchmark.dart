@@ -515,12 +515,12 @@ class _ResultCard extends StatelessWidget {
                 ),
                 decoration: BoxDecoration(
                   color: isGpu
-                      ? theme.colorScheme.primary.withValues(alpha: 0.16)
+                      ? theme.colorScheme.primary.withOpacity(0.16)
                       : theme.colorScheme.outlineVariant,
                   borderRadius: BorderRadius.circular(6),
                   border: Border.all(
                     color: isGpu
-                        ? theme.colorScheme.primary.withValues(alpha: 0.4)
+                        ? theme.colorScheme.primary.withOpacity(0.4)
                         : theme.colorScheme.outline,
                   ),
                 ),
@@ -647,12 +647,12 @@ class _Speedup extends StatelessWidget {
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: isFaster
-            ? Colors.green.withValues(alpha: 0.16)
+            ? Colors.green.withOpacity(0.16)
             : theme.colorScheme.surface,
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
           color: isFaster
-              ? Colors.green.withValues(alpha: 0.4)
+              ? Colors.green.withOpacity(0.4)
               : theme.colorScheme.outline,
           width: 1,
         ),

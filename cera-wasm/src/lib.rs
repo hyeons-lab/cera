@@ -2298,7 +2298,12 @@ mod webgpu {
             let max = cera::model::Model::config(&self.model).max_seq_len;
             let end = start
                 .checked_add(n_tokens)
-                .ok_or_else(|| JsError::new("position overflow appending image embeddings"))?;
+                .ok_or_else(|| {
+                    crate::map_cera_err(cera::CeraError::ContextOverflow {
+                        max_seq_len: max as u32,
+                        by: u32::MAX,
+                    })
+                })?;
             if end > max {
                 return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
                     max_seq_len: max as u32,
@@ -2377,7 +2382,12 @@ mod webgpu {
             let max = cera::model::Model::config(&self.model).max_seq_len;
             let end = start
                 .checked_add(n_tokens)
-                .ok_or_else(|| JsError::new("position overflow appending audio embeddings"))?;
+                .ok_or_else(|| {
+                    crate::map_cera_err(cera::CeraError::ContextOverflow {
+                        max_seq_len: max as u32,
+                        by: u32::MAX,
+                    })
+                })?;
             if end > max {
                 return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
                     max_seq_len: max as u32,

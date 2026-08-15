@@ -160,29 +160,35 @@ impl GenerateOpts {
     /// given manifest (if any), falling back to standard defaults for unmentioned fields.
     pub fn from_manifest(manifest: &crate::manifest::Manifest) -> Self {
         let mut opts = Self::default();
-        if let crate::manifest::GenerationDefaults::Text {
-            temperature,
-            min_p,
-            top_p,
-            top_k,
-            repetition_penalty,
-        } = &manifest.generation_defaults
-        {
-            if let Some(t) = temperature {
-                opts.temperature = *t;
+        match &manifest.generation_defaults {
+            crate::manifest::GenerationDefaults::Text {
+                temperature,
+                min_p,
+                top_p,
+                top_k,
+                repetition_penalty,
+            } => {
+                if let Some(t) = temperature {
+                    opts.temperature = *t;
+                }
+                if let Some(mp) = min_p {
+                    opts.min_p = *mp;
+                }
+                if let Some(tp) = top_p {
+                    opts.top_p = *tp;
+                }
+                if let Some(tk) = top_k {
+                    opts.top_k = *tk;
+                }
+                if let Some(rp) = repetition_penalty {
+                    opts.repetition_penalty = *rp;
+                }
             }
-            if let Some(mp) = min_p {
-                opts.min_p = *mp;
+            crate::manifest::GenerationDefaults::Audio { .. } => {
+                // Audio models (e.g. ASR) default to greedy decoding.
+                opts.temperature = 0.0;
             }
-            if let Some(tp) = top_p {
-                opts.top_p = *tp;
-            }
-            if let Some(tk) = top_k {
-                opts.top_k = *tk;
-            }
-            if let Some(rp) = repetition_penalty {
-                opts.repetition_penalty = *rp;
-            }
+            _ => {}
         }
         opts
     }

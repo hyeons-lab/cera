@@ -2227,14 +2227,7 @@ fn main() -> Result<()> {
                 // (256 / "f32" mirror the `Run` clap defaults; `transcribe` uses the same budget.)
                 let prompt_is_empty = prompt.as_deref().unwrap_or("").trim().is_empty();
                 let effective_temp =
-                    temperature.unwrap_or_else(|| match &engine.manifest().generation_defaults {
-                        cera::manifest::GenerationDefaults::Text {
-                            temperature: Some(t),
-                            ..
-                        } => *t,
-                        cera::manifest::GenerationDefaults::Audio { .. } => 0.0,
-                        _ => 0.7,
-                    });
+                    temperature.unwrap_or(engine.default_generate_opts().temperature);
                 let transcribe_compatible = prompt_is_empty
                     && effective_temp <= 0.0
                     && max_tokens == 256

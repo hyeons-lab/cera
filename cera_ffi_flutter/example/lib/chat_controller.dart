@@ -485,7 +485,9 @@ class ChatController extends ValueNotifier<ChatState> {
         onError: (Object err) {
           assistantTurn.isGenerating = false;
           assistantTurn.statusText = null;
-          assistantTurn.text = 'Error: $err';
+          assistantTurn.text = assistantTurn.text.isEmpty
+              ? 'Error: $err'
+              : '${assistantTurn.text}\n\n[Error: $err]';
           notifyListeners();
           if (!done.isCompleted) done.complete();
         },
@@ -501,7 +503,9 @@ class ChatController extends ValueNotifier<ChatState> {
     } catch (err) {
       assistantTurn.isGenerating = false;
       assistantTurn.statusText = null;
-      assistantTurn.text = 'Error: $err';
+      assistantTurn.text = assistantTurn.text.isEmpty
+          ? 'Error: $err'
+          : '${assistantTurn.text}\n\n[Error: $err]';
       notifyListeners();
     } finally {
       stopwatch.stop();
@@ -624,6 +628,9 @@ class ChatController extends ValueNotifier<ChatState> {
   void dispose() {
     _disposed = true;
     _generationSub?.cancel();
+    if (_generationCompleter != null && !_generationCompleter!.isCompleted) {
+      _generationCompleter!.complete();
+    }
     _ceraEngine?.close();
     super.dispose();
   }

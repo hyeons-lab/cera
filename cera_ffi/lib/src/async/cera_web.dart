@@ -518,7 +518,9 @@ class _WorkerCera implements Cera {
       final ahead = _queue;
       final mine = Completer<void>();
       _queue = mine.future;
-      await ahead;
+      try {
+        await ahead;
+      } catch (_) {}
       // Release the queue BEFORE closing the controller on every early exit;
       // `close()`'s future does not complete while a subscription is paused, so
       // the other order can leave `_queue` uncompleted forever.
@@ -629,7 +631,9 @@ class _WorkerCera implements Cera {
     final mine = Completer<void>();
     _queue = mine.future;
     try {
-      await ahead;
+      try {
+        await ahead;
+      } catch (_) {}
       final buffer = _detach(bytes);
       await _send(
         _newId(),
@@ -652,7 +656,9 @@ class _WorkerCera implements Cera {
     final mine = Completer<void>();
     _queue = mine.future;
     try {
-      await ahead;
+      try {
+        await ahead;
+      } catch (_) {}
       final floatList = pcm is Float32List ? pcm : Float32List.fromList(pcm);
       await _send(
         _newId(),
@@ -674,7 +680,9 @@ class _WorkerCera implements Cera {
     final mine = Completer<void>();
     _queue = mine.future;
     try {
-      await ahead;
+      try {
+        await ahead;
+      } catch (_) {}
       final floatList = pcm is Float32List ? pcm : Float32List.fromList(pcm);
       final result = await _send(
         _newId(),

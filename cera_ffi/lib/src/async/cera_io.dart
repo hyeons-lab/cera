@@ -341,7 +341,9 @@ class _NativeCera implements Cera {
       final ahead = _queue;
       final mine = Completer<void>();
       _queue = mine.future;
-      await ahead;
+      try {
+        await ahead;
+      } catch (_) {}
       // Release the queue BEFORE closing the controller on every early exit.
       // `close()`'s future does not complete while a subscription is paused, so
       // awaiting it first would leave `_queue` uncompleted and block every
@@ -444,7 +446,9 @@ class _NativeCera implements Cera {
     final mine = Completer<void>();
     _queue = mine.future;
     try {
-      await ahead;
+      try {
+        await ahead;
+      } catch (_) {}
       _ensureOpen();
       _session.appendImage(bytes, maxLongSize);
     } finally {
@@ -458,7 +462,9 @@ class _NativeCera implements Cera {
     final mine = Completer<void>();
     _queue = mine.future;
     try {
-      await ahead;
+      try {
+        await ahead;
+      } catch (_) {}
       _ensureOpen();
       _session.appendAudio(pcm, sampleRate);
     } finally {
@@ -475,7 +481,9 @@ class _NativeCera implements Cera {
     final mine = Completer<void>();
     _queue = mine.future;
     try {
-      await ahead;
+      try {
+        await ahead;
+      } catch (_) {}
       _ensureOpen();
       return _engine.transcribe(pcm, sampleRate);
     } finally {
