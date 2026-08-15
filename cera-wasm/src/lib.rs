@@ -2578,8 +2578,17 @@ mod webgpu {
             {
                 ids.insert(0, bos);
             }
-            self.generate_ids(ids, max_tokens, temperature, top_p, top_k, seed, on_token)
-                .await
+            self.generate_ids(
+                ids,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                seed,
+                on_token,
+                None,
+            )
+            .await
         }
 
         /// The tokenizer this session's GGUF declares, for callers that need to
