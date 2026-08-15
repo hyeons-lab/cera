@@ -186,6 +186,47 @@ impl cera::bundle::DownloadProgress for CliDownloadProgress {
     }
 }
 
+/// CLI sampling and generation arguments.
+struct CliSamplingArgs {
+    max_tokens: usize,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    repetition_penalty: Option<f32>,
+}
+
+impl CliSamplingArgs {
+    /// Construct [`cera::GenerateOpts`] from manifest defaults and CLI overrides.
+    fn build_generate_opts(
+        &self,
+        engine: &cera::CeraEngine,
+        grammar: Option<std::sync::Arc<cera::grammar::Grammar>>,
+        grammar_trigger_tokens: Vec<u32>,
+    ) -> cera::GenerateOpts {
+        let mut opts = cera::GenerateOpts::from_manifest(engine.manifest());
+        opts.max_tokens = self.max_tokens as u32;
+        if let Some(t) = self.temperature {
+            opts.temperature = t;
+        }
+        if let Some(p) = self.top_p {
+            opts.top_p = p;
+        }
+        if let Some(k) = self.top_k {
+            opts.top_k = k;
+        }
+        if let Some(mp) = self.min_p {
+            opts.min_p = mp;
+        }
+        if let Some(rp) = self.repetition_penalty {
+            opts.repetition_penalty = rp;
+        }
+        opts.grammar = grammar;
+        opts.grammar_trigger_tokens = grammar_trigger_tokens;
+        opts
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "cera", version, about = "Rust-native LLM inference engine")]
 struct Cli {
@@ -2069,30 +2110,19 @@ fn main() -> Result<()> {
                 cache_disk_gb,
             );
 
+            let sampling_args = CliSamplingArgs {
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                min_p,
+                repetition_penalty,
+            };
             let build_opts = |engine: &cera::CeraEngine,
                               grammar: Option<std::sync::Arc<cera::grammar::Grammar>>,
                               triggers: Vec<u32>|
              -> cera::GenerateOpts {
-                let mut opts = cera::GenerateOpts::from_manifest(engine.manifest());
-                opts.max_tokens = max_tokens as u32;
-                if let Some(t) = temperature {
-                    opts.temperature = t;
-                }
-                if let Some(p) = top_p {
-                    opts.top_p = p;
-                }
-                if let Some(k) = top_k {
-                    opts.top_k = k;
-                }
-                if let Some(mp) = min_p {
-                    opts.min_p = mp;
-                }
-                if let Some(rp) = repetition_penalty {
-                    opts.repetition_penalty = rp;
-                }
-                opts.grammar = grammar;
-                opts.grammar_trigger_tokens = triggers;
-                opts
+                sampling_args.build_generate_opts(engine, grammar, triggers)
             };
 
             // Image-input path (mutually exclusive with --audio-in,
@@ -2551,10 +2581,14 @@ fn main() -> Result<()> {
                 } else {
                     cera::audio_engine::AudioMode::Sequential
                 };
+                let default_opts = engine.default_generate_opts();
                 let audio_config = cera::audio_engine::AudioGenerateConfig {
                     max_tokens,
                     sampler: cera::sampler::SamplerConfig {
-                        temperature: temperature.unwrap_or(0.7),
+                        temperature: temperature.unwrap_or(default_opts.temperature),
+                        top_p: default_opts.top_p,
+                        top_k: default_opts.top_k as usize,
+                        min_p: default_opts.min_p,
                         ..Default::default()
                     },
                     audio_temperature,
@@ -3165,23 +3199,15 @@ fn main() -> Result<()> {
             // not memcpy).
             let mut pending_images: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
 
-            let mut opts = cera::GenerateOpts::from_manifest(engine.manifest());
-            opts.max_tokens = max_tokens as u32;
-            if let Some(t) = temperature {
-                opts.temperature = t;
+            let opts = CliSamplingArgs {
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                min_p,
+                repetition_penalty,
             }
-            if let Some(p) = top_p {
-                opts.top_p = p;
-            }
-            if let Some(k) = top_k {
-                opts.top_k = k;
-            }
-            if let Some(mp) = min_p {
-                opts.min_p = mp;
-            }
-            if let Some(rp) = repetition_penalty {
-                opts.repetition_penalty = rp;
-            }
+            .build_generate_opts(&engine, None, Vec::new());
 
             // Dispatch: inline TUI when both stdin AND stdout are TTYs
             // (so cursor positioning + raw-mode keystroke reads behave

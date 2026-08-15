@@ -20,7 +20,7 @@ class TurnStats {
 
 /// A single message turn in the conversation transcript.
 class Turn {
-  Turn({
+  const Turn({
     required this.role,
     required this.text,
     this.modelName,
@@ -33,14 +33,38 @@ class Turn {
   });
 
   final String role;
-  String text;
+  final String text;
   final String? modelName;
   final Uint8List? imageBytes;
   final String? imageName;
   final double? audioDurationSeconds;
-  TurnStats? stats;
-  bool isGenerating;
-  String? statusText;
+  final TurnStats? stats;
+  final bool isGenerating;
+  final String? statusText;
+
+  Turn copyWith({
+    String? role,
+    String? text,
+    String? modelName,
+    Uint8List? imageBytes,
+    String? imageName,
+    double? audioDurationSeconds,
+    TurnStats? stats,
+    bool? isGenerating,
+    String? Function()? statusText,
+  }) {
+    return Turn(
+      role: role ?? this.role,
+      text: text ?? this.text,
+      modelName: modelName ?? this.modelName,
+      imageBytes: imageBytes ?? this.imageBytes,
+      imageName: imageName ?? this.imageName,
+      audioDurationSeconds: audioDurationSeconds ?? this.audioDurationSeconds,
+      stats: stats ?? this.stats,
+      isGenerating: isGenerating ?? this.isGenerating,
+      statusText: statusText != null ? statusText() : this.statusText,
+    );
+  }
 }
 
 /// Record of a downloaded and locally cached model bundle.
