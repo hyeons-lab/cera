@@ -122,9 +122,6 @@ class ChatController extends ValueNotifier<ChatState> {
             ? bundleName.substring(0, bundleName.length - '-GGUF'.length)
             : bundleName;
 
-        // Ensure active model is recorded in downloaded models
-        await _saveDownloadedRecord(bundleName, quant, displayName);
-
         await _load(
           bundleSource: BundleModelSource(
             name: '$displayName · $quant',
@@ -415,16 +412,12 @@ class ChatController extends ValueNotifier<ChatState> {
     );
 
     String formattedPrompt;
-    if (promptText.isNotEmpty) {
-      try {
-        formattedPrompt = await cera.applyChatTemplate([
-          CeraMessage.user(promptText),
-        ]);
-      } catch (_) {
-        formattedPrompt = promptText;
-      }
-    } else {
-      formattedPrompt = '';
+    try {
+      formattedPrompt = await cera.applyChatTemplate([
+        CeraMessage.user(promptText),
+      ]);
+    } catch (_) {
+      formattedPrompt = promptText;
     }
 
     try {
@@ -582,7 +575,12 @@ class ChatController extends ValueNotifier<ChatState> {
         try {
           final reloaded = await current.open();
           _ceraEngine = reloaded;
-        } catch (_) {}
+        } catch (err) {
+          value = value.copyWith(
+            loadedModel: () => null,
+            status: 'Failed to reload model: $err',
+          );
+        }
       }
     } catch (_) {}
     value = value.copyWith(turns: []);

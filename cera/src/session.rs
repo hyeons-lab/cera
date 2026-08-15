@@ -1043,10 +1043,8 @@ impl Session {
     /// MLP adapter) and prefills the resulting per-frame hidden
     /// states into KV via [`Self::append_embeddings`].
     ///
-    /// `samples` is f32 PCM in `[-1, 1]`, mono. `sample_rate` must
-    /// match [`crate::model::audio_encoder::SAMPLE_RATE`] (16 kHz);
-    /// resampling is out of scope — caller is expected to resample
-    /// externally if their source rate differs.
+    /// `samples` is f32 PCM in `[-1, 1]`, mono. Non-16kHz inputs
+    /// are automatically linearly resampled to 16 kHz.
     ///
     /// Errors are checked in the order listed. The first matching
     /// condition wins — e.g. an empty `samples` buffer paired with

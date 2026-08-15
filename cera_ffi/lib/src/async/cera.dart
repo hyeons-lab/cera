@@ -461,10 +461,8 @@ abstract interface class Cera {
   /// generations are serialized against each other.
   Future<void> appendAudio(List<double> pcm, {int sampleRate = 16000});
 
-  /// Transcribes mono PCM audio to text.
-  ///
-  /// `pcm` is normalized to roughly [-1.0, 1.0] and `sampleRate` must already
-  /// match what the model's audio encoder expects; nothing here resamples.
+  /// `pcm` is normalized to roughly [-1.0, 1.0]. Non-16kHz inputs are
+  /// automatically resampled to 16 kHz by the engine.
   ///
   /// Independent of the conversation: this runs the model's own "Perform ASR."
   /// mode start to finish and returns the whole transcript, rather than
