@@ -380,8 +380,8 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
             ),
           );
         }
-        final rawBundles = snapshot.data;
-        if (rawBundles == null) {
+        final bundles = snapshot.data;
+        if (bundles == null) {
           return Center(
             child: CircularProgressIndicator(
               valueColor: AlwaysStoppedAnimation<Color>(
@@ -390,12 +390,6 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
             ),
           );
         }
-        final bundles = rawBundles.toList()
-          ..sort(
-            (a, b) => a.displayName.toLowerCase().compareTo(
-              b.displayName.toLowerCase(),
-            ),
-          );
         return ListView.separated(
           itemCount: bundles.length,
           separatorBuilder: (_, _) =>
