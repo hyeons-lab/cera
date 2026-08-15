@@ -320,7 +320,10 @@ class _ChatPageState extends State<ChatPage> {
                         theme.colorScheme.primary,
                       ),
                     )
-                  : Container(color: theme.colorScheme.outlineVariant, height: 1),
+                  : Container(
+                      color: theme.colorScheme.outlineVariant,
+                      height: 1,
+                    ),
             ),
             actions: [
               IconButton(

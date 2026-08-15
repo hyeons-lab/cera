@@ -384,7 +384,9 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
         if (rawBundles == null) {
           return Center(
             child: CircularProgressIndicator(
-              valueColor: AlwaysStoppedAnimation<Color>(theme.colorScheme.primary),
+              valueColor: AlwaysStoppedAnimation<Color>(
+                theme.colorScheme.primary,
+              ),
             ),
           );
         }
@@ -493,7 +495,9 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                                     vertical: 1,
                                   ),
                                   decoration: BoxDecoration(
-                                    color: theme.colorScheme.primary.withValues(alpha: 0.2),
+                                    color: theme.colorScheme.primary.withValues(
+                                      alpha: 0.2,
+                                    ),
                                     borderRadius: BorderRadius.circular(4),
                                   ),
                                   child: Text(

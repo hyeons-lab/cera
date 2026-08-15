@@ -591,10 +591,7 @@ class _ResultCard extends StatelessWidget {
               const SizedBox(height: 4),
               Text(
                 result.note!,
-                style: TextStyle(
-                  color: theme.colorScheme.error,
-                  fontSize: 12,
-                ),
+                style: TextStyle(color: theme.colorScheme.error, fontSize: 12),
               ),
             ],
             const SizedBox(height: 10),

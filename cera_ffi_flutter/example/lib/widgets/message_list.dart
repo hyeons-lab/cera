@@ -206,10 +206,14 @@ class _TurnBubble extends StatelessWidget {
                             vertical: 2,
                           ),
                           decoration: BoxDecoration(
-                            color: theme.colorScheme.primary.withValues(alpha: 0.12),
+                            color: theme.colorScheme.primary.withValues(
+                              alpha: 0.12,
+                            ),
                             borderRadius: BorderRadius.circular(4),
                             border: Border.all(
-                              color: theme.colorScheme.primary.withValues(alpha: 0.24),
+                              color: theme.colorScheme.primary.withValues(
+                                alpha: 0.24,
+                              ),
                             ),
                           ),
                           child: Row(
@@ -249,7 +253,8 @@ class _TurnBubble extends StatelessWidget {
                                 ' · TTFT ',
                                 style: TextStyle(
                                   fontSize: 11,
-                                  color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.7),
+                                  color: theme.colorScheme.onSurfaceVariant
+                                      .withValues(alpha: 0.7),
                                 ),
                               ),
                               Text(

@@ -193,7 +193,10 @@ class _MessageComposerState extends State<MessageComposer> {
           decoration: BoxDecoration(
             color: theme.colorScheme.surface,
             border: Border(
-              top: BorderSide(color: theme.colorScheme.outlineVariant, width: 1),
+              top: BorderSide(
+                color: theme.colorScheme.outlineVariant,
+                width: 1,
+              ),
             ),
           ),
           child: Row(
@@ -219,8 +222,8 @@ class _MessageComposerState extends State<MessageComposer> {
                     decoration: BoxDecoration(
                       color: _isRecordingAudio
                           ? (_draggedToCancel
-                              ? theme.colorScheme.error
-                              : theme.colorScheme.primary)
+                                ? theme.colorScheme.error
+                                : theme.colorScheme.primary)
                           : Colors.transparent,
                       shape: BoxShape.circle,
                     ),
@@ -327,10 +330,7 @@ class _MessageComposerState extends State<MessageComposer> {
           Container(
             width: 8,
             height: 8,
-            decoration: BoxDecoration(
-              color: color,
-              shape: BoxShape.circle,
-            ),
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
           ),
           const SizedBox(width: 8),
           Text(
@@ -347,10 +347,7 @@ class _MessageComposerState extends State<MessageComposer> {
               _draggedToCancel
                   ? 'Release to cancel'
                   : 'Recording... (slide away to cancel)',
-              style: TextStyle(
-                fontSize: 11,
-                color: color,
-              ),
+              style: TextStyle(fontSize: 11, color: color),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),
