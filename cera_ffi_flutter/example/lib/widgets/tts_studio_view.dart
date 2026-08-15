@@ -84,7 +84,9 @@ class _TtsStudioViewState extends State<TtsStudioView> {
                     Container(
                       padding: const EdgeInsets.all(8),
                       decoration: BoxDecoration(
-                        color: theme.colorScheme.primary.withValues(alpha: 0.16),
+                        color: theme.colorScheme.primary.withValues(
+                          alpha: 0.16,
+                        ),
                         borderRadius: BorderRadius.circular(8),
                       ),
                       child: Icon(
@@ -368,9 +370,8 @@ class _TtsStudioViewState extends State<TtsStudioView> {
                   ),
                 ),
                 TextButton(
-                  onPressed: () => widget.controller.dispatch(
-                    const ClearTranscriptIntent(),
-                  ),
+                  onPressed: () =>
+                      widget.controller.dispatch(const ClearTranscriptIntent()),
                   child: const Text(
                     'Clear Outputs',
                     style: TextStyle(fontSize: 11),
