@@ -333,6 +333,7 @@ class ChatController extends ValueNotifier<ChatState> {
     final assistantTurn = Turn(
       role: 'assistant',
       text: '',
+      modelName: value.loadedModel?.name,
       isGenerating: true,
       statusText: imageBytes != null ? 'Analyzing image...' : 'Thinking...',
     );

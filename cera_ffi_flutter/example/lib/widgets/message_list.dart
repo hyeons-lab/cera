@@ -157,36 +157,76 @@ class _TurnBubble extends StatelessWidget {
                           ),
                         ),
                 ),
-                if (turn.stats != null) ...[
+                if (!isUser &&
+                    (turn.modelName != null || turn.stats != null)) ...[
                   const SizedBox(height: 6),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
+                  Wrap(
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    spacing: 8,
+                    runSpacing: 4,
                     children: [
-                      Text(
-                        '${turn.stats!.tokens} tokens · ${turn.stats!.tps.toStringAsFixed(1)} tok/s',
-                        style: const TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
-                          color: Color(0xFF8E95A5),
-                        ),
-                      ),
-                      if (turn.stats!.ttftMs != null) ...[
-                        const Text(
-                          ' · TTFT ',
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: Color(0xFF64748B),
+                      if (turn.modelName != null)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF182234),
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(color: const Color(0xFF24334C)),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(
+                                Icons.memory_rounded,
+                                size: 11,
+                                color: Color(0xFF60A5FA),
+                              ),
+                              const SizedBox(width: 4),
+                              Text(
+                                turn.modelName!,
+                                style: const TextStyle(
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.w600,
+                                  color: Color(0xFF93C5FD),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
-                        Text(
-                          '${turn.stats!.ttftMs}ms',
-                          style: const TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                            color: Color(0xFF8E95A5),
-                          ),
+                      if (turn.stats != null)
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              '${turn.stats!.tokens} tokens · ${turn.stats!.tps.toStringAsFixed(1)} tok/s',
+                              style: const TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: Color(0xFF8E95A5),
+                              ),
+                            ),
+                            if (turn.stats!.ttftMs != null) ...[
+                              const Text(
+                                ' · TTFT ',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: Color(0xFF64748B),
+                                ),
+                              ),
+                              Text(
+                                '${turn.stats!.ttftMs}ms',
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  color: Color(0xFF8E95A5),
+                                ),
+                              ),
+                            ],
+                          ],
                         ),
-                      ],
                     ],
                   ),
                 ],

@@ -23,6 +23,7 @@ class Turn {
   Turn({
     required this.role,
     required this.text,
+    this.modelName,
     this.imageBytes,
     this.imageName,
     this.stats,
@@ -32,6 +33,7 @@ class Turn {
 
   final String role;
   String text;
+  final String? modelName;
   final Uint8List? imageBytes;
   final String? imageName;
   TurnStats? stats;
