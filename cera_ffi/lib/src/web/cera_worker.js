@@ -399,7 +399,7 @@ const OPS = {
     const view = new Uint8Array(bytes);
     const cap = maxLongSize ?? 384;
     console.info(
-      `[cera:worker] appendImage: received ${bytes.length} bytes of image data (maxLongSize: ${cap ?? 'none'})`,
+      `[cera:worker] appendImage: received ${view.byteLength} bytes of image data (maxLongSize: ${cap ?? 'none'})`,
     );
     if (gpu) {
       console.info(
