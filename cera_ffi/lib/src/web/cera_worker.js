@@ -141,14 +141,24 @@ async function ensureModule(moduleUrl) {
   // value and then fails inside wasm-bindgen with "wasm not initialized"
   // instead of retrying the load that actually broke.
   await module.default();
-  if (typeof module.initThreadPool === 'function' && self.crossOriginIsolated) {
-    try {
-      const concurrency = self.navigator?.hardwareConcurrency || 4;
-      await module.initThreadPool(concurrency);
-      console.info(`[cera:worker] multi-threaded wasm initialized with ${concurrency} threads`);
-    } catch (e) {
-      console.warn(`[cera:worker] initThreadPool failed: ${e}`);
+  if (typeof module.initThreadPool === 'function') {
+    if (self.crossOriginIsolated) {
+      try {
+        const concurrency = self.navigator?.hardwareConcurrency || 4;
+        await module.initThreadPool(concurrency);
+        console.info(`[cera:worker] multi-threaded wasm initialized with ${concurrency} threads`);
+      } catch (e) {
+        console.warn(`[cera:worker] initThreadPool failed: ${e}`);
+      }
+    } else {
+      console.warn(
+        '[cera:worker] multi-threaded wasm build detected, but crossOriginIsolated is FALSE. ' +
+          'COOP (Cross-Origin-Opener-Policy: same-origin) and COEP (Cross-Origin-Embedder-Policy: require-corp) ' +
+          'headers are required for SharedArrayBuffer to enable multi-core execution. Running single-threaded.',
+      );
     }
+  } else {
+    console.info('[cera:worker] wasm loaded (single-threaded WebGPU/CPU build)');
   }
   wasm = module;
 }
@@ -414,18 +424,15 @@ const OPS = {
    * Both paths append patch embeddings to the same KV cache `generate` writes
    * to, so ordering is the caller's: image first, then the question.
    */
-  appendImage({ bytes, maxLongSize }) {
+  async appendImage({ bytes, maxLongSize }) {
     const t0 = performance.now();
     const view = new Uint8Array(bytes);
     const cap = maxLongSize ?? undefined;
     console.info(
-      `[cera:worker] appendImage: received ${view.byteLength} bytes of image data (maxLongSize: ${cap ?? 'model-default'})`,
+      `[cera:worker] appendImage: received ${view.byteLength} bytes of raw image data (maxLongSize cap: ${cap ?? 'model-default'})`,
     );
     if (gpu) {
-      console.info(
-        '[cera:worker] appendImage: preprocessing and encoding image patches for WebGPU KV cache...',
-      );
-      gpu.session.appendImage(view, cap);
+      await gpu.session.appendImage(view, cap);
     } else {
       console.info(
         '[cera:worker] appendImage: preprocessing and encoding image patches on CPU session (this may take several seconds)...',
@@ -433,7 +440,7 @@ const OPS = {
       cpu.session.appendImage(view, cap);
     }
     const elapsed = (performance.now() - t0).toFixed(1);
-    console.info(`[cera:worker] appendImage: image embeddings seeded into KV cache in ${elapsed}ms`);
+    console.info(`[cera:worker] appendImage: total image dispatch completed in ${elapsed}ms`);
     return null;
   },
 

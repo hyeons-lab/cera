@@ -306,6 +306,16 @@ fn map_cera_err(err: cera::CeraError) -> JsError {
     JsError::new(&err.to_string())
 }
 
+#[inline]
+pub(crate) fn console_info(msg: &str) {
+    web_sys::console::info_1(&wasm_bindgen::JsValue::from_str(msg));
+}
+
+#[inline]
+pub(crate) fn console_warn(msg: &str) {
+    web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(msg));
+}
+
 /// Loaded inference engine — wraps `cera::CeraEngine` with sync access
 /// to model metadata and the tokenizer.
 ///
@@ -1863,8 +1873,9 @@ impl<'a> cera::ModalitySink for JsTextSink<'a> {
 // See devlog 000169.
 #[cfg(feature = "wgpu")]
 mod webgpu {
-    use super::{Capabilities, Tokenizer, capabilities_to_js, map_err};
+    use super::{Capabilities, Tokenizer, capabilities_to_js, console_info, console_warn, map_err};
     use cera::model::Model;
+    use cera::time::Instant;
     use std::sync::Arc;
     use wasm_bindgen::prelude::*;
 
@@ -2231,7 +2242,7 @@ mod webgpu {
         /// session this cannot shift the KV cache to make room; that
         /// limitation is pre-existing and applies to prompts too.
         #[wasm_bindgen(js_name = appendImage)]
-        pub fn append_image(
+        pub async fn append_image(
             &mut self,
             bytes: &[u8],
             max_long_size: Option<u32>,
@@ -2245,38 +2256,83 @@ mod webgpu {
                 Some(n) => Some(n),
             };
 
+            let t_start = Instant::now();
             let pre = cera::model::vision_preprocessor::preprocess_image_with_opts(
                 bytes,
                 &encoder.config,
                 cap,
             )
             .map_err(crate::map_cera_err)?;
+            let t_pre = t_start.elapsed();
+
+            let grid_tokens = pre.grid_w.saturating_mul(pre.grid_h);
+            console_info(&format!(
+                "[cera:worker] appendImage: 1/3 Preprocessed image ({}x{} grid = {grid_tokens} patches) in {:.1}ms",
+                pre.grid_w,
+                pre.grid_h,
+                t_pre.as_secs_f64() * 1000.0
+            ));
 
             // Prefer the GPU tower, but only within the attention kernel's
             // token capacity, and fall back rather than fail on a runtime GPU
             // error: the CPU encoder is always attached and numerically
             // equivalent. Same policy as `Session::append_image_with_opts`.
-            let grid_tokens = pre.grid_w.saturating_mul(pre.grid_h);
             let gpu = self
                 .gpu_vision_encoder
                 .as_ref()
                 .filter(|_| grid_tokens <= cera::model::vision_encoder_gpu::MAX_VIT_TOKENS);
-            let img_tokens = match gpu {
-                Some(g) => match g.encode_image(&pre.pixels, pre.grid_w, pre.grid_h) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!(
-                            "gpu vision encode failed ({e:#}); falling back to CPU encoder"
-                        );
+
+            let t_enc_start = Instant::now();
+            let (img_tokens, backend_name) = match gpu {
+                Some(g) => {
+                    console_info(&format!(
+                        "[cera:worker] appendImage: 2/3 Running WebGPU Vision Tower ({grid_tokens} patches, projection_dim={})...",
+                        encoder.config.projection_dim
+                    ));
+                    match g
+                        .encode_image_async(&pre.pixels, pre.grid_w, pre.grid_h)
+                        .await
+                    {
+                        Ok(t) => (t, "WebGPU"),
+                        Err(e) => {
+                            console_warn(&format!(
+                                "[cera:worker] appendImage: 2/3 WebGPU vision encode failed ({e:#}); falling back to WASM CPU encoder"
+                            ));
+                            (
+                                encoder
+                                    .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
+                                    .map_err(map_err)?,
+                                "WASM-CPU (fallback)",
+                            )
+                        }
+                    }
+                }
+                None => {
+                    if self.gpu_vision_encoder.is_some()
+                        && grid_tokens > cera::model::vision_encoder_gpu::MAX_VIT_TOKENS
+                    {
+                        console_warn(&format!(
+                            "[cera:worker] appendImage: 2/3 Image grid ({grid_tokens} patches) exceeds WebGPU ViT max ({}); running on WASM CPU (this may be slow)...",
+                            cera::model::vision_encoder_gpu::MAX_VIT_TOKENS
+                        ));
+                    } else {
+                        console_info(&format!(
+                            "[cera:worker] appendImage: 2/3 Running WASM CPU Vision Tower ({grid_tokens} patches)..."
+                        ));
+                    }
+                    (
                         encoder
                             .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
-                            .map_err(map_err)?
-                    }
-                },
-                None => encoder
-                    .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
-                    .map_err(map_err)?,
+                            .map_err(map_err)?,
+                        "WASM-CPU",
+                    )
+                }
             };
+            let t_enc = t_enc_start.elapsed();
+            console_info(&format!(
+                "[cera:worker] appendImage: 2/3 Vision Tower encoded {grid_tokens} tokens on {backend_name} in {:.1}ms",
+                t_enc.as_secs_f64() * 1000.0
+            ));
 
             let hidden = cera::model::Model::config(&self.model).hidden_size;
             if hidden == 0 || !img_tokens.len().is_multiple_of(hidden) {
@@ -2310,24 +2366,28 @@ mod webgpu {
                 }));
             }
 
-            // `seed_embeddings`, not `Model::forward_prefill_from_embeddings`:
-            // the trait method ends in a blocking `download_f32`, and blocking
-            // is exactly what this thread must not do. The readback completes
-            // from the JS event loop, which cannot run until this call returns,
-            // so waiting on it here hangs the worker outright. The logits it
-            // would fetch are discarded on this path anyway; appending an image
-            // wants the KV cache, nothing more.
+            console_info(&format!(
+                "[cera:worker] appendImage: 3/3 Seeding {n_tokens} embeddings into WebGPU LLM KV cache (pos {start} -> {end})..."
+            ));
+            let t_seed_start = Instant::now();
             self.model
                 .seed_embeddings(&img_tokens, n_tokens, start, &mut self.state);
-            // `seed_embeddings` advances `seq_len` itself, once per frame, so
-            // assigning `end` here would be a no-op on a good day and would
-            // paper over a miscount on a bad one. Assert the contract instead:
-            // a mismatch means the KV cache holds a different number of frames
-            // than the session thinks, and every later position is wrong.
+            let t_seed = t_seed_start.elapsed();
+
             debug_assert_eq!(
                 self.state.seq_len, end,
                 "seed_embeddings must advance seq_len by n_tokens"
             );
+
+            let t_total = t_start.elapsed();
+            console_info(&format!(
+                "[cera:worker] appendImage: 3/3 KV cache seeded in {:.1}ms (total: {:.1}ms [prep: {:.1}ms, vit: {:.1}ms, kv: {:.1}ms])",
+                t_seed.as_secs_f64() * 1000.0,
+                t_total.as_secs_f64() * 1000.0,
+                t_pre.as_secs_f64() * 1000.0,
+                t_enc.as_secs_f64() * 1000.0,
+                t_seed.as_secs_f64() * 1000.0
+            ));
             Ok(())
         }
 

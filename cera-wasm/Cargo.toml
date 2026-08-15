@@ -80,6 +80,7 @@ web-sys = { version = "0.3", features = [
     # connection leaves the promise pending forever instead of rejecting.
     "AbortSignal",
     "Blob",
+    "console",
     "File",
     "FileSystemDirectoryHandle",
     "FileSystemFileHandle",
