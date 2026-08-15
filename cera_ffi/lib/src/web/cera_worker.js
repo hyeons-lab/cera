@@ -485,12 +485,12 @@ const OPS = {
     const currentPos = position();
     const userContent =
       prompt && prompt.trim().length > 0
-        ? `${prompt.trim()}\n${markerName}`
+        ? `${prompt.trim()} ${markerName}`
         : markerName;
     const messages = [];
     if (currentPos === 0) {
       const systemPrompt = capabilitiesOf().audioOut
-        ? 'Respond with interleaved text and audio.'
+        ? "Perform TTS. Lily's voice is clear, bright and natural."
         : 'Respond to the user.';
       messages.push({ role: 'system', content: systemPrompt });
     }
