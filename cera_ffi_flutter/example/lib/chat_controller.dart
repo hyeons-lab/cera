@@ -475,61 +475,32 @@ class ChatController extends ValueNotifier<ChatState> {
       pendingImageName: () => null,
     );
 
-    String finalPrompt = promptText;
-    if (finalPrompt.isEmpty) {
-      try {
-        assistantTurn.statusText = 'Transcribing audio...';
-        notifyListeners();
-        final transcribed = await cera.transcribe(
-          intent.pcmSamples,
-          sampleRate: intent.sampleRate,
-        );
-        if (transcribed.trim().isNotEmpty) {
-          finalPrompt = transcribed.trim();
-          userTurn.text = finalPrompt;
-          notifyListeners();
-        }
-      } catch (err) {
-        debugPrint('[cera:chat] ASR transcription skipped / failed: $err');
-      }
-    }
-
-    String formattedPrompt;
     try {
-      formattedPrompt = await cera.applyChatTemplate([
-        CeraMessage.user(finalPrompt.isNotEmpty ? finalPrompt : 'Hello'),
-      ]);
-    } catch (_) {
-      formattedPrompt = finalPrompt.isNotEmpty ? finalPrompt : 'Hello';
+      assistantTurn.statusText = 'Encoding audio into model...';
+      notifyListeners();
+      debugPrint(
+        '[cera:chat] Encoding audio frames directly into model at ${intent.sampleRate}Hz...',
+      );
+      await cera.appendAudio(
+        intent.pcmSamples,
+        sampleRate: intent.sampleRate,
+        prompt: promptText,
+      );
+      debugPrint(
+        '[cera:chat] Audio successfully encoded and seeded into KV cache',
+      );
+      assistantTurn.statusText = 'Generating response...';
+      notifyListeners();
+    } catch (err) {
+      assistantTurn.isGenerating = false;
+      assistantTurn.statusText = null;
+      assistantTurn.text = 'Failed to process audio: $err';
+      notifyListeners();
+      value = value.copyWith(isGenerating: false);
+      return;
     }
 
-    if (finalPrompt == promptText && promptText.isEmpty) {
-      try {
-        assistantTurn.statusText = 'Encoding audio frames...';
-        notifyListeners();
-        debugPrint(
-          '[cera:chat] Encoding audio frames at ${intent.sampleRate}Hz...',
-        );
-        await cera.appendAudio(
-          intent.pcmSamples,
-          sampleRate: intent.sampleRate,
-        );
-        debugPrint(
-          '[cera:chat] Audio successfully encoded and seeded into KV cache',
-        );
-      } catch (err) {
-        assistantTurn.isGenerating = false;
-        assistantTurn.statusText = null;
-        assistantTurn.text = 'Failed to process audio: $err';
-        notifyListeners();
-        value = value.copyWith(isGenerating: false);
-        return;
-      }
-    }
-
-    assistantTurn.statusText = 'Generating response...';
-    notifyListeners();
-    await _runGeneration(assistantTurn, formattedPrompt);
+    await _runGeneration(assistantTurn, '');
   }
 
   Future<void> _runGeneration(

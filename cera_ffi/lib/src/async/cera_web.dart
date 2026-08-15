@@ -662,7 +662,11 @@ class _WorkerCera implements Cera {
   }
 
   @override
-  Future<void> appendAudio(List<double> pcm, {int sampleRate = 16000}) async {
+  Future<void> appendAudio(
+    List<double> pcm, {
+    int sampleRate = 16000,
+    String? prompt,
+  }) async {
     final ahead = _queue;
     final mine = Completer<void>();
     _queue = mine.future;
@@ -679,6 +683,7 @@ class _WorkerCera implements Cera {
           op: 'appendAudio',
           pcm: Float32List.view(buffer.toDart).toJS,
           sampleRate: sampleRate,
+          prompt: prompt,
         ),
         transfer: <JSAny>[buffer],
       );

@@ -83,7 +83,8 @@ pub const NORM_VAR_EPS: f64 = 1e-5;
 ///   Speech energy is mostly under 8 kHz so this is tolerable for
 ///   ASR but not studio-quality.
 pub fn resample_linear(samples: &[f32], sr_in: u32, sr_out: u32) -> Vec<f32> {
-    if samples.is_empty() || sr_in == 0 || sr_out == 0 {
+    if samples.is_empty() || !(1000..=192_000).contains(&sr_in) || !(1..=192_000).contains(&sr_out)
+    {
         return Vec::new();
     }
     if sr_in == sr_out {

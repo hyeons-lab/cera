@@ -56,6 +56,7 @@ let gpu = null; // {session, tokenizer}
 
 /** Human-readable description of the backend that actually loaded. */
 let backendLabel = 'none';
+let pendingAudioSuffixTokens = null;
 
 /**
  * Tokens currently in the live session's KV cache. Zero means BOS.
@@ -437,22 +438,70 @@ const OPS = {
   /**
    * Feed mono PCM audio into the live conversation.
    */
-  appendAudio({ pcm, sampleRate }) {
+  async appendAudio({ pcm, sampleRate, prompt }) {
     const t0 = performance.now();
     const samples = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm);
     const sr = sampleRate ?? 16000;
     console.info(
       `[cera:worker] appendAudio: processing ${samples.length} audio samples at ${sr}Hz (${(samples.length / sr).toFixed(1)}s)...`,
     );
+
+    const tk = tokenizer();
+    let markerName = '<|reserved_4|>';
+    let markerId = tk.specialTokenId(markerName);
+    if (markerId == null) {
+      for (const candidate of ['<|reserved_5|>', '<|reserved_6|>', '<|reserved_7|>', '<|audio_start|>']) {
+        const id = tk.specialTokenId(candidate);
+        if (id != null) {
+          markerName = candidate;
+          markerId = id;
+          break;
+        }
+      }
+    }
+
+    const userContent =
+      prompt && prompt.trim().length > 0
+        ? `${prompt.trim()}\n${markerName}`
+        : markerName;
+    const messages = [{ role: 'user', content: userContent }];
+    let formatted;
+    try {
+      formatted = tk.applyChatTemplate(messages, true);
+    } catch (_) {
+      formatted = userContent;
+    }
+
+    const allTokens = Array.from(tk.encode(formatted, false));
+    const splitIdx = markerId != null ? allTokens.indexOf(markerId) : -1;
+    const prefix = splitIdx > 0 ? allTokens.slice(0, splitIdx) : [];
+    const suffix = splitIdx >= 0 ? allTokens.slice(splitIdx + 1) : [];
+
     if (gpu) {
       console.info('[cera:worker] appendAudio: encoding audio frames for WebGPU KV cache...');
+      if (prefix.length > 0) {
+        await gpu.session.generateTokens(
+          new Uint32Array(prefix),
+          0,
+          null,
+          null,
+          null,
+          null,
+          () => {},
+        );
+      }
       gpu.session.appendAudio(samples, sr);
     } else {
       console.info('[cera:worker] appendAudio: encoding audio frames on CPU session...');
+      if (prefix.length > 0) {
+        cpu.session.appendTokens(Uint32Array.from(prefix));
+      }
       cpu.session.appendAudio(samples, sr);
     }
+    pendingAudioSuffixTokens = suffix.length > 0 ? Uint32Array.from(suffix) : null;
+
     const elapsed = (performance.now() - t0).toFixed(1);
-    console.info(`[cera:worker] appendAudio: audio embeddings seeded into KV cache in ${elapsed}ms`);
+    console.info(`[cera:worker] appendAudio: audio framed with template prefix & embeddings seeded into KV cache in ${elapsed}ms`);
     return null;
   },
 
@@ -566,8 +615,16 @@ const OPS = {
         config.free();
       }
     }
-    const ids = encodePrompt(prompt, currentPos === 0);
-    console.info(`[cera:worker] generate: prompt encoded into ${ids.length} tokens`);
+    let ids;
+    if (pendingAudioSuffixTokens != null && (!prompt || prompt.trim() === '')) {
+      ids = pendingAudioSuffixTokens;
+      pendingAudioSuffixTokens = null;
+      console.info(`[cera:worker] generate: using ${ids.length} pending audio suffix tokens for generation`);
+    } else {
+      pendingAudioSuffixTokens = null;
+      ids = encodePrompt(prompt, currentPos === 0);
+      console.info(`[cera:worker] generate: prompt encoded into ${ids.length} tokens`);
+    }
     const started = performance.now();
     let firstTokenTime = null;
     let tokenCount = 0;

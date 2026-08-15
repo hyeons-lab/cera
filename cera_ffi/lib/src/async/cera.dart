@@ -457,13 +457,22 @@ abstract interface class Cera {
   /// Feeds mono PCM audio into the conversation, to be processed by the next
   /// [generate].
   ///
+  /// Feed mono PCM audio into the live conversation.
+  ///
+  /// Feeds raw audio frames directly through the model's audio encoder into the
+  /// LLM's KV cache. An optional `prompt` text can accompany the audio.
+  ///
   /// `pcm` is normalized to roughly [-1.0, 1.0]. Non-16 kHz inputs are
   /// automatically resampled by the engine to the model's required rate.
   ///
   /// Throws if this model has no audio encoder, i.e. whenever [capabilities]
   /// reports `audioIn: false`. Serialized against [generate] the same way
   /// generations are serialized against each other.
-  Future<void> appendAudio(List<double> pcm, {int sampleRate = 16000});
+  Future<void> appendAudio(
+    List<double> pcm, {
+    int sampleRate = 16000,
+    String? prompt,
+  });
 
   /// `pcm` is normalized to roughly [-1.0, 1.0]. Non-16kHz inputs are
   /// automatically resampled to 16 kHz by the engine.

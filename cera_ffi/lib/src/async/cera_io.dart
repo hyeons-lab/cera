@@ -232,6 +232,7 @@ class _NativeCera implements Cera {
 
   Session _session;
   bool _closed = false;
+  List<int>? _pendingAudioSuffixTokens;
 
   /// Completes when the generation currently queued or running has finished.
   ///
@@ -413,7 +414,15 @@ class _NativeCera implements Cera {
           _session.close();
           _session = reseeded;
         }
-        final tokens = _frame(prompt);
+        List<int> tokens;
+        final pendingSuffix = _pendingAudioSuffixTokens;
+        if (pendingSuffix != null && prompt.trim().isEmpty) {
+          _pendingAudioSuffixTokens = null;
+          tokens = pendingSuffix;
+        } else {
+          _pendingAudioSuffixTokens = null;
+          tokens = _frame(prompt);
+        }
         if (tokens.isNotEmpty) {
           _session.appendTokens(tokens);
         }
@@ -480,7 +489,11 @@ class _NativeCera implements Cera {
   }
 
   @override
-  Future<void> appendAudio(List<double> pcm, {int sampleRate = 16000}) async {
+  Future<void> appendAudio(
+    List<double> pcm, {
+    int sampleRate = 16000,
+    String? prompt,
+  }) async {
     final ahead = _queue;
     final mine = Completer<void>();
     _queue = mine.future;
@@ -489,7 +502,53 @@ class _NativeCera implements Cera {
         await ahead;
       } catch (_) {}
       _ensureOpen();
-      _session.appendAudio(pcm, sampleRate);
+
+      final markerCandidates = [
+        '<|reserved_4|>',
+        '<|reserved_5|>',
+        '<|reserved_6|>',
+        '<|reserved_7|>',
+        '<|audio_start|>',
+      ];
+      String? markerName;
+      int? markerId;
+      for (final candidate in markerCandidates) {
+        final id = _engine.specialTokenId(candidate);
+        if (id != null) {
+          markerName = candidate;
+          markerId = id;
+          break;
+        }
+      }
+      markerName ??= '<|reserved_4|>';
+
+      final userContent =
+          (prompt != null && prompt.trim().isNotEmpty)
+              ? '${prompt.trim()}\n$markerName'
+              : markerName;
+
+      String formatted;
+      try {
+        formatted = _engine.applyChatTemplate([
+          ChatMessage(role: 'user', content: userContent),
+        ], true);
+      } catch (_) {
+        formatted = userContent;
+      }
+
+      final allTokens = _engine.encodeText(formatted);
+      final splitIdx = markerId != null ? allTokens.indexOf(markerId) : -1;
+
+      if (splitIdx > 0) {
+        _session.appendTokens(allTokens.sublist(0, splitIdx));
+      }
+      final floatList = pcm is Float32List ? pcm : Float32List.fromList(pcm);
+      _session.appendAudio(floatList, sampleRate);
+      if (splitIdx >= 0 && splitIdx + 1 < allTokens.length) {
+        _pendingAudioSuffixTokens = allTokens.sublist(splitIdx + 1);
+      } else {
+        _pendingAudioSuffixTokens = null;
+      }
     } finally {
       mine.complete();
     }

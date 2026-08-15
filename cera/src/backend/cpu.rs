@@ -1971,10 +1971,11 @@ pub fn gemv_q4_1_f32(
 
 /// Vector dot product of two `f32` slices of equal length.
 #[inline]
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "dot_f32 input lengths must match");
-    let (a_chunks, a_rem) = a.as_chunks::<8>();
-    let (b_chunks, b_rem) = b.as_chunks::<8>();
+    let mut a_chunks = a.chunks_exact(8);
+    let mut b_chunks = b.chunks_exact(8);
     let mut sum0 = 0.0f32;
     let mut sum1 = 0.0f32;
     let mut sum2 = 0.0f32;
@@ -1984,7 +1985,7 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     let mut sum6 = 0.0f32;
     let mut sum7 = 0.0f32;
 
-    for (ca, cb) in a_chunks.iter().zip(b_chunks.iter()) {
+    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
         sum0 += ca[0] * cb[0];
         sum1 += ca[1] * cb[1];
         sum2 += ca[2] * cb[2];
@@ -1995,7 +1996,7 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         sum7 += ca[7] * cb[7];
     }
     let mut sum = ((sum0 + sum1) + (sum2 + sum3)) + ((sum4 + sum5) + (sum6 + sum7));
-    for (x, y) in a_rem.iter().zip(b_rem.iter()) {
+    for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
         sum += x * y;
     }
     sum

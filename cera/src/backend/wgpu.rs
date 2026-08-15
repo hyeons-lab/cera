@@ -212,6 +212,24 @@ pub struct GpuContext {
     staging_size: std::sync::atomic::AtomicU64,
 }
 
+impl Clone for GpuContext {
+    fn clone(&self) -> Self {
+        Self {
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+            adapter_name: self.adapter_name.clone(),
+            backend: self.backend.clone(),
+            max_storage_buffer_binding_size: self.max_storage_buffer_binding_size,
+            max_buffer_size: self.max_buffer_size,
+            min_storage_buffer_offset_alignment: self.min_storage_buffer_offset_alignment,
+            preprocessor: self.preprocessor.clone(),
+            profiler: None,
+            staging: std::sync::Mutex::new(None),
+            staging_size: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
 /// A tensor stored on the GPU.
 pub struct GpuTensor {
     pub buffer: wgpu::Buffer,
