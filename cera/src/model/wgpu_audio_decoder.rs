@@ -872,6 +872,72 @@ impl WgpuAudioDecoder {
         Ok(result)
     }
 
+    fn encode_istft_to_pcm(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        spectrum: &[f32],
+        n_fft: usize,
+        hop_length: usize,
+    ) -> Option<(Buffer, usize)> {
+        let bins = n_fft / 2 + 1;
+        let frame_size = bins * 2;
+        let n_frames = spectrum.len() / frame_size;
+        if n_frames == 0 {
+            return None;
+        }
+
+        let spec_buf = self.ctx.upload_f32(spectrum, "audio_istft_spectrum_in");
+        let n_spec_floats = n_frames * frame_size;
+        let complex_buf = self.ctx.create_storage_rw(
+            (n_spec_floats * std::mem::size_of::<f32>()) as u64,
+            "audio_istft_complex_half_spectrum",
+        );
+        let ep_params = self.params(
+            &[n_frames as u32, bins as u32],
+            "audio_istft_exp_polar_params",
+        );
+        self.encode(
+            enc,
+            &self.pipes.exp_polar,
+            &[&spec_buf, &complex_buf, &ep_params],
+            (((n_frames * bins) as u32).div_ceil(256), 1, 1),
+            "audio_istft_exp_polar",
+        );
+
+        let windowed_buf = self.ctx.create_storage_rw(
+            (n_frames * n_fft * std::mem::size_of::<f32>()) as u64,
+            "audio_istft_windowed_frames",
+        );
+        self.gemm(
+            enc,
+            &self.idft_basis,
+            &complex_buf,
+            &windowed_buf,
+            n_frames as u32,
+            frame_size as u32,
+            n_fft as u32,
+        );
+
+        let total_samples = n_frames * hop_length;
+        let pcm_buf = self.ctx.create_storage_rw(
+            (total_samples * std::mem::size_of::<f32>()) as u64,
+            "audio_istft_pcm_out",
+        );
+        let oa_params = self.params(
+            &[n_frames as u32, n_fft as u32, hop_length as u32, 0u32],
+            "audio_istft_overlap_add_params",
+        );
+        self.encode(
+            enc,
+            &self.pipes.overlap_add,
+            &[&windowed_buf, &self.hann, &pcm_buf, &oa_params],
+            ((total_samples as u32).div_ceil(256), 1, 1),
+            "audio_istft_overlap_add",
+        );
+
+        Some((pcm_buf, total_samples))
+    }
+
     /// Convert the accumulated spectrum to PCM on the GPU: `exp_polar` →
     /// iDFT-matmul → windowed `overlap_add`. Numerically mirrors the CPU
     /// `istft_to_pcm` (the iDFT basis folds the Hermitian mirror and the
@@ -905,61 +971,15 @@ impl WgpuAudioDecoder {
         }
 
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-
-        let spec_buf = self.ctx.upload_f32(spectrum, "audio_istft_spectrum_in");
-        let n_spec_floats = n_frames * frame_size;
-        let complex_buf = self.ctx.create_storage_rw(
-            (n_spec_floats * std::mem::size_of::<f32>()) as u64,
-            "audio_istft_complex_half_spectrum",
-        );
-        let ep_params = self.params(&[n_spec_floats as u32], "audio_istft_exp_polar_params");
-        self.encode(
-            &mut enc,
-            &self.pipes.exp_polar,
-            &[&spec_buf, &complex_buf, &ep_params],
-            (((n_spec_floats as u32) / 2).div_ceil(256), 1, 1),
-            "audio_istft_exp_polar",
-        );
-
-        let windowed_buf = self.ctx.create_storage_rw(
-            (n_frames * n_fft * std::mem::size_of::<f32>()) as u64,
-            "audio_istft_windowed_frames",
-        );
-        self.gemm(
-            &mut enc,
-            &self.idft_basis,
-            &complex_buf,
-            &windowed_buf,
-            n_frames as u32,
-            frame_size as u32,
-            n_fft as u32,
-        );
-
-        let pcm_len = (n_frames - 1) * hop_length + n_fft;
-        let pcm_buf = self.ctx.create_storage_rw(
-            (pcm_len * std::mem::size_of::<f32>()) as u64,
-            "audio_istft_pcm_out",
-        );
-        let oa_params = self.params(
-            &[
-                n_frames as u32,
-                hop_length as u32,
-                n_fft as u32,
-                pcm_len as u32,
-            ],
-            "audio_istft_overlap_add_params",
-        );
-        self.encode(
-            &mut enc,
-            &self.pipes.overlap_add,
-            &[&windowed_buf, &self.hann, &pcm_buf, &oa_params],
-            ((pcm_len as u32).div_ceil(256), 1, 1),
-            "audio_istft_overlap_add",
-        );
+        let (pcm_buf, total_samples) =
+            match self.encode_istft_to_pcm(&mut enc, spectrum, n_fft, hop_length) {
+                Some(res) => res,
+                None => return vec![],
+            };
 
         self.ctx.submit_encoder(enc);
 
-        let mut pcm = self.ctx.download_f32(&pcm_buf, n_frames * hop_length);
+        let mut pcm = self.ctx.download_f32(&pcm_buf, total_samples);
         let padding = (n_fft - hop_length) / 2;
         if pcm.len() > padding {
             pcm.drain(..padding);
@@ -992,63 +1012,17 @@ impl WgpuAudioDecoder {
         }
 
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-
-        let spec_buf = self.ctx.upload_f32(spectrum, "audio_istft_spectrum_in");
-        let n_spec_floats = n_frames * frame_size;
-        let complex_buf = self.ctx.create_storage_rw(
-            (n_spec_floats * std::mem::size_of::<f32>()) as u64,
-            "audio_istft_complex_half_spectrum",
-        );
-        let ep_params = self.params(&[n_spec_floats as u32], "audio_istft_exp_polar_params");
-        self.encode(
-            &mut enc,
-            &self.pipes.exp_polar,
-            &[&spec_buf, &complex_buf, &ep_params],
-            (((n_spec_floats as u32) / 2).div_ceil(256), 1, 1),
-            "audio_istft_exp_polar",
-        );
-
-        let windowed_buf = self.ctx.create_storage_rw(
-            (n_frames * n_fft * std::mem::size_of::<f32>()) as u64,
-            "audio_istft_windowed_frames",
-        );
-        self.gemm(
-            &mut enc,
-            &self.idft_basis,
-            &complex_buf,
-            &windowed_buf,
-            n_frames as u32,
-            frame_size as u32,
-            n_fft as u32,
-        );
-
-        let pcm_len = (n_frames - 1) * hop_length + n_fft;
-        let pcm_buf = self.ctx.create_storage_rw(
-            (pcm_len * std::mem::size_of::<f32>()) as u64,
-            "audio_istft_pcm_out",
-        );
-        let oa_params = self.params(
-            &[
-                n_frames as u32,
-                hop_length as u32,
-                n_fft as u32,
-                pcm_len as u32,
-            ],
-            "audio_istft_overlap_add_params",
-        );
-        self.encode(
-            &mut enc,
-            &self.pipes.overlap_add,
-            &[&windowed_buf, &self.hann, &pcm_buf, &oa_params],
-            ((pcm_len as u32).div_ceil(256), 1, 1),
-            "audio_istft_overlap_add",
-        );
+        let (pcm_buf, total_samples) =
+            match self.encode_istft_to_pcm(&mut enc, spectrum, n_fft, hop_length) {
+                Some(res) => res,
+                None => return Ok(vec![]),
+            };
 
         let pending = {
             self.ctx.submit_encoder(enc);
             self.ctx.begin_download(
                 &pcm_buf,
-                ((n_frames * hop_length) * std::mem::size_of::<f32>()) as u64,
+                (total_samples * std::mem::size_of::<f32>()) as u64,
             )
         };
         let bytes = pending.recv().await?;
