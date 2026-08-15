@@ -416,17 +416,21 @@ class _WorkerCera implements Cera {
     }
     if (reply.event == 'audio') {
       final callback = _audioCallbacks[reply.id];
-      if (callback != null) {
-        final pcmJs = reply.pcm;
-        final sampleRate =
-            ((reply.sampleRate as JSNumber?)?.toDartDouble ?? 24000).toInt();
-        if (pcmJs != null) {
-          final pcm =
-              (pcmJs as JSArray<JSNumber>).toDart
-                  .map((n) => n.toDartDouble)
-                  .toList();
-          callback(pcm, sampleRate);
-        }
+      final pcmJs = reply.pcm;
+      final sampleRate =
+          ((reply.sampleRate as JSNumber?)?.toDartDouble ?? 24000).toInt();
+      print(
+        '[cera:web] received audio event for id=${reply.id}, hasCallback=${callback != null}, sampleRate=$sampleRate, pcmJs=$pcmJs',
+      );
+      if (callback != null && pcmJs != null) {
+        final pcm =
+            (pcmJs as JSArray<JSNumber>).toDart
+                .map((n) => n.toDartDouble)
+                .toList();
+        print(
+          '[cera:web] invoking audio callback with ${pcm.length} samples at $sampleRate Hz',
+        );
+        callback(pcm, sampleRate);
       }
       return;
     }
@@ -565,6 +569,7 @@ class _WorkerCera implements Cera {
       _streams[id] = controller;
       if (onAudio != null) {
         _audioCallbacks[id] = onAudio;
+        print('[cera:web] registered onAudio callback for stream id=$id');
       }
       void terminate(Object? error, StackTrace? stack) {
         finished = true;

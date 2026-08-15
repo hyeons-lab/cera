@@ -130,7 +130,7 @@ class _TurnBubble extends StatelessWidget {
                   ),
                   const SizedBox(height: 8),
                 ],
-                if (isUser && turn.audioDurationSeconds != null) ...[
+                if (turn.audioDurationSeconds != null) ...[
                   Padding(
                     padding: const EdgeInsets.only(bottom: 6),
                     child: AudioWaveformBubble(

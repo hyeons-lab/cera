@@ -1848,6 +1848,12 @@ impl<'a> cera::ModalitySink for JsTextSink<'a> {
     }
 
     fn on_audio_frames(&mut self, pcm: &[f32], sample_rate: u32) {
+        console_info(&format!(
+            "[cera-wasm] JsTextSink::on_audio_frames: {} PCM samples at {} Hz, callback present: {}",
+            pcm.len(),
+            sample_rate,
+            self.on_audio.is_some()
+        ));
         if let Some(cb) = self.on_audio {
             let array = js_sys::Float32Array::from(pcm);
             let rate = JsValue::from_f64(sample_rate as f64);
@@ -2144,7 +2150,11 @@ mod webgpu {
 
             if is_audio {
                 let weights = cera::model::audio_encoder::AudioEncoderWeights::from_gguf(&proj_arc)
-                    .map_err(map_err)?;
+                    .map_err(|e| {
+                        JsError::new(&format!(
+                            "failed to parse audio encoder mmproj weights: {e:#}"
+                        ))
+                    })?;
                 let enc_hidden = weights.config.llm_hidden_size;
                 if enc_hidden != llm_hidden {
                     return Err(JsError::new(&format!(
@@ -2161,7 +2171,11 @@ mod webgpu {
             } else {
                 let weights =
                     cera::model::vision_encoder::VisionEncoderWeights::from_gguf(&proj_arc)
-                        .map_err(map_err)?;
+                        .map_err(|e| {
+                            JsError::new(&format!(
+                                "failed to parse vision encoder mmproj weights: {e:#}"
+                            ))
+                        })?;
                 let proj_dim = weights.config.projection_dim;
                 if proj_dim != llm_hidden {
                     return Err(JsError::new(&format!(

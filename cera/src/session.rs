@@ -1854,6 +1854,12 @@ impl Session {
         // and returns the argmax token directly — a real win on Metal
         // (~hundreds of μs per token saved at 64 K vocab).
         let mut logits = self.last_logits.take().ok_or(CeraError::EmptyInput)?;
+        tracing::info!(
+            "[cera:session] generate starting: current_pos={}, max_seq_len={}, audio_vocoder_attached={}",
+            self.current_pos,
+            self.max_seq_len,
+            self.audio_decoder.is_some() && self.detok_weights.is_some()
+        );
 
         // Greedy mode is decided once per generate call: deterministic
         // argmax + `forward_greedy`. Stochastic mode samples with RNG +
@@ -2088,6 +2094,9 @@ impl Session {
             if token == crate::audio_engine::TOKEN_AUDIO_START
                 && let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights)
             {
+                tracing::info!(
+                    "[cera:session] hit TOKEN_AUDIO_START (128). Beginning vocoder audio decoding..."
+                );
                 pending.pop();
                 if !pending.is_empty() {
                     sink.on_text_tokens(&pending);
@@ -2101,6 +2110,7 @@ impl Session {
                 pos += 1;
 
                 let mut cancelled = false;
+                let mut frame_count = 0;
                 loop {
                     if self.cancel.load(Ordering::Relaxed) {
                         cancelled = true;
@@ -2111,8 +2121,14 @@ impl Session {
                     }
                     let outcome = decoder.decode_frame(&emb);
                     let audio_emb = match outcome {
-                        crate::audio_engine::FrameOutcome::End => break,
+                        crate::audio_engine::FrameOutcome::End => {
+                            tracing::info!(
+                                "[cera:session] vocoder emitted End code after {frame_count} frames"
+                            );
+                            break;
+                        }
                         crate::audio_engine::FrameOutcome::Codes { audio_embedding } => {
+                            frame_count += 1;
                             audio_embedding
                         }
                     };
@@ -2123,9 +2139,19 @@ impl Session {
                     generated += 1;
                 }
 
+                let mut sample_count = 0;
                 decoder.finish(|pcm, rate| {
+                    sample_count += pcm.len();
+                    tracing::info!(
+                        "[cera:session] vocoder finish produced {} PCM samples at {} Hz",
+                        pcm.len(),
+                        rate
+                    );
                     sink.on_audio_frames(pcm, rate);
                 });
+                tracing::info!(
+                    "[cera:session] audio generation finished with {frame_count} frames and {sample_count} total PCM samples"
+                );
                 finish = if cancelled {
                     FinishReason::Cancelled
                 } else if pos >= self.max_seq_len {

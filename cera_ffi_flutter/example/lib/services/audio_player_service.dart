@@ -13,6 +13,9 @@ class AudioPlayerService {
 
   /// Plays a completed mono Float32 PCM waveform.
   Future<void> playPcm(List<double> samples, {int sampleRate = 24000}) async {
+    debugPrint(
+      '[cera:audio_player_service] playPcm called with ${samples.length} samples at $sampleRate Hz (kIsWeb=$kIsWeb)',
+    );
     if (samples.isEmpty) return;
     _isPlaying = true;
     try {
@@ -27,6 +30,9 @@ class AudioPlayerService {
 
   /// Begins an audio streaming session.
   void startStream({int sampleRate = 24000}) {
+    debugPrint(
+      '[cera:audio_player_service] startStream called (sampleRate=$sampleRate, kIsWeb=$kIsWeb)',
+    );
     _isPlaying = true;
     if (kIsWeb) {
       web_player.startAudioStream(sampleRate);
@@ -35,6 +41,9 @@ class AudioPlayerService {
 
   /// Appends an audio PCM chunk to the live stream.
   void appendChunk(List<double> chunk) {
+    debugPrint(
+      '[cera:audio_player_service] appendChunk called with ${chunk.length} samples (isPlaying=$_isPlaying, kIsWeb=$kIsWeb)',
+    );
     if (chunk.isEmpty || !_isPlaying) return;
     final floatList = Float32List.fromList(chunk);
     if (kIsWeb) {
@@ -44,6 +53,7 @@ class AudioPlayerService {
 
   /// Stops streaming and ends audio playback.
   void stop() {
+    debugPrint('[cera:audio_player_service] stop called (kIsWeb=$kIsWeb)');
     _isPlaying = false;
     if (kIsWeb) {
       web_player.stopAudioStream();

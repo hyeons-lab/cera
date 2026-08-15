@@ -87,6 +87,9 @@
         }
         const data = raw instanceof Float32Array ? raw : new Float32Array(raw);
         if (data.length === 0) return;
+        console.info(
+          `[cera:html] appendChunk: received ${data.length} samples, ctx.state=${this.ctx.state}, currentTime=${this.ctx.currentTime.toFixed(2)}, nextStartTime=${this.nextStartTime.toFixed(2)}`,
+        );
         const buffer = this.ctx.createBuffer(1, data.length, this.sampleRate);
         buffer.copyToChannel(data, 0);
         const source = this.ctx.createBufferSource();
@@ -99,6 +102,7 @@
       }
 
       stop() {
+        console.info('[cera:html] streamer stop called');
         this.isPlaying = false;
         if (this.ctx && this.ctx.state !== 'closed') {
           this.ctx.close().catch(() => {});
@@ -116,6 +120,9 @@
       }
       activeAudioCtx = ctx;
       const data = raw instanceof Float32Array ? raw : new Float32Array(raw);
+      console.info(
+        `[cera:html] ceraPlayAudio called with ${data.length} samples at ${sr}Hz, ctx.state=${ctx.state}`,
+      );
       const buffer = ctx.createBuffer(1, data.length, sr);
       buffer.copyToChannel(data, 0);
       const source = ctx.createBufferSource();
@@ -124,6 +131,7 @@
       activeAudioSource = source;
       return new Promise((resolve) => {
         source.onended = () => {
+          console.info('[cera:html] ceraPlayAudio onended fired');
           if (activeAudioSource === source) {
             activeAudioSource = null;
           }
@@ -152,6 +160,7 @@
     };
 
     window.ceraStartAudioStream = function(sampleRate) {
+      console.info(`[cera:html] ceraStartAudioStream called (sampleRate=${sampleRate})`);
       if (activeStreamer) activeStreamer.stop();
       activeStreamer = new CeraAudioStreamer(sampleRate || 24000);
     };
@@ -159,10 +168,13 @@
     window.ceraAppendAudioStreamChunk = function(raw) {
       if (activeStreamer) {
         activeStreamer.appendChunk(raw);
+      } else {
+        console.warn('[cera:html] ceraAppendAudioStreamChunk called but no activeStreamer exists!');
       }
     };
 
     window.ceraStopAudioStream = function() {
+      console.info('[cera:html] ceraStopAudioStream called');
       if (activeStreamer) {
         activeStreamer.stop();
         activeStreamer = null;

@@ -270,14 +270,17 @@ function openCpu(bytes, contextSize, mmproj, inferenceType, turboQuant) {
 
 function initCpuSession(engine, turboQuant) {
   const config = new wasm.SessionConfig();
+  let tq = null;
   if (turboQuant && typeof wasm.TurboQuantConfig === 'function') {
-    config.kvCompression = new wasm.TurboQuantConfig(BigInt(0));
+    tq = new wasm.TurboQuantConfig(BigInt(0));
+    config.kvCompression = tq;
   }
   try {
     const session = engine.newSession(config);
     cpu = { engine, session, tokenizer: engine.tokenizer, turboQuant: Boolean(turboQuant) };
   } finally {
     config.free();
+    tq?.free();
   }
   backendLabel = 'wasm cpu';
 }
@@ -687,6 +690,9 @@ const OPS = {
       text += piece;
       post({ event: 'token', text: piece });
     };
+    console.info(
+      `[cera:worker] generate op started: backend=${gpu ? 'gpu' : 'cpu'}, maxTokens=${maxTokens}, ids=${ids.length}`,
+    );
     if (gpu) {
       // Caller-framed: `generateTokens` prepends nothing, which is what makes
       // the BOS rule in `encodePrompt` the single place BOS is decided.
@@ -718,10 +724,13 @@ const OPS = {
       // that the host sees output as it is produced.
       let uncommittedTokens = [];
       const onAudio = (pcm, sampleRate) => {
-        console.info(`[cera:worker] generate: emitting ${pcm.length} audio PCM samples at ${sampleRate}Hz`);
+        console.info(
+          `[cera:worker] generate: emitting ${pcm?.length} audio PCM samples at ${sampleRate}Hz, posting to host with id=${req.id}`,
+        );
         post({ event: 'audio', pcm: Array.from(pcm), sampleRate });
       };
       try {
+        console.info('[cera:worker] calling cpu.session.generate...');
         cpu.session.generate(
           opts,
           (toks) => {

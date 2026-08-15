@@ -22,6 +22,9 @@ external void _ceraStopAudioStream();
 
 /// Plays a single audio PCM buffer using the browser Web Audio API.
 Future<void> playAudioPcm(Float32List samples, int sampleRate) async {
+  debugPrint(
+    '[cera:audio_player_web] playAudioPcm calling ceraPlayAudio with ${samples.length} samples at $sampleRate Hz',
+  );
   try {
     final promise = _ceraPlayAudio(samples.toJS, sampleRate.toJS);
     if (promise != null) {
@@ -34,6 +37,7 @@ Future<void> playAudioPcm(Float32List samples, int sampleRate) async {
 
 /// Stops any active audio playback.
 void stopAudioPlayback() {
+  debugPrint('[cera:audio_player_web] stopAudioPlayback calling ceraStopAudio');
   try {
     _ceraStopAudio();
   } catch (err) {
@@ -43,6 +47,9 @@ void stopAudioPlayback() {
 
 /// Starts an audio streaming playback session.
 void startAudioStream(int sampleRate) {
+  debugPrint(
+    '[cera:audio_player_web] startAudioStream calling ceraStartAudioStream ($sampleRate Hz)',
+  );
   try {
     _ceraStartAudioStream(sampleRate.toJS);
   } catch (err) {
@@ -52,6 +59,9 @@ void startAudioStream(int sampleRate) {
 
 /// Appends a PCM chunk to the active audio stream.
 void appendAudioStreamChunk(Float32List chunk) {
+  debugPrint(
+    '[cera:audio_player_web] appendAudioStreamChunk calling ceraAppendAudioStreamChunk with ${chunk.length} samples',
+  );
   try {
     _ceraAppendAudioStreamChunk(chunk.toJS);
   } catch (err) {
@@ -61,6 +71,9 @@ void appendAudioStreamChunk(Float32List chunk) {
 
 /// Stops and closes the audio streaming session.
 void stopAudioStream() {
+  debugPrint(
+    '[cera:audio_player_web] stopAudioStream calling ceraStopAudioStream',
+  );
   try {
     _ceraStopAudioStream();
   } catch (err) {

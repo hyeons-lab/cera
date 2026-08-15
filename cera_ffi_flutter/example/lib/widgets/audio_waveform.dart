@@ -212,7 +212,10 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
       setState(() => _isPlaying = false);
     } else {
       setState(() => _isPlaying = true);
-      await player.playPcm(samples, sampleRate: 16000);
+      final sr = widget.durationSeconds > 0
+          ? (samples.length / widget.durationSeconds).round()
+          : 24000;
+      await player.playPcm(samples, sampleRate: sr);
       if (mounted) {
         setState(() => _isPlaying = false);
       }
