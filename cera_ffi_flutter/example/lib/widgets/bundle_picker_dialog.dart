@@ -246,12 +246,12 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
         return Container(
           decoration: BoxDecoration(
             color: isActive
-                ? theme.colorScheme.primary.withOpacity(0.16)
+                ? theme.colorScheme.primary.withValues(alpha: 0.16)
                 : null,
             borderRadius: BorderRadius.circular(8),
             border: isActive
                 ? Border.all(
-                    color: theme.colorScheme.primary.withOpacity(0.4),
+                    color: theme.colorScheme.primary.withValues(alpha: 0.4),
                     width: 1,
                   )
                 : null,
@@ -276,9 +276,11 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                       vertical: 2,
                     ),
                     decoration: BoxDecoration(
-                      color: Colors.green.withOpacity(0.2),
+                      color: Colors.green.withValues(alpha: 0.2),
                       borderRadius: BorderRadius.circular(6),
-                      border: Border.all(color: Colors.green.withOpacity(0.4)),
+                      border: Border.all(
+                        color: Colors.green.withValues(alpha: 0.4),
+                      ),
                     ),
                     child: const Row(
                       mainAxisSize: MainAxisSize.min,
@@ -415,10 +417,10 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                         vertical: 2,
                       ),
                       decoration: BoxDecoration(
-                        color: Colors.green.withOpacity(0.2),
+                        color: Colors.green.withValues(alpha: 0.2),
                         borderRadius: BorderRadius.circular(6),
                         border: Border.all(
-                          color: Colors.green.withOpacity(0.4),
+                          color: Colors.green.withValues(alpha: 0.4),
                         ),
                       ),
                       child: const Row(
@@ -461,7 +463,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                       );
                       return Container(
                         color: isLoadedQuant
-                            ? theme.colorScheme.primary.withOpacity(0.16)
+                            ? theme.colorScheme.primary.withValues(alpha: 0.16)
                             : null,
                         child: ListTile(
                           dense: true,
@@ -487,8 +489,9 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                                     vertical: 1,
                                   ),
                                   decoration: BoxDecoration(
-                                    color: theme.colorScheme.primary
-                                        .withOpacity(0.2),
+                                    color: theme.colorScheme.primary.withValues(
+                                      alpha: 0.2,
+                                    ),
                                     borderRadius: BorderRadius.circular(4),
                                   ),
                                   child: Text(
