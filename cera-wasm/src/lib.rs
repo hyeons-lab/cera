@@ -1848,12 +1848,6 @@ impl<'a> cera::ModalitySink for JsTextSink<'a> {
     }
 
     fn on_audio_frames(&mut self, pcm: &[f32], sample_rate: u32) {
-        console_info(&format!(
-            "[cera-wasm] JsTextSink::on_audio_frames: {} PCM samples at {} Hz, callback present: {}",
-            pcm.len(),
-            sample_rate,
-            self.on_audio.is_some()
-        ));
         if let Some(cb) = self.on_audio {
             let array = js_sys::Float32Array::from(pcm);
             let rate = JsValue::from_f64(sample_rate as f64);
@@ -2188,9 +2182,7 @@ mod webgpu {
             let proj_arc = Arc::new(proj_gguf);
             let llm_hidden = cera::model::Model::config(&self.model).hidden_size;
 
-            let is_audio = proj_arc.metadata.contains_key("clip.audio.block_count")
-                || proj_arc.metadata.contains_key("clip.has_audio_encoder")
-                || proj_arc.metadata.contains_key("audio.block_count");
+            let is_audio = cera::model::audio_encoder::is_audio_encoder_gguf(&proj_arc);
 
             if is_audio {
                 let weights = cera::model::audio_encoder::AudioEncoderWeights::from_gguf(&proj_arc)

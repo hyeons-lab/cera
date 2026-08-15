@@ -4,6 +4,8 @@
 // compute shaders. Full forward pass in a single CommandEncoder — only logits
 // are read back to CPU.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use wgpu::util::DeviceExt;
 
@@ -204,12 +206,12 @@ pub struct GpuContext {
     pub min_storage_buffer_offset_alignment: u64,
     pub preprocessor: Preprocessor,
     /// Timestamp profiling (None if TIMESTAMP_QUERY not supported).
-    pub profiler: Option<GpuProfiler>,
+    pub profiler: Option<Arc<GpuProfiler>>,
     /// Pre-allocated staging buffer for download_f32. Resized on demand.
     /// `Mutex` (not `RefCell`) so `GpuContext` is `Sync`, which is the
     /// prerequisite for `Arc<dyn Model>: Send + Sync` through the FFI.
-    staging: std::sync::Mutex<Option<wgpu::Buffer>>,
-    staging_size: std::sync::atomic::AtomicU64,
+    staging: Arc<std::sync::Mutex<Option<wgpu::Buffer>>>,
+    staging_size: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Clone for GpuContext {
@@ -223,9 +225,9 @@ impl Clone for GpuContext {
             max_buffer_size: self.max_buffer_size,
             min_storage_buffer_offset_alignment: self.min_storage_buffer_offset_alignment,
             preprocessor: self.preprocessor.clone(),
-            profiler: None,
-            staging: std::sync::Mutex::new(None),
-            staging_size: std::sync::atomic::AtomicU64::new(0),
+            profiler: self.profiler.clone(),
+            staging: Arc::clone(&self.staging),
+            staging_size: Arc::clone(&self.staging_size),
         }
     }
 }
@@ -429,7 +431,7 @@ impl GpuContext {
                 mapped_at_creation: false,
             });
             tracing::info!("GPU timestamp profiling enabled (period={timestamp_period}ns/tick)");
-            Some(GpuProfiler {
+            Some(Arc::new(GpuProfiler {
                 query_set,
                 resolve_buf,
                 read_buf,
@@ -437,7 +439,7 @@ impl GpuContext {
                 spans: std::sync::Mutex::new(Vec::new()),
                 next_query: std::sync::atomic::AtomicU32::new(0),
                 max_queries,
-            })
+            }))
         } else {
             tracing::info!("GPU timestamp profiling not available");
             None
@@ -466,8 +468,8 @@ impl GpuContext {
                 as u64,
             preprocessor,
             profiler,
-            staging: std::sync::Mutex::new(None),
-            staging_size: std::sync::atomic::AtomicU64::new(0),
+            staging: Arc::new(std::sync::Mutex::new(None)),
+            staging_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 

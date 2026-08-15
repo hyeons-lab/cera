@@ -8,9 +8,9 @@
 // Weight tensors are Q4_0 in the vocoder GGUF — accessed via zero-copy mmap
 // exactly like the LLM weights in metal_lfm2.rs.
 
-use std::cell::Cell;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState};
@@ -127,7 +127,7 @@ pub struct MetalAudioDecoder {
     conv_bufs: Vec<Option<Buffer>>,
     kv_k: Vec<Option<Buffer>>,
     kv_v: Vec<Option<Buffer>>,
-    n_past: Cell<usize>,
+    n_past: AtomicUsize,
     // mmap removed — all weights uploaded as dequantized F32 for CPU-matching precision
 }
 
@@ -406,12 +406,12 @@ impl MetalAudioDecoder {
             conv_bufs,
             kv_k,
             kv_v,
-            n_past: Cell::new(0),
+            n_past: AtomicUsize::new(0),
         })
     }
 
     pub fn reset(&self) {
-        self.n_past.set(0);
+        self.n_past.store(0, Ordering::Relaxed);
         for b in self.conv_bufs.iter().flatten() {
             unsafe {
                 std::ptr::write_bytes(b.contents() as *mut u8, 0, b.length() as usize);
@@ -870,7 +870,7 @@ impl MetalAudioDecoder {
         }
 
         // 3. Encode layers
-        let n_past = self.n_past.get();
+        let n_past = self.n_past.load(Ordering::Relaxed);
 
         for (il, lw) in self.layers.iter().enumerate() {
             let cb = self.ctx.queue.new_command_buffer();
@@ -920,7 +920,7 @@ impl MetalAudioDecoder {
             cb.wait_until_completed();
         }
 
-        self.n_past.set(n_past + n_frames);
+        self.n_past.store(n_past + n_frames, Ordering::Relaxed);
 
         // 5. Read spectrum from GPU
         let total = n_frames * spectrum_per_frame;
@@ -1081,7 +1081,7 @@ pub struct MetalDepthformer {
     // KV caches: f32, 6 layers × [max_seq=8, kv_dim]
     kv_k: Vec<Buffer>,
     kv_v: Vec<Buffer>,
-    n_past: Cell<usize>,
+    n_past: AtomicUsize,
     // Params
     rmsnorm_params: Buffer,
     elementwise_is: Buffer,
@@ -1255,14 +1255,14 @@ impl MetalDepthformer {
             logits_buf,
             kv_k,
             kv_v,
-            n_past: Cell::new(0),
+            n_past: std::sync::atomic::AtomicUsize::new(0),
             rmsnorm_params,
             elementwise_is,
         })
     }
 
     pub fn reset(&self) {
-        self.n_past.set(0);
+        self.n_past.store(0, std::sync::atomic::Ordering::Relaxed);
         // KV caches don't need clearing — n_past=0 means attention reads 0 entries.
     }
 
@@ -1285,7 +1285,7 @@ impl MetalDepthformer {
         let mut prev_token: i32 = -1;
 
         for (j, code) in codes.iter_mut().enumerate().take(dec.n_codebook) {
-            let pos = self.n_past.get();
+            let pos = self.n_past.load(std::sync::atomic::Ordering::Relaxed);
 
             // Build command buffer for this codebook
             let cb = self.ctx.queue.new_command_buffer();
@@ -1427,7 +1427,7 @@ impl MetalDepthformer {
                 self.encode_df_gemv_accum(enc, &lw.w2, &self.gate_buf, &self.hidden_buf);
             }
 
-            self.n_past.set(pos + 1);
+            self.n_past.store(pos + 1, Ordering::Relaxed);
 
             // 4. to_logits: rmsnorm → GEMV → logits
             enc.set_compute_pipeline_state(&self.pipes.rmsnorm);

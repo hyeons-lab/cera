@@ -42,6 +42,16 @@ const KEY_N_HEAD: &str = "clip.audio.attention.head_count";
 const KEY_LN_EPS: &str = "clip.audio.attention.layer_norm_epsilon";
 const KEY_N_MEL_BINS: &str = "clip.audio.num_mel_bins";
 
+/// Returns whether a GGUF mmproj file contains an audio encoder rather than a vision encoder.
+pub fn is_audio_encoder_gguf(gguf: &GgufFile) -> bool {
+    gguf.metadata.contains_key("clip.audio.block_count")
+        || gguf.metadata.contains_key("clip.has_audio_encoder")
+        || gguf.metadata.contains_key("audio.block_count")
+        || gguf
+            .get_tensor("audio_model.encoder.layers.0.attn.q.weight")
+            .is_ok()
+}
+
 // ── Audio preprocessing constants (hardcoded by llama.cpp's LFM2A
 //    preprocessor — not stored in the GGUF; surfaced here so the
 //    forward-pass PR can read them from one place) ───────────────────
