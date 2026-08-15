@@ -307,11 +307,13 @@ fn map_cera_err(err: cera::CeraError) -> JsError {
 }
 
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn console_info(msg: &str) {
     web_sys::console::info_1(&wasm_bindgen::JsValue::from_str(msg));
 }
 
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn console_warn(msg: &str) {
     web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(msg));
 }
@@ -414,6 +416,7 @@ impl CeraEngine {
         let parts = cera::ModelBytes {
             model: bytes.into(),
             multimodal_projector: mmproj.map(Into::into),
+            audio_decoder: None,
             // `parse_str` maps anything unrecognized to `Unknown(s)`, which
             // `from_parts` rejects by name, better than silently falling
             // back to text when a caller fat-fingers the string.

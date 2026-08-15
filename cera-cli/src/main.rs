@@ -2258,8 +2258,13 @@ fn main() -> Result<()> {
                 let prompt_is_empty = prompt.as_deref().unwrap_or("").trim().is_empty();
                 let effective_temp =
                     temperature.unwrap_or(engine.default_generate_opts().temperature);
+                let has_sampling_overrides = top_p.is_some()
+                    || top_k.is_some()
+                    || min_p.is_some()
+                    || repetition_penalty.is_some();
                 let transcribe_compatible = prompt_is_empty
                     && effective_temp <= 0.0
+                    && !has_sampling_overrides
                     && max_tokens == 256
                     && kv_cache_keys == "f32"
                     // `engine.transcribe` bypasses the session, so a LoRA adapter
@@ -2591,6 +2596,8 @@ fn main() -> Result<()> {
                             .map(|k| k as usize)
                             .unwrap_or(default_opts.top_k as usize),
                         min_p: min_p.unwrap_or(default_opts.min_p),
+                        repetition_penalty: repetition_penalty
+                            .unwrap_or(default_opts.repetition_penalty),
                         ..Default::default()
                     },
                     audio_temperature,

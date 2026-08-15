@@ -444,18 +444,30 @@ impl CeraEngine {
         // A text type ignores the mmproj entirely, which is what makes the
         // documented opt-out ("text plus an ignored sidecar") mean something.
         let (audio_decoder, detok_weights) = if let Some(voc_bytes) = parts.audio_decoder {
-            if let Ok(voc_gguf) = GgufFile::from_bytes(voc_bytes) {
-                let voc_arc = Arc::new(voc_gguf);
-                (
-                    crate::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_arc)
+            match GgufFile::from_bytes(voc_bytes) {
+                Ok(voc_gguf) => {
+                    let voc_arc = Arc::new(voc_gguf);
+                    let dec = crate::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_arc)
+                        .map_err(|e| {
+                            tracing::warn!("failed to parse audio decoder weights: {e:#}");
+                            e
+                        })
                         .ok()
-                        .map(Arc::new),
-                    crate::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_arc)
-                        .ok()
-                        .map(Arc::new),
-                )
-            } else {
-                (None, None)
+                        .map(Arc::new);
+                    let detok =
+                        crate::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_arc)
+                            .map_err(|e| {
+                                tracing::warn!("failed to parse detokenizer weights: {e:#}");
+                                e
+                            })
+                            .ok()
+                            .map(Arc::new);
+                    (dec, detok)
+                }
+                Err(e) => {
+                    tracing::warn!("failed to read vocoder GGUF file: {e:#}");
+                    (None, None)
+                }
             }
         } else {
             (None, None)
