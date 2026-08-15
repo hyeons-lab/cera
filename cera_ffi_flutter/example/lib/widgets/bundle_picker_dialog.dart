@@ -276,25 +276,27 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                       vertical: 2,
                     ),
                     decoration: BoxDecoration(
-                      color: Colors.green.withValues(alpha: 0.2),
+                      color: theme.colorScheme.primaryContainer.withValues(
+                        alpha: 0.5,
+                      ),
                       borderRadius: BorderRadius.circular(6),
                       border: Border.all(
-                        color: Colors.green.withValues(alpha: 0.4),
+                        color: theme.colorScheme.primary.withValues(alpha: 0.4),
                       ),
                     ),
-                    child: const Row(
+                    child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Icon(
                           Icons.check_circle_rounded,
                           size: 11,
-                          color: Colors.greenAccent,
+                          color: theme.colorScheme.primary,
                         ),
-                        SizedBox(width: 4),
+                        const SizedBox(width: 4),
                         Text(
                           'Active',
                           style: TextStyle(
-                            color: Colors.greenAccent,
+                            color: theme.colorScheme.primary,
                             fontSize: 11,
                             fontWeight: FontWeight.w600,
                           ),
@@ -417,25 +419,29 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                         vertical: 2,
                       ),
                       decoration: BoxDecoration(
-                        color: Colors.green.withValues(alpha: 0.2),
+                        color: theme.colorScheme.primaryContainer.withValues(
+                          alpha: 0.5,
+                        ),
                         borderRadius: BorderRadius.circular(6),
                         border: Border.all(
-                          color: Colors.green.withValues(alpha: 0.4),
+                          color: theme.colorScheme.primary.withValues(
+                            alpha: 0.4,
+                          ),
                         ),
                       ),
-                      child: const Row(
+                      child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Icon(
                             Icons.check_circle_rounded,
                             size: 12,
-                            color: Colors.greenAccent,
+                            color: theme.colorScheme.primary,
                           ),
-                          SizedBox(width: 4),
+                          const SizedBox(width: 4),
                           Text(
                             'Active',
                             style: TextStyle(
-                              color: Colors.greenAccent,
+                              color: theme.colorScheme.primary,
                               fontSize: 11,
                               fontWeight: FontWeight.w600,
                             ),

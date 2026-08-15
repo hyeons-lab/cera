@@ -457,8 +457,6 @@ abstract interface class Cera {
   /// Feeds mono PCM audio into the conversation, to be processed by the next
   /// [generate].
   ///
-  /// Feed mono PCM audio into the live conversation.
-  ///
   /// Feeds raw audio frames directly through the model's audio encoder into the
   /// LLM's KV cache. An optional `prompt` text can accompany the audio.
   ///

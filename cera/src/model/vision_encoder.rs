@@ -153,6 +153,10 @@ impl VisionEncoderConfig {
             gguf.get_u32(KEY_PATCH_SIZE)
                 .with_context(|| format!("missing `{KEY_PATCH_SIZE}`"))? as usize;
         anyhow::ensure!(
+            n_head > 0 && n_embd.is_multiple_of(n_head),
+            "n_embd ({n_embd}) must be a positive multiple of n_head ({n_head})"
+        );
+        anyhow::ensure!(
             patch_size > 0 && image_size.is_multiple_of(patch_size),
             "image_size ({image_size}) must be a positive multiple of patch_size ({patch_size})"
         );
@@ -918,6 +922,9 @@ pub(crate) fn interpolate_pos_embed_2d(
     out_w: usize,
     n_embd: usize,
 ) -> Vec<f32> {
+    if in_h == 0 || in_w == 0 || out_h == 0 || out_w == 0 || n_embd == 0 {
+        return Vec::new();
+    }
     debug_assert_eq!(pos.len(), in_h * in_w * n_embd);
     let mut out = vec![0f32; out_h * out_w * n_embd];
     let scale_y = in_h as f32 / out_h as f32;

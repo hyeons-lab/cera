@@ -111,7 +111,7 @@ pub fn resample_linear(samples: &[f32], sr_in: u32, sr_out: u32) -> Vec<f32> {
 /// Configuration for the LFM2A Conformer audio encoder. Read from
 /// the `clip.audio.*` metadata block of the multimodal_projector
 /// GGUF.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AudioEncoderConfig {
     /// Number of Conformer blocks.
     pub n_layer: usize,
@@ -574,6 +574,7 @@ pub const POS_EMB_DIM: usize = 512;
 /// Caller passes `n_frames` = the encoder's effective sequence
 /// length **after** the conv subsampling stem. The output then
 /// feeds every per-block `linear_pos` projection.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn relative_pos_emb(n_frames: usize) -> Vec<f32> {
     assert!(n_frames > 0, "n_frames must be > 0");
     // Use checked arithmetic for the size math: on 32-bit targets a
@@ -595,18 +596,13 @@ pub fn relative_pos_emb(n_frames: usize) -> Vec<f32> {
     let inv_freq = inv_freq_cached();
     let n_frames_f = n_frames as f64;
 
-    for (pos, row) in pos_emb
-        .as_chunks_mut::<POS_EMB_DIM>()
-        .0
-        .iter_mut()
-        .enumerate()
-    {
+    for (pos, row) in pos_emb.chunks_exact_mut(POS_EMB_DIM).enumerate() {
         // Signed relative shift: pos=0 → max-positive,
         // pos=seq_len-1 → max-negative. Computed in f64 directly
         // rather than via i64 cast so the math doesn't wrap on
         // unusual `pos` values.
         let rel_pos = n_frames_f - pos as f64 - 1.0;
-        for (i, pair) in row.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        for (i, pair) in row.chunks_exact_mut(2).enumerate() {
             let (sin, cos) = ((rel_pos * inv_freq[i]) as f32).sin_cos();
             pair[0] = sin;
             pair[1] = cos;
@@ -888,7 +884,10 @@ pub fn conformer_conv_module_forward(
         0,      // explicit pad already applied above
         n_embd, // groups = in_channels → true depthwise
     );
-    debug_assert_eq!(t_out, t, "causal pad math drifted: t_out={t_out} != t={t}");
+    debug_assert_eq!(
+        t_out, t,
+        "symmetric pad math drifted: t_out={t_out} != t={t}"
+    );
 
     // ── Step 5: conv_norm affine (per-channel mul+add, broadcast
     //    across time), SiLU. Walk channel-by-channel for the

@@ -198,7 +198,7 @@ class ChatController extends ValueNotifier<ChatState> {
           LoadBundleIntent(
             bundleName: model.bundleName,
             quant: model.quant,
-            displayName: model.name,
+            displayName: model.displayName ?? model.bundleName,
             storeDir: _defaultStoreDir,
           ),
         );
@@ -212,6 +212,7 @@ class ChatController extends ValueNotifier<ChatState> {
       name: label,
       bundleName: intent.bundleName,
       quant: intent.quant,
+      displayName: intent.displayName,
       getStoreDir: intent.storeDir,
     );
 
@@ -221,7 +222,7 @@ class ChatController extends ValueNotifier<ChatState> {
         intent.bundleName,
         intent.quant,
         storeDir: await intent.storeDir(),
-        options: CeraOptions(turboQuant: value.settings.turboQuant),
+        options: value.settings.ceraOptions,
         onProgress: onProgress,
       ),
       label: label,
@@ -235,7 +236,7 @@ class ChatController extends ValueNotifier<ChatState> {
   Future<void> _onLoadLocalModel(LoadLocalModelIntent intent) async {
     await _load(
       modelSource: intent.source,
-      openFn: (_) => intent.source.open(),
+      openFn: (_) => intent.source.open(options: value.settings.ceraOptions),
       label: intent.source.name,
       isBundle: false,
     );
@@ -430,6 +431,7 @@ class ChatController extends ValueNotifier<ChatState> {
       }
     }
 
+    if (_disposed || !value.isGenerating) return;
     await _runGeneration(assistantTurn, formattedPrompt);
   }
 
@@ -500,6 +502,7 @@ class ChatController extends ValueNotifier<ChatState> {
       return;
     }
 
+    if (_disposed || !value.isGenerating) return;
     await _runGeneration(assistantTurn, '');
   }
 
@@ -657,7 +660,9 @@ class ChatController extends ValueNotifier<ChatState> {
         await _ceraEngine?.close();
         _ceraEngine = null;
         try {
-          final reloaded = await current.open();
+          final reloaded = await current.open(
+            options: value.settings.ceraOptions,
+          );
           if (_disposed) {
             await reloaded.close();
             return;

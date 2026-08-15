@@ -84,6 +84,9 @@ class ChatSettings {
   /// null means use model's native resolution limit. Defaults to 256 for fast inference.
   final int? maxImageLongSize;
 
+  /// Converts settings to engine open options.
+  CeraOptions get ceraOptions => CeraOptions(turboQuant: turboQuant);
+
   ChatSettings copyWith({bool? turboQuant, int? Function()? maxImageLongSize}) {
     return ChatSettings(
       turboQuant: turboQuant ?? this.turboQuant,

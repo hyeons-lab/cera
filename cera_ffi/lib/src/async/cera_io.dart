@@ -542,6 +542,9 @@ class _NativeCera implements Cera {
 
       if (splitIdx > 0) {
         _session.appendTokens(allTokens.sublist(0, splitIdx));
+      } else if (splitIdx == -1 && prompt != null && prompt.trim().isNotEmpty) {
+        final promptTokens = _frame(prompt);
+        if (promptTokens.isNotEmpty) _session.appendTokens(promptTokens);
       }
       final floatList = pcm is Float32List ? pcm : Float32List.fromList(pcm);
       _session.appendAudio(floatList, sampleRate);
@@ -583,16 +586,26 @@ class _NativeCera implements Cera {
     // emitting into a session state it no longer matches, and a GPU-backed
     // model shares KV state across sessions besides.
     _session.cancel();
-    await _queue;
-    // Re-checked: `close()` can land during the await above, and reset would
-    // then run on a disposed handle and surface the binding's raw error
-    // instead of this one.
-    _ensureOpen();
-    // `Session.reset`, not a fresh session. It clears KV, position and token
-    // history and lowers the cancel flag, all of which rebuilding also did,
-    // but it keeps the session's own config: rebuilding with a default
-    // `SessionConfig` silently discarded a seed installed by `generate(seed:)`.
-    _session.reset();
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      try {
+        await ahead;
+      } catch (_) {}
+      _pendingAudioSuffixTokens = null;
+      // Re-checked: `close()` can land during the await above, and reset would
+      // then run on a disposed handle and surface the binding's raw error
+      // instead of this one.
+      _ensureOpen();
+      // `Session.reset`, not a fresh session. It clears KV, position and token
+      // history and lowers the cancel flag, all of which rebuilding also did,
+      // but it keeps the session's own config: rebuilding with a default
+      // `SessionConfig` silently discarded a seed installed by `generate(seed:)`.
+      _session.reset();
+    } finally {
+      mine.complete();
+    }
   }
 
   @override
@@ -722,11 +735,15 @@ class _StreamingSink implements ModalitySink {
   void finish() {
     if (_finished) return;
     _finished = true;
-    if (_ids.isNotEmpty && isOpen()) {
-      final full = engine.decodeTokens(_ids);
-      if (full.length > _emitted) emit(full.substring(_emitted));
+    try {
+      if (_ids.isNotEmpty && isOpen()) {
+        final full = engine.decodeTokens(_ids);
+        if (full.length > _emitted) emit(full.substring(_emitted));
+      }
+      done(null);
+    } catch (e) {
+      done(e);
     }
-    done(null);
   }
 
   /// Reports failure. Idempotent, and mutually exclusive with [finish].

@@ -2306,7 +2306,7 @@ mod webgpu {
             if end > max {
                 return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
                     max_seq_len: max as u32,
-                    by: (end - max) as u32,
+                    by: u32::try_from(end.saturating_sub(max)).unwrap_or(u32::MAX),
                 }));
             }
 
@@ -2340,6 +2340,11 @@ mod webgpu {
             };
             if samples.is_empty() {
                 return Err(crate::map_cera_err(cera::CeraError::EmptyInput));
+            }
+            if !(1000..=192_000).contains(&sample_rate) {
+                return Err(crate::map_cera_err(cera::CeraError::Backend(format!(
+                    "unsupported audio sample rate: {sample_rate} Hz (expected 1000..=192000 Hz)"
+                ))));
             }
             let target_sr = cera::model::audio_encoder::SAMPLE_RATE;
             let resampled: std::borrow::Cow<[f32]> = if sample_rate == target_sr {
@@ -2388,7 +2393,7 @@ mod webgpu {
             if end > max {
                 return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
                     max_seq_len: max as u32,
-                    by: (end - max) as u32,
+                    by: u32::try_from(end.saturating_sub(max)).unwrap_or(u32::MAX),
                 }));
             }
 

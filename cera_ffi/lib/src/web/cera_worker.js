@@ -308,6 +308,7 @@ const OPS = {
    * usage is briefly twice the model size on both paths.
    */
   async open({ moduleUrl, bytes, mmproj, contextSize, backend, inferenceType, turboQuant }) {
+    OPS.close();
     await ensureModule(moduleUrl);
     const view = new Uint8Array(bytes);
     // Transferred separately from `bytes`, and absent for a text-only model.
@@ -359,6 +360,7 @@ const OPS = {
    * access and fires no progress events.
    */
   async openBundle(req, post) {
+    OPS.close();
     const { moduleUrl, bundleId, quant, contextSize, backend, storeDir, turboQuant } = req;
     await ensureModule(moduleUrl);
     const repo = new wasm.BundleRepo(storeDir ?? undefined);
@@ -474,7 +476,11 @@ const OPS = {
 
     const allTokens = Array.from(tk.encode(formatted, false));
     const splitIdx = markerId != null ? allTokens.indexOf(markerId) : -1;
-    const prefix = splitIdx > 0 ? allTokens.slice(0, splitIdx) : [];
+    let prefix = splitIdx > 0 ? allTokens.slice(0, splitIdx) : [];
+    if (splitIdx === -1 && prompt && prompt.trim() !== '') {
+      const currentPos = position();
+      prefix = Array.from(encodePrompt(prompt, currentPos === 0));
+    }
     const suffix = splitIdx >= 0 ? allTokens.slice(splitIdx + 1) : [];
 
     if (gpu) {
@@ -542,7 +548,6 @@ const OPS = {
       const allTokens = Array.from(tk.encode(formatted, false));
       const splitIdx = markerId != null ? allTokens.indexOf(markerId) : -1;
 
-      gpu.session.reset();
       if (splitIdx > 0) {
         const prefix = allTokens.slice(0, splitIdx);
         await gpu.session.generateTokens(
@@ -608,6 +613,9 @@ const OPS = {
     if (req.seed != null && currentPos === 0 && cpu) {
       const config = new wasm.SessionConfig();
       config.seed = BigInt(req.seed);
+      if (cpu.turboQuant && typeof wasm.TurboQuantConfig === 'function') {
+        config.kvCompression = new wasm.TurboQuantConfig(BigInt(0));
+      }
       try {
         cpu.session.free();
         cpu.session = cpu.engine.newSession(config);
@@ -738,6 +746,7 @@ const OPS = {
    * than silently continuing a conversation the caller believes it cleared.
    */
   reset() {
+    pendingAudioSuffixTokens = null;
     if (cpu) {
       // `Session.reset`, not a fresh session. It clears KV, position and token
       // history and lowers the cancel flag, which is all rebuilding did, while
@@ -782,6 +791,7 @@ const OPS = {
   },
 
   close() {
+    pendingAudioSuffixTokens = null;
     // The tokenizer handles are separate wasm-bindgen objects holding their own
     // `Arc<BpeTokenizer>` clone, so freeing the engine does not reclaim them.
     // Terminating the worker would, but this protocol is documented as usable

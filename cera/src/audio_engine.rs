@@ -13,6 +13,7 @@ use crate::time::{Duration, Instant};
 use crate::tokenizer::BpeTokenizer;
 
 /// Audio generation configuration.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AudioGenerateConfig {
     pub max_tokens: usize,
     pub sampler: SamplerConfig,
@@ -27,7 +28,7 @@ pub struct AudioGenerateConfig {
     pub gpu_depthformer: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioMode {
     /// All text first, then audio when <|audio_start|> (128) is emitted.
     Sequential,
@@ -36,6 +37,7 @@ pub enum AudioMode {
 }
 
 /// Result of audio generation.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AudioGenerateResult {
     pub text_tokens: usize,
     pub audio_frames: usize,
@@ -139,19 +141,17 @@ impl<'a> AudioOutputDecoder<'a> {
     /// frame, or the prior frame's feedback embedding afterward).
     fn decode_frame(&mut self, embed: &[f32]) -> FrameOutcome {
         let t0 = Instant::now();
-        let codes = if self.use_gpu_df {
-            let g = self
-                .gpu
-                .expect("use_gpu_df implies gpu is Some (set at construction)");
-            g.sample_audio_frame(embed, self.audio_temperature, self.audio_top_k)
-        } else {
-            sample_audio_frame(
+        let codes = match (self.use_gpu_df, self.gpu) {
+            (true, Some(g)) => {
+                g.sample_audio_frame(embed, self.audio_temperature, self.audio_top_k)
+            }
+            _ => sample_audio_frame(
                 self.weights,
                 &mut self.df_state,
                 embed,
                 self.audio_temperature,
                 self.audio_top_k,
-            )
+            ),
         };
         self.time_depthformer += t0.elapsed();
 

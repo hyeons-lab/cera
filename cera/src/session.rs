@@ -35,11 +35,11 @@ pub struct SessionConfig {
     pub max_seq_len: Option<u32>,
     /// KV cache compression mode.
     pub kv_compression: KvCompression,
-    /// Reserved for Phase 1.5 context shift — tokens pinned at the front on overflow. Ignored in 1.1.
+    /// Number of tokens pinned at the front on context shift overflow (e.g. system prompt).
     pub n_keep: u32,
     /// Optional deterministic seed for the sampler.
     pub seed: Option<u64>,
-    /// Reserved for Phase 1.4 chunked prefill — ubatch size. Ignored in 1.1 (prefill is monolithic).
+    /// Micro-batch size for chunked prompt prefill.
     pub ubatch_size: u32,
 }
 
@@ -1101,6 +1101,11 @@ impl Session {
         if samples.is_empty() {
             return Err(CeraError::EmptyInput);
         }
+        if !(1000..=192_000).contains(&sample_rate) {
+            return Err(CeraError::Backend(format!(
+                "unsupported audio sample rate: {sample_rate} Hz (expected 1000..=192000 Hz)"
+            )));
+        }
         let target_sr = crate::model::audio_encoder::SAMPLE_RATE;
         let resampled: std::borrow::Cow<[f32]> = if sample_rate == target_sr {
             std::borrow::Cow::Borrowed(samples)
@@ -1769,7 +1774,7 @@ impl Session {
         struct CancelGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
         impl Drop for CancelGuard {
             fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+                self.0.store(false, std::sync::atomic::Ordering::Release);
             }
         }
         let _cancel_guard = CancelGuard(Arc::clone(&self.cancel));

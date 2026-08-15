@@ -380,10 +380,6 @@ class _ChatPageState extends State<ChatPage> {
                               child: Text('256 px (Fast)'),
                             ),
                             DropdownMenuItem(
-                              value: 384,
-                              child: Text('384 px (Med)'),
-                            ),
-                            DropdownMenuItem(
                               value: 512,
                               child: Text('512 px (HD)'),
                             ),

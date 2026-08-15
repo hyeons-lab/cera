@@ -539,11 +539,11 @@ class _ResultCard extends StatelessWidget {
               if (rate != null)
                 Text(
                   '${rate.toStringAsFixed(1)} tok/s',
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 18,
                     fontWeight: FontWeight.w700,
                     fontFamily: 'monospace',
-                    color: Colors.greenAccent,
+                    color: theme.colorScheme.primary,
                   ),
                 ),
             ],
@@ -647,12 +647,12 @@ class _Speedup extends StatelessWidget {
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: isFaster
-            ? Colors.green.withValues(alpha: 0.16)
+            ? theme.colorScheme.primaryContainer.withValues(alpha: 0.4)
             : theme.colorScheme.surface,
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
           color: isFaster
-              ? Colors.green.withValues(alpha: 0.4)
+              ? theme.colorScheme.primary.withValues(alpha: 0.4)
               : theme.colorScheme.outline,
           width: 1,
         ),
@@ -662,7 +662,7 @@ class _Speedup extends StatelessWidget {
           Icon(
             isFaster ? Icons.bolt_rounded : Icons.info_outline_rounded,
             color: isFaster
-                ? Colors.greenAccent
+                ? theme.colorScheme.primary
                 : theme.colorScheme.onSurfaceVariant,
             size: 24,
           ),
@@ -672,7 +672,7 @@ class _Speedup extends StatelessWidget {
               headline,
               style: TextStyle(
                 color: isFaster
-                    ? Colors.greenAccent
+                    ? theme.colorScheme.primary
                     : theme.colorScheme.onSurface,
                 fontSize: 15,
                 fontWeight: FontWeight.w600,

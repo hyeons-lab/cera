@@ -944,13 +944,13 @@ fn append_audio_wrong_sample_rate_returns_backend_error() {
     session.attach_audio_encoder(encoder);
 
     let pcm = vec![0.0f32; 16_000];
-    let err = session.append_audio(&pcm, 24_000).unwrap_err();
+    let err = session.append_audio(&pcm, 500).unwrap_err();
     let cera::CeraError::Backend(msg) = err else {
-        panic!("expected Backend error for sample-rate mismatch, got {err:?}");
+        panic!("expected Backend error for unsupported sample rate, got {err:?}");
     };
     assert!(
-        msg.contains("sample_rate") && msg.contains("16000"),
-        "Backend error should mention sample_rate + expected 16000; got: {msg}"
+        msg.contains("sample rate"),
+        "Backend error should mention sample rate; got: {msg}"
     );
 }
 

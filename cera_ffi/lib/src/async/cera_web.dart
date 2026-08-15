@@ -393,18 +393,10 @@ class _WorkerCera implements Cera {
   /// views onto it. Copy in that case; the common case is a whole-buffer list
   /// and costs nothing.
   JSArrayBuffer _detach(Uint8List bytes) {
-    if (bytes.offsetInBytes == 0 &&
-        bytes.lengthInBytes == bytes.buffer.lengthInBytes) {
-      return bytes.buffer.toJS;
-    }
     return Uint8List.fromList(bytes).buffer.toJS;
   }
 
   JSArrayBuffer _detachF32(Float32List floats) {
-    if (floats.offsetInBytes == 0 &&
-        floats.lengthInBytes == floats.buffer.lengthInBytes) {
-      return floats.buffer.toJS;
-    }
     return Float32List.fromList(floats).buffer.toJS;
   }
 
@@ -727,12 +719,21 @@ class _WorkerCera implements Cera {
     // natively, and B would then run against a conversation the caller cleared
     // before starting it.
     await cancel();
-    await _queue;
-    // `_send` throws synchronously on a closed engine; `async` here turns that
-    // into a failed future, which is what the native twin returns. The two
-    // transports would otherwise differ on the one call an app is most likely
-    // to leave unawaited.
-    await _send(_newId(), (id) => _Request(id: id, op: 'reset'));
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      try {
+        await ahead;
+      } catch (_) {}
+      // `_send` throws synchronously on a closed engine; `async` here turns that
+      // into a failed future, which is what the native twin returns. The two
+      // transports would otherwise differ on the one call an app is most likely
+      // to leave unawaited.
+      await _send(_newId(), (id) => _Request(id: id, op: 'reset'));
+    } finally {
+      mine.complete();
+    }
   }
 
   @override

@@ -76,12 +76,16 @@ class BundleModelSource implements LoadedModel {
     required this.name,
     required this.bundleName,
     required this.quant,
+    this.displayName,
     this.storeDir,
     this.getStoreDir,
   });
 
   @override
   final String name;
+
+  /// The human-readable bundle display name without quant suffix (e.g. "LFM2-700M").
+  final String? displayName;
 
   /// The catalog bundle name (e.g. "LFM2-700M").
   final String bundleName;

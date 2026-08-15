@@ -323,19 +323,34 @@ impl MmapWeight {
         let bytes = &self.data()[offset..offset + row_bytes];
         match self.dtype {
             DType::F32 => {
-                let src: &[f32] = bytemuck::cast_slice(bytes);
-                dst.copy_from_slice(src);
+                if let Ok(src) = bytemuck::try_cast_slice::<u8, f32>(bytes) {
+                    dst.copy_from_slice(src);
+                } else {
+                    bytemuck::cast_slice_mut::<f32, u8>(dst).copy_from_slice(bytes);
+                }
             }
             DType::F16 => {
-                let src: &[half::f16] = bytemuck::cast_slice(bytes);
-                for (d, &s) in dst.iter_mut().zip(src) {
-                    *d = crate::quant::f16_to_f32(s.to_bits());
+                if let Ok(src) = bytemuck::try_cast_slice::<u8, half::f16>(bytes) {
+                    for (d, &s) in dst.iter_mut().zip(src) {
+                        *d = crate::quant::f16_to_f32(s.to_bits());
+                    }
+                } else {
+                    for (i, d) in dst.iter_mut().enumerate() {
+                        let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                        *d = crate::quant::f16_to_f32(bits);
+                    }
                 }
             }
             DType::BF16 => {
-                let src: &[half::bf16] = bytemuck::cast_slice(bytes);
-                for (d, &s) in dst.iter_mut().zip(src) {
-                    *d = crate::quant::bf16_to_f32(s.to_bits());
+                if let Ok(src) = bytemuck::try_cast_slice::<u8, half::bf16>(bytes) {
+                    for (d, &s) in dst.iter_mut().zip(src) {
+                        *d = crate::quant::bf16_to_f32(s.to_bits());
+                    }
+                } else {
+                    for (i, d) in dst.iter_mut().enumerate() {
+                        let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                        *d = crate::quant::bf16_to_f32(bits);
+                    }
                 }
             }
             DType::Q4_0 => crate::quant::dequantize_q4_0_row(bytes, dst),

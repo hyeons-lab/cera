@@ -424,7 +424,7 @@ pub fn encode_image_gpu<O: VitGpuOps>(
         ($label:literal, $e:expr) => {{
             match &prof {
                 Some(p) => {
-                    let __t = std::time::Instant::now();
+                    let __t = crate::time::Instant::now();
                     let __r = $e;
                     ops.sync();
                     p.record($label, __t.elapsed());
@@ -439,7 +439,7 @@ pub fn encode_image_gpu<O: VitGpuOps>(
         ($label:literal, $e:expr) => {{
             match &prof {
                 Some(p) => {
-                    let __t = std::time::Instant::now();
+                    let __t = crate::time::Instant::now();
                     let __r = $e;
                     p.record($label, __t.elapsed());
                     __r
