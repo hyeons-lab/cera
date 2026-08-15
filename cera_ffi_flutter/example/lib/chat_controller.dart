@@ -354,9 +354,9 @@ class ChatController extends ValueNotifier<ChatState> {
         assistantTurn.statusText = 'Encoding image patches...';
         notifyListeners();
         debugPrint(
-          '[cera:chat] Encoding image patches with maxLongSize 384...',
+          '[cera:chat] Encoding image patches with maxLongSize 256...',
         );
-        await cera.appendImage(imageBytes, maxLongSize: 384);
+        await cera.appendImage(imageBytes, maxLongSize: 256);
         debugPrint(
           '[cera:chat] Image successfully encoded and seeded into KV cache',
         );
