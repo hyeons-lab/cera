@@ -105,15 +105,14 @@
         const elapsedSec = (nowMs - this.firstChunkTime) / 1000.0;
         const rtf = elapsedSec > 0.05 ? (this.totalDurationQueued / elapsedSec) : 1.0;
 
-        // Dynamic buffer threshold: if generation is slower than real-time (RTF < 1.0),
-        // buffer proportional to the speed gap (between 0.6s and 1.8s) so playback never underruns.
-        let targetBufferSec = 0.25;
-        if (rtf < 0.95) {
-          targetBufferSec = Math.min(1.8, Math.max(0.6, (1.0 - rtf) * 2.2));
-        }
-
+        // Adaptive pre-buffering to guarantee zero underrun stutters:
+        // - Faster than real-time (RTF >= 1.0): start after 0.25s of audio.
+        // - Slower than real-time (RTF < 1.0): wait until bufferedAudio >= elapsedSec * (1.0 - RTF).
         if (!this.startedPlaying) {
-          if (this.totalDurationQueued >= targetBufferSec) {
+          const ready = rtf >= 1.0
+            ? (this.totalDurationQueued >= 0.25)
+            : (this.totalDurationQueued >= (elapsedSec * (1.0 - rtf)));
+          if (ready) {
             this._startPlayback();
           }
         } else {
@@ -124,26 +123,42 @@
       _startPlayback() {
         if (this.startedPlaying || !this.isPlaying) return;
         this.startedPlaying = true;
-        this.nextStartTime = this.ctx.currentTime + 0.05;
+        this.nextStartTime = this.ctx.currentTime + 0.03;
         this._drainQueue();
       }
 
       _drainQueue() {
-        if (!this.startedPlaying || !this.isPlaying) return;
+        if (!this.startedPlaying || !this.isPlaying || this.queue.length === 0) return;
         const now = this.ctx.currentTime;
         if (this.nextStartTime < now) {
           this.nextStartTime = now + 0.02;
         }
+
+        // Coalesce all queued chunks into a single contiguous AudioBuffer to eliminate node fragmentation
+        let totalSamples = 0;
+        for (let i = 0; i < this.queue.length; i++) {
+          totalSamples += this.queue[i].length;
+        }
+        if (totalSamples === 0) {
+          this.queue = [];
+          return;
+        }
+
+        const merged = new Float32Array(totalSamples);
+        let offset = 0;
         while (this.queue.length > 0) {
           const chunk = this.queue.shift();
-          const buffer = this.ctx.createBuffer(1, chunk.length, this.sampleRate);
-          buffer.copyToChannel(chunk, 0);
-          const source = this.ctx.createBufferSource();
-          source.buffer = buffer;
-          source.connect(this.ctx.destination);
-          source.start(this.nextStartTime);
-          this.nextStartTime += buffer.duration;
+          merged.set(chunk, offset);
+          offset += chunk.length;
         }
+
+        const buffer = this.ctx.createBuffer(1, merged.length, this.sampleRate);
+        buffer.copyToChannel(merged, 0);
+        const source = this.ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(this.ctx.destination);
+        source.start(this.nextStartTime);
+        this.nextStartTime += buffer.duration;
       }
 
       finish() {

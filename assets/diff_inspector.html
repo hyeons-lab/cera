@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cera — Interactive Raster Diff & Alignment</title>
+  <style>
+    body {
+      background: #090c10;
+      color: #f0f6fc;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      padding: 30px 20px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    h1 { margin-bottom: 8px; font-size: 26px; }
+    p.sub { color: #8b949e; margin-bottom: 24px; }
+    
+    .panel-row {
+      display: flex;
+      gap: 24px;
+      margin-bottom: 32px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .panel-card {
+      background: #12161f;
+      border: 1px solid #21262d;
+      border-radius: 16px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+    .panel-card h3 { font-size: 15px; color: #a5b4fc; }
+    .panel-box {
+      width: 320px;
+      height: 320px;
+      background: #0e1218;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      overflow: hidden;
+    }
+    .panel-box img, .panel-box svg {
+      width: 320px;
+      height: 320px;
+    }
+
+    /* Interactive Split Slider */
+    .slider-container {
+      position: relative;
+      width: 440px;
+      height: 440px;
+      border-radius: 16px;
+      overflow: hidden;
+      border: 2px solid #30363d;
+      margin-top: 10px;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.5);
+    }
+    .slider-container img {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      user-select: none;
+    }
+    .img-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      width: 50%;
+      overflow: hidden;
+      border-right: 2px solid #fbbf24;
+      background: #0e1218;
+    }
+    .img-overlay img {
+      width: 440px;
+      max-width: none;
+    }
+    .slider-range {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0;
+      cursor: ew-resize;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Cera — Vector vs. Master Artwork Visual Diff</h1>
+  <p class="sub">Side-by-side raster diff & interactive before/after split slider</p>
+
+  <div class="panel-row">
+    <!-- 1. Original -->
+    <div class="panel-card">
+      <h3>1. Original Master Artwork</h3>
+      <div class="panel-box">
+        <img src="/Users/dberrios/.gemini/antigravity-cli/brain/27adc6ca-ba93-43e9-b72f-6262adfb28d6/cera_exact_base_icon_centered.png" alt="Original" />
+      </div>
+    </div>
+
+    <!-- 2. Rasterized SVG -->
+    <div class="panel-card">
+      <h3>2. Rasterized Vector SVG</h3>
+      <div class="panel-box">
+        <img src="cera-icon-512x512.png" alt="Rasterized SVG" />
+      </div>
+    </div>
+
+    <!-- 3. Difference Heatmap -->
+    <div class="panel-card">
+      <h3>3. Difference Heatmap (Red = Diff)</h3>
+      <div class="panel-box">
+        <img src="/Users/dberrios/.gemini/antigravity-cli/brain/27adc6ca-ba93-43e9-b72f-6262adfb28d6/cera_vector_vs_master_diff.png" style="width: 960px; max-width: none; transform: translateX(-640px);" alt="Heatmap" />
+      </div>
+    </div>
+  </div>
+
+  <h2 style="font-size: 18px; margin-top: 10px;">Interactive Split Comparison (Drag to compare):</h2>
+  <div class="slider-container" id="sliderContainer">
+    <!-- Base (SVG) -->
+    <img src="cera-icon-512x512.png" alt="Vector SVG" />
+    
+    <!-- Top (Reference Artwork) -->
+    <div class="img-overlay" id="overlay">
+      <img src="/Users/dberrios/.gemini/antigravity-cli/brain/27adc6ca-ba93-43e9-b72f-6262adfb28d6/cera_exact_base_icon_centered.png" alt="Original Artwork" />
+    </div>
+
+    <input type="range" min="0" max="100" value="50" class="slider-range" id="rangeInput" />
+  </div>
+
+  <script>
+    const range = document.getElementById('rangeInput');
+    const overlay = document.getElementById('overlay');
+    range.addEventListener('input', (e) => {
+      overlay.style.width = e.target.value + '%';
+    });
+  </script>
+
+</body>
+</html>

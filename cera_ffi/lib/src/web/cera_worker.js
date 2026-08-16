@@ -692,9 +692,6 @@ const OPS = {
       `[cera:worker] generate op started: backend=${gpu ? 'gpu' : 'cpu'}, maxTokens=${maxTokens}, ids=${ids.length}`,
     );
     const onAudio = (pcm, sampleRate) => {
-      console.info(
-        `[cera:worker] generate: emitting ${pcm?.length} audio PCM samples at ${sampleRate}Hz, posting to host with id=${req.id}`,
-      );
       post({ event: 'audio', pcm: Array.from(pcm), sampleRate });
     };
     if (gpu) {

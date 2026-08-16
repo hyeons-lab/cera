@@ -419,17 +419,11 @@ class _WorkerCera implements Cera {
       final pcmJs = reply.pcm;
       final sampleRate =
           ((reply.sampleRate as JSNumber?)?.toDartDouble ?? 24000).toInt();
-      print(
-        '[cera:web] received audio event for id=${reply.id}, hasCallback=${callback != null}, sampleRate=$sampleRate, pcmJs=$pcmJs',
-      );
       if (callback != null && pcmJs != null) {
         final pcm =
             (pcmJs as JSArray<JSNumber>).toDart
                 .map((n) => n.toDartDouble)
                 .toList();
-        print(
-          '[cera:web] invoking audio callback with ${pcm.length} samples at $sampleRate Hz',
-        );
         callback(pcm, sampleRate);
       }
       return;

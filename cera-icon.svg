@@ -1,0 +1,58 @@
+<svg viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    :root {
+      --cera-gold: #FBBF24;
+      --cera-tangerine: #FB923C;
+      --cera-terracotta: #EA580C;
+      --cera-rust: #9A3412;
+    }
+  </style>
+
+  <g id="cera-helix-mark">
+    <!-- Strand 1: Upper-Left Gold Loop (Top Arch + Left Loop + Upper Diagonal) -->
+    <path id="strand-gold" d="
+      M 160 215 
+      C 125 175 125 115 170 75 
+      C 225 25 320 40 375 105 
+      C 390 122 384 142 365 148 
+      C 348 154 332 142 318 126 
+      C 280 82 210 75 174 110 
+      C 142 140 144 182 170 215 
+      L 242 290 
+      C 252 300 240 312 228 302 
+      L 160 215 Z" fill="#FBBF24" />
+
+    <!-- Strand 2: Upper-Right Tangerine Wing (Top-Right Terminal Loop) -->
+    <path id="strand-tangerine" d="
+      M 375 105 
+      C 412 148 422 210 380 252 
+      C 365 268 344 262 338 244 
+      C 332 224 345 210 358 194 
+      C 382 165 376 132 352 110 
+      L 375 105 Z" fill="#FB923C" />
+
+    <!-- Strand 3: Lower-Left Terracotta Loop (100% Exact Vertical Mirror of Strand 1 across y=256) -->
+    <!-- Mirror formula: y' = 512 - y -->
+    <path id="strand-terracotta" d="
+      M 160 297 
+      C 125 337 125 397 170 437 
+      C 225 487 320 472 375 407 
+      C 390 390 384 370 365 364 
+      C 348 358 332 370 318 386 
+      C 280 430 210 437 174 402 
+      C 142 372 144 330 170 297 
+      L 242 222 
+      C 252 212 240 200 228 210 
+      L 160 297 Z" fill="#EA580C" />
+
+    <!-- Strand 4: Lower-Right Rust Fold (100% Exact Vertical Mirror of Strand 2 across y=256) -->
+    <!-- Mirror formula: y' = 512 - y -->
+    <path id="strand-rust" d="
+      M 375 407 
+      C 412 364 422 302 380 260 
+      C 365 244 344 250 338 268 
+      C 332 288 345 302 358 318 
+      C 382 347 376 380 352 402 
+      L 375 407 Z" fill="#9A3412" />
+  </g>
+</svg>
