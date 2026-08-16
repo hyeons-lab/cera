@@ -89,6 +89,8 @@ class UpdateSettingsIntent extends ChatIntent {
     this.maxImageLongSize,
     this.clearMaxImageLongSize = false,
     this.audioChatMode,
+    this.chatVoice,
+    this.ttsStudioVoice,
     this.ttsVoice,
   });
 
@@ -97,6 +99,8 @@ class UpdateSettingsIntent extends ChatIntent {
   final int? maxImageLongSize;
   final bool clearMaxImageLongSize;
   final AudioChatMode? audioChatMode;
+  final String? chatVoice;
+  final String? ttsStudioVoice;
   final String? ttsVoice;
 }
 

@@ -17,6 +17,9 @@ external void _ceraStartAudioStream(JSNumber sampleRate);
 @JS('ceraAppendAudioStreamChunk')
 external void _ceraAppendAudioStreamChunk(JSFloat32Array chunk);
 
+@JS('ceraFinishAudioStream')
+external void _ceraFinishAudioStream();
+
 @JS('ceraStopAudioStream')
 external void _ceraStopAudioStream();
 
@@ -66,6 +69,18 @@ void appendAudioStreamChunk(Float32List chunk) {
     _ceraAppendAudioStreamChunk(chunk.toJS);
   } catch (err) {
     debugPrint('[cera:audio_player_web] appendAudioStreamChunk failed: $err');
+  }
+}
+
+/// Flushes and finishes active stream playback.
+void finishAudioStream() {
+  debugPrint(
+    '[cera:audio_player_web] finishAudioStream calling ceraFinishAudioStream',
+  );
+  try {
+    _ceraFinishAudioStream();
+  } catch (err) {
+    debugPrint('[cera:audio_player_web] finishAudioStream failed: $err');
   }
 }
 

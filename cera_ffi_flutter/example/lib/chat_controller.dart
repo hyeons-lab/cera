@@ -137,14 +137,20 @@ class ChatController extends ValueNotifier<ChatState> {
         'textOnly' => AudioChatMode.textOnly,
         _ => AudioChatMode.interleaved,
       };
-      final ttsVoice =
-          prefs.getString('cera_tts_voice') ?? 'Use the US female voice.';
+      final chatVoice =
+          prefs.getString('cera_chat_voice') ??
+          prefs.getString('cera_tts_voice') ??
+          'Use the US female voice.';
+      final ttsStudioVoice =
+          prefs.getString('cera_tts_studio_voice') ??
+          'Use the US female voice.';
       final restoredSettings = ChatSettings(
         backend: backend,
         turboQuant: turboQuant,
         maxImageLongSize: maxImageDim == 0 ? null : (maxImageDim ?? 256),
         audioChatMode: audioMode,
-        ttsVoice: ttsVoice,
+        chatVoice: chatVoice,
+        ttsStudioVoice: ttsStudioVoice,
       );
       value = value.copyWith(settings: restoredSettings);
 
@@ -194,14 +200,17 @@ class ChatController extends ValueNotifier<ChatState> {
         ? null
         : (intent.maxImageLongSize ?? current.maxImageLongSize);
     final newAudioMode = intent.audioChatMode ?? current.audioChatMode;
-    final newTtsVoice = intent.ttsVoice ?? current.ttsVoice;
+    final newChatVoice =
+        intent.chatVoice ?? intent.ttsVoice ?? current.chatVoice;
+    final newTtsStudioVoice = intent.ttsStudioVoice ?? current.ttsStudioVoice;
 
     final updated = current.copyWith(
       backend: newBackend,
       turboQuant: newTurbo,
       maxImageLongSize: () => newMaxImage,
       audioChatMode: newAudioMode,
-      ttsVoice: newTtsVoice,
+      chatVoice: newChatVoice,
+      ttsStudioVoice: newTtsStudioVoice,
     );
 
     value = value.copyWith(settings: updated);
@@ -220,7 +229,8 @@ class ChatController extends ValueNotifier<ChatState> {
         AudioChatMode.textOnly => 'textOnly',
         AudioChatMode.interleaved => 'interleaved',
       });
-      await prefs.setString('cera_tts_voice', newTtsVoice);
+      await prefs.setString('cera_chat_voice', newChatVoice);
+      await prefs.setString('cera_tts_studio_voice', newTtsStudioVoice);
     } catch (err) {
       debugPrint('cera: error persisting settings: $err');
     }
@@ -539,9 +549,15 @@ class ChatController extends ValueNotifier<ChatState> {
       '(image: ${imageBytes != null ? "${imageBytes.length} bytes" : "none"}, audioMode: ${audioMode.name})',
     );
 
+    final voicePersona = value.uiMode == AppUIMode.ttsStudio
+        ? value.settings.ttsStudioVoice
+        : value.settings.chatVoice;
+
     final String? systemPrompt = isTts
-        ? 'Perform TTS. ${value.settings.ttsVoice}'.trim()
-        : (isInterleaved ? 'Respond with interleaved text and audio.' : null);
+        ? 'Perform TTS. $voicePersona'.trim()
+        : (isInterleaved
+              ? 'Respond with interleaved text and audio. $voicePersona'.trim()
+              : null);
 
     final messages = <CeraMessage>[
       if (systemPrompt != null) CeraMessage.system(systemPrompt),
@@ -772,12 +788,21 @@ class ChatController extends ValueNotifier<ChatState> {
               ? (totalTokens / (totalMs / 1000.0))
               : 0.0);
 
-    final stats = totalTokens > 0
+    final audioDurationSec = generatedAudioSamples.isNotEmpty
+        ? (generatedAudioSamples.length / 24000.0)
+        : null;
+    final audioRtf = (audioDurationSec != null && totalMs > 0)
+        ? (audioDurationSec / (totalMs / 1000.0))
+        : null;
+
+    final stats = (totalTokens > 0 || audioDurationSec != null)
         ? TurnStats(
             tokens: totalTokens,
             totalMs: totalMs,
             ttftMs: ttft,
             tps: tps,
+            audioDurationSeconds: audioDurationSec,
+            audioRtf: audioRtf,
           )
         : null;
 
@@ -788,15 +813,20 @@ class ChatController extends ValueNotifier<ChatState> {
 
     debugPrint(
       '[cera:chat] Generation completed: $totalTokens tokens in ${totalMs}ms '
-      '(${tps.toStringAsFixed(1)} tok/s, TTFT: ${ttft ?? totalMs}ms)',
+      '(${tps.toStringAsFixed(1)} tok/s, TTFT: ${ttft ?? totalMs}ms'
+      '${audioDurationSec != null ? ", ${audioDurationSec.toStringAsFixed(1)}s audio, RTF: ${audioRtf?.toStringAsFixed(2)}x" : ""})',
     );
 
     if (!_disposed) {
       value = value.copyWith(isGenerating: false);
-      if (generatedAudioSamples.isNotEmpty && isTts) {
-        unawaited(
-          _audioPlayer.playPcm(generatedAudioSamples, sampleRate: 24000),
-        );
+      if (generatedAudioSamples.isNotEmpty) {
+        if (isTts) {
+          unawaited(
+            _audioPlayer.playPcm(generatedAudioSamples, sampleRate: 24000),
+          );
+        } else {
+          _audioPlayer.finishStream();
+        }
       }
     }
   }

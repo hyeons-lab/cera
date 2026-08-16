@@ -72,13 +72,16 @@
         const AudioCtx = window.AudioContext || window.webkitAudioContext;
         this.ctx = new AudioCtx({ sampleRate });
         this.sampleRate = sampleRate;
-        this.nextStartTime = 0;
         this.isPlaying = true;
-        this.started = false;
+        this.queue = [];
+        this.totalDurationQueued = 0;
+        this.firstChunkTime = null;
+        this.nextStartTime = 0;
+        this.startedPlaying = false;
         if (this.ctx.state === 'suspended') {
           this.ctx.resume().catch(() => {});
         }
-        console.info(`[cera:audio] streamer started at ${sampleRate}Hz`);
+        console.info(`[cera:audio] dynamic streamer started at ${sampleRate}Hz`);
       }
 
       appendChunk(raw) {
@@ -88,29 +91,102 @@
         }
         const data = raw instanceof Float32Array ? raw : new Float32Array(raw);
         if (data.length === 0) return;
-        const now = this.ctx.currentTime;
-        if (!this.started || this.nextStartTime < now) {
-          // Give 0.25s buffer lead time to absorb generation jitter
-          this.nextStartTime = now + 0.25;
-          this.started = true;
+
+        const duration = data.length / this.sampleRate;
+        const nowMs = performance.now();
+        if (this.firstChunkTime === null) {
+          this.firstChunkTime = nowMs;
         }
-        const buffer = this.ctx.createBuffer(1, data.length, this.sampleRate);
-        buffer.copyToChannel(data, 0);
-        const source = this.ctx.createBufferSource();
-        source.buffer = buffer;
-        source.connect(this.ctx.destination);
-        source.start(this.nextStartTime);
-        this.nextStartTime += buffer.duration;
+
+        this.queue.push(data);
+        this.totalDurationQueued += duration;
+
+        // Compute generation Real-Time Factor (RTF)
+        const elapsedSec = (nowMs - this.firstChunkTime) / 1000.0;
+        const rtf = elapsedSec > 0.05 ? (this.totalDurationQueued / elapsedSec) : 1.0;
+
+        // Dynamic buffer threshold: if generation is slower than real-time (RTF < 1.0),
+        // buffer proportional to the speed gap (between 0.6s and 1.8s) so playback never underruns.
+        let targetBufferSec = 0.25;
+        if (rtf < 0.95) {
+          targetBufferSec = Math.min(1.8, Math.max(0.6, (1.0 - rtf) * 2.2));
+        }
+
+        if (!this.startedPlaying) {
+          if (this.totalDurationQueued >= targetBufferSec) {
+            this._startPlayback();
+          }
+        } else {
+          this._drainQueue();
+        }
+      }
+
+      _startPlayback() {
+        if (this.startedPlaying || !this.isPlaying) return;
+        this.startedPlaying = true;
+        this.nextStartTime = this.ctx.currentTime + 0.05;
+        this._drainQueue();
+      }
+
+      _drainQueue() {
+        if (!this.startedPlaying || !this.isPlaying) return;
+        const now = this.ctx.currentTime;
+        if (this.nextStartTime < now) {
+          this.nextStartTime = now + 0.02;
+        }
+        while (this.queue.length > 0) {
+          const chunk = this.queue.shift();
+          const buffer = this.ctx.createBuffer(1, chunk.length, this.sampleRate);
+          buffer.copyToChannel(chunk, 0);
+          const source = this.ctx.createBufferSource();
+          source.buffer = buffer;
+          source.connect(this.ctx.destination);
+          source.start(this.nextStartTime);
+          this.nextStartTime += buffer.duration;
+        }
+      }
+
+      finish() {
+        if (!this.startedPlaying) {
+          this._startPlayback();
+        } else {
+          this._drainQueue();
+        }
       }
 
       stop() {
         console.info('[cera:html] streamer stop called');
         this.isPlaying = false;
+        this.queue = [];
         if (this.ctx && this.ctx.state !== 'closed') {
           this.ctx.close().catch(() => {});
         }
       }
     }
+
+    window.ceraStartAudioStream = function(sampleRate) {
+      window.ceraStopAudioStream();
+      activeStreamer = new CeraAudioStreamer(sampleRate || 24000);
+    };
+
+    window.ceraAppendAudioStreamChunk = function(chunk) {
+      if (activeStreamer) {
+        activeStreamer.appendChunk(chunk);
+      }
+    };
+
+    window.ceraFinishAudioStream = function() {
+      if (activeStreamer) {
+        activeStreamer.finish();
+      }
+    };
+
+    window.ceraStopAudioStream = function() {
+      if (activeStreamer) {
+        activeStreamer.stop();
+        activeStreamer = null;
+      }
+    };
 
     window.ceraProbeBundleFiles = async function(bundleName, quant) {
       try {
@@ -215,11 +291,20 @@
       }
     };
 
-    window.ceraStopAudioStream = function() {
-      console.info('[cera:html] ceraStopAudioStream called');
-      if (activeStreamer) {
-        activeStreamer.stop();
-        activeStreamer = null;
+    window.ceraDownloadFile = function(bytes, filename, mimeType) {
+      try {
+        const data = bytes instanceof Uint8List || bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        const blob = new Blob([data], { type: mimeType || 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename || 'cera_download';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+      } catch (err) {
+        console.error('[cera:html] ceraDownloadFile failed:', err);
       }
     };
 
@@ -228,7 +313,9 @@
     globalThis.ceraStopAudio = window.ceraStopAudio;
     globalThis.ceraStartAudioStream = window.ceraStartAudioStream;
     globalThis.ceraAppendAudioStreamChunk = window.ceraAppendAudioStreamChunk;
+    globalThis.ceraFinishAudioStream = window.ceraFinishAudioStream;
     globalThis.ceraStopAudioStream = window.ceraStopAudioStream;
+    globalThis.ceraDownloadFile = window.ceraDownloadFile;
   </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>

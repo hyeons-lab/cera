@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../chat_controller.dart';
 import '../chat_intent.dart';
 import '../chat_state.dart';
@@ -299,37 +300,41 @@ class _TtsStudioViewState extends State<TtsStudioView> {
             children: [
               _VoiceChip(
                 label: '👩 US Female (Default)',
-                selected: state.settings.ttsVoice == 'Use the US female voice.',
+                selected:
+                    state.settings.ttsStudioVoice == 'Use the US female voice.',
                 onSelected: () => widget.controller.dispatch(
                   const UpdateSettingsIntent(
-                    ttsVoice: 'Use the US female voice.',
+                    ttsStudioVoice: 'Use the US female voice.',
                   ),
                 ),
               ),
               _VoiceChip(
                 label: '👨 US Male',
-                selected: state.settings.ttsVoice == 'Use the US male voice.',
+                selected:
+                    state.settings.ttsStudioVoice == 'Use the US male voice.',
                 onSelected: () => widget.controller.dispatch(
                   const UpdateSettingsIntent(
-                    ttsVoice: 'Use the US male voice.',
+                    ttsStudioVoice: 'Use the US male voice.',
                   ),
                 ),
               ),
               _VoiceChip(
                 label: '👩 UK Female',
-                selected: state.settings.ttsVoice == 'Use the UK female voice.',
+                selected:
+                    state.settings.ttsStudioVoice == 'Use the UK female voice.',
                 onSelected: () => widget.controller.dispatch(
                   const UpdateSettingsIntent(
-                    ttsVoice: 'Use the UK female voice.',
+                    ttsStudioVoice: 'Use the UK female voice.',
                   ),
                 ),
               ),
               _VoiceChip(
                 label: '👨 UK Male',
-                selected: state.settings.ttsVoice == 'Use the UK male voice.',
+                selected:
+                    state.settings.ttsStudioVoice == 'Use the UK male voice.',
                 onSelected: () => widget.controller.dispatch(
                   const UpdateSettingsIntent(
-                    ttsVoice: 'Use the UK male voice.',
+                    ttsStudioVoice: 'Use the UK male voice.',
                   ),
                 ),
               ),
@@ -490,21 +495,42 @@ class _TtsStudioViewState extends State<TtsStudioView> {
                         const SizedBox(height: 8),
                         Wrap(
                           spacing: 12,
+                          runSpacing: 4,
                           children: [
-                            Text(
-                              'Tokens: ${turn.stats!.tokens}',
-                              style: TextStyle(
-                                fontSize: 10.5,
-                                color: theme.colorScheme.onSurfaceVariant,
+                            if (turn.stats!.tokens > 0)
+                              Text(
+                                'Tokens: ${turn.stats!.tokens}',
+                                style: TextStyle(
+                                  fontSize: 10.5,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
                               ),
-                            ),
-                            Text(
-                              'Speed: ${turn.stats!.tps.toStringAsFixed(1)} tok/s',
-                              style: TextStyle(
-                                fontSize: 10.5,
-                                color: theme.colorScheme.onSurfaceVariant,
+                            if (turn.stats!.tps > 0)
+                              Text(
+                                'Speed: ${turn.stats!.tps.toStringAsFixed(1)} tok/s',
+                                style: TextStyle(
+                                  fontSize: 10.5,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
                               ),
-                            ),
+                            if (turn.stats!.audioDurationSeconds != null)
+                              Text(
+                                'Audio: ${turn.stats!.audioDurationSeconds!.toStringAsFixed(1)}s',
+                                style: TextStyle(
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.w600,
+                                  color: theme.colorScheme.primary,
+                                ),
+                              ),
+                            if (turn.stats!.audioRtf != null)
+                              Text(
+                                'RTF: ${turn.stats!.audioRtf!.toStringAsFixed(2)}x',
+                                style: TextStyle(
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.w600,
+                                  color: theme.colorScheme.primary,
+                                ),
+                              ),
                             Text(
                               'Latency: ${turn.stats!.totalMs}ms',
                               style: TextStyle(
@@ -512,6 +538,33 @@ class _TtsStudioViewState extends State<TtsStudioView> {
                                 color: theme.colorScheme.onSurfaceVariant,
                               ),
                             ),
+                            if (turn.text.isNotEmpty)
+                              IconButton(
+                                icon: Icon(
+                                  Icons.copy_rounded,
+                                  size: 13,
+                                  color: theme.colorScheme.onSurfaceVariant
+                                      .withValues(alpha: 0.7),
+                                ),
+                                padding: EdgeInsets.zero,
+                                constraints: const BoxConstraints(
+                                  minWidth: 18,
+                                  minHeight: 18,
+                                ),
+                                tooltip: 'Copy text',
+                                onPressed: () {
+                                  Clipboard.setData(
+                                    ClipboardData(text: turn.text),
+                                  );
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                      content: Text('Copied to clipboard'),
+                                      duration: Duration(seconds: 1),
+                                      behavior: SnackBarBehavior.floating,
+                                    ),
+                                  );
+                                },
+                              ),
                           ],
                         ),
                       ],

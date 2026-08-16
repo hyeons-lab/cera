@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../chat_state.dart';
 import '../services/audio_player_service.dart';
 import 'audio_waveform.dart';
@@ -221,37 +222,120 @@ class _TurnBubble extends StatelessWidget {
                           ),
                         ),
                       if (turn.stats != null)
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
+                        Wrap(
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          spacing: 4,
                           children: [
-                            Text(
-                              '${turn.stats!.tokens} tokens · ${turn.stats!.tps.toStringAsFixed(1)} tok/s',
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w600,
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                            if (turn.stats!.ttftMs != null) ...[
+                            if (turn.stats!.tokens > 0)
                               Text(
-                                ' · TTFT ',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: theme.colorScheme.onSurfaceVariant
-                                      .withValues(alpha: 0.7),
-                                ),
-                              ),
-                              Text(
-                                '${turn.stats!.ttftMs}ms',
+                                '${turn.stats!.tokens} tokens · ${turn.stats!.tps.toStringAsFixed(1)} tok/s',
                                 style: TextStyle(
                                   fontSize: 11,
                                   fontWeight: FontWeight.w600,
                                   color: theme.colorScheme.onSurfaceVariant,
                                 ),
                               ),
+                            if (turn.stats!.audioRtf != null &&
+                                turn.stats!.audioDurationSeconds != null) ...[
+                              if (turn.stats!.tokens > 0)
+                                Text(
+                                  '·',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    color: theme.colorScheme.onSurfaceVariant
+                                        .withValues(alpha: 0.5),
+                                  ),
+                                ),
+                              Text(
+                                '${turn.stats!.audioDurationSeconds!.toStringAsFixed(1)}s audio · ${turn.stats!.audioRtf!.toStringAsFixed(2)}x RTF',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  color: theme.colorScheme.primary,
+                                ),
+                              ),
                             ],
+                            if (turn.stats!.ttftMs != null) ...[
+                              Text(
+                                '· TTFT ${turn.stats!.ttftMs}ms',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: theme.colorScheme.onSurfaceVariant
+                                      .withValues(alpha: 0.8),
+                                ),
+                              ),
+                            ],
+                            if (turn.stats!.tokens == 0 &&
+                                turn.stats!.audioDurationSeconds == null)
+                              Text(
+                                '${turn.stats!.totalMs}ms',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                              ),
                           ],
                         ),
+                      if (turn.text.isNotEmpty)
+                        IconButton(
+                          icon: Icon(
+                            Icons.copy_rounded,
+                            size: 13,
+                            color: theme.colorScheme.onSurfaceVariant
+                                .withValues(alpha: 0.7),
+                          ),
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(
+                            minWidth: 20,
+                            minHeight: 20,
+                          ),
+                          tooltip: 'Copy text',
+                          onPressed: () {
+                            Clipboard.setData(ClipboardData(text: turn.text));
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('Copied to clipboard'),
+                                duration: Duration(seconds: 1),
+                                behavior: SnackBarBehavior.floating,
+                              ),
+                            );
+                          },
+                        ),
+                    ],
+                  ),
+                ],
+                if (isUser && turn.text.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      IconButton(
+                        icon: Icon(
+                          Icons.copy_rounded,
+                          size: 13,
+                          color: theme.colorScheme.onSurfaceVariant.withValues(
+                            alpha: 0.6,
+                          ),
+                        ),
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(
+                          minWidth: 20,
+                          minHeight: 20,
+                        ),
+                        tooltip: 'Copy text',
+                        onPressed: () {
+                          Clipboard.setData(ClipboardData(text: turn.text));
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text('Copied to clipboard'),
+                              duration: Duration(seconds: 1),
+                              behavior: SnackBarBehavior.floating,
+                            ),
+                          );
+                        },
+                      ),
                     ],
                   ),
                 ],

@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../services/audio_player_service.dart';
+import '../services/file_download_service.dart';
 
 /// Animated live waveform indicator displayed during audio recording.
 class RecordingWaveformIndicator extends StatefulWidget {
@@ -279,6 +280,39 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
               color: theme.colorScheme.primary,
             ),
           ),
+          if (widget.samples != null && widget.samples!.isNotEmpty) ...[
+            const SizedBox(width: 4),
+            IconButton(
+              icon: Icon(
+                Icons.download_rounded,
+                size: 16,
+                color: theme.colorScheme.primary,
+              ),
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+              tooltip: 'Download WAV audio',
+              onPressed: () async {
+                final sr = widget.durationSeconds > 0
+                    ? (widget.samples!.length / widget.durationSeconds).round()
+                    : 24000;
+                await downloadAudioWav(
+                  widget.samples!,
+                  filename:
+                      'cera_audio_${DateTime.now().millisecondsSinceEpoch}.wav',
+                  sampleRate: sr,
+                );
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('WAV audio downloaded'),
+                      duration: Duration(seconds: 1),
+                      behavior: SnackBarBehavior.floating,
+                    ),
+                  );
+                }
+              },
+            ),
+          ],
         ],
       ),
     );

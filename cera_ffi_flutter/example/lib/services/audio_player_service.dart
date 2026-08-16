@@ -51,6 +51,16 @@ class AudioPlayerService {
     }
   }
 
+  /// Flushes remaining buffered chunks when stream generation completes.
+  void finishStream() {
+    debugPrint(
+      '[cera:audio_player_service] finishStream called (kIsWeb=$kIsWeb)',
+    );
+    if (kIsWeb) {
+      web_player.finishAudioStream();
+    }
+  }
+
   /// Stops streaming and ends audio playback.
   void stop() {
     debugPrint('[cera:audio_player_service] stop called (kIsWeb=$kIsWeb)');

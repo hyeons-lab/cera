@@ -10,12 +10,21 @@ class TurnStats {
     required this.totalMs,
     required this.ttftMs,
     required this.tps,
+    this.audioDurationSeconds,
+    this.audioRtf,
   });
 
   final int tokens;
   final int totalMs;
   final int? ttftMs;
   final double tps;
+
+  /// Total seconds of audio synthesized by the neural vocoder.
+  final double? audioDurationSeconds;
+
+  /// Real-Time Factor (RTF = audioDuration / generationWallTime).
+  /// > 1.0 means faster than real-time speech generation.
+  final double? audioRtf;
 }
 
 /// A single message turn in the conversation transcript.
@@ -119,7 +128,8 @@ class ChatSettings {
     this.turboQuant = false,
     this.maxImageLongSize = 256,
     this.audioChatMode = AudioChatMode.interleaved,
-    this.ttsVoice = 'Use the US female voice.',
+    this.chatVoice = 'Use the US female voice.',
+    this.ttsStudioVoice = 'Use the US female voice.',
   });
 
   /// Which compute backend to run on.
@@ -136,8 +146,14 @@ class ChatSettings {
   /// Mode for audio generation when an audio-capable model is loaded.
   final AudioChatMode audioChatMode;
 
-  /// Voice persona description for TTS synthesis.
-  final String ttsVoice;
+  /// Voice persona description for Voice Chat mode.
+  final String chatVoice;
+
+  /// Voice persona description for dedicated TTS Studio.
+  final String ttsStudioVoice;
+
+  /// Backwards compatibility getter for ttsVoice.
+  String get ttsVoice => chatVoice;
 
   /// Converts settings to engine open options.
   CeraOptions get ceraOptions => CeraOptions(
@@ -156,6 +172,8 @@ class ChatSettings {
     bool? turboQuant,
     int? Function()? maxImageLongSize,
     AudioChatMode? audioChatMode,
+    String? chatVoice,
+    String? ttsStudioVoice,
     String? ttsVoice,
   }) {
     return ChatSettings(
@@ -165,7 +183,8 @@ class ChatSettings {
           ? maxImageLongSize()
           : this.maxImageLongSize,
       audioChatMode: audioChatMode ?? this.audioChatMode,
-      ttsVoice: ttsVoice ?? this.ttsVoice,
+      chatVoice: chatVoice ?? ttsVoice ?? this.chatVoice,
+      ttsStudioVoice: ttsStudioVoice ?? this.ttsStudioVoice,
     );
   }
 }

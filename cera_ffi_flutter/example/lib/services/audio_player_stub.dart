@@ -9,4 +9,6 @@ void startAudioStream(int sampleRate) {}
 
 void appendAudioStreamChunk(Float32List chunk) {}
 
+void finishAudioStream() {}
+
 void stopAudioStream() {}

@@ -476,6 +476,50 @@ class _ChatPageState extends State<ChatPage> {
                           },
                         ),
                       ),
+                      if (state.capabilities?.audioOut ?? true) ...[
+                        const SizedBox(height: 8),
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Voice Persona'),
+                          subtitle: Text(
+                            'Persona for voice chat responses (TTS Studio maintains its own dedicated voice setting).',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          trailing: DropdownButton<String>(
+                            value: currentSettings.chatVoice,
+                            dropdownColor: theme.colorScheme.surface,
+                            underline: const SizedBox.shrink(),
+                            items: const [
+                              DropdownMenuItem(
+                                value: 'Use the US female voice.',
+                                child: Text('👩 US Female (Default)'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'Use the US male voice.',
+                                child: Text('👨 US Male'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'Use the UK female voice.',
+                                child: Text('👩 UK Female'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'Use the UK male voice.',
+                                child: Text('👨 UK Male'),
+                              ),
+                            ],
+                            onChanged: (val) {
+                              if (val == null) return;
+                              setModalState(() {});
+                              _controller.dispatch(
+                                UpdateSettingsIntent(chatVoice: val),
+                              );
+                            },
+                          ),
+                        ),
+                      ],
                       if (state.hasModel) ...[
                         Divider(color: theme.dividerColor, height: 24),
                         Text(
