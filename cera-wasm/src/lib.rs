@@ -2808,7 +2808,10 @@ mod webgpu {
             let cfg = cera::sampler::SamplerConfig {
                 temperature: temperature.or(def_temp).unwrap_or(defaults.temperature),
                 top_p: top_p.or(def_top_p).unwrap_or(defaults.top_p),
-                top_k: top_k.or(def_top_k).map(|k| k as usize).unwrap_or(defaults.top_k),
+                top_k: top_k
+                    .or(def_top_k)
+                    .map(|k| k as usize)
+                    .unwrap_or(defaults.top_k),
                 min_p: def_min_p.unwrap_or(defaults.min_p),
                 repetition_penalty: def_rep_pen.unwrap_or(defaults.repetition_penalty),
                 seed,
@@ -2841,7 +2844,12 @@ mod webgpu {
                         .as_deref()
                         .map(|g| g as &dyn cera::model::audio_decoder::AudioGpu);
                     Some(cera::audio_engine::AudioOutputDecoder::new(
-                        dec, detok, gpu_ref, audio_temp, audio_top_k, false,
+                        dec,
+                        detok,
+                        gpu_ref,
+                        audio_temp,
+                        audio_top_k,
+                        false,
                     ))
                 } else {
                     None
