@@ -12,7 +12,11 @@ Future<void> downloadFile(
   required String filename,
   String mimeType = 'application/octet-stream',
 }) async {
-  await platform.downloadFileBytes(bytes, filename: filename, mimeType: mimeType);
+  await platform.downloadFileBytes(
+    bytes,
+    filename: filename,
+    mimeType: mimeType,
+  );
 }
 
 /// Encodes Float32 audio samples into a 16-bit WAV file and triggers download.
