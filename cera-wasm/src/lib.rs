@@ -2842,6 +2842,7 @@ mod webgpu {
                         .gpu_audio_decoder
                         .as_deref()
                         .map(|g| g as &dyn cera::model::audio_decoder::AudioGpu);
+                    let use_gpu_df = gpu_ref.map(|g| g.supports_depthformer()).unwrap_or(false);
                     Some(
                         cera::audio_engine::AudioOutputDecoder::new(
                             dec,
@@ -2849,7 +2850,7 @@ mod webgpu {
                             gpu_ref,
                             audio_temp,
                             audio_top_k,
-                            false,
+                            use_gpu_df,
                         )
                         .with_streaming(false),
                     )
