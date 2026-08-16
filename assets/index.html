@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cera — Official Vector Brand Kit</title>
+  <style>
+    :root {
+      --bg: #090c10;
+      --card-bg: #12161f;
+      --border: #21262d;
+      --text: #f0f6fc;
+      --text-muted: #8b949e;
+      --cera-gold: #FBBF24;
+      --cera-tangerine: #FB923C;
+      --cera-terracotta: #EA580C;
+      --cera-rust: #9A3412;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, Helvetica, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 48px 24px;
+      line-height: 1.5;
+    }
+    .header {
+      max-width: 1100px;
+      margin: 0 auto 40px;
+      text-align: center;
+    }
+    .badge {
+      display: inline-block;
+      padding: 5px 14px;
+      background: rgba(251, 191, 36, 0.12);
+      color: var(--cera-gold);
+      border: 1px solid rgba(251, 191, 36, 0.28);
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 12px;
+    }
+    h1 {
+      font-size: 38px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 8px;
+    }
+    p.sub {
+      color: var(--text-muted);
+      font-size: 16px;
+      max-width: 700px;
+      margin: 0 auto;
+    }
+    .grid {
+      max-width: 1100px;
+      margin: 0 auto 40px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 28px;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .card-title {
+      font-size: 18px;
+      font-weight: 700;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .tag {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      background: #1e2430;
+      color: #94a3b8;
+      font-weight: 600;
+      font-family: ui-monospace, monospace;
+    }
+    .stage {
+      height: 240px;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+    .stage.dark {
+      background: #0d1117;
+    }
+    .stage.light {
+      background: #ffffff;
+      border-color: #e2e8f0;
+    }
+    .stage img, .stage object {
+      width: 160px;
+      height: 160px;
+    }
+    .stage.logo-stage img, .stage.logo-stage object {
+      width: 300px;
+      height: 90px;
+    }
+    .palette-grid {
+      max-width: 1100px;
+      margin: 0 auto 40px;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 24px;
+    }
+    .palette-grid h2 {
+      font-size: 18px;
+      margin-bottom: 16px;
+    }
+    .swatches {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+    }
+    .swatch {
+      background: #090c10;
+      border: 1px solid #21262d;
+      border-radius: 12px;
+      padding: 12px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .swatch-color {
+      width: 44px;
+      height: 44px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.1);
+    }
+    .swatch-info strong {
+      display: block;
+      font-size: 14px;
+      color: #fff;
+    }
+    .swatch-info code {
+      font-size: 12px;
+      color: #8b949e;
+      font-family: ui-monospace, monospace;
+    }
+    .scale-row {
+      max-width: 1100px;
+      margin: 0 auto;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 24px;
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-around;
+      flex-wrap: wrap;
+      gap: 20px;
+    }
+    .scale-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="badge">Official Brand Assets</div>
+    <h1>Cera — Master Vector Asset Kit</h1>
+    <p class="sub">100% Pure Vector SVGs extracted with mathematical fidelity from the master base artwork. Zero gradients, modular paths, and multi-resolution PNG packages in <code>assets/</code>.</p>
+  </div>
+
+  <div class="grid">
+
+    <!-- Standalone Mark (Dark) -->
+    <div class="card">
+      <div class="card-title">
+        <span>Standalone Mark (SVG)</span>
+        <span class="tag">assets/cera-icon.svg</span>
+      </div>
+      <div class="stage dark">
+        <img src="cera-icon.svg" alt="Cera Icon Mark" />
+      </div>
+    </div>
+
+    <!-- Wordmark Logo (Dark) -->
+    <div class="card">
+      <div class="card-title">
+        <span>Logo + Wordmark (Dark)</span>
+        <span class="tag">assets/cera-logo-dark.svg</span>
+      </div>
+      <div class="stage dark logo-stage">
+        <img src="cera-logo-dark.svg" alt="Cera Logo Dark" />
+      </div>
+    </div>
+
+    <!-- Wordmark Logo (Light) -->
+    <div class="card">
+      <div class="card-title">
+        <span>Logo + Wordmark (Light)</span>
+        <span class="tag">assets/cera-logo-light.svg</span>
+      </div>
+      <div class="stage light logo-stage">
+        <img src="cera-logo-light.svg" alt="Cera Logo Light" />
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Color Palette -->
+  <div class="palette-grid">
+    <h2>Canonical Color Tokens</h2>
+    <div class="swatches">
+      <div class="swatch">
+        <div class="swatch-color" style="background: var(--cera-gold);"></div>
+        <div class="swatch-info">
+          <strong>Beeswax Gold</strong>
+          <code>#FBBF24</code>
+        </div>
+      </div>
+      <div class="swatch">
+        <div class="swatch-color" style="background: var(--cera-tangerine);"></div>
+        <div class="swatch-info">
+          <strong>Tangerine Amber</strong>
+          <code>#FB923C</code>
+        </div>
+      </div>
+      <div class="swatch">
+        <div class="swatch-color" style="background: var(--cera-terracotta);"></div>
+        <div class="swatch-info">
+          <strong>Vivid Terracotta</strong>
+          <code>#EA580C</code>
+        </div>
+      </div>
+      <div class="swatch">
+        <div class="swatch-color" style="background: var(--cera-rust);"></div>
+        <div class="swatch-info">
+          <strong>Deep Rust</strong>
+          <code>#9A3412</code>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Scale Strip -->
+  <div class="scale-row">
+    <div class="scale-item">
+      <img src="cera-icon-16x16.png" width="16" height="16" />
+      16px
+    </div>
+    <div class="scale-item">
+      <img src="cera-icon-32x32.png" width="32" height="32" />
+      32px
+    </div>
+    <div class="scale-item">
+      <img src="cera-icon-64x64.png" width="64" height="64" />
+      64px
+    </div>
+    <div class="scale-item">
+      <img src="cera-icon-128x128.png" width="96" height="96" />
+      128px
+    </div>
+    <div class="scale-item">
+      <img src="cera-icon-256x256.png" width="140" height="140" />
+      256px
+    </div>
+  </div>
+
+</body>
+</html>

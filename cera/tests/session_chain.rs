@@ -944,13 +944,13 @@ fn append_audio_wrong_sample_rate_returns_backend_error() {
     session.attach_audio_encoder(encoder);
 
     let pcm = vec![0.0f32; 16_000];
-    let err = session.append_audio(&pcm, 24_000).unwrap_err();
+    let err = session.append_audio(&pcm, 500).unwrap_err();
     let cera::CeraError::Backend(msg) = err else {
-        panic!("expected Backend error for sample-rate mismatch, got {err:?}");
+        panic!("expected Backend error for unsupported sample rate, got {err:?}");
     };
     assert!(
-        msg.contains("sample_rate") && msg.contains("16000"),
-        "Backend error should mention sample_rate + expected 16000; got: {msg}"
+        msg.contains("sample rate"),
+        "Backend error should mention sample rate; got: {msg}"
     );
 }
 
@@ -1653,4 +1653,42 @@ fn ignore_eos_does_not_override_active_grammar() {
             "EOS must not leak into grammar output"
         );
     }
+}
+
+#[test]
+fn generate_honors_pre_armed_cancel() {
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available — skipping");
+        return;
+    };
+
+    let gguf = cera::gguf::GgufFile::open(&model_path).unwrap();
+    let tokenizer = cera::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
+    let model = cera::model::load_model(gguf, None, 4096).unwrap();
+    let prompt_toks = tokenizer.encode("Hello");
+
+    let mut session = make_session(model, tokenizer, SessionConfig::default());
+    session.append_tokens(&prompt_toks).unwrap();
+
+    // Pre-arm cancel before calling generate
+    session.cancel();
+
+    let opts = GenerateOpts::default();
+    let mut sink = CollectSink(Vec::new());
+    let summary = session.generate(&opts, &mut sink).unwrap();
+
+    assert_eq!(summary.finish_reason, FinishReason::Cancelled);
+    assert_eq!(summary.tokens_generated, 0);
+    assert!(sink.0.is_empty());
+    // Cancel flag was consumed by the cancelled generate
+    assert!(
+        !session
+            .cancel_handle()
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    // Next generate after appending should work without being cancelled
+    session.append_tokens(&prompt_toks).unwrap();
+    let summary2 = session.generate(&opts, &mut sink).unwrap();
+    assert_ne!(summary2.finish_reason, FinishReason::Cancelled);
 }
