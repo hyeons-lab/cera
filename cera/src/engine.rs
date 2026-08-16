@@ -472,6 +472,14 @@ impl CeraEngine {
                     (None, None)
                 }
             }
+        } else if let Some(ref g) = mmproj {
+            let dec = crate::model::audio_decoder::AudioDecoderWeights::from_gguf(g)
+                .ok()
+                .map(Arc::new);
+            let detok = crate::model::audio_decoder::DetokenizerWeights::from_gguf(g)
+                .ok()
+                .map(Arc::new);
+            (dec, detok)
         } else {
             (None, None)
         };
@@ -692,7 +700,7 @@ impl CeraEngine {
             .and_then(|w| crate::model::audio_encoder_gpu::build_gpu_audio_encoder(w, cfg.backend));
         let audio_decoder = aux.audio_decoder.filter(|dec| {
             let model_dim = model.config().hidden_size;
-            let vocoder_dim = dec.depthformer_config.n_embd;
+            let vocoder_dim = dec.decoder_config.n_embd;
             if vocoder_dim != model_dim {
                 tracing::warn!(
                     "audio decoder embedding dimension ({vocoder_dim}) does not match model hidden size ({model_dim}); ignoring mismatched vocoder"

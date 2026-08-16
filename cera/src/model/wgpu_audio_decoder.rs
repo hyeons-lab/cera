@@ -32,13 +32,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{Context, Result};
 use wgpu::Buffer;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::backend::wgpu::DevicePollExt;
 use crate::backend::wgpu::{GpuContext, shaders};
 use crate::gguf::GgufFile;
 use crate::model::audio_decoder::{
     DecoderConfig, DepthformerConfig, DetokenizerConfig, DetokenizerWeights,
 };
 use crate::model::gpu_lfm2::{
-    MUL_MAT_TILE_M, MUL_MAT_TILE_N, MUL_MAT_TILE_WG_M, MUL_MAT_TILE_WG_N,
+    MUL_MAT_TILE_K, MUL_MAT_TILE_M, MUL_MAT_TILE_N, MUL_MAT_TILE_WG_M, MUL_MAT_TILE_WG_N,
 };
 
 /// Tokens per detokenizer frame (fixed upsample factor, mirrors the CPU and
@@ -53,19 +55,17 @@ struct GpuWeight {
     k: u32,
 }
 
-/// Per-layer depthformer weights on GPU.
+/// Per-layer depthformer weights and pre-baked bind groups on GPU.
 struct DfLayerGpu {
-    operator_norm: Buffer,
-    wq: GpuWeight,
-    wk: GpuWeight,
-    wv: GpuWeight,
-    q_norm: Buffer,
-    k_norm: Buffer,
-    wo: GpuWeight,
-    ffn_norm: Buffer,
-    w1: GpuWeight,
-    w2: GpuWeight,
-    w3: GpuWeight,
+    operator_norm_bg: wgpu::BindGroup,
+    gemm_qkv_bg: wgpu::BindGroup,
+    rope_bgs: Vec<wgpu::BindGroup>, // 8 entries for pos 0..8
+    kv_copy_bgs: Vec<wgpu::BindGroup>, // 8 entries for pos 0..8
+    attn_bgs: Vec<wgpu::BindGroup>, // 8 entries for pos 0..8
+    gemm_wo_accum_bg: wgpu::BindGroup,
+    ffn_norm_bg: wgpu::BindGroup,
+    ffn_gate_up_bg: wgpu::BindGroup,
+    gemm_w2_accum_bg: wgpu::BindGroup,
 }
 
 /// Per-layer detokenizer weights on the GPU (conv XOR attention, plus FFN).
@@ -91,6 +91,8 @@ struct DetokLayerGpu {
 #[derive(Clone)]
 pub(crate) struct Pipelines {
     gemm_f32: wgpu::ComputePipeline,
+    gemv_f32: wgpu::ComputePipeline,
+    gemv_f32_accum: wgpu::ComputePipeline,
     rmsnorm_batch: wgpu::ComputePipeline,
     add_rmsnorm_batch: wgpu::ComputePipeline,
     qk_norm_rope_batch: wgpu::ComputePipeline,
@@ -101,6 +103,12 @@ pub(crate) struct Pipelines {
     bias_add: wgpu::ComputePipeline,
     exp_polar: wgpu::ComputePipeline,
     overlap_add: wgpu::ComputePipeline,
+    argmax_f32: wgpu::ComputePipeline,
+    df_embed_add: wgpu::ComputePipeline,
+    df_kv_copy: wgpu::ComputePipeline,
+    df_sample_logits: wgpu::ComputePipeline,
+    df_ffn_gate_up: wgpu::ComputePipeline,
+    df_qkv_gemv: wgpu::ComputePipeline,
 }
 
 pub struct WgpuAudioDecoder {
@@ -229,14 +237,17 @@ impl WgpuAudioDecoder {
                 ("WORKGROUP_SIZE_N", &format!("{MUL_MAT_TILE_WG_N}u")),
                 ("TILE_M", &format!("{MUL_MAT_TILE_M}u")),
                 ("TILE_N", &format!("{MUL_MAT_TILE_N}u")),
-                (
-                    "TILE_K",
-                    &format!("{tile_k}u", tile_k = crate::model::gpu_lfm2::MUL_MAT_TILE_K),
-                ),
+                ("TILE_K", &format!("{MUL_MAT_TILE_K}u")),
             ],
         );
         let pipes = Pipelines {
             gemm_f32,
+            gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "audio_df_gemv_f32"),
+            gemv_f32_accum: ctx.create_pipeline(
+                shaders::GEMV_F32,
+                "gemv_f32_accum",
+                "audio_df_gemv_f32_accum",
+            ),
             rmsnorm_batch: ctx.create_pipeline(
                 shaders::RMSNORM_BATCH,
                 "rmsnorm_batch",
@@ -282,6 +293,36 @@ impl WgpuAudioDecoder {
                 shaders::OVERLAP_ADD,
                 "overlap_add",
                 "audio_istft_overlap_add",
+            ),
+            argmax_f32: ctx.create_pipeline(
+                shaders::ARGMAX_F32,
+                "argmax_f32",
+                "audio_df_argmax_f32",
+            ),
+            df_embed_add: ctx.create_pipeline(
+                include_str!("../backend/shaders/df_embed_add.wgsl"),
+                "df_embed_add",
+                "audio_df_embed_add",
+            ),
+            df_kv_copy: ctx.create_pipeline(
+                include_str!("../backend/shaders/df_kv_cache_copy.wgsl"),
+                "df_kv_cache_copy",
+                "audio_df_kv_copy",
+            ),
+            df_sample_logits: ctx.create_pipeline(
+                include_str!("../backend/shaders/df_sample_logits.wgsl"),
+                "df_sample_logits",
+                "audio_df_sample_logits",
+            ),
+            df_ffn_gate_up: ctx.create_pipeline(
+                include_str!("../backend/shaders/df_ffn_gate_up.wgsl"),
+                "df_ffn_gate_up",
+                "audio_df_ffn_gate_up",
+            ),
+            df_qkv_gemv: ctx.create_pipeline(
+                include_str!("../backend/shaders/df_qkv_gemv.wgsl"),
+                "df_qkv_gemv",
+                "audio_df_qkv_gemv",
             ),
         };
 
@@ -409,7 +450,7 @@ impl WgpuAudioDecoder {
                 Some(df)
             }
             Err(e) => {
-                tracing::info!(
+                tracing::warn!(
                     "[cera:wgpu_audio_decoder] WebGPU depthformer unavailable ({e:#}), using CPU depthformer"
                 );
                 None
@@ -901,7 +942,8 @@ impl WgpuAudioDecoder {
             (n_frames * spec_per_frame * std::mem::size_of::<f32>()) as u64,
         );
         let bytes = pending.recv().await?;
-        let result: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+        let mut result = vec![0f32; n_frames * spec_per_frame];
+        bytemuck::cast_slice_mut(&mut result).copy_from_slice(&bytes);
         Ok(result)
     }
 
@@ -1057,12 +1099,18 @@ impl WgpuAudioDecoder {
             (total_samples * std::mem::size_of::<f32>()) as u64,
         );
         let bytes = pending.recv().await?;
-        let mut pcm: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+        let mut pcm = vec![0f32; total_samples];
+        bytemuck::cast_slice_mut(&mut pcm).copy_from_slice(&bytes);
         let padding = (n_fft - hop_length) / 2;
         if pcm.len() > padding {
             pcm.drain(..padding);
         }
         Ok(pcm)
+    }
+
+    /// Whether this GPU audio decoder has an active GPU depthformer.
+    pub fn supports_depthformer(&self) -> bool {
+        self.depthformer.is_some()
     }
 }
 
@@ -1103,6 +1151,22 @@ impl crate::model::audio_decoder::AudioGpu for WgpuAudioDecoder {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<[i32; 8]>> + Send + 'a>> {
         if let Some(ref df) = self.depthformer {
             Box::pin(df.sample_frame_async(embedding, temperature, top_k))
+        } else {
+            Box::pin(async move {
+                anyhow::bail!("WGPU depthformer not available");
+            })
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn sample_audio_frame_from_gpu_hidden_async<'a>(
+        &'a self,
+        hidden_buf: &'a wgpu::Buffer,
+        temperature: f32,
+        top_k: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<[i32; 8]>> + Send + 'a>> {
+        if let Some(ref df) = self.depthformer {
+            Box::pin(df.sample_frame_from_gpu_hidden_async(hidden_buf, temperature, top_k))
         } else {
             Box::pin(async move {
                 anyhow::bail!("WGPU depthformer not available");
@@ -1151,30 +1215,42 @@ impl crate::model::audio_decoder::AudioGpu for WgpuAudioDecoder {
 // F32 dequantized weights + F32 KV cache. Runs all 8 codebook steps of an audio
 // frame on WebGPU compute shaders, reading back only the 2049 logits per step.
 
+#[allow(dead_code)]
 pub struct WgpuDepthformer {
     ctx: GpuContext,
     df_cfg: DepthformerConfig,
     dec_cfg: DecoderConfig,
     pipes: Arc<Pipelines>,
     layers: Vec<DfLayerGpu>,
-    depth_linear_slices: Vec<GpuWeight>, // 8 x [1024 x 2048]
-    depth_linear_b_slices: Vec<Buffer>,  // 8 x [1024]
-    codebook_norms: Vec<Buffer>,         // 8 x [1024]
-    codebook_to_logits: Vec<GpuWeight>,  // 8 x [2049 x 1024]
-    codebook_emb_f32: Vec<Vec<f32>>,     // 8 x [2049 * 1024]
-    // GPU Buffers:
+    // Pre-baked bind groups:
+    depth_linear_bgs: Vec<wgpu::BindGroup>, // 8 entries
+    bias_add_bgs: Vec<wgpu::BindGroup>,     // 8 entries
+    embed_add_bgs: Vec<wgpu::BindGroup>,    // 7 entries (j=0..6 for prev codebooks 0..6)
+    to_logits_norm_bgs: Vec<wgpu::BindGroup>, // 8 entries
+    to_logits_gemm_bgs: Vec<wgpu::BindGroup>, // 8 entries
+    argmax_bgs: Vec<wgpu::BindGroup>,         // 8 entries
+    sample_bgs: Vec<wgpu::BindGroup>,         // 8 entries
+    sample_params_bufs: Vec<Buffer>,          // 8 entries
+    // Grid dispatch dimensions:
+    depth_linear_wg_m: u32,
+    qkv_wg_m: u32,
+    n_embd_wg_m: u32,
+    ffn_dim_wg_m: u32,
+    n_vocab_wg_m: u32,
+    // Storage buffers:
+    embedding_in_buf: Buffer,
     hidden_buf: Buffer,
     normed_buf: Buffer,
-    proj_buf: Buffer,
-    gate_buf: Buffer,
-    up_buf: Buffer,
+    q_buf: Buffer,
+    k_buf: Buffer,
+    v_buf: Buffer,
     attn_out_buf: Buffer,
-    embedding_in_buf: Buffer,
+    ffn_act_buf: Buffer,
+    sampled_codes_buf: Buffer,
+    staging_readback_buf: Buffer,
     logits_buf: Buffer,
-    rope_freqs_dummy: Buffer,
     kv_k: Vec<Buffer>,
     kv_v: Vec<Buffer>,
-    n_past: AtomicUsize,
 }
 
 impl WgpuDepthformer {
@@ -1262,124 +1338,27 @@ impl WgpuDepthformer {
         let kv_dim = n_kv * hd;
         let ffn_dim = df_cfg.ffn_dim;
 
-        let make_weight = |name: &str| -> Result<GpuWeight> {
-            let t = gguf.get_tensor(name)?;
-            let f32_data = t.to_f32_vec();
-            let shape = t.shape();
-            let (rows, cols) = match shape.len() {
-                1 => (1, shape[0]),
-                2 => (shape[1], shape[0]),
-                _ => anyhow::bail!("unexpected rank for {name}"),
-            };
-            let buf = ctx.upload_f32(&f32_data, name);
-            Ok(GpuWeight {
-                buf,
-                m: rows as u32,
-                k: cols as u32,
-            })
-        };
         let upload_vec = |name: &str| -> Result<Buffer> {
             Ok(ctx.upload_f32(&gguf.get_tensor(name)?.to_f32_vec(), name))
         };
 
-        let mut layers = Vec::with_capacity(df_cfg.n_layer);
-        for i in 0..df_cfg.n_layer {
-            let pfx = format!("depthformer.layers.{i}");
-            let qkv_t = gguf.get_tensor(&format!("{pfx}.operator.qkv_proj.weight"))?;
-            let qkv_f32 = qkv_t.to_f32_vec();
-            let qkv_cols = qkv_t.shape()[0]; // n_embd (1024)
-
-            let q_size = q_dim * qkv_cols;
-            let k_size = kv_dim * qkv_cols;
-            let v_size = kv_dim * qkv_cols;
-
-            let wq_data = &qkv_f32[0..q_size];
-            let wk_data = &qkv_f32[q_size..q_size + k_size];
-            let wv_data = &qkv_f32[q_size + k_size..q_size + k_size + v_size];
-
-            let wq = GpuWeight {
-                buf: ctx.upload_f32(wq_data, &format!("{pfx}.wq")),
-                m: q_dim as u32,
-                k: qkv_cols as u32,
-            };
-            let wk = GpuWeight {
-                buf: ctx.upload_f32(wk_data, &format!("{pfx}.wk")),
-                m: kv_dim as u32,
-                k: qkv_cols as u32,
-            };
-            let wv = GpuWeight {
-                buf: ctx.upload_f32(wv_data, &format!("{pfx}.wv")),
-                m: kv_dim as u32,
-                k: qkv_cols as u32,
-            };
-
-            layers.push(DfLayerGpu {
-                operator_norm: upload_vec(&format!("{pfx}.operator_norm.weight"))?,
-                wq,
-                wk,
-                wv,
-                q_norm: upload_vec(&format!("{pfx}.operator.attention.q_layernorm.weight"))?,
-                k_norm: upload_vec(&format!("{pfx}.operator.attention.k_layernorm.weight"))?,
-                wo: make_weight(&format!("{pfx}.operator.out_proj.weight"))?,
-                ffn_norm: upload_vec(&format!("{pfx}.ffn_norm.weight"))?,
-                w1: make_weight(&format!("{pfx}.feed_forward.w1.weight"))?,
-                w2: make_weight(&format!("{pfx}.feed_forward.w2.weight"))?,
-                w3: make_weight(&format!("{pfx}.feed_forward.w3.weight"))?,
-            });
-        }
-
-        // Slice depth_linear.weight into 8 slices
-        let dl_t = gguf.get_tensor("depth_linear.weight")?;
-        let dl_f32 = dl_t.to_f32_vec();
-        let dl_cols = dl_t.shape()[0]; // 2048 (n_embd_llm)
-        let dl_rows = dl_t.shape()[1]; // 8 * 1024
-        let n_embd_d = dl_rows / dec_cfg.n_codebook;
-        let mut depth_linear_slices = Vec::with_capacity(dec_cfg.n_codebook);
-        for j in 0..dec_cfg.n_codebook {
-            let start = j * n_embd_d * dl_cols;
-            let end = start + n_embd_d * dl_cols;
-            let slice_data = &dl_f32[start..end];
-            let buf = ctx.upload_f32(slice_data, &format!("depth_linear_slice_{j}"));
-            depth_linear_slices.push(GpuWeight {
-                buf,
-                m: n_embd_d as u32,
-                k: dl_cols as u32,
-            });
-        }
-
-        // Slice depth_linear.bias into 8 slices
-        let mut depth_linear_b_slices = Vec::with_capacity(dec_cfg.n_codebook);
-        for j in 0..dec_cfg.n_codebook {
-            let start = j * n_embd_d;
-            let end = start + n_embd_d;
-            let slice_data = &depth_linear_b[start..end];
-            depth_linear_b_slices
-                .push(ctx.upload_f32(slice_data, &format!("depth_linear_b_slice_{j}")));
-        }
-
-        let mut codebook_norms = Vec::with_capacity(dec_cfg.n_codebook);
-        let mut codebook_to_logits = Vec::with_capacity(dec_cfg.n_codebook);
-        let mut codebook_emb_f32 = Vec::with_capacity(dec_cfg.n_codebook);
-        for j in 0..dec_cfg.n_codebook {
-            let pfx = format!("depth_embeddings.{j}");
-            codebook_norms.push(upload_vec(&format!("{pfx}.embedding_norm.weight"))?);
-            codebook_to_logits.push(make_weight(&format!("{pfx}.to_logits.weight"))?);
-            codebook_emb_f32.push(
-                gguf.get_tensor(&format!("{pfx}.embedding.weight"))?
-                    .to_f32_vec(),
-            );
-        }
-
         let alloc = |n: usize, label: &str| ctx.create_storage_rw((n * 4) as u64, label);
-        let max_dim = n_embd.max(q_dim).max(ffn_dim);
         let hidden_buf = alloc(n_embd, "df_hidden");
         let normed_buf = alloc(n_embd, "df_normed");
-        let proj_buf = alloc(max_dim, "df_proj");
-        let gate_buf = alloc(max_dim, "df_gate");
-        let up_buf = alloc(max_dim, "df_up");
+        let q_buf = alloc(q_dim, "df_q");
+        let k_buf = alloc(kv_dim, "df_k");
+        let v_buf = alloc(kv_dim, "df_v");
         let attn_out_buf = alloc(q_dim, "df_attn_out");
+        let ffn_act_buf = alloc(ffn_dim, "df_ffn_act");
         let embedding_in_buf = alloc(dec_cfg.n_embd, "df_embedding_in");
         let logits_buf = alloc(dec_cfg.n_vocab, "df_logits");
+        let sampled_codes_buf = alloc(dec_cfg.n_codebook, "df_sampled_codes");
+        let staging_readback_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("df_staging_readback"),
+            size: (dec_cfg.n_codebook * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let rope_freqs_dummy = ctx.upload_f32(&[1.0f32], "df_rope_dummy");
 
         let mut kv_k = Vec::with_capacity(df_cfg.n_layer);
@@ -1389,142 +1368,278 @@ impl WgpuDepthformer {
             kv_v.push(alloc(df_cfg.max_seq_len * kv_dim, &format!("df_kv_v_{i}")));
         }
 
+        let make_bg = |pipeline: &wgpu::ComputePipeline, bufs: &[&Buffer], label: &str| -> wgpu::BindGroup {
+            let entries: Vec<wgpu::BindGroupEntry> = bufs
+                .iter()
+                .enumerate()
+                .map(|(i, b)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: b.as_entire_binding(),
+                })
+                .collect();
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &entries,
+            })
+        };
+
+        // Shared param buffers
+        let hs = n_embd as u32;
+        let rmsnorm_params_1 = ctx.upload_storage(
+            bytemuck::cast_slice(&[
+                hs,
+                df_cfg.rms_norm_eps.to_bits(),
+                hs,
+                hs,
+                1.0f32.to_bits(),
+            ]),
+            "df_rmsnorm_params_1",
+        );
+        let add_params_n_embd = ctx.upload_storage(
+            bytemuck::cast_slice(&[n_embd as u32, 0u32]),
+            "df_add_params_n_embd",
+        );
+
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let mut rope_params = Vec::with_capacity(df_cfg.max_seq_len);
+        let mut attn_params = Vec::with_capacity(df_cfg.max_seq_len);
+        let mut kv_copy_params = Vec::with_capacity(df_cfg.max_seq_len);
+        for pos in 0..df_cfg.max_seq_len {
+            rope_params.push(ctx.upload_storage(
+                bytemuck::cast_slice(&[
+                    pos as u32,
+                    1,
+                    n_head as u32,
+                    n_kv as u32,
+                    hd as u32,
+                    df_cfg.rms_norm_eps.to_bits(),
+                    df_cfg.rope_freq_base.to_bits(),
+                    1, // rope_type = interleaved / NORM
+                    q_dim as u32,
+                    kv_dim as u32,
+                    0,
+                    1,
+                ]),
+                &format!("df_rope_params_{pos}"),
+            ));
+            attn_params.push(ctx.upload_storage(
+                bytemuck::cast_slice(&[
+                    n_head as u32,
+                    n_kv as u32,
+                    hd as u32,
+                    kv_dim as u32,
+                    (pos + 1) as u32,
+                    scale.to_bits(),
+                    0,
+                    0,
+                ]),
+                &format!("df_attn_params_{pos}"),
+            ));
+            kv_copy_params.push(ctx.upload_storage(
+                bytemuck::cast_slice(&[(pos * kv_dim) as u32, kv_dim as u32]),
+                &format!("df_kv_copy_params_{pos}"),
+            ));
+        }
+
+        // Layer GEMV params: vec4<u32>(m, k, row_base, 0)
+        let qkv_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[q_dim as u32, kv_dim as u32, n_embd as u32, 0u32]),
+            "df_qkv_params",
+        );
+        let wo_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[n_embd as u32, q_dim as u32, 0u32, 0u32]),
+            "df_wo_params",
+        );
+        let w13_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[ffn_dim as u32, n_embd as u32, 0u32, 0u32]),
+            "df_w13_params",
+        );
+        let w2_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[n_embd as u32, ffn_dim as u32, 0u32, 0u32]),
+            "df_w2_params",
+        );
+
+        let mut layers = Vec::with_capacity(df_cfg.n_layer);
+        for i in 0..df_cfg.n_layer {
+            let pfx = format!("depthformer.layers.{i}");
+            let qkv_t = gguf.get_tensor(&format!("{pfx}.operator.qkv_proj.weight"))?;
+            let qkv_f32 = qkv_t.to_f32_vec();
+            let qkv_buf = ctx.upload_f32(&qkv_f32, &format!("{pfx}.qkv"));
+
+            let op_norm = upload_vec(&format!("{pfx}.operator_norm.weight"))?;
+            let q_norm = upload_vec(&format!("{pfx}.operator.attention.q_layernorm.weight"))?;
+            let k_norm = upload_vec(&format!("{pfx}.operator.attention.k_layernorm.weight"))?;
+            let wo_buf = ctx.upload_f32(&gguf.get_tensor(&format!("{pfx}.operator.out_proj.weight"))?.to_f32_vec(), &format!("{pfx}.wo"));
+            let ffn_norm = upload_vec(&format!("{pfx}.ffn_norm.weight"))?;
+
+            let w1_vec = gguf.get_tensor(&format!("{pfx}.feed_forward.w1.weight"))?.to_f32_vec();
+            let w3_vec = gguf.get_tensor(&format!("{pfx}.feed_forward.w3.weight"))?.to_f32_vec();
+            let mut w13_vec = Vec::with_capacity(w1_vec.len() + w3_vec.len());
+            w13_vec.extend_from_slice(&w1_vec);
+            w13_vec.extend_from_slice(&w3_vec);
+            let w13_buf = ctx.upload_f32(&w13_vec, &format!("{pfx}.w13"));
+            let w2_buf = ctx.upload_f32(&gguf.get_tensor(&format!("{pfx}.feed_forward.w2.weight"))?.to_f32_vec(), &format!("{pfx}.w2"));
+
+            let operator_norm_bg = make_bg(&pipes.rmsnorm_batch, &[&hidden_buf, &normed_buf, &op_norm, &rmsnorm_params_1], &format!("df_op_norm_bg_{i}"));
+            let gemm_qkv_bg = make_bg(&pipes.df_qkv_gemv, &[&qkv_buf, &normed_buf, &q_buf, &k_buf, &v_buf, &qkv_params], &format!("df_qkv_bg_{i}"));
+
+            let mut rope_bgs = Vec::with_capacity(df_cfg.max_seq_len);
+            let mut kv_copy_bgs = Vec::with_capacity(df_cfg.max_seq_len);
+            let mut attn_bgs = Vec::with_capacity(df_cfg.max_seq_len);
+            for pos in 0..df_cfg.max_seq_len {
+                rope_bgs.push(make_bg(
+                    &pipes.qk_norm_rope_batch,
+                    &[&q_buf, &k_buf, &q_norm, &k_norm, &rope_params[pos], &rope_freqs_dummy],
+                    &format!("df_rope_bg_{i}_{pos}"),
+                ));
+                kv_copy_bgs.push(make_bg(
+                    &pipes.df_kv_copy,
+                    &[&k_buf, &v_buf, &kv_k[i], &kv_v[i], &kv_copy_params[pos]],
+                    &format!("df_kv_copy_bg_{i}_{pos}"),
+                ));
+                attn_bgs.push(make_bg(
+                    &pipes.flash_attention,
+                    &[&q_buf, &kv_k[i], &kv_v[i], &attn_out_buf, &attn_params[pos]],
+                    &format!("df_attn_bg_{i}_{pos}"),
+                ));
+            }
+
+            let gemm_wo_accum_bg = make_bg(&pipes.gemv_f32_accum, &[&wo_buf, &attn_out_buf, &hidden_buf, &wo_params], &format!("df_wo_accum_bg_{i}"));
+            let ffn_norm_bg = make_bg(&pipes.rmsnorm_batch, &[&hidden_buf, &normed_buf, &ffn_norm, &rmsnorm_params_1], &format!("df_ffn_norm_bg_{i}"));
+            let ffn_gate_up_bg = make_bg(&pipes.df_ffn_gate_up, &[&w13_buf, &normed_buf, &ffn_act_buf, &w13_params], &format!("df_ffn_gate_up_bg_{i}"));
+            let gemm_w2_accum_bg = make_bg(&pipes.gemv_f32_accum, &[&w2_buf, &ffn_act_buf, &hidden_buf, &w2_params], &format!("df_w2_accum_bg_{i}"));
+
+            layers.push(DfLayerGpu {
+                operator_norm_bg,
+                gemm_qkv_bg,
+                rope_bgs,
+                kv_copy_bgs,
+                attn_bgs,
+                gemm_wo_accum_bg,
+                ffn_norm_bg,
+                ffn_gate_up_bg,
+                gemm_w2_accum_bg,
+            });
+        }
+
+        // Slice depth_linear.weight and pre-bake depth_linear GEMM and bias_add
+        let dl_t = gguf.get_tensor("depth_linear.weight")?;
+        let dl_f32 = dl_t.to_f32_vec();
+        let dl_cols = dl_t.shape()[0]; // 2048 (n_embd_llm)
+        let dl_rows = dl_t.shape()[1]; // 8 * 1024
+        let n_embd_d = dl_rows / dec_cfg.n_codebook;
+        let dl_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[n_embd_d as u32, dl_cols as u32, 0u32, 0u32]),
+            "df_dl_params",
+        );
+        let mut depth_linear_bgs = Vec::with_capacity(dec_cfg.n_codebook);
+        let mut bias_add_bgs = Vec::with_capacity(dec_cfg.n_codebook);
+
+        for j in 0..dec_cfg.n_codebook {
+            let start = j * n_embd_d * dl_cols;
+            let end = start + n_embd_d * dl_cols;
+            let slice_data = &dl_f32[start..end];
+            let buf = ctx.upload_f32(slice_data, &format!("depth_linear_slice_{j}"));
+            depth_linear_bgs.push(make_bg(&pipes.gemv_f32, &[&buf, &embedding_in_buf, &hidden_buf, &dl_params], &format!("df_dl_bg_{j}")));
+
+            let b_start = j * n_embd_d;
+            let b_end = b_start + n_embd_d;
+            let b_slice = &depth_linear_b[b_start..b_end];
+            let b_buf = ctx.upload_f32(b_slice, &format!("depth_linear_b_{j}"));
+            bias_add_bgs.push(make_bg(&pipes.add_inplace, &[&hidden_buf, &b_buf, &add_params_n_embd], &format!("df_bias_add_bg_{j}")));
+        }
+
+        let tl_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[dec_cfg.n_vocab as u32, n_embd as u32, 0u32, 0u32]),
+            "df_tl_params",
+        );
+        let mut embed_add_bgs = Vec::with_capacity(dec_cfg.n_codebook.saturating_sub(1));
+        let mut to_logits_norm_bgs = Vec::with_capacity(dec_cfg.n_codebook);
+        let mut to_logits_gemm_bgs = Vec::with_capacity(dec_cfg.n_codebook);
+        let mut argmax_bgs = Vec::with_capacity(dec_cfg.n_codebook);
+
+        for j in 0..dec_cfg.n_codebook {
+            let pfx = format!("depth_embeddings.{j}");
+            let norm_buf = upload_vec(&format!("{pfx}.embedding_norm.weight"))?;
+            to_logits_norm_bgs.push(make_bg(&pipes.rmsnorm_batch, &[&hidden_buf, &normed_buf, &norm_buf, &rmsnorm_params_1], &format!("df_cb_norm_bg_{j}")));
+
+            let tl_t = gguf.get_tensor(&format!("{pfx}.to_logits.weight"))?;
+            let tl_f32 = tl_t.to_f32_vec();
+            let tl_buf = ctx.upload_f32(&tl_f32, &format!("{pfx}.to_logits"));
+            to_logits_gemm_bgs.push(make_bg(&pipes.gemv_f32, &[&tl_buf, &normed_buf, &logits_buf, &tl_params], &format!("df_tl_bg_{j}")));
+
+            let am_params = ctx.upload_storage(
+                bytemuck::cast_slice(&[dec_cfg.n_vocab as u32, j as u32]),
+                &format!("df_argmax_params_{j}"),
+            );
+            argmax_bgs.push(make_bg(&pipes.argmax_f32, &[&logits_buf, &sampled_codes_buf, &am_params], &format!("df_argmax_bg_{j}")));
+
+            if j < dec_cfg.n_codebook - 1 {
+                let emb_t = gguf.get_tensor(&format!("{pfx}.embedding.weight"))?;
+                let emb_buf = ctx.upload_f32(&emb_t.to_f32_vec(), &format!("{pfx}.emb"));
+                let em_params = ctx.upload_storage(
+                    bytemuck::cast_slice(&[n_embd as u32, j as u32]),
+                    &format!("df_embed_params_{j}"),
+                );
+                embed_add_bgs.push(make_bg(&pipes.df_embed_add, &[&emb_buf, &sampled_codes_buf, &hidden_buf, &em_params], &format!("df_embed_add_bg_{j}")));
+            }
+        }
+
+        let mut sample_params_bufs = Vec::with_capacity(dec_cfg.n_codebook);
+        let mut sample_bgs = Vec::with_capacity(dec_cfg.n_codebook);
+        for j in 0..dec_cfg.n_codebook {
+            let sm_params = alloc(4, &format!("df_sample_params_{j}"));
+            sample_bgs.push(make_bg(
+                &pipes.df_sample_logits,
+                &[&logits_buf, &sampled_codes_buf, &sm_params],
+                &format!("df_sample_bg_{j}"),
+            ));
+            sample_params_bufs.push(sm_params);
+        }
+
+        let depth_linear_wg_m = (n_embd_d as u32).div_ceil(8);
+        let qkv_wg_m = ((q_dim + 2 * kv_dim) as u32).div_ceil(8);
+        let n_embd_wg_m = (n_embd as u32).div_ceil(8);
+        let ffn_dim_wg_m = (ffn_dim as u32).div_ceil(8);
+        let n_vocab_wg_m = (dec_cfg.n_vocab as u32).div_ceil(8);
+
         Ok(Self {
             ctx: ctx.clone(),
             df_cfg: df_cfg.clone(),
             dec_cfg: dec_cfg.clone(),
             pipes: pipes.clone(),
             layers,
-            depth_linear_slices,
-            depth_linear_b_slices,
-            codebook_norms,
-            codebook_to_logits,
-            codebook_emb_f32,
+            depth_linear_bgs,
+            bias_add_bgs,
+            embed_add_bgs,
+            to_logits_norm_bgs,
+            to_logits_gemm_bgs,
+            argmax_bgs,
+            sample_bgs,
+            sample_params_bufs,
+            depth_linear_wg_m,
+            qkv_wg_m,
+            n_embd_wg_m,
+            ffn_dim_wg_m,
+            n_vocab_wg_m,
+            embedding_in_buf,
             hidden_buf,
             normed_buf,
-            proj_buf,
-            gate_buf,
-            up_buf,
+            q_buf,
+            k_buf,
+            v_buf,
             attn_out_buf,
-            embedding_in_buf,
+            ffn_act_buf,
+            sampled_codes_buf,
+            staging_readback_buf,
             logits_buf,
-            rope_freqs_dummy,
             kv_k,
             kv_v,
-            n_past: AtomicUsize::new(0),
         })
     }
 
-    fn encode(
-        &self,
-        enc: &mut wgpu::CommandEncoder,
-        pipeline: &wgpu::ComputePipeline,
-        bufs: &[&Buffer],
-        workgroups: (u32, u32, u32),
-        label: &str,
-    ) {
-        let entries: Vec<wgpu::BindGroupEntry> = bufs
-            .iter()
-            .enumerate()
-            .map(|(i, b)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: b.as_entire_binding(),
-            })
-            .collect();
-        let bind_group = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &pipeline.get_bind_group_layout(0),
-                entries: &entries,
-            });
-        let mut pass = self.ctx.begin_pass(enc, label);
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
-    }
-
-    fn params(&self, data: &[u32], label: &str) -> Buffer {
-        self.ctx.upload_storage(bytemuck::cast_slice(data), label)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn gemm(
-        &self,
-        enc: &mut wgpu::CommandEncoder,
-        w: &GpuWeight,
-        x: &Buffer,
-        y: &Buffer,
-        n: u32,
-        x_stride: u32,
-        y_stride: u32,
-    ) {
-        let params = self.params(&[w.m, w.k, n, x_stride, y_stride], "df_gemm_params");
-        let wg_m = w.m.div_ceil(MUL_MAT_TILE_WG_M * MUL_MAT_TILE_M);
-        let wg_n = n.div_ceil(MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N);
-        self.encode(
-            enc,
-            &self.pipes.gemm_f32,
-            &[&w.buf, x, y, &params],
-            (wg_m, wg_n, 1),
-            "df_gemm",
-        );
-    }
-
-    fn rmsnorm_batch(
-        &self,
-        enc: &mut wgpu::CommandEncoder,
-        src: &Buffer,
-        dst: &Buffer,
-        weight: &Buffer,
-        n: u32,
-    ) {
-        let hs = self.df_cfg.n_embd as u32;
-        let p = self.params(
-            &[
-                hs,
-                self.df_cfg.rms_norm_eps.to_bits(),
-                hs,
-                hs,
-                1.0f32.to_bits(),
-            ],
-            "df_rmsnorm_params",
-        );
-        self.encode(
-            enc,
-            &self.pipes.rmsnorm_batch,
-            &[src, dst, weight, &p],
-            (n, 1, 1),
-            "df_rmsnorm",
-        );
-    }
-
-    fn add_inplace(&self, enc: &mut wgpu::CommandEncoder, a: &Buffer, b: &Buffer, n: u32) {
-        let p = self.params(&[n, 0], "df_add_params");
-        self.encode(
-            enc,
-            &self.pipes.add_inplace,
-            &[a, b, &p],
-            (n.div_ceil(256), 1, 1),
-            "df_add",
-        );
-    }
-
-    fn silu_mul(&self, enc: &mut wgpu::CommandEncoder, gate: &Buffer, up: &Buffer, total: u32) {
-        let p = self.params(&[total, 0], "df_silu_params");
-        self.encode(
-            enc,
-            &self.pipes.silu_mul,
-            &[gate, up, &p],
-            (total.div_ceil(256), 1, 1),
-            "df_silu_mul",
-        );
-    }
-
-    pub fn reset(&self) {
-        self.n_past.store(0, Ordering::Relaxed);
-    }
+    pub fn reset(&self) {}
 
     pub async fn sample_frame_async(
         &self,
@@ -1532,284 +1647,193 @@ impl WgpuDepthformer {
         temperature: f32,
         top_k: usize,
     ) -> Result<[i32; 8]> {
-        self.reset();
-        let mut codes = [0i32; 8];
-        let mut prev_token: i32 = -1;
+        self.ctx
+            .queue
+            .write_buffer(&self.embedding_in_buf, 0, bytemuck::cast_slice(embedding));
+        self.sample_frame_internal_async(temperature, top_k, None).await
+    }
 
+    pub async fn sample_frame_from_gpu_hidden_async(
+        &self,
+        hidden_buf: &wgpu::Buffer,
+        temperature: f32,
+        top_k: usize,
+    ) -> Result<[i32; 8]> {
+        self.sample_frame_internal_async(temperature, top_k, Some(hidden_buf)).await
+    }
+
+    async fn sample_frame_internal_async(
+        &self,
+        temperature: f32,
+        top_k: usize,
+        gpu_hidden_src: Option<&wgpu::Buffer>,
+    ) -> Result<[i32; 8]> {
         let n_embd = self.df_cfg.n_embd;
         let hd = self.df_cfg.n_embd_head;
         let n_head = self.df_cfg.n_head as u32;
         let n_kv = self.df_cfg.n_head_kv as u32;
-        let q_dim = n_head * hd as u32;
         let kv_dim = n_kv * hd as u32;
-        let ffn_dim = self.df_cfg.ffn_dim as u32;
-        let scale = 1.0f32 / (hd as f32).sqrt();
 
-        for (j, code) in codes.iter_mut().enumerate().take(self.dec_cfg.n_codebook) {
-            let pos = self.n_past.load(Ordering::Relaxed);
-            let mut enc = self
-                .ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("wgpu_depthformer_codebook"),
-                });
+        let use_sampling = temperature > 0.0 && top_k > 1;
+        let inv_temp = if temperature > 0.0 { 1.0 / temperature } else { 1.0 };
 
-            // 1. Upload LLM embedding to embedding_in_buf
-            self.ctx
-                .queue
-                .write_buffer(&self.embedding_in_buf, 0, bytemuck::cast_slice(embedding));
-
-            // 2. depth_linear projection: embedding → hidden_buf
-            self.gemm(
-                &mut enc,
-                &self.depth_linear_slices[j],
-                &self.embedding_in_buf,
-                &self.hidden_buf,
-                1,
-                self.dec_cfg.n_embd as u32,
-                n_embd as u32,
-            );
-
-            // 3. Add bias: hidden_buf += depth_linear_b_slices[j]
-            self.add_inplace(
-                &mut enc,
-                &self.hidden_buf,
-                &self.depth_linear_b_slices[j],
-                n_embd as u32,
-            );
-
-            // 4. If j > 0, add prev codebook's embedding
-            if j > 0 && prev_token >= 0 {
-                let tok = prev_token as usize;
-                let emb_table = &self.codebook_emb_f32[j - 1];
-                let row = &emb_table[tok * n_embd..(tok + 1) * n_embd];
-                self.ctx
-                    .queue
-                    .write_buffer(&self.proj_buf, 0, bytemuck::cast_slice(row));
-                self.add_inplace(&mut enc, &self.hidden_buf, &self.proj_buf, n_embd as u32);
+        if use_sampling {
+            for j in 0..self.dec_cfg.n_codebook {
+                let rand_val = rand::random::<f32>();
+                let params = [
+                    self.dec_cfg.n_vocab as f32,
+                    j as f32,
+                    inv_temp,
+                    rand_val,
+                ];
+                self.ctx.queue.write_buffer(
+                    &self.sample_params_bufs[j],
+                    0,
+                    bytemuck::cast_slice(&params),
+                );
             }
-
-            // 5. Transformer layers
-            for (il, lw) in self.layers.iter().enumerate() {
-                // RMSnorm → normed_buf
-                self.rmsnorm_batch(
-                    &mut enc,
-                    &self.hidden_buf,
-                    &self.normed_buf,
-                    &lw.operator_norm,
-                    1,
-                );
-
-                // QKV GEMMs
-                self.gemm(
-                    &mut enc,
-                    &lw.wq,
-                    &self.normed_buf,
-                    &self.proj_buf,
-                    1,
-                    n_embd as u32,
-                    q_dim,
-                );
-                self.gemm(
-                    &mut enc,
-                    &lw.wk,
-                    &self.normed_buf,
-                    &self.gate_buf,
-                    1,
-                    n_embd as u32,
-                    kv_dim,
-                );
-                self.gemm(
-                    &mut enc,
-                    &lw.wv,
-                    &self.normed_buf,
-                    &self.up_buf,
-                    1,
-                    n_embd as u32,
-                    kv_dim,
-                );
-
-                // QK norm + RoPE (interleaved / NORM)
-                let p = self.params(
-                    &[
-                        pos as u32,
-                        1,
-                        n_head,
-                        n_kv,
-                        hd as u32,
-                        self.df_cfg.rms_norm_eps.to_bits(),
-                        self.df_cfg.rope_freq_base.to_bits(),
-                        1, // rope_type = interleaved / NORM
-                        q_dim,
-                        kv_dim,
-                        0, // has_freq_factors
-                        1, // has_qk_norm
-                    ],
-                    "df_rope_params",
-                );
-                let tg = n_head + n_kv;
-                self.encode(
-                    &mut enc,
-                    &self.pipes.qk_norm_rope_batch,
-                    &[
-                        &self.proj_buf,
-                        &self.gate_buf,
-                        &lw.q_norm,
-                        &lw.k_norm,
-                        &p,
-                        &self.rope_freqs_dummy,
-                    ],
-                    (tg, 1, 1),
-                    "df_qk_rope",
-                );
-
-                // KV Cache write at slot `pos`
-                let dst_off = (pos * kv_dim as usize * 4) as u64;
-                let chunk = (kv_dim as usize * 4) as u64;
-                enc.copy_buffer_to_buffer(&self.gate_buf, 0, &self.kv_k[il], dst_off, chunk);
-                enc.copy_buffer_to_buffer(&self.up_buf, 0, &self.kv_v[il], dst_off, chunk);
-
-                // Flash Attention
-                let seq_len = (pos + 1) as u32;
-                let attn_p = self.params(
-                    &[
-                        n_head,
-                        n_kv,
-                        hd as u32,
-                        kv_dim,
-                        seq_len,
-                        scale.to_bits(),
-                        0,
-                        0,
-                    ],
-                    "df_attn_params",
-                );
-                self.encode(
-                    &mut enc,
-                    &self.pipes.flash_attention,
-                    &[
-                        &self.proj_buf,
-                        &self.kv_k[il],
-                        &self.kv_v[il],
-                        &self.attn_out_buf,
-                        &attn_p,
-                    ],
-                    (n_head, 1, 1),
-                    "df_flash_attention",
-                );
-
-                // Out projection: attn_out → proj_buf
-                self.gemm(
-                    &mut enc,
-                    &lw.wo,
-                    &self.attn_out_buf,
-                    &self.proj_buf,
-                    1,
-                    q_dim,
-                    n_embd as u32,
-                );
-                // Add residual: hidden_buf += proj_buf
-                self.add_inplace(&mut enc, &self.hidden_buf, &self.proj_buf, n_embd as u32);
-
-                // FFN: RMSnorm → gate & up → silu_mul → down → residual
-                self.rmsnorm_batch(
-                    &mut enc,
-                    &self.hidden_buf,
-                    &self.normed_buf,
-                    &lw.ffn_norm,
-                    1,
-                );
-                self.gemm(
-                    &mut enc,
-                    &lw.w1,
-                    &self.normed_buf,
-                    &self.gate_buf,
-                    1,
-                    n_embd as u32,
-                    ffn_dim,
-                );
-                self.gemm(
-                    &mut enc,
-                    &lw.w3,
-                    &self.normed_buf,
-                    &self.up_buf,
-                    1,
-                    n_embd as u32,
-                    ffn_dim,
-                );
-                self.silu_mul(&mut enc, &self.gate_buf, &self.up_buf, ffn_dim);
-                self.gemm(
-                    &mut enc,
-                    &lw.w2,
-                    &self.gate_buf,
-                    &self.proj_buf,
-                    1,
-                    ffn_dim,
-                    n_embd as u32,
-                );
-                self.add_inplace(&mut enc, &self.hidden_buf, &self.proj_buf, n_embd as u32);
-            }
-
-            self.n_past.fetch_add(1, Ordering::Relaxed);
-
-            // 6. to_logits: RMSnorm → GEMV → logits_buf
-            self.rmsnorm_batch(
-                &mut enc,
-                &self.hidden_buf,
-                &self.normed_buf,
-                &self.codebook_norms[j],
-                1,
-            );
-            self.gemm(
-                &mut enc,
-                &self.codebook_to_logits[j],
-                &self.normed_buf,
-                &self.logits_buf,
-                1,
-                n_embd as u32,
-                self.dec_cfg.n_vocab as u32,
-            );
-
-            // 7. Download logits
-            let pending = self.ctx.begin_download_with_encoder(
-                enc,
-                &self.logits_buf,
-                (self.dec_cfg.n_vocab * 4) as u64,
-            );
-            let bytes = pending.recv().await?;
-            let logits: &[f32] = bytemuck::cast_slice(&bytes);
-
-            // 8. Sample codebook token
-            let sampled = if temperature <= 0.0 {
-                crate::sampler::argmax(logits) as i32
-            } else {
-                let mut logits_vec = logits.to_vec();
-                let inv_temp = 1.0 / temperature;
-                for l in &mut logits_vec {
-                    *l *= inv_temp;
-                }
-                crate::backend::cpu::softmax_inplace(&mut logits_vec);
-                let mut indices: Vec<usize> = (0..logits_vec.len()).collect();
-                indices
-                    .sort_unstable_by(|&a, &b| logits_vec[b].partial_cmp(&logits_vec[a]).unwrap());
-                indices.truncate(top_k.min(logits_vec.len()));
-                let sum: f32 = indices.iter().map(|&i| logits_vec[i]).sum();
-                let mut r = rand::random::<f32>() * sum;
-                let mut picked = indices[0];
-                for &i in &indices {
-                    r -= logits_vec[i];
-                    if r <= 0.0 {
-                        picked = i;
-                        break;
-                    }
-                }
-                picked as i32
-            };
-
-            *code = sampled;
-            prev_token = sampled;
         }
 
-        Ok(codes)
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("wgpu_depthformer_all_codebooks"),
+            });
+
+        if let Some(src) = gpu_hidden_src {
+            let size = (self.dec_cfg.n_embd * 4) as u64;
+            enc.copy_buffer_to_buffer(src, 0, &self.embedding_in_buf, 0, size);
+        }
+
+        for j in 0..self.dec_cfg.n_codebook {
+            let pos = j;
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("df_codebook_pass"),
+                timestamp_writes: None,
+            });
+
+            // Initial projections for this codebook
+            pass.set_pipeline(&self.pipes.gemv_f32);
+            pass.set_bind_group(0, &self.depth_linear_bgs[j], &[]);
+            pass.dispatch_workgroups(self.depth_linear_wg_m, 1, 1);
+
+            pass.set_pipeline(&self.pipes.add_inplace);
+            pass.set_bind_group(0, &self.bias_add_bgs[j], &[]);
+            pass.dispatch_workgroups((n_embd as u32).div_ceil(256), 1, 1);
+
+            if j > 0 {
+                pass.set_pipeline(&self.pipes.df_embed_add);
+                pass.set_bind_group(0, &self.embed_add_bgs[j - 1], &[]);
+                pass.dispatch_workgroups((n_embd as u32).div_ceil(256), 1, 1);
+            }
+
+            // Transformer layers with fused QKV, fused FFN gate+up with inline SiLU, and direct residual accumulators
+            for lw in &self.layers {
+                // RMSnorm -> normed_buf
+                pass.set_pipeline(&self.pipes.rmsnorm_batch);
+                pass.set_bind_group(0, &lw.operator_norm_bg, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+
+                // Fused QKV GEMV -> q_buf, k_buf, v_buf
+                pass.set_pipeline(&self.pipes.df_qkv_gemv);
+                pass.set_bind_group(0, &lw.gemm_qkv_bg, &[]);
+                pass.dispatch_workgroups(self.qkv_wg_m, 1, 1);
+
+                // QK norm + RoPE (interleaved / NORM)
+                pass.set_pipeline(&self.pipes.qk_norm_rope_batch);
+                pass.set_bind_group(0, &lw.rope_bgs[pos], &[]);
+                pass.dispatch_workgroups(n_head + n_kv, 1, 1);
+
+                // GPU-side KV cache slot copy inside the compute pass
+                pass.set_pipeline(&self.pipes.df_kv_copy);
+                pass.set_bind_group(0, &lw.kv_copy_bgs[pos], &[]);
+                pass.dispatch_workgroups(kv_dim.div_ceil(256), 1, 1);
+
+                // Flash Attention -> attn_out_buf
+                pass.set_pipeline(&self.pipes.flash_attention);
+                pass.set_bind_group(0, &lw.attn_bgs[pos], &[]);
+                pass.dispatch_workgroups(n_head, 1, 1);
+
+                // Out projection directly accumulated into hidden_buf (hidden_buf += Wo · attn_out)
+                pass.set_pipeline(&self.pipes.gemv_f32_accum);
+                pass.set_bind_group(0, &lw.gemm_wo_accum_bg, &[]);
+                pass.dispatch_workgroups(self.n_embd_wg_m, 1, 1);
+
+                // FFN: RMSnorm -> normed_buf
+                pass.set_pipeline(&self.pipes.rmsnorm_batch);
+                pass.set_bind_group(0, &lw.ffn_norm_bg, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+
+                // FFN Fused Gate + Up with inline SiLU -> ffn_act_buf
+                pass.set_pipeline(&self.pipes.df_ffn_gate_up);
+                pass.set_bind_group(0, &lw.ffn_gate_up_bg, &[]);
+                pass.dispatch_workgroups(self.ffn_dim_wg_m, 1, 1);
+
+                // FFN W2 Down projection directly accumulated into hidden_buf (hidden_buf += W2 · ffn_act)
+                pass.set_pipeline(&self.pipes.gemv_f32_accum);
+                pass.set_bind_group(0, &lw.gemm_w2_accum_bg, &[]);
+                pass.dispatch_workgroups(self.n_embd_wg_m, 1, 1);
+            }
+
+            // to_logits: RMSnorm -> GEMV -> logits_buf
+            pass.set_pipeline(&self.pipes.rmsnorm_batch);
+            pass.set_bind_group(0, &self.to_logits_norm_bgs[j], &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+
+            pass.set_pipeline(&self.pipes.gemv_f32);
+            pass.set_bind_group(0, &self.to_logits_gemm_bgs[j], &[]);
+            pass.dispatch_workgroups(self.n_vocab_wg_m, 1, 1);
+
+            // Sample on GPU (with temperature) or Argmax on GPU -> sampled_codes_buf[j]
+            if use_sampling {
+                pass.set_pipeline(&self.pipes.df_sample_logits);
+                pass.set_bind_group(0, &self.sample_bgs[j], &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            } else {
+                pass.set_pipeline(&self.pipes.argmax_f32);
+                pass.set_bind_group(0, &self.argmax_bgs[j], &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+        }
+
+        // Single 32-byte download of all 8 codes via pre-allocated staging buffer
+        let size = (self.dec_cfg.n_codebook * 4) as u64;
+        enc.copy_buffer_to_buffer(&self.sampled_codes_buf, 0, &self.staging_readback_buf, 0, size);
+        self.ctx.submit_encoder(enc);
+
+        let (tx, rx) = futures_channel::oneshot::channel();
+        self.staging_readback_buf
+            .slice(0..size)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        self.ctx.device.poll_wait();
+
+        let res = rx.await;
+        let mut codes = [0i32; 8];
+        match res {
+            Ok(Ok(())) => {
+                let parse_res: Result<[i32; 8]> = {
+                    let slice = self.staging_readback_buf.slice(0..size);
+                    match slice.get_mapped_range() {
+                        Ok(data) => {
+                            let sampled_u32: &[u32] = bytemuck::cast_slice(&data);
+                            for (i, &c) in sampled_u32.iter().enumerate().take(8) {
+                                codes[i] = c as i32;
+                            }
+                            Ok(codes)
+                        }
+                        Err(e) => Err(anyhow::anyhow!("get_mapped_range failed: {e:?}")),
+                    }
+                };
+                self.staging_readback_buf.unmap();
+                parse_res
+            }
+            Ok(Err(e)) => anyhow::bail!("GPU readback failed: {e:?}"),
+            Err(_) => anyhow::bail!("GPU readback channel closed"),
+        }
     }
 }

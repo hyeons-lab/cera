@@ -4701,6 +4701,30 @@ impl GpuLfm2Model {
         Ok(out)
     }
 
+    /// Decode step computing hidden state and keeping it in `hidden_buf` on the GPU with no host readback.
+    pub fn forward_hidden_from_embedding_gpu(
+        &self,
+        embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<&wgpu::Buffer> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _lora_guard = self.resolve_lora(state);
+        self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
+        self.forward_inner_compute_tail_seeded(
+            HiddenSeed::Embedding(embedding),
+            pos,
+            state,
+            DecodeTail::Hidden,
+        );
+        Ok(&self.hidden_buf)
+    }
+
+    /// Access the GPU hidden state buffer directly for zero-copy downstream pipeline stages.
+    pub fn hidden_buffer(&self) -> &wgpu::Buffer {
+        &self.hidden_buf
+    }
+
     /// Async decode step returning logits when seeded by an audio embedding.
     pub async fn forward_logits_from_embedding_async(
         &self,

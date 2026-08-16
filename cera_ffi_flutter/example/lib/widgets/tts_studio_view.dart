@@ -23,17 +23,49 @@ class TtsStudioView extends StatefulWidget {
 }
 
 class _TtsStudioViewState extends State<TtsStudioView> {
-  final TextEditingController _textController = TextEditingController(
-    text:
-        'Hello! This voice was synthesized entirely on-device with Cera neural vocoder.',
-  );
+  late final TextEditingController _textController;
 
-  static const List<String> _samplePrompts = [
-    'Hello! This voice was synthesized entirely on-device with Cera neural vocoder.',
+  static String _getModelDisplayName(ChatState state) {
+    final rawName = state.loadedModel?.name;
+    if (rawName == null || rawName.isEmpty) {
+      return 'LFM2';
+    }
+    var name = rawName;
+    if (name.toLowerCase().endsWith('.gguf')) {
+      name = name.substring(0, name.length - 5);
+    }
+    return name;
+  }
+
+  static String _defaultSampleText(String modelName) =>
+      'Hello, this voice was synthesized entirely on-device with the $modelName model powered by Cera.';
+
+  static List<String> _getSamplePrompts(String modelName) => [
+    _defaultSampleText(modelName),
     'Cera runs high-performance multimodal AI on Apple Silicon, WebGPU, and CPU.',
     'On-device intelligence guarantees complete privacy with zero cloud latency.',
     'Streaming ISTFT produces 24 kHz neural audio in real-time without external TTS libraries.',
   ];
+
+  @override
+  void initState() {
+    super.initState();
+    final modelName = _getModelDisplayName(widget.state);
+    _textController = TextEditingController(text: _defaultSampleText(modelName));
+  }
+
+  @override
+  void didUpdateWidget(TtsStudioView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final oldModel = _getModelDisplayName(oldWidget.state);
+    final newModel = _getModelDisplayName(widget.state);
+    if (oldModel != newModel) {
+      final oldDefault = _defaultSampleText(oldModel);
+      if (_textController.text.isEmpty || _textController.text == oldDefault) {
+        _textController.text = _defaultSampleText(newModel);
+      }
+    }
+  }
 
   @override
   void dispose() {
@@ -221,7 +253,7 @@ class _TtsStudioViewState extends State<TtsStudioView> {
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: Row(
-              children: _samplePrompts.map((prompt) {
+              children: _getSamplePrompts(_getModelDisplayName(state)).map((prompt) {
                 return Padding(
                   padding: const EdgeInsets.only(right: 8),
                   child: ActionChip(
@@ -358,12 +390,12 @@ class _TtsStudioViewState extends State<TtsStudioView> {
                   ),
                 ),
                 icon: state.isGenerating
-                    ? const SizedBox(
+                    ? SizedBox(
                         width: 16,
                         height: 16,
                         child: CircularProgressIndicator(
                           strokeWidth: 2,
-                          color: Colors.white,
+                          color: theme.colorScheme.onPrimary,
                         ),
                       )
                     : const Icon(Icons.volume_up_rounded, size: 18),
@@ -427,10 +459,11 @@ class _TtsStudioViewState extends State<TtsStudioView> {
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
                 ),
-                TextButton(
+                TextButton.icon(
+                  icon: const Icon(Icons.delete_sweep_rounded, size: 14),
                   onPressed: () =>
                       widget.controller.dispatch(const ClearTranscriptIntent()),
-                  child: const Text(
+                  label: const Text(
                     'Clear Outputs',
                     style: TextStyle(fontSize: 11),
                   ),
@@ -444,7 +477,7 @@ class _TtsStudioViewState extends State<TtsStudioView> {
               itemCount: audioTurns.length,
               separatorBuilder: (_, _) => const SizedBox(height: 12),
               itemBuilder: (context, index) {
-                final turn = audioTurns.reversed.toList()[index];
+                final turn = audioTurns[audioTurns.length - 1 - index];
                 return Container(
                   padding: const EdgeInsets.all(14),
                   decoration: BoxDecoration(

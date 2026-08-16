@@ -8,7 +8,6 @@
 //   flutter run -d macos
 //   flutter run -d chrome
 
-import 'dart:async';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart'
     show defaultTargetPlatform, kIsWeb, TargetPlatform;
@@ -441,9 +440,9 @@ class _ChatPageState extends State<ChatPage> {
                       const SizedBox(height: 8),
                       ListTile(
                         contentPadding: EdgeInsets.zero,
-                        title: const Text('Audio Output Mode'),
+                        title: const Text('Voice Mode'),
                         subtitle: Text(
-                          'Select how audio-capable models generate speech (using the model\'s neural vocoder, not OS/browser TTS).',
+                          'Select how audio-capable models interact with speech (Speech to Text ASR, Interleaved Voice Chat, Text to Speech TTS, or Text Only).',
                           style: TextStyle(
                             fontSize: 12,
                             color: theme.colorScheme.onSurfaceVariant,
@@ -454,6 +453,10 @@ class _ChatPageState extends State<ChatPage> {
                           dropdownColor: theme.colorScheme.surface,
                           underline: const SizedBox.shrink(),
                           items: const [
+                            DropdownMenuItem(
+                              value: AudioChatMode.speechToText,
+                              child: Text('Speech to Text (ASR)'),
+                            ),
                             DropdownMenuItem(
                               value: AudioChatMode.interleaved,
                               child: Text('Voice Chat (Interleaved)'),
@@ -665,7 +668,7 @@ class _ChatPageState extends State<ChatPage> {
                 ),
               ),
               IconButton(
-                icon: const Icon(Icons.delete_outline_rounded),
+                icon: const Icon(Icons.delete_sweep_rounded),
                 tooltip: 'Clear transcript',
                 onPressed: state.turns.isEmpty
                     ? null
@@ -694,7 +697,8 @@ class _ChatPageState extends State<ChatPage> {
                       ),
                     ),
                     if (state.hasModel &&
-                        (state.capabilities?.audioOut ?? false))
+                        ((state.capabilities?.audioIn ?? false) ||
+                            (state.capabilities?.audioOut ?? false)))
                       Container(
                         padding: const EdgeInsets.symmetric(
                           horizontal: 16,
@@ -733,6 +737,20 @@ class _ChatPageState extends State<ChatPage> {
                                 scrollDirection: Axis.horizontal,
                                 child: Row(
                                   children: [
+                                    _AudioModeChip(
+                                      label: 'Speech to Text (ASR)',
+                                      icon: Icons.transcribe_rounded,
+                                      isSelected:
+                                          state.settings.audioChatMode ==
+                                          AudioChatMode.speechToText,
+                                      onTap: () => _controller.dispatch(
+                                        const UpdateSettingsIntent(
+                                          audioChatMode:
+                                              AudioChatMode.speechToText,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 6),
                                     _AudioModeChip(
                                       label: 'Voice Chat',
                                       icon: Icons.record_voice_over_outlined,

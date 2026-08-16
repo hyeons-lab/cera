@@ -167,7 +167,39 @@ class AudioWaveformBubble extends StatefulWidget {
 }
 
 class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
-  bool _isPlaying = false;
+  @override
+  void initState() {
+    super.initState();
+    widget.audioPlayer?.addListener(_onPlayerStateChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant AudioWaveformBubble oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.audioPlayer != widget.audioPlayer) {
+      oldWidget.audioPlayer?.removeListener(_onPlayerStateChanged);
+      widget.audioPlayer?.addListener(_onPlayerStateChanged);
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.audioPlayer?.removeListener(_onPlayerStateChanged);
+    super.dispose();
+  }
+
+  void _onPlayerStateChanged() {
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  bool get _isPlaying {
+    final player = widget.audioPlayer;
+    final samples = widget.samples;
+    if (player == null || samples == null || samples.isEmpty) return false;
+    return player.isSourcePlaying(samples);
+  }
 
   List<double> _computeNormalizedBars(List<double>? pcm, int numBars) {
     if (pcm == null || pcm.isEmpty) {
@@ -179,18 +211,17 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
     }
 
     final bars = List<double>.filled(numBars, 0.0);
-    final chunkSize = pcm.length ~/ numBars;
-    if (chunkSize == 0) return bars;
-
     double maxVal = 0.0;
     for (var i = 0; i < numBars; i++) {
+      final start = (i * pcm.length) ~/ numBars;
+      final end = math.max(start + 1, ((i + 1) * pcm.length) ~/ numBars);
       double sum = 0.0;
-      final start = i * chunkSize;
-      final end = math.min(pcm.length, start + chunkSize);
-      for (var j = start; j < end; j++) {
+      final limit = math.min(end, pcm.length);
+      for (var j = start; j < limit; j++) {
         sum += pcm[j].abs();
       }
-      final avg = sum / (end - start);
+      final count = math.max(1, limit - start);
+      final avg = sum / count;
       bars[i] = avg;
       if (avg > maxVal) maxVal = avg;
     }
@@ -203,6 +234,18 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
     return bars;
   }
 
+  List<double>? _cachedBars;
+  List<double>? _lastSamples;
+
+  List<double> _getBars(int numBars) {
+    if (_cachedBars != null && identical(_lastSamples, widget.samples)) {
+      return _cachedBars!;
+    }
+    _lastSamples = widget.samples;
+    _cachedBars = _computeNormalizedBars(widget.samples, numBars);
+    return _cachedBars!;
+  }
+
   Future<void> _togglePlayback() async {
     final player = widget.audioPlayer;
     final samples = widget.samples;
@@ -210,16 +253,11 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
 
     if (_isPlaying) {
       player.stop();
-      setState(() => _isPlaying = false);
     } else {
-      setState(() => _isPlaying = true);
       final sr = widget.durationSeconds > 0
           ? (samples.length / widget.durationSeconds).round()
           : 24000;
-      await player.playPcm(samples, sampleRate: sr);
-      if (mounted) {
-        setState(() => _isPlaying = false);
-      }
+      await player.playPcm(samples, sampleRate: sr, source: samples);
     }
   }
 
@@ -227,7 +265,7 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     const numBars = 24;
-    final bars = _computeNormalizedBars(widget.samples, numBars);
+    final bars = _getBars(numBars);
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),

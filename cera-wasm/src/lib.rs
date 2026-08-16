@@ -595,6 +595,15 @@ impl CeraEngine {
         metadata_to_js(self.inner.metadata())
     }
 
+    /// Constructs a `GenerateOpts` seeded with the advisory defaults from the
+    /// model manifest (if any), falling back to standard defaults for unmentioned fields.
+    #[wasm_bindgen(js_name = defaultGenerateOpts)]
+    pub fn default_generate_opts(&self) -> GenerateOpts {
+        GenerateOpts {
+            inner: cera::GenerateOpts::from_manifest(self.inner.manifest()),
+        }
+    }
+
     /// Transcribe mono `f32` PCM audio (roughly normalized to `[-1.0, 1.0]`)
     /// to text, using the model's own audio encoder and chat template.
     ///
@@ -1922,10 +1931,45 @@ mod webgpu {
         image_max_long_size: Option<u32>,
         /// Generation defaults from the bundle manifest.
         generation_defaults: Option<cera::manifest::GenerationDefaults>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[wasm_bindgen]
+    pub struct WebGpuCancelHandle {
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[wasm_bindgen]
+    impl WebGpuCancelHandle {
+        #[wasm_bindgen]
+        pub fn cancel(&self) {
+            self.cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        #[wasm_bindgen(js_name = clearCancel)]
+        pub fn clear_cancel(&self) {
+            self.cancel.store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     #[wasm_bindgen]
     impl WebGpuSession {
+        #[wasm_bindgen(js_name = cancelHandle)]
+        pub fn cancel_handle(&self) -> WebGpuCancelHandle {
+            WebGpuCancelHandle {
+                cancel: self.cancel.clone(),
+            }
+        }
+
+        #[wasm_bindgen]
+        pub fn cancel(&self) {
+            self.cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        #[wasm_bindgen(js_name = clearCancel)]
+        pub fn clear_cancel(&self) {
+            self.cancel.store(false, std::sync::atomic::Ordering::Release);
+        }
         /// Async constructor: initialize WebGPU (`requestAdapter` /
         /// `requestDevice` resolve on the JS event loop), parse the in-memory
         /// GGUF, upload the model to the GPU, and build a fresh inference
@@ -2072,6 +2116,7 @@ mod webgpu {
                 gpu_audio_decoder: None,
                 image_max_long_size: None,
                 generation_defaults: None,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             })
         }
 
@@ -2166,12 +2211,23 @@ mod webgpu {
                     JsError::new(&format!("failed to parse detokenizer weights: {e:#}"))
                 })?;
             let ctx = self.model.ctx().clone();
-            self.gpu_audio_decoder =
-                cera::model::wgpu_audio_decoder::WgpuAudioDecoder::from_gguf_with_context(
-                    ctx, &voc_arc,
-                )
-                .map(Arc::new)
-                .ok();
+            match cera::model::wgpu_audio_decoder::WgpuAudioDecoder::from_gguf_with_context(
+                ctx, &voc_arc,
+            ) {
+                Ok(gad) => {
+                    console_info(&format!(
+                        "[cera-wasm] WgpuAudioDecoder loaded: supports_depthformer={}",
+                        gad.supports_depthformer()
+                    ));
+                    self.gpu_audio_decoder = Some(Arc::new(gad));
+                }
+                Err(e) => {
+                    console_info(&format!(
+                        "[cera-wasm] WgpuAudioDecoder load failed ({e:#}), using CPU decoder"
+                    ));
+                    self.gpu_audio_decoder = None;
+                }
+            }
             self.audio_decoder = Some(Arc::new(decoder_weights));
             self.detok_weights = Some(Arc::new(detok_weights));
             Ok(())
@@ -2183,7 +2239,7 @@ mod webgpu {
         /// Shared by `createWithParts` and `fromBundleId` so the two cannot
         /// drift on the pairing check below.
         fn attach_projector(&mut self, mmproj: Arc<[u8]>) -> Result<(), JsError> {
-            let proj_gguf = cera::gguf::GgufFile::from_bytes(mmproj).map_err(map_err)?;
+            let proj_gguf = cera::gguf::GgufFile::from_bytes(Arc::clone(&mmproj)).map_err(map_err)?;
             let proj_arc = Arc::new(proj_gguf);
             let llm_hidden = cera::model::Model::config(&self.model).hidden_size;
 
@@ -2208,6 +2264,9 @@ mod webgpu {
                 // Audio encoding on WebGPU falls back to the CPU encoder path.
                 self.gpu_audio_encoder = None;
                 self.audio_encoder = Some(weights);
+                if self.audio_decoder.is_none() {
+                    let _ = self.attach_vocoder(Arc::clone(&mmproj));
+                }
                 Ok(())
             } else {
                 let weights =
@@ -2842,7 +2901,14 @@ mod webgpu {
                         .gpu_audio_decoder
                         .as_deref()
                         .map(|g| g as &dyn cera::model::audio_decoder::AudioGpu);
-                    let use_gpu_df = gpu_ref.map(|g| g.supports_depthformer()).unwrap_or(false);
+                    let use_gpu_df = self
+                        .gpu_audio_decoder
+                        .as_ref()
+                        .is_some_and(|g| g.supports_depthformer());
+                    console_info(&format!(
+                        "[cera-wasm] AudioOutputDecoder: use_gpu_df={use_gpu_df}, gpu_audio_decoder={}",
+                        self.gpu_audio_decoder.is_some()
+                    ));
                     Some(
                         cera::audio_engine::AudioOutputDecoder::new(
                             dec,
@@ -2852,12 +2918,18 @@ mod webgpu {
                             audio_top_k,
                             use_gpu_df,
                         )
-                        .with_streaming(false),
+                        .with_streaming(true),
                     )
                 } else {
                     None
                 };
-            let mut modality_budget = 6usize;
+            let is_tts = if let Ok(prompt_str) = std::str::from_utf8(&self.tokenizer.decode_bytes(&ids)) {
+                prompt_str.contains("Perform TTS")
+            } else {
+                false
+            };
+            let is_interleaved = on_audio.is_some() && !is_tts;
+            let mut modality_budget = if is_interleaved { 6usize } else { usize::MAX };
             let mut text_done = false;
             let mut trailing_audio_segments: usize = 0;
             const MAX_TRAILING_AUDIO_SEGMENTS: usize = 3;
@@ -2868,18 +2940,32 @@ mod webgpu {
             // corrupt non-ASCII output into U+FFFD replacement chars.
             let mut out = String::new();
             let mut pending = Vec::<u8>::new();
-            let mut generated = 0;
+            let mut text_tokens_count = 0;
+            let mut audio_frames_count = 0;
+            let mut llm_hidden_passes = 0;
+
+            let mut time_llm_text_ms = 0.0;
+            let mut time_llm_audio_ms = 0.0;
+            let mut time_depthformer_ms = 0.0;
+            let mut time_vocoder_finish_ms = 0.0;
+
+            let gen_start_time = js_sys::Date::now();
+
+            self.cancel.store(false, std::sync::atomic::Ordering::Release);
+
             for _ in 0..max_tokens {
+                if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 if Some(next) == self.eos {
                     break;
                 }
-                generated += 1;
 
                 if next == cera::audio_engine::TOKEN_AUDIO_START
                     && let Some(ref mut dec) = decoder
                 {
                     console_info(
-                        "[cera-wasm] WebGpuSession hit TOKEN_AUDIO_START (128). Beginning sequential vocoder audio decoding...",
+                        &format!("[cera-wasm] WebGpuSession hit audio start token ({}). Beginning sequential vocoder audio decoding...", next),
                     );
                     if !pending.is_empty() {
                         let valid = match std::str::from_utf8(&pending) {
@@ -2895,19 +2981,35 @@ mod webgpu {
                     }
 
                     if pos < max_seq_len {
+                        let t_emb0 = js_sys::Date::now();
                         let mut emb = self
                             .model
                             .forward_embedding_async(next, pos, &mut self.state)
                             .await
                             .map_err(map_err)?;
+                        time_llm_audio_ms += js_sys::Date::now() - t_emb0;
                         pos += 1;
 
                         let mut frame_count = 0;
+                        let can_use_gpu_buf = dec.supports_gpu_depthformer();
+                        let mut use_gpu_buf = false;
                         loop {
-                            if generated >= max_tokens as usize || pos >= max_seq_len {
+                            if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                                 break;
                             }
-                            let outcome = dec.decode_frame_async(&emb).await.map_err(map_err)?;
+                            if pos >= max_seq_len || audio_frames_count >= 4096 {
+                                break;
+                            }
+                            let t_df0 = js_sys::Date::now();
+                            let outcome = if use_gpu_buf && can_use_gpu_buf {
+                                dec.decode_frame_from_gpu_hidden_async(self.model.hidden_buffer())
+                                    .await
+                                    .map_err(map_err)?
+                            } else {
+                                dec.decode_frame_async(&emb).await.map_err(map_err)?
+                            };
+                            time_depthformer_ms += js_sys::Date::now() - t_df0;
+
                             let audio_emb = match outcome {
                                 cera::audio_engine::FrameOutcome::End => {
                                     console_info(&format!(
@@ -2920,6 +3022,7 @@ mod webgpu {
                                     pcm,
                                 } => {
                                     frame_count += 1;
+                                    audio_frames_count += 1;
                                     if !pcm.is_empty()
                                         && let Some(cb) = on_audio
                                     {
@@ -2930,30 +3033,32 @@ mod webgpu {
                                     audio_embedding
                                 }
                             };
-                            emb = self
-                                .model
-                                .forward_hidden_from_embedding_async(
-                                    &audio_emb,
-                                    pos,
-                                    &mut self.state,
-                                )
-                                .await
-                                .map_err(map_err)?;
-                            pos += 1;
-                            generated += 1;
-                        }
 
-                        dec.finish_async(|pcm, rate| {
-                            if !pcm.is_empty()
-                                && let Some(cb) = on_audio
-                            {
-                                let array = js_sys::Float32Array::from(pcm);
-                                let rate_val = JsValue::from_f64(rate as f64);
-                                let _ = cb.call2(&JsValue::null(), &array, &rate_val);
+                            let t_hid0 = js_sys::Date::now();
+                            if can_use_gpu_buf {
+                                self.model
+                                    .forward_hidden_from_embedding_gpu(
+                                        &audio_emb,
+                                        pos,
+                                        &mut self.state,
+                                    )
+                                    .map_err(map_err)?;
+                                use_gpu_buf = true;
+                            } else {
+                                emb = self
+                                    .model
+                                    .forward_hidden_from_embedding_async(
+                                        &audio_emb,
+                                        pos,
+                                        &mut self.state,
+                                    )
+                                    .await
+                                    .map_err(map_err)?;
                             }
-                        })
-                        .await
-                        .map_err(map_err)?;
+                            time_llm_audio_ms += js_sys::Date::now() - t_hid0;
+                            llm_hidden_passes += 1;
+                            pos += 1;
+                        }
                     }
                     break;
                 }
@@ -2963,6 +3068,7 @@ mod webgpu {
                 }
 
                 if next != cera::audio_engine::TOKEN_TEXT_END {
+                    text_tokens_count += 1;
                     pending.extend_from_slice(&self.tokenizer.decode_bytes(&[next]));
                     let valid = match std::str::from_utf8(&pending) {
                         Ok(s) => s.len(),
@@ -2980,7 +3086,8 @@ mod webgpu {
 
                 // Interleaved audio generation: when modality budget hits 0 or text is done,
                 // extract audio embedding from this token and decode up to 12 audio frames.
-                if let Some(ref mut dec) = decoder
+                if is_interleaved
+                    && let Some(ref mut dec) = decoder
                     && (modality_budget == 0 || text_done)
                     && pos < max_seq_len
                 {
@@ -3004,30 +3111,74 @@ mod webgpu {
                         }
                     }
 
+                    let t_emb0 = js_sys::Date::now();
                     let mut emb = self
                         .model
                         .forward_embedding_async(next, pos, &mut self.state)
                         .await
                         .map_err(map_err)?;
+                    time_llm_audio_ms += js_sys::Date::now() - t_emb0;
                     pos += 1;
 
                     let mut audio_budget = 12usize;
                     let mut end_reached = false;
+                    let can_use_gpu_buf = dec.supports_gpu_depthformer();
+                    let mut use_gpu_buf = false;
                     loop {
-                        if generated >= max_tokens as usize || pos >= max_seq_len {
+                        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) || pos >= max_seq_len {
                             break;
                         }
-                        let outcome = dec.decode_frame_async(&emb).await.map_err(map_err)?;
+                        let t_df0 = js_sys::Date::now();
+                        let outcome = if use_gpu_buf && can_use_gpu_buf {
+                            dec.decode_frame_from_gpu_hidden_async(self.model.hidden_buffer())
+                                .await
+                                .map_err(map_err)?
+                        } else {
+                            dec.decode_frame_async(&emb).await.map_err(map_err)?
+                        };
+                        time_depthformer_ms += js_sys::Date::now() - t_df0;
+
                         let audio_emb = match outcome {
                             cera::audio_engine::FrameOutcome::End => {
-                                text_done = true;
-                                end_reached = true;
+                                if text_done {
+                                    end_reached = true;
+                                    break;
+                                }
+                                // Transition back to text by forwarding the audio end token
+                                let t_trans0 = js_sys::Date::now();
+                                next = match sampler.as_mut() {
+                                    Some(s) => {
+                                        let mut l = self
+                                            .model
+                                            .forward_logits_async(
+                                                cera::audio_engine::TOKEN_TEXT_END,
+                                                pos,
+                                                &mut self.state,
+                                            )
+                                            .await
+                                            .map_err(map_err)?;
+                                        s.sample(&mut l)
+                                    }
+                                    None => self
+                                        .model
+                                        .forward_greedy_async(
+                                            cera::audio_engine::TOKEN_TEXT_END,
+                                            pos,
+                                            &mut self.state,
+                                        )
+                                        .await
+                                        .map_err(map_err)?,
+                                };
+                                time_llm_text_ms += js_sys::Date::now() - t_trans0;
+                                pos += 1;
+                                modality_budget = 6;
                                 break;
                             }
                             cera::audio_engine::FrameOutcome::Codes {
                                 audio_embedding,
                                 pcm,
                             } => {
+                                audio_frames_count += 1;
                                 if !pcm.is_empty()
                                     && let Some(cb) = on_audio
                                 {
@@ -3042,6 +3193,7 @@ mod webgpu {
 
                         if audio_budget == 0 && !text_done {
                             // Transition back to text from the audio embedding
+                            let t_trans0 = js_sys::Date::now();
                             next = match sampler.as_mut() {
                                 Some(s) => {
                                     let mut l = self
@@ -3065,34 +3217,43 @@ mod webgpu {
                                     .await
                                     .map_err(map_err)?,
                             };
+                            time_llm_text_ms += js_sys::Date::now() - t_trans0;
                             pos += 1;
                             modality_budget = 6;
                             break;
                         }
 
-                        emb = self
-                            .model
-                            .forward_hidden_from_embedding_async(&audio_emb, pos, &mut self.state)
-                            .await
-                            .map_err(map_err)?;
+                        let t_hid0 = js_sys::Date::now();
+                        if can_use_gpu_buf {
+                            self.model
+                                .forward_hidden_from_embedding_gpu(&audio_emb, pos, &mut self.state)
+                                .map_err(map_err)?;
+                            use_gpu_buf = true;
+                        } else {
+                            emb = self
+                                .model
+                                .forward_hidden_from_embedding_async(&audio_emb, pos, &mut self.state)
+                                .await
+                                .map_err(map_err)?;
+                        }
+                        time_llm_audio_ms += js_sys::Date::now() - t_hid0;
+                        llm_hidden_passes += 1;
                         pos += 1;
-                        generated += 1;
                     }
 
                     if end_reached {
                         break;
                     }
-                    if audio_budget == 0 && !text_done {
-                        continue;
-                    }
+                    continue;
                 }
 
                 // Stop before the next forward would overflow the context
                 // window (the GPU forward asserts `seq_len < max_seq_len`). The
                 // token just emitted is the last one this call can produce.
-                if pos >= max_seq_len || generated >= max_tokens as usize {
+                if pos >= max_seq_len || text_tokens_count >= max_tokens as usize {
                     break;
                 }
+                let t_txt0 = js_sys::Date::now();
                 next = match sampler.as_mut() {
                     Some(s) => {
                         let mut logits = self
@@ -3108,14 +3269,16 @@ mod webgpu {
                         .await
                         .map_err(map_err)?,
                 };
+                time_llm_text_ms += js_sys::Date::now() - t_txt0;
                 pos += 1;
             }
 
+            let mut total_samples = 0;
             if let Some(mut dec) = decoder
                 && dec.audio_frames() > 0
                 && let Some(cb) = on_audio
             {
-                let mut total_samples = 0;
+                let t_fin0 = js_sys::Date::now();
                 dec.finish_async(|pcm, rate| {
                     total_samples += pcm.len();
                     console_info(&format!(
@@ -3125,18 +3288,44 @@ mod webgpu {
                     ));
                     let array = js_sys::Float32Array::from(pcm);
                     let rate_val = JsValue::from_f64(rate as f64);
-                    if let Err(err) = cb.call2(&JsValue::null(), &array, &rate_val) {
-                        wasm_bindgen::throw_val(err);
-                    }
+                    let _ = cb.call2(&JsValue::null(), &array, &rate_val);
                 })
                 .await
                 .map_err(map_err)?;
+                time_vocoder_finish_ms += js_sys::Date::now() - t_fin0;
+                let final_samples = if dec.streamed_samples() > 0 {
+                    dec.streamed_samples()
+                } else {
+                    total_samples
+                };
+                total_samples = final_samples;
                 console_info(&format!(
                     "[cera-wasm] WebGpuSession audio generation finished with {} frames and {} total samples",
                     dec.audio_frames(),
                     total_samples
                 ));
             }
+
+            let total_gen_ms = js_sys::Date::now() - gen_start_time;
+            let audio_dur_sec = total_samples as f64 / 24000.0;
+            let rtf = if total_gen_ms > 0.0 {
+                audio_dur_sec / (total_gen_ms / 1000.0)
+            } else {
+                0.0
+            };
+
+            let avg_txt = if text_tokens_count > 0 { time_llm_text_ms / text_tokens_count as f64 } else { 0.0 };
+            let avg_aud = if llm_hidden_passes > 0 { time_llm_audio_ms / llm_hidden_passes as f64 } else { 0.0 };
+            let avg_df = if audio_frames_count > 0 { time_depthformer_ms / audio_frames_count as f64 } else { 0.0 };
+
+            console_info(&format!(
+                "[cera:perf] Breakdown (total: {total_gen_ms:.1}ms, {audio_dur_sec:.2}s audio, RTF: {rtf:.2}x):\n\
+                 - LLM Text Decode:      {time_llm_text_ms:.1}ms ({text_tokens_count} tokens, {avg_txt:.1}ms/tok)\n\
+                 - LLM Audio Embedding:  {time_llm_audio_ms:.1}ms ({llm_hidden_passes} passes, {avg_aud:.1}ms/pass)\n\
+                 - Depthformer (CPU/GPU):{time_depthformer_ms:.1}ms ({audio_frames_count} frames, {avg_df:.1}ms/frame)\n\
+                 - Vocoder Detok+ISTFT:  {time_vocoder_finish_ms:.1}ms ({total_samples} PCM samples)"
+            ));
+
             // Flush any trailing bytes (an incomplete multi-byte char at the
             // stop boundary — lossy as a last resort).
             if !pending.is_empty() {
@@ -3150,4 +3339,4 @@ mod webgpu {
 }
 
 #[cfg(feature = "wgpu")]
-pub use webgpu::WebGpuSession;
+pub use webgpu::{WebGpuCancelHandle, WebGpuSession};

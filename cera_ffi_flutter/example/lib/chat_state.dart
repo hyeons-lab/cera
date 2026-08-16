@@ -109,8 +109,11 @@ class DownloadedModelRecord {
       );
 }
 
-/// Audio generation mode when an audio-capable model (with neural vocoder) is loaded.
+/// Voice interaction and generation modes when an audio-capable model is loaded.
 enum AudioChatMode {
+  /// Speech to Text (ASR): Transcribes recorded or uploaded audio into text.
+  speechToText,
+
   /// Voice Chat (Interleaved): Model generates conversational text and spoken audio.
   interleaved,
 

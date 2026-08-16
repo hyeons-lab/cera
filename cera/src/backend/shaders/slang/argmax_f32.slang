@@ -139,6 +139,7 @@ void argmax_f32(uint3 lid : SV_GroupThreadID) {
 
     uint winner = block_argmax(tid, local_max, local_idx);
     if (tid == 0u) {
-        out_buf[0] = winner;
+        uint out_idx = par_buf[0].y;
+        out_buf[out_idx] = winner;
     }
 }

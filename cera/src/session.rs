@@ -142,8 +142,8 @@ impl Default for GenerateOpts {
             temperature: 0.7,
             top_p: 0.9,
             top_k: 40,
-            min_p: 0.0,
-            repetition_penalty: 1.0,
+            min_p: 0.05,
+            repetition_penalty: 1.1,
             stop_tokens: Vec::new(),
             ignore_eos: false,
             grammar: None,
@@ -194,9 +194,6 @@ impl GenerateOpts {
             } => {
                 if let Some(t) = temperature {
                     opts.temperature = *t;
-                } else {
-                    // Audio models (e.g. ASR) default to greedy decoding if unmentioned.
-                    opts.temperature = 0.0;
                 }
                 if let Some(mp) = min_p {
                     opts.min_p = *mp;
@@ -2008,6 +2005,20 @@ impl Session {
         // That preserves seeded-split-generation reproducibility: a
         // single `generate(N)` advances RNG the same number of steps as
         // two `generate(N/2)` calls with the same seed.
+        let mut decoder =
+            if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
+                Some(
+                    crate::audio_engine::AudioOutputDecoder::new(dec, detok, None, 0.8, 4, false)
+                        .with_streaming(false),
+                )
+            } else {
+                None
+            };
+        let mut modality_budget = 6usize;
+        let mut text_done = false;
+        let mut trailing_audio_segments: usize = 0;
+        const MAX_TRAILING_AUDIO_SEGMENTS: usize = 3;
+
         loop {
             if self.cancel.load(Ordering::Relaxed) {
                 finish = FinishReason::Cancelled;
@@ -2084,9 +2095,9 @@ impl Session {
             // constraint begins on the next token.
             if is_pending_trigger {
                 armed = true;
-            } else if armed && let Some(state) = grammar_state.as_mut() {
+            } else if armed && let (Some(state), Some(mask)) = (grammar_state.as_mut(), grammar_mask.as_ref()) {
                 // Advance the grammar by the chosen (grammar-valid, non-EOS) token.
-                state.accept(grammar_mask.as_ref().unwrap().token_bytes(token));
+                state.accept(mask.token_bytes(token));
                 // For a lazy tool-call grammar, deactivate once the interior is
                 // complete so the model can emit its closing marker and continue.
                 // Reset to a fresh grammar state so a later trigger token re-arms
@@ -2100,7 +2111,6 @@ impl Session {
                 }
             }
 
-            pending.push(token);
             // Record here too, not just on the spec path's `emit!`. A session can
             // mix the two — spec engages only for plain greedy on a dense model
             // with uncompressed KV, so grammar, sampling, a compressed cache, or
@@ -2111,56 +2121,79 @@ impl Session {
             // the current position, so the drafts are rejected and the round is
             // wasted. Output stays correct either way (`verify_draft` re-derives
             // every token), which is exactly why the gap would go unnoticed.
-            self.token_history.push(token);
-            generated += 1;
+            let is_audio_transition = token == crate::audio_engine::TOKEN_AUDIO_START
+                || token == crate::audio_engine::TOKEN_TEXT_END;
+            if token == crate::audio_engine::TOKEN_TEXT_END {
+                text_done = true;
+            }
 
-            if token == crate::audio_engine::TOKEN_AUDIO_START
-                && let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights)
+            if !is_audio_transition {
+                pending.push(token);
+                self.token_history.push(token);
+                generated += 1;
+                modality_budget = modality_budget.saturating_sub(1);
+            }
+
+            if let Some(ref mut dec) = decoder
+                && (is_audio_transition || (modality_budget == 0 || text_done))
+                && pos < self.max_seq_len
             {
-                tracing::info!(
-                    "[cera:session] hit TOKEN_AUDIO_START (128). Beginning vocoder audio decoding..."
-                );
-                pending.pop();
+                if text_done {
+                    trailing_audio_segments += 1;
+                    if trailing_audio_segments > MAX_TRAILING_AUDIO_SEGMENTS {
+                        break;
+                    }
+                }
+
                 if !pending.is_empty() {
                     sink.on_text_tokens(&pending);
                     pending.clear();
                 }
 
-                let mut decoder =
-                    crate::audio_engine::AudioOutputDecoder::new(dec, detok, None, 0.8, 4, false);
-
                 let mut emb = self.model.forward_embedding(&[token], pos, &mut self.state);
                 pos += 1;
 
-                let mut cancelled = false;
-                let mut frame_count = 0;
+                let mut audio_budget = 12usize;
+                let mut end_reached = false;
                 loop {
                     if self.cancel.load(Ordering::Relaxed) {
-                        cancelled = true;
+                        finish = FinishReason::Cancelled;
                         break;
                     }
                     if generated >= opts.max_tokens || pos >= self.max_seq_len {
                         break;
                     }
-                    let outcome = decoder.decode_frame(&emb);
+                    let outcome = dec.decode_frame(&emb);
                     let audio_emb = match outcome {
                         crate::audio_engine::FrameOutcome::End => {
-                            tracing::info!(
-                                "[cera:session] vocoder emitted End code after {frame_count} frames"
-                            );
+                            text_done = true;
+                            end_reached = true;
                             break;
                         }
                         crate::audio_engine::FrameOutcome::Codes {
                             audio_embedding,
                             pcm,
                         } => {
-                            frame_count += 1;
                             if !pcm.is_empty() {
-                                sink.on_audio_frames(&pcm, decoder.sample_rate());
+                                sink.on_audio_frames(&pcm, dec.sample_rate());
                             }
                             audio_embedding
                         }
                     };
+                    audio_budget = audio_budget.saturating_sub(1);
+
+                    if audio_budget == 0 && !text_done {
+                        // Switch back to text from the audio embedding
+                        logits =
+                            self.model.forward_from_embedding(&audio_emb, pos, &mut self.state);
+                        if greedy {
+                            greedy_next = crate::sampler::argmax(&logits);
+                        }
+                        pos += 1;
+                        modality_budget = 6;
+                        break;
+                    }
+
                     emb =
                         self.model
                             .forward_hidden_from_embedding(&audio_emb, pos, &mut self.state);
@@ -2168,27 +2201,12 @@ impl Session {
                     generated += 1;
                 }
 
-                let mut sample_count = 0;
-                decoder.finish(|pcm, rate| {
-                    sample_count += pcm.len();
-                    tracing::info!(
-                        "[cera:session] vocoder finish produced {} PCM samples at {} Hz",
-                        pcm.len(),
-                        rate
-                    );
-                    sink.on_audio_frames(pcm, rate);
-                });
-                tracing::info!(
-                    "[cera:session] audio generation finished with {frame_count} frames and {sample_count} total PCM samples"
-                );
-                finish = if cancelled {
-                    FinishReason::Cancelled
-                } else if pos >= self.max_seq_len {
-                    FinishReason::ContextFull
-                } else {
-                    FinishReason::Stop
-                };
-                break;
+                if end_reached {
+                    break;
+                }
+                if audio_budget == 0 && !text_done {
+                    continue;
+                }
             }
 
             let should_flush_n = pending.len() >= flush_n;
@@ -2227,6 +2245,14 @@ impl Session {
 
         if !pending.is_empty() {
             sink.on_text_tokens(&pending);
+        }
+
+        if let Some(mut dec) = decoder
+            && dec.audio_frames() > 0
+        {
+            dec.finish(|pcm, rate| {
+                sink.on_audio_frames(pcm, rate);
+            });
         }
 
         self.current_pos = pos;

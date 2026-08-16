@@ -86,7 +86,7 @@ fn argmax_f32(@builtin(local_invocation_id) lid_0 : vec3<u32>)
     var winner_0 : u32 = block_argmax_0(tid_1, local_max_0, local_idx_0);
     if(tid_1 == u32(0))
     {
-        out_buf_0[i32(0)] = winner_0;
+        out_buf_0[par_buf_0[i32(0)].y] = winner_0;
     }
     return;
 }

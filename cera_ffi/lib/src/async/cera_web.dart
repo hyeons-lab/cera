@@ -96,6 +96,15 @@ extension type _Reply._(JSObject _) implements JSObject {
 extension type _OpenResult._(JSObject _) implements JSObject {
   external String get backend;
   external _Capabilities get capabilities;
+  external JSAny? get cancelBuffer;
+}
+
+@JS('Atomics')
+external _Atomics get _atomics;
+
+extension type _Atomics._(JSObject _) implements JSObject {
+  external int store(JSInt32Array typedArray, int index, int value);
+  external int load(JSInt32Array typedArray, int index);
 }
 
 /// One entry of the `listBundles` reply.
@@ -245,6 +254,8 @@ class _WorkerCera implements Cera {
   final _audioCallbacks =
       <int, void Function(List<double> pcm, int sampleRate)>{};
 
+  JSInt32Array? _cancelArray;
+
   int _nextId = 0;
   String _backend = 'unknown';
   bool _closed = false;
@@ -391,6 +402,12 @@ class _WorkerCera implements Cera {
     final opened = result as _OpenResult;
     _backend = opened.backend;
     _capabilities = _capabilitiesOf(opened.capabilities);
+    final buf = opened.cancelBuffer;
+    if (buf != null) {
+      try {
+        _cancelArray = JSInt32Array(buf as JSArrayBuffer);
+      } catch (_) {}
+    }
   }
 
   /// Produces an `ArrayBuffer` that is safe to transfer.
@@ -420,10 +437,15 @@ class _WorkerCera implements Cera {
       final sampleRate =
           ((reply.sampleRate as JSNumber?)?.toDartDouble ?? 24000).toInt();
       if (callback != null && pcmJs != null) {
-        final pcm =
-            (pcmJs as JSArray<JSNumber>).toDart
-                .map((n) => n.toDartDouble)
-                .toList();
+        final List<double> pcm;
+        if (pcmJs.isA<JSFloat32Array>()) {
+          pcm = (pcmJs as JSFloat32Array).toDart;
+        } else {
+          pcm =
+              (pcmJs as JSArray<JSNumber>).toDart
+                  .map((n) => n.toDartDouble)
+                  .toList();
+        }
         callback(pcm, sampleRate);
       }
       return;
@@ -563,7 +585,6 @@ class _WorkerCera implements Cera {
       _streams[id] = controller;
       if (onAudio != null) {
         _audioCallbacks[id] = onAudio;
-        print('[cera:web] registered onAudio callback for stream id=$id');
       }
       void terminate(Object? error, StackTrace? stack) {
         finished = true;
@@ -770,6 +791,11 @@ class _WorkerCera implements Cera {
     // there is nothing left to stop, and cancel is the call most often fired
     // from a dispose path that has already closed.
     if (_closed) return;
+    if (_cancelArray != null) {
+      try {
+        _atomics.store(_cancelArray!, 0, 1);
+      } catch (_) {}
+    }
     await _send(_newId(), (id) => _Request(id: id, op: 'cancel'));
   }
 

@@ -1451,7 +1451,7 @@ impl MetalDepthformer {
             let logits = unsafe {
                 std::slice::from_raw_parts(self.logits_buf.contents() as *const f32, dec.n_vocab)
             };
-            let sampled = if temperature <= 0.0 {
+            let sampled = if temperature <= 0.0 || top_k <= 1 {
                 crate::sampler::argmax(logits) as i32
             } else {
                 let mut logits_vec = logits.to_vec();
@@ -1462,8 +1462,9 @@ impl MetalDepthformer {
                 crate::backend::cpu::softmax_inplace(&mut logits_vec);
                 let mut indices: Vec<usize> = (0..logits_vec.len()).collect();
                 indices
-                    .sort_unstable_by(|&a, &b| logits_vec[b].partial_cmp(&logits_vec[a]).unwrap());
-                indices.truncate(top_k.min(logits_vec.len()));
+                    .sort_unstable_by(|&a, &b| logits_vec[b].total_cmp(&logits_vec[a]));
+                let k = top_k.clamp(1, logits_vec.len());
+                indices.truncate(k);
                 let sum: f32 = indices.iter().map(|&i| logits_vec[i]).sum();
                 let mut r = rand::random::<f32>() * sum;
                 let mut picked = indices[0];

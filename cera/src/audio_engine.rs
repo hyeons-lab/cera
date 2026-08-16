@@ -111,6 +111,11 @@ impl<'a> AudioOutputDecoder<'a> {
         self.audio_frames
     }
 
+    /// Total audio samples streamed so far in this session.
+    pub fn streamed_samples(&self) -> usize {
+        self.streamed_samples
+    }
+
     /// Sample rate of the vocoder in Hz (typically 24000).
     pub fn sample_rate(&self) -> u32 {
         self.detok_weights.config.sample_rate as u32
@@ -166,10 +171,15 @@ impl<'a> AudioOutputDecoder<'a> {
             time_detokenizer: Duration::ZERO,
             audio_temperature,
             audio_top_k,
-            use_gpu_df: gpu_depthformer && gpu.is_some(),
+            use_gpu_df: gpu_depthformer && gpu.is_some_and(|g| g.supports_depthformer()),
             streaming: true,
             all_codes: Vec::new(),
         }
+    }
+
+    /// Whether this decoder is using the GPU depthformer.
+    pub fn supports_gpu_depthformer(&self) -> bool {
+        self.use_gpu_df
     }
 
     /// Sample one audio frame via depthformer, detect end-of-stream,
@@ -222,7 +232,6 @@ impl<'a> AudioOutputDecoder<'a> {
             )
         };
         self.time_detokenizer += t1.elapsed();
-        self.all_spectrum.extend_from_slice(&spectrum);
 
         let pcm = self.streamer.feed_frames(&spectrum);
         self.streamed_samples += pcm.len();
@@ -279,7 +288,59 @@ impl<'a> AudioOutputDecoder<'a> {
             )
         };
         self.time_detokenizer += t1.elapsed();
-        self.all_spectrum.extend_from_slice(&spectrum);
+
+        let pcm = self.streamer.feed_frames(&spectrum);
+        self.streamed_samples += pcm.len();
+
+        Ok(FrameOutcome::Codes {
+            audio_embedding,
+            pcm,
+        })
+    }
+
+    /// Async version of [`Self::decode_frame_async`] taking a GPU hidden buffer directly.
+    #[cfg(feature = "gpu")]
+    pub async fn decode_frame_from_gpu_hidden_async(
+        &mut self,
+        hidden_buf: &wgpu::Buffer,
+    ) -> anyhow::Result<FrameOutcome> {
+        let t0 = Instant::now();
+        let codes = if let (true, Some(g)) = (self.use_gpu_df, self.gpu) {
+            g.sample_audio_frame_from_gpu_hidden_async(hidden_buf, self.audio_temperature, self.audio_top_k)
+                .await?
+        } else {
+            anyhow::bail!("GPU hidden buffer handoff requires GPU depthformer");
+        };
+        self.time_depthformer += t0.elapsed();
+
+        if codes[0] == AUDIO_END_CODE {
+            return Ok(FrameOutcome::End);
+        }
+
+        self.audio_frames += 1;
+        let audio_embedding = embed_audio_token(self.weights, &codes);
+
+        if !self.streaming {
+            self.all_codes.extend_from_slice(&codes);
+            return Ok(FrameOutcome::Codes {
+                audio_embedding,
+                pcm: vec![],
+            });
+        }
+
+        let t1 = Instant::now();
+        let spectrum = if let Some(g) = self.gpu {
+            g.detokenize_to_spectrum_async(self.detok_weights, &codes)
+                .await?
+        } else {
+            detokenize_to_spectrum(
+                self.detok_weights,
+                self.weights,
+                &mut self.detok_state,
+                &codes,
+            )
+        };
+        self.time_detokenizer += t1.elapsed();
 
         let pcm = self.streamer.feed_frames(&spectrum);
         self.streamed_samples += pcm.len();
@@ -294,7 +355,7 @@ impl<'a> AudioOutputDecoder<'a> {
     /// If streaming was already performed during decoding, returns the
     /// accumulated streamed sample count.
     pub fn finish(&mut self, mut sink: impl FnMut(&[f32], u32)) -> usize {
-        if self.streamed_samples > 0 {
+        if self.streaming {
             let remaining = self.streamer.flush();
             if !remaining.is_empty() {
                 sink(&remaining, self.detok_weights.config.sample_rate as u32);
@@ -343,7 +404,7 @@ impl<'a> AudioOutputDecoder<'a> {
         &mut self,
         mut sink: impl FnMut(&[f32], u32),
     ) -> anyhow::Result<usize> {
-        if self.streamed_samples > 0 {
+        if self.streaming {
             let remaining = self.streamer.flush();
             if !remaining.is_empty() {
                 sink(&remaining, self.detok_weights.config.sample_rate as u32);
@@ -510,7 +571,12 @@ pub fn generate_audio(
                     let outcome = decoder.decode_frame(&emb);
                     let audio_emb = match outcome {
                         FrameOutcome::End => {
-                            text_done = true;
+                            if text_done {
+                                break;
+                            }
+                            logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
+                            next_token = sampler.sample(&mut logits);
+                            pos += 1;
                             break;
                         }
                         FrameOutcome::Codes {
@@ -541,6 +607,10 @@ pub fn generate_audio(
                     emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
                     pos += 1;
                     generated += 1;
+                }
+
+                if text_done {
+                    break;
                 }
 
                 // Switch back to text.
@@ -603,11 +673,6 @@ pub fn generate_audio(
                 };
                 modality_budget = modality_budget.saturating_sub(1);
 
-                // Feed codes back as embedding → next hidden state.
-                emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
-                pos += 1;
-                generated += 1;
-
                 if generated >= config.max_tokens || pos >= model_config.max_seq_len {
                     break;
                 }
@@ -622,6 +687,11 @@ pub fn generate_audio(
                     pos += 1;
                     break;
                 }
+
+                // Feed codes back as embedding → next hidden state.
+                emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
+                pos += 1;
+                generated += 1;
             }
         }
     }

@@ -2511,7 +2511,7 @@ fn main() -> Result<()> {
                 // {metal, wgpu, cpu}. Default: metal on macOS+metal, else cpu.
                 let audio_gpu_choice = std::env::var("CERA_AUDIO_GPU").ok();
                 let audio_gpu_choice = audio_gpu_choice.as_deref().unwrap_or(
-                    if cfg!(all(feature = "metal", target_os = "macos")) {
+                    if cfg!(all(feature = "metal", any(target_os = "macos", target_os = "ios"))) {
                         "metal"
                     } else {
                         "cpu"
@@ -2521,7 +2521,7 @@ fn main() -> Result<()> {
                     match audio_gpu_choice {
                         "cpu" => None,
                         "metal" => {
-                            #[cfg(all(feature = "metal", target_os = "macos"))]
+                            #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
                             {
                                 match cera::model::metal_audio_decoder::MetalAudioDecoder::from_gguf(
                                     &voc_gguf,
@@ -2538,7 +2538,7 @@ fn main() -> Result<()> {
                                     }
                                 }
                             }
-                            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+                            #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
                             {
                                 eprintln!(
                                     "CERA_AUDIO_GPU=metal but the metal backend is not built; using CPU"
@@ -2603,8 +2603,8 @@ fn main() -> Result<()> {
                 }
 
                 let mut all_pcm = Vec::new();
-                let sys = system.as_deref().unwrap();
-                let mode = if sys == "Respond with interleaved text and audio." {
+                let sys = system.as_deref().unwrap_or("");
+                let mode = if sys.contains("interleaved") {
                     cera::audio_engine::AudioMode::Interleaved
                 } else {
                     cera::audio_engine::AudioMode::Sequential

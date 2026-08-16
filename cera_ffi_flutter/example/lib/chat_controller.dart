@@ -133,7 +133,8 @@ class ChatController extends ValueNotifier<ChatState> {
       final maxImageDim = prefs.getInt('cera_max_image_dim');
       final audioModeStr = prefs.getString('cera_audio_chat_mode');
       final audioMode = switch (audioModeStr) {
-        'tts' => AudioChatMode.textToSpeech,
+        'asr' || 'speechToText' => AudioChatMode.speechToText,
+        'tts' || 'textToSpeech' => AudioChatMode.textToSpeech,
         'textOnly' => AudioChatMode.textOnly,
         _ => AudioChatMode.interleaved,
       };
@@ -225,6 +226,7 @@ class ChatController extends ValueNotifier<ChatState> {
         await prefs.setInt('cera_max_image_dim', 0);
       }
       await prefs.setString('cera_audio_chat_mode', switch (newAudioMode) {
+        AudioChatMode.speechToText => 'asr',
         AudioChatMode.textToSpeech => 'tts',
         AudioChatMode.textOnly => 'textOnly',
         AudioChatMode.interleaved => 'interleaved',
@@ -615,6 +617,7 @@ class ChatController extends ValueNotifier<ChatState> {
 
     final durationSec = intent.pcmSamples.length / intent.sampleRate;
     final promptText = intent.prompt.trim();
+    final isAsr = value.settings.audioChatMode == AudioChatMode.speechToText;
 
     final userTurn = Turn(
       role: 'user',
@@ -628,13 +631,48 @@ class ChatController extends ValueNotifier<ChatState> {
       text: '',
       modelName: value.loadedModel?.name,
       isGenerating: true,
-      statusText: 'Processing audio...',
+      statusText: isAsr ? 'Transcribing speech...' : 'Processing audio...',
     );
 
     final newTurns = List<Turn>.from(value.turns)
       ..addAll([userTurn, assistantTurn]);
 
     value = value.copyWith(turns: newTurns, isGenerating: true);
+
+    if (isAsr) {
+      try {
+        debugPrint(
+          '[cera:chat] Running Speech to Text (ASR) on ${intent.pcmSamples.length} samples at ${intent.sampleRate} Hz...',
+        );
+        final transcribed = await cera.transcribe(
+          intent.pcmSamples,
+          sampleRate: intent.sampleRate,
+        );
+        debugPrint('[cera:chat] ASR result: "$transcribed"');
+        final recognizedText = transcribed.trim().isNotEmpty
+            ? transcribed.trim()
+            : '(No speech detected)';
+        _updateLastTurn(
+          (t) => t.copyWith(
+            text: recognizedText,
+            isGenerating: false,
+            statusText: () => null,
+          ),
+        );
+        value = value.copyWith(isGenerating: false);
+        return;
+      } catch (err) {
+        _updateLastTurn(
+          (t) => t.copyWith(
+            isGenerating: false,
+            statusText: () => null,
+            text: 'Transcription failed: $err',
+          ),
+        );
+        value = value.copyWith(isGenerating: false);
+        return;
+      }
+    }
 
     try {
       debugPrint(
@@ -691,23 +729,34 @@ class ChatController extends ValueNotifier<ChatState> {
 
     final generatedAudioSamples = <double>[];
     final isTts = value.settings.audioChatMode == AudioChatMode.textToSpeech;
+    final shouldStreamAudio = (value.capabilities?.audioOut ?? false) &&
+        (value.settings.audioChatMode == AudioChatMode.interleaved ||
+            value.settings.audioChatMode == AudioChatMode.textToSpeech);
+
+    if (shouldStreamAudio) {
+      _audioPlayer.startStream(sampleRate: 24000);
+    }
 
     try {
       final stream = cera.generate(
         formattedPrompt,
+        maxTokens: 512,
         temperature: isTts ? 0.0 : null,
-        onAudio: (pcm, rate) {
-          debugPrint(
-            '[cera:chat] Received ${pcm.length} audio samples at $rate Hz',
-          );
-          generatedAudioSamples.addAll(pcm);
-          _updateLastTurn(
-            (t) => t.copyWith(
-              audioSamples: generatedAudioSamples,
-              audioDurationSeconds: generatedAudioSamples.length / rate,
-            ),
-          );
-        },
+        onAudio: shouldStreamAudio
+            ? (pcm, rate) {
+                debugPrint(
+                  '[cera:chat] Received ${pcm.length} audio samples at $rate Hz',
+                );
+                generatedAudioSamples.addAll(pcm);
+                _audioPlayer.appendChunk(pcm);
+                _updateLastTurn(
+                  (t) => t.copyWith(
+                    audioSamples: List.of(generatedAudioSamples),
+                    audioDurationSeconds: generatedAudioSamples.length / rate,
+                  ),
+                );
+              }
+            : null,
       );
 
       final sub = stream.listen(
@@ -756,6 +805,7 @@ class ChatController extends ValueNotifier<ChatState> {
       );
     } finally {
       stopwatch.stop();
+      _audioPlayer.finishStream();
       _generationSub = null;
       _generationCompleter = null;
     }
@@ -813,16 +863,16 @@ class ChatController extends ValueNotifier<ChatState> {
 
     if (!_disposed) {
       value = value.copyWith(isGenerating: false);
-      if (generatedAudioSamples.isNotEmpty) {
-        unawaited(
-          _audioPlayer.playPcm(generatedAudioSamples, sampleRate: 24000),
-        );
-      }
     }
   }
 
   Future<void> _onStopGeneration() async {
     _audioPlayer.stop();
+    if (_ceraEngine != null) {
+      try {
+        await _ceraEngine?.cancel();
+      } catch (_) {}
+    }
     if (_generationSub != null) {
       await _generationSub?.cancel();
       _generationSub = null;

@@ -70,43 +70,41 @@
     class CeraAudioStreamer {
       constructor(sampleRate = 24000) {
         this.sampleRate = sampleRate;
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        this.ctx = new AudioCtx({ sampleRate: this.sampleRate });
+        this.nextStartTime = this.ctx.currentTime;
         this.isPlaying = true;
-        this.queue = [];
-        console.info(`[cera:audio] streamer session started at ${sampleRate}Hz`);
+        console.info(`[cera:audio] live streamer session started at ${sampleRate}Hz`);
       }
 
       appendChunk(raw) {
         if (!this.isPlaying || !raw) return;
         const data = raw instanceof Float32Array ? raw : new Float32Array(raw);
         if (data.length === 0) return;
-        this.queue.push(data);
+        if (this.ctx.state === 'suspended') {
+          this.ctx.resume().catch(() => {});
+        }
+        const buf = this.ctx.createBuffer(1, data.length, this.sampleRate);
+        buf.copyToChannel(data, 0);
+        const src = this.ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(this.ctx.destination);
+        const cur = this.ctx.currentTime;
+        const startTime = Math.max(cur + 0.005, this.nextStartTime);
+        src.start(startTime);
+        this.nextStartTime = startTime + buf.duration;
       }
 
       finish() {
-        if (!this.isPlaying || this.queue.length === 0) return;
-        let totalSamples = 0;
-        for (let i = 0; i < this.queue.length; i++) {
-          totalSamples += this.queue[i].length;
-        }
-        if (totalSamples === 0) {
-          this.queue = [];
-          return;
-        }
-        const merged = new Float32Array(totalSamples);
-        let offset = 0;
-        for (let i = 0; i < this.queue.length; i++) {
-          merged.set(this.queue[i], offset);
-          offset += this.queue[i].length;
-        }
-        this.queue = [];
-        window.ceraPlayAudio(merged, this.sampleRate);
+        console.info('[cera:html] streamer finish called');
       }
 
       stop() {
         console.info('[cera:html] streamer stop called');
         this.isPlaying = false;
-        this.queue = [];
-        window.ceraStopAudio();
+        if (this.ctx && this.ctx.state !== 'closed') {
+          try { this.ctx.close(); } catch (_) {}
+        }
       }
     }
 
@@ -223,23 +221,9 @@
       }
     };
 
-    window.ceraStartAudioStream = function(sampleRate) {
-      console.info(`[cera:html] ceraStartAudioStream called (sampleRate=${sampleRate})`);
-      if (activeStreamer) activeStreamer.stop();
-      activeStreamer = new CeraAudioStreamer(sampleRate || 24000);
-    };
-
-    window.ceraAppendAudioStreamChunk = function(raw) {
-      if (activeStreamer) {
-        activeStreamer.appendChunk(raw);
-      } else {
-        console.warn('[cera:html] ceraAppendAudioStreamChunk called but no activeStreamer exists!');
-      }
-    };
-
     window.ceraDownloadFile = function(bytes, filename, mimeType) {
       try {
-        const data = bytes instanceof Uint8List || bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        const data = (typeof Uint8Array !== 'undefined' && bytes instanceof Uint8Array) ? bytes : new Uint8Array(bytes);
         const blob = new Blob([data], { type: mimeType || 'application/octet-stream' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
