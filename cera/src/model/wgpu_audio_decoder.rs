@@ -860,13 +860,11 @@ impl WgpuAudioDecoder {
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
         let (n_frames, spec_per_frame) =
             self.encode_detokenize_to_spectrum(&mut enc, cpu_weights, codes);
-        let pending = {
-            self.ctx.submit_encoder(enc);
-            self.ctx.begin_download(
-                &self.spectrum_buf,
-                (n_frames * spec_per_frame * std::mem::size_of::<f32>()) as u64,
-            )
-        };
+        let pending = self.ctx.begin_download_with_encoder(
+            enc,
+            &self.spectrum_buf,
+            (n_frames * spec_per_frame * std::mem::size_of::<f32>()) as u64,
+        );
         let bytes = pending.recv().await?;
         let result: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
         Ok(result)
@@ -1018,13 +1016,11 @@ impl WgpuAudioDecoder {
                 None => return Ok(vec![]),
             };
 
-        let pending = {
-            self.ctx.submit_encoder(enc);
-            self.ctx.begin_download(
-                &pcm_buf,
-                (total_samples * std::mem::size_of::<f32>()) as u64,
-            )
-        };
+        let pending = self.ctx.begin_download_with_encoder(
+            enc,
+            &pcm_buf,
+            (total_samples * std::mem::size_of::<f32>()) as u64,
+        );
         let bytes = pending.recv().await?;
         let mut pcm: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
         let padding = (n_fft - hop_length) / 2;

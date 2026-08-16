@@ -1207,6 +1207,11 @@ enum DecodeTail {
     Logits(TailArgmax),
     /// Output norm only, leaving the normed hidden state in `hidden_buf`.
     Hidden,
+    /// Output norm only, leaving the normed hidden state in `hidden_buf` and returning
+    /// the unsubmitted command encoder for single-pass download staging.
+    HiddenUnsubmitted,
+    /// Output norm and logits/argmax, returning the unsubmitted command encoder.
+    LogitsUnsubmitted(TailArgmax),
 }
 
 impl GpuLfm2Model {
@@ -3563,9 +3568,9 @@ impl GpuLfm2Model {
         pos: usize,
         state: &mut InferenceState,
         tail: DecodeTail,
-    ) {
+    ) -> Option<wgpu::CommandEncoder> {
         assert_eq!(tokens.len(), 1, "GPU forward expects single token");
-        self.forward_inner_compute_tail_seeded(HiddenSeed::Token(tokens[0]), pos, state, tail);
+        self.forward_inner_compute_tail_seeded(HiddenSeed::Token(tokens[0]), pos, state, tail)
     }
 
     /// As [`Self::forward_inner_compute_tail`], but the initial hidden state
@@ -3578,7 +3583,7 @@ impl GpuLfm2Model {
         pos: usize,
         state: &mut InferenceState,
         tail: DecodeTail,
-    ) {
+    ) -> Option<wgpu::CommandEncoder> {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let hs32 = hs as u32;
@@ -4446,62 +4451,74 @@ impl GpuLfm2Model {
             hs32,
             cfg.rms_norm_eps,
         );
-        let DecodeTail::Logits(argmax) = tail else {
-            self.submit_and_wait(enc);
-            self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
-            state.seq_len += 1;
-            self.ctx.finish_profiler();
-            return;
-        };
-        self.encode_lm_head(&mut enc, &self.hidden_buf, &self.logits_buf);
-        // Granite divides the logits by `logits_scaling` (identity elsewhere).
-        if let Some(params) = self.logit_scale_params.as_ref() {
-            let scale_bg = self
-                .ctx
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("logit_scale_bg"),
-                    layout: &self.pipelines.scale_f32.get_bind_group_layout(0),
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.logits_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: params.as_entire_binding(),
-                        },
-                    ],
-                });
-            // Was unprofiled; routing it through the choke point gives it a
-            // span too, which is harmless — `begin_profile_span` returns `None`
-            // once the query budget is spent.
-            let mut pass = self.ctx.begin_pass(&mut enc, "logit_scale");
-            self.dispatch_into(
-                &mut pass,
-                &self.pipelines.scale_f32,
-                &scale_bg,
-                ((cfg.vocab_size as u32).div_ceil(256), 1, 1),
-            );
-            drop(pass);
+        match tail {
+            DecodeTail::Hidden => {
+                self.submit_and_wait(enc);
+                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
+                state.seq_len += 1;
+                self.ctx.finish_profiler();
+                None
+            }
+            DecodeTail::HiddenUnsubmitted => {
+                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
+                state.seq_len += 1;
+                self.ctx.finish_profiler();
+                Some(enc)
+            }
+            DecodeTail::Logits(argmax) | DecodeTail::LogitsUnsubmitted(argmax) => {
+                self.encode_lm_head(&mut enc, &self.hidden_buf, &self.logits_buf);
+                // Granite divides the logits by `logits_scaling` (identity elsewhere).
+                if let Some(params) = self.logit_scale_params.as_ref() {
+                    let scale_bg = self
+                        .ctx
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("logit_scale_bg"),
+                            layout: &self.pipelines.scale_f32.get_bind_group_layout(0),
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: self.logits_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: params.as_entire_binding(),
+                                },
+                            ],
+                        });
+                    let mut pass = self.ctx.begin_pass(&mut enc, "logit_scale");
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.scale_f32,
+                        &scale_bg,
+                        ((cfg.vocab_size as u32).div_ceil(256), 1, 1),
+                    );
+                    drop(pass);
+                }
+                if argmax != TailArgmax::None {
+                    self.encode_argmax_pass(&mut enc);
+                }
+                if argmax == TailArgmax::DispatchAndStage {
+                    // Stage the 4-byte result in this same submission.
+                    enc.copy_buffer_to_buffer(
+                        &self.argmax_out_buf,
+                        0,
+                        &self.argmax_readback_buf,
+                        0,
+                        4,
+                    );
+                }
+                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
+                state.seq_len += 1;
+                self.ctx.finish_profiler();
+                if matches!(tail, DecodeTail::LogitsUnsubmitted(_)) {
+                    Some(enc)
+                } else {
+                    self.submit_and_wait(enc);
+                    None
+                }
+            }
         }
-        if argmax != TailArgmax::None {
-            self.encode_argmax_pass(&mut enc);
-        }
-        if argmax == TailArgmax::DispatchAndStage {
-            // Stage the 4-byte result in this same submission. On its own it is
-            // another GPU round trip (~1.5 ms) for a 4-byte copy — the handoff
-            // is cheap, waiting for the submission to execute and signal is not.
-            enc.copy_buffer_to_buffer(&self.argmax_out_buf, 0, &self.argmax_readback_buf, 0, 4);
-        }
-        self.submit_and_wait(enc);
-
-        // 4. Update seq_len + profile bookkeeping. Logits are now in
-        // `logits_buf` on the GPU; the caller decides how to consume
-        // them (full readback vs. argmax-then-u32-readback).
-        self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
-        state.seq_len += 1;
-        self.ctx.finish_profiler();
     }
 
     /// Encode the argmax compute pass into `enc`. Shared by the sync and async
@@ -4569,18 +4586,20 @@ impl GpuLfm2Model {
             let _lora_guard = self.resolve_lora(state);
             // Keep the KV-write slot in lockstep with the RoPE position.
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
-            // `Dispatch`, not `DispatchAndStage`: this path reads through
-            // `begin_download`'s per-call buffer, so staging into the shared one
-            // would be a copy nothing reads.
-            self.forward_inner_compute_tail(
-                &[token],
-                pos,
-                state,
-                DecodeTail::Logits(TailArgmax::Dispatch),
-            );
+            let enc = self
+                .forward_inner_compute_tail(
+                    &[token],
+                    pos,
+                    state,
+                    DecodeTail::LogitsUnsubmitted(TailArgmax::Dispatch),
+                )
+                .expect("LogitsUnsubmitted returned None");
 
-            self.ctx
-                .begin_download(&self.argmax_out_buf, std::mem::size_of::<u32>() as u64)
+            self.ctx.begin_download_with_encoder(
+                enc,
+                &self.argmax_out_buf,
+                std::mem::size_of::<u32>() as u64,
+            )
         };
 
         let bytes = pending.recv().await?;
@@ -4616,16 +4635,17 @@ impl GpuLfm2Model {
             let _lora_guard = self.resolve_lora(state);
             // Keep the KV-write slot in lockstep with the RoPE position.
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
-            // `None`: the argmax would be computed and then ignored, and its
-            // staging copy is a second readback nothing reads.
-            self.forward_inner_compute_tail(
-                &[token],
-                pos,
-                state,
-                DecodeTail::Logits(TailArgmax::None),
-            );
+            let enc = self
+                .forward_inner_compute_tail(
+                    &[token],
+                    pos,
+                    state,
+                    DecodeTail::LogitsUnsubmitted(TailArgmax::None),
+                )
+                .expect("LogitsUnsubmitted returned None");
 
-            self.ctx.begin_download(
+            self.ctx.begin_download_with_encoder(
+                enc,
                 &self.logits_buf,
                 (vocab * std::mem::size_of::<f32>()) as u64,
             )
@@ -4651,8 +4671,11 @@ impl GpuLfm2Model {
             let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
             let _lora_guard = self.resolve_lora(state);
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
-            self.forward_inner_compute_tail(&[token], pos, state, DecodeTail::Hidden);
-            self.ctx.begin_download(
+            let enc = self
+                .forward_inner_compute_tail(&[token], pos, state, DecodeTail::HiddenUnsubmitted)
+                .expect("HiddenUnsubmitted returned None");
+            self.ctx.begin_download_with_encoder(
+                enc,
                 &self.hidden_buf,
                 (hidden_size * std::mem::size_of::<f32>()) as u64,
             )
@@ -4675,13 +4698,16 @@ impl GpuLfm2Model {
             let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
             let _lora_guard = self.resolve_lora(state);
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
-            self.forward_inner_compute_tail_seeded(
-                HiddenSeed::Embedding(embedding),
-                pos,
-                state,
-                DecodeTail::Hidden,
-            );
-            self.ctx.begin_download(
+            let enc = self
+                .forward_inner_compute_tail_seeded(
+                    HiddenSeed::Embedding(embedding),
+                    pos,
+                    state,
+                    DecodeTail::HiddenUnsubmitted,
+                )
+                .expect("HiddenUnsubmitted returned None");
+            self.ctx.begin_download_with_encoder(
+                enc,
                 &self.hidden_buf,
                 (hidden_size * std::mem::size_of::<f32>()) as u64,
             )
@@ -4704,13 +4730,16 @@ impl GpuLfm2Model {
             let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
             let _lora_guard = self.resolve_lora(state);
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
-            self.forward_inner_compute_tail_seeded(
-                HiddenSeed::Embedding(embedding),
-                pos,
-                state,
-                DecodeTail::Logits(TailArgmax::None),
-            );
-            self.ctx.begin_download(
+            let enc = self
+                .forward_inner_compute_tail_seeded(
+                    HiddenSeed::Embedding(embedding),
+                    pos,
+                    state,
+                    DecodeTail::LogitsUnsubmitted(TailArgmax::None),
+                )
+                .expect("LogitsUnsubmitted returned None");
+            self.ctx.begin_download_with_encoder(
+                enc,
                 &self.logits_buf,
                 (vocab_size * std::mem::size_of::<f32>()) as u64,
             )
@@ -4732,14 +4761,19 @@ impl GpuLfm2Model {
             let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
             let _lora_guard = self.resolve_lora(state);
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
-            self.forward_inner_compute_tail_seeded(
-                HiddenSeed::Embedding(embedding),
-                pos,
-                state,
-                DecodeTail::Logits(TailArgmax::Dispatch),
-            );
-            self.ctx
-                .begin_download(&self.argmax_out_buf, std::mem::size_of::<u32>() as u64)
+            let enc = self
+                .forward_inner_compute_tail_seeded(
+                    HiddenSeed::Embedding(embedding),
+                    pos,
+                    state,
+                    DecodeTail::LogitsUnsubmitted(TailArgmax::Dispatch),
+                )
+                .expect("LogitsUnsubmitted returned None");
+            self.ctx.begin_download_with_encoder(
+                enc,
+                &self.argmax_out_buf,
+                std::mem::size_of::<u32>() as u64,
+            )
         };
         let bytes = pending.recv().await?;
         let token = bytemuck::pod_read_unaligned::<u32>(&bytes);

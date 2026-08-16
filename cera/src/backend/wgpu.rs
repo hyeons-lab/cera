@@ -703,6 +703,22 @@ impl GpuContext {
     /// sync path reuses) — per-token readback alloc is fine for the current
     /// prototype (a staging-reuse perf pass is a follow-up).
     pub(crate) fn begin_download(&self, buffer: &wgpu::Buffer, size: u64) -> PendingReadback {
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("download-async"),
+            });
+        self.begin_download_with_encoder(encoder, buffer, size)
+    }
+
+    /// Submit a GPU→CPU readback using an existing command encoder, fusing the
+    /// preceding GPU work and the staging copy into a single submission.
+    pub(crate) fn begin_download_with_encoder(
+        &self,
+        mut encoder: wgpu::CommandEncoder,
+        buffer: &wgpu::Buffer,
+        size: u64,
+    ) -> PendingReadback {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging-download-async"),
             size,
@@ -710,11 +726,6 @@ impl GpuContext {
             mapped_at_creation: false,
         });
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("download-async"),
-            });
         encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
         self.submit_encoder(encoder);
 
