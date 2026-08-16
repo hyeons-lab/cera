@@ -8,6 +8,7 @@ import 'chat_intent.dart';
 import 'chat_state.dart';
 import 'model_source.dart';
 import 'services/audio_player_service.dart';
+import 'services/bundle_size_probe.dart';
 
 /// MVI Controller / Store managing state transitions, Cera engine lifecycle,
 /// download progress, and token generation.
@@ -307,50 +308,84 @@ class ChatController extends ValueNotifier<ChatState> {
       pendingImageName: () => null,
     );
 
-    final Map<String, ({int downloaded, int? total})> fileDownloads = {};
+    Map<String, int> knownFileSizes = {};
+    if (isBundle && bundleName != null && quant != null) {
+      try {
+        knownFileSizes = await probeBundleFileSizes(bundleName, quant);
+      } catch (_) {}
+    }
+
+    final uniqueSizes = <String, int>{};
+    for (final entry in knownFileSizes.entries) {
+      final key = entry.key.contains('/')
+          ? entry.key.split('/').last
+          : entry.key;
+      if (!key.endsWith('.json')) {
+        uniqueSizes[key] = entry.value;
+      }
+    }
+    final int expectedTotalBytes = uniqueSizes.values.fold<int>(
+      0,
+      (a, b) => a + b,
+    );
+
+    final Map<String, int> fileDownloaded = {};
+    final Map<String, int> fileTotals = {};
+    double maxFraction = 0.0;
 
     try {
       final cera = await openFn((progress) {
         if (_disposed) return;
-        fileDownloads[progress.url] = (
-          downloaded: progress.bytesDownloaded,
-          total: progress.totalBytes,
-        );
-
-        final totalDownloaded = fileDownloads.values.fold<int>(
-          0,
-          (sum, f) => sum + f.downloaded,
-        );
-
-        int? sumTotal;
-        bool allTotalsKnown = true;
-        int runningTotal = 0;
-        for (final f in fileDownloads.values) {
-          if (f.total != null) {
-            runningTotal += f.total!;
-          } else {
-            allTotalsKnown = false;
-          }
-        }
-        if (allTotalsKnown && runningTotal > 0) {
-          sumTotal = runningTotal;
-        }
-
-        final fraction = (sumTotal != null && sumTotal > 0)
-            ? (totalDownloaded / sumTotal).clamp(0.0, 1.0)
-            : null;
-
         final fileName = progress.url.contains('/')
             ? progress.url.split('/').last
             : progress.url;
+
+        // Skip tiny manifest JSON from triggering 100% false spikes
+        if (fileName.endsWith('.json') && expectedTotalBytes > 0) {
+          return;
+        }
+
+        fileDownloaded[fileName] = progress.bytesDownloaded;
+        if (progress.totalBytes != null && progress.totalBytes! > 0) {
+          fileTotals[fileName] = progress.totalBytes!;
+        } else if (knownFileSizes.containsKey(fileName)) {
+          fileTotals[fileName] = knownFileSizes[fileName]!;
+        } else if (knownFileSizes.containsKey(progress.url)) {
+          fileTotals[fileName] = knownFileSizes[progress.url]!;
+        }
+
+        int totalBytes = expectedTotalBytes;
+        if (totalBytes <= 0) {
+          totalBytes = fileTotals.values.fold<int>(0, (a, b) => a + b);
+        } else {
+          for (final entry in fileTotals.entries) {
+            if (!uniqueSizes.containsKey(entry.key)) {
+              totalBytes += entry.value;
+            }
+          }
+        }
+
+        final totalDownloaded = fileDownloaded.values.fold<int>(
+          0,
+          (sum, b) => sum + b,
+        );
+
+        double? fraction;
+        if (totalBytes > 0) {
+          final computed = (totalDownloaded / totalBytes).clamp(0.0, 1.0);
+          if (computed >= maxFraction) {
+            maxFraction = computed;
+          }
+          fraction = maxFraction;
+        }
 
         final downloadedMb = (totalDownloaded / 1024 / 1024).toStringAsFixed(1);
         final pctStr = fraction != null
             ? '${(fraction * 100).toStringAsFixed(0)}%'
             : '$downloadedMb MB';
 
-        final totalStr = sumTotal != null
-            ? '${(sumTotal / 1024 / 1024).toStringAsFixed(1)} MB'
+        final totalStr = totalBytes > 0
+            ? '${(totalBytes / 1024 / 1024).toStringAsFixed(1)} MB'
             : null;
 
         final bytesInfo = totalStr != null
@@ -639,7 +674,10 @@ class ChatController extends ValueNotifier<ChatState> {
     );
 
     final generatedAudioSamples = <double>[];
-    _audioPlayer.startStream();
+    final isTts = value.settings.audioChatMode == AudioChatMode.textToSpeech;
+    if (!isTts) {
+      _audioPlayer.startStream();
+    }
 
     try {
       final stream = cera.generate(
@@ -649,7 +687,9 @@ class ChatController extends ValueNotifier<ChatState> {
             '[cera:chat] Received ${pcm.length} audio samples at $rate Hz',
           );
           generatedAudioSamples.addAll(pcm);
-          _audioPlayer.appendChunk(pcm);
+          if (!isTts) {
+            _audioPlayer.appendChunk(pcm);
+          }
           _updateLastTurn(
             (t) => t.copyWith(
               audioSamples: generatedAudioSamples,
@@ -752,6 +792,11 @@ class ChatController extends ValueNotifier<ChatState> {
 
     if (!_disposed) {
       value = value.copyWith(isGenerating: false);
+      if (generatedAudioSamples.isNotEmpty && isTts) {
+        unawaited(
+          _audioPlayer.playPcm(generatedAudioSamples, sampleRate: 24000),
+        );
+      }
     }
   }
 

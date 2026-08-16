@@ -2815,7 +2815,6 @@ mod webgpu {
                 min_p: def_min_p.unwrap_or(defaults.min_p),
                 repetition_penalty: def_rep_pen.unwrap_or(defaults.repetition_penalty),
                 seed,
-                ..defaults
             };
             let mut sampler =
                 (cfg.temperature > 0.0 && cfg.top_k != 1).then(|| cera::sampler::Sampler::new(cfg));
