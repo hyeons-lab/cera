@@ -2508,7 +2508,7 @@ impl GpuLfm2Model {
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
-                            resource: self.normed_buf.as_entire_binding(),
+                            resource: self.ffn_input_buf.as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
@@ -3973,7 +3973,7 @@ impl GpuLfm2Model {
                 // note in the module docs.
                 {
                     let mut pass = self.ctx.begin_pass(&mut enc, "conv");
-                    self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
+                    self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, norm_bg, (1, 1, 1));
                     self.dispatch_gemv_into(&mut pass, in_w, in_bg);
                     if let Some((t, (bg_a, bg_b))) = &in_lora_bgs {
                         self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
@@ -3981,7 +3981,7 @@ impl GpuLfm2Model {
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.conv1d_fused,
-                        &conv_fused_bg,
+                        conv_fused_bg,
                         (hs32.div_ceil(256), 1, 1),
                     );
                     self.dispatch_gemv_into(&mut pass, out_w, out_bg);
@@ -3991,7 +3991,7 @@ impl GpuLfm2Model {
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.add_inplace,
-                        &add_bg,
+                        add_bg,
                         (hs32.div_ceil(256), 1, 1),
                     );
                 }
@@ -4143,7 +4143,7 @@ impl GpuLfm2Model {
                 );
                 {
                     let mut pass = self.ctx.begin_pass(&mut enc, "attn_pre");
-                    self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
+                    self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, norm_bg, (1, 1, 1));
                     self.dispatch_gemv_into(&mut pass, q_w, q_bg);
                     self.dispatch_gemv_into(&mut pass, k_w, k_bg);
                     self.dispatch_gemv_into(&mut pass, v_w, v_bg);
@@ -4202,7 +4202,7 @@ impl GpuLfm2Model {
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.rope,
-                        &rope_bg,
+                        rope_bg,
                         (max_pairs.div_ceil(256), 1, 1),
                     );
                 }
@@ -4295,7 +4295,7 @@ impl GpuLfm2Model {
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.scaled_add_inplace,
-                        &add_bg,
+                        add_bg,
                         (hs32.div_ceil(256), 1, 1),
                     );
                     if let Some((t, (bg_a, bg_b))) = o_lora_bgs.as_ref() {
@@ -4384,7 +4384,7 @@ impl GpuLfm2Model {
             {
                 let mut pass = self.ctx.begin_pass(&mut enc, "ffn");
                 // rmsnorm
-                self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
+                self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, norm_bg, (1, 1, 1));
                 // gate + up GEMVs
                 self.dispatch_gemv_into(&mut pass, &dense.gate, gate_bg);
                 self.dispatch_gemv_into(&mut pass, &dense.up, up_bg);
@@ -4399,7 +4399,7 @@ impl GpuLfm2Model {
                 self.dispatch_into(
                     &mut pass,
                     &self.pipelines.silu_mul_inplace,
-                    &silu_bg,
+                    silu_bg,
                     ((dense.gate.tensor.shape[0] as u32).div_ceil(256), 1, 1),
                 );
                 // down GEMV
@@ -4408,7 +4408,7 @@ impl GpuLfm2Model {
                 self.dispatch_into(
                     &mut pass,
                     &self.pipelines.scaled_add_inplace,
-                    &add_bg,
+                    add_bg,
                     (hs32.div_ceil(256), 1, 1),
                 );
                 // LoRA ffn-down delta into the post-residual hidden state.
