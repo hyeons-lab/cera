@@ -691,9 +691,6 @@ class ChatController extends ValueNotifier<ChatState> {
 
     final generatedAudioSamples = <double>[];
     final isTts = value.settings.audioChatMode == AudioChatMode.textToSpeech;
-    if (!isTts) {
-      _audioPlayer.startStream();
-    }
 
     try {
       final stream = cera.generate(
@@ -704,9 +701,6 @@ class ChatController extends ValueNotifier<ChatState> {
             '[cera:chat] Received ${pcm.length} audio samples at $rate Hz',
           );
           generatedAudioSamples.addAll(pcm);
-          if (!isTts) {
-            _audioPlayer.appendChunk(pcm);
-          }
           _updateLastTurn(
             (t) => t.copyWith(
               audioSamples: generatedAudioSamples,
@@ -820,13 +814,9 @@ class ChatController extends ValueNotifier<ChatState> {
     if (!_disposed) {
       value = value.copyWith(isGenerating: false);
       if (generatedAudioSamples.isNotEmpty) {
-        if (isTts) {
-          unawaited(
-            _audioPlayer.playPcm(generatedAudioSamples, sampleRate: 24000),
-          );
-        } else {
-          _audioPlayer.finishStream();
-        }
+        unawaited(
+          _audioPlayer.playPcm(generatedAudioSamples, sampleRate: 24000),
+        );
       }
     }
   }
