@@ -305,8 +305,7 @@ impl<'a> AudioOutputDecoder<'a> {
 
         if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
             let t1 = Instant::now();
-            for chunk in self.all_codes.chunks_exact(8) {
-                let codes: [i32; 8] = chunk.try_into().unwrap_or([0; 8]);
+            for &codes in self.all_codes.as_chunks::<8>().0 {
                 let spectrum = if let Some(g) = self.gpu {
                     g.detokenize_to_spectrum(self.detok_weights, &codes)
                 } else {
@@ -355,8 +354,7 @@ impl<'a> AudioOutputDecoder<'a> {
 
         if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
             let t1 = Instant::now();
-            for chunk in self.all_codes.chunks_exact(8) {
-                let codes: [i32; 8] = chunk.try_into().unwrap_or([0; 8]);
+            for &codes in self.all_codes.as_chunks::<8>().0 {
                 let spectrum = if let Some(g) = self.gpu {
                     g.detokenize_to_spectrum_async(self.detok_weights, &codes)
                         .await?
