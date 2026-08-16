@@ -36,10 +36,9 @@ Future<Map<String, int>> probeBundleFileSizes(
       final val = loadTime[key];
       if (val is String && val.trim().isNotEmpty) {
         final trimmed = val.trim();
-        final resolved =
-            trimmed.startsWith('http')
-                ? trimmed
-                : manifestUri.resolve(trimmed).toString();
+        final resolved = trimmed.startsWith('http')
+            ? trimmed
+            : manifestUri.resolve(trimmed).toString();
         fileUrls.add(resolved);
       }
     }
@@ -52,9 +51,9 @@ Future<Map<String, int>> probeBundleFileSizes(
           final headReq = await client
               .headUrl(uri)
               .timeout(const Duration(seconds: 3));
-          final headRes = await headReq
-              .close()
-              .timeout(const Duration(seconds: 3));
+          final headRes = await headReq.close().timeout(
+            const Duration(seconds: 3),
+          );
           if (headRes.contentLength > 0) {
             sizes[url] = headRes.contentLength;
             final fileName = url.split('/').last;
