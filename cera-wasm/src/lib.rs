@@ -2937,7 +2937,7 @@ mod webgpu {
                             generated += 1;
                         }
 
-                        dec.finish(|pcm, rate| {
+                        dec.finish_async(|pcm, rate| {
                             if !pcm.is_empty()
                                 && let Some(cb) = on_audio
                             {
@@ -2945,7 +2945,9 @@ mod webgpu {
                                 let rate_val = JsValue::from_f64(rate as f64);
                                 let _ = cb.call2(&JsValue::null(), &array, &rate_val);
                             }
-                        });
+                        })
+                        .await
+                        .map_err(map_err)?;
                     }
                     break;
                 }

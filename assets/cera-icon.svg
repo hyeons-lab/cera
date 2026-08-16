@@ -9,50 +9,52 @@
   </style>
 
   <g id="cera-helix-mark">
-    <!-- Strand 1: Upper-Left Gold Loop (Top Arch + Left Loop + Upper Diagonal) -->
+    <!-- Strand 1: Upper-Left Continuous Gold Loop (Closed on Left, Arches Over Top) -->
     <path id="strand-gold" d="
-      M 160 215 
-      C 125 175 125 115 170 75 
-      C 225 25 320 40 375 105 
-      C 390 122 384 142 365 148 
-      C 348 154 332 142 318 126 
-      C 280 82 210 75 174 110 
-      C 142 140 144 182 170 215 
-      L 242 290 
-      C 252 300 240 312 228 302 
-      L 160 215 Z" fill="#FBBF24" />
+      M 100 256 
+      C 100 155 170 75 270 75 
+      C 325 75 365 98 385 125 
+      C 395 138 388 155 370 160 
+      C 352 165 338 152 325 138 
+      C 290 102 230 95 190 135 
+      C 152 172 152 230 185 268 
+      L 255 345 
+      C 265 355 252 370 238 360 
+      L 155 275 
+      C 120 238 100 215 100 256 Z" fill="#FBBF24" />
 
-    <!-- Strand 2: Upper-Right Tangerine Wing (Top-Right Terminal Loop) -->
+    <!-- Strand 2: Top-Right Tangerine Wing (Smooth Return Loop) -->
     <path id="strand-tangerine" d="
-      M 375 105 
-      C 412 148 422 210 380 252 
-      C 365 268 344 262 338 244 
-      C 332 224 345 210 358 194 
-      C 382 165 376 132 352 110 
-      L 375 105 Z" fill="#FB923C" />
+      M 385 125 
+      C 418 165 425 225 385 270 
+      C 370 286 348 280 342 260 
+      C 336 240 348 225 362 208 
+      C 385 180 380 145 356 122 
+      L 385 125 Z" fill="#FB923C" />
 
-    <!-- Strand 3: Lower-Left Terracotta Loop (100% Exact Vertical Mirror of Strand 1 across y=256) -->
+    <!-- Strand 3: Lower Continuous Terracotta Loop (Exact Vertical Mirror across y=256, Closed on Left) -->
     <!-- Mirror formula: y' = 512 - y -->
     <path id="strand-terracotta" d="
-      M 160 297 
-      C 125 337 125 397 170 437 
-      C 225 487 320 472 375 407 
-      C 390 390 384 370 365 364 
-      C 348 358 332 370 318 386 
-      C 280 430 210 437 174 402 
-      C 142 372 144 330 170 297 
-      L 242 222 
-      C 252 212 240 200 228 210 
-      L 160 297 Z" fill="#EA580C" />
+      M 100 256 
+      C 100 357 170 437 270 437 
+      C 325 437 365 414 385 387 
+      C 395 374 388 357 370 352 
+      C 352 347 338 360 325 374 
+      C 290 410 230 417 190 377 
+      C 152 340 152 282 185 244 
+      L 255 167 
+      C 265 157 252 142 238 152 
+      L 155 237 
+      C 120 274 100 297 100 256 Z" fill="#EA580C" />
 
-    <!-- Strand 4: Lower-Right Rust Fold (100% Exact Vertical Mirror of Strand 2 across y=256) -->
+    <!-- Strand 4: Lower-Right Rust Fold (Exact Vertical Mirror across y=256) -->
     <!-- Mirror formula: y' = 512 - y -->
     <path id="strand-rust" d="
-      M 375 407 
-      C 412 364 422 302 380 260 
-      C 365 244 344 250 338 268 
-      C 332 288 345 302 358 318 
-      C 382 347 376 380 352 402 
-      L 375 407 Z" fill="#9A3412" />
+      M 385 387 
+      C 418 347 425 287 385 242 
+      C 370 226 348 232 342 252 
+      C 336 272 348 287 362 304 
+      C 385 332 380 367 356 390 
+      L 385 387 Z" fill="#9A3412" />
   </g>
 </svg>

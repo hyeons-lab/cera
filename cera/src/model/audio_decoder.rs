@@ -369,6 +369,17 @@ pub fn depthformer_forward_into(
     state: &mut DepthformerState,
     input: &[f32],
 ) {
+    state.cur.copy_from_slice(input);
+    depthformer_forward_step(weights, state);
+}
+
+/// In-place depthformer forward pass directly reading `state.depthformer_in`.
+pub fn depthformer_forward_inplace(weights: &AudioDecoderWeights, state: &mut DepthformerState) {
+    state.cur.copy_from_slice(&state.depthformer_in);
+    depthformer_forward_step(weights, state);
+}
+
+fn depthformer_forward_step(weights: &AudioDecoderWeights, state: &mut DepthformerState) {
     let cfg = &weights.depthformer_config;
     let n_embd = cfg.n_embd;
     let n_head = cfg.n_head;
@@ -381,8 +392,6 @@ pub fn depthformer_forward_into(
     let group_size = n_head / n_kv;
     let scale = 1.0 / (hd as f32).sqrt();
 
-    state.cur.copy_from_slice(input);
-
     for (il, lw) in weights.depthformer_layers.iter().enumerate() {
         state.residual.copy_from_slice(&state.cur);
 
@@ -391,9 +400,6 @@ pub fn depthformer_forward_into(
 
         // 2. Fused QKV projection → split.
         // Pre-quantize cur to Q8_0 once, reuse for QKV and later wo.
-        let nb = n_embd / 32;
-        state.q8_scales.resize(nb, 0.0);
-        state.q8_quants.resize(n_embd, 0);
         crate::backend::cpu::quantize_f32_to_q8_0_into(
             &state.cur,
             &mut state.q8_scales,
@@ -481,9 +487,6 @@ pub fn depthformer_forward_into(
         cpu::rmsnorm(&mut state.cur, &lw.ffn_norm, cfg.rms_norm_eps);
 
         // Pre-quantize cur for FFN gate + up (same input).
-        let nb = n_embd / 32;
-        state.q8_scales.resize(nb, 0.0);
-        state.q8_quants.resize(n_embd, 0);
         crate::backend::cpu::quantize_f32_to_q8_0_into(
             &state.cur,
             &mut state.q8_scales,
@@ -577,8 +580,7 @@ pub fn sample_audio_frame(
         }
 
         // 3. Run depthformer in-place.
-        let df_input = state.depthformer_in.clone();
-        depthformer_forward_into(weights, state, &df_input);
+        depthformer_forward_inplace(weights, state);
 
         // 4. RMSnorm → to_logits → sample.
         state.normed.copy_from_slice(&state.cur);

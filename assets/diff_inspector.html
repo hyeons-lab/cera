@@ -3,23 +3,23 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Cera — Interactive Raster Diff & Alignment</title>
+  <title>Cera — Smooth Closed-Left Vector vs. Master Artwork</title>
   <style>
     body {
       background: #090c10;
       color: #f0f6fc;
-      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
       padding: 30px 20px;
       display: flex;
       flex-direction: column;
       align-items: center;
     }
-    h1 { margin-bottom: 8px; font-size: 26px; }
+    h1 { margin-bottom: 6px; font-size: 26px; font-weight: 800; }
     p.sub { color: #8b949e; margin-bottom: 24px; }
     
     .panel-row {
       display: flex;
-      gap: 24px;
+      gap: 28px;
       margin-bottom: 32px;
       flex-wrap: wrap;
       justify-content: center;
@@ -36,8 +36,8 @@
     }
     .panel-card h3 { font-size: 15px; color: #a5b4fc; }
     .panel-box {
-      width: 320px;
-      height: 320px;
+      width: 340px;
+      height: 340px;
       background: #0e1218;
       border-radius: 10px;
       display: flex;
@@ -45,10 +45,21 @@
       justify-content: center;
       position: relative;
       overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.05);
     }
     .panel-box img, .panel-box svg {
       width: 320px;
       height: 320px;
+    }
+    .symmetry-line {
+      position: absolute;
+      top: 50%;
+      left: 0;
+      width: 100%;
+      height: 1px;
+      border-top: 1px dashed rgba(245, 158, 11, 0.4);
+      pointer-events: none;
+      z-index: 5;
     }
 
     /* Interactive Split Slider */
@@ -60,16 +71,22 @@
       overflow: hidden;
       border: 2px solid #30363d;
       margin-top: 10px;
+      background: #0e1218;
       box-shadow: 0 12px 30px rgba(0,0,0,0.5);
     }
-    .slider-container img {
+    .slider-container .base-layer {
       position: absolute;
       top: 0;
       left: 0;
       width: 100%;
       height: 100%;
-      object-fit: contain;
-      user-select: none;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .slider-container .base-layer svg {
+      width: 400px;
+      height: 400px;
     }
     .img-overlay {
       position: absolute;
@@ -83,6 +100,8 @@
     }
     .img-overlay img {
       width: 440px;
+      height: 440px;
+      object-fit: contain;
       max-width: none;
     }
     .slider-range {
@@ -95,45 +114,62 @@
       cursor: ew-resize;
       z-index: 10;
     }
+    .badge {
+      display: inline-block;
+      padding: 3px 10px;
+      background: rgba(34, 197, 94, 0.15);
+      color: #4ade80;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
   </style>
 </head>
 <body>
 
-  <h1>Cera — Vector vs. Master Artwork Visual Diff</h1>
-  <p class="sub">Side-by-side raster diff & interactive before/after split slider</p>
+  <div class="badge">Smooth Curves • Closed on Left • Open on Right</div>
+  <h1>Cera — Master Vector vs. Original Artwork</h1>
+  <p class="sub">Continuous smooth curves with unbroken left flank, open right mouth, and vertical reflection symmetry.</p>
 
   <div class="panel-row">
-    <!-- 1. Original -->
+    <!-- 1. Original Master Reference -->
     <div class="panel-card">
-      <h3>1. Original Master Artwork</h3>
+      <h3>1. Original Master Artwork (PNG)</h3>
       <div class="panel-box">
         <img src="/Users/dberrios/.gemini/antigravity-cli/brain/27adc6ca-ba93-43e9-b72f-6262adfb28d6/cera_exact_base_icon_centered.png" alt="Original" />
       </div>
     </div>
 
-    <!-- 2. Rasterized SVG -->
+    <!-- 2. Live Smooth Vector SVG -->
     <div class="panel-card">
-      <h3>2. Rasterized Vector SVG</h3>
+      <h3>2. Smooth Closed-Left Vector (Live SVG)</h3>
       <div class="panel-box">
-        <img src="cera-icon-512x512.png" alt="Rasterized SVG" />
-      </div>
-    </div>
-
-    <!-- 3. Difference Heatmap -->
-    <div class="panel-card">
-      <h3>3. Difference Heatmap (Red = Diff)</h3>
-      <div class="panel-box">
-        <img src="/Users/dberrios/.gemini/antigravity-cli/brain/27adc6ca-ba93-43e9-b72f-6262adfb28d6/cera_vector_vs_master_diff.png" style="width: 960px; max-width: none; transform: translateX(-640px);" alt="Heatmap" />
+        <div class="symmetry-line"></div>
+        <!-- LIVE INLINE SVG -->
+        <svg viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M 100 256 C 100 155 170 75 270 75 C 325 75 365 98 385 125 C 395 138 388 155 370 160 C 352 165 338 152 325 138 C 290 102 230 95 190 135 C 152 172 152 230 185 268 L 255 345 C 265 355 252 370 238 360 L 155 275 C 120 238 100 215 100 256 Z" fill="#FBBF24" />
+          <path d="M 385 125 C 418 165 425 225 385 270 C 370 286 348 280 342 260 C 336 240 348 225 362 208 C 385 180 380 145 356 122 L 385 125 Z" fill="#FB923C" />
+          <path d="M 100 256 C 100 357 170 437 270 437 C 325 437 365 414 385 387 C 395 374 388 357 370 352 C 352 347 338 360 325 374 C 290 410 230 417 190 377 C 152 340 152 282 185 244 L 255 167 C 265 157 252 142 238 152 L 155 237 C 120 274 100 297 100 256 Z" fill="#EA580C" />
+          <path d="M 385 387 C 418 347 425 287 385 242 C 370 226 348 232 342 252 C 336 272 348 287 362 304 C 385 332 380 367 356 390 L 385 387 Z" fill="#9A3412" />
+        </svg>
       </div>
     </div>
   </div>
 
   <h2 style="font-size: 18px; margin-top: 10px;">Interactive Split Comparison (Drag to compare):</h2>
   <div class="slider-container" id="sliderContainer">
-    <!-- Base (SVG) -->
-    <img src="cera-icon-512x512.png" alt="Vector SVG" />
+    <!-- Base Layer (Live SVG) -->
+    <div class="base-layer">
+      <svg viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M 100 256 C 100 155 170 75 270 75 C 325 75 365 98 385 125 C 395 138 388 155 370 160 C 352 165 338 152 325 138 C 290 102 230 95 190 135 C 152 172 152 230 185 268 L 255 345 C 265 355 252 370 238 360 L 155 275 C 120 238 100 215 100 256 Z" fill="#FBBF24" />
+        <path d="M 385 125 C 418 165 425 225 385 270 C 370 286 348 280 342 260 C 336 240 348 225 362 208 C 385 180 380 145 356 122 L 385 125 Z" fill="#FB923C" />
+        <path d="M 100 256 C 100 357 170 437 270 437 C 325 437 365 414 385 387 C 395 374 388 357 370 352 C 352 347 338 360 325 374 C 290 410 230 417 190 377 C 152 340 152 282 185 244 L 255 167 C 265 157 252 142 238 152 L 155 237 C 120 274 100 297 100 256 Z" fill="#EA580C" />
+        <path d="M 385 387 C 418 347 425 287 385 242 C 370 226 348 232 342 252 C 336 272 348 287 362 304 C 385 332 380 367 356 390 L 385 387 Z" fill="#9A3412" />
+      </svg>
+    </div>
     
-    <!-- Top (Reference Artwork) -->
+    <!-- Top Layer (Original Reference Artwork) -->
     <div class="img-overlay" id="overlay">
       <img src="/Users/dberrios/.gemini/antigravity-cli/brain/27adc6ca-ba93-43e9-b72f-6262adfb28d6/cera_exact_base_icon_centered.png" alt="Original Artwork" />
     </div>
